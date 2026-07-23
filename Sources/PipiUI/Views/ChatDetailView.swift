@@ -13,6 +13,7 @@ struct ChatDetailView: View {
     @State private var rightPanelWidthRatio: CGFloat?
     @State private var rightPanelDragStartWidth: CGFloat?
     @State private var rightPanelDragWidth: CGFloat?
+    @StateObject private var gitBranches = GitBranchStore()
 
     private let minimumChatWidth: CGFloat = 360
     private let minimumRightPanelWidth: CGFloat = 300
@@ -33,6 +34,8 @@ struct ChatDetailView: View {
         .navigationTitle(session.displayTitle)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                GitBranchMenu(store: gitBranches) { session.lastError = $0 }
+
                 Button {
                     if session.rightPanel == .agents {
                         session.rightPanel = nil
@@ -60,6 +63,12 @@ struct ChatDetailView: View {
                 }
                 .help("内置浏览器面板（pi 可通过 browser_* 工具驱动）")
             }
+        }
+        .onAppear {
+            gitBranches.bind(projectURL: session.projectURL)
+        }
+        .onChange(of: session.id) { _, _ in
+            gitBranches.bind(projectURL: session.projectURL)
         }
     }
 
