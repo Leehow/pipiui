@@ -1,0 +1,138 @@
+=== FILES ===
+Sources/PipiUI/SessionMessageQueue.swift (new)
+Sources/PipiUI/SelfTest.swift (modified section 8)
+
+=== SessionMessageQueue.swift ===
+import Foundation
+
+struct QueuedMessage: Identifiable {
+    let id: UUID
+    var text: String
+    var images: [DraftImage]
+
+    init(id: UUID = UUID(), text: String, images: [DraftImage] = []) {
+        self.id = id
+        self.text = text
+        self.images = images
+    }
+}
+
+/// Pure session follow-up queue (no RPC). ChatSession owns one instance.
+struct SessionMessageQueue {
+    private(set) var items: [QueuedMessage] = []
+    private(set) var interceptSendFirst = false
+
+    var isEmpty: Bool { items.isEmpty }
+    var count: Int { items.count }
+
+    /// Enqueue a follow-up. `text` should already include attachment path footnotes if any.
+    @discardableResult
+    mutating func enqueue(text: String, images: [DraftImage] = []) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty || !images.isEmpty else { return false }
+        items.append(QueuedMessage(text: text, images: images))
+        return true
+    }
+
+    mutating func restoreAll() -> (text: String, images: [DraftImage]) {
+        let texts = items.map(\.text)
+        let images = items.flatMap(\.images)
+        items.removeAll()
+        interceptSendFirst = false
+        return (Self.joinTexts(texts), images)
+    }
+
+    static func joinTexts(_ texts: [String]) -> String {
+        texts.joined(separator: "\n\n")
+    }
+
+    mutating func noteAbort() {
+        if !items.isEmpty { interceptSendFirst = true }
+    }
+
+    mutating func clearIntercept() {
+        interceptSendFirst = false
+    }
+
+    /// Pop head when idle and alive. Clears intercept when popping or when queue empty.
+    mutating func popForIdleDrain(isStreaming: Bool, processAlive: Bool) -> QueuedMessage? {
+        if items.isEmpty {
+            interceptSendFirst = false
+            return nil
+        }
+        guard processAlive, !isStreaming else { return nil }
+        interceptSendFirst = false
+        return items.removeFirst()
+    }
+
+    mutating func requeueFront(_ msg: QueuedMessage) {
+        items.insert(msg, at: 0)
+    }
+}
+
+=== SelfTest.swift queue section ===
+221:        // 8. Session message queue (follow-up / restore / intercept drain)
+222-        var q = SessionMessageQueue()
+223-        check("enqueue rejects empty", q.enqueue(text: "  ", images: []) == false)
+224-        check("enqueue text", q.enqueue(text: "first"))
+225-        check("enqueue second", q.enqueue(text: "second"))
+226-        check("queue count 2", q.count == 2)
+227-
+228-        // No drain while streaming
+229-        check("no pop while streaming",
+230-              q.popForIdleDrain(isStreaming: true, processAlive: true) == nil)
+231-        check("still 2 after blocked pop", q.count == 2)
+232-
+233-        // Idle drain FIFO
+234-        let head = q.popForIdleDrain(isStreaming: false, processAlive: true)
+235-        check("pop head first", head?.text == "first")
+236-        check("one left", q.count == 1 && q.items.first?.text == "second")
+237-
+238-        // Requeue front on failure
+239-        if let head {
+240-            q.requeueFront(head)
+241-            check("requeue front", q.items.first?.text == "first" && q.count == 2)
+242-            // pop again to restore single "second" scenario for later tests
+243-            _ = q.popForIdleDrain(isStreaming: false, processAlive: true)
+244-        }
+245-
+246-        // Abort intercept flag
+247-        q.noteAbort()
+248-        check("abort sets intercept when non-empty", q.interceptSendFirst)
+249-        let afterAbort = q.popForIdleDrain(isStreaming: false, processAlive: true)
+250-        check("intercept pop sends remaining head", afterAbort?.text == "second")
+251-        check("intercept cleared after pop", q.interceptSendFirst == false)
+252-        check("queue empty", q.isEmpty)
+253-
+254-        // noteAbort on empty is no-op
+255-        q.noteAbort()
+256-        check("abort empty no intercept", q.interceptSendFirst == false)
+257-
+258-        // restoreAll join + clear
+259-        _ = q.enqueue(text: "a")
+260-        _ = q.enqueue(text: "b")
+261-        q.noteAbort()
+262-        let restored = q.restoreAll()
+263-        check("restore join blank line", restored.text == "a\n\nb", "got: \(restored.text)")
+264-        check("restore clears queue", q.isEmpty && q.interceptSendFirst == false)
+265-
+266-        // dead process no pop
+267-        _ = q.enqueue(text: "x")
+268-        check("dead process no pop",
+269-              q.popForIdleDrain(isStreaming: false, processAlive: false) == nil)
+270-        _ = q.restoreAll()
+271-
+272-        // joinTexts helper
+273-        check("joinTexts single", SessionMessageQueue.joinTexts(["only"]) == "only")
+274-        check("joinTexts multi", SessionMessageQueue.joinTexts(["a", "b"]) == "a\n\nb")
+275-
+276-        print("---")
+277-        if failures.isEmpty {
+278-            print("ALL PASSED")
+279-            exit(0)
+280-        } else {
+281-            print("FAILED \(failures.count): \(failures.joined(separator: ", "))")
+282-            exit(1)
+283-        }
+284-    }
+285-}

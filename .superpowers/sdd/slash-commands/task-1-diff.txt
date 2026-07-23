@@ -1,0 +1,60 @@
+=== Task 1: XCTest scaffolding ===
+PATH_TAKEN: library+thin-entry (PipiUI library + PipiUIApp executable) because simple executable+testTarget pulled @main into test bundle; CLT has no XCTest.framework so used PipiUITestRunner executable harness instead of SPM swift test.
+
+=== Package.swift ===
+// swift-tools-version:5.9
+import PackageDescription
+
+let package = Package(
+    name: "PipiUI",
+    platforms: [.macOS(.v14)],
+    products: [
+        // Product name stays `PipiUI` so `swift run` / make-app keep familiar paths.
+        .executable(name: "PipiUI", targets: ["PipiUIApp"]),
+    ],
+    targets: [
+        .target(
+            name: "PipiUI",
+            path: "Sources/PipiUI",
+            resources: [
+                // App 自有的 pi 插件（补丁版 subagent + 我们的 agents），
+                // 运行时拷到 Application Support 并 -e 加载，独立于 ~/.pi
+                .copy("PiExt")
+            ]
+        ),
+        .executableTarget(
+            name: "PipiUIApp",
+            dependencies: ["PipiUI"],
+            path: "Sources/PipiUIApp"
+        ),
+        // CLT-only hosts have no XCTest.framework and Apple's swiftpm-testing-helper
+        // does not actually execute Swift Testing cases. This executable runs the same
+        // suite via a tiny harness (`MiniXCTest` + `PipiUITestsMain.runAll`).
+        // Use: `swift run PipiUITestRunner`  (alias for planned `swift test` verification)
+        .executableTarget(
+            name: "PipiUITestRunner",
+            dependencies: ["PipiUI"],
+            path: "Tests/PipiUITests"
+        ),
+    ]
+)
+
+=== Sources/PipiUIApp/AppEntry.swift ===
+import PipiUI
+
+/// Thin executable entry so the `PipiUI` module can be a library (testable without `@main`).
+@main
+enum PipiUIMainEntry {
+    static func main() {
+        PipiUIApp.main()
+    }
+}
+
+=== Tests/PipiUITests (harness) ===
+total 64
+drwxr-xr-x@ 6 haoli  staff    192 Jul 23 11:44 .
+drwxr-xr-x@ 3 haoli  staff     96 Jul 23 11:33 ..
+-rw-r--r--@ 1 haoli  staff   1022 Jul 23 11:44 BuiltinHostMock.swift
+-rw-r--r--@ 1 haoli  staff   6130 Jul 23 11:43 MiniXCTest.swift
+-rw-r--r--@ 1 haoli  staff  12654 Jul 23 11:44 SlashCommandTests.swift
+-rw-r--r--@ 1 haoli  staff    354 Jul 23 11:44 main.swift

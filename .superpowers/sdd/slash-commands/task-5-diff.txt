@@ -1,0 +1,141 @@
+=== Task 5: ChatSession ===
+     817 Sources/PipiUI/ChatSession.swift
+91:    /// Server-side slash commands from `get_commands` (extension / prompt / skill).
+92:    @Published var availableCommands: [SlashCommand] = []
+95:    var onRequestNewSession: (() -> Void)?
+97:    var onRequestClose: (() -> Void)?
+201:        proc?.request(["type": "get_commands"]) { [weak self] resp in
+203:            // Failure/empty → leave availableCommands empty; builtins still work. No flash.
+204:            self.availableCommands = SlashCommandParser.parseGetCommandsResponse(resp)
+455:    func sendPrompt(_ text: String, images: [DraftImage] = []) {
+472:           let inv = BuiltinCommands.parseInvocation(trimmed),
+473:           BuiltinCommands.execute(name: inv.name, args: inv.args, host: self) {
+487:        sendPromptNow(message: prepared.message, images: prepared.images)
+567:    private func sendPromptNow(message: String, images: [DraftImage], requeueOnFailure: QueuedMessage? = nil) {
+624:        sendPromptNow(message: msg.text, images: msg.images, requeueOnFailure: msg)
+721:    func flash(_ message: String) {
+726:// MARK: - BuiltinCommandHost
+728:extension ChatSession: BuiltinCommandHost {
+729:    func runCompact() {
+799:    func runSetModel(providerSlashId: String) {
+----- tail extension -----
+    }
+
+    /// Clear the sidebar green badge after the user opens/selects this session.
+    func markCompletionSeen() {
+        if hasUnseenCompletion { hasUnseenCompletion = false }
+    }
+
+    /// Green = unseen successful settle. Skip if already selected or unhealthy.
+    private func markUnseenCompletionAfterSuccessfulSettle() {
+        let healthy = lastError == nil && processAlive
+        guard healthy else { return }
+        if isSelectedCheck?() == true {
+            hasUnseenCompletion = false
+        } else {
+            hasUnseenCompletion = true
+        }
+    }
+
+    /// 调试用：直接塞一条 assistant 消息（PIPIUI_MD_DEMO 渲染验证钩子）
+    func appendDebugAssistant(_ markdown: String) {
+        transcript.append(ChatItem(id: nextItemId(), role: "assistant", blocks: [.text(markdown)]))
+    }
+
+    func flash(_ message: String) {
+        lastError = message
+    }
+}
+
+// MARK: - BuiltinCommandHost
+
+extension ChatSession: BuiltinCommandHost {
+    func runCompact() {
+        proc?.request(["type": "compact"]) { [weak self] resp in
+            guard let self else { return }
+            if resp["success"].bool != true {
+                self.flash(resp["error"].string ?? "压缩失败")
+            }
+            // Success: existing compaction_start/end events append system lines.
+        }
+    }
+
+    func runSetSessionName(_ name: String) {
+        setSessionName(name)
+    }
+
+    func runShowSessionStats() {
+        // Refresh then flash current snapshot (callbacks update published fields).
+        proc?.request(["type": "get_session_stats"]) { [weak self] resp in
+            guard let self else { return }
+            if resp["success"].bool == true {
+                self.cost = resp["data"]["cost"].double ?? self.cost
+                self.contextPercent = resp["data"]["contextUsage"]["percent"].double
+            }
+            self.proc?.request(["type": "get_state"]) { [weak self] stateResp in
+                guard let self else { return }
+                self.applyState(stateResp["data"])
+                let modelName = self.model?.id ?? "(无模型)"
+                let name = self.sessionName ?? "(未命名)"
+                let pct: String = {
+                    if let p = self.contextPercent { return "\(Int(p))%" }
+                    return "—"
+                }()
+                let file = self.sessionFile ?? "—"
+                self.flash(
+                    "会话：\(name)\n模型：\(modelName)\n费用：$\(String(format: "%.4f", self.cost)) · 上下文：\(pct)\n文件：\(file)"
+                )
+            }
+        }
+    }
+
+    func runExportHTML() {
+        proc?.request(["type": "export_html"]) { [weak self] resp in
+            guard let self else { return }
+            if resp["success"].bool == true, let path = resp["data"]["path"].string {
+                self.flash("已导出 HTML：\(path)")
+                let url = URL(fileURLWithPath: path)
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            } else {
+                self.flash(resp["error"].string ?? "导出失败")
+            }
+        }
+    }
+
+    func runCopyLastAssistant() {
+        // Walk transcript from end for last assistant text blocks.
+        for item in transcript.reversed() where item.role == "assistant" {
+            let text = item.blocks.compactMap { block -> String? in
+                if case .text(let t) = block { return t }
+                return nil
+            }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setString(text, forType: .string)
+                flash("已复制最后一条助手回复（\(text.count) 字符）")
+                return
+            }
+        }
+        flash("没有可复制的助手回复")
+    }
+
+    func runSetModel(providerSlashId: String) {
+        let parts = providerSlashId.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2 else {
+            flash("模型格式应为 provider/modelId，例如 openai/gpt-4o")
+            return
+        }
+        let provider = String(parts[0])
+        let modelId = String(parts[1])
+        guard !provider.isEmpty, !modelId.isEmpty else {
+            flash("模型格式应为 provider/modelId，例如 openai/gpt-4o")
+            return
+        }
+        if let known = availableModels.first(where: { $0.provider == provider && $0.modelId == modelId }) {
+            setModel(known)
+        } else {
+            setModel(ModelInfo(provider: provider, modelId: modelId, name: modelId))
+        }
+    }
+}

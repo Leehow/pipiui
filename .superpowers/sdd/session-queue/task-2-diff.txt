@@ -1,0 +1,108 @@
+--- .superpowers/sdd/session-queue/ChatSession.before-t2.swift	2026-07-23 07:30:07
++++ Sources/PipiUI/ChatSession.swift	2026-07-23 07:30:39
+@@ -59,6 +59,8 @@
+     @Published var sessionFile: String?
+     @Published var lastError: String?
+     @Published var processAlive = true
++    /// Local follow-up queue mirror for SwiftUI (busy Enter enqueues here).
++    @Published private(set) var messageQueue: [QueuedMessage] = []
+ 
+     /// 右侧面板：内置浏览器 / subagent 树
+     enum RightPanel: Equatable { case web, agents }
+@@ -73,6 +75,8 @@
+     var onSessionMetaChanged: (() -> Void)?
+     private var proc: PiProcess?
+     private var itemCounter = 0
++    private var queue = SessionMessageQueue()
++    private var isSendingFromQueue = false
+     // 流式更新节流：每个 token delta 都刷 UI 会卡，按 50ms 合并
+     private var pendingStreamMessage: J?
+     private var streamFlushScheduled = false
+@@ -183,6 +187,7 @@
+             isStreaming = false
+             streamingItem = nil
+             refreshStats()
++            drainQueueIfIdle()
+             proc?.request(["type": "get_state"]) { [weak self] resp in
+                 self?.applyState(resp["data"])
+                 self?.onSessionMetaChanged?()
+@@ -380,32 +385,72 @@
+     func sendPrompt(_ text: String, images: [DraftImage] = []) {
+         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+         guard !trimmed.isEmpty || !images.isEmpty else { return }
++        let prepared = prepareMessage(text: trimmed, images: images)
+ 
+-        // Dual delivery: multimodal RPC images + real on-disk paths.
+-        // Coding models often try `read /home/workdir/attachments/...` first; without a real
+-        // path that call fails even when vision works. Saving under .pi/attachments fixes it.
+-        var message = trimmed
++        if isStreaming {
++            let ok = queue.enqueue(text: prepared.message, images: prepared.images)
++            if ok { publishQueue() }
++            return
++        }
++        sendPromptNow(message: prepared.message, images: prepared.images)
++    }
++
++    /// Dual delivery: multimodal RPC images + real on-disk paths.
++    /// Coding models often try `read .../attachments/...` first; saving under .pi/attachments fixes it.
++    private func prepareMessage(text: String, images: [DraftImage]) -> (message: String, images: [DraftImage]) {
++        var message = text
+         if !images.isEmpty {
+             let paths = ImageAttachment.saveToProjectAttachments(images, projectURL: projectURL)
+-            message = ImageAttachment.messageWithAttachmentPaths(text: trimmed, paths: paths)
++            message = ImageAttachment.messageWithAttachmentPaths(text: text, paths: paths)
+         }
++        return (message, images)
++    }
+ 
++    private func sendPromptNow(message: String, images: [DraftImage], requeueOnFailure: QueuedMessage? = nil) {
+         var cmd: [String: Any] = ["type": "prompt", "message": message]
+         if !images.isEmpty {
+             cmd["images"] = ImageAttachment.rpcPayload(from: images)
+         }
+-        if isStreaming { cmd["streamingBehavior"] = "steer" }
++        // Never set streamingBehavior: "steer" — busy delivery is local queue + idle drain.
+         proc?.request(cmd) { [weak self] resp in
++            guard let self else { return }
+             if resp["success"].bool != true {
+-                self?.lastError = resp["error"].string ?? "发送失败"
++                self.lastError = resp["error"].string ?? "发送失败"
++                if let requeueOnFailure {
++                    self.queue.requeueFront(requeueOnFailure)
++                    self.publishQueue()
++                }
+             }
+         }
+     }
+ 
++    private func publishQueue() {
++        messageQueue = queue.items
++    }
++
++    func restoreQueueToDraft() -> (text: String, images: [DraftImage]) {
++        let restored = queue.restoreAll()
++        publishQueue()
++        return restored
++    }
++
+     func abort() {
++        queue.noteAbort()
++        publishQueue()
++        // intercept flag only; items stay until idle drain
+         proc?.send(["type": "abort"])
+     }
+ 
++    /// Drain queue head when agent is idle. Call only from agent_settled (not applyState / process death).
++    private func drainQueueIfIdle() {
++        guard let msg = queue.popForIdleDrain(isStreaming: isStreaming, processAlive: processAlive) else {
++            publishQueue()
++            return
++        }
++        publishQueue()
++        sendPromptNow(message: msg.text, images: msg.images, requeueOnFailure: msg)
++    }
++
+     func setModel(_ m: ModelInfo) {
+         proc?.request(["type": "set_model", "provider": m.provider, "modelId": m.modelId]) { [weak self] resp in
+             guard let self else { return }

@@ -1,0 +1,67 @@
+=== FINAL slash-commands snapshot 2026-07-23T15:59:49Z ===
+Feature: 斜杠命令（/）— 逻辑 / 集成 / UI / 文档收尾
+Verify: swift build (exit 0) ; swift run PipiUITestRunner → 27/27 passed
+Status: Phase A–D complete (Phase D docs-only; no source edits)
+Host note: CLT only — use PipiUITestRunner, not swift test / XCTest
+
+## 新增文件
+
+| 路径 | 行数 | 一句话职责 |
+|---|---:|---|
+| Sources/PipiUI/SlashCommand.swift | 234 | 斜杠模型、get_commands 解析、palette query、fuzzy、BuiltinCommandHost、BuiltinCommands 路由 |
+| Sources/PipiUI/Views/SlashPalette.swift | 78 | `/` 补全浮层 UI（列表、徽标、选中高亮、点击=补全） |
+| Sources/PipiUIApp/AppEntry.swift | 9 | 薄 @main 入口（Package 拆库后调用 PipiUIApp.main） |
+| Tests/PipiUITests/SlashCommandTests.swift | 292 | 斜杠单测 27 条（parser / fuzzy / builtin / palette query） |
+| Tests/PipiUITests/MiniXCTest.swift | 124 | CLT MiniXCTest 断言 + allTests 注册表 + runAll |
+| Tests/PipiUITests/BuiltinHostMock.swift | 32 | BuiltinCommandHost mock |
+| Tests/PipiUITests/main.swift | 10 | PipiUITestRunner 入口 |
+| docs/superpowers/plans/2025-07-23-slash-commands.md | — | 实现计划 |
+| docs/superpowers/specs/2025-07-23-slash-commands-design.md | — | 设计 spec |
+| .superpowers/sdd/slash-commands/* | — | 阶段 diff/report、进度、验收清单、本快照 |
+
+## 修改文件
+
+| 路径 | 行数 | 一句话职责 / 本特性改动 |
+|---|---:|---|
+| Package.swift | 36 | 拆 PipiUI 库 + PipiUIApp 可执行 + PipiUITestRunner 可执行 |
+| Sources/PipiUI/App.swift | 185 | 去掉 @main，公开 PipiUIApp 供 AppEntry |
+| Sources/PipiUI/J.swift | 51 | package 可见性，供 SlashCommandParser 使用 |
+| Sources/PipiUI/ChatSession.swift | 817 | availableCommands、get_commands 拉取、sendPrompt builtin 闸门、BuiltinCommandHost、flash |
+| Sources/PipiUI/AppStore.swift | 502 | makeSession 注入 onRequestNewSession / onRequestClose（/new /quit） |
+| Sources/PipiUI/Views/InputBar.swift | 752 | 挂载 SlashPalette、draft 过滤、complete/execute、ComposerSlashKeyMonitor |
+| README.md | 97 | 功能 bullet、斜杠命令专节、代码结构、已知限制、TestRunner 说明 |
+| make-app.sh | — | 注释对齐 product 名（二进制仍为 PipiUI） |
+
+## 未改（本特性有意不动）
+
+- Sources/PipiUI/PiProcess.swift — 通用 request 已够
+- Sources/PipiUI/Views/ChatDetailView.swift — flash 走既有 lastError，无专属改动
+
+## MiniXCTest 注册自检
+
+- SlashCommandTests 中 `func test…` 方法数：27
+- MiniXCTest.allTests 注册条数：27
+- 方法数 == 注册数：OK（无漏登静默跳过）
+
+## 源码快照副本（本目录，无 git 对照用）
+
+- SlashCommand.swift
+- SlashPalette.swift
+- InputBar.swift
+- ChatSession.swift
+- Package.swift
+- ChatSession.after-t5.swift（Phase B 中间副本）
+- phase-A/B/C-diff.txt + reports
+- task-1..6-diff.txt
+- acceptance-checklist.md
+- phase-D-report.md
+
+## 验证命令（本轮新鲜）
+
+```bash
+swift build
+# Build complete! (exit 0)
+
+swift run PipiUITestRunner
+# Executed 27 tests, with 0 failures (27 passed)
+```

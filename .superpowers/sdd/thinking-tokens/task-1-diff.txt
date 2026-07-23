@@ -1,0 +1,77 @@
+=== Task 1 diff package (no git) ===
+Files: MessageViews.swift (enum only), SelfTest.swift (checks)
+
+        }
+    }
+}
+
+/// chars÷4 estimate for Thinking header (not a real tokenizer).
+enum ThinkingTokenEstimate {
+    static func tokenCount(for text: String) -> Int {
+        guard !text.isEmpty else { return 0 }
+        return max(1, Int((Double(text.count) / 4.0).rounded()))
+    }
+
+    /// Compact count: 999 → "999"; 1000 → "1k"; 1200 → "1.2k"; 15400 → "15.4k"
+    static func formatCount(_ n: Int) -> String {
+        guard n >= 1000 else { return String(n) }
+        let k = Double(n) / 1000.0
+        let raw = String(format: "%.1f", k)
+        if raw.hasSuffix(".0") {
+            return String(raw.dropLast(2)) + "k"
+        }
+        return raw + "k"
+    }
+
+    /// nil when no tokens to show; otherwise "~1.2k tokens"
+    static func labelSuffix(for text: String) -> String? {
+        let n = tokenCount(for: text)
+        guard n > 0 else { return nil }
+        return "~\(formatCount(n)) tokens"
+    }
+}
+
+struct ThinkingBlockView: View {
+    let text: String
+    @State private var expanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            Text(text)
+                .font(.callout)
+                .italic()
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+
+=== SelfTest additions ===
+            let midAttached = "Please see Attached notes in the doc.\nMore text."
+            check("strip mid-message Attached intact",
+                  ImageAttachment.stripAttachmentPathsForDisplay(midAttached) == midAttached)
+
+            try? FileManager.default.removeItem(at: tmpProject)
+        }
+
+        // Thinking token estimate
+        check("empty text → 0 tokens", ThinkingTokenEstimate.tokenCount(for: "") == 0)
+        check("1 char → 1 token", ThinkingTokenEstimate.tokenCount(for: "a") == 1)
+        check("4 chars → 1 token", ThinkingTokenEstimate.tokenCount(for: "abcd") == 1)
+        check("5 chars → 1 token (round 1.25→1)", ThinkingTokenEstimate.tokenCount(for: "abcde") == 1)
+        check("6 chars → 2 tokens (round 1.5→2)", ThinkingTokenEstimate.tokenCount(for: "abcdef") == 2)
+        check("4000 chars → 1000 tokens", ThinkingTokenEstimate.tokenCount(for: String(repeating: "x", count: 4000)) == 1000)
+        check("format 999", ThinkingTokenEstimate.formatCount(999) == "999")
+        check("format 1000 → 1k", ThinkingTokenEstimate.formatCount(1000) == "1k")
+        check("format 1200 → 1.2k", ThinkingTokenEstimate.formatCount(1200) == "1.2k")
+        check("format 15400 → 15.4k", ThinkingTokenEstimate.formatCount(15400) == "15.4k")
+        check("suffix empty nil", ThinkingTokenEstimate.labelSuffix(for: "") == nil)
+        check("suffix sample", ThinkingTokenEstimate.labelSuffix(for: String(repeating: "x", count: 4800)) == "~1.2k tokens")
+
+        // 8. Session message queue (follow-up / restore / intercept drain)
+        var q = SessionMessageQueue()
+        check("enqueue rejects empty", q.enqueue(text: "  ", images: []) == false)
+        check("enqueue text", q.enqueue(text: "first"))
+        check("enqueue second", q.enqueue(text: "second"))
+        check("queue count 2", q.count == 2)
+
+        // No drain while streaming
+        check("no pop while streaming",
+              q.popForIdleDrain(isStreaming: true, processAlive: true) == nil)

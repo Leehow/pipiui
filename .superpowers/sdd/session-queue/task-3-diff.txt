@@ -1,0 +1,107 @@
+--- .superpowers/sdd/session-queue/InputBar.before-t3.swift	2026-07-23 07:33:49
++++ Sources/PipiUI/Views/InputBar.swift	2026-07-23 07:34:18
+@@ -48,6 +48,10 @@
+ 
+     var body: some View {
+         VStack(spacing: 8) {
++            if !session.messageQueue.isEmpty {
++                queueStrip
++            }
++
+             if !draftImages.isEmpty {
+                 attachmentStrip
+             }
+@@ -68,7 +72,7 @@
+                 .help("添加图片")
+                 .disabled(!session.processAlive)
+ 
+-                TextField(session.isStreaming ? "输入将作为 steer 消息插入…" : "输入消息…",
++                TextField(session.isStreaming ? "输入将排队，完成后发送…" : "输入消息…",
+                           text: $draft, axis: .vertical)
+                     .textFieldStyle(.plain)
+                     .lineLimit(1...10)
+@@ -92,7 +96,7 @@
+                             .foregroundStyle(.red)
+                     }
+                     .buttonStyle(.plain)
+-                    .help("中止当前回复")
++                    .help(session.messageQueue.isEmpty ? "中止当前回复" : "中止并发送队首")
+                 }
+ 
+                 Button(action: send) {
+@@ -110,7 +114,9 @@
+                 thinkingMenu
+                 Spacer()
+                 if session.isStreaming {
+-                    Text("生成中…")
++                    Text(session.messageQueue.isEmpty
++                         ? "生成中…"
++                         : "生成中 · \(session.messageQueue.count) 条排队")
+                         .font(.caption)
+                         .foregroundStyle(.secondary)
+                 }
+@@ -155,6 +161,53 @@
+         }
+     }
+ 
++    // MARK: - Queue strip
++
++    private var queueStrip: some View {
++        HStack(spacing: 10) {
++            Image(systemName: "tray")
++                .foregroundStyle(.secondary)
++            VStack(alignment: .leading, spacing: 2) {
++                Text("排队 \(session.messageQueue.count) 条")
++                    .font(.caption.weight(.semibold))
++                if let preview = queuePreview {
++                    Text(preview)
++                        .font(.caption2)
++                        .foregroundStyle(.secondary)
++                        .lineLimit(1)
++                }
++            }
++            Spacer()
++            Button("撤回编辑") {
++                let restored = session.restoreQueueToDraft()
++                if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
++                    draft = restored.text
++                } else if !restored.text.isEmpty {
++                    draft = draft + "\n\n" + restored.text
++                }
++                draftImages.append(contentsOf: restored.images)
++            }
++            .font(.caption.weight(.medium))
++        }
++        .padding(.horizontal, 12)
++        .padding(.vertical, 8)
++        .background(
++            RoundedRectangle(cornerRadius: 10, style: .continuous)
++                .fill(Color.accentColor.opacity(0.08))
++        )
++    }
++
++    private var queuePreview: String? {
++        guard let text = session.messageQueue.first?.text else { return nil }
++        let firstLine = text.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? text
++        let trimmed = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
++        if trimmed.isEmpty {
++            return session.messageQueue.first?.images.isEmpty == false ? "(图片)" : nil
++        }
++        if trimmed.count <= 40 { return "「\(trimmed)」" }
++        return "「\(trimmed.prefix(40))…」"
++    }
++
+     // MARK: - Attachment strip
+ 
+     private var attachmentStrip: some View {
+--- .superpowers/sdd/session-queue/README.before-t3.md	2026-07-23 07:33:49
++++ README.md	2026-07-23 07:34:18
+@@ -7,7 +7,7 @@
+ - **左侧栏**：项目文件夹管理（持久化）+ 每个项目的历史会话列表（从 `~/.pi/agent/sessions/` 自动发现，显示会话名和时间）
+ - **会话**：新建 / 点击恢复历史会话；每个打开的会话独立一个 `pi --mode rpc` 子进程，后台会话继续运行（绿点表示正在生成）
+ - **聊天区**：用户气泡、Markdown 正文（含围栏代码块）、Thinking 折叠块、工具调用卡片（bash/read/edit 图标、实时流式输出、成功/失败状态、可展开）
+-- **输入栏**：Enter 发送（生成中自动转为 steer 插话）、中止按钮、底部模型切换菜单（按 provider 分组）和 thinking 等级菜单；支持粘贴/拖入/选文件添加多图预览，经 RPC `images` 发给模型，用户气泡与历史会话可显示图片
++- **输入栏**：Enter 发送；生成中消息进入会话 follow-up 队列（完成后按序发送），可「撤回编辑」；停止按钮在有队列时为「中止并发送队首」；模型/thinking 菜单；多图附件（粘贴/拖入/选文件预览，经 RPC `images` 发给模型，用户气泡与历史会话可显示图片）
+ - **状态**：顶栏实时显示会话费用和上下文占用百分比；自动重试 / 压缩事件有提示
+ 
+ ## 内置浏览器 + pi browser 工具

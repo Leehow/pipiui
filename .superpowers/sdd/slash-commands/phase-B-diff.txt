@@ -1,0 +1,489 @@
+=== Phase B: Task 5–6 ChatSession + AppStore integration ===
+
+=== Files changed ===
+- Sources/PipiUI/ChatSession.swift
+- Sources/PipiUI/AppStore.swift
+
+=== ChatSession key symbols ===
+3:import AppKit
+91:    /// Server-side slash commands from `get_commands` (extension / prompt / skill).
+92:    @Published var availableCommands: [SlashCommand] = []
+95:    var onRequestNewSession: (() -> Void)?
+97:    var onRequestClose: (() -> Void)?
+201:        proc?.request(["type": "get_commands"]) { [weak self] resp in
+203:            // Failure/empty → leave availableCommands empty; builtins still work. No flash.
+204:            self.availableCommands = SlashCommandParser.parseGetCommandsResponse(resp)
+472:           let inv = BuiltinCommands.parseInvocation(trimmed),
+473:           BuiltinCommands.execute(name: inv.name, args: inv.args, host: self) {
+721:    func flash(_ message: String) {
+726:// MARK: - BuiltinCommandHost
+728:extension ChatSession: BuiltinCommandHost {
+729:    func runCompact() {
+739:    func runSetSessionName(_ name: String) {
+743:    func runShowSessionStats() {
+768:    func runExportHTML() {
+781:    func runCopyLastAssistant() {
+799:    func runSetModel(providerSlashId: String) {
+
+=== sendPrompt builtin gate ===
+469:        // Builtin slash commands: local/GUI or dedicated RPC — never go through prompt queue.
+470-        // Only when there are no images (slash is text-only UX).
+471-        if images.isEmpty,
+472-           let inv = BuiltinCommands.parseInvocation(trimmed),
+473-           BuiltinCommands.execute(name: inv.name, args: inv.args, host: self) {
+474-            draftText = ""
+475-            draftImages = []
+476-            return
+477-        }
+478-
+479-        let prepared = prepareMessage(text: trimmed, images: images)
+480-
+481-        // Busy while streaming OR in the gap after drain popped until agent_start.
+
+=== AppStore makeSession hooks ===
+139:        session.isSelectedCheck = { [weak self] in self?.selectedSessionKey == key }
+140:        session.onRequestNewSession = { [weak self] in
+141-            guard let self else { return }
+142-            self.newSession(project: project)
+143-        }
+144:        session.onRequestClose = { [weak self] in
+145-            self?.closeSession(key: key)
+146-        }
+147-        return session
+148-    }
+149-
+150-    private func persistProjects() {
+151-        UserDefaults.standard.set(projects.map(\.path), forKey: Self.projectsKey)
+152-    }
+153-
+154-    private func persistArchivedSessions() {
+
+=== Diff against Sources.bak if present ===
+--- Sources.bak-20260723-104538/PipiUI/ChatSession.swift	2026-07-23 10:45:38
++++ Sources/PipiUI/ChatSession.swift	2026-07-23 11:53:35
+@@ -1,5 +1,6 @@
+ import Foundation
+ import Combine
++import AppKit
+ 
+ struct ModelInfo: Identifiable, Hashable {
+     let provider: String
+@@ -20,11 +21,18 @@
+     let mimeType: String
+ }
+ 
++struct VideoBlock: Identifiable, Equatable {
++    let id: String
++    let path: String
++    let remoteURL: String?
++}
++
+ enum ChatBlock: Equatable {
+     case text(String)
+     case thinking(String)
+     case toolCall(ToolCallBlock)
+     case image(ImageBlock)
++    case video(VideoBlock)
+ }
+ 
+ struct ChatItem: Identifiable, Equatable {
+@@ -63,6 +71,15 @@
+     @Published var hasUnseenCompletion = false
+     /// Local follow-up queue mirror for SwiftUI (busy Enter enqueues here).
+     @Published private(set) var messageQueue: [QueuedMessage] = []
++    /// In-memory composer draft (per session; not persisted).
++    @Published var draftText: String = ""
++    @Published var draftImages: [DraftImage] = []
++    /// + menu mode: chat vs Grok Imagine image/video generation.
++    @Published var composerMode: ComposerMode = .chat
++    @Published var imageMediaModel: MediaModel = MediaModelCatalog.defaultModel(for: .generateImage)!
++    @Published var videoMediaModel: MediaModel = MediaModelCatalog.defaultModel(for: .generateVideo)!
++    @Published var mediaBusy = false
++    @Published var mediaStatus: String?
+ 
+     /// Streaming or prompt dispatch in flight (first send / queue drain until agent_start).
+     /// Depends on @Published isStreaming + isSendingFromQueue so observers refresh.
+@@ -71,6 +88,14 @@
+     /// Provided by AppStore so settle can skip green when this session is already selected.
+     var isSelectedCheck: (() -> Bool)?
+ 
++    /// Server-side slash commands from `get_commands` (extension / prompt / skill).
++    @Published var availableCommands: [SlashCommand] = []
++
++    /// Injected by AppStore for `/new`.
++    var onRequestNewSession: (() -> Void)?
++    /// Injected by AppStore for `/quit`.
++    var onRequestClose: (() -> Void)?
++
+     /// 右侧面板：内置浏览器 / subagent 树
+     enum RightPanel: Equatable { case web, agents }
+     @Published var rightPanel: RightPanel?
+@@ -118,7 +143,11 @@
+         // App 自有插件通过 -e 加载：webview 工具 + 补丁版 subagent（覆盖自动发现的官方版）
+         if bridgePort > 0 {
+             if let webviewExtension { args += ["-e", webviewExtension] }
+-            if let subagentDir { args += ["-e", subagentDir] }
++            if let subagentDir {
++                args += ["-e", subagentDir]
++                // Nested subagent pi processes re-read this to pass `-e` again (#3).
++                extraEnv["PIPIUI_SUBAGENT_EXT"] = subagentDir
++            }
+             extraEnv["PIPIUI_BRIDGE_PORT"] = String(bridgePort)
+             extraEnv["PIPIUI_SESSION_KEY"] = id
+             // 补丁版 subagent 从 App 自有目录读 agent 定义，不碰 ~/.pi/agent/agents
+@@ -169,6 +198,11 @@
+             }
+         }
+         refreshStats()
++        proc?.request(["type": "get_commands"]) { [weak self] resp in
++            guard let self else { return }
++            // Failure/empty → leave availableCommands empty; builtins still work. No flash.
++            self.availableCommands = SlashCommandParser.parseGetCommandsResponse(resp)
++        }
+     }
+ 
+     private func applyState(_ data: J) {
+@@ -176,7 +210,11 @@
+             model = ModelInfo(provider: pid, modelId: mid, name: data["model"]["name"].string ?? mid)
+         }
+         thinkingLevel = data["thinkingLevel"].string ?? "off"
+-        isStreaming = data["isStreaming"].bool ?? isStreaming
++        // get_state 与 agent_start 可能交错：只在本地未处于工作态时才采用远端 isStreaming，
++        // 避免把已开始的流式状态盖回 false（#14）。
++        if !isWorking, let remoteStreaming = data["isStreaming"].bool {
++            isStreaming = remoteStreaming
++        }
+         sessionName = data["sessionName"].string ?? sessionName
+         if let file = data["sessionFile"].string, file != sessionFile {
+             sessionFile = file
+@@ -417,6 +455,27 @@
+     func sendPrompt(_ text: String, images: [DraftImage] = []) {
+         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+         guard !trimmed.isEmpty || !images.isEmpty else { return }
++
++        // Media generation modes bypass pi RPC and hit local relays (Grok Build Imagine path).
++        if composerMode == .generateImage || composerMode == .generateVideo {
++            guard !trimmed.isEmpty else {
++                lastError = composerMode == .generateImage ? "请描述要生成的图像" : "请描述要生成的视频"
++                return
++            }
++            generateMedia(prompt: trimmed, images: images)
++            return
++        }
++
++        // Builtin slash commands: local/GUI or dedicated RPC — never go through prompt queue.
++        // Only when there are no images (slash is text-only UX).
++        if images.isEmpty,
++           let inv = BuiltinCommands.parseInvocation(trimmed),
++           BuiltinCommands.execute(name: inv.name, args: inv.args, host: self) {
++            draftText = ""
++            draftImages = []
++            return
++        }
++
+         let prepared = prepareMessage(text: trimmed, images: images)
+ 
+         // Busy while streaming OR in the gap after drain popped until agent_start.
+@@ -428,6 +487,72 @@
+         sendPromptNow(message: prepared.message, images: prepared.images)
+     }
+ 
++    /// Run image/video generation via grok-relay / coding-relay REST (same APIs as Grok Build).
++    func generateMedia(prompt: String, images: [DraftImage]) {
++        guard !mediaBusy else { return }
++        let mode = composerMode
++        let model = mode == .generateVideo ? videoMediaModel : imageMediaModel
++        mediaBusy = true
++        mediaStatus = "正在\(mode.label)…"
++        lastError = nil
++
++        // Show user bubble immediately
++        var userBlocks: [ChatBlock] = [.text(prompt)]
++        for img in images {
++            userBlocks.append(.image(ImageBlock(id: UUID().uuidString, data: img.data, mimeType: img.mimeType)))
++        }
++        transcript.append(ChatItem(id: nextItemId(), role: "user", blocks: userBlocks))
++
++        Task { [weak self] in
++            guard let self else { return }
++            do {
++                let result = try await MediaClient.generate(
++                    model: model,
++                    prompt: prompt,
++                    referenceImages: images,
++                    projectURL: self.projectURL,
++                    progress: { [weak self] status in
++                        DispatchQueue.main.async { self?.mediaStatus = status }
++                    }
++                )
++                await MainActor.run {
++                    self.appendMediaResult(result)
++                    self.mediaBusy = false
++                    self.mediaStatus = nil
++                    // Stay in media mode so user can iterate; clear only drafts (caller does that)
++                }
++            } catch {
++                await MainActor.run {
++                    self.mediaBusy = false
++                    self.mediaStatus = nil
++                    self.lastError = error.localizedDescription
++                    self.transcript.append(ChatItem(
++                        id: self.nextItemId(),
++                        role: "system",
++                        blocks: [.text("\(mode.label)失败：\(error.localizedDescription)")]
++                    ))
++                }
++            }
++        }
++    }
++
++    private func appendMediaResult(_ result: MediaGenerationResult) {
++        var blocks: [ChatBlock] = [
++            .text("\(result.modelId)")
++        ]
++        switch result.kind {
++        case .image(let data, let mime, let path):
++            blocks.append(.image(ImageBlock(id: UUID().uuidString, data: data, mimeType: mime)))
++            if let path {
++                blocks.append(.text(path.path))
++            }
++        case .video(let path, let remote):
++            blocks.append(.video(VideoBlock(id: UUID().uuidString, path: path.path, remoteURL: remote)))
++            blocks.append(.text(path.path))
++        }
++        transcript.append(ChatItem(id: nextItemId(), role: "assistant", blocks: blocks))
++    }
++
+     /// Dual delivery: multimodal RPC images + real on-disk paths.
+     /// Coding models often try `read .../attachments/...` first; saving under .pi/attachments fixes it.
+     private func prepareMessage(text: String, images: [DraftImage]) -> (message: String, images: [DraftImage]) {
+@@ -532,8 +657,44 @@
+         }
+     }
+ 
+-    func shutdown() {
+-        proc?.terminate()
++    /// Terminate the pi process (and descendant subagents). Always flushes agent tree to disk first.
++    /// If `onExited` is provided, it runs once on the main thread after the process exits or after ~2s timeout
++    /// (so restart can spawn without concurrent .jsonl writers).
++    func shutdown(onExited: (() -> Void)? = nil) {
++        subagents.saveNow()
++        guard let proc else {
++            onExited?()
++            return
++        }
++        guard let onExited else {
++            proc.terminate()
++            return
++        }
++        if !proc.isRunning {
++            onExited()
++            return
++        }
++        var settled = false
++        let finish = {
++            guard !settled else { return }
++            settled = true
++            onExited()
++        }
++        let previous = proc.onExit
++        proc.onExit = { code, stderr in
++            previous?(code, stderr)
++            finish()
++        }
++        proc.terminate()
++        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak proc] in
++            if !settled {
++                proc?.forceKill()
++            }
++            // Force-kill should still trip terminationHandler; hard cap so restart always proceeds.
++            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
++                finish()
++            }
++        }
+     }
+ 
+     /// Clear the sidebar green badge after the user opens/selects this session.
+@@ -556,4 +717,101 @@
+     func appendDebugAssistant(_ markdown: String) {
+         transcript.append(ChatItem(id: nextItemId(), role: "assistant", blocks: [.text(markdown)]))
+     }
++
++    func flash(_ message: String) {
++        lastError = message
++    }
+ }
++
++// MARK: - BuiltinCommandHost
++
++extension ChatSession: BuiltinCommandHost {
++    func runCompact() {
++        proc?.request(["type": "compact"]) { [weak self] resp in
++            guard let self else { return }
++            if resp["success"].bool != true {
++                self.flash(resp["error"].string ?? "压缩失败")
++            }
++            // Success: existing compaction_start/end events append system lines.
++        }
++    }
++
++    func runSetSessionName(_ name: String) {
++        setSessionName(name)
++    }
++
++    func runShowSessionStats() {
++        // Refresh then flash current snapshot (callbacks update published fields).
++        proc?.request(["type": "get_session_stats"]) { [weak self] resp in
++            guard let self else { return }
++            if resp["success"].bool == true {
++                self.cost = resp["data"]["cost"].double ?? self.cost
++                self.contextPercent = resp["data"]["contextUsage"]["percent"].double
++            }
++            self.proc?.request(["type": "get_state"]) { [weak self] stateResp in
++                guard let self else { return }
++                self.applyState(stateResp["data"])
++                let modelName = self.model?.id ?? "(无模型)"
++                let name = self.sessionName ?? "(未命名)"
++                let pct: String = {
++                    if let p = self.contextPercent { return "\(Int(p))%" }
++                    return "—"
++                }()
++                let file = self.sessionFile ?? "—"
++                self.flash(
++                    "会话：\(name)\n模型：\(modelName)\n费用：$\(String(format: "%.4f", self.cost)) · 上下文：\(pct)\n文件：\(file)"
++                )
++            }
++        }
++    }
++
++    func runExportHTML() {
++        proc?.request(["type": "export_html"]) { [weak self] resp in
++            guard let self else { return }
++            if resp["success"].bool == true, let path = resp["data"]["path"].string {
++                self.flash("已导出 HTML：\(path)")
++                let url = URL(fileURLWithPath: path)
++                NSWorkspace.shared.activateFileViewerSelecting([url])
++            } else {
++                self.flash(resp["error"].string ?? "导出失败")
++            }
++        }
++    }
++
++    func runCopyLastAssistant() {
++        // Walk transcript from end for last assistant text blocks.
++        for item in transcript.reversed() where item.role == "assistant" {
++            let text = item.blocks.compactMap { block -> String? in
++                if case .text(let t) = block { return t }
++                return nil
++            }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
++            if !text.isEmpty {
++                let pb = NSPasteboard.general
++                pb.clearContents()
++                pb.setString(text, forType: .string)
++                flash("已复制最后一条助手回复（\(text.count) 字符）")
++                return
++            }
++        }
++        flash("没有可复制的助手回复")
++    }
++
++    func runSetModel(providerSlashId: String) {
++        let parts = providerSlashId.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
++        guard parts.count == 2 else {
++            flash("模型格式应为 provider/modelId，例如 openai/gpt-4o")
++            return
++        }
++        let provider = String(parts[0])
++        let modelId = String(parts[1])
++        guard !provider.isEmpty, !modelId.isEmpty else {
++            flash("模型格式应为 provider/modelId，例如 openai/gpt-4o")
++            return
++        }
++        if let known = availableModels.first(where: { $0.provider == provider && $0.modelId == modelId }) {
++            setModel(known)
++        } else {
++            setModel(ModelInfo(provider: provider, modelId: modelId, name: modelId))
++        }
++    }
++}
+-----
+--- Sources.bak-20260723-104538/PipiUI/AppStore.swift	2026-07-23 10:45:38
++++ Sources/PipiUI/AppStore.swift	2026-07-23 11:53:35
+@@ -18,6 +18,8 @@
+     @Published var projects: [URL] = []
+     @Published var selectedProjectPath: String?
+     @Published var sessionsByProject: [String: [SessionMeta]] = [:]
++    /// 各项目下已归档会话（扫盘得到，path 在 archivedSessionPaths 且文件仍存在）
++    @Published var archivedByProject: [String: [SessionMeta]] = [:]
+     @Published var openSessions: [String: ChatSession] = [:]
+     @Published var selectedSessionKey: String? {
+         didSet {
+@@ -68,12 +70,12 @@
+ 
+         plugin = PiPlugin.installAll()
+         bridge = BridgeServer { request, respond in
+-            // Handler 已在主线程；按 sessionKey 路由到对应会话的 WebView。
+-            // 未知 key 时兜底到当前选中会话，方便外部 pi 进程驱动可见的面板。
++            // Handler 已在主线程；按 sessionKey 精确路由到对应会话。
++            // 未知/已关闭 key 必须拒绝，避免子 agent 孤儿请求落到「当前选中」会话上乱 eval。
+             let store = AppStore.shared
+             let key = request["sessionKey"].string ?? ""
+-            guard let session = store.openSessions[key] ?? store.currentSession else {
+-                respond(["ok": false, "error": "no open session to route to"])
++            guard !key.isEmpty, let session = store.openSessions[key] else {
++                respond(["ok": false, "error": "unknown session key"])
+                 return
+             }
+             let action = request["action"].string ?? ""
+@@ -122,8 +124,26 @@
+             blockedReason: conflicts.isEmpty ? nil
+                 : "扩展撞名，pi 未启动。修复上方冲突后会自动重启会话。"
+         )
+-        session.onSessionMetaChanged = { [weak self] in self?.refreshSessions(for: project) }
++        session.onSessionMetaChanged = { [weak self, weak session] in
++            guard let self, let session else { return }
++            // 乐观插入：sessionFile 一到立刻进侧边栏磁盘列表，避免 refresh 异步扫描空窗导致选中行消失
++            if let file = session.sessionFile {
++                self.upsertLiveSessionMeta(
++                    project: project,
++                    file: file,
++                    name: session.sessionName ?? "新会话"
++                )
++            }
++            self.refreshSessions(for: project)
++        }
+         session.isSelectedCheck = { [weak self] in self?.selectedSessionKey == key }
++        session.onRequestNewSession = { [weak self] in
++            guard let self else { return }
++            self.newSession(project: project)
++        }
++        session.onRequestClose = { [weak self] in
++            self?.closeSession(key: key)
++        }
+         return session
+     }
+ 
+@@ -159,6 +179,13 @@
+     }
+ 
+     func removeProject(_ url: URL) {
++        // Close every live session under this project so pi/subagent processes stop.
++        let keys = openSessions.compactMap { key, session -> String? in
++            session.projectURL.path == url.path ? key : nil
++        }
++        for key in keys {
++            closeSession(key: key)
++        }
+         projects.removeAll { $0.path == url.path }
+         persistProjects()
+         if selectedProjectPath == url.path {
+@@ -187,18 +214,80 @@
+             let fm = FileManager.default
+             let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]))?
+                 .filter { $0.pathExtension == "jsonl" } ?? []
+-            var metas: [SessionMeta] = files.compactMap { url in
+-                guard !archived.contains(url.path) else { return nil }
++            var active: [SessionMeta] = []
++            var archivedMetas: [SessionMeta] = []
++            for url in files {
+                 let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
