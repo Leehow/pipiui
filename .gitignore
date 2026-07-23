@@ -1,0 +1,5 @@
+.build/
+.tmp/
+build/
+Sources.bak-20260723-104538/
+.DS_Store
