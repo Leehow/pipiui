@@ -9,3 +9,6 @@ Sources.bak-20260723-104538/
 
 # ZCode session/plan cache
 .zcode/
+
+# Local git worktrees
+.worktrees/
