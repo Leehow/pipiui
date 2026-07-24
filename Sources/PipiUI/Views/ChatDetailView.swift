@@ -22,7 +22,9 @@ private struct ChatDetailViewBody: View {
     @Environment(\.scenePhase) private var scenePhase
 
     /// Coalesce streaming scrollToBottom calls (~50ms) to avoid layout thrash.
-    /// Transient view state — reset on session.id change (no longer wiped via .id(session.id)).
+    /// Transient view state. App.swift still applies `.id(session.id)`, so a switch
+    /// tears this view down and these reset naturally; the `.onChange(of: session.id)`
+    /// below is the safety net for the reused-detail-view path.
     @State private var scrollCoalesceScheduled = false
     @State private var scrollNeedsRetry = false
     @State private var rightPanelWidthRatio: CGFloat?
@@ -90,7 +92,9 @@ private struct ChatDetailViewBody: View {
             gitBranches.bind(projectURL: session.projectURL)
         }
         .onChange(of: session.id) { _, _ in
-            // Detail view is reused across sessions (App no longer forces .id rebuild).
+            // Safety net for the reused-detail-view path. App.swift currently keeps
+            // `.id(session.id)`, so a switch tears this view down and this branch is
+            // effectively dead on switch — but it is kept correct in case .id is removed.
             gitBranches.bind(projectURL: session.projectURL)
             scrollCoalesceScheduled = false
             scrollNeedsRetry = false
@@ -238,13 +242,20 @@ private struct ChatDetailViewBody: View {
         let hidden = max(0, items.count - visibleCount)
         return ScrollViewReader { proxy in
             ScrollView {
-                // VStack (not LazyVStack): a bottom-anchored LazyVStack leaves the rows
-                // above the "bottom" anchor unrealized after `proxy.scrollTo("bottom")`,
-                // so the pane renders blank until a real scroll forces realization
-                // (ScrollDiagnostics logs this as `subviews=1 — BLANK signature`).
-                // `transcriptVisibleCount` already caps ForEach to suffix(~150), so the
-                // realized-row budget is bounded either way; the lazy stack bought nothing.
-                VStack(alignment: .leading, spacing: 14) {
+                // LazyVStack: only realizes the rows in the visible viewport (~10),
+                // not all of suffix(~150). This is what makes a long transcript cheap
+                // to re-layout on window resize — an eager VStack realized every row's
+                // body on every resize frame.
+                //
+                // The historical reason this was an eager VStack was that a bottom-
+                // anchored LazyVStack left rows above the "bottom" anchor unrealized
+                // after `proxy.scrollTo("bottom")`, rendering a blank pane until a real
+                // scroll forced realization (ScrollDiagnostics: subviews=1 — BLANK).
+                // That is now solved below with a `.task(id: session.id)` that uses
+                // `Task.sleep` to yield to the layout pass before scrolling, instead of
+                // the old wall-clock `DispatchQueue.main.asyncAfter` retries that raced
+                // the layout and lost.
+                LazyVStack(alignment: .leading, spacing: 14) {
                     if hidden > 0 {
                         Button("显示更早的 \(hidden) 条消息") {
                             session.transcriptVisibleCount += 200
@@ -322,17 +333,34 @@ private struct ChatDetailViewBody: View {
             }
             .animation(.easeInOut(duration: 0.2), value: session.isInitializing)
             .animation(.easeInOut(duration: 0.15), value: session.pinTranscriptToBottom)
-            .onAppear {
-                // Unconditional, unlike every other call site. A freshly built
-                // transcript (`.id(session.id)` gives each session its own) starts at
-                // `defaultScrollAnchor(.bottom)`, which a LazyVStack can only estimate
-                // while its rows are unrealized — the estimate lands the viewport past
-                // the real content and the user sees a blank pane until they scroll.
-                // Forcing an explicit scroll realizes the rows and settles the offset.
-                forceScrollToBottom(proxy)
+            .task(id: session.id) {
+                // A freshly built transcript (`.id(session.id)` gives each session its
+                // own) starts at `defaultScrollAnchor(.bottom)`, which a LazyVStack can
+                // only estimate while its rows are unrealized — the estimate lands the
+                // viewport past the real content and the user sees a blank pane.
+                //
+                // The old fix was `forceScrollToBottom` with wall-clock
+                // DispatchQueue.main.asyncAfter retries at 0/0.05/0.2s. Those raced the
+                // layout pass and reliably lost against LazyVStack realization timing
+                // (ScrollDiagnostics logs: subviews=1 — BLANK). `Task.sleep` actually
+                // yields the runloop to the layout pass between scrolls, so the second
+                // and third attempts land after LazyVStack has realized the visible rows
+                // and recomputed its content size.
+                //
+                // Unconditional on pin state: this is "land the freshly built view on
+                // its content", not "follow new content" — a session that the user had
+                // scrolled up in must still resolve its initial anchor.
+                applyScrollToBottom(proxy)
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                applyScrollToBottom(proxy)
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                applyScrollToBottom(proxy)
             }
             .onChange(of: session.id) { _, _ in
-                // After warm switch: one stick-to-bottom pass when this session still pins.
+                // After warm switch (no .id rebuild): one stick-to-bottom pass when this
+                // session still pins. With .id(session.id) active in App.swift this branch
+                // is effectively dead on switch (the view is torn down instead), but it is
+                // kept as a safety net for the reused-detail-view path.
                 scrollCoalesceScheduled = false
                 scrollNeedsRetry = false
                 if session.pinTranscriptToBottom {
@@ -400,18 +428,6 @@ private struct ChatDetailViewBody: View {
         // 在途 async 到达时用户可能已上翻 unpin，必须再检查
         guard session.pinTranscriptToBottom else { return }
         applyScrollToBottom(proxy)
-    }
-
-    /// Scrolls regardless of pin state, on a schedule that outlives one layout pass.
-    /// Used only when the transcript first appears, where "don't move the view" would
-    /// mean "leave the user staring at an unrealized region".
-    private func forceScrollToBottom(_ proxy: ScrollViewProxy) {
-        applyScrollToBottom(proxy)
-        for delay in [0.05, 0.2] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                applyScrollToBottom(proxy)
-            }
-        }
     }
 
     private func applyScrollToBottom(_ proxy: ScrollViewProxy) {
