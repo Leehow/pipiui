@@ -81,4 +81,46 @@ final class TaskPinLogicTests: XCTestCase {
         let out = TaskPinLogic.stickyDisplayText(of: item, maxChars: 40)
         XCTAssertEqual(out.count, 40)
     }
+
+    func testSectionStickyPicksClosestAboveNotLatest() {
+        // Both tasks above viewport; closer one (higher maxY) wins — even if not latest.
+        let id = TaskPinLogic.sectionStickyId(
+            above: [("old", -200), ("mid", -20)],
+            anyPinnableVisible: false,
+            truncatedNewestFirst: [],
+            fallbackLatestId: "newest"
+        )
+        XCTAssertEqual(id, "mid")
+    }
+
+    func testSectionStickyHidesWhenPinnableVisible() {
+        let id = TaskPinLogic.sectionStickyId(
+            above: [("old", -40)],
+            anyPinnableVisible: true,
+            truncatedNewestFirst: [],
+            fallbackLatestId: "newest"
+        )
+        XCTAssertNil(id)
+    }
+
+    func testSectionStickyFallbackAndTruncated() {
+        XCTAssertEqual(
+            TaskPinLogic.sectionStickyId(
+                above: [],
+                anyPinnableVisible: false,
+                truncatedNewestFirst: ["t2", "t1"],
+                fallbackLatestId: "latest"
+            ),
+            "t2"
+        )
+        XCTAssertEqual(
+            TaskPinLogic.sectionStickyId(
+                above: [],
+                anyPinnableVisible: false,
+                truncatedNewestFirst: [],
+                fallbackLatestId: "latest"
+            ),
+            "latest"
+        )
+    }
 }
