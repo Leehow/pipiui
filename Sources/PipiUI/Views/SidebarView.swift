@@ -7,21 +7,6 @@ struct SidebarView: View {
     /// Per-project expand state for the archived section; missing key = collapsed.
     @State private var archivedExpandedByProject: [String: Bool] = [:]
 
-    /// List 在 tag 短暂缺失时会把 selection 清成 nil；open 中的会话拒绝被这样清掉。
-    private var selectionBinding: Binding<String?> {
-        Binding(
-            get: { store.selectedSessionKey },
-            set: { newValue in
-                if newValue == nil,
-                   let old = store.selectedSessionKey,
-                   store.openSessions[old] != nil {
-                    return
-                }
-                store.selectedSessionKey = newValue
-            }
-        )
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             BrandMark(size: .sidebar)
@@ -29,7 +14,11 @@ struct SidebarView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 12)
                 .padding(.bottom, 8)
-            List(selection: selectionBinding) {
+            // 普通 List（无 selection）：选中态由 store.selectedSessionKey 驱动，
+            // 背景由 SessionRowContainer 的 listRowBackground 单层绘制。
+            // 不用 List(selection:) 是为了避开 .sidebar 的系统选中 chrome——
+            // 它会在我们的 listRowBackground 之外再叠一层全宽底，形成“两层背景”。
+            List {
                 projectsSection
                 if let project = store.selectedProject {
                     sessionsSection(project: project)
@@ -242,8 +231,7 @@ struct SidebarView: View {
         }()
 
         // 主区域点选 + 尾部操作按钮，避免整行单一 Button 吞掉子按钮点击
-        // Selection fill lives in listRowBackground so it replaces system sidebar chrome
-        // (Color.clear does not). Hover fill stays inside SessionRowContainer only.
+        // hover/selected 背景统一由 SessionRowContainer 内的 listRowBackground 单层绘制。
         SessionRowContainer(
             isSelected: store.selectedSessionKey == tag,
             onSelect: onSelect,
@@ -283,12 +271,6 @@ struct SidebarView: View {
                 )
             }
         }
-        .tag(tag)
-        .listRowBackground(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(store.selectedSessionKey == tag ? Color.accentColor.opacity(0.12) : Color.clear)
-                .padding(.horizontal, 4)
-        )
         .contextMenu {
             Button("修改标题…") {
                 beginRename(
@@ -354,7 +336,7 @@ private struct RenameTarget: Identifiable {
 }
 
 /// 行容器：左侧点选主区域 + hover 时右侧改名/归档，避免嵌套 Button 抢事件。
-/// Hover fill only; selected fill is drawn via listRowBackground on the List row.
+/// Hover 与 selected 共享同一层 `.listRowBackground`（全宽、圆角），避免两层背景。
 private struct SessionRowContainer<Content: View>: View {
     let isSelected: Bool
     let onSelect: () -> Void
@@ -364,27 +346,16 @@ private struct SessionRowContainer<Content: View>: View {
 
     @State private var isHovered = false
 
-    /// Hover-only; selection highlight is owned by the row's listRowBackground.
-    private var rowFill: Color {
-        if isHovered && !isSelected {
-            return Color.primary.opacity(0.06)
-        }
-        return .clear
-    }
-
     var body: some View {
         // Non-Button hit target + overlay action Buttons (no nested Button).
         // On hover, content hides its trailing subtitle so actions own that corner.
         content(isHovered)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-            .onTapGesture(perform: onSelect)
+            // padding 先于 contentShape：命中范围扩展到含 padding 的整圈
             .padding(.vertical, 2)
             .padding(.horizontal, 4)
-            .background {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(rowFill)
-            }
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onSelect)
             .overlay(alignment: .trailing) {
                 HStack(spacing: 4) {
                     Button(action: onRename) {
@@ -415,6 +386,13 @@ private struct SessionRowContainer<Content: View>: View {
             .onHover { isHovered = $0 }
             .animation(.easeInOut(duration: 0.12), value: isHovered)
             .animation(.easeInOut(duration: 0.12), value: isSelected)
+            // 单层全宽背景：hover 与 selected 同源同几何，避免“hover 特别细 / 选中两层”。
+            .listRowBackground(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isSelected ? Color.accentColor.opacity(0.12)
+                                     : (isHovered ? Color.primary.opacity(0.06) : Color.clear))
+                    .padding(.horizontal, 4)
+            )
     }
 }
 
