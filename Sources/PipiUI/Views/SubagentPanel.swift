@@ -182,6 +182,9 @@ private struct AgentDetailView: View {
                     Text(String(format: "$%.4f", agent.cost)).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
                     Text(durationText).font(.caption2).foregroundStyle(.tertiary)
                 }
+                if agent.worktreeBranch != nil || agent.worktreePath != nil || agent.worktreeError != nil {
+                    worktreeMeta
+                }
             }
             .padding(10)
             Divider()
@@ -304,6 +307,50 @@ private struct AgentDetailView: View {
         let end = agent.ended ?? Date()
         let seconds = Int(end.timeIntervalSince(agent.started))
         return seconds < 60 ? "\(seconds)s" : "\(seconds / 60)m\(seconds % 60)s"
+    }
+
+    @ViewBuilder
+    private var worktreeMeta: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if let branch = agent.worktreeBranch, !branch.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(branch)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            if let path = agent.worktreePath, !path.isEmpty {
+                Text(shortenPath(path))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(path)
+            }
+            if let err = agent.worktreeError, !err.isEmpty {
+                Text(err)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+            }
+        }
+    }
+
+    /// Prefer last two path components for display; full path remains selectable via help/selection.
+    private func shortenPath(_ path: String) -> String {
+        let ns = path as NSString
+        let last = ns.lastPathComponent
+        let parent = (ns.deletingLastPathComponent as NSString).lastPathComponent
+        if parent.isEmpty || parent == "/" { return last }
+        return "\(parent)/\(last)"
     }
 }
 

@@ -57,6 +57,7 @@ subagent({ tasks: [ {agent, task}, {agent, task}, ... ] })
 
 ## 任务书要求
 每个派工任务必须自包含（工人看不到你的上下文）：目标、现状/证据、允许与禁止改动的范围、验收标准、验证命令。宁可写长，不可含糊。
+- 工人默认在独立 git worktree（`.pi/worktrees/` + `pipiui/*` 分支）写代码；验收通过后再由你或用户 merge。**勿假设主工作区已改。**
 
 ## 异步派工（depth 0 默认 background）
 - 在 Boss（depth 0）下，`subagent` 的 single / parallel **默认 background=true**：工具立刻返回「已启动 + agentId」**不等于做完**。

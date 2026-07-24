@@ -378,4 +378,69 @@ final class GitRepoTests: XCTestCase {
         XCTAssertThrowsError(try GitRepo.checkout(branch: "-b", in: dir))
         XCTAssertThrowsError(try GitRepo.checkout(branch: "--force", in: dir))
     }
+
+    func testWorktreeAddCreatesIsolatedRepoPath() throws {
+        guard GitRepo.findGitExecutable() != nil else {
+            throw XCTSkip("git not available")
+        }
+
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(
+            "pipiui-git-wt-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        _ = try GitRepo.run(gitArgs: ["init", "-b", "main"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["config", "user.email", "pipiui-test@example.com"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["config", "user.name", "PipiUI Test"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["commit", "--allow-empty", "-m", "init"], in: dir)
+
+        let wtRoot = dir.appendingPathComponent(".pi/worktrees", isDirectory: true)
+        try fm.createDirectory(at: wtRoot, withIntermediateDirectories: true)
+        let wtPath = wtRoot.appendingPathComponent("agent-test1", isDirectory: true)
+        let branch = "pipiui/agent-test1"
+
+        try GitRepo.worktreeAdd(branch: branch, at: wtPath, in: dir)
+
+        let status = GitRepo.probe(workTree: wtPath)
+        XCTAssertTrue(status.isRepo)
+        XCTAssertEqual(status.currentBranch, branch)
+        XCTAssertFalse(status.isDetached)
+
+        // main worktree unchanged
+        let main = GitRepo.probe(workTree: dir)
+        XCTAssertEqual(main.currentBranch, "main")
+    }
+
+    func testWorktreeAddRejectsDangerousNames() throws {
+        guard GitRepo.findGitExecutable() != nil else {
+            throw XCTSkip("git not available")
+        }
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(
+            "pipiui-git-wt-bad-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        _ = try GitRepo.run(gitArgs: ["init", "-b", "main"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["config", "user.email", "pipiui-test@example.com"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["config", "user.name", "PipiUI Test"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["commit", "--allow-empty", "-m", "init"], in: dir)
+
+        let dest = dir.appendingPathComponent("wt-safe", isDirectory: true)
+        XCTAssertThrowsError(try GitRepo.worktreeAdd(branch: "", at: dest, in: dir))
+        XCTAssertThrowsError(try GitRepo.worktreeAdd(branch: "-b", at: dest, in: dir))
+        XCTAssertThrowsError(try GitRepo.worktreeAdd(branch: "--force", at: dest, in: dir))
+        XCTAssertThrowsError(
+            try GitRepo.worktreeAdd(
+                branch: "pipiui/ok",
+                at: URL(fileURLWithPath: "-evil"),
+                in: dir
+            )
+        )
+    }
 }

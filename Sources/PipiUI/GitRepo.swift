@@ -462,4 +462,28 @@ package enum GitRepo {
         }
         _ = try run(gitArgs: ["checkout", name], in: workTree)
     }
+
+    /// Create a new git worktree at `path` on a new local branch from HEAD.
+    /// Rejects empty names and names starting with `-` (path or branch).
+    /// Equivalent to: `git worktree add -b <branch> <path> HEAD`
+    package static func worktreeAdd(branch: String, at path: URL, in workTree: URL) throws {
+        let branchName = branch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !branchName.isEmpty else {
+            throw GitRepoError.commandFailed("分支名不能为空")
+        }
+        guard !branchName.hasPrefix("-") else {
+            throw GitRepoError.commandFailed("非法分支名")
+        }
+        let dest = path.path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !dest.isEmpty else {
+            throw GitRepoError.commandFailed("worktree 路径不能为空")
+        }
+        guard !dest.hasPrefix("-") else {
+            throw GitRepoError.commandFailed("非法 worktree 路径")
+        }
+        _ = try run(
+            gitArgs: ["worktree", "add", "-b", branchName, dest, "HEAD"],
+            in: workTree
+        )
+    }
 }

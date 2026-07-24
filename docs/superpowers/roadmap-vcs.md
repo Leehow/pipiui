@@ -56,13 +56,19 @@
 - [x] 单测更新：`swift test --filter GitRepoTests`
 - [x] 本文档 + 短 plan
 
-## L3 — Worktree（下一步）
+## L3 — Worktree（部分完成：subagent 自动隔离）
 
-- [ ] 设计：会话/任务是否绑定独立 worktree 路径
-- [ ] `git worktree add/list/remove` 封装（仍走 CLI）
-- [ ] UI：创建 / 切换 / 清理 worktree；与项目根关系清晰
-- [ ] Agent：snapshot 与 tools 的 cwd 跟随 worktree
-- [ ] 单测：路径安全、拒绝危险 ref
+- [x] 设计（首版）：**按 subagent** 自动附着独立 worktree，不按会话绑定
+  - 路径：`<toplevel>/.pi/worktrees/<safeId>`
+  - 分支：`pipiui/<safeId>`（冲突时后缀）
+  - 关闭：`PIPIUI_WORKTREE=0` 或工具显式 `cwd`
+  - **不**自动 remove / commit / merge
+- [x] TS：`resolveSubagentWorktree` + `runSingleAgent` 接线（spawn cwd / env / start+end report）
+- [x] Swift bridge：`SubagentInfo.worktreePath|Branch|Error`；面板显示 branch + 缩短 path + 橙色 error
+- [x] `GitRepo.worktreeAdd(branch:at:in:)` + 单测（temp init + worktree + 危险名拒绝）
+- [ ] UI：手动创建 / 切换 / 清理 worktree（与项目根关系）
+- [ ] Agent snapshot / `git_*` tools 的 cwd 跟随选中 worktree（主会话仍是项目根）
+- [ ] worktree list/remove 完整封装与清理策略
 
 ## L4 — GitHub 轻量
 
@@ -82,20 +88,25 @@
 
 ---
 
-## 关键文件（L1+L2）
+## 关键文件（L1–L3）
 
 | 文件 | 层级 |
 |------|------|
-| `Sources/PipiUI/GitRepo.swift` | L1+L2 |
+| `Sources/PipiUI/GitRepo.swift` | L1+L2+L3 worktreeAdd |
 | `Sources/PipiUI/GitBranchStore.swift` | L1 |
 | `Sources/PipiUI/Views/GitBranchMenu.swift` | L1+L2 dirty UI |
 | `Sources/PipiUI/GitExtension.swift` | L2 |
 | `Sources/PipiUI/PiPlugin.swift` | L2 接线 |
 | `Sources/PipiUI/ChatSession.swift` | L2 接线 |
 | `Sources/PipiUI/AppStore.swift` | L2 接线 |
-| `Tests/PipiUITests/GitRepoTests.swift` | L1+L2 |
+| `Sources/PipiUI/PiExt/subagent/index.ts` | L3 resolve + runSingleAgent |
+| `Sources/PipiUI/SubagentStore.swift` | L3 bridge fields |
+| `Sources/PipiUI/Views/SubagentPanel.swift` | L3 worktree UI |
+| `Sources/PipiUI/BossPrompt.swift` | L3 工人 worktree 提示 |
+| `Tests/PipiUITests/GitRepoTests.swift` | L1–L3 |
 | `docs/superpowers/roadmap-vcs.md` | 本任务本 |
 | `docs/superpowers/plans/2026-07-23-git-first-l2.md` | L2 短 plan |
+| `docs/superpowers/plans/2026-07-23-git-worktree-subagents.md` | L3 短 plan |
 
 ## 验证口令
 

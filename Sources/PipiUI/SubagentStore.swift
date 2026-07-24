@@ -34,6 +34,11 @@ struct SubagentInfo: Identifiable, Equatable, Codable {
     var turns = 0
     var started = Date()
     var ended: Date?
+    /// Isolated git worktree path when auto-created for this agent.
+    var worktreePath: String? = nil
+    var worktreeBranch: String? = nil
+    /// Set when worktree was requested but creation failed (spawn fell back).
+    var worktreeError: String? = nil
 }
 
 /// 每个会话一棵 subagent 树；agent_event 桥接事件在主线程进来。
@@ -103,7 +108,7 @@ final class SubagentStore: ObservableObject {
         switch e["kind"].string ?? "" {
         case "start":
             guard !agents.contains(where: { $0.id == id }) else { return }
-            agents.append(SubagentInfo(
+            var info = SubagentInfo(
                 id: id,
                 parentId: e["parentId"].string,
                 toolCallId: e["toolCallId"].string,
@@ -111,7 +116,11 @@ final class SubagentStore: ObservableObject {
                 task: e["task"].string ?? "",
                 depth: max(1, e["depth"].int ?? 1),
                 model: e["model"].string
-            ))
+            )
+            info.worktreePath = e["worktreePath"].string
+            info.worktreeBranch = e["worktreeBranch"].string
+            info.worktreeError = e["worktreeError"].string
+            agents.append(info)
             if selectedId == nil { selectedId = id }
         case "update":
             guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
@@ -146,6 +155,9 @@ final class SubagentStore: ObservableObject {
             agents[i].cost = e["cost"].double ?? agents[i].cost
             agents[i].turns = e["turns"].int ?? agents[i].turns
             agents[i].ended = Date()
+            if let path = e["worktreePath"].string { agents[i].worktreePath = path }
+            if let branch = e["worktreeBranch"].string { agents[i].worktreeBranch = branch }
+            if let err = e["worktreeError"].string { agents[i].worktreeError = err }
         default:
             break
         }
