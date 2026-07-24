@@ -23,13 +23,15 @@ enum TaskPinLogic {
 
     static func isPinnable(_ item: ChatItem) -> Bool {
         guard item.role == "user" else { return false }
-        let display = displayText(of: item).trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = displayText(of: item)
+        let display = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasImage = hasImageAttachment(item)
         if display.hasPrefix("[subagent-done]") { return false }
         if display.contains("PipiUI internal") { return false }
         if display.isEmpty && !hasImage { return false }
 
         if hasImage { return true }
+        if raw.contains(where: \.isNewline) { return true }
 
         let normalized = display.lowercased()
         if ackBlacklist.contains(normalized) { return false }
@@ -37,7 +39,6 @@ enum TaskPinLogic {
         // ≤2 grapheme clusters, no attachment → ack-like
         if display.count <= 2 { return false }
 
-        if display.contains(where: \.isNewline) { return true }
         return true
     }
 

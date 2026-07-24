@@ -27,6 +27,13 @@ final class TaskPinLogicTests: XCTestCase {
 
     func testNewlineOrImageIsPinnable() {
         XCTAssertTrue(TaskPinLogic.isPinnable(user("看\n这个")))
+        // Newline bypasses blacklist and ≤2-char floor (check raw text before trim).
+        XCTAssertTrue(TaskPinLogic.isPinnable(user("x\n")))
+        XCTAssertTrue(TaskPinLogic.isPinnable(user("ok\n")))
+        XCTAssertTrue(TaskPinLogic.isPinnable(user("继续\n")))
+        XCTAssertFalse(TaskPinLogic.isPinnable(user("x")))
+        XCTAssertFalse(TaskPinLogic.isPinnable(user("ok")))
+        XCTAssertFalse(TaskPinLogic.isPinnable(user("继续")))
         let img = ImageBlock(id: "i1", data: Data([0]), mimeType: "image/png", path: nil)
         XCTAssertTrue(TaskPinLogic.isPinnable(user("", images: [img])))
         XCTAssertTrue(TaskPinLogic.isPinnable(user("a", images: [img]))) // short text + image
