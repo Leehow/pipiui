@@ -44,6 +44,8 @@ private struct ChatDetailViewBody: View {
     /// Last settled chat-column width. Width changes (window resize / right panel)
     /// reflow LazyVStack row heights; we re-pin after the width stops moving.
     @State private var settledChatColumnWidth: CGFloat?
+    /// Width seen during `NSWindow.inLiveResize` — apply + re-pin only when drag ends.
+    @State private var pendingChatColumnWidth: CGFloat?
     @State private var chatColumnWidthSettleWork: DispatchWorkItem?
 
     private let minimumChatWidth: CGFloat = 360
@@ -110,6 +112,7 @@ private struct ChatDetailViewBody: View {
             stickySectionId = nil
             stickyTaskBarHeight = 0
             settledChatColumnWidth = nil
+            pendingChatColumnWidth = nil
             chatColumnWidthSettleWork?.cancel()
             chatColumnWidthSettleWork = nil
             // draft / rightPanel / pinTranscriptToBottom / transcriptVisibleCount live on ChatSession.
@@ -457,7 +460,14 @@ private struct ChatDetailViewBody: View {
                 scheduleChatColumnWidthSettleRepin(proxy, width: width)
             }
             .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEndLiveResizeNotification)) { _ in
-                // Live resize ended: LazyVStack has finished most width reflow — reassert bottom.
+                // Live resize ended: one re-pin only (never scroll while the drag is live —
+                // that caused the transcript to tremble).
+                chatColumnWidthSettleWork?.cancel()
+                chatColumnWidthSettleWork = nil
+                if let pending = pendingChatColumnWidth {
+                    settledChatColumnWidth = pending
+                    pendingChatColumnWidth = nil
+                }
                 scrollToBottom(proxy, retry: true)
             }
             .onChange(of: scenePhase) { _, phase in
@@ -471,15 +481,28 @@ private struct ChatDetailViewBody: View {
         }
     }
 
-    /// Debounce chat-column width changes, then re-pin. Skips the first measurement and
-    /// sub-point noise so open/animation frames do not spam `scrollTo`.
+    /// Debounce chat-column width changes, then re-pin — but **never** while the window
+    /// is in live resize. Mid-drag `scrollTo("bottom")` races LazyVStack reflow and
+    /// makes the transcript tremble; window drags only re-pin on `didEndLiveResize`.
+    /// Right-panel toggles (not live resize) still settle-then-repin here.
     private func scheduleChatColumnWidthSettleRepin(_ proxy: ScrollViewProxy, width: CGFloat) {
         guard width.isFinite, width > 1 else { return }
         if let settled = settledChatColumnWidth, abs(settled - width) < 0.5 {
             return
         }
+        if NSApp.keyWindow?.inLiveResize == true {
+            pendingChatColumnWidth = width
+            chatColumnWidthSettleWork?.cancel()
+            chatColumnWidthSettleWork = nil
+            return
+        }
         chatColumnWidthSettleWork?.cancel()
         let work = DispatchWorkItem {
+            // Drag may have started after this work was scheduled.
+            if NSApp.keyWindow?.inLiveResize == true {
+                pendingChatColumnWidth = width
+                return
+            }
             let previous = settledChatColumnWidth
             settledChatColumnWidth = width
             // First layout pass only records width — do not yank an initial scroll.
