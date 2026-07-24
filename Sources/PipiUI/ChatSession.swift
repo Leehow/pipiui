@@ -212,6 +212,8 @@ final class ChatSession: ObservableObject, Identifiable {
         self.id = id
         self.projectURL = projectURL
         self.resumedFromDisk = sessionPath != nil
+        // Worktree auto-merge target (successful subagents → merge into session project root).
+        subagents.bindMainProject(projectURL)
 
         // 已知会必然崩的启动条件（例如扩展撞名）就别 spawn 了：
         // 让用户只看到那条能一键修的提示，而不是再叠一条 pi 崩溃日志

@@ -56,26 +56,16 @@
 - [x] 单测更新：`swift test --filter GitRepoTests`
 - [x] 本文档 + 短 plan
 
-## L3 — Worktree（自动隔离 + 审核后 merge/discard 闭环）
+## L3 — Worktree（完成：隔离 + 成功自动 merge + UI 兜底）
 
-- [x] 设计（首版）：**按 subagent** 自动附着独立 worktree，不按会话绑定
-  - 路径：`<toplevel>/.pi/worktrees/<safeId>`
-  - 分支：`pipiui/<safeId>`（冲突时后缀）
-  - 关闭：`PIPIUI_WORKTREE=0` 或工具显式 `cwd`
-  - **不**自动 remove / commit / merge（合并须 GUI 确认）；**永不** push remote
-- [x] TS：`resolveSubagentWorktree` + `runSingleAgent` 接线（spawn cwd / env / start+end report）
-- [x] Swift bridge：`SubagentInfo.worktreePath|Branch|Error`；面板显示 branch + 缩短 path + 橙色 error
-- [x] `GitRepo.worktreeAdd(branch:at:in:)` + 单测（temp init + worktree + 危险名拒绝）
-- [x] **WorktreeLifecycle 闭环**（2026-07-24）
-  - 状态机：`none → active → pendingReview → merged|discarded`
-  - `GitRepo.mergeBranch` / `worktreeRemove` / `worktreeList` / `diffStat(from:to:)`
-  - `SubagentStore.mergeWorktree` / `discardWorktree`（主 worktree 执行；冲突不删树）
-  - UI：Subagents 详情「合并到主分支」「丢弃 worktree」+ lifecycle 徽章 + 可选 diff --stat
-  - TS 续作：path 复用 + `worktree list` 按 branch `pipiui/<id>` 复用
-  - BossPrompt 四步工作流；plan：`docs/superpowers/plans/2026-07-24-worktree-lifecycle.md`
-- [ ] UI：手动创建 / 切换任意 worktree（与项目根关系；非 agent 路径）
-- [ ] Agent snapshot / `git_*` tools 的 cwd 跟随选中 worktree（主会话仍是项目根）
-
+- [x] **产品默认（auto-merge on ok）**：agent **成功结束** → 自动 merge 进主项目 + remove worktree
+- [x] failed/aborted/interrupted → **保留** `pendingReview` 便于续作（不自动丢弃）
+- [x] UI「合并 / 丢弃」作手动兜底；**永不** push remote
+- [x] `SubagentStore.bindMainProject` + `ChatSession.init` 接线
+- [x] `handle` end ok → `DispatchQueue.main.async` `mergeWorktree`
+- [x] WorktreeLifecycle + GitRepo merge/remove + panel UI
+- [ ] UI：手动创建 / 切换任意 worktree
+- [ ] Agent snapshot / `git_*` cwd 跟随选中 worktree
 
 ## L4 — GitHub 轻量
 
@@ -104,12 +94,12 @@
 | `Sources/PipiUI/Views/GitBranchMenu.swift` | L1+L2 dirty UI |
 | `Sources/PipiUI/GitExtension.swift` | L2 |
 | `Sources/PipiUI/PiPlugin.swift` | L2 接线 |
-| `Sources/PipiUI/ChatSession.swift` | L2 接线 |
+| `Sources/PipiUI/ChatSession.swift` | L2 接线 + L3 bindMainProject |
 | `Sources/PipiUI/AppStore.swift` | L2 接线 |
 | `Sources/PipiUI/PiExt/subagent/index.ts` | L3 resolve + branch 复用 |
-| `Sources/PipiUI/SubagentStore.swift` | L3 lifecycle + merge/discard |
-| `Sources/PipiUI/Views/SubagentPanel.swift` | L3 review UI |
-| `Sources/PipiUI/BossPrompt.swift` | L3 worktree 四步闭环 |
+| `Sources/PipiUI/SubagentStore.swift` | L3 lifecycle + auto-merge on ok |
+| `Sources/PipiUI/Views/SubagentPanel.swift` | L3 review UI（手动兜底） |
+| `Sources/PipiUI/BossPrompt.swift` | L3 auto-merge / 续作 |
 | `Tests/PipiUITests/GitRepoTests.swift` | L1–L3 |
 | `docs/superpowers/roadmap-vcs.md` | 本任务本 |
 | `docs/superpowers/plans/2026-07-23-git-first-l2.md` | L2 短 plan |

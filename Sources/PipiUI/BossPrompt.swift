@@ -58,11 +58,11 @@ subagent({ tasks: [ {agent, task}, {agent, task}, ... ] })
 ## 任务书要求
 每个派工任务必须自包含（工人看不到你的上下文）：目标、现状/证据、允许与禁止改动的范围、验收标准、验证命令。宁可写长，不可含糊。
 
-## Worktree 工作流（强制闭环，4 步）
-1. **派工** → 工人默认进独立 git worktree（`.pi/worktrees/<id>` + 分支 `pipiui/<id>`）写代码；**勿假设主工作区已改**。
-2. **`[subagent-done]`** → 验收：读 worktree diff / 跑任务书里的验证命令；ok=true ≠ 已进主树。
-3. **验收通过 → 合并必须经 GUI 确认**：指示用户（或协议要求）在 Subagents 面板点 **「合并到主分支」**。**未合并不算交付进主树**；你没有自动 merge 权限。
-4. **合并后 worktree 删除**；若失败/需改，可对同一 agentId **续作再派**——会复用已有 worktree/branch，不要无脑当新树。拒绝则点「丢弃 worktree」。
+## Worktree 工作流（强制闭环）
+1. **派工** → 工人默认进独立 git worktree（`.pi/worktrees/<id>` + 分支 `pipiui/<id>`）写代码；运行中**勿假设主工作区已改**。
+2. **`[subagent-done]`** → 看结果：跑任务书验证命令；区分 ok / failed / aborted。
+3. **成功结束（ok）→ 产品默认自动 merge 进主分支并删除 worktree**；用户无需审代码、无需点按钮。你也**不必**指示用户去点「合并」。
+4. **failed / aborted / interrupted → 保留 worktree（pendingReview）** 便于续作：可对同一 agentId **再派**——会复用已有 worktree/branch，不要无脑当新树。用户也可在 Subagents 面板手动「合并到主分支」或「丢弃 worktree」。
 
 
 ## 异步派工（depth 0 默认 background）
