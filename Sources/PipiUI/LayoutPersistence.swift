@@ -7,6 +7,10 @@ enum LayoutPersistence {
         static let windowHeight = "pipiui.windowHeight"
         static let sidebarWidthRatio = "pipiui.sidebarWidthRatio"
         static let rightPanelWidthRatio = "pipiui.rightPanelWidthRatio"
+
+        static func grokQuotaSelectedPeriod(accountId: String) -> String {
+            "pipiui.grokQuotaSelectedPeriod.\(accountId)"
+        }
     }
 
     static let minimumWindowContentSize = NSSize(width: 800, height: 560)
@@ -51,6 +55,16 @@ enum LayoutPersistence {
     @discardableResult
     static func saveRightPanelWidthRatio(_ ratio: CGFloat, defaults: UserDefaults = .standard) -> CGFloat? {
         saveRatio(ratio, forKey: Key.rightPanelWidthRatio, in: rightPanelRatioRange, defaults: defaults)
+    }
+
+    static func grokQuotaSelectedPeriod(accountId: String, defaults: UserDefaults = .standard) -> Int? {
+        guard defaults.object(forKey: Key.grokQuotaSelectedPeriod(accountId: accountId)) != nil else { return nil }
+        let v = defaults.integer(forKey: Key.grokQuotaSelectedPeriod(accountId: accountId))
+        return v >= 0 ? v : nil
+    }
+
+    static func setGrokQuotaSelectedPeriod(_ typeRaw: Int, accountId: String, defaults: UserDefaults = .standard) {
+        defaults.set(typeRaw, forKey: Key.grokQuotaSelectedPeriod(accountId: accountId))
     }
 
     static func clampedRestoredWindowContentSize(_ savedSize: NSSize, for window: NSWindow) -> NSSize {
