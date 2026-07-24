@@ -502,15 +502,63 @@ function gitSpawnSync(
 }
 
 /**
+ * Parse `git worktree list --porcelain` into { path, branch? } rows.
+ * branch is short name (refs/heads/ stripped); detached → branch undefined.
+ */
+function parseWorktreeListPorcelain(output: string): Array<{ path: string; branch?: string }> {
+	const results: Array<{ path: string; branch?: string }> = [];
+	let currentPath: string | undefined;
+	let currentBranch: string | undefined;
+
+	const flush = () => {
+		if (!currentPath) {
+			currentPath = undefined;
+			currentBranch = undefined;
+			return;
+		}
+		results.push({ path: currentPath, branch: currentBranch });
+		currentPath = undefined;
+		currentBranch = undefined;
+	};
+
+	for (const raw of output.split(/\r?\n/)) {
+		const line = raw;
+		if (line.startsWith("worktree ")) {
+			flush();
+			currentPath = line.slice("worktree ".length);
+		} else if (line.startsWith("branch ")) {
+			let ref = line.slice("branch ".length).trim();
+			if (ref.startsWith("refs/heads/")) ref = ref.slice("refs/heads/".length);
+			currentBranch = ref || undefined;
+		} else if (line === "detached") {
+			currentBranch = undefined;
+		} else if (line.trim() === "") {
+			flush();
+		}
+	}
+	flush();
+	return results;
+}
+
+/**
  * Default: create an isolated git worktree under <toplevel>/.pi/worktrees/<safeId>
  * on branch pipiui/<safeId> so subagents write without polluting the main dirty tree.
+ *
+ * Resume / continue same agentId:
+ * - Reuses preferred path when it is already a valid git worktree.
+ * - If branch `pipiui/<safeId>` is already checked out in *any* registered worktree
+ *   (even when preferred path differs), reuses that path so续作 lands on the same tree.
+ * - Process is still a fresh spawn; only cwd/branch continuity is preserved (not LLM context).
  *
  * Off when:
  * - PIPIUI_WORKTREE=0
  * - caller passed explicit cwd (respect; do not wrap)
  * - effective cwd is not inside a git work tree
  *
- * Never auto remove / commit / merge. On failure, fall back to original cwd + worktreeError.
+ * TS never auto remove / commit / merge (Swift SubagentStore owns lifecycle).
+ * On failure creating wt, fall back to original cwd + worktreeError.
+ * Never auto-merge in TS or Swift end handlers — GUI confirms merge/discard.
+ * failed/aborted/interrupted → keep pendingReview for续作; GUI merge/discard remains as fallback.
  */
 function resolveSubagentWorktree(opts: {
 	agentId: string;
@@ -553,7 +601,7 @@ function resolveSubagentWorktree(opts: {
 	const preferredPath = path.resolve(worktreesRoot, id);
 	const preferredBranch = `pipiui/${id}`;
 
-	// Reuse existing directory if it is already a valid worktree
+	// 1) Reuse existing directory if it is already a valid worktree
 	if (fs.existsSync(preferredPath)) {
 		const reuse = gitSpawnSync(["-C", preferredPath, "rev-parse", "--is-inside-work-tree"]);
 		if (reuse.ok && reuse.stdout === "true") {
@@ -568,6 +616,44 @@ function resolveSubagentWorktree(opts: {
 		}
 	}
 
+	// 2) Resume by branch: if pipiui/<id> is already attached somewhere in worktree list, reuse that path
+	//    (even when preferred path differs — e.g. previous alt path/suffix).
+	const listOut = gitSpawnSync(["-C", toplevel, "worktree", "list", "--porcelain"], toplevel);
+	if (listOut.ok && listOut.stdout) {
+		const rows = parseWorktreeListPorcelain(listOut.stdout);
+		const hit = rows.find((r) => r.branch === preferredBranch && r.path);
+		if (hit) {
+			const abs = path.resolve(hit.path);
+			const still = gitSpawnSync(["-C", abs, "rev-parse", "--is-inside-work-tree"]);
+			if (still.ok && still.stdout === "true") {
+				return {
+					cwd: abs,
+					worktreePath: abs,
+					worktreeBranch: preferredBranch,
+				};
+			}
+		}
+		// Also match any pipiui/<id>-* suffix branch already checked out (prior collision rename)
+		const prefix = `pipiui/${id}`;
+		const prefixed = rows.find(
+			(r) =>
+				r.branch &&
+				(r.branch === prefix || r.branch.startsWith(`${prefix}-`)) &&
+				r.path,
+		);
+		if (prefixed && prefixed.branch) {
+			const abs = path.resolve(prefixed.path);
+			const still = gitSpawnSync(["-C", abs, "rev-parse", "--is-inside-work-tree"]);
+			if (still.ok && still.stdout === "true") {
+				return {
+					cwd: abs,
+					worktreePath: abs,
+					worktreeBranch: prefixed.branch,
+				};
+			}
+		}
+	}
+
 	const tryAdd = (absPath: string, branch: string): { ok: boolean; error: string } => {
 		const r = gitSpawnSync(
 			["-C", toplevel, "worktree", "add", "-b", branch, absPath, "HEAD"],
@@ -577,6 +663,7 @@ function resolveSubagentWorktree(opts: {
 		return { ok: false, error: r.stderr || r.stdout || "git worktree add failed" };
 	};
 
+	// 3) Create new worktree on preferred path/branch
 	let add = tryAdd(preferredPath, preferredBranch);
 	if (add.ok) {
 		return {
@@ -1143,7 +1230,7 @@ export default function (pi: ExtensionAPI) {
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
-			"By default each agent writes in an isolated git worktree under .pi/worktrees/ on a pipiui/* branch; pass explicit cwd or set PIPIUI_WORKTREE=0 to disable. Worktrees are never auto-merged.",
+			"By default each agent writes in an isolated git worktree under .pi/worktrees/ on a pipiui/* branch; pass explicit cwd or set PIPIUI_WORKTREE=0 to disable. Worktrees are never auto-merged; after review use the Subagents panel to merge or discard.",
 			"Track jobs with subagent_status(agentId?). Never re-spawn a finished task without reading its result via [subagent-done] or subagent_status.",
 			"Do not busy-loop poll; one status check per decision is correct.",
 			"chain and nested (depth>0) are always synchronous. Set background:false to await a single/parallel result.",

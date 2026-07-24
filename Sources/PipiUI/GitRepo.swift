@@ -486,4 +486,142 @@ package enum GitRepo {
             in: workTree
         )
     }
+
+    /// Reject empty names and argv-injection-style names that start with `-`.
+    private static func validatedRefName(_ name: String, label: String) throws -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw GitRepoError.commandFailed("\(label)不能为空")
+        }
+        guard !trimmed.hasPrefix("-") else {
+            throw GitRepoError.commandFailed("非法\(label)")
+        }
+        return trimmed
+    }
+
+    private static func validatedPathArg(_ path: URL, label: String) throws -> String {
+        let dest = path.path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !dest.isEmpty else {
+            throw GitRepoError.commandFailed("\(label)不能为空")
+        }
+        guard !dest.hasPrefix("-") else {
+            throw GitRepoError.commandFailed("非法\(label)")
+        }
+        return dest
+    }
+
+    /// Merge `branch` into the current HEAD of `workTree` (typically the main worktree).
+    /// Uses `git merge --no-edit` (not ff-only). On conflict / failure, throws and does not clean up.
+    package static func mergeBranch(_ branch: String, into workTree: URL) throws {
+        let name = try validatedRefName(branch, label: "分支名")
+        _ = try run(gitArgs: ["merge", "--no-edit", name], in: workTree)
+    }
+
+    /// Remove a linked worktree at `path`. Run from the main worktree.
+    /// Default `force: true` discards uncommitted changes in that worktree.
+    package static func worktreeRemove(at path: URL, in mainWorkTree: URL, force: Bool = true) throws {
+        let dest = try validatedPathArg(path, label: "worktree 路径")
+        var args = ["worktree", "remove"]
+        if force { args.append("--force") }
+        args.append(dest)
+        _ = try run(gitArgs: args, in: mainWorkTree)
+    }
+
+    /// Parse `git worktree list --porcelain` into absolute paths and optional short branch names.
+    package static func parseWorktreeListPorcelain(_ output: String) -> [(path: String, branch: String?)] {
+        var results: [(path: String, branch: String?)] = []
+        var currentPath: String?
+        var currentBranch: String?
+
+        func flush() {
+            guard let path = currentPath, !path.isEmpty else {
+                currentPath = nil
+                currentBranch = nil
+                return
+            }
+            results.append((path: path, branch: currentBranch))
+            currentPath = nil
+            currentBranch = nil
+        }
+
+        for raw in output.split(whereSeparator: \.isNewline) {
+            let line = String(raw)
+            if line.hasPrefix("worktree ") {
+                flush()
+                currentPath = String(line.dropFirst("worktree ".count))
+            } else if line.hasPrefix("branch ") {
+                var ref = String(line.dropFirst("branch ".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if ref.hasPrefix("refs/heads/") {
+                    ref = String(ref.dropFirst("refs/heads/".count))
+                }
+                currentBranch = ref.isEmpty ? nil : ref
+            } else if line == "detached" {
+                currentBranch = nil
+            } else if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                flush()
+            }
+        }
+        flush()
+        return results
+    }
+
+    /// List registered worktrees via `git worktree list --porcelain`.
+    package static func worktreeList(in workTree: URL) -> [(path: String, branch: String?)] {
+        guard let out = try? run(gitArgs: ["worktree", "list", "--porcelain"], in: workTree) else {
+            return []
+        }
+        return parseWorktreeListPorcelain(out)
+    }
+
+    /// `git diff --stat from...to` with hard truncation (branch/commit range summary).
+    package static func diffStat(
+        from: String,
+        to: String,
+        in workTree: URL,
+        maxFiles: Int = defaultDiffMaxFiles,
+        maxBytes: Int = defaultDiffMaxBytes
+    ) -> String {
+        let fromRef: String
+        let toRef: String
+        do {
+            fromRef = try validatedRefName(from, label: "from")
+            toRef = try validatedRefName(to, label: "to")
+        } catch {
+            return "(diff unavailable)"
+        }
+        let range = "\(fromRef)...\(toRef)"
+        guard let out = try? run(gitArgs: ["diff", "--stat", range], in: workTree) else {
+            return "(diff unavailable)"
+        }
+        let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return "(no diff)"
+        }
+        return truncateDiffOutput(out, maxFiles: maxFiles, maxBytes: maxBytes)
+    }
+
+    /// Delete a local branch (`git branch -D` when force, else `-d`). Does not touch remotes.
+    package static func deleteLocalBranch(_ branch: String, in workTree: URL, force: Bool = true) throws {
+        let name = try validatedRefName(branch, label: "分支名")
+        let flag = force ? "-D" : "-d"
+        _ = try run(gitArgs: ["branch", flag, name], in: workTree)
+    }
+
+    /// Best-effort: stage all and commit in `workTree` when dirty. Returns true if a commit was made.
+    /// Returns false when clean or when commit fails (caller may still merge existing commits).
+    @discardableResult
+    package static func commitAllIfDirty(in workTree: URL, message: String) -> Bool {
+        let status = probe(workTree: workTree)
+        guard status.isRepo, status.isDirty else { return false }
+        let msg = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !msg.isEmpty, !msg.hasPrefix("-") else { return false }
+        do {
+            _ = try run(gitArgs: ["add", "-A"], in: workTree)
+            _ = try run(gitArgs: ["commit", "-m", msg], in: workTree)
+            return true
+        } catch {
+            return false
+        }
+    }
 }

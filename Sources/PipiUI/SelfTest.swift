@@ -625,10 +625,39 @@ enum SelfTest {
                 "name": "explore",
                 "task": "t",
                 "depth": 1,
+                "worktreePath": "/tmp/fake-wt",
+                "worktreeBranch": "pipiui/a1",
             ] as [String: Any]))
             agents.saveNow()
             check("saveNow without attach is safe", true)
             check("subagent recorded", agents.agents.count == 1)
+            check("worktree lifecycle active on start",
+                  agents.agents.first?.worktreeLifecycle == .active)
+            agents.handle(J([
+                "kind": "end",
+                "agentId": "a1",
+                "ok": true,
+                "aborted": false,
+                "worktreePath": "/tmp/fake-wt",
+                "worktreeBranch": "pipiui/a1",
+            ] as [String: Any]))
+            check("worktree lifecycle pendingReview on end",
+                  agents.agents.first?.worktreeLifecycle == .pendingReview
+                  && agents.agents.first?.canReviewWorktree == true)
+            // Resume same agentId → active again
+            agents.handle(J([
+                "kind": "start",
+                "agentId": "a1",
+                "name": "explore",
+                "task": "continue",
+                "depth": 1,
+                "worktreePath": "/tmp/fake-wt",
+                "worktreeBranch": "pipiui/a1",
+            ] as [String: Any]))
+            check("worktree lifecycle resume active",
+                  agents.agents.count == 1
+                  && agents.agents.first?.state == .running
+                  && agents.agents.first?.worktreeLifecycle == .active)
         }
 
         // 14. SessionTitleLogic + SessionTitleClient pure helpers
