@@ -12,7 +12,7 @@
  * Uses JSON mode to capture structured output from subagents.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -224,6 +224,16 @@ interface RunSingleAgentOptions {
 	background?: boolean;
 	/** Pre-assigned id (background path needs ids before process exits). */
 	agentId?: string;
+}
+
+/** Optional worktree isolation metadata reported to the App bridge. */
+interface WorktreePlacement {
+	/** Effective spawn cwd (worktree path or original). */
+	cwd: string;
+	worktreePath?: string;
+	worktreeBranch?: string;
+	/** Set when worktree was requested but creation failed (spawn falls back). */
+	worktreeError?: string;
 }
 
 const DONE_RESULT_CAP = 8000;
@@ -466,6 +476,163 @@ function generatePipiuiAgentId(): string {
 	return `agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** Sanitize agentId for branch/dir names (filesystem + git ref safe). */
+function safeId(agentId: string): string {
+	return agentId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) || "agent";
+}
+
+function gitSpawnSync(
+	args: string[],
+	cwd?: string,
+): { ok: boolean; stdout: string; stderr: string; status: number | null } {
+	const result = spawnSync("git", args, {
+		cwd,
+		encoding: "utf8",
+		shell: false,
+		env: process.env,
+	});
+	const stdout = typeof result.stdout === "string" ? result.stdout : "";
+	const stderr = typeof result.stderr === "string" ? result.stderr : "";
+	return {
+		ok: result.status === 0 && !result.error,
+		stdout: stdout.trim(),
+		stderr: (stderr || result.error?.message || "").trim(),
+		status: result.status,
+	};
+}
+
+/**
+ * Default: create an isolated git worktree under <toplevel>/.pi/worktrees/<safeId>
+ * on branch pipiui/<safeId> so subagents write without polluting the main dirty tree.
+ *
+ * Off when:
+ * - PIPIUI_WORKTREE=0
+ * - caller passed explicit cwd (respect; do not wrap)
+ * - effective cwd is not inside a git work tree
+ *
+ * Never auto remove / commit / merge. On failure, fall back to original cwd + worktreeError.
+ */
+function resolveSubagentWorktree(opts: {
+	agentId: string;
+	defaultCwd: string;
+	explicitCwd?: string;
+}): WorktreePlacement {
+	const fallbackCwd = opts.explicitCwd ?? opts.defaultCwd;
+
+	if (process.env.PIPIUI_WORKTREE === "0") {
+		return { cwd: fallbackCwd };
+	}
+	// Explicit cwd from tool caller → respect, no worktree wrap
+	if (opts.explicitCwd) {
+		return { cwd: opts.explicitCwd };
+	}
+
+	const effectiveCwd = opts.defaultCwd;
+	const inside = gitSpawnSync(["-C", effectiveCwd, "rev-parse", "--is-inside-work-tree"]);
+	if (!inside.ok || inside.stdout !== "true") {
+		return { cwd: effectiveCwd };
+	}
+
+	const top = gitSpawnSync(["-C", effectiveCwd, "rev-parse", "--show-toplevel"]);
+	if (!top.ok || !top.stdout) {
+		return {
+			cwd: effectiveCwd,
+			worktreeError: top.stderr || "git rev-parse --show-toplevel failed",
+		};
+	}
+	const toplevel = path.resolve(top.stdout);
+	const id = safeId(opts.agentId);
+	const worktreesRoot = path.join(toplevel, ".pi", "worktrees");
+	try {
+		fs.mkdirSync(worktreesRoot, { recursive: true });
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return { cwd: effectiveCwd, worktreeError: `mkdir .pi/worktrees: ${msg}` };
+	}
+
+	const preferredPath = path.resolve(worktreesRoot, id);
+	const preferredBranch = `pipiui/${id}`;
+
+	// Reuse existing directory if it is already a valid worktree
+	if (fs.existsSync(preferredPath)) {
+		const reuse = gitSpawnSync(["-C", preferredPath, "rev-parse", "--is-inside-work-tree"]);
+		if (reuse.ok && reuse.stdout === "true") {
+			const br = gitSpawnSync(["-C", preferredPath, "rev-parse", "--abbrev-ref", "HEAD"]);
+			const branch =
+				br.ok && br.stdout && br.stdout !== "HEAD" ? br.stdout : preferredBranch;
+			return {
+				cwd: preferredPath,
+				worktreePath: preferredPath,
+				worktreeBranch: branch,
+			};
+		}
+	}
+
+	const tryAdd = (absPath: string, branch: string): { ok: boolean; error: string } => {
+		const r = gitSpawnSync(
+			["-C", toplevel, "worktree", "add", "-b", branch, absPath, "HEAD"],
+			toplevel,
+		);
+		if (r.ok) return { ok: true, error: "" };
+		return { ok: false, error: r.stderr || r.stdout || "git worktree add failed" };
+	};
+
+	let add = tryAdd(preferredPath, preferredBranch);
+	if (add.ok) {
+		return {
+			cwd: preferredPath,
+			worktreePath: preferredPath,
+			worktreeBranch: preferredBranch,
+		};
+	}
+
+	// Branch (or path) collision → unique suffix
+	const suffix = Date.now().toString(36).slice(-6);
+	const altBranch = `pipiui/${id}-${suffix}`;
+	// Clean a failed non-git leftover at preferred path when possible
+	if (fs.existsSync(preferredPath)) {
+		const stillGit = gitSpawnSync(["-C", preferredPath, "rev-parse", "--is-inside-work-tree"]);
+		if (!(stillGit.ok && stillGit.stdout === "true")) {
+			try {
+				fs.rmSync(preferredPath, { recursive: true, force: true });
+			} catch {
+				/* ignore */
+			}
+		}
+	}
+
+	// Spec: worktree add ${absPath} -b pipiui/${id}-${suffix} HEAD
+	const altAddSamePath = gitSpawnSync(
+		["-C", toplevel, "worktree", "add", preferredPath, "-b", altBranch, "HEAD"],
+		toplevel,
+	);
+	if (altAddSamePath.ok) {
+		return {
+			cwd: preferredPath,
+			worktreePath: preferredPath,
+			worktreeBranch: altBranch,
+		};
+	}
+
+	const altPath = path.resolve(worktreesRoot, `${id}-${suffix}`);
+	add = tryAdd(altPath, altBranch);
+	if (add.ok) {
+		return {
+			cwd: altPath,
+			worktreePath: altPath,
+			worktreeBranch: altBranch,
+		};
+	}
+
+	const errParts = [add.error, altAddSamePath.stderr || altAddSamePath.stdout]
+		.filter(Boolean)
+		.join("; ");
+	return {
+		cwd: effectiveCwd,
+		worktreeError: errParts || "git worktree add failed",
+	};
+}
+
 function truncateDoneOutput(output: string, cap = DONE_RESULT_CAP): string {
 	return truncateText(output, cap);
 }
@@ -649,6 +816,13 @@ async function runSingleAgent(
 		return fail;
 	}
 
+	const placement = resolveSubagentWorktree({
+		agentId: pipiuiAgentId,
+		defaultCwd,
+		explicitCwd: cwd, // only when caller passed cwd; undefined → auto worktree
+	});
+	const spawnCwd = placement.cwd;
+
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
@@ -683,6 +857,9 @@ async function runSingleAgent(
 		depth: PIPIUI_DEPTH + 1,
 		model: agent.model ?? null,
 		...(isBackground ? { background: true } : {}),
+		...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
+		...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
+		...(placement.worktreeError ? { worktreeError: placement.worktreeError } : {}),
 	});
 	jobUpsertRunning(pipiuiAgentId, agentName, task);
 	const pipiuiUpdate = (force = false) => {
@@ -727,7 +904,7 @@ async function runSingleAgent(
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
+				cwd: spawnCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 				detached: false,
@@ -737,6 +914,8 @@ async function runSingleAgent(
 					...process.env,
 					PIPIUI_AGENT_ID: pipiuiAgentId,
 					PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
+					...(placement.worktreePath ? { PIPIUI_WORKTREE_PATH: placement.worktreePath } : {}),
+					...(placement.worktreeBranch ? { PIPIUI_WORKTREE_BRANCH: placement.worktreeBranch } : {}),
 				},
 			});
 			pipiuiTrackChild(proc);
@@ -864,6 +1043,9 @@ async function runSingleAgent(
 			turns: currentResult.usage.turns,
 			contextTokens: currentResult.usage.contextTokens,
 			stopReason: currentResult.stopReason ?? null,
+			...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
+			...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
+			...(placement.worktreeError ? { worktreeError: placement.worktreeError } : {}),
 		});
 		// Terminal job state before notify/return so status works even if follow-up delivery fails.
 		const endState: JobState = wasAborted ? "aborted" : endOk ? "ok" : "failed";
@@ -961,6 +1143,7 @@ export default function (pi: ExtensionAPI) {
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
+			"By default each agent writes in an isolated git worktree under .pi/worktrees/ on a pipiui/* branch; pass explicit cwd or set PIPIUI_WORKTREE=0 to disable. Worktrees are never auto-merged.",
 			"Track jobs with subagent_status(agentId?). Never re-spawn a finished task without reading its result via [subagent-done] or subagent_status.",
 			"Do not busy-loop poll; one status check per decision is correct.",
 			"chain and nested (depth>0) are always synchronous. Set background:false to await a single/parallel result.",
