@@ -88,6 +88,7 @@ final class ComposerSlashKeyMonitor {
 }
 
 struct InputBar: View {
+    @EnvironmentObject var store: AppStore
     @ObservedObject var session: ChatSession
     @State private var attachError: String?
     @FocusState private var focused: Bool
@@ -792,10 +793,20 @@ struct InputBar: View {
     }()
 
     private var modelMenu: some View {
-        Menu {
-            ForEach(groupedProviders, id: \.self) { provider in
+        // Read revision so toggles in Settings refresh this menu immediately.
+        let _ = store.modelVisibilityRevision
+        let visible = ModelVisibility.pickerModels(
+            from: session.availableModels,
+            selectedId: session.model?.id
+        )
+        let providers = ModelVisibility.pickerProviders(
+            from: session.availableModels,
+            selectedId: session.model?.id
+        )
+        return Menu {
+            ForEach(providers, id: \.self) { provider in
                 Section(provider) {
-                    ForEach(session.availableModels.filter { $0.provider == provider }) { m in
+                    ForEach(visible.filter { $0.provider == provider }) { m in
                         Button {
                             session.setModel(m)
                         } label: {
@@ -852,13 +863,4 @@ struct InputBar: View {
         .disabled(session.thinkingLevels == ["off"])
     }
 
-    private var groupedProviders: [String] {
-        var seen: Set<String> = []
-        var result: [String] = []
-        for m in session.availableModels where !seen.contains(m.provider) {
-            seen.insert(m.provider)
-            result.append(m.provider)
-        }
-        return result
-    }
 }

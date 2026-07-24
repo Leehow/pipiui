@@ -14,15 +14,30 @@ final class AppStore: ObservableObject {
     static let shared = AppStore()
     private static let projectsKey = "pipiui.projects"
     private static let archivedSessionsKey = "pipiui.archivedSessions"
+    private static let lastProjectKey = "pipiui.lastProjectPath"
+    private static let lastSessionFileKey = "pipiui.lastSessionFile"
+    private static let lastSessionProjectKey = "pipiui.lastSessionProject"
 
     @Published var projects: [URL] = []
-    @Published var selectedProjectPath: String?
+    @Published var selectedProjectPath: String? {
+        didSet {
+            guard selectedProjectPath != oldValue else { return }
+            UserDefaults.standard.set(selectedProjectPath, forKey: Self.lastProjectKey)
+        }
+    }
     @Published var sessionsByProject: [String: [SessionMeta]] = [:]
     /// 各项目下已归档会话（扫盘得到，path 在 archivedSessionPaths 且文件仍存在）
     @Published var archivedByProject: [String: [SessionMeta]] = [:]
     @Published var openSessions: [String: ChatSession] = [:]
     @Published var selectedSessionKey: String? {
         didSet {
+            // 记住最后选中的会话，下次启动直接恢复；新会话尚无文件时保留上一条记录。
+            if let key = selectedSessionKey,
+               let file = openSessions[key]?.sessionFile ?? sessionFileFromKey(key) {
+                UserDefaults.standard.set(file, forKey: Self.lastSessionFileKey)
+                UserDefaults.standard.set(openSessions[key]?.projectURL.path ?? selectedProjectPath,
+                                          forKey: Self.lastSessionProjectKey)
+            }
             guard selectedSessionKey != oldValue, let key = selectedSessionKey else { return }
             // TEMP SWITCH PERF: measure how long a sidebar switch blocks the main thread.
             Self.lastSwitchAt = CFAbsoluteTimeGetCurrent()
@@ -90,12 +105,40 @@ final class AppStore: ObservableObject {
         didSet { UserDefaults.standard.set(bossModeEnabled, forKey: "pipiui.bossMode") }
     }
 
+    /// Bumped when model picker visibility preferences change so InputBar refreshes.
+    @Published var modelVisibilityRevision: Int = 0
+
+    /// Restart every open pi RPC process so auth.json changes take effect.
+    func restartAllOpenSessions() {
+        for key in Array(openSessions.keys) {
+            restartSession(key: key)
+        }
+    }
+
+    /// 会话 key 形如 "resume:<session 文件路径>"，选中时尚未 spawn 完也能拿到文件路径。
+    private func sessionFileFromKey(_ key: String) -> String? {
+        key.hasPrefix("resume:") ? String(key.dropFirst("resume:".count)) : nil
+    }
+
     private init() {
         let paths = UserDefaults.standard.stringArray(forKey: Self.projectsKey) ?? []
         projects = paths.map { URL(fileURLWithPath: $0) }
-        selectedProjectPath = projects.first?.path
+        let savedProject = UserDefaults.standard.string(forKey: Self.lastProjectKey)
+        selectedProjectPath = projects.contains(where: { $0.path == savedProject })
+            ? savedProject : projects.first?.path
         archivedSessionPaths = Set(UserDefaults.standard.stringArray(forKey: Self.archivedSessionsKey) ?? [])
         for p in projects { refreshSessions(for: p) }
+
+        // 启动即恢复关闭前选中的会话（文件还在且未被归档才恢复）。
+        if let file = UserDefaults.standard.string(forKey: Self.lastSessionFileKey),
+           let projectPath = UserDefaults.standard.string(forKey: Self.lastSessionProjectKey),
+           !archivedSessionPaths.contains(file),
+           let meta = sessionsByProject[projectPath]?.first(where: { $0.path == file }) {
+            let project = URL(fileURLWithPath: projectPath)
+            DispatchQueue.main.async { [weak self] in
+                self?.openSession(meta, project: project)
+            }
+        }
 
         plugin = PiPlugin.installAll()
         bridge = BridgeServer { request, respond in

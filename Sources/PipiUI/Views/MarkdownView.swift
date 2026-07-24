@@ -10,19 +10,16 @@ struct MarkdownTextView: View {
     @Environment(\.chatTypography) private var chatTypography
 
     var body: some View {
-        VStack(alignment: .leading, spacing: chatTypography.blockSpacing) {
-            ForEach(Array(Self.cachedParse(text).enumerated()), id: \.offset) { _, block in
-                MarkdownBlockView(block: block, onFlash: onFlash)
-            }
-        }
-        // Prose uses PathLinkedText (selectable + ⌘+click paths). Residual SwiftUI links still work.
-        .environment(\.openURL, PathLinkOpenURL.action(onFlash: onFlash))
-        .contextMenu {
-            Button("复制") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(text, forType: .string)
-            }
-        }
+        // SwiftUI gives every block its own text-selection host, so a drag cannot cross a
+        // paragraph/list/code boundary. One NSTextView keeps all rendered blocks in one
+        // NSTextStorage, which is the unit AppKit uses for native drag selection.
+        SelectableMarkdownTextView(
+            attributedText: MarkdownSelectionContent.attributedString(
+                for: text,
+                typography: chatTypography
+            ),
+            bodyFont: chatTypography.bodyNSFont
+        )
     }
 
     /// 解析结果缓存：SwiftUI body 会反复求值，长会话里重复解析很浪费。
@@ -259,6 +256,115 @@ struct MarkdownTextView: View {
             result.append(inlineWithPaths(item.text))
         }
         return result
+    }
+}
+
+/// Flattens rendered markdown blocks into one attributed storage while preserving the text a
+/// user sees and copies. The AppKit bridge below then provides a single native selection range.
+enum MarkdownSelectionContent {
+    static func attributedString(
+        for text: String,
+        typography: ChatTypography = .make(fontSize: ChatTypography.defaultFontSize)
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let blocks = MarkdownTextView.cachedParse(text)
+
+        for (index, block) in blocks.enumerated() {
+            if index > 0 { result.append(NSAttributedString(string: "\n\n")) }
+            switch block {
+            case .paragraph(let paragraph):
+                result.append(rendered(MarkdownTextView.inlineWithPaths(paragraph), font: typography.bodyNSFont))
+            case .heading(let level, let title):
+                result.append(rendered(
+                    MarkdownTextView.inlineWithPaths(title),
+                    font: typography.headingNSFont(level: level)
+                ))
+            case .code(let code), .mono(let code):
+                result.append(rendered(
+                    AttributedString(code),
+                    font: typography.codeNSFont,
+                    background: NSColor.labelColor.withAlphaComponent(0.05)
+                ))
+            case .list(let items):
+                result.append(rendered(MarkdownTextView.listAttributed(items), font: typography.bodyNSFont))
+            case .quote(let quote):
+                result.append(rendered(
+                    MarkdownTextView.inlineWithPaths(quote),
+                    font: typography.bodyNSFont,
+                    color: .secondaryLabelColor
+                ))
+            case .table(let header, let rows):
+                result.append(rendered(
+                    AttributedString(([header] + rows)
+                        .map { $0.joined(separator: "\t") }
+                        .joined(separator: "\n")),
+                    font: typography.bodyNSFont
+                ))
+            case .rule:
+                result.append(rendered(AttributedString("────────"), font: typography.bodyNSFont, color: .separatorColor))
+            }
+        }
+        return result
+    }
+
+    private static func rendered(
+        _ text: AttributedString,
+        font: NSFont,
+        color: NSColor = .labelColor,
+        background: NSColor? = nil
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString(attributedString: NSAttributedString(text))
+        let range = NSRange(location: 0, length: result.length)
+        guard range.length > 0 else { return result }
+        result.addAttribute(.font, value: font, range: range)
+        result.addAttribute(.foregroundColor, value: color, range: range)
+        if let background {
+            result.addAttribute(.backgroundColor, value: background, range: range)
+        }
+        return result
+    }
+}
+
+/// AppKit selection host for a complete markdown message. `NSTextView` owns one text storage,
+/// so dragging from one paragraph/block into another keeps a continuous selection and copies
+/// the full range correctly.
+private struct SelectableMarkdownTextView: NSViewRepresentable {
+    let attributedText: NSAttributedString
+    let bodyFont: NSFont
+
+    func makeNSView(context: Context) -> NSTextView {
+        let textView = NSTextView(frame: .zero)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        applyContent(to: textView)
+        return textView
+    }
+
+    func updateNSView(_ textView: NSTextView, context: Context) {
+        applyContent(to: textView)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView textView: NSTextView, context: Context) -> CGSize? {
+        guard let width = proposal.width, width > 0 else { return nil }
+        let container = textView.textContainer!
+        container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
+        container.widthTracksTextView = false
+        textView.layoutManager?.ensureLayout(for: container)
+        let used = textView.layoutManager?.usedRect(for: container) ?? .zero
+        return CGSize(width: width, height: ceil(used.height))
+    }
+
+    private func applyContent(to textView: NSTextView) {
+        guard textView.attributedString() != attributedText else { return }
+        textView.font = bodyFont
+        textView.textColor = .labelColor
+        textView.textStorage?.setAttributedString(attributedText)
     }
 }
 

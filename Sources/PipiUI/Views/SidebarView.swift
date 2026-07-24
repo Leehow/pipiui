@@ -4,6 +4,7 @@ struct SidebarView: View {
     @EnvironmentObject var store: AppStore
     @State private var renameTarget: RenameTarget?
     @State private var renameText: String = ""
+    @State private var showSettings = false
     /// Per-project expand state for the archived section; missing key = collapsed.
     @State private var archivedExpandedByProject: [String: Bool] = [:]
 
@@ -28,7 +29,20 @@ struct SidebarView: View {
             .listStyle(.sidebar)
         }
         .safeAreaInset(edge: .bottom) {
-            HStack {
+            HStack(spacing: 8) {
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.body)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(HoverButtonStyle())
+                .help("设置")
+                .accessibilityLabel("设置")
+
+                Spacer(minLength: 0)
+
                 Toggle(isOn: $store.bossModeEnabled) {
                     Label("Boss", systemImage: "crown")
                         .font(.callout)
@@ -40,6 +54,10 @@ struct SidebarView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .background(.bar)
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsSheet()
+                .environmentObject(store)
         }
         .sheet(item: $renameTarget) { target in
             VStack(alignment: .leading, spacing: 16) {

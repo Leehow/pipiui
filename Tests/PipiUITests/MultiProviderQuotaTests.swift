@@ -13,17 +13,20 @@ final class MultiProviderQuotaTests: XCTestCase {
         XCTAssertEqual(ModelInfo(provider: "zhipu-coding", modelId: "glm-5.2", name: "GLM", contextWindow: nil).quotaProvider, .glm)
         XCTAssertEqual(ModelInfo(provider: "anthropic", modelId: "claude-sonnet-4-5", name: "Claude", contextWindow: nil).quotaProvider, .claude)
         XCTAssertEqual(ModelInfo(provider: "openai-codex", modelId: "gpt-5.4", name: "GPT", contextWindow: nil).quotaProvider, .codex)
+        XCTAssertEqual(ModelInfo(provider: "kimi-coding", modelId: "kimi-for-coding", name: "Kimi", contextWindow: nil).quotaProvider, .kimi)
 
         // Relays → nil (never show quota).
         XCTAssertNil(ModelInfo(provider: "grok-relay", modelId: "grok-4.5", name: "Grok", contextWindow: nil).quotaProvider)
         XCTAssertNil(ModelInfo(provider: "coding-relay", modelId: "gpt-5.6", name: "GPT", contextWindow: nil).quotaProvider)
         XCTAssertNil(ModelInfo(provider: "coding-relay-18890", modelId: "glm-5.2", name: "GLM", contextWindow: nil).quotaProvider)
+        XCTAssertNil(ModelInfo(provider: "kimi-relay", modelId: "kimi-for-coding", name: "Kimi", contextWindow: nil).quotaProvider)
 
         // Unknown → nil.
         XCTAssertNil(ModelInfo(provider: "acme", modelId: "x", name: "x", contextWindow: nil).quotaProvider)
 
         // shouldShowAccountQuota agrees with quotaProvider != nil.
         XCTAssertTrue(ModelInfo(provider: "anthropic", modelId: "claude", name: "c", contextWindow: nil).shouldShowAccountQuota)
+        XCTAssertTrue(ModelInfo(provider: "kimi-coding", modelId: "k3", name: "K3", contextWindow: nil).shouldShowAccountQuota)
         XCTAssertFalse(ModelInfo(provider: "grok-relay", modelId: "grok-4.5", name: "g", contextWindow: nil).shouldShowAccountQuota)
     }
 
@@ -32,6 +35,7 @@ final class MultiProviderQuotaTests: XCTestCase {
         XCTAssertEqual(QuotaProvider.glm.accountLabel, "GLM 账号额度")
         XCTAssertEqual(QuotaProvider.claude.accountLabel, "Claude 账号额度")
         XCTAssertEqual(QuotaProvider.codex.accountLabel, "Codex 账号额度")
+        XCTAssertEqual(QuotaProvider.kimi.accountLabel, "Kimi 账号额度")
     }
 
     // MARK: - GLM parsing

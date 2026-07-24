@@ -27,7 +27,7 @@ struct ModelInfo: Identifiable, Hashable {
     /// Which first-party account-quota source backs this model, if any.
     /// `nil` for relay providers and unknown providers → no pill shown.
     /// Provider id strings come from `pi --list-models` (e.g. `xai`, `zai-coding-cn`,
-    /// `anthropic`, `openai-codex`).
+    /// `anthropic`, `openai-codex`, `kimi-coding`).
     var quotaProvider: QuotaProvider? {
         if isRelayProvider { return nil }
         let p = provider.lowercased()
@@ -35,6 +35,8 @@ struct ModelInfo: Identifiable, Hashable {
         if p.contains("zai") || p.contains("zhipu") || p.contains("bigmodel") { return .glm }
         if p == "anthropic" || p.contains("claude") { return .claude }
         if p.contains("openai") || p.contains("codex") { return .codex }
+        // Kimi Code Plan (`kimi-coding`); not Moonshot open-platform balance.
+        if p.contains("kimi") { return .kimi }
         return nil
     }
 
