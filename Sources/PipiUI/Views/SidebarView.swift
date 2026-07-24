@@ -418,24 +418,39 @@ private struct SessionRowContainer<Content: View>: View {
     }
 }
 
-/// Sidebar-only session indicator. Priority: running > error > unseen-ok/green > none.
+/// Sidebar-only session indicator.
+/// Priority: main running > background subagents > error > unseen-ok/green > none.
 private enum SessionRowStatus: Equatable {
     case running
+    case subagentsRunning(Int)
     case error
     case ok
     case none
 
     static func from(_ session: ChatSession) -> SessionRowStatus {
         if session.isWorking { return .running }
+        let n = session.subagents.runningCount
+        if n > 0 { return .subagentsRunning(n) }
         if session.lastError != nil || !session.processAlive { return .error }
         if session.hasUnseenCompletion { return .ok }
         return .none
+    }
+
+    var subtitleOverride: String? {
+        switch self {
+        case .running: return "进行中"
+        case .subagentsRunning(let n):
+            return n > 1 ? "\(n) 个子任务" : "子任务中"
+        default: return nil
+        }
     }
 }
 
 /// Observes a live ChatSession so status dots update without reselection.
 private struct LiveSessionRow: View {
     @ObservedObject var session: ChatSession
+    /// Must observe subagents separately — agent_event updates won't refresh via session alone.
+    @ObservedObject private var agents: SubagentStore
     /// Fallback when session.sessionName is nil/empty (e.g. disk meta name).
     let fallbackTitle: String
     /// Shown when not running (e.g. relative modified time). Empty for unsaved new sessions.
@@ -443,15 +458,30 @@ private struct LiveSessionRow: View {
     /// Hide trailing caption while hover actions occupy that corner.
     var hideSubtitle: Bool = false
 
+    init(
+        session: ChatSession,
+        fallbackTitle: String,
+        idleSubtitle: String,
+        hideSubtitle: Bool = false
+    ) {
+        self.session = session
+        self.agents = session.subagents
+        self.fallbackTitle = fallbackTitle
+        self.idleSubtitle = idleSubtitle
+        self.hideSubtitle = hideSubtitle
+    }
+
     var body: some View {
+        // Touch agents.runningCount so SwiftUI tracks SubagentStore publishes.
+        let _ = agents.runningCount
         let status = SessionRowStatus.from(session)
         // Prefer non-empty live name so disk meta still shows when sessionName unset.
         let title = session.sessionName.flatMap { $0.isEmpty ? nil : $0 } ?? fallbackTitle
-        let subtitle = status == .running ? "进行中" : idleSubtitle
+        let subtitle = status.subtitleOverride ?? idleSubtitle
         HStack(spacing: 8) {
             // Keep status column width stable so titles don't shift
             statusIndicator(status)
-                .frame(width: 10, height: 10)
+                .frame(width: 12, height: 12)
             TypewriterText(
                 text: title,
                 animationToken: session.titleAnimationToken,
@@ -475,7 +505,9 @@ private struct LiveSessionRow: View {
             ProgressView()
                 .controlSize(.mini)
                 .scaleEffect(0.55)
-                .frame(width: 10, height: 10)
+                .frame(width: 12, height: 12)
+        case .subagentsRunning(let count):
+            SubagentsRunningIndicator(count: count)
         case .ok:
             Circle()
                 .fill(Color.green)
@@ -493,6 +525,36 @@ private struct LiveSessionRow: View {
     }
 }
 
+/// Distinct from main-agent ProgressView spinner: people icon + mild pulse.
+private struct SubagentsRunningIndicator: View {
+    let count: Int
+    @State private var pulse = false
+
+    var body: some View {
+        ZStack {
+            Image(systemName: "person.2.fill")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(Color.orange)
+                .opacity(pulse ? 0.45 : 1.0)
+            if count > 1 {
+                Text("\(min(count, 9))")
+                    .font(.system(size: 6, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 2)
+                    .background(Capsule().fill(Color.orange.opacity(0.95)))
+                    .offset(x: 5, y: -4)
+            }
+        }
+        .frame(width: 12, height: 12)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                pulse = true
+            }
+        }
+        .accessibilityLabel(count > 1 ? "\(count) 个子任务运行中" : "子任务运行中")
+    }
+}
+
 private struct SessionRow: View {
     let title: String
     let subtitle: String
@@ -504,7 +566,7 @@ private struct SessionRow: View {
         HStack(spacing: 8) {
             // Keep status column width stable so titles don't shift
             statusIndicator
-                .frame(width: 10, height: 10)
+                .frame(width: 12, height: 12)
             Text(title)
                 .lineLimit(1)
             Spacer(minLength: 0)
@@ -525,7 +587,9 @@ private struct SessionRow: View {
             ProgressView()
                 .controlSize(.mini)
                 .scaleEffect(0.55)
-                .frame(width: 10, height: 10)
+                .frame(width: 12, height: 12)
+        case .subagentsRunning(let count):
+            SubagentsRunningIndicator(count: count)
         case .ok:
             Circle()
                 .fill(Color.green)

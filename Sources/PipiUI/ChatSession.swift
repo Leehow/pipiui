@@ -8,6 +8,13 @@ struct ModelInfo: Identifiable, Hashable {
     let name: String
     let contextWindow: Int?
     var id: String { provider + "/" + modelId }
+
+    /// Whether this model belongs to a Grok/xAI provider (used to gate Grok account credit display).
+    var isGrokProvider: Bool {
+        let p = provider.lowercased()
+        let i = modelId.lowercased()
+        return p.contains("grok") || p == "xai" || i.contains("grok")
+    }
 }
 
 struct ToolCallBlock: Identifiable, Equatable {
@@ -20,6 +27,8 @@ struct ImageBlock: Identifiable, Equatable {
     let id: String
     let data: Data
     let mimeType: String
+    /// On-disk path when known (attachments, media generation, RPC path/filePath).
+    var path: String? = nil
 }
 
 struct VideoBlock: Identifiable, Equatable {
@@ -614,8 +623,17 @@ final class ChatSession: ObservableObject, Identifiable {
                 return
             }
             skipNextAssistantIngest = false
-            if let item = convert(message: message, id: nextItemId()),
-               !item.blocks.isEmpty { transcript.append(item) }
+            if let raw = convert(message: message, id: nextItemId()), !raw.blocks.isEmpty {
+                let item = Self.hydrateUserImagesIfNeeded(raw)
+                // Replace optimistic local user bubble when the server echoes the same turn.
+                if let lastIdx = transcript.indices.last,
+                   Self.shouldReplaceOptimisticUser(existing: transcript[lastIdx], incoming: item) {
+                    let keepId = transcript[lastIdx].id
+                    transcript[lastIdx] = ChatItem(id: keepId, role: item.role, blocks: item.blocks)
+                } else {
+                    transcript.append(item)
+                }
+            }
         case "assistant":
             if skipNextAssistantIngest {
                 skipNextAssistantIngest = false
@@ -677,9 +695,10 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Supports RPC/session shapes:
     /// - `{ type, data, mimeType }`
     /// - `{ type, source: { type: "base64", mediaType, data } }`
+    /// - path-only with on-disk file when base64 missing/empty
     static func parseImageBlock(_ block: J) -> ImageBlock? {
         let b64: String?
-        let mime: String
+        var mime: String
         if block["source"].exists {
             b64 = block["source"]["data"].string
             mime = block["source"]["mediaType"].string
@@ -689,12 +708,114 @@ final class ChatSession: ObservableObject, Identifiable {
             b64 = block["data"].string
             mime = block["mimeType"].string ?? block["mediaType"].string ?? "image/png"
         }
-        guard let b64, let data = Data(base64Encoded: b64), !data.isEmpty else { return nil }
+        let path = block["path"].string
+            ?? block["filePath"].string
+            ?? block["file_path"].string
+            ?? block["source"]["path"].string
+            ?? block["source"]["filePath"].string
+        let trimmedPath = path?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedPath = (trimmedPath?.isEmpty == false) ? trimmedPath : nil
+
+        var data: Data?
+        if let b64, !b64.isEmpty {
+            data = Data(base64Encoded: b64)
+                ?? Data(base64Encoded: b64, options: .ignoreUnknownCharacters)
+        }
+        if data == nil || data?.isEmpty == true, let resolvedPath,
+           FileManager.default.fileExists(atPath: resolvedPath) {
+            data = try? Data(contentsOf: URL(fileURLWithPath: resolvedPath))
+            if mime == "image/png" || mime.isEmpty {
+                mime = Self.mimeType(forImagePath: resolvedPath) ?? mime
+            }
+        }
+        guard let data, !data.isEmpty else { return nil }
         return ImageBlock(
             id: block["id"].string ?? UUID().uuidString,
             data: data,
-            mimeType: mime
+            mimeType: mime.isEmpty ? "image/png" : mime,
+            path: resolvedPath
         )
+    }
+
+    /// Fill missing image blocks from `Attached image file(s):` footnotes (session resume).
+    package static func hydrateUserImagesIfNeeded(_ item: ChatItem) -> ChatItem {
+        guard item.role == "user" else { return item }
+        let plain = plainText(of: item)
+        let paths = ImageAttachment.attachmentPaths(fromMessageText: plain)
+        guard !paths.isEmpty else { return item }
+
+        var imageBlocks: [ImageBlock] = []
+        var nonImage: [ChatBlock] = []
+        for block in item.blocks {
+            if case .image(let img) = block {
+                imageBlocks.append(img)
+            } else {
+                nonImage.append(block)
+            }
+        }
+
+        // Attach known paths onto existing images that lack path.
+        for i in imageBlocks.indices where imageBlocks[i].path == nil && i < paths.count {
+            imageBlocks[i].path = paths[i]
+        }
+
+        // Load any footnote paths not already represented as image blocks.
+        if imageBlocks.count < paths.count {
+            for i in imageBlocks.count..<paths.count {
+                let p = paths[i]
+                guard FileManager.default.fileExists(atPath: p),
+                      let data = try? Data(contentsOf: URL(fileURLWithPath: p)),
+                      !data.isEmpty else { continue }
+                imageBlocks.append(ImageBlock(
+                    id: UUID().uuidString,
+                    data: data,
+                    mimeType: mimeType(forImagePath: p) ?? "image/png",
+                    path: p
+                ))
+            }
+        }
+
+        // Prefer images-first layout (matches optimistic send).
+        var blocks: [ChatBlock] = imageBlocks.map { .image($0) }
+        blocks.append(contentsOf: nonImage)
+        return ChatItem(id: item.id, role: item.role, blocks: blocks)
+    }
+
+    /// True when `incoming` is the server echo of an optimistic local user bubble.
+    package static func shouldReplaceOptimisticUser(existing: ChatItem, incoming: ChatItem) -> Bool {
+        guard existing.role == "user", incoming.role == "user" else { return false }
+        let a = ImageAttachment.stripAttachmentPathsForDisplay(plainText(of: existing))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = ImageAttachment.stripAttachmentPathsForDisplay(plainText(of: incoming))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Same prose (incl. both empty for image-only): replace optimistic with server item.
+        return a == b
+    }
+
+    package static func plainText(of item: ChatItem) -> String {
+        item.blocks.compactMap { block -> String? in
+            if case .text(let t) = block { return t }
+            return nil
+        }.joined(separator: "\n")
+    }
+
+    package static func imageCount(of item: ChatItem) -> Int {
+        item.blocks.reduce(0) { n, b in
+            if case .image = b { return n + 1 }
+            return n
+        }
+    }
+
+    package static func mimeType(forImagePath path: String) -> String? {
+        switch (path as NSString).pathExtension.lowercased() {
+        case "jpg", "jpeg": return "image/jpeg"
+        case "png": return "image/png"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        case "tif", "tiff": return "image/tiff"
+        case "heic": return "image/heic"
+        default: return nil
+        }
     }
 
     static func argsSummary(name: String, args: J) -> String {
@@ -812,7 +933,12 @@ final class ChatSession: ObservableObject, Identifiable {
         ]
         switch result.kind {
         case .image(let data, let mime, let path):
-            blocks.append(.image(ImageBlock(id: UUID().uuidString, data: data, mimeType: mime)))
+            blocks.append(.image(ImageBlock(
+                id: UUID().uuidString,
+                data: data,
+                mimeType: mime,
+                path: path?.path
+            )))
             if let path {
                 blocks.append(.text(path.path))
             }
@@ -849,12 +975,17 @@ final class ChatSession: ObservableObject, Identifiable {
             requestSideChannelTitleIfNeeded(userMessage: message)
         }
 
+        // Optimistic user bubble (text + images) so thumbnails appear before message_end.
+        appendOptimisticUserMessage(message: message, images: images)
+
         // Cover first-send / drain gap before agent_start so sidebar shows spinner, not green.
         isSendingFromQueue = true
         var cmd: [String: Any] = ["type": "prompt", "message": message]
         if !images.isEmpty {
             cmd["images"] = ImageAttachment.rpcPayload(from: images)
         }
+        // Bump sidebar session to top immediately on user submit (don't wait for agent_settled).
+        onSessionMetaChanged?()
         // Never set streamingBehavior: "steer" — busy delivery is local queue + idle drain.
         proc?.request(cmd) { [weak self] resp in
             guard let self else { return }
@@ -867,6 +998,26 @@ final class ChatSession: ObservableObject, Identifiable {
                 }
             }
         }
+    }
+
+    /// Local user row before pi `message_end` (deduped on ingest).
+    private func appendOptimisticUserMessage(message: String, images: [DraftImage]) {
+        var blocks: [ChatBlock] = []
+        let paths = ImageAttachment.attachmentPaths(fromMessageText: message)
+        for (i, img) in images.enumerated() {
+            let path = i < paths.count ? paths[i] : nil
+            blocks.append(.image(ImageBlock(
+                id: UUID().uuidString,
+                data: img.data,
+                mimeType: img.mimeType,
+                path: path
+            )))
+        }
+        if !message.isEmpty {
+            blocks.append(.text(message))
+        }
+        guard !blocks.isEmpty else { return }
+        transcript.append(ChatItem(id: nextItemId(), role: "user", blocks: blocks))
     }
 
     private func publishQueue() {
@@ -936,6 +1087,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 self.proc?.request(["type": "get_state"]) { [weak self] r in self?.applyState(r["data"]) }
                 // Authoritative refresh: get_session_stats re-reads current model's window + tokens
                 self.refreshStats()
+                GrokQuotaMonitor.shared.refreshIfNeeded(force: true)
             } else {
                 self.lastError = resp["error"].string ?? "切换模型失败"
             }

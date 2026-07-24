@@ -302,15 +302,16 @@ struct InputBar: View {
             HStack(spacing: 10) {
                 ForEach(session.draftImages) { img in
                     ZStack(alignment: .topTrailing) {
-                        Image(nsImage: img.preview)
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(width: 64, height: 64)
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .strokeBorder(Color.primary.opacity(0.12))
-                            )
+                        // Enlarge OK; path unknown for drafts → reveal disabled via content match off.
+                        ImageThumbnailView(
+                            data: img.data,
+                            mimeType: img.mimeType,
+                            path: nil,
+                            fillSize: CGSize(width: 64, height: 64),
+                            projectURL: session.projectURL,
+                            onFlash: { session.flash($0) },
+                            allowContentMatch: false
+                        )
 
                         Button {
                             session.draftImages.removeAll { $0.id == img.id }
@@ -711,7 +712,7 @@ struct InputBar: View {
                     .foregroundStyle(hot ? .orange : .secondary)
                     .help("上下文占用")
             }
-            if let quota = session.quotaPercent {
+            if let quota = session.quotaPercent, session.model?.isGrokProvider == true {
                 let label = session.quotaPeriodLabel ?? "额"
                 let help = session.quotaPeriodHelp ?? "额度"
                 Text("\(label) \(Int(quota.rounded()))%")

@@ -205,6 +205,8 @@ interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
+	/** PipiUI bridge / completion-signal id */
+	agentId?: string;
 }
 
 interface SubagentDetails {
@@ -212,6 +214,302 @@ interface SubagentDetails {
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
+	/** True when tool returned immediately and completion arrives via [subagent-done] followUp */
+	background?: boolean;
+	agentIds?: string[];
+}
+
+interface RunSingleAgentOptions {
+	/** When true, start report includes background flag; caller must not bind parent abort. */
+	background?: boolean;
+	/** Pre-assigned id (background path needs ids before process exits). */
+	agentId?: string;
+}
+
+const DONE_RESULT_CAP = 8000;
+const JOB_RESULT_STORE_CAP = 12000;
+const JOB_RESULT_DISPLAY_CAP = 8000;
+const MAX_JOB_RECORDS = 40;
+
+const emptyUsage = (): UsageStats => ({
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	cost: 0,
+	contextTokens: 0,
+	turns: 0,
+});
+
+// ---- In-process job registry (model-visible via subagent_status; independent of App UI) ----
+type JobState = "running" | "ok" | "failed" | "aborted";
+
+interface JobRecord {
+	agentId: string;
+	name: string;
+	task: string; // truncated summary
+	state: JobState;
+	startedAt: number;
+	endedAt?: number;
+	activity?: string;
+	cost?: number;
+	turns?: number;
+	/** Full-ish result text for status-by-id (capped) */
+	resultText?: string;
+}
+
+const jobRegistry = new Map<string, JobRecord>();
+
+function truncateText(text: string, cap: number): string {
+	if (text.length <= cap) return text;
+	return text.slice(-cap);
+}
+
+function taskSummary(task: string, cap = 200): string {
+	const t = task.replace(/\s+/g, " ").trim();
+	return t.length <= cap ? t : `${t.slice(0, cap)}…`;
+}
+
+function jobPrune(): void {
+	if (jobRegistry.size <= MAX_JOB_RECORDS) return;
+	const finished = [...jobRegistry.entries()]
+		.filter(([, j]) => j.state !== "running")
+		.sort((a, b) => (a[1].endedAt ?? a[1].startedAt) - (b[1].endedAt ?? b[1].startedAt));
+	for (const [id] of finished) {
+		if (jobRegistry.size <= MAX_JOB_RECORDS) break;
+		jobRegistry.delete(id);
+	}
+	if (jobRegistry.size <= MAX_JOB_RECORDS) return;
+	const all = [...jobRegistry.entries()].sort((a, b) => a[1].startedAt - b[1].startedAt);
+	for (const [id] of all) {
+		if (jobRegistry.size <= MAX_JOB_RECORDS) break;
+		jobRegistry.delete(id);
+	}
+}
+
+function jobUpsertRunning(agentId: string, name: string, task: string): void {
+	const existing = jobRegistry.get(agentId);
+	if (existing && existing.state !== "running") return; // never reopen a terminal job
+	jobRegistry.set(agentId, {
+		agentId,
+		name,
+		task: taskSummary(task),
+		state: "running",
+		startedAt: existing?.startedAt ?? Date.now(),
+		activity: existing?.activity,
+		cost: existing?.cost,
+		turns: existing?.turns,
+	});
+	jobPrune();
+}
+
+function jobPatchRunning(
+	agentId: string,
+	patch: { activity?: string; cost?: number; turns?: number },
+): void {
+	const job = jobRegistry.get(agentId);
+	if (!job || job.state !== "running") return;
+	if (patch.activity !== undefined) job.activity = patch.activity;
+	if (patch.cost !== undefined) job.cost = patch.cost;
+	if (patch.turns !== undefined) job.turns = patch.turns;
+}
+
+function jobFinalize(
+	agentId: string,
+	fields: {
+		name?: string;
+		task?: string;
+		state: JobState;
+		resultText?: string;
+		cost?: number;
+		turns?: number;
+		activity?: string;
+	},
+): void {
+	if (fields.state === "running") return;
+	const existing = jobRegistry.get(agentId);
+	const now = Date.now();
+	if (existing && existing.state !== "running") {
+		// Already terminal: fill missing result/metrics only (notify may race with runSingleAgent end)
+		if (!existing.resultText && fields.resultText) existing.resultText = truncateText(fields.resultText, JOB_RESULT_STORE_CAP);
+		if (existing.cost === undefined && fields.cost !== undefined) existing.cost = fields.cost;
+		if (existing.turns === undefined && fields.turns !== undefined) existing.turns = fields.turns;
+		if (!existing.activity && fields.activity) existing.activity = fields.activity;
+		return;
+	}
+	jobRegistry.set(agentId, {
+		agentId,
+		name: fields.name ?? existing?.name ?? "?",
+		task: fields.task ? taskSummary(fields.task) : (existing?.task ?? ""),
+		state: fields.state,
+		startedAt: existing?.startedAt ?? now,
+		endedAt: now,
+		activity: fields.activity ?? existing?.activity,
+		cost: fields.cost ?? existing?.cost,
+		turns: fields.turns ?? existing?.turns,
+		resultText:
+			fields.resultText !== undefined
+				? truncateText(fields.resultText, JOB_RESULT_STORE_CAP)
+				: existing?.resultText,
+	});
+	jobPrune();
+}
+
+function jobStateFromResult(
+	result: SingleResult,
+	extra?: { aborted?: boolean; error?: string },
+): JobState {
+	const aborted = extra?.aborted ?? result.stopReason === "aborted";
+	if (aborted) return "aborted";
+	if (extra?.error || isFailedResult(result)) return "failed";
+	return "ok";
+}
+
+/** Mark job terminal before/with notify so status works even if deliver fails. */
+function ensureJobTerminalFromResult(
+	result: SingleResult,
+	extra?: { aborted?: boolean; error?: string },
+): void {
+	const agentId = result.agentId;
+	if (!agentId) return;
+	const resultText = extra?.error || getResultOutput(result) || result.stderr || "(no output)";
+	jobFinalize(agentId, {
+		name: result.agent,
+		task: result.task,
+		state: jobStateFromResult(result, extra),
+		resultText,
+		cost: result.usage.cost,
+		turns: result.usage.turns,
+	});
+}
+
+function formatElapsedMs(ms: number): string {
+	const s = Math.max(0, Math.floor(ms / 1000));
+	if (s < 60) return `${s}s`;
+	const m = Math.floor(s / 60);
+	const rs = s % 60;
+	if (m < 60) return `${m}m${rs}s`;
+	const h = Math.floor(m / 60);
+	const rm = m % 60;
+	return `${h}h${rm}m`;
+}
+
+function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean }): string {
+	const now = Date.now();
+	if (opts.agentId) {
+		const job = jobRegistry.get(opts.agentId);
+		if (!job) {
+			return `No job found for agentId=${opts.agentId}. Use subagent_status without agentId to list recent jobs.`;
+		}
+		const elapsed =
+			job.state === "running"
+				? formatElapsedMs(now - job.startedAt)
+				: formatElapsedMs((job.endedAt ?? now) - job.startedAt);
+		const cost = typeof job.cost === "number" ? `$${job.cost.toFixed(4)}` : "-";
+		const turns = job.turns ?? "-";
+		const lines = [
+			`agentId: ${job.agentId}`,
+			`name: ${job.name}`,
+			`state: ${job.state}`,
+			`turns: ${turns}`,
+			`cost: ${cost}`,
+			`elapsed: ${elapsed}`,
+			`Task: ${job.task || "(none)"}`,
+		];
+		if (job.state === "running") {
+			lines.push(`activity: ${job.activity || "(starting/idle)"}`);
+		} else {
+			const result = truncateText(job.resultText || "(no result stored)", JOB_RESULT_DISPLAY_CAP);
+			lines.push("Result:", result);
+		}
+		return lines.join("\n");
+	}
+
+	let jobs = [...jobRegistry.values()];
+	if (opts.onlyRunning) jobs = jobs.filter((j) => j.state === "running");
+	if (jobs.length === 0) {
+		return opts.onlyRunning
+			? "No running subagent jobs."
+			: "No subagent jobs recorded in this process.";
+	}
+
+	// running first, then newest endedAt/startedAt
+	jobs.sort((a, b) => {
+		const ar = a.state === "running" ? 0 : 1;
+		const br = b.state === "running" ? 0 : 1;
+		if (ar !== br) return ar - br;
+		const at = a.endedAt ?? a.startedAt;
+		const bt = b.endedAt ?? b.startedAt;
+		return bt - at;
+	});
+
+	const header = `| agentId | name | state | turns | cost | elapsed | preview |`;
+	const sep = `| --- | --- | --- | --- | --- | --- | --- |`;
+	const rows = jobs.map((j) => {
+		const elapsed =
+			j.state === "running"
+				? formatElapsedMs(now - j.startedAt)
+				: formatElapsedMs((j.endedAt ?? now) - j.startedAt);
+		const cost = typeof j.cost === "number" ? `$${j.cost.toFixed(4)}` : "-";
+		const turns = j.turns ?? "-";
+		const previewRaw =
+			j.state === "running"
+				? j.activity || j.task || ""
+				: j.resultText || j.task || "";
+		const preview = previewRaw.replace(/\s+/g, " ").trim().slice(0, 80);
+		return `| ${j.agentId} | ${j.name} | ${j.state} | ${turns} | ${cost} | ${elapsed} | ${preview || "-"} |`;
+	});
+	return [header, sep, ...rows].join("\n");
+}
+
+function generatePipiuiAgentId(): string {
+	return `agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function truncateDoneOutput(output: string, cap = DONE_RESULT_CAP): string {
+	return truncateText(output, cap);
+}
+
+function formatSubagentDoneMessage(
+	result: SingleResult,
+	extra?: { aborted?: boolean; error?: string },
+): string {
+	const aborted = extra?.aborted ?? result.stopReason === "aborted";
+	const ok = !isFailedResult(result) && !aborted && !extra?.error;
+	const output = truncateDoneOutput(
+		extra?.error || getResultOutput(result) || result.stderr || "(no output)",
+	);
+	const cost =
+		typeof result.usage.cost === "number" ? result.usage.cost.toFixed(4) : String(result.usage.cost ?? 0);
+	return [
+		`[subagent-done] agentId=${result.agentId ?? "?"} name=${result.agent} ok=${ok} aborted=${aborted} cost=${cost} turns=${result.usage.turns ?? 0}`,
+		"",
+		`Task: ${result.task}`,
+		"Result:",
+		output,
+	].join("\n");
+}
+
+function deliverSubagentDone(pi: ExtensionAPI, text: string): void {
+	try {
+		pi.sendUserMessage(text, { deliverAs: "followUp" });
+	} catch {
+		try {
+			pi.sendUserMessage(text);
+		} catch (err) {
+			console.error("[pipiui-subagent] failed to deliver [subagent-done]:", err);
+		}
+	}
+}
+
+function notifySubagentDone(
+	pi: ExtensionAPI,
+	result: SingleResult,
+	extra?: { aborted?: boolean; error?: string },
+): void {
+	// Finalize job BEFORE deliver: status must work even if sendUserMessage fails.
+	ensureJobTerminalFromResult(result, extra);
+	deliverSubagentDone(pi, formatSubagentDoneMessage(result, extra));
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -321,21 +619,34 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	options?: RunSingleAgentOptions,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
+	const pipiuiAgentId = options?.agentId ?? generatePipiuiAgentId();
+	const isBackground = options?.background === true;
 
 	if (!agent) {
 		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-		return {
+		const fail: SingleResult = {
 			agent: agentName,
 			agentSource: "unknown",
 			task,
 			exitCode: 1,
 			messages: [],
 			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			usage: emptyUsage(),
 			step,
+			agentId: pipiuiAgentId,
+			stopReason: "error",
+			errorMessage: `Unknown agent: "${agentName}"`,
 		};
+		jobFinalize(pipiuiAgentId, {
+			name: agentName,
+			task,
+			state: "failed",
+			resultText: fail.stderr,
+		});
+		return fail;
 	}
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
@@ -354,12 +665,12 @@ async function runSingleAgent(
 		exitCode: 0,
 		messages: [],
 		stderr: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		usage: emptyUsage(),
 		model: agent.model,
 		step,
+		agentId: pipiuiAgentId,
 	};
 
-	const pipiuiAgentId = `agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 	let pipiuiLastUpdate = 0;
 	let pipiuiActivity = "";
 	pipiuiReport({
@@ -371,7 +682,9 @@ async function runSingleAgent(
 		task,
 		depth: PIPIUI_DEPTH + 1,
 		model: agent.model ?? null,
+		...(isBackground ? { background: true } : {}),
 	});
+	jobUpsertRunning(pipiuiAgentId, agentName, task);
 	const pipiuiUpdate = (force = false) => {
 		const now = Date.now();
 		if (!force && now - pipiuiLastUpdate < 500) return;
@@ -380,6 +693,11 @@ async function runSingleAgent(
 			kind: "update",
 			agentId: pipiuiAgentId,
 			output: (getFinalOutput(currentResult.messages) || "").slice(-4000),
+			activity: pipiuiActivity,
+			cost: currentResult.usage.cost,
+			turns: currentResult.usage.turns,
+		});
+		jobPatchRunning(pipiuiAgentId, {
 			activity: pipiuiActivity,
 			cost: currentResult.usage.cost,
 			turns: currentResult.usage.turns,
@@ -534,16 +852,31 @@ async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
+		const endOk = exitCode === 0 && !currentResult.errorMessage && !wasAborted;
+		if (wasAborted) currentResult.stopReason = currentResult.stopReason ?? "aborted";
 		pipiuiReport({
 			kind: "end",
 			agentId: pipiuiAgentId,
-			ok: exitCode === 0 && !currentResult.errorMessage && !wasAborted,
+			ok: endOk,
 			aborted: wasAborted,
 			output: (getFinalOutput(currentResult.messages) || currentResult.stderr || "").slice(-8000),
 			cost: currentResult.usage.cost,
 			turns: currentResult.usage.turns,
 			contextTokens: currentResult.usage.contextTokens,
 			stopReason: currentResult.stopReason ?? null,
+		});
+		// Terminal job state before notify/return so status works even if follow-up delivery fails.
+		const endState: JobState = wasAborted ? "aborted" : endOk ? "ok" : "failed";
+		const endResultText =
+			getResultOutput(currentResult) || currentResult.stderr || getFinalOutput(currentResult.messages) || "(no output)";
+		jobFinalize(pipiuiAgentId, {
+			name: agentName,
+			task,
+			state: endState,
+			resultText: endResultText,
+			cost: currentResult.usage.cost,
+			turns: currentResult.usage.turns,
+			activity: pipiuiActivity,
 		});
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
@@ -590,15 +923,47 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	background: Type.Optional(
+		Type.Boolean({
+			description:
+				"If true, return immediately after starting agents; completion is delivered later as a follow-up message. Default: true at boss depth (0), false for nested agents or chain mode.",
+		}),
+	),
 });
 
 export default function (pi: ExtensionAPI) {
+	pi.registerTool({
+		name: "subagent_status",
+		label: "Subagent Status",
+		description: [
+			"Query subagent job status in this session process (running / ok / failed / aborted).",
+			"Use when deciding next action, when the user asks for progress, or before re-dispatching.",
+			"Prefer reading finished results via this tool or [subagent-done] over spawning a new agent for the same work.",
+			"Do not busy-loop poll; one check per decision is correct.",
+		].join(" "),
+		parameters: Type.Object({
+			agentId: Type.Optional(Type.String({ description: "If set, return this job only with fuller Result text." })),
+			onlyRunning: Type.Optional(Type.Boolean({ description: "If true, only running jobs. Default false." })),
+		}),
+		async execute(_toolCallId, params) {
+			const text = formatJobsStatus({
+				agentId: params.agentId,
+				onlyRunning: params.onlyRunning === true,
+			});
+			return { content: [{ type: "text", text }] };
+		},
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
+			"Track jobs with subagent_status(agentId?). Never re-spawn a finished task without reading its result via [subagent-done] or subagent_status.",
+			"Do not busy-loop poll; one status check per decision is correct.",
+			"chain and nested (depth>0) are always synchronous. Set background:false to await a single/parallel result.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
@@ -627,15 +992,86 @@ export default function (pi: ExtensionAPI) {
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
 			const hasSingle = Boolean(params.agent && params.task);
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
+			const isChain = hasChain;
+			// Default background at boss depth for single/parallel; chain and nested always sync.
+			const wantBg = params.background ?? (PIPIUI_DEPTH === 0 && !isChain);
+			const useBackground = Boolean(wantBg && !isChain && PIPIUI_DEPTH === 0);
+			const bgIgnoredWarning =
+				params.background === true && (PIPIUI_DEPTH > 0 || isChain)
+					? "Warning: background:true ignored (nested depth>0 or chain mode always runs synchronously).\n\n"
+					: "";
 
 			const makeDetails =
-				(mode: "single" | "parallel" | "chain") =>
+				(mode: "single" | "parallel" | "chain", extra?: { background?: boolean; agentIds?: string[] }) =>
 				(results: SingleResult[]): SubagentDetails => ({
 					mode,
 					agentScope,
 					projectAgentsDir: discovery.projectAgentsDir,
 					results,
+					...(extra?.background ? { background: true } : {}),
+					...(extra?.agentIds ? { agentIds: extra.agentIds } : {}),
 				});
+
+			const startBackgroundAgent = (
+				agentName: string,
+				task: string,
+				cwd: string | undefined,
+				agentId: string,
+				mode: "single" | "parallel",
+			): void => {
+				void runSingleAgent(
+					ctx.cwd,
+					agents,
+					agentName,
+					task,
+					cwd,
+					undefined,
+					undefined, // do not bind parent abort — turn abort must not kill background workers
+					undefined,
+					makeDetails(mode, { background: true, agentIds: [agentId] }),
+					{ background: true, agentId },
+				)
+					.then((result) => {
+						notifySubagentDone(pi, result);
+					})
+					.catch((err) => {
+						const msg = err instanceof Error ? err.message : String(err);
+						console.error("[pipiui-subagent] background agent error:", agentId, msg);
+						const aborted = /abort/i.test(msg);
+						notifySubagentDone(
+							pi,
+							{
+								agent: agentName,
+								agentId,
+								agentSource: agents.find((a) => a.name === agentName)?.source ?? "unknown",
+								task,
+								exitCode: 1,
+								messages: [],
+								stderr: msg,
+								errorMessage: msg,
+								usage: emptyUsage(),
+								stopReason: aborted ? "aborted" : "error",
+							},
+							{ aborted, error: msg },
+						);
+					});
+			};
+
+			const formatStartedMessage = (
+				items: { agentId: string; name: string; task: string }[],
+			): string => {
+				const lines = items.map(
+					(it) =>
+						`- agentId=${it.agentId} name=${it.name} task=${it.task.length > 120 ? `${it.task.slice(0, 120)}...` : it.task}`,
+				);
+				return (
+					`${bgIgnoredWarning}Started background agent(s) (${items.length}). ` +
+					"You will receive a completion signal per agent when each finishes. " +
+					"Do not busy-loop poll; use subagent_status before re-dispatch. " +
+					"Continue other work or dispatch more independent agents.\n\n" +
+					lines.join("\n")
+				);
+			};
 
 			if (modeCount !== 1) {
 				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
@@ -715,7 +1151,12 @@ export default function (pi: ExtensionAPI) {
 					if (isError) {
 						const errorMsg = getResultOutput(result);
 						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
+							content: [
+								{
+									type: "text",
+									text: `${bgIgnoredWarning}Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}`,
+								},
+							],
 							details: makeDetails("chain")(results),
 							isError: true,
 						};
@@ -723,7 +1164,14 @@ export default function (pi: ExtensionAPI) {
 					previousOutput = getFinalOutput(result.messages);
 				}
 				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+					content: [
+						{
+							type: "text",
+							text:
+								bgIgnoredWarning +
+								(getFinalOutput(results[results.length - 1].messages) || "(no output)"),
+						},
+					],
 					details: makeDetails("chain")(results),
 				};
 			}
@@ -740,6 +1188,92 @@ export default function (pi: ExtensionAPI) {
 						details: makeDetails("parallel")([]),
 					};
 
+				if (useBackground) {
+					const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+					const unknown = params.tasks.filter((t) => !agents.some((a) => a.name === t.agent));
+					if (unknown.length > 0) {
+						const names = unknown.map((t) => `"${t.agent}"`).join(", ");
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Unknown agent(s): ${names}. Available agents: ${available}.`,
+								},
+							],
+							details: makeDetails("parallel")([]),
+							isError: true,
+						};
+					}
+
+					const startedItems: { agentId: string; name: string; task: string }[] = [];
+					const placeholders: SingleResult[] = [];
+					const agentIds: string[] = [];
+
+					for (const t of params.tasks) {
+						const agentCfg = agents.find((a) => a.name === t.agent)!;
+						const agentId = generatePipiuiAgentId();
+						agentIds.push(agentId);
+						startedItems.push({ agentId, name: t.agent, task: t.task });
+						placeholders.push({
+							agent: t.agent,
+							agentId,
+							agentSource: agentCfg.source,
+							task: t.task,
+							exitCode: -1,
+							messages: [],
+							stderr: "",
+							usage: emptyUsage(),
+							model: agentCfg.model,
+						});
+					}
+
+					// Fire-and-forget with the same concurrency cap; each task notifies on its own completion.
+					void mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
+						const agentId = agentIds[index];
+						try {
+							const result = await runSingleAgent(
+								ctx.cwd,
+								agents,
+								t.agent,
+								t.task,
+								t.cwd,
+								undefined,
+								undefined, // no parent abort binding
+								undefined,
+								makeDetails("parallel", { background: true, agentIds }),
+								{ background: true, agentId },
+							);
+							notifySubagentDone(pi, result);
+							return result;
+						} catch (err) {
+							const msg = err instanceof Error ? err.message : String(err);
+							console.error("[pipiui-subagent] background parallel agent error:", agentId, msg);
+							const aborted = /abort/i.test(msg);
+							const failResult: SingleResult = {
+								agent: t.agent,
+								agentId,
+								agentSource: agents.find((a) => a.name === t.agent)?.source ?? "unknown",
+								task: t.task,
+								exitCode: 1,
+								messages: [],
+								stderr: msg,
+								errorMessage: msg,
+								usage: emptyUsage(),
+								stopReason: aborted ? "aborted" : "error",
+							};
+							notifySubagentDone(pi, failResult, { aborted, error: msg });
+							return failResult;
+						}
+					}).catch((err) => {
+						console.error("[pipiui-subagent] background parallel runner error:", err);
+					});
+
+					return {
+						content: [{ type: "text", text: formatStartedMessage(startedItems) }],
+						details: makeDetails("parallel", { background: true, agentIds })(placeholders),
+					};
+				}
+
 				// Track all results for streaming updates
 				const allResults: SingleResult[] = new Array(params.tasks.length);
 
@@ -752,7 +1286,7 @@ export default function (pi: ExtensionAPI) {
 						exitCode: -1, // -1 = still running
 						messages: [],
 						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+						usage: emptyUsage(),
 					};
 				}
 
@@ -804,7 +1338,9 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
+							text:
+								bgIgnoredWarning +
+								`Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
 						},
 					],
 					details: makeDetails("parallel")(results),
@@ -812,6 +1348,49 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
+				if (useBackground) {
+					const agentCfg = agents.find((a) => a.name === params.agent);
+					if (!agentCfg) {
+						const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Unknown agent: "${params.agent}". Available agents: ${available}.`,
+								},
+							],
+							details: makeDetails("single")([]),
+							isError: true,
+						};
+					}
+					const agentId = generatePipiuiAgentId();
+					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single");
+					const placeholder: SingleResult = {
+						agent: params.agent,
+						agentId,
+						agentSource: agentCfg.source,
+						task: params.task,
+						exitCode: -1,
+						messages: [],
+						stderr: "",
+						usage: emptyUsage(),
+						model: agentCfg.model,
+					};
+					return {
+						content: [
+							{
+								type: "text",
+								text: formatStartedMessage([
+									{ agentId, name: params.agent, task: params.task },
+								]),
+							},
+						],
+						details: makeDetails("single", { background: true, agentIds: [agentId] })([
+							placeholder,
+						]),
+					};
+				}
+
 				const result = await runSingleAgent(
 					ctx.cwd,
 					agents,
@@ -827,13 +1406,23 @@ export default function (pi: ExtensionAPI) {
 				if (isError) {
 					const errorMsg = getResultOutput(result);
 					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+						content: [
+							{
+								type: "text",
+								text: `${bgIgnoredWarning}Agent ${result.stopReason || "failed"}: ${errorMsg}`,
+							},
+						],
 						details: makeDetails("single")([result]),
 						isError: true,
 					};
 				}
 				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+					content: [
+						{
+							type: "text",
+							text: bgIgnoredWarning + (getFinalOutput(result.messages) || "(no output)"),
+						},
+					],
 					details: makeDetails("single")([result]),
 				};
 			}
@@ -916,6 +1505,18 @@ export default function (pi: ExtensionAPI) {
 
 			if (details.mode === "single" && details.results.length === 1) {
 				const r = details.results[0];
+				const isRunning = r.exitCode === -1 || details.background === true;
+				// Background tool result is an immediate "started" placeholder; prefer content text.
+				if (isRunning && details.background) {
+					const text = result.content[0];
+					const body = text?.type === "text" ? text.text : "(background agent started)";
+					const header =
+						theme.fg("warning", "⏳") +
+						" " +
+						theme.fg("toolTitle", theme.bold(r.agent)) +
+						theme.fg("muted", ` (${r.agentSource}) background`);
+					return new Text(`${header}\n${theme.fg("dim", body)}`, 0, 0);
+				}
 				const isError = isFailedResult(r);
 				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
 				const displayItems = getDisplayItems(r.messages);

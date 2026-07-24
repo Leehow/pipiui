@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build PipiUI.app bundle from the SPM executable
+# Build PipiUI.app bundle from the SPM executable (release).
+# CONSTITUTION.md: 编译通过即打包 — this is the canonical ship path for build/PipiUI.app.
 set -e
 cd "$(dirname "$0")"
 swift build -c release
@@ -34,4 +35,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 codesign --force --sign - "$APP" 2>/dev/null || true
+BIN="$APP/Contents/MacOS/PipiUI"
 echo "Built $APP"
+echo "Open:  open $APP"
+if [[ -x "$BIN" ]]; then
+  stat -f 'Binary mtime: %Sm  %N' -t '%Y-%m-%d %H:%M:%S' "$BIN"
+fi

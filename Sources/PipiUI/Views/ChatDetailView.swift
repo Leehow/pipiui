@@ -221,6 +221,8 @@ struct ChatDetailView: View {
                             item: item,
                             toolRuns: runs(for: item),
                             subagents: subagents(for: item),
+                            projectURL: session.projectURL,
+                            onFlash: { session.flash($0) },
                             onSelectAgent: selectAgent
                         )
                         .equatable()
@@ -231,6 +233,8 @@ struct ChatDetailView: View {
                             toolRuns: runs(for: streaming),
                             subagents: subagents(for: streaming),
                             isStreaming: session.isStreaming,
+                            projectURL: session.projectURL,
+                            onFlash: { session.flash($0) },
                             onSelectAgent: selectAgent
                         )
                     } else if session.isWorking || session.mediaBusy {

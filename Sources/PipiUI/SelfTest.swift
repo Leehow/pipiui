@@ -677,6 +677,46 @@ enum SelfTest {
               SessionTitleClient.truncateUserMessageForPrompt(longPrompt).count == 500
               && SessionTitleClient.truncateUserMessageForPrompt("  hi  ") == "hi")
 
+        // 15. SubagentDoneMessage parse (collapsed bubble input)
+        do {
+            let sample = """
+                [subagent-done] agentId=a1 name=explore ok=true aborted=false cost=0.0123 turns=4
+
+                Task: dig into SidebarView
+                Result:
+                fixed the indicator
+                more lines here
+                """.trimmingCharacters(in: .whitespacesAndNewlines)
+            let p = SubagentDoneMessage.parse(sample)
+            check("subagent-done parse ok", p != nil)
+            check("subagent-done fields",
+                  p?.name == "explore"
+                  && p?.ok == true
+                  && p?.aborted == false
+                  && p?.cost == "0.0123"
+                  && p?.outcome == .ok
+                  && p?.task == "dig into SidebarView"
+                  && (p?.result.contains("fixed the indicator") == true),
+                  "\(String(describing: p))")
+
+            let failSample = "[subagent-done] agentId=x name=worker ok=false aborted=false cost=1 turns=2\n\nTask: t\nResult:\nbad"
+            check("subagent-done fail outcome",
+                  SubagentDoneMessage.parse(failSample)?.outcome == .fail)
+
+            let abortSample = "[subagent-done] agentId=x name=worker ok=false aborted=true cost=0 turns=0\n\nTask: t\nResult:\nstopped"
+            check("subagent-done aborted outcome",
+                  SubagentDoneMessage.parse(abortSample)?.outcome == .aborted)
+
+            check("subagent-done rejects plain user text",
+                  SubagentDoneMessage.parse("hello world") == nil)
+
+            // Prefix only / broken body still parses header for collapse title
+            let bare = "[subagent-done] name=z ok=true aborted=false"
+            let bareP = SubagentDoneMessage.parse(bare)
+            check("subagent-done bare header",
+                  bareP?.name == "z" && bareP?.task.isEmpty == true && bareP?.result.isEmpty == true)
+        }
+
         print("---")
         if failures.isEmpty {
             print("ALL PASSED")

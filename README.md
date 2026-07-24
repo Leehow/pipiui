@@ -7,7 +7,8 @@
 - **左侧栏**：项目文件夹管理（持久化）+ 每个项目的历史会话列表（从 `~/.pi/agent/sessions/` 自动发现，显示会话名和时间）
 - **会话**：新建 / 点击恢复历史会话；每个打开的会话独立一个 `pi --mode rpc` 子进程，后台会话继续运行（绿点表示正在生成）
 - **聊天区**：用户气泡、Markdown 正文（含围栏代码块）、Thinking 折叠块、工具调用卡片（bash/read/edit 图标、实时流式输出、成功/失败状态、可展开）
-- **输入栏**：Enter 发送；生成中消息进入会话 follow-up 队列（完成后按序发送），可「撤回编辑」；停止按钮在有队列时为「中止并发送队首」；模型/thinking 菜单；多图附件（粘贴/拖入/选文件预览，经 RPC `images` 发给模型，用户气泡与历史会话可显示图片）
+- **输入栏**：Enter 发送；生成中消息进入会话 follow-up 队列（完成后按序发送），可「撤回编辑」；停止按钮在有队列时为「中止并发送队首」；模型/thinking 菜单；多图附件（粘贴/拖入/选文件预览，经 RPC `images` 发给模型；用户/助手/工具图片可点击放大、右键「在访达中显示 / 打开 / 存储…」）
+- **路径链接**：Markdown 正文与工具参数/输出中的绝对路径、`file://` 可点击并在访达中显示（围栏代码块内不链接）
 - **斜杠命令**：输入 `/` 弹出补全面板（↑↓ 选择，Tab 补全，Enter 执行，Esc 关闭）；内置 `/compact` `/new` `/name` `/session` `/export` `/copy` `/quit` `/model` `/reload` 走本地/GUI 或专用 RPC；扩展/prompt/skill 来自启动时 `get_commands`，经 `prompt` 发送（忙时入队）
 - **状态**：顶栏实时显示会话费用和上下文占用百分比；自动重试 / 压缩事件有提示
 
@@ -63,10 +64,21 @@
 
 ## 构建运行
 
+**宪章（强制）：编译通过后必须更新 `build/PipiUI.app`。** 详见 [`CONSTITUTION.md`](./CONSTITUTION.md)；agent 入口见 [`AGENTS.md`](./AGENTS.md)。仅 `swift build` / `swift run` 成功而 `.app` 仍旧时，不得宣称「可打开 App」。
+
 ```bash
-swift run              # 开发运行
-./make-app.sh          # 构建 release 并打包 build/PipiUI.app
+swift run                 # 开发调试（不更新 .app）
+./make-app.sh             # release 构建并打包 → build/PipiUI.app（交付路径）
+./scripts/build-app.sh    # 可选：先 swift test 再 make-app.sh（--skip-tests 跳过测试）
 open build/PipiUI.app
+```
+
+打包后核对二进制新于源码，例如：
+
+```bash
+stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
+  build/PipiUI.app/Contents/MacOS/PipiUI \
+  Sources/PipiUI/Views/ImagePreview.swift
 ```
 
 要求：macOS 14+，已安装 pi CLI（在 `~/.npm-global/bin/pi`、`/opt/homebrew/bin` 或 PATH 中可找到）。
@@ -74,6 +86,7 @@ open build/PipiUI.app
 单测（本机仅 CLT、无 XCTest 时用自研 runner）：
 
 ```bash
+swift test                # 有 XCTest 时
 swift run PipiUITestRunner
 ```
 
@@ -93,6 +106,7 @@ swift run PipiUITestRunner
 ## 已知限制（v1）
 
 - 扩展的交互式对话框（select/confirm/input）暂不弹窗：confirm 自动拒绝、其余自动取消，并在对话流里提示
-- 聊天气泡内图片暂不支持点击放大/保存；assistant/tool 结果中的图不渲染
-- Markdown 为简化渲染（行内语法 + 代码块），无表格/语法高亮
+- 图片灯箱为等比适应窗口，暂不支持捏合/滚轮缩放与多图左右翻页；无 path 时依赖 `.pi/attachments` 内容匹配或「存储…」
+- 绝对路径自动链接 v1：不识别带空格的路径；围栏代码块内不做路径链接
+- Markdown 为简化渲染（行内语法 + 代码块/表格），无语法高亮
 - 斜杠命令 v1：无 `/model` 模型列表补全（手输 id）；TUI 专有且无 RPC 的命令（`/settings` `/login` `/share` `/import` `/trust` `/hotkeys` `/scoped-models`）不出现在面板；扩展交互对话框仍自动取消；流式中 extension/prompt/skill 命令会排队、无法即时执行（`/reload` 等 builtin 可即时执行）
