@@ -777,6 +777,9 @@ private extension View {
                 }
             }
             .onPreferenceChange(StickySectionIdKey.self) { pick in
+                // Freeze sticky target while the window chrome is dragged — geometry
+                // thrash made the bar swim even when root layout was stable.
+                guard NSApp.keyWindow?.inLiveResize != true else { return }
                 if let pick { stickySectionId.wrappedValue = pick.id }
             }
             .safeAreaInset(edge: .top, spacing: 0) {
