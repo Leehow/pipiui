@@ -235,22 +235,23 @@ private struct ChatDetailViewBody: View {
         let hidden = max(0, items.count - visibleCount)
         return ScrollViewReader { proxy in
             ScrollView {
-                // VStack (NOT LazyVStack): a bottom-anchored LazyVStack leaves the rows
-                // above the "bottom" anchor unrealized after `proxy.scrollTo("bottom")`,
-                // so the pane renders blank until a real scroll forces realization
-                // (ScrollDiagnostics: subviews=1 — BLANK). The resize cost of realizing
-                // all ~150 suffix rows is now mitigated by ResizeThrottle (~60fps cap,
-                // App.swift) and the removal of per-node GeometryReaders in PathLinkedText.
+                // LazyVStack: only realizes the ~10 rows in the visible viewport, not all
+                // of suffix(~150). This is what makes a long transcript cheap to re-layout
+                // on window resize — the structural win on top of ResizeThrottle + the
+                // per-node GeometryReader removal.
                 //
-                // NOTE: LazyVStack was attempted again in ed9a440 with a `.task(id:)` +
-                // Task.sleep realization strategy. It still blanked — the problem is not
-                // timing. `defaultScrollAnchor(.bottom)` pins the offset before any row
-                // realizes, the visible rect then contains no rows, and LazyVStack only
-                // realizes rows in the visible rect — a chicken-and-egg lock no amount of
-                // sleeping breaks. Making LazyVStack work requires abandoning the bottom
-                // anchor and laying out top-down first, then scrolling; that is a separate,
-                // larger change. Do NOT re-attempt by just tweaking the retry schedule.
-                VStack(alignment: .leading, spacing: 14) {
+                // History of this being a VStack, and why it is Lazy again:
+                // The original LazyVStack blanked because `.defaultScrollAnchor(.bottom)`
+                // (removed below) pinned the scroll offset before any row realized — the
+                // visible rect then contained no rows, and LazyVStack only realizes rows in
+                // the visible rect: a chicken-and-egg lock (ScrollDiagnostics: subviews=1).
+                // ed9a440 tried to fix it with `.task(id:)` + Task.sleep; that still blanked
+                // because the problem is layout strategy, not timing. This attempt removes
+                // the bottom anchor so the ScrollView lays out top-down (rows realize
+                // normally), then scrolls to the bottom once history arrives — see the
+                // `onChange(of: session.isInitializing)` below. SubagentPanel uses this same
+                // no-anchor + LazyVStack pattern and has never blanked.
+                LazyVStack(alignment: .leading, spacing: 14) {
                     if hidden > 0 {
                         Button("显示更早的 \(hidden) 条消息") {
                             session.transcriptVisibleCount += 200
@@ -294,8 +295,22 @@ private struct ChatDetailViewBody: View {
                 }
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                // Force synchronous geometry measurement of the transcript content.
+                // Without this, a LazyVStack reports an *estimated* content size for the
+                // rows it hasn't realized, so proxy.scrollTo("bottom") can land on a wrong
+                // offset and then jump as rows realize and the estimate corrects.
+                // geometryGroup makes the measured size deterministic, which is what lets
+                // the programmatic scroll-to-bottom settle correctly without the bottom
+                // anchor. (Available macOS 14+. See ChatDetailView history in git for the
+                // two prior failed attempts without this.)
+                .geometryGroup()
             }
-            .defaultScrollAnchor(.bottom)
+            // No `.defaultScrollAnchor(.bottom)`: with a LazyVStack the bottom anchor pins
+            // the scroll offset before any row realizes, leaving the visible rect empty so
+            // the lazy stack realizes nothing (white-screen — see the comment on the stack
+            // above). Laying out top-down instead lets rows realize normally; we then scroll
+            // to the bottom programmatically once history arrives (onAppear + the
+            // isInitializing onChange below).
             .overlay(alignment: .bottomTrailing) {
                 if !session.pinTranscriptToBottom {
                     Button {
@@ -317,11 +332,16 @@ private struct ChatDetailViewBody: View {
                 }
             }
             .overlay {
-                // Fills the pane while pi boots and the initial transcript is built,
-                // so a new or resuming session shows progress rather than blank white.
-                // Only shown when there is nothing to look at yet — a resumed session
-                // whose history is already on screen should not be covered.
-                if session.isInitializing && session.transcript.isEmpty && session.streamingItem == nil {
+                // Covers the pane while pi boots and the initial transcript is built,
+                // AND through the first bottom-settle of a resumed session. Without the
+                // bottom scroll anchor (removed above), a resumed session's first frame
+                // shows the TOP of history before the programmatic scroll-to-bottom lands.
+                // Keeping the overlay up for the whole `isInitializing` window hides that
+                // flash — isInitializing flips false only after history is assigned and the
+                // settle scroll is dispatched (see onChange(of: isInitializing) above).
+                // `streamingItem == nil` guards against covering live content in the rare
+                // case streaming has already started (deferred events replay after init).
+                if session.isInitializing && session.streamingItem == nil {
                     SessionLoadingView()
                         .transition(.opacity)
                 }
@@ -329,14 +349,12 @@ private struct ChatDetailViewBody: View {
             .animation(.easeInOut(duration: 0.2), value: session.isInitializing)
             .animation(.easeInOut(duration: 0.15), value: session.pinTranscriptToBottom)
             .onAppear {
-                // Unconditional, unlike every other call site. A freshly built
-                // transcript (`.id(session.id)` gives each session its own) starts at
-                // `defaultScrollAnchor(.bottom)`, which a LazyVStack can only estimate
-                // while its rows are unrealized — the estimate lands the viewport past
-                // the real content and the user sees a blank pane until they scroll.
-                // Forcing an explicit scroll realizes the rows and settles the offset.
-                // (VStack realizes eagerly so this is belt-and-suspenders, but it also
-                //  corrects the initial offset on first appearance.)
+                // A freshly built transcript starts at the TOP (no bottom anchor — see
+                // the comment where the anchor was removed). For a session whose history
+                // is already loaded by the time this view appears, this scrolls to the
+                // bottom right away. For a session still initializing (history loading
+                // off-main), the transcript is empty here and this scrolls an empty stack
+                // — the real settle happens in the `onChange(of: isInitializing)` below.
                 forceScrollToBottom(proxy)
             }
             .onChange(of: session.id) { _, _ in
@@ -347,6 +365,19 @@ private struct ChatDetailViewBody: View {
                 scrollNeedsRetry = false
                 if session.pinTranscriptToBottom {
                     scrollToBottom(proxy, retry: true)
+                }
+            }
+            .onChange(of: session.isInitializing) { wasInitializing, isInitializing in
+                // The moment history arrives: isInitializing flips true→false once the
+                // initial transcript is built and assigned (ChatSession.applyInitialTranscript).
+                // This is the authoritative "content is ready" signal — far more reliable
+                // than guessing a Task.sleep delay. By the time this fires the transcript
+                // array is populated, but the LazyVStack may still be realizing its bottom
+                // rows, so retry lets a couple of layout passes complete before the scroll
+                // lands. Without this, a resumed session shows the TOP of history because
+                // onAppear's forceScrollToBottom ran against an empty transcript.
+                if wasInitializing && !isInitializing {
+                    forceScrollToBottom(proxy)
                 }
             }
             .onChange(of: session.transcript.count) { _, _ in
