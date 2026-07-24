@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Plain button whose label foreground shifts on hover/press.
@@ -43,8 +44,28 @@ struct HoverRowBackground: ViewModifier {
     }
 }
 
+/// Shows the pointing-hand cursor while the pointer is over a tappable region.
+struct PointingHandCursor: ViewModifier {
+    var enabled: Bool = true
+
+    func body(content: Content) -> some View {
+        content.onHover { hovering in
+            guard enabled else { return }
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+    }
+}
+
 extension View {
     func hoverRowBackground(cornerRadius: CGFloat = 6) -> some View {
         modifier(HoverRowBackground(cornerRadius: cornerRadius))
+    }
+
+    func pointingHandCursor(_ enabled: Bool = true) -> some View {
+        modifier(PointingHandCursor(enabled: enabled))
     }
 }

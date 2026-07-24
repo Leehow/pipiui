@@ -5,7 +5,7 @@ final class ChatTypographyTests: XCTestCase {
     func testDefaultMakeUses15() {
         let t = ChatTypography.make(fontSize: ChatTypography.defaultFontSize)
         XCTAssertEqual(t.fontSize, 15)
-        XCTAssertEqual(t.lineSpacing, 15 * 0.3, accuracy: 0.001)
+        XCTAssertEqual(t.lineSpacing, 15 * 0.5, accuracy: 0.001)
         XCTAssertEqual(t.messageSpacing, 22, accuracy: 0.001)
         XCTAssertEqual(t.blockSpacing, 10, accuracy: 0.001)
     }

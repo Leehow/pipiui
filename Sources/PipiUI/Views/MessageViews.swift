@@ -1,6 +1,26 @@
 import SwiftUI
 import AppKit
 
+/// Adjacent transcript text events form one user-visible message body. Keeping them together
+/// gives the AppKit markdown host one NSTextStorage, so selection can cross event boundaries.
+enum MessageTextBlocks {
+    static func mergeAdjacent(_ blocks: [ChatBlock]) -> [ChatBlock] {
+        var merged: [ChatBlock] = []
+        for block in blocks {
+            guard case .text(let text) = block else {
+                merged.append(block)
+                continue
+            }
+            guard case .text(let previous)? = merged.last else {
+                merged.append(block)
+                continue
+            }
+            merged[merged.count - 1] = .text(previous + "\n\n" + text)
+        }
+        return merged
+    }
+}
+
 /// 单条消息行。只依赖自己的 item 和相关 toolRuns/subagents（Equatable），
 /// 流式更新时未变化的行不会重新计算 body。
 struct MessageRow: View, Equatable {
@@ -109,45 +129,15 @@ struct MessageRow: View, Equatable {
     }
 
     private var assistantView: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(item.blocks.enumerated()), id: \.offset) { _, block in
-                switch block {
-                case .text(let text):
-                    MarkdownTextView(text: text, onFlash: onFlash)
-                case .thinking(let text):
-                    ThinkingBlockView(text: text, isStreaming: isStreaming)
-                case .toolCall(let call):
-                    if call.name == "subagent", !agentsFor(call).isEmpty {
-                        SubagentToolCardView(
-                            call: call,
-                            run: toolRuns[call.id],
-                            agents: agentsFor(call),
-                            onSelect: onSelectAgent
-                        )
-                    } else {
-                        ToolCardView(
-                            call: call,
-                            run: toolRuns[call.id],
-                            projectURL: projectURL,
-                            onFlash: onFlash
-                        )
-                    }
-                case .image(let img):
-                    ImageThumbnailView(
-                        data: img.data,
-                        mimeType: img.mimeType,
-                        path: img.path,
-                        maxWidth: 360,
-                        maxHeight: 240,
-                        projectURL: projectURL,
-                        onFlash: onFlash
-                    )
-                case .video(let vid):
-                    VideoBlockView(path: vid.path, onFlash: onFlash)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        AssistantSegmentsView(
+            segments: AssistantBlockLayout.plan(blocks: item.blocks, groupFinished: !isStreaming),
+            toolRuns: toolRuns,
+            subagents: subagents,
+            isStreaming: isStreaming,
+            projectURL: projectURL,
+            onFlash: onFlash,
+            onSelectAgent: onSelectAgent
+        )
     }
 
     private var plainText: String {
@@ -173,13 +163,91 @@ struct MessageRow: View, Equatable {
             return nil
         }
     }
+}
 
-    /// 属于某次 subagent 工具调用的 agent（含它们的子孙）
+/// Renders planned assistant segments (single message or coalesced tool-round run).
+struct AssistantSegmentsView: View, Equatable {
+    let segments: [AssistantBlockLayout.Segment]
+    let toolRuns: [String: ToolRun]
+    var subagents: [SubagentInfo] = []
+    var isStreaming: Bool = false
+    var projectURL: URL? = nil
+    var onFlash: ((String) -> Void)? = nil
+    var onSelectAgent: ((String) -> Void)?
+
+    static func == (lhs: AssistantSegmentsView, rhs: AssistantSegmentsView) -> Bool {
+        lhs.segments == rhs.segments
+            && lhs.toolRuns == rhs.toolRuns
+            && lhs.subagents == rhs.subagents
+            && lhs.isStreaming == rhs.isStreaming
+            && lhs.projectURL == rhs.projectURL
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                switch segment {
+                case .text(let text):
+                    MarkdownTextView(text: text, onFlash: onFlash)
+                case .image(let img):
+                    ImageThumbnailView(
+                        data: img.data,
+                        mimeType: img.mimeType,
+                        path: img.path,
+                        maxWidth: 360,
+                        maxHeight: 240,
+                        projectURL: projectURL,
+                        onFlash: onFlash
+                    )
+                case .video(let vid):
+                    VideoBlockView(path: vid.path, onFlash: onFlash)
+                case .singleton(let block):
+                    assistantBlockView(block)
+                case .finishedGroup(let blocks):
+                    FinishedNonTextGroupView(
+                        blocks: blocks,
+                        toolRuns: toolRuns,
+                        subagents: subagents,
+                        projectURL: projectURL,
+                        onFlash: onFlash,
+                        onSelectAgent: onSelectAgent
+                    )
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func assistantBlockView(_ block: ChatBlock) -> some View {
+        switch block {
+        case .thinking(let text):
+            ThinkingBlockView(text: text, isStreaming: isStreaming)
+        case .toolCall(let call):
+            if call.name == "subagent", !agentsFor(call).isEmpty {
+                SubagentToolCardView(
+                    call: call,
+                    run: toolRuns[call.id],
+                    agents: agentsFor(call),
+                    onSelect: onSelectAgent
+                )
+            } else {
+                ToolCardView(
+                    call: call,
+                    run: toolRuns[call.id],
+                    projectURL: projectURL,
+                    onFlash: onFlash
+                )
+            }
+        case .text, .image, .video:
+            EmptyView()
+        }
+    }
+
     private func agentsFor(_ call: ToolCallBlock) -> [SubagentInfo] {
         let roots = subagents.filter { $0.toolCallId == call.id }
         guard !roots.isEmpty else { return [] }
         let rootIds = Set(roots.map(\.id))
-        // 子孙：parentId 链上挂在这些根下的（一般就两层，线性扫即可）
         var result = roots
         var frontier = rootIds
         while true {
@@ -255,6 +323,7 @@ struct SubagentToolCardView: View {
                     .padding(.vertical, 6)
                     .contentShape(Rectangle())
                     .onTapGesture { onSelect?(agent.id) }
+                    .pointingHandCursor(onSelect != nil)
                 }
             }
         }
@@ -452,7 +521,28 @@ struct SubagentDoneBubbleView: View {
     }
 
     var body: some View {
-        DisclosureGroup(isExpanded: $expanded) {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: outcomeIcon)
+                    .foregroundStyle(outcomeColor)
+                    .imageScale(.medium)
+                Text(summaryTitle)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { expanded.toggle() }
+            .pointingHandCursor()
+            .accessibilityAddTraits(.isButton)
+            .accessibilityValue(expanded ? "已展开" : "已折叠")
+
+            if expanded {
             VStack(alignment: .leading, spacing: 8) {
                 if let parsed {
                     if !parsed.task.isEmpty {
@@ -483,16 +573,6 @@ struct SubagentDoneBubbleView: View {
                 }
             }
             .padding(.top, 6)
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: outcomeIcon)
-                    .foregroundStyle(outcomeColor)
-                    .imageScale(.medium)
-                Text(summaryTitle)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
             }
         }
         .padding(.horizontal, 12)
@@ -642,11 +722,7 @@ struct ThinkingBlockView: View {
     private static let streamingMaxHeight: CGFloat = 240
 
     var body: some View {
-        DisclosureGroup(isExpanded: $expanded) {
-            content
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 4)
-        } label: {
+        VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 Label("Thinking", systemImage: "brain")
                     .font(.caption.weight(.medium))
@@ -660,6 +736,21 @@ struct ThinkingBlockView: View {
                     ProgressView()
                         .controlSize(.mini)
                 }
+                Spacer(minLength: 0)
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { expanded.toggle() }
+            .pointingHandCursor()
+            .accessibilityAddTraits(.isButton)
+            .accessibilityValue(expanded ? "已展开" : "已折叠")
+
+            if expanded {
+            content
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
             }
         }
         .padding(.horizontal, 12)
@@ -705,6 +796,104 @@ struct ThinkingBlockView: View {
             }
             .frame(maxHeight: Self.fullMaxHeight)
         }
+    }
+}
+
+/// Collapsed summary for consecutive finished thinking/toolCall rows between text/media.
+struct FinishedNonTextGroupView: View {
+    let blocks: [ChatBlock]
+    let toolRuns: [String: ToolRun]
+    var subagents: [SubagentInfo] = []
+    var projectURL: URL? = nil
+    var onFlash: ((String) -> Void)? = nil
+    var onSelectAgent: ((String) -> Void)?
+    @State private var expanded = false
+
+    private var title: String {
+        AssistantBlockLayout.summaryTitle(for: blocks)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "rectangle.stack")
+                    .foregroundStyle(.secondary)
+                    .imageScale(.medium)
+                Text(title)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { expanded.toggle() }
+            .pointingHandCursor()
+            .accessibilityAddTraits(.isButton)
+            .accessibilityLabel(title)
+            .accessibilityValue(expanded ? "已展开" : "已折叠")
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                        memberView(block)
+                    }
+                }
+                .padding(.top, 8)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.primary.opacity(0.035))
+        )
+    }
+
+    @ViewBuilder
+    private func memberView(_ block: ChatBlock) -> some View {
+        switch block {
+        case .thinking(let text):
+            ThinkingBlockView(text: text, isStreaming: false)
+        case .toolCall(let call):
+            if call.name == "subagent", !agentsFor(call).isEmpty {
+                SubagentToolCardView(
+                    call: call,
+                    run: toolRuns[call.id],
+                    agents: agentsFor(call),
+                    onSelect: onSelectAgent
+                )
+            } else {
+                ToolCardView(
+                    call: call,
+                    run: toolRuns[call.id],
+                    projectURL: projectURL,
+                    onFlash: onFlash
+                )
+            }
+        case .text, .image, .video:
+            EmptyView()
+        }
+    }
+
+    private func agentsFor(_ call: ToolCallBlock) -> [SubagentInfo] {
+        let roots = subagents.filter { $0.toolCallId == call.id }
+        guard !roots.isEmpty else { return [] }
+        let rootIds = Set(roots.map(\.id))
+        var result = roots
+        var frontier = rootIds
+        while true {
+            let children = subagents.filter { a in
+                a.parentId.map { frontier.contains($0) } == true && !result.contains(where: { $0.id == a.id })
+            }
+            if children.isEmpty { break }
+            result.append(contentsOf: children)
+            frontier = Set(children.map(\.id))
+        }
+        return result
     }
 }
 
@@ -794,20 +983,22 @@ struct ToolCardView: View {
                         .foregroundStyle(statusColor)
                         .font(.caption)
                 }
-                // Expand only controls long text output; images always show.
+                // The complete header is the disclosure target; the chevron remains an affordance.
                 if hasTextOutput {
-                    Button {
-                        expanded.toggle()
-                    } label: {
-                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                            .font(.caption)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if hasTextOutput { expanded.toggle() }
+            }
+            .pointingHandCursor(hasTextOutput)
+            .accessibilityAddTraits(hasTextOutput ? .isButton : [])
+            .accessibilityValue(hasTextOutput ? (expanded ? "已展开" : "已折叠") : "")
 
             // Always show tool result thumbnails (even when collapsed).
             if !toolImages.isEmpty {

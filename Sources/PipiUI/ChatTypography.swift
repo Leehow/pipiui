@@ -20,7 +20,9 @@ struct ChatTypography: Equatable {
 
     static func make(fontSize raw: CGFloat) -> ChatTypography {
         let fontSize = sanitizedFontSize(raw)
-        let lineSpacing = fontSize * 0.3
+        // ~CSS line-height 1.7 (SwiftUI lineSpacing is extra atop ~1.2× system leading).
+        // Chinese technical replies read better near 1.7 than the WCAG floor (~1.5).
+        let lineSpacing = fontSize * 0.5
         let messageSpacing = min(
             28,
             max(16, 18 + (fontSize - 13) * 2)

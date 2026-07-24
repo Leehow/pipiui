@@ -13,7 +13,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         UIEventLog.shared.install()
+        #if DEBUG
+        // Global clip-view observers — keep off release scroll path.
         ScrollDiagnostics.shared.install()
+        #endif
         LaunchDiagnostics.scheduleSnapshots()
     }
 

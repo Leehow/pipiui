@@ -1,12 +1,11 @@
 import SwiftUI
 
-/// Flips a view 180° (and mirrors X) so a newest-first LazyVStack reads as a
-/// bottom-anchored chat transcript. Apply to the stack *and* each row so text
-/// stays upright. Pattern used by Stream Chat / common SwiftUI inverted lists.
+/// Vertically flips a view so a newest-first LazyVStack reads as a bottom-anchored
+/// chat. Apply to the `ScrollView` *and* each row (row flip cancels the container
+/// flip so text stays upright). Prefer `scaleEffect(y: -1)` over `rotationEffect`:
+/// rotating a tall stack around its center does not invert the visible clip.
 extension View {
     func transcriptFlip() -> some View {
-        self
-            .rotationEffect(.radians(.pi))
-            .scaleEffect(x: -1, y: 1, anchor: .center)
+        self.scaleEffect(x: 1, y: -1, anchor: .center)
     }
 }

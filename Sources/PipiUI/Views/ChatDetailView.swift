@@ -19,13 +19,10 @@ private struct ChatDetailViewBody: View {
     @ObservedObject var session: ChatSession
     /// 单独观察 subagent 树：它更新时主界面的 subagent 卡片要实时跟着动
     @ObservedObject var agentStore: SubagentStore
-    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.chatTypography) private var chatTypography
 
-    /// Coalesce streaming scrollToBottom calls (~50ms) to avoid layout thrash.
-    /// Transient view state. App.swift still applies `.id(session.id)`, so a switch
-    /// tears this view down and these reset naturally; the `.onChange(of: session.id)`
-    /// below is the safety net for the reused-detail-view path.
+    /// Coalesce jump-to-latest `scrollTo` (not streaming follow — flipped list grows
+    /// at the pin edge). Transient; reset on session switch.
     @State private var scrollCoalesceScheduled = false
     @State private var scrollNeedsRetry = false
     @State private var rightPanelWidthRatio: CGFloat?
@@ -33,14 +30,6 @@ private struct ChatDetailViewBody: View {
     @State private var rightPanelDragWidth: CGFloat?
     @StateObject private var gitBranches = GitBranchStore()
 
-    /// Section sticky target id (Zed/Hermes: the pinnable user message that owns content
-    /// at the top of the viewport — not always the globally latest task). `nil` hides the
-    /// bar. Driven by multi-row `StickyTaskAnchorsKey` geometry + `TaskPinLogic.sectionStickyId`.
-    @State private var stickySectionId: String?
-    /// Last-measured height of the rendered `StickyTaskBar`, used to offset the "fully
-    /// above viewport" geometry threshold by the space the bar itself occupies (see
-    /// `stickyTaskBarOverlay`). Starts at 0 (pre-inset threshold) until first measured.
-    @State private var stickyTaskBarHeight: CGFloat = 0
     /// Last settled chat-column width. Width changes (window resize / right panel)
     /// reflow LazyVStack row heights; we re-pin after the width stops moving.
     @State private var settledChatColumnWidth: CGFloat?
@@ -67,6 +56,7 @@ private struct ChatDetailViewBody: View {
         }
         .background(Color(nsColor: .textBackgroundColor))
         .navigationTitle(session.displayTitle)
+        .navigationSubtitle(session.projectURL.lastPathComponent)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 GitBranchMenu(store: gitBranches) { session.lastError = $0 }
@@ -111,8 +101,6 @@ private struct ChatDetailViewBody: View {
             scrollNeedsRetry = false
             rightPanelDragStartWidth = nil
             rightPanelDragWidth = nil
-            stickySectionId = nil
-            stickyTaskBarHeight = 0
             settledChatColumnWidth = nil
             pendingChatColumnWidth = nil
             chatColumnWidthSettleWork?.cancel()
@@ -263,23 +251,16 @@ private struct ChatDetailViewBody: View {
         let items = session.transcript
         let visibleCount = session.transcriptVisibleCount
         let hidden = max(0, items.count - visibleCount)
-        // Pinnable ids trimmed out of the visible suffix are always above the viewport
-        // (suffix only drops *older* items). Newest-first so sectionStickyId can pick the
-        // closest truncated section when LazyVStack has no realized pinnable geometry yet.
-        let truncatedNewestFirst: [String] = items.prefix(hidden).reversed().compactMap { item in
-            TaskPinLogic.isPinnable(item) ? item.id : nil
-        }
-        let fallbackLatestId = TaskPinLogic.latestPinnableUser(in: items)?.id
-        let stickyTarget = stickySectionId.flatMap { id in items.first(where: { $0.id == id }) }
-        // Visible suffix, newest-first for the flipped stack (layout start = visual bottom).
-        let visibleNewestFirst = Array(items.suffix(visibleCount).reversed())
+        // Coalesce consecutive assistant tool-rounds, then newest-first for the flipped stack.
+        let visibleRowsNewestFirst = AssistantBlockLayout
+            .planTranscript(items: Array(items.suffix(visibleCount)))
+            .reversed()
         return ScrollViewReader { proxy in
             ScrollView {
-                // Flipped transcript: newest-first LazyVStack + `.transcriptFlip()` on the
-                // stack and each row. Default scroll offset (document start) shows the latest
-                // without `.defaultScrollAnchor(.bottom)` (which blanked LazyVStack).
+                // Newest-first stack. `.transcriptFlip()` on the ScrollView (below) puts
+                // document-start at the visual bottom — no `.defaultScrollAnchor(.bottom)`.
                 LazyVStack(alignment: .leading, spacing: chatTypography.messageSpacing) {
-                    // Visual bottom / pin edge (document start after flip).
+                    // Visual bottom / pin edge (document start after scroll-view flip).
                     Color.clear
                         .frame(height: 1)
                         .id("bottom")
@@ -313,22 +294,35 @@ private struct ChatDetailViewBody: View {
                         .transcriptFlip()
                     }
 
-                    ForEach(visibleNewestFirst) { item in
-                        MessageRow(
-                            item: item,
-                            toolRuns: runs(for: item),
-                            subagents: subagents(for: item),
-                            projectURL: session.projectURL,
-                            chatFontSize: chatTypography.fontSize,
-                            onFlash: { session.flash($0) },
-                            onSelectAgent: selectAgent
-                        )
-                        .equatable()
-                        .id(item.id)
-                        .anchorPreference(key: StickyTaskAnchorsKey.self, value: .bounds) { anchor in
-                            TaskPinLogic.isPinnable(item) ? [item.id: anchor] : [:]
+                    ForEach(visibleRowsNewestFirst, id: \.id) { row in
+                        switch row {
+                        case .leaf(let item):
+                            MessageRow(
+                                item: item,
+                                toolRuns: runs(for: item),
+                                subagents: subagents(for: item),
+                                projectURL: session.projectURL,
+                                chatFontSize: chatTypography.fontSize,
+                                onFlash: { session.flash($0) },
+                                onSelectAgent: selectAgent
+                            )
+                            .equatable()
+                            .id(item.id)
+                            .transcriptFlip()
+                        case .assistantRun(let id, let segments):
+                            let callIds = AssistantBlockLayout.toolCallIds(in: segments)
+                            AssistantSegmentsView(
+                                segments: segments,
+                                toolRuns: runs(forToolCallIds: callIds),
+                                subagents: subagents(forToolCallIds: callIds),
+                                projectURL: session.projectURL,
+                                onFlash: { session.flash($0) },
+                                onSelectAgent: selectAgent
+                            )
+                            .equatable()
+                            .id(id)
+                            .transcriptFlip()
                         }
-                        .transcriptFlip()
                     }
 
                     if hidden > 0 {
@@ -343,21 +337,14 @@ private struct ChatDetailViewBody: View {
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .geometryGroup()
-                .transcriptFlip()
             }
-            .stickyTaskBarOverlay(
-                stickySectionId: $stickySectionId,
-                stickyTaskBarHeight: $stickyTaskBarHeight,
-                stickyTarget: stickyTarget,
-                truncatedNewestFirst: truncatedNewestFirst,
-                fallbackLatestId: fallbackLatestId,
-                onTap: { target in scrollToStickyTarget(proxy, item: target) }
-            )
+            // Flip the scroll view itself so document-start maps to the visual bottom.
+            .transcriptFlip()
             .overlay(alignment: .bottomTrailing) {
                 if !session.pinTranscriptToBottom {
                     Button {
                         session.pinTranscriptToBottom = true
-                        scrollToBottom(proxy, retry: true)
+                        jumpToLatest(proxy, retry: true)
                     } label: {
                         Image(systemName: "arrow.down")
                             .font(.system(size: 13, weight: .semibold))
@@ -369,80 +356,35 @@ private struct ChatDetailViewBody: View {
                     .buttonStyle(.plain)
                     .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
                     .padding(12)
-                    .help("跳到底部并恢复自动跟随")
-                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                    .help("跳到最新消息")
                 }
             }
             .overlay {
-                // Covers the pane while pi boots and the initial transcript is built,
-                // AND through the first bottom-settle of a resumed session. Without the
-                // bottom scroll anchor (removed above), a resumed session's first frame
-                // shows the TOP of history before the programmatic scroll-to-bottom lands.
-                // Keeping the overlay up for the whole `isInitializing` window hides that
-                // flash — isInitializing flips false only after history is assigned and the
-                // settle scroll is dispatched (see onChange(of: isInitializing) above).
-                // `streamingItem == nil` guards against covering live content in the rare
-                // case streaming has already started (deferred events replay after init).
+                // Covers the pane while pi boots and the initial transcript is built.
                 if session.isInitializing && session.streamingItem == nil {
                     SessionLoadingView()
                         .transition(.opacity)
                 }
             }
             .animation(.easeInOut(duration: 0.2), value: session.isInitializing)
-            .animation(.easeInOut(duration: 0.15), value: session.pinTranscriptToBottom)
-            .onAppear {
-                // Flipped stack: document start is already the latest. One settle pass
-                // still helps LazyVStack realize the pin-edge rows after first layout.
-                forceScrollToBottom(proxy)
-            }
             .onChange(of: session.id) { _, _ in
-                // Safety net for the reused-detail-view path. App.swift currently keeps
-                // `.id(session.id)`, so a switch tears this view down and this branch is
-                // effectively dead on switch — but it is kept correct in case .id is removed.
                 scrollCoalesceScheduled = false
                 scrollNeedsRetry = false
-                stickySectionId = nil
-                stickyTaskBarHeight = 0
-                if session.pinTranscriptToBottom {
-                    scrollToBottom(proxy, retry: true)
-                }
             }
             .onChange(of: session.isInitializing) { wasInitializing, isInitializing in
-                // History arrived — re-settle on the pin edge (document start / visual bottom).
-                if wasInitializing && !isInitializing {
-                    forceScrollToBottom(proxy)
+                // History arrived: one LazyVStack realize nudge at the pin edge.
+                // Streaming / new messages do *not* scrollTo — growth is at document start.
+                if wasInitializing && !isInitializing, session.pinTranscriptToBottom {
+                    jumpToLatest(proxy)
                 }
             }
-            .onChange(of: session.transcript.count) { _, _ in
-                // 仅在仍贴底时跟随；上翻阅读历史时不强制拖回
-                scrollToBottom(proxy)
-            }
-            .onChange(of: streamingSize) { _, _ in
-                scrollToBottom(proxy)
-            }
-            .onChange(of: session.isWorking) { _, _ in
-                scrollToBottom(proxy)
-            }
-            .onChange(of: session.mediaBusy) { _, _ in
-                scrollToBottom(proxy)
-            }
-            .onChange(of: session.toolOutputVersion) { _, _ in
-                scrollToBottom(proxy)
-            }
-            .onChange(of: agentStore.agents.count) { _, _ in
-                scrollToBottom(proxy)
-            }
             .onChange(of: session.rightPanel != nil) { _, _ in
-                // Width change + immediate scrollTo("bottom") blanks LazyVStack
-                // (subviews=1). Recover by realizing a real row first, then pin.
                 recoverPinAfterColumnWidthChange(proxy)
             }
             .onPreferenceChange(ChatColumnWidthKey.self) { width in
                 scheduleChatColumnWidthSettleRepin(proxy, width: width)
             }
             .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEndLiveResizeNotification)) { _ in
-                // Live resize ended: one re-pin only (never scroll while the drag is live —
-                // that caused the transcript to tremble).
                 chatColumnWidthSettleWork?.cancel()
                 chatColumnWidthSettleWork = nil
                 if let pending = pendingChatColumnWidth {
@@ -450,14 +392,6 @@ private struct ChatDetailViewBody: View {
                     pendingChatColumnWidth = nil
                 }
                 recoverPinAfterColumnWidthChange(proxy)
-            }
-            .onChange(of: scenePhase) { _, phase in
-                if phase == .active {
-                    scrollToBottom(proxy, retry: true)
-                }
-            }
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                scrollToBottom(proxy, retry: true)
             }
         }
     }
@@ -495,10 +429,8 @@ private struct ChatDetailViewBody: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
     }
 
-    /// After chat-column width jumps (right panel / resize end), wait for LazyVStack
-    /// to place real rows at the new width, scroll to the last message id (forces
-    /// realization), then to the bottom spacer. Immediate `scrollTo("bottom")` alone
-    /// is the classic white-screen race (ScrollDiagnostics subviews=1).
+    /// After chat-column width jumps (right panel / resize end), one pin-edge settle
+    /// so LazyVStack realizes rows at the new width. Only when still pinned.
     private func recoverPinAfterColumnWidthChange(_ proxy: ScrollViewProxy) {
         guard session.pinTranscriptToBottom else { return }
         widthRecoverGeneration += 1
@@ -506,28 +438,13 @@ private struct ChatDetailViewBody: View {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 32_000_000)
             guard generation == widthRecoverGeneration, session.pinTranscriptToBottom else { return }
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            if let newestId = session.transcript.suffix(session.transcriptVisibleCount).last?.id {
-                withTransaction(transaction) {
-                    proxy.scrollTo(newestId, anchor: .top)
-                }
-            }
-            try? await Task.sleep(nanoseconds: 50_000_000)
-            guard generation == widthRecoverGeneration, session.pinTranscriptToBottom else { return }
-            withTransaction(transaction) {
-                proxy.scrollTo("bottom", anchor: .top)
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-            guard generation == widthRecoverGeneration, session.pinTranscriptToBottom else { return }
-            withTransaction(transaction) {
-                proxy.scrollTo("bottom", anchor: .top)
-            }
+            applyJumpToLatest(proxy)
         }
     }
 
-    /// 贴底滚动：仅当用户仍 pin 在底部时执行；流式更新合并为 ~50ms 一次，避免每分片都触发布局
-    private func scrollToBottom(_ proxy: ScrollViewProxy, retry: Bool = false) {
+    /// Explicit jump to the pin edge (jump button / init settle / width recover).
+    /// Not used for streaming follow — flipped growth stays at document start.
+    private func jumpToLatest(_ proxy: ScrollViewProxy, retry: Bool = false) {
         guard session.pinTranscriptToBottom else { return }
         if retry { scrollNeedsRetry = true }
         guard !scrollCoalesceScheduled else { return }
@@ -536,43 +453,24 @@ private struct ChatDetailViewBody: View {
             scrollCoalesceScheduled = false
             let needsRetry = scrollNeedsRetry
             scrollNeedsRetry = false
-            performScrollToBottom(proxy)
+            guard session.pinTranscriptToBottom else { return }
+            applyJumpToLatest(proxy)
             if needsRetry {
-                // 激活/布局后多档重试，等 clip 尺寸与 LazyVStack 估高稳定后再贴底
-                for delay in [0.05, 0.2, 0.45] as [TimeInterval] {
+                for delay in [0.05, 0.2] as [TimeInterval] {
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                        performScrollToBottom(proxy)
+                        guard session.pinTranscriptToBottom else { return }
+                        applyJumpToLatest(proxy)
                     }
                 }
             }
         }
     }
 
-    private func performScrollToBottom(_ proxy: ScrollViewProxy) {
-        // 在途 async 到达时用户可能已上翻 unpin，必须再检查
-        guard session.pinTranscriptToBottom else { return }
-        applyScrollToBottom(proxy)
-    }
-
-    /// Scrolls regardless of pin state, on a schedule that outlives one layout pass.
-    /// Used only when the transcript first appears, where "don't move the view" would
-    /// mean "leave the user staring at an unrealized region".
-    private func forceScrollToBottom(_ proxy: ScrollViewProxy) {
-        applyScrollToBottom(proxy)
-        for delay in [0.05, 0.2] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                applyScrollToBottom(proxy)
-            }
-        }
-    }
-
-    private func applyScrollToBottom(_ proxy: ScrollViewProxy) {
+    private func applyJumpToLatest(_ proxy: ScrollViewProxy) {
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            // Flipped transcript: pin edge is document start. `.top` in layout space is
-            // the visual bottom after `.transcriptFlip()`. Prefer a real newest row so
-            // LazyVStack keeps content realized near the pin edge.
+            // ScrollView is y-flipped: layout `.top` is the visual bottom / pin edge.
             if let newestId = session.transcript.suffix(session.transcriptVisibleCount).last?.id {
                 proxy.scrollTo(newestId, anchor: .top)
             }
@@ -580,43 +478,19 @@ private struct ChatDetailViewBody: View {
         }
     }
 
-    /// Jumps back to the sticky bar's target message, expanding `transcriptVisibleCount`
-    /// first if the target has been trimmed out of the currently-rendered suffix.
-    private func scrollToStickyTarget(_ proxy: ScrollViewProxy, item: ChatItem) {
-        if let idx = session.transcript.firstIndex(where: { $0.id == item.id }) {
-            let needed = session.transcript.count - idx
-            if session.transcriptVisibleCount < needed {
-                session.transcriptVisibleCount = max(session.transcriptVisibleCount, needed + 20)
-            }
-        }
-        // Mirrors the `.task(id: session.id)` bottom-scroll retry pattern above: bumping
-        // `transcriptVisibleCount` triggers a LazyVStack re-layout, and the first
-        // `scrollTo` can fire before that row is actually realized (same
-        // ScrollDiagnostics "subviews=1 — BLANK" race). Retry at 0/50/200ms, yielding to
-        // the runloop between attempts, instead of a single best-effort call.
-        Task { @MainActor in
-            applyScrollToStickyTarget(proxy, itemId: item.id)
-            try? await Task.sleep(nanoseconds: 50_000_000)
-            applyScrollToStickyTarget(proxy, itemId: item.id)
-            try? await Task.sleep(nanoseconds: 150_000_000)
-            applyScrollToStickyTarget(proxy, itemId: item.id)
-        }
-    }
-
-    private func applyScrollToStickyTarget(_ proxy: ScrollViewProxy, itemId: String) {
-        withAnimation(.easeInOut(duration: 0.2)) {
-            // Flipped: layout `.bottom` maps to the visual top of the viewport.
-            proxy.scrollTo(itemId, anchor: .bottom)
-        }
-    }
-
     /// 只取该消息里工具调用对应的 run，让 MessageRow 的 Equatable 比较保持廉价
     private func runs(for item: ChatItem) -> [String: ToolRun] {
-        var result: [String: ToolRun] = [:]
+        var ids = Set<String>()
         for block in item.blocks {
-            if case .toolCall(let call) = block, let run = session.toolRuns[call.id] {
-                result[call.id] = run
-            }
+            if case .toolCall(let call) = block { ids.insert(call.id) }
+        }
+        return runs(forToolCallIds: ids)
+    }
+
+    private func runs(forToolCallIds ids: Set<String>) -> [String: ToolRun] {
+        var result: [String: ToolRun] = [:]
+        for id in ids {
+            if let run = session.toolRuns[id] { result[id] = run }
         }
         return result
     }
@@ -627,6 +501,10 @@ private struct ChatDetailViewBody: View {
             if case .toolCall(let call) = block, call.name == "subagent" { return call.id }
             return nil
         })
+        return subagents(forToolCallIds: callIds)
+    }
+
+    private func subagents(forToolCallIds callIds: Set<String>) -> [SubagentInfo] {
         guard !callIds.isEmpty else { return [] }
         let all = agentStore.agents
         var keep = all.filter { $0.toolCallId.map(callIds.contains) == true }
@@ -658,20 +536,6 @@ private struct ChatDetailViewBody: View {
             }
         }
         return false
-    }
-
-    /// 流式内容长度，用来触发自动滚动
-    private var streamingSize: Int {
-        guard let item = session.streamingItem else { return 0 }
-        return item.blocks.reduce(0) { acc, block in
-            switch block {
-            case .text(let t): return acc + t.count
-            case .thinking(let t): return acc + t.count
-            case .toolCall: return acc + 1
-            case .image: return acc + 1
-            case .video: return acc + 1
-            }
-        }
     }
 
     /// 撞名扩展会让 pi 一启动就 exit(1)，这里给出具体路径和一键修复，别让用户只看到崩溃日志
@@ -756,131 +620,6 @@ private struct RightPanelDivider: View {
             }
         }
         .help("拖动调整右侧面板宽度")
-    }
-}
-
-// MARK: - Sticky task bar geometry
-
-private extension View {
-    /// Resolves every pinnable row's `StickyTaskAnchorsKey` against this ScrollView's
-    /// geometry, then picks the section sticky id via `TaskPinLogic.sectionStickyId`.
-    ///
-    /// This `GeometryReader` sits *before* `safeAreaInset`, so `geo`'s origin is the outer
-    /// top edge. Content that remains once the bar is showing starts at `y = barHeight`;
-    /// "fully above" means `maxY <= barHeight`, and "visible" means the rect intersects
-    /// `(barHeight, geo.size.height)`.
-    ///
-    /// Split out of `transcript`'s modifier chain — folded in-line, the type-checker times out.
-    func stickyTaskBarOverlay(
-        stickySectionId: Binding<String?>,
-        stickyTaskBarHeight: Binding<CGFloat>,
-        stickyTarget: ChatItem?,
-        truncatedNewestFirst: [String],
-        fallbackLatestId: String?,
-        onTap: @escaping (ChatItem) -> Void
-    ) -> some View {
-        let barHeight = stickyTaskBarHeight.wrappedValue
-        return self
-            .backgroundPreferenceValue(StickyTaskAnchorsKey.self) { anchors in
-                GeometryReader { geo in
-                    let resolved = Self.resolveSectionStickyId(
-                        anchors: anchors,
-                        geo: geo,
-                        contentTop: barHeight,
-                        truncatedNewestFirst: truncatedNewestFirst,
-                        fallbackLatestId: fallbackLatestId
-                    )
-                    // Wrap so an intentional `nil` (hide bar) is not dropped by PreferenceKey
-                    // reduce treating Optional.none as "no update".
-                    Color.clear
-                        .preference(key: StickySectionIdKey.self, value: StickySectionPick(id: resolved))
-                }
-            }
-            .onPreferenceChange(StickySectionIdKey.self) { pick in
-                // Freeze sticky target while the window chrome is dragged — geometry
-                // thrash made the bar swim even when root layout was stable.
-                guard NSApp.keyWindow?.inLiveResize != true else { return }
-                if let pick { stickySectionId.wrappedValue = pick.id }
-            }
-            .safeAreaInset(edge: .top, spacing: 0) {
-                if let stickyTarget {
-                    StickyTaskBar(text: TaskPinLogic.stickyDisplayText(of: stickyTarget)) {
-                        onTap(stickyTarget)
-                    }
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear
-                                .preference(key: StickyTaskBarHeightKey.self, value: geo.size.height)
-                        }
-                    )
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                }
-            }
-            .onPreferenceChange(StickyTaskBarHeightKey.self) { height in
-                stickyTaskBarHeight.wrappedValue = height
-            }
-            .animation(.easeInOut(duration: 0.15), value: stickySectionId.wrappedValue)
-    }
-
-    /// Pure geometry → section id (kept out of ViewBuilder so `for`/`if` are allowed).
-    private static func resolveSectionStickyId(
-        anchors: [String: Anchor<CGRect>],
-        geo: GeometryProxy,
-        contentTop: CGFloat,
-        truncatedNewestFirst: [String],
-        fallbackLatestId: String?
-    ) -> String? {
-        let contentBottom = geo.size.height
-        var above: [(id: String, maxY: CGFloat)] = []
-        var anyVisible = false
-        for (id, anchor) in anchors {
-            let rect = geo[anchor]
-            if rect.maxY <= contentTop {
-                above.append((id, rect.maxY))
-            } else if rect.maxY > contentTop && rect.minY < contentBottom {
-                anyVisible = true
-            }
-        }
-        return TaskPinLogic.sectionStickyId(
-            above: above,
-            anyPinnableVisible: anyVisible,
-            truncatedNewestFirst: truncatedNewestFirst,
-            fallbackLatestId: fallbackLatestId
-        )
-    }
-}
-
-/// Bounds anchors for every realized pinnable user row (id → bounds). Merged across the
-/// LazyVStack so section sticky can pick the closest-above task, not only the latest.
-private struct StickyTaskAnchorsKey: PreferenceKey {
-    static var defaultValue: [String: Anchor<CGRect>] = [:]
-    static func reduce(value: inout [String: Anchor<CGRect>], nextValue: () -> [String: Anchor<CGRect>]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
-}
-
-/// Wrapper so `id == nil` (hide bar) is a real published value, not PreferenceKey "absent".
-private struct StickySectionPick: Equatable {
-    let id: String?
-}
-
-/// Resolved section sticky pick for this render.
-private struct StickySectionIdKey: PreferenceKey {
-    static var defaultValue: StickySectionPick? = nil
-    static func reduce(value: inout StickySectionPick?, nextValue: () -> StickySectionPick?) {
-        value = nextValue() ?? value
-    }
-}
-
-/// Rendered height of the `StickyTaskBar`, measured from inside the `safeAreaInset`
-/// content. Used to offset the "fully above viewport" geometry threshold (see
-/// `stickyTaskBarOverlay`) by the space the bar itself occupies at the top of the
-/// ScrollView. Standard max-reduce: only one publisher exists per render, but `max`
-/// is a safe combine if that ever changes.
-private struct StickyTaskBarHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
     }
 }
 
@@ -1117,16 +856,24 @@ struct StickToBottomTracker: NSViewRepresentable {
             )
             guard let desired else { return }
             // Unpin from a live wheel/trackpad scroll synchronously so in-flight
-            // `scrollToBottom` / width-recover see `pin == false` this runloop.
+            // jump / width-recover see `pin == false` this runloop.
             if desired == false, userLiveScroll {
                 pendingPinValue = nil
-                if isPinned.wrappedValue {
-                    isPinned.wrappedValue = false
-                }
+                writePin(false)
                 return
             }
             // Re-pin / other writes: bounce to next runloop (avoid layout feedback).
             schedulePinWrite(desired)
+        }
+
+        private func writePin(_ value: Bool) {
+            guard isPinned.wrappedValue != value else { return }
+            // Avoid implicit animation / transition thrash on the jump-to-bottom control.
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                isPinned.wrappedValue = value
+            }
         }
 
         private func schedulePinWrite(_ value: Bool) {
@@ -1138,9 +885,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                 self.pinWriteScheduled = false
                 guard let pending = self.pendingPinValue else { return }
                 self.pendingPinValue = nil
-                if self.isPinned.wrappedValue != pending {
-                    self.isPinned.wrappedValue = pending
-                }
+                self.writePin(pending)
             }
         }
 
