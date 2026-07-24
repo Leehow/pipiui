@@ -1,14 +1,25 @@
+import AppKit
 import SwiftUI
 
 /// Block-level markdown renderer: headings, tables, lists, quotes, rules,
 /// fenced code, and a monospaced fallback for ASCII diagrams outside fences.
+/// Absolute file paths in prose become clickable (not inside fenced code).
 struct MarkdownTextView: View {
     let text: String
+    var onFlash: ((String) -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(Self.cachedParse(text).enumerated()), id: \.offset) { _, block in
-                MarkdownBlockView(block: block)
+                MarkdownBlockView(block: block, onFlash: onFlash)
+            }
+        }
+        // Prose uses PathLinkedText (selectable + ⌘+click paths). Residual SwiftUI links still work.
+        .environment(\.openURL, PathLinkOpenURL.action(onFlash: onFlash))
+        .contextMenu {
+            Button("复制") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
             }
         }
     }
@@ -190,23 +201,48 @@ struct MarkdownTextView: View {
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         )) ?? AttributedString(string)
     }
+
+    /// Inline markdown + absolute path / file:// links (for prose blocks only).
+    static func inlineWithPaths(_ string: String) -> AttributedString {
+        // Plain prose without markdown markers: pure path linking is simpler/safer.
+        if !hasInlineMarkdownMarkers(string) {
+            return FileReveal.attributedStringLinkingPaths(string)
+        }
+        let md = inline(string)
+        return FileReveal.injectPathLinks(into: md)
+    }
+
+    private static func hasInlineMarkdownMarkers(_ string: String) -> Bool {
+        string.contains("*")
+            || string.contains("_")
+            || string.contains("`")
+            || string.contains("[")
+            || string.contains("](")
+            || string.contains("~~")
+    }
 }
 
 private struct MarkdownBlockView: View {
     let block: MarkdownTextView.Block
+    var onFlash: ((String) -> Void)? = nil
 
     var body: some View {
         switch block {
         case .paragraph(let text):
-            Text(MarkdownTextView.inline(text))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            PathLinkedText(
+                attributed: MarkdownTextView.inlineWithPaths(text),
+                onFlash: onFlash
+            )
         case .heading(let level, let title):
-            Text(MarkdownTextView.inline(title))
-                .font(headingFont(level))
-                .textSelection(.enabled)
-                .padding(.top, level <= 2 ? 6 : 2)
+            PathLinkedText(
+                attributed: MarkdownTextView.inlineWithPaths(title),
+                nsFont: headingNSFont(level),
+                onFlash: onFlash
+            )
+            .padding(.top, level <= 2 ? 6 : 2)
         case .code(let code), .mono(let code):
+            // Do NOT path-link inside fenced / mono code bodies.
+            // Code blocks keep SwiftUI Text + textSelection (no path ⌘+click required).
             ScrollView(.horizontal) {
                 // 含框线字符的图走终端式网格渲染（CJK 占两格，框线严格对齐）
                 if MonoArtView.hasBoxDrawing(code) {
@@ -229,43 +265,59 @@ private struct MarkdownBlockView: View {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(item.marker)
                             .foregroundStyle(.secondary)
-                        Text(MarkdownTextView.inline(item.text))
-                            .textSelection(.enabled)
+                        PathLinkedText(
+                            attributed: MarkdownTextView.inlineWithPaths(item.text),
+                            onFlash: onFlash
+                        )
                     }
                     .padding(.leading, CGFloat(item.indent) * 16)
                 }
             }
         case .quote(let text):
-            HStack(spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
                 RoundedRectangle(cornerRadius: 2)
                     .fill(Color.accentColor.opacity(0.5))
                     .frame(width: 3)
-                Text(MarkdownTextView.inline(text))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                PathLinkedText(
+                    attributed: {
+                        var a = MarkdownTextView.inlineWithPaths(text)
+                        a.foregroundColor = Color.secondary
+                        return a
+                    }(),
+                    onFlash: onFlash
+                )
             }
         case .rule:
             Divider()
         }
     }
 
-    private func headingFont(_ level: Int) -> Font {
+    private func headingNSFont(_ level: Int) -> NSFont {
         switch level {
-        case 1: return .title2.weight(.bold)
-        case 2: return .title3.weight(.semibold)
-        case 3: return .headline
-        default: return .callout.weight(.semibold)
+        case 1:
+            return NSFont.systemFont(ofSize: NSFont.systemFontSize + 5, weight: .bold)
+        case 2:
+            return NSFont.systemFont(ofSize: NSFont.systemFontSize + 3, weight: .semibold)
+        case 3:
+            return NSFont.systemFont(ofSize: NSFont.systemFontSize + 1, weight: .semibold)
+        default:
+            return NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
         }
     }
 
     private func tableView(header: [String], rows: [[String]]) -> some View {
         let columns = max(header.count, rows.map(\.count).max() ?? 0)
+        let headerFont = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
         return ScrollView(.horizontal) {
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 0) {
                 GridRow {
                     ForEach(0..<columns, id: \.self) { c in
-                        Text(MarkdownTextView.inline(c < header.count ? header[c] : ""))
-                            .font(.callout.weight(.semibold))
+                        PathLinkedText(
+                            attributed: MarkdownTextView.inlineWithPaths(c < header.count ? header[c] : ""),
+                            lineLimit: 3,
+                            nsFont: headerFont,
+                            onFlash: onFlash
+                        )
                     }
                 }
                 .padding(.vertical, 6)
@@ -273,8 +325,11 @@ private struct MarkdownBlockView: View {
                 ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
                     GridRow {
                         ForEach(0..<columns, id: \.self) { c in
-                            Text(MarkdownTextView.inline(c < row.count ? row[c] : ""))
-                                .textSelection(.enabled)
+                            PathLinkedText(
+                                attributed: MarkdownTextView.inlineWithPaths(c < row.count ? row[c] : ""),
+                                lineLimit: 3,
+                                onFlash: onFlash
+                            )
                         }
                     }
                     .padding(.vertical, 5)

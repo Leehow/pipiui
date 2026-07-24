@@ -8,6 +8,8 @@ struct MessageRow: View, Equatable {
     let toolRuns: [String: ToolRun]
     var subagents: [SubagentInfo] = []
     var isStreaming: Bool = false
+    var projectURL: URL? = nil
+    var onFlash: ((String) -> Void)? = nil
     var onSelectAgent: ((String) -> Void)?
 
     static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
@@ -15,6 +17,8 @@ struct MessageRow: View, Equatable {
             && lhs.toolRuns == rhs.toolRuns
             && lhs.subagents == rhs.subagents
             && lhs.isStreaming == rhs.isStreaming
+            && lhs.projectURL == rhs.projectURL
+        // onFlash / onSelectAgent intentionally excluded
     }
 
     var body: some View {
@@ -31,42 +35,74 @@ struct MessageRow: View, Equatable {
     private var userView: some View {
         HStack {
             Spacer(minLength: 60)
-            VStack(alignment: .trailing, spacing: 8) {
-                ForEach(imageBlocks) { img in
-                    if let ns = NSImage(data: img.data) {
-                        Image(nsImage: ns)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(maxWidth: 280, maxHeight: 200)
-                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            if userDisplayText.hasPrefix("[subagent-done]") {
+                // System signal from background worker — collapse by default (avoid PathLinkedText on ~8k Result).
+                VStack(alignment: .trailing, spacing: 8) {
+                    userImageThumbnails
+                    SubagentDoneBubbleView(text: userDisplayText, onFlash: onFlash)
+                }
+            } else {
+                VStack(alignment: .trailing, spacing: 8) {
+                    userImageThumbnails
+                    if !userDisplayText.isEmpty {
+                        PathLinkedText(
+                            text: userDisplayText,
+                            base: {
+                                var c = AttributeContainer()
+                                c.foregroundColor = Color.white
+                                return c
+                            }(),
+                            linkColor: .white,
+                            onFlash: onFlash
+                        )
                     }
                 }
-                if !userDisplayText.isEmpty {
-                    Text(userDisplayText)
-                        .textSelection(.enabled)
-                        .foregroundStyle(.white)
-                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color.accentColor)
+                )
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 9)
-            .background(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(Color.accentColor)
+        }
+    }
+
+    @ViewBuilder
+    private var userImageThumbnails: some View {
+        ForEach(Array(imageBlocks.enumerated()), id: \.element.id) { index, img in
+            ImageThumbnailView(
+                data: img.data,
+                mimeType: img.mimeType,
+                path: img.path,
+                maxWidth: 280,
+                maxHeight: 200,
+                projectURL: projectURL,
+                footnotePaths: footnotePaths,
+                imageIndex: index,
+                onFlash: onFlash
             )
         }
     }
 
     private var systemView: some View {
-        Text(plainText)
-            .font(.caption.monospaced())
-            .foregroundStyle(.secondary)
-            .textSelection(.enabled)
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.primary.opacity(0.04))
-            )
+        PathLinkedText(
+            text: plainText,
+            base: {
+                var c = AttributeContainer()
+                c.foregroundColor = Color.secondary
+                return c
+            }(),
+            monospaced: true,
+            onFlash: onFlash
+        )
+        .font(.caption.monospaced())
+        .foregroundStyle(.secondary)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.primary.opacity(0.04))
+        )
     }
 
     private var assistantView: some View {
@@ -74,7 +110,7 @@ struct MessageRow: View, Equatable {
             ForEach(Array(item.blocks.enumerated()), id: \.offset) { _, block in
                 switch block {
                 case .text(let text):
-                    MarkdownTextView(text: text)
+                    MarkdownTextView(text: text, onFlash: onFlash)
                 case .thinking(let text):
                     ThinkingBlockView(text: text, isStreaming: isStreaming)
                 case .toolCall(let call):
@@ -86,18 +122,25 @@ struct MessageRow: View, Equatable {
                             onSelect: onSelectAgent
                         )
                     } else {
-                        ToolCardView(call: call, run: toolRuns[call.id])
+                        ToolCardView(
+                            call: call,
+                            run: toolRuns[call.id],
+                            projectURL: projectURL,
+                            onFlash: onFlash
+                        )
                     }
                 case .image(let img):
-                    if let ns = NSImage(data: img.data) {
-                        Image(nsImage: ns)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(maxWidth: 360, maxHeight: 240)
-                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    }
+                    ImageThumbnailView(
+                        data: img.data,
+                        mimeType: img.mimeType,
+                        path: img.path,
+                        maxWidth: 360,
+                        maxHeight: 240,
+                        projectURL: projectURL,
+                        onFlash: onFlash
+                    )
                 case .video(let vid):
-                    VideoBlockView(path: vid.path)
+                    VideoBlockView(path: vid.path, onFlash: onFlash)
                 }
             }
         }
@@ -114,6 +157,11 @@ struct MessageRow: View, Equatable {
     /// User bubble text without attachment path footnotes (still sent to the model).
     private var userDisplayText: String {
         ImageAttachment.stripAttachmentPathsForDisplay(plainText)
+    }
+
+    /// Footnote paths from the full (unstripped) user message for image path resolution.
+    private var footnotePaths: [String] {
+        ImagePathResolver.attachmentPaths(fromMessageText: plainText)
     }
 
     private var imageBlocks: [ImageBlock] {
@@ -264,6 +312,201 @@ enum ThinkingTokenEstimate {
     }
 }
 
+// MARK: - [subagent-done] user message (collapsed by default)
+
+/// Parsed shape of a background worker completion message injected via `pi.sendUserMessage`.
+struct SubagentDoneMessage: Equatable {
+    enum Outcome: Equatable {
+        case ok, fail, aborted
+    }
+
+    let headerLine: String
+    let agentId: String?
+    let name: String
+    let ok: Bool
+    let aborted: Bool
+    let cost: String?
+    let turns: String?
+    let task: String
+    let result: String
+
+    var outcome: Outcome {
+        if aborted { return .aborted }
+        if ok { return .ok }
+        return .fail
+    }
+
+    /// Returns nil when text does not start with `[subagent-done]`.
+    static func parse(_ text: String) -> SubagentDoneMessage? {
+        guard text.hasPrefix("[subagent-done]") else { return nil }
+
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let headerLine = lines.first else { return nil }
+
+        var fields: [String: String] = [:]
+        let afterPrefix = headerLine.dropFirst("[subagent-done]".count)
+            .trimmingCharacters(in: .whitespaces)
+        for token in afterPrefix.split(separator: " ", omittingEmptySubsequences: true) {
+            guard let eq = token.firstIndex(of: "=") else { continue }
+            let key = String(token[..<eq])
+            let value = String(token[token.index(after: eq)...])
+            if !key.isEmpty { fields[key] = value }
+        }
+
+        let ok = (fields["ok"] ?? "").lowercased() == "true"
+        let aborted = (fields["aborted"] ?? "").lowercased() == "true"
+        let name = fields["name"].flatMap { $0.isEmpty ? nil : $0 } ?? "agent"
+
+        var task = ""
+        var result = ""
+        var i = 1
+        while i < lines.count && lines[i].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            i += 1
+        }
+        if i < lines.count {
+            let line = lines[i]
+            if line.hasPrefix("Task:") {
+                task = String(line.dropFirst("Task:".count)).trimmingCharacters(in: .whitespaces)
+                i += 1
+            }
+        }
+        while i < lines.count && lines[i].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            i += 1
+        }
+        if i < lines.count {
+            let line = lines[i]
+            if line.hasPrefix("Result:") {
+                let inline = String(line.dropFirst("Result:".count)).trimmingCharacters(in: .whitespaces)
+                i += 1
+                let rest = i < lines.count ? lines[i...].joined(separator: "\n") : ""
+                if inline.isEmpty {
+                    result = rest
+                } else if rest.isEmpty {
+                    result = inline
+                } else {
+                    result = inline + "\n" + rest
+                }
+            }
+        }
+
+        return SubagentDoneMessage(
+            headerLine: headerLine,
+            agentId: fields["agentId"],
+            name: name,
+            ok: ok,
+            aborted: aborted,
+            cost: fields["cost"],
+            turns: fields["turns"],
+            task: task,
+            result: result
+        )
+    }
+}
+
+/// Collapsed card for `[subagent-done]` — avoids rendering full Result until expanded.
+struct SubagentDoneBubbleView: View {
+    let text: String
+    var onFlash: ((String) -> Void)? = nil
+    @State private var expanded = false
+
+    private var parsed: SubagentDoneMessage? { SubagentDoneMessage.parse(text) }
+
+    private var outcomeIcon: String {
+        switch parsed?.outcome {
+        case .ok: return "checkmark.circle.fill"
+        case .fail: return "xmark.circle.fill"
+        case .aborted: return "stop.circle.fill"
+        case nil: return "checkmark.seal"
+        }
+    }
+
+    private var outcomeColor: Color {
+        switch parsed?.outcome {
+        case .ok: return .green
+        case .fail: return .red
+        case .aborted: return .orange
+        case nil: return .secondary
+        }
+    }
+
+    private var outcomeLabel: String {
+        switch parsed?.outcome {
+        case .ok: return "ok"
+        case .fail: return "fail"
+        case .aborted: return "aborted"
+        case nil: return ""
+        }
+    }
+
+    private var summaryTitle: String {
+        guard let parsed else { return "子任务完成" }
+        var parts = ["子任务完成", parsed.name, outcomeLabel]
+        if let cost = parsed.cost, !cost.isEmpty {
+            parts.append("cost \(cost)")
+        }
+        return parts.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                if let parsed {
+                    if !parsed.task.isEmpty {
+                        Text("Task: \(parsed.task)")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    let bodyText = parsed.result.isEmpty ? text : parsed.result
+                    PathLinkedText(
+                        text: bodyText,
+                        base: {
+                            var c = AttributeContainer()
+                            c.foregroundColor = Color.primary.opacity(0.85)
+                            return c
+                        }(),
+                        monospaced: true,
+                        onFlash: onFlash
+                    )
+                    .font(.caption.monospaced())
+                } else {
+                    Text(text)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.primary.opacity(0.85))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding(.top, 6)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: outcomeIcon)
+                    .foregroundStyle(outcomeColor)
+                    .imageScale(.medium)
+                Text(summaryTitle)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 420, alignment: .trailing)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.primary.opacity(0.06))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                )
+        )
+        .accessibilityLabel(summaryTitle)
+    }
+}
+
 struct ThinkingBlockView: View {
     let text: String
     var isStreaming: Bool = false
@@ -325,12 +568,18 @@ struct WaitingPlaceholderView: View {
 struct ToolCardView: View {
     let call: ToolCallBlock
     let run: ToolRun?
+    var projectURL: URL? = nil
+    var onFlash: ((String) -> Void)? = nil
     @State private var expanded = false
 
     private var statusColor: Color {
         guard let run else { return .secondary }
         if run.isRunning { return .blue }
         return run.isError ? .red : .green
+    }
+
+    private var toolImages: [ImageBlock] {
+        run?.images ?? []
     }
 
     var body: some View {
@@ -340,11 +589,20 @@ struct ToolCardView: View {
                     .foregroundStyle(statusColor)
                 Text(call.name)
                     .font(.callout.weight(.semibold).monospaced())
-                Text(call.argsSummary)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                PathLinkedText(
+                    text: call.argsSummary,
+                    base: {
+                        var c = AttributeContainer()
+                        c.foregroundColor = Color.secondary
+                        return c
+                    }(),
+                    monospaced: true,
+                    lineLimit: 1,
+                    truncationMode: .middle,
+                    onFlash: onFlash
+                )
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
                 Spacer()
                 if run?.isRunning == true {
                     ProgressView().controlSize(.mini)
@@ -353,7 +611,8 @@ struct ToolCardView: View {
                         .foregroundStyle(statusColor)
                         .font(.caption)
                 }
-                if hasOutput {
+                // Expand only controls long text output; images always show.
+                if hasTextOutput {
                     Button {
                         expanded.toggle()
                     } label: {
@@ -367,29 +626,43 @@ struct ToolCardView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
 
-            if hasBody, expanded || run?.isRunning == true {
+            // Always show tool result thumbnails (even when collapsed).
+            if !toolImages.isEmpty {
                 Divider()
-                VStack(alignment: .leading, spacing: 8) {
-                    if let imgs = run?.images, !imgs.isEmpty {
-                        ForEach(imgs) { img in
-                            if let ns = NSImage(data: img.data) {
-                                Image(nsImage: ns)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                                    .frame(maxWidth: 320, maxHeight: 220)
-                                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                                    .padding(.horizontal, 10)
-                                    .padding(.top, 8)
-                            }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 8) {
+                        ForEach(Array(toolImages.enumerated()), id: \.element.id) { index, img in
+                            ImageThumbnailView(
+                                data: img.data,
+                                mimeType: img.mimeType,
+                                path: img.path,
+                                maxWidth: 200,
+                                maxHeight: 140,
+                                projectURL: projectURL,
+                                imageIndex: index,
+                                onFlash: onFlash
+                            )
                         }
                     }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                }
+                .background(Color.primary.opacity(0.025))
+            }
+
+            if hasTextOutput, expanded || run?.isRunning == true {
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
                     if let output = run?.output, !output.isEmpty {
                         ScrollView {
-                            Text(trimmedOutput(output))
-                                .font(.caption.monospaced())
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(10)
+                            PathLinkedText(
+                                text: trimmedOutput(output),
+                                monospaced: true,
+                                onFlash: onFlash
+                            )
+                            .font(.caption.monospaced())
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
                         }
                         .frame(maxHeight: expanded ? 400 : 120)
                     }
@@ -405,13 +678,23 @@ struct ToolCardView: View {
             RoundedRectangle(cornerRadius: 10)
                 .strokeBorder(Color.primary.opacity(0.08))
         )
+        .onAppear {
+            // Auto-expand text when images arrived so any caption is visible once.
+            if !toolImages.isEmpty, hasTextOutput {
+                expanded = true
+            }
+        }
     }
 
-    private var hasOutput: Bool { hasBody }
-
-    private var hasBody: Bool {
-        !(run?.output.isEmpty ?? true) || !(run?.images.isEmpty ?? true)
+    private var hasTextOutput: Bool {
+        !(run?.output.isEmpty ?? true)
     }
+
+    private var hasOutput: Bool {
+        hasTextOutput || !toolImages.isEmpty
+    }
+
+    private var hasBody: Bool { hasOutput }
 
     private var iconName: String {
         switch call.name {
@@ -435,6 +718,7 @@ struct ToolCardView: View {
 
 struct VideoBlockView: View {
     let path: String
+    var onFlash: ((String) -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -447,14 +731,27 @@ struct VideoBlockView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("生成的视频")
                             .font(.callout.weight(.semibold))
-                        Text((path as NSString).lastPathComponent)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                        PathLinkedText(
+                            text: (path as NSString).lastPathComponent,
+                            monospaced: true,
+                            lineLimit: 1,
+                            onFlash: onFlash
+                        )
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
                     }
                     Spacer()
+                    Button("在访达中显示") {
+                        if !FileReveal.revealInFinder(path: path) {
+                            onFlash?(FileReveal.missingPathMessage(path))
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                     Button("打开") {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                        if !FileReveal.open(path: path) {
+                            onFlash?(FileReveal.missingPathMessage(path))
+                        }
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)

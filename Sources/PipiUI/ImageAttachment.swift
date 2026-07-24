@@ -16,9 +16,9 @@ struct DraftImage: Identifiable {
     }
 }
 
-enum ImageAttachment {
-    static let maxBytes = 20 * 1024 * 1024
-    static let maxEdge: CGFloat = 2000
+package enum ImageAttachment {
+    package static let maxBytes = 20 * 1024 * 1024
+    package static let maxEdge: CGFloat = 2000
 
     enum LoadError: LocalizedError {
         case tooLarge
@@ -150,7 +150,7 @@ enum ImageAttachment {
         "(Images are also embedded multimodally; prefer viewing them directly. If you use the read tool, use the paths above — do not invent paths like /home/workdir/attachments/.)"
 
     /// Append readable absolute paths so models that prefer tools over vision can `read` them.
-    static func messageWithAttachmentPaths(text: String, paths: [URL]) -> String {
+    package static func messageWithAttachmentPaths(text: String, paths: [URL]) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !paths.isEmpty else { return trimmed }
         var lines: [String] = []
@@ -166,9 +166,45 @@ enum ImageAttachment {
         return lines.joined(separator: "\n")
     }
 
+    /// Absolute paths listed by `messageWithAttachmentPaths` footnotes (order preserved).
+    package static func attachmentPaths(fromMessageText text: String) -> [String] {
+        var paths: [String] = []
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var i = 0
+        while i < lines.count {
+            let t = lines[i].trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("Attached image file: ") {
+                let p = String(t.dropFirst("Attached image file: ".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !p.isEmpty { paths.append(p) }
+                i += 1
+                continue
+            }
+            if t == "Attached image files:" {
+                i += 1
+                while i < lines.count {
+                    let lt = lines[i].trimmingCharacters(in: .whitespaces)
+                    if lt.hasPrefix("- ") {
+                        let p = String(lt.dropFirst(2))
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !p.isEmpty { paths.append(p) }
+                        i += 1
+                    } else if lt.isEmpty {
+                        break
+                    } else {
+                        break
+                    }
+                }
+                continue
+            }
+            i += 1
+        }
+        return paths
+    }
+
     /// Remove path footnotes added by `messageWithAttachmentPaths` for UI display.
     /// Keeps the user's real prose; safe no-op if no footer present.
-    static func stripAttachmentPathsForDisplay(_ text: String) -> String {
+    package static func stripAttachmentPathsForDisplay(_ text: String) -> String {
         var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         // Tolerate trailing blank lines when matching the footer.
         while lines.last?.trimmingCharacters(in: .whitespaces).isEmpty == true {

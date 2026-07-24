@@ -299,10 +299,13 @@ final class AppStore: ObservableObject {
         var metas = sessionsByProject[projectPath] ?? []
         if let idx = metas.firstIndex(where: { $0.path == file }) {
             let old = metas[idx]
-            metas[idx] = SessionMeta(path: file, name: displayName, modified: old.modified)
+            // Don't clobber a real title with placeholder / "新会话".
+            let keptName = SessionTitleLogic.isPlaceholderName(displayName) ? old.name : displayName
+            metas[idx] = SessionMeta(path: file, name: keptName, modified: Date())
         } else {
             metas.insert(SessionMeta(path: file, name: displayName, modified: Date()), at: 0)
         }
+        metas.sort { $0.modified > $1.modified }
         sessionsByProject[projectPath] = metas
     }
 
