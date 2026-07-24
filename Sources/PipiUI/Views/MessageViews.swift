@@ -9,6 +9,8 @@ struct MessageRow: View, Equatable {
     var subagents: [SubagentInfo] = []
     var isStreaming: Bool = false
     var projectURL: URL? = nil
+    /// Bumps Equatable when chat typography changes so `.equatable()` rows re-render.
+    var chatFontSize: CGFloat = ChatTypography.defaultFontSize
     var onFlash: ((String) -> Void)? = nil
     var onSelectAgent: ((String) -> Void)?
 
@@ -18,6 +20,7 @@ struct MessageRow: View, Equatable {
             && lhs.subagents == rhs.subagents
             && lhs.isStreaming == rhs.isStreaming
             && lhs.projectURL == rhs.projectURL
+            && lhs.chatFontSize == rhs.chatFontSize
         // onFlash / onSelectAgent intentionally excluded
     }
 
@@ -58,7 +61,7 @@ struct MessageRow: View, Equatable {
                     }
                 }
                 .padding(.horizontal, 14)
-                .padding(.vertical, 9)
+                .padding(.vertical, 11)
                 .background(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(Color.accentColor)

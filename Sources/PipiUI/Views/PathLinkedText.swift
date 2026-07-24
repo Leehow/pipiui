@@ -96,6 +96,7 @@ struct PathLinkedText: View {
     var onFlash: ((String) -> Void)? = nil
     /// Optional explicit AppKit font (headings / caption overrides).
     var nsFont: NSFont? = nil
+    @Environment(\.chatTypography) private var chatTypography
 
     init(
         text: String,
@@ -182,13 +183,16 @@ struct PathLinkedText: View {
 
     @ViewBuilder
     private func fontApplied(_ text: Text) -> some View {
-        if let nsFont {
-            text.font(Font(nsFont))
-        } else if monospaced {
-            text.font(.system(size: NSFont.smallSystemFontSize, design: .monospaced))
-        } else {
-            text
-        }
+        let sized: Text = {
+            if let nsFont {
+                return text.font(Font(nsFont))
+            }
+            if monospaced {
+                return text.font(Font(chatTypography.codeNSFont))
+            }
+            return text.font(Font(chatTypography.bodyNSFont))
+        }()
+        sized.lineSpacing(chatTypography.lineSpacing)
     }
 
     @ViewBuilder
@@ -218,10 +222,8 @@ struct PathLinkedText: View {
 
     private func resolveHitFont() -> NSFont {
         if let nsFont { return nsFont }
-        if monospaced {
-            return NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
-        }
-        return NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        if monospaced { return chatTypography.codeNSFont }
+        return chatTypography.bodyNSFont
     }
 }
 

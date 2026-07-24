@@ -20,6 +20,7 @@ private struct ChatDetailViewBody: View {
     /// 单独观察 subagent 树：它更新时主界面的 subagent 卡片要实时跟着动
     @ObservedObject var agentStore: SubagentStore
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.chatTypography) private var chatTypography
 
     /// Coalesce streaming scrollToBottom calls (~50ms) to avoid layout thrash.
     /// Transient view state. App.swift still applies `.id(session.id)`, so a switch
@@ -270,7 +271,7 @@ private struct ChatDetailViewBody: View {
                 // normally), then scrolls to the bottom once history arrives — see the
                 // `onChange(of: session.isInitializing)` below. SubagentPanel uses this same
                 // no-anchor + LazyVStack pattern and has never blanked.
-                LazyVStack(alignment: .leading, spacing: 14) {
+                LazyVStack(alignment: .leading, spacing: chatTypography.messageSpacing) {
                     if hidden > 0 {
                         Button("显示更早的 \(hidden) 条消息") {
                             session.transcriptVisibleCount += 200
@@ -284,6 +285,7 @@ private struct ChatDetailViewBody: View {
                             toolRuns: runs(for: item),
                             subagents: subagents(for: item),
                             projectURL: session.projectURL,
+                            chatFontSize: chatTypography.fontSize,
                             onFlash: { session.flash($0) },
                             onSelectAgent: selectAgent
                         )
@@ -302,6 +304,7 @@ private struct ChatDetailViewBody: View {
                             subagents: subagents(for: streaming),
                             isStreaming: session.isStreaming,
                             projectURL: session.projectURL,
+                            chatFontSize: chatTypography.fontSize,
                             onFlash: { session.flash($0) },
                             onSelectAgent: selectAgent
                         )

@@ -7,9 +7,10 @@ import SwiftUI
 struct MarkdownTextView: View {
     let text: String
     var onFlash: ((String) -> Void)? = nil
+    @Environment(\.chatTypography) private var chatTypography
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: chatTypography.blockSpacing) {
             ForEach(Array(Self.cachedParse(text).enumerated()), id: \.offset) { _, block in
                 MarkdownBlockView(block: block, onFlash: onFlash)
             }
@@ -264,6 +265,7 @@ struct MarkdownTextView: View {
 private struct MarkdownBlockView: View {
     let block: MarkdownTextView.Block
     var onFlash: ((String) -> Void)? = nil
+    @Environment(\.chatTypography) private var chatTypography
 
     var body: some View {
         switch block {
@@ -275,7 +277,7 @@ private struct MarkdownBlockView: View {
         case .heading(let level, let title):
             PathLinkedText(
                 attributed: MarkdownTextView.inlineWithPaths(title),
-                nsFont: headingNSFont(level),
+                nsFont: chatTypography.headingNSFont(level: level),
                 onFlash: onFlash
             )
             .padding(.top, level <= 2 ? 6 : 2)
@@ -289,7 +291,7 @@ private struct MarkdownBlockView: View {
                         .padding(10)
                 } else {
                     Text(code)
-                        .font(.callout.monospaced())
+                        .font(Font(chatTypography.codeNSFont))
                         .textSelection(.enabled)
                         .padding(10)
                 }
@@ -323,22 +325,9 @@ private struct MarkdownBlockView: View {
         }
     }
 
-    private func headingNSFont(_ level: Int) -> NSFont {
-        switch level {
-        case 1:
-            return NSFont.systemFont(ofSize: NSFont.systemFontSize + 5, weight: .bold)
-        case 2:
-            return NSFont.systemFont(ofSize: NSFont.systemFontSize + 3, weight: .semibold)
-        case 3:
-            return NSFont.systemFont(ofSize: NSFont.systemFontSize + 1, weight: .semibold)
-        default:
-            return NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
-        }
-    }
-
     private func tableView(header: [String], rows: [[String]]) -> some View {
         let columns = max(header.count, rows.map(\.count).max() ?? 0)
-        let headerFont = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        let headerFont = NSFont.systemFont(ofSize: chatTypography.fontSize, weight: .semibold)
         return ScrollView(.horizontal) {
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 0) {
                 GridRow {
