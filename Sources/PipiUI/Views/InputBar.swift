@@ -717,7 +717,7 @@ struct InputBar: View {
                     .foregroundStyle(hot ? .orange : .secondary)
                     .help("上下文占用")
             }
-            if let quota = session.quotaPercent, session.model?.isGrokProvider == true {
+            if let quota = session.quotaPercent, session.model?.shouldShowAccountQuota == true {
                 let label = session.quotaPeriodLabel ?? "额"
                 let help = session.quotaPeriodHelp ?? "额度"
                 Text("\(label) \(Int(quota.rounded()))%")
@@ -741,24 +741,24 @@ struct InputBar: View {
 
     private var quotaPopover: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Grok 账号用量")
+            Text(session.quotaProvider?.accountLabel ?? "账号额度")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
-            if session.periods.isEmpty {
-                Text("暂无多周期用量数据")
+            if session.quotaWindows.isEmpty {
+                Text("暂无用量数据")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 6)
             } else {
-                ForEach(session.periods) { p in
-                    periodRow(p)
+                ForEach(session.quotaWindows) { w in
+                    quotaWindowRow(w)
                 }
             }
         }
     }
 
-    private func periodRow(_ p: PeriodUsage) -> some View {
-        let selected = session.selectedPeriodTypeRaw == p.typeRaw
+    private func quotaWindowRow(_ w: QuotaWindow) -> some View {
+        let selected = session.quotaSelectedWindowId == w.id
         return HStack(alignment: .top, spacing: 8) {
             Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                 .foregroundStyle(selected ? Color.accentColor : Color.secondary)
@@ -766,15 +766,15 @@ struct InputBar: View {
                 .padding(.top, 2)
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
-                    Text(p.label).font(.caption.bold())
+                    Text(w.title).font(.caption.bold())
                     Spacer()
-                    Text("\(Int(p.percent.rounded()))%")
+                    Text("\(Int(w.usedPercent.rounded()))%")
                         .font(.caption.monospacedDigit())
-                        .foregroundStyle(p.percent > 80 ? Color.orange : Color.secondary)
+                        .foregroundStyle(w.usedPercent > 80 ? Color.orange : Color.secondary)
                 }
-                ProgressView(value: p.percent, total: 100)
-                    .tint(p.percent > 80 ? Color.orange : Color.accentColor)
-                if let reset = p.resetDate {
+                ProgressView(value: w.usedPercent, total: 100)
+                    .tint(w.usedPercent > 80 ? Color.orange : Color.accentColor)
+                if let reset = w.resetsAt {
                     Text("重置于 \(Self.quotaDateFmt.string(from: reset))")
                         .font(.system(size: 9))
                         .foregroundStyle(.secondary.opacity(0.7))
@@ -782,7 +782,7 @@ struct InputBar: View {
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture { session.selectPeriod(typeRaw: p.typeRaw) }
+        .onTapGesture { session.selectQuotaWindow(id: w.id) }
     }
 
     private static let quotaDateFmt: DateFormatter = {

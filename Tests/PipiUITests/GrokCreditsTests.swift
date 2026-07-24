@@ -132,26 +132,34 @@ final class GrokCreditsTests: XCTestCase {
         XCTAssertEqual(creds.accountId, "abc-def-123")
     }
 
-    func testQuotaDisplayResolvesSelected() {
-        let periods = [PeriodUsage(typeRaw: 2, label: "周", percent: 38, resetDate: nil),
-                       PeriodUsage(typeRaw: 1, label: "月", percent: 33, resetDate: nil)]
-        let r = GrokQuotaDisplay.resolve(periods: periods, selected: 2, fallbackPercent: 75, fallbackLabel: "额")
-        XCTAssertEqual(r.percent, 38)
-        XCTAssertEqual(r.label, "周")
+    /// The footer capsule must show the top-level account credit usage (`usedPercent`),
+    /// NOT a rate-limit period sub-value. grok.com returns both: a top-level usage
+    /// percent (the real "how much of your credits are used" number) and repeated
+    /// rate-limit period entries (5h/weekly/monthly caps) that are a *different*
+    /// dimension. Previously a non-empty `periods` array hijacked the capsule,
+    /// showing e.g. "周 38%" while the real usage was 97%. (#flow-stats)
+    func testCapsuleAlwaysShowsTopLevelUsedPercent() {
+        let c = GrokQuotaDisplay.capsule(
+            usedPercent: 97,
+            periodLabel: "周",
+            periods: [
+                PeriodUsage(typeRaw: 1, label: "月", percent: 55, resetDate: nil),
+                PeriodUsage(typeRaw: 2, label: "周", percent: 38, resetDate: nil),
+                PeriodUsage(typeRaw: 4, label: "额", percent: 4, resetDate: nil),
+            ]
+        )
+        XCTAssertEqual(c?.percent, 97, "capsule must show top-level usedPercent, not a period sub-value")
+        XCTAssertEqual(c?.label, "周")
     }
 
-    func testQuotaDisplayFallsBackToMaxWhenNoSelection() {
-        let periods = [PeriodUsage(typeRaw: 2, label: "周", percent: 38, resetDate: nil),
-                       PeriodUsage(typeRaw: 1, label: "月", percent: 60, resetDate: nil)]
-        let r = GrokQuotaDisplay.resolve(periods: periods, selected: nil, fallbackPercent: 75, fallbackLabel: "额")
-        XCTAssertEqual(r.percent, 60)
-        XCTAssertEqual(r.label, "月")
+    func testCapsuleUsedPercentWhenNoPeriods() {
+        let c = GrokQuotaDisplay.capsule(usedPercent: 97, periodLabel: "周", periods: [])
+        XCTAssertEqual(c?.percent, 97)
+        XCTAssertEqual(c?.label, "周")
     }
 
-    func testQuotaDisplayFallsBackWhenPeriodsEmpty() {
-        let r = GrokQuotaDisplay.resolve(periods: [], selected: nil, fallbackPercent: 75, fallbackLabel: "额")
-        XCTAssertEqual(r.percent, 75)
-        XCTAssertEqual(r.label, "额")
+    func testCapsuleNilUsedPercentShowsNothing() {
+        XCTAssertNil(GrokQuotaDisplay.capsule(usedPercent: nil, periodLabel: "额", periods: []))
     }
 
     func testParseBillingFloatPercent() throws {
