@@ -32,6 +32,11 @@ private struct ChatDetailViewBody: View {
     @State private var rightPanelDragWidth: CGFloat?
     @StateObject private var gitBranches = GitBranchStore()
 
+    /// Whether the sticky task bar (latest pinnable user message, scrolled fully above the
+    /// transcript viewport) should currently be shown. Driven by `StickyTaskAnchorKey`/
+    /// `StickyTaskShowKey` geometry preferences computed inside `transcript`.
+    @State private var showStickyTaskBar = false
+
     private let minimumChatWidth: CGFloat = 360
     private let minimumRightPanelWidth: CGFloat = 300
     private let preferredRightPanelWidth: CGFloat = 460
@@ -100,6 +105,7 @@ private struct ChatDetailViewBody: View {
             scrollNeedsRetry = false
             rightPanelDragStartWidth = nil
             rightPanelDragWidth = nil
+            showStickyTaskBar = false
             // draft / rightPanel / pinTranscriptToBottom / transcriptVisibleCount live on ChatSession.
         }
     }
@@ -240,6 +246,9 @@ private struct ChatDetailViewBody: View {
         let items = session.transcript
         let visibleCount = session.transcriptVisibleCount
         let hidden = max(0, items.count - visibleCount)
+        // Recomputed each body pass; O(n) reverse scan capped at the first hit, cheap for
+        // realistic transcript sizes. Nil when no user message in this session is pinnable.
+        let stickyTarget = TaskPinLogic.latestPinnableUser(in: items)
         return ScrollViewReader { proxy in
             ScrollView {
                 // LazyVStack: only realizes the rows in the visible viewport (~10),
@@ -273,6 +282,12 @@ private struct ChatDetailViewBody: View {
                             onSelectAgent: selectAgent
                         )
                         .equatable()
+                        .id(item.id)
+                        // Only the sticky-target row publishes its bounds; every other row
+                        // publishes nil, which `StickyTaskAnchorKey.reduce` treats as "no change".
+                        .anchorPreference(key: StickyTaskAnchorKey.self, value: .bounds) { anchor in
+                            item.id == stickyTarget?.id ? anchor : nil
+                        }
                     }
                     if let streaming = session.streamingItem, hasVisibleContent(streaming) {
                         MessageRow(
@@ -301,6 +316,11 @@ private struct ChatDetailViewBody: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .defaultScrollAnchor(.bottom)
+            .stickyTaskBarOverlay(
+                showStickyTaskBar: $showStickyTaskBar,
+                stickyTarget: stickyTarget,
+                onTap: { target in scrollToStickyTarget(proxy, item: target) }
+            )
             .overlay(alignment: .bottomTrailing) {
                 if !session.pinTranscriptToBottom {
                     Button {
@@ -363,6 +383,7 @@ private struct ChatDetailViewBody: View {
                 // kept as a safety net for the reused-detail-view path.
                 scrollCoalesceScheduled = false
                 scrollNeedsRetry = false
+                showStickyTaskBar = false
                 if session.pinTranscriptToBottom {
                     scrollToBottom(proxy, retry: true)
                 }
@@ -435,6 +456,24 @@ private struct ChatDetailViewBody: View {
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             proxy.scrollTo("bottom", anchor: .bottom)
+        }
+    }
+
+    /// Jumps back to the sticky bar's target message, expanding `transcriptVisibleCount`
+    /// first if the target has been trimmed out of the currently-rendered suffix.
+    private func scrollToStickyTarget(_ proxy: ScrollViewProxy, item: ChatItem) {
+        if let idx = session.transcript.firstIndex(where: { $0.id == item.id }) {
+            let needed = session.transcript.count - idx
+            if session.transcriptVisibleCount < needed {
+                session.transcriptVisibleCount = max(session.transcriptVisibleCount, needed + 20)
+            }
+        }
+        // Let the visibleCount change (if any) land its layout pass before scrolling,
+        // so the target row exists in the LazyVStack when `scrollTo` runs.
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                proxy.scrollTo(item.id, anchor: .top)
+            }
         }
     }
 
@@ -584,6 +623,81 @@ private struct RightPanelDivider: View {
             }
         }
         .help("拖动调整右侧面板宽度")
+    }
+}
+
+// MARK: - Sticky task bar geometry
+
+private extension View {
+    /// Resolves `StickyTaskAnchorKey` (published from inside the transcript's
+    /// `LazyVStack`) against this view's own geometry — since this is attached to the
+    /// `ScrollView` itself, not the scrolled content, that geometry *is* the viewport
+    /// frame, so no named coordinate space is needed; anchors resolve through whatever
+    /// `GeometryReader` reads them.
+    ///
+    /// `rect.maxY <= 0` means the target row's bottom edge is above the viewport's top
+    /// edge, i.e. fully scrolled out above. When the target row is not currently
+    /// realized by the `LazyVStack` (scrolled far away, or trimmed out of
+    /// `items.suffix(visibleCount)` — which only ever trims *older* items, so "absent"
+    /// here always means "above"), the anchor is nil for that render; `showStickyTaskBar`
+    /// then keeps its last-known value instead of being forced to `false`, avoiding a
+    /// visibility flicker while the row is unrealized.
+    ///
+    /// Split out of `transcript`'s modifier chain into its own function — folded into
+    /// the same expression, this many chained modifiers made the type-checker time out.
+    @ViewBuilder
+    func stickyTaskBarOverlay(
+        showStickyTaskBar: Binding<Bool>,
+        stickyTarget: ChatItem?,
+        onTap: @escaping (ChatItem) -> Void
+    ) -> some View {
+        self
+            .backgroundPreferenceValue(StickyTaskAnchorKey.self) { anchor in
+                GeometryReader { geo in
+                    Color.clear
+                        .preference(key: StickyTaskShowKey.self, value: anchor.map { geo[$0].maxY <= 0 })
+                }
+            }
+            .onPreferenceChange(StickyTaskShowKey.self) { known in
+                if let known { showStickyTaskBar.wrappedValue = known }
+            }
+            .onChange(of: stickyTarget?.id) { _, _ in
+                // New target picked (new task, or first pinnable message in the session):
+                // hide until geometry re-confirms it is actually above the viewport, so a
+                // freshly sent (visible) task never flashes the bar.
+                showStickyTaskBar.wrappedValue = false
+            }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if showStickyTaskBar.wrappedValue, let stickyTarget {
+                    StickyTaskBar(text: TaskPinLogic.stickyDisplayText(of: stickyTarget)) {
+                        onTap(stickyTarget)
+                    }
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .animation(.easeInOut(duration: 0.15), value: showStickyTaskBar.wrappedValue)
+    }
+}
+
+/// Bubbles up the sticky-target row's `.bounds` anchor from inside the transcript
+/// `LazyVStack`. Every row contributes (most yield `nil`); `reduce` treats a `nil`
+/// contribution as "no change" so a still-realized target row's last-known anchor is
+/// never clobbered by its non-matching siblings.
+private struct StickyTaskAnchorKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = nextValue() ?? value
+    }
+}
+
+/// Whether the sticky target row is fully above the scroll viewport, resolved from
+/// `StickyTaskAnchorKey` against the `ScrollView`'s own geometry. `nil` means "target row
+/// not currently realized this render" (see comment at the `backgroundPreferenceValue`
+/// call site) — callers should hold their last-known value rather than treat it as hidden.
+private struct StickyTaskShowKey: PreferenceKey {
+    static var defaultValue: Bool? = nil
+    static func reduce(value: inout Bool?, nextValue: () -> Bool?) {
+        value = nextValue() ?? value
     }
 }
 
