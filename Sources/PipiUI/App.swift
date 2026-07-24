@@ -38,6 +38,10 @@ public struct PipiUIApp: App {
         WindowGroup("Pipi UI") {
             ContentView()
                 .environmentObject(store)
+                .environment(
+                    \.chatTypography,
+                    ChatTypography.make(fontSize: CGFloat(store.chatFontSize))
+                )
                 .frame(minWidth: 800, minHeight: 560)
                 .background(WindowSizePersistenceView())
         }
@@ -51,6 +55,13 @@ public struct PipiUIApp: App {
                     .keyboardShortcut("-", modifiers: .command)
                 Button("实际大小") { store.setUIScale(1.0) }
                     .keyboardShortcut("0", modifiers: .command)
+                Divider()
+                Button("聊天字号放大") { store.setChatFontSize(store.chatFontSize + 1) }
+                    .keyboardShortcut("=", modifiers: [.command, .shift])
+                Button("聊天字号缩小") { store.setChatFontSize(store.chatFontSize - 1) }
+                    .keyboardShortcut("-", modifiers: [.command, .shift])
+                Button("聊天字号默认") { store.setChatFontSize(Double(ChatTypography.defaultFontSize)) }
+                    .keyboardShortcut("0", modifiers: [.command, .shift])
             }
         }
     }

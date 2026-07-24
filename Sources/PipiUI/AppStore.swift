@@ -60,6 +60,20 @@ final class AppStore: ObservableObject {
         UserDefaults.standard.set(uiScale, forKey: "pipiui.uiScale")
     }
 
+    /// Chat body font size (pt). Independent of whole-window `uiScale`.
+    @Published var chatFontSize: Double = {
+        let key = "pipiui.chatFontSize"
+        guard UserDefaults.standard.object(forKey: key) != nil else {
+            return Double(ChatTypography.defaultFontSize)
+        }
+        return Double(ChatTypography.sanitizedFontSize(CGFloat(UserDefaults.standard.double(forKey: key))))
+    }()
+
+    func setChatFontSize(_ size: Double) {
+        chatFontSize = Double(ChatTypography.sanitizedFontSize(CGFloat(size)))
+        UserDefaults.standard.set(chatFontSize, forKey: "pipiui.chatFontSize")
+    }
+
     var currentSession: ChatSession? {
         selectedSessionKey.flatMap { openSessions[$0] }
     }
