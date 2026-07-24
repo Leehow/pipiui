@@ -41,6 +41,10 @@ private struct ChatDetailViewBody: View {
     /// above viewport" geometry threshold by the space the bar itself occupies (see
     /// `stickyTaskBarOverlay`). Starts at 0 (pre-inset threshold) until first measured.
     @State private var stickyTaskBarHeight: CGFloat = 0
+    /// Last settled chat-column width. Width changes (window resize / right panel)
+    /// reflow LazyVStack row heights; we re-pin after the width stops moving.
+    @State private var settledChatColumnWidth: CGFloat?
+    @State private var chatColumnWidthSettleWork: DispatchWorkItem?
 
     private let minimumChatWidth: CGFloat = 360
     private let minimumRightPanelWidth: CGFloat = 300
@@ -105,6 +109,9 @@ private struct ChatDetailViewBody: View {
             rightPanelDragWidth = nil
             stickySectionId = nil
             stickyTaskBarHeight = 0
+            settledChatColumnWidth = nil
+            chatColumnWidthSettleWork?.cancel()
+            chatColumnWidthSettleWork = nil
             // draft / rightPanel / pinTranscriptToBottom / transcriptVisibleCount live on ChatSession.
         }
     }
@@ -120,6 +127,11 @@ private struct ChatDetailViewBody: View {
             }
             InputBar(session: session)
         }
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(key: ChatColumnWidthKey.self, value: geo.size.width)
+            }
+        )
         .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
         .layoutPriority(1)
     }
@@ -441,6 +453,13 @@ private struct ChatDetailViewBody: View {
                 // 右栏开关会改 transcript 宽度/高度，布局后再贴底
                 scrollToBottom(proxy, retry: true)
             }
+            .onPreferenceChange(ChatColumnWidthKey.self) { width in
+                scheduleChatColumnWidthSettleRepin(proxy, width: width)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEndLiveResizeNotification)) { _ in
+                // Live resize ended: LazyVStack has finished most width reflow — reassert bottom.
+                scrollToBottom(proxy, retry: true)
+            }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active {
                     scrollToBottom(proxy, retry: true)
@@ -450,6 +469,25 @@ private struct ChatDetailViewBody: View {
                 scrollToBottom(proxy, retry: true)
             }
         }
+    }
+
+    /// Debounce chat-column width changes, then re-pin. Skips the first measurement and
+    /// sub-point noise so open/animation frames do not spam `scrollTo`.
+    private func scheduleChatColumnWidthSettleRepin(_ proxy: ScrollViewProxy, width: CGFloat) {
+        guard width.isFinite, width > 1 else { return }
+        if let settled = settledChatColumnWidth, abs(settled - width) < 0.5 {
+            return
+        }
+        chatColumnWidthSettleWork?.cancel()
+        let work = DispatchWorkItem {
+            let previous = settledChatColumnWidth
+            settledChatColumnWidth = width
+            // First layout pass only records width — do not yank an initial scroll.
+            guard previous != nil else { return }
+            scrollToBottom(proxy, retry: true)
+        }
+        chatColumnWidthSettleWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
     }
 
     /// 贴底滚动：仅当用户仍 pin 在底部时执行；流式更新合并为 ~50ms 一次，避免每分片都触发布局
@@ -464,12 +502,11 @@ private struct ChatDetailViewBody: View {
             scrollNeedsRetry = false
             performScrollToBottom(proxy)
             if needsRetry {
-                // 激活/布局后多档重试，等 clip 尺寸稳定后再贴底
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    performScrollToBottom(proxy)
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    performScrollToBottom(proxy)
+                // 激活/布局后多档重试，等 clip 尺寸与 LazyVStack 估高稳定后再贴底
+                for delay in [0.05, 0.2, 0.45] as [TimeInterval] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        performScrollToBottom(proxy)
+                    }
                 }
             }
         }
@@ -801,6 +838,14 @@ private struct StickyTaskBarHeightKey: PreferenceKey {
     }
 }
 
+/// Chat column width (transcript + input). Used to re-pin after width settle.
+private struct ChatColumnWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 // MARK: - Stick-to-bottom tracking (AppKit)
 
 /// Decides whether a clip-view move is the user scrolling or the app scrolling.
@@ -818,8 +863,13 @@ enum ScrollOrigin {
     case user
     case programmaticOrUnknown
 
-    static func classify(mouseButtonsDown: Int) -> ScrollOrigin {
-        mouseButtonsDown != 0 ? .user : .programmaticOrUnknown
+    /// - Parameter windowInLiveResize: AppKit window chrome drag. The mouse button
+    ///   is held (same signal as a scroller-knob drag) while transcript width/height
+    ///   reflows — that must not unpin, or settle-time `scrollTo("bottom")` is skipped
+    ///   and the viewport lands mid-history after LazyVStack re-estimates row heights.
+    static func classify(mouseButtonsDown: Int, windowInLiveResize: Bool = false) -> ScrollOrigin {
+        if windowInLiveResize { return .programmaticOrUnknown }
+        return mouseButtonsDown != 0 ? .user : .programmaticOrUnknown
     }
 
     /// Only a scroll we can attribute to the user may release the bottom pin;
@@ -891,6 +941,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                     object: sv,
                     queue: .main
                 ) { [weak self] _ in
+                    guard self?.scrollView?.window?.inLiveResize != true else { return }
                     self?.updatePinFromUserScroll()
                 }
                 endScrollObs = center.addObserver(
@@ -898,6 +949,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                     object: sv,
                     queue: .main
                 ) { [weak self] _ in
+                    guard self?.scrollView?.window?.inLiveResize != true else { return }
                     self?.updatePinFromUserScroll()
                 }
                 // Catches scroller-knob drags, which post no live-scroll notification.
@@ -908,7 +960,11 @@ struct StickToBottomTracker: NSViewRepresentable {
                     object: clip,
                     queue: .main
                 ) { [weak self] _ in
-                    let origin = ScrollOrigin.classify(mouseButtonsDown: Int(NSEvent.pressedMouseButtons))
+                    let inLiveResize = self?.scrollView?.window?.inLiveResize == true
+                    let origin = ScrollOrigin.classify(
+                        mouseButtonsDown: Int(NSEvent.pressedMouseButtons),
+                        windowInLiveResize: inLiveResize
+                    )
                     guard origin.allowsUnpin else { return }
                     self?.updatePinFromUserScroll()
                 }

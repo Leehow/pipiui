@@ -27,4 +27,12 @@ final class ScrollOriginTests: XCTestCase {
             XCTAssertFalse(ScrollOrigin.classify(mouseButtonsDown: 0).allowsUnpin)
         }
     }
+
+    /// Window resize holds a mouse button on the chrome while the transcript
+    /// reflows — must not look like a scroller-knob drag that unpins.
+    func testLiveWindowResizeNeverUnpinsEvenWithMouseDown() {
+        let origin = ScrollOrigin.classify(mouseButtonsDown: 1, windowInLiveResize: true)
+        XCTAssertEqual(origin, .programmaticOrUnknown)
+        XCTAssertFalse(origin.allowsUnpin)
+    }
 }
