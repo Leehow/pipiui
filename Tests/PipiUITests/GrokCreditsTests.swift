@@ -132,6 +132,28 @@ final class GrokCreditsTests: XCTestCase {
         XCTAssertEqual(creds.accountId, "abc-def-123")
     }
 
+    func testQuotaDisplayResolvesSelected() {
+        let periods = [PeriodUsage(typeRaw: 2, label: "周", percent: 38, resetDate: nil),
+                       PeriodUsage(typeRaw: 1, label: "月", percent: 33, resetDate: nil)]
+        let r = GrokQuotaDisplay.resolve(periods: periods, selected: 2, fallbackPercent: 75, fallbackLabel: "额")
+        XCTAssertEqual(r.percent, 38)
+        XCTAssertEqual(r.label, "周")
+    }
+
+    func testQuotaDisplayFallsBackToMaxWhenNoSelection() {
+        let periods = [PeriodUsage(typeRaw: 2, label: "周", percent: 38, resetDate: nil),
+                       PeriodUsage(typeRaw: 1, label: "月", percent: 60, resetDate: nil)]
+        let r = GrokQuotaDisplay.resolve(periods: periods, selected: nil, fallbackPercent: 75, fallbackLabel: "额")
+        XCTAssertEqual(r.percent, 60)
+        XCTAssertEqual(r.label, "月")
+    }
+
+    func testQuotaDisplayFallsBackWhenPeriodsEmpty() {
+        let r = GrokQuotaDisplay.resolve(periods: [], selected: nil, fallbackPercent: 75, fallbackLabel: "额")
+        XCTAssertEqual(r.percent, 75)
+        XCTAssertEqual(r.label, "额")
+    }
+
     func testParseBillingFloatPercent() throws {
         // field 1 = message; nested field 1 = float percent 42.5
         // Simplest: raw protobuf with fixed32 percent at path ending in 1.

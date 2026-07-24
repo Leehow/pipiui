@@ -205,6 +205,27 @@ struct GrokCreditsSnapshot: Equatable {
     }
 }
 
+enum GrokQuotaDisplay {
+    /// Resolve the capsule's displayed (percent, label) from available periods.
+    /// - If a period is selected (by typeRaw) and present → use it.
+    /// - Else if any periods exist → use the highest-usage one.
+    /// - Else → fallback values.
+    static func resolve(
+        periods: [PeriodUsage],
+        selected typeRaw: Int?,
+        fallbackPercent: Double?,
+        fallbackLabel: String
+    ) -> (percent: Double, label: String) {
+        if let typeRaw, let p = periods.first(where: { $0.typeRaw == typeRaw }) {
+            return (p.percent, p.label)
+        }
+        if let top = periods.max(by: { $0.percent < $1.percent }) {
+            return (top.percent, top.label)
+        }
+        return (fallbackPercent ?? 0, fallbackLabel)
+    }
+}
+
 // MARK: - gRPC-web billing fetch
 
 /// Minimal port of CodexBar's working grok.com billing path (bearer from `~/.grok/auth.json`).
