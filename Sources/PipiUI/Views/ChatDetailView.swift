@@ -491,7 +491,8 @@ private struct ChatDetailViewBody: View {
     /// Right-panel toggles (not live resize) still settle-then-repin here.
     private func scheduleChatColumnWidthSettleRepin(_ proxy: ScrollViewProxy, width: CGFloat) {
         guard width.isFinite, width > 1 else { return }
-        if let settled = settledChatColumnWidth, abs(settled - width) < 0.5 {
+        // Ignore sub-point / layout jitter — recovering on noise fights the wheel.
+        if let settled = settledChatColumnWidth, abs(settled - width) < 12 {
             return
         }
         if NSApp.keyWindow?.inLiveResize == true {
@@ -943,11 +944,40 @@ enum ScrollOrigin {
     var allowsUnpin: Bool { self == .user }
 }
 
+/// Pure pin/unpin decision for stick-to-bottom (unit-tested).
+enum StickToBottomLogic {
+    /// Soft band used to *re*-pin when the user scrolls back near the end.
+    static let rePinThreshold: CGFloat = 72
+    /// On wheel/trackpad live scroll, leave the absolute bottom by more than this → unpin
+    /// immediately. A 72pt band let `scrollToBottom` win against small wheel ticks.
+    static let liveScrollUnpinDistance: CGFloat = 4
+
+    /// - Returns: `true`/`false` to write pin, or `nil` for no change.
+    static func desiredPin(
+        currentlyPinned: Bool,
+        distanceFromBottom: CGFloat,
+        userLiveScroll: Bool,
+        allowUnpin: Bool
+    ) -> Bool? {
+        if userLiveScroll, allowUnpin, currentlyPinned, distanceFromBottom > liveScrollUnpinDistance {
+            return false
+        }
+        let nearBottom = distanceFromBottom <= rePinThreshold
+        if nearBottom {
+            return currentlyPinned ? nil : true
+        }
+        if allowUnpin, currentlyPinned {
+            return false
+        }
+        return nil
+    }
+}
+
 /// 挂到 ScrollView 内容底部：只在用户手势滚动时更新 pin 状态。
 /// 内容增高导致的「暂时离底」不会取消 pin（由上层 scrollTo 拉回）。
 struct StickToBottomTracker: NSViewRepresentable {
     @Binding var isPinned: Bool
-    var threshold: CGFloat = 72
+    var threshold: CGFloat = StickToBottomLogic.rePinThreshold
 
     func makeCoordinator() -> Coordinator {
         Coordinator(isPinned: $isPinned, threshold: threshold)
@@ -1008,7 +1038,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                     queue: .main
                 ) { [weak self] _ in
                     guard self?.scrollView?.window?.inLiveResize != true else { return }
-                    self?.updatePinFromUserScroll()
+                    self?.updatePinFromUserScroll(userLiveScroll: true)
                 }
                 endScrollObs = center.addObserver(
                     forName: NSScrollView.didEndLiveScrollNotification,
@@ -1016,7 +1046,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                     queue: .main
                 ) { [weak self] _ in
                     guard self?.scrollView?.window?.inLiveResize != true else { return }
-                    self?.updatePinFromUserScroll()
+                    self?.updatePinFromUserScroll(userLiveScroll: true)
                 }
                 // Catches scroller-knob drags, which post no live-scroll notification.
                 let clip = sv.contentView
@@ -1057,7 +1087,7 @@ struct StickToBottomTracker: NSViewRepresentable {
             pendingPinValue = nil
         }
 
-        private func updatePinFromUserScroll(allowUnpin: Bool = true) {
+        private func updatePinFromUserScroll(allowUnpin: Bool = true, userLiveScroll: Bool = false) {
             guard let sv = scrollView, let doc = sv.documentView else { return }
             // documentVisibleRect 在 doc 坐标系下，配合 isFlipped 两种方向都正确
             let visible = sv.documentVisibleRect
@@ -1070,17 +1100,23 @@ struct StickToBottomTracker: NSViewRepresentable {
                 // y 向上：底部 = 0，距底 = visible.minY
                 distance = visible.minY
             }
-            let nearBottom = distance <= threshold
-            let desired: Bool?
-            if nearBottom {
-                desired = isPinned.wrappedValue ? nil : true
-            } else if allowUnpin, isPinned.wrappedValue {
-                desired = false
-            } else {
-                desired = nil
-            }
+            let desired = StickToBottomLogic.desiredPin(
+                currentlyPinned: isPinned.wrappedValue,
+                distanceFromBottom: distance,
+                userLiveScroll: userLiveScroll,
+                allowUnpin: allowUnpin
+            )
             guard let desired else { return }
-            // Never write @Binding synchronously from scroll/layout — bounce to next runloop.
+            // Unpin from a live wheel/trackpad scroll synchronously so in-flight
+            // `scrollToBottom` / width-recover see `pin == false` this runloop.
+            if desired == false, userLiveScroll {
+                pendingPinValue = nil
+                if isPinned.wrappedValue {
+                    isPinned.wrappedValue = false
+                }
+                return
+            }
+            // Re-pin / other writes: bounce to next runloop (avoid layout feedback).
             schedulePinWrite(desired)
         }
 
