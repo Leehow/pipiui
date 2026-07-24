@@ -36,6 +36,10 @@ private struct ChatDetailViewBody: View {
     /// transcript viewport) should currently be shown. Driven by `StickyTaskAnchorKey`/
     /// `StickyTaskShowKey` geometry preferences computed inside `transcript`.
     @State private var showStickyTaskBar = false
+    /// Last-measured height of the rendered `StickyTaskBar`, used to offset the "fully
+    /// above viewport" geometry threshold by the space the bar itself occupies (see
+    /// `stickyTaskBarOverlay`). Starts at 0 (pre-inset threshold) until first measured.
+    @State private var stickyTaskBarHeight: CGFloat = 0
 
     private let minimumChatWidth: CGFloat = 360
     private let minimumRightPanelWidth: CGFloat = 300
@@ -106,6 +110,7 @@ private struct ChatDetailViewBody: View {
             rightPanelDragStartWidth = nil
             rightPanelDragWidth = nil
             showStickyTaskBar = false
+            stickyTaskBarHeight = 0
             // draft / rightPanel / pinTranscriptToBottom / transcriptVisibleCount live on ChatSession.
         }
     }
@@ -249,6 +254,16 @@ private struct ChatDetailViewBody: View {
         // Recomputed each body pass; O(n) reverse scan capped at the first hit, cheap for
         // realistic transcript sizes. Nil when no user message in this session is pinnable.
         let stickyTarget = TaskPinLogic.latestPinnableUser(in: items)
+        // `items.suffix(visibleCount)` only ever trims *older* items (indices < hidden), so
+        // a target whose index falls before that cutoff can never be realized by the
+        // LazyVStack — it will never get an anchor via `StickyTaskAnchorKey` no matter how
+        // long we wait. Treat that case as "definitely above the viewport" up front instead
+        // of depending on geometry that can never arrive.
+        let stickyTargetTruncated: Bool = {
+            guard let stickyTarget,
+                  let idx = items.firstIndex(where: { $0.id == stickyTarget.id }) else { return false }
+            return idx < hidden
+        }()
         return ScrollViewReader { proxy in
             ScrollView {
                 // LazyVStack: only realizes the rows in the visible viewport (~10),
@@ -318,7 +333,9 @@ private struct ChatDetailViewBody: View {
             .defaultScrollAnchor(.bottom)
             .stickyTaskBarOverlay(
                 showStickyTaskBar: $showStickyTaskBar,
+                stickyTaskBarHeight: $stickyTaskBarHeight,
                 stickyTarget: stickyTarget,
+                stickyTargetTruncated: stickyTargetTruncated,
                 onTap: { target in scrollToStickyTarget(proxy, item: target) }
             )
             .overlay(alignment: .bottomTrailing) {
@@ -384,6 +401,7 @@ private struct ChatDetailViewBody: View {
                 scrollCoalesceScheduled = false
                 scrollNeedsRetry = false
                 showStickyTaskBar = false
+                stickyTaskBarHeight = 0
                 if session.pinTranscriptToBottom {
                     scrollToBottom(proxy, retry: true)
                 }
@@ -468,12 +486,23 @@ private struct ChatDetailViewBody: View {
                 session.transcriptVisibleCount = max(session.transcriptVisibleCount, needed + 20)
             }
         }
-        // Let the visibleCount change (if any) land its layout pass before scrolling,
-        // so the target row exists in the LazyVStack when `scrollTo` runs.
-        DispatchQueue.main.async {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                proxy.scrollTo(item.id, anchor: .top)
-            }
+        // Mirrors the `.task(id: session.id)` bottom-scroll retry pattern above: bumping
+        // `transcriptVisibleCount` triggers a LazyVStack re-layout, and the first
+        // `scrollTo` can fire before that row is actually realized (same
+        // ScrollDiagnostics "subviews=1 — BLANK" race). Retry at 0/50/200ms, yielding to
+        // the runloop between attempts, instead of a single best-effort call.
+        Task { @MainActor in
+            applyScrollToStickyTarget(proxy, itemId: item.id)
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            applyScrollToStickyTarget(proxy, itemId: item.id)
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            applyScrollToStickyTarget(proxy, itemId: item.id)
+        }
+    }
+
+    private func applyScrollToStickyTarget(_ proxy: ScrollViewProxy, itemId: String) {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            proxy.scrollTo(itemId, anchor: .top)
         }
     }
 
@@ -635,27 +664,45 @@ private extension View {
     /// frame, so no named coordinate space is needed; anchors resolve through whatever
     /// `GeometryReader` reads them.
     ///
-    /// `rect.maxY <= 0` means the target row's bottom edge is above the viewport's top
-    /// edge, i.e. fully scrolled out above. When the target row is not currently
-    /// realized by the `LazyVStack` (scrolled far away, or trimmed out of
-    /// `items.suffix(visibleCount)` — which only ever trims *older* items, so "absent"
-    /// here always means "above"), the anchor is nil for that render; `showStickyTaskBar`
-    /// then keeps its last-known value instead of being forced to `false`, avoiding a
-    /// visibility flicker while the row is unrealized.
+    /// This `GeometryReader` sits at a point in the chain *before* `safeAreaInset` below
+    /// adds the bar, so `geo`'s frame is the ScrollView's frame as if the bar weren't
+    /// occupying space at the top — i.e. `geo`'s origin is the *outer* top edge, not the
+    /// top of the area actually left for scrollable content once the bar is showing.
+    /// Comparing against `rect.maxY <= 0` would therefore ask the target to clear the
+    /// bar's own height *again* on top of clearing the viewport, hiding the bar one
+    /// bar-height too early while scrolling back down to the target. Comparing against
+    /// `rect.maxY <= stickyTaskBarHeight` (the last-measured rendered height of the bar
+    /// below) accounts for that inset, so "fully above viewport" means fully above the
+    /// space that remains once the bar's own footprint is subtracted.
+    ///
+    /// When the target row is not currently realized by the `LazyVStack` (scrolled far
+    /// away — still present in `items.suffix(visibleCount)`, just not laid out yet), the
+    /// anchor is nil for that render; `showStickyTaskBar` then keeps its last-known value
+    /// instead of being forced to `false`, avoiding a visibility flicker while the row is
+    /// unrealized. When the target has been trimmed out of `items.suffix(visibleCount)`
+    /// entirely (`stickyTargetTruncated`), it can never receive an anchor no matter how
+    /// long we wait — since the suffix only ever trims *older* items, "not in the
+    /// suffix" always means "above viewport", so that case is shown unconditionally,
+    /// bypassing geometry.
     ///
     /// Split out of `transcript`'s modifier chain into its own function — folded into
     /// the same expression, this many chained modifiers made the type-checker time out.
-    @ViewBuilder
+    /// A single unconditional `return` below, so no `@ViewBuilder` is needed (and adding
+    /// one only produces an "application ... disabled by explicit 'return'" warning).
     func stickyTaskBarOverlay(
         showStickyTaskBar: Binding<Bool>,
+        stickyTaskBarHeight: Binding<CGFloat>,
         stickyTarget: ChatItem?,
+        stickyTargetTruncated: Bool,
         onTap: @escaping (ChatItem) -> Void
     ) -> some View {
-        self
+        let barHeight = stickyTaskBarHeight.wrappedValue
+        let effectiveShow = stickyTargetTruncated || showStickyTaskBar.wrappedValue
+        return self
             .backgroundPreferenceValue(StickyTaskAnchorKey.self) { anchor in
                 GeometryReader { geo in
                     Color.clear
-                        .preference(key: StickyTaskShowKey.self, value: anchor.map { geo[$0].maxY <= 0 })
+                        .preference(key: StickyTaskShowKey.self, value: anchor.map { geo[$0].maxY <= barHeight })
                 }
             }
             .onPreferenceChange(StickyTaskShowKey.self) { known in
@@ -664,18 +711,29 @@ private extension View {
             .onChange(of: stickyTarget?.id) { _, _ in
                 // New target picked (new task, or first pinnable message in the session):
                 // hide until geometry re-confirms it is actually above the viewport, so a
-                // freshly sent (visible) task never flashes the bar.
+                // freshly sent (visible) task never flashes the bar. `stickyTargetTruncated`
+                // (computed fresh from the new target) still overrides this immediately if
+                // the new target itself starts out beyond the visible suffix.
                 showStickyTaskBar.wrappedValue = false
             }
             .safeAreaInset(edge: .top, spacing: 0) {
-                if showStickyTaskBar.wrappedValue, let stickyTarget {
+                if effectiveShow, let stickyTarget {
                     StickyTaskBar(text: TaskPinLogic.stickyDisplayText(of: stickyTarget)) {
                         onTap(stickyTarget)
                     }
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear
+                                .preference(key: StickyTaskBarHeightKey.self, value: geo.size.height)
+                        }
+                    )
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
-            .animation(.easeInOut(duration: 0.15), value: showStickyTaskBar.wrappedValue)
+            .onPreferenceChange(StickyTaskBarHeightKey.self) { height in
+                stickyTaskBarHeight.wrappedValue = height
+            }
+            .animation(.easeInOut(duration: 0.15), value: effectiveShow)
     }
 }
 
@@ -698,6 +756,18 @@ private struct StickyTaskShowKey: PreferenceKey {
     static var defaultValue: Bool? = nil
     static func reduce(value: inout Bool?, nextValue: () -> Bool?) {
         value = nextValue() ?? value
+    }
+}
+
+/// Rendered height of the `StickyTaskBar`, measured from inside the `safeAreaInset`
+/// content. Used to offset the "fully above viewport" geometry threshold (see
+/// `stickyTaskBarOverlay`) by the space the bar itself occupies at the top of the
+/// ScrollView. Standard max-reduce: only one publisher exists per render, but `max`
+/// is a safe combine if that ever changes.
+private struct StickyTaskBarHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
