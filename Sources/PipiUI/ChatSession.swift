@@ -194,6 +194,7 @@ final class ChatSession: ObservableObject, Identifiable {
          bridgePort: UInt16 = 0,
          webviewExtension: String? = nil,
          mediaExtension: String? = nil,
+         gitExtension: String? = nil,
          reloadExtension: String? = nil,
          subagentDir: String? = nil,
          agentsDir: String? = nil,
@@ -217,8 +218,9 @@ final class ChatSession: ObservableObject, Identifiable {
         if let bossPromptPath {
             args += ["--append-system-prompt", bossPromptPath]
         }
-        // 对话内 generate_image / reload：不依赖 bridge
+        // 对话内 generate_image / git / reload：不依赖 bridge
         if let mediaExtension { args += ["-e", mediaExtension] }
+        if let gitExtension { args += ["-e", gitExtension] }
         if let reloadExtension { args += ["-e", reloadExtension] }
         var extraEnv: [String: String] = [:]
         // App 自有插件通过 -e 加载：webview 工具 + 补丁版 subagent（覆盖自动发现的官方版）
