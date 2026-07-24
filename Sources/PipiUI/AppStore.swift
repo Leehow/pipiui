@@ -24,9 +24,16 @@ final class AppStore: ObservableObject {
     @Published var selectedSessionKey: String? {
         didSet {
             guard selectedSessionKey != oldValue, let key = selectedSessionKey else { return }
+            // TEMP SWITCH PERF: measure how long a sidebar switch blocks the main thread.
+            Self.lastSwitchAt = CFAbsoluteTimeGetCurrent()
+            let warm = openSessions[key] != nil
+            Log.info("switch start → \(key) warm=\(warm)", category: .session)
             openSessions[key]?.markCompletionSeen()
         }
     }
+
+    /// TEMP SWITCH PERF: remove after the "卡一下" measurement settles.
+    static var lastSwitchAt: CFAbsoluteTime = 0
     @Published private(set) var archivedSessionPaths: Set<String> = []
 
     /// 撞名扩展（会让 pi 直接 exit(1)），按会话 key 记录，供 UI 提示与一键修复
@@ -37,6 +44,10 @@ final class AppStore: ObservableObject {
     /// 首次恢复历史会话前的一个短暂排队标记。让侧栏可以先更新选中态，
     /// 同时保证连续点击同一条历史会话不会排队启动多个 pi 进程。
     private var pendingHistoricalSessionOpens: [String: (token: UUID, projectPath: String)] = [:]
+
+    /// Optimistic "pin to top" timestamps keyed by session jsonl path.
+    /// Used so a just-sent session stays above disk-mtime ordering until closed/archived.
+    private var pinnedToTop: [String: Date] = [:]
 
     /// 整体 UI 缩放（含文字），Cmd+= / Cmd+- / Cmd+0 调节
     @Published var uiScale: Double = {
@@ -146,6 +157,16 @@ final class AppStore: ObservableObject {
             }
             self.refreshSessions(for: project)
         }
+        session.onUserSubmitted = { [weak self, weak session] in
+            guard let self, let session else { return }
+            // Only pin when session file is known; brand-new sessions already insert at top via upsert.
+            guard let file = session.sessionFile, !file.isEmpty else { return }
+            self.pinnedToTop[file] = Date()
+            let projectPath = project.path
+            var metas = self.sessionsByProject[projectPath] ?? []
+            metas.sort { self.effectiveModified($0) > self.effectiveModified($1) }
+            self.sessionsByProject[projectPath] = metas
+        }
         session.isSelectedCheck = { [weak self] in self?.selectedSessionKey == key }
         session.onRequestNewSession = { [weak self] in
             guard let self else { return }
@@ -211,6 +232,11 @@ final class AppStore: ObservableObject {
 
     // MARK: - Session discovery (~/.pi/agent/sessions)
 
+    /// Sort key: max(disk mtime, optimistic pin time).
+    private func effectiveModified(_ m: SessionMeta) -> Date {
+        max(m.modified, pinnedToTop[m.path] ?? .distantPast)
+    }
+
     /// pi 的会话目录命名规则：`--` + cwd 去掉开头斜杠、`/ \ :` 全部换成 `-` + `--`
     static func sessionDirectory(forCwd cwd: String) -> URL {
         var escaped = cwd
@@ -265,7 +291,7 @@ final class AppStore: ObservableObject {
                         ))
                     }
                 }
-                merged.sort { $0.modified > $1.modified }
+                merged.sort { self.effectiveModified($0) > self.effectiveModified($1) }
                 // 主线程 apply 时用最新 archived 再滤，避免乱序 refresh 把已归档会话写回列表
                 let liveArchived = self.archivedSessionPaths
                 merged.removeAll { liveArchived.contains($0.path) }
@@ -284,13 +310,14 @@ final class AppStore: ObservableObject {
                 for prev in previous where liveArchived.contains(prev.path) && !archivedPathsNow.contains(prev.path) {
                     archivedList.append(prev)
                 }
-                archivedList.sort { $0.modified > $1.modified }
+                archivedList.sort { self.effectiveModified($0) > self.effectiveModified($1) }
                 self.archivedByProject[projectPath] = archivedList
             }
         }
     }
 
     /// 立刻把 live session 的文件路径写进侧边栏 metas（主线程），异步 refresh 会用真实 mtime/name 覆盖。
+    /// Does NOT bump modified for existing sessions — ordering changes only via user submit pin or disk mtime.
     func upsertLiveSessionMeta(project: URL, file: String, name: String) {
         guard !archivedSessionPaths.contains(file) else { return }
         let projectPath = project.path
@@ -301,11 +328,11 @@ final class AppStore: ObservableObject {
             let old = metas[idx]
             // Don't clobber a real title with placeholder / "新会话".
             let keptName = SessionTitleLogic.isPlaceholderName(displayName) ? old.name : displayName
-            metas[idx] = SessionMeta(path: file, name: keptName, modified: Date())
+            metas[idx] = SessionMeta(path: file, name: keptName, modified: old.modified)
         } else {
+            // New session: optimistic insert at top with fresh timestamp.
             metas.insert(SessionMeta(path: file, name: displayName, modified: Date()), at: 0)
         }
-        metas.sort { $0.modified > $1.modified }
         sessionsByProject[projectPath] = metas
     }
 
@@ -469,6 +496,9 @@ final class AppStore: ObservableObject {
 
     func closeSession(key: String) {
         pendingHistoricalSessionOpens.removeValue(forKey: key)
+        if let file = openSessions[key]?.sessionFile {
+            pinnedToTop.removeValue(forKey: file)
+        }
         openSessions[key]?.shutdown()
         openSessions.removeValue(forKey: key)
         if selectedSessionKey == key { selectedSessionKey = nil }
@@ -477,6 +507,7 @@ final class AppStore: ObservableObject {
     // MARK: - Archive / rename
 
     func archiveSession(path: String, project: URL) {
+        pinnedToTop.removeValue(forKey: path)
         archivedSessionPaths.insert(path)
         persistArchivedSessions()
 
@@ -524,7 +555,7 @@ final class AppStore: ObservableObject {
             var active = sessionsByProject[projectPath] ?? []
             active.removeAll { $0.path == path }
             active.insert(moved, at: 0)
-            active.sort { $0.modified > $1.modified }
+            active.sort { self.effectiveModified($0) > self.effectiveModified($1) }
             sessionsByProject[projectPath] = active
         }
 

@@ -134,7 +134,7 @@ private struct AgentRow: View {
                         lifecycleBadge(text: "wt", color: .blue)
                     }
                 }
-                Text(agent.state == .running && !agent.activity.isEmpty ? agent.activity : agent.task)
+                Text(agent.state == .running && !agent.activity.isEmpty ? agent.activity : (agent.title ?? agent.task))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -195,6 +195,11 @@ private struct AgentDetailView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 4) {
+                if let title = agent.title, !title.isEmpty {
+                    Text(title)
+                        .font(.callout.weight(.medium))
+                        .textSelection(.enabled)
+                }
                 Text(agent.task)
                     .font(.caption)
                     .foregroundStyle(.secondary)

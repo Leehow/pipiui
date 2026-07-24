@@ -4,12 +4,27 @@ import AppKit
 struct ChatDetailView: View {
     @EnvironmentObject var store: AppStore
     @ObservedObject var session: ChatSession
+
+    var body: some View {
+        // Pass subagents each render so warm session switch (no .id teardown) rebinds observation.
+        ChatDetailViewBody(session: session, agentStore: session.subagents)
+            .environmentObject(store)
+    }
+}
+
+/// Detail chrome + transcript. Separate from `ChatDetailView` so `@ObservedObject agentStore`
+/// always tracks the *current* session's `SubagentStore` after removing `.id(session.id)`.
+private struct ChatDetailViewBody: View {
+    @EnvironmentObject var store: AppStore
+    @ObservedObject var session: ChatSession
     /// 单独观察 subagent 树：它更新时主界面的 subagent 卡片要实时跟着动
-    @ObservedObject private var agentStore: SubagentStore
+    @ObservedObject var agentStore: SubagentStore
     @Environment(\.scenePhase) private var scenePhase
 
-    /// 用户贴在底部时才自动跟随；上翻历史后保持原位
-    @State private var pinToBottom = true
+    /// Coalesce streaming scrollToBottom calls (~50ms) to avoid layout thrash.
+    /// Transient view state — reset on session.id change (no longer wiped via .id(session.id)).
+    @State private var scrollCoalesceScheduled = false
+    @State private var scrollNeedsRetry = false
     @State private var rightPanelWidthRatio: CGFloat?
     @State private var rightPanelDragStartWidth: CGFloat?
     @State private var rightPanelDragWidth: CGFloat?
@@ -20,9 +35,9 @@ struct ChatDetailView: View {
     private let preferredRightPanelWidth: CGFloat = 460
     private let rightPanelDividerWidth: CGFloat = 16
 
-    init(session: ChatSession) {
+    init(session: ChatSession, agentStore: SubagentStore) {
         self.session = session
-        self.agentStore = session.subagents
+        self.agentStore = agentStore
         self._rightPanelWidthRatio = State(initialValue: LayoutPersistence.rightPanelWidthRatio())
     }
 
@@ -65,10 +80,23 @@ struct ChatDetailView: View {
             }
         }
         .onAppear {
+            // TEMP SWITCH PERF: time from selectedSessionKey change to first appear of the
+            // rebuilt detail view. onAppear fires AFTER the .id-driven rebuild has finished
+            // its first layout pass, so this delta approximates the blocked main-thread time.
+            if AppStore.lastSwitchAt > 0 {
+                let dt = (CFAbsoluteTimeGetCurrent() - AppStore.lastSwitchAt) * 1000
+                Log.info("switch end onAppear +\(Int(dt))ms", category: .session)
+            }
             gitBranches.bind(projectURL: session.projectURL)
         }
         .onChange(of: session.id) { _, _ in
+            // Detail view is reused across sessions (App no longer forces .id rebuild).
             gitBranches.bind(projectURL: session.projectURL)
+            scrollCoalesceScheduled = false
+            scrollNeedsRetry = false
+            rightPanelDragStartWidth = nil
+            rightPanelDragWidth = nil
+            // draft / rightPanel / pinTranscriptToBottom / transcriptVisibleCount live on ChatSession.
         }
     }
 
@@ -89,27 +117,31 @@ struct ChatDetailView: View {
 
     @ViewBuilder
     private func adaptiveLayout(width: CGFloat) -> some View {
-        if let panel = session.rightPanel, width >= 760 {
+        if width >= 760 {
+            // 宽屏恒为 HStack：开关右栏只插入/移除 divider+panel 兄弟节点，
+            // chatColumn 视图身份保持不变 → 不再因 HStack↔ZStack 翻转而拆除重建。
             HStack(spacing: 0) {
                 chatColumn
                     .frame(minWidth: minimumChatWidth)
-                RightPanelDivider(
-                    onChanged: { translation in
-                        updateRightPanelDrag(
-                            translation: translation / store.uiScale,
-                            availableWidth: width
-                        )
-                    },
-                    onEnded: { translation in
-                        finishRightPanelDrag(
-                            translation: translation / store.uiScale,
-                            availableWidth: width
-                        )
-                    }
-                )
-                .frame(width: rightPanelDividerWidth)
-                panelView(panel)
-                    .frame(width: wideRightPanelWidth(for: width))
+                if let panel = session.rightPanel {
+                    RightPanelDivider(
+                        onChanged: { translation in
+                            updateRightPanelDrag(
+                                translation: translation / store.uiScale,
+                                availableWidth: width
+                            )
+                        },
+                        onEnded: { translation in
+                            finishRightPanelDrag(
+                                translation: translation / store.uiScale,
+                                availableWidth: width
+                            )
+                        }
+                    )
+                    .frame(width: rightPanelDividerWidth)
+                    panelView(panel)
+                        .frame(width: wideRightPanelWidth(for: width))
+                }
             }
         } else {
             ZStack(alignment: .trailing) {
@@ -200,18 +232,22 @@ struct ChatDetailView: View {
         rightPanelDragWidth = nil
     }
 
-    /// 超长会话只渲染最近这些条，顶部按钮按需展开
-    @State private var visibleCount = 150
-
     private var transcript: some View {
         let items = session.transcript
+        let visibleCount = session.transcriptVisibleCount
         let hidden = max(0, items.count - visibleCount)
         return ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
+                // VStack (not LazyVStack): a bottom-anchored LazyVStack leaves the rows
+                // above the "bottom" anchor unrealized after `proxy.scrollTo("bottom")`,
+                // so the pane renders blank until a real scroll forces realization
+                // (ScrollDiagnostics logs this as `subviews=1 — BLANK signature`).
+                // `transcriptVisibleCount` already caps ForEach to suffix(~150), so the
+                // realized-row budget is bounded either way; the lazy stack bought nothing.
+                VStack(alignment: .leading, spacing: 14) {
                     if hidden > 0 {
                         Button("显示更早的 \(hidden) 条消息") {
-                            visibleCount += 200
+                            session.transcriptVisibleCount += 200
                         }
                         .buttonStyle(.link)
                         .frame(maxWidth: .infinity)
@@ -248,16 +284,16 @@ struct ChatDetailView: View {
                     Color.clear
                         .frame(height: 1)
                         .id("bottom")
-                        .background(StickToBottomTracker(isPinned: $pinToBottom))
+                        .background(StickToBottomTracker(isPinned: $session.pinTranscriptToBottom))
                 }
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .defaultScrollAnchor(.bottom)
             .overlay(alignment: .bottomTrailing) {
-                if !pinToBottom {
+                if !session.pinTranscriptToBottom {
                     Button {
-                        pinToBottom = true
+                        session.pinTranscriptToBottom = true
                         scrollToBottom(proxy, retry: true)
                     } label: {
                         Image(systemName: "arrow.down")
@@ -274,9 +310,34 @@ struct ChatDetailView: View {
                     .transition(.opacity.combined(with: .scale(scale: 0.92)))
                 }
             }
-            .animation(.easeInOut(duration: 0.15), value: pinToBottom)
+            .overlay {
+                // Fills the pane while pi boots and the initial transcript is built,
+                // so a new or resuming session shows progress rather than blank white.
+                // Only shown when there is nothing to look at yet — a resumed session
+                // whose history is already on screen should not be covered.
+                if session.isInitializing && session.transcript.isEmpty && session.streamingItem == nil {
+                    SessionLoadingView()
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: session.isInitializing)
+            .animation(.easeInOut(duration: 0.15), value: session.pinTranscriptToBottom)
             .onAppear {
-                scrollToBottom(proxy)
+                // Unconditional, unlike every other call site. A freshly built
+                // transcript (`.id(session.id)` gives each session its own) starts at
+                // `defaultScrollAnchor(.bottom)`, which a LazyVStack can only estimate
+                // while its rows are unrealized — the estimate lands the viewport past
+                // the real content and the user sees a blank pane until they scroll.
+                // Forcing an explicit scroll realizes the rows and settles the offset.
+                forceScrollToBottom(proxy)
+            }
+            .onChange(of: session.id) { _, _ in
+                // After warm switch: one stick-to-bottom pass when this session still pins.
+                scrollCoalesceScheduled = false
+                scrollNeedsRetry = false
+                if session.pinTranscriptToBottom {
+                    scrollToBottom(proxy, retry: true)
+                }
             }
             .onChange(of: session.transcript.count) { _, _ in
                 // 仅在仍贴底时跟随；上翻阅读历史时不强制拖回
@@ -291,7 +352,7 @@ struct ChatDetailView: View {
             .onChange(of: session.mediaBusy) { _, _ in
                 scrollToBottom(proxy)
             }
-            .onChange(of: toolOutputSignature) { _, _ in
+            .onChange(of: session.toolOutputVersion) { _, _ in
                 scrollToBottom(proxy)
             }
             .onChange(of: agentStore.agents.count) { _, _ in
@@ -312,23 +373,52 @@ struct ChatDetailView: View {
         }
     }
 
-    /// 贴底滚动：仅当用户仍 pin 在底部时执行；async 避开 LazyVStack 布局中期 scrollTo 失效
+    /// 贴底滚动：仅当用户仍 pin 在底部时执行；流式更新合并为 ~50ms 一次，避免每分片都触发布局
     private func scrollToBottom(_ proxy: ScrollViewProxy, retry: Bool = false) {
-        guard pinToBottom else { return }
-        let run = {
-            // 在途 async 到达时用户可能已上翻 unpin，必须再检查
-            guard pinToBottom else { return }
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                proxy.scrollTo("bottom", anchor: .bottom)
+        guard session.pinTranscriptToBottom else { return }
+        if retry { scrollNeedsRetry = true }
+        guard !scrollCoalesceScheduled else { return }
+        scrollCoalesceScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            scrollCoalesceScheduled = false
+            let needsRetry = scrollNeedsRetry
+            scrollNeedsRetry = false
+            performScrollToBottom(proxy)
+            if needsRetry {
+                // 激活/布局后多档重试，等 clip 尺寸稳定后再贴底
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    performScrollToBottom(proxy)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    performScrollToBottom(proxy)
+                }
             }
         }
-        DispatchQueue.main.async(execute: run)
-        if retry {
-            // 激活/布局后多档重试，等 clip 尺寸稳定后再贴底
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: run)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: run)
+    }
+
+    private func performScrollToBottom(_ proxy: ScrollViewProxy) {
+        // 在途 async 到达时用户可能已上翻 unpin，必须再检查
+        guard session.pinTranscriptToBottom else { return }
+        applyScrollToBottom(proxy)
+    }
+
+    /// Scrolls regardless of pin state, on a schedule that outlives one layout pass.
+    /// Used only when the transcript first appears, where "don't move the view" would
+    /// mean "leave the user staring at an unrealized region".
+    private func forceScrollToBottom(_ proxy: ScrollViewProxy) {
+        applyScrollToBottom(proxy)
+        for delay in [0.05, 0.2] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                applyScrollToBottom(proxy)
+            }
+        }
+    }
+
+    private func applyScrollToBottom(_ proxy: ScrollViewProxy) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            proxy.scrollTo("bottom", anchor: .bottom)
         }
     }
 
@@ -394,15 +484,6 @@ struct ChatDetailView: View {
             case .video: return acc + 1
             }
         }
-    }
-
-    /// 工具输出/状态变化会使卡片高度变高，但 streamingSize 可能不变
-    private var toolOutputSignature: Int {
-        var sig = session.toolRuns.count
-        for (id, run) in session.toolRuns {
-            sig = sig &+ id.count &+ run.output.count &+ (run.isRunning ? 1 : 0) &+ (run.isError ? 2 : 0)
-        }
-        return sig
     }
 
     /// 撞名扩展会让 pi 一启动就 exit(1)，这里给出具体路径和一键修复，别让用户只看到崩溃日志
@@ -492,6 +573,30 @@ private struct RightPanelDivider: View {
 
 // MARK: - Stick-to-bottom tracking (AppKit)
 
+/// Decides whether a clip-view move is the user scrolling or the app scrolling.
+///
+/// `didLiveScroll` only covers wheel and trackpad gestures. Dragging the scroller
+/// knob moves the clip view silently, so the transcript stayed "pinned to bottom"
+/// and every streaming chunk yanked it back under the user's cursor. Clip bounds
+/// changes see every scroll — including our own `scrollTo` — so they need a filter.
+///
+/// A time-based "we just scrolled" window cannot work here: during streaming the app
+/// scrolls every ~50 ms, so such a window is permanently open and would swallow the
+/// user's drag, which is precisely the case being fixed. A held mouse button, on the
+/// other hand, is present for a knob drag and absent for a programmatic scroll.
+enum ScrollOrigin {
+    case user
+    case programmaticOrUnknown
+
+    static func classify(mouseButtonsDown: Int) -> ScrollOrigin {
+        mouseButtonsDown != 0 ? .user : .programmaticOrUnknown
+    }
+
+    /// Only a scroll we can attribute to the user may release the bottom pin;
+    /// anything else keeps the old, conservative behaviour (pin-only updates).
+    var allowsUnpin: Bool { self == .user }
+}
+
 /// 挂到 ScrollView 内容底部：只在用户手势滚动时更新 pin 状态。
 /// 内容增高导致的「暂时离底」不会取消 pin（由上层 scrollTo 拉回）。
 struct StickToBottomTracker: NSViewRepresentable {
@@ -511,7 +616,8 @@ struct StickToBottomTracker: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {
         context.coordinator.isPinned = $isPinned
         context.coordinator.threshold = threshold
-        context.coordinator.attach(from: nsView)
+        // Do not re-attach on every SwiftUI body pass — only when not yet wired.
+        context.coordinator.ensureAttached(from: nsView)
     }
 
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
@@ -524,7 +630,10 @@ struct StickToBottomTracker: NSViewRepresentable {
         private weak var scrollView: NSScrollView?
         private var liveScrollObs: NSObjectProtocol?
         private var endScrollObs: NSObjectProtocol?
+        private var boundsObs: NSObjectProtocol?
         private var attachAttempts = 0
+        private var pinWriteScheduled = false
+        private var pendingPinValue: Bool?
 
         init(isPinned: Binding<Bool>, threshold: CGFloat) {
             self.isPinned = isPinned
@@ -533,10 +642,14 @@ struct StickToBottomTracker: NSViewRepresentable {
 
         deinit { detach() }
 
+        /// Idempotent: skip if observers already live on a scroll view.
+        func ensureAttached(from view: NSView) {
+            if scrollView != nil, liveScrollObs != nil { return }
+            attach(from: view)
+        }
+
         func attach(from view: NSView) {
-            if let existing = scrollView, existing.window != nil {
-                return
-            }
+            if scrollView != nil, liveScrollObs != nil { return }
             detach()
             // SwiftUI 嵌入后 enclosingScrollView 可能尚未就绪
             if let sv = view.enclosingScrollView ?? Self.findScrollView(startingAt: view) {
@@ -557,6 +670,18 @@ struct StickToBottomTracker: NSViewRepresentable {
                 ) { [weak self] _ in
                     self?.updatePinFromUserScroll()
                 }
+                // Catches scroller-knob drags, which post no live-scroll notification.
+                let clip = sv.contentView
+                clip.postsBoundsChangedNotifications = true
+                boundsObs = center.addObserver(
+                    forName: NSView.boundsDidChangeNotification,
+                    object: clip,
+                    queue: .main
+                ) { [weak self] _ in
+                    let origin = ScrollOrigin.classify(mouseButtonsDown: Int(NSEvent.pressedMouseButtons))
+                    guard origin.allowsUnpin else { return }
+                    self?.updatePinFromUserScroll()
+                }
                 // 安装时只允许「确认在底部 → pin」，避免布局未完成时误 unpin
                 updatePinFromUserScroll(allowUnpin: false)
             } else if attachAttempts < 8 {
@@ -571,9 +696,13 @@ struct StickToBottomTracker: NSViewRepresentable {
             let center = NotificationCenter.default
             if let liveScrollObs { center.removeObserver(liveScrollObs) }
             if let endScrollObs { center.removeObserver(endScrollObs) }
+            if let boundsObs { center.removeObserver(boundsObs) }
             liveScrollObs = nil
             endScrollObs = nil
+            boundsObs = nil
             scrollView = nil
+            pinWriteScheduled = false
+            pendingPinValue = nil
         }
 
         private func updatePinFromUserScroll(allowUnpin: Bool = true) {
@@ -590,12 +719,31 @@ struct StickToBottomTracker: NSViewRepresentable {
                 distance = visible.minY
             }
             let nearBottom = distance <= threshold
+            let desired: Bool?
             if nearBottom {
-                if !isPinned.wrappedValue {
-                    isPinned.wrappedValue = true
-                }
+                desired = isPinned.wrappedValue ? nil : true
             } else if allowUnpin, isPinned.wrappedValue {
-                isPinned.wrappedValue = false
+                desired = false
+            } else {
+                desired = nil
+            }
+            guard let desired else { return }
+            // Never write @Binding synchronously from scroll/layout — bounce to next runloop.
+            schedulePinWrite(desired)
+        }
+
+        private func schedulePinWrite(_ value: Bool) {
+            pendingPinValue = value
+            guard !pinWriteScheduled else { return }
+            pinWriteScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.pinWriteScheduled = false
+                guard let pending = self.pendingPinValue else { return }
+                self.pendingPinValue = nil
+                if self.isPinned.wrappedValue != pending {
+                    self.isPinned.wrappedValue = pending
+                }
             }
         }
 

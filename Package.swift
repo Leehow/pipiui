@@ -15,7 +15,8 @@ let package = Package(
             resources: [
                 // App 自有的 pi 插件（补丁版 subagent + 我们的 agents），
                 // 运行时拷到 Application Support 并 -e 加载，独立于 ~/.pi
-                .copy("PiExt")
+                .copy("PiExt"),
+                .copy("Resources")
             ]
         ),
         .executableTarget(

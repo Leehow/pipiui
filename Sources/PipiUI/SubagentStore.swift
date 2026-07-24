@@ -38,6 +38,8 @@ struct SubagentInfo: Identifiable, Equatable, Codable {
     var toolCallId: String?
     let name: String
     let task: String
+    /// 短标题：Subagents 面板列表用它替代冗长任务书；为空则回退到 task。
+    var title: String?
     let depth: Int
     let model: String?
     var state: State = .running
@@ -57,7 +59,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable {
     var worktreeLifecycle: WorktreeLifecycle = .none
 
     enum CodingKeys: String, CodingKey {
-        case id, parentId, toolCallId, name, task, depth, model
+        case id, parentId, toolCallId, name, task, title, depth, model
         case state, output, activity, log, cost, turns, started, ended
         case worktreePath, worktreeBranch, worktreeError, worktreeLifecycle
     }
@@ -68,6 +70,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable {
         toolCallId: String? = nil,
         name: String,
         task: String,
+        title: String? = nil,
         depth: Int,
         model: String?,
         state: State = .running,
@@ -88,6 +91,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable {
         self.toolCallId = toolCallId
         self.name = name
         self.task = task
+        self.title = title
         self.depth = depth
         self.model = model
         self.state = state
@@ -111,6 +115,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable {
         toolCallId = try c.decodeIfPresent(String.self, forKey: .toolCallId)
         name = try c.decode(String.self, forKey: .name)
         task = try c.decode(String.self, forKey: .task)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
         depth = try c.decode(Int.self, forKey: .depth)
         model = try c.decodeIfPresent(String.self, forKey: .model)
         state = try c.decodeIfPresent(State.self, forKey: .state) ?? .running
@@ -138,6 +143,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable {
         try c.encodeIfPresent(toolCallId, forKey: .toolCallId)
         try c.encode(name, forKey: .name)
         try c.encode(task, forKey: .task)
+        try c.encodeIfPresent(title, forKey: .title)
         try c.encode(depth, forKey: .depth)
         try c.encodeIfPresent(model, forKey: .model)
         try c.encode(state, forKey: .state)
@@ -203,6 +209,9 @@ final class SubagentStore: ObservableObject {
     @Published var worktreeActionError: String?
     /// Main project worktree (session root). Used for auto-merge on successful agent end.
     private(set) var mainProjectURL: URL?
+    /// Owning chat session key; set by ChatSession so per-turn usage events can be
+    /// attributed to the right session in the token ledger.
+    var sessionKey: String?
     private var logCounter = 0
     private var persistURL: URL?
     private var saveScheduled = false
@@ -279,6 +288,7 @@ final class SubagentStore: ObservableObject {
                 agents[i].activity = ""
                 agents[i].ended = nil
                 if let tc = e["toolCallId"].string { agents[i].toolCallId = tc }
+                if let t = e["title"].string { agents[i].title = t }
                 if let path = e["worktreePath"].string { agents[i].worktreePath = path }
                 if let branch = e["worktreeBranch"].string { agents[i].worktreeBranch = branch }
                 if let err = e["worktreeError"].string {
@@ -297,6 +307,7 @@ final class SubagentStore: ObservableObject {
                 toolCallId: e["toolCallId"].string,
                 name: e["name"].string ?? "agent",
                 task: e["task"].string ?? "",
+                title: e["title"].string,
                 depth: max(1, e["depth"].int ?? 1),
                 model: e["model"].string
             )
@@ -329,6 +340,29 @@ final class SubagentStore: ObservableObject {
             if agents[i].log.count > 800 {
                 agents[i].log.removeFirst(agents[i].log.count - 800)
             }
+        case "usage":
+            // Per-turn usage from the subagent extension (`index.ts` message_end →
+            // pipiuiReport kind:"usage"). Forwarded to the token ledger for analysis;
+            // no UI state to update — cost/turns aggregates still come via "end".
+            guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
+            let agent = agents[i]
+            let usage = TokenLedger.UsageSnapshot.from(e["usage"])
+            let model = e["model"].string ?? agent.model ?? "?"
+            let turn = e["turn"].int ?? 0
+            TokenLedger.shared.append(
+                session: sessionKey ?? "",
+                channel: "subagent",
+                agentId: id,
+                agentName: agent.name,
+                depth: agent.depth,
+                model: model,
+                turn: turn,
+                usage: usage
+            )
+            Log.info(
+                "subagent \(agent.name) turn \(turn) usage ↑\(usage.input) ↓\(usage.output) R\(usage.cacheRead) W\(usage.cacheWrite) $\(String(format: "%.4f", usage.cost)) ctx:\(usage.contextTokens) — \(model)",
+                category: .token
+            )
         case "end":
             guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
             if e["aborted"].bool == true {
