@@ -96,6 +96,7 @@ struct InputBar: View {
     @State private var slashMatches: [SlashCommand] = []
     @State private var slashSelectedIndex: Int = 0
     @State private var slashPaletteVisible: Bool = false
+    @State private var showQuotaPopover: Bool = false
 
     var body: some View {
         VStack(spacing: 8) {
@@ -641,6 +642,12 @@ struct InputBar: View {
 
     // MARK: - Menus
 
+    /// Candidates must report their *content* width. A candidate carrying
+    /// `.frame(maxWidth: .infinity)` claims all available width, so "does this fit"
+    /// depends on the width `ViewThatFits` is itself trying to pick — a circular
+    /// dependency that SwiftUI reports as `AttributeGraph: cycle detected` and then
+    /// re-evaluates forever (47M such lines in four minutes during one session, with
+    /// the app unusable). The expansion belongs on the container, after the choice.
     private var responsiveStatus: some View {
         ViewThatFits(in: .horizontal) {
             // Wide: model + thinking glued left; activity/metrics on the trailing edge.
@@ -659,7 +666,6 @@ struct InputBar: View {
                 activityStatus
                 metricsStatus
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
 
             VStack(spacing: 6) {
                 HStack(spacing: 8) {
@@ -679,9 +685,8 @@ struct InputBar: View {
                     metricsStatus
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -722,10 +727,69 @@ struct InputBar: View {
                     .padding(.vertical, 3)
                     .background(Capsule().fill(Color.primary.opacity(0.06)))
                     .help(help)
+                    .contentShape(Capsule())
+                    .onTapGesture { showQuotaPopover.toggle() }
+                    .popover(isPresented: $showQuotaPopover, arrowEdge: .bottom) {
+                        quotaPopover
+                            .frame(width: 264)
+                            .padding(10)
+                    }
             }
         }
         .fixedSize(horizontal: true, vertical: false)
     }
+
+    private var quotaPopover: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Grok 账号用量")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+            if session.periods.isEmpty {
+                Text("暂无多周期用量数据")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 6)
+            } else {
+                ForEach(session.periods) { p in
+                    periodRow(p)
+                }
+            }
+        }
+    }
+
+    private func periodRow(_ p: PeriodUsage) -> some View {
+        let selected = session.selectedPeriodTypeRaw == p.typeRaw
+        return HStack(alignment: .top, spacing: 8) {
+            Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                .font(.caption)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text(p.label).font(.caption.bold())
+                    Spacer()
+                    Text("\(Int(p.percent.rounded()))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(p.percent > 80 ? Color.orange : Color.secondary)
+                }
+                ProgressView(value: p.percent, total: 100)
+                    .tint(p.percent > 80 ? Color.orange : Color.accentColor)
+                if let reset = p.resetDate {
+                    Text("重置于 \(Self.quotaDateFmt.string(from: reset))")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary.opacity(0.7))
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { session.selectPeriod(typeRaw: p.typeRaw) }
+    }
+
+    private static let quotaDateFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm"
+        return f
+    }()
 
     private var modelMenu: some View {
         Menu {
