@@ -48,4 +48,17 @@ enum TaskPinLogic {
         }
         return nil
     }
+
+    static func stickyDisplayText(of item: ChatItem, maxChars: Int = 120) -> String {
+        var s = displayText(of: item).trimmingCharacters(in: .whitespacesAndNewlines)
+        s = String(s.drop(while: { $0.isWhitespace || $0.isNewline }))
+        if let r = s.range(of: #"\n\s*\n"#, options: .regularExpression) {
+            s = String(s[..<r.lowerBound])
+        }
+        s = s.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
+        if s.count > maxChars {
+            s = String(s.prefix(maxChars))
+        }
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
