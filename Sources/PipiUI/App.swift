@@ -3,12 +3,23 @@ import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Log.bootstrap() // idempotent; covers library/test hosts that skip AppEntry
+        CrashReporting.install() // idempotent; same reason
+        Log.info(
+            "applicationDidFinishLaunching (restored windows: \(NSApp.windows.count))",
+            category: .app
+        )
         SelfTest.runIfRequested()
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        UIEventLog.shared.install()
+        ScrollDiagnostics.shared.install()
+        LaunchDiagnostics.scheduleSnapshots()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        Log.info("applicationWillTerminate", category: .app)
+        PipiLogger.shared.flushSync()
         AppStore.shared.shutdown()
     }
 
@@ -32,6 +43,7 @@ public struct PipiUIApp: App {
         }
         .windowStyle(.automatic)
         .commands {
+            LogCommands()
             CommandGroup(after: .toolbar) {
                 Button("放大") { store.setUIScale(store.uiScale + 0.1) }
                     .keyboardShortcut("=", modifiers: .command)
@@ -50,26 +62,138 @@ struct ContentView: View {
     @State private var sidebarCollapsedForWidth = false
     @State private var sidebarWidthRatio = LayoutPersistence.sidebarWidthRatio()
 
+    /// Resize throttling. SwiftUI fires one `GeometryReader` update per live-resize
+    /// frame (often >120Hz on a fast display); letting every frame re-frame the
+    /// whole `NavigationSplitView` saturates the main thread — visibly so when a
+    /// streaming session is also rewriting its rows every ~50ms. `settledLogicalSize`
+    /// is the size downstream layout actually sees, updated at most ~60fps. Frames
+    /// dropped inside the cooldown are stashed in `pendingLogicalSize` and flushed
+    /// on `didEndLiveResizeNotification` so the window still lands on its exact
+    /// final pixel size when the user lets go.
+    @State private var settledLogicalSize: CGSize?
+    @State private var pendingLogicalSize: CGSize?
+    @State private var lastResizeEmitAt: Date?
+
     private let sidebarCollapseWidth: CGFloat = 720
 
     var body: some View {
         // 整体缩放：内容按 1/scale 布局再放大 scale 倍，UI 和文字一起缩放
         GeometryReader { geo in
-            let logicalWidth = geo.size.width / store.uiScale
+            let metrics = RootLayoutMetrics.resolve(available: geo.size, uiScale: store.uiScale)
 
-            splitView(logicalWidth: logicalWidth)
-                .frame(
-                    width: logicalWidth,
-                    height: geo.size.height / store.uiScale
-                )
-                .scaleEffect(store.uiScale, anchor: .topLeading)
+            scaledContent(metrics: metrics)
                 .onAppear {
-                    updateSidebarVisibility(for: logicalWidth)
+                    applyResize(metrics, force: true)
                 }
-                .onChange(of: logicalWidth) { _, width in
-                    updateSidebarVisibility(for: width)
+                .onChange(of: metrics.logicalSize) { _, _ in
+                    applyResize(metrics, force: false)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEndLiveResizeNotification)) { _ in
+                    // Live resize ended: flush whatever final size we dropped, so the
+                    // window settles on the exact pixel the user stopped at rather than
+                    // the last frame that slipped inside the ~60fps window.
+                    if let pending = pendingLogicalSize, pending != settledLogicalSize {
+                        settledLogicalSize = pending
+                    }
+                    pendingLogicalSize = nil
                 }
         }
+    }
+
+    /// Routes a fresh `RootLayoutMetrics` through the resize throttle: the first
+    /// frame and any frame past the cooldown updates `settledLogicalSize`; frames
+    /// inside the cooldown are stashed as `pendingLogicalSize` for the
+    /// `didEndLiveResize` flush. `force: true` bypasses the throttle (onAppear /
+    /// non-resize-driven changes).
+    private func applyResize(_ metrics: RootLayoutMetrics, force: Bool) {
+        noteRootLayout(metrics)
+        updateSidebarVisibility(for: metrics.logicalSize.width)
+        let now = Date()
+        let emit = force || ResizeThrottle.shouldEmit(now: now, lastEmittedAt: lastResizeEmitAt)
+        if emit {
+            settledLogicalSize = metrics.logicalSize
+            pendingLogicalSize = nil
+            lastResizeEmitAt = now
+        } else {
+            pendingLogicalSize = metrics.logicalSize
+        }
+    }
+
+    @ViewBuilder
+    private func scaledContent(metrics: RootLayoutMetrics) -> some View {
+        // Prefer the throttled size; fall back to the raw metrics for the very
+        // first render (before onAppear has run) and for any zero/NaN proposal
+        // that must use the unscaled fallback path below.
+        let size = settledLogicalSize ?? metrics.logicalSize
+        if metrics.isUsable {
+            splitView(logicalWidth: size.width)
+                .frame(width: size.width, height: size.height)
+                .scaleEffect(metrics.scale, anchor: .topLeading)
+        } else {
+            // Zero / NaN proposal (window restoration, a resize animation passing
+            // through zero). Pinning to that size renders an empty window, so lay
+            // out unscaled and let the next pass — which has a real size — take over.
+            splitView(logicalWidth: sidebarCollapseWidth)
+        }
+    }
+
+    private func noteRootLayout(_ metrics: RootLayoutMetrics) {
+        LaunchDiagnostics.rootLayoutCount += 1
+        LaunchDiagnostics.lastRootGeometry = metrics.logicalSize
+        if metrics.isUsable {
+            Log.debug("root layout \(metrics.logDescription)", category: .ui)
+        } else {
+            Log.warn(
+                "root layout unusable \(metrics.logDescription) — rendering unscaled fallback",
+                category: .ui
+            )
+        }
+        // TEMP RESIZE DIAG: dump every sizable scroll view on each layout pass
+        // (throttled) to find what is actually relayouting during window resize.
+        // Remove after resize perf is diagnosed.
+        Self.dumpResizeScrollViews()
+    }
+
+    // TEMP RESIZE DIAG — delete after root cause is found.
+    private static var lastResizeDiagAt: Date = .distantPast
+    private static func dumpResizeScrollViews() {
+        let now = Date()
+        guard now.timeIntervalSince(lastResizeDiagAt) > 0.3 else { return }
+        lastResizeDiagAt = now
+        guard let window = NSApp?.keyWindow,
+              let root = window.contentView else { return }
+        var idx = 0
+        var queue: [(NSView, Int)] = [(root, 0)]
+        while !queue.isEmpty, idx < 40 {
+            let (view, depth) = queue.removeFirst()
+            if let sv = view as? NSScrollView, sv.bounds.width >= 100 {
+                let doc = sv.documentView
+                let docH = doc?.frame.height ?? 0
+                let docKind = doc.map { String(describing: type(of: $0)) } ?? "nil"
+                let docSubviews = doc?.subviews.count ?? 0
+                // Ancestors help tell transcript vs subagent-log vs web apart.
+                let parentChain = Self.parentChain(of: sv, maxLength: 3)
+                Log.info(
+                    "RESIZE-DIAG sv[\(idx)] d\(depth) frame=\(String(format: "%.0fx%.0f@%.0f,%.0f", sv.frame.width, sv.frame.height, sv.frame.minX, sv.frame.minY)) docH=\(String(format: "%.0f", docH)) docKind=\(docKind) docSubViews=\(docSubviews) clip=\(String(format: "%.0fx%.0f", sv.contentView.bounds.width, sv.contentView.bounds.height)) parents=\(parentChain)",
+                    category: .ui
+                )
+                idx += 1
+            }
+            queue.append(contentsOf: view.subviews.map { ($0, depth + 1) })
+        }
+        if idx == 0 {
+            Log.info("RESIZE-DIAG no sizable scroll view found", category: .ui)
+        }
+    }
+
+    private static func parentChain(of view: NSView, maxLength: Int) -> String {
+        var parts: [String] = []
+        var current: NSView? = view.superview
+        while let v = current, parts.count < maxLength {
+            parts.append(String(describing: type(of: v)))
+            current = v.superview
+        }
+        return parts.joined(separator: "→")
     }
 
     private func splitView(logicalWidth: CGFloat) -> some View {
@@ -87,6 +211,15 @@ struct ContentView: View {
                 )
         } detail: {
             if let session = store.currentSession {
+                // Force identity change on session switch. Per-session state that must survive
+                // (transcriptVisibleCount / pinTranscriptToBottom) lives on ChatSession, so the
+                // rebuilt detail view reads it back immediately; only transient scroll/drag @State
+                // resets, which is what we want on switch.
+                //
+                // Do NOT remove this .id: without it SwiftUI reuses ChatDetailView across sessions
+                // and diffs the old+new transcript arrays in one pass. MessageRow.== compares inline
+                // ImageBlock.data byte-for-byte, so a switch into an image-heavy session freezes the
+                // main thread for seconds (the "切会话卡死" regression).
                 ChatDetailView(session: session)
                     .id(session.id)
             } else {
@@ -97,11 +230,22 @@ struct ContentView: View {
     }
 
     private func updateSidebarVisibility(for logicalWidth: CGFloat) {
+        // A degenerate width would collapse the sidebar on a proposal that means
+        // "not laid out yet", not "narrow window".
+        guard RootLayoutMetrics.isUsable(CGSize(width: logicalWidth, height: 1)) else { return }
+
         let shouldCollapse = logicalWidth < sidebarCollapseWidth
         guard shouldCollapse != sidebarCollapsedForWidth else { return }
 
         sidebarCollapsedForWidth = shouldCollapse
         columnVisibility = shouldCollapse ? .detailOnly : .all
+        Log.info(
+            String(
+                format: "sidebar visibility → %@ (logicalWidth=%.0f)",
+                shouldCollapse ? "detailOnly" : "all", logicalWidth
+            ),
+            category: .ui
+        )
     }
 
     private func sidebarIdealWidth(for logicalWidth: CGFloat) -> CGFloat {

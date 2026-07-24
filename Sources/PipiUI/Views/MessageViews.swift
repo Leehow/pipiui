@@ -277,7 +277,7 @@ struct SubagentToolCardView: View {
         case .ok:
             return "完成 · \(agent.turns) turns · " + String(format: "$%.3f", agent.cost)
         case .failed:
-            return "失败 · " + String(agent.task.prefix(60))
+            return "失败 · " + String((agent.title ?? agent.task).prefix(60))
         case .aborted:
             return "已中止"
         case .interrupted:
@@ -507,18 +507,140 @@ struct SubagentDoneBubbleView: View {
     }
 }
 
+// MARK: - Thinking block
+
+/// Per-render budget for one thinking chunk: keep each `Text(chunk)` layout job
+/// small enough that SwiftUI/CoreText lays it out in a frame or two, while never
+/// splitting a line mid-grapheme. Oversized single lines fall through as their
+/// own chunk (we don't break words).
+enum ThinkingChunkBudget {
+    static let maxChars = 4000
+    static let maxLines = 80
+    /// Tail-window size for streaming-expanded mode (B).
+    static let streamingTailChars = 1200
+}
+
+/// Cached split of a thinking blob into layout-friendly chunks. Session history
+/// is immutable, so a warm re-build reuses the same split instead of rescanning.
+/// Mirrors `MarkdownTextView.parseCache`'s NSCache-by-raw-string approach.
+enum ThinkingChunkCache {
+    private static let cache: NSCache<NSString, NSObject> = {
+        let c = NSCache<NSString, NSObject>()
+        c.countLimit = 200
+        return c
+    }()
+
+    /// Splits `text` into chunks of at most ~`maxChars`/`maxLines`, breaking only
+    /// at newlines. Result is cached by full text (immutable history → safe key).
+    /// `MessageRow.equatable()` skips unchanged rows' bodies, and the cache turns
+    /// repeats into O(1), so we always run `splitLines` — a single linear pass that
+    /// also honours the line budget (char count alone can't, e.g. 85 two-char lines
+    /// is 254 chars but 85 lines).
+    static func chunks(for text: String) -> [String] {
+        let key = text as NSString
+        if let box = cache.object(forKey: key) as? Box { return box.chunks }
+        let split = splitLines(text)
+        cache.setObject(Box(split), forKey: key)
+        return split
+    }
+
+    /// Tail window for streaming-expanded mode: the last ~`maxChars` characters,
+    /// advanced to the next newline so the window starts at a line boundary (never
+    /// slices a multi-byte grapheme or leaves a leading half-line). Keeps the
+    /// ~50 ms streaming ChatItem rebuild re-laying out O(window), not O(n).
+    static func tailWindow(of text: String, maxChars: Int = ThinkingChunkBudget.streamingTailChars) -> String {
+        guard text.count > maxChars else { return text }
+        let from = text.index(text.endIndex, offsetBy: -maxChars, limitedBy: text.startIndex) ?? text.startIndex
+        var start = from
+        if let nl = text[start...].firstIndex(of: "\n") {
+            start = text.index(after: nl)
+        }
+        return String(text[start...])
+    }
+
+    private static func splitLines(_ text: String) -> [String] {
+        var out: [String] = []
+        var slice = Substring()
+        var chars = 0
+        var lines = 0
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let n = line.count
+            // Push the current slice before adding a line that would overflow.
+            if !slice.isEmpty,
+               chars + n + 1 > ThinkingChunkBudget.maxChars
+                || lines + 1 > ThinkingChunkBudget.maxLines {
+                out.append(String(slice))
+                slice = Substring()
+                chars = 0
+                lines = 0
+            }
+            // A single line longer than the budget can't break at a newline, so
+            // hard-slice it on Character boundaries into budget-sized chunks.
+            // (Without this, one very long line would become one giant Text —
+            // exactly the lag we're fixing.) Linear: one forward grapheme walk
+            // with a running count; never recomputes `.count` of the remainder
+            // (the index(offsetBy:)/distance form was O(n²) on a 12 MB line).
+            if slice.isEmpty, n > ThinkingChunkBudget.maxChars {
+                let budget = ThinkingChunkBudget.maxChars
+                var lo = line.startIndex
+                var count = 0
+                var hi = lo
+                while hi < line.endIndex {
+                    line.formIndex(after: &hi)
+                    count += 1
+                    if count >= budget {
+                        out.append(String(line[lo..<hi]))
+                        lo = hi
+                        count = 0
+                    }
+                }
+                if lo < line.endIndex { out.append(String(line[lo..<hi])) }
+                slice = Substring()
+                chars = 0
+                lines = 0
+                continue
+            }
+            if slice.isEmpty {
+                slice = line
+                chars = n
+            } else {
+                slice += "\n"
+                slice += line
+                chars += 1 + n
+            }
+            lines += 1
+        }
+        if !slice.isEmpty { out.append(String(slice)) }
+        return out
+    }
+
+    private final class Box: NSObject {
+        let chunks: [String]
+        init(_ chunks: [String]) { self.chunks = chunks }
+    }
+}
+
+/// Renders an AI reasoning ("thinking") block. Three layered mitigations against
+/// the lag of laying out a multi-thousand-char blob as one `Text`:
+/// - **A height cap**: content sits in a bounded `ScrollView` (mirrors
+///   `ToolCardView`'s `.frame(maxHeight:)` idiom), so the transcript never hosts
+///   a full-document-height block.
+/// - **B streaming tail window**: while `isStreaming && expanded`, only the last
+///   ~1200 chars are rendered, so the ~50 ms streaming `ChatItem` rebuild only
+///   re-lays-out the window, not the whole growing blob.
+/// - **C chunked LazyVStack**: in the steady state, cached chunks render in a
+///   `LazyVStack` so CoreText only lays out visible chunks.
 struct ThinkingBlockView: View {
     let text: String
     var isStreaming: Bool = false
     @State private var expanded = false
 
+    private static let fullMaxHeight: CGFloat = 480
+    private static let streamingMaxHeight: CGFloat = 240
+
     var body: some View {
         DisclosureGroup(isExpanded: $expanded) {
-            Text(text)
-                .font(.callout)
-                .italic()
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
+            content
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 4)
         } label: {
@@ -544,6 +666,43 @@ struct ThinkingBlockView: View {
                 .fill(Color.primary.opacity(0.035))
         )
     }
+
+    @ViewBuilder
+    private var content: some View {
+        if isStreaming, expanded {
+            // B: tail window keeps the streaming re-layout O(window).
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(ThinkingChunkCache.tailWindow(of: text))
+                        .font(.callout)
+                        .italic()
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text("正在思考… 已写 \(ThinkingTokenEstimate.formatCount(ThinkingTokenEstimate.tokenCount(for: text))) tokens")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .frame(maxHeight: Self.streamingMaxHeight)
+        } else {
+            // A + C: bounded scroll view of cached chunks, lazily realized.
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(ThinkingChunkCache.chunks(for: text).enumerated()), id: \.offset) { _, chunk in
+                        Text(chunk)
+                            .font(.callout)
+                            .italic()
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+            .frame(maxHeight: Self.fullMaxHeight)
+        }
+    }
 }
 
 /// 用户已发送、assistant 尚无可展示 block 时的轻量等待提示。
@@ -560,6 +719,27 @@ struct WaitingPlaceholderView: View {
         }
         .padding(.vertical, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(message)
+    }
+}
+
+/// Full-pane placeholder shown while a session is still starting (pi spawning +
+/// initial transcript building). Distinct from `WaitingPlaceholderView`, which is
+/// an inline "AI 正在思考…" row inside an already-populated transcript.
+struct SessionLoadingView: View {
+    var message: String = "正在启动会话…"
+
+    var body: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.large)
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .textBackgroundColor))
         .accessibilityElement(children: .combine)
         .accessibilityLabel(message)
     }

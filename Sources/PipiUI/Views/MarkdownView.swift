@@ -202,14 +202,36 @@ struct MarkdownTextView: View {
         )) ?? AttributedString(string)
     }
 
-    /// Inline markdown + absolute path / file:// links (for prose blocks only).
+    /// Inline markdown parse cache. Session history text is immutable, so a warm switch that
+    /// rebuilds ~150 `MessageRow`s (each with several markdown blocks) re-parses nothing — the
+    /// `AttributedString(markdown:)` Foundation call is the single biggest main-thread cost there.
+    /// Keyed by the raw string, matching `parseCache`.
+    private static let inlineCache: NSCache<NSString, InlineBox> = {
+        let cache = NSCache<NSString, InlineBox>()
+        cache.countLimit = 1000
+        return cache
+    }()
+
+    private final class InlineBox {
+        let attributed: AttributedString
+        init(_ attributed: AttributedString) { self.attributed = attributed }
+    }
+
+    /// Inline markdown for prose blocks. Path style + ⌘+click targets are applied once in
+    /// `PathLinkedText` via `FileReveal.pathLinkedContent` (avoids a second full-text scan).
+    /// Result is cached by the raw string (immutable history text → always hits after first view).
     static func inlineWithPaths(_ string: String) -> AttributedString {
-        // Plain prose without markdown markers: pure path linking is simpler/safer.
-        if !hasInlineMarkdownMarkers(string) {
-            return FileReveal.attributedStringLinkingPaths(string)
-        }
-        let md = inline(string)
-        return FileReveal.injectPathLinks(into: md)
+        let key = string as NSString
+        if let cached = inlineCache.object(forKey: key) { return cached.attributed }
+        // Plain prose without markdown markers: hand plain attributed text to PathLinkedText.
+        let result = hasInlineMarkdownMarkers(string) ? inline(string) : AttributedString(string)
+        inlineCache.setObject(InlineBox(result), forKey: key)
+        return result
+    }
+
+    /// Test / memory-pressure helper: drop the inline markdown cache.
+    static func clearInlineCache() {
+        inlineCache.removeAllObjects()
     }
 
     private static func hasInlineMarkdownMarkers(_ string: String) -> Bool {
@@ -219,6 +241,23 @@ struct MarkdownTextView: View {
             || string.contains("[")
             || string.contains("](")
             || string.contains("~~")
+    }
+
+    /// One AttributedString for a whole list block so SwiftUI `.textSelection` can
+    /// drag across bullets. (Separate `PathLinkedText` per item cannot share a selection.)
+    static func listAttributed(_ items: [ListItem]) -> AttributedString {
+        var result = AttributedString()
+        for (index, item) in items.enumerated() {
+            if index > 0 { result.append(AttributedString("\n")) }
+            if item.indent > 0 {
+                result.append(AttributedString(String(repeating: "  ", count: item.indent)))
+            }
+            var marker = AttributedString(item.marker + " ")
+            marker.foregroundColor = Color.secondary
+            result.append(marker)
+            result.append(inlineWithPaths(item.text))
+        }
+        return result
     }
 }
 
@@ -260,19 +299,11 @@ private struct MarkdownBlockView: View {
         case .table(let header, let rows):
             tableView(header: header, rows: rows)
         case .list(let items):
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text(item.marker)
-                            .foregroundStyle(.secondary)
-                        PathLinkedText(
-                            attributed: MarkdownTextView.inlineWithPaths(item.text),
-                            onFlash: onFlash
-                        )
-                    }
-                    .padding(.leading, CGFloat(item.indent) * 16)
-                }
-            }
+            // Single selectable Text: per-item PathLinkedText cannot share drag selection.
+            PathLinkedText(
+                attributed: MarkdownTextView.listAttributed(items),
+                onFlash: onFlash
+            )
         case .quote(let text):
             HStack(alignment: .top, spacing: 8) {
                 RoundedRectangle(cornerRadius: 2)

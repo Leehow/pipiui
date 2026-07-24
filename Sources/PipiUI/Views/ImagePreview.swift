@@ -18,19 +18,14 @@ struct ImageThumbnailView: View {
     /// Composer drafts: reveal only when path is known (no attachment scan required).
     var allowContentMatch: Bool = true
 
-    @State private var showLightbox = false
     @State private var hovering = false
 
     var body: some View {
         Group {
-            if let ns = NSImage(data: data) {
+            if let ns = ImageDecodeCache.shared.image(for: data) {
                 imageView(ns)
                     .contentShape(Rectangle())
-                    .onTapGesture { showLightbox = true }
-                    // macOS: fullScreenCover is unavailable — sheet + dark chrome approximates lightbox.
-                    .sheet(isPresented: $showLightbox) {
-                        ImageLightbox(image: ns, isPresented: $showLightbox)
-                    }
+                    .onTapGesture { ImageLightboxPresenter.present(image: ns) }
                     .accessibilityAddTraits(.isButton)
                     .accessibilityLabel("图片预览")
                     .accessibilityHint("点击放大")
@@ -205,30 +200,109 @@ struct ImageThumbnailView: View {
     }
 }
 
-/// Dimmed lightbox for a single image (presented as sheet on macOS).
-struct ImageLightbox: View {
+// MARK: - Borderless NSPanel lightbox
+
+/// Presents a single borderless dimmed overlay panel (no sheet chrome).
+enum ImageLightboxPresenter {
+    private static var activePanel: NSPanel?
+    private static var activeMonitor: Any?
+
+    static func present(image: NSImage) {
+        dismiss()
+
+        let panel = NSPanel(
+            contentRect: .zero,
+            styleMask: [.borderless, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.level = .modalPanel
+        panel.collectionBehavior = [.fullScreenAuxiliary, .moveToActiveSpace]
+        panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.animationBehavior = .utilityWindow
+
+        let chrome = ImageLightboxChrome(image: image) {
+            dismiss()
+        }
+        let hosting = NSHostingView(rootView: chrome)
+        hosting.autoresizingMask = [.width, .height]
+        panel.contentView = hosting
+
+        positionAndShow(panel)
+        activePanel = panel
+
+        // Local Esc in case SwiftUI key handling misses focus races.
+        activeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.keyCode == 53 { // Escape
+                dismiss()
+                return nil
+            }
+            return event
+        }
+    }
+
+    static func dismiss() {
+        if let monitor = activeMonitor {
+            NSEvent.removeMonitor(monitor)
+            activeMonitor = nil
+        }
+        guard let panel = activePanel else { return }
+        activePanel = nil
+        panel.orderOut(nil)
+        panel.contentView = nil
+    }
+
+    private static func positionAndShow(_ panel: NSPanel) {
+        let screenFrame: NSRect
+        if let key = NSApp.keyWindow, let screen = key.screen {
+            // Cover the screen that hosts the key window for a true lightbox feel.
+            screenFrame = screen.frame
+        } else if let main = NSScreen.main {
+            screenFrame = main.frame
+        } else {
+            screenFrame = NSRect(x: 0, y: 0, width: 1280, height: 800)
+        }
+
+        panel.setFrame(screenFrame, display: true)
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+/// Soft-dimmed chrome inside the borderless panel.
+struct ImageLightboxChrome: View {
     let image: NSImage
-    @Binding var isPresented: Bool
+    let onDismiss: () -> Void
 
     var body: some View {
         ZStack {
-            Color.black.opacity(0.92)
+            Color.black.opacity(0.52)
                 .ignoresSafeArea()
                 .contentShape(Rectangle())
-                .onTapGesture { dismiss() }
+                .onTapGesture(perform: onDismiss)
 
             Image(nsImage: image)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(40)
-                // Absorb taps on the image so they don't dismiss via the background.
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .shadow(color: .black.opacity(0.35), radius: 24, y: 8)
+                .padding(32)
+                // Absorb taps on the image so they don't dismiss via the backdrop.
+                .contentShape(Rectangle())
                 .onTapGesture { /* keep open */ }
 
             VStack {
                 HStack {
                     Spacer()
-                    Button(action: dismiss) {
+                    Button(action: onDismiss) {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 28))
                             .symbolRenderingMode(.palette)
@@ -242,18 +316,12 @@ struct ImageLightbox: View {
                 Spacer()
             }
         }
-        .frame(minWidth: 640, minHeight: 480)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black)
         .focusable()
         .onKeyPress(.escape) {
-            dismiss()
+            onDismiss()
             return .handled
         }
-        .onExitCommand(perform: dismiss)
-    }
-
-    private func dismiss() {
-        isPresented = false
+        .onExitCommand(perform: onDismiss)
     }
 }

@@ -24,11 +24,28 @@ enum PiExtensionConflicts {
 
     private static var fm: FileManager { .default }
 
+    /// `project.path` → (扩展目录/设置 mtime stamp, conflicts)。
+    /// 同项目冷启动多个 session 时避免重复读 package.json/源码。
+    /// stamp 变化（扩展目录或 settings.json mtime）必须失效重扫。
+    private static var cache: [String: (mtime: Date, conflicts: [PiExtensionConflict])] = [:]
+    private static let cacheLock = NSLock()
+
     // MARK: - 检测
 
     /// 扫描用户级和项目级扩展目录，返回会撞名的入口文件。
     /// 项目级只有在 pi 信任该项目时才会真正加载，标签里已注明。
     static func detect(projectDir: URL?) -> [PiExtensionConflict] {
+        let key = cacheKey(projectDir: projectDir)
+        let stamp = cacheStamp(projectDir: projectDir)
+
+        cacheLock.lock()
+        if let hit = cache[key], hit.mtime == stamp {
+            let cached = hit.conflicts
+            cacheLock.unlock()
+            return cached
+        }
+        cacheLock.unlock()
+
         var result = scan(
             baseDir: fm.homeDirectoryForCurrentUser.appendingPathComponent(".pi/agent"),
             scopeLabel: "用户级 ~/.pi/agent/extensions"
@@ -39,7 +56,43 @@ enum PiExtensionConflicts {
                 scopeLabel: "项目级 .pi/extensions（项目被信任时生效）"
             )
         }
+
+        cacheLock.lock()
+        cache[key] = (mtime: stamp, conflicts: result)
+        cacheLock.unlock()
         return result
+    }
+
+    /// 测试/修复后清空缓存（disable 写 settings 后也会调）。
+    static func clearCache() {
+        cacheLock.lock()
+        cache.removeAll()
+        cacheLock.unlock()
+    }
+
+    private static func cacheKey(projectDir: URL?) -> String {
+        projectDir?.standardizedFileURL.path ?? ""
+    }
+
+    /// 取用户级 + 项目级的 extensions 目录与 settings.json 的最新 mtime。
+    /// settings 必须纳入：disable 只改 settings，不改扩展目录 mtime。
+    private static func cacheStamp(projectDir: URL?) -> Date {
+        var dates: [Date] = [.distantPast]
+        let userBase = fm.homeDirectoryForCurrentUser.appendingPathComponent(".pi/agent")
+        dates.append(contentsOf: relevantMTimes(baseDir: userBase))
+        if let projectDir {
+            dates.append(contentsOf: relevantMTimes(baseDir: projectDir.appendingPathComponent(".pi")))
+        }
+        return dates.max() ?? .distantPast
+    }
+
+    private static func relevantMTimes(baseDir: URL) -> [Date] {
+        [
+            baseDir.appendingPathComponent("extensions"),
+            baseDir.appendingPathComponent("settings.json"),
+        ].compactMap { url -> Date? in
+            (try? fm.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
+        }
     }
 
     /// 扫描一个 pi 配置根（`~/.pi/agent` 或项目 `.pi`）。SelfTest 用临时目录直接调它。
@@ -142,5 +195,7 @@ enum PiExtensionConflicts {
             withJSONObject: json, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         )
         try out.write(to: url, options: .atomic)
+        // settings mtime 已变；明确清缓存避免极短窗口与时钟精度问题
+        clearCache()
     }
 }

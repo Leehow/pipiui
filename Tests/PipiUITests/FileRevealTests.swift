@@ -120,6 +120,62 @@ final class FileRevealTests: XCTestCase {
         XCTAssertEqual(String(text[matches[0]]), "file:///Users/alice/doc.pdf")
     }
 
+    func testFileURLMatchCaseInsensitiveScheme() {
+        let text = "open FILE:///Users/alice/doc.pdf and File:///tmp/out.log"
+        let matches = FileReveal.absolutePathMatches(in: text)
+        let paths = matches.map { String(text[$0]) }
+        XCTAssertEqual(paths, [
+            "FILE:///Users/alice/doc.pdf",
+            "File:///tmp/out.log",
+        ])
+    }
+
+    func testAbsolutePathMatchesLinearOnLongText() {
+        // Regression guard: old impl lowercased text[i...] per character → ~O(n²).
+        // ~80k chars should finish well under a second on any reasonable host.
+        // Use a delimiter after the path — CJK letters are path-body chars, punctuation is not.
+        let path = "/Users/alice/proj/src/main.swift"
+        let padding = String(repeating: "字", count: 40_000)
+        let text = padding + path + "。" + padding
+        let started = CFAbsoluteTimeGetCurrent()
+        let matches = FileReveal.absolutePathMatches(in: text)
+        let elapsed = CFAbsoluteTimeGetCurrent() - started
+        XCTAssertEqual(matches.count, 1)
+        XCTAssertEqual(String(text[matches[0]]), path)
+        XCTAssertLessThan(elapsed, 0.5, "path scan took \(elapsed)s — likely super-linear")
+    }
+
+    func testPathLinkCacheIdempotent() {
+        FileReveal.clearPathLinkCache()
+        let text = "see /Users/alice/x.txt and file:///tmp/y.log end"
+
+        let firstTargets = FileReveal.pathTargets(in: text)
+        let secondTargets = FileReveal.pathTargets(in: text)
+        XCTAssertEqual(firstTargets, secondTargets)
+        XCTAssertEqual(firstTargets.count, 2)
+
+        let first = FileReveal.pathLinkedContent(text: text)
+        let second = FileReveal.pathLinkedContent(text: text)
+        XCTAssertEqual(first.targets, second.targets)
+        XCTAssertEqual(String(first.visual.characters), text)
+        XCTAssertEqual(String(second.visual.characters), text)
+
+        // Cached visual must keep path underline styling (no `.link`).
+        var underlined = 0
+        for run in second.visual.runs {
+            XCTAssertNil(run.link)
+            if run.underlineStyle == .single {
+                underlined += 1
+            }
+        }
+        XCTAssertEqual(underlined, 2)
+
+        // inject path + targets share the same scan cache
+        let md = AttributedString(text)
+        let injected = FileReveal.pathLinkedContent(attributed: md)
+        XCTAssertEqual(injected.targets, first.targets)
+    }
+
     func testDoesNotMatchHTTP() {
         let text = "see https://example.com/Users/fake/a.png please"
         let matches = FileReveal.absolutePathMatches(in: text)

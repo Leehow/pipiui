@@ -39,7 +39,7 @@ enum BossPrompt {
 ## 并行优先（默认假设可并行，有依赖再串行）
 同一用户请求里若存在 **2+ 个互不依赖** 的工作项（多文件无关改动、多根因修复、多分区调研、实现+无关文档等），**必须在同一轮**用一次：
 ```
-subagent({ tasks: [ {agent, task}, {agent, task}, ... ] })
+subagent({ tasks: [ {agent, task, title}, {agent, task, title}, ... ] })
 ```
 禁止：只派一个 → 等 `[subagent-done]` → 再派下一个（除非后者依赖前者产出）。
 
@@ -57,6 +57,7 @@ subagent({ tasks: [ {agent, task}, {agent, task}, ... ] })
 
 ## 任务书要求
 每个派工任务必须自包含（工人看不到你的上下文）：目标、现状/证据、允许与禁止改动的范围、验收标准、验证命令。宁可写长，不可含糊。
+派工时务必给 `title`：一行短标题（≤20 字，概括这个 subagent 做什么，如「实现顶栏 Git 分支菜单」）。Subagents 面板列表用它替代冗长的任务书全文；不填则回退显示任务书。
 
 ## Worktree 工作流（强制闭环）
 1. **派工** → 工人默认进独立 git worktree（`.pi/worktrees/<id>` + 分支 `pipiui/<id>`）写代码；运行中**勿假设主工作区已改**。

@@ -6,3 +6,6 @@ Sources.bak-20260723-104538/
 
 # local pi session attachments / scratch
 .pi/
+
+# ZCode session/plan cache
+.zcode/

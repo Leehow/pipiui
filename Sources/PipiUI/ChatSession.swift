@@ -29,6 +29,22 @@ struct ImageBlock: Identifiable, Equatable {
     let mimeType: String
     /// On-disk path when known (attachments, media generation, RPC path/filePath).
     var path: String? = nil
+
+    /// Identity comparison — deliberately **not** byte-for-byte.
+    ///
+    /// `MessageRow` is `Equatable` so SwiftUI can skip unchanged rows, which means
+    /// this `==` runs for every image in the transcript on every diff pass — once per
+    /// streaming chunk, and again on every layout-triggered re-evaluation. Synthesized
+    /// equality compares `data` byte by byte, so a session holding a few multi-megabyte
+    /// images burned hundreds of MB/s of `memcmp` on the main thread purely to conclude
+    /// that nothing had changed. An image's bytes never change under a fixed id, so
+    /// id + size + type + path is both O(1) and sufficient.
+    static func == (lhs: ImageBlock, rhs: ImageBlock) -> Bool {
+        lhs.id == rhs.id
+            && lhs.data.count == rhs.data.count
+            && lhs.mimeType == rhs.mimeType
+            && lhs.path == rhs.path
+    }
 }
 
 struct VideoBlock: Identifiable, Equatable {
@@ -97,8 +113,17 @@ enum SessionStatsMerge {
     }
 }
 
+/// Offline result of converting `get_messages` history (safe to build off the main thread).
+struct InitialTranscriptBuild: Equatable {
+    var items: [ChatItem]
+    var toolRuns: [String: ToolRun]
+    var itemCounter: Int
+    var skipNextAssistantIngest: Bool
+}
+
 /// One live pi RPC session bound to a project directory.
-/// All mutation happens on the main thread (PiProcess delivers callbacks there).
+/// Published state is mutated on the main thread (PiProcess delivers callbacks there).
+/// Heavy initial transcript conversion (image disk/base64) may run off-main before a single assign.
 final class ChatSession: ObservableObject, Identifiable {
     let id: String
     let projectURL: URL
@@ -106,6 +131,8 @@ final class ChatSession: ObservableObject, Identifiable {
     @Published var transcript: [ChatItem] = []
     @Published var streamingItem: ChatItem?
     @Published var toolRuns: [String: ToolRun] = [:]
+    /// Monotonic counter bumped when toolRuns actually changes (UI watches this instead of scanning outputs).
+    @Published private(set) var toolOutputVersion: UInt64 = 0
     @Published var isStreaming = false
     @Published var model: ModelInfo?
     @Published var availableModels: [ModelInfo] = []
@@ -123,10 +150,18 @@ final class ChatSession: ObservableObject, Identifiable {
     @Published var quotaPeriodLabel: String?
     /// Tooltip for quota pill: 周额度 / 月额度 / 额度.
     @Published var quotaPeriodHelp: String?
+    /// Multi-period usage breakdown from Grok billing (empty when unavailable).
+    @Published var periods: [PeriodUsage] = []
+    /// User-selected period typeRaw to show in the capsule (persisted per account).
+    @Published private(set) var selectedPeriodTypeRaw: Int?
     @Published var sessionName: String?
     @Published var sessionFile: String?
     @Published var lastError: String?
     @Published var processAlive = true
+    /// True from spawn until the first `get_messages` load settles. Drives the
+    /// "正在启动会话…" placeholder so a new/resuming session shows progress instead
+    /// of a blank pane while pi boots and the initial transcript is built off-main.
+    @Published private(set) var isInitializing = true
     /// Sidebar green badge: successful settle not yet acknowledged by selecting this session.
     @Published var hasUnseenCompletion = false
     /// Local follow-up queue mirror for SwiftUI (busy Enter enqueues here).
@@ -177,6 +212,11 @@ final class ChatSession: ObservableObject, Identifiable {
     enum RightPanel: Equatable { case web, agents }
     @Published var rightPanel: RightPanel?
 
+    /// Per-session transcript window (survives detail view reuse when switching sessions).
+    @Published var transcriptVisibleCount: Int = 150
+    /// Per-session stick-to-bottom preference.
+    @Published var pinTranscriptToBottom: Bool = true
+
     /// 内置浏览器，pi 的 browser_* 工具通过桥接服务驱动它
     lazy var webView = WebViewStore()
 
@@ -184,6 +224,8 @@ final class ChatSession: ObservableObject, Identifiable {
     let subagents = SubagentStore()
 
     var onSessionMetaChanged: (() -> Void)?
+    /// Fired only when the user actually submits a prompt (not resume / name / settle).
+    var onUserSubmitted: (() -> Void)?
     private var proc: PiProcess?
     private var itemCounter = 0
     private var queue = SessionMessageQueue()
@@ -196,8 +238,19 @@ final class ChatSession: ObservableObject, Identifiable {
     // 流式更新节流：每个 token delta 都刷 UI 会卡，按 50ms 合并
     private var pendingStreamMessage: J?
     private var streamFlushScheduled = false
+    // 工具输出分片同样节流：高频 tool_execution_update 直接刷 toolRuns 会拖垮布局
+    private var pendingToolRuns: [String: ToolRun] = [:]
+    private var toolRunFlushScheduled = false
     /// Grok quota monitor subscription (shared app-wide cache).
     private var quotaObserverID: UUID?
+
+    /// Bumped when a new initial `get_messages` load starts; stale background builds are dropped.
+    private var initialLoadGeneration: UInt64 = 0
+    /// True until the first `get_messages` transcript is applied (or the request settles empty/failed).
+    /// Runtime assumption (verify in app): pi may emit agent/message/tool events before `get_messages`
+    /// completes; those are deferred and replayed after the one-shot transcript assign so they are not wiped.
+    private var awaitingInitialTranscript = false
+    private var deferredInitialEvents: [J] = []
 
     init(id: String, projectURL: URL, sessionPath: String?,
          bridgePort: UInt16 = 0,
@@ -214,12 +267,15 @@ final class ChatSession: ObservableObject, Identifiable {
         self.resumedFromDisk = sessionPath != nil
         // Worktree auto-merge target (successful subagents → merge into session project root).
         subagents.bindMainProject(projectURL)
+        // Attribute per-turn usage events to this session in the token ledger.
+        subagents.sessionKey = id
 
         // 已知会必然崩的启动条件（例如扩展撞名）就别 spawn 了：
         // 让用户只看到那条能一键修的提示，而不是再叠一条 pi 崩溃日志
         if let blockedReason {
             lastError = blockedReason
             processAlive = false
+            isInitializing = false
             bindQuotaMonitor()
             return
         }
@@ -250,6 +306,7 @@ final class ChatSession: ObservableObject, Identifiable {
         guard let proc = PiProcess(cwd: projectURL, arguments: args, extraEnv: extraEnv) else {
             lastError = "找不到 pi 可执行文件（试过 ~/.npm-global/bin、/opt/homebrew/bin 等）"
             processAlive = false
+            isInitializing = false
             return
         }
         self.proc = proc
@@ -259,6 +316,8 @@ final class ChatSession: ObservableObject, Identifiable {
             self.processAlive = false
             self.isStreaming = false
             self.isSendingFromQueue = false
+            // Exit before the first transcript arrives must not leave the spinner up.
+            self.isInitializing = false
             self.titleLLMTask?.cancel()
             self.titleLLMTask = nil
             if code != 0 {
@@ -282,10 +341,50 @@ final class ChatSession: ObservableObject, Identifiable {
     private func bindQuotaMonitor() {
         quotaObserverID = GrokQuotaMonitor.shared.observe { [weak self] snap in
             guard let self else { return }
-            self.quotaPercent = snap?.usedPercent
-            self.quotaPeriodLabel = snap?.periodLabel
-            self.quotaPeriodHelp = snap?.periodHelp
+            self.periods = snap?.periods ?? []
+            self.recomputeQuotaDisplay(
+                usedPercent: snap?.usedPercent,
+                periodLabel: snap?.periodLabel ?? "额",
+                periodHelp: snap?.periodHelp ?? "额度"
+            )
         }
+    }
+
+    /// Derive capsule display (quotaPercent/quotaPeriodLabel) from selected period;
+    /// falls back to highest-usage period, then to the top-level usedPercent.
+    private func recomputeQuotaDisplay(usedPercent: Double?, periodLabel: String, periodHelp: String) {
+        if selectedPeriodTypeRaw == nil,
+           let aid = GrokAuthStore.load()?.accountId, !aid.isEmpty {
+            selectedPeriodTypeRaw = LayoutPersistence.grokQuotaSelectedPeriod(accountId: aid)
+        }
+        quotaPeriodHelp = periodHelp
+        if periods.isEmpty {
+            quotaPercent = usedPercent
+            quotaPeriodLabel = periodLabel
+            return
+        }
+        let r = GrokQuotaDisplay.resolve(
+            periods: periods,
+            selected: selectedPeriodTypeRaw,
+            fallbackPercent: usedPercent,
+            fallbackLabel: periodLabel
+        )
+        quotaPercent = r.percent
+        quotaPeriodLabel = r.label
+    }
+
+    /// User picked a period in the popover → persist per account + refresh capsule.
+    func selectPeriod(typeRaw: Int) {
+        selectedPeriodTypeRaw = typeRaw
+        if let aid = GrokAuthStore.load()?.accountId, !aid.isEmpty {
+            LayoutPersistence.setGrokQuotaSelectedPeriod(typeRaw, accountId: aid)
+        }
+        let snap = GrokQuotaMonitor.shared.snapshot
+        recomputeQuotaDisplay(
+            usedPercent: snap?.usedPercent,
+            periodLabel: snap?.periodLabel ?? "额",
+            periodHelp: snap?.periodHelp ?? "额度"
+        )
     }
 
     private func nextItemId() -> String {
@@ -306,18 +405,102 @@ final class ChatSession: ObservableObject, Identifiable {
             }
         }
         refreshThinkingLevels()
-        proc?.request(["type": "get_messages"]) { [weak self] resp in
-            guard let self else { return }
-            self.transcript = []
-            for message in resp["data"]["messages"].array {
-                self.ingest(message: message)
-            }
-        }
+        beginInitialMessagesLoad()
         refreshStats()
         proc?.request(["type": "get_commands"]) { [weak self] resp in
             guard let self else { return }
             // Failure/empty → leave availableCommands empty; builtins still work. No flash.
             self.availableCommands = SlashCommandParser.parseGetCommandsResponse(resp)
+        }
+    }
+
+    /// Kick off `get_messages` → background `buildTranscript` → one main-thread assign.
+    private func beginInitialMessagesLoad() {
+        initialLoadGeneration &+= 1
+        let generation = initialLoadGeneration
+        awaitingInitialTranscript = true
+        deferredInitialEvents.removeAll(keepingCapacity: true)
+
+        guard proc != nil else {
+            // No process (should not reach here on normal spawn path) — do not gate events forever.
+            applyInitialTranscript(
+                InitialTranscriptBuild(items: [], toolRuns: [:], itemCounter: 0, skipNextAssistantIngest: false),
+                generation: generation
+            )
+            return
+        }
+
+        let requestedAt = DispatchTime.now()
+        proc?.request(["type": "get_messages"]) { [weak self] resp in
+            guard let self else { return }
+            // Capture JSON messages on main (resp is only valid for this callback), build off-main.
+            let messages = resp["data"]["messages"].array
+            let success = resp["success"].bool ?? true
+            let rpcMs = Double(DispatchTime.now().uptimeNanoseconds - requestedAt.uptimeNanoseconds) / 1_000_000
+            Log.info("initial load: get_messages returned \(messages.count) msgs in \(Int(rpcMs))ms", category: .session)
+
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let buildStart = DispatchTime.now()
+                let built: InitialTranscriptBuild
+                if success {
+                    built = Self.buildTranscript(from: messages)
+                } else {
+                    built = InitialTranscriptBuild(
+                        items: [],
+                        toolRuns: [:],
+                        itemCounter: 0,
+                        skipNextAssistantIngest: false
+                    )
+                }
+                let buildMs = Double(DispatchTime.now().uptimeNanoseconds - buildStart.uptimeNanoseconds) / 1_000_000
+                let imageCount = built.items.reduce(0) { $0 + Self.imageCount(of: $1) }
+                Log.info(
+                    "initial load: buildTranscript → \(built.items.count) items, \(imageCount) images in \(Int(buildMs))ms",
+                    category: .session
+                )
+                DispatchQueue.main.async {
+                    self?.applyInitialTranscript(built, generation: generation)
+                }
+            }
+        }
+    }
+
+    /// Apply a background-built history once; drop if generation is stale (session recycled / re-load).
+    private func applyInitialTranscript(_ built: InitialTranscriptBuild, generation: UInt64) {
+        guard generation == initialLoadGeneration else { return }
+        guard awaitingInitialTranscript else { return }
+
+        // Optimistic local bubbles (rare: user sent while history still loading) stay after history.
+        // Re-id them so they cannot collide with history `item-N` ids from the build.
+        let extras = transcript
+        var counter = max(itemCounter, built.itemCounter)
+        let rebasedExtras: [ChatItem] = extras.map { item in
+            counter += 1
+            return ChatItem(id: "item-\(counter)", role: item.role, blocks: item.blocks)
+        }
+
+        itemCounter = counter
+        skipNextAssistantIngest = built.skipNextAssistantIngest
+
+        // History toolRuns first; any live runs already on self win (should be empty while gated).
+        var mergedRuns = built.toolRuns
+        for (tid, run) in toolRuns {
+            mergedRuns[tid] = run
+        }
+        toolRuns = mergedRuns
+        if !built.toolRuns.isEmpty || !rebasedExtras.isEmpty {
+            toolOutputVersion &+= 1
+        }
+
+        // Single assignment — avoid per-message @Published churn.
+        transcript = built.items + rebasedExtras
+
+        awaitingInitialTranscript = false
+        isInitializing = false
+        let deferred = deferredInitialEvents
+        deferredInitialEvents.removeAll(keepingCapacity: false)
+        for event in deferred {
+            handleEvent(event)
         }
     }
 
@@ -411,10 +594,54 @@ final class ChatSession: ObservableObject, Identifiable {
         )
     }
 
+    /// Record per-turn usage from an assistant `message_end` into the token ledger.
+    /// `pi` emits `message.usage` (same shape subagents parse at `index.ts:1036`);
+    /// if absent we silently skip — no telemetry is better than wrong telemetry.
+    /// Turn index counts assistant messages in the transcript, which already includes
+    /// the one just ingested by the caller.
+    private func recordTurnUsage(for message: J) {
+        let u = message["usage"]
+        guard u["input"].int != nil || u["output"].int != nil else { return }
+        let usage = TokenLedger.UsageSnapshot.from(u)
+        let model = message["model"].string ?? self.model?.id ?? "?"
+        let turn = transcript.lazy.filter { $0.role == "assistant" }.count
+        TokenLedger.shared.append(
+            session: id,
+            channel: "main",
+            agentId: nil,
+            agentName: nil,
+            depth: 0,
+            model: model,
+            turn: turn,
+            usage: usage
+        )
+        Log.info(
+            "main turn \(turn) usage ↑\(usage.input) ↓\(usage.output) R\(usage.cacheRead) W\(usage.cacheWrite) $\(String(format: "%.4f", usage.cost)) ctx:\(usage.contextTokens) — \(model)",
+            category: .token
+        )
+    }
+
     // MARK: - Event handling
 
     private func handleEvent(_ e: J) {
         let type = e["type"].string ?? ""
+
+        // Defer transcript/stream/tool mutations until initial history is applied once.
+        // Assumption to runtime-verify: cold open can interleave agent_* / message_* / tool_*
+        // with the get_messages response; replaying after assign preserves order vs wiping.
+        if awaitingInitialTranscript {
+            switch type {
+            case "agent_start", "agent_settled",
+                 "message_start", "message_update", "message_end",
+                 "tool_execution_start", "tool_execution_update", "tool_execution_end",
+                 "auto_retry_start", "auto_retry_end",
+                 "compaction_start", "compaction_end":
+                deferredInitialEvents.append(e)
+                return
+            default:
+                break
+            }
+        }
 
         switch type {
         case "agent_start":
@@ -436,7 +663,7 @@ final class ChatSession: ObservableObject, Identifiable {
             }
         case "message_start":
             if e["message"]["role"].string == "assistant" {
-                streamingItem = convert(message: e["message"], id: "streaming")
+                streamingItem = Self.convert(message: e["message"], id: "streaming")
             }
         case "message_update":
             pendingStreamMessage = e["message"]
@@ -446,20 +673,26 @@ final class ChatSession: ObservableObject, Identifiable {
             if e["message"]["role"].string == "assistant" {
                 pendingStreamMessage = nil
                 streamingItem = nil
+                recordTurnUsage(for: e["message"])
             }
         case "tool_execution_start":
             if let tid = e["toolCallId"].string {
+                pendingToolRuns.removeValue(forKey: tid)
                 toolRuns[tid] = ToolRun(isRunning: true)
+                toolOutputVersion &+= 1
             }
         case "tool_execution_update":
             if let tid = e["toolCallId"].string {
-                var run = toolRuns[tid] ?? ToolRun()
+                // Coalesce partial chunks; flush on main ~50ms (same idea as scheduleStreamFlush).
+                var run = pendingToolRuns[tid] ?? toolRuns[tid] ?? ToolRun()
                 run.isRunning = true
                 run.output = Self.contentText(e["partialResult"]["content"])
-                toolRuns[tid] = run
+                pendingToolRuns[tid] = run
+                scheduleToolRunFlush()
             }
         case "tool_execution_end":
             if let tid = e["toolCallId"].string {
+                pendingToolRuns.removeValue(forKey: tid)
                 let content = e["result"]["content"]
                 toolRuns[tid] = ToolRun(
                     isRunning: false,
@@ -467,6 +700,7 @@ final class ChatSession: ObservableObject, Identifiable {
                     output: Self.contentText(content),
                     images: Self.contentImages(content)
                 )
+                toolOutputVersion &+= 1
             }
         case "auto_retry_start":
             lastError = "请求失败，自动重试中 (\(e["attempt"].int ?? 0)/\(e["maxAttempts"].int ?? 0))…"
@@ -604,8 +838,25 @@ final class ChatSession: ObservableObject, Identifiable {
             self.streamFlushScheduled = false
             if let message = self.pendingStreamMessage {
                 self.pendingStreamMessage = nil
-                self.streamingItem = self.convert(message: message, id: "streaming")
+                self.streamingItem = Self.convert(message: message, id: "streaming")
             }
+        }
+    }
+
+    /// Merge high-frequency tool partials into `toolRuns` at most ~every 50ms.
+    private func scheduleToolRunFlush() {
+        guard !toolRunFlushScheduled else { return }
+        toolRunFlushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self else { return }
+            self.toolRunFlushScheduled = false
+            guard !self.pendingToolRuns.isEmpty else { return }
+            let batch = self.pendingToolRuns
+            self.pendingToolRuns.removeAll(keepingCapacity: true)
+            for (tid, run) in batch {
+                self.toolRuns[tid] = run
+            }
+            self.toolOutputVersion &+= 1
         }
     }
 
@@ -625,7 +876,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 return
             }
             skipNextAssistantIngest = false
-            if let raw = convert(message: message, id: nextItemId()), !raw.blocks.isEmpty {
+            if let raw = Self.convert(message: message, id: nextItemId()), !raw.blocks.isEmpty {
                 let item = Self.hydrateUserImagesIfNeeded(raw)
                 // Replace optimistic local user bubble when the server echoes the same turn.
                 if let lastIdx = transcript.indices.last,
@@ -641,9 +892,10 @@ final class ChatSession: ObservableObject, Identifiable {
                 skipNextAssistantIngest = false
                 return
             }
-            if let item = convert(message: message, id: nextItemId()) { transcript.append(item) }
+            if let item = Self.convert(message: message, id: nextItemId()) { transcript.append(item) }
         case "toolResult":
             if let tid = message["toolCallId"].string {
+                pendingToolRuns.removeValue(forKey: tid)
                 let content = message["content"]
                 toolRuns[tid] = ToolRun(
                     isRunning: false,
@@ -651,6 +903,7 @@ final class ChatSession: ObservableObject, Identifiable {
                     output: Self.contentText(content),
                     images: Self.contentImages(content)
                 )
+                toolOutputVersion &+= 1
             }
         case "bashExecution":
             let cmd = message["command"].string ?? ""
@@ -661,7 +914,8 @@ final class ChatSession: ObservableObject, Identifiable {
         }
     }
 
-    private func convert(message: J, id: String) -> ChatItem? {
+    /// Convert one pi message JSON into a `ChatItem` (image base64/path I/O may run here).
+    package static func convert(message: J, id: String) -> ChatItem? {
         guard let role = message["role"].string else { return nil }
         var blocks: [ChatBlock] = []
         if let text = message["content"].string {
@@ -692,6 +946,70 @@ final class ChatSession: ObservableObject, Identifiable {
             }
         }
         return ChatItem(id: id, role: role, blocks: blocks)
+    }
+
+    /// Pure history build for `get_messages` (call off main: disk read + base64 in `parseImageBlock` / hydrate).
+    /// Preserves message order; mirrors `ingest` including ghost-title skip and toolResult → toolRuns.
+    package static func buildTranscript(from messages: [J]) -> InitialTranscriptBuild {
+        var items: [ChatItem] = []
+        var toolRuns: [String: ToolRun] = [:]
+        var itemCounter = 0
+        var skipNextAssistantIngest = false
+
+        func nextId() -> String {
+            itemCounter += 1
+            return "item-\(itemCounter)"
+        }
+
+        for message in messages {
+            switch message["role"].string ?? "" {
+            case "user":
+                let text = contentText(message["content"])
+                if text.contains(sessionTitleJobMarker) {
+                    skipNextAssistantIngest = true
+                    continue
+                }
+                skipNextAssistantIngest = false
+                if let raw = convert(message: message, id: nextId()), !raw.blocks.isEmpty {
+                    items.append(hydrateUserImagesIfNeeded(raw))
+                }
+            case "assistant":
+                if skipNextAssistantIngest {
+                    skipNextAssistantIngest = false
+                    continue
+                }
+                if let item = convert(message: message, id: nextId()) {
+                    items.append(item)
+                }
+            case "toolResult":
+                if let tid = message["toolCallId"].string {
+                    let content = message["content"]
+                    toolRuns[tid] = ToolRun(
+                        isRunning: false,
+                        isError: message["isError"].bool ?? false,
+                        output: contentText(content),
+                        images: contentImages(content)
+                    )
+                }
+            case "bashExecution":
+                let cmd = message["command"].string ?? ""
+                let out = message["output"].string ?? ""
+                items.append(ChatItem(
+                    id: nextId(),
+                    role: "system",
+                    blocks: [.text("$ \(cmd)\n\(out)")]
+                ))
+            default:
+                break
+            }
+        }
+
+        return InitialTranscriptBuild(
+            items: items,
+            toolRuns: toolRuns,
+            itemCounter: itemCounter,
+            skipNextAssistantIngest: skipNextAssistantIngest
+        )
     }
 
     /// Supports RPC/session shapes:
@@ -986,8 +1304,8 @@ final class ChatSession: ObservableObject, Identifiable {
         if !images.isEmpty {
             cmd["images"] = ImageAttachment.rpcPayload(from: images)
         }
-        // Bump sidebar session to top immediately on user submit (don't wait for agent_settled).
-        onSessionMetaChanged?()
+        // Pin sidebar session to top on user submit (don't wait for agent_settled / disk mtime).
+        onUserSubmitted?()
         // Never set streamingBehavior: "steer" — busy delivery is local queue + idle drain.
         proc?.request(cmd) { [weak self] resp in
             guard let self else { return }

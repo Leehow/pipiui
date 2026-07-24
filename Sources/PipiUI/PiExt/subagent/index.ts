@@ -197,6 +197,8 @@ interface SingleResult {
 	agent: string;
 	agentSource: "user" | "project" | "unknown";
 	task: string;
+	/** Short title for UI display; falls back to task if omitted. */
+	title?: string;
 	exitCode: number;
 	messages: Message[];
 	stderr: string;
@@ -224,6 +226,8 @@ interface RunSingleAgentOptions {
 	background?: boolean;
 	/** Pre-assigned id (background path needs ids before process exits). */
 	agentId?: string;
+	/** Short one-line title for the Subagents panel list; falls back to task text if omitted. */
+	title?: string;
 }
 
 /** Optional worktree isolation metadata reported to the App bridge. */
@@ -258,6 +262,8 @@ interface JobRecord {
 	agentId: string;
 	name: string;
 	task: string; // truncated summary
+	/** Short UI title (optional). */
+	title?: string;
 	state: JobState;
 	startedAt: number;
 	endedAt?: number;
@@ -297,13 +303,14 @@ function jobPrune(): void {
 	}
 }
 
-function jobUpsertRunning(agentId: string, name: string, task: string): void {
+function jobUpsertRunning(agentId: string, name: string, task: string, title?: string): void {
 	const existing = jobRegistry.get(agentId);
 	if (existing && existing.state !== "running") return; // never reopen a terminal job
 	jobRegistry.set(agentId, {
 		agentId,
 		name,
 		task: taskSummary(task),
+		title,
 		state: "running",
 		startedAt: existing?.startedAt ?? Date.now(),
 		activity: existing?.activity,
@@ -420,6 +427,7 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean }): st
 		const lines = [
 			`agentId: ${job.agentId}`,
 			`name: ${job.name}`,
+			...(job.title ? [`title: ${job.title}`] : []),
 			`state: ${job.state}`,
 			`turns: ${turns}`,
 			`cost: ${cost}`,
@@ -923,6 +931,7 @@ async function runSingleAgent(
 		agent: agentName,
 		agentSource: agent.source,
 		task,
+		title: options?.title,
 		exitCode: 0,
 		messages: [],
 		stderr: "",
@@ -943,12 +952,13 @@ async function runSingleAgent(
 		task,
 		depth: PIPIUI_DEPTH + 1,
 		model: agent.model ?? null,
+		...(options?.title ? { title: options.title } : {}),
 		...(isBackground ? { background: true } : {}),
 		...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
 		...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
 		...(placement.worktreeError ? { worktreeError: placement.worktreeError } : {}),
 	});
-	jobUpsertRunning(pipiuiAgentId, agentName, task);
+	jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title);
 	const pipiuiUpdate = (force = false) => {
 		const now = Date.now();
 		if (!force && now - pipiuiLastUpdate < 500) return;
@@ -1021,17 +1031,34 @@ async function runSingleAgent(
 					const msg = event.message as Message;
 					currentResult.messages.push(msg);
 
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
+						if (msg.role === "assistant") {
+							currentResult.usage.turns++;
+							const usage = msg.usage;
+							if (usage) {
+								currentResult.usage.input += usage.input || 0;
+								currentResult.usage.output += usage.output || 0;
+								currentResult.usage.cacheRead += usage.cacheRead || 0;
+								currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+								currentResult.usage.cost += usage.cost?.total || 0;
+								currentResult.usage.contextTokens = usage.totalTokens || 0;
+								// Per-turn usage → PipiUI token ledger. Independent of the
+								// cost/turns aggregates above; gives per-turn input/output/cache
+								// breakdown that "end" doesn't carry. Safe to no-op if bridge unset.
+								pipiuiReport({
+									kind: "usage",
+									agentId: pipiuiAgentId,
+									turn: currentResult.usage.turns,
+									model: msg.model || currentResult.model || null,
+									usage: {
+										input: usage.input || 0,
+										output: usage.output || 0,
+										cacheRead: usage.cacheRead || 0,
+										cacheWrite: usage.cacheWrite || 0,
+										cost: usage.cost?.total || 0,
+										contextTokens: usage.totalTokens || 0,
+									},
+								});
+							}
 						if (!currentResult.model && msg.model) currentResult.model = msg.model;
 						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
 						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
@@ -1168,12 +1195,24 @@ async function runSingleAgent(
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
+	title: Type.Optional(
+		Type.String({
+			description:
+				"Short one-line title shown in the Subagents panel list instead of the full task; omit to fall back to task text",
+		}),
+	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
+	title: Type.Optional(
+		Type.String({
+			description:
+				"Short one-line title shown in the Subagents panel list instead of the full task; omit to fall back to task text",
+		}),
+	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
@@ -1185,7 +1224,13 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
+	title: Type.Optional(
+		Type.String({
+			description:
+				"Short one-line title shown in the Subagents panel list instead of the full task (single mode); omit to fall back to task text",
+		}),
+	),
+	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task, title?} for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
@@ -1288,6 +1333,7 @@ export default function (pi: ExtensionAPI) {
 				cwd: string | undefined,
 				agentId: string,
 				mode: "single" | "parallel",
+				title: string | undefined,
 			): void => {
 				void runSingleAgent(
 					ctx.cwd,
@@ -1299,7 +1345,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ background: true, agentId },
+					{ background: true, agentId, title },
 				)
 					.then((result) => {
 						notifySubagentDone(pi, result);
@@ -1328,11 +1374,11 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const formatStartedMessage = (
-				items: { agentId: string; name: string; task: string }[],
+				items: { agentId: string; name: string; task: string; title?: string }[],
 			): string => {
 				const lines = items.map(
 					(it) =>
-						`- agentId=${it.agentId} name=${it.name} task=${it.task.length > 120 ? `${it.task.slice(0, 120)}...` : it.task}`,
+						`- agentId=${it.agentId} name=${it.name}${it.title ? ` title=${it.title}` : ""} task=${it.task.length > 120 ? `${it.task.slice(0, 120)}...` : it.task}`,
 				);
 				return (
 					`${bgIgnoredWarning}Started background agent(s) (${items.length}). ` +
@@ -1414,6 +1460,8 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						chainUpdate,
 						makeDetails("chain"),
+
+						{ title: step.title },
 					);
 					results.push(result);
 
@@ -1475,7 +1523,7 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 
-					const startedItems: { agentId: string; name: string; task: string }[] = [];
+					const startedItems: { agentId: string; name: string; task: string; title?: string }[] = [];
 					const placeholders: SingleResult[] = [];
 					const agentIds: string[] = [];
 
@@ -1483,12 +1531,13 @@ export default function (pi: ExtensionAPI) {
 						const agentCfg = agents.find((a) => a.name === t.agent)!;
 						const agentId = generatePipiuiAgentId();
 						agentIds.push(agentId);
-						startedItems.push({ agentId, name: t.agent, task: t.task });
+						startedItems.push({ agentId, name: t.agent, task: t.task, title: t.title });
 						placeholders.push({
 							agent: t.agent,
 							agentId,
 							agentSource: agentCfg.source,
 							task: t.task,
+							title: t.title,
 							exitCode: -1,
 							messages: [],
 							stderr: "",
@@ -1511,7 +1560,7 @@ export default function (pi: ExtensionAPI) {
 								undefined, // no parent abort binding
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ background: true, agentId },
+								{ background: true, agentId, title: t.title },
 							);
 							notifySubagentDone(pi, result);
 							return result;
@@ -1524,6 +1573,7 @@ export default function (pi: ExtensionAPI) {
 								agentId,
 								agentSource: agents.find((a) => a.name === t.agent)?.source ?? "unknown",
 								task: t.task,
+								title: t.title,
 								exitCode: 1,
 								messages: [],
 								stderr: msg,
@@ -1553,6 +1603,7 @@ export default function (pi: ExtensionAPI) {
 						agent: params.tasks[i].agent,
 						agentSource: "unknown",
 						task: params.tasks[i].task,
+						title: params.tasks[i].title,
 						exitCode: -1, // -1 = still running
 						messages: [],
 						stderr: "",
@@ -1590,6 +1641,8 @@ export default function (pi: ExtensionAPI) {
 							}
 						},
 						makeDetails("parallel"),
+
+						{ title: t.title },
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -1634,12 +1687,13 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 					const agentId = generatePipiuiAgentId();
-					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single");
+					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title);
 					const placeholder: SingleResult = {
 						agent: params.agent,
 						agentId,
 						agentSource: agentCfg.source,
 						task: params.task,
+						title: params.title,
 						exitCode: -1,
 						messages: [],
 						stderr: "",
@@ -1651,7 +1705,7 @@ export default function (pi: ExtensionAPI) {
 							{
 								type: "text",
 								text: formatStartedMessage([
-									{ agentId, name: params.agent, task: params.task },
+									{ agentId, name: params.agent, task: params.task, title: params.title },
 								]),
 							},
 						],
@@ -1671,6 +1725,8 @@ export default function (pi: ExtensionAPI) {
 					signal,
 					onUpdate,
 					makeDetails("single"),
+
+					{ title: params.title },
 				);
 				const isError = isFailedResult(result);
 				if (isError) {

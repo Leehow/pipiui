@@ -8,7 +8,7 @@ final class PiProcess {
     private let stdinPipe = Pipe()
     private let stdoutPipe = Pipe()
     private let stderrPipe = Pipe()
-    private var buffer = Data()
+    private var framer = LineFramer()
     private var pending: [String: (J) -> Void] = [:] // main thread only
     private let stdinQueue = DispatchQueue(label: "pipiui.pi.stdin")
     private(set) var isRunning = false
@@ -81,12 +81,10 @@ final class PiProcess {
     }
 
     /// Split accumulated stdout on LF only (protocol requirement), strip trailing CR.
+    /// Framing is O(n) via `LineFramer`; a single 11.5 MB response line must not be
+    /// rescanned per chunk (that cost 20–30 s to open a long session).
     private func consume(_ data: Data) {
-        buffer.append(data)
-        while let nl = buffer.firstIndex(of: 0x0A) {
-            var line = buffer.subdata(in: buffer.startIndex..<nl)
-            buffer.removeSubrange(buffer.startIndex...nl)
-            if line.last == 0x0D { line.removeLast() }
+        for line in framer.push(data) {
             guard !line.isEmpty, let json = J.parse(line) else { continue }
             DispatchQueue.main.async { [weak self] in
                 self?.dispatch(json)

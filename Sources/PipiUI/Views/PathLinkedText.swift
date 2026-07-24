@@ -108,8 +108,10 @@ struct PathLinkedText: View {
         onFlash: ((String) -> Void)? = nil
     ) {
         self.plainText = text
-        self.visual = FileReveal.attributedStringLinkingPaths(text, base: base, linkColor: linkColor)
-        self.targets = FileReveal.pathTargets(in: text)
+        // Single scan → visual + ⌘+click targets (cached for default style).
+        let linked = FileReveal.pathLinkedContent(text: text, base: base, linkColor: linkColor)
+        self.visual = linked.visual
+        self.targets = linked.targets
         self.monospaced = monospaced
         self.lineLimit = lineLimit
         self.truncationMode = truncationMode
@@ -128,8 +130,10 @@ struct PathLinkedText: View {
     ) {
         let plain = String(attributed.characters)
         self.plainText = plain
-        self.visual = FileReveal.injectPathLinks(into: attributed)
-        self.targets = FileReveal.pathTargets(in: plain)
+        // Single scan → inject style + targets (match cache shared with plain scans).
+        let linked = FileReveal.pathLinkedContent(attributed: attributed)
+        self.visual = linked.visual
+        self.targets = linked.targets
         self.monospaced = monospaced
         self.lineLimit = lineLimit
         self.truncationMode = truncationMode
