@@ -72,20 +72,26 @@ struct SidebarView: View {
     private var projectsSection: some View {
         Section {
             ForEach(store.projects, id: \.path) { project in
-                HStack(spacing: 6) {
-                    Image(systemName: "folder")
-                        .foregroundStyle(project.path == store.selectedProjectPath ? Color.accentColor : .secondary)
-                    Text(project.lastPathComponent)
-                        .fontWeight(project.path == store.selectedProjectPath ? .semibold : .regular)
-                    Spacer(minLength: 0)
-                    Text("\(store.sessionsByProject[project.path]?.count ?? 0)")
-                        .foregroundStyle(.tertiary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    store.selectedProjectPath = project.path
-                    store.refreshSessions(for: project)
+                let isSelected = project.path == store.selectedProjectPath
+                SessionRowContainer(
+                    isSelected: isSelected,
+                    onSelect: {
+                        store.selectedProjectPath = project.path
+                        store.refreshSessions(for: project)
+                    },
+                    onRename: { },
+                    onArchive: nil
+                ) { _ in
+                    HStack(spacing: 6) {
+                        Image(systemName: "folder")
+                            .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                        Text(project.lastPathComponent)
+                            .fontWeight(isSelected ? .semibold : .regular)
+                        Spacer(minLength: 0)
+                        Text("\(store.sessionsByProject[project.path]?.count ?? 0)")
+                            .foregroundStyle(.tertiary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .contextMenu {
                     Button("在 Finder 中显示") {
@@ -95,7 +101,6 @@ struct SidebarView: View {
                         store.removeProject(project)
                     }
                 }
-                .hoverRowBackground()
             }
         } header: {
             HStack {
