@@ -54,4 +54,26 @@ final class StickToBottomLogicTests: XCTestCase {
         )
         XCTAssertEqual(desired, true)
     }
+
+    func testDistanceDocumentEndFlipped() {
+        let visible = CGRect(x: 0, y: 100, width: 300, height: 400)
+        let d = StickToBottomLogic.distanceFromPinEdge(
+            visible: visible,
+            contentHeight: 1000,
+            documentIsFlipped: true,
+            pinEdge: .documentEnd
+        )
+        XCTAssertEqual(d, 500) // 1000 - 500
+    }
+
+    func testDistanceDocumentStartFlipped() {
+        let visible = CGRect(x: 0, y: 40, width: 300, height: 400)
+        let d = StickToBottomLogic.distanceFromPinEdge(
+            visible: visible,
+            contentHeight: 1000,
+            documentIsFlipped: true,
+            pinEdge: .documentStart
+        )
+        XCTAssertEqual(d, 40)
+    }
 }
