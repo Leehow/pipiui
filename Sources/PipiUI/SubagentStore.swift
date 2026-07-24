@@ -201,10 +201,16 @@ final class SubagentStore: ObservableObject {
     @Published var selectedId: String?
     /// Last merge/discard error for panel display (cleared on success or next action).
     @Published var worktreeActionError: String?
+    /// Main project worktree (session root). Used for auto-merge on successful agent end.
+    private(set) var mainProjectURL: URL?
     private var logCounter = 0
     private var persistURL: URL?
     private var saveScheduled = false
 
+    /// Bind the session's main project URL so successful agents can auto-merge.
+    func bindMainProject(_ url: URL) {
+        mainProjectURL = url
+    }
 
     // MARK: - 持久化（跟随 pi 会话文件，App 崩溃/重启后恢复 agent 树）
 
@@ -345,6 +351,16 @@ final class SubagentStore: ObservableObject {
                     break
                 default:
                     agents[i].worktreeLifecycle = .pendingReview
+                }
+            }
+            // Product default: successful agent + worktree → auto-merge into main + remove wt.
+            // failed/aborted/interrupted keep pendingReview for续作; UI buttons remain as fallback.
+            if agents[i].state == .ok,
+               agents[i].worktreeLifecycle == .pendingReview,
+               let main = mainProjectURL {
+                let aid = agents[i].id
+                DispatchQueue.main.async { [weak self] in
+                    _ = self?.mergeWorktree(agentId: aid, mainProjectURL: main)
                 }
             }
         default:
