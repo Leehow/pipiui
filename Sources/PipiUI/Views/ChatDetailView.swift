@@ -47,6 +47,8 @@ private struct ChatDetailViewBody: View {
     /// Width seen during `NSWindow.inLiveResize` — apply + re-pin only when drag ends.
     @State private var pendingChatColumnWidth: CGFloat?
     @State private var chatColumnWidthSettleWork: DispatchWorkItem?
+    /// Cancels in-flight width-recovery scrolls when another width change arrives.
+    @State private var widthRecoverGeneration = 0
 
     private let minimumChatWidth: CGFloat = 360
     private let minimumRightPanelWidth: CGFloat = 300
@@ -115,6 +117,7 @@ private struct ChatDetailViewBody: View {
             pendingChatColumnWidth = nil
             chatColumnWidthSettleWork?.cancel()
             chatColumnWidthSettleWork = nil
+            widthRecoverGeneration += 1
             // draft / rightPanel / pinTranscriptToBottom / transcriptVisibleCount live on ChatSession.
         }
     }
@@ -453,8 +456,9 @@ private struct ChatDetailViewBody: View {
                 scrollToBottom(proxy)
             }
             .onChange(of: session.rightPanel != nil) { _, _ in
-                // 右栏开关会改 transcript 宽度/高度，布局后再贴底
-                scrollToBottom(proxy, retry: true)
+                // Width change + immediate scrollTo("bottom") blanks LazyVStack
+                // (subviews=1). Recover by realizing a real row first, then pin.
+                recoverPinAfterColumnWidthChange(proxy)
             }
             .onPreferenceChange(ChatColumnWidthKey.self) { width in
                 scheduleChatColumnWidthSettleRepin(proxy, width: width)
@@ -468,7 +472,7 @@ private struct ChatDetailViewBody: View {
                     settledChatColumnWidth = pending
                     pendingChatColumnWidth = nil
                 }
-                scrollToBottom(proxy, retry: true)
+                recoverPinAfterColumnWidthChange(proxy)
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active {
@@ -507,10 +511,41 @@ private struct ChatDetailViewBody: View {
             settledChatColumnWidth = width
             // First layout pass only records width — do not yank an initial scroll.
             guard previous != nil else { return }
-            scrollToBottom(proxy, retry: true)
+            recoverPinAfterColumnWidthChange(proxy)
         }
         chatColumnWidthSettleWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+    }
+
+    /// After chat-column width jumps (right panel / resize end), wait for LazyVStack
+    /// to place real rows at the new width, scroll to the last message id (forces
+    /// realization), then to the bottom spacer. Immediate `scrollTo("bottom")` alone
+    /// is the classic white-screen race (ScrollDiagnostics subviews=1).
+    private func recoverPinAfterColumnWidthChange(_ proxy: ScrollViewProxy) {
+        guard session.pinTranscriptToBottom else { return }
+        widthRecoverGeneration += 1
+        let generation = widthRecoverGeneration
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 32_000_000)
+            guard generation == widthRecoverGeneration, session.pinTranscriptToBottom else { return }
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            if let lastId = session.transcript.suffix(session.transcriptVisibleCount).last?.id {
+                withTransaction(transaction) {
+                    proxy.scrollTo(lastId, anchor: .bottom)
+                }
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            guard generation == widthRecoverGeneration, session.pinTranscriptToBottom else { return }
+            withTransaction(transaction) {
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard generation == widthRecoverGeneration, session.pinTranscriptToBottom else { return }
+            withTransaction(transaction) {
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
+        }
     }
 
     /// 贴底滚动：仅当用户仍 pin 在底部时执行；流式更新合并为 ~50ms 一次，避免每分片都触发布局
@@ -557,6 +592,11 @@ private struct ChatDetailViewBody: View {
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
+            // Prefer a real row so LazyVStack keeps content realized near the end;
+            // then the bottom spacer. Same-transaction is fine for streaming follow.
+            if let lastId = session.transcript.suffix(session.transcriptVisibleCount).last?.id {
+                proxy.scrollTo(lastId, anchor: .bottom)
+            }
             proxy.scrollTo("bottom", anchor: .bottom)
         }
     }
