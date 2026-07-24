@@ -31,7 +31,7 @@ enum TaskPinLogic {
         if display.isEmpty && !hasImage { return false }
 
         if hasImage { return true }
-        if raw.contains(where: \.isNewline) { return true }
+        if display.contains(where: \.isNewline) { return true }
 
         let normalized = display.lowercased()
         if ackBlacklist.contains(normalized) { return false }

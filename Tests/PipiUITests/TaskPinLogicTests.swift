@@ -27,10 +27,10 @@ final class TaskPinLogicTests: XCTestCase {
 
     func testNewlineOrImageIsPinnable() {
         XCTAssertTrue(TaskPinLogic.isPinnable(user("看\n这个")))
-        // Newline bypasses blacklist and ≤2-char floor (check raw text before trim).
-        XCTAssertTrue(TaskPinLogic.isPinnable(user("x\n")))
-        XCTAssertTrue(TaskPinLogic.isPinnable(user("ok\n")))
-        XCTAssertTrue(TaskPinLogic.isPinnable(user("继续\n")))
+        // Trailing newline only (trimmed to ack/short) is not pinnable.
+        XCTAssertFalse(TaskPinLogic.isPinnable(user("x\n")))
+        XCTAssertFalse(TaskPinLogic.isPinnable(user("ok\n")))
+        XCTAssertFalse(TaskPinLogic.isPinnable(user("继续\n")))
         XCTAssertFalse(TaskPinLogic.isPinnable(user("x")))
         XCTAssertFalse(TaskPinLogic.isPinnable(user("ok")))
         XCTAssertFalse(TaskPinLogic.isPinnable(user("继续")))
