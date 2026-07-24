@@ -147,18 +147,19 @@ struct PathLinkedText: View {
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                GeometryReader { geo in
-                    // Overlay fills the Text's laid-out size only — never invents height.
-                    CmdPathClickOverlay(
-                        plainText: plainText,
-                        targets: targets,
-                        size: geo.size,
-                        font: hitFont,
-                        lineLimit: lineLimit,
-                        onFlash: onFlash
-                    )
-                    .frame(width: geo.size.width, height: geo.size.height)
-                }
+                // No GeometryReader: a `.background` overlay is sized to the Text's
+                // laid-out frame by SwiftUI, and CmdPathClickNSView already reads its
+                // own `bounds` at click time (see pathURL(at:) below). Routing the size
+                // through a GeometryReader here meant one GeometryReader + NSViewRepresentable
+                // update per text node per resize frame — hundreds of them across a long
+                // transcript. The overlay gets its bounds from layout either way.
+                CmdPathClickOverlay(
+                    plainText: plainText,
+                    targets: targets,
+                    font: hitFont,
+                    lineLimit: lineLimit,
+                    onFlash: onFlash
+                )
             )
             .contextMenu { contextMenuContent }
     }
@@ -257,7 +258,6 @@ enum PathLinkOpenURL {
 private struct CmdPathClickOverlay: NSViewRepresentable {
     let plainText: String
     let targets: [FileReveal.PathTarget]
-    let size: CGSize
     let font: NSFont
     let lineLimit: Int?
     let onFlash: ((String) -> Void)?
@@ -277,7 +277,6 @@ private struct CmdPathClickOverlay: NSViewRepresentable {
     private func apply(to view: CmdPathClickNSView) {
         view.plainText = plainText
         view.targets = targets
-        view.layoutSize = size
         view.hitFont = font
         view.lineLimit = lineLimit
         view.onFlash = onFlash
@@ -287,7 +286,6 @@ private struct CmdPathClickOverlay: NSViewRepresentable {
 private final class CmdPathClickNSView: NSView {
     var plainText: String = ""
     var targets: [FileReveal.PathTarget] = []
-    var layoutSize: CGSize = .zero
     var hitFont: NSFont = .systemFont(ofSize: NSFont.systemFontSize)
     var lineLimit: Int?
     var onFlash: ((String) -> Void)?
@@ -342,10 +340,13 @@ private final class CmdPathClickNSView: NSView {
 
     private func pathURL(at event: NSEvent) -> URL? {
         let point = convert(event.locationInWindow, from: nil)
-        // Prefer live bounds (GeometryReader-filled); fall back to last reported layout size.
+        // The overlay's own bounds are set by SwiftUI to the Text's laid-out size;
+        // that is the authoritative width for the TextKit hit-test below. Before the
+        // first layout pass bounds may be degenerate — fall back to .zero, which makes
+        // PathLinkHitTest naturally miss (same as clicking text that hasn't laid out yet).
         let size = bounds.width > 1 && bounds.height > 1
             ? bounds.size
-            : layoutSize
+            : .zero
         return PathLinkHitTest.pathURL(
             at: point,
             text: plainText,
