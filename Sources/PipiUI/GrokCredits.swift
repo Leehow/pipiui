@@ -149,6 +149,17 @@ enum GrokAuthStore {
 
 // MARK: - Web billing snapshot
 
+struct PeriodUsage: Equatable, Identifiable {
+    /// 周期类型 enum 原始值（来自 [1,7,1]）。持久化引用用。
+    let typeRaw: Int
+    /// 5小时 / 周 / 月 / 额
+    let label: String
+    /// 0…100
+    let percent: Double
+    let resetDate: Date?
+    var id: Int { typeRaw }
+}
+
 struct GrokCreditsSnapshot: Equatable {
     /// 0…100 usage against included credits.
     var usedPercent: Double
@@ -157,6 +168,7 @@ struct GrokCreditsSnapshot: Equatable {
     var periodLabel: String
     /// Help tooltip: 周额度 / 月额度 / 额度
     var periodHelp: String
+    var periods: [PeriodUsage] = []
 
     /// Prefer full billing-window length (start→end); fall back to time-until-reset.
     static func period(
@@ -177,6 +189,8 @@ struct GrokCreditsSnapshot: Equatable {
 
     private static func label(forDuration seconds: TimeInterval) -> (label: String, help: String)? {
         guard seconds > 3600 else { return nil }
+        let hours = seconds / 3600
+        if (4.5...5.5).contains(hours) { return ("5小时", "5小时额度") }
         let days = Int((seconds / 86400).rounded(.toNearestOrAwayFromZero))
         if (4...12).contains(days) { return ("周", "周额度") }
         if (20...45).contains(days) { return ("月", "月额度") }
