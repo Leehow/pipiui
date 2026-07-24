@@ -62,4 +62,23 @@ final class TaskPinLogicTests: XCTestCase {
         ]
         XCTAssertEqual(TaskPinLogic.latestPinnableUser(in: items)?.id, "new")
     }
+
+    func testStickyDisplayTextUsesFirstParagraphAndCollapsesWhitespace() {
+        let item = ChatItem(
+            id: "u",
+            role: "user",
+            blocks: [.text("  标题行  还有空格\n\n第二段不要\n第三行")]
+        )
+        XCTAssertEqual(
+            TaskPinLogic.stickyDisplayText(of: item),
+            "标题行 还有空格"
+        )
+    }
+
+    func testStickyDisplayTextCapsLength() {
+        let long = String(repeating: "任务", count: 80) // 160 chars
+        let item = ChatItem(id: "u", role: "user", blocks: [.text(long)])
+        let out = TaskPinLogic.stickyDisplayText(of: item, maxChars: 40)
+        XCTAssertEqual(out.count, 40)
+    }
 }
