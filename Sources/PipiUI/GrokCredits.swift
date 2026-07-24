@@ -54,6 +54,7 @@ struct GrokAuthCredentials {
     let accessToken: String
     let expiresAt: Date?
     let principalType: String?
+    let accountId: String
 
     var isExpired: Bool {
         guard let expiresAt else { return false }
@@ -104,17 +105,23 @@ enum GrokAuthStore {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        guard let (_, entry) = selectPreferredEntry(in: root),
+        guard let (scope, entry) = selectPreferredEntry(in: root),
               let key = entry["key"] as? String,
               !key.isEmpty
         else { return nil }
+
+        let accountId = (entry["principal_id"] as? String)?.nilIfEmpty
+            ?? (entry["user_id"] as? String)?.nilIfEmpty
+            ?? scope.split(separator: "::").last.map(String.init)
+            ?? ""
 
         return GrokAuthCredentials(
             accessToken: key,
             expiresAt: parseDate(entry["expires_at"]),
             principalType: (entry["principal_type"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-                .nilIfEmpty
+                .nilIfEmpty,
+            accountId: accountId
         )
     }
 
@@ -248,7 +255,8 @@ enum GrokWebBilling {
             usedPercent: parsed.usedPercent,
             resetsAt: parsed.resetsAt,
             periodLabel: period.label,
-            periodHelp: period.help
+            periodHelp: period.help,
+            periods: parsed.periods
         )
     }
 
@@ -266,6 +274,7 @@ enum GrokWebBilling {
         var usedPercent: Double
         var resetsAt: Date?
         var periodStart: Date?
+        var periods: [PeriodUsage] = []
     }
 
     static func parseGRPCWebResponse(_ data: Data, now: Date = Date()) throws -> ParsedBilling {
@@ -323,7 +332,54 @@ enum GrokWebBilling {
         guard let percent = parsedPercent ?? (noUsageYet ? 0 : nil) else {
             throw BillingError.parseFailed
         }
-        return ParsedBilling(usedPercent: percent, resetsAt: reset, periodStart: periodStart)
+
+        let periodEntries = scan.lenDelimitedFields.filter { $0.path == [1, 7] }
+        var periods: [PeriodUsage] = []
+        for entry in periodEntries {
+            let es = scanProtobuf(entry.bytes, depth: 0, path: [], order: 0)
+            let typeRaw = es.scan.varintFields.first { $0.path == [1] }?.value
+            let matchingPercent = es.scan.fixed32Fields.filter { f in
+                f.path == [2] && f.value.isFinite && f.value >= 0 && f.value <= 100
+            }
+            let entryPercent = matchingPercent.first.map { Double($0.value) }
+            guard let typeRaw, let entryPercent else { continue } // 配对失败跳过
+            // reset 时间：entry 内若有 [3]/[4] varint 时间戳则用，否则 nil（标签兜底）
+            let entryReset = es.scan.varintFields
+                .compactMap { f -> Date? in
+                    guard (1_700_000_000...2_100_000_000).contains(f.value),
+                          f.path == [3] || f.path == [4]
+                    else { return nil }
+                    return Date(timeIntervalSince1970: TimeInterval(f.value))
+                }.first
+            let startVarint = es.scan.varintFields.first { f in f.path == [4] }
+            let labelInfo: (label: String, help: String)
+            if let entryReset, let startVarint {
+                let start = Date(timeIntervalSince1970: TimeInterval(startVarint.value))
+                labelInfo = GrokCreditsSnapshot.period(resetsAt: entryReset, periodStart: start, now: now)
+            } else {
+                labelInfo = GrokCreditsSnapshot.period(resetsAt: entryReset, now: now)
+            }
+            // typeRaw 已知映射兜底（2→周）；label 若为兜底"额"且 typeRaw 已知则覆盖
+            var label = labelInfo.label
+            if label == "额" {
+                if typeRaw == 2 { label = "周" }
+                else if typeRaw == 1 { label = "月" }
+                // 其它未知 typeRaw 保留"额"
+            }
+            periods.append(PeriodUsage(
+                typeRaw: Int(typeRaw),
+                label: label,
+                percent: entryPercent,
+                resetDate: entryReset
+            ))
+        }
+
+        return ParsedBilling(
+            usedPercent: percent,
+            resetsAt: reset,
+            periodStart: periodStart,
+            periods: periods
+        )
     }
 
     private static func looksLikeProtobufPayload(_ data: Data) -> Bool {
@@ -423,12 +479,20 @@ enum GrokWebBilling {
             var value: UInt64
         }
 
+        struct LenDelimited {
+            var path: [UInt64]
+            var bytes: Data
+            var order: Int
+        }
+
         var fixed32Fields: [Fixed32Field] = []
         var varintFields: [VarintField] = []
+        var lenDelimitedFields: [LenDelimited] = []
 
         mutating func merge(_ other: ProtobufScan) {
             fixed32Fields.append(contentsOf: other.fixed32Fields)
             varintFields.append(contentsOf: other.varintFields)
+            lenDelimitedFields.append(contentsOf: other.lenDelimitedFields)
         }
     }
 
@@ -476,6 +540,11 @@ enum GrokWebBilling {
                 }
                 let start = index
                 let end = index + Int(length)
+                scan.lenDelimitedFields.append(.init(
+                    path: fieldPath,
+                    bytes: Data(bytes[start..<end]),
+                    order: nextOrder
+                ))
                 if depth < 4 {
                     let nested = scanProtobuf(
                         Data(bytes[start..<end]),

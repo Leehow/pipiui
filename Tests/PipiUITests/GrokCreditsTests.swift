@@ -108,6 +108,30 @@ final class GrokCreditsTests: XCTestCase {
         XCTAssertFalse(creds.isTeamPrincipal)
     }
 
+    func testAccountIdFromPrincipalId() throws {
+        let json = """
+        {"https://auth.x.ai::client": {"key":"k","principal_id":"pid-9","user_id":"uid-1","principal_type":"user"}}
+        """
+        let creds = try XCTUnwrap(GrokAuthStore.parse(data: Data(json.utf8)))
+        XCTAssertEqual(creds.accountId, "pid-9")
+    }
+
+    func testAccountIdFallbackToUserId() throws {
+        let json = """
+        {"https://auth.x.ai::client": {"key":"k","user_id":"uid-7","principal_type":"user"}}
+        """
+        let creds = try XCTUnwrap(GrokAuthStore.parse(data: Data(json.utf8)))
+        XCTAssertEqual(creds.accountId, "uid-7")
+    }
+
+    func testAccountIdFallbackToScopeUUID() throws {
+        let json = """
+        {"https://auth.x.ai::abc-def-123": {"key":"k","principal_type":"user"}}
+        """
+        let creds = try XCTUnwrap(GrokAuthStore.parse(data: Data(json.utf8)))
+        XCTAssertEqual(creds.accountId, "abc-def-123")
+    }
+
     func testParseBillingFloatPercent() throws {
         // field 1 = message; nested field 1 = float percent 42.5
         // Simplest: raw protobuf with fixed32 percent at path ending in 1.
@@ -132,5 +156,49 @@ final class GrokCreditsTests: XCTestCase {
 
         let parsed = try GrokWebBilling.parseGRPCWebResponse(frame)
         XCTAssertEqual(parsed.usedPercent, 25.0, accuracy: 0.01)
+    }
+
+    func testParsePeriodsFromRepeatedField() {
+        // 构造 gRPC-web frame: 5-byte header + protobuf payload
+        // payload = field1(message){ field1=f32(75), field7(msg){ field1=varint(2), field2=f32(38) },
+        //                              field7(msg){ field1=varint(1), field2=f32(33) } }
+        func tag(_ fn: Int, _ wt: Int) -> UInt8 { UInt8((fn << 3) | wt) }
+        func varint(_ v: UInt64) -> Data {
+            var v = v; var out = Data()
+            while v >= 0x80 { out.append(UInt8((v & 0x7f) | 0x80)); v >>= 7 }
+            out.append(UInt8(v)); return out
+        }
+        func f32(_ f: Float) -> Data {
+            var f = f; return Data(bytes: &f, count: 4) // little-endian on arm64
+        }
+        // inner entry1: field1(varint)=2, field2(f32)=38
+        var entry1 = Data()
+        entry1.append(tag(1, 0)); entry1.append(varint(2))
+        entry1.append(tag(2, 5)); entry1.append(f32(38))
+        // inner entry2: field1(varint)=1, field2(f32)=33
+        var entry2 = Data()
+        entry2.append(tag(1, 0)); entry2.append(varint(1))
+        entry2.append(tag(2, 5)); entry2.append(f32(33))
+        // config = field1(f32)=75, field7(msg)=entry1, field7(msg)=entry2
+        var cfg = Data()
+        cfg.append(tag(1, 5)); cfg.append(f32(75))
+        cfg.append(tag(7, 2)); cfg.append(varint(UInt64(entry1.count))); cfg.append(entry1)
+        cfg.append(tag(7, 2)); cfg.append(varint(UInt64(entry2.count))); cfg.append(entry2)
+        var payload = Data()
+        payload.append(tag(1, 2)); payload.append(varint(UInt64(cfg.count))); payload.append(cfg)
+        // gRPC-web frame
+        var frame = Data([0x00, 0x00, 0x00, 0x00, 0x00])
+        frame.append(payload)
+        // Fix length in header (big-endian)
+        let plen = UInt32(payload.count).bigEndian
+        withUnsafeBytes(of: plen) { frame.replaceSubrange(1..<5, with: $0) }
+
+        let parsed = try! GrokWebBilling.parseGRPCWebResponse(frame)
+        XCTAssertEqual(parsed.usedPercent, 75, accuracy: 0.01)
+        XCTAssertEqual(parsed.periods.count, 2)
+        XCTAssertEqual(parsed.periods[0].typeRaw, 2)
+        XCTAssertEqual(parsed.periods[0].percent, 38, accuracy: 0.01)
+        XCTAssertEqual(parsed.periods[1].typeRaw, 1)
+        XCTAssertEqual(parsed.periods[1].percent, 33, accuracy: 0.01)
     }
 }
