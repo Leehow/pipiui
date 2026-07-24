@@ -4,6 +4,8 @@ import AppKit
 /// 右侧 Subagent 面板：上半是 agent 树列表，下半是选中 agent 的实时详情。
 struct SubagentPanel: View {
     @ObservedObject var store: SubagentStore
+    /// Session project root (main git worktree) for merge/discard.
+    var projectURL: URL
     var onClose: () -> Void
 
     var body: some View {
@@ -86,7 +88,7 @@ struct SubagentPanel: View {
     @ViewBuilder
     private var detail: some View {
         if let agent = store.agents.first(where: { $0.id == store.selectedId }) {
-            AgentDetailView(agent: agent)
+            AgentDetailView(agent: agent, store: store, projectURL: projectURL)
         } else {
             Text("选择一个 agent 查看详情")
                 .font(.caption)
@@ -122,6 +124,15 @@ private struct AgentRow: View {
                             .padding(.vertical, 1)
                             .background(Capsule().fill(Color.accentColor.opacity(0.15)))
                     }
+                    if agent.worktreeLifecycle == .pendingReview || agent.canReviewWorktree {
+                        lifecycleBadge(text: "审核", color: .orange)
+                    } else if agent.worktreeLifecycle == .merged {
+                        lifecycleBadge(text: "已合并", color: .green)
+                    } else if agent.worktreeLifecycle == .discarded {
+                        lifecycleBadge(text: "已丢弃", color: .secondary)
+                    } else if agent.worktreeLifecycle == .active, agent.state == .running {
+                        lifecycleBadge(text: "wt", color: .blue)
+                    }
                 }
                 Text(agent.state == .running && !agent.activity.isEmpty ? agent.activity : agent.task)
                     .font(.caption)
@@ -144,6 +155,15 @@ private struct AgentRow: View {
         )
     }
 
+    private func lifecycleBadge(text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(color.opacity(0.15)))
+            .foregroundStyle(color)
+    }
+
     @ViewBuilder
     private var statusDot: some View {
         switch agent.state {
@@ -163,8 +183,14 @@ private struct AgentRow: View {
 
 private struct AgentDetailView: View {
     let agent: SubagentInfo
+    @ObservedObject var store: SubagentStore
+    var projectURL: URL
     @Environment(\.scenePhase) private var scenePhase
     @State private var pinToBottom = true
+    @State private var worktreeBusy = false
+    @State private var showDiscardConfirm = false
+    @State private var showDiffStat = false
+    @State private var diffStatText: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -182,7 +208,7 @@ private struct AgentDetailView: View {
                     Text(String(format: "$%.4f", agent.cost)).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
                     Text(durationText).font(.caption2).foregroundStyle(.tertiary)
                 }
-                if agent.worktreeBranch != nil || agent.worktreePath != nil || agent.worktreeError != nil {
+                if agent.hasWorktreeMeta {
                     worktreeMeta
                 }
             }
@@ -240,6 +266,8 @@ private struct AgentDetailView: View {
                 }
                 .onChange(of: agent.id) { _, _ in
                     pinToBottom = true
+                    showDiffStat = false
+                    diffStatText = nil
                     scrollToBottom(proxy, retry: true)
                 }
                 .onChange(of: scenePhase) { _, phase in
@@ -249,6 +277,18 @@ private struct AgentDetailView: View {
                     scrollToBottom(proxy, retry: true)
                 }
             }
+        }
+        .confirmationDialog(
+            "丢弃 worktree？",
+            isPresented: $showDiscardConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("丢弃（不合并）", role: .destructive) {
+                runDiscard()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将强制删除该 agent 的 worktree 与本地分支，不会合并进主分支。此操作不可撤销。")
         }
     }
 
@@ -311,8 +351,20 @@ private struct AgentDetailView: View {
 
     @ViewBuilder
     private var worktreeMeta: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            if let branch = agent.worktreeBranch, !branch.isEmpty {
+        VStack(alignment: .leading, spacing: 4) {
+            // Lifecycle badge + running branch label
+            HStack(spacing: 6) {
+                lifecycleLabel
+                if agent.state == .running, let branch = agent.worktreeBranch, !branch.isEmpty {
+                    Text("工作中 · \(branch)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+
+            if let branch = agent.worktreeBranch, !branch.isEmpty, agent.state != .running {
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.triangle.branch")
                         .font(.caption2)
@@ -341,7 +393,125 @@ private struct AgentDetailView: View {
                     .textSelection(.enabled)
                     .lineLimit(2)
             }
+
+            if agent.canReviewWorktree {
+                worktreeActions
+            }
+
+            if let actionErr = store.worktreeActionError, store.selectedId == agent.id {
+                Text(actionErr)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+                    .lineLimit(4)
+            }
         }
+    }
+
+    @ViewBuilder
+    private var lifecycleLabel: some View {
+        let (text, color): (String, Color) = {
+            switch agent.worktreeLifecycle {
+            case .active:
+                return agent.state == .running ? ("工作中", .blue) : ("审核中", .orange)
+            case .pendingReview:
+                return ("审核中", .orange)
+            case .merged:
+                return ("已合并", .green)
+            case .discarded:
+                return ("已丢弃", .secondary)
+            case .none:
+                if agent.canReviewWorktree {
+                    return ("审核中", .orange)
+                }
+                return ("", .clear)
+            }
+        }()
+        if !text.isEmpty {
+            Text(text)
+                .font(.caption2.weight(.medium))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Capsule().fill(color.opacity(0.15)))
+                .foregroundStyle(color)
+        }
+    }
+
+    @ViewBuilder
+    private var worktreeActions: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // Optional diff stat (collapsed)
+            Button {
+                if showDiffStat {
+                    showDiffStat = false
+                } else {
+                    diffStatText = store.worktreeDiffStat(agentId: agent.id, mainProjectURL: projectURL)
+                    showDiffStat = true
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: showDiffStat ? "chevron.down" : "chevron.right")
+                        .font(.caption2)
+                    Text(showDiffStat ? "隐藏 diff --stat" : "查看 diff --stat")
+                        .font(.caption2)
+                }
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .disabled(worktreeBusy)
+
+            if showDiffStat, let diff = diffStatText {
+                Text(diff)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(12)
+                    .padding(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.primary.opacity(0.04)))
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    runMerge()
+                } label: {
+                    if worktreeBusy {
+                        ProgressView().controlSize(.mini)
+                    }
+                    Text("合并到主分支")
+                        .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(worktreeBusy)
+
+                Button {
+                    showDiscardConfirm = true
+                } label: {
+                    Text("丢弃 worktree")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(worktreeBusy)
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    private func runMerge() {
+        worktreeBusy = true
+        store.worktreeActionError = nil
+        // Git CLI is synchronous; keep on main (agent merges are typically small).
+        _ = store.mergeWorktree(agentId: agent.id, mainProjectURL: projectURL)
+        worktreeBusy = false
+    }
+
+    private func runDiscard() {
+        worktreeBusy = true
+        store.worktreeActionError = nil
+        _ = store.discardWorktree(agentId: agent.id, mainProjectURL: projectURL)
+        worktreeBusy = false
     }
 
     /// Prefer last two path components for display; full path remains selectable via help/selection.

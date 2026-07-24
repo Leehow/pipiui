@@ -140,7 +140,7 @@ struct ChatDetailView: View {
                 session.rightPanel = nil
             }
         case .agents:
-            SubagentPanel(store: session.subagents) {
+            SubagentPanel(store: session.subagents, projectURL: session.projectURL) {
                 session.rightPanel = nil
             }
         }

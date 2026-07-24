@@ -443,4 +443,151 @@ final class GitRepoTests: XCTestCase {
             )
         )
     }
+
+    func testParseWorktreeListPorcelain() {
+        let sample = """
+            worktree /tmp/main
+            HEAD abcdef0
+            branch refs/heads/main
+
+            worktree /tmp/main/.pi/worktrees/agent1
+            HEAD 1234567
+            branch refs/heads/pipiui/agent1
+
+            worktree /tmp/detached-wt
+            HEAD deadbeef
+            detached
+
+            """
+        let rows = GitRepo.parseWorktreeListPorcelain(sample)
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertEqual(rows[0].path, "/tmp/main")
+        XCTAssertEqual(rows[0].branch, "main")
+        XCTAssertEqual(rows[1].path, "/tmp/main/.pi/worktrees/agent1")
+        XCTAssertEqual(rows[1].branch, "pipiui/agent1")
+        XCTAssertEqual(rows[2].path, "/tmp/detached-wt")
+        XCTAssertNil(rows[2].branch)
+    }
+
+    func testMergeBranchAndWorktreeRemove() throws {
+        guard GitRepo.findGitExecutable() != nil else {
+            throw XCTSkip("git not available")
+        }
+
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(
+            "pipiui-git-merge-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        _ = try GitRepo.run(gitArgs: ["init", "-b", "main"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["config", "user.email", "pipiui-test@example.com"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["config", "user.name", "PipiUI Test"], in: dir)
+        try "base\n".write(to: dir.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+        _ = try GitRepo.run(gitArgs: ["add", "tracked.txt"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["commit", "-m", "init"], in: dir)
+
+        let wtRoot = dir.appendingPathComponent(".pi/worktrees", isDirectory: true)
+        try fm.createDirectory(at: wtRoot, withIntermediateDirectories: true)
+        let wtPath = wtRoot.appendingPathComponent("agent-merge", isDirectory: true)
+        let branch = "pipiui/agent-merge"
+
+        try GitRepo.worktreeAdd(branch: branch, at: wtPath, in: dir)
+
+        // Agent work: new file on branch
+        try "from-agent\n".write(
+            to: wtPath.appendingPathComponent("agent-file.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try GitRepo.run(gitArgs: ["add", "agent-file.txt"], in: wtPath)
+        _ = try GitRepo.run(gitArgs: ["commit", "-m", "agent work"], in: wtPath)
+
+        // main should not have the file yet
+        XCTAssertFalse(fm.fileExists(atPath: dir.appendingPathComponent("agent-file.txt").path))
+
+        let listBefore = GitRepo.worktreeList(in: dir)
+        XCTAssertTrue(listBefore.contains(where: { $0.branch == branch }))
+
+        let stat = GitRepo.diffStat(from: "main", to: branch, in: dir)
+        XCTAssertTrue(stat.contains("agent-file") || stat.contains("1 file"), stat)
+
+        try GitRepo.mergeBranch(branch, into: dir)
+
+        let merged = try String(contentsOf: dir.appendingPathComponent("agent-file.txt"), encoding: .utf8)
+        XCTAssertEqual(merged, "from-agent\n")
+
+        try GitRepo.worktreeRemove(at: wtPath, in: dir, force: true)
+        XCTAssertFalse(fm.fileExists(atPath: wtPath.path))
+
+        let listAfter = GitRepo.worktreeList(in: dir)
+        XCTAssertFalse(listAfter.contains(where: { $0.branch == branch }))
+    }
+
+    func testMergeBranchRejectsDangerousNames() throws {
+        guard GitRepo.findGitExecutable() != nil else {
+            throw XCTSkip("git not available")
+        }
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(
+            "pipiui-git-merge-bad-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        _ = try GitRepo.run(gitArgs: ["init", "-b", "main"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["commit", "--allow-empty", "-m", "init"], in: dir)
+
+        XCTAssertThrowsError(try GitRepo.mergeBranch("", into: dir))
+        XCTAssertThrowsError(try GitRepo.mergeBranch("-m", into: dir))
+        XCTAssertThrowsError(try GitRepo.mergeBranch("--no-commit", into: dir))
+        XCTAssertThrowsError(
+            try GitRepo.worktreeRemove(at: URL(fileURLWithPath: "-evil"), in: dir)
+        )
+    }
+
+    func testMergeConflictDoesNotRemoveWorktree() throws {
+        guard GitRepo.findGitExecutable() != nil else {
+            throw XCTSkip("git not available")
+        }
+
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(
+            "pipiui-git-conflict-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        _ = try GitRepo.run(gitArgs: ["init", "-b", "main"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["config", "user.email", "pipiui-test@example.com"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["config", "user.name", "PipiUI Test"], in: dir)
+        try "v1\n".write(to: dir.appendingPathComponent("clash.txt"), atomically: true, encoding: .utf8)
+        _ = try GitRepo.run(gitArgs: ["add", "clash.txt"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["commit", "-m", "init"], in: dir)
+
+        let wtRoot = dir.appendingPathComponent(".pi/worktrees", isDirectory: true)
+        try fm.createDirectory(at: wtRoot, withIntermediateDirectories: true)
+        let wtPath = wtRoot.appendingPathComponent("agent-clash", isDirectory: true)
+        let branch = "pipiui/agent-clash"
+        try GitRepo.worktreeAdd(branch: branch, at: wtPath, in: dir)
+
+        try "from-agent\n".write(to: wtPath.appendingPathComponent("clash.txt"), atomically: true, encoding: .utf8)
+        _ = try GitRepo.run(gitArgs: ["add", "clash.txt"], in: wtPath)
+        _ = try GitRepo.run(gitArgs: ["commit", "-m", "agent side"], in: wtPath)
+
+        try "from-main\n".write(to: dir.appendingPathComponent("clash.txt"), atomically: true, encoding: .utf8)
+        _ = try GitRepo.run(gitArgs: ["add", "clash.txt"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["commit", "-m", "main side"], in: dir)
+
+        XCTAssertThrowsError(try GitRepo.mergeBranch(branch, into: dir))
+        // Worktree must still exist after failed merge
+        XCTAssertTrue(fm.fileExists(atPath: wtPath.path))
+
+        // Abort merge so cleanup can remove the temp dir
+        _ = try? GitRepo.run(gitArgs: ["merge", "--abort"], in: dir)
+    }
 }
