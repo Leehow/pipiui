@@ -216,12 +216,12 @@ struct ContentView: View {
                 // rebuilt detail view reads it back immediately; only transient scroll/drag @State
                 // resets, which is what we want on switch.
                 //
-                // Keep this .id: it gives each session a fresh ChatDetailView whose `.task(id:)`
-                // fires on creation, which is how the LazyVStack gets realized-and-scrolled after
-                // a switch (see ChatDetailView.transcript). The original reason — a switch into an
-                // image-heavy session freezing the main thread — no longer holds: ImageBlock.==
-                // compares data.count, not bytes, so SwiftUI's diff is cheap. The .id is now kept
-                // for the clean lifecycle it gives the lazy realization path, not for diff cost.
+                // Keep this .id: without it SwiftUI reuses ChatDetailView across sessions and diffs
+                // the old+new transcript arrays in one pass. The historical "切会话卡死" rationale
+                // (ImageBlock.== comparing bytes) no longer applies — it compares data.count now —
+                // but tearing the view down on switch is still the cheaper, more predictable path
+                // than letting SwiftUI reconcile two large transcript lists, and it gives a clean
+                // .onAppear for the initial scroll settle.
                 ChatDetailView(session: session)
                     .id(session.id)
             } else {
