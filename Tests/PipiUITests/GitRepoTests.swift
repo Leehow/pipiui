@@ -51,6 +51,111 @@ final class GitRepoTests: XCTestCase {
         XCTAssertNil(GitRepo.parseShortSHA("   \n"))
     }
 
+    func testParsePorcelainCounts() {
+        let empty = GitRepo.parsePorcelain("")
+        XCTAssertEqual(empty.staged, 0)
+        XCTAssertEqual(empty.unstaged, 0)
+        XCTAssertEqual(empty.untracked, 0)
+
+        let sample = """
+        M  staged.txt
+         M unstaged.txt
+        MM both.txt
+        ?? untracked.txt
+        A  added.txt
+         D deleted-wt.txt
+        """
+        let c = GitRepo.parsePorcelain(sample)
+        XCTAssertEqual(c.staged, 3) // M , MM, A
+        XCTAssertEqual(c.unstaged, 3) //  M, MM,  D
+        XCTAssertEqual(c.untracked, 1)
+
+        let onlyUntracked = GitRepo.parsePorcelain("?? a\n?? b\n")
+        XCTAssertEqual(onlyUntracked.untracked, 2)
+        XCTAssertEqual(onlyUntracked.staged, 0)
+        XCTAssertEqual(onlyUntracked.unstaged, 0)
+    }
+
+    func testParseUpstreamCounts() {
+        let a = GitRepo.parseUpstreamCounts("3\t1\n")
+        XCTAssertEqual(a.behind, 3)
+        XCTAssertEqual(a.ahead, 1)
+
+        let b = GitRepo.parseUpstreamCounts("0 0")
+        XCTAssertEqual(b.behind, 0)
+        XCTAssertEqual(b.ahead, 0)
+
+        let c = GitRepo.parseUpstreamCounts("12\t0")
+        XCTAssertEqual(c.behind, 12)
+        XCTAssertEqual(c.ahead, 0)
+
+        let bad = GitRepo.parseUpstreamCounts("nope")
+        XCTAssertEqual(bad.behind, 0)
+        XCTAssertEqual(bad.ahead, 0)
+
+        let empty = GitRepo.parseUpstreamCounts("")
+        XCTAssertEqual(empty.behind, 0)
+        XCTAssertEqual(empty.ahead, 0)
+    }
+
+    func testPromptSnapshot() {
+        let clean = GitRepoStatus(
+            isRepo: true,
+            currentBranch: "main",
+            isDetached: false,
+            shortSHA: "abc1234",
+            localBranches: ["main"],
+            isDirty: false,
+            stagedCount: 0,
+            unstagedCount: 0,
+            untrackedCount: 0,
+            ahead: 1,
+            behind: 2,
+            upstream: "origin/main",
+            originURL: "https://github.com/acme/app.git"
+        )
+        let text = GitRepo.promptSnapshot(status: clean)
+        XCTAssertTrue(text.hasPrefix("## Git (Pipi UI)"))
+        XCTAssertTrue(text.contains("branch: main"))
+        XCTAssertTrue(text.contains("sha: abc1234"))
+        XCTAssertTrue(text.contains("dirty: no (staged=0 unstaged=0 untracked=0)"))
+        XCTAssertTrue(text.contains("upstream: origin/main +1 -2"))
+        XCTAssertTrue(text.contains("origin: https://github.com/acme/app.git"))
+
+        let notRepo = GitRepo.promptSnapshot(status: .empty)
+        XCTAssertTrue(notRepo.contains("## Git (Pipi UI)"))
+        XCTAssertTrue(notRepo.contains("not a git repository"))
+
+        let detached = GitRepo.promptSnapshot(
+            status: GitRepoStatus(
+                isRepo: true,
+                isDetached: true,
+                shortSHA: "deadbee",
+                isDirty: true,
+                stagedCount: 1,
+                unstagedCount: 0,
+                untrackedCount: 2
+            )
+        )
+        XCTAssertTrue(detached.contains("branch: (detached) @ deadbee"))
+        XCTAssertTrue(detached.contains("dirty: yes (staged=1 unstaged=0 untracked=2)"))
+        XCTAssertTrue(detached.contains("upstream: (none)"))
+    }
+
+    func testTruncateDiffOutput() {
+        let lines = (0..<10).map { "line\($0)" }.joined(separator: "\n")
+        let byFiles = GitRepo.truncateDiffOutput(lines, maxFiles: 3, maxBytes: 10_000)
+        XCTAssertTrue(byFiles.contains("line0"))
+        XCTAssertTrue(byFiles.contains("line2"))
+        XCTAssertFalse(byFiles.contains("line9"))
+        XCTAssertTrue(byFiles.contains("[truncated: showing first 3 lines]"))
+
+        let long = String(repeating: "x", count: 500)
+        let byBytes = GitRepo.truncateDiffOutput(long, maxFiles: 100, maxBytes: 50)
+        XCTAssertTrue(byBytes.contains("[truncated at 50 bytes]"))
+        XCTAssertLessThan(byBytes.utf8.count, 120)
+    }
+
     func testToolbarTitleTruncation() {
         XCTAssertEqual(GitRepo.toolbarTitle(for: "main"), "main")
         XCTAssertEqual(GitRepo.toolbarTitle(for: "  main  "), "main")
@@ -101,6 +206,17 @@ final class GitRepoTests: XCTestCase {
         )
         XCTAssertEqual(attached.displayBranchName, "main")
         XCTAssertEqual(attached.toolbarTitle, "main")
+        XCTAssertFalse(attached.isDirty)
+
+        let dirty = GitRepoStatus(
+            isRepo: true,
+            currentBranch: "main",
+            isDirty: true,
+            stagedCount: 1,
+            unstagedCount: 2,
+            untrackedCount: 0
+        )
+        XCTAssertEqual(dirty.toolbarTitle, "main*")
 
         let detached = GitRepoStatus(
             isRepo: true,
@@ -112,6 +228,20 @@ final class GitRepoTests: XCTestCase {
         )
         XCTAssertEqual(detached.displayBranchName, "detached @ deadbee")
         XCTAssertTrue(detached.toolbarTitle.hasPrefix("detached"))
+        XCTAssertFalse(detached.toolbarTitle.hasSuffix("*"))
+    }
+
+    func testEmptyDefaultsIncludeNewFields() {
+        let e = GitRepoStatus.empty
+        XCTAssertFalse(e.isRepo)
+        XCTAssertFalse(e.isDirty)
+        XCTAssertEqual(e.stagedCount, 0)
+        XCTAssertEqual(e.unstagedCount, 0)
+        XCTAssertEqual(e.untrackedCount, 0)
+        XCTAssertEqual(e.ahead, 0)
+        XCTAssertEqual(e.behind, 0)
+        XCTAssertNil(e.upstream)
+        XCTAssertNil(e.originURL)
     }
 
     // MARK: - probe integration
@@ -129,6 +259,7 @@ final class GitRepoTests: XCTestCase {
         XCTAssertFalse(status.isRepo)
         XCTAssertNil(status.currentBranch)
         XCTAssertEqual(status.localBranches, [])
+        XCTAssertFalse(status.isDirty)
     }
 
     func testProbeTempGitInitWithBranches() throws {
@@ -159,11 +290,73 @@ final class GitRepoTests: XCTestCase {
         XCTAssertTrue(status.localBranches.contains("main"))
         XCTAssertTrue(status.localBranches.contains("feature/x"))
         XCTAssertNil(status.githubBrowserURL)
+        XCTAssertFalse(status.isDirty)
+        XCTAssertEqual(status.stagedCount, 0)
+        XCTAssertEqual(status.unstagedCount, 0)
+        XCTAssertEqual(status.untrackedCount, 0)
 
         // checkout feature/x then re-probe
         try GitRepo.checkout(branch: "feature/x", in: dir)
         let after = GitRepo.probe(workTree: dir)
         XCTAssertEqual(after.currentBranch, "feature/x")
+    }
+
+    func testProbeDirtyAndOriginAndDiffStat() throws {
+        guard GitRepo.findGitExecutable() != nil else {
+            throw XCTSkip("git not available")
+        }
+
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(
+            "pipiui-git-dirty-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        _ = try GitRepo.run(gitArgs: ["init", "-b", "main"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["config", "user.email", "pipiui-test@example.com"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["config", "user.name", "PipiUI Test"], in: dir)
+        let tracked = dir.appendingPathComponent("tracked.txt")
+        try "v1\n".write(to: tracked, atomically: true, encoding: .utf8)
+        _ = try GitRepo.run(gitArgs: ["add", "tracked.txt"], in: dir)
+        _ = try GitRepo.run(gitArgs: ["commit", "-m", "init"], in: dir)
+
+        // origin (non-github still fills originURL)
+        _ = try GitRepo.run(
+            gitArgs: ["remote", "add", "origin", "https://example.com/acme/app.git"],
+            in: dir
+        )
+
+        // unstaged + untracked
+        try "v2\n".write(to: tracked, atomically: true, encoding: .utf8)
+        try "new\n".write(
+            to: dir.appendingPathComponent("fresh.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        // staged
+        let staged = dir.appendingPathComponent("staged.txt")
+        try "s\n".write(to: staged, atomically: true, encoding: .utf8)
+        _ = try GitRepo.run(gitArgs: ["add", "staged.txt"], in: dir)
+
+        let status = GitRepo.probe(workTree: dir)
+        XCTAssertTrue(status.isRepo)
+        XCTAssertTrue(status.isDirty)
+        XCTAssertEqual(status.stagedCount, 1)
+        XCTAssertEqual(status.unstagedCount, 1)
+        XCTAssertEqual(status.untrackedCount, 1)
+        XCTAssertEqual(status.originURL, "https://example.com/acme/app.git")
+        XCTAssertNil(status.githubBrowserURL)
+        XCTAssertTrue(status.toolbarTitle.hasSuffix("*"))
+
+        let snap = GitRepo.promptSnapshot(status: status)
+        XCTAssertTrue(snap.contains("dirty: yes"))
+        XCTAssertTrue(snap.contains("origin: https://example.com/acme/app.git"))
+
+        let stat = GitRepo.diffStat(workTree: dir, maxFiles: 50, maxBytes: 80_000)
+        XCTAssertFalse(stat.isEmpty)
+        XCTAssertFalse(stat.contains("(diff unavailable)"))
     }
 
     func testCheckoutRejectsDangerousNames() throws {

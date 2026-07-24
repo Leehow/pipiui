@@ -47,12 +47,24 @@ struct GitBranchMenu: View {
             }
             .menuStyle(.borderlessButton)
             .disabled(store.isBusy)
-            .help("Git 分支：\(store.status.displayBranchName)")
+            .help(branchHelpText)
             .onAppear {
                 store.startAppActiveRefresh()
                 store.refresh()
             }
         }
+    }
+
+    private var branchHelpText: String {
+        let s = store.status
+        var text = "Git 分支：\(s.displayBranchName)"
+        if s.isDirty {
+            text += "*（staged=\(s.stagedCount) unstaged=\(s.unstagedCount) untracked=\(s.untrackedCount)）"
+        }
+        if let up = s.upstream, !up.isEmpty {
+            text += " · upstream \(up) +\(s.ahead) -\(s.behind)"
+        }
+        return text
     }
 
     /// Current branch first (with checkmark), remaining local branches case-insensitive sorted.

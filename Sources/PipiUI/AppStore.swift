@@ -126,6 +126,7 @@ final class AppStore: ObservableObject {
             bridgePort: bridge?.port ?? 0,
             webviewExtension: plugin.webviewExtension,
             mediaExtension: plugin.mediaExtension,
+            gitExtension: plugin.gitExtension,
             reloadExtension: plugin.reloadExtension,
             subagentDir: plugin.subagentDir,
             agentsDir: plugin.agentsDir,

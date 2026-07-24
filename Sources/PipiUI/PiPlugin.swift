@@ -18,6 +18,7 @@ enum PiPlugin {
         var subagentDir: String?   // -e 这个目录（含补丁版 index.ts）
         var webviewExtension: String? // -e 这个文件
         var mediaExtension: String?   // -e 对话内 generate_image
+        var gitExtension: String?     // -e git_status / git_diff + prompt snapshot
         var reloadExtension: String?  // -e 内部 pipiui_reload 命令
         var agentsDir: String?     // PIPIUI_AGENTS_DIR
         var bossPrompt: String?    // --append-system-prompt（Boss 模式）
@@ -53,10 +54,13 @@ enum PiPlugin {
         // 3. 对话内生图工具（Grok Imagine / Coding Relay）
         result.mediaExtension = MediaExtension.install(into: root)
 
-        // 4. 热重载扩展/skills/prompts/context（内部命令 pipiui_reload）
+        // 4. Git 结构化 status/diff + system prompt snapshot
+        result.gitExtension = GitExtension.install(into: root)
+
+        // 5. 热重载扩展/skills/prompts/context（内部命令 pipiui_reload）
         result.reloadExtension = ReloadExtension.install(into: root)
 
-        // 5. Boss 协议提示词
+        // 6. Boss 协议提示词
         result.bossPrompt = BossPrompt.install(into: root)
 
         return result
