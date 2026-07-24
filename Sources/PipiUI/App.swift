@@ -73,14 +73,11 @@ struct ContentView: View {
     @State private var sidebarCollapsedForWidth = false
     @State private var sidebarWidthRatio = LayoutPersistence.sidebarWidthRatio()
 
-    /// Resize throttling. SwiftUI fires one `GeometryReader` update per live-resize
-    /// frame (often >120Hz on a fast display); letting every frame re-frame the
-    /// whole `NavigationSplitView` saturates the main thread — visibly so when a
-    /// streaming session is also rewriting its rows every ~50ms. `settledLogicalSize`
-    /// is the size downstream layout actually sees, updated at most ~60fps. Frames
-    /// dropped inside the cooldown are stashed in `pendingLogicalSize` and flushed
-    /// on `didEndLiveResizeNotification` so the window still lands on its exact
-    /// final pixel size when the user lets go.
+    /// Layout size the split view actually uses. During AppKit live window resize
+    /// this is frozen (new proposals go to `pendingLogicalSize` only) so the
+    /// transcript does not reflow every drag frame. Flushed on
+    /// `didEndLiveResizeNotification`. When not live-resizing, still throttled
+    /// to ~60fps via `ResizeThrottle`.
     @State private var settledLogicalSize: CGSize?
     @State private var pendingLogicalSize: CGSize?
     @State private var lastResizeEmitAt: Date?
@@ -100,28 +97,36 @@ struct ContentView: View {
                     applyResize(metrics, force: false)
                 }
                 .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEndLiveResizeNotification)) { _ in
-                    // Live resize ended: flush whatever final size we dropped, so the
-                    // window settles on the exact pixel the user stopped at rather than
-                    // the last frame that slipped inside the ~60fps window.
-                    if let pending = pendingLogicalSize, pending != settledLogicalSize {
-                        settledLogicalSize = pending
+                    // Live resize ended: one layout pass at the final size (layout was
+                    // frozen for the whole drag — see `shouldUpdateSettledLayout`).
+                    if let pending = pendingLogicalSize {
+                        updateSidebarVisibility(for: pending.width)
+                        if pending != settledLogicalSize {
+                            settledLogicalSize = pending
+                        }
+                        lastResizeEmitAt = Date()
                     }
                     pendingLogicalSize = nil
                 }
         }
     }
 
-    /// Routes a fresh `RootLayoutMetrics` through the resize throttle: the first
-    /// frame and any frame past the cooldown updates `settledLogicalSize`; frames
-    /// inside the cooldown are stashed as `pendingLogicalSize` for the
-    /// `didEndLiveResize` flush. `force: true` bypasses the throttle (onAppear /
-    /// non-resize-driven changes).
+    /// Routes a fresh `RootLayoutMetrics` through the resize throttle. During
+    /// AppKit live window resize we **freeze** `settledLogicalSize` (stash only)
+    /// so the transcript does not reflow every drag frame — that was the lag and
+    /// the sticky bar swimming. Flush happens on `didEndLiveResize`.
     private func applyResize(_ metrics: RootLayoutMetrics, force: Bool) {
         noteRootLayout(metrics)
-        updateSidebarVisibility(for: metrics.logicalSize.width)
+        let inLiveResize = NSApp.keyWindow?.inLiveResize == true
         let now = Date()
-        let emit = force || ResizeThrottle.shouldEmit(now: now, lastEmittedAt: lastResizeEmitAt)
+        let emit = ResizeThrottle.shouldUpdateSettledLayout(
+            force: force,
+            inLiveResize: inLiveResize,
+            now: now,
+            lastEmittedAt: lastResizeEmitAt
+        )
         if emit {
+            updateSidebarVisibility(for: metrics.logicalSize.width)
             settledLogicalSize = metrics.logicalSize
             pendingLogicalSize = nil
             lastResizeEmitAt = now
@@ -159,10 +164,11 @@ struct ContentView: View {
                 category: .ui
             )
         }
-        // TEMP RESIZE DIAG: dump every sizable scroll view on each layout pass
-        // (throttled) to find what is actually relayouting during window resize.
-        // Remove after resize perf is diagnosed.
-        Self.dumpResizeScrollViews()
+        // TEMP RESIZE DIAG: skip during live resize — walking the NSView tree on
+        // every proposal made drag jank worse while we were diagnosing it.
+        if NSApp.keyWindow?.inLiveResize != true {
+            Self.dumpResizeScrollViews()
+        }
     }
 
     // TEMP RESIZE DIAG — delete after root cause is found.

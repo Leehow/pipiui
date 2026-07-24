@@ -43,4 +43,23 @@ public enum ResizeThrottle {
         guard let lastEmittedAt else { return true }
         return now.timeIntervalSince(lastEmittedAt) >= cooldown
     }
+
+    /// Whether the root layout size should propagate into `settledLogicalSize`.
+    ///
+    /// During AppKit live window resize, updating settled size every frame reflows
+    /// the whole transcript (Markdown wrap + sticky bar geometry). That both lags
+    /// and makes chrome like the sticky task bar "swim". Freeze layout until the
+    /// drag ends (`force` / `didEndLiveResize` flush); still apply the cooldown
+    /// when not live-resizing.
+    public static func shouldUpdateSettledLayout(
+        force: Bool,
+        inLiveResize: Bool,
+        now: Date,
+        lastEmittedAt: Date?,
+        cooldown: TimeInterval = defaultCooldown
+    ) -> Bool {
+        if force { return true }
+        if inLiveResize { return false }
+        return shouldEmit(now: now, lastEmittedAt: lastEmittedAt, cooldown: cooldown)
+    }
 }

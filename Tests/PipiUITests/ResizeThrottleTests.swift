@@ -92,4 +92,42 @@ final class ResizeThrottleTests: XCTestCase {
             )
         )
     }
+
+    func testLiveResizeFreezesSettledLayoutUnlessForced() {
+        XCTAssertFalse(
+            ResizeThrottle.shouldUpdateSettledLayout(
+                force: false,
+                inLiveResize: true,
+                now: epoch.addingTimeInterval(1),
+                lastEmittedAt: epoch
+            )
+        )
+        XCTAssertTrue(
+            ResizeThrottle.shouldUpdateSettledLayout(
+                force: true,
+                inLiveResize: true,
+                now: epoch,
+                lastEmittedAt: nil
+            )
+        )
+    }
+
+    func testIdleResizeStillRespectsCooldown() {
+        XCTAssertFalse(
+            ResizeThrottle.shouldUpdateSettledLayout(
+                force: false,
+                inLiveResize: false,
+                now: epoch,
+                lastEmittedAt: epoch
+            )
+        )
+        XCTAssertTrue(
+            ResizeThrottle.shouldUpdateSettledLayout(
+                force: false,
+                inLiveResize: false,
+                now: epoch.addingTimeInterval(cooldown + 0.0001),
+                lastEmittedAt: epoch
+            )
+        )
+    }
 }
