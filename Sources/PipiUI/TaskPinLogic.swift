@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 enum TaskPinLogic {
@@ -47,6 +48,33 @@ enum TaskPinLogic {
             return item
         }
         return nil
+    }
+
+    /// Section sticky: which pinnable user message "owns" the content at the top of the
+    /// viewport (Zed / Hermes style — not always the globally latest task).
+    ///
+    /// - `above`: realized pinnable rows fully above the sticky threshold, with their
+    ///   `maxY` in viewport coordinates (higher = closer to the top edge from above).
+    /// - `anyPinnableVisible`: a pinnable user bubble intersects the content viewport →
+    ///   hide the bar (avoid duplicating a still-on-screen bubble).
+    /// - `truncatedNewestFirst`: pinnable ids trimmed out of the visible suffix (all are
+    ///   above); newest-first so the closest truncated section wins when geometry is empty.
+    /// - `fallbackLatestId`: when nothing is realized above (typical: long session opened
+    ///   at the bottom) but later content exists under the latest task.
+    static func sectionStickyId(
+        above: [(id: String, maxY: CGFloat)],
+        anyPinnableVisible: Bool,
+        truncatedNewestFirst: [String],
+        fallbackLatestId: String?
+    ) -> String? {
+        if anyPinnableVisible { return nil }
+        if let best = above.max(by: { $0.maxY < $1.maxY }) {
+            return best.id
+        }
+        if let truncated = truncatedNewestFirst.first {
+            return truncated
+        }
+        return fallbackLatestId
     }
 
     static func stickyDisplayText(of item: ChatItem, maxChars: Int = 120) -> String {
