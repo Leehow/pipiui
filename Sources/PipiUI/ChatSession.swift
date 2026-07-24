@@ -15,6 +15,33 @@ struct ModelInfo: Identifiable, Hashable {
         let i = modelId.lowercased()
         return p.contains("grok") || p == "xai" || i.contains("grok")
     }
+
+    /// Whether this model is served via a local relay (e.g. `grok-relay` → 127.0.0.1:18891,
+    /// `coding-relay` → 127.0.0.1:18888). Such providers authenticate with a relay token
+    /// whose account is unrelated to any first-party account surface, so their credits
+    /// cannot be read and the pill is suppressed.
+    var isRelayProvider: Bool {
+        provider.lowercased().contains("relay")
+    }
+
+    /// Which first-party account-quota source backs this model, if any.
+    /// `nil` for relay providers and unknown providers → no pill shown.
+    /// Provider id strings come from `pi --list-models` (e.g. `xai`, `zai-coding-cn`,
+    /// `anthropic`, `openai-codex`).
+    var quotaProvider: QuotaProvider? {
+        if isRelayProvider { return nil }
+        let p = provider.lowercased()
+        if p == "xai" || p.contains("grok") { return .grok }
+        if p.contains("zai") || p.contains("zhipu") || p.contains("bigmodel") { return .glm }
+        if p == "anthropic" || p.contains("claude") { return .claude }
+        if p.contains("openai") || p.contains("codex") { return .codex }
+        return nil
+    }
+
+    /// Whether the account-quota pill should be shown for this model.
+    var shouldShowAccountQuota: Bool {
+        quotaProvider != nil
+    }
 }
 
 struct ToolCallBlock: Identifiable, Equatable {
@@ -144,16 +171,20 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Model context window size in tokens.
     @Published var contextWindow: Int?
     @Published var contextPercent: Double?
-    /// Grok/xAI account credit usage 0…100 (nil when unavailable).
+    /// Account credit usage 0…100 of the shown window (nil when unavailable).
     @Published var quotaPercent: Double?
-    /// Compact period label: 周 / 月 / 额.
+    /// Compact period label of the shown window: 周 / 5h / 月 / 额.
     @Published var quotaPeriodLabel: String?
-    /// Tooltip for quota pill: 周额度 / 月额度 / 额度.
+    /// Tooltip for quota pill: 周额度 / 5小时额度 / 额度.
     @Published var quotaPeriodHelp: String?
-    /// Multi-period usage breakdown from Grok billing (empty when unavailable).
-    @Published var periods: [PeriodUsage] = []
-    /// User-selected period typeRaw to show in the capsule (persisted per account).
-    @Published private(set) var selectedPeriodTypeRaw: Int?
+    /// Which provider backs the quota pill (nil = none shown).
+    @Published private(set) var quotaProvider: QuotaProvider?
+    /// All windows the current provider reports (popover lists these).
+    @Published private(set) var quotaWindows: [QuotaWindow] = []
+    /// id of the window currently shown in the capsule (popover checkmark).
+    @Published private(set) var quotaSelectedWindowId: String?
+    /// When the current billing window resets (popover detail).
+    @Published var quotaResetsAt: Date?
     @Published var sessionName: String?
     @Published var sessionFile: String?
     @Published var lastError: String?
@@ -241,8 +272,10 @@ final class ChatSession: ObservableObject, Identifiable {
     // 工具输出分片同样节流：高频 tool_execution_update 直接刷 toolRuns 会拖垮布局
     private var pendingToolRuns: [String: ToolRun] = [:]
     private var toolRunFlushScheduled = false
-    /// Grok quota monitor subscription (shared app-wide cache).
+    /// Per-provider quota monitor subscription (shared app-wide cache per provider).
     private var quotaObserverID: UUID?
+    /// The monitor currently subscribed to (so model switches can unbind/rebind).
+    private var currentQuotaMonitor: QuotaMonitor?
 
     /// Bumped when a new initial `get_messages` load starts; stale background builds are dropped.
     private var initialLoadGeneration: UInt64 = 0
@@ -329,62 +362,77 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     deinit {
-        if let quotaObserverID {
+        if let quotaObserverID, let monitor = currentQuotaMonitor {
             let id = quotaObserverID
+            let mon = monitor
             // deinit may leave the main thread; hop back before touching the monitor.
             DispatchQueue.main.async {
-                GrokQuotaMonitor.shared.removeObserver(id)
+                mon.removeObserver(id)
             }
         }
     }
 
+    /// Bind the quota monitor matching the session's current model provider, if any.
+    /// Called on init, on first `applyState`, and on `setModel`. Idempotent: if
+    /// already bound to the same provider, it does nothing — this avoids a clear +
+    /// re-show flicker when `setModel` then `applyState` both call it in quick
+    /// succession for the same new model.
     private func bindQuotaMonitor() {
-        quotaObserverID = GrokQuotaMonitor.shared.observe { [weak self] snap in
-            guard let self else { return }
-            self.periods = snap?.periods ?? []
-            self.recomputeQuotaDisplay(
-                usedPercent: snap?.usedPercent,
-                periodLabel: snap?.periodLabel ?? "额",
-                periodHelp: snap?.periodHelp ?? "额度"
-            )
-        }
-    }
-
-    /// Derive capsule display (quotaPercent/quotaPeriodLabel) from selected period;
-    /// falls back to highest-usage period, then to the top-level usedPercent.
-    private func recomputeQuotaDisplay(usedPercent: Double?, periodLabel: String, periodHelp: String) {
-        if selectedPeriodTypeRaw == nil,
-           let aid = GrokAuthStore.load()?.accountId, !aid.isEmpty {
-            selectedPeriodTypeRaw = LayoutPersistence.grokQuotaSelectedPeriod(accountId: aid)
-        }
-        quotaPeriodHelp = periodHelp
-        if periods.isEmpty {
-            quotaPercent = usedPercent
-            quotaPeriodLabel = periodLabel
+        let provider = model?.quotaProvider
+        // Already bound to this provider → no-op (preserve selection, no churn).
+        if quotaProvider == provider, currentQuotaMonitor != nil || provider == nil {
+            if provider == nil { applyQuotaSnapshot(nil) }
             return
         }
-        let r = GrokQuotaDisplay.resolve(
-            periods: periods,
-            selected: selectedPeriodTypeRaw,
-            fallbackPercent: usedPercent,
-            fallbackLabel: periodLabel
-        )
-        quotaPercent = r.percent
-        quotaPeriodLabel = r.label
+        unbindQuotaMonitor()
+        guard let provider else {
+            quotaProvider = nil
+            quotaWindows = []
+            applyQuotaSnapshot(nil)
+            return
+        }
+        let monitor = provider.monitor
+        currentQuotaMonitor = monitor
+        quotaProvider = provider
+        // Restore the user's previously-picked window for this provider. Re-read on
+        // every dispatch (not captured once) so selectQuotaWindow's write is honored
+        // by the next poll instead of being clobbered by a stale closure value.
+        quotaObserverID = monitor.observe { [weak self, provider] snap in
+            guard let self else { return }
+            let persisted = LayoutPersistence.quotaSelectedWindow(provider: provider)
+            self.applyQuotaSnapshot(snap?.copy(selectedWindowId: persisted ?? snap?.selectedWindowId))
+        }
     }
 
-    /// User picked a period in the popover → persist per account + refresh capsule.
-    func selectPeriod(typeRaw: Int) {
-        selectedPeriodTypeRaw = typeRaw
-        if let aid = GrokAuthStore.load()?.accountId, !aid.isEmpty {
-            LayoutPersistence.setGrokQuotaSelectedPeriod(typeRaw, accountId: aid)
+    /// Map a snapshot to the published capsule fields, honoring the selected window.
+    private func applyQuotaSnapshot(_ snap: QuotaSnapshot?) {
+        quotaWindows = snap?.windows ?? []
+        let shown = snap?.capsule
+        quotaSelectedWindowId = shown?.id
+        quotaPercent = shown?.usedPercent
+        quotaPeriodLabel = shown?.label
+        quotaPeriodHelp = shown?.title
+        quotaResetsAt = shown?.resetsAt
+    }
+
+    /// User picked a window in the popover → persist per provider + refresh capsule.
+    func selectQuotaWindow(id: String) {
+        guard let provider = quotaProvider else { return }
+        LayoutPersistence.setQuotaSelectedWindow(id, provider: provider)
+        // Apply against the live monitor snapshot.
+        let snap = currentQuotaMonitor?.snapshot?.copy(selectedWindowId: id)
+        applyQuotaSnapshot(snap)
+    }
+
+    private func unbindQuotaMonitor() {
+        if let quotaObserverID, let monitor = currentQuotaMonitor {
+            monitor.removeObserver(quotaObserverID)
         }
-        let snap = GrokQuotaMonitor.shared.snapshot
-        recomputeQuotaDisplay(
-            usedPercent: snap?.usedPercent,
-            periodLabel: snap?.periodLabel ?? "额",
-            periodHelp: snap?.periodHelp ?? "额度"
-        )
+        quotaObserverID = nil
+        currentQuotaMonitor = nil
+        // Clear immediately so a previous provider's value never flashes while the
+        // new provider's snapshot is in flight.
+        applyQuotaSnapshot(nil)
     }
 
     private func nextItemId() -> String {
@@ -519,6 +567,9 @@ final class ChatSession: ObservableObject, Identifiable {
                     contextPercent = min(100.0, Double(t) / Double(w) * 100.0)
                 }
             }
+            // The first applyState reveals the model; bind the matching quota monitor
+            // (idempotent if already bound to the same provider).
+            bindQuotaMonitor()
         }
         thinkingLevel = data["thinkingLevel"].string ?? "off"
         // get_state 与 agent_start 可能交错：只在本地未处于工作态时才采用远端 isStreaming，
@@ -1407,7 +1458,9 @@ final class ChatSession: ObservableObject, Identifiable {
                 self.proc?.request(["type": "get_state"]) { [weak self] r in self?.applyState(r["data"]) }
                 // Authoritative refresh: get_session_stats re-reads current model's window + tokens
                 self.refreshStats()
-                GrokQuotaMonitor.shared.refreshIfNeeded(force: true)
+                // Re-bind quota monitor for the new provider, then force-refresh it.
+                self.bindQuotaMonitor()
+                self.currentQuotaMonitor?.refreshIfNeeded(force: true)
             } else {
                 self.lastError = resp["error"].string ?? "切换模型失败"
             }
@@ -1442,10 +1495,7 @@ final class ChatSession: ObservableObject, Identifiable {
     /// (so restart can spawn without concurrent .jsonl writers).
     func shutdown(onExited: (() -> Void)? = nil) {
         cancelSideChannelTitle()
-        if let quotaObserverID {
-            GrokQuotaMonitor.shared.removeObserver(quotaObserverID)
-            self.quotaObserverID = nil
-        }
+        unbindQuotaMonitor()
         subagents.saveNow()
         guard let proc else {
             onExited?()
@@ -1550,7 +1600,7 @@ extension ChatSession: BuiltinCommandHost {
 
     func runShowSessionStats() {
         // Refresh then flash current snapshot (callbacks update published fields).
-        GrokQuotaMonitor.shared.refreshIfNeeded(force: true)
+        currentQuotaMonitor?.refreshIfNeeded(force: true)
         proc?.request(["type": "get_session_stats"]) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool == true {

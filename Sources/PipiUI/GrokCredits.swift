@@ -206,23 +206,20 @@ struct GrokCreditsSnapshot: Equatable {
 }
 
 enum GrokQuotaDisplay {
-    /// Resolve the capsule's displayed (percent, label) from available periods.
-    /// - If a period is selected (by typeRaw) and present → use it.
-    /// - Else if any periods exist → use the highest-usage one.
-    /// - Else → fallback values.
-    static func resolve(
-        periods: [PeriodUsage],
-        selected typeRaw: Int?,
-        fallbackPercent: Double?,
-        fallbackLabel: String
-    ) -> (percent: Double, label: String) {
-        if let typeRaw, let p = periods.first(where: { $0.typeRaw == typeRaw }) {
-            return (p.percent, p.label)
-        }
-        if let top = periods.max(by: { $0.percent < $1.percent }) {
-            return (top.percent, top.label)
-        }
-        return (fallbackPercent ?? 0, fallbackLabel)
+    /// The footer capsule's (percent, label). Always reflects the top-level account
+    /// credit usage (`usedPercent`) — the real "how much of your Grok credits are
+    /// used" number that grok.com surfaces — labeled by the billing-window duration.
+    ///
+    /// The `periods` array is a *different* dimension (per-rate-limit-window caps),
+    /// so it must never override the capsule; it stays available in the popover as
+    /// auxiliary detail. Returns nil when there is no usage data to show.
+    static func capsule(
+        usedPercent: Double?,
+        periodLabel: String,
+        periods: [PeriodUsage]
+    ) -> (percent: Double, label: String)? {
+        guard let usedPercent else { return nil }
+        return (usedPercent, periodLabel)
     }
 }
 
@@ -615,107 +612,49 @@ enum GrokWebBilling {
 
 /// App-wide Grok credit usage cache. Failures are silent; last good value is kept.
 /// Callers are expected on the main thread (same convention as ChatSession).
-final class GrokQuotaMonitor {
+final class GrokQuotaMonitor: QuotaMonitor {
     static let shared = GrokQuotaMonitor()
 
-    private(set) var snapshot: GrokCreditsSnapshot?
-    private var lastAttemptAt: Date?
-    private var lastSuccessAt: Date?
-    private var inFlight = false
-    private var timer: Timer?
-    private var activeObserver: NSObjectProtocol?
-    private var listeners: [UUID: (GrokCreditsSnapshot?) -> Void] = [:]
+    private let core = QuotaMonitorCore()
 
-    /// Don't hammer the network harder than once per minute.
-    private let minAttemptInterval: TimeInterval = 60
-    /// Consider cache stale after 3 minutes.
-    private let staleAfter: TimeInterval = 3 * 60
-    /// Background poll cadence.
-    private let pollInterval: TimeInterval = 5 * 60
+    /// Raw parsed grok.com response (kept for tests / direct inspection).
+    private(set) var grokSnapshot: GrokCreditsSnapshot?
 
-    private init() {}
+    private init() {
+        core.fetcher = { [weak self] _ in try await self?.fetchGrok() }
+    }
 
-    /// Register for snapshot updates. Immediately receives the cached value (if any).
+    /// Current snapshot in the generic UI shape.
+    var snapshot: QuotaSnapshot? { core.snapshot }
+
     @discardableResult
-    func observe(_ handler: @escaping (GrokCreditsSnapshot?) -> Void) -> UUID {
-        let id = UUID()
-        listeners[id] = handler
-        handler(snapshot)
-        ensureStarted()
-        refreshIfNeeded(force: false)
-        return id
+    func observe(_ handler: @escaping (QuotaSnapshot?) -> Void) -> UUID {
+        core.observe(handler)
     }
 
     func removeObserver(_ id: UUID) {
-        listeners.removeValue(forKey: id)
-    }
-
-    func ensureStarted() {
-        if timer == nil {
-            let t = Timer(timeInterval: pollInterval, repeats: true) { [weak self] _ in
-                self?.refreshIfNeeded(force: false)
-            }
-            RunLoop.main.add(t, forMode: .common)
-            timer = t
-        }
-        if activeObserver == nil {
-            activeObserver = NotificationCenter.default.addObserver(
-                forName: NSApplication.didBecomeActiveNotification,
-                object: nil,
-                queue: .main
-            ) { [weak self] _ in
-                self?.refreshIfNeeded(force: false)
-            }
-        }
+        core.removeObserver(id)
     }
 
     func refreshIfNeeded(force: Bool) {
-        let now = Date()
-        if !force,
-           let lastSuccessAt,
-           now.timeIntervalSince(lastSuccessAt) < staleAfter {
-            return
-        }
-        if !force,
-           let lastAttemptAt,
-           now.timeIntervalSince(lastAttemptAt) < minAttemptInterval {
-            return
-        }
-        guard !inFlight else { return }
-        guard let credentials = GrokAuthStore.load(), !credentials.isExpired else {
-            // Keep last good snapshot; don't clear on missing auth.
-            return
-        }
-        // Team principals often can't read personal credit surface — skip quietly.
-        if credentials.isTeamPrincipal { return }
-
-        inFlight = true
-        lastAttemptAt = now
-        Task { [weak self] in
-            let result: GrokCreditsSnapshot?
-            do {
-                result = try await GrokWebBilling.fetch(credentials: credentials)
-            } catch {
-                result = nil
-            }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.inFlight = false
-                if let result {
-                    self.snapshot = result
-                    self.lastSuccessAt = Date()
-                    self.publish()
-                }
-                // On failure: keep prior cache, no error UI.
-            }
-        }
+        core.refreshIfNeeded(force: force)
     }
 
-    private func publish() {
-        let snap = snapshot
-        for handler in listeners.values {
-            handler(snap)
-        }
+    private func fetchGrok() async throws -> QuotaSnapshot? {
+        guard let credentials = GrokAuthStore.load(), !credentials.isExpired else { return nil }
+        // Team principals often can't read personal credit surface — skip quietly.
+        if credentials.isTeamPrincipal { return nil }
+        let snap = try await GrokWebBilling.fetch(credentials: credentials)
+        self.grokSnapshot = snap
+        // Grok surfaces a single account-credit window (its `periods[]` are rate
+        // limits, a different dimension — not shown as credit windows).
+        return QuotaSnapshot(windows: [QuotaWindow(
+            id: "account",
+            usedPercent: snap.usedPercent,
+            resetsAt: snap.resetsAt,
+            label: snap.periodLabel,
+            title: snap.periodHelp.isEmpty ? "额度" : snap.periodHelp
+        )])
     }
 }
 
