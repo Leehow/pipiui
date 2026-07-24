@@ -57,6 +57,23 @@ final class GrokCreditsTests: XCTestCase {
         XCTAssertEqual(nearEnd.label, "周")
     }
 
+    func testPeriodLabelFiveHour() {
+        let now = Date()
+        // 周期窗口 ~5 小时 → "5小时"
+        let fiveHour = GrokCreditsSnapshot.period(
+            resetsAt: now.addingTimeInterval(5 * 3600),
+            periodStart: now,
+            now: now
+        )
+        XCTAssertEqual(fiveHour.label, "5小时")
+        XCTAssertEqual(fiveHour.help, "5小时额度")
+    }
+
+    func testPeriodUsageIdentityByTypeRaw() {
+        let p = PeriodUsage(typeRaw: 2, label: "周", percent: 38, resetDate: nil)
+        XCTAssertEqual(p.id, 2)
+    }
+
     func testLiveFetchIfAuthPresent() async throws {
         guard let creds = GrokAuthStore.load(), !creds.isExpired else {
             throw XCTSkip("no usable ~/.grok/auth.json")
