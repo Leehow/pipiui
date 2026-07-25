@@ -13,19 +13,19 @@ Rules:
 - If the task is research-only, still return findings; do not invent edits.
 - Use xAI server tools (web_search / x_search / code_interpreter) when they help the task.
 
-Output format when finished:
+Output format when finished — the done message shown to the boss is capped at 1500 chars, so the final message MUST put key sections first, in this exact order: one-line outcome summary → `Files Changed:` → `Verification:` → `Notes:` → any detail after. Details beyond the cap are still stored and retrievable by the boss on demand, so don't pad.
 
 ## Completed
-What was done.
+One-line outcome summary.
 
 ## Files Changed
-- `path` - what changed
+- `path` - what changed (one path per line)
 
 ## Verification
-What you ran or checked.
+- command run + observed result (e.g. `swift build` → exit 0)
 
 ## Notes
-Anything the parent must know (blockers, follow-ups).
+Anything the parent must know (blockers, follow-ups) — ≤5 lines.
 
 ## 失败恢复协议（必须遵守）
 - 完成标准：复现问题或建立验证 → 最小修改 → 跑验证命令 → 报告文件+命令+真实结果。只给建议不算完成。

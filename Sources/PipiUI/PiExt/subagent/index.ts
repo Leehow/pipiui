@@ -209,6 +209,8 @@ interface SingleResult {
 	step?: number;
 	/** PipiUI bridge / completion-signal id */
 	agentId?: string;
+	/** Runtime-attested verify result (set when the brief carried `verify`). */
+	verify?: VerifyAttestation;
 }
 
 interface SubagentDetails {
@@ -230,6 +232,8 @@ interface RunSingleAgentOptions {
 	title?: string;
 	/** Current session model as `provider/id` (depth 0 `ctx.model`); used for「跟随主 Agent」. */
 	sessionModel?: string;
+	/** Shell command the runtime runs in the agent's cwd after the process ends (attested verify). */
+	verify?: string;
 }
 
 /** Format ExtensionAPI ctx.model → `provider/id`. */
@@ -346,10 +350,106 @@ interface WorktreePlacement {
 	worktreeError?: string;
 }
 
-const DONE_RESULT_CAP = 8000;
+// Done-message caps (clean-context orchestration): verdict agents get a tight cap
+// (code is the product; the report is evidence), explore/plan keep a larger one
+// (the report IS the deliverable), errors/aborts always get the error cap.
+const VERDICT_DONE_CAP = 1500;
+const REPORT_DONE_CAP = 6000;
+const ERROR_DONE_CAP = 6000;
 const JOB_RESULT_STORE_CAP = 12000;
 const JOB_RESULT_DISPLAY_CAP = 8000;
 const MAX_JOB_RECORDS = 40;
+
+// ---- Attested verify (system testimony): the runtime runs `verify` in the agent's cwd ----
+const VERIFY_TIMEOUT_MS = 120_000;
+const VERIFY_TAIL_CHARS = 2000;
+const VERIFY_TAIL_LINES = 20;
+const VERIFY_DONE_TAIL_LINES = 12;
+
+interface VerifyAttestation {
+	command: string;
+	exitCode: number | null;
+	timedOut: boolean;
+	tail: string;
+}
+
+function tailText(text: string, maxChars: number, maxLines: number): string {
+	const trimmed = text.replace(/\s+$/g, "");
+	if (!trimmed) return "";
+	const lines = trimmed.split("\n");
+	const sliced = lines.length > maxLines ? lines.slice(-maxLines) : lines;
+	let out = sliced.join("\n");
+	if (out.length > maxChars) out = out.slice(-maxChars);
+	return out;
+}
+
+/** Run `bash -lc <command>` in cwd with a hard timeout; capture combined stdout+stderr tail. */
+function runVerifyCommand(command: string, cwd: string): Promise<VerifyAttestation> {
+	return new Promise((resolve) => {
+		let proc: ReturnType<typeof spawn>;
+		try {
+			proc = spawn("bash", ["-lc", command], {
+				cwd,
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+				env: process.env,
+			});
+		} catch (err) {
+			resolve({
+				command,
+				exitCode: null,
+				timedOut: false,
+				tail: `[verify spawn error: ${err instanceof Error ? err.message : String(err)}]`,
+			});
+			return;
+		}
+		let combined = "";
+		let timedOut = false;
+		const killTimer = setTimeout(() => {
+			timedOut = true;
+			try {
+				proc.kill("SIGTERM");
+			} catch {
+				/* ignore */
+			}
+			setTimeout(() => {
+				try {
+					proc.kill("SIGKILL");
+				} catch {
+					/* ignore */
+				}
+			}, 5000);
+		}, VERIFY_TIMEOUT_MS);
+		proc.stdout?.on("data", (d) => {
+			combined += d.toString();
+		});
+		proc.stderr?.on("data", (d) => {
+			combined += d.toString();
+		});
+		proc.on("error", (err) => {
+			clearTimeout(killTimer);
+			combined += `\n[verify spawn error: ${err.message}]`;
+			resolve({
+				command,
+				exitCode: null,
+				timedOut,
+				tail: tailText(combined, VERIFY_TAIL_CHARS, VERIFY_TAIL_LINES),
+			});
+		});
+		proc.on("close", (code) => {
+			clearTimeout(killTimer);
+			const timeoutNote = `[verify timed out after ${VERIFY_TIMEOUT_MS / 1000}s]`;
+			let tail = tailText(combined, VERIFY_TAIL_CHARS, VERIFY_TAIL_LINES);
+			if (timedOut) tail = tail ? `${tail}\n${timeoutNote}` : timeoutNote;
+			resolve({ command, exitCode: timedOut ? null : code, timedOut, tail });
+		});
+	});
+}
+
+function formatVerifyExit(att: VerifyAttestation): string {
+	if (att.timedOut) return "null (timed out)";
+	return String(att.exitCode ?? "null");
+}
 
 const emptyUsage = (): UsageStats => ({
 	input: 0,
@@ -378,6 +478,8 @@ interface JobRecord {
 	turns?: number;
 	/** Full-ish result text for status-by-id (capped) */
 	resultText?: string;
+	/** Runtime-attested verify (when the brief carried `verify`). */
+	verify?: VerifyAttestation;
 }
 
 const jobRegistry = new Map<string, JobRecord>();
@@ -447,6 +549,7 @@ function jobFinalize(
 		cost?: number;
 		turns?: number;
 		activity?: string;
+		verify?: VerifyAttestation;
 	},
 ): void {
 	if (fields.state === "running") return;
@@ -458,6 +561,7 @@ function jobFinalize(
 		if (existing.cost === undefined && fields.cost !== undefined) existing.cost = fields.cost;
 		if (existing.turns === undefined && fields.turns !== undefined) existing.turns = fields.turns;
 		if (!existing.activity && fields.activity) existing.activity = fields.activity;
+		if (!existing.verify && fields.verify) existing.verify = fields.verify;
 		return;
 	}
 	jobRegistry.set(agentId, {
@@ -474,6 +578,7 @@ function jobFinalize(
 			fields.resultText !== undefined
 				? truncateText(fields.resultText, JOB_RESULT_STORE_CAP)
 				: existing?.resultText,
+		verify: fields.verify ?? existing?.verify,
 	});
 	jobPrune();
 }
@@ -503,6 +608,7 @@ function ensureJobTerminalFromResult(
 		resultText,
 		cost: result.usage.cost,
 		turns: result.usage.turns,
+		verify: result.verify,
 	});
 }
 
@@ -517,7 +623,7 @@ function formatElapsedMs(ms: number): string {
 	return `${h}h${rm}m`;
 }
 
-function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean }): string {
+function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?: boolean }): string {
 	const now = Date.now();
 	if (opts.agentId) {
 		const job = jobRegistry.get(opts.agentId);
@@ -540,10 +646,17 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean }): st
 			`elapsed: ${elapsed}`,
 			`Task: ${job.task || "(none)"}`,
 		];
+		if (job.verify) {
+			lines.push(`Verify: $ ${job.verify.command} → exit ${formatVerifyExit(job.verify)} (attested)`);
+			if (job.verify.tail) {
+				lines.push("Verify tail:", ...job.verify.tail.split("\n").map((l) => `  ${l}`));
+			}
+		}
 		if (job.state === "running") {
 			lines.push(`activity: ${job.activity || "(starting/idle)"}`);
 		} else {
-			const result = truncateText(job.resultText || "(no result stored)", JOB_RESULT_DISPLAY_CAP);
+			const stored = job.resultText || "(no result stored)";
+			const result = opts.full ? stored : truncateText(stored, JOB_RESULT_DISPLAY_CAP);
 			lines.push("Result:", result);
 		}
 		return lines.join("\n");
@@ -834,8 +947,12 @@ function resolveSubagentWorktree(opts: {
 	};
 }
 
-function truncateDoneOutput(output: string, cap = DONE_RESULT_CAP): string {
-	return truncateText(output, cap);
+/** Done-message cap by agent name; error/abort overrides to ERROR_DONE_CAP. */
+function doneCapForAgent(agentName: string, isError: boolean): number {
+	if (isError) return ERROR_DONE_CAP;
+	if (agentName === "explore" || agentName === "plan") return REPORT_DONE_CAP;
+	// general-purpose / reviewer / lead, and the default for unknown names
+	return VERDICT_DONE_CAP;
 }
 
 function formatSubagentDoneMessage(
@@ -844,18 +961,50 @@ function formatSubagentDoneMessage(
 ): string {
 	const aborted = extra?.aborted ?? result.stopReason === "aborted";
 	const ok = !isFailedResult(result) && !aborted && !extra?.error;
-	const output = truncateDoneOutput(
+	const isError = aborted || Boolean(extra?.error) || isFailedResult(result);
+	const att = result.verify;
+	// `ok` stays process-level; `verified` reflects only the runtime-attested verify command.
+	// Abort/error short-circuits to none — no testimony was gathered for a synthesized failure.
+	const verified: "pass" | "fail" | "none" =
+		aborted || extra?.error || !att ? "none" : !att.timedOut && att.exitCode === 0 ? "pass" : "fail";
+	const output = truncateText(
 		extra?.error || getResultOutput(result) || result.stderr || "(no output)",
+		doneCapForAgent(result.agent, isError),
 	);
 	const cost =
 		typeof result.usage.cost === "number" ? result.usage.cost.toFixed(4) : String(result.usage.cost ?? 0);
-	return [
-		`[subagent-done] agentId=${result.agentId ?? "?"} name=${result.agent} ok=${ok} aborted=${aborted} cost=${cost} turns=${result.usage.turns ?? 0}`,
-		"",
-		`Task: ${result.task}`,
+	const title = result.title?.trim() || (result.task.split("\n")[0] ?? "").trim() || "(untitled)";
+	const lines = [
+		`[subagent-done] agentId=${result.agentId ?? "?"} name=${result.agent} ok=${ok} verified=${verified} cost=${cost} turns=${result.usage.turns ?? 0}`,
+		`Title: ${title}`,
+	];
+	if (verified === "none") {
+		lines.push("Verification: worker-claimed only (no verify in brief)");
+	} else if (att) {
+		lines.push(`Verify: $ ${att.command} → exit ${formatVerifyExit(att)} (attested)`);
+		for (const tailLine of att.tail.split("\n").slice(-VERIFY_DONE_TAIL_LINES)) {
+			lines.push(`  ${tailLine}`);
+		}
+	}
+	lines.push(
 		"Result:",
 		output,
-	].join("\n");
+		`Full report: subagent_status({agentId:"${result.agentId ?? "?"}", full:true})`,
+	);
+	return lines.join("\n");
+}
+
+/** Per-step attested verify blocks for chain results: `Verify[i/n]: $ ... → exit N (attested)`. */
+function formatChainVerifyPrefix(results: SingleResult[]): string {
+	const lines: string[] = [];
+	results.forEach((r, i) => {
+		if (!r.verify) return;
+		lines.push(`Verify[${i + 1}/${results.length}]: $ ${r.verify.command} → exit ${formatVerifyExit(r.verify)} (attested)`);
+		for (const tailLine of r.verify.tail.split("\n").slice(-VERIFY_DONE_TAIL_LINES)) {
+			lines.push(`  ${tailLine}`);
+		}
+	});
+	return lines.length > 0 ? `${lines.join("\n")}\n` : "";
 }
 
 function deliverSubagentDone(pi: ExtensionAPI, text: string): void {
@@ -1270,6 +1419,12 @@ async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
+		// Attested verify: runs AFTER the agent process exits and BEFORE the "end" report,
+		// because Swift auto-merges and removes the worktree on "end". Skipped on abort
+		// (user interrupted; don't block up to VERIFY_TIMEOUT_MS on a dead task).
+		if (options?.verify && options.verify.trim() && !wasAborted) {
+			currentResult.verify = await runVerifyCommand(options.verify.trim(), spawnCwd);
+		}
 		const endOk = exitCode === 0 && !currentResult.errorMessage && !wasAborted;
 		if (wasAborted) currentResult.stopReason = currentResult.stopReason ?? "aborted";
 		pipiuiReport({
@@ -1285,6 +1440,12 @@ async function runSingleAgent(
 			...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
 			...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
 			...(placement.worktreeError ? { worktreeError: placement.worktreeError } : {}),
+			...(currentResult.verify
+				? {
+						verifyCommand: currentResult.verify.command,
+						verifyExit: currentResult.verify.timedOut ? -1 : (currentResult.verify.exitCode ?? -1),
+					}
+				: {}),
 		});
 		// Terminal job state before notify/return so status works even if follow-up delivery fails.
 		const endState: JobState = wasAborted ? "aborted" : endOk ? "ok" : "failed";
@@ -1298,6 +1459,7 @@ async function runSingleAgent(
 			cost: currentResult.usage.cost,
 			turns: currentResult.usage.turns,
 			activity: pipiuiActivity,
+			verify: currentResult.verify,
 		});
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
@@ -1317,6 +1479,9 @@ async function runSingleAgent(
 	}
 }
 
+const VERIFY_PARAM_DESCRIPTION =
+	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Boss must fill this for implementation tasks.";
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
@@ -1327,6 +1492,7 @@ const TaskItem = Type.Object({
 		}),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 });
 
 const ChainItem = Type.Object({
@@ -1339,6 +1505,7 @@ const ChainItem = Type.Object({
 		}),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -1355,13 +1522,14 @@ const SubagentParams = Type.Object({
 				"Short one-line title shown in the Subagents panel list instead of the full task (single mode); omit to fall back to task text",
 		}),
 	),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task, title?} for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
+	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task, title?, cwd?, verify?} for parallel execution" })),
+	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task, title?, cwd?, verify?} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	background: Type.Optional(
 		Type.Boolean({
 			description:
@@ -1383,13 +1551,20 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			agentId: Type.Optional(Type.String({ description: "If set, return this job only with fuller Result text." })),
 			onlyRunning: Type.Optional(Type.Boolean({ description: "If true, only running jobs. Default false." })),
+			full: Type.Optional(
+				Type.Boolean({
+					description:
+						"If true (with agentId), return the job's full stored result text without display truncation. Default false.",
+				}),
+			),
 		}),
 		async execute(_toolCallId, params) {
 			const text = formatJobsStatus({
 				agentId: params.agentId,
 				onlyRunning: params.onlyRunning === true,
+				full: params.full === true,
 			});
-			return { content: [{ type: "text", text }] };
+			return { content: [{ type: "text", text }], details: null };
 		},
 	});
 
@@ -1462,6 +1637,7 @@ export default function (pi: ExtensionAPI) {
 				agentId: string,
 				mode: "single" | "parallel",
 				title: string | undefined,
+				verify: string | undefined,
 			): void => {
 				void runSingleAgent(
 					ctx.cwd,
@@ -1473,7 +1649,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ background: true, agentId, title, sessionModel },
+					{ background: true, agentId, title, sessionModel, verify },
 				)
 					.then((result) => {
 						notifySubagentDone(pi, result);
@@ -1589,7 +1765,7 @@ export default function (pi: ExtensionAPI) {
 						chainUpdate,
 						makeDetails("chain"),
 
-						{ title: step.title, sessionModel },
+						{ title: step.title, sessionModel, verify: step.verify },
 					);
 					results.push(result);
 
@@ -1600,7 +1776,7 @@ export default function (pi: ExtensionAPI) {
 							content: [
 								{
 									type: "text",
-									text: `${bgIgnoredWarning}Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}`,
+									text: `${bgIgnoredWarning}${formatChainVerifyPrefix(results)}Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}`,
 								},
 							],
 							details: makeDetails("chain")(results),
@@ -1609,13 +1785,17 @@ export default function (pi: ExtensionAPI) {
 					}
 					previousOutput = getFinalOutput(result.messages);
 				}
+				const lastChainResult = results[results.length - 1];
+				// Chain aggregated output = final step output; capped by that agent's done cap.
+				const chainOutput = truncateText(
+					getFinalOutput(lastChainResult.messages) || "(no output)",
+					doneCapForAgent(lastChainResult.agent, false),
+				);
 				return {
 					content: [
 						{
 							type: "text",
-							text:
-								bgIgnoredWarning +
-								(getFinalOutput(results[results.length - 1].messages) || "(no output)"),
+							text: bgIgnoredWarning + formatChainVerifyPrefix(results) + chainOutput,
 						},
 					],
 					details: makeDetails("chain")(results),
@@ -1688,7 +1868,7 @@ export default function (pi: ExtensionAPI) {
 								undefined, // no parent abort binding
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ background: true, agentId, title: t.title, sessionModel },
+								{ background: true, agentId, title: t.title, sessionModel, verify: t.verify },
 							);
 							notifySubagentDone(pi, result);
 							return result;
@@ -1770,7 +1950,7 @@ export default function (pi: ExtensionAPI) {
 						},
 						makeDetails("parallel"),
 
-						{ title: t.title, sessionModel },
+						{ title: t.title, sessionModel, verify: t.verify },
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -1815,7 +1995,7 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 					const agentId = generatePipiuiAgentId();
-					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title);
+					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify);
 					const placeholder: SingleResult = {
 						agent: params.agent,
 						agentId,
@@ -1854,7 +2034,7 @@ export default function (pi: ExtensionAPI) {
 					onUpdate,
 					makeDetails("single"),
 
-					{ title: params.title, sessionModel },
+					{ title: params.title, sessionModel, verify: params.verify },
 				);
 				const isError = isFailedResult(result);
 				if (isError) {
