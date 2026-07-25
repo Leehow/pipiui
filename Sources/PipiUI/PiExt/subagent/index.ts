@@ -524,6 +524,77 @@ interface JobRecord {
 
 const jobRegistry = new Map<string, JobRecord>();
 
+// ---- Stall watchdog + abort：运行中后台 job 的外部可触达句柄 ----
+const STALL_THRESHOLD_MS = 120_000;
+const STALL_WATCHDOG_INTERVAL_MS = 30_000;
+
+interface RunningAgentHandle {
+	/** 外部中止入口（action=abort / subagent_abort 命令）；走 killProc SIGTERM→SIGKILL。 */
+	controller: AbortController;
+	name: string;
+	task: string;
+	title?: string;
+	/** 最后一次有任何流式事件/输出（stdout/stderr）的时间戳。 */
+	lastActivityAt: number;
+	/** 当前卡死片段是否已推送过（有新活动后重新武装）。 */
+	stallNotified: boolean;
+}
+
+/** 仅后台 job 注册；前台 job 由工具调用自身的 abort signal 负责。 */
+const runningAgents = new Map<string, RunningAgentHandle>();
+
+function noteAgentActivity(agentId: string): void {
+	const handle = runningAgents.get(agentId);
+	if (!handle) return;
+	handle.lastActivityAt = Date.now();
+	handle.stallNotified = false;
+}
+
+function stalledInfoFor(agentId: string, now: number): { stalled: boolean; idleSec: number } {
+	const handle = runningAgents.get(agentId);
+	if (!handle) return { stalled: false, idleSec: 0 };
+	const idleSec = Math.max(0, Math.floor((now - handle.lastActivityAt) / 1000));
+	return { stalled: idleSec * 1000 >= STALL_THRESHOLD_MS, idleSec };
+}
+
+function formatJobStateWithStall(job: JobRecord, now: number): string {
+	if (job.state !== "running") return job.state;
+	const info = stalledInfoFor(job.agentId, now);
+	return info.stalled ? `running (stalled, idle ${info.idleSec}s)` : "running";
+}
+
+/**
+ * 中止运行中的后台 job：触发其 AbortController → killProc（SIGTERM，5s 后未退出则 SIGKILL）。
+ * job 以 aborted 结束并正常推 [subagent-done]。agentId 不存在/已结束返回明确错误。
+ */
+function abortRunningAgent(agentId: string): { ok: boolean; message: string } {
+	const job = jobRegistry.get(agentId);
+	if (job && job.state !== "running") {
+		return {
+			ok: false,
+			message: `Cannot abort agentId=${agentId}: job already finished with state "${job.state}".`,
+		};
+	}
+	const handle = runningAgents.get(agentId);
+	if (!handle) {
+		if (!job) {
+			return {
+				ok: false,
+				message: `Cannot abort agentId=${agentId}: unknown agentId (no such job in this session process).`,
+			};
+		}
+		return {
+			ok: false,
+			message: `Cannot abort agentId=${agentId}: job is running but has no abort handle (already finishing?).`,
+		};
+	}
+	handle.controller.abort();
+	return {
+		ok: true,
+		message: `Abort requested for agentId=${agentId} (${handle.name}). SIGTERM sent (SIGKILL after 5s if still alive); the job will report [subagent-done] with aborted status.`,
+	};
+}
+
 function truncateText(text: string, cap: number): string {
 	if (text.length <= cap) return text;
 	return text.slice(-cap);
@@ -691,7 +762,7 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 			`agentId: ${job.agentId}`,
 			`name: ${job.name}`,
 			...(job.title ? [`title: ${job.title}`] : []),
-			`state: ${job.state}`,
+			`state: ${formatJobStateWithStall(job, now)}`,
 			`turns: ${turns}`,
 			`cost: ${cost}`,
 			`elapsed: ${elapsed}`,
@@ -745,7 +816,7 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 				? j.activity || j.task || ""
 				: j.resultText || j.task || "";
 		const preview = previewRaw.replace(/\s+/g, " ").trim().slice(0, 80);
-		return `| ${j.agentId} | ${j.name} | ${j.state} | ${turns} | ${cost} | ${elapsed} | ${preview || "-"} |`;
+		return `| ${j.agentId} | ${j.name} | ${formatJobStateWithStall(j, now)} | ${turns} | ${cost} | ${elapsed} | ${preview || "-"} |`;
 	});
 	return [header, sep, ...rows].join("\n");
 }
@@ -1284,6 +1355,20 @@ async function runSingleAgent(
 		...(placement.worktreeError ? { worktreeError: placement.worktreeError } : {}),
 	});
 	jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title);
+	// 后台 job：注册外部可触达的 AbortController（subagent_abort / action=abort 入口），
+	// 同一句柄也是 stall watchdog 的活动时间戳载体。前台 job 不注册（父 abort 已可杀）。
+	let backgroundAbort: AbortController | undefined;
+	if (isBackground) {
+		backgroundAbort = new AbortController();
+		runningAgents.set(pipiuiAgentId, {
+			controller: backgroundAbort,
+			name: agentName,
+			task,
+			title: options?.title,
+			lastActivityAt: Date.now(),
+			stallNotified: false,
+		});
+	}
 	const pipiuiUpdate = (force = false) => {
 		const now = Date.now();
 		if (!force && now - pipiuiLastUpdate < 500) return;
@@ -1446,6 +1531,7 @@ async function runSingleAgent(
 			};
 
 			proc.stdout.on("data", (data) => {
+				if (isBackground) noteAgentActivity(pipiuiAgentId);
 				buffer += data.toString();
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
@@ -1453,6 +1539,7 @@ async function runSingleAgent(
 			});
 
 			proc.stderr.on("data", (data) => {
+				if (isBackground) noteAgentActivity(pipiuiAgentId);
 				currentResult.stderr += data.toString();
 			});
 
@@ -1465,16 +1552,23 @@ async function runSingleAgent(
 				resolve(1);
 			});
 
-			if (signal) {
+			// 后台 job 用外部可触达的 backgroundAbort（subagent_abort）；前台沿用工具调用 signal。
+			const effectiveSignal = signal ?? backgroundAbort?.signal;
+			if (effectiveSignal) {
+				let procExited = false;
+				proc.on("close", () => {
+					procExited = true;
+				});
 				const killProc = () => {
 					wasAborted = true;
 					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
+					const forceKill = setTimeout(() => {
+						if (!procExited) proc.kill("SIGKILL");
 					}, 5000);
+					forceKill.unref?.();
 				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
+				if (effectiveSignal.aborted) killProc();
+				else effectiveSignal.addEventListener("abort", killProc, { once: true });
 			}
 		});
 
@@ -1528,6 +1622,7 @@ async function runSingleAgent(
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
+		if (isBackground) runningAgents.delete(pipiuiAgentId);
 		if (tmpPromptPath)
 			try {
 				fs.unlinkSync(tmpPromptPath);
@@ -1578,6 +1673,15 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 });
 
 const SubagentParams = Type.Object({
+	action: Type.Optional(
+		StringEnum(["abort"] as const, {
+			description:
+				'Optional action instead of dispatching. "abort": terminate a running background job (requires agentId); the job still reports [subagent-done] with aborted status.',
+		}),
+	),
+	agentId: Type.Optional(
+		Type.String({ description: 'Target background job id for action="abort".' }),
+	),
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	title: Type.Optional(
@@ -1603,6 +1707,62 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	// ---- Stall watchdog：后台 job 超过 120s 无任何流式事件/输出 → 向 boss 会话推一条 ----
+	// [subagent-stalled] agentId=<id> title=<title> idle=<秒>s last=<最后一行动作摘要>
+	// 每个卡死片段只推一次（有新活动后重新武装）；复用 [subagent-done] 的 followUp 通道。
+	// 30s interval 扫描；无 PIPIUI_* 环境变量时桥接上报自动静默（pipiuiReport no-op）。
+	const STALL_WATCHDOG_KEY = "__pipiuiSubagentStallWatchdog";
+	const g = globalThis as Record<string, unknown>;
+	const prevWatchdog = g[STALL_WATCHDOG_KEY] as ReturnType<typeof setInterval> | undefined;
+	if (prevWatchdog) clearInterval(prevWatchdog); // 防扩展 reload 后旧定时器泄漏
+	const stallWatchdog = setInterval(() => {
+		const now = Date.now();
+		for (const [agentId, handle] of runningAgents) {
+			if (handle.stallNotified) continue;
+			const idleMs = now - handle.lastActivityAt;
+			if (idleMs < STALL_THRESHOLD_MS) continue;
+			handle.stallNotified = true;
+			const idleSec = Math.floor(idleMs / 1000);
+			const job = jobRegistry.get(agentId);
+			const title =
+				handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 80) || "(untitled)";
+			const activityRaw = job?.activity?.trim() || "";
+			const lastLine = (activityRaw.split("\n").pop() ?? "").trim().slice(0, 120) || "(no activity)";
+			deliverSubagentDone(
+				pi,
+				`[subagent-stalled] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine}`,
+			);
+			pipiuiReport({
+				kind: "stalled",
+				agentId,
+				stalled: true,
+				idle: idleSec,
+				activity: lastLine,
+			});
+		}
+	}, STALL_WATCHDOG_INTERVAL_MS);
+	stallWatchdog.unref?.();
+	g[STALL_WATCHDOG_KEY] = stallWatchdog;
+	// 进程退出时清理定时器（unref 已保证不拖住退出；这里是显式清理）。
+	process.on("exit", () => {
+		clearInterval(stallWatchdog);
+		if (g[STALL_WATCHDOG_KEY] === stallWatchdog) delete g[STALL_WATCHDOG_KEY];
+	});
+
+	// ---- RPC 命令：GUI 经 {"type":"prompt","message":"/subagent_abort <agentId>"} 调用 ----
+	pi.registerCommand("subagent_abort", {
+		description: "Abort a running background subagent: /subagent_abort <agentId> (PipiUI)",
+		handler: async (args, ctx) => {
+			const agentId = (args ?? "").trim();
+			if (!agentId) {
+				ctx.ui.notify("Usage: /subagent_abort <agentId>", "error");
+				return;
+			}
+			const result = abortRunningAgent(agentId);
+			ctx.ui.notify(result.message, result.ok ? "info" : "error");
+		},
+	});
+
 	pi.registerTool({
 		name: "subagent_status",
 		label: "Subagent Status",
@@ -1641,6 +1801,8 @@ export default function (pi: ExtensionAPI) {
 			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
 			"By default each agent writes in an isolated git worktree under .pi/worktrees/ on a pipiui/* branch; pass explicit cwd or set PIPIUI_WORKTREE=0 to disable. On successful end the app auto-merges into the main project and removes the worktree (silent on success). If merge fails, the main session receives [worktree-merge-failed] for the boss to resolve; failed/aborted keeps worktree for resume (GUI merge/discard fallback).",
 			"Track jobs with subagent_status(agentId?). Never re-spawn a finished task without reading its result via [subagent-done] or subagent_status.",
+			'Abort a running background job with action:"abort" + agentId (equivalent to /subagent_abort); it ends as aborted and still reports [subagent-done].',
+			"Background jobs with no output for 120s are pushed as [subagent-stalled] and marked stalled (with idle seconds) in subagent_status.",
 			"Do not busy-loop poll; one status check per decision is correct.",
 			"chain and nested (depth>0) are always synchronous. Set background:false to await a single/parallel result.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
@@ -1693,6 +1855,26 @@ export default function (pi: ExtensionAPI) {
 					...(extra?.background ? { background: true } : {}),
 					...(extra?.agentIds ? { agentIds: extra.agentIds } : {}),
 				});
+
+			// action=abort：中止运行中的后台 job（不占 single/parallel/chain 的 mode 名额）
+			if (params.action === "abort") {
+				const target = params.agentId?.trim();
+				if (!target) {
+					return {
+						content: [
+							{ type: "text", text: 'action="abort" requires agentId of a running background job.' },
+						],
+						details: makeDetails("single")([]),
+						isError: true,
+					};
+				}
+				const abortResult = abortRunningAgent(target);
+				return {
+					content: [{ type: "text", text: abortResult.message }],
+					details: makeDetails("single")([]),
+					isError: !abortResult.ok,
+				};
+			}
 
 			const startBackgroundAgent = (
 				agentName: string,
@@ -2143,6 +2325,15 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme, _context) {
+			if (args.action === "abort") {
+				return new Text(
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+						theme.fg("warning", "abort ") +
+						theme.fg("accent", args.agentId || "?"),
+					0,
+					0,
+				);
+			}
 			const scope: AgentScope = args.agentScope ?? "user";
 			if (args.chain && args.chain.length > 0) {
 				let text =
