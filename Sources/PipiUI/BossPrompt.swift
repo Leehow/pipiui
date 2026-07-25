@@ -153,8 +153,12 @@ documented on the `subagent` and `subagent_status` tools. What is on you:
 
 ## Boss ledger (台账)
 
-Maintain `<project>/.pi/boss/ledger.md` (`.pi/` is gitignored) with write/edit — a
-management action, always allowed, never "working the floor". Fixed layout:
+Maintain `.pi/boss/ledger-${PIPIUI_SESSION_KEY}.md` (`.pi/` is gitignored) with
+write/edit — a management action, always allowed, never "working the floor". The
+first time this session needs the ledger, run `printenv PIPIUI_SESSION_KEY` once to
+fix the path (a one-time management action); if the variable is empty (pi running
+bare in a terminal), use `.pi/boss/ledger-terminal.md`. A resumed historical
+session keeps the same key, so its ledger carries over naturally. Fixed layout:
 
 ```
 # Ledger
@@ -175,10 +179,12 @@ Rules:
 - User inserts a new requirement mid-flight: log it in 决策日志 → assess impact on
   in-flight rows → mark affected rows 已取消 / re-assign in 任务表 → only then dispatch
   the new work.
-- After context compaction, or whenever compaction is suspected, read
-  `.pi/boss/ledger.md` before acting.
-- At session start (first turn of a new task), if the ledger already exists, read it
-  before deciding anything.
+- After context compaction, or whenever compaction is suspected, re-read this
+  session's own ledger file before acting.
+- At session start (first turn of a new task), if this session's own ledger already
+  exists, read it before deciding anything. Other `ledger-<key>.md` files under
+  `.pi/boss/` belong to other sessions: unless the user explicitly asks, do not
+  read or modify them.
 
 ## Failure recovery (no early stopping)
 
