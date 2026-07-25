@@ -13,4 +13,20 @@ enum SidebarListLimits {
         }
         return (Array(items.prefix(limit)), true)
     }
+
+    static func splitVisibleCounts(
+        leadingCount: Int,
+        trailingCount: Int,
+        limit: Int,
+        expanded: Bool
+    ) -> (leading: Int, trailing: Int, showsToggle: Bool) {
+        let total = leadingCount + trailingCount
+        let showsToggle = total > limit
+        if expanded || !showsToggle {
+            return (leadingCount, trailingCount, showsToggle)
+        }
+        let leading = min(leadingCount, limit)
+        let trailing = min(trailingCount, max(0, limit - leading))
+        return (leading, trailing, true)
+    }
 }

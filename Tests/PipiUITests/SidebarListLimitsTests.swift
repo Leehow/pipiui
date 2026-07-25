@@ -34,4 +34,16 @@ final class SidebarListLimitsTests: XCTestCase {
         XCTAssertTrue(out.items.isEmpty)
         XCTAssertFalse(out.showsToggle)
     }
+
+    func testSplitVisibleCounts() {
+        let out = SidebarListLimits.splitVisibleCounts(
+            leadingCount: 3,
+            trailingCount: 20,
+            limit: 20,
+            expanded: false
+        )
+        XCTAssertEqual(out.leading, 3)
+        XCTAssertEqual(out.trailing, 17)
+        XCTAssertTrue(out.showsToggle)
+    }
 }
