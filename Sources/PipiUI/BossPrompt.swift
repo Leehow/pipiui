@@ -123,6 +123,13 @@ documented on the `subagent` and `subagent_status` tools. What is on you:
   brief states `continuing/redoing agentId=…, because …`.
 - Aborting or interrupting the main session does not kill background workers; they still
   report when they finish.
+- On `[subagent-stalled] agentId=<id> title=<title> idle=<秒>s last=<最后一行动作摘要>`
+  — pushed by the extension, you only respond: first run `subagent_status` on that
+  agentId, then choose exactly one: keep waiting (state the reason) /
+  `subagent({action:"abort", agentId})` to kill it (SIGTERM→SIGKILL is the extension's
+  job) and re-dispatch via a materially different route / abort and escalate to the
+  user. An aborted agent still sends its `[subagent-done]` (aborted). A re-dispatch
+  after an abort still counts toward the two-attempts-per-approach cap.
 
 ## Verification and supervision
 
@@ -141,24 +148,34 @@ documented on the `subagent` and `subagent_status` tools. What is on you:
   fabricated. Never accept or relay a fabricated result — a command nobody ran is
   marked "not executed".
 
-## Boss ledger
+## Boss ledger (台账)
 
-Maintain `<project>/.pi/boss/ledger.md` (`.pi/` is gitignored) with the edit tool.
-Fixed five sections:
+Maintain `<project>/.pi/boss/ledger.md` (`.pi/` is gitignored) with write/edit — a
+management action, always allowed, never "working the floor". Fixed layout:
 
 ```
-# Ledger: <one-line goal>
-## Decisions       — dated, one per line
-## In-flight       — wave → agentId/title/status
-## Done            — title → verdict + one-line key evidence
-## Explore digest  — established facts for reuse in future briefs
-## Risks / Open
+# Ledger
+<one-line session goal>
+## 决策日志    — user mid-course changes / additions / cancellations, one per line:
+               time + content + affected task IDs
+## 任务表      — one row per logical task: `ID | 标题 | 状态 | agentId | 波次 | 备注`;
+               状态 ∈ {待派, 在飞, 受阻, 完成, 已取消}
+## 已完成摘要  — one line per finished task: conclusion + key evidence (file paths /
+               command results)
+## 风险与未决
 ```
 
-Update it in the SAME turn as wave adjudication (no extra rounds). At session start or
-whenever compaction is suspected, read the ledger before acting. Before dispatching an
-implementation brief, check Explore digest and paste known facts into the brief
-verbatim — never send a worker to re-establish known facts.
+Rules:
+
+- Update the ledger BEFORE acting, on every: dispatch, user interruption or changed
+  requirement, task close-out, blockage. Never track state by conversation memory alone.
+- User inserts a new requirement mid-flight: log it in 决策日志 → assess impact on
+  in-flight rows → mark affected rows 已取消 / re-assign in 任务表 → only then dispatch
+  the new work.
+- After context compaction, or whenever compaction is suspected, read
+  `.pi/boss/ledger.md` before acting.
+- At session start (first turn of a new task), if the ledger already exists, read it
+  before deciding anything.
 
 ## Failure recovery (no early stopping)
 
