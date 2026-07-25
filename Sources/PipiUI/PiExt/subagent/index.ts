@@ -211,6 +211,8 @@ interface SingleResult {
 	agentId?: string;
 	/** Runtime-attested verify result (set when the brief carried `verify`). */
 	verify?: VerifyAttestation;
+	/** Brief carried `verify` but it was not run because the agent was aborted. */
+	verifySkipped?: boolean;
 }
 
 interface SubagentDetails {
@@ -365,6 +367,9 @@ const VERIFY_TIMEOUT_MS = 120_000;
 const VERIFY_TAIL_CHARS = 2000;
 const VERIFY_TAIL_LINES = 20;
 const VERIFY_DONE_TAIL_LINES = 12;
+/** Rolling collection cap while verify runs: retain only this tail so a chatty
+ * command cannot buffer unbounded output for up to VERIFY_TIMEOUT_MS. */
+const VERIFY_COLLECT_TAIL_CHARS = 64 * 1024;
 
 interface VerifyAttestation {
 	command: string;
@@ -388,9 +393,13 @@ function runVerifyCommand(command: string, cwd: string): Promise<VerifyAttestati
 	return new Promise((resolve) => {
 		let proc: ReturnType<typeof spawn>;
 		try {
+			// detached: own process group so a timeout can SIGKILL the whole group —
+			// grandchildren holding the stdout pipe must not delay `close` (verify is
+			// awaited before the "end" report, so a stuck descendant blocks done+merge).
 			proc = spawn("bash", ["-lc", command], {
 				cwd,
 				shell: false,
+				detached: true,
 				stdio: ["ignore", "pipe", "pipe"],
 				env: process.env,
 			});
@@ -405,30 +414,43 @@ function runVerifyCommand(command: string, cwd: string): Promise<VerifyAttestati
 		}
 		let combined = "";
 		let timedOut = false;
+		// Rolling tail buffer: never retain more than VERIFY_COLLECT_TAIL_CHARS.
+		const appendChunk = (chunk: string) => {
+			combined += chunk;
+			if (combined.length > VERIFY_COLLECT_TAIL_CHARS) {
+				combined = combined.slice(-VERIFY_COLLECT_TAIL_CHARS);
+			}
+		};
 		const killTimer = setTimeout(() => {
 			timedOut = true;
 			try {
-				proc.kill("SIGTERM");
+				if (proc.pid !== undefined) process.kill(-proc.pid, "SIGKILL");
+				else proc.kill("SIGKILL");
 			} catch {
-				/* ignore */
-			}
-			setTimeout(() => {
+				// Group kill failed (e.g. process already gone) — fall back to the direct pid.
 				try {
 					proc.kill("SIGKILL");
 				} catch {
 					/* ignore */
 				}
-			}, 5000);
+			}
+			// Destroy stdio so `close` fires even if a descendant still holds the pipes.
+			try {
+				proc.stdout?.destroy();
+				proc.stderr?.destroy();
+			} catch {
+				/* ignore */
+			}
 		}, VERIFY_TIMEOUT_MS);
 		proc.stdout?.on("data", (d) => {
-			combined += d.toString();
+			appendChunk(d.toString());
 		});
 		proc.stderr?.on("data", (d) => {
-			combined += d.toString();
+			appendChunk(d.toString());
 		});
 		proc.on("error", (err) => {
 			clearTimeout(killTimer);
-			combined += `\n[verify spawn error: ${err.message}]`;
+			appendChunk(`\n[verify spawn error: ${err.message}]`);
 			resolve({
 				command,
 				exitCode: null,
@@ -449,6 +471,24 @@ function runVerifyCommand(command: string, cwd: string): Promise<VerifyAttestati
 function formatVerifyExit(att: VerifyAttestation): string {
 	if (att.timedOut) return "null (timed out)";
 	return String(att.exitCode ?? "null");
+}
+
+/** `Verify: $ ... → exit N (attested)` line for a runtime attestation. */
+function formatVerifyLine(att: VerifyAttestation): string {
+	return `Verify: $ ${att.command} → exit ${formatVerifyExit(att)} (attested)`;
+}
+
+/**
+ * `verified` tri-state shared by done messages and foreground aggregates.
+ * Abort/error short-circuits to none — no testimony was gathered for a synthesized failure.
+ */
+function verifiedStateFor(
+	result: SingleResult,
+	extra?: { aborted?: boolean; error?: string | boolean },
+): "pass" | "fail" | "none" {
+	const aborted = extra?.aborted ?? result.stopReason === "aborted";
+	const att = result.verify;
+	return aborted || extra?.error || !att ? "none" : !att.timedOut && att.exitCode === 0 ? "pass" : "fail";
 }
 
 const emptyUsage = (): UsageStats => ({
@@ -487,6 +527,17 @@ const jobRegistry = new Map<string, JobRecord>();
 function truncateText(text: string, cap: number): string {
 	if (text.length <= cap) return text;
 	return text.slice(-cap);
+}
+
+/**
+ * Head-keeping truncation for done-message Results: worker templates put the key
+ * sections (summary / Files / Verification / Notes) FIRST, so keep the head and
+ * mark the omission in the same bracketed style as truncateParallelOutput.
+ * (Shared truncateText stays tail-keeping for callers that rely on it.)
+ */
+function truncateTextHead(text: string, cap: number): string {
+	if (text.length <= cap) return text;
+	return `${text.slice(0, cap)}\n\n[Output truncated: ${text.length - cap} chars omitted.]`;
 }
 
 function taskSummary(task: string, cap = 200): string {
@@ -964,24 +1015,30 @@ function formatSubagentDoneMessage(
 	const isError = aborted || Boolean(extra?.error) || isFailedResult(result);
 	const att = result.verify;
 	// `ok` stays process-level; `verified` reflects only the runtime-attested verify command.
-	// Abort/error short-circuits to none — no testimony was gathered for a synthesized failure.
-	const verified: "pass" | "fail" | "none" =
-		aborted || extra?.error || !att ? "none" : !att.timedOut && att.exitCode === 0 ? "pass" : "fail";
-	const output = truncateText(
+	const verified = verifiedStateFor(result, extra);
+	// Head-keep: templates put summary/Files/Verification/Notes first — a tail-keep
+	// truncation would drop exactly those sections once the report exceeds the cap.
+	const output = truncateTextHead(
 		extra?.error || getResultOutput(result) || result.stderr || "(no output)",
 		doneCapForAgent(result.agent, isError),
 	);
 	const cost =
 		typeof result.usage.cost === "number" ? result.usage.cost.toFixed(4) : String(result.usage.cost ?? 0);
-	const title = result.title?.trim() || (result.task.split("\n")[0] ?? "").trim() || "(untitled)";
+	const title =
+		result.title?.trim() || (result.task.split("\n")[0] ?? "").trim().slice(0, 80) || "(untitled)";
 	const lines = [
 		`[subagent-done] agentId=${result.agentId ?? "?"} name=${result.agent} ok=${ok} verified=${verified} cost=${cost} turns=${result.usage.turns ?? 0}`,
 		`Title: ${title}`,
 	];
 	if (verified === "none") {
-		lines.push("Verification: worker-claimed only (no verify in brief)");
+		if (!att && result.verifySkipped) {
+			// Brief carried a verify command but it was not run (agent aborted).
+			lines.push("Verification: skipped (agent aborted)");
+		} else {
+			lines.push("Verification: worker-claimed only (no verify in brief)");
+		}
 	} else if (att) {
-		lines.push(`Verify: $ ${att.command} → exit ${formatVerifyExit(att)} (attested)`);
+		lines.push(formatVerifyLine(att));
 		for (const tailLine of att.tail.split("\n").slice(-VERIFY_DONE_TAIL_LINES)) {
 			lines.push(`  ${tailLine}`);
 		}
@@ -1004,7 +1061,10 @@ function formatChainVerifyPrefix(results: SingleResult[]): string {
 			lines.push(`  ${tailLine}`);
 		}
 	});
-	return lines.length > 0 ? `${lines.join("\n")}\n` : "";
+	if (lines.length === 0) return "";
+	// Cap the aggregated prefix (REPORT_DONE_CAP): unbounded chain length × ~2000
+	// chars/step must not blow up the tool result. Head-keep, earliest steps first.
+	return `${truncateTextHead(lines.join("\n"), REPORT_DONE_CAP)}\n`;
 }
 
 function deliverSubagentDone(pi: ExtensionAPI, text: string): void {
@@ -1424,6 +1484,10 @@ async function runSingleAgent(
 		// (user interrupted; don't block up to VERIFY_TIMEOUT_MS on a dead task).
 		if (options?.verify && options.verify.trim() && !wasAborted) {
 			currentResult.verify = await runVerifyCommand(options.verify.trim(), spawnCwd);
+		} else if (options?.verify && options.verify.trim()) {
+			// Aborted: verify was in the brief but intentionally not run — record that
+			// so the done message can say "skipped" instead of "no verify in brief".
+			currentResult.verifySkipped = true;
 		}
 		const endOk = exitCode === 0 && !currentResult.errorMessage && !wasAborted;
 		if (wasAborted) currentResult.stopReason = currentResult.stopReason ?? "aborted";
@@ -1786,8 +1850,9 @@ export default function (pi: ExtensionAPI) {
 					previousOutput = getFinalOutput(result.messages);
 				}
 				const lastChainResult = results[results.length - 1];
-				// Chain aggregated output = final step output; capped by that agent's done cap.
-				const chainOutput = truncateText(
+				// Chain aggregated output = final step output; capped by that agent's done
+				// cap, head-keep (templates put the key sections first).
+				const chainOutput = truncateTextHead(
 					getFinalOutput(lastChainResult.messages) || "(no output)",
 					doneCapForAgent(lastChainResult.agent, false),
 				);
@@ -1960,10 +2025,14 @@ export default function (pi: ExtensionAPI) {
 				const successCount = results.filter((r) => !isFailedResult(r)).length;
 				const summaries = results.map((r) => {
 					const output = truncateParallelOutput(getResultOutput(r));
-					const status = isFailedResult(r)
+					const failed = isFailedResult(r);
+					const status = failed
 						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
 						: "completed";
-					return `### [${r.agent}] ${status}\n\n${output}`;
+					// Same attestation surface as [subagent-done]: verified field + Verify line.
+					const verified = verifiedStateFor(r, { error: failed });
+					const verifyLine = r.verify && verified !== "none" ? `${formatVerifyLine(r.verify)}\n\n` : "";
+					return `### [${r.agent}] ${status} · verified=${verified}\n\n${verifyLine}${output}`;
 				});
 				return {
 					content: [
@@ -2054,7 +2123,12 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: bgIgnoredWarning + (getFinalOutput(result.messages) || "(no output)"),
+							text:
+								bgIgnoredWarning +
+								(getFinalOutput(result.messages) || "(no output)") +
+								// Same attestation surface as [subagent-done]: verified field + Verify line.
+								`\n\nverified=${verifiedStateFor(result)}` +
+								(result.verify ? `\n${formatVerifyLine(result.verify)}` : ""),
 						},
 					],
 					details: makeDetails("single")([result]),
