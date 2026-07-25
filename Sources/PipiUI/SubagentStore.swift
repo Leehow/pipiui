@@ -60,6 +60,9 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
     var worktreeLifecycle: WorktreeLifecycle = .none
     /// Attested smoke-verify command reported at agent end; re-run in main repo after merge.
     var verifyCommand: String? = nil
+    /// Attested exit code of the verify command run in the agent worktree.
+    /// Present + ≠ 0 ⇒ worker's own verify failed: keep pendingReview, never auto-merge.
+    var verifyExit: Int? = nil
     /// Latest turn context occupancy (from usage.totalTokens / contextTokens).
     var contextTokens: Int = 0
     /// Model context window when known.
@@ -113,7 +116,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         case id, parentId, toolCallId, name, task, title, depth, model
         case state, output, activity, log, cost, turns, started, ended
         case worktreePath, worktreeBranch, worktreeError, worktreeLifecycle
-        case verifyCommand
+        case verifyCommand, verifyExit
         case contextTokens, contextWindow
         case totalInput, totalOutput, totalCacheRead, totalCacheWrite
     }
@@ -140,6 +143,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         worktreeError: String? = nil,
         worktreeLifecycle: WorktreeLifecycle = .none,
         verifyCommand: String? = nil,
+        verifyExit: Int? = nil,
         contextTokens: Int = 0,
         contextWindow: Int? = nil,
         totalInput: Int = 0,
@@ -168,6 +172,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         self.worktreeError = worktreeError
         self.worktreeLifecycle = worktreeLifecycle
         self.verifyCommand = verifyCommand
+        self.verifyExit = verifyExit
         self.contextTokens = contextTokens
         self.contextWindow = contextWindow
         self.totalInput = totalInput
@@ -203,6 +208,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         }
         worktreeLifecycle = life
         verifyCommand = try c.decodeIfPresent(String.self, forKey: .verifyCommand)
+        verifyExit = try c.decodeIfPresent(Int.self, forKey: .verifyExit)
         contextTokens = try c.decodeIfPresent(Int.self, forKey: .contextTokens) ?? 0
         contextWindow = try c.decodeIfPresent(Int.self, forKey: .contextWindow)
         totalInput = try c.decodeIfPresent(Int.self, forKey: .totalInput) ?? 0
@@ -234,6 +240,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         try c.encodeIfPresent(worktreeError, forKey: .worktreeError)
         try c.encode(worktreeLifecycle, forKey: .worktreeLifecycle)
         try c.encodeIfPresent(verifyCommand, forKey: .verifyCommand)
+        try c.encodeIfPresent(verifyExit, forKey: .verifyExit)
         try c.encode(contextTokens, forKey: .contextTokens)
         try c.encodeIfPresent(contextWindow, forKey: .contextWindow)
         try c.encode(totalInput, forKey: .totalInput)
@@ -333,7 +340,7 @@ enum WorktreeMergeFailedMessage {
             "error:",
             error,
             "",
-            "Worktree 仍保留（pendingReview）。请你自行决策并处理：优先用 git/read/subagent 工具解决（例如查看主工作区与分支差异、在主仓合理 stash/commit 后重试合并、解决冲突、或丢弃过时 worktree）。只有无法自行裁决的歧义或不可逆选择时才简短问用户一次。不要把这条消息当成用户新需求。",
+            "Worktree 仍保留（pendingReview）。默认动作是派一个 general-purpose fixer 解决合并（brief 附分支名与冲突文件清单，verify 填合并后的构建/测试命令）；你只三选一裁决：接受 fixer 结果 / 丢弃无价值 worktree / 问用户（一句话、一个具体选项）。绝不亲自打开冲突 diff；不要把原始 git 报错转发给用户；不要把这条消息当成用户新需求。",
         ].joined(separator: "\n")
     }
 
@@ -396,38 +403,106 @@ enum PostMergeVerifyFailedMessage {
 }
 
 /// Runs the post-merge verify command synchronously on a background thread.
-/// Mirrors GitRepo.run's blocking style, but via `bash -lc` with a hard timeout.
+/// Spawns `bash -lc` in its OWN process group (posix_spawn + POSIX_SPAWN_SETPGROUP)
+/// so a timeout can SIGKILL the whole group — grandchildren inheriting the pipe die
+/// too, the pipe closes, and the read loop below terminates.
+/// Output is collected into a rolling 64KB tail buffer (never unbounded in memory);
+/// the stored tail stays ≤2000 chars.
 enum PostMergeVerifyRunner {
+    private static let tailBufferLimit = 64 * 1024
+
     static func run(command: String, in directory: URL, timeout: TimeInterval = 120) -> PostMergeVerifyFailure {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = ["-lc", command]
-        proc.currentDirectoryURL = directory
-        proc.standardInput = FileHandle.nullDevice
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = pipe
-        do {
-            try proc.run()
-        } catch {
+        var pipeFDs: [Int32] = [0, 0]
+        guard Darwin.pipe(&pipeFDs) == 0 else {
             return PostMergeVerifyFailure(
                 command: command, exitCode: -1, timedOut: false,
-                outputTail: "无法启动 verify 进程: \(error.localizedDescription)")
+                outputTail: "无法创建 verify 管道")
         }
+        let readFD = pipeFDs[0]
+        let writeFD = pipeFDs[1]
+
+        var fileActions: posix_spawn_file_actions_t? = nil
+        posix_spawn_file_actions_init(&fileActions)
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+        posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_adddup2(&fileActions, writeFD, STDOUT_FILENO)
+        posix_spawn_file_actions_adddup2(&fileActions, writeFD, STDERR_FILENO)
+        posix_spawn_file_actions_addclose(&fileActions, writeFD)
+        posix_spawn_file_actions_addclose(&fileActions, readFD)
+        posix_spawn_file_actions_addchdir_np(&fileActions, directory.path)
+
+        var attr: posix_spawnattr_t? = nil
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        // New process group: pgid == child pid ⇒ kill(-pid, sig) reaches the whole tree.
+        posix_spawnattr_setpgroup(&attr, 0)
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP))
+
+        let argv: [UnsafeMutablePointer<CChar>?] = [
+            strdup("/bin/bash"), strdup("-lc"), strdup(command), nil,
+        ]
+        defer { for a in argv { free(a) } }
+        // Full inherited environment (same as the old Process()-based runner).
+        var envp: [UnsafeMutablePointer<CChar>?] =
+            ProcessInfo.processInfo.environment.map { strdup("\($0)=\($1)") } + [nil]
+        defer { for e in envp { free(e) } }
+
+        var pid = pid_t()
+        let spawnErr = posix_spawn(&pid, "/bin/bash", &fileActions, &attr, argv, &envp)
+        guard spawnErr == 0 else {
+            close(readFD)
+            close(writeFD)
+            return PostMergeVerifyFailure(
+                command: command, exitCode: -1, timedOut: false,
+                outputTail: "无法启动 verify 进程: posix_spawn error \(spawnErr)")
+        }
+        // Parent closes its copy of the write end so read() sees EOF at group exit.
+        close(writeFD)
+
         let timedOutBox = LockedBool()
         let timeoutItem = DispatchWorkItem {
             timedOutBox.set(true)
-            if proc.isRunning { proc.terminate() }
+            // SIGTERM the whole group first; escalated to SIGKILL below if needed.
+            kill(-pid, SIGTERM)
         }
-        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutItem)
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        proc.waitUntilExit()
+        let killItem = DispatchWorkItem {
+            // Escalate: guarantee the pipe closes even if the TERM was ignored.
+            kill(-pid, SIGKILL)
+        }
+        let timerQueue = DispatchQueue.global()
+        timerQueue.asyncAfter(deadline: .now() + timeout, execute: timeoutItem)
+        timerQueue.asyncAfter(deadline: .now() + timeout + 3, execute: killItem)
+
+        // Rolling tail buffer: keep only the last tailBufferLimit bytes.
+        var tail = Data()
+        tail.reserveCapacity(tailBufferLimit)
+        var chunk = [UInt8](repeating: 0, count: 8192)
+        while true {
+            let n = Darwin.read(readFD, &chunk, chunk.count)
+            if n <= 0 { break }
+            tail.append(contentsOf: chunk[0..<n])
+            if tail.count > tailBufferLimit {
+                tail.removeFirst(tail.count - tailBufferLimit)
+            }
+        }
+        close(readFD)
+
+        var status: Int32 = 0
+        while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
         timeoutItem.cancel()
-        let text = String(data: data, encoding: .utf8) ?? ""
-        let tail = String(text.suffix(2000)).trimmingCharacters(in: .whitespacesAndNewlines)
+        killItem.cancel()
+
+        let text = String(data: tail, encoding: .utf8) ?? ""
+        let tailText = String(text.suffix(2000)).trimmingCharacters(in: .whitespacesAndNewlines)
+        let exitCode: Int32
+        if (status & 0x7f) == 0 {
+            exitCode = (status >> 8) & 0xff          // WIFEXITED → WEXITSTATUS
+        } else {
+            exitCode = 128 + (status & 0x7f)         // WIFSIGNALED → 128 + signal
+        }
         return PostMergeVerifyFailure(
-            command: command, exitCode: proc.terminationStatus,
-            timedOut: timedOutBox.get(), outputTail: tail)
+            command: command, exitCode: exitCode,
+            timedOut: timedOutBox.get(), outputTail: tailText)
     }
 }
 
@@ -707,6 +782,7 @@ final class SubagentStore: ObservableObject {
             if let branch = e["worktreeBranch"].string { agents[i].worktreeBranch = branch }
             if let err = e["worktreeError"].string { agents[i].worktreeError = err }
             if let verify = e["verifyCommand"].string { agents[i].verifyCommand = verify }
+            if let verifyExit = e["verifyExit"].int { agents[i].verifyExit = verifyExit }
             // Terminal + still has worktree path → pending review.
             if let path = agents[i].worktreePath, !path.isEmpty {
                 switch agents[i].worktreeLifecycle {
@@ -718,8 +794,12 @@ final class SubagentStore: ObservableObject {
             }
             // Product default: successful agent + worktree → auto-merge into main + remove wt.
             // failed/aborted/interrupted keep pendingReview for续作; UI buttons remain as fallback.
+            // Attested verify FAILED in the worktree (verifyExit present and ≠ 0): keep
+            // pendingReview and skip auto-merge — merging would knowingly break main and
+            // delete the worktree the failure-recovery loop needs.
             if agents[i].state == .ok,
                agents[i].worktreeLifecycle == .pendingReview,
+               (agents[i].verifyExit ?? 0) == 0,
                let main = mainProjectURL {
                 let aid = agents[i].id
                 // git 操作在 mergeWorktree 内部 Task.detached 后台执行，主线程只收尾状态。
@@ -825,10 +905,12 @@ final class SubagentStore: ObservableObject {
             }
             return setWorktreeError(full)
         case .removeFailed(let msg):
-            // Merge already succeeded — mark merged but surface remove error.
+            // Merge already succeeded — mark merged, still run post-merge verify,
+            // but surface remove error.
             if let idx = agents.firstIndex(where: { $0.id == agentId }) {
                 agents[idx].worktreeLifecycle = .merged
                 scheduleSave()
+                runPostMergeVerifyIfNeeded(agent: agents[idx], mainProjectURL: main)
             }
             return setWorktreeError("已合并，但删除 worktree 失败: \(msg)")
         }
