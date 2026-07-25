@@ -24,6 +24,11 @@ struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var tab: SettingsTab = .general
+    /// 懒加载 + keep-alive：只有访问过的 tab 的 section 才会进 ZStack；
+    /// 进入后永不移除（配合 SettingsTabKeepAlive 保留 @State / AppKit 控件）。
+    /// 初始只含当前 tab，避免打开设置时一次性构建全部 5 个 section 造成卡顿；
+    /// sheet 显示后由 prewarmRemainingTabs() 逐个后台预热其余 section。
+    @State private var visitedTabs: Set<SettingsTab> = [.general]
     @State private var models: [ModelInfo] = []
     @State private var credentials: [PiAuthStore.CredentialInfo] = []
     @State private var hiddenIds: Set<String> = ModelVisibility.hiddenModelIds()
@@ -79,22 +84,34 @@ struct SettingsSheet: View {
             .padding(.bottom, 10)
             Divider()
             ScrollView {
-                // Keep-alive: all five sections stay in the view tree, so switching
-                // tabs doesn't tear down / rebuild their AppKit controls (and each
-                // section's @State survives). Inactive sections are invisible,
-                // non-interactive and zero-height, so the ZStack — and thus the
-                // scroll content — sizes to the active section only.
+                // Lazy + keep-alive: only visited sections enter the view tree
+                // (visitedTabs), so opening the sheet builds just the initial tab;
+                // once visited, a section stays forever — switching tabs doesn't
+                // tear down / rebuild its AppKit controls (and its @State survives).
+                // Inactive sections are invisible, non-interactive and zero-height,
+                // so the ZStack — and thus the scroll content — sizes to the active
+                // section only.
                 ZStack(alignment: .top) {
-                    generalSection
-                        .settingsTabKeepAlive(active: tab == .general)
-                    modelSettingsSection
-                        .settingsTabKeepAlive(active: tab == .models)
-                    usageSection
-                        .settingsTabKeepAlive(active: tab == .usage)
-                    toolsSkillsSection
-                        .settingsTabKeepAlive(active: tab == .toolsSkills)
-                    subagentModelsSection
-                        .settingsTabKeepAlive(active: tab == .subagentModels)
+                    if visitedTabs.contains(.general) {
+                        generalSection
+                            .settingsTabKeepAlive(active: tab == .general)
+                    }
+                    if visitedTabs.contains(.models) {
+                        modelSettingsSection
+                            .settingsTabKeepAlive(active: tab == .models)
+                    }
+                    if visitedTabs.contains(.usage) {
+                        usageSection
+                            .settingsTabKeepAlive(active: tab == .usage)
+                    }
+                    if visitedTabs.contains(.toolsSkills) {
+                        toolsSkillsSection
+                            .settingsTabKeepAlive(active: tab == .toolsSkills)
+                    }
+                    if visitedTabs.contains(.subagentModels) {
+                        subagentModelsSection
+                            .settingsTabKeepAlive(active: tab == .subagentModels)
+                    }
                 }
                 .padding(20)
             }
@@ -115,7 +132,9 @@ struct SettingsSheet: View {
         }
         .frame(width: 640, height: 620)
         .task { await reload() }
+        .task { await prewarmRemainingTabs() }
         .onChange(of: tab) { _, newValue in
+            visitedTabs.insert(newValue)
             if newValue == .usage { reloadUsage() }
         }
         .onChange(of: usagePeriod) { _, _ in reloadUsage() }
@@ -151,6 +170,21 @@ struct SettingsSheet: View {
         } message: {
             Text("将从 ~/.pi/agent/auth.json 移除该 provider 的凭据（与 pi /logout 相同）。默认不影响 ~/.pi/agent/.env 中的同名 key——若 .env 也配置了该 provider 的 key，模型仍可用，可选「同时从 .env 移除」一并删除。models.json 不受影响。删除后该 provider 下所有模型会从列表消失。")
         }
+    }
+
+    /// 预热：sheet 显示后，把尚未访问的 tab 逐个加入 visitedTabs，使其 section
+    /// 以 inactive（keep-alive）状态构建一次。这样用户首次切到该 tab 也是即时的。
+    /// 每个 section 间隔一小段时间分散到不同 frame，避免同一帧内集中构建造成掉帧。
+    /// 打开即关时 task 自动取消，不会白做功。
+    private func prewarmRemainingTabs() async {
+        do {
+            try await Task.sleep(for: .milliseconds(300))
+            for t in SettingsTab.allCases where !visitedTabs.contains(t) {
+                try Task.checkCancellation()
+                visitedTabs.insert(t)
+                try await Task.sleep(for: .milliseconds(120))
+            }
+        } catch { /* cancelled — sheet dismissed */ }
     }
 
     private var header: some View {
