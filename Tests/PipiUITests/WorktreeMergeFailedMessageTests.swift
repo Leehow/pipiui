@@ -67,9 +67,15 @@ final class WorktreeMergeFailedMessageTests: XCTestCase {
         let path = try XCTUnwrap(BossPrompt.install(into: dir))
         let text = try String(contentsOfFile: path, encoding: .utf8)
         XCTAssertTrue(text.contains("[worktree-merge-failed]"))
-        // The don't-bother-the-user discipline: boss resolves the merge itself and never
-        // forwards a raw git error. (Prompt is English since the token-budget pass.)
-        XCTAssertTrue(text.contains("Ask the user only when"))
+        // The don't-bother-the-user discipline: on a failed merge the boss dispatches a
+        // fixer by default and only adjudicates — accept / discard / ask the user, one
+        // sentence, one concrete choice — and never forwards a raw git error. The same
+        // discipline covers post-merge verify failures. (Prompt is English since the
+        // token-budget pass.)
+        XCTAssertTrue(text.contains("Default action: dispatch"))
+        XCTAssertTrue(text.contains("a general-purpose fixer"))
+        XCTAssertTrue(text.contains("one sentence, one concrete choice"))
         XCTAssertTrue(text.contains("Never forward a raw git error"))
+        XCTAssertTrue(text.contains("[post-merge-verify-failed]"))
     }
 }
