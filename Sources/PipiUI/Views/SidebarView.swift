@@ -4,7 +4,6 @@ struct SidebarView: View {
     @EnvironmentObject var store: AppStore
     @State private var renameTarget: RenameTarget?
     @State private var renameText: String = ""
-    @State private var showSettings = false
     /// Per-project expand state for the archived section; missing key = collapsed.
     @State private var archivedExpandedByProject: [String: Bool] = [:]
     @State private var projectsExpanded = false
@@ -46,7 +45,7 @@ struct SidebarView: View {
         .safeAreaInset(edge: .bottom) {
             HStack {
                 Button {
-                    showSettings = true
+                    store.showSettings = true
                 } label: {
                     Image(systemName: "gearshape")
                         .font(.body)
@@ -61,10 +60,6 @@ struct SidebarView: View {
             .padding(.horizontal, Self.sidebarGutter + 2)
             .padding(.vertical, 12)
             .background(.bar)
-        }
-        .sheet(isPresented: $showSettings) {
-            SettingsSheet()
-                .environmentObject(store)
         }
         .onAppear {
             syncProjectsExpansion()

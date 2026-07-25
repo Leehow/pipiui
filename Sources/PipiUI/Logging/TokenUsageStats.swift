@@ -81,6 +81,14 @@ enum TokenUsageStats {
         var rows: [Row]
     }
 
+    /// How `Metrics.cost` is filled during aggregation.
+    enum CostMode: Equatable {
+        /// Keep ledger `cost` as-is (tests / raw pi USD).
+        case ledger
+        /// Reprice from tokens using `ModelPricing` → CNY; fall back to ledger×FX.
+        case estimateCNY
+    }
+
     struct Record {
         var date: Date
         var channel: String
@@ -91,6 +99,7 @@ enum TokenUsageStats {
         var cacheRead: Int
         var cacheWrite: Int
         var cost: Double
+        var contextTokens: Int
         var tools: [String]
     }
 
@@ -174,6 +183,7 @@ enum TokenUsageStats {
         let cacheRead = obj["cacheRead"] as? Int ?? 0
         let cacheWrite = obj["cacheWrite"] as? Int ?? 0
         let cost = (obj["cost"] as? NSNumber)?.doubleValue ?? 0
+        let contextTokens = obj["contextTokens"] as? Int ?? 0
         let tools = obj["tools"] as? [String] ?? []
 
         return Record(
@@ -186,8 +196,78 @@ enum TokenUsageStats {
             cacheRead: cacheRead,
             cacheWrite: cacheWrite,
             cost: cost,
+            contextTokens: contextTokens,
             tools: tools
         )
+    }
+
+    /// Resolve display cost for one record (CNY when `costMode == .estimateCNY`).
+    static func resolvedCost(
+        for record: Record,
+        mode: CostMode,
+        catalog: ModelPricing.Catalog = .shared
+    ) -> Double {
+        switch mode {
+        case .ledger:
+            return record.cost
+        case .estimateCNY:
+            if let estimated = catalog.estimateCNY(
+                model: record.model,
+                input: record.input,
+                output: record.output,
+                cacheRead: record.cacheRead,
+                cacheWrite: record.cacheWrite,
+                contextTokens: record.contextTokens
+            ) {
+                return estimated
+            }
+            // Unknown model: convert ledger USD (often 0 on subscription plans).
+            return record.cost * catalog.exchangeRate
+        }
+    }
+
+    // MARK: - Per-session cache totals (resume rehydration)
+
+    /// 累计某会话的 cacheRead / cacheWrite，流式读取 active+rolled ledger，不构建 [Record]、不全量驻留。
+    /// 用于 resume 时回填 `ChatSession.sessionCacheRead` / `sessionCacheWrite`。
+    /// 公开版先 flush 在途写入，再委托给可注入 urls 的 internal 重载。
+    static func sessionCacheTotals(
+        for sessionId: String,
+        fileManager: FileManager = .default
+    ) -> (cacheRead: Int, cacheWrite: Int) {
+        TokenLedger.shared.flushSync()
+        return sessionCacheTotals(
+            for: sessionId,
+            urls: [TokenLedger.shared.fileURL, TokenLedger.shared.rolledFileURL],
+            fileManager: fileManager
+        )
+    }
+
+    /// 可注入 urls 的 internal 重载，便于测试；不调用 flushSync（测试直接读写文件）。
+    /// 廉价预过滤（`line.contains(sessionId)`）命中后再 JSON 解析，并严格校验
+    /// `(obj["session"] as? String) == sessionId` 才累加，避免串会话 / 缺字段 / 非字符串行误计。
+    static func sessionCacheTotals(
+        for sessionId: String,
+        urls: [URL],
+        fileManager: FileManager = .default
+    ) -> (cacheRead: Int, cacheWrite: Int) {
+        var cacheRead = 0
+        var cacheWrite = 0
+        for url in urls {
+            guard fileManager.fileExists(atPath: url.path),
+                  let data = try? Data(contentsOf: url),
+                  let text = String(data: data, encoding: .utf8) else { continue }
+            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                // sessionId 通常是较长的唯一路径串，先做一次廉价的子串预过滤。
+                guard line.contains(sessionId) else { continue }
+                guard let lineData = String(line).data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                      (obj["session"] as? String) == sessionId else { continue }
+                cacheRead += obj["cacheRead"] as? Int ?? 0
+                cacheWrite += obj["cacheWrite"] as? Int ?? 0
+            }
+        }
+        return (cacheRead, cacheWrite)
     }
 
     // MARK: - Aggregate
@@ -197,7 +277,9 @@ enum TokenUsageStats {
         period: Period,
         groupBy: GroupBy,
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        costMode: CostMode = .estimateCNY,
+        pricingCatalog: ModelPricing.Catalog = .shared
     ) -> Report {
         let filtered = records.filter { matchesPeriod($0.date, period: period, now: now, calendar: calendar) }
         var total = Metrics()
@@ -205,21 +287,28 @@ enum TokenUsageStats {
         var secondary: [String: [String: Metrics]] = [:]
 
         for rec in filtered {
-            total.add(record: rec)
+            let cost = resolvedCost(for: rec, mode: costMode, catalog: pricingCatalog)
+            total.add(
+                input: rec.input,
+                output: rec.output,
+                cacheRead: rec.cacheRead,
+                cacheWrite: rec.cacheWrite,
+                cost: cost
+            )
             let role = roleKey(channel: rec.channel, agentName: rec.agentName)
 
             switch groupBy {
             case .model:
-                accumulate(into: &primary, key: rec.model, record: rec)
-                accumulateNested(into: &secondary, primary: rec.model, secondary: role, record: rec)
+                accumulate(into: &primary, key: rec.model, record: rec, cost: cost)
+                accumulateNested(into: &secondary, primary: rec.model, secondary: role, record: rec, cost: cost)
             case .role:
-                accumulate(into: &primary, key: role, record: rec)
-                accumulateNested(into: &secondary, primary: role, secondary: rec.model, record: rec)
+                accumulate(into: &primary, key: role, record: rec, cost: cost)
+                accumulateNested(into: &secondary, primary: role, secondary: rec.model, record: rec, cost: cost)
             case .tool:
                 let toolKeys = rec.tools.isEmpty ? [noToolKey] : Array(Set(rec.tools))
                 for tool in toolKeys {
-                    accumulate(into: &primary, key: tool, record: rec)
-                    accumulateNested(into: &secondary, primary: tool, secondary: role, record: rec)
+                    accumulate(into: &primary, key: tool, record: rec, cost: cost)
+                    accumulateNested(into: &secondary, primary: tool, secondary: role, record: rec, cost: cost)
                 }
             }
         }
@@ -273,9 +362,20 @@ enum TokenUsageStats {
         }
     }
 
-    private static func accumulate(into map: inout [String: Metrics], key: String, record: Record) {
+    private static func accumulate(
+        into map: inout [String: Metrics],
+        key: String,
+        record: Record,
+        cost: Double
+    ) {
         var m = map[key] ?? Metrics()
-        m.add(record: record)
+        m.add(
+            input: record.input,
+            output: record.output,
+            cacheRead: record.cacheRead,
+            cacheWrite: record.cacheWrite,
+            cost: cost
+        )
         map[key] = m
     }
 
@@ -283,11 +383,18 @@ enum TokenUsageStats {
         into map: inout [String: [String: Metrics]],
         primary: String,
         secondary: String,
-        record: Record
+        record: Record,
+        cost: Double
     ) {
         var inner = map[primary] ?? [:]
         var m = inner[secondary] ?? Metrics()
-        m.add(record: record)
+        m.add(
+            input: record.input,
+            output: record.output,
+            cacheRead: record.cacheRead,
+            cacheWrite: record.cacheWrite,
+            cost: cost
+        )
         inner[secondary] = m
         map[primary] = inner
     }

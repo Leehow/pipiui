@@ -262,6 +262,34 @@ struct ContentView: View {
             }
         }
         .navigationSplitViewStyle(.prominentDetail)
+        .overlay {
+            // 设置面板常驻预渲染：启动即把整棵 SettingsSheet 视图树（含 AppKit 控件）
+            // 材质化在主窗口内，首次点齿轮零构建成本；同一份实例在多次开关间复用，
+            // @State / visited tab / 滚动位置全部保留。隐藏时仅 opacity 0 —— 视图仍
+            // 参与渲染（这是预渲染生效的关键），但不响应命中、不进焦点环、不对
+            // VoiceOver 可见。回车/Esc 快捷键在 SettingsSheet 头部按 showSettings 门控。
+            ZStack {
+                Color.black.opacity(0.35)
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture { store.showSettings = false }
+                    .opacity(store.showSettings ? 1 : 0)
+
+                SettingsSheet()
+                    .environmentObject(store)
+                    .frame(width: 640, height: 620)
+                    .background(Color(nsColor: .windowBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .shadow(color: .black.opacity(0.28), radius: 28, y: 10)
+                    .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .opacity(store.showSettings ? 1 : 0)
+                    .accessibilityIdentifier("PipiUI.SettingsPanel")
+            }
+            .allowsHitTesting(store.showSettings)
+            .accessibilityHidden(!store.showSettings)
+            .focusable(store.showSettings)
+        }
+        .animation(.easeOut(duration: 0.15), value: store.showSettings)
     }
 
     private func updateSidebarVisibility(for logicalWidth: CGFloat) {
@@ -578,6 +606,52 @@ private final class SidebarDividerTrackingView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? {
         nil
     }
+}
+
+/// 设置面板预渲染探针：确认常驻 overlay 在隐藏（opacity 0）状态下仍被真正材质化。
+/// 原理：SwiftUI 对 opacity 0 的视图不做裁剪，AppKit 控件照常创建；探针进窗口后
+/// 统计其所在宿主分支的 NSView 子树规模并打一条日志。若面板被条件移除（未渲染），
+/// 探针根本不会进窗口，日志不会出现。
+struct SettingsPrewarmProbe: NSViewRepresentable {
+    final class ProbeView: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil else { return }
+            // 延迟到首轮布局/渲染完成后统计，结果更贴近真实材质化规模。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self, let contentView = self.window?.contentView else { return }
+                // 探针位于 SettingsSheet 体内且已拿到非 nil window —— 这本身就证明
+                // opacity 0 的设置树被 SwiftUI 真正材质化（被裁剪的视图不会创建
+                // NSViewRepresentable 的 NSView，更不会进窗口）。再统计整窗 NSView
+                // 规模和各 NSScrollView 尺寸，供人工核对设置面板（宽≈600）的滚动视图。
+                var total = 0
+                var controls = 0
+                var scrollFrames: [String] = []
+                var stack: [NSView] = [contentView]
+                while let v = stack.popLast() {
+                    total += 1
+                    if v is NSControl { controls += 1 }
+                    if let sv = v as? NSScrollView {
+                        let doc = sv.documentView?.frame.size ?? .zero
+                        scrollFrames.append(
+                            String(format: "%.0fx%.0f(doc %.0fx%.0f)",
+                                   sv.frame.width, sv.frame.height, doc.width, doc.height)
+                        )
+                    }
+                    stack.append(contentsOf: v.subviews)
+                }
+                Log.info(
+                    "settings prewarm materialized: probe in window; window has \(total) NSViews (\(controls) controls, \(scrollFrames.count) scrollViews \(scrollFrames))",
+                    category: .ui
+                )
+            }
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+
+    func makeNSView(context: Context) -> ProbeView { ProbeView() }
+    func updateNSView(_ nsView: ProbeView, context: Context) {}
 }
 
 struct EmptyStateView: View {

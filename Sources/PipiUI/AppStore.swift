@@ -110,6 +110,9 @@ final class AppStore: ObservableObject {
         didSet { UserDefaults.standard.set(bossModeEnabled, forKey: "pipiui.bossMode") }
     }
 
+    /// Settings overlay (tap dimmed backdrop to dismiss).
+    @Published var showSettings = false
+
     /// Bumped when model picker visibility preferences change so InputBar refreshes.
     @Published var modelVisibilityRevision: Int = 0
     /// Bumped when skill enable/disable toggles change so slash menu refreshes.
