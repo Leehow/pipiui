@@ -1,19 +1,30 @@
 import SwiftUI
 
 private enum SettingsTab: String, CaseIterable, Identifiable {
+    case general = "通用"
     case models = "模型"
     case usage = "用量"
     case toolsSkills = "工具与 Skills"
     case subagentModels = "Subagent 模型"
-    case webSearch = "网络搜索"
     var id: String { rawValue }
+
+    /// SF Symbol for the settings tab strip (CodexBar-style glanceable icons).
+    var systemImage: String {
+        switch self {
+        case .general: return "slider.horizontal.3"
+        case .models: return "cpu"
+        case .usage: return "chart.bar.fill"
+        case .toolsSkills: return "wrench.and.screwdriver"
+        case .subagentModels: return "person.2"
+        }
+    }
 }
 
 struct SettingsSheet: View {
     @EnvironmentObject var store: AppStore
     @Environment(\.dismiss) private var dismiss
 
-    @State private var tab: SettingsTab = .models
+    @State private var tab: SettingsTab = .general
     @State private var models: [ModelInfo] = []
     @State private var credentials: [PiAuthStore.CredentialInfo] = []
     @State private var hiddenIds: Set<String> = ModelVisibility.hiddenModelIds()
@@ -49,18 +60,23 @@ struct SettingsSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            Picker("", selection: $tab) {
+            Picker("设置分页", selection: $tab) {
                 ForEach(SettingsTab.allCases) { t in
-                    Text(t.rawValue).tag(t)
+                    Label(t.rawValue, systemImage: t.systemImage)
+                        .tag(t)
+                        .help(t.rawValue)
                 }
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .padding(.horizontal, 20)
             .padding(.bottom, 10)
             Divider()
             ScrollView {
                 Group {
                     switch tab {
+                    case .general:
+                        generalSection
                     case .models:
                         modelSettingsSection
                     case .usage:
@@ -69,8 +85,6 @@ struct SettingsSheet: View {
                         toolsSkillsSection
                     case .subagentModels:
                         subagentModelsSection
-                    case .webSearch:
-                        webSearchSection
                     }
                 }
                 .padding(20)
@@ -140,6 +154,26 @@ struct SettingsSheet: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    // MARK: - General
+
+    private var generalSection: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("通用")
+                    .font(.title3.weight(.semibold))
+                Toggle(isOn: $store.bossModeEnabled) {
+                    Label("Boss 模式", systemImage: "crown")
+                }
+                .help("Boss 模式：新会话以大组长协议启动——不亲自干活，按难度分派 subagent（简单派单兵、复杂派组长、调研扇出），配合反早停失败恢复协议")
+                Text("开启后，新会话以大组长协议启动：不亲自干活，按难度分派 subagent。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Divider()
+            webSearchSection
+        }
     }
 
     // MARK: - Models
@@ -245,9 +279,17 @@ struct SettingsSheet: View {
 
     // MARK: - Usage
 
+    /// CodexBar menu-bar teal (≈ #49A3B0) for usage bars / histogram.
+    private var usageAccent: Color {
+        Color(red: 73 / 255, green: 163 / 255, blue: 176 / 255)
+    }
+
     private var usageSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
+            HStack(spacing: 8) {
+                Image(systemName: "chart.bar.fill")
+                    .font(.title3)
+                    .foregroundStyle(usageAccent)
                 Text("用量统计")
                     .font(.title3.weight(.semibold))
                 Spacer()
@@ -278,12 +320,16 @@ struct SettingsSheet: View {
 
             Picker("视图", selection: $usageGroupBy) {
                 ForEach(TokenUsageStats.GroupBy.allCases) { groupBy in
-                    Text(groupBy.label).tag(groupBy)
+                    Label(groupBy.label, systemImage: usageGroupByIcon(groupBy)).tag(groupBy)
                 }
             }
             .pickerStyle(.segmented)
 
             usageTotalsBar
+
+            if !usageReport.rows.isEmpty {
+                usageDistributionChart
+            }
 
             Divider()
 
@@ -292,10 +338,14 @@ struct SettingsSheet: View {
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 24)
             } else if usageReport.rows.isEmpty {
-                Text("暂无用量记录。发送消息或派出 subagent 后会出现在这里。")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .padding(.vertical, 12)
+                HStack(spacing: 8) {
+                    Image(systemName: "chart.bar.doc.horizontal")
+                        .foregroundStyle(.tertiary)
+                    Text("暂无用量记录。发送消息或派出 subagent 后会出现在这里。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 12)
             } else {
                 usageColumnHeader
                 ForEach(usageReport.rows) { row in
@@ -336,28 +386,72 @@ struct SettingsSheet: View {
     }
 
     private var usageTotalsBar: some View {
-        HStack(spacing: 20) {
-            usageTotalItem(label: "Calls", value: "\(usageReport.total.calls)")
-            usageTotalItem(label: "Tokens", value: TokenFormat.compact(usageReport.total.tokens))
-            usageTotalItem(label: "Cost", value: usageCostText(usageReport.total.cost))
+        HStack(spacing: 16) {
+            usageTotalItem(icon: "number", label: "Calls", value: "\(usageReport.total.calls)")
+            usageTotalItem(icon: "text.word.spacing", label: "Tokens", value: TokenFormat.compact(usageReport.total.tokens))
+            usageTotalItem(icon: "dollarsign.circle", label: "Cost", value: usageCostText(usageReport.total.cost))
         }
-        .padding(10)
+        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.primary.opacity(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(usageAccent.opacity(0.25), lineWidth: 1)
+                )
+        )
     }
 
-    private func usageTotalItem(label: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.callout.weight(.semibold))
+    /// Mini vertical bars for top rows — CodexBar usage-history glance.
+    private var usageDistributionChart: some View {
+        let bars = Array(usageReport.rows.prefix(16))
+        let maxWeight = bars.map(usageWeight).max() ?? 0
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "chart.bar.fill")
+                    .font(.caption2)
+                    .foregroundStyle(usageAccent)
+                Text("分布（当前视图前 \(bars.count) 项）")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            HStack(alignment: .bottom, spacing: 3) {
+                ForEach(bars) { row in
+                    let h = maxWeight > 0 ? max(3, 36 * usageWeight(row) / maxWeight) : 3
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(usageAccent.opacity(0.85))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: h)
+                        .help("\(row.key): \(usageCostText(row.metrics.cost)) · \(TokenFormat.compact(row.metrics.tokens)) tok")
+                }
+            }
+            .frame(height: 40)
+            .padding(.horizontal, 2)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
+    }
+
+    private func usageTotalItem(icon: String, label: String, value: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.callout)
+                .foregroundStyle(usageAccent)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(value)
+                    .font(.callout.weight(.semibold).monospacedDigit())
+            }
         }
     }
 
     private func usageRowView(_ row: TokenUsageStats.Row) -> some View {
         let isExpanded = usageExpanded.contains(row.key)
+        let share = usageShare(of: row.metrics)
         return VStack(alignment: .leading, spacing: 4) {
             Button {
                 if isExpanded {
@@ -366,24 +460,33 @@ struct SettingsSheet: View {
                     usageExpanded.insert(row.key)
                 }
             } label: {
-                HStack {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 12)
-                    Text(row.key)
-                        .font(.callout)
-                        .lineLimit(1)
-                    Spacer()
-                    Text("\(row.metrics.calls)")
-                        .font(.callout.monospacedDigit())
-                        .frame(width: 50, alignment: .trailing)
-                    Text(TokenFormat.compact(row.metrics.tokens))
-                        .font(.callout.monospacedDigit())
-                        .frame(width: 70, alignment: .trailing)
-                    Text(usageCostText(row.metrics.cost))
-                        .font(.callout.monospacedDigit())
-                        .frame(width: 70, alignment: .trailing)
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 12)
+                        Image(systemName: usageRowIcon(for: row.key))
+                            .font(.caption)
+                            .foregroundStyle(usageAccent)
+                            .frame(width: 16)
+                        Text(row.key)
+                            .font(.callout)
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(row.metrics.calls)")
+                            .font(.callout.monospacedDigit())
+                            .frame(width: 50, alignment: .trailing)
+                        Text(TokenFormat.compact(row.metrics.tokens))
+                            .font(.callout.monospacedDigit())
+                            .frame(width: 70, alignment: .trailing)
+                        Text(usageCostText(row.metrics.cost))
+                            .font(.callout.monospacedDigit())
+                            .frame(width: 70, alignment: .trailing)
+                    }
+                    // CodexBar-style track + teal fill (share of current-view total).
+                    usageProgressBar(share: share)
+                        .padding(.leading, 34)
                 }
                 .contentShape(Rectangle())
             }
@@ -391,19 +494,19 @@ struct SettingsSheet: View {
 
             if isExpanded {
                 usageDetailView(row.metrics)
-                    .padding(.leading, 20)
+                    .padding(.leading, 34)
                 if !row.children.isEmpty {
                     VStack(alignment: .leading, spacing: 3) {
                         ForEach(row.children) { child in
                             usageChildRowView(child)
                         }
                     }
-                    .padding(.leading, 20)
+                    .padding(.leading, 34)
                     .padding(.top, 2)
                 }
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 5)
         .padding(.horizontal, 4)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(isExpanded ? 0.04 : 0)))
     }
@@ -411,17 +514,31 @@ struct SettingsSheet: View {
     private func usageDetailView(_ metrics: TokenUsageStats.Metrics) -> some View {
         let denom = metrics.input + metrics.cacheRead + metrics.cacheWrite
         let hitRate = denom > 0 ? Double(metrics.cacheRead) / Double(denom) : 0
-        return Text(
-            "↑In \(TokenFormat.compact(metrics.input))  ↓Out \(TokenFormat.compact(metrics.output))"
-            + "  CacheR \(TokenFormat.compact(metrics.cacheRead))  CacheW \(TokenFormat.compact(metrics.cacheWrite))"
-            + "  命中 \(Int((hitRate * 100).rounded()))%"
-        )
-        .font(.caption)
+        return HStack(spacing: 10) {
+            usageChip(icon: "arrow.up", text: "In \(TokenFormat.compact(metrics.input))")
+            usageChip(icon: "arrow.down", text: "Out \(TokenFormat.compact(metrics.output))")
+            usageChip(icon: "internaldrive", text: "R \(TokenFormat.compact(metrics.cacheRead))")
+            usageChip(icon: "externaldrive.badge.plus", text: "W \(TokenFormat.compact(metrics.cacheWrite))")
+            usageChip(icon: "bolt.fill", text: "命中 \(Int((hitRate * 100).rounded()))%")
+        }
+    }
+
+    private func usageChip(icon: String, text: String) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(.caption2)
+            Text(text)
+                .font(.caption.monospacedDigit())
+        }
         .foregroundStyle(.secondary)
     }
 
     private func usageChildRowView(_ row: TokenUsageStats.Row) -> some View {
-        HStack {
+        HStack(spacing: 6) {
+            Image(systemName: usageChildIcon(for: row.key))
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .frame(width: 14)
             Text(row.key)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -439,6 +556,101 @@ struct SettingsSheet: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 70, alignment: .trailing)
+        }
+    }
+
+    private func usageProgressBar(share: Double) -> some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.primary.opacity(0.08))
+                Capsule()
+                    .fill(usageAccent)
+                    .frame(width: max(2, geo.size.width * min(1, max(0, share))))
+            }
+        }
+        .frame(height: 4)
+        .accessibilityLabel("占比 \(Int((share * 100).rounded()))%")
+    }
+
+    private func usageWeight(_ row: TokenUsageStats.Row) -> Double {
+        if usageReport.total.cost > 0 { return row.metrics.cost }
+        return Double(row.metrics.tokens)
+    }
+
+    private func usageShare(of metrics: TokenUsageStats.Metrics) -> Double {
+        if usageReport.total.cost > 0 {
+            return min(1, metrics.cost / usageReport.total.cost)
+        }
+        let denom = Double(usageReport.total.tokens)
+        guard denom > 0 else { return 0 }
+        return min(1, Double(metrics.tokens) / denom)
+    }
+
+    private func usageGroupByIcon(_ groupBy: TokenUsageStats.GroupBy) -> String {
+        switch groupBy {
+        case .model: return "cpu"
+        case .role: return "person.2"
+        case .tool: return "wrench.and.screwdriver"
+        }
+    }
+
+    private func usageRowIcon(for key: String) -> String {
+        switch usageGroupBy {
+        case .model: return usageModelIcon(key)
+        case .role: return usageRoleIcon(key)
+        case .tool: return usageToolIcon(key)
+        }
+    }
+
+    private func usageChildIcon(for key: String) -> String {
+        switch usageGroupBy {
+        case .model: return usageRoleIcon(key)   // children are roles
+        case .role: return usageModelIcon(key)   // children are models
+        case .tool: return usageRoleIcon(key)    // children are roles
+        }
+    }
+
+    private func usageModelIcon(_ key: String) -> String {
+        let k = key.lowercased()
+        if k.contains("anthropic") || k.contains("claude") { return "a.circle.fill" }
+        if k.contains("openai") || k.contains("gpt") || k.contains("codex") { return "circle.hexagongrid.fill" }
+        if k.contains("google") || k.contains("gemini") { return "g.circle.fill" }
+        if k.contains("xai") || k.contains("grok") { return "x.circle.fill" }
+        if k.contains("kimi") || k.contains("moonshot") { return "moon.circle.fill" }
+        if k.contains("glm") || k.contains("zhipu") || k.contains("zai") { return "z.circle.fill" }
+        if k.contains("qoder") { return "q.circle.fill" }
+        return "cpu"
+    }
+
+    private func usageRoleIcon(_ key: String) -> String {
+        switch key {
+        case "main": return "person.fill"
+        case "explore": return "magnifyingglass"
+        case "plan": return "map"
+        case "general-purpose": return "wrench.and.screwdriver"
+        case "reviewer": return "eye"
+        case "lead": return "flag.fill"
+        case "subagent": return "person.2"
+        default: return "person.crop.circle"
+        }
+    }
+
+    private func usageToolIcon(_ key: String) -> String {
+        switch key {
+        case TokenUsageStats.noToolKey: return "text.alignleft"
+        case "bash": return "terminal"
+        case "read": return "doc.text"
+        case "write": return "square.and.pencil"
+        case "edit": return "pencil"
+        case "grep", "find": return "magnifyingglass"
+        case "ls": return "folder"
+        case "web_search", "web_fetch": return "globe"
+        case "subagent", "subagent_status": return "person.2"
+        case "generate_image": return "photo"
+        case "browser", "browser_navigate", "browser_click": return "safari"
+        case "git_status", "git_diff": return "arrow.triangle.branch"
+        default: return "hammer"
         }
     }
 
