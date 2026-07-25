@@ -1,6 +1,11 @@
 #!/bin/bash
 # Build PipiUI.app bundle from the SPM executable (release).
-# CONSTITUTION.md: 编译通过即打包 — this is the canonical ship path for build/PipiUI.app.
+# CONSTITUTION.md: 编译通过即打包 — canonical ship path for build/PipiUI.app,
+# then always install/sync to /Applications/PipiUI.app (user launch target).
+#
+# Escape hatches:
+#   PIPIUI_SKIP_INSTALL=1              skip Applications install (rare CI/debug)
+#   PIPIUI_INSTALL_APP=/other/path.app override install destination
 set -e
 cd "$(dirname "$0")"
 swift build -c release
@@ -52,4 +57,43 @@ if [[ -x "$BIN" ]]; then
 fi
 if [[ -f "$APP/Contents/Resources/AppIcon.icns" ]]; then
   stat -f 'AppIcon: %Sm  %N (%z bytes)' -t '%Y-%m-%d %H:%M:%S' "$APP/Contents/Resources/AppIcon.icns"
+fi
+
+# --- Install to Applications (user launch target) ---
+# build/PipiUI.app stays the in-repo artifact; Applications is what users open.
+INSTALL_APP="${PIPIUI_INSTALL_APP:-/Applications/PipiUI.app}"
+if [[ "${PIPIUI_SKIP_INSTALL:-}" == "1" ]]; then
+  echo "Skipped install (PIPIUI_SKIP_INSTALL=1)"
+else
+  echo "Installing → $INSTALL_APP"
+  install_ok=0
+  if command -v ditto >/dev/null 2>&1; then
+    if ditto "$APP" "$INSTALL_APP"; then
+      install_ok=1
+    fi
+  else
+    rm -rf "$INSTALL_APP"
+    if cp -R "$APP" "$INSTALL_APP"; then
+      install_ok=1
+    fi
+  fi
+  if [[ "$install_ok" -ne 1 ]]; then
+    echo "ERROR: failed to install $APP → $INSTALL_APP" >&2
+    if [[ ! -w "$(dirname "$INSTALL_APP")" ]]; then
+      echo "  Permission denied writing $(dirname "$INSTALL_APP")." >&2
+      echo "  Fix: grant write access, or run with sufficient privileges." >&2
+      echo "  Escape: PIPIUI_SKIP_INSTALL=1 or PIPIUI_INSTALL_APP=\$HOME/Applications/PipiUI.app" >&2
+    fi
+    exit 1
+  fi
+  codesign --force --sign - "$INSTALL_APP" 2>/dev/null || true
+  echo "Installed $INSTALL_APP"
+  echo "Open: open -a PipiUI"
+  echo "Open: open $INSTALL_APP"
+  INSTALL_BIN="$INSTALL_APP/Contents/MacOS/PipiUI"
+  if [[ -x "$BIN" && -x "$INSTALL_BIN" ]]; then
+    stat -f 'Binary mtime: %Sm  %N' -t '%Y-%m-%d %H:%M:%S' "$BIN" "$INSTALL_BIN"
+  elif [[ -x "$INSTALL_BIN" ]]; then
+    stat -f 'Binary mtime: %Sm  %N' -t '%Y-%m-%d %H:%M:%S' "$INSTALL_BIN"
+  fi
 fi
