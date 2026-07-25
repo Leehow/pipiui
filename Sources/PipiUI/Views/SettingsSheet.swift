@@ -30,7 +30,7 @@ struct SettingsSheet: View {
     /// .env 中已配置 key 的 provider 集合（用于 auth.json 残留冲突警告）。
     @State private var envConfiguredProviders: Set<String> = []
     /// .env 存取（placeholder 查询、清除、删除凭据时可选的同步移除）。
-    @State private var envStore = EnvFileStore()
+    @State private var envStore = EnvFileStore.shared
     @State private var isLoading = false
     @State private var statusMessage: String?
     @State private var errorMessage: String?
@@ -810,7 +810,7 @@ struct SettingsSheet: View {
     /// reload 的同步 I/O 前缀快照（后台线程执行，主线程只赋值）。
     /// 注意：不再调 SubagentModelSettings.syncJSONFile() / ToolSkillSettings.syncJSONFile()——
     /// 它们的 setter 在真正编辑时已各自同步；reload 无编辑场景不应重写文件。
-    private struct ReloadSnapshot {
+    struct ReloadSnapshot {
         var credentials: [PiAuthStore.CredentialInfo]
         var hiddenIds: Set<String>
         var weakIds: Set<String>
@@ -824,9 +824,9 @@ struct SettingsSheet: View {
     }
 
     /// 磁盘 I/O 集中在后台：auth.json、agents 目录（已有进程级缓存）、UserDefaults、.env 读取。
-    nonisolated private static func loadReloadSnapshot() -> ReloadSnapshot {
+    nonisolated static func loadReloadSnapshot() -> ReloadSnapshot {
         let backend = WebSearchSettings.backend()
-        let envStore = EnvFileStore()
+        let envStore = EnvFileStore.shared
         let credentials = PiAuthStore.list()
         // .env 已配置 key 的 provider：仅 auth.json 在列的 provider 才需要冲突检测。
         let envConfigured = Set(
@@ -850,8 +850,14 @@ struct SettingsSheet: View {
 
     @MainActor
     private func reload(restartSessions: Bool = false) async {
-        isLoading = true
         errorMessage = nil
+        // 启动预热的缓存先行同步渲染：有缓存时打开设置不闪 spinner、不等子进程。
+        let cache = SettingsDataStore.shared
+        if let cachedSnapshot = cache.snapshot {
+            apply(snapshot: cachedSnapshot)
+            if let cachedModels = cache.models { models = cachedModels }
+        }
+        isLoading = cache.snapshot == nil
         defer { isLoading = false }
 
         // T9：同步 I/O 前缀挪到后台，主线程只拿快照赋 @State，修复「打开设置卡一下」。
@@ -859,16 +865,8 @@ struct SettingsSheet: View {
             Self.loadReloadSnapshot()
         }.value
 
-        credentials = snapshot.credentials
-        hiddenIds = snapshot.hiddenIds
-        weakIds = snapshot.weakIds
-        agents = snapshot.agents
-        subagentOverrides = snapshot.subagentOverrides
-        disabledTools = snapshot.disabledTools
-        disabledSkills = snapshot.disabledSkills
-        webSearchBackend = snapshot.webSearchBackend
-        webSearchKeyConfigured = snapshot.webSearchKeyConfigured
-        envConfiguredProviders = snapshot.envConfiguredProviders
+        apply(snapshot: snapshot)
+        cache.update(snapshot: snapshot)
         // 输入缓冲不回显已存 key；reload 不动用户可能正在输入的值。
 
         if restartSessions {
@@ -882,8 +880,21 @@ struct SettingsSheet: View {
             } else if !restartSessions,
                       let any = store.openSessions.values.first(where: { !$0.availableModels.isEmpty }) {
                 models = any.availableModels
+            } else if !restartSessions, let cached = cache.models {
+                // 无打开会话：先用预热缓存，避免每次打开都跑 list-models 子进程。
+                models = cached
+                Task.detached(priority: .utility) {
+                    if let fresh = try? await PiAuthHelper.listModels() {
+                        SettingsDataStore.shared.update(models: fresh)
+                        await MainActor.run { [fresh] in
+                            if !restartSessions { models = fresh }
+                        }
+                    }
+                }
             } else {
-                models = try await PiAuthHelper.listModels()
+                let fresh = try await PiAuthHelper.listModels()
+                models = fresh
+                cache.update(models: fresh)
             }
         } catch {
             if let live = store.currentSession?.availableModels, !live.isEmpty {
@@ -902,6 +913,20 @@ struct SettingsSheet: View {
         }
         // models / hiddenIds / subagentOverrides 已就位，重算 picker 候选缓存。
         recomputePickerModels()
+    }
+
+    /// 把快照字段落到 @State（缓存预渲染与后台刷新共用）。
+    private func apply(snapshot: ReloadSnapshot) {
+        credentials = snapshot.credentials
+        hiddenIds = snapshot.hiddenIds
+        weakIds = snapshot.weakIds
+        agents = snapshot.agents
+        subagentOverrides = snapshot.subagentOverrides
+        disabledTools = snapshot.disabledTools
+        disabledSkills = snapshot.disabledSkills
+        webSearchBackend = snapshot.webSearchBackend
+        webSearchKeyConfigured = snapshot.webSearchKeyConfigured
+        envConfiguredProviders = snapshot.envConfiguredProviders
     }
 
     @MainActor
@@ -949,6 +974,14 @@ struct AddModelSheet: View {
     @State private var isWorking = false
     @State private var errorMessage: String?
     @State private var statusMessage: String?
+
+    /// 有预热缓存时直接渲染 provider 列表（ProgressView 只在冷启动第一次出现）。
+    init(onFinished: @escaping () -> Void) {
+        self.onFinished = onFinished
+        let cached = SettingsDataStore.shared.providers ?? []
+        _providers = State(initialValue: cached)
+        _selectedProviderId = State(initialValue: cached.first { $0.authTypes.contains("api_key") }?.id)
+    }
 
     private var filteredProviders: [PiAuthHelper.LoginProvider] {
         providers.filter { $0.authTypes.contains(authType) }
@@ -1038,10 +1071,15 @@ struct AddModelSheet: View {
     private func loadProviders() async {
         errorMessage = nil
         do {
-            providers = try await PiAuthHelper.listProviders()
-            selectedProviderId = filteredProviders.first?.id
+            let fresh = try await PiAuthHelper.listProviders()
+            providers = fresh
+            SettingsDataStore.shared.update(providers: fresh)
+            if selectedProviderId == nil || !fresh.contains(where: { $0.id == selectedProviderId }) {
+                selectedProviderId = filteredProviders.first?.id
+            }
         } catch {
-            errorMessage = error.localizedDescription
+            // 缓存已在渲染时可用；仅无缓存时才展示错误。
+            if providers.isEmpty { errorMessage = error.localizedDescription }
         }
     }
 
@@ -1063,7 +1101,7 @@ struct AddModelSheet: View {
                     return
                 }
                 let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-                try EnvFileStore().setSync(trimmed, forKey: envVar)
+                try EnvFileStore.shared.setSync(trimmed, forKey: envVar)
                 try PiAuthStore.deleteAPIKeyEntry(providerId: providerId)
             } else {
                 try await PiAuthHelper.login(providerId: providerId, authType: "oauth")
