@@ -69,20 +69,21 @@
 
 ## 构建运行
 
-**宪章（强制）：编译通过后必须更新 `build/PipiUI.app`。** 详见 [`CONSTITUTION.md`](./CONSTITUTION.md)；agent 入口见 [`AGENTS.md`](./AGENTS.md)。仅 `swift build` / `swift run` 成功而 `.app` 仍旧时，不得宣称「可打开 App」。
+**宪章（强制）：编译通过后必须更新 `build/PipiUI.app`，并由 `make-app.sh` 同步安装到 `/Applications/PipiUI.app`。** 详见 [`CONSTITUTION.md`](./CONSTITUTION.md)；agent 入口见 [`AGENTS.md`](./AGENTS.md)。仅 `swift build` / `swift run` 成功而 `.app` 仍旧时，不得宣称「可打开 App」。
 
 ```bash
 swift run                 # 开发调试（不更新 .app）
-./make-app.sh             # release 构建并打包 → build/PipiUI.app（交付路径）
+./make-app.sh             # release 打包 → build/PipiUI.app，并安装 /Applications/PipiUI.app
 ./scripts/build-app.sh    # 可选：先 swift test 再 make-app.sh（--skip-tests 跳过测试）
-open build/PipiUI.app
+open -a PipiUI            # 用户启动路径（应用程序）
 ```
 
-打包后核对二进制新于源码，例如：
+打包后核对 build + Applications 二进制均新于源码，例如：
 
 ```bash
 stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
   build/PipiUI.app/Contents/MacOS/PipiUI \
+  /Applications/PipiUI.app/Contents/MacOS/PipiUI \
   Sources/PipiUI/Views/ImagePreview.swift
 ```
 
