@@ -98,6 +98,9 @@ struct InputBar: View {
     @State private var slashSelectedIndex: Int = 0
     @State private var slashPaletteVisible: Bool = false
     @State private var showQuotaPopover: Bool = false
+    @State private var showContextPopover: Bool = false
+    /// Measured width of the status row; drives compact vs wide without ViewThatFits.
+    @State private var statusBarWidth: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 8) {
@@ -140,45 +143,7 @@ struct InputBar: View {
                 .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
 
-            HStack(alignment: .bottom, spacing: 10) {
-                plusMenu
-
-                TextField(fieldPlaceholder,
-                          text: $session.draftText, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...10)
-                    .focused($focused)
-                    .onSubmit(send)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .fill(Color.primary.opacity(0.05))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .strokeBorder(Color.primary.opacity(0.1))
-                    )
-
-                if session.isStreaming {
-                    Button(action: { session.abort() }) {
-                        Image(systemName: "stop.circle.fill")
-                            .font(.system(size: 26))
-                            .foregroundStyle(.red)
-                    }
-                    .buttonStyle(.plain)
-                    .help(session.messageQueue.isEmpty ? "中止当前回复" : "中止并发送队首")
-                }
-
-                Button(action: send) {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 26))
-                        .foregroundStyle(canSend ? Color.accentColor : Color.secondary.opacity(0.4))
-                }
-                .buttonStyle(.plain)
-                .disabled(!canSend)
-                .keyboardShortcut(.return, modifiers: .command)
-            }
+            composerShell
 
             responsiveStatus
         }
@@ -228,6 +193,9 @@ struct InputBar: View {
             refreshSlashPalette()
         }
         .onChange(of: session.availableCommands) { _, _ in
+            refreshSlashPalette()
+        }
+        .onChange(of: store.skillVisibilityRevision) { _, _ in
             refreshSlashPalette()
         }
         .onChange(of: session.composerMode) { _, _ in
@@ -334,6 +302,59 @@ struct InputBar: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    // MARK: - Composer shell (Cursor-style capsule)
+
+    private var composerShell: some View {
+        HStack(alignment: .bottom, spacing: 10) {
+            plusMenu
+
+            TextField(fieldPlaceholder,
+                      text: $session.draftText, axis: .vertical)
+                .textFieldStyle(.plain)
+                .lineLimit(1...10)
+                .focused($focused)
+                .onSubmit(send)
+                .padding(.vertical, 6)
+
+            if session.isStreaming {
+                Button(action: { session.abort() }) {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 28, height: 28)
+                        .background(Circle().fill(Color.primary))
+                }
+                .buttonStyle(.plain)
+                .help(session.messageQueue.isEmpty ? "中止当前回复" : "中止并发送队首")
+            }
+
+            Button(action: send) {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(canSend ? Color(nsColor: .windowBackgroundColor) : Color.secondary.opacity(0.55))
+                    .frame(width: 28, height: 28)
+                    .background(
+                        Circle().fill(canSend ? Color.primary : Color.primary.opacity(0.12))
+                    )
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSend)
+            .keyboardShortcut(.return, modifiers: .command)
+        }
+        .padding(.leading, 10)
+        .padding(.trailing, 8)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+                .shadow(color: Color.black.opacity(0.06), radius: 8, y: 2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+        )
+    }
+
     // MARK: - Plus menu & media mode
 
     private var plusMenu: some View {
@@ -361,11 +382,22 @@ struct InputBar: View {
                 Label("生成视频", systemImage: "film")
             }
         } label: {
-            Image(systemName: "plus.circle.fill")
-                .font(.system(size: 26))
-                .foregroundStyle(session.composerMode == .chat ? Color.secondary.opacity(0.85) : Color.accentColor)
+            ZStack {
+                Circle().fill(
+                    session.composerMode == .chat
+                        ? Color.primary.opacity(0.06)
+                        : Color.accentColor.opacity(0.15)
+                )
+                // Drawn plus stays optically centered; SF "plus" + Menu chrome looked skewed.
+                PlusGlyph(
+                    color: session.composerMode == .chat ? Color.secondary : Color.accentColor
+                )
+            }
+            .frame(width: 28, height: 28)
+            .contentShape(Circle())
         }
         .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
         .fixedSize()
         .help("上传图片 / 生成图像 / 生成视频")
         .disabled(session.mediaBusy)
@@ -460,7 +492,14 @@ struct InputBar: View {
     // MARK: - Slash palette
 
     private func allSlashCommands() -> [SlashCommand] {
-        BuiltinCommands.all + session.availableCommands
+        let disabled = ToolSkillSettings.disabledSkills()
+        let skillsFiltered = session.availableCommands.filter { cmd in
+            if cmd.source == .skill {
+                return !disabled.contains(cmd.name)
+            }
+            return true
+        }
+        return BuiltinCommands.all + skillsFiltered
     }
 
     private func refreshSlashPalette() {
@@ -643,17 +682,48 @@ struct InputBar: View {
 
     // MARK: - Menus
 
-    /// Candidates must report their *content* width. A candidate carrying
-    /// `.frame(maxWidth: .infinity)` claims all available width, so "does this fit"
-    /// depends on the width `ViewThatFits` is itself trying to pick — a circular
-    /// dependency that SwiftUI reports as `AttributeGraph: cycle detected` and then
-    /// re-evaluates forever (47M such lines in four minutes during one session, with
-    /// the app unusable). The expansion belongs on the container, after the choice.
+    /// Width-threshold layout (not `ViewThatFits`). Size-fitting against borderless
+    /// `Menu` + `.fixedSize()` previously cycled AttributeGraph and hung the main
+    /// thread on session switch (~55s hang, 2026-07-24).
     private var responsiveStatus: some View {
-        ViewThatFits(in: .horizontal) {
-            // Wide: model + thinking glued left; activity/metrics on the trailing edge.
-            // Inner fixedSize HStack prevents borderless Menu from claiming extra width.
-            HStack(spacing: 12) {
+        Group {
+            if InputBarStatusLayout.isCompact(width: statusBarWidth) {
+                compactStatus
+            } else {
+                wideStatus
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(key: InputBarStatusWidthKey.self, value: geo.size.width)
+            }
+        )
+        .onPreferenceChange(InputBarStatusWidthKey.self) { statusBarWidth = $0 }
+    }
+
+    /// Wide: model + thinking glued left; activity/metrics on the trailing edge.
+    /// Inner fixedSize HStack prevents borderless Menu from claiming extra width.
+    private var wideStatus: some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 8) {
+                modelMenu
+                    .fixedSize()
+                thinkingMenu
+                    .fixedSize()
+            }
+            .fixedSize(horizontal: true, vertical: false)
+
+            Spacer(minLength: 12)
+
+            activityStatus
+            metricsStatus
+        }
+    }
+
+    private var compactStatus: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
                 HStack(spacing: 8) {
                     modelMenu
                         .fixedSize()
@@ -662,32 +732,14 @@ struct InputBar: View {
                 }
                 .fixedSize(horizontal: true, vertical: false)
 
-                Spacer(minLength: 12)
-
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 8) {
                 activityStatus
+                Spacer(minLength: 4)
                 metricsStatus
             }
-
-            VStack(spacing: 6) {
-                HStack(spacing: 8) {
-                    HStack(spacing: 8) {
-                        modelMenu
-                            .fixedSize()
-                        thinkingMenu
-                            .fixedSize()
-                    }
-                    .fixedSize(horizontal: true, vertical: false)
-
-                    Spacer(minLength: 0)
-                }
-                HStack(spacing: 8) {
-                    activityStatus
-                    Spacer(minLength: 4)
-                    metricsStatus
-                }
-            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -709,14 +761,38 @@ struct InputBar: View {
         }
     }
 
+    /// Ring fraction + footer label. Full data → ring + "38k/262k" (no percent,
+    /// the ring already encodes it); degraded forms fall back to contextStatusText.
+    private var contextMetric: (ring: Double?, text: String)? {
+        if let t = session.contextTokens, let w = session.contextWindow, w > 0 {
+            return (Double(t) / Double(w), "\(TokenFormat.compact(t))/\(TokenFormat.compact(w))")
+        }
+        if let text = session.contextStatusText {
+            return (nil, text)
+        }
+        return nil
+    }
+
     private var metricsStatus: some View {
         HStack(spacing: 8) {
-            if let contextText = session.contextStatusText {
-                let hot = (session.contextPercent ?? 0) > 80
-                Text(contextText)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(hot ? .orange : .secondary)
-                    .help("上下文占用")
+            if let ctx = contextMetric {
+                let hot = (ctx.ring ?? 0) > 0.8
+                HStack(spacing: 4) {
+                    if let ring = ctx.ring {
+                        ContextRing(progress: ring, hot: hot)
+                    }
+                    Text(ctx.text)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(hot ? .orange : .secondary)
+                }
+                .help("上下文占用")
+                .contentShape(Rectangle())
+                .onTapGesture { showContextPopover.toggle() }
+                .popover(isPresented: $showContextPopover, arrowEdge: .bottom) {
+                    contextPopover
+                        .frame(width: 264)
+                        .padding(10)
+                }
             }
             if let quota = session.quotaPercent, session.model?.shouldShowAccountQuota == true {
                 let label = session.quotaPeriodLabel ?? "额"
@@ -792,6 +868,66 @@ struct InputBar: View {
         return f
     }()
 
+    private var contextPopover: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("上下文占用")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+            if let t = session.contextTokens, let w = session.contextWindow, w > 0 {
+                let pct = Double(t) / Double(w) * 100
+                HStack {
+                    Text("\(TokenFormat.compact(t)) / \(TokenFormat.compact(w))")
+                        .font(.caption.monospacedDigit())
+                    Spacer()
+                    Text("\(Int(pct.rounded()))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(pct > 80 ? Color.orange : Color.secondary)
+                }
+                ProgressView(value: pct, total: 100)
+                    .tint(pct > 80 ? Color.orange : Color.accentColor)
+            } else {
+                Text("暂无上下文数据")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let u = session.lastTurnUsage {
+                Divider()
+                Text("上一轮用量")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                contextDetailRow("输入", TokenFormat.compact(u.input))
+                contextDetailRow("输出", TokenFormat.compact(u.output))
+                contextDetailRow("缓存读取", TokenFormat.compact(u.cacheRead))
+                contextDetailRow("缓存写入", TokenFormat.compact(u.cacheWrite))
+                let denom = u.input + u.cacheRead + u.cacheWrite
+                if denom > 0 {
+                    let hit = Double(u.cacheRead) / Double(denom)
+                    contextDetailRow("缓存命中率", "\(Int((hit * 100).rounded()))%")
+                }
+            }
+
+            Divider()
+            Text("本次会话")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+            contextDetailRow("累计缓存读取", TokenFormat.compact(session.sessionCacheRead))
+            contextDetailRow("累计缓存写入", TokenFormat.compact(session.sessionCacheWrite))
+            contextDetailRow("累计花费", String(format: "$%.4f", session.cost))
+        }
+    }
+
+    private func contextDetailRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(value)
+                .font(.caption.monospacedDigit())
+        }
+    }
+
     private var modelMenu: some View {
         // Read revision so toggles in Settings refresh this menu immediately.
         let _ = store.modelVisibilityRevision
@@ -863,4 +999,55 @@ struct InputBar: View {
         .disabled(session.thinkingLevels == ["off"])
     }
 
+}
+
+/// Optically centered + for the composer attach control (SF Symbol looked skewed in Menu label).
+private struct PlusGlyph: View {
+    var color: Color
+    var arm: CGFloat = 5
+    var lineWidth: CGFloat = 1.6
+
+    var body: some View {
+        Canvas { context, size in
+            let mid = CGPoint(x: size.width / 2, y: size.height / 2)
+            var horizontal = Path()
+            horizontal.move(to: CGPoint(x: mid.x - arm, y: mid.y))
+            horizontal.addLine(to: CGPoint(x: mid.x + arm, y: mid.y))
+            var vertical = Path()
+            vertical.move(to: CGPoint(x: mid.x, y: mid.y - arm))
+            vertical.addLine(to: CGPoint(x: mid.x, y: mid.y + arm))
+            let style = StrokeStyle(lineWidth: lineWidth, lineCap: .round)
+            context.stroke(horizontal, with: .color(color), style: style)
+            context.stroke(vertical, with: .color(color), style: style)
+        }
+        .frame(width: 14, height: 14)
+        .accessibilityHidden(true)
+    }
+}
+
+/// Caption-row-sized circular progress ring for context window usage.
+private struct ContextRing: View {
+    var progress: Double
+    var hot: Bool
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.primary.opacity(0.12), lineWidth: 2.5)
+            Circle()
+                .trim(from: 0, to: min(max(progress, 0), 1))
+                .stroke(hot ? Color.orange : Color.accentColor,
+                        style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: 14, height: 14)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct InputBarStatusWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
 }

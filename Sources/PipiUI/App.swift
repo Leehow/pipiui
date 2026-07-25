@@ -75,6 +75,10 @@ struct ContentView: View {
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var sidebarCollapsedForWidth = false
     @State private var sidebarWidthRatio = LayoutPersistence.sidebarWidthRatio()
+    /// Absolute sidebar width fed to NavigationSplitView. Kept stable across session
+    /// switches — recomputing `ratio * logicalWidth` every body pass made the column pulse
+    /// when GeometryReader briefly jittered during detail rebuild.
+    @State private var sidebarColumnWidth: CGFloat = 250
 
     /// Layout size the split view actually uses. During AppKit live window resize
     /// this is frozen (new proposals go to `pendingLogicalSize` only) so the
@@ -226,9 +230,18 @@ struct ContentView: View {
                 }
                 .navigationSplitViewColumnWidth(
                     min: 200,
-                    ideal: sidebarIdealWidth(for: logicalWidth),
+                    ideal: sidebarColumnWidth,
                     max: 340
                 )
+                .onAppear {
+                    syncSidebarColumnWidth(totalLogicalWidth: logicalWidth)
+                }
+                .onChange(of: logicalWidth) { oldWidth, newWidth in
+                    // Session-switch layout often jitters a few points; only rescale
+                    // the sidebar when the window actually resized.
+                    guard abs(oldWidth - newWidth) > 8 else { return }
+                    syncSidebarColumnWidth(totalLogicalWidth: newWidth)
+                }
         } detail: {
             if let session = store.currentSession {
                 // Force identity change on session switch. Per-session state that must survive
@@ -270,9 +283,17 @@ struct ContentView: View {
         )
     }
 
-    private func sidebarIdealWidth(for logicalWidth: CGFloat) -> CGFloat {
-        guard let sidebarWidthRatio else { return 250 }
-        return min(max(sidebarWidthRatio * logicalWidth, 200), 340)
+    private func syncSidebarColumnWidth(totalLogicalWidth: CGFloat) {
+        guard totalLogicalWidth.isFinite, totalLogicalWidth > 0 else { return }
+        let next: CGFloat
+        if let sidebarWidthRatio {
+            next = min(max(sidebarWidthRatio * totalLogicalWidth, 200), 340)
+        } else {
+            next = 250
+        }
+        // Ignore sub-point jitter from session-switch layout passes.
+        guard abs(sidebarColumnWidth - next) > 1.5 else { return }
+        sidebarColumnWidth = next
     }
 
     private func recordSidebarWidth(_ sidebarWidth: CGFloat, totalLogicalWidth: CGFloat) {
@@ -290,6 +311,9 @@ struct ContentView: View {
         guard let validRatio = LayoutPersistence.saveSidebarWidthRatio(ratio) else { return }
         if sidebarWidthRatio == nil || abs((sidebarWidthRatio ?? 0) - validRatio) > 0.001 {
             sidebarWidthRatio = validRatio
+        }
+        if abs(sidebarColumnWidth - sidebarWidth) > 0.5 {
+            sidebarColumnWidth = min(max(sidebarWidth, 200), 340)
         }
     }
 }
@@ -331,11 +355,14 @@ private struct SidebarDividerDragObserver: NSViewRepresentable {
         private weak var splitView: NSSplitView?
         private weak var sidebarPane: NSView?
         private var eventMonitor: Any?
+        /// Pointer went down near the divider — not yet a resize until dragged past threshold.
+        private var dividerPressActive = false
         private var isDraggingDivider = false
+        private var pressOriginX: CGFloat = 0
         private var resolveGeneration = 0
-        private var dragLeaseGeneration = 0
-        private let dragLeaseDuration: TimeInterval = 0.2
         private var layoutIdentity: CGFloat
+        /// Ignore micro-movements from normal clicks in the widened hit slop.
+        private static let dragStartThreshold: CGFloat = 3
 
         init(layoutIdentity: CGFloat, onDrag: @escaping (CGFloat) -> Void) {
             self.layoutIdentity = layoutIdentity
@@ -401,15 +428,26 @@ private struct SidebarDividerDragObserver: NSViewRepresentable {
                     splitView: splitView,
                     sidebarPane: sidebarPane
                 ) {
-                    refreshDragIntentLease()
+                    // Do NOT mark as dragging yet — session clicks near the trailing
+                    // edge used to arm a 0.2s drag lease; layout from switching chats
+                    // then wrote a new width ratio and the column pulsed.
+                    dividerPressActive = true
+                    isDraggingDivider = false
+                    pressOriginX = splitView.convert(event.locationInWindow, from: nil).x
                 } else {
                     clearDragIntent()
                 }
             case .leftMouseDragged:
-                if isDraggingDivider {
-                    refreshDragIntentLease()
-                    reportWidthAfterLayout()
+                guard dividerPressActive else { break }
+                let x = splitView.convert(event.locationInWindow, from: nil).x
+                if !isDraggingDivider {
+                    guard abs(x - pressOriginX) >= Self.dragStartThreshold else { break }
+                    isDraggingDivider = true
                 }
+                // Drive resize ourselves so the widened hit slop still moves the pane
+                // when the pointer is outside AppKit's thin native divider.
+                applyDividerPosition(for: event, splitView: splitView)
+                reportWidthAfterLayout()
             case .leftMouseUp:
                 if isDraggingDivider {
                     reportWidthAfterLayout()
@@ -418,6 +456,15 @@ private struct SidebarDividerDragObserver: NSViewRepresentable {
             default:
                 break
             }
+        }
+
+        private func applyDividerPosition(for event: NSEvent, splitView: NSSplitView) {
+            guard splitView.subviews.count >= 2 else { return }
+            let point = splitView.convert(event.locationInWindow, from: nil)
+            let minW: CGFloat = 200
+            let maxW: CGFloat = 340
+            let position = min(max(point.x, minW), maxW)
+            splitView.setPosition(position, ofDividerAt: 0)
         }
 
         private func attachToNearestSplitView(from view: NSView) {
@@ -441,6 +488,8 @@ private struct SidebarDividerDragObserver: NSViewRepresentable {
             detachFromSplitView()
             self.splitView = splitView
             self.sidebarPane = sidebarPane
+            // Visible resize grip. Hit target is further widened in `isNearSidebarDivider`.
+            splitView.dividerStyle = .paneSplitter
             NotificationCenter.default.addObserver(
                 self,
                 selector: #selector(splitViewDidResize(_:)),
@@ -470,20 +519,13 @@ private struct SidebarDividerDragObserver: NSViewRepresentable {
             reportWidthAfterLayout()
         }
 
-        private func refreshDragIntentLease() {
-            isDraggingDivider = true
-            dragLeaseGeneration += 1
-            let generation = dragLeaseGeneration
-            DispatchQueue.main.asyncAfter(deadline: .now() + dragLeaseDuration) { [weak self] in
-                guard let self, self.dragLeaseGeneration == generation else { return }
-                self.isDraggingDivider = false
-            }
+        private func clearDragIntent() {
+            dividerPressActive = false
+            isDraggingDivider = false
         }
 
-        private func clearDragIntent() {
-            isDraggingDivider = false
-            dragLeaseGeneration += 1
-        }
+        /// Half-width of the resize hit band around the sidebar trailing edge (pt).
+        private static let dividerHitSlop: CGFloat = 16
 
         private func isNearSidebarDivider(
             _ event: NSEvent,
@@ -492,7 +534,7 @@ private struct SidebarDividerDragObserver: NSViewRepresentable {
         ) -> Bool {
             let point = splitView.convert(event.locationInWindow, from: nil)
             let verticalTolerance: CGFloat = 8
-            let dividerTolerance = max(splitView.dividerThickness + 6, 10)
+            let dividerTolerance = max(splitView.dividerThickness / 2 + Self.dividerHitSlop, Self.dividerHitSlop)
             return point.y >= splitView.bounds.minY - verticalTolerance
                 && point.y <= splitView.bounds.maxY + verticalTolerance
                 && abs(point.x - sidebarPane.frame.maxX) <= dividerTolerance

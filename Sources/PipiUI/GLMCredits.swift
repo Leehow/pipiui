@@ -17,6 +17,7 @@ enum GLMAuthStore {
     ]
 
     static func load(env: [String: String] = ProcessInfo.processInfo.environment) -> String? {
+        let env = QuotaEnvFallback.merged(env)
         for key in envKeys {
             if let v = cleaned(env[key]) { return v }
         }
@@ -59,6 +60,7 @@ enum GLMAPIRegion {
 
     /// Resolve the quota host honoring env overrides (`Z_AI_API_HOST` full host).
     static func resolveHost(env: [String: String] = ProcessInfo.processInfo.environment) -> String {
+        let env = QuotaEnvFallback.merged(env)
         if let h = env["Z_AI_API_HOST"]?.trimmingCharacters(in: .whitespacesAndNewlines), !h.isEmpty {
             return h
         }

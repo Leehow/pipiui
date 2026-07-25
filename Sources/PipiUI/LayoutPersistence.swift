@@ -15,12 +15,14 @@ enum LayoutPersistence {
     static let defaultRightPanelWidthRatio: CGFloat = 0.46
 
     static func storedWindowContentSize(defaults: UserDefaults = .standard) -> NSSize? {
-        guard defaults.object(forKey: Key.windowWidth) != nil,
-              defaults.object(forKey: Key.windowHeight) != nil else {
+        let pendingWidth = pendingValue(forKey: Key.windowWidth, defaults: defaults)
+        let pendingHeight = pendingValue(forKey: Key.windowHeight, defaults: defaults)
+        guard pendingWidth != nil || defaults.object(forKey: Key.windowWidth) != nil,
+              pendingHeight != nil || defaults.object(forKey: Key.windowHeight) != nil else {
             return nil
         }
-        let width = defaults.double(forKey: Key.windowWidth)
-        let height = defaults.double(forKey: Key.windowHeight)
+        let width = pendingWidth ?? defaults.double(forKey: Key.windowWidth)
+        let height = pendingHeight ?? defaults.double(forKey: Key.windowHeight)
         guard width.isFinite, height.isFinite, width > 0, height > 0 else { return nil }
         return NSSize(width: width, height: height)
     }
@@ -31,8 +33,10 @@ enum LayoutPersistence {
               size.height >= minimumWindowContentSize.height else {
             return
         }
-        defaults.set(Double(size.width), forKey: Key.windowWidth)
-        defaults.set(Double(size.height), forKey: Key.windowHeight)
+        // T23: live resize fires one notification per frame — cache in memory and
+        // let the debounced flush persist once the storm settles.
+        cachePending(Double(size.width), forKey: Key.windowWidth, defaults: defaults)
+        cachePending(Double(size.height), forKey: Key.windowHeight, defaults: defaults)
     }
 
     static func sidebarWidthRatio(defaults: UserDefaults = .standard) -> CGFloat? {
@@ -81,8 +85,11 @@ enum LayoutPersistence {
         in range: ClosedRange<CGFloat>,
         defaults: UserDefaults
     ) -> CGFloat? {
-        guard defaults.object(forKey: key) != nil else { return nil }
-        let value = defaults.double(forKey: key)
+        // Read-through: a debounced write that has not hit disk yet still wins,
+        // so back-to-back read/modify cycles observe the latest value.
+        let pending = pendingValue(forKey: key, defaults: defaults)
+        guard pending != nil || defaults.object(forKey: key) != nil else { return nil }
+        let value = pending ?? defaults.double(forKey: key)
         guard value.isFinite else { return nil }
         let ratio = CGFloat(value)
         guard range.contains(ratio) else { return nil }
@@ -96,8 +103,51 @@ enum LayoutPersistence {
         defaults: UserDefaults
     ) -> CGFloat? {
         guard ratio.isFinite, range.contains(ratio) else { return nil }
-        defaults.set(Double(ratio), forKey: key)
+        // T23: divider drags call this per mouseDragged event — persist via the
+        // debounced flush instead of one UserDefaults write per event.
+        cachePending(Double(ratio), forKey: key, defaults: defaults)
         return ratio
+    }
+
+    // MARK: - Debounced writes (T23)
+
+    /// Writes are coalesced for this long before hitting UserDefaults.
+    static let writeDebounceInterval: TimeInterval = 0.3
+
+    private static let writeLock = NSLock()
+    private static var pendingWrites: [String: (value: Double, defaults: UserDefaults)] = [:]
+    private static var flushWorkItem: DispatchWorkItem?
+
+    private static func cachePending(_ value: Double, forKey key: String, defaults: UserDefaults) {
+        writeLock.lock()
+        pendingWrites[key] = (value, defaults)
+        if flushWorkItem == nil {
+            let work = DispatchWorkItem { flushPendingWrites() }
+            flushWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + writeDebounceInterval, execute: work)
+        }
+        writeLock.unlock()
+    }
+
+    private static func pendingValue(forKey key: String, defaults: UserDefaults) -> Double? {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        guard let entry = pendingWrites[key], entry.defaults === defaults else { return nil }
+        return entry.value
+    }
+
+    /// Persist every coalesced write now. Called automatically ~300ms after the
+    /// first write of a burst; also exposed for tests and app-termination hooks.
+    static func flushPendingWrites() {
+        writeLock.lock()
+        let writes = pendingWrites
+        pendingWrites.removeAll()
+        flushWorkItem?.cancel()
+        flushWorkItem = nil
+        writeLock.unlock()
+        for (key, entry) in writes {
+            entry.defaults.set(entry.value, forKey: key)
+        }
     }
 }
 

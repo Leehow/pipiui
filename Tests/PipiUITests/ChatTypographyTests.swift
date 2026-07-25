@@ -5,9 +5,13 @@ final class ChatTypographyTests: XCTestCase {
     func testDefaultMakeUses15() {
         let t = ChatTypography.make(fontSize: ChatTypography.defaultFontSize)
         XCTAssertEqual(t.fontSize, 15)
-        XCTAssertEqual(t.lineSpacing, 15 * 0.5, accuracy: 0.001)
+        // CJK-friendly ~1.75× line-height: natural ~1.2× + 0.55× extra.
+        XCTAssertEqual(t.lineSpacing, 15 * 0.55, accuracy: 0.001)
+        XCTAssertEqual(t.paragraphSpacing, 6, accuracy: 0.001)
+        XCTAssertEqual(t.listItemSpacing, 5, accuracy: 0.001)
+        XCTAssertEqual(t.headingLineSpacing, 15 * 0.15, accuracy: 0.001)
         XCTAssertEqual(t.messageSpacing, 22, accuracy: 0.001)
-        XCTAssertEqual(t.blockSpacing, 10, accuracy: 0.001)
+        XCTAssertEqual(t.blockSpacing, 15, accuracy: 0.001)
     }
 
     func testSanitizedFontSizeClampsAndRounds() {
@@ -25,7 +29,13 @@ final class ChatTypographyTests: XCTestCase {
     }
 
     func testBlockSpacingFloor() {
-        // fontSize 12 → round(7.8)=8 → max(8,8)=8
-        XCTAssertEqual(ChatTypography.make(fontSize: 12).blockSpacing, 8, accuracy: 0.001)
+        // fontSize 12 → round(12)=12 → max(12,12)=12
+        XCTAssertEqual(ChatTypography.make(fontSize: 12).blockSpacing, 12, accuracy: 0.001)
+    }
+
+    func testParagraphAndListSpacingScale() {
+        let t = ChatTypography.make(fontSize: 20)
+        XCTAssertEqual(t.paragraphSpacing, 8, accuracy: 0.001) // max(6, round(8))
+        XCTAssertEqual(t.listItemSpacing, 6, accuracy: 0.001) // max(4, round(6))
     }
 }

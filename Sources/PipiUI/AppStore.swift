@@ -14,6 +14,7 @@ final class AppStore: ObservableObject {
     static let shared = AppStore()
     private static let projectsKey = "pipiui.projects"
     private static let archivedSessionsKey = "pipiui.archivedSessions"
+    private static let pinnedSessionsKey = "pipiui.pinnedSessions"
     private static let lastProjectKey = "pipiui.lastProjectPath"
     private static let lastSessionFileKey = "pipiui.lastSessionFile"
     private static let lastSessionProjectKey = "pipiui.lastSessionProject"
@@ -50,6 +51,10 @@ final class AppStore: ObservableObject {
     /// TEMP SWITCH PERF: remove after the "卡一下" measurement settles.
     static var lastSwitchAt: CFAbsoluteTime = 0
     @Published private(set) var archivedSessionPaths: Set<String> = []
+    /// User-pinned session jsonl paths (global). Distinct from send-time `pinnedToTop`.
+    @Published private(set) var userPinnedSessionPaths: Set<String> = []
+    /// Session jsonl paths mid-turn when last quit; sidebar red「已中断」badge.
+    @Published private(set) var interruptedSessionPaths: Set<String> = InterruptedSessionStore.paths()
 
     /// 撞名扩展（会让 pi 直接 exit(1)），按会话 key 记录，供 UI 提示与一键修复
     @Published private(set) var extensionConflicts: [String: [PiExtensionConflict]] = [:]
@@ -107,6 +112,8 @@ final class AppStore: ObservableObject {
 
     /// Bumped when model picker visibility preferences change so InputBar refreshes.
     @Published var modelVisibilityRevision: Int = 0
+    /// Bumped when skill enable/disable toggles change so slash menu refreshes.
+    @Published var skillVisibilityRevision: Int = 0
 
     /// Restart every open pi RPC process so auth.json changes take effect.
     func restartAllOpenSessions() {
@@ -127,6 +134,7 @@ final class AppStore: ObservableObject {
         selectedProjectPath = projects.contains(where: { $0.path == savedProject })
             ? savedProject : projects.first?.path
         archivedSessionPaths = Set(UserDefaults.standard.stringArray(forKey: Self.archivedSessionsKey) ?? [])
+        userPinnedSessionPaths = Set(UserDefaults.standard.stringArray(forKey: Self.pinnedSessionsKey) ?? [])
         for p in projects { refreshSessions(for: p) }
 
         // 启动即恢复关闭前选中的会话（文件还在且未被归档才恢复）。
@@ -141,12 +149,23 @@ final class AppStore: ObservableObject {
         }
 
         plugin = PiPlugin.installAll()
+        SubagentModelSettings.syncJSONFile()
+        ToolSkillSettings.syncJSONFile()
+        WebSearchSettings.syncJSONFile()
+
+        // T20: 一次性把 auth.json / UserDefaults / 旧 websearch-config.json 里的
+        // API key 迁到 ~/.pi/agent/.env。幂等；全程后台队列，主线程零 I/O。
+        DispatchQueue.global(qos: .utility).async {
+            AuthMigration.migrateIfNeeded()
+        }
         bridge = BridgeServer { request, respond in
             // Handler 已在主线程；按 sessionKey 精确路由到对应会话。
             // 未知/已关闭 key 必须拒绝，避免子 agent 孤儿请求落到「当前选中」会话上乱 eval。
             let store = AppStore.shared
             let key = request["sessionKey"].string ?? ""
-            guard !key.isEmpty, let session = store.openSessions[key] else {
+            guard !key.isEmpty,
+                  let session = store.openSessions[key]
+                    ?? store.openSessions.values.first(where: { $0.bridgeRoutingKey == key }) else {
                 respond(["ok": false, "error": "unknown session key"])
                 return
             }
@@ -180,13 +199,20 @@ final class AppStore: ObservableObject {
     }
 
     private func makeSession(key: String, project: URL, sessionPath: String?) -> ChatSession {
-        // spawn 前自检：撞名扩展会让 pi 直接退出，先把它变成可修复的提示而不是一行崩溃日志
-        let conflicts = PiExtensionConflicts.detect(projectDir: project)
-            .filter { !ignoredConflicts.contains($0.entryPath) }
+        // spawn 前自检：撞名扩展会让 pi 直接退出，先把它变成可修复的提示而不是一行崩溃日志。
+        // T11: 主路径只做便宜的 stamp 检查 + 缓存命中；未缓存时先放行 spawn，
+        // 全量扫描挪后台，结果回来真有冲突再把会话切成 blocked 态提示修复。
+        let cachedConflicts = PiExtensionConflicts.cached(projectDir: project)
+        let conflicts = (cachedConflicts ?? []).filter { !ignoredConflicts.contains($0.entryPath) }
         if conflicts.isEmpty {
             extensionConflicts.removeValue(forKey: key)
         } else {
             extensionConflicts[key] = conflicts
+        }
+        if cachedConflicts == nil {
+            PiExtensionConflicts.detectAsync(projectDir: project) { [weak self] found in
+                self?.applyLateDetectedConflicts(found, key: key)
+            }
         }
 
         let session = ChatSession(
@@ -196,6 +222,10 @@ final class AppStore: ObservableObject {
             mediaExtension: plugin.mediaExtension,
             gitExtension: plugin.gitExtension,
             reloadExtension: plugin.reloadExtension,
+            webSearchExtension: plugin.webSearchExtension,
+            skillTierExtension: plugin.skillTierExtension,
+            codexServerToolsExtension: plugin.codexServerToolsExtension,
+            claudeServerToolsExtension: plugin.claudeServerToolsExtension,
             subagentDir: plugin.subagentDir,
             agentsDir: plugin.agentsDir,
             bossPromptPath: bossModeEnabled ? plugin.bossPrompt : nil,
@@ -224,15 +254,80 @@ final class AppStore: ObservableObject {
             metas.sort { self.effectiveModified($0) > self.effectiveModified($1) }
             self.sessionsByProject[projectPath] = metas
         }
-        session.isSelectedCheck = { [weak self] in self?.selectedSessionKey == key }
+        session.onSessionFileRebound = { [weak self] oldPath, newPath in
+            self?.rebindOpenSessionFile(from: oldPath, to: newPath)
+        }
+        session.onBranchedSessionReady = { [weak self, weak session] newPath in
+            guard let self, let session else { return }
+            let suggestedName = Self.branchSessionName(from: session.sessionName)
+            self.openBranchedSession(
+                path: newPath,
+                project: session.projectURL,
+                suggestedName: suggestedName
+            )
+        }
+        // Object identity survives edit-fork rebind (captured `key` would go stale).
+        session.isSelectedCheck = { [weak self, weak session] in
+            guard let self, let session else { return false }
+            return self.currentSession === session
+        }
+        session.onInFlightChange = { [weak self] path, inFlight in
+            self?.applyInFlightChange(path: path, inFlight: inFlight)
+        }
         session.onRequestNewSession = { [weak self] in
             guard let self else { return }
             self.newSession(project: project)
         }
-        session.onRequestClose = { [weak self] in
-            self?.closeSession(key: key)
+        session.onRequestClose = { [weak self, weak session] in
+            guard let self, let session,
+                  let currentKey = self.openSessions.first(where: { $0.value === session })?.key else {
+                return
+            }
+            self.closeSession(key: currentKey)
         }
         return session
+    }
+
+    /// Keep a resumed tab bound to the file created by an edit-fork.
+    func rebindOpenSessionFile(from oldPath: String, to newPath: String) {
+        guard !oldPath.isEmpty, !newPath.isEmpty, oldPath != newPath else { return }
+
+        let oldKey = "resume:\(oldPath)"
+        let newKey = "resume:\(newPath)"
+        let session = openSessions[oldKey]
+            ?? openSessions.values.first(where: { $0.sessionFile == newPath })
+        guard let session else { return }
+
+        if openSessions[oldKey] === session {
+            openSessions.removeValue(forKey: oldKey)
+            session.rebindIdentity(to: newKey)
+            openSessions[newKey] = session
+            if selectedSessionKey == oldKey {
+                selectedSessionKey = newKey
+            }
+            if let conflicts = extensionConflicts.removeValue(forKey: oldKey) {
+                extensionConflicts[newKey] = conflicts
+            }
+        }
+
+        upsertLiveSessionMeta(
+            project: session.projectURL,
+            file: newPath,
+            name: session.sessionName ?? "新会话"
+        )
+        refreshSessions(for: session.projectURL)
+    }
+
+    private func applyInFlightChange(path: String, inFlight: Bool) {
+        var next = interruptedSessionPaths
+        if inFlight {
+            next.insert(path)
+        } else {
+            next.remove(path)
+        }
+        if next != interruptedSessionPaths {
+            interruptedSessionPaths = next
+        }
     }
 
     private func persistProjects() {
@@ -241,6 +336,55 @@ final class AppStore: ObservableObject {
 
     private func persistArchivedSessions() {
         UserDefaults.standard.set(Array(archivedSessionPaths).sorted(), forKey: Self.archivedSessionsKey)
+    }
+
+    private func persistPinnedSessions() {
+        UserDefaults.standard.set(Array(userPinnedSessionPaths).sorted(), forKey: Self.pinnedSessionsKey)
+    }
+
+    // MARK: - User pin (global sidebar section)
+
+    func isSessionPinned(_ path: String) -> Bool {
+        userPinnedSessionPaths.contains(path)
+    }
+
+    func pinSession(path: String) {
+        guard !path.isEmpty, !archivedSessionPaths.contains(path) else { return }
+        guard !userPinnedSessionPaths.contains(path) else { return }
+        userPinnedSessionPaths.insert(path)
+        persistPinnedSessions()
+    }
+
+    func unpinSession(path: String) {
+        guard userPinnedSessionPaths.contains(path) else { return }
+        userPinnedSessionPaths.remove(path)
+        persistPinnedSessions()
+    }
+
+    func togglePinSession(path: String) {
+        if isSessionPinned(path) {
+            unpinSession(path: path)
+        } else {
+            pinSession(path: path)
+        }
+    }
+
+    /// Pinned metas across all projects, newest activity first.
+    var pinnedSessionMetas: [SessionMeta] {
+        SessionPinLogic.pinnedMetas(
+            sessionsByProject: sessionsByProject,
+            pinned: userPinnedSessionPaths,
+            sortBy: { effectiveModified($0) > effectiveModified($1) }
+        )
+    }
+
+    func project(forSessionPath path: String) -> URL? {
+        guard let projectPath = SessionPinLogic.projectPath(
+            forSessionPath: path,
+            projects: projects,
+            sessionDirectory: Self.sessionDirectory(forCwd:)
+        ) else { return nil }
+        return projects.first { $0.path == projectPath }
     }
 
     // MARK: - Projects
@@ -280,6 +424,18 @@ final class AppStore: ObservableObject {
         for key in pendingKeys {
             closeSession(key: key)
         }
+        // Drop global pins that belonged to this project's session directory.
+        let dirPrefix: String = {
+            let dir = Self.sessionDirectory(forCwd: url.path).path
+            return dir.hasSuffix("/") ? dir : dir + "/"
+        }()
+        let before = userPinnedSessionPaths.count
+        userPinnedSessionPaths = userPinnedSessionPaths.filter { path in
+            !(path == Self.sessionDirectory(forCwd: url.path).path || path.hasPrefix(dirPrefix))
+        }
+        if userPinnedSessionPaths.count != before {
+            persistPinnedSessions()
+        }
         projects.removeAll { $0.path == url.path }
         persistProjects()
         if selectedProjectPath == url.path {
@@ -305,27 +461,51 @@ final class AppStore: ObservableObject {
             .appendingPathComponent(".pi/agent/sessions/--\(escaped)--")
     }
 
+    /// T7: 增量扫描缓存——projectPath → (session 文件路径 → (mtime, name, ephemeral))。
+    /// 只有新增或 mtime 变化的文件才重新读内容解析 name/ephemeral，其余复用上次结果。
+    private var sessionScanCache: [String: [String: (mtime: Date, name: String, ephemeral: Bool)]] = [:]
+    private let sessionScanCacheLock = NSLock()
+
     func refreshSessions(for project: URL) {
         let dir = Self.sessionDirectory(forCwd: project.path)
         let projectPath = project.path
         let archived = archivedSessionPaths
+        sessionScanCacheLock.lock()
+        let cachedEntries = sessionScanCache[projectPath] ?? [:]
+        sessionScanCacheLock.unlock()
         DispatchQueue.global(qos: .userInitiated).async {
             let fm = FileManager.default
             let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]))?
                 .filter { $0.pathExtension == "jsonl" } ?? []
             var active: [SessionMeta] = []
             var archivedMetas: [SessionMeta] = []
+            var newCache: [String: (mtime: Date, name: String, ephemeral: Bool)] = [:]
+            newCache.reserveCapacity(files.count)
             for url in files {
-                // Skip orphan side-channel title-gen sessions (pi ran without --no-session).
-                if Self.isEphemeralTitlePromptSession(url) { continue }
+                let path = url.path
                 let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let meta = SessionMeta(path: url.path, name: Self.sessionDisplayName(url), modified: mtime)
-                if archived.contains(url.path) {
+                // 增量：mtime 未变直接复用上次的 name/ephemeral，不重复读文件内容
+                let entry: (name: String, ephemeral: Bool)
+                if let hit = cachedEntries[path], hit.mtime == mtime {
+                    entry = (hit.name, hit.ephemeral)
+                } else if Self.isEphemeralTitlePromptSession(url) {
+                    entry = ("", true)
+                } else {
+                    entry = (Self.sessionDisplayName(url), false)
+                }
+                newCache[path] = (mtime: mtime, name: entry.name, ephemeral: entry.ephemeral)
+                // Skip orphan side-channel title-gen sessions (pi ran without --no-session).
+                if entry.ephemeral { continue }
+                let meta = SessionMeta(path: path, name: entry.name, modified: mtime)
+                if archived.contains(path) {
                     archivedMetas.append(meta)
                 } else {
                     active.append(meta)
                 }
             }
+            self.sessionScanCacheLock.lock()
+            self.sessionScanCache[projectPath] = newCache
+            self.sessionScanCacheLock.unlock()
             active.sort { $0.modified > $1.modified }
             archivedMetas.sort { $0.modified > $1.modified }
             DispatchQueue.main.async {
@@ -511,7 +691,55 @@ final class AppStore: ObservableObject {
         selectedSessionKey = key
     }
 
+    func openBranchedSession(path: String, project: URL, suggestedName: String) {
+        guard !path.isEmpty else { return }
+        let key = "resume:\(path)"
+        if openSessions[key] == nil {
+            openSessions[key] = makeSession(key: key, project: project, sessionPath: path)
+        }
+        selectedSessionKey = key
+        upsertLiveSessionMeta(project: project, file: path, name: suggestedName)
+        refreshSessions(for: project)
+
+        // The resumed process needs a moment to finish startup before accepting rename RPCs.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.openSessions[key]?.setSessionName(suggestedName)
+        }
+    }
+
+    package static func branchSessionName(
+        from currentName: String?,
+        date: Date = Date(),
+        timeZone: TimeZone = .current
+    ) -> String {
+        let base = currentName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let label: String
+        if let base, !base.isEmpty, !SessionTitleLogic.isPlaceholderName(base) {
+            label = "分支 · \(base)"
+        } else {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = timeZone
+            formatter.dateFormat = "HHmmss"
+            label = "分支 · \(formatter.string(from: date))"
+        }
+        return label.count > 40 ? String(label.prefix(39)) + "…" : label
+    }
+
     // MARK: - 扩展冲突
+
+    /// 后台全量检测结果回流（主线程）：真有冲突时弹出可修复提示。
+    /// 会话此时已经 spawn——真冲突下 pi 会自己 exit(1)，这里只负责给出修复入口，
+    /// 不再杀进程重启，避免保守检测的误报打断健康会话。
+    private func applyLateDetectedConflicts(_ found: [PiExtensionConflict], key: String) {
+        guard openSessions[key] != nil else { return }
+        let conflicts = found.filter { !ignoredConflicts.contains($0.entryPath) }
+        if conflicts.isEmpty {
+            extensionConflicts.removeValue(forKey: key)
+        } else {
+            extensionConflicts[key] = conflicts
+        }
+    }
 
     /// 把冲突扩展在 pi 的 settings.json 里关掉，然后重启会话让补丁版独占 subagent 工具名
     func resolveExtensionConflicts(sessionKey: String) {
@@ -565,6 +793,10 @@ final class AppStore: ObservableObject {
 
     func archiveSession(path: String, project: URL) {
         pinnedToTop.removeValue(forKey: path)
+        if userPinnedSessionPaths.contains(path) {
+            userPinnedSessionPaths.remove(path)
+            persistPinnedSessions()
+        }
         archivedSessionPaths.insert(path)
         persistArchivedSessions()
 

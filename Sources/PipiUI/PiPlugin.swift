@@ -20,6 +20,10 @@ enum PiPlugin {
         var mediaExtension: String?   // -e 对话内 generate_image
         var gitExtension: String?     // -e git_status / git_diff + prompt snapshot
         var reloadExtension: String?  // -e 内部 pipiui_reload 命令
+        var webSearchExtension: String? // -e web_search / web_fetch
+        var skillTierExtension: String? // -e 按模型档位注入 Superpowers 指令 + 派工闸门
+        var codexServerToolsExtension: String? // -e openai-codex hosted web_search
+        var claudeServerToolsExtension: String? // -e anthropic hosted web_search
         var agentsDir: String?     // PIPIUI_AGENTS_DIR
         var bossPrompt: String?    // --append-system-prompt（Boss 模式）
     }
@@ -29,23 +33,123 @@ enum PiPlugin {
             .appendingPathComponent("PipiUI")
     }
 
+    /// 启动指纹标记：上次完整安装时的插件指纹，未变更则整轮跳过（第二次启动基本零 I/O）。
+    private static var markerURL: URL { root.appendingPathComponent(".install-marker") }
+
     /// 每次启动调用：把打包的插件源拷到 Application Support（覆盖旧版）。
+    /// 指纹（可执行文件 mtime+size + 打包 PiExt 目录签名）未变且目标文件齐全时整体跳过。
+    /// 首次调用（或任何变更后）仍是同步完整安装，保证 spawn 首个会话前插件已就绪。
     static func installAll() -> Installed {
-        var result = Installed()
         let fm = FileManager.default
         try? fm.createDirectory(at: root, withIntermediateDirectories: true)
+        let fingerprint = currentFingerprint()
+        if let saved = try? String(contentsOf: markerURL, encoding: .utf8),
+           saved == fingerprint,
+           let existing = installedIfComplete() {
+            return existing
+        }
+        let result = performInstall()
+        try? fingerprint.write(to: markerURL, atomically: true, encoding: .utf8)
+        return result
+    }
+
+    /// 插件内容指纹：扩展/提示词源码编译进二进制，PiExt 是打包资源。
+    /// 可执行文件 mtime+size 每次重编译都变，覆盖前者；目录签名覆盖后者。
+    private static func currentFingerprint() -> String {
+        var parts: [String] = []
+        if let exe = Bundle.main.executableURL,
+           let attrs = try? FileManager.default.attributesOfItem(atPath: exe.path) {
+            let m = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            let s = (attrs[.size] as? Int) ?? 0
+            parts.append("exe:\(s):\(m)")
+        }
+        if let bundled = Bundle.module.url(forResource: "PiExt", withExtension: nil) {
+            parts.append(directorySignature(bundled))
+        }
+        return parts.joined(separator: "|")
+    }
+
+    /// 目录签名：相对路径 + size + mtime 拼接（不读文件内容，几十个文件很快）。
+    private static func directorySignature(_ dir: URL) -> String {
+        let fm = FileManager.default
+        guard let e = fm.enumerator(at: dir, includingPropertiesForKeys: nil) else { return "" }
+        var sig = ""
+        for case let url as URL in e {
+            let rel = url.path.replacingOccurrences(of: dir.path, with: "")
+            let attrs = try? fm.attributesOfItem(atPath: url.path)
+            let m = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            let s = (attrs?[.size] as? Int) ?? 0
+            sig += "\(rel)#\(s)#\(m);"
+        }
+        return sig
+    }
+
+    /// 跳过路径：所有目标文件都还在才可信（用户手删/Application Support 被清时回退全量安装）。
+    private static func installedIfComplete() -> Installed? {
+        let fm = FileManager.default
+        var result = Installed()
+        if Bundle.module.url(forResource: "PiExt", withExtension: nil) != nil {
+            let dest = root.appendingPathComponent("pi-ext")
+            let sub = dest.appendingPathComponent("subagent").path
+            let agents = dest.appendingPathComponent("agents").path
+            guard fm.fileExists(atPath: sub), fm.fileExists(atPath: agents) else { return nil }
+            result.subagentDir = sub
+            result.agentsDir = agents
+        }
+        let files: [(String, WritableKeyPath<Installed, String?>)] = [
+            ("pipiui-webview.ts", \.webviewExtension),
+            ("pipiui-media.ts", \.mediaExtension),
+            ("pipiui-git.ts", \.gitExtension),
+            ("pipiui-reload.ts", \.reloadExtension),
+            ("pipiui-websearch.ts", \.webSearchExtension),
+            ("pipiui-skilltier.ts", \.skillTierExtension),
+            ("pipiui-codex-server-tools.ts", \.codexServerToolsExtension),
+            ("pipiui-claude-server-tools.ts", \.claudeServerToolsExtension),
+            ("boss-prompt.md", \.bossPrompt),
+        ]
+        for (name, keyPath) in files {
+            let path = root.appendingPathComponent(name).path
+            guard fm.fileExists(atPath: path) else { return nil }
+            result[keyPath: keyPath] = path
+        }
+        return result
+    }
+
+    private static func performInstall() -> Installed {
+        var result = Installed()
+        let fm = FileManager.default
 
         // 1. 从 SPM 资源里把整个 PiExt 拷到 Application Support/pi-ext
-        if let bundled = Bundle.module.url(forResource: "PiExt", withExtension: nil) {
+        let bundledPiExt =
+            Bundle.module.url(forResource: "PiExt", withExtension: nil)
+            ?? Bundle.module.resourceURL?.appendingPathComponent("PiExt", isDirectory: true)
+        if let bundled = bundledPiExt, fm.fileExists(atPath: bundled.path) {
             let dest = root.appendingPathComponent("pi-ext")
             try? fm.removeItem(at: dest)
             do {
                 try fm.copyItem(at: bundled, to: dest)
-                result.subagentDir = dest.appendingPathComponent("subagent").path
-                result.agentsDir = dest.appendingPathComponent("agents").path
+                let subagent = dest.appendingPathComponent("subagent")
+                let agents = dest.appendingPathComponent("agents")
+                if fm.fileExists(atPath: subagent.path) {
+                    result.subagentDir = subagent.path
+                }
+                if fm.fileExists(atPath: agents.path) {
+                    result.agentsDir = agents.path
+                }
             } catch {
                 // 拷贝失败时降级：subagent 面板仍能用（依赖用户自装的），只是没补丁
             }
+        }
+        // If Application Support is stale/incomplete, still point at the bundle agents.
+        if result.agentsDir == nil,
+           let bundledAgents = bundledPiExt?.appendingPathComponent("agents"),
+           fm.fileExists(atPath: bundledAgents.path) {
+            result.agentsDir = bundledAgents.path
+        }
+        if result.subagentDir == nil,
+           let bundledSub = bundledPiExt?.appendingPathComponent("subagent"),
+           fm.fileExists(atPath: bundledSub.path) {
+            result.subagentDir = bundledSub.path
         }
 
         // 2. 内置浏览器扩展（字符串生成，无外部依赖）
@@ -59,6 +163,19 @@ enum PiPlugin {
 
         // 5. 热重载扩展/skills/prompts/context（内部命令 pipiui_reload）
         result.reloadExtension = ReloadExtension.install(into: root)
+
+        // 5.5 通用网络搜索 + 网页抓取（web_search / web_fetch）
+        result.webSearchExtension = WebSearchExtension.install(into: root)
+
+        // 5.6 模型档位 → Superpowers 强度（强模型作参考，弱模型强制走 SOP）
+        result.skillTierExtension = SkillTierExtension.install(into: root)
+        ModelTierSettings.syncJSONFile()
+
+        // 5.7 官方 openai-codex Responses hosted web_search
+        result.codexServerToolsExtension = CodexServerToolsExtension.install(into: root)
+
+        // 5.8 官方 anthropic-messages hosted web_search
+        result.claudeServerToolsExtension = ClaudeServerToolsExtension.install(into: root)
 
         // 6. Boss 协议提示词
         result.bossPrompt = BossPrompt.install(into: root)

@@ -75,4 +75,27 @@ final class PiExtensionConflictsCacheTests: XCTestCase {
         let after = PiExtensionConflicts.scan(baseDir: base, scopeLabel: "test")
         XCTAssertTrue(after.isEmpty, "disable should force-exclude the entry for scan")
     }
+
+    func testCachedReturnsNilBeforeDetectAndHitAfter() throws {
+        XCTAssertNil(
+            PiExtensionConflicts.cached(projectDir: tempRoot),
+            "cold cache must report miss so caller can go async"
+        )
+        let detected = PiExtensionConflicts.detect(projectDir: tempRoot)
+        let hit = PiExtensionConflicts.cached(projectDir: tempRoot)
+        XCTAssertEqual(hit, detected, "stamp-unchanged cache hit should return detected result")
+    }
+
+    func testDetectAsyncDeliversResultOnMainThread() throws {
+        let expected = PiExtensionConflicts.detect(projectDir: tempRoot)
+        PiExtensionConflicts.clearCache()
+
+        let exp = expectation(description: "async detect")
+        PiExtensionConflicts.detectAsync(projectDir: tempRoot) { result in
+            XCTAssertTrue(Thread.isMainThread, "completion must be delivered on main thread")
+            XCTAssertEqual(result, expected)
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 10)
+    }
 }

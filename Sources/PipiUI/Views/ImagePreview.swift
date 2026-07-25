@@ -282,39 +282,51 @@ struct ImageLightboxChrome: View {
     let image: NSImage
     let onDismiss: () -> Void
 
+    private let margin: CGFloat = 32
+
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.52)
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture(perform: onDismiss)
+        GeometryReader { geo in
+            let fitted = Self.fittedSize(
+                imageSize: image.size,
+                in: CGSize(
+                    width: max(0, geo.size.width - margin * 2),
+                    height: max(0, geo.size.height - margin * 2)
+                )
+            )
+            ZStack {
+                // Full-screen hit target — must sit under a tightly-sized image frame
+                // or letterboxed Image bounds swallow backdrop taps.
+                Color.black.opacity(0.52)
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onDismiss)
 
-            Image(nsImage: image)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .shadow(color: .black.opacity(0.35), radius: 24, y: 8)
-                .padding(32)
-                // Absorb taps on the image so they don't dismiss via the backdrop.
-                .contentShape(Rectangle())
-                .onTapGesture { /* keep open */ }
+                Image(nsImage: image)
+                    .resizable()
+                    .frame(width: fitted.width, height: fitted.height)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .shadow(color: .black.opacity(0.35), radius: 24, y: 8)
+                    // Only the drawn image absorbs taps; surrounding dim dismisses.
+                    .onTapGesture { /* keep open */ }
 
-            VStack {
-                HStack {
-                    Spacer()
-                    Button(action: onDismiss) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 28))
-                            .symbolRenderingMode(.palette)
-                            .foregroundStyle(.white, .white.opacity(0.35))
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button(action: onDismiss) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 28))
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(.white, .white.opacity(0.35))
+                        }
+                        .buttonStyle(.plain)
+                        .keyboardShortcut(.cancelAction)
+                        .padding(20)
+                        .help("关闭 (Esc)")
                     }
-                    .buttonStyle(.plain)
-                    .keyboardShortcut(.cancelAction)
-                    .padding(20)
-                    .help("关闭 (Esc)")
+                    Spacer()
                 }
-                Spacer()
             }
+            .frame(width: geo.size.width, height: geo.size.height)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .focusable()
@@ -323,5 +335,16 @@ struct ImageLightboxChrome: View {
             return .handled
         }
         .onExitCommand(perform: onDismiss)
+    }
+
+    /// Aspect-fit size that matches the visible image (not the letterboxed layout frame).
+    static func fittedSize(imageSize: CGSize, in bounds: CGSize) -> CGSize {
+        let iw = max(imageSize.width, 1)
+        let ih = max(imageSize.height, 1)
+        let bw = max(bounds.width, 0)
+        let bh = max(bounds.height, 0)
+        guard bw > 0, bh > 0 else { return .zero }
+        let scale = min(bw / iw, bh / ih)
+        return CGSize(width: iw * scale, height: ih * scale)
     }
 }

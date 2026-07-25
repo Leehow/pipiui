@@ -294,10 +294,29 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("before_agent_start", (event) => {
-    if (event.systemPrompt.includes(MARKER)) return;
+  // Cache discipline: this snapshot must never touch the system prompt.
+  //
+  // `before_agent_start` fires on every user turn and always receives the *base*
+  // prompt (agent-session passes `_baseSystemPrompt`), so a MARKER guard never
+  // trips and appending here rewrites the cached prefix every turn. Any change to
+  // the dirty counts — i.e. every turn where the agent wrote a file — then costs a
+  // full re-prime of the whole conversation at uncached prices.
+  //
+  // A custom message lands *after* the prefix (pi maps role "custom" to a user
+  // message), so it is cache-neutral. Emit one only when the snapshot actually
+  // changed; steady-state turns then add nothing at all.
+  let lastSnapshot: string | null = null;
+  pi.on("before_agent_start", () => {
     const snap = buildSnapshot(process.cwd());
-    return { systemPrompt: `${event.systemPrompt}\n\n${snap}` };
+    if (snap === lastSnapshot) return;
+    lastSnapshot = snap;
+    return {
+      message: {
+        customType: "pipiui-git-snapshot",
+        content: [{ type: "text", text: snap }],
+        display: false,
+      },
+    };
   });
 }
 """#

@@ -25,6 +25,7 @@ struct HoverForeground<Content: View>: View {
             .foregroundStyle(isPressed || isHovered ? hovered : base)
             .animation(.easeInOut(duration: 0.12), value: isHovered)
             .onHover { isHovered = $0 }
+            .pointingHandCursor()
     }
 }
 

@@ -14,15 +14,16 @@
 
 ## 内置浏览器 + pi browser 工具
 
-每个会话有一个内置 WKWebView 面板（顶栏 🌐 按钮开关，pi 调 `browser_navigate` 时自动弹出），带地址栏/前进后退/刷新。App 启动时会把一个 pi 扩展写到 `~/Library/Application Support/PipiUI/pipiui-webview.ts`，并在 spawn pi 时自动 `-e` 加载，注册以下工具供模型测试网页开发：
+每个会话有一个内置 WKWebView 面板（顶栏 🌐 按钮开关，pi 调 `browser` 的 navigate 时自动弹出），带地址栏/前进后退/刷新。App 启动时会把一个 pi 扩展写到 `~/Library/Application Support/PipiUI/pipiui-webview.ts`，并在 spawn pi 时自动 `-e` 加载，注册**单个** `browser` 工具供模型测试网页开发（合并前是 5 个 `browser_*` 工具，占前缀 517 token；合为一个后约 110 token，且工具集恒定不会毁缓存——见 [`docs/progressive-disclosure.md`](./docs/progressive-disclosure.md)）：
 
-| 工具 | 作用 |
+| `browser({action})` | 作用 |
 |---|---|
-| `browser_navigate` | 打开 URL 并等待加载完成 |
-| `browser_content` | 读取页面可见文本或完整 HTML |
-| `browser_eval` | 在页面里执行任意 JS（DOM 检查、触发点击等） |
-| `browser_console` | 读取捕获的 console 输出 / JS 异常 / 导航失败 |
-| `browser_screenshot` | 页面截图，以图片形式返回给模型（模型能看） |
+| `navigate {url}` | 打开 URL 并等待加载完成 |
+| `content {mode?}` | 读取页面可见文本（默认）或完整 HTML |
+| `eval {js}` | 在页面里执行任意 JS（DOM 检查、触发点击等） |
+| `console {clear?}` | 读取捕获的 console 输出 / JS 异常 / 导航失败 |
+| `screenshot` | 页面截图，以图片形式返回给模型（模型能看） |
+| `help` | 返回上述全部参数说明（细节走 tool result，不进前缀） |
 
 实现：App 内起一个仅监听 127.0.0.1 的 HTTP 桥接服务，扩展通过 `PIPIUI_BRIDGE_PORT` / `PIPIUI_SESSION_KEY` 环境变量找到它并按会话路由；未知 key 兜底路由到当前选中会话（终端里手动跑 `pi -e pipiui-webview.ts` 也能驱动 GUI 面板）。调试钩子：`PIPIUI_AUTO_SESSION=<项目路径>` 启动可自动建会话。
 
@@ -61,6 +62,10 @@
 **服务端命令**：会话启动时自动 `get_commands`，解析 extension / prompt / skill 三类并入候选（徽标 `ext` / `prompt` / `skill`）。执行走现有 `prompt` 路径；生成中入 follow-up 队列。`get_commands` 失败或为空时仅显示内置，不报错刷屏。
 
 **其它规则**：未知 `/xxx`（不在内置与服务端列表）当普通消息发出；⌘V 粘贴等既有输入行为不受影响。
+
+## API key 与凭据管理
+
+所有 API key 统一存放在 `~/.pi/agent/.env`（0600，原子写入）：模型 key 在 spawn 会话子进程时注入环境（改 key 需重启会话生效），搜索 key 每次搜索热读即时生效；OAuth 凭据永远留在 pi 自己的 `auth.json`（refresh token 轮转）。首次启动自动把 `auth.json` 里的旧 `api_key` 条目迁入 `.env`（备份 `auth.json.pipiui-bak`，`.env` 已有值优先）。设置页 key 输入框不回显、留空即不修改，`.env` 与 `auth.json` 双份残留时给出冲突警告 + 一键清理。终端里直接用 pi TUI 需在 shell rc 里 source 该文件。详见 [`docs/key-management.md`](./docs/key-management.md)。
 
 ## 构建运行
 

@@ -77,4 +77,25 @@ final class ModelSettingsTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
         XCTAssertThrowsError(try PiAuthStore.setAPIKey(providerId: "openai", key: "  ", authURL: url))
     }
+
+    func testDeleteAPIKeyEntryOnlyRemovesAPIKeyType() throws {
+        let url = tempAuthURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        // api_key entry is removed.
+        try PiAuthStore.setAPIKey(providerId: "anthropic", key: "sk-ant", authURL: url)
+        XCTAssertTrue(try PiAuthStore.deleteAPIKeyEntry(providerId: "anthropic", authURL: url))
+        XCTAssertTrue(PiAuthStore.list(authURL: url).isEmpty)
+        XCTAssertFalse(try PiAuthStore.deleteAPIKeyEntry(providerId: "anthropic", authURL: url))
+
+        // oauth entry is never touched.
+        var root: [String: Any] = ["openai": ["type": "oauth", "access": "tok", "refresh": "ref"]]
+        let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+        try data.write(to: url, options: .atomic)
+        XCTAssertFalse(try PiAuthStore.deleteAPIKeyEntry(providerId: "openai", authURL: url))
+        let listed = PiAuthStore.list(authURL: url)
+        XCTAssertEqual(listed.map(\.providerId), ["openai"])
+        XCTAssertEqual(listed.first?.type, "oauth")
+        root.removeAll()
+    }
 }

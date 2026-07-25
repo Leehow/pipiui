@@ -147,6 +147,64 @@ final class TokenLedgerTests: XCTestCase {
         XCTAssertLessThan(activeLines.count, rolledLines.count + activeLines.count, "total grew monotonically")
     }
 
+    func testAppendWritesToolsWhenNonEmpty() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-ledger-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ledger = makeLedger(in: dir)
+        ledger.append(
+            session: "s", channel: "main", agentId: nil, agentName: nil,
+            depth: 0, model: "xai/a", turn: 1,
+            usage: .init(input: 1, output: 2),
+            tools: ["bash", "read"]
+        )
+        ledger.flushSync()
+        let data = try Data(contentsOf: ledger.fileURL)
+        let line = String(data: data, encoding: .utf8)!
+            .split(separator: "\n").first!
+        let obj = try JSONSerialization.jsonObject(with: Data(line.utf8)) as! [String: Any]
+        XCTAssertEqual(obj["tools"] as? [String], ["bash", "read"])
+    }
+
+    func testAppendOmitsToolsWhenEmpty() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-ledger-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ledger = makeLedger(in: dir)
+        ledger.append(
+            session: "s", channel: "main", agentId: nil, agentName: nil,
+            depth: 0, model: "xai/a", turn: 1,
+            usage: .init(input: 1, output: 2),
+            tools: []
+        )
+        ledger.flushSync()
+        let data = try Data(contentsOf: ledger.fileURL)
+        let line = String(data: data, encoding: .utf8)!
+            .split(separator: "\n").first!
+        let obj = try JSONSerialization.jsonObject(with: Data(line.utf8)) as! [String: Any]
+        XCTAssertNil(obj["tools"])
+    }
+
+    func testToolNamesFromMessageDedupsAndSorts() {
+        let message: [String: Any] = [
+            "role": "assistant",
+            "content": [
+                ["type": "text", "text": "hi"],
+                ["type": "toolCall", "name": "read", "id": "1"],
+                ["type": "toolCall", "name": "bash", "id": "2"],
+                ["type": "toolCall", "name": "read", "id": "3"],
+            ],
+        ]
+        XCTAssertEqual(TokenLedger.toolNames(from: J(message)), ["bash", "read"])
+    }
+
+    func testRolledFileURLSuffix() {
+        let ledger = TokenLedger(baseDirectory: FileManager.default.temporaryDirectory)
+        XCTAssertTrue(ledger.rolledFileURL.path.hasSuffix("pipiui-token-ledger.jsonl.1"))
+    }
+
     func testRollReplacesPreviousBackup() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("pipiui-ledger-\(UUID().uuidString)", isDirectory: true)

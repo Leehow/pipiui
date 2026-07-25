@@ -38,86 +38,79 @@ function text(t: string) {
   return { content: [{ type: "text" as const, text: t }], details: {} };
 }
 
+// Full parameter docs live here, not in the tool schema: help text is delivered as a
+// tool result, which appends to the conversation instead of rewriting the cached
+// prefix. See docs/progressive-disclosure.md.
+const HELP = [
+  "browser actions:",
+  "",
+  "navigate {url}          Open a URL in the panel and wait for load. Scheme optional;",
+  "                        localhost defaults to http. Returns final URL + title.",
+  "content {mode?}         Page content. mode='text' (default) visible text, 'html' full DOM.",
+  "eval {js}               Evaluate JS in the current page; returns the JSON-stringified result.",
+  "                        Use for DOM inspection, triggering clicks, reading state.",
+  "console {clear?}        Console output (log/info/warn/error), JS exceptions and failed",
+  "                        navigations since the last clear. clear=true empties the buffer.",
+  "screenshot              Screenshot of the current page, returned as an image you can look at.",
+  "help                    This text.",
+].join("\n");
+
 export default function (pi: ExtensionAPI) {
   if (!PORT || !KEY) return; // Not running inside Pipi UI; stay dormant.
 
+  // One stable tool instead of five browser_* tools. The tool set never changes, so the
+  // prompt prefix stays cached, and the per-request schema cost drops ~400 tokens.
   pi.registerTool({
-    name: "browser_navigate",
-    label: "Browser Navigate",
+    name: "browser",
+    label: "Browser",
     description:
-      "Navigate the built-in WebView panel to a URL and wait for the page to load. " +
-      "Use this to open a local dev server (e.g. http://localhost:3000) or any page you need to test. " +
-      "Returns the final URL and page title.",
+      "Drive the built-in WebView panel to test web pages. " +
+      "actions: navigate{url}, content{mode?}, eval{js}, console{clear?}, screenshot, help. " +
+      'Call with action:"help" for full parameter docs.',
     parameters: Type.Object({
-      url: Type.String({ description: "URL to open. Scheme optional; localhost defaults to http." }),
-    }),
-    async execute(_id, params) {
-      const r = await bridge("navigate", { url: params.url });
-      const note = r.note ? `\nnote: ${r.note}` : "";
-      return text(`Loaded: ${r.url}\nTitle: ${r.title}${note}`);
-    },
-  });
-
-  pi.registerTool({
-    name: "browser_eval",
-    label: "Browser Eval JS",
-    description:
-      "Execute JavaScript in the built-in WebView's current page and return the result " +
-      "(JSON-stringified when possible). Use for DOM inspection, triggering clicks, reading state.",
-    parameters: Type.Object({
-      js: Type.String({ description: "JavaScript expression or IIFE to evaluate in the page" }),
-    }),
-    async execute(_id, params) {
-      const r = await bridge("eval", { js: params.js });
-      return text(String(r.result ?? "undefined"));
-    },
-  });
-
-  pi.registerTool({
-    name: "browser_content",
-    label: "Browser Page Content",
-    description:
-      "Get the built-in WebView's current page content. mode='text' returns visible text (default), " +
-      "mode='html' returns the full serialized DOM.",
-    parameters: Type.Object({
+      action: Type.String({
+        description: "navigate | content | eval | console | screenshot | help",
+      }),
+      url: Type.Optional(Type.String()),
+      js: Type.Optional(Type.String()),
       mode: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("html")])),
-    }),
-    async execute(_id, params) {
-      const r = await bridge("content", { mode: params.mode ?? "text" });
-      const suffix = r.truncated ? "\n\n[content truncated at 100000 chars]" : "";
-      return text((r.content || "(empty page)") + suffix);
-    },
-  });
-
-  pi.registerTool({
-    name: "browser_console",
-    label: "Browser Console Logs",
-    description:
-      "Read console output (log/info/warn/error), JS exceptions and failed navigations captured from " +
-      "the built-in WebView since the last clear. Set clear=true to clear the buffer after reading.",
-    parameters: Type.Object({
       clear: Type.Optional(Type.Boolean()),
     }),
     async execute(_id, params) {
-      const r = await bridge("console", { clear: params.clear ?? false });
-      const logs: string[] = r.logs || [];
-      return text(logs.length ? logs.join("\n") : "(console is empty)");
-    },
-  });
-
-  pi.registerTool({
-    name: "browser_screenshot",
-    label: "Browser Screenshot",
-    description:
-      "Take a screenshot of the built-in WebView's current page and return it as an image " +
-      "you can look at. Use to visually verify layout and styling.",
-    parameters: Type.Object({}),
-    async execute() {
-      const r = await bridge("screenshot");
-      return {
-        content: [{ type: "image" as const, data: r.base64, mimeType: r.mimeType || "image/png" }],
-        details: {},
-      };
+      switch (params.action) {
+        case "navigate": {
+          if (!params.url) return text('browser navigate requires "url".\n\n' + HELP);
+          const r = await bridge("navigate", { url: params.url });
+          const note = r.note ? `\nnote: ${r.note}` : "";
+          return text(`Loaded: ${r.url}\nTitle: ${r.title}${note}`);
+        }
+        case "content": {
+          const r = await bridge("content", { mode: params.mode ?? "text" });
+          const suffix = r.truncated ? "\n\n[content truncated at 100000 chars]" : "";
+          return text((r.content || "(empty page)") + suffix);
+        }
+        case "eval": {
+          if (!params.js) return text('browser eval requires "js".\n\n' + HELP);
+          const r = await bridge("eval", { js: params.js });
+          return text(String(r.result ?? "undefined"));
+        }
+        case "console": {
+          const r = await bridge("console", { clear: params.clear ?? false });
+          const logs: string[] = r.logs || [];
+          return text(logs.length ? logs.join("\n") : "(console is empty)");
+        }
+        case "screenshot": {
+          const r = await bridge("screenshot");
+          return {
+            content: [{ type: "image" as const, data: r.base64, mimeType: r.mimeType || "image/png" }],
+            details: {},
+          };
+        }
+        case "help":
+          return text(HELP);
+        default:
+          return text(`Unknown browser action "${params.action}".\n\n${HELP}`);
+      }
     },
   });
 }

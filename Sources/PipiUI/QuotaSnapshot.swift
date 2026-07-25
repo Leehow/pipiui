@@ -49,7 +49,7 @@ struct QuotaSnapshot: Equatable {
 
 /// The provider kind backing an account-quota pill.
 enum QuotaProvider: String, CaseIterable {
-    case grok, glm, claude, codex, kimi
+    case grok, glm, claude, codex, kimi, qoder
 
     /// Human-readable name for the popover title, e.g. "Grok 账号额度".
     var accountLabel: String {
@@ -59,6 +59,7 @@ enum QuotaProvider: String, CaseIterable {
         case .claude: return "Claude 账号额度"
         case .codex: return "Codex 账号额度"
         case .kimi: return "Kimi 账号额度"
+        case .qoder: return "Qoder 账号额度"
         }
     }
 
@@ -71,6 +72,7 @@ enum QuotaProvider: String, CaseIterable {
         case .claude: return ClaudeQuotaMonitor.shared
         case .codex: return CodexQuotaMonitor.shared
         case .kimi: return KimiQuotaMonitor.shared
+        case .qoder: return QoderQuotaMonitor.shared
         }
     }
 }

@@ -3,6 +3,54 @@ import XCTest
 
 final class KimiCreditsTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // Isolate from the real ~/.pi/agent/.env; individual tests re-point this.
+        QuotaEnvFallback.envFileValues = { [:] }
+    }
+
+    override func tearDown() {
+        QuotaEnvFallback.envFileValues = { EnvFileStore().all() }
+        super.tearDown()
+    }
+
+    // MARK: - .env fallback
+
+    func testAuthFallsBackToDotEnvWhenProcessEnvMissing() {
+        QuotaEnvFallback.envFileValues = { ["KIMI_CODE_API_KEY": "dotenv-key"] }
+        let cred = KimiAuthStore.resolveCodeBearer(
+            authURL: URL(fileURLWithPath: "/tmp/pipiui-missing-auth-\(UUID().uuidString).json"),
+            env: [:],
+            kimiCodeHome: nil
+        )
+        XCTAssertEqual(cred, "dotenv-key")
+    }
+
+    func testProcessEnvWinsOverDotEnv() {
+        QuotaEnvFallback.envFileValues = { ["KIMI_API_KEY": "dotenv-generic"] }
+        let cred = KimiAuthStore.resolveCodeBearer(
+            authURL: URL(fileURLWithPath: "/tmp/pipiui-missing-auth-\(UUID().uuidString).json"),
+            env: ["KIMI_API_KEY": "process-generic"],
+            kimiCodeHome: nil
+        )
+        XCTAssertEqual(cred, "process-generic")
+    }
+
+    func testDotEnvDoesNotOverridePiAuth() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-kimi-auth-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let authURL = dir.appendingPathComponent("auth.json")
+        let payload: [String: Any] = [
+            "kimi-coding": ["type": "api_key", "key": "pi-key"]
+        ]
+        try JSONSerialization.data(withJSONObject: payload).write(to: authURL)
+        QuotaEnvFallback.envFileValues = { ["KIMI_CODE_API_KEY": "dotenv-key"] }
+        let cred = KimiAuthStore.resolveCodeBearer(authURL: authURL, env: [:], kimiCodeHome: nil)
+        XCTAssertEqual(cred, "pi-key")
+    }
+
     // MARK: - Code API parse
 
     func testParseCodeAPIUsageWindows() throws {

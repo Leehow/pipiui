@@ -30,4 +30,67 @@ final class MarkdownSelectionContentTests: XCTestCase {
             [.text("第一段。\n\n第二段。")]
         )
     }
+
+    func testSelectionAttributedAppliesBodyRhythm() {
+        let typography = ChatTypography.make(fontSize: 15)
+        let content = MarkdownSelectionContent.attributedString(
+            for: "第一行文字足够长会换行。\n第二行。",
+            typography: typography
+        )
+
+        var range = NSRange()
+        let style = content.attribute(.paragraphStyle, at: 0, effectiveRange: &range) as? NSParagraphStyle
+        XCTAssertNotNil(style)
+        XCTAssertEqual(style?.lineSpacing ?? -1, typography.lineSpacing, accuracy: 0.001)
+        XCTAssertEqual(style?.paragraphSpacing ?? -1, typography.paragraphSpacing, accuracy: 0.001)
+    }
+
+    func testListItemsUseListItemSpacing() {
+        let typography = ChatTypography.make(fontSize: 15)
+        let content = MarkdownSelectionContent.attributedString(
+            for: "- 一项\n- 二项",
+            typography: typography
+        )
+
+        var range = NSRange()
+        let style = content.attribute(.paragraphStyle, at: 0, effectiveRange: &range) as? NSParagraphStyle
+        XCTAssertNotNil(style)
+        XCTAssertEqual(style?.lineSpacing ?? -1, typography.lineSpacing, accuracy: 0.001)
+        XCTAssertEqual(style?.paragraphSpacing ?? -1, typography.listItemSpacing, accuracy: 0.001)
+    }
+
+    func testHeadingUsesTighterLineSpacing() {
+        let typography = ChatTypography.make(fontSize: 15)
+        let content = MarkdownSelectionContent.attributedString(
+            for: "## 标题",
+            typography: typography
+        )
+
+        var range = NSRange()
+        let style = content.attribute(.paragraphStyle, at: 0, effectiveRange: &range) as? NSParagraphStyle
+        XCTAssertNotNil(style)
+        XCTAssertEqual(style?.lineSpacing ?? -1, typography.headingLineSpacing, accuracy: 0.001)
+    }
+
+    func testBlockSeparatorUsesBlockSpacingLineHeight() {
+        let typography = ChatTypography.make(fontSize: 15)
+        let content = MarkdownSelectionContent.attributedString(
+            for: "第一段。\n\n第二段。",
+            typography: typography
+        )
+
+        // Separator sits at the first "\n\n" between the two paragraphs.
+        let separatorIndex = (content.string as NSString).range(of: "\n\n").location
+        XCTAssertNotEqual(separatorIndex, NSNotFound)
+
+        var range = NSRange()
+        let style = content.attribute(
+            .paragraphStyle,
+            at: separatorIndex,
+            effectiveRange: &range
+        ) as? NSParagraphStyle
+        XCTAssertNotNil(style)
+        XCTAssertEqual(style?.minimumLineHeight ?? -1, typography.blockSpacing, accuracy: 0.001)
+        XCTAssertEqual(style?.maximumLineHeight ?? -1, typography.blockSpacing, accuracy: 0.001)
+    }
 }

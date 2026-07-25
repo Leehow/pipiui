@@ -8,26 +8,38 @@ struct SidebarView: View {
     /// Per-project expand state for the archived section; missing key = collapsed.
     @State private var archivedExpandedByProject: [String: Bool] = [:]
 
+    /// Shared leading gutter — `.sidebar` List defaults are wider than needed.
+    private static let sidebarGutter: CGFloat = 10
+
     var body: some View {
         VStack(spacing: 0) {
             BrandMark(size: .sidebar)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
-                .padding(.bottom, 8)
-            // 普通 List（无 selection）：选中态由 store.selectedSessionKey 驱动，
-            // 背景由 SessionRowContainer 的 listRowBackground 单层绘制。
-            // 不用 List(selection:) 是为了避开 .sidebar 的系统选中 chrome——
-            // 它会在我们的 listRowBackground 之外再叠一层全宽底，形成“两层背景”。
-            List {
-                projectsSection
-                if let project = store.selectedProject {
-                    sessionsSection(project: project)
-                    archivedSessionsSection(project: project)
+                .padding(.horizontal, Self.sidebarGutter + 2)
+                .padding(.top, 14)
+                .padding(.bottom, 10)
+            // ScrollView — not List.sidebar. AppKit NSTableView scrollers ignore
+            // `.scrollIndicators(.hidden)` / hasVerticalScroller=false and keep a fat
+            // legacy track that expands on hover and flips column insets (忽大忽小).
+            // Selection chrome is drawn by SessionRowContainer.background.
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    projectsSection
+                    pinnedSection
+                    if let project = store.selectedProject {
+                        sessionsSection(project: project)
+                        archivedSessionsSection(project: project)
+                    }
                 }
+                .padding(.horizontal, Self.sidebarGutter)
+                .padding(.vertical, 8)
+                // Inside the document so enclosingScrollView resolves.
+                .overlayScrollers()
             }
-            .listStyle(.sidebar)
+            .scrollIndicators(.automatic)
+            .clipShape(Rectangle())
         }
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
         .safeAreaInset(edge: .bottom) {
             HStack(spacing: 8) {
                 Button {
@@ -51,8 +63,8 @@ struct SidebarView: View {
                 .controlSize(.mini)
                 .help("Boss 模式：新会话以大组长协议启动——不亲自干活，按难度分派 subagent（简单派单兵、复杂派组长、调研扇出），配合反早停失败恢复协议")
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, Self.sidebarGutter + 2)
+            .padding(.vertical, 12)
             .background(.bar)
         }
         .sheet(isPresented: $showSettings) {
@@ -88,7 +100,16 @@ struct SidebarView: View {
     }
 
     private var projectsSection: some View {
-        Section {
+        sidebarSection("项目") {
+            Button {
+                store.addProjectViaPanel()
+            } label: {
+                Image(systemName: "folder.badge.plus")
+            }
+            .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
+            .help("添加项目")
+            .accessibilityLabel("添加项目")
+        } rows: {
             ForEach(store.projects, id: \.path) { project in
                 let isSelected = project.path == store.selectedProjectPath
                 SessionRowContainer(
@@ -97,6 +118,8 @@ struct SidebarView: View {
                         store.selectedProjectPath = project.path
                         store.refreshSessions(for: project)
                     },
+                    onPin: nil,
+                    isPinned: false,
                     onRename: { },
                     onArchive: nil
                 ) { _ in
@@ -120,25 +143,57 @@ struct SidebarView: View {
                     }
                 }
             }
-        } header: {
-            HStack {
-                Text("项目")
-                Spacer()
-                Button {
-                    store.addProjectViaPanel()
-                } label: {
-                    Image(systemName: "folder.badge.plus")
+        }
+    }
+
+    @ViewBuilder
+    private var pinnedSection: some View {
+        let pinned: [(SessionMeta, URL)] = store.pinnedSessionMetas.compactMap { meta in
+            guard let project = store.project(forSessionPath: meta.path) else { return nil }
+            return (meta, project)
+        }
+        if !pinned.isEmpty {
+            sidebarSection("置顶") {
+                EmptyView()
+            } rows: {
+                ForEach(pinned, id: \.0.path) { meta, project in
+                    let openKey = openKeyFor(meta: meta) ?? "resume:\(meta.path)"
+                    let live = openKeyFor(meta: meta).flatMap { store.openSessions[$0] }
+                    sessionRow(
+                        tag: openKey,
+                        onSelect: {
+                            store.selectedProjectPath = project.path
+                            store.openSession(meta, project: project)
+                        },
+                        live: live,
+                        fallbackTitle: meta.name,
+                        idleSubtitle: project.lastPathComponent,
+                        meta: meta,
+                        openKey: openKeyFor(meta: meta),
+                        project: project,
+                        archivePath: meta.path,
+                        isPinned: true
+                    )
                 }
-                .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
-                .help("添加项目")
-                .accessibilityLabel("添加项目")
             }
         }
     }
 
     private func sessionsSection(project: URL) -> some View {
-        let metas = store.sessionsByProject[project.path] ?? []
-        return Section {
+        let metas = SessionPinLogic.activeMetas(
+            from: store.sessionsByProject[project.path] ?? [],
+            excludingPinned: store.userPinnedSessionPaths
+        )
+        return sidebarSection("会话") {
+            Button {
+                store.newSession(project: project)
+            } label: {
+                Image(systemName: "plus")
+            }
+            .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
+            .help("新建会话")
+            .accessibilityLabel("新建会话")
+        } rows: {
             // 未落盘，或已有 sessionFile 但 metas 尚未代表该 path 的 new:*（交接空窗）
             ForEach(newSessionEntries(project: project), id: \.0) { key, session in
                 sessionRow(
@@ -150,7 +205,8 @@ struct SidebarView: View {
                     meta: nil,
                     openKey: key,
                     project: project,
-                    archivePath: session.sessionFile
+                    archivePath: session.sessionFile,
+                    isPinned: false
                 )
             }
 
@@ -166,22 +222,36 @@ struct SidebarView: View {
                     meta: meta,
                     openKey: openKeyFor(meta: meta),
                     project: project,
-                    archivePath: meta.path
+                    archivePath: meta.path,
+                    isPinned: false
                 )
             }
-        } header: {
-            HStack {
-                Text("会话")
-                Spacer()
-                Button {
-                    store.newSession(project: project)
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
-                .help("新建会话")
-                .accessibilityLabel("新建会话")
+        }
+    }
+
+    /// Trailing bleed so header actions clear the sidebar divider (~列表行内边距对齐).
+    private static let sectionHeaderTrailingBleed: CGFloat = 12
+
+    private func sidebarSection<Trailing: View, Rows: View>(
+        _ title: String,
+        @ViewBuilder trailing: () -> Trailing,
+        @ViewBuilder rows: () -> Rows
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .tracking(0.5)
+                Spacer(minLength: 0)
+                trailing()
             }
+            .padding(.top, 14)
+            .padding(.bottom, 6)
+            .padding(.horizontal, 6)
+            .padding(.trailing, Self.sectionHeaderTrailingBleed)
+
+            rows()
         }
     }
 
@@ -189,50 +259,61 @@ struct SidebarView: View {
     private func archivedSessionsSection(project: URL) -> some View {
         let archived = store.archivedByProject[project.path] ?? []
         if !archived.isEmpty {
-            Section(isExpanded: archivedExpandedBinding(for: project.path)) {
-                ForEach(archived) { meta in
-                    Button {
-                        store.restoreSession(meta, project: project)
-                    } label: {
-                        SessionRow(
-                            title: meta.name,
-                            subtitle: Self.relative(meta.modified),
-                            status: .none
-                        )
-                        .foregroundStyle(.secondary)
+            let expanded = archivedExpandedByProject[project.path] ?? false
+            VStack(alignment: .leading, spacing: 4) {
+                Button {
+                    archivedExpandedByProject[project.path] = !expanded
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 10)
+                        Text("已归档")
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .tracking(0.5)
+                        Spacer(minLength: 0)
+                        Text("\(archived.count)")
+                            .font(.subheadline)
+                            .foregroundStyle(.tertiary)
                     }
-                    .buttonStyle(.plain)
-                    .selectionDisabled(true)
-                    .contextMenu {
-                        Button("取消归档") {
-                            store.unarchiveSession(path: meta.path, project: project)
-                        }
-                        Button("取消归档并打开") {
-                            store.restoreSession(meta, project: project)
-                        }
-                    }
-                    // Match SessionRowContainer insets so time captions share trailing x.
-                    .padding(.vertical, 2)
-                    .padding(.horizontal, 4)
-                    .hoverRowBackground()
+                    .padding(.top, 14)
+                    .padding(.bottom, 6)
+                    .padding(.horizontal, 6)
+                    .padding(.trailing, Self.sectionHeaderTrailingBleed)
+                    .contentShape(Rectangle())
                 }
-            } header: {
-                HStack {
-                    Text("已归档")
-                    Spacer()
-                    Text("\(archived.count)")
-                        .foregroundStyle(.tertiary)
+                .buttonStyle(.plain)
+
+                if expanded {
+                    ForEach(archived) { meta in
+                        Button {
+                            store.restoreSession(meta, project: project)
+                        } label: {
+                            SessionRow(
+                                title: meta.name,
+                                subtitle: Self.relative(meta.modified),
+                                status: .none
+                            )
+                            .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            Button("取消归档") {
+                                store.unarchiveSession(path: meta.path, project: project)
+                            }
+                            Button("取消归档并打开") {
+                                store.restoreSession(meta, project: project)
+                            }
+                        }
+                        .padding(.vertical, 5)
+                        .padding(.horizontal, 6)
+                        .hoverRowBackground(cornerRadius: 7)
+                    }
                 }
             }
         }
-    }
-
-    /// Default collapsed (`false`) when project has no remembered expand state.
-    private func archivedExpandedBinding(for projectPath: String) -> Binding<Bool> {
-        Binding(
-            get: { archivedExpandedByProject[projectPath] ?? false },
-            set: { archivedExpandedByProject[projectPath] = $0 }
-        )
     }
 
     @ViewBuilder
@@ -245,7 +326,8 @@ struct SidebarView: View {
         meta: SessionMeta?,
         openKey: String?,
         project: URL,
-        archivePath: String?
+        archivePath: String?,
+        isPinned: Bool
     ) -> some View {
         let titleForRename: String = {
             if let live, let name = live.sessionName, !name.isEmpty { return name }
@@ -254,10 +336,14 @@ struct SidebarView: View {
         }()
 
         // 主区域点选 + 尾部操作按钮，避免整行单一 Button 吞掉子按钮点击
-        // hover/selected 背景统一由 SessionRowContainer 内的 listRowBackground 单层绘制。
+        // hover/selected 背景由 SessionRowContainer.background 单层绘制。
         SessionRowContainer(
             isSelected: store.selectedSessionKey == tag,
             onSelect: onSelect,
+            onPin: archivePath.map { path in
+                { store.togglePinSession(path: path) }
+            },
+            isPinned: isPinned,
             onRename: {
                 beginRename(
                     id: meta?.path ?? tag,
@@ -279,10 +365,11 @@ struct SidebarView: View {
                     hideSubtitle: isHovered
                 )
             } else if let meta {
+                let interrupted = store.interruptedSessionPaths.contains(meta.path)
                 SessionRow(
                     title: displayTitle(meta: meta, openKey: openKey),
-                    subtitle: idleSubtitle,
-                    status: .none,
+                    subtitle: interrupted ? "已中断" : idleSubtitle,
+                    status: interrupted ? .interrupted : .none,
                     hideSubtitle: isHovered
                 )
             } else {
@@ -295,6 +382,11 @@ struct SidebarView: View {
             }
         }
         .contextMenu {
+            if let archivePath {
+                Button(isPinned ? "取消置顶" : "置顶") {
+                    store.togglePinSession(path: archivePath)
+                }
+            }
             Button("修改标题…") {
                 beginRename(
                     id: meta?.path ?? tag,
@@ -332,6 +424,8 @@ struct SidebarView: View {
                 guard key.hasPrefix("new:") else { return false }
                 guard session.projectURL.path == project.path else { return false }
                 if let file = session.sessionFile {
+                    // Pinned live files belong only in the pinned section.
+                    if store.isSessionPinned(file) { return false }
                     return !metaPaths.contains(file)
                 }
                 return true
@@ -358,11 +452,13 @@ private struct RenameTarget: Identifiable {
     let openKey: String?
 }
 
-/// 行容器：左侧点选主区域 + hover 时右侧改名/归档，避免嵌套 Button 抢事件。
-/// Hover 与 selected 共享同一层 `.listRowBackground`（全宽、圆角），避免两层背景。
+/// 行容器：左侧点选主区域 + hover 时右侧置顶/改名/归档，避免嵌套 Button 抢事件。
+/// Hover 与 selected 共享同一层背景（全宽、圆角），避免两层。
 private struct SessionRowContainer<Content: View>: View {
     let isSelected: Bool
     let onSelect: () -> Void
+    let onPin: (() -> Void)?
+    let isPinned: Bool
     let onRename: () -> Void
     let onArchive: (() -> Void)?
     @ViewBuilder var content: (_ isHovered: Bool) -> Content
@@ -375,12 +471,23 @@ private struct SessionRowContainer<Content: View>: View {
         content(isHovered)
             .frame(maxWidth: .infinity, alignment: .leading)
             // padding 先于 contentShape：命中范围扩展到含 padding 的整圈
-            .padding(.vertical, 2)
-            .padding(.horizontal, 4)
+            .padding(.vertical, 5)
+            .padding(.horizontal, 6)
             .contentShape(Rectangle())
             .onTapGesture(perform: onSelect)
             .overlay(alignment: .trailing) {
                 HStack(spacing: 4) {
+                    if let onPin {
+                        Button(action: onPin) {
+                            Image(systemName: isPinned ? "pin.fill" : "pin")
+                                .font(.system(size: 11, weight: .medium))
+                                .frame(width: 20, height: 20)
+                        }
+                        .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
+                        .help(isPinned ? "取消置顶" : "置顶")
+                        .accessibilityLabel(isPinned ? "取消置顶" : "置顶")
+                    }
+
                     Button(action: onRename) {
                         Image(systemName: "pencil")
                             .font(.system(size: 11, weight: .medium))
@@ -401,7 +508,7 @@ private struct SessionRowContainer<Content: View>: View {
                         .accessibilityLabel("归档会话")
                     }
                 }
-                .padding(.trailing, 4)
+                .padding(.trailing, 6)
                 .opacity(isHovered ? 1 : 0)
                 .allowsHitTesting(isHovered)
                 .accessibilityHidden(!isHovered)
@@ -409,22 +516,23 @@ private struct SessionRowContainer<Content: View>: View {
             .onHover { isHovered = $0 }
             .animation(.easeInOut(duration: 0.12), value: isHovered)
             .animation(.easeInOut(duration: 0.12), value: isSelected)
-            // 单层全宽背景：hover 与 selected 同源同几何，避免“hover 特别细 / 选中两层”。
-            .listRowBackground(
-                RoundedRectangle(cornerRadius: 6)
+            // 单层全宽背景：hover 与 selected 同源同几何（ScrollView 行，非 List）。
+            .background {
+                RoundedRectangle(cornerRadius: 7)
                     .fill(isSelected ? Color.accentColor.opacity(0.12)
                                      : (isHovered ? Color.primary.opacity(0.06) : Color.clear))
-                    .padding(.horizontal, 4)
-            )
+                    .padding(.horizontal, 2)
+            }
     }
 }
 
 /// Sidebar-only session indicator.
-/// Priority: main running > background subagents > error > unseen-ok/green > none.
+/// Priority: main running > background subagents > error > interrupted > unseen-ok/green > none.
 private enum SessionRowStatus: Equatable {
     case running
     case subagentsRunning(Int)
     case error
+    case interrupted
     case ok
     case none
 
@@ -433,6 +541,7 @@ private enum SessionRowStatus: Equatable {
         let n = session.subagents.runningCount
         if n > 0 { return .subagentsRunning(n) }
         if session.lastError != nil || !session.processAlive { return .error }
+        if session.hasUnseenInterruption { return .interrupted }
         if session.hasUnseenCompletion { return .ok }
         return .none
     }
@@ -442,6 +551,7 @@ private enum SessionRowStatus: Equatable {
         case .running: return "进行中"
         case .subagentsRunning(let n):
             return n > 1 ? "\(n) 个子任务" : "子任务中"
+        case .interrupted: return "已中断"
         default: return nil
         }
     }
@@ -491,8 +601,8 @@ private struct LiveSessionRow: View {
             Spacer(minLength: 0)
             if !subtitle.isEmpty, !hideSubtitle {
                 Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -513,7 +623,7 @@ private struct LiveSessionRow: View {
             Circle()
                 .fill(Color.green)
                 .frame(width: 7, height: 7)
-        case .error:
+        case .error, .interrupted:
             Circle()
                 .fill(Color.red)
                 .frame(width: 7, height: 7)
@@ -573,8 +683,8 @@ private struct SessionRow: View {
             Spacer(minLength: 0)
             if !subtitle.isEmpty, !hideSubtitle {
                 Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -595,7 +705,7 @@ private struct SessionRow: View {
             Circle()
                 .fill(Color.green)
                 .frame(width: 7, height: 7)
-        case .error:
+        case .error, .interrupted:
             Circle()
                 .fill(Color.red)
                 .frame(width: 7, height: 7)

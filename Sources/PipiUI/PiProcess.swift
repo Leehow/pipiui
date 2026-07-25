@@ -126,7 +126,14 @@ final class PiProcess {
         }
     }
 
-    /// Best-effort SIGTERM to descendant processes (subagent `pi` children).
+    /// Serial background queue for pgrep/kill sweeps. Each `signalChildren` call spawns
+    /// `/usr/bin/pgrep` and blocks on `waitUntilExit` (recursively, once per process tree
+    /// level), so it must never run on the main thread: closing/restarting sessions and
+    /// batch `removeProject` closes would otherwise stall the UI.
+    private static let signalQueue = DispatchQueue(label: "pipiui.pi.signal")
+
+    /// Best-effort signal to descendant processes (subagent `pi` children).
+    /// Must be called from `signalQueue` (or another non-main thread); blocks on pgrep.
     private static func signalChildren(of pid: Int32, signal sig: Int32) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
@@ -198,9 +205,16 @@ final class PiProcess {
         guard isRunning else { return }
         isRunning = false
         let pid = process.processIdentifier
-        Self.signalChildren(of: pid, signal: SIGTERM)
-        process.terminate()
-        // Settle on the calling thread (normally main). failAllPending is idempotent.
+        // Signal the process tree off the main thread (children first, then the
+        // process itself) so pgrep never stalls the UI. Semantics unchanged:
+        // the process is SIGTERM'd and `terminationHandler` still delivers onExit
+        // on the main thread.
+        Self.signalQueue.async { [process] in
+            Self.signalChildren(of: pid, signal: SIGTERM)
+            process.terminate()
+        }
+        // Settle on the calling thread (normally main). failAllPending is idempotent
+        // and main-thread by design, so it stays here — never move it to signalQueue.
         failAllPending(error: "process exited")
     }
 
@@ -220,8 +234,11 @@ final class PiProcess {
         stderrPipe.fileHandleForReading.readabilityHandler = nil
         if process.isRunning {
             let pid = process.processIdentifier
-            Self.signalChildren(of: pid, signal: SIGTERM)
-            process.terminate()
+            // deinit may run on any thread; never block it on pgrep.
+            Self.signalQueue.async { [process] in
+                Self.signalChildren(of: pid, signal: SIGTERM)
+                process.terminate()
+            }
         }
         // Last resort: if still holding pending (e.g. released without terminate()),
         // fire completions now. Safe when already drained by terminate()/handler.

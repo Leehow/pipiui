@@ -19,7 +19,7 @@ struct SubagentPanel: View {
                     agentList
                         .frame(minHeight: 64, idealHeight: 160)
                     detail
-                        .frame(minHeight: 88)
+                        .frame(minHeight: 56)
                 }
             }
         }
@@ -82,7 +82,9 @@ struct SubagentPanel: View {
                 }
             }
             .padding(8)
+            .overlayScrollers()
         }
+        .scrollIndicators(.automatic)
     }
 
     @ViewBuilder
@@ -134,7 +136,7 @@ private struct AgentRow: View {
                         lifecycleBadge(text: "wt", color: .blue)
                     }
                 }
-                Text(agent.state == .running && !agent.activity.isEmpty ? agent.activity : (agent.title ?? agent.task))
+                Text(agent.listSubtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -191,33 +193,16 @@ private struct AgentDetailView: View {
     @State private var showDiscardConfirm = false
     @State private var showDiffStat = false
     @State private var diffStatText: String?
+    @State private var diffBusy = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                if let title = agent.title, !title.isEmpty {
-                    Text(title)
-                        .font(.callout.weight(.medium))
-                        .textSelection(.enabled)
-                }
-                Text(agent.task)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
-                    .textSelection(.enabled)
-                HStack(spacing: 10) {
-                    if let model = agent.model {
-                        Text(model).font(.caption2.monospaced()).foregroundStyle(.tertiary)
-                    }
-                    Text("\(agent.turns) turns").font(.caption2).foregroundStyle(.tertiary)
-                    Text(String(format: "$%.4f", agent.cost)).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
-                    Text(durationText).font(.caption2).foregroundStyle(.tertiary)
-                }
-                if agent.hasWorktreeMeta {
-                    worktreeMeta
-                }
+            metricsHeader
+            if agent.canReviewWorktree || (store.worktreeActionError != nil && store.selectedId == agent.id) {
+                worktreeMeta
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 8)
             }
-            .padding(10)
             Divider()
             if agent.state == .running {
                 runningActivity
@@ -240,7 +225,9 @@ private struct AgentDetailView: View {
                     }
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .overlayScrollers()
                 }
+                .scrollIndicators(.automatic)
                 .overlay(alignment: .bottomTrailing) {
                     if !pinToBottom {
                         Button {
@@ -297,17 +284,52 @@ private struct AgentDetailView: View {
         }
     }
 
+    private var metricsHeader: some View {
+        let parts = SubagentMetricsLine.parts(for: agent)
+        return HStack(spacing: 8) {
+            Text(parts.title)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .textSelection(.enabled)
+                .help(agent.task)
+            Spacer(minLength: 4)
+            if let context = parts.context {
+                Text(context)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .help("上下文占用")
+            }
+            if let cache = parts.cache {
+                Text(cache)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .help("累计缓存命中率")
+            }
+            if let sum = parts.sum {
+                Text(sum)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .help("累计 input+output tokens")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+    }
+
     private var runningActivity: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        let summary = ToolCallSummary.summarizeActivity(agent.activity)
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
             ProgressView().controlSize(.mini)
             VStack(alignment: .leading, spacing: 2) {
                 Text("正在执行")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
-                Text(agent.activity.isEmpty ? "等待 agent 返回第一条工作记录…" : agent.activity)
+                Text(summary.isEmpty ? "等待 agent 返回第一条工作记录…" : summary)
                     .font(.caption.monospaced())
                     .lineLimit(2)
                     .truncationMode(.middle)
+                    .help(agent.activity)
             }
         }
         .padding(.horizontal, 10)
@@ -348,49 +370,22 @@ private struct AgentDetailView: View {
         }
     }
 
-    private var durationText: String {
-        let end = agent.ended ?? Date()
-        let seconds = Int(end.timeIntervalSince(agent.started))
-        return seconds < 60 ? "\(seconds)s" : "\(seconds / 60)m\(seconds % 60)s"
-    }
-
     @ViewBuilder
     private var worktreeMeta: some View {
         VStack(alignment: .leading, spacing: 4) {
-            // Lifecycle badge + running branch label
             HStack(spacing: 6) {
                 lifecycleLabel
-                if agent.state == .running, let branch = agent.worktreeBranch, !branch.isEmpty {
-                    Text("工作中 · \(branch)")
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-            }
-
-            if let branch = agent.worktreeBranch, !branch.isEmpty, agent.state != .running {
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.triangle.branch")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                if let branch = agent.worktreeBranch, !branch.isEmpty {
                     Text(branch)
                         .font(.caption2.monospaced())
                         .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                        .help(agent.worktreePath ?? branch)
                 }
+                Spacer(minLength: 0)
             }
-            if let path = agent.worktreePath, !path.isEmpty {
-                Text(shortenPath(path))
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
-                    .textSelection(.enabled)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(path)
-            }
+
             if let err = agent.worktreeError, !err.isEmpty {
                 Text(err)
                     .font(.caption2)
@@ -408,7 +403,7 @@ private struct AgentDetailView: View {
                     .font(.caption2)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
-                    .lineLimit(4)
+                    .lineLimit(3)
             }
         }
     }
@@ -450,20 +445,33 @@ private struct AgentDetailView: View {
                 if showDiffStat {
                     showDiffStat = false
                 } else {
-                    diffStatText = store.worktreeDiffStat(agentId: agent.id, mainProjectURL: projectURL)
-                    showDiffStat = true
+                    guard !diffBusy else { return }
+                    diffBusy = true
+                    let agentId = agent.id
+                    let url = projectURL
+                    // git probe + diff --stat 在后台执行，回主线程再填文本。
+                    Task { @MainActor in
+                        let text = await store.worktreeDiffStat(agentId: agentId, mainProjectURL: url)
+                        diffStatText = text
+                        showDiffStat = true
+                        diffBusy = false
+                    }
                 }
             } label: {
                 HStack(spacing: 4) {
-                    Image(systemName: showDiffStat ? "chevron.down" : "chevron.right")
-                        .font(.caption2)
+                    if diffBusy {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: showDiffStat ? "chevron.down" : "chevron.right")
+                            .font(.caption2)
+                    }
                     Text(showDiffStat ? "隐藏 diff --stat" : "查看 diff --stat")
                         .font(.caption2)
                 }
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
-            .disabled(worktreeBusy)
+            .disabled(worktreeBusy || diffBusy)
 
             if showDiffStat, let diff = diffStatText {
                 Text(diff)
@@ -505,31 +513,33 @@ private struct AgentDetailView: View {
     }
 
     private func runMerge() {
+        guard !worktreeBusy else { return }
         worktreeBusy = true
         store.worktreeActionError = nil
-        // Git CLI is synchronous; keep on main (agent merges are typically small).
-        _ = store.mergeWorktree(agentId: agent.id, mainProjectURL: projectURL)
-        worktreeBusy = false
+        let agentId = agent.id
+        let url = projectURL
+        // Git CLI 在 store 内部后台执行；busy 防重入，完成后回主线程解除。
+        Task { @MainActor in
+            _ = await store.mergeWorktree(agentId: agentId, mainProjectURL: url)
+            worktreeBusy = false
+        }
     }
 
     private func runDiscard() {
+        guard !worktreeBusy else { return }
         worktreeBusy = true
         store.worktreeActionError = nil
-        _ = store.discardWorktree(agentId: agent.id, mainProjectURL: projectURL)
-        worktreeBusy = false
+        let agentId = agent.id
+        let url = projectURL
+        Task { @MainActor in
+            _ = await store.discardWorktree(agentId: agentId, mainProjectURL: url)
+            worktreeBusy = false
+        }
     }
 
-    /// Prefer last two path components for display; full path remains selectable via help/selection.
-    private func shortenPath(_ path: String) -> String {
-        let ns = path as NSString
-        let last = ns.lastPathComponent
-        let parent = (ns.deletingLastPathComponent as NSString).lastPathComponent
-        if parent.isEmpty || parent == "/" { return last }
-        return "\(parent)/\(last)"
-    }
 }
 
-/// 工作流水单行：文本走 Markdown，思考灰斜体，工具调用/结果紧凑卡片。
+/// 工作流水单行：文本走 Markdown，思考灰斜体，工具调用对齐主会话 ToolCard 折叠头。
 private struct AgentLogRow: View {
     let item: AgentLogItem
     @State private var expanded = false
@@ -544,26 +554,12 @@ private struct AgentLogRow: View {
                 .lineLimit(expanded ? nil : 2)
                 .onTapGesture { expanded.toggle() }
         case "tool":
-            HStack(spacing: 6) {
-                Image(systemName: "wrench.and.screwdriver")
-                    .font(.caption2)
-                    .foregroundStyle(.blue)
-                Text(item.name)
-                    .font(.caption.weight(.semibold).monospaced())
-                Text(item.text)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 6).fill(Color.blue.opacity(0.06)))
+            toolRow
         case "toolResult":
             Text(item.text.isEmpty ? "（无输出）" : item.text)
                 .font(.caption.monospaced())
                 .foregroundStyle(item.isError ? .red : .secondary)
-                .lineLimit(expanded ? nil : 5)
+                .lineLimit(expanded ? nil : 3)
                 .textSelection(.enabled)
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -575,5 +571,50 @@ private struct AgentLogRow: View {
         default:
             MarkdownTextView(text: item.text)
         }
+    }
+
+    private var toolSummary: String {
+        ToolCallSummary.summarize(name: item.name, argsJSON: item.text).summary
+    }
+
+    private var toolRow: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "wrench.and.screwdriver")
+                    .font(.caption2)
+                    .foregroundStyle(.blue)
+                Text(item.name)
+                    .font(.caption.weight(.semibold).monospaced())
+                Text(toolSummary)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                if !item.text.isEmpty {
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if !item.text.isEmpty { expanded.toggle() }
+            }
+            .pointingHandCursor(!item.text.isEmpty)
+
+            if expanded, !item.text.isEmpty {
+                Divider()
+                Text(item.text)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.blue.opacity(0.06)))
     }
 }
