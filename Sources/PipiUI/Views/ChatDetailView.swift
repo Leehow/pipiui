@@ -28,7 +28,8 @@ private struct ChatDetailViewBody: View {
     @State private var rightPanelWidthRatio: CGFloat?
     @State private var rightPanelDragStartWidth: CGFloat?
     @State private var rightPanelDragWidth: CGFloat?
-    @StateObject private var gitBranches = GitBranchStore()
+    /// Process-wide store: view teardown on session switch keeps the cached probe.
+    @ObservedObject private var gitBranches = GitBranchStore.shared
 
     /// Last settled chat-column width. Width changes (window resize / right panel)
     /// reflow LazyVStack row heights; we re-pin after the width stops moving.

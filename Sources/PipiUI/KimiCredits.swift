@@ -90,7 +90,7 @@ enum KimiAuthStore {
     }
 
     static func loadFromPiAuth(authURL: URL) -> String? {
-        guard let data = try? Data(contentsOf: authURL),
+        guard let data = AuthFileCache.data(for: authURL),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let entry = root["kimi-coding"] as? [String: Any]
         else { return nil }

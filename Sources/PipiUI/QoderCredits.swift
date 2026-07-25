@@ -61,7 +61,7 @@ enum QoderAuthStore {
     }
 
     static func load(authURL: URL = defaultAuthURL()) -> Credentials? {
-        guard let data = try? Data(contentsOf: authURL),
+        guard let data = AuthFileCache.data(for: authURL),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
         // Prefer the CN entry when both exist.
