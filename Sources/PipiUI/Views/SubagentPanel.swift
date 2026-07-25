@@ -6,6 +6,8 @@ struct SubagentPanel: View {
     @ObservedObject var store: SubagentStore
     /// Session project root (main git worktree) for merge/discard.
     var projectURL: URL
+    /// 中止运行中 agent（ChatSession.abortSubagent → /subagent_abort RPC）。
+    var onAbort: (String) -> Void
     var onClose: () -> Void
 
     var body: some View {
@@ -76,7 +78,12 @@ struct SubagentPanel: View {
         ScrollView {
             LazyVStack(spacing: 2) {
                 ForEach(store.displayOrder) { agent in
-                    AgentRow(agent: agent, selected: agent.id == store.selectedId)
+                    AgentRow(
+                        agent: agent,
+                        selected: agent.id == store.selectedId,
+                        abortPending: store.abortPending.contains(agent.id),
+                        onAbort: { onAbort(agent.id) }
+                    )
                         .contentShape(Rectangle())
                         .onTapGesture { store.selectedId = agent.id }
                 }
@@ -103,6 +110,8 @@ struct SubagentPanel: View {
 private struct AgentRow: View {
     let agent: SubagentInfo
     let selected: Bool
+    var abortPending: Bool = false
+    var onAbort: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 8) {
@@ -127,6 +136,13 @@ private struct AgentRow: View {
                             .padding(.vertical, 1)
                             .background(Capsule().fill(Color.accentColor.opacity(0.15)))
                     }
+                    if agent.state == .running, agent.stalled {
+                        lifecycleBadge(
+                            text: agent.stalledIdleSec > 0 ? "卡住 \(agent.stalledIdleSec)s" : "卡住",
+                            color: .yellow
+                        )
+                        .help("已 \(agent.stalledIdleSec)s 无任何活动，可能卡死；可点右侧 ⏹ 中止")
+                    }
                     if agent.worktreeLifecycle == .pendingReview || agent.canReviewWorktree {
                         lifecycleBadge(text: "审核", color: .orange)
                     } else if agent.worktreeLifecycle == .merged {
@@ -148,6 +164,15 @@ private struct AgentRow: View {
                 Text(String(format: "$%.3f", agent.cost))
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.tertiary)
+            }
+            if agent.state == .running, let onAbort {
+                Button(action: onAbort) {
+                    Image(systemName: "stop.circle")
+                        .font(.callout)
+                }
+                .buttonStyle(HoverButtonStyle(base: abortPending ? Color.secondary.opacity(0.4) : .secondary, hovered: .red))
+                .disabled(abortPending)
+                .help(abortPending ? "正在中止…" : "中止该 agent（/subagent_abort）")
             }
         }
         .padding(.horizontal, 8)

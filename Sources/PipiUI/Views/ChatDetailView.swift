@@ -201,7 +201,11 @@ private struct ChatDetailViewBody: View {
                     session.rightPanel = nil
                 }
             case .agents:
-                SubagentPanel(store: session.subagents, projectURL: session.projectURL) {
+                SubagentPanel(
+                    store: session.subagents,
+                    projectURL: session.projectURL,
+                    onAbort: { agentId in session.abortSubagent(agentId) }
+                ) {
                     session.rightPanel = nil
                 }
             case .document:
