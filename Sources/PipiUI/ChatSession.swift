@@ -470,6 +470,13 @@ final class ChatSession: ObservableObject, Identifiable {
                 self.sendPrompt(text)
             }
         }
+        subagents.onPostMergeVerifyFailed = { [weak self] agent, failure in
+            guard let self else { return }
+            let text = PostMergeVerifyFailedMessage.format(agent: agent, failure: failure)
+            DispatchQueue.main.async {
+                self.sendPrompt(text)
+            }
+        }
         if let sessionPath, InterruptedSessionStore.contains(sessionPath) {
             hasUnseenInterruption = true
         }
