@@ -69,12 +69,37 @@ git_status + git_diff       368
 
 1. ~~git 快照移出 system prompt~~（已完成，回收约 30% 总开销）
 2. ~~boss prompt 英文化 + 机制细节去重到工具 description~~（已完成，-1,061 token）
-3. `browser_*` 5 → 1（-400 token，本文档的第一个 L1 样例）
-4. `git_status` / `git_diff` → 单 `git` 工具（-200 token）
-5. media 的 prompt 块 + `generate_image` → L2 skill（-560 token）
-6. boss prompt 的 Superpowers 段落 → L2（-340 token）
+3. ~~`browser_*` 5 → 1~~（已完成，517 → 201 token，本文档的第一个 L1 样例）
+4. ~~Superpowers 段落改为按模型档位注入~~（已完成，见下节）
+5. ~~`git_status` / `git_diff` → 单 `git` 工具~~（已完成，368 → 195 token）
+6. ~~media 的 prompt 块 + `generate_image` 瘦身~~（已完成，563 → 255 token）
 
-3–6 全做完，PipiUI 注入部分从 6,270 降到约 3,200 token。
+第 6 项没有按原计划整个降到 L2：`generate_image` 是**工具**不是指令，删掉功能就没了。实际做法是去重——它原先在前缀里出现两次（system prompt 的 image 段 + promptGuidelines），内容几乎一样；现在 system prompt 段整个删除、guidelines 压成一行，完整用法改由 `confirmed=false` 分支作为 tool result 返回（落在对话里而非前缀）。
+
+同口径实测（探针，同一套扩展 + boss prompt）：
+
+| | 裸 pi | 改造前 | 改造后 |
+|---|---:|---:|---:|
+| system prompt | 6,896 | 10,498 | **9,142** |
+| 工具 schema | 2,609 | 4,404 | **3,737** |
+| **固定前缀合计** | 9,505 | 14,902 | **12,879** |
+
+PipiUI 注入部分 5,397 → **3,374 token（-37%）**。`subagent` 的 579 token 两边都未计入（探针里没加载该扩展）。
+
+## 按模型档位分级（Superpowers 的特例）
+
+Superpowers 不能简单降到 L2：弱模型不走 SOP 几乎不可用，而强模型被重流程拖累。所以它按**模型档位**注入两套文本，而不是一刀切：
+
+| 档位 | 注入 | 体量 |
+|---|---|---:|
+| 强（默认） | 「技能库是参考，T0/T1 别进重流程，verification-before-completion 仍然有效」 | ~60 tok |
+| 弱（Settings 勾选） | 完整强制 SOP：什么情况读哪个 skill、必须读文件本身而不是凭记忆、拿不准就读 | ~380 tok |
+
+**为什么这样不毁缓存**：注入文本是「当前模型」的纯函数，同一模型下逐回合字节一致，前缀照常命中；只有切模型时才变，而切模型本身已经作废了缓存，所以这次替换是**免费搭车**。这是 `before_agent_start` 允许返回 `systemPrompt` 的唯一正当场景——判据是「这段文本会不会在同一模型下发生变化」，不是「它长不长」。
+
+档位来源只有一个：Settings → 模型里逐个勾选，未勾 = 强。**代码里不存在任何内置强弱模型清单**，`ModelTierSettingsTests` 会断言这一点——硬编码清单必然过时，而分错档会静默改变整个会话的工作方式。
+
+弱模型另有一道闸门：本会话没读过任何 skill 时，第一次调 `subagent` 会被 `tool_call` 钩子拦一次并要求先读 SOP，**每会话只拦一次**，误伤上限一次往返。行为用 `./scripts/check-skilltier-gate.sh` 验证（直接驱动扩展 handler，不发 API 请求）。
 
 ## 反模式
 

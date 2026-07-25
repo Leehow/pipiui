@@ -145,152 +145,158 @@ function buildSnapshot(cwd: string): string {
   }
 
   lines.push(
-    "Tools: git_status (porcelain + branch), git_diff (capped ~80KB). Prefer these over raw shell git when summarizing.",
+    "Tool: git (action: status | diff | help). Prefer it over raw shell git when summarizing.",
   );
   return lines.join("\n");
 }
 
+// Full parameter docs are delivered as a tool result (action "help") rather than carried in
+// the schema on every request. See docs/progressive-disclosure.md.
+const GIT_HELP = [
+  "git actions:",
+  "",
+  "status                 Branch, SHA, dirty counts (staged/unstaged/untracked), upstream",
+  "                       ahead/behind, origin URL, and the porcelain lines.",
+  "diff {staged?, path?}  Working-tree diff via `git diff HEAD` (falls back to `git diff`).",
+  "                       staged=true uses `--cached`. path limits to one pathspec and must",
+  "                       not start with '-'. Output is capped at ~80KB with a truncation note.",
+  "help                   This text.",
+].join("\n");
+
+function gitStatus() {
+  const cwd = process.cwd();
+  const inside = runGit(["rev-parse", "--is-inside-work-tree"], cwd);
+  if (!inside.ok || inside.stdout.trim() !== "true") {
+    return text("not a git repository", true);
+  }
+
+  const parts: string[] = [];
+  const branch = runGit(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
+  const sha = runGit(["rev-parse", "--short", "HEAD"], cwd);
+  if (branch.ok) parts.push(`branch: ${branch.stdout.trim()}`);
+  if (sha.ok) parts.push(`sha: ${sha.stdout.trim()}`);
+
+  const porcelain = runGit(["status", "--porcelain"], cwd);
+  if (!porcelain.ok) {
+    return text(`git status failed: ${porcelain.stderr || porcelain.code}`, true);
+  }
+  const counts = parsePorcelain(porcelain.stdout);
+  const dirty = counts.staged + counts.unstaged + counts.untracked > 0;
+  parts.push(
+    `dirty: ${dirty ? "yes" : "no"} (staged=${counts.staged} unstaged=${counts.unstaged} untracked=${counts.untracked})`,
+  );
+
+  const up = runGit(
+    ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+    cwd,
+  );
+  if (up.ok && up.stdout.trim()) {
+    const lr = runGit(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"], cwd);
+    let behind = 0;
+    let ahead = 0;
+    if (lr.ok) {
+      const p = lr.stdout.trim().split(/\s+/);
+      if (p.length >= 2) {
+        behind = parseInt(p[0], 10) || 0;
+        ahead = parseInt(p[1], 10) || 0;
+      }
+    }
+    parts.push(`upstream: ${up.stdout.trim()} +${ahead} -${behind}`);
+  } else {
+    parts.push("upstream: (none)");
+  }
+
+  const origin = runGit(["remote", "get-url", "origin"], cwd);
+  if (origin.ok && origin.stdout.trim()) {
+    parts.push(`origin: ${origin.stdout.trim()}`);
+  }
+
+  parts.push("");
+  parts.push("## porcelain");
+  const body = porcelain.stdout.trimEnd();
+  parts.push(body.length ? body : "(clean)");
+
+  return text(parts.join("\n"));
+}
+
+function gitDiff(params: { staged?: boolean; path?: string }) {
+  const cwd = process.cwd();
+  const inside = runGit(["rev-parse", "--is-inside-work-tree"], cwd);
+  if (!inside.ok || inside.stdout.trim() !== "true") {
+    return text("not a git repository", true);
+  }
+
+  const staged = !!params.staged;
+  const pathSpec =
+    typeof params.path === "string" && params.path.trim() ? params.path.trim() : "";
+
+  // Reject path that looks like a flag to avoid option injection via path.
+  if (pathSpec.startsWith("-")) {
+    return text("invalid path: must not start with '-'", true);
+  }
+
+  let args: string[];
+  if (staged) {
+    args = ["diff", "--cached"];
+  } else {
+    // Prefer HEAD so new files show as diffs when already staged-or-not mixed; fallback below.
+    args = ["diff", "HEAD"];
+  }
+  if (pathSpec) {
+    args.push("--", pathSpec);
+  }
+
+  let result = runGit(args, cwd);
+  if (!result.ok && !staged) {
+    args = pathSpec ? ["diff", "--", pathSpec] : ["diff"];
+    result = runGit(args, cwd);
+  }
+  if (!result.ok) {
+    return text(`git diff failed: ${result.stderr || result.code}`, true);
+  }
+
+  const raw = result.stdout;
+  if (!raw.trim()) {
+    return text(staged ? "(no staged changes)" : "(no diff)");
+  }
+
+  const { text: out, truncated } = truncateBytes(raw, DIFF_MAX_BYTES);
+  const header = truncated
+    ? `diff (${staged ? "staged" : "worktree"}; truncated at ${DIFF_MAX_BYTES} bytes)\n\n`
+    : `diff (${staged ? "staged" : "worktree"})\n\n`;
+  return text(header + out);
+}
+
 export default function (pi: ExtensionAPI) {
+  // One stable tool instead of git_status + git_diff: fewer schemas in the prefix, and the
+  // tool set stays constant so the prompt cache is never invalidated by it.
   pi.registerTool({
-    name: "git_status",
-    label: "Git Status",
+    name: "git",
+    label: "Git",
     description:
-      "Return structured git status for the project working tree: branch, SHA, dirty counts " +
-      "(staged/unstaged/untracked), upstream ahead/behind, origin URL, and porcelain lines. " +
-      "Prefer this over running shell `git status` when you need repo state.",
-    promptSnippet: "Structured git status (branch, dirty counts, upstream)",
+      "Structured git for this project. actions: status, diff{staged?, path?}, help. " +
+      'Prefer this over shelling out to git. Call action:"help" for details.',
+    promptSnippet: "Structured git status / capped diff",
     promptGuidelines: [
-      "Use git_status to inspect the current repo before commit/PR summaries.",
-      "Do not shell out to git status when this tool is available.",
-    ],
-    parameters: Type.Object({}),
-    async execute() {
-      const cwd = process.cwd();
-      const inside = runGit(["rev-parse", "--is-inside-work-tree"], cwd);
-      if (!inside.ok || inside.stdout.trim() !== "true") {
-        return text("not a git repository", true);
-      }
-
-      const parts: string[] = [];
-      const branch = runGit(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
-      const sha = runGit(["rev-parse", "--short", "HEAD"], cwd);
-      if (branch.ok) parts.push(`branch: ${branch.stdout.trim()}`);
-      if (sha.ok) parts.push(`sha: ${sha.stdout.trim()}`);
-
-      const porcelain = runGit(["status", "--porcelain"], cwd);
-      if (!porcelain.ok) {
-        return text(`git status failed: ${porcelain.stderr || porcelain.code}`, true);
-      }
-      const counts = parsePorcelain(porcelain.stdout);
-      const dirty = counts.staged + counts.unstaged + counts.untracked > 0;
-      parts.push(
-        `dirty: ${dirty ? "yes" : "no"} (staged=${counts.staged} unstaged=${counts.unstaged} untracked=${counts.untracked})`,
-      );
-
-      const up = runGit(
-        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
-        cwd,
-      );
-      if (up.ok && up.stdout.trim()) {
-        const lr = runGit(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"], cwd);
-        let behind = 0;
-        let ahead = 0;
-        if (lr.ok) {
-          const p = lr.stdout.trim().split(/\s+/);
-          if (p.length >= 2) {
-            behind = parseInt(p[0], 10) || 0;
-            ahead = parseInt(p[1], 10) || 0;
-          }
-        }
-        parts.push(`upstream: ${up.stdout.trim()} +${ahead} -${behind}`);
-      } else {
-        parts.push("upstream: (none)");
-      }
-
-      const origin = runGit(["remote", "get-url", "origin"], cwd);
-      if (origin.ok && origin.stdout.trim()) {
-        parts.push(`origin: ${origin.stdout.trim()}`);
-      }
-
-      parts.push("");
-      parts.push("## porcelain");
-      const body = porcelain.stdout.trimEnd();
-      parts.push(body.length ? body : "(clean)");
-
-      return text(parts.join("\n"));
-    },
-  });
-
-  pi.registerTool({
-    name: "git_diff",
-    label: "Git Diff",
-    description:
-      "Return a git diff for the project working tree. Default: unstaged + untracked context via " +
-      "`git diff HEAD` (falls back to `git diff`). Set staged=true for `--cached`. Optional path " +
-      "limits to one path. Output is hard-capped at ~80KB with an explicit truncation note.",
-    promptSnippet: "Capped git diff (staged or worktree, ~80KB max)",
-    promptGuidelines: [
-      "Use git_diff instead of shelling out to git diff for large changes.",
-      "If truncated, summarize from the head of the diff or narrow with path=.",
+      "Use the git tool rather than shelling out to git status/diff.",
+      "If a diff comes back truncated, narrow it with path= instead of re-running it.",
     ],
     parameters: Type.Object({
-      staged: Type.Optional(
-        Type.Boolean({
-          description: "If true, show staged diff only (`git diff --cached`).",
-        }),
-      ),
-      path: Type.Optional(
-        Type.String({
-          description: "Optional pathspec to limit the diff (no shell metacharacters needed).",
-        }),
-      ),
+      action: Type.String({ description: "status | diff | help" }),
+      staged: Type.Optional(Type.Boolean()),
+      path: Type.Optional(Type.String()),
     }),
     async execute(_id, params) {
-      const cwd = process.cwd();
-      const inside = runGit(["rev-parse", "--is-inside-work-tree"], cwd);
-      if (!inside.ok || inside.stdout.trim() !== "true") {
-        return text("not a git repository", true);
+      switch (params.action) {
+        case "status":
+          return gitStatus();
+        case "diff":
+          return gitDiff(params);
+        case "help":
+          return text(GIT_HELP);
+        default:
+          return text(`Unknown git action "${params.action}".\n\n${GIT_HELP}`, true);
       }
-
-      const staged = !!params.staged;
-      const pathSpec =
-        typeof params.path === "string" && params.path.trim() ? params.path.trim() : "";
-
-      // Reject path that looks like a flag to avoid option injection via path.
-      if (pathSpec.startsWith("-")) {
-        return text("invalid path: must not start with '-'", true);
-      }
-
-      let args: string[];
-      if (staged) {
-        args = ["diff", "--cached"];
-      } else {
-        // Prefer HEAD so new files show as diffs when already staged-or-not mixed; fallback below.
-        args = ["diff", "HEAD"];
-      }
-      if (pathSpec) {
-        args.push("--", pathSpec);
-      }
-
-      let result = runGit(args, cwd);
-      if (!result.ok && !staged) {
-        args = pathSpec ? ["diff", "--", pathSpec] : ["diff"];
-        result = runGit(args, cwd);
-      }
-      if (!result.ok) {
-        return text(`git diff failed: ${result.stderr || result.code}`, true);
-      }
-
-      const raw = result.stdout;
-      if (!raw.trim()) {
-        return text(staged ? "(no staged changes)" : "(no diff)");
-      }
-
-      const { text: out, truncated } = truncateBytes(raw, DIFF_MAX_BYTES);
-      const header = truncated
-        ? `diff (${staged ? "staged" : "worktree"}; truncated at ${DIFF_MAX_BYTES} bytes)\n\n`
-        : `diff (${staged ? "staged" : "worktree"})\n\n`;
-      return text(header + out);
     },
   });
 

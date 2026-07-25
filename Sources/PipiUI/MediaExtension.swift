@@ -208,31 +208,21 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "generate_image",
     label: "Generate Image",
+    // Kept deliberately short: this rides in the cached prefix of every request, including
+    // the many sessions that never generate an image. The long-form rules are returned by
+    // the confirmed=false branch below, which lands in the conversation instead.
     description:
-      "Generate or edit an image via local Grok Imagine / Coding Relay (same APIs as Grok Build). " +
-      "ONLY call after the user has confirmed the generation request in chat. " +
-      "If the user attached or mentioned image files, pass them in reference_paths for image-to-image. " +
-      "Returns the image and the saved absolute path under .pi/attachments/.",
-    promptSnippet: "Generate or edit images after user confirms (Grok Imagine / GPT image)",
+      "Generate or edit an image (Grok Imagine / Coding Relay; backend picked from the active " +
+      "model). Call only after the user confirmed in chat. Returns the image and its saved path.",
+    promptSnippet: "Generate or edit images after the user confirms",
     promptGuidelines: [
-      "When the user asks in normal chat to generate/draw/create an image (or edit one): first briefly confirm subject, style, and whether to use any attached reference images. Do NOT call generate_image until they confirm.",
-      "After confirmation, call generate_image with confirmed=true. Choose backend automatically from the active coding model (Grok/xAI → Grok Imagine; GPT/Codex → Coding Relay *-image).",
-      "If the user provided images (attachments or paths like .pi/attachments/...), pass those absolute paths in reference_paths for image-to-image / edit.",
-      "Do not invent paths like /home/workdir/attachments/. Use real paths from the conversation.",
+      "When asked in chat to generate/draw/edit an image, confirm subject and style first, then call generate_image with confirmed=true.",
     ],
     parameters: Type.Object({
-      prompt: Type.String({
-        description: "Image description or edit instruction (English or Chinese).",
-      }),
-      confirmed: Type.Boolean({
-        description: "Must be true only after the user confirmed this generation in chat.",
-      }),
+      prompt: Type.String({ description: "Image description or edit instruction." }),
+      confirmed: Type.Boolean({ description: "True only after the user confirmed in chat." }),
       reference_paths: Type.Optional(
-        Type.Array(
-          Type.String({
-            description: "Absolute paths to reference images for i2i/edit.",
-          }),
-        ),
+        Type.Array(Type.String(), { description: "Absolute paths of reference images for i2i/edit." }),
       ),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -241,7 +231,18 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: "refused: confirmed=false. Ask the user to confirm the image request first, then call again with confirmed=true.",
+              text: [
+                "refused: confirmed=false.",
+                "",
+                "How this tool is meant to be used:",
+                "1. Briefly confirm subject, style, and whether to use any reference images the user attached.",
+                "2. Only after they confirm, call again with confirmed=true.",
+                "3. For image-to-image / edit, pass the real absolute paths from the conversation in",
+                "   reference_paths (attachments live under .pi/attachments/). Never invent a path such as",
+                "   /home/workdir/attachments/, and do not use the read tool on one.",
+                "4. The backend follows the active model automatically: Grok/xAI → Grok Imagine,",
+                "   GPT/Codex → Coding Relay *-image. You do not select it.",
+              ].join("\n"),
             },
           ],
           details: {},
@@ -296,20 +297,12 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("before_agent_start", (event) => {
-    const tip = [
-      "",
-      "## Image generation (Pipi UI)",
-      "Users may ask in normal chat to generate or edit images.",
-      "1. Parse intent; briefly confirm subject/style/references.",
-      "2. After they confirm, call tool `generate_image` with confirmed=true.",
-      "3. Backend is chosen from the active model: Grok/xAI → Grok Imagine; GPT → Coding Relay image models.",
-      "4. Pass attachment paths in reference_paths when doing image-to-image.",
-      "Do not use the read tool on fake paths like /home/workdir/attachments/.",
-    ].join("\n");
-    if (event.systemPrompt.includes("## Image generation (Pipi UI)")) return;
-    return { systemPrompt: `${event.systemPrompt}${tip}` };
-  });
+  // No before_agent_start block here on purpose. It used to append an image-generation
+  // section to the system prompt that merely restated promptGuidelines and the tool
+  // description — ~130 tokens of the cached prefix, on every request, for a tool most
+  // sessions never call. The long form now comes back from the confirmed=false branch,
+  // which lands in the conversation rather than the prefix.
+  // (Its marker guard never worked either: the hook always receives the base prompt.)
 }
 """#
 }
