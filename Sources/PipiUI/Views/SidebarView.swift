@@ -66,8 +66,15 @@ struct SidebarView: View {
             SettingsSheet()
                 .environmentObject(store)
         }
+        .onAppear {
+            syncProjectsExpansion()
+        }
         .onChange(of: store.selectedProjectPath) { _, _ in
             sessionsExpanded = false
+            syncProjectsExpansion()
+        }
+        .onChange(of: store.projects.map(\.path)) { _, _ in
+            syncProjectsExpansion()
         }
         .sheet(item: $renameTarget) { target in
             VStack(alignment: .leading, spacing: 16) {
@@ -94,6 +101,17 @@ struct SidebarView: View {
             }
             .padding(20)
             .frame(width: 360)
+        }
+    }
+
+    /// Ensures the selected project stays visible even when it falls outside the
+    /// collapsed prefix (e.g. selection made via search/restore, not by clicking a
+    /// currently-visible row).
+    private func syncProjectsExpansion() {
+        guard !projectsExpanded, let path = store.selectedProjectPath else { return }
+        guard let index = store.projects.firstIndex(where: { $0.path == path }) else { return }
+        if index >= SidebarListLimits.projects {
+            projectsExpanded = true
         }
     }
 
@@ -147,7 +165,7 @@ struct SidebarView: View {
                 }
             }
             if capped.showsToggle {
-                moreToggle(expanded: $projectsExpanded)
+                moreToggle(expanded: $projectsExpanded, sectionName: "项目")
             }
         }
     }
@@ -187,7 +205,7 @@ struct SidebarView: View {
                     )
                 }
                 if capped.showsToggle {
-                    moreToggle(expanded: $pinnedExpanded)
+                    moreToggle(expanded: $pinnedExpanded, sectionName: "置顶")
                 }
             }
         }
@@ -250,7 +268,7 @@ struct SidebarView: View {
                 )
             }
             if visibleCounts.showsToggle {
-                moreToggle(expanded: $sessionsExpanded)
+                moreToggle(expanded: $sessionsExpanded, sectionName: "会话")
             }
         }
     }
@@ -282,7 +300,7 @@ struct SidebarView: View {
     }
 
     @ViewBuilder
-    private func moreToggle(expanded: Binding<Bool>) -> some View {
+    private func moreToggle(expanded: Binding<Bool>, sectionName: String) -> some View {
         Button(expanded.wrappedValue ? "收起" : "更多") {
             expanded.wrappedValue.toggle()
         }
@@ -293,6 +311,7 @@ struct SidebarView: View {
         .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
+        .accessibilityLabel(expanded.wrappedValue ? "收起\(sectionName)" : "展开更多\(sectionName)")
     }
 
     @ViewBuilder

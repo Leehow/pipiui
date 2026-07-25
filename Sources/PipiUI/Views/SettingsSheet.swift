@@ -61,9 +61,14 @@ struct SettingsSheet: View {
             header
             Picker("设置分页", selection: $tab) {
                 ForEach(SettingsTab.allCases) { t in
-                    Label(t.rawValue, systemImage: t.systemImage)
+                    // macOS segmented Picker can silently drop the title when the
+                    // option content is a `Label` (icon+text), leaving only the
+                    // icon visible. Use `Text` so the tab title is always shown;
+                    // the icon is preserved for assistive tech via .help/a11y label.
+                    Text(t.rawValue)
                         .tag(t)
                         .help(t.rawValue)
+                        .accessibilityLabel(t.rawValue)
                 }
             }
             .pickerStyle(.segmented)
