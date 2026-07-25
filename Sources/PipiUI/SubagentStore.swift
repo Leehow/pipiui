@@ -58,6 +58,8 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
     var worktreeError: String? = nil
     /// Worktree lifecycle for review/merge UI.
     var worktreeLifecycle: WorktreeLifecycle = .none
+    /// Attested smoke-verify command reported at agent end; re-run in main repo after merge.
+    var verifyCommand: String? = nil
     /// Latest turn context occupancy (from usage.totalTokens / contextTokens).
     var contextTokens: Int = 0
     /// Model context window when known.
@@ -111,6 +113,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         case id, parentId, toolCallId, name, task, title, depth, model
         case state, output, activity, log, cost, turns, started, ended
         case worktreePath, worktreeBranch, worktreeError, worktreeLifecycle
+        case verifyCommand
         case contextTokens, contextWindow
         case totalInput, totalOutput, totalCacheRead, totalCacheWrite
     }
@@ -136,6 +139,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         worktreeBranch: String? = nil,
         worktreeError: String? = nil,
         worktreeLifecycle: WorktreeLifecycle = .none,
+        verifyCommand: String? = nil,
         contextTokens: Int = 0,
         contextWindow: Int? = nil,
         totalInput: Int = 0,
@@ -163,6 +167,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         self.worktreeBranch = worktreeBranch
         self.worktreeError = worktreeError
         self.worktreeLifecycle = worktreeLifecycle
+        self.verifyCommand = verifyCommand
         self.contextTokens = contextTokens
         self.contextWindow = contextWindow
         self.totalInput = totalInput
@@ -197,6 +202,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
             life = Self.inferredLifecycle(state: state, path: worktreePath)
         }
         worktreeLifecycle = life
+        verifyCommand = try c.decodeIfPresent(String.self, forKey: .verifyCommand)
         contextTokens = try c.decodeIfPresent(Int.self, forKey: .contextTokens) ?? 0
         contextWindow = try c.decodeIfPresent(Int.self, forKey: .contextWindow)
         totalInput = try c.decodeIfPresent(Int.self, forKey: .totalInput) ?? 0
@@ -227,6 +233,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         try c.encodeIfPresent(worktreeBranch, forKey: .worktreeBranch)
         try c.encodeIfPresent(worktreeError, forKey: .worktreeError)
         try c.encode(worktreeLifecycle, forKey: .worktreeLifecycle)
+        try c.encodeIfPresent(verifyCommand, forKey: .verifyCommand)
         try c.encode(contextTokens, forKey: .contextTokens)
         try c.encodeIfPresent(contextWindow, forKey: .contextWindow)
         try c.encode(totalInput, forKey: .totalInput)
@@ -357,6 +364,80 @@ enum WorktreeMergeFailedMessage {
     }
 }
 
+/// Result of the post-merge smoke verify run in the main project directory.
+struct PostMergeVerifyFailure: Equatable, Sendable {
+    let command: String
+    /// Process exit status; -1 when the process could not be launched.
+    let exitCode: Int32
+    /// True when the 120s timeout fired and the process had to be terminated.
+    let timedOut: Bool
+    /// Combined stdout+stderr tail (≤2000 chars).
+    let outputTail: String
+}
+
+/// Injected when the merged tree fails the agent's attested verify command.
+enum PostMergeVerifyFailedMessage {
+    static let prefix = "[post-merge-verify-failed]"
+
+    static func format(agent: SubagentInfo, failure: PostMergeVerifyFailure) -> String {
+        let branch = agent.worktreeBranch ?? "?"
+        let exitDesc = failure.timedOut ? "\(failure.exitCode) (timeout 120s)" : "\(failure.exitCode)"
+        let tail = failure.outputTail.isEmpty ? "(no output)" : failure.outputTail
+        return [
+            "\(prefix) agentId=\(agent.id) name=\(agent.name) branch=\(branch)",
+            "",
+            "verify: $ \(failure.command) → exit \(exitDesc)",
+            "output tail:",
+            tail,
+            "",
+            "主仓在合并该分支后未通过这条系统证词验证；worktree 已合并并移除。请立即派一个 general-purpose fixer 在主仓修复（brief 附上面的命令与输出尾部，verify 填同一条命令），修复后 verified=pass 才可接受；只有取舍真正属于用户时才简短问一次。不要把这条消息当成用户新需求。",
+        ].joined(separator: "\n")
+    }
+}
+
+/// Runs the post-merge verify command synchronously on a background thread.
+/// Mirrors GitRepo.run's blocking style, but via `bash -lc` with a hard timeout.
+enum PostMergeVerifyRunner {
+    static func run(command: String, in directory: URL, timeout: TimeInterval = 120) -> PostMergeVerifyFailure {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = ["-lc", command]
+        proc.currentDirectoryURL = directory
+        proc.standardInput = FileHandle.nullDevice
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        do {
+            try proc.run()
+        } catch {
+            return PostMergeVerifyFailure(
+                command: command, exitCode: -1, timedOut: false,
+                outputTail: "无法启动 verify 进程: \(error.localizedDescription)")
+        }
+        let timedOutBox = LockedBool()
+        let timeoutItem = DispatchWorkItem {
+            timedOutBox.set(true)
+            if proc.isRunning { proc.terminate() }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutItem)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        timeoutItem.cancel()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        let tail = String(text.suffix(2000)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return PostMergeVerifyFailure(
+            command: command, exitCode: proc.terminationStatus,
+            timedOut: timedOutBox.get(), outputTail: tail)
+    }
+}
+
+private final class LockedBool {
+    private let lock = NSLock()
+    private var value = false
+    func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
+    func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
+}
+
 /// 每个会话一棵 subagent 树；agent_event 桥接事件在主线程进来。
 final class SubagentStore: ObservableObject {
     /// didSet 版本计数：任何 agents 写入（含元素级 in-place 修改）都会 bump，
@@ -424,6 +505,9 @@ final class SubagentStore: ObservableObject {
     var resolveContextWindow: ((String?) -> Int?)?
     /// Fired when merge fails (auto or manual); ChatSession injects `[worktree-merge-failed]`.
     var onWorktreeMergeFailed: ((SubagentInfo, String) -> Void)?
+    /// Fired when the merged tree fails the agent's attested verify command;
+    /// ChatSession injects `[post-merge-verify-failed]`.
+    var onPostMergeVerifyFailed: ((SubagentInfo, PostMergeVerifyFailure) -> Void)?
     /// Dedup identical merge-fail injections (agentId + error) within this window.
     private var lastMergeFailKey: String?
     private var lastMergeFailAt: Date?
@@ -622,6 +706,7 @@ final class SubagentStore: ObservableObject {
             if let path = e["worktreePath"].string { agents[i].worktreePath = path }
             if let branch = e["worktreeBranch"].string { agents[i].worktreeBranch = branch }
             if let err = e["worktreeError"].string { agents[i].worktreeError = err }
+            if let verify = e["verifyCommand"].string { agents[i].verifyCommand = verify }
             // Terminal + still has worktree path → pending review.
             if let path = agents[i].worktreePath, !path.isEmpty {
                 switch agents[i].worktreeLifecycle {
@@ -731,6 +816,7 @@ final class SubagentStore: ObservableObject {
             agents[idx].worktreeLifecycle = .merged
             // Keep path/branch strings for history display; buttons hide via lifecycle.
             scheduleSave()
+            runPostMergeVerifyIfNeeded(agent: agents[idx], mainProjectURL: main)
             return nil
         case .mergeFailed(let msg):
             let full = "合并失败（worktree 未删除）: \(msg)"
@@ -824,14 +910,45 @@ final class SubagentStore: ObservableObject {
 
     /// Notify main agent once per (agentId, error) within 60s.
     func notifyMergeFailed(agent: SubagentInfo, error: String) {
-        let key = "\(agent.id)|\(error)"
+        guard shouldNotify(kind: "merge", agentId: agent.id, detail: error) else { return }
+        onWorktreeMergeFailed?(agent, error)
+    }
+
+    /// Post-merge smoke verify: re-run the agent's attested command in the MAIN project
+    /// directory. Silent on success; injects `[post-merge-verify-failed]` on failure/timeout.
+    /// Threading: bash 在 Task.detached 后台跑，回调回主线程。
+    private func runPostMergeVerifyIfNeeded(agent: SubagentInfo, mainProjectURL: URL) {
+        guard let command = agent.verifyCommand?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !command.isEmpty else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            let result = PostMergeVerifyRunner.run(command: command, in: mainProjectURL, timeout: 120)
+            guard result.exitCode == 0, !result.timedOut else {
+                await MainActor.run { [weak self] in
+                    self?.notifyPostMergeVerifyFailed(agent: agent, failure: result)
+                }
+                return
+            }
+            Log.info("post-merge verify passed for \(agent.name): \(command)", category: .session)
+        }
+    }
+
+    /// Dedup post-merge verify-fail injections the same way as merge failures.
+    func notifyPostMergeVerifyFailed(agent: SubagentInfo, failure: PostMergeVerifyFailure) {
+        guard shouldNotify(kind: "verify", agentId: agent.id,
+                           detail: "\(failure.command)|\(failure.exitCode)|\(failure.timedOut)") else { return }
+        onPostMergeVerifyFailed?(agent, failure)
+    }
+
+    /// Shared 60s dedup for merge/verify failure injections (keyed per kind).
+    private func shouldNotify(kind: String, agentId: String, detail: String) -> Bool {
+        let key = "\(kind)|\(agentId)|\(detail)"
         let now = Date()
         if let lastKey = lastMergeFailKey, lastKey == key,
            let at = lastMergeFailAt, now.timeIntervalSince(at) < 60 {
-            return
+            return false
         }
         lastMergeFailKey = key
         lastMergeFailAt = now
-        onWorktreeMergeFailed?(agent, error)
+        return true
     }
 }
