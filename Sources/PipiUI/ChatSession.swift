@@ -2599,6 +2599,34 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 }
 
+// MARK: - Subagent 控制
+
+extension ChatSession {
+    /// 中止运行中的后台 subagent：RPC prompt → 扩展注册的 `subagent_abort` 命令
+    /// （与 pipiui_reload 同一传输通道）。面板不本地改状态——agent 以 aborted 结束后
+    /// 经生命周期上报自然落终态；这里只置 abortPending 让按钮置灰防重复点击。
+    func abortSubagent(_ agentId: String) {
+        guard let proc else {
+            flash("pi 未运行，无法中止 subagent")
+            return
+        }
+        // agentId 形如 agent-xxxx-yyyy；拼进 prompt 字符串前拒绝空白/换行。
+        guard !agentId.isEmpty,
+              agentId.range(of: #"\s"#, options: .regularExpression) == nil else {
+            flash("非法 agentId，无法中止")
+            return
+        }
+        subagents.markAbortPending(agentId)
+        proc.request(["type": "prompt", "message": "/subagent_abort \(agentId)"]) { [weak self] resp in
+            guard let self else { return }
+            if resp["success"].bool != true {
+                self.subagents.clearAbortPending(agentId)
+                self.flash(resp["error"].string ?? "中止 subagent 失败")
+            }
+        }
+    }
+}
+
 // MARK: - BuiltinCommandHost
 
 extension ChatSession: BuiltinCommandHost {

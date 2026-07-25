@@ -51,6 +51,10 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
     var turns = 0
     var started = Date()
     var ended: Date?
+    /// 扩展 stall watchdog 上报：120s+ 无任何流式事件。恢复活动后自动解除。
+    var stalled: Bool = false
+    /// stalled 上报附带的 idle 秒数（badge tooltip 用）。
+    var stalledIdleSec: Int = 0
     /// Isolated git worktree path when auto-created for this agent.
     var worktreePath: String? = nil
     var worktreeBranch: String? = nil
@@ -115,6 +119,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id, parentId, toolCallId, name, task, title, depth, model
         case state, output, activity, log, cost, turns, started, ended
+        case stalled, stalledIdleSec
         case worktreePath, worktreeBranch, worktreeError, worktreeLifecycle
         case verifyCommand, verifyExit
         case contextTokens, contextWindow
@@ -138,6 +143,8 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         turns: Int = 0,
         started: Date = Date(),
         ended: Date? = nil,
+        stalled: Bool = false,
+        stalledIdleSec: Int = 0,
         worktreePath: String? = nil,
         worktreeBranch: String? = nil,
         worktreeError: String? = nil,
@@ -167,6 +174,8 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         self.turns = turns
         self.started = started
         self.ended = ended
+        self.stalled = stalled
+        self.stalledIdleSec = stalledIdleSec
         self.worktreePath = worktreePath
         self.worktreeBranch = worktreeBranch
         self.worktreeError = worktreeError
@@ -199,6 +208,8 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         turns = try c.decodeIfPresent(Int.self, forKey: .turns) ?? 0
         started = try c.decodeIfPresent(Date.self, forKey: .started) ?? Date()
         ended = try c.decodeIfPresent(Date.self, forKey: .ended)
+        stalled = try c.decodeIfPresent(Bool.self, forKey: .stalled) ?? false
+        stalledIdleSec = try c.decodeIfPresent(Int.self, forKey: .stalledIdleSec) ?? 0
         worktreePath = try c.decodeIfPresent(String.self, forKey: .worktreePath)
         worktreeBranch = try c.decodeIfPresent(String.self, forKey: .worktreeBranch)
         worktreeError = try c.decodeIfPresent(String.self, forKey: .worktreeError)
@@ -235,6 +246,8 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         try c.encode(turns, forKey: .turns)
         try c.encode(started, forKey: .started)
         try c.encodeIfPresent(ended, forKey: .ended)
+        try c.encode(stalled, forKey: .stalled)
+        try c.encode(stalledIdleSec, forKey: .stalledIdleSec)
         try c.encodeIfPresent(worktreePath, forKey: .worktreePath)
         try c.encodeIfPresent(worktreeBranch, forKey: .worktreeBranch)
         try c.encodeIfPresent(worktreeError, forKey: .worktreeError)
@@ -596,6 +609,8 @@ final class SubagentStore: ObservableObject {
     @Published var selectedId: String?
     /// Last merge/discard error for panel display (cleared on success or next action).
     @Published var worktreeActionError: String?
+    /// 已发出中止请求、等待生命周期上报落终态的 agentId（停止按钮置灰防重复点击）。
+    @Published private(set) var abortPending: Set<String> = []
     /// Main project worktree (session root). Used for auto-merge on successful agent end.
     private(set) var mainProjectURL: URL?
     /// Owning chat session key; set by ChatSession so per-turn usage events can be
@@ -651,6 +666,8 @@ final class SubagentStore: ObservableObject {
             for i in loaded.indices where loaded[i].state == .running {
                 loaded[i].state = .interrupted
                 loaded[i].activity = ""
+                loaded[i].stalled = false
+                loaded[i].stalledIdleSec = 0
                 loaded[i].ended = loaded[i].ended ?? Date()
                 if let path = loaded[i].worktreePath, !path.isEmpty {
                     loaded[i].worktreeLifecycle = .pendingReview
@@ -709,6 +726,22 @@ final class SubagentStore: ObservableObject {
         selectedId = agents.max(by: { $0.started < $1.started })?.id
     }
 
+    /// 标记已发出中止请求（面板停止按钮置灰）；end 上报到达或 RPC 失败时清除。
+    func markAbortPending(_ agentId: String) {
+        abortPending.insert(agentId)
+    }
+
+    /// 中止 RPC 未被接受时解除置灰，允许重试。
+    func clearAbortPending(_ agentId: String) {
+        abortPending.remove(agentId)
+    }
+
+    /// 任意正常活动上报到达 → 解除 stalled 标记（扩展侧恢复活动时也会重新武装 watchdog）。
+    private func clearStalled(_ index: Int) {
+        agents[index].stalled = false
+        agents[index].stalledIdleSec = 0
+    }
+
     func handle(_ e: J) {
         guard let id = e["agentId"].string, !id.isEmpty else { return }
         var runningCountMayHaveChanged = false
@@ -719,6 +752,8 @@ final class SubagentStore: ObservableObject {
             if let i = agents.firstIndex(where: { $0.id == id }) {
                 agents[i].state = .running
                 agents[i].activity = ""
+                clearStalled(i)
+                abortPending.remove(id)
                 agents[i].ended = nil
                 if let tc = e["toolCallId"].string { agents[i].toolCallId = tc }
                 if let t = e["title"].string { agents[i].title = t }
@@ -754,12 +789,14 @@ final class SubagentStore: ObservableObject {
             if selectedId == nil { selectedId = id }
         case "update":
             guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
+            clearStalled(i)
             if let output = e["output"].string, !output.isEmpty { agents[i].output = output }
             agents[i].activity = e["activity"].string ?? agents[i].activity
             agents[i].cost = e["cost"].double ?? agents[i].cost
             agents[i].turns = e["turns"].int ?? agents[i].turns
         case "log":
             guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
+            clearStalled(i)
             for item in e["items"].array {
                 logCounter += 1
                 agents[i].log.append(AgentLogItem(
@@ -777,6 +814,7 @@ final class SubagentStore: ObservableObject {
             // Per-turn usage from the subagent extension (`index.ts` message_end →
             // pipiuiReport kind:"usage"). Updates detail metrics + token ledger.
             guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
+            clearStalled(i)
             let usage = TokenLedger.UsageSnapshot.from(e["usage"])
             let model = e["model"].string ?? agents[i].model ?? "?"
             let turn = e["turn"].int ?? 0
@@ -801,9 +839,21 @@ final class SubagentStore: ObservableObject {
                 "subagent \(agent.name) turn \(turn) usage ↑\(usage.input) ↓\(usage.output) R\(usage.cacheRead) W\(usage.cacheWrite) $\(String(format: "%.4f", usage.cost)) ctx:\(usage.contextTokens) — \(model)",
                 category: .token
             )
+        case "stalled":
+            // Stall watchdog：120s+ 无流式事件 → 面板黄标；后续 update/log/usage 自动解除。
+            guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
+            if agents[i].state == .running {
+                agents[i].stalled = true
+                agents[i].stalledIdleSec = e["idle"].int ?? agents[i].stalledIdleSec
+                if let last = e["activity"].string, !last.isEmpty {
+                    agents[i].activity = last
+                }
+            }
         case "end":
             guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
             runningCountMayHaveChanged = true
+            clearStalled(i)
+            abortPending.remove(id)
             if e["aborted"].bool == true {
                 agents[i].state = .aborted
             } else {
@@ -873,6 +923,7 @@ final class SubagentStore: ObservableObject {
 
     func clearFinished() {
         agents.removeAll { $0.state != .running }
+        abortPending.formIntersection(agents.map(\.id))
         if let selected = selectedId, !agents.contains(where: { $0.id == selected }) {
             selectedId = agents.first?.id
         }
