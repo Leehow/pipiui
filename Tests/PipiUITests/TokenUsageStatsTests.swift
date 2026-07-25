@@ -39,6 +39,7 @@ final class TokenUsageStatsTests: XCTestCase {
             cacheRead: cacheRead,
             cacheWrite: cacheWrite,
             cost: cost,
+            contextTokens: 0,
             tools: tools
         )
     }
@@ -74,7 +75,7 @@ final class TokenUsageStatsTests: XCTestCase {
         ]
         let report = TokenUsageStats.aggregate(
             records: records, period: .all, groupBy: .model,
-            now: now, calendar: utcCalendar
+            now: now, calendar: utcCalendar, costMode: .ledger
         )
         XCTAssertEqual(report.total.calls, 3)
         XCTAssertEqual(report.total.cost, 3.5, accuracy: 1e-9)
@@ -104,7 +105,7 @@ final class TokenUsageStatsTests: XCTestCase {
         ]
         let report = TokenUsageStats.aggregate(
             records: records, period: .all, groupBy: .role,
-            now: now, calendar: utcCalendar
+            now: now, calendar: utcCalendar, costMode: .ledger
         )
         XCTAssertEqual(report.rows.count, 2)
         XCTAssertEqual(report.rows[0].key, "main")
@@ -126,7 +127,7 @@ final class TokenUsageStatsTests: XCTestCase {
         ]
         let report = TokenUsageStats.aggregate(
             records: records, period: .all, groupBy: .tool,
-            now: now, calendar: utcCalendar
+            now: now, calendar: utcCalendar, costMode: .ledger
         )
         XCTAssertEqual(report.total.cost, 1.5, accuracy: 1e-9)
         XCTAssertEqual(report.total.calls, 2)
@@ -148,7 +149,7 @@ final class TokenUsageStatsTests: XCTestCase {
         ]
         let report = TokenUsageStats.aggregate(
             records: records, period: .all, groupBy: .tool,
-            now: now, calendar: utcCalendar
+            now: now, calendar: utcCalendar, costMode: .ledger
         )
         XCTAssertEqual(report.rows.count, 1)
         XCTAssertEqual(report.rows[0].key, TokenUsageStats.noToolKey)
@@ -165,7 +166,7 @@ final class TokenUsageStatsTests: XCTestCase {
         ]
         let report = TokenUsageStats.aggregate(
             records: records, period: .today, groupBy: .model,
-            now: now, calendar: utcCalendar
+            now: now, calendar: utcCalendar, costMode: .ledger
         )
         XCTAssertEqual(report.total.calls, 1)
         XCTAssertEqual(report.total.cost, 1.0, accuracy: 1e-9)
@@ -208,5 +209,82 @@ final class TokenUsageStatsTests: XCTestCase {
         """
         XCTAssertEqual(TokenUsageStats.parseLine(fractional)?.input, 1)
         XCTAssertEqual(TokenUsageStats.parseLine(plain)?.input, 3)
+    }
+
+    // MARK: - sessionCacheTotals (resume rehydration)
+
+    private func writeJSONL(_ lines: [String], to url: URL) throws {
+        let payload = lines.joined(separator: "\n") + "\n"
+        try payload.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    func testSessionCacheTotalsSumsMatchingSessionOnly() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-cache-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let active = dir.appendingPathComponent("active.jsonl")
+        let alpha = "alpha-sess-id"
+        let beta = "beta-sess-id"
+
+        let lines = [
+            // alpha, turn 1
+            #"{"ts":"2026-07-25T10:00:00Z","session":"\#(alpha)","channel":"main","model":"m","input":1,"output":1,"cacheRead":100,"cacheWrite":10,"cost":0.1}"#,
+            // beta — must be ignored for alpha
+            #"{"ts":"2026-07-25T10:01:00Z","session":"\#(beta)","channel":"main","model":"m","input":1,"output":1,"cacheRead":999,"cacheWrite":999,"cost":0.1}"#,
+            // alpha, turn 2
+            #"{"ts":"2026-07-25T10:02:00Z","session":"\#(alpha)","channel":"main","model":"m","input":1,"output":1,"cacheRead":200,"cacheWrite":20,"cost":0.1}"#,
+            // no session field, but substring appears in model — must be ignored
+            #"{"ts":"2026-07-25T10:03:00Z","channel":"main","model":"\#(alpha)-x","input":1,"output":1,"cacheRead":5,"cacheWrite":6,"cost":0.1}"#,
+            // session = null, substring in model — must be ignored
+            #"{"ts":"2026-07-25T10:04:00Z","session":null,"channel":"main","model":"\#(alpha)-x","input":1,"output":1,"cacheRead":7,"cacheWrite":8,"cost":0.1}"#,
+            // session = number, substring in model — must be ignored
+            #"{"ts":"2026-07-25T10:05:00Z","session":123,"channel":"main","model":"\#(alpha)-x","input":1,"output":1,"cacheRead":9,"cacheWrite":11,"cost":0.1}"#,
+        ]
+        try writeJSONL(lines, to: active)
+
+        let alphaTotals = TokenUsageStats.sessionCacheTotals(for: alpha, urls: [active])
+        XCTAssertEqual(alphaTotals.cacheRead, 300)
+        XCTAssertEqual(alphaTotals.cacheWrite, 30)
+
+        let betaTotals = TokenUsageStats.sessionCacheTotals(for: beta, urls: [active])
+        XCTAssertEqual(betaTotals.cacheRead, 999)
+        XCTAssertEqual(betaTotals.cacheWrite, 999)
+
+        let noneTotals = TokenUsageStats.sessionCacheTotals(for: "missing-sess-id", urls: [active])
+        XCTAssertEqual(noneTotals.cacheRead, 0)
+        XCTAssertEqual(noneTotals.cacheWrite, 0)
+    }
+
+    func testSessionCacheTotalsAcrossActiveAndRolled() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-cache2-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let active = dir.appendingPathComponent("active.jsonl")
+        let rolled = dir.appendingPathComponent("active.jsonl.1")
+        let alpha = "alpha-sess-id"
+
+        try writeJSONL([
+            #"{"ts":"2026-07-25T10:00:00Z","session":"\#(alpha)","channel":"main","model":"m","input":1,"output":1,"cacheRead":100,"cacheWrite":10,"cost":0.1}"#,
+        ], to: active)
+        try writeJSONL([
+            #"{"ts":"2026-07-24T10:00:00Z","session":"\#(alpha)","channel":"main","model":"m","input":1,"output":1,"cacheRead":200,"cacheWrite":20,"cost":0.1}"#,
+        ], to: rolled)
+
+        let totals = TokenUsageStats.sessionCacheTotals(for: alpha, urls: [active, rolled])
+        XCTAssertEqual(totals.cacheRead, 300)
+        XCTAssertEqual(totals.cacheWrite, 30)
+    }
+
+    func testSessionCacheTotalsMissingFilesAreZero() {
+        let totals = TokenUsageStats.sessionCacheTotals(
+            for: "alpha",
+            urls: [FileManager.default.temporaryDirectory.appendingPathComponent("does-not-exist-\(UUID().uuidString).jsonl")]
+        )
+        XCTAssertEqual(totals.cacheRead, 0)
+        XCTAssertEqual(totals.cacheWrite, 0)
     }
 }
