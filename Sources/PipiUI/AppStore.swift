@@ -153,10 +153,6 @@ final class AppStore: ObservableObject {
         ToolSkillSettings.syncJSONFile()
         WebSearchSettings.syncJSONFile()
 
-        // 后台预热设置页数据（auth 快照 + list-models / list-providers 子进程），
-        // 打开设置先渲染缓存再后台刷新；全程后台，失败 = 空缓存退回现加载。
-        SettingsDataStore.shared.warm()
-
         // T20: 一次性把 auth.json / UserDefaults / 旧 websearch-config.json 里的
         // API key 迁到 ~/.pi/agent/.env。幂等；全程后台队列，主线程零 I/O。
         DispatchQueue.global(qos: .utility).async {

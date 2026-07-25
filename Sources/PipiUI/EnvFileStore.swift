@@ -52,9 +52,6 @@ public final class EnvFileStore {
     /// Serial queue for all mutations of the on-disk file.
     private let writeQueue = DispatchQueue(label: "pipiui.EnvFileStore.write")
 
-    /// 进程级共享实例（内部缓存已是 mtime 校验 + 锁保护，跨调用复用才有效）。
-    public static let shared = EnvFileStore()
-
     public init(fileURL: URL = EnvFileStore.defaultURL) {
         self.fileURL = fileURL
     }
