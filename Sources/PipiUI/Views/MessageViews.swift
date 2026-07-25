@@ -1297,32 +1297,13 @@ struct ToolCardView: View {
 
 // MARK: - Generated video
 
-/// Path-existence probes for generated videos: resolved once off-main and cached by
-/// path, so scroll recreation of rows never stats the disk on the main thread.
-private enum VideoFileExistsCache {
-    private static var cache: [String: Bool] = [:]
-    private static let lock = NSLock()
-
-    static func cachedValue(for path: String) -> Bool? {
-        lock.lock()
-        defer { lock.unlock() }
-        return cache[path]
-    }
-
-    static func store(_ value: Bool, for path: String) {
-        lock.lock()
-        cache[path] = value
-        lock.unlock()
-    }
-}
-
 struct VideoBlockView: View {
     let path: String
     var onFlash: ((String) -> Void)? = nil
 
     /// T24: `VideoBlock` / `appendMediaResult` live in ChatSession.swift, so the
-    /// existence check cannot be hoisted into the model from here. Instead probe
-    /// once off-main and cache by path — body evaluation stays stat-free.
+    /// existence check cannot be hoisted into the model from here. Instead stat
+    /// once on first appear and cache in @State — body evaluation stays stat-free.
     /// nil = not yet probed (first body pass before onAppear).
     @State private var fileExists: Bool? = nil
 
@@ -1375,18 +1356,8 @@ struct VideoBlockView: View {
         }
         .frame(maxWidth: 420)
         .onAppear {
-            guard fileExists == nil else { return }
-            if let hit = VideoFileExistsCache.cachedValue(for: path) {
-                fileExists = hit
-                return
-            }
-            let path = self.path
-            Task.detached(priority: .utility) {
-                let exists = FileManager.default.fileExists(atPath: path)
-                VideoFileExistsCache.store(exists, for: path)
-                await MainActor.run {
-                    fileExists = exists
-                }
+            if fileExists == nil {
+                fileExists = FileManager.default.fileExists(atPath: path)
             }
         }
     }

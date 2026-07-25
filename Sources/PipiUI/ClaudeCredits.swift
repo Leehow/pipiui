@@ -22,7 +22,7 @@ enum ClaudeAuthStore {
     }
 
     static func load() -> ClaudeCredentials? {
-        guard let data = AuthFileCache.data(for: authFileURL()) else { return nil }
+        guard let data = try? Data(contentsOf: authFileURL()) else { return nil }
         return parse(data: data)
     }
 
