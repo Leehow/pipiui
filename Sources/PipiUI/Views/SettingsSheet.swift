@@ -48,6 +48,8 @@ struct SettingsSheet: View {
     @State private var showAddSheet = false
     /// T9/T-tab 减负：pickerModels 改为缓存 @State，仅在 models/hiddenIds/subagentOverrides 变化时重算。
     @State private var pickerModels: [ModelInfo] = []
+    /// 模型 tab 的 provider 分组缓存（reload 时重算，见 recomputeGroupedModels）。
+    @State private var groupedModels: [ProviderModelGroup] = []
 
     @State private var usagePeriod: TokenUsageStats.Period = .today
     @State private var usageGroupBy: TokenUsageStats.GroupBy = .model
@@ -77,19 +79,22 @@ struct SettingsSheet: View {
             .padding(.bottom, 10)
             Divider()
             ScrollView {
-                Group {
-                    switch tab {
-                    case .general:
-                        generalSection
-                    case .models:
-                        modelSettingsSection
-                    case .usage:
-                        usageSection
-                    case .toolsSkills:
-                        toolsSkillsSection
-                    case .subagentModels:
-                        subagentModelsSection
-                    }
+                // Keep-alive: all five sections stay in the view tree, so switching
+                // tabs doesn't tear down / rebuild their AppKit controls (and each
+                // section's @State survives). Inactive sections are invisible,
+                // non-interactive and zero-height, so the ZStack — and thus the
+                // scroll content — sizes to the active section only.
+                ZStack(alignment: .top) {
+                    generalSection
+                        .settingsTabKeepAlive(active: tab == .general)
+                    modelSettingsSection
+                        .settingsTabKeepAlive(active: tab == .models)
+                    usageSection
+                        .settingsTabKeepAlive(active: tab == .usage)
+                    toolsSkillsSection
+                        .settingsTabKeepAlive(active: tab == .toolsSkills)
+                    subagentModelsSection
+                        .settingsTabKeepAlive(active: tab == .subagentModels)
                 }
                 .padding(20)
             }
@@ -183,7 +188,7 @@ struct SettingsSheet: View {
     // MARK: - Models
 
     private var modelSettingsSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        LazyVStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("模型设置")
                     .font(.title3.weight(.semibold))
@@ -211,12 +216,12 @@ struct SettingsSheet: View {
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 12)
             } else {
-                ForEach(groupedProviders, id: \.self) { provider in
-                    VStack(alignment: .leading, spacing: 6) {
+                ForEach(groupedModels) { group in
+                    LazyVStack(alignment: .leading, spacing: 6) {
                         HStack {
-                            Text(provider)
+                            Text(group.provider)
                                 .font(.subheadline.weight(.semibold))
-                            if let cred = credentials.first(where: { $0.providerId == provider }) {
+                            if let cred = credentials.first(where: { $0.providerId == group.provider }) {
                                 Text(cred.type == "oauth" ? "账号" : "API key")
                                     .font(.caption2)
                                     .padding(.horizontal, 6)
@@ -225,7 +230,7 @@ struct SettingsSheet: View {
                             }
                             Spacer()
                             Button(role: .destructive) {
-                                pendingDeleteProvider = provider
+                                pendingDeleteProvider = group.provider
                             } label: {
                                 Image(systemName: "trash")
                             }
@@ -234,9 +239,9 @@ struct SettingsSheet: View {
                         }
                         // T19 冲突警告：.env 与 auth.json(api_key) 同时存在时，
                         // auth.json 的旧 key 会覆盖 .env，提供一键清理。
-                        if let cred = credentials.first(where: { $0.providerId == provider }),
+                        if let cred = credentials.first(where: { $0.providerId == group.provider }),
                            cred.type == "api_key",
-                           envConfiguredProviders.contains(provider) {
+                           envConfiguredProviders.contains(group.provider) {
                             HStack(spacing: 6) {
                                 Image(systemName: "exclamationmark.triangle.fill")
                                     .foregroundStyle(.orange)
@@ -245,12 +250,12 @@ struct SettingsSheet: View {
                                     .foregroundStyle(.orange)
                                 Spacer()
                                 Button("清理") {
-                                    Task { await cleanupStaleAuthKey(provider) }
+                                    Task { await cleanupStaleAuthKey(group.provider) }
                                 }
                                 .font(.caption)
                             }
                         }
-                        ForEach(models.filter { $0.provider == provider }) { model in
+                        ForEach(group.models) { model in
                             HStack(spacing: 8) {
                                 Toggle(isOn: visibilityBinding(for: model.id)) {
                                     VStack(alignment: .leading, spacing: 2) {
@@ -506,7 +511,7 @@ struct SettingsSheet: View {
     // MARK: - Tools & Skills
 
     private var toolsSkillsSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        LazyVStack(alignment: .leading, spacing: 16) {
             Text("工具与 Skills")
                 .font(.title3.weight(.semibold))
             Text("开关关闭后：工具通过 `--exclude-tools` 在会话重启后对 pi 生效；Skills 立即从斜杠菜单隐藏（下次派出 subagent 也会尊重工具禁用）。")
@@ -516,7 +521,7 @@ struct SettingsSheet: View {
             catalogGroup(title: "内置工具", entries: ToolSkillCatalog.builtinTools)
             catalogGroup(title: "扩展工具", entries: ToolSkillCatalog.extensionTools)
 
-            VStack(alignment: .leading, spacing: 8) {
+            LazyVStack(alignment: .leading, spacing: 8) {
                 Text("Skills")
                     .font(.subheadline.weight(.semibold))
                 let skills = ToolSkillCatalog.skills(from: store.currentSession?.availableCommands ?? [])
@@ -573,7 +578,7 @@ struct SettingsSheet: View {
     }
 
     private func catalogGroup(title: String, entries: [ToolSkillCatalog.ToolEntry]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        LazyVStack(alignment: .leading, spacing: 8) {
             Text(title)
                 .font(.subheadline.weight(.semibold))
             ForEach(entries) { tool in
@@ -640,26 +645,13 @@ struct SettingsSheet: View {
             }
 
             ForEach(agents) { agent in
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(agent.name)
-                        .font(.subheadline.weight(.semibold))
-                    Text(agent.description)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                    Picker(
-                        "模型",
-                        selection: subagentModelBinding(for: agent.name)
-                    ) {
-                        Text("跟随主 Agent").tag(SubagentModelSettings.followMainSentinel)
-                        ForEach(pickerModels) { model in
-                            Text("\(model.name)（\(model.id)）").tag(model.id)
-                        }
-                    }
-                    .labelsHidden()
+                SubagentModelRow(
+                    agent: agent,
+                    pickerModels: pickerModels,
+                    selection: subagentOverrides[agent.name] ?? SubagentModelSettings.followMainSentinel
+                ) { newValue in
+                    setSubagentModelOverride(newValue, for: agent.name)
                 }
-                .padding(10)
-                .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
             }
         }
     }
@@ -675,20 +667,15 @@ struct SettingsSheet: View {
         }
     }
 
-    private func subagentModelBinding(for agentName: String) -> Binding<String> {
-        Binding(
-            get: { subagentOverrides[agentName] ?? SubagentModelSettings.followMainSentinel },
-            set: { newValue in
-                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                SubagentModelSettings.setModelOverride(
-                    trimmed.isEmpty ? nil : trimmed,
-                    for: agentName
-                )
-                subagentOverrides = SubagentModelSettings.allOverrides()
-                recomputePickerModels()
-                statusMessage = "已保存 \(agentName) 的模型设置"
-            }
+    private func setSubagentModelOverride(_ newValue: String, for agentName: String) {
+        let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        SubagentModelSettings.setModelOverride(
+            trimmed.isEmpty ? nil : trimmed,
+            for: agentName
         )
+        subagentOverrides = SubagentModelSettings.allOverrides()
+        recomputePickerModels()
+        statusMessage = "已保存 \(agentName) 的模型设置"
     }
 
     // MARK: - Web Search
@@ -810,14 +797,20 @@ struct SettingsSheet: View {
         }
     }
 
-    private var groupedProviders: [String] {
+    /// 模型 tab 的 provider 分组缓存：原实现每次 body 求值都
+    /// `models.filter { $0.provider == provider }`（每 provider 全量过滤）。
+    /// models 只在 reload() 中变化，故在 reload 末尾一次性算好。
+    private func recomputeGroupedModels() {
         var seen: Set<String> = []
-        var result: [String] = []
+        var groups: [ProviderModelGroup] = []
         for m in models where !seen.contains(m.provider) {
             seen.insert(m.provider)
-            result.append(m.provider)
+            groups.append(ProviderModelGroup(
+                provider: m.provider,
+                models: models.filter { $0.provider == m.provider }
+            ))
         }
-        return result
+        groupedModels = groups
     }
 
     private func visibilityBinding(for modelId: String) -> Binding<Bool> {
@@ -938,7 +931,8 @@ struct SettingsSheet: View {
         if restartSessions {
             statusMessage = "已更新，相关会话已刷新"
         }
-        // models / hiddenIds / subagentOverrides 已就位，重算 picker 候选缓存。
+        // models / hiddenIds / subagentOverrides 已就位，重算 picker 候选与 provider 分组缓存。
+        recomputeGroupedModels()
         recomputePickerModels()
     }
 
@@ -971,6 +965,74 @@ struct SettingsSheet: View {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+}
+
+// MARK: - Settings internals
+
+/// 模型 tab 的 provider 分组（groupedModels @State 元素）。
+private struct ProviderModelGroup: Identifiable {
+    let provider: String
+    let models: [ModelInfo]
+    var id: String { provider }
+}
+
+/// Keep-alive 修饰符：让不活跃 tab 的 section 留在视图树里（AppKit 控件不销毁、
+/// @State 保留），但不可见、不可交互、不占布局高度，ZStack 仅按活跃 section 定尺寸。
+private struct SettingsTabKeepAlive: ViewModifier {
+    let active: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(active ? 1 : 0)
+            .allowsHitTesting(active)
+            .accessibilityHidden(!active)
+            .frame(maxHeight: active ? .infinity : 0, alignment: .top)
+            .clipped()
+    }
+}
+
+private extension View {
+    func settingsTabKeepAlive(active: Bool) -> some View {
+        modifier(SettingsTabKeepAlive(active: active))
+    }
+}
+
+/// Subagent 模型 tab 的单行。抽成独立 Equatable View 后，父视图其它状态变化
+/// （statusMessage、usage 等）只按身份 diff，不再整行重建 ~30 项的 Picker 内容。
+private struct SubagentModelRow: View, Equatable {
+    let agent: AgentDefinition
+    let pickerModels: [ModelInfo]
+    let selection: String
+    let onSelect: (String) -> Void
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.agent == rhs.agent
+            && lhs.pickerModels == rhs.pickerModels
+            && lhs.selection == rhs.selection
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(agent.name)
+                .font(.subheadline.weight(.semibold))
+            Text(agent.description)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Picker(
+                "模型",
+                selection: Binding(get: { selection }, set: { onSelect($0) })
+            ) {
+                Text("跟随主 Agent").tag(SubagentModelSettings.followMainSentinel)
+                ForEach(pickerModels) { model in
+                    Text("\(model.name)（\(model.id)）").tag(model.id)
+                }
+            }
+            .labelsHidden()
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
     }
 }
 

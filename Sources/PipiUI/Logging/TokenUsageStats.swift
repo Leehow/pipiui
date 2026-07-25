@@ -106,9 +106,43 @@ enum TokenUsageStats {
 
     // MARK: - Load
 
-    static func loadSharedRecords() -> [Record] {
+    /// mtime+size 指纹；两本 ledger 都未变时复用缓存，避免每次进「用量」tab
+    /// 全量重解析 JSONL（模式同 AgentCatalog.directoryStamp）。nil 字段 = 文件缺失。
+    private struct LedgerFileStamp: Equatable {
+        var mtime: Date?
+        var size: NSNumber?
+    }
+
+    private static let sharedRecordsCacheLock = NSLock()
+    private static var sharedRecordsCache: (stamps: [LedgerFileStamp], records: [Record])?
+
+    static func loadSharedRecords(fileManager: FileManager = .default) -> [Record] {
+        // 先把 TokenLedger 内存缓冲落盘，再取指纹，保证缓存判断基于最新文件状态。
         TokenLedger.shared.flushSync()
-        return loadRecords(from: [TokenLedger.shared.fileURL, TokenLedger.shared.rolledFileURL])
+        let urls = [TokenLedger.shared.fileURL, TokenLedger.shared.rolledFileURL]
+        let stamps = urls.map { ledgerStamp(of: $0, fileManager: fileManager) }
+        sharedRecordsCacheLock.lock()
+        if let cache = sharedRecordsCache, cache.stamps == stamps {
+            let records = cache.records
+            sharedRecordsCacheLock.unlock()
+            return records
+        }
+        sharedRecordsCacheLock.unlock()
+        let records = loadRecords(from: urls, fileManager: fileManager)
+        sharedRecordsCacheLock.lock()
+        sharedRecordsCache = (stamps: stamps, records: records)
+        sharedRecordsCacheLock.unlock()
+        return records
+    }
+
+    private static func ledgerStamp(of url: URL, fileManager: FileManager) -> LedgerFileStamp {
+        guard let attrs = try? fileManager.attributesOfItem(atPath: url.path) else {
+            return LedgerFileStamp(mtime: nil, size: nil)
+        }
+        return LedgerFileStamp(
+            mtime: attrs[.modificationDate] as? Date,
+            size: attrs[.size] as? NSNumber
+        )
     }
 
     static func loadRecords(from urls: [URL], fileManager: FileManager = .default) -> [Record] {
