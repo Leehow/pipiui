@@ -3,9 +3,21 @@ import CoreGraphics
 import SwiftUI
 
 /// Chat-body typography tokens. Only `fontSize` is persisted; spacing is derived.
+///
+/// Rhythm targets (CJK-heavy assistant replies):
+/// - body line-height ≈ 1.75× (SF natural ~1.2× + `lineSpacing`)
+/// - list / hard-break gaps via `paragraphSpacing` / `listItemSpacing`
+/// - markdown block gaps via `blockSpacing` (NSTextView separator line height)
 struct ChatTypography: Equatable {
     var fontSize: CGFloat
+    /// Extra leading for AppKit/SwiftUI (`lineSpacing`), atop ~1.2× natural.
     var lineSpacing: CGFloat
+    /// Soft paragraph / hard-break gap inside prose blocks.
+    var paragraphSpacing: CGFloat
+    /// Gap between markdown list items (separate NS paragraphs).
+    var listItemSpacing: CGFloat
+    /// Tighter extra leading for headings (~1.25× total).
+    var headingLineSpacing: CGFloat
     var messageSpacing: CGFloat
     var blockSpacing: CGFloat
 
@@ -20,17 +32,21 @@ struct ChatTypography: Equatable {
 
     static func make(fontSize raw: CGFloat) -> ChatTypography {
         let fontSize = sanitizedFontSize(raw)
-        // ~CSS line-height 1.7 (SwiftUI lineSpacing is extra atop ~1.2× system leading).
-        // Chinese technical replies read better near 1.7 than the WCAG floor (~1.5).
-        let lineSpacing = fontSize * 0.5
+        let lineSpacing = fontSize * 0.55
+        let paragraphSpacing = max(6, (fontSize * 0.4).rounded())
+        let listItemSpacing = max(4, (fontSize * 0.3).rounded())
+        let headingLineSpacing = fontSize * 0.15
         let messageSpacing = min(
             28,
             max(16, 18 + (fontSize - 13) * 2)
         )
-        let blockSpacing = max(8, (fontSize * 0.65).rounded())
+        let blockSpacing = max(12, fontSize.rounded())
         return ChatTypography(
             fontSize: fontSize,
             lineSpacing: lineSpacing,
+            paragraphSpacing: paragraphSpacing,
+            listItemSpacing: listItemSpacing,
+            headingLineSpacing: headingLineSpacing,
             messageSpacing: messageSpacing,
             blockSpacing: blockSpacing
         )

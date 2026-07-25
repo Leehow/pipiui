@@ -68,6 +68,11 @@ final class TokenLedger: @unchecked Sendable {
         logsDirectoryURL.appendingPathComponent(Self.fileName, isDirectory: false)
     }
 
+    /// Rolled backup file URL (active file path + `.1`).
+    var rolledFileURL: URL {
+        URL(fileURLWithPath: fileURL.path + Self.rolledSuffix)
+    }
+
     // MARK: - Append
 
     /// Append a per-turn usage record. Never blocks the caller.
@@ -80,6 +85,7 @@ final class TokenLedger: @unchecked Sendable {
         model: String,
         turn: Int,
         usage: UsageSnapshot,
+        tools: [String] = [],
         date: Date = Date()
     ) {
         let record = Record(
@@ -96,7 +102,8 @@ final class TokenLedger: @unchecked Sendable {
             cacheRead: usage.cacheRead,
             cacheWrite: usage.cacheWrite,
             cost: usage.cost,
-            contextTokens: usage.contextTokens
+            contextTokens: usage.contextTokens,
+            tools: tools
         )
         guard let data = record.toJSONLine() else { return }
         queue.async { [weak self] in
@@ -204,10 +211,11 @@ final class TokenLedger: @unchecked Sendable {
         let cacheWrite: Int
         let cost: Double
         let contextTokens: Int
+        let tools: [String]
 
         /// Compact single-line JSON terminated by `\n`. Returns nil if encoding fails.
         func toJSONLine() -> Data? {
-            let obj: [String: Any?] = [
+            var obj: [String: Any?] = [
                 "ts": ts,
                 "session": session,
                 "channel": channel,
@@ -223,6 +231,9 @@ final class TokenLedger: @unchecked Sendable {
                 "cost": cost,
                 "contextTokens": contextTokens,
             ]
+            if !tools.isEmpty {
+                obj["tools"] = tools
+            }
             // Strip null values to keep lines short and consistent with `J`'s nil-vs-absent convention.
             let compacted = obj.compactMapValues { $0 }
             guard JSONSerialization.isValidJSONObject(compacted),
@@ -232,6 +243,18 @@ final class TokenLedger: @unchecked Sendable {
             }
             return data + Data([0x0A]) // '\n'
         }
+    }
+
+    /// Unique tool names from assistant `content` blocks with `type == "toolCall"`, sorted.
+    static func toolNames(from message: J) -> [String] {
+        var names = Set<String>()
+        for block in message["content"].array {
+            guard block["type"].string == "toolCall",
+                  let name = block["name"].string?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !name.isEmpty else { continue }
+            names.insert(name)
+        }
+        return names.sorted()
     }
 }
 

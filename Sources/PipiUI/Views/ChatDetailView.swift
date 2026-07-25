@@ -86,7 +86,15 @@ private struct ChatDetailViewBody: View {
                     Image(systemName: "globe")
                         .foregroundStyle(session.rightPanel == .web ? Color.accentColor : Color.secondary)
                 }
-                .help("内置浏览器面板（pi 可通过 browser_* 工具驱动）")
+                .help("内置浏览器面板（pi 可通过 browser 工具驱动）")
+
+                Button {
+                    session.rightPanel = session.rightPanel == .document ? nil : .document
+                } label: {
+                    Image(systemName: "doc.text")
+                        .foregroundStyle(session.rightPanel == .document ? Color.accentColor : Color.secondary)
+                }
+                .help("文档面板（⌘+点击聊天中的 md/txt 文档路径在此预览）")
             }
         }
         .onAppear {
@@ -108,6 +116,11 @@ private struct ChatDetailViewBody: View {
             widthRecoverGeneration += 1
             // draft / rightPanel / pinTranscriptToBottom / transcriptVisibleCount live on ChatSession.
         }
+        .environment(\.openDocument, { url in
+            // ⌘+点击聊天中的文档路径 → 右侧文档面板渲染（非文档路径仍走访达）。
+            session.documents.open(url)
+            session.rightPanel = .document
+        })
     }
 
     private var chatColumn: some View {
@@ -181,16 +194,23 @@ private struct ChatDetailViewBody: View {
 
     @ViewBuilder
     private func panelView(_ panel: ChatSession.RightPanel) -> some View {
-        switch panel {
-        case .web:
-            WebViewPanel(store: session.webView) {
-                session.rightPanel = nil
-            }
-        case .agents:
-            SubagentPanel(store: session.subagents, projectURL: session.projectURL) {
-                session.rightPanel = nil
+        Group {
+            switch panel {
+            case .web:
+                WebViewPanel(store: session.webView) {
+                    session.rightPanel = nil
+                }
+            case .agents:
+                SubagentPanel(store: session.subagents, projectURL: session.projectURL) {
+                    session.rightPanel = nil
+                }
+            case .document:
+                DocumentPanel(store: session.documents) {
+                    session.rightPanel = nil
+                }
             }
         }
+        .overlayScrollers()
     }
 
     private func overlayPanelWidth(for availableWidth: CGFloat) -> CGFloat {
@@ -251,9 +271,15 @@ private struct ChatDetailViewBody: View {
         let items = session.transcript
         let visibleCount = session.transcriptVisibleCount
         let hidden = max(0, items.count - visibleCount)
-        // Coalesce consecutive assistant tool-rounds, then newest-first for the flipped stack.
-        let visibleRowsNewestFirst = AssistantBlockLayout
-            .planTranscript(items: Array(items.suffix(visibleCount)))
+        // T6 布局记忆化：版本 key 未变时直接命中缓存，不再每次 body 求值全量重排。
+        let visibleRowsNewestFirst = session.transcriptPlanner
+            .rows(
+                items: items,
+                toolRuns: session.toolRuns,
+                visibleCount: visibleCount,
+                transcriptVersion: session.transcriptVersion,
+                toolOutputVersion: session.toolOutputVersion
+            )
             .reversed()
         return ScrollViewReader { proxy in
             ScrollView {
@@ -280,8 +306,21 @@ private struct ChatDetailViewBody: View {
                             isStreaming: session.isStreaming,
                             projectURL: session.projectURL,
                             chatFontSize: chatTypography.fontSize,
+                            isWorking: session.isWorking,
                             onFlash: { session.flash($0) },
-                            onSelectAgent: selectAgent
+                            onSelectAgent: selectAgent,
+                            onCopy: {
+                                session.copySegmentsText(
+                                    AssistantBlockLayout.plan(
+                                        blocks: streaming.blocks,
+                                        groupFinished: !session.isStreaming
+                                    )
+                                )
+                            },
+                            onBranch: {
+                                guard let entryId = streaming.entryId else { return }
+                                session.branchFromAssistant(runLastEntryId: entryId)
+                            }
                         )
                         .transcriptFlip()
                     } else if session.isWorking || session.mediaBusy {
@@ -303,13 +342,19 @@ private struct ChatDetailViewBody: View {
                                 subagents: subagents(for: item),
                                 projectURL: session.projectURL,
                                 chatFontSize: chatTypography.fontSize,
+                                isWorking: session.isWorking,
+                                isEditing: session.editingItemId == item.id,
                                 onFlash: { session.flash($0) },
-                                onSelectAgent: selectAgent
+                                onSelectAgent: selectAgent,
+                                onCopy: { session.copyItemText(item) },
+                                onBeginEdit: { session.beginEditingUserMessage(itemId: item.id) },
+                                onCancelEdit: { session.cancelEditingUserMessage() },
+                                onCommitEdit: { session.commitEditingUserMessage(newText: $0) }
                             )
                             .equatable()
                             .id(item.id)
                             .transcriptFlip()
-                        case .assistantRun(let id, let segments):
+                        case .assistantRun(let id, let entryId, let segments):
                             let callIds = AssistantBlockLayout.toolCallIds(in: segments)
                             AssistantSegmentsView(
                                 segments: segments,
@@ -317,7 +362,14 @@ private struct ChatDetailViewBody: View {
                                 subagents: subagents(forToolCallIds: callIds),
                                 projectURL: session.projectURL,
                                 onFlash: { session.flash($0) },
-                                onSelectAgent: selectAgent
+                                onSelectAgent: selectAgent,
+                                entryId: entryId,
+                                isWorking: session.isWorking,
+                                onCopy: { session.copySegmentsText(segments) },
+                                onBranch: {
+                                    guard let entryId else { return }
+                                    session.branchFromAssistant(runLastEntryId: entryId)
+                                }
                             )
                             .equatable()
                             .id(id)
@@ -338,6 +390,8 @@ private struct ChatDetailViewBody: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .geometryGroup()
             }
+            // Prefer overlay indicators; AppKit style is forced in StickToBottomTracker.
+            .scrollIndicators(.automatic)
             // Flip the scroll view itself so document-start maps to the visual bottom.
             .transcriptFlip()
             .overlay(alignment: .bottomTrailing) {
@@ -505,19 +559,8 @@ private struct ChatDetailViewBody: View {
     }
 
     private func subagents(forToolCallIds callIds: Set<String>) -> [SubagentInfo] {
-        guard !callIds.isEmpty else { return [] }
-        let all = agentStore.agents
-        var keep = all.filter { $0.toolCallId.map(callIds.contains) == true }
-        var frontier = Set(keep.map(\.id))
-        while !frontier.isEmpty {
-            let children = all.filter { a in
-                a.parentId.map(frontier.contains) == true && !keep.contains(where: { $0.id == a.id })
-            }
-            if children.isEmpty { break }
-            keep.append(contentsOf: children)
-            frontier = Set(children.map(\.id))
-        }
-        return keep
+        // O(结果数) 索引查询（索引在 agents 变化时惰性重建）。
+        agentStore.agents(forToolCallIds: callIds)
     }
 
     private func selectAgent(_ id: String) {
@@ -743,6 +786,10 @@ struct StickToBottomTracker: NSViewRepresentable {
         context.coordinator.pinEdge = pinEdge
         // Do not re-attach on every SwiftUI body pass — only when not yet wired.
         context.coordinator.ensureAttached(from: nsView)
+        // Re-apply only if SwiftUI reset style to legacy (applyIfNeeded is a no-op otherwise).
+        if let sv = context.coordinator.attachedScrollView {
+            OverlayScrollers.applyIfNeeded(to: sv)
+        }
     }
 
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
@@ -754,6 +801,8 @@ struct StickToBottomTracker: NSViewRepresentable {
         var threshold: CGFloat
         var pinEdge: StickPinEdge
         private weak var scrollView: NSScrollView?
+        /// Exposed so `updateNSView` can re-apply overlay style after SwiftUI resets it.
+        var attachedScrollView: NSScrollView? { scrollView }
         private var liveScrollObs: NSObjectProtocol?
         private var endScrollObs: NSObjectProtocol?
         private var boundsObs: NSObjectProtocol?
@@ -782,6 +831,7 @@ struct StickToBottomTracker: NSViewRepresentable {
             if let sv = view.enclosingScrollView ?? Self.findScrollView(startingAt: view) {
                 scrollView = sv
                 attachAttempts = 0
+                OverlayScrollers.apply(to: sv)
                 let center = NotificationCenter.default
                 liveScrollObs = center.addObserver(
                     forName: NSScrollView.didLiveScrollNotification,

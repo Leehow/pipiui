@@ -20,6 +20,26 @@ struct KimiParsedUsage: Equatable {
     let rateLimit: KimiUsageDetail?
 }
 
+// MARK: - .env fallback (shared by Kimi/GLM quota modules)
+
+/// Merges process environment with the cached `~/.pi/agent/.env` store.
+/// Process env wins; `.env` entries only fill in missing keys. This lets
+/// GUI launches (no shell env) still pick up keys written to the dotenv file.
+/// EnvFileStore reads are lock-guarded and mtime-cached, safe from background Tasks.
+enum QuotaEnvFallback {
+    /// Shared default store (mtime-cached reads).
+    private static let sharedStore = EnvFileStore()
+
+    /// Injectable `.env` value source — tests override to isolate from the
+    /// real user file; must be restored in tearDown.
+    static var envFileValues: () -> [String: String] = { sharedStore.all() }
+
+    /// `.env` as base layer, `env` overlaid on top (injected/process values win).
+    static func merged(_ env: [String: String]) -> [String: String] {
+        envFileValues().merging(env) { _, injected in injected }
+    }
+}
+
 // MARK: - Auth
 
 /// Resolves Kimi Code bearers and optional web `kimi-auth` for monthly enrichment.
@@ -34,6 +54,7 @@ enum KimiAuthStore {
     static func defaultKimiCodeHome(
         env: [String: String] = ProcessInfo.processInfo.environment
     ) -> URL {
+        let env = QuotaEnvFallback.merged(env)
         if let raw = cleaned(env["KIMI_CODE_HOME"]) {
             return URL(fileURLWithPath: raw, isDirectory: true)
         }
@@ -48,6 +69,7 @@ enum KimiAuthStore {
         kimiCodeHome: URL? = nil,
         now: Date = Date()
     ) -> String? {
+        let env = QuotaEnvFallback.merged(env)
         if let fromPi = loadFromPiAuth(authURL: authURL) { return fromPi }
         if let v = cleaned(env["KIMI_CODE_API_KEY"]) { return v }
         if let v = cleaned(env["KIMI_API_KEY"]) { return v }
@@ -60,6 +82,7 @@ enum KimiAuthStore {
         env: [String: String] = ProcessInfo.processInfo.environment,
         desktopLoader: () -> String? = { KimiDesktopAuthToken.load() }
     ) -> String? {
+        let env = QuotaEnvFallback.merged(env)
         if let v = cleaned(env["KIMI_AUTH_TOKEN"]) ?? cleaned(env["kimi_auth_token"]) {
             return v
         }

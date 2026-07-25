@@ -70,6 +70,25 @@ enum PiExtensionConflicts {
         cacheLock.unlock()
     }
 
+    /// 便宜路径：只做 stamp 检查，缓存命中才返回结果；未缓存/stamp 已变返回 nil。
+    /// 供 makeSession 主路径调用，未命中时由 detectAsync 后台补全量扫描。
+    static func cached(projectDir: URL?) -> [PiExtensionConflict]? {
+        let key = cacheKey(projectDir: projectDir)
+        let stamp = cacheStamp(projectDir: projectDir)
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        guard let hit = cache[key], hit.mtime == stamp else { return nil }
+        return hit.conflicts
+    }
+
+    /// 后台跑全量 detect（含 stamp 检查），结果回到主线程回调。
+    static func detectAsync(projectDir: URL?, completion: @escaping ([PiExtensionConflict]) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = detect(projectDir: projectDir)
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
     private static func cacheKey(projectDir: URL?) -> String {
         projectDir?.standardizedFileURL.path ?? ""
     }

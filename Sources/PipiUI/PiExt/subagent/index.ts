@@ -228,6 +228,112 @@ interface RunSingleAgentOptions {
 	agentId?: string;
 	/** Short one-line title for the Subagents panel list; falls back to task text if omitted. */
 	title?: string;
+	/** Current session model as `provider/id` (depth 0 `ctx.model`); used for「跟随主 Agent」. */
+	sessionModel?: string;
+}
+
+/** Format ExtensionAPI ctx.model → `provider/id`. */
+function formatCtxModel(model: { provider?: string; id?: string } | undefined | null): string | undefined {
+	if (!model?.provider || !model?.id) return undefined;
+	return `${model.provider}/${model.id}`;
+}
+
+/** Hot-read PipiUI settings JSON (UserDefaults mirror). Missing / empty = follow main. */
+function loadSubagentModelOverrides(): Record<string, string> {
+	const file =
+		process.env.PIPIUI_SUBAGENT_MODELS_FILE ||
+		path.join(os.homedir(), "Library/Application Support/PipiUI/subagent-models.json");
+	try {
+		const raw = fs.readFileSync(file, "utf-8");
+		const parsed = JSON.parse(raw) as unknown;
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			return parsed as Record<string, string>;
+		}
+	} catch {
+		// absent or unreadable → all follow main
+	}
+	return {};
+}
+
+/**
+ * Hot-read the composer / bottom-bar model written by Swift (`main-model.txt`).
+ * Prefer this over a stale PIPIUI_MAIN_MODEL env from process spawn.
+ */
+function loadMainModelFile(): string | undefined {
+	const file =
+		process.env.PIPIUI_MAIN_MODEL_FILE ||
+		path.join(os.homedir(), "Library/Application Support/PipiUI/main-model.txt");
+	try {
+		const raw = fs.readFileSync(file, "utf-8").trim();
+		return raw || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+// Settings still store the group id `browser_*`; it now expands to the single `browser` tool.
+const BROWSER_TOOL_NAMES = ["browser"];
+
+/** Hot-read Settings → 工具开关 denylist. */
+function loadDisabledTools(): Set<string> {
+	const file = path.join(
+		os.homedir(),
+		"Library/Application Support/PipiUI/tool-skill-settings.json",
+	);
+	try {
+		const raw = fs.readFileSync(file, "utf-8");
+		const parsed = JSON.parse(raw) as { disabledTools?: unknown };
+		const list = Array.isArray(parsed.disabledTools)
+			? parsed.disabledTools.filter((x): x is string => typeof x === "string")
+			: [];
+		const out = new Set<string>();
+		for (const name of list) {
+			if (name === "browser_*") {
+				for (const t of BROWSER_TOOL_NAMES) out.add(t);
+			} else {
+				out.add(name);
+			}
+		}
+		return out;
+	} catch {
+		return new Set();
+	}
+}
+
+/**
+ * Resolve model for a subagent type:
+ * 1. Explicit override in settings JSON
+ * 2. Follow main (composer/bottom-bar): depth0 ctx.model → main-model.txt → PIPIUI_MAIN_MODEL
+ * 3. agent.md frontmatter model
+ */
+function resolveAgentModel(
+	agentName: string,
+	frontmatterModel: string | undefined,
+	sessionModel: string | undefined,
+): string | undefined {
+	const overrides = loadSubagentModelOverrides();
+	const explicit = overrides[agentName];
+	if (typeof explicit === "string" && explicit.trim()) {
+		return explicit.trim();
+	}
+	const fileMain = loadMainModelFile();
+	const main =
+		(PIPIUI_DEPTH === 0 ? sessionModel : undefined) ||
+		fileMain ||
+		process.env.PIPIUI_MAIN_MODEL ||
+		sessionModel;
+	if (main && main.trim()) return main.trim();
+	const fb = frontmatterModel?.trim();
+	return fb || undefined;
+}
+
+/** Main-agent model to stamp onto child env so nested agents still「跟随主」. */
+function inheritMainModel(sessionModel: string | undefined): string | undefined {
+	const fileMain = loadMainModelFile();
+	if (PIPIUI_DEPTH === 0) {
+		return sessionModel || fileMain || process.env.PIPIUI_MAIN_MODEL || undefined;
+	}
+	return process.env.PIPIUI_MAIN_MODEL || fileMain || sessionModel || undefined;
 }
 
 /** Optional worktree isolation metadata reported to the App bridge. */
@@ -918,11 +1024,21 @@ async function runSingleAgent(
 	});
 	const spawnCwd = placement.cwd;
 
+	const resolvedModel = resolveAgentModel(agentName, agent.model, options?.sessionModel);
+	const mainModelForChild = inheritMainModel(options?.sessionModel);
+
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
-	if (agent.model) args.push("--model", agent.model);
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	if (resolvedModel) args.push("--model", resolvedModel);
+	const disabledTools = loadDisabledTools();
+	if (agent.tools && agent.tools.length > 0) {
+		const allowed = agent.tools.filter((t) => !disabledTools.has(t));
+		if (allowed.length > 0) args.push("--tools", allowed.join(","));
+		else args.push("--no-tools");
+	} else if (disabledTools.size > 0) {
+		args.push("--exclude-tools", [...disabledTools].sort().join(","));
+	}
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
@@ -936,7 +1052,7 @@ async function runSingleAgent(
 		messages: [],
 		stderr: "",
 		usage: emptyUsage(),
-		model: agent.model,
+		model: resolvedModel,
 		step,
 		agentId: pipiuiAgentId,
 	};
@@ -951,7 +1067,7 @@ async function runSingleAgent(
 		name: agentName,
 		task,
 		depth: PIPIUI_DEPTH + 1,
-		model: agent.model ?? null,
+		model: resolvedModel ?? null,
 		...(options?.title ? { title: options.title } : {}),
 		...(isBackground ? { background: true } : {}),
 		...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
@@ -1011,6 +1127,7 @@ async function runSingleAgent(
 					...process.env,
 					PIPIUI_AGENT_ID: pipiuiAgentId,
 					PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
+					...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
 					...(placement.worktreePath ? { PIPIUI_WORKTREE_PATH: placement.worktreePath } : {}),
 					...(placement.worktreeBranch ? { PIPIUI_WORKTREE_BRANCH: placement.worktreeBranch } : {}),
 				},
@@ -1044,11 +1161,19 @@ async function runSingleAgent(
 								// Per-turn usage → PipiUI token ledger. Independent of the
 								// cost/turns aggregates above; gives per-turn input/output/cache
 								// breakdown that "end" doesn't carry. Safe to no-op if bridge unset.
+								const toolSet = new Set<string>();
+								for (const part of (msg as any).content ?? []) {
+									if (part?.type === "toolCall" && typeof part.name === "string" && part.name) {
+										toolSet.add(part.name);
+									}
+								}
+								const tools = [...toolSet].sort();
 								pipiuiReport({
 									kind: "usage",
 									agentId: pipiuiAgentId,
 									turn: currentResult.usage.turns,
 									model: msg.model || currentResult.model || null,
+									tools,
 									usage: {
 										input: usage.input || 0,
 										output: usage.output || 0,
@@ -1275,7 +1400,7 @@ export default function (pi: ExtensionAPI) {
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
-			"By default each agent writes in an isolated git worktree under .pi/worktrees/ on a pipiui/* branch; pass explicit cwd or set PIPIUI_WORKTREE=0 to disable. On successful end the app auto-merges into the main project and removes the worktree; failed/aborted keeps it for resume (GUI merge/discard fallback).",
+			"By default each agent writes in an isolated git worktree under .pi/worktrees/ on a pipiui/* branch; pass explicit cwd or set PIPIUI_WORKTREE=0 to disable. On successful end the app auto-merges into the main project and removes the worktree (silent on success). If merge fails, the main session receives [worktree-merge-failed] for the boss to resolve; failed/aborted keeps worktree for resume (GUI merge/discard fallback).",
 			"Track jobs with subagent_status(agentId?). Never re-spawn a finished task without reading its result via [subagent-done] or subagent_status.",
 			"Do not busy-loop poll; one status check per decision is correct.",
 			"chain and nested (depth>0) are always synchronous. Set background:false to await a single/parallel result.",
@@ -1286,6 +1411,9 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			pipiuiCurrentToolCall = _toolCallId;
+			const sessionModel = formatCtxModel(
+				(ctx as { model?: { provider?: string; id?: string } } | undefined)?.model,
+			);
 			// 多层深度护栏：达到上限的进程不允许继续派 subagent
 			if (PIPIUI_DEPTH >= PIPIUI_MAX_DEPTH) {
 				return {
@@ -1345,7 +1473,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ background: true, agentId, title },
+					{ background: true, agentId, title, sessionModel },
 				)
 					.then((result) => {
 						notifySubagentDone(pi, result);
@@ -1461,7 +1589,7 @@ export default function (pi: ExtensionAPI) {
 						chainUpdate,
 						makeDetails("chain"),
 
-						{ title: step.title },
+						{ title: step.title, sessionModel },
 					);
 					results.push(result);
 
@@ -1542,7 +1670,7 @@ export default function (pi: ExtensionAPI) {
 							messages: [],
 							stderr: "",
 							usage: emptyUsage(),
-							model: agentCfg.model,
+							model: resolveAgentModel(t.agent, agentCfg.model, sessionModel),
 						});
 					}
 
@@ -1560,7 +1688,7 @@ export default function (pi: ExtensionAPI) {
 								undefined, // no parent abort binding
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ background: true, agentId, title: t.title },
+								{ background: true, agentId, title: t.title, sessionModel },
 							);
 							notifySubagentDone(pi, result);
 							return result;
@@ -1642,7 +1770,7 @@ export default function (pi: ExtensionAPI) {
 						},
 						makeDetails("parallel"),
 
-						{ title: t.title },
+						{ title: t.title, sessionModel },
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -1698,7 +1826,7 @@ export default function (pi: ExtensionAPI) {
 						messages: [],
 						stderr: "",
 						usage: emptyUsage(),
-						model: agentCfg.model,
+						model: resolveAgentModel(params.agent, agentCfg.model, sessionModel),
 					};
 					return {
 						content: [
@@ -1726,7 +1854,7 @@ export default function (pi: ExtensionAPI) {
 					onUpdate,
 					makeDetails("single"),
 
-					{ title: params.title },
+					{ title: params.title, sessionModel },
 				);
 				const isError = isFailedResult(result);
 				if (isError) {

@@ -4,6 +4,33 @@ import XCTest
 /// Provider routing + per-provider quota parsing for GLM / Claude / Codex.
 final class MultiProviderQuotaTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        QuotaEnvFallback.envFileValues = { [:] }
+    }
+
+    override func tearDown() {
+        QuotaEnvFallback.envFileValues = { EnvFileStore().all() }
+        super.tearDown()
+    }
+
+    // MARK: - GLM .env fallback
+
+    func testGLMKeyFallsBackToDotEnv() {
+        QuotaEnvFallback.envFileValues = { ["Z_AI_API_KEY": "dotenv-glm"] }
+        XCTAssertEqual(GLMAuthStore.load(env: [:]), "dotenv-glm")
+    }
+
+    func testGLMProcessEnvWinsOverDotEnv() {
+        QuotaEnvFallback.envFileValues = { ["Z_AI_API_KEY": "dotenv-glm"] }
+        XCTAssertEqual(GLMAuthStore.load(env: ["Z_AI_API_KEY": "process-glm"]), "process-glm")
+    }
+
+    func testGLMHostOverrideFromDotEnv() {
+        QuotaEnvFallback.envFileValues = { ["Z_AI_API_HOST": "https://example.test"] }
+        XCTAssertEqual(GLMAPIRegion.resolveHost(env: [:]), "https://example.test")
+    }
+
     // MARK: - ModelInfo.quotaProvider routing
 
     func testQuotaProviderRouting() {
@@ -194,12 +221,12 @@ final class MultiProviderQuotaTests: XCTestCase {
     func testClaudeCredentialPiAuthShape() throws {
         // The exact shape stored by pi at ~/.pi/agent/auth.json.
         let json = """
-        {"anthropic":{"type":"oauth","refresh":"r-token","access":"a-token","expires":1784912290908}}
+        {"anthropic":{"type":"oauth","refresh":"r-token","access":"a-token","expires":2000000000000}}
         """
         let creds = try XCTUnwrap(ClaudeAuthStore.parse(data: Data(json.utf8)))
         XCTAssertEqual(creds.accessToken, "a-token")
         XCTAssertNotNil(creds.expiresAt)
-        XCTAssertFalse(creds.isExpired) // 1784912290908ms is well in the future
+        XCTAssertFalse(creds.isExpired) // 2000000000000ms = 2033-05，远未来（原为 2026-07-24，已过期）
     }
 
     func testClaudeCredentialRejectsNonOAuth() {

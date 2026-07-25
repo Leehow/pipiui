@@ -22,18 +22,23 @@ enum AssistantBlockLayout {
         /// user / system (or any non-assistant) row, rendered as a normal `MessageRow`.
         case leaf(ChatItem)
         /// Coalesced consecutive assistant items. `id` is the last item id (scroll target).
-        case assistantRun(id: String, segments: [Segment])
+        case assistantRun(id: String, entryId: String?, segments: [Segment])
 
         var id: String {
             switch self {
             case .leaf(let item): return item.id
-            case .assistantRun(let id, _): return id
+            case .assistantRun(let id, _, _): return id
             }
         }
     }
 
     /// - Parameter groupFinished: `true` for settled transcript rows; `false` while streaming.
-    static func plan(blocks: [ChatBlock], groupFinished: Bool) -> [Segment] {
+    /// - Parameter toolRuns: used so toolCalls with result images stay outside finished groups.
+    static func plan(
+        blocks: [ChatBlock],
+        groupFinished: Bool,
+        toolRuns: [String: ToolRun] = [:]
+    ) -> [Segment] {
         let merged = MessageTextBlocks.mergeAdjacent(blocks)
         guard groupFinished else {
             return merged.map(segment(for:))
@@ -52,7 +57,7 @@ enum AssistantBlockLayout {
         }
 
         for block in merged {
-            if isGroupable(block) {
+            if isGroupable(block, toolRuns: toolRuns) {
                 pending.append(block)
             } else {
                 flushPending()
@@ -65,15 +70,18 @@ enum AssistantBlockLayout {
 
     /// Coalesce consecutive assistant items, then plan blocks so text/media boundaries
     /// span tool-round messages (finished transcript only).
-    static func planTranscript(items: [ChatItem]) -> [TranscriptRow] {
+    static func planTranscript(
+        items: [ChatItem],
+        toolRuns: [String: ToolRun] = [:]
+    ) -> [TranscriptRow] {
         var result: [TranscriptRow] = []
         var pending: [ChatItem] = []
 
         func flushAssistant() {
             guard let last = pending.last else { return }
             let blocks = pending.flatMap(\.blocks)
-            let segments = plan(blocks: blocks, groupFinished: true)
-            result.append(.assistantRun(id: last.id, segments: segments))
+            let segments = plan(blocks: blocks, groupFinished: true, toolRuns: toolRuns)
+            result.append(.assistantRun(id: last.id, entryId: last.entryId, segments: segments))
             pending.removeAll(keepingCapacity: true)
         }
 
@@ -99,10 +107,30 @@ enum AssistantBlockLayout {
         return "\(blocks.count) steps · \(joined)"
     }
 
-    static func isGroupable(_ block: ChatBlock) -> Bool {
+    /// Tools whose primary UX is a result image — never bury in a finished group,
+    /// even before `toolRuns` images arrive (race after `message_end`).
+    static let imageResultToolNames: Set<String> = [
+        "generate_image",
+    ]
+
+    /// `browser` multiplexes several actions behind one tool; only `screenshot` returns an
+    /// image, and the action leads `argsSummary` (see `ToolCallSummary.browserSummary`).
+    static func producesImageResult(_ call: ToolCallBlock) -> Bool {
+        if imageResultToolNames.contains(call.name) { return true }
+        return call.name == "browser" && call.argsSummary.hasPrefix("screenshot")
+    }
+
+    static func isGroupable(_ block: ChatBlock, toolRuns: [String: ToolRun] = [:]) -> Bool {
         switch block {
-        case .thinking, .toolCall: return true
-        case .text, .image, .video: return false
+        case .thinking:
+            return true
+        case .toolCall(let call):
+            if producesImageResult(call) { return false }
+            // Any other tool that already carries result thumbnails stays visible too.
+            if let run = toolRuns[call.id], !run.images.isEmpty { return false }
+            return true
+        case .text, .image, .video:
+            return false
         }
     }
 

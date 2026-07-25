@@ -32,6 +32,19 @@ enum PiAuthStore {
         return true
     }
 
+    /// Deletes the entry only when it is a `type: "api_key"` credential.
+    /// OAuth entries are never touched (T19: used to clean auth.json residue
+    /// after the key moves to `~/.pi/agent/.env`).
+    @discardableResult
+    static func deleteAPIKeyEntry(providerId: String, authURL: URL = defaultAuthURL()) throws -> Bool {
+        var root = readRoot(authURL: authURL) ?? [:]
+        guard let entry = root[providerId] as? [String: Any],
+              (entry["type"] as? String) == "api_key" else { return false }
+        root.removeValue(forKey: providerId)
+        try writeRoot(root, authURL: authURL)
+        return true
+    }
+
     /// Stores an API key credential in the shape pi expects.
     static func setAPIKey(providerId: String, key: String, authURL: URL = defaultAuthURL()) throws {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)

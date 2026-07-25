@@ -37,6 +37,8 @@ struct ModelInfo: Identifiable, Hashable {
         if p.contains("openai") || p.contains("codex") { return .codex }
         // Kimi Code Plan (`kimi-coding`); not Moonshot open-platform balance.
         if p.contains("kimi") { return .kimi }
+        // Qoder subscription (pi-provider-qoder extension: `qoder` / `qoder-cn`).
+        if p.contains("qoder") { return .qoder }
         return nil
     }
 
@@ -50,6 +52,98 @@ struct ToolCallBlock: Identifiable, Equatable {
     let id: String
     let name: String
     let argsSummary: String
+    /// Char count of streamed write/edit payload (for live `~N tokens`); 0 for other tools.
+    var payloadChars: Int = 0
+}
+
+/// Path + payload size for tool-call headers. write/edit never fall back to JSON dumps.
+enum ToolCallSummary {
+    static func summarize(name: String, args: J) -> (summary: String, payloadChars: Int) {
+        switch name {
+        case "write":
+            return (pathSummary(args), args["content"].string?.count ?? 0)
+        case "edit":
+            return (pathSummary(args), editPayloadChars(args))
+        case "generate_image":
+            return (promptSummary(args), 0)
+        case "web_search":
+            return (args["query"].string ?? "…", 0)
+        case "web_fetch":
+            return (args["url"].string ?? "…", 0)
+        case "browser":
+            return (browserSummary(args), 0)
+        default:
+            return (legacySummary(name: name, args: args), 0)
+        }
+    }
+
+    /// Summarize when args arrive as a JSON object string (subagent log `item.text`).
+    static func summarize(name: String, argsJSON: String) -> (summary: String, payloadChars: Int) {
+        let trimmed = argsJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return ("…", 0)
+        }
+        if let data = trimmed.data(using: .utf8), let j = J.parse(data), j.dict != nil {
+            return summarize(name: name, args: j)
+        }
+        // Already a plain summary, or truncated non-JSON — never echo braces-heavy dumps as-is if huge.
+        if trimmed.contains("{"), trimmed.count > 120 {
+            return (String(trimmed.prefix(120)) + "…", 0)
+        }
+        return (trimmed, 0)
+    }
+
+    /// Subagent `activity` is often `toolName {json…}`. Return human summary (no JSON dump).
+    static func summarizeActivity(_ activity: String) -> String {
+        let trimmed = activity.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        guard let space = trimmed.firstIndex(of: " ") else { return trimmed }
+        let name = String(trimmed[..<space])
+        let rest = String(trimmed[trimmed.index(after: space)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard rest.hasPrefix("{") else {
+            return trimmed.count > 160 ? String(trimmed.prefix(160)) + "…" : trimmed
+        }
+        return summarize(name: name, argsJSON: rest).summary
+    }
+
+    /// `browser` is one tool with an `action` discriminator; lead the header with the action
+    /// so the card reads `navigate http://localhost:3000` rather than a JSON dump.
+    private static func browserSummary(_ args: J) -> String {
+        let action = args["action"].string ?? "…"
+        let detail = args["url"].string ?? args["js"].string ?? args["mode"].string ?? ""
+        return detail.isEmpty ? action : "\(action) \(detail)"
+    }
+
+    private static func promptSummary(_ args: J) -> String {
+        let raw = args["prompt"].string?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !raw.isEmpty else { return "…" }
+        if raw.count <= 80 { return raw }
+        return String(raw.prefix(80)) + "…"
+    }
+
+    private static func pathSummary(_ args: J) -> String {
+        if let path = args["path"].string, !path.isEmpty { return path }
+        if let path = args["file_path"].string, !path.isEmpty { return path }
+        return "…"
+    }
+
+    private static func editPayloadChars(_ args: J) -> Int {
+        let edits = args["edits"].array
+        if !edits.isEmpty {
+            return edits.reduce(0) { $0 + ($1["newText"].string?.count ?? 0) }
+        }
+        return args["newText"].string?.count ?? 0
+    }
+
+    private static func legacySummary(name: String, args: J) -> String {
+        if let cmd = args["command"].string { return cmd }
+        if let path = args["path"].string { return path }
+        if let path = args["file_path"].string { return path }
+        let compact = args.compactJSON
+        return compact.count > 120 ? String(compact.prefix(120)) + "…" : compact
+    }
 }
 
 struct ImageBlock: Identifiable, Equatable {
@@ -94,6 +188,9 @@ struct ChatItem: Identifiable, Equatable {
     let id: String
     let role: String // user / assistant / system
     var blocks: [ChatBlock]
+    var entryId: String? = nil
+    /// App-only bubble with no corresponding pi session entry (for example media generation).
+    var isLocalOnly = false
 }
 
 struct ToolRun: Equatable {
@@ -154,10 +251,22 @@ struct InitialTranscriptBuild: Equatable {
 /// Published state is mutated on the main thread (PiProcess delivers callbacks there).
 /// Heavy initial transcript conversion (image disk/base64) may run off-main before a single assign.
 final class ChatSession: ObservableObject, Identifiable {
-    let id: String
+    @Published private(set) var id: String
+    /// Immutable capability used by bridge extensions spawned with this process.
+    /// Unlike the open-session key, this survives edit-fork file rebinding.
+    package let bridgeRoutingKey = UUID().uuidString
     let projectURL: URL
 
-    @Published var transcript: [ChatItem] = []
+    /// didSet 版本计数：任何 transcript 写入（append / 整体替换 / 元素修改）都会 bump，
+    /// TranscriptPlanner 以此判断是否重算布局。宁滥勿缺——不确定的修改路径走属性写入即自动覆盖。
+    @Published var transcript: [ChatItem] = [] {
+        didSet { transcriptVersion &+= 1 }
+    }
+    /// 随 transcript 每次写入单调递增（T6 布局记忆化 key 的一部分）。非 @Published：
+    /// transcript 本身的 @Published 已负责触发刷新。
+    private(set) var transcriptVersion: UInt64 = 0
+    /// T6 transcript 布局记忆化（planTranscript 结果缓存，body 里只读缓存）。
+    let transcriptPlanner = TranscriptPlanner()
     @Published var streamingItem: ChatItem?
     @Published var toolRuns: [String: ToolRun] = [:]
     /// Monotonic counter bumped when toolRuns actually changes (UI watches this instead of scanning outputs).
@@ -173,6 +282,9 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Model context window size in tokens.
     @Published var contextWindow: Int?
     @Published var contextPercent: Double?
+    @Published private(set) var lastTurnUsage: TokenLedger.UsageSnapshot?
+    @Published private(set) var sessionCacheRead: Int = 0
+    @Published private(set) var sessionCacheWrite: Int = 0
     /// Account credit usage 0…100 of the shown window (nil when unavailable).
     @Published var quotaPercent: Double?
     /// Compact period label of the shown window: 周 / 5h / 月 / 额.
@@ -197,11 +309,15 @@ final class ChatSession: ObservableObject, Identifiable {
     @Published private(set) var isInitializing = true
     /// Sidebar green badge: successful settle not yet acknowledged by selecting this session.
     @Published var hasUnseenCompletion = false
+    /// Sidebar red badge: turn was cut off (crash / force-quit) and not yet acknowledged.
+    @Published var hasUnseenInterruption = false
     /// Local follow-up queue mirror for SwiftUI (busy Enter enqueues here).
     @Published private(set) var messageQueue: [QueuedMessage] = []
     /// In-memory composer draft (per session; not persisted).
     @Published var draftText: String = ""
     @Published var draftImages: [DraftImage] = []
+    /// Local transcript item currently shown in the inline user-message editor.
+    @Published var editingItemId: String?
     /// + menu mode: chat vs Grok Imagine image/video generation.
     @Published var composerMode: ComposerMode = .chat
     @Published var imageMediaModel: MediaModel = MediaModelCatalog.defaultModel(for: .generateImage)!
@@ -217,6 +333,10 @@ final class ChatSession: ObservableObject, Identifiable {
     @Published private(set) var displayTitle: String = SessionTitleLogic.placeholderName
     /// Opened with `--session` path (historical disk resume).
     private let resumedFromDisk: Bool
+    /// True between `agent_start` and `agent_settled` (for in-flight persistence).
+    private var agentTurnActive = false
+    /// Notifies AppStore to persist / clear interrupted-path badges.
+    var onInFlightChange: ((String, Bool) -> Void)?
     /// False after resuming a disk session that already has a real name.
     private var autoTitleEnabled = true
     /// First `applyState` applied (used once for resume naming policy).
@@ -241,8 +361,8 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Injected by AppStore for `/quit`.
     var onRequestClose: (() -> Void)?
 
-    /// 右侧面板：内置浏览器 / subagent 树
-    enum RightPanel: Equatable { case web, agents }
+    /// 右侧面板：内置浏览器 / subagent 树 / 文档预览
+    enum RightPanel: Equatable { case web, agents, document }
     @Published var rightPanel: RightPanel?
 
     /// Per-session transcript window (survives detail view reuse when switching sessions).
@@ -253,19 +373,37 @@ final class ChatSession: ObservableObject, Identifiable {
     /// 内置浏览器，pi 的 browser_* 工具通过桥接服务驱动它
     lazy var webView = WebViewStore()
 
+    /// 文档预览面板（⌘+点击聊天中的 md/txt 文档路径在此打开）
+    lazy var documents = DocumentStore()
+
     /// pi 派出的 subagent 树（扩展通过桥接上报）
     let subagents = SubagentStore()
 
     var onSessionMetaChanged: (() -> Void)?
     /// Fired only when the user actually submits a prompt (not resume / name / settle).
     var onUserSubmitted: (() -> Void)?
+    /// AppStore rekeys a resumed open session after edit-fork changes its backing file.
+    var onSessionFileRebound: ((String, String) -> Void)?
+    /// AppStore opens the cloned/forked file as a separate sidebar session.
+    var onBranchedSessionReady: ((String) -> Void)?
     private var proc: PiProcess?
     private var itemCounter = 0
     private var queue = SessionMessageQueue()
     /// True from prompt dispatch until agent_start (or failure / process death).
     @Published private(set) var isSendingFromQueue = false
     /// Historical ghost title prompts in old session files (ingest skip only; never sent on main proc).
-    static let sessionTitleJobMarker = "[PipiUI internal — session title"
+    package static let sessionTitleJobMarker = "[PipiUI internal — session title"
+    /// T17: shared reader for `~/.pi/agent/.env` (provider API keys etc.),
+    /// injected into every spawned pi process environment at session start.
+    private static let dotEnvStore = EnvFileStore()
+
+    /// Merge `.env` pairs as the base layer under PipiUI-internal keys:
+    /// internal `PIPIUI_*` keys always win and can never be overridden by `.env`.
+    static func mergedSpawnEnv(dotEnv: [String: String], internal internalEnv: [String: String]) -> [String: String] {
+        var env = dotEnv
+        env.merge(internalEnv) { _, new in new }
+        return env
+    }
     /// After skipping a historical ghost title user message on load/ingest, drop the following assistant turn.
     private var skipNextAssistantIngest = false
     // 流式更新节流：每个 token delta 都刷 UI 会卡，按 50ms 合并
@@ -281,11 +419,15 @@ final class ChatSession: ObservableObject, Identifiable {
 
     /// Bumped when a new initial `get_messages` load starts; stale background builds are dropped.
     private var initialLoadGeneration: UInt64 = 0
+    /// Bumped for each entry-id sync so an older RPC response cannot overwrite newer ids.
+    private var entryIdSyncGeneration: UInt64 = 0
     /// True until the first `get_messages` transcript is applied (or the request settles empty/failed).
     /// Runtime assumption (verify in app): pi may emit agent/message/tool events before `get_messages`
     /// completes; those are deferred and replayed after the one-shot transcript assign so they are not wiped.
     private var awaitingInitialTranscript = false
     private var deferredInitialEvents: [J] = []
+    private var cachedBranchMessages: [J] = []
+    private var cachedLeafId: String?
 
     init(id: String, projectURL: URL, sessionPath: String?,
          bridgePort: UInt16 = 0,
@@ -293,6 +435,10 @@ final class ChatSession: ObservableObject, Identifiable {
          mediaExtension: String? = nil,
          gitExtension: String? = nil,
          reloadExtension: String? = nil,
+         webSearchExtension: String? = nil,
+         skillTierExtension: String? = nil,
+         codexServerToolsExtension: String? = nil,
+         claudeServerToolsExtension: String? = nil,
          subagentDir: String? = nil,
          agentsDir: String? = nil,
          bossPromptPath: String? = nil,
@@ -304,6 +450,29 @@ final class ChatSession: ObservableObject, Identifiable {
         subagents.bindMainProject(projectURL)
         // Attribute per-turn usage events to this session in the token ledger.
         subagents.sessionKey = id
+        subagents.resolveContextWindow = { [weak self] modelId in
+            guard let modelId, !modelId.isEmpty else { return nil }
+            if let m = self?.availableModels.first(where: { $0.id == modelId }),
+               let w = m.contextWindow, w > 0 {
+                return w
+            }
+            // Allow bare model id match when provider prefix is omitted.
+            if let m = self?.availableModels.first(where: { $0.modelId == modelId }),
+               let w = m.contextWindow, w > 0 {
+                return w
+            }
+            return nil
+        }
+        subagents.onWorktreeMergeFailed = { [weak self] agent, error in
+            guard let self else { return }
+            let text = WorktreeMergeFailedMessage.format(agent: agent, error: error)
+            DispatchQueue.main.async {
+                self.sendPrompt(text)
+            }
+        }
+        if let sessionPath, InterruptedSessionStore.contains(sessionPath) {
+            hasUnseenInterruption = true
+        }
 
         // 已知会必然崩的启动条件（例如扩展撞名）就别 spawn 了：
         // 让用户只看到那条能一键修的提示，而不是再叠一条 pi 崩溃日志
@@ -324,7 +493,15 @@ final class ChatSession: ObservableObject, Identifiable {
         if let mediaExtension { args += ["-e", mediaExtension] }
         if let gitExtension { args += ["-e", gitExtension] }
         if let reloadExtension { args += ["-e", reloadExtension] }
+        if let webSearchExtension { args += ["-e", webSearchExtension] }
+        if let skillTierExtension { args += ["-e", skillTierExtension] }
+        if let codexServerToolsExtension { args += ["-e", codexServerToolsExtension] }
+        if let claudeServerToolsExtension { args += ["-e", claudeServerToolsExtension] }
+        // Settings → 工具开关：禁用项走 pi --exclude-tools（会话重启后生效）
+        args += ToolSkillSettings.excludeToolsCLIArgs()
         var extraEnv: [String: String] = [:]
+        extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"] = WebSearchSettings.configFileURL().path
+        extraEnv["PIPIUI_MODEL_TIERS_FILE"] = ModelTierSettings.tiersFileURL().path
         // App 自有插件通过 -e 加载：webview 工具 + 补丁版 subagent（覆盖自动发现的官方版）
         if bridgePort > 0 {
             if let webviewExtension { args += ["-e", webviewExtension] }
@@ -334,11 +511,23 @@ final class ChatSession: ObservableObject, Identifiable {
                 extraEnv["PIPIUI_SUBAGENT_EXT"] = subagentDir
             }
             extraEnv["PIPIUI_BRIDGE_PORT"] = String(bridgePort)
-            extraEnv["PIPIUI_SESSION_KEY"] = id
+            extraEnv["PIPIUI_SESSION_KEY"] = bridgeRoutingKey
             // 补丁版 subagent 从 App 自有目录读 agent 定义，不碰 ~/.pi/agent/agents
             if let agentsDir { extraEnv["PIPIUI_AGENTS_DIR"] = agentsDir }
+            // Subagent 模型设置（热读 JSON）+ 主会话模型（跟随主 Agent = 底栏/composer）
+            extraEnv["PIPIUI_SUBAGENT_MODELS_FILE"] =
+                SubagentModelSettings.overridesFileURL().path
+            extraEnv["PIPIUI_MAIN_MODEL_FILE"] =
+                SubagentModelSettings.mainModelFileURL().path
+            let mainId = model?.id ?? SubagentModelSettings.readMainModel()
+            if let mid = mainId, !mid.isEmpty {
+                extraEnv["PIPIUI_MAIN_MODEL"] = mid
+            }
         }
-        guard let proc = PiProcess(cwd: projectURL, arguments: args, extraEnv: extraEnv) else {
+        // T17: ~/.pi/agent/.env 注入（GUI app 从 Finder 启动没有 shell 环境）。
+        // .env 在底层，PIPIUI_* 内部键绝不被 .env 覆盖；不得在日志打印这些键值。
+        let spawnEnv = Self.mergedSpawnEnv(dotEnv: Self.dotEnvStore.all(), internal: extraEnv)
+        guard let proc = PiProcess(cwd: projectURL, arguments: args, extraEnv: spawnEnv) else {
             lastError = "找不到 pi 可执行文件（试过 ~/.npm-global/bin、/opt/homebrew/bin 等）"
             processAlive = false
             isInitializing = false
@@ -348,6 +537,7 @@ final class ChatSession: ObservableObject, Identifiable {
         proc.onEvent = { [weak self] event in self?.handleEvent(event) }
         proc.onExit = { [weak self] code, stderr in
             guard let self else { return }
+            let cutOff = self.agentTurnActive || self.isWorking
             self.processAlive = false
             self.isStreaming = false
             self.isSendingFromQueue = false
@@ -355,6 +545,10 @@ final class ChatSession: ObservableObject, Identifiable {
             self.isInitializing = false
             self.titleLLMTask?.cancel()
             self.titleLLMTask = nil
+            if cutOff {
+                self.persistInFlightMark()
+                self.hasUnseenInterruption = true
+            }
             if code != 0 {
                 self.lastError = "pi 进程退出 (code \(code))：\(stderr.suffix(300))"
             }
@@ -526,7 +720,13 @@ final class ChatSession: ObservableObject, Identifiable {
         var counter = max(itemCounter, built.itemCounter)
         let rebasedExtras: [ChatItem] = extras.map { item in
             counter += 1
-            return ChatItem(id: "item-\(counter)", role: item.role, blocks: item.blocks)
+            return ChatItem(
+                id: "item-\(counter)",
+                role: item.role,
+                blocks: item.blocks,
+                entryId: item.entryId,
+                isLocalOnly: item.isLocalOnly
+            )
         }
 
         itemCounter = counter
@@ -552,6 +752,34 @@ final class ChatSession: ObservableObject, Identifiable {
         for event in deferred {
             handleEvent(event)
         }
+        syncEntryIds()
+    }
+
+    /// After transcript assign (initial or post-fork), fetch entries and stamp entryIds.
+    private func syncEntryIds(completion: (() -> Void)? = nil) {
+        entryIdSyncGeneration &+= 1
+        let generation = entryIdSyncGeneration
+        proc?.request(["type": "get_entries"]) { [weak self] resp in
+            guard let self else { return }
+            guard generation == self.entryIdSyncGeneration else {
+                completion?()
+                return
+            }
+            guard resp["success"].bool == true else {
+                completion?()
+                return
+            }
+            let entries = resp["data"]["entries"].array
+            let leafId = resp["data"]["leafId"].string
+            let branch = MessageActions.activeBranchMessages(entries: entries, leafId: leafId)
+            self.transcript = MessageActions.applyingEntryIds(
+                items: self.transcript,
+                branchMessages: branch
+            )
+            self.cachedBranchMessages = branch
+            self.cachedLeafId = leafId
+            completion?()
+        }
     }
 
     private func applyState(_ data: J) {
@@ -562,6 +790,10 @@ final class ChatSession: ObservableObject, Identifiable {
                 name: data["model"]["name"].string ?? mid,
                 contextWindow: data["model"]["contextWindow"].int
             )
+            // Composer / bottom-bar model — source of truth for「跟随主 Agent」.
+            if let id = model?.id {
+                SubagentModelSettings.writeMainModel(id)
+            }
             // Update window immediately from get_state model; keep existing tokens, re-derive %.
             if let w = data["model"]["contextWindow"].int, w > 0 {
                 contextWindow = w
@@ -605,6 +837,9 @@ final class ChatSession: ObservableObject, Identifiable {
         if let file = data["sessionFile"].string, file != sessionFile {
             sessionFile = file
             onSessionMetaChanged?()
+            if agentTurnActive {
+                persistInFlightMark()
+            }
         }
         // 会话文件确定后挂载 subagent 树持久化（恢复历史 + 后续落盘）
         if let file = sessionFile {
@@ -656,6 +891,9 @@ final class ChatSession: ObservableObject, Identifiable {
         let u = message["usage"]
         guard u["input"].int != nil || u["output"].int != nil else { return }
         let usage = TokenLedger.UsageSnapshot.from(u)
+        lastTurnUsage = usage
+        sessionCacheRead += usage.cacheRead
+        sessionCacheWrite += usage.cacheWrite
         let model = message["model"].string ?? self.model?.id ?? "?"
         let turn = transcript.lazy.filter { $0.role == "assistant" }.count
         TokenLedger.shared.append(
@@ -666,7 +904,8 @@ final class ChatSession: ObservableObject, Identifiable {
             depth: 0,
             model: model,
             turn: turn,
-            usage: usage
+            usage: usage,
+            tools: TokenLedger.toolNames(from: message)
         )
         Log.info(
             "main turn \(turn) usage ↑\(usage.input) ↓\(usage.output) R\(usage.cacheRead) W\(usage.cacheWrite) $\(String(format: "%.4f", usage.cost)) ctx:\(usage.contextTokens) — \(model)",
@@ -701,10 +940,16 @@ final class ChatSession: ObservableObject, Identifiable {
             isStreaming = true
             isSendingFromQueue = false
             lastError = nil
+            agentTurnActive = true
+            persistInFlightMark()
         case "agent_settled":
             isStreaming = false
             streamingItem = nil
+            agentTurnActive = false
+            clearInFlightMark()
+            hasUnseenInterruption = false
             refreshStats()
+            syncEntryIds()
             drainQueueIfIdle()
             // Green badge when still idle after drain (no queued follow-up).
             if !isWorking && messageQueue.isEmpty {
@@ -716,7 +961,7 @@ final class ChatSession: ObservableObject, Identifiable {
             }
         case "message_start":
             if e["message"]["role"].string == "assistant" {
-                streamingItem = Self.convert(message: e["message"], id: "streaming")
+                streamingItem = Self.convert(message: e["message"], id: "streaming", allowDiskRead: false)
             }
         case "message_update":
             pendingStreamMessage = e["message"]
@@ -751,9 +996,10 @@ final class ChatSession: ObservableObject, Identifiable {
                     isRunning: false,
                     isError: e["isError"].bool ?? false,
                     output: Self.contentText(content),
-                    images: Self.contentImages(content)
+                    images: Self.contentImages(content, allowDiskRead: false)
                 )
                 toolOutputVersion &+= 1
+                scheduleImageBackfill(toolCallId: tid)
             }
         case "auto_retry_start":
             lastError = "请求失败，自动重试中 (\(e["attempt"].int ?? 0)/\(e["maxAttempts"].int ?? 0))…"
@@ -929,23 +1175,32 @@ final class ChatSession: ObservableObject, Identifiable {
                 return
             }
             skipNextAssistantIngest = false
-            if let raw = Self.convert(message: message, id: nextItemId()), !raw.blocks.isEmpty {
-                let item = Self.hydrateUserImagesIfNeeded(raw)
+            if let raw = Self.convert(message: message, id: nextItemId(), allowDiskRead: false), !raw.blocks.isEmpty {
+                // Live path: image bytes stay on disk here (path-only placeholders);
+                // scheduleImageBackfill loads them off-main and patches the item.
+                let item = Self.hydrateUserImagesIfNeeded(raw, allowDiskRead: false)
                 // Replace optimistic local user bubble when the server echoes the same turn.
+                let appliedId: String
                 if let lastIdx = transcript.indices.last,
                    Self.shouldReplaceOptimisticUser(existing: transcript[lastIdx], incoming: item) {
                     let keepId = transcript[lastIdx].id
                     transcript[lastIdx] = ChatItem(id: keepId, role: item.role, blocks: item.blocks)
+                    appliedId = keepId
                 } else {
                     transcript.append(item)
+                    appliedId = item.id
                 }
+                scheduleImageBackfill(itemId: appliedId)
             }
         case "assistant":
             if skipNextAssistantIngest {
                 skipNextAssistantIngest = false
                 return
             }
-            if let item = Self.convert(message: message, id: nextItemId()) { transcript.append(item) }
+            if let item = Self.convert(message: message, id: nextItemId(), allowDiskRead: false) {
+                transcript.append(item)
+                scheduleImageBackfill(itemId: item.id)
+            }
         case "toolResult":
             if let tid = message["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
@@ -954,9 +1209,10 @@ final class ChatSession: ObservableObject, Identifiable {
                     isRunning: false,
                     isError: message["isError"].bool ?? false,
                     output: Self.contentText(content),
-                    images: Self.contentImages(content)
+                    images: Self.contentImages(content, allowDiskRead: false)
                 )
                 toolOutputVersion &+= 1
+                scheduleImageBackfill(toolCallId: tid)
             }
         case "bashExecution":
             let cmd = message["command"].string ?? ""
@@ -967,8 +1223,11 @@ final class ChatSession: ObservableObject, Identifiable {
         }
     }
 
-    /// Convert one pi message JSON into a `ChatItem` (image base64/path I/O may run here).
-    package static func convert(message: J, id: String) -> ChatItem? {
+    /// Convert one pi message JSON into a `ChatItem`.
+    /// - `allowDiskRead: true` (history build, off-main): path-only blocks read the file now.
+    /// - `allowDiskRead: false` (live main-thread ingest): path-only blocks become zero-byte
+    ///   placeholders carrying their path; the caller backfills bytes off the main thread.
+    package static func convert(message: J, id: String, allowDiskRead: Bool = true) -> ChatItem? {
         guard let role = message["role"].string else { return nil }
         var blocks: [ChatBlock] = []
         if let text = message["content"].string {
@@ -984,13 +1243,15 @@ final class ChatSession: ObservableObject, Identifiable {
                     if !t.isEmpty { blocks.append(.thinking(t)) }
                 case "toolCall":
                     let name = block["name"].string ?? "tool"
+                    let summary = ToolCallSummary.summarize(name: name, args: block["arguments"])
                     blocks.append(.toolCall(ToolCallBlock(
                         id: block["id"].string ?? UUID().uuidString,
                         name: name,
-                        argsSummary: Self.argsSummary(name: name, args: block["arguments"])
+                        argsSummary: summary.summary,
+                        payloadChars: summary.payloadChars
                     )))
                 case "image":
-                    if let imageBlock = Self.parseImageBlock(block) {
+                    if let imageBlock = Self.parseImageBlock(block, allowDiskRead: allowDiskRead) {
                         blocks.append(.image(imageBlock))
                     }
                 default:
@@ -1069,7 +1330,12 @@ final class ChatSession: ObservableObject, Identifiable {
     /// - `{ type, data, mimeType }`
     /// - `{ type, source: { type: "base64", mediaType, data } }`
     /// - path-only with on-disk file when base64 missing/empty
-    static func parseImageBlock(_ block: J) -> ImageBlock? {
+    ///
+    /// Disk reads go through `ImageFileDataCache` (read-through; a file is read at most once).
+    /// With `allowDiskRead: false` (live main-thread ingest) a path-only block becomes a
+    /// zero-byte placeholder carrying `path`; the caller backfills bytes off-main via
+    /// `backfilledBlocks` / `backfilledImages` and drops placeholders whose file is unreadable.
+    static func parseImageBlock(_ block: J, allowDiskRead: Bool = true) -> ImageBlock? {
         let b64: String?
         var mime: String
         if block["source"].exists {
@@ -1094,11 +1360,20 @@ final class ChatSession: ObservableObject, Identifiable {
             data = Data(base64Encoded: b64)
                 ?? Data(base64Encoded: b64, options: .ignoreUnknownCharacters)
         }
-        if data == nil || data?.isEmpty == true, let resolvedPath,
-           FileManager.default.fileExists(atPath: resolvedPath) {
-            data = try? Data(contentsOf: URL(fileURLWithPath: resolvedPath))
+        if data == nil || data?.isEmpty == true, let resolvedPath {
             if mime == "image/png" || mime.isEmpty {
                 mime = Self.mimeType(forImagePath: resolvedPath) ?? mime
+            }
+            if allowDiskRead {
+                data = ImageFileDataCache.data(forPath: resolvedPath)
+            } else {
+                // Live-path placeholder: no stat/read here; backfill decides if it survives.
+                return ImageBlock(
+                    id: block["id"].string ?? UUID().uuidString,
+                    data: Data(),
+                    mimeType: mime.isEmpty ? "image/png" : mime,
+                    path: resolvedPath
+                )
             }
         }
         guard let data, !data.isEmpty else { return nil }
@@ -1111,7 +1386,10 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     /// Fill missing image blocks from `Attached image file(s):` footnotes (session resume).
-    package static func hydrateUserImagesIfNeeded(_ item: ChatItem) -> ChatItem {
+    /// `allowDiskRead: false` (live main-thread ingest) appends zero-byte path placeholders
+    /// instead of reading; the caller backfills off-main (unreadable files drop the block,
+    /// matching this function's legacy skip-missing behavior).
+    package static func hydrateUserImagesIfNeeded(_ item: ChatItem, allowDiskRead: Bool = true) -> ChatItem {
         guard item.role == "user" else { return item }
         let plain = plainText(of: item)
         let paths = ImageAttachment.attachmentPaths(fromMessageText: plain)
@@ -1136,15 +1414,22 @@ final class ChatSession: ObservableObject, Identifiable {
         if imageBlocks.count < paths.count {
             for i in imageBlocks.count..<paths.count {
                 let p = paths[i]
-                guard FileManager.default.fileExists(atPath: p),
-                      let data = try? Data(contentsOf: URL(fileURLWithPath: p)),
-                      !data.isEmpty else { continue }
-                imageBlocks.append(ImageBlock(
-                    id: UUID().uuidString,
-                    data: data,
-                    mimeType: mimeType(forImagePath: p) ?? "image/png",
-                    path: p
-                ))
+                if allowDiskRead {
+                    guard let data = ImageFileDataCache.data(forPath: p) else { continue }
+                    imageBlocks.append(ImageBlock(
+                        id: UUID().uuidString,
+                        data: data,
+                        mimeType: mimeType(forImagePath: p) ?? "image/png",
+                        path: p
+                    ))
+                } else {
+                    imageBlocks.append(ImageBlock(
+                        id: UUID().uuidString,
+                        data: Data(),
+                        mimeType: mimeType(forImagePath: p) ?? "image/png",
+                        path: p
+                    ))
+                }
             }
         }
 
@@ -1152,6 +1437,77 @@ final class ChatSession: ObservableObject, Identifiable {
         var blocks: [ChatBlock] = imageBlocks.map { .image($0) }
         blocks.append(contentsOf: nonImage)
         return ChatItem(id: item.id, role: item.role, blocks: blocks)
+    }
+
+    // MARK: - Live image backfill (T4: keep disk reads off the main-thread ingest path)
+
+    /// Placeholder (zero-byte, path-carrying) image blocks produced by live ingest.
+    private static func placeholderImageTargets(in images: [ImageBlock]) -> [(id: String, path: String)] {
+        images.compactMap { img in
+            (img.data.isEmpty && img.path != nil) ? (img.id, img.path!) : nil
+        }
+    }
+
+    /// Merge off-main loaded bytes into placeholder image blocks.
+    /// Placeholders with no readable file are dropped — matching the legacy behavior where
+    /// `parseImageBlock` / hydrate produced no block for missing files. Pure; main-thread apply.
+    package static func backfilledImages(_ images: [ImageBlock], loaded: [String: Data]) -> [ImageBlock] {
+        images.compactMap { img in
+            guard img.data.isEmpty, let path = img.path else { return img }
+            guard let data = loaded[img.id], !data.isEmpty else { return nil }
+            return ImageBlock(id: img.id, data: data, mimeType: img.mimeType, path: path)
+        }
+    }
+
+    /// `backfilledImages` over generic chat blocks (non-image and non-placeholder pass through).
+    package static func backfilledBlocks(_ blocks: [ChatBlock], loaded: [String: Data]) -> [ChatBlock] {
+        blocks.compactMap { block in
+            guard case .image(let img) = block else { return block }
+            guard img.data.isEmpty, let path = img.path else { return block }
+            guard let data = loaded[img.id], !data.isEmpty else { return nil }
+            return .image(ImageBlock(id: img.id, data: data, mimeType: img.mimeType, path: path))
+        }
+    }
+
+    /// After live ingest appended an item/toolRun containing path-only placeholder images,
+    /// read the files on a background queue (deduped through `ImageFileDataCache`) and patch
+    /// the transcript/toolRuns back on the main thread. Items removed in the meantime are skipped.
+    private func scheduleImageBackfill(itemId: String? = nil, toolCallId: String? = nil) {
+        let targets: [(id: String, path: String)]
+        if let itemId, let item = transcript.first(where: { $0.id == itemId }) {
+            targets = Self.placeholderImageTargets(in: item.blocks.compactMap { block in
+                if case .image(let img) = block { return img }
+                return nil
+            })
+        } else if let toolCallId, let run = toolRuns[toolCallId] {
+            targets = Self.placeholderImageTargets(in: run.images)
+        } else {
+            return
+        }
+        guard !targets.isEmpty else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var loaded: [String: Data] = [:]
+            for target in targets {
+                if let data = ImageFileDataCache.data(forPath: target.path) {
+                    loaded[target.id] = data
+                }
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if let itemId, let idx = self.transcript.firstIndex(where: { $0.id == itemId }) {
+                    var item = self.transcript[idx]
+                    item.blocks = Self.backfilledBlocks(item.blocks, loaded: loaded)
+                    self.transcript[idx] = item
+                }
+                if let toolCallId, let run = self.toolRuns[toolCallId] {
+                    var next = run
+                    next.images = Self.backfilledImages(run.images, loaded: loaded)
+                    self.toolRuns[toolCallId] = next
+                    self.toolOutputVersion &+= 1
+                }
+            }
+        }
     }
 
     /// True when `incoming` is the server echo of an optimistic local user bubble.
@@ -1192,11 +1548,7 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     static func argsSummary(name: String, args: J) -> String {
-        if let cmd = args["command"].string { return cmd }
-        if let path = args["path"].string { return path }
-        if let path = args["file_path"].string { return path }
-        let compact = args.compactJSON
-        return compact.count > 120 ? String(compact.prefix(120)) + "…" : compact
+        ToolCallSummary.summarize(name: name, args: args).summary
     }
 
     static func contentText(_ content: J) -> String {
@@ -1207,14 +1559,419 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     /// Images from tool result content (e.g. generate_image / browser_screenshot).
-    static func contentImages(_ content: J) -> [ImageBlock] {
+    static func contentImages(_ content: J, allowDiskRead: Bool = true) -> [ImageBlock] {
         content.array.compactMap { block -> ImageBlock? in
             guard block["type"].string == "image" else { return nil }
-            return parseImageBlock(block)
+            return parseImageBlock(block, allowDiskRead: allowDiskRead)
         }
     }
 
     // MARK: - User actions
+
+    /// Keep object identity aligned with AppStore's current dictionary key after a file rebind.
+    package func rebindIdentity(to sessionKey: String) {
+        guard !sessionKey.isEmpty, sessionKey != id else { return }
+        id = sessionKey
+        subagents.sessionKey = sessionKey
+    }
+
+    func copyItemText(_ item: ChatItem) {
+        copyTextToPasteboard(MessageActions.copyableText(from: item))
+    }
+
+    func copySegmentsText(_ segments: [AssistantBlockLayout.Segment]) {
+        copyTextToPasteboard(MessageActions.copyableText(from: segments))
+    }
+
+    private func copyTextToPasteboard(_ text: String) {
+        guard !text.isEmpty else {
+            flash("没有可复制的内容")
+            return
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        flash("已复制（\(text.count) 字符）")
+    }
+
+    func beginEditingUserMessage(itemId: String) {
+        guard !isWorking else { return }
+        guard let item = transcript.first(where: { $0.id == itemId }),
+              MessageActions.canEditUserMessage(item) else { return }
+        if item.entryId != nil {
+            editingItemId = itemId
+            return
+        }
+        // Ids stamp asynchronously after settle; sync once so 撤回 is usable immediately.
+        syncEntryIds { [weak self] in
+            guard let self else { return }
+            guard let refreshed = self.transcript.first(where: { $0.id == itemId }),
+                  refreshed.entryId != nil else {
+                self.flash("无法撤回：消息尚未就绪")
+                return
+            }
+            self.editingItemId = itemId
+        }
+    }
+
+    func cancelEditingUserMessage() {
+        editingItemId = nil
+    }
+
+    func branchFromAssistant(runLastEntryId: String) {
+        guard !isWorking else {
+            flash("请等待当前任务结束")
+            return
+        }
+        guard let oldPath = sessionFile, !oldPath.isEmpty else {
+            flash("会话尚未保存，稍后再试")
+            return
+        }
+        guard let proc else {
+            flash("pi 未运行，无法创建分支")
+            return
+        }
+
+        isSendingFromQueue = true
+        proc.request(["type": "get_entries"]) { [weak self] response in
+            guard let self else { return }
+            guard response["success"].bool == true else {
+                self.isSendingFromQueue = false
+                self.flash(response["error"].string ?? "无法读取会话树")
+                return
+            }
+
+            let entries = response["data"]["entries"].array
+            let leafId = response["data"]["leafId"].string
+            let branch = MessageActions.activeBranchMessages(entries: entries, leafId: leafId)
+            self.cachedBranchMessages = branch
+            self.cachedLeafId = leafId
+            let nextUser = MessageActions.nextUserEntryId(
+                after: runLastEntryId,
+                branchMessages: branch
+            )
+            guard let op = MessageActions.branchOp(
+                runLastEntryId: runLastEntryId,
+                leafId: leafId,
+                nextUserEntryId: nextUser
+            ) else {
+                self.isSendingFromQueue = false
+                self.flash("无法从此消息创建分支")
+                return
+            }
+
+            let request: [String: Any]
+            switch op {
+            case .clone:
+                request = ["type": "clone"]
+            case .fork(let nextUserEntryId):
+                request = ["type": "fork", "entryId": nextUserEntryId]
+            }
+            proc.request(request) { [weak self] branchResponse in
+                guard let self else { return }
+                guard branchResponse["success"].bool == true,
+                      branchResponse["data"]["cancelled"].bool != true else {
+                    self.isSendingFromQueue = false
+                    self.flash(branchResponse["error"].string ?? "创建分支失败")
+                    return
+                }
+
+                proc.request(["type": "get_state"]) { [weak self] stateResponse in
+                    guard let self else { return }
+                    let newPath = stateResponse["data"]["sessionFile"].string
+                    guard stateResponse["success"].bool != false,
+                          let newPath,
+                          !newPath.isEmpty,
+                          newPath != oldPath else {
+                        self.returnToOriginalSession(path: oldPath) { [weak self] restoreError in
+                            guard let self else { return }
+                            self.isSendingFromQueue = false
+                            let reason = stateResponse["error"].string
+                                ?? "创建分支失败：未得到新会话文件"
+                            if let restoreError {
+                                self.flash("\(reason)；\(restoreError)")
+                            } else {
+                                self.flash(reason)
+                            }
+                        }
+                        return
+                    }
+
+                    self.returnToOriginalSession(path: oldPath) { [weak self] restoreError in
+                        guard let self else { return }
+                        self.isSendingFromQueue = false
+                        if let restoreError {
+                            self.flash(restoreError)
+                            return
+                        }
+                        self.onBranchedSessionReady?(newPath)
+                        self.flash("已创建分支会话")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clone/fork changes the process's active file. Restore this ChatSession to its original
+    /// file and transcript before AppStore opens the branch in a second process.
+    private func returnToOriginalSession(
+        path: String,
+        completion: @escaping (String?) -> Void
+    ) {
+        guard let proc else {
+            completion("pi 未运行，无法恢复原会话")
+            return
+        }
+        proc.request(["type": "switch_session", "sessionPath": path]) { [weak self] response in
+            guard let self else { return }
+            guard response["success"].bool == true,
+                  response["data"]["cancelled"].bool != true else {
+                let switchError = response["error"].string ?? "未知错误"
+                proc.request(["type": "get_state"]) { [weak self] stateResponse in
+                    guard let self else { return }
+                    let stateRefreshed = stateResponse["success"].bool != false
+                    if stateRefreshed {
+                        self.applyStateTrackingFileRebind(stateResponse["data"])
+                    }
+                    self.reloadTranscriptAfterSessionReplace { reloadError in
+                        let currentState: String
+                        if !stateRefreshed {
+                            currentState = "无法确认当前会话文件"
+                        } else if let reloadError {
+                            currentState = "已重新绑定当前会话，但刷新失败（\(reloadError)）"
+                        } else {
+                            currentState = "当前会话已重新绑定并载入"
+                        }
+                        completion("恢复原会话失败（\(switchError)），\(currentState)")
+                    }
+                }
+                return
+            }
+            self.bindSessionFileAfterConfirmedSwitch(path)
+            proc.request(["type": "get_state"]) { [weak self] stateResponse in
+                guard let self else { return }
+                let stateError: String?
+                if stateResponse["success"].bool == false {
+                    stateError = stateResponse["error"].string ?? "无法刷新原会话状态"
+                } else {
+                    self.applyState(stateResponse["data"])
+                    stateError = nil
+                }
+                self.reloadTranscriptAfterSessionReplace { reloadError in
+                    completion(stateError ?? reloadError)
+                }
+            }
+        }
+    }
+
+    func commitEditingUserMessage(newText: String) {
+        let trimmed = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard MessageActions.isEditDraftSendable(trimmed) else {
+            flash("消息不能为空")
+            return
+        }
+        guard let itemId = editingItemId,
+              let item = transcript.first(where: { $0.id == itemId }) else {
+            editingItemId = nil
+            return
+        }
+        guard let entryId = item.entryId else {
+            editingItemId = nil
+            flash("无法撤回：消息尚未就绪")
+            return
+        }
+        guard MessageActions.canEditUserMessage(item) else {
+            editingItemId = nil
+            return
+        }
+        let original = MessageActions.copyableText(from: item)
+        if MessageActions.shouldNoOpEdit(
+            originalText: original,
+            newText: trimmed,
+            itemEntryId: entryId,
+            branchMessages: cachedBranchMessages
+        ) {
+            editingItemId = nil
+            return
+        }
+        guard let previousPath = sessionFile, !previousPath.isEmpty else {
+            flash("会话尚未保存，稍后再试")
+            editingItemId = nil
+            return
+        }
+        guard !isWorking else {
+            flash("请等待当前任务结束")
+            return
+        }
+        guard let proc else {
+            flash("pi 未运行，无法编辑消息")
+            editingItemId = nil
+            return
+        }
+
+        editingItemId = nil
+        isSendingFromQueue = true
+        proc.request(["type": "fork", "entryId": entryId]) { [weak self] response in
+            guard let self else { return }
+            guard response["success"].bool == true,
+                  response["data"]["cancelled"].bool != true else {
+                self.isSendingFromQueue = false
+                self.flash(response["error"].string ?? "编辑失败")
+                return
+            }
+            self.proc?.request(["type": "get_state"]) { [weak self] stateResponse in
+                guard let self else { return }
+                guard stateResponse["success"].bool != false else {
+                    self.restorePreviousSessionAfterFailedEdit(
+                        previousPath: previousPath,
+                        reason: stateResponse["error"].string ?? "无法读取编辑后的会话"
+                    )
+                    return
+                }
+                self.applyStateTrackingFileRebind(stateResponse["data"])
+                guard let newPath = self.sessionFile,
+                      !newPath.isEmpty,
+                      newPath != previousPath else {
+                    self.restorePreviousSessionAfterFailedEdit(
+                        previousPath: previousPath,
+                        reason: "编辑分叉后未得到新会话文件"
+                    )
+                    return
+                }
+                self.reloadTranscriptAfterSessionReplace { [weak self] reloadError in
+                    guard let self else { return }
+                    if let reloadError {
+                        self.restorePreviousSessionAfterFailedEdit(
+                            previousPath: previousPath,
+                            reason: reloadError
+                        )
+                    } else {
+                        self.sendPromptNow(message: trimmed, images: [])
+                    }
+                }
+            }
+        }
+    }
+
+    private func applyStateTrackingFileRebind(_ data: J) {
+        let previousPath = sessionFile
+        applyState(data)
+        if let previousPath,
+           let newPath = sessionFile,
+           !previousPath.isEmpty,
+           previousPath != newPath {
+            onSessionFileRebound?(previousPath, newPath)
+        }
+    }
+
+    private func bindSessionFileAfterConfirmedSwitch(_ path: String) {
+        guard !path.isEmpty, sessionFile != path else { return }
+        let previousPath = sessionFile
+        sessionFile = path
+        subagents.attachPersistence(sessionFile: path)
+        onSessionMetaChanged?()
+        if let previousPath, !previousPath.isEmpty {
+            onSessionFileRebound?(previousPath, path)
+        }
+    }
+
+    /// A successful fork changes the process before follow-up reads complete. If those reads
+    /// fail, return the process and AppStore binding to the original file before reporting.
+    private func restorePreviousSessionAfterFailedEdit(previousPath: String, reason: String) {
+        guard let proc else {
+            isSendingFromQueue = false
+            flash("编辑未发送：\(reason)；pi 未运行，无法恢复原会话")
+            return
+        }
+        proc.request(["type": "switch_session", "sessionPath": previousPath]) { [weak self] response in
+            guard let self else { return }
+            let switchedBack = response["success"].bool == true
+                && response["data"]["cancelled"].bool != true
+            if switchedBack {
+                self.bindSessionFileAfterConfirmedSwitch(previousPath)
+            }
+            self.refreshAfterFailedEdit(
+                reason: reason,
+                switchedBack: switchedBack,
+                switchError: response["error"].string
+            )
+        }
+    }
+
+    private func refreshAfterFailedEdit(
+        reason: String,
+        switchedBack: Bool,
+        switchError: String?
+    ) {
+        proc?.request(["type": "get_state"]) { [weak self] stateResponse in
+            guard let self else { return }
+            let stateRefreshed = stateResponse["success"].bool != false
+            if stateRefreshed {
+                self.applyStateTrackingFileRebind(stateResponse["data"])
+            }
+            self.reloadTranscriptAfterSessionReplace { [weak self] reloadResult in
+                guard let self else { return }
+                self.isSendingFromQueue = false
+                if switchedBack {
+                    if let reloadError = reloadResult {
+                        self.flash("编辑未发送：\(reason)；已恢复原会话，但刷新失败（\(reloadError)）")
+                    } else {
+                        self.flash("编辑未发送：\(reason)；已恢复原会话")
+                    }
+                } else {
+                    let detail = switchError ?? "未知错误"
+                    let location: String
+                    if !stateRefreshed {
+                        location = "无法确认当前会话文件"
+                    } else if let reloadError = reloadResult {
+                        location = "已重新绑定当前会话，但刷新失败（\(reloadError)）"
+                    } else {
+                        location = "当前会话已重新绑定并载入"
+                    }
+                    self.flash("编辑未发送：\(reason)；恢复原会话失败（\(detail)），\(location)")
+                }
+            }
+        }
+    }
+
+    private func reloadTranscriptAfterSessionReplace(
+        completion: @escaping (String?) -> Void
+    ) {
+        streamingItem = nil
+        isStreaming = false
+        editingItemId = nil
+        pendingStreamMessage = nil
+        pendingToolRuns.removeAll(keepingCapacity: false)
+
+        guard let proc else {
+            completion("pi 未运行，无法刷新会话")
+            return
+        }
+        proc.request(["type": "get_messages"]) { [weak self] response in
+            guard let self else { return }
+            guard response["success"].bool != false else {
+                completion(response["error"].string ?? "无法刷新编辑后的会话")
+                return
+            }
+            let messages = response["data"]["messages"].array
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let built = Self.buildTranscript(from: messages)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.transcript = built.items
+                    self.toolRuns = built.toolRuns
+                    self.toolOutputVersion &+= 1
+                    self.itemCounter = built.itemCounter
+                    self.skipNextAssistantIngest = built.skipNextAssistantIngest
+                    self.cachedBranchMessages = []
+                    self.cachedLeafId = nil
+                    self.syncEntryIds {
+                        completion(nil)
+                    }
+                }
+            }
+        }
+    }
 
     func sendPrompt(_ text: String, images: [DraftImage] = []) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1265,7 +2022,12 @@ final class ChatSession: ObservableObject, Identifiable {
         for img in images {
             userBlocks.append(.image(ImageBlock(id: UUID().uuidString, data: img.data, mimeType: img.mimeType)))
         }
-        transcript.append(ChatItem(id: nextItemId(), role: "user", blocks: userBlocks))
+        transcript.append(ChatItem(
+            id: nextItemId(),
+            role: "user",
+            blocks: userBlocks,
+            isLocalOnly: true
+        ))
 
         Task { [weak self] in
             guard let self else { return }
@@ -1319,15 +2081,21 @@ final class ChatSession: ObservableObject, Identifiable {
             blocks.append(.video(VideoBlock(id: UUID().uuidString, path: path.path, remoteURL: remote)))
             blocks.append(.text(path.path))
         }
-        transcript.append(ChatItem(id: nextItemId(), role: "assistant", blocks: blocks))
+        transcript.append(ChatItem(
+            id: nextItemId(),
+            role: "assistant",
+            blocks: blocks,
+            isLocalOnly: true
+        ))
     }
 
     /// Dual delivery: multimodal RPC images + real on-disk paths.
     /// Coding models often try `read .../attachments/...` first; saving under .pi/attachments fixes it.
+    /// T12: paths are precomputed synchronously (no disk I/O); bytes are written off-main.
     private func prepareMessage(text: String, images: [DraftImage]) -> (message: String, images: [DraftImage]) {
         var message = text
         if !images.isEmpty {
-            let paths = ImageAttachment.saveToProjectAttachments(images, projectURL: projectURL)
+            let paths = ImageAttachment.saveToProjectAttachmentsAsync(images, projectURL: projectURL)
             message = ImageAttachment.messageWithAttachmentPaths(text: text, paths: paths)
         }
         return (message, images)
@@ -1366,8 +2134,15 @@ final class ChatSession: ObservableObject, Identifiable {
                 self.lastError = resp["error"].string ?? "发送失败"
                 self.isSendingFromQueue = false
                 if let requeueOnFailure {
+                    // Queued item is retried with the same text/paths — keep the files.
                     self.queue.requeueFront(requeueOnFailure)
                     self.publishQueue()
+                } else {
+                    // Permanent failure: remove attachment files we wrote for this message.
+                    // (Only paths recorded by saveToProjectAttachmentsAsync are touched.)
+                    ImageAttachment.discardAttachments(
+                        atPaths: ImageAttachment.attachmentPaths(fromMessageText: message)
+                    )
                 }
             }
         }
@@ -1449,6 +2224,8 @@ final class ChatSession: ObservableObject, Identifiable {
             guard let self else { return }
             if resp["success"].bool == true {
                 self.model = m
+                // Keep「跟随主 Agent」aligned with composer/bottom-bar selection.
+                SubagentModelSettings.writeMainModel(m.id)
                 // Apply new model's context window immediately (re-derive % from existing tokens)
                 if let w = (resp["data"]["contextWindow"].int ?? m.contextWindow), w > 0 {
                     self.contextWindow = w
@@ -1534,9 +2311,25 @@ final class ChatSession: ObservableObject, Identifiable {
         }
     }
 
-    /// Clear the sidebar green badge after the user opens/selects this session.
+    /// Clear sidebar green/red badges after the user opens/selects this session.
     func markCompletionSeen() {
         if hasUnseenCompletion { hasUnseenCompletion = false }
+        if hasUnseenInterruption {
+            hasUnseenInterruption = false
+            clearInFlightMark()
+        }
+    }
+
+    private func persistInFlightMark() {
+        guard let file = sessionFile, !file.isEmpty else { return }
+        InterruptedSessionStore.mark(file)
+        onInFlightChange?(file, true)
+    }
+
+    private func clearInFlightMark() {
+        guard let file = sessionFile, !file.isEmpty else { return }
+        InterruptedSessionStore.clear(file)
+        onInFlightChange?(file, false)
     }
 
     /// Green = unseen successful settle. Skip if already selected or unhealthy.

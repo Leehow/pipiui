@@ -34,7 +34,25 @@ enum PiAuthHelper {
         return Bundle.module.url(forResource: "pi-auth-helper", withExtension: "mjs")
     }
 
+    /// Process-level lazy cache for the node binary path. `findNode()` otherwise
+    /// re-scans PATH (`isExecutableFile` per segment) and lists
+    /// `~/.nvm/versions/node` on every helper invocation. The cached path is
+    /// re-validated with a single `fileExists`; if validation fails we rescan.
+    private static let nodePathLock = NSLock()
+    private static var cachedNodePath: String?
+
     static func findNode() -> String? {
+        nodePathLock.lock()
+        defer { nodePathLock.unlock() }
+        if let cached = cachedNodePath, FileManager.default.fileExists(atPath: cached) {
+            return cached
+        }
+        let found = scanForNode()
+        cachedNodePath = found
+        return found
+    }
+
+    private static func scanForNode() -> String? {
         let fm = FileManager.default
         var candidates = [
             "/opt/homebrew/bin/node",

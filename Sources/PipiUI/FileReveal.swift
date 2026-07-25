@@ -206,8 +206,10 @@ package enum FileReveal {
 
     private static func isPathBodyChar(_ ch: Character) -> Bool {
         if ch.isWhitespace { return false }
-        // Stop at common delimiters / CJK punctuation (strip handles trailing; body stops early)
-        if "<>\"'`()[]{}|,;。，；：、】》".contains(ch) { return false }
+        // ASCII 分隔符 + CJK 标点/括号/箭头：中文行文里路径后面紧跟的标点不能吞进路径
+        //（如 /tmp/a.md」就是正文 → 路径应止于 」前）。
+        // 注意 CJK 表意文字本身仍是合法路径字符（/Users/x/文档/a.md），不在此拦截。
+        if "<>\"'`()[]{}|,;。，；：、？！…—（）【】《》「」『』〈〉～·→←↑↓".contains(ch) { return false }
         // Allow percent-encoding and typical path chars
         return true
     }
@@ -335,10 +337,19 @@ package enum FileReveal {
                   let upper = AttributedString.Index(range.upperBound, within: result) else { continue }
             if skipExistingLinks, result[lower..<upper].link != nil { continue }
             var style = AttributeContainer()
+            // 双 scope 写入：SwiftUI scope 供 SwiftUI Text（PathLinkedText），
+            // AppKit scope 供 NSAttributedString 桥接（MarkdownSelectionContent → NSTextView）——
+            // SwiftUI Color 不会自动桥接，必须显式写 NSColor。
             if let linkColor {
                 style.foregroundColor = linkColor
+                style.foregroundColor = NSColor(linkColor)
             }
             style.underlineStyle = .single
+            // 文档类路径（md/txt…，可在右侧文档面板打开）加淡色背景高亮，一眼可辨。
+            if DocumentDetector.isDocument(target.url) {
+                style.backgroundColor = (linkColor ?? Color.accentColor).opacity(0.14)
+                style.backgroundColor = NSColor(linkColor ?? Color.accentColor).withAlphaComponent(0.14)
+            }
             result[lower..<upper].mergeAttributes(style)
         }
         return result

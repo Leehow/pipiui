@@ -31,8 +31,17 @@ struct MessageRow: View, Equatable {
     var projectURL: URL? = nil
     /// Bumps Equatable when chat typography changes so `.equatable()` rows re-render.
     var chatFontSize: CGFloat = ChatTypography.defaultFontSize
+    var isWorking: Bool = false
+    var isEditing: Bool = false
     var onFlash: ((String) -> Void)? = nil
     var onSelectAgent: ((String) -> Void)?
+    var onCopy: (() -> Void)? = nil
+    var onBranch: (() -> Void)? = nil
+    var onBeginEdit: (() -> Void)? = nil
+    var onCancelEdit: (() -> Void)? = nil
+    var onCommitEdit: ((String) -> Void)? = nil
+    @State private var hovered = false
+    @State private var draft = ""
 
     static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
         lhs.item == rhs.item
@@ -41,7 +50,9 @@ struct MessageRow: View, Equatable {
             && lhs.isStreaming == rhs.isStreaming
             && lhs.projectURL == rhs.projectURL
             && lhs.chatFontSize == rhs.chatFontSize
-        // onFlash / onSelectAgent intentionally excluded
+            && lhs.isWorking == rhs.isWorking
+            && lhs.isEditing == rhs.isEditing
+        // Callbacks intentionally excluded.
     }
 
     var body: some View {
@@ -58,35 +69,97 @@ struct MessageRow: View, Equatable {
     private var userView: some View {
         HStack {
             Spacer(minLength: 60)
-            if userDisplayText.hasPrefix("[subagent-done]") {
-                // System signal from background worker — collapse by default (avoid PathLinkedText on ~8k Result).
-                VStack(alignment: .trailing, spacing: 8) {
-                    userImageThumbnails
-                    SubagentDoneBubbleView(text: userDisplayText, onFlash: onFlash)
-                }
-            } else {
-                VStack(alignment: .trailing, spacing: 8) {
-                    userImageThumbnails
-                    if !userDisplayText.isEmpty {
-                        PathLinkedText(
-                            text: userDisplayText,
-                            base: {
-                                var c = AttributeContainer()
-                                c.foregroundColor = Color.white
-                                return c
-                            }(),
-                            linkColor: .white,
-                            onFlash: onFlash
+            VStack(alignment: .trailing, spacing: 8) {
+                if isEditing {
+                    VStack(alignment: .trailing, spacing: 8) {
+                        TextEditor(text: $draft)
+                            .font(.body)
+                            .frame(minHeight: 60, maxHeight: 180)
+                            .padding(8)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(Color.accentColor.opacity(0.85))
+                            )
+                        HStack {
+                            Button("取消") { onCancelEdit?() }
+                            Button("发送") {
+                                guard editDraftSendable else {
+                                    onFlash?("消息不能为空")
+                                    return
+                                }
+                                onCommitEdit?(draft)
+                            }
+                            .disabled(!editDraftSendable)
+                            .keyboardShortcut(.defaultAction)
+                        }
+                    }
+                    .onAppear {
+                        draft = MessageActions.copyableText(from: item)
+                    }
+                    .onExitCommand {
+                        onCancelEdit?()
+                    }
+                } else {
+                    // ScrollView + row each use `.transcriptFlip()` → flips cancel, so
+                    // layout order == visual order. Bar after bubble = under the message.
+                    userBubble
+                    MessageActionSlot(hovered: hovered, alignment: .trailing) {
+                        MessageActionBar(
+                            alignment: .trailing,
+                            showEdit: MessageActions.showsMutatingActions(
+                                role: item.role,
+                                entryId: item.entryId,
+                                displayText: userDisplayText,
+                                isWorking: isWorking
+                            ) && MessageActions.canEditUserMessage(item),
+                            onCopy: { onCopy?() },
+                            onEdit: { onBeginEdit?() }
                         )
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 11)
-                .background(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(Color.accentColor)
-                )
             }
+            .contentShape(Rectangle())
+        }
+        .contentShape(Rectangle())
+        .onHover { hovered = $0 }
+    }
+
+
+    @ViewBuilder
+    private var userBubble: some View {
+        if userDisplayText.hasPrefix("[subagent-done]") {
+            // System signal from background worker — collapse by default (avoid PathLinkedText on ~8k Result).
+            VStack(alignment: .trailing, spacing: 8) {
+                userImageThumbnails
+                SubagentDoneBubbleView(text: userDisplayText, onFlash: onFlash)
+            }
+        } else if userDisplayText.hasPrefix("[worktree-merge-failed]") {
+            VStack(alignment: .trailing, spacing: 8) {
+                userImageThumbnails
+                WorktreeMergeFailedBubbleView(text: userDisplayText, onFlash: onFlash)
+            }
+        } else {
+            VStack(alignment: .trailing, spacing: 8) {
+                userImageThumbnails
+                if !userDisplayText.isEmpty {
+                    PathLinkedText(
+                        text: userDisplayText,
+                        base: {
+                            var c = AttributeContainer()
+                            c.foregroundColor = Color.white
+                            return c
+                        }(),
+                        linkColor: .white,
+                        onFlash: onFlash
+                    )
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.88))
+            )
         }
     }
 
@@ -130,13 +203,21 @@ struct MessageRow: View, Equatable {
 
     private var assistantView: some View {
         AssistantSegmentsView(
-            segments: AssistantBlockLayout.plan(blocks: item.blocks, groupFinished: !isStreaming),
+            segments: AssistantBlockLayout.plan(
+                blocks: item.blocks,
+                groupFinished: !isStreaming,
+                toolRuns: toolRuns
+            ),
             toolRuns: toolRuns,
             subagents: subagents,
             isStreaming: isStreaming,
             projectURL: projectURL,
             onFlash: onFlash,
-            onSelectAgent: onSelectAgent
+            onSelectAgent: onSelectAgent,
+            entryId: item.entryId,
+            isWorking: isWorking,
+            onCopy: onCopy,
+            onBranch: onBranch
         )
     }
 
@@ -163,6 +244,10 @@ struct MessageRow: View, Equatable {
             return nil
         }
     }
+
+    private var editDraftSendable: Bool {
+        MessageActions.isEditDraftSendable(draft)
+    }
 }
 
 /// Renders planned assistant segments (single message or coalesced tool-round run).
@@ -174,6 +259,11 @@ struct AssistantSegmentsView: View, Equatable {
     var projectURL: URL? = nil
     var onFlash: ((String) -> Void)? = nil
     var onSelectAgent: ((String) -> Void)?
+    var entryId: String? = nil
+    var isWorking: Bool = false
+    var onCopy: (() -> Void)? = nil
+    var onBranch: (() -> Void)? = nil
+    @State private var hovered = false
 
     static func == (lhs: AssistantSegmentsView, rhs: AssistantSegmentsView) -> Bool {
         lhs.segments == rhs.segments
@@ -181,41 +271,62 @@ struct AssistantSegmentsView: View, Equatable {
             && lhs.subagents == rhs.subagents
             && lhs.isStreaming == rhs.isStreaming
             && lhs.projectURL == rhs.projectURL
+            && lhs.entryId == rhs.entryId
+            && lhs.isWorking == rhs.isWorking
+        // Callbacks intentionally excluded.
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
-                switch segment {
-                case .text(let text):
-                    MarkdownTextView(text: text, onFlash: onFlash)
-                case .image(let img):
-                    ImageThumbnailView(
-                        data: img.data,
-                        mimeType: img.mimeType,
-                        path: img.path,
-                        maxWidth: 360,
-                        maxHeight: 240,
-                        projectURL: projectURL,
-                        onFlash: onFlash
-                    )
-                case .video(let vid):
-                    VideoBlockView(path: vid.path, onFlash: onFlash)
-                case .singleton(let block):
-                    assistantBlockView(block)
-                case .finishedGroup(let blocks):
-                    FinishedNonTextGroupView(
-                        blocks: blocks,
-                        toolRuns: toolRuns,
-                        subagents: subagents,
-                        projectURL: projectURL,
-                        onFlash: onFlash,
-                        onSelectAgent: onSelectAgent
-                    )
+        VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                    switch segment {
+                    case .text(let text):
+                        MarkdownTextView(text: text, onFlash: onFlash)
+                    case .image(let img):
+                        ImageThumbnailView(
+                            data: img.data,
+                            mimeType: img.mimeType,
+                            path: img.path,
+                            maxWidth: 360,
+                            maxHeight: 240,
+                            projectURL: projectURL,
+                            onFlash: onFlash
+                        )
+                    case .video(let vid):
+                        VideoBlockView(path: vid.path, onFlash: onFlash)
+                    case .singleton(let block):
+                        assistantBlockView(block)
+                    case .finishedGroup(let blocks):
+                        FinishedNonTextGroupView(
+                            blocks: blocks,
+                            toolRuns: toolRuns,
+                            subagents: subagents,
+                            projectURL: projectURL,
+                            onFlash: onFlash,
+                            onSelectAgent: onSelectAgent
+                        )
+                    }
                 }
+            }
+            // ScrollView + row flips cancel → layout order == visual order.
+            MessageActionSlot(hovered: hovered, alignment: .leading) {
+                MessageActionBar(
+                    alignment: .leading,
+                    showBranch: MessageActions.showsMutatingActions(
+                        role: "assistant",
+                        entryId: entryId,
+                        displayText: MessageActions.copyableText(from: segments),
+                        isWorking: isWorking
+                    ),
+                    onCopy: { onCopy?() },
+                    onBranch: { onBranch?() }
+                )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onHover { hovered = $0 }
     }
 
     @ViewBuilder
@@ -235,6 +346,7 @@ struct AssistantSegmentsView: View, Equatable {
                 ToolCardView(
                     call: call,
                     run: toolRuns[call.id],
+                    isStreaming: isStreaming,
                     projectURL: projectURL,
                     onFlash: onFlash
                 )
@@ -309,7 +421,7 @@ struct SubagentToolCardView: View {
                         statusIcon(agent.state)
                         Text(agent.name)
                             .font(.caption.weight(.semibold))
-                        Text(statusLine(agent))
+                        Text(SubagentToolCardStatus.line(for: agent))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -341,15 +453,19 @@ struct SubagentToolCardView: View {
         case .interrupted: Image(systemName: "bolt.slash.circle.fill").foregroundStyle(.orange).font(.caption)
         }
     }
+}
 
-    private func statusLine(_ agent: SubagentInfo) -> String {
+/// Status subtitle for the main-chat subagent tool card (testable; never shows activity JSON).
+enum SubagentToolCardStatus {
+    static func line(for agent: SubagentInfo) -> String {
         switch agent.state {
         case .running:
-            return agent.activity.isEmpty ? "思考中…" : agent.activity
+            let title = agent.listSubtitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            return title.isEmpty ? "思考中…" : title
         case .ok:
             return "完成 · \(agent.turns) turns · " + String(format: "$%.3f", agent.cost)
         case .failed:
-            return "失败 · " + String((agent.title ?? agent.task).prefix(60))
+            return "失败 · " + String(agent.listSubtitle.prefix(60))
         case .aborted:
             return "已中止"
         case .interrupted:
@@ -358,11 +474,15 @@ struct SubagentToolCardView: View {
     }
 }
 
-/// chars÷4 estimate for Thinking header (not a real tokenizer).
+/// chars÷4 estimate for Thinking / write·edit headers (not a real tokenizer).
 enum ThinkingTokenEstimate {
+    static func tokenCount(charCount: Int) -> Int {
+        guard charCount > 0 else { return 0 }
+        return max(1, Int((Double(charCount) / 4.0).rounded()))
+    }
+
     static func tokenCount(for text: String) -> Int {
-        guard !text.isEmpty else { return 0 }
-        return max(1, Int((Double(text.count) / 4.0).rounded()))
+        tokenCount(charCount: text.count)
     }
 
     /// Compact count: 999 → "999"; 1000 → "1k"; 1200 → "1.2k"; 15400 → "15.4k"
@@ -377,10 +497,14 @@ enum ThinkingTokenEstimate {
     }
 
     /// nil when no tokens to show; otherwise "~1.2k tokens"
-    static func labelSuffix(for text: String) -> String? {
-        let n = tokenCount(for: text)
+    static func labelSuffix(charCount: Int) -> String? {
+        let n = tokenCount(charCount: charCount)
         guard n > 0 else { return nil }
         return "~\(formatCount(n)) tokens"
+    }
+
+    static func labelSuffix(for text: String) -> String? {
+        labelSuffix(charCount: text.count)
     }
 }
 
@@ -584,6 +708,73 @@ struct SubagentDoneBubbleView: View {
                 .overlay(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                )
+        )
+        .accessibilityLabel(summaryTitle)
+    }
+}
+
+/// Collapsed card for `[worktree-merge-failed]` — merge error + self-handle hint.
+struct WorktreeMergeFailedBubbleView: View {
+    let text: String
+    var onFlash: ((String) -> Void)? = nil
+    @State private var expanded = false
+
+    private var parsed: (headerLine: String, agentId: String?, name: String?, error: String)? {
+        WorktreeMergeFailedMessage.parse(text)
+    }
+
+    private var summaryTitle: String {
+        guard let parsed else { return "Worktree 合并失败" }
+        let name = parsed.name ?? "agent"
+        return "Worktree 合并失败 · \(name)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .imageScale(.medium)
+                Text(summaryTitle)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { expanded.toggle() }
+            .pointingHandCursor()
+            .accessibilityAddTraits(.isButton)
+
+            if expanded {
+                PathLinkedText(
+                    text: text,
+                    base: {
+                        var c = AttributeContainer()
+                        c.foregroundColor = Color.primary.opacity(0.85)
+                        return c
+                    }(),
+                    monospaced: true,
+                    onFlash: onFlash
+                )
+                .font(.caption.monospaced())
+                .padding(.top, 6)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 420, alignment: .trailing)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.orange.opacity(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Color.orange.opacity(0.2), lineWidth: 1)
                 )
         )
         .accessibilityLabel(summaryTitle)
@@ -940,18 +1131,27 @@ struct SessionLoadingView: View {
 struct ToolCardView: View {
     let call: ToolCallBlock
     let run: ToolRun?
+    var isStreaming: Bool = false
     var projectURL: URL? = nil
     var onFlash: ((String) -> Void)? = nil
     @State private var expanded = false
 
     private var statusColor: Color {
-        guard let run else { return .secondary }
+        guard let run else { return isStreaming ? .blue : .secondary }
         if run.isRunning { return .blue }
         return run.isError ? .red : .green
     }
 
     private var toolImages: [ImageBlock] {
         run?.images ?? []
+    }
+
+    private var isLive: Bool {
+        isStreaming || run?.isRunning == true
+    }
+
+    private var showsPayloadTokens: Bool {
+        call.name == "write" || call.name == "edit"
     }
 
     var body: some View {
@@ -975,8 +1175,15 @@ struct ToolCardView: View {
                 )
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
-                Spacer()
-                if run?.isRunning == true {
+                if showsPayloadTokens,
+                   let suffix = ThinkingTokenEstimate.labelSuffix(charCount: call.payloadChars) {
+                    Text("· \(suffix)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .layoutPriority(1)
+                }
+                Spacer(minLength: 0)
+                if isLive {
                     ProgressView().controlSize(.mini)
                 } else if run != nil {
                     Image(systemName: run!.isError ? "xmark.circle.fill" : "checkmark.circle.fill")
@@ -1094,9 +1301,15 @@ struct VideoBlockView: View {
     let path: String
     var onFlash: ((String) -> Void)? = nil
 
+    /// T24: `VideoBlock` / `appendMediaResult` live in ChatSession.swift, so the
+    /// existence check cannot be hoisted into the model from here. Instead stat
+    /// once on first appear and cache in @State — body evaluation stays stat-free.
+    /// nil = not yet probed (first body pass before onAppear).
+    @State private var fileExists: Bool? = nil
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if FileManager.default.fileExists(atPath: path) {
+            if fileExists == true {
                 // macOS: open with default player via link; inline AVPlayer would need AVKit.
                 HStack(spacing: 10) {
                     Image(systemName: "film")
@@ -1135,13 +1348,18 @@ struct VideoBlockView: View {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(Color.primary.opacity(0.05))
                 )
-            } else {
+            } else if fileExists == false {
                 Text("视频文件不存在：\(path)")
                     .font(.caption)
                     .foregroundStyle(.red)
             }
         }
         .frame(maxWidth: 420)
+        .onAppear {
+            if fileExists == nil {
+                fileExists = FileManager.default.fileExists(atPath: path)
+            }
+        }
     }
 }
 

@@ -8,6 +8,8 @@ struct MarkdownTextView: View {
     let text: String
     var onFlash: ((String) -> Void)? = nil
     @Environment(\.chatTypography) private var chatTypography
+    /// 文档路径 ⌘+点击 → 右侧文档面板（ChatDetailView 注入；nil 时回退访达显示）。
+    @Environment(\.openDocument) private var openDocument
 
     var body: some View {
         // SwiftUI gives every block its own text-selection host, so a drag cannot cross a
@@ -18,7 +20,9 @@ struct MarkdownTextView: View {
                 for: text,
                 typography: chatTypography
             ),
-            bodyFont: chatTypography.bodyNSFont
+            bodyFont: chatTypography.bodyNSFont,
+            onOpenDocument: openDocument,
+            onFlash: onFlash
         )
     }
 
@@ -262,35 +266,59 @@ struct MarkdownTextView: View {
 /// Flattens rendered markdown blocks into one attributed storage while preserving the text a
 /// user sees and copies. The AppKit bridge below then provides a single native selection range.
 enum MarkdownSelectionContent {
+    enum ParagraphRole {
+        case body
+        case list
+        case heading
+        case code
+    }
+
     static func attributedString(
         for text: String,
         typography: ChatTypography = .make(fontSize: ChatTypography.defaultFontSize)
     ) -> NSAttributedString {
         let result = NSMutableAttributedString()
         let blocks = MarkdownTextView.cachedParse(text)
+        let bodyStyle = paragraphStyle(for: typography, role: .body)
+        let listStyle = paragraphStyle(for: typography, role: .list)
+        let headingStyle = paragraphStyle(for: typography, role: .heading)
+        let codeStyle = paragraphStyle(for: typography, role: .code)
 
         for (index, block) in blocks.enumerated() {
-            if index > 0 { result.append(NSAttributedString(string: "\n\n")) }
+            if index > 0 {
+                result.append(blockSeparator(typography: typography))
+            }
             switch block {
             case .paragraph(let paragraph):
-                result.append(rendered(MarkdownTextView.inlineWithPaths(paragraph), font: typography.bodyNSFont))
+                result.append(rendered(
+                    MarkdownTextView.inlineWithPaths(paragraph),
+                    font: typography.bodyNSFont,
+                    style: bodyStyle
+                ))
             case .heading(let level, let title):
                 result.append(rendered(
                     MarkdownTextView.inlineWithPaths(title),
-                    font: typography.headingNSFont(level: level)
+                    font: typography.headingNSFont(level: level),
+                    style: headingStyle
                 ))
             case .code(let code), .mono(let code):
                 result.append(rendered(
                     AttributedString(code),
                     font: typography.codeNSFont,
+                    style: codeStyle,
                     background: NSColor.labelColor.withAlphaComponent(0.05)
                 ))
             case .list(let items):
-                result.append(rendered(MarkdownTextView.listAttributed(items), font: typography.bodyNSFont))
+                result.append(rendered(
+                    MarkdownTextView.listAttributed(items),
+                    font: typography.bodyNSFont,
+                    style: listStyle
+                ))
             case .quote(let quote):
                 result.append(rendered(
                     MarkdownTextView.inlineWithPaths(quote),
                     font: typography.bodyNSFont,
+                    style: bodyStyle,
                     color: .secondaryLabelColor
                 ))
             case .table(let header, let rows):
@@ -298,18 +326,63 @@ enum MarkdownSelectionContent {
                     AttributedString(([header] + rows)
                         .map { $0.joined(separator: "\t") }
                         .joined(separator: "\n")),
-                    font: typography.bodyNSFont
+                    font: typography.bodyNSFont,
+                    style: bodyStyle
                 ))
             case .rule:
-                result.append(rendered(AttributedString("────────"), font: typography.bodyNSFont, color: .separatorColor))
+                result.append(rendered(
+                    AttributedString("────────"),
+                    font: typography.bodyNSFont,
+                    style: bodyStyle,
+                    color: .separatorColor
+                ))
             }
         }
+        return result
+    }
+
+    /// NSTextView ignores SwiftUI `.lineSpacing`; spacing must live on `NSParagraphStyle`.
+    static func paragraphStyle(
+        for typography: ChatTypography,
+        role: ParagraphRole = .body
+    ) -> NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        switch role {
+        case .body:
+            style.lineSpacing = typography.lineSpacing
+            style.paragraphSpacing = typography.paragraphSpacing
+        case .list:
+            style.lineSpacing = typography.lineSpacing
+            style.paragraphSpacing = typography.listItemSpacing
+        case .heading:
+            style.lineSpacing = typography.headingLineSpacing
+            style.paragraphSpacing = typography.paragraphSpacing
+        case .code:
+            // ~1.5× total line-height for monospace blocks.
+            style.lineSpacing = typography.fontSize * 0.3
+            style.paragraphSpacing = typography.paragraphSpacing
+        }
+        return style
+    }
+
+    /// Empty paragraph between markdown blocks; height is exactly `blockSpacing`.
+    private static func blockSeparator(typography: ChatTypography) -> NSAttributedString {
+        let style = NSMutableParagraphStyle()
+        style.minimumLineHeight = typography.blockSpacing
+        style.maximumLineHeight = typography.blockSpacing
+        style.lineSpacing = 0
+        style.paragraphSpacing = 0
+        let result = NSMutableAttributedString(string: "\n\n")
+        let range = NSRange(location: 0, length: result.length)
+        result.addAttribute(.font, value: typography.bodyNSFont, range: range)
+        result.addAttribute(.paragraphStyle, value: style, range: range)
         return result
     }
 
     private static func rendered(
         _ text: AttributedString,
         font: NSFont,
+        style: NSParagraphStyle,
         color: NSColor = .labelColor,
         background: NSColor? = nil
     ) -> NSAttributedString {
@@ -317,7 +390,16 @@ enum MarkdownSelectionContent {
         let range = NSRange(location: 0, length: result.length)
         guard range.length > 0 else { return result }
         result.addAttribute(.font, value: font, range: range)
-        result.addAttribute(.foregroundColor, value: color, range: range)
+        // 默认色只补无颜色的 run：inlineWithPaths 注入的路径 accent 色/下划线必须保留，
+        // 否则用户看不到哪里可以 ⌘+点击。
+        var uncolored: [NSRange] = []
+        result.enumerateAttribute(.foregroundColor, in: range) { value, r, _ in
+            if value == nil { uncolored.append(r) }
+        }
+        for r in uncolored {
+            result.addAttribute(.foregroundColor, value: color, range: r)
+        }
+        result.addAttribute(.paragraphStyle, value: style, range: range)
         if let background {
             result.addAttribute(.backgroundColor, value: background, range: range)
         }
@@ -331,9 +413,11 @@ enum MarkdownSelectionContent {
 private struct SelectableMarkdownTextView: NSViewRepresentable {
     let attributedText: NSAttributedString
     let bodyFont: NSFont
+    var onOpenDocument: ((URL) -> Void)? = nil
+    var onFlash: ((String) -> Void)? = nil
 
     func makeNSView(context: Context) -> NSTextView {
-        let textView = NSTextView(frame: .zero)
+        let textView = PathClickTextView(frame: .zero)
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = false
@@ -343,11 +427,19 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.autoresizingMask = [.width]
         applyContent(to: textView)
+        applyWire(to: textView)
         return textView
     }
 
     func updateNSView(_ textView: NSTextView, context: Context) {
         applyContent(to: textView)
+        applyWire(to: textView)
+    }
+
+    private func applyWire(to textView: NSTextView) {
+        guard let textView = textView as? PathClickTextView else { return }
+        textView.onOpenDocument = onOpenDocument
+        textView.onFlash = onFlash
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView textView: NSTextView, context: Context) -> CGSize? {
@@ -365,6 +457,69 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
         textView.font = bodyFont
         textView.textColor = .labelColor
         textView.textStorage?.setAttributedString(attributedText)
+    }
+}
+
+/// 与 PathLinkedText 相同的 ⌘+点击路径约定：文档（md/txt…）→ 右侧文档面板，
+/// 其它文件 → 访达显示；⌘+悬停路径显示手型光标。路径命中范围基于当前显示文本
+/// 现算（PathLinkCache 缓存，mousemove 走命中缓存）。
+private final class PathClickTextView: NSTextView {
+    var onOpenDocument: ((URL) -> Void)?
+    var onFlash: ((String) -> Void)?
+    private var trackingAreaRef: NSTrackingArea?
+
+    override func mouseDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.command), let url = pathURL(at: event) {
+            if let onOpenDocument, DocumentDetector.isDocument(url) {
+                onOpenDocument(url)
+            } else if !FileReveal.revealInFinder(url: url) {
+                onFlash?(FileReveal.missingPathMessage(url.path))
+            }
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    private func pathURL(at event: NSEvent) -> URL? {
+        guard let layoutManager, let textContainer, !string.isEmpty else { return nil }
+        var point = convert(event.locationInWindow, from: nil)
+        point.x -= textContainerInset.width
+        point.y -= textContainerInset.height
+        let charIndex = layoutManager.characterIndex(
+            for: point,
+            in: textContainer,
+            fractionOfDistanceBetweenInsertionPoints: nil
+        )
+        guard charIndex != NSNotFound else { return nil }
+        // 排除点在某行尾部空白处误命中末尾字符的情况。
+        let glyphIndex = layoutManager.glyphIndexForCharacter(at: charIndex)
+        let glyphRect = layoutManager.boundingRect(
+            forGlyphRange: NSRange(location: glyphIndex, length: 1),
+            in: textContainer
+        )
+        guard glyphRect.insetBy(dx: -3, dy: -3).contains(point) else { return nil }
+        let targets = FileReveal.pathTargets(in: string)
+        return PathLinkHitTest.pathTarget(atCharacterIndex: charIndex, targets: targets)?.url
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingAreaRef { removeTrackingArea(trackingAreaRef) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self
+        )
+        addTrackingArea(area)
+        trackingAreaRef = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        if event.modifierFlags.contains(.command), pathURL(at: event) != nil {
+            NSCursor.pointingHand.set()
+        } else {
+            super.mouseMoved(with: event)
+        }
     }
 }
 

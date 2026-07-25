@@ -113,6 +113,22 @@ final class FileRevealTests: XCTestCase {
         }
     }
 
+    func testAbsolutePathMatchesStopsAtCJKBracketsAndProse() {
+        // 回归：路径后面紧跟 CJK 括号/中文时不能吞进去（此前 /tmp/demo.md」就是正文 整体被当成路径）
+        let cases: [(String, String)] = [
+            ("点这里「/tmp/demo.md」就是正文", "/tmp/demo.md"),
+            ("验证：/tmp/demo.md」（现在应该是蓝色下划线了）→", "/tmp/demo.md"),
+            ("看《/Users/a/b.md》这本书", "/Users/a/b.md"),
+            ("文件（/tmp/x.log）已生成", "/tmp/x.log"),
+            // CJK 表意文字本身是合法路径字符，不能误伤
+            ("打开 /Users/x/文档/报告.md 看看", "/Users/x/文档/报告.md"),
+        ]
+        for (text, expected) in cases {
+            let matches = FileReveal.absolutePathMatches(in: text)
+            XCTAssertEqual(matches.map { String(text[$0]) }, [expected], "text: \(text)")
+        }
+    }
+
     func testFileURLMatchInProse() {
         let text = "open file:///Users/alice/doc.pdf now"
         let matches = FileReveal.absolutePathMatches(in: text)
@@ -206,6 +222,49 @@ final class FileRevealTests: XCTestCase {
         XCTAssertEqual(targets.count, 1)
         XCTAssertEqual(targets[0].path, "/Users/alice/x.txt")
         XCTAssertEqual(targets[0].range.location, ("file at " as NSString).length)
+    }
+
+    // MARK: - Document path highlight
+
+    func testDocumentPathsGetBackgroundHighlight() {
+        let text = "打开 /tmp/notes.md 或 /tmp/image.png 看看"
+        let attr = FileReveal.attributedStringLinkingPaths(text)
+        var mdHighlighted = false
+        var pngHighlighted = false
+        for run in attr.runs {
+            let slice = String(attr[run.range].characters)
+            if slice == "/tmp/notes.md" {
+                mdHighlighted = run.backgroundColor != nil
+                XCTAssertEqual(run.underlineStyle, .single)
+            }
+            if slice == "/tmp/image.png" {
+                pngHighlighted = run.backgroundColor != nil
+            }
+        }
+        XCTAssertTrue(mdHighlighted, "文档路径应带背景高亮")
+        XCTAssertFalse(pngHighlighted, "非文档路径不应带背景高亮")
+    }
+
+    func testDocumentHighlightBridgesToNSAttributedString() {
+        // NSTextView 渲染链：SwiftUI AttributedString 的背景高亮必须能桥接成 NSAttributedString。
+        let text = "看 /tmp/notes.md 这里"
+        let attr = FileReveal.attributedStringLinkingPaths(text)
+        let ns = NSAttributedString(attr)
+        var foundBackground = false
+        var foundAccentForeground = false
+        ns.enumerateAttribute(.backgroundColor, in: NSRange(location: 0, length: ns.length)) { value, range, _ in
+            if value != nil {
+                foundBackground = true
+                XCTAssertEqual((ns.string as NSString).substring(with: range), "/tmp/notes.md")
+            }
+        }
+        ns.enumerateAttribute(.foregroundColor, in: NSRange(location: 0, length: ns.length)) { value, range, _ in
+            if value != nil, (ns.string as NSString).substring(with: range) == "/tmp/notes.md" {
+                foundAccentForeground = true
+            }
+        }
+        XCTAssertTrue(foundBackground, "背景高亮应能桥接到 NSAttributedString（NSTextView 渲染路径）")
+        XCTAssertTrue(foundAccentForeground, "accent 前景色应能桥接到 NSAttributedString")
     }
 
     // MARK: - Reveal existing / missing

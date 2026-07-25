@@ -16,6 +16,36 @@ struct DraftImage: Identifiable {
     }
 }
 
+/// Thread-safe path→Data read-through cache for on-disk image files
+/// (attachments, RPC path-only blocks, hydrate footnotes).
+///
+/// Same idea as `ImageDecodeCache` but one layer lower: it dedupes the *disk read*,
+/// so history build, live ingest backfill, and repeated hydrate passes never read the
+/// same file twice. `NSCache` is internally synchronized → callable from any queue.
+package enum ImageFileDataCache {
+    private static let cache: NSCache<NSString, NSData> = {
+        let c = NSCache<NSString, NSData>()
+        c.countLimit = 64
+        c.totalCostLimit = 256 * 1024 * 1024 // ~12 max-size images
+        return c
+    }()
+
+    /// Read-through: a cache hit performs **zero** disk I/O; a miss reads once and stores.
+    /// Returns nil for missing/empty/unreadable files (same shape as a failed `Data(contentsOf:)`).
+    package static func data(forPath path: String) -> Data? {
+        let key = path as NSString
+        if let hit = cache.object(forKey: key) { return hit as Data }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), !data.isEmpty else { return nil }
+        cache.setObject(data as NSData, forKey: key, cost: data.count)
+        return data
+    }
+
+    /// Test / memory-pressure helper: drop all entries.
+    package static func removeAll() {
+        cache.removeAllObjects()
+    }
+}
+
 package enum ImageAttachment {
     package static let maxBytes = 20 * 1024 * 1024
     package static let maxEdge: CGFloat = 2000
@@ -113,15 +143,19 @@ package enum ImageAttachment {
         }
     }
 
+    private static func attachmentsDirectory(projectURL: URL) -> URL {
+        projectURL
+            .appendingPathComponent(".pi", isDirectory: true)
+            .appendingPathComponent("attachments", isDirectory: true)
+    }
+
     /// Persist drafts under `<project>/.pi/attachments/` so that if the model
     /// tries `read` on a path (common coding-agent habit), the file actually exists.
     /// Returns absolute paths written successfully.
     @discardableResult
     static func saveToProjectAttachments(_ images: [DraftImage], projectURL: URL) -> [URL] {
         guard !images.isEmpty else { return [] }
-        let dir = projectURL
-            .appendingPathComponent(".pi", isDirectory: true)
-            .appendingPathComponent("attachments", isDirectory: true)
+        let dir = attachmentsDirectory(projectURL: projectURL)
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         } catch {
@@ -143,6 +177,122 @@ package enum ImageAttachment {
             }
         }
         return urls
+    }
+
+    // MARK: - Background attachment writes (T12: keep disk I/O off the main thread)
+
+    private static let attachmentWriteLock = NSLock()
+    /// draft id → assigned destination (written or write in flight).
+    /// Re-sending the same draft (queue restore, retry) reuses its original path,
+    /// so the footnote text already embedded in the message stays valid.
+    private static var attachmentURLsByDraft: [UUID: URL] = [:]
+    /// draft ids whose write completed successfully (skip re-write).
+    private static var attachmentWritesDone: Set<UUID> = []
+    /// draft ids currently being written on the background queue.
+    private static var attachmentWritesInFlight: Set<UUID> = []
+
+    /// Destination paths for drafts — **pure path computation, zero disk I/O**, main-thread safe.
+    /// The mapping is recorded up front so a re-send of the same draft reuses the path.
+    static func attachmentURLs(for images: [DraftImage], projectURL: URL) -> [URL] {
+        let dir = attachmentsDirectory(projectURL: projectURL)
+        let stamp = ISO8601DateFormatter()
+        stamp.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let stampText = stamp.string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        attachmentWriteLock.lock()
+        defer { attachmentWriteLock.unlock() }
+        return images.enumerated().map { idx, img in
+            if let existing = attachmentURLsByDraft[img.id] { return existing }
+            let ext = fileExtension(for: img.mimeType)
+            // uuid suffix: distinct drafts can share stamp+idx on rapid double-send.
+            let name = "\(stampText)-\(idx)-\(img.id.uuidString.prefix(8)).\(ext)"
+            let url = dir.appendingPathComponent(name)
+            attachmentURLsByDraft[img.id] = url
+            return url
+        }
+    }
+
+    /// Precompute paths synchronously and write bytes on a background queue.
+    /// Returns the paths immediately (they do not depend on write completion).
+    /// Each draft is written at most once: duplicate calls for an already-written or
+    /// in-flight draft reuse its path and skip the write. `completion` runs on an
+    /// unspecified queue with the successfully (re)written paths.
+    @discardableResult
+    static func saveToProjectAttachmentsAsync(
+        _ images: [DraftImage],
+        projectURL: URL,
+        completion: @escaping ([URL]) -> Void = { _ in }
+    ) -> [URL] {
+        guard !images.isEmpty else { return [] }
+        let urls = attachmentURLs(for: images, projectURL: projectURL)
+
+        attachmentWriteLock.lock()
+        let toWrite: [(id: UUID, data: Data, url: URL)] = images.compactMap { img in
+            guard !attachmentWritesDone.contains(img.id),
+                  !attachmentWritesInFlight.contains(img.id),
+                  let url = attachmentURLsByDraft[img.id] else { return nil }
+            attachmentWritesInFlight.insert(img.id)
+            return (img.id, img.data, url)
+        }
+        attachmentWriteLock.unlock()
+
+        guard !toWrite.isEmpty else {
+            completion(urls)
+            return urls
+        }
+
+        let dir = attachmentsDirectory(projectURL: projectURL)
+        DispatchQueue.global(qos: .userInitiated).async {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for entry in toWrite {
+                var wrote = false
+                do {
+                    try entry.data.write(to: entry.url, options: .atomic)
+                    wrote = true
+                } catch {
+                    // Mapping stays but is not marked done → a later re-send retries the write.
+                }
+                attachmentWriteLock.lock()
+                attachmentWritesInFlight.remove(entry.id)
+                // If the mapping was discarded while we were writing (permanent send failure),
+                // the file is unwanted — delete it instead of leaking it.
+                let stillWanted = attachmentURLsByDraft[entry.id] != nil
+                if wrote && stillWanted { attachmentWritesDone.insert(entry.id) }
+                attachmentWriteLock.unlock()
+                if !stillWanted {
+                    try? FileManager.default.removeItem(at: entry.url)
+                }
+            }
+            completion(urls)
+        }
+        return urls
+    }
+
+    /// Permanent-send-failure cleanup: delete files **we** wrote for these paths and
+    /// forget the draft→path mapping (a later re-send then gets a fresh path + write).
+    /// Paths we never recorded are ignored, so arbitrary user paths in text are safe.
+    static func discardAttachments(atPaths paths: [String]) {
+        guard !paths.isEmpty else { return }
+        attachmentWriteLock.lock()
+        let doomed = attachmentURLsByDraft.filter { paths.contains($0.value.path) }
+        for (id, _) in doomed {
+            attachmentURLsByDraft.removeValue(forKey: id)
+            attachmentWritesDone.remove(id)
+        }
+        attachmentWriteLock.unlock()
+        let urls = Array(doomed.values)
+        guard !urls.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            for url in urls { try? FileManager.default.removeItem(at: url) }
+        }
+    }
+
+    /// Test helper: forget all draft→path state (does not delete files).
+    static func resetAttachmentWriteState() {
+        attachmentWriteLock.lock()
+        attachmentURLsByDraft.removeAll()
+        attachmentWritesDone.removeAll()
+        attachmentWritesInFlight.removeAll()
+        attachmentWriteLock.unlock()
     }
 
     /// Footer note appended after attachment path lines (kept in sync with strip).

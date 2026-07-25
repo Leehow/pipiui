@@ -97,6 +97,8 @@ struct PathLinkedText: View {
     /// Optional explicit AppKit font (headings / caption overrides).
     var nsFont: NSFont? = nil
     @Environment(\.chatTypography) private var chatTypography
+    /// 文档路径 ⌘+点击 → 右侧文档面板（由 ChatDetailView 注入；nil 时维持访达显示）。
+    @Environment(\.openDocument) private var openDocument
 
     init(
         text: String,
@@ -159,7 +161,8 @@ struct PathLinkedText: View {
                     targets: targets,
                     font: hitFont,
                     lineLimit: lineLimit,
-                    onFlash: onFlash
+                    onFlash: onFlash,
+                    onOpenDocument: openDocument
                 )
             )
             .contextMenu { contextMenuContent }
@@ -200,6 +203,13 @@ struct PathLinkedText: View {
         Button("复制") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(plainText, forType: .string)
+        }
+        if let url = contextRevealURL,
+           DocumentDetector.isDocument(url),
+           let openDocument {
+            Button("在文档面板打开") {
+                openDocument(url)
+            }
         }
         if let url = contextRevealURL {
             Button("在访达中显示") {
@@ -263,6 +273,7 @@ private struct CmdPathClickOverlay: NSViewRepresentable {
     let font: NSFont
     let lineLimit: Int?
     let onFlash: ((String) -> Void)?
+    let onOpenDocument: ((URL) -> Void)?
 
     func makeNSView(context: Context) -> CmdPathClickNSView {
         let view = CmdPathClickNSView()
@@ -282,6 +293,7 @@ private struct CmdPathClickOverlay: NSViewRepresentable {
         view.hitFont = font
         view.lineLimit = lineLimit
         view.onFlash = onFlash
+        view.onOpenDocument = onOpenDocument
     }
 }
 
@@ -291,6 +303,7 @@ private final class CmdPathClickNSView: NSView {
     var hitFont: NSFont = .systemFont(ofSize: NSFont.systemFontSize)
     var lineLimit: Int?
     var onFlash: ((String) -> Void)?
+    var onOpenDocument: ((URL) -> Void)?
 
     override var isOpaque: Bool { false }
 
@@ -310,8 +323,16 @@ private final class CmdPathClickNSView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         guard event.modifierFlags.contains(.command) else { return }
-        guard let url = pathURL(at: event) else { return }
-        reveal(url)
+        // 位置命中失败且全文只有一条路径 → 兜底用唯一目标：单行中间截断时
+        // TextKit 测量与实际渲染错位，精确映射不可靠。
+        let url = pathURL(at: event) ?? (targets.count == 1 ? targets[0].url : nil)
+        guard let url else { return }
+        // 文档（md/txt…）→ 右侧文档面板渲染；其它文件维持访达显示。
+        if let onOpenDocument, DocumentDetector.isDocument(url) {
+            onOpenDocument(url)
+        } else {
+            reveal(url)
+        }
     }
 
     override func mouseUp(with event: NSEvent) {
