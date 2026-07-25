@@ -7,6 +7,9 @@ struct SidebarView: View {
     @State private var showSettings = false
     /// Per-project expand state for the archived section; missing key = collapsed.
     @State private var archivedExpandedByProject: [String: Bool] = [:]
+    @State private var projectsExpanded = false
+    @State private var pinnedExpanded = false
+    @State private var sessionsExpanded = false
 
     /// Shared leading gutter — `.sidebar` List defaults are wider than needed.
     private static let sidebarGutter: CGFloat = 10
@@ -41,7 +44,7 @@ struct SidebarView: View {
         }
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
         .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 8) {
+            HStack {
                 Button {
                     showSettings = true
                 } label: {
@@ -54,14 +57,6 @@ struct SidebarView: View {
                 .accessibilityLabel("设置")
 
                 Spacer(minLength: 0)
-
-                Toggle(isOn: $store.bossModeEnabled) {
-                    Label("Boss", systemImage: "crown")
-                        .font(.callout)
-                }
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .help("Boss 模式：新会话以大组长协议启动——不亲自干活，按难度分派 subagent（简单派单兵、复杂派组长、调研扇出），配合反早停失败恢复协议")
             }
             .padding(.horizontal, Self.sidebarGutter + 2)
             .padding(.vertical, 12)
@@ -70,6 +65,9 @@ struct SidebarView: View {
         .sheet(isPresented: $showSettings) {
             SettingsSheet()
                 .environmentObject(store)
+        }
+        .onChange(of: store.selectedProjectPath) { _, _ in
+            sessionsExpanded = false
         }
         .sheet(item: $renameTarget) { target in
             VStack(alignment: .leading, spacing: 16) {
@@ -110,7 +108,12 @@ struct SidebarView: View {
             .help("添加项目")
             .accessibilityLabel("添加项目")
         } rows: {
-            ForEach(store.projects, id: \.path) { project in
+            let capped = SidebarListLimits.visiblePrefix(
+                of: store.projects,
+                limit: SidebarListLimits.projects,
+                expanded: projectsExpanded
+            )
+            ForEach(capped.items, id: \.path) { project in
                 let isSelected = project.path == store.selectedProjectPath
                 SessionRowContainer(
                     isSelected: isSelected,
@@ -143,6 +146,9 @@ struct SidebarView: View {
                     }
                 }
             }
+            if capped.showsToggle {
+                moreToggle(expanded: $projectsExpanded)
+            }
         }
     }
 
@@ -156,7 +162,12 @@ struct SidebarView: View {
             sidebarSection("置顶") {
                 EmptyView()
             } rows: {
-                ForEach(pinned, id: \.0.path) { meta, project in
+                let capped = SidebarListLimits.visiblePrefix(
+                    of: pinned,
+                    limit: SidebarListLimits.pinned,
+                    expanded: pinnedExpanded
+                )
+                ForEach(capped.items, id: \.0.path) { meta, project in
                     let openKey = openKeyFor(meta: meta) ?? "resume:\(meta.path)"
                     let live = openKeyFor(meta: meta).flatMap { store.openSessions[$0] }
                     sessionRow(
@@ -175,6 +186,9 @@ struct SidebarView: View {
                         isPinned: true
                     )
                 }
+                if capped.showsToggle {
+                    moreToggle(expanded: $pinnedExpanded)
+                }
             }
         }
     }
@@ -184,6 +198,15 @@ struct SidebarView: View {
             from: store.sessionsByProject[project.path] ?? [],
             excludingPinned: store.userPinnedSessionPaths
         )
+        let news = newSessionEntries(project: project)
+        let visibleCounts = SidebarListLimits.splitVisibleCounts(
+            leadingCount: news.count,
+            trailingCount: metas.count,
+            limit: SidebarListLimits.sessions,
+            expanded: sessionsExpanded
+        )
+        let visibleNews = Array(news.prefix(visibleCounts.leading))
+        let visibleMetas = Array(metas.prefix(visibleCounts.trailing))
         return sidebarSection("会话") {
             Button {
                 store.newSession(project: project)
@@ -195,7 +218,7 @@ struct SidebarView: View {
             .accessibilityLabel("新建会话")
         } rows: {
             // 未落盘，或已有 sessionFile 但 metas 尚未代表该 path 的 new:*（交接空窗）
-            ForEach(newSessionEntries(project: project), id: \.0) { key, session in
+            ForEach(visibleNews, id: \.0) { key, session in
                 sessionRow(
                     tag: key,
                     onSelect: { store.selectedSessionKey = key },
@@ -210,7 +233,7 @@ struct SidebarView: View {
                 )
             }
 
-            ForEach(metas) { meta in
+            ForEach(visibleMetas) { meta in
                 let openKey = openKeyFor(meta: meta) ?? "resume:\(meta.path)"
                 let live = openKeyFor(meta: meta).flatMap { store.openSessions[$0] }
                 sessionRow(
@@ -225,6 +248,9 @@ struct SidebarView: View {
                     archivePath: meta.path,
                     isPinned: false
                 )
+            }
+            if visibleCounts.showsToggle {
+                moreToggle(expanded: $sessionsExpanded)
             }
         }
     }
@@ -253,6 +279,20 @@ struct SidebarView: View {
 
             rows()
         }
+    }
+
+    @ViewBuilder
+    private func moreToggle(expanded: Binding<Bool>) -> some View {
+        Button(expanded.wrappedValue ? "收起" : "更多") {
+            expanded.wrappedValue.toggle()
+        }
+        .buttonStyle(.plain)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder
