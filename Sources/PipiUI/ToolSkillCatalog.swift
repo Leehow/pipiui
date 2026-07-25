@@ -24,8 +24,7 @@ enum ToolSkillCatalog {
     static let extensionTools: [ToolEntry] = [
         .init(name: "generate_image", group: "扩展", summary: "对话内生图（Grok Imagine / Coding Relay）"),
         .init(name: "browser_*", group: "扩展", summary: "应用内 WebView 浏览器工具（browser）"),
-        .init(name: "git_status", group: "扩展", summary: "结构化 git status"),
-        .init(name: "git_diff", group: "扩展", summary: "结构化 git diff"),
+        .init(name: "git", group: "扩展", summary: "结构化 git status / capped diff"),
         .init(name: "web_search", group: "扩展", summary: "联网搜索（Tavily / Brave / SerpAPI / Exa / Kimi / DuckDuckGo）"),
         .init(name: "web_fetch", group: "扩展", summary: "抓取网页正文文本"),
     ]

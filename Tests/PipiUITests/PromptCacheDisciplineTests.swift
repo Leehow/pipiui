@@ -27,6 +27,26 @@ final class PromptCacheDisciplineTests: XCTestCase {
         XCTAssertTrue(source.contains("if (snap === lastSnapshot) return;"))
     }
 
+    /// `generate_image` is rarely used but rode in the prefix twice: once as a system-prompt
+    /// section and once as promptGuidelines saying the same thing. The long form now comes
+    /// back from the `confirmed=false` branch, which lands in the conversation.
+    func testMediaExtensionNeverRewritesSystemPrompt() throws {
+        let source = try install(MediaExtension.install(into:))
+        XCTAssertFalse(source.contains("systemPrompt:"))
+        XCTAssertFalse(source.contains("## Image generation"))
+        XCTAssertTrue(source.contains("How this tool is meant to be used:"))
+    }
+
+    /// git_status + git_diff folded into one `git` tool, same CLI-style shape as `browser`.
+    func testGitExtensionRegistersOneStableTool() throws {
+        let source = try install(GitExtension.install(into:))
+        XCTAssertEqual(source.components(separatedBy: "registerTool(").count - 1, 1)
+        XCTAssertTrue(source.contains("name: \"git\""))
+        for action in ["status", "diff", "help"] {
+            XCTAssertTrue(source.contains("case \"\(action)\":"), "missing git action \(action)")
+        }
+    }
+
     /// The tool set is part of the prefix, so it must stay constant within a session.
     /// The five browser_* tools are one `browser` tool with an `action` discriminator.
     func testWebviewExtensionRegistersOneStableTool() throws {
