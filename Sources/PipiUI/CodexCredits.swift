@@ -27,7 +27,7 @@ enum CodexAuthStore {
 
     static func load(env: [String: String] = ProcessInfo.processInfo.environment) -> CodexCredentials? {
         let url = authFileURL(env: env)
-        guard let data = AuthFileCache.data(for: url) else { return nil }
+        guard let data = try? Data(contentsOf: url) else { return nil }
         return parse(data: data)
     }
 
