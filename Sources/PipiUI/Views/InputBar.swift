@@ -2,10 +2,12 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// Captures ⌘V image pastes while the composer is focused (TextField would otherwise insert a path).
+/// Captures ⌘V while the composer is focused: images → attachments; large text → collapse marker.
 final class ComposerPasteCatcher {
     var focused = false
     var onPasteImages: ([DraftImage]) -> Void = { _ in }
+    /// Called with pasteboard string when it exceeds the large-paste threshold.
+    var onPasteLargeText: (String) -> Void = { _ in }
     private var monitor: Any?
 
     func start() {
@@ -20,10 +22,19 @@ final class ComposerPasteCatcher {
                   event.charactersIgnoringModifiers?.lowercased() == "v"
             else { return event }
 
-            guard ImageAttachment.pasteboardHasImage() else { return event }
-            let images = ImageAttachment.imagesFromPasteboard()
-            guard !images.isEmpty else { return event }
-            DispatchQueue.main.async { self.onPasteImages(images) }
+            // Images win (TextField would otherwise insert a path / file URL).
+            if ImageAttachment.pasteboardHasImage() {
+                let images = ImageAttachment.imagesFromPasteboard()
+                guard !images.isEmpty else { return event }
+                DispatchQueue.main.async { self.onPasteImages(images) }
+                return nil
+            }
+
+            guard let text = NSPasteboard.general.string(forType: .string),
+                  DraftPasteCollapse.isLargePaste(text)
+            else { return event }
+
+            DispatchQueue.main.async { self.onPasteLargeText(text) }
             return nil
         }
     }
@@ -36,6 +47,37 @@ final class ComposerPasteCatcher {
     }
 
     deinit { stop() }
+}
+
+enum ComposerPasteInsertion {
+    /// Insert `marker` at the focused text field's selection; fall back to appending on `draftText`.
+    static func insertMarker(_ marker: String, draftText: inout String) {
+        if let textView = NSApp.keyWindow?.firstResponder as? NSTextView,
+           textView.isEditable {
+            let range = textView.selectedRange()
+            if textView.shouldChangeText(in: range, replacementString: marker) {
+                textView.replaceCharacters(in: range, with: marker)
+                textView.didChangeText()
+            }
+            // Keep SwiftUI binding in sync when the field is the draft composer.
+            draftText = textView.string
+            return
+        }
+        if let field = NSApp.keyWindow?.firstResponder as? NSTextField {
+            let editor = field.currentEditor()
+            let ns = (editor?.string ?? field.stringValue) as NSString
+            let range = editor?.selectedRange ?? NSRange(location: ns.length, length: 0)
+            let updated = ns.replacingCharacters(in: range, with: marker)
+            field.stringValue = updated
+            draftText = updated
+            if let editor {
+                let cursor = range.location + (marker as NSString).length
+                editor.selectedRange = NSRange(location: cursor, length: 0)
+            }
+            return
+        }
+        draftText += marker
+    }
 }
 
 /// Arrow/Tab/Return/Esc while slash palette is open. Mirrors ComposerPasteCatcher lifecycle.
@@ -159,6 +201,11 @@ struct InputBar: View {
                 session.draftImages.append(contentsOf: images)
                 attachError = nil
             }
+            pasteCatcher.onPasteLargeText = { text in
+                let marker = session.registerLargePaste(text)
+                ComposerPasteInsertion.insertMarker(marker, draftText: &session.draftText)
+                attachError = nil
+            }
             pasteCatcher.start()
 
             slashKeyMonitor.onMove = { delta in
@@ -190,6 +237,7 @@ struct InputBar: View {
             refreshSlashKeyMonitorActive()
         }
         .onChange(of: session.draftText) { _, _ in
+            session.pruneOrphanDraftPastes()
             refreshSlashPalette()
         }
         .onChange(of: session.availableCommands) { _, _ in
@@ -316,16 +364,27 @@ struct InputBar: View {
                 .onSubmit(send)
                 .padding(.vertical, 6)
 
-            if session.isStreaming {
+            if session.isStreaming || session.isSendingFromQueue || session.isStopping {
                 Button(action: { session.abort() }) {
-                    Image(systemName: "stop.fill")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 28, height: 28)
-                        .background(Circle().fill(Color.primary))
+                    Group {
+                        if session.isStopping {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(.white)
+                        } else {
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.white)
+                        }
+                    }
+                    .opacity(session.isStopping ? 0.6 : 1)
+                    .frame(width: 28, height: 28)
+                    .background(Circle().fill(Color.primary))
                 }
                 .buttonStyle(.plain)
-                .help(session.messageQueue.isEmpty ? "中止当前回复" : "中止并发送队首")
+                .help(session.isStopping
+                      ? "正在停止…"
+                      : (session.messageQueue.isEmpty ? "中止当前回复" : "中止并发送队首"))
             }
 
             Button(action: send) {
@@ -553,6 +612,7 @@ struct InputBar: View {
         }()
         session.draftText = ""
         session.draftImages = []
+        session.clearDraftPastes()
         slashPaletteVisible = false
         slashMatches = []
         slashSelectedIndex = 0
@@ -595,9 +655,11 @@ struct InputBar: View {
         }
         guard canSend else { return }
         let images = session.draftImages
-        let text = session.draftText
+        // Expand before clearing draftText — onChange prune would otherwise wipe draftPastes.
+        let text = session.expandedDraftText(from: session.draftText)
         session.draftText = ""
         session.draftImages = []
+        session.clearDraftPastes()
         attachError = nil
         session.sendPrompt(text, images: images)
     }
@@ -946,10 +1008,12 @@ struct InputBar: View {
                         Button {
                             session.setModel(m)
                         } label: {
-                            if m.id == session.model?.id {
-                                Label(m.name, systemImage: "checkmark")
-                            } else {
+                            HStack(spacing: 6) {
+                                ProviderLogo(model: m, size: 12)
                                 Text(m.name)
+                                if m.id == session.model?.id {
+                                    Image(systemName: "checkmark")
+                                }
                             }
                         }
                     }
@@ -957,7 +1021,12 @@ struct InputBar: View {
             }
         } label: {
             HStack(spacing: 4) {
-                Image(systemName: "cpu")
+                if let model = session.model {
+                    ProviderLogo(model: model, size: 12)
+                } else {
+                    Image(systemName: "cpu")
+                        .font(.caption)
+                }
                 Text(session.model?.name ?? "选择模型")
                     .lineLimit(1)
                     .truncationMode(.tail)

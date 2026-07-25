@@ -36,6 +36,7 @@ struct MessageRow: View, Equatable {
     var onFlash: ((String) -> Void)? = nil
     var onSelectAgent: ((String) -> Void)?
     var onCopy: (() -> Void)? = nil
+    var onResend: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
     var onBeginEdit: (() -> Void)? = nil
     var onCancelEdit: (() -> Void)? = nil
@@ -106,13 +107,10 @@ struct MessageRow: View, Equatable {
                     MessageActionSlot(hovered: hovered, alignment: .trailing) {
                         MessageActionBar(
                             alignment: .trailing,
-                            showEdit: MessageActions.showsMutatingActions(
-                                role: item.role,
-                                entryId: item.entryId,
-                                displayText: userDisplayText,
-                                isWorking: isWorking
-                            ) && MessageActions.canEditUserMessage(item),
+                            showEdit: showsMutatingActions,
+                            showResend: showsMutatingActions,
                             onCopy: { onCopy?() },
+                            onResend: { onResend?() },
                             onEdit: { onBeginEdit?() }
                         )
                     }
@@ -142,16 +140,7 @@ struct MessageRow: View, Equatable {
             VStack(alignment: .trailing, spacing: 8) {
                 userImageThumbnails
                 if !userDisplayText.isEmpty {
-                    PathLinkedText(
-                        text: userDisplayText,
-                        base: {
-                            var c = AttributeContainer()
-                            c.foregroundColor = Color.white
-                            return c
-                        }(),
-                        linkColor: .white,
-                        onFlash: onFlash
-                    )
+                    CollapsibleUserBubbleView(text: userDisplayText, onFlash: onFlash)
                 }
             }
             .padding(.horizontal, 14)
@@ -226,6 +215,17 @@ struct MessageRow: View, Equatable {
             if case .text(let t) = block { return t }
             return nil
         }.joined(separator: "\n")
+    }
+
+    /// 撤回修改 / 重发按钮可见性：user 消息、空闲时显示（带图消息同样可撤回 / 重发）。
+    /// `isLocalOnly` 气泡（图片/视频生成提示词）不对应 pi 会话树 entry，无法 fork，故不显示。
+    private var showsMutatingActions: Bool {
+        !item.isLocalOnly && MessageActions.showsMutatingActions(
+            role: item.role,
+            entryId: item.entryId,
+            displayText: userDisplayText,
+            isWorking: isWorking
+        )
     }
 
     /// User bubble text without attachment path footnotes (still sent to the model).
@@ -505,6 +505,130 @@ enum ThinkingTokenEstimate {
 
     static func labelSuffix(for text: String) -> String? {
         labelSuffix(charCount: text.count)
+    }
+}
+
+// MARK: - Long user message (collapsed by default)
+
+/// Preview-first user bubble: short messages render immediately; long ones lazy-load
+/// full text after expand (spinner + fade-in). Expanded long text uses plain `Text`
+/// (not `PathLinkedText`) so path-scan / AttributedString work stays off the hot path.
+struct CollapsibleUserBubbleView: View {
+    let text: String
+    var onFlash: ((String) -> Void)? = nil
+
+    @State private var expanded = false
+    @State private var fullReady = false
+    @State private var fullOpacity: Double = 0
+
+    private var collapses: Bool { UserMessageCollapse.shouldCollapse(text) }
+    private var previewText: String { UserMessageCollapse.preview(text) }
+
+    private var whiteBase: AttributeContainer {
+        var c = AttributeContainer()
+        c.foregroundColor = Color.white
+        return c
+    }
+
+    var body: some View {
+        if collapses {
+            collapsibleBody
+        } else {
+            PathLinkedText(
+                text: text,
+                base: whiteBase,
+                linkColor: .white,
+                onFlash: onFlash
+            )
+        }
+    }
+
+    private var collapsibleBody: some View {
+        VStack(alignment: .trailing, spacing: 6) {
+            // Toggle stays at the top so「收起」is reachable without scrolling a huge body.
+            toggleBar
+
+            if expanded && fullReady {
+                Text(text)
+                    .foregroundStyle(.white)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .opacity(fullOpacity)
+                    .onAppear {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            fullOpacity = 1
+                        }
+                    }
+                // Duplicate control under long bodies so users who scrolled down can collapse.
+                toggleBar
+            } else {
+                Text(previewText)
+                    .foregroundStyle(.white)
+                    .lineLimit(UserMessageCollapse.previewMaxLines)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private var toggleBar: some View {
+        HStack(spacing: 6) {
+            if expanded && !fullReady {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(.white)
+            }
+            Button {
+                if expanded && fullReady {
+                    collapse()
+                } else if !expanded {
+                    beginExpand()
+                }
+            } label: {
+                Text(toggleLabel)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+            .buttonStyle(.plain)
+            .disabled(expanded && !fullReady)
+            .pointingHandCursor(!(expanded && !fullReady))
+            .accessibilityAddTraits(.isButton)
+            .accessibilityValue(accessibilityExpandValue)
+        }
+    }
+
+    private var toggleLabel: String {
+        if expanded && fullReady { return "收起" }
+        if expanded { return "展开中…" }
+        return "展开"
+    }
+
+    private var accessibilityExpandValue: String {
+        if expanded && fullReady { return "已展开" }
+        if expanded { return "展开中" }
+        return "已折叠"
+    }
+
+    private func beginExpand() {
+        expanded = true
+        fullReady = false
+        fullOpacity = 0
+        Task { @MainActor in
+            await Task.yield()
+            guard expanded else { return }
+            fullReady = true
+        }
+    }
+
+    private func collapse() {
+        // Avoid animating a huge Text out — that itself can hitch the main thread.
+        var t = Transaction()
+        t.disablesAnimations = true
+        withTransaction(t) {
+            expanded = false
+            fullReady = false
+            fullOpacity = 0
+        }
     }
 }
 

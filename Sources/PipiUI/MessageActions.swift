@@ -38,14 +38,6 @@ enum MessageActions {
         return true
     }
 
-    /// Text-only resend (v1): messages with image blocks stay copyable but not editable.
-    static func canEditUserMessage(_ item: ChatItem) -> Bool {
-        !item.blocks.contains { block in
-            if case .image = block { return true }
-            return false
-        }
-    }
-
     static func isEditDraftSendable(_ text: String) -> Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }

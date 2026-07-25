@@ -327,7 +327,7 @@ private struct ChatDetailViewBody: View {
                         WaitingPlaceholderView(
                             message: session.mediaBusy
                                 ? (session.mediaStatus ?? "正在处理…")
-                                : "AI 正在思考…"
+                                : (session.isStopping ? "正在停止…" : "AI 正在思考…")
                         )
                         .id("waiting-placeholder")
                         .transcriptFlip()
@@ -347,6 +347,7 @@ private struct ChatDetailViewBody: View {
                                 onFlash: { session.flash($0) },
                                 onSelectAgent: selectAgent,
                                 onCopy: { session.copyItemText(item) },
+                                onResend: { session.resendUserMessage(itemId: item.id) },
                                 onBeginEdit: { session.beginEditingUserMessage(itemId: item.id) },
                                 onCancelEdit: { session.cancelEditingUserMessage() },
                                 onCommitEdit: { session.commitEditingUserMessage(newText: $0) }

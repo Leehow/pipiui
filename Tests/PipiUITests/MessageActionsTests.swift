@@ -112,27 +112,6 @@ final class MessageActionsTests: XCTestCase {
             role: "user", entryId: "e", displayText: "hi", isWorking: false))
     }
 
-    func testCanEditUserMessageRejectsImageBlocks() {
-        let withImage = ChatItem(
-            id: "img",
-            role: "user",
-            blocks: [
-                .text("caption"),
-                .image(ImageBlock(id: "i", data: Data([1]), mimeType: "image/png")),
-            ],
-            entryId: "e1"
-        )
-        let textOnly = ChatItem(
-            id: "txt",
-            role: "user",
-            blocks: [.text("hello")],
-            entryId: "e2"
-        )
-
-        XCTAssertFalse(MessageActions.canEditUserMessage(withImage))
-        XCTAssertTrue(MessageActions.canEditUserMessage(textOnly))
-    }
-
     func testIsEditDraftSendableRejectsBlank() {
         XCTAssertFalse(MessageActions.isEditDraftSendable(""))
         XCTAssertFalse(MessageActions.isEditDraftSendable("   \n  "))

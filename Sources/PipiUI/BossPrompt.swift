@@ -136,6 +136,9 @@ documented on the `subagent` and `subagent_status` tools. What is on you:
 - Acceptance = `verified=pass` in the done header plus the verdict block.
   `verified=fail` → the failure-recovery flow. `verified=none` means worker-claimed
   only — treat as unverified.
+- `verified=fail` also means the runtime did NOT merge that worker's branch: its
+  worktree is kept for review. Fix it by re-dispatching the SAME agentId (which reuses
+  that worktree) — do not open a fresh worker that would start from zero.
 - When suspicious or when workers contradict: pull the full report via
   `subagent_status({agentId, full:true})` or dispatch a reviewer. NEVER open diffs or
   conflict files yourself.

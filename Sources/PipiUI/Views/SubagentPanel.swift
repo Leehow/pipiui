@@ -115,6 +115,7 @@ private struct AgentRow: View {
                     .foregroundStyle(.tertiary)
             }
             statusDot
+            ProviderLogo(modelRef: agent.model, size: 14)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
                     Text(agent.name)
@@ -287,12 +288,23 @@ private struct AgentDetailView: View {
     private var metricsHeader: some View {
         let parts = SubagentMetricsLine.parts(for: agent)
         return HStack(spacing: 8) {
-            Text(parts.title)
-                .font(.caption.weight(.medium))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .textSelection(.enabled)
-                .help(agent.task)
+            ProviderLogo(modelRef: agent.model, size: 14)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(parts.title)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .textSelection(.enabled)
+                    .help(agent.task)
+                if let model = agent.model, !model.isEmpty {
+                    Text(model)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+            }
             Spacer(minLength: 4)
             if let context = parts.context {
                 Text(context)

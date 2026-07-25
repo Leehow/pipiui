@@ -115,6 +115,40 @@ function formatUsageStats(
 	return parts.join(" ");
 }
 
+/** Plain summary for PipiUI bridge (no theme codes) — matches main-agent ToolCallSummary. */
+function summarizeToolArgsForUI(toolName: string, args: Record<string, unknown>): string {
+	const pathOf = () => String(args.file_path || args.path || "…");
+	switch (toolName) {
+		case "edit":
+		case "write":
+		case "read":
+		case "ls":
+			return pathOf();
+		case "bash":
+		case "shell": {
+			const command = String(args.command || "…");
+			return command.length > 120 ? `${command.slice(0, 120)}…` : command;
+		}
+		case "web_search":
+			return String(args.query || "…");
+		case "web_fetch":
+			return String(args.url || "…");
+		case "generate_image": {
+			const prompt = String(args.prompt || "…").trim();
+			return prompt.length > 80 ? `${prompt.slice(0, 80)}…` : prompt || "…";
+		}
+		case "browser": {
+			const action = String(args.action || "…");
+			const detail = String(args.url || args.js || args.mode || "");
+			return detail ? `${action} ${detail}` : action;
+		}
+		default: {
+			const raw = JSON.stringify(args ?? {});
+			return raw.length > 120 ? `${raw.slice(0, 120)}…` : raw;
+		}
+	}
+}
+
 function formatToolCall(
 	toolName: string,
 	args: Record<string, unknown>,
@@ -358,7 +392,10 @@ interface WorktreePlacement {
 const VERDICT_DONE_CAP = 1500;
 const REPORT_DONE_CAP = 6000;
 const ERROR_DONE_CAP = 6000;
-const JOB_RESULT_STORE_CAP = 12000;
+// Store cap for the pull path (`subagent_status full:true`). Must comfortably hold a
+// whole explore/plan report: this is the only place the full text survives, and every
+// done message advertises it as the escape hatch.
+const JOB_RESULT_STORE_CAP = 32000;
 const JOB_RESULT_DISPLAY_CAP = 8000;
 const MAX_JOB_RECORDS = 40;
 
@@ -524,16 +561,13 @@ interface JobRecord {
 
 const jobRegistry = new Map<string, JobRecord>();
 
-function truncateText(text: string, cap: number): string {
-	if (text.length <= cap) return text;
-	return text.slice(-cap);
-}
-
 /**
- * Head-keeping truncation for done-message Results: worker templates put the key
- * sections (summary / Files / Verification / Notes) FIRST, so keep the head and
- * mark the omission in the same bracketed style as truncateParallelOutput.
- * (Shared truncateText stays tail-keeping for callers that rely on it.)
+ * Head-keeping truncation for every report surface (done message, job store, status
+ * display): worker templates put the key sections (summary / Files / Verification /
+ * Notes) FIRST, so keep the head and mark the omission in the same bracketed style as
+ * truncateParallelOutput. All three surfaces must truncate the SAME direction —
+ * mixing head-keep and tail-keep makes the advertised "full report" pull return a
+ * disjoint slice of the report the done message showed.
  */
 function truncateTextHead(text: string, cap: number): string {
 	if (text.length <= cap) return text;
@@ -608,7 +642,8 @@ function jobFinalize(
 	const now = Date.now();
 	if (existing && existing.state !== "running") {
 		// Already terminal: fill missing result/metrics only (notify may race with runSingleAgent end)
-		if (!existing.resultText && fields.resultText) existing.resultText = truncateText(fields.resultText, JOB_RESULT_STORE_CAP);
+		if (!existing.resultText && fields.resultText)
+			existing.resultText = truncateTextHead(fields.resultText, JOB_RESULT_STORE_CAP);
 		if (existing.cost === undefined && fields.cost !== undefined) existing.cost = fields.cost;
 		if (existing.turns === undefined && fields.turns !== undefined) existing.turns = fields.turns;
 		if (!existing.activity && fields.activity) existing.activity = fields.activity;
@@ -627,7 +662,7 @@ function jobFinalize(
 		turns: fields.turns ?? existing?.turns,
 		resultText:
 			fields.resultText !== undefined
-				? truncateText(fields.resultText, JOB_RESULT_STORE_CAP)
+				? truncateTextHead(fields.resultText, JOB_RESULT_STORE_CAP)
 				: existing?.resultText,
 		verify: fields.verify ?? existing?.verify,
 	});
@@ -707,7 +742,8 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 			lines.push(`activity: ${job.activity || "(starting/idle)"}`);
 		} else {
 			const stored = job.resultText || "(no result stored)";
-			const result = opts.full ? stored : truncateText(stored, JOB_RESULT_DISPLAY_CAP);
+			// Head-keep like the done message: the report's structured sections come first.
+			const result = opts.full ? stored : truncateTextHead(stored, JOB_RESULT_DISPLAY_CAP);
 			lines.push("Result:", result);
 		}
 		return lines.join("\n");
@@ -1400,9 +1436,11 @@ async function runSingleAgent(
 						const pipiuiItems: Record<string, unknown>[] = [];
 						for (const part of (msg as any).content ?? []) {
 							if (part?.type === "toolCall") {
-								const argsText = JSON.stringify(part.arguments ?? {});
-								pipiuiActivity = `${part.name} ${argsText.slice(0, 120)}`;
-								pipiuiItems.push({ itemType: "tool", name: part.name, text: argsText.slice(0, 400) });
+								const args = (part.arguments ?? {}) as Record<string, unknown>;
+								const summary = summarizeToolArgsForUI(String(part.name ?? ""), args);
+								pipiuiActivity = `${part.name} ${summary}`;
+								// Send human summary (path/command), not truncated JSON — matches main agent.
+								pipiuiItems.push({ itemType: "tool", name: part.name, text: summary });
 							} else if (part?.type === "text" && String(part.text ?? "").trim()) {
 								pipiuiItems.push({ itemType: "text", text: String(part.text).slice(0, 4000) });
 							} else if (part?.type === "thinking" && String(part.thinking ?? "").trim()) {

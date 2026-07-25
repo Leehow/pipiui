@@ -31,14 +31,19 @@ struct MessageActionBar: View {
 
     var alignment: Alignment
     var showEdit: Bool = false
+    var showResend: Bool = false
     var showBranch: Bool = false
     var onCopy: () -> Void
+    var onResend: (() -> Void)? = nil
     var onEdit: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 1) {
             iconButton("doc.on.doc", help: "复制", action: onCopy)
+            if showResend, let onResend {
+                iconButton("arrow.clockwise", help: "重发（撤回后重新发送）", action: onResend)
+            }
             if showEdit, let onEdit {
                 iconButton("square.and.pencil", help: "撤回修改", action: onEdit)
             }

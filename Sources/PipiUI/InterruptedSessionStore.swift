@@ -2,8 +2,20 @@ import Foundation
 
 /// Persists session jsonl paths that were mid-agent when the app/process died.
 /// Survives abnormal quit so the sidebar can show a red "已中断" badge on reopen.
+///
+/// "In flight" covers both the main agent turn **and** background subagents while
+/// the main agent has settled and is waiting for `[subagent-done]`.
 enum InterruptedSessionStore {
     static let defaultsKey = "pipiui.inFlightSessionPaths"
+
+    /// Whether the session path should stay marked for a post-crash red badge.
+    static func shouldPersistMark(
+        agentTurnActive: Bool,
+        isWorking: Bool,
+        runningSubagents: Int
+    ) -> Bool {
+        agentTurnActive || isWorking || runningSubagents > 0
+    }
 
     static func paths(defaults: UserDefaults = .standard) -> Set<String> {
         Set(defaults.stringArray(forKey: defaultsKey) ?? [])
