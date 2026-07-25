@@ -33,7 +33,7 @@ Scope: 转录渲染层（thinking / toolCall；跨 pi tool-round 消息）
 
 - 历史行走 `planTranscript`；streaming 行仍单条 `plan(..., groupFinished: false)`。
 - 仅当连续可分组块 **≥ 2** 时生成 `finishedGroup`；单条保持 singleton。
-- 可分组：`.thinking`、`.toolCall`。边界：`.text` / `.image` / `.video`；user/system 打断 coalesce。
+- 可分组：`.thinking`、无结果图的 `.toolCall`。边界：`.text` / `.image` / `.video`、以及 `toolRuns[id].images` 非空的 toolCall；user/system 打断 coalesce。
 - 先 `MessageTextBlocks.mergeAdjacent`，再 plan。
 
 ## UI
