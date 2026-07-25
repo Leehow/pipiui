@@ -48,4 +48,36 @@ final class InterruptedSessionStoreTests: XCTestCase {
         InterruptedSessionStore.clear("/a.jsonl", defaults: defaults)
         XCTAssertEqual(InterruptedSessionStore.paths(defaults: defaults), ["/b.jsonl"])
     }
+
+    func testShouldPersistMarkIncludesRunningSubagents() {
+        // Main settled, waiting on background subagent — must keep crash badge.
+        XCTAssertTrue(
+            InterruptedSessionStore.shouldPersistMark(
+                agentTurnActive: false,
+                isWorking: false,
+                runningSubagents: 1
+            )
+        )
+        XCTAssertTrue(
+            InterruptedSessionStore.shouldPersistMark(
+                agentTurnActive: true,
+                isWorking: false,
+                runningSubagents: 0
+            )
+        )
+        XCTAssertTrue(
+            InterruptedSessionStore.shouldPersistMark(
+                agentTurnActive: false,
+                isWorking: true,
+                runningSubagents: 0
+            )
+        )
+        XCTAssertFalse(
+            InterruptedSessionStore.shouldPersistMark(
+                agentTurnActive: false,
+                isWorking: false,
+                runningSubagents: 0
+            )
+        )
+    }
 }

@@ -386,18 +386,25 @@ struct PostMergeVerifyFailure: Equatable, Sendable {
 enum PostMergeVerifyFailedMessage {
     static let prefix = "[post-merge-verify-failed]"
 
-    static func format(agent: SubagentInfo, failure: PostMergeVerifyFailure) -> String {
+    static func format(
+        agent: SubagentInfo, failure: PostMergeVerifyFailure, mainDirty: Bool = false
+    ) -> String {
         let branch = agent.worktreeBranch ?? "?"
         let exitDesc = failure.timedOut ? "\(failure.exitCode) (timeout 120s)" : "\(failure.exitCode)"
         let tail = failure.outputTail.isEmpty ? "(no output)" : failure.outputTail
+        let guidance =
+            mainDirty
+            ? "主仓在合并该分支后未通过这条系统证词验证，但主仓当前有未提交改动——失败可能来自用户自己在写的代码，而不是本 agent 的工作。先判断归属：确属 agent 工作则派 general-purpose fixer 在主仓修复（brief 附上面的命令与输出尾部，verify 填同一条命令）；疑似用户 WIP 则用一句话向用户说明，不要擅自改动用户未提交的代码。不要把这条消息当成用户新需求。"
+            : "主仓在合并该分支后未通过这条系统证词验证；worktree 已合并并移除。请立即派一个 general-purpose fixer 在主仓修复（brief 附上面的命令与输出尾部，verify 填同一条命令），修复后 verified=pass 才可接受；只有取舍真正属于用户时才简短问一次。不要把这条消息当成用户新需求。"
         return [
-            "\(prefix) agentId=\(agent.id) name=\(agent.name) branch=\(branch)",
+            "\(prefix) agentId=\(agent.id) name=\(agent.name) branch=\(branch)"
+                + (mainDirty ? " mainDirty=true" : ""),
             "",
             "verify: $ \(failure.command) → exit \(exitDesc)",
             "output tail:",
             tail,
             "",
-            "主仓在合并该分支后未通过这条系统证词验证；worktree 已合并并移除。请立即派一个 general-purpose fixer 在主仓修复（brief 附上面的命令与输出尾部，verify 填同一条命令），修复后 verified=pass 才可接受；只有取舍真正属于用户时才简短问一次。不要把这条消息当成用户新需求。",
+            guidance,
         ].joined(separator: "\n")
     }
 }
@@ -506,6 +513,24 @@ enum PostMergeVerifyRunner {
     }
 }
 
+/// Serializes every operation that touches the MAIN project worktree: `git merge`,
+/// `git worktree remove`, and post-merge verify runs.
+///
+/// Agents finishing at the same time each entered `mergeWorktree` independently, and
+/// that method releases the main actor at its `await` — so two merges, or a merge and
+/// a verify build, ran concurrently against one working tree. Symptoms: `index.lock`
+/// collisions, and builds reading a tree another merge was mid-rewrite of, which
+/// injected `[post-merge-verify-failed]` for failures that never existed.
+enum MainRepoSerialQueue {
+    private static let queue = DispatchQueue(label: "pipiui.subagentstore.mainrepo")
+
+    static func run<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume(returning: body()) }
+        }
+    }
+}
+
 private final class LockedBool {
     private let lock = NSLock()
     private var value = false
@@ -581,11 +606,19 @@ final class SubagentStore: ObservableObject {
     /// Fired when merge fails (auto or manual); ChatSession injects `[worktree-merge-failed]`.
     var onWorktreeMergeFailed: ((SubagentInfo, String) -> Void)?
     /// Fired when the merged tree fails the agent's attested verify command;
-    /// ChatSession injects `[post-merge-verify-failed]`.
-    var onPostMergeVerifyFailed: ((SubagentInfo, PostMergeVerifyFailure) -> Void)?
-    /// Dedup identical merge-fail injections (agentId + error) within this window.
-    private var lastMergeFailKey: String?
-    private var lastMergeFailAt: Date?
+    /// ChatSession injects `[post-merge-verify-failed]`. Third arg: main tree was dirty
+    /// (the failure may be the user's own WIP rather than the agent's work).
+    var onPostMergeVerifyFailed: ((SubagentInfo, PostMergeVerifyFailure, Bool) -> Void)?
+    /// Fired after start/end when `runningCount` may have changed (main thread).
+    /// ChatSession keeps the interrupted-path badge marked while background subagents run.
+    var onRunningCountMayHaveChanged: (() -> Void)?
+    /// Dedup identical merge/verify-fail injections within 60s, keyed per event.
+    private var recentNotifications: [String: Date] = [:]
+    /// Post-merge verify coalescing: distinct command → latest merged agent to report it.
+    private var pendingVerifyByCommand: [String: SubagentInfo] = [:]
+    private var pendingVerifyFlush: DispatchWorkItem?
+    /// Debounce window: merges of one wave land within a second or two of each other.
+    private static let verifyCoalesceWindow: TimeInterval = 2.0
     private var logCounter = 0
     private var persistURL: URL?
     private var saveScheduled = false
@@ -678,8 +711,10 @@ final class SubagentStore: ObservableObject {
 
     func handle(_ e: J) {
         guard let id = e["agentId"].string, !id.isEmpty else { return }
+        var runningCountMayHaveChanged = false
         switch e["kind"].string ?? "" {
         case "start":
+            runningCountMayHaveChanged = true
             // Same agentId may resume (续作) after end — refresh running state + worktree meta.
             if let i = agents.firstIndex(where: { $0.id == id }) {
                 agents[i].state = .running
@@ -768,6 +803,7 @@ final class SubagentStore: ObservableObject {
             )
         case "end":
             guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
+            runningCountMayHaveChanged = true
             if e["aborted"].bool == true {
                 agents[i].state = .aborted
             } else {
@@ -811,6 +847,9 @@ final class SubagentStore: ObservableObject {
             break
         }
         scheduleSave()
+        if runningCountMayHaveChanged {
+            onRunningCountMayHaveChanged?()
+        }
     }
 
     /// 按树序展开（父节点后紧跟其子孙），用于列表显示。
@@ -868,7 +907,8 @@ final class SubagentStore: ObservableObject {
         let wtURL = URL(fileURLWithPath: pathStr, isDirectory: true)
         let main = mainProjectURL
 
-        let outcome: MergeGitOutcome = await Task.detached(priority: .userInitiated) {
+        // Serialized against every other main-repo operation (other merges, verify runs).
+        let outcome: MergeGitOutcome = await MainRepoSerialQueue.run {
             // Best-effort: commit dirty files in the agent worktree so they are not lost.
             _ = GitRepo.commitAllIfDirty(
                 in: wtURL,
@@ -887,7 +927,7 @@ final class SubagentStore: ObservableObject {
                 return .removeFailed(msg)
             }
             return .ok
-        }.value
+        }
 
         // 回到主线程：git 期间 agent 可能已被清空/移除，写状态前 re-check。
         switch outcome {
@@ -896,7 +936,7 @@ final class SubagentStore: ObservableObject {
             agents[idx].worktreeLifecycle = .merged
             // Keep path/branch strings for history display; buttons hide via lifecycle.
             scheduleSave()
-            runPostMergeVerifyIfNeeded(agent: agents[idx], mainProjectURL: main)
+            schedulePostMergeVerify(agent: agents[idx], mainProjectURL: main)
             return nil
         case .mergeFailed(let msg):
             let full = "合并失败（worktree 未删除）: \(msg)"
@@ -910,7 +950,7 @@ final class SubagentStore: ObservableObject {
             if let idx = agents.firstIndex(where: { $0.id == agentId }) {
                 agents[idx].worktreeLifecycle = .merged
                 scheduleSave()
-                runPostMergeVerifyIfNeeded(agent: agents[idx], mainProjectURL: main)
+                schedulePostMergeVerify(agent: agents[idx], mainProjectURL: main)
             }
             return setWorktreeError("已合并，但删除 worktree 失败: \(msg)")
         }
@@ -998,39 +1038,76 @@ final class SubagentStore: ObservableObject {
 
     /// Post-merge smoke verify: re-run the agent's attested command in the MAIN project
     /// directory. Silent on success; injects `[post-merge-verify-failed]` on failure/timeout.
-    /// Threading: bash 在 Task.detached 后台跑，回调回主线程。
-    private func runPostMergeVerifyIfNeeded(agent: SubagentInfo, mainProjectURL: URL) {
+    ///
+    /// Coalesced by command: a wave of agents sharing one verify command (the common
+    /// case — everyone passes `swift build`) runs it ONCE, after the last merge in the
+    /// wave settles. Without this, N agents meant N cold builds of the same tree, and
+    /// each one raced the others' merges.
+    ///
+    /// The surviving run tests the tree AFTER every merge in the window, which is the
+    /// state that actually matters; the latest merged agent is recorded as the reporter.
+    @MainActor
+    private func schedulePostMergeVerify(agent: SubagentInfo, mainProjectURL: URL) {
         guard let command = agent.verifyCommand?.trimmingCharacters(in: .whitespacesAndNewlines),
               !command.isEmpty else { return }
-        Task.detached(priority: .utility) { [weak self] in
-            let result = PostMergeVerifyRunner.run(command: command, in: mainProjectURL, timeout: 120)
-            guard result.exitCode == 0, !result.timedOut else {
-                await MainActor.run { [weak self] in
-                    self?.notifyPostMergeVerifyFailed(agent: agent, failure: result)
+        pendingVerifyByCommand[command] = agent
+        pendingVerifyFlush?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.flushPendingVerifies(mainProjectURL: mainProjectURL) }
+        }
+        pendingVerifyFlush = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.verifyCoalesceWindow, execute: item)
+    }
+
+    /// Run one verify per distinct command, serialized behind any in-flight merge.
+    @MainActor
+    private func flushPendingVerifies(mainProjectURL: URL) {
+        let batch = pendingVerifyByCommand
+        pendingVerifyByCommand.removeAll()
+        pendingVerifyFlush = nil
+        for (command, agent) in batch {
+            Task { [weak self] in
+                // MainRepoSerialQueue: never let a build read a tree another merge is rewriting.
+                let result = await MainRepoSerialQueue.run {
+                    PostMergeVerifyRunner.run(command: command, in: mainProjectURL, timeout: 120)
                 }
-                return
+                guard result.exitCode != 0 || result.timedOut else {
+                    Log.info("post-merge verify passed: \(command)", category: .session)
+                    return
+                }
+                // A dirty main tree is the user's own WIP — a failure there may not be
+                // the agent's fault, so say so instead of sending the boss after it.
+                let mainDirty = await MainRepoSerialQueue.run {
+                    GitRepo.probe(workTree: mainProjectURL).isDirty
+                }
+                await MainActor.run {
+                    self?.notifyPostMergeVerifyFailed(
+                        agent: agent, failure: result, mainDirty: mainDirty)
+                }
             }
-            Log.info("post-merge verify passed for \(agent.name): \(command)", category: .session)
         }
     }
 
     /// Dedup post-merge verify-fail injections the same way as merge failures.
-    func notifyPostMergeVerifyFailed(agent: SubagentInfo, failure: PostMergeVerifyFailure) {
+    func notifyPostMergeVerifyFailed(
+        agent: SubagentInfo, failure: PostMergeVerifyFailure, mainDirty: Bool = false
+    ) {
         guard shouldNotify(kind: "verify", agentId: agent.id,
                            detail: "\(failure.command)|\(failure.exitCode)|\(failure.timedOut)") else { return }
-        onPostMergeVerifyFailed?(agent, failure)
+        onPostMergeVerifyFailed?(agent, failure, mainDirty)
     }
 
-    /// Shared 60s dedup for merge/verify failure injections (keyed per kind).
+    /// 60s dedup for merge/verify failure injections, keyed per (kind, agentId, detail).
+    /// A dictionary, not a single slot: in a parallel wave, agent B's failure must not
+    /// evict agent A's key and let A's identical failure re-inject.
     private func shouldNotify(kind: String, agentId: String, detail: String) -> Bool {
         let key = "\(kind)|\(agentId)|\(detail)"
         let now = Date()
-        if let lastKey = lastMergeFailKey, lastKey == key,
-           let at = lastMergeFailAt, now.timeIntervalSince(at) < 60 {
+        if let at = recentNotifications[key], now.timeIntervalSince(at) < 60 {
             return false
         }
-        lastMergeFailKey = key
-        lastMergeFailAt = now
+        recentNotifications = recentNotifications.filter { now.timeIntervalSince($0.value) < 60 }
+        recentNotifications[key] = now
         return true
     }
 }

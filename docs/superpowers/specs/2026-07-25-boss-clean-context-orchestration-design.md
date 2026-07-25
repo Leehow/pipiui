@@ -75,6 +75,9 @@ Full report: subagent_status({agentId:"ab12", full:true})
 ```
 
 - **去掉 `Task:` 全文回显**，只留 `Title:`（job 已存 title，`index.ts:419`，零成本）。
+- 上面示意里的 `Files:` 行**实现时未单独解析**：worker 模板已把 `## Files Changed`
+  放在报告开头，留头截断天然会把它带进来。这样避免了对 worker 散文做脆弱的结构解析，
+  效果等价。（2026-07-25 评审确认保持现状。）
 - **cap 按 agent 类型分档**，新增两个常量替换单一 `DONE_RESULT_CAP`：
   - `VERDICT_DONE_CAP = 1500`：general-purpose / reviewer / lead——代码/审查结论
     是产物，报告只是证据；

@@ -229,4 +229,81 @@ final class WorktreeMergeFailedMessageTests: XCTestCase {
         XCTAssertTrue(text.contains("Never forward a raw git error"))
         XCTAssertTrue(text.contains("[post-merge-verify-failed]"))
     }
+
+    /// A `verified=fail` worker is not merged and keeps its worktree, so the fix must
+    /// reuse the same agentId rather than starting a fresh worker from zero.
+    func testBossPromptTellsBossToReuseAgentIdOnVerifyFail() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-boss-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = try XCTUnwrap(BossPrompt.install(into: dir))
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertTrue(text.contains("did NOT merge"))
+        XCTAssertTrue(text.contains("re-dispatching the SAME agentId"))
+    }
+
+    /// Regression: dedup used a single slot, so in a parallel wave agent B's failure
+    /// evicted agent A's key and let A's identical failure inject a second time.
+    func testDedupIsPerAgentNotASingleSlot() {
+        let store = SubagentStore()
+        var calls: [String] = []
+        store.onWorktreeMergeFailed = { agent, _ in calls.append(agent.id) }
+        let a = makeAgent(id: "a1")
+        let b = makeAgent(id: "b1")
+        store.notifyMergeFailed(agent: a, error: "same-error")
+        store.notifyMergeFailed(agent: b, error: "same-error")
+        // A repeats its identical failure: must still be suppressed despite B in between.
+        store.notifyMergeFailed(agent: a, error: "same-error")
+        XCTAssertEqual(calls, ["a1", "b1"])
+    }
+
+    /// Merge and verify failures are different event kinds and must not evict each other.
+    func testMergeAndVerifyDedupAreIndependent() {
+        let store = SubagentStore()
+        var merges: [String] = []
+        var verifies: [String] = []
+        store.onWorktreeMergeFailed = { agent, _ in merges.append(agent.id) }
+        store.onPostMergeVerifyFailed = { agent, _, _ in verifies.append(agent.id) }
+        let agent = makeAgent(id: "x1")
+        let failure = PostMergeVerifyFailure(
+            command: "swift build", exitCode: 1, timedOut: false, outputTail: "boom")
+        store.notifyMergeFailed(agent: agent, error: "e")
+        store.notifyPostMergeVerifyFailed(agent: agent, failure: failure)
+        store.notifyMergeFailed(agent: agent, error: "e")
+        store.notifyPostMergeVerifyFailed(agent: agent, failure: failure)
+        XCTAssertEqual(merges, ["x1"])
+        XCTAssertEqual(verifies, ["x1"])
+    }
+
+    /// A dirty main tree means the failure may be the user's own WIP; the boss must be
+    /// told to establish blame before sending a fixer at uncommitted user code.
+    func testPostMergeVerifyMessageFlagsDirtyMainTree() {
+        let agent = makeAgent(id: "d1")
+        let failure = PostMergeVerifyFailure(
+            command: "swift build", exitCode: 1, timedOut: false, outputTail: "error: boom")
+        let clean = PostMergeVerifyFailedMessage.format(agent: agent, failure: failure)
+        XCTAssertFalse(clean.contains("mainDirty=true"))
+        XCTAssertTrue(clean.contains("请立即派一个 general-purpose fixer"))
+
+        let dirty = PostMergeVerifyFailedMessage.format(
+            agent: agent, failure: failure, mainDirty: true)
+        XCTAssertTrue(dirty.contains("mainDirty=true"))
+        XCTAssertTrue(dirty.contains("未提交改动"))
+        XCTAssertTrue(dirty.contains("不要擅自改动用户未提交的代码"))
+    }
+
+    private func makeAgent(id: String) -> SubagentInfo {
+        SubagentInfo(
+            id: id,
+            parentId: nil,
+            name: "general-purpose",
+            task: "t",
+            depth: 1,
+            model: nil,
+            state: .ok,
+            worktreePath: "/tmp/wt-\(id)",
+            worktreeBranch: "pipiui/\(id)",
+            worktreeLifecycle: .pendingReview
+        )
+    }
 }

@@ -86,11 +86,66 @@ enum ToolCallSummary {
         if let data = trimmed.data(using: .utf8), let j = J.parse(data), j.dict != nil {
             return summarize(name: name, args: j)
         }
+        // Subagent bridge truncates args (edit/write → invalid JSON). Scrape known fields.
+        if let scraped = scrapeSummary(name: name, from: trimmed) {
+            return (scraped, 0)
+        }
         // Already a plain summary, or truncated non-JSON — never echo braces-heavy dumps as-is if huge.
         if trimmed.contains("{"), trimmed.count > 120 {
             return (String(trimmed.prefix(120)) + "…", 0)
         }
         return (trimmed, 0)
+    }
+
+    /// Best-effort field scrape from truncated / invalid tool-arg JSON.
+    private static func scrapeSummary(name: String, from text: String) -> String? {
+        switch name {
+        case "edit", "write", "read", "ls":
+            return scrapeJSONString(key: "path", from: text)
+                ?? scrapeJSONString(key: "file_path", from: text)
+        case "bash", "shell":
+            guard let cmd = scrapeJSONString(key: "command", from: text) else { return nil }
+            return cmd.count > 120 ? String(cmd.prefix(120)) + "…" : cmd
+        case "web_search":
+            return scrapeJSONString(key: "query", from: text)
+        case "web_fetch":
+            return scrapeJSONString(key: "url", from: text)
+        case "generate_image":
+            guard let prompt = scrapeJSONString(key: "prompt", from: text) else { return nil }
+            return prompt.count > 80 ? String(prompt.prefix(80)) + "…" : prompt
+        default:
+            return scrapeJSONString(key: "path", from: text)
+                ?? scrapeJSONString(key: "file_path", from: text)
+                ?? scrapeJSONString(key: "command", from: text)
+        }
+    }
+
+    /// Extract `"key":"…"` value; tolerates truncated trailing content / missing close quote.
+    private static func scrapeJSONString(key: String, from text: String) -> String? {
+        let needle = "\"\(key)\""
+        guard let keyRange = text.range(of: needle) else { return nil }
+        var i = keyRange.upperBound
+        while i < text.endIndex, text[i].isWhitespace { i = text.index(after: i) }
+        guard i < text.endIndex, text[i] == ":" else { return nil }
+        i = text.index(after: i)
+        while i < text.endIndex, text[i].isWhitespace { i = text.index(after: i) }
+        guard i < text.endIndex, text[i] == "\"" else { return nil }
+        i = text.index(after: i)
+        var result = ""
+        while i < text.endIndex {
+            let c = text[i]
+            if c == "\\" {
+                let next = text.index(after: i)
+                guard next < text.endIndex else { break }
+                result.append(text[next])
+                i = text.index(after: next)
+                continue
+            }
+            if c == "\"" { break }
+            result.append(c)
+            i = text.index(after: i)
+        }
+        return result.isEmpty ? nil : result
     }
 
     /// Subagent `activity` is often `toolName {json…}`. Return human summary (no JSON dump).
@@ -272,6 +327,9 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Monotonic counter bumped when toolRuns actually changes (UI watches this instead of scanning outputs).
     @Published private(set) var toolOutputVersion: UInt64 = 0
     @Published var isStreaming = false
+    /// True between the user clicking Stop and the turn actually settling.
+    /// Drives optimistic 'stopping…' UI so one click is visibly acknowledged.
+    @Published var isStopping = false
     @Published var model: ModelInfo?
     @Published var availableModels: [ModelInfo] = []
     @Published var thinkingLevel = "off"
@@ -316,6 +374,9 @@ final class ChatSession: ObservableObject, Identifiable {
     /// In-memory composer draft (per session; not persisted).
     @Published var draftText: String = ""
     @Published var draftImages: [DraftImage] = []
+    /// Large ⌘V bodies collapsed to `[paste #N …]` markers in `draftText` (pi TUI–style).
+    private(set) var draftPastes: [Int: String] = [:]
+    private var pasteCounter = 0
     /// Local transcript item currently shown in the inline user-message editor.
     @Published var editingItemId: String?
     /// + menu mode: chat vs Grok Imagine image/video generation.
@@ -334,6 +395,7 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Opened with `--session` path (historical disk resume).
     private let resumedFromDisk: Bool
     /// True between `agent_start` and `agent_settled` (for in-flight persistence).
+    /// Background subagents after settle are tracked separately via `subagents.runningCount`.
     private var agentTurnActive = false
     /// Notifies AppStore to persist / clear interrupted-path badges.
     var onInFlightChange: ((String, Bool) -> Void)?
@@ -470,12 +532,17 @@ final class ChatSession: ObservableObject, Identifiable {
                 self.sendPrompt(text)
             }
         }
-        subagents.onPostMergeVerifyFailed = { [weak self] agent, failure in
+        subagents.onPostMergeVerifyFailed = { [weak self] agent, failure, mainDirty in
             guard let self else { return }
-            let text = PostMergeVerifyFailedMessage.format(agent: agent, failure: failure)
+            let text = PostMergeVerifyFailedMessage.format(
+                agent: agent, failure: failure, mainDirty: mainDirty)
             DispatchQueue.main.async {
                 self.sendPrompt(text)
             }
+        }
+        // Keep crash badge while background subagents run after main agent_settled.
+        subagents.onRunningCountMayHaveChanged = { [weak self] in
+            self?.syncInFlightMark()
         }
         if let sessionPath, InterruptedSessionStore.contains(sessionPath) {
             hasUnseenInterruption = true
@@ -544,9 +611,15 @@ final class ChatSession: ObservableObject, Identifiable {
         proc.onEvent = { [weak self] event in self?.handleEvent(event) }
         proc.onExit = { [weak self] code, stderr in
             guard let self else { return }
-            let cutOff = self.agentTurnActive || self.isWorking
+            // Main turn OR background subagents waiting → red "已中断" after unexpected quit.
+            let cutOff = InterruptedSessionStore.shouldPersistMark(
+                agentTurnActive: self.agentTurnActive,
+                isWorking: self.isWorking,
+                runningSubagents: self.subagents.runningCount
+            )
             self.processAlive = false
             self.isStreaming = false
+            self.isStopping = false
             self.isSendingFromQueue = false
             // Exit before the first transcript arrives must not leave the spinner up.
             self.isInitializing = false
@@ -658,6 +731,9 @@ final class ChatSession: ObservableObject, Identifiable {
         refreshThinkingLevels()
         beginInitialMessagesLoad()
         refreshStats()
+        // pi 的 get_session_stats 只回填 cost/contextUsage，不返回累计 cacheRead/cacheWrite，
+        // 需从本地 TokenLedger 按 session id 流式求和回填（off-main）。
+        rehydrateSessionCacheUsage()
         proc?.request(["type": "get_commands"]) { [weak self] resp in
             guard let self else { return }
             // Failure/empty → leave availableCommands empty; builtins still work. No flash.
@@ -817,6 +893,7 @@ final class ChatSession: ObservableObject, Identifiable {
         // 避免把已开始的流式状态盖回 false（#14）。
         if !isWorking, let remoteStreaming = data["isStreaming"].bool {
             isStreaming = remoteStreaming
+            if !remoteStreaming { isStopping = false }
         }
         // Prefer local non-placeholder over empty/stale get_state while optimistic auto-title is in flight.
         if let incoming = data["sessionName"].string {
@@ -844,9 +921,7 @@ final class ChatSession: ObservableObject, Identifiable {
         if let file = data["sessionFile"].string, file != sessionFile {
             sessionFile = file
             onSessionMetaChanged?()
-            if agentTurnActive {
-                persistInFlightMark()
-            }
+            syncInFlightMark()
         }
         // 会话文件确定后挂载 subagent 树持久化（恢复历史 + 后续落盘）
         if let file = sessionFile {
@@ -865,6 +940,22 @@ final class ChatSession: ObservableObject, Identifiable {
         proc?.request(["type": "get_session_stats"]) { [weak self] resp in
             guard let self, resp["success"].bool == true else { return }
             self.applySessionStats(resp["data"])
+        }
+    }
+
+    /// Resume 时从已落盘的 TokenLedger 按 session id 回填累计 cacheRead/cacheWrite。
+    /// 在 boot 序列里调用一次。startup 阶段用户不可能已发完一轮并收到 message_end，
+    /// 故 SET 不会与 `recordTurnUsage` 的 `+=` 竞争；即使极端竞态，误差仅一次 turn 且可接受——
+    /// 保持简单，不做加法式合并以免与已 append 进 ledger 的本轮重复计数。
+    private func rehydrateSessionCacheUsage() {
+        let sid = id
+        DispatchQueue.global(qos: .utility).async {
+            let totals = TokenUsageStats.sessionCacheTotals(for: sid)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.sessionCacheRead = totals.cacheRead
+                self.sessionCacheWrite = totals.cacheWrite
+            }
         }
     }
 
@@ -945,15 +1036,19 @@ final class ChatSession: ObservableObject, Identifiable {
         switch type {
         case "agent_start":
             isStreaming = true
+            // Defensive: a stale stop flag must never bleed into the next turn.
+            isStopping = false
             isSendingFromQueue = false
             lastError = nil
             agentTurnActive = true
-            persistInFlightMark()
+            syncInFlightMark()
         case "agent_settled":
             isStreaming = false
+            isStopping = false
             streamingItem = nil
             agentTurnActive = false
-            clearInFlightMark()
+            // Do not clear while background subagents are still running.
+            syncInFlightMark()
             hasUnseenInterruption = false
             refreshStats()
             syncEntryIds()
@@ -1205,8 +1300,13 @@ final class ChatSession: ObservableObject, Identifiable {
                 return
             }
             if let item = Self.convert(message: message, id: nextItemId(), allowDiskRead: false) {
-                transcript.append(item)
-                scheduleImageBackfill(itemId: item.id)
+                if item.blocks.isEmpty, message["stopReason"].string == "error" {
+                    // API returned an error with no content — surface it instead of a blank bubble.
+                    appendSystem("⚠️ 模型请求失败（stopReason=error），请检查扩展冲突或 API 状态。")
+                } else {
+                    transcript.append(item)
+                    scheduleImageBackfill(itemId: item.id)
+                }
             }
         case "toolResult":
             if let tid = message["toolCallId"].string {
@@ -1603,8 +1703,7 @@ final class ChatSession: ObservableObject, Identifiable {
 
     func beginEditingUserMessage(itemId: String) {
         guard !isWorking else { return }
-        guard let item = transcript.first(where: { $0.id == itemId }),
-              MessageActions.canEditUserMessage(item) else { return }
+        guard let item = transcript.first(where: { $0.id == itemId }) else { return }
         if item.entryId != nil {
             editingItemId = itemId
             return
@@ -1787,10 +1886,6 @@ final class ChatSession: ObservableObject, Identifiable {
             flash("无法撤回：消息尚未就绪")
             return
         }
-        guard MessageActions.canEditUserMessage(item) else {
-            editingItemId = nil
-            return
-        }
         let original = MessageActions.copyableText(from: item)
         if MessageActions.shouldNoOpEdit(
             originalText: original,
@@ -1810,20 +1905,107 @@ final class ChatSession: ObservableObject, Identifiable {
             flash("请等待当前任务结束")
             return
         }
-        guard let proc else {
+        guard proc != nil else {
             flash("pi 未运行，无法编辑消息")
             editingItemId = nil
             return
         }
+        let images = draftImages(from: item)
 
         editingItemId = nil
+        forkAndResendPrompt(
+            entryId: entryId,
+            text: trimmed,
+            images: images,
+            previousPath: previousPath,
+            actionNoun: "编辑"
+        )
+    }
+
+    /// 重发：撤回后以原文原图重新发送（不弹编辑器）。
+    func resendUserMessage(itemId: String) {
+        guard !isWorking else {
+            flash("请等待当前任务结束")
+            return
+        }
+        guard let item = transcript.first(where: { $0.id == itemId }) else { return }
+        guard item.entryId != nil else {
+            // Ids stamp asynchronously after settle; sync once so 重发 is usable immediately.
+            syncEntryIds { [weak self] in
+                guard let self else { return }
+                self.resendUserMessageNow(itemId: itemId)
+            }
+            return
+        }
+        resendUserMessageNow(itemId: itemId)
+    }
+
+    /// 重发核心：用刷新后的 item 重读 entryId / 文本 / 图片，走共享 fork 流程。
+    private func resendUserMessageNow(itemId: String) {
+        guard !isWorking else {
+            flash("请等待当前任务结束")
+            return
+        }
+        guard let item = transcript.first(where: { $0.id == itemId }),
+              let entryId = item.entryId else {
+            flash("无法重发：消息尚未就绪")
+            return
+        }
+        let text = MessageActions.copyableText(from: item)
+        guard MessageActions.isEditDraftSendable(text) else {
+            flash("消息为空，无法重发")
+            return
+        }
+        guard let previousPath = sessionFile, !previousPath.isEmpty else {
+            flash("会话尚未保存，稍后再试")
+            return
+        }
+        guard proc != nil else {
+            flash("pi 未运行，无法重发消息")
+            return
+        }
+        forkAndResendPrompt(
+            entryId: entryId,
+            text: text,
+            images: draftImages(from: item),
+            previousPath: previousPath,
+            actionNoun: "重发"
+        )
+    }
+
+    /// 把消息里的 image block 还原成 DraftImage（撤回修改 / 重发时原样携带图片）。
+    private func draftImages(from item: ChatItem) -> [DraftImage] {
+        item.blocks.compactMap { block -> DraftImage? in
+            guard case .image(let img) = block else { return nil }
+            var data = img.data
+            if data.isEmpty, let path = img.path, !path.isEmpty {
+                data = ImageFileDataCache.data(forPath: path) ?? Data()
+            }
+            guard !data.isEmpty, let preview = NSImage(data: data) else { return nil }
+            return DraftImage(data: data, mimeType: img.mimeType, preview: preview)
+        }
+    }
+
+    /// 撤回修改 / 重发共享的核心流程：fork 到 entryId → get_state → 重绑会话文件
+    /// → 重载 transcript → prepareMessage + sendPromptNow。失败时恢复原会话并 flash。
+    private func forkAndResendPrompt(
+        entryId: String,
+        text: String,
+        images: [DraftImage],
+        previousPath: String,
+        actionNoun: String
+    ) {
+        guard let proc else {
+            flash("pi 未运行，无法\(actionNoun)消息")
+            return
+        }
         isSendingFromQueue = true
         proc.request(["type": "fork", "entryId": entryId]) { [weak self] response in
             guard let self else { return }
             guard response["success"].bool == true,
                   response["data"]["cancelled"].bool != true else {
                 self.isSendingFromQueue = false
-                self.flash(response["error"].string ?? "编辑失败")
+                self.flash(response["error"].string ?? "\(actionNoun)失败")
                 return
             }
             self.proc?.request(["type": "get_state"]) { [weak self] stateResponse in
@@ -1831,7 +2013,8 @@ final class ChatSession: ObservableObject, Identifiable {
                 guard stateResponse["success"].bool != false else {
                     self.restorePreviousSessionAfterFailedEdit(
                         previousPath: previousPath,
-                        reason: stateResponse["error"].string ?? "无法读取编辑后的会话"
+                        reason: stateResponse["error"].string ?? "无法读取\(actionNoun)后的会话",
+                        actionNoun: actionNoun
                     )
                     return
                 }
@@ -1841,7 +2024,8 @@ final class ChatSession: ObservableObject, Identifiable {
                       newPath != previousPath else {
                     self.restorePreviousSessionAfterFailedEdit(
                         previousPath: previousPath,
-                        reason: "编辑分叉后未得到新会话文件"
+                        reason: "\(actionNoun)分叉后未得到新会话文件",
+                        actionNoun: actionNoun
                     )
                     return
                 }
@@ -1850,10 +2034,12 @@ final class ChatSession: ObservableObject, Identifiable {
                     if let reloadError {
                         self.restorePreviousSessionAfterFailedEdit(
                             previousPath: previousPath,
-                            reason: reloadError
+                            reason: reloadError,
+                            actionNoun: actionNoun
                         )
                     } else {
-                        self.sendPromptNow(message: trimmed, images: [])
+                        let prepared = self.prepareMessage(text: text, images: images)
+                        self.sendPromptNow(message: prepared.message, images: prepared.images)
                     }
                 }
             }
@@ -1884,10 +2070,14 @@ final class ChatSession: ObservableObject, Identifiable {
 
     /// A successful fork changes the process before follow-up reads complete. If those reads
     /// fail, return the process and AppStore binding to the original file before reporting.
-    private func restorePreviousSessionAfterFailedEdit(previousPath: String, reason: String) {
+    private func restorePreviousSessionAfterFailedEdit(
+        previousPath: String,
+        reason: String,
+        actionNoun: String = "编辑"
+    ) {
         guard let proc else {
             isSendingFromQueue = false
-            flash("编辑未发送：\(reason)；pi 未运行，无法恢复原会话")
+            flash("\(actionNoun)未发送：\(reason)；pi 未运行，无法恢复原会话")
             return
         }
         proc.request(["type": "switch_session", "sessionPath": previousPath]) { [weak self] response in
@@ -1900,7 +2090,8 @@ final class ChatSession: ObservableObject, Identifiable {
             self.refreshAfterFailedEdit(
                 reason: reason,
                 switchedBack: switchedBack,
-                switchError: response["error"].string
+                switchError: response["error"].string,
+                actionNoun: actionNoun
             )
         }
     }
@@ -1908,7 +2099,8 @@ final class ChatSession: ObservableObject, Identifiable {
     private func refreshAfterFailedEdit(
         reason: String,
         switchedBack: Bool,
-        switchError: String?
+        switchError: String?,
+        actionNoun: String = "编辑"
     ) {
         proc?.request(["type": "get_state"]) { [weak self] stateResponse in
             guard let self else { return }
@@ -1921,9 +2113,9 @@ final class ChatSession: ObservableObject, Identifiable {
                 self.isSendingFromQueue = false
                 if switchedBack {
                     if let reloadError = reloadResult {
-                        self.flash("编辑未发送：\(reason)；已恢复原会话，但刷新失败（\(reloadError)）")
+                        self.flash("\(actionNoun)未发送：\(reason)；已恢复原会话，但刷新失败（\(reloadError)）")
                     } else {
-                        self.flash("编辑未发送：\(reason)；已恢复原会话")
+                        self.flash("\(actionNoun)未发送：\(reason)；已恢复原会话")
                     }
                 } else {
                     let detail = switchError ?? "未知错误"
@@ -1935,7 +2127,7 @@ final class ChatSession: ObservableObject, Identifiable {
                     } else {
                         location = "当前会话已重新绑定并载入"
                     }
-                    self.flash("编辑未发送：\(reason)；恢复原会话失败（\(detail)），\(location)")
+                    self.flash("\(actionNoun)未发送：\(reason)；恢复原会话失败（\(detail)），\(location)")
                 }
             }
         }
@@ -1946,6 +2138,7 @@ final class ChatSession: ObservableObject, Identifiable {
     ) {
         streamingItem = nil
         isStreaming = false
+        isStopping = false
         editingItemId = nil
         pendingStreamMessage = nil
         pendingToolRuns.removeAll(keepingCapacity: false)
@@ -1981,8 +2174,14 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     func sendPrompt(_ text: String, images: [DraftImage] = []) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let expanded = expandedDraftText(from: text)
+        // Bodies are now in `expanded`; drop map so markers cannot be re-expanded later.
+        clearDraftPastes()
+        let trimmed = expanded.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !images.isEmpty else { return }
+
+        // Defensive: a stale stop flag must never bleed into the next turn.
+        isStopping = false
 
         // Media generation modes bypass pi RPC and hit local relays (Grok Build Imagine path).
         if composerMode == .generateImage || composerMode == .generateVideo {
@@ -2096,6 +2295,29 @@ final class ChatSession: ObservableObject, Identifiable {
         ))
     }
 
+    /// Store a large paste body and return the short marker to insert into `draftText`.
+    @discardableResult
+    func registerLargePaste(_ text: String) -> String {
+        pasteCounter += 1
+        let id = pasteCounter
+        draftPastes[id] = text
+        let counts = DraftPasteCollapse.lineAndCharCount(of: text)
+        return DraftPasteCollapse.makeMarker(id: id, lineCount: counts.lines, charCount: counts.chars)
+    }
+
+    func expandedDraftText(from text: String) -> String {
+        DraftPasteCollapse.expandPasteMarkers(text: text, pastes: draftPastes)
+    }
+
+    func clearDraftPastes() {
+        draftPastes = [:]
+        pasteCounter = 0
+    }
+
+    func pruneOrphanDraftPastes() {
+        draftPastes = DraftPasteCollapse.pruneOrphanPastes(text: draftText, pastes: draftPastes)
+    }
+
     /// Dual delivery: multimodal RPC images + real on-disk paths.
     /// Coding models often try `read .../attachments/...` first; saving under .pi/attachments fixes it.
     /// T12: paths are precomputed synchronously (no disk I/O); bytes are written off-main.
@@ -2128,6 +2350,8 @@ final class ChatSession: ObservableObject, Identifiable {
 
         // Cover first-send / drain gap before agent_start so sidebar shows spinner, not green.
         isSendingFromQueue = true
+        // Defensive: a stale stop flag must never bleed into the next turn.
+        isStopping = false
         var cmd: [String: Any] = ["type": "prompt", "message": message]
         if !images.isEmpty {
             cmd["images"] = ImageAttachment.rpcPayload(from: images)
@@ -2194,6 +2418,8 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     func abort() {
+        // Optimistic: acknowledge the click immediately. Cleared on settle / exit / new turn.
+        isStopping = true
         queue.noteAbort()
         publishQueue()
         cancelSideChannelTitle()
@@ -2323,6 +2549,19 @@ final class ChatSession: ObservableObject, Identifiable {
         if hasUnseenCompletion { hasUnseenCompletion = false }
         if hasUnseenInterruption {
             hasUnseenInterruption = false
+            clearInFlightMark()
+        }
+    }
+
+    /// Mark / clear interrupted-path badge for main turn **or** running background subagents.
+    private func syncInFlightMark() {
+        if InterruptedSessionStore.shouldPersistMark(
+            agentTurnActive: agentTurnActive,
+            isWorking: isWorking,
+            runningSubagents: subagents.runningCount
+        ) {
+            persistInFlightMark()
+        } else {
             clearInFlightMark()
         }
     }

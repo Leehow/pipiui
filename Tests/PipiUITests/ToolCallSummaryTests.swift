@@ -66,6 +66,26 @@ final class ToolCallSummaryTests: XCTestCase {
         XCTAssertFalse(r.summary.contains("{"))
     }
 
+    /// Subagent log truncates edit args at 400 chars — JSON becomes invalid; still show path.
+    func testSummarizeTruncatedEditJSONShowsPath() {
+        let truncated = #"{"path":"Sources/PipiUI/Logging/TokenUsageStats.swift","edits":[{"oldText":"func foo() {\n    return 1\n}\n","newText":"func foo() {\n    return 2\n}\n"#
+        let r = ToolCallSummary.summarize(name: "edit", argsJSON: truncated)
+        XCTAssertEqual(r.summary, "Sources/PipiUI/Logging/TokenUsageStats.swift")
+        XCTAssertFalse(r.summary.contains("{"))
+    }
+
+    func testSummarizeTruncatedBashJSONShowsCommand() {
+        let truncated = #"{"command":"swift test 2>&1 | tee /tmp/pipiui_test.log | grep -i fail | head -40; echo \"---TAIL"#
+        let r = ToolCallSummary.summarize(name: "bash", argsJSON: truncated)
+        XCTAssertTrue(r.summary.hasPrefix("swift test 2>&1"))
+        XCTAssertFalse(r.summary.hasPrefix("{"))
+    }
+
+    func testSummarizePlainPathPassthrough() {
+        let r = ToolCallSummary.summarize(name: "edit", argsJSON: "Sources/PipiUI/App.swift")
+        XCTAssertEqual(r.summary, "Sources/PipiUI/App.swift")
+    }
+
     func testSummarizeActivityStripsJSON() {
         let s = ToolCallSummary.summarizeActivity(
             #"read {"path":"/Users/haoli/leehow/code/pipiui/Sources/PipiUI/Logging/Log.swift"}"#
@@ -77,6 +97,14 @@ final class ToolCallSummaryTests: XCTestCase {
     func testSummarizeActivityBashCommand() {
         let s = ToolCallSummary.summarizeActivity(#"bash {"command":"ls -la"}"#)
         XCTAssertEqual(s, "ls -la")
+    }
+
+    func testSummarizeActivityTruncatedEdit() {
+        let s = ToolCallSummary.summarizeActivity(
+            #"edit {"path":"Sources/PipiUI/Foo.swift","edits":[{"oldText":"a","newText":"bb"#
+        )
+        XCTAssertEqual(s, "Sources/PipiUI/Foo.swift")
+        XCTAssertFalse(s.contains("{"))
     }
 
     func testSummarizeActivityEmpty() {
