@@ -646,6 +646,9 @@ final class ChatSession: ObservableObject, Identifiable {
             }
             extraEnv["PIPIUI_BRIDGE_PORT"] = String(bridgePort)
             extraEnv["PIPIUI_SESSION_KEY"] = bridgeRoutingKey
+            // Authoritative session root inherited by nested processes. Management
+            // roles such as secretary must never mistake a worker worktree for main.
+            extraEnv["PIPIUI_MAIN_CWD"] = projectURL.path
             // 补丁版 subagent 从 App 自有目录读 agent 定义，不碰 ~/.pi/agent/agents
             if let agentsDir { extraEnv["PIPIUI_AGENTS_DIR"] = agentsDir }
             // Subagent 模型设置（热读 JSON）+ 主会话模型（跟随主 Agent = 底栏/composer）

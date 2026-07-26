@@ -109,6 +109,58 @@ package enum GitRepoError: Error, LocalizedError, Equatable, Sendable {
     }
 }
 
+/// Deterministic closeout classification for one persisted agent branch.
+///
+/// The closeout secretary may report these states, but only `.eligible` is safe for
+/// automatic deletion. Everything else is deliberately retained for review.
+package enum AgentBranchCleanupDisposition: Equatable, Sendable {
+    /// The branch ref is already gone; stale persisted path/branch strings may remain as history.
+    case alreadyAbsent
+    /// Internal, detached from all registered worktrees, and merged into integration HEAD.
+    case eligible
+    /// Branch is outside the runtime-owned `pipiui/agent-*` namespace.
+    case retainedNonInternal
+    /// A real registered worktree still owns the branch. Dirty is captured explicitly.
+    case retainedRegisteredWorktree(path: String, dirty: Bool)
+    /// Branch has commits that are not ancestors of the integration ref.
+    case retainedUniqueCommits
+    /// Git state could not be established safely.
+    case blocked(String)
+}
+
+/// Reconciles persisted subagent metadata with Git's current authoritative state.
+package struct AgentBranchReconciliation: Equatable, Sendable {
+    package let branch: String
+    package let isInternal: Bool
+    package let branchExists: Bool
+    package let registeredWorktreePath: String?
+    package let registeredWorktreeDirty: Bool
+    package let isAncestorOfIntegrationHead: Bool?
+    package let persistedWorktreePath: String?
+    /// True when history points at a path that Git no longer registers for this branch.
+    package let persistedWorktreeIsStale: Bool
+    package let disposition: AgentBranchCleanupDisposition
+}
+
+/// Result of the only automatic branch-deletion path used by agent closeout.
+package enum AgentBranchCleanupResult: Equatable, Sendable {
+    case deleted(AgentBranchReconciliation)
+    case alreadyAbsent(AgentBranchReconciliation)
+    case retained(AgentBranchReconciliation)
+    case failed(AgentBranchReconciliation, String)
+
+    package var warning: String? {
+        switch self {
+        case .deleted, .alreadyAbsent:
+            return nil
+        case .retained(let state):
+            return GitRepo.cleanupWarning(for: state)
+        case .failed(_, let message):
+            return message
+        }
+    }
+}
+
 /// Git CLI helpers. Pure Foundation — no libgit2.
 package enum GitRepo {
 
@@ -478,7 +530,7 @@ package enum GitRepo {
         guard !dest.isEmpty else {
             throw GitRepoError.commandFailed("worktree 路径不能为空")
         }
-        guard !dest.hasPrefix("-") else {
+        guard !dest.hasPrefix("-"), !path.lastPathComponent.hasPrefix("-") else {
             throw GitRepoError.commandFailed("非法 worktree 路径")
         }
         _ = try run(
@@ -504,7 +556,7 @@ package enum GitRepo {
         guard !dest.isEmpty else {
             throw GitRepoError.commandFailed("\(label)不能为空")
         }
-        guard !dest.hasPrefix("-") else {
+        guard !dest.hasPrefix("-"), !path.lastPathComponent.hasPrefix("-") else {
             throw GitRepoError.commandFailed("非法\(label)")
         }
         return dest
@@ -574,6 +626,230 @@ package enum GitRepo {
         return parseWorktreeListPorcelain(out)
     }
 
+    /// Reconcile one persisted agent branch against the real Git worktree/ref graph.
+    ///
+    /// Safety gate for automatic cleanup:
+    /// `pipiui/agent-*` + no registered worktree + ancestor of integration HEAD.
+    package static func reconcileAgentBranch(
+        _ branch: String,
+        persistedWorktreePath: String? = nil,
+        integrationRef: String = "HEAD",
+        in workTree: URL
+    ) -> AgentBranchReconciliation {
+        let trimmedBranch = branch.trimmingCharacters(in: .whitespacesAndNewlines)
+        let persisted = persistedWorktreePath?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let persistedPath = persisted.flatMap { value -> String? in
+            guard !value.isEmpty else { return nil }
+            return URL(fileURLWithPath: value, isDirectory: true)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .path
+        }
+        let isInternal = trimmedBranch.hasPrefix("pipiui/agent-")
+
+        guard !trimmedBranch.isEmpty, !trimmedBranch.hasPrefix("-") else {
+            return AgentBranchReconciliation(
+                branch: trimmedBranch,
+                isInternal: false,
+                branchExists: false,
+                registeredWorktreePath: nil,
+                registeredWorktreeDirty: false,
+                isAncestorOfIntegrationHead: nil,
+                persistedWorktreePath: persistedPath,
+                persistedWorktreeIsStale: persistedPath != nil,
+                disposition: .blocked("非法 agent 分支名")
+            )
+        }
+
+        guard probe(workTree: workTree).isRepo else {
+            return AgentBranchReconciliation(
+                branch: trimmedBranch,
+                isInternal: isInternal,
+                branchExists: false,
+                registeredWorktreePath: nil,
+                registeredWorktreeDirty: false,
+                isAncestorOfIntegrationHead: nil,
+                persistedWorktreePath: persistedPath,
+                persistedWorktreeIsStale: persistedPath != nil,
+                disposition: .blocked("无法确认 Git 仓库状态")
+            )
+        }
+
+        let fullRef = "refs/heads/\(trimmedBranch)"
+        let branchExists = (try? run(
+            gitArgs: ["show-ref", "--verify", "--quiet", fullRef],
+            in: workTree
+        )) != nil
+        let rows: [(path: String, branch: String?)]
+        do {
+            let output = try run(
+                gitArgs: ["worktree", "list", "--porcelain"],
+                in: workTree
+            )
+            rows = parseWorktreeListPorcelain(output)
+        } catch {
+            let detail = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            return AgentBranchReconciliation(
+                branch: trimmedBranch,
+                isInternal: isInternal,
+                branchExists: branchExists,
+                registeredWorktreePath: nil,
+                registeredWorktreeDirty: false,
+                isAncestorOfIntegrationHead: nil,
+                persistedWorktreePath: persistedPath,
+                persistedWorktreeIsStale: persistedPath != nil,
+                disposition: isInternal
+                    ? .blocked("无法读取 worktree 注册表: \(detail)")
+                    : .retainedNonInternal
+            )
+        }
+        let registeredPath = rows.first(where: { $0.branch == trimmedBranch }).map {
+            URL(fileURLWithPath: $0.path, isDirectory: true)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .path
+        }
+        let registeredDirty: Bool
+        if let registeredPath {
+            registeredDirty = probe(
+                workTree: URL(fileURLWithPath: registeredPath, isDirectory: true)
+            ).isDirty
+        } else {
+            registeredDirty = false
+        }
+        let persistedIsStale = persistedPath != nil && persistedPath != registeredPath
+
+        if !isInternal {
+            return AgentBranchReconciliation(
+                branch: trimmedBranch,
+                isInternal: false,
+                branchExists: branchExists,
+                registeredWorktreePath: registeredPath,
+                registeredWorktreeDirty: registeredDirty,
+                isAncestorOfIntegrationHead: nil,
+                persistedWorktreePath: persistedPath,
+                persistedWorktreeIsStale: persistedIsStale,
+                disposition: .retainedNonInternal
+            )
+        }
+
+        if let registeredPath {
+            return AgentBranchReconciliation(
+                branch: trimmedBranch,
+                isInternal: true,
+                branchExists: branchExists,
+                registeredWorktreePath: registeredPath,
+                registeredWorktreeDirty: registeredDirty,
+                isAncestorOfIntegrationHead: nil,
+                persistedWorktreePath: persistedPath,
+                persistedWorktreeIsStale: persistedIsStale,
+                disposition: .retainedRegisteredWorktree(
+                    path: registeredPath,
+                    dirty: registeredDirty
+                )
+            )
+        }
+
+        guard branchExists else {
+            return AgentBranchReconciliation(
+                branch: trimmedBranch,
+                isInternal: true,
+                branchExists: false,
+                registeredWorktreePath: nil,
+                registeredWorktreeDirty: false,
+                isAncestorOfIntegrationHead: nil,
+                persistedWorktreePath: persistedPath,
+                persistedWorktreeIsStale: persistedIsStale,
+                disposition: .alreadyAbsent
+            )
+        }
+
+        let integration: String
+        do {
+            integration = try validatedRefName(integrationRef, label: "integration ref")
+        } catch {
+            return AgentBranchReconciliation(
+                branch: trimmedBranch,
+                isInternal: true,
+                branchExists: true,
+                registeredWorktreePath: nil,
+                registeredWorktreeDirty: false,
+                isAncestorOfIntegrationHead: nil,
+                persistedWorktreePath: persistedPath,
+                persistedWorktreeIsStale: persistedIsStale,
+                disposition: .blocked(
+                    (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                )
+            )
+        }
+        let isAncestor = (try? run(
+            gitArgs: ["merge-base", "--is-ancestor", trimmedBranch, integration],
+            in: workTree
+        )) != nil
+        return AgentBranchReconciliation(
+            branch: trimmedBranch,
+            isInternal: true,
+            branchExists: true,
+            registeredWorktreePath: nil,
+            registeredWorktreeDirty: false,
+            isAncestorOfIntegrationHead: isAncestor,
+            persistedWorktreePath: persistedPath,
+            persistedWorktreeIsStale: persistedIsStale,
+            disposition: isAncestor ? .eligible : .retainedUniqueCommits
+        )
+    }
+
+    /// Delete only a proven-safe internal branch, using non-force `git branch -d`.
+    package static func safelyDeleteMergedAgentBranch(
+        _ branch: String,
+        persistedWorktreePath: String? = nil,
+        integrationRef: String = "HEAD",
+        in workTree: URL
+    ) -> AgentBranchCleanupResult {
+        let state = reconcileAgentBranch(
+            branch,
+            persistedWorktreePath: persistedWorktreePath,
+            integrationRef: integrationRef,
+            in: workTree
+        )
+        switch state.disposition {
+        case .alreadyAbsent:
+            return .alreadyAbsent(state)
+        case .eligible:
+            do {
+                try deleteLocalBranch(branch, in: workTree)
+                return .deleted(state)
+            } catch {
+                let detail = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                return .failed(state, "agent 分支安全删除失败，已保留: \(detail)")
+            }
+        case .retainedNonInternal, .retainedRegisteredWorktree,
+             .retainedUniqueCommits, .blocked:
+            return .retained(state)
+        }
+    }
+
+    fileprivate static func cleanupWarning(
+        for state: AgentBranchReconciliation
+    ) -> String {
+        switch state.disposition {
+        case .alreadyAbsent, .eligible:
+            return ""
+        case .retainedNonInternal:
+            return "已集成，但分支不属于 pipiui/agent-*；已保留供人工处置"
+        case .retainedRegisteredWorktree(let path, let dirty):
+            let suffix = dirty ? "且含未提交改动" : ""
+            return "已集成，但分支仍注册在 worktree \(path)\(suffix)；已保留"
+        case .retainedUniqueCommits:
+            return "分支仍含未进入集成 HEAD 的独有提交；已保留"
+        case .blocked(let detail):
+            return "无法安全确认 agent 分支状态；已保留: \(detail)"
+        }
+    }
+
     /// `git diff --stat from...to` with hard truncation (branch/commit range summary).
     package static func diffStat(
         from: String,
@@ -601,11 +877,10 @@ package enum GitRepo {
         return truncateDiffOutput(out, maxFiles: maxFiles, maxBytes: maxBytes)
     }
 
-    /// Delete a local branch (`git branch -D` when force, else `-d`). Does not touch remotes.
-    package static func deleteLocalBranch(_ branch: String, in workTree: URL, force: Bool = true) throws {
+    /// Delete a local branch with non-force `git branch -d`. Does not touch remotes.
+    package static func deleteLocalBranch(_ branch: String, in workTree: URL) throws {
         let name = try validatedRefName(branch, label: "分支名")
-        let flag = force ? "-D" : "-d"
-        _ = try run(gitArgs: ["branch", flag, name], in: workTree)
+        _ = try run(gitArgs: ["branch", "-d", name], in: workTree)
     }
 
     /// Best-effort: stage all and commit in `workTree` when dirty. Returns true if a commit was made.
