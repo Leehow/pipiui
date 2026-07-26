@@ -10,5 +10,9 @@ Sources.bak-20260723-104538/
 # ZCode session/plan cache
 .zcode/
 
+# Local coding-agent state and execution records
+.qoder/
+.superpowers/sdd/
+
 # Local git worktrees
 .worktrees/
