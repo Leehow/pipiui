@@ -746,7 +746,7 @@ struct SettingsSheet: View {
         LazyVStack(alignment: .leading, spacing: 16) {
             Text("工具与 Skills")
                 .font(.title3.weight(.semibold))
-            Text("开关关闭后：工具通过 `--exclude-tools` 在会话重启后对 pi 生效；Skills 立即从斜杠菜单隐藏（下次派出 subagent 也会尊重工具禁用）。")
+            Text("开关关闭后：工具通过 `--exclude-tools` 在会话重启后对 pi 生效；Skill 立即从斜杠菜单隐藏，并从下一轮起不再出现在模型的 `<available_skills>` 里（仍可手动 `/skill:名字` 显式调用）。下次派出 subagent 也会尊重这两项禁用。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -851,7 +851,9 @@ struct SettingsSheet: View {
                 ToolSkillSettings.setSkillEnabled(enabled, name: name)
                 disabledSkills = ToolSkillSettings.disabledSkills()
                 store.skillVisibilityRevision &+= 1
-                statusMessage = enabled ? "已启用 skill /\(name)" : "已禁用 skill /\(name)（斜杠菜单已隐藏）"
+                statusMessage = enabled
+                    ? "已启用 skill /\(name)"
+                    : "已禁用 skill /\(name)（斜杠菜单已隐藏；下一轮起模型不再看到，仍可 /\(name) 显式调用）"
             }
         )
     }

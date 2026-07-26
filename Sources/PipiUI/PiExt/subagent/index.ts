@@ -34,6 +34,7 @@ import {
 	runSecretaryCommit,
 } from "./secretary-commit.ts";
 import { secretaryToolCallBlock } from "./secretary-policy.ts";
+import { filterDisabledSkills, loadDisabledSkills } from "./skill-visibility.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -360,12 +361,14 @@ function loadMainModelFile(): string | undefined {
 // Settings still store the group id `browser_*`; it now expands to the single `browser` tool.
 const BROWSER_TOOL_NAMES = ["browser"];
 
+const TOOL_SKILL_SETTINGS_FILE = path.join(
+	os.homedir(),
+	"Library/Application Support/PipiUI/tool-skill-settings.json",
+);
+
 /** Hot-read Settings → 工具开关 denylist. */
 function loadDisabledTools(): Set<string> {
-	const file = path.join(
-		os.homedir(),
-		"Library/Application Support/PipiUI/tool-skill-settings.json",
-	);
+	const file = TOOL_SKILL_SETTINGS_FILE;
 	try {
 		const raw = fs.readFileSync(file, "utf-8");
 		const parsed = JSON.parse(raw) as { disabledTools?: unknown };
@@ -1965,6 +1968,26 @@ export default function (pi: ExtensionAPI) {
 			};
 		});
 	}
+
+	// Settings → skill 开关. Pi exposes no "exclude skills" flag, so a disabled skill is
+	// removed from the `<available_skills>` block instead — the only thing that makes it
+	// model-visible. Read per turn so a toggle takes effect without restarting the session.
+	// Registered unconditionally: this extension is loaded by the main session (-e) and by
+	// every nested pi process (PIPIUI_SUBAGENT_EXT), and for plan children the handler above
+	// already removed the block, so this one no-ops there.
+	// `/skill:name` stays available on purpose — see skill-visibility.ts.
+	pi.on("before_agent_start", (event) => {
+		const disabled = loadDisabledSkills(TOOL_SKILL_SETTINGS_FILE);
+		if (disabled.size === 0) return;
+		const result = filterDisabledSkills(event.systemPrompt, disabled);
+		if (!result.hadBlock || result.removed.length === 0) return;
+		// Nothing left to advertise: drop pi's preamble too instead of leaving an empty block.
+		const systemPrompt =
+			result.remaining === 0
+				? stripPiSkillsFromSystemPrompt(event.systemPrompt).trimEnd()
+				: result.systemPrompt;
+		return { systemPrompt };
+	});
 
 	// Prompt text is not a security boundary. The runtime-owned closeout secretary
 	// may write only its state records and may not perform destructive cleanup.
