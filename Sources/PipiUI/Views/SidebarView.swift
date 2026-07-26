@@ -8,7 +8,13 @@ struct SidebarView: View {
     @State private var archivedExpandedByProject: [String: Bool] = [:]
     @State private var projectsExpanded = false
     @State private var pinnedExpanded = false
-    @State private var sessionsExpanded = false
+    /// Project folders can be opened independently. The selected project is
+    /// always opened when it is selected, but opening one folder never closes
+    /// another.
+    @State private var expandedProjectPaths: Set<String> = []
+    /// The active-session cap is applied independently inside each project
+    /// folder, so one project's "更多" does not affect the others.
+    @State private var sessionsExpandedByProject: [String: Bool] = [:]
 
     /// Shared leading gutter — `.sidebar` List defaults are wider than needed.
     private static let sidebarGutter: CGFloat = 10
@@ -28,10 +34,6 @@ struct SidebarView: View {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     projectsSection
                     pinnedSection
-                    if let project = store.selectedProject {
-                        sessionsSection(project: project)
-                        archivedSessionsSection(project: project)
-                    }
                 }
                 .padding(.horizontal, Self.sidebarGutter)
                 .padding(.vertical, 8)
@@ -65,7 +67,6 @@ struct SidebarView: View {
             syncProjectsExpansion()
         }
         .onChange(of: store.selectedProjectPath) { _, _ in
-            sessionsExpanded = false
             syncProjectsExpansion()
         }
         .onChange(of: store.projects.map(\.path)) { _, _ in
@@ -99,11 +100,12 @@ struct SidebarView: View {
         }
     }
 
-    /// Ensures the selected project stays visible even when it falls outside the
-    /// collapsed prefix (e.g. selection made via search/restore, not by clicking a
-    /// currently-visible row).
+    /// Ensures the selected project stays visible and open even when selection
+    /// came from search/restore rather than a currently visible folder row.
     private func syncProjectsExpansion() {
-        guard !projectsExpanded, let path = store.selectedProjectPath else { return }
+        guard let path = store.selectedProjectPath else { return }
+        expandedProjectPaths.insert(path)
+        guard !projectsExpanded else { return }
         guard let index = store.projects.firstIndex(where: { $0.path == path }) else { return }
         if index >= SidebarListLimits.projects {
             projectsExpanded = true
@@ -127,42 +129,90 @@ struct SidebarView: View {
                 expanded: projectsExpanded
             )
             ForEach(capped.items, id: \.path) { project in
-                let isSelected = project.path == store.selectedProjectPath
-                SessionRowContainer(
-                    isSelected: isSelected,
-                    onSelect: {
-                        store.selectedProjectPath = project.path
-                        store.refreshSessions(for: project)
-                    },
-                    onPin: nil,
-                    isPinned: false,
-                    onRename: { },
-                    onArchive: nil
-                ) { _ in
-                    HStack(spacing: 6) {
-                        Image(systemName: "folder")
-                            .foregroundStyle(isSelected ? Color.accentColor : .secondary)
-                        Text(project.lastPathComponent)
-                            .fontWeight(isSelected ? .semibold : .regular)
-                        Spacer(minLength: 0)
-                        Text("\(store.sessionsByProject[project.path]?.count ?? 0)")
-                            .foregroundStyle(.tertiary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .contextMenu {
-                    Button("在 Finder 中显示") {
-                        NSWorkspace.shared.activateFileViewerSelecting([project])
-                    }
-                    Button("移除项目", role: .destructive) {
-                        store.removeProject(project)
-                    }
+                projectFolderRow(project)
+                if expandedProjectPaths.contains(project.path) {
+                    projectSessionChildren(project)
                 }
             }
             if capped.showsToggle {
                 moreToggle(expanded: $projectsExpanded, sectionName: "项目")
             }
         }
+    }
+
+    /// A project is a folder in the sidebar tree. The disclosure control only
+    /// changes that folder, while selecting the project refreshes its sessions
+    /// and leaves the folder open.
+    @ViewBuilder
+    private func projectFolderRow(_ project: URL) -> some View {
+        let isSelected = project.path == store.selectedProjectPath
+        let isExpanded = expandedProjectPaths.contains(project.path)
+        HStack(spacing: 6) {
+            Button {
+                if isExpanded {
+                    expandedProjectPaths.remove(project.path)
+                } else {
+                    expandedProjectPaths.insert(project.path)
+                }
+            } label: {
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 12, height: 20)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "收起\(project.lastPathComponent)" : "展开\(project.lastPathComponent)")
+
+            Button {
+                selectProject(project)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: isExpanded ? "folder.fill" : "folder")
+                        .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                    Text(project.lastPathComponent)
+                        .fontWeight(isSelected ? .semibold : .regular)
+                    Spacer(minLength: 0)
+                    Text("\(store.sessionsByProject[project.path]?.count ?? 0)")
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("选择项目\(project.lastPathComponent)")
+
+            Button {
+                selectProject(project)
+                store.newSession(project: project)
+            } label: {
+                Image(systemName: "plus")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 20, height: 20)
+            }
+            .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
+            .help("新建会话")
+            .accessibilityLabel("在\(project.lastPathComponent)中新建会话")
+        }
+        .padding(.vertical, 5)
+        .padding(.horizontal, 6)
+        .background {
+            RoundedRectangle(cornerRadius: 7)
+                .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
+        }
+        .hoverRowBackground(cornerRadius: 7)
+        .contextMenu {
+            Button("在 Finder 中显示") {
+                NSWorkspace.shared.activateFileViewerSelecting([project])
+            }
+            Button("移除项目", role: .destructive) {
+                store.removeProject(project)
+            }
+        }
+    }
+
+    private func selectProject(_ project: URL) {
+        expandedProjectPaths.insert(project.path)
+        store.selectedProjectPath = project.path
+        store.refreshSessions(for: project)
     }
 
     @ViewBuilder
@@ -206,30 +256,27 @@ struct SidebarView: View {
         }
     }
 
-    private func sessionsSection(project: URL) -> some View {
+    /// Active and archived session rows live directly under their project
+    /// folder. There is deliberately no standalone active-session section.
+    private func projectSessionChildren(_ project: URL) -> some View {
         let metas = SessionPinLogic.activeMetas(
             from: store.sessionsByProject[project.path] ?? [],
             excludingPinned: store.userPinnedSessionPaths
         )
         let news = newSessionEntries(project: project)
+        let sessionsExpanded = Binding(
+            get: { sessionsExpandedByProject[project.path] ?? false },
+            set: { sessionsExpandedByProject[project.path] = $0 }
+        )
         let visibleCounts = SidebarListLimits.splitVisibleCounts(
             leadingCount: news.count,
             trailingCount: metas.count,
             limit: SidebarListLimits.sessions,
-            expanded: sessionsExpanded
+            expanded: sessionsExpanded.wrappedValue
         )
         let visibleNews = Array(news.prefix(visibleCounts.leading))
         let visibleMetas = Array(metas.prefix(visibleCounts.trailing))
-        return sidebarSection("会话") {
-            Button {
-                store.newSession(project: project)
-            } label: {
-                Image(systemName: "plus")
-            }
-            .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
-            .help("新建会话")
-            .accessibilityLabel("新建会话")
-        } rows: {
+        return VStack(alignment: .leading, spacing: 0) {
             // 未落盘，或已有 sessionFile 但 metas 尚未代表该 path 的 new:*（交接空窗）
             ForEach(visibleNews, id: \.0) { key, session in
                 sessionRow(
@@ -263,9 +310,11 @@ struct SidebarView: View {
                 )
             }
             if visibleCounts.showsToggle {
-                moreToggle(expanded: $sessionsExpanded, sectionName: "会话")
+                moreToggle(expanded: sessionsExpanded, sectionName: "\(project.lastPathComponent) 会话")
             }
+            archivedSessionsSection(project: project)
         }
+        .padding(.leading, 20)
     }
 
     /// Trailing bleed so header actions clear the sidebar divider (~列表行内边距对齐).
