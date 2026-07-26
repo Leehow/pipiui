@@ -506,6 +506,36 @@ final class AppStore: ObservableObject {
         persistProjectSidebarPreferences()
     }
 
+    /// Reorders projects inside their visible pin group. Pinned projects remain
+    /// ahead of unpinned projects, while their individual order is persisted in
+    /// the same project-path preference used at launch.
+    @discardableResult
+    func moveProject(path: String, before destinationPath: String) -> Bool {
+        guard path != destinationPath,
+              let source = projects.first(where: { $0.path == path }),
+              let destination = projects.first(where: { $0.path == destinationPath }) else {
+            return false
+        }
+        let isPinned = pinnedProjectPaths.contains(source.path)
+        guard pinnedProjectPaths.contains(destination.path) == isPinned else { return false }
+
+        var group = projects.filter { pinnedProjectPaths.contains($0.path) == isPinned }
+        guard let sourceIndex = group.firstIndex(where: { $0.path == source.path }),
+              let destinationIndex = group.firstIndex(where: { $0.path == destination.path }) else {
+            return false
+        }
+        group.remove(at: sourceIndex)
+        let insertionIndex = sourceIndex < destinationIndex ? destinationIndex - 1 : destinationIndex
+        group.insert(source, at: insertionIndex)
+
+        var iterator = group.makeIterator()
+        projects = projects.map { project in
+            pinnedProjectPaths.contains(project.path) == isPinned ? iterator.next()! : project
+        }
+        persistProjects()
+        return true
+    }
+
     func removeProject(_ url: URL) {
         // Close every live session under this project so pi/subagent processes stop.
         let keys = openSessions.compactMap { key, session -> String? in

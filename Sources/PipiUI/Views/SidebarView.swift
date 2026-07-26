@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SidebarView: View {
     @EnvironmentObject var store: AppStore
@@ -216,6 +217,7 @@ struct SidebarView: View {
             .menuIndicator(.hidden)
             .help("项目菜单")
             .accessibilityLabel("项目菜单\(displayName)")
+            .pointingHandCursor()
 
             Button {
                 selectProject(project)
@@ -231,6 +233,11 @@ struct SidebarView: View {
         }
         .padding(.vertical, 5)
         .padding(.horizontal, 6)
+        .onDrag {
+            expandedProjectPaths.removeAll()
+            return NSItemProvider(object: project.path as NSString)
+        }
+        .onDrop(of: [UTType.plainText], delegate: ProjectDropDelegate(project: project, store: store))
         .background {
             RoundedRectangle(cornerRadius: 7)
                 .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
@@ -393,6 +400,7 @@ struct SidebarView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .accessibilityLabel(expanded.wrappedValue ? "收起\(sectionName)" : "展开更多\(sectionName)")
+        .pointingHandCursor()
     }
 
     @ViewBuilder
@@ -424,6 +432,7 @@ struct SidebarView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .pointingHandCursor()
 
                 if archivedExpanded {
                     ForEach(archived, id: \.meta.path) { entry in
@@ -596,6 +605,30 @@ private struct RenameTarget: Identifiable {
 private struct ProjectRenameTarget: Identifiable {
     let project: URL
     var id: String { project.path }
+}
+
+private struct ProjectDropDelegate: DropDelegate {
+    let project: URL
+    let store: AppStore
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [UTType.plainText])
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let provider = info.itemProviders(for: [UTType.plainText]).first else { return false }
+        provider.loadObject(ofClass: NSString.self) { object, _ in
+            guard let path = object as? String else { return }
+            DispatchQueue.main.async {
+                store.moveProject(path: path, before: project.path)
+            }
+        }
+        return true
+    }
 }
 
 /// 行容器：左侧点选主区域 + hover 时右侧置顶/改名/归档，避免嵌套 Button 抢事件。
