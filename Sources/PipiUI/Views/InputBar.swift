@@ -49,23 +49,213 @@ final class ComposerPasteCatcher {
     deinit { stop() }
 }
 
-/// Routes asynchronous paste-catcher payloads to the currently displayed composer session.
-/// The view can be reused across a warm A→B switch, so it must not retain session A.
-final class ComposerPasteRouter {
+/// Routes composer actions to the currently displayed session.
+///
+/// `InputBar` is intentionally warm-reused across session switches. Persistent key monitors
+/// and asynchronous drop completions therefore capture this stable router, never an
+/// `InputBar` value (which would strongly retain the session from that render).
+final class ComposerSessionRouter: ObservableObject {
     private weak var session: ChatSession?
 
+    @Published private(set) var slashMatches: [SlashCommand] = []
+    @Published private(set) var slashSelectedIndex = 0
+    @Published private(set) var slashPaletteVisible = false
+    @Published private(set) var attachError: String?
+
     func bind(to session: ChatSession) {
+        guard self.session !== session else { return }
         self.session = session
+        dismissSlashPalette()
+        attachError = nil
     }
 
     func route(images: [DraftImage]) {
         session?.draftImages.append(contentsOf: images)
+        attachError = nil
     }
 
     func routeLargeText(_ text: String) {
         guard let session else { return }
         let marker = session.registerLargePaste(text)
         ComposerPasteInsertion.insertMarker(marker, draftText: &session.draftText)
+        attachError = nil
+    }
+
+    func appendResults(_ results: [Result<DraftImage, ImageAttachment.LoadError>]) {
+        guard let session else { return }
+        var lastError: String?
+        for result in results {
+            switch result {
+            case .success(let image):
+                session.draftImages.append(image)
+            case .failure(let error):
+                lastError = error.localizedDescription
+            }
+        }
+        attachError = lastError
+        guard let lastError else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard self?.attachError == lastError else { return }
+            self?.attachError = nil
+        }
+    }
+
+    func clearAttachError() {
+        attachError = nil
+    }
+
+    func refreshSlashPalette(disabledSkills: Set<String>) {
+        guard let session,
+              session.composerMode == .chat,
+              session.draftImages.isEmpty,
+              let query = SlashPaletteQuery.paletteQuery(from: session.draftText)
+        else {
+            dismissSlashPalette()
+            return
+        }
+
+        let availableCommands = session.availableCommands.filter { command in
+            command.source != .skill || !disabledSkills.contains(command.name)
+        }
+        slashMatches = SlashFuzzy.filter(
+            commands: BuiltinCommands.all + availableCommands,
+            query: query
+        )
+        slashPaletteVisible = !slashMatches.isEmpty
+        if slashSelectedIndex >= slashMatches.count {
+            slashSelectedIndex = max(0, slashMatches.count - 1)
+        }
+    }
+
+    func moveSlashSelection(by delta: Int) {
+        guard !slashMatches.isEmpty else { return }
+        let next = slashSelectedIndex + delta
+        slashSelectedIndex = min(max(0, next), slashMatches.count - 1)
+    }
+
+    func dismissSlashPalette() {
+        slashPaletteVisible = false
+        slashMatches = []
+        slashSelectedIndex = 0
+    }
+
+    @discardableResult
+    func completeSelectedSlash() -> Bool {
+        guard slashPaletteVisible,
+              slashMatches.indices.contains(slashSelectedIndex) else { return false }
+        return completeSlash(slashMatches[slashSelectedIndex])
+    }
+
+    @discardableResult
+    func completeSlash(_ command: SlashCommand) -> Bool {
+        guard let session else { return false }
+        session.draftText = "/\(command.name) "
+        dismissSlashPalette()
+        return true
+    }
+
+    @discardableResult
+    func executeSelectedSlash() -> Bool {
+        guard slashPaletteVisible,
+              slashMatches.indices.contains(slashSelectedIndex) else { return false }
+        return executeSlash(slashMatches[slashSelectedIndex])
+    }
+
+    @discardableResult
+    func executeSlash(_ command: SlashCommand) -> Bool {
+        guard let session else { return false }
+        let args: String
+        if let invocation = BuiltinCommands.parseInvocation(session.draftText),
+           invocation.name == command.name {
+            args = invocation.args
+        } else {
+            args = ""
+        }
+
+        session.draftText = ""
+        session.draftImages = []
+        session.clearDraftPastes()
+        dismissSlashPalette()
+
+        if command.source == .builtin {
+            _ = BuiltinCommands.execute(name: command.name, args: args, host: session)
+        } else {
+            let message = args.isEmpty
+                ? "/\(command.name)"
+                : "/\(command.name) \(args)"
+            session.sendPrompt(message, images: [])
+        }
+        return true
+    }
+
+    var canSend: Bool {
+        guard let session, !session.mediaBusy else { return false }
+        let hasText = !session.draftText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+        let hasImages = !session.draftImages.isEmpty
+        switch session.composerMode {
+        case .generateImage, .generateVideo:
+            return hasText
+        case .chat:
+            return session.processAlive && (hasText || hasImages)
+        }
+    }
+
+    @discardableResult
+    func send() -> Bool {
+        if executeSelectedSlash() {
+            return true
+        }
+        guard let session, canSend else { return false }
+        let images = session.draftImages
+        // Expand before clearing draftText — onChange prune would otherwise wipe draftPastes.
+        let text = session.expandedDraftText(from: session.draftText)
+        session.draftText = ""
+        session.draftImages = []
+        session.clearDraftPastes()
+        attachError = nil
+        session.sendPrompt(text, images: images)
+        return true
+    }
+}
+
+/// Installs the callbacks that outlive an individual `InputBar` render.
+///
+/// Keeping the production wiring here makes its capture graph directly testable: the
+/// callbacks retain only the stable router and, where needed, the monitor weakly.
+enum ComposerPersistentCallbackBinder {
+    static func install(
+        pasteCatcher: ComposerPasteCatcher,
+        slashKeyMonitor: ComposerSlashKeyMonitor,
+        router: ComposerSessionRouter
+    ) {
+        pasteCatcher.onPasteImages = { [router] images in
+            router.route(images: images)
+        }
+        pasteCatcher.onPasteLargeText = { [router] text in
+            router.routeLargeText(text)
+        }
+
+        slashKeyMonitor.onMove = { [router] delta in
+            router.moveSlashSelection(by: delta)
+        }
+        slashKeyMonitor.onEscape = { [router, weak slashKeyMonitor] in
+            router.dismissSlashPalette()
+            slashKeyMonitor?.isActive = false
+        }
+        slashKeyMonitor.onTab = { [router, weak slashKeyMonitor] in
+            if router.completeSelectedSlash() {
+                slashKeyMonitor?.isActive = false
+            }
+        }
+        slashKeyMonitor.onReturn = { [router, weak slashKeyMonitor] in
+            let handled = router.executeSelectedSlash()
+            if handled {
+                slashKeyMonitor?.isActive = false
+            }
+            return handled
+        }
     }
 }
 
@@ -152,14 +342,10 @@ final class ComposerSlashKeyMonitor {
 struct InputBar: View {
     @EnvironmentObject var store: AppStore
     @ObservedObject var session: ChatSession
-    @State private var attachError: String?
     @FocusState private var focused: Bool
     @State private var pasteCatcher = ComposerPasteCatcher()
-    @State private var pasteRouter = ComposerPasteRouter()
+    @StateObject private var composerRouter = ComposerSessionRouter()
     @State private var slashKeyMonitor = ComposerSlashKeyMonitor()
-    @State private var slashMatches: [SlashCommand] = []
-    @State private var slashSelectedIndex: Int = 0
-    @State private var slashPaletteVisible: Bool = false
     @State private var showQuotaPopover: Bool = false
     @State private var showContextPopover: Bool = false
     /// Measured width of the status row; drives compact vs wide without ViewThatFits.
@@ -179,7 +365,7 @@ struct InputBar: View {
                 mediaModeStrip
             }
 
-            if let attachError {
+            if let attachError = composerRouter.attachError {
                 Text(attachError)
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -196,10 +382,10 @@ struct InputBar: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if slashPaletteVisible && !slashMatches.isEmpty {
+            if composerRouter.slashPaletteVisible && !composerRouter.slashMatches.isEmpty {
                 SlashPalette(
-                    commands: slashMatches,
-                    selectedIndex: slashSelectedIndex,
+                    commands: composerRouter.slashMatches,
+                    selectedIndex: composerRouter.slashSelectedIndex,
                     onSelect: { completeSlash($0) }
                 )
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -218,35 +404,13 @@ struct InputBar: View {
         .onAppear {
             focused = true
             pasteCatcher.focused = true
-            pasteRouter.bind(to: session)
-            pasteCatcher.onPasteImages = { [router = pasteRouter] images in
-                router.route(images: images)
-            }
-            pasteCatcher.onPasteLargeText = { [router = pasteRouter] text in
-                router.routeLargeText(text)
-            }
+            composerRouter.bind(to: session)
+            ComposerPersistentCallbackBinder.install(
+                pasteCatcher: pasteCatcher,
+                slashKeyMonitor: slashKeyMonitor,
+                router: composerRouter
+            )
             pasteCatcher.start()
-
-            slashKeyMonitor.onMove = { delta in
-                guard !slashMatches.isEmpty else { return }
-                let next = slashSelectedIndex + delta
-                slashSelectedIndex = min(max(0, next), slashMatches.count - 1)
-            }
-            slashKeyMonitor.onEscape = {
-                slashPaletteVisible = false
-                refreshSlashKeyMonitorActive()
-            }
-            slashKeyMonitor.onTab = {
-                guard slashPaletteVisible,
-                      slashMatches.indices.contains(slashSelectedIndex) else { return }
-                completeSlash(slashMatches[slashSelectedIndex])
-            }
-            slashKeyMonitor.onReturn = {
-                guard slashPaletteVisible,
-                      slashMatches.indices.contains(slashSelectedIndex) else { return false }
-                executeSlash(slashMatches[slashSelectedIndex])
-                return true
-            }
             slashKeyMonitor.start()
             refreshSlashPalette()
             refreshSlashKeyMonitorActive()
@@ -256,12 +420,13 @@ struct InputBar: View {
             refreshSlashKeyMonitorActive()
         }
         .onChange(of: ObjectIdentifier(session)) { _, _ in
-            pasteRouter.bind(to: session)
+            composerRouter.bind(to: session)
+            refreshSlashPalette()
         }
         .onChange(of: session.draftText) { _, _ in
             session.pruneOrphanDraftPastes()
             refreshSlashPalette()
-            attachError = nil
+            composerRouter.clearAttachError()
         }
         .onChange(of: session.availableCommands) { _, _ in
             refreshSlashPalette()
@@ -274,7 +439,7 @@ struct InputBar: View {
         }
         .onChange(of: session.draftImages.count) { _, _ in
             refreshSlashPalette()
-            attachError = nil
+            composerRouter.clearAttachError()
         }
         .onDisappear {
             pasteCatcher.stop()
@@ -390,7 +555,9 @@ struct InputBar: View {
                 .lineLimit(1...10)
                 .frame(minHeight: 20, alignment: .leading)
                 .focused($focused)
-                .onSubmit(send)
+                .onSubmit { [router = composerRouter] in
+                    router.send()
+                }
                 .padding(.vertical, 6)
 
             if session.isStreaming || session.isSendingFromQueue || session.isStopping {
@@ -416,7 +583,7 @@ struct InputBar: View {
                       : (session.messageQueue.isEmpty ? "中止当前回复" : "中止并发送队首"))
             }
 
-            Button(action: send) {
+            Button(action: { [router = composerRouter] in router.send() }) {
                 Image(systemName: "arrow.up")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundStyle(canSend ? Color(nsColor: .windowBackgroundColor) : Color.secondary.opacity(0.55))
@@ -579,118 +746,29 @@ struct InputBar: View {
 
     // MARK: - Slash palette
 
-    private func allSlashCommands() -> [SlashCommand] {
-        let disabled = ToolSkillSettings.disabledSkills()
-        let skillsFiltered = session.availableCommands.filter { cmd in
-            if cmd.source == .skill {
-                return !disabled.contains(cmd.name)
-            }
-            return true
-        }
-        return BuiltinCommands.all + skillsFiltered
-    }
-
     private func refreshSlashPalette() {
-        // Non-chat media modes and drafts with attachments skip slash palette
-        // so Return/send paths stay consistent (no builtin vs generateMedia / drop-images fork).
-        guard session.composerMode == .chat, session.draftImages.isEmpty else {
-            slashPaletteVisible = false
-            slashMatches = []
-            slashSelectedIndex = 0
-            refreshSlashKeyMonitorActive()
-            return
-        }
-        guard let query = SlashPaletteQuery.paletteQuery(from: session.draftText) else {
-            slashPaletteVisible = false
-            slashMatches = []
-            slashSelectedIndex = 0
-            refreshSlashKeyMonitorActive()
-            return
-        }
-        let matches = SlashFuzzy.filter(commands: allSlashCommands(), query: query)
-        slashMatches = matches
-        slashPaletteVisible = !matches.isEmpty
-        if slashSelectedIndex >= matches.count {
-            slashSelectedIndex = max(0, matches.count - 1)
-        }
+        composerRouter.refreshSlashPalette(disabledSkills: ToolSkillSettings.disabledSkills())
         refreshSlashKeyMonitorActive()
     }
 
     private func refreshSlashKeyMonitorActive() {
-        slashKeyMonitor.isActive = focused && slashPaletteVisible && !slashMatches.isEmpty
+        slashKeyMonitor.isActive = focused
+            && composerRouter.slashPaletteVisible
+            && !composerRouter.slashMatches.isEmpty
     }
 
     /// Tab / click: fill `/name ` and keep focus for args.
     private func completeSlash(_ cmd: SlashCommand) {
-        session.draftText = "/\(cmd.name) "
-        slashPaletteVisible = false
-        slashMatches = []
-        slashSelectedIndex = 0
-        focused = true
-        refreshSlashKeyMonitorActive()
-    }
-
-    /// Return while palette open: run command now.
-    private func executeSlash(_ cmd: SlashCommand) {
-        let args: String = {
-            // If draft is `/name rest`, pass rest; if user selected different cmd, args empty.
-            if let inv = BuiltinCommands.parseInvocation(session.draftText), inv.name == cmd.name {
-                return inv.args
-            }
-            return ""
-        }()
-        session.draftText = ""
-        session.draftImages = []
-        session.clearDraftPastes()
-        slashPaletteVisible = false
-        slashMatches = []
-        slashSelectedIndex = 0
-        refreshSlashKeyMonitorActive()
-        // Builtin path or server prompt:
-        if cmd.source == .builtin {
-            _ = BuiltinCommands.execute(name: cmd.name, args: args, host: session)
-        } else {
-            let message: String
-            if args.isEmpty {
-                message = "/\(cmd.name)"
-            } else {
-                message = "/\(cmd.name) \(args)"
-            }
-            session.sendPrompt(message, images: [])
+        if composerRouter.completeSlash(cmd) {
+            focused = true
         }
+        refreshSlashKeyMonitorActive()
     }
 
     // MARK: - Send
 
     private var canSend: Bool {
-        if session.mediaBusy { return false }
-        let hasText = !session.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let hasImages = !session.draftImages.isEmpty
-        switch session.composerMode {
-        case .generateImage, .generateVideo:
-            // Media gen only needs text (refs optional); does not require pi process.
-            return hasText
-        case .chat:
-            return session.processAlive && (hasText || hasImages)
-        }
-    }
-
-    private func send() {
-        // Belt-and-suspenders: palette Return must not double-fire via onSubmit.
-        if slashPaletteVisible, !slashMatches.isEmpty,
-           slashMatches.indices.contains(slashSelectedIndex) {
-            executeSlash(slashMatches[slashSelectedIndex])
-            return
-        }
-        guard canSend else { return }
-        let images = session.draftImages
-        // Expand before clearing draftText — onChange prune would otherwise wipe draftPastes.
-        let text = session.expandedDraftText(from: session.draftText)
-        session.draftText = ""
-        session.draftImages = []
-        session.clearDraftPastes()
-        attachError = nil
-        session.sendPrompt(text, images: images)
+        composerRouter.canSend
     }
 
     // MARK: - Pick / paste / drop
@@ -704,7 +782,7 @@ struct InputBar: View {
         panel.prompt = "添加"
         panel.message = "选择要发送的图片"
         guard panel.runModal() == .OK else { return }
-        appendResults(panel.urls.map { ImageAttachment.make(from: $0) })
+        composerRouter.appendResults(panel.urls.map { ImageAttachment.make(from: $0) })
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -747,28 +825,11 @@ struct InputBar: View {
         }
 
         guard handled else { return false }
+        let router = composerRouter
         group.notify(queue: .main) {
-            self.appendResults(results)
+            router.appendResults(results)
         }
         return true
-    }
-
-    private func appendResults(_ results: [Result<DraftImage, ImageAttachment.LoadError>]) {
-        var lastError: String?
-        for result in results {
-            switch result {
-            case .success(let img):
-                session.draftImages.append(img)
-            case .failure(let err):
-                lastError = err.localizedDescription
-            }
-        }
-        attachError = lastError
-        if lastError != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                if attachError == lastError { attachError = nil }
-            }
-        }
     }
 
     // MARK: - Menus
