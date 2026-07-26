@@ -331,12 +331,10 @@ final class ComposerNSTextView: NSTextView {
             return
         }
 
-        // Let the input method own Return while marked text is active. Resetting
-        // or submitting here would split a Chinese IME composition mid-candidate.
-        guard !hasMarkedText() else {
-            super.doCommand(by: commandSelector)
-            return
-        }
+        // The input context normally consumes candidate confirmation before this
+        // command reaches NSTextView. If it does arrive with marked text active,
+        // do nothing: calling super would replace the marked range with a newline.
+        guard !hasMarkedText() else { return }
 
         let modifiers = NSApp.currentEvent?.modifierFlags
             .intersection(.deviceIndependentFlagsMask) ?? []
@@ -355,7 +353,21 @@ final class ComposerPlaceholderLabel: NSTextField {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
-final class ComposerTextViewHost: NSView {
+final class ComposerUndoManager: UndoManager {
+    var onUndoOrRedo: () -> Void = {}
+
+    override func undo() {
+        super.undo()
+        onUndoOrRedo()
+    }
+
+    override func redo() {
+        super.redo()
+        onUndoOrRedo()
+    }
+}
+
+class ComposerTextViewHost: NSView {
     let scrollView = NSScrollView(frame: .zero)
     let textView = ComposerNSTextView(frame: .zero)
     let placeholderLabel = ComposerPlaceholderLabel(labelWithString: "")
@@ -438,6 +450,10 @@ final class ComposerTextViewHost: NSView {
         NSSize(width: NSView.noIntrinsicMetric, height: visibleTextHeight)
     }
 
+    var shouldScrollSelectionDuringLayout: Bool {
+        window?.firstResponder === textView
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         onMoveToWindow()
@@ -453,7 +469,7 @@ final class ComposerTextViewHost: NSView {
             width: bounds.width,
             height: ceil(lineHeight)
         )
-        refreshLayout(scrollSelection: false)
+        refreshLayout(scrollSelection: shouldScrollSelectionDuringLayout)
     }
 
     func updatePlaceholder(_ placeholder: String) {
@@ -554,7 +570,7 @@ struct ComposerTextView: NSViewRepresentable {
         host.textView.onSubmit = {}
         host.onHeightChange = { _ in }
         host.onMoveToWindow = {}
-        coordinator.host = nil
+        coordinator.dismantle()
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -567,13 +583,20 @@ struct ComposerTextView: NSViewRepresentable {
         private var pendingTextApplicationScheduled = false
         private var focusRequestScheduled = false
         private var applyingProgrammaticText = false
+        private var isDismantled = false
+        private let composerUndoManager = ComposerUndoManager()
 
         init(parent: ComposerTextView) {
             self.parent = parent
             boundSessionIdentity = parent.sessionIdentity
+            super.init()
+            composerUndoManager.onUndoOrRedo = { [weak self] in
+                self?.synchronizeAfterUndoOrRedo()
+            }
         }
 
         func synchronize(_ host: ComposerTextViewHost) {
+            guard !isDismantled else { return }
             self.host = host
             host.textView.onSubmit = { [weak self] in
                 self?.parent.onSubmit()
@@ -606,11 +629,13 @@ struct ComposerTextView: NSViewRepresentable {
         }
 
         func textDidBeginEditing(_ notification: Notification) {
+            guard !isDismantled else { return }
             guard !parent.isFocused else { return }
             parent.isFocused = true
         }
 
         func textDidEndEditing(_ notification: Notification) {
+            guard !isDismantled else { return }
             if pendingExternalText != nil, let host {
                 schedulePendingTextApplication(on: host)
             }
@@ -620,7 +645,8 @@ struct ComposerTextView: NSViewRepresentable {
         }
 
         func textDidChange(_ notification: Notification) {
-            guard !applyingProgrammaticText,
+            guard !isDismantled,
+                  !applyingProgrammaticText,
                   let textView = notification.object as? NSTextView,
                   let host else { return }
 
@@ -638,12 +664,27 @@ struct ComposerTextView: NSViewRepresentable {
             host.refreshLayout(scrollSelection: true)
         }
 
+        func undoManager(for view: NSTextView) -> UndoManager? {
+            composerUndoManager
+        }
+
+        private func synchronizeAfterUndoOrRedo() {
+            guard !isDismantled, !applyingProgrammaticText, let host else { return }
+            if parent.text != host.textView.string {
+                parent.text = host.textView.string
+            }
+            host.refreshLayout(scrollSelection: true)
+        }
+
         func receiveHeight(_ newHeight: CGFloat) {
-            guard abs(parent.height - newHeight) > 0.5,
+            guard !isDismantled,
+                  abs(parent.height - newHeight) > 0.5,
                   pendingHeight != newHeight else { return }
             pendingHeight = newHeight
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.pendingHeight == newHeight else { return }
+                guard let self,
+                      !self.isDismantled,
+                      self.pendingHeight == newHeight else { return }
                 self.pendingHeight = nil
                 if abs(self.parent.height - newHeight) > 0.5 {
                     self.parent.height = newHeight
@@ -657,7 +698,8 @@ struct ComposerTextView: NSViewRepresentable {
             DispatchQueue.main.async { [weak self, weak host] in
                 guard let self, let host else { return }
                 self.pendingTextApplicationScheduled = false
-                guard let pendingExternalText = self.pendingExternalText,
+                guard !self.isDismantled,
+                      let pendingExternalText = self.pendingExternalText,
                       !host.textView.hasMarkedText() else { return }
                 self.pendingExternalText = nil
                 self.apply(
@@ -673,6 +715,7 @@ struct ComposerTextView: NSViewRepresentable {
         }
 
         func synchronizeFocus(_ host: ComposerTextViewHost) {
+            guard !isDismantled else { return }
             if parent.isFocused {
                 guard host.window?.firstResponder !== host.textView,
                       !focusRequestScheduled else { return }
@@ -680,7 +723,7 @@ struct ComposerTextView: NSViewRepresentable {
                 DispatchQueue.main.async { [weak self, weak host] in
                     guard let self, let host else { return }
                     self.focusRequestScheduled = false
-                    guard self.parent.isFocused else { return }
+                    guard !self.isDismantled, self.parent.isFocused else { return }
                     host.window?.makeFirstResponder(host.textView)
                 }
             } else if host.window?.firstResponder === host.textView {
@@ -693,15 +736,28 @@ struct ComposerTextView: NSViewRepresentable {
             to textView: NSTextView,
             moveCursorToEnd: Bool
         ) {
+            // Every call represents an external whole-draft boundary, including
+            // an equal-string session rebind. Old range-based typing actions must
+            // never survive into the replacement/session on the other side.
+            composerUndoManager.removeAllActions()
             guard textView.string != newText else { return }
             let oldSelection = textView.selectedRange()
+            let oldLength = (textView.string as NSString).length
             let wasApplyingProgrammaticText = applyingProgrammaticText
             applyingProgrammaticText = true
+            composerUndoManager.disableUndoRegistration()
             textView.string = newText
+            composerUndoManager.enableUndoRegistration()
+            composerUndoManager.removeAllActions()
             applyingProgrammaticText = wasApplyingProgrammaticText
 
             let length = (newText as NSString).length
             if moveCursorToEnd {
+                textView.setSelectedRange(NSRange(location: length, length: 0))
+            } else if oldSelection.length == 0, oldSelection.location == oldLength {
+                // Preserve the semantic "end of draft" caret across replacements
+                // such as slash completion: "/na" becomes "/name " and arguments
+                // must continue after the trailing space.
                 textView.setSelectedRange(NSRange(location: length, length: 0))
             } else {
                 let location = min(oldSelection.location, length)
@@ -710,6 +766,15 @@ struct ComposerTextView: NSViewRepresentable {
                     NSRange(location: location, length: selectionLength)
                 )
             }
+        }
+
+        func dismantle() {
+            isDismantled = true
+            pendingExternalText = nil
+            pendingHeight = nil
+            composerUndoManager.onUndoOrRedo = {}
+            composerUndoManager.removeAllActions()
+            host = nil
         }
     }
 }

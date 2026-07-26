@@ -147,10 +147,19 @@ final class ComposerTextViewTests: XCTestCase {
         textView.didChangeText()
         XCTAssertTrue(textView.hasMarkedText())
 
+        boundText = "旧会话外部更新"
+        coordinator.parent = parent()
+        coordinator.synchronize(host)
+        textView.unmarkText()
+        textView.didChangeText()
+
+        // Rebind before the queued post-unmark replacement runs. The callback
+        // from the old identity must not overwrite the new session draft.
         activeIdentity = ObjectIdentifier(secondIdentity)
         boundText = "新会话草稿"
         coordinator.parent = parent()
         coordinator.synchronize(host)
+        spinRunLoop()
 
         XCTAssertFalse(textView.hasMarkedText())
         XCTAssertEqual(textView.string, "新会话草稿")
@@ -175,6 +184,237 @@ final class ComposerTextViewTests: XCTestCase {
 
         XCTAssertEqual(submitCount, 1)
         XCTAssertEqual(textView.string, "draft\n")
+    }
+
+    func testReturnDuringMarkedTextDoesNotSubmitOrReplaceCompositionWithNewline() {
+        let textView = ComposerNSTextView(frame: .zero)
+        var submitCount = 0
+        textView.onSubmit = { submitCount += 1 }
+        textView.setMarkedText(
+            "拼",
+            selectedRange: NSRange(location: 1, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+
+        XCTAssertTrue(textView.hasMarkedText())
+        textView.doCommand(by: #selector(NSTextView.insertNewline(_:)))
+
+        XCTAssertEqual(submitCount, 0)
+        XCTAssertTrue(textView.hasMarkedText())
+        XCTAssertEqual(textView.string, "拼")
+    }
+
+    func testExternalClearResetsTypingUndoBoundary() {
+        var boundText = ""
+        var isFocused = false
+        var boundHeight = ComposerTextViewLayout.minimumHeight(
+            for: .systemFont(ofSize: NSFont.systemFontSize)
+        )
+        let identity = NSObject()
+
+        func parent() -> ComposerTextView {
+            ComposerTextView(
+                text: Binding(
+                    get: { boundText },
+                    set: { boundText = $0 }
+                ),
+                isFocused: Binding(
+                    get: { isFocused },
+                    set: { isFocused = $0 }
+                ),
+                height: Binding(
+                    get: { boundHeight },
+                    set: { boundHeight = $0 }
+                ),
+                sessionIdentity: ObjectIdentifier(identity),
+                placeholder: "输入消息…",
+                onSubmit: {}
+            )
+        }
+
+        let coordinator = ComposerTextView.Coordinator(parent: parent())
+        let host = ComposerTextViewHost()
+        host.textView.delegate = coordinator
+        coordinator.host = host
+        coordinator.synchronize(host)
+
+        host.textView.insertText(
+            "abc",
+            replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+        host.textView.didChangeText()
+        let undoManager = coordinator.undoManager(for: host.textView)!
+
+        XCTAssertEqual(boundText, "abc")
+        XCTAssertTrue(undoManager.canUndo)
+
+        undoManager.undo()
+        spinRunLoop()
+        XCTAssertEqual(host.textView.string, "")
+        XCTAssertEqual(boundText, "")
+        undoManager.redo()
+        spinRunLoop()
+        XCTAssertEqual(host.textView.string, "abc")
+        XCTAssertEqual(boundText, "abc")
+
+        boundText = ""
+        coordinator.parent = parent()
+        coordinator.synchronize(host)
+
+        XCTAssertFalse(undoManager.canUndo)
+        undoManager.undo()
+        XCTAssertEqual(host.textView.string, "")
+        XCTAssertEqual(boundText, "")
+    }
+
+    func testSessionRebindResetsOldSessionTypingUndoBoundary() {
+        var boundText = ""
+        var isFocused = false
+        var boundHeight = ComposerTextViewLayout.minimumHeight(
+            for: .systemFont(ofSize: NSFont.systemFontSize)
+        )
+        let firstIdentity = NSObject()
+        let secondIdentity = NSObject()
+        var activeIdentity = ObjectIdentifier(firstIdentity)
+
+        func parent() -> ComposerTextView {
+            ComposerTextView(
+                text: Binding(
+                    get: { boundText },
+                    set: { boundText = $0 }
+                ),
+                isFocused: Binding(
+                    get: { isFocused },
+                    set: { isFocused = $0 }
+                ),
+                height: Binding(
+                    get: { boundHeight },
+                    set: { boundHeight = $0 }
+                ),
+                sessionIdentity: activeIdentity,
+                placeholder: "输入消息…",
+                onSubmit: {}
+            )
+        }
+
+        let coordinator = ComposerTextView.Coordinator(parent: parent())
+        let host = ComposerTextViewHost()
+        host.textView.delegate = coordinator
+        coordinator.host = host
+        coordinator.synchronize(host)
+        host.textView.insertText(
+            "old",
+            replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+        host.textView.didChangeText()
+        let undoManager = coordinator.undoManager(for: host.textView)!
+
+        XCTAssertEqual(boundText, "old")
+        XCTAssertTrue(undoManager.canUndo)
+
+        activeIdentity = ObjectIdentifier(secondIdentity)
+        // Use the same visible text to prove that the session boundary itself,
+        // not merely a string assignment, invalidates the old range operation.
+        boundText = "old"
+        coordinator.parent = parent()
+        coordinator.synchronize(host)
+
+        XCTAssertFalse(undoManager.canUndo)
+        undoManager.undo()
+        XCTAssertEqual(host.textView.string, "old")
+        XCTAssertEqual(boundText, "old")
+    }
+
+    func testExternalCompletionMapsCaretAtOldEndToNewEnd() {
+        var boundText = "/na"
+        var isFocused = false
+        var boundHeight = ComposerTextViewLayout.minimumHeight(
+            for: .systemFont(ofSize: NSFont.systemFontSize)
+        )
+        let identity = NSObject()
+
+        func parent() -> ComposerTextView {
+            ComposerTextView(
+                text: Binding(
+                    get: { boundText },
+                    set: { boundText = $0 }
+                ),
+                isFocused: Binding(
+                    get: { isFocused },
+                    set: { isFocused = $0 }
+                ),
+                height: Binding(
+                    get: { boundHeight },
+                    set: { boundHeight = $0 }
+                ),
+                sessionIdentity: ObjectIdentifier(identity),
+                placeholder: "输入消息…",
+                onSubmit: {}
+            )
+        }
+
+        let coordinator = ComposerTextView.Coordinator(parent: parent())
+        let host = ComposerTextViewHost()
+        host.textView.delegate = coordinator
+        coordinator.host = host
+        coordinator.synchronize(host)
+        host.textView.setSelectedRange(NSRange(location: 3, length: 0))
+
+        boundText = "/name "
+        coordinator.parent = parent()
+        coordinator.synchronize(host)
+
+        XCTAssertEqual(host.textView.string, "/name ")
+        XCTAssertEqual(
+            host.textView.selectedRange(),
+            NSRange(location: 6, length: 0)
+        )
+
+        host.textView.setSelectedRange(NSRange(location: 1, length: 2))
+        boundText = "/other "
+        coordinator.parent = parent()
+        coordinator.synchronize(host)
+
+        XCTAssertEqual(
+            host.textView.selectedRange(),
+            NSRange(location: 1, length: 2)
+        )
+    }
+
+    func testFocusedWidthOnlyRelayoutKeepsEndSelectionVisiblePastTenLineCap() {
+        let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let maximumHeight = ComposerTextViewLayout.maximumHeight(for: font)
+        let host = FocusedComposerTextViewHost(font: font)
+        host.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: 1_000,
+            height: maximumHeight
+        )
+
+        host.textView.string = String(
+            repeating: "这是用于验证窗口缩窄时插入点仍然可见的连续文本。",
+            count: 6
+        )
+        let end = (host.textView.string as NSString).length
+        host.textView.setSelectedRange(NSRange(location: end, length: 0))
+        host.layoutSubtreeIfNeeded()
+        XCTAssertLessThanOrEqual(host.documentTextHeight, maximumHeight)
+
+        host.frame.size.width = 160
+        host.needsLayout = true
+        host.layoutSubtreeIfNeeded()
+
+        XCTAssertGreaterThan(host.documentTextHeight, maximumHeight)
+        XCTAssertGreaterThan(
+            host.scrollView.contentView.bounds.origin.y,
+            0,
+            "A width-only relayout must scroll the active end selection into view"
+        )
+    }
+
+    private final class FocusedComposerTextViewHost: ComposerTextViewHost {
+        override var shouldScrollSelectionDuringLayout: Bool { true }
     }
 
     private func spinRunLoop() {
