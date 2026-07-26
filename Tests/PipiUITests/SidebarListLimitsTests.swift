@@ -5,7 +5,7 @@ final class SidebarListLimitsTests: XCTestCase {
     func testConstants() {
         XCTAssertEqual(SidebarListLimits.projects, 6)
         XCTAssertEqual(SidebarListLimits.pinned, 10)
-        XCTAssertEqual(SidebarListLimits.sessions, 20)
+        XCTAssertEqual(SidebarListLimits.sessions, 10)
     }
 
     func testCollapsedTruncatesAndShowsToggle() {
