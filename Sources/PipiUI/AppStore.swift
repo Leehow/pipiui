@@ -15,11 +15,17 @@ final class AppStore: ObservableObject {
     private static let projectsKey = "pipiui.projects"
     private static let archivedSessionsKey = "pipiui.archivedSessions"
     private static let pinnedSessionsKey = "pipiui.pinnedSessions"
+    private static let pinnedProjectsKey = "pipiui.pinnedProjects"
+    private static let projectDisplayNamesKey = "pipiui.projectDisplayNames"
     private static let lastProjectKey = "pipiui.lastProjectPath"
     private static let lastSessionFileKey = "pipiui.lastSessionFile"
     private static let lastSessionProjectKey = "pipiui.lastSessionProject"
 
     @Published var projects: [URL] = []
+    /// Project-specific sidebar preferences, persisted separately from project
+    /// paths so reordering pins never changes the user's configured project order.
+    @Published private(set) var pinnedProjectPaths: Set<String> = []
+    @Published private(set) var projectDisplayNameOverrides: [String: String] = [:]
     @Published var selectedProjectPath: String? {
         didSet {
             guard selectedProjectPath != oldValue else { return }
@@ -103,6 +109,17 @@ final class AppStore: ObservableObject {
         projects.first { $0.path == selectedProjectPath }
     }
 
+    /// Pinned projects are grouped first, with the original configured order
+    /// retained inside both the pinned and unpinned groups.
+    var orderedProjects: [URL] {
+        projects.filter { pinnedProjectPaths.contains($0.path) }
+            + projects.filter { !pinnedProjectPaths.contains($0.path) }
+    }
+
+    func projectDisplayName(for project: URL) -> String {
+        projectDisplayNameOverrides[project.path] ?? project.lastPathComponent
+    }
+
     private var bridge: BridgeServer?
     private var plugin = PiPlugin.Installed()
     /// Immutable JSONL snapshots only. This cache never constructs ChatSession/PiProcess.
@@ -136,6 +153,14 @@ final class AppStore: ObservableObject {
     private init() {
         let paths = UserDefaults.standard.stringArray(forKey: Self.projectsKey) ?? []
         projects = paths.map { URL(fileURLWithPath: $0) }
+        let projectPaths = Set(projects.map(\.path))
+        pinnedProjectPaths = Set(UserDefaults.standard.stringArray(forKey: Self.pinnedProjectsKey) ?? [])
+            .intersection(projectPaths)
+        projectDisplayNameOverrides = Self.sanitizedProjectDisplayNameOverrides(
+            UserDefaults.standard.dictionary(forKey: Self.projectDisplayNamesKey) as? [String: String] ?? [:],
+            projectPaths: projectPaths
+        )
+        persistProjectSidebarPreferences()
         let savedProject = UserDefaults.standard.string(forKey: Self.lastProjectKey)
         selectedProjectPath = projects.contains(where: { $0.path == savedProject })
             ? savedProject : projects.first?.path
@@ -352,6 +377,29 @@ final class AppStore: ObservableObject {
         UserDefaults.standard.set(Array(userPinnedSessionPaths).sorted(), forKey: Self.pinnedSessionsKey)
     }
 
+    private func persistProjectSidebarPreferences() {
+        UserDefaults.standard.set(Array(pinnedProjectPaths).sorted(), forKey: Self.pinnedProjectsKey)
+        UserDefaults.standard.set(projectDisplayNameOverrides, forKey: Self.projectDisplayNamesKey)
+    }
+
+    /// Stable grouping used by the sidebar and unit tests.
+    static func orderedProjectPaths(_ paths: [String], pinnedPaths: Set<String>) -> [String] {
+        paths.filter { pinnedPaths.contains($0) } + paths.filter { !pinnedPaths.contains($0) }
+    }
+
+    /// Removes stale project-name preference entries and normalizes saved titles.
+    static func sanitizedProjectDisplayNameOverrides(
+        _ overrides: [String: String],
+        projectPaths: Set<String>
+    ) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: overrides.compactMap { path, name in
+            guard projectPaths.contains(path) else { return nil }
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            return (path, trimmed)
+        })
+    }
+
     // MARK: - User pin (global sidebar section)
 
     func isSessionPinned(_ path: String) -> Bool {
@@ -388,6 +436,18 @@ final class AppStore: ObservableObject {
         )
     }
 
+    /// Archived rows retain their owning project so the global sidebar section
+    /// can restore/unarchive them without losing context.
+    var archivedSessionMetas: [(meta: SessionMeta, project: URL)] {
+        projects
+            .flatMap { project in
+                (archivedByProject[project.path] ?? []).map { (meta: $0, project: project) }
+            }
+            .sorted { lhs, rhs in
+                effectiveModified(lhs.meta) > effectiveModified(rhs.meta)
+            }
+    }
+
     func project(forSessionPath path: String) -> URL? {
         guard let projectPath = SessionPinLogic.projectPath(
             forSessionPath: path,
@@ -420,6 +480,32 @@ final class AppStore: ObservableObject {
         refreshSessions(for: url)
     }
 
+    func isProjectPinned(_ project: URL) -> Bool {
+        pinnedProjectPaths.contains(project.path)
+    }
+
+    func toggleProjectPin(_ project: URL) {
+        guard projects.contains(where: { $0.path == project.path }) else { return }
+        if pinnedProjectPaths.contains(project.path) {
+            pinnedProjectPaths.remove(project.path)
+        } else {
+            pinnedProjectPaths.insert(project.path)
+        }
+        persistProjectSidebarPreferences()
+    }
+
+    func renameProject(_ project: URL, to name: String) {
+        guard projects.contains(where: { $0.path == project.path }) else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if trimmed == project.lastPathComponent {
+            projectDisplayNameOverrides.removeValue(forKey: project.path)
+        } else {
+            projectDisplayNameOverrides[project.path] = trimmed
+        }
+        persistProjectSidebarPreferences()
+    }
+
     func removeProject(_ url: URL) {
         // Close every live session under this project so pi/subagent processes stop.
         let keys = openSessions.compactMap { key, session -> String? in
@@ -447,6 +533,9 @@ final class AppStore: ObservableObject {
             persistPinnedSessions()
         }
         projects.removeAll { $0.path == url.path }
+        pinnedProjectPaths.remove(url.path)
+        projectDisplayNameOverrides.removeValue(forKey: url.path)
+        persistProjectSidebarPreferences()
         persistProjects()
         if selectedProjectPath == url.path {
             selectedProjectPath = projects.first?.path
