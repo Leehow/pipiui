@@ -1,7 +1,7 @@
 import Foundation
 
-/// Pi extension: injects the Superpowers instructions that match the active model's tier,
-/// and gates the first dispatch of a weak-model session until an SOP has been read.
+/// Pi extension: injects the planning and verification guardrails that match the active
+/// model's tier.
 ///
 /// Why `before_agent_start` may rewrite the system prompt here (unlike `GitExtension`):
 /// the injected text is a pure function of the active model, so it is byte-identical turn
@@ -33,24 +33,26 @@ const STRONG_BLOCK = `
 ## Superpowers (reference)
 The skill library is available but secondary. Consult a skill when you actually want its
 SOP; do not pull T0/T1 work into brainstorming / writing-plans / subagent-driven-development.
-verification-before-completion still binds at every level: no "done" without fresh evidence
-from this round.`;
+For code-changing T2/T3, the main Boss may either use writing-plans itself or dispatch the
+existing lightweight plan subagent; choose whichever route is proportionate, review the
+resulting plan, then automatically dispatch the appropriate general-purpose worker(s)
+and validation/review. Never present an execution-mode menu or wait for user confirmation
+about subagent versus current-session execution. verification-before-completion still
+binds at every level: no "done" without fresh evidence from this round.`;
 
 const WEAK_BLOCK = `
 
-## Superpowers (mandatory for this model)
-This session runs the skill library as a hard SOP, not a reference. Your own difficulty
-triage tends to run low, so when in doubt, treat the task as the harder case.
+## Superpowers (weak-model guardrails)
+Use these planning and verification guardrails; do not turn the entire skill library into
+a mandatory SOP.
 
-- Anything past T1 — several files, unclear current state, a bug hunt, or work you cannot
-  finish with one worker — requires reading the matching skill BEFORE you dispatch:
-  vague requirement → brainstorming; multi-step work → writing-plans; execution →
-  subagent-driven-development; defect → systematic-debugging; independent problems →
-  dispatching-parallel-agents.
-- Read the skill file itself; its path is listed in <available_skills>. Do not act on your
-  recollection of what a skill says.
-- Reading a skill costs one tool call. Skipping it costs a failed dispatch you then have to
-  redo — when unsure whether a skill applies, read it.
+- For code-changing T2/T3, the main Boss MUST NOT read or invoke \`writing-plans\` or
+  \`brainstorming\`. It MUST dispatch the existing lightweight \`plan\` subagent, review
+  that result, then automatically dispatch the appropriate general-purpose worker(s)
+  and validation/review. Never present an execution-mode menu or wait for user
+  confirmation about subagent versus current-session execution.
+- Other skills remain available when their specific SOP is genuinely useful; there is no
+  first-dispatch skill-read gate.
 - verification-before-completion binds every level: never claim or relay done / fixed /
   passing without fresh evidence you checked this round.
 - Where skill docs say "dispatch subagent / Task tool", that is the \`subagent\` tool here
@@ -83,44 +85,12 @@ function isWeak(model: { provider?: string; id?: string } | undefined | null): b
   return key !== null && weakModelIds().has(key);
 }
 
-/** Skills live in `.../skills/<name>/SKILL.md`; a read of one counts as consulting it. */
-function looksLikeSkillRead(toolName: string, input: unknown): boolean {
-  if (toolName !== "read") return false;
-  const p = (input as { path?: unknown } | undefined)?.path;
-  if (typeof p !== "string") return false;
-  return p.includes("/skills/") || p.endsWith("SKILL.md");
-}
-
 export default function (pi: ExtensionAPI) {
-  let skillWasRead = false;
-  let gateFired = false;
-
   pi.on("before_agent_start", (event, ctx) => {
     const block = isWeak(ctx.model) ? WEAK_BLOCK : STRONG_BLOCK;
     // Stable per model ⇒ cache-safe. Guard anyway so a re-entrant call cannot double it.
     if (event.systemPrompt.endsWith(block)) return;
     return { systemPrompt: `${event.systemPrompt}${block}` };
-  });
-
-  pi.on("tool_call", (event, ctx) => {
-    if (looksLikeSkillRead(event.toolName, event.input)) {
-      skillWasRead = true;
-      return;
-    }
-    if (event.toolName !== "subagent") return;
-    if (gateFired || skillWasRead || !isWeak(ctx.model)) return;
-    // One shot only: the cost of a wrong guess is capped at a single round trip.
-    gateFired = true;
-    return {
-      block: true,
-      reason:
-        "Blocked once (weak-model guard): this model is marked as a weak model in PipiUI and " +
-        "no skill has been read in this session yet. Read the SOP that fits this task first — " +
-        "paths are in <available_skills> (subagent-driven-development for implementation, " +
-        "brainstorming or writing-plans for a vague requirement, systematic-debugging for a " +
-        "defect). Then dispatch again: this guard fires once per session and will not block you " +
-        "a second time.",
-    };
   });
 }
 """#
