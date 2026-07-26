@@ -553,7 +553,12 @@ struct InputBar: View {
                 // light and dark appearances.
                 .foregroundStyle(Color.primary)
                 .lineLimit(1...10)
-                .frame(minHeight: 20, alignment: .leading)
+                // Fill the gap between fixed controls, but let the vertical
+                // TextField report its wrapped-content height through the
+                // existing ten-line cap instead of clipping inside one row.
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, minHeight: 20, alignment: .leading)
+                .layoutPriority(1)
                 .focused($focused)
                 .onSubmit { [router = composerRouter] in
                     router.send()
