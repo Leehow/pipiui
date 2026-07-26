@@ -1,10 +1,10 @@
 #!/bin/bash
-# Worker-safe verification: tests + worktree-local release app package.
+# Worker-safe verification: debug tests by default, optional local preview.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/verify-worker.sh [--skip-tests]
+Usage: ./scripts/verify-worker.sh [--package-preview]
 
 Valid branches:
   ai/*
@@ -13,17 +13,22 @@ Valid branches:
 The current workspace must be a genuine linked worktree; the primary checkout
 is rejected even if it is manually switched to a worker-named branch.
 
-Runs ./scripts/build-app.sh in that linked worktree. The resulting
-build/PipiUI.app is local to it; /Applications is never modified.
-Use --skip-tests only when the handoff explicitly records why tests were not run.
+Default:
+  Runs swift test (real debug compile + tests, never lint/diff-only). It does
+  not run make-app.sh or create a release App package.
+
+Options:
+  --package-preview  Run tests, then create worktree-local build/PipiUI.app.
+
+/Applications is never modified.
 EOF
 }
 
-ARGS=()
+PACKAGE_PREVIEW=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --skip-tests)
-      ARGS+=("--skip-tests")
+    --package-preview)
+      PACKAGE_PREVIEW=1
       shift
       ;;
     -h|--help)
@@ -74,18 +79,21 @@ PRIMARY_PHYSICAL="$(cd "$PRIMARY_ROOT" 2>/dev/null && pwd -P)" || {
 }
 if [[ "$CURRENT_PHYSICAL" == "$PRIMARY_PHYSICAL" ]]; then
   echo "ERROR: worker verification is forbidden in the primary checkout: $PRIMARY_PHYSICAL" >&2
-  echo "Use ./scripts/new-ai-worktree.sh and run verification in its linked worktree." >&2
+  echo "External IDEs use new-ai-worktree.sh; PipiUI Boss uses its native extension." >&2
   exit 1
 fi
 
 echo "Worker verification"
 echo "  branch:   $BRANCH"
 echo "  worktree: $CURRENT_PHYSICAL"
-echo "  output:   $CURRENT_PHYSICAL/build/PipiUI.app"
 echo "  install:  disabled"
 
-if [[ "${#ARGS[@]}" -gt 0 ]]; then
-  exec ./scripts/build-app.sh "${ARGS[@]}"
-else
+if [[ "$PACKAGE_PREVIEW" -eq 1 ]]; then
+  echo "  mode:     test + local release package"
+  echo "  output:   $CURRENT_PHYSICAL/build/PipiUI.app"
   exec ./scripts/build-app.sh
+else
+  echo "  mode:     swift test (real debug compile + tests; no release package)"
+  echo "  output:   $CURRENT_PHYSICAL/.build/"
+  exec swift test
 fi
