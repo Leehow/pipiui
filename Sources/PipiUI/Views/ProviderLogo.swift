@@ -3,6 +3,11 @@ import SwiftUI
 
 /// Resolves provider / model refs to logo assets, SF Symbols, or monogram fallbacks.
 enum ProviderLogoCatalog {
+    enum RenderingStrategy: Equatable {
+        case vector(asset: String)
+        case systemSymbol(name: String)
+    }
+
     /// Map provider (+ optional modelId) → asset basename without extension, or nil.
     static func assetName(provider: String, modelId: String? = nil) -> String? {
         let p = provider.lowercased()
@@ -81,6 +86,68 @@ enum ProviderLogoCatalog {
         return String(ch).uppercased()
     }
 
+    /// Selects the deterministic rendering route used by `ProviderLogo`.
+    ///
+    /// Every known provider uses a generated native SwiftUI vector path. Unknown
+    /// providers retain the semantic SF Symbol fallback.
+    static func renderingStrategy(provider: String, modelId: String? = nil) -> RenderingStrategy {
+        guard let asset = assetName(provider: provider, modelId: modelId) else {
+            return .systemSymbol(name: systemImage(provider: provider, modelId: modelId))
+        }
+        if GeneratedProviderLogoShapes.vectorAssetNames.contains(asset) {
+            return .vector(asset: asset)
+        }
+        return .systemSymbol(name: systemImage(provider: provider, modelId: modelId))
+    }
+
+    /// Bridges generated SwiftUI vector paths into the `NSImage` representation
+    /// required by native macOS `Menu` / `Picker` rows.
+    ///
+    /// The bundled PNG files are deliberately not consulted. Each layer is
+    /// composited from `GeneratedProviderLogoShapes`, including even-odd fill
+    /// and opacity, then marked as a template for semantic menu-row tinting.
+    static func vectorNSImage(named asset: String, pointSize: CGFloat) -> NSImage? {
+        guard GeneratedProviderLogoShapes.vectorAssetNames.contains(asset),
+              let layers = GeneratedProviderLogoShapes.layers(for: asset),
+              !layers.isEmpty else {
+            return nil
+        }
+        let boundedPointSize = max(1, pointSize)
+        let cacheKey = "\(asset)@\(boundedPointSize)" as NSString
+        if let cached = vectorImageCache.object(forKey: cacheKey) {
+            return cached
+        }
+
+        let imageSize = NSSize(width: boundedPointSize, height: boundedPointSize)
+        let image = NSImage(size: imageSize, flipped: false) { rect in
+            guard let context = NSGraphicsContext.current?.cgContext else { return false }
+            context.saveGState()
+            defer { context.restoreGState() }
+
+            // SVG / SwiftUI coordinates run top-to-bottom; AppKit drawing runs
+            // bottom-to-top. Flip once before drawing the generated 24×24 paths.
+            context.translateBy(x: 0, y: rect.height)
+            context.scaleBy(x: 1, y: -1)
+            context.setFillColor(NSColor.black.cgColor)
+
+            for layer in layers {
+                context.saveGState()
+                context.setAlpha(CGFloat(layer.opacity))
+                let path = GeneratedProviderLogoShapes.path(
+                    for: layer,
+                    in: CGRect(origin: .zero, size: rect.size)
+                )
+                context.addPath(path.cgPath)
+                context.drawPath(using: layer.usesEvenOddFill ? .eoFill : .fill)
+                context.restoreGState()
+            }
+            return true
+        }
+        image.isTemplate = true
+        vectorImageCache.setObject(image, forKey: cacheKey)
+        return image
+    }
+
     /// Parse `"provider/modelId"` (modelId may contain `/`).
     static func parse(modelRef: String?) -> (provider: String, modelId: String?) {
         guard let raw = modelRef?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -102,6 +169,8 @@ enum ProviderLogoCatalog {
         "qwen", "mistral", "groq", "openrouter", "meta", "huggingface",
         "minimax", "nvidia", "qoder", "codex",
     ]
+
+    private static let vectorImageCache = NSCache<NSString, NSImage>()
 
     private static func existing(_ name: String) -> String? {
         knownAssets.contains(name) ? name : nil
@@ -131,23 +200,6 @@ enum ProviderLogoCatalog {
         return nil
     }
 
-    static func loadNSImage(named asset: String) -> NSImage? {
-        if let cached = imageCache.object(forKey: asset as NSString) {
-            return cached
-        }
-        guard let url = Bundle.module.url(
-            forResource: asset,
-            withExtension: "png",
-            subdirectory: "provider-logos"
-        ),
-        let image = NSImage(contentsOf: url) else {
-            return nil
-        }
-        imageCache.setObject(image, forKey: asset as NSString)
-        return image
-    }
-
-    private static let imageCache = NSCache<NSString, NSImage>()
 }
 
 /// Compact provider / model logo with asset → SF Symbol → monogram fallback.
@@ -184,20 +236,33 @@ struct ProviderLogo: View, Equatable {
 
     var body: some View {
         Group {
-            if let name = ProviderLogoCatalog.assetName(provider: provider, modelId: modelId),
-               let nsImage = ProviderLogoCatalog.loadNSImage(named: name) {
-                Image(nsImage: nsImage)
+            switch ProviderLogoCatalog.renderingStrategy(provider: provider, modelId: modelId) {
+            case let .vector(asset):
+                if let image = ProviderLogoCatalog.vectorNSImage(named: asset, pointSize: size) {
+                    Image(nsImage: image)
+                        .renderingMode(.template)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .foregroundStyle(.primary)
+                } else {
+                    Image(systemName: ProviderLogoCatalog.systemImage(
+                        provider: provider,
+                        modelId: modelId
+                    ))
                     .resizable()
-                    .interpolation(.high)
                     .aspectRatio(contentMode: .fit)
-            } else {
-                Image(systemName: ProviderLogoCatalog.systemImage(provider: provider, modelId: modelId))
+                    .foregroundStyle(.secondary)
+                }
+            case let .systemSymbol(name):
+                Image(systemName: name)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .foregroundStyle(.secondary)
             }
         }
         .frame(width: size, height: size)
+        .clipped()
         .accessibilityHidden(true)
     }
 }
