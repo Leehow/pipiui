@@ -9,6 +9,23 @@ struct SessionMeta: Identifiable, Hashable {
     var id: String { path }
 }
 
+enum SessionInitialTranscriptSeed {
+    static func select(
+        sessionPath: String?,
+        cachedTranscript: InitialTranscriptBuild?
+    ) -> InitialTranscriptBuild? {
+        guard sessionPath != nil else {
+            return InitialTranscriptBuild(
+                items: [],
+                toolRuns: [:],
+                itemCounter: 0,
+                skipNextAssistantIngest: false
+            )
+        }
+        return cachedTranscript
+    }
+}
+
 /// Global app state: project folders, discovered pi sessions, open RPC sessions.
 final class AppStore: ObservableObject {
     static let shared = AppStore()
@@ -221,9 +238,13 @@ final class AppStore: ObservableObject {
             }
         }
 
-        let preloadedTranscript = sessionPath.flatMap {
+        let cachedTranscript = sessionPath.flatMap {
             historyPreloader.snapshotIfCurrent(path: $0)?.transcript
         }
+        let initialTranscript = SessionInitialTranscriptSeed.select(
+            sessionPath: sessionPath,
+            cachedTranscript: cachedTranscript
+        )
         let session = ChatSession(
             id: key, projectURL: project, sessionPath: sessionPath,
             bridgePort: bridge?.port ?? 0,
@@ -240,7 +261,7 @@ final class AppStore: ObservableObject {
             bossPromptPath: bossModeEnabled ? plugin.bossPrompt : nil,
             blockedReason: conflicts.isEmpty ? nil
                 : "扩展撞名，pi 未启动。修复上方冲突后会自动重启会话。",
-            initialTranscript: preloadedTranscript
+            initialTranscript: initialTranscript
         )
         session.onSessionMetaChanged = { [weak self, weak session] in
             guard let self, let session else { return }

@@ -17,6 +17,51 @@ final class SessionHistoryPreloaderTests: XCTestCase {
         try? FileManager.default.removeItem(at: temporaryDirectory)
     }
 
+    func testNewSessionReceivesExplicitEmptySeed() throws {
+        let seed = try XCTUnwrap(
+            SessionInitialTranscriptSeed.select(
+                sessionPath: nil,
+                cachedTranscript: nil
+            )
+        )
+        XCTAssertEqual(
+            seed,
+            InitialTranscriptBuild(
+                items: [],
+                toolRuns: [:],
+                itemCounter: 0,
+                skipNextAssistantIngest: false
+            )
+        )
+    }
+
+    func testHistoricalSessionUsesCacheHitAsSeed() {
+        let cached = InitialTranscriptBuild(
+            items: [
+                ChatItem(id: "item-1", role: "user", blocks: [.text("cached")]),
+            ],
+            toolRuns: [:],
+            itemCounter: 1,
+            skipNextAssistantIngest: false
+        )
+        XCTAssertEqual(
+            SessionInitialTranscriptSeed.select(
+                sessionPath: "/tmp/history.jsonl",
+                cachedTranscript: cached
+            ),
+            cached
+        )
+    }
+
+    func testColdHistoricalSessionKeepsLoadingSeedNil() {
+        XCTAssertNil(
+            SessionInitialTranscriptSeed.select(
+                sessionPath: "/tmp/cold.jsonl",
+                cachedTranscript: nil
+            )
+        )
+    }
+
     func testParserReconstructsLatestActiveBranchAndToolRunsWithoutImages() throws {
         let imageBytes = Data(repeating: 0xAB, count: 128 * 1024).base64EncodedString()
         let file = temporaryDirectory.appendingPathComponent("branch.jsonl")
@@ -147,7 +192,7 @@ final class SessionHistoryPreloaderTests: XCTestCase {
         XCTAssertEqual(finalParserCalls, 0)
     }
 
-    func testPlanUsesExactlyTopTwentyPerProjectAndPrioritizesSelectionAndLastSession() {
+    func testPlanUsesExactlyTwentyPerProjectAndPrioritizesSelectionAndLastSession() {
         let firstProject = URL(fileURLWithPath: "/projects/first")
         let selectedProject = URL(fileURLWithPath: "/projects/selected")
         let first = (0..<25).map {
@@ -168,13 +213,20 @@ final class SessionHistoryPreloaderTests: XCTestCase {
             archivedPaths: ["/selected/2"]
         )
 
+        XCTAssertEqual(SessionHistoryPreloadPlan.sessionsPerProject, 20)
         XCTAssertEqual(result.count, 40)
         XCTAssertEqual(result.first, "/first/3")
         XCTAssertFalse(result.contains("/selected/2"))
         XCTAssertFalse(result.contains("/selected/21"))
         XCTAssertFalse(result.contains("/first/20"))
-        XCTAssertEqual(result.filter { $0.hasPrefix("/selected/") }.count, 20)
-        XCTAssertEqual(result.filter { $0.hasPrefix("/first/") }.count, 20)
+        XCTAssertEqual(
+            result.filter { $0.hasPrefix("/selected/") }.count,
+            SessionHistoryPreloadPlan.sessionsPerProject
+        )
+        XCTAssertEqual(
+            result.filter { $0.hasPrefix("/first/") }.count,
+            SessionHistoryPreloadPlan.sessionsPerProject
+        )
     }
 
     func testDefaultConcurrencyIsExplicitlyBoundedToTwo() {

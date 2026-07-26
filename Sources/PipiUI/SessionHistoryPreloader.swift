@@ -26,13 +26,16 @@ struct SessionHistorySnapshot: Equatable {
 
 /// Pure candidate selection shared by launch preloading and focused tests.
 enum SessionHistoryPreloadPlan {
+    /// Product preload depth is intentionally independent from the sidebar's display cap.
+    static let sessionsPerProject = 20
+
     static func candidates(
         projects: [URL],
         sessionsByProject: [String: [SessionMeta]],
         selectedProjectPath: String?,
         preferredSessionPath: String?,
         archivedPaths: Set<String>,
-        limit: Int = SidebarListLimits.sessions
+        limit: Int = SessionHistoryPreloadPlan.sessionsPerProject
     ) -> [String] {
         guard limit > 0 else { return [] }
 
