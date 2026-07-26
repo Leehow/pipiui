@@ -116,3 +116,7 @@ swift run PipiUITestRunner
 - 绝对路径自动链接 v1：不识别带空格的路径；围栏代码块内不做路径链接
 - Markdown 为简化渲染（行内语法 + 代码块/表格），无语法高亮
 - 斜杠命令 v1：无 `/model` 模型列表补全（手输 id）；TUI 专有且无 RPC 的命令（`/settings` `/login` `/share` `/import` `/trust` `/hotkeys` `/scoped-models`）不出现在面板；扩展交互对话框仍自动取消；流式中 extension/prompt/skill 命令会排队、无法即时执行（`/reload` 等 builtin 可即时执行）
+
+## 许可证
+
+Pipi UI 基于 [Apache License 2.0](./LICENSE) 开源。
