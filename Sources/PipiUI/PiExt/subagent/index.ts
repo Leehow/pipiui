@@ -45,6 +45,7 @@ const PIPIUI_PARENT = process.env.PIPIUI_AGENT_ID || null;
 const PIPIUI_MAX_DEPTH = Number.parseInt(process.env.PIPIUI_AGENT_MAX_DEPTH || "2", 10);
 // App 注入的补丁版 subagent 扩展目录；嵌套 spawn 时再传 `-e`，保持上报/护栏一致
 const PIPIUI_SUBAGENT_EXT = process.env.PIPIUI_SUBAGENT_EXT;
+const PIPIUI_PLAN_SKILL_ISOLATION = process.env.PIPIUI_PLAN_SKILL_ISOLATION === "1";
 
 // 跟踪本扩展 spawn 出的子 pi，父进程退出时尽量收割，避免孤儿继续打桥接
 const pipiuiChildProcs = new Set<ReturnType<typeof spawn>>();
@@ -1332,6 +1333,35 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
+const PLAN_SUBAGENT_SKILL_ISOLATION = `[PLAN SUBAGENT ISOLATION — HIGHEST PRIORITY]
+This is a specialized dispatched plan subagent. Honor Superpowers' <SUBAGENT-STOP>: you MUST NOT load or invoke using-superpowers, writing-plans, brainstorming, or any other skill. You MUST NOT create or save plan artifacts. Return only the lightweight plan format defined by this agent's own system prompt.`;
+
+const PI_SKILLS_PREAMBLE = [
+	"The following skills provide specialized instructions for specific tasks.",
+	"Use the read tool to load a skill's file when the task matches its description.",
+	"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+	"",
+].join("\n");
+
+const AVAILABLE_SKILLS_BLOCK = /\n*<available_skills>[\s\S]*?<\/available_skills>/g;
+
+function stripPiSkillsFromSystemPrompt(systemPrompt: string): string {
+	return systemPrompt.split(PI_SKILLS_PREAMBLE).join("").replace(AVAILABLE_SKILLS_BLOCK, "");
+}
+
+function isSkillReadPath(requestedPath: unknown): boolean {
+	if (typeof requestedPath !== "string") return false;
+	const normalized = requestedPath.replace(/\\/g, "/");
+	return /(?:^|\/)SKILL\.md$/i.test(normalized) || /(?:^|\/)skills\//i.test(normalized);
+}
+
+// Superpowers' Pi extension skips bootstrap injection when any context message contains
+// this stable marker. The explicit PipiUI extension loads first, so a plan-only sentinel
+// reaches Superpowers' messageContainsBootstrap guard without disabling other extensions.
+const SUPERPOWERS_BOOTSTRAP_MARKER = "superpowers:using-superpowers bootstrap for pi";
+const PLAN_BOOTSTRAP_SUPPRESSION_NOTE = `[PipiUI plan isolation sentinel: ${SUPERPOWERS_BOOTSTRAP_MARKER}
+Superpowers bootstrap is intentionally suppressed for this specialized plan subagent. This sentinel is not a skill instruction; follow only the lightweight plan system prompt.]`;
+
 async function runSingleAgent(
 	defaultCwd: string,
 	agents: AgentConfig[],
@@ -1384,6 +1414,7 @@ async function runSingleAgent(
 	const mainModelForChild = inheritMainModel(options?.sessionModel);
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	if (agentName === "plan") args.push("--no-skills");
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
 	// A new explicit thinking override wins over Pi's older `model:thinking` shorthand.
@@ -1501,6 +1532,8 @@ async function runSingleAgent(
 					PIPIUI_AGENT_ID: pipiuiAgentId,
 					PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
 					...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
+					// Override a possibly inherited marker so only plan children activate the hooks.
+					PIPIUI_PLAN_SKILL_ISOLATION: agentName === "plan" ? "1" : undefined,
 					...(placement.worktreePath ? { PIPIUI_WORKTREE_PATH: placement.worktreePath } : {}),
 					...(placement.worktreeBranch ? { PIPIUI_WORKTREE_BRANCH: placement.worktreeBranch } : {}),
 				},
@@ -1788,6 +1821,73 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	if (PIPIUI_PLAN_SKILL_ISOLATION) {
+		// Pi still accepts extension-contributed skillPaths under --no-skills. Remove the
+		// generated model-visible skill catalog and make this child extension the sole
+		// authority for the lightweight plan isolation instruction.
+		pi.on("before_agent_start", (event) => {
+			const systemPrompt = stripPiSkillsFromSystemPrompt(event.systemPrompt).trimEnd();
+			return {
+				systemPrompt: `${systemPrompt}\n\n${PLAN_SUBAGENT_SKILL_ISOLATION}`,
+			};
+		});
+
+		// The PipiUI extension is supplied explicitly with -e and loads before global
+		// extensions. Superpowers sees this marker in its later context handler and uses
+		// its own messageContainsBootstrap guard instead of injecting using-superpowers.
+		pi.on("context", (event) => {
+			const markerPresent = event.messages.some((message) => {
+				const content = (message as { content?: unknown }).content;
+				if (typeof content === "string") return content.includes(SUPERPOWERS_BOOTSTRAP_MARKER);
+				if (!Array.isArray(content)) return false;
+				return content.some(
+					(part) =>
+						part &&
+						typeof part === "object" &&
+						(part as { type?: unknown }).type === "text" &&
+						typeof (part as { text?: unknown }).text === "string" &&
+						(part as { text: string }).text.includes(SUPERPOWERS_BOOTSTRAP_MARKER),
+				);
+			});
+			if (markerPresent) return;
+
+			const taskIndex = event.messages.findIndex(
+				(message) => (message as { role?: unknown }).role === "user",
+			);
+			if (taskIndex < 0) return;
+
+			const messages = [...event.messages];
+			const taskMessage = messages[taskIndex] as { content?: unknown };
+			if (typeof taskMessage.content === "string") {
+				messages[taskIndex] = {
+					...messages[taskIndex],
+					content: `${taskMessage.content}\n\n${PLAN_BOOTSTRAP_SUPPRESSION_NOTE}`,
+				};
+			} else if (Array.isArray(taskMessage.content)) {
+				messages[taskIndex] = {
+					...messages[taskIndex],
+					content: [...taskMessage.content, { type: "text", text: PLAN_BOOTSTRAP_SUPPRESSION_NOTE }],
+				};
+			} else {
+				return;
+			}
+			return { messages };
+		});
+
+		// Even if another extension registers skill paths, the plan child cannot load the
+		// discovered instructions through Pi's read tool.
+		pi.on("tool_call", (event) => {
+			if (event.toolName !== "read") return;
+			const input = event.input as { path?: unknown; file_path?: unknown };
+			const requestedPath = input.path ?? input.file_path;
+			if (!isSkillReadPath(requestedPath)) return;
+			return {
+				block: true,
+				reason: "Plan subagents cannot load SKILL.md files or files under a skills directory.",
+			};
+		});
+	}
+
 	// ---- Stall watchdog：后台 job 超过 120s 无任何流式事件/输出 → 向 boss 会话推一条 ----
 	// [subagent-stalled] agentId=<id> title=<title> idle=<秒>s last=<最后一行动作摘要>
 	// 每个卡死片段只推一次（有新活动后重新武装）；复用 [subagent-done] 的 followUp 通道。
