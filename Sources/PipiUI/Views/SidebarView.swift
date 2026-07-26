@@ -188,18 +188,6 @@ struct SidebarView: View {
             .buttonStyle(.plain)
             .accessibilityLabel("\(isExpanded ? "收起" : "展开")项目\(displayName)")
 
-            Button {
-                selectProject(project)
-                store.newSession(project: project)
-            } label: {
-                Image(systemName: "plus")
-                    .font(.caption.weight(.semibold))
-                    .frame(width: 20, height: 20)
-            }
-            .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
-            .help("新建会话")
-            .accessibilityLabel("在\(displayName)中新建会话")
-
             Menu {
                 Button(store.isProjectPinned(project) ? "取消置顶项目" : "置顶项目") {
                     store.toggleProjectPin(project)
@@ -222,6 +210,18 @@ struct SidebarView: View {
             .menuStyle(.borderlessButton)
             .help("项目菜单")
             .accessibilityLabel("项目菜单\(displayName)")
+
+            Button {
+                selectProject(project)
+                store.newSession(project: project)
+            } label: {
+                Image(systemName: "plus")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 20, height: 20)
+            }
+            .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
+            .help("新建会话")
+            .accessibilityLabel("在\(displayName)中新建会话")
         }
         .padding(.vertical, 5)
         .padding(.horizontal, 6)
@@ -346,7 +346,6 @@ struct SidebarView: View {
                 moreToggle(expanded: sessionsExpanded, sectionName: "\(store.projectDisplayName(for: project)) 会话")
             }
         }
-        .padding(.leading, 20)
     }
 
     /// Trailing bleed so header actions clear the sidebar divider (~列表行内边距对齐).
