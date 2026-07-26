@@ -30,7 +30,7 @@ extension ComputerCoordinator {
             ))
             return
         }
-        guard let current = ComputerFrontmostApplication.current(),
+        guard let current = frontmostApplicationProvider(),
               Self.sameProcess(current, application) else {
             reply.respond(Self.failure(
                 "focus or process changed while the desktop batch awaited approval"
@@ -55,7 +55,7 @@ extension ComputerCoordinator {
             guard currentDescriptor == descriptor else {
                 throw ComputerCaptureDescriptorError.providerDescriptorMismatch
             }
-            try ComputerInputSynth.shared.validate(
+            try inputSynth.validate(
                 actions: request.actions,
                 imageSize: descriptor.outputSize,
                 displayBounds: descriptor.globalBounds
@@ -149,7 +149,7 @@ extension ComputerCoordinator {
                 )
             } else {
                 self.clearLeasePresentation()
-                ComputerInputSynth.shared.releaseAll()
+                self.inputSynth.releaseAll()
                 self.statusMessage = "Computer Use lease 已超时释放。"
                 self.refreshInputMonitoring()
             }

@@ -180,79 +180,6 @@ final class ComputerSafetyTests: XCTestCase {
         ))
     }
 
-    func testWriteApprovalIsExactExpiringAndOneUse() {
-        XCTAssertFalse(ComputerRequest(
-            actions: [action(.screenshot)]
-        ).requiresWriteApproval)
-        XCTAssertTrue(ComputerRequest(
-            actions: [action(.wait, duration: 0)]
-        ).requiresWriteApproval)
-
-        let coordinator = ComputerCoordinator(supportsInputMonitoring: false)
-        let old = makeWriteApproval(id: UUID(), requestID: UUID().uuidString, fingerprint: "old")
-        let replacement = makeWriteApproval(
-            id: UUID(),
-            requestID: UUID().uuidString,
-            fingerprint: "replacement"
-        )
-        var approvals = 0
-        var denials = 0
-        coordinator.pendingWriteApproval = replacement
-        coordinator.pendingWriteContinuation = .init(
-            approvalID: replacement.id,
-            requestID: replacement.requestID,
-            sessionKey: replacement.sessionKey,
-            fingerprint: replacement.fingerprint,
-            approve: { approvals += 1 },
-            deny: { _ in denials += 1 }
-        )
-
-        XCTAssertFalse(coordinator.approvePendingWrite(
-            id: old.id,
-            requestID: old.requestID,
-            fingerprint: old.fingerprint
-        ))
-        XCTAssertEqual(coordinator.pendingWriteApproval, replacement)
-        XCTAssertEqual(approvals, 0)
-        XCTAssertTrue(coordinator.approvePendingWrite(
-            id: replacement.id,
-            requestID: replacement.requestID,
-            fingerprint: replacement.fingerprint
-        ))
-        XCTAssertEqual(approvals, 1)
-        XCTAssertNil(coordinator.pendingWriteApproval)
-        XCTAssertFalse(coordinator.approvePendingWrite(
-            id: replacement.id,
-            requestID: replacement.requestID,
-            fingerprint: replacement.fingerprint
-        ))
-        XCTAssertEqual(approvals, 1)
-        XCTAssertEqual(denials, 0)
-
-        let expired = makeWriteApproval(
-            id: UUID(),
-            requestID: UUID().uuidString,
-            fingerprint: "expired",
-            expiresAt: Date(timeIntervalSince1970: 10)
-        )
-        coordinator.pendingWriteApproval = expired
-        coordinator.pendingWriteContinuation = .init(
-            approvalID: expired.id,
-            requestID: expired.requestID,
-            sessionKey: expired.sessionKey,
-            fingerprint: expired.fingerprint,
-            approve: { approvals += 1 },
-            deny: { _ in denials += 1 }
-        )
-        XCTAssertFalse(coordinator.approvePendingWrite(
-            id: expired.id,
-            requestID: expired.requestID,
-            fingerprint: expired.fingerprint,
-            now: Date(timeIntervalSince1970: 11)
-        ))
-        XCTAssertEqual(denials, 1)
-    }
-
     func testWriteApprovalHoldsOriginalRequestUntilExactDecision() throws {
         let coordinator = ComputerCoordinator(supportsInputMonitoring: false)
         let requestID = UUID().uuidString
@@ -335,20 +262,4 @@ final class ComputerSafetyTests: XCTestCase {
         }
     }
 
-    private func makeWriteApproval(
-        id: UUID,
-        requestID: String,
-        sessionKey: String = "session",
-        fingerprint: String,
-        expiresAt: Date = Date().addingTimeInterval(10)
-    ) -> ComputerCoordinator.PendingWriteApproval {
-        .init(
-            id: id,
-            requestID: requestID,
-            sessionKey: sessionKey,
-            fingerprint: fingerprint,
-            actionKinds: [.leftClick],
-            expiresAt: expiresAt
-        )
-    }
 }

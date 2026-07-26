@@ -3,17 +3,19 @@
 日期：2026-07-25
 状态：已实现 v1（代码与自动测试完成；真实 TCC / UI / 输入 V3 验收未执行）
 
-> 2026-07-26 实现修订：以下九项为最终实现约束并覆盖本文较早的单会话/单 action 表述：
+> 2026-07-26 实现修订：以下十一项为最终实现约束并覆盖本文较早的单会话/单 action 表述：
 >
 > 1. `ComputerCoordinator` 是 process-global 单控制者，使用 session lease、固定目标 bundle、预算、超时、用户接管和急停。
 > 2. OpenAI/Codex 不改写为原生 `computer_call`；v1 只对 Anthropic messages 使用官方 typed tool，其余统一自定义 batch schema。
 > 3. 内部请求统一为 `actions:[ComputerAction]`；每个未取消且被接受的 batch 结束后强制截图。
 > 4. 会话授权之外增加 bundle-id 应用授权；PipiUI、终端、密码管理器、钥匙串和 System Settings 永久拒绝。
 > 5. 截图只驻留内存：pi session 中仅保存 opaque marker，`context` hook 在 provider 调用前重新注入 PNG。
-> 6. 所有非纯截图 batch 都使用 request-id + 完整指纹绑定的 10 秒一次性确认；确认期间原请求保持挂起，不允许旧 UI 按钮批准替代请求。
+> 6. 所有非纯截图 batch 都使用 request-id + 完整指纹绑定的 10 秒一次性确认；点击 PipiUI 确认只进入 `approvedAwaitingTargetRefocus`，原请求继续挂起，必须由用户手动切回原 bundle + PID 后才一次性启动。
 > 7. 执行器有 20 秒 watchdog 和 17 秒静态预算；pi 35 秒 / bridge 40 秒超时或断连会按 request-id 取消输入、释放 held state 与 lease。
-> 8. 每个鼠标事件都以前后顺序窗口命中结果约束到已授权 PID；每个 action 前后还会核对 bundle + PID。
+> 8. 每个实际 input post 都在与取消共用的串行 gate 内重新核对 exact frontmost bundle + PID；键盘/Unicode 使用 `CGEvent.postToPid`，取消先获得 gate 后不会再发生正常 post。
 > 9. display id、输出像素尺寸与全局 point bounds 组成同一不可变 capture descriptor；选中显示器消失时 fail closed。
+> 10. 每个鼠标/scroll post 还以前后顺序窗口命中结果约束到已授权 PID；Dock、菜单、其他 App 或空白区域拒绝。
+> 11. held-key/mouse/Unicode cleanup-up 绕过正常授权以防输入卡住；键盘 cleanup 只发往记录的原目标 PID，Unicode cleanup 不重复文本。
 >
 > 运行说明、安全边界和 V3 手工验收见 [`docs/computer-use.md`](../../computer-use.md)。
 
@@ -113,9 +115,9 @@ globalPoint = bounds.origin + (imgX / imgW * bounds.width,
 
 ### D3. 输入合成
 
-- 鼠标：`CGEvent(mouseEventSource:mouseType:mouseCursorPosition:mouseButton:)` + `.post(tap: .cghidEventTap)`；down/up 成对；双击/三击靠 `setIntegerValueField(.mouseEventClickState, 2/3)`
+- 鼠标：`CGEvent(mouseEventSource:mouseType:mouseCursorPosition:mouseButton:)` + `.post(tap: .cghidEventTap)`；down/up 成对；双击/三击靠 `setIntegerValueField(.mouseEventClickState, 2/3)`。每个实际 post 前都在 execution gate 内复核 exact frontmost PID 与 topmost-window owner PID。
 - 拖拽：down → **若干中间 `mouseDragged` 帧** → up（一步到位很多 App 不认）
-- 打字：`CGEvent.keyboardSetUnicodeString` —— 不建 keycode 表，中文/emoji 直接过，也绕开输入法；20 个 UTF-16 unit 的事件分块只能在 Swift `Character` 边界切分，不能切断 surrogate pair、组合字符或 emoji ZWJ 序列
+- 打字：`CGEvent.keyboardSetUnicodeString` —— 不建 keycode 表，中文/emoji 直接过，也绕开输入法；20 个 UTF-16 unit 的事件分块只能在 Swift `Character` 边界切分，不能切断 surrogate pair、组合字符或 emoji ZWJ 序列。Unicode 文本只附在 down，普通 up 与失败 cleanup-up 都不携带文本，并通过 `postToPid` 定向原目标进程。
 - 快捷键：`key` 走 virtual keycode + modifier flags，需要一张**具名键**表（Return=36, Escape=53, Tab=48…）。这是有限机械枚举，不是开放语义分类；任意字符一律走 `type`
 - 节流：事件之间 sleep 8–16ms，否则大量 App 丢事件
 
@@ -150,8 +152,8 @@ Info.plist 不用改（macOS 的屏幕录制/辅助功能没有 usage-descriptio
 
 1. **全局开关**（设置 → 工具，默认**关**）。关时扩展根本不 `-e` 挂载 → 工具不存在 → 前缀零成本。注意 `ToolSkillSettings` 是「缺省=启用」的 opt-out 语义，**不能复用**，需要独立的 opt-in key。
 2. **会话级 + 应用级**：顶栏 🖥️ 指示器，激活时常亮；首次调用确认顶层会话，新 bundle/PID 捕获的应用身份另行确认。
-3. **批次级写确认**：任何含非 screenshot action 的 batch 使用 request-id、完整动作指纹、10 秒过期时间和一次性 continuation；确认 UI 必须提交精确 approval id/request id/fingerprint。
-4. **窗口命中约束**：每个 move/click/drag/scroll/down/up 事件前按 `CGWindowList` front-to-back 命中，最上层 owner PID 必须等于已授权前台 PID；Dock、菜单栏、系统 UI、其他 App 和空白区域均拒绝。
+3. **批次级写确认**：任何含非 screenshot action 的 batch 使用 request-id、完整动作指纹和 10 秒绝对期限；确认 UI 必须提交精确 approval id/request id/fingerprint。按钮只把请求推进 `approvedAwaitingTargetRefocus`，不激活 App、不同步执行；轮询检测原 bundle + PID 重新前台后清状态并启动一次。
+4. **逐事件进程与窗口约束**：取消和每个实际 input post 共享串行 gate；gate 内先核对 execution + exact frontmost bundle/PID。每个 move/click/drag/scroll/down/up 再按 `CGWindowList` front-to-back 命中，最上层 owner PID 必须等于目标 PID；键盘用 `postToPid`。Dock、菜单栏、系统 UI、其他 App 和空白区域均拒绝。
 5. **急停**：全局热键（⌥⇧Esc）先收集 active/in-flight/pending/paused/lease 会话，再撤销授权、取消对应生成并释放所有 down 状态。
 6. **subagent 边界**：默认只有主会话能用。Boss 模式会派深度 2 的树、后台会话继续跑，无人值守时这是最大风险面。经补丁版 subagent 的工具禁用路径注入 `--exclude-tools computer`。
 7. **审计**：每个动作写 JSONL（照 `Logging/TokenLedger` 的模式）。截图**不落盘**，只走内存 → base64。
@@ -208,7 +210,8 @@ Tests/PipiUITests/ComputerSafetyTests.swift
 | `anthropic-beta` 被别的扩展覆盖 → 官方工具 400 | 合并而非覆盖；T5 验收时实测 header 内容 |
 | 无人值守 agent 树误操作 | 默认关 + subagent 排除 + 每写批确认 + 全局 lease + 急停 + 审计 |
 | 请求超时后仍继续点击 | request-id 取消、20 秒 watchdog、35/40 秒传输 deadline、held-input 清理 |
-| 点击落到 Dock/菜单/其他 App | 每个 pointer event front-to-back owner PID 命中 + action 前后精确 PID 核对 |
+| PipiUI 确认按钮抢走焦点导致批准必失败 | 确认后等待用户手动切回原 bundle + PID；同 PID 才启动一次，替换/超时/取消 fail closed |
+| 点击或键盘落到其他 App | 每个 post 与取消串行；逐事件 exact frontmost PID，pointer 再做 topmost owner PID 命中，键盘 `postToPid` |
 | 截图泄露敏感信息 | 不落盘；文档明示；建议只在需要时开 |
 | 官方工具进 tools 数组会让 Anthropic 注入内建 system prompt → 前缀变化 | 开关只在 spawn 时生效（与现有 `--exclude-tools` 行为一致），会话内工具集恒定，不毁缓存 |
 

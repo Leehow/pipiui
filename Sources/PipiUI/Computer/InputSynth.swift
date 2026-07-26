@@ -13,6 +13,7 @@ enum ComputerInputError: LocalizedError {
     case sensitiveTextBlocked
     case eventCreationFailed
     case executionStopped
+    case targetProcessChanged
 
     var errorDescription: String? {
         switch self {
@@ -37,8 +38,20 @@ enum ComputerInputError: LocalizedError {
             return "macOS refused to create an input event"
         case .executionStopped:
             return "computer execution stopped"
+        case .targetProcessChanged:
+            return "frontmost application no longer matches the authorized target process"
         }
     }
+}
+
+struct ComputerHeldMouseState {
+    let targetPID: Int32
+    let point: CGPoint
+}
+
+struct ComputerHeldKeyState {
+    let targetPID: Int32
+    let modifiers: CGEventFlags
 }
 
 final class ComputerInputSynth: @unchecked Sendable {
@@ -48,9 +61,21 @@ final class ComputerInputSynth: @unchecked Sendable {
     let lock = NSLock()
     var heldMouseButtons: Set<CGMouseButton> = []
     var heldKeys: Set<CGKeyCode> = []
+    var heldMouseStates: [CGMouseButton: ComputerHeldMouseState] = [:]
+    var heldKeyStates: [CGKeyCode: ComputerHeldKeyState] = [:]
+    var heldUnicodeTargetPID: Int32?
     let source = CGEventSource(stateID: .privateState)
+    let eventSink: ComputerEventSink
+    let accessibilityTrusted: @Sendable () -> Bool
 
-    private init() {
+    init(
+        eventSink: ComputerEventSink = .live,
+        accessibilityTrusted: @escaping @Sendable () -> Bool = {
+            AXIsProcessTrusted()
+        }
+    ) {
+        self.eventSink = eventSink
+        self.accessibilityTrusted = accessibilityTrusted
         source?.localEventsSuppressionInterval = 0
     }
 
@@ -138,9 +163,9 @@ final class ComputerInputSynth: @unchecked Sendable {
         imageSize: ComputerImageSize,
         displayBounds: CGRect,
         shouldStop: @escaping @Sendable () -> Bool = { false },
-        authorizePointer: @escaping @Sendable (CGPoint) throws -> Void = { _ in }
+        postGate: ComputerLivePostGate
     ) throws {
-        guard AXIsProcessTrusted() || !action.emitsInput else {
+        guard accessibilityTrusted() || !action.emitsInput else {
             throw ComputerInputError.accessibilityPermissionMissing
         }
         try ensureRunning(shouldStop)
@@ -148,13 +173,16 @@ final class ComputerInputSynth: @unchecked Sendable {
         case .screenshot:
             return
         case .wait:
-            try cancellablePause(action.duration ?? 1, shouldStop: shouldStop)
+            try cancellablePause(
+                action.duration ?? 1,
+                shouldStop: shouldStop,
+                poll: { try postGate.poll() }
+            )
         case .mouseMove:
-            try ensureRunning(shouldStop)
             try postMouse(
                 .mouseMoved,
                 at: try point(action, imageSize, displayBounds),
-                authorizePointer: authorizePointer
+                postGate: postGate
             )
         case .leftClick:
             try click(
@@ -162,7 +190,7 @@ final class ComputerInputSynth: @unchecked Sendable {
                 at: try point(action, imageSize, displayBounds),
                 count: 1,
                 shouldStop: shouldStop,
-                authorizePointer: authorizePointer
+                postGate: postGate
             )
         case .rightClick:
             try click(
@@ -170,7 +198,7 @@ final class ComputerInputSynth: @unchecked Sendable {
                 at: try point(action, imageSize, displayBounds),
                 count: 1,
                 shouldStop: shouldStop,
-                authorizePointer: authorizePointer
+                postGate: postGate
             )
         case .middleClick:
             try click(
@@ -178,7 +206,7 @@ final class ComputerInputSynth: @unchecked Sendable {
                 at: try point(action, imageSize, displayBounds),
                 count: 1,
                 shouldStop: shouldStop,
-                authorizePointer: authorizePointer
+                postGate: postGate
             )
         case .doubleClick:
             try click(
@@ -186,7 +214,7 @@ final class ComputerInputSynth: @unchecked Sendable {
                 at: try point(action, imageSize, displayBounds),
                 count: 2,
                 shouldStop: shouldStop,
-                authorizePointer: authorizePointer
+                postGate: postGate
             )
         case .tripleClick:
             try click(
@@ -194,7 +222,7 @@ final class ComputerInputSynth: @unchecked Sendable {
                 at: try point(action, imageSize, displayBounds),
                 count: 3,
                 shouldStop: shouldStop,
-                authorizePointer: authorizePointer
+                postGate: postGate
             )
         case .leftMouseDown:
             let location = try optionalPoint(action, imageSize, displayBounds)
@@ -202,73 +230,100 @@ final class ComputerInputSynth: @unchecked Sendable {
             try mouseDown(
                 .left,
                 at: location,
-                shouldStop: shouldStop,
-                authorizePointer: authorizePointer
+                postGate: postGate
             )
         case .leftMouseUp:
             let location = try optionalPoint(action, imageSize, displayBounds)
                 ?? CGEvent(source: nil)?.location ?? .zero
-            try mouseUp(.left, at: location, authorizePointer: authorizePointer)
+            try mouseUp(.left, at: location, postGate: postGate)
         case .drag:
             try drag(
                 action,
                 imageSize: imageSize,
                 displayBounds: displayBounds,
                 shouldStop: shouldStop,
-                authorizePointer: authorizePointer
+                postGate: postGate
             )
         case .type:
-            try typeUnicode(action.text ?? "", shouldStop: shouldStop)
+            try typeUnicode(
+                action.text ?? "",
+                shouldStop: shouldStop,
+                postGate: postGate
+            )
         case .key:
             let chord = try ComputerKeyChord.parse(keys: action.keys, fallbackText: action.text)
-            try keyDown(chord, shouldStop: shouldStop)
+            try keyDown(chord, postGate: postGate)
             do {
-                try cancellablePause(0.012, shouldStop: shouldStop)
-                try keyUp(chord)
+                try cancellablePause(
+                    0.012,
+                    shouldStop: shouldStop,
+                    poll: { try postGate.poll() }
+                )
+                try keyUp(chord, postGate: postGate)
             } catch {
-                try? keyUp(chord)
+                cleanupKeyUp(chord)
                 throw error
             }
         case .holdKey:
             let chord = try ComputerKeyChord.parse(keys: action.keys, fallbackText: action.text)
-            try keyDown(chord, shouldStop: shouldStop)
-            defer { try? keyUp(chord) }
-            try cancellablePause(action.duration ?? 1, shouldStop: shouldStop)
+            try keyDown(chord, postGate: postGate)
+            do {
+                try cancellablePause(
+                    action.duration ?? 1,
+                    shouldStop: shouldStop,
+                    poll: { try postGate.poll() }
+                )
+                try keyUp(chord, postGate: postGate)
+            } catch {
+                cleanupKeyUp(chord)
+                throw error
+            }
         case .scroll:
-            try ensureRunning(shouldStop)
-            try scroll(action, authorizePointer: authorizePointer)
+            try scroll(action, postGate: postGate)
         }
-        try cancellablePause(0.012, shouldStop: shouldStop)
+        try cancellablePause(
+            0.012,
+            shouldStop: shouldStop,
+            poll: { try postGate.poll() }
+        )
     }
 
     func releaseAll() {
-        lock.lock()
-        let buttons = heldMouseButtons
-        let keys = heldKeys
-
-        let location = CGEvent(source: nil)?.location ?? .zero
-        for button in buttons {
+        let snapshot = lock.withLock {
+            let value = (
+                mouse: heldMouseStates,
+                keys: heldKeyStates,
+                unicodePID: heldUnicodeTargetPID
+            )
+            heldMouseButtons.removeAll()
+            heldKeys.removeAll()
+            heldMouseStates.removeAll()
+            heldKeyStates.removeAll()
+            heldUnicodeTargetPID = nil
+            return value
+        }
+        for (button, state) in snapshot.mouse {
             let eventType: CGEventType
             switch button {
             case .left: eventType = .leftMouseUp
             case .right: eventType = .rightMouseUp
             default: eventType = .otherMouseUp
             }
-            try? postMouse(eventType, at: location, button: button)
+            postCleanupMouseUp(
+                eventType,
+                button: button,
+                state: state
+            )
         }
-        for keyCode in keys {
-            if let event = CGEvent(
-                keyboardEventSource: source,
-                virtualKey: keyCode,
-                keyDown: false
-            ) {
-                tag(event)
-                event.post(tap: .cghidEventTap)
-            }
+        for (keyCode, state) in snapshot.keys {
+            postCleanupKeyUp(
+                keyCode: keyCode,
+                state: state
+            )
         }
-        heldMouseButtons.removeAll()
-        heldKeys.removeAll()
-        lock.unlock()
+        if let targetPID = snapshot.unicodePID {
+            postCleanupUnicodeUp(targetPID: targetPID)
+        }
     }
 
     func ensureRunning(_ shouldStop: @Sendable () -> Bool) throws {
@@ -279,11 +334,13 @@ final class ComputerInputSynth: @unchecked Sendable {
 
     func cancellablePause(
         _ duration: TimeInterval,
-        shouldStop: @Sendable () -> Bool
+        shouldStop: @Sendable () -> Bool,
+        poll: @Sendable () throws -> Void = {}
     ) throws {
         let deadline = Date().addingTimeInterval(duration)
         repeat {
             try ensureRunning(shouldStop)
+            try poll()
             let remaining = deadline.timeIntervalSinceNow
             if remaining <= 0 { return }
             Thread.sleep(forTimeInterval: min(0.02, remaining))

@@ -17,6 +17,16 @@ enum ComputerFrontmostApplication {
         )
     }
 
+    static func isRunning(_ identity: ComputerApplicationIdentity) -> Bool {
+        guard let running = NSRunningApplication(
+            processIdentifier: identity.processID
+        ), !running.isTerminated,
+        running.bundleIdentifier?.lowercased() == identity.normalizedBundleID else {
+            return false
+        }
+        return true
+    }
+
     private static func frontWindowTitle(processID: pid_t) -> String? {
         guard let rows = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],

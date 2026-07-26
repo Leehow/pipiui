@@ -14,6 +14,18 @@ final class ComputerExecutionGate: @unchecked Sendable {
     func cancel() {
         lock.withLock { cancelled = true }
     }
+
+    /// Cancellation and the final target check + event post share this lock.
+    /// Whichever acquires it first wins: once cancellation returns, no later
+    /// normal input post can begin.
+    func withActivePost<T>(_ body: () throws -> T) throws -> T {
+        try lock.withLock {
+            guard !cancelled else {
+                throw ComputerInputError.executionStopped
+            }
+            return try body()
+        }
+    }
 }
 
 final class ComputerResponseGate: @unchecked Sendable {
@@ -42,6 +54,12 @@ final class ComputerInFlightExecution {
     let gate: ComputerExecutionGate
     let reply: ComputerResponseGate
     var watchdog: DispatchWorkItem?
+    private let stateLock = NSLock()
+    private var current = true
+
+    var isCurrent: Bool {
+        stateLock.withLock { current }
+    }
 
     init(
         requestID: String,
@@ -55,6 +73,10 @@ final class ComputerInFlightExecution {
         self.generation = generation
         self.gate = gate
         self.reply = reply
+    }
+
+    func markNoLongerCurrent() {
+        stateLock.withLock { current = false }
     }
 }
 
@@ -79,12 +101,19 @@ final class ComputerCoordinator: ObservableObject {
     }
 
     struct PendingWriteApproval: Identifiable, Equatable {
+        enum Phase: Equatable {
+            case awaitingUserDecision
+            case approvedAwaitingTargetRefocus
+        }
+
         let id: UUID
         let requestID: String
         let sessionKey: String
         let fingerprint: String
         let actionKinds: [ComputerActionKind]
+        let targetApplication: ComputerApplicationIdentity
         let expiresAt: Date
+        var phase: Phase
     }
 
     @Published var pendingApproval: PendingApproval?
@@ -104,15 +133,38 @@ final class ComputerCoordinator: ObservableObject {
     var inFlightExecution: ComputerInFlightExecution?
     var pendingWriteContinuation: ComputerPendingWriteContinuation?
     var pendingWriteExpiryWork: DispatchWorkItem?
+    var pendingWriteRefocusWork: DispatchWorkItem?
     var expiryWork: DispatchWorkItem?
     var globalMonitor: Any?
     var localMonitor: Any?
     var monitorAccessibilityState: Bool?
     var onEmergencyStop: ((String) -> Void)?
     let supportsInputMonitoring: Bool
+    let supportsRefocusPolling: Bool
+    let frontmostApplicationProvider:
+        @Sendable () -> ComputerApplicationIdentity?
+    let targetProcessValidator:
+        @Sendable (ComputerApplicationIdentity) -> Bool
+    let inputSynth: ComputerInputSynth
 
-    init(supportsInputMonitoring: Bool = true) {
+    init(
+        supportsInputMonitoring: Bool = true,
+        supportsRefocusPolling: Bool = true,
+        frontmostApplicationProvider:
+            @escaping @Sendable () -> ComputerApplicationIdentity? = {
+                ComputerFrontmostApplication.current()
+            },
+        targetProcessValidator:
+            @escaping @Sendable (ComputerApplicationIdentity) -> Bool = {
+                ComputerFrontmostApplication.isRunning($0)
+            },
+        inputSynth: ComputerInputSynth = .shared
+    ) {
         self.supportsInputMonitoring = supportsInputMonitoring
+        self.supportsRefocusPolling = supportsRefocusPolling
+        self.frontmostApplicationProvider = frontmostApplicationProvider
+        self.targetProcessValidator = targetProcessValidator
+        self.inputSynth = inputSynth
     }
 
     func configure(onEmergencyStop: @escaping (String) -> Void) {
@@ -250,7 +302,7 @@ final class ComputerCoordinator: ObservableObject {
         }
         guard guardPermissions(for: request, reply: reply) else { return }
 
-        guard let application = ComputerFrontmostApplication.current() else {
+        guard let application = frontmostApplicationProvider() else {
             reply.respond(Self.failure("frontmost application identity is unavailable"))
             return
         }
@@ -275,7 +327,7 @@ final class ComputerCoordinator: ObservableObject {
                 width: rawRequest["displayWidth"].int,
                 height: rawRequest["displayHeight"].int
             )
-            try ComputerInputSynth.shared.validate(
+            try inputSynth.validate(
                 actions: request.actions,
                 imageSize: descriptor.outputSize,
                 displayBounds: descriptor.globalBounds

@@ -70,6 +70,9 @@ struct ComputerConsentBar: View {
 
     private var title: String {
         if let pendingWrite {
+            if pendingWrite.phase == .approvedAwaitingTargetRefocus {
+                return "动作已批准，请切回 \(pendingWrite.targetApplication.name)"
+            }
             return "确认 \(pendingWrite.actionKinds.count) 个桌面动作"
         }
         if let pending {
@@ -94,6 +97,13 @@ struct ComputerConsentBar: View {
 
     private var message: String {
         if let pendingWrite {
+            if pendingWrite.phase == .approvedAwaitingTargetRefocus {
+                return "请手动切回 \(pendingWrite.targetApplication.name) "
+                    + "(\(pendingWrite.targetApplication.bundleID)，PID "
+                    + "\(pendingWrite.targetApplication.processID))。"
+                    + "PipiUI 不会主动切换应用；仅当这个精确进程重新位于前台时才执行，"
+                    + "超时、进程替换或策略变化都会取消。"
+            }
             let actions = pendingWrite.actionKinds.map(\.rawValue).joined(separator: " → ")
             return "仅批准请求 \(pendingWrite.requestID.prefix(8)) 的精确动作指纹；"
                 + "\(Int(ComputerRuntimeBudget.maximumApprovalSeconds)) 秒后过期且只能使用一次。"
@@ -125,22 +135,32 @@ struct ComputerConsentBar: View {
     @ViewBuilder
     private var controls: some View {
         if let pendingWrite {
-            HStack(spacing: 6) {
-                Button("拒绝") {
+            if pendingWrite.phase == .approvedAwaitingTargetRefocus {
+                Button("取消等待") {
                     coordinator.denyPendingWrite(
                         id: pendingWrite.id,
                         requestID: pendingWrite.requestID,
                         fingerprint: pendingWrite.fingerprint
                     )
                 }
-                Button("确认并执行") {
-                    coordinator.approvePendingWrite(
-                        id: pendingWrite.id,
-                        requestID: pendingWrite.requestID,
-                        fingerprint: pendingWrite.fingerprint
-                    )
+            } else {
+                HStack(spacing: 6) {
+                    Button("拒绝") {
+                        coordinator.denyPendingWrite(
+                            id: pendingWrite.id,
+                            requestID: pendingWrite.requestID,
+                            fingerprint: pendingWrite.fingerprint
+                        )
+                    }
+                    Button("确认，等待切回目标") {
+                        coordinator.approvePendingWrite(
+                            id: pendingWrite.id,
+                            requestID: pendingWrite.requestID,
+                            fingerprint: pendingWrite.fingerprint
+                        )
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
             }
         } else if let pending {
             switch pending.kind {

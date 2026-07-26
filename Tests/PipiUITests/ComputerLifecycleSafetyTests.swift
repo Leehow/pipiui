@@ -68,7 +68,8 @@ final class ComputerLifecycleSafetyTests: XCTestCase {
             id: UUID(),
             requestID: UUID().uuidString,
             sessionKey: "pending-write",
-            fingerprint: "write"
+            fingerprint: "write",
+            phase: .approvedAwaitingTargetRefocus
         )
         var writeDenied = false
         coordinator.pendingWriteApproval = write
@@ -77,6 +78,8 @@ final class ComputerLifecycleSafetyTests: XCTestCase {
             requestID: write.requestID,
             sessionKey: write.sessionKey,
             fingerprint: write.fingerprint,
+            targetApplication: write.targetApplication,
+            validateContext: {},
             approve: {},
             deny: { _ in writeDenied = true }
         )
@@ -175,7 +178,9 @@ final class ComputerLifecycleSafetyTests: XCTestCase {
         id: UUID,
         requestID: String,
         sessionKey: String,
-        fingerprint: String
+        fingerprint: String,
+        phase: ComputerCoordinator.PendingWriteApproval.Phase =
+            .awaitingUserDecision
     ) -> ComputerCoordinator.PendingWriteApproval {
         .init(
             id: id,
@@ -183,7 +188,14 @@ final class ComputerLifecycleSafetyTests: XCTestCase {
             sessionKey: sessionKey,
             fingerprint: fingerprint,
             actionKinds: [.leftClick],
-            expiresAt: Date().addingTimeInterval(10)
+            targetApplication: .init(
+                bundleID: "com.example.editor",
+                name: "Editor",
+                processID: 42,
+                windowTitle: nil
+            ),
+            expiresAt: Date().addingTimeInterval(10),
+            phase: phase
         )
     }
 }

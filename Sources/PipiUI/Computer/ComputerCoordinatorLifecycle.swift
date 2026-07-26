@@ -61,7 +61,7 @@ extension ComputerCoordinator {
         if activeSessionKey == sessionKey {
             clearLeasePresentation()
         }
-        ComputerInputSynth.shared.releaseAll()
+        inputSynth.releaseAll()
         refreshInputMonitoring()
     }
 
@@ -95,7 +95,7 @@ extension ComputerCoordinator {
             pausedSessionKeys.removeAll()
             auditSessionIDs.removeAll()
         }
-        ComputerInputSynth.shared.releaseAll()
+        inputSynth.releaseAll()
         refreshInputMonitoring()
     }
 
@@ -138,13 +138,14 @@ extension ComputerCoordinator {
         guard inFlightExecution === execution else { return }
         execution.watchdog?.cancel()
         execution.gate.cancel()
+        execution.markNoLongerCurrent()
         inFlightExecution = nil
         executionGeneration &+= 1
         _ = leaseController.release(sessionKey: execution.sessionKey)
         expiryWork?.cancel()
         expiryWork = nil
         clearLeasePresentation()
-        ComputerInputSynth.shared.releaseAll()
+        inputSynth.releaseAll()
         if respond {
             execution.reply.respond(Self.failure(reason))
         }

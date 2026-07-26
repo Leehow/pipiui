@@ -13,8 +13,8 @@ v1 的边界：
 - 不读取 Accessibility Tree、Secure Text Field 或 OCR，不能可靠理解像素中的“支付/发布/删除”语义；因此 v1 不允许无人值守的破坏性流程。常见 token/private-key 形态会在输入前被拦截，但这不是完整的 secret 检测。
 - 任意时刻只有一个顶层会话持有全局桌面 lease。切换 PipiUI 会话、关闭/重启会话、进程退出、超时、用户接管或急停都会释放 lease。
 - subagent 无条件排除 `computer`，不受工具设置或 agent 定义影响。
-- 目标应用按当前前台 bundle identifier **和 PID** 在每个动作前后重新核对。每个 pointer event 还会 front-to-back 命中最上层可见窗口；Dock、菜单栏、系统 UI、其他 App 或空白区域都会在事件发送前被拒绝。
-- 新应用需要显式确认；可以仅本会话允许或持久允许/拒绝。每个含非 screenshot action 的批次还需要一次 request-id + 完整动作指纹绑定的确认，10 秒过期、只执行一次，旧确认按钮不能批准替代请求。
+- 目标应用按当前前台 bundle identifier **和 PID** 在每个动作前后及每个实际 input event 发送前重新核对。取消与最终核对/发送共用串行 gate；取消先发生时不会再有后续正常事件。pointer event 还会 front-to-back 命中最上层可见窗口；Dock、菜单栏、系统 UI、其他 App 或空白区域都会在事件发送前被拒绝。Unicode 与具名键事件使用 `CGEvent.postToPid` 投递到已授权 PID。
+- 新应用需要显式确认；可以仅本会话允许或持久允许/拒绝。每个含非 screenshot action 的批次还需要一次 request-id + 完整动作指纹绑定的确认，10 秒过期、只执行一次，旧确认按钮不能批准替代请求。点击 PipiUI 内的确认后，请求进入“已批准、等待精确目标进程重新前台”状态；PipiUI 不会主动激活目标 App，只有原 bundle + 原 PID 被用户手动切回后才启动。
 - PipiUI 自身、Terminal/iTerm/Ghostty/Warp/Kitty/WezTerm/Alacritty 等终端、密码管理器、钥匙串、系统授权进程和 System Settings 永久拒绝。`⌘Tab` / `⌘Space` 应用切换以及 `⌘Q` / `⌘Delete` 等高风险快捷键也被拒绝；需要用户亲自切到并授权新目标应用。
 - 用户真实移动鼠标、点击、按键或滚动时立即暂停并释放控制权。全局急停为 `⌥⇧Esc`；它会收集并中止 active、in-flight、pending approval 和 paused 会话，撤销授权并释放所有按键/鼠标 down 状态。
 
@@ -88,7 +88,8 @@ tccutil reset ScreenCapture com.leehow.pipiui
 ## 安全与隐私
 
 - bridge 只监听 `127.0.0.1`，只接受有 Content-Length 的 `POST /rpc`，请求 body 上限 2 MiB，连接超时 40 秒。
-- 每个 batch 有 UUID request id。pi 在 35 秒超时时发送显式 `computer_cancel`；bridge 断连/40 秒 deadline 和 Swift 20 秒执行 watchdog 也会按同一 request id 取消 gate、阻止后续动作并释放 lease/held input。10 秒确认期 + 20 秒执行上限严格低于两层传输 deadline。
+- 每个 batch 有 UUID request id。pi 在 35 秒超时时发送显式 `computer_cancel`；bridge 断连/40 秒 deadline 和 Swift 20 秒执行 watchdog 也会按同一 request id 取消 gate、阻止后续动作并释放 lease/held input。确认与等待重聚焦共用同一个绝对 10 秒期限；10 + 20 = 30 秒，分别给 pi 和 bridge 留出 5/10 秒传输余量。
+- 每个实际 pointer、scroll、Unicode down/up、named-key down/up 都通过同一个 live post gate。该 gate 在一把锁内核对 execution 未取消、前台 bundle/PID 精确匹配，pointer 再核对 topmost-window PID，然后才调用 event sink。hold/down-up 间隔每 20ms 轮询同一 gate；漂移或取消时只发送不经普通授权的 cleanup-up，其中键盘 cleanup 定向到最初记录的 PID，Unicode cleanup-up 不携带文本。
 - 每个顶层会话使用独立的 32-byte 路由 capability 与桌面写 capability；任何 bridge 请求都在主线程路由前做恒时比较验证，`computer_batch` 还要通过第二个 capability。桌面 capability 会从 subagent、验证 shell 和辅助 git 子进程的环境中删除。
 - 截图 PNG 不写文件、不进入 pi JSONL；进程退出即丢失。
 - `~/Library/Application Support/PipiUI/computer-audit.jsonl` 只记录时间、随机 audit session id、bundle id、应用名、动作种类/坐标/计数、结果与 focus drift。
@@ -105,7 +106,7 @@ tccutil reset ScreenCapture com.leehow.pipiui
 2. 打开 `build/PipiUI.app`，在设置中开启 Computer Use，并授予两项 TCC 权限。
 3. 建立顶层会话；确认工具栏出现桌面图标，subagent 的工具参数中没有 `computer`。
 4. 首次工具调用应先返回 session consent required；批准后重试。首次目标应用调用应再返回 application authorization required；批准后必须切回该 App 再重试。
-5. 第一个非 screenshot batch 应保持请求等待并出现精确批次确认条；10 秒内批准后只执行一次，拒绝、过期、关闭会话或传输取消都不得继续发送输入。
+5. 第一个非 screenshot batch 应保持请求等待并出现精确批次确认条；点击确认后 UI 必须变为“请切回目标应用”，此时不得执行。手动切回最初捕获的 bundle + PID 后只能启动一次；同 bundle 新 PID、拒绝、10 秒绝对期限到期、关闭会话或传输取消都不得继续发送输入。
 
 ### TextEdit
 

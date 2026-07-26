@@ -1,5 +1,5 @@
-import Foundation
 import CoreGraphics
+import Foundation
 
 extension ComputerInputSynth {
     func point(
@@ -35,35 +35,37 @@ extension ComputerInputSynth {
         at point: CGPoint,
         count: Int,
         shouldStop: @Sendable () -> Bool,
-        authorizePointer: @Sendable (CGPoint) throws -> Void
+        postGate: ComputerLivePostGate
     ) throws {
         for clickState in 1...count {
             try mouseDown(
                 button,
                 at: point,
                 clickState: clickState,
-                shouldStop: shouldStop,
-                authorizePointer: authorizePointer
+                postGate: postGate
             )
             do {
-                try cancellablePause(0.012, shouldStop: shouldStop)
+                try cancellablePause(
+                    0.012,
+                    shouldStop: shouldStop,
+                    poll: { try postGate.poll() }
+                )
                 try mouseUp(
                     button,
                     at: point,
                     clickState: clickState,
-                    authorizePointer: authorizePointer
+                    postGate: postGate
                 )
             } catch {
-                try? mouseUp(
-                    button,
-                    at: point,
-                    clickState: clickState,
-                    authorizePointer: authorizePointer
-                )
+                cleanupMouseUp(button)
                 throw error
             }
             if clickState < count {
-                try cancellablePause(0.012, shouldStop: shouldStop)
+                try cancellablePause(
+                    0.012,
+                    shouldStop: shouldStop,
+                    poll: { try postGate.poll() }
+                )
             }
         }
     }
@@ -72,8 +74,7 @@ extension ComputerInputSynth {
         _ button: CGMouseButton,
         at point: CGPoint,
         clickState: Int = 1,
-        shouldStop: @Sendable () -> Bool = { false },
-        authorizePointer: @Sendable (CGPoint) throws -> Void = { _ in }
+        postGate: ComputerLivePostGate
     ) throws {
         let type: CGEventType
         switch button {
@@ -81,20 +82,32 @@ extension ComputerInputSynth {
         case .right: type = .rightMouseDown
         default: type = .otherMouseDown
         }
-        try lock.withLock {
-            try ensureRunning(shouldStop)
-            heldMouseButtons.insert(button)
-            do {
-                try postMouse(
-                    type,
-                    at: point,
-                    button: button,
-                    clickState: clickState,
-                    authorizePointer: authorizePointer
+        guard let event = makeMouseEvent(
+            type,
+            at: point,
+            button: button,
+            clickState: clickState
+        ) else {
+            throw ComputerInputError.eventCreationFailed
+        }
+        try postGate.post(pointerAt: point) {
+            try lock.withLock {
+                heldMouseButtons.insert(button)
+                heldMouseStates[button] = .init(
+                    targetPID: postGate.targetPID,
+                    point: point
                 )
-            } catch {
-                heldMouseButtons.remove(button)
-                throw error
+                do {
+                    try eventSink.postGlobal(
+                        event,
+                        postGate.targetPID,
+                        .pointer
+                    )
+                } catch {
+                    heldMouseButtons.remove(button)
+                    heldMouseStates.removeValue(forKey: button)
+                    throw error
+                }
             }
         }
     }
@@ -103,7 +116,7 @@ extension ComputerInputSynth {
         _ button: CGMouseButton,
         at point: CGPoint,
         clickState: Int = 1,
-        authorizePointer: @Sendable (CGPoint) throws -> Void = { _ in }
+        postGate: ComputerLivePostGate
     ) throws {
         let type: CGEventType
         switch button {
@@ -111,15 +124,20 @@ extension ComputerInputSynth {
         case .right: type = .rightMouseUp
         default: type = .otherMouseUp
         }
-        try lock.withLock {
-            try postMouse(
-                type,
-                at: point,
-                button: button,
-                clickState: clickState,
-                authorizePointer: authorizePointer
-            )
-            heldMouseButtons.remove(button)
+        guard let event = makeMouseEvent(
+            type,
+            at: point,
+            button: button,
+            clickState: clickState
+        ) else {
+            throw ComputerInputError.eventCreationFailed
+        }
+        try postGate.post(pointerAt: point) {
+            try eventSink.postGlobal(event, postGate.targetPID, .pointer)
+            lock.withLock {
+                heldMouseButtons.remove(button)
+                heldMouseStates.removeValue(forKey: button)
+            }
         }
     }
 
@@ -128,20 +146,28 @@ extension ComputerInputSynth {
         at point: CGPoint,
         button: CGMouseButton = .left,
         clickState: Int = 1,
-        authorizePointer: @Sendable (CGPoint) throws -> Void = { _ in }
+        trackHeldButton: CGMouseButton? = nil,
+        postGate: ComputerLivePostGate
     ) throws {
-        try authorizePointer(point)
-        guard let event = CGEvent(
-            mouseEventSource: source,
-            mouseType: type,
-            mouseCursorPosition: point,
-            mouseButton: button
+        guard let event = makeMouseEvent(
+            type,
+            at: point,
+            button: button,
+            clickState: clickState
         ) else {
             throw ComputerInputError.eventCreationFailed
         }
-        event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
-        tag(event)
-        event.post(tap: .cghidEventTap)
+        try postGate.post(pointerAt: point) {
+            try eventSink.postGlobal(event, postGate.targetPID, .pointer)
+            if let trackHeldButton {
+                lock.withLock {
+                    heldMouseStates[trackHeldButton] = .init(
+                        targetPID: postGate.targetPID,
+                        point: point
+                    )
+                }
+            }
+        }
     }
 
     func drag(
@@ -149,7 +175,7 @@ extension ComputerInputSynth {
         imageSize: ComputerImageSize,
         displayBounds: CGRect,
         shouldStop: @Sendable () -> Bool,
-        authorizePointer: @Sendable (CGPoint) throws -> Void
+        postGate: ComputerLivePostGate
     ) throws {
         let end = try point(action, imageSize, displayBounds)
         let start: CGPoint
@@ -162,44 +188,40 @@ extension ComputerInputSynth {
         } else {
             start = CGEvent(source: nil)?.location ?? end
         }
-        var lastPoint = start
-        try mouseDown(
-            .left,
-            at: start,
-            shouldStop: shouldStop,
-            authorizePointer: authorizePointer
-        )
-        defer {
-            try? mouseUp(
-                .left,
-                at: lastPoint,
-                authorizePointer: authorizePointer
-            )
-        }
-        let frames = 16
-        for index in 1...frames {
-            try ensureRunning(shouldStop)
-            let progress = CGFloat(index) / CGFloat(frames)
-            let point = CGPoint(
-                x: start.x + (end.x - start.x) * progress,
-                y: start.y + (end.y - start.y) * progress
-            )
-            try postMouse(
-                .leftMouseDragged,
-                at: point,
-                authorizePointer: authorizePointer
-            )
-            lastPoint = point
-            try cancellablePause(0.012, shouldStop: shouldStop)
+        try mouseDown(.left, at: start, postGate: postGate)
+        do {
+            let frames = 16
+            for index in 1...frames {
+                let progress = CGFloat(index) / CGFloat(frames)
+                let nextPoint = CGPoint(
+                    x: start.x + (end.x - start.x) * progress,
+                    y: start.y + (end.y - start.y) * progress
+                )
+                try postMouse(
+                    .leftMouseDragged,
+                    at: nextPoint,
+                    trackHeldButton: .left,
+                    postGate: postGate
+                )
+                try cancellablePause(
+                    0.012,
+                    shouldStop: shouldStop,
+                    poll: { try postGate.poll() }
+                )
+            }
+            try mouseUp(.left, at: end, postGate: postGate)
+        } catch {
+            cleanupMouseUp(.left)
+            throw error
         }
     }
 
     func typeUnicode(
         _ text: String,
-        shouldStop: @Sendable () -> Bool
+        shouldStop: @Sendable () -> Bool,
+        postGate: ComputerLivePostGate
     ) throws {
         for textChunk in try ComputerUnicodeChunker.chunks(text) {
-            try ensureRunning(shouldStop)
             let chunk = Array(textChunk.utf16)
             guard let down = CGEvent(
                 keyboardEventSource: source,
@@ -217,23 +239,54 @@ extension ComputerInputSynth {
                     stringLength: buffer.count,
                     unicodeString: buffer.baseAddress
                 )
-                up.keyboardSetUnicodeString(
-                    stringLength: buffer.count,
-                    unicodeString: buffer.baseAddress
-                )
             }
             tag(down)
             tag(up)
-            down.post(tap: .cghidEventTap)
-            throttle()
-            up.post(tap: .cghidEventTap)
-            try cancellablePause(0.012, shouldStop: shouldStop)
+
+            try postGate.post {
+                try lock.withLock {
+                    heldUnicodeTargetPID = postGate.targetPID
+                    do {
+                        try eventSink.postToPID(
+                            down,
+                            postGate.targetPID,
+                            .unicodeDown(utf16Count: chunk.count)
+                        )
+                    } catch {
+                        heldUnicodeTargetPID = nil
+                        throw error
+                    }
+                }
+            }
+            do {
+                try cancellablePause(
+                    0.012,
+                    shouldStop: shouldStop,
+                    poll: { try postGate.poll() }
+                )
+                try postGate.post {
+                    try eventSink.postToPID(
+                        up,
+                        postGate.targetPID,
+                        .unicodeUp
+                    )
+                    lock.withLock { heldUnicodeTargetPID = nil }
+                }
+            } catch {
+                cleanupUnicodeUp(targetPID: postGate.targetPID)
+                throw error
+            }
+            try cancellablePause(
+                0.012,
+                shouldStop: shouldStop,
+                poll: { try postGate.poll() }
+            )
         }
     }
 
     func keyDown(
         _ chord: ComputerKeyChord,
-        shouldStop: @Sendable () -> Bool = { false }
+        postGate: ComputerLivePostGate
     ) throws {
         guard let event = CGEvent(
             keyboardEventSource: source,
@@ -242,16 +295,34 @@ extension ComputerInputSynth {
         ) else {
             throw ComputerInputError.eventCreationFailed
         }
-        try lock.withLock {
-            try ensureRunning(shouldStop)
-            heldKeys.insert(chord.keyCode)
-            event.flags = chord.modifiers
-            tag(event)
-            event.post(tap: .cghidEventTap)
+        event.flags = chord.modifiers
+        tag(event)
+        try postGate.post {
+            try lock.withLock {
+                heldKeys.insert(chord.keyCode)
+                heldKeyStates[chord.keyCode] = .init(
+                    targetPID: postGate.targetPID,
+                    modifiers: chord.modifiers
+                )
+                do {
+                    try eventSink.postToPID(
+                        event,
+                        postGate.targetPID,
+                        .keyDown(chord.keyCode)
+                    )
+                } catch {
+                    heldKeys.remove(chord.keyCode)
+                    heldKeyStates.removeValue(forKey: chord.keyCode)
+                    throw error
+                }
+            }
         }
     }
 
-    func keyUp(_ chord: ComputerKeyChord) throws {
+    func keyUp(
+        _ chord: ComputerKeyChord,
+        postGate: ComputerLivePostGate
+    ) throws {
         guard let event = CGEvent(
             keyboardEventSource: source,
             virtualKey: chord.keyCode,
@@ -259,20 +330,26 @@ extension ComputerInputSynth {
         ) else {
             throw ComputerInputError.eventCreationFailed
         }
-        lock.withLock {
-            event.flags = chord.modifiers
-            tag(event)
-            event.post(tap: .cghidEventTap)
-            heldKeys.remove(chord.keyCode)
+        event.flags = chord.modifiers
+        tag(event)
+        try postGate.post {
+            try eventSink.postToPID(
+                event,
+                postGate.targetPID,
+                .keyUp(chord.keyCode)
+            )
+            lock.withLock {
+                heldKeys.remove(chord.keyCode)
+                heldKeyStates.removeValue(forKey: chord.keyCode)
+            }
         }
     }
 
     func scroll(
         _ action: ComputerAction,
-        authorizePointer: @Sendable (CGPoint) throws -> Void = { _ in }
+        postGate: ComputerLivePostGate
     ) throws {
         let location = CGEvent(source: nil)?.location ?? .zero
-        try authorizePointer(location)
         let amount = Int32(min(10_000, max(1, action.scrollAmount ?? 0)))
         let direction = action.scrollDirection?.lowercased() ?? ""
         let vertical: Int32
@@ -296,26 +373,9 @@ extension ComputerInputSynth {
         }
         event.location = location
         tag(event)
-        event.post(tap: .cghidEventTap)
+        try postGate.post(pointerAt: location) {
+            try eventSink.postGlobal(event, postGate.targetPID, .scroll)
+        }
     }
 
-    func tag(_ event: CGEvent) {
-        event.setIntegerValueField(
-            .eventSourceUserData,
-            value: Self.syntheticEventTag
-        )
-    }
-
-    func throttle() {
-        Thread.sleep(forTimeInterval: 0.012)
-    }
-}
-
-extension NSLock {
-    @discardableResult
-    func withLock<T>(_ body: () throws -> T) rethrows -> T {
-        lock()
-        defer { unlock() }
-        return try body()
-    }
 }

@@ -39,7 +39,7 @@ extension ComputerCoordinator {
                 ))
                 break
             }
-            guard let before = ComputerFrontmostApplication.current(),
+            guard let before = frontmostApplicationProvider(),
                   Self.sameProcess(before, targetApplication) else {
                 focusDrift = true
                 batchError = "focus or process drift detected before action \(index)"
@@ -53,22 +53,30 @@ extension ComputerCoordinator {
             }
 
             do {
+                let actionInputSynth = inputSynth
+                let postGate = ComputerLivePostGate(
+                    executionGate: execution.gate,
+                    targetApplication: targetApplication,
+                    frontmostApplicationProvider: frontmostApplicationProvider,
+                    authorizePointer: { point in
+                        try ComputerWindowConfinement.authorizeLive(
+                            point: point,
+                            targetPID: targetApplication.processID
+                        )
+                    },
+                    isExecutionCurrent: { execution.isCurrent }
+                )
                 try await Task.detached(priority: .userInitiated) {
-                    try ComputerInputSynth.shared.execute(
+                    try actionInputSynth.execute(
                         action,
                         imageSize: descriptor.outputSize,
                         displayBounds: descriptor.globalBounds,
                         shouldStop: { execution.gate.isCancelled },
-                        authorizePointer: { point in
-                            try ComputerWindowConfinement.authorizeLive(
-                                point: point,
-                                targetPID: targetApplication.processID
-                            )
-                        }
+                        postGate: postGate
                     )
                 }.value
             } catch {
-                ComputerInputSynth.shared.releaseAll()
+                inputSynth.releaseAll()
                 batchError = error.localizedDescription
                 outcomes.append(.init(
                     index: index,
@@ -79,9 +87,9 @@ extension ComputerCoordinator {
                 break
             }
 
-            guard let after = ComputerFrontmostApplication.current(),
+            guard let after = frontmostApplicationProvider(),
                   Self.sameProcess(after, targetApplication) else {
-                ComputerInputSynth.shared.releaseAll()
+                inputSynth.releaseAll()
                 focusDrift = true
                 batchError = "focus or process drift detected after action \(index)"
                 outcomes.append(.init(
@@ -100,7 +108,7 @@ extension ComputerCoordinator {
             ))
         }
 
-        var finalApp = ComputerFrontmostApplication.current() ?? targetApplication
+        var finalApp = frontmostApplicationProvider() ?? targetApplication
         if !Self.sameProcess(finalApp, targetApplication) {
             focusDrift = true
             batchError = batchError ?? "focus or process drift detected after batch"
@@ -123,7 +131,7 @@ extension ComputerCoordinator {
                 batchError = batchError ?? error.localizedDescription
             }
         }
-        if let postCapture = ComputerFrontmostApplication.current() {
+        if let postCapture = frontmostApplicationProvider() {
             finalApp = postCapture
             if !Self.sameProcess(postCapture, targetApplication) {
                 focusDrift = true
@@ -153,6 +161,7 @@ extension ComputerCoordinator {
         let ownsExecution = inFlightExecution === execution
         if ownsExecution {
             execution.watchdog?.cancel()
+            execution.markNoLongerCurrent()
             inFlightExecution = nil
             activeApplication = result.finalApplication
         }
@@ -212,7 +221,8 @@ extension ComputerCoordinator {
     }
 
     func executionIsCurrent(_ execution: ComputerInFlightExecution) -> Bool {
-        !execution.gate.isCancelled
+        execution.isCurrent
+            && !execution.gate.isCancelled
             && inFlightExecution === execution
             && executionGeneration == execution.generation
     }
