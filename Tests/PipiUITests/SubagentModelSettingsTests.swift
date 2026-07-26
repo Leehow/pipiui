@@ -184,6 +184,43 @@ final class SubagentModelSettingsTests: XCTestCase {
         XCTAssertTrue(source.contains("args.push(\"--thinking\", resolvedThinking)"))
         XCTAssertTrue(source.contains("stripModelThinkingSuffix(resolvedModel)"))
     }
+
+    func testPlanSubagentDeterministicallyIsolatesSkillsAndKeepsExtensions() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // PipiUITests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // repository root
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/PipiUI/PiExt/subagent/index.ts"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(source.contains("if (agentName === \"plan\") args.push(\"--no-skills\");"))
+        XCTAssertEqual(source.components(separatedBy: "args.push(\"--no-skills\")").count - 1, 1)
+        XCTAssertTrue(source.contains("PIPIUI_PLAN_SKILL_ISOLATION: agentName === \"plan\" ? \"1\" : undefined"))
+        XCTAssertTrue(source.contains("process.env.PIPIUI_PLAN_SKILL_ISOLATION === \"1\""))
+        XCTAssertTrue(source.contains("if (PIPIUI_PLAN_SKILL_ISOLATION)"))
+        XCTAssertTrue(source.contains("pi.on(\"before_agent_start\""))
+        XCTAssertTrue(source.contains("stripPiSkillsFromSystemPrompt(event.systemPrompt)"))
+        XCTAssertTrue(source.contains("The following skills provide specialized instructions for specific tasks."))
+        XCTAssertTrue(source.contains("<available_skills>"))
+        XCTAssertTrue(source.contains("<\\/available_skills>"))
+        XCTAssertTrue(source.contains("Honor Superpowers' <SUBAGENT-STOP>"))
+        XCTAssertTrue(source.contains("using-superpowers, writing-plans, brainstorming, or any other skill"))
+        XCTAssertTrue(source.contains("MUST NOT create or save plan artifacts"))
+        XCTAssertTrue(source.contains("Return only the lightweight plan format defined by this agent's own system prompt"))
+        XCTAssertTrue(source.contains("pi.on(\"context\""))
+        XCTAssertTrue(source.contains("superpowers:using-superpowers bootstrap for pi"))
+        XCTAssertTrue(source.contains("Superpowers bootstrap is intentionally suppressed for this specialized plan subagent"))
+        XCTAssertTrue(source.contains("text: PLAN_BOOTSTRAP_SUPPRESSION_NOTE"))
+        XCTAssertTrue(source.contains("pi.on(\"tool_call\""))
+        XCTAssertTrue(source.contains("if (event.toolName !== \"read\") return"))
+        XCTAssertTrue(source.contains("isSkillReadPath(requestedPath)"))
+        XCTAssertTrue(source.contains("cannot load SKILL.md files or files under a skills directory"))
+        XCTAssertTrue(source.contains("writePromptToTempFile(agent.name, agent.systemPrompt)"))
+        XCTAssertTrue(source.contains("if (PIPIUI_SUBAGENT_EXT) args.push(\"-e\", PIPIUI_SUBAGENT_EXT);"))
+        XCTAssertFalse(source.contains("args.push(\"--no-extensions\")"))
+    }
 }
 
 final class AgentCatalogTests: XCTestCase {
