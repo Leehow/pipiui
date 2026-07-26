@@ -75,12 +75,15 @@
 [`AGENTS.md`](./AGENTS.md)。
 
 ```bash
+./scripts/init-integration-line.sh --base <committed-ref>
 swift run                        # Worker 快速调试，仅当前 worktree
 ./scripts/verify-worker.sh       # Worker 默认: 真实 debug 编译+测试，不打 release
 ./scripts/verify-worker.sh --package-preview # 显式: test + 本地 release .app
+./scripts/integrate-worker.sh --branch ai/codex/<task>
+./scripts/promote-green.sh       # full test 后原子推进 green
 ./make-app.sh                    # Worker: release 本地打包，不安装
 ./scripts/build-app.sh           # Worker: test + 本地打包，不安装
-./scripts/ship-app.sh            # Integration: 唯一 canonical 安装入口
+./scripts/ship-app.sh            # Release main: 唯一 canonical 安装入口
 open -a PipiUI                   # 打开最近一次 canonical ship
 ```
 
@@ -91,7 +94,7 @@ open -a PipiUI                   # 打开最近一次 canonical ship
   --tool codex \
   --work-id settings \
   --topic sidebar \
-  --base codex/settings
+  --base integration/green
 ```
 
 该 helper 只支持外部 IDE：`codex`、`claude`、`cursor`。默认在主 checkout
@@ -103,19 +106,42 @@ open -a PipiUI                   # 打开最近一次 canonical ship
 它的成功仅表示 worker-local verification passed，不能声称已更新 Launchpad
 中的 App。
 默认验证只跑 `swift test`/debug；只有明确需要本地可双击预览时才加
-`--package-preview`。最终集成负责人逐个 merge 后，从 clean 的 `main`、`codex/*` 或
-`integration/*` 执行 `ship-app.sh`；脚本持有全局锁、运行测试/本地打包、
-安装 `/Applications/PipiUI.app`，并核对双路径二进制 SHA-256 与时间戳。
+`--package-preview`。
 
 `PIPIUI_INSTALL_APP=/absolute/other/PipiUI.app` 可为受控验证覆盖安装位置；
 普通 worker 不得使用该变量绕过 `ship-app.sh`。已有 ship lock 必须先调查其
 owner 记录，脚本不会自动删除。
 
+### Green / staging 共享迭代主线
+
+`main` 只用于 release；`integration/green` 是最近一次完整测试通过的共享 head，
+不应 checkout；`integration/staging` 是唯一串行 merge/test candidate，其 linked
+worktree 也是 PipiUI Boss 的项目根目录。首次用显式 committed base 初始化：
+
+```bash
+./scripts/init-integration-line.sh --base <committed-ref>
+```
+
+外部 worker 从 `integration/green` 创建，在自己的 worktree 真实编译并跑相关
+测试。完成后 integration owner 在 clean staging 中一次接收一个：
+
+```bash
+./scripts/integrate-worker.sh --branch ai/codex/<work-id>-<topic>
+```
+
+它执行 `--no-ff` merge，再调用 `promote-green.sh` 跑完整 `swift test`；只有通过
+才用 expected-old 原子推进 green。Merge/test 失败时 staging 保留给 fixer，
+green 与 main 不变，且在 staging 恢复并 promote 前拒绝下一个 external worker。
+
+Active divergent task 不强行同步 green。完成的 worktree 退役；下一个任务从最新
+green 新建。IDE 只在 idle + clean 时同步。最终由 integration owner 在 helper
+之外显式 merge green → main，然后只从 clean main 运行一次 `ship-app.sh`。
+这些 helper 与 Boss runtime 都不直接推进 Git `main`。
+
 ### PipiUI Boss native lifecycle（优先）
 
-- Boss 主会话应打开在专用、clean 的 `codex/*` 或 `integration/*` integration
-  worktree；active development 不直接使用 shared dirty primary checkout 或
-  Git `main`。
+- Boss 主会话应打开在专用、clean 的 `integration/staging` linked worktree；
+  active development 不直接使用 shared dirty primary checkout 或 Git `main`。
 - Native extension 独占 `.pi/worktrees/*` child 创建/复用、`pipiui/*` 命名、
   attested structured verify、串行 auto-merge、成功移除与失败 worktree
   recovery。auto-merge target 是当前 session project root，不必是 Git `main`。
@@ -125,8 +151,8 @@ owner 记录，脚本不会自动删除。
   runtime auto-merge 明确允许；“worker 不得 merge”只指 leaf worker。
 - Merge/verify failure 服从 `BossPrompt.swift` 的 same-agent/fixer recovery；
   BossPrompt/native runtime 与通用外部 IDE 规则冲突时，native lifecycle 优先。
-- Boss ledger/work terminal 且 integration clean 后，只运行一次
-  `ship-app.sh`。
+- Boss wave terminal、post-merge verified 且 staging clean 后，由 integration
+  owner 运行 `promote-green.sh`；Boss 不直接 auto-merge Git `main`。
 
 ### 构建开销
 

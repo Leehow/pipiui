@@ -8,11 +8,14 @@ alwaysApply: true
 [`CONSTITUTION.md`](../../CONSTITUTION.md) is binding and is the single
 source of truth.
 
-- Create Cursor tasks with `./scripts/new-ai-worktree.sh --tool cursor ...`.
+- Create Cursor tasks from current green with
+  `./scripts/new-ai-worktree.sh --tool cursor ... --base integration/green`.
 - Open and edit only the returned linked worktree.
 - Run `./scripts/verify-worker.sh` for a real debug compile + relevant tests.
 - Do not package a release App by default; use `--package-preview` only when a
   local runnable preview is explicitly needed.
+- Do not merge green into an active divergent task. Retire completed worktrees
+  and create the next task from current green.
 - Never install or replace `/Applications/PipiUI.app`; only the integration
-  owner may run `./scripts/ship-app.sh`.
+  owner may integrate, promote green, merge green to main, and ship.
 - Do not merge, clean another workspace, or claim canonical delivery.
