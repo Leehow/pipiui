@@ -8,6 +8,10 @@ alwaysApply: true
 [`CONSTITUTION.md`](../../CONSTITUTION.md) is binding and is the single
 source of truth.
 
+- Supported external tool slugs are `codex|claude|cursor|kimi|qoder|zcode`;
+  each uses `ai/<tool>/*`. Kimi CLI, Qoder, and ZCode use the binding root
+  `AGENTS.md` without duplicated tool-specific rules or copied local
+  permissions. PipiUI Boss is the only native-lifecycle exception.
 - Create Cursor tasks from current green with
   `./scripts/new-ai-worktree.sh --tool cursor ... --base integration/green`.
 - Open and edit only the returned linked worktree.

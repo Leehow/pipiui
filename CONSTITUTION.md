@@ -7,7 +7,7 @@ Binding rules for humans and coding agents. Short and enforceable.
 
 ## 1. 两条隔离工作流（强制）
 
-### 外部 IDE：Codex / Claude Code / Cursor
+### 外部 IDE：Codex / Claude Code / Cursor / Kimi CLI / Qoder / ZCode
 
 每个实现任务必须使用独立 branch + linked worktree。不得让多个工具在同一工作
 目录里切分支或并行写代码。
@@ -18,6 +18,9 @@ Binding rules for humans and coding agents. Short and enforceable.
 ```
 
 - Worker 分支：`ai/<tool>/<work-id>-<topic>`。
+- `--tool` 仅接受 `codex|claude|cursor|kimi|qoder|zcode`。Kimi CLI、Qoder 与
+  ZCode 直接服从根 `AGENTS.md`；不得复制或提交本地 permissions，也不新增重复
+  的 tool-specific rule。
 - Worker 从明确的 committed base ref 创建；调用者工作区可有未提交内容，但绝不会复制过去。
 - IDE 必须打开新 worktree 根目录。Worker 只提交自己的范围，不合并别人的分支。
 - 新任务从 `integration/green` 开始。active divergent task 不在中途强行 merge
@@ -175,7 +178,8 @@ BossPrompt/native runtime 优先规则处理。
 
 **权威用户产物：** `/Applications/PipiUI.app`（仅 `ship-app.sh` 可更新）
 
-**外部 IDE 入口：** `new-ai-worktree.sh` · `verify-worker.sh`
+**外部 IDE 入口（`codex|claude|cursor|kimi|qoder|zcode`）：**
+`new-ai-worktree.sh` · `verify-worker.sh`
 
 **PipiUI Boss 入口：** native extension / `BossPrompt.swift`
 
