@@ -59,10 +59,30 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         XCTAssertTrue(text.contains("**Research / analysis-only**"))
         XCTAssertTrue(text.contains("this route is terminal without plan or implementation"))
         XCTAssertTrue(text.contains("**T2 medium, code-changing**"))
-        XCTAssertTrue(text.contains("explore → plan"))
-        XCTAssertTrue(text.contains("otherwise start with plan"))
+        XCTAssertTrue(text.contains("follow the model-tier planning route appended below"))
+        XCTAssertTrue(text.contains("explore first and then take that planning route"))
         XCTAssertTrue(text.contains("then dispatch general-purpose to implement"))
         XCTAssertTrue(text.contains("never completion of a change request"))
+        XCTAssertTrue(text.contains("each genuinely new user goal"))
+        XCTAssertTrue(text.contains("exactly one visible triage line"))
+        XCTAssertTrue(text.contains("follow-up questions"))
+        XCTAssertTrue(text.contains("confirmations or approvals"))
+        XCTAssertTrue(text.contains("requests for a path"))
+        XCTAssertTrue(text.contains("clarifications"))
+        XCTAssertTrue(text.contains("[subagent-done]"))
+        XCTAssertTrue(text.contains("any other internal worker signal"))
+        XCTAssertTrue(text.contains("keep any reclassification internal and silent"))
+        XCTAssertTrue(text.contains("## Automatic execution routing (highest priority)"))
+        XCTAssertTrue(text.contains("Execution routing is not a user product"))
+        XCTAssertTrue(text.contains("automatically select the"))
+        XCTAssertTrue(text.contains("multi-agent/subagent execution route"))
+        XCTAssertTrue(text.contains("immediately dispatch the appropriate"))
+        XCTAssertTrue(text.contains("general-purpose worker(s)"))
+        XCTAssertTrue(text.contains("MUST NOT present, relay, or ask the user"))
+        XCTAssertTrue(text.contains("execution-mode menu"))
+        XCTAssertTrue(text.contains("ignore it and continue with worker dispatch"))
+        XCTAssertTrue(text.contains("MUST NOT pause for confirmation"))
+        XCTAssertTrue(text.contains("do it yourself, no subagents"))
         XCTAssertTrue(text.contains("## Completion ownership and optional audit"))
         XCTAssertTrue(text.contains("The Boss owns the completion decision"))
         XCTAssertTrue(text.contains("Routine research and clean T1/T2 work do not require"))
@@ -75,6 +95,70 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         XCTAssertFalse(text.contains("MUST dispatch `secretary`"))
         XCTAssertFalse(text.contains("secretary-controlled commit gate"))
         XCTAssertFalse(text.contains("`closeout=pass` plus required integration verification"))
+        XCTAssertFalse(text.contains("Open every task with one line"))
+    }
+
+    func testBossPromptContinuesAutonomouslyUnlessAuthorityIsActuallyNeeded() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "pipiui-boss-confirmation-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = try XCTUnwrap(BossPrompt.install(into: dir))
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+
+        XCTAssertTrue(text.contains(
+            "## Autonomous continuation and minimal confirmation gate (highest priority)"
+        ))
+        XCTAssertTrue(text.contains(
+            "requested a fix or implementation"
+        ))
+        XCTAssertTrue(text.contains(
+            "within that scope is established"
+        ))
+        XCTAssertTrue(text.contains(
+            "MUST NOT ask them to reply \"fix\", \"continue\", \"start\""
+        ))
+        XCTAssertTrue(text.contains(
+            "safe, reversible, within the"
+        ))
+        XCTAssertTrue(text.contains(
+            "derivable from repository or conversation evidence"
+        ))
+        XCTAssertTrue(text.contains("review feedback"))
+        XCTAssertTrue(text.contains("internal spec rebaselining"))
+        XCTAssertTrue(text.contains("worker failure recovery"))
+        XCTAssertTrue(text.contains(
+            "adopt the most conservative interpretation"
+        ))
+        XCTAssertTrue(text.contains("update the internal ledger"))
+        XCTAssertTrue(text.contains(
+            "immediately dispatch implementation"
+        ))
+        XCTAssertTrue(text.contains(
+            "do not relay that request"
+        ))
+        XCTAssertTrue(text.contains(
+            "Ask exactly one minimal question only when"
+        ))
+        XCTAssertTrue(text.contains(
+            "materially change user-visible product behavior"
+        ))
+        XCTAssertTrue(text.contains(
+            "a new authorization is needed for an external or irreversible"
+        ))
+        XCTAssertTrue(text.contains(
+            "explicit user requirements conflict with no safe"
+        ))
+        XCTAssertTrue(text.contains(
+            "are never by themselves reasons to ask"
+        ))
+        XCTAssertTrue(text.contains(
+            "exhaust repository and conversation evidence"
+        ))
+        XCTAssertTrue(text.contains(
+            "never ask a generic \"should I continue?\""
+        ))
     }
 
     func testSafeEligibilityClassifiesMergedUniqueDirtyAndNonInternal() throws {

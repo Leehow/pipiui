@@ -1,8 +1,8 @@
 import XCTest
 @testable import PipiUI
 
-/// Model tiering drives how hard a session leans on Superpowers: strong models get a
-/// pointer, weak models get a mandatory SOP plus a one-shot dispatch gate.
+/// Model tiering gives strong and weak models different planning routes while preserving
+/// verification-before-completion for both.
 final class ModelTierSettingsTests: XCTestCase {
     private func tempSuite() -> (String, UserDefaults) {
         let name = "pipiui.tier.tests.\(UUID().uuidString)"
@@ -53,7 +53,7 @@ final class ModelTierSettingsTests: XCTestCase {
     /// Tier text is a pure function of the active model, which is what makes it safe to
     /// append to the system prompt: identical every turn, changing only on a model switch
     /// (which already invalidates the cache on its own).
-    func testTierExtensionShipsBothTiersAndNoModelTable() throws {
+    func testTierExtensionShipsDistinctPlanningRoutesWithoutDispatchGate() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("pipiui-tier-\(UUID().uuidString)", isDirectory: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
@@ -61,16 +61,45 @@ final class ModelTierSettingsTests: XCTestCase {
         let source = try String(contentsOfFile: path, encoding: .utf8)
 
         XCTAssertTrue(source.contains("Superpowers (reference)"))
-        XCTAssertTrue(source.contains("Superpowers (mandatory for this model)"))
+        XCTAssertTrue(source.contains("Superpowers (weak-model guardrails)"))
+        XCTAssertTrue(source.contains(
+            "main Boss may either use writing-plans itself or dispatch the"
+        ))
+        XCTAssertTrue(source.contains("existing lightweight plan subagent"))
+        XCTAssertTrue(source.contains(
+            "resulting plan, then automatically dispatch the appropriate general-purpose"
+        ))
+        XCTAssertTrue(source.contains(
+            "main Boss MUST NOT read or invoke \\`writing-plans\\` or"
+        ))
+        XCTAssertTrue(source.contains("\\`brainstorming\\`"))
+        XCTAssertTrue(source.contains(
+            "It MUST dispatch the existing lightweight \\`plan\\` subagent"
+        ))
+        XCTAssertTrue(source.contains(
+            "that result, then automatically dispatch the appropriate general-purpose"
+        ))
+        XCTAssertTrue(source.contains(
+            "Never present an execution-mode menu or wait for user"
+        ))
+        XCTAssertTrue(source.contains(
+            "confirmation about subagent versus current-session execution"
+        ))
+        XCTAssertTrue(source.contains(
+            "do not turn the entire skill library into"
+        ))
+        XCTAssertTrue(source.contains("verification-before-completion binds every level"))
         // Tiers come from user settings only. A built-in table would go stale and would
         // silently change how a whole session is run.
         for vendor in ["gpt-", "claude-", "gemini", "glm-", "grok", "k3", "qwen", "deepseek"] {
             XCTAssertFalse(source.lowercased().contains(vendor),
                            "no built-in model table allowed (found \(vendor))")
         }
-        // The dispatch gate must be capped at one block per session.
-        XCTAssertTrue(source.contains("gateFired"))
-        XCTAssertTrue(source.contains("if (gateFired || skillWasRead || !isWeak(ctx.model)) return;"))
+        XCTAssertFalse(source.contains("skillWasRead"))
+        XCTAssertFalse(source.contains("gateFired"))
+        XCTAssertFalse(source.contains("looksLikeSkillRead"))
+        XCTAssertFalse(source.contains("pi.on(\"tool_call\""))
+        XCTAssertFalse(source.contains("Blocked once (weak-model guard)"))
     }
 
     /// The boss prompt hands the Superpowers rules to the tier extension; keeping a second
