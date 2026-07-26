@@ -138,6 +138,13 @@ green 新建。IDE 只在 idle + clean 时同步。最终由 integration owner �
 之外显式 merge green → main，然后只从 clean main 运行一次 `ship-app.sh`。
 这些 helper 与 Boss runtime 都不直接推进 Git `main`。
 
+同一时间 staging 只能有一个 lifecycle owner。Boss child running、auto-merge、
+post-merge verify 或 recovery 期间，禁止运行 `integrate-worker.sh` /
+`promote-green.sh`；external integrate/promote 运行期间也不得启动或恢复 Boss
+wave。`pipiui-integration-line.lock` 只串行 shell helpers，native
+`MainRepoSerialQueue` 不使用它，二者不能并发协调。系统不做不可靠的自动探测，
+integration owner 必须显式交接 owner。
+
 ### PipiUI Boss native lifecycle（优先）
 
 - Boss 主会话应打开在专用、clean 的 `integration/staging` linked worktree；
@@ -151,8 +158,9 @@ green 新建。IDE 只在 idle + clean 时同步。最终由 integration owner �
   runtime auto-merge 明确允许；“worker 不得 merge”只指 leaf worker。
 - Merge/verify failure 服从 `BossPrompt.swift` 的 same-agent/fixer recovery；
   BossPrompt/native runtime 与通用外部 IDE 规则冲突时，native lifecycle 优先。
-- Boss wave terminal、post-merge verified 且 staging clean 后，由 integration
-  owner 运行 `promote-green.sh`；Boss 不直接 auto-merge Git `main`。
+- Boss wave terminal、无 active/recovery agent、post-merge verified 且 staging
+  clean 后，由 integration owner 运行 `promote-green.sh`；Boss 不直接
+  auto-merge Git `main`。
 
 ### 构建开销
 

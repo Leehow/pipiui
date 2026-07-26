@@ -12,8 +12,16 @@ integration/green before accepting a worker. The script merges exactly one
 external worker branch with --no-ff --no-edit, preserves that worker branch and
 worktree, then calls promote-green.sh.
 
+Hard lifecycle-owner precondition:
+  integration/staging must have exactly one lifecycle owner at a time.
+  Confirm no Boss child, auto-merge, post-merge verify, or recovery is active.
+  Do not start/resume a Boss wave until this helper and promotion finish.
+  The shell lock serializes helpers only; native MainRepoSerialQueue does not
+  use it. This cross-runtime ownership handoff is intentionally not auto-detected.
+
 PipiUI Boss native auto-merge never calls this helper. After a terminal Boss
-wave and post-merge verification, the integration owner runs promote-green.sh.
+wave with no active/recovery agent, post-merge verification, and clean staging,
+the integration owner runs promote-green.sh.
 
 On merge or test failure, staging is preserved for fixer/recovery and green/main
 remain unchanged. The script never resets, reverts, cleans, deletes, or forces.
@@ -135,6 +143,8 @@ COMMON_DIR="$(cd "$COMMON_DIR_RAW" 2>/dev/null && pwd -P)" || {
   echo "ERROR: could not resolve the common Git directory" >&2
   exit 1
 }
+# This lock serializes shell helpers only. It does not coordinate with PipiUI's
+# native MainRepoSerialQueue; the human lifecycle-owner gate remains mandatory.
 LOCK_DIR="$COMMON_DIR/pipiui-integration-line.lock"
 LOCK_OWNED=0
 

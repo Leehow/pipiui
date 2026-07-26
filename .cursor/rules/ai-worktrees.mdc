@@ -16,6 +16,12 @@ source of truth.
   local runnable preview is explicitly needed.
 - Do not merge green into an active divergent task. Retire completed worktrees
   and create the next task from current green.
+- Staging has exactly one lifecycle owner. Never integrate/promote during an
+  active Boss wave, and never start/resume Boss while external
+  integration/promote owns staging. The shell lock does not coordinate with
+  native `MainRepoSerialQueue`.
+- Promote a Boss candidate only after terminal state, no active/recovery agent,
+  passed post-merge verify, and clean staging.
 - Never install or replace `/Applications/PipiUI.app`; only the integration
   owner may integrate, promote green, merge green to main, and ship.
 - Do not merge, clean another workspace, or claim canonical delivery.

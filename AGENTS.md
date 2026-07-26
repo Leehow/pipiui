@@ -36,8 +36,9 @@ Only successful `scripts/ship-app.sh` supports “done / open the app”.
   workers, not the Boss runtime.
 - Merge/verify failure follows `BossPrompt.swift` same-agent/fixer recovery.
   BossPrompt/native runtime wins over conflicting generic external-IDE rules.
-- After a terminal, post-merge-verified Boss wave, the integration owner runs
-  `promote-green.sh`. Boss never auto-merges Git `main`.
+- After a terminal Boss wave with no active/recovery agent, post-merge verify
+  complete, and clean staging, the integration owner runs `promote-green.sh`.
+  Boss never auto-merges Git `main`.
 
 ## Shared integration line
 
@@ -55,6 +56,15 @@ Only successful `scripts/ship-app.sh` supports “done / open the app”.
   clean.
 - Final release is an explicit green → main merge outside helper scripts,
   followed by one `ship-app.sh` from clean main.
+
+Hard lifecycle-owner gate: `integration/staging` has exactly one owner at a
+time. While any Boss child, auto-merge, post-merge verify, or recovery is
+active, do not run `integrate-worker.sh` or `promote-green.sh`. While either
+shell workflow runs, do not start or resume a Boss wave. The
+`pipiui-integration-line.lock` serializes shell helpers only; native
+`MainRepoSerialQueue` does not use it. There is no reliable automatic
+cross-runtime detector, so the integration owner must explicitly hand off
+ownership before operating.
 
 ## Quick map
 

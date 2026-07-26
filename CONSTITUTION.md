@@ -39,8 +39,9 @@ Binding rules for humans and coding agents. Short and enforceable.
 - Merge/verify 失败服从 `BossPrompt.swift` 的 same-agent/fixer recovery，不用
   通用手工冲突规则覆盖。若本宪章的外部 IDE 通用语言与 BossPrompt/native
   runtime 冲突，后者优先。
-- Boss wave terminal、post-merge verified 且 staging clean 后，由 integration
-  owner 执行 `promote-green.sh`；Boss 不直接 auto-merge Git `main`。
+- Boss wave terminal、无 active/recovery agent、post-merge verified 且 staging
+  clean 后，由 integration owner 执行 `promote-green.sh`；Boss 不直接
+  auto-merge Git `main`。
 
 ## 2. Green / staging 共享迭代主线（强制）
 
@@ -76,6 +77,19 @@ terminal 且 post-merge verified 后，integration owner 单独执行：
 不变；staging 未恢复并 promote 前，禁止接收下一个 external worker。所有新任务
 只从 green 创建。IDE 只在 idle + clean 时切到/重建最新 green；不得把 green
 强行 merge 到 active divergent task worktree。
+
+### 单一 lifecycle owner（硬门禁）
+
+同一时间 `integration/staging` 只能有一个 lifecycle owner：
+
+- Boss wave 活动期间（child running、auto-merge、post-merge verify 或 recovery
+  任一阶段），禁止运行 `integrate-worker.sh` 或 `promote-green.sh`。
+- External integrate/promote 开始后直到结束，禁止启动或恢复 Boss wave。
+- `pipiui-integration-line.lock` 只串行化 shell helpers；PipiUI native
+  `MainRepoSerialQueue` 不读取该锁，两者**不具备并发协调能力**。
+- 不做不可靠的自动探测。Integration owner 必须在操作前人工确认 owner 已交接；
+  promote Boss wave 还必须确认 terminal、无 active/recovery agent、
+  post-merge verified、staging clean。
 
 ## 3. 四层构建与唯一安装入口（强制）
 

@@ -8,6 +8,14 @@ Usage: ./scripts/promote-green.sh
 
 Run only from the clean linked worktree on integration/staging.
 
+Hard lifecycle-owner precondition:
+  integration/staging must have exactly one lifecycle owner at a time.
+  Do not run during an active Boss wave or recovery. For a Boss candidate,
+  confirm wave terminal, no active/recovery agent, post-merge verify complete,
+  and staging clean. Do not start/resume Boss until promotion finishes.
+  The shell lock does not coordinate with native MainRepoSerialQueue; this
+  ownership handoff is intentionally not auto-detected.
+
 The script:
   1. Requires integration/green to be an unchecked-out ancestor of staging.
   2. Runs full swift test with no skip/bypass.
@@ -104,6 +112,8 @@ COMMON_DIR="$(cd "$COMMON_DIR_RAW" 2>/dev/null && pwd -P)" || {
   echo "ERROR: could not resolve the common Git directory" >&2
   exit 1
 }
+# This lock serializes shell helpers only. It does not coordinate with PipiUI's
+# native MainRepoSerialQueue; the human lifecycle-owner gate remains mandatory.
 LOCK_DIR="$COMMON_DIR/pipiui-integration-line.lock"
 LOCK_OWNED=0
 
