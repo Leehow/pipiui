@@ -13,7 +13,9 @@ struct AgentDefinition: Identifiable, Equatable, Hashable, Sendable {
 /// Discovers agent markdown under PipiUI's installed agents directory.
 enum AgentCatalog {
     /// Preferred display order for built-in PipiUI agents.
-    static let preferredOrder = ["explore", "plan", "general-purpose", "reviewer", "lead"]
+    static let preferredOrder = [
+        "explore", "plan", "general-purpose", "reviewer", "lead", "secretary",
+    ]
 
     /// Hardcoded fallbacks so Settings never shows an empty Subagent tab when
     /// Application Support / bundle resources are missing or stale.
@@ -50,6 +52,13 @@ enum AgentCatalog {
             name: "lead",
             description: "Team-lead orchestrator. Breaks a goal into subtasks, delegates them to other subagents, tracks results, and integrates a final answer.",
             tools: ["read", "grep", "find", "ls", "subagent"],
+            frontmatterModel: "xai/grok-4.5:high",
+            filePath: ""
+        ),
+        .init(
+            name: "secretary",
+            description: "Boss closeout secretary. Reconciles agent outcomes, worktrees, branches, verification, temporary artifacts, and the existing Boss ledger without creating another worktree.",
+            tools: ["read", "grep", "find", "ls", "bash", "edit", "write"],
             frontmatterModel: "xai/grok-4.5:high",
             filePath: ""
         ),
