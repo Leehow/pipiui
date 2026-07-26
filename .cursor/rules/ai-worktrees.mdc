@@ -10,7 +10,9 @@ source of truth.
 
 - Create Cursor tasks with `./scripts/new-ai-worktree.sh --tool cursor ...`.
 - Open and edit only the returned linked worktree.
-- Run `./scripts/verify-worker.sh` for worker-local validation.
+- Run `./scripts/verify-worker.sh` for a real debug compile + relevant tests.
+- Do not package a release App by default; use `--package-preview` only when a
+  local runnable preview is explicitly needed.
 - Never install or replace `/Applications/PipiUI.app`; only the integration
   owner may run `./scripts/ship-app.sh`.
 - Do not merge, clean another workspace, or claim canonical delivery.

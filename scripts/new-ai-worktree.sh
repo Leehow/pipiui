@@ -1,12 +1,12 @@
 #!/bin/bash
-# Create one isolated branch + linked worktree for an AI task.
+# Create one isolated branch + linked worktree for an external coding tool.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
 Usage:
   ./scripts/new-ai-worktree.sh \
-    --tool <codex|claude|cursor|pipiui> \
+    --tool <codex|claude|cursor> \
     --work-id <slug> \
     --topic <slug> \
     --base <committed-ref> \
@@ -14,11 +14,12 @@ Usage:
 
 Examples:
   ./scripts/new-ai-worktree.sh --tool codex --work-id settings --topic sidebar --base main
-  ./scripts/new-ai-worktree.sh --tool pipiui --work-id ms09o3da --topic browser --base codex/settings
 
 Branches:
-  codex/claude/cursor: ai/<tool>/<work-id>-<topic>
-  pipiui:             pipiui/agent-<work-id>-<topic>
+  ai/<tool>/<work-id>-<topic>
+
+PipiUI Boss subagents are not supported by this helper. Its native extension
+exclusively owns their worktrees, pipiui/* branches, verification, and merge.
 
 The default worktree root is a sibling of the primary checkout:
   <primary-repo-parent>/<primary-repo-name>-wt/
@@ -82,9 +83,9 @@ for required in TOOL WORK_ID TOPIC BASE; do
 done
 
 case "$TOOL" in
-  codex|claude|cursor|pipiui) ;;
+  codex|claude|cursor) ;;
   *)
-    echo "ERROR: unsupported --tool '$TOOL' (expected codex, claude, cursor, or pipiui)" >&2
+    echo "ERROR: unsupported --tool '$TOOL' (expected codex, claude, or cursor)" >&2
     exit 2
     ;;
 esac
@@ -124,11 +125,7 @@ BASE_COMMIT="$(git rev-parse --verify "${BASE}^{commit}" 2>/dev/null)" || {
   exit 1
 }
 
-if [[ "$TOOL" == "pipiui" ]]; then
-  BRANCH="pipiui/agent-${WORK_ID}-${TOPIC}"
-else
-  BRANCH="ai/${TOOL}/${WORK_ID}-${TOPIC}"
-fi
+BRANCH="ai/${TOOL}/${WORK_ID}-${TOPIC}"
 if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
   echo "ERROR: generated branch name is not a valid Git ref: $BRANCH" >&2
   exit 2

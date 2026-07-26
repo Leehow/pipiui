@@ -76,7 +76,8 @@
 
 ```bash
 swift run                        # Worker 快速调试，仅当前 worktree
-./scripts/verify-worker.sh       # Worker: test + 本地 build/PipiUI.app
+./scripts/verify-worker.sh       # Worker 默认: 真实 debug 编译+测试，不打 release
+./scripts/verify-worker.sh --package-preview # 显式: test + 本地 release .app
 ./make-app.sh                    # Worker: release 本地打包，不安装
 ./scripts/build-app.sh           # Worker: test + 本地打包，不安装
 ./scripts/ship-app.sh            # Integration: 唯一 canonical 安装入口
@@ -93,21 +94,47 @@ open -a PipiUI                   # 打开最近一次 canonical ship
   --base codex/settings
 ```
 
-支持 `codex`、`claude`、`cursor`、`pipiui`。默认在主 checkout 的同级
-`pipiui-wt/` 下创建临时目录。IDE 必须打开返回的新 worktree 根目录，而不是在
-共享目录中切分支。
+该 helper 只支持外部 IDE：`codex`、`claude`、`cursor`。默认在主 checkout
+的同级 `pipiui-wt/` 下创建临时目录。IDE 必须打开返回的新 worktree 根目录，
+而不是在共享目录中切分支。
 
 `verify-worker.sh` 只接受真实 linked worktree 中的 `ai/*` 和
 `pipiui/agent-*` worker 分支；primary checkout 即使手动切成该名称也会被拒绝。
 它的成功仅表示 worker-local verification passed，不能声称已更新 Launchpad
 中的 App。
-最终集成负责人逐个 merge 后，从 clean 的 `main`、`codex/*` 或
+默认验证只跑 `swift test`/debug；只有明确需要本地可双击预览时才加
+`--package-preview`。最终集成负责人逐个 merge 后，从 clean 的 `main`、`codex/*` 或
 `integration/*` 执行 `ship-app.sh`；脚本持有全局锁、运行测试/本地打包、
 安装 `/Applications/PipiUI.app`，并核对双路径二进制 SHA-256 与时间戳。
 
 `PIPIUI_INSTALL_APP=/absolute/other/PipiUI.app` 可为受控验证覆盖安装位置；
 普通 worker 不得使用该变量绕过 `ship-app.sh`。已有 ship lock 必须先调查其
 owner 记录，脚本不会自动删除。
+
+### PipiUI Boss native lifecycle（优先）
+
+- Boss 主会话应打开在专用、clean 的 `codex/*` 或 `integration/*` integration
+  worktree；active development 不直接使用 shared dirty primary checkout 或
+  Git `main`。
+- Native extension 独占 `.pi/worktrees/*` child 创建/复用、`pipiui/*` 命名、
+  attested structured verify、串行 auto-merge、成功移除与失败 worktree
+  recovery。auto-merge target 是当前 session project root，不必是 Git `main`。
+  每份 implementation brief 的 structured verify 必须包含真实编译和相关测试，
+  不能只做 lint/diff；成功移除 worktree 时其 `.build` 也会回收。
+- Boss/native workers 不调用 `new-ai-worktree.sh`，也不手工 merge。verified
+  runtime auto-merge 明确允许；“worker 不得 merge”只指 leaf worker。
+- Merge/verify failure 服从 `BossPrompt.swift` 的 same-agent/fixer recovery；
+  BossPrompt/native runtime 与通用外部 IDE 规则冲突时，native lifecycle 优先。
+- Boss ledger/work terminal 且 integration clean 后，只运行一次
+  `ship-app.sh`。
+
+### 构建开销
+
+Git branch 本身不构建；每个 active linked worktree 各有 `.build/` 与 `build/`。
+这能避免产物互踩，但执行命令时会重复编译。每个 worker 做聚焦 debug/test，
+不要默认做 release package；build-heavy 验证应限并发或串行，最后只做一次
+integration ship。所有代码改动仍须在各自 worktree 真实编译并跑相关测试；
+只省掉重复 release `.app` 打包。不要使用共享 SwiftPM scratch path。
 
 要求：macOS 14+，已安装 pi CLI（在 `~/.npm-global/bin/pi`、`/opt/homebrew/bin` 或 PATH 中可找到）。
 
