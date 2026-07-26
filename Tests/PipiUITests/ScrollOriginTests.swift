@@ -35,4 +35,10 @@ final class ScrollOriginTests: XCTestCase {
         XCTAssertEqual(origin, .programmaticOrUnknown)
         XCTAssertFalse(origin.allowsUnpin)
     }
+
+    func testProgrammaticBoundsChangeNeverStartsKnobDragTracking() {
+        // A programmatic scrollTo also posts a clip-bounds notification. Without
+        // the held-button attribution it must not enter the knob-drag path.
+        XCTAssertFalse(ScrollOrigin.classify(mouseButtonsDown: 0).allowsUnpin)
+    }
 }

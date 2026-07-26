@@ -24,6 +24,19 @@ final class StickToBottomLogicTests: XCTestCase {
         XCTAssertNil(desired)
     }
 
+    func testScrollerKnobDragUsesLiveScrollUnpinDistance() {
+        // Knob drags are delivered through clip-bounds notifications rather than
+        // didLiveScroll, but once attributed to the user they must use the same
+        // immediate 4pt release rule as wheel/trackpad scrolling.
+        let desired = StickToBottomLogic.desiredPin(
+            currentlyPinned: true,
+            distanceFromBottom: StickToBottomLogic.liveScrollUnpinDistance + 1,
+            userLiveScroll: true,
+            allowUnpin: true
+        )
+        XCTAssertEqual(desired, false)
+    }
+
     func testProgrammaticDriftInsideBandDoesNotUnpin() {
         // Content growth / estimated height jitter without a live scroll must keep pin.
         let desired = StickToBottomLogic.desiredPin(

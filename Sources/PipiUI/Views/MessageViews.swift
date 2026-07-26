@@ -264,8 +264,13 @@ struct AssistantSegmentsView: View, Equatable {
     var onCopy: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
     var onJump: (() -> Void)? = nil
+    /// A parent transcript turn may own this state so worker signals do not split one fold.
+    var collapsedOverride: Bool? = nil
+    var onCollapseToggle: (() -> Void)? = nil
     @State private var hovered = false
-    @State private var collapsed = false
+    @State private var locallyCollapsed = false
+
+    private var collapsed: Bool { collapsedOverride ?? locallyCollapsed }
 
     static func == (lhs: AssistantSegmentsView, rhs: AssistantSegmentsView) -> Bool {
         lhs.segments == rhs.segments
@@ -275,6 +280,7 @@ struct AssistantSegmentsView: View, Equatable {
             && lhs.projectURL == rhs.projectURL
             && lhs.entryId == rhs.entryId
             && lhs.isWorking == rhs.isWorking
+            && lhs.collapsedOverride == rhs.collapsedOverride
         // Callbacks intentionally excluded.
     }
 
@@ -388,10 +394,14 @@ struct AssistantSegmentsView: View, Equatable {
 
     /// 折叠/展开切换：禁用大段正文进出动画，避免卡顿（参考 CollapsibleUserBubbleView.collapse）。
     private func toggleCollapse() {
+        if let onCollapseToggle {
+            onCollapseToggle()
+            return
+        }
         var t = Transaction()
         t.disablesAnimations = true
         withTransaction(t) {
-            collapsed.toggle()
+            locallyCollapsed.toggle()
         }
     }
 

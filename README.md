@@ -69,13 +69,14 @@
 
 ## 构建运行
 
-**宪章（强制）：编译通过后必须更新 `build/PipiUI.app`。** 详见 [`CONSTITUTION.md`](./CONSTITUTION.md)；agent 入口见 [`AGENTS.md`](./AGENTS.md)。仅 `swift build` / `swift run` 成功而 `.app` 仍旧时，不得宣称「可打开 App」。
+**宪章（强制）：只有主工作区 `/Users/haoli/leehow/code/pipiui` 能创建唯一的 `build/PipiUI.app`；其他 worktree 只能编译/测试，不能打包 App。** 详见 [`CONSTITUTION.md`](./CONSTITUTION.md)；agent 入口见 [`AGENTS.md`](./AGENTS.md)。仅 `swift build` / `swift run` 成功而主工作区 `.app` 仍旧时，不得宣称「可打开 App」。
 
 ```bash
-swift run                 # 开发调试（不更新 .app）
-./make-app.sh             # release 打包 → build/PipiUI.app
+swift run                 # 任意 worktree 的开发调试（不更新 .app）
+cd /Users/haoli/leehow/code/pipiui
+./make-app.sh             # 唯一 release 包 → build/PipiUI.app
 ./scripts/build-app.sh    # 可选：先 swift test 再 make-app.sh（--skip-tests 跳过测试）
-open build/PipiUI.app     # 启动打包后的 App
+open build/PipiUI.app     # 启动唯一打包后的 App
 ```
 
 打包后核对 build 二进制新于源码，例如：

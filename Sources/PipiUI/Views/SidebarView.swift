@@ -1,11 +1,13 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SidebarView: View {
     @EnvironmentObject var store: AppStore
     @State private var renameTarget: RenameTarget?
     @State private var renameText: String = ""
-    /// Per-project expand state for the archived section; missing key = collapsed.
-    @State private var archivedExpandedByProject: [String: Bool] = [:]
+    @State private var projectRenameTarget: ProjectRenameTarget?
+    @State private var projectRenameText: String = ""
+    @State private var archivedExpanded = false
     @State private var projectsExpanded = false
     @State private var pinnedExpanded = false
     /// Project folders can be opened independently. The selected project is
@@ -26,21 +28,20 @@ struct SidebarView: View {
                 .padding(.horizontal, Self.sidebarGutter + 2)
                 .padding(.top, 14)
                 .padding(.bottom, 10)
-            // ScrollView — not List.sidebar. AppKit NSTableView scrollers ignore
-            // `.scrollIndicators(.hidden)` / hasVerticalScroller=false and keep a fat
-            // legacy track that expands on hover and flips column insets (忽大忽小).
+            // SwiftUI hides the indicator, while the sidebar-only AppKit
+            // installer below also disables any legacy reserved scroller track.
             // Selection chrome is drawn by SessionRowContainer.background.
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    projectsSection
                     pinnedSection
+                    projectsSection
+                    archivedSessionsSection
                 }
                 .padding(.horizontal, Self.sidebarGutter)
                 .padding(.vertical, 8)
-                // Inside the document so enclosingScrollView resolves.
-                .overlayScrollers()
+                .sidebarHiddenVerticalScroller()
             }
-            .scrollIndicators(.automatic)
+            .scrollIndicators(.hidden)
             .clipShape(Rectangle())
         }
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
@@ -98,6 +99,27 @@ struct SidebarView: View {
             .padding(20)
             .frame(width: 360)
         }
+        .sheet(item: $projectRenameTarget) { target in
+            VStack(alignment: .leading, spacing: 16) {
+                Text("编辑项目名称")
+                    .font(.headline)
+                TextField("项目名称", text: $projectRenameText)
+                    .textFieldStyle(.roundedBorder)
+                HStack {
+                    Spacer()
+                    Button("取消") { projectRenameTarget = nil }
+                        .keyboardShortcut(.cancelAction)
+                    Button("保存") {
+                        store.renameProject(target.project, to: projectRenameText)
+                        projectRenameTarget = nil
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(projectRenameText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .padding(20)
+            .frame(width: 360)
+        }
     }
 
     /// Ensures the selected project stays visible and open even when selection
@@ -106,7 +128,7 @@ struct SidebarView: View {
         guard let path = store.selectedProjectPath else { return }
         expandedProjectPaths.insert(path)
         guard !projectsExpanded else { return }
-        guard let index = store.projects.firstIndex(where: { $0.path == path }) else { return }
+        guard let index = store.orderedProjects.firstIndex(where: { $0.path == path }) else { return }
         if index >= SidebarListLimits.projects {
             projectsExpanded = true
         }
@@ -124,7 +146,7 @@ struct SidebarView: View {
             .accessibilityLabel("添加项目")
         } rows: {
             let capped = SidebarListLimits.visiblePrefix(
-                of: store.projects,
+                of: store.orderedProjects,
                 limit: SidebarListLimits.projects,
                 expanded: projectsExpanded
             )
@@ -140,45 +162,63 @@ struct SidebarView: View {
         }
     }
 
-    /// A project is a folder in the sidebar tree. The disclosure control only
-    /// changes that folder, while selecting the project refreshes its sessions
-    /// and leaves the folder open.
+    /// A project is a folder in the sidebar tree. Its primary row both selects
+    /// and toggles the folder, avoiding a tiny disclosure-only hit target.
     @ViewBuilder
     private func projectFolderRow(_ project: URL) -> some View {
         let isSelected = project.path == store.selectedProjectPath
         let isExpanded = expandedProjectPaths.contains(project.path)
+        let isPinned = store.isProjectPinned(project)
+        let displayName = store.projectDisplayName(for: project)
+        let sessionCount = store.sessionsByProject[project.path]?.count ?? 0
         HStack(spacing: 6) {
             Button {
-                if isExpanded {
-                    expandedProjectPaths.remove(project.path)
-                } else {
-                    expandedProjectPaths.insert(project.path)
-                }
-            } label: {
-                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .frame(width: 12, height: 20)
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(isExpanded ? "收起\(project.lastPathComponent)" : "展开\(project.lastPathComponent)")
-
-            Button {
-                selectProject(project)
+                selectAndToggleProject(project, wasSelected: isSelected, wasExpanded: isExpanded)
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: isExpanded ? "folder.fill" : "folder")
                         .foregroundStyle(isSelected ? Color.accentColor : .secondary)
-                    Text(project.lastPathComponent)
+                    Text(displayName)
                         .fontWeight(isSelected ? .semibold : .regular)
+                    if isPinned {
+                        Image(systemName: "pin.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("已置顶项目")
+                    }
                     Spacer(minLength: 0)
-                    Text("\(store.sessionsByProject[project.path]?.count ?? 0)")
-                        .foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("选择项目\(project.lastPathComponent)")
+            .accessibilityLabel("\(isExpanded ? "收起" : "展开")项目\(displayName)")
+
+            Menu {
+                Text("共 \(sessionCount) 个会话")
+                Divider()
+                Button(isPinned ? "取消置顶项目" : "置顶项目") {
+                    store.toggleProjectPin(project)
+                }
+                Button("在 Finder 中显示") {
+                    NSWorkspace.shared.activateFileViewerSelecting([project])
+                }
+                Button("编辑项目名称") {
+                    projectRenameText = displayName
+                    projectRenameTarget = ProjectRenameTarget(project: project)
+                }
+                Button("移除项目", role: .destructive) {
+                    store.removeProject(project)
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 20, height: 20)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .help("项目菜单")
+            .accessibilityLabel("项目菜单\(displayName)")
+            .pointingHandCursor()
 
             Button {
                 selectProject(project)
@@ -190,29 +230,36 @@ struct SidebarView: View {
             }
             .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
             .help("新建会话")
-            .accessibilityLabel("在\(project.lastPathComponent)中新建会话")
+            .accessibilityLabel("在\(displayName)中新建会话")
         }
         .padding(.vertical, 5)
         .padding(.horizontal, 6)
+        .onDrag {
+            expandedProjectPaths.removeAll()
+            return NSItemProvider(object: project.path as NSString)
+        }
+        .onDrop(of: [UTType.plainText], delegate: ProjectDropDelegate(project: project, store: store))
         .background {
             RoundedRectangle(cornerRadius: 7)
                 .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
         }
         .hoverRowBackground(cornerRadius: 7)
-        .contextMenu {
-            Button("在 Finder 中显示") {
-                NSWorkspace.shared.activateFileViewerSelecting([project])
-            }
-            Button("移除项目", role: .destructive) {
-                store.removeProject(project)
-            }
-        }
     }
 
     private func selectProject(_ project: URL) {
         expandedProjectPaths.insert(project.path)
         store.selectedProjectPath = project.path
         store.refreshSessions(for: project)
+    }
+
+    private func selectAndToggleProject(_ project: URL, wasSelected: Bool, wasExpanded: Bool) {
+        store.selectedProjectPath = project.path
+        store.refreshSessions(for: project)
+        if wasSelected && wasExpanded {
+            expandedProjectPaths.remove(project.path)
+        } else {
+            expandedProjectPaths.insert(project.path)
+        }
     }
 
     @ViewBuilder
@@ -241,7 +288,7 @@ struct SidebarView: View {
                         },
                         live: live,
                         fallbackTitle: meta.name,
-                        idleSubtitle: project.lastPathComponent,
+                        idleSubtitle: store.projectDisplayName(for: project),
                         meta: meta,
                         openKey: openKeyFor(meta: meta),
                         project: project,
@@ -256,8 +303,8 @@ struct SidebarView: View {
         }
     }
 
-    /// Active and archived session rows live directly under their project
-    /// folder. There is deliberately no standalone active-session section.
+    /// Active session rows live directly under their project folder. There is
+    /// deliberately no standalone active-session section.
     private func projectSessionChildren(_ project: URL) -> some View {
         let metas = SessionPinLogic.activeMetas(
             from: store.sessionsByProject[project.path] ?? [],
@@ -310,11 +357,9 @@ struct SidebarView: View {
                 )
             }
             if visibleCounts.showsToggle {
-                moreToggle(expanded: sessionsExpanded, sectionName: "\(project.lastPathComponent) 会话")
+                moreToggle(expanded: sessionsExpanded, sectionName: "\(store.projectDisplayName(for: project)) 会话")
             }
-            archivedSessionsSection(project: project)
         }
-        .padding(.leading, 20)
     }
 
     /// Trailing bleed so header actions clear the sidebar divider (~列表行内边距对齐).
@@ -356,19 +401,19 @@ struct SidebarView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .accessibilityLabel(expanded.wrappedValue ? "收起\(sectionName)" : "展开更多\(sectionName)")
+        .pointingHandCursor()
     }
 
     @ViewBuilder
-    private func archivedSessionsSection(project: URL) -> some View {
-        let archived = store.archivedByProject[project.path] ?? []
+    private var archivedSessionsSection: some View {
+        let archived = store.archivedSessionMetas
         if !archived.isEmpty {
-            let expanded = archivedExpandedByProject[project.path] ?? false
             VStack(alignment: .leading, spacing: 4) {
                 Button {
-                    archivedExpandedByProject[project.path] = !expanded
+                    archivedExpanded.toggle()
                 } label: {
                     HStack(spacing: 6) {
-                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        Image(systemName: archivedExpanded ? "chevron.down" : "chevron.right")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .frame(width: 10)
@@ -388,15 +433,18 @@ struct SidebarView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .pointingHandCursor()
 
-                if expanded {
-                    ForEach(archived) { meta in
+                if archivedExpanded {
+                    ForEach(archived, id: \.meta.path) { entry in
+                        let meta = entry.meta
+                        let project = entry.project
                         Button {
                             store.restoreSession(meta, project: project)
                         } label: {
                             SessionRow(
                                 title: meta.name,
-                                subtitle: Self.relative(meta.modified),
+                                subtitle: "\(store.projectDisplayName(for: project)) · \(Self.relative(meta.modified))",
                                 status: .none
                             )
                             .foregroundStyle(.secondary)
@@ -553,6 +601,35 @@ private struct RenameTarget: Identifiable {
     let project: URL
     let meta: SessionMeta?
     let openKey: String?
+}
+
+private struct ProjectRenameTarget: Identifiable {
+    let project: URL
+    var id: String { project.path }
+}
+
+private struct ProjectDropDelegate: DropDelegate {
+    let project: URL
+    let store: AppStore
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [UTType.plainText])
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let provider = info.itemProviders(for: [UTType.plainText]).first else { return false }
+        provider.loadObject(ofClass: NSString.self) { object, _ in
+            guard let path = object as? String else { return }
+            DispatchQueue.main.async {
+                store.moveProject(path: path, before: project.path)
+            }
+        }
+        return true
+    }
 }
 
 /// 行容器：左侧点选主区域 + hover 时右侧置顶/改名/归档，避免嵌套 Button 抢事件。

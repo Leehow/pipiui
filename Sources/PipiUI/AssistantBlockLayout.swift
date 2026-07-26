@@ -32,6 +32,42 @@ enum AssistantBlockLayout {
         }
     }
 
+    /// A real user prompt and every following assistant run belong to one fold group.
+    /// Runtime worker signals use the user role but do not start a new group.
+    struct UserTurnGroups: Equatable {
+        var groupIDForRowID: [String: String]
+        var lastAssistantRunIDForGroupID: [String: String]
+    }
+
+    static func userTurnGroups(rows: [TranscriptRow]) -> UserTurnGroups {
+        var groupIDForRowID: [String: String] = [:]
+        var lastAssistantRunIDForGroupID: [String: String] = [:]
+        var currentGroupID: String?
+
+        for row in rows {
+            switch row {
+            case .leaf(let item):
+                guard item.role == "user" else { continue }
+                if MessageActions.isUserAuthoredMessage(item) {
+                    currentGroupID = item.id
+                }
+                if let currentGroupID {
+                    groupIDForRowID[item.id] = currentGroupID
+                }
+            case .assistantRun(let id, _, _):
+                if let currentGroupID {
+                    groupIDForRowID[id] = currentGroupID
+                    lastAssistantRunIDForGroupID[currentGroupID] = id
+                }
+            }
+        }
+
+        return UserTurnGroups(
+            groupIDForRowID: groupIDForRowID,
+            lastAssistantRunIDForGroupID: lastAssistantRunIDForGroupID
+        )
+    }
+
     /// - Parameter groupFinished: `true` for settled transcript rows; `false` while streaming.
     /// - Parameter toolRuns: used so toolCalls with result images stay outside finished groups.
     static func plan(

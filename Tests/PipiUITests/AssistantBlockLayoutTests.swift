@@ -260,4 +260,25 @@ final class AssistantBlockLayoutTests: XCTestCase {
         }
         XCTAssertEqual(entryId, "e2")
     }
+
+    func testUserTurnGroupsKeepSubagentDoneInsidePreviousRealUserTurn() {
+        let rows = AssistantBlockLayout.planTranscript(items: [
+            ChatItem(id: "u1", role: "user", blocks: [.text("实现功能")]),
+            ChatItem(id: "a1", role: "assistant", blocks: [.text("开始处理")]),
+            ChatItem(id: "done", role: "user", blocks: [.text("[subagent-done] agentId=x")]),
+            ChatItem(id: "a2", role: "assistant", blocks: [.text("处理完成")]),
+            ChatItem(id: "u2", role: "user", blocks: [.text("继续")]),
+            ChatItem(id: "a3", role: "assistant", blocks: [.text("继续处理")]),
+        ])
+
+        let groups = AssistantBlockLayout.userTurnGroups(rows: rows)
+
+        XCTAssertEqual(groups.groupIDForRowID["u1"], "u1")
+        XCTAssertEqual(groups.groupIDForRowID["a1"], "u1")
+        XCTAssertEqual(groups.groupIDForRowID["done"], "u1")
+        XCTAssertEqual(groups.groupIDForRowID["a2"], "u1")
+        XCTAssertEqual(groups.lastAssistantRunIDForGroupID["u1"], "a2")
+        XCTAssertEqual(groups.groupIDForRowID["u2"], "u2")
+        XCTAssertEqual(groups.lastAssistantRunIDForGroupID["u2"], "a3")
+    }
 }

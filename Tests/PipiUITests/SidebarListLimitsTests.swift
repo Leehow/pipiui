@@ -46,4 +46,21 @@ final class SidebarListLimitsTests: XCTestCase {
         XCTAssertEqual(out.trailing, 17)
         XCTAssertTrue(out.showsToggle)
     }
+
+    func testPinnedProjectsSortStably() {
+        XCTAssertEqual(
+            AppStore.orderedProjectPaths(["a", "b", "c", "d"], pinnedPaths: ["b", "d"]),
+            ["b", "d", "a", "c"]
+        )
+    }
+
+    func testProjectDisplayNamePreferencesDropStaleAndBlankEntries() {
+        XCTAssertEqual(
+            AppStore.sanitizedProjectDisplayNameOverrides(
+                ["/one": "  Alpha  ", "/two": "   ", "/stale": "Gone"],
+                projectPaths: ["/one", "/two"]
+            ),
+            ["/one": "Alpha"]
+        )
+    }
 }
