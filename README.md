@@ -97,9 +97,12 @@ open -a PipiUI                   # 打开最近一次 canonical ship
   --base integration/green
 ```
 
-该 helper 只支持外部 IDE：`codex`、`claude`、`cursor`。默认在主 checkout
-的同级 `pipiui-wt/` 下创建临时目录。IDE 必须打开返回的新 worktree 根目录，
-而不是在共享目录中切分支。
+该 helper 支持外部 coding 工具：`codex`、`claude`、`cursor`、`kimi`、
+`qoder`、`zcode`，并生成 `ai/<tool>/<work-id>-<topic>`。默认在主 checkout
+的同级 `pipiui-wt/` 下创建临时目录。工具必须打开返回的新 worktree 根目录，
+而不是在共享目录中切分支。Kimi CLI、Qoder 和 ZCode 直接读取根 `AGENTS.md`；
+不要为其复制规则或提交本地 permissions。PipiUI Boss 仍是唯一使用 native
+lifecycle 的例外。
 
 `verify-worker.sh` 只接受真实 linked worktree 中的 `ai/*` 和
 `pipiui/agent-*` worker 分支；primary checkout 即使手动切成该名称也会被拒绝。

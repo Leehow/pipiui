@@ -6,7 +6,7 @@ usage() {
   cat <<'EOF'
 Usage:
   ./scripts/new-ai-worktree.sh \
-    --tool <codex|claude|cursor> \
+    --tool <codex|claude|cursor|kimi|qoder|zcode> \
     --work-id <slug> \
     --topic <slug> \
     --base <committed-ref> \
@@ -87,9 +87,9 @@ for required in TOOL WORK_ID TOPIC BASE; do
 done
 
 case "$TOOL" in
-  codex|claude|cursor) ;;
+  codex|claude|cursor|kimi|qoder|zcode) ;;
   *)
-    echo "ERROR: unsupported --tool '$TOOL' (expected codex, claude, or cursor)" >&2
+    echo "ERROR: unsupported --tool '$TOOL' (expected codex, claude, cursor, kimi, qoder, or zcode)" >&2
     exit 2
     ;;
 esac

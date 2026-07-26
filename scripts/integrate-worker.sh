@@ -5,7 +5,8 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/integrate-worker.sh --branch <ai/codex/...|ai/claude/...|ai/cursor/...>
+  ./scripts/integrate-worker.sh \
+    --branch <ai/codex/...|ai/claude/...|ai/cursor/...|ai/kimi/...|ai/qoder/...|ai/zcode/...>
 
 Run only from the clean linked integration/staging worktree. Staging must equal
 integration/green before accepting a worker. The script merges exactly one
@@ -54,9 +55,9 @@ if [[ -z "$WORKER_BRANCH" ]]; then
   exit 2
 fi
 case "$WORKER_BRANCH" in
-  ai/codex/*|ai/claude/*|ai/cursor/*) ;;
+  ai/codex/*|ai/claude/*|ai/cursor/*|ai/kimi/*|ai/qoder/*|ai/zcode/*) ;;
   *)
-    echo "ERROR: worker branch must be ai/codex/*, ai/claude/*, or ai/cursor/*" >&2
+    echo "ERROR: worker branch must be ai/codex/*, ai/claude/*, ai/cursor/*, ai/kimi/*, ai/qoder/*, or ai/zcode/*" >&2
     exit 2
     ;;
 esac

@@ -10,7 +10,7 @@ integration/green may reach release-only main.**
 
 ```bash
 ./scripts/init-integration-line.sh --base <committed-ref>
-./scripts/new-ai-worktree.sh ...          # Codex/Claude/Cursor only
+./scripts/new-ai-worktree.sh ...          # Codex/Claude/Cursor/Kimi/Qoder/ZCode
 ./scripts/verify-worker.sh                # real debug compile + tests
 ./scripts/integrate-worker.sh --branch ai/codex/...
 ./scripts/promote-green.sh                # full test + atomic green advance
@@ -20,6 +20,12 @@ integration/green may reach release-only main.**
 `make-app.sh` and `scripts/build-app.sh` are local-only and must never install
 under `/Applications`. Do not claim delivery from worker-local validation.
 Only successful `scripts/ship-app.sh` supports “done / open the app”.
+
+Supported external tool slugs are `codex`, `claude`, `cursor`, `kimi`, `qoder`,
+and `zcode`, producing `ai/<tool>/*` branches. Kimi CLI, Qoder, and ZCode use
+this binding `AGENTS.md`; do not duplicate it into tool-specific rule files or
+copy local permission settings. PipiUI Boss is the only native-lifecycle
+exception.
 
 ## PipiUI Boss native lifecycle (precedence)
 

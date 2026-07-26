@@ -3,6 +3,10 @@
 [`CONSTITUTION.md`](./CONSTITUTION.md) is binding and is the single source of
 truth. Read it before changing code.
 
+- Supported external tool slugs are `codex|claude|cursor|kimi|qoder|zcode`;
+  each uses `ai/<tool>/*`. Kimi CLI, Qoder, and ZCode use the binding root
+  `AGENTS.md` without duplicated tool-specific rules or copied local
+  permissions. PipiUI Boss is the only native-lifecycle exception.
 - Create one task branch + linked worktree with
   `./scripts/new-ai-worktree.sh --tool claude ... --base integration/green`.
 - Work only inside that returned worktree.
