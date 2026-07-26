@@ -97,8 +97,10 @@ open -a PipiUI                   # 打开最近一次 canonical ship
 `pipiui-wt/` 下创建临时目录。IDE 必须打开返回的新 worktree 根目录，而不是在
 共享目录中切分支。
 
-`verify-worker.sh` 只接受 `ai/*` 和 `pipiui/agent-*` worker 分支。它的成功仅
-表示 worker-local verification passed，不能声称已更新 Launchpad 中的 App。
+`verify-worker.sh` 只接受真实 linked worktree 中的 `ai/*` 和
+`pipiui/agent-*` worker 分支；primary checkout 即使手动切成该名称也会被拒绝。
+它的成功仅表示 worker-local verification passed，不能声称已更新 Launchpad
+中的 App。
 最终集成负责人逐个 merge 后，从 clean 的 `main`、`codex/*` 或
 `integration/*` 执行 `ship-app.sh`；脚本持有全局锁、运行测试/本地打包、
 安装 `/Applications/PipiUI.app`，并核对双路径二进制 SHA-256 与时间戳。

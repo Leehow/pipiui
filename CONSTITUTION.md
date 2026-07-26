@@ -33,6 +33,9 @@ branch + linked worktree。不得让多个工具在同一工作目录里切分�
 canonical installer；它只接受 `main`、`codex/*`、`integration/*`，要求完全
 clean，并持有全局原子锁。
 
+`verify-worker.sh` 同时验证 worker 分支和 linked-worktree 身份；即使手动切到
+`ai/*`，primary checkout 也会被拒绝。
+
 ## 3. Worker 验证不等于交付
 
 Worker 完成前应运行：
