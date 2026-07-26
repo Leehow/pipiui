@@ -25,7 +25,17 @@
 | `screenshot` | 页面截图，以图片形式返回给模型（模型能看） |
 | `help` | 返回上述全部参数说明（细节走 tool result，不进前缀） |
 
-实现：App 内起一个仅监听 127.0.0.1 的 HTTP 桥接服务，扩展通过 `PIPIUI_BRIDGE_PORT` / `PIPIUI_SESSION_KEY` 环境变量找到它并按会话路由；未知 key 兜底路由到当前选中会话（终端里手动跑 `pi -e pipiui-webview.ts` 也能驱动 GUI 面板）。调试钩子：`PIPIUI_AUTO_SESSION=<项目路径>` 启动可自动建会话。
+实现：App 内起一个仅监听 127.0.0.1 的 HTTP 桥接服务，扩展通过 `PIPIUI_BRIDGE_PORT` / `PIPIUI_SESSION_KEY` 环境变量找到它；后者是每个顶层会话独立的高熵 capability，桥在分发任何请求前都会校验。未知或已关闭的 capability 一律拒绝，不会回退到当前选中会话。调试钩子：`PIPIUI_AUTO_SESSION=<项目路径>` 启动可自动建会话。
+
+## Computer Use（macOS 桌面控制，opt-in）
+
+设置 → 工具与 Skills 中可显式开启 `computer`。默认关闭时扩展不会通过 `-e` 挂载，因此工具不存在、没有前缀成本。开启后仅顶层会话可用；所有 subagent 均硬排除 `computer`。
+
+v1 具备单会话全局 lease、会话与应用两级确认、按 bundle identifier 持久允许/拒绝、屏幕录制/辅助功能状态、用户接管暂停、动作预算/超时、焦点漂移检查、审计与 `⌥⇧Esc` 急停。每批动作结束都会给模型一张新截图；PNG 只保存在进程内存中，通过 context hook 注入下一次模型调用，不写入 pi 会话 JSONL。
+
+Anthropic `anthropic-messages` 请求会把同名自定义工具替换为官方 `computer_20251124` 并合并 beta header；OpenAI/Codex 与其他 provider 使用通用 `actions:[...]` 自定义工具，不声称支持 OpenAI 原生 `computer_call` 循环。
+
+完整安全边界、稳定签名/TCC 设置和手工验收步骤见 [`docs/computer-use.md`](./docs/computer-use.md)。
 
 ## Subagent 面板 + Boss 模式
 

@@ -25,6 +25,7 @@ enum PiPlugin {
         var searchScopeExtension: String? // -e 项目内搜索边界 + 当轮外部路径授权
         var codexServerToolsExtension: String? // -e openai-codex hosted web_search
         var claudeServerToolsExtension: String? // -e anthropic hosted web_search
+        var computerUseExtension: String? // -e opt-in desktop computer harness
         var agentsDir: String?     // PIPIUI_AGENTS_DIR
         var bossPrompt: String?    // --append-system-prompt（Boss 模式）
     }
@@ -114,6 +115,7 @@ enum PiPlugin {
             ("pipiui-search-scope.ts", \.searchScopeExtension),
             ("pipiui-codex-server-tools.ts", \.codexServerToolsExtension),
             ("pipiui-claude-server-tools.ts", \.claudeServerToolsExtension),
+            ("pipiui-computer-use.ts", \.computerUseExtension),
             ("boss-prompt.md", \.bossPrompt),
         ]
         for (name, keyPath) in files {
@@ -188,6 +190,9 @@ enum PiPlugin {
 
         // 5.8 官方 anthropic-messages hosted web_search
         result.claudeServerToolsExtension = ClaudeServerToolsExtension.install(into: root)
+
+        // 5.9 macOS Computer Use（仅安装；独立 opt-in 决定 ChatSession 是否 -e 挂载）
+        result.computerUseExtension = ComputerUseExtension.install(into: root)
 
         // 6. Boss 协议提示词
         result.bossPrompt = BossPrompt.install(into: root)

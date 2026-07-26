@@ -714,6 +714,7 @@ struct SettingsSheet: View {
         case "subagent", "subagent_status": return "person.2"
         case "generate_image": return "photo"
         case "browser", "browser_navigate", "browser_click": return "safari"
+        case "computer": return "desktopcomputer"
         case "git_status", "git_diff": return "arrow.triangle.branch"
         default: return "hammer"
         }
@@ -746,10 +747,11 @@ struct SettingsSheet: View {
         LazyVStack(alignment: .leading, spacing: 16) {
             Text("工具与 Skills")
                 .font(.title3.weight(.semibold))
-            Text("开关关闭后：工具通过 `--exclude-tools` 在会话重启后对 pi 生效；Skills 立即从斜杠菜单隐藏（下次派出 subagent 也会尊重工具禁用）。")
+            Text("普通工具关闭后通过 `--exclude-tools` 在会话重启后生效。Computer Use 是独立 opt-in：关闭时扩展完全不挂载。Skills 会立即从斜杠菜单隐藏。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
+            ComputerUseSettingsPanel()
             catalogGroup(title: "内置工具", entries: ToolSkillCatalog.builtinTools)
             catalogGroup(title: "扩展工具", entries: ToolSkillCatalog.extensionTools)
 
@@ -813,7 +815,7 @@ struct SettingsSheet: View {
         LazyVStack(alignment: .leading, spacing: 8) {
             Text(title)
                 .font(.subheadline.weight(.semibold))
-            ForEach(entries) { tool in
+            ForEach(entries.filter { $0.name != "computer" }) { tool in
                 Toggle(isOn: toolEnabledBinding(for: tool.name)) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(tool.name)

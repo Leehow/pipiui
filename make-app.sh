@@ -80,8 +80,24 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
-codesign --force --sign - "$RESOURCE_BUNDLE"
-codesign --force --sign - "$APP"
+
+# Stable signing keeps Screen Recording / Accessibility TCC grants attached to
+# the same designated requirement across rebuilds. A certificate is optional:
+# clean machines retain the prior ad-hoc build path with an explicit warning.
+SIGN_ID="${PIPIUI_SIGN_ID:-PipiUI Dev}"
+if security find-identity -v -p codesigning 2>/dev/null \
+  | grep -Fq "\"$SIGN_ID\""; then
+  CODE_SIGN_ID="$SIGN_ID"
+  echo "Signing with stable identity: $CODE_SIGN_ID"
+else
+  CODE_SIGN_ID="-"
+  echo "⚠️  Stable code-signing identity '$SIGN_ID' was not found; using ad-hoc signing." >&2
+  echo "    Computer Use TCC grants may be lost after rebuilds." >&2
+  echo "    See docs/computer-use.md for one-time certificate and permission setup." >&2
+fi
+
+codesign --force --sign "$CODE_SIGN_ID" "$RESOURCE_BUNDLE"
+codesign --force --sign "$CODE_SIGN_ID" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 BIN="$APP/Contents/MacOS/PipiUI"
 echo "Built $APP"

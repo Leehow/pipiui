@@ -78,6 +78,10 @@ private struct ChatDetailViewBody: View {
             ToolbarItemGroup(placement: .primaryAction) {
                 GitBranchMenu(store: gitBranches) { session.lastError = $0 }
 
+                if ComputerUseSettings.isEnabled() {
+                    ComputerToolbarControl(sessionKey: session.bridgeRoutingKey)
+                }
+
                 Button {
                     if session.rightPanel == .agents {
                         session.rightPanel = nil
@@ -142,6 +146,7 @@ private struct ChatDetailViewBody: View {
 
     private var chatColumn: some View {
         VStack(spacing: 0) {
+            ComputerConsentBar(sessionKey: session.bridgeRoutingKey)
             transcript
             if let conflicts = store.extensionConflicts[session.id], !conflicts.isEmpty {
                 conflictBanner(conflicts)

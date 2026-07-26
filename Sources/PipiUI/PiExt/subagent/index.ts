@@ -43,6 +43,16 @@ const PER_TASK_OUTPUT_CAP = 50 * 1024;
 // ---- Pipi UI 集成：向 App 桥接服务上报 subagent 生命周期（无环境变量时完全静默） ----
 const PIPIUI_PORT = process.env.PIPIUI_BRIDGE_PORT;
 const PIPIUI_SESSION = process.env.PIPIUI_SESSION_KEY;
+
+function pipiuiChildProcessEnv(
+	extra: Record<string, string | undefined> = {},
+): Record<string, string | undefined> {
+	const env = { ...process.env, ...extra };
+	// Defense in depth: child agents, verifier shells, and git helpers can all
+	// reach loopback. None receives the independent desktop-write capability.
+	delete env.PIPIUI_COMPUTER_CAPABILITY;
+	return env;
+}
 // 当前进程在 agent 树里的身份：主会话 depth=0，被派出的 subagent 由父进程注入
 const PIPIUI_DEPTH = Number.parseInt(process.env.PIPIUI_AGENT_DEPTH || "0", 10);
 const PIPIUI_PARENT = process.env.PIPIUI_AGENT_ID || null;
@@ -510,7 +520,7 @@ function runVerifyCommand(command: string, cwd: string): Promise<VerifyAttestati
 				shell: false,
 				detached: true,
 				stdio: ["ignore", "pipe", "pipe"],
-				env: process.env,
+				env: pipiuiChildProcessEnv(),
 			});
 		} catch (err) {
 			resolve({
@@ -946,7 +956,7 @@ function gitSpawnSync(
 		cwd,
 		encoding: "utf8",
 		shell: false,
-		env: process.env,
+		env: pipiuiChildProcessEnv(),
 	});
 	const stdout = typeof result.stdout === "string" ? result.stdout : "";
 	const stderr = typeof result.stderr === "string" ? result.stderr : "";
@@ -1467,12 +1477,16 @@ async function runSingleAgent(
 		const allowed = agent.tools.filter(
 			(t) =>
 				!disabledTools.has(t) &&
+				t !== "computer" &&
 				(runtimePolicy.allowRecursiveDelegation || t !== "subagent"),
 		);
 		if (allowed.length > 0) args.push("--tools", allowed.join(","));
 		else args.push("--no-tools");
-	} else if (disabledTools.size > 0 || !runtimePolicy.allowRecursiveDelegation) {
+	} else {
 		const excluded = new Set(disabledTools);
+		// Hard safety boundary: nested/subagent Pi processes never receive desktop
+		// control, independent of global settings or an agent definition's tool list.
+		excluded.add("computer");
 		if (!runtimePolicy.allowRecursiveDelegation) excluded.add("subagent");
 		args.push("--exclude-tools", [...excluded].sort().join(","));
 	}
@@ -1567,6 +1581,19 @@ async function runSingleAgent(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
+			const childEnv = pipiuiChildProcessEnv({
+				PIPIUI_AGENT_ID: pipiuiAgentId,
+				PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
+				PIPIUI_AGENT_ROLE: runtimePolicy.role,
+				...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
+				// Override a possibly inherited marker so only plan children activate the hooks.
+				PIPIUI_PLAN_SKILL_ISOLATION: agentName === "plan" ? "1" : undefined,
+				...(runtimePolicy.worktree === "main-session"
+					? { PIPIUI_WORKTREE: "0", PIPIUI_AGENT_NO_DELEGATION: "1" }
+					: {}),
+				...(placement.worktreePath ? { PIPIUI_WORKTREE_PATH: placement.worktreePath } : {}),
+				...(placement.worktreeBranch ? { PIPIUI_WORKTREE_BRANCH: placement.worktreeBranch } : {}),
+			});
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: spawnCwd,
 				shell: false,
@@ -1575,20 +1602,7 @@ async function runSingleAgent(
 				// 把 agent 树身份传给子进程：子进程再派 subagent 时 parentId/depth 自动正确
 				// PIPIUI_SUBAGENT_EXT / SEARCH_SCOPE_EXT / grant file / bridge / session
 				// 经 process.env 继承；子进程只读当前真人回合的 grant file。
-				env: {
-					...process.env,
-					PIPIUI_AGENT_ID: pipiuiAgentId,
-					PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
-					PIPIUI_AGENT_ROLE: runtimePolicy.role,
-					...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
-					// Override a possibly inherited marker so only plan children activate the hooks.
-					PIPIUI_PLAN_SKILL_ISOLATION: agentName === "plan" ? "1" : undefined,
-					...(runtimePolicy.worktree === "main-session"
-						? { PIPIUI_WORKTREE: "0", PIPIUI_AGENT_NO_DELEGATION: "1" }
-						: {}),
-					...(placement.worktreePath ? { PIPIUI_WORKTREE_PATH: placement.worktreePath } : {}),
-					...(placement.worktreeBranch ? { PIPIUI_WORKTREE_BRANCH: placement.worktreeBranch } : {}),
-				},
+				env: childEnv,
 			});
 			pipiuiTrackChild(proc);
 			let buffer = "";

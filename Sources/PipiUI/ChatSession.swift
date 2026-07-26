@@ -72,6 +72,11 @@ enum ToolCallSummary {
             return (args["url"].string ?? "…", 0)
         case "browser":
             return (browserSummary(args), 0)
+        case "computer":
+            let count = args["actions"].array.count
+            let action = args["action"].string ?? args["type"].string
+            if count > 0 { return ("\(count) desktop actions", 0) }
+            return (action ?? "desktop action", 0)
         default:
             return (legacySummary(name: name, args: args), 0)
         }
@@ -353,7 +358,10 @@ final class ChatSession: ObservableObject, Identifiable {
     @Published private(set) var id: String
     /// Immutable capability used by bridge extensions spawned with this process.
     /// Unlike the open-session key, this survives edit-fork file rebinding.
-    package let bridgeRoutingKey = UUID().uuidString
+    package let bridgeRoutingKey = BridgeCapabilityToken.generate()
+    /// Separate desktop-write capability. It is mounted only in the top-level
+    /// computer extension and explicitly removed from every subagent process.
+    package let computerRoutingKey = BridgeCapabilityToken.generate()
     let projectURL: URL
 
     /// didSet 版本计数：任何 transcript 写入（append / 整体替换 / 元素修改）都会 bump，
@@ -556,6 +564,7 @@ final class ChatSession: ObservableObject, Identifiable {
          skillTierExtension: String? = nil,
          codexServerToolsExtension: String? = nil,
          claudeServerToolsExtension: String? = nil,
+         computerUseExtension: String? = nil,
          subagentDir: String? = nil,
          agentsDir: String? = nil,
          bossPromptPath: String? = nil,
@@ -642,6 +651,11 @@ final class ChatSession: ObservableObject, Identifiable {
         }
         if let codexServerToolsExtension { args += ["-e", codexServerToolsExtension] }
         if let claudeServerToolsExtension { args += ["-e", claudeServerToolsExtension] }
+        // Independent opt-in: when disabled the extension is not mounted at all, so the
+        // `computer` tool does not exist and contributes zero tool-prefix cost.
+        if ComputerUseSettings.isEnabled(), let computerUseExtension {
+            args += ["-e", computerUseExtension]
+        }
         // Settings → 工具开关：禁用项走 pi --exclude-tools（会话重启后生效）
         args += ToolSkillSettings.excludeToolsCLIArgs()
         var extraEnv: [String: String] = [:]
@@ -663,6 +677,12 @@ final class ChatSession: ObservableObject, Identifiable {
             }
             extraEnv["PIPIUI_BRIDGE_PORT"] = String(bridgePort)
             extraEnv["PIPIUI_SESSION_KEY"] = bridgeRoutingKey
+            if ComputerUseSettings.isEnabled(), computerUseExtension != nil {
+                extraEnv["PIPIUI_COMPUTER_CAPABILITY"] = computerRoutingKey
+                let size = ComputerUseSettings.providerDisplaySize()
+                extraEnv["PIPIUI_COMPUTER_WIDTH"] = String(size.width)
+                extraEnv["PIPIUI_COMPUTER_HEIGHT"] = String(size.height)
+            }
             // Authoritative session root inherited by nested processes. Management
             // roles such as secretary must never mistake a worker worktree for main.
             extraEnv["PIPIUI_MAIN_CWD"] = projectURL.path
@@ -717,6 +737,10 @@ final class ChatSession: ObservableObject, Identifiable {
             self.isInitializing = false
             self.titleLLMTask?.cancel()
             self.titleLLMTask = nil
+            ComputerCoordinator.shared.release(
+                sessionKey: self.bridgeRoutingKey,
+                revokeConsent: true
+            )
             if cutOff {
                 self.persistInFlightMark()
                 self.hasUnseenInterruption = true
@@ -2656,6 +2680,10 @@ final class ChatSession: ObservableObject, Identifiable {
         cancelSideChannelTitle()
         unbindQuotaMonitor()
         subagents.saveNow()
+        ComputerCoordinator.shared.release(
+            sessionKey: bridgeRoutingKey,
+            revokeConsent: true
+        )
         guard let proc else {
             onExited?()
             return

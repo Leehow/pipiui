@@ -56,6 +56,15 @@ final class AppStore: ObservableObject {
     @Published var openSessions: [String: ChatSession] = [:]
     @Published var selectedSessionKey: String? {
         didSet {
+            if selectedSessionKey != oldValue,
+               let oldValue,
+               let oldSession = openSessions[oldValue] {
+                // Desktop focus/input is process-global. Merely switching the visible
+                // PipiUI session releases any lease held by the previous controller.
+                ComputerCoordinator.shared.release(
+                    sessionKey: oldSession.bridgeRoutingKey
+                )
+            }
             // 记住最后选中的会话，下次启动直接恢复；新会话尚无文件时保留上一条记录。
             if let key = selectedSessionKey,
                let file = openSessions[key]?.sessionFile ?? sessionFileFromKey(key) {
@@ -206,14 +215,29 @@ final class AppStore: ObservableObject {
         DispatchQueue.global(qos: .utility).async {
             AuthMigration.migrateIfNeeded()
         }
-        bridge = BridgeServer { request, respond in
+        ComputerCoordinator.shared.configure { sessionCapability in
+            let session = AppStore.shared.openSessions.values.first {
+                BridgeCapabilityToken.matches(
+                    sessionCapability,
+                    expected: $0.bridgeRoutingKey
+                )
+            }
+            session?.abort()
+        }
+        bridge = BridgeServer(authorize: { request in
+            let candidate = request["sessionKey"].string ?? ""
+            return AppStore.shared.openSessions.values.contains {
+                BridgeCapabilityToken.matches(candidate, expected: $0.bridgeRoutingKey)
+            }
+        }) { request, respond in
             // Handler 已在主线程；按 sessionKey 精确路由到对应会话。
             // 未知/已关闭 key 必须拒绝，避免子 agent 孤儿请求落到「当前选中」会话上乱 eval。
             let store = AppStore.shared
             let key = request["sessionKey"].string ?? ""
             guard !key.isEmpty,
-                  let session = store.openSessions[key]
-                    ?? store.openSessions.values.first(where: { $0.bridgeRoutingKey == key }) else {
+                  let session = store.openSessions.values.first(where: {
+                      BridgeCapabilityToken.matches(key, expected: $0.bridgeRoutingKey)
+                  }) else {
                 respond(["ok": false, "error": "unknown session key"])
                 return
             }
@@ -225,6 +249,25 @@ final class AppStore: ObservableObject {
                     session.rightPanel = .agents
                 }
                 respond(["ok": true])
+                return
+            }
+            if action == "computer_batch" {
+                let computerCapability = request["computerCapability"].string ?? ""
+                guard BridgeCapabilityToken.matches(
+                    computerCapability,
+                    expected: session.computerRoutingKey
+                ) else {
+                    respond([
+                        "ok": false,
+                        "error": "unauthorized computer capability",
+                    ])
+                    return
+                }
+                ComputerCoordinator.shared.handle(
+                    request: request,
+                    sessionKey: session.bridgeRoutingKey,
+                    respond: respond
+                )
                 return
             }
             if action == "navigate", session.rightPanel != .web {
@@ -286,6 +329,8 @@ final class AppStore: ObservableObject {
             skillTierExtension: plugin.skillTierExtension,
             codexServerToolsExtension: plugin.codexServerToolsExtension,
             claudeServerToolsExtension: plugin.claudeServerToolsExtension,
+            computerUseExtension: ComputerUseSettings.isEnabled()
+                ? plugin.computerUseExtension : nil,
             subagentDir: plugin.subagentDir,
             agentsDir: plugin.agentsDir,
             bossPromptPath: bossModeEnabled ? plugin.bossPrompt : nil,
@@ -1102,6 +1147,7 @@ final class AppStore: ObservableObject {
 
     func shutdown() {
         pendingHistoricalSessionOpens.removeAll()
+        ComputerCoordinator.shared.releaseAll(revokeConsent: true)
         for session in openSessions.values {
             session.subagents.saveNow()
             session.shutdown()

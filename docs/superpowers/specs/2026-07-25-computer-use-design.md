@@ -1,7 +1,17 @@
 # Computer Use（桌面控制）实施方案
 
 日期：2026-07-25
-状态：待批准（未开工）
+状态：已实现 v1（代码与自动测试完成；真实 TCC / UI / 输入 V3 验收未执行）
+
+> 2026-07-26 实现修订：以下五项为最终实现约束并覆盖本文较早的单会话/单 action 表述：
+>
+> 1. `ComputerCoordinator` 是 process-global 单控制者，使用 session lease、固定目标 bundle、预算、超时、用户接管和急停。
+> 2. OpenAI/Codex 不改写为原生 `computer_call`；v1 只对 Anthropic messages 使用官方 typed tool，其余统一自定义 batch schema。
+> 3. 内部请求统一为 `actions:[ComputerAction]`；每个被接受的 batch 结束后强制截图。
+> 4. 会话授权之外增加 bundle-id 应用授权；PipiUI、终端、密码管理器、钥匙串和 System Settings 永久拒绝。
+> 5. 截图只驻留内存：pi session 中仅保存 opaque marker，`context` hook 在 provider 调用前重新注入 PNG。
+>
+> 运行说明、安全边界和 V3 手工验收见 [`docs/computer-use.md`](../../computer-use.md)。
 
 ## 问题
 
