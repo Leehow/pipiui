@@ -6,8 +6,8 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/ship-app.sh
 
-Integration-only canonical ship:
-  1. Requires branch main, codex/*, or integration/*.
+Canonical release ship:
+  1. Safety gate accepts main, codex/*, or integration/*.
   2. Requires a completely clean worktree (tracked and untracked files).
   3. Acquires a machine-wide, per-user atomic mkdir lock.
   4. Runs tests and creates worktree-local build/PipiUI.app.
@@ -22,6 +22,10 @@ Environment:
 
 There is intentionally no dirty-worktree, branch, test, or stale-lock override.
 Never remove an existing lock unless its recorded owner has been investigated.
+
+The shared green/staging workflow calls this only from clean release main after
+an explicit integration/green -> main release merge. This script never performs
+that merge.
 EOF
 }
 

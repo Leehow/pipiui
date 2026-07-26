@@ -13,7 +13,8 @@ Usage:
     [--worktree-root <absolute-path>]
 
 Examples:
-  ./scripts/new-ai-worktree.sh --tool codex --work-id settings --topic sidebar --base main
+  ./scripts/new-ai-worktree.sh \
+    --tool codex --work-id settings --topic sidebar --base integration/green
 
 Branches:
   ai/<tool>/<work-id>-<topic>
@@ -26,6 +27,9 @@ The default worktree root is a sibling of the primary checkout:
 
 The current checkout may be dirty. The new worktree always starts from the
 explicit committed --base ref; uncommitted changes are never copied.
+
+Normal tasks should use --base integration/green. The base remains explicit so
+the caller always chooses the exact shared head intentionally.
 EOF
 }
 
