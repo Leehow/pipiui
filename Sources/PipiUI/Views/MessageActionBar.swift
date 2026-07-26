@@ -37,6 +37,9 @@ struct MessageActionBar: View {
     var onResend: (() -> Void)? = nil
     var onEdit: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
+    var collapsed: Bool = false
+    var onToggleCollapse: (() -> Void)? = nil
+    var onJump: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 1) {
@@ -49,6 +52,16 @@ struct MessageActionBar: View {
             }
             if showBranch, let onBranch {
                 iconButton("arrow.triangle.branch", help: "创建分支会话", action: onBranch)
+            }
+            if showBranch, let onToggleCollapse {
+                iconButton(
+                    collapsed ? "rectangle.expand.vertical" : "rectangle.compress.vertical",
+                    help: collapsed ? "展开" : "折叠",
+                    action: onToggleCollapse
+                )
+            }
+            if showBranch, let onJump {
+                iconButton("arrow.up", help: "跳转到消息开头", action: onJump)
             }
         }
         .frame(

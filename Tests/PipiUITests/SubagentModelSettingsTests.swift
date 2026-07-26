@@ -52,6 +52,64 @@ final class SubagentModelSettingsTests: XCTestCase {
         XCTAssertNil(SubagentModelSettings.modelOverride(for: "plan", defaults: suite))
     }
 
+    func testLegacyStringOverrideLoadsWithoutThinking() {
+        let (name, suite) = tempSuite()
+        defer { suite.removePersistentDomain(forName: name) }
+
+        suite.set(["explore": "xai/grok-4.5:high"], forKey: SubagentModelSettings.defaultsKey)
+
+        XCTAssertEqual(SubagentModelSettings.modelOverride(for: "explore", defaults: suite), "xai/grok-4.5:high")
+        XCTAssertNil(SubagentModelSettings.thinkingOverride(for: "explore", defaults: suite))
+        XCTAssertEqual(
+            SubagentModelSettings.resolveModel(
+                for: "explore",
+                mainModelId: "anthropic/claude-sonnet-4-6",
+                frontmatterFallback: nil,
+                defaults: suite
+            ),
+            "xai/grok-4.5:high"
+        )
+    }
+
+    func testExplicitThinkingPersistsSeparatelyFromModel() throws {
+        let (name, suite) = tempSuite()
+        defer { suite.removePersistentDomain(forName: name) }
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("pipiui-thinking-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        let url = root.appendingPathComponent("subagent-models.json")
+
+        SubagentModelSettings.setOverride(
+            "anthropic/claude-sonnet-4-6",
+            thinking: "high",
+            for: "reviewer",
+            defaults: suite,
+            to: url
+        )
+
+        XCTAssertEqual(SubagentModelSettings.modelOverride(for: "reviewer", defaults: suite), "anthropic/claude-sonnet-4-6")
+        XCTAssertEqual(SubagentModelSettings.thinkingOverride(for: "reviewer", defaults: suite), "high")
+        let data = try Data(contentsOf: url)
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let reviewer = try XCTUnwrap(obj["reviewer"] as? [String: String])
+        XCTAssertEqual(reviewer["model"], "anthropic/claude-sonnet-4-6")
+        XCTAssertEqual(reviewer["thinking"], "high")
+    }
+
+    func testDefaultThinkingUsesLegacyStringShape() throws {
+        let (name, suite) = tempSuite()
+        defer { suite.removePersistentDomain(forName: name) }
+
+        suite.set(["plan": "xai/grok-4"], forKey: SubagentModelSettings.defaultsKey)
+
+        XCTAssertNil(SubagentModelSettings.thinkingOverride(for: "plan", defaults: suite))
+        let encoded = SubagentModelSettings.jsonString(defaults: suite)
+        let data = try XCTUnwrap(encoded.data(using: .utf8))
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
+        XCTAssertEqual(obj["plan"], "xai/grok-4")
+    }
+
     func testEmptyOverrideClearsAndFallsBack() {
         let (name, suite) = tempSuite()
         defer { suite.removePersistentDomain(forName: name) }
@@ -87,13 +145,12 @@ final class SubagentModelSettingsTests: XCTestCase {
         try fm.createDirectory(at: tmpRoot, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: tmpRoot) }
 
-        // Write JSON next to a custom path by invoking sync with a map into Application Support
-        // is hard to redirect; instead verify encoder shape via jsonString + file write helper path.
         let (name, suite) = tempSuite()
         defer { suite.removePersistentDomain(forName: name) }
         suite.set(["lead": "anthropic/claude-sonnet-4-6", "explore": ""], forKey: SubagentModelSettings.defaultsKey)
-        let encoded = SubagentModelSettings.jsonString(defaults: suite)
-        let data = try XCTUnwrap(encoded.data(using: .utf8))
+        let url = tmpRoot.appendingPathComponent("subagent-models.json")
+        SubagentModelSettings.syncJSONFile(defaults: suite, to: url)
+        let data = try Data(contentsOf: url)
         let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
         XCTAssertEqual(obj["lead"], "anthropic/claude-sonnet-4-6")
         XCTAssertEqual(obj["explore"], "")
@@ -112,6 +169,20 @@ final class SubagentModelSettingsTests: XCTestCase {
         map.removeValue(forKey: "reviewer")
         suite.set(map, forKey: SubagentModelSettings.defaultsKey)
         XCTAssertNil(SubagentModelSettings.modelOverride(for: "reviewer", defaults: suite))
+    }
+
+    func testSubagentExtensionUsesSeparateThinkingArgumentForExplicitOverride() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // PipiUITests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // repository root
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/PipiUI/PiExt/subagent/index.ts"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("function resolveAgentThinking"))
+        XCTAssertTrue(source.contains("args.push(\"--thinking\", resolvedThinking)"))
+        XCTAssertTrue(source.contains("stripModelThinkingSuffix(resolvedModel)"))
     }
 }
 

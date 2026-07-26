@@ -1,6 +1,10 @@
 import SwiftUI
 import AppKit
 
+// ScrollView 经 transcriptFlip 翻转：layout .top == 可视底部（见 applyJumpToLatest 注释）。
+// 跳转要把目标落到「可视顶部」以便从头阅读，故用 .bottom。
+private let jumpAnchor: UnitPoint = .bottom
+
 struct ChatDetailView: View {
     @EnvironmentObject var store: AppStore
     @ObservedObject var session: ChatSession
@@ -101,9 +105,8 @@ private struct ChatDetailViewBody: View {
             gitBranches.bind(projectURL: session.projectURL)
         }
         .onChange(of: session.id) { _, _ in
-            // Safety net for the reused-detail-view path. App.swift currently keeps
-            // `.id(session.id)`, so a switch tears this view down and this branch is
-            // effectively dead on switch — but it is kept correct in case .id is removed.
+            // The detail chrome is reused across sessions. Reset only transient view state;
+            // draft, panel selection, transcript window and pin state live on ChatSession.
             gitBranches.bind(projectURL: session.projectURL)
             scrollCoalesceScheduled = false
             scrollNeedsRetry = false
@@ -286,9 +289,13 @@ private struct ChatDetailViewBody: View {
             )
             .reversed()
         return ScrollViewReader { proxy in
+            // assistant run id → 其文档顺序上一条 user 消息 id（无则缺省，回退到自身 id）。
+            let jumpTargets = jumpTargetMap(rows: visibleRowsNewestFirst)
             ScrollView {
                 // Newest-first stack. `.transcriptFlip()` on the ScrollView (below) puts
                 // document-start at the visual bottom — no `.defaultScrollAnchor(.bottom)`.
+                // Keep rows lazy: warm session switches should create and measure only the
+                // visible Markdown/AppKit views, not the whole transcript window.
                 LazyVStack(alignment: .leading, spacing: chatTypography.messageSpacing) {
                     // Visual bottom / pin edge (document start after scroll-view flip).
                     Color.clear
@@ -374,6 +381,12 @@ private struct ChatDetailViewBody: View {
                                 onBranch: {
                                     guard let entryId else { return }
                                     session.branchFromAssistant(runLastEntryId: entryId)
+                                },
+                                onJump: {
+                                    let target = jumpTargets[id] ?? id
+                                    var t = Transaction()
+                                    t.disablesAnimations = true
+                                    withTransaction(t) { proxy.scrollTo(target, anchor: jumpAnchor) }
                                 }
                             )
                             .equatable()
@@ -393,8 +406,16 @@ private struct ChatDetailViewBody: View {
                 }
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .geometryGroup()
             }
+            // Reset only the scroll subtree on a session switch. With the inverted transcript,
+            // a fresh scroll view naturally starts at document-start == the visual latest edge,
+            // so no programmatic settle scroll (and no second visible text placement) is needed.
+            // Do not animate this identity replacement: a fresh LazyVStack measures its visible
+            // AppKit text rows on the first layout pass, and interpolating that provisional
+            // geometry makes the transcript visibly shrink before reaching its final size.
+            .id(session.id)
+            .animation(nil, value: session.id)
+            .transition(.identity)
             // Prefer overlay indicators; AppKit style is forced in StickToBottomTracker.
             .scrollIndicators(.automatic)
             // Flip the scroll view itself so document-start maps to the visual bottom.
@@ -419,23 +440,16 @@ private struct ChatDetailViewBody: View {
                 }
             }
             .overlay {
-                // Covers the pane while pi boots and the initial transcript is built.
-                if session.isInitializing && session.streamingItem == nil {
-                    SessionLoadingView()
-                        .transition(.opacity)
+                ZStack {
+                    // Covers the pane while pi boots and the initial transcript is built.
+                    if session.isInitializing && session.streamingItem == nil {
+                        SessionLoadingView()
+                            .transition(.opacity)
+                    }
                 }
-            }
-            .animation(.easeInOut(duration: 0.2), value: session.isInitializing)
-            .onChange(of: session.id) { _, _ in
-                scrollCoalesceScheduled = false
-                scrollNeedsRetry = false
-            }
-            .onChange(of: session.isInitializing) { wasInitializing, isInitializing in
-                // History arrived: one LazyVStack realize nudge at the pin edge.
-                // Streaming / new messages do *not* scrollTo — growth is at document start.
-                if wasInitializing && !isInitializing, session.pinTranscriptToBottom {
-                    jumpToLatest(proxy)
-                }
+                // Keep the loading fade local. Applying this animation to the ScrollView also
+                // animates LazyVStack/AppKit measurement corrections during a session switch.
+                .animation(.easeInOut(duration: 0.2), value: session.isInitializing)
             }
             .onChange(of: session.rightPanel != nil) { _, _ in
                 recoverPinAfterColumnWidthChange(proxy)
@@ -501,7 +515,7 @@ private struct ChatDetailViewBody: View {
         }
     }
 
-    /// Explicit jump to the pin edge (jump button / init settle / width recover).
+    /// Explicit jump to the pin edge (jump button / width recover).
     /// Not used for streaming follow — flipped growth stays at document start.
     private func jumpToLatest(_ proxy: ScrollViewProxy, retry: Bool = false) {
         guard session.pinTranscriptToBottom else { return }
@@ -535,6 +549,27 @@ private struct ChatDetailViewBody: View {
             }
             proxy.scrollTo("bottom", anchor: .top)
         }
+    }
+
+    /// assistant run id → 其文档顺序上一条 user 消息 id（无前驱 user 时缺省）。
+    /// `rows` 为 newest-first；反向遍历（oldest-first）维护「最近见过的 user leaf id」，
+    /// 遇 `.assistantRun` 记录映射，遇 user `.leaf` 更新维护值。
+    private func jumpTargetMap(rows: some BidirectionalCollection<AssistantBlockLayout.TranscriptRow>) -> [String: String] {
+        var map: [String: String] = [:]
+        var lastUserLeafId: String?
+        for row in rows.reversed() {
+            switch row {
+            case .leaf(let item):
+                if item.role == "user" {
+                    lastUserLeafId = item.id
+                }
+            case .assistantRun(let id, _, _):
+                if let lastUserLeafId {
+                    map[id] = lastUserLeafId
+                }
+            }
+        }
+        return map
     }
 
     /// 只取该消息里工具调用对应的 run，让 MessageRow 的 Equatable 比较保持廉价
