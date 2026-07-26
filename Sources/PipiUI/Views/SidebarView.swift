@@ -27,8 +27,8 @@ struct SidebarView: View {
                 .padding(.horizontal, Self.sidebarGutter + 2)
                 .padding(.top, 14)
                 .padding(.bottom, 10)
-            // ScrollView keeps the sidebar's manual-scroll behavior while the
-            // hidden indicator avoids reserving a wide AppKit track on hover.
+            // SwiftUI hides the indicator, while the sidebar-only AppKit
+            // installer below also disables any legacy reserved scroller track.
             // Selection chrome is drawn by SessionRowContainer.background.
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
@@ -38,6 +38,7 @@ struct SidebarView: View {
                 }
                 .padding(.horizontal, Self.sidebarGutter)
                 .padding(.vertical, 8)
+                .sidebarHiddenVerticalScroller()
             }
             .scrollIndicators(.hidden)
             .clipShape(Rectangle())

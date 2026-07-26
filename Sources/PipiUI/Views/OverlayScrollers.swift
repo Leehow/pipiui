@@ -145,9 +145,96 @@ private struct OverlayScrollerInstaller: NSViewRepresentable {
     }
 }
 
+/// Sidebar-only AppKit backstop for macOS configurations that keep a legacy
+/// vertical scroller visible even when SwiftUI requests hidden indicators.
+/// It only removes the scroller chrome; wheel, trackpad, and keyboard scrolling
+/// continue to be handled by the enclosing `NSScrollView`.
+private struct SidebarVerticalScrollerHider: NSViewRepresentable {
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> InstallerView {
+        let view = InstallerView(frame: .zero)
+        view.isHidden = true
+        view.onAttach = { [weak coordinator = context.coordinator] host in
+            coordinator?.ensureInstalled(from: host)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: InstallerView, context: Context) {
+        context.coordinator.ensureInstalled(from: nsView)
+    }
+
+    static func dismantleNSView(_ nsView: InstallerView, coordinator: Coordinator) {
+        coordinator.cancel()
+        nsView.onAttach = nil
+    }
+
+    final class InstallerView: NSView {
+        var onAttach: ((NSView) -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window != nil { onAttach?(self) }
+        }
+
+        override func viewDidMoveToSuperview() {
+            super.viewDidMoveToSuperview()
+            if superview != nil { onAttach?(self) }
+        }
+    }
+
+    final class Coordinator {
+        private var attempts = 0
+        private var workItem: DispatchWorkItem?
+
+        func ensureInstalled(from view: NSView) {
+            let scrollViews = OverlayScrollers.collect(from: view)
+            guard !scrollViews.isEmpty else {
+                scheduleRetry(from: view)
+                return
+            }
+            for scrollView in scrollViews {
+                // `hasVerticalScroller` removes the AppKit-reserved track;
+                // `isHidden` covers a scroller instance already materialized
+                // by SwiftUI before this installer attached.
+                scrollView.verticalScroller?.isHidden = true
+                scrollView.hasVerticalScroller = false
+            }
+            // SwiftUI can reset the AppKit flag during initial attachment.
+            // Reapply briefly, just as the overlay installer retries discovery.
+            scheduleRetry(from: view)
+        }
+
+        private func scheduleRetry(from view: NSView) {
+            guard attempts < 16 else { return }
+            attempts += 1
+            workItem?.cancel()
+            let item = DispatchWorkItem { [weak self, weak view] in
+                guard let self, let view else { return }
+                self.ensureInstalled(from: view)
+            }
+            workItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: item)
+        }
+
+        func cancel() {
+            workItem?.cancel()
+            workItem = nil
+        }
+
+        deinit { cancel() }
+    }
+}
+
 extension View {
     /// Thin overlay scrollbars (transcript, sidebar, right panels).
     func overlayScrollers() -> some View {
         background(OverlayScrollerInstaller())
+    }
+
+    /// Force-hide only the enclosing sidebar's AppKit vertical scroller.
+    func sidebarHiddenVerticalScroller() -> some View {
+        background(SidebarVerticalScrollerHider())
     }
 }
