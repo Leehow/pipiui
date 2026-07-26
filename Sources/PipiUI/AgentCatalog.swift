@@ -13,7 +13,9 @@ struct AgentDefinition: Identifiable, Equatable, Hashable, Sendable {
 /// Discovers agent markdown under PipiUI's installed agents directory.
 enum AgentCatalog {
     /// Preferred display order for built-in PipiUI agents.
-    static let preferredOrder = ["explore", "plan", "general-purpose", "reviewer", "lead"]
+    static let preferredOrder = [
+        "explore", "plan", "general-purpose", "reviewer", "lead", "secretary",
+    ]
 
     /// Hardcoded fallbacks so Settings never shows an empty Subagent tab when
     /// Application Support / bundle resources are missing or stale.
@@ -53,6 +55,13 @@ enum AgentCatalog {
             frontmatterModel: "xai/grok-4.5:high",
             filePath: ""
         ),
+        .init(
+            name: "secretary",
+            description: "Boss closeout secretary. Reconciles agent outcomes, worktrees, branches, verification, temporary artifacts, and the existing Boss ledger without creating another worktree.",
+            tools: ["read", "grep", "find", "ls", "bash", "edit", "write", "secretary_commit"],
+            frontmatterModel: "xai/grok-4.5:high",
+            filePath: ""
+        ),
     ]
 
     static func defaultAgentsDirectory(fileManager: FileManager = .default) -> URL {
@@ -63,10 +72,10 @@ enum AgentCatalog {
     /// Candidate directories: Application Support (runtime install) → bundle PiExt/agents.
     static func candidateDirectories(fileManager: FileManager = .default) -> [URL] {
         var dirs: [URL] = [defaultAgentsDirectory(fileManager: fileManager)]
-        if let bundled = Bundle.module.url(forResource: "PiExt", withExtension: nil)?
+        if let bundled = PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil)?
             .appendingPathComponent("agents", isDirectory: true) {
             dirs.append(bundled)
-        } else if let resourceRoot = Bundle.module.resourceURL?
+        } else if let resourceRoot = PipiResourceBundle.shared.resourceURL?
             .appendingPathComponent("PiExt/agents", isDirectory: true) {
             dirs.append(resourceRoot)
         }

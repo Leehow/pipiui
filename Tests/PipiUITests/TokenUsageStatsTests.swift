@@ -287,4 +287,38 @@ final class TokenUsageStatsTests: XCTestCase {
         XCTAssertEqual(totals.cacheRead, 0)
         XCTAssertEqual(totals.cacheWrite, 0)
     }
+
+    func testSessionUsageRestoresOnlyMainTurnsAndUsesLatestTimestampAcrossFiles() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-session-usage-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let active = dir.appendingPathComponent("active.jsonl")
+        let rolled = dir.appendingPathComponent("active.jsonl.1")
+        let session = "session-alpha"
+        try writeJSONL([
+            // Newer than the active file even though it is supplied second.
+            #"{"ts":"2026-07-25T12:00:00Z","session":"\#(session)","channel":"main","model":"m","input":120,"output":12,"cacheRead":1200,"cacheWrite":120,"cost":1.2,"contextTokens":12000}"#,
+            // Another session and a subagent must never affect the footer.
+            #"{"ts":"2026-07-25T13:00:00Z","session":"session-beta","channel":"main","model":"m","input":999,"output":999,"cacheRead":999,"cacheWrite":999,"cost":9.9,"contextTokens":99999}"#,
+            #"{"ts":"2026-07-25T14:00:00Z","session":"\#(session)","channel":"subagent","model":"m","input":777,"output":777,"cacheRead":777,"cacheWrite":777,"cost":7.7,"contextTokens":77777}"#,
+        ], to: rolled)
+        try writeJSONL([
+            #"{"ts":"2026-07-25T11:00:00Z","session":"\#(session)","channel":"main","model":"m","input":110,"output":11,"cacheRead":1100,"cacheWrite":110,"cost":1.1,"contextTokens":11000}"#,
+            "{malformed json}",
+            // A matching substring without a string session value is not a record.
+            #"{"ts":"2026-07-25T15:00:00Z","session":null,"channel":"main","model":"\#(session)","input":1,"output":1,"cacheRead":1,"cacheWrite":1,"cost":1,"contextTokens":1}"#,
+        ], to: active)
+
+        let usage = TokenUsageStats.sessionUsage(for: session, urls: [active, rolled])
+        XCTAssertEqual(usage.cacheRead, 2300)
+        XCTAssertEqual(usage.cacheWrite, 230)
+        XCTAssertEqual(usage.cost, 2.3, accuracy: 1e-9)
+        XCTAssertEqual(usage.lastTurnUsage?.input, 120)
+        XCTAssertEqual(usage.lastTurnUsage?.output, 12)
+        XCTAssertEqual(usage.lastTurnUsage?.cacheRead, 1200)
+        XCTAssertEqual(usage.lastTurnUsage?.contextTokens, 12000)
+        XCTAssertEqual(usage.contextTokens, 12000)
+    }
 }

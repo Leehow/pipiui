@@ -71,7 +71,7 @@ enum PiPlugin {
             let s = (attrs[.size] as? Int) ?? 0
             parts.append("exe:\(s):\(m)")
         }
-        if let bundled = Bundle.module.url(forResource: "PiExt", withExtension: nil) {
+        if let bundled = PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil) {
             parts.append(directorySignature(bundled))
         }
         return parts.joined(separator: "|")
@@ -96,7 +96,7 @@ enum PiPlugin {
     private static func installedIfComplete() -> Installed? {
         let fm = FileManager.default
         var result = Installed()
-        if Bundle.module.url(forResource: "PiExt", withExtension: nil) != nil {
+        if PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil) != nil {
             let dest = root.appendingPathComponent("pi-ext")
             let sub = dest.appendingPathComponent("subagent").path
             let agents = dest.appendingPathComponent("agents").path
@@ -130,8 +130,8 @@ enum PiPlugin {
 
         // 1. 从 SPM 资源里把整个 PiExt 拷到 Application Support/pi-ext
         let bundledPiExt =
-            Bundle.module.url(forResource: "PiExt", withExtension: nil)
-            ?? Bundle.module.resourceURL?.appendingPathComponent("PiExt", isDirectory: true)
+            PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil)
+            ?? PipiResourceBundle.shared.resourceURL?.appendingPathComponent("PiExt", isDirectory: true)
         if let bundled = bundledPiExt, fm.fileExists(atPath: bundled.path) {
             let dest = root.appendingPathComponent("pi-ext")
             try? fm.removeItem(at: dest)

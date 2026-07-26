@@ -86,6 +86,19 @@ final class MessageActionsTests: XCTestCase {
         XCTAssertEqual(MessageActions.copyableText(from: item), "visible")
     }
 
+    func testUserAuthoredMessageExcludesRuntimeWorkerSignals() {
+        func userItem(_ text: String) -> ChatItem {
+            ChatItem(id: text, role: "user", blocks: [.text(text)])
+        }
+
+        XCTAssertTrue(MessageActions.isUserAuthoredMessage(userItem("修复跳转")))
+        XCTAssertFalse(MessageActions.isUserAuthoredMessage(userItem("[subagent-done] agentId=a")))
+        XCTAssertFalse(MessageActions.isUserAuthoredMessage(userItem("[worktree-merge-failed] merge failed")))
+        XCTAssertFalse(MessageActions.isUserAuthoredMessage(
+            ChatItem(id: "a", role: "assistant", blocks: [.text("answer")])
+        ))
+    }
+
     func testCopyableTextFromSegments() {
         let segments: [AssistantBlockLayout.Segment] = [
             .singleton(.thinking("x")),

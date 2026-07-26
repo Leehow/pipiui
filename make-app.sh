@@ -10,8 +10,28 @@ mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 # Library+thin-entry layout: product binary is still named PipiUI (see Package.swift products).
 cp .build/release/PipiUI "$APP/Contents/MacOS/PipiUI"
-# Bundle.module 在可执行文件旁查找资源包，必须一起拷进 .app
-cp -R .build/release/PipiUI_PipiUI.bundle "$APP/Contents/MacOS/" 2>/dev/null || true
+# Embed the SwiftPM resource bundle in the standard signed-app location.
+# PipiResourceBundle resolves it here in packaged builds and falls back to
+# Bundle.module for `swift run` / tests.
+RESOURCE_BUNDLE="$APP/Contents/Resources/PipiUI_PipiUI.bundle"
+mkdir -p "$RESOURCE_BUNDLE/Contents/Resources"
+cp -R .build/release/PipiUI_PipiUI.bundle/. "$RESOURCE_BUNDLE/Contents/Resources/"
+
+# SwiftPM emits a flat resource directory without bundle metadata. Give it a
+# valid bundle identity so codesign can seal it as nested code instead of
+# rejecting the whole app as an unrecognized subcomponent.
+cat > "$RESOURCE_BUNDLE/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>com.leehow.pipiui.resources</string>
+    <key>CFBundleName</key><string>PipiUI Resources</string>
+    <key>CFBundlePackageType</key><string>BNDL</string>
+    <key>CFBundleVersion</key><string>1</string>
+</dict>
+</plist>
+PLIST
 
 # App icon (.icns) from assets/brand/app-icon.png — before codesign
 ./scripts/make-icon.sh \
@@ -43,7 +63,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
-codesign --force --sign - "$APP" 2>/dev/null || true
+codesign --force --sign - "$RESOURCE_BUNDLE"
+codesign --force --sign - "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
 BIN="$APP/Contents/MacOS/PipiUI"
 echo "Built $APP"
 echo "Open:  open $APP"
