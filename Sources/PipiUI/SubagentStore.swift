@@ -20,8 +20,24 @@ enum WorktreeLifecycle: String, Codable, Equatable, Sendable {
     case pendingReview
     /// Merged into main worktree and removed.
     case merged
+    /// Integration succeeded, but worktree/branch cleanup is incomplete and actionable.
+    case mergedCleanupPending
     /// Discarded (removed without merge).
     case discarded
+}
+
+/// Persisted final disposition used by Boss closeout and restart reconciliation.
+enum AgentCloseoutDisposition: String, Codable, Equatable, Sendable {
+    /// Still running, awaiting merge/verify, or not yet audited.
+    case unclassified
+    /// Integrated, verified when required, and mechanically cleaned.
+    case cleaned
+    /// Deliberately preserved because it may contain useful or user-owned work.
+    case retained
+    /// Boss must dispatch a fixer/integrator/cleanup worker.
+    case needsFixer
+    /// Product/scope ownership is genuinely ambiguous and requires the user.
+    case needsUser
 }
 
 /// 一个被派出的 subagent 的实时状态（由扩展通过桥接上报）。
@@ -67,6 +83,10 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
     /// Attested exit code of the verify command run in the agent worktree.
     /// Present + ≠ 0 ⇒ worker's own verify failed: keep pendingReview, never auto-merge.
     var verifyExit: Int? = nil
+    /// Closeout is authoritative in the existing per-session agent history; the
+    /// secretary mirrors/summarizes it into the Boss ledger rather than creating a second ledger.
+    var closeoutDisposition: AgentCloseoutDisposition = .unclassified
+    var closeoutReason: String? = nil
     /// Latest turn context occupancy (from usage.totalTokens / contextTokens).
     var contextTokens: Int = 0
     /// Model context window when known.
@@ -122,6 +142,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         case stalled, stalledIdleSec
         case worktreePath, worktreeBranch, worktreeError, worktreeLifecycle
         case verifyCommand, verifyExit
+        case closeoutDisposition, closeoutReason
         case contextTokens, contextWindow
         case totalInput, totalOutput, totalCacheRead, totalCacheWrite
     }
@@ -151,6 +172,8 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         worktreeLifecycle: WorktreeLifecycle = .none,
         verifyCommand: String? = nil,
         verifyExit: Int? = nil,
+        closeoutDisposition: AgentCloseoutDisposition = .unclassified,
+        closeoutReason: String? = nil,
         contextTokens: Int = 0,
         contextWindow: Int? = nil,
         totalInput: Int = 0,
@@ -182,6 +205,8 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         self.worktreeLifecycle = worktreeLifecycle
         self.verifyCommand = verifyCommand
         self.verifyExit = verifyExit
+        self.closeoutDisposition = closeoutDisposition
+        self.closeoutReason = closeoutReason
         self.contextTokens = contextTokens
         self.contextWindow = contextWindow
         self.totalInput = totalInput
@@ -220,6 +245,11 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         worktreeLifecycle = life
         verifyCommand = try c.decodeIfPresent(String.self, forKey: .verifyCommand)
         verifyExit = try c.decodeIfPresent(Int.self, forKey: .verifyExit)
+        closeoutDisposition = try c.decodeIfPresent(
+            AgentCloseoutDisposition.self,
+            forKey: .closeoutDisposition
+        ) ?? .unclassified
+        closeoutReason = try c.decodeIfPresent(String.self, forKey: .closeoutReason)
         contextTokens = try c.decodeIfPresent(Int.self, forKey: .contextTokens) ?? 0
         contextWindow = try c.decodeIfPresent(Int.self, forKey: .contextWindow)
         totalInput = try c.decodeIfPresent(Int.self, forKey: .totalInput) ?? 0
@@ -254,6 +284,8 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         try c.encode(worktreeLifecycle, forKey: .worktreeLifecycle)
         try c.encodeIfPresent(verifyCommand, forKey: .verifyCommand)
         try c.encodeIfPresent(verifyExit, forKey: .verifyExit)
+        try c.encode(closeoutDisposition, forKey: .closeoutDisposition)
+        try c.encodeIfPresent(closeoutReason, forKey: .closeoutReason)
         try c.encode(contextTokens, forKey: .contextTokens)
         try c.encodeIfPresent(contextWindow, forKey: .contextWindow)
         try c.encode(totalInput, forKey: .totalInput)
@@ -285,7 +317,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
             return state != .running
         case .active:
             return state != .running
-        case .merged, .discarded:
+        case .merged, .mergedCleanupPending, .discarded:
             return false
         }
     }
@@ -295,7 +327,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         if let p = worktreePath, !p.isEmpty { return true }
         if let e = worktreeError, !e.isEmpty { return true }
         switch worktreeLifecycle {
-        case .merged, .discarded, .pendingReview, .active:
+        case .merged, .mergedCleanupPending, .discarded, .pendingReview, .active:
             return true
         case .none:
             return false
@@ -308,6 +340,7 @@ private enum MergeGitOutcome: Sendable {
     case ok
     case mergeFailed(String)
     case removeFailed(String)
+    case cleanupFailed(String)
 }
 
 /// Compact strings for the subagent detail metrics line.
@@ -353,7 +386,7 @@ enum WorktreeMergeFailedMessage {
             "error:",
             error,
             "",
-            "Worktree 仍保留（pendingReview）。默认动作是派一个 general-purpose fixer 解决合并（brief 附分支名与冲突文件清单，verify 填合并后的构建/测试命令）；你只三选一裁决：接受 fixer 结果 / 丢弃无价值 worktree / 问用户（一句话、一个具体选项）。绝不亲自打开冲突 diff；不要把原始 git 报错转发给用户；不要把这条消息当成用户新需求。",
+            "Worktree kept (pendingReview). Default action: dispatch a general-purpose fixer to resolve the merge (brief carries the branch name + conflicted file list, verify = the post-merge build/test command). You adjudicate three ways only: accept the fixer result / discard a worthless worktree / ask the user (one sentence, one concrete choice). Never open conflict diffs yourself; never forward the raw git error to the user; do not treat this message as a new user request.",
         ].joined(separator: "\n")
     }
 
@@ -407,8 +440,8 @@ enum PostMergeVerifyFailedMessage {
         let tail = failure.outputTail.isEmpty ? "(no output)" : failure.outputTail
         let guidance =
             mainDirty
-            ? "主仓在合并该分支后未通过这条系统证词验证，但主仓当前有未提交改动——失败可能来自用户自己在写的代码，而不是本 agent 的工作。先判断归属：确属 agent 工作则派 general-purpose fixer 在主仓修复（brief 附上面的命令与输出尾部，verify 填同一条命令）；疑似用户 WIP 则用一句话向用户说明，不要擅自改动用户未提交的代码。不要把这条消息当成用户新需求。"
-            : "主仓在合并该分支后未通过这条系统证词验证；worktree 已合并并移除。请立即派一个 general-purpose fixer 在主仓修复（brief 附上面的命令与输出尾部，verify 填同一条命令），修复后 verified=pass 才可接受；只有取舍真正属于用户时才简短问一次。不要把这条消息当成用户新需求。"
+            ? "The main repo failed this attested verify command after merging the branch, but the main repo currently has uncommitted changes — the failure may come from the user's own work in progress, not this agent's work. Attribute first: if it belongs to the agent's work, dispatch a general-purpose fixer on the main repo (brief carries the command and output tail above, verify = the same command); if it looks like user WIP, explain to the user in one sentence and never touch their uncommitted code. Do not treat this message as a new user request."
+            : "The main repo failed this attested verify command after merging the branch; the worktree has been merged and removed. Immediately dispatch a general-purpose fixer on the main repo (brief carries the command and output tail above, verify = the same command); accept only after verified=pass. Ask the user briefly only when the trade-off is genuinely theirs. Do not treat this message as a new user request."
         return [
             "\(prefix) agentId=\(agent.id) name=\(agent.name) branch=\(branch)"
                 + (mainDirty ? " mainDirty=true" : ""),
@@ -436,7 +469,7 @@ enum PostMergeVerifyRunner {
         guard Darwin.pipe(&pipeFDs) == 0 else {
             return PostMergeVerifyFailure(
                 command: command, exitCode: -1, timedOut: false,
-                outputTail: "无法创建 verify 管道")
+                outputTail: "failed to create verify pipe")
         }
         let readFD = pipeFDs[0]
         let writeFD = pipeFDs[1]
@@ -474,7 +507,7 @@ enum PostMergeVerifyRunner {
             close(writeFD)
             return PostMergeVerifyFailure(
                 command: command, exitCode: -1, timedOut: false,
-                outputTail: "无法启动 verify 进程: posix_spawn error \(spawnErr)")
+                outputTail: "failed to spawn verify process: posix_spawn error \(spawnErr)")
         }
         // Parent closes its copy of the write end so read() sees EOF at group exit.
         close(writeFD)
@@ -647,6 +680,27 @@ final class SubagentStore: ObservableObject {
 
     // MARK: - 持久化（跟随 pi 会话文件，App 崩溃/重启后恢复 agent 树）
 
+    /// Reconcile persisted "running" rows after process restart. The process is gone,
+    /// so the work must remain reviewable and explicitly classified.
+    static func reconcileInterruptedAfterRestart(
+        _ persisted: [SubagentInfo]
+    ) -> [SubagentInfo] {
+        var loaded = persisted
+        for i in loaded.indices where loaded[i].state == .running {
+            loaded[i].state = .interrupted
+            loaded[i].activity = ""
+            loaded[i].stalled = false
+            loaded[i].stalledIdleSec = 0
+            loaded[i].ended = loaded[i].ended ?? Date()
+            loaded[i].closeoutDisposition = .retained
+            loaded[i].closeoutReason = "App 重启时 agent 仍在运行；按中断成果保留"
+            if let path = loaded[i].worktreePath, !path.isEmpty {
+                loaded[i].worktreeLifecycle = .pendingReview
+            }
+        }
+        return loaded
+    }
+
     /// 会话文件路径已知后挂载持久化：加载历史 agent 树，此后每次事件防抖落盘。
     func attachPersistence(sessionFile: String) {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -661,18 +715,8 @@ final class SubagentStore: ObservableObject {
         guard agents.isEmpty else { return }
         Task.detached(priority: .utility) { [weak self] in
             guard let data = try? Data(contentsOf: url),
-                  var loaded = try? JSONDecoder().decode([SubagentInfo].self, from: data) else { return }
-            // 上次退出时还在跑的 agent：进程已不存在，如实标记为中断
-            for i in loaded.indices where loaded[i].state == .running {
-                loaded[i].state = .interrupted
-                loaded[i].activity = ""
-                loaded[i].stalled = false
-                loaded[i].stalledIdleSec = 0
-                loaded[i].ended = loaded[i].ended ?? Date()
-                if let path = loaded[i].worktreePath, !path.isEmpty {
-                    loaded[i].worktreeLifecycle = .pendingReview
-                }
-            }
+                  let persisted = try? JSONDecoder().decode([SubagentInfo].self, from: data) else { return }
+            let loaded = Self.reconcileInterruptedAfterRestart(persisted)
             let maxLogId = loaded.flatMap(\.log).map(\.id).max() ?? 0
             await MainActor.run {
                 guard let self, self.persistURL == url, self.agents.isEmpty else { return }
@@ -755,6 +799,8 @@ final class SubagentStore: ObservableObject {
                 clearStalled(i)
                 abortPending.remove(id)
                 agents[i].ended = nil
+                agents[i].closeoutDisposition = .unclassified
+                agents[i].closeoutReason = nil
                 if let tc = e["toolCallId"].string { agents[i].toolCallId = tc }
                 if let t = e["title"].string { agents[i].title = t }
                 if let path = e["worktreePath"].string { agents[i].worktreePath = path }
@@ -872,11 +918,23 @@ final class SubagentStore: ObservableObject {
             // Terminal + still has worktree path → pending review.
             if let path = agents[i].worktreePath, !path.isEmpty {
                 switch agents[i].worktreeLifecycle {
-                case .merged, .discarded:
+                case .merged, .mergedCleanupPending, .discarded:
                     break
                 default:
                     agents[i].worktreeLifecycle = .pendingReview
                 }
+            }
+            let verifyFailed = (agents[i].verifyExit ?? 0) != 0
+            if agents[i].state != .ok {
+                agents[i].closeoutDisposition = .retained
+                agents[i].closeoutReason = "agent \(agents[i].state.rawValue)；成果与 worktree 保留审核"
+            } else if verifyFailed {
+                agents[i].closeoutDisposition = .retained
+                agents[i].closeoutReason = "agent worktree 验证失败；禁止自动合并或清理"
+            } else if agents[i].worktreePath?.isEmpty != false {
+                // Explicit-main-cwd roles (notably secretary) have no branch/worktree to clean.
+                agents[i].closeoutDisposition = .cleaned
+                agents[i].closeoutReason = "无隔离 worktree；运行时无需机械清理"
             }
             // Product default: successful agent + worktree → auto-merge into main + remove wt.
             // failed/aborted/interrupted keep pendingReview for续作; UI buttons remain as fallback.
@@ -965,6 +1023,14 @@ final class SubagentStore: ObservableObject {
                 in: wtURL,
                 message: "pipiui: agent \(agentId) work"
             )
+            // Never force-remove unexplained leftovers after a failed commit attempt.
+            // The existing add-all commit contract remains for compatibility, but a
+            // still-dirty tree is retained for secretary/fixer classification.
+            if GitRepo.probe(workTree: wtURL).isDirty {
+                return .mergeFailed(
+                    "agent worktree 提交后仍有未提交/未分类文件；已保留，禁止自动清理"
+                )
+            }
             do {
                 try GitRepo.mergeBranch(branch, into: main)
             } catch {
@@ -972,10 +1038,19 @@ final class SubagentStore: ObservableObject {
                 return .mergeFailed(msg)
             }
             do {
-                try GitRepo.worktreeRemove(at: wtURL, in: main, force: true)
+                try GitRepo.worktreeRemove(at: wtURL, in: main, force: false)
             } catch {
                 let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 return .removeFailed(msg)
+            }
+            let cleanup = GitRepo.safelyDeleteMergedAgentBranch(
+                branch,
+                persistedWorktreePath: pathStr,
+                integrationRef: "HEAD",
+                in: main
+            )
+            if let warning = cleanup.warning, !warning.isEmpty {
+                return .cleanupFailed(warning)
             }
             return .ok
         }
@@ -985,6 +1060,8 @@ final class SubagentStore: ObservableObject {
         case .ok:
             guard let idx = agents.firstIndex(where: { $0.id == agentId }) else { return nil }
             agents[idx].worktreeLifecycle = .merged
+            agents[idx].worktreeError = nil
+            markIntegratedAwaitingVerifyOrCleaned(index: idx)
             // Keep path/branch strings for history display; buttons hide via lifecycle.
             scheduleSave()
             schedulePostMergeVerify(agent: agents[idx], mainProjectURL: main)
@@ -992,22 +1069,55 @@ final class SubagentStore: ObservableObject {
         case .mergeFailed(let msg):
             let full = "合并失败（worktree 未删除）: \(msg)"
             if let idx = agents.firstIndex(where: { $0.id == agentId }) {
+                agents[idx].closeoutDisposition = .needsFixer
+                agents[idx].closeoutReason = full
                 notifyMergeFailed(agent: agents[idx], error: full)
             }
             return setWorktreeError(full)
         case .removeFailed(let msg):
-            // Merge already succeeded — mark merged, still run post-merge verify,
-            // but surface remove error.
+            // Merge already succeeded — preserve integration, retain actionable cleanup state,
+            // and still run post-merge verify.
             if let idx = agents.firstIndex(where: { $0.id == agentId }) {
-                agents[idx].worktreeLifecycle = .merged
+                let warning = "已合并，但删除 worktree 失败: \(msg)"
+                agents[idx].worktreeLifecycle = .mergedCleanupPending
+                agents[idx].worktreeError = warning
+                agents[idx].closeoutDisposition = .needsFixer
+                agents[idx].closeoutReason = warning
                 scheduleSave()
                 schedulePostMergeVerify(agent: agents[idx], mainProjectURL: main)
             }
             return setWorktreeError("已合并，但删除 worktree 失败: \(msg)")
+        case .cleanupFailed(let msg):
+            // Merge + worktree removal succeeded. The ref remains because safe cleanup
+            // could not prove deletion eligibility or `git branch -d` failed.
+            if let idx = agents.firstIndex(where: { $0.id == agentId }) {
+                let warning = "已合并并删除 worktree，但 \(msg)"
+                agents[idx].worktreeLifecycle = .mergedCleanupPending
+                agents[idx].worktreeError = warning
+                agents[idx].closeoutDisposition = .needsFixer
+                agents[idx].closeoutReason = warning
+                scheduleSave()
+                schedulePostMergeVerify(agent: agents[idx], mainProjectURL: main)
+            }
+            return setWorktreeError("已合并并删除 worktree，但 \(msg)")
         }
     }
 
-    /// Force-remove worktree and delete local `pipiui/*` branch without merging.
+    private func markIntegratedAwaitingVerifyOrCleaned(index: Int) {
+        let verify = agents[index].verifyCommand?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if verify?.isEmpty == false {
+            agents[index].closeoutDisposition = .unclassified
+            agents[index].closeoutReason = "已集成并完成机械清理；等待主仓验证"
+        } else {
+            agents[index].closeoutDisposition = .cleaned
+            agents[index].closeoutReason = "已集成，worktree 与内部分支已安全清理"
+        }
+    }
+
+    /// Force-remove an explicitly discarded worktree. The separately confirmed UI action
+    /// may also force-delete its now-unregistered runtime-owned branch, including unique commits.
+    /// Non-internal branches and any branch still registered to a worktree remain retained.
     /// Threading: 同 `mergeWorktree` —— git 后台跑，状态主线程收尾并 re-check。
     @MainActor
     @discardableResult
@@ -1033,27 +1143,43 @@ final class SubagentStore: ObservableObject {
         let branch = agent.worktreeBranch
         let main = mainProjectURL
 
-        let errorMsg: String? = await Task.detached(priority: .userInitiated) {
+        let discardOutcome: (error: String?, warning: String?) = await Task.detached(
+            priority: .userInitiated
+        ) {
             do {
                 try GitRepo.worktreeRemove(at: wtURL, in: main, force: true)
             } catch {
                 // Path may already be gone — continue to branch cleanup if possible.
                 if FileManager.default.fileExists(atPath: pathStr) {
                     let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                    return "删除 worktree 失败: \(msg)"
+                    return ("删除 worktree 失败: \(msg)", nil)
                 }
             }
             if let branch, !branch.isEmpty, !branch.hasPrefix("-") {
-                try? GitRepo.deleteLocalBranch(branch, in: main, force: true)
+                let warning = GitRepo.forceDeleteInternalAgentBranchAfterConfirmedDiscard(
+                    branch,
+                    persistedWorktreePath: pathStr,
+                    in: main
+                )
+                return (nil, warning)
             }
-            return nil
+            return (nil, nil)
         }.value
 
-        if let errorMsg {
+        if let errorMsg = discardOutcome.error {
             return setWorktreeError(errorMsg)
         }
         if let idx = agents.firstIndex(where: { $0.id == agentId }) {
             agents[idx].worktreeLifecycle = .discarded
+            if let warning = discardOutcome.warning, !warning.isEmpty {
+                agents[idx].worktreeError = "worktree 已按确认丢弃；\(warning)"
+                agents[idx].closeoutDisposition = .retained
+                agents[idx].closeoutReason = agents[idx].worktreeError
+            } else {
+                agents[idx].worktreeError = nil
+                agents[idx].closeoutDisposition = .cleaned
+                agents[idx].closeoutReason = "已按用户确认丢弃 worktree，并删除对应内部分支"
+            }
             scheduleSave()
         }
         return nil
@@ -1124,6 +1250,18 @@ final class SubagentStore: ObservableObject {
                 }
                 guard result.exitCode != 0 || result.timedOut else {
                     Log.info("post-merge verify passed: \(command)", category: .session)
+                    await MainActor.run {
+                        guard let self,
+                              let index = self.agents.firstIndex(where: { $0.id == agent.id }),
+                              self.agents[index].worktreeLifecycle == .merged,
+                              self.agents[index].closeoutDisposition == .unclassified else {
+                            return
+                        }
+                        self.agents[index].closeoutDisposition = .cleaned
+                        self.agents[index].closeoutReason =
+                            "已集成、主仓验证通过，worktree 与内部分支已清理"
+                        self.scheduleSave()
+                    }
                     return
                 }
                 // A dirty main tree is the user's own WIP — a failure there may not be
@@ -1143,6 +1281,13 @@ final class SubagentStore: ObservableObject {
     func notifyPostMergeVerifyFailed(
         agent: SubagentInfo, failure: PostMergeVerifyFailure, mainDirty: Bool = false
     ) {
+        if let index = agents.firstIndex(where: { $0.id == agent.id }) {
+            agents[index].closeoutDisposition = mainDirty ? .needsUser : .needsFixer
+            agents[index].closeoutReason = mainDirty
+                ? "主仓验证失败且含未提交改动；需确认失败归属"
+                : "主仓验证失败；需 fixer 修复后重新验证"
+            scheduleSave()
+        }
         guard shouldNotify(kind: "verify", agentId: agent.id,
                            detail: "\(failure.command)|\(failure.exitCode)|\(failure.timedOut)") else { return }
         onPostMergeVerifyFailed?(agent, failure, mainDirty)

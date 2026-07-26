@@ -19,6 +19,12 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
     }
 }
 
+enum SettingsReloadPolicy {
+    static func shouldReload(from wasVisible: Bool, to isVisible: Bool) -> Bool {
+        !wasVisible && isVisible
+    }
+}
+
 struct SettingsSheet: View {
     @EnvironmentObject var store: AppStore
 
@@ -136,6 +142,11 @@ struct SettingsSheet: View {
         .background(SettingsPrewarmProbe())
         .task { await reload() }
         .task { await prewarmRemainingTabs() }
+        .onChange(of: store.showSettings) { wasVisible, isVisible in
+            if SettingsReloadPolicy.shouldReload(from: wasVisible, to: isVisible) {
+                Task { await reload() }
+            }
+        }
         .onChange(of: tab) { _, newValue in
             visitedTabs.insert(newValue)
             if newValue == .usage { reloadUsage() }

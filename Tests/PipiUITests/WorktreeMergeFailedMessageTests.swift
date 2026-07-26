@@ -47,14 +47,13 @@ final class WorktreeMergeFailedMessageTests: XCTestCase {
         let text = WorktreeMergeFailedMessage.format(agent: agent, error: "conflict in Foo.swift")
         // BossPrompt discipline: dispatch a fixer by default; the boss never opens
         // conflict diffs personally and only adjudicates three ways.
-        XCTAssertFalse(text.contains("请你自行决策"))
         XCTAssertTrue(text.contains("general-purpose fixer"))
-        XCTAssertTrue(text.contains("分支名与冲突文件清单"))
-        XCTAssertTrue(text.contains("接受 fixer 结果"))
-        XCTAssertTrue(text.contains("丢弃无价值 worktree"))
-        XCTAssertTrue(text.contains("绝不亲自打开冲突 diff"))
-        XCTAssertTrue(text.contains("不要把原始 git 报错转发给用户"))
-        XCTAssertTrue(text.contains("不要把这条消息当成用户新需求"))
+        XCTAssertTrue(text.contains("branch name + conflicted file list"))
+        XCTAssertTrue(text.contains("accept the fixer result"))
+        XCTAssertTrue(text.contains("discard a worthless worktree"))
+        XCTAssertTrue(text.contains("Never open conflict diffs yourself"))
+        XCTAssertTrue(text.contains("never forward the raw git error to the user"))
+        XCTAssertTrue(text.contains("treat this message as a new user request"))
     }
 
     func testPostMergeVerifyFailedMessageFormat() {
@@ -83,7 +82,7 @@ final class WorktreeMergeFailedMessageTests: XCTestCase {
         XCTAssertTrue(text.contains("FooTests.testBar: XCTAssertEqual failed"))
         XCTAssertTrue(text.contains("general-purpose fixer"))
         XCTAssertTrue(text.contains("verified=pass"))
-        XCTAssertTrue(text.contains("不要把这条消息当成用户新需求"))
+        XCTAssertTrue(text.contains("treat this message as a new user request"))
     }
 
     func testPostMergeVerifyFailedMessageTimeoutExitDescription() {
@@ -283,13 +282,13 @@ final class WorktreeMergeFailedMessageTests: XCTestCase {
             command: "swift build", exitCode: 1, timedOut: false, outputTail: "error: boom")
         let clean = PostMergeVerifyFailedMessage.format(agent: agent, failure: failure)
         XCTAssertFalse(clean.contains("mainDirty=true"))
-        XCTAssertTrue(clean.contains("请立即派一个 general-purpose fixer"))
+        XCTAssertTrue(clean.contains("Immediately dispatch a general-purpose fixer"))
 
         let dirty = PostMergeVerifyFailedMessage.format(
             agent: agent, failure: failure, mainDirty: true)
         XCTAssertTrue(dirty.contains("mainDirty=true"))
-        XCTAssertTrue(dirty.contains("未提交改动"))
-        XCTAssertTrue(dirty.contains("不要擅自改动用户未提交的代码"))
+        XCTAssertTrue(dirty.contains("uncommitted changes"))
+        XCTAssertTrue(dirty.contains("never touch their uncommitted code"))
     }
 
     private func makeAgent(id: String) -> SubagentInfo {

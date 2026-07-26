@@ -228,6 +228,78 @@ enum TokenUsageStats {
 
     // MARK: - Per-session cache totals (resume rehydration)
 
+    /// Footer/popover values reconstructed from persisted main-chat turns for one session.
+    /// `lastTurnUsage` and `contextTokens` come from the newest record by timestamp;
+    /// aggregate fields cover every valid main-chat record for that same session.
+    struct SessionUsage {
+        var cacheRead = 0
+        var cacheWrite = 0
+        var cost: Double = 0
+        var lastTurnUsage: TokenLedger.UsageSnapshot?
+        var contextTokens: Int?
+    }
+
+    /// Read the active and rolled ledgers after flushing pending writes.
+    static func sessionUsage(
+        for sessionId: String,
+        fileManager: FileManager = .default
+    ) -> SessionUsage {
+        TokenLedger.shared.flushSync()
+        return sessionUsage(
+            for: sessionId,
+            urls: [TokenLedger.shared.fileURL, TokenLedger.shared.rolledFileURL],
+            fileManager: fileManager
+        )
+    }
+
+    /// Testable session-scoped aggregation. Strictly checks the JSON `session` field
+    /// before accepting a record, so similarly named sessions can never mix. The
+    /// ledger files are not guaranteed to be supplied in chronological order.
+    static func sessionUsage(
+        for sessionId: String,
+        urls: [URL],
+        fileManager: FileManager = .default
+    ) -> SessionUsage {
+        var summary = SessionUsage()
+        var latest: (record: Record, contextTokens: Int?)?
+
+        for url in urls {
+            guard fileManager.fileExists(atPath: url.path),
+                  let data = try? Data(contentsOf: url),
+                  let text = String(data: data, encoding: .utf8) else { continue }
+            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                guard line.contains(sessionId),
+                      let lineData = String(line).data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                      (obj["session"] as? String) == sessionId,
+                      (obj["channel"] as? String) == "main",
+                      let record = parseLine(String(line)) else { continue }
+
+                summary.cacheRead += record.cacheRead
+                summary.cacheWrite += record.cacheWrite
+                summary.cost += record.cost
+                if latest == nil || record.date > latest!.record.date {
+                    // Older ledgers may predate contextTokens. Do not invent a zero
+                    // context value for the footer when that field was never written.
+                    latest = (record, obj["contextTokens"] as? Int)
+                }
+            }
+        }
+
+        if let latest {
+            summary.lastTurnUsage = TokenLedger.UsageSnapshot(
+                input: latest.record.input,
+                output: latest.record.output,
+                cacheRead: latest.record.cacheRead,
+                cacheWrite: latest.record.cacheWrite,
+                cost: latest.record.cost,
+                contextTokens: latest.record.contextTokens
+            )
+            summary.contextTokens = latest.contextTokens
+        }
+        return summary
+    }
+
     /// 累计某会话的 cacheRead / cacheWrite，流式读取 active+rolled ledger，不构建 [Record]、不全量驻留。
     /// 用于 resume 时回填 `ChatSession.sessionCacheRead` / `sessionCacheWrite`。
     /// 公开版先 flush 在途写入，再委托给可注入 urls 的 internal 重载。

@@ -136,6 +136,13 @@ private struct AgentRow: View {
                             .padding(.vertical, 1)
                             .background(Capsule().fill(Color.accentColor.opacity(0.15)))
                     }
+                    if agent.name == "secretary" {
+                        Text("收尾")
+                            .font(.caption2)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.purple.opacity(0.15)))
+                    }
                     if agent.state == .running, agent.stalled {
                         lifecycleBadge(
                             text: agent.stalledIdleSec > 0 ? "卡住 \(agent.stalledIdleSec)s" : "卡住",
@@ -147,6 +154,8 @@ private struct AgentRow: View {
                         lifecycleBadge(text: "审核", color: .orange)
                     } else if agent.worktreeLifecycle == .merged {
                         lifecycleBadge(text: "已合并", color: .green)
+                    } else if agent.worktreeLifecycle == .mergedCleanupPending {
+                        lifecycleBadge(text: "待善后", color: .orange)
                     } else if agent.worktreeLifecycle == .discarded {
                         lifecycleBadge(text: "已丢弃", color: .secondary)
                     } else if agent.worktreeLifecycle == .active, agent.state == .running {
@@ -224,7 +233,10 @@ private struct AgentDetailView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             metricsHeader
-            if agent.canReviewWorktree || (store.worktreeActionError != nil && store.selectedId == agent.id) {
+            if agent.canReviewWorktree
+                || agent.worktreeLifecycle == .mergedCleanupPending
+                || (agent.worktreeError?.isEmpty == false)
+                || (store.worktreeActionError != nil && store.selectedId == agent.id) {
                 worktreeMeta
                     .padding(.horizontal, 10)
                     .padding(.bottom, 8)
@@ -306,7 +318,7 @@ private struct AgentDetailView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("将强制删除该 agent 的 worktree 与本地分支，不会合并进主分支。此操作不可撤销。")
+            Text("将强制删除该 agent 的 worktree，不会合并进主分支；对应的 pipiui/agent-* 内部分支也会删除，即使含独有提交。非内部分支会保留。此操作不可撤销。")
         }
     }
 
@@ -455,6 +467,8 @@ private struct AgentDetailView: View {
                 return ("审核中", .orange)
             case .merged:
                 return ("已合并", .green)
+            case .mergedCleanupPending:
+                return ("已合并·待善后", .orange)
             case .discarded:
                 return ("已丢弃", .secondary)
             case .none:

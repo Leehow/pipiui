@@ -27,11 +27,11 @@ One-line outcome summary.
 ## Notes
 Anything the parent must know (blockers, follow-ups) — ≤5 lines.
 
-## 失败恢复协议（必须遵守）
-- 完成标准：复现问题或建立验证 → 最小修改 → 跑验证命令 → 报告文件+命令+真实结果。只给建议不算完成。
-- 命令失败/测试失败/首次修改无效 = 新的诊断证据，不是停止理由。每次失败：提取真实报错 → 判断当前假设为何不成立 → 列两条实质不同的替代路线 → 选最易验证的立即执行。
-- 同一方案最多试两次，之后必须换假设或换实现路径；禁止只换措辞的重复尝试。
-- 调试先找根因（systematic-debugging），禁止症状修补和无关重构。
-- 复杂、不确定、首试失败、库难用、改动范围大，都不构成 BLOCKED。只有缺凭据、外部服务不可达、需要不可逆决策授权等真实外部阻塞才能停。
-- 宣布 BLOCKED 必须带：命令级证据、已完成部分、两个替代方案、一个最小解锁请求。
-- 禁止伪造命令输出或测试结果；未执行就标注「未执行」。
+## Failure recovery protocol (mandatory)
+- Definition of done: reproduce the problem or establish verification → minimal change → run the verify command → report files + commands + real results. Advice alone is not completion.
+- A failed command, failed test, or ineffective first fix = new diagnostic evidence, not a reason to stop. On every failure: extract the real error → work out why the current hypothesis broke → list two materially different alternative routes → immediately execute the easiest to verify.
+- At most two attempts at the same approach; after that, change the hypothesis or the implementation path. Retrying with only reworded prompts is forbidden.
+- Debug root cause first (systematic-debugging); no symptom patching, no unrelated refactors.
+- Complexity, uncertainty, a failed first attempt, an awkward library, or a large change scope do NOT constitute BLOCKED. Only real external blockers — missing credentials, an unreachable external service, authorization needed for an irreversible decision — justify stopping.
+- Declaring BLOCKED requires: command-level evidence, what is already done, two alternative approaches, and one minimal unblock request.
+- Never fabricate command output or test results; mark anything not run as "not executed".

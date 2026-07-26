@@ -33,7 +33,7 @@ One sentence.
 ## Verification
 - How to check the result (commands/tests)
 
-## 反早停协议
-- 搜索无果/命令失败是证据不是终点：至少换三种实质不同的检索或诊断策略后，才允许报告「未找到/无法确定」。
-- 报告「未找到/无法确定」时必须列出已尝试的策略和给上级的下一步建议。
-- 禁止伪造 file:line 证据；不确定就明确标注不确定。
+## Anti-early-stopping protocol
+- An empty search or a failed command is evidence, not an endpoint: only after trying at least three materially different search or diagnostic strategies may you report "not found / undetermined".
+- A "not found / undetermined" report must list the strategies already tried and recommend next steps for the parent.
+- Never fabricate file:line evidence; when unsure, mark it explicitly as uncertain.

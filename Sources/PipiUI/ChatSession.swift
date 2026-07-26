@@ -387,6 +387,10 @@ final class ChatSession: ObservableObject, Identifiable {
     @Published private(set) var lastTurnUsage: TokenLedger.UsageSnapshot?
     @Published private(set) var sessionCacheRead: Int = 0
     @Published private(set) var sessionCacheWrite: Int = 0
+    /// A successful live stats response owns its corresponding restored fields,
+    /// regardless of whether its asynchronous ledger read completes before or after it.
+    private var hasLiveSessionCost = false
+    private var hasLiveSessionContext = false
     /// Account credit usage 0…100 of the shown window (nil when unavailable).
     @Published var quotaPercent: Double?
     /// Compact period label of the shown window: 周 / 5h / 月 / 额.
@@ -659,6 +663,9 @@ final class ChatSession: ObservableObject, Identifiable {
             }
             extraEnv["PIPIUI_BRIDGE_PORT"] = String(bridgePort)
             extraEnv["PIPIUI_SESSION_KEY"] = bridgeRoutingKey
+            // Authoritative session root inherited by nested processes. Management
+            // roles such as secretary must never mistake a worker worktree for main.
+            extraEnv["PIPIUI_MAIN_CWD"] = projectURL.path
             // 补丁版 subagent 从 App 自有目录读 agent 定义，不碰 ~/.pi/agent/agents
             if let agentsDir { extraEnv["PIPIUI_AGENTS_DIR"] = agentsDir }
             // Subagent 模型设置（热读 JSON）+ 主会话模型（跟随主 Agent = 底栏/composer）
@@ -816,9 +823,9 @@ final class ChatSession: ObservableObject, Identifiable {
         refreshThinkingLevels()
         beginInitialMessagesLoad()
         refreshStats()
-        // pi 的 get_session_stats 只回填 cost/contextUsage，不返回累计 cacheRead/cacheWrite，
-        // 需从本地 TokenLedger 按 session id 流式求和回填（off-main）。
-        rehydrateSessionCacheUsage()
+        // pi 的 get_session_stats 不含上一轮和累计缓存；从本地 TokenLedger 按 session id
+        // 恢复完整 footer/popover 快照（off-main）。实时 RPC 回包仍优先于恢复值。
+        rehydrateSessionUsage()
         proc?.request(["type": "get_commands"]) { [weak self] resp in
             guard let self else { return }
             // Failure/empty → leave availableCommands empty; builtins still work. No flash.
@@ -1027,32 +1034,49 @@ final class ChatSession: ObservableObject, Identifiable {
         }
     }
 
-    /// Resume 时从已落盘的 TokenLedger 按 session id 回填累计 cacheRead/cacheWrite。
-    /// 在 boot 序列里调用一次。startup 阶段用户不可能已发完一轮并收到 message_end，
-    /// 故 SET 不会与 `recordTurnUsage` 的 `+=` 竞争；即使极端竞态，误差仅一次 turn 且可接受——
-    /// 保持简单，不做加法式合并以免与已 append 进 ledger 的本轮重复计数。
-    private func rehydrateSessionCacheUsage() {
+    /// Resume 时按 session id 恢复 ledger 中的主聊天 footer/popover 快照。
+    /// Startup does not normally overlap a completed turn; live get_session_stats
+    /// remains authoritative for cost/context even if its callback wins this race.
+    private func rehydrateSessionUsage() {
         let sid = id
         DispatchQueue.global(qos: .utility).async {
-            let totals = TokenUsageStats.sessionCacheTotals(for: sid)
+            let usage = TokenUsageStats.sessionUsage(for: sid)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.sessionCacheRead = totals.cacheRead
-                self.sessionCacheWrite = totals.cacheWrite
+                self.lastTurnUsage = usage.lastTurnUsage
+                self.sessionCacheRead = usage.cacheRead
+                self.sessionCacheWrite = usage.cacheWrite
+                if !self.hasLiveSessionCost {
+                    self.cost = usage.cost
+                }
+                if !self.hasLiveSessionContext, let tokens = usage.contextTokens {
+                    self.contextTokens = tokens
+                    if let window = self.contextWindow ?? self.model?.contextWindow, window > 0 {
+                        self.contextWindow = window
+                        self.contextPercent = Double(tokens) / Double(window) * 100
+                    }
+                }
             }
         }
     }
 
     /// Parse `get_session_stats` payload into published context/cost fields.
     private func applySessionStats(_ data: J) {
-        cost = data["cost"].double ?? cost
-        let merged = SessionStatsMerge.apply(
-            contextUsage: data["contextUsage"],
-            to: .init(tokens: contextTokens, window: contextWindow, percent: contextPercent)
-        )
-        contextTokens = merged.tokens
-        contextWindow = merged.window
-        contextPercent = merged.percent
+        if let liveCost = data["cost"].double {
+            hasLiveSessionCost = true
+            cost = liveCost
+        }
+        let contextUsage = data["contextUsage"]
+        if contextUsage.exists, contextUsage.dict != nil {
+            hasLiveSessionContext = true
+            let merged = SessionStatsMerge.apply(
+                contextUsage: contextUsage,
+                to: .init(tokens: contextTokens, window: contextWindow, percent: contextPercent)
+            )
+            contextTokens = merged.tokens
+            contextWindow = merged.window
+            contextPercent = merged.percent
+        }
     }
 
     /// Compact context line for footer /session flash.

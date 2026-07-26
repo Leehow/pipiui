@@ -224,7 +224,7 @@ enum ModelPricing {
             let jsonData: Data?
             if let data {
                 jsonData = data
-            } else if let url = Bundle.module.url(forResource: "model-pricing", withExtension: "json"),
+            } else if let url = PipiResourceBundle.shared.url(forResource: "model-pricing", withExtension: "json"),
                       let d = try? Data(contentsOf: url)
             {
                 jsonData = d

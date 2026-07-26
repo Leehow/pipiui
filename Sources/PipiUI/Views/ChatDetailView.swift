@@ -407,15 +407,10 @@ private struct ChatDetailViewBody: View {
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            // Reset only the scroll subtree on a session switch. With the inverted transcript,
-            // a fresh scroll view naturally starts at document-start == the visual latest edge,
-            // so no programmatic settle scroll (and no second visible text placement) is needed.
-            // Do not animate this identity replacement: a fresh LazyVStack measures its visible
-            // AppKit text rows on the first layout pass, and interpolating that provisional
-            // geometry makes the transcript visibly shrink before reaching its final size.
-            .id(session.id)
+            // Keep the same NSScrollView across session switches. Replacing it with
+            // `.id(session.id)` also recreated every visible AppKit text view, exposing a
+            // provisional LazyVStack measurement for one frame and making the text jump.
             .animation(nil, value: session.id)
-            .transition(.identity)
             // Prefer overlay indicators; AppKit style is forced in StickToBottomTracker.
             .scrollIndicators(.automatic)
             // Flip the scroll view itself so document-start maps to the visual bottom.
@@ -450,6 +445,18 @@ private struct ChatDetailViewBody: View {
                 // Keep the loading fade local. Applying this animation to the ScrollView also
                 // animates LazyVStack/AppKit measurement corrections during a session switch.
                 .animation(.easeInOut(duration: 0.2), value: session.isInitializing)
+            }
+            .onChange(of: session.id) { _, _ in
+                // A reused scroll view keeps its old offset. Most sessions are already at
+                // document-start (the visual latest edge); only correct it when the target
+                // session says it should be pinned. The anchor is always realized, so this
+                // does not wait for lazy Markdown rows or expose a second placement.
+                guard session.pinTranscriptToBottom else { return }
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    proxy.scrollTo("bottom", anchor: .top)
+                }
             }
             .onChange(of: session.rightPanel != nil) { _, _ in
                 recoverPinAfterColumnWidthChange(proxy)
@@ -560,7 +567,7 @@ private struct ChatDetailViewBody: View {
         for row in rows.reversed() {
             switch row {
             case .leaf(let item):
-                if item.role == "user" {
+                if MessageActions.isUserAuthoredMessage(item) {
                     lastUserLeafId = item.id
                 }
             case .assistantRun(let id, _, _):

@@ -29,6 +29,11 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import {
+	formatSecretaryCommitResult,
+	runSecretaryCommit,
+} from "./secretary-commit.ts";
+import { secretaryToolCallBlock } from "./secretary-policy.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -41,6 +46,10 @@ const PIPIUI_SESSION = process.env.PIPIUI_SESSION_KEY;
 // 当前进程在 agent 树里的身份：主会话 depth=0，被派出的 subagent 由父进程注入
 const PIPIUI_DEPTH = Number.parseInt(process.env.PIPIUI_AGENT_DEPTH || "0", 10);
 const PIPIUI_PARENT = process.env.PIPIUI_AGENT_ID || null;
+// App-owned authoritative session root. Nested agents inherit it even when their own
+// process cwd is an isolated worktree.
+const PIPIUI_MAIN_CWD = process.env.PIPIUI_MAIN_CWD;
+const PIPIUI_AGENT_ROLE = process.env.PIPIUI_AGENT_ROLE;
 // 多层护栏：depth >= 上限的进程不允许再派 subagent（终端裸跑同样生效）
 const PIPIUI_MAX_DEPTH = Number.parseInt(process.env.PIPIUI_AGENT_MAX_DEPTH || "2", 10);
 // App 注入的补丁版 subagent 扩展目录；嵌套 spawn 时再传 `-e`，保持上报/护栏一致
@@ -426,6 +435,27 @@ interface WorktreePlacement {
 	worktreeBranch?: string;
 	/** Set when worktree was requested but creation failed (spawn falls back). */
 	worktreeError?: string;
+}
+
+interface AgentRuntimeRolePolicy {
+	role: "worker" | "closeout-secretary";
+	worktree: "isolated" | "main-session";
+	allowRecursiveDelegation: boolean;
+}
+
+/**
+ * Runtime-owned policy: agent markdown/prompt text cannot opt the closeout secretary
+ * back into a worktree or recursive delegation.
+ */
+function runtimeRolePolicyForAgent(agentName: string): AgentRuntimeRolePolicy {
+	if (agentName === "secretary") {
+		return {
+			role: "closeout-secretary",
+			worktree: "main-session",
+			allowRecursiveDelegation: false,
+		};
+	}
+	return { role: "worker", worktree: "isolated", allowRecursiveDelegation: true };
 }
 
 // Done-message caps (clean-context orchestration): verdict agents get a tight cap
@@ -991,9 +1021,15 @@ function resolveSubagentWorktree(opts: {
 	agentId: string;
 	defaultCwd: string;
 	explicitCwd?: string;
+	policy: AgentRuntimeRolePolicy;
 }): WorktreePlacement {
 	const fallbackCwd = opts.explicitCwd ?? opts.defaultCwd;
 
+	if (opts.policy.worktree === "main-session") {
+		// Ignore caller cwd and nested worker cwd: secretary is a session-management
+		// role and must not manufacture another branch/worktree while closing them out.
+		return { cwd: path.resolve(PIPIUI_MAIN_CWD || opts.defaultCwd) };
+	}
 	if (process.env.PIPIUI_WORKTREE === "0") {
 		return { cwd: fallbackCwd };
 	}
@@ -1404,10 +1440,12 @@ async function runSingleAgent(
 		return fail;
 	}
 
+	const runtimePolicy = runtimeRolePolicyForAgent(agentName);
 	const placement = resolveSubagentWorktree({
 		agentId: pipiuiAgentId,
 		defaultCwd,
 		explicitCwd: cwd, // only when caller passed cwd; undefined → auto worktree
+		policy: runtimePolicy,
 	});
 	const spawnCwd = placement.cwd;
 
@@ -1426,11 +1464,17 @@ async function runSingleAgent(
 	if (resolvedThinking) args.push("--thinking", resolvedThinking);
 	const disabledTools = loadDisabledTools();
 	if (agent.tools && agent.tools.length > 0) {
-		const allowed = agent.tools.filter((t) => !disabledTools.has(t));
+		const allowed = agent.tools.filter(
+			(t) =>
+				!disabledTools.has(t) &&
+				(runtimePolicy.allowRecursiveDelegation || t !== "subagent"),
+		);
 		if (allowed.length > 0) args.push("--tools", allowed.join(","));
 		else args.push("--no-tools");
-	} else if (disabledTools.size > 0) {
-		args.push("--exclude-tools", [...disabledTools].sort().join(","));
+	} else if (disabledTools.size > 0 || !runtimePolicy.allowRecursiveDelegation) {
+		const excluded = new Set(disabledTools);
+		if (!runtimePolicy.allowRecursiveDelegation) excluded.add("subagent");
+		args.push("--exclude-tools", [...excluded].sort().join(","));
 	}
 
 	let tmpPromptDir: string | null = null;
@@ -1529,14 +1573,19 @@ async function runSingleAgent(
 				stdio: ["ignore", "pipe", "pipe"],
 				detached: false,
 				// 把 agent 树身份传给子进程：子进程再派 subagent 时 parentId/depth 自动正确
-				// PIPIUI_SUBAGENT_EXT / BRIDGE / SESSION 经 process.env 继承，嵌套 -e 与上报保持一致
+				// PIPIUI_SUBAGENT_EXT / SEARCH_SCOPE_EXT / grant file / bridge / session
+				// 经 process.env 继承；子进程只读当前真人回合的 grant file。
 				env: {
 					...process.env,
 					PIPIUI_AGENT_ID: pipiuiAgentId,
 					PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
+					PIPIUI_AGENT_ROLE: runtimePolicy.role,
 					...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
 					// Override a possibly inherited marker so only plan children activate the hooks.
 					PIPIUI_PLAN_SKILL_ISOLATION: agentName === "plan" ? "1" : undefined,
+					...(runtimePolicy.worktree === "main-session"
+						? { PIPIUI_WORKTREE: "0", PIPIUI_AGENT_NO_DELEGATION: "1" }
+						: {}),
 					...(placement.worktreePath ? { PIPIUI_WORKTREE_PATH: placement.worktreePath } : {}),
 					...(placement.worktreeBranch ? { PIPIUI_WORKTREE_BRANCH: placement.worktreeBranch } : {}),
 				},
@@ -1823,6 +1872,32 @@ const SubagentParams = Type.Object({
 	),
 });
 
+const SecretaryCommitParams = Type.Object({
+	closeout: StringEnum(["pass", "needs-action", "blocked"] as const),
+	integrationVerify: StringEnum(["pass", "fail", "none"] as const),
+	commitMessage: Type.String({
+		description: "Safe, non-empty one-line Git commit message (maximum 200 characters).",
+	}),
+	paths: Type.Array(
+		Type.String({
+			description:
+				"Exact accepted repository-relative path. Absolute, traversal, .git, and .pi paths are denied.",
+		}),
+	),
+	allRelevantItemsClassified: Type.Boolean({
+		description: "Must be true only after every relevant closeout item has a final disposition.",
+	}),
+	dispositions: Type.Array(
+		Type.Object({
+			item: Type.String(),
+			disposition: StringEnum(
+				["cleaned", "retained", "unclassified", "needs-fixer", "needs-user"] as const,
+			),
+			reason: Type.Optional(Type.String()),
+		}),
+	),
+});
+
 export default function (pi: ExtensionAPI) {
 	if (PIPIUI_PLAN_SKILL_ISOLATION) {
 		// Pi still accepts extension-contributed skillPaths under --no-skills. Remove the
@@ -1890,6 +1965,38 @@ export default function (pi: ExtensionAPI) {
 			};
 		});
 	}
+
+	// Prompt text is not a security boundary. The runtime-owned closeout secretary
+	// may write only its state records and may not perform destructive cleanup.
+	pi.on("tool_call", (event) => {
+		return secretaryToolCallBlock(
+			PIPIUI_AGENT_ROLE,
+			{ toolName: event.toolName, input: event.input },
+			PIPIUI_MAIN_CWD,
+		);
+	});
+
+	pi.registerTool({
+		name: "secretary_commit",
+		label: "Secretary Commit",
+		description: [
+			"Runtime-owned final commit gate for the closeout secretary.",
+			"Requires closeout=pass, integrationVerify=pass, a final structured disposition set, an empty pre-existing index, and an exact accepted-path manifest.",
+			"Stages and commits only that manifest; raw git add/commit remains forbidden in bash.",
+			"Returns commit=created:<sha>, already-clean:<sha>, or blocked:<reason>, plus committed and remaining dirty paths.",
+		].join(" "),
+		parameters: SecretaryCommitParams,
+		async execute(_toolCallId, params) {
+			const result = runSecretaryCommit(params, {
+				processRole: PIPIUI_AGENT_ROLE,
+				mainCwd: PIPIUI_MAIN_CWD,
+			});
+			return {
+				content: [{ type: "text", text: formatSecretaryCommitResult(result) }],
+				details: result,
+			};
+		},
+	});
 
 	// ---- Stall watchdog：后台 job 超过 120s 无任何流式事件/输出 → 向 boss 会话推一条 ----
 	// [subagent-stalled] agentId=<id> title=<title> idle=<秒>s last=<最后一行动作摘要>
@@ -1983,7 +2090,7 @@ export default function (pi: ExtensionAPI) {
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
-			"By default each agent writes in an isolated git worktree under .pi/worktrees/ on a pipiui/* branch; pass explicit cwd or set PIPIUI_WORKTREE=0 to disable. On successful end the app auto-merges into the main project and removes the worktree (silent on success). If merge fails, the main session receives [worktree-merge-failed] for the boss to resolve; failed/aborted keeps worktree for resume (GUI merge/discard fallback).",
+			"By default each worker writes in an isolated git worktree under .pi/worktrees/ on a pipiui/agent-* branch; pass explicit cwd or set PIPIUI_WORKTREE=0 to disable. The runtime-owned secretary role is the exception: it always runs in PIPIUI_MAIN_CWD with recursive delegation disabled and never creates a worktree. On successful worker end the app auto-merges into the main project, removes the worktree, and safely deletes only a merged internal branch with git branch -d. If merge or cleanup fails, the main session retains actionable state; failed/aborted keeps worktree for resume (GUI merge/discard fallback).",
 			"Track jobs with subagent_status(agentId?). Never re-spawn a finished task without reading its result via [subagent-done] or subagent_status.",
 			'Abort a running background job with action:"abort" + agentId (equivalent to /subagent_abort); it ends as aborted and still reports [subagent-done].',
 			"Background jobs with no output for 120s are pushed as [subagent-stalled] and marked stalled (with idle seconds) in subagent_status.",

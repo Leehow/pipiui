@@ -24,14 +24,14 @@ enum PiAuthHelper {
     }
 
     static func helperURL() -> URL? {
-        if let url = Bundle.module.url(
+        if let url = PipiResourceBundle.shared.url(
             forResource: "pi-auth-helper",
             withExtension: "mjs",
             subdirectory: "Resources"
         ) {
             return url
         }
-        return Bundle.module.url(forResource: "pi-auth-helper", withExtension: "mjs")
+        return PipiResourceBundle.shared.url(forResource: "pi-auth-helper", withExtension: "mjs")
     }
 
     /// Process-level lazy cache for the node binary path. `findNode()` otherwise
@@ -92,8 +92,26 @@ enum PiAuthHelper {
         }
     }
 
+    /// Produces the subprocess environment for model discovery without reading or logging values.
+    /// Dotenv values override inherited values; helper PATH additions remain prepended.
+    static func modelDiscoveryEnvironment(
+        base: [String: String],
+        dotEnv: [String: String],
+        piExecutablePath: String?
+    ) -> [String: String] {
+        var environment = base
+        environment.merge(dotEnv) { _, dotEnvValue in dotEnvValue }
+        let extra = [
+            piExecutablePath.map { ($0 as NSString).deletingLastPathComponent },
+            "/opt/homebrew/bin", "/usr/local/bin",
+        ].compactMap { $0 }
+        environment["PATH"] = (extra + [environment["PATH"] ?? ""]).joined(separator: ":")
+        return environment
+    }
+
     static func listModels() async throws -> [ModelInfo] {
-        let json = try await run(arguments: ["list-models"])
+        let dotEnv = EnvFileStore().all()
+        let json = try await run(arguments: ["list-models"], environmentOverlay: dotEnv)
         guard let models = json["models"] as? [[String: Any]] else {
             throw HelperError.failed("无效的 models 响应")
         }
@@ -117,7 +135,11 @@ enum PiAuthHelper {
 
     // MARK: - Process
 
-    private static func run(arguments: [String], timeout: TimeInterval = 60) async throws -> [String: Any] {
+    private static func run(
+        arguments: [String],
+        timeout: TimeInterval = 60,
+        environmentOverlay: [String: String] = [:]
+    ) async throws -> [String: Any] {
         guard let helper = helperURL() else { throw HelperError.helperMissing }
         guard let node = findNode() else { throw HelperError.nodeMissing }
 
@@ -125,13 +147,11 @@ enum PiAuthHelper {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: node)
             proc.arguments = [helper.path] + arguments
-            var env = ProcessInfo.processInfo.environment
-            let extra = [
-                (PiProcess.findPiExecutable() as NSString?)?.deletingLastPathComponent,
-                "/opt/homebrew/bin", "/usr/local/bin",
-            ].compactMap { $0 }
-            env["PATH"] = (extra + [env["PATH"] ?? ""]).joined(separator: ":")
-            proc.environment = env
+            proc.environment = modelDiscoveryEnvironment(
+                base: ProcessInfo.processInfo.environment,
+                dotEnv: environmentOverlay,
+                piExecutablePath: PiProcess.findPiExecutable()
+            )
 
             let out = Pipe()
             let err = Pipe()

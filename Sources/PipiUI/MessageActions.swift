@@ -1,6 +1,15 @@
 import Foundation
 
 enum MessageActions {
+    /// Runtime worker signals arrive with the user role, but must not be treated as
+    /// user-authored prompts by transcript navigation or message actions.
+    static func isUserAuthoredMessage(_ item: ChatItem) -> Bool {
+        guard item.role == "user" else { return false }
+        let displayText = copyableText(from: item)
+        return !displayText.hasPrefix("[subagent-done]")
+            && !displayText.hasPrefix("[worktree-merge-failed]")
+    }
+
     static func copyableText(from item: ChatItem) -> String {
         let text = item.blocks.compactMap { block -> String? in
             if case .text(let t) = block { return t }
