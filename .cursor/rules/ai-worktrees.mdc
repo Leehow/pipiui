@@ -1,0 +1,16 @@
+---
+description: Binding PipiUI worktree and build isolation rules
+alwaysApply: true
+---
+
+# PipiUI AI workspace rule
+
+[`CONSTITUTION.md`](../../CONSTITUTION.md) is binding and is the single
+source of truth.
+
+- Create Cursor tasks with `./scripts/new-ai-worktree.sh --tool cursor ...`.
+- Open and edit only the returned linked worktree.
+- Run `./scripts/verify-worker.sh` for worker-local validation.
+- Never install or replace `/Applications/PipiUI.app`; only the integration
+  owner may run `./scripts/ship-app.sh`.
+- Do not merge, clean another workspace, or claim canonical delivery.

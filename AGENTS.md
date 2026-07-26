@@ -4,23 +4,18 @@
 
 **Read and follow [`CONSTITUTION.md`](./CONSTITUTION.md).**
 
-Hard rule: **successful compile meant for the runnable app ⇒ refresh `build/PipiUI.app` and `/Applications/PipiUI.app`.**
+Hard rule: **one AI task = one branch + one linked worktree. Worker builds are
+local; only a clean integration worktree may install the canonical app.**
 
 ```bash
-./make-app.sh              # required ship path (release .app + install to Applications)
-./scripts/build-app.sh     # test (optional skip) then make-app.sh
+./scripts/new-ai-worktree.sh ... # create isolated worker branch + worktree
+./scripts/verify-worker.sh       # worker test + local build/PipiUI.app
+./scripts/ship-app.sh            # integration-only canonical install
 ```
 
-Do **not** report "done / open the app" if only `.build/*` is fresh and `build/PipiUI.app` or `/Applications/PipiUI.app` is older than sources.
-
-Verify after package:
-
-```bash
-stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
-  build/PipiUI.app/Contents/MacOS/PipiUI \
-  /Applications/PipiUI.app/Contents/MacOS/PipiUI \
-  <changed-source-files>
-```
+`make-app.sh` and `scripts/build-app.sh` are local-only and must never install
+under `/Applications`. Do not claim delivery from worker-local validation.
+Only successful `scripts/ship-app.sh` supports “done / open the app”.
 
 ## Quick map
 
@@ -28,8 +23,11 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 |------|--------|
 | Project rules | `CONSTITUTION.md` |
 | Build / run docs | `README.md` → 构建运行 |
-| Package + install App | `./make-app.sh` → `build/` + `/Applications/PipiUI.app` |
-| Test + package | `./scripts/build-app.sh` |
+| Create isolated AI workspace | `./scripts/new-ai-worktree.sh --help` |
+| Worker test + local package | `./scripts/verify-worker.sh` |
+| Local package only | `./make-app.sh` |
+| Canonical integration install | `./scripts/ship-app.sh` |
 | Dev loop only | `swift run` |
 
-macOS 14+ · SwiftPM · product binary `PipiUI` → `build/PipiUI.app` + `/Applications/PipiUI.app`.
+macOS 14+ · SwiftPM · each worktree owns `.build/` and `build/`; canonical user
+target remains `/Applications/PipiUI.app`.
