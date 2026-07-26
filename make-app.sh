@@ -2,7 +2,24 @@
 # Build PipiUI.app bundle from the SPM executable (release).
 # CONSTITUTION.md: 编译通过即打包 — canonical runnable artifact is build/PipiUI.app.
 set -e
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+cd "$SCRIPT_DIR"
+
+# A release .app is a single shared artifact. Git reports the primary checkout
+# first; linked worktrees must use `swift build` / `swift test` only so they do
+# not create competing `build/PipiUI.app` bundles.
+CURRENT_ROOT="$(git rev-parse --show-toplevel)"
+CANONICAL_ROOT="$(git worktree list --porcelain | awk '/^worktree / { sub(/^worktree /, ""); print; exit }')"
+CANONICAL_ROOT="$(cd "$CANONICAL_ROOT" && pwd -P)"
+
+if [[ "$CURRENT_ROOT" != "$CANONICAL_ROOT" ]]; then
+  echo "Refusing to package PipiUI.app outside the canonical checkout." >&2
+  echo "Canonical checkout: $CANONICAL_ROOT" >&2
+  echo "Current checkout:   $CURRENT_ROOT" >&2
+  echo "Use swift build or swift test in linked worktrees." >&2
+  exit 1
+fi
+
 swift build -c release
 APP=build/PipiUI.app
 rm -rf "$APP"
