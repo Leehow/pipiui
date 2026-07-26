@@ -49,10 +49,30 @@ final class ComposerPasteCatcher {
     deinit { stop() }
 }
 
+/// Routes asynchronous paste-catcher payloads to the currently displayed composer session.
+/// The view can be reused across a warm A→B switch, so it must not retain session A.
+final class ComposerPasteRouter {
+    private weak var session: ChatSession?
+
+    func bind(to session: ChatSession) {
+        self.session = session
+    }
+
+    func route(images: [DraftImage]) {
+        session?.draftImages.append(contentsOf: images)
+    }
+
+    func routeLargeText(_ text: String) {
+        guard let session else { return }
+        let marker = session.registerLargePaste(text)
+        ComposerPasteInsertion.insertMarker(marker, draftText: &session.draftText)
+    }
+}
+
 enum ComposerPasteInsertion {
     /// Insert `marker` at the focused text field's selection; fall back to appending on `draftText`.
     static func insertMarker(_ marker: String, draftText: inout String) {
-        if let textView = NSApp.keyWindow?.firstResponder as? NSTextView,
+        if let textView = NSApp?.keyWindow?.firstResponder as? NSTextView,
            textView.isEditable {
             let range = textView.selectedRange()
             if textView.shouldChangeText(in: range, replacementString: marker) {
@@ -63,7 +83,7 @@ enum ComposerPasteInsertion {
             draftText = textView.string
             return
         }
-        if let field = NSApp.keyWindow?.firstResponder as? NSTextField {
+        if let field = NSApp?.keyWindow?.firstResponder as? NSTextField {
             let editor = field.currentEditor()
             let ns = (editor?.string ?? field.stringValue) as NSString
             let range = editor?.selectedRange ?? NSRange(location: ns.length, length: 0)
@@ -135,6 +155,7 @@ struct InputBar: View {
     @State private var attachError: String?
     @FocusState private var focused: Bool
     @State private var pasteCatcher = ComposerPasteCatcher()
+    @State private var pasteRouter = ComposerPasteRouter()
     @State private var slashKeyMonitor = ComposerSlashKeyMonitor()
     @State private var slashMatches: [SlashCommand] = []
     @State private var slashSelectedIndex: Int = 0
@@ -197,14 +218,12 @@ struct InputBar: View {
         .onAppear {
             focused = true
             pasteCatcher.focused = true
-            pasteCatcher.onPasteImages = { images in
-                session.draftImages.append(contentsOf: images)
-                attachError = nil
+            pasteRouter.bind(to: session)
+            pasteCatcher.onPasteImages = { [router = pasteRouter] images in
+                router.route(images: images)
             }
-            pasteCatcher.onPasteLargeText = { text in
-                let marker = session.registerLargePaste(text)
-                ComposerPasteInsertion.insertMarker(marker, draftText: &session.draftText)
-                attachError = nil
+            pasteCatcher.onPasteLargeText = { [router = pasteRouter] text in
+                router.routeLargeText(text)
             }
             pasteCatcher.start()
 
@@ -236,9 +255,13 @@ struct InputBar: View {
             pasteCatcher.focused = isFocused
             refreshSlashKeyMonitorActive()
         }
+        .onChange(of: ObjectIdentifier(session)) { _, _ in
+            pasteRouter.bind(to: session)
+        }
         .onChange(of: session.draftText) { _, _ in
             session.pruneOrphanDraftPastes()
             refreshSlashPalette()
+            attachError = nil
         }
         .onChange(of: session.availableCommands) { _, _ in
             refreshSlashPalette()
@@ -251,6 +274,7 @@ struct InputBar: View {
         }
         .onChange(of: session.draftImages.count) { _, _ in
             refreshSlashPalette()
+            attachError = nil
         }
         .onDisappear {
             pasteCatcher.stop()
