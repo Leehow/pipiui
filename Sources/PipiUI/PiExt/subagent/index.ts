@@ -29,6 +29,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { secretaryToolCallBlock } from "./secretary-policy.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -44,6 +45,7 @@ const PIPIUI_PARENT = process.env.PIPIUI_AGENT_ID || null;
 // App-owned authoritative session root. Nested agents inherit it even when their own
 // process cwd is an isolated worktree.
 const PIPIUI_MAIN_CWD = process.env.PIPIUI_MAIN_CWD;
+const PIPIUI_AGENT_ROLE = process.env.PIPIUI_AGENT_ROLE;
 // 多层护栏：depth >= 上限的进程不允许再派 subagent（终端裸跑同样生效）
 const PIPIUI_MAX_DEPTH = Number.parseInt(process.env.PIPIUI_AGENT_MAX_DEPTH || "2", 10);
 // App 注入的补丁版 subagent 扩展目录；嵌套 spawn 时再传 `-e`，保持上报/护栏一致
@@ -1830,6 +1832,16 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	// Prompt text is not a security boundary. The runtime-owned closeout secretary
+	// may write only its state records and may not perform destructive cleanup.
+	pi.on("tool_call", (event) => {
+		return secretaryToolCallBlock(
+			PIPIUI_AGENT_ROLE,
+			{ toolName: event.toolName, input: event.input },
+			PIPIUI_MAIN_CWD,
+		);
+	});
+
 	// ---- Stall watchdog：后台 job 超过 120s 无任何流式事件/输出 → 向 boss 会话推一条 ----
 	// [subagent-stalled] agentId=<id> title=<title> idle=<秒>s last=<最后一行动作摘要>
 	// 每个卡死片段只推一次（有新活动后重新武装）；复用 [subagent-done] 的 followUp 通道。
