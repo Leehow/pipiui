@@ -58,7 +58,7 @@ enum AgentCatalog {
         .init(
             name: "secretary",
             description: "Boss closeout secretary. Reconciles agent outcomes, worktrees, branches, verification, temporary artifacts, and the existing Boss ledger without creating another worktree.",
-            tools: ["read", "grep", "find", "ls", "bash", "edit", "write"],
+            tools: ["read", "grep", "find", "ls", "bash", "edit", "write", "secretary_commit"],
             frontmatterModel: "xai/grok-4.5:high",
             filePath: ""
         ),

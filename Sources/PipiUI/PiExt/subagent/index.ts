@@ -29,6 +29,10 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import {
+	formatSecretaryCommitResult,
+	runSecretaryCommit,
+} from "./secretary-commit.ts";
 import { secretaryToolCallBlock } from "./secretary-policy.ts";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -1864,6 +1868,32 @@ const SubagentParams = Type.Object({
 	),
 });
 
+const SecretaryCommitParams = Type.Object({
+	closeout: StringEnum(["pass", "needs-action", "blocked"] as const),
+	integrationVerify: StringEnum(["pass", "fail", "none"] as const),
+	commitMessage: Type.String({
+		description: "Safe, non-empty one-line Git commit message (maximum 200 characters).",
+	}),
+	paths: Type.Array(
+		Type.String({
+			description:
+				"Exact accepted repository-relative path. Absolute, traversal, .git, and .pi paths are denied.",
+		}),
+	),
+	allRelevantItemsClassified: Type.Boolean({
+		description: "Must be true only after every relevant closeout item has a final disposition.",
+	}),
+	dispositions: Type.Array(
+		Type.Object({
+			item: Type.String(),
+			disposition: StringEnum(
+				["cleaned", "retained", "unclassified", "needs-fixer", "needs-user"] as const,
+			),
+			reason: Type.Optional(Type.String()),
+		}),
+	),
+});
+
 export default function (pi: ExtensionAPI) {
 	if (PIPIUI_PLAN_SKILL_ISOLATION) {
 		// Pi still accepts extension-contributed skillPaths under --no-skills. Remove the
@@ -1940,6 +1970,28 @@ export default function (pi: ExtensionAPI) {
 			{ toolName: event.toolName, input: event.input },
 			PIPIUI_MAIN_CWD,
 		);
+	});
+
+	pi.registerTool({
+		name: "secretary_commit",
+		label: "Secretary Commit",
+		description: [
+			"Runtime-owned final commit gate for the closeout secretary.",
+			"Requires closeout=pass, integrationVerify=pass, a final structured disposition set, an empty pre-existing index, and an exact accepted-path manifest.",
+			"Stages and commits only that manifest; raw git add/commit remains forbidden in bash.",
+			"Returns commit=created:<sha>, already-clean:<sha>, or blocked:<reason>, plus committed and remaining dirty paths.",
+		].join(" "),
+		parameters: SecretaryCommitParams,
+		async execute(_toolCallId, params) {
+			const result = runSecretaryCommit(params, {
+				processRole: PIPIUI_AGENT_ROLE,
+				mainCwd: PIPIUI_MAIN_CWD,
+			});
+			return {
+				content: [{ type: "text", text: formatSecretaryCommitResult(result) }],
+				details: result,
+			};
+		},
 	});
 
 	// ---- Stall watchdog：后台 job 超过 120s 无任何流式事件/输出 → 向 boss 会话推一条 ----

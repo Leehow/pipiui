@@ -9,6 +9,10 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         )
         XCTAssertTrue(secretary.description.contains("closeout"))
         XCTAssertFalse(secretary.tools.contains("subagent"))
+        XCTAssertTrue(secretary.tools.contains("secretary_commit"))
+        XCTAssertTrue(ToolSkillCatalog.builtinTools.contains(where: {
+            $0.name == "secretary_commit"
+        }))
 
         let root = repositoryRoot()
         let runtime = try String(
@@ -26,6 +30,8 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         XCTAssertTrue(runtime.contains("PIPIUI_AGENT_NO_DELEGATION: \"1\""))
         XCTAssertTrue(runtime.contains("secretaryToolCallBlock"))
         XCTAssertTrue(runtime.contains("pi.on(\"tool_call\""))
+        XCTAssertTrue(runtime.contains("name: \"secretary_commit\""))
+        XCTAssertTrue(runtime.contains("runSecretaryCommit"))
 
         let definition = try String(
             contentsOf: root.appendingPathComponent(
@@ -35,8 +41,10 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         )
         XCTAssertTrue(definition.contains("name: secretary"))
         XCTAssertTrue(definition.contains("only `.pi/boss/**`"))
-        XCTAssertTrue(definition.contains("Never run `git clean`, `git branch -D`"))
+        XCTAssertTrue(definition.contains("Never run raw `git add`, `git commit`"))
         XCTAssertTrue(definition.contains("closeout=pass | needs-action | blocked"))
+        XCTAssertTrue(definition.contains("commit=created:<sha>"))
+        XCTAssertTrue(definition.contains("secretary_commit"))
     }
 
     func testBossPromptRequiresSecretaryCloseoutAndNoUnclassifiedItems() throws {
@@ -54,6 +62,9 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         XCTAssertTrue(text.contains("No final success while any relevant agent"))
         XCTAssertTrue(text.contains("unclassified"))
         XCTAssertTrue(text.contains("`closeout=pass` plus required integration verification"))
+        XCTAssertTrue(text.contains("secretary-controlled commit gate"))
+        XCTAssertTrue(text.contains("`commit=created:<sha>`"))
+        XCTAssertTrue(text.contains("`commit=not-required`"))
         XCTAssertTrue(text.contains("clean T1"))
         XCTAssertTrue(text.contains("`needs-fixer`"))
     }
@@ -266,6 +277,15 @@ final class BossSecretaryCloseoutTests: XCTestCase {
                 "git cherry-pick HEAD",
                 "git rebase main",
                 "git push origin main",
+                "git add accepted.txt",
+                "git commit -m accepted",
+                "git commit -am accepted",
+                "git update-ref refs/heads/topic HEAD",
+                "git update-index --add accepted.txt",
+                "git rm accepted.txt",
+                "git mv old.txt new.txt",
+                "git worktree add ../other topic",
+                "git branch topic",
                 "git branch -D pipiui/agent-old",
                 "rm -rf .pi/boss/old",
                 "  rm -rf .pi/boss/old",
@@ -279,6 +299,7 @@ final class BossSecretaryCloseoutTests: XCTestCase {
                 "git branch -d pipiui/agent-old",
             ]) assert.equal(call("bash", { command }), undefined, command);
 
+            assert.equal(call("secretary_commit", {}), undefined);
             assert.equal(
                 call("write", { file_path: path.join(main, "outside/worker.md") }, "worker"),
                 undefined,

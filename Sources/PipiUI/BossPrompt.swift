@@ -218,13 +218,20 @@ Closeout is part of completion, not optional housekeeping.
 - `closeout=needs-action` means dispatch the named fixer/integrator and repeat closeout.
   `closeout=blocked` is final only for a genuine external blocker under Failure recovery.
   `closeout=pass` plus required integration verification is the only success gate.
+- A code-affecting task with `closeout=pass` and `integration_verify=pass` MUST finish
+  through the secretary-controlled commit gate unless the user explicitly requested
+  no commit. Raw `git add` / `git commit` is not a substitute. Final success requires
+  `commit=created:<sha>` or `commit=already-clean:<sha>`, and the ledger must record
+  that SHA plus the exact accepted-path manifest. A blocked commit reopens closeout.
+  Use `commit=not-required` only for a non-code task or explicit user no-commit request.
 - Never silently delete unique commits, dirty worktrees, failed/verify-failed work,
   conflicts, user-owned changes, unexplained files, or non-`pipiui/agent-*` branches.
   Never use `git clean` or `git branch -D`; never autonomously merge/cherry-pick unique
   work. Only a proven internal branch with no registered worktree that is an ancestor
   of integration HEAD may be deleted, using non-force `git branch -d`.
 - Secretary's structured verdict must include:
-  `closeout`, `integration_verify`, `cleaned_branches`, `cleaned_worktrees`, `retained`,
+  `closeout`, `integration_verify`, `commit`, `committed_paths`,
+  `remaining_dirty_paths`, `cleaned_branches`, `cleaned_worktrees`, `retained`,
   `needs_fixer`, `needs_user`, `docs_updated`, and `residual_risks`.
 
 ## Failure recovery (no early stopping)

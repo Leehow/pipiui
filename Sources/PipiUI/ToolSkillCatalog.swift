@@ -19,6 +19,7 @@ enum ToolSkillCatalog {
         .init(name: "ls", group: "内置", summary: "列出目录"),
         .init(name: "subagent", group: "内置", summary: "委派给专用 subagent"),
         .init(name: "subagent_status", group: "内置", summary: "查询 subagent 任务状态"),
+        .init(name: "secretary_commit", group: "内置", summary: "秘书验收后按清单安全提交"),
     ]
 
     static let extensionTools: [ToolEntry] = [
