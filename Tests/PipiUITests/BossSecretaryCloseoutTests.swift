@@ -47,7 +47,7 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         XCTAssertTrue(definition.contains("secretary_commit"))
     }
 
-    func testBossPromptRequiresSecretaryCloseoutAndNoUnclassifiedItems() throws {
+    func testBossPromptOwnsCompletionAndUsesSecretaryOnlyForAmbiguity() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(
             "pipiui-boss-closeout-\(UUID().uuidString)",
             isDirectory: true
@@ -56,17 +56,25 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         let path = try XCTUnwrap(BossPrompt.install(into: dir))
         let text = try String(contentsOfFile: path, encoding: .utf8)
 
-        XCTAssertTrue(text.contains("## Closeout hard gate"))
+        XCTAssertTrue(text.contains("**Research / analysis-only**"))
+        XCTAssertTrue(text.contains("this route is terminal without plan or implementation"))
+        XCTAssertTrue(text.contains("**T2 medium, code-changing**"))
+        XCTAssertTrue(text.contains("explore → plan"))
+        XCTAssertTrue(text.contains("otherwise start with plan"))
+        XCTAssertTrue(text.contains("then dispatch general-purpose to implement"))
+        XCTAssertTrue(text.contains("never completion of a change request"))
+        XCTAssertTrue(text.contains("## Completion ownership and optional audit"))
+        XCTAssertTrue(text.contains("The Boss owns the completion decision"))
+        XCTAssertTrue(text.contains("Routine research and clean T1/T2 work do not require"))
+        XCTAssertTrue(text.contains("only as an optional audit/reconciliation helper"))
+        XCTAssertTrue(text.contains("Its verdict"))
+        XCTAssertTrue(text.contains("is advisory"))
+        XCTAssertTrue(text.contains("A secretary-controlled commit is never a"))
         XCTAssertTrue(text.contains("subagent_status"))
-        XCTAssertTrue(text.contains("MUST dispatch `secretary`"))
-        XCTAssertTrue(text.contains("No final success while any relevant agent"))
-        XCTAssertTrue(text.contains("unclassified"))
-        XCTAssertTrue(text.contains("`closeout=pass` plus required integration verification"))
-        XCTAssertTrue(text.contains("secretary-controlled commit gate"))
-        XCTAssertTrue(text.contains("`commit=created:<sha>`"))
-        XCTAssertTrue(text.contains("`commit=not-required`"))
-        XCTAssertTrue(text.contains("clean T1"))
-        XCTAssertTrue(text.contains("`needs-fixer`"))
+        XCTAssertFalse(text.contains("## Closeout hard gate"))
+        XCTAssertFalse(text.contains("MUST dispatch `secretary`"))
+        XCTAssertFalse(text.contains("secretary-controlled commit gate"))
+        XCTAssertFalse(text.contains("`closeout=pass` plus required integration verification"))
     }
 
     func testSafeEligibilityClassifiesMergedUniqueDirtyAndNonInternal() throws {

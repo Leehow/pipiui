@@ -5,6 +5,17 @@ import AppKit
 // 跳转要把目标落到「可视顶部」以便从头阅读，故用 .bottom。
 private let jumpAnchor: UnitPoint = .bottom
 
+/// SwiftUI row/anchor identity must be unique across warm session switches.
+///
+/// `ChatItem.id` is intentionally local to one `ChatSession` (`item-1`, `item-2`, …).
+/// The outer `NSScrollView` survives a session switch for performance, so feeding those
+/// local ids directly to its lazy content lets rows from different sessions alias.
+enum TranscriptRenderIdentity {
+    static func scoped(sessionKey: String, localID: String) -> String {
+        "\(sessionKey):\(localID)"
+    }
+}
+
 struct ChatDetailView: View {
     @EnvironmentObject var store: AppStore
     @ObservedObject var session: ChatSession
@@ -32,6 +43,8 @@ private struct ChatDetailViewBody: View {
     @State private var rightPanelWidthRatio: CGFloat?
     @State private var rightPanelDragStartWidth: CGFloat?
     @State private var rightPanelDragWidth: CGFloat?
+    /// Real user prompt ids whose complete assistant turn is folded.
+    @State private var collapsedUserTurnIDs: Set<String> = []
     @StateObject private var gitBranches = GitBranchStore()
 
     /// Last settled chat-column width. Width changes (window resize / right panel)
@@ -112,6 +125,7 @@ private struct ChatDetailViewBody: View {
             scrollNeedsRetry = false
             rightPanelDragStartWidth = nil
             rightPanelDragWidth = nil
+            collapsedUserTurnIDs = []
             settledChatColumnWidth = nil
             pendingChatColumnWidth = nil
             chatColumnWidthSettleWork?.cancel()
@@ -279,7 +293,7 @@ private struct ChatDetailViewBody: View {
         let visibleCount = session.transcriptVisibleCount
         let hidden = max(0, items.count - visibleCount)
         // T6 布局记忆化：版本 key 未变时直接命中缓存，不再每次 body 求值全量重排。
-        let visibleRowsNewestFirst = session.transcriptPlanner
+        let visibleRowsOldestFirst = session.transcriptPlanner
             .rows(
                 items: items,
                 toolRuns: session.toolRuns,
@@ -287,7 +301,8 @@ private struct ChatDetailViewBody: View {
                 transcriptVersion: session.transcriptVersion,
                 toolOutputVersion: session.toolOutputVersion
             )
-            .reversed()
+        let visibleRowsNewestFirst = visibleRowsOldestFirst.reversed()
+        let userTurnGroups = AssistantBlockLayout.userTurnGroups(rows: visibleRowsOldestFirst)
         return ScrollViewReader { proxy in
             // assistant run id → 其文档顺序上一条 user 消息 id（无则缺省，回退到自身 id）。
             let jumpTargets = jumpTargetMap(rows: visibleRowsNewestFirst)
@@ -300,7 +315,7 @@ private struct ChatDetailViewBody: View {
                     // Visual bottom / pin edge (document start after scroll-view flip).
                     Color.clear
                         .frame(height: 1)
-                        .id("bottom")
+                        .id(transcriptID("bottom"))
                         .background(
                             StickToBottomTracker(
                                 isPinned: $session.pinTranscriptToBottom,
@@ -333,6 +348,7 @@ private struct ChatDetailViewBody: View {
                                 session.branchFromAssistant(runLastEntryId: entryId)
                             }
                         )
+                        .id(transcriptID("streaming"))
                         .transcriptFlip()
                     } else if session.isWorking || session.mediaBusy {
                         WaitingPlaceholderView(
@@ -340,58 +356,82 @@ private struct ChatDetailViewBody: View {
                                 ? (session.mediaStatus ?? "正在处理…")
                                 : (session.isStopping ? "正在停止…" : "AI 正在思考…")
                         )
-                        .id("waiting-placeholder")
+                        .id(transcriptID("waiting-placeholder"))
                         .transcriptFlip()
                     }
 
                     ForEach(visibleRowsNewestFirst, id: \.id) { row in
                         switch row {
                         case .leaf(let item):
-                            MessageRow(
-                                item: item,
-                                toolRuns: runs(for: item),
-                                subagents: subagents(for: item),
-                                projectURL: session.projectURL,
-                                chatFontSize: chatTypography.fontSize,
-                                isWorking: session.isWorking,
-                                isEditing: session.editingItemId == item.id,
-                                onFlash: { session.flash($0) },
-                                onSelectAgent: selectAgent,
-                                onCopy: { session.copyItemText(item) },
-                                onResend: { session.resendUserMessage(itemId: item.id) },
-                                onBeginEdit: { session.beginEditingUserMessage(itemId: item.id) },
-                                onCancelEdit: { session.cancelEditingUserMessage() },
-                                onCommitEdit: { session.commitEditingUserMessage(newText: $0) }
-                            )
-                            .equatable()
-                            .id(item.id)
-                            .transcriptFlip()
+                            let groupID = userTurnGroups.groupIDForRowID[item.id]
+                            let isInternalSignal = groupID != nil
+                                && !MessageActions.isUserAuthoredMessage(item)
+                            let isFoldedSignal = isInternalSignal && isUserTurnCollapsed(groupID)
+                            if !isFoldedSignal {
+                                MessageRow(
+                                    item: item,
+                                    toolRuns: runs(for: item),
+                                    subagents: subagents(for: item),
+                                    projectURL: session.projectURL,
+                                    chatFontSize: chatTypography.fontSize,
+                                    isWorking: session.isWorking,
+                                    isEditing: session.editingItemId == item.id,
+                                    onFlash: { session.flash($0) },
+                                    onSelectAgent: selectAgent,
+                                    onCopy: { session.copyItemText(item) },
+                                    onResend: { session.resendUserMessage(itemId: item.id) },
+                                    onBeginEdit: { session.beginEditingUserMessage(itemId: item.id) },
+                                    onCancelEdit: { session.cancelEditingUserMessage() },
+                                    onCommitEdit: { session.commitEditingUserMessage(newText: $0) }
+                                )
+                                .equatable()
+                                .id(transcriptID(item.id))
+                                .transcriptFlip()
+                            }
                         case .assistantRun(let id, let entryId, let segments):
-                            let callIds = AssistantBlockLayout.toolCallIds(in: segments)
-                            AssistantSegmentsView(
-                                segments: segments,
-                                toolRuns: runs(forToolCallIds: callIds),
-                                subagents: subagents(forToolCallIds: callIds),
-                                projectURL: session.projectURL,
-                                onFlash: { session.flash($0) },
-                                onSelectAgent: selectAgent,
-                                entryId: entryId,
-                                isWorking: session.isWorking,
-                                onCopy: { session.copySegmentsText(segments) },
-                                onBranch: {
-                                    guard let entryId else { return }
-                                    session.branchFromAssistant(runLastEntryId: entryId)
-                                },
-                                onJump: {
-                                    let target = jumpTargets[id] ?? id
-                                    var t = Transaction()
-                                    t.disablesAnimations = true
-                                    withTransaction(t) { proxy.scrollTo(target, anchor: jumpAnchor) }
-                                }
-                            )
-                            .equatable()
-                            .id(id)
-                            .transcriptFlip()
+                            let groupID = userTurnGroups.groupIDForRowID[id]
+                            let isFolded = isUserTurnCollapsed(groupID)
+                            let isGroupLastAssistant = groupID.flatMap {
+                                userTurnGroups.lastAssistantRunIDForGroupID[$0]
+                            } == id
+                            if !isFolded || isGroupLastAssistant {
+                                let callIds = AssistantBlockLayout.toolCallIds(in: segments)
+                                AssistantSegmentsView(
+                                    segments: segments,
+                                    toolRuns: runs(forToolCallIds: callIds),
+                                    subagents: subagents(forToolCallIds: callIds),
+                                    projectURL: session.projectURL,
+                                    onFlash: { session.flash($0) },
+                                    onSelectAgent: selectAgent,
+                                    entryId: entryId,
+                                    isWorking: session.isWorking,
+                                    onCopy: { session.copySegmentsText(segments) },
+                                    onBranch: {
+                                        guard let entryId else { return }
+                                        session.branchFromAssistant(runLastEntryId: entryId)
+                                    },
+                                    onJump: {
+                                        let target = jumpTargets[id] ?? id
+                                        var t = Transaction()
+                                        t.disablesAnimations = true
+                                        withTransaction(t) {
+                                            proxy.scrollTo(transcriptID(target), anchor: jumpAnchor)
+                                        }
+                                    },
+                                    collapsedOverride: isFolded,
+                                    onCollapseToggle: {
+                                        guard let groupID else { return }
+                                        if collapsedUserTurnIDs.contains(groupID) {
+                                            collapsedUserTurnIDs.remove(groupID)
+                                        } else {
+                                            collapsedUserTurnIDs.insert(groupID)
+                                        }
+                                    }
+                                )
+                                .equatable()
+                                .id(transcriptID(id))
+                                .transcriptFlip()
+                            }
                         }
                     }
 
@@ -404,6 +444,9 @@ private struct ChatDetailViewBody: View {
                         .transcriptFlip()
                     }
                 }
+                // Reset only the lazy transcript content on a session switch. The enclosing
+                // NSScrollView, detail chrome and cached session/process all stay warm.
+                .id(session.bridgeRoutingKey)
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -455,7 +498,7 @@ private struct ChatDetailViewBody: View {
                 var transaction = Transaction()
                 transaction.disablesAnimations = true
                 withTransaction(transaction) {
-                    proxy.scrollTo("bottom", anchor: .top)
+                    proxy.scrollTo(transcriptID("bottom"), anchor: .top)
                 }
             }
             .onChange(of: session.rightPanel != nil) { _, _ in
@@ -552,10 +595,22 @@ private struct ChatDetailViewBody: View {
         withTransaction(transaction) {
             // ScrollView is y-flipped: layout `.top` is the visual bottom / pin edge.
             if let newestId = session.transcript.suffix(session.transcriptVisibleCount).last?.id {
-                proxy.scrollTo(newestId, anchor: .top)
+                proxy.scrollTo(transcriptID(newestId), anchor: .top)
             }
-            proxy.scrollTo("bottom", anchor: .top)
+            proxy.scrollTo(transcriptID("bottom"), anchor: .top)
         }
+    }
+
+    private func transcriptID(_ localID: String) -> String {
+        TranscriptRenderIdentity.scoped(
+            sessionKey: session.bridgeRoutingKey,
+            localID: localID
+        )
+    }
+
+    private func isUserTurnCollapsed(_ groupID: String?) -> Bool {
+        guard let groupID else { return false }
+        return collapsedUserTurnIDs.contains(groupID)
     }
 
     /// assistant run id → 其文档顺序上一条 user 消息 id（无前驱 user 时缺省）。
@@ -856,6 +911,13 @@ struct StickToBottomTracker: NSViewRepresentable {
         private var attachAttempts = 0
         private var pinWriteScheduled = false
         private var pendingPinValue: Bool?
+        /// Clip bounds changes arrive for every scroller-knob movement. Process at
+        /// most one attributed drag update per main-loop turn so the pin state
+        /// machine cannot feed SwiftUI layout back into the drag continuously.
+        private var knobDragUpdateScheduled = false
+        /// Invalidates a queued bounds update if this coordinator is detached and
+        /// later attached to another scroll view before the next main-loop turn.
+        private var boundsUpdateGeneration = 0
 
         init(isPinned: Binding<Bool>, threshold: CGFloat, pinEdge: StickPinEdge) {
             self.isPinned = isPinned
@@ -910,7 +972,14 @@ struct StickToBottomTracker: NSViewRepresentable {
                         windowInLiveResize: inLiveResize
                     )
                     guard origin.allowsUnpin else { return }
-                    self?.updatePinFromUserScroll()
+                    // A clip movement with a held mouse button (outside a live
+                    // window resize) is a scroller-knob drag. Unlike the old
+                    // conservative path, mark it as a live user scroll so a move
+                    // farther than 4pt releases the pin before streaming/reflow
+                    // can pull the thumb back. Bounds notifications are high
+                    // frequency, so coalesce them to one state-machine entry per
+                    // runloop.
+                    self?.scheduleKnobDragPinUpdate()
                 }
                 // 安装时只允许「确认在底部 → pin」，避免布局未完成时误 unpin
                 updatePinFromUserScroll(allowUnpin: false)
@@ -933,6 +1002,19 @@ struct StickToBottomTracker: NSViewRepresentable {
             scrollView = nil
             pinWriteScheduled = false
             pendingPinValue = nil
+            knobDragUpdateScheduled = false
+            boundsUpdateGeneration += 1
+        }
+
+        private func scheduleKnobDragPinUpdate() {
+            guard !knobDragUpdateScheduled else { return }
+            knobDragUpdateScheduled = true
+            let generation = boundsUpdateGeneration
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.boundsUpdateGeneration == generation else { return }
+                self.knobDragUpdateScheduled = false
+                self.updatePinFromUserScroll(userLiveScroll: true)
+            }
         }
 
         private func updatePinFromUserScroll(allowUnpin: Bool = true, userLiveScroll: Bool = false) {

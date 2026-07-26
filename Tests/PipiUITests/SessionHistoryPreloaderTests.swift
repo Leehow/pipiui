@@ -229,6 +229,84 @@ final class SessionHistoryPreloaderTests: XCTestCase {
         )
     }
 
+    func testReadyProjectPlanningDoesNotWaitForSlowProjectScan() {
+        let first = URL(fileURLWithPath: "/projects/first")
+        let slow = URL(fileURLWithPath: "/projects/slow")
+        let last = URL(fileURLWithPath: "/projects/last")
+        let ready = SessionHistoryPreloadPlan.readyProjects(
+            [first, slow, last],
+            completedProjectPaths: [first.path]
+        )
+        XCTAssertEqual(ready.map(\.path), [first.path])
+
+        let sessions = (0..<25).map {
+            SessionMeta(path: "/first/\($0)", name: "\($0)", modified: Date())
+        }
+        let candidates = SessionHistoryPreloadPlan.candidates(
+            projects: ready,
+            sessionsByProject: [first.path: sessions],
+            selectedProjectPath: first.path,
+            preferredSessionPath: "/first/3",
+            archivedPaths: ["/first/2"]
+        )
+        XCTAssertEqual(candidates.count, SessionHistoryPreloadPlan.sessionsPerProject)
+        XCTAssertEqual(candidates.first, "/first/3")
+        XCTAssertFalse(candidates.contains("/first/2"))
+        XCTAssertTrue(candidates.allSatisfy { $0.hasPrefix("/first/") })
+    }
+
+    func testClickedQueuedPathIsPromotedAndCoalescedWithoutDuplicateParse() throws {
+        let blocker = temporaryDirectory.appendingPathComponent("blocker.jsonl")
+        let other = temporaryDirectory.appendingPathComponent("other.jsonl")
+        let clicked = temporaryDirectory.appendingPathComponent("clicked.jsonl")
+        try writeSimpleSession(text: "blocker", padding: 32, to: blocker)
+        try writeSimpleSession(text: "other", padding: 32, to: other)
+        try writeSimpleSession(text: "clicked", padding: 32, to: clicked)
+
+        let blockerStarted = expectation(description: "blocker started")
+        let releaseBlocker = DispatchSemaphore(value: 0)
+        let callsLock = NSLock()
+        var loadOrder: [String] = []
+        let preloader = SessionHistoryPreloader(
+            maxConcurrentLoads: 1,
+            snapshotLoader: { path in
+                callsLock.lock()
+                loadOrder.append(path)
+                callsLock.unlock()
+                if path == blocker.path {
+                    blockerStarted.fulfill()
+                    releaseBlocker.wait()
+                }
+                return SessionHistoryParser.load(path: path)
+            }
+        )
+
+        preloader.preload(paths: [blocker.path, other.path, clicked.path])
+        wait(for: [blockerStarted], timeout: 2)
+
+        let firstCompletion = expectation(description: "first click completion")
+        let secondCompletion = expectation(description: "second click completion")
+        preloader.loadPrioritized(path: clicked.path) { snapshot in
+            XCTAssertEqual(snapshot?.identity.path, clicked.path)
+            firstCompletion.fulfill()
+        }
+        preloader.loadPrioritized(path: clicked.path) { snapshot in
+            XCTAssertEqual(snapshot?.identity.path, clicked.path)
+            secondCompletion.fulfill()
+        }
+        releaseBlocker.signal()
+
+        wait(for: [firstCompletion, secondCompletion], timeout: 2)
+        preloader.waitForAllLoads()
+        callsLock.lock()
+        let finalOrder = loadOrder
+        callsLock.unlock()
+
+        XCTAssertEqual(finalOrder, [blocker.path, clicked.path, other.path])
+        XCTAssertEqual(finalOrder.filter { $0 == clicked.path }.count, 1)
+        XCTAssertNotNil(preloader.snapshotIfCurrent(path: clicked.path))
+    }
+
     func testDefaultConcurrencyIsExplicitlyBoundedToTwo() {
         let preloader = SessionHistoryPreloader()
         XCTAssertEqual(

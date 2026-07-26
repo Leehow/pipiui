@@ -4,10 +4,11 @@
 
 **Read and follow [`CONSTITUTION.md`](./CONSTITUTION.md).**
 
-Hard rule: **successful compile meant for the runnable app ⇒ refresh `build/PipiUI.app`.**
+Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may create a runnable App.** All other linked/temporary worktrees must verify with `swift build` / `swift test` only and must never create `build/PipiUI.app`.
 
 ```bash
-./make-app.sh              # required ship path (release .app in build/)
+cd /Users/haoli/leehow/code/pipiui
+./make-app.sh              # the sole release .app location
 ./scripts/build-app.sh     # test (optional skip) then make-app.sh
 ```
 
@@ -27,8 +28,8 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 |------|--------|
 | Project rules | `CONSTITUTION.md` |
 | Build / run docs | `README.md` → 构建运行 |
-| Package App | `./make-app.sh` → `build/PipiUI.app` |
-| Test + package | `./scripts/build-app.sh` |
-| Dev loop only | `swift run` |
+| Package App (primary checkout only) | `./make-app.sh` → `build/PipiUI.app` |
+| Test + package (primary checkout only) | `./scripts/build-app.sh` |
+| Worker/dev verification | `swift run` / `swift build` / `swift test` |
 
-macOS 14+ · SwiftPM · product binary `PipiUI` → `build/PipiUI.app`.
+macOS 14+ · SwiftPM · the only product bundle is `/Users/haoli/leehow/code/pipiui/build/PipiUI.app`.

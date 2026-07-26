@@ -29,6 +29,13 @@ enum SessionHistoryPreloadPlan {
     /// Product preload depth is intentionally independent from the sidebar's display cap.
     static let sessionsPerProject = 20
 
+    static func readyProjects(
+        _ projects: [URL],
+        completedProjectPaths: Set<String>
+    ) -> [URL] {
+        projects.filter { completedProjectPaths.contains($0.path) }
+    }
+
     static func candidates(
         projects: [URL],
         sessionsByProject: [String: [SessionMeta]],
@@ -73,12 +80,17 @@ final class SessionHistoryPreloader {
         var lastAccess: UInt64
     }
 
+    private struct InFlightLoad {
+        let operation: BlockOperation
+        var completions: [(SessionHistorySnapshot?) -> Void]
+    }
+
     private let byteBudget: Int
     private let queue: OperationQueue
     private let snapshotLoader: (String) -> SessionHistorySnapshot?
     private let lock = NSLock()
     private var entries: [String: CacheEntry] = [:]
-    private var inFlight: Set<String> = []
+    private var inFlight: [String: InFlightLoad] = [:]
     private var totalBytes = 0
     private var accessCounter: UInt64 = 0
 
@@ -97,21 +109,38 @@ final class SessionHistoryPreloader {
 
     var maxConcurrentLoadCount: Int { queue.maxConcurrentOperationCount }
 
-    func preload(paths: [String]) {
+    func preload(
+        paths: [String],
+        queuePriority: Operation.QueuePriority = .normal
+    ) {
         for path in paths {
-            guard reserveLoad(path: path) else { continue }
-            queue.addOperation { [weak self] in
-                guard let self else { return }
-                defer { self.finishLoad(path: path) }
-                guard let current = SessionFileIdentity.current(path: path),
-                      current.size <= self.byteBudget,
-                      !self.contains(path: path, identity: current) else {
-                    return
-                }
-                guard let snapshot = self.snapshotLoader(path) else { return }
-                self.store(snapshot)
-            }
+            enqueue(
+                path: path,
+                queuePriority: queuePriority,
+                qualityOfService: .utility,
+                completion: nil
+            )
         }
+    }
+
+    /// User-click path: reuse/promote an existing queued load, or enqueue one high-priority
+    /// background parse. Every coalesced completion is delivered once on the main queue.
+    func loadPrioritized(
+        path: String,
+        completion: @escaping (SessionHistorySnapshot?) -> Void
+    ) {
+        if let cached = snapshotIfCurrent(path: path) {
+            DispatchQueue.main.async {
+                completion(cached)
+            }
+            return
+        }
+        enqueue(
+            path: path,
+            queuePriority: .veryHigh,
+            qualityOfService: .userInitiated,
+            completion: completion
+        )
     }
 
     /// Synchronous test/support hook; production launch work uses `preload(paths:)`.
@@ -157,25 +186,102 @@ final class SessionHistoryPreloader {
         return Set(entries.keys)
     }
 
-    private func reserveLoad(path: String) -> Bool {
-        guard !path.isEmpty else { return false }
-        lock.lock()
-        defer { lock.unlock() }
-        guard !inFlight.contains(path) else { return false }
-        inFlight.insert(path)
-        return true
-    }
+    private func enqueue(
+        path: String,
+        queuePriority: Operation.QueuePriority,
+        qualityOfService: QualityOfService,
+        completion: ((SessionHistorySnapshot?) -> Void)?
+    ) {
+        guard !path.isEmpty else {
+            if let completion {
+                DispatchQueue.main.async { completion(nil) }
+            }
+            return
+        }
 
-    private func contains(path: String, identity: SessionFileIdentity) -> Bool {
         lock.lock()
-        defer { lock.unlock() }
-        return entries[path]?.snapshot.identity == identity
-    }
+        if var existing = inFlight[path] {
+            if let completion {
+                existing.completions.append(completion)
+            }
+            if Self.priorityRank(queuePriority) > Self.priorityRank(existing.operation.queuePriority) {
+                existing.operation.queuePriority = queuePriority
+            }
+            if qualityOfService == .userInitiated {
+                existing.operation.qualityOfService = .userInitiated
+            }
+            inFlight[path] = existing
+            lock.unlock()
+            return
+        }
 
-    private func finishLoad(path: String) {
-        lock.lock()
-        inFlight.remove(path)
+        let operation = BlockOperation()
+        operation.queuePriority = queuePriority
+        operation.qualityOfService = qualityOfService
+        let completions = completion.map { [$0] } ?? []
+        inFlight[path] = InFlightLoad(operation: operation, completions: completions)
+        operation.addExecutionBlock { [weak self, weak operation] in
+            guard let self, operation?.isCancelled != true else { return }
+            let snapshot = self.loadSnapshotIfNeeded(path: path)
+            self.finishLoad(path: path, snapshot: snapshot)
+        }
         lock.unlock()
+        queue.addOperation(operation)
+    }
+
+    private static func priorityRank(_ priority: Operation.QueuePriority) -> Int {
+        switch priority {
+        case .veryLow: return 0
+        case .low: return 1
+        case .normal: return 2
+        case .high: return 3
+        case .veryHigh: return 4
+        @unknown default: return 2
+        }
+    }
+
+    private func loadSnapshotIfNeeded(path: String) -> SessionHistorySnapshot? {
+        guard let current = SessionFileIdentity.current(path: path),
+              current.size <= byteBudget else {
+            return nil
+        }
+        if let cached = cachedSnapshot(path: path, identity: current) {
+            return cached
+        }
+        guard let snapshot = snapshotLoader(path) else { return nil }
+        guard SessionFileIdentity.current(path: path) == snapshot.identity,
+              snapshot.approximateBytes <= byteBudget else {
+            return nil
+        }
+        store(snapshot)
+        return snapshot
+    }
+
+    private func cachedSnapshot(
+        path: String,
+        identity: SessionFileIdentity
+    ) -> SessionHistorySnapshot? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var entry = entries[path], entry.snapshot.identity == identity else {
+            return nil
+        }
+        accessCounter &+= 1
+        entry.lastAccess = accessCounter
+        entries[path] = entry
+        return entry.snapshot
+    }
+
+    private func finishLoad(path: String, snapshot: SessionHistorySnapshot?) {
+        lock.lock()
+        let completions = inFlight.removeValue(forKey: path)?.completions ?? []
+        lock.unlock()
+        guard !completions.isEmpty else { return }
+        DispatchQueue.main.async {
+            for completion in completions {
+                completion(snapshot)
+            }
+        }
     }
 
     private func store(_ snapshot: SessionHistorySnapshot) {

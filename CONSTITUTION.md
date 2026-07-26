@@ -5,22 +5,25 @@ Binding rules for humans and coding agents. Short and enforceable.
 
 ---
 
-## 1. 编译通过即打包（强制）
+## 1. 唯一可运行包与唯一打包地点（强制）
 
-**Any successful `swift build` / feature completion / "build passed" verification that is meant to update the runnable app MUST also package so `build/PipiUI.app` is not stale.**
+**The only permitted runnable App is `/Users/haoli/leehow/code/pipiui/build/PipiUI.app`. Only this primary checkout may package it.**
 
-凡成功编译、功能完成、或声称「构建通过 / 可运行」且意图更新可双击运行的 App 时，**必须**随后打包，不得只停在 `.build/debug` 或 `.build/release`。
+凡成功编译、功能完成、或声称「构建通过 / 可运行」且意图更新可双击运行的 App 时，**只能**在主工作区 `/Users/haoli/leehow/code/pipiui` 随后打包。不得只停在 `.build/debug` 或 `.build/release`。
+
+所有 linked worktree、临时 worktree 与 `pipiui-wt/*` 目录只可运行 `swift build`、`swift test` 或 `swift run` 作验证；**严禁**运行会创建 `build/PipiUI.app` 的打包命令。不得保留、打开、分发或在 Launchpad 中依赖这些目录里的 `.app`。若发现历史遗留副本，应删除该副本，主工作区的唯一包不受影响。
 
 Canonical commands:
 
 ```bash
-./make-app.sh                 # release → build/PipiUI.app
+cd /Users/haoli/leehow/code/pipiui
+./make-app.sh                 # release → 此唯一位置的 build/PipiUI.app
 ./scripts/build-app.sh        # 可选：先测再打包（见脚本 --help）
 ```
 
 ## 2. 时间戳验收（强制）
 
-打包后验证 `build/PipiUI.app` 二进制新于改动源码：
+仅在主工作区打包后，验证唯一 `build/PipiUI.app` 二进制新于改动源码：
 
 ```bash
 stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
@@ -39,10 +42,10 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 
 | 用途 | 命令 |
 |------|------|
-| 快速调试 | `swift run` / `swift build -c debug` |
-| 可双击 / 给用户打开的 App | `./make-app.sh`（release 打包到 `build/PipiUI.app`） |
+| 任意 worktree 的快速调试/验证 | `swift run` / `swift build -c debug` / `swift test` |
+| 主工作区的可双击 App | `./make-app.sh`（仅主工作区，release 打包到唯一 `build/PipiUI.app`） |
 
-Prefer release package via `make-app.sh` for the double-clickable app. `swift run` is for quick debug only.
+Prefer release package via `make-app.sh` for the double-clickable app, but only from the primary checkout. `swift run` is for quick debug only.
 
 ## 5. 其它质量底线（简）
 
@@ -52,6 +55,6 @@ Prefer release package via `make-app.sh` for the double-clickable app. `swift ru
 
 ---
 
-**权威产物路径：** `build/PipiUI.app`（唯一可运行包）
+**权威产物路径：** `/Users/haoli/leehow/code/pipiui/build/PipiUI.app`（唯一可运行包）
 **入口脚本：** `./make-app.sh` · `./scripts/build-app.sh`  
 **Agent 入口：** 见根目录 `AGENTS.md`

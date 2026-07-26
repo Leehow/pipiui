@@ -29,13 +29,6 @@ struct SettingsSheet: View {
     @EnvironmentObject var store: AppStore
 
     @State private var tab: SettingsTab = .general
-    /// 懒加载 + keep-alive：只有访问过的 tab 的 section 才会进 ZStack；
-    /// 进入后永不移除（配合 SettingsTabKeepAlive 保留 @State / AppKit 控件）。
-    /// 初始只含当前 tab，避免一次性构建全部 5 个 section 造成卡顿；
-    /// prewarmRemainingTabs() 随后逐个后台预热其余 section。设置面板自启动起
-    /// 常驻主窗口 overlay（App.swift），因此预热实际发生在启动后 ~300ms，
-    /// 用户首次点齿轮时整棵树已构建完毕。
-    @State private var visitedTabs: Set<SettingsTab> = [.general]
     @State private var models: [ModelInfo] = []
     @State private var credentials: [PiAuthStore.CredentialInfo] = []
     @State private var hiddenIds: Set<String> = ModelVisibility.hiddenModelIds()
@@ -90,37 +83,13 @@ struct SettingsSheet: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 10)
             Divider()
-            ScrollView {
-                // Lazy + keep-alive: only visited sections enter the view tree
-                // (visitedTabs), so opening the sheet builds just the initial tab;
-                // once visited, a section stays forever — switching tabs doesn't
-                // tear down / rebuild its AppKit controls (and its @State survives).
-                // Inactive sections are invisible, non-interactive and zero-height,
-                // so the ZStack — and thus the scroll content — sizes to the active
-                // section only.
-                ZStack(alignment: .top) {
-                    if visitedTabs.contains(.general) {
-                        generalSection
-                            .settingsTabKeepAlive(active: tab == .general)
-                    }
-                    if visitedTabs.contains(.models) {
-                        modelSettingsSection
-                            .settingsTabKeepAlive(active: tab == .models)
-                    }
-                    if visitedTabs.contains(.usage) {
-                        usageSection
-                            .settingsTabKeepAlive(active: tab == .usage)
-                    }
-                    if visitedTabs.contains(.toolsSkills) {
-                        toolsSkillsSection
-                            .settingsTabKeepAlive(active: tab == .toolsSkills)
-                    }
-                    if visitedTabs.contains(.subagentModels) {
-                        subagentModelsSection
-                            .settingsTabKeepAlive(active: tab == .subagentModels)
-                    }
+            if tab == .models {
+                modelSettingsList
+            } else {
+                ScrollView {
+                    activeNonModelSection
+                        .padding(20)
                 }
-                .padding(20)
             }
             if let statusMessage {
                 Text(statusMessage)
@@ -138,17 +107,13 @@ struct SettingsSheet: View {
             }
         }
         .frame(width: 640, height: 620)
-        // 预渲染探针：进窗口即证明常驻隐藏的设置树已材质化（见 App.swift overlay）。
-        .background(SettingsPrewarmProbe())
         .task { await reload() }
-        .task { await prewarmRemainingTabs() }
         .onChange(of: store.showSettings) { wasVisible, isVisible in
             if SettingsReloadPolicy.shouldReload(from: wasVisible, to: isVisible) {
                 Task { await reload() }
             }
         }
         .onChange(of: tab) { _, newValue in
-            visitedTabs.insert(newValue)
             if newValue == .usage { reloadUsage() }
         }
         .onChange(of: usagePeriod) { _, _ in reloadUsage() }
@@ -186,20 +151,20 @@ struct SettingsSheet: View {
         }
     }
 
-    /// 预热：面板材质化后（启动即发生，见 App.swift 常驻 overlay），把尚未访问的
-    /// tab 逐个加入 visitedTabs，使其 section 以 inactive（keep-alive）状态构建一次。
-    /// 这样用户首次切到该 tab 也是即时的。
-    /// 每个 section 间隔一小段时间分散到不同 frame，避免同一帧内集中构建造成掉帧。
-    /// task 随视图销毁自动取消。
-    private func prewarmRemainingTabs() async {
-        do {
-            try await Task.sleep(for: .milliseconds(300))
-            for t in SettingsTab.allCases where !visitedTabs.contains(t) {
-                try Task.checkCancellation()
-                visitedTabs.insert(t)
-                try await Task.sleep(for: .milliseconds(120))
-            }
-        } catch { /* cancelled — 视图销毁 */ }
+    @ViewBuilder
+    private var activeNonModelSection: some View {
+        switch tab {
+        case .general:
+            generalSection
+        case .usage:
+            usageSection
+        case .toolsSkills:
+            toolsSkillsSection
+        case .subagentModels:
+            subagentModelsSection
+        case .models:
+            EmptyView()
+        }
     }
 
     private var header: some View {
@@ -207,9 +172,7 @@ struct SettingsSheet: View {
             Text("设置")
                 .font(.headline)
             Spacer()
-            // 快捷键按可见性门控：设置面板现在常驻视图树（启动预渲染，见 App.swift
-            // overlay），若不门控，回车/Esc 会在面板隐藏时仍全局生效（回车会抢走
-            // 聊天输入框的提交键）。
+            // 快捷键按可见性门控，避免隐藏的设置面板抢走聊天输入框的回车/Esc。
             Button("完成") { store.showSettings = false }
                 .keyboardShortcut(store.showSettings ? .defaultAction : nil)
             Button("") { store.showSettings = false }
@@ -244,8 +207,11 @@ struct SettingsSheet: View {
 
     // MARK: - Models
 
-    private var modelSettingsSection: some View {
-        LazyVStack(alignment: .leading, spacing: 10) {
+    /// Native List virtualizes at the individual model-row level. A LazyVStack
+    /// nested inside provider cards only deferred whole cards, which still forced
+    /// every model toggle in a provider to be created while scrolling.
+    private var modelSettingsList: some View {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("模型设置")
                     .font(.title3.weight(.semibold))
@@ -273,77 +239,89 @@ struct SettingsSheet: View {
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 12)
             } else {
-                ForEach(groupedModels) { group in
-                    LazyVStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            ProviderLogo(provider: group.provider, size: 14)
-                            Text(group.provider)
-                                .font(.subheadline.weight(.semibold))
-                            if let cred = credentials.first(where: { $0.providerId == group.provider }) {
-                                Text(cred.type == "oauth" ? "账号" : "API key")
-                                    .font(.caption2)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Capsule().fill(Color.primary.opacity(0.08)))
-                            }
-                            Spacer()
-                            Button(role: .destructive) {
-                                pendingDeleteProvider = group.provider
-                            } label: {
-                                Image(systemName: "trash")
-                            }
-                            .buttonStyle(.borderless)
-                            .help("删除该 provider 凭据")
-                        }
-                        // T19 冲突警告：.env 与 auth.json(api_key) 同时存在时，
-                        // auth.json 的旧 key 会覆盖 .env，提供一键清理。
-                        if let cred = credentials.first(where: { $0.providerId == group.provider }),
-                           cred.type == "api_key",
-                           envConfiguredProviders.contains(group.provider) {
-                            HStack(spacing: 6) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundStyle(.orange)
-                                Text("auth.json 残留旧 key 将覆盖 .env")
-                                    .font(.caption)
-                                    .foregroundStyle(.orange)
-                                Spacer()
-                                Button("清理") {
-                                    Task { await cleanupStaleAuthKey(group.provider) }
-                                }
-                                .font(.caption)
-                            }
-                        }
-                        ForEach(group.models) { model in
-                            HStack(spacing: 8) {
-                                Toggle(isOn: visibilityBinding(for: model.id)) {
-                                    HStack(spacing: 8) {
-                                        ProviderLogo(model: model, size: 16)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(model.name)
-                                                .font(.callout)
-                                            Text(model.id)
-                                                .font(.caption2)
-                                                .foregroundStyle(.tertiary)
-                                        }
-                                    }
-                                }
-                                .toggleStyle(.checkbox)
-
-                                Spacer(minLength: 8)
-
-                                Toggle(isOn: weakTierBinding(for: model.id)) {
-                                    Text("弱模型")
+                List {
+                    ForEach(groupedModels) { group in
+                        Section {
+                            // T19 冲突警告：.env 与 auth.json(api_key) 同时存在时，
+                            // auth.json 的旧 key 会覆盖 .env，提供一键清理。
+                            if let cred = credentials.first(where: { $0.providerId == group.provider }),
+                               cred.type == "api_key",
+                               envConfiguredProviders.contains(group.provider) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundStyle(.orange)
+                                    Text("auth.json 残留旧 key 将覆盖 .env")
                                         .font(.caption)
+                                        .foregroundStyle(.orange)
+                                    Spacer()
+                                    Button("清理") {
+                                        Task { await cleanupStaleAuthKey(group.provider) }
+                                    }
+                                    .font(.caption)
                                 }
-                                .toggleStyle(.checkbox)
-                                .help("勾选后该模型强制走 Superpowers 流程：难任务必须先调技能，首次派工前会被要求先读 SOP。")
                             }
+                            ForEach(group.models) { model in
+                                modelSettingsRow(model)
+                            }
+                        } header: {
+                            modelProviderHeader(group)
                         }
                     }
-                    .padding(10)
-                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+                }
+                .listStyle(.inset)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+    }
+
+    private func modelProviderHeader(_ group: ProviderModelGroup) -> some View {
+        HStack {
+            ProviderLogo(provider: group.provider, size: 14)
+            Text(group.provider)
+                .font(.subheadline.weight(.semibold))
+            if let cred = credentials.first(where: { $0.providerId == group.provider }) {
+                Text(cred.type == "oauth" ? "账号" : "API key")
+                    .font(.caption2)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.primary.opacity(0.08)))
+            }
+            Spacer()
+            Button(role: .destructive) {
+                pendingDeleteProvider = group.provider
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .help("删除该 provider 凭据")
+        }
+    }
+
+    private func modelSettingsRow(_ model: ModelInfo) -> some View {
+        HStack(spacing: 8) {
+            Toggle(isOn: visibilityBinding(for: model.id)) {
+                HStack(spacing: 8) {
+                    ProviderLogo(model: model, size: 16)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.name)
+                            .font(.callout)
+                        Text(model.id)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             }
+            .toggleStyle(.checkbox)
+
+            Spacer(minLength: 8)
+
+            Toggle(isOn: weakTierBinding(for: model.id)) {
+                Text("弱模型")
+                    .font(.caption)
+            }
+            .toggleStyle(.checkbox)
+            .help("勾选后该模型强制走 Superpowers 流程：难任务必须先调技能，首次派工前会被要求先读 SOP。")
         }
     }
 
@@ -1249,27 +1227,6 @@ private struct ProviderModelGroup: Identifiable {
     let provider: String
     let models: [ModelInfo]
     var id: String { provider }
-}
-
-/// Keep-alive 修饰符：让不活跃 tab 的 section 留在视图树里（AppKit 控件不销毁、
-/// @State 保留），但不可见、不可交互、不占布局高度，ZStack 仅按活跃 section 定尺寸。
-private struct SettingsTabKeepAlive: ViewModifier {
-    let active: Bool
-
-    func body(content: Content) -> some View {
-        content
-            .opacity(active ? 1 : 0)
-            .allowsHitTesting(active)
-            .accessibilityHidden(!active)
-            .frame(maxHeight: active ? .infinity : 0, alignment: .top)
-            .clipped()
-    }
-}
-
-private extension View {
-    func settingsTabKeepAlive(active: Bool) -> some View {
-        modifier(SettingsTabKeepAlive(active: active))
-    }
 }
 
 /// Subagent 模型 tab 的单行。抽成独立 Equatable View 后，父视图其它状态变化
