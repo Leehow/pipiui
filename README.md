@@ -69,23 +69,43 @@
 
 ## 构建运行
 
-**宪章（强制）：编译通过后必须更新 `build/PipiUI.app`，并由 `make-app.sh` 同步安装到 `/Applications/PipiUI.app`。** 详见 [`CONSTITUTION.md`](./CONSTITUTION.md)；agent 入口见 [`AGENTS.md`](./AGENTS.md)。仅 `swift build` / `swift run` 成功而 `.app` 仍旧时，不得宣称「可打开 App」。
+**宪章（强制）：每个 AI 任务使用独立 branch + linked worktree；worker 构建
+只写自己的工作区，只有 clean integration worktree 可以安装 canonical App。**
+详见 [`CONSTITUTION.md`](./CONSTITUTION.md)；agent 入口见
+[`AGENTS.md`](./AGENTS.md)。
 
 ```bash
-swift run                 # 开发调试（不更新 .app）
-./make-app.sh             # release 打包 → build/PipiUI.app，并安装 /Applications/PipiUI.app
-./scripts/build-app.sh    # 可选：先 swift test 再 make-app.sh（--skip-tests 跳过测试）
-open -a PipiUI            # 用户启动路径（应用程序）
+swift run                        # Worker 快速调试，仅当前 worktree
+./scripts/verify-worker.sh       # Worker: test + 本地 build/PipiUI.app
+./make-app.sh                    # Worker: release 本地打包，不安装
+./scripts/build-app.sh           # Worker: test + 本地打包，不安装
+./scripts/ship-app.sh            # Integration: 唯一 canonical 安装入口
+open -a PipiUI                   # 打开最近一次 canonical ship
 ```
 
-打包后核对 build + Applications 二进制均新于源码，例如：
+新任务示例（可从 dirty checkout 调用，只要 `--base` 是 committed ref）：
 
 ```bash
-stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
-  build/PipiUI.app/Contents/MacOS/PipiUI \
-  /Applications/PipiUI.app/Contents/MacOS/PipiUI \
-  Sources/PipiUI/Views/ImagePreview.swift
+./scripts/new-ai-worktree.sh \
+  --tool codex \
+  --work-id settings \
+  --topic sidebar \
+  --base codex/settings
 ```
+
+支持 `codex`、`claude`、`cursor`、`pipiui`。默认在主 checkout 的同级
+`pipiui-wt/` 下创建临时目录。IDE 必须打开返回的新 worktree 根目录，而不是在
+共享目录中切分支。
+
+`verify-worker.sh` 只接受 `ai/*` 和 `pipiui/agent-*` worker 分支。它的成功仅
+表示 worker-local verification passed，不能声称已更新 Launchpad 中的 App。
+最终集成负责人逐个 merge 后，从 clean 的 `main`、`codex/*` 或
+`integration/*` 执行 `ship-app.sh`；脚本持有全局锁、运行测试/本地打包、
+安装 `/Applications/PipiUI.app`，并核对双路径二进制 SHA-256 与时间戳。
+
+`PIPIUI_INSTALL_APP=/absolute/other/PipiUI.app` 可为受控验证覆盖安装位置；
+普通 worker 不得使用该变量绕过 `ship-app.sh`。已有 ship lock 必须先调查其
+owner 记录，脚本不会自动删除。
 
 要求：macOS 14+，已安装 pi CLI（在 `~/.npm-global/bin/pi`、`/opt/homebrew/bin` 或 PATH 中可找到）。
 

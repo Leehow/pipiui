@@ -5,68 +5,83 @@ Binding rules for humans and coding agents. Short and enforceable.
 
 ---
 
-## 1. 编译通过即打包（强制）
+## 1. 一任务一分支一 worktree（强制）
 
-**Any successful `swift build` / feature completion / "build passed" verification that is meant to update the runnable app MUST also package so `build/PipiUI.app` is not stale.**
-
-凡成功编译、功能完成、或声称「构建通过 / 可运行」且意图更新可双击运行的 App 时，**必须**随后打包，不得只停在 `.build/debug` 或 `.build/release`。
-
-Canonical commands:
+Codex、Claude Code、Cursor 与 PipiUI agent 的每个实现任务都必须使用独立
+branch + linked worktree。不得让多个工具在同一工作目录里切分支或并行写代码。
 
 ```bash
-./make-app.sh                 # release → build/PipiUI.app + install /Applications/PipiUI.app
-./scripts/build-app.sh        # 可选：先测再打包（见脚本 --help）
+./scripts/new-ai-worktree.sh \
+  --tool codex --work-id settings --topic sidebar --base codex/settings
 ```
 
-## 2. 打包后必须安装到应用程序（强制）
+- Worker 分支：`ai/<tool>/<work-id>-<topic>`；PipiUI：`pipiui/agent-<work-id>-<topic>`。
+- Worker 从明确的 committed base ref 创建；调用者工作区可有未提交内容，但绝不会复制过去。
+- IDE 必须打开新 worktree 根目录。Worker 只提交自己的范围，不合并别人的分支。
+- 会修改同一核心文件的任务应串行；集成负责人从同一 integration branch 逐个 merge。
 
-**After every successful `./make-app.sh`, `/Applications/PipiUI.app` MUST be refreshed (same generation as `build/PipiUI.app`).**
+## 2. 三层构建与唯一安装入口（强制）
 
-`./make-app.sh` 成功后，**必须**把同代产物同步到 `/Applications/PipiUI.app`。用户打开路径是应用程序（`open -a PipiUI` / Launchpad / 应用程序文件夹）。
+| 层级 | 命令 | 产物 / 权限 |
+|------|------|-------------|
+| Worker 快速调试 | `swift run` / `swift build -c debug` / `swift test` | 当前 worktree 的 `.build/`；不安装 |
+| Worker 本地可运行预览 | `./scripts/verify-worker.sh` | 当前 worktree 的 `build/PipiUI.app`；不安装 |
+| Integration canonical ship | `./scripts/ship-app.sh` | 测试 + 本地打包 + 独占安装 `/Applications/PipiUI.app` |
 
-- `build/PipiUI.app` = in-repo build artifact（仓库内构建产物）
-- `/Applications/PipiUI.app` = user launch target（用户启动目标）
-- Escape（rare）：`PIPIUI_SKIP_INSTALL=1` 或 `PIPIUI_INSTALL_APP=/other/path.app`
+`./make-app.sh` 与 `./scripts/build-app.sh` 永远只生成当前 worktree 的
+`build/PipiUI.app`，不得写 `/Applications`。`./scripts/ship-app.sh` 是唯一
+canonical installer；它只接受 `main`、`codex/*`、`integration/*`，要求完全
+clean，并持有全局原子锁。
 
-Do not claim done if the Applications copy is older than the build product or sources.
-Applications 副本旧于 `build/PipiUI.app` 或源码时，**不得**声称完成。
+## 3. Worker 验证不等于交付
 
-## 3. 时间戳验收（强制）
-
-打包后验证 **build + Applications** 二进制均新于改动源码：
+Worker 完成前应运行：
 
 ```bash
-stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
-  build/PipiUI.app/Contents/MacOS/PipiUI \
-  /Applications/PipiUI.app/Contents/MacOS/PipiUI \
-  Sources/PipiUI/Views/ImagePreview.swift   # 或本次实际改动的源文件
+./scripts/verify-worker.sh              # test + release local package
+./scripts/verify-worker.sh --skip-tests # 仅在 handoff 明确解释原因时
 ```
 
-两者 **必须** 新于本次变更的 sources，且 Applications 与 build 同代。否则不算完成。
+Worker 必须报告 branch、base/head SHA、改动文件、验证命令与结果。即使本地
+`build/PipiUI.app` 可运行，也只能声称「worker verification passed」，不得声称
+已交付、已安装或用户可通过 Launchpad 打开最新版。
 
-## 4. 禁止「半完成」话术
+## 4. Integration ship 验收（强制）
 
-- **Do not** tell the user "done / ready to open app" if only `.build/debug` (or bare `swift build`) succeeded and `.app` is older than sources.
-- 仅 `swift build` / `swift run` 成功而 `.app` 仍旧时，**不得**说「完成 / 可以打开 App 了」。
-- 仅 `build/PipiUI.app` 更新而 `/Applications/PipiUI.app` 仍旧时，同样不算完成。
+集成负责人串行 merge；每次 merge 后运行相关测试。全部通过后，在 clean 的
+integration worktree 中执行：
 
-## 5. 开发 vs 交付
+```bash
+./scripts/ship-app.sh
+```
 
-| 用途 | 命令 |
-|------|------|
-| 快速调试 | `swift run` / `swift build -c debug` |
-| 可双击 / 给用户打开的 App | `./make-app.sh`（release 打包 + 安装到应用程序） |
+脚本会拒绝 worker/detached 分支、tracked 或 untracked 脏状态、已有锁与模糊
+安装路径；随后运行测试与本地打包、安装 canonical App，并验证 build 与
+Applications 二进制 SHA-256 相同及打印时间戳。不得静默删除 stale/foreign lock。
 
-Prefer release package via `make-app.sh` for the double-clickable app. `swift run` is for quick debug only.
+只有成功的 `ship-app.sh` 输出才支持「已交付 / 可以打开 App」的结论。
+
+## 5. 冲突与清理
+
+- 只允许集成负责人解决 merge 冲突；业务语义冲突应基于最新 integration head
+  新建修复 worktree，不让两个 AI 同时抢修。
+- 未确认 merge 成功前不得删除 worker branch/worktree。
+- 禁止用 `git reset --hard`、`git clean`、`git restore` 或 stash 处理别人的改动。
+- 遇到意外 dirty files、分支或同文件并行编辑时，停止并报告，不得自行清理。
 
 ## 6. 其它质量底线（简）
 
-- 改动业务逻辑 / 解析 / 状态机时：尽量跑 `swift test` 或 `swift run PipiUITestRunner`（环境无 XCTest 时用后者）；`./scripts/build-app.sh` 默认会先测。
-- 不破坏现有 `make-app.sh` 行为；脚本保持 `set -e` 与可执行位。
-- 声称完成前：有命令级证据（构建/打包/安装输出 + 双路径时间戳），禁止口头「应该好了」。
+- 改动业务逻辑 / 解析 / 状态机时运行 `swift test`；环境无 XCTest 时记录并使用
+  `swift run PipiUITestRunner`。
+- 构建脚本保持 `set -e` / `set -euo pipefail` 与可执行位。
+- 声称完成前必须有命令级证据，禁止口头「应该好了」。
 
 ---
 
-**权威产物路径：** `build/PipiUI.app`（仓库产物）· `/Applications/PipiUI.app`（用户启动）  
-**入口脚本：** `./make-app.sh` · `./scripts/build-app.sh`  
+**Worker 产物：** 每个 worktree 自己的 `build/PipiUI.app`
+
+**权威用户产物：** `/Applications/PipiUI.app`（仅 `ship-app.sh` 可更新）
+
+**入口脚本：** `new-ai-worktree.sh` · `verify-worker.sh` · `ship-app.sh`
+
 **Agent 入口：** 见根目录 `AGENTS.md`

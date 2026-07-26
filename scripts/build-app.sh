@@ -1,7 +1,6 @@
 #!/bin/bash
-# Test (optional) then package build/PipiUI.app via make-app.sh
-# (make-app also installs /Applications/PipiUI.app).
-# See CONSTITUTION.md — 编译通过即打包.
+# Test (optional) then package the worktree-local build/PipiUI.app.
+# This script never installs /Applications/PipiUI.app.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -14,9 +13,10 @@ for arg in "$@"; do
 Usage: ./scripts/build-app.sh [--skip-tests]
 
   Runs swift test (unless --skip-tests), then ./make-app.sh
-  (release → build/PipiUI.app + install /Applications/PipiUI.app).
+  (release → worktree-local build/PipiUI.app).
 
-  Canonical ship path per CONSTITUTION.md. For debug-only iteration use: swift run
+  This is worker-safe and never writes /Applications.
+  For canonical integration delivery use: ./scripts/ship-app.sh
 EOF
       exit 0
       ;;
