@@ -170,6 +170,7 @@ struct SidebarView: View {
         let isExpanded = expandedProjectPaths.contains(project.path)
         let isPinned = store.isProjectPinned(project)
         let displayName = store.projectDisplayName(for: project)
+        let sessionCount = store.sessionsByProject[project.path]?.count ?? 0
         HStack(spacing: 6) {
             Button {
                 selectAndToggleProject(project, wasSelected: isSelected, wasExpanded: isExpanded)
@@ -186,8 +187,6 @@ struct SidebarView: View {
                             .accessibilityLabel("已置顶项目")
                     }
                     Spacer(minLength: 0)
-                    Text("\(store.sessionsByProject[project.path]?.count ?? 0)")
-                        .foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -195,6 +194,8 @@ struct SidebarView: View {
             .accessibilityLabel("\(isExpanded ? "收起" : "展开")项目\(displayName)")
 
             Menu {
+                Text("共 \(sessionCount) 个会话")
+                Divider()
                 Button(isPinned ? "取消置顶项目" : "置顶项目") {
                     store.toggleProjectPin(project)
                 }
