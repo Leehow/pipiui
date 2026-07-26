@@ -145,6 +145,7 @@ final class ComputerCoordinator: ObservableObject {
         @Sendable () -> ComputerApplicationIdentity?
     let targetProcessValidator:
         @Sendable (ComputerApplicationIdentity) -> Bool
+    let approvalClock: @Sendable () -> Date
     let inputSynth: ComputerInputSynth
 
     init(
@@ -158,12 +159,14 @@ final class ComputerCoordinator: ObservableObject {
             @escaping @Sendable (ComputerApplicationIdentity) -> Bool = {
                 ComputerFrontmostApplication.isRunning($0)
             },
+        approvalClock: @escaping @Sendable () -> Date = { Date() },
         inputSynth: ComputerInputSynth = .shared
     ) {
         self.supportsInputMonitoring = supportsInputMonitoring
         self.supportsRefocusPolling = supportsRefocusPolling
         self.frontmostApplicationProvider = frontmostApplicationProvider
         self.targetProcessValidator = targetProcessValidator
+        self.approvalClock = approvalClock
         self.inputSynth = inputSynth
     }
 

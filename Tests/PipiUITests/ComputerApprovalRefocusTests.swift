@@ -175,14 +175,47 @@ final class ComputerApprovalRefocusTests: XCTestCase {
         XCTAssertEqual(contextProbe.denials, 1)
     }
 
+    func testValidationCrossingAbsoluteExpiryDeniesWithoutStarting() {
+        let expiresAt = Date(timeIntervalSince1970: 402)
+        let clock = LockedApprovalClock(
+            Date(timeIntervalSince1970: 401.999)
+        )
+        let frontmost = LockedFrontmostApplication(target)
+        let coordinator = makeCoordinator(
+            frontmost,
+            approvalClock: { clock.current() }
+        )
+        let probe = ApprovalProbe()
+        let approval = installPending(
+            on: coordinator,
+            probe: probe,
+            expiresAt: expiresAt,
+            phase: .approvedAwaitingTargetRefocus,
+            validateContext: {
+                clock.set(Date(timeIntervalSince1970: 402.001))
+            }
+        )
+
+        XCTAssertFalse(coordinator.evaluateApprovedWriteRefocus(
+            approvalID: approval.id,
+            now: Date(timeIntervalSince1970: 401.999)
+        ))
+        XCTAssertEqual(probe.starts, 0)
+        XCTAssertEqual(probe.denials, 1)
+        XCTAssertNil(coordinator.pendingWriteApproval)
+        XCTAssertNil(coordinator.pendingWriteContinuation)
+    }
+
     private func makeCoordinator(
-        _ frontmost: LockedFrontmostApplication
+        _ frontmost: LockedFrontmostApplication,
+        approvalClock: @escaping @Sendable () -> Date = { .distantPast }
     ) -> ComputerCoordinator {
         ComputerCoordinator(
             supportsInputMonitoring: false,
             supportsRefocusPolling: false,
             frontmostApplicationProvider: { frontmost.current() },
-            targetProcessValidator: { _ in true }
+            targetProcessValidator: { _ in true },
+            approvalClock: approvalClock
         )
     }
 
@@ -191,6 +224,7 @@ final class ComputerApprovalRefocusTests: XCTestCase {
         on coordinator: ComputerCoordinator,
         probe: ApprovalProbe,
         expiresAt: Date,
+        phase: ComputerCoordinator.PendingWriteApproval.Phase = .awaitingUserDecision,
         validateContext: @escaping () throws -> Void = {}
     ) -> ComputerCoordinator.PendingWriteApproval {
         let approval = ComputerCoordinator.PendingWriteApproval(
@@ -201,7 +235,7 @@ final class ComputerApprovalRefocusTests: XCTestCase {
             actionKinds: [.type],
             targetApplication: target,
             expiresAt: expiresAt,
-            phase: .awaitingUserDecision
+            phase: phase
         )
         coordinator.pendingWriteApproval = approval
         coordinator.pendingWriteContinuation = .init(
@@ -238,4 +272,21 @@ private final class LockedFrontmostApplication: @unchecked Sendable {
 private final class ApprovalProbe {
     var starts = 0
     var denials = 0
+}
+
+private final class LockedApprovalClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var now: Date
+
+    init(_ now: Date) {
+        self.now = now
+    }
+
+    func current() -> Date {
+        lock.withLock { now }
+    }
+
+    func set(_ now: Date) {
+        lock.withLock { self.now = now }
+    }
 }

@@ -244,6 +244,11 @@ extension ComputerCoordinator {
             if scheduleNext { scheduleWriteRefocusCheck(approvalID: approvalID) }
             return false
         }
+        guard approvalClock() < approval.expiresAt else {
+            let reason = "approved desktop batch expired while awaiting target refocus"
+            resolvePendingWrite(approvalID: approvalID, reason: reason)
+            return false
+        }
 
         clearPendingWriteState()
         statusMessage = "已回到精确目标进程，开始执行批准的桌面动作。"
