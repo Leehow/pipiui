@@ -27,9 +27,8 @@ struct SidebarView: View {
                 .padding(.horizontal, Self.sidebarGutter + 2)
                 .padding(.top, 14)
                 .padding(.bottom, 10)
-            // ScrollView — not List.sidebar. AppKit NSTableView scrollers ignore
-            // `.scrollIndicators(.hidden)` / hasVerticalScroller=false and keep a fat
-            // legacy track that expands on hover and flips column insets (忽大忽小).
+            // ScrollView keeps the sidebar's manual-scroll behavior while the
+            // hidden indicator avoids reserving a wide AppKit track on hover.
             // Selection chrome is drawn by SessionRowContainer.background.
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
@@ -39,10 +38,8 @@ struct SidebarView: View {
                 }
                 .padding(.horizontal, Self.sidebarGutter)
                 .padding(.vertical, 8)
-                // Inside the document so enclosingScrollView resolves.
-                .overlayScrollers()
             }
-            .scrollIndicators(.automatic)
+            .scrollIndicators(.hidden)
             .clipShape(Rectangle())
         }
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
@@ -169,6 +166,7 @@ struct SidebarView: View {
     private func projectFolderRow(_ project: URL) -> some View {
         let isSelected = project.path == store.selectedProjectPath
         let isExpanded = expandedProjectPaths.contains(project.path)
+        let isPinned = store.isProjectPinned(project)
         let displayName = store.projectDisplayName(for: project)
         HStack(spacing: 6) {
             Button {
@@ -179,6 +177,12 @@ struct SidebarView: View {
                         .foregroundStyle(isSelected ? Color.accentColor : .secondary)
                     Text(displayName)
                         .fontWeight(isSelected ? .semibold : .regular)
+                    if isPinned {
+                        Image(systemName: "pin.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("已置顶项目")
+                    }
                     Spacer(minLength: 0)
                     Text("\(store.sessionsByProject[project.path]?.count ?? 0)")
                         .foregroundStyle(.tertiary)
@@ -189,7 +193,7 @@ struct SidebarView: View {
             .accessibilityLabel("\(isExpanded ? "收起" : "展开")项目\(displayName)")
 
             Menu {
-                Button(store.isProjectPinned(project) ? "取消置顶项目" : "置顶项目") {
+                Button(isPinned ? "取消置顶项目" : "置顶项目") {
                     store.toggleProjectPin(project)
                 }
                 Button("在 Finder 中显示") {
@@ -208,6 +212,7 @@ struct SidebarView: View {
                     .frame(width: 20, height: 20)
             }
             .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
             .help("项目菜单")
             .accessibilityLabel("项目菜单\(displayName)")
 
