@@ -45,6 +45,8 @@ const PIPIUI_PARENT = process.env.PIPIUI_AGENT_ID || null;
 const PIPIUI_MAX_DEPTH = Number.parseInt(process.env.PIPIUI_AGENT_MAX_DEPTH || "2", 10);
 // App 注入的补丁版 subagent 扩展目录；嵌套 spawn 时再传 `-e`，保持上报/护栏一致
 const PIPIUI_SUBAGENT_EXT = process.env.PIPIUI_SUBAGENT_EXT;
+// App-owned search guard; children load the same code and inherit the human-turn grant file.
+const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
 const PIPIUI_PLAN_SKILL_ISOLATION = process.env.PIPIUI_PLAN_SKILL_ISOLATION === "1";
 
 // 跟踪本扩展 spawn 出的子 pi，父进程退出时尽量收割，避免孤儿继续打桥接
@@ -1417,6 +1419,7 @@ async function runSingleAgent(
 	if (agentName === "plan") args.push("--no-skills");
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
+	if (PIPIUI_SEARCH_SCOPE_EXT) args.push("-e", PIPIUI_SEARCH_SCOPE_EXT);
 	// A new explicit thinking override wins over Pi's older `model:thinking` shorthand.
 	// Strip only a recognized shorthand suffix, preserving other colon-containing model ids.
 	if (resolvedModel) args.push("--model", resolvedThinking ? stripModelThinkingSuffix(resolvedModel) : resolvedModel);
