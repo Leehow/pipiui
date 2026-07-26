@@ -318,7 +318,7 @@ private struct AgentDetailView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("将强制删除该 agent 的 worktree，不会合并进主分支；含独有提交的分支会保留供人工处置。此操作不可撤销。")
+            Text("将强制删除该 agent 的 worktree，不会合并进主分支；对应的 pipiui/agent-* 内部分支也会删除，即使含独有提交。非内部分支会保留。此操作不可撤销。")
         }
     }
 

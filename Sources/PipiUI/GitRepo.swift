@@ -832,6 +832,46 @@ package enum GitRepo {
         }
     }
 
+    /// Force-delete a runtime-owned branch only after the user has explicitly confirmed
+    /// discarding its worktree. This is intentionally separate from automatic closeout:
+    /// unique commits may be destroyed here, but never for non-internal or still-registered refs.
+    package static func forceDeleteInternalAgentBranchAfterConfirmedDiscard(
+        _ branch: String,
+        persistedWorktreePath: String? = nil,
+        in workTree: URL
+    ) -> String? {
+        let state = reconcileAgentBranch(
+            branch,
+            persistedWorktreePath: persistedWorktreePath,
+            in: workTree
+        )
+        switch state.disposition {
+        case .alreadyAbsent:
+            return nil
+        case .eligible, .retainedUniqueCommits:
+            guard state.isInternal, state.branchExists,
+                  state.registeredWorktreePath == nil else {
+                return "无法确认内部分支已脱离 worktree；已保留"
+            }
+            do {
+                let name = try validatedRefName(branch, label: "分支名")
+                _ = try run(gitArgs: ["branch", "-D", name], in: workTree)
+                return nil
+            } catch {
+                let detail = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                return "显式丢弃后的内部分支删除失败；已保留: \(detail)"
+            }
+        case .retainedNonInternal:
+            return "分支不属于 pipiui/agent-*；已保留供人工处置"
+        case .retainedRegisteredWorktree(let path, let dirty):
+            let suffix = dirty ? "且含未提交改动" : ""
+            return "分支仍注册在 worktree \(path)\(suffix)；已保留"
+        case .blocked(let detail):
+            return "无法确认分支可按显式丢弃删除；已保留: \(detail)"
+        }
+    }
+
     fileprivate static func cleanupWarning(
         for state: AgentBranchReconciliation
     ) -> String {

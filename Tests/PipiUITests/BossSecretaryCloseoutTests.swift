@@ -24,6 +24,8 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         XCTAssertTrue(runtime.contains("PIPIUI_MAIN_CWD || opts.defaultCwd"))
         XCTAssertTrue(runtime.contains("t !== \"subagent\""))
         XCTAssertTrue(runtime.contains("PIPIUI_AGENT_NO_DELEGATION: \"1\""))
+        XCTAssertTrue(runtime.contains("secretaryToolCallBlock"))
+        XCTAssertTrue(runtime.contains("pi.on(\"tool_call\""))
 
         let definition = try String(
             contentsOf: root.appendingPathComponent(
@@ -122,6 +124,180 @@ final class BossSecretaryCloseoutTests: XCTestCase {
             GitRepo.reconcileAgentBranch(external, in: repo).disposition,
             .retainedNonInternal
         )
+    }
+
+    func testConfirmedDiscardDeletesInternalUniqueBranchButRetainsNonInternal() async throws {
+        let (repo, cleanup) = try makeRepository()
+        defer { cleanup() }
+
+        let internalBranch = "pipiui/agent-confirmed-discard"
+        let internalWorktree = repo.appendingPathComponent(
+            "confirmed-discard-wt",
+            isDirectory: true
+        )
+        try GitRepo.worktreeAdd(branch: internalBranch, at: internalWorktree, in: repo)
+        try "unique\n".write(
+            to: internalWorktree.appendingPathComponent("unique-discard.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try GitRepo.run(gitArgs: ["add", "unique-discard.txt"], in: internalWorktree)
+        _ = try GitRepo.run(gitArgs: ["commit", "-m", "unique discard"], in: internalWorktree)
+
+        let internalStore = SubagentStore()
+        internalStore.bindMainProject(repo)
+        internalStore.handle(startEvent(
+            id: "confirmed-discard",
+            path: internalWorktree.path,
+            branch: internalBranch
+        ))
+        internalStore.handle(J(endEvent(
+            id: "confirmed-discard",
+            path: internalWorktree.path,
+            branch: internalBranch,
+            ok: false
+        )))
+        let internalDiscardError = await internalStore.discardWorktree(
+            agentId: "confirmed-discard",
+            mainProjectURL: repo
+        )
+        XCTAssertNil(internalDiscardError)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: internalWorktree.path))
+        XCTAssertThrowsError(
+            try GitRepo.run(
+                gitArgs: ["show-ref", "--verify", "--quiet", "refs/heads/\(internalBranch)"],
+                in: repo
+            )
+        )
+        XCTAssertEqual(internalStore.agents.first?.closeoutDisposition, .cleaned)
+
+        let externalBranch = "feature/confirmed-discard-retained"
+        let externalWorktree = repo.appendingPathComponent(
+            "external-discard-wt",
+            isDirectory: true
+        )
+        try GitRepo.worktreeAdd(branch: externalBranch, at: externalWorktree, in: repo)
+        try "external\n".write(
+            to: externalWorktree.appendingPathComponent("external-discard.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try GitRepo.run(gitArgs: ["add", "external-discard.txt"], in: externalWorktree)
+        _ = try GitRepo.run(gitArgs: ["commit", "-m", "external discard"], in: externalWorktree)
+
+        let externalStore = SubagentStore()
+        externalStore.bindMainProject(repo)
+        externalStore.handle(startEvent(
+            id: "external-discard",
+            path: externalWorktree.path,
+            branch: externalBranch
+        ))
+        externalStore.handle(J(endEvent(
+            id: "external-discard",
+            path: externalWorktree.path,
+            branch: externalBranch,
+            ok: false
+        )))
+        let externalDiscardError = await externalStore.discardWorktree(
+            agentId: "external-discard",
+            mainProjectURL: repo
+        )
+        XCTAssertNil(externalDiscardError)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: externalWorktree.path))
+        XCTAssertNoThrow(
+            try GitRepo.run(
+                gitArgs: ["show-ref", "--verify", "--quiet", "refs/heads/\(externalBranch)"],
+                in: repo
+            )
+        )
+        XCTAssertEqual(externalStore.agents.first?.closeoutDisposition, .retained)
+        XCTAssertTrue(externalStore.agents.first?.worktreeError?.contains("不属于") == true)
+    }
+
+    func testSecretaryRuntimePolicyBlocksOutOfScopeWritesAndDestructiveShell() throws {
+        let node = Process()
+        node.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        let root = repositoryRoot()
+        let policy = root.appendingPathComponent(
+            "Sources/PipiUI/PiExt/subagent/secretary-policy.ts"
+        )
+        let main = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "pipiui-secretary-policy-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let boss = main.appendingPathComponent(".pi/boss", isDirectory: true)
+        let outside = main.appendingPathComponent("outside", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: main) }
+        try FileManager.default.createDirectory(at: boss, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: boss.appendingPathComponent("escape"),
+            withDestinationURL: outside
+        )
+
+        node.arguments = [
+            "node",
+            "--experimental-strip-types",
+            "--input-type=module",
+            "--eval",
+            #"""
+            import assert from "node:assert/strict";
+            import path from "node:path";
+            const { secretaryToolCallBlock } = await import(process.env.POLICY_MODULE);
+            const main = process.env.SECRETARY_MAIN;
+            const call = (toolName, input, role = "closeout-secretary") =>
+                secretaryToolCallBlock(role, { toolName, input }, main);
+
+            assert.equal(call("write", { file_path: path.join(main, ".pi/boss/state.json") }), undefined);
+            assert.equal(call("edit", { path: path.join(main, ".pi/boss/nested/report.md") }), undefined);
+            assert.ok(call("write", {}));
+            assert.ok(call("edit", { file_path: "relative.md" }));
+            assert.ok(call("write", { file_path: path.join(main, "outside/report.md") }));
+            assert.ok(call("write", { file_path: `${main}/.pi/boss/../escape.md` }));
+            assert.ok(call("write", { file_path: path.join(main, ".pi/boss/escape/report.md") }));
+
+            for (const command of [
+                "git clean -fd",
+                `git -C "${main}" reset --hard`,
+                "git restore .",
+                "git checkout -- file",
+                "git stash",
+                "git merge topic",
+                "git cherry-pick HEAD",
+                "git rebase main",
+                "git push origin main",
+                "git branch -D pipiui/agent-old",
+                "rm -rf .pi/boss/old",
+                "  rm -rf .pi/boss/old",
+                "find . -delete",
+            ]) assert.ok(call("bash", { command }), command);
+
+            for (const command of [
+                "git status --short",
+                "git log -1 --oneline",
+                "git worktree list --porcelain",
+                "git branch -d pipiui/agent-old",
+            ]) assert.equal(call("bash", { command }), undefined, command);
+
+            assert.equal(
+                call("write", { file_path: path.join(main, "outside/worker.md") }, "worker"),
+                undefined,
+            );
+            """#,
+        ]
+        var environment = ProcessInfo.processInfo.environment
+        environment["POLICY_MODULE"] = policy.absoluteString
+        environment["SECRETARY_MAIN"] = main.path
+        node.environment = environment
+        let stderr = Pipe()
+        node.standardError = stderr
+        try node.run()
+        node.waitUntilExit()
+        let errorText = String(
+            data: stderr.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+        XCTAssertEqual(node.terminationStatus, 0, errorText)
     }
 
     func testSuccessfulMergeRemovesWorktreeAndInternalBranch() async throws {

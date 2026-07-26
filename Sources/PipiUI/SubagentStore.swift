@@ -1115,8 +1115,9 @@ final class SubagentStore: ObservableObject {
         }
     }
 
-    /// Force-remove an explicitly discarded worktree. Its branch is deleted only when
-    /// the same non-force safety gate proves it merged; unique commits remain retained.
+    /// Force-remove an explicitly discarded worktree. The separately confirmed UI action
+    /// may also force-delete its now-unregistered runtime-owned branch, including unique commits.
+    /// Non-internal branches and any branch still registered to a worktree remain retained.
     /// Threading: 同 `mergeWorktree` —— git 后台跑，状态主线程收尾并 re-check。
     @MainActor
     @discardableResult
@@ -1155,13 +1156,12 @@ final class SubagentStore: ObservableObject {
                 }
             }
             if let branch, !branch.isEmpty, !branch.hasPrefix("-") {
-                let cleanup = GitRepo.safelyDeleteMergedAgentBranch(
+                let warning = GitRepo.forceDeleteInternalAgentBranchAfterConfirmedDiscard(
                     branch,
                     persistedWorktreePath: pathStr,
-                    integrationRef: "HEAD",
                     in: main
                 )
-                return (nil, cleanup.warning)
+                return (nil, warning)
             }
             return (nil, nil)
         }.value
@@ -1178,7 +1178,7 @@ final class SubagentStore: ObservableObject {
             } else {
                 agents[idx].worktreeError = nil
                 agents[idx].closeoutDisposition = .cleaned
-                agents[idx].closeoutReason = "已按用户确认丢弃 worktree，并安全清理已合并内部分支"
+                agents[idx].closeoutReason = "已按用户确认丢弃 worktree，并删除对应内部分支"
             }
             scheduleSave()
         }
