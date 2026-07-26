@@ -302,6 +302,50 @@ struct InitialTranscriptBuild: Equatable {
     var skipNextAssistantIngest: Bool
 }
 
+struct InitialTranscriptReconciliation: Equatable {
+    var items: [ChatItem]
+    var toolRuns: [String: ToolRun]
+    var itemCounter: Int
+    var appendedLiveItemCount: Int
+}
+
+enum InitialTranscriptReconciler {
+    /// Replace an offline preview with authoritative history while preserving app-only/user
+    /// bubbles appended after the preview was published.
+    static func reconcile(
+        authoritative: InitialTranscriptBuild,
+        currentItems: [ChatItem],
+        currentToolRuns: [String: ToolRun],
+        currentItemCounter: Int,
+        previewItemCount: Int,
+        previewToolRunIDs: Set<String>
+    ) -> InitialTranscriptReconciliation {
+        let previewCount = min(max(0, previewItemCount), currentItems.count)
+        let extras = Array(currentItems.dropFirst(previewCount))
+        var counter = max(currentItemCounter, authoritative.itemCounter)
+        let rebasedExtras = extras.map { item in
+            counter += 1
+            return ChatItem(
+                id: "item-\(counter)",
+                role: item.role,
+                blocks: item.blocks,
+                entryId: item.entryId,
+                isLocalOnly: item.isLocalOnly
+            )
+        }
+        var mergedRuns = authoritative.toolRuns
+        for (toolCallID, run) in currentToolRuns where !previewToolRunIDs.contains(toolCallID) {
+            mergedRuns[toolCallID] = run
+        }
+        return InitialTranscriptReconciliation(
+            items: authoritative.items + rebasedExtras,
+            toolRuns: mergedRuns,
+            itemCounter: counter,
+            appendedLiveItemCount: rebasedExtras.count
+        )
+    }
+}
+
 /// One live pi RPC session bound to a project directory.
 /// Published state is mutated on the main thread (PiProcess delivers callbacks there).
 /// Heavy initial transcript conversion (image disk/base64) may run off-main before a single assign.
@@ -490,6 +534,11 @@ final class ChatSession: ObservableObject, Identifiable {
     private var deferredInitialEvents: [J] = []
     private var cachedBranchMessages: [J] = []
     private var cachedLeafId: String?
+    /// Offline preview state is replaced (not appended as optimistic live content) once
+    /// authoritative get_messages completes.
+    private var initialPreviewItemCount = 0
+    private var initialPreviewToolRunIDs: Set<String> = []
+    private var processStartCancelled = false
 
     init(id: String, projectURL: URL, sessionPath: String?,
          bridgePort: UInt16 = 0,
@@ -504,7 +553,8 @@ final class ChatSession: ObservableObject, Identifiable {
          subagentDir: String? = nil,
          agentsDir: String? = nil,
          bossPromptPath: String? = nil,
-         blockedReason: String? = nil) {
+         blockedReason: String? = nil,
+         initialTranscript: InitialTranscriptBuild? = nil) {
         self.id = id
         self.projectURL = projectURL
         self.resumedFromDisk = sessionPath != nil
@@ -546,6 +596,16 @@ final class ChatSession: ObservableObject, Identifiable {
         }
         if let sessionPath, InterruptedSessionStore.contains(sessionPath) {
             hasUnseenInterruption = true
+        }
+        if let initialTranscript {
+            transcript = initialTranscript.items
+            toolRuns = initialTranscript.toolRuns
+            itemCounter = initialTranscript.itemCounter
+            skipNextAssistantIngest = initialTranscript.skipNextAssistantIngest
+            initialPreviewItemCount = initialTranscript.items.count
+            initialPreviewToolRunIDs = Set(initialTranscript.toolRuns.keys)
+            // History can render while model/command/composer readiness continues.
+            isInitializing = false
         }
 
         // 已知会必然崩的启动条件（例如扩展撞名）就别 spawn 了：
@@ -601,7 +661,19 @@ final class ChatSession: ObservableObject, Identifiable {
         // T17: ~/.pi/agent/.env 注入（GUI app 从 Finder 启动没有 shell 环境）。
         // .env 在底层，PIPIUI_* 内部键绝不被 .env 覆盖；不得在日志打印这些键值。
         let spawnEnv = Self.mergedSpawnEnv(dotEnv: Self.dotEnvStore.all(), internal: extraEnv)
-        guard let proc = PiProcess(cwd: projectURL, arguments: args, extraEnv: spawnEnv) else {
+        if initialTranscript != nil {
+            // Let AppStore publish the cached transcript before process construction starts.
+            DispatchQueue.main.async { [weak self] in
+                self?.startProcess(arguments: args, environment: spawnEnv)
+            }
+        } else {
+            startProcess(arguments: args, environment: spawnEnv)
+        }
+    }
+
+    private func startProcess(arguments: [String], environment: [String: String]) {
+        guard !processStartCancelled, proc == nil else { return }
+        guard let proc = PiProcess(cwd: projectURL, arguments: arguments, extraEnv: environment) else {
             lastError = "找不到 pi 可执行文件（试过 ~/.npm-global/bin、/opt/homebrew/bin 等）"
             processAlive = false
             isInitializing = false
@@ -765,20 +837,14 @@ final class ChatSession: ObservableObject, Identifiable {
             let success = resp["success"].bool ?? true
             let rpcMs = Double(DispatchTime.now().uptimeNanoseconds - requestedAt.uptimeNanoseconds) / 1_000_000
             Log.info("initial load: get_messages returned \(messages.count) msgs in \(Int(rpcMs))ms", category: .session)
+            guard success else {
+                self.finishInitialMessagesLoadWithoutReplacement(generation: generation)
+                return
+            }
 
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let buildStart = DispatchTime.now()
-                let built: InitialTranscriptBuild
-                if success {
-                    built = Self.buildTranscript(from: messages)
-                } else {
-                    built = InitialTranscriptBuild(
-                        items: [],
-                        toolRuns: [:],
-                        itemCounter: 0,
-                        skipNextAssistantIngest: false
-                    )
-                }
+                let built = Self.buildTranscript(from: messages)
                 let buildMs = Double(DispatchTime.now().uptimeNanoseconds - buildStart.uptimeNanoseconds) / 1_000_000
                 let imageCount = built.items.reduce(0) { $0 + Self.imageCount(of: $1) }
                 Log.info(
@@ -792,41 +858,46 @@ final class ChatSession: ObservableObject, Identifiable {
         }
     }
 
+    /// A failed get_messages response is not authoritative. Keep the validated preview and
+    /// optimistic bubbles, then replay any live events that arrived during the request.
+    private func finishInitialMessagesLoadWithoutReplacement(generation: UInt64) {
+        guard generation == initialLoadGeneration, awaitingInitialTranscript else { return }
+        initialPreviewItemCount = 0
+        initialPreviewToolRunIDs.removeAll(keepingCapacity: false)
+        awaitingInitialTranscript = false
+        isInitializing = false
+        let deferred = deferredInitialEvents
+        deferredInitialEvents.removeAll(keepingCapacity: false)
+        for event in deferred {
+            handleEvent(event)
+        }
+        syncEntryIds()
+    }
+
     /// Apply a background-built history once; drop if generation is stale (session recycled / re-load).
     private func applyInitialTranscript(_ built: InitialTranscriptBuild, generation: UInt64) {
         guard generation == initialLoadGeneration else { return }
         guard awaitingInitialTranscript else { return }
 
-        // Optimistic local bubbles (rare: user sent while history still loading) stay after history.
-        // Re-id them so they cannot collide with history `item-N` ids from the build.
-        let extras = transcript
-        var counter = max(itemCounter, built.itemCounter)
-        let rebasedExtras: [ChatItem] = extras.map { item in
-            counter += 1
-            return ChatItem(
-                id: "item-\(counter)",
-                role: item.role,
-                blocks: item.blocks,
-                entryId: item.entryId,
-                isLocalOnly: item.isLocalOnly
-            )
-        }
-
-        itemCounter = counter
+        let reconciled = InitialTranscriptReconciler.reconcile(
+            authoritative: built,
+            currentItems: transcript,
+            currentToolRuns: toolRuns,
+            currentItemCounter: itemCounter,
+            previewItemCount: initialPreviewItemCount,
+            previewToolRunIDs: initialPreviewToolRunIDs
+        )
+        itemCounter = reconciled.itemCounter
         skipNextAssistantIngest = built.skipNextAssistantIngest
-
-        // History toolRuns first; any live runs already on self win (should be empty while gated).
-        var mergedRuns = built.toolRuns
-        for (tid, run) in toolRuns {
-            mergedRuns[tid] = run
-        }
-        toolRuns = mergedRuns
-        if !built.toolRuns.isEmpty || !rebasedExtras.isEmpty {
+        toolRuns = reconciled.toolRuns
+        if !built.toolRuns.isEmpty || reconciled.appendedLiveItemCount > 0 {
             toolOutputVersion &+= 1
         }
 
         // Single assignment — avoid per-message @Published churn.
-        transcript = built.items + rebasedExtras
+        transcript = reconciled.items
+        initialPreviewItemCount = 0
+        initialPreviewToolRunIDs.removeAll(keepingCapacity: false)
 
         awaitingInitialTranscript = false
         isInitializing = false
@@ -1371,7 +1442,10 @@ final class ChatSession: ObservableObject, Identifiable {
 
     /// Pure history build for `get_messages` (call off main: disk read + base64 in `parseImageBlock` / hydrate).
     /// Preserves message order; mirrors `ingest` including ghost-title skip and toolResult → toolRuns.
-    package static func buildTranscript(from messages: [J]) -> InitialTranscriptBuild {
+    package static func buildTranscript(
+        from messages: [J],
+        loadImageData: Bool = true
+    ) -> InitialTranscriptBuild {
         var items: [ChatItem] = []
         var toolRuns: [String: ToolRun] = [:]
         var itemCounter = 0
@@ -1391,15 +1465,25 @@ final class ChatSession: ObservableObject, Identifiable {
                     continue
                 }
                 skipNextAssistantIngest = false
-                if let raw = convert(message: message, id: nextId()), !raw.blocks.isEmpty {
-                    items.append(hydrateUserImagesIfNeeded(raw))
+                if let raw = convert(
+                    message: message,
+                    id: nextId(),
+                    allowDiskRead: loadImageData
+                ), !raw.blocks.isEmpty {
+                    items.append(
+                        loadImageData ? hydrateUserImagesIfNeeded(raw) : raw
+                    )
                 }
             case "assistant":
                 if skipNextAssistantIngest {
                     skipNextAssistantIngest = false
                     continue
                 }
-                if let item = convert(message: message, id: nextId()) {
+                if let item = convert(
+                    message: message,
+                    id: nextId(),
+                    allowDiskRead: loadImageData
+                ) {
                     items.append(item)
                 }
             case "toolResult":
@@ -1409,7 +1493,7 @@ final class ChatSession: ObservableObject, Identifiable {
                         isRunning: false,
                         isError: message["isError"].bool ?? false,
                         output: contentText(content),
-                        images: contentImages(content)
+                        images: contentImages(content, allowDiskRead: loadImageData)
                     )
                 }
             case "bashExecution":
@@ -2506,6 +2590,7 @@ final class ChatSession: ObservableObject, Identifiable {
     /// If `onExited` is provided, it runs once on the main thread after the process exits or after ~2s timeout
     /// (so restart can spawn without concurrent .jsonl writers).
     func shutdown(onExited: (() -> Void)? = nil) {
+        processStartCancelled = true
         cancelSideChannelTitle()
         unbindQuotaMonitor()
         subagents.saveNow()

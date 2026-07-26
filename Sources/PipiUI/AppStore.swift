@@ -24,6 +24,7 @@ final class AppStore: ObservableObject {
         didSet {
             guard selectedProjectPath != oldValue else { return }
             UserDefaults.standard.set(selectedProjectPath, forKey: Self.lastProjectKey)
+            scheduleHistoryPreload()
         }
     }
     @Published var sessionsByProject: [String: [SessionMeta]] = [:]
@@ -104,6 +105,8 @@ final class AppStore: ObservableObject {
 
     private var bridge: BridgeServer?
     private var plugin = PiPlugin.Installed()
+    /// Immutable JSONL snapshots only. This cache never constructs ChatSession/PiProcess.
+    private let historyPreloader = SessionHistoryPreloader()
 
     /// Boss 模式：新会话以「大组长」协议启动（不亲自干活，全部派 subagent）
     @Published var bossModeEnabled: Bool = UserDefaults.standard.object(forKey: "pipiui.bossMode") as? Bool ?? true {
@@ -218,6 +221,9 @@ final class AppStore: ObservableObject {
             }
         }
 
+        let preloadedTranscript = sessionPath.flatMap {
+            historyPreloader.snapshotIfCurrent(path: $0)?.transcript
+        }
         let session = ChatSession(
             id: key, projectURL: project, sessionPath: sessionPath,
             bridgePort: bridge?.port ?? 0,
@@ -233,7 +239,8 @@ final class AppStore: ObservableObject {
             agentsDir: plugin.agentsDir,
             bossPromptPath: bossModeEnabled ? plugin.bossPrompt : nil,
             blockedReason: conflicts.isEmpty ? nil
-                : "扩展撞名，pi 未启动。修复上方冲突后会自动重启会话。"
+                : "扩展撞名，pi 未启动。修复上方冲突后会自动重启会话。",
+            initialTranscript: preloadedTranscript
         )
         session.onSessionMetaChanged = { [weak self, weak session] in
             guard let self, let session else { return }
@@ -468,6 +475,23 @@ final class AppStore: ObservableObject {
     /// 只有新增或 mtime 变化的文件才重新读内容解析 name/ephemeral，其余复用上次结果。
     private var sessionScanCache: [String: [String: (mtime: Date, name: String, ephemeral: Bool)]] = [:]
     private let sessionScanCacheLock = NSLock()
+    /// Avoid filling the preload queue from whichever project scan happens to finish first.
+    /// Once every configured project has one metadata result, the selected/last priorities
+    /// can be applied globally.
+    private var completedSessionScans: Set<String> = []
+
+    private func scheduleHistoryPreload() {
+        let configuredProjects = Set(projects.map(\.path))
+        guard configuredProjects.isSubset(of: completedSessionScans) else { return }
+        let candidates = SessionHistoryPreloadPlan.candidates(
+            projects: projects,
+            sessionsByProject: sessionsByProject,
+            selectedProjectPath: selectedProjectPath,
+            preferredSessionPath: UserDefaults.standard.string(forKey: Self.lastSessionFileKey),
+            archivedPaths: archivedSessionPaths
+        )
+        historyPreloader.preload(paths: candidates)
+    }
 
     func refreshSessions(for project: URL) {
         let dir = Self.sessionDirectory(forCwd: project.path)
@@ -552,6 +576,8 @@ final class AppStore: ObservableObject {
                 }
                 archivedList.sort { self.effectiveModified($0) > self.effectiveModified($1) }
                 self.archivedByProject[projectPath] = archivedList
+                self.completedSessionScans.insert(projectPath)
+                self.scheduleHistoryPreload()
             }
         }
     }
