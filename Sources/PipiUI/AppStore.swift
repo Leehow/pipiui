@@ -229,7 +229,7 @@ final class AppStore: ObservableObject {
             return AppStore.shared.openSessions.values.contains {
                 BridgeCapabilityToken.matches(candidate, expected: $0.bridgeRoutingKey)
             }
-        }) { request, respond in
+        }) { request, respond, registerCancellation in
             // Handler 已在主线程；按 sessionKey 精确路由到对应会话。
             // 未知/已关闭 key 必须拒绝，避免子 agent 孤儿请求落到「当前选中」会话上乱 eval。
             let store = AppStore.shared
@@ -251,7 +251,7 @@ final class AppStore: ObservableObject {
                 respond(["ok": true])
                 return
             }
-            if action == "computer_batch" {
+            if action == "computer_batch" || action == "computer_cancel" {
                 let computerCapability = request["computerCapability"].string ?? ""
                 guard BridgeCapabilityToken.matches(
                     computerCapability,
@@ -260,6 +260,31 @@ final class AppStore: ObservableObject {
                     respond([
                         "ok": false,
                         "error": "unauthorized computer capability",
+                    ])
+                    return
+                }
+                let requestID = request["requestID"].string ?? ""
+                if action == "computer_cancel" {
+                    ComputerCoordinator.shared.cancelRequest(
+                        requestID: requestID,
+                        sessionKey: session.bridgeRoutingKey,
+                        reason: "computer request cancelled by the pi extension"
+                    )
+                    respond(["ok": true])
+                    return
+                }
+                guard registerCancellation({
+                    Task { @MainActor in
+                        ComputerCoordinator.shared.cancelRequest(
+                            requestID: requestID,
+                            sessionKey: session.bridgeRoutingKey,
+                            reason: "computer bridge disconnected or timed out"
+                        )
+                    }
+                }) else {
+                    respond([
+                        "ok": false,
+                        "error": "computer bridge request was already cancelled",
                     ])
                     return
                 }
@@ -1148,6 +1173,7 @@ final class AppStore: ObservableObject {
     func shutdown() {
         pendingHistoricalSessionOpens.removeAll()
         ComputerCoordinator.shared.releaseAll(revokeConsent: true)
+        ComputerCoordinator.shared.shutdownInputMonitoring()
         for session in openSessions.values {
             session.subagents.saveNow()
             session.shutdown()

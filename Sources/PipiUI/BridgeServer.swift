@@ -37,16 +37,75 @@ enum BridgeRequestLimits {
     }
 }
 
-/// Minimal HTTP/1.1 JSON server on 127.0.0.1 used by the pi webview extension
-/// to drive the in-app WKWebView. Single endpoint: POST /rpc with a JSON body.
+final class BridgeRequestLifecycle: @unchecked Sendable {
+    private enum State {
+        case active
+        case completed
+        case cancelled
+    }
+
+    private let lock = NSLock()
+    private var state: State = .active
+    private var cancellation: (() -> Void)?
+
+    @discardableResult
+    func registerCancellation(_ callback: @escaping () -> Void) -> Bool {
+        let result = lock.withLock { () -> (registered: Bool, call: Bool) in
+            switch state {
+            case .active:
+                cancellation = callback
+                return (true, false)
+            case .cancelled:
+                return (false, true)
+            case .completed:
+                return (false, false)
+            }
+        }
+        if result.call { callback() }
+        return result.registered
+    }
+
+    func complete() -> Bool {
+        lock.withLock {
+            guard case .active = state else { return false }
+            state = .completed
+            cancellation = nil
+            return true
+        }
+    }
+
+    @discardableResult
+    func cancel() -> Bool {
+        let callback: (() -> Void)? = lock.withLock {
+            guard case .active = state else { return nil }
+            state = .cancelled
+            let callback = cancellation
+            cancellation = nil
+            return callback
+        }
+        callback?()
+        return callback != nil
+    }
+}
+
+/// Minimal HTTP/1.1 JSON server on 127.0.0.1 used by app-owned pi extensions.
+/// Single endpoint: POST /rpc with a bounded JSON body.
 final class BridgeServer {
     /// Handler is invoked on the main thread; call `respond` exactly once (any thread).
-    typealias Handler = (_ request: J, _ respond: @escaping ([String: Any]) -> Void) -> Void
+    typealias CancellationRegistrar = (@escaping () -> Void) -> Bool
+    typealias Handler = (
+        _ request: J,
+        _ respond: @escaping ([String: Any]) -> Void,
+        _ registerCancellation: @escaping CancellationRegistrar
+    ) -> Void
 
     private var listener: NWListener?
     private let handler: Handler
     private let authorize: ((J) -> Bool)?
     private let queue = DispatchQueue(label: "pipiui.bridge")
+    private var activeConnections: [
+        ObjectIdentifier: (NWConnection, BridgeRequestLifecycle)
+    ] = [:]
     private(set) var port: UInt16 = 0
 
     init?(
@@ -78,14 +137,36 @@ final class BridgeServer {
     }
 
     private func serve(_ connection: NWConnection) {
+        let lifecycle = BridgeRequestLifecycle()
+        let identifier = ObjectIdentifier(connection)
+        activeConnections[identifier] = (connection, lifecycle)
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection else { return }
+            switch state {
+            case .failed, .cancelled:
+                lifecycle.cancel()
+                self.queue.async {
+                    self.activeConnections.removeValue(
+                        forKey: ObjectIdentifier(connection)
+                    )
+                }
+            default:
+                break
+            }
+        }
         connection.start(queue: queue)
         queue.asyncAfter(deadline: .now() + BridgeRequestLimits.requestTimeout) {
+            lifecycle.cancel()
             connection.cancel()
         }
-        readRequest(connection, buffer: Data())
+        readRequest(connection, lifecycle: lifecycle, buffer: Data())
     }
 
-    private func readRequest(_ connection: NWConnection, buffer: Data) {
+    private func readRequest(
+        _ connection: NWConnection,
+        lifecycle: BridgeRequestLifecycle,
+        buffer: Data
+    ) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
             [weak self] data, _, isComplete, error in
             guard let self else { return }
@@ -97,13 +178,21 @@ final class BridgeServer {
             }
             switch Self.parseRequestBody(buffer) {
             case .complete(let request):
-                self.process(request, connection)
+                self.process(request, connection, lifecycle: lifecycle)
             case .invalid(let message):
-                self.reply(connection, ["ok": false, "error": message])
+                self.reply(
+                    connection,
+                    lifecycle: lifecycle,
+                    ["ok": false, "error": message]
+                )
             case .incomplete where isComplete:
                 connection.cancel()
             case .incomplete:
-                self.readRequest(connection, buffer: buffer)
+                self.readRequest(
+                    connection,
+                    lifecycle: lifecycle,
+                    buffer: buffer
+                )
             }
         }
     }
@@ -160,9 +249,17 @@ final class BridgeServer {
         return .complete(Data(body.prefix(contentLength)))
     }
 
-    private func process(_ body: Data, _ connection: NWConnection) {
+    private func process(
+        _ body: Data,
+        _ connection: NWConnection,
+        lifecycle: BridgeRequestLifecycle
+    ) {
         guard let json = J.parse(body), json.dict != nil else {
-            reply(connection, ["ok": false, "error": "invalid JSON body"])
+            reply(
+                connection,
+                lifecycle: lifecycle,
+                ["ok": false, "error": "invalid JSON body"]
+            )
             return
         }
         DispatchQueue.main.async { [authorize, handler] in
@@ -170,20 +267,37 @@ final class BridgeServer {
                 self.queue.async {
                     self.reply(
                         connection,
+                        lifecycle: lifecycle,
                         ["ok": false, "error": "unauthorized bridge capability"]
                     )
                 }
                 return
             }
-            handler(json) { [weak self] response in
-                self?.queue.async {
-                    self?.reply(connection, response)
+            handler(
+                json,
+                { [weak self] response in
+                    self?.queue.async {
+                        self?.reply(
+                            connection,
+                            lifecycle: lifecycle,
+                            response
+                        )
+                    }
+                },
+                { cancellation in
+                    lifecycle.registerCancellation(cancellation)
                 }
-            }
+            )
         }
     }
 
-    private func reply(_ connection: NWConnection, _ object: [String: Any]) {
+    private func reply(
+        _ connection: NWConnection,
+        lifecycle: BridgeRequestLifecycle,
+        _ object: [String: Any]
+    ) {
+        guard lifecycle.complete() else { return }
+        activeConnections.removeValue(forKey: ObjectIdentifier(connection))
         let body = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
         var response = Data("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
         response.append(body)
@@ -194,5 +308,14 @@ final class BridgeServer {
 
     func stop() {
         listener?.cancel()
+        queue.async { [weak self] in
+            guard let self else { return }
+            let active = self.activeConnections.values
+            self.activeConnections.removeAll()
+            for (connection, lifecycle) in active {
+                lifecycle.cancel()
+                connection.cancel()
+            }
+        }
     }
 }

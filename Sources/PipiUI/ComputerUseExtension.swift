@@ -27,9 +27,11 @@ import { randomUUID } from "node:crypto";
 const PORT = process.env.PIPIUI_BRIDGE_PORT;
 const CAPABILITY = process.env.PIPIUI_SESSION_KEY;
 const COMPUTER_CAPABILITY = process.env.PIPIUI_COMPUTER_CAPABILITY;
+const DISPLAY_ID = Number.parseInt(process.env.PIPIUI_COMPUTER_DISPLAY_ID || "", 10);
 const DISPLAY_WIDTH = Number.parseInt(process.env.PIPIUI_COMPUTER_WIDTH || "1440", 10);
 const DISPLAY_HEIGHT = Number.parseInt(process.env.PIPIUI_COMPUTER_HEIGHT || "900", 10);
 const REQUEST_TIMEOUT_MS = 35_000;
+const CANCEL_TIMEOUT_MS = 1_500;
 const MAX_IN_MEMORY_SCREENSHOTS = 12;
 const SCREENSHOT_MARKER = "PIPIUI_COMPUTER_SCREENSHOT";
 
@@ -77,6 +79,7 @@ export function normalizeActions(params: {
 }
 
 async function bridge(actions: ComputerAction[]): Promise<any> {
+  const requestID = randomUUID();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
@@ -88,12 +91,44 @@ async function bridge(actions: ComputerAction[]): Promise<any> {
         sessionKey: CAPABILITY,
         computerCapability: COMPUTER_CAPABILITY,
         action: "computer_batch",
+        requestID,
+        displayID: DISPLAY_ID,
+        displayWidth: DISPLAY_WIDTH,
+        displayHeight: DISPLAY_HEIGHT,
         actions,
       }),
     });
     const json: any = await response.json();
     if (!json.ok) throw new Error(json.error || "computer bridge request failed");
     return json;
+  } catch (error: any) {
+    if (controller.signal.aborted) {
+      await cancelBridgeRequest(requestID);
+      throw new Error("computer request timed out and was cancelled");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function cancelBridgeRequest(requestID: string): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CANCEL_TIMEOUT_MS);
+  try {
+    await fetch(`http://127.0.0.1:${PORT}/rpc`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        sessionKey: CAPABILITY,
+        computerCapability: COMPUTER_CAPABILITY,
+        action: "computer_cancel",
+        requestID,
+      }),
+    });
+  } catch {
+    // The Swift bridge also has a disconnect/timeout cancellation watchdog.
   } finally {
     clearTimeout(timer);
   }
@@ -103,14 +138,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isAnthropicMessagesModel(
-  model: { provider?: string; api?: string } | undefined,
+const ANTHROPIC_20251124_MODEL_PREFIXES = [
+  "claude-sonnet-5",
+  "claude-opus-4-8",
+  "claude-opus-4-7",
+  "claude-opus-4-6",
+  "claude-sonnet-4-6",
+  "claude-opus-4-5",
+] as const;
+
+export function isAnthropicComputer20251124Model(
+  model: { provider?: string; api?: string; id?: string } | undefined,
 ): boolean {
   if (!model || model.api !== "anthropic-messages") return false;
   const provider = (model.provider || "").toLowerCase();
-  return provider === "anthropic"
-    || provider.includes("anthropic")
-    || provider.includes("claude");
+  const id = (model.id || "").toLowerCase();
+  if (provider !== "anthropic" || !id) return false;
+  return ANTHROPIC_20251124_MODEL_PREFIXES.some(
+    (prefix) => id === prefix || id.startsWith(`${prefix}-`),
+  );
 }
 
 function anthropicComputerTool() {
@@ -178,7 +224,12 @@ export function injectInMemoryScreenshots(messages: any[]): any[] {
 }
 
 export default function (pi: ExtensionAPI) {
-  if (!PORT || !CAPABILITY || !COMPUTER_CAPABILITY) return;
+  if (
+    !PORT || !CAPABILITY || !COMPUTER_CAPABILITY
+    || !Number.isInteger(DISPLAY_ID)
+    || !Number.isInteger(DISPLAY_WIDTH)
+    || !Number.isInteger(DISPLAY_HEIGHT)
+  ) return;
 
   pi.registerTool({
     name: "computer",
@@ -193,7 +244,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       actions: Type.Optional(Type.Array(ActionSchema, {
         description: "Ordered batch of desktop actions (preferred for custom providers).",
-        maxItems: 24,
+        maxItems: 12,
       })),
       action: Type.Optional(Type.String()),
       coordinate: Type.Optional(Type.Tuple([Type.Number(), Type.Number()])),
@@ -251,7 +302,10 @@ export default function (pi: ExtensionAPI) {
   }));
 
   pi.on("before_provider_request", (event, ctx) => {
-    if (!isAnthropicMessagesModel(ctx.model) || !isRecord(event.payload)) return;
+    if (
+      !isAnthropicComputer20251124Model(ctx.model)
+      || !isRecord(event.payload)
+    ) return;
     const payload = event.payload as Record<string, unknown>;
     return {
       ...payload,
@@ -260,7 +314,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_headers", (event, ctx) => {
-    if (!isAnthropicMessagesModel(ctx.model)) return;
+    if (!isAnthropicComputer20251124Model(ctx.model)) return;
     const existingKey = Object.keys(event.headers).find(
       (key) => key.toLowerCase() === "anthropic-beta",
     );

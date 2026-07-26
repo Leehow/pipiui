@@ -3,13 +3,17 @@
 日期：2026-07-25
 状态：已实现 v1（代码与自动测试完成；真实 TCC / UI / 输入 V3 验收未执行）
 
-> 2026-07-26 实现修订：以下五项为最终实现约束并覆盖本文较早的单会话/单 action 表述：
+> 2026-07-26 实现修订：以下九项为最终实现约束并覆盖本文较早的单会话/单 action 表述：
 >
 > 1. `ComputerCoordinator` 是 process-global 单控制者，使用 session lease、固定目标 bundle、预算、超时、用户接管和急停。
 > 2. OpenAI/Codex 不改写为原生 `computer_call`；v1 只对 Anthropic messages 使用官方 typed tool，其余统一自定义 batch schema。
-> 3. 内部请求统一为 `actions:[ComputerAction]`；每个被接受的 batch 结束后强制截图。
+> 3. 内部请求统一为 `actions:[ComputerAction]`；每个未取消且被接受的 batch 结束后强制截图。
 > 4. 会话授权之外增加 bundle-id 应用授权；PipiUI、终端、密码管理器、钥匙串和 System Settings 永久拒绝。
 > 5. 截图只驻留内存：pi session 中仅保存 opaque marker，`context` hook 在 provider 调用前重新注入 PNG。
+> 6. 所有非纯截图 batch 都使用 request-id + 完整指纹绑定的 10 秒一次性确认；确认期间原请求保持挂起，不允许旧 UI 按钮批准替代请求。
+> 7. 执行器有 20 秒 watchdog 和 17 秒静态预算；pi 35 秒 / bridge 40 秒超时或断连会按 request-id 取消输入、释放 held state 与 lease。
+> 8. 每个鼠标事件都以前后顺序窗口命中结果约束到已授权 PID；每个 action 前后还会核对 bundle + PID。
+> 9. display id、输出像素尺寸与全局 point bounds 组成同一不可变 capture descriptor；选中显示器消失时 fail closed。
 >
 > 运行说明、安全边界和 V3 手工验收见 [`docs/computer-use.md`](../../computer-use.md)。
 
@@ -45,7 +49,7 @@ Computer use = 给模型「看整块屏幕 + 合成鼠标键盘」的能力。�
 | `ClaudeServerToolsExtension.swift` | pi 提供 `pi.on("before_provider_request")`，可改写发给 provider 的原始 `payload.tools` —— 这是「按 provider 换 wire shape」的现成先例 |
 | `PiPlugin.swift` / `ChatSession.swift:493-514` | 扩展安装 + `-e` 挂载 + `PIPIUI_BRIDGE_PORT/SESSION_KEY` 注入的位置已定型 |
 | `ToolSkillSettings.swift` | 已有工具开关框架（opt-**out** 语义）+ `--exclude-tools` CLI 注入 |
-| Anthropic computer use 文档 | 当前工具 `type: "computer_20251124"`，beta header `computer-use-2025-11-24`（Opus 5 / Sonnet 5 / Opus 4.8/4.7/4.6 / Sonnet 4.6 / Opus 4.5）；旧版 `computer_20250124` + `computer-use-2025-01-24` |
+| Anthropic computer use 文档 | 当前工具 `type: "computer_20251124"`，beta header `computer-use-2025-11-24`（Sonnet 5 / Opus 4.8/4.7/4.6 / Sonnet 4.6 / Opus 4.5）；旧版 `computer_20250124` + `computer-use-2025-01-24` |
 | 同上 | **schema-less 工具**：只给 `{type, name, display_width_px, display_height_px}`，input schema 内建在模型里，不可改 |
 | 同上 | 截图会自动跑 prompt-injection 分类器，命中时模型会先要用户确认 —— 官方路径自带一层安全网 |
 | `make-app.sh` | ad-hoc 签名 + 每次 `rm -rf` 重建；仓库无 `.entitlements`（**未沙盒**，CGEvent 可用） |
@@ -66,16 +70,16 @@ Computer use = 给模型「看整块屏幕 + 合成鼠标键盘」的能力。�
 
 | provider | tools 数组里的形状 | 前缀成本 |
 |---|---|---|
-| `anthropic` + `anthropic-messages` | 官方 `{type:"computer_20251124", name:"computer", display_width_px, display_height_px}` | tools 里 ~30 token；Anthropic 服务端另加内建 system prompt |
+| 精确 `anthropic` + `anthropic-messages` + 明确支持 20251124 的 model id | 官方 `{type:"computer_20251124", name:"computer", display_width_px, display_height_px}` | tools 里 ~30 token；Anthropic 服务端另加内建 system prompt |
 | 其它 | 自定义 schema，action/参数名**逐字对齐**官方词表 | ~200-250 token |
 
-做法照抄 `ClaudeServerToolsExtension`：`before_provider_request` 里把 `payload.tools` 中名为 `computer` 的自定义条目**替换**成官方 typed 定义。名字不变 → pi 的 dispatcher 照样找得到本地执行器。
+做法照抄 `ClaudeServerToolsExtension`：`before_provider_request` 里只对 Sonnet 5、Opus 4.8/4.7/4.6、Sonnet 4.6、Opus 4.5 的显式 model-id 前缀，把 `payload.tools` 中名为 `computer` 的自定义条目**替换**成官方 typed 定义。旧模型、未知模型、Opus 5 和 proxy provider 都保留自定义工具且不加 beta header。名字不变 → pi 的 dispatcher 照样找得到本地执行器。
 
 beta header 走**另一个事件**（已核对 `dist/core/extensions/types.d.ts:494-506`，两者是分开的钩子）：
 
 ```ts
 pi.on("before_provider_headers", (event, ctx) => {
-  if (!isAnthropicMessagesModel(ctx.model)) return;
+  if (!isAnthropicComputer20251124Model(ctx.model)) return;
   // 就地修改；返回值被忽略；置 null 表示删除该 header
   event.headers["anthropic-beta"] = mergeBeta(
     event.headers["anthropic-beta"], "computer-use-2025-11-24",
@@ -90,12 +94,13 @@ pi.on("before_provider_headers", (event, ctx) => {
 ### D2. 坐标空间（bug 最集中的地方，必须纯函数 + 单测）
 
 ```
-SCStreamConfiguration.width/height  ←  直接设成降采样后的目标尺寸（SCK 在 GPU 上缩放，不要先全量截图再 resize）
+ComputerCaptureDescriptor ← 精确 display id + 输出 pixel size + CGDisplayBounds global points
+SCStreamConfiguration.width/height  ←  descriptor 的输出尺寸（SCK 在 GPU 上缩放，不要先全量截图再 resize）
                                        scale = min(1, maxLongEdge / max(pxW, pxH))
 display_width_px / display_height_px ←  就是上面这个目标尺寸（模型坐标空间）
 ```
 
-回映射：用 `CGDisplayBounds(displayID)`——它已经是**左上原点、全局 points**，正好是 `CGEvent` 用的坐标系，省掉 `NSScreen` 的翻转。
+回映射：使用同一 descriptor 中启动时捕获并在每个 action 前重新核对的 `CGDisplayBounds(displayID)`——它已经是**左上原点、全局 points**，正好是 `CGEvent` 用的坐标系，省掉 `NSScreen` 的翻转。provider 广告尺寸、输入验证、坐标映射和最终截图必须消费同一 descriptor；显示器缺失或几何变化时不回退主显示器。
 
 ```
 globalPoint = bounds.origin + (imgX / imgW * bounds.width,
@@ -110,7 +115,7 @@ globalPoint = bounds.origin + (imgX / imgW * bounds.width,
 
 - 鼠标：`CGEvent(mouseEventSource:mouseType:mouseCursorPosition:mouseButton:)` + `.post(tap: .cghidEventTap)`；down/up 成对；双击/三击靠 `setIntegerValueField(.mouseEventClickState, 2/3)`
 - 拖拽：down → **若干中间 `mouseDragged` 帧** → up（一步到位很多 App 不认）
-- 打字：`CGEvent.keyboardSetUnicodeString` —— 不建 keycode 表，中文/emoji 直接过，也绕开输入法
+- 打字：`CGEvent.keyboardSetUnicodeString` —— 不建 keycode 表，中文/emoji 直接过，也绕开输入法；20 个 UTF-16 unit 的事件分块只能在 Swift `Character` 边界切分，不能切断 surrogate pair、组合字符或 emoji ZWJ 序列
 - 快捷键：`key` 走 virtual keycode + modifier flags，需要一张**具名键**表（Return=36, Escape=53, Tab=48…）。这是有限机械枚举，不是开放语义分类；任意字符一律走 `type`
 - 节流：事件之间 sleep 8–16ms，否则大量 App 丢事件
 
@@ -141,14 +146,16 @@ Info.plist 不用改（macOS 的屏幕录制/辅助功能没有 usage-descriptio
 
 **`swift run` 路径**：裸二进制，TCC 归属终端而非 PipiUI.app，行为与 `.app` 不一致 —— 这个功能只能用 `.app` 测，写进文档。
 
-### D5. 安全闸门（三层 + 边界）
+### D5. 安全闸门（多层 + 边界）
 
 1. **全局开关**（设置 → 工具，默认**关**）。关时扩展根本不 `-e` 挂载 → 工具不存在 → 前缀零成本。注意 `ToolSkillSettings` 是「缺省=启用」的 opt-out 语义，**不能复用**，需要独立的 opt-in key。
-2. **会话级**：顶栏 🖥️ 指示器，激活时常亮；未激活时首次调用弹确认（授权只对当前会话有效）。
-3. **急停**：全局热键（⌥⇧Esc）→ 立即撤销会话级授权 + 中断生成。
-4. **subagent 边界**：默认只有主会话能用。Boss 模式会派深度 2 的树、后台会话继续跑，无人值守时这是最大风险面。经补丁版 subagent 的工具禁用路径注入 `--exclude-tools computer`。
-5. **审计**：每个动作写 JSONL（照 `Logging/TokenLedger` 的模式）。截图**不落盘**，只走内存 → base64。
-6. 文档明说：截图可能含密码/私信；Anthropic 路径有自动 prompt-injection 分类器，其它 provider **没有**。
+2. **会话级 + 应用级**：顶栏 🖥️ 指示器，激活时常亮；首次调用确认顶层会话，新 bundle/PID 捕获的应用身份另行确认。
+3. **批次级写确认**：任何含非 screenshot action 的 batch 使用 request-id、完整动作指纹、10 秒过期时间和一次性 continuation；确认 UI 必须提交精确 approval id/request id/fingerprint。
+4. **窗口命中约束**：每个 move/click/drag/scroll/down/up 事件前按 `CGWindowList` front-to-back 命中，最上层 owner PID 必须等于已授权前台 PID；Dock、菜单栏、系统 UI、其他 App 和空白区域均拒绝。
+5. **急停**：全局热键（⌥⇧Esc）先收集 active/in-flight/pending/paused/lease 会话，再撤销授权、取消对应生成并释放所有 down 状态。
+6. **subagent 边界**：默认只有主会话能用。Boss 模式会派深度 2 的树、后台会话继续跑，无人值守时这是最大风险面。经补丁版 subagent 的工具禁用路径注入 `--exclude-tools computer`。
+7. **审计**：每个动作写 JSONL（照 `Logging/TokenLedger` 的模式）。截图**不落盘**，只走内存 → base64。
+8. 文档明说：截图可能含密码/私信；Anthropic 路径有自动 prompt-injection 分类器，其它 provider **没有**。
 
 ---
 
@@ -160,16 +167,19 @@ Sources/PipiUI/Computer/ScreenCapture.swift   ~140  SCScreenshotManager 截屏 +
 Sources/PipiUI/Computer/InputSynth.swift      ~200  CGEvent 鼠标/键盘/滚动/拖拽 + 节流
 Sources/PipiUI/Computer/KeyMap.swift          ~90   具名键 → virtual keycode（US 布局）
 Sources/PipiUI/Computer/CoordinateMap.swift   ~70   纯函数：图像坐标 ↔ 全局显示坐标
-Sources/PipiUI/Computer/ComputerStore.swift   ~180  bridge action 分发 + 授权状态 + 会话闸门 + 审计
+Sources/PipiUI/Computer/ComputerCoordinator*.swift  全局 lease、精确批次确认、watchdog、急停与 monitor 生命周期
+Sources/PipiUI/Computer/ComputerCaptureDescriptor.swift  显示器 pixel/point 单一事实来源
+Sources/PipiUI/Computer/ComputerWindowConfinement.swift  front-to-back 窗口 owner PID 命中
 Sources/PipiUI/ComputerUseSettings.swift      ~90   opt-in 开关 + 显示器/分辨率 + JSON 同步
 Sources/PipiUI/Views/ComputerConsentBar.swift ~90   顶栏指示 + 急停 + 授权引导
 
 Tests/PipiUITests/ComputerCoordinateTests.swift
 Tests/PipiUITests/ComputerKeyMapTests.swift
 Tests/PipiUITests/ComputerUseSettingsTests.swift
+Tests/PipiUITests/ComputerSafetyTests.swift
 ```
 
-`AppStore.swift:161` 的 bridge handler 加一个分支：`computer_*` action 路由到 `ComputerStore`，不进 `WebViewStore`（那是 webview 的）。
+`AppStore` 的 bridge handler 加一个分支：`computer_*` action 路由到 `ComputerCoordinator`，不进 `WebViewStore`（后者只负责 webview）。
 
 ---
 
@@ -196,7 +206,9 @@ Tests/PipiUITests/ComputerUseSettingsTests.swift
 | Retina 坐标算错 → 点偏 | 纯函数 + 单测；先做只读的 T3 验证坐标，再开 T4 写路径 |
 | TCC 授权反复失效拖垮开发 | T1 排在最前 |
 | `anthropic-beta` 被别的扩展覆盖 → 官方工具 400 | 合并而非覆盖；T5 验收时实测 header 内容 |
-| 无人值守 agent 树误操作 | 默认关 + subagent 排除 + 急停 + 审计 |
+| 无人值守 agent 树误操作 | 默认关 + subagent 排除 + 每写批确认 + 全局 lease + 急停 + 审计 |
+| 请求超时后仍继续点击 | request-id 取消、20 秒 watchdog、35/40 秒传输 deadline、held-input 清理 |
+| 点击落到 Dock/菜单/其他 App | 每个 pointer event front-to-back owner PID 命中 + action 前后精确 PID 核对 |
 | 截图泄露敏感信息 | 不落盘；文档明示；建议只在需要时开 |
 | 官方工具进 tools 数组会让 Anthropic 注入内建 system prompt → 前缀变化 | 开关只在 spawn 时生效（与现有 `--exclude-tools` 行为一致），会话内工具集恒定，不毁缓存 |
 

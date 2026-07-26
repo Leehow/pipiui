@@ -36,11 +36,12 @@ enum ComputerUseSettings {
     }
 
     static func selectedDisplayID(defaults: UserDefaults = .standard) -> CGDirectDisplayID {
-        let saved = defaults.integer(forKey: displayIDKey)
-        if let displayID = CGDirectDisplayID(exactly: saved), saved > 0 {
-            if CGDisplayIsActive(displayID) != 0 {
-                return displayID
-            }
+        if let saved = defaults.object(forKey: displayIDKey) as? NSNumber,
+           saved.intValue > 0,
+           let displayID = CGDirectDisplayID(exactly: saved.intValue) {
+            // Preserve the explicit choice even when disconnected. Capture must fail
+            // closed instead of silently targeting the main display.
+            return displayID
         }
         return CGMainDisplayID()
     }
@@ -99,30 +100,37 @@ enum ComputerUseSettings {
         )
     }
 
-    static func providerDisplaySize(defaults: UserDefaults = .standard) -> ComputerImageSize {
-        let displayID = selectedDisplayID(defaults: defaults)
-        let width = CGDisplayPixelsWide(displayID)
-        let height = CGDisplayPixelsHigh(displayID)
-        if width == 0 || height == 0 {
-            return ComputerImageSize(width: defaultMaxLongEdge, height: 900)
-        }
-        return downscaledSize(
-            pixelWidth: width,
-            pixelHeight: height,
+    static func captureDescriptor(
+        defaults: UserDefaults = .standard
+    ) throws -> ComputerCaptureDescriptor {
+        try ComputerCaptureDescriptor.resolve(
+            selectedDisplayID: selectedDisplayID(defaults: defaults),
+            geometries: activeDisplayGeometries(),
             maxLongEdge: maxLongEdge(defaults: defaults)
         )
     }
 
     static func activeDisplayIDs() -> [CGDirectDisplayID] {
+        activeDisplayGeometries().map(\.displayID)
+    }
+
+    static func activeDisplayGeometries() -> [ComputerDisplayGeometry] {
         var count: UInt32 = 0
         guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else {
-            return [CGMainDisplayID()]
+            return []
         }
         var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
         guard CGGetActiveDisplayList(count, &displays, &count) == .success else {
-            return [CGMainDisplayID()]
+            return []
         }
-        return Array(displays.prefix(Int(count)))
+        return displays.prefix(Int(count)).map { displayID in
+            ComputerDisplayGeometry(
+                displayID: displayID,
+                globalBounds: CGDisplayBounds(displayID),
+                pixelWidth: CGDisplayPixelsWide(displayID),
+                pixelHeight: CGDisplayPixelsHigh(displayID)
+            )
+        }
     }
 }
 

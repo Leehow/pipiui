@@ -38,6 +38,17 @@ enum ComputerActionKind: String, Codable, CaseIterable, Sendable {
         default: return ComputerActionKind(rawValue: value.lowercased())
         }
     }
+
+    var emitsPointerEvent: Bool {
+        switch self {
+        case .mouseMove, .leftClick, .rightClick, .middleClick,
+             .doubleClick, .tripleClick, .leftMouseDown, .leftMouseUp,
+             .drag, .scroll:
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 struct ComputerAction: Equatable, Sendable {
@@ -145,8 +156,12 @@ struct ComputerAction: Equatable, Sendable {
 }
 
 struct ComputerRequest: Equatable, Sendable {
-    static let maximumActions = 24
+    static let maximumActions = 12
     let actions: [ComputerAction]
+
+    var requiresWriteApproval: Bool {
+        actions.contains { $0.kind != .screenshot }
+    }
 
     static func normalize(_ request: J) throws -> ComputerRequest {
         let rawActions: [J]

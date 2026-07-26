@@ -1,6 +1,4 @@
 import Foundation
-import AppKit
-import CoreGraphics
 
 struct ComputerBatchExecutionResult {
     let outcomes: [ComputerActionOutcome]
@@ -14,64 +12,26 @@ extension ComputerCoordinator {
     @MainActor
     func executeBatch(
         _ request: ComputerRequest,
-        sessionKey: String,
-        generation: UInt64,
-        gate: ComputerExecutionGate,
+        execution: ComputerInFlightExecution,
         targetApplication: ComputerApplicationIdentity,
-        displayID: CGDirectDisplayID,
-        imageSize: ComputerImageSize,
-        displayBounds: CGRect
+        descriptor: ComputerCaptureDescriptor
     ) async -> ComputerBatchExecutionResult {
         var outcomes: [ComputerActionOutcome] = []
         var focusDrift = false
         var batchError: String?
 
-        for (index, action) in request.actions.enumerated() {
-            guard !gate.isCancelled,
-                  executionGeneration == generation,
-                  batchInFlightSessionKey == sessionKey else {
-                batchError = "computer execution stopped before action \(index)"
-                outcomes.append(ComputerActionOutcome(
-                    index: index,
-                    kind: action.kind,
-                    ok: false,
-                    message: batchError ?? "stopped"
-                ))
-                break
-            }
-            if action.emitsInput {
-                guard let current = ComputerFrontmostApplication.current(),
-                      current.normalizedBundleID == targetApplication.normalizedBundleID else {
-                    focusDrift = true
-                    batchError = "focus drift detected before action \(index); input stopped"
-                    outcomes.append(ComputerActionOutcome(
-                        index: index,
-                        kind: action.kind,
-                        ok: false,
-                        message: batchError ?? "focus drift"
-                    ))
-                    break
-                }
-            }
+        var cursor = ComputerActionCursor(actions: request.actions)
+        while let (index, action) = cursor.next(
+            gate: execution.gate,
+            isCurrent: { executionIsCurrent(execution) }
+        ) {
             do {
-                try await Task.detached(priority: .userInitiated) {
-                    try ComputerInputSynth.shared.execute(
-                        action,
-                        imageSize: imageSize,
-                        displayBounds: displayBounds,
-                        shouldStop: { gate.isCancelled }
-                    )
-                }.value
-                outcomes.append(ComputerActionOutcome(
-                    index: index,
-                    kind: action.kind,
-                    ok: true,
-                    message: action.kind == .screenshot ? "capture requested" : "executed"
-                ))
+                guard try ComputerUseSettings.captureDescriptor() == descriptor else {
+                    throw ComputerCaptureDescriptorError.providerDescriptorMismatch
+                }
             } catch {
-                ComputerInputSynth.shared.releaseAll()
                 batchError = error.localizedDescription
-                outcomes.append(ComputerActionOutcome(
+                outcomes.append(.init(
                     index: index,
                     kind: action.kind,
                     ok: false,
@@ -79,33 +39,99 @@ extension ComputerCoordinator {
                 ))
                 break
             }
+            guard let before = ComputerFrontmostApplication.current(),
+                  Self.sameProcess(before, targetApplication) else {
+                focusDrift = true
+                batchError = "focus or process drift detected before action \(index)"
+                outcomes.append(.init(
+                    index: index,
+                    kind: action.kind,
+                    ok: false,
+                    message: batchError ?? "focus drift"
+                ))
+                break
+            }
+
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try ComputerInputSynth.shared.execute(
+                        action,
+                        imageSize: descriptor.outputSize,
+                        displayBounds: descriptor.globalBounds,
+                        shouldStop: { execution.gate.isCancelled },
+                        authorizePointer: { point in
+                            try ComputerWindowConfinement.authorizeLive(
+                                point: point,
+                                targetPID: targetApplication.processID
+                            )
+                        }
+                    )
+                }.value
+            } catch {
+                ComputerInputSynth.shared.releaseAll()
+                batchError = error.localizedDescription
+                outcomes.append(.init(
+                    index: index,
+                    kind: action.kind,
+                    ok: false,
+                    message: error.localizedDescription
+                ))
+                break
+            }
+
+            guard let after = ComputerFrontmostApplication.current(),
+                  Self.sameProcess(after, targetApplication) else {
+                ComputerInputSynth.shared.releaseAll()
+                focusDrift = true
+                batchError = "focus or process drift detected after action \(index)"
+                outcomes.append(.init(
+                    index: index,
+                    kind: action.kind,
+                    ok: false,
+                    message: batchError ?? "focus drift"
+                ))
+                break
+            }
+            outcomes.append(.init(
+                index: index,
+                kind: action.kind,
+                ok: true,
+                message: action.kind == .screenshot ? "capture requested" : "executed"
+            ))
         }
 
         var finalApp = ComputerFrontmostApplication.current() ?? targetApplication
-        if finalApp.normalizedBundleID != targetApplication.normalizedBundleID {
+        if !Self.sameProcess(finalApp, targetApplication) {
             focusDrift = true
-            batchError = batchError ?? "focus drift detected after batch"
+            batchError = batchError ?? "focus or process drift detected after batch"
         }
 
-        // Every accepted batch finishes with one fresh in-memory screenshot, including
-        // partial action failures. Emergency stop may invalidate the generation, but the
-        // capture remains read-only and gives the model an honest final state.
+        // Every non-cancelled accepted batch returns one fresh in-memory screenshot.
+        // Cancellation skips read-only capture so a timed-out task finishes promptly.
         let screenshot: ComputerScreenshot?
-        do {
-            screenshot = try await ComputerScreenCapture.capture(
-                displayID: displayID,
-                maxLongEdge: ComputerUseSettings.maxLongEdge(),
-                app: finalApp
-            )
-        } catch {
+        if execution.gate.isCancelled {
             screenshot = nil
-            batchError = batchError ?? error.localizedDescription
+            batchError = batchError ?? "computer execution cancelled"
+        } else {
+            do {
+                screenshot = try await ComputerScreenCapture.capture(
+                    descriptor: descriptor,
+                    app: finalApp
+                )
+            } catch {
+                screenshot = nil
+                batchError = batchError ?? error.localizedDescription
+            }
         }
-        if let postCaptureApp = ComputerFrontmostApplication.current(),
-           postCaptureApp.normalizedBundleID != targetApplication.normalizedBundleID {
-            finalApp = postCaptureApp
+        if let postCapture = ComputerFrontmostApplication.current() {
+            finalApp = postCapture
+            if !Self.sameProcess(postCapture, targetApplication) {
+                focusDrift = true
+                batchError = batchError ?? "focus drift detected while capturing final state"
+            }
+        } else {
             focusDrift = true
-            batchError = batchError ?? "focus drift detected while capturing final state"
+            batchError = batchError ?? "frontmost application disappeared after batch"
         }
 
         return ComputerBatchExecutionResult(
@@ -121,15 +147,13 @@ extension ComputerCoordinator {
     func finishBatch(
         _ result: ComputerBatchExecutionResult,
         request: ComputerRequest,
-        sessionKey: String,
-        gate: ComputerExecutionGate,
-        auditSessionID: String,
-        respond: @escaping ([String: Any]) -> Void
+        execution: ComputerInFlightExecution,
+        auditSessionID: String
     ) {
-        let ownsCurrentExecution = executionGate === gate
-        if ownsCurrentExecution {
-            executionGate = nil
-            batchInFlightSessionKey = nil
+        let ownsExecution = inFlightExecution === execution
+        if ownsExecution {
+            execution.watchdog?.cancel()
+            inFlightExecution = nil
             activeApplication = result.finalApplication
         }
 
@@ -142,13 +166,28 @@ extension ComputerCoordinator {
             focusDrift: result.focusDrift
         ))
 
-        if result.focusDrift, ownsCurrentExecution {
-            release(sessionKey: sessionKey)
-            statusMessage = "检测到焦点漂移，桌面 lease 已释放。"
+        let exhausted = leaseController.lease?.sessionKey == execution.sessionKey
+            && leaseController.lease?.remainingActions == 0
+        if ownsExecution && (result.focusDrift || result.error != nil) {
+            release(sessionKey: execution.sessionKey)
+            if result.focusDrift {
+                statusMessage = "检测到焦点漂移，桌面 lease 已释放。"
+            } else {
+                statusMessage = "桌面动作失败，lease 与输入状态已释放。"
+            }
+        } else if ownsExecution && exhausted {
+            _ = releaseIfActionBudgetExhausted(
+                sessionKey: execution.sessionKey
+            )
+            statusMessage = "Computer Use 动作预算已耗尽，桌面 lease 已自动释放。"
+        } else {
+            refreshInputMonitoring()
         }
 
         guard let screenshot = result.screenshot else {
-            respond(Self.failure(result.error ?? "final screenshot failed"))
+            execution.reply.respond(Self.failure(
+                result.error ?? "final screenshot failed"
+            ))
             return
         }
         var response: [String: Any] = [
@@ -168,76 +207,13 @@ extension ComputerCoordinator {
             "mimeType": "image/png",
             "base64": screenshot.base64,
         ]
-        if let error = result.error {
-            response["batchError"] = error
-        }
-        respond(response)
+        if let error = result.error { response["batchError"] = error }
+        execution.reply.respond(response)
     }
 
-    func scheduleExpiry(for lease: ComputerLease) {
-        expiryWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            if self.leaseController.purgeExpired(now: Date()) {
-                self.executionGeneration &+= 1
-                self.executionGate?.cancel()
-                self.executionGate = nil
-                self.batchInFlightSessionKey = nil
-                self.activeSessionKey = nil
-                self.activeApplication = nil
-                self.remainingActions = nil
-                ComputerInputSynth.shared.releaseAll()
-                self.statusMessage = "Computer Use lease 已超时释放。"
-            }
-        }
-        expiryWork = work
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + max(0, lease.expiresAt.timeIntervalSinceNow),
-            execute: work
-        )
-    }
-
-    func installInputMonitors() {
-        let userInputMask: NSEvent.EventTypeMask = [
-            .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown,
-            .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
-            .scrollWheel,
-        ]
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: userInputMask) {
-            [weak self] event in
-            Task { @MainActor in
-                self?.observePhysicalInput(event)
-            }
-        }
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: userInputMask) {
-            [weak self] event in
-            if Self.isEmergencyHotkey(event) {
-                Task { @MainActor in self?.emergencyStop() }
-                return nil
-            }
-            self?.observePhysicalInput(event)
-            return event
-        }
-    }
-
-    func observePhysicalInput(_ event: NSEvent) {
-        if Self.isEmergencyHotkey(event) {
-            emergencyStop()
-            return
-        }
-        if event.cgEvent?.getIntegerValueField(.eventSourceUserData)
-            == ComputerInputSynth.syntheticEventTag {
-            return
-        }
-        guard let owner = activeSessionKey else { return }
-        pausedSessionKeys.insert(owner)
-        release(sessionKey: owner)
-        statusMessage = "检测到用户鼠标或键盘输入，Computer Use 已暂停并释放控制权。"
-    }
-
-    static func isEmergencyHotkey(_ event: NSEvent) -> Bool {
-        guard event.type == .keyDown, event.keyCode == 53 else { return false }
-        return event.modifierFlags.contains(.option)
-            && event.modifierFlags.contains(.shift)
+    func executionIsCurrent(_ execution: ComputerInFlightExecution) -> Bool {
+        !execution.gate.isCancelled
+            && inFlightExecution === execution
+            && executionGeneration == execution.generation
     }
 }

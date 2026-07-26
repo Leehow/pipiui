@@ -29,6 +29,15 @@ enum ComputerAppPolicy {
         "com.apple.terminal",
         "com.googlecode.iterm2",
         "com.mitchellh.ghostty",
+        "dev.warp.warp-stable",
+        "dev.warp.warp",
+        "net.kovidgoyal.kitty",
+        "com.github.wez.wezterm",
+        "org.alacritty",
+        "co.zeit.hyper",
+        "com.raphaelamorim.rio",
+        "org.tabby",
+        "com.termius-dmg.mac",
         "com.1password.1password",
         "com.agilebits.onepassword7",
         "com.bitwarden.desktop",
@@ -39,7 +48,8 @@ enum ComputerAppPolicy {
 
     private static let permanentlyDeniedNameFragments = [
         "password", "1password", "bitwarden", "lastpass", "dashlane",
-        "keychain access", "terminal", "iterm", "ghostty",
+        "keychain access", "terminal", "iterm", "ghostty", "warp",
+        "kitty", "wezterm", "alacritty", "hyper", "tabby", "termius",
         "authentication", "authorization", "securityagent",
     ]
 

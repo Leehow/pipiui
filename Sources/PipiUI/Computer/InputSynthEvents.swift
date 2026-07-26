@@ -34,20 +34,32 @@ extension ComputerInputSynth {
         _ button: CGMouseButton,
         at point: CGPoint,
         count: Int,
-        shouldStop: @Sendable () -> Bool
+        shouldStop: @Sendable () -> Bool,
+        authorizePointer: @Sendable (CGPoint) throws -> Void
     ) throws {
         for clickState in 1...count {
             try mouseDown(
                 button,
                 at: point,
                 clickState: clickState,
-                shouldStop: shouldStop
+                shouldStop: shouldStop,
+                authorizePointer: authorizePointer
             )
             do {
                 try cancellablePause(0.012, shouldStop: shouldStop)
-                try mouseUp(button, at: point, clickState: clickState)
+                try mouseUp(
+                    button,
+                    at: point,
+                    clickState: clickState,
+                    authorizePointer: authorizePointer
+                )
             } catch {
-                try? mouseUp(button, at: point, clickState: clickState)
+                try? mouseUp(
+                    button,
+                    at: point,
+                    clickState: clickState,
+                    authorizePointer: authorizePointer
+                )
                 throw error
             }
             if clickState < count {
@@ -60,7 +72,8 @@ extension ComputerInputSynth {
         _ button: CGMouseButton,
         at point: CGPoint,
         clickState: Int = 1,
-        shouldStop: @Sendable () -> Bool = { false }
+        shouldStop: @Sendable () -> Bool = { false },
+        authorizePointer: @Sendable (CGPoint) throws -> Void = { _ in }
     ) throws {
         let type: CGEventType
         switch button {
@@ -72,7 +85,13 @@ extension ComputerInputSynth {
             try ensureRunning(shouldStop)
             heldMouseButtons.insert(button)
             do {
-                try postMouse(type, at: point, button: button, clickState: clickState)
+                try postMouse(
+                    type,
+                    at: point,
+                    button: button,
+                    clickState: clickState,
+                    authorizePointer: authorizePointer
+                )
             } catch {
                 heldMouseButtons.remove(button)
                 throw error
@@ -83,7 +102,8 @@ extension ComputerInputSynth {
     func mouseUp(
         _ button: CGMouseButton,
         at point: CGPoint,
-        clickState: Int = 1
+        clickState: Int = 1,
+        authorizePointer: @Sendable (CGPoint) throws -> Void = { _ in }
     ) throws {
         let type: CGEventType
         switch button {
@@ -92,7 +112,13 @@ extension ComputerInputSynth {
         default: type = .otherMouseUp
         }
         try lock.withLock {
-            try postMouse(type, at: point, button: button, clickState: clickState)
+            try postMouse(
+                type,
+                at: point,
+                button: button,
+                clickState: clickState,
+                authorizePointer: authorizePointer
+            )
             heldMouseButtons.remove(button)
         }
     }
@@ -101,8 +127,10 @@ extension ComputerInputSynth {
         _ type: CGEventType,
         at point: CGPoint,
         button: CGMouseButton = .left,
-        clickState: Int = 1
+        clickState: Int = 1,
+        authorizePointer: @Sendable (CGPoint) throws -> Void = { _ in }
     ) throws {
+        try authorizePointer(point)
         guard let event = CGEvent(
             mouseEventSource: source,
             mouseType: type,
@@ -120,7 +148,8 @@ extension ComputerInputSynth {
         _ action: ComputerAction,
         imageSize: ComputerImageSize,
         displayBounds: CGRect,
-        shouldStop: @Sendable () -> Bool
+        shouldStop: @Sendable () -> Bool,
+        authorizePointer: @Sendable (CGPoint) throws -> Void
     ) throws {
         let end = try point(action, imageSize, displayBounds)
         let start: CGPoint
@@ -133,8 +162,20 @@ extension ComputerInputSynth {
         } else {
             start = CGEvent(source: nil)?.location ?? end
         }
-        try mouseDown(.left, at: start, shouldStop: shouldStop)
-        defer { try? mouseUp(.left, at: end) }
+        var lastPoint = start
+        try mouseDown(
+            .left,
+            at: start,
+            shouldStop: shouldStop,
+            authorizePointer: authorizePointer
+        )
+        defer {
+            try? mouseUp(
+                .left,
+                at: lastPoint,
+                authorizePointer: authorizePointer
+            )
+        }
         let frames = 16
         for index in 1...frames {
             try ensureRunning(shouldStop)
@@ -143,7 +184,12 @@ extension ComputerInputSynth {
                 x: start.x + (end.x - start.x) * progress,
                 y: start.y + (end.y - start.y) * progress
             )
-            try postMouse(.leftMouseDragged, at: point)
+            try postMouse(
+                .leftMouseDragged,
+                at: point,
+                authorizePointer: authorizePointer
+            )
+            lastPoint = point
             try cancellablePause(0.012, shouldStop: shouldStop)
         }
     }
@@ -152,12 +198,9 @@ extension ComputerInputSynth {
         _ text: String,
         shouldStop: @Sendable () -> Bool
     ) throws {
-        let units = Array(text.utf16)
-        let chunkSize = 20
-        for start in stride(from: 0, to: units.count, by: chunkSize) {
+        for textChunk in try ComputerUnicodeChunker.chunks(text) {
             try ensureRunning(shouldStop)
-            let end = min(units.count, start + chunkSize)
-            let chunk = Array(units[start..<end])
+            let chunk = Array(textChunk.utf16)
             guard let down = CGEvent(
                 keyboardEventSource: source,
                 virtualKey: 0,
@@ -224,7 +267,12 @@ extension ComputerInputSynth {
         }
     }
 
-    func scroll(_ action: ComputerAction) throws {
+    func scroll(
+        _ action: ComputerAction,
+        authorizePointer: @Sendable (CGPoint) throws -> Void = { _ in }
+    ) throws {
+        let location = CGEvent(source: nil)?.location ?? .zero
+        try authorizePointer(location)
         let amount = Int32(min(10_000, max(1, action.scrollAmount ?? 0)))
         let direction = action.scrollDirection?.lowercased() ?? ""
         let vertical: Int32
@@ -246,6 +294,7 @@ extension ComputerInputSynth {
         ) else {
             throw ComputerInputError.eventCreationFailed
         }
+        event.location = location
         tag(event)
         event.post(tap: .cghidEventTap)
     }

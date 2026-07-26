@@ -635,6 +635,10 @@ final class ChatSession: ObservableObject, Identifiable {
             return
         }
 
+        let computerCaptureDescriptor: ComputerCaptureDescriptor? =
+            ComputerUseSettings.isEnabled()
+                ? try? ComputerUseSettings.captureDescriptor()
+                : nil
         var args: [String] = []
         if let sessionPath { args += ["--session", sessionPath] }
         if let bossPromptPath {
@@ -653,7 +657,7 @@ final class ChatSession: ObservableObject, Identifiable {
         if let claudeServerToolsExtension { args += ["-e", claudeServerToolsExtension] }
         // Independent opt-in: when disabled the extension is not mounted at all, so the
         // `computer` tool does not exist and contributes zero tool-prefix cost.
-        if ComputerUseSettings.isEnabled(), let computerUseExtension {
+        if computerCaptureDescriptor != nil, let computerUseExtension {
             args += ["-e", computerUseExtension]
         }
         // Settings → 工具开关：禁用项走 pi --exclude-tools（会话重启后生效）
@@ -677,11 +681,15 @@ final class ChatSession: ObservableObject, Identifiable {
             }
             extraEnv["PIPIUI_BRIDGE_PORT"] = String(bridgePort)
             extraEnv["PIPIUI_SESSION_KEY"] = bridgeRoutingKey
-            if ComputerUseSettings.isEnabled(), computerUseExtension != nil {
+            if let descriptor = computerCaptureDescriptor,
+               computerUseExtension != nil {
                 extraEnv["PIPIUI_COMPUTER_CAPABILITY"] = computerRoutingKey
-                let size = ComputerUseSettings.providerDisplaySize()
-                extraEnv["PIPIUI_COMPUTER_WIDTH"] = String(size.width)
-                extraEnv["PIPIUI_COMPUTER_HEIGHT"] = String(size.height)
+                extraEnv["PIPIUI_COMPUTER_DISPLAY_ID"] =
+                    String(descriptor.displayID)
+                extraEnv["PIPIUI_COMPUTER_WIDTH"] =
+                    String(descriptor.outputSize.width)
+                extraEnv["PIPIUI_COMPUTER_HEIGHT"] =
+                    String(descriptor.outputSize.height)
             }
             // Authoritative session root inherited by nested processes. Management
             // roles such as secretary must never mistake a worker worktree for main.

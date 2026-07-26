@@ -25,7 +25,8 @@ enum ComputerInputError: LocalizedError {
         case .invalidScroll:
             return "scroll requires direction up/down/left/right and a positive amount"
         case .durationOutOfRange:
-            return "wait/hold duration must be between 0 and 10 seconds"
+            return "wait/hold duration must be between 0 and "
+                + "\(Int(ComputerRuntimeBudget.maximumPauseSeconds)) seconds"
         case .unsupportedAppSwitchShortcut:
             return "application-switching shortcuts are blocked; select and authorize the target app first"
         case .sensitiveShortcutBlocked:
@@ -80,9 +81,13 @@ final class ComputerInputSynth: @unchecked Sendable {
                 guard let text = action.text, !text.isEmpty else {
                     throw ComputerInputError.missingText
                 }
-                guard text.utf16.count <= 100_000 else {
-                    throw ComputerRequestError.invalidAction("typed text exceeds 100000 UTF-16 units")
+                guard text.utf16.count <= ComputerRuntimeBudget.maximumTypedUTF16Units else {
+                    throw ComputerRequestError.invalidAction(
+                        "typed text exceeds \(ComputerRuntimeBudget.maximumTypedUTF16Units) "
+                            + "UTF-16 units"
+                    )
                 }
+                _ = try ComputerUnicodeChunker.chunks(text)
                 if ComputerSensitiveTextPolicy.appearsSensitive(text) {
                     throw ComputerInputError.sensitiveTextBlocked
                 }
@@ -105,7 +110,8 @@ final class ComputerInputSynth: @unchecked Sendable {
                 }
                 if action.kind == .holdKey {
                     let duration = action.duration ?? 1
-                    guard duration >= 0, duration <= 10 else {
+                    guard duration >= 0,
+                          duration <= ComputerRuntimeBudget.maximumPauseSeconds else {
                         throw ComputerInputError.durationOutOfRange
                     }
                 }
@@ -117,7 +123,8 @@ final class ComputerInputSynth: @unchecked Sendable {
                 }
             case .wait:
                 let duration = action.duration ?? 1
-                guard duration >= 0, duration <= 10 else {
+                guard duration >= 0,
+                      duration <= ComputerRuntimeBudget.maximumPauseSeconds else {
                     throw ComputerInputError.durationOutOfRange
                 }
             case .leftMouseDown, .leftMouseUp, .screenshot:
@@ -130,7 +137,8 @@ final class ComputerInputSynth: @unchecked Sendable {
         _ action: ComputerAction,
         imageSize: ComputerImageSize,
         displayBounds: CGRect,
-        shouldStop: @escaping @Sendable () -> Bool = { false }
+        shouldStop: @escaping @Sendable () -> Bool = { false },
+        authorizePointer: @escaping @Sendable (CGPoint) throws -> Void = { _ in }
     ) throws {
         guard AXIsProcessTrusted() || !action.emitsInput else {
             throw ComputerInputError.accessibilityPermissionMissing
@@ -143,56 +151,71 @@ final class ComputerInputSynth: @unchecked Sendable {
             try cancellablePause(action.duration ?? 1, shouldStop: shouldStop)
         case .mouseMove:
             try ensureRunning(shouldStop)
-            try postMouse(.mouseMoved, at: try point(action, imageSize, displayBounds))
+            try postMouse(
+                .mouseMoved,
+                at: try point(action, imageSize, displayBounds),
+                authorizePointer: authorizePointer
+            )
         case .leftClick:
             try click(
                 .left,
                 at: try point(action, imageSize, displayBounds),
                 count: 1,
-                shouldStop: shouldStop
+                shouldStop: shouldStop,
+                authorizePointer: authorizePointer
             )
         case .rightClick:
             try click(
                 .right,
                 at: try point(action, imageSize, displayBounds),
                 count: 1,
-                shouldStop: shouldStop
+                shouldStop: shouldStop,
+                authorizePointer: authorizePointer
             )
         case .middleClick:
             try click(
                 .center,
                 at: try point(action, imageSize, displayBounds),
                 count: 1,
-                shouldStop: shouldStop
+                shouldStop: shouldStop,
+                authorizePointer: authorizePointer
             )
         case .doubleClick:
             try click(
                 .left,
                 at: try point(action, imageSize, displayBounds),
                 count: 2,
-                shouldStop: shouldStop
+                shouldStop: shouldStop,
+                authorizePointer: authorizePointer
             )
         case .tripleClick:
             try click(
                 .left,
                 at: try point(action, imageSize, displayBounds),
                 count: 3,
-                shouldStop: shouldStop
+                shouldStop: shouldStop,
+                authorizePointer: authorizePointer
             )
         case .leftMouseDown:
             let location = try optionalPoint(action, imageSize, displayBounds)
                 ?? CGEvent(source: nil)?.location ?? .zero
-            try mouseDown(.left, at: location, shouldStop: shouldStop)
+            try mouseDown(
+                .left,
+                at: location,
+                shouldStop: shouldStop,
+                authorizePointer: authorizePointer
+            )
         case .leftMouseUp:
             let location = try optionalPoint(action, imageSize, displayBounds)
                 ?? CGEvent(source: nil)?.location ?? .zero
-            try mouseUp(.left, at: location)
+            try mouseUp(.left, at: location, authorizePointer: authorizePointer)
         case .drag:
             try drag(
                 action,
                 imageSize: imageSize,
                 displayBounds: displayBounds,
-                shouldStop: shouldStop
+                shouldStop: shouldStop,
+                authorizePointer: authorizePointer
             )
         case .type:
             try typeUnicode(action.text ?? "", shouldStop: shouldStop)
@@ -213,7 +236,7 @@ final class ComputerInputSynth: @unchecked Sendable {
             try cancellablePause(action.duration ?? 1, shouldStop: shouldStop)
         case .scroll:
             try ensureRunning(shouldStop)
-            try scroll(action)
+            try scroll(action, authorizePointer: authorizePointer)
         }
         try cancellablePause(0.012, shouldStop: shouldStop)
     }

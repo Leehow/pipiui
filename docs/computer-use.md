@@ -9,13 +9,14 @@ Computer Use 默认关闭。关闭时 `pipiui-computer-use.ts` 不会传给 `pi 
 v1 的边界：
 
 - macOS 14+；一个设置中选定的显示器，不做多显示器全景拼接。
-- ScreenCaptureKit 直接按最长边 1080 或 1440 px 降采样，内存中编码 PNG，并尽量排除 PipiUI 应用窗口。
+- ScreenCaptureKit 直接按最长边 1080 或 1440 px 降采样，内存中编码 PNG，并排除 PipiUI 应用窗口。
 - 不读取 Accessibility Tree、Secure Text Field 或 OCR，不能可靠理解像素中的“支付/发布/删除”语义；因此 v1 不允许无人值守的破坏性流程。常见 token/private-key 形态会在输入前被拦截，但这不是完整的 secret 检测。
 - 任意时刻只有一个顶层会话持有全局桌面 lease。切换 PipiUI 会话、关闭/重启会话、进程退出、超时、用户接管或急停都会释放 lease。
 - subagent 无条件排除 `computer`，不受工具设置或 agent 定义影响。
-- 目标应用按当前前台 bundle identifier 每次重新核对。新应用需要显式确认；可以仅本会话允许或持久允许/拒绝。
-- PipiUI 自身、Terminal/iTerm/Ghostty、密码管理器、钥匙串、系统授权进程和 System Settings 永久拒绝。`⌘Tab` / `⌘Space` 应用切换以及 `⌘Q` / `⌘Delete` 等高风险快捷键也被拒绝；需要用户亲自切到并授权新目标应用。
-- 用户真实移动鼠标、点击、按键或滚动时立即暂停并释放控制权。全局急停为 `⌥⇧Esc`；它还会撤销所有会话授权、释放所有按键/鼠标 down 状态并向当前控制会话发送 abort。
+- 目标应用按当前前台 bundle identifier **和 PID** 在每个动作前后重新核对。每个 pointer event 还会 front-to-back 命中最上层可见窗口；Dock、菜单栏、系统 UI、其他 App 或空白区域都会在事件发送前被拒绝。
+- 新应用需要显式确认；可以仅本会话允许或持久允许/拒绝。每个含非 screenshot action 的批次还需要一次 request-id + 完整动作指纹绑定的确认，10 秒过期、只执行一次，旧确认按钮不能批准替代请求。
+- PipiUI 自身、Terminal/iTerm/Ghostty/Warp/Kitty/WezTerm/Alacritty 等终端、密码管理器、钥匙串、系统授权进程和 System Settings 永久拒绝。`⌘Tab` / `⌘Space` 应用切换以及 `⌘Q` / `⌘Delete` 等高风险快捷键也被拒绝；需要用户亲自切到并授权新目标应用。
+- 用户真实移动鼠标、点击、按键或滚动时立即暂停并释放控制权。全局急停为 `⌥⇧Esc`；它会收集并中止 active、in-flight、pending approval 和 paused 会话，撤销授权并释放所有按键/鼠标 down 状态。
 
 ## 工具协议
 
@@ -32,9 +33,9 @@ v1 的边界：
 }
 ```
 
-支持 screenshot、mouse_move、left/right/middle click、double/triple click、left mouse down/up、drag、Unicode type（含中文/emoji）、named-key shortcut、hold_key、scroll 和 wait。最多 24 个动作一批；所有坐标在发送输入前统一验证，越界整批拒绝。
+支持 screenshot、mouse_move、left/right/middle click、double/triple click、left mouse down/up、drag、Unicode type（含中文/emoji）、named-key shortcut、hold_key、scroll 和 wait。最多 12 个动作一批；wait/hold 最长 3 秒、输入最多 4000 UTF-16 units，并先通过 17 秒静态运行预算。Unicode 只在完整 grapheme 边界分块，不切断 surrogate pair、组合字符或 emoji。所有坐标在发送输入前统一验证，越界整批拒绝。
 
-Anthropic + `anthropic-messages` 只在 provider 请求边界替换成官方：
+只有 provider 精确为 `anthropic`、API 为 `anthropic-messages`，且 model id 明确属于 Sonnet 5、Opus 4.8/4.7/4.6、Sonnet 4.6 或 Opus 4.5 时，才在 provider 请求边界替换成官方：
 
 ```json
 {
@@ -45,11 +46,11 @@ Anthropic + `anthropic-messages` 只在 provider 请求边界替换成官方：
 }
 ```
 
-扩展会把 `computer-use-2025-11-24` 合并进已有 `anthropic-beta`，不会覆盖其他 beta。Anthropic 的单 action 输入会在本地规范化为长度 1 的 batch。
+扩展会把 `computer-use-2025-11-24` 合并进已有 `anthropic-beta`，不会覆盖其他 beta。Anthropic 的单 action 输入会在本地规范化为长度 1 的 batch。旧模型、未知模型、Opus 5 和 proxy provider 保持自定义工具路径，不猜测 provider 能力。
 
 OpenAI/Codex 与其他 provider 仍走上述自定义工具。v1 **没有**实现或宣称支持 OpenAI 原生 `computer_call` / `computer_call_output` 循环。
 
-每个被安全闸门接受的 batch 都以新截图结束，并返回动作 outcome、前台应用、窗口标题、截图尺寸和 focus-drift 状态。为了保证截图不落盘，扩展只把一个 opaque screenshot marker 写进 pi 的 toolResult；PNG 最多保留最近 12 张在扩展进程内存中，由 `context` hook 注入提供给模型。重启会话后旧 marker 对应的图片不可恢复。
+每个未被取消、且被安全闸门接受的 batch 都以新截图结束，并返回动作 outcome、前台应用、窗口标题、截图尺寸和 focus-drift 状态。选中 display id、输出 pixel size 与全局 point bounds 是一个不可变 descriptor；provider schema、坐标验证/映射与 ScreenCaptureKit 输出共用它，显示器缺失或几何变化时不会静默回退主显示器。为了保证截图不落盘，扩展只把一个 opaque screenshot marker 写进 pi 的 toolResult；PNG 最多保留最近 12 张在扩展进程内存中，由 `context` hook 注入提供给模型。重启会话后旧 marker 对应的图片不可恢复。
 
 ## 权限与稳定签名
 
@@ -87,6 +88,7 @@ tccutil reset ScreenCapture com.leehow.pipiui
 ## 安全与隐私
 
 - bridge 只监听 `127.0.0.1`，只接受有 Content-Length 的 `POST /rpc`，请求 body 上限 2 MiB，连接超时 40 秒。
+- 每个 batch 有 UUID request id。pi 在 35 秒超时时发送显式 `computer_cancel`；bridge 断连/40 秒 deadline 和 Swift 20 秒执行 watchdog 也会按同一 request id 取消 gate、阻止后续动作并释放 lease/held input。10 秒确认期 + 20 秒执行上限严格低于两层传输 deadline。
 - 每个顶层会话使用独立的 32-byte 路由 capability 与桌面写 capability；任何 bridge 请求都在主线程路由前做恒时比较验证，`computer_batch` 还要通过第二个 capability。桌面 capability 会从 subagent、验证 shell 和辅助 git 子进程的环境中删除。
 - 截图 PNG 不写文件、不进入 pi JSONL；进程退出即丢失。
 - `~/Library/Application Support/PipiUI/computer-audit.jsonl` 只记录时间、随机 audit session id、bundle id、应用名、动作种类/坐标/计数、结果与 focus drift。
@@ -103,6 +105,7 @@ tccutil reset ScreenCapture com.leehow.pipiui
 2. 打开 `build/PipiUI.app`，在设置中开启 Computer Use，并授予两项 TCC 权限。
 3. 建立顶层会话；确认工具栏出现桌面图标，subagent 的工具参数中没有 `computer`。
 4. 首次工具调用应先返回 session consent required；批准后重试。首次目标应用调用应再返回 application authorization required；批准后必须切回该 App 再重试。
+5. 第一个非 screenshot batch 应保持请求等待并出现精确批次确认条；10 秒内批准后只执行一次，拒绝、过期、关闭会话或传输取消都不得继续发送输入。
 
 ### TextEdit
 

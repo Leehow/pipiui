@@ -16,6 +16,48 @@ final class ComputerExecutionGate: @unchecked Sendable {
     }
 }
 
+final class ComputerResponseGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didRespond = false
+    private let callback: ([String: Any]) -> Void
+
+    init(_ callback: @escaping ([String: Any]) -> Void) {
+        self.callback = callback
+    }
+
+    func respond(_ response: [String: Any]) {
+        let shouldRespond = lock.withLock {
+            guard !didRespond else { return false }
+            didRespond = true
+            return true
+        }
+        if shouldRespond { callback(response) }
+    }
+}
+
+final class ComputerInFlightExecution {
+    let requestID: String
+    let sessionKey: String
+    let generation: UInt64
+    let gate: ComputerExecutionGate
+    let reply: ComputerResponseGate
+    var watchdog: DispatchWorkItem?
+
+    init(
+        requestID: String,
+        sessionKey: String,
+        generation: UInt64,
+        gate: ComputerExecutionGate,
+        reply: ComputerResponseGate
+    ) {
+        self.requestID = requestID
+        self.sessionKey = sessionKey
+        self.generation = generation
+        self.gate = gate
+        self.reply = reply
+    }
+}
+
 final class ComputerCoordinator: ObservableObject {
     static let shared = ComputerCoordinator()
 
@@ -25,12 +67,28 @@ final class ComputerCoordinator: ObservableObject {
             case application(ComputerApplicationIdentity)
         }
 
-        let id = UUID()
+        let id: UUID
         let sessionKey: String
         let kind: Kind
+
+        init(id: UUID = UUID(), sessionKey: String, kind: Kind) {
+            self.id = id
+            self.sessionKey = sessionKey
+            self.kind = kind
+        }
+    }
+
+    struct PendingWriteApproval: Identifiable, Equatable {
+        let id: UUID
+        let requestID: String
+        let sessionKey: String
+        let fingerprint: String
+        let actionKinds: [ComputerActionKind]
+        let expiresAt: Date
     }
 
     @Published var pendingApproval: PendingApproval?
+    @Published var pendingWriteApproval: PendingWriteApproval?
     @Published var activeSessionKey: String?
     @Published var activeApplication: ComputerApplicationIdentity?
     @Published var remainingActions: Int?
@@ -43,15 +101,18 @@ final class ComputerCoordinator: ObservableObject {
     var sessionAllowedApps: [String: Set<String>] = [:]
     var auditSessionIDs: [String: String] = [:]
     var executionGeneration: UInt64 = 0
-    var executionGate: ComputerExecutionGate?
-    var batchInFlightSessionKey: String?
+    var inFlightExecution: ComputerInFlightExecution?
+    var pendingWriteContinuation: ComputerPendingWriteContinuation?
+    var pendingWriteExpiryWork: DispatchWorkItem?
     var expiryWork: DispatchWorkItem?
     var globalMonitor: Any?
     var localMonitor: Any?
-    private var onEmergencyStop: ((String) -> Void)?
+    var monitorAccessibilityState: Bool?
+    var onEmergencyStop: ((String) -> Void)?
+    let supportsInputMonitoring: Bool
 
-    private init() {
-        installInputMonitors()
+    init(supportsInputMonitoring: Bool = true) {
+        self.supportsInputMonitoring = supportsInputMonitoring
     }
 
     func configure(onEmergencyStop: @escaping (String) -> Void) {
@@ -70,22 +131,27 @@ final class ComputerCoordinator: ObservableObject {
         activeSessionKey == sessionKey
     }
 
-    func approvePendingSession(_ sessionKey: String) {
-        guard pendingApproval?.sessionKey == sessionKey,
+    func approvePendingSession(id: UUID, sessionKey: String) {
+        guard pendingApproval?.id == id,
+              pendingApproval?.sessionKey == sessionKey,
               pendingApproval?.kind == .session else { return }
         sessionConsents.insert(sessionKey)
         deniedSessionKeys.remove(sessionKey)
         pausedSessionKeys.remove(sessionKey)
         pendingApproval = nil
         statusMessage = "Computer Use 已授权给当前会话；请让模型重试。"
+        refreshInputMonitoring()
     }
 
-    func denyPendingSession(_ sessionKey: String) {
-        guard pendingApproval?.sessionKey == sessionKey else { return }
+    func denyPendingSession(id: UUID, sessionKey: String) {
+        guard pendingApproval?.id == id,
+              pendingApproval?.sessionKey == sessionKey,
+              pendingApproval?.kind == .session else { return }
         deniedSessionKeys.insert(sessionKey)
         sessionConsents.remove(sessionKey)
         pendingApproval = nil
         statusMessage = "已拒绝当前会话的 Computer Use。"
+        refreshInputMonitoring()
     }
 
     func allowSessionFromToolbar(_ sessionKey: String) {
@@ -93,28 +159,35 @@ final class ComputerCoordinator: ObservableObject {
         deniedSessionKeys.remove(sessionKey)
         pausedSessionKeys.remove(sessionKey)
         statusMessage = "Computer Use 已授权给当前会话。"
+        refreshInputMonitoring()
     }
 
     func approvePendingApplication(
-        _ sessionKey: String,
+        id: UUID,
+        sessionKey: String,
         persist: Bool
     ) {
         guard let pending = pendingApproval,
+              pending.id == id,
               pending.sessionKey == sessionKey,
               case .application(let app) = pending.kind else { return }
-        let bundleID = app.normalizedBundleID
-        sessionAllowedApps[sessionKey, default: []].insert(bundleID)
+        sessionAllowedApps[sessionKey, default: []].insert(app.normalizedBundleID)
         if persist {
-            ComputerUseSettings.setPersistedPolicy(bundleID: bundleID, decision: .allow)
+            ComputerUseSettings.setPersistedPolicy(
+                bundleID: app.normalizedBundleID,
+                decision: .allow
+            )
         }
         pendingApproval = nil
         statusMessage = persist
             ? "已始终允许 \(app.name)；请让模型重试。"
             : "本会话已允许 \(app.name)；请让模型重试。"
+        refreshInputMonitoring()
     }
 
-    func denyPendingApplication(_ sessionKey: String, persist: Bool) {
+    func denyPendingApplication(id: UUID, sessionKey: String, persist: Bool) {
         guard let pending = pendingApproval,
+              pending.id == id,
               pending.sessionKey == sessionKey,
               case .application(let app) = pending.kind else { return }
         if persist {
@@ -127,77 +200,13 @@ final class ComputerCoordinator: ObservableObject {
         statusMessage = persist
             ? "已始终拒绝 \(app.name)。"
             : "已拒绝本次对 \(app.name) 的请求。"
+        refreshInputMonitoring()
     }
 
     func resumeAfterUserTakeover(_ sessionKey: String) {
         pausedSessionKeys.remove(sessionKey)
         statusMessage = "已解除用户接管暂停；请先切回目标应用，再让模型重试。"
-    }
-
-    func release(sessionKey: String, revokeConsent: Bool = false) {
-        if pendingApproval?.sessionKey == sessionKey {
-            pendingApproval = nil
-        }
-        if revokeConsent {
-            sessionConsents.remove(sessionKey)
-            sessionAllowedApps.removeValue(forKey: sessionKey)
-            deniedSessionKeys.remove(sessionKey)
-            pausedSessionKeys.remove(sessionKey)
-            auditSessionIDs.removeValue(forKey: sessionKey)
-        }
-        guard leaseController.release(sessionKey: sessionKey) != nil
-                || batchInFlightSessionKey == sessionKey else {
-            return
-        }
-        executionGeneration &+= 1
-        executionGate?.cancel()
-        executionGate = nil
-        batchInFlightSessionKey = nil
-        expiryWork?.cancel()
-        expiryWork = nil
-        activeSessionKey = nil
-        activeApplication = nil
-        remainingActions = nil
-        ComputerInputSynth.shared.releaseAll()
-    }
-
-    func releaseAll(revokeConsent: Bool) {
-        if revokeConsent {
-            sessionConsents.removeAll()
-            sessionAllowedApps.removeAll()
-            deniedSessionKeys.removeAll()
-            pausedSessionKeys.removeAll()
-            auditSessionIDs.removeAll()
-            pendingApproval = nil
-        }
-        executionGeneration &+= 1
-        executionGate?.cancel()
-        executionGate = nil
-        batchInFlightSessionKey = nil
-        _ = leaseController.release()
-        expiryWork?.cancel()
-        expiryWork = nil
-        activeSessionKey = nil
-        activeApplication = nil
-        remainingActions = nil
-        ComputerInputSynth.shared.releaseAll()
-    }
-
-    func emergencyStop(sessionKey: String? = nil) {
-        if let sessionKey {
-            release(sessionKey: sessionKey, revokeConsent: true)
-            statusMessage = "急停已触发：桌面控制权与会话授权已撤销，输入状态已释放。"
-            onEmergencyStop?(sessionKey)
-            return
-        }
-        let target = activeSessionKey
-        releaseAll(revokeConsent: true)
-        guard let target else {
-            statusMessage = "Computer Use 已全局停止；所有会话授权已撤销。"
-            return
-        }
-        statusMessage = "全局急停已触发：所有桌面控制与会话授权已撤销，输入状态已释放。"
-        onEmergencyStop?(target)
+        refreshInputMonitoring()
     }
 
     func handle(
@@ -205,32 +214,30 @@ final class ComputerCoordinator: ObservableObject {
         sessionKey: String,
         respond: @escaping ([String: Any]) -> Void
     ) {
+        let reply = ComputerResponseGate(respond)
+        guard let requestID = rawRequest["requestID"].string,
+              UUID(uuidString: requestID) != nil else {
+            reply.respond(Self.failure("computer request is missing a valid requestID"))
+            return
+        }
         guard ComputerUseSettings.isEnabled() else {
-            respond(Self.failure("computer tool is disabled globally"))
+            reply.respond(Self.failure("computer tool is disabled globally"))
             return
         }
         guard !deniedSessionKeys.contains(sessionKey) else {
-            respond(Self.failure(
+            reply.respond(Self.failure(
                 "computer consent denied for this session; use the toolbar to allow it"
             ))
             return
         }
         guard !pausedSessionKeys.contains(sessionKey) else {
-            respond(Self.failure(
+            reply.respond(Self.failure(
                 "computer paused after user input; explicitly resume it in PipiUI"
             ))
             return
         }
         guard sessionConsents.contains(sessionKey) else {
-            guard pendingApproval == nil || pendingApproval?.sessionKey == sessionKey else {
-                respond(Self.failure("computer busy: another session is awaiting approval"))
-                return
-            }
-            pendingApproval = PendingApproval(sessionKey: sessionKey, kind: .session)
-            statusMessage = "Computer Use 等待当前会话授权。"
-            respond(Self.failure(
-                "computer session consent required; approve it in the PipiUI consent bar, then retry"
-            ))
+            requestSessionApproval(sessionKey: sessionKey, reply: reply)
             return
         }
 
@@ -238,132 +245,92 @@ final class ComputerCoordinator: ObservableObject {
         do {
             request = try ComputerRequest.normalize(rawRequest)
         } catch {
-            respond(Self.failure(error.localizedDescription))
+            reply.respond(Self.failure(error.localizedDescription))
             return
         }
+        guard guardPermissions(for: request, reply: reply) else { return }
 
-        let permissions = ComputerPermissions.snapshot()
-        guard permissions.screenRecording else {
-            statusMessage = "缺少屏幕录制权限。"
-            respond(Self.failure(
-                "Screen Recording permission is missing; grant it in System Settings"
-            ))
-            return
-        }
-        if request.actions.contains(where: \.emitsInput), !permissions.accessibility {
-            statusMessage = "缺少辅助功能权限。"
-            respond(Self.failure(
-                "Accessibility permission is missing; grant it in System Settings"
-            ))
-            return
-        }
         guard let application = ComputerFrontmostApplication.current() else {
-            respond(Self.failure("frontmost application identity is unavailable"))
+            reply.respond(Self.failure("frontmost application identity is unavailable"))
             return
         }
-
-        let policy = ComputerAppPolicy.decision(
-            for: application,
-            sessionAllowed: sessionAllowedApps[sessionKey] ?? [],
-            persistedAllowed: ComputerUseSettings.persistedAllowedBundleIDs(),
-            persistedDenied: ComputerUseSettings.persistedDeniedBundleIDs()
-        )
-        switch policy {
-        case .deny(let reason):
-            statusMessage = reason
-            respond(Self.failure(reason))
-            return
-        case .needsConfirmation:
-            guard pendingApproval == nil || pendingApproval?.sessionKey == sessionKey else {
-                respond(Self.failure("computer busy: another session is awaiting approval"))
-                return
-            }
-            pendingApproval = PendingApproval(
-                sessionKey: sessionKey,
-                kind: .application(application)
-            )
-            statusMessage = "Computer Use 等待 \(application.name) 的应用级授权。"
-            respond(Self.failure(
-                "application authorization required for \(application.name) "
-                    + "(\(application.bundleID)); approve the captured identity in PipiUI, then retry"
-            ))
-            return
-        case .allow:
-            break
-        }
-
-        if let inFlight = batchInFlightSessionKey {
-            let error = inFlight == sessionKey
+        guard authorizeApplication(
+            application,
+            sessionKey: sessionKey,
+            reply: reply
+        ) else { return }
+        guard inFlightExecution == nil else {
+            let message = inFlightExecution?.sessionKey == sessionKey
                 ? "computer busy: this session already has a batch in flight"
                 : "computer busy: another PipiUI session owns the desktop"
-            respond(Self.failure(error))
+            reply.respond(Self.failure(message))
             return
         }
 
-        let displayID = ComputerUseSettings.selectedDisplayID()
-        let imageSize = ComputerUseSettings.providerDisplaySize()
-        let displayBounds = CGDisplayBounds(displayID)
+        let descriptor: ComputerCaptureDescriptor
         do {
+            descriptor = try ComputerUseSettings.captureDescriptor()
+            try descriptor.validateAdvertisement(
+                displayID: rawRequest["displayID"].int,
+                width: rawRequest["displayWidth"].int,
+                height: rawRequest["displayHeight"].int
+            )
             try ComputerInputSynth.shared.validate(
                 actions: request.actions,
-                imageSize: imageSize,
-                displayBounds: displayBounds
+                imageSize: descriptor.outputSize,
+                displayBounds: descriptor.globalBounds
             )
+            try ComputerRuntimeBudget.validate(request.actions)
         } catch {
-            respond(Self.failure(error.localizedDescription))
+            reply.respond(Self.failure(error.localizedDescription))
             return
         }
 
-        let now = Date()
-        let lease: ComputerLease
-        do {
-            lease = try leaseController.acquire(
-                sessionKey: sessionKey,
-                targetBundleID: application.normalizedBundleID,
-                actionCount: request.actions.count,
-                now: now
-            )
-        } catch {
-            if case ComputerLeaseError.targetChanged = error {
-                release(sessionKey: sessionKey)
+        if request.requiresWriteApproval {
+            do {
+                try requestWriteApproval(
+                    requestID: requestID,
+                    sessionKey: sessionKey,
+                    request: request,
+                    application: application,
+                    descriptor: descriptor,
+                    reply: reply
+                )
+            } catch {
+                reply.respond(Self.failure(error.localizedDescription))
             }
-            respond(Self.failure(error.localizedDescription))
             return
         }
+        beginExecution(
+            requestID: requestID,
+            sessionKey: sessionKey,
+            request: request,
+            application: application,
+            descriptor: descriptor,
+            reply: reply
+        )
+    }
 
-        activeSessionKey = sessionKey
-        activeApplication = application
-        remainingActions = lease.remainingActions
-        batchInFlightSessionKey = sessionKey
-        executionGeneration &+= 1
-        let generation = executionGeneration
-        let gate = ComputerExecutionGate()
-        executionGate = gate
-        scheduleExpiry(for: lease)
-        let auditID = auditSessionIDs[sessionKey] ?? UUID().uuidString
-        auditSessionIDs[sessionKey] = auditID
-
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let result = await self.executeBatch(
-                request,
-                sessionKey: sessionKey,
-                generation: generation,
-                gate: gate,
-                targetApplication: application,
-                displayID: displayID,
-                imageSize: imageSize,
-                displayBounds: displayBounds
-            )
-            self.finishBatch(
-                result,
-                request: request,
-                sessionKey: sessionKey,
-                gate: gate,
-                auditSessionID: auditID,
-                respond: respond
-            )
+    private func guardPermissions(
+        for request: ComputerRequest,
+        reply: ComputerResponseGate
+    ) -> Bool {
+        let permissions = ComputerPermissions.snapshot()
+        if !permissions.screenRecording {
+            statusMessage = "缺少屏幕录制权限。"
+            reply.respond(Self.failure(
+                "Screen Recording permission is missing; grant it in System Settings"
+            ))
+            return false
+        } else if request.actions.contains(where: \.emitsInput),
+                  !permissions.accessibility {
+            statusMessage = "缺少辅助功能权限。"
+            reply.respond(Self.failure(
+                "Accessibility permission is missing; grant it in System Settings"
+            ))
+            return false
         }
+        return true
     }
 
     static func failure(_ message: String) -> [String: Any] {

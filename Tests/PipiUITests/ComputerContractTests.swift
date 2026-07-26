@@ -120,6 +120,9 @@ final class ComputerContractTests: XCTestCase {
         XCTAssertTrue(source.contains("injectInMemoryScreenshots("))
         XCTAssertTrue(source.contains("PIPIUI_COMPUTER_CAPABILITY"))
         XCTAssertTrue(source.contains("computerCapability: COMPUTER_CAPABILITY"))
+        XCTAssertTrue(source.contains(#"action: "computer_cancel""#))
+        XCTAssertTrue(source.contains("requestID"))
+        XCTAssertTrue(source.contains("PIPIUI_COMPUTER_DISPLAY_ID"))
         XCTAssertTrue(source.contains(
             "Keep only an opaque marker in agent"
         ))
@@ -146,7 +149,7 @@ final class ComputerContractTests: XCTestCase {
             root.appendingPathComponent("Sources/PipiUI/Computer/ComputerAudit.swift"))
 
         XCTAssertTrue(chat.contains(
-            "if ComputerUseSettings.isEnabled(), let computerUseExtension"
+            "if computerCaptureDescriptor != nil, let computerUseExtension"
         ))
         XCTAssertTrue(subagent.contains(#"excluded.add("computer")"#))
         XCTAssertTrue(subagent.contains(#"t !== "computer""#))
@@ -155,9 +158,9 @@ final class ComputerContractTests: XCTestCase {
         ))
         XCTAssertTrue(subagent.contains("env: pipiuiChildProcessEnv()"))
         XCTAssertTrue(coordinator.contains(
-            "Every accepted batch finishes with one fresh in-memory screenshot"
+            "Every non-cancelled accepted batch returns one fresh in-memory screenshot"
         ))
-        XCTAssertTrue(coordinator.contains("ComputerScreenCapture.capture("))
+        XCTAssertTrue(coordinator.contains("descriptor: descriptor"))
         XCTAssertTrue(signing.contains(#"PIPIUI_SIGN_ID:-PipiUI Dev"#))
         XCTAssertTrue(signing.contains(#"CODE_SIGN_ID="-""#))
         XCTAssertFalse(audit.contains("\"base64\""))
@@ -212,7 +215,35 @@ const anthropic = provider(
     { name: "computer", description: "custom" },
     { name: "read", description: "unchanged" },
   ] } },
-  { model: { provider: "anthropic", api: "anthropic-messages" } },
+  { model: {
+    provider: "anthropic",
+    api: "anthropic-messages",
+    id: "claude-sonnet-5-20260701",
+  } },
+);
+const olderAnthropic = provider(
+  { payload: { messages: [], tools: [{ name: "computer", description: "custom" }] } },
+  { model: {
+    provider: "anthropic",
+    api: "anthropic-messages",
+    id: "claude-opus-4-1-20250805",
+  } },
+);
+const proxyAnthropic = provider(
+  { payload: { messages: [], tools: [{ name: "computer", description: "custom" }] } },
+  { model: {
+    provider: "anthropic-proxy",
+    api: "anthropic-messages",
+    id: "claude-sonnet-5",
+  } },
+);
+const unknownAnthropic = provider(
+  { payload: { messages: [], tools: [{ name: "computer", description: "custom" }] } },
+  { model: { provider: "anthropic", api: "anthropic-messages", id: "claude-future" } },
+);
+const unsupportedOpus5 = provider(
+  { payload: { messages: [], tools: [{ name: "computer", description: "custom" }] } },
+  { model: { provider: "anthropic", api: "anthropic-messages", id: "claude-opus-5" } },
 );
 const openai = provider(
   { payload: { messages: [], tools: [{ name: "computer", description: "custom" }] } },
@@ -222,7 +253,20 @@ const openai = provider(
 const headerEvent: any = { headers: { "anthropic-beta": "existing-beta" } };
 handlers.get("before_provider_headers")!(
   headerEvent,
-  { model: { provider: "anthropic", api: "anthropic-messages" } },
+  { model: {
+    provider: "anthropic",
+    api: "anthropic-messages",
+    id: "claude-opus-4-8-20260601",
+  } },
+);
+const proxyHeaderEvent: any = { headers: {} };
+handlers.get("before_provider_headers")!(
+  proxyHeaderEvent,
+  { model: {
+    provider: "anthropic-proxy",
+    api: "anthropic-messages",
+    id: "claude-opus-4-8",
+  } },
 );
 
 const id = retainScreenshot("png-base64", "image/png");
@@ -266,10 +310,16 @@ let bridgedBody: any;
     anthropicTyped:
       anthropic.tools[0].type === "computer_20251124"
       && anthropic.tools[1].name === "read",
+    olderAnthropicCustom: olderAnthropic === undefined,
+    proxyAnthropicCustom: proxyAnthropic === undefined,
+    unknownAnthropicCustom: unknownAnthropic === undefined,
+    unsupportedOpus5Custom: unsupportedOpus5 === undefined,
     openaiUntouched: openai === undefined,
     betaMerged:
       headerEvent.headers["anthropic-beta"]
         === "existing-beta,computer-use-2025-11-24",
+    proxyBetaUntouched:
+      proxyHeaderEvent.headers["anthropic-beta"] === undefined,
     imageInjected:
       injected[0].content[1].type === "image"
       && injected[0].content[1].data === "png-base64",
@@ -281,7 +331,12 @@ let bridgedBody: any;
         === "x,computer-use-2025-11-24",
     bridgeCapabilities:
       bridgedBody.sessionKey === "test-capability"
-      && bridgedBody.computerCapability === "test-computer-capability",
+      && bridgedBody.computerCapability === "test-computer-capability"
+      && bridgedBody.displayID === 7
+      && bridgedBody.displayWidth === 1440
+      && bridgedBody.displayHeight === 900
+      && typeof bridgedBody.requestID === "string"
+      && bridgedBody.requestID.length > 20,
     resultMarkerOnly:
       executed.content.length === 1
       && executed.content[0].type === "text"
@@ -304,6 +359,7 @@ let bridgedBody: any;
                 "PIPIUI_BRIDGE_PORT": "1",
                 "PIPIUI_SESSION_KEY": "test-capability",
                 "PIPIUI_COMPUTER_CAPABILITY": "test-computer-capability",
+                "PIPIUI_COMPUTER_DISPLAY_ID": "7",
             ],
             uniquingKeysWith: { _, new in new }
         )

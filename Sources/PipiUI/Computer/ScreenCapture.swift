@@ -36,9 +36,7 @@ enum ComputerScreenCapture {
     /// Captures one selected display into a downscaled in-memory PNG.
     /// No screenshot bytes or intermediate bitmap are written to disk.
     static func capture(
-        displayID requestedDisplayID: CGDirectDisplayID =
-            ComputerUseSettings.selectedDisplayID(),
-        maxLongEdge: Int = ComputerUseSettings.maxLongEdge(),
+        descriptor: ComputerCaptureDescriptor,
         app expectedApp: ComputerApplicationIdentity? = nil
     ) async throws -> ComputerScreenshot {
         guard CGPreflightScreenCaptureAccess() else {
@@ -48,9 +46,9 @@ enum ComputerScreenCapture {
             false,
             onScreenWindowsOnly: true
         )
-        let display = content.displays.first(where: { $0.displayID == requestedDisplayID })
-            ?? content.displays.first(where: { $0.displayID == CGMainDisplayID() })
-        guard let display else {
+        guard let display = content.displays.first(where: {
+            $0.displayID == descriptor.displayID
+        }) else {
             throw ComputerScreenCaptureError.displayUnavailable
         }
 
@@ -63,14 +61,9 @@ enum ComputerScreenCapture {
             excludingApplications: excludedApps,
             exceptingWindows: []
         )
-        let size = ComputerUseSettings.downscaledSize(
-            pixelWidth: display.width,
-            pixelHeight: display.height,
-            maxLongEdge: maxLongEdge
-        )
         let configuration = SCStreamConfiguration()
-        configuration.width = size.width
-        configuration.height = size.height
+        configuration.width = descriptor.outputSize.width
+        configuration.height = descriptor.outputSize.height
         configuration.showsCursor = true
         configuration.scalesToFit = true
 
@@ -78,6 +71,10 @@ enum ComputerScreenCapture {
             contentFilter: filter,
             configuration: configuration
         )
+        guard cgImage.width == descriptor.outputSize.width,
+              cgImage.height == descriptor.outputSize.height else {
+            throw ComputerCaptureDescriptorError.capturedSizeMismatch
+        }
         let representation = NSBitmapImageRep(cgImage: cgImage)
         guard let png = representation.representation(using: .png, properties: [:]) else {
             throw ComputerScreenCaptureError.encodingFailed
@@ -96,7 +93,7 @@ enum ComputerScreenCapture {
         return ComputerScreenshot(
             pngData: png,
             imageSize: ComputerImageSize(width: cgImage.width, height: cgImage.height),
-            displayID: display.displayID,
+            displayID: descriptor.displayID,
             app: app
         )
     }
