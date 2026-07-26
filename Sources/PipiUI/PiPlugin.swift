@@ -22,6 +22,7 @@ enum PiPlugin {
         var reloadExtension: String?  // -e 内部 pipiui_reload 命令
         var webSearchExtension: String? // -e web_search / web_fetch
         var skillTierExtension: String? // -e 按模型档位注入 Superpowers 指令 + 派工闸门
+        var searchScopeExtension: String? // -e 项目内搜索边界 + 当轮外部路径授权
         var codexServerToolsExtension: String? // -e openai-codex hosted web_search
         var claudeServerToolsExtension: String? // -e anthropic hosted web_search
         var agentsDir: String?     // PIPIUI_AGENTS_DIR
@@ -31,6 +32,13 @@ enum PiPlugin {
     private static var root: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("PipiUI")
+    }
+
+    /// ChatSession is constructed from an Installed value in AppStore, but keeping this
+    /// path app-owned avoids widening that already-large initializer solely for one guard.
+    static var searchScopeExtensionPath: String? {
+        let path = root.appendingPathComponent("pipiui-search-scope.ts").path
+        return FileManager.default.fileExists(atPath: path) ? path : nil
     }
 
     /// 启动指纹标记：上次完整安装时的插件指纹，未变更则整轮跳过（第二次启动基本零 I/O）。
@@ -103,6 +111,7 @@ enum PiPlugin {
             ("pipiui-reload.ts", \.reloadExtension),
             ("pipiui-websearch.ts", \.webSearchExtension),
             ("pipiui-skilltier.ts", \.skillTierExtension),
+            ("pipiui-search-scope.ts", \.searchScopeExtension),
             ("pipiui-codex-server-tools.ts", \.codexServerToolsExtension),
             ("pipiui-claude-server-tools.ts", \.claudeServerToolsExtension),
             ("boss-prompt.md", \.bossPrompt),
@@ -170,6 +179,9 @@ enum PiPlugin {
         // 5.6 模型档位 → Superpowers 强度（强模型作参考，弱模型强制走 SOP）
         result.skillTierExtension = SkillTierExtension.install(into: root)
         ModelTierSettings.syncJSONFile()
+
+        // 5.65 项目搜索边界：内建 find/grep/ls + 明确的递归 bash 搜索
+        result.searchScopeExtension = SearchScopeExtension.install(into: root)
 
         // 5.7 官方 openai-codex Responses hosted web_search
         result.codexServerToolsExtension = CodexServerToolsExtension.install(into: root)

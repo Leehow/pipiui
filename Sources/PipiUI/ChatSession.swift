@@ -534,6 +534,8 @@ final class ChatSession: ObservableObject, Identifiable {
     private var deferredInitialEvents: [J] = []
     private var cachedBranchMessages: [J] = []
     private var cachedLeafId: String?
+    /// Exact app-generated prompts that must neither create nor revoke a human path grant.
+    private var searchGrantSuppressedMessages: [String: Int] = [:]
     /// Offline preview state is replaced (not appended as optimistic live content) once
     /// authoritative get_messages completes.
     private var initialPreviewItemCount = 0
@@ -558,6 +560,8 @@ final class ChatSession: ObservableObject, Identifiable {
         self.id = id
         self.projectURL = projectURL
         self.resumedFromDisk = sessionPath != nil
+        // A restarted/resumed session never inherits a stale external-search grant.
+        SearchScopeExtension.resetTurnGrant(sessionKey: id, projectRoot: projectURL)
         // Worktree auto-merge target (successful subagents → merge into session project root).
         subagents.bindMainProject(projectURL)
         // Attribute per-turn usage events to this session in the token ledger.
@@ -579,7 +583,7 @@ final class ChatSession: ObservableObject, Identifiable {
             guard let self else { return }
             let text = WorktreeMergeFailedMessage.format(agent: agent, error: error)
             DispatchQueue.main.async {
-                self.sendPrompt(text)
+                self.sendAppGeneratedPrompt(text)
             }
         }
         subagents.onPostMergeVerifyFailed = { [weak self] agent, failure, mainDirty in
@@ -587,7 +591,7 @@ final class ChatSession: ObservableObject, Identifiable {
             let text = PostMergeVerifyFailedMessage.format(
                 agent: agent, failure: failure, mainDirty: mainDirty)
             DispatchQueue.main.async {
-                self.sendPrompt(text)
+                self.sendAppGeneratedPrompt(text)
             }
         }
         // Keep crash badge while background subagents run after main agent_settled.
@@ -629,6 +633,9 @@ final class ChatSession: ObservableObject, Identifiable {
         if let reloadExtension { args += ["-e", reloadExtension] }
         if let webSearchExtension { args += ["-e", webSearchExtension] }
         if let skillTierExtension { args += ["-e", skillTierExtension] }
+        if let searchScopeExtension = PiPlugin.searchScopeExtensionPath {
+            args += ["-e", searchScopeExtension]
+        }
         if let codexServerToolsExtension { args += ["-e", codexServerToolsExtension] }
         if let claudeServerToolsExtension { args += ["-e", claudeServerToolsExtension] }
         // Settings → 工具开关：禁用项走 pi --exclude-tools（会话重启后生效）
@@ -636,6 +643,12 @@ final class ChatSession: ObservableObject, Identifiable {
         var extraEnv: [String: String] = [:]
         extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"] = WebSearchSettings.configFileURL().path
         extraEnv["PIPIUI_MODEL_TIERS_FILE"] = ModelTierSettings.tiersFileURL().path
+        extraEnv["PIPIUI_SEARCH_GRANT_FILE"] =
+            SearchScopeExtension.grantFileURL(sessionKey: id).path
+        if let searchScopeExtension = PiPlugin.searchScopeExtensionPath {
+            // Nested subagent Pi processes inherit this and pass the same guard via -e.
+            extraEnv["PIPIUI_SEARCH_SCOPE_EXT"] = searchScopeExtension
+        }
         // App 自有插件通过 -e 加载：webview 工具 + 补丁版 subagent（覆盖自动发现的官方版）
         if bridgePort > 0 {
             if let webviewExtension { args += ["-e", webviewExtension] }
@@ -2298,6 +2311,14 @@ final class ChatSession: ObservableObject, Identifiable {
         sendPromptNow(message: prepared.message, images: prepared.images)
     }
 
+    /// App-authored user-role messages are useful orchestration input, but are not
+    /// human authorization. Preserve the latest human grant without widening it.
+    private func sendAppGeneratedPrompt(_ text: String) {
+        let key = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        searchGrantSuppressedMessages[key, default: 0] += 1
+        sendPrompt(text)
+    }
+
     /// Run image/video generation via grok-relay / coding-relay REST (same APIs as Grok Build).
     func generateMedia(prompt: String, images: [DraftImage]) {
         guard !mediaBusy else { return }
@@ -2415,6 +2436,23 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     private func sendPromptNow(message: String, images: [DraftImage], requeueOnFailure: QueuedMessage? = nil) {
+        let suppressionCount = searchGrantSuppressedMessages[message] ?? 0
+        if suppressionCount > 0 {
+            if suppressionCount == 1 {
+                searchGrantSuppressedMessages.removeValue(forKey: message)
+            } else {
+                searchGrantSuppressedMessages[message] = suppressionCount - 1
+            }
+        } else {
+            // Replace the grant before Pi sees this human-composer turn. A prompt without
+            // an explicit path writes an empty list, expiring any permission from last turn.
+            try? SearchScopeExtension.recordUserTurn(
+                message,
+                sessionKey: id,
+                projectRoot: projectURL
+            )
+        }
+
         // Provisional title + at most one side-channel LLM refine (first user message only).
         // Never ghost-prompt the main pi process.
         if autoTitleEnabled,
