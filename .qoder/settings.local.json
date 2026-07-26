@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /Users/haoli/leehow/code/pipiui && git --no-pager log --oneline -20)",
+      "Bash(cd /Users/haoli/leehow/code/pipiui && git --no-pager log --oneline -25)"
+    ]
+  }
+}

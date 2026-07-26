@@ -89,7 +89,8 @@ final class ScrollStateTests: XCTestCase {
     /// but a LazyVStack realizes only that anchor row and none of the message rows
     /// in the visible rectangle. Logs captured this exact signature:
     ///   document=10403 visible=9585..10403 (818) subviews=1 overshoot=0
-    /// Switching the transcript to a non-lazy VStack is what makes subviews > 1 here.
+    /// The inverted transcript avoids producing this state by starting at its natural
+    /// document origin instead of programmatically scrolling to the bottom on switch.
     func testPinnedToBottomButOnlyAnchorRealizedIsBlank() {
         let signature = state(document: 10403, visibleY: 9585, visibleHeight: 818, subviews: 1)
         XCTAssertEqual(signature.overshoot, 0)

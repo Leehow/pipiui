@@ -359,7 +359,12 @@ struct InputBar: View {
             TextField(fieldPlaceholder,
                       text: $session.draftText, axis: .vertical)
                 .textFieldStyle(.plain)
+                // Do not inherit a low-contrast foreground from the surrounding
+                // status/menu chrome. Draft text must remain readable in both
+                // light and dark appearances.
+                .foregroundStyle(Color.primary)
                 .lineLimit(1...10)
+                .frame(minHeight: 20, alignment: .leading)
                 .focused($focused)
                 .onSubmit(send)
                 .padding(.vertical, 6)

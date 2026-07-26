@@ -3,15 +3,12 @@ import Combine
 
 /// Explains the "切进会话先白屏、拖一下滚动条才出字" report.
 ///
-/// Root cause (confirmed by logs: `document=10403 visible=9585..10403 (818) subviews=1`):
-/// the transcript was a `LazyVStack` inside a bottom-anchored `ScrollView`. On
-/// session switch `proxy.scrollTo("bottom")` lands the clip view on the bottom
-/// anchor (`overshoot=0`), but a LazyVStack does not realize the message rows
-/// sitting in the visible rectangle above that anchor — only the anchor row
-/// itself gets realized (`subviews=1`), so the pane stays blank until a real
-/// scroll event (dragging the scrollbar) forces the lazy stack to populate.
-/// Fix: the transcript now uses a non-lazy `VStack`; realized-row budget is the
-/// same because `transcriptVisibleCount` already caps `ForEach` to `suffix(~150)`.
+/// Historical root cause (confirmed by logs:
+/// `document=10403 visible=9585..10403 (818) subviews=1`): a programmatic
+/// `scrollTo("bottom")` on the old bottom-anchored transcript realized only the
+/// anchor row. The current inverted transcript avoids that switch-time scroll:
+/// its session-scoped scroll view starts naturally at document-start, which is
+/// the visual latest edge, while the `LazyVStack` realizes the visible rows.
 ///
 /// This observer records the three numbers that tell those cases apart:
 /// document height, visible rectangle, and how far the visible rectangle sits

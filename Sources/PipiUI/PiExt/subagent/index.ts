@@ -278,8 +278,18 @@ function formatCtxModel(model: { provider?: string; id?: string } | undefined | 
 	return `${model.provider}/${model.id}`;
 }
 
-/** Hot-read PipiUI settings JSON (UserDefaults mirror). Missing / empty = follow main. */
-function loadSubagentModelOverrides(): Record<string, string> {
+interface SubagentModelOverride {
+	model: string;
+	/** Explicit Pi `--thinking` level. Absent preserves the existing/default behavior. */
+	thinking?: string;
+}
+
+/** Hot-read PipiUI settings JSON (UserDefaults mirror). Missing / empty = follow main.
+ *
+ * Legacy values are model strings. New values are `{ model, thinking? }`; normalizing
+ * both shapes here lets a running extension immediately see settings saved by the app.
+ */
+function loadSubagentModelOverrides(): Record<string, SubagentModelOverride> {
 	const file =
 		process.env.PIPIUI_SUBAGENT_MODELS_FILE ||
 		path.join(os.homedir(), "Library/Application Support/PipiUI/subagent-models.json");
@@ -287,12 +297,36 @@ function loadSubagentModelOverrides(): Record<string, string> {
 		const raw = fs.readFileSync(file, "utf-8");
 		const parsed = JSON.parse(raw) as unknown;
 		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-			return parsed as Record<string, string>;
+			const result: Record<string, SubagentModelOverride> = {};
+			for (const [agentName, value] of Object.entries(parsed)) {
+				if (typeof value === "string" && value.trim()) {
+					result[agentName] = { model: value.trim() };
+				} else if (value && typeof value === "object" && !Array.isArray(value)) {
+					const candidate = value as { model?: unknown; thinking?: unknown };
+					if (typeof candidate.model === "string" && candidate.model.trim()) {
+						const thinking =
+							typeof candidate.thinking === "string" && candidate.thinking.trim()
+								? candidate.thinking.trim()
+								: undefined;
+						result[agentName] = { model: candidate.model.trim(), ...(thinking ? { thinking } : {}) };
+					}
+				}
+			}
+			return result;
 		}
 	} catch {
 		// absent or unreadable → all follow main
 	}
 	return {};
+}
+
+const PI_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+/** `model:high` is Pi shorthand, not a distinct model id. */
+function stripModelThinkingSuffix(modelRef: string): string {
+	const colon = modelRef.lastIndexOf(":");
+	if (colon <= 0) return modelRef;
+	return PI_THINKING_LEVELS.has(modelRef.slice(colon + 1)) ? modelRef.slice(0, colon) : modelRef;
 }
 
 /**
@@ -353,8 +387,8 @@ function resolveAgentModel(
 ): string | undefined {
 	const overrides = loadSubagentModelOverrides();
 	const explicit = overrides[agentName];
-	if (typeof explicit === "string" && explicit.trim()) {
-		return explicit.trim();
+	if (explicit?.model) {
+		return explicit.model;
 	}
 	const fileMain = loadMainModelFile();
 	const main =
@@ -365,6 +399,11 @@ function resolveAgentModel(
 	if (main && main.trim()) return main.trim();
 	const fb = frontmatterModel?.trim();
 	return fb || undefined;
+}
+
+/** Only explicit per-subagent settings receive a `--thinking` argument. */
+function resolveAgentThinking(agentName: string): string | undefined {
+	return loadSubagentModelOverrides()[agentName]?.thinking;
 }
 
 /** Main-agent model to stamp onto child env so nested agents still「跟随主」. */
@@ -1341,12 +1380,16 @@ async function runSingleAgent(
 	const spawnCwd = placement.cwd;
 
 	const resolvedModel = resolveAgentModel(agentName, agent.model, options?.sessionModel);
+	const resolvedThinking = resolveAgentThinking(agentName);
 	const mainModelForChild = inheritMainModel(options?.sessionModel);
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
-	if (resolvedModel) args.push("--model", resolvedModel);
+	// A new explicit thinking override wins over Pi's older `model:thinking` shorthand.
+	// Strip only a recognized shorthand suffix, preserving other colon-containing model ids.
+	if (resolvedModel) args.push("--model", resolvedThinking ? stripModelThinkingSuffix(resolvedModel) : resolvedModel);
+	if (resolvedThinking) args.push("--thinking", resolvedThinking);
 	const disabledTools = loadDisabledTools();
 	if (agent.tools && agent.tools.length > 0) {
 		const allowed = agent.tools.filter((t) => !disabledTools.has(t));

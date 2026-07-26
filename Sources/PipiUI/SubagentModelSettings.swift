@@ -6,6 +6,16 @@ enum SubagentModelSettings {
     static let defaultsKey = "pipiui.subagentModels"
     /// Sentinel stored value is never used; absence or "" means follow.
     static let followMainSentinel = ""
+    /// Picker sentinel: omit `--thinking` and let Pi/the selected model choose its default.
+    static let defaultThinkingSentinel = ""
+
+    /// An explicit per-agent override. Legacy persisted values are strings containing just
+    /// `model`; newer values can add `thinking`. Keeping the two fields separate avoids
+    /// treating Pi's optional `model:thinking` shorthand as part of a model id.
+    struct Override: Equatable {
+        let model: String
+        let thinking: String?
+    }
 
     /// Application Support JSON consumed by the Node subagent extension at spawn time.
     static func overridesFileURL(
@@ -62,15 +72,44 @@ enum SubagentModelSettings {
     }
 
 
-    static func allOverrides(defaults: UserDefaults = .standard) -> [String: String] {
-        // UserDefaults returns [String: Any] with NSString values — do not cast to [String: String].
+    static func allSettings(defaults: UserDefaults = .standard) -> [String: Override] {
+        // UserDefaults returns [String: Any] with NSString/nested NSDictionary values — do not
+        // cast the complete dictionary. String entries are the pre-thinking-level format.
         guard let raw = defaults.dictionary(forKey: defaultsKey) else { return [:] }
-        var result: [String: String] = [:]
+        var result: [String: Override] = [:]
         for (key, value) in raw {
             if let s = value as? String {
-                result[key] = s
+                let model = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !model.isEmpty { result[key] = Override(model: model, thinking: nil) }
             } else if let s = value as? NSString {
-                result[key] = s as String
+                let model = (s as String).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !model.isEmpty { result[key] = Override(model: model, thinking: nil) }
+            } else if let dict = value as? [String: Any],
+                      let rawModel = dict["model"] as? String {
+                let model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                let thinking = (dict["thinking"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !model.isEmpty {
+                    result[key] = Override(model: model, thinking: thinking?.isEmpty == false ? thinking : nil)
+                }
+            }
+        }
+        return result
+    }
+
+    /// Model-only compatibility surface for existing callers.
+    static func allOverrides(defaults: UserDefaults = .standard) -> [String: String] {
+        var result = allSettings(defaults: defaults).mapValues(\.model)
+        // Preserve an old explicit empty-string sentinel for diagnostics/serialization even
+        // though `allSettings` correctly treats it as follow-main rather than an override.
+        if let raw = defaults.dictionary(forKey: defaultsKey) {
+            for (key, value) in raw {
+                if let string = value as? String, string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    result[key] = string
+                } else if let string = value as? NSString,
+                          (string as String).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    result[key] = string as String
+                }
             }
         }
         return result
@@ -78,9 +117,12 @@ enum SubagentModelSettings {
 
     /// `nil` means follow main agent.
     static func modelOverride(for agentName: String, defaults: UserDefaults = .standard) -> String? {
-        let raw = allOverrides(defaults: defaults)[agentName] ?? ""
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        allSettings(defaults: defaults)[agentName]?.model
+    }
+
+    /// `nil` means use Pi/model default; it is never inherited from the main agent.
+    static func thinkingOverride(for agentName: String, defaults: UserDefaults = .standard) -> String? {
+        allSettings(defaults: defaults)[agentName]?.thinking
     }
 
     static func setModelOverride(
@@ -89,15 +131,36 @@ enum SubagentModelSettings {
         defaults: UserDefaults = .standard,
         fileManager: FileManager = .default
     ) {
-        var map = allOverrides(defaults: defaults)
+        setOverride(
+            modelId,
+            thinking: thinkingOverride(for: agentName, defaults: defaults),
+            for: agentName,
+            defaults: defaults,
+            fileManager: fileManager
+        )
+    }
+
+    static func setOverride(
+        _ modelId: String?,
+        thinking: String?,
+        for agentName: String,
+        defaults: UserDefaults = .standard,
+        fileManager: FileManager = .default,
+        to url: URL? = nil
+    ) {
+        var map = allSettings(defaults: defaults)
         let trimmed = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if trimmed.isEmpty {
             map.removeValue(forKey: agentName)
         } else {
-            map[agentName] = trimmed
+            let normalizedThinking = thinking?.trimmingCharacters(in: .whitespacesAndNewlines)
+            map[agentName] = Override(
+                model: trimmed,
+                thinking: normalizedThinking?.isEmpty == false ? normalizedThinking : nil
+            )
         }
-        defaults.set(map, forKey: defaultsKey)
-        syncJSONFile(map: map, fileManager: fileManager)
+        defaults.set(encodeForDefaults(map), forKey: defaultsKey)
+        syncJSONFile(map: map, fileManager: fileManager, to: url)
     }
 
     /// Resolve the model id that should be used for `agentName`.
@@ -121,27 +184,59 @@ enum SubagentModelSettings {
 
     /// Ensure the hot-read JSON matches UserDefaults (call on launch / after edits).
     static func syncJSONFile(
-        map: [String: String]? = nil,
+        map: [String: Override]? = nil,
         defaults: UserDefaults = .standard,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        to url: URL? = nil
     ) {
-        let payload = map ?? allOverrides(defaults: defaults)
-        let url = overridesFileURL(fileManager: fileManager)
-        let dir = url.deletingLastPathComponent()
+        let payload = map.map(encodeForDefaults) ?? serializedPayload(defaults: defaults)
+        let target = url ?? overridesFileURL(fileManager: fileManager)
+        let dir = target.deletingLastPathComponent()
         try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) else {
             return
         }
-        try? data.write(to: url, options: .atomic)
+        try? data.write(to: target, options: .atomic)
     }
 
     /// Encode overrides for tests / diagnostics.
     static func jsonString(defaults: UserDefaults = .standard) -> String {
-        let map = allOverrides(defaults: defaults)
+        let map = serializedPayload(defaults: defaults)
         guard let data = try? JSONSerialization.data(withJSONObject: map, options: [.sortedKeys]),
               let s = String(data: data, encoding: .utf8) else {
             return "{}"
         }
         return s
+    }
+
+    /// Write no-thinking entries as legacy strings so older extensions remain able to read
+    /// them. Only an explicitly selected strength upgrades that agent's JSON value to an object.
+    private static func encodeForDefaults(_ settings: [String: Override]) -> [String: Any] {
+        var encoded: [String: Any] = [:]
+        for (agentName, setting) in settings {
+            if let thinking = setting.thinking, !thinking.isEmpty {
+                encoded[agentName] = ["model": setting.model, "thinking": thinking]
+            } else {
+                encoded[agentName] = setting.model
+            }
+        }
+        return encoded
+    }
+
+    private static func serializedPayload(defaults: UserDefaults) -> [String: Any] {
+        var payload = encodeForDefaults(allSettings(defaults: defaults))
+        // A prior release could persist `"agent": ""`; retain it on app-launch sync so a
+        // legacy preference file is not needlessly rewritten, while runtime still follows main.
+        if let raw = defaults.dictionary(forKey: defaultsKey) {
+            for (agentName, value) in raw {
+                if let string = value as? String, string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    payload[agentName] = string
+                } else if let string = value as? NSString,
+                          (string as String).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    payload[agentName] = string as String
+                }
+            }
+        }
+        return payload
     }
 }

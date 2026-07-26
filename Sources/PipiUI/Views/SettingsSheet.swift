@@ -35,7 +35,7 @@ struct SettingsSheet: View {
     @State private var hiddenIds: Set<String> = ModelVisibility.hiddenModelIds()
     @State private var weakIds: Set<String> = ModelTierSettings.weakModelIds()
     @State private var agents: [AgentDefinition] = []
-    @State private var subagentOverrides: [String: String] = SubagentModelSettings.allOverrides()
+    @State private var subagentSettings: [String: SubagentModelSettings.Override] = SubagentModelSettings.allSettings()
     @State private var disabledTools: Set<String> = ToolSkillSettings.disabledTools()
     @State private var disabledSkills: Set<String> = ToolSkillSettings.disabledSkills()
     @State private var webSearchBackend: String = WebSearchSettings.backend()
@@ -52,7 +52,7 @@ struct SettingsSheet: View {
     @State private var errorMessage: String?
     @State private var pendingDeleteProvider: String?
     @State private var showAddSheet = false
-    /// T9/T-tab 减负：pickerModels 改为缓存 @State，仅在 models/hiddenIds/subagentOverrides 变化时重算。
+    /// T9/T-tab 减负：pickerModels 改为缓存 @State，仅在 models/hiddenIds/subagentSettings 变化时重算。
     @State private var pickerModels: [ModelInfo] = []
     /// 模型 tab 的 provider 分组缓存（reload 时重算，见 recomputeGroupedModels）。
     @State private var groupedModels: [ProviderModelGroup] = []
@@ -873,7 +873,7 @@ struct SettingsSheet: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Subagent 模型")
                 .font(.title3.weight(.semibold))
-            Text("默认「跟随主 Agent」= 输入框下方 / 底栏当前选中的模型；也可为 explore / plan / general-purpose 等类型指定固定模型。下次派出即生效。")
+            Text("默认「跟随主 Agent」= 输入框下方 / 底栏当前选中的模型；也可为 explore / plan / general-purpose 等类型指定固定模型和思考强度。未指定思考强度时使用 Pi / 模型默认值；下次派出即生效。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -894,9 +894,12 @@ struct SettingsSheet: View {
                 SubagentModelRow(
                     agent: agent,
                     pickerModels: pickerModels,
-                    selection: subagentOverrides[agent.name] ?? SubagentModelSettings.followMainSentinel
+                    selection: subagentSettings[agent.name]?.model ?? SubagentModelSettings.followMainSentinel,
+                    thinking: subagentSettings[agent.name]?.thinking ?? SubagentModelSettings.defaultThinkingSentinel
                 ) { newValue in
                     setSubagentModelOverride(newValue, for: agent.name)
+                } onSelectThinking: { newValue in
+                    setSubagentThinkingOverride(newValue, for: agent.name)
                 }
             }
         }
@@ -906,7 +909,7 @@ struct SettingsSheet: View {
     /// 全量 hiddenModelIds()+filter，切 tab 会卡）。调用时机：reload 完成、
     /// 可见性勾选变化、subagent override 变化。
     private func recomputePickerModels() {
-        let selectedIds = Set(subagentOverrides.values.filter { !$0.isEmpty })
+        let selectedIds = Set(subagentSettings.values.map(\.model))
         pickerModels = models.filter { model in
             if selectedIds.contains(model.id) { return true }
             return !hiddenIds.contains(model.id)
@@ -915,13 +918,27 @@ struct SettingsSheet: View {
 
     private func setSubagentModelOverride(_ newValue: String, for agentName: String) {
         let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        SubagentModelSettings.setModelOverride(
+        let currentThinking = subagentSettings[agentName]?.thinking
+        SubagentModelSettings.setOverride(
             trimmed.isEmpty ? nil : trimmed,
+            thinking: currentThinking,
             for: agentName
         )
-        subagentOverrides = SubagentModelSettings.allOverrides()
+        subagentSettings = SubagentModelSettings.allSettings()
         recomputePickerModels()
         statusMessage = "已保存 \(agentName) 的模型设置"
+    }
+
+    private func setSubagentThinkingOverride(_ newValue: String, for agentName: String) {
+        guard let model = subagentSettings[agentName]?.model else { return }
+        let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        SubagentModelSettings.setOverride(
+            model,
+            thinking: trimmed.isEmpty ? nil : trimmed,
+            for: agentName
+        )
+        subagentSettings = SubagentModelSettings.allSettings()
+        statusMessage = "已保存 \(agentName) 的思考强度"
     }
 
     // MARK: - Web Search
@@ -1092,7 +1109,7 @@ struct SettingsSheet: View {
         var hiddenIds: Set<String>
         var weakIds: Set<String>
         var agents: [AgentDefinition]
-        var subagentOverrides: [String: String]
+        var subagentSettings: [String: SubagentModelSettings.Override]
         var disabledTools: Set<String>
         var disabledSkills: Set<String>
         var webSearchBackend: String
@@ -1116,7 +1133,7 @@ struct SettingsSheet: View {
             hiddenIds: ModelVisibility.hiddenModelIds(),
             weakIds: ModelTierSettings.weakModelIds(),
             agents: AgentCatalog.load(),
-            subagentOverrides: SubagentModelSettings.allOverrides(),
+            subagentSettings: SubagentModelSettings.allSettings(),
             disabledTools: ToolSkillSettings.disabledTools(),
             disabledSkills: ToolSkillSettings.disabledSkills(),
             webSearchBackend: backend,
@@ -1140,7 +1157,7 @@ struct SettingsSheet: View {
         hiddenIds = snapshot.hiddenIds
         weakIds = snapshot.weakIds
         agents = snapshot.agents
-        subagentOverrides = snapshot.subagentOverrides
+        subagentSettings = snapshot.subagentSettings
         disabledTools = snapshot.disabledTools
         disabledSkills = snapshot.disabledSkills
         webSearchBackend = snapshot.webSearchBackend
@@ -1177,7 +1194,7 @@ struct SettingsSheet: View {
         if restartSessions {
             statusMessage = "已更新，相关会话已刷新"
         }
-        // models / hiddenIds / subagentOverrides 已就位，重算 picker 候选与 provider 分组缓存。
+        // models / hiddenIds / subagentSettings 已就位，重算 picker 候选与 provider 分组缓存。
         recomputeGroupedModels()
         recomputePickerModels()
     }
@@ -1250,12 +1267,15 @@ private struct SubagentModelRow: View, Equatable {
     let agent: AgentDefinition
     let pickerModels: [ModelInfo]
     let selection: String
+    let thinking: String
     let onSelect: (String) -> Void
+    let onSelectThinking: (String) -> Void
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.agent == rhs.agent
             && lhs.pickerModels == rhs.pickerModels
             && lhs.selection == rhs.selection
+            && lhs.thinking == rhs.thinking
     }
 
     var body: some View {
@@ -1283,6 +1303,22 @@ private struct SubagentModelRow: View, Equatable {
                 }
             }
             .labelsHidden()
+
+            Picker(
+                "思考强度",
+                selection: Binding(get: { thinking }, set: { onSelectThinking($0) })
+            ) {
+                Text("默认（由模型决定）").tag(SubagentModelSettings.defaultThinkingSentinel)
+                Text("关闭思考").tag("off")
+                Text("极低").tag("minimal")
+                Text("低").tag("low")
+                Text("中").tag("medium")
+                Text("高").tag("high")
+                Text("极高").tag("xhigh")
+                Text("最大").tag("max")
+            }
+            .disabled(selection.isEmpty)
+            .help(selection.isEmpty ? "跟随主 Agent 时仅跟随当前底栏模型" : "仅对这个 Subagent 的新进程生效")
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))

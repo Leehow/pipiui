@@ -244,19 +244,10 @@ struct ContentView: View {
                 }
         } detail: {
             if let session = store.currentSession {
-                // Force identity change on session switch. Per-session state that must survive
-                // (transcriptVisibleCount / pinTranscriptToBottom) lives on ChatSession, so the
-                // rebuilt detail view reads it back immediately; only transient scroll/drag @State
-                // resets, which is what we want on switch.
-                //
-                // Keep this .id: without it SwiftUI reuses ChatDetailView across sessions and diffs
-                // the old+new transcript arrays in one pass. The historical "切会话卡死" rationale
-                // (ImageBlock.== comparing bytes) no longer applies — it compares data.count now —
-                // but tearing the view down on switch is still the cheaper, more predictable path
-                // than letting SwiftUI reconcile two large transcript lists, and it gives a clean
-                // .onAppear for the initial scroll settle.
+                // Reuse the detail chrome across warm switches. The transcript owns the
+                // session-scoped identity that resets its scroll origin; keeping that identity
+                // narrow avoids rebuilding the toolbar, panels, composer, and their AppKit views.
                 ChatDetailView(session: session)
-                    .id(session.id)
             } else {
                 EmptyStateView()
             }

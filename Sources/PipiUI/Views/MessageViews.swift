@@ -263,7 +263,9 @@ struct AssistantSegmentsView: View, Equatable {
     var isWorking: Bool = false
     var onCopy: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
+    var onJump: (() -> Void)? = nil
     @State private var hovered = false
+    @State private var collapsed = false
 
     static func == (lhs: AssistantSegmentsView, rhs: AssistantSegmentsView) -> Bool {
         lhs.segments == rhs.segments
@@ -278,55 +280,119 @@ struct AssistantSegmentsView: View, Equatable {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
-                    switch segment {
-                    case .text(let text):
-                        MarkdownTextView(text: text, onFlash: onFlash)
-                    case .image(let img):
-                        ImageThumbnailView(
-                            data: img.data,
-                            mimeType: img.mimeType,
-                            path: img.path,
-                            maxWidth: 360,
-                            maxHeight: 240,
-                            projectURL: projectURL,
-                            onFlash: onFlash
-                        )
-                    case .video(let vid):
-                        VideoBlockView(path: vid.path, onFlash: onFlash)
-                    case .singleton(let block):
-                        assistantBlockView(block)
-                    case .finishedGroup(let blocks):
-                        FinishedNonTextGroupView(
-                            blocks: blocks,
-                            toolRuns: toolRuns,
-                            subagents: subagents,
-                            projectURL: projectURL,
-                            onFlash: onFlash,
-                            onSelectAgent: onSelectAgent
-                        )
-                    }
-                }
+            // 折叠态：流式中强制展开（保持正文可见）；否则用一行摘要替换正文 VStack。
+            if collapsed && !isStreaming {
+                collapsedSummaryView
+            } else {
+                segmentsBody
             }
-            // ScrollView + row flips cancel → layout order == visual order.
+            // 操作栏始终保留（折叠/展开按钮始终可达）。
             MessageActionSlot(hovered: hovered, alignment: .leading) {
                 MessageActionBar(
                     alignment: .leading,
-                    showBranch: MessageActions.showsMutatingActions(
-                        role: "assistant",
-                        entryId: entryId,
-                        displayText: MessageActions.copyableText(from: segments),
-                        isWorking: isWorking
-                    ),
+                    showBranch: showsMutatingActions,
                     onCopy: { onCopy?() },
-                    onBranch: { onBranch?() }
+                    onBranch: { onBranch?() },
+                    collapsed: collapsed,
+                    onToggleCollapse: showsCollapseAction ? { toggleCollapse() } : nil,
+                    onJump: onJump
                 )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onHover { hovered = $0 }
+    }
+
+    @ViewBuilder
+    private var segmentsBody: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                switch segment {
+                case .text(let text):
+                    MarkdownTextView(text: text, onFlash: onFlash)
+                case .image(let img):
+                    ImageThumbnailView(
+                        data: img.data,
+                        mimeType: img.mimeType,
+                        path: img.path,
+                        maxWidth: 360,
+                        maxHeight: 240,
+                        projectURL: projectURL,
+                        onFlash: onFlash
+                    )
+                case .video(let vid):
+                    VideoBlockView(path: vid.path, onFlash: onFlash)
+                case .singleton(let block):
+                    assistantBlockView(block)
+                case .finishedGroup(let blocks):
+                    FinishedNonTextGroupView(
+                        blocks: blocks,
+                        toolRuns: toolRuns,
+                        subagents: subagents,
+                        projectURL: projectURL,
+                        onFlash: onFlash,
+                        onSelectAgent: onSelectAgent
+                    )
+                }
+            }
+        }
+    }
+
+    /// 助手消息空闲时的操作可见性（复制/分支/折叠/跳转共用此门）。
+    private var showsMutatingActions: Bool {
+        MessageActions.showsMutatingActions(
+            role: "assistant",
+            entryId: entryId,
+            displayText: MessageActions.copyableText(from: segments),
+            isWorking: isWorking
+        )
+    }
+
+    /// 折叠按钮可见性：空闲（showsMutatingActions）且非流式。
+    private var showsCollapseAction: Bool {
+        showsMutatingActions && !isStreaming
+    }
+
+    /// 折叠摘要：首个文本段第一行（≤80 字符，超出截断加「…」）；无文本段返回空串。
+    private var collapsedSummaryText: String {
+        for segment in segments {
+            if case .text(let text) = segment {
+                let firstLine = text.split(separator: "\n", omittingEmptySubsequences: false)
+                    .first
+                    .map(String.init) ?? ""
+                let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
+                let limit = 80
+                if trimmed.count <= limit { return trimmed }
+                return String(trimmed.prefix(limit)) + "…"
+            }
+        }
+        return ""
+    }
+
+    @ViewBuilder
+    private var collapsedSummaryView: some View {
+        HStack(spacing: 4) {
+            Text("（已折叠）")
+            Text(collapsedSummaryText.isEmpty ? "AI 消息" : collapsedSummaryText)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture { toggleCollapse() }
+        .pointingHandCursor()
+    }
+
+    /// 折叠/展开切换：禁用大段正文进出动画，避免卡顿（参考 CollapsibleUserBubbleView.collapse）。
+    private func toggleCollapse() {
+        var t = Transaction()
+        t.disablesAnimations = true
+        withTransaction(t) {
+            collapsed.toggle()
+        }
     }
 
     @ViewBuilder
