@@ -23,11 +23,4 @@ final class SettingsModelDiscoveryTests: XCTestCase {
             "/custom/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin"
         )
     }
-
-    func testSettingsReloadPolicyOnlyReloadsWhenBecomingVisible() {
-        XCTAssertTrue(SettingsReloadPolicy.shouldReload(from: false, to: true))
-        XCTAssertFalse(SettingsReloadPolicy.shouldReload(from: false, to: false))
-        XCTAssertFalse(SettingsReloadPolicy.shouldReload(from: true, to: true))
-        XCTAssertFalse(SettingsReloadPolicy.shouldReload(from: true, to: false))
-    }
 }

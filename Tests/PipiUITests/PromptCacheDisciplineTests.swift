@@ -65,11 +65,14 @@ final class PromptCacheDisciplineTests: XCTestCase {
         XCTAssertEqual(ToolSkillSettings.browserToolNames, ["browser"])
     }
 
-    /// The boss prompt sits in the cached prefix of every request; English is roughly half the
+    /// Layer bodies sit in the cached prefix of every request; English is roughly half the
     /// tokens of the equivalent Chinese, so a regression back to Chinese is a real cost.
-    func testBossPromptStaysEnglish() throws {
-        let text = try install(BossPrompt.install(into:))
-        let han = text.unicodeScalars.filter { (0x4E00...0x9FFF).contains($0.value) }
-        XCTAssertTrue(han.isEmpty, "boss prompt must stay English (found \(han.count) Han chars)")
+    /// Frontmatter (name/summary) is settings-panel text and stays Chinese by design.
+    func testPhilosophyLayerBodiesStayEnglish() throws {
+        for layer in try PhilosophyLayerFixture.layers() {
+            let han = layer.body.unicodeScalars.filter { (0x4E00...0x9FFF).contains($0.value) }
+            XCTAssertTrue(han.isEmpty,
+                          "layer \(layer.id) must stay English (found \(han.count) Han chars)")
+        }
     }
 }

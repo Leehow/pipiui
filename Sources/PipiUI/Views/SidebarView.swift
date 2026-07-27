@@ -3,6 +3,8 @@ import UniformTypeIdentifiers
 
 struct SidebarView: View {
     @EnvironmentObject var store: AppStore
+    @ObservedObject private var computerCoordinator =
+        ComputerCoordinator.shared
     @State private var renameTarget: RenameTarget?
     @State private var renameText: String = ""
     @State private var projectRenameTarget: ProjectRenameTarget?
@@ -17,6 +19,9 @@ struct SidebarView: View {
     /// The active-session cap is applied independently inside each project
     /// folder, so one project's "更多" does not affect the others.
     @State private var sessionsExpandedByProject: [String: Bool] = [:]
+    /// Settings sheet is presented from this sidebar (window-local): opening it in
+    /// one window never opens settings in another window of the same app.
+    @State private var showSettings = false
 
     /// Shared leading gutter — `.sidebar` List defaults are wider than needed.
     private static let sidebarGutter: CGFloat = 10
@@ -48,7 +53,7 @@ struct SidebarView: View {
         .safeAreaInset(edge: .bottom) {
             HStack {
                 Button {
-                    store.showSettings = true
+                    showSettings = true
                 } label: {
                     Image(systemName: "gearshape")
                         .font(.body)
@@ -57,6 +62,40 @@ struct SidebarView: View {
                 .buttonStyle(HoverButtonStyle())
                 .help("设置")
                 .accessibilityLabel("设置")
+
+                Button {
+                    store.toggleComputerUse()
+                } label: {
+                    Image(systemName: computerCoordinator.emergencyStopped
+                        ? "desktopcomputer.trianglebadge.exclamationmark"
+                        : "desktopcomputer")
+                        .font(.body)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(HoverButtonStyle(
+                    base: store.computerUseEnabled
+                        && !computerCoordinator.emergencyStopped
+                        ? .accentColor : .secondary,
+                    hovered: store.computerUseEnabled
+                        && !computerCoordinator.emergencyStopped
+                        ? .accentColor : .primary
+                ))
+                .background {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(store.computerUseEnabled
+                            && !computerCoordinator.emergencyStopped
+                            ? Color.accentColor.opacity(0.14)
+                            : .clear)
+                }
+                .help(computerCoordinator.emergencyStopped
+                    ? "重新开启桌面控制"
+                    : (store.computerUseEnabled ? "关闭桌面控制" : "开启桌面控制"))
+                .accessibilityLabel(computerCoordinator.emergencyStopped
+                    ? "重新开启桌面控制"
+                    : (store.computerUseEnabled ? "关闭桌面控制" : "开启桌面控制"))
+                .accessibilityValue(computerCoordinator.emergencyStopped
+                    ? "已急停"
+                    : (store.computerUseEnabled ? "已开启" : "已关闭"))
 
                 Spacer(minLength: 0)
             }
@@ -119,6 +158,11 @@ struct SidebarView: View {
             }
             .padding(20)
             .frame(width: 360)
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsSheet()
+                .environmentObject(store)
+                .accessibilityIdentifier("PipiUI.SettingsPanel")
         }
     }
 

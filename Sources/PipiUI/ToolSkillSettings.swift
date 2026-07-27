@@ -4,6 +4,12 @@ import Foundation
 enum ToolSkillSettings {
     static let disabledToolsKey = "pipiui.disabledTools"
     static let disabledSkillsKey = "pipiui.disabledSkills"
+    /// Computer Use has its own explicit global opt-in. Once that button is on,
+    /// stale generic tool settings must not silently hide either desktop tool.
+    static let reservedToolNames: Set<String> = [
+        "computer",
+        "open_application",
+    ]
 
     /// Catalog id for the browser tool group (expands to concrete names for `--exclude-tools`).
     /// The id is kept as `browser_*` so settings saved before the five browser_* tools were
@@ -19,7 +25,14 @@ enum ToolSkillSettings {
     }
 
     static func disabledTools(defaults: UserDefaults = .standard) -> Set<String> {
-        Set(defaults.stringArray(forKey: disabledToolsKey) ?? [])
+        let stored = Set(defaults.stringArray(forKey: disabledToolsKey) ?? [])
+        let sanitized = stored.subtracting(reservedToolNames)
+        if sanitized != stored {
+            // One-time migration for older builds that exposed `computer` to
+            // the generic tool denylist. Preserve every unrelated choice.
+            defaults.set(Array(sanitized).sorted(), forKey: disabledToolsKey)
+        }
+        return sanitized
     }
 
     static func disabledSkills(defaults: UserDefaults = .standard) -> Set<String> {
@@ -27,7 +40,8 @@ enum ToolSkillSettings {
     }
 
     static func isToolEnabled(_ name: String, defaults: UserDefaults = .standard) -> Bool {
-        !disabledTools(defaults: defaults).contains(name)
+        reservedToolNames.contains(name)
+            || !disabledTools(defaults: defaults).contains(name)
     }
 
     static func isSkillEnabled(_ name: String, defaults: UserDefaults = .standard) -> Bool {
@@ -41,7 +55,9 @@ enum ToolSkillSettings {
         fileManager: FileManager = .default
     ) {
         var ids = disabledTools(defaults: defaults)
-        if enabled {
+        if reservedToolNames.contains(name) {
+            ids.remove(name)
+        } else if enabled {
             ids.remove(name)
         } else {
             ids.insert(name)
@@ -90,13 +106,14 @@ enum ToolSkillSettings {
 
     static func syncJSONFile(
         defaults: UserDefaults = .standard,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        to explicitURL: URL? = nil
     ) {
         let payload: [String: Any] = [
             "disabledTools": Array(disabledTools(defaults: defaults)).sorted(),
             "disabledSkills": Array(disabledSkills(defaults: defaults)).sorted(),
         ]
-        let url = settingsFileURL(fileManager: fileManager)
+        let url = explicitURL ?? settingsFileURL(fileManager: fileManager)
         let dir = url.deletingLastPathComponent()
         try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
         guard let data = try? JSONSerialization.data(

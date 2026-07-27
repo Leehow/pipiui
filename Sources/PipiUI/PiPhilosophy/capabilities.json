@@ -1,0 +1,50 @@
+{
+  "$comment": [
+    "The single place where this package knows pi's tool names.",
+    "Layer bodies reference capabilities as {{delegate}}, {{search}}, ... and never",
+    "name a tool directly — a test enforces that. When pi renames or drops a tool,",
+    "edit this file; the four layer bodies stay untouched.",
+    "",
+    "required=true : a layer listing this capability in `requires-capabilities` is",
+    "                skipped entirely when the tool is absent.",
+    "required=false: the tool is merely mentioned; when absent, `absent` is",
+    "                substituted so no dead tool name survives into the prompt.",
+    "",
+    "Deliberately excluded: read / grep / write / edit. They are pi's most primitive",
+    "tools (least likely to be renamed) and they are ordinary English words, so",
+    "placeholder-ing them would make the prose unreadable and the bare-name test useless."
+  ],
+  "capabilities": {
+    "delegate": {
+      "tool": "subagent",
+      "required": true
+    },
+    "delegate_status": {
+      "tool": "subagent_status",
+      "required": false,
+      "absent": "your runtime's status channel"
+    },
+    "search": {
+      "tool": "web_search",
+      "required": false,
+      "absent": "your model's own hosted search"
+    },
+    "fetch": {
+      "tool": "web_fetch",
+      "required": false,
+      "absent": "a fetch of the page"
+    },
+    "browser": {
+      "tool": "browser",
+      "required": false,
+      "absent": "an in-app browser"
+    }
+  },
+  "agents": [
+    "explore",
+    "plan",
+    "general-purpose",
+    "reviewer",
+    "lead"
+  ]
+}

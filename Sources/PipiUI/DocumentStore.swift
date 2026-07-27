@@ -1,11 +1,13 @@
 import Foundation
 
 /// 文档面板可渲染的文档类型。
-package enum DocumentKind: Equatable {
+package enum DocumentKind: Equatable, Sendable {
     /// Markdown（.md / .markdown …）→ MarkdownTextView 渲染。
     case markdown
     /// 纯文本（.txt / .log / 无扩展的 README 等）→ 等宽可选中原文。
     case plain
+    /// PDF → PDFKit 按 URL 分页渲染，不解码为文本。
+    case pdf
 }
 
 /// 判定哪些本地文件进右侧文档面板（其余维持访达显示）。
@@ -20,6 +22,10 @@ package enum DocumentDetector {
     package static let plainTextExtensions: Set<String> = [
         "txt", "text", "log",
     ]
+    /// PDFKit 渲染的扩展名（小写，不含点）。
+    package static let pdfExtensions: Set<String> = [
+        "pdf",
+    ]
     /// 知名无扩展文档名 → 纯文本（无标记散文按 markdown 猜会误伤下划线等）。
     package static let docBasenames: Set<String> = [
         "readme", "license", "licence", "copying", "changelog", "changes",
@@ -32,6 +38,7 @@ package enum DocumentDetector {
         if !ext.isEmpty {
             if markdownExtensions.contains(ext) { return .markdown }
             if plainTextExtensions.contains(ext) { return .plain }
+            if pdfExtensions.contains(ext) { return .pdf }
             return nil
         }
         if docBasenames.contains(url.lastPathComponent.lowercased()) { return .plain }
@@ -74,6 +81,8 @@ package final class DocumentStore: ObservableObject {
 
     /// 渲染上限：超过则提示改用外部应用，避免一个巨型 log 卡死面板。
     package static let maxFileSize = 2 * 1024 * 1024
+    /// PDFKit 按 URL 分页，不整文件读成 String；只用文件属性执行独立的大小保护。
+    package static let pdfMaxFileSize = 50 * 1024 * 1024
 
     @Published package private(set) var loadState: LoadState = .empty
     /// 当前目标文件（含 missing / tooLarge 等失败态），供头部按钮使用。
@@ -147,6 +156,24 @@ package final class DocumentStore: ObservableObject {
         let path = url.path
         guard FileManager.default.fileExists(atPath: path) else {
             return .missing(path: path)
+        }
+        if kind == .pdf {
+            do {
+                let attrs = try FileManager.default.attributesOfItem(atPath: path)
+                let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
+                guard size <= pdfMaxFileSize else {
+                    return .tooLarge(path: path, size: size)
+                }
+                return .loaded(Document(
+                    url: url,
+                    kind: .pdf,
+                    text: "",
+                    fileSize: size,
+                    modifiedAt: attrs[.modificationDate] as? Date
+                ))
+            } catch {
+                return .unreadable(path: path)
+            }
         }
         do {
             let attrs = try FileManager.default.attributesOfItem(atPath: path)

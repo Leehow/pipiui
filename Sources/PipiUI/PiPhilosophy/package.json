@@ -1,0 +1,42 @@
+{
+  "name": "pipi-philosophy",
+  "version": "0.1.0",
+  "description": "Layered, toggleable working philosophy for the pi coding agent: foundation, method, orchestration, fan-out.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
+  "exports": {
+    ".": {
+      "types": "./philosophy.ts",
+      "default": "./philosophy.ts"
+    }
+  },
+  "types": "./philosophy.ts",
+  "pi": {
+    "extensions": [
+      "./philosophy.ts"
+    ]
+  },
+  "files": [
+    "philosophy.ts",
+    "compose.ts",
+    "capabilities.json",
+    "layers",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3"
+  }
+}

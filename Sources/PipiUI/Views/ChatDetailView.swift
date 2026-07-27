@@ -78,6 +78,10 @@ private struct ChatDetailViewBody: View {
             ToolbarItemGroup(placement: .primaryAction) {
                 GitBranchMenu(store: gitBranches) { session.lastError = $0 }
 
+                if ComputerUseSettings.isEnabled() {
+                    ComputerToolbarControl(sessionKey: session.bridgeRoutingKey)
+                }
+
                 Button {
                     if session.rightPanel == .agents {
                         session.rightPanel = nil
@@ -142,6 +146,7 @@ private struct ChatDetailViewBody: View {
 
     private var chatColumn: some View {
         VStack(spacing: 0) {
+            ComputerConsentBar(sessionKey: session.bridgeRoutingKey)
             transcript
             if let conflicts = store.extensionConflicts[session.id], !conflicts.isEmpty {
                 conflictBanner(conflicts)
@@ -303,6 +308,18 @@ private struct ChatDetailViewBody: View {
             )
         let visibleRowsNewestFirst = visibleRowsOldestFirst.reversed()
         let userTurnGroups = AssistantBlockLayout.userTurnGroups(rows: visibleRowsOldestFirst)
+        // 只要某用户回合派发的任一 subagent 仍在运行，该回合就不可折叠（始终展示状态卡片）。
+        // agentStore 是 @ObservedObject：agent 状态变化会触发本 body 重算，guard 随之刷新。
+        let runningSubagentToolCallIds = Set(
+            agentStore.agents.lazy
+                .filter { $0.state == .running }
+                .compactMap { $0.toolCallId }
+        )
+        let runningGuardedGroupIDs = UserTurnCollapseGuard.runningGuardedGroupIDs(
+            rows: visibleRowsOldestFirst,
+            groups: userTurnGroups,
+            runningSubagentToolCallIds: runningSubagentToolCallIds
+        )
         return ScrollViewReader { proxy in
             // assistant run id → 其文档顺序上一条 user 消息 id（无则缺省，回退到自身 id）。
             let jumpTargets = jumpTargetMap(rows: visibleRowsNewestFirst)
@@ -366,7 +383,8 @@ private struct ChatDetailViewBody: View {
                             let groupID = userTurnGroups.groupIDForRowID[item.id]
                             let isInternalSignal = groupID != nil
                                 && !MessageActions.isUserAuthoredMessage(item)
-                            let isFoldedSignal = isInternalSignal && isUserTurnCollapsed(groupID)
+                            let isFoldedSignal = isInternalSignal
+                                && isUserTurnCollapsed(groupID, guarded: runningGuardedGroupIDs)
                             if !isFoldedSignal {
                                 MessageRow(
                                     item: item,
@@ -390,7 +408,7 @@ private struct ChatDetailViewBody: View {
                             }
                         case .assistantRun(let id, let entryId, let segments):
                             let groupID = userTurnGroups.groupIDForRowID[id]
-                            let isFolded = isUserTurnCollapsed(groupID)
+                            let isFolded = isUserTurnCollapsed(groupID, guarded: runningGuardedGroupIDs)
                             let isGroupLastAssistant = groupID.flatMap {
                                 userTurnGroups.lastAssistantRunIDForGroupID[$0]
                             } == id
@@ -608,9 +626,12 @@ private struct ChatDetailViewBody: View {
         )
     }
 
-    private func isUserTurnCollapsed(_ groupID: String?) -> Bool {
-        guard let groupID else { return false }
-        return collapsedUserTurnIDs.contains(groupID)
+    private func isUserTurnCollapsed(_ groupID: String?, guarded: Set<String>) -> Bool {
+        UserTurnCollapseGuard.isCollapsed(
+            groupID: groupID,
+            collapsedUserTurnIDs: collapsedUserTurnIDs,
+            guardedGroupIDs: guarded
+        )
     }
 
     /// assistant run id → 其文档顺序上一条 user 消息 id（无前驱 user 时缺省）。

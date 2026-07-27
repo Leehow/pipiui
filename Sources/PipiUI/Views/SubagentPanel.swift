@@ -253,7 +253,7 @@ private struct AgentDetailView: View {
                             waitingForFirstLog
                         } else {
                             ForEach(agent.log) { item in
-                                AgentLogRow(item: item)
+                                AgentLogRow(item: item, base: documentBase)
                             }
                         }
                         Color.clear
@@ -320,6 +320,13 @@ private struct AgentDetailView: View {
         } message: {
             Text("将强制删除该 agent 的 worktree，不会合并进主分支；对应的 pipiui/agent-* 内部分支也会删除，即使含独有提交。非内部分支会保留。此操作不可撤销。")
         }
+    }
+
+    private var documentBase: URL? {
+        DocumentReferenceScanner.effectiveBase(
+            worktreePath: agent.worktreePath,
+            projectURL: projectURL
+        )
     }
 
     private var metricsHeader: some View {
@@ -593,6 +600,7 @@ private struct AgentDetailView: View {
 /// 工作流水单行：文本走 Markdown，思考灰斜体，工具调用对齐主会话 ToolCard 折叠头。
 private struct AgentLogRow: View {
     let item: AgentLogItem
+    var base: URL? = nil
     @State private var expanded = false
 
     var body: some View {
@@ -620,7 +628,13 @@ private struct AgentLogRow: View {
                 )
                 .onTapGesture { expanded.toggle() }
         default:
-            MarkdownTextView(text: item.text)
+            VStack(alignment: .leading, spacing: 6) {
+                MarkdownTextView(text: item.text)
+                let cards = DocumentReferenceScanner.references(in: item.text, base: base)
+                if !cards.isEmpty {
+                    DocumentFileCardStack(references: cards)
+                }
+            }
         }
     }
 

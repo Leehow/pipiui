@@ -542,7 +542,7 @@ enum SelfTest {
 
         // 12. Bridge rejects unknown session key (no currentSession fallback) (#4)
         do {
-            let bridge = BridgeServer { request, respond in
+            let bridge = BridgeServer { request, respond, _ in
                 // Mirror AppStore routing after the fix
                 let key = request["sessionKey"].string ?? ""
                 let open: [String: Bool] = ["alive-key": true]

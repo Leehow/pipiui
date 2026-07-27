@@ -13,7 +13,8 @@
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
+import { openURL } from "./pi-auth-open-url.mjs";
 import { createInterface } from "node:readline";
 import { existsSync } from "node:fs";
 
@@ -50,14 +51,6 @@ async function loadModelRuntime() {
 
 function emit(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
-}
-
-function openURL(url) {
-  try {
-    spawn("open", [url], { detached: true, stdio: "ignore" }).unref();
-  } catch {
-    // ignore
-  }
 }
 
 async function withRuntime(fn) {
@@ -107,6 +100,8 @@ async function listModels() {
         id: m.id,
         name: m.name ?? m.id,
         contextWindow: m.contextWindow ?? null,
+        reasoning: m.reasoning ?? null,
+        thinkingLevelMap: m.thinkingLevelMap ?? null,
       })),
     });
   });

@@ -142,13 +142,13 @@ final class AppStore: ObservableObject {
     /// Immutable JSONL snapshots only. This cache never constructs ChatSession/PiProcess.
     private let historyPreloader = SessionHistoryPreloader()
 
-    /// Boss 模式：新会话以「大组长」协议启动（不亲自干活，全部派 subagent）
-    @Published var bossModeEnabled: Bool = UserDefaults.standard.object(forKey: "pipiui.bossMode") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(bossModeEnabled, forKey: "pipiui.bossMode") }
-    }
+    /// Bumped when a philosophy toggle changes, so Settings rows recompute their effective state.
+    @Published var philosophyRevision: UInt64 = 0
 
-    /// Settings overlay (tap dimmed backdrop to dismiss).
-    @Published var showSettings = false
+    /// Shared source of truth for the sidebar shortcut and Settings panel.
+    /// Persisted state remains default-off in `ComputerUseSettings`; callers must
+    /// use `setComputerUseEnabled` so lifecycle side effects cannot diverge.
+    @Published private(set) var computerUseEnabled = ComputerUseSettings.isEnabled()
 
     /// Bumped when model picker visibility preferences change so InputBar refreshes.
     @Published var modelVisibilityRevision: Int = 0
@@ -160,6 +160,49 @@ final class AppStore: ObservableObject {
         for key in Array(openSessions.keys) {
             restartSession(key: key)
         }
+    }
+
+    /// Mount or unmount the desktop harness for every open top-level session.
+    /// Turning it on is the only PipiUI authorization gate for all current and
+    /// future sessions and subagents. macOS TCC, the in-flight mutex, technical
+    /// target validation, cleanup, and emergency stop remain independent.
+    func setComputerUseEnabled(_ enabled: Bool) {
+        let persisted = ComputerUseSettings.isEnabled()
+        if enabled, persisted,
+           ComputerCoordinator.shared.emergencyStopped {
+            ComputerCoordinator.shared.enableGlobalAuthorization()
+            computerUseEnabled = true
+            return
+        }
+        guard enabled != persisted else {
+            // Repair an in-memory observation mismatch without restarting pi.
+            if computerUseEnabled != persisted {
+                computerUseEnabled = persisted
+            }
+            return
+        }
+
+        ComputerUseSettings.setEnabled(enabled)
+        computerUseEnabled = enabled
+        if enabled {
+            ComputerCoordinator.shared.enableGlobalAuthorization()
+            ComputerCoordinator.shared.refreshInputMonitoring(
+                permissionSnapshot: ComputerPermissions.snapshot()
+            )
+        } else {
+            ComputerCoordinator.shared.emergencyStop()
+            ComputerCoordinator.shared.shutdownInputMonitoring()
+        }
+        restartAllOpenSessions()
+    }
+
+    func toggleComputerUse() {
+        if computerUseEnabled,
+           ComputerCoordinator.shared.emergencyStopped {
+            setComputerUseEnabled(true)
+            return
+        }
+        setComputerUseEnabled(!computerUseEnabled)
     }
 
     /// 会话 key 形如 "resume:<session 文件路径>"，选中时尚未 spawn 完也能拿到文件路径。
@@ -206,14 +249,29 @@ final class AppStore: ObservableObject {
         DispatchQueue.global(qos: .utility).async {
             AuthMigration.migrateIfNeeded()
         }
-        bridge = BridgeServer { request, respond in
+        ComputerCoordinator.shared.configure { sessionCapability in
+            let session = AppStore.shared.openSessions.values.first {
+                BridgeCapabilityToken.matches(
+                    sessionCapability,
+                    expected: $0.bridgeRoutingKey
+                )
+            }
+            session?.abort()
+        }
+        bridge = BridgeServer(authorize: { request in
+            let candidate = request["sessionKey"].string ?? ""
+            return AppStore.shared.openSessions.values.contains {
+                BridgeCapabilityToken.matches(candidate, expected: $0.bridgeRoutingKey)
+            }
+        }) { request, respond, registerCancellation in
             // Handler 已在主线程；按 sessionKey 精确路由到对应会话。
             // 未知/已关闭 key 必须拒绝，避免子 agent 孤儿请求落到「当前选中」会话上乱 eval。
             let store = AppStore.shared
             let key = request["sessionKey"].string ?? ""
             guard !key.isEmpty,
-                  let session = store.openSessions[key]
-                    ?? store.openSessions.values.first(where: { $0.bridgeRoutingKey == key }) else {
+                  let session = store.openSessions.values.first(where: {
+                      BridgeCapabilityToken.matches(key, expected: $0.bridgeRoutingKey)
+                  }) else {
                 respond(["ok": false, "error": "unknown session key"])
                 return
             }
@@ -225,6 +283,60 @@ final class AppStore: ObservableObject {
                     session.rightPanel = .agents
                 }
                 respond(["ok": true])
+                return
+            }
+            if action == "computer_batch"
+                || action == "computer_open_application"
+                || action == "computer_cancel" {
+                let computerCapability = request["computerCapability"].string ?? ""
+                guard BridgeCapabilityToken.matches(
+                    computerCapability,
+                    expected: session.computerRoutingKey
+                ) else {
+                    respond([
+                        "ok": false,
+                        "error": "unauthorized computer capability",
+                    ])
+                    return
+                }
+                let requestID = request["requestID"].string ?? ""
+                if action == "computer_cancel" {
+                    ComputerCoordinator.shared.cancelRequest(
+                        requestID: requestID,
+                        sessionKey: session.bridgeRoutingKey,
+                        reason: "computer request cancelled by the pi extension"
+                    )
+                    respond(["ok": true])
+                    return
+                }
+                guard registerCancellation({
+                    Task { @MainActor in
+                        ComputerCoordinator.shared.cancelRequest(
+                            requestID: requestID,
+                            sessionKey: session.bridgeRoutingKey,
+                            reason: "computer bridge disconnected or timed out"
+                        )
+                    }
+                }) else {
+                    respond([
+                        "ok": false,
+                        "error": "computer bridge request was already cancelled",
+                    ])
+                    return
+                }
+                if action == "computer_open_application" {
+                    ComputerCoordinator.shared.handleOpenApplication(
+                        request: request,
+                        sessionKey: session.bridgeRoutingKey,
+                        respond: respond
+                    )
+                } else {
+                    ComputerCoordinator.shared.handle(
+                        request: request,
+                        sessionKey: session.bridgeRoutingKey,
+                        respond: respond
+                    )
+                }
                 return
             }
             if action == "navigate", session.rightPanel != .web {
@@ -283,12 +395,14 @@ final class AppStore: ObservableObject {
             gitExtension: plugin.gitExtension,
             reloadExtension: plugin.reloadExtension,
             webSearchExtension: plugin.webSearchExtension,
-            skillTierExtension: plugin.skillTierExtension,
+            skillLoaderExtension: plugin.skillLoaderExtension,
             codexServerToolsExtension: plugin.codexServerToolsExtension,
             claudeServerToolsExtension: plugin.claudeServerToolsExtension,
+            computerUseExtension: ComputerUseSettings.isEnabled()
+                ? plugin.computerUseExtension : nil,
             subagentDir: plugin.subagentDir,
             agentsDir: plugin.agentsDir,
-            bossPromptPath: bossModeEnabled ? plugin.bossPrompt : nil,
+            philosophyExtension: PhilosophyPackage.fallbackExtensionPath,
             blockedReason: conflicts.isEmpty ? nil
                 : "扩展撞名，pi 未启动。修复上方冲突后会自动重启会话。",
             initialTranscript: initialTranscript
@@ -1102,6 +1216,8 @@ final class AppStore: ObservableObject {
 
     func shutdown() {
         pendingHistoricalSessionOpens.removeAll()
+        ComputerCoordinator.shared.releaseAll(revokeConsent: true)
+        ComputerCoordinator.shared.shutdownInputMonitoring()
         for session in openSessions.values {
             session.subagents.saveNow()
             session.shutdown()

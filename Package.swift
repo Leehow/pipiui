@@ -16,6 +16,9 @@ let package = Package(
                 // App 自有的 pi 插件（补丁版 subagent + 我们的 agents），
                 // 运行时拷到 Application Support 并 -e 加载，独立于 ~/.pi
                 .copy("PiExt"),
+                // pipi-philosophy 的随包快照：安装为 pi 的本地 package，
+                // 所以裸 TUI 也吃得到（refresh: ./scripts/sync-philosophy.sh）
+                .copy("PiPhilosophy"),
                 .copy("Resources")
             ]
         ),

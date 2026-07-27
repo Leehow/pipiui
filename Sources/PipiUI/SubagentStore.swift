@@ -713,17 +713,23 @@ final class SubagentStore: ObservableObject {
 
         // 后台读 + 解码持久化 JSON，完成后回主线程 assign（避免主线程 IO/解码卡顿）。
         guard agents.isEmpty else { return }
-        Task.detached(priority: .utility) { [weak self] in
+        let loadTask = Task.detached(priority: .utility) {
             guard let data = try? Data(contentsOf: url),
-                  let persisted = try? JSONDecoder().decode([SubagentInfo].self, from: data) else { return }
+                  let persisted = try? JSONDecoder().decode([SubagentInfo].self, from: data) else {
+                return Optional<([SubagentInfo], Int)>.none
+            }
             let loaded = Self.reconcileInterruptedAfterRestart(persisted)
             let maxLogId = loaded.flatMap(\.log).map(\.id).max() ?? 0
-            await MainActor.run {
-                guard let self, self.persistURL == url, self.agents.isEmpty else { return }
-                self.agents = loaded
-                self.logCounter = maxLogId
-                if self.selectedId == nil { self.selectedId = self.agents.last?.id }
-            }
+            return (loaded, maxLogId)
+        }
+        Task { @MainActor [weak self] in
+            guard let (loaded, maxLogId) = await loadTask.value,
+                  let self,
+                  self.persistURL == url,
+                  self.agents.isEmpty else { return }
+            self.agents = loaded
+            self.logCounter = maxLogId
+            if self.selectedId == nil { self.selectedId = self.agents.last?.id }
         }
     }
 

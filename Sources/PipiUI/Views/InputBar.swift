@@ -290,6 +290,512 @@ enum ComposerPasteInsertion {
     }
 }
 
+enum ComposerTextViewLayout {
+    static let minimumLines = 1
+    static let maximumLines = 10
+    static let verticalInset: CGFloat = 2
+    static let minimumControlHeight: CGFloat = 20
+
+    static func lineHeight(for font: NSFont) -> CGFloat {
+        NSLayoutManager().defaultLineHeight(for: font)
+    }
+
+    static func minimumHeight(for font: NSFont) -> CGFloat {
+        max(
+            minimumControlHeight,
+            ceil(lineHeight(for: font) * CGFloat(minimumLines) + verticalInset * 2)
+        )
+    }
+
+    static func maximumHeight(for font: NSFont) -> CGFloat {
+        ceil(lineHeight(for: font) * CGFloat(maximumLines) + verticalInset * 2)
+    }
+
+    static func visibleHeight(usedTextHeight: CGFloat, font: NSFont) -> CGFloat {
+        let contentHeight = ceil(max(lineHeight(for: font), usedTextHeight) + verticalInset * 2)
+        return min(maximumHeight(for: font), max(minimumHeight(for: font), contentHeight))
+    }
+}
+
+final class ComposerNSTextView: NSTextView {
+    var onSubmit: () -> Void = {}
+
+    override func doCommand(by commandSelector: Selector) {
+        if commandSelector == #selector(insertNewlineIgnoringFieldEditor(_:)) {
+            super.doCommand(by: commandSelector)
+            return
+        }
+
+        guard commandSelector == #selector(insertNewline(_:)) else {
+            super.doCommand(by: commandSelector)
+            return
+        }
+
+        // The input context normally consumes candidate confirmation before this
+        // command reaches NSTextView. If it does arrive with marked text active,
+        // do nothing: calling super would replace the marked range with a newline.
+        guard !hasMarkedText() else { return }
+
+        let modifiers = NSApp.currentEvent?.modifierFlags
+            .intersection(.deviceIndependentFlagsMask) ?? []
+        if modifiers.contains(.shift) || modifiers.contains(.option) {
+            super.doCommand(by: commandSelector)
+            return
+        }
+
+        // Matches the previous TextField.onSubmit contract: plain Return sends
+        // (and Command-Return still reaches the existing button key equivalent).
+        onSubmit()
+    }
+}
+
+final class ComposerPlaceholderLabel: NSTextField {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+final class ComposerUndoManager: UndoManager {
+    var onUndoOrRedo: () -> Void = {}
+
+    override func undo() {
+        super.undo()
+        onUndoOrRedo()
+    }
+
+    override func redo() {
+        super.redo()
+        onUndoOrRedo()
+    }
+}
+
+class ComposerTextViewHost: NSView {
+    let scrollView = NSScrollView(frame: .zero)
+    let textView = ComposerNSTextView(frame: .zero)
+    let placeholderLabel = ComposerPlaceholderLabel(labelWithString: "")
+    var onHeightChange: (CGFloat) -> Void = { _ in }
+    var onMoveToWindow: () -> Void = {}
+
+    private(set) var visibleTextHeight: CGFloat
+    private(set) var documentTextHeight: CGFloat = 0
+    private let composerFont: NSFont
+
+    override var isFlipped: Bool { true }
+
+    init(font: NSFont = .systemFont(ofSize: NSFont.systemFontSize)) {
+        composerFont = font
+        visibleTextHeight = ComposerTextViewLayout.minimumHeight(for: font)
+        super.init(frame: .zero)
+
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.contentView.drawsBackground = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.horizontalScrollElasticity = .none
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.verticalScrollElasticity = .none
+
+        textView.delegate = nil
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.drawsBackground = false
+        textView.backgroundColor = .clear
+        textView.font = font
+        textView.textColor = .labelColor
+        textView.insertionPointColor = .labelColor
+        textView.textContainerInset = NSSize(
+            width: 0,
+            height: ComposerTextViewLayout.verticalInset
+        )
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.minSize = .zero
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.allowsUndo = true
+        textView.typingAttributes = [
+            .font: font,
+            .foregroundColor: NSColor.labelColor,
+        ]
+        textView.setAccessibilityLabel("消息输入框")
+
+        placeholderLabel.font = font
+        placeholderLabel.textColor = .placeholderTextColor
+        placeholderLabel.backgroundColor = .clear
+        placeholderLabel.isBordered = false
+        placeholderLabel.isEditable = false
+        placeholderLabel.isSelectable = false
+        placeholderLabel.lineBreakMode = .byTruncatingTail
+
+        scrollView.documentView = textView
+        addSubview(scrollView)
+        addSubview(placeholderLabel)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: visibleTextHeight)
+    }
+
+    var shouldScrollSelectionDuringLayout: Bool {
+        window?.firstResponder === textView
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        onMoveToWindow()
+    }
+
+    override func layout() {
+        super.layout()
+        scrollView.frame = bounds
+        let lineHeight = ComposerTextViewLayout.lineHeight(for: composerFont)
+        placeholderLabel.frame = NSRect(
+            x: 0,
+            y: ComposerTextViewLayout.verticalInset,
+            width: bounds.width,
+            height: ceil(lineHeight)
+        )
+        refreshLayout(scrollSelection: shouldScrollSelectionDuringLayout)
+    }
+
+    func updatePlaceholder(_ placeholder: String) {
+        placeholderLabel.stringValue = placeholder
+        placeholderLabel.isHidden = !textView.string.isEmpty || textView.hasMarkedText()
+    }
+
+    @discardableResult
+    func refreshLayout(scrollSelection: Bool) -> CGFloat {
+        let viewportWidth = scrollView.contentSize.width
+        guard viewportWidth > 1 else { return visibleTextHeight }
+        guard let textContainer = textView.textContainer,
+              let layoutManager = textView.layoutManager else {
+            return visibleTextHeight
+        }
+
+        var textFrame = textView.frame
+        textFrame.size.width = viewportWidth
+        textFrame.size.height = max(textFrame.height, scrollView.contentSize.height)
+        textView.frame = textFrame
+        textContainer.containerSize = NSSize(
+            width: viewportWidth,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textContainer.widthTracksTextView = true
+
+        layoutManager.ensureLayout(for: textContainer)
+        let usedRect = layoutManager.usedRect(for: textContainer)
+        let lineHeight = ComposerTextViewLayout.lineHeight(for: composerFont)
+        documentTextHeight = ceil(
+            max(lineHeight, usedRect.height) + ComposerTextViewLayout.verticalInset * 2
+        )
+
+        if abs(textView.frame.height - documentTextHeight) > 0.5 {
+            textFrame.size.height = max(documentTextHeight, scrollView.contentSize.height)
+            textView.frame = textFrame
+        }
+
+        let nextVisibleHeight = ComposerTextViewLayout.visibleHeight(
+            usedTextHeight: usedRect.height,
+            font: composerFont
+        )
+        if abs(nextVisibleHeight - visibleTextHeight) > 0.5 {
+            visibleTextHeight = nextVisibleHeight
+            invalidateIntrinsicContentSize()
+            onHeightChange(nextVisibleHeight)
+        }
+
+        updatePlaceholder(placeholderLabel.stringValue)
+
+        if documentTextHeight <= nextVisibleHeight + 0.5 {
+            // When all content fits, pin the document to its top. A stale field-editor
+            // scroll origin is what visually clips the previous line during growth.
+            scrollView.contentView.scroll(to: .zero)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        } else if scrollSelection {
+            textView.scrollRangeToVisible(textView.selectedRange())
+        }
+
+        return nextVisibleHeight
+    }
+}
+
+struct ComposerTextView: NSViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+    @Binding var height: CGFloat
+    let sessionIdentity: ObjectIdentifier
+    let placeholder: String
+    let onSubmit: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeNSView(context: Context) -> ComposerTextViewHost {
+        let host = ComposerTextViewHost()
+        context.coordinator.host = host
+        host.textView.delegate = context.coordinator
+        host.onHeightChange = { [weak coordinator = context.coordinator] height in
+            coordinator?.receiveHeight(height)
+        }
+        host.onMoveToWindow = { [weak coordinator = context.coordinator, weak host] in
+            guard let coordinator, let host else { return }
+            coordinator.synchronizeFocus(host)
+        }
+        context.coordinator.synchronize(host)
+        return host
+    }
+
+    func updateNSView(_ host: ComposerTextViewHost, context: Context) {
+        context.coordinator.parent = self
+        context.coordinator.synchronize(host)
+    }
+
+    static func dismantleNSView(_ host: ComposerTextViewHost, coordinator: Coordinator) {
+        host.textView.delegate = nil
+        host.textView.onSubmit = {}
+        host.onHeightChange = { _ in }
+        host.onMoveToWindow = {}
+        coordinator.dismantle()
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: ComposerTextView
+        weak var host: ComposerTextViewHost?
+
+        private var boundSessionIdentity: ObjectIdentifier
+        private var pendingExternalText: String?
+        private var pendingHeight: CGFloat?
+        private var pendingTextApplicationScheduled = false
+        private var focusRequestScheduled = false
+        private var applyingProgrammaticText = false
+        private var isDismantled = false
+        private let composerUndoManager = ComposerUndoManager()
+        var appIsActiveProvider: () -> Bool = { NSApp.isActive }
+        var windowIsKeyProvider: (NSWindow) -> Bool = { $0.isKeyWindow }
+        var makeFirstResponder: (NSWindow, NSTextView) -> Void = {
+            window,
+            textView in
+            window.makeFirstResponder(textView)
+        }
+
+        init(parent: ComposerTextView) {
+            self.parent = parent
+            boundSessionIdentity = parent.sessionIdentity
+            super.init()
+            composerUndoManager.onUndoOrRedo = { [weak self] in
+                self?.synchronizeAfterUndoOrRedo()
+            }
+        }
+
+        func synchronize(_ host: ComposerTextViewHost) {
+            guard !isDismantled else { return }
+            self.host = host
+            host.textView.onSubmit = { [weak self] in
+                self?.parent.onSubmit()
+            }
+            host.updatePlaceholder(parent.placeholder)
+
+            if boundSessionIdentity != parent.sessionIdentity {
+                // The InputBar is warm-reused. Never let marked text from the old
+                // session commit into the newly rebound draft.
+                boundSessionIdentity = parent.sessionIdentity
+                pendingExternalText = nil
+                applyingProgrammaticText = true
+                host.textView.inputContext?.discardMarkedText()
+                apply(parent.text, to: host.textView, moveCursorToEnd: true)
+                applyingProgrammaticText = false
+            } else if host.textView.string != parent.text {
+                if host.textView.hasMarkedText() {
+                    // SwiftUI may re-render for unrelated state while IME owns a marked
+                    // range. Defer external replacement until composition completes.
+                    pendingExternalText = parent.text
+                } else {
+                    let replacement = pendingExternalText ?? parent.text
+                    pendingExternalText = nil
+                    apply(replacement, to: host.textView, moveCursorToEnd: false)
+                }
+            }
+
+            host.refreshLayout(scrollSelection: true)
+            synchronizeFocus(host)
+        }
+
+        func textDidBeginEditing(_ notification: Notification) {
+            guard !isDismantled else { return }
+            guard !parent.isFocused else { return }
+            parent.isFocused = true
+        }
+
+        func textDidEndEditing(_ notification: Notification) {
+            guard !isDismantled else { return }
+            if pendingExternalText != nil, let host {
+                schedulePendingTextApplication(on: host)
+            }
+            if parent.isFocused {
+                parent.isFocused = false
+            }
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard !isDismantled,
+                  !applyingProgrammaticText,
+                  let textView = notification.object as? NSTextView,
+                  let host else { return }
+
+            if pendingExternalText != nil {
+                if !textView.hasMarkedText() {
+                    // NSTextView can notify delegates before an IME unmark operation
+                    // finishes mutating storage. Apply on the next run loop so the
+                    // committed marked string cannot overwrite the external update.
+                    schedulePendingTextApplication(on: host)
+                }
+            } else if parent.text != textView.string {
+                parent.text = textView.string
+            }
+
+            host.refreshLayout(scrollSelection: true)
+        }
+
+        func undoManager(for view: NSTextView) -> UndoManager? {
+            composerUndoManager
+        }
+
+        private func synchronizeAfterUndoOrRedo() {
+            guard !isDismantled, !applyingProgrammaticText, let host else { return }
+            if parent.text != host.textView.string {
+                parent.text = host.textView.string
+            }
+            host.refreshLayout(scrollSelection: true)
+        }
+
+        func receiveHeight(_ newHeight: CGFloat) {
+            guard !isDismantled,
+                  abs(parent.height - newHeight) > 0.5,
+                  pendingHeight != newHeight else { return }
+            pendingHeight = newHeight
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      !self.isDismantled,
+                      self.pendingHeight == newHeight else { return }
+                self.pendingHeight = nil
+                if abs(self.parent.height - newHeight) > 0.5 {
+                    self.parent.height = newHeight
+                }
+            }
+        }
+
+        private func schedulePendingTextApplication(on host: ComposerTextViewHost) {
+            guard !pendingTextApplicationScheduled else { return }
+            pendingTextApplicationScheduled = true
+            DispatchQueue.main.async { [weak self, weak host] in
+                guard let self, let host else { return }
+                self.pendingTextApplicationScheduled = false
+                guard !self.isDismantled,
+                      let pendingExternalText = self.pendingExternalText,
+                      !host.textView.hasMarkedText() else { return }
+                self.pendingExternalText = nil
+                self.apply(
+                    pendingExternalText,
+                    to: host.textView,
+                    moveCursorToEnd: false
+                )
+                if self.parent.text != pendingExternalText {
+                    self.parent.text = pendingExternalText
+                }
+                host.refreshLayout(scrollSelection: true)
+            }
+        }
+
+        func synchronizeFocus(_ host: ComposerTextViewHost) {
+            guard !isDismantled else { return }
+            if parent.isFocused {
+                guard appIsActiveProvider(),
+                      let window = host.window,
+                      windowIsKeyProvider(window),
+                      window.firstResponder !== host.textView,
+                      !focusRequestScheduled else { return }
+                focusRequestScheduled = true
+                DispatchQueue.main.async { [weak self, weak host] in
+                    guard let self, let host else { return }
+                    self.focusRequestScheduled = false
+                    guard !self.isDismantled,
+                          self.parent.isFocused,
+                          self.appIsActiveProvider(),
+                          let window = host.window,
+                          self.windowIsKeyProvider(window),
+                          window.firstResponder !== host.textView else {
+                        return
+                    }
+                    self.makeFirstResponder(window, host.textView)
+                }
+            } else if host.window?.firstResponder === host.textView {
+                host.window?.makeFirstResponder(nil)
+            }
+        }
+
+        private func apply(
+            _ newText: String,
+            to textView: NSTextView,
+            moveCursorToEnd: Bool
+        ) {
+            // Every call represents an external whole-draft boundary, including
+            // an equal-string session rebind. Old range-based typing actions must
+            // never survive into the replacement/session on the other side.
+            composerUndoManager.removeAllActions()
+            guard textView.string != newText else { return }
+            let oldSelection = textView.selectedRange()
+            let oldLength = (textView.string as NSString).length
+            let wasApplyingProgrammaticText = applyingProgrammaticText
+            applyingProgrammaticText = true
+            composerUndoManager.disableUndoRegistration()
+            textView.string = newText
+            composerUndoManager.enableUndoRegistration()
+            composerUndoManager.removeAllActions()
+            applyingProgrammaticText = wasApplyingProgrammaticText
+
+            let length = (newText as NSString).length
+            if moveCursorToEnd {
+                textView.setSelectedRange(NSRange(location: length, length: 0))
+            } else if oldSelection.length == 0, oldSelection.location == oldLength {
+                // Preserve the semantic "end of draft" caret across replacements
+                // such as slash completion: "/na" becomes "/name " and arguments
+                // must continue after the trailing space.
+                textView.setSelectedRange(NSRange(location: length, length: 0))
+            } else {
+                let location = min(oldSelection.location, length)
+                let selectionLength = min(oldSelection.length, length - location)
+                textView.setSelectedRange(
+                    NSRange(location: location, length: selectionLength)
+                )
+            }
+        }
+
+        func dismantle() {
+            isDismantled = true
+            pendingExternalText = nil
+            pendingHeight = nil
+            composerUndoManager.onUndoOrRedo = {}
+            composerUndoManager.removeAllActions()
+            host = nil
+        }
+    }
+}
+
 /// Arrow/Tab/Return/Esc while slash palette is open. Mirrors ComposerPasteCatcher lifecycle.
 final class ComposerSlashKeyMonitor {
     var isActive = false
@@ -342,7 +848,10 @@ final class ComposerSlashKeyMonitor {
 struct InputBar: View {
     @EnvironmentObject var store: AppStore
     @ObservedObject var session: ChatSession
-    @FocusState private var focused: Bool
+    @State private var focused = false
+    @State private var composerTextHeight = ComposerTextViewLayout.minimumHeight(
+        for: .systemFont(ofSize: NSFont.systemFontSize)
+    )
     @State private var pasteCatcher = ComposerPasteCatcher()
     @StateObject private var composerRouter = ComposerSessionRouter()
     @State private var slashKeyMonitor = ComposerSlashKeyMonitor()
@@ -402,8 +911,10 @@ struct InputBar: View {
         .background(.bar)
         .onDrop(of: [.image, .fileURL], isTargeted: nil, perform: handleDrop)
         .onAppear {
-            focused = true
-            pasteCatcher.focused = true
+            let mayFocus = NSApp.isActive
+                && NSApp.keyWindow?.isKeyWindow == true
+            focused = mayFocus
+            pasteCatcher.focused = mayFocus
             composerRouter.bind(to: session)
             ComposerPersistentCallbackBinder.install(
                 pasteCatcher: pasteCatcher,
@@ -545,19 +1056,19 @@ struct InputBar: View {
         HStack(alignment: .bottom, spacing: 10) {
             plusMenu
 
-            TextField(fieldPlaceholder,
-                      text: $session.draftText, axis: .vertical)
-                .textFieldStyle(.plain)
-                // Do not inherit a low-contrast foreground from the surrounding
-                // status/menu chrome. Draft text must remain readable in both
-                // light and dark appearances.
-                .foregroundStyle(Color.primary)
-                .lineLimit(1...10)
-                .frame(minHeight: 20, alignment: .leading)
-                .focused($focused)
-                .onSubmit { [router = composerRouter] in
+            ComposerTextView(
+                text: $session.draftText,
+                isFocused: $focused,
+                height: $composerTextHeight,
+                sessionIdentity: ObjectIdentifier(session),
+                placeholder: fieldPlaceholder,
+                onSubmit: { [router = composerRouter] in
                     router.send()
                 }
+            )
+                .frame(maxWidth: .infinity)
+                .frame(height: composerTextHeight, alignment: .leading)
+                .layoutPriority(1)
                 .padding(.vertical, 6)
 
             if session.isStreaming || session.isSendingFromQueue || session.isStopping {
