@@ -7,6 +7,16 @@ package enum FileReveal {
 
     // MARK: - Reveal / open
 
+    /// Test seam: swap these out so tests never spawn a real Finder window.
+    nonisolated(unsafe) package static var revealHandler: ([URL]) -> Void = {
+        NSWorkspace.shared.activateFileViewerSelecting($0)
+    }
+
+    /// Test seam: swap this out so tests never launch a real app.
+    nonisolated(unsafe) package static var openHandler: (URL) -> Bool = {
+        NSWorkspace.shared.open($0)
+    }
+
     @discardableResult
     package static func revealInFinder(path: String) -> Bool {
         revealInFinder(url: URL(fileURLWithPath: path))
@@ -17,7 +27,7 @@ package enum FileReveal {
         let resolved = url.isFileURL ? url : URL(fileURLWithPath: url.path)
         let path = resolved.path
         guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else { return false }
-        NSWorkspace.shared.activateFileViewerSelecting([resolved])
+        revealHandler([resolved])
         return true
     }
 
@@ -25,7 +35,7 @@ package enum FileReveal {
     package static func open(path: String) -> Bool {
         let url = URL(fileURLWithPath: path)
         guard FileManager.default.fileExists(atPath: path) else { return false }
-        return NSWorkspace.shared.open(url)
+        return openHandler(url)
     }
 
     package static func missingPathMessage(_ path: String) -> String {
