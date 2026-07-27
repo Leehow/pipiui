@@ -45,7 +45,7 @@ final class WorktreeMergeFailedMessageTests: XCTestCase {
             worktreeLifecycle: .pendingReview
         )
         let text = WorktreeMergeFailedMessage.format(agent: agent, error: "conflict in Foo.swift")
-        // BossPrompt discipline: dispatch a fixer by default; the boss never opens
+        // Fan-out layer discipline: dispatch a fixer by default; the boss never opens
         // conflict diffs personally and only adjudicates three ways.
         XCTAssertTrue(text.contains("general-purpose fixer"))
         XCTAssertTrue(text.contains("branch name + conflicted file list"))
@@ -210,35 +210,26 @@ final class WorktreeMergeFailedMessageTests: XCTestCase {
         XCTAssertEqual(calls.map(\.1), ["err-a", "err-b"])
     }
 
-    func testBossPromptMentionsMergeFailedSelfHandle() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("pipiui-boss-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let path = try XCTUnwrap(BossPrompt.install(into: dir))
-        let text = try String(contentsOfFile: path, encoding: .utf8)
+    func testFanoutLayerMentionsMergeFailedSelfHandle() throws {
+        let text = try PhilosophyLayerFixture.normalizedBody("fanout")
         XCTAssertTrue(text.contains("[worktree-merge-failed]"))
         // The don't-bother-the-user discipline: on a failed merge the boss dispatches a
         // fixer by default and only adjudicates — accept / discard / ask the user, one
         // sentence, one concrete choice — and never forwards a raw git error. The same
-        // discipline covers post-merge verify failures. (Prompt is English since the
-        // token-budget pass.)
+        // discipline covers post-merge verify failures.
         XCTAssertTrue(text.contains("Default action: dispatch"))
-        XCTAssertTrue(text.contains("a general-purpose fixer"))
-        XCTAssertTrue(text.contains("one sentence, one concrete choice"))
-        XCTAssertTrue(text.contains("Never forward a raw git error"))
+        XCTAssertTrue(text.contains("dispatch a fixer whose brief carries the branch name"))
+        XCTAssertTrue(text.contains("one sentence with one concrete choice"))
+        XCTAssertTrue(text.contains("Never forward a raw Git error"))
         XCTAssertTrue(text.contains("[post-merge-verify-failed]"))
     }
 
     /// A `verified=fail` worker is not merged and keeps its worktree, so the fix must
-    /// reuse the same agentId rather than starting a fresh worker from zero.
-    func testBossPromptTellsBossToReuseAgentIdOnVerifyFail() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("pipiui-boss-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let path = try XCTUnwrap(BossPrompt.install(into: dir))
-        let text = try String(contentsOfFile: path, encoding: .utf8)
+    /// reuse the same agent id rather than starting a fresh worker from zero.
+    func testOrchestrationLayerTellsBossToReuseAgentIdOnVerifyFail() throws {
+        let text = try PhilosophyLayerFixture.normalizedBody("orchestration")
         XCTAssertTrue(text.contains("did NOT merge"))
-        XCTAssertTrue(text.contains("re-dispatching the SAME agentId"))
+        XCTAssertTrue(text.contains("re-dispatching the SAME agent id"))
     }
 
     /// Regression: dedup used a single slot, so in a parallel wave agent B's failure

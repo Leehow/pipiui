@@ -19,20 +19,14 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
     }
 }
 
-enum SettingsReloadPolicy {
-    static func shouldReload(from wasVisible: Bool, to isVisible: Bool) -> Bool {
-        !wasVisible && isVisible
-    }
-}
-
 struct SettingsSheet: View {
     @EnvironmentObject var store: AppStore
+    @Environment(\.dismiss) private var dismiss
 
     @State private var tab: SettingsTab = .general
     @State private var models: [ModelInfo] = []
     @State private var credentials: [PiAuthStore.CredentialInfo] = []
     @State private var hiddenIds: Set<String> = ModelVisibility.hiddenModelIds()
-    @State private var weakIds: Set<String> = ModelTierSettings.weakModelIds()
     @State private var agents: [AgentDefinition] = []
     @State private var subagentSettings: [String: SubagentModelSettings.Override] = SubagentModelSettings.allSettings()
     @State private var disabledTools: Set<String> = ToolSkillSettings.disabledTools()
@@ -108,11 +102,6 @@ struct SettingsSheet: View {
         }
         .frame(width: 640, height: 620)
         .task { await reload() }
-        .onChange(of: store.showSettings) { wasVisible, isVisible in
-            if SettingsReloadPolicy.shouldReload(from: wasVisible, to: isVisible) {
-                Task { await reload() }
-            }
-        }
         .onChange(of: tab) { _, newValue in
             if newValue == .usage { reloadUsage() }
         }
@@ -172,11 +161,12 @@ struct SettingsSheet: View {
             Text("设置")
                 .font(.headline)
             Spacer()
-            // 快捷键按可见性门控，避免隐藏的设置面板抢走聊天输入框的回车/Esc。
-            Button("完成") { store.showSettings = false }
-                .keyboardShortcut(store.showSettings ? .defaultAction : nil)
-            Button("") { store.showSettings = false }
-                .keyboardShortcut(store.showSettings ? .cancelAction : nil)
+            // 回车完成 / Esc 取消：sheet 呈现时才进窗口，快捷键不再需要可见性门控。
+            Button("完成") { dismiss() }
+                .keyboardShortcut(.defaultAction)
+            // 隐藏的 Esc cancel action：与「完成」共享同一 dismiss，保证 Esc 始终关闭面板。
+            Button("") { dismiss() }
+                .keyboardShortcut(.cancelAction)
                 .frame(width: 0, height: 0)
                 .opacity(0)
                 .accessibilityHidden(true)
@@ -192,13 +182,7 @@ struct SettingsSheet: View {
             VStack(alignment: .leading, spacing: 12) {
                 Text("通用")
                     .font(.title3.weight(.semibold))
-                Toggle(isOn: $store.bossModeEnabled) {
-                    Label("Boss 模式", systemImage: "crown")
-                }
-                .help("Boss 模式：新会话以大组长协议启动——不亲自干活，按难度分派 subagent（简单派单兵、复杂派组长、调研扇出），配合反早停失败恢复协议")
-                Text("开启后，新会话以大组长协议启动：不亲自干活，按难度分派 subagent。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                PhilosophySection(store: store)
             }
             Divider()
             webSearchSection
@@ -224,8 +208,7 @@ struct SettingsSheet: View {
                 .disabled(isLoading)
             }
 
-            Text("左侧勾选控制底栏模型菜单是否显示；删除会移除该 provider 的 Pi 凭据。"
-                 + "「弱模型」标记的模型会强制走 Superpowers 流程（未标记 = 强模型，技能库只作提示）。")
+            Text("左侧勾选控制底栏模型菜单是否显示；删除会移除该 provider 的 Pi 凭据。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -314,14 +297,6 @@ struct SettingsSheet: View {
             }
             .toggleStyle(.checkbox)
 
-            Spacer(minLength: 8)
-
-            Toggle(isOn: weakTierBinding(for: model.id)) {
-                Text("弱模型")
-                    .font(.caption)
-            }
-            .toggleStyle(.checkbox)
-            .help("勾选后该模型强制走 Superpowers 流程：难任务必须先调技能，首次派工前会被要求先读 SOP。")
         }
     }
 
@@ -714,6 +689,7 @@ struct SettingsSheet: View {
         case "subagent", "subagent_status": return "person.2"
         case "generate_image": return "photo"
         case "browser", "browser_navigate", "browser_click": return "safari"
+        case "computer": return "desktopcomputer"
         case "git_status", "git_diff": return "arrow.triangle.branch"
         default: return "hammer"
         }
@@ -746,10 +722,11 @@ struct SettingsSheet: View {
         LazyVStack(alignment: .leading, spacing: 16) {
             Text("工具与 Skills")
                 .font(.title3.weight(.semibold))
-            Text("开关关闭后：工具通过 `--exclude-tools` 在会话重启后对 pi 生效；Skills 立即从斜杠菜单隐藏（下次派出 subagent 也会尊重工具禁用）。")
+            Text("普通工具关闭后通过 `--exclude-tools` 在会话重启后生效。Computer Use 是独立 opt-in：关闭时扩展完全不挂载。Skills 会立即从斜杠菜单隐藏。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
+            ComputerUseSettingsPanel()
             catalogGroup(title: "内置工具", entries: ToolSkillCatalog.builtinTools)
             catalogGroup(title: "扩展工具", entries: ToolSkillCatalog.extensionTools)
 
@@ -813,7 +790,7 @@ struct SettingsSheet: View {
         LazyVStack(alignment: .leading, spacing: 8) {
             Text(title)
                 .font(.subheadline.weight(.semibold))
-            ForEach(entries) { tool in
+            ForEach(entries.filter { $0.name != "computer" }) { tool in
                 Toggle(isOn: toolEnabledBinding(for: tool.name)) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(tool.name)
@@ -905,17 +882,56 @@ struct SettingsSheet: View {
         }
     }
 
+    private func capability(
+        forModelId modelId: String
+    ) -> (reasoning: Bool?, thinkingLevelMap: [String: String?]?) {
+        guard let model = models.first(where: { $0.id == modelId }) else {
+            return (nil, nil)
+        }
+        return (model.reasoning, model.thinkingLevelMap)
+    }
+
     private func setSubagentModelOverride(_ newValue: String, for agentName: String) {
         let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let currentThinking = subagentSettings[agentName]?.thinking
+        let cap = capability(forModelId: trimmed)
+        let resolution = ThinkingCapability.resolveSelection(
+            newModelId: trimmed,
+            persistedThinking: subagentSettings[agentName]?.thinking,
+            reasoning: cap.reasoning,
+            thinkingLevelMap: cap.thinkingLevelMap
+        )
         SubagentModelSettings.setOverride(
-            trimmed.isEmpty ? nil : trimmed,
-            thinking: currentThinking,
+            resolution.modelId,
+            thinking: resolution.thinking,
             for: agentName
         )
         subagentSettings = SubagentModelSettings.allSettings()
         recomputePickerModels()
-        statusMessage = "已保存 \(agentName) 的模型设置"
+        statusMessage = resolution.didReset
+            ? "已重置 \(agentName) 的思考强度（\(trimmed) 不支持该档位）"
+            : "已保存 \(agentName) 的模型设置"
+    }
+
+    /// Silent and idempotent migration of persisted choices using known model metadata only.
+    private func normalizeSubagentThinkingIfNeeded() {
+        var changed = false
+        for (agent, override) in subagentSettings {
+            let cap = capability(forModelId: override.model)
+            guard ThinkingCapability.normalizationDecision(
+                modelId: override.model,
+                persistedThinking: override.thinking,
+                reasoning: cap.reasoning,
+                thinkingLevelMap: cap.thinkingLevelMap
+            ) == .reset
+            else {
+                continue
+            }
+            SubagentModelSettings.setOverride(override.model, thinking: nil, for: agent)
+            changed = true
+        }
+        if changed {
+            subagentSettings = SubagentModelSettings.allSettings()
+        }
     }
 
     private func setSubagentThinkingOverride(_ newValue: String, for agentName: String) {
@@ -1077,26 +1093,12 @@ struct SettingsSheet: View {
         )
     }
 
-    /// Tier only drives prompt wording and the dispatch gate — it changes neither the picker
-    /// nor any spawn argument, so the extension's hot-read JSON is the whole propagation path
-    /// (no session restart needed).
-    private func weakTierBinding(for modelId: String) -> Binding<Bool> {
-        Binding(
-            get: { weakIds.contains(modelId) },
-            set: { weak in
-                ModelTierSettings.setWeak(weak, modelId: modelId)
-                weakIds = ModelTierSettings.weakModelIds()
-            }
-        )
-    }
-
     /// reload 的同步 I/O 前缀快照（后台线程执行，主线程只赋值）。
     /// 注意：不再调 SubagentModelSettings.syncJSONFile() / ToolSkillSettings.syncJSONFile()——
     /// 它们的 setter 在真正编辑时已各自同步；reload 无编辑场景不应重写文件。
     private struct ReloadSnapshot {
         var credentials: [PiAuthStore.CredentialInfo]
         var hiddenIds: Set<String>
-        var weakIds: Set<String>
         var agents: [AgentDefinition]
         var subagentSettings: [String: SubagentModelSettings.Override]
         var disabledTools: Set<String>
@@ -1120,7 +1122,6 @@ struct SettingsSheet: View {
         return ReloadSnapshot(
             credentials: credentials,
             hiddenIds: ModelVisibility.hiddenModelIds(),
-            weakIds: ModelTierSettings.weakModelIds(),
             agents: AgentCatalog.load(),
             subagentSettings: SubagentModelSettings.allSettings(),
             disabledTools: ToolSkillSettings.disabledTools(),
@@ -1144,7 +1145,6 @@ struct SettingsSheet: View {
 
         credentials = snapshot.credentials
         hiddenIds = snapshot.hiddenIds
-        weakIds = snapshot.weakIds
         agents = snapshot.agents
         subagentSettings = snapshot.subagentSettings
         disabledTools = snapshot.disabledTools
@@ -1186,6 +1186,7 @@ struct SettingsSheet: View {
         // models / hiddenIds / subagentSettings 已就位，重算 picker 候选与 provider 分组缓存。
         recomputeGroupedModels()
         recomputePickerModels()
+        normalizeSubagentThinkingIfNeeded()
     }
 
     @MainActor
@@ -1239,6 +1240,24 @@ private struct SubagentModelRow: View, Equatable {
     let onSelect: (String) -> Void
     let onSelectThinking: (String) -> Void
 
+    private var selectedCapability: (reasoning: Bool?, thinkingLevelMap: [String: String?]?) {
+        guard let model = pickerModels.first(where: { $0.id == selection }) else {
+            return (nil, nil)
+        }
+        return (model.reasoning, model.thinkingLevelMap)
+    }
+
+    private var isNonReasoning: Bool {
+        selectedCapability.reasoning == .some(false)
+    }
+
+    private var allowedThinkingTags: [String] {
+        ThinkingCapability.allowedLevels(
+            reasoning: selectedCapability.reasoning,
+            thinkingLevelMap: selectedCapability.thinkingLevelMap
+        )
+    }
+
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.agent == rhs.agent
             && lhs.pickerModels == rhs.pickerModels
@@ -1272,24 +1291,39 @@ private struct SubagentModelRow: View, Equatable {
             }
             .labelsHidden()
 
-            Picker(
-                "思考强度",
-                selection: Binding(get: { thinking }, set: { onSelectThinking($0) })
-            ) {
-                Text("默认（由模型决定）").tag(SubagentModelSettings.defaultThinkingSentinel)
-                Text("关闭思考").tag("off")
-                Text("极低").tag("minimal")
-                Text("低").tag("low")
-                Text("中").tag("medium")
-                Text("高").tag("high")
-                Text("极高").tag("xhigh")
-                Text("最大").tag("max")
+            if isNonReasoning {
+                Text("该模型为非推理模型，思考强度由模型决定。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Picker(
+                    "思考强度",
+                    selection: Binding(get: { thinking }, set: { onSelectThinking($0) })
+                ) {
+                    ForEach(allowedThinkingTags, id: \.self) { tag in
+                        Text(thinkingLabel(for: tag)).tag(tag)
+                    }
+                }
+                .disabled(selection.isEmpty)
+                .help(selection.isEmpty ? "跟随主 Agent 时仅跟随当前底栏模型" : "仅对这个 Subagent 的新进程生效")
             }
-            .disabled(selection.isEmpty)
-            .help(selection.isEmpty ? "跟随主 Agent 时仅跟随当前底栏模型" : "仅对这个 Subagent 的新进程生效")
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+    }
+
+    private func thinkingLabel(for tag: String) -> String {
+        switch tag {
+        case "": return "默认（由模型决定）"
+        case "off": return "关闭思考"
+        case "minimal": return "极低"
+        case "low": return "低"
+        case "medium": return "中"
+        case "high": return "高"
+        case "xhigh": return "极高"
+        case "max": return "最大"
+        default: return tag
+        }
     }
 
     @ViewBuilder

@@ -1,4 +1,5 @@
 import AppKit
+import PDFKit
 import SwiftUI
 
 /// 聊天文本 → 「在右侧文档面板打开这个文件」的环境钩子。
@@ -86,7 +87,11 @@ struct DocumentPanel: View {
     private var headerIcon: String {
         switch store.loadState {
         case .loaded(let doc):
-            return doc.kind == .markdown ? "doc.richtext" : "doc.plaintext"
+            switch doc.kind {
+            case .markdown: return "doc.richtext"
+            case .plain: return "doc.plaintext"
+            case .pdf: return "doc"
+            }
         case .empty:
             return "doc.text"
         case .missing, .unreadable, .tooLarge:
@@ -137,7 +142,7 @@ struct DocumentPanel: View {
                 placeholder(
                     icon: "doc.zipper",
                     title: "文件过大（\(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))）",
-                    message: "超过 2 MB 的文档不在面板内渲染"
+                    message: "超过文档预览上限，请使用默认应用打开"
                 )
                 Button("用默认应用打开") {
                     _ = FileReveal.open(path: path)
@@ -167,24 +172,54 @@ struct DocumentPanel: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    @ViewBuilder
     private func documentView(_ doc: DocumentStore.Document) -> some View {
-        ScrollView {
-            Group {
-                switch doc.kind {
-                case .markdown:
-                    MarkdownTextView(text: doc.text)
-                case .plain:
-                    Text(doc.text)
-                        .font(Font(chatTypography.codeNSFont))
-                        .lineSpacing(chatTypography.lineSpacing)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+        switch doc.kind {
+        case .pdf:
+            PDFKitView(url: doc.url)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .markdown, .plain:
+            ScrollView {
+                Group {
+                    switch doc.kind {
+                    case .markdown:
+                        MarkdownTextView(text: doc.text)
+                    case .plain:
+                        Text(doc.text)
+                            .font(Font(chatTypography.codeNSFont))
+                            .lineSpacing(chatTypography.lineSpacing)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    case .pdf:
+                        EmptyView()
+                    }
                 }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .overlayScrollers()
             }
-            .padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .overlayScrollers()
+            .scrollIndicators(.automatic)
         }
-        .scrollIndicators(.automatic)
+    }
+}
+
+/// PDFKit host for the document panel. The store performs an attribute-only 50 MB guard;
+/// PDFKit then loads from the URL instead of decoding the file into a String.
+private struct PDFKitView: NSViewRepresentable {
+    let url: URL
+
+    func makeNSView(context: Context) -> PDFView {
+        let view = PDFView()
+        view.autoScales = true
+        view.displayMode = .singlePageContinuous
+        view.document = PDFDocument(url: url)
+        return view
+    }
+
+    func updateNSView(_ nsView: PDFView, context: Context) {
+        if nsView.document?.documentURL?.standardizedFileURL.path
+            != url.standardizedFileURL.path {
+            nsView.document = PDFDocument(url: url)
+        }
     }
 }

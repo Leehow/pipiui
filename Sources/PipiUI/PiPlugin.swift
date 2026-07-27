@@ -11,7 +11,10 @@ import Foundation
 ///   由 `PiExtensionConflicts` 在 spawn 前检出并提示修复。
 /// - App 自有 agent 目录（lead + 反摆烂版 explore/plan/reviewer/general-purpose），
 ///   通过 `PIPIUI_AGENTS_DIR` 让补丁版 subagent 读取，不碰 `~/.pi/agent/agents`。
-/// - 内置浏览器扩展、Boss 协议提示词。
+/// - 内置浏览器扩展。
+///
+/// 唯一的例外是工作哲学（`PhilosophyPackage`）：它注册进 `~/.pi/agent/settings.json`，
+/// 因为它是这里唯一「离开本 App 仍然成立」的东西——裸 TUI 也该吃到。
 enum PiPlugin {
     /// 安装结果：spawn pi 时需要的路径与环境变量。
     struct Installed {
@@ -21,12 +24,12 @@ enum PiPlugin {
         var gitExtension: String?     // -e git_status / git_diff + prompt snapshot
         var reloadExtension: String?  // -e 内部 pipiui_reload 命令
         var webSearchExtension: String? // -e web_search / web_fetch
-        var skillTierExtension: String? // -e 按模型档位注入 Superpowers 指令 + 派工闸门
+        var skillLoaderExtension: String? // -e 技能按需加载（名字索引 + skill_search / skill_load）
         var searchScopeExtension: String? // -e 项目内搜索边界 + 当轮外部路径授权
         var codexServerToolsExtension: String? // -e openai-codex hosted web_search
         var claudeServerToolsExtension: String? // -e anthropic hosted web_search
+        var computerUseExtension: String? // -e opt-in desktop computer harness
         var agentsDir: String?     // PIPIUI_AGENTS_DIR
-        var bossPrompt: String?    // --append-system-prompt（Boss 模式）
     }
 
     private static var root: URL {
@@ -50,6 +53,10 @@ enum PiPlugin {
     static func installAll() -> Installed {
         let fm = FileManager.default
         try? fm.createDirectory(at: root, withIntermediateDirectories: true)
+        // Cheap, and must run even on the skip path: registration lives in the user's pi
+        // settings, which anything outside this App may have changed since last launch.
+        PhilosophySettings.migrateFromBossModeIfNeeded()
+        defer { syncPhilosophyRegistration() }
         let fingerprint = currentFingerprint()
         if let saved = try? String(contentsOf: markerURL, encoding: .utf8),
            saved == fingerprint,
@@ -59,6 +66,14 @@ enum PiPlugin {
         let result = performInstall()
         try? fingerprint.write(to: markerURL, atomically: true, encoding: .utf8)
         return result
+    }
+
+    /// Keep pi's package list in step with the user's choice. A deliberate "移除" is remembered,
+    /// so this never re-adds what the user removed.
+    private static func syncPhilosophyRegistration() {
+        guard PhilosophyPackage.autoRegisterEnabled() else { return }
+        guard PhilosophyPackage.extensionPath != nil else { return }
+        try? PhilosophyPackage.register()
     }
 
     /// 插件内容指纹：扩展/提示词源码编译进二进制，PiExt 是打包资源。
@@ -73,6 +88,9 @@ enum PiPlugin {
         }
         if let bundled = PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil) {
             parts.append(directorySignature(bundled))
+        }
+        if let philosophy = PipiResourceBundle.shared.url(forResource: "PiPhilosophy", withExtension: nil) {
+            parts.append(directorySignature(philosophy))
         }
         return parts.joined(separator: "|")
     }
@@ -110,17 +128,18 @@ enum PiPlugin {
             ("pipiui-git.ts", \.gitExtension),
             ("pipiui-reload.ts", \.reloadExtension),
             ("pipiui-websearch.ts", \.webSearchExtension),
-            ("pipiui-skilltier.ts", \.skillTierExtension),
+            ("pipiui-skillloader.ts", \.skillLoaderExtension),
             ("pipiui-search-scope.ts", \.searchScopeExtension),
             ("pipiui-codex-server-tools.ts", \.codexServerToolsExtension),
             ("pipiui-claude-server-tools.ts", \.claudeServerToolsExtension),
-            ("boss-prompt.md", \.bossPrompt),
+            ("pipiui-computer-use.ts", \.computerUseExtension),
         ]
         for (name, keyPath) in files {
             let path = root.appendingPathComponent(name).path
             guard fm.fileExists(atPath: path) else { return nil }
             result[keyPath: keyPath] = path
         }
+        guard PhilosophyPackage.extensionPath != nil else { return nil }
         return result
     }
 
@@ -176,9 +195,8 @@ enum PiPlugin {
         // 5.5 通用网络搜索 + 网页抓取（web_search / web_fetch）
         result.webSearchExtension = WebSearchExtension.install(into: root)
 
-        // 5.6 模型档位 → Superpowers 强度（强模型作参考，弱模型强制走 SOP）
-        result.skillTierExtension = SkillTierExtension.install(into: root)
-        ModelTierSettings.syncJSONFile()
+        // 5.6 技能按需加载：提示里只留名字，描述/正文走 skill_search / skill_load
+        result.skillLoaderExtension = SkillLoaderExtension.install(into: root)
 
         // 5.65 项目搜索边界：内建 find/grep/ls + 明确的递归 bash 搜索
         result.searchScopeExtension = SearchScopeExtension.install(into: root)
@@ -189,8 +207,14 @@ enum PiPlugin {
         // 5.8 官方 anthropic-messages hosted web_search
         result.claudeServerToolsExtension = ClaudeServerToolsExtension.install(into: root)
 
-        // 6. Boss 协议提示词
-        result.bossPrompt = BossPrompt.install(into: root)
+        // 5.9 macOS Computer Use（仅安装；独立 opt-in 决定 ChatSession 是否 -e 挂载）
+        result.computerUseExtension = ComputerUseExtension.install(into: root)
+
+        // 6. 工作哲学：随包快照落盘（注册进 pi 由 syncPhilosophyRegistration 负责）
+        PhilosophyPackage.install()
+
+        // 旧版 Boss 提示词已由哲学包取代，别在用户机器上留 20KB 死文件
+        try? fm.removeItem(at: root.appendingPathComponent("boss-prompt.md"))
 
         return result
     }

@@ -47,118 +47,68 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         XCTAssertTrue(definition.contains("secretary_commit"))
     }
 
-    func testBossPromptOwnsCompletionAndUsesSecretaryOnlyForAmbiguity() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "pipiui-boss-closeout-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let path = try XCTUnwrap(BossPrompt.install(into: dir))
-        let text = try String(contentsOfFile: path, encoding: .utf8)
+    func testOrchestrationOwnsCompletionAndUsesSecretaryOnlyForAmbiguity() throws {
+        let text = try PhilosophyLayerFixture.normalizedBody("orchestration")
 
-        XCTAssertTrue(text.contains("**Research / analysis-only**"))
-        XCTAssertTrue(text.contains("this route is terminal without plan or implementation"))
-        XCTAssertTrue(text.contains("**T2 medium, code-changing**"))
-        XCTAssertTrue(text.contains("follow the model-tier planning route appended below"))
-        XCTAssertTrue(text.contains("explore first and then take that planning route"))
-        XCTAssertTrue(text.contains("then dispatch general-purpose to implement"))
-        XCTAssertTrue(text.contains("never completion of a change request"))
-        XCTAssertTrue(text.contains("each genuinely new user goal"))
-        XCTAssertTrue(text.contains("exactly one visible triage line"))
-        XCTAssertTrue(text.contains("follow-up questions"))
-        XCTAssertTrue(text.contains("confirmations or approvals"))
-        XCTAssertTrue(text.contains("requests for a path"))
-        XCTAssertTrue(text.contains("clarifications"))
-        XCTAssertTrue(text.contains("[subagent-done]"))
-        XCTAssertTrue(text.contains("any other internal worker signal"))
-        XCTAssertTrue(text.contains("keep any reclassification internal and silent"))
         XCTAssertTrue(text.contains("## Automatic execution routing (highest priority)"))
         XCTAssertTrue(text.contains("Execution routing is not a user product"))
-        XCTAssertTrue(text.contains("automatically select the"))
-        XCTAssertTrue(text.contains("multi-agent/subagent execution route"))
-        XCTAssertTrue(text.contains("immediately dispatch the appropriate"))
-        XCTAssertTrue(text.contains("general-purpose worker(s)"))
+        XCTAssertTrue(text.contains("automatically select the delegated execution route"))
+        XCTAssertTrue(text.contains("immediately dispatch the appropriate implementation worker(s)"))
         XCTAssertTrue(text.contains("MUST NOT present, relay, or ask the user"))
         XCTAssertTrue(text.contains("execution-mode menu"))
         XCTAssertTrue(text.contains("ignore it and continue with worker dispatch"))
         XCTAssertTrue(text.contains("MUST NOT pause for confirmation"))
-        XCTAssertTrue(text.contains("do it yourself, no subagents"))
-        XCTAssertTrue(text.contains("## Completion ownership and optional audit"))
-        XCTAssertTrue(text.contains("The Boss owns the completion decision"))
-        XCTAssertTrue(text.contains("Routine research and clean T1/T2 work do not require"))
-        XCTAssertTrue(text.contains("only as an optional audit/reconciliation helper"))
-        XCTAssertTrue(text.contains("Its verdict"))
-        XCTAssertTrue(text.contains("is advisory"))
-        XCTAssertTrue(text.contains("A secretary-controlled commit is never a"))
-        XCTAssertTrue(text.contains("subagent_status"))
-        XCTAssertFalse(text.contains("## Closeout hard gate"))
-        XCTAssertFalse(text.contains("MUST dispatch `secretary`"))
-        XCTAssertFalse(text.contains("secretary-controlled commit gate"))
-        XCTAssertFalse(text.contains("`closeout=pass` plus required integration verification"))
-        XCTAssertFalse(text.contains("Open every task with one line"))
+        XCTAssertTrue(text.contains("do it yourself, no workers"))
+        XCTAssertTrue(text.contains("## Completion ownership"))
+        XCTAssertTrue(text.contains("You own the completion decision"))
+        XCTAssertTrue(text.contains("Routine research and clean, uncontested work need no audit pass"))
+        XCTAssertTrue(text.contains("Its verdict is advisory"))
+        XCTAssertTrue(text.contains("An audit-controlled commit is never a prerequisite"))
+        // Tool names live in capabilities.json, so the body must reference the capability.
+        XCTAssertTrue(text.contains("{{delegate_status}}"))
+        XCTAssertFalse(text.contains("subagent_status"))
+
+        // Research-only terminality moved to the layer that ships to workers too.
+        let foundation = try PhilosophyLayerFixture.normalizedBody("foundation")
+        XCTAssertTrue(foundation.contains("Research and analysis-only requests are terminal"))
+        XCTAssertTrue(foundation.contains("never completion of a change request"))
+
+        let all = try PhilosophyLayerFixture.allNormalizedBodies()
+        XCTAssertFalse(all.contains("## Closeout hard gate"))
+        XCTAssertFalse(all.contains("MUST dispatch `secretary`"))
+        XCTAssertFalse(all.contains("secretary-controlled commit gate"))
+        XCTAssertFalse(all.contains("`closeout=pass` plus required integration verification"))
+        XCTAssertFalse(all.contains("Open every task with one line"))
     }
 
-    func testBossPromptContinuesAutonomouslyUnlessAuthorityIsActuallyNeeded() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "pipiui-boss-confirmation-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let path = try XCTUnwrap(BossPrompt.install(into: dir))
-        let text = try String(contentsOfFile: path, encoding: .utf8)
+    func testFoundationContinuesAutonomouslyUnlessAuthorityIsActuallyNeeded() throws {
+        let text = try PhilosophyLayerFixture.normalizedBody("foundation")
 
-        XCTAssertTrue(text.contains(
-            "## Autonomous continuation and minimal confirmation gate (highest priority)"
-        ))
-        XCTAssertTrue(text.contains(
-            "requested a fix or implementation"
-        ))
-        XCTAssertTrue(text.contains(
-            "within that scope is established"
-        ))
-        XCTAssertTrue(text.contains(
-            "MUST NOT ask them to reply \"fix\", \"continue\", \"start\""
-        ))
-        XCTAssertTrue(text.contains(
-            "safe, reversible, within the"
-        ))
-        XCTAssertTrue(text.contains(
-            "derivable from repository or conversation evidence"
-        ))
+        XCTAssertTrue(text.contains("## Authorization is established by the request"))
+        XCTAssertTrue(text.contains("asked for a fix or an implementation"))
+        XCTAssertTrue(text.contains("within that scope exists"))
+        XCTAssertTrue(text.contains("MUST NOT ask them to reply \"fix\", \"continue\", \"start\""))
+        XCTAssertTrue(text.contains("safe, reversible, within the authorized scope"))
+        XCTAssertTrue(text.contains("derivable from repository or conversation evidence"))
         XCTAssertTrue(text.contains("review feedback"))
         XCTAssertTrue(text.contains("internal spec rebaselining"))
-        XCTAssertTrue(text.contains("worker failure recovery"))
-        XCTAssertTrue(text.contains(
-            "adopt the most conservative interpretation"
-        ))
-        XCTAssertTrue(text.contains("update the internal ledger"))
-        XCTAssertTrue(text.contains(
-            "immediately dispatch implementation"
-        ))
-        XCTAssertTrue(text.contains(
-            "do not relay that request"
-        ))
-        XCTAssertTrue(text.contains(
-            "Ask exactly one minimal question only when"
-        ))
-        XCTAssertTrue(text.contains(
-            "materially change user-visible product behavior"
-        ))
-        XCTAssertTrue(text.contains(
-            "a new authorization is needed for an external or irreversible"
-        ))
-        XCTAssertTrue(text.contains(
-            "explicit user requirements conflict with no safe"
-        ))
-        XCTAssertTrue(text.contains(
-            "are never by themselves reasons to ask"
-        ))
-        XCTAssertTrue(text.contains(
-            "exhaust repository and conversation evidence"
-        ))
-        XCTAssertTrue(text.contains(
-            "never ask a generic \"should I continue?\""
-        ))
+        XCTAssertTrue(text.contains("failure recovery"))
+        XCTAssertTrue(text.contains("do not relay that request"))
+        XCTAssertTrue(text.contains("Ask exactly one minimal question only when"))
+        XCTAssertTrue(text.contains("materially change user-visible behavior"))
+        XCTAssertTrue(text.contains("a new authorization is needed for an external or irreversible"))
+        XCTAssertTrue(text.contains("explicit requirements conflict with no safe"))
+        XCTAssertTrue(text.contains("are never by themselves reasons to ask"))
+        XCTAssertTrue(text.contains("exhaust repository and conversation evidence"))
+        XCTAssertTrue(text.contains("never ask a generic \"should I continue?\""))
+        // A worker reached by a brief must decide from it, never wait for a human it cannot reach.
+        XCTAssertTrue(text.contains("the brief is the confirmation"))
+
+        // Spec-vs-direction conflicts are resolved by the boss, in the orchestration layer.
+        let orchestration = try PhilosophyLayerFixture.normalizedBody("orchestration")
+        XCTAssertTrue(orchestration.contains("adopt the most conservative interpretation"))
+        XCTAssertTrue(orchestration.contains("update the ledger"))
+        XCTAssertTrue(orchestration.contains("immediately dispatch implementation"))
     }
 
     func testSafeEligibilityClassifiesMergedUniqueDirtyAndNonInternal() throws {

@@ -133,6 +133,15 @@ enum AssistantBlockLayout {
         return result
     }
 
+    /// Tool-call ids referenced by a raw block list (used by the collapse guard).
+    static func toolCallIds(in blocks: [ChatBlock]) -> Set<String> {
+        var ids = Set<String>()
+        for block in blocks {
+            if case .toolCall(let call) = block { ids.insert(call.id) }
+        }
+        return ids
+    }
+
     /// Summary like `3 steps · Thinking · read · bash`.
     static func summaryTitle(for blocks: [ChatBlock]) -> String {
         let labels = blocks.compactMap(label(for:))
@@ -203,5 +212,59 @@ enum AssistantBlockLayout {
         case .toolCall(let call): return call.name
         case .text, .image, .video: return nil
         }
+    }
+}
+
+/// Pure collapse guard for user-turn fold groups.
+///
+/// A user turn (group) must stay expanded while any subagent it dispatched is still
+/// in-flight, so the live status card / running state never gets hidden by the fold.
+/// Once every related agent has reached a terminal state, the existing collapse
+/// mechanism applies unchanged.
+///
+/// The caller derives `runningSubagentToolCallIds` from `SubagentStore` (the set of
+/// `toolCallId`s whose dispatched agent is `.running`), keeping this helper free of
+/// store/UI dependencies and fully unit-testable.
+enum UserTurnCollapseGuard {
+    /// Group ids that must NOT be folded because at least one of their rows owns a
+    /// tool call whose dispatched subagent is still running.
+    static func runningGuardedGroupIDs(
+        rows: [AssistantBlockLayout.TranscriptRow],
+        groups: AssistantBlockLayout.UserTurnGroups,
+        runningSubagentToolCallIds: Set<String>
+    ) -> Set<String> {
+        guard !runningSubagentToolCallIds.isEmpty else { return [] }
+        var guarded: Set<String> = []
+        for row in rows {
+            let groupID: String?
+            let callIds: Set<String>
+            switch row {
+            case .leaf(let item):
+                groupID = groups.groupIDForRowID[item.id]
+                callIds = AssistantBlockLayout.toolCallIds(in: item.blocks)
+            case .assistantRun(let id, _, let segments):
+                groupID = groups.groupIDForRowID[id]
+                callIds = AssistantBlockLayout.toolCallIds(in: segments)
+            }
+            guard let groupID, !callIds.isDisjoint(with: runningSubagentToolCallIds) else { continue }
+            guarded.insert(groupID)
+        }
+        return guarded
+    }
+
+    /// Resolve whether a group is currently folded, honouring the running-subagent guard.
+    /// - Parameters:
+    ///   - groupID: The fold group id (preceding user-authored message id), or nil.
+    ///   - collapsedUserTurnIDs: Persisted user fold intent.
+    ///   - guardedGroupIDs: Groups forced open by an in-flight subagent.
+    /// - Returns: `true` only when the group is folded AND not guarded by a running agent.
+    static func isCollapsed(
+        groupID: String?,
+        collapsedUserTurnIDs: Set<String>,
+        guardedGroupIDs: Set<String>
+    ) -> Bool {
+        guard let groupID else { return false }
+        if guardedGroupIDs.contains(groupID) { return false }
+        return collapsedUserTurnIDs.contains(groupID)
     }
 }

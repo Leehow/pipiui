@@ -149,7 +149,7 @@ final class QuotaMonitorCore {
             let result: QuotaSnapshot?
             do { result = try await fetcher(force) }
             catch { result = nil }
-            DispatchQueue.main.async {
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.inFlight = false
                 if let result {
