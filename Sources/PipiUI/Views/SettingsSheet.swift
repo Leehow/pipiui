@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 private enum SettingsTab: String, CaseIterable, Identifiable {
     case general = "通用"
@@ -185,7 +186,56 @@ struct SettingsSheet: View {
                 PhilosophySection(store: store)
             }
             Divider()
+            localRemoteSection
+            Divider()
             webSearchSection
+        }
+    }
+
+    private var localRemoteSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("本地远程网页测试")
+                        .font(.title3.weight(.semibold))
+                    Text("默认关闭；仅在本机 127.0.0.1 的随机端口启动独立网页服务。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { store.localRemoteEnabled },
+                        set: { store.setLocalRemoteEnabled($0) }
+                    )
+                )
+                .labelsHidden()
+            }
+
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(store.localRemoteURL == nil ? Color.secondary : Color.green)
+                    .frame(width: 8, height: 8)
+                Text(store.localRemoteStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let url = store.localRemoteURL {
+                    Button("在浏览器打开") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            }
+            if let url = store.localRemoteURL {
+                Text(url.absoluteString)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Text("此阶段只支持项目/会话列表、文本 transcript、发送和 Stop；不含 LAN、账号、附件、Relay 或 E2EE。关闭开关会立即停止 listener 和现有连接。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
