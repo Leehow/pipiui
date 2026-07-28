@@ -218,6 +218,53 @@ private struct AgentRow: View {
     }
 }
 
+struct AgentAutoScrollGate {
+    struct Token: Equatable {
+        let agentID: String
+        let generation: UInt
+    }
+
+    private(set) var activeToken: Token?
+    private var generation: UInt = 0
+
+    static func anchorID(for agentID: String) -> String {
+        "agent-bottom-\(agentID)"
+    }
+
+    mutating func request(agentID: String, isPinned: Bool) -> Token? {
+        guard isPinned else {
+            invalidate()
+            return nil
+        }
+        if let activeToken {
+            if activeToken.agentID == agentID {
+                return nil
+            }
+            invalidate()
+        }
+        generation &+= 1
+        let token = Token(agentID: agentID, generation: generation)
+        activeToken = token
+        return token
+    }
+
+    func permits(_ token: Token, agentID: String, isPinned: Bool) -> Bool {
+        isPinned && token.agentID == agentID && activeToken == token
+    }
+
+    @discardableResult
+    mutating func complete(_ token: Token) -> Bool {
+        guard activeToken == token else { return false }
+        activeToken = nil
+        return true
+    }
+
+    mutating func invalidate() {
+        generation &+= 1
+        activeToken = nil
+    }
+}
+
 private struct AgentDetailView: View {
     let agent: SubagentInfo
     @ObservedObject var store: SubagentStore
@@ -229,6 +276,8 @@ private struct AgentDetailView: View {
     @State private var showDiffStat = false
     @State private var diffStatText: String?
     @State private var diffBusy = false
+    @State private var autoScrollGate = AgentAutoScrollGate()
+    @State private var autoScrollTask: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -248,21 +297,27 @@ private struct AgentDetailView: View {
             }
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        if agent.log.isEmpty {
-                            waitingForFirstLog
-                        } else {
-                            ForEach(agent.log) { item in
-                                AgentLogRow(item: item, base: documentBase)
+                    VStack(spacing: 0) {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            if agent.log.isEmpty {
+                                waitingForFirstLog
+                            } else {
+                                ForEach(agent.log) { item in
+                                    AgentLogRow(item: item, base: documentBase)
+                                }
                             }
+                            Color.clear
+                                .frame(height: 1)
+                                .id(AgentAutoScrollGate.anchorID(for: agent.id))
                         }
-                        Color.clear
-                            .frame(height: 1)
-                            .id("agent-bottom")
-                            .background(StickToBottomTracker(isPinned: $pinToBottom))
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    // Keep AppKit observation outside LazyVStack placements. Putting
+                    // the representable on the lazy bottom row can make its binding
+                    // write participate in the same AttributeGraph layout pass.
+                    .background(StickToBottomTracker(isPinned: $pinToBottom))
                     .overlayScrollers()
                 }
                 .scrollIndicators(.automatic)
@@ -270,7 +325,7 @@ private struct AgentDetailView: View {
                     if !pinToBottom {
                         Button {
                             pinToBottom = true
-                            scrollToBottom(proxy, retry: true)
+                            requestAutoScroll(proxy)
                         } label: {
                             Image(systemName: "arrow.down")
                                 .font(.system(size: 12, weight: .semibold))
@@ -287,25 +342,32 @@ private struct AgentDetailView: View {
                     }
                 }
                 .animation(.easeInOut(duration: 0.15), value: pinToBottom)
-                .onAppear { scrollToBottom(proxy) }
+                .onAppear { requestAutoScroll(proxy) }
                 .onChange(of: agent.log.count) { _, _ in
-                    scrollToBottom(proxy)
+                    requestAutoScroll(proxy)
                 }
                 .onChange(of: agent.output.count) { _, _ in
-                    scrollToBottom(proxy)
+                    requestAutoScroll(proxy)
                 }
                 .onChange(of: agent.id) { _, _ in
+                    cancelAutoScroll()
                     pinToBottom = true
                     showDiffStat = false
                     diffStatText = nil
-                    scrollToBottom(proxy, retry: true)
+                    requestAutoScroll(proxy)
+                }
+                .onChange(of: pinToBottom) { _, pinned in
+                    if !pinned {
+                        cancelAutoScroll()
+                    }
                 }
                 .onChange(of: scenePhase) { _, phase in
-                    if phase == .active { scrollToBottom(proxy, retry: true) }
+                    if phase == .active { requestAutoScroll(proxy) }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                    scrollToBottom(proxy, retry: true)
+                    requestAutoScroll(proxy)
                 }
+                .onDisappear { cancelAutoScroll() }
             }
         }
         .confirmationDialog(
@@ -407,23 +469,42 @@ private struct AgentDetailView: View {
         .padding(10)
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy, retry: Bool = false) {
-        guard pinToBottom else { return }
-        let run = {
-            // 在途 async 到达时用户可能已上翻 unpin，必须再检查
-            guard pinToBottom else { return }
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                proxy.scrollTo("agent-bottom", anchor: .bottom)
+    private func requestAutoScroll(_ proxy: ScrollViewProxy) {
+        guard let token = autoScrollGate.request(agentID: agent.id, isPinned: pinToBottom) else {
+            return
+        }
+        autoScrollTask = Task { @MainActor in
+            defer {
+                if autoScrollGate.complete(token) {
+                    autoScrollTask = nil
+                }
+            }
+
+            // One task owns the complete settle sequence. Log/output bursts and the
+            // two activation notifications coalesce into this bounded sequence.
+            await Task.yield()
+            let settleDelays: [UInt64] = [0, 50_000_000, 150_000_000]
+            for delay in settleDelays {
+                if delay > 0 {
+                    try? await Task.sleep(nanoseconds: delay)
+                }
+                guard !Task.isCancelled,
+                      autoScrollGate.permits(token, agentID: agent.id, isPinned: pinToBottom) else {
+                    return
+                }
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    proxy.scrollTo(AgentAutoScrollGate.anchorID(for: token.agentID), anchor: .bottom)
+                }
             }
         }
-        DispatchQueue.main.async(execute: run)
-        if retry {
-            // 激活/布局后多档重试，等 clip 尺寸稳定后再贴底
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: run)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: run)
-        }
+    }
+
+    private func cancelAutoScroll() {
+        autoScrollGate.invalidate()
+        autoScrollTask?.cancel()
+        autoScrollTask = nil
     }
 
     @ViewBuilder
