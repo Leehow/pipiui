@@ -45,10 +45,22 @@ final class PhilosophyLayerTests: XCTestCase {
         let foundation = try text("foundation")
         assertContains(foundation, "Authorization is established by the request")
         assertContains(foundation, "No early stopping")
-        assertContains(foundation, "Process weight must match the work")
+        assertContains(foundation, "Evidence outranks authority")
         let orchestration = try text("orchestration")
         XCTAssertFalse(orchestration.contains(normalized("No early stopping")),
                        "failure recovery belongs to foundation, not to the dispatch protocol")
+
+        // Craft belongs to method: delete foundation and the agent becomes untrustworthy;
+        // delete method and it stays trustworthy but works badly.
+        let method = try text("method")
+        assertContains(method, "Process weight must match the work")
+        assertContains(method, "Plans are lists, not documents")
+        assertContains(method, "Write the minimum that solves it")
+        assertContains(method, "Change only what the task requires")
+        for craft in ["Process weight must match the work", "Plans are lists, not documents"] {
+            XCTAssertFalse(foundation.contains(normalized(craft)),
+                           "\(craft) is craft, not an axiom of the relationship")
+        }
     }
 
     // MARK: - Ported content guards
@@ -56,7 +68,7 @@ final class PhilosophyLayerTests: XCTestCase {
     /// Difficulty tiers were a classification ritual paid for on every goal, and a heavy tier
     /// pulled trivial work into recon + planning + review. The judgement stays; labels do not.
     func testNoDifficultyTiersOrClassificationRitual() throws {
-        let t = try text("foundation")
+        let t = try text("method")
         assertContains(t, "There are no difficulty tiers and no classification ritual")
         assertContains(t, "Never emit a difficulty label and never announce a level")
         assertContains(t, "Process weight must match the work")
@@ -92,18 +104,63 @@ final class PhilosophyLayerTests: XCTestCase {
     /// The plan loop that motivated all of this: a design doc, a plan doc, a review of the plan
     /// doc, and a re-plan when the read-only planner could not write the file.
     func testForbidsPlanArtifactCeremony() throws {
-        let foundation = try text("foundation")
-        assertContains(foundation, "Plans are lists, not documents")
-        assertContains(foundation, "a spec / design / plan / review document by default")
-        assertContains(foundation, "write one when the user asked for it, or when you have judged this specific goal large enough")
-        assertContains(foundation, "exception to the two rules above, not a way around them")
-        assertContains(foundation, "stays: one planning step, no document")
-        assertContains(foundation, "MUST NOT run a design → approval → plan → plan-review sequence")
+        let method = try text("method")
+        assertContains(method, "Plans are lists, not documents")
+        assertContains(method, "a spec / design / plan / review document by default")
+        assertContains(method, "write one when the user asked for it, or when you have judged this specific goal large enough")
+        assertContains(method, "exception to the two rules above, not a way around them")
+        assertContains(method, "stays: one planning step, no document")
+        assertContains(method, "MUST NOT run a design → approval → plan → plan-review sequence")
 
         let orchestration = try text("orchestration")
         assertContains(orchestration, "MUST omit `verify`")
         assertContains(orchestration, "Never re-dispatch a read-only worker to make a shell command pass")
         assertContains(orchestration, "never dispatch a reviewer to review a plan document")
+    }
+
+    /// Persistent coordination state is required once delegation begins, but merely loading
+    /// the orchestration philosophy must not make an ordinary direct task probe the shell.
+    func testLedgerDiscoveryIsLazyUntilRealOrchestration() throws {
+        let orchestration = try text("orchestration")
+
+        assertContains(
+            orchestration,
+            "Ledger discovery is lazy"
+        )
+        assertContains(
+            orchestration,
+            "Ordinary direct tasks — including web research, {{browser}} or desktop operations, simple read-only questions, and single-lane direct work — MUST NOT read `PIPIUI_SESSION_KEY`, inspect `.pi/boss/`, create or read a ledger, or run shell merely to discover ledger state"
+        )
+        assertContains(
+            orchestration,
+            "The trigger is this session actually deciding to dispatch/delegate or otherwise entering real multi-worker coordination"
+        )
+        assertContains(
+            orchestration,
+            "Before the first dispatch or coordination action, initialize the ledger under `.pi/boss/`"
+        )
+        assertContains(
+            orchestration,
+            "read it once at this trigger, then stop re-reading it"
+        )
+        assertContains(
+            orchestration,
+            "From that point onward, update the ledger BEFORE acting"
+        )
+        assertContains(
+            orchestration,
+            "After context compaction, or whenever compaction is suspected during active orchestration, re-read this session's own ledger before acting"
+        )
+        assertContains(
+            orchestration,
+            "Other ledger files under `.pi/boss/` belong to other sessions"
+        )
+        XCTAssertFalse(
+            orchestration.contains(normalized(
+                "At session start, if this session's own ledger already exists"
+            )),
+            "session start alone must not trigger a ledger probe"
+        )
     }
 
     /// Search is for cross-checking a hypothesis you already formed — not a first move and not
@@ -119,8 +176,13 @@ final class PhilosophyLayerTests: XCTestCase {
         assertContains(t, "probably not unique to this codebase")
         assertContains(t, "prior art would sharpen or overturn your plan")
         assertContains(t, "unverified assumption about")
-        assertContains(t, "Results are evidence, not authority")
         assertContains(t, "This is a judgement call, never a mandatory step")
+
+        // What counts as proof is an axiom, so it sits in foundation, not in craft.
+        let foundation = try text("foundation")
+        assertContains(foundation, "Evidence outranks authority")
+        assertContains(foundation, "evidence, not authority")
+        assertContains(foundation, "A command nobody ran is reported as \"not executed\"")
     }
 
     /// Skills are advice from another harness, so the philosophy states how to translate the

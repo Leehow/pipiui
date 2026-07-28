@@ -164,7 +164,10 @@ async function bridge(
 }
 
 async function openApplicationBridge(
-  target: { bundle_identifier?: string; application_name?: string },
+  target: {
+    bundle_identifier?: string;
+    application_name?: string;
+  },
   externalSignal?: AbortSignal,
 ): Promise<any> {
   const requestID = randomUUID();
@@ -233,6 +236,115 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function lifecycleShellBlockReason(
+  toolName: string,
+  input: unknown,
+): string | null {
+  if (toolName !== "bash" && toolName !== "shell") return null;
+  if (!isRecord(input) || typeof input.command !== "string") return null;
+  if (!shellCommandContainsOpen(input.command)) return null;
+  return (
+    "Do not use shell open for apps, folders, files, or URLs. " +
+    "Call open_application to launch or activate the exact app, then use " +
+    "computer AX actions or an in-app keyboard shortcut for navigation. " +
+    "Prefer the browser tool for web URLs."
+  );
+}
+
+function shellCommandContainsOpen(command: string, depth = 0): boolean {
+  if (depth > 3) return false;
+  for (const segment of command.split(/\n|&&|\|\||[;|]/)) {
+    const rawTokens =
+      segment.trim().match(
+        /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s]+/g,
+      ) || [];
+    const tokens = rawTokens.map((token) => {
+      const quoted =
+        (token.startsWith('"') && token.endsWith('"'))
+        || (token.startsWith("'") && token.endsWith("'"));
+      return quoted ? token.slice(1, -1) : token;
+    });
+    if (shellTokensContainOpen(tokens, depth)) return true;
+  }
+  return false;
+}
+
+function shellTokensContainOpen(tokens: string[], depth: number): boolean {
+  const isAssignment = (value: string | undefined) =>
+    /^[A-Za-z_][A-Za-z0-9_]*=/.test(value || "");
+  const nestedShells = new Set([
+    "sh", "bash", "zsh", "/bin/sh", "/bin/bash", "/bin/zsh",
+  ]);
+  let index = 0;
+  const skipAssignments = () => {
+    while (isAssignment(tokens[index])) index += 1;
+  };
+  skipAssignments();
+
+  // Unwrap only well-known command-position prefixes. Arguments elsewhere are
+  // never scanned, so `echo /usr/bin/open` and `tool --open` remain allowed.
+  for (let wrappers = 0; wrappers < 8 && index < tokens.length; wrappers += 1) {
+    const executable = tokens[index];
+    if (executable === "open" || executable === "/usr/bin/open") return true;
+
+    if (executable === "exec") {
+      index += 1;
+      if (tokens[index] === "--") index += 1;
+      skipAssignments();
+      continue;
+    }
+    if (executable === "command") {
+      index += 1;
+      while (tokens[index] === "-p" || tokens[index] === "--") index += 1;
+      skipAssignments();
+      continue;
+    }
+    if (
+      executable === "env"
+      || executable === "/usr/bin/env"
+      || executable === "/bin/env"
+    ) {
+      index += 1;
+      while (index < tokens.length) {
+        const option = tokens[index];
+        if (isAssignment(option)) {
+          index += 1;
+        } else if (option === "--") {
+          index += 1;
+          break;
+        } else if (option === "-u" || option === "--unset") {
+          index += 2;
+        } else if (option.startsWith("--unset=")) {
+          index += 1;
+        } else if (
+          ["-i", "--ignore-environment", "-0", "--null", "-v", "--debug"]
+            .includes(option)
+        ) {
+          index += 1;
+        } else {
+          break;
+        }
+      }
+      skipAssignments();
+      continue;
+    }
+    if (nestedShells.has(executable)) {
+      index += 1;
+      while (index < tokens.length && tokens[index].startsWith("-")) {
+        const option = tokens[index];
+        if (/^-[^-]*c/.test(option)) {
+          const nestedCommand = tokens[index + 1];
+          return typeof nestedCommand === "string"
+            && shellCommandContainsOpen(nestedCommand, depth + 1);
+        }
+        index += 1;
+      }
+    }
+    return false;
+  }
+  return false;
+}
+
 const ANTHROPIC_20251124_MODEL_PREFIXES = [
   "claude-sonnet-5",
   "claude-opus-4-8",
@@ -279,15 +391,24 @@ export function mergeBeta(existing: unknown, required: string): string {
   return values.join(",");
 }
 
-export function retainScreenshot(data: string, mimeType: string): string {
-  const id = randomUUID();
-  screenshots.set(id, { data, mimeType });
+export function retainScreenshot(
+  data: string,
+  mimeType: string,
+  id?: string,
+): string {
+  // When id is provided it must be the bridge-issued screenshotId so Swift chat
+  // ToolRun can resolve the same in-memory PNG the model context injects.
+  // Callers that mint agent-facing markers must require a stable bridge id;
+  // randomUUID here is only for Node-local retain helpers (tests / inject).
+  const screenshotId =
+    typeof id === "string" && id.length > 0 ? id : randomUUID();
+  screenshots.set(screenshotId, { data, mimeType });
   while (screenshots.size > MAX_IN_MEMORY_SCREENSHOTS) {
     const oldest = screenshots.keys().next().value;
     if (!oldest) break;
     screenshots.delete(oldest);
   }
-  return id;
+  return screenshotId;
 }
 
 export function compactAccessibility(value: unknown): Record<string, unknown> | undefined {
@@ -335,9 +456,33 @@ export function screenshotToolResult(
   result: any,
   metadata: Record<string, unknown>,
 ) {
+  // Contract: bridge success paths must advertise a stable screenshotId that
+  // Swift already retained. Minting a Node-only UUID would let the model see
+  // the image (via inject) while chat ToolRun cache-misses — user never sees
+  // "what AI saw". Refuse unhydratable markers instead.
+  const bridgeScreenshotId =
+    typeof result?.screenshotId === "string" && result.screenshotId.length > 0
+      ? result.screenshotId
+      : undefined;
+  const base64 =
+    typeof result?.base64 === "string" && result.base64.length > 0
+      ? result.base64
+      : undefined;
+  if (!base64) {
+    throw new Error(
+      "computer bridge success payload missing base64 screenshot",
+    );
+  }
+  if (!bridgeScreenshotId) {
+    throw new Error(
+      "computer bridge success payload missing stable screenshotId " +
+        "(refusing unhydratable marker)",
+    );
+  }
   const screenshotID = retainScreenshot(
-    result.base64,
+    base64,
     result.mimeType || "image/png",
+    bridgeScreenshotId,
   );
   return {
     content: [
@@ -355,7 +500,10 @@ export function screenshotToolResult(
 function screenshotIDs(content: unknown): string[] {
   if (!Array.isArray(content)) return [];
   const ids: string[] = [];
-  const pattern = new RegExp(`\\[${SCREENSHOT_MARKER}:([a-f0-9-]+)\\]`, "g");
+  const pattern = new RegExp(
+    `\\[${SCREENSHOT_MARKER}:([a-fA-F0-9-]+)\\]`,
+    "g",
+  );
   for (const block of content) {
     if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
     for (const match of block.text.matchAll(pattern)) ids.push(match[1]);
@@ -388,14 +536,22 @@ export default function (pi: ExtensionAPI) {
     || !Number.isInteger(DISPLAY_HEIGHT)
   ) return;
 
+  pi.on("tool_call", (event) => {
+    const reason = lifecycleShellBlockReason(event.toolName, event.input);
+    if (reason) return { block: true, reason };
+  });
+
   pi.registerTool({
     name: "open_application",
     label: "Open Application",
     description:
       "Select or switch this session's exact macOS target through embedded Cua Driver. " +
       "Use this deterministic lifecycle tool instead of pixel clicks for app launch or activation. " +
-      "For running-state checks or graceful quit, prefer Pi's existing shell/bash or OS lifecycle commands. " +
-      "Do not default to force quit or kill -9 when a normal quit is available. " +
+      "For in-app navigation, first pin the app here, then use computer AX actions or a keyboard shortcut; never run shell open. " +
+      "For Finder folder navigation, prefer Cmd-Shift-G, type the exact absolute path, and press Enter. " +
+      "Prefer the browser tool for ordinary web tasks. If the user explicitly requests Chrome, Safari, or another external browser App, " +
+      "pin it here, copy one complete percent-encoded URL with printf '%s' '<URL>' | pbcopy, then use one computer batch: " +
+      "CMD+L, CMD+V, RETURN, wait. Do not use AppleScript/osascript or shell open for external-browser navigation. " +
       "Provide an exact bundle identifier when known, otherwise a human app name. " +
       "The successful result pins the returned pid and window id to the authenticated " +
       "PipiUI session; later computer batches keep using that target even if PipiUI is frontmost.",
@@ -452,8 +608,14 @@ export default function (pi: ExtensionAPI) {
       "the global desktop button is on. Call open_application first to select or switch " +
       "the target; PipiUI becoming frontmost never changes it. This is unrestricted mode: there are no per-session, " +
       "per-app, sensitive-action, or destructive-action prompts. " +
-      "Routing priority: deterministic app lifecycle first (open_application for launch/activation; " +
-      "existing shell/bash or OS lifecycle commands for status/graceful quit), then AX, then pixels. " +
+      "Routing priority: deterministic app lifecycle first (open_application for launch, activation, " +
+      "or target switching), then in-app AX or keyboard-shortcut navigation, then pixels. Never shell open. " +
+      "Use existing shell/macOS lifecycle commands for running-state checks and graceful quit; " +
+      "do not default to force quit or kill -9. " +
+      "Prefer the browser tool for ordinary web tasks. If the user explicitly requests Chrome, Safari, or another external browser App, " +
+      "first pin that browser with open_application, copy one complete percent-encoded URL using " +
+      "printf '%s' '<URL>' | pbcopy, then send one computer batch: CMD+L, CMD+V, RETURN, wait. " +
+      "Do not use AppleScript/osascript or shell open for external-browser navigation because AppleEvents may require TCC or hang. " +
       "Prefer element_index/element_token AX actions over screenshot coordinates. " +
       "Use screenshot coordinates only as a fallback when lifecycle commands and AX cannot complete the task. " +
       "Prefer actions:[...] batches; every accepted batch returns a fresh screenshot. " +

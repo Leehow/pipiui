@@ -39,14 +39,7 @@ public struct PipiUIApp: App {
 
     public var body: some Scene {
         WindowGroup("Pipi UI") {
-            ContentView()
-                .environmentObject(store)
-                .environment(
-                    \.chatTypography,
-                    ChatTypography.make(fontSize: CGFloat(store.chatFontSize))
-                )
-                .frame(minWidth: 800, minHeight: 560)
-                .background(WindowSizePersistenceView())
+            ComputerUseSceneRoot(store: store)
         }
         .windowStyle(.automatic)
         .commands {
@@ -67,6 +60,22 @@ public struct PipiUIApp: App {
                     .keyboardShortcut("0", modifiers: [.command, .shift])
             }
         }
+    }
+}
+
+private struct ComputerUseSceneRoot: View {
+    @ObservedObject var store: AppStore
+
+    var body: some View {
+        ContentView()
+            .environmentObject(store)
+            .environment(
+                \.chatTypography,
+                ChatTypography.make(fontSize: CGFloat(store.chatFontSize))
+            )
+            .frame(minWidth: 800, minHeight: 560)
+            .background(WindowSizePersistenceView())
+            .background(ComputerUseWindowPresentationView())
     }
 }
 

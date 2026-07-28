@@ -123,6 +123,12 @@ final class ComputerCoordinator: ObservableObject {
     @Published var pendingWriteApproval: PendingWriteApproval?
     @Published var activeSessionKey: String?
     @Published var activeApplication: ComputerApplicationIdentity?
+    /// Cua Driver pins an exact CGWindowID; the legacy path follows the
+    /// frontmost window belonging to `activeApplication` instead.
+    @Published var activeWindowID: UInt32?
+    /// Published separately from the concrete in-flight object so the AppKit
+    /// presentation controller reliably transitions into and out of mini mode.
+    @Published var isDesktopOperationActive = false
     @Published var remainingActions: Int?
     @Published var pausedSessionKeys: Set<String> = []
     @Published var deniedSessionKeys: Set<String> = []

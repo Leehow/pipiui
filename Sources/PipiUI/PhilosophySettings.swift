@@ -158,6 +158,19 @@ enum PhilosophySettings {
             .reduce(0) { $0 + $1.estimatedTokens }
     }
 
+    /// Write the default config once, so the file's presence is a reliable signal that the
+    /// philosophy is installed here. The dispatch runtime reads it to decide whether the
+    /// fan-out layer is live — and therefore whether background dispatch is a hard invariant
+    /// rather than a per-call preference. Never overwrites an existing file.
+    static func ensureDefaultConfig(configURL url: URL = configURL) {
+        guard !FileManager.default.fileExists(atPath: url.path) else { return }
+        writeConfig([
+            "enabled": true,
+            "layers": ["foundation": true, "method": true, "orchestration": true, "fanout": true],
+            "scopes": ["worker": false],
+        ], to: url)
+    }
+
     // MARK: - Migration
 
     /// One-time carry-over from the old single `Boss 模式` switch.

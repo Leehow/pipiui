@@ -165,7 +165,10 @@ extension ComputerCoordinator {
         execution: ComputerInFlightExecution,
         auditSessionID: String
     ) {
-        let ownsExecution = inFlightExecution === execution
+        // Capture ownership before teardown. A superseded/cancelled task may still
+        // finish its post-await screenshot path; without this gate it would retain
+        // orphan PNGs in the FIFO cache even when ComputerResponseGate no-ops.
+        let ownsExecution = executionIsCurrent(execution)
         if ownsExecution {
             execution.watchdog?.cancel()
             execution.markNoLongerCurrent()
@@ -184,12 +187,13 @@ extension ComputerCoordinator {
             focusDrift: result.focusDrift
         ))
 
-        if ownsExecution {
-            statusMessage = result.error == nil
-                ? "Computer Use 批次已完成，桌面互斥槽已释放。"
-                : "Computer Use 批次已结束，桌面互斥槽与输入状态已释放。"
-            refreshInputMonitoring()
-        }
+        // Lost ownership: never cache, never respond (abort/cancel already settled).
+        guard ownsExecution else { return }
+
+        statusMessage = result.error == nil
+            ? "Computer Use 批次已完成，桌面互斥槽已释放。"
+            : "Computer Use 批次已结束，桌面互斥槽与输入状态已释放。"
+        refreshInputMonitoring()
 
         guard let screenshot = result.screenshot else {
             execution.reply.respond(Self.failure(
@@ -211,9 +215,11 @@ extension ComputerCoordinator {
             "displayID": screenshot.displayID,
             "width": screenshot.imageSize.width,
             "height": screenshot.imageSize.height,
-            "mimeType": "image/png",
-            "base64": screenshot.base64,
         ]
+        ComputerScreenshotMemoryCache.attach(
+            to: &response,
+            pngData: screenshot.pngData
+        )
         if let error = result.error { response["batchError"] = error }
         execution.reply.respond(response)
     }

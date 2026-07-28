@@ -77,6 +77,8 @@ struct ToolCallBlock: Identifiable, Equatable {
     let argsSummary: String
     /// Char count of streamed write/edit payload (for live `~N tokens`); 0 for other tools.
     var payloadChars: Int = 0
+    /// Bounded, UI-safe subset of write/edit arguments used to explain finished changes.
+    var fileChangePayload: FileChangePayload? = nil
 }
 
 /// Path + payload size for tool-call headers. write/edit never fall back to JSON dumps.
@@ -1623,12 +1625,17 @@ final class ChatSession: ObservableObject, Identifiable {
                     if !t.isEmpty { blocks.append(.thinking(t)) }
                 case "toolCall":
                     let name = block["name"].string ?? "tool"
-                    let summary = ToolCallSummary.summarize(name: name, args: block["arguments"])
+                    let arguments = block["arguments"]
+                    let summary = ToolCallSummary.summarize(name: name, args: arguments)
                     blocks.append(.toolCall(ToolCallBlock(
                         id: block["id"].string ?? UUID().uuidString,
                         name: name,
                         argsSummary: summary.summary,
-                        payloadChars: summary.payloadChars
+                        payloadChars: summary.payloadChars,
+                        fileChangePayload: FileChangePayload.parse(
+                            toolName: name,
+                            arguments: arguments
+                        )
                     )))
                 case "image":
                     if let imageBlock = Self.parseImageBlock(block, allowDiskRead: allowDiskRead) {
@@ -1952,11 +1959,16 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     /// Images from tool result content (e.g. generate_image / browser_screenshot).
+    /// Computer/open_application keep PNG off the wire (marker-only text); when ordinary
+    /// image blocks are absent, resolve `[PIPIUI_COMPUTER_SCREENSHOT:id]` via the
+    /// process-local memory cache. Cache miss → no images (history after restart).
     static func contentImages(_ content: J, allowDiskRead: Bool = true) -> [ImageBlock] {
-        content.array.compactMap { block -> ImageBlock? in
+        let fromBlocks = content.array.compactMap { block -> ImageBlock? in
             guard block["type"].string == "image" else { return nil }
             return parseImageBlock(block, allowDiskRead: allowDiskRead)
         }
+        if !fromBlocks.isEmpty { return fromBlocks }
+        return ComputerScreenshotMarker.images(fromText: contentText(content))
     }
 
     // MARK: - User actions

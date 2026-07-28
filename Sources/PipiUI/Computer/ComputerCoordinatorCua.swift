@@ -141,7 +141,7 @@ extension ComputerCoordinator {
                 let expectedForeground = target.applicationIdentity
                 self.statusMessage =
                     "已通过 Cua Driver 打开 \(resolvedName) 并固定精确窗口目标。"
-                reply.respond([
+                var openResponse: [String: Any] = [
                     "ok": true,
                     "openedApplication": true,
                     "focusDrift": observedForeground.map {
@@ -155,12 +155,15 @@ extension ComputerCoordinator {
                     "displayID": descriptor.displayID,
                     "width": descriptor.outputSize.width,
                     "height": descriptor.outputSize.height,
-                    "mimeType": "image/png",
-                    "base64": advertisedPNG,
                     "target": target.dictionary,
                     "screenshotTarget": target.screenshotDictionary,
                     "accessibility": state.accessibility,
-                ])
+                ]
+                ComputerScreenshotMemoryCache.attach(
+                    to: &openResponse,
+                    base64PNG: advertisedPNG
+                )
+                reply.respond(openResponse)
             } catch is CancellationError {
                 self.finishCancelledCuaOperation(operation)
             } catch {
@@ -351,12 +354,14 @@ extension ComputerCoordinator {
                     "displayID": descriptor.displayID,
                     "width": descriptor.outputSize.width,
                     "height": descriptor.outputSize.height,
-                    "mimeType": "image/png",
-                    "base64": advertisedPNG,
                     "target": currentTarget.dictionary,
                     "screenshotTarget": currentTarget.screenshotDictionary,
                     "accessibility": state.accessibility,
                 ]
+                ComputerScreenshotMemoryCache.attach(
+                    to: &response,
+                    base64PNG: advertisedPNG
+                )
                 if let batchError {
                     response["batchError"] = batchError
                 }
@@ -399,7 +404,14 @@ extension ComputerCoordinator {
         cuaInFlightOperation = operation
         activeSessionKey = sessionKey
         activeApplication = cuaSessionTargets[sessionKey]?.applicationIdentity
+        activeWindowID = cuaSessionTargets[sessionKey]?.primaryWindowID
+        isDesktopOperationActive = true
         remainingActions = nil
+        let targetName = activeApplication?.name ?? "目标应用"
+        statusMessage = "正在操作 \(targetName)…"
+        Task { @MainActor in
+            ComputerUseWindowPresentation.shared.update(for: self)
+        }
         refreshInputMonitoring()
         return true
     }

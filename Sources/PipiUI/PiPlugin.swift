@@ -55,6 +55,7 @@ enum PiPlugin {
         try? fm.createDirectory(at: root, withIntermediateDirectories: true)
         // Cheap, and must run even on the skip path: registration lives in the user's pi
         // settings, which anything outside this App may have changed since last launch.
+        PhilosophySettings.ensureDefaultConfig()
         PhilosophySettings.migrateFromBossModeIfNeeded()
         defer { syncPhilosophyRegistration() }
         let fingerprint = currentFingerprint()

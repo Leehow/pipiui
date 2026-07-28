@@ -101,13 +101,21 @@ vague.
 - Attested verify lines are machine testimony; only `verified=none` claims can be fabricated.
   Never accept or relay a fabricated result.
 
-## Ledger
+## Ledger — only after real orchestration begins
 
-Maintain a ledger under `.pi/boss/` with write/edit — a management action, always allowed,
-never "working the floor". Use `.pi/boss/ledger-<session-key>.md` when your runtime exposes a
-session key (PipiUI sets `PIPIUI_SESSION_KEY`; read it once, then stop re-reading it), and
-`.pi/boss/ledger-terminal.md` when it does not. A resumed session keeps its key, so its
-ledger carries over naturally. Fixed layout:
+Ledger discovery is lazy. Ordinary direct tasks — including web research, {{browser}} or
+desktop operations, simple read-only questions, and single-lane direct work — MUST NOT read
+`PIPIUI_SESSION_KEY`, inspect `.pi/boss/`, create or read a ledger, or run shell merely to
+discover ledger state.
+
+The trigger is this session actually deciding to dispatch/delegate or otherwise entering real
+multi-worker coordination that requires persisted task state. Before the first dispatch or
+coordination action, initialize the ledger under `.pi/boss/` with write/edit — a management
+action, always allowed, never "working the floor". Use
+`.pi/boss/ledger-<session-key>.md` when your runtime exposes a session key (PipiUI sets
+`PIPIUI_SESSION_KEY`; read it once at this trigger, then stop re-reading it), and
+`.pi/boss/ledger-terminal.md` when it does not. A resumed orchestration session keeps its key,
+so its ledger carries over naturally. Fixed layout:
 
 ```
 # Ledger
@@ -124,16 +132,17 @@ ledger carries over naturally. Fixed layout:
                disposition is cleaned / retained / needs-fixer / needs-user
 ```
 
-- Update the ledger BEFORE acting, on every dispatch, user interruption, changed requirement,
-  task close-out, and blockage. Never track state by conversation memory alone.
+- From that point onward, update the ledger BEFORE acting: before the first and every later
+  dispatch or coordination action, and on every user interruption, changed requirement, task
+  close-out, and blockage. Never track orchestration state by conversation memory alone.
 - User inserts a new requirement mid-flight: log it under Decisions → assess impact on
   in-flight rows → mark affected rows cancelled or re-assigned in Tasks → only then dispatch
   the new work.
-- After context compaction, or whenever compaction is suspected, re-read this session's own
-  ledger before acting.
-- At session start, if this session's own ledger already exists, read it before deciding
-  anything. Other ledger files under `.pi/boss/` belong to other sessions: unless the user
-  explicitly asks, do not read or modify them.
+- After context compaction, or whenever compaction is suspected during active orchestration,
+  re-read this session's own ledger before acting.
+- When the orchestration trigger fires, if this session's own ledger already exists, read it
+  before the first dispatch or coordination action. Other ledger files under `.pi/boss/`
+  belong to other sessions: unless the user explicitly asks, do not read or modify them.
 
 ## Completion ownership
 

@@ -140,6 +140,32 @@ final class AssistantBlockLayoutTests: XCTestCase {
         )
     }
 
+    /// computer / open_application screenshot cards stay on the main transcript,
+    /// even before toolRuns images land (same race as generate_image).
+    func testComputerAndOpenApplicationBreakGroupWithoutRuns() {
+        let computer = tool("c1", "computer")
+        let openApp = tool("o1", "open_application")
+        let blocks: [ChatBlock] = [
+            .thinking("a"),
+            tool("1", "bash"),
+            computer,
+            .thinking("b"),
+            openApp,
+            tool("2", "read"),
+        ]
+        XCTAssertEqual(
+            AssistantBlockLayout.plan(blocks: blocks, groupFinished: true, toolRuns: [:]),
+            [
+                .finishedGroup([.thinking("a"), tool("1", "bash")]),
+                .singleton(computer),
+                // Lone groupable members stay singletons (finishedGroup needs ≥2).
+                .singleton(.thinking("b")),
+                .singleton(openApp),
+                .singleton(tool("2", "read")),
+            ]
+        )
+    }
+
     func testMergesAdjacentTextBeforePlanning() {
         let blocks: [ChatBlock] = [
             .text("a"),

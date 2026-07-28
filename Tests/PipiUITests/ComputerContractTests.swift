@@ -155,6 +155,7 @@ final class ComputerContractTests: XCTestCase {
         XCTAssertTrue(source.contains("every accepted batch returns a fresh screenshot"))
         XCTAssertTrue(source.contains(#"pi.on("context""#))
         XCTAssertTrue(source.contains("retainScreenshot("))
+        XCTAssertTrue(source.contains("result.screenshotId"))
         XCTAssertTrue(source.contains("injectInMemoryScreenshots("))
         XCTAssertTrue(source.contains("PIPIUI_COMPUTER_CAPABILITY"))
         XCTAssertTrue(source.contains("computerCapability: COMPUTER_CAPABILITY"))
@@ -174,9 +175,17 @@ final class ComputerContractTests: XCTestCase {
         XCTAssertTrue(source.contains(
             "application_name: Type.Optional(Type.String"
         ))
+        XCTAssertFalse(source.contains(
+            "path: Type.Optional(Type.String"
+        ))
+        XCTAssertFalse(source.contains(
+            "url: Type.Optional(Type.String"
+        ))
         XCTAssertTrue(source.contains(
             "open_application requires bundle_identifier or application_name"
         ))
+        XCTAssertTrue(source.contains("lifecycleShellBlockReason"))
+        XCTAssertTrue(source.contains("Do not use shell open"))
         XCTAssertTrue(source.contains("element_index: Type.Optional"))
         XCTAssertTrue(source.contains("element_token: Type.Optional"))
         XCTAssertTrue(source.contains("delivery_mode: Type.Optional"))
@@ -186,10 +195,34 @@ final class ComputerContractTests: XCTestCase {
             "Use this deterministic lifecycle tool instead of pixel clicks"
         ))
         XCTAssertTrue(source.contains(
-            "running-state checks or graceful quit"
+            "then use computer AX actions or a keyboard shortcut"
+        ))
+        XCTAssertTrue(source.contains(
+            "For Finder folder navigation, prefer Cmd-Shift-G"
         ))
         XCTAssertTrue(source.contains(
             "Routing priority: deterministic app lifecycle first"
+        ))
+        XCTAssertTrue(source.contains(
+            "running-state checks and graceful quit"
+        ))
+        XCTAssertTrue(source.contains(
+            "do not default to force quit or kill -9"
+        ))
+        XCTAssertTrue(source.contains(
+            "Prefer the browser tool for ordinary web tasks"
+        ))
+        XCTAssertTrue(source.contains(
+            "one complete percent-encoded URL"
+        ))
+        XCTAssertTrue(source.contains(
+            #"printf '%s' '<URL>' | pbcopy"#
+        ))
+        XCTAssertTrue(source.contains(
+            "one computer batch: CMD+L, CMD+V, RETURN, wait"
+        ))
+        XCTAssertTrue(source.contains(
+            "Do not use AppleScript/osascript or shell open for external-browser navigation"
         ))
         XCTAssertTrue(source.contains(
             "Prefer element_index/element_token AX actions over screenshot coordinates"
@@ -198,7 +231,7 @@ final class ComputerContractTests: XCTestCase {
             "Use screenshot coordinates only as a fallback"
         ))
         XCTAssertTrue(source.contains(
-            "Do not default to force quit or kill -9"
+            "Never shell open"
         ))
         XCTAssertTrue(source.contains("requestID"))
         XCTAssertTrue(source.contains("PIPIUI_COMPUTER_DISPLAY_ID"))
@@ -296,6 +329,7 @@ final class ComputerContractTests: XCTestCase {
         let script = #"""
 import computerExtension, {
   injectInMemoryScreenshots,
+  lifecycleShellBlockReason,
   mergeBeta,
   normalizeActions,
   retainScreenshot,
@@ -412,6 +446,7 @@ const bridgedBodies: any[] = [];
         height: 80,
         base64: "result-png",
         mimeType: "image/png",
+        screenshotId: "bridge-shot-id-001",
         accessibility: {
           tree_markdown: "[element_index 0] duplicated markdown",
           elements: [{
@@ -522,16 +557,65 @@ const bridgedBodies: any[] = [];
       && openSchema.properties.bundle_identifier.type === "string"
       && openSchema.properties.application_name.type === "string"
       && !("path" in openSchema.properties)
+      && !("url" in openSchema.properties)
       && !("command" in openSchema.properties)
-      && !("url" in openSchema.properties),
+      ,
     openApplicationBridge:
       openBody.action === "computer_open_application"
       && openBody.bundle_identifier === "com.google.Chrome"
+      && !("path" in openBody)
+      && !("url" in openBody)
       && openBody.sessionKey === "test-capability"
       && openBody.computerCapability === "test-computer-capability"
       && openBody.displayID === 7
       && typeof openBody.requestID === "string"
       && openBody.requestID.length > 20,
+    browserAppClipboardRoute:
+      computerTool.description.includes(
+        "Prefer the browser tool for ordinary web tasks"
+      )
+      && computerTool.description.includes(
+        "one complete percent-encoded URL"
+      )
+      && computerTool.description.includes(
+        "printf '%s' '<URL>' | pbcopy"
+      )
+      && computerTool.description.includes(
+        "one computer batch: CMD+L, CMD+V, RETURN, wait"
+      )
+      && computerTool.description.includes(
+        "Do not use AppleScript/osascript or shell open for external-browser navigation"
+      ),
+    shellOpenBlocked:
+      [
+        "/usr/bin/open /Users/me/Downloads",
+        "exec /usr/bin/open /Users/me/Downloads",
+        "env /usr/bin/open /Users/me/Downloads",
+        "\"/usr/bin/open\" /Users/me/Downloads",
+        "command open /Users/me/Downloads",
+        "sh -c '/usr/bin/open /Users/me/Downloads'",
+        "/bin/zsh -c 'exec open /Users/me/Downloads'",
+        "/usr/bin/env /usr/bin/open /Users/me/Downloads",
+        "env -u FOO /usr/bin/open /Users/me/Downloads",
+        "command -p /usr/bin/open /Users/me/Downloads",
+        "exec -- /usr/bin/open /Users/me/Downloads",
+        "bash -lc '/usr/bin/open /Users/me/Downloads'",
+        "VAR=x /usr/bin/open /Users/me/Downloads",
+      ].every((command) =>
+        lifecycleShellBlockReason(
+          "bash",
+          { command },
+        )?.includes("Do not use shell open") === true
+      )
+      && [
+        "pgrep -x Finder",
+        "osascript -e 'tell application \"Finder\" to quit'",
+        "swift test",
+        "echo /usr/bin/open is blocked only in command position",
+        "tool --open file",
+      ].every((command) =>
+        lifecycleShellBlockReason("bash", { command }) === null
+      ),
     batchAbortSignal:
       batchAbortRejected
       && typeof abortedBatchBody?.requestID === "string"
@@ -549,14 +633,20 @@ const bridgedBodies: any[] = [];
     resultMarkerOnly:
       executed.content.length === 1
       && executed.content[0].type === "text"
-      && executed.content[0].text.includes("[PIPIUI_COMPUTER_SCREENSHOT:")
-      && !executed.content[0].text.includes("result-png"),
+      && executed.content[0].text.includes(
+        "[PIPIUI_COMPUTER_SCREENSHOT:bridge-shot-id-001]"
+      )
+      && !executed.content[0].text.includes("result-png")
+      && !executed.content[0].text.includes("screenshotId"),
     openResultMarkerOnly:
       opened.content.length === 1
       && opened.content[0].type === "text"
-      && opened.content[0].text.includes("[PIPIUI_COMPUTER_SCREENSHOT:")
+      && opened.content[0].text.includes(
+        "[PIPIUI_COMPUTER_SCREENSHOT:bridge-shot-id-001]"
+      )
       && !opened.content[0].text.includes("result-png")
-      && opened.details.foregroundApp.bundleID === "com.google.Chrome",
+      && opened.details.foregroundApp.bundleID === "com.google.Chrome"
+      && opened.details.openedTarget === undefined,
     compactAccessibilityResult:
       executed.content[0].text.includes("required-token")
       && !executed.content[0].text.includes("duplicated markdown")
@@ -582,6 +672,9 @@ const bridgedBodies: any[] = [];
                 "PIPIUI_SESSION_KEY": "test-capability",
                 "PIPIUI_COMPUTER_CAPABILITY": "test-computer-capability",
                 "PIPIUI_COMPUTER_DISPLAY_ID": "7",
+                // Pin geometry so host PIPIUI_COMPUTER_* env cannot flake the contract.
+                "PIPIUI_COMPUTER_WIDTH": "1440",
+                "PIPIUI_COMPUTER_HEIGHT": "900",
             ],
             uniquingKeysWith: { _, new in new }
         )
