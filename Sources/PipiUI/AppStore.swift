@@ -205,6 +205,31 @@ final class AppStore: ObservableObject {
         setComputerUseEnabled(!computerUseEnabled)
     }
 
+    func setComputerUseStrategyKind(_ kind: ComputerUseStrategyKind) {
+        guard ComputerUseSettings.strategyKind() != kind else { return }
+        ComputerUseSettings.setStrategyKind(kind)
+        if computerUseEnabled {
+            restartAllOpenSessions()
+        }
+    }
+
+    func setExternalComputerUseStrategyPath(_ path: String) {
+        let decision = ComputerUseSettings.externalStrategyApplyDecision(
+            submittedPath: path,
+            currentPath: ComputerUseSettings.externalStrategyPath(),
+            computerUseEnabled: computerUseEnabled,
+            strategyKind: ComputerUseSettings.strategyKind()
+        )
+        if decision.shouldPersist {
+            ComputerUseSettings.setExternalStrategyPath(
+                decision.normalizedPath
+            )
+        }
+        if decision.shouldRestartSessions {
+            restartAllOpenSessions()
+        }
+    }
+
     /// 会话 key 形如 "resume:<session 文件路径>"，选中时尚未 spawn 完也能拿到文件路径。
     private func sessionFileFromKey(_ key: String) -> String? {
         key.hasPrefix("resume:") ? String(key.dropFirst("resume:".count)) : nil
@@ -285,19 +310,43 @@ final class AppStore: ObservableObject {
                 respond(["ok": true])
                 return
             }
-            if action == "computer_batch"
-                || action == "computer_open_application"
-                || action == "computer_cancel" {
+            if ComputerRuntimeContract.operations.contains(action) {
                 let computerCapability = request["computerCapability"].string ?? ""
                 guard BridgeCapabilityToken.matches(
                     computerCapability,
                     expected: session.computerRoutingKey
                 ) else {
-                    respond([
-                        "ok": false,
-                        "error": "unauthorized computer capability",
-                    ])
+                    respond(ComputerRuntimeContract.failure(
+                        code: "unauthorized_computer_capability",
+                        message: "unauthorized computer capability",
+                        retryable: false,
+                        requiresObservation: false
+                    ))
                     return
+                }
+                if let versionFailure = ComputerRuntimeContract.validateVersion(request) {
+                    respond(versionFailure)
+                    return
+                }
+                if action == ComputerRuntimeContract.capabilitiesAction {
+                    do {
+                        let descriptor = try ComputerUseSettings.captureDescriptor()
+                        respond(ComputerRuntimeContract.capabilities(
+                            descriptor: descriptor,
+                            permissions: ComputerPermissions.snapshot()
+                        ))
+                    } catch {
+                        respond(ComputerRuntimeContract.failure(
+                            code: "runtime_unavailable",
+                            message: error.localizedDescription,
+                            retryable: false,
+                            requiresObservation: false
+                        ))
+                    }
+                    return
+                }
+                let computerRespond: ([String: Any]) -> Void = {
+                    respond(ComputerRuntimeContract.compatibilityEnvelope($0))
                 }
                 let requestID = request["requestID"].string ?? ""
                 if action == "computer_cancel" {
@@ -306,7 +355,7 @@ final class AppStore: ObservableObject {
                         sessionKey: session.bridgeRoutingKey,
                         reason: "computer request cancelled by the pi extension"
                     )
-                    respond(["ok": true])
+                    computerRespond(["ok": true])
                     return
                 }
                 guard registerCancellation({
@@ -318,23 +367,25 @@ final class AppStore: ObservableObject {
                         )
                     }
                 }) else {
-                    respond([
-                        "ok": false,
-                        "error": "computer bridge request was already cancelled",
-                    ])
+                    computerRespond(ComputerRuntimeContract.failure(
+                        code: "request_cancelled",
+                        message: "computer bridge request was already cancelled",
+                        retryable: true,
+                        requiresObservation: true
+                    ))
                     return
                 }
                 if action == "computer_open_application" {
                     ComputerCoordinator.shared.handleOpenApplication(
                         request: request,
                         sessionKey: session.bridgeRoutingKey,
-                        respond: respond
+                        respond: computerRespond
                     )
                 } else {
                     ComputerCoordinator.shared.handle(
                         request: request,
                         sessionKey: session.bridgeRoutingKey,
-                        respond: respond
+                        respond: computerRespond
                     )
                 }
                 return
@@ -380,6 +431,30 @@ final class AppStore: ObservableObject {
             }
         }
 
+        let selectedComputerStrategy: ComputerUseStrategySelection?
+        let computerStrategyError: String?
+        if ComputerUseSettings.isEnabled() {
+            do {
+                selectedComputerStrategy = try ComputerUseSettings.resolveStrategy(
+                    builtInPath: plugin.computerUseExtension
+                )
+                computerStrategyError = nil
+            } catch {
+                selectedComputerStrategy = nil
+                computerStrategyError =
+                    "Computer Use 策略无法加载：\(error.localizedDescription)"
+            }
+        } else {
+            selectedComputerStrategy = nil
+            computerStrategyError = nil
+        }
+        let sessionBlockedReason = [
+            conflicts.isEmpty
+                ? nil
+                : "扩展撞名，pi 未启动。修复上方冲突后会自动重启会话。",
+            computerStrategyError,
+        ].compactMap { $0 }.joined(separator: "\n")
+
         let cachedTranscript = preloadedTranscript ?? sessionPath.flatMap {
             historyPreloader.snapshotIfCurrent(path: $0)?.transcript
         }
@@ -398,13 +473,12 @@ final class AppStore: ObservableObject {
             skillLoaderExtension: plugin.skillLoaderExtension,
             codexServerToolsExtension: plugin.codexServerToolsExtension,
             claudeServerToolsExtension: plugin.claudeServerToolsExtension,
-            computerUseExtension: ComputerUseSettings.isEnabled()
-                ? plugin.computerUseExtension : nil,
+            computerUseExtension: selectedComputerStrategy?.extensionPath,
             subagentDir: plugin.subagentDir,
             agentsDir: plugin.agentsDir,
             philosophyExtension: PhilosophyPackage.fallbackExtensionPath,
-            blockedReason: conflicts.isEmpty ? nil
-                : "扩展撞名，pi 未启动。修复上方冲突后会自动重启会话。",
+            blockedReason: sessionBlockedReason.isEmpty
+                ? nil : sessionBlockedReason,
             initialTranscript: initialTranscript
         )
         session.onSessionMetaChanged = { [weak self, weak session] in

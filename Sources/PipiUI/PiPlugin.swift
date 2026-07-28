@@ -2,8 +2,8 @@ import Foundation
 
 /// App 自有的 pi 插件集合，安装到 Application Support 后通过 `-e` 加载。
 ///
-/// 设计目标：所有对 pi 行为的扩展都由 App 拥有并在每次启动时重装，
-/// 完全独立于 `~/.pi`——pi 升级、重装示例、重置用户配置都不影响我们。
+/// 设计目标：内置扩展以资源形式随 App 发布并安装到 Application Support。
+/// Computer Use 还允许用户选择外部 Pi strategy；外部路径不会被复制或覆盖。
 ///
 /// - 补丁版 subagent 扩展（生命周期上报 + 深度护栏 + agent 树身份），通过 `-e` 加载。
 ///   注意：pi 对同名工具是**硬失败**（重名 → error 诊断 → `process.exit(1)`），
@@ -133,13 +133,17 @@ enum PiPlugin {
             ("pipiui-search-scope.ts", \.searchScopeExtension),
             ("pipiui-codex-server-tools.ts", \.codexServerToolsExtension),
             ("pipiui-claude-server-tools.ts", \.claudeServerToolsExtension),
-            ("pipiui-computer-use.ts", \.computerUseExtension),
         ]
         for (name, keyPath) in files {
             let path = root.appendingPathComponent(name).path
             guard fm.fileExists(atPath: path) else { return nil }
             result[keyPath: keyPath] = path
         }
+        let builtInComputerStrategy = root
+            .appendingPathComponent("pi-ext")
+            .appendingPathComponent(ComputerUseStrategyResource.fileName)
+        guard fm.fileExists(atPath: builtInComputerStrategy.path) else { return nil }
+        result.computerUseExtension = builtInComputerStrategy.path
         guard PhilosophyPackage.extensionPath != nil else { return nil }
         return result
     }
@@ -165,6 +169,12 @@ enum PiPlugin {
                 if fm.fileExists(atPath: agents.path) {
                     result.agentsDir = agents.path
                 }
+                let computerStrategy = dest.appendingPathComponent(
+                    ComputerUseStrategyResource.fileName
+                )
+                if fm.fileExists(atPath: computerStrategy.path) {
+                    result.computerUseExtension = computerStrategy.path
+                }
             } catch {
                 // 拷贝失败时降级：subagent 面板仍能用（依赖用户自装的），只是没补丁
             }
@@ -179,6 +189,13 @@ enum PiPlugin {
            let bundledSub = bundledPiExt?.appendingPathComponent("subagent"),
            fm.fileExists(atPath: bundledSub.path) {
             result.subagentDir = bundledSub.path
+        }
+        if result.computerUseExtension == nil,
+           let bundledComputerStrategy = bundledPiExt?.appendingPathComponent(
+                ComputerUseStrategyResource.fileName
+           ),
+           fm.fileExists(atPath: bundledComputerStrategy.path) {
+            result.computerUseExtension = bundledComputerStrategy.path
         }
 
         // 2. 内置浏览器扩展（字符串生成，无外部依赖）
@@ -208,8 +225,8 @@ enum PiPlugin {
         // 5.8 官方 anthropic-messages hosted web_search
         result.claudeServerToolsExtension = ClaudeServerToolsExtension.install(into: root)
 
-        // 5.9 macOS Computer Use（仅安装；独立 opt-in 决定 ChatSession 是否 -e 挂载）
-        result.computerUseExtension = ComputerUseExtension.install(into: root)
+        // 5.9 macOS Computer Use 的默认策略已随 PiExt 资源复制。Swift 不生成、
+        // 不覆盖策略源码；独立 opt-in 与策略选择决定 ChatSession 挂载哪个 -e。
 
         // 6. 工作哲学：随包快照落盘（注册进 pi 由 syncPhilosophyRegistration 负责）
         PhilosophyPackage.install()

@@ -39,13 +39,12 @@ function containsTupleItems(value) {
   return Object.values(value).some(containsTupleItems);
 }
 
-test("computer coordinate schema is xAI-compatible in the existing custom provider shape", async () => {
-  const swift = await readFile(
-    join(repositoryRoot, "Sources/PipiUI/ComputerUseExtension.swift"),
+test("resource-backed computer coordinate schema is xAI-compatible in the custom provider shape", async () => {
+  const source = await readFile(
+    join(repositoryRoot, "Sources/PipiUI/PiExt/computer-use-strategy.ts"),
     "utf8",
   );
-  const source = swift.match(/static let source = #"""\n([\s\S]*?)\n"""#/)?.[1];
-  assert.ok(source, "generated Computer Use extension source was not found");
+  assert.ok(source, "bundled Computer Use strategy resource was not found");
 
   const directory = await mkdtemp(join(tmpdir(), "pipiui-computer-schema-"));
   try {

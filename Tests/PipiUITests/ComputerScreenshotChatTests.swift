@@ -110,8 +110,8 @@ final class ComputerScreenshotChatTests: XCTestCase {
         XCTAssertNotNil(ComputerScreenshotMemoryCache.entry(for: ids.last!))
     }
 
-    func testBridgeScreenshotIdAlignsWithNodeMarkerContractInExtensionSource() {
-        let source = ComputerUseExtension.source
+    func testBridgeScreenshotIdAlignsWithNodeMarkerContractInExtensionResource() throws {
+        let source = try ComputerUseStrategyResource.bundledSource()
         XCTAssertTrue(source.contains("result.screenshotId"))
         XCTAssertTrue(source.contains("result?.screenshotId"))
         XCTAssertTrue(source.contains("missing stable screenshotId"))
