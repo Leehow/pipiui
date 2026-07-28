@@ -1077,11 +1077,89 @@ function validateAgentId(id: string): string | null {
  * than the worker's own cwd: that cwd is a worktree, and a successful merge deletes it — which
  * would throw away the context on exactly the runs that went well.
  */
+/**
+ * Retention for stored worker conversations.
+ *
+ * Deliberately conservative in both directions. Deleting one throws away the context that
+ * makes continuing a worker worth anything, so age is the only "this is finished" signal
+ * trusted here: a merged slice is often continued the next day, while a worker nobody has
+ * touched in two weeks is reasoning about code that has since moved on. The count cap only
+ * exists so a burst of short-lived workers cannot grow the directory without bound.
+ */
+const SESSION_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+const SESSION_MAX_KEEP = 50;
+
+interface StoredSession {
+	name: string;
+	agentId: string;
+	mtimeMs: number;
+}
+
+/** Pure so the retention rule can be tested without touching a filesystem. */
+function selectStaleSessions(
+	entries: StoredSession[],
+	opts: { now: number; maxAgeMs: number; maxKeep: number; running: Set<string> },
+): string[] {
+	const candidates = entries.filter((e) => !opts.running.has(e.agentId));
+	const stale = new Set(
+		candidates.filter((e) => opts.now - e.mtimeMs > opts.maxAgeMs).map((e) => e.name),
+	);
+	// Newest first, then anything past the cap goes too.
+	const survivors = candidates
+		.filter((e) => !stale.has(e.name))
+		.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	for (const extra of survivors.slice(opts.maxKeep)) stale.add(extra.name);
+	return [...stale];
+}
+
+function readStoredSessions(dir: string): StoredSession[] {
+	try {
+		return fs
+			.readdirSync(dir)
+			.map((name) => {
+				const agentId = /_pipiui-(.+)\.jsonl$/.exec(name)?.[1];
+				if (!agentId) return undefined;
+				try {
+					return { name, agentId, mtimeMs: fs.statSync(path.join(dir, name)).mtimeMs };
+				} catch {
+					return undefined;
+				}
+			})
+			.filter((e): e is StoredSession => Boolean(e));
+	} catch {
+		return [];
+	}
+}
+
+let prunedThisProcess = false;
+
+/** Once per process: this is housekeeping, not something to redo on every dispatch. */
+function pruneAgentSessions(dir: string): void {
+	if (prunedThisProcess) return;
+	prunedThisProcess = true;
+	const running = new Set(
+		[...jobRegistry.values()].filter((j) => j.state === "running").map((j) => j.agentId),
+	);
+	for (const name of selectStaleSessions(readStoredSessions(dir), {
+		now: Date.now(),
+		maxAgeMs: SESSION_MAX_AGE_MS,
+		maxKeep: SESSION_MAX_KEEP,
+		running,
+	})) {
+		try {
+			fs.rmSync(path.join(dir, name));
+		} catch {
+			// A file we cannot remove only costs disk; never fail a dispatch over housekeeping.
+		}
+	}
+}
+
 function agentSessionDir(): string | undefined {
 	if (!PIPIUI_MAIN_CWD) return undefined;
 	const dir = path.join(PIPIUI_MAIN_CWD, ".pi", "agent-sessions");
 	try {
 		fs.mkdirSync(dir, { recursive: true });
+		pruneAgentSessions(dir);
 		return dir;
 	} catch {
 		return undefined;
