@@ -35,6 +35,32 @@ const USER_LAYERS_DIR = path.join(AGENT_DIR, "philosophy-user");
  */
 const MARKER = "<!-- pipi-philosophy -->";
 
+/**
+ * Runtime state for other extensions in this same pi process.
+ *
+ * A layer is only advice until something enforces it. `fanout` in particular claims workers
+ * run in the background — a dispatch runtime that lets a caller turn that off is running a
+ * fake fan-out. So the composed result is published here, keyed by pid, and a dispatcher can
+ * read exactly what this process actually resolved: capability guards, role scope and layer
+ * dependencies all already applied.
+ *
+ * A file rather than `globalThis` on purpose: whether extensions share a realm is an
+ * implementation detail of pi's module loader, while "same pid" is not.
+ */
+const STATE_FILE = path.join(os.tmpdir(), `pipi-philosophy-${process.pid}.json`);
+
+function publishState(activeLayerIds: string[]): void {
+  try {
+    fs.writeFileSync(
+      STATE_FILE,
+      JSON.stringify({ pid: process.pid, layers: activeLayerIds, at: Date.now() }),
+      "utf-8",
+    );
+  } catch {
+    // Advisory only: a dispatcher that cannot read it falls back to caller-decides.
+  }
+}
+
 const loadErrors: string[] = [];
 
 // ---------------------------------------------------------------------------
@@ -183,8 +209,19 @@ export default function (pi: ExtensionAPI) {
       role: resolveRole(process.env),
       activeTools: pi.getActiveTools(),
     });
+    // Published before the turn runs, so any tool called during it sees this turn's truth.
+    publishState(result.included.map((l) => l.id));
     if (!result.text) return;
     return { systemPrompt: `${event.systemPrompt.trimEnd()}\n\n${MARKER}\n${result.text}` };
+  });
+
+  // Leave no state behind for a future process that happens to reuse this pid.
+  pi.on("session_shutdown", () => {
+    try {
+      fs.unlinkSync(STATE_FILE);
+    } catch {
+      // Already gone, or never written.
+    }
   });
 
   pi.registerCommand("philosophy", {

@@ -160,6 +160,42 @@ final class PhilosophySettingsTests: XCTestCase {
         }
     }
 
+    // MARK: - Fan-out is a runtime invariant, not a prompt suggestion
+
+    /// The fan-out layer's premise is that workers run in the background. A boss that blocks on
+    /// every dispatch is running a fake fan-out, so while the layer is on the dispatch runtime
+    /// must refuse background:false rather than trusting the model — session history shows
+    /// models passing it regardless of what the system prompt says.
+    func testDispatchRuntimeForcesBackgroundWhileFanoutIsActive() throws {
+        let bundled = try XCTUnwrap(PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil))
+        let source = try String(
+            contentsOf: bundled.appendingPathComponent("subagent/index.ts"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("function fanoutLayerActive()"))
+        // Keyed to this pid, so an uninstalled or unloaded philosophy cannot leave a stale
+        // config file forcing behaviour nothing is actually backing.
+        XCTAssertTrue(source.contains("pipi-philosophy-${process.pid}.json"))
+        XCTAssertTrue(source.contains("state.pid !== process.pid"))
+        XCTAssertTrue(source.contains(#"state.layers.includes("fanout")"#),
+                      "must read what the composer resolved, not what the config requested")
+        XCTAssertTrue(source.contains("const forcedBackground = PIPIUI_DEPTH === 0 && !isChain && fanoutLayerActive()"))
+        XCTAssertTrue(source.contains("params.background === false && forcedBackground"),
+                      "an ignored background:false must tell the model it was ignored")
+    }
+
+    /// `fanoutLayerActive()` keys off this file, so a default install must have one.
+    func testEnsureDefaultConfigWritesOnceAndNeverOverwrites() throws {
+        PhilosophySettings.ensureDefaultConfig(configURL: configURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configURL.path))
+        XCTAssertTrue(PhilosophySettings.isEnabled(configURL: configURL))
+        XCTAssertTrue(PhilosophySettings.isLayerEnabled("fanout", configURL: configURL))
+
+        PhilosophySettings.setLayerEnabled(false, id: "fanout", configURL: configURL)
+        PhilosophySettings.ensureDefaultConfig(configURL: configURL)
+        XCTAssertFalse(PhilosophySettings.isLayerEnabled("fanout", configURL: configURL),
+                       "a user choice must survive the next launch")
+    }
+
     // MARK: - Catalog parsing
 
     func testParseLayerReadsFrontmatterAndStripsIt() throws {

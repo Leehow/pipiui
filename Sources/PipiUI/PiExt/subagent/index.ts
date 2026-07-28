@@ -81,32 +81,41 @@ const PIPIUI_SUBAGENT_SKILL_ISOLATION = process.env.PIPIUI_SUBAGENT_SKILL_ISOLAT
 // Read-only planners additionally cannot pull SKILL.md through the read tool.
 const PIPIUI_SKILL_READ_BLOCK = process.env.PIPIUI_SKILL_READ_BLOCK === "1";
 
-/** Where the pipi-philosophy package keeps its config; the App writes defaults on install. */
-const PHILOSOPHY_CONFIG = path.join(os.homedir(), ".pi", "agent", "philosophy.json");
+/**
+ * Runtime state published by the pipi-philosophy extension for this exact pid, each turn.
+ * Not the config file: the config says what the user asked for, this says what the composer
+ * actually resolved after capability guards, role scope and layer dependencies.
+ */
+const PHILOSOPHY_STATE = path.join(os.tmpdir(), `pipi-philosophy-${process.pid}.json`);
 
 /**
- * Is the fan-out philosophy layer live for this session?
+ * Is the fan-out philosophy layer live in this very process?
  *
- * That layer's whole premise is that workers run in the background and report through signals
- * — a boss that blocks on each dispatch is running a fake fan-out. So while the layer is on,
+ * That layer's premise is that workers run in the background and report through signals — a
+ * boss that blocks on each dispatch is running a fake fan-out. So while the layer is on,
  * background stops being a per-call preference and becomes a runtime invariant, exactly like
- * the depth guard. Mirrors the composer: a layer is active unless switched off, and `fanout`
- * additionally dies with `orchestration`.
+ * the depth guard. The guard has to live here rather than in the prompt: session history shows
+ * models passing background:false regardless of what the system prompt says.
  *
- * Read fresh per call so a Settings toggle applies without restarting the session. A missing
- * config file means the philosophy is not installed here, and the old caller-decides
- * behaviour stands.
+ * Read fresh per call, so a Settings toggle applies from the next turn without a restart. No
+ * state file means the philosophy is not loaded here, and the old caller-decides behaviour
+ * stands.
  */
 function fanoutLayerActive(): boolean {
-	let parsed: { enabled?: unknown; layers?: Record<string, unknown> };
 	try {
-		parsed = JSON.parse(fs.readFileSync(PHILOSOPHY_CONFIG, "utf-8"));
+		const state = JSON.parse(fs.readFileSync(PHILOSOPHY_STATE, "utf-8")) as {
+			pid?: number;
+			layers?: unknown;
+			at?: number;
+		};
+		if (state.pid !== process.pid || !Array.isArray(state.layers)) return false;
+		// Rewritten every turn, so anything old belongs to a dead process whose pid the OS
+		// recycled — not to us.
+		if (typeof state.at !== "number" || Date.now() - state.at > 3_600_000) return false;
+		return state.layers.includes("fanout");
 	} catch {
 		return false;
 	}
-	if (parsed?.enabled === false) return false;
-	const layers = parsed?.layers ?? {};
-	return layers.fanout !== false && layers.orchestration !== false;
 }
 
 // 跟踪本扩展 spawn 出的子 pi，父进程退出时尽量收割，避免孤儿继续打桥接
