@@ -2509,11 +2509,55 @@ final class ChatSession: ObservableObject, Identifiable {
 
         // Busy while streaming OR in the gap after drain popped until agent_start.
         if isStreaming || isSendingFromQueue {
-            let ok = queue.enqueue(text: prepared.message, images: prepared.images)
+            let ok = queue.enqueue(
+                text: prepared.message,
+                images: prepared.images,
+                recordsSearchScopeGrant: true
+            )
             if ok { publishQueue() }
             return
         }
-        sendPromptNow(message: prepared.message, images: prepared.images)
+        sendPromptNow(
+            message: prepared.message,
+            images: prepared.images,
+            recordsSearchScopeGrant: true
+        )
+    }
+
+    enum RemotePromptSubmissionResult: Equatable {
+        case accepted
+        case empty
+        case rejectedBuiltin(String)
+    }
+
+    /// Explicit remote-text seam. It shares the normal local queue, optimistic
+    /// transcript and Pi abort behavior, while refusing every PipiUI-local
+    /// builtin and never treating remote text as local filesystem authorization.
+    func submitRemotePrompt(_ text: String) -> RemotePromptSubmissionResult {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .empty }
+        if let builtinName = RemotePromptPolicy.rejectedBuiltinName(in: trimmed) {
+            return .rejectedBuiltin(builtinName)
+        }
+
+        let prepared = prepareMessage(text: trimmed, images: [])
+        if isStreaming || isSendingFromQueue {
+            guard queue.enqueue(
+                text: prepared.message,
+                images: [],
+                recordsSearchScopeGrant: false
+            ) else {
+                return .empty
+            }
+            publishQueue()
+        } else {
+            sendPromptNow(
+                message: prepared.message,
+                images: [],
+                recordsSearchScopeGrant: false
+            )
+        }
+        return .accepted
     }
 
     /// App-authored user-role messages are useful orchestration input, but are not
@@ -2642,22 +2686,29 @@ final class ChatSession: ObservableObject, Identifiable {
         return (message, images)
     }
 
-    private func sendPromptNow(message: String, images: [DraftImage], requeueOnFailure: QueuedMessage? = nil) {
-        let suppressionCount = searchGrantSuppressedMessages[message] ?? 0
-        if suppressionCount > 0 {
-            if suppressionCount == 1 {
-                searchGrantSuppressedMessages.removeValue(forKey: message)
+    private func sendPromptNow(
+        message: String,
+        images: [DraftImage],
+        requeueOnFailure: QueuedMessage? = nil,
+        recordsSearchScopeGrant: Bool = true
+    ) {
+        if recordsSearchScopeGrant {
+            let suppressionCount = searchGrantSuppressedMessages[message] ?? 0
+            if suppressionCount > 0 {
+                if suppressionCount == 1 {
+                    searchGrantSuppressedMessages.removeValue(forKey: message)
+                } else {
+                    searchGrantSuppressedMessages[message] = suppressionCount - 1
+                }
             } else {
-                searchGrantSuppressedMessages[message] = suppressionCount - 1
+                // Replace the grant before Pi sees this human-composer turn. A prompt without
+                // an explicit path writes an empty list, expiring any permission from last turn.
+                try? SearchScopeExtension.recordUserTurn(
+                    message,
+                    sessionKey: id,
+                    projectRoot: projectURL
+                )
             }
-        } else {
-            // Replace the grant before Pi sees this human-composer turn. A prompt without
-            // an explicit path writes an empty list, expiring any permission from last turn.
-            try? SearchScopeExtension.recordUserTurn(
-                message,
-                sessionKey: id,
-                projectRoot: projectURL
-            )
         }
 
         // Provisional title + at most one side-channel LLM refine (first user message only).
@@ -2756,6 +2807,15 @@ final class ChatSession: ObservableObject, Identifiable {
         proc?.send(["type": "abort"])
     }
 
+    /// Remote Stop is narrower than the local method because the webpage keeps
+    /// a persistent button. An idle click must not leave `isStopping` stuck.
+    @discardableResult
+    func abortRemoteGeneration() -> Bool {
+        guard isStreaming || isSendingFromQueue else { return false }
+        abort()
+        return true
+    }
+
     /// 插队 / 阻截：中止当前 run（若在生成），settle 后发送队首；FIFO 剩余项不变。不恢复到 draft。
     /// Same path as Stop-with-queue when streaming; when idle, drains head immediately.
     func cutInQueueHead() {
@@ -2778,7 +2838,12 @@ final class ChatSession: ObservableObject, Identifiable {
             return
         }
         publishQueue()
-        sendPromptNow(message: msg.text, images: msg.images, requeueOnFailure: msg)
+        sendPromptNow(
+            message: msg.text,
+            images: msg.images,
+            requeueOnFailure: msg,
+            recordsSearchScopeGrant: msg.recordsSearchScopeGrant
+        )
     }
 
     func setModel(_ m: ModelInfo) {

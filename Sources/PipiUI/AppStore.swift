@@ -88,6 +88,9 @@ final class AppStore: ObservableObject {
     /// 首次恢复历史会话前的一个短暂排队标记。让侧栏可以先更新选中态，
     /// 同时保证连续点击同一条历史会话不会排队启动多个 pi 进程。
     private var pendingHistoricalSessionOpens: [String: (token: UUID, projectPath: String)] = [:]
+    private var pendingHistoricalRemoteCompletions: [
+        String: [(ChatSession?) -> Void]
+    ] = [:]
 
     /// Optimistic "pin to top" timestamps keyed by session jsonl path.
     /// Used so a just-sent session stays above disk-mtime ordering until closed/archived.
@@ -150,6 +153,13 @@ final class AppStore: ObservableObject {
     /// use `setComputerUseEnabled` so lifecycle side effects cannot diverge.
     @Published private(set) var computerUseEnabled = ComputerUseSettings.isEnabled()
 
+    /// Independent default-off loopback web test host. This never changes the
+    /// BridgeServer listener or exposes either bridge capability.
+    @Published private(set) var localRemoteEnabled = LocalRemoteSettings.isEnabled()
+    @Published private(set) var localRemoteURL: URL?
+    @Published private(set) var localRemoteStatus = "已关闭"
+    private var localRemoteHost: RemoteHostService?
+
     /// Bumped when model picker visibility preferences change so InputBar refreshes.
     @Published var modelVisibilityRevision: Int = 0
     /// Bumped when skill enable/disable toggles change so slash menu refreshes.
@@ -211,6 +221,54 @@ final class AppStore: ObservableObject {
         if computerUseEnabled {
             restartAllOpenSessions()
         }
+    }
+
+    func setLocalRemoteEnabled(_ enabled: Bool) {
+        guard enabled != localRemoteEnabled || (enabled && localRemoteHost == nil) else {
+            return
+        }
+        LocalRemoteSettings.setEnabled(enabled)
+        localRemoteEnabled = enabled
+        if enabled {
+            startLocalRemoteHost()
+        } else {
+            localRemoteHost?.stop()
+            localRemoteHost = nil
+            localRemoteURL = nil
+            localRemoteStatus = "已关闭"
+        }
+    }
+
+    private func startLocalRemoteHost() {
+        localRemoteHost?.stop()
+        localRemoteHost = nil
+        localRemoteURL = nil
+        localRemoteStatus = "正在启动…"
+        guard let host = RemoteHostService(store: self, stateChanged: { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .starting:
+                self.localRemoteStatus = "正在启动…"
+                self.localRemoteURL = nil
+            case .listening(let url):
+                self.localRemoteStatus = "仅监听 127.0.0.1"
+                self.localRemoteURL = url
+            case .failed(let message):
+                self.localRemoteStatus = "启动失败：\(message)"
+                self.localRemoteURL = nil
+            case .stopped:
+                if !self.localRemoteEnabled {
+                    self.localRemoteStatus = "已关闭"
+                }
+                self.localRemoteURL = nil
+            }
+        }) else {
+            localRemoteEnabled = false
+            LocalRemoteSettings.setEnabled(false)
+            localRemoteStatus = "启动失败"
+            return
+        }
+        localRemoteHost = host
     }
 
     func setExternalComputerUseStrategyPath(_ path: String) {
@@ -405,6 +463,11 @@ final class AppStore: ObservableObject {
                 if ProcessInfo.processInfo.environment["PIPIUI_MD_DEMO"] != nil {
                     self?.currentSession?.appendDebugAssistant(Self.markdownDemo)
                 }
+            }
+        }
+        if localRemoteEnabled {
+            DispatchQueue.main.async { [weak self] in
+                self?.startLocalRemoteHost()
             }
         }
     }
@@ -1043,46 +1106,95 @@ final class AppStore: ObservableObject {
     // MARK: - Open / create sessions
 
     func openSession(_ meta: SessionMeta, project: URL) {
+        selectedSessionKey = openSessionInBackground(meta, project: project)
+    }
+
+    /// Loads/opens a historical session without touching either desktop
+    /// selection. Disk parsing remains in SessionHistoryPreloader's utility queue.
+    @discardableResult
+    func openSessionInBackground(
+        _ meta: SessionMeta,
+        project: URL,
+        completion: ((ChatSession?) -> Void)? = nil
+    ) -> String {
+        let desktopSelection = RemoteDesktopSelectionState(
+            projectPath: selectedProjectPath,
+            sessionKey: selectedSessionKey
+        )
+        defer {
+            assert(desktopSelection.matches(
+                projectPath: selectedProjectPath,
+                sessionKey: selectedSessionKey
+            ))
+        }
         let key = "resume:\(meta.path)"
         // 历史会话第一次打开后始终使用这个稳定 key；重复点击不必扫描所有 live session。
-        if openSessions[key] != nil {
-            selectedSessionKey = key
-            return
+        if let session = openSessions[key] {
+            completion?(session)
+            return key
         }
         // 已经有进程挂着这个会话文件时直接切换过去
         if let existing = openSessions.first(where: { $0.value.sessionFile == meta.path }) {
-            selectedSessionKey = existing.key
-            return
+            completion?(existing.value)
+            return existing.key
         }
 
-        // 先让 List/详情区域消费新的 selection；首次启动 pi 和扩展冲突扫描
-        // 会在下一次主循环执行。已加载过的会话已经在 openSessions 中，会走上面的
-        // 立即返回路径，不会重启 pi 或再次 get_messages。
-        selectedSessionKey = key
-        guard pendingHistoricalSessionOpens[key] == nil else { return }
+        if let completion {
+            pendingHistoricalRemoteCompletions[key, default: []].append(completion)
+        }
+        guard pendingHistoricalSessionOpens[key] == nil else { return key }
         let token = UUID()
         pendingHistoricalSessionOpens[key] = (token, project.path)
         historyPreloader.loadPrioritized(path: meta.path) { [weak self] snapshot in
             guard let self,
-                  self.pendingHistoricalSessionOpens[key]?.token == token else { return }
+                  self.pendingHistoricalSessionOpens[key]?.token == token else {
+                return
+            }
             self.pendingHistoricalSessionOpens.removeValue(forKey: key)
+            let completions = self.pendingHistoricalRemoteCompletions.removeValue(forKey: key) ?? []
             // 归档、移除项目或关闭会话可能发生在这个短暂的排队窗口内。
             guard !self.archivedSessionPaths.contains(meta.path),
                   self.projects.contains(where: { $0.path == project.path }),
-                  self.openSessions[key] == nil else { return }
-            self.openSessions[key] = self.makeSession(
-                key: key,
-                project: project,
-                sessionPath: meta.path,
-                preloadedTranscript: snapshot?.transcript
-            )
+                  self.openSessions[key] == nil else {
+                let existing = self.openSessions[key]
+                    ?? self.openSessions.values.first { $0.sessionFile == meta.path }
+                completions.forEach { $0(existing) }
+                return
+            }
+            let session = self.makeSession(
+                    key: key,
+                    project: project,
+                    sessionPath: meta.path,
+                    preloadedTranscript: snapshot?.transcript
+                )
+            self.openSessions[key] = session
+            completions.forEach { $0(session) }
         }
+        return key
     }
 
     func newSession(project: URL) {
-        let key = "new:\(UUID().uuidString)"
-        openSessions[key] = makeSession(key: key, project: project, sessionPath: nil)
+        let (key, _) = createSessionInBackground(project: project)
         selectedSessionKey = key
+    }
+
+    /// Creates a live Pi session without changing desktop selection.
+    @discardableResult
+    func createSessionInBackground(project: URL) -> (key: String, session: ChatSession) {
+        let desktopSelection = RemoteDesktopSelectionState(
+            projectPath: selectedProjectPath,
+            sessionKey: selectedSessionKey
+        )
+        defer {
+            assert(desktopSelection.matches(
+                projectPath: selectedProjectPath,
+                sessionKey: selectedSessionKey
+            ))
+        }
+        let key = "new:\(UUID().uuidString)"
+        let session = makeSession(key: key, project: project, sessionPath: nil)
+        openSessions[key] = session
+        return (key, session)
     }
 
     func openBranchedSession(path: String, project: URL, suggestedName: String) {
@@ -1290,6 +1402,11 @@ final class AppStore: ObservableObject {
 
     func shutdown() {
         pendingHistoricalSessionOpens.removeAll()
+        let pendingRemoteCompletions = pendingHistoricalRemoteCompletions.values.flatMap { $0 }
+        pendingHistoricalRemoteCompletions.removeAll()
+        pendingRemoteCompletions.forEach { $0(nil) }
+        localRemoteHost?.stop()
+        localRemoteHost = nil
         ComputerCoordinator.shared.releaseAll(revokeConsent: true)
         ComputerCoordinator.shared.shutdownInputMonitoring()
         for session in openSessions.values {

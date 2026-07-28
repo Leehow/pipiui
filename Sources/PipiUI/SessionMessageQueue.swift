@@ -4,11 +4,20 @@ struct QueuedMessage: Identifiable {
     let id: UUID
     var text: String
     var images: [DraftImage]
+    /// Only a direct local human-composer turn may widen the per-turn filesystem
+    /// search grant. Remote/app-authored prompts carry false through queue drain.
+    var recordsSearchScopeGrant: Bool
 
-    init(id: UUID = UUID(), text: String, images: [DraftImage] = []) {
+    init(
+        id: UUID = UUID(),
+        text: String,
+        images: [DraftImage] = [],
+        recordsSearchScopeGrant: Bool = true
+    ) {
         self.id = id
         self.text = text
         self.images = images
+        self.recordsSearchScopeGrant = recordsSearchScopeGrant
     }
 }
 
@@ -22,10 +31,18 @@ struct SessionMessageQueue {
 
     /// Enqueue a follow-up. `text` should already include attachment path footnotes if any.
     @discardableResult
-    mutating func enqueue(text: String, images: [DraftImage] = []) -> Bool {
+    mutating func enqueue(
+        text: String,
+        images: [DraftImage] = [],
+        recordsSearchScopeGrant: Bool = true
+    ) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !images.isEmpty else { return false }
-        items.append(QueuedMessage(text: text, images: images))
+        items.append(QueuedMessage(
+            text: text,
+            images: images,
+            recordsSearchScopeGrant: recordsSearchScopeGrant
+        ))
         return true
     }
 
