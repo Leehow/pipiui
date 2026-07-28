@@ -109,3 +109,23 @@ test("runtime docs state the process-level trust and emergency-stop lifecycle", 
     /Applying an unchanged path deliberately[\s\S]*edit-and-reload loop/,
   );
 });
+
+test("runtime docs make generic and unknown error flags directly trustworthy", async () => {
+  const contractDoc = await readFile(contractDocURL, "utf8");
+  assert.match(
+    contractDoc,
+    /boolean fields are authoritative Runtime guidance/,
+  );
+  assert.match(
+    contractDoc,
+    /Unknown codes fail closed with[\s\S]*`retryable: false` and `requiresObservation: true`/,
+  );
+  assert.match(
+    contractDoc,
+    /`runtime_error`[\s\S]*do not retry and observe before[\s\S]*continuing/,
+  );
+  assert.doesNotMatch(
+    contractDoc,
+    /false` flags[\s\S]*do not prove/,
+  );
+});

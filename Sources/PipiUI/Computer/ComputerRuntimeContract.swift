@@ -183,16 +183,21 @@ enum ComputerRuntimeContract {
              "unauthorized_session_capability",
              "unauthorized_computer_capability",
              "unsupported_protocol_version",
-             "runtime_unavailable",
-             "runtime_error":
+             "runtime_unavailable":
             return ComputerRuntimeErrorSemantics(
                 retryable: false,
                 requiresObservation: false
             )
+        case "runtime_error":
+            // A generic mechanics failure cannot prove whether an action ran.
+            return ComputerRuntimeErrorSemantics(
+                retryable: false,
+                requiresObservation: true
+            )
         default:
             return ComputerRuntimeErrorSemantics(
                 retryable: false,
-                requiresObservation: false
+                requiresObservation: true
             )
         }
     }

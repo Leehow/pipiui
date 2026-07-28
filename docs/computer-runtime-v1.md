@@ -237,7 +237,8 @@ Clients should branch on `runtimeError.code`, `retryable`, and
 `requiresObservation`; `message` and legacy `error` are diagnostic text and may
 change. `retryable: true` means a retry is eligible only after satisfying
 `requiresObservation` and any user/runtime prerequisite; it never instructs a
-client to retry blindly. Stable v1 guidance includes:
+client to retry blindly. The boolean fields are authoritative Runtime guidance,
+including for generic and unknown codes. Stable v1 guidance includes:
 
 - `unauthorized_session_capability`: do not retry; the owning Pi session ended
   or the session capability is invalid.
@@ -261,12 +262,13 @@ client to retry blindly. Stable v1 guidance includes:
 - `invalid_application_target` / `invalid_computer_request`: correct the
   request rather than retrying it unchanged.
 - `runtime_error`: compatibility wrapper for a runtime-mechanics failure that
-  does not yet have a narrower stable code.
+  does not yet have a narrower stable code; do not retry and observe before
+  continuing.
 
-Additional lower-level codes may be returned. The compatibility wrapper emits
-conservative `false` flags for unknown codes. Those values do not prove that
-continuing without observation is safe: clients must fail closed, surface the
-diagnostic, and must not guess behavior from message text.
+Additional lower-level codes may be returned. Unknown codes fail closed with
+`retryable: false` and `requiresObservation: true`; clients can trust those
+fields directly, must surface the diagnostic, and must not guess behavior from
+message text.
 
 ## Minimal third-party TypeScript strategy
 

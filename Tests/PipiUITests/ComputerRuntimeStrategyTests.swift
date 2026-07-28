@@ -254,6 +254,8 @@ final class ComputerRuntimeStrategyTests: XCTestCase {
         )
         XCTAssertEqual(runtimeError["code"] as? String, "runtime_error")
         XCTAssertEqual(runtimeError["message"] as? String, "permission missing")
+        XCTAssertEqual(runtimeError["retryable"] as? Bool, false)
+        XCTAssertEqual(runtimeError["requiresObservation"] as? Bool, true)
     }
 
     func testKnownLowerLevelRuntimeErrorsGetExplicitSemantics() throws {
@@ -268,6 +270,11 @@ final class ComputerRuntimeStrategyTests: XCTestCase {
             ("cua_driver_error", false, true),
             ("invalid_application_target", false, false),
             ("invalid_computer_request", false, false),
+            ("unauthorized_session_capability", false, false),
+            ("unauthorized_computer_capability", false, false),
+            ("unsupported_protocol_version", false, false),
+            ("runtime_unavailable", false, false),
+            ("runtime_error", false, true),
         ]
 
         for (code, retryable, requiresObservation) in expectations {
@@ -296,6 +303,18 @@ final class ComputerRuntimeStrategyTests: XCTestCase {
         XCTAssertEqual(
             ComputerRuntimeContract.errorSemantics(
                 for: "computer_outcome_unknown"
+            ),
+            ComputerRuntimeErrorSemantics(
+                retryable: false,
+                requiresObservation: true
+            )
+        )
+    }
+
+    func testUnknownRuntimeErrorFailsClosedAndRequiresObservation() {
+        XCTAssertEqual(
+            ComputerRuntimeContract.errorSemantics(
+                for: "future_mechanics_failure"
             ),
             ComputerRuntimeErrorSemantics(
                 retryable: false,
