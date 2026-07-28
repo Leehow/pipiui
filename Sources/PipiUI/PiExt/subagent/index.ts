@@ -321,6 +321,8 @@ interface SingleResult {
 	verifySkipped?: boolean;
 	/** Brief carried `verify` for a read-only agent; the runtime dropped it as unattestable. */
 	verifyDropped?: boolean;
+	/** Continued an existing worker's conversation instead of starting it cold. */
+	resumed?: boolean;
 }
 
 interface SubagentDetails {
@@ -344,6 +346,8 @@ interface RunSingleAgentOptions {
 	sessionModel?: string;
 	/** Shell command the runtime runs in the agent's cwd after the process ends (attested verify). */
 	verify?: string;
+	/** Discard this worker's stored conversation and start it cold. */
+	fresh?: boolean;
 }
 
 /** Format ExtensionAPI ctx.model → `provider/id`. */
@@ -995,6 +999,68 @@ function generatePipiuiAgentId(): string {
 	return `agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * A worker's id is what the boss has to type back to continue with the same worker, so it is
+ * chosen by the boss and kept short and meaningful: `quota-pill`, not `agent-ms1mo5dx-pn6o1l`.
+ * Long random ids drift when a model retypes them, and a drifted id silently becomes a new
+ * worker with an empty head — the exact failure this naming exists to prevent.
+ *
+ * Also lands verbatim in a git branch (`pipiui/<id>`) and a session filename, so the character
+ * set is the intersection of "safe there" and "hard to mistype".
+ */
+const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{1,23}$/;
+const RESERVED_AGENT_IDS = new Set(["root", "main", "head", "master"]);
+
+/** Returns an error addressed to the model, or null when the id is usable. */
+function validateAgentId(id: string): string | null {
+	if (!AGENT_ID_PATTERN.test(id)) {
+		return `Invalid agentId ${JSON.stringify(id)}. Use 2-24 chars of lowercase letters, digits, "-" or "_", starting with a letter or digit — a short name for this worker, e.g. "quota-pill".`;
+	}
+	if (RESERVED_AGENT_IDS.has(id)) {
+		return `agentId ${JSON.stringify(id)} is reserved. Pick another short name.`;
+	}
+	if (id.includes("..")) {
+		return `agentId ${JSON.stringify(id)} must not contain "..".`;
+	}
+	return null;
+}
+
+/**
+ * Where a reusable worker's conversation lives. Deliberately under the main project rather
+ * than the worker's own cwd: that cwd is a worktree, and a successful merge deletes it — which
+ * would throw away the context on exactly the runs that went well.
+ */
+function agentSessionDir(): string | undefined {
+	if (!PIPIUI_MAIN_CWD) return undefined;
+	const dir = path.join(PIPIUI_MAIN_CWD, ".pi", "agent-sessions");
+	try {
+		fs.mkdirSync(dir, { recursive: true });
+		return dir;
+	} catch {
+		return undefined;
+	}
+}
+
+/** pi writes `<timestamp>_<sessionId>.jsonl`, so presence is a suffix match. */
+function agentSessionExists(dir: string, sessionId: string): boolean {
+	try {
+		return fs.readdirSync(dir).some((f) => f.endsWith(`_${sessionId}.jsonl`));
+	} catch {
+		return false;
+	}
+}
+
+function agentSessionFiles(dir: string, sessionId: string): string[] {
+	try {
+		return fs
+			.readdirSync(dir)
+			.filter((f) => f.endsWith(`_${sessionId}.jsonl`))
+			.map((f) => path.join(dir, f));
+	} catch {
+		return [];
+	}
+}
+
 /** Sanitize agentId for branch/dir names (filesystem + git ref safe). */
 function safeId(agentId: string): string {
 	return agentId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) || "agent";
@@ -1067,7 +1133,8 @@ function parseWorktreeListPorcelain(output: string): Array<{ path: string; branc
  * - Reuses preferred path when it is already a valid git worktree.
  * - If branch `pipiui/<safeId>` is already checked out in *any* registered worktree
  *   (even when preferred path differs), reuses that path so续作 lands on the same tree.
- * - Process is still a fresh spawn; only cwd/branch continuity is preserved (not LLM context).
+ * - The process is a fresh spawn, but a non-read-only worker resumes its own stored
+ *   conversation (see agentSessionDir), so cwd, branch AND context all continue.
  *
  * Off when:
  * - PIPIUI_WORKTREE=0
@@ -1274,7 +1341,7 @@ function formatSubagentDoneMessage(
 	const title =
 		result.title?.trim() || (result.task.split("\n")[0] ?? "").trim().slice(0, 80) || "(untitled)";
 	const lines = [
-		`[subagent-done] agentId=${result.agentId ?? "?"} name=${result.agent} ok=${ok} verified=${verified} cost=${cost} turns=${result.usage.turns ?? 0}`,
+		`[subagent-done] agentId=${result.agentId ?? "?"} name=${result.agent} ok=${ok} verified=${verified} cost=${cost} turns=${result.usage.turns ?? 0}${result.resumed ? " resumed=true" : ""}`,
 		`Title: ${title}`,
 	];
 	if (verified === "none") {
@@ -1552,7 +1619,32 @@ async function runSingleAgent(
 	const resolvedThinking = resolveAgentThinking(agentName);
 	const mainModelForChild = inheritMainModel(options?.sessionModel);
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	// A worker keeps its conversation across re-dispatches so a vertical slice — implement,
+	// verify, debug, fix, re-verify — is done by someone who remembers writing the code, rather
+	// than by a stranger who re-reads the files and re-derives the same wrong assumption every
+	// round. Read-only roles stay ephemeral: their deliverable is a one-shot report, and stale
+	// context would bias the next one.
+	const sessionDir = READ_ONLY_AGENTS.has(agentName) ? undefined : agentSessionDir();
+	const sessionId = `pipiui-${pipiuiAgentId}`;
+	const resumingSession = Boolean(
+		sessionDir && !options?.fresh && agentSessionExists(sessionDir, sessionId),
+	);
+	if (sessionDir && options?.fresh) {
+		// Explicitly starting over: drop the old conversation rather than resuming a poisoned one.
+		for (const file of agentSessionFiles(sessionDir, sessionId)) {
+			try {
+				fs.rmSync(file);
+			} catch {
+				// Best effort; a leftover file only costs a stale resume the boss asked to avoid.
+			}
+		}
+	}
+	const args: string[] = ["--mode", "json", "-p"];
+	if (sessionDir) {
+		args.push("--session-id", sessionId, "--session-dir", sessionDir);
+	} else {
+		args.push("--no-session");
+	}
 	// Skill libraries are off for every dispatched role, not just plan: a worker that
 	// discovers a process skill on its own turns a scoped brief into someone else's SOP.
 	args.push("--no-skills");
@@ -1599,6 +1691,7 @@ async function runSingleAgent(
 		model: resolvedModel,
 		step,
 		agentId: pipiuiAgentId,
+		...(resumingSession ? { resumed: true } : {}),
 	};
 
 	let pipiuiLastUpdate = 0;
@@ -1928,6 +2021,11 @@ async function runSingleAgent(
 const VERIFY_PARAM_DESCRIPTION =
 	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Boss must fill this for implementation tasks. Omit it for read-only agents (plan/explore/reviewer) — they deliver a report, not files, and the runtime drops any verify they are given.";
 
+const AGENT_ID_DESCRIPTION =
+	"Short semantic name for the worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\". Re-dispatching the same agentId continues that worker with its previous conversation, worktree and branch — use it for one vertical slice (implement, verify, debug, fix, re-verify). Omit for one-off work and a name is generated. Also the target id for action=\"abort\".";
+const FRESH_DESCRIPTION =
+	"Discard this agentId's stored conversation and start it cold. Use when its context went wrong, not routinely.";
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
@@ -1939,6 +2037,8 @@ const TaskItem = Type.Object({
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
+	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
+	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 });
 
 const ChainItem = Type.Object({
@@ -1966,9 +2066,8 @@ const SubagentParams = Type.Object({
 				'Optional action instead of dispatching. "abort": terminate a running background job (requires agentId); the job still reports [subagent-done] with aborted status.',
 		}),
 	),
-	agentId: Type.Optional(
-		Type.String({ description: 'Target background job id for action="abort".' }),
-	),
+	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
+	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	title: Type.Optional(
@@ -2269,6 +2368,23 @@ export default function (pi: ExtensionAPI) {
 			const hasSingle = Boolean(params.agent && params.task);
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 			const isChain = hasChain;
+			// Caller-chosen ids are the addressing scheme for continuing a worker, so a bad one
+			// is reported back to the model to fix rather than silently replaced — a silently
+			// replaced id becomes a different worker with an empty head.
+			for (const candidate of [
+				...(params.action !== "abort" ? [params.agentId] : []),
+				...(params.tasks ?? []).map((t) => t.agentId),
+			]) {
+				if (candidate === undefined) continue;
+				const problem = validateAgentId(candidate.trim());
+				if (problem) {
+					return {
+						content: [{ type: "text", text: problem }],
+						details: makeDetails(isChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+						isError: true,
+					};
+				}
+			}
 			// Default background at boss depth for single/parallel; chain and nested always sync.
 			// While the fan-out layer is on, background is not the caller's to switch off: a boss
 			// that blocks on every dispatch is running a fake fan-out, and the guard has to be
@@ -2323,6 +2439,7 @@ export default function (pi: ExtensionAPI) {
 				mode: "single" | "parallel",
 				title: string | undefined,
 				verify: string | undefined,
+				fresh?: boolean,
 			): void => {
 				void runSingleAgent(
 					ctx.cwd,
@@ -2334,7 +2451,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ background: true, agentId, title, sessionModel, verify },
+					{ background: true, agentId, title, sessionModel, verify, fresh },
 				)
 					.then((result) => {
 						notifySubagentDone(pi, result);
@@ -2523,7 +2640,7 @@ export default function (pi: ExtensionAPI) {
 
 					for (const t of params.tasks) {
 						const agentCfg = agents.find((a) => a.name === t.agent)!;
-						const agentId = generatePipiuiAgentId();
+						const agentId = t.agentId?.trim() || generatePipiuiAgentId();
 						agentIds.push(agentId);
 						startedItems.push({ agentId, name: t.agent, task: t.task, title: t.title });
 						placeholders.push({
@@ -2554,7 +2671,7 @@ export default function (pi: ExtensionAPI) {
 								undefined, // no parent abort binding
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ background: true, agentId, title: t.title, sessionModel, verify: t.verify },
+								{ background: true, agentId, title: t.title, sessionModel, verify: t.verify, fresh: t.fresh },
 							);
 							notifySubagentDone(pi, result);
 							return result;
@@ -2636,7 +2753,7 @@ export default function (pi: ExtensionAPI) {
 						},
 						makeDetails("parallel"),
 
-						{ title: t.title, sessionModel, verify: t.verify },
+						{ title: t.title, sessionModel, verify: t.verify, agentId: t.agentId?.trim(), fresh: t.fresh },
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -2684,8 +2801,8 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					const agentId = generatePipiuiAgentId();
-					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify);
+					const agentId = params.agentId?.trim() || generatePipiuiAgentId();
+					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.fresh);
 					const placeholder: SingleResult = {
 						agent: params.agent,
 						agentId,
@@ -2724,7 +2841,7 @@ export default function (pi: ExtensionAPI) {
 					onUpdate,
 					makeDetails("single"),
 
-					{ title: params.title, sessionModel, verify: params.verify },
+					{ title: params.title, sessionModel, verify: params.verify, agentId: params.agentId?.trim(), fresh: params.fresh },
 				);
 				const isError = isFailedResult(result);
 				if (isError) {
