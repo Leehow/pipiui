@@ -86,6 +86,13 @@ struct PhilosophySection: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            // This layer is not only prompt text: it changes how dispatch actually runs, so
+            // the switch has to say so rather than letting the behaviour change silently.
+            if layer.id == "fanout" {
+                Text("开启时派工强制后台执行，`background:false` 会被运行时忽略（`chain` 不受影响）。")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
         }
         .padding(.leading, layer.requires.isEmpty ? 0 : 18)
         .opacity(enabled ? 1 : 0.5)

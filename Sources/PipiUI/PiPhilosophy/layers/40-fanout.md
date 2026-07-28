@@ -13,6 +13,12 @@ Delegation here is intrinsically concurrent. Workers run in the background, they
 through signals rather than through you watching them, and the wave — not the single task —
 is the unit you plan.
 
+While this layer is active, that is an invariant rather than a preference: the dispatch
+runtime forces background at your depth and ignores any request to wait for a worker inline.
+A boss that blocks on each dispatch is running a fake fan-out — it pays the full cost of
+delegation and collects none of the concurrency. Do not try to serialize a wave by asking for
+a synchronous dispatch; use a dependency chain when steps genuinely must be ordered.
+
 ## Parallel by default
 
 If one user request contains 2+ items with no dependency between them (unrelated file
