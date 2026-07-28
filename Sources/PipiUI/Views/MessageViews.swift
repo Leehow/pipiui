@@ -1439,22 +1439,14 @@ struct FinishedNonTextGroupView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 7) {
-                Image(systemName: fileChanges.files.isEmpty ? "rectangle.stack" : "doc.badge.gearshape")
+                Image(systemName: "rectangle.stack")
                     .foregroundStyle(.secondary)
                     .imageScale(.medium)
-                Text(
-                    fileChanges.files.isEmpty
-                        ? title
-                        : "已编辑 \(fileChanges.files.count) 个文件"
-                )
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(fileChanges.files.isEmpty ? .secondary : .primary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                if !fileChanges.files.isEmpty {
-                    compactChangeCount(fileChanges.additions, color: .green, prefix: "+")
-                    compactChangeCount(fileChanges.deletions, color: .red, prefix: "−")
-                }
+                Text(title)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                 Spacer(minLength: 0)
                 Image(systemName: "arrow.up.right.square")
                     .font(.caption2.weight(.semibold))
@@ -1465,6 +1457,17 @@ struct FinishedNonTextGroupView: View {
 
             if !fileChanges.files.isEmpty {
                 Divider()
+                HStack(spacing: 7) {
+                    Image(systemName: "doc.badge.gearshape")
+                        .foregroundStyle(.secondary)
+                    Text("已编辑 \(fileChanges.files.count) 个文件")
+                        .font(.caption.weight(.semibold))
+                    compactChangeCount(fileChanges.additions, color: .green, prefix: "+")
+                    compactChangeCount(fileChanges.deletions, color: .red, prefix: "−")
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
                 ForEach(fileChanges.files) { file in
                     HStack(spacing: 8) {
                         Text(file.displayPath)
@@ -1524,6 +1527,7 @@ struct FinishedNonTextGroupDetailView: View {
     var onSelectAgent: ((String) -> Void)?
     @Environment(\.dismiss) private var dismiss
     @State private var selectedFileID: String?
+    @State private var selectedOperationID: String?
 
     private var title: String {
         AssistantBlockLayout.summaryTitle(for: presentation.blocks)
@@ -1574,6 +1578,7 @@ struct FinishedNonTextGroupDetailView: View {
                                 ForEach(fileChanges.files) { file in
                                     Button {
                                         selectedFileID = file.id
+                                        selectedOperationID = nil
                                     } label: {
                                         HStack(spacing: 8) {
                                             Image(systemName: "doc.text")
@@ -1631,7 +1636,11 @@ struct FinishedNonTextGroupDetailView: View {
 
                 if let selectedFile {
                     Divider()
-                    FileChangeDiffInspector(file: selectedFile)
+                    FileChangeDiffInspector(
+                        file: selectedFile,
+                        targetOperationID: selectedOperationID
+                    )
+                        .id(selectedFile.id)
                         .frame(minWidth: 480, idealWidth: 560)
                 }
             }
@@ -1699,7 +1708,10 @@ struct FinishedNonTextGroupDetailView: View {
 
     private func selectionAction(for callID: String) -> (() -> Void)? {
         guard let file = fileChanges.file(forCallID: callID) else { return nil }
-        return { selectedFileID = file.id }
+        return {
+            selectedFileID = file.id
+            selectedOperationID = callID
+        }
     }
 
     private func agentsFor(_ call: ToolCallBlock) -> [SubagentInfo] {
@@ -1722,6 +1734,7 @@ struct FinishedNonTextGroupDetailView: View {
 
 private struct FileChangeDiffInspector: View {
     let file: FileChangeFilePresentation
+    let targetOperationID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1748,35 +1761,122 @@ private struct FileChangeDiffInspector: View {
 
             Divider()
 
-            ScrollView([.horizontal, .vertical]) {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(file.lines) { line in
-                        HStack(alignment: .firstTextBaseline, spacing: 0) {
-                            Text(line.oldLineNumber.map(String.init) ?? "")
-                                .frame(width: 38, alignment: .trailing)
-                            Text(line.newLineNumber.map(String.init) ?? "")
-                                .frame(width: 38, alignment: .trailing)
-                            Text(marker(for: line.kind))
-                                .frame(width: 22, alignment: .center)
-                            Text(line.text.isEmpty ? " " : line.text)
-                                .fixedSize(horizontal: true, vertical: false)
+            ScrollViewReader { proxy in
+                ScrollView([.horizontal, .vertical]) {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(Array(file.operations.enumerated()), id: \.element.id) { index, operation in
+                            VStack(alignment: .leading, spacing: 0) {
+                                HStack(spacing: 8) {
+                                    Text(operationTitle(operation, at: index))
+                                        .font(.caption.monospaced().weight(.semibold))
+                                    Text("+\(operation.additions)")
+                                        .foregroundStyle(.green)
+                                    Text("−\(operation.deletions)")
+                                        .foregroundStyle(.red)
+                                    Spacer(minLength: 8)
+                                }
+                                .font(.caption.monospacedDigit().weight(.medium))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(
+                                    targetOperationID == operation.id
+                                        ? Color.accentColor.opacity(0.14)
+                                        : Color.primary.opacity(0.045)
+                                )
+                                .accessibilityElement(children: .combine)
+                                .accessibilityLabel(
+                                    "\(operationTitle(operation, at: index))，新增 \(operation.additions) 行，删除 \(operation.deletions) 行"
+                                )
+
+                                if let qualityMessage = operation.qualityMessage {
+                                    Label(qualityMessage, systemImage: "info.circle")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .accessibilityLabel(qualityMessage)
+                                }
+
+                                if operation.lines.isEmpty {
+                                    Text("没有行级变化")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .padding(10)
+                                } else {
+                                    ForEach(operation.lines) { line in
+                                        diffLine(line)
+                                    }
+                                }
+                            }
+                            .id(operation.id)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .strokeBorder(
+                                        targetOperationID == operation.id
+                                            ? Color.accentColor.opacity(0.55)
+                                            : Color.primary.opacity(0.08)
+                                    )
+                            )
                         }
-                        .font(.caption.monospaced())
-                        .foregroundStyle(foreground(for: line.kind))
-                        .padding(.vertical, 1)
-                        .padding(.trailing, 12)
-                        .background(background(for: line.kind))
-                        .accessibilityElement(children: .combine)
-                        .accessibilityLabel(accessibilityLabel(for: line))
                     }
+                    .padding(12)
+                    .frame(minWidth: 460, alignment: .leading)
                 }
-                .frame(minWidth: 460, alignment: .leading)
+                .onAppear {
+                    scrollToTarget(proxy)
+                }
+                .onChange(of: targetOperationID) { _, _ in
+                    scrollToTarget(proxy)
+                }
             }
             .textSelection(.enabled)
         }
         .background(Color(nsColor: .textBackgroundColor))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("文件差异 \(file.displayPath)")
+    }
+
+    private func operationTitle(
+        _ operation: FileChangeOperationPresentation,
+        at index: Int
+    ) -> String {
+        let matching = file.operations.filter { $0.toolName == operation.toolName }
+        let ordinal = file.operations.prefix(index + 1)
+            .filter { $0.toolName == operation.toolName }
+            .count
+        if operation.toolName == "edit" || matching.count > 1 {
+            return "\(operation.toolName) \(ordinal)"
+        }
+        return operation.toolName
+    }
+
+    private func scrollToTarget(_ proxy: ScrollViewProxy) {
+        guard let scrollID = targetOperationID ?? file.operations.first?.id else { return }
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.18)) {
+                proxy.scrollTo(scrollID, anchor: .top)
+            }
+        }
+    }
+
+    private func diffLine(_ line: FileChangeDiffLine) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
+            Text(line.oldLineNumber.map(String.init) ?? "")
+                .frame(width: 38, alignment: .trailing)
+            Text(line.newLineNumber.map(String.init) ?? "")
+                .frame(width: 38, alignment: .trailing)
+            Text(marker(for: line.kind))
+                .frame(width: 22, alignment: .center)
+            Text(line.text.isEmpty ? " " : line.text)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .font(.caption.monospaced())
+        .foregroundStyle(foreground(for: line.kind))
+        .padding(.vertical, 1)
+        .padding(.trailing, 12)
+        .background(background(for: line.kind))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel(for: line))
     }
 
     private func marker(for kind: FileChangeDiffLine.Kind) -> String {

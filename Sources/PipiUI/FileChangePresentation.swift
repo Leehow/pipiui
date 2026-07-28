@@ -95,6 +95,18 @@ struct FileChangeFilePresentation: Equatable, Identifiable {
     let deletions: Int
     let lines: [FileChangeDiffLine]
     let qualityMessage: String?
+    let operations: [FileChangeOperationPresentation]
+}
+
+struct FileChangeOperationPresentation: Equatable, Identifiable {
+    /// Stable tool-call id, also used as the inspector scroll target.
+    let id: String
+    let toolName: String
+    let path: String
+    let additions: Int
+    let deletions: Int
+    let lines: [FileChangeDiffLine]
+    let qualityMessage: String?
 }
 
 struct FileChangeGroupPresentation: Equatable {
@@ -128,6 +140,7 @@ struct FileChangeGroupPresentation: Equatable {
             var isTruncated = false
             var usesOperationAccounting = false
             var knownWrittenContent: String?
+            var operations: [FileChangeOperationPresentation] = []
         }
 
         var order: [String] = []
@@ -151,6 +164,9 @@ struct FileChangeGroupPresentation: Equatable {
             }
             guard var accumulator = accumulators[normalized] else { continue }
             accumulator.callIDs.append(call.id)
+            accumulator.operations.append(
+                operationPresentation(call: call, payload: payload)
+            )
 
             switch payload {
             case .write(_, let content, let isTruncated):
@@ -237,10 +253,71 @@ struct FileChangeGroupPresentation: Equatable {
                 additions: accumulator.additions,
                 deletions: accumulator.deletions,
                 lines: renderedLines,
-                qualityMessage: quality
+                qualityMessage: quality,
+                operations: accumulator.operations
             )
         }
         return FileChangeGroupPresentation(files: files)
+    }
+
+    private static func operationPresentation(
+        call: ToolCallBlock,
+        payload: FileChangePayload
+    ) -> FileChangeOperationPresentation {
+        let path = payload.path
+        switch payload {
+        case .write(_, let content, let isTruncated):
+            let allLines = writtenContentLines(content, callID: call.id)
+            let renderedLines = Array(allLines.prefix(renderedLineLimit))
+            var qualityParts = ["显示写入内容；缺少写入前版本"]
+            if isTruncated || renderedLines.count < allLines.count {
+                qualityParts.append("变更内容过长，以下差异已截断")
+            }
+            return FileChangeOperationPresentation(
+                id: call.id,
+                toolName: call.name,
+                path: path,
+                additions: logicalLines(content).count,
+                deletions: 0,
+                lines: renderedLines,
+                qualityMessage: qualityParts.joined(separator: "；")
+            )
+        case .edit(_, let replacements, let isTruncated):
+            var allLines: [FileChangeDiffLine] = []
+            var additions = 0
+            var deletions = 0
+            var usedFallback = false
+            for (replacementIndex, replacement) in replacements.enumerated() {
+                let diff = lineDiff(
+                    oldText: replacement.oldText,
+                    newText: replacement.newText,
+                    idPrefix: "\(call.id):operation:\(replacementIndex)"
+                )
+                allLines.append(contentsOf: diff.lines)
+                additions += diff.additions
+                deletions += diff.deletions
+                usedFallback = usedFallback || diff.usedOperationFallback
+            }
+            let renderedLines = Array(allLines.prefix(renderedLineLimit))
+            var qualityParts: [String] = []
+            if usedFallback {
+                qualityParts.append("部分变更按操作行统计，可能包含未变行")
+            }
+            if isTruncated || renderedLines.count < allLines.count {
+                qualityParts.append("变更内容过长，以下差异已截断")
+            }
+            return FileChangeOperationPresentation(
+                id: call.id,
+                toolName: call.name,
+                path: path,
+                additions: additions,
+                deletions: deletions,
+                lines: renderedLines,
+                qualityMessage: qualityParts.isEmpty
+                    ? nil
+                    : qualityParts.joined(separator: "；")
+            )
+        }
     }
 
     private struct LineDiffResult {

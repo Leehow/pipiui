@@ -143,6 +143,99 @@ final class FileChangePresentationTests: XCTestCase {
         )
     }
 
+    func testWriteAndRepeatedEditsRetainChronologicalOperations() {
+        let writeCall = write(id: "write-1", path: "a.txt", content: "a\nb\n")
+        let editOne = ToolCallBlock(
+            id: "edit-1",
+            name: "edit",
+            argsSummary: "a.txt",
+            fileChangePayload: .edit(
+                path: "a.txt",
+                replacements: [.init(oldText: "b", newText: "B")],
+                isTruncated: false
+            )
+        )
+        let editTwo = ToolCallBlock(
+            id: "edit-2",
+            name: "edit",
+            argsSummary: "a.txt",
+            fileChangePayload: .edit(
+                path: "a.txt",
+                replacements: [.init(oldText: "B", newText: "B\nc")],
+                isTruncated: false
+            )
+        )
+        let result = FileChangeGroupPresentation.make(
+            blocks: [
+                .toolCall(writeCall),
+                .toolCall(editOne),
+                .toolCall(editTwo),
+            ],
+            toolRuns: [
+                "write-1": ToolRun(),
+                "edit-1": ToolRun(),
+                "edit-2": ToolRun(),
+            ],
+            projectURL: nil
+        )
+
+        XCTAssertEqual(result.files.count, 1)
+        XCTAssertEqual(
+            result.files[0].operations.map(\.id),
+            ["write-1", "edit-1", "edit-2"]
+        )
+        XCTAssertEqual(
+            result.files[0].operations.map(\.toolName),
+            ["write", "edit", "edit"]
+        )
+        XCTAssertEqual(result.additions, 3)
+        XCTAssertEqual(result.deletions, 0)
+        XCTAssertEqual(result.files[0].lines.map(\.text), ["a", "B", "c"])
+    }
+
+    func testFailedOperationIsAbsentBetweenSuccessfulOperations() {
+        let writeCall = write(id: "write", path: "a.txt", content: "a\nb\n")
+        let failedEdit = ToolCallBlock(
+            id: "failed-edit",
+            name: "edit",
+            argsSummary: "a.txt",
+            fileChangePayload: .edit(
+                path: "a.txt",
+                replacements: [.init(oldText: "a", newText: "bad")],
+                isTruncated: false
+            )
+        )
+        let successfulEdit = ToolCallBlock(
+            id: "successful-edit",
+            name: "edit",
+            argsSummary: "a.txt",
+            fileChangePayload: .edit(
+                path: "a.txt",
+                replacements: [.init(oldText: "b", newText: "B")],
+                isTruncated: false
+            )
+        )
+        let result = FileChangeGroupPresentation.make(
+            blocks: [
+                .toolCall(writeCall),
+                .toolCall(failedEdit),
+                .toolCall(successfulEdit),
+            ],
+            toolRuns: [
+                "write": ToolRun(),
+                "failed-edit": ToolRun(isError: true),
+                "successful-edit": ToolRun(),
+            ],
+            projectURL: nil
+        )
+
+        XCTAssertEqual(
+            result.files[0].operations.map(\.id),
+            ["write", "successful-edit"]
+        )
+        XCTAssertEqual(result.files[0].lines.map(\.text), ["a", "B"])
+    }
+
     func testRepeatedEditBlocksWithSharedLinesHaveDeterministicTotals() {
         func edit(_ id: String, old: String, new: String) -> ChatBlock {
             .toolCall(ToolCallBlock(

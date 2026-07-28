@@ -75,6 +75,19 @@ final class SubagentContinuityTests: XCTestCase {
                       "synchronous single must honour the caller's name")
     }
 
+    /// The registry is memory in one process, so a restarted session forgets every worker it
+    /// dispatched while their conversations are still on disk. Status has to see those, or the
+    /// boss cannot establish state after a crash and will restart workers that never failed.
+    func testStatusSurfacesWorkersResumableFromDisk() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains("function resumableAgentIds()"))
+        XCTAssertTrue(s.contains(#"/_pipiui-(.+)\.jsonl$/"#), "must map session filenames back to agent ids")
+        XCTAssertTrue(s.contains(#"jobRegistry.get(id)?.state !== "running""#),
+                      "a live worker is not a resumable one")
+        XCTAssertTrue(s.contains("Resumable workers (stored context, not running)"))
+        XCTAssertTrue(s.contains("This is an interruption, not a failure"))
+    }
+
     /// The philosophy has to teach the boss to use the mechanism, or nobody names anything.
     func testOrchestrationLayerTeachesNamedVerticalSlices() throws {
         let t = try PhilosophyLayerFixture.normalizedBody("orchestration")
@@ -83,5 +96,8 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertTrue(t.contains("implement → verify → diagnose the failure → fix → re-verify"))
         XCTAssertTrue(t.contains("two-attempts rule outranks continuity"))
         XCTAssertTrue(t.contains("Read-only roles (plan / explore / reviewer) are always cold"))
+        XCTAssertTrue(t.contains("An interruption is not a failure"))
+        XCTAssertTrue(t.contains("a *failed* worker produced a wrong answer; an *interrupted* one produced no answer yet"))
+        XCTAssertTrue(t.contains("establish state rather than guessing"))
     }
 }

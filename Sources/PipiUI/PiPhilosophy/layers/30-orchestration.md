@@ -104,6 +104,16 @@ branch. It remembers writing the code — which is exactly who you want debuggin
   two-attempts rule outranks continuity; a poisoned context is worth throwing away.
 - Read-only roles (plan / explore / reviewer) are always cold by design. Their deliverable is
   a one-shot report, and yesterday's context would only bias it.
+- **An interruption is not a failure.** A worker that was aborted, stalled out, or died with
+  its process made no wrong decision — it was cut off mid-thought, and everything it had
+  worked out is still on disk. Continue it by name. Restarting it cold is throwing away good
+  context, and it is the same mistake as sending a fresh worker to debug someone else's code.
+  Judge the two apart: a *failed* worker produced a wrong answer; an *interrupted* one
+  produced no answer yet.
+- Before deciding, establish state rather than guessing: ask for status. It reports both the
+  workers running now and the ones that are merely stopped with their context intact. That
+  list survives a restart of your own session, so a crash costs you the running processes, not
+  what they knew.
 - `resumed=true` in a done header means that worker continued; its absence on a name you
   meant to continue is a signal you typed the name wrong.
 
