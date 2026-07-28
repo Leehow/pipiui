@@ -79,9 +79,33 @@ vague.
   re-dispatch a read-only worker to make a shell command pass.
 - Always pass a `title`: one short line (≤20 chars) naming the job. Panels and status
   listings show it instead of the whole brief.
+- Name the worker, not just the task. Pass a short `agentId` you choose — `quota-pill`,
+  `auth-refactor` — because that name is how you continue with the same worker later. A long
+  generated id is one you will retype wrong, and a mistyped id is silently a different worker
+  with an empty head.
 - Decide shared architecture before dispatching, not inside each worker.
 - A brief is the worker's plan. If a brief is complete enough to dispatch, no separate plan
   artifact is needed.
+
+## One worker per vertical slice
+
+A worker you re-dispatch by the same `agentId` keeps its conversation, its worktree and its
+branch. It remembers writing the code — which is exactly who you want debugging it.
+
+- Keep one named worker for a whole vertical slice: implement → verify → diagnose the failure
+  → fix → re-verify. Handing round two to a fresh worker pays a cold start, re-reads the same
+  files, and re-derives the same wrong assumption.
+- `verified=fail` is the clearest case: re-dispatch that same `agentId` rather than opening a
+  new worker that starts from zero.
+- Start a new name for genuinely new work: a different area, a different goal, work whose
+  context has nothing to do with the last slice.
+- Start a new name — or pass `fresh` — when the worker's context is the problem: it has been
+  wrong twice the same way, it is arguing with itself, or the slice was abandoned. The
+  two-attempts rule outranks continuity; a poisoned context is worth throwing away.
+- Read-only roles (plan / explore / reviewer) are always cold by design. Their deliverable is
+  a one-shot report, and yesterday's context would only bias it.
+- `resumed=true` in a done header means that worker continued; its absence on a name you
+  meant to continue is a signal you typed the name wrong.
 
 ## Verification and supervision
 

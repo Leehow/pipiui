@@ -66,7 +66,12 @@ final class ComputerUsePresentationTests: XCTestCase {
         let coordinator = ComputerCoordinator(computerUseEnabledProvider: { true })
         let controller = ComputerUseWindowPresentation()
         let originalContent = NSView(frame: NSRect(x: 0, y: 0, width: 1000, height: 700))
-        let window = NSWindow(
+        // A test-only window substitute intercepts every AppKit fronting call.
+        // The production presentMiniWindow() still calls orderFrontRegardless()
+        // (verified via orderFrontRegardlessCallCount below), but the dynamic
+        // dispatch lands here as a no-op so the fixture never reaches the
+        // real desktop.
+        let window = NonOrderingTestWindow(
             contentRect: originalContent.frame,
             styleMask: [.titled, .resizable],
             backing: .buffered,
@@ -110,6 +115,13 @@ final class ComputerUsePresentationTests: XCTestCase {
         )
         XCTAssertTrue(window.collectionBehavior.contains(.canJoinAllSpaces))
 
+        // The mini-mode fronting path was reached exactly once, yet the
+        // substitute kept the window off-screen — the fixture must never
+        // become visible during the test.
+        XCTAssertEqual(window.orderFrontRegardlessCallCount, 1)
+        XCTAssertEqual(window.orderFrontCallCount, 0)
+        XCTAssertFalse(window.isVisible)
+
         // SwiftUI dismantles the attachment as a consequence of the deliberate
         // content swap. This must not immediately undo mini mode.
         controller.attach(to: nil)
@@ -128,5 +140,26 @@ final class ComputerUsePresentationTests: XCTestCase {
         XCTAssertFalse(window.titlebarAppearsTransparent)
         XCTAssertTrue(window.toolbar?.isVisible ?? false)
         XCTAssertFalse(window.standardWindowButton(.closeButton)?.isHidden ?? true)
+
+        // Restoration must not surface the window either.
+        XCTAssertEqual(window.orderFrontRegardlessCallCount, 1)
+        XCTAssertFalse(window.isVisible)
+    }
+}
+
+/// Test-only `NSWindow` substitute that neutralizes AppKit's window-fronting
+/// entry points. It records invocations instead of ordering the window front,
+/// so tests can prove the production fronting code path ran without ever
+/// putting the fixture on the real desktop.
+private final class NonOrderingTestWindow: NSWindow {
+    var orderFrontRegardlessCallCount = 0
+    var orderFrontCallCount = 0
+
+    override func orderFrontRegardless() {
+        orderFrontRegardlessCallCount += 1
+    }
+
+    override func orderFront(_ sender: Any?) {
+        orderFrontCallCount += 1
     }
 }
