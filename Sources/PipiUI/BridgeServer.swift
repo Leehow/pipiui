@@ -265,10 +265,20 @@ final class BridgeServer {
         DispatchQueue.main.async { [authorize, handler] in
             if let authorize, !authorize(json) {
                 self.queue.async {
+                    let action = json["action"].string ?? ""
+                    let response: [String: Any] =
+                        ComputerRuntimeContract.operations.contains(action)
+                        ? ComputerRuntimeContract.failure(
+                            code: "unauthorized_session_capability",
+                            message: "unauthorized bridge capability",
+                            retryable: false,
+                            requiresObservation: false
+                        )
+                        : ["ok": false, "error": "unauthorized bridge capability"]
                     self.reply(
                         connection,
                         lifecycle: lifecycle,
-                        ["ok": false, "error": "unauthorized bridge capability"]
+                        response
                     )
                 }
                 return

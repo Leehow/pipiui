@@ -790,8 +790,8 @@ final class ChatSession: ObservableObject, Identifiable {
         }
         if let codexServerToolsExtension { args += ["-e", codexServerToolsExtension] }
         if let claudeServerToolsExtension { args += ["-e", claudeServerToolsExtension] }
-        // Independent opt-in: when disabled the extension is not mounted at all, so the
-        // `computer` tool does not exist and contributes zero tool-prefix cost.
+        // Independent opt-in: mount exactly one selected strategy. External selection
+        // suppresses the built-in strategy, so Pi never sees duplicate desktop tools.
         if computerCaptureDescriptor != nil, let computerUseExtension {
             args += ["-e", computerUseExtension]
         }
@@ -819,6 +819,10 @@ final class ChatSession: ObservableObject, Identifiable {
                computerUseExtension != nil {
                 extraEnv["PIPIUI_COMPUTER_EXT"] = computerUseExtension
                 extraEnv["PIPIUI_COMPUTER_CAPABILITY"] = computerRoutingKey
+                extraEnv["PIPIUI_COMPUTER_RUNTIME_PROTOCOL"] =
+                    String(ComputerRuntimeContract.version)
+                // The built-in Anthropic provider hook needs synchronous typed-tool
+                // dimensions. Runtime v1 negotiation remains authoritative.
                 extraEnv["PIPIUI_COMPUTER_DISPLAY_ID"] =
                     String(descriptor.displayID)
                 extraEnv["PIPIUI_COMPUTER_WIDTH"] =

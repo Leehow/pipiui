@@ -25,6 +25,10 @@ test("globally enabled subagent Pi loads both desktop tools", async () => {
     chatSession,
     /extraEnv\["PIPIUI_COMPUTER_EXT"\]\s*=\s*computerUseExtension/,
   );
+  assert.match(
+    chatSession,
+    /extraEnv\["PIPIUI_COMPUTER_RUNTIME_PROTOCOL"\]\s*=/,
+  );
   assert.match(subagent, /args\.push\("-e", PIPIUI_COMPUTER_EXT\)/);
   assert.match(subagent, /resolveSubagentToolSelection\(\{/);
   assert.match(subagent, /sanitizeDisabledToolNames\(out\)/);
@@ -93,5 +97,33 @@ test("desktop capability reaches only the dispatched Pi child", async () => {
   assert.ok(
     helperCalls.length >= 4,
     "expected helper definition, verifier/git calls, and dispatched Pi call",
+  );
+});
+
+test("selected strategy path and runtime capabilities reach nested Pi without duplicate mounting", async () => {
+  const [subagent, chatSession] = await Promise.all([
+    readFile(subagentURL, "utf8"),
+    readFile(chatSessionURL, "utf8"),
+  ]);
+  const topLevelMounts = chatSession.match(
+    /args \+= \["-e", computerUseExtension\]/g,
+  ) ?? [];
+  const nestedMounts = subagent.match(
+    /args\.push\("-e", PIPIUI_COMPUTER_EXT\)/g,
+  ) ?? [];
+  assert.equal(topLevelMounts.length, 1);
+  assert.equal(nestedMounts.length, 1);
+  assert.match(
+    chatSession,
+    /extraEnv\["PIPIUI_COMPUTER_CAPABILITY"\]\s*=\s*computerRoutingKey/,
+  );
+  assert.match(
+    subagent,
+    /PIPIUI_COMPUTER_EXT && process\.env\.PIPIUI_COMPUTER_CAPABILITY/,
+  );
+  assert.match(
+    chatSession,
+    /PIPIUI_COMPUTER_DISPLAY_ID/,
+    "built-in synchronous provider adaptation keeps its descriptor hint",
   );
 });

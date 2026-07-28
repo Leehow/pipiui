@@ -1,5 +1,8 @@
 # PipiUI Computer Use
 
+可替换策略与公开 Runtime API 见
+[`computer-runtime-v1.md`](./computer-runtime-v1.md)。
+
 状态（2026-07-27）：Cua Driver 集成、工具协议、精确目标、坐标变换、取消路径和自动测试已实现。真实打包 App 的 TCC 归属、TextEdit/Finder/Xcode/Simulator 操作仍须在主 checkout 手工验收，不能由 `swift test` 代替。
 
 ## 架构
