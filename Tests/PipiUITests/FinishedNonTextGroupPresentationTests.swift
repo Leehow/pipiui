@@ -124,7 +124,9 @@ final class FinishedNonTextGroupPresentationTests: XCTestCase {
 
         XCTAssertTrue(summary.contains("onOpen?(presentation)"))
         XCTAssertTrue(summary.contains("ForEach(fileChanges.files)"))
+        XCTAssertTrue(summary.contains("Text(title)"))
         XCTAssertTrue(summary.contains("已编辑"))
+        XCTAssertFalse(summary.contains("? title"))
         XCTAssertFalse(summary.contains("ScrollView"))
         XCTAssertFalse(summary.contains("@State private var expanded"))
         XCTAssertFalse(summary.contains("if expanded"))
@@ -138,13 +140,20 @@ final class FinishedNonTextGroupPresentationTests: XCTestCase {
             in: source
         )
 
-        XCTAssertEqual(detail.components(separatedBy: "ScrollView").count - 1, 2)
+        XCTAssertEqual(detail.components(separatedBy: "ScrollView {").count - 1, 1)
+        XCTAssertEqual(detail.components(separatedBy: "ScrollView([").count - 1, 1)
+        XCTAssertTrue(detail.contains("ScrollViewReader"))
         XCTAssertTrue(detail.contains("ForEach(presentation.members)"))
         XCTAssertTrue(detail.contains("LazyVStack"))
         XCTAssertTrue(detail.contains("ThinkingBlockView(text: text, isStreaming: false)"))
         XCTAssertTrue(detail.contains("ToolCardView("))
         XCTAssertTrue(detail.contains("FileChangeDiffInspector"))
         XCTAssertTrue(detail.contains("selectedFileID"))
+        XCTAssertTrue(detail.contains("selectedOperationID = callID"))
+        XCTAssertTrue(detail.contains("selectedOperationID = nil"))
+        XCTAssertTrue(detail.contains("targetOperationID: selectedOperationID"))
+        XCTAssertTrue(detail.contains("targetOperationID ?? file.operations.first?.id"))
+        XCTAssertTrue(detail.contains("ForEach(Array(file.operations.enumerated())"))
         XCTAssertTrue(detail.contains("已编辑"))
 
         let thinking = try section(

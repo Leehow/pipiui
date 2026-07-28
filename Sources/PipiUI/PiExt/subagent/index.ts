@@ -918,11 +918,54 @@ function formatElapsedMs(ms: number): string {
 	return `${h}h${rm}m`;
 }
 
+/**
+ * Workers whose conversation survives on disk without a live job entry.
+ *
+ * The registry is memory in one process, so a restarted main session forgets every worker it
+ * dispatched — while their stored conversations are still sitting there. An interrupted worker
+ * is not a failed one: it was cut off mid-thought, and restarting it from zero throws away
+ * context that is still perfectly good. This is what lets the boss find those again.
+ */
+function resumableAgentIds(): string[] {
+	const dir = PIPIUI_MAIN_CWD
+		? path.join(PIPIUI_MAIN_CWD, ".pi", "agent-sessions")
+		: undefined;
+	if (!dir) return [];
+	try {
+		return fs
+			.readdirSync(dir)
+			.map((f) => /_pipiui-(.+)\.jsonl$/.exec(f)?.[1])
+			.filter((id): id is string => Boolean(id))
+			.filter((id) => jobRegistry.get(id)?.state !== "running")
+			.sort();
+	} catch {
+		return [];
+	}
+}
+
+function formatResumableSection(exclude: Set<string>): string[] {
+	const ids = resumableAgentIds().filter((id) => !exclude.has(id));
+	if (ids.length === 0) return [];
+	return [
+		"",
+		`Resumable workers (stored context, not running): ${ids.join(", ")}`,
+		"Re-dispatch one by its agentId to continue with everything it already knows; pass fresh only to throw that context away.",
+	];
+}
+
 function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?: boolean }): string {
 	const now = Date.now();
 	if (opts.agentId) {
 		const job = jobRegistry.get(opts.agentId);
 		if (!job) {
+			const resumable = resumableAgentIds().includes(opts.agentId);
+			if (resumable) {
+				return [
+					`agentId: ${opts.agentId}`,
+					"state: not running in this process, but its stored conversation is intact.",
+					"This is an interruption, not a failure — re-dispatch this same agentId to continue where it left off.",
+				].join("\n");
+			}
 			return `No job found for agentId=${opts.agentId}. Use subagent_status without agentId to list recent jobs.`;
 		}
 		const elapsed =
@@ -961,9 +1004,11 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 	let jobs = [...jobRegistry.values()];
 	if (opts.onlyRunning) jobs = jobs.filter((j) => j.state === "running");
 	if (jobs.length === 0) {
-		return opts.onlyRunning
+		const head = opts.onlyRunning
 			? "No running subagent jobs."
 			: "No subagent jobs recorded in this process.";
+		// A restarted main session has an empty registry while stored conversations remain.
+		return opts.onlyRunning ? head : [head, ...formatResumableSection(new Set())].join("\n");
 	}
 
 	// running first, then newest endedAt/startedAt
@@ -992,7 +1037,9 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 		const preview = previewRaw.replace(/\s+/g, " ").trim().slice(0, 80);
 		return `| ${j.agentId} | ${j.name} | ${formatJobStateWithStall(j, now)} | ${turns} | ${cost} | ${elapsed} | ${preview || "-"} |`;
 	});
-	return [header, sep, ...rows].join("\n");
+	return [header, sep, ...rows, ...formatResumableSection(new Set(jobs.map((j) => j.agentId)))].join(
+		"\n",
+	);
 }
 
 function generatePipiuiAgentId(): string {
@@ -2297,7 +2344,8 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_status",
 		label: "Subagent Status",
 		description: [
-			"Query subagent job status in this session process (running / ok / failed / aborted).",
+			"Query subagent job status (running / ok / failed / aborted), plus workers that are stopped but still hold their stored context.",
+			"An interrupted worker is not a failed one: re-dispatch its agentId to continue where it left off instead of starting someone cold.",
 			"Use when deciding next action, when the user asks for progress, or before re-dispatching.",
 			"Prefer reading finished results via this tool or [subagent-done] over spawning a new agent for the same work.",
 			"Do not busy-loop poll; one check per decision is correct.",
