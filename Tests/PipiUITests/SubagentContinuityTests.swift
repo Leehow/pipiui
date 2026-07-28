@@ -88,6 +88,21 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertTrue(s.contains("This is an interruption, not a failure"))
     }
 
+    /// Stored conversations are the whole point of naming a worker, so retention leans toward
+    /// keeping them: age is the only "finished" signal trusted, because a merged slice is often
+    /// continued the next day. The count cap only stops unbounded growth.
+    func testSessionRetentionIsConservativeAndNeverTouchesRunningWorkers() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains("const SESSION_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;"))
+        XCTAssertTrue(s.contains("const SESSION_MAX_KEEP = 50;"))
+        XCTAssertTrue(s.contains("function selectStaleSessions("), "the rule must be pure and testable")
+        XCTAssertTrue(s.contains("entries.filter((e) => !opts.running.has(e.agentId))"),
+                      "a running worker's conversation must never be a deletion candidate")
+        XCTAssertTrue(s.contains("if (prunedThisProcess) return;"), "housekeeping runs once, not per dispatch")
+        // Cleanup must never be able to fail a dispatch.
+        XCTAssertTrue(s.contains("// A file we cannot remove only costs disk; never fail a dispatch over housekeeping."))
+    }
+
     /// The philosophy has to teach the boss to use the mechanism, or nobody names anything.
     func testOrchestrationLayerTeachesNamedVerticalSlices() throws {
         let t = try PhilosophyLayerFixture.normalizedBody("orchestration")
