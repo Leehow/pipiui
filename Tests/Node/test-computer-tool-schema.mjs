@@ -62,6 +62,7 @@ test("computer coordinate schema is xAI-compatible in the existing custom provid
 import install, {
   compactAccessibility,
   compactToolDetails,
+  lifecycleShellBlockReason,
   screenshotToolResult,
 } from "./extension.ts";
 
@@ -105,20 +106,61 @@ const compactDetails = compactToolDetails({
   accessibility: compactAX,
 });
 const modelResult = screenshotToolResult(
-  { base64: "png-base64", mimeType: "image/png" },
+  {
+    base64: "png-base64",
+    mimeType: "image/png",
+    screenshotId: "bridge-aligned-id",
+  },
   {
     batchOK: true,
     outcomes: [{ index: 0, ok: true }],
     accessibility: compactAX,
   },
 );
+let modelResultFallbackError = null;
+try {
+  screenshotToolResult(
+    { base64: "png-base64-2", mimeType: "image/png" },
+    { batchOK: true },
+  );
+} catch (error) {
+  modelResultFallbackError = String(error?.message || error);
+}
 process.stdout.write(JSON.stringify({
   schema: computer.parameters,
+  openApplicationSchema: tools.get("open_application")?.parameters,
   computerDescription: computer.description,
   openApplicationDescription: tools.get("open_application")?.description,
+  blockedShellOpenShapes: [
+    "/usr/bin/open /Users/me/Downloads",
+    "exec /usr/bin/open /Users/me/Downloads",
+    "env /usr/bin/open /Users/me/Downloads",
+    "\\"/usr/bin/open\\" /Users/me/Downloads",
+    "command open /Users/me/Downloads",
+    "sh -c '/usr/bin/open /Users/me/Downloads'",
+    "/bin/zsh -c 'exec open /Users/me/Downloads'",
+    "/usr/bin/env /usr/bin/open /Users/me/Downloads",
+    "env -u FOO /usr/bin/open /Users/me/Downloads",
+    "command -p /usr/bin/open /Users/me/Downloads",
+    "exec -- /usr/bin/open /Users/me/Downloads",
+    "bash -lc '/usr/bin/open /Users/me/Downloads'",
+    "VAR=x /usr/bin/open /Users/me/Downloads",
+  ].map((command) =>
+    lifecycleShellBlockReason("bash", { command })
+  ),
+  allowedLifecycleShellShapes: [
+    "pgrep -x Finder",
+    "osascript -e 'tell application \\"Finder\\" to quit'",
+    "swift test",
+    "echo /usr/bin/open is blocked only in command position",
+    "tool --open file",
+  ].map((command) =>
+    lifecycleShellBlockReason("bash", { command })
+  ),
   compactAX,
   compactDetails,
   modelResult,
+  modelResultFallbackError,
   payload,
   providerPassedThrough: providerResult === undefined,
 }));
@@ -181,15 +223,57 @@ process.stdout.write(JSON.stringify({
     );
     assert.match(
       result.openApplicationDescription,
-      /running-state checks or graceful quit/,
+      /Cmd-Shift-G/,
     );
-    assert.match(
-      result.openApplicationDescription,
-      /Do not default to force quit or kill -9/,
+    assert.equal(
+      "path" in result.openApplicationSchema.properties,
+      false,
+    );
+    assert.equal(
+      "url" in result.openApplicationSchema.properties,
+      false,
+    );
+    assert.equal(
+      result.blockedShellOpenShapes.every(
+        (reason) => /Do not use shell open/.test(reason),
+      ),
+      true,
+    );
+    assert.deepEqual(
+      result.allowedLifecycleShellShapes,
+      [null, null, null, null, null],
     );
     assert.match(
       result.computerDescription,
       /Routing priority: deterministic app lifecycle first/,
+    );
+    assert.match(
+      result.computerDescription,
+      /running-state checks and graceful quit/,
+    );
+    assert.match(
+      result.computerDescription,
+      /do not default to force quit or kill -9/,
+    );
+    assert.match(
+      result.computerDescription,
+      /Prefer the browser tool for ordinary web tasks/,
+    );
+    assert.match(
+      result.computerDescription,
+      /one complete percent-encoded URL/,
+    );
+    assert.match(
+      result.computerDescription,
+      /printf '%s' '<URL>' \| pbcopy/,
+    );
+    assert.match(
+      result.computerDescription,
+      /one computer batch: CMD\+L, CMD\+V, RETURN, wait/,
+    );
+    assert.match(
+      result.computerDescription,
+      /Do not use AppleScript\/osascript or shell open for external-browser navigation/,
     );
     assert.match(
       result.computerDescription,
@@ -237,6 +321,33 @@ process.stdout.write(JSON.stringify({
       "outcomes" in result.modelResult.details,
       false,
       "assembled tool result details must remain compact",
+    );
+    assert.equal(result.modelResult.content.length, 1);
+    assert.equal(result.modelResult.content[0].type, "text");
+    assert.match(
+      result.modelResult.content[0].text,
+      /\[PIPIUI_COMPUTER_SCREENSHOT:bridge-aligned-id\]/,
+      "marker must reuse bridge screenshotId",
+    );
+    assert.doesNotMatch(
+      result.modelResult.content[0].text,
+      /png-base64/,
+      "toolResult text must stay marker-only without raw base64",
+    );
+    assert.match(
+      result.modelResultFallbackError || "",
+      /missing stable screenshotId/,
+      "missing bridge screenshotId must fail the marker contract",
+    );
+    assert.doesNotMatch(
+      result.modelResultFallbackError || "",
+      /png-base64-2/,
+      "contract failure must not embed raw base64",
+    );
+    assert.doesNotMatch(
+      result.modelResultFallbackError || "",
+      /PIPIUI_COMPUTER_SCREENSHOT/,
+      "contract failure must not emit an unhydratable marker",
     );
   } finally {
     await rm(directory, { recursive: true, force: true });

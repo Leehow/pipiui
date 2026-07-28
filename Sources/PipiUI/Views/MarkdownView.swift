@@ -245,8 +245,8 @@ struct MarkdownTextView: View {
             || string.contains("~~")
     }
 
-    /// One AttributedString for a whole list block so SwiftUI `.textSelection` can
-    /// drag across bullets. (Separate `PathLinkedText` per item cannot share a selection.)
+    /// One AttributedString for a whole list block so bullets and text preserve
+    /// one visual run. (Separate `PathLinkedText` per item cannot share styling.)
     static func listAttributed(_ items: [ListItem]) -> AttributedString {
         var result = AttributedString()
         for (index, item) in items.enumerated() {
@@ -423,6 +423,7 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
         textView.drawsBackground = false
         textView.textContainerInset = .zero
         textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = false
         textView.isHorizontallyResizable = false
         textView.isVerticallyResizable = true
         textView.autoresizingMask = [.width]
@@ -445,8 +446,15 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
     func sizeThatFits(_ proposal: ProposedViewSize, nsView textView: NSTextView, context: Context) -> CGSize? {
         guard let width = proposal.width, width > 0 else { return nil }
         let container = textView.textContainer!
-        container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
-        container.widthTracksTextView = false
+        let scale =
+            textView.window?.backingScaleFactor
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 2
+        MarkdownLayoutSizing.updateContainerIfNeeded(
+            container,
+            proposedWidth: width,
+            backingScale: scale
+        )
         textView.layoutManager?.ensureLayout(for: container)
         let used = textView.layoutManager?.usedRect(for: container) ?? .zero
         return CGSize(width: width, height: ceil(used.height))
@@ -457,6 +465,53 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
         textView.font = bodyFont
         textView.textColor = .labelColor
         textView.textStorage?.setAttributedString(attributedText)
+    }
+}
+
+enum MarkdownLayoutSizing {
+    static func normalizedWidth(
+        _ width: CGFloat,
+        backingScale: CGFloat
+    ) -> CGFloat {
+        guard width.isFinite, width > 0 else { return 1 }
+        let scale = backingScale.isFinite && backingScale > 0
+            ? backingScale
+            : 1
+        return max(1, floor(width * scale) / scale)
+    }
+
+    static func containerNeedsUpdate(
+        current: NSSize,
+        target: NSSize
+    ) -> Bool {
+        current.width != target.width
+            || current.height != target.height
+    }
+
+    /// Returns true only when it mutates TextKit. Reassigning the same
+    /// infinite-height size keeps AppKit layout dirty and can recursively drive
+    /// SwiftUI's platform-view sizeThatFits during rapid transcript scrolling.
+    @discardableResult
+    static func updateContainerIfNeeded(
+        _ container: NSTextContainer,
+        proposedWidth: CGFloat,
+        backingScale: CGFloat
+    ) -> Bool {
+        let target = NSSize(
+            width: normalizedWidth(
+                proposedWidth,
+                backingScale: backingScale
+            ),
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        guard containerNeedsUpdate(
+            current: container.containerSize,
+            target: target
+        ) else {
+            return false
+        }
+        container.containerSize = target
+        return true
     }
 }
 
@@ -544,7 +599,8 @@ private struct MarkdownBlockView: View {
             .padding(.top, level <= 2 ? 6 : 2)
         case .code(let code), .mono(let code):
             // Do NOT path-link inside fenced / mono code bodies.
-            // Code blocks keep SwiftUI Text + textSelection (no path ⌘+click required).
+            // This legacy block renderer avoids SwiftUI textSelection. The active
+            // MarkdownTextView path uses one selectable AppKit NSTextView instead.
             ScrollView(.horizontal) {
                 // 含框线字符的图走终端式网格渲染（CJK 占两格，框线严格对齐）
                 if MonoArtView.hasBoxDrawing(code) {
@@ -553,7 +609,15 @@ private struct MarkdownBlockView: View {
                 } else {
                     Text(code)
                         .font(Font(chatTypography.codeNSFont))
-                        .textSelection(.enabled)
+                        .contextMenu {
+                            Button("复制") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(
+                                    code,
+                                    forType: .string
+                                )
+                            }
+                        }
                         .padding(10)
                 }
             }

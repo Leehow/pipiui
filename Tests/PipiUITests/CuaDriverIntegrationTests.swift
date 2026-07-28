@@ -339,6 +339,68 @@ final class CuaDriverIntegrationTests: XCTestCase {
         )
     }
 
+    func testFinderDownloadsUsesPinnedWindowShortcutRoute() async throws {
+        let driver = FakeDriver(pngBase64: try png())
+        driver.setLaunch(Launch(
+            bundleID: "com.apple.finder",
+            name: "Finder",
+            processID: 901,
+            windowID: 9_001
+        ))
+        let coordinator = makeCoordinator(driver)
+
+        let opened = await open(
+            coordinator,
+            session: "session-a",
+            bundleID: "com.apple.finder"
+        )
+        XCTAssertEqual(opened["ok"] as? Bool, true)
+        let downloads = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Downloads", isDirectory: true).path
+        let navigated = await batch(
+            coordinator,
+            session: "session-a",
+            actions: [
+                ["type": "keypress", "keys": ["CMD", "SHIFT", "G"]],
+                ["type": "type", "text": downloads],
+                ["type": "keypress", "keys": ["ENTER"]],
+            ]
+        )
+
+        XCTAssertEqual(navigated["ok"] as? Bool, true)
+        let navigationCalls = driver.calls.filter {
+            ["hotkey", "type_text", "press_key"].contains($0.tool)
+        }
+        XCTAssertEqual(
+            navigationCalls.map(\.tool),
+            ["hotkey", "type_text", "press_key"]
+        )
+        XCTAssertEqual(
+            navigationCalls[0].arguments["keys"] as? [String],
+            ["CMD", "SHIFT", "G"]
+        )
+        XCTAssertEqual(
+            navigationCalls[1].arguments["text"] as? String,
+            downloads
+        )
+        XCTAssertEqual(
+            navigationCalls[2].arguments["key"] as? String,
+            "ENTER"
+        )
+        XCTAssertEqual(
+            Set(navigationCalls.compactMap {
+                $0.arguments["window_id"] as? UInt32
+            }),
+            [9_001]
+        )
+        XCTAssertTrue(
+            driver.calls.suffix(1).allSatisfy {
+                $0.tool == "get_window_state"
+                    && ($0.arguments["window_id"] as? UInt32) == 9_001
+            }
+        )
+    }
+
     func testTwoSessionsRetainIndependentTargetsWhenFrontmostAppChanges() async throws {
         let driver = FakeDriver(pngBase64: try png())
         let coordinator = makeCoordinator(driver)
@@ -1133,11 +1195,19 @@ final class CuaDriverIntegrationTests: XCTestCase {
                     processID: 999,
                     windowTitle: nil
                 )
-            }
+            },
+        applicationResolver:
+            @escaping @Sendable (String) throws
+                -> ComputerResolvedApplication = {
+                    try ComputerApplicationResolver.resolve(
+                        bundleIdentifier: $0
+                    )
+                }
     ) -> ComputerCoordinator {
         ComputerCoordinator(
             supportsInputMonitoring: false,
             frontmostApplicationProvider: frontmostApplicationProvider,
+            applicationResolver: applicationResolver,
             openApplicationPermissionProvider: {
                 ComputerPermissionSnapshot(
                     screenRecording: true,

@@ -9,6 +9,10 @@ enum ComputerInputMonitorPolicy {
 }
 
 extension ComputerCoordinator {
+    var isPresentingDesktopOperation: Bool {
+        isDesktopOperationActive
+    }
+
     func cancelRequest(
         requestID: String,
         sessionKey: String,
@@ -185,7 +189,12 @@ extension ComputerCoordinator {
     func clearLeasePresentation() {
         activeSessionKey = nil
         activeApplication = nil
+        activeWindowID = nil
+        isDesktopOperationActive = false
         remainingActions = nil
+        Task { @MainActor in
+            ComputerUseWindowPresentation.shared.update(for: self)
+        }
     }
 
     @discardableResult

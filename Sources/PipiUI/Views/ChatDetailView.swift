@@ -8,12 +8,22 @@ private let jumpAnchor: UnitPoint = .bottom
 /// SwiftUI row/anchor identity must be unique across warm session switches.
 ///
 /// `ChatItem.id` is intentionally local to one `ChatSession` (`item-1`, `item-2`, …).
-/// The outer `NSScrollView` survives a session switch for performance, so feeding those
-/// local ids directly to its lazy content lets rows from different sessions alias.
+/// Even though the complete transcript root is session-scoped below, delayed ScrollViewReader
+/// operations and anchor bookkeeping must never address another session's local row id.
 enum TranscriptRenderIdentity {
     static func scoped(sessionKey: String, localID: String) -> String {
         "\(sessionKey):\(localID)"
     }
+}
+
+/// Identity for the complete transcript scroll hierarchy.
+///
+/// A different ChatSession must receive a fresh outer NSScrollView, not only a
+/// fresh LazyVStack. Otherwise the old clip offset, lazy layout cache, and nested
+/// tool-output ScrollView phase can be reconciled against an unrelated session.
+/// `bridgeRoutingKey` is stable when one logical session rebinds its persisted id.
+struct TranscriptSessionRootIdentity: Hashable {
+    let sessionKey: String
 }
 
 struct ChatDetailView: View {
@@ -45,6 +55,8 @@ private struct ChatDetailViewBody: View {
     @State private var rightPanelDragWidth: CGFloat?
     /// Real user prompt ids whose complete assistant turn is folded.
     @State private var collapsedUserTurnIDs: Set<String> = []
+    /// Hosted above the lazy transcript so row recycling cannot dismiss or corrupt it.
+    @State private var finishedGroupPresentation: AssistantBlockLayout.FinishedGroupPresentation?
     @StateObject private var gitBranches = GitBranchStore()
 
     /// Last settled chat-column width. Width changes (window resize / right panel)
@@ -118,8 +130,27 @@ private struct ChatDetailViewBody: View {
                 .help("文档面板（⌘+点击聊天中的 md/txt 文档路径在此预览）")
             }
         }
+        .sheet(item: $finishedGroupPresentation) { presentation in
+            let callIDs = AssistantBlockLayout.toolCallIds(in: presentation.blocks)
+            FinishedNonTextGroupDetailView(
+                presentation: presentation,
+                toolRuns: runs(forToolCallIds: callIDs),
+                subagents: subagents(forToolCallIds: callIDs),
+                projectURL: session.projectURL,
+                onFlash: { session.flash($0) },
+                onSelectAgent: { agentID in
+                    finishedGroupPresentation = nil
+                    selectAgent(agentID)
+                }
+            )
+        }
         .onAppear {
             gitBranches.bind(projectURL: session.projectURL)
+        }
+        .onChange(of: session.bridgeRoutingKey) { _, _ in
+            // A distinct ChatSession receives a fresh bridge key. Persisted-id
+            // rebinding keeps the key stable and must not dismiss an open detail.
+            finishedGroupPresentation = nil
         }
         .onChange(of: session.id) { _, _ in
             // The detail chrome is reused across sessions. Reset only transient view state;
@@ -349,9 +380,12 @@ private struct ChatDetailViewBody: View {
                             isStreaming: session.isStreaming,
                             projectURL: session.projectURL,
                             chatFontSize: chatTypography.fontSize,
+                            sessionKey: session.bridgeRoutingKey,
+                            presentationScopeID: transcriptID("streaming"),
                             isWorking: session.isWorking,
                             onFlash: { session.flash($0) },
                             onSelectAgent: selectAgent,
+                            onOpenFinishedGroup: presentFinishedGroup,
                             onCopy: {
                                 session.copySegmentsText(
                                     AssistantBlockLayout.plan(
@@ -392,10 +426,13 @@ private struct ChatDetailViewBody: View {
                                     subagents: subagents(for: item),
                                     projectURL: session.projectURL,
                                     chatFontSize: chatTypography.fontSize,
+                                    sessionKey: session.bridgeRoutingKey,
+                                    presentationScopeID: transcriptID(item.id),
                                     isWorking: session.isWorking,
                                     isEditing: session.editingItemId == item.id,
                                     onFlash: { session.flash($0) },
                                     onSelectAgent: selectAgent,
+                                    onOpenFinishedGroup: presentFinishedGroup,
                                     onCopy: { session.copyItemText(item) },
                                     onResend: { session.resendUserMessage(itemId: item.id) },
                                     onBeginEdit: { session.beginEditingUserMessage(itemId: item.id) },
@@ -421,6 +458,9 @@ private struct ChatDetailViewBody: View {
                                     projectURL: session.projectURL,
                                     onFlash: { session.flash($0) },
                                     onSelectAgent: selectAgent,
+                                    sessionKey: session.bridgeRoutingKey,
+                                    presentationScopeID: transcriptID(id),
+                                    onOpenFinishedGroup: presentFinishedGroup,
                                     entryId: entryId,
                                     isWorking: session.isWorking,
                                     onCopy: { session.copySegmentsText(segments) },
@@ -462,15 +502,11 @@ private struct ChatDetailViewBody: View {
                         .transcriptFlip()
                     }
                 }
-                // Reset only the lazy transcript content on a session switch. The enclosing
-                // NSScrollView, detail chrome and cached session/process all stay warm.
-                .id(session.bridgeRoutingKey)
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            // Keep the same NSScrollView across session switches. Replacing it with
-            // `.id(session.id)` also recreated every visible AppKit text view, exposing a
-            // provisional LazyVStack measurement for one frame and making the text jump.
+            // Same-session identity rebinds may still update session.id without
+            // replacing this ScrollView. Never animate that bookkeeping change.
             .animation(nil, value: session.id)
             // Prefer overlay indicators; AppKit style is forced in StickToBottomTracker.
             .scrollIndicators(.automatic)
@@ -507,18 +543,6 @@ private struct ChatDetailViewBody: View {
                 // animates LazyVStack/AppKit measurement corrections during a session switch.
                 .animation(.easeInOut(duration: 0.2), value: session.isInitializing)
             }
-            .onChange(of: session.id) { _, _ in
-                // A reused scroll view keeps its old offset. Most sessions are already at
-                // document-start (the visual latest edge); only correct it when the target
-                // session says it should be pinned. The anchor is always realized, so this
-                // does not wait for lazy Markdown rows or expose a second placement.
-                guard session.pinTranscriptToBottom else { return }
-                var transaction = Transaction()
-                transaction.disablesAnimations = true
-                withTransaction(transaction) {
-                    proxy.scrollTo(transcriptID("bottom"), anchor: .top)
-                }
-            }
             .onChange(of: session.rightPanel != nil) { _, _ in
                 recoverPinAfterColumnWidthChange(proxy)
             }
@@ -535,6 +559,14 @@ private struct ChatDetailViewBody: View {
                 recoverPinAfterColumnWidthChange(proxy)
             }
         }
+        // Replace the entire transcript scroll hierarchy across ChatSession objects.
+        // A LazyVStack-only id leaves the enclosing flipped NSScrollView's old offset,
+        // prefetch cache, and nested ScrollView phase alive. Reusing those while switching
+        // from a tall expanded tool result to a short session can keep AttributeGraph in
+        // sizeThatFits / LazyLayout reconciliation indefinitely.
+        .id(TranscriptSessionRootIdentity(
+            sessionKey: session.bridgeRoutingKey
+        ))
     }
 
     /// Debounce chat-column width changes, then re-pin — but **never** while the window
@@ -689,6 +721,13 @@ private struct ChatDetailViewBody: View {
     private func selectAgent(_ id: String) {
         session.subagents.selectedId = id
         session.rightPanel = .agents
+    }
+
+    private func presentFinishedGroup(
+        _ presentation: AssistantBlockLayout.FinishedGroupPresentation
+    ) {
+        guard presentation.belongs(to: session.bridgeRoutingKey) else { return }
+        finishedGroupPresentation = presentation
     }
 
     /// streamingItem 是否已有可展示内容（空 blocks / 空 text·thinking 不算）

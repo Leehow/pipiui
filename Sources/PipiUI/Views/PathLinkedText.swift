@@ -84,8 +84,14 @@ enum PathLinkHitTest {
 
 // MARK: - SwiftUI entry
 
-/// Selectable SwiftUI text with absolute paths styled (color + underline, no `.link`).
+/// SwiftUI text with absolute paths styled (color + underline, no `.link`).
 /// **⌘+click** on a path reveals in Finder via a transparent overlay that does not own layout.
+///
+/// Do not add SwiftUI's selection modifier here. On macOS it installs a
+/// private `SelectionOverlay` backed by `NSTextField`; realizing many transcript
+/// rows can repeatedly invalidate that overlay's intrinsic size. Whole-text copy
+/// remains available from the context menu, while assistant Markdown uses its
+/// dedicated selectable `NSTextView`.
 struct PathLinkedText: View {
     private let plainText: String
     private let visual: AttributedString
@@ -147,7 +153,6 @@ struct PathLinkedText: View {
     var body: some View {
         let hitFont = resolveHitFont()
         textBody
-            .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 // No GeometryReader: a `.background` overlay is sized to the Text's
@@ -265,8 +270,7 @@ enum PathLinkOpenURL {
 
 // MARK: - ⌘+click overlay (no layout ownership)
 
-/// Transparent hit-test overlay. Steals events only for ⌘+mouse; otherwise passes through
-/// so SwiftUI `Text` selection / drag / copy work normally.
+/// Transparent hit-test overlay. Steals events only for ⌘+mouse; otherwise passes through.
 private struct CmdPathClickOverlay: NSViewRepresentable {
     let plainText: String
     let targets: [FileReveal.PathTarget]

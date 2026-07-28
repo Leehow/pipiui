@@ -31,10 +31,13 @@ struct MessageRow: View, Equatable {
     var projectURL: URL? = nil
     /// Bumps Equatable when chat typography changes so `.equatable()` rows re-render.
     var chatFontSize: CGFloat = ChatTypography.defaultFontSize
+    var sessionKey: String = ""
+    var presentationScopeID: String = ""
     var isWorking: Bool = false
     var isEditing: Bool = false
     var onFlash: ((String) -> Void)? = nil
     var onSelectAgent: ((String) -> Void)?
+    var onOpenFinishedGroup: ((AssistantBlockLayout.FinishedGroupPresentation) -> Void)?
     var onCopy: (() -> Void)? = nil
     var onResend: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
@@ -51,6 +54,8 @@ struct MessageRow: View, Equatable {
             && lhs.isStreaming == rhs.isStreaming
             && lhs.projectURL == rhs.projectURL
             && lhs.chatFontSize == rhs.chatFontSize
+            && lhs.sessionKey == rhs.sessionKey
+            && lhs.presentationScopeID == rhs.presentationScopeID
             && lhs.isWorking == rhs.isWorking
             && lhs.isEditing == rhs.isEditing
         // Callbacks intentionally excluded.
@@ -207,6 +212,9 @@ struct MessageRow: View, Equatable {
             projectURL: projectURL,
             onFlash: onFlash,
             onSelectAgent: onSelectAgent,
+            sessionKey: sessionKey,
+            presentationScopeID: presentationScopeID,
+            onOpenFinishedGroup: onOpenFinishedGroup,
             entryId: item.entryId,
             isWorking: isWorking,
             onCopy: onCopy,
@@ -274,6 +282,9 @@ struct AssistantSegmentsView: View, Equatable {
     var projectURL: URL? = nil
     var onFlash: ((String) -> Void)? = nil
     var onSelectAgent: ((String) -> Void)?
+    var sessionKey: String = ""
+    var presentationScopeID: String = ""
+    var onOpenFinishedGroup: ((AssistantBlockLayout.FinishedGroupPresentation) -> Void)?
     var entryId: String? = nil
     var isWorking: Bool = false
     var onCopy: (() -> Void)? = nil
@@ -293,6 +304,8 @@ struct AssistantSegmentsView: View, Equatable {
             && lhs.subagents == rhs.subagents
             && lhs.isStreaming == rhs.isStreaming
             && lhs.projectURL == rhs.projectURL
+            && lhs.sessionKey == rhs.sessionKey
+            && lhs.presentationScopeID == rhs.presentationScopeID
             && lhs.entryId == rhs.entryId
             && lhs.isWorking == rhs.isWorking
             && lhs.collapsedOverride == rhs.collapsedOverride
@@ -328,7 +341,7 @@ struct AssistantSegmentsView: View, Equatable {
     @ViewBuilder
     private var segmentsBody: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+            ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
                 switch segment {
                 case .text(let text):
                     MarkdownTextView(text: text, onFlash: onFlash)
@@ -348,12 +361,15 @@ struct AssistantSegmentsView: View, Equatable {
                     assistantBlockView(block)
                 case .finishedGroup(let blocks):
                     FinishedNonTextGroupView(
-                        blocks: blocks,
+                        presentation: AssistantBlockLayout.finishedGroupPresentation(
+                            sessionKey: sessionKey,
+                            scopeID: presentationScopeID,
+                            segmentIndex: index,
+                            blocks: blocks
+                        ),
                         toolRuns: toolRuns,
-                        subagents: subagents,
                         projectURL: projectURL,
-                        onFlash: onFlash,
-                        onSelectAgent: onSelectAgent
+                        onOpen: onOpenFinishedGroup
                     )
                 }
             }
@@ -519,7 +535,6 @@ private struct DocumentFileCardView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(6)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -816,8 +831,8 @@ struct CollapsibleUserBubbleView: View {
             if expanded && fullReady {
                 Text(text)
                     .foregroundStyle(.white)
-                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .transcriptCopyMenu(text)
                     .opacity(fullOpacity)
                     .onAppear {
                         withAnimation(.easeOut(duration: 0.2)) {
@@ -830,8 +845,8 @@ struct CollapsibleUserBubbleView: View {
                 Text(previewText)
                     .foregroundStyle(.white)
                     .lineLimit(UserMessageCollapse.previewMaxLines)
-                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .transcriptCopyMenu(text)
             }
         }
     }
@@ -1068,8 +1083,8 @@ struct SubagentDoneBubbleView: View {
                         Text("Task: \(parsed.task)")
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .transcriptCopyMenu(parsed.task)
                     }
                     let bodyText = parsed.result.isEmpty ? text : parsed.result
                     PathLinkedText(
@@ -1087,8 +1102,8 @@ struct SubagentDoneBubbleView: View {
                     Text(text)
                         .font(.caption.monospaced())
                         .foregroundStyle(.primary.opacity(0.85))
-                        .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .transcriptCopyMenu(text)
                 }
                 if !documentCards.isEmpty {
                     DocumentFileCardStack(references: documentCards)
@@ -1360,8 +1375,8 @@ struct ThinkingBlockView: View {
                         .font(.callout)
                         .italic()
                         .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .transcriptCopyMenu(text)
                     Text("正在思考… 已写 \(ThinkingTokenEstimate.formatCount(ThinkingTokenEstimate.tokenCount(for: text))) tokens")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.tertiary)
@@ -1378,8 +1393,8 @@ struct ThinkingBlockView: View {
                             .font(.callout)
                             .italic()
                             .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .transcriptCopyMenu(chunk)
                     }
                 }
             }
@@ -1388,58 +1403,249 @@ struct ThinkingBlockView: View {
     }
 }
 
+private extension View {
+    /// Transcript fallback for short SwiftUI `Text` nodes. It intentionally
+    /// avoids SwiftUI's selection modifier, whose macOS `SelectionOverlay` can dirty
+    /// constraints while a long lazy transcript realizes many rows at once.
+    func transcriptCopyMenu(_ text: String) -> some View {
+        contextMenu {
+            Button("复制") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+            }
+        }
+    }
+}
+
 /// Collapsed summary for consecutive finished thinking/toolCall rows between text/media.
 struct FinishedNonTextGroupView: View {
-    let blocks: [ChatBlock]
+    let presentation: AssistantBlockLayout.FinishedGroupPresentation
+    var toolRuns: [String: ToolRun] = [:]
+    var projectURL: URL? = nil
+    var onOpen: ((AssistantBlockLayout.FinishedGroupPresentation) -> Void)?
+
+    private var title: String {
+        AssistantBlockLayout.summaryTitle(for: presentation.blocks)
+    }
+
+    private var fileChanges: FileChangeGroupPresentation {
+        FileChangeGroupPresentation.make(
+            blocks: presentation.blocks,
+            toolRuns: toolRuns,
+            projectURL: projectURL
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 7) {
+                Image(systemName: fileChanges.files.isEmpty ? "rectangle.stack" : "doc.badge.gearshape")
+                    .foregroundStyle(.secondary)
+                    .imageScale(.medium)
+                Text(
+                    fileChanges.files.isEmpty
+                        ? title
+                        : "已编辑 \(fileChanges.files.count) 个文件"
+                )
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(fileChanges.files.isEmpty ? .secondary : .primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                if !fileChanges.files.isEmpty {
+                    compactChangeCount(fileChanges.additions, color: .green, prefix: "+")
+                    compactChangeCount(fileChanges.deletions, color: .red, prefix: "−")
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "arrow.up.right.square")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            if !fileChanges.files.isEmpty {
+                Divider()
+                ForEach(fileChanges.files) { file in
+                    HStack(spacing: 8) {
+                        Text(file.displayPath)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer(minLength: 8)
+                        compactChangeCount(file.additions, color: .green, prefix: "+")
+                        compactChangeCount(file.deletions, color: .red, prefix: "−")
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    if file.id != fileChanges.files.last?.id {
+                        Divider()
+                    }
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { onOpen?(presentation) }
+        .pointingHandCursor()
+        .accessibilityAddTraits(.isButton)
+        .accessibilityLabel(title)
+        .accessibilityValue("打开详情")
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.primary.opacity(0.035))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.primary.opacity(0.06))
+        )
+    }
+
+    @ViewBuilder
+    private func compactChangeCount(_ count: Int, color: Color, prefix: String) -> some View {
+        if count > 0 {
+            Text("\(prefix)\(count)")
+                .font(.caption.monospacedDigit().weight(.medium))
+                .foregroundStyle(color)
+                .layoutPriority(1)
+        }
+    }
+}
+
+/// Stable, detached detail surface for a finished group.
+///
+/// This view is presented by `ChatDetailViewBody`, outside the transcript's
+/// `LazyVStack`, so opening a group never changes the transcript row height.
+struct FinishedNonTextGroupDetailView: View {
+    let presentation: AssistantBlockLayout.FinishedGroupPresentation
     let toolRuns: [String: ToolRun]
     var subagents: [SubagentInfo] = []
     var projectURL: URL? = nil
     var onFlash: ((String) -> Void)? = nil
     var onSelectAgent: ((String) -> Void)?
-    @State private var expanded = false
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedFileID: String?
 
     private var title: String {
-        AssistantBlockLayout.summaryTitle(for: blocks)
+        AssistantBlockLayout.summaryTitle(for: presentation.blocks)
+    }
+
+    private var fileChanges: FileChangeGroupPresentation {
+        FileChangeGroupPresentation.make(
+            blocks: presentation.blocks,
+            toolRuns: toolRuns,
+            projectURL: projectURL
+        )
+    }
+
+    private var selectedFile: FileChangeFilePresentation? {
+        fileChanges.files.first { $0.id == selectedFileID }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "rectangle.stack")
-                    .foregroundStyle(.secondary)
-                    .imageScale(.medium)
-                Text(title)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer(minLength: 0)
-                Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { expanded.toggle() }
-            .pointingHandCursor()
-            .accessibilityAddTraits(.isButton)
-            .accessibilityLabel(title)
-            .accessibilityValue(expanded ? "已展开" : "已折叠")
-
-            if expanded {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                        memberView(block)
-                    }
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                if fileChanges.files.isEmpty {
+                    Label(title, systemImage: "rectangle.stack")
+                        .font(.headline)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } else {
+                    Label("已编辑 \(fileChanges.files.count) 个文件", systemImage: "doc.badge.gearshape")
+                        .font(.headline)
+                    changeCount(fileChanges.additions, color: .green, prefix: "+")
+                    changeCount(fileChanges.deletions, color: .red, prefix: "−")
                 }
-                .padding(.top, 8)
+                Spacer(minLength: 16)
+                Button("完成") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+
+            Divider()
+
+            HStack(spacing: 0) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        if !fileChanges.files.isEmpty {
+                            VStack(spacing: 0) {
+                                ForEach(fileChanges.files) { file in
+                                    Button {
+                                        selectedFileID = file.id
+                                    } label: {
+                                        HStack(spacing: 8) {
+                                            Image(systemName: "doc.text")
+                                                .foregroundStyle(.secondary)
+                                            Text(file.displayPath)
+                                                .font(.caption.monospaced())
+                                                .foregroundStyle(.primary)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                            Spacer(minLength: 8)
+                                            changeCount(file.additions, color: .green, prefix: "+")
+                                            changeCount(file.deletions, color: .red, prefix: "−")
+                                            Image(systemName: "chevron.right")
+                                                .font(.caption2)
+                                                .foregroundStyle(.tertiary)
+                                        }
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 9)
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .background(
+                                        selectedFileID == file.id
+                                            ? Color.accentColor.opacity(0.1)
+                                            : Color.clear
+                                    )
+                                    .accessibilityLabel(
+                                        "\(file.displayPath)，新增 \(file.additions) 行，删除 \(file.deletions) 行"
+                                    )
+                                    if file.id != fileChanges.files.last?.id {
+                                        Divider()
+                                    }
+                                }
+                            }
+                            .background(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(Color.primary.opacity(0.03))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .strokeBorder(Color.primary.opacity(0.08))
+                            )
+                            Divider()
+                                .padding(.vertical, 4)
+                        }
+
+                        ForEach(presentation.members) { member in
+                            memberView(member.block)
+                        }
+                    }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(minWidth: 480)
+
+                if let selectedFile {
+                    Divider()
+                    FileChangeDiffInspector(file: selectedFile)
+                        .frame(minWidth: 480, idealWidth: 560)
+                }
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color.primary.opacity(0.035))
+        .frame(
+            minWidth: selectedFile == nil ? 520 : 980,
+            idealWidth: selectedFile == nil ? 680 : 1120,
+            maxWidth: selectedFile == nil ? 820 : 1280,
+            minHeight: 360,
+            idealHeight: 560,
+            maxHeight: 760
         )
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("工具组详情 \(title)")
     }
 
     @ViewBuilder
@@ -1460,12 +1666,40 @@ struct FinishedNonTextGroupView: View {
                     call: call,
                     run: toolRuns[call.id],
                     projectURL: projectURL,
-                    onFlash: onFlash
+                    onFlash: onFlash,
+                    onSelectFileChange: selectionAction(for: call.id)
                 )
             }
-        case .text, .image, .video:
-            EmptyView()
+        case .text(let text):
+            MarkdownTextView(text: text, onFlash: onFlash)
+        case .image(let image):
+            ImageThumbnailView(
+                data: image.data,
+                mimeType: image.mimeType,
+                path: image.path,
+                maxWidth: 360,
+                maxHeight: 240,
+                projectURL: projectURL,
+                onFlash: onFlash
+            )
+        case .video(let video):
+            VideoBlockView(path: video.path, onFlash: onFlash)
         }
+    }
+
+    @ViewBuilder
+    private func changeCount(_ count: Int, color: Color, prefix: String) -> some View {
+        if count > 0 {
+            Text("\(prefix)\(count)")
+                .font(.caption.monospacedDigit().weight(.medium))
+                .foregroundStyle(color)
+                .layoutPriority(1)
+        }
+    }
+
+    private func selectionAction(for callID: String) -> (() -> Void)? {
+        guard let file = fileChanges.file(forCallID: callID) else { return nil }
+        return { selectedFileID = file.id }
     }
 
     private func agentsFor(_ call: ToolCallBlock) -> [SubagentInfo] {
@@ -1483,6 +1717,98 @@ struct FinishedNonTextGroupView: View {
             frontier = Set(children.map(\.id))
         }
         return result
+    }
+}
+
+private struct FileChangeDiffInspector: View {
+    let file: FileChangeFilePresentation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(file.displayPath)
+                    .font(.callout.monospaced().weight(.semibold))
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                HStack(spacing: 8) {
+                    Text("+\(file.additions)")
+                        .foregroundStyle(.green)
+                    Text("−\(file.deletions)")
+                        .foregroundStyle(.red)
+                }
+                .font(.caption.monospacedDigit().weight(.medium))
+                if let qualityMessage = file.qualityMessage {
+                    Label(qualityMessage, systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel(qualityMessage)
+                }
+            }
+            .padding(14)
+
+            Divider()
+
+            ScrollView([.horizontal, .vertical]) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(file.lines) { line in
+                        HStack(alignment: .firstTextBaseline, spacing: 0) {
+                            Text(line.oldLineNumber.map(String.init) ?? "")
+                                .frame(width: 38, alignment: .trailing)
+                            Text(line.newLineNumber.map(String.init) ?? "")
+                                .frame(width: 38, alignment: .trailing)
+                            Text(marker(for: line.kind))
+                                .frame(width: 22, alignment: .center)
+                            Text(line.text.isEmpty ? " " : line.text)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        .font(.caption.monospaced())
+                        .foregroundStyle(foreground(for: line.kind))
+                        .padding(.vertical, 1)
+                        .padding(.trailing, 12)
+                        .background(background(for: line.kind))
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(accessibilityLabel(for: line))
+                    }
+                }
+                .frame(minWidth: 460, alignment: .leading)
+            }
+            .textSelection(.enabled)
+        }
+        .background(Color(nsColor: .textBackgroundColor))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("文件差异 \(file.displayPath)")
+    }
+
+    private func marker(for kind: FileChangeDiffLine.Kind) -> String {
+        switch kind {
+        case .addition: return "+"
+        case .deletion: return "−"
+        case .separator: return ""
+        }
+    }
+
+    private func foreground(for kind: FileChangeDiffLine.Kind) -> Color {
+        switch kind {
+        case .addition: return .green
+        case .deletion: return .red
+        case .separator: return .secondary
+        }
+    }
+
+    private func background(for kind: FileChangeDiffLine.Kind) -> Color {
+        switch kind {
+        case .addition: return Color.green.opacity(0.09)
+        case .deletion: return Color.red.opacity(0.09)
+        case .separator: return Color.secondary.opacity(0.06)
+        }
+    }
+
+    private func accessibilityLabel(for line: FileChangeDiffLine) -> String {
+        switch line.kind {
+        case .addition: return "新增：\(line.text)"
+        case .deletion: return "删除：\(line.text)"
+        case .separator: return line.text
+        }
     }
 }
 
@@ -1656,6 +1982,8 @@ struct ToolCardView: View {
     var isStreaming: Bool = false
     var projectURL: URL? = nil
     var onFlash: ((String) -> Void)? = nil
+    /// Present only inside the detached finished-group detail.
+    var onSelectFileChange: (() -> Void)? = nil
     @State private var expanded = false
 
     private var statusColor: Color {
@@ -1723,10 +2051,16 @@ struct ToolCardView: View {
             .padding(.vertical, 8)
             .contentShape(Rectangle())
             .onTapGesture {
-                if hasTextOutput { expanded.toggle() }
+                if let onSelectFileChange {
+                    onSelectFileChange()
+                } else if hasTextOutput {
+                    expanded.toggle()
+                }
             }
-            .pointingHandCursor(hasTextOutput)
-            .accessibilityAddTraits(hasTextOutput ? .isButton : [])
+            .pointingHandCursor(hasTextOutput || onSelectFileChange != nil)
+            .accessibilityAddTraits(
+                hasTextOutput || onSelectFileChange != nil ? .isButton : []
+            )
             .accessibilityValue(hasTextOutput ? (expanded ? "已展开" : "已折叠") : "")
 
             // Always show tool result thumbnails (even when collapsed).
@@ -1756,11 +2090,11 @@ struct ToolCardView: View {
             if hasTextOutput, expanded || run?.isRunning == true {
                 Divider()
                 VStack(alignment: .leading, spacing: 8) {
-                    if let output = run?.output, !output.isEmpty {
+                    if !displayOutput.isEmpty {
                         ScrollView {
                             PathLinkedText(
                                 text: ToolOutputRenderBudget.preview(
-                                    output: output,
+                                    output: displayOutput,
                                     expanded: expanded
                                 ).text,
                                 monospaced: true,
@@ -1796,8 +2130,13 @@ struct ToolCardView: View {
         }
     }
 
+    /// UI-only: hide opaque computer screenshot markers; raw ToolRun.output stays intact.
+    private var displayOutput: String {
+        ComputerScreenshotMarker.displayText(run?.output ?? "")
+    }
+
     private var hasTextOutput: Bool {
-        !(run?.output.isEmpty ?? true)
+        !displayOutput.isEmpty
     }
 
     private var hasOutput: Bool {
@@ -1812,6 +2151,7 @@ struct ToolCardView: View {
         case "read": return "doc.text"
         case "edit", "write": return "pencil"
         case "generate_image": return "wand.and.stars"
+        case "computer", "open_application": return "desktopcomputer"
         default: return "wrench.and.screwdriver"
         }
     }

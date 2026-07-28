@@ -58,7 +58,13 @@ extension ComputerCoordinator {
 
         activeSessionKey = sessionKey
         activeApplication = application
+        activeWindowID = nil
+        isDesktopOperationActive = true
         remainingActions = nil
+        statusMessage = "正在操作 \(application.name)…"
+        Task { @MainActor in
+            ComputerUseWindowPresentation.shared.update(for: self)
+        }
         executionGeneration &+= 1
         let gate = ComputerExecutionGate()
         let execution = ComputerInFlightExecution(

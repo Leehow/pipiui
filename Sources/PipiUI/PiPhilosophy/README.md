@@ -32,10 +32,14 @@ pi -e /path/to/pipi-philosophy/philosophy.ts
 
 ## The four layers
 
+The split runs along one line: **delete `foundation` and the agent becomes untrustworthy;
+delete `method` and it stays trustworthy but works badly.** Foundation is what you are owed as
+the person it works for. Method is craft.
+
 | id | 中文名 | What it governs | Scope |
 |---|---|---|---|
-| `foundation` | 基础哲学 | Authorization is established by the request; process weight matches the work; no early stopping; plans are lists, not documents; external advice never outranks your own judgement | main + lead + worker |
-| `method` | 工作方式哲学 | Form your own read of the problem *first*, then cross-validate against the outside world; evidence outranks authority | main + lead + worker |
+| `foundation` | 基础哲学 | Authorization is established by the request (state the assumption you proceeded under, never ask a ritual question); evidence outranks authority; no early stopping; external advice never outranks your own judgement | main + lead + worker |
+| `method` | 工作方式哲学 | Form your own read *first*, then cross-validate outside; process weight matches the work; plans are lists; define the success criterion before starting; write the minimum that solves it; change only what the task requires | main + lead + worker |
 | `orchestration` | 编排哲学 | Do not work the floor: decompose, delegate, verify, integrate, report. Briefs, verification, ledger, completion ownership | main + lead |
 | `fanout` | 瀑布流哲学 | Parallel by default; fan-out width triggers a lead firewall; worker state arrives as signals; keep the wave's raw output out of your context | main + lead |
 
@@ -133,6 +137,17 @@ The composition core (`compose.ts`) imports nothing from pi, so every rule that 
 placeholder resolution, dependency and scope filtering, capability degradation, user overrides
 — is tested with plain node and no API calls. `philosophy.ts` is the only file that touches the
 runtime.
+
+## Credits
+
+Three sections of the `method` layer — *write the minimum that solves it*, *change only what
+the task requires*, and *define the success criterion before you start* — were prompted by
+[andrej-karpathy-skills](https://github.com/multica-ai/andrej-karpathy-skills) (MIT), which
+distills Andrej Karpathy's observations about how LLMs fail at coding: they overcomplicate,
+they make orthogonal edits, and they run with assumptions nobody checked. The wording here is
+our own, and its fourth principle ("ask when unsure") is deliberately *not* adopted — a
+dispatched worker has no channel to a human, so the equivalent rule in `foundation` is "do not
+ask, but do not hide either": state the assumption and continue.
 
 ## License
 

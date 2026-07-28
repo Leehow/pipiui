@@ -68,10 +68,10 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         XCTAssertTrue(text.contains("{{delegate_status}}"))
         XCTAssertFalse(text.contains("subagent_status"))
 
-        // Research-only terminality moved to the layer that ships to workers too.
-        let foundation = try PhilosophyLayerFixture.normalizedBody("foundation")
-        XCTAssertTrue(foundation.contains("Research and analysis-only requests are terminal"))
-        XCTAssertTrue(foundation.contains("never completion of a change request"))
+        // Research-only terminality is craft, and lives in the layer that ships to workers too.
+        let method = try PhilosophyLayerFixture.normalizedBody("method")
+        XCTAssertTrue(method.contains("Research and analysis-only requests are terminal"))
+        XCTAssertTrue(method.contains("never completion of a change request"))
 
         let all = try PhilosophyLayerFixture.allNormalizedBodies()
         XCTAssertFalse(all.contains("## Closeout hard gate"))

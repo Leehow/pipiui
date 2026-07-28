@@ -38,6 +38,7 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
     private struct RegisteredProcess {
         let process: Process
         let epoch: UInt64
+        let socketURL: URL
     }
     private var registeredProcesses:
         [ObjectIdentifier: RegisteredProcess] = [:]
@@ -87,7 +88,7 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
     /// Do not wait for the serialized JSON-RPC queue here. It may be blocked
     /// in a bounded MCP read, and emergency stop is a main-thread action.
     /// SIGTERM immediately interrupts both children; the owning queue performs
-    /// normal handle/socket cleanup as the failed request unwinds.
+    /// normal cleanup, with a delayed exact-generation kill/socket fallback.
     func cancelAndStop() {
         let cancellation = signalCancellation()
         queue.async { [self] in
@@ -95,9 +96,10 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
         }
         DispatchQueue.global(qos: .userInitiated).asyncAfter(
             deadline: .now() + 0.4
-        ) { [weak self] in
-            self?.forceKill(
+        ) { [self] in
+            forceKill(
                 processes: cancellation.processes,
+                socketURLs: cancellation.socketURLs,
                 olderThanEpoch: cancellation.epoch
             )
         }
@@ -117,20 +119,27 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
 
     private func signalCancellation() -> (
         epoch: UInt64,
-        processes: [Process]
+        processes: [Process],
+        socketURLs: [URL]
     ) {
         cancellationLock.withLock {
             cancellationEpoch &+= 1
-            let processes = registeredProcesses.values.map(\.process)
+            let registrations = Array(registeredProcesses.values)
+            let processes = registrations.map(\.process)
             for process in processes where process.isRunning {
                 Darwin.kill(process.processIdentifier, SIGTERM)
             }
-            return (cancellationEpoch, processes)
+            return (
+                cancellationEpoch,
+                processes,
+                Array(Set(registrations.map(\.socketURL)))
+            )
         }
     }
 
     private func forceKill(
         processes: [Process],
+        socketURLs: [URL],
         olderThanEpoch: UInt64
     ) {
         cancellationLock.withLock {
@@ -142,6 +151,9 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
                       process.isRunning else { continue }
                 Darwin.kill(process.processIdentifier, SIGKILL)
             }
+        }
+        for socketURL in socketURLs {
+            try? FileManager.default.removeItem(at: socketURL)
         }
     }
 
@@ -218,6 +230,7 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
         daemonLivenessInput = liveness.fileHandleForWriting
         try register(
             process: daemonProcess,
+            socketURL: socket,
             expectedEpoch: expectedEpoch
         )
 
@@ -253,6 +266,7 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
         proxy = proxyProcess
         try register(
             process: proxyProcess,
+            socketURL: socket,
             expectedEpoch: expectedEpoch
         )
         proxyInput = toProxy.fileHandleForWriting
@@ -300,13 +314,15 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
 
     private func register(
         process: Process,
+        socketURL: URL,
         expectedEpoch: UInt64
     ) throws {
         let accepted = cancellationLock.withLock {
             guard cancellationEpoch == expectedEpoch else { return false }
             registeredProcesses[ObjectIdentifier(process)] = RegisteredProcess(
                 process: process,
-                epoch: expectedEpoch
+                epoch: expectedEpoch,
+                socketURL: socketURL
             )
             return true
         }

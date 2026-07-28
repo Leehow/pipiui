@@ -58,14 +58,19 @@ final class ImageAttachmentAsyncSaveTests: XCTestCase {
         let project = makeProject()
         let draft = makeDraft()
 
-        let first = ImageAttachment.saveToProjectAttachmentsAsync([draft], projectURL: project)
-        let second = ImageAttachment.saveToProjectAttachmentsAsync([draft], projectURL: project)
-        XCTAssertEqual(first, second, "same draft id must reuse its original path")
-
+        // The "write done" signal must hang off the FIRST call — it is the only one
+        // that actually performs the background write. Later duplicate calls reuse
+        // the draft's path and skip the write (draft is in-flight), so their
+        // completion fires synchronously and cannot be used as a "bytes settled"
+        // signal. Waiting on a no-op call's completion was a race that surfaced as
+        // files.count == 0 under full-suite load.
         let done = expectation(description: "write done")
-        ImageAttachment.saveToProjectAttachmentsAsync([draft], projectURL: project) { _ in
+        let first = ImageAttachment.saveToProjectAttachmentsAsync([draft], projectURL: project) { _ in
             done.fulfill()
         }
+        let second = ImageAttachment.saveToProjectAttachmentsAsync([draft], projectURL: project)
+        XCTAssertEqual(first, second, "same draft id must reuse its original path")
+        ImageAttachment.saveToProjectAttachmentsAsync([draft], projectURL: project)
         wait(for: [done], timeout: 5)
 
         let dir = project.appendingPathComponent(".pi/attachments", isDirectory: true)

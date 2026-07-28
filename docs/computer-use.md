@@ -33,15 +33,17 @@ CUA_DRIVER_RS_TELEMETRY_ENABLED=false
 
 Computer Use 是混合桌面能力包，不等于所有任务都从截图中找坐标。模型侧工具说明固定采用以下顺序：
 
-1. **确定性应用生命周期优先**：启动和激活使用 `open_application`；查询运行状态或优雅退出时，优先使用 Pi 已有的 shell/bash 或 macOS 生命周期命令。正常退出可用时，不把 force quit 或 `kill -9` 当作默认路径。
-2. **Accessibility/AX 其次**：窗口已选定后，只要最新 snapshot 提供 `element_index` / `element_token`，就优先使用 AX element action。
+1. **确定性应用生命周期优先**：启动或激活目标 App 使用 `open_application`；它只接受 bundle identifier 或 application name，不接受 path/URL。运行状态检查和优雅退出继续优先使用已有 shell/macOS lifecycle 命令，默认不 force quit / `kill -9`。
+2. **Accessibility/AX 或应用内快捷键其次**：窗口已选定后，只要最新 snapshot 提供 `element_index` / `element_token`，就优先使用 AX element action。Finder 目录导航推荐先固定 Finder，再发送 `Cmd-Shift-G`、输入精确绝对路径并按 Enter。
 3. **截图坐标最后**：只有生命周期命令和 AX 都不能完成目标时，才回退到截图像素坐标。
 
-这只是给模型的路由纪律；v1 没有为生命周期操作新增重量级工具，也没有因此增加审批层。
+这只是给模型的路由纪律；目录/文件导航留在已经固定的目标窗口内完成。扩展会拒绝直接、wrapper 或嵌套 shell 中的 `/usr/bin/open` / `open`，并引导模型先调用 `open_application`，再使用 `computer` AX/快捷键。Web URL 优先使用现有 browser 工具。
+
+普通 Web 任务仍优先使用 browser 工具。若用户明确要求操作 Chrome、Safari 等外部浏览器 App，则先用 `open_application` 固定该浏览器，把完整 percent-encoded URL 通过 `printf '%s' '<URL>' | pbcopy` 放入剪贴板，再在固定窗口上用一个 `computer` batch 顺序执行 `CMD+L → CMD+V → RETURN → wait`。不要用 AppleScript/`osascript` 或 shell `open` 做外部浏览器导航，避免 AppleEvents TCC 提示或无响应。
 
 ## 目标与坐标
 
-`open_application` 接受 `bundle_identifier` 或 `application_name`。Cua `launch_app` 返回 PID 和窗口，PipiUI 再执行 `bring_to_front` 与 `get_window_state`，并为 bridge session 原子保存：
+`open_application` 接受 `bundle_identifier` 或 `application_name`。Cua `launch_app` 返回 PID 后，PipiUI 执行 `bring_to_front` 与 `get_window_state`，并为 bridge session 原子保存：
 
 - bundle ID、应用名和 PID；
 - 当前 window ID、同 PID 的 window ID 集合和 revision；

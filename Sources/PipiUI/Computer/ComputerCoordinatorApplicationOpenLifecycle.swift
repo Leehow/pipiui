@@ -46,7 +46,7 @@ extension ComputerCoordinator {
         )
         statusMessage =
             "已打开 \(application.name)，验证目标并释放桌面互斥槽。"
-        execution.reply.respond([
+        var response: [String: Any] = [
             "ok": true,
             "openedApplication": true,
             "foregroundApp": [
@@ -58,9 +58,12 @@ extension ComputerCoordinator {
             "displayID": screenshot.displayID,
             "width": screenshot.imageSize.width,
             "height": screenshot.imageSize.height,
-            "mimeType": "image/png",
-            "base64": screenshot.base64,
-        ])
+        ]
+        ComputerScreenshotMemoryCache.attach(
+            to: &response,
+            pngData: screenshot.pngData
+        )
+        execution.reply.respond(response)
     }
 
     @MainActor

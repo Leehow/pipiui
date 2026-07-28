@@ -7,6 +7,32 @@ import Foundation
 /// coalesce consecutive assistant items before planning — otherwise each round becomes its
 /// own tiny "2 steps" chip instead of one package between text segments.
 enum AssistantBlockLayout {
+    /// Stable identity for one member of a finished thinking/tool group.
+    ///
+    /// Identity is derived from the tool-call id or a deterministic content digest,
+    /// with an occurrence suffix for duplicate members. It deliberately does not use
+    /// the array offset alone: the detail sheet may outlive the lazy transcript row
+    /// that opened it.
+    struct FinishedGroupMember: Equatable, Identifiable {
+        let id: String
+        let block: ChatBlock
+    }
+
+    /// Value handed from a lazy transcript row to the stable detail-level presenter.
+    struct FinishedGroupPresentation: Equatable, Identifiable {
+        let id: String
+        let sessionKey: String
+        let members: [FinishedGroupMember]
+
+        var blocks: [ChatBlock] {
+            members.map(\.block)
+        }
+
+        func belongs(to sessionKey: String) -> Bool {
+            self.sessionKey == sessionKey
+        }
+    }
+
     enum Segment: Equatable {
         case text(String)
         case image(ImageBlock)
@@ -152,10 +178,45 @@ enum AssistantBlockLayout {
         return "\(blocks.count) steps · \(joined)"
     }
 
+    /// Derive stable, unique identities without making transcript layout depend on
+    /// `ForEach` offsets. Duplicate payloads receive deterministic occurrence suffixes.
+    static func finishedGroupMembers(_ blocks: [ChatBlock]) -> [FinishedGroupMember] {
+        var occurrences: [String: Int] = [:]
+        return blocks.map { block in
+            let baseID = finishedGroupMemberBaseID(block)
+            let occurrence = occurrences[baseID, default: 0]
+            occurrences[baseID] = occurrence + 1
+            return FinishedGroupMember(
+                id: "\(baseID)#\(occurrence)",
+                block: block
+            )
+        }
+    }
+
+    /// A presentation id combines the stable logical session, assistant-run scope,
+    /// segment position, and member identities. Segment position is only a disambiguator,
+    /// never the sole identity.
+    static func finishedGroupPresentation(
+        sessionKey: String,
+        scopeID: String,
+        segmentIndex: Int,
+        blocks: [ChatBlock]
+    ) -> FinishedGroupPresentation {
+        let members = finishedGroupMembers(blocks)
+        let memberKey = members.map(\.id).joined(separator: "|")
+        return FinishedGroupPresentation(
+            id: "\(sessionKey):\(scopeID):finished-group:\(segmentIndex):\(memberKey)",
+            sessionKey: sessionKey,
+            members: members
+        )
+    }
+
     /// Tools whose primary UX is a result image — never bury in a finished group,
     /// even before `toolRuns` images arrive (race after `message_end`).
     static let imageResultToolNames: Set<String> = [
         "generate_image",
+        "computer",
+        "open_application",
     ]
 
     /// `browser` multiplexes several actions behind one tool; only `screenshot` returns an
@@ -212,6 +273,31 @@ enum AssistantBlockLayout {
         case .toolCall(let call): return call.name
         case .text, .image, .video: return nil
         }
+    }
+
+    private static func finishedGroupMemberBaseID(_ block: ChatBlock) -> String {
+        switch block {
+        case .thinking(let text):
+            return "thinking:\(stableContentDigest(text))"
+        case .toolCall(let call):
+            return "tool:\(call.id)"
+        case .text(let text):
+            return "text:\(stableContentDigest(text))"
+        case .image(let image):
+            return "image:\(image.id)"
+        case .video(let video):
+            return "video:\(video.id)"
+        }
+    }
+
+    /// FNV-1a gives deterministic cross-launch identity; Swift's `Hasher` is randomized.
+    private static func stableContentDigest(_ text: String) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in text.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return String(format: "%016llx", hash)
     }
 }
 

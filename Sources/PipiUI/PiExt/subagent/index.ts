@@ -81,6 +81,34 @@ const PIPIUI_SUBAGENT_SKILL_ISOLATION = process.env.PIPIUI_SUBAGENT_SKILL_ISOLAT
 // Read-only planners additionally cannot pull SKILL.md through the read tool.
 const PIPIUI_SKILL_READ_BLOCK = process.env.PIPIUI_SKILL_READ_BLOCK === "1";
 
+/** Where the pipi-philosophy package keeps its config; the App writes defaults on install. */
+const PHILOSOPHY_CONFIG = path.join(os.homedir(), ".pi", "agent", "philosophy.json");
+
+/**
+ * Is the fan-out philosophy layer live for this session?
+ *
+ * That layer's whole premise is that workers run in the background and report through signals
+ * — a boss that blocks on each dispatch is running a fake fan-out. So while the layer is on,
+ * background stops being a per-call preference and becomes a runtime invariant, exactly like
+ * the depth guard. Mirrors the composer: a layer is active unless switched off, and `fanout`
+ * additionally dies with `orchestration`.
+ *
+ * Read fresh per call so a Settings toggle applies without restarting the session. A missing
+ * config file means the philosophy is not installed here, and the old caller-decides
+ * behaviour stands.
+ */
+function fanoutLayerActive(): boolean {
+	let parsed: { enabled?: unknown; layers?: Record<string, unknown> };
+	try {
+		parsed = JSON.parse(fs.readFileSync(PHILOSOPHY_CONFIG, "utf-8"));
+	} catch {
+		return false;
+	}
+	if (parsed?.enabled === false) return false;
+	const layers = parsed?.layers ?? {};
+	return layers.fanout !== false && layers.orchestration !== false;
+}
+
 // 跟踪本扩展 spawn 出的子 pi，父进程退出时尽量收割，避免孤儿继续打桥接
 const pipiuiChildProcs = new Set<ReturnType<typeof spawn>>();
 
@@ -2193,6 +2221,7 @@ export default function (pi: ExtensionAPI) {
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
+			"While the fan-out philosophy layer is active, background=false is ignored at boss depth — asynchronous dispatch is that layer's premise, not a preference. Use chain for genuinely ordered synchronous steps.",
 			"By default each worker writes in an isolated git worktree under .pi/worktrees/ on a pipiui/agent-* branch; pass explicit cwd or set PIPIUI_WORKTREE=0 to disable. The runtime-owned secretary role is the exception: it always runs in PIPIUI_MAIN_CWD with recursive delegation disabled and never creates a worktree. On successful worker end the app auto-merges into the main project, removes the worktree, and safely deletes only a merged internal branch with git branch -d. If merge or cleanup fails, the main session retains actionable state; failed/aborted keeps worktree for resume (GUI merge/discard fallback).",
 			"Track jobs with subagent_status(agentId?). Never re-spawn a finished task without reading its result via [subagent-done] or subagent_status.",
 			'Abort a running background job with action:"abort" + agentId (equivalent to /subagent_abort); it ends as aborted and still reports [subagent-done].',
@@ -2232,12 +2261,19 @@ export default function (pi: ExtensionAPI) {
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 			const isChain = hasChain;
 			// Default background at boss depth for single/parallel; chain and nested always sync.
-			const wantBg = params.background ?? (PIPIUI_DEPTH === 0 && !isChain);
+			// While the fan-out layer is on, background is not the caller's to switch off: a boss
+			// that blocks on every dispatch is running a fake fan-out, and the guard has to be
+			// here rather than in the prompt — models do pass background:false regardless of what
+			// the system prompt says.
+			const forcedBackground = PIPIUI_DEPTH === 0 && !isChain && fanoutLayerActive();
+			const wantBg = forcedBackground || (params.background ?? (PIPIUI_DEPTH === 0 && !isChain));
 			const useBackground = Boolean(wantBg && !isChain && PIPIUI_DEPTH === 0);
 			const bgIgnoredWarning =
 				params.background === true && (PIPIUI_DEPTH > 0 || isChain)
 					? "Warning: background:true ignored (nested depth>0 or chain mode always runs synchronously).\n\n"
-					: "";
+					: params.background === false && forcedBackground
+						? "Warning: background:false ignored — the fan-out philosophy layer is active, and it requires dispatch to stay asynchronous. Do not wait here: keep dispatching independent work, then read [subagent-done]. Use chain if you genuinely need ordered synchronous steps, or turn off the 瀑布流 layer in Settings.\n\n"
+						: "";
 
 			const makeDetails =
 				(mode: "single" | "parallel" | "chain", extra?: { background?: boolean; agentIds?: string[] }) =>
