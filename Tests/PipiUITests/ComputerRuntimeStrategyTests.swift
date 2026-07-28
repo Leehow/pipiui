@@ -159,6 +159,43 @@ final class ComputerRuntimeStrategyTests: XCTestCase {
         )
     }
 
+    func testApplyingSameExternalPathStillRequestsHotReload() {
+        let samePath = "/tmp/custom-computer-strategy.ts"
+        let decision = ComputerUseSettings.externalStrategyApplyDecision(
+            submittedPath: "  \(samePath)  ",
+            currentPath: samePath,
+            computerUseEnabled: true,
+            strategyKind: .external
+        )
+        XCTAssertEqual(decision.normalizedPath, samePath)
+        XCTAssertFalse(decision.shouldPersist)
+        XCTAssertTrue(decision.shouldRestartSessions)
+
+        XCTAssertFalse(
+            ComputerUseSettings.externalStrategyApplyDecision(
+                submittedPath: samePath,
+                currentPath: samePath,
+                computerUseEnabled: false,
+                strategyKind: .external
+            ).shouldRestartSessions
+        )
+        XCTAssertFalse(
+            ComputerUseSettings.externalStrategyApplyDecision(
+                submittedPath: samePath,
+                currentPath: samePath,
+                computerUseEnabled: true,
+                strategyKind: .builtIn
+            ).shouldRestartSessions
+        )
+    }
+
+    func testNestedStrategySurfaceUsesOnlyStableReservedToolNames() {
+        XCTAssertEqual(
+            ComputerUseSettings.requiredNestedStrategyToolNames,
+            ["computer", "open_application"]
+        )
+    }
+
     func testRuntimeV1HandshakeAndVersionFailureAreStructured() throws {
         let descriptor = ComputerCaptureDescriptor(
             displayID: 7,
@@ -217,5 +254,53 @@ final class ComputerRuntimeStrategyTests: XCTestCase {
         )
         XCTAssertEqual(runtimeError["code"] as? String, "runtime_error")
         XCTAssertEqual(runtimeError["message"] as? String, "permission missing")
+    }
+
+    func testKnownLowerLevelRuntimeErrorsGetExplicitSemantics() throws {
+        let expectations: [(String, Bool, Bool)] = [
+            ("computer_busy", true, false),
+            ("computer_cancelled", true, true),
+            ("request_cancelled", true, true),
+            ("computer_target_missing", false, true),
+            ("computer_target_lost", false, true),
+            ("computer_outcome_unknown", false, true),
+            ("user_handoff_required", true, true),
+            ("cua_driver_error", false, true),
+            ("invalid_application_target", false, false),
+            ("invalid_computer_request", false, false),
+        ]
+
+        for (code, retryable, requiresObservation) in expectations {
+            let response = ComputerRuntimeContract.compatibilityEnvelope([
+                "ok": false,
+                "errorCode": code,
+                "error": "fixture",
+            ])
+            let runtimeError = try XCTUnwrap(
+                response["runtimeError"] as? [String: Any]
+            )
+            XCTAssertEqual(
+                runtimeError["retryable"] as? Bool,
+                retryable,
+                code
+            )
+            XCTAssertEqual(
+                runtimeError["requiresObservation"] as? Bool,
+                requiresObservation,
+                code
+            )
+        }
+    }
+
+    func testOutcomeUnknownNeverAuthorizesBlindRetry() {
+        XCTAssertEqual(
+            ComputerRuntimeContract.errorSemantics(
+                for: "computer_outcome_unknown"
+            ),
+            ComputerRuntimeErrorSemantics(
+                retryable: false,
+                requiresObservation: true
+            )
+        )
     }
 }

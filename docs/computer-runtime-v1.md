@@ -1,12 +1,17 @@
 # PipiUI Computer Runtime v1
 
-PipiUI exposes a loopback-only, capability-authenticated desktop runtime to one
-trusted Pi extension selected by the user. PipiUI owns macOS permissions,
-capture, accessibility, input delivery, target PID/window validation,
-coordinate conversion, cancellation, the global execution mutex, helper
-lifecycle, emergency stop, and held-input cleanup. The Pi extension owns tool
-schemas and descriptions, prompting, routing, batching, retries, provider
+PipiUI exposes a loopback-only, capability-authenticated desktop runtime and
+explicitly mounts exactly one Pi strategy selected by the user. PipiUI owns
+macOS permissions, capture, accessibility, input delivery, target PID/window
+validation, coordinate conversion, cancellation, the global execution mutex,
+helper lifecycle, emergency stop, and held-input cleanup. The Pi strategy owns
+tool schemas and descriptions, prompting, routing, batching, retries, provider
 adaptation, and model-context shaping.
+
+This is a selection boundary, not code isolation. Pi can also auto-discover or
+load other extensions, and every extension in the same Pi process can read the
+process environment that carries Runtime capabilities. Treat all extensions in
+that process as trusted.
 
 The Cua helper is private implementation detail. Strategy extensions must use
 this contract rather than starting or calling that helper directly.
@@ -23,15 +28,30 @@ PipiUI validates the configured path and blocks Pi session startup with a clear
 error if it is missing, unreadable, or unsupported. It never silently falls
 back to the built-in strategy. Exactly one strategy is mounted with Pi `-e`.
 Nested Pi processes dispatched by PipiUI mount the same selected path.
+Choosing **应用** restarts all open Pi sessions when Computer Use is enabled
+and the external strategy is selected. Applying an unchanged path deliberately
+does the same, providing a simple edit-and-reload loop; merely opening Settings
+or refreshing its status does not restart sessions.
 
 External Pi extensions are trusted executable code. While Computer Use is on,
-the selected extension can act through the desktop runtime. Review its source
-and provenance before enabling it.
+the explicitly selected strategy and any other extension in the same Pi process
+can read the Runtime capability and attempt desktop requests. Review the source
+and provenance of the complete Pi extension set before enabling it.
+
+### Required nested strategy surface
+
+An external v1 strategy that must work in PipiUI-dispatched nested Pi processes
+must register tools named exactly `computer` and `open_application`. PipiUI's
+explicit subagent tool allowlist knows only those two reserved names. Additional
+custom tools may work in a top-level Pi session, but arbitrary names are not
+automatically added to nested explicit allowlists.
 
 ## Discovery and lifecycle
 
-PipiUI injects these process environment variables into the selected top-level
-strategy and its dispatched Pi children:
+PipiUI injects these environment variables into the owning top-level Pi process,
+and dispatched Pi children inherit the corresponding values. They are not
+scoped to the selected extension: every extension loaded in one of those
+processes can read its process environment.
 
 | Variable | Meaning |
 |---|---|
@@ -54,9 +74,14 @@ Computer Runtime request must carry both capability values and
 `protocolVersion: 1`.
 
 Capabilities are per session, remain in process memory, and must not be written
-to disk or logs. PipiUI revokes their usefulness when the session closes,
-Computer Use is disabled, or emergency stop terminates the active workflow.
-Extensions must not pass them to unrelated subprocesses.
+to disk or logs. Closing a session terminates its Pi process. Disabling Computer
+Use restarts open sessions without the strategy mount or desktop capability, so
+the old process-held values become unusable. Emergency stop is different: it
+latches desktop execution off, cancels active work, clears targets, and releases
+held input, but does not rotate the `computerRoutingKey` or the environment
+value in a still-live Pi process. Runtime execution remains blocked until the
+user explicitly re-enables it. Extensions must not pass capabilities to
+unrelated subprocesses.
 
 ## Request envelope and negotiation
 
@@ -210,7 +235,9 @@ v1 failures retain the legacy top-level `error` string and add the stable
 
 Clients should branch on `runtimeError.code`, `retryable`, and
 `requiresObservation`; `message` and legacy `error` are diagnostic text and may
-change. Contract-level codes in v1 are:
+change. `retryable: true` means a retry is eligible only after satisfying
+`requiresObservation` and any user/runtime prerequisite; it never instructs a
+client to retry blindly. Stable v1 guidance includes:
 
 - `unauthorized_session_capability`: do not retry; the owning Pi session ended
   or the session capability is invalid.
@@ -219,18 +246,33 @@ change. Contract-level codes in v1 are:
 - `runtime_unavailable`: fix display/runtime configuration or permissions.
 - `request_cancelled`: retry only when the user still wants the operation, and
   observe again first.
+- `computer_busy`: the request was rejected before execution; retry after the
+  current desktop operation finishes.
+- `computer_cancelled`: cancellation can race with posted input; observe again
+  before a user-intended retry.
+- `computer_target_missing` / `computer_target_lost`: do not retry the same
+  batch; use `open_application` to establish and observe the exact target.
+- `computer_outcome_unknown`: do not blindly retry. Reopen and observe the exact
+  target before deciding the next action.
+- `user_handoff_required`: let the user complete the protected prompt, then
+  observe before retrying.
+- `cua_driver_error`: do not retry the same mutation because its outcome may be
+  uncertain; observe first.
+- `invalid_application_target` / `invalid_computer_request`: correct the
+  request rather than retrying it unchanged.
 - `runtime_error`: compatibility wrapper for a runtime-mechanics failure that
   does not yet have a narrower stable code.
 
-Additional lower-level codes may be returned. Unknown codes must be treated
-according to `retryable` and `requiresObservation`, not guessed from message
-text.
+Additional lower-level codes may be returned. The compatibility wrapper emits
+conservative `false` flags for unknown codes. Those values do not prove that
+continuing without observation is safe: clients must fail closed, surface the
+diagnostic, and must not guess behavior from message text.
 
 ## Minimal third-party TypeScript strategy
 
-This example registers a deliberately small `computer` tool. A production
-strategy should add cancellation, result shaping, screenshot memory handling,
-and provider-specific hooks as needed.
+This example registers the two required nested-compatible tool names. A
+production strategy should add cancellation, result shaping, screenshot memory
+handling, and provider-specific hooks as needed.
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -289,6 +331,33 @@ export default function strategy(pi: ExtensionAPI) {
       };
     },
   });
+
+  pi.registerTool({
+    name: "open_application",
+    label: "Open Application",
+    description: "Launch or activate an exact app and establish its target.",
+    parameters: Type.Object({
+      bundle_identifier: Type.Optional(Type.String()),
+      application_name: Type.Optional(Type.String()),
+    }),
+    async execute(_toolCallId, input) {
+      capabilities ??= await rpc({
+        action: "computer_runtime_capabilities",
+      });
+      const result = await rpc({
+        action: "computer_open_application",
+        requestID: crypto.randomUUID(),
+        displayID: capabilities.display.id,
+        displayWidth: capabilities.display.width,
+        displayHeight: capabilities.display.height,
+        ...input,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        details: result,
+      };
+    },
+  });
 }
 ```
 
@@ -303,7 +372,9 @@ requires a new major protocol version.
 
 The built-in strategy continues to register the custom Pi `computer` and
 `open_application` tools and adapts supported Anthropic models to
-`computer_20251124`. The current Pi extension surface does **not** promise an
-OpenAI-native `computer_call` / `computer_call_output` lifecycle. OpenAI and
-OpenAI-compatible providers continue to use the custom tool unless a future
-runtime and Pi extension contract explicitly adds native support.
+`computer_20251124`. External strategies should keep those exact names when
+nested compatibility is required. The current Pi extension surface does
+**not** promise an OpenAI-native `computer_call` / `computer_call_output`
+lifecycle. OpenAI and OpenAI-compatible providers continue to use the custom
+tool unless a future runtime and Pi extension contract explicitly adds native
+support.

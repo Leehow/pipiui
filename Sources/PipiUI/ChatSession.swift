@@ -491,8 +491,8 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Immutable capability used by bridge extensions spawned with this process.
     /// Unlike the open-session key, this survives edit-fork file rebinding.
     package let bridgeRoutingKey = BridgeCapabilityToken.generate()
-    /// Separate desktop-write capability. It is mounted only in the top-level
-    /// computer extension and forwarded only to dispatched Pi subagent processes.
+    /// Separate desktop-write capability. It is exposed through the Pi process
+    /// environment, so every trusted extension loaded in that process can read it.
     package let computerRoutingKey = BridgeCapabilityToken.generate()
     let projectURL: URL
 

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { RESERVED_DESKTOP_TOOL_NAMES } from "../../Sources/PipiUI/PiExt/subagent/desktop-tool-policy.mjs";
 
 const strategyURL = new URL(
   "../../Sources/PipiUI/PiExt/computer-use-strategy.ts",
@@ -55,7 +56,10 @@ test("custom tools and Anthropic adaptation remain while native OpenAI is not cl
   assert.match(strategy, /computer-use-2025-11-24/);
   assert.doesNotMatch(strategy, /name: "computer_call"/);
   assert.doesNotMatch(strategy, /type: "computer_call"/);
-  assert.match(contractDoc, /does \*\*not\*\* promise an[\s\S]*OpenAI-native/);
+  assert.match(
+    contractDoc,
+    /does[\s\S]*\*\*not\*\* promise an OpenAI-native/,
+  );
 });
 
 test("capability tokens have no persisted settings key or documented logging path", async () => {
@@ -68,4 +72,40 @@ test("capability tokens have no persisted settings key or documented logging pat
     /computerCapability|sessionKey|PIPIUI_COMPUTER_CAPABILITY/,
   );
   assert.match(contractDoc, /must not be written[\s\S]*to disk or logs/);
+});
+
+test("nested strategy compatibility is limited to the two reserved tool names", async () => {
+  const [settings, contractDoc] = await Promise.all([
+    readFile(settingsURL, "utf8"),
+    readFile(contractDocURL, "utf8"),
+  ]);
+  assert.deepEqual(
+    [...RESERVED_DESKTOP_TOOL_NAMES],
+    ["computer", "open_application"],
+  );
+  assert.match(settings, /requiredNestedStrategyToolNames/);
+  assert.match(
+    contractDoc,
+    /must register tools named exactly `computer` and `open_application`/,
+  );
+  assert.match(
+    contractDoc,
+    /arbitrary names are not[\s\S]*automatically added to nested explicit allowlists/,
+  );
+});
+
+test("runtime docs state the process-level trust and emergency-stop lifecycle", async () => {
+  const contractDoc = await readFile(contractDocURL, "utf8");
+  assert.match(
+    contractDoc,
+    /every extension in the same Pi process can read the[\s\S]*process environment/,
+  );
+  assert.match(
+    contractDoc,
+    /Emergency stop[\s\S]*does not rotate the `computerRoutingKey`/,
+  );
+  assert.match(
+    contractDoc,
+    /Applying an unchanged path deliberately[\s\S]*edit-and-reload loop/,
+  );
 });

@@ -27,6 +27,12 @@ struct ComputerUseStrategySelection: Equatable {
     }
 }
 
+struct ComputerUseExternalStrategyApplyDecision: Equatable {
+    let normalizedPath: String
+    let shouldPersist: Bool
+    let shouldRestartSessions: Bool
+}
+
 enum ComputerUseStrategySelectionError: LocalizedError, Equatable {
     case builtInUnavailable
     case externalPathMissing
@@ -70,6 +76,13 @@ enum ComputerUseSettings {
 
     static let defaultMaxLongEdge = 1440
     static let supportedLongEdges = [1080, 1440]
+    /// PipiUI's nested Pi allowlist recognizes only these stable strategy tool
+    /// names. Additional tools may be useful top-level, but are not guaranteed
+    /// to survive an explicit subagent tool allowlist.
+    static let requiredNestedStrategyToolNames = [
+        "computer",
+        "open_application",
+    ]
 
     static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
         defaults.object(forKey: enabledKey) as? Bool ?? false
@@ -105,6 +118,29 @@ enum ComputerUseSettings {
         defaults.set(
             path.trimmingCharacters(in: .whitespacesAndNewlines),
             forKey: externalStrategyPathKey
+        )
+    }
+
+    /// Applying an external strategy is also the explicit hot-reload action.
+    /// Re-applying an unchanged path must therefore restart eligible sessions;
+    /// passive status reads do not call this seam and remain side-effect free.
+    static func externalStrategyApplyDecision(
+        submittedPath: String,
+        currentPath: String,
+        computerUseEnabled: Bool,
+        strategyKind: ComputerUseStrategyKind
+    ) -> ComputerUseExternalStrategyApplyDecision {
+        let normalizedPath = submittedPath.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let normalizedCurrentPath = currentPath.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        return ComputerUseExternalStrategyApplyDecision(
+            normalizedPath: normalizedPath,
+            shouldPersist: normalizedPath != normalizedCurrentPath,
+            shouldRestartSessions:
+                computerUseEnabled && strategyKind == .external
         )
     }
 

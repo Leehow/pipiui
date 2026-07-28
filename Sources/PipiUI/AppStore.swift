@@ -214,11 +214,18 @@ final class AppStore: ObservableObject {
     }
 
     func setExternalComputerUseStrategyPath(_ path: String) {
-        let normalized = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard ComputerUseSettings.externalStrategyPath() != normalized else { return }
-        ComputerUseSettings.setExternalStrategyPath(normalized)
-        if computerUseEnabled,
-           ComputerUseSettings.strategyKind() == .external {
+        let decision = ComputerUseSettings.externalStrategyApplyDecision(
+            submittedPath: path,
+            currentPath: ComputerUseSettings.externalStrategyPath(),
+            computerUseEnabled: computerUseEnabled,
+            strategyKind: ComputerUseSettings.strategyKind()
+        )
+        if decision.shouldPersist {
+            ComputerUseSettings.setExternalStrategyPath(
+                decision.normalizedPath
+            )
+        }
+        if decision.shouldRestartSessions {
             restartAllOpenSessions()
         }
     }

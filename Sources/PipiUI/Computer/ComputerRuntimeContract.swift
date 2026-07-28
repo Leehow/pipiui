@@ -1,5 +1,10 @@
 import Foundation
 
+struct ComputerRuntimeErrorSemantics: Equatable {
+    let retryable: Bool
+    let requiresObservation: Bool
+}
+
 /// Public, versioned boundary between PipiUI's desktop runtime and a trusted
 /// replaceable Pi strategy. The Cua helper remains private to the App.
 enum ComputerRuntimeContract {
@@ -128,15 +133,67 @@ enum ComputerRuntimeContract {
         }
         let message = response["error"] as? String ?? "computer runtime request failed"
         let code = response["errorCode"] as? String ?? "runtime_error"
+        let semantics = errorSemantics(for: code)
         var result = response
         result["errorCode"] = code
         result["runtimeError"] = [
             "code": code,
             "message": message,
-            "retryable": response["retryable"] as? Bool ?? false,
+            "retryable":
+                response["retryable"] as? Bool ?? semantics.retryable,
             "requiresObservation":
-                response["requiresObservation"] as? Bool ?? false,
+                response["requiresObservation"] as? Bool
+                ?? semantics.requiresObservation,
         ]
         return result
+    }
+
+    /// Stable guidance for lower-level mechanics codes that predate Runtime v1.
+    /// Unknown codes fail closed: absence of positive guidance never authorizes
+    /// a retry or proves that continuing without observation is safe.
+    static func errorSemantics(for code: String) -> ComputerRuntimeErrorSemantics {
+        switch code {
+        case "computer_busy":
+            // The request was rejected before execution began.
+            return ComputerRuntimeErrorSemantics(
+                retryable: true,
+                requiresObservation: false
+            )
+        case "computer_cancelled", "request_cancelled":
+            // Cancellation can race with already-posted input.
+            return ComputerRuntimeErrorSemantics(
+                retryable: true,
+                requiresObservation: true
+            )
+        case "computer_target_missing",
+             "computer_target_lost",
+             "computer_outcome_unknown",
+             "cua_driver_error":
+            return ComputerRuntimeErrorSemantics(
+                retryable: false,
+                requiresObservation: true
+            )
+        case "user_handoff_required":
+            return ComputerRuntimeErrorSemantics(
+                retryable: true,
+                requiresObservation: true
+            )
+        case "invalid_application_target",
+             "invalid_computer_request",
+             "unauthorized_session_capability",
+             "unauthorized_computer_capability",
+             "unsupported_protocol_version",
+             "runtime_unavailable",
+             "runtime_error":
+            return ComputerRuntimeErrorSemantics(
+                retryable: false,
+                requiresObservation: false
+            )
+        default:
+            return ComputerRuntimeErrorSemantics(
+                retryable: false,
+                requiresObservation: false
+            )
+        }
     }
 }
