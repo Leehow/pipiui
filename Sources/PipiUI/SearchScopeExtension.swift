@@ -73,6 +73,35 @@ enum SearchScopeExtension {
         )
     }
 
+    /// Apply the authorization semantics attached to the message that is about
+    /// to reach Pi. Queueing/retry must carry this policy with the message.
+    static func applyPromptPolicy(
+        _ policy: PromptSearchGrantPolicy,
+        prompt: String,
+        sessionKey: String,
+        projectRoot: URL,
+        baseDirectory: URL? = nil
+    ) throws {
+        switch policy {
+        case .localHumanRecordPromptPaths:
+            try recordUserTurn(
+                prompt,
+                sessionKey: sessionKey,
+                projectRoot: projectRoot,
+                baseDirectory: baseDirectory
+            )
+        case .appAuthoredPreserveLatestHumanGrant:
+            break
+        case .remoteClearGrant:
+            try recordUserTurn(
+                "",
+                sessionKey: sessionKey,
+                projectRoot: projectRoot,
+                baseDirectory: baseDirectory
+            )
+        }
+    }
+
     static func readGrantFile(at url: URL) throws -> TurnGrant {
         try JSONDecoder().decode(TurnGrant.self, from: Data(contentsOf: url))
     }

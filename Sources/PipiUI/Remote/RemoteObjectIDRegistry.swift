@@ -14,6 +14,20 @@ struct RemoteDesktopSelectionState: Equatable {
     }
 }
 
+enum RemoteSelectionNeutralMutation {
+    /// Execute an open-session mutation while mechanically checking that neither
+    /// desktop selection changed. AppStore uses the same seam covered by tests.
+    static func perform<Result>(
+        selection: () -> RemoteDesktopSelectionState,
+        mutation: () -> Result
+    ) -> Result {
+        let before = selection()
+        let result = mutation()
+        assert(before == selection(), "background session mutation changed desktop selection")
+        return result
+    }
+}
+
 /// Runtime-only opaque identifiers for the local test host.
 ///
 /// These values are identifiers, not authorization capabilities. They are never

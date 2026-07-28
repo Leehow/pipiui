@@ -2,6 +2,14 @@ import XCTest
 @testable import PipiUI
 
 final class LocalRemoteWebTests: XCTestCase {
+    private func temporaryDirectory(_ prefix: String) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+
     func testOpaqueRegistryNeverUsesLocalPathsAsIDs() {
         let registry = RemoteObjectIDRegistry()
         let projectPath = "/Users/private-name/secret-project"
@@ -26,23 +34,25 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertNotEqual(projectID, sessionID)
     }
 
-    func testBackgroundSelectionInvariantDetectsEitherDesktopMutation() {
-        let snapshot = RemoteDesktopSelectionState(
+    func testSelectionNeutralMutationChangesSessionStateWithoutChangingDesktopSelection() {
+        let selection = RemoteDesktopSelectionState(
             projectPath: "/project/selected",
             sessionKey: "selected-session"
         )
-        XCTAssertTrue(snapshot.matches(
-            projectPath: "/project/selected",
-            sessionKey: "selected-session"
-        ))
-        XCTAssertFalse(snapshot.matches(
-            projectPath: "/project/other",
-            sessionKey: "selected-session"
-        ))
-        XCTAssertFalse(snapshot.matches(
-            projectPath: "/project/selected",
-            sessionKey: "other-session"
-        ))
+        var openSessionKeys: [String] = []
+
+        let inserted = RemoteSelectionNeutralMutation.perform(
+            selection: { selection },
+            mutation: {
+                openSessionKeys.append("background-session")
+                return openSessionKeys[0]
+            }
+        )
+
+        XCTAssertEqual(inserted, "background-session")
+        XCTAssertEqual(openSessionKeys, ["background-session"])
+        XCTAssertEqual(selection.projectPath, "/project/selected")
+        XCTAssertEqual(selection.sessionKey, "selected-session")
     }
 
     func testRemoteBuiltinSlashCommandsAreRejectedButUnknownCommandsPass() {
@@ -56,7 +66,7 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertNil(RemotePromptPolicy.rejectedBuiltinName(in: "explain /new"))
     }
 
-    func testChatSessionRemoteSubmissionSeamRejectsBuiltinAndAcceptsUnknownSlash() {
+    func testChatSessionRemoteSubmissionRejectsUnavailableBeforeOptimisticMutation() {
         let session = ChatSession(
             id: "remote-test-session",
             projectURL: URL(fileURLWithPath: "/tmp/remote-test-project"),
@@ -68,9 +78,8 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertEqual(session.submitRemotePrompt("/new"), .rejectedBuiltin("new"))
         XCTAssertTrue(session.transcript.isEmpty)
 
-        XCTAssertEqual(session.submitRemotePrompt("/extension_command go"), .accepted)
-        XCTAssertEqual(session.transcript.count, 1)
-        XCTAssertEqual(session.transcript.first?.role, "user")
+        XCTAssertEqual(session.submitRemotePrompt("/extension_command go"), .unavailable)
+        XCTAssertTrue(session.transcript.isEmpty)
     }
 
     func testRemoteStopCannotStickIdleSessionInStoppingState() {
@@ -101,22 +110,77 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertFalse(cache.contains("two", now: start.addingTimeInterval(11)))
     }
 
-    func testRemoteAuthorizationPolicySurvivesQueueDrainAndRetry() {
+    func testAllSearchGrantPoliciesSurviveQueueDrainAndRetry() {
         var queue = SessionMessageQueue()
-        XCTAssertTrue(queue.enqueue(
-            text: "remote",
-            recordsSearchScopeGrant: false
-        ))
-        let popped = queue.popForIdleDrain(isStreaming: false, processAlive: true)
-        XCTAssertEqual(popped?.text, "remote")
-        XCTAssertEqual(popped?.recordsSearchScopeGrant, false)
-        if let popped {
-            queue.requeueFront(popped)
+        let policies: [PromptSearchGrantPolicy] = [
+            .localHumanRecordPromptPaths,
+            .appAuthoredPreserveLatestHumanGrant,
+            .remoteClearGrant,
+        ]
+        for (index, policy) in policies.enumerated() {
+            XCTAssertTrue(queue.enqueue(
+                text: "message-\(index)",
+                searchGrantPolicy: policy
+            ))
         }
+        for policy in policies {
+            let popped = queue.popForIdleDrain(isStreaming: false, processAlive: true)
+            XCTAssertEqual(popped?.searchGrantPolicy, policy)
+            if let popped {
+                queue.requeueFront(popped)
+                XCTAssertEqual(
+                    queue.popForIdleDrain(isStreaming: false, processAlive: true)?
+                        .searchGrantPolicy,
+                    policy
+                )
+            }
+        }
+    }
+
+    func testSearchGrantPoliciesRecordPreserveAndRemoteClearUsingRealGrantFile() throws {
+        let stateRoot = try temporaryDirectory("pipiui-remote-grant-state")
+        let projectRoot = try temporaryDirectory("pipiui-remote-grant-project")
+        let sessionKey = "remote-policy-session"
+        let grantURL = SearchScopeExtension.grantFileURL(
+            sessionKey: sessionKey,
+            baseDirectory: stateRoot
+        )
+
+        try SearchScopeExtension.applyPromptPolicy(
+            .localHumanRecordPromptPaths,
+            prompt: "inspect /sensitive/path",
+            sessionKey: sessionKey,
+            projectRoot: projectRoot,
+            baseDirectory: stateRoot
+        )
         XCTAssertEqual(
-            queue.popForIdleDrain(isStreaming: false, processAlive: true)?
-                .recordsSearchScopeGrant,
-            false
+            try SearchScopeExtension.readGrantFile(at: grantURL).paths,
+            ["/sensitive/path"]
+        )
+
+        try SearchScopeExtension.applyPromptPolicy(
+            .appAuthoredPreserveLatestHumanGrant,
+            prompt: "app asks about /different/path",
+            sessionKey: sessionKey,
+            projectRoot: projectRoot,
+            baseDirectory: stateRoot
+        )
+        XCTAssertEqual(
+            try SearchScopeExtension.readGrantFile(at: grantURL).paths,
+            ["/sensitive/path"],
+            "app-authored text must preserve the last human grant"
+        )
+
+        try SearchScopeExtension.applyPromptPolicy(
+            .remoteClearGrant,
+            prompt: "remote asks about /sensitive/path",
+            sessionKey: sessionKey,
+            projectRoot: projectRoot,
+            baseDirectory: stateRoot
+        )
+        XCTAssertTrue(
+            try SearchScopeExtension.readGrantFile(at: grantURL).paths.isEmpty,
+            "remote input must revoke the previous local human grant"
         )
     }
 
@@ -253,6 +317,86 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertFalse(messages[0].text.contains("image.png"))
         XCTAssertEqual(messages[0].text, "inspect [local path]")
         XCTAssertEqual(messages[1].text, "stored under [local path]")
+    }
+
+    func testSnapshotCacheReturns304WithoutRenormalizingFinalizedTranscript() throws {
+        let cache = RemoteSnapshotCache()
+        let finalized = [
+            ChatItem(id: "f1", role: "user", blocks: [.text("hello")]),
+        ]
+        let initial = RemoteSnapshotCacheInput(
+            sessionID: "snapshot-session",
+            title: "title",
+            transcriptVersion: 1,
+            finalizedItems: finalized,
+            streamingItem: nil,
+            projectPath: "/project",
+            homeDirectory: "/Users/test"
+        )
+
+        guard case .response(let firstData, let firstRevision) = cache.resolve(
+            initial,
+            requestedRevision: nil
+        ) else {
+            return XCTFail("first snapshot should be encoded")
+        }
+        XCTAssertEqual(firstRevision, 1)
+        XCTAssertFalse(firstData.isEmpty)
+        XCTAssertEqual(cache.finalizedNormalizationCount, 1)
+        XCTAssertEqual(cache.streamingNormalizationCount, 0)
+
+        guard case .notModified(let unchangedRevision) = cache.resolve(
+            initial,
+            requestedRevision: firstRevision
+        ) else {
+            return XCTFail("unchanged poll should return 304 decision")
+        }
+        XCTAssertEqual(unchangedRevision, firstRevision)
+        XCTAssertEqual(cache.finalizedNormalizationCount, 1)
+        XCTAssertEqual(cache.streamingNormalizationCount, 0)
+
+        let streaming = RemoteSnapshotCacheInput(
+            sessionID: "snapshot-session",
+            title: "title",
+            transcriptVersion: 1,
+            finalizedItems: finalized,
+            streamingItem: ChatItem(
+                id: "stream",
+                role: "assistant",
+                blocks: [.text("partial")]
+            ),
+            isGenerating: true,
+            projectPath: "/project",
+            homeDirectory: "/Users/test"
+        )
+        guard case .response(_, let streamingRevision) = cache.resolve(
+            streaming,
+            requestedRevision: firstRevision
+        ) else {
+            return XCTFail("streaming change should produce a new snapshot")
+        }
+        XCTAssertEqual(streamingRevision, 2)
+        XCTAssertEqual(cache.finalizedNormalizationCount, 1)
+        XCTAssertEqual(cache.streamingNormalizationCount, 1)
+
+        let statusOnly = RemoteSnapshotCacheInput(
+            sessionID: "snapshot-session",
+            title: "title",
+            transcriptVersion: 1,
+            finalizedItems: finalized,
+            streamingItem: streaming.streamingItem,
+            isGenerating: true,
+            isStopping: true,
+            projectPath: "/project",
+            homeDirectory: "/Users/test"
+        )
+        _ = cache.resolve(statusOnly, requestedRevision: streamingRevision)
+        XCTAssertEqual(cache.finalizedNormalizationCount, 1)
+        XCTAssertEqual(
+            cache.streamingNormalizationCount,
+            1,
+            "status-only changes must reuse both finalized and streaming normalization"
+        )
     }
 
     func testWebPageUsesSafeDOMAndDoesNotPutTokenInURL() throws {

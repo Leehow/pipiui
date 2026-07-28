@@ -678,8 +678,6 @@ final class ChatSession: ObservableObject, Identifiable {
     private var deferredInitialEvents: [J] = []
     private var cachedBranchMessages: [J] = []
     private var cachedLeafId: String?
-    /// Exact app-generated prompts that must neither create nor revoke a human path grant.
-    private var searchGrantSuppressedMessages: [String: Int] = [:]
     /// Offline preview state is replaced (not appended as optimistic live content) once
     /// authoritative get_messages completes.
     private var initialPreviewItemCount = 0
@@ -2476,6 +2474,18 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     func sendPrompt(_ text: String, images: [DraftImage] = []) {
+        sendPrompt(
+            text,
+            images: images,
+            searchGrantPolicy: .localHumanRecordPromptPaths
+        )
+    }
+
+    private func sendPrompt(
+        _ text: String,
+        images: [DraftImage],
+        searchGrantPolicy: PromptSearchGrantPolicy
+    ) {
         let expanded = expandedDraftText(from: text)
         // Bodies are now in `expanded`; drop map so markers cannot be re-expanded later.
         clearDraftPastes()
@@ -2512,7 +2522,7 @@ final class ChatSession: ObservableObject, Identifiable {
             let ok = queue.enqueue(
                 text: prepared.message,
                 images: prepared.images,
-                recordsSearchScopeGrant: true
+                searchGrantPolicy: searchGrantPolicy
             )
             if ok { publishQueue() }
             return
@@ -2520,7 +2530,7 @@ final class ChatSession: ObservableObject, Identifiable {
         sendPromptNow(
             message: prepared.message,
             images: prepared.images,
-            recordsSearchScopeGrant: true
+            searchGrantPolicy: searchGrantPolicy
         )
     }
 
@@ -2528,6 +2538,7 @@ final class ChatSession: ObservableObject, Identifiable {
         case accepted
         case empty
         case rejectedBuiltin(String)
+        case unavailable
     }
 
     /// Explicit remote-text seam. It shares the normal local queue, optimistic
@@ -2539,23 +2550,26 @@ final class ChatSession: ObservableObject, Identifiable {
         if let builtinName = RemotePromptPolicy.rejectedBuiltinName(in: trimmed) {
             return .rejectedBuiltin(builtinName)
         }
+        guard processAlive, proc != nil else { return .unavailable }
 
         let prepared = prepareMessage(text: trimmed, images: [])
         if isStreaming || isSendingFromQueue {
             guard queue.enqueue(
                 text: prepared.message,
                 images: [],
-                recordsSearchScopeGrant: false
+                searchGrantPolicy: .remoteClearGrant
             ) else {
                 return .empty
             }
             publishQueue()
         } else {
-            sendPromptNow(
+            guard sendPromptNow(
                 message: prepared.message,
                 images: [],
-                recordsSearchScopeGrant: false
-            )
+                searchGrantPolicy: .remoteClearGrant
+            ) else {
+                return .unavailable
+            }
         }
         return .accepted
     }
@@ -2563,9 +2577,11 @@ final class ChatSession: ObservableObject, Identifiable {
     /// App-authored user-role messages are useful orchestration input, but are not
     /// human authorization. Preserve the latest human grant without widening it.
     private func sendAppGeneratedPrompt(_ text: String) {
-        let key = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        searchGrantSuppressedMessages[key, default: 0] += 1
-        sendPrompt(text)
+        sendPrompt(
+            text,
+            images: [],
+            searchGrantPolicy: .appAuthoredPreserveLatestHumanGrant
+        )
     }
 
     /// Run image/video generation via grok-relay / coding-relay REST (same APIs as Grok Build).
@@ -2686,29 +2702,31 @@ final class ChatSession: ObservableObject, Identifiable {
         return (message, images)
     }
 
+    @discardableResult
     private func sendPromptNow(
         message: String,
         images: [DraftImage],
         requeueOnFailure: QueuedMessage? = nil,
-        recordsSearchScopeGrant: Bool = true
-    ) {
-        if recordsSearchScopeGrant {
-            let suppressionCount = searchGrantSuppressedMessages[message] ?? 0
-            if suppressionCount > 0 {
-                if suppressionCount == 1 {
-                    searchGrantSuppressedMessages.removeValue(forKey: message)
-                } else {
-                    searchGrantSuppressedMessages[message] = suppressionCount - 1
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths
+    ) -> Bool {
+        do {
+            try SearchScopeExtension.applyPromptPolicy(
+                searchGrantPolicy,
+                prompt: message,
+                sessionKey: id,
+                projectRoot: projectURL
+            )
+        } catch {
+            if searchGrantPolicy == .remoteClearGrant {
+                lastError = "远程消息未发送：无法清除上一轮本地路径授权"
+                if let requeueOnFailure {
+                    queue.requeueFront(requeueOnFailure)
+                    publishQueue()
                 }
-            } else {
-                // Replace the grant before Pi sees this human-composer turn. A prompt without
-                // an explicit path writes an empty list, expiring any permission from last turn.
-                try? SearchScopeExtension.recordUserTurn(
-                    message,
-                    sessionKey: id,
-                    projectRoot: projectURL
-                )
+                return false
             }
+            // Preserve the existing local-composer behavior if grant persistence
+            // is unavailable; the Pi extension itself still fails closed outside cwd.
         }
 
         // Provisional title + at most one side-channel LLM refine (first user message only).
@@ -2757,6 +2775,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 }
             }
         }
+        return true
     }
 
     /// Local user row before pi `message_end` (deduped on ingest).
@@ -2842,7 +2861,7 @@ final class ChatSession: ObservableObject, Identifiable {
             message: msg.text,
             images: msg.images,
             requeueOnFailure: msg,
-            recordsSearchScopeGrant: msg.recordsSearchScopeGrant
+            searchGrantPolicy: msg.searchGrantPolicy
         )
     }
 

@@ -46,41 +46,9 @@ enum RemoteTranscriptNormalizer {
         pattern: #"(?<![A-Za-z0-9_:/])/(?:[^\s/"'<>\[\]\(\)\{\}]+/)+[^\s"'<>\[\]\(\)\{\}]+"#
     )
 
-    static func snapshot(
-        sessionID: String,
-        session: ChatSession,
-        homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path
-    ) -> RemoteSessionSnapshotPayload {
-        var items = session.transcript
-        if let streaming = session.streamingItem {
-            items.append(streaming)
-        }
-        let messages = normalizedMessages(
-            items,
-            projectPath: session.projectURL.path,
-            homeDirectory: homeDirectory
-        )
-        return RemoteSessionSnapshotPayload(
-            sessionID: sessionID,
-            title: sanitizedTitle(session.displayTitle),
-            messages: messages,
-            isGenerating: session.isStreaming,
-            isStopping: session.isStopping,
-            isInitializing: session.isInitializing,
-            processAlive: session.processAlive,
-            queuedPromptCount: session.messageQueue.count,
-            error: session.lastError.map {
-                redactKnownLocalPaths(
-                    $0,
-                    projectPath: session.projectURL.path,
-                    homeDirectory: homeDirectory
-                )
-            }
-        )
-    }
-
     static func normalizedMessages(
         _ items: [ChatItem],
+        startingIndex: Int = 0,
         projectPath: String,
         homeDirectory: String
     ) -> [RemoteTranscriptMessageDTO] {
@@ -108,7 +76,11 @@ enum RemoteTranscriptNormalizer {
             default:
                 role = "system"
             }
-            return RemoteTranscriptMessageDTO(id: "m-\(index)", role: role, text: text)
+            return RemoteTranscriptMessageDTO(
+                id: "m-\(startingIndex + index)",
+                role: role,
+                text: text
+            )
         }
     }
 

@@ -88,9 +88,6 @@ final class AppStore: ObservableObject {
     /// 首次恢复历史会话前的一个短暂排队标记。让侧栏可以先更新选中态，
     /// 同时保证连续点击同一条历史会话不会排队启动多个 pi 进程。
     private var pendingHistoricalSessionOpens: [String: (token: UUID, projectPath: String)] = [:]
-    private var pendingHistoricalRemoteCompletions: [
-        String: [(ChatSession?) -> Void]
-    ] = [:]
 
     /// Optimistic "pin to top" timestamps keyed by session jsonl path.
     /// Used so a just-sent session stays above disk-mtime ordering until closed/archived.
@@ -1114,34 +1111,30 @@ final class AppStore: ObservableObject {
     @discardableResult
     func openSessionInBackground(
         _ meta: SessionMeta,
-        project: URL,
-        completion: ((ChatSession?) -> Void)? = nil
+        project: URL
     ) -> String {
-        let desktopSelection = RemoteDesktopSelectionState(
-            projectPath: selectedProjectPath,
-            sessionKey: selectedSessionKey
-        )
-        defer {
-            assert(desktopSelection.matches(
-                projectPath: selectedProjectPath,
-                sessionKey: selectedSessionKey
-            ))
+        RemoteSelectionNeutralMutation.perform(selection: { [self] in
+            RemoteDesktopSelectionState(
+                projectPath: self.selectedProjectPath,
+                sessionKey: self.selectedSessionKey
+            )
+        }) { [self] in
+            self.openSessionInBackgroundUnchecked(meta, project: project)
         }
+    }
+
+    private func openSessionInBackgroundUnchecked(
+        _ meta: SessionMeta,
+        project: URL
+    ) -> String {
         let key = "resume:\(meta.path)"
         // 历史会话第一次打开后始终使用这个稳定 key；重复点击不必扫描所有 live session。
-        if let session = openSessions[key] {
-            completion?(session)
-            return key
-        }
+        if openSessions[key] != nil { return key }
         // 已经有进程挂着这个会话文件时直接切换过去
         if let existing = openSessions.first(where: { $0.value.sessionFile == meta.path }) {
-            completion?(existing.value)
             return existing.key
         }
 
-        if let completion {
-            pendingHistoricalRemoteCompletions[key, default: []].append(completion)
-        }
         guard pendingHistoricalSessionOpens[key] == nil else { return key }
         let token = UUID()
         pendingHistoricalSessionOpens[key] = (token, project.path)
@@ -1151,24 +1144,24 @@ final class AppStore: ObservableObject {
                 return
             }
             self.pendingHistoricalSessionOpens.removeValue(forKey: key)
-            let completions = self.pendingHistoricalRemoteCompletions.removeValue(forKey: key) ?? []
             // 归档、移除项目或关闭会话可能发生在这个短暂的排队窗口内。
             guard !self.archivedSessionPaths.contains(meta.path),
                   self.projects.contains(where: { $0.path == project.path }),
-                  self.openSessions[key] == nil else {
-                let existing = self.openSessions[key]
-                    ?? self.openSessions.values.first { $0.sessionFile == meta.path }
-                completions.forEach { $0(existing) }
-                return
-            }
+                  self.openSessions[key] == nil else { return }
             let session = self.makeSession(
-                    key: key,
-                    project: project,
-                    sessionPath: meta.path,
-                    preloadedTranscript: snapshot?.transcript
+                key: key,
+                project: project,
+                sessionPath: meta.path,
+                preloadedTranscript: snapshot?.transcript
+            )
+            RemoteSelectionNeutralMutation.perform(selection: { [self] in
+                RemoteDesktopSelectionState(
+                    projectPath: self.selectedProjectPath,
+                    sessionKey: self.selectedSessionKey
                 )
-            self.openSessions[key] = session
-            completions.forEach { $0(session) }
+            }) { [self] in
+                self.openSessions[key] = session
+            }
         }
         return key
     }
@@ -1181,20 +1174,17 @@ final class AppStore: ObservableObject {
     /// Creates a live Pi session without changing desktop selection.
     @discardableResult
     func createSessionInBackground(project: URL) -> (key: String, session: ChatSession) {
-        let desktopSelection = RemoteDesktopSelectionState(
-            projectPath: selectedProjectPath,
-            sessionKey: selectedSessionKey
-        )
-        defer {
-            assert(desktopSelection.matches(
-                projectPath: selectedProjectPath,
-                sessionKey: selectedSessionKey
-            ))
+        RemoteSelectionNeutralMutation.perform(selection: { [self] in
+            RemoteDesktopSelectionState(
+                projectPath: self.selectedProjectPath,
+                sessionKey: self.selectedSessionKey
+            )
+        }) { [self] in
+            let key = "new:\(UUID().uuidString)"
+            let session = self.makeSession(key: key, project: project, sessionPath: nil)
+            self.openSessions[key] = session
+            return (key, session)
         }
-        let key = "new:\(UUID().uuidString)"
-        let session = makeSession(key: key, project: project, sessionPath: nil)
-        openSessions[key] = session
-        return (key, session)
     }
 
     func openBranchedSession(path: String, project: URL, suggestedName: String) {
@@ -1402,9 +1392,6 @@ final class AppStore: ObservableObject {
 
     func shutdown() {
         pendingHistoricalSessionOpens.removeAll()
-        let pendingRemoteCompletions = pendingHistoricalRemoteCompletions.values.flatMap { $0 }
-        pendingHistoricalRemoteCompletions.removeAll()
-        pendingRemoteCompletions.forEach { $0(nil) }
         localRemoteHost?.stop()
         localRemoteHost = nil
         ComputerCoordinator.shared.releaseAll(revokeConsent: true)
