@@ -1,23 +1,32 @@
 import Foundation
 
+enum PromptSearchGrantPolicy: Equatable {
+    /// Direct local human input replaces the grant with paths in this prompt.
+    case localHumanRecordPromptPaths
+    /// App-generated orchestration text is not human authorization and leaves
+    /// the latest human grant untouched.
+    case appAuthoredPreserveLatestHumanGrant
+    /// Remote input is not local human authorization and explicitly revokes
+    /// any grant inherited from an earlier local turn.
+    case remoteClearGrant
+}
+
 struct QueuedMessage: Identifiable {
     let id: UUID
     var text: String
     var images: [DraftImage]
-    /// Only a direct local human-composer turn may widen the per-turn filesystem
-    /// search grant. Remote/app-authored prompts carry false through queue drain.
-    var recordsSearchScopeGrant: Bool
+    var searchGrantPolicy: PromptSearchGrantPolicy
 
     init(
         id: UUID = UUID(),
         text: String,
         images: [DraftImage] = [],
-        recordsSearchScopeGrant: Bool = true
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths
     ) {
         self.id = id
         self.text = text
         self.images = images
-        self.recordsSearchScopeGrant = recordsSearchScopeGrant
+        self.searchGrantPolicy = searchGrantPolicy
     }
 }
 
@@ -34,14 +43,14 @@ struct SessionMessageQueue {
     mutating func enqueue(
         text: String,
         images: [DraftImage] = [],
-        recordsSearchScopeGrant: Bool = true
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths
     ) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !images.isEmpty else { return false }
         items.append(QueuedMessage(
             text: text,
             images: images,
-            recordsSearchScopeGrant: recordsSearchScopeGrant
+            searchGrantPolicy: searchGrantPolicy
         ))
         return true
     }

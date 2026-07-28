@@ -15,9 +15,7 @@ final class RemoteHostService {
     private let nonce = BridgeCapabilityToken.generate(byteCount: 18)
     private let registry = RemoteObjectIDRegistry()
     private var idempotency = RemotePromptIdempotencyCache()
-    private var snapshotStates: [
-        String: (material: Data, revision: UInt64)
-    ] = [:]
+    private let snapshotCache = RemoteSnapshotCache()
     private var server: LocalRemoteHTTPServer?
     private let stateChanged: (LocalRemoteHostState) -> Void
     private var port: UInt16 = 0
@@ -56,7 +54,7 @@ final class RemoteHostService {
         server?.stop()
         server = nil
         port = 0
-        snapshotStates.removeAll()
+        snapshotCache.removeAll()
         stateChanged(.stopped)
     }
 
@@ -161,26 +159,19 @@ final class RemoteHostService {
                 return
             }
             let requestedRevision = (body["revision"] as? NSNumber)?.uint64Value
-            let payload = RemoteTranscriptNormalizer.snapshot(
-                sessionID: sessionID,
-                session: session
-            )
-            let material = (try? JSONEncoder().encode(payload)) ?? Data()
-            let previous = snapshotStates[sessionID]
-            let revision: UInt64
-            if previous?.material == material {
-                revision = previous?.revision ?? 1
-            } else {
-                revision = (previous?.revision ?? 0) &+ 1
-                snapshotStates[sessionID] = (material, revision)
-            }
-            if requestedRevision == revision {
+            switch snapshotCache.resolve(
+                RemoteSnapshotCacheInput(sessionID: sessionID, session: session),
+                requestedRevision: requestedRevision
+            ) {
+            case .notModified:
                 respond(.empty(status: 304))
-            } else {
-                respond(encode(RemoteSessionSnapshotDTO(
-                    revision: revision,
-                    snapshot: payload
-                )))
+            case .response(let data, _):
+                respond(LocalRemoteHTTPResponse(
+                    status: 200,
+                    contentType: "application/json; charset=utf-8",
+                    headers: [:],
+                    body: data
+                ))
             }
 
         case ("POST", "/api/send"):
@@ -216,6 +207,8 @@ final class RemoteHostService {
                     status: 403,
                     ["error": "local builtin slash command is unavailable remotely", "command": name]
                 ))
+            case .unavailable:
+                respond(.json(status: 409, ["error": "session process is unavailable"]))
             }
 
         case ("POST", "/api/stop"):
