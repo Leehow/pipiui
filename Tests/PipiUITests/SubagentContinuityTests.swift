@@ -112,7 +112,7 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertTrue(s.contains("if (runningAgents.size === 0) return;"),
                       "an idle session must stay silent; a heartbeat costs the boss a turn")
         XCTAssertTrue(s.contains("[subagent-heartbeat] outstanding="))
-        XCTAssertTrue(s.contains("Do not re-dispatch a worker that is still running."))
+        XCTAssertTrue(s.contains("Do not re-dispatch a worker that is still running"))
     }
 
     /// Idleness is not death: a worker can be quiet while thinking, and a dead one can leave a
@@ -174,9 +174,10 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertTrue(t.contains("a *failed* worker produced a wrong answer; an *interrupted* one produced no answer yet"))
         XCTAssertTrue(t.contains("establish state rather than guessing"))
 
-        let fanout = try PhilosophyLayerFixture.normalizedBody("fanout")
-        XCTAssertTrue(fanout.contains("[subagent-heartbeat]"))
-        XCTAssertTrue(fanout.contains("still thinking, died without reporting, or its report was lost"))
-        XCTAssertTrue(fanout.contains("Never re-dispatch a worker still shown as running"))
+        // How to read a heartbeat travels with the heartbeat, not in every turn's prefix.
+        let s = try source()
+        XCTAssertTrue(s.contains("Silence is not progress"))
+        XCTAssertTrue(s.contains("still thinking, died without reporting, or its report was lost"))
+        XCTAssertTrue(s.contains("Do not re-dispatch a worker that is still running"))
     }
 }

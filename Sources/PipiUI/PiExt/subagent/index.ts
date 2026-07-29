@@ -2531,7 +2531,7 @@ export default function (pi: ExtensionAPI) {
 			);
 		}
 		lines.push(
-			"Decide and act: keep waiting (say why), pull one report with subagent_status, or recover a vanished worker. Do not re-dispatch a worker that is still running.",
+			"Silence is not progress: it means one of still thinking, died without reporting, or its report was lost. Decide which and act — keep waiting (say why), pull one report with subagent_status, or recover a vanished worker. Do not re-dispatch a worker that is still running; that puts two agents in the same files.",
 		);
 		deliverSubagentDone(pi, lines.join("\n"));
 	}, HEARTBEAT_INTERVAL_MS);

@@ -133,16 +133,15 @@ final class PhilosophyLayerTests: XCTestCase {
         )
         assertContains(
             orchestration,
-            "The trigger is this session actually deciding to dispatch/delegate or otherwise entering real multi-worker coordination"
+            "The trigger is this session actually deciding to dispatch or otherwise entering real multi-worker coordination"
         )
+        // The runtime now creates the file at that same trigger, so the layer points at it
+        // instead of carrying ~380 tokens of layout on every turn.
         assertContains(
             orchestration,
-            "Before the first dispatch or coordination action, initialize the ledger under `.pi/boss/`"
+            "the runtime has already created your ledger under `.pi/boss/`"
         )
-        assertContains(
-            orchestration,
-            "read it once at this trigger, then stop re-reading it"
-        )
+        assertContains(orchestration, "Find it, fill it in, and keep it current")
         assertContains(
             orchestration,
             "From that point onward, update the ledger BEFORE acting"
