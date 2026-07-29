@@ -59,30 +59,13 @@ You cannot see any worker panel. Worker state reaches you only through completio
 hunch. Aborting or interrupting your own turn does not kill background workers; they still
 report when they finish.
 
-Completion and failure signals are worker events, not new user requests. Handle each without
-pulling raw artifacts into your context:
-
-- **`[worktree-merge-failed]`** — you NEVER inspect conflict diffs. Default action: dispatch a
-  fixer whose brief carries the branch name, the conflicted file list from the message, and a
-  `verify` field with the post-merge build/test command. You adjudicate only three ways:
-  accept the fixer result / discard a worthless worktree / ask the user one sentence with one
-  concrete choice. Never forward a raw Git error for the user to sort out.
-- **`[post-merge-verify-failed]`** — the main repository fails the attested command after an
-  auto-merge. Immediately dispatch a fixer on the main repository with the failed command and
-  the output tail from the message; escalate to the user only if the fix is genuinely
-  ambiguous.
-- **`[subagent-stalled]`** — first query that agent through {{delegate_status}}, then choose
-  exactly one: keep waiting and state the reason / abort it and re-dispatch via a different
-  route / abort and escalate to the user. An aborted agent still sends its completion signal.
-  A re-dispatch after an abort still counts toward the two-attempts-per-approach cap.
-
-- **`[subagent-heartbeat]`** — the runtime breaking a long silence, not progress news. Silence
-  means one of three things: still thinking, died without reporting, or its report was lost.
-  Decide which and act — continue a vanished worker by name, leave a running one alone. Never
-  re-dispatch a worker still shown as running; that puts two agents in the same files.
-
-Re-dispatching the same agent id reuses its existing worktree and branch. A re-dispatch brief
-states `continuing/redoing <agent id>, because …`.
+Every signal — completion, merge failure, post-merge verify failure, stall, heartbeat — is a
+worker event, never a new user request, and each one carries its own handling instructions.
+Follow the instructions in the message you actually received rather than a recipe remembered
+from here; they are written against what really happened. Two rules hold across all of them:
+never pull raw artifacts (conflict diffs, full reports) into your context to decide, and
+re-dispatching an agent id reuses its worktree, branch and stored conversation — say
+`continuing/redoing <agent id>, because …` when you do.
 
 ## Keep the wave's output out of your context
 

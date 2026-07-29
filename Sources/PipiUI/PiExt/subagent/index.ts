@@ -1157,6 +1157,7 @@ function readStoredSessions(dir: string): StoredSession[] {
 }
 
 let prunedThisProcess = false;
+let seededLedger = false;
 
 /** Once per process: this is housekeeping, not something to redo on every dispatch. */
 function pruneAgentSessions(dir: string): void {
@@ -1176,6 +1177,55 @@ function pruneAgentSessions(dir: string): void {
 		} catch {
 			// A file we cannot remove only costs disk; never fail a dispatch over housekeeping.
 		}
+	}
+}
+
+/**
+ * Seed the boss ledger the first time this session actually dispatches.
+ *
+ * The layout used to live in the system prompt — roughly 380 tokens of template resident on
+ * every turn so that it would be correct on the few turns that write it. Creating the file
+ * with its sections already laid out puts the format where it is used and costs nothing per
+ * turn. Never overwrites: an existing ledger is the session's own state.
+ */
+function seedBossLedger(): void {
+	if (seededLedger || !PIPIUI_MAIN_CWD) return;
+	seededLedger = true;
+	const key = PIPIUI_SESSION?.trim() || "terminal";
+	const dir = path.join(PIPIUI_MAIN_CWD, ".pi", "boss");
+	const file = path.join(dir, `ledger-${key}.md`);
+	try {
+		if (fs.existsSync(file)) return;
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(
+			file,
+			[
+				"# Ledger",
+				"<one-line session goal>",
+				"",
+				"## Decisions",
+				"<!-- user mid-course changes / additions / cancellations: time + content + affected task IDs -->",
+				"",
+				"## Tasks",
+				"| ID | title | status | agent | wave | notes |",
+				"| -- | ----- | ------ | ----- | ---- | ----- |",
+				"<!-- status: pending | in-flight | blocked | done | cancelled -->",
+				"",
+				"## Done",
+				"<!-- one line per finished task: conclusion + key evidence (file paths / command results) -->",
+				"",
+				"## Risks & open questions",
+				"",
+				"## Closeout dispositions",
+				"| item | disposition | evidence/reason |",
+				"| ---- | ----------- | --------------- |",
+				"<!-- disposition: cleaned | retained | needs-fixer | needs-user -->",
+				"",
+			].join("\n"),
+			"utf-8",
+		);
+	} catch {
+		// The boss can still create it itself; never fail a dispatch over bookkeeping.
 	}
 }
 
@@ -1774,6 +1824,9 @@ async function runSingleAgent(
 	// than by a stranger who re-reads the files and re-derives the same wrong assumption every
 	// round. Read-only roles stay ephemeral: their deliverable is a one-shot report, and stale
 	// context would bias the next one.
+	// First real dispatch is exactly when the ledger becomes relevant (see the lazy-discovery
+	// rule the orchestration layer states), so seed it here rather than on every session start.
+	seedBossLedger();
 	const sessionDir = READ_ONLY_AGENTS.has(agentName) ? undefined : agentSessionDir();
 	const sessionId = `pipiui-${pipiuiAgentId}`;
 	const resumingSession = Boolean(
@@ -2414,7 +2467,13 @@ export default function (pi: ExtensionAPI) {
 			const lastLine = (activityRaw.split("\n").pop() ?? "").trim().slice(0, 120) || "(no activity)";
 			deliverSubagentDone(
 				pi,
-				`[subagent-stalled] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine}`,
+				// Handling rides with the event rather than sitting in the cached prefix all
+				// session waiting for a stall that may never happen — and it is more likely to
+				// be followed here, next to the thing it is about.
+				[
+					`[subagent-stalled] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine}`,
+					`Query it first with subagent_status({agentId:"${agentId}"}), then choose exactly one: keep waiting (say why) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent still reports [subagent-done], and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
+				].join("\n"),
 			);
 			pipiuiReport({
 				kind: "stalled",

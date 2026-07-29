@@ -142,29 +142,13 @@ desktop operations, simple read-only questions, and single-lane direct work — 
 `PIPIUI_SESSION_KEY`, inspect `.pi/boss/`, create or read a ledger, or run shell merely to
 discover ledger state.
 
-The trigger is this session actually deciding to dispatch/delegate or otherwise entering real
-multi-worker coordination that requires persisted task state. Before the first dispatch or
-coordination action, initialize the ledger under `.pi/boss/` with write/edit — a management
-action, always allowed, never "working the floor". Use
-`.pi/boss/ledger-<session-key>.md` when your runtime exposes a session key (PipiUI sets
-`PIPIUI_SESSION_KEY`; read it once at this trigger, then stop re-reading it), and
-`.pi/boss/ledger-terminal.md` when it does not. A resumed orchestration session keeps its key,
-so its ledger carries over naturally. Fixed layout:
+The trigger is this session actually deciding to dispatch or otherwise entering real
+multi-worker coordination. At that point the runtime has already created your ledger under
+`.pi/boss/`, with its sections laid out — Decisions, Tasks, Done, Risks & open questions,
+Closeout dispositions. Find it, fill it in, and keep it current; writing there is a management
+action, always allowed, never "working the floor". A resumed orchestration session keeps the
+same file.
 
-```
-# Ledger
-<one-line session goal>
-## Decisions   — user mid-course changes / additions / cancellations, one per line:
-               time + content + affected task IDs
-## Tasks       — one row per logical task: `ID | title | status | agent | wave | notes`;
-               status in {pending, in-flight, blocked, done, cancelled}
-## Done        — one line per finished task: conclusion + key evidence (file paths /
-               command results)
-## Risks & open questions
-## Closeout dispositions — one row per agent/worktree/branch/artifact:
-               `item | disposition | evidence/reason`;
-               disposition is cleaned / retained / needs-fixer / needs-user
-```
 
 - From that point onward, update the ledger BEFORE acting: before the first and every later
   dispatch or coordination action, and on every user interruption, changed requirement, task

@@ -129,6 +129,39 @@ final class SubagentContinuityTests: XCTestCase {
                       "a vanished worker still has its context and should be continued by name")
     }
 
+    /// Handling that only matters when an event fires does not belong in a prefix paid for on
+    /// every turn. It rides with the event instead — cheaper, and more likely to be followed
+    /// sitting next to the thing it describes.
+    func testSignalHandlingRidesWithTheEventNotThePrefix() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains(#"Query it first with subagent_status({agentId:"${agentId}"})"#),
+                      "a stall must arrive with its own handling")
+        XCTAssertTrue(s.contains("Do not treat this message as a new user request."))
+
+        // The layer keeps the standing facts and delegates the recipes to the messages.
+        let fanout = try PhilosophyLayerFixture.normalizedBody("fanout")
+        XCTAssertTrue(fanout.contains("each one carries its own handling instructions"))
+        XCTAssertTrue(fanout.contains("Follow the instructions in the message you actually received"))
+        for duplicated in ["you NEVER inspect conflict diffs", "Never forward a raw Git error"] {
+            XCTAssertFalse(fanout.contains(PhilosophyLayerFixture.normalize(duplicated)),
+                           "recipe duplicated in the prefix: \(duplicated)")
+        }
+    }
+
+    /// 380 tokens of ledger template used to sit in every turn's prefix so it would be right on
+    /// the few turns that write it. The file carries its own shape instead.
+    func testLedgerLayoutLivesInTheFileNotThePrefix() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains("function seedBossLedger()"))
+        XCTAssertTrue(s.contains("if (fs.existsSync(file)) return;"), "an existing ledger is session state")
+        XCTAssertTrue(s.contains("## Closeout dispositions"), "the seeded file carries the layout")
+        XCTAssertTrue(s.contains("seedBossLedger();"), "seeded at first real dispatch, matching lazy discovery")
+
+        let t = try PhilosophyLayerFixture.normalizedBody("orchestration")
+        XCTAssertTrue(t.contains("the runtime has already created your ledger"))
+        XCTAssertFalse(t.contains("| ID | title | status |"), "the template must be gone from the prefix")
+    }
+
     /// The philosophy has to teach the boss to use the mechanism, or nobody names anything.
     func testOrchestrationLayerTeachesNamedVerticalSlices() throws {
         let t = try PhilosophyLayerFixture.normalizedBody("orchestration")
