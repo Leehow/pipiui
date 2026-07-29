@@ -76,6 +76,11 @@ pulling raw artifacts into your context:
   route / abort and escalate to the user. An aborted agent still sends its completion signal.
   A re-dispatch after an abort still counts toward the two-attempts-per-approach cap.
 
+- **`[subagent-heartbeat]`** — the runtime breaking a long silence, not progress news. Silence
+  means one of three things: still thinking, died without reporting, or its report was lost.
+  Decide which and act — continue a vanished worker by name, leave a running one alone. Never
+  re-dispatch a worker still shown as running; that puts two agents in the same files.
+
 Re-dispatching the same agent id reuses its existing worktree and branch. A re-dispatch brief
 states `continuing/redoing <agent id>, because …`.
 

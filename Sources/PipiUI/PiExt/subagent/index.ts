@@ -702,6 +702,23 @@ const jobRegistry = new Map<string, JobRecord>();
 // ---- Stall watchdog + abort：运行中后台 job 的外部可触达句柄 ----
 const STALL_THRESHOLD_MS = 120_000;
 const STALL_WATCHDOG_INTERVAL_MS = 30_000;
+/**
+ * How long the boss may hear nothing at all while work is outstanding. Chosen to be far longer
+ * than the stall threshold: this is the last line of defence against silence, not a progress
+ * report, and every heartbeat costs the boss a turn.
+ */
+const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000;
+
+/** Signal 0 tests for existence without touching the process. */
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		// EPERM means it exists but belongs to someone else — alive for our purposes.
+		return (err as NodeJS.ErrnoException)?.code === "EPERM";
+	}
+}
 
 interface RunningAgentHandle {
 	/** 外部中止入口（action=abort / subagent_abort 命令）；走 killProc SIGTERM→SIGKILL。 */
@@ -713,6 +730,14 @@ interface RunningAgentHandle {
 	lastActivityAt: number;
 	/** 当前卡死片段是否已推送过（有新活动后重新武装）。 */
 	stallNotified: boolean;
+	/** When this worker was dispatched; the heartbeat reports elapsed time. */
+	startedAt: number;
+	/**
+	 * Child pid, so liveness can be checked directly. Idleness is not death: a worker can be
+	 * quiet while thinking, and a dead one can leave a registry entry behind if its close
+	 * handler never ran — which is precisely when the boss would otherwise wait forever.
+	 */
+	pid?: number;
 }
 
 /** 仅后台 job 注册；前台 job 由工具调用自身的 abort signal 负责。 */
@@ -1849,6 +1874,7 @@ async function runSingleAgent(
 			title: options?.title,
 			lastActivityAt: Date.now(),
 			stallNotified: false,
+			startedAt: Date.now(),
 		});
 	}
 	const pipiuiUpdate = (force = false) => {
@@ -1923,6 +1949,9 @@ async function runSingleAgent(
 				env: childEnv,
 			});
 			pipiuiTrackChild(proc);
+			// Recorded so the heartbeat can tell "quiet" from "gone".
+			const liveHandle = runningAgents.get(pipiuiAgentId);
+			if (liveHandle) liveHandle.pid = proc.pid;
 			let buffer = "";
 
 			const processLine = (line: string) => {
@@ -2398,6 +2427,57 @@ export default function (pi: ExtensionAPI) {
 	}, STALL_WATCHDOG_INTERVAL_MS);
 	stallWatchdog.unref?.();
 	g[STALL_WATCHDOG_KEY] = stallWatchdog;
+
+	// Heartbeat. Background dispatch ends the boss's turn, so from then on the session only
+	// moves again when something pushes it. Every push so far fires at most once per worker:
+	// [subagent-done] on exit, [subagent-stalled] once per idle episode. If any of those is
+	// missed — the close handler never ran, the extension reloaded mid-flight, delivery failed
+	// — nothing ever wakes the boss and it waits forever on work that is already over.
+	//
+	// Codex avoids this by making the wait itself bounded: `wait_agent` takes a timeout and
+	// returns an empty status when it expires, so control always comes back. We cannot bound a
+	// wait the boss never issued, so we bound the silence instead: while anything is
+	// outstanding, the boss hears from us at least this often, whatever else did or did not
+	// happen.
+	const HEARTBEAT_KEY = "__pipiuiSubagentHeartbeat";
+	const prevHeartbeat = g[HEARTBEAT_KEY] as ReturnType<typeof setInterval> | undefined;
+	if (prevHeartbeat) clearInterval(prevHeartbeat);
+	const heartbeat = setInterval(() => {
+		if (runningAgents.size === 0) return; // nothing outstanding: stay quiet
+		const now = Date.now();
+		const alive: string[] = [];
+		const vanished: string[] = [];
+		for (const [agentId, handle] of [...runningAgents]) {
+			const title =
+				handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 60) || "(untitled)";
+			const elapsed = formatElapsedMs(now - handle.startedAt);
+			const idle = Math.floor((now - handle.lastActivityAt) / 1000);
+			if (handle.pid !== undefined && !isProcessAlive(handle.pid)) {
+				// Its process is gone but nothing reported it. Stop tracking so this is said once.
+				runningAgents.delete(agentId);
+				vanished.push(`  ${agentId} (${title}) — process gone after ${elapsed}, no result reported`);
+				continue;
+			}
+			alive.push(`  ${agentId} (${title}) — running ${elapsed}, idle ${idle}s`);
+		}
+		if (alive.length === 0 && vanished.length === 0) return;
+		const lines = [
+			`[subagent-heartbeat] outstanding=${alive.length} vanished=${vanished.length}`,
+			...alive,
+			...vanished,
+		];
+		if (vanished.length > 0) {
+			lines.push(
+				"A vanished worker was interrupted, not failed: its stored conversation is intact, so re-dispatch that same agentId to continue where it left off.",
+			);
+		}
+		lines.push(
+			"Decide and act: keep waiting (say why), pull one report with subagent_status, or recover a vanished worker. Do not re-dispatch a worker that is still running.",
+		);
+		deliverSubagentDone(pi, lines.join("\n"));
+	}, HEARTBEAT_INTERVAL_MS);
+	heartbeat.unref?.();
+	g[HEARTBEAT_KEY] = heartbeat;
 	// 进程退出时清理定时器（unref 已保证不拖住退出；这里是显式清理）。
 	process.on("exit", () => {
 		clearInterval(stallWatchdog);

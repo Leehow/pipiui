@@ -103,6 +103,32 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertTrue(s.contains("// A file we cannot remove only costs disk; never fail a dispatch over housekeeping."))
     }
 
+    /// Background dispatch ends the boss's turn, so the session only moves again when something
+    /// pushes it — and every other push fires at most once per worker. If one is missed the boss
+    /// waits forever on work that is already over, so the silence itself has to be bounded.
+    func testHeartbeatBoundsHowLongTheBossCanHearNothing() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains("const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000;"))
+        XCTAssertTrue(s.contains("if (runningAgents.size === 0) return;"),
+                      "an idle session must stay silent; a heartbeat costs the boss a turn")
+        XCTAssertTrue(s.contains("[subagent-heartbeat] outstanding="))
+        XCTAssertTrue(s.contains("Do not re-dispatch a worker that is still running."))
+    }
+
+    /// Idleness is not death: a worker can be quiet while thinking, and a dead one can leave a
+    /// registry entry behind when its close handler never ran — exactly the case that hangs the
+    /// boss. Only asking the OS separates the two.
+    func testVanishedWorkersAreDetectedByLivenessNotByIdleness() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains("function isProcessAlive(pid: number): boolean"))
+        XCTAssertTrue(s.contains("process.kill(pid, 0)"))
+        XCTAssertTrue(s.contains(#"=== "EPERM""#), "a process owned by someone else is still alive")
+        XCTAssertTrue(s.contains("if (handle.pid !== undefined && !isProcessAlive(handle.pid))"))
+        XCTAssertTrue(s.contains("runningAgents.delete(agentId);"), "report a vanished worker once")
+        XCTAssertTrue(s.contains("interrupted, not failed"),
+                      "a vanished worker still has its context and should be continued by name")
+    }
+
     /// The philosophy has to teach the boss to use the mechanism, or nobody names anything.
     func testOrchestrationLayerTeachesNamedVerticalSlices() throws {
         let t = try PhilosophyLayerFixture.normalizedBody("orchestration")
@@ -114,5 +140,10 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertTrue(t.contains("An interruption is not a failure"))
         XCTAssertTrue(t.contains("a *failed* worker produced a wrong answer; an *interrupted* one produced no answer yet"))
         XCTAssertTrue(t.contains("establish state rather than guessing"))
+
+        let fanout = try PhilosophyLayerFixture.normalizedBody("fanout")
+        XCTAssertTrue(fanout.contains("[subagent-heartbeat]"))
+        XCTAssertTrue(fanout.contains("still thinking, died without reporting, or its report was lost"))
+        XCTAssertTrue(fanout.contains("Never re-dispatch a worker still shown as running"))
     }
 }
