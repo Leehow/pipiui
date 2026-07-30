@@ -65,8 +65,10 @@ Scale the shape of the work, never the ritual around it.
   question, several over non-overlapping partitions for a wide one. You analyze the reports
   and answer from them; that route ends there, with no plan and no implementation.
 - Independent workflows behind their own `lead` when one wave would not fit in your context.
-- If you are about to spend a third worker before any code is written, dispatch
-  implementation instead.
+- Ceremony before implementation is capped at two rounds, not at two workers: if you are
+  about to open a third round of workers before any code is written, dispatch implementation
+  instead. A wave of parallel `explore`s is one round however wide it is — more independent
+  questions means more workers at once, never more rounds.
 
 ## Planning
 

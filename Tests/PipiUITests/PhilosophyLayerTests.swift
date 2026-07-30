@@ -92,7 +92,12 @@ final class PhilosophyLayerTests: XCTestCase {
         assertContains(t, "the plan is a short numbered list of dispatchable steps")
         assertContains(t, "lightweight `plan` worker")
         assertContains(t, "MUST NOT present, relay, or ask the user to choose an execution-mode menu")
-        assertContains(t, "third worker before any code is written")
+        assertContains(t, "third round of workers before any code is written")
+        // Counting workers rather than rounds made a wide research fan-out illegal, which the
+        // research route and the lead's ≥4 trigger both assume is legal.
+        assertContains(t, "capped at two rounds, not at two workers")
+        assertContains(t, "A wave of parallel `explore`s is one round however wide it is")
+        assertContains(t, "more independent questions means more workers at once, never more rounds")
 
         let all = try PhilosophyLayerFixture.allNormalizedBodies()
         for tier in ["weak model", "strong model", "model-tier", "model tier", "capable model"] {
