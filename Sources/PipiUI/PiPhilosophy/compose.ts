@@ -18,10 +18,17 @@ export interface Capability {
   absent?: string;
 }
 
+/**
+ * One entry of the roster rendered as `{{agents}}`. `use` is written for the boss deciding
+ * where to send a task — when to reach for this agent — not for the agent describing itself.
+ * A bare string still works and renders without a description.
+ */
+export type AgentEntry = string | { name: string; use: string };
+
 export interface CapabilityTable {
   capabilities: Record<string, Capability>;
   /** Rendered as `{{agents}}`. The roster is a property of the dispatch runtime, not of pi. */
-  agents: string[];
+  agents: AgentEntry[];
 }
 
 export interface Layer {
@@ -170,6 +177,17 @@ export function placeholdersIn(body: string): string[] {
   return [...body.matchAll(PLACEHOLDER)].map((m) => m[1]);
 }
 
+/**
+ * A bare name list left the boss guessing what `plan` and `lead` were for, and a guess about
+ * an unfamiliar name resolves as "do it myself". One line each, so the roster answers "who
+ * takes this?" without a lookup the boss has no way to perform.
+ */
+export function renderAgents(agents: AgentEntry[]): string {
+  return agents
+    .map((a) => (typeof a === "string" ? `- \`${a}\`` : `- \`${a.name}\` — ${a.use}`))
+    .join("\n");
+}
+
 export type ResolveResult = { ok: true; body: string } | { ok: false; error: string };
 
 export function resolvePlaceholders(
@@ -179,7 +197,7 @@ export function resolvePlaceholders(
 ): ResolveResult {
   let failure: string | undefined;
   const body = layer.body.replace(PLACEHOLDER, (_whole, key: string) => {
-    if (key === "agents") return capabilities.agents.join(" / ");
+    if (key === "agents") return renderAgents(capabilities.agents);
     const capability = capabilities.capabilities[key];
     if (!capability) {
       failure ??= `${layer.file}: unknown placeholder {{${key}}}`;

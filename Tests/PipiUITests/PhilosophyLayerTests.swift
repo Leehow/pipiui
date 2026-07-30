@@ -91,6 +91,14 @@ final class PhilosophyLayerTests: XCTestCase {
         assertContains(t, "## Planning")
         assertContains(t, "the plan is a short numbered list of dispatchable steps")
         assertContains(t, "lightweight `plan` worker")
+        // "whichever is proportionate" put self-service first and gave no criterion, so the
+        // boss always wrote it. The criterion is what it already knows, not how big it feels.
+        assertContains(t, "Who writes it follows from what you already know, never from how large the goal feels")
+        assertContains(t, "if working out the decomposition means reading code nobody has read yet, that is a lightweight `plan` worker, not a longer think")
+        // "if a brief is complete enough to dispatch, no plan is needed" was always true —
+        // briefs are required to be complete — so it read as a standing ban on the agent.
+        assertContains(t, "It never rules out dispatching a `plan` worker to work the steps out in the first place")
+        assertContains(t, "you cannot put steps in a brief that nobody has established yet")
         assertContains(t, "MUST NOT present, relay, or ask the user to choose an execution-mode menu")
         assertContains(t, "third round of workers before any code is written")
         // Counting workers rather than rounds made a wide research fan-out illegal, which the
@@ -230,8 +238,11 @@ final class PhilosophyLayerTests: XCTestCase {
         assertContains(t, "a handful of locating reads to size a goal or answer the user")
         assertContains(t, "Past a handful of reads, that is an `explore`, not your own grep")
         assertContains(t, "a sweep across directories, call sites, or naming conventions")
-        assertContains(t, "Its report costs context; that is the trade, and it is the right one")
-        assertContains(t, "It is never a reason to run a search yourself")
+        assertContains(t, "it is never a reason to run a search yourself")
+        // The cost model priced the worker's report and left self-service looking free, which
+        // is the arithmetic that made "do it myself" win every weighing.
+        assertContains(t, "reading files yourself spends that same resource")
+        assertContains(t, "Self-service is not the cheap option")
         assertContains(t, "A research or analysis-only goal is delegated like any other")
         assertContains(t, "one `explore` for a contained question, several over non-overlapping partitions")
         assertContains(t, "before answering about code you have not read")
@@ -248,6 +259,53 @@ final class PhilosophyLayerTests: XCTestCase {
         let fanout = try text("fanout")
         assertContains(fanout, "Two unrelated small changes are two workers")
         assertContains(fanout, "one worker told to cover several independent sub-items")
+    }
+
+    /// `{{agents}}` used to render five bare names, so a rule saying "delegate this" left the
+    /// boss without a way to answer "to whom" — and an unrecognized name resolves as "do it
+    /// myself". Each entry now carries when to reach for it, written for the boss routing a
+    /// task rather than for the agent describing itself.
+    func testRosterTellsTheBossWhenToReachForEachAgent() throws {
+        let table = try capabilityTable()
+        let agents = try XCTUnwrap(table["agents"] as? [[String: String]],
+                                   "the roster must be entries with a `use`, not bare strings")
+        let byName = Dictionary(uniqueKeysWithValues: agents.compactMap { entry in
+            entry["name"].map { ($0, entry["use"] ?? "") }
+        })
+
+        for required in ["explore", "plan", "general-purpose", "reviewer", "lead", "secretary"] {
+            let use = try XCTUnwrap(byName[required], "\(required) is missing from the roster")
+            XCTAssertFalse(use.isEmpty, "\(required) has no `use` text")
+        }
+        // The two the boss could not infer from the name alone are the whole point.
+        XCTAssertTrue(byName["plan"]?.contains("depends on code nobody has read yet") == true)
+        XCTAssertTrue(byName["lead"]?.contains("keep a wide wave out of your context") == true)
+
+        let body = try PhilosophyLayerFixture.normalizedBody("orchestration")
+        assertContains(body, "Your roster: {{agents}}")
+        assertContains(body, "A name whose purpose you cannot recall is one to look up here")
+    }
+
+    /// The roster is hand-written in capabilities.json because the philosophy package cannot
+    /// reach PiExt's agent directory. Nothing stops the two drifting, so the names are pinned
+    /// to the definitions that actually ship.
+    func testEveryRosterNameHasAnAgentDefinition() throws {
+        let table = try capabilityTable()
+        let agents = try XCTUnwrap(table["agents"] as? [[String: String]])
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        for entry in agents {
+            let name = try XCTUnwrap(entry["name"])
+            let definition = root.appendingPathComponent("Sources/PipiUI/PiExt/agents/\(name).md")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: definition.path),
+                          "roster names \(name) but no agents/\(name).md ships")
+        }
+    }
+
+    private func capabilityTable() throws -> [String: Any] {
+        let bundled = try XCTUnwrap(PhilosophyPackage.bundledURL)
+        let data = try Data(contentsOf: bundled.appendingPathComponent("capabilities.json"))
+        return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
     /// Layer bodies sit in the cached prefix of every request; English is roughly half the

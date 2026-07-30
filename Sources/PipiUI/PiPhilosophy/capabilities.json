@@ -41,10 +41,29 @@
     }
   },
   "agents": [
-    "explore",
-    "plan",
-    "general-purpose",
-    "reviewer",
-    "lead"
+    {
+      "name": "explore",
+      "use": "read-only investigation; sweeps the repo and returns compressed findings with file:line evidence. Reach for it when you do not yet know which files matter."
+    },
+    {
+      "name": "plan",
+      "use": "read-only; turns a goal into a numbered list of dispatchable steps. Reach for it when the decomposition itself depends on code nobody has read yet."
+    },
+    {
+      "name": "general-purpose",
+      "use": "the only agent that edits files. Implements one brief and runs its verify."
+    },
+    {
+      "name": "reviewer",
+      "use": "read-only judgement machines cannot make: design quality, off-target work, security risk, arbitrating workers that contradict each other."
+    },
+    {
+      "name": "lead",
+      "use": "runs a sub-wave of its own workers and hands you one consolidated report. Reach for it to keep a wide wave out of your context."
+    },
+    {
+      "name": "secretary",
+      "use": "optional closeout audit: reconciles worktrees, branches and leftover artifacts. Advisory, and never owns the completion decision."
+    }
   ]
 }
