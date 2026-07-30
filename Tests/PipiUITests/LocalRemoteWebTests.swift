@@ -674,10 +674,44 @@ final class LocalRemoteWebTests: XCTestCase {
         ))
         XCTAssertTrue(html.contains("textContent"))
         XCTAssertTrue(html.contains("replaceChildren"))
-        XCTAssertFalse(html.contains("innerHTML"))
+        for forbiddenAPI in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"] {
+            XCTAssertFalse(html.contains(forbiddenAPI))
+        }
         XCTAssertFalse(html.contains("?\(token)"))
         XCTAssertFalse(html.contains("#\(token)"))
         XCTAssertTrue(html.contains(#""X-PipiUI-Remote-Token": token"#))
+    }
+
+    func testWebPageMarkdownRendererUsesSafeDOMAndWhitelistedLinks() throws {
+        let html = try XCTUnwrap(String(
+            data: LocalRemoteWebPage.render(
+                token: String(repeating: "d", count: 64),
+                nonce: "nonce"
+            ),
+            encoding: .utf8
+        ))
+
+        XCTAssertTrue(html.contains("function renderMarkdown(text)"))
+        XCTAssertTrue(html.contains("function appendInline(parent, text, depth = 0)"))
+        XCTAssertTrue(html.contains("bubble.append(renderMarkdown(message.text));"))
+        XCTAssertTrue(html.contains(#"document.createElement("strong")"#))
+        XCTAssertTrue(html.contains(#"document.createElement("em")"#))
+        XCTAssertTrue(html.contains(#"document.createElement("del")"#))
+        XCTAssertTrue(html.contains(#"document.createElement("pre")"#))
+        XCTAssertTrue(html.contains(#"document.createElement("blockquote")"#))
+        XCTAssertTrue(html.contains(#"document.createElement("ul")"#))
+        XCTAssertTrue(html.contains(#"document.createElement("ol")"#))
+
+        XCTAssertTrue(html.contains(#"url.startsWith("http://")"#))
+        XCTAssertTrue(html.contains(#"url.startsWith("https://")"#))
+        XCTAssertTrue(html.contains(#"link.setAttribute("href", url)"#))
+        XCTAssertTrue(html.contains(#"link.setAttribute("target", "_blank")"#))
+        XCTAssertTrue(html.contains(#"link.setAttribute("rel", "noopener noreferrer")"#))
+        for forbiddenAPI in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"] {
+            XCTAssertFalse(html.contains(forbiddenAPI))
+        }
+        XCTAssertFalse(html.contains(#"<script src="#))
+        XCTAssertFalse(html.contains(#"<link rel="stylesheet""#))
     }
 
     func testWebPageHasPersistentConnectionPillAndNeverLeaksTokenIntoURL() throws {
@@ -696,6 +730,34 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertFalse(html.contains("?\(token)"))
         XCTAssertFalse(html.contains("#\(token)"))
         XCTAssertFalse(html.contains("/\(token)"))
+    }
+
+    func testWebPageLocksAppShellToViewportWithIndependentScrollRegions() throws {
+        let html = try XCTUnwrap(String(
+            data: LocalRemoteWebPage.render(
+                token: String(repeating: "e", count: 64),
+                nonce: "nonce"
+            ),
+            encoding: .utf8
+        ))
+        // The document itself never scrolls; the shell is viewport-locked.
+        XCTAssertTrue(html.contains("height: 100vh; height: 100dvh;"))
+        XCTAssertTrue(html.contains("overflow: hidden"))
+        XCTAssertTrue(html.contains("display: flex; flex-direction: column;"))
+        // main fills the leftover space without calc()-based viewport math.
+        XCTAssertTrue(html.contains("main { flex: 1; min-height: 0;"))
+        XCTAssertFalse(html.contains("calc(100dvh -"))
+        XCTAssertFalse(html.contains("calc(100vh -"))
+        // Sidebar and transcript scroll independently; composer stays in flow.
+        XCTAssertTrue(html.contains("aside { min-height: 0; overflow-y: auto;"))
+        XCTAssertTrue(html.contains("#transcript { flex: 1; min-height: 0; overflow-y: auto;"))
+        XCTAssertTrue(
+            html.contains("flex: none; display: grid; gap: 8px;"),
+            "composer must stay in normal flow at the column bottom"
+        )
+        XCTAssertFalse(html.contains("#transcript { flex: 1; overflow: auto;"))
+        // Auto-scroll-to-bottom after each transcript render stays intact.
+        XCTAssertTrue(html.contains("transcript.scrollTop = transcript.scrollHeight;"))
     }
 
     func testWebPageHasMobileListDetailFlowAndAccessibleBackControl() throws {
