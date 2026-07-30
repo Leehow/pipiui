@@ -702,12 +702,17 @@ const jobRegistry = new Map<string, JobRecord>();
 // ---- Stall watchdog + abort：运行中后台 job 的外部可触达句柄 ----
 const STALL_THRESHOLD_MS = 120_000;
 const STALL_WATCHDOG_INTERVAL_MS = 30_000;
+/** stall 复推节奏：boss 决定继续等时，最多 5 分钟沉默一次，不必等心跳。 */
+const STALL_RENOTIFY_INTERVAL_MS = 5 * 60 * 1000;
+/** done 重投节奏：30s 扫描每次都看，但同一 agentId 两次投递至少隔 60s，避免轰炸正在处理中的 boss。 */
+const DONE_RETRY_MIN_INTERVAL_MS = 60_000;
 /**
  * How long the boss may hear nothing at all while work is outstanding. Chosen to be far longer
  * than the stall threshold: this is the last line of defence against silence, not a progress
- * report, and every heartbeat costs the boss a turn.
+ * report, and every heartbeat costs the boss a turn. 即时性已由 30s 轮询（stall 复推 / done
+ * 重投 / vanished 检测）承担，心跳只做兜底摘要，故从 15min 降到 5min。
  */
-const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000;
+const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 
 /** Signal 0 tests for existence without touching the process. */
 function isProcessAlive(pid: number): boolean {
@@ -728,8 +733,8 @@ interface RunningAgentHandle {
 	title?: string;
 	/** 最后一次有任何流式事件/输出（stdout/stderr）的时间戳。 */
 	lastActivityAt: number;
-	/** 当前卡死片段是否已推送过（有新活动后重新武装）。 */
-	stallNotified: boolean;
+	/** 上次推送 [subagent-stalled] 的时间戳；0 = 本卡死片段尚未推过（有新活动后复位为 0）。 */
+	lastStallNotifyAt: number;
 	/** When this worker was dispatched; the heartbeat reports elapsed time. */
 	startedAt: number;
 	/**
@@ -747,7 +752,7 @@ function noteAgentActivity(agentId: string): void {
 	const handle = runningAgents.get(agentId);
 	if (!handle) return;
 	handle.lastActivityAt = Date.now();
-	handle.stallNotified = false;
+	handle.lastStallNotifyAt = 0;
 }
 
 function stalledInfoFor(agentId: string, now: number): { stalled: boolean; idleSec: number } {
@@ -1587,16 +1592,66 @@ function formatChainVerifyPrefix(results: SingleResult[]): string {
 	return `${truncateTextHead(lines.join("\n"), REPORT_DONE_CAP)}\n`;
 }
 
-function deliverSubagentDone(pi: ExtensionAPI, text: string): void {
+/**
+ * 低层投递：带 options 失败则降级为裸发；两级都用 await 接住 sync throw 和 async rejection，
+ * 返回是否确认送达，自身永不 reject（调用方可以放心 void，不会产生 unhandled rejection）。
+ */
+async function trySendUserMessage(pi: ExtensionAPI, text: string): Promise<boolean> {
 	try {
-		pi.sendUserMessage(text, { deliverAs: "followUp" });
+		await pi.sendUserMessage(text, { deliverAs: "followUp" });
+		return true;
 	} catch {
-		try {
-			pi.sendUserMessage(text);
-		} catch (err) {
-			console.error("[pipiui-subagent] failed to deliver [subagent-done]:", err);
-		}
+		// 降级到不带 options 的形式（旧版 pi 可能不认识 deliverAs）。
 	}
+	try {
+		await pi.sendUserMessage(text);
+		return true;
+	} catch (err) {
+		console.error("[pipiui-subagent] failed to deliver message:", err);
+		return false;
+	}
+}
+
+/** 一次性通知（stall / heartbeat / vanished）：投出去即可，失败由各自的重推节奏兜底。 */
+function deliverSubagentDone(pi: ExtensionAPI, text: string): void {
+	void trySendUserMessage(pi, text);
+}
+
+/** done 消息在 promise resolve 前都视为未确认；未确认的由 30s 轮询按 ≥60s 节奏重投。进程内存即可，不持久化。 */
+interface PendingDoneEntry {
+	text: string;
+	firstFailedAt: number;
+	attempts: number;
+	lastAttemptAt: number;
+}
+const pendingDone = new Map<string, PendingDoneEntry>();
+
+function sendDoneWithConfirmation(pi: ExtensionAPI, agentId: string, text: string, isRetry: boolean): void {
+	const now = Date.now();
+	let entry = pendingDone.get(agentId);
+	if (!entry) {
+		entry = { text, firstFailedAt: 0, attempts: 0, lastAttemptAt: 0 };
+		pendingDone.set(agentId, entry);
+	}
+	entry.attempts += 1;
+	entry.lastAttemptAt = now;
+	// 重投沿用同一 text，首行前加一行说明这是重复投递，防止 boss 当成新事件。
+	const outText = isRetry
+		? `(re-delivery #${entry.attempts}: the previous [subagent-done] below was not confirmed delivered; treat it as the same event, not a new one.)\n${entry.text}`
+		: entry.text;
+	void trySendUserMessage(pi, outText).then((ok) => {
+		if (ok) {
+			// 只在自己仍是当前 entry 时删除，避免与并发重投交错误删新状态。
+			if (pendingDone.get(agentId) === entry) pendingDone.delete(agentId);
+		} else if (entry.firstFailedAt === 0) {
+			entry.firstFailedAt = now;
+		}
+	});
+}
+
+/** [subagent-done] 专用：带送达确认 + 失败重投。job 此时已 terminal，重投只依赖保存的 text。 */
+function deliverConfirmedDone(pi: ExtensionAPI, agentId: string, text: string): void {
+	sendDoneWithConfirmation(pi, agentId, text, false);
 }
 
 function notifySubagentDone(
@@ -1606,7 +1661,13 @@ function notifySubagentDone(
 ): void {
 	// Finalize job BEFORE deliver: status must work even if sendUserMessage fails.
 	ensureJobTerminalFromResult(result, extra);
-	deliverSubagentDone(pi, formatSubagentDoneMessage(result, extra));
+	const text = formatSubagentDoneMessage(result, extra);
+	// 前台 job 可能没有 bridge agentId；那种情况下投递确认无从挂起，退化为一次性投递。
+	if (result.agentId) {
+		deliverConfirmedDone(pi, result.agentId, text);
+	} else {
+		deliverSubagentDone(pi, text);
+	}
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -1926,7 +1987,7 @@ async function runSingleAgent(
 			task,
 			title: options?.title,
 			lastActivityAt: Date.now(),
-			stallNotified: false,
+			lastStallNotifyAt: 0,
 			startedAt: Date.now(),
 		});
 	}
@@ -2444,21 +2505,52 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ---- Stall watchdog：后台 job 超过 120s 无任何流式事件/输出 → 向 boss 会话推一条 ----
-	// [subagent-stalled] agentId=<id> title=<title> idle=<秒>s last=<最后一行动作摘要>
-	// 每个卡死片段只推一次（有新活动后重新武装）；复用 [subagent-done] 的 followUp 通道。
-	// 30s interval 扫描；无 PIPIUI_* 环境变量时桥接上报自动静默（pipiuiReport no-op）。
+	// ---- 统一轮询（30s）：承载三条按节奏补推的路径 ——
+	// 1) done 重投：sendUserMessage 的 promise 未确认（reject 或未 settle）的 [subagent-done]，
+	//    同一 agentId 至少隔 60s 重投一次，直到确认。job 已 terminal，重投只依赖 pendingDone 里的 text。
+	// 2) vanished 即时检测：pid 已死但没人报告 → 立刻推（不等 5min 心跳），推一次后从 runningAgents 删除。
+	// 3) stall 复推：idle ≥ 120s 即推 [subagent-stalled]，boss 若继续等，每 5 分钟复推一次（idle 秒数更新）；
+	//    有新活动后 noteAgentActivity 复位 lastStallNotifyAt=0，重新武装。
+	// 复用 [subagent-done] 的 followUp 通道。无 PIPIUI_* 环境变量时桥接上报自动静默（pipiuiReport no-op）。
 	const STALL_WATCHDOG_KEY = "__pipiuiSubagentStallWatchdog";
 	const g = globalThis as Record<string, unknown>;
 	const prevWatchdog = g[STALL_WATCHDOG_KEY] as ReturnType<typeof setInterval> | undefined;
 	if (prevWatchdog) clearInterval(prevWatchdog); // 防扩展 reload 后旧定时器泄漏
 	const stallWatchdog = setInterval(() => {
 		const now = Date.now();
+
+		// (1) done 重投
+		for (const [agentId, entry] of [...pendingDone]) {
+			if (now - entry.lastAttemptAt < DONE_RETRY_MIN_INTERVAL_MS) continue;
+			sendDoneWithConfirmation(pi, agentId, entry.text, true);
+		}
+
+		// (2) vanished 即时检测（isProcessAlive 只是 signal 0，很便宜）。先于 stall 扫描：
+		// 死掉的进程不该再收到 stall 推送。
+		for (const [agentId, handle] of [...runningAgents]) {
+			if (handle.pid === undefined || isProcessAlive(handle.pid)) continue;
+			// 进程已没但没人报告：停止跟踪，这件事只说一次。
+			runningAgents.delete(agentId);
+			const title =
+				handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 60) || "(untitled)";
+			const elapsed = formatElapsedMs(now - handle.startedAt);
+			deliverSubagentDone(
+				pi,
+				[
+					`[subagent-heartbeat] outstanding=${runningAgents.size} vanished=1`,
+					`  ${agentId} (${title}) — process gone after ${elapsed}, no result reported`,
+					"A vanished worker was interrupted, not failed: its stored conversation is intact, so re-dispatch that same agentId to continue where it left off.",
+				].join("\n"),
+			);
+		}
+
+		// (3) stall 推送 / 复推
 		for (const [agentId, handle] of runningAgents) {
-			if (handle.stallNotified) continue;
 			const idleMs = now - handle.lastActivityAt;
 			if (idleMs < STALL_THRESHOLD_MS) continue;
-			handle.stallNotified = true;
+			// 本片段推过且距上次不足 5 分钟：boss 可能正在处理，保持沉默。
+			if (handle.lastStallNotifyAt > 0 && now - handle.lastStallNotifyAt < STALL_RENOTIFY_INTERVAL_MS) continue;
+			handle.lastStallNotifyAt = now;
 			const idleSec = Math.floor(idleMs / 1000);
 			const job = jobRegistry.get(agentId);
 			const title =
