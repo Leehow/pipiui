@@ -174,11 +174,14 @@ private struct AgentRow: View {
                     .truncationMode(.tail)
             }
             Spacer()
-            if agent.cost > 0 {
-                Text(String(format: "$%.3f", agent.cost))
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+            VStack(alignment: .trailing, spacing: 1) {
+                if agent.cost > 0 {
+                    Text(String(format: "$%.3f", agent.cost))
+                }
+                durationText
             }
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.tertiary)
             if agent.state == .running, let onAbort {
                 Button(action: onAbort) {
                     Image(systemName: "stop.circle")
@@ -195,6 +198,17 @@ private struct AgentRow: View {
             RoundedRectangle(cornerRadius: 6)
                 .fill(selected ? Color.accentColor.opacity(0.12) : Color.clear)
         )
+    }
+
+    @ViewBuilder
+    private var durationText: some View {
+        if agent.state == .running {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text(DurationFormat.compact(context.date.timeIntervalSince(agent.started)))
+            }
+        } else {
+            Text(DurationFormat.compact((agent.ended ?? agent.started).timeIntervalSince(agent.started)))
+        }
     }
 
     private func lifecycleBadge(text: String, color: Color) -> some View {
@@ -283,6 +297,7 @@ private struct AgentDetailView: View {
     @State private var diffBusy = false
     @State private var autoScrollGate = AgentAutoScrollGate()
     @State private var autoScrollTask: Task<Void, Never>?
+    @State private var expandedToolGroupIDs: Set<Int> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -307,8 +322,13 @@ private struct AgentDetailView: View {
                             if agent.log.isEmpty {
                                 waitingForFirstLog
                             } else {
-                                ForEach(agent.log) { item in
-                                    AgentLogRow(item: item, base: documentBase)
+                                ForEach(SubagentLogLayout.plan(agent.log)) { segment in
+                                    switch segment {
+                                    case .item(let item):
+                                        AgentLogRow(item: item, base: documentBase)
+                                    case .toolGroup(let items):
+                                        toolGroup(items)
+                                    }
                                 }
                             }
                             Color.clear
@@ -472,6 +492,54 @@ private struct AgentDetailView: View {
         }
         .frame(maxWidth: .infinity, minHeight: 120)
         .padding(10)
+    }
+
+    private func toolGroup(_ items: [AgentLogItem]) -> some View {
+        let groupID = items[0].id
+        let expanded = expandedToolGroupIDs.contains(groupID)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "wrench.and.screwdriver")
+                    .foregroundStyle(.secondary)
+                    .imageScale(.medium)
+                Text(SubagentLogLayout.summaryTitle(for: items))
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if expanded {
+                    expandedToolGroupIDs.remove(groupID)
+                } else {
+                    expandedToolGroupIDs.insert(groupID)
+                }
+            }
+            .pointingHandCursor()
+            .accessibilityAddTraits(.isButton)
+            .accessibilityLabel(SubagentLogLayout.summaryTitle(for: items))
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.primary.opacity(0.035))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.primary.opacity(0.06))
+            )
+
+            if expanded {
+                ForEach(items) { item in
+                    AgentLogRow(item: item, base: documentBase)
+                }
+            }
+        }
     }
 
     private func requestAutoScroll(_ proxy: ScrollViewProxy) {
