@@ -30,6 +30,9 @@ enum PiPlugin {
         var claudeServerToolsExtension: String? // -e anthropic hosted web_search
         var computerUseExtension: String? // -e opt-in desktop computer harness
         var agentsDir: String?     // PIPIUI_AGENTS_DIR
+        /// Set when the PiExt copy did not happen, so the fingerprint is not persisted and the
+        /// next launch retries instead of trusting a stale tree.
+        var piExtFailure: String?
     }
 
     private static var root: URL {
@@ -58,7 +61,14 @@ enum PiPlugin {
             return existing
         }
         let result = performInstall()
-        try? fingerprint.write(to: markerURL, atomically: true, encoding: .utf8)
+        // The marker means "this fingerprint is installed". Writing it after a failed copy is
+        // what turned a one-off error into a permanent one: the next launch matched the marker,
+        // took the skip path, and adopted the stale tree as if it were current.
+        if result.piExtFailure == nil {
+            try? fingerprint.write(to: markerURL, atomically: true, encoding: .utf8)
+        } else {
+            try? fm.removeItem(at: markerURL)
+        }
         return result
     }
 
@@ -165,7 +175,24 @@ enum PiPlugin {
             ?? PipiResourceBundle.shared.resourceURL?.appendingPathComponent("PiExt", isDirectory: true)
         if let bundled = bundledPiExt, fm.fileExists(atPath: bundled.path) {
             let dest = root.appendingPathComponent("pi-ext")
-            try? fm.removeItem(at: dest)
+            // A single undeletable file — one `chflags uchg` is enough — fails the remove, and
+            // then the copy fails because dest still exists. Both used to be swallowed. Sessions
+            // survived on the bundle fallbacks below, but nothing said so: the install failed on
+            // every launch for six days, in silence, and left a stale tree that read like the
+            // live one. A fallback that quietly becomes the permanent path is not a fallback.
+            do {
+                try fm.removeItem(at: dest)
+            } catch CocoaError.fileNoSuchFile {
+                // Nothing installed yet; the copy below is the first install.
+            } catch {
+                result.piExtFailure = "无法清除旧的 pi-ext（\(error.localizedDescription)）"
+                Log.error(
+                    "pi-ext install: cannot remove \(dest.path): \(error). "
+                        + "A locked or unwritable file there pins the extension at its old version; "
+                        + "check `ls -lO` for a uchg flag.",
+                    category: .process
+                )
+            }
             do {
                 try fm.copyItem(at: bundled, to: dest)
                 let subagent = dest.appendingPathComponent("subagent")
@@ -183,7 +210,16 @@ enum PiPlugin {
                     result.computerUseExtension = computerStrategy.path
                 }
             } catch {
-                // 拷贝失败时降级：subagent 面板仍能用（依赖用户自装的），只是没补丁
+                // 降级到下面的 bundle 路径，会话仍是当前代码；但必须留痕，
+                // 否则 Application Support 里那份陈旧副本会一直冒充在跑的版本。
+                result.piExtFailure = result.piExtFailure
+                    ?? "无法安装 pi-ext（\(error.localizedDescription)）"
+                Log.error(
+                    "pi-ext install: copy \(bundled.path) -> \(dest.path) failed: \(error). "
+                        + "Falling back to the bundle copy; the tree under Application Support "
+                        + "is now stale and must not be read as what sessions run.",
+                    category: .process
+                )
             }
         }
         // If Application Support is stale/incomplete, still point at the bundle agents.
