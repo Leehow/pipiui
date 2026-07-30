@@ -296,9 +296,9 @@ final class SubagentModelSettingsTests: XCTestCase {
         XCTAssertTrue(source.contains("pi.on(\"context\""))
         XCTAssertTrue(source.contains("superpowers:using-superpowers bootstrap for pi"))
         XCTAssertTrue(source.contains("text: SUBAGENT_BOOTSTRAP_SUPPRESSION_NOTE"))
-        // The read block is scoped to read-only planners: an implementer may legitimately
+        // The read block is scoped to agents that ask for it: an implementer may legitimately
         // need to read a skills/ path that belongs to the user's own repository.
-        XCTAssertTrue(source.contains("PIPIUI_SKILL_READ_BLOCK: agentName === \"plan\" ? \"1\" : undefined"))
+        XCTAssertTrue(source.contains("PIPIUI_SKILL_READ_BLOCK: agent.traits.blockSkillReads ? \"1\" : undefined"))
         XCTAssertTrue(source.contains("if (PIPIUI_SKILL_READ_BLOCK) {"))
         XCTAssertTrue(source.contains("if (event.toolName !== \"read\") return"))
         XCTAssertTrue(source.contains("isSkillReadPath(requestedPath)"))
@@ -332,10 +332,12 @@ final class SubagentModelSettingsTests: XCTestCase {
     func testReadOnlyAgentsNeverRunAnUnattestableVerify() throws {
         let source = try subagentExtensionSource()
 
-        XCTAssertTrue(source.contains("const READ_ONLY_AGENTS = new Set([\"plan\", \"explore\", \"reviewer\"]);"))
+        // Read-only-ness is declared by the agent now, so a new read-only agent gets this
+        // protection by saying so rather than by being remembered in a set here.
         XCTAssertTrue(source.contains(
-            "const attestableVerify = READ_ONLY_AGENTS.has(agentName) ? undefined : options?.verify;"
+            "const attestableVerify = agent.traits.readOnly ? undefined : options?.verify;"
         ))
+        XCTAssertFalse(source.contains("READ_ONLY_AGENTS"), "the name set must be gone")
         XCTAssertTrue(source.contains("currentResult.verifyDropped = true;"))
         XCTAssertTrue(source.contains("verifyDropped?: boolean;"))
         XCTAssertTrue(source.contains("Verification: not applicable"))

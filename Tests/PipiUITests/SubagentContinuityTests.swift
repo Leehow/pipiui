@@ -40,7 +40,7 @@ final class SubagentContinuityTests: XCTestCase {
     /// A report is a one-shot deliverable; yesterday's context would only bias the next one.
     func testReadOnlyRolesStayEphemeral() throws {
         let s = try source()
-        XCTAssertTrue(s.contains("const sessionDir = READ_ONLY_AGENTS.has(agentName) ? undefined : agentSessionDir();"))
+        XCTAssertTrue(s.contains("const sessionDir = agent.traits.readOnly ? undefined : agentSessionDir();"))
         XCTAssertTrue(s.contains(#"args.push("--no-session")"#), "no session dir must still mean no session")
     }
 

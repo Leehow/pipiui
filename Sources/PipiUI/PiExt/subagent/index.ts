@@ -321,6 +321,8 @@ interface SingleResult {
 	verifySkipped?: boolean;
 	/** Brief carried `verify` for a read-only agent; the runtime dropped it as unattestable. */
 	verifyDropped?: boolean;
+	/** Declared `deliverable: report`: the done message carries a report, capped higher. */
+	reportsInFull?: boolean;
 	/** Continued an existing worker's conversation instead of starting it cold. */
 	resumed?: boolean;
 }
@@ -512,6 +514,12 @@ interface AgentRuntimeRolePolicy {
 /**
  * Runtime-owned policy: agent markdown/prompt text cannot opt the closeout secretary
  * back into a worktree or recursive delegation.
+ *
+ * This is deliberately the one policy that stayed keyed on the name while the rest moved to
+ * AgentTraits. The traits an agent declares only ever narrow it — read-only drops its verify,
+ * a skill block takes reads away — so a definition that lies costs it capability. These two
+ * grant: a main-session worktree and the right to delegate. A project-scoped `secretary.md`
+ * must not be able to hand itself either by editing its own frontmatter.
  */
 function runtimeRolePolicyForAgent(agentName: string): AgentRuntimeRolePolicy {
 	if (agentName === "secretary") {
@@ -1517,12 +1525,14 @@ function resolveSubagentWorktree(opts: {
 	};
 }
 
-/** Done-message cap by agent name; error/abort overrides to ERROR_DONE_CAP. */
-function doneCapForAgent(agentName: string, isError: boolean): number {
+/**
+ * Done-message cap. The agent declares whether its deliverable is a report (`deliverable:
+ * report`); a verdict is the default, including for an agent whose definition never loaded.
+ * Error/abort overrides both.
+ */
+function doneCapForResult(result: { reportsInFull?: boolean }, isError: boolean): number {
 	if (isError) return ERROR_DONE_CAP;
-	if (agentName === "explore" || agentName === "plan") return REPORT_DONE_CAP;
-	// general-purpose / reviewer / lead, and the default for unknown names
-	return VERDICT_DONE_CAP;
+	return result.reportsInFull ? REPORT_DONE_CAP : VERDICT_DONE_CAP;
 }
 
 function formatSubagentDoneMessage(
@@ -1539,7 +1549,7 @@ function formatSubagentDoneMessage(
 	// truncation would drop exactly those sections once the report exceeds the cap.
 	const output = truncateTextHead(
 		extra?.error || getResultOutput(result) || result.stderr || "(no output)",
-		doneCapForAgent(result.agent, isError),
+		doneCapForResult(result, isError),
 	);
 	const cost =
 		typeof result.usage.cost === "number" ? result.usage.cost.toFixed(4) : String(result.usage.cost ?? 0);
@@ -1772,8 +1782,8 @@ This session is a dispatched subagent. External skill libraries are switched off
 
 const PLAN_SUBAGENT_ARTIFACT_BAN = `You are read-only: you MUST NOT create or save plan artifacts. Your deliverable is the plan text in your final message.`;
 
-/** Read-only roles: their deliverable is a report, so a shell verify has nothing to attest. */
-const READ_ONLY_AGENTS = new Set(["plan", "explore", "reviewer"]);
+// Read-only-ness now travels on the agent definition (`read-only: true`), so a new agent
+// declares it instead of being remembered here. See AgentTraits in ./agents.ts.
 
 const PI_SKILLS_PREAMBLE = [
 	"The following skills provide specialized instructions for specific tasks.",
@@ -1888,7 +1898,7 @@ async function runSingleAgent(
 	// First real dispatch is exactly when the ledger becomes relevant (see the lazy-discovery
 	// rule the orchestration layer states), so seed it here rather than on every session start.
 	seedBossLedger();
-	const sessionDir = READ_ONLY_AGENTS.has(agentName) ? undefined : agentSessionDir();
+	const sessionDir = agent.traits.readOnly ? undefined : agentSessionDir();
 	const sessionId = `pipiui-${pipiuiAgentId}`;
 	const resumingSession = Boolean(
 		sessionDir && !options?.fresh && agentSessionExists(sessionDir, sessionId),
@@ -1946,6 +1956,8 @@ async function runSingleAgent(
 	const currentResult: SingleResult = {
 		agent: agentName,
 		agentSource: agent.source,
+		// Carried on the result because the done formatter runs far from the agent definition.
+		reportsInFull: agent.traits.reportsInFull,
 		task,
 		title: options?.title,
 		exitCode: 0,
@@ -2036,16 +2048,17 @@ async function runSingleAgent(
 				PIPIUI_AGENT_ID: pipiuiAgentId,
 				PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
 				PIPIUI_AGENT_ROLE: runtimePolicy.role,
-				// Scope marker read by the philosophy package. A `lead` delegates, so it needs
-				// the orchestration layers; every other dispatched agent must not get them —
-				// depth alone cannot tell the two apart, and a worker taught to fan out would
-				// fight PIPIUI_AGENT_MAX_DEPTH.
-				PIPI_PHILOSOPHY_ROLE: agentName === "lead" ? "lead" : "worker",
+				// Scope marker read by the philosophy package. An agent that delegates needs the
+				// orchestration layers; every other dispatched agent must not get them — depth
+				// alone cannot tell the two apart, and a worker taught to fan out would fight
+				// PIPIUI_AGENT_MAX_DEPTH. Declared by the agent (`delegates: true`), which is
+				// consistent with `tools` already deciding whether it can dispatch at all.
+				PIPI_PHILOSOPHY_ROLE: agent.traits.delegates ? "lead" : "worker",
 				...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
-				// Every dispatched child runs isolated from external skill libraries; only
-				// read-only planners also get the SKILL.md read block.
+				// Every dispatched child runs isolated from external skill libraries; an agent
+				// that asks for it (`block-skill-reads: true`) also cannot read SKILL.md at all.
 				PIPIUI_SUBAGENT_SKILL_ISOLATION: "1",
-				PIPIUI_SKILL_READ_BLOCK: agentName === "plan" ? "1" : undefined,
+				PIPIUI_SKILL_READ_BLOCK: agent.traits.blockSkillReads ? "1" : undefined,
 				...(runtimePolicy.worktree === "main-session"
 					? { PIPIUI_WORKTREE: "0", PIPIUI_AGENT_NO_DELEGATION: "1" }
 					: {}),
@@ -2220,8 +2233,8 @@ async function runSingleAgent(
 		// A read-only role delivers a report, not a file: running a verify against it can
 		// only ever fail, which used to burn the two-attempts budget on a re-dispatch that
 		// was structurally incapable of passing. `verifyDropped` tells the boss why.
-		const attestableVerify = READ_ONLY_AGENTS.has(agentName) ? undefined : options?.verify;
-		if (READ_ONLY_AGENTS.has(agentName) && options?.verify && options.verify.trim()) {
+		const attestableVerify = agent.traits.readOnly ? undefined : options?.verify;
+		if (agent.traits.readOnly && options?.verify && options.verify.trim()) {
 			currentResult.verifyDropped = true;
 		}
 		if (attestableVerify && attestableVerify.trim() && !wasAborted) {
@@ -2287,7 +2300,7 @@ async function runSingleAgent(
 }
 
 const VERIFY_PARAM_DESCRIPTION =
-	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Boss must fill this for implementation tasks. Omit it for read-only agents (plan/explore/reviewer) — they deliver a report, not files, and the runtime drops any verify they are given.";
+	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Boss must fill this for implementation tasks. Omit it for read-only agents — they deliver a report, not files, and the runtime drops any verify they are given.";
 
 const AGENT_ID_DESCRIPTION =
 	"Short semantic name for the worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\". Re-dispatching the same agentId continues that worker with its previous conversation, worktree and branch — use it for one vertical slice (implement, verify, debug, fix, re-verify). Omit for one-off work and a name is generated. Also the target id for action=\"abort\".";
@@ -2949,7 +2962,7 @@ export default function (pi: ExtensionAPI) {
 				// cap, head-keep (templates put the key sections first).
 				const chainOutput = truncateTextHead(
 					getFinalOutput(lastChainResult.messages) || "(no output)",
-					doneCapForAgent(lastChainResult.agent, false),
+					doneCapForResult(lastChainResult, false),
 				);
 				return {
 					content: [

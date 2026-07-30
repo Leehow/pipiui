@@ -220,14 +220,19 @@ final class PhilosophyLayerTests: XCTestCase {
         }
     }
 
-    /// A dispatched `lead` delegates, so it must be marked as a lead rather than a worker;
-    /// depth alone cannot tell them apart, and a plain worker taught to fan out would fight
-    /// the recursion guard.
+    /// An agent that delegates must be marked as a lead rather than a worker; depth alone
+    /// cannot tell them apart, and a plain worker taught to fan out would fight the recursion
+    /// guard. Which agents those are is declared by them (`delegates: true`), not remembered
+    /// by name here — see AgentTraitsTests.
     func testSubagentExtensionMarksLeadsSeparatelyFromWorkers() throws {
         let bundled = try XCTUnwrap(PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil))
         let source = try String(
             contentsOf: bundled.appendingPathComponent("subagent/index.ts"), encoding: .utf8)
-        XCTAssertTrue(source.contains("PIPI_PHILOSOPHY_ROLE: agentName === \"lead\" ? \"lead\" : \"worker\""))
+        XCTAssertTrue(source.contains("PIPI_PHILOSOPHY_ROLE: agent.traits.delegates ? \"lead\" : \"worker\""))
+
+        let lead = try String(
+            contentsOf: bundled.appendingPathComponent("agents/lead.md"), encoding: .utf8)
+        XCTAssertTrue(lead.contains("delegates: true"), "the roster's only orchestrator must say so")
     }
 
     /// Dropping the tier table took the only route that named `explore` with it, leaving four
