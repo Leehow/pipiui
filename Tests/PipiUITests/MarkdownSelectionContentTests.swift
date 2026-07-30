@@ -93,4 +93,80 @@ final class MarkdownSelectionContentTests: XCTestCase {
         XCTAssertEqual(style?.minimumLineHeight ?? -1, typography.blockSpacing, accuracy: 0.001)
         XCTAssertEqual(style?.maximumLineHeight ?? -1, typography.blockSpacing, accuracy: 0.001)
     }
+
+    func testBoldAndCodeFontsSurviveRendered() {
+        let typography = ChatTypography.make(fontSize: 15)
+        let content = MarkdownSelectionContent.attributedString(
+            for: "**agentId** and `explore-sidebar`",
+            typography: typography
+        )
+
+        XCTAssertEqual(content.string, "agentId and explore-sidebar")
+
+        let ns = content.string as NSString
+        let boldRange = ns.range(of: "agentId")
+        XCTAssertNotEqual(boldRange.location, NSNotFound)
+        let boldFont = content.attribute(.font, at: boldRange.location, effectiveRange: nil) as? NSFont
+        XCTAssertNotNil(boldFont)
+        XCTAssertTrue(
+            boldFont!.fontDescriptor.symbolicTraits.contains(.bold),
+            "expected bold font on **agentId**, got \(boldFont!.fontName)"
+        )
+
+        let codeRange = ns.range(of: "explore-sidebar")
+        XCTAssertNotEqual(codeRange.location, NSNotFound)
+        let codeFont = content.attribute(.font, at: codeRange.location, effectiveRange: nil) as? NSFont
+        XCTAssertNotNil(codeFont)
+        XCTAssertTrue(
+            codeFont!.fontDescriptor.symbolicTraits.contains(.monoSpace),
+            "expected monospaced font on `explore-sidebar`, got \(codeFont!.fontName)"
+        )
+    }
+
+    func testItalicAndStrikethroughSurviveRendered() {
+        let content = MarkdownSelectionContent.attributedString(
+            for: "*斜体* and ~~删除线~~"
+        )
+        let ns = content.string as NSString
+
+        let italicRange = ns.range(of: "斜体")
+        XCTAssertNotEqual(italicRange.location, NSNotFound)
+        let italicFont = content.attribute(.font, at: italicRange.location, effectiveRange: nil) as? NSFont
+        XCTAssertNotNil(italicFont)
+        XCTAssertTrue(
+            italicFont!.fontDescriptor.symbolicTraits.contains(.italic),
+            "expected italic font on *斜体*, got \(italicFont!.fontName)"
+        )
+
+        let strikeRange = ns.range(of: "删除线")
+        XCTAssertNotEqual(strikeRange.location, NSNotFound)
+        let strike = content.attribute(.strikethroughStyle, at: strikeRange.location, effectiveRange: nil) as? Int
+        XCTAssertEqual(strike, NSUnderlineStyle.single.rawValue)
+    }
+
+    func testTableCellsKeepInlineMarkdown() {
+        let markdown = """
+        | Key | Value |
+        | --- | --- |
+        | **agentId** | `explore` |
+        """
+        let content = MarkdownSelectionContent.attributedString(for: markdown)
+        let ns = content.string as NSString
+
+        let boldRange = ns.range(of: "agentId")
+        XCTAssertNotEqual(boldRange.location, NSNotFound)
+        let boldFont = content.attribute(.font, at: boldRange.location, effectiveRange: nil) as? NSFont
+        XCTAssertTrue(
+            boldFont?.fontDescriptor.symbolicTraits.contains(.bold) == true,
+            "table cell **agentId** must stay bold"
+        )
+
+        let codeRange = ns.range(of: "explore")
+        XCTAssertNotEqual(codeRange.location, NSNotFound)
+        let codeFont = content.attribute(.font, at: codeRange.location, effectiveRange: nil) as? NSFont
+        XCTAssertTrue(
+            codeFont?.fontDescriptor.symbolicTraits.contains(.monoSpace) == true,
+            "table cell `explore` must stay monospaced"
+        )
+    }
 }

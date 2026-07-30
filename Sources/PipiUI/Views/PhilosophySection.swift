@@ -1,5 +1,29 @@
 import SwiftUI
 
+/// Reloadable state for the General-tab philosophy detail controls. The
+/// built-in feature is a hard upper bound: config/package detail cannot become
+/// effective while the master capability is off.
+struct PhilosophySectionState: Equatable {
+    let builtInEnabled: Bool
+    let configEnabled: Bool
+
+    var allowsConfiguration: Bool { builtInEnabled }
+    var effectiveEnabled: Bool { builtInEnabled && configEnabled }
+
+    static func load(
+        defaults: UserDefaults = .standard,
+        configURL: URL = PhilosophySettings.configURL
+    ) -> PhilosophySectionState {
+        PhilosophySectionState(
+            builtInEnabled: BuiltInFeatureSettings.isEnabled(
+                .philosophy,
+                defaults: defaults
+            ),
+            configEnabled: PhilosophySettings.isEnabled(configURL: configURL)
+        )
+    }
+}
+
 /// Settings → 通用 → 哲学.
 ///
 /// Small on purpose: the philosophy itself lives in the `pipi-philosophy` pi package, and this
@@ -9,7 +33,7 @@ struct PhilosophySection: View {
     @ObservedObject var store: AppStore
 
     @State private var catalog: [PhilosophySettings.Layer] = []
-    @State private var enabled = PhilosophySettings.isEnabled()
+    @State private var state = PhilosophySectionState.load()
     @State private var registration = PhilosophyPackage.registration()
     @State private var statusMessage: String?
 
@@ -41,7 +65,10 @@ struct PhilosophySection: View {
             Toggle(isOn: enabledBinding) {
                 Label("哲学", systemImage: "brain")
             }
-            .help("常驻工作哲学：判断准则、编排方式、并发方式。装在 pi 里，不在本 App 里。")
+            .disabled(!state.allowsConfiguration)
+            .help(state.allowsConfiguration
+                ? "常驻工作哲学：判断准则、编排方式、并发方式。装在 pi 里，不在本 App 里。"
+                : "已由「内置」总控关闭；请先在「内置」tab 启用工作哲学。")
             Text(subtitle)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -49,7 +76,10 @@ struct PhilosophySection: View {
     }
 
     private var subtitle: String {
-        guard enabled else { return "关闭后不再注入任何一层。" }
+        guard state.builtInEnabled else {
+            return "已由「内置」总控关闭。此处的层级与 pi 包注册不可修改。"
+        }
+        guard state.configEnabled else { return "关闭后不再注入任何一层。" }
         let tokens = PhilosophySettings.estimatedActiveTokens()
         return "每轮常驻，约 \(tokens >= 1000 ? String(format: "%.1fk", Double(tokens) / 1000) : "\(tokens)") tokens。改动在新一轮生效。"
     }
@@ -80,7 +110,7 @@ struct PhilosophySection: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            .disabled(!enabled || !blockedBy.isEmpty)
+            .disabled(!state.effectiveEnabled || !blockedBy.isEmpty)
             if !layer.summary.isEmpty {
                 Text(blockedName.isEmpty ? layer.summary : "\(layer.summary)（依赖「\(blockedName)」）")
                     .font(.caption)
@@ -95,33 +125,41 @@ struct PhilosophySection: View {
             }
         }
         .padding(.leading, layer.requires.isEmpty ? 0 : 18)
-        .opacity(enabled ? 1 : 0.5)
+        .opacity(state.effectiveEnabled ? 1 : 0.5)
     }
 
     @ViewBuilder
     private var registrationRow: some View {
         HStack(spacing: 8) {
-            switch registration {
-            case .registered:
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                Text("已装进 pi —— 终端裸跑 `pi` 和派出去的 worker 也生效")
+            if !state.allowsConfiguration {
+                Image(systemName: "lock.fill").foregroundStyle(.secondary)
+                Text("pi 包注册受「内置」总控锁定；先启用工作哲学才能修改。")
                     .font(.caption)
+                    .foregroundStyle(.secondary)
                 Spacer()
-                Button("移除") { setRegistered(false) }
-                    .font(.caption)
-            case .notRegistered:
-                Image(systemName: "exclamationmark.circle").foregroundStyle(.orange)
-                Text("仅本 App 生效；装进 pi 后终端裸跑也能用")
-                    .font(.caption)
-                Spacer()
-                Button("装进 pi") { setRegistered(true) }
-                    .font(.caption)
-            case .unreadable(let detail):
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                Text("~/.pi/agent/settings.json \(detail)，已跳过注册（不会覆盖你的配置）")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                Spacer()
+            } else {
+                switch registration {
+                case .registered:
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text("已装进 pi —— 终端裸跑 `pi` 和派出去的 worker 也生效")
+                        .font(.caption)
+                    Spacer()
+                    Button("移除") { setRegistered(false) }
+                        .font(.caption)
+                case .notRegistered:
+                    Image(systemName: "exclamationmark.circle").foregroundStyle(.orange)
+                    Text("仅本 App 生效；装进 pi 后终端裸跑也能用")
+                        .font(.caption)
+                    Spacer()
+                    Button("装进 pi") { setRegistered(true) }
+                        .font(.caption)
+                case .unreadable(let detail):
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Text("~/.pi/agent/settings.json \(detail)，已跳过注册（不会覆盖你的配置）")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    Spacer()
+                }
             }
         }
         .padding(.top, 2)
@@ -131,10 +169,11 @@ struct PhilosophySection: View {
 
     private var enabledBinding: Binding<Bool> {
         Binding(
-            get: { enabled },
+            get: { state.effectiveEnabled },
             set: { newValue in
+                guard state.allowsConfiguration else { return }
                 PhilosophySettings.setEnabled(newValue)
-                enabled = newValue
+                state = PhilosophySectionState.load()
                 statusMessage = nil
                 store.philosophyRevision &+= 1
             }
@@ -145,6 +184,7 @@ struct PhilosophySection: View {
         Binding(
             get: { PhilosophySettings.isLayerEnabled(layer.id) },
             set: { newValue in
+                guard state.allowsConfiguration else { return }
                 PhilosophySettings.setLayerEnabled(newValue, id: layer.id)
                 statusMessage = nil
                 store.philosophyRevision &+= 1
@@ -153,6 +193,7 @@ struct PhilosophySection: View {
     }
 
     private func setRegistered(_ shouldRegister: Bool) {
+        guard state.allowsConfiguration else { return }
         do {
             if shouldRegister {
                 try PhilosophyPackage.register()
@@ -172,7 +213,7 @@ struct PhilosophySection: View {
 
     private func reload() {
         catalog = PhilosophySettings.layers()
-        enabled = PhilosophySettings.isEnabled()
+        state = PhilosophySectionState.load()
         registration = PhilosophyPackage.registration()
     }
 }

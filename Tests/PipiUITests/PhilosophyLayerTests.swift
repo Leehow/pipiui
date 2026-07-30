@@ -217,6 +217,34 @@ final class PhilosophyLayerTests: XCTestCase {
         XCTAssertTrue(source.contains("PIPI_PHILOSOPHY_ROLE: agentName === \"lead\" ? \"lead\" : \"worker\""))
     }
 
+    /// Dropping the tier table took the only route that named `explore` with it, leaving four
+    /// rules arguing against recon and none for it — so the boss grepped everything itself.
+    /// The routing has to be stated where delegation lives, not inferred from a cost model.
+    func testInvestigationIsRoutedToExploreNotDoneByTheBoss() throws {
+        let t = try text("orchestration")
+        assertContains(t, "a handful of locating reads to size a goal or answer the user")
+        assertContains(t, "Past a handful of reads, that is an `explore`, not your own grep")
+        assertContains(t, "a sweep across directories, call sites, or naming conventions")
+        assertContains(t, "Its report costs context; that is the trade, and it is the right one")
+        assertContains(t, "It is never a reason to run a search yourself")
+        assertContains(t, "A research or analysis-only goal is delegated like any other")
+        assertContains(t, "one `explore` for a contained question, several over non-overlapping partitions")
+        assertContains(t, "before answering about code you have not read")
+    }
+
+    /// "One worker for a contained change" next to a section headed "One worker per vertical
+    /// slice" outvoted the fan-out layer, which the boss only reaches ~7k tokens later.
+    func testWorkerCountFollowsIndependenceNotSize() throws {
+        let t = try text("orchestration")
+        assertContains(t, "Two unrelated changes are two workers in one dispatch")
+        assertContains(t, "never one worker told to do both")
+        assertContains(t, "independence decides the count, size does not")
+
+        let fanout = try text("fanout")
+        assertContains(fanout, "Two unrelated small changes are two workers")
+        assertContains(fanout, "one worker told to cover several independent sub-items")
+    }
+
     /// Layer bodies sit in the cached prefix of every request; English is roughly half the
     /// tokens of the equivalent Chinese. Frontmatter (name/summary) is UI text and may be
     /// Chinese — only the body that reaches the model is pinned.

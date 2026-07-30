@@ -1,0 +1,7 @@
+tunnel: replace-with-tunnel-uuid
+credentials-file: /etc/cloudflared/replace-with-tunnel-uuid.json
+
+ingress:
+  - hostname: pipi.aichattrpg.com
+    service: http://127.0.0.1:8787
+  - service: http_status:404

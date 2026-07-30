@@ -143,6 +143,7 @@ private struct ChatDetailViewBody: View {
                     selectAgent(agentID)
                 }
             )
+            .dismissOnOutsideClick { finishedGroupPresentation = nil }
         }
         .onAppear {
             gitBranches.bind(projectURL: session.projectURL)

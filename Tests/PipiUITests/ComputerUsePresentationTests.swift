@@ -145,6 +145,50 @@ final class ComputerUsePresentationTests: XCTestCase {
         XCTAssertEqual(window.orderFrontRegardlessCallCount, 1)
         XCTAssertFalse(window.isVisible)
     }
+
+    func testUnattachedPresentationLeavesStrayVisibleWindowAlone() {
+        // A host process (the XCTest target) never attaches a PipiUI main
+        // window to the presentation. The old presentMiniWindow() fallback
+        // grabbed `NSApp.windows.first(where: { $0.isVisible })` and reshaped
+        // whichever stray window it found into the mini progress chrome,
+        // then orderFrontRegardless()'d it — stranding an unrelated window
+        // (a test fixture, a leftover panel) on screen. The fix requires an
+        // explicit attachment, so an unattached presentation must be a no-op
+        // even when a visible window is available to grab.
+        let coordinator = ComputerCoordinator(computerUseEnabledProvider: { true })
+        let controller = ComputerUseWindowPresentation()
+        // Deliberately do NOT attach: no mainWindow is realized.
+
+        let decoy = NonOrderingTestWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        decoy.reportsVisible = true
+        // The decoy is the only window AppKit considers visible, so the old
+        // fallback could not have picked a different victim. This makes the
+        // regression deterministic rather than dependent on harness state.
+        XCTAssertEqual(NSApp.windows.filter { $0.isVisible }, [decoy])
+
+        let originalContentView = decoy.contentView
+        let originalFrame = decoy.frame
+        let originalLevel = decoy.level
+        let originalStyleMask = decoy.styleMask
+
+        coordinator.isDesktopOperationActive = true
+        coordinator.statusMessage = "正在操作 测试应用…"
+        controller.update(for: coordinator)
+
+        // Nothing was claimed: no mini content swap, no resize, no restyle,
+        // and no fronting path reached.
+        XCTAssertEqual(decoy.contentView, originalContentView)
+        XCTAssertEqual(decoy.frame, originalFrame)
+        XCTAssertEqual(decoy.level, originalLevel)
+        XCTAssertEqual(decoy.styleMask, originalStyleMask)
+        XCTAssertEqual(decoy.orderFrontRegardlessCallCount, 0)
+        XCTAssertEqual(decoy.orderFrontCallCount, 0)
+    }
 }
 
 /// Test-only `NSWindow` substitute that neutralizes AppKit's window-fronting
@@ -152,6 +196,14 @@ final class ComputerUsePresentationTests: XCTestCase {
 /// so tests can prove the production fronting code path ran without ever
 /// putting the fixture on the real desktop.
 private final class NonOrderingTestWindow: NSWindow {
+    /// When true, AppKit's `isVisible` reports the window as on screen even
+    /// though no fronting call ran. Simulates a stray visible window — the
+    /// kind the old `NSApp.windows` fallback grabbed — without putting a real
+    /// window on the desktop. Defaults to false so existing fixtures that
+    /// assert `isVisible == false` are unaffected.
+    var reportsVisible = false
+    override var isVisible: Bool { reportsVisible }
+
     var orderFrontRegardlessCallCount = 0
     var orderFrontCallCount = 0
 

@@ -108,11 +108,54 @@ final class SubagentContinuityTests: XCTestCase {
     /// waits forever on work that is already over, so the silence itself has to be bounded.
     func testHeartbeatBoundsHowLongTheBossCanHearNothing() throws {
         let s = try source()
-        XCTAssertTrue(s.contains("const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000;"))
+        XCTAssertTrue(s.contains("const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;"),
+                      "immediacy is the 30s poll's job now; the heartbeat is only the backstop, so 5min not 15min")
         XCTAssertTrue(s.contains("if (runningAgents.size === 0) return;"),
                       "an idle session must stay silent; a heartbeat costs the boss a turn")
         XCTAssertTrue(s.contains("[subagent-heartbeat] outstanding="))
         XCTAssertTrue(s.contains("Do not re-dispatch a worker that is still running"))
+    }
+
+    /// sendUserMessage is async: a sync try/catch around it never sees the rejection, so one
+    /// failed delivery used to mean the boss never heard the done at all. Delivery must await
+    /// both fallback tiers, and an unconfirmed done must be retried until the promise resolves.
+    func testDoneDeliveryIsAwaitedConfirmedAndRetriedUntilAcknowledged() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains("await pi.sendUserMessage(text, { deliverAs: \"followUp\" });"),
+                      "only await turns an async rejection into a caught failure")
+        XCTAssertTrue(s.contains("const pendingDone = new Map<string, PendingDoneEntry>();"),
+                      "a done is unconfirmed until its promise resolves, so it must be tracked for retry")
+        XCTAssertTrue(s.contains("if (pendingDone.get(agentId) === entry) pendingDone.delete(agentId);"),
+                      "only a confirmed resolve may clear the retry state")
+        XCTAssertTrue(s.contains("if (now - entry.lastAttemptAt < DONE_RETRY_MIN_INTERVAL_MS) continue;"),
+                      "retries ride the 30s scan but no more than once a minute per worker")
+        XCTAssertTrue(s.contains("(re-delivery #"),
+                      "a retry must say it is the same event, not a new one")
+    }
+
+    /// A boolean stallNotified pushed once and then went silent until the 15-minute heartbeat.
+    /// A boss that chose to keep waiting must hear again: the handle now stamps the last push
+    /// and re-pushes once five more minutes of idleness have passed.
+    func testStallRenotifiesOnATimestampNotABoolean() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains("lastStallNotifyAt: number;"),
+                      "a timestamp, not a boolean, so a continuing stall can be re-pushed")
+        XCTAssertTrue(s.contains("handle.lastStallNotifyAt = 0;"),
+                      "new activity re-arms the stall push for the next idle episode")
+        XCTAssertTrue(s.contains("if (handle.lastStallNotifyAt > 0 && now - handle.lastStallNotifyAt < STALL_RENOTIFY_INTERVAL_MS) continue;"),
+                      "re-push is gated at five minutes, not swallowed until the heartbeat")
+    }
+
+    /// A worker whose pid is gone but whose close handler never ran used to wait for the
+    /// heartbeat to be noticed. isProcessAlive is only signal 0, so the 30s poll can afford to
+    /// check it every pass and report within half a minute.
+    func testVanishedWorkersAreCaughtInTheThirtySecondPoll() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains("if (handle.pid === undefined || isProcessAlive(handle.pid)) continue;"),
+                      "a dead pid must surface in the 30s poll, not at the next 5min heartbeat")
+        XCTAssertTrue(s.contains("runningAgents.delete(agentId);"), "report a vanished worker once")
+        XCTAssertTrue(s.contains("interrupted, not failed"),
+                      "a vanished worker still has its context and should be continued by name")
     }
 
     /// Idleness is not death: a worker can be quiet while thinking, and a dead one can leave a
@@ -165,7 +208,9 @@ final class SubagentContinuityTests: XCTestCase {
     /// The philosophy has to teach the boss to use the mechanism, or nobody names anything.
     func testOrchestrationLayerTeachesNamedVerticalSlices() throws {
         let t = try PhilosophyLayerFixture.normalizedBody("orchestration")
-        XCTAssertTrue(t.contains("One worker per vertical slice"))
+        XCTAssertTrue(t.contains("Continuity within one vertical slice"))
+        XCTAssertTrue(t.contains("It says nothing about how many slices run at once"),
+                      "a continuity rule must not read as a cap on concurrent workers")
         XCTAssertTrue(t.contains("Name the worker, not just the task"))
         XCTAssertTrue(t.contains("implement → verify → diagnose the failure → fix → re-verify"))
         XCTAssertTrue(t.contains("two-attempts rule outranks continuity"))

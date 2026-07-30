@@ -95,15 +95,17 @@ enum PhilosophyPackage {
             let packages = settings["packages"] as? [Any] ?? []
             let target = installedURL.path
             let listed = packages.contains { entry in
-                if let s = entry as? String { return matches(s, target) }
-                // pi also accepts `{ "source": ... }` entries.
-                if let dict = entry as? [String: Any], let s = dict["source"] as? String {
-                    return matches(s, target)
-                }
-                return false
+                packageSource(entry).map { matches($0, target) } ?? false
             }
             return listed ? .registered : .notRegistered
         }
+    }
+
+    /// pi accepts both a string and `{ "source": ... }` for package entries.
+    /// Registration, idempotence, and removal must use the same parser.
+    private static func packageSource(_ entry: Any) -> String? {
+        if let source = entry as? String { return source }
+        return (entry as? [String: Any])?["source"] as? String
     }
 
     /// Trailing slashes and `~` are both legal in pi's package list; compare resolved paths.
@@ -130,8 +132,9 @@ enum PhilosophyPackage {
     static func register(settingsURL url: URL = settingsURL) throws {
         try mutatePackages(url) { packages in
             let target = installedURL.path
-            guard !packages.contains(where: { ($0 as? String).map { matches($0, target) } ?? false })
-            else {
+            guard !packages.contains(where: {
+                packageSource($0).map { matches($0, target) } ?? false
+            }) else {
                 return false
             }
             packages.append(target)
@@ -144,7 +147,7 @@ enum PhilosophyPackage {
             let target = installedURL.path
             let before = packages.count
             packages.removeAll { entry in
-                (entry as? String).map { matches($0, target) } ?? false
+                packageSource(entry).map { matches($0, target) } ?? false
             }
             return packages.count != before
         }
@@ -194,6 +197,11 @@ enum PhilosophyPackage {
               let dict = object as? [String: Any]
         else {
             return .unreadable("不是合法的 JSON 对象")
+        }
+        // A present `packages` value belongs to pi/user configuration. If it is
+        // not an array, never reinterpret it as [] and overwrite it.
+        if let packages = dict["packages"], !(packages is [Any]) {
+            return .unreadable("packages 不是数组")
         }
         return .ok(dict)
     }

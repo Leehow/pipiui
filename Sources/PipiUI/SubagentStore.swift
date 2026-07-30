@@ -343,6 +343,22 @@ private enum MergeGitOutcome: Sendable {
     case cleanupFailed(String)
 }
 
+private struct WorktreeReconcileCandidate: Sendable {
+    let agentId: String
+    let branch: String
+    let persistedWorktreePath: String?
+}
+
+private enum WorktreeReconcileResolution: Sendable {
+    case merged
+    case discarded
+}
+
+private struct WorktreeReconcileResult: Sendable {
+    let candidate: WorktreeReconcileCandidate
+    let resolution: WorktreeReconcileResolution
+}
+
 /// Compact strings for the subagent detail metrics line.
 enum SubagentMetricsLine {
     struct Parts: Equatable {
@@ -672,6 +688,9 @@ final class SubagentStore: ObservableObject {
     private var saveScheduled = false
     /// Serial queue for JSON encode + atomic write (TokenLedger.append 模式：主线程只拷快照)。
     private let persistQueue = DispatchQueue(label: "pipiui.subagentstore.persist")
+    /// Panel appearance and main-turn settle can fire close together; Git reconciliation is capped per store.
+    private static let worktreeReconcileThrottle: TimeInterval = 10
+    private var lastWorktreeReconcileAt: Date?
 
     /// Bind the session's main project URL so successful agents can auto-merge.
     func bindMainProject(_ url: URL) {
@@ -992,6 +1011,108 @@ final class SubagentStore: ObservableObject {
             selectedId = agents.first?.id
         }
         scheduleSave()
+    }
+
+    /// Reconcile terminal agent rows with Git after the worktree was handled outside this panel.
+    /// This is observation-only: it never removes a worktree, branch, or file. Synchronous Git
+    /// probes run on the serialized main-repo background queue; only state updates run on main.
+    @MainActor
+    func reconcileWorktreeLifecycles(mainProjectURL: URL? = nil) async {
+        guard let main = mainProjectURL ?? self.mainProjectURL else { return }
+
+        let candidates = agents.compactMap { agent -> WorktreeReconcileCandidate? in
+            guard agent.state != .running else { return nil }
+            guard agent.worktreeLifecycle == .active
+                    || agent.worktreeLifecycle == .pendingReview else { return nil }
+            guard let branch = agent.worktreeBranch?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !branch.isEmpty else { return nil }
+            let path = agent.worktreePath?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return WorktreeReconcileCandidate(
+                agentId: agent.id,
+                branch: branch,
+                persistedWorktreePath: path.flatMap { $0.isEmpty ? nil : $0 }
+            )
+        }
+        guard !candidates.isEmpty else { return }
+
+        let now = Date()
+        if let lastWorktreeReconcileAt,
+           now.timeIntervalSince(lastWorktreeReconcileAt) < Self.worktreeReconcileThrottle {
+            return
+        }
+        lastWorktreeReconcileAt = now
+
+        let results: [WorktreeReconcileResult] = await MainRepoSerialQueue.run {
+            candidates.compactMap { candidate -> WorktreeReconcileResult? in
+                // A persisted path still on disk is not externally closed out, even if Git's
+                // registration is momentarily unavailable or stale.
+                if let path = candidate.persistedWorktreePath,
+                   FileManager.default.fileExists(atPath: path) {
+                    return nil
+                }
+
+                let state = GitRepo.reconcileAgentBranch(
+                    candidate.branch,
+                    persistedWorktreePath: candidate.persistedWorktreePath,
+                    integrationRef: "HEAD",
+                    in: main
+                )
+                guard state.registeredWorktreePath == nil else { return nil }
+
+                switch state.disposition {
+                case .eligible:
+                    guard state.branchExists,
+                          state.isAncestorOfIntegrationHead == true else { return nil }
+                    return WorktreeReconcileResult(candidate: candidate, resolution: .merged)
+                case .alreadyAbsent:
+                    guard !state.branchExists else { return nil }
+                    return WorktreeReconcileResult(candidate: candidate, resolution: .discarded)
+                case .retainedNonInternal, .retainedRegisteredWorktree,
+                     .retainedUniqueCommits, .blocked:
+                    return nil
+                }
+            }
+        }
+
+        var didChange = false
+        for result in results {
+            guard let index = agents.firstIndex(where: {
+                $0.id == result.candidate.agentId
+            }) else { continue }
+            let trimmedCurrentPath = agents[index].worktreePath?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let currentPath = trimmedCurrentPath.flatMap { $0.isEmpty ? nil : $0 }
+            guard agents[index].state != .running,
+                  agents[index].worktreeLifecycle == .active
+                    || agents[index].worktreeLifecycle == .pendingReview,
+                  agents[index].worktreeBranch?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) == result.candidate.branch,
+                  currentPath == result.candidate.persistedWorktreePath else {
+                continue
+            }
+
+            switch result.resolution {
+            case .merged:
+                agents[index].worktreeLifecycle = .merged
+                agents[index].worktreeError = nil
+                agents[index].closeoutDisposition = .cleaned
+                agents[index].closeoutReason = "外部已集成（非本面板合并）；worktree 已清理"
+            case .discarded:
+                agents[index].worktreeLifecycle = .discarded
+                agents[index].worktreeError = nil
+                agents[index].closeoutDisposition = .cleaned
+                agents[index].closeoutReason = "外部已清理 worktree 与分支"
+            }
+            didChange = true
+        }
+
+        if didChange {
+            // This unkeyed panel error is necessarily stale once its pending row is closed out.
+            worktreeActionError = nil
+            scheduleSave()
+        }
     }
 
     // MARK: - Worktree merge / discard (main worktree only; no push)

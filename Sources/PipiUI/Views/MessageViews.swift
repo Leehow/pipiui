@@ -140,6 +140,11 @@ struct MessageRow: View, Equatable {
                     onFlash: onFlash
                 )
             }
+        } else if SubagentHeartbeatMessage.parse(userDisplayText) != nil {
+            VStack(alignment: .trailing, spacing: 8) {
+                userImageThumbnails
+                SubagentHeartbeatBubbleView(text: userDisplayText, onFlash: onFlash)
+            }
         } else if userDisplayText.hasPrefix("[worktree-merge-failed]") {
             VStack(alignment: .trailing, spacing: 8) {
                 userImageThumbnails
@@ -912,6 +917,220 @@ struct CollapsibleUserBubbleView: View {
     }
 }
 
+// MARK: - [subagent-heartbeat] user message (collapsed by default)
+
+/// Parsed shape of the periodic background-worker heartbeat injected via `pi.sendUserMessage`.
+struct SubagentHeartbeatMessage: Equatable {
+    struct WorkerSummary: Equatable {
+        enum Status: Equatable {
+            case running, vanished
+        }
+
+        let agentId: String
+        let title: String
+        let status: Status
+        let elapsed: String
+        let idleSeconds: Int?
+        let rawLine: String
+
+        var state: Status { status }
+    }
+
+    let headerLine: String
+    let outstanding: Int
+    let vanished: Int
+    let workers: [WorkerSummary]
+    let remainingText: String
+    let fullText: String
+
+    var workerSummaries: [WorkerSummary] { workers }
+
+    /// Returns nil for non-heartbeats or malformed headers/worker summary lines.
+    static func parse(_ text: String) -> SubagentHeartbeatMessage? {
+        guard text.hasPrefix("[subagent-heartbeat]") else { return nil }
+
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let headerLine = lines.first else { return nil }
+
+        let prefix = "[subagent-heartbeat]"
+        guard headerLine == prefix || headerLine.hasPrefix(prefix + " ") else { return nil }
+        let fieldsText = headerLine.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
+        var fields: [String: String] = [:]
+        for token in fieldsText.split(separator: " ", omittingEmptySubsequences: true) {
+            guard let equals = token.firstIndex(of: "=") else { return nil }
+            let key = String(token[..<equals])
+            let value = String(token[token.index(after: equals)...])
+            guard !key.isEmpty, !value.isEmpty else { return nil }
+            fields[key] = value
+        }
+        guard let outstandingText = fields["outstanding"],
+              let outstanding = Int(outstandingText), outstanding >= 0,
+              let vanishedText = fields["vanished"],
+              let vanished = Int(vanishedText), vanished >= 0 else {
+            return nil
+        }
+
+        var workers: [WorkerSummary] = []
+        var index = 1
+        while index < lines.count {
+            let line = lines[index]
+            guard line.hasPrefix("  "), !line.trimmingCharacters(in: .whitespaces).isEmpty else {
+                break
+            }
+            guard let worker = parseWorkerSummary(line) else { return nil }
+            workers.append(worker)
+            index += 1
+        }
+
+        let remainingText = index < lines.count ? lines[index...].joined(separator: "\n") : ""
+        return SubagentHeartbeatMessage(
+            headerLine: headerLine,
+            outstanding: outstanding,
+            vanished: vanished,
+            workers: workers,
+            remainingText: remainingText,
+            fullText: text
+        )
+    }
+
+    private static func parseWorkerSummary(_ rawLine: String) -> WorkerSummary? {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        guard let titleStart = line.range(of: " ("),
+              let detailStart = line.range(of: ") — ", options: .backwards),
+              titleStart.upperBound <= detailStart.lowerBound else {
+            return nil
+        }
+
+        let agentId = String(line[..<titleStart.lowerBound])
+        let title = String(line[titleStart.upperBound..<detailStart.lowerBound])
+        let detail = String(line[detailStart.upperBound...])
+        guard !agentId.isEmpty,
+              !agentId.contains(where: { $0.isWhitespace }),
+              !title.isEmpty else {
+            return nil
+        }
+
+        if detail.hasPrefix("running "),
+           let idleRange = detail.range(of: ", idle ", options: .backwards) {
+            let elapsed = String(detail[detail.index(detail.startIndex, offsetBy: "running ".count)..<idleRange.lowerBound])
+            let idleText = String(detail[idleRange.upperBound...])
+            guard !elapsed.isEmpty,
+                  idleText.hasSuffix("s"),
+                  let idleSeconds = Int(idleText.dropLast()),
+                  idleSeconds >= 0 else {
+                return nil
+            }
+            return WorkerSummary(
+                agentId: agentId,
+                title: title,
+                status: .running,
+                elapsed: elapsed,
+                idleSeconds: idleSeconds,
+                rawLine: rawLine
+            )
+        }
+
+        let vanishedPrefix = "process gone after "
+        let vanishedSuffix = ", no result reported"
+        guard detail.hasPrefix(vanishedPrefix), detail.hasSuffix(vanishedSuffix) else { return nil }
+        let elapsedStart = detail.index(detail.startIndex, offsetBy: vanishedPrefix.count)
+        let elapsedEnd = detail.index(detail.endIndex, offsetBy: -vanishedSuffix.count)
+        let elapsed = String(detail[elapsedStart..<elapsedEnd])
+        guard !elapsed.isEmpty else { return nil }
+        return WorkerSummary(
+            agentId: agentId,
+            title: title,
+            status: .vanished,
+            elapsed: elapsed,
+            idleSeconds: nil,
+            rawLine: rawLine
+        )
+    }
+}
+
+/// Compact heartbeat card. The operational guidance remains available only after expansion.
+struct SubagentHeartbeatBubbleView: View {
+    let text: String
+    var onFlash: ((String) -> Void)? = nil
+    @State private var expanded = false
+
+    private var parsed: SubagentHeartbeatMessage? { SubagentHeartbeatMessage.parse(text) }
+    private var hasVanishedWorkers: Bool { (parsed?.vanished ?? 0) > 0 }
+
+    private var summaryTitle: String {
+        guard let parsed else { return "心跳" }
+        var parts = ["心跳", "运行中 \(parsed.outstanding)"]
+        if parsed.vanished > 0 {
+            parts.append("失联 \(parsed.vanished)")
+        }
+        if let worker = parsed.workers.first {
+            parts.append("\(worker.agentId) \(worker.elapsed)")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var statusColor: Color {
+        hasVanishedWorkers ? .orange : .secondary
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "heart.fill")
+                    .foregroundStyle(statusColor)
+                    .imageScale(.medium)
+                Text(summaryTitle)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(statusColor)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { expanded.toggle() }
+            .pointingHandCursor()
+            .accessibilityAddTraits(.isButton)
+            .accessibilityValue(expanded ? "已展开" : "已折叠")
+
+            if expanded {
+                PathLinkedText(
+                    text: text,
+                    base: {
+                        var c = AttributeContainer()
+                        c.foregroundColor = Color.primary.opacity(0.85)
+                        return c
+                    }(),
+                    monospaced: true,
+                    onFlash: onFlash
+                )
+                .font(.caption.monospaced())
+                .padding(.top, 6)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 420, alignment: .trailing)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(hasVanishedWorkers ? Color.orange.opacity(0.08) : Color.primary.opacity(0.06))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(
+                            hasVanishedWorkers ? Color.orange.opacity(0.2) : Color.primary.opacity(0.08),
+                            lineWidth: 1
+                        )
+                )
+        )
+        .accessibilityLabel(summaryTitle)
+    }
+}
+
 // MARK: - [subagent-done] user message (collapsed by default)
 
 /// Parsed shape of a background worker completion message injected via `pi.sendUserMessage`.
@@ -1418,11 +1637,23 @@ private extension View {
 }
 
 /// Collapsed summary for consecutive finished thinking/toolCall rows between text/media.
+enum FileChangeDocumentTarget {
+    static func url(path: String, projectURL: URL?) -> URL? {
+        let expanded = (path as NSString).expandingTildeInPath
+        if (expanded as NSString).isAbsolutePath {
+            return URL(fileURLWithPath: expanded).standardizedFileURL
+        }
+        guard let projectURL else { return nil }
+        return projectURL.appendingPathComponent(expanded).standardizedFileURL
+    }
+}
+
 struct FinishedNonTextGroupView: View {
     let presentation: AssistantBlockLayout.FinishedGroupPresentation
     var toolRuns: [String: ToolRun] = [:]
     var projectURL: URL? = nil
     var onOpen: ((AssistantBlockLayout.FinishedGroupPresentation) -> Void)?
+    @Environment(\.openDocument) private var openDocument
 
     private var title: String {
         AssistantBlockLayout.summaryTitle(for: presentation.blocks)
@@ -1438,61 +1669,89 @@ struct FinishedNonTextGroupView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 7) {
-                Image(systemName: "rectangle.stack")
-                    .foregroundStyle(.secondary)
-                    .imageScale(.medium)
-                Text(title)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer(minLength: 0)
-                Image(systemName: "arrow.up.right.square")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+            Button {
+                onOpen?(presentation)
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "rectangle.stack")
+                        .foregroundStyle(.secondary)
+                        .imageScale(.medium)
+                    Text(title)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 0)
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .buttonStyle(.plain)
+            .accessibilityLabel(title)
+            .accessibilityValue("打开详情")
 
             if !fileChanges.files.isEmpty {
                 Divider()
-                HStack(spacing: 7) {
-                    Image(systemName: "doc.badge.gearshape")
-                        .foregroundStyle(.secondary)
-                    Text("已编辑 \(fileChanges.files.count) 个文件")
-                        .font(.caption.weight(.semibold))
-                    compactChangeCount(fileChanges.additions, color: .green, prefix: "+")
-                    compactChangeCount(fileChanges.deletions, color: .red, prefix: "−")
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                ForEach(fileChanges.files) { file in
-                    HStack(spacing: 8) {
-                        Text(file.displayPath)
-                            .font(.caption.monospaced())
+                Button {
+                    onOpen?(presentation)
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "doc.badge.gearshape")
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Spacer(minLength: 8)
-                        compactChangeCount(file.additions, color: .green, prefix: "+")
-                        compactChangeCount(file.deletions, color: .red, prefix: "−")
+                        Text("已编辑 \(fileChanges.files.count) 个文件")
+                            .font(.caption.weight(.semibold))
+                        compactChangeCount(fileChanges.additions, color: .green, prefix: "+")
+                        compactChangeCount(fileChanges.deletions, color: .red, prefix: "−")
+                        Spacer(minLength: 0)
                     }
+                    .contentShape(Rectangle())
                     .padding(.horizontal, 12)
                     .padding(.vertical, 7)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    "已编辑 \(fileChanges.files.count) 个文件，新增 \(fileChanges.additions) 行，删除 \(fileChanges.deletions) 行"
+                )
+                .accessibilityValue("打开详情")
+
+                ForEach(fileChanges.files) { file in
+                    Button {
+                        guard let documentURL = FileChangeDocumentTarget.url(
+                            path: file.path,
+                            projectURL: projectURL
+                        ) else { return }
+                        openDocument?(documentURL)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text(file.displayPath)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 8)
+                            compactChangeCount(file.additions, color: .green, prefix: "+")
+                            compactChangeCount(file.deletions, color: .red, prefix: "−")
+                        }
+                        .contentShape(Rectangle())
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(
+                        "\(file.displayPath)，新增 \(file.additions) 行，删除 \(file.deletions) 行"
+                    )
+                    .accessibilityValue("打开文档")
                     if file.id != fileChanges.files.last?.id {
                         Divider()
                     }
                 }
             }
         }
-        .contentShape(Rectangle())
-        .onTapGesture { onOpen?(presentation) }
         .pointingHandCursor()
-        .accessibilityAddTraits(.isButton)
-        .accessibilityLabel(title)
-        .accessibilityValue("打开详情")
         .background(
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color.primary.opacity(0.035))

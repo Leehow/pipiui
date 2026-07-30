@@ -168,6 +168,10 @@ final class SearchScopeExtensionTests: XCTestCase {
             contentsOf: root.appendingPathComponent("Sources/PipiUI/PiPlugin.swift"),
             encoding: .utf8
         )
+        let assembly = try String(
+            contentsOf: root.appendingPathComponent("Sources/PipiUI/PipiSpawnAssembly.swift"),
+            encoding: .utf8
+        )
         let subagent = try String(
             contentsOf: root.appendingPathComponent(
                 "Sources/PipiUI/PiExt/subagent/index.ts"
@@ -176,10 +180,15 @@ final class SearchScopeExtensionTests: XCTestCase {
         )
 
         XCTAssertTrue(plugin.contains("SearchScopeExtension.install(into: root)"))
-        XCTAssertTrue(chat.contains("PiPlugin.searchScopeExtensionPath"))
-        XCTAssertTrue(chat.contains("PIPIUI_SEARCH_SCOPE_EXT"))
-        XCTAssertTrue(chat.contains("PIPIUI_SEARCH_GRANT_FILE"))
+        // ChatSession must take the path as an explicit initializer argument and
+        // must NOT statically read `PiPlugin.searchScopeExtensionPath` anymore.
+        XCTAssertTrue(chat.contains("searchScopeExtension:"))
+        XCTAssertFalse(chat.contains("PiPlugin.searchScopeExtensionPath"))
         XCTAssertTrue(chat.contains("sendAppGeneratedPrompt(text)"))
+        // The -e / env wiring now lives in the pure assembly (gated by the
+        // built-in feature snapshot), not inline in ChatSession.
+        XCTAssertTrue(assembly.contains("PIPIUI_SEARCH_SCOPE_EXT"))
+        XCTAssertTrue(assembly.contains("PIPIUI_SEARCH_GRANT_FILE"))
         XCTAssertTrue(subagent.contains("process.env.PIPIUI_SEARCH_SCOPE_EXT"))
         XCTAssertTrue(
             subagent.contains(

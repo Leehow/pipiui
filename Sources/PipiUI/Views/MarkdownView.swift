@@ -293,18 +293,21 @@ enum MarkdownSelectionContent {
                 result.append(rendered(
                     MarkdownTextView.inlineWithPaths(paragraph),
                     font: typography.bodyNSFont,
+                    codeFont: typography.codeNSFont,
                     style: bodyStyle
                 ))
             case .heading(let level, let title):
                 result.append(rendered(
                     MarkdownTextView.inlineWithPaths(title),
                     font: typography.headingNSFont(level: level),
+                    codeFont: typography.codeNSFont,
                     style: headingStyle
                 ))
             case .code(let code), .mono(let code):
                 result.append(rendered(
                     AttributedString(code),
                     font: typography.codeNSFont,
+                    codeFont: typography.codeNSFont,
                     style: codeStyle,
                     background: NSColor.labelColor.withAlphaComponent(0.05)
                 ))
@@ -312,27 +315,29 @@ enum MarkdownSelectionContent {
                 result.append(rendered(
                     MarkdownTextView.listAttributed(items),
                     font: typography.bodyNSFont,
+                    codeFont: typography.codeNSFont,
                     style: listStyle
                 ))
             case .quote(let quote):
                 result.append(rendered(
                     MarkdownTextView.inlineWithPaths(quote),
                     font: typography.bodyNSFont,
+                    codeFont: typography.codeNSFont,
                     style: bodyStyle,
                     color: .secondaryLabelColor
                 ))
             case .table(let header, let rows):
                 result.append(rendered(
-                    AttributedString(([header] + rows)
-                        .map { $0.joined(separator: "\t") }
-                        .joined(separator: "\n")),
+                    tableAttributed(header: header, rows: rows),
                     font: typography.bodyNSFont,
+                    codeFont: typography.codeNSFont,
                     style: bodyStyle
                 ))
             case .rule:
                 result.append(rendered(
                     AttributedString("────────"),
                     font: typography.bodyNSFont,
+                    codeFont: typography.codeNSFont,
                     style: bodyStyle,
                     color: .separatorColor
                 ))
@@ -379,9 +384,24 @@ enum MarkdownSelectionContent {
         return result
     }
 
+    /// Tab/newline join of table cells, preserving per-cell inline markdown (bold/code/…).
+    private static func tableAttributed(header: [String], rows: [[String]]) -> AttributedString {
+        var result = AttributedString()
+        let allRows = [header] + rows
+        for (rowIndex, row) in allRows.enumerated() {
+            if rowIndex > 0 { result.append(AttributedString("\n")) }
+            for (cellIndex, cell) in row.enumerated() {
+                if cellIndex > 0 { result.append(AttributedString("\t")) }
+                result.append(MarkdownTextView.inlineWithPaths(cell))
+            }
+        }
+        return result
+    }
+
     private static func rendered(
         _ text: AttributedString,
         font: NSFont,
+        codeFont: NSFont,
         style: NSParagraphStyle,
         color: NSColor = .labelColor,
         background: NSColor? = nil
@@ -389,7 +409,25 @@ enum MarkdownSelectionContent {
         let result = NSMutableAttributedString(attributedString: NSAttributedString(text))
         let range = NSRange(location: 0, length: result.length)
         guard range.length > 0 else { return result }
-        result.addAttribute(.font, value: font, range: range)
+        // Per-run fonts: a single body font over the whole range wipes bold/italic/code that
+        // Foundation only carries as `inlinePresentationIntent` after markdown parse.
+        result.enumerateAttributes(in: range) { attrs, r, _ in
+            let resolved = fontByMergingMarkdownTraits(
+                base: font,
+                codeFont: codeFont,
+                attributes: attrs
+            )
+            result.addAttribute(.font, value: resolved, range: r)
+            let intent = inlinePresentationIntent(from: attrs)
+            if intent.contains(.strikethrough),
+               attrs[.strikethroughStyle] == nil {
+                result.addAttribute(
+                    .strikethroughStyle,
+                    value: NSUnderlineStyle.single.rawValue,
+                    range: r
+                )
+            }
+        }
         // 默认色只补无颜色的 run：inlineWithPaths 注入的路径 accent 色/下划线必须保留，
         // 否则用户看不到哪里可以 ⌘+点击。
         var uncolored: [NSRange] = []
@@ -404,6 +442,54 @@ enum MarkdownSelectionContent {
             result.addAttribute(.backgroundColor, value: background, range: range)
         }
         return result
+    }
+
+    /// Read `inlinePresentationIntent` whether bridged as the OptionSet or an NSNumber.
+    private static func inlinePresentationIntent(
+        from attributes: [NSAttributedString.Key: Any]
+    ) -> InlinePresentationIntent {
+        if let intent = attributes[.inlinePresentationIntent] as? InlinePresentationIntent {
+            return intent
+        }
+        if let number = attributes[.inlinePresentationIntent] as? NSNumber {
+            return InlinePresentationIntent(rawValue: number.uintValue)
+        }
+        return []
+    }
+
+    /// Map markdown inline intents onto a concrete NSFont so NSTextView paints bold/code.
+    private static func fontByMergingMarkdownTraits(
+        base: NSFont,
+        codeFont: NSFont,
+        attributes: [NSAttributedString.Key: Any]
+    ) -> NSFont {
+        let intent = inlinePresentationIntent(from: attributes)
+        var traits = (attributes[.font] as? NSFont)?.fontDescriptor.symbolicTraits ?? []
+        if intent.contains(.stronglyEmphasized) { traits.insert(.bold) }
+        if intent.contains(.emphasized) { traits.insert(.italic) }
+
+        if intent.contains(.code) {
+            let weight: NSFont.Weight = traits.contains(.bold) ? .semibold : .regular
+            let mono = NSFont.monospacedSystemFont(ofSize: codeFont.pointSize, weight: weight)
+            if traits.contains(.italic),
+               let italic = font(mono, matchingTraits: mono.fontDescriptor.symbolicTraits.union(.italic)) {
+                return italic
+            }
+            return mono
+        }
+
+        guard !traits.isEmpty else { return base }
+        let merged = base.fontDescriptor.symbolicTraits.union(traits)
+        return font(base, matchingTraits: merged) ?? base
+    }
+
+    private static func font(
+        _ base: NSFont,
+        matchingTraits traits: NSFontDescriptor.SymbolicTraits
+    ) -> NSFont? {
+        // AppKit's withSymbolicTraits is non-optional (UIKit's is Optional).
+        let descriptor = base.fontDescriptor.withSymbolicTraits(traits)
+        return NSFont(descriptor: descriptor, size: base.pointSize)
     }
 }
 

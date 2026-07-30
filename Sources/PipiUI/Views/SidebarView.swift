@@ -22,6 +22,9 @@ struct SidebarView: View {
     /// Settings sheet is presented from this sidebar (window-local): opening it in
     /// one window never opens settings in another window of the same app.
     @State private var showSettings = false
+    /// Remote connection details are also window-local and never alter project
+    /// or session selection.
+    @State private var showRemoteConnection = false
 
     /// Shared leading gutter — `.sidebar` List defaults are wider than needed.
     private static let sidebarGutter: CGFloat = 10
@@ -97,6 +100,29 @@ struct SidebarView: View {
                     ? "已急停"
                     : (store.computerUseEnabled ? "已开启" : "已关闭"))
 
+                Button {
+                    showRemoteConnection = true
+                } label: {
+                    Image(systemName: "qrcode")
+                        .font(.body)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(HoverButtonStyle(
+                    base: remoteConnectionButtonColor,
+                    hovered: remoteConnectionIndicator == .off ? .primary : remoteConnectionButtonColor
+                ))
+                .background {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(remoteConnectionButtonBackground)
+                }
+                .help(RemoteConnectionAccessibility.sidebarButtonLabel)
+                .accessibilityLabel(RemoteConnectionAccessibility.sidebarButtonLabel)
+                .accessibilityValue(
+                    store.remoteRelayConfiguration.enabled
+                        ? store.remoteRelayState.displayText
+                        : store.localRemoteStatus
+                )
+
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, Self.sidebarGutter + 2)
@@ -137,6 +163,8 @@ struct SidebarView: View {
             }
             .padding(20)
             .frame(width: 360)
+            // Click on the dimmed overlay discards unsaved input, same as Esc/取消.
+            .dismissOnOutsideClick { renameTarget = nil }
         }
         .sheet(item: $projectRenameTarget) { target in
             VStack(alignment: .leading, spacing: 16) {
@@ -158,11 +186,67 @@ struct SidebarView: View {
             }
             .padding(20)
             .frame(width: 360)
+            // Click on the dimmed overlay discards unsaved input, same as Esc/取消.
+            .dismissOnOutsideClick { projectRenameTarget = nil }
         }
         .sheet(isPresented: $showSettings) {
             SettingsSheet()
                 .environmentObject(store)
                 .accessibilityIdentifier("PipiUI.SettingsPanel")
+        }
+        .sheet(isPresented: $showRemoteConnection) {
+            RemoteConnectionSheet()
+                .environmentObject(store)
+                .dismissOnOutsideClick { showRemoteConnection = false }
+        }
+    }
+
+    private var remoteConnectionIndicator: LocalRemoteConnectionIndicator {
+        if store.remoteRelayState == .connected {
+            return .listening
+        }
+        if store.remoteRelayConfiguration.enabled {
+            switch store.remoteRelayState {
+            case .authenticationFailed, .invalidConfiguration, .protocolMismatch:
+                return .failed
+            case .disabled:
+                break
+            case .connecting, .retrying:
+                return .starting
+            case .connected:
+                return .listening
+            }
+        }
+        return .resolve(
+            enabled: store.localRemoteEnabled,
+            url: store.localRemoteURL,
+            status: store.localRemoteStatus
+        )
+    }
+
+    private var remoteConnectionButtonColor: Color {
+        switch remoteConnectionIndicator {
+        case .off:
+            return .secondary
+        case .starting:
+            return .accentColor
+        case .listening:
+            return .green
+        case .failed:
+            return .orange
+        }
+    }
+
+    private var remoteConnectionButtonBackground: Color {
+        switch remoteConnectionIndicator {
+        case .off:
+            return .clear
+        case .starting:
+            return Color.accentColor.opacity(0.10)
+        case .listening:
+            return Color.green.opacity(0.12)
+        case .failed:
+            return Color.orange.opacity(0.10)
         }
     }
 

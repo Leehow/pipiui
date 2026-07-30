@@ -1,16 +1,29 @@
 import SwiftUI
+import AppKit
 
 private enum SettingsTab: String, CaseIterable, Identifiable {
     case general = "通用"
+    case builtIn = "内置"
     case models = "模型"
     case usage = "用量"
-    case toolsSkills = "工具与 Skills"
-    case subagentModels = "Subagent 模型"
+    case toolsSkills = "工具"
+    case subagentModels = "Subagent"
     var id: String { rawValue }
+
+    /// Full name for VoiceOver / tooltip; the segmented picker shows the short
+    /// `rawValue` so six tabs fit the 640pt sheet without truncation.
+    var accessibilityName: String {
+        switch self {
+        case .toolsSkills: return "工具与 Skills"
+        case .subagentModels: return "Subagent 模型"
+        default: return rawValue
+        }
+    }
 
     var systemImage: String {
         switch self {
         case .general: return "slider.horizontal.3"
+        case .builtIn: return "shippingbox"
         case .models: return "cpu"
         case .usage: return "chart.bar.fill"
         case .toolsSkills: return "wrench.and.screwdriver"
@@ -31,6 +44,9 @@ struct SettingsSheet: View {
     @State private var subagentSettings: [String: SubagentModelSettings.Override] = SubagentModelSettings.allSettings()
     @State private var disabledTools: Set<String> = ToolSkillSettings.disabledTools()
     @State private var disabledSkills: Set<String> = ToolSkillSettings.disabledSkills()
+    /// Master on/off snapshot for the「内置」tab. Missing = enabled; mirrors
+    /// `BuiltInFeatureSettings` defaults so first launch shows everything on.
+    @State private var builtInDisabled: Set<String> = BuiltInFeatureSettings.disabledIDs()
     @State private var webSearchBackend: String = WebSearchSettings.backend()
     /// 输入缓冲：永不回显已存 key；留空 = 不修改。
     @State private var webSearchApiKey: String = ""
@@ -68,8 +84,8 @@ struct SettingsSheet: View {
                     // the icon is preserved for assistive tech via .help/a11y label.
                     Text(t.rawValue)
                         .tag(t)
-                        .help(t.rawValue)
-                        .accessibilityLabel(t.rawValue)
+                        .help(t.accessibilityName)
+                        .accessibilityLabel(t.accessibilityName)
                 }
             }
             .pickerStyle(.segmented)
@@ -101,6 +117,10 @@ struct SettingsSheet: View {
             }
         }
         .frame(width: 640, height: 620)
+        // Click on the dimmed parent / overlay area dismisses the sheet, in
+        // addition to「完成」 and Esc. Attached here so both presentation sites
+        // (SidebarView, ComputerConsentBar) get it for free.
+        .dismissOnOutsideClick { dismiss() }
         .task { await reload() }
         .onChange(of: tab) { _, newValue in
             if newValue == .usage { reloadUsage() }
@@ -115,6 +135,10 @@ struct SettingsSheet: View {
                 Task { await reload(restartSessions: true) }
             }
             .environmentObject(store)
+            // Key-window check in OverlayDismiss keeps this nested sheet safe:
+            // while Add Model is key, a click outside closes only it, never the
+            // parent SettingsSheet.
+            .dismissOnOutsideClick { showAddSheet = false }
         }
         .confirmationDialog(
             "删除凭据？",
@@ -145,6 +169,8 @@ struct SettingsSheet: View {
         switch tab {
         case .general:
             generalSection
+        case .builtIn:
+            builtInSection
         case .usage:
             usageSection
         case .toolsSkills:
@@ -185,8 +211,154 @@ struct SettingsSheet: View {
                 PhilosophySection(store: store)
             }
             Divider()
+            localRemoteSection
+            Divider()
             webSearchSection
         }
+    }
+
+    private var localRemoteSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("本地远程网页测试")
+                        .font(.title3.weight(.semibold))
+                    Text("默认关闭；仅在本机 127.0.0.1 的随机端口启动独立网页服务。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { store.localRemoteEnabled },
+                        set: { store.setLocalRemoteEnabled($0) }
+                    )
+                )
+                .labelsHidden()
+            }
+
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(store.localRemoteURL == nil ? Color.secondary : Color.green)
+                    .frame(width: 8, height: 8)
+                Text(store.localRemoteStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let url = store.localRemoteURL {
+                    Button("在浏览器打开") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            }
+            if let url = store.localRemoteURL {
+                Text(url.absoluteString)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Text("此阶段只支持项目/会话列表、文本 transcript、发送和 Stop；不含 LAN、账号、附件、Relay 或 E2EE。关闭开关会立即停止 listener 和现有连接。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Built-in features (master controls)
+
+    private var builtInSection: some View {
+        LazyVStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("内置")
+                    .font(.title3.weight(.semibold))
+                Text("PipiUI 自带的扩展 / agents / 提示层 / Computer Use。每项默认开启；关闭后重启会话生效。「通用」「工具」里仍可做细粒度配置，但这里是总开关。全部关闭后新建/重启的会话等价于裸 pi（仅保留模型凭据、RPC、历史与 UI）。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            ForEach(BuiltInFeatureSettings.Section.allCases, id: \.rawValue) { section in
+                builtInGroup(section)
+            }
+
+            if BuiltInFeatureSettings.EnabledSet(disabled: builtInDisabled).allDisabled {
+                Label("全部已关闭：新建/重启会话将不挂载任何 PipiUI 自有能力。", systemImage: "moon.zzz")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private func builtInGroup(_ section: BuiltInFeatureSettings.Section) -> some View {
+        let entries = BuiltInFeatureSettings.catalog.filter { $0.section == section }
+        return VStack(alignment: .leading, spacing: 8) {
+            Text(section.rawValue)
+                .font(.subheadline.weight(.semibold))
+            ForEach(entries) { entry in
+                Toggle(isOn: builtInBinding(entry)) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(entry.title)
+                            .font(.callout)
+                        Text(entry.summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.checkbox)
+                .padding(.vertical, 2)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+    }
+
+    private func builtInBinding(_ entry: BuiltInFeatureSettings.Entry) -> Binding<Bool> {
+        Binding(
+            get: { !builtInDisabled.contains(entry.id.rawValue) },
+            set: { enabled in setBuiltInFeature(enabled, id: entry.id) }
+        )
+    }
+
+    /// Master toggle for one built-in capability. Philosophy is special-cased so
+    /// the pi package registration / auto-register / config stay in sync.
+    private func setBuiltInFeature(_ enabled: Bool, id: BuiltInFeatureSettings.FeatureID) {
+        guard id != .philosophy else {
+            setBuiltInPhilosophy(enabled)
+            return
+        }
+        store.setBuiltInFeatureEnabled(enabled, id: id)
+        errorMessage = nil
+        statusMessage = enabled
+            ? "已启用内置能力「\(title(for: id))」（将重启会话）"
+            : "已关闭内置能力「\(title(for: id))」（将重启会话）"
+        builtInDisabled = BuiltInFeatureSettings.disabledIDs()
+    }
+
+    /// Philosophy is transactional because settings.json mutation can fail.
+    /// Register/unregister completes first; only success commits the master,
+    /// config, auto-register state and restarts sessions. Failure leaves the
+    /// checkbox and actual package state unchanged.
+    private func setBuiltInPhilosophy(_ enabled: Bool) {
+        statusMessage = nil
+        errorMessage = nil
+        do {
+            try BuiltInPhilosophyTransition.apply(enabled: enabled)
+            builtInDisabled = BuiltInFeatureSettings.disabledIDs()
+            statusMessage = enabled
+                ? "已启用工作哲学并装回 pi（将重启会话）"
+                : "已关闭工作哲学：已从 pi 移除并跳过 fallback 注入（将重启会话）"
+            store.philosophyRevision &+= 1
+            store.restartAllOpenSessions()
+        } catch {
+            // Refresh from persisted truth: the transaction committed nothing.
+            builtInDisabled = BuiltInFeatureSettings.disabledIDs()
+            statusMessage = "工作哲学未更改。"
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func title(for id: BuiltInFeatureSettings.FeatureID) -> String {
+        BuiltInFeatureSettings.catalog.first(where: { $0.id == id })?.title ?? id.rawValue
     }
 
     // MARK: - Models
@@ -1103,6 +1275,7 @@ struct SettingsSheet: View {
         var subagentSettings: [String: SubagentModelSettings.Override]
         var disabledTools: Set<String>
         var disabledSkills: Set<String>
+        var builtInDisabled: Set<String>
         var webSearchBackend: String
         var webSearchKeyConfigured: Bool
         var envConfiguredProviders: Set<String>
@@ -1126,6 +1299,7 @@ struct SettingsSheet: View {
             subagentSettings: SubagentModelSettings.allSettings(),
             disabledTools: ToolSkillSettings.disabledTools(),
             disabledSkills: ToolSkillSettings.disabledSkills(),
+            builtInDisabled: BuiltInFeatureSettings.disabledIDs(),
             webSearchBackend: backend,
             webSearchKeyConfigured: WebSearchSettings.isKeyConfigured(for: backend, store: envStore),
             envConfiguredProviders: envConfigured
@@ -1149,6 +1323,7 @@ struct SettingsSheet: View {
         subagentSettings = snapshot.subagentSettings
         disabledTools = snapshot.disabledTools
         disabledSkills = snapshot.disabledSkills
+        builtInDisabled = snapshot.builtInDisabled
         webSearchBackend = snapshot.webSearchBackend
         webSearchKeyConfigured = snapshot.webSearchKeyConfigured
         envConfiguredProviders = snapshot.envConfiguredProviders

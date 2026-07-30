@@ -26,6 +26,11 @@ struct SubagentPanel: View {
             }
         }
         .background(Color(nsColor: .textBackgroundColor))
+        .onAppear {
+            Task { @MainActor in
+                await store.reconcileWorktreeLifecycles(mainProjectURL: projectURL)
+            }
+        }
     }
 
     private var header: some View {
