@@ -37,13 +37,6 @@ enum PiPlugin {
             .appendingPathComponent("PipiUI")
     }
 
-    /// ChatSession is constructed from an Installed value in AppStore, but keeping this
-    /// path app-owned avoids widening that already-large initializer solely for one guard.
-    static var searchScopeExtensionPath: String? {
-        let path = root.appendingPathComponent("pipiui-search-scope.ts").path
-        return FileManager.default.fileExists(atPath: path) ? path : nil
-    }
-
     /// 启动指纹标记：上次完整安装时的插件指纹，未变更则整轮跳过（第二次启动基本零 I/O）。
     private static var markerURL: URL { root.appendingPathComponent(".install-marker") }
 
@@ -69,11 +62,25 @@ enum PiPlugin {
         return result
     }
 
+    /// Pure startup gate: both the built-in master and the legacy
+    /// auto-register preference must allow registration, and the installed
+    /// extension must exist. This prevents an old/missing auto-register key from
+    /// resurrecting philosophy after the new master switch is off.
+    static func shouldSyncPhilosophyRegistration(
+        defaults: UserDefaults = .standard,
+        extensionAvailable: Bool
+    ) -> Bool {
+        BuiltInFeatureSettings.isEnabled(.philosophy, defaults: defaults)
+            && PhilosophyPackage.autoRegisterEnabled(defaults: defaults)
+            && extensionAvailable
+    }
+
     /// Keep pi's package list in step with the user's choice. A deliberate "移除" is remembered,
-    /// so this never re-adds what the user removed.
+    /// and the built-in master is the hard upper bound.
     private static func syncPhilosophyRegistration() {
-        guard PhilosophyPackage.autoRegisterEnabled() else { return }
-        guard PhilosophyPackage.extensionPath != nil else { return }
+        guard shouldSyncPhilosophyRegistration(
+            extensionAvailable: PhilosophyPackage.extensionPath != nil
+        ) else { return }
         try? PhilosophyPackage.register()
     }
 

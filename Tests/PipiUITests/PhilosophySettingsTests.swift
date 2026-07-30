@@ -77,6 +77,24 @@ final class PhilosophySettingsTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: settingsURL, encoding: .utf8), "{ this is not json")
     }
 
+    func testNonArrayPackagesSchemaIsRejectedWithoutWriting() throws {
+        try writeSettings(
+            #"{"packages": {"source": "keep-this-object"}, "theme": "dark"}"#
+        )
+        let before = try Data(contentsOf: settingsURL)
+
+        guard case .unreadable(let detail) = PhilosophyPackage.registration(
+            settingsURL: settingsURL
+        ) else {
+            return XCTFail("expected non-array packages to be unreadable")
+        }
+        XCTAssertTrue(detail.contains("packages"))
+        XCTAssertThrowsError(try PhilosophyPackage.register(settingsURL: settingsURL))
+        XCTAssertEqual(try Data(contentsOf: settingsURL), before)
+        XCTAssertThrowsError(try PhilosophyPackage.unregister(settingsURL: settingsURL))
+        XCTAssertEqual(try Data(contentsOf: settingsURL), before)
+    }
+
     /// A `{ "source": ... }` entry is a legal package spelling; missing it would make the App
     /// append a duplicate on every launch.
     func testRegistrationRecognizesObjectFormEntries() throws {
@@ -87,7 +105,58 @@ final class PhilosophySettingsTests: XCTestCase {
         XCTAssertEqual(PhilosophyPackage.registration(settingsURL: settingsURL), .registered)
     }
 
+    func testObjectFormRegistrationIsIdempotentAndCanBeUnregistered() throws {
+        let escaped = PhilosophyPackage.installedURL.path
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        try writeSettings(
+            #"{"packages": ["npm:keep-me", {"source": "\#(escaped)", "version": "1"}]}"#
+        )
+
+        try PhilosophyPackage.register(settingsURL: settingsURL)
+        let registered = try XCTUnwrap(readSettings()["packages"] as? [Any])
+        XCTAssertEqual(registered.count, 2, "object form must not be duplicated")
+
+        try PhilosophyPackage.unregister(settingsURL: settingsURL)
+        let remaining = try XCTUnwrap(readSettings()["packages"] as? [Any])
+        XCTAssertEqual(remaining.count, 1)
+        XCTAssertEqual(remaining.first as? String, "npm:keep-me")
+        XCTAssertEqual(PhilosophyPackage.registration(settingsURL: settingsURL), .notRegistered)
+    }
+
     // MARK: - Config
+
+    func testGeneralSectionReloadUsesBuiltInFeatureAsUpperBound() {
+        let suite = "pipiui.test.philosophy-section.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        PhilosophySettings.setEnabled(true, configURL: configURL)
+        BuiltInFeatureSettings.setEnabled(
+            false,
+            id: .philosophy,
+            defaults: defaults
+        )
+
+        let locked = PhilosophySectionState.load(
+            defaults: defaults,
+            configURL: configURL
+        )
+        XCTAssertFalse(locked.allowsConfiguration)
+        XCTAssertFalse(locked.effectiveEnabled)
+        XCTAssertTrue(locked.configEnabled, "master off must dominate an old on config")
+
+        BuiltInFeatureSettings.setEnabled(
+            true,
+            id: .philosophy,
+            defaults: defaults
+        )
+        let refreshed = PhilosophySectionState.load(
+            defaults: defaults,
+            configURL: configURL
+        )
+        XCTAssertTrue(refreshed.allowsConfiguration)
+        XCTAssertTrue(refreshed.effectiveEnabled)
+    }
 
     func testLayerTogglesRoundTripAndUnknownKeysSurvive() throws {
         try #"{"version": 1, "scopes": {"worker": true}, "userDir": "~/mine"}"#

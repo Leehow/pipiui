@@ -49,9 +49,16 @@ final class ComputerUseWindowPresentation: NSObject {
     }
 
     private func presentMiniWindow() {
-        let window = mainWindow ?? NSApp.windows.first(where: { $0.isVisible })
-        guard let window else { return }
-        mainWindow = window
+        // Only the explicitly attached PipiUI main window may be reshaped
+        // into the mini progress chrome. A host process (notably the XCTest
+        // target) never attaches one, so a fallback to the first visible
+        // NSApp window would grab and orderFrontRegardless() an unrelated
+        // window — a stray test fixture or a leftover panel — and strand it
+        // on screen. In production the attachment representable realizes
+        // the main window during the first layout pass, well before any
+        // desktop operation can start, so requiring the attachment never
+        // silently drops the chrome.
+        guard let window = mainWindow else { return }
         if normalContentSize == nil {
             normalFrame = window.frame
             normalContentSize = window.contentRect(forFrameRect: window.frame).size

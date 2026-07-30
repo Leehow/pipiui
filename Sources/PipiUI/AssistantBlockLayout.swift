@@ -121,6 +121,12 @@ enum AssistantBlockLayout {
         for block in merged {
             if isGroupable(block, toolRuns: toolRuns) {
                 pending.append(block)
+                // A settled edit closes the current tool/thinking package. Include
+                // the edit itself, then let the following groupable block start a
+                // fresh segment with its own file-change summary and detail scope.
+                if case .toolCall(let call) = block, call.name == "edit" {
+                    flushPending()
+                }
             } else {
                 flushPending()
                 result.append(segment(for: block))

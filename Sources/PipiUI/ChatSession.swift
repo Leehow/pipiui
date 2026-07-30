@@ -647,10 +647,15 @@ final class ChatSession: ObservableObject, Identifiable {
     /// injected into every spawned pi process environment at session start.
     private static let dotEnvStore = EnvFileStore()
 
-    /// Merge `.env` pairs as the base layer under PipiUI-internal keys:
-    /// internal `PIPIUI_*` keys always win and can never be overridden by `.env`.
-    static func mergedSpawnEnv(dotEnv: [String: String], internal internalEnv: [String: String]) -> [String: String] {
-        var env = dotEnv
+    /// Merge `.env` pairs as the base layer under PipiUI-internal keys.
+    /// Built-in-managed names are first removed from `.env`, so a disabled
+    /// feature cannot be resurrected by stale PIPIUI_* entries; the current
+    /// assembly's internal values are then authoritative.
+    static func mergedSpawnEnv(
+        dotEnv: [String: String],
+        internal internalEnv: [String: String]
+    ) -> [String: String] {
+        var env = PipiSpawnEnvironmentPolicy.sanitized(dotEnv)
         env.merge(internalEnv) { _, new in new }
         return env
     }
@@ -678,8 +683,6 @@ final class ChatSession: ObservableObject, Identifiable {
     private var deferredInitialEvents: [J] = []
     private var cachedBranchMessages: [J] = []
     private var cachedLeafId: String?
-    /// Exact app-generated prompts that must neither create nor revoke a human path grant.
-    private var searchGrantSuppressedMessages: [String: Int] = [:]
     /// Offline preview state is replaced (not appended as optimistic live content) once
     /// authoritative get_messages completes.
     private var initialPreviewItemCount = 0
@@ -700,13 +703,22 @@ final class ChatSession: ObservableObject, Identifiable {
          subagentDir: String? = nil,
          agentsDir: String? = nil,
          philosophyExtension: String? = nil,
+         searchScopeExtension: String? = nil,
+         builtInFeatures: BuiltInFeatureSettings.EnabledSet = .init(),
          blockedReason: String? = nil,
          initialTranscript: InitialTranscriptBuild? = nil) {
         self.id = id
         self.projectURL = projectURL
         self.resumedFromDisk = sessionPath != nil
-        // A restarted/resumed session never inherits a stale external-search grant.
-        SearchScopeExtension.resetTurnGrant(sessionKey: id, projectRoot: projectURL)
+        // A restarted/resumed session never inherits a stale external-search
+        // grant — but only when the SearchScope capability is actually mounted.
+        // Bare-pi mode must not create/reset PipiUI grant files at all.
+        if PipiSpawnAssembly.shouldResetSearchGrant(
+            searchScopeExtension: searchScopeExtension,
+            features: builtInFeatures
+        ) {
+            SearchScopeExtension.resetTurnGrant(sessionKey: id, projectRoot: projectURL)
+        }
         // Worktree auto-merge target (successful subagents → merge into session project root).
         subagents.bindMainProject(projectURL)
         // Attribute per-turn usage events to this session in the token ledger.
@@ -767,84 +779,49 @@ final class ChatSession: ObservableObject, Identifiable {
             return
         }
 
+        // Computer Use also depends on the built-in capability switch: even if the
+        // standalone authorization (`ComputerUseSettings.isEnabled()`) is on, the
+        // harness is never mounted when the master feature is off.
         let computerCaptureDescriptor: ComputerCaptureDescriptor? =
-            ComputerUseSettings.isEnabled()
+            (ComputerUseSettings.isEnabled() && builtInFeatures.isEnabled(.computerUse))
                 ? try? ComputerUseSettings.captureDescriptor()
                 : nil
-        var args: [String] = []
-        if let sessionPath { args += ["--session", sessionPath] }
-        // Philosophy normally arrives through pi's own package list, so every frontend and every
-        // dispatched worker gets it. This `-e` is only the fallback for when that registration
-        // is missing; it is deliberately NOT `--append-system-prompt`, which would suppress
-        // pi's discovery of the user's own ~/.pi/agent/APPEND_SYSTEM.md entirely.
-        if let philosophyExtension { args += ["-e", philosophyExtension] }
-        // 对话内 generate_image / git / reload：不依赖 bridge
-        if let mediaExtension { args += ["-e", mediaExtension] }
-        if let gitExtension { args += ["-e", gitExtension] }
-        if let reloadExtension { args += ["-e", reloadExtension] }
-        if let webSearchExtension { args += ["-e", webSearchExtension] }
-        // Main session only: dispatched workers stay fully skill-free.
-        if let skillLoaderExtension { args += ["-e", skillLoaderExtension] }
-        if let searchScopeExtension = PiPlugin.searchScopeExtensionPath {
-            args += ["-e", searchScopeExtension]
-        }
-        if let codexServerToolsExtension { args += ["-e", codexServerToolsExtension] }
-        if let claudeServerToolsExtension { args += ["-e", claudeServerToolsExtension] }
-        // Independent opt-in: mount exactly one selected strategy. External selection
-        // suppresses the built-in strategy, so Pi never sees duplicate desktop tools.
-        if computerCaptureDescriptor != nil, let computerUseExtension {
-            args += ["-e", computerUseExtension]
-        }
-        // Settings → 工具开关：禁用项走 pi --exclude-tools（会话重启后生效）
-        args += ToolSkillSettings.excludeToolsCLIArgs()
-        var extraEnv: [String: String] = [:]
-        extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"] = WebSearchSettings.configFileURL().path
-        extraEnv["PIPIUI_SEARCH_GRANT_FILE"] =
-            SearchScopeExtension.grantFileURL(sessionKey: id).path
-        if let searchScopeExtension = PiPlugin.searchScopeExtensionPath {
-            // Nested subagent Pi processes inherit this and pass the same guard via -e.
-            extraEnv["PIPIUI_SEARCH_SCOPE_EXT"] = searchScopeExtension
-        }
-        // App 自有插件通过 -e 加载：webview 工具 + 补丁版 subagent（覆盖自动发现的官方版）
-        if bridgePort > 0 {
-            if let webviewExtension { args += ["-e", webviewExtension] }
-            if let subagentDir {
-                args += ["-e", subagentDir]
-                // Nested subagent pi processes re-read this to pass `-e` again (#3).
-                extraEnv["PIPIUI_SUBAGENT_EXT"] = subagentDir
-            }
-            extraEnv["PIPIUI_BRIDGE_PORT"] = String(bridgePort)
-            extraEnv["PIPIUI_SESSION_KEY"] = bridgeRoutingKey
-            if let descriptor = computerCaptureDescriptor,
-               computerUseExtension != nil {
-                extraEnv["PIPIUI_COMPUTER_EXT"] = computerUseExtension
-                extraEnv["PIPIUI_COMPUTER_CAPABILITY"] = computerRoutingKey
-                extraEnv["PIPIUI_COMPUTER_RUNTIME_PROTOCOL"] =
-                    String(ComputerRuntimeContract.version)
-                // The built-in Anthropic provider hook needs synchronous typed-tool
-                // dimensions. Runtime v1 negotiation remains authoritative.
-                extraEnv["PIPIUI_COMPUTER_DISPLAY_ID"] =
-                    String(descriptor.displayID)
-                extraEnv["PIPIUI_COMPUTER_WIDTH"] =
-                    String(descriptor.outputSize.width)
-                extraEnv["PIPIUI_COMPUTER_HEIGHT"] =
-                    String(descriptor.outputSize.height)
-            }
-            // Authoritative session root inherited by nested processes. Management
-            // roles such as secretary must never mistake a worker worktree for main.
-            extraEnv["PIPIUI_MAIN_CWD"] = projectURL.path
-            // 补丁版 subagent 从 App 自有目录读 agent 定义，不碰 ~/.pi/agent/agents
-            if let agentsDir { extraEnv["PIPIUI_AGENTS_DIR"] = agentsDir }
-            // Subagent 模型设置（热读 JSON）+ 主会话模型（跟随主 Agent = 底栏/composer）
-            extraEnv["PIPIUI_SUBAGENT_MODELS_FILE"] =
-                SubagentModelSettings.overridesFileURL().path
-            extraEnv["PIPIUI_MAIN_MODEL_FILE"] =
-                SubagentModelSettings.mainModelFileURL().path
-            let mainId = model?.id ?? SubagentModelSettings.readMainModel()
-            if let mid = mainId, !mid.isEmpty {
-                extraEnv["PIPIUI_MAIN_MODEL"] = mid
-            }
-        }
+        // Spawn argument assembly is centralized in `PipiSpawnAssembly` so the
+        // "disabled feature ⇒ no -e / env" and "all off ⇒ bare pi" rules are
+        // unit-testable without launching a subprocess. Every PipiUI-owned `-e`
+        // and `PIPIUI_*` key is gated by the built-in feature snapshot there.
+        let assembly = PipiSpawnAssembly.assemble(
+            PipiSpawnAssembly.Input(
+                sessionPath: sessionPath,
+                bridgePort: bridgePort,
+                bridgeRoutingKey: bridgeRoutingKey,
+                computerRoutingKey: computerRoutingKey,
+                grantSessionKey: id,
+                mainCWD: projectURL.path,
+                paths: PipiSpawnAssembly.Paths(
+                    philosophy: philosophyExtension,
+                    media: mediaExtension,
+                    git: gitExtension,
+                    reload: reloadExtension,
+                    webSearch: webSearchExtension,
+                    skillLoader: skillLoaderExtension,
+                    searchScope: searchScopeExtension,
+                    codexServerTools: codexServerToolsExtension,
+                    claudeServerTools: claudeServerToolsExtension,
+                    computerUse: computerUseExtension,
+                    webview: webviewExtension,
+                    subagentDir: subagentDir,
+                    agentsDir: agentsDir
+                ),
+                features: builtInFeatures,
+                computerDescriptor: computerCaptureDescriptor,
+                mainModelId: model?.id ?? SubagentModelSettings.readMainModel(),
+                excludeToolsArgs: ToolSkillSettings.excludeToolsCLIArgs(),
+                webSearchConfigFile: WebSearchSettings.configFileURL().path
+            )
+        )
+        let args = assembly.args
+        let extraEnv = assembly.extraEnv
         // T17: ~/.pi/agent/.env 注入（GUI app 从 Finder 启动没有 shell 环境）。
         // .env 在底层，PIPIUI_* 内部键绝不被 .env 覆盖；不得在日志打印这些键值。
         let spawnEnv = Self.mergedSpawnEnv(dotEnv: Self.dotEnvStore.all(), internal: extraEnv)
@@ -2476,6 +2453,18 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     func sendPrompt(_ text: String, images: [DraftImage] = []) {
+        sendPrompt(
+            text,
+            images: images,
+            searchGrantPolicy: .localHumanRecordPromptPaths
+        )
+    }
+
+    private func sendPrompt(
+        _ text: String,
+        images: [DraftImage],
+        searchGrantPolicy: PromptSearchGrantPolicy
+    ) {
         let expanded = expandedDraftText(from: text)
         // Bodies are now in `expanded`; drop map so markers cannot be re-expanded later.
         clearDraftPastes()
@@ -2509,19 +2498,69 @@ final class ChatSession: ObservableObject, Identifiable {
 
         // Busy while streaming OR in the gap after drain popped until agent_start.
         if isStreaming || isSendingFromQueue {
-            let ok = queue.enqueue(text: prepared.message, images: prepared.images)
+            let ok = queue.enqueue(
+                text: prepared.message,
+                images: prepared.images,
+                searchGrantPolicy: searchGrantPolicy
+            )
             if ok { publishQueue() }
             return
         }
-        sendPromptNow(message: prepared.message, images: prepared.images)
+        sendPromptNow(
+            message: prepared.message,
+            images: prepared.images,
+            searchGrantPolicy: searchGrantPolicy
+        )
+    }
+
+    enum RemotePromptSubmissionResult: Equatable {
+        case accepted
+        case empty
+        case rejectedBuiltin(String)
+        case unavailable
+    }
+
+    /// Explicit remote-text seam. It shares the normal local queue, optimistic
+    /// transcript and Pi abort behavior, while refusing every PipiUI-local
+    /// builtin and never treating remote text as local filesystem authorization.
+    func submitRemotePrompt(_ text: String) -> RemotePromptSubmissionResult {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .empty }
+        if let builtinName = RemotePromptPolicy.rejectedBuiltinName(in: trimmed) {
+            return .rejectedBuiltin(builtinName)
+        }
+        guard processAlive, proc != nil else { return .unavailable }
+
+        let prepared = prepareMessage(text: trimmed, images: [])
+        if isStreaming || isSendingFromQueue {
+            guard queue.enqueue(
+                text: prepared.message,
+                images: [],
+                searchGrantPolicy: .remoteClearGrant
+            ) else {
+                return .empty
+            }
+            publishQueue()
+        } else {
+            guard sendPromptNow(
+                message: prepared.message,
+                images: [],
+                searchGrantPolicy: .remoteClearGrant
+            ) else {
+                return .unavailable
+            }
+        }
+        return .accepted
     }
 
     /// App-authored user-role messages are useful orchestration input, but are not
     /// human authorization. Preserve the latest human grant without widening it.
     private func sendAppGeneratedPrompt(_ text: String) {
-        let key = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        searchGrantSuppressedMessages[key, default: 0] += 1
-        sendPrompt(text)
+        sendPrompt(
+            text,
+            images: [],
+            searchGrantPolicy: .appAuthoredPreserveLatestHumanGrant
+        )
     }
 
     /// Run image/video generation via grok-relay / coding-relay REST (same APIs as Grok Build).
@@ -2642,22 +2681,31 @@ final class ChatSession: ObservableObject, Identifiable {
         return (message, images)
     }
 
-    private func sendPromptNow(message: String, images: [DraftImage], requeueOnFailure: QueuedMessage? = nil) {
-        let suppressionCount = searchGrantSuppressedMessages[message] ?? 0
-        if suppressionCount > 0 {
-            if suppressionCount == 1 {
-                searchGrantSuppressedMessages.removeValue(forKey: message)
-            } else {
-                searchGrantSuppressedMessages[message] = suppressionCount - 1
-            }
-        } else {
-            // Replace the grant before Pi sees this human-composer turn. A prompt without
-            // an explicit path writes an empty list, expiring any permission from last turn.
-            try? SearchScopeExtension.recordUserTurn(
-                message,
+    @discardableResult
+    private func sendPromptNow(
+        message: String,
+        images: [DraftImage],
+        requeueOnFailure: QueuedMessage? = nil,
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths
+    ) -> Bool {
+        do {
+            try SearchScopeExtension.applyPromptPolicy(
+                searchGrantPolicy,
+                prompt: message,
                 sessionKey: id,
                 projectRoot: projectURL
             )
+        } catch {
+            if searchGrantPolicy == .remoteClearGrant {
+                lastError = "远程消息未发送：无法清除上一轮本地路径授权"
+                if let requeueOnFailure {
+                    queue.requeueFront(requeueOnFailure)
+                    publishQueue()
+                }
+                return false
+            }
+            // Preserve the existing local-composer behavior if grant persistence
+            // is unavailable; the Pi extension itself still fails closed outside cwd.
         }
 
         // Provisional title + at most one side-channel LLM refine (first user message only).
@@ -2706,6 +2754,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 }
             }
         }
+        return true
     }
 
     /// Local user row before pi `message_end` (deduped on ingest).
@@ -2756,6 +2805,15 @@ final class ChatSession: ObservableObject, Identifiable {
         proc?.send(["type": "abort"])
     }
 
+    /// Remote Stop is narrower than the local method because the webpage keeps
+    /// a persistent button. An idle click must not leave `isStopping` stuck.
+    @discardableResult
+    func abortRemoteGeneration() -> Bool {
+        guard isStreaming || isSendingFromQueue else { return false }
+        abort()
+        return true
+    }
+
     /// 插队 / 阻截：中止当前 run（若在生成），settle 后发送队首；FIFO 剩余项不变。不恢复到 draft。
     /// Same path as Stop-with-queue when streaming; when idle, drains head immediately.
     func cutInQueueHead() {
@@ -2778,7 +2836,12 @@ final class ChatSession: ObservableObject, Identifiable {
             return
         }
         publishQueue()
-        sendPromptNow(message: msg.text, images: msg.images, requeueOnFailure: msg)
+        sendPromptNow(
+            message: msg.text,
+            images: msg.images,
+            requeueOnFailure: msg,
+            searchGrantPolicy: msg.searchGrantPolicy
+        )
     }
 
     func setModel(_ m: ModelInfo) {

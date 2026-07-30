@@ -1418,11 +1418,23 @@ private extension View {
 }
 
 /// Collapsed summary for consecutive finished thinking/toolCall rows between text/media.
+enum FileChangeDocumentTarget {
+    static func url(path: String, projectURL: URL?) -> URL? {
+        let expanded = (path as NSString).expandingTildeInPath
+        if (expanded as NSString).isAbsolutePath {
+            return URL(fileURLWithPath: expanded).standardizedFileURL
+        }
+        guard let projectURL else { return nil }
+        return projectURL.appendingPathComponent(expanded).standardizedFileURL
+    }
+}
+
 struct FinishedNonTextGroupView: View {
     let presentation: AssistantBlockLayout.FinishedGroupPresentation
     var toolRuns: [String: ToolRun] = [:]
     var projectURL: URL? = nil
     var onOpen: ((AssistantBlockLayout.FinishedGroupPresentation) -> Void)?
+    @Environment(\.openDocument) private var openDocument
 
     private var title: String {
         AssistantBlockLayout.summaryTitle(for: presentation.blocks)
@@ -1438,61 +1450,89 @@ struct FinishedNonTextGroupView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 7) {
-                Image(systemName: "rectangle.stack")
-                    .foregroundStyle(.secondary)
-                    .imageScale(.medium)
-                Text(title)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer(minLength: 0)
-                Image(systemName: "arrow.up.right.square")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+            Button {
+                onOpen?(presentation)
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "rectangle.stack")
+                        .foregroundStyle(.secondary)
+                        .imageScale(.medium)
+                    Text(title)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 0)
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .buttonStyle(.plain)
+            .accessibilityLabel(title)
+            .accessibilityValue("打开详情")
 
             if !fileChanges.files.isEmpty {
                 Divider()
-                HStack(spacing: 7) {
-                    Image(systemName: "doc.badge.gearshape")
-                        .foregroundStyle(.secondary)
-                    Text("已编辑 \(fileChanges.files.count) 个文件")
-                        .font(.caption.weight(.semibold))
-                    compactChangeCount(fileChanges.additions, color: .green, prefix: "+")
-                    compactChangeCount(fileChanges.deletions, color: .red, prefix: "−")
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                ForEach(fileChanges.files) { file in
-                    HStack(spacing: 8) {
-                        Text(file.displayPath)
-                            .font(.caption.monospaced())
+                Button {
+                    onOpen?(presentation)
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "doc.badge.gearshape")
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Spacer(minLength: 8)
-                        compactChangeCount(file.additions, color: .green, prefix: "+")
-                        compactChangeCount(file.deletions, color: .red, prefix: "−")
+                        Text("已编辑 \(fileChanges.files.count) 个文件")
+                            .font(.caption.weight(.semibold))
+                        compactChangeCount(fileChanges.additions, color: .green, prefix: "+")
+                        compactChangeCount(fileChanges.deletions, color: .red, prefix: "−")
+                        Spacer(minLength: 0)
                     }
+                    .contentShape(Rectangle())
                     .padding(.horizontal, 12)
                     .padding(.vertical, 7)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    "已编辑 \(fileChanges.files.count) 个文件，新增 \(fileChanges.additions) 行，删除 \(fileChanges.deletions) 行"
+                )
+                .accessibilityValue("打开详情")
+
+                ForEach(fileChanges.files) { file in
+                    Button {
+                        guard let documentURL = FileChangeDocumentTarget.url(
+                            path: file.path,
+                            projectURL: projectURL
+                        ) else { return }
+                        openDocument?(documentURL)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text(file.displayPath)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 8)
+                            compactChangeCount(file.additions, color: .green, prefix: "+")
+                            compactChangeCount(file.deletions, color: .red, prefix: "−")
+                        }
+                        .contentShape(Rectangle())
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(
+                        "\(file.displayPath)，新增 \(file.additions) 行，删除 \(file.deletions) 行"
+                    )
+                    .accessibilityValue("打开文档")
                     if file.id != fileChanges.files.last?.id {
                         Divider()
                     }
                 }
             }
         }
-        .contentShape(Rectangle())
-        .onTapGesture { onOpen?(presentation) }
         .pointingHandCursor()
-        .accessibilityAddTraits(.isButton)
-        .accessibilityLabel(title)
-        .accessibilityValue("打开详情")
         .background(
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color.primary.opacity(0.035))

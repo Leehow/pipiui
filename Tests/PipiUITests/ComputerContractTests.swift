@@ -251,6 +251,8 @@ final class ComputerContractTests: XCTestCase {
             .deletingLastPathComponent()
         let chat = try String(contentsOf:
             root.appendingPathComponent("Sources/PipiUI/ChatSession.swift"))
+        let assembly = try String(contentsOf:
+            root.appendingPathComponent("Sources/PipiUI/PipiSpawnAssembly.swift"))
         let coordinator = try String(contentsOf:
             root.appendingPathComponent(
                 "Sources/PipiUI/Computer/ComputerCoordinatorExecution.swift"
@@ -263,11 +265,11 @@ final class ComputerContractTests: XCTestCase {
         let audit = try String(contentsOf:
             root.appendingPathComponent("Sources/PipiUI/Computer/ComputerAudit.swift"))
 
-        XCTAssertTrue(chat.contains(
-            "if computerCaptureDescriptor != nil, let computerUseExtension"
+        XCTAssertTrue(assembly.contains(
+            "input.computerDescriptor != nil,"
         ))
-        XCTAssertTrue(chat.contains(
-            "args += ToolSkillSettings.excludeToolsCLIArgs()"
+        XCTAssertTrue(assembly.contains(
+            "args += input.excludeToolsArgs"
         ))
         XCTAssertTrue(subagent.contains("PIPIUI_COMPUTER_EXT"))
         XCTAssertTrue(subagent.contains("resolveSubagentToolSelection({"))
@@ -287,8 +289,8 @@ final class ComputerContractTests: XCTestCase {
             childEnvStart.lowerBound..<childSpawnStart.lowerBound
         ]
         XCTAssertTrue(childEnvBlock.contains("}, true);"))
-        XCTAssertTrue(chat.contains(
-            #"extraEnv["PIPIUI_COMPUTER_EXT"] = computerUseExtension"#
+        XCTAssertTrue(assembly.contains(
+            #"env["PIPIUI_COMPUTER_EXT"] = p"#
         ))
         XCTAssertTrue(coordinator.contains(
             "Every non-cancelled accepted batch returns one fresh in-memory screenshot"
