@@ -319,6 +319,19 @@ enum ComposerTextViewLayout {
 
 final class ComposerNSTextView: NSTextView {
     var onSubmit: () -> Void = {}
+    var onDidChangeText: (ComposerNSTextView) -> Void = { _ in }
+
+    override func didChangeText() {
+        super.didChangeText()
+
+        // AppKit suppresses NSTextDidChangeNotification while an input method owns
+        // marked text, so the delegate cannot update the binding or placeholder.
+        // Limit this hook to composition changes to avoid duplicating ordinary
+        // delegate notifications.
+        if hasMarkedText() {
+            onDidChangeText(self)
+        }
+    }
 
     override func doCommand(by commandSelector: Selector) {
         if commandSelector == #selector(insertNewlineIgnoringFieldEditor(_:)) {
@@ -549,6 +562,9 @@ struct ComposerTextView: NSViewRepresentable {
         let host = ComposerTextViewHost()
         context.coordinator.host = host
         host.textView.delegate = context.coordinator
+        host.textView.onDidChangeText = { [weak coordinator = context.coordinator] textView in
+            coordinator?.textViewDidChangeText(textView)
+        }
         host.onHeightChange = { [weak coordinator = context.coordinator] height in
             coordinator?.receiveHeight(height)
         }
@@ -568,6 +584,7 @@ struct ComposerTextView: NSViewRepresentable {
     static func dismantleNSView(_ host: ComposerTextViewHost, coordinator: Coordinator) {
         host.textView.delegate = nil
         host.textView.onSubmit = {}
+        host.textView.onDidChangeText = { _ in }
         host.onHeightChange = { _ in }
         host.onMoveToWindow = {}
         coordinator.dismantle()
@@ -667,10 +684,15 @@ struct ComposerTextView: NSViewRepresentable {
         }
 
         func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            textViewDidChangeText(textView)
+        }
+
+        func textViewDidChangeText(_ textView: NSTextView) {
             guard !isDismantled,
                   !applyingProgrammaticText,
-                  let textView = notification.object as? NSTextView,
-                  let host else { return }
+                  let host,
+                  host.textView === textView else { return }
 
             // Keep SwiftUI current even during composition. NSTextView.string includes
             // marked text, and writing it back prevents a high-frequency unrelated
