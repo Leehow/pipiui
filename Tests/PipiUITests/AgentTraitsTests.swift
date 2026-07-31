@@ -41,7 +41,9 @@ final class AgentTraitsTests: XCTestCase {
         XCTAssertTrue(s.contains(#"readOnly: flag(frontmatter["read-only"])"#))
         XCTAssertTrue(s.contains("delegates: flag(frontmatter.delegates)"))
         XCTAssertTrue(s.contains(#"blockSkillReads: flag(frontmatter["block-skill-reads"])"#))
-        XCTAssertTrue(s.contains(#"reportsInFull: frontmatter.deliverable?.trim().toLowerCase() === "report""#))
+        // Read through the same string coercion as every other field: pi parses frontmatter as
+        // real YAML, so a value that is not a string must not reach .trim().
+        XCTAssertTrue(s.contains(#"reportsInFull: str(frontmatter.deliverable)?.trim().toLowerCase() === "report""#))
         XCTAssertTrue(s.contains("traits: parseAgentTraits(frontmatter)"))
         // An absent or misspelled key must land on the plain-worker answer, which is what an
         // unlisted name already got before the traits existed.
