@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import PipiUI
 
 /// T6 transcript 布局记忆化：版本 key 驱动失效，输入版本未变不重算。
@@ -113,6 +114,26 @@ final class TranscriptPlannerTests: XCTestCase {
         XCTAssertGreaterThan(session.transcriptVersion, v1)
         session.transcript = []
         XCTAssertGreaterThan(session.transcriptVersion, v1)
+    }
+
+    func testStreamingStateForwardsWithoutPublishingChatSession() {
+        let session = ChatSession(
+            id: "streaming-isolation-test", projectURL: URL(fileURLWithPath: "/tmp"),
+            sessionPath: nil, blockedReason: "test-only"
+        )
+        var sessionChangeCount = 0
+        let observer = session.objectWillChange.sink { _ in sessionChangeCount += 1 }
+        defer { observer.cancel() }
+
+        let item = ChatItem(id: "streaming", role: "assistant", blocks: [.text("partial")])
+        session.streaming.streamingItem = item
+        session.streaming.toolRuns["tool-1"] = ToolRun(isRunning: true, output: "partial output")
+        session.streaming.toolOutputVersion &+= 1
+
+        XCTAssertEqual(session.streamingItem, item)
+        XCTAssertEqual(session.toolRuns["tool-1"]?.output, "partial output")
+        XCTAssertEqual(session.toolOutputVersion, 1)
+        XCTAssertEqual(sessionChangeCount, 0)
     }
 }
 
