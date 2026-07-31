@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-private enum SettingsTab: String, CaseIterable, Identifiable {
+enum SettingsTab: String, CaseIterable, Identifiable {
     case general = "通用"
     case builtIn = "内置"
     case models = "模型"
@@ -36,7 +36,7 @@ struct SettingsSheet: View {
     @EnvironmentObject var store: AppStore
     @Environment(\.dismiss) private var dismiss
 
-    @State private var tab: SettingsTab = .general
+    @State private var tab: SettingsTab
     @State private var models: [ModelInfo] = []
     @State private var credentials: [PiAuthStore.CredentialInfo] = []
     @State private var hiddenIds: Set<String> = ModelVisibility.hiddenModelIds()
@@ -72,6 +72,10 @@ struct SettingsSheet: View {
     @State private var usageExpanded: Set<String> = []
     @State private var usageLoading = false
     @State private var usageRequestID = 0
+
+    init(initialTab: SettingsTab = .general) {
+        _tab = State(initialValue: initialTab)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
