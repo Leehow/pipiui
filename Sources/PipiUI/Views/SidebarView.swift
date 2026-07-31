@@ -572,6 +572,7 @@ struct SidebarView: View {
                         } label: {
                             SessionRow(
                                 title: meta.name,
+                                modelRef: meta.modelRef,
                                 subtitle: "\(store.projectDisplayName(for: project)) · \(Self.relative(meta.modified))",
                                 status: .none
                             )
@@ -647,6 +648,7 @@ struct SidebarView: View {
                 let interrupted = store.interruptedSessionPaths.contains(meta.path)
                 SessionRow(
                     title: displayTitle(meta: meta, openKey: openKey),
+                    modelRef: meta.modelRef,
                     subtitle: interrupted ? "已中断" : idleSubtitle,
                     status: interrupted ? .interrupted : .none,
                     hideSubtitle: isHovered
@@ -897,10 +899,15 @@ private struct LiveSessionRow: View {
         // Prefer non-empty live name so disk meta still shows when sessionName unset.
         let title = session.sessionName.flatMap { $0.isEmpty ? nil : $0 } ?? fallbackTitle
         let subtitle = status.subtitleOverride ?? idleSubtitle
-        HStack(spacing: 8) {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
             // Keep status column width stable so titles don't shift
             statusIndicator(status)
                 .frame(width: 12, height: 12)
+                .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] }
+            if let model = session.model {
+                ProviderLogo(model: model, size: 13)
+                    .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] }
+            }
             TypewriterText(
                 text: title,
                 animationToken: session.titleAnimationToken,
@@ -976,16 +983,22 @@ private struct SubagentsRunningIndicator: View {
 
 private struct SessionRow: View {
     let title: String
+    var modelRef: String? = nil
     let subtitle: String
     var status: SessionRowStatus = .none
     /// Hide trailing caption while hover actions occupy that corner.
     var hideSubtitle: Bool = false
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
             // Keep status column width stable so titles don't shift
             statusIndicator
                 .frame(width: 12, height: 12)
+                .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] }
+            if let modelRef {
+                ProviderLogo(modelRef: modelRef, size: 13)
+                    .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] }
+            }
             Text(title)
                 .lineLimit(1)
             Spacer(minLength: 0)
