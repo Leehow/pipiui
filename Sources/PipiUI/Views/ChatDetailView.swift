@@ -28,7 +28,7 @@ struct TranscriptSessionRootIdentity: Hashable {
 
 struct ChatDetailView: View {
     @EnvironmentObject var store: AppStore
-    @ObservedObject var session: ChatSession
+    let session: ChatSession
 
     var body: some View {
         // Pass subagents each render so warm session switch (no .id teardown) rebinds observation.
@@ -46,8 +46,8 @@ struct ChatDetailView: View {
 private struct ChatDetailViewBody: View {
     @EnvironmentObject var store: AppStore
     @ObservedObject var session: ChatSession
-    /// Isolated publisher for live message/tool deltas; avoids publishing those through ChatSession.
-    @ObservedObject var streaming: StreamingState
+    /// Passed through without observation; `TranscriptScrollView` owns the high-frequency subscription.
+    let streaming: StreamingState
     /// 单独观察 subagent 树：它更新时主界面的 subagent 卡片要实时跟着动
     @ObservedObject var agentStore: SubagentStore
     @Environment(\.chatTypography) private var chatTypography
@@ -138,17 +138,12 @@ private struct ChatDetailViewBody: View {
             }
         }
         .sheet(item: $finishedGroupPresentation) { presentation in
-            let callIDs = AssistantBlockLayout.toolCallIds(in: presentation.blocks)
-            FinishedNonTextGroupDetailView(
+            FinishedNonTextGroupSheetContent(
                 presentation: presentation,
-                toolRuns: runs(forToolCallIds: callIDs),
-                subagents: subagents(forToolCallIds: callIDs),
-                projectURL: session.projectURL,
-                onFlash: { session.flash($0) },
-                onSelectAgent: { agentID in
-                    finishedGroupPresentation = nil
-                    selectAgent(agentID)
-                }
+                session: session,
+                streaming: streaming,
+                agentStore: agentStore,
+                onDismiss: { finishedGroupPresentation = nil }
             )
             .dismissOnOutsideClick { finishedGroupPresentation = nil }
         }
@@ -186,7 +181,7 @@ private struct ChatDetailViewBody: View {
     private var chatColumn: some View {
         VStack(spacing: 0) {
             ComputerConsentBar(sessionKey: session.bridgeRoutingKey)
-            transcript
+            transcriptContent
             if let conflicts = store.extensionConflicts[session.id], !conflicts.isEmpty {
                 conflictBanner(conflicts)
             }
@@ -335,205 +330,32 @@ private struct ChatDetailViewBody: View {
         rightPanelDragWidth = nil
     }
 
-    private var transcript: some View {
-        let items = session.transcript
-        let visibleCount = session.transcriptVisibleCount
-        let hidden = max(0, items.count - visibleCount)
-        // T6 布局记忆化：版本 key 未变时直接命中缓存，不再每次 body 求值全量重排。
-        let visibleRowsOldestFirst = session.transcriptPlanner
-            .rows(
-                items: items,
-                toolRuns: streaming.toolRuns,
-                visibleCount: visibleCount,
-                transcriptVersion: session.transcriptVersion,
-                toolOutputVersion: streaming.toolOutputVersion
-            )
-        let visibleRowsNewestFirst = visibleRowsOldestFirst.reversed()
-        let lastAssistantRunID = visibleRowsOldestFirst.reduce(into: String?.none) { result, row in
-            if case .assistantRun(let id, _, _) = row {
-                result = id
-            }
-        }
-        let userTurnGroups = AssistantBlockLayout.userTurnGroups(rows: visibleRowsOldestFirst)
-        // 只要某用户回合派发的任一 subagent 仍在运行，该回合就不可折叠（始终展示状态卡片）。
-        // agentStore 是 @ObservedObject：agent 状态变化会触发本 body 重算，guard 随之刷新。
-        let runningSubagentToolCallIds = Set(
-            agentStore.agents.lazy
-                .filter { $0.state == .running }
-                .compactMap { $0.toolCallId }
-        )
-        let runningGuardedGroupIDs = UserTurnCollapseGuard.runningGuardedGroupIDs(
-            rows: visibleRowsOldestFirst,
-            groups: userTurnGroups,
-            runningSubagentToolCallIds: runningSubagentToolCallIds
-        )
-        return ScrollViewReader { proxy in
-            // assistant run id → 其文档顺序上一条 user 消息 id（无则缺省，回退到自身 id）。
-            let jumpTargets = jumpTargetMap(rows: visibleRowsNewestFirst)
+    /// The scroll container remains a sibling of InputBar. Only its row subtree observes
+    /// StreamingState, so 20 Hz token/tool updates do not call ComposerTextView.updateNSView.
+    private var transcriptContent: some View {
+        ScrollViewReader { proxy in
             ScrollView {
-                // Newest-first stack. `.transcriptFlip()` on the ScrollView (below) puts
-                // document-start at the visual bottom — no `.defaultScrollAnchor(.bottom)`.
-                // Keep rows lazy: warm session switches should create and measure only the
-                // visible Markdown/AppKit views, not the whole transcript window.
-                LazyVStack(alignment: .leading, spacing: chatTypography.messageSpacing) {
-                    // Visual bottom / pin edge (document start after scroll-view flip).
-                    Color.clear
-                        .frame(height: 1)
-                        .id(transcriptID("bottom"))
-                        .background(
-                            StickToBottomTracker(
-                                isPinned: $session.pinTranscriptToBottom,
-                                pinEdge: .documentStart
-                            )
-                        )
-                        .transcriptFlip()
-
-                    if let streamingItem = streaming.streamingItem, hasVisibleContent(streamingItem) {
-                        MessageRow(
-                            item: streamingItem,
-                            toolRuns: runs(for: streamingItem),
-                            subagents: subagents(for: streamingItem),
-                            isStreaming: session.isStreaming,
-                            projectURL: session.projectURL,
-                            chatFontSize: chatTypography.fontSize,
-                            sessionKey: session.bridgeRoutingKey,
-                            presentationScopeID: transcriptID("streaming"),
-                            isWorking: session.isWorking,
-                            onFlash: { session.flash($0) },
-                            onSelectAgent: selectAgent,
-                            onOpenFinishedGroup: presentFinishedGroup,
-                            onCopy: {
-                                session.copySegmentsText(
-                                    AssistantBlockLayout.plan(
-                                        blocks: streamingItem.blocks,
-                                        groupFinished: !session.isStreaming
-                                    )
-                                )
-                            },
-                            onBranch: {
-                                guard let entryId = streamingItem.entryId else { return }
-                                session.branchFromAssistant(runLastEntryId: entryId)
-                            }
-                        )
-                        .id(transcriptID("streaming"))
-                        .transcriptFlip()
-                        if let startedAt = session.turnWallClockStartedAt {
-                            TurnElapsedText(startedAt: startedAt)
-                                .id(transcriptID("streaming-turn-elapsed"))
-                                .transcriptFlip()
-                        }
-                    } else if session.isWorking || session.mediaBusy {
-                        WaitingPlaceholderView(
-                            message: session.mediaBusy
-                                ? (session.mediaStatus ?? "正在处理…")
-                                : (session.isStopping ? "正在停止…" : "AI 正在思考…"),
-                            turnStartedAt: session.turnWallClockStartedAt
-                        )
-                        .id(transcriptID("waiting-placeholder"))
-                        .transcriptFlip()
-                    }
-
-                    ForEach(visibleRowsNewestFirst, id: \.id) { row in
-                        switch row {
-                        case .leaf(let item):
-                            let groupID = userTurnGroups.groupIDForRowID[item.id]
-                            let isInternalSignal = groupID != nil
-                                && !MessageActions.isUserAuthoredMessage(item)
-                            let isFoldedSignal = isInternalSignal
-                                && isUserTurnCollapsed(groupID, guarded: runningGuardedGroupIDs)
-                            if !isFoldedSignal {
-                                MessageRow(
-                                    item: item,
-                                    toolRuns: runs(for: item),
-                                    subagents: subagents(for: item),
-                                    projectURL: session.projectURL,
-                                    chatFontSize: chatTypography.fontSize,
-                                    sessionKey: session.bridgeRoutingKey,
-                                    presentationScopeID: transcriptID(item.id),
-                                    isWorking: session.isWorking,
-                                    isEditing: session.editingItemId == item.id,
-                                    onFlash: { session.flash($0) },
-                                    onSelectAgent: selectAgent,
-                                    onOpenFinishedGroup: presentFinishedGroup,
-                                    onCopy: { session.copyItemText(item) },
-                                    onResend: { session.resendUserMessage(itemId: item.id) },
-                                    onBeginEdit: { session.beginEditingUserMessage(itemId: item.id) },
-                                    onCancelEdit: { session.cancelEditingUserMessage() },
-                                    onCommitEdit: { session.commitEditingUserMessage(newText: $0) }
-                                )
-                                .equatable()
-                                .id(transcriptID(item.id))
-                                .transcriptFlip()
-                            }
-                        case .assistantRun(let id, let entryId, let segments):
-                            let groupID = userTurnGroups.groupIDForRowID[id]
-                            let isFolded = isUserTurnCollapsed(groupID, guarded: runningGuardedGroupIDs)
-                            let isGroupLastAssistant = groupID.flatMap {
-                                userTurnGroups.lastAssistantRunIDForGroupID[$0]
-                            } == id
-                            if !isFolded || isGroupLastAssistant {
-                                let callIds = AssistantBlockLayout.toolCallIds(in: segments)
-                                AssistantSegmentsView(
-                                    segments: segments,
-                                    toolRuns: runs(forToolCallIds: callIds),
-                                    subagents: subagents(forToolCallIds: callIds),
-                                    projectURL: session.projectURL,
-                                    onFlash: { session.flash($0) },
-                                    onSelectAgent: selectAgent,
-                                    sessionKey: session.bridgeRoutingKey,
-                                    presentationScopeID: transcriptID(id),
-                                    onOpenFinishedGroup: presentFinishedGroup,
-                                    entryId: entryId,
-                                    isWorking: session.isWorking,
-                                    completionText: id == lastAssistantRunID ? session.turnCompletionText : nil,
-                                    onCopy: { session.copySegmentsText(segments) },
-                                    onBranch: {
-                                        guard let entryId else { return }
-                                        session.branchFromAssistant(runLastEntryId: entryId)
-                                    },
-                                    onJump: {
-                                        let target = jumpTargets[id] ?? id
-                                        var t = Transaction()
-                                        t.disablesAnimations = true
-                                        withTransaction(t) {
-                                            proxy.scrollTo(transcriptID(target), anchor: jumpAnchor)
-                                        }
-                                    },
-                                    collapsedOverride: isFolded,
-                                    onCollapseToggle: {
-                                        guard let groupID else { return }
-                                        if collapsedUserTurnIDs.contains(groupID) {
-                                            collapsedUserTurnIDs.remove(groupID)
-                                        } else {
-                                            collapsedUserTurnIDs.insert(groupID)
-                                        }
-                                    }
-                                )
-                                .equatable()
-                                .id(transcriptID(id))
-                                .transcriptFlip()
-                            }
+                StreamingTranscriptRows(
+                    session: session,
+                    streaming: streaming,
+                    agentStore: agentStore,
+                    collapsedUserTurnIDs: $collapsedUserTurnIDs,
+                    onOpenFinishedGroup: presentFinishedGroup,
+                    onJump: { target in
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            proxy.scrollTo(target, anchor: jumpAnchor)
                         }
                     }
-
-                    if hidden > 0 {
-                        Button("显示更早的 \(hidden) 条消息") {
-                            session.transcriptVisibleCount += 200
-                        }
-                        .buttonStyle(.link)
-                        .frame(maxWidth: .infinity)
-                        .transcriptFlip()
-                    }
-                }
+                )
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             // Same-session identity rebinds may still update session.id without
             // replacing this ScrollView. Never animate that bookkeeping change.
             .animation(nil, value: session.id)
-            // Prefer overlay indicators; AppKit style is forced in StickToBottomTracker.
             .scrollIndicators(.automatic)
-            // Flip the scroll view itself so document-start maps to the visual bottom.
             .transcriptFlip()
             .overlay(alignment: .bottomTrailing) {
                 if !session.pinTranscriptToBottom {
@@ -555,16 +377,7 @@ private struct ChatDetailViewBody: View {
                 }
             }
             .overlay {
-                ZStack {
-                    // Covers the pane while pi boots and the initial transcript is built.
-                    if session.isInitializing && streaming.streamingItem == nil {
-                        SessionLoadingView()
-                            .transition(.opacity)
-                    }
-                }
-                // Keep the loading fade local. Applying this animation to the ScrollView also
-                // animates LazyVStack/AppKit measurement corrections during a session switch.
-                .animation(.easeInOut(duration: 0.2), value: session.isInitializing)
+                TranscriptLoadingOverlay(session: session, streaming: streaming)
             }
             .onChange(of: session.rightPanel != nil) { _, _ in
                 recoverPinAfterColumnWidthChange(proxy)
@@ -583,13 +396,7 @@ private struct ChatDetailViewBody: View {
             }
         }
         // Replace the entire transcript scroll hierarchy across ChatSession objects.
-        // A LazyVStack-only id leaves the enclosing flipped NSScrollView's old offset,
-        // prefetch cache, and nested ScrollView phase alive. Reusing those while switching
-        // from a tall expanded tool result to a short session can keep AttributeGraph in
-        // sizeThatFits / LazyLayout reconciliation indefinitely.
-        .id(TranscriptSessionRootIdentity(
-            sessionKey: session.bridgeRoutingKey
-        ))
+        .id(TranscriptSessionRootIdentity(sessionKey: session.bridgeRoutingKey))
     }
 
     /// Debounce chat-column width changes, then re-pin — but **never** while the window
@@ -681,71 +488,6 @@ private struct ChatDetailViewBody: View {
         )
     }
 
-    private func isUserTurnCollapsed(_ groupID: String?, guarded: Set<String>) -> Bool {
-        UserTurnCollapseGuard.isCollapsed(
-            groupID: groupID,
-            collapsedUserTurnIDs: collapsedUserTurnIDs,
-            guardedGroupIDs: guarded
-        )
-    }
-
-    /// assistant run id → 其文档顺序上一条 user 消息 id（无前驱 user 时缺省）。
-    /// `rows` 为 newest-first；反向遍历（oldest-first）维护「最近见过的 user leaf id」，
-    /// 遇 `.assistantRun` 记录映射，遇 user `.leaf` 更新维护值。
-    private func jumpTargetMap(rows: some BidirectionalCollection<AssistantBlockLayout.TranscriptRow>) -> [String: String] {
-        var map: [String: String] = [:]
-        var lastUserLeafId: String?
-        for row in rows.reversed() {
-            switch row {
-            case .leaf(let item):
-                if MessageActions.isUserAuthoredMessage(item) {
-                    lastUserLeafId = item.id
-                }
-            case .assistantRun(let id, _, _):
-                if let lastUserLeafId {
-                    map[id] = lastUserLeafId
-                }
-            }
-        }
-        return map
-    }
-
-    /// 只取该消息里工具调用对应的 run，让 MessageRow 的 Equatable 比较保持廉价
-    private func runs(for item: ChatItem) -> [String: ToolRun] {
-        var ids = Set<String>()
-        for block in item.blocks {
-            if case .toolCall(let call) = block { ids.insert(call.id) }
-        }
-        return runs(forToolCallIds: ids)
-    }
-
-    private func runs(forToolCallIds ids: Set<String>) -> [String: ToolRun] {
-        var result: [String: ToolRun] = [:]
-        for id in ids {
-            if let run = streaming.toolRuns[id] { result[id] = run }
-        }
-        return result
-    }
-
-    /// 该消息里 subagent 工具调用派出的 agent（含子孙），供卡片实时展示
-    private func subagents(for item: ChatItem) -> [SubagentInfo] {
-        let callIds = Set(item.blocks.compactMap { block -> String? in
-            if case .toolCall(let call) = block, call.name == "subagent" { return call.id }
-            return nil
-        })
-        return subagents(forToolCallIds: callIds)
-    }
-
-    private func subagents(forToolCallIds callIds: Set<String>) -> [SubagentInfo] {
-        // O(结果数) 索引查询（索引在 agents 变化时惰性重建）。
-        agentStore.agents(forToolCallIds: callIds)
-    }
-
-    private func selectAgent(_ id: String) {
-        session.subagents.selectedId = id
-        session.rightPanel = .agents
-    }
-
     /// User-clicked UI fallback for a potentially unavailable automatic status channel.
     /// This is deliberately a normal prompt, not a direct process probe from the UI.
     private func requestManualSubagentStatusCheck(_ agentIDs: [String]) {
@@ -758,19 +500,6 @@ private struct ChatDetailViewBody: View {
     ) {
         guard presentation.belongs(to: session.bridgeRoutingKey) else { return }
         finishedGroupPresentation = presentation
-    }
-
-    /// streamingItem 是否已有可展示内容（空 blocks / 空 text·thinking 不算）
-    private func hasVisibleContent(_ item: ChatItem) -> Bool {
-        for block in item.blocks {
-            switch block {
-            case .text(let t), .thinking(let t):
-                if !t.isEmpty { return true }
-            case .toolCall, .image, .video:
-                return true
-            }
-        }
-        return false
     }
 
     /// 撞名扩展会让 pi 一启动就 exit(1)，这里给出具体路径和一键修复，别让用户只看到崩溃日志
@@ -816,6 +545,323 @@ private struct ChatDetailViewBody: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(Color.orange.opacity(0.1))
+    }
+}
+
+/// Keeps finished-group tool/subagent cards live without widening the detail chrome's
+/// StreamingState subscription domain.
+private struct FinishedNonTextGroupSheetContent: View {
+    let presentation: AssistantBlockLayout.FinishedGroupPresentation
+    @ObservedObject var session: ChatSession
+    @ObservedObject var streaming: StreamingState
+    @ObservedObject var agentStore: SubagentStore
+    let onDismiss: () -> Void
+
+    var body: some View {
+        let callIDs = AssistantBlockLayout.toolCallIds(in: presentation.blocks)
+        FinishedNonTextGroupDetailView(
+            presentation: presentation,
+            toolRuns: runs(forToolCallIDs: callIDs),
+            subagents: agentStore.agents(forToolCallIds: callIDs),
+            projectURL: session.projectURL,
+            onFlash: { session.flash($0) },
+            onSelectAgent: { agentID in
+                onDismiss()
+                session.subagents.selectedId = agentID
+                session.rightPanel = .agents
+            }
+        )
+    }
+
+    private func runs(forToolCallIDs ids: Set<String>) -> [String: ToolRun] {
+        var result: [String: ToolRun] = [:]
+        for id in ids {
+            if let run = streaming.toolRuns[id] { result[id] = run }
+        }
+        return result
+    }
+}
+
+/// The only transcript subtree that subscribes to high-frequency stream/tool updates.
+/// Its parent scroll container and the sibling InputBar receive no StreamingState invalidations.
+private struct StreamingTranscriptRows: View {
+    @ObservedObject var session: ChatSession
+    @ObservedObject var streaming: StreamingState
+    @ObservedObject var agentStore: SubagentStore
+    @Binding var collapsedUserTurnIDs: Set<String>
+    let onOpenFinishedGroup: (AssistantBlockLayout.FinishedGroupPresentation) -> Void
+    let onJump: (String) -> Void
+    @Environment(\.chatTypography) private var chatTypography
+
+    var body: some View {
+        let items = session.transcript
+        let visibleCount = session.transcriptVisibleCount
+        let hidden = max(0, items.count - visibleCount)
+        // Keep the planner lookup inside the stream subscription domain because
+        // toolOutputVersion belongs to StreamingState.
+        let visibleRowsOldestFirst = session.transcriptPlanner.rows(
+            items: items,
+            toolRuns: streaming.toolRuns,
+            visibleCount: visibleCount,
+            transcriptVersion: session.transcriptVersion,
+            toolOutputVersion: streaming.toolOutputVersion
+        )
+        let visibleRowsNewestFirst = visibleRowsOldestFirst.reversed()
+        let lastAssistantRunID = visibleRowsOldestFirst.reduce(into: String?.none) { result, row in
+            if case .assistantRun(let id, _, _) = row {
+                result = id
+            }
+        }
+        let userTurnGroups = AssistantBlockLayout.userTurnGroups(rows: visibleRowsOldestFirst)
+        let runningSubagentToolCallIds = Set(
+            agentStore.agents.lazy
+                .filter { $0.state == .running }
+                .compactMap { $0.toolCallId }
+        )
+        let runningGuardedGroupIDs = UserTurnCollapseGuard.runningGuardedGroupIDs(
+            rows: visibleRowsOldestFirst,
+            groups: userTurnGroups,
+            runningSubagentToolCallIds: runningSubagentToolCallIds
+        )
+        let jumpTargets = jumpTargetMap(rows: visibleRowsNewestFirst)
+
+        LazyVStack(alignment: .leading, spacing: chatTypography.messageSpacing) {
+            Color.clear
+                .frame(height: 1)
+                .id(transcriptID("bottom"))
+                .background(
+                    StickToBottomTracker(
+                        isPinned: $session.pinTranscriptToBottom,
+                        pinEdge: .documentStart
+                    )
+                )
+                .transcriptFlip()
+
+            if let streamingItem = streaming.streamingItem, hasVisibleContent(streamingItem) {
+                MessageRow(
+                    item: streamingItem,
+                    toolRuns: runs(for: streamingItem),
+                    subagents: subagents(for: streamingItem),
+                    isStreaming: session.isStreaming,
+                    projectURL: session.projectURL,
+                    chatFontSize: chatTypography.fontSize,
+                    sessionKey: session.bridgeRoutingKey,
+                    presentationScopeID: transcriptID("streaming"),
+                    isWorking: session.isWorking,
+                    onFlash: { session.flash($0) },
+                    onSelectAgent: selectAgent,
+                    onOpenFinishedGroup: onOpenFinishedGroup,
+                    onCopy: {
+                        session.copySegmentsText(
+                            AssistantBlockLayout.plan(
+                                blocks: streamingItem.blocks,
+                                groupFinished: !session.isStreaming
+                            )
+                        )
+                    },
+                    onBranch: {
+                        guard let entryId = streamingItem.entryId else { return }
+                        session.branchFromAssistant(runLastEntryId: entryId)
+                    }
+                )
+                .equatable()
+                .id(transcriptID("streaming"))
+                .transcriptFlip()
+                if let startedAt = session.turnWallClockStartedAt {
+                    TurnElapsedText(startedAt: startedAt)
+                        .id(transcriptID("streaming-turn-elapsed"))
+                        .transcriptFlip()
+                }
+            } else if session.isWorking || session.mediaBusy {
+                WaitingPlaceholderView(
+                    message: session.mediaBusy
+                        ? (session.mediaStatus ?? "正在处理…")
+                        : (session.isStopping ? "正在停止…" : "AI 正在思考…"),
+                    turnStartedAt: session.turnWallClockStartedAt
+                )
+                .id(transcriptID("waiting-placeholder"))
+                .transcriptFlip()
+            }
+
+            ForEach(visibleRowsNewestFirst, id: \.id) { row in
+                switch row {
+                case .leaf(let item):
+                    let groupID = userTurnGroups.groupIDForRowID[item.id]
+                    let isInternalSignal = groupID != nil
+                        && !MessageActions.isUserAuthoredMessage(item)
+                    let isFoldedSignal = isInternalSignal
+                        && isUserTurnCollapsed(groupID, guarded: runningGuardedGroupIDs)
+                    if !isFoldedSignal {
+                        MessageRow(
+                            item: item,
+                            toolRuns: runs(for: item),
+                            subagents: subagents(for: item),
+                            projectURL: session.projectURL,
+                            chatFontSize: chatTypography.fontSize,
+                            sessionKey: session.bridgeRoutingKey,
+                            presentationScopeID: transcriptID(item.id),
+                            isWorking: session.isWorking,
+                            isEditing: session.editingItemId == item.id,
+                            onFlash: { session.flash($0) },
+                            onSelectAgent: selectAgent,
+                            onOpenFinishedGroup: onOpenFinishedGroup,
+                            onCopy: { session.copyItemText(item) },
+                            onResend: { session.resendUserMessage(itemId: item.id) },
+                            onBeginEdit: { session.beginEditingUserMessage(itemId: item.id) },
+                            onCancelEdit: { session.cancelEditingUserMessage() },
+                            onCommitEdit: { session.commitEditingUserMessage(newText: $0) }
+                        )
+                        .equatable()
+                        .id(transcriptID(item.id))
+                        .transcriptFlip()
+                    }
+                case .assistantRun(let id, let entryId, let segments):
+                    let groupID = userTurnGroups.groupIDForRowID[id]
+                    let isFolded = isUserTurnCollapsed(groupID, guarded: runningGuardedGroupIDs)
+                    let isGroupLastAssistant = groupID.flatMap {
+                        userTurnGroups.lastAssistantRunIDForGroupID[$0]
+                    } == id
+                    if !isFolded || isGroupLastAssistant {
+                        let callIds = AssistantBlockLayout.toolCallIds(in: segments)
+                        AssistantSegmentsView(
+                            segments: segments,
+                            toolRuns: runs(forToolCallIds: callIds),
+                            subagents: subagents(forToolCallIds: callIds),
+                            projectURL: session.projectURL,
+                            onFlash: { session.flash($0) },
+                            onSelectAgent: selectAgent,
+                            sessionKey: session.bridgeRoutingKey,
+                            presentationScopeID: transcriptID(id),
+                            onOpenFinishedGroup: onOpenFinishedGroup,
+                            entryId: entryId,
+                            isWorking: session.isWorking,
+                            completionText: id == lastAssistantRunID ? session.turnCompletionText : nil,
+                            onCopy: { session.copySegmentsText(segments) },
+                            onBranch: {
+                                guard let entryId else { return }
+                                session.branchFromAssistant(runLastEntryId: entryId)
+                            },
+                            onJump: {
+                                onJump(transcriptID(jumpTargets[id] ?? id))
+                            },
+                            collapsedOverride: isFolded,
+                            onCollapseToggle: {
+                                guard let groupID else { return }
+                                if collapsedUserTurnIDs.contains(groupID) {
+                                    collapsedUserTurnIDs.remove(groupID)
+                                } else {
+                                    collapsedUserTurnIDs.insert(groupID)
+                                }
+                            }
+                        )
+                        .equatable()
+                        .id(transcriptID(id))
+                        .transcriptFlip()
+                    }
+                }
+            }
+
+            if hidden > 0 {
+                Button("显示更早的 \(hidden) 条消息") {
+                    session.transcriptVisibleCount += 200
+                }
+                .buttonStyle(.link)
+                .frame(maxWidth: .infinity)
+                .transcriptFlip()
+            }
+        }
+    }
+
+    private func transcriptID(_ localID: String) -> String {
+        TranscriptRenderIdentity.scoped(sessionKey: session.bridgeRoutingKey, localID: localID)
+    }
+
+    private func isUserTurnCollapsed(_ groupID: String?, guarded: Set<String>) -> Bool {
+        UserTurnCollapseGuard.isCollapsed(
+            groupID: groupID,
+            collapsedUserTurnIDs: collapsedUserTurnIDs,
+            guardedGroupIDs: guarded
+        )
+    }
+
+    private func jumpTargetMap(
+        rows: some BidirectionalCollection<AssistantBlockLayout.TranscriptRow>
+    ) -> [String: String] {
+        var map: [String: String] = [:]
+        var lastUserLeafId: String?
+        for row in rows.reversed() {
+            switch row {
+            case .leaf(let item):
+                if MessageActions.isUserAuthoredMessage(item) {
+                    lastUserLeafId = item.id
+                }
+            case .assistantRun(let id, _, _):
+                if let lastUserLeafId { map[id] = lastUserLeafId }
+            }
+        }
+        return map
+    }
+
+    private func runs(for item: ChatItem) -> [String: ToolRun] {
+        let ids = Set(item.blocks.compactMap { block -> String? in
+            if case .toolCall(let call) = block { return call.id }
+            return nil
+        })
+        return runs(forToolCallIds: ids)
+    }
+
+    private func runs(forToolCallIds ids: Set<String>) -> [String: ToolRun] {
+        var result: [String: ToolRun] = [:]
+        for id in ids {
+            if let run = streaming.toolRuns[id] { result[id] = run }
+        }
+        return result
+    }
+
+    private func subagents(for item: ChatItem) -> [SubagentInfo] {
+        let callIds = Set(item.blocks.compactMap { block -> String? in
+            if case .toolCall(let call) = block, call.name == "subagent" { return call.id }
+            return nil
+        })
+        return subagents(forToolCallIds: callIds)
+    }
+
+    private func subagents(forToolCallIds callIds: Set<String>) -> [SubagentInfo] {
+        agentStore.agents(forToolCallIds: callIds)
+    }
+
+    private func selectAgent(_ id: String) {
+        session.subagents.selectedId = id
+        session.rightPanel = .agents
+    }
+
+    private func hasVisibleContent(_ item: ChatItem) -> Bool {
+        for block in item.blocks {
+            switch block {
+            case .text(let text), .thinking(let text):
+                if !text.isEmpty { return true }
+            case .toolCall, .image, .video:
+                return true
+            }
+        }
+        return false
+    }
+}
+
+/// StreamingState also controls whether the initial loading veil is visible, so keep
+/// that narrow observation local to the transcript rather than its InputBar sibling.
+private struct TranscriptLoadingOverlay: View {
+    @ObservedObject var session: ChatSession
+    @ObservedObject var streaming: StreamingState
+
+    var body: some View {
+        ZStack {
+            if session.isInitializing && streaming.streamingItem == nil {
+                SessionLoadingView()
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: session.isInitializing)
     }
 }
 

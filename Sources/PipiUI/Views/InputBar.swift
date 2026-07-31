@@ -600,6 +600,13 @@ struct ComposerTextView: NSViewRepresentable {
         /// IME owns marked text, a matching binding value is a stale render echo, not
         /// an external draft replacement.
         private var lastKnownText: String
+        /// State last handled by `synchronize`. A ChatSession draft write re-renders
+        /// InputBar, but should not force TextKit layout when AppKit already owns the
+        /// matching text/selection/geometry.
+        private var lastSynchronizedPlaceholder: String?
+        private var lastSynchronizedFocus: Bool?
+        private var lastSynchronizedViewportWidth: CGFloat?
+        private var lastSynchronizedSelection: NSRange?
         private var pendingHeight: CGFloat?
         private var pendingTextApplicationScheduled = false
         private var focusRequestScheduled = false
@@ -627,12 +634,40 @@ struct ComposerTextView: NSViewRepresentable {
         func synchronize(_ host: ComposerTextViewHost) {
             guard !isDismantled else { return }
             self.host = host
+
+            let sessionChanged = boundSessionIdentity != parent.sessionIdentity
+            let placeholderChanged = lastSynchronizedPlaceholder != parent.placeholder
+            let viewportWidth = host.scrollView.contentSize.width
+            let widthChanged = lastSynchronizedViewportWidth.map {
+                abs($0 - viewportWidth) > 0.5
+            } ?? true
+            let selectionChanged = lastSynchronizedSelection.map {
+                !NSEqualRanges($0, host.textView.selectedRange())
+            } ?? true
+            let textNeedsSynchronization = host.textView.string != parent.text
+            let focusNeedsSynchronization = needsFocusSynchronization(host)
+
+            // A keystroke first changes TextKit and then writes the binding. Its
+            // resulting ChatSession publish must not re-run ensureLayout/scrolling
+            // when text, width, placeholder, focus, and selection are unchanged.
+            guard sessionChanged
+                    || placeholderChanged
+                    || widthChanged
+                    || selectionChanged
+                    || textNeedsSynchronization
+                    || pendingExternalText != nil
+                    || focusNeedsSynchronization
+            else { return }
+
             host.textView.onSubmit = { [weak self] in
                 self?.parent.onSubmit()
             }
-            host.updatePlaceholder(parent.placeholder)
+            if placeholderChanged {
+                host.updatePlaceholder(parent.placeholder)
+            }
 
-            if boundSessionIdentity != parent.sessionIdentity {
+            var needsLayout = widthChanged || selectionChanged
+            if sessionChanged {
                 // The InputBar is warm-reused. Never let marked text from the old
                 // session commit into the newly rebound draft.
                 boundSessionIdentity = parent.sessionIdentity
@@ -642,7 +677,8 @@ struct ComposerTextView: NSViewRepresentable {
                 apply(parent.text, to: host.textView, moveCursorToEnd: true)
                 applyingProgrammaticText = false
                 lastKnownText = parent.text
-            } else if host.textView.string != parent.text {
+                needsLayout = true
+            } else if textNeedsSynchronization {
                 if host.textView.hasMarkedText() {
                     // NSTextView.string includes the IME-owned marked range. A render
                     // with the text we last synchronized is therefore a stale binding
@@ -660,11 +696,17 @@ struct ComposerTextView: NSViewRepresentable {
                     pendingExternalText = nil
                     apply(replacement, to: host.textView, moveCursorToEnd: false)
                     lastKnownText = replacement
+                    needsLayout = true
                 }
             }
 
-            host.refreshLayout(scrollSelection: true)
-            synchronizeFocus(host)
+            if needsLayout {
+                refreshLayout(host, scrollSelection: true)
+            }
+            if focusNeedsSynchronization || lastSynchronizedFocus != parent.isFocused {
+                synchronizeFocus(host)
+            }
+            recordSynchronizedState(for: host)
         }
 
         func textDidBeginEditing(_ notification: Notification) {
@@ -707,7 +749,7 @@ struct ComposerTextView: NSViewRepresentable {
                 schedulePendingTextApplication(on: host)
             }
 
-            host.refreshLayout(scrollSelection: true)
+            refreshLayout(host, scrollSelection: true)
         }
 
         func undoManager(for view: NSTextView) -> UndoManager? {
@@ -717,7 +759,31 @@ struct ComposerTextView: NSViewRepresentable {
         private func synchronizeAfterUndoOrRedo() {
             guard !isDismantled, !applyingProgrammaticText, let host else { return }
             synchronizeBinding(with: host.textView.string)
-            host.refreshLayout(scrollSelection: true)
+            refreshLayout(host, scrollSelection: true)
+        }
+
+        private func refreshLayout(
+            _ host: ComposerTextViewHost,
+            scrollSelection: Bool
+        ) {
+            host.refreshLayout(scrollSelection: scrollSelection)
+            recordSynchronizedState(for: host)
+        }
+
+        private func recordSynchronizedState(for host: ComposerTextViewHost) {
+            lastSynchronizedPlaceholder = parent.placeholder
+            lastSynchronizedFocus = parent.isFocused
+            lastSynchronizedViewportWidth = host.scrollView.contentSize.width
+            lastSynchronizedSelection = host.textView.selectedRange()
+        }
+
+        private func needsFocusSynchronization(_ host: ComposerTextViewHost) -> Bool {
+            if lastSynchronizedFocus != parent.isFocused { return true }
+            guard let window = host.window else { return false }
+            if parent.isFocused {
+                return window.firstResponder !== host.textView
+            }
+            return window.firstResponder === host.textView
         }
 
         private func synchronizeBinding(with text: String) {
@@ -759,7 +825,7 @@ struct ComposerTextView: NSViewRepresentable {
                     moveCursorToEnd: false
                 )
                 self.synchronizeBinding(with: pendingExternalText)
-                host.refreshLayout(scrollSelection: true)
+                self.refreshLayout(host, scrollSelection: true)
             }
         }
 
