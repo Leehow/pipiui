@@ -569,6 +569,23 @@ package enum GitRepo {
         _ = try run(gitArgs: ["merge", "--no-edit", name], in: workTree)
     }
 
+    /// Whether `branch` is already reachable from `integrationRef`.
+    /// Invalid refs and Git failures conservatively return false.
+    package static func isAncestor(
+        _ branch: String,
+        of integrationRef: String = "HEAD",
+        in workTree: URL
+    ) -> Bool {
+        guard let name = try? validatedRefName(branch, label: "分支名"),
+              let integration = try? validatedRefName(integrationRef, label: "integration ref") else {
+            return false
+        }
+        return (try? run(
+            gitArgs: ["merge-base", "--is-ancestor", name, integration],
+            in: workTree
+        )) != nil
+    }
+
     /// Remove a linked worktree at `path`. Run from the main worktree.
     /// Default `force: true` discards uncommitted changes in that worktree.
     package static func worktreeRemove(at path: URL, in mainWorkTree: URL, force: Bool = true) throws {
