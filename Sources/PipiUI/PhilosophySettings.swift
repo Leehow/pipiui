@@ -209,6 +209,7 @@ enum PhilosophySettings {
     }
 
     private static func writeConfig(_ config: [String: Any], to url: URL) {
+        guard SharedConfigWriteGuard.mayWrite(url, sharedDefault: configURL) else { return }
         var payload = config
         if payload["version"] == nil { payload["version"] = 1 }
         guard let data = try? JSONSerialization.data(

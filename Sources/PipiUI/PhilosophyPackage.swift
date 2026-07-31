@@ -166,6 +166,9 @@ enum PhilosophyPackage {
         case .ok(let existing):
             settings = existing
         }
+        // Registration edits the user's own pi settings, which every pi session on this
+        // machine reads. A test process must never reach that file.
+        guard SharedConfigWriteGuard.mayWrite(url, sharedDefault: settingsURL) else { return }
         var packages = settings["packages"] as? [Any] ?? []
         guard body(&packages) else { return }
         settings["packages"] = packages

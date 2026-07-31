@@ -24,4 +24,11 @@ enum SharedConfigWriteGuard {
     static func mayWriteSharedFile(explicitURL: URL?) -> Bool {
         explicitURL != nil || !isRunningTests
     }
+
+    /// For APIs whose target is always explicit but defaults to the shared file: a suite that
+    /// passes its own URL keeps exercising the real writer, while the default path — the user's
+    /// own pi settings or philosophy config — stays untouched under test.
+    static func mayWrite(_ target: URL, sharedDefault: URL) -> Bool {
+        !isRunningTests || target.standardizedFileURL != sharedDefault.standardizedFileURL
+    }
 }
