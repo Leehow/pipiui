@@ -276,6 +276,16 @@ async function searchDuckDuckGo(query: string, maxResults: number): Promise<Sear
   });
   if (!res.ok) throw new Error(`DuckDuckGo HTTP ${res.status}`);
   const html = await res.text();
+  // DuckDuckGo answers bot detection with 200/202 and a challenge page, not an error status.
+  // Parsing that yields zero links, which is indistinguishable from "nothing matched" — and a
+  // silent empty result is worse than a failure here: a caller cross-validating a design would
+  // read "no prior art" when the truth is "the search never ran".
+  if (!/class="result-link"/i.test(html) && /anomaly|challenge|captcha/i.test(html)) {
+    throw new Error(
+      "DuckDuckGo refused the query (bot challenge). Configure a real backend — set `backend` " +
+        "and its API key in websearch-config.json (tavily, brave, serpapi, exa or kimi).",
+    );
+  }
   const results: SearchResult[] = [];
   // Lite DDG: results are in <a class="result-link"> and snippet in <td class="result-snippet">
   const linkRe = /<a[^>]+class="result-link"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;

@@ -131,4 +131,23 @@ final class WebSearchSettingsTests: XCTestCase {
         XCTAssertFalse(WebSearchSettings.isNativeSearchModel(provider: "coding-relay", modelId: "gpt-5.4"))
         XCTAssertFalse(WebSearchSettings.isNativeSearchModel(provider: "kimi-coding", modelId: "kimi-k2"))
     }
+
+    /// DuckDuckGo answers bot detection with a 2xx challenge page, so `res.ok` is true and the
+    /// parser simply finds no links. Reporting that as "no results" is worse than failing: a
+    /// caller cross-validating a design against prior art would read "nothing exists" when the
+    /// truth is "the search never ran", and a design would pass validation it never got.
+    func testBlockedSearchBackendFailsLoudlyInsteadOfReportingNoResults() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-ws-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let path = try XCTUnwrap(WebSearchExtension.install(into: dir))
+        let source = try String(contentsOfFile: path, encoding: .utf8)
+
+        XCTAssertTrue(source.contains(#"/anomaly|challenge|captcha/i.test(html)"#))
+        XCTAssertTrue(source.contains("bot challenge"))
+        // A genuinely empty result page must still report "no results", not an error.
+        XCTAssertTrue(source.contains(#"!/class="result-link"/i.test(html) &&"#),
+                      "the guard must require BOTH no links AND a challenge marker")
+        XCTAssertTrue(source.contains("No results found for:"))
+    }
 }
