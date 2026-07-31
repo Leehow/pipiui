@@ -74,3 +74,30 @@ enum DurationFormat {
         return String(format: "%dh%02dm", seconds / 3_600, (seconds % 3_600) / 60)
     }
 }
+
+/// Wall-clock elapsed-time strings for a boss turn and all of its subagents.
+enum TurnDurationFormat {
+    static func elapsed(_ interval: TimeInterval) -> String {
+        let seconds = max(0, Int(interval))
+        if seconds < 60 {
+            return "\(seconds)s"
+        }
+        if seconds < 3_600 {
+            return String(format: "%dmin%02ds", seconds / 60, seconds % 60)
+        }
+        return String(
+            format: "%dh%02dmin%02ds",
+            seconds / 3_600,
+            (seconds % 3_600) / 60,
+            seconds % 60
+        )
+    }
+
+    static func completedAt(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy.M.d HH:mm"
+        return formatter.string(from: date)
+    }
+}

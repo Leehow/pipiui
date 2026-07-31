@@ -349,6 +349,11 @@ private struct ChatDetailViewBody: View {
                 toolOutputVersion: streaming.toolOutputVersion
             )
         let visibleRowsNewestFirst = visibleRowsOldestFirst.reversed()
+        let lastAssistantRunID = visibleRowsOldestFirst.reduce(into: String?.none) { result, row in
+            if case .assistantRun(let id, _, _) = row {
+                result = id
+            }
+        }
         let userTurnGroups = AssistantBlockLayout.userTurnGroups(rows: visibleRowsOldestFirst)
         // 只要某用户回合派发的任一 subagent 仍在运行，该回合就不可折叠（始终展示状态卡片）。
         // agentStore 是 @ObservedObject：agent 状态变化会触发本 body 重算，guard 随之刷新。
@@ -412,11 +417,17 @@ private struct ChatDetailViewBody: View {
                         )
                         .id(transcriptID("streaming"))
                         .transcriptFlip()
+                        if let startedAt = session.turnWallClockStartedAt {
+                            TurnElapsedText(startedAt: startedAt)
+                                .id(transcriptID("streaming-turn-elapsed"))
+                                .transcriptFlip()
+                        }
                     } else if session.isWorking || session.mediaBusy {
                         WaitingPlaceholderView(
                             message: session.mediaBusy
                                 ? (session.mediaStatus ?? "正在处理…")
-                                : (session.isStopping ? "正在停止…" : "AI 正在思考…")
+                                : (session.isStopping ? "正在停止…" : "AI 正在思考…"),
+                            turnStartedAt: session.turnWallClockStartedAt
                         )
                         .id(transcriptID("waiting-placeholder"))
                         .transcriptFlip()
@@ -474,6 +485,7 @@ private struct ChatDetailViewBody: View {
                                     onOpenFinishedGroup: presentFinishedGroup,
                                     entryId: entryId,
                                     isWorking: session.isWorking,
+                                    completionText: id == lastAssistantRunID ? session.turnCompletionText : nil,
                                     onCopy: { session.copySegmentsText(segments) },
                                     onBranch: {
                                         guard let entryId else { return }
