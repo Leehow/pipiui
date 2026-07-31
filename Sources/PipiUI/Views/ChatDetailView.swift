@@ -32,7 +32,11 @@ struct ChatDetailView: View {
 
     var body: some View {
         // Pass subagents each render so warm session switch (no .id teardown) rebinds observation.
-        ChatDetailViewBody(session: session, agentStore: session.subagents)
+        ChatDetailViewBody(
+            session: session,
+            streaming: session.streaming,
+            agentStore: session.subagents
+        )
             .environmentObject(store)
     }
 }
@@ -42,6 +46,8 @@ struct ChatDetailView: View {
 private struct ChatDetailViewBody: View {
     @EnvironmentObject var store: AppStore
     @ObservedObject var session: ChatSession
+    /// Isolated publisher for live message/tool deltas; avoids publishing those through ChatSession.
+    @ObservedObject var streaming: StreamingState
     /// 单独观察 subagent 树：它更新时主界面的 subagent 卡片要实时跟着动
     @ObservedObject var agentStore: SubagentStore
     @Environment(\.chatTypography) private var chatTypography
@@ -73,8 +79,9 @@ private struct ChatDetailViewBody: View {
     private let preferredRightPanelWidth: CGFloat = 460
     private let rightPanelDividerWidth: CGFloat = 16
 
-    init(session: ChatSession, agentStore: SubagentStore) {
+    init(session: ChatSession, streaming: StreamingState, agentStore: SubagentStore) {
         self.session = session
+        self.streaming = streaming
         self.agentStore = agentStore
         self._rightPanelWidthRatio = State(initialValue: LayoutPersistence.rightPanelWidthRatio())
     }
@@ -336,10 +343,10 @@ private struct ChatDetailViewBody: View {
         let visibleRowsOldestFirst = session.transcriptPlanner
             .rows(
                 items: items,
-                toolRuns: session.toolRuns,
+                toolRuns: streaming.toolRuns,
                 visibleCount: visibleCount,
                 transcriptVersion: session.transcriptVersion,
-                toolOutputVersion: session.toolOutputVersion
+                toolOutputVersion: streaming.toolOutputVersion
             )
         let visibleRowsNewestFirst = visibleRowsOldestFirst.reversed()
         let userTurnGroups = AssistantBlockLayout.userTurnGroups(rows: visibleRowsOldestFirst)
@@ -376,11 +383,11 @@ private struct ChatDetailViewBody: View {
                         )
                         .transcriptFlip()
 
-                    if let streaming = session.streamingItem, hasVisibleContent(streaming) {
+                    if let streamingItem = streaming.streamingItem, hasVisibleContent(streamingItem) {
                         MessageRow(
-                            item: streaming,
-                            toolRuns: runs(for: streaming),
-                            subagents: subagents(for: streaming),
+                            item: streamingItem,
+                            toolRuns: runs(for: streamingItem),
+                            subagents: subagents(for: streamingItem),
                             isStreaming: session.isStreaming,
                             projectURL: session.projectURL,
                             chatFontSize: chatTypography.fontSize,
@@ -393,13 +400,13 @@ private struct ChatDetailViewBody: View {
                             onCopy: {
                                 session.copySegmentsText(
                                     AssistantBlockLayout.plan(
-                                        blocks: streaming.blocks,
+                                        blocks: streamingItem.blocks,
                                         groupFinished: !session.isStreaming
                                     )
                                 )
                             },
                             onBranch: {
-                                guard let entryId = streaming.entryId else { return }
+                                guard let entryId = streamingItem.entryId else { return }
                                 session.branchFromAssistant(runLastEntryId: entryId)
                             }
                         )
@@ -538,7 +545,7 @@ private struct ChatDetailViewBody: View {
             .overlay {
                 ZStack {
                     // Covers the pane while pi boots and the initial transcript is built.
-                    if session.isInitializing && session.streamingItem == nil {
+                    if session.isInitializing && streaming.streamingItem == nil {
                         SessionLoadingView()
                             .transition(.opacity)
                     }
@@ -703,7 +710,7 @@ private struct ChatDetailViewBody: View {
     private func runs(forToolCallIds ids: Set<String>) -> [String: ToolRun] {
         var result: [String: ToolRun] = [:]
         for id in ids {
-            if let run = session.toolRuns[id] { result[id] = run }
+            if let run = streaming.toolRuns[id] { result[id] = run }
         }
         return result
     }

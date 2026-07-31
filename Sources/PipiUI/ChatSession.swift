@@ -483,6 +483,17 @@ enum InitialTranscriptReconciler {
     }
 }
 
+/// High-frequency state observed only by views that render the live transcript.
+///
+/// Keeping this separate from `ChatSession` prevents every streamed token/tool chunk
+/// from publishing to composer and sidebar observers of the session itself.
+final class StreamingState: ObservableObject {
+    @Published var streamingItem: ChatItem?
+    @Published var toolRuns: [String: ToolRun] = [:]
+    /// Monotonic counter bumped when toolRuns actually changes (UI watches this instead of scanning outputs).
+    @Published var toolOutputVersion: UInt64 = 0
+}
+
 /// One live pi RPC session bound to a project directory.
 /// Published state is mutated on the main thread (PiProcess delivers callbacks there).
 /// Heavy initial transcript conversion (image disk/base64) may run off-main before a single assign.
@@ -506,10 +517,12 @@ final class ChatSession: ObservableObject, Identifiable {
     private(set) var transcriptVersion: UInt64 = 0
     /// T6 transcript 布局记忆化（planTranscript 结果缓存，body 里只读缓存）。
     let transcriptPlanner = TranscriptPlanner()
-    @Published var streamingItem: ChatItem?
-    @Published var toolRuns: [String: ToolRun] = [:]
-    /// Monotonic counter bumped when toolRuns actually changes (UI watches this instead of scanning outputs).
-    @Published private(set) var toolOutputVersion: UInt64 = 0
+    /// Isolated publisher for high-frequency stream and tool-output updates.
+    let streaming = StreamingState()
+    /// Read-only compatibility forwarding; deliberately does not publish `ChatSession.objectWillChange`.
+    var streamingItem: ChatItem? { streaming.streamingItem }
+    var toolRuns: [String: ToolRun] { streaming.toolRuns }
+    var toolOutputVersion: UInt64 { streaming.toolOutputVersion }
     @Published var isStreaming = false
     /// True between the user clicking Stop and the turn actually settling.
     /// Drives optimistic 'stopping…' UI so one click is visibly acknowledged.
@@ -760,7 +773,7 @@ final class ChatSession: ObservableObject, Identifiable {
         }
         if let initialTranscript {
             transcript = initialTranscript.items
-            toolRuns = initialTranscript.toolRuns
+            streaming.toolRuns = initialTranscript.toolRuns
             itemCounter = initialTranscript.itemCounter
             skipNextAssistantIngest = initialTranscript.skipNextAssistantIngest
             initialPreviewItemCount = initialTranscript.items.count
@@ -1050,16 +1063,16 @@ final class ChatSession: ObservableObject, Identifiable {
         let reconciled = InitialTranscriptReconciler.reconcile(
             authoritative: built,
             currentItems: transcript,
-            currentToolRuns: toolRuns,
+            currentToolRuns: streaming.toolRuns,
             currentItemCounter: itemCounter,
             previewItemCount: initialPreviewItemCount,
             previewToolRunIDs: initialPreviewToolRunIDs
         )
         itemCounter = reconciled.itemCounter
         skipNextAssistantIngest = built.skipNextAssistantIngest
-        toolRuns = reconciled.toolRuns
+        streaming.toolRuns = reconciled.toolRuns
         if !built.toolRuns.isEmpty || reconciled.appendedLiveItemCount > 0 {
-            toolOutputVersion &+= 1
+            streaming.toolOutputVersion &+= 1
         }
 
         // Single assignment — avoid per-message @Published churn.
@@ -1301,7 +1314,9 @@ final class ChatSession: ObservableObject, Identifiable {
         case "agent_settled":
             isStreaming = false
             isStopping = false
-            streamingItem = nil
+            pendingStreamMessage = nil
+            pendingToolRuns.removeAll(keepingCapacity: true)
+            streaming.streamingItem = nil
             agentTurnActive = false
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -1325,7 +1340,7 @@ final class ChatSession: ObservableObject, Identifiable {
             }
         case "message_start":
             if e["message"]["role"].string == "assistant" {
-                streamingItem = Self.convert(message: e["message"], id: "streaming", allowDiskRead: false)
+                streaming.streamingItem = Self.convert(message: e["message"], id: "streaming", allowDiskRead: false)
             }
         case "message_update":
             pendingStreamMessage = e["message"]
@@ -1334,19 +1349,19 @@ final class ChatSession: ObservableObject, Identifiable {
             ingest(message: e["message"])
             if e["message"]["role"].string == "assistant" {
                 pendingStreamMessage = nil
-                streamingItem = nil
+                streaming.streamingItem = nil
                 recordTurnUsage(for: e["message"])
             }
         case "tool_execution_start":
             if let tid = e["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
-                toolRuns[tid] = ToolRun(isRunning: true)
-                toolOutputVersion &+= 1
+                streaming.toolRuns[tid] = ToolRun(isRunning: true)
+                streaming.toolOutputVersion &+= 1
             }
         case "tool_execution_update":
             if let tid = e["toolCallId"].string {
                 // Coalesce partial chunks; flush on main ~50ms (same idea as scheduleStreamFlush).
-                var run = pendingToolRuns[tid] ?? toolRuns[tid] ?? ToolRun()
+                var run = pendingToolRuns[tid] ?? streaming.toolRuns[tid] ?? ToolRun()
                 run.isRunning = true
                 run.output = Self.contentText(e["partialResult"]["content"])
                 pendingToolRuns[tid] = run
@@ -1356,13 +1371,13 @@ final class ChatSession: ObservableObject, Identifiable {
             if let tid = e["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
                 let content = e["result"]["content"]
-                toolRuns[tid] = ToolRun(
+                streaming.toolRuns[tid] = ToolRun(
                     isRunning: false,
                     isError: e["isError"].bool ?? false,
                     output: Self.contentText(content),
                     images: Self.contentImages(content, allowDiskRead: false)
                 )
-                toolOutputVersion &+= 1
+                streaming.toolOutputVersion &+= 1
                 scheduleImageBackfill(toolCallId: tid)
             }
         case "auto_retry_start":
@@ -1501,7 +1516,11 @@ final class ChatSession: ObservableObject, Identifiable {
             self.streamFlushScheduled = false
             if let message = self.pendingStreamMessage {
                 self.pendingStreamMessage = nil
-                self.streamingItem = Self.convert(message: message, id: "streaming")
+                self.streaming.streamingItem = Self.convert(
+                    message: message,
+                    id: "streaming",
+                    allowDiskRead: false
+                )
             }
         }
     }
@@ -1517,9 +1536,9 @@ final class ChatSession: ObservableObject, Identifiable {
             let batch = self.pendingToolRuns
             self.pendingToolRuns.removeAll(keepingCapacity: true)
             for (tid, run) in batch {
-                self.toolRuns[tid] = run
+                self.streaming.toolRuns[tid] = run
             }
-            self.toolOutputVersion &+= 1
+            self.streaming.toolOutputVersion &+= 1
         }
     }
 
@@ -1574,13 +1593,13 @@ final class ChatSession: ObservableObject, Identifiable {
             if let tid = message["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
                 let content = message["content"]
-                toolRuns[tid] = ToolRun(
+                streaming.toolRuns[tid] = ToolRun(
                     isRunning: false,
                     isError: message["isError"].bool ?? false,
                     output: Self.contentText(content),
                     images: Self.contentImages(content, allowDiskRead: false)
                 )
-                toolOutputVersion &+= 1
+                streaming.toolOutputVersion &+= 1
                 scheduleImageBackfill(toolCallId: tid)
             }
         case "bashExecution":
@@ -1866,7 +1885,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 if case .image(let img) = block { return img }
                 return nil
             })
-        } else if let toolCallId, let run = toolRuns[toolCallId] {
+        } else if let toolCallId, let run = streaming.toolRuns[toolCallId] {
             targets = Self.placeholderImageTargets(in: run.images)
         } else {
             return
@@ -1887,11 +1906,11 @@ final class ChatSession: ObservableObject, Identifiable {
                     item.blocks = Self.backfilledBlocks(item.blocks, loaded: loaded)
                     self.transcript[idx] = item
                 }
-                if let toolCallId, let run = self.toolRuns[toolCallId] {
+                if let toolCallId, let run = self.streaming.toolRuns[toolCallId] {
                     var next = run
                     next.images = Self.backfilledImages(run.images, loaded: loaded)
-                    self.toolRuns[toolCallId] = next
-                    self.toolOutputVersion &+= 1
+                    self.streaming.toolRuns[toolCallId] = next
+                    self.streaming.toolOutputVersion &+= 1
                 }
             }
         }
@@ -2421,7 +2440,7 @@ final class ChatSession: ObservableObject, Identifiable {
     private func reloadTranscriptAfterSessionReplace(
         completion: @escaping (String?) -> Void
     ) {
-        streamingItem = nil
+        streaming.streamingItem = nil
         isStreaming = false
         isStopping = false
         editingItemId = nil
@@ -2444,8 +2463,8 @@ final class ChatSession: ObservableObject, Identifiable {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.transcript = built.items
-                    self.toolRuns = built.toolRuns
-                    self.toolOutputVersion &+= 1
+                    self.streaming.toolRuns = built.toolRuns
+                    self.streaming.toolOutputVersion &+= 1
                     self.itemCounter = built.itemCounter
                     self.skipNextAssistantIngest = built.skipNextAssistantIngest
                     self.cachedBranchMessages = []
@@ -2804,6 +2823,9 @@ final class ChatSession: ObservableObject, Identifiable {
     func abort() {
         // Optimistic: acknowledge the click immediately. Cleared on settle / exit / new turn.
         isStopping = true
+        pendingStreamMessage = nil
+        pendingToolRuns.removeAll(keepingCapacity: true)
+        streaming.streamingItem = nil
         queue.noteAbort()
         publishQueue()
         cancelSideChannelTitle()
