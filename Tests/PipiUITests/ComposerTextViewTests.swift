@@ -43,7 +43,7 @@ final class ComposerTextViewTests: XCTestCase {
         XCTAssertEqual(host.scrollView.contentView.bounds.origin.y, 0, accuracy: 0.5)
     }
 
-    func testMarkedTextHookHidesPlaceholderAndSynchronizesBinding() {
+    func testMarkedTextHookHidesPlaceholder() {
         var boundText = ""
         var isFocused = false
         var boundHeight = ComposerTextViewLayout.minimumHeight(
@@ -89,6 +89,48 @@ final class ComposerTextViewTests: XCTestCase {
 
         XCTAssertTrue(host.textView.hasMarkedText())
         XCTAssertTrue(host.placeholderLabel.isHidden)
+    }
+
+    func testMarkedTextHookSynchronizesBindingWithoutDelegateNotification() {
+        var boundText = ""
+        var isFocused = false
+        var boundHeight = ComposerTextViewLayout.minimumHeight(
+            for: .systemFont(ofSize: NSFont.systemFontSize)
+        )
+        let identity = NSObject()
+        let parent = ComposerTextView(
+            text: Binding(
+                get: { boundText },
+                set: { boundText = $0 }
+            ),
+            isFocused: Binding(
+                get: { isFocused },
+                set: { isFocused = $0 }
+            ),
+            height: Binding(
+                get: { boundHeight },
+                set: { boundHeight = $0 }
+            ),
+            sessionIdentity: ObjectIdentifier(identity),
+            placeholder: "输入消息…",
+            onSubmit: {}
+        )
+        let coordinator = ComposerTextView.Coordinator(parent: parent)
+        let host = ComposerTextViewHost()
+        host.textView.delegate = coordinator
+        host.textView.onDidChangeText = { coordinator.textViewDidChangeText($0) }
+        coordinator.host = host
+        coordinator.synchronize(host)
+
+        // Do not call synchronize or didChangeText manually: setMarkedText must
+        // reach the binding through ComposerNSTextView's marked-text hook.
+        host.textView.setMarkedText(
+            "zai",
+            selectedRange: NSRange(location: 3, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+
+        XCTAssertTrue(host.textView.hasMarkedText())
         XCTAssertEqual(boundText, "zai")
     }
 
