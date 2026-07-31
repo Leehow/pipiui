@@ -85,6 +85,45 @@ final class SubagentLogLayoutTests: XCTestCase {
         XCTAssertEqual(SubagentLogLayout.plan([read, result, grep]).first?.id, 10)
     }
 
+    func testWindowPlansSuffixBeforeReversingSegments() {
+        let old = item(1, "text", text: "old")
+        let read = item(2, "tool", name: "read")
+        let readResult = item(3, "toolResult", text: "file")
+        let conclusion = item(4, "text", text: "new")
+        let window = Array([old, read, readResult, conclusion].suffix(3))
+
+        let newestFirst = SubagentLogLayout.plan(window).reversed()
+
+        XCTAssertEqual(
+            Array(newestFirst),
+            [
+                .item(conclusion),
+                .toolGroup([read, readResult]),
+            ]
+        )
+    }
+
+    func testWindowKeepsToolGroupIntactBeforeSegmentReverse() {
+        let old = item(1, "text", text: "old")
+        let read = item(2, "tool", name: "read")
+        let readResult = item(3, "toolResult", text: "file")
+        let grep = item(4, "tool", name: "grep")
+        let grepResult = item(5, "toolResult", text: "match")
+        let newest = item(6, "text", text: "new")
+        let window = Array([old, read, readResult, grep, grepResult, newest].suffix(5))
+
+        let newestFirst = Array(SubagentLogLayout.plan(window).reversed())
+
+        XCTAssertEqual(newestFirst.map(\.id), [6, 2])
+        XCTAssertEqual(
+            newestFirst,
+            [
+                .item(newest),
+                .toolGroup([read, readResult, grep, grepResult]),
+            ]
+        )
+    }
+
     func testCompactDurationBoundaries() {
         XCTAssertEqual(DurationFormat.compact(59), "59s")
         XCTAssertEqual(DurationFormat.compact(60), "1m0s")

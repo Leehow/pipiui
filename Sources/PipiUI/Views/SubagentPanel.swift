@@ -1,5 +1,4 @@
 import SwiftUI
-import AppKit
 
 /// 右侧 Subagent 面板：上半是 agent 树列表，下半是选中 agent 的实时详情。
 struct SubagentPanel: View {
@@ -276,69 +275,25 @@ private struct AgentRow: View {
     }
 }
 
-struct AgentAutoScrollGate {
-    struct Token: Equatable {
-        let agentID: String
-        let generation: UInt
-    }
-
-    private(set) var activeToken: Token?
-    private var generation: UInt = 0
-
-    static func anchorID(for agentID: String) -> String {
-        "agent-bottom-\(agentID)"
-    }
-
-    mutating func request(agentID: String, isPinned: Bool) -> Token? {
-        guard isPinned else {
-            invalidate()
-            return nil
-        }
-        if let activeToken {
-            if activeToken.agentID == agentID {
-                return nil
-            }
-            invalidate()
-        }
-        generation &+= 1
-        let token = Token(agentID: agentID, generation: generation)
-        activeToken = token
-        return token
-    }
-
-    func permits(_ token: Token, agentID: String, isPinned: Bool) -> Bool {
-        isPinned && token.agentID == agentID && activeToken == token
-    }
-
-    @discardableResult
-    mutating func complete(_ token: Token) -> Bool {
-        guard activeToken == token else { return false }
-        activeToken = nil
-        return true
-    }
-
-    mutating func invalidate() {
-        generation &+= 1
-        activeToken = nil
-    }
-}
-
 private struct AgentDetailView: View {
     let agent: SubagentInfo
     @ObservedObject var store: SubagentStore
     var projectURL: URL
-    @Environment(\.scenePhase) private var scenePhase
     @State private var pinToBottom = true
+    @State private var logVisibleCount = 100
     @State private var worktreeBusy = false
     @State private var showDiscardConfirm = false
     @State private var showDiffStat = false
     @State private var diffStatText: String?
     @State private var diffBusy = false
-    @State private var autoScrollGate = AgentAutoScrollGate()
-    @State private var autoScrollTask: Task<Void, Never>?
     @State private var expandedToolGroupIDs: Set<Int> = []
 
     var body: some View {
+        let window = Array(agent.log.suffix(logVisibleCount))
+        let hidden = max(0, agent.log.count - logVisibleCount)
+        let segmentsOldest = SubagentLogLayout.plan(window)
+        let segmentsNewestFirst = segmentsOldest.reversed()
+
         VStack(alignment: .leading, spacing: 0) {
             metricsHeader
             if agent.canReviewWorktree
@@ -356,40 +311,58 @@ private struct AgentDetailView: View {
             }
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(spacing: 0) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            if agent.log.isEmpty {
-                                waitingForFirstLog
-                            } else {
-                                ForEach(SubagentLogLayout.plan(agent.log)) { segment in
-                                    switch segment {
-                                    case .item(let item):
-                                        AgentLogRow(item: item, base: documentBase)
-                                    case .toolGroup(let items):
-                                        toolGroup(items)
-                                    }
+                    // Newest-first stack. The scroll view flip maps document start to
+                    // the visual bottom, while each rendered row flips back upright.
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        Color.clear
+                            .frame(height: 1)
+                            .id(logAnchorID)
+                            .background(
+                                StickToBottomTracker(
+                                    isPinned: $pinToBottom,
+                                    pinEdge: .documentStart
+                                )
+                            )
+                            .transcriptFlip()
+
+                        if window.isEmpty {
+                            waitingForFirstLog
+                                .transcriptFlip()
+                        } else {
+                            ForEach(segmentsNewestFirst) { segment in
+                                switch segment {
+                                case .item(let item):
+                                    AgentLogRow(item: item, base: documentBase)
+                                        .transcriptFlip()
+                                case .toolGroup(let items):
+                                    // Flip the group once: its children retain their
+                                    // planned oldest-to-newest order without double flips.
+                                    toolGroup(items)
+                                        .transcriptFlip()
                                 }
                             }
-                            Color.clear
-                                .frame(height: 1)
-                                .id(AgentAutoScrollGate.anchorID(for: agent.id))
                         }
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                        if hidden > 0 {
+                            Button("显示更早的 \(hidden) 条日志") {
+                                logVisibleCount += 100
+                            }
+                            .buttonStyle(.link)
+                            .frame(maxWidth: .infinity)
+                            .transcriptFlip()
+                        }
                     }
+                    .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    // Keep AppKit observation outside the log stack. Putting
-                    // the representable on the bottom row can make its binding
-                    // write participate in the same AttributeGraph layout pass.
-                    .background(StickToBottomTracker(isPinned: $pinToBottom))
                     .overlayScrollers()
                 }
                 .scrollIndicators(.automatic)
+                .transcriptFlip()
                 .overlay(alignment: .bottomTrailing) {
                     if !pinToBottom {
                         Button {
                             pinToBottom = true
-                            requestAutoScroll(proxy)
+                            jumpToLatest(proxy)
                         } label: {
                             Image(systemName: "arrow.down")
                                 .font(.system(size: 12, weight: .semibold))
@@ -401,37 +374,26 @@ private struct AgentDetailView: View {
                         .buttonStyle(.plain)
                         .shadow(color: .black.opacity(0.2), radius: 3, y: 1)
                         .padding(8)
-                        .help("跳到底部")
+                        .help("跳到最新日志")
                         .transition(.opacity)
                     }
                 }
                 .animation(.easeInOut(duration: 0.15), value: pinToBottom)
-                .onAppear { requestAutoScroll(proxy) }
-                .onChange(of: agent.log.count) { _, _ in
-                    requestAutoScroll(proxy)
-                }
-                .onChange(of: agent.output.count) { _, _ in
-                    requestAutoScroll(proxy)
+                .onAppear {
+                    DispatchQueue.main.async {
+                        jumpToLatest(proxy)
+                    }
                 }
                 .onChange(of: agent.id) { _, _ in
-                    cancelAutoScroll()
+                    logVisibleCount = 100
+                    expandedToolGroupIDs.removeAll()
                     pinToBottom = true
                     showDiffStat = false
                     diffStatText = nil
-                    requestAutoScroll(proxy)
-                }
-                .onChange(of: pinToBottom) { _, pinned in
-                    if !pinned {
-                        cancelAutoScroll()
+                    DispatchQueue.main.async {
+                        jumpToLatest(proxy)
                     }
                 }
-                .onChange(of: scenePhase) { _, phase in
-                    if phase == .active { requestAutoScroll(proxy) }
-                }
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                    requestAutoScroll(proxy)
-                }
-                .onDisappear { cancelAutoScroll() }
             }
             // Replace the scroll hierarchy when changing agents so AppKit does not
             // reuse the previous agent's offset or layout cache.
@@ -584,42 +546,18 @@ private struct AgentDetailView: View {
         }
     }
 
-    private func requestAutoScroll(_ proxy: ScrollViewProxy) {
-        guard let token = autoScrollGate.request(agentID: agent.id, isPinned: pinToBottom) else {
-            return
-        }
-        autoScrollTask = Task { @MainActor in
-            defer {
-                if autoScrollGate.complete(token) {
-                    autoScrollTask = nil
-                }
-            }
-
-            // One task owns the complete settle sequence. Log/output bursts and the
-            // two activation notifications coalesce into this bounded sequence.
-            await Task.yield()
-            let settleDelays: [UInt64] = [0, 50_000_000, 150_000_000, 350_000_000, 700_000_000, 1_200_000_000]
-            for delay in settleDelays {
-                if delay > 0 {
-                    try? await Task.sleep(nanoseconds: delay)
-                }
-                guard !Task.isCancelled,
-                      autoScrollGate.permits(token, agentID: agent.id, isPinned: pinToBottom) else {
-                    return
-                }
-                var transaction = Transaction()
-                transaction.disablesAnimations = true
-                withTransaction(transaction) {
-                    proxy.scrollTo(AgentAutoScrollGate.anchorID(for: token.agentID), anchor: .bottom)
-                }
-            }
-        }
+    private var logAnchorID: String {
+        "agent-bottom-\(agent.id)"
     }
 
-    private func cancelAutoScroll() {
-        autoScrollGate.invalidate()
-        autoScrollTask?.cancel()
-        autoScrollTask = nil
+    /// The flipped scroll view maps layout top to the visual bottom / latest edge.
+    private func jumpToLatest(_ proxy: ScrollViewProxy) {
+        guard pinToBottom else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            proxy.scrollTo(logAnchorID, anchor: .top)
+        }
     }
 
     @ViewBuilder
