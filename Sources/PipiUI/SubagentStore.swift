@@ -720,6 +720,11 @@ final class SubagentStore: ObservableObject {
     var onRunningCountMayHaveChanged: (() -> Void)?
     /// Dedup identical merge/verify-fail injections within 60s, keyed per event.
     private var recentNotifications: [String: Date] = [:]
+    /// Prevent a restored row and its end event from scheduling the same automatic merge twice.
+    private var automaticallyMergingAgentIDs: Set<String> = []
+    /// Persisted rows load asynchronously after the main project may already be bound.
+    private var hasLoadedPersistedAgents = false
+    private var didRetryPersistedPendingReviewMerges = false
     /// Post-merge verify coalescing: distinct command → latest merged agent to report it.
     private var pendingVerifyByCommand: [String: SubagentInfo] = [:]
     private var pendingVerifyFlush: DispatchWorkItem?
@@ -737,6 +742,7 @@ final class SubagentStore: ObservableObject {
     /// Bind the session's main project URL so successful agents can auto-merge.
     func bindMainProject(_ url: URL) {
         mainProjectURL = url
+        retryPersistedPendingReviewMergesIfReady()
     }
 
     // MARK: - 持久化（跟随 pi 会话文件，App 崩溃/重启后恢复 agent 树）
@@ -790,7 +796,32 @@ final class SubagentStore: ObservableObject {
                   self.agents.isEmpty else { return }
             self.agents = loaded
             self.logCounter = maxLogId
+            self.hasLoadedPersistedAgents = true
             if self.selectedId == nil { self.selectedId = self.agents.last?.id }
+            self.retryPersistedPendingReviewMergesIfReady()
+        }
+    }
+
+    /// After restart, resume one missed automatic merge for each eligible persisted row.
+    /// The end-event path uses the same scheduler, so a concurrent replay cannot duplicate Git work.
+    private func retryPersistedPendingReviewMergesIfReady() {
+        guard hasLoadedPersistedAgents,
+              !didRetryPersistedPendingReviewMerges,
+              let main = mainProjectURL else { return }
+        didRetryPersistedPendingReviewMerges = true
+        for agent in agents where agent.state == .ok
+                && agent.worktreeLifecycle == .pendingReview
+                && (agent.verifyExit ?? 0) == 0
+                && agent.worktreePath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            scheduleAutomaticMerge(agentId: agent.id, mainProjectURL: main)
+        }
+    }
+
+    private func scheduleAutomaticMerge(agentId: String, mainProjectURL: URL) {
+        guard automaticallyMergingAgentIDs.insert(agentId).inserted else { return }
+        Task { [weak self] in
+            _ = await self?.mergeWorktree(agentId: agentId, mainProjectURL: mainProjectURL)
+            self?.automaticallyMergingAgentIDs.remove(agentId)
         }
     }
 
@@ -1033,9 +1064,7 @@ final class SubagentStore: ObservableObject {
                let main = mainProjectURL {
                 let aid = agents[i].id
                 // git 操作在 mergeWorktree 内部 Task.detached 后台执行，主线程只收尾状态。
-                Task { [weak self] in
-                    _ = await self?.mergeWorktree(agentId: aid, mainProjectURL: main)
-                }
+                scheduleAutomaticMerge(agentId: aid, mainProjectURL: main)
             }
         default:
             break
@@ -1255,7 +1284,8 @@ final class SubagentStore: ObservableObject {
             schedulePostMergeVerify(agent: agents[idx], mainProjectURL: main)
             return nil
         case .mergeFailed(let msg):
-            let full = "合并失败（worktree 未删除）: \(msg)"
+            let dirtyPrefix = GitRepo.probe(workTree: main).isDirty ? "主仓有未提交改动;" : ""
+            let full = "\(dirtyPrefix)合并失败（worktree 未删除）: \(msg)"
             if let idx = agents.firstIndex(where: { $0.id == agentId }) {
                 agents[idx].closeoutDisposition = .needsFixer
                 agents[idx].closeoutReason = full
