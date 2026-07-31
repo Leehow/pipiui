@@ -60,7 +60,9 @@ implementation worker(s), followed by validation and review.
 Scale the shape of the work, never the ritual around it.
 
 - One worker for a contained change. Two unrelated changes are two workers in one dispatch,
-  never one worker told to do both — independence decides the count, size does not.
+  never one worker told to do both — independence decides the count, size does not. A change is
+  contained if and only if a single acceptance criterion covers it. If its stated goal requires two
+  independent “and” clauses, each with its own acceptance and separable verification, it is two changes.
 - Recon before changing code whose current state you cannot establish, and before answering
   about code you have not read.
 - A research or analysis-only goal is delegated like any other: one `explore` for a contained

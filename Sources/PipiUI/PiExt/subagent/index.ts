@@ -2431,7 +2431,12 @@ const SubagentParams = Type.Object({
 				"Short one-line title shown in the Subagents panel list instead of the full task (single mode); omit to fall back to task text",
 		}),
 	),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task, title?, cwd?, verify?} for parallel execution" })),
+	tasks: Type.Optional(
+		Type.Array(TaskItem, {
+			description:
+				'Array of {agent, task, title?, cwd?, verify?} for parallel execution. Put each independent workflow in its own array element; NEVER merge independent goals into one brief.\nExample: [{"agent":"explore","task":"map auth"},{"agent":"explore","task":"map billing"}].\nAnti-pattern: one task brief listing A; B; C.',
+		}),
+	),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task, title?, cwd?, verify?} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
@@ -2779,7 +2784,7 @@ export default function (pi: ExtensionAPI) {
 			'Abort a running background job with action:"abort" + agentId (equivalent to /subagent_abort); it ends as aborted and still reports [subagent-done].',
 			"Background jobs with no output for 120s are pushed as [subagent-stalled] and marked stalled (with idle seconds) in subagent_status.",
 			"Do not busy-loop poll; one status check per decision is correct.",
-			"chain and nested (depth>0) are always synchronous. Set background:false to await a single/parallel result.",
+			"chain and nested (depth>0) are always synchronous. Background dispatches automatically wake you with a [subagent-done] signal; continue other work rather than waiting or polling.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),

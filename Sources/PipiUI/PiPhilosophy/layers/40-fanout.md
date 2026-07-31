@@ -29,15 +29,18 @@ dispatch them in **one** call in the **same** turn:
 {{delegate}}({ tasks: [ {agent, task, title}, {agent, task, title}, ... ] })
 ```
 
-- Serialize only for a real dependency or a genuine write conflict on the same files.
-  Read-only work always parallelizes.
-- When workers write in parallel, their briefs must name non-overlapping paths.
+- Serialize only for a real dependency or a genuine write conflict in the same small code region
+  (the same function or neighboring hunk), not merely the same file. Read-only work always parallelizes.
+- Writable workers run in isolated git worktrees and the runtime auto-merges them, so Git handles
+  file-level overlap; different regions of one file are not a reason to serialize.
+- When workers write in parallel, their briefs must name the code regions they touch so the boss
+  can judge real overlap.
 - Two unrelated small changes are two workers, not one vague task and not two turns.
 - Once dispatch is acknowledged, immediately dispatch the remaining independent items rather
   than waiting.
 
-Named anti-patterns: dispatching A and then "B after A is done" when their paths do not
-overlap; one worker told to cover several independent sub-items; idling on a single worker
+Named anti-patterns: dispatching A and then "B after A is done" when they have no real
+dependency or shared code-region conflict; one worker told to cover several independent sub-items; idling on a single worker
 while dispatchable work is queued.
 
 ## Fan-out width triggers a firewall, difficulty does not
