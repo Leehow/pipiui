@@ -1344,7 +1344,8 @@ function parseWorktreeListPorcelain(output: string): Array<{ path: string; branc
 
 /**
  * Default: create an isolated git worktree under <toplevel>/.pi/worktrees/<safeId>
- * on branch pipiui/<safeId> so subagents write without polluting the main dirty tree.
+ * on branch pipiui/<safeId> so non-read-only subagents write without polluting the main dirty tree.
+ * Read-only roles run directly in their fallback cwd and never create a worktree or branch.
  *
  * Resume / continue same agentId:
  * - Reuses preferred path when it is already a valid git worktree.
@@ -1354,6 +1355,7 @@ function parseWorktreeListPorcelain(output: string): Array<{ path: string; branc
  *   conversation (see agentSessionDir), so cwd, branch AND context all continue.
  *
  * Off when:
+ * - agent is read-only
  * - PIPIUI_WORKTREE=0
  * - caller passed explicit cwd (respect; do not wrap)
  * - effective cwd is not inside a git work tree
@@ -1361,12 +1363,13 @@ function parseWorktreeListPorcelain(output: string): Array<{ path: string; branc
  * TS never auto remove / commit / merge (Swift SubagentStore owns lifecycle).
  * On failure creating wt, fall back to original cwd + worktreeError.
  * Never auto-merge in TS or Swift end handlers — GUI confirms merge/discard.
- * failed/aborted/interrupted → keep pendingReview for续作; GUI merge/discard remains as fallback.
+ * failed/aborted/interrupted writable workers → keep pendingReview for续作; GUI merge/discard remains as fallback.
  */
 function resolveSubagentWorktree(opts: {
 	agentId: string;
 	defaultCwd: string;
 	explicitCwd?: string;
+	readOnly: boolean;
 	policy: AgentRuntimeRolePolicy;
 }): WorktreePlacement {
 	const fallbackCwd = opts.explicitCwd ?? opts.defaultCwd;
@@ -1376,7 +1379,7 @@ function resolveSubagentWorktree(opts: {
 		// role and must not manufacture another branch/worktree while closing them out.
 		return { cwd: path.resolve(PIPIUI_MAIN_CWD || opts.defaultCwd) };
 	}
-	if (process.env.PIPIUI_WORKTREE === "0") {
+	if (opts.readOnly || process.env.PIPIUI_WORKTREE === "0") {
 		return { cwd: fallbackCwd };
 	}
 	// Explicit cwd from tool caller → respect, no worktree wrap
@@ -1886,6 +1889,7 @@ async function runSingleAgent(
 		agentId: pipiuiAgentId,
 		defaultCwd,
 		explicitCwd: cwd, // only when caller passed cwd; undefined → auto worktree
+		readOnly: agent.traits.readOnly,
 		policy: runtimePolicy,
 	});
 	const spawnCwd = placement.cwd;
@@ -2308,7 +2312,7 @@ const VERIFY_PARAM_DESCRIPTION =
 	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Boss must fill this for implementation tasks. Omit it for read-only agents — they deliver a report, not files, and the runtime drops any verify they are given.";
 
 const AGENT_ID_DESCRIPTION =
-	"Short semantic name for the worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\". Re-dispatching the same agentId continues that worker with its previous conversation, worktree and branch — use it for one vertical slice (implement, verify, debug, fix, re-verify). Omit for one-off work and a name is generated. Also the target id for action=\"abort\".";
+	"Short semantic name for the worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\". Re-dispatching the same agentId continues a writable worker with its previous conversation, worktree and branch — use it for one vertical slice (implement, verify, debug, fix, re-verify). Read-only roles are one-shot and do not create a worktree. Omit for one-off work and a name is generated. Also the target id for action=\"abort\".";
 const FRESH_DESCRIPTION =
 	"Discard this agentId's stored conversation and start it cold. Use when its context went wrong, not routinely.";
 
@@ -2705,7 +2709,7 @@ export default function (pi: ExtensionAPI) {
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
 			"While the fan-out philosophy layer is active, background=false is ignored at boss depth — asynchronous dispatch is that layer's premise, not a preference. Use chain for genuinely ordered synchronous steps.",
-			"By default each worker writes in an isolated git worktree under .pi/worktrees/ on a pipiui/agent-* branch; pass explicit cwd or set PIPIUI_WORKTREE=0 to disable. The runtime-owned secretary role is the exception: it always runs in PIPIUI_MAIN_CWD with recursive delegation disabled and never creates a worktree. On successful worker end the app auto-merges into the main project, removes the worktree, and safely deletes only a merged internal branch with git branch -d. If merge or cleanup fails, the main session retains actionable state; failed/aborted keeps worktree for resume (GUI merge/discard fallback).",
+			"By default writable workers run in an isolated git worktree under .pi/worktrees/ on a pipiui/<agentId> branch; read-only roles run directly in the caller cwd and never create a worktree. Pass explicit cwd or set PIPIUI_WORKTREE=0 to disable worktree isolation. The runtime-owned secretary role is also an exception: it always runs in PIPIUI_MAIN_CWD with recursive delegation disabled and never creates a worktree. On successful writable-worker end the app auto-merges into the main project, removes the worktree, and safely deletes only a merged internal branch with git branch -d. If merge or cleanup fails, the main session retains actionable state; failed/aborted keeps worktree for resume (GUI merge/discard fallback).",
 			"Track jobs with subagent_status(agentId?). Never re-spawn a finished task without reading its result via [subagent-done] or subagent_status.",
 			'Abort a running background job with action:"abort" + agentId (equivalent to /subagent_abort); it ends as aborted and still reports [subagent-done].',
 			"Background jobs with no output for 120s are pushed as [subagent-stalled] and marked stalled (with idle seconds) in subagent_status.",

@@ -380,6 +380,7 @@ enum SubagentStatusCheckPrompt {
 /// 后台 git 操作结果（detached 任务返回值，跨线程传递）。
 private enum MergeGitOutcome: Sendable {
     case ok
+    case zeroChangeCleaned
     case mergeFailed(String)
     case removeFailed(String)
     case cleanupFailed(String)
@@ -1235,6 +1236,28 @@ final class SubagentStore: ObservableObject {
 
         // Serialized against every other main-repo operation (other merges, verify runs).
         let outcome: MergeGitOutcome = await MainRepoSerialQueue.run {
+            // A clean branch that is already reachable from main has no agent work to merge.
+            // Remove it directly, but only after both conditions prove no changes can be lost.
+            if !GitRepo.probe(workTree: wtURL).isDirty,
+               GitRepo.isAncestor(branch, of: "HEAD", in: main) {
+                do {
+                    try GitRepo.worktreeRemove(at: wtURL, in: main, force: false)
+                } catch {
+                    let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    return .removeFailed(msg)
+                }
+                let cleanup = GitRepo.safelyDeleteMergedAgentBranch(
+                    branch,
+                    persistedWorktreePath: pathStr,
+                    integrationRef: "HEAD",
+                    in: main
+                )
+                if let warning = cleanup.warning, !warning.isEmpty {
+                    return .cleanupFailed(warning)
+                }
+                return .zeroChangeCleaned
+            }
+
             // Best-effort: commit dirty files in the agent worktree so they are not lost.
             _ = GitRepo.commitAllIfDirty(
                 in: wtURL,
@@ -1274,6 +1297,14 @@ final class SubagentStore: ObservableObject {
 
         // 回到主线程：git 期间 agent 可能已被清空/移除，写状态前 re-check。
         switch outcome {
+        case .zeroChangeCleaned:
+            guard let idx = agents.firstIndex(where: { $0.id == agentId }) else { return nil }
+            agents[idx].worktreeLifecycle = .merged
+            agents[idx].worktreeError = nil
+            agents[idx].closeoutDisposition = .cleaned
+            agents[idx].closeoutReason = "零改动,已直接清理"
+            scheduleSave()
+            return nil
         case .ok:
             guard let idx = agents.firstIndex(where: { $0.id == agentId }) else { return nil }
             agents[idx].worktreeLifecycle = .merged
