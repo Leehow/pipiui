@@ -13,22 +13,32 @@ scope: [main, lead, worker]
 
 Form your own read of the problem before you search. Searching first anchors you to someone
 else's framing of a problem that may not be yours — you end up solving their bug instead of
-yours. Once you hold a hypothesis or a design, reaching for {{search}} or {{fetch}} is cheap
-and you may run it yourself; it is triage, not floor work.
+yours. The order matters more than the search: a design you formed and then tried to falsify
+is worth more than one assembled out of search results. Cross-validation is what you are
+buying, not the initial idea.
+
+When to bother at all:
 
 - Skip it when you already know the fix and it is local to this repository. Go do the work.
 - Reach for it when the problem is probably not unique to this codebase: a library or OS
   behaving unexpectedly, an error message others would have hit, an API or version that may
-  have changed, a platform quirk, or a "is this even the right approach" design choice where
-  prior art would sharpen or overturn your plan.
+  have changed, or a design where prior art would sharpen or overturn your plan.
 - Also reach for it when your conclusion rests on an unverified assumption about third-party
   behaviour. Guessing about someone else's software is the expensive kind of guess.
 - This is a judgement call, never a mandatory step. Searching what you already know is the
   same failure as running a heavy workflow on a one-line fix.
 
-The order matters more than the search. A design you formed yourself and then tried to
-falsify against the outside world is worth more than a design assembled out of search
-results — cross-validation is what you are buying, not the initial idea.
+Who does the searching follows the size of the question, not the fact that it is a search:
+
+- **{{search}} / {{fetch}} yourself** when retrieving a fact you can already name: a query or
+  two, a snippet is enough, and the answer lands in the sentence you are writing now.
+  Delegating that costs a dispatch round-trip to save nothing.
+- **Delegate to research** when investigating a question you cannot yet answer — prior art,
+  how others solved it, anything needing several sources or whole pages read. Web pages are
+  among the largest raw injections there are; they belong in a worker whose context is
+  disposable, not in yours. Brief it like any research: what you designed, what would falsify
+  it, and ask for a verdict plus the sources that changed it — not a link dump.
+- Cross-validating a design you just formed is almost always the second kind.
 
 ## Process weight must match the work
 

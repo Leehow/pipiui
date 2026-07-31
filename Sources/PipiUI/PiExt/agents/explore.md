@@ -1,7 +1,7 @@
 ---
 name: explore
-description: Grok-style research agent. Searches, reads, greps, and runs shell, but does not edit files.
-tools: read, grep, find, ls, bash
+description: Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files.
+tools: read, grep, find, ls, bash, web_search, web_fetch
 model: xai/grok-4.5:high
 read-only: true
 deliverable: report

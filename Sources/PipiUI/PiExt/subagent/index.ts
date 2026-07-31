@@ -75,6 +75,10 @@ const PIPIUI_SUBAGENT_EXT = process.env.PIPIUI_SUBAGENT_EXT;
 const PIPIUI_COMPUTER_EXT = process.env.PIPIUI_COMPUTER_EXT;
 // App-owned search guard; children load the same code and inherit the human-turn grant file.
 const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
+// Generic web_search / web_fetch. Provider-hosted search already reaches workers through pi's
+// own extension discovery, but only when the worker's model has a provider that ships it —
+// this is the fallback that makes research delegable no matter which model runs it.
+const PIPIUI_WEBSEARCH_EXT = process.env.PIPIUI_WEBSEARCH_EXT;
 // Every dispatched subagent runs with the external skill library switched off: a worker
 // follows its own agent prompt plus the brief, never a skill SOP it discovered on its own.
 const PIPIUI_SUBAGENT_SKILL_ISOLATION = process.env.PIPIUI_SUBAGENT_SKILL_ISOLATION === "1";
@@ -1925,6 +1929,7 @@ async function runSingleAgent(
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
 	if (PIPIUI_SEARCH_SCOPE_EXT) args.push("-e", PIPIUI_SEARCH_SCOPE_EXT);
+	if (PIPIUI_WEBSEARCH_EXT) args.push("-e", PIPIUI_WEBSEARCH_EXT);
 	if (PIPIUI_COMPUTER_EXT && process.env.PIPIUI_COMPUTER_CAPABILITY) {
 		args.push("-e", PIPIUI_COMPUTER_EXT);
 	}

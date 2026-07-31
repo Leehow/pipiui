@@ -168,6 +168,11 @@ enum PipiSpawnAssembly {
         if f.isEnabled(.webSearch), let p = input.paths.webSearch {
             args += ["-e", p]
             env["PIPIUI_WEBSEARCH_CONFIG_FILE"] = input.webSearchConfigFile
+            // Re-exported so dispatched workers can mount it too. Provider-hosted search
+            // already reaches them through pi's own extension discovery, but only for models
+            // whose provider ships it; this is the fallback that makes an `explore` worker
+            // able to search regardless of which model it happens to run on.
+            env["PIPIUI_WEBSEARCH_EXT"] = p
         }
 
         // Main session only: dispatched workers stay fully skill-free.

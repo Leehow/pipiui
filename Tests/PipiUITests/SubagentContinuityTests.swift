@@ -205,6 +205,44 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertFalse(t.contains("| ID | title | status |"), "the template must be gone from the prefix")
     }
 
+    /// Research is the largest raw injection there is, so the boss must be able to hand it to a
+    /// worker. Provider-hosted search already reaches workers through pi's own discovery, but
+    /// only for models whose provider ships it — the generic tools are the fallback that makes
+    /// delegating research work whatever model the worker runs.
+    func testWorkersCanSearchTheWebSoResearchIsDelegable() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains("const PIPIUI_WEBSEARCH_EXT = process.env.PIPIUI_WEBSEARCH_EXT;"))
+        XCTAssertTrue(s.contains(#"if (PIPIUI_WEBSEARCH_EXT) args.push("-e", PIPIUI_WEBSEARCH_EXT);"#))
+
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let assembly = try String(
+            contentsOf: root.appendingPathComponent("Sources/PipiUI/PipiSpawnAssembly.swift"),
+            encoding: .utf8)
+        XCTAssertTrue(assembly.contains(#"env["PIPIUI_WEBSEARCH_EXT"] = p"#),
+                      "re-exported only inside the webSearch feature gate")
+
+        // The allowlist filters registered tools, so explore needs them named explicitly.
+        let explore = try String(
+            contentsOf: root.appendingPathComponent("Sources/PipiUI/PiExt/agents/explore.md"),
+            encoding: .utf8)
+        XCTAssertTrue(explore.contains("web_search"))
+        XCTAssertTrue(explore.contains("web_fetch"))
+    }
+
+    /// The rule used to tell the boss to run every search itself, which contradicts the axiom
+    /// that its context is the one non-renewable resource. Size decides now, not the fact that
+    /// it is a search.
+    func testMethodLayerRoutesResearchOutAndKeepsLookupsInline() throws {
+        let t = try PhilosophyLayerFixture.normalizedBody("method")
+        XCTAssertTrue(t.contains("Who does the searching follows the size of the question"))
+        XCTAssertTrue(t.contains("retrieving a fact you can already name"))
+        XCTAssertTrue(t.contains("Delegate to research"))
+        XCTAssertTrue(t.contains("Cross-validating a design you just formed is almost always the second kind"))
+        XCTAssertFalse(t.contains("you may run it yourself"),
+                       "the blanket permission to search personally is what this replaced")
+    }
+
     /// The philosophy has to teach the boss to use the mechanism, or nobody names anything.
     func testOrchestrationLayerTeachesNamedVerticalSlices() throws {
         let t = try PhilosophyLayerFixture.normalizedBody("orchestration")

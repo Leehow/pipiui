@@ -183,7 +183,9 @@ final class PhilosophyLayerTests: XCTestCase {
         assertContains(t, "anchors you to")
         assertContains(t, "{{search}}")
         assertContains(t, "{{fetch}}")
-        assertContains(t, "it is triage, not floor work")
+        // "triage, not floor work" was the blanket permission to search personally; who runs
+        // the search is now decided by the size of the question.
+        assertContains(t, "Who does the searching follows the size of the question")
         assertContains(t, "Skip it when you already know the fix")
         assertContains(t, "probably not unique to this codebase")
         assertContains(t, "prior art would sharpen or overturn your plan")
