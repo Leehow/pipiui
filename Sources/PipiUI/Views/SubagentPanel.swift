@@ -170,9 +170,11 @@ private struct AgentRow: View {
                 HStack(spacing: 6) {
                     Text(agent.name)
                         .font(.callout.weight(.medium))
+                        .foregroundStyle(.primary)
                     if agent.name == "lead" {
                         Text("组长")
                             .font(.caption2)
+                            .foregroundStyle(Color.accentColor)
                             .padding(.horizontal, 4)
                             .padding(.vertical, 1)
                             .background(Capsule().fill(Color.accentColor.opacity(0.15)))
@@ -180,6 +182,7 @@ private struct AgentRow: View {
                     if agent.name == "secretary" {
                         Text("收尾")
                             .font(.caption2)
+                            .foregroundStyle(.purple)
                             .padding(.horizontal, 4)
                             .padding(.vertical, 1)
                             .background(Capsule().fill(Color.purple.opacity(0.15)))
@@ -187,7 +190,7 @@ private struct AgentRow: View {
                     if agent.state == .running, agent.stalled {
                         lifecycleBadge(
                             text: agent.stalledIdleSec > 0 ? "卡住 \(agent.stalledIdleSec)s" : "卡住",
-                            color: .yellow
+                            color: .orange
                         )
                         .help("已 \(agent.stalledIdleSec)s 无任何活动，可能卡死；可点右侧 ⏹ 中止")
                     }
@@ -260,7 +263,7 @@ private struct AgentRow: View {
     private var statusDot: some View {
         switch agent.state {
         case .running:
-            ProgressView().controlSize(.mini)
+            ProgressView().controlSize(.mini).tint(.secondary)
         case .ok:
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
         case .failed:

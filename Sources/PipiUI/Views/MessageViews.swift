@@ -706,6 +706,7 @@ struct SubagentToolCardView: View {
                         statusIcon(agent.state)
                         Text(agent.name)
                             .font(.caption.weight(.semibold))
+                            .foregroundStyle(.primary)
                         Text(SubagentToolCardStatus.line(for: agent))
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -731,7 +732,7 @@ struct SubagentToolCardView: View {
     @ViewBuilder
     private func statusIcon(_ state: SubagentInfo.State) -> some View {
         switch state {
-        case .running: ProgressView().controlSize(.mini)
+        case .running: ProgressView().controlSize(.mini).tint(.secondary)
         case .ok: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
         case .failed: Image(systemName: "xmark.circle.fill").foregroundStyle(.red).font(.caption)
         case .aborted: Image(systemName: "stop.circle.fill").foregroundStyle(.orange).font(.caption)
