@@ -3,8 +3,9 @@
  * Probe native multi-tool-call and subagent batch preferences without sending
  * credentials or unredacted provider responses to disk. Node 18+; no deps.
  *
- * Reads only ~/.pi/agent/models.json, models-store.json, and auth.json.
- * Default reports are intentionally written to the primary checkout so a
+ * Reads ~/.pi/agent/models.json, models-store.json, and auth.json, plus the
+ * provider API-key environment variables documented by pi. Default reports
+ * are intentionally written to the primary checkout so a
  * disposable worktree cannot lose experiment evidence.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -62,10 +63,26 @@ function findProviderConfig(config, provider) {
   return config?.providers?.[provider];
 }
 
+const ENV_API_KEYS = {
+  anthropic: "ANTHROPIC_API_KEY",
+  deepseek: "DEEPSEEK_API_KEY",
+  google: "GEMINI_API_KEY",
+  "kimi-coding": "KIMI_API_KEY",
+  "zai-coding-cn": "ZAI_CODING_CN_API_KEY",
+  xai: "XAI_API_KEY",
+};
+
 function credentialFor({ provider, model, auth, config }) {
   const authEntry = auth?.[provider];
   if (authEntry?.key) return { value: authEntry.key, kind: "api_key", source: "auth.json" };
-  if (authEntry?.access) return { value: authEntry.access, kind: "oauth", source: "auth.json" };
+  if (authEntry?.access) {
+    if (typeof authEntry.expires === "number" && authEntry.expires <= Date.now()) {
+      return { expired: true, source: "auth.json", reason: "OAuth access token is expired; the provider-specific refresh flow is not replayed by this probe" };
+    }
+    return { value: authEntry.access, kind: "oauth", source: "auth.json" };
+  }
+  const envName = ENV_API_KEYS[provider];
+  if (envName && process.env[envName]?.trim()) return { value: process.env[envName], kind: "api_key", source: `environment:${envName}` };
   const direct = findProviderConfig(config, provider);
   if (direct?.apiKey) return { value: direct.apiKey, kind: "api_key", source: "models.json" };
 
@@ -82,7 +99,9 @@ function credentialFor({ provider, model, auth, config }) {
 
 function headersFor(target) {
   const headers = { "content-type": "application/json", ...(target.model.headers || {}) };
-  if (target.model.api === "anthropic-messages") {
+  if (target.credential.kind === "oauth") {
+    headers.authorization = `Bearer ${target.credential.value}`;
+  } else if (target.model.api === "anthropic-messages") {
     headers["x-api-key"] = target.credential.value;
     headers["anthropic-version"] = "2023-06-01";
   } else {
@@ -362,6 +381,11 @@ function markdown(results, rawPath, startedAt) {
     const distribution = Object.entries(C.distribution).filter(([, count]) => count).map(([kind, count]) => `${kind}: ${count}`).join(", ") || "none";
     lines.push(`| ${label} | ${a} | ${b} | ${uplift} | ${pct(C.batchRate)} | ${distribution}; errors: ${C.errors} | ${interpretation(item)} |`);
   }
+  const supplemental = results.filter((item) => item.supplementalAt);
+  if (supplemental.length) {
+    lines.push("", "## Supplemental credential recheck", "");
+    for (const item of supplemental) lines.push(`- ${item.provider}/${item.model}: ${item.supplementalAt} (${item.credentialSource ?? item.reason ?? "no credential source"}).`);
+  }
   lines.push("", "## Method notes", "", "- ‘Multi-call’ means the first model response contained two or more tool calls. City coverage is the mean number of Paris/Tokyo/New York calls in that response.", "- The raw JSON stores normalized tool names/arguments, timing, HTTP status, and sanitized errors only. It never stores credentials, request headers, or unredacted provider responses.", `- Raw JSON: \`${rawPath}\`.`, "");
   return lines.join("\n");
 }
@@ -374,7 +398,8 @@ async function main() {
     const model = findModel(store, provider, id);
     if (!model) return { provider, id, skip: "model is not present in models-store.json" };
     const credential = credentialFor({ provider, model, auth, config });
-    if (!credential) return { provider, id, model, skip: "no credential in the three allowed configuration files" };
+    if (!credential) return { provider, id, model, skip: "no credential in auth.json, models.json, or the documented provider environment variable" };
+    if (credential.expired) return { provider, id, model, skip: credential.reason };
     return { provider, id, model, credential, auth };
   });
   if (args.only && !targets.length) throw new Error(`Unknown probe target: ${args.only}`);
@@ -388,7 +413,7 @@ async function main() {
   const results = (resumed?.results || []).filter((item) => !targets.some((target) => target.provider === item.provider && target.id === item.model));
   for (const target of targets) {
     if (target.skip) {
-      results.push({ provider: target.provider, model: target.id, status: "skipped", reason: target.skip });
+      results.push({ provider: target.provider, model: target.id, status: "skipped", reason: target.skip, supplementalAt: startedAt });
       continue;
     }
     console.log(`Probing ${target.provider}/${target.id}…`);
@@ -400,7 +425,7 @@ async function main() {
     const allFailed = records.every((record) => record.status === "error");
     results.push({
       provider: target.provider, model: target.id, api: target.model.api,
-      status: allFailed ? "unavailable" : "completed",
+      status: allFailed ? "unavailable" : "completed", supplementalAt: startedAt,
       ...(allFailed ? { reason: `all ${records.length} requests failed: ${records[0].error}` } : {}),
       credentialSource: target.credential.source,
       records, metrics: { A: summarizeAB(byProbe.A), B: summarizeAB(byProbe.B), C: summarizeC(byProbe.C) },
