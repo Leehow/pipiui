@@ -64,7 +64,7 @@ enum ToolSkillSettings {
         }
         defaults.set(Array(ids).sorted(), forKey: disabledToolsKey)
         // Only mirror the live app defaults into Application Support (avoid test suites clobbering).
-        if defaults === UserDefaults.standard {
+        if SharedConfigWriteGuard.mayWriteSharedFile(explicitURL: nil) {
             syncJSONFile(defaults: defaults, fileManager: fileManager)
         }
     }
@@ -82,7 +82,7 @@ enum ToolSkillSettings {
             ids.insert(name)
         }
         defaults.set(Array(ids).sorted(), forKey: disabledSkillsKey)
-        if defaults === UserDefaults.standard {
+        if SharedConfigWriteGuard.mayWriteSharedFile(explicitURL: nil) {
             syncJSONFile(defaults: defaults, fileManager: fileManager)
         }
     }

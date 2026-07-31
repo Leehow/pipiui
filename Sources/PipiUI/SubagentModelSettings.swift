@@ -196,7 +196,7 @@ enum SubagentModelSettings {
         // (they live in UserDefaults) while every dispatch silently falls back to the main
         // model, which is indistinguishable from the feature simply not working. An explicit
         // `to:` is a caller-chosen target and always honoured.
-        guard url != nil || defaults === UserDefaults.standard else { return }
+        guard SharedConfigWriteGuard.mayWriteSharedFile(explicitURL: url) else { return }
         let payload = map.map(encodeForDefaults) ?? serializedPayload(defaults: defaults)
         let target = url ?? overridesFileURL(fileManager: fileManager)
         let dir = target.deletingLastPathComponent()

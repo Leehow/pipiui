@@ -170,4 +170,30 @@ final class WebSearchSettingsTests: XCTestCase {
         // The old wording forbade the tool outright, leaving no way back.
         XCTAssertFalse(source.contains("Use your built-in search capability directly instead of this tool."))
     }
+
+    /// The user picks Tavily; a suite mirrors its own unset (therefore default) backend over
+    /// the shared file; every search silently runs on DuckDuckGo while Settings still shows
+    /// Tavily, because the selection lives in UserDefaults and only the mirror was reset.
+    func testOnlyLiveAppDefaultsMayWriteTheSharedSearchConfig() throws {
+        let suite = "pipiui.test.websearch-guard.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let shared = WebSearchSettings.configFileURL()
+        let before = try? Data(contentsOf: shared)
+
+        WebSearchSettings.setBackend("duckduckgo", defaults: defaults)
+        WebSearchSettings.syncJSONFile(defaults: defaults)
+
+        XCTAssertEqual(before, try? Data(contentsOf: shared),
+                       "a test suite must not rewrite the user's search backend")
+        XCTAssertEqual(WebSearchSettings.backend(defaults: defaults), "duckduckgo",
+                       "the suite still records its own choice; only the shared mirror is withheld")
+
+        let own = FileManager.default.temporaryDirectory
+            .appendingPathComponent("websearch-\(UUID().uuidString).json")
+        addTeardownBlock { try? FileManager.default.removeItem(at: own) }
+        WebSearchSettings.syncJSONFile(defaults: defaults, to: own)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: own.path))
+    }
 }
