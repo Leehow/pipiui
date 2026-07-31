@@ -108,8 +108,7 @@ final class SubagentContinuityTests: XCTestCase {
     /// waits forever on work that is already over, so the silence itself has to be bounded.
     func testHeartbeatBoundsHowLongTheBossCanHearNothing() throws {
         let s = try source()
-        XCTAssertTrue(s.contains("const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;"),
-                      "immediacy is the 30s poll's job now; the heartbeat is only the backstop, so 5min not 15min")
+        XCTAssertTrue(s.contains("const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;"))
         XCTAssertTrue(s.contains("if (runningAgents.size === 0) return;"),
                       "an idle session must stay silent; a heartbeat costs the boss a turn")
         XCTAssertTrue(s.contains("[subagent-heartbeat] outstanding="))
