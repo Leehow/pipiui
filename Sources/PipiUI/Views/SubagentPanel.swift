@@ -598,7 +598,7 @@ private struct AgentDetailView: View {
             // One task owns the complete settle sequence. Log/output bursts and the
             // two activation notifications coalesce into this bounded sequence.
             await Task.yield()
-            let settleDelays: [UInt64] = [0, 50_000_000, 150_000_000]
+            let settleDelays: [UInt64] = [0, 50_000_000, 150_000_000, 350_000_000, 700_000_000, 1_200_000_000]
             for delay in settleDelays {
                 if delay > 0 {
                     try? await Task.sleep(nanoseconds: delay)
@@ -825,7 +825,12 @@ private struct AgentLogRow: View {
                 .onTapGesture { expanded.toggle() }
         default:
             VStack(alignment: .leading, spacing: 6) {
-                MarkdownTextView(text: item.text)
+                MarkdownTextView(
+                    text: item.text,
+                    lineLimit: expanded ? nil : 3
+                )
+                .contentShape(Rectangle())
+                .onTapGesture { expanded.toggle() }
                 let cards = DocumentReferenceScanner.references(in: item.text, base: base)
                 if !cards.isEmpty {
                     DocumentFileCardStack(references: cards)

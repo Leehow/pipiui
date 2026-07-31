@@ -6,6 +6,7 @@ import SwiftUI
 /// Absolute file paths in prose become clickable (not inside fenced code).
 struct MarkdownTextView: View {
     let text: String
+    var lineLimit: Int? = nil
     var onFlash: ((String) -> Void)? = nil
     @Environment(\.chatTypography) private var chatTypography
     /// 文档路径 ⌘+点击 → 右侧文档面板（ChatDetailView 注入；nil 时回退访达显示）。
@@ -21,6 +22,7 @@ struct MarkdownTextView: View {
                 typography: chatTypography
             ),
             bodyFont: chatTypography.bodyNSFont,
+            maximumNumberOfLines: lineLimit,
             onOpenDocument: openDocument,
             onFlash: onFlash
         )
@@ -499,6 +501,7 @@ enum MarkdownSelectionContent {
 private struct SelectableMarkdownTextView: NSViewRepresentable {
     let attributedText: NSAttributedString
     let bodyFont: NSFont
+    var maximumNumberOfLines: Int? = nil
     var onOpenDocument: ((URL) -> Void)? = nil
     var onFlash: ((String) -> Void)? = nil
 
@@ -514,13 +517,27 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.autoresizingMask = [.width]
         applyContent(to: textView)
+        applyLineLimit(to: textView)
         applyWire(to: textView)
         return textView
     }
 
     func updateNSView(_ textView: NSTextView, context: Context) {
         applyContent(to: textView)
+        applyLineLimit(to: textView)
         applyWire(to: textView)
+
+        guard let container = textView.textContainer,
+              textView.bounds.width > 0 else {
+            return
+        }
+        if MarkdownLayoutSizing.updateContainerIfNeeded(
+            container,
+            proposedWidth: textView.bounds.width,
+            backingScale: backingScale(for: textView)
+        ) {
+            textView.invalidateIntrinsicContentSize()
+        }
     }
 
     private func applyWire(to textView: NSTextView) {
@@ -532,14 +549,10 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
     func sizeThatFits(_ proposal: ProposedViewSize, nsView textView: NSTextView, context: Context) -> CGSize? {
         guard let width = proposal.width, width > 0 else { return nil }
         let container = textView.textContainer!
-        let scale =
-            textView.window?.backingScaleFactor
-            ?? NSScreen.main?.backingScaleFactor
-            ?? 2
         MarkdownLayoutSizing.updateContainerIfNeeded(
             container,
-            proposedWidth: width,
-            backingScale: scale
+            proposedWidth: max(width, MarkdownLayoutSizing.minimumMeasurementWidth),
+            backingScale: backingScale(for: textView)
         )
         textView.layoutManager?.ensureLayout(for: container)
         let used = textView.layoutManager?.usedRect(for: container) ?? .zero
@@ -552,9 +565,26 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
         textView.textColor = .labelColor
         textView.textStorage?.setAttributedString(attributedText)
     }
+
+    private func applyLineLimit(to textView: NSTextView) {
+        guard let container = textView.textContainer else { return }
+        let limit = max(0, maximumNumberOfLines ?? 0)
+        guard container.maximumNumberOfLines != limit else { return }
+        container.maximumNumberOfLines = limit
+        container.lineBreakMode = limit > 0 ? .byTruncatingTail : .byWordWrapping
+    }
+
+    private func backingScale(for textView: NSTextView) -> CGFloat {
+        textView.window?.backingScaleFactor
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 2
+    }
 }
 
 enum MarkdownLayoutSizing {
+    /// Reject transient near-zero SwiftUI proposals during the first layout pass.
+    static let minimumMeasurementWidth: CGFloat = 120
+
     static func normalizedWidth(
         _ width: CGFloat,
         backingScale: CGFloat
