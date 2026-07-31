@@ -398,14 +398,28 @@ export default function (pi: ExtensionAPI) {
       max_results: Type.Optional(
         Type.Number({ description: "Maximum number of results to return (default 5, max 10)." }),
       ),
+      force: Type.Optional(
+        Type.Boolean({
+          description:
+            "Run this tool even if your model is expected to have native search. Set it when a first call came back skipped and you have no working built-in search — that expectation is a guess from the model name and it can be wrong.",
+        }),
+      ),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      // Gate: skip if model has native search
+      // Gate: skip when the model is expected to carry native search, so a redundant generic
+      // search is not paid for. The expectation is inferred from the provider and model name,
+      // which is a guess: a relay that fronts grok or codex matches the name while the hosted
+      // tools that would serve the search are not actually loaded. So the skip must never be
+      // final — a caller that finds it has no built-in search retries with force and gets a
+      // real answer, turning a wrong guess into one wasted round-trip rather than a worker with
+      // no search at all that was told it had one.
       const model = ctx.model as { provider?: string; id?: string } | undefined;
-      if (hasNativeSearch(model)) {
+      if (hasNativeSearch(model) && !params.force) {
         return text(
-          "web_search skipped: the current model has native server-side web search. " +
-          "Use your built-in search capability directly instead of this tool.",
+          "web_search skipped: this model is expected to have native server-side web search, " +
+          "so use your built-in search first. That expectation is inferred from the model name " +
+          "and can be wrong — if you have no working built-in search, call web_search again " +
+          "with force: true and this tool will run.",
           true,
         );
       }

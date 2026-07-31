@@ -150,4 +150,24 @@ final class WebSearchSettingsTests: XCTestCase {
                       "the guard must require BOTH no links AND a challenge marker")
         XCTAssertTrue(source.contains("No results found for:"))
     }
+
+    /// Native-search detection is a guess from the provider and model name. A relay that fronts
+    /// grok or codex matches the name while the hosted tools are not loaded, so the model is
+    /// told "use your built-in search" when it has none — and with a hard skip that leaves a
+    /// worker with no search at all. The skip must therefore be recoverable.
+    func testNativeSearchSkipIsRecoverableSoAWrongGuessIsNotFatal() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-ws-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let path = try XCTUnwrap(WebSearchExtension.install(into: dir))
+        let source = try String(contentsOfFile: path, encoding: .utf8)
+
+        XCTAssertTrue(source.contains("hasNativeSearch(model) && !params.force"),
+                      "force must bypass the guess")
+        XCTAssertTrue(source.contains("force: Type.Optional("), "the escape has to be callable")
+        XCTAssertTrue(source.contains("call web_search again"),
+                      "the skip message must tell the caller how to recover")
+        // The old wording forbade the tool outright, leaving no way back.
+        XCTAssertFalse(source.contains("Use your built-in search capability directly instead of this tool."))
+    }
 }
