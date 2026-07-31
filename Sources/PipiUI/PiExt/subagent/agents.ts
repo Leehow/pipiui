@@ -44,18 +44,31 @@ export interface AgentConfig {
 	traits: AgentTraits;
 }
 
-/** Frontmatter is untyped text; anything but an explicit truthy word is the safe default. */
-function flag(raw: string | undefined): boolean {
-	const v = raw?.trim().toLowerCase();
+/**
+ * Frontmatter is real YAML, not a string map: pi parses it with the `yaml` package, so
+ * `read-only: true` arrives as a boolean and `depth: 2` as a number. Every field is therefore
+ * read through a coercion here rather than trusted to be a string — a lesson learned the hard
+ * way, since the old `Record<string, string>` annotation made the compiler vouch for a shape
+ * the runtime never produced, and `read-only: true` crashed every agent that declared it.
+ */
+function str(raw: unknown): string | undefined {
+	return typeof raw === "string" ? raw : undefined;
+}
+
+/** Anything but an explicit truthy value is the safe default. */
+function flag(raw: unknown): boolean {
+	if (typeof raw === "boolean") return raw;
+	if (typeof raw === "number") return raw === 1;
+	const v = str(raw)?.trim().toLowerCase();
 	return v === "true" || v === "yes" || v === "1";
 }
 
-export function parseAgentTraits(frontmatter: Record<string, string>): AgentTraits {
+export function parseAgentTraits(frontmatter: Record<string, unknown>): AgentTraits {
 	return {
 		readOnly: flag(frontmatter["read-only"]),
 		delegates: flag(frontmatter.delegates),
 		blockSkillReads: flag(frontmatter["block-skill-reads"]),
-		reportsInFull: frontmatter.deliverable?.trim().toLowerCase() === "report",
+		reportsInFull: str(frontmatter.deliverable)?.trim().toLowerCase() === "report",
 	};
 }
 
@@ -90,22 +103,24 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+		const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
 
-		if (!frontmatter.name || !frontmatter.description) {
+		const name = str(frontmatter.name);
+		const description = str(frontmatter.description);
+		if (!name || !description) {
 			continue;
 		}
 
-		const tools = frontmatter.tools
+		const tools = str(frontmatter.tools)
 			?.split(",")
 			.map((t: string) => t.trim())
 			.filter(Boolean);
 
 		agents.push({
-			name: frontmatter.name,
-			description: frontmatter.description,
+			name,
+			description,
 			tools: tools && tools.length > 0 ? tools : undefined,
-			model: frontmatter.model,
+			model: str(frontmatter.model),
 			systemPrompt: body,
 			source,
 			filePath,

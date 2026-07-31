@@ -243,6 +243,22 @@ final class SubagentContinuityTests: XCTestCase {
                        "the blanket permission to search personally is what this replaced")
     }
 
+    /// pi parses agent frontmatter as real YAML, so `read-only: true` arrives as a boolean.
+    /// The old `Record<string, string>` annotation made the compiler vouch for a shape the
+    /// runtime never produced, and `raw?.trim()` then threw for every agent declaring a flag —
+    /// explore, plan, reviewer and lead were all un-dispatchable while general-purpose worked.
+    func testAgentFrontmatterIsCoercedNotAssumedToBeStrings() throws {
+        let bundled = try XCTUnwrap(PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil))
+        let s = try String(
+            contentsOf: bundled.appendingPathComponent("subagent/agents.ts"), encoding: .utf8)
+        XCTAssertTrue(s.contains("function flag(raw: unknown): boolean"))
+        XCTAssertTrue(s.contains(#"if (typeof raw === "boolean") return raw;"#))
+        XCTAssertTrue(s.contains("function str(raw: unknown): string | undefined"))
+        XCTAssertTrue(s.contains("parseFrontmatter<Record<string, unknown>>(content)"),
+                      "the annotation must not claim every value is a string")
+        XCTAssertFalse(s.contains("function flag(raw: string | undefined)"))
+    }
+
     /// The philosophy has to teach the boss to use the mechanism, or nobody names anything.
     func testOrchestrationLayerTeachesNamedVerticalSlices() throws {
         let t = try PhilosophyLayerFixture.normalizedBody("orchestration")
