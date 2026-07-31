@@ -160,7 +160,9 @@ enum SubagentModelSettings {
             )
         }
         defaults.set(encodeForDefaults(map), forKey: defaultsKey)
-        syncJSONFile(map: map, fileManager: fileManager, to: url)
+        // Pass `defaults` through: without it the mirror runs as if it were the live app and a
+        // test suite's overrides land in the user's real file.
+        syncJSONFile(map: map, defaults: defaults, fileManager: fileManager, to: url)
     }
 
     /// Resolve the model id that should be used for `agentName`.
@@ -189,6 +191,12 @@ enum SubagentModelSettings {
         fileManager: FileManager = .default,
         to url: URL? = nil
     ) {
+        // Only the live app may write the shared file. A suite that mirrors its own overrides
+        // there wipes the user's real subagent models — the settings panel keeps showing them
+        // (they live in UserDefaults) while every dispatch silently falls back to the main
+        // model, which is indistinguishable from the feature simply not working. An explicit
+        // `to:` is a caller-chosen target and always honoured.
+        guard url != nil || defaults === UserDefaults.standard else { return }
         let payload = map.map(encodeForDefaults) ?? serializedPayload(defaults: defaults)
         let target = url ?? overridesFileURL(fileManager: fileManager)
         let dir = target.deletingLastPathComponent()
