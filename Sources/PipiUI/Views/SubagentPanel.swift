@@ -838,7 +838,40 @@ private struct AgentLogRow: View {
         ToolCallSummary.summarize(name: item.name, argsJSON: item.text).summary
     }
 
+    private var editFilePresentation: FileChangeFilePresentation? {
+        guard item.name == "edit",
+              let data = item.text.data(using: .utf8),
+              let arguments = J.parse(data),
+              let payload = FileChangePayload.parse(toolName: "edit", arguments: arguments)
+        else {
+            return nil
+        }
+        let callID = "subagent-edit-\(item.id)"
+        let call = ToolCallBlock(
+            id: callID,
+            name: "edit",
+            argsSummary: payload.path,
+            fileChangePayload: payload
+        )
+        // Reuse the main transcript's FileChangeGroupPresentation and lineDiff
+        // accounting so the +/− totals and line hunks cannot drift.
+        return FileChangeGroupPresentation.make(
+            blocks: [.toolCall(call)],
+            toolRuns: [callID: ToolRun()],
+            projectURL: nil
+        ).files.first
+    }
+
+    @ViewBuilder
     private var toolRow: some View {
+        if let file = editFilePresentation {
+            editToolRow(file)
+        } else {
+            genericToolRow
+        }
+    }
+
+    private var genericToolRow: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 Image(systemName: "wrench.and.screwdriver")
@@ -877,5 +910,107 @@ private struct AgentLogRow: View {
             }
         }
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.blue.opacity(0.06)))
+    }
+
+    private func editToolRow(_ file: FileChangeFilePresentation) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "pencil.line")
+                    .font(.caption2)
+                    .foregroundStyle(.blue)
+                Text("edit")
+                    .font(.caption.weight(.semibold).monospaced())
+                Text(file.displayPath)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("+\(file.additions)")
+                    .foregroundStyle(.green)
+                Text("−\(file.deletions)")
+                    .foregroundStyle(.red)
+                Spacer(minLength: 0)
+                Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .font(.caption.monospacedDigit().weight(.medium))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+            .onTapGesture { expanded.toggle() }
+            .pointingHandCursor(true)
+
+            if expanded {
+                Divider()
+                if let message = file.qualityMessage {
+                    Label(message, systemImage: "info.circle")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(8)
+                }
+                if file.lines.isEmpty {
+                    Text("没有行级变化")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(8)
+                } else {
+                    ScrollView(.horizontal) {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(file.lines) { line in
+                                editDiffLine(line)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 260)
+                }
+            }
+        }
+        .textSelection(.enabled)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.blue.opacity(0.06)))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("编辑 \(file.displayPath)，新增 \(file.additions) 行，删除 \(file.deletions) 行")
+    }
+
+    private func editDiffLine(_ line: FileChangeDiffLine) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
+            Text(line.oldLineNumber.map(String.init) ?? "")
+                .frame(width: 30, alignment: .trailing)
+            Text(line.newLineNumber.map(String.init) ?? "")
+                .frame(width: 30, alignment: .trailing)
+            Text(editDiffMarker(line.kind))
+                .frame(width: 18)
+            Text(line.text.isEmpty ? " " : line.text)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .font(.caption2.monospaced())
+        .foregroundStyle(editDiffForeground(line.kind))
+        .padding(.vertical, 1)
+        .padding(.trailing, 8)
+        .background(editDiffBackground(line.kind))
+    }
+
+    private func editDiffMarker(_ kind: FileChangeDiffLine.Kind) -> String {
+        switch kind {
+        case .addition: return "+"
+        case .deletion: return "−"
+        case .separator: return ""
+        }
+    }
+
+    private func editDiffForeground(_ kind: FileChangeDiffLine.Kind) -> Color {
+        switch kind {
+        case .addition: return .green
+        case .deletion: return .red
+        case .separator: return .secondary
+        }
+    }
+
+    private func editDiffBackground(_ kind: FileChangeDiffLine.Kind) -> Color {
+        switch kind {
+        case .addition: return Color.green.opacity(0.09)
+        case .deletion: return Color.red.opacity(0.09)
+        case .separator: return Color.secondary.opacity(0.06)
+        }
     }
 }
