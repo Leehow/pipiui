@@ -66,6 +66,9 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
     var cost: Double = 0
     var turns = 0
     var started = Date()
+    /// Most recent bridge event observed by the UI for this agent. This is a UI-side
+    /// liveness hint only; it cannot prove that the subagent process has stopped.
+    var lastObservedAt = Date()
     var ended: Date?
     /// 扩展 stall watchdog 上报：120s+ 无任何流式事件。恢复活动后自动解除。
     var stalled: Bool = false
@@ -138,7 +141,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, parentId, toolCallId, name, task, title, depth, model
-        case state, output, activity, log, cost, turns, started, ended
+        case state, output, activity, log, cost, turns, started, lastObservedAt, ended
         case stalled, stalledIdleSec
         case worktreePath, worktreeBranch, worktreeError, worktreeLifecycle
         case verifyCommand, verifyExit
@@ -163,6 +166,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         cost: Double = 0,
         turns: Int = 0,
         started: Date = Date(),
+        lastObservedAt: Date? = nil,
         ended: Date? = nil,
         stalled: Bool = false,
         stalledIdleSec: Int = 0,
@@ -196,6 +200,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         self.cost = cost
         self.turns = turns
         self.started = started
+        self.lastObservedAt = lastObservedAt ?? started
         self.ended = ended
         self.stalled = stalled
         self.stalledIdleSec = stalledIdleSec
@@ -232,6 +237,9 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         cost = try c.decodeIfPresent(Double.self, forKey: .cost) ?? 0
         turns = try c.decodeIfPresent(Int.self, forKey: .turns) ?? 0
         started = try c.decodeIfPresent(Date.self, forKey: .started) ?? Date()
+        // Older persisted snapshots predate this UI-only observation field. Their
+        // known start time is the safest conservative baseline for the watchdog.
+        lastObservedAt = try c.decodeIfPresent(Date.self, forKey: .lastObservedAt) ?? started
         ended = try c.decodeIfPresent(Date.self, forKey: .ended)
         stalled = try c.decodeIfPresent(Bool.self, forKey: .stalled) ?? false
         stalledIdleSec = try c.decodeIfPresent(Int.self, forKey: .stalledIdleSec) ?? 0
@@ -275,6 +283,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         try c.encode(cost, forKey: .cost)
         try c.encode(turns, forKey: .turns)
         try c.encode(started, forKey: .started)
+        try c.encode(lastObservedAt, forKey: .lastObservedAt)
         try c.encodeIfPresent(ended, forKey: .ended)
         try c.encode(stalled, forKey: .stalled)
         try c.encode(stalledIdleSec, forKey: .stalledIdleSec)
@@ -332,6 +341,39 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         case .none:
             return false
         }
+    }
+}
+
+/// UI-only fallback for a missing subagent status channel. It deliberately reports
+/// uncertainty rather than inferring that a worker died.
+enum SubagentWatchdog {
+    static let staleThreshold: TimeInterval = 10 * 60
+
+    static func staleAgentIDs(
+        in agents: [SubagentInfo],
+        now: Date,
+        threshold: TimeInterval = staleThreshold
+    ) -> [String] {
+        agents.compactMap { agent in
+            guard agent.state == .running,
+                  now.timeIntervalSince(agent.lastObservedAt) >= threshold else {
+                return nil
+            }
+            return agent.id
+        }
+    }
+}
+
+/// The UI sends this only after a person clicks the watchdog warning. Keep the
+/// request narrowly scoped so a status check cannot be mistaken for work authority.
+enum SubagentStatusCheckPrompt {
+    static func make(agentIDs: [String]) -> String {
+        let exactIDs = agentIDs.map { "`\($0)`" }.joined(separator: "、")
+        return """
+        这是用户在界面主动发起的仅状态检查。请先且只针对以下确切 agentId 调用 `subagent_status`：\(exactIDs)。
+
+        不要自动重新派发任何 subagent；不要修改文件、搜索项目，或执行其他工具/操作。若状态通道不可用或无法确认，请直接清楚报告“状态不可确认”。
+        """
     }
 }
 
@@ -790,6 +832,12 @@ final class SubagentStore: ObservableObject {
         agents.reduce(0) { $0 + $1.cost }
     }
 
+    /// Running agents whose UI bridge observation has been silent for the
+    /// conservative watchdog window. `now` is injectable for deterministic tests.
+    func staleRunningAgentIDs(now: Date = Date()) -> [String] {
+        SubagentWatchdog.staleAgentIDs(in: agents, now: now)
+    }
+
     /// 打开 Subagents 面板时选中最近启动的 agent；不会在面板已打开时抢走用户的手动选择。
     func selectLatest() {
         selectedId = agents.max(by: { $0.started < $1.started })?.id
@@ -811,14 +859,25 @@ final class SubagentStore: ObservableObject {
         agents[index].stalledIdleSec = 0
     }
 
-    func handle(_ e: J) {
+    private func markObserved(_ index: Int, at date: Date) {
+        agents[index].lastObservedAt = date
+    }
+
+    func handle(_ e: J, observedAt: Date = Date()) {
         guard let id = e["agentId"].string, !id.isEmpty else { return }
+        let kind = e["kind"].string ?? ""
+        // For every event tied to an existing agent, record that the UI-side
+        // status channel itself is still delivering. `start` also covers a new row.
+        if kind != "start", let i = agents.firstIndex(where: { $0.id == id }) {
+            markObserved(i, at: observedAt)
+        }
         var runningCountMayHaveChanged = false
-        switch e["kind"].string ?? "" {
+        switch kind {
         case "start":
             runningCountMayHaveChanged = true
             // Same agentId may resume (续作) after end — refresh running state + worktree meta.
             if let i = agents.firstIndex(where: { $0.id == id }) {
+                markObserved(i, at: observedAt)
                 agents[i].state = .running
                 agents[i].activity = ""
                 clearStalled(i)
@@ -848,7 +907,9 @@ final class SubagentStore: ObservableObject {
                 task: e["task"].string ?? "",
                 title: e["title"].string,
                 depth: max(1, e["depth"].int ?? 1),
-                model: e["model"].string
+                model: e["model"].string,
+                started: observedAt,
+                lastObservedAt: observedAt
             )
             info.worktreePath = e["worktreePath"].string
             info.worktreeBranch = e["worktreeBranch"].string
@@ -934,7 +995,7 @@ final class SubagentStore: ObservableObject {
             agents[i].activity = ""
             agents[i].cost = e["cost"].double ?? agents[i].cost
             agents[i].turns = e["turns"].int ?? agents[i].turns
-            agents[i].ended = Date()
+            agents[i].ended = observedAt
             if let path = e["worktreePath"].string { agents[i].worktreePath = path }
             if let branch = e["worktreeBranch"].string { agents[i].worktreeBranch = branch }
             if let err = e["worktreeError"].string { agents[i].worktreeError = err }

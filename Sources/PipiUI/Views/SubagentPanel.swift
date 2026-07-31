@@ -8,11 +8,16 @@ struct SubagentPanel: View {
     var projectURL: URL
     /// 中止运行中 agent（ChatSession.abortSubagent → /subagent_abort RPC）。
     var onAbort: (String) -> Void
+    /// UI-only recovery action for agents whose normal status observations went silent.
+    var onManualStatusCheck: ([String]) -> Void
     var onClose: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
             header
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                statusChannelWarning(at: context.date)
+            }
             Divider()
             if store.agents.isEmpty {
                 emptyHint
@@ -61,6 +66,37 @@ struct SubagentPanel: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private func statusChannelWarning(at now: Date) -> some View {
+        let staleAgentIDs = store.staleRunningAgentIDs(now: now)
+        if !staleAgentIDs.isEmpty {
+            HStack(alignment: .center, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(statusChannelWarningText(for: staleAgentIDs))
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                Button("手动检查") {
+                    onManualStatusCheck(staleAgentIDs)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("向主会话发出用户主动的状态查询；不会自动重新派发 agent")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(Color.orange.opacity(0.12))
+        }
+    }
+
+    private func statusChannelWarningText(for staleAgentIDs: [String]) -> String {
+        let visibleIDs = staleAgentIDs.prefix(3).joined(separator: "、")
+        let suffix = staleAgentIDs.count > 3 ? " 等" : ""
+        return "\(staleAgentIDs.count) 个子代理（\(visibleIDs)\(suffix)）超过 10 分钟未收到状态更新；自动状态通道可能不可用，暂时无法确认状态。"
     }
 
     private var emptyHint: some View {

@@ -258,7 +258,10 @@ private struct ChatDetailViewBody: View {
                 SubagentPanel(
                     store: session.subagents,
                     projectURL: session.projectURL,
-                    onAbort: { agentId in session.abortSubagent(agentId) }
+                    onAbort: { agentId in session.abortSubagent(agentId) },
+                    onManualStatusCheck: { agentIDs in
+                        requestManualSubagentStatusCheck(agentIDs)
+                    }
                 ) {
                     session.rightPanel = nil
                 }
@@ -722,6 +725,13 @@ private struct ChatDetailViewBody: View {
     private func selectAgent(_ id: String) {
         session.subagents.selectedId = id
         session.rightPanel = .agents
+    }
+
+    /// User-clicked UI fallback for a potentially unavailable automatic status channel.
+    /// This is deliberately a normal prompt, not a direct process probe from the UI.
+    private func requestManualSubagentStatusCheck(_ agentIDs: [String]) {
+        guard !agentIDs.isEmpty else { return }
+        session.sendPrompt(SubagentStatusCheckPrompt.make(agentIDs: agentIDs))
     }
 
     private func presentFinishedGroup(
