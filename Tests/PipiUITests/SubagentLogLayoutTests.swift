@@ -46,7 +46,27 @@ final class SubagentLogLayoutTests: XCTestCase {
                 .item(thinking),
                 .toolGroup([grep, grepResult]),
                 .item(text),
-                .toolGroup([edit, editResult]),
+                .item(edit),
+                .item(editResult),
+            ]
+        )
+    }
+
+    func testEditDoesNotBreakGroupingAroundOrdinaryTools() {
+        let read = item(1, "tool", name: "read")
+        let readResult = item(2, "toolResult")
+        let edit = item(3, "tool", name: "edit")
+        let editResult = item(4, "toolResult")
+        let grep = item(5, "tool", name: "grep")
+        let grepResult = item(6, "toolResult")
+
+        XCTAssertEqual(
+            SubagentLogLayout.plan([read, readResult, edit, editResult, grep, grepResult]),
+            [
+                .toolGroup([read, readResult]),
+                .item(edit),
+                .item(editResult),
+                .toolGroup([grep, grepResult]),
             ]
         )
     }

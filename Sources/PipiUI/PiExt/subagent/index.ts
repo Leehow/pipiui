@@ -192,6 +192,68 @@ function formatUsageStats(
 }
 
 /** Plain summary for PipiUI bridge (no theme codes) — matches main-agent ToolCallSummary. */
+const PIPIUI_EDIT_PAYLOAD_LIMIT = 20_000;
+
+/**
+ * Keep enough edit arguments for the native log to render a diff, while ensuring
+ * the bridge never retains an unbounded tool payload. Every returned value is
+ * complete JSON: oversized replacements are shortened or omitted as whole items.
+ */
+function boundedEditPayloadForUI(args: Record<string, unknown>): string {
+	const rawPath = String(args.path ?? args.file_path ?? "");
+	let path = rawPath;
+	while (JSON.stringify({ path }).length > PIPIUI_EDIT_PAYLOAD_LIMIT && path.length > 0) {
+		path = path.slice(0, Math.max(0, path.length - Math.ceil(path.length / 4)));
+	}
+
+	const source = Array.isArray(args.edits)
+		? args.edits
+		: [{ oldText: args.oldText, newText: args.newText }];
+	const edits = source.flatMap((value) => {
+		if (!value || typeof value !== "object") return [];
+		const edit = value as Record<string, unknown>;
+		return typeof edit.oldText === "string" && typeof edit.newText === "string"
+			? [{ oldText: edit.oldText, newText: edit.newText }]
+			: [];
+	});
+
+	const retained: Array<{ oldText: string; newText: string }> = [];
+	for (const edit of edits) {
+		const full = [...retained, edit];
+		if (JSON.stringify({ path, edits: full }).length <= PIPIUI_EDIT_PAYLOAD_LIMIT) {
+			retained.push(edit);
+			continue;
+		}
+
+		// Retain as much of the first overflowing replacement as fits, without
+		// ever slicing serialized JSON (which would corrupt escaping/structure).
+		if (JSON.stringify({ path, edits: [...retained, { oldText: "", newText: "" }] }).length
+			> PIPIUI_EDIT_PAYLOAD_LIMIT) break;
+		let low = 0;
+		let high = edit.oldText.length + edit.newText.length;
+		while (low < high) {
+			const count = Math.ceil((low + high + 1) / 2);
+			const oldCount = Math.min(edit.oldText.length, count);
+			const candidate = {
+				oldText: edit.oldText.slice(0, oldCount),
+				newText: edit.newText.slice(0, Math.max(0, count - oldCount)),
+			};
+			if (JSON.stringify({ path, edits: [...retained, candidate] }).length <= PIPIUI_EDIT_PAYLOAD_LIMIT) {
+				low = count;
+			} else {
+				high = count - 1;
+			}
+		}
+		const oldCount = Math.min(edit.oldText.length, low);
+		retained.push({
+			oldText: edit.oldText.slice(0, oldCount),
+			newText: edit.newText.slice(0, Math.max(0, low - oldCount)),
+		});
+		break;
+	}
+	return JSON.stringify(retained.length > 0 ? { path, edits: retained } : { path });
+}
+
 function summarizeToolArgsForUI(toolName: string, args: Record<string, unknown>): string {
 	const pathOf = () => String(args.file_path || args.path || "…");
 	switch (toolName) {
@@ -2145,8 +2207,11 @@ async function runSingleAgent(
 								const args = (part.arguments ?? {}) as Record<string, unknown>;
 								const summary = summarizeToolArgsForUI(String(part.name ?? ""), args);
 								pipiuiActivity = `${part.name} ${summary}`;
-								// Send human summary (path/command), not truncated JSON — matches main agent.
-								pipiuiItems.push({ itemType: "tool", name: part.name, text: summary });
+								// Edit keeps a bounded, valid JSON payload so the native subagent log can
+								// render the same line diff as the main-agent transcript. Other tools
+								// retain their compact human-readable summary.
+								const text = part.name === "edit" ? boundedEditPayloadForUI(args) : summary;
+								pipiuiItems.push({ itemType: "tool", name: part.name, text });
 							} else if (part?.type === "text" && String(part.text ?? "").trim()) {
 								pipiuiItems.push({ itemType: "text", text: String(part.text).slice(0, 4000) });
 							} else if (part?.type === "thinking" && String(part.thinking ?? "").trim()) {

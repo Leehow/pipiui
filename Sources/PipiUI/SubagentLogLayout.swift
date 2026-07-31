@@ -36,6 +36,10 @@ enum SubagentLogLayout {
 
         for item in items {
             switch item.kind {
+            case "tool" where item.name == "edit":
+                // Edits stay visible so their inline diff is never hidden in a tool group.
+                flushPending()
+                result.append(.item(item))
             case "tool":
                 pendingTools.append(item)
             case "toolResult" where pendingTools.last?.kind == "tool":
