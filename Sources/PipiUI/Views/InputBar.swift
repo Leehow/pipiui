@@ -579,6 +579,10 @@ struct ComposerTextView: NSViewRepresentable {
 
         private var boundSessionIdentity: ObjectIdentifier
         private var pendingExternalText: String?
+        /// The last value coordinated between AppKit and the SwiftUI binding. While an
+        /// IME owns marked text, a matching binding value is a stale render echo, not
+        /// an external draft replacement.
+        private var lastKnownText: String
         private var pendingHeight: CGFloat?
         private var pendingTextApplicationScheduled = false
         private var focusRequestScheduled = false
@@ -596,6 +600,7 @@ struct ComposerTextView: NSViewRepresentable {
         init(parent: ComposerTextView) {
             self.parent = parent
             boundSessionIdentity = parent.sessionIdentity
+            lastKnownText = parent.text
             super.init()
             composerUndoManager.onUndoOrRedo = { [weak self] in
                 self?.synchronizeAfterUndoOrRedo()
@@ -619,15 +624,25 @@ struct ComposerTextView: NSViewRepresentable {
                 host.textView.inputContext?.discardMarkedText()
                 apply(parent.text, to: host.textView, moveCursorToEnd: true)
                 applyingProgrammaticText = false
+                lastKnownText = parent.text
             } else if host.textView.string != parent.text {
                 if host.textView.hasMarkedText() {
-                    // SwiftUI may re-render for unrelated state while IME owns a marked
-                    // range. Defer external replacement until composition completes.
-                    pendingExternalText = parent.text
+                    // NSTextView.string includes the IME-owned marked range. A render
+                    // with the text we last synchronized is therefore a stale binding
+                    // echo, not an external replacement; keep the binding current so
+                    // subsequent streaming renders cannot queue that stale value.
+                    if parent.text == lastKnownText {
+                        synchronizeBinding(with: host.textView.string)
+                    } else {
+                        // A different value was written by code while composition is
+                        // active. Preserve it and apply it after the IME commits.
+                        pendingExternalText = parent.text
+                    }
                 } else {
                     let replacement = pendingExternalText ?? parent.text
                     pendingExternalText = nil
                     apply(replacement, to: host.textView, moveCursorToEnd: false)
+                    lastKnownText = replacement
                 }
             }
 
@@ -657,15 +672,17 @@ struct ComposerTextView: NSViewRepresentable {
                   let textView = notification.object as? NSTextView,
                   let host else { return }
 
-            if pendingExternalText != nil {
-                if !textView.hasMarkedText() {
-                    // NSTextView can notify delegates before an IME unmark operation
-                    // finishes mutating storage. Apply on the next run loop so the
-                    // committed marked string cannot overwrite the external update.
-                    schedulePendingTextApplication(on: host)
-                }
-            } else if parent.text != textView.string {
-                parent.text = textView.string
+            // Keep SwiftUI current even during composition. NSTextView.string includes
+            // marked text, and writing it back prevents a high-frequency unrelated
+            // render (such as streaming output) from mistaking an old binding value
+            // for an external replacement.
+            synchronizeBinding(with: textView.string)
+
+            if pendingExternalText != nil, !textView.hasMarkedText() {
+                // NSTextView can notify delegates before an IME unmark operation
+                // finishes mutating storage. Apply on the next run loop so the
+                // committed marked string cannot overwrite the external update.
+                schedulePendingTextApplication(on: host)
             }
 
             host.refreshLayout(scrollSelection: true)
@@ -677,10 +694,15 @@ struct ComposerTextView: NSViewRepresentable {
 
         private func synchronizeAfterUndoOrRedo() {
             guard !isDismantled, !applyingProgrammaticText, let host else { return }
-            if parent.text != host.textView.string {
-                parent.text = host.textView.string
-            }
+            synchronizeBinding(with: host.textView.string)
             host.refreshLayout(scrollSelection: true)
+        }
+
+        private func synchronizeBinding(with text: String) {
+            lastKnownText = text
+            if parent.text != text {
+                parent.text = text
+            }
         }
 
         func receiveHeight(_ newHeight: CGFloat) {
@@ -714,9 +736,7 @@ struct ComposerTextView: NSViewRepresentable {
                     to: host.textView,
                     moveCursorToEnd: false
                 )
-                if self.parent.text != pendingExternalText {
-                    self.parent.text = pendingExternalText
-                }
+                self.synchronizeBinding(with: pendingExternalText)
                 host.refreshLayout(scrollSelection: true)
             }
         }

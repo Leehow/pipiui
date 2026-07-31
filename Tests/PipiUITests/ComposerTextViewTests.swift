@@ -166,6 +166,71 @@ final class ComposerTextViewTests: XCTestCase {
         XCTAssertEqual(boundText, "新会话草稿")
     }
 
+    func testStreamingRenderDoesNotQueueStaleBindingDuringMarkedText() {
+        var boundText = ""
+        var isFocused = false
+        var boundHeight = ComposerTextViewLayout.minimumHeight(
+            for: .systemFont(ofSize: NSFont.systemFontSize)
+        )
+        let identity = NSObject()
+
+        func parent() -> ComposerTextView {
+            ComposerTextView(
+                text: Binding(
+                    get: { boundText },
+                    set: { boundText = $0 }
+                ),
+                isFocused: Binding(
+                    get: { isFocused },
+                    set: { isFocused = $0 }
+                ),
+                height: Binding(
+                    get: { boundHeight },
+                    set: { boundHeight = $0 }
+                ),
+                sessionIdentity: ObjectIdentifier(identity),
+                placeholder: "输入将排队，完成后发送…",
+                onSubmit: {}
+            )
+        }
+
+        let coordinator = ComposerTextView.Coordinator(parent: parent())
+        let host = ComposerTextViewHost()
+        host.textView.delegate = coordinator
+        coordinator.host = host
+        coordinator.synchronize(host)
+        let textView = host.textView
+
+        // Simulate an IME composition whose delegate callback has not yet updated
+        // SwiftUI when a streaming-driven updateNSView render arrives.
+        textView.setMarkedText(
+            "ni",
+            selectedRange: NSRange(location: 2, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+        XCTAssertTrue(textView.hasMarkedText())
+        XCTAssertEqual(boundText, "")
+
+        coordinator.parent = parent()
+        coordinator.synchronize(host)
+
+        XCTAssertEqual(boundText, "ni")
+        XCTAssertTrue(textView.hasMarkedText())
+
+        // If synchronize had queued the stale empty binding as an external update,
+        // post-commit processing would replace this committed character with "".
+        textView.insertText(
+            "你",
+            replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+        textView.didChangeText()
+        spinRunLoop()
+
+        XCTAssertFalse(textView.hasMarkedText())
+        XCTAssertEqual(textView.string, "你")
+        XCTAssertEqual(boundText, "你")
+    }
+
     func testReturnSubmitsAndExplicitLineBreakCommandStillInsertsNewline() {
         let textView = ComposerNSTextView(frame: .zero)
         var submitCount = 0
