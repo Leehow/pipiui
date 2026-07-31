@@ -22,6 +22,8 @@ struct SidebarView: View {
     /// Settings sheet is presented from this sidebar (window-local): opening it in
     /// one window never opens settings in another window of the same app.
     @State private var showSettings = false
+    /// Subagent settings are window-local and open directly to the model tab.
+    @State private var showSubagentSettings = false
     /// Remote connection details are also window-local and never alter project
     /// or session selection.
     @State private var showRemoteConnection = false
@@ -123,6 +125,17 @@ struct SidebarView: View {
                         : store.localRemoteStatus
                 )
 
+                Button {
+                    showSubagentSettings = true
+                } label: {
+                    Image(systemName: "person.2")
+                        .font(.body)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(HoverButtonStyle())
+                .help("Subagent 模型")
+                .accessibilityLabel("Subagent 模型")
+
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, Self.sidebarGutter + 2)
@@ -191,6 +204,11 @@ struct SidebarView: View {
         }
         .sheet(isPresented: $showSettings) {
             SettingsSheet()
+                .environmentObject(store)
+                .accessibilityIdentifier("PipiUI.SettingsPanel")
+        }
+        .sheet(isPresented: $showSubagentSettings) {
+            SettingsSheet(initialTab: .subagentModels)
                 .environmentObject(store)
                 .accessibilityIdentifier("PipiUI.SettingsPanel")
         }
