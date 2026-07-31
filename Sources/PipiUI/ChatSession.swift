@@ -613,6 +613,16 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Depends on @Published isStreaming + isSendingFromQueue so observers refresh.
     var isWorking: Bool { isStreaming || isSendingFromQueue }
 
+    /// Wall-clock bounds for the most recently submitted boss turn, including its subagents.
+    @Published private(set) var turnWallClockStartedAt: Date?
+    @Published private(set) var turnWallClockEndedAt: Date?
+
+    var turnCompletionText: String? {
+        guard let startedAt = turnWallClockStartedAt,
+              let endedAt = turnWallClockEndedAt else { return nil }
+        return "\(TurnDurationFormat.completedAt(endedAt))完成，用时\(TurnDurationFormat.elapsed(endedAt.timeIntervalSince(startedAt)))"
+    }
+
     /// Provided by AppStore so settle can skip green when this session is already selected.
     var isSelectedCheck: (() -> Bool)?
 
@@ -1330,6 +1340,7 @@ final class ChatSession: ObservableObject, Identifiable {
             refreshStats()
             syncEntryIds()
             drainQueueIfIdle()
+            syncInFlightMark()
             // Green badge when still idle after drain (no queued follow-up).
             if !isWorking && messageQueue.isEmpty {
                 markUnseenCompletionAfterSuccessfulSettle()
@@ -2520,6 +2531,7 @@ final class ChatSession: ObservableObject, Identifiable {
         }
 
         let prepared = prepareMessage(text: trimmed, images: images)
+        beginTurnWallClock()
 
         // Busy while streaming OR in the gap after drain popped until agent_start.
         if isStreaming || isSendingFromQueue {
@@ -2980,6 +2992,7 @@ final class ChatSession: ObservableObject, Identifiable {
 
     /// Mark / clear interrupted-path badge for main turn **or** running background subagents.
     private func syncInFlightMark() {
+        updateTurnWallClockCompletionIfNeeded()
         if InterruptedSessionStore.shouldPersistMark(
             agentTurnActive: agentTurnActive,
             isWorking: isWorking,
@@ -2989,6 +3002,20 @@ final class ChatSession: ObservableObject, Identifiable {
         } else {
             clearInFlightMark()
         }
+    }
+
+    private func beginTurnWallClock() {
+        turnWallClockStartedAt = Date()
+        turnWallClockEndedAt = nil
+    }
+
+    private func updateTurnWallClockCompletionIfNeeded() {
+        guard turnWallClockStartedAt != nil,
+              turnWallClockEndedAt == nil,
+              !isWorking,
+              messageQueue.isEmpty,
+              subagents.runningCount == 0 else { return }
+        turnWallClockEndedAt = Date()
     }
 
     private func persistInFlightMark() {

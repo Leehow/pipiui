@@ -71,4 +71,10 @@ final class SubagentLogLayoutTests: XCTestCase {
         XCTAssertEqual(DurationFormat.compact(3_600), "1h00m")
         XCTAssertEqual(DurationFormat.compact(3_720), "1h02m")
     }
+
+    func testTurnElapsedDurationBoundaries() {
+        XCTAssertEqual(TurnDurationFormat.elapsed(8), "8s")
+        XCTAssertEqual(TurnDurationFormat.elapsed(187), "3min07s")
+        XCTAssertEqual(TurnDurationFormat.elapsed(81_469), "22h37min49s")
+    }
 }

@@ -292,6 +292,7 @@ struct AssistantSegmentsView: View, Equatable {
     var onOpenFinishedGroup: ((AssistantBlockLayout.FinishedGroupPresentation) -> Void)?
     var entryId: String? = nil
     var isWorking: Bool = false
+    var completionText: String? = nil
     var onCopy: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
     var onJump: (() -> Void)? = nil
@@ -313,6 +314,7 @@ struct AssistantSegmentsView: View, Equatable {
             && lhs.presentationScopeID == rhs.presentationScopeID
             && lhs.entryId == rhs.entryId
             && lhs.isWorking == rhs.isWorking
+            && lhs.completionText == rhs.completionText
             && lhs.collapsedOverride == rhs.collapsedOverride
         // Callbacks intentionally excluded.
     }
@@ -336,6 +338,11 @@ struct AssistantSegmentsView: View, Equatable {
                     onToggleCollapse: showsCollapseAction ? { toggleCollapse() } : nil,
                     onJump: onJump
                 )
+            }
+            if let completionText {
+                Text(completionText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2172,9 +2179,22 @@ private struct FileChangeDiffInspector: View {
     }
 }
 
+struct TurnElapsedText: View {
+    let startedAt: Date
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            Text("已用时 \(TurnDurationFormat.elapsed(context.date.timeIntervalSince(startedAt)))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
 /// 用户已发送、assistant 尚无可展示 block 时的轻量等待提示。
 struct WaitingPlaceholderView: View {
     let message: String
+    var turnStartedAt: Date? = nil
 
     var body: some View {
         HStack(spacing: 8) {
@@ -2183,6 +2203,9 @@ struct WaitingPlaceholderView: View {
             Text(message)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            if let turnStartedAt {
+                TurnElapsedText(startedAt: turnStartedAt)
+            }
         }
         .padding(.vertical, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
