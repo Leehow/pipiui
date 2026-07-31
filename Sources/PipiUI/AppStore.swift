@@ -6,7 +6,55 @@ struct SessionMeta: Identifiable, Hashable {
     let path: String
     let name: String
     let modified: Date
+    /// `provider/modelId` of the latest main-agent model selection in the session file.
+    let modelRef: String?
+
+    init(path: String, name: String, modified: Date, modelRef: String? = nil) {
+        self.path = path
+        self.name = name
+        self.modified = modified
+        self.modelRef = modelRef
+    }
+
     var id: String { path }
+}
+
+/// Extracts the newest main-agent model selection from a pi session JSONL tail.
+enum SessionModelReferenceParser {
+    static func latestModelRef(in jsonlTail: Data) -> String? {
+        guard let text = String(data: jsonlTail, encoding: .utf8) else { return nil }
+
+        // The first line can be truncated because callers read only a tail window.
+        // Work backwards so the first valid model record is the latest selection.
+        for line in text.split(separator: "\n").reversed() {
+            guard let entry = J.parse(Data(line.utf8)),
+                  let type = entry["type"].string,
+                  type == "model_change" || type == "set_model"
+            else {
+                continue
+            }
+
+            let provider = entry["provider"].string ?? entry["model"]["provider"].string
+            let modelId = entry["modelId"].string
+                ?? entry["model"]["modelId"].string
+                ?? entry["model"]["id"].string
+            guard let normalizedProvider = normalized(provider),
+                  let normalizedModelId = normalized(modelId)
+            else {
+                continue
+            }
+            return "\(normalizedProvider)/\(normalizedModelId)"
+        }
+        return nil
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
 }
 
 enum SessionInitialTranscriptSeed {
@@ -1119,9 +1167,9 @@ final class AppStore: ObservableObject {
             .appendingPathComponent(".pi/agent/sessions/--\(escaped)--")
     }
 
-    /// T7: 增量扫描缓存——projectPath → (session 文件路径 → (mtime, name, ephemeral))。
-    /// 只有新增或 mtime 变化的文件才重新读内容解析 name/ephemeral，其余复用上次结果。
-    private var sessionScanCache: [String: [String: (mtime: Date, name: String, ephemeral: Bool)]] = [:]
+    /// T7: 增量扫描缓存——projectPath → (session 文件路径 → (mtime, name, modelRef, ephemeral))。
+    /// 只有新增或 mtime 变化的文件才重新读内容解析元数据，其余复用上次结果。
+    private var sessionScanCache: [String: [String: (mtime: Date, name: String, modelRef: String?, ephemeral: Bool)]] = [:]
     private let sessionScanCacheLock = NSLock()
     /// Projects with at least one completed metadata scan may warm independently.
     private var completedSessionScans: Set<String> = []
@@ -1181,24 +1229,38 @@ final class AppStore: ObservableObject {
                 .filter { $0.pathExtension == "jsonl" } ?? []
             var active: [SessionMeta] = []
             var archivedMetas: [SessionMeta] = []
-            var newCache: [String: (mtime: Date, name: String, ephemeral: Bool)] = [:]
+            var newCache: [String: (mtime: Date, name: String, modelRef: String?, ephemeral: Bool)] = [:]
             newCache.reserveCapacity(files.count)
             for url in files {
                 let path = url.path
                 let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                // 增量：mtime 未变直接复用上次的 name/ephemeral，不重复读文件内容
-                let entry: (name: String, ephemeral: Bool)
+                // 增量：mtime 未变直接复用上次的元数据，不重复读文件内容。
+                let entry: (name: String, modelRef: String?, ephemeral: Bool)
                 if let hit = cachedEntries[path], hit.mtime == mtime {
-                    entry = (hit.name, hit.ephemeral)
+                    entry = (hit.name, hit.modelRef, hit.ephemeral)
                 } else if Self.isEphemeralTitlePromptSession(url) {
-                    entry = ("", true)
+                    entry = ("", nil, true)
                 } else {
-                    entry = (Self.sessionDisplayName(url), false)
+                    entry = (
+                        Self.sessionDisplayName(url),
+                        Self.sessionModelRef(url),
+                        false
+                    )
                 }
-                newCache[path] = (mtime: mtime, name: entry.name, ephemeral: entry.ephemeral)
+                newCache[path] = (
+                    mtime: mtime,
+                    name: entry.name,
+                    modelRef: entry.modelRef,
+                    ephemeral: entry.ephemeral
+                )
                 // Skip orphan side-channel title-gen sessions (pi ran without --no-session).
                 if entry.ephemeral { continue }
-                let meta = SessionMeta(path: path, name: entry.name, modified: mtime)
+                let meta = SessionMeta(
+                    path: path,
+                    name: entry.name,
+                    modified: mtime,
+                    modelRef: entry.modelRef
+                )
                 if archived.contains(path) {
                     archivedMetas.append(meta)
                 } else {
@@ -1295,6 +1357,22 @@ final class AppStore: ObservableObject {
             if !t.isEmpty { return false }
         }
         return false
+    }
+
+    /// Reads only the final 64 KiB: enough to find a recent pi `model_change`,
+    /// while keeping session discovery bounded even for very large transcripts.
+    private static func sessionModelRef(_ url: URL) -> String? {
+        let tailWindowBytes: UInt64 = 64 * 1024
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        do {
+            let endOffset = try handle.seekToEnd()
+            try handle.seek(toOffset: endOffset > tailWindowBytes ? endOffset - tailWindowBytes : 0)
+            guard let tail = try handle.readToEnd() else { return nil }
+            return SessionModelReferenceParser.latestModelRef(in: tail)
+        } catch {
+            return nil
+        }
     }
 
     /// 会话显示名：最后一条非 junk session_info name，否则第一条非 internal user 消息，否则「新会话」（不回退 ISO 文件名）。
