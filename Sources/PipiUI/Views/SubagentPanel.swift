@@ -357,7 +357,7 @@ private struct AgentDetailView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(spacing: 0) {
-                        LazyVStack(alignment: .leading, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 8) {
                             if agent.log.isEmpty {
                                 waitingForFirstLog
                             } else {
@@ -378,8 +378,8 @@ private struct AgentDetailView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    // Keep AppKit observation outside LazyVStack placements. Putting
-                    // the representable on the lazy bottom row can make its binding
+                    // Keep AppKit observation outside the log stack. Putting
+                    // the representable on the bottom row can make its binding
                     // write participate in the same AttributeGraph layout pass.
                     .background(StickToBottomTracker(isPinned: $pinToBottom))
                     .overlayScrollers()
@@ -433,6 +433,9 @@ private struct AgentDetailView: View {
                 }
                 .onDisappear { cancelAutoScroll() }
             }
+            // Replace the scroll hierarchy when changing agents so AppKit does not
+            // reuse the previous agent's offset or layout cache.
+            .id(agent.id)
         }
         .confirmationDialog(
             "丢弃 worktree？",
