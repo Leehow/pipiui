@@ -126,6 +126,8 @@ struct ToolCallBlock: Identifiable, Equatable {
     var payloadChars: Int = 0
     /// Bounded, UI-safe subset of write/edit arguments used to explain finished changes.
     var fileChangePayload: FileChangePayload? = nil
+    /// Wall-clock duration of a finished tool execution; nil while running or unknown.
+    var durationSeconds: TimeInterval? = nil
 }
 
 /// Path + payload size for tool-call headers. write/edit never fall back to JSON dumps.
@@ -437,6 +439,10 @@ struct ToolRun: Equatable {
     var isError = false
     var output = ""
     var images: [ImageBlock] = []
+    /// Wall-clock start of this tool execution (set on `tool_execution_start`).
+    var startedAt: Date? = nil
+    /// Last time partial/final output was observed (start has no output yet).
+    var lastOutputAt: Date? = nil
 }
 
 /// Pure merge of `get_session_stats` / `contextUsage` into current context fields.
@@ -836,7 +842,9 @@ final class ChatSession: ObservableObject, Identifiable {
             hasUnseenInterruption = true
         }
         if let initialTranscript {
-            transcript = initialTranscript.items
+            var stampedItems = initialTranscript.items
+            Self.stampToolDurations(&stampedItems, from: initialTranscript.toolRuns)
+            transcript = stampedItems
             streaming.toolRuns = initialTranscript.toolRuns
             itemCounter = initialTranscript.itemCounter
             skipNextAssistantIngest = initialTranscript.skipNextAssistantIngest
@@ -1193,8 +1201,12 @@ final class ChatSession: ObservableObject, Identifiable {
             streaming.toolOutputVersion &+= 1
         }
 
+        // Stamp durations before the single assignment so the publish carries them.
+        var stampedItems = reconciled.items
+        Self.stampToolDurations(&stampedItems, from: reconciled.toolRuns)
+
         // Single assignment — avoid per-message @Published churn.
-        transcript = reconciled.items
+        transcript = stampedItems
         initialPreviewItemCount = 0
         initialPreviewToolRunIDs.removeAll(keepingCapacity: false)
 
@@ -1478,7 +1490,7 @@ final class ChatSession: ObservableObject, Identifiable {
         case "tool_execution_start":
             if let tid = e["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
-                streaming.toolRuns[tid] = ToolRun(isRunning: true)
+                streaming.toolRuns[tid] = ToolRun(isRunning: true, startedAt: Date())
                 streaming.toolOutputVersion &+= 1
             }
         case "tool_execution_update":
@@ -1486,7 +1498,9 @@ final class ChatSession: ObservableObject, Identifiable {
                 // Coalesce partial chunks; flush on main ~50ms (same idea as scheduleStreamFlush).
                 var run = pendingToolRuns[tid] ?? streaming.toolRuns[tid] ?? ToolRun()
                 run.isRunning = true
+                if run.startedAt == nil { run.startedAt = Date() }
                 run.output = Self.contentText(e["partialResult"]["content"])
+                run.lastOutputAt = Date()
                 pendingToolRuns[tid] = run
                 scheduleToolRunFlush()
             }
@@ -1494,13 +1508,18 @@ final class ChatSession: ObservableObject, Identifiable {
             if let tid = e["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
                 let content = e["result"]["content"]
+                let previous = streaming.toolRuns[tid]
+                let now = Date()
                 streaming.toolRuns[tid] = ToolRun(
                     isRunning: false,
                     isError: e["isError"].bool ?? false,
                     output: Self.contentText(content),
-                    images: Self.contentImages(content, allowDiskRead: false)
+                    images: Self.contentImages(content, allowDiskRead: false),
+                    startedAt: previous?.startedAt,
+                    lastOutputAt: now
                 )
                 streaming.toolOutputVersion &+= 1
+                Self.stampToolDurations(&transcript, from: streaming.toolRuns)
                 scheduleImageBackfill(toolCallId: tid)
             }
         case "auto_retry_start":
@@ -1752,13 +1771,17 @@ final class ChatSession: ObservableObject, Identifiable {
             if let tid = message["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
                 let content = message["content"]
+                let previous = streaming.toolRuns[tid]
                 streaming.toolRuns[tid] = ToolRun(
                     isRunning: false,
                     isError: message["isError"].bool ?? false,
                     output: Self.contentText(content),
-                    images: Self.contentImages(content, allowDiskRead: false)
+                    images: Self.contentImages(content, allowDiskRead: false),
+                    startedAt: previous?.startedAt,
+                    lastOutputAt: previous?.lastOutputAt ?? Date()
                 )
                 streaming.toolOutputVersion &+= 1
+                Self.stampToolDurations(&transcript, from: streaming.toolRuns)
                 scheduleImageBackfill(toolCallId: tid)
             }
         case "bashExecution":
@@ -1814,6 +1837,44 @@ final class ChatSession: ObservableObject, Identifiable {
         return ChatItem(id: id, role: role, blocks: blocks)
     }
 
+    /// Stamp finished wall-clock durations onto toolCall blocks from live toolRuns.
+    /// A block is stamped only when its run has both a start and a later last-output time;
+    /// unknown or non-positive deltas leave `durationSeconds` nil (never cleared once set).
+    package static func stampToolDurations(
+        _ items: inout [ChatItem],
+        from toolRuns: [String: ToolRun]
+    ) {
+        guard !toolRuns.isEmpty else { return }
+        for itemIndex in items.indices {
+            for blockIndex in items[itemIndex].blocks.indices {
+                guard case .toolCall(let block) = items[itemIndex].blocks[blockIndex],
+                      let run = toolRuns[block.id],
+                      let startedAt = run.startedAt,
+                      let lastOutputAt = run.lastOutputAt else { continue }
+                let delta = lastOutputAt.timeIntervalSince(startedAt)
+                guard delta > 0 else { continue }
+                var stamped = block
+                stamped.durationSeconds = delta
+                items[itemIndex].blocks[blockIndex] = .toolCall(stamped)
+            }
+        }
+    }
+
+    private static let entryTimestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let entryTimestampFormatterNoFractional = ISO8601DateFormatter()
+
+    /// Entry-level ISO8601 timestamp from pi session JSONL; nil when absent or unparsable.
+    private static func entryTimestamp(of message: J) -> Date? {
+        guard let raw = message["timestamp"].string else { return nil }
+        return entryTimestampFormatter.date(from: raw)
+            ?? entryTimestampFormatterNoFractional.date(from: raw)
+    }
+
     /// Pure history build for `get_messages` (call off main: disk read + base64 in `parseImageBlock` / hydrate).
     /// Preserves message order; mirrors `ingest` including ghost-title skip and toolResult → toolRuns.
     package static func buildTranscript(
@@ -1824,13 +1885,37 @@ final class ChatSession: ObservableObject, Identifiable {
         var toolRuns: [String: ToolRun] = [:]
         var itemCounter = 0
         var skipNextAssistantIngest = false
+        // toolCall id → wall-clock start (entry timestamp of the assistant message that declares it).
+        var toolCallStart: [String: Date] = [:]
 
         func nextId() -> String {
             itemCounter += 1
             return "item-\(itemCounter)"
         }
 
+        /// Stamps `durationSeconds` on the already-built block for `tid` when the
+        /// result timestamp is strictly after the recorded start.
+        func applyTiming(tid: String, start: Date, resultTimestamp: Date) {
+            let delta = resultTimestamp.timeIntervalSince(start)
+            guard delta > 0 else { return }
+            guard let itemIndex = items.firstIndex(where: { item in
+                item.blocks.contains { block in
+                    if case .toolCall(let call) = block { return call.id == tid }
+                    return false
+                }
+            }),
+            let blockIndex = items[itemIndex].blocks.firstIndex(where: { block in
+                if case .toolCall(let call) = block { return call.id == tid }
+                return false
+            }) else { return }
+            guard case .toolCall(let block) = items[itemIndex].blocks[blockIndex] else { return }
+            var stamped = block
+            stamped.durationSeconds = delta
+            items[itemIndex].blocks[blockIndex] = .toolCall(stamped)
+        }
+
         for message in messages {
+            let timestamp = entryTimestamp(of: message)
             switch message["role"].string ?? "" {
             case "user":
                 let text = contentText(message["content"])
@@ -1858,6 +1943,13 @@ final class ChatSession: ObservableObject, Identifiable {
                     id: nextId(),
                     allowDiskRead: loadImageData
                 ) {
+                    if let timestamp {
+                        for block in item.blocks {
+                            if case .toolCall(let call) = block {
+                                toolCallStart[call.id] = timestamp
+                            }
+                        }
+                    }
                     items.append(item)
                 }
             case "toolResult":
@@ -1869,6 +1961,11 @@ final class ChatSession: ObservableObject, Identifiable {
                         output: contentText(content),
                         images: contentImages(content, allowDiskRead: loadImageData)
                     )
+                    if let timestamp, let start = toolCallStart[tid] {
+                        applyTiming(tid: tid, start: start, resultTimestamp: timestamp)
+                        toolRuns[tid]?.startedAt = start
+                        toolRuns[tid]?.lastOutputAt = timestamp
+                    }
                 }
             case "bashExecution":
                 let cmd = message["command"].string ?? ""
@@ -2625,7 +2722,9 @@ final class ChatSession: ObservableObject, Identifiable {
                 let built = Self.buildTranscript(from: messages)
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    self.transcript = built.items
+                    var stampedItems = built.items
+                    Self.stampToolDurations(&stampedItems, from: built.toolRuns)
+                    self.transcript = stampedItems
                     self.streaming.toolRuns = built.toolRuns
                     self.streaming.toolOutputVersion &+= 1
                     self.itemCounter = built.itemCounter

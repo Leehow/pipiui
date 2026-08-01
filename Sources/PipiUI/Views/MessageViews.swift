@@ -2492,6 +2492,19 @@ struct ToolCardView: View {
                 }
                 .background(Color.primary.opacity(0.025))
             }
+
+            // Finished calls show wall-clock duration; running calls keep the spinner only.
+            if let duration = call.durationSeconds, !isLive {
+                Divider()
+                HStack(spacing: 4) {
+                    Text("耗时 \(DurationFormat.compact(duration))")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+            }
         }
         .background(
             RoundedRectangle(cornerRadius: 10)

@@ -124,6 +124,60 @@ final class SessionHistoryPreloaderTests: XCTestCase {
         XCTAssertEqual(snapshot.transcript.toolRuns["call-1"]?.images.count, 0)
     }
 
+    func testParserStampsToolDurationFromEntryTimestamps() throws {
+        let file = temporaryDirectory.appendingPathComponent("timed.jsonl")
+        try writeJSONLines([
+            ["type": "session", "version": 3, "id": "session"],
+            ["type": "model_change", "id": "root", "parentId": NSNull()],
+            messageEntry(
+                id: "u1",
+                parent: "root",
+                role: "user",
+                content: "go",
+                timestamp: "2026-07-26T12:00:00.000Z"
+            ),
+            messageEntry(
+                id: "a1",
+                parent: "u1",
+                role: "assistant",
+                content: [
+                    [
+                        "type": "toolCall",
+                        "id": "call-1",
+                        "name": "read",
+                        "arguments": ["path": "/tmp/x"],
+                    ],
+                ],
+                timestamp: "2026-07-26T12:00:01.000Z"
+            ),
+            messageEntry(
+                id: "t1",
+                parent: "a1",
+                role: "toolResult",
+                content: [["type": "text", "text": "ok"]],
+                extras: ["toolCallId": "call-1", "isError": false],
+                timestamp: "2026-07-26T12:00:06.000Z"
+            ),
+        ], to: file)
+
+        let snapshot = try XCTUnwrap(SessionHistoryParser.load(path: file.path))
+        let toolCallBlock = snapshot.transcript.items.lazy
+            .flatMap(\.blocks)
+            .first { block in
+                if case .toolCall(let call) = block { return call.id == "call-1" }
+                return false
+            }
+        guard case .toolCall(let call)? = toolCallBlock else {
+            return XCTFail("expected toolCall block")
+        }
+        XCTAssertEqual(call.durationSeconds, 5)
+        let run = try XCTUnwrap(snapshot.transcript.toolRuns["call-1"])
+        let startedAt = try XCTUnwrap(run.startedAt)
+        let lastOutputAt = try XCTUnwrap(run.lastOutputAt)
+        XCTAssertEqual(lastOutputAt.timeIntervalSince(startedAt), 5)
+        XCTAssertEqual(run.output, "ok")
+    }
+
     func testChangedOrDeletedFileInvalidatesCachedSnapshot() throws {
         let file = temporaryDirectory.appendingPathComponent("invalidate.jsonl")
         try writeSimpleSession(text: "first", padding: 32, to: file)
@@ -404,7 +458,8 @@ final class SessionHistoryPreloaderTests: XCTestCase {
         parent: String,
         role: String,
         content: Any,
-        extras: [String: Any] = [:]
+        extras: [String: Any] = [:],
+        timestamp: String? = nil
     ) -> [String: Any] {
         var message: [String: Any] = [
             "role": role,
@@ -413,12 +468,16 @@ final class SessionHistoryPreloaderTests: XCTestCase {
         for (key, value) in extras {
             message[key] = value
         }
-        return [
+        var entry: [String: Any] = [
             "type": "message",
             "id": id,
             "parentId": parent,
             "message": message,
         ]
+        if let timestamp {
+            entry["timestamp"] = timestamp
+        }
+        return entry
     }
 
     private func writeJSONLines(_ objects: [[String: Any]], to file: URL) throws {

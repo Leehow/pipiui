@@ -150,6 +150,147 @@ final class InitialTranscriptBuildTests: XCTestCase {
         }
     }
 
+    func testBuildTranscriptStampsToolDurationAndRunDatesFromTimestamps() throws {
+        let messages: [J] = [
+            J([
+                "role": "assistant",
+                "timestamp": "2026-07-26T12:00:00.000Z",
+                "content": [
+                    [
+                        "type": "toolCall",
+                        "id": "call-1",
+                        "name": "read",
+                        "arguments": ["path": "/tmp/x"],
+                    ],
+                ],
+            ]),
+            J([
+                "role": "toolResult",
+                "timestamp": "2026-07-26T12:00:05.000Z",
+                "toolCallId": "call-1",
+                "isError": false,
+                "content": [["type": "text", "text": "ok"]],
+            ]),
+        ]
+
+        let built = ChatSession.buildTranscript(from: messages)
+        XCTAssertEqual(built.items.count, 1)
+        guard case .toolCall(let call)? = built.items[0].blocks.first else {
+            return XCTFail("expected toolCall block")
+        }
+        XCTAssertEqual(call.durationSeconds, 5)
+        let run = try XCTUnwrap(built.toolRuns["call-1"])
+        let startedAt = try XCTUnwrap(run.startedAt)
+        let lastOutputAt = try XCTUnwrap(run.lastOutputAt)
+        XCTAssertEqual(lastOutputAt.timeIntervalSince(startedAt), 5)
+        XCTAssertEqual(run.output, "ok")
+    }
+
+    func testBuildTranscriptLeavesDurationNilWithoutUsableTimestamps() throws {
+        // No timestamps at all → nil duration, no run dates.
+        let plain: [J] = [
+            J([
+                "role": "assistant",
+                "content": [
+                    ["type": "toolCall", "id": "c1", "name": "bash", "arguments": ["command": "ls"]],
+                ],
+            ]),
+            J([
+                "role": "toolResult",
+                "toolCallId": "c1",
+                "isError": false,
+                "content": ["done"],
+            ]),
+        ]
+        var built = ChatSession.buildTranscript(from: plain)
+        guard case .toolCall(let call)? = built.items.first?.blocks.first else {
+            return XCTFail("expected toolCall block")
+        }
+        XCTAssertNil(call.durationSeconds)
+        XCTAssertNil(built.toolRuns["c1"]?.startedAt)
+        XCTAssertNil(built.toolRuns["c1"]?.lastOutputAt)
+
+        // Result before start (non-positive delta) → duration stays nil.
+        let reversed: [J] = [
+            J([
+                "role": "assistant",
+                "timestamp": "2026-07-26T12:00:10.000Z",
+                "content": [
+                    ["type": "toolCall", "id": "c2", "name": "bash", "arguments": ["command": "ls"]],
+                ],
+            ]),
+            J([
+                "role": "toolResult",
+                "timestamp": "2026-07-26T12:00:05.000Z",
+                "toolCallId": "c2",
+                "isError": false,
+                "content": ["done"],
+            ]),
+        ]
+        built = ChatSession.buildTranscript(from: reversed)
+        guard case .toolCall(let late)? = built.items.first?.blocks.first else {
+            return XCTFail("expected toolCall block")
+        }
+        XCTAssertNil(late.durationSeconds)
+    }
+
+    func testStampToolDurationsOnlyStampsPositiveDeltasWithKnownStart() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        var items: [ChatItem] = [
+            ChatItem(id: "item-1", role: "assistant", blocks: [
+                .toolCall(ToolCallBlock(id: "a", name: "read", argsSummary: "/x")),
+                .text("keep me"),
+                .toolCall(ToolCallBlock(id: "b", name: "bash", argsSummary: "ls")),
+                .toolCall(ToolCallBlock(id: "c", name: "edit", argsSummary: "/f")),
+                .toolCall(ToolCallBlock(id: "d", name: "read", argsSummary: "/y")),
+                .toolCall(ToolCallBlock(id: "e", name: "read", argsSummary: "/z")),
+            ]),
+            ChatItem(id: "item-2", role: "user", blocks: [.text("u")]),
+        ]
+        var alreadyStamped = ToolCallBlock(id: "e", name: "read", argsSummary: "/z")
+        alreadyStamped.durationSeconds = 9
+        items[0].blocks[5] = .toolCall(alreadyStamped)
+
+        let runs: [String: ToolRun] = [
+            // Complete positive delta → stamped.
+            "a": ToolRun(
+                isRunning: false,
+                startedAt: base,
+                lastOutputAt: base.addingTimeInterval(5)
+            ),
+            // Started but no final output time → not stamped.
+            "b": ToolRun(isRunning: false, startedAt: base),
+            // No start → not stamped.
+            "c": ToolRun(isRunning: false, lastOutputAt: base.addingTimeInterval(3)),
+            // Negative delta → not stamped.
+            "d": ToolRun(
+                isRunning: false,
+                startedAt: base,
+                lastOutputAt: base.addingTimeInterval(-2)
+            ),
+            // Missing run → existing duration must be preserved, not cleared.
+        ]
+
+        ChatSession.stampToolDurations(&items, from: runs)
+
+        XCTAssertEqual(duration(of: items[0], id: "a"), 5)
+        XCTAssertNil(duration(of: items[0], id: "b"))
+        XCTAssertNil(duration(of: items[0], id: "c"))
+        XCTAssertNil(duration(of: items[0], id: "d"))
+        XCTAssertEqual(duration(of: items[0], id: "e"), 9)
+        XCTAssertEqual(ChatSession.plainText(of: items[0]), "keep me")
+        XCTAssertEqual(items[0].blocks.count, 6)
+    }
+
+    private func duration(of item: ChatItem, id: String) -> TimeInterval? {
+        for block in item.blocks {
+            if case .toolCall(let call) = block, call.id == id {
+                return call.durationSeconds
+            }
+        }
+        return nil
+    }
+
     func testBuildTranscriptStableIdsSequential() {
         let messages: [J] = [
             J(["role": "user", "content": "a"]),
