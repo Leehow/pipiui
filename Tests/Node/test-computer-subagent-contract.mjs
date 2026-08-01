@@ -14,20 +14,24 @@ const chatSessionURL = new URL(
   "../../Sources/PipiUI/ChatSession.swift",
   import.meta.url,
 );
+const spawnAssemblyURL = new URL(
+  "../../Sources/PipiUI/PipiSpawnAssembly.swift",
+  import.meta.url,
+);
 
 test("globally enabled subagent Pi loads both desktop tools", async () => {
-  const [subagent, chatSession] = await Promise.all([
+  const [subagent, assembly] = await Promise.all([
     readFile(subagentURL, "utf8"),
-    readFile(chatSessionURL, "utf8"),
+    readFile(spawnAssemblyURL, "utf8"),
   ]);
 
   assert.match(
-    chatSession,
-    /extraEnv\["PIPIUI_COMPUTER_EXT"\]\s*=\s*computerUseExtension/,
+    assembly,
+    /env\["PIPIUI_COMPUTER_EXT"\]\s*=\s*p/,
   );
   assert.match(
-    chatSession,
-    /extraEnv\["PIPIUI_COMPUTER_RUNTIME_PROTOCOL"\]\s*=/,
+    assembly,
+    /env\["PIPIUI_COMPUTER_RUNTIME_PROTOCOL"\]\s*=/,
   );
   assert.match(subagent, /args\.push\("-e", PIPIUI_COMPUTER_EXT\)/);
   assert.match(subagent, /resolveSubagentToolSelection\(\{/);
@@ -101,28 +105,30 @@ test("desktop capability reaches only the dispatched Pi child", async () => {
 });
 
 test("selected strategy path and runtime capabilities reach nested Pi without duplicate mounting", async () => {
-  const [subagent, chatSession] = await Promise.all([
+  const [subagent, assembly, chatSession] = await Promise.all([
     readFile(subagentURL, "utf8"),
+    readFile(spawnAssemblyURL, "utf8"),
     readFile(chatSessionURL, "utf8"),
   ]);
-  const topLevelMounts = chatSession.match(
-    /args \+= \["-e", computerUseExtension\]/g,
+  const topLevelMounts = assembly.match(
+    /if f\.isEnabled\(\.computerUse\),\s*input\.computerDescriptor != nil,\s*let p = input\.paths\.computerUse \{\s*args \+= \["-e", p\]/g,
   ) ?? [];
   const nestedMounts = subagent.match(
     /args\.push\("-e", PIPIUI_COMPUTER_EXT\)/g,
   ) ?? [];
   assert.equal(topLevelMounts.length, 1);
   assert.equal(nestedMounts.length, 1);
+  assert.match(chatSession, /let assembly = PipiSpawnAssembly\.assemble\(/);
   assert.match(
-    chatSession,
-    /extraEnv\["PIPIUI_COMPUTER_CAPABILITY"\]\s*=\s*computerRoutingKey/,
+    assembly,
+    /env\["PIPIUI_COMPUTER_CAPABILITY"\]\s*=\s*input\.computerRoutingKey/,
   );
   assert.match(
     subagent,
     /PIPIUI_COMPUTER_EXT && process\.env\.PIPIUI_COMPUTER_CAPABILITY/,
   );
   assert.match(
-    chatSession,
+    assembly,
     /PIPIUI_COMPUTER_DISPLAY_ID/,
     "built-in synchronous provider adaptation keeps its descriptor hint",
   );
