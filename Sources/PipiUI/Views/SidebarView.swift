@@ -401,17 +401,17 @@ struct SidebarView: View {
                 },
                 onOpen: { hit in
                     expandedProjectPaths.insert(target.project.path)
+                    // Show the full session list of the project (expand 更多 toggle)
+                    // so the selected row is visible beyond the first 10 sessions.
+                    sessionsExpandedByProject[target.project.path] = true
                     store.selectedProjectPath = target.project.path
-                    if hit.isLive {
-                        store.selectedSessionKey = hit.path
-                    } else {
-                        let meta = SessionMeta(
-                            path: hit.path,
-                            name: hit.title,
-                            modified: hit.modified ?? Date(),
-                            modelRef: nil
-                        )
+                    switch SessionSearch.openAction(for: hit) {
+                    case .selectLive(let key):
+                        store.selectedSessionKey = key
+                    case .openDisk(let meta):
                         store.openSession(meta, project: target.project)
+                    case .restoreArchived(let meta):
+                        store.restoreSession(meta, project: target.project)
                     }
                     sessionSearchTarget = nil
                 },
@@ -820,7 +820,15 @@ private struct SessionSearchPopover: View {
     @State private var query: String = ""
     @State private var hits: [SessionSearchHit] = []
     @State private var searching = false
+    /// The in-flight background scan. Cancelled on .task re-entry and popover
+    /// dismissal so obsolete scans stop instead of overlapping with the new one.
+    @State private var scanTask: Task<[SessionSearchHit], Never>?
+    /// Bumped whenever the project session lists publish (refresh completed),
+    /// so the search re-runs against fresh snapshots.
+    @State private var refreshGeneration = 0
     @FocusState private var queryFocused: Bool
+
+    private var searchIdentity: String { "\(query)|\(refreshGeneration)" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -897,7 +905,15 @@ private struct SessionSearchPopover: View {
             store.refreshSessions(for: project)
             queryFocused = true
         }
-        .task(id: query) {
+        .onChange(of: store.sessionsByProject[project.path]) { _, _ in
+            refreshGeneration += 1
+        }
+        .onChange(of: store.archivedByProject[project.path]) { _, _ in
+            refreshGeneration += 1
+        }
+        .task(id: searchIdentity) {
+            scanTask?.cancel()
+            scanTask = nil
             let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
                 hits = []
@@ -912,17 +928,22 @@ private struct SessionSearchPopover: View {
             let archived = store.archivedByProject[project.path] ?? []
             let live = liveEntries()
             let q = trimmed
-            let results = await Task.detached(priority: .userInitiated) {
+            let task = Task.detached(priority: .userInitiated) {
                 SessionSearch.search(
                     metas: metas,
                     archived: archived,
                     query: q,
                     liveEntries: live
                 )
-            }.value
+            }
+            scanTask = task
+            let results = await task.value
             guard !Task.isCancelled else { return }
             hits = results
             searching = false
+        }
+        .onDisappear {
+            scanTask?.cancel()
         }
         .onExitCommand {
             onDismiss()

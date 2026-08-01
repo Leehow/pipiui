@@ -193,4 +193,177 @@ final class SessionSearchTests: XCTestCase {
         XCTAssertTrue(hits[0].isTitleMatch)
         XCTAssertNil(hits[0].snippet)
     }
+
+    // MARK: - Review findings
+
+    func testOpenActionDispatchArchivedGoesThroughRestore() {
+        var hit = SessionSearchHit(
+            path: "/tmp/arch.jsonl",
+            title: "Archived T",
+            modified: nil,
+            snippet: nil,
+            isTitleMatch: true,
+            isArchived: true,
+            isLive: false
+        )
+        guard case .restoreArchived(let meta) = SessionSearch.openAction(for: hit) else {
+            return XCTFail("archived hit must dispatch to restoreArchived, got \(SessionSearch.openAction(for: hit))")
+        }
+        XCTAssertEqual(meta.path, "/tmp/arch.jsonl")
+        XCTAssertEqual(meta.name, "Archived T")
+
+        hit = SessionSearchHit(
+            path: "/tmp/disk.jsonl",
+            title: "Disk T",
+            modified: Date(timeIntervalSince1970: 1),
+            snippet: "s",
+            isTitleMatch: false,
+            isArchived: false,
+            isLive: false
+        )
+        guard case .openDisk(let diskMeta) = SessionSearch.openAction(for: hit) else {
+            return XCTFail("disk hit must dispatch to openDisk")
+        }
+        XCTAssertEqual(diskMeta.path, "/tmp/disk.jsonl")
+        XCTAssertEqual(diskMeta.modified, Date(timeIntervalSince1970: 1))
+
+        hit = SessionSearchHit(
+            path: "new:abc",
+            title: "Live T",
+            modified: nil,
+            snippet: nil,
+            isTitleMatch: true,
+            isArchived: false,
+            isLive: true
+        )
+        guard case .selectLive(let key) = SessionSearch.openAction(for: hit) else {
+            return XCTFail("live hit must dispatch to selectLive")
+        }
+        XCTAssertEqual(key, "new:abc")
+    }
+
+    func testScannerSurvivesByteCutMidMultibyteChar() {
+        // Line 1 holds the keyword; a 3-byte 中 is placed so its lead byte (E4)
+        // lands at maxBytes-2 and its final byte (AD) falls outside the 10MiB
+        // read window. The old whole-prefix UTF-8 decode would fail entirely;
+        // the streaming scanner only drops the cut partial line.
+        let maxBytes = 10 * 1024 * 1024
+        let keywordLine = sessionLine(role: "user", contentJSON: textParts("early-keyword-survives-cut"))
+        var data = Data(keywordLine.utf8)
+        data.append(0x0A)
+        let padCount = maxBytes - 2 - data.count
+        XCTAssertGreaterThan(padCount, 0)
+        data.append(Data(repeating: 0x41, count: padCount)) // 'A'
+        data.append(Data([0xE4, 0xB8, 0xAD])) // 中 cut mid-scalar
+        let url = tempDir.appendingPathComponent("cut.jsonl")
+        try! data.write(to: url)
+        XCTAssertGreaterThan(data.count, maxBytes)
+
+        let hit = SessionSearch.scan(
+            file: url,
+            title: "Cut",
+            query: "early-keyword-survives-cut",
+            modified: nil
+        )
+        XCTAssertNotNil(hit)
+        XCTAssertTrue(hit?.snippet?.contains("early-keyword-survives-cut") == true)
+    }
+
+    func testMalformedLinesSkipped() {
+        let url = writeJSONL("malformed.jsonl", lines: [
+            "not json at all {{{",
+            sessionLine(role: "user", contentJSON: textParts("valid-line-with-marker-token")),
+            #"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"truncated""#,
+            "",
+            "{\"type\":\"custom_message\",\"customType\":\"pipiui-git-snapshot\",\"content\":[{\"type\":\"text\",\"text\":\"## Git\\nno token here\"}],\"display\":false}",
+            "{invalid",
+            // Valid JSON but no message key → skipped without failing the scan.
+            #"{"type":"session","version":3,"id":"abc","timestamp":"2026-07-25T16:33:09.371Z","cwd":"/tmp"}"#,
+        ])
+        let hit = SessionSearch.scan(file: url, title: "Mal", query: "valid-line-with-marker-token", modified: nil)
+        XCTAssertNotNil(hit)
+        XCTAssertTrue(hit?.snippet?.contains("valid-line-with-marker-token") == true)
+    }
+
+    func testQueryWithQuoteMatchesDecodedText() {
+        // The raw line stores the quote escaped as \" so the decoded text
+        // contains 说"好" while the raw bytes only have 说\"好\" — the old
+        // raw-text prefilter could never match this query.
+        let content = "她说\"好\"吧"
+        let url = writeJSONL("quote.jsonl", lines: [
+            sessionLine(role: "user", contentJSON: textParts(content)),
+        ])
+        let hit = SessionSearch.scan(file: url, title: "Q", query: "说\"好\"", modified: nil)
+        XCTAssertNotNil(hit)
+        XCTAssertEqual(hit?.snippet, "她说\"好\"吧")
+    }
+
+    func testQueryWithNewlineMatchesDecodedText() {
+        // Decoded text has a real newline; the raw line only carries the \n
+        // escape, so a raw prefilter cannot see the query 行\n第二.
+        let content = "第一行\n第二行"
+        let url = writeJSONL("nl.jsonl", lines: [
+            sessionLine(role: "user", contentJSON: textParts(content)),
+        ])
+        let hit = SessionSearch.scan(file: url, title: "NL", query: "行\n第二", modified: nil)
+        XCTAssertNotNil(hit)
+        XCTAssertTrue(hit?.snippet?.contains("第一行") == true)
+    }
+
+    func testLineCapRespected() {
+        var lines: [String] = []
+        for _ in 0..<1000 {
+            lines.append(sessionLine(role: "user", contentJSON: textParts("filler no match here")))
+        }
+        lines.append(sessionLine(role: "user", contentJSON: textParts("beyond-line-cap-token")))
+        let url = writeJSONL("linecap.jsonl", lines: lines)
+        let hit = SessionSearch.scan(file: url, title: "Cap", query: "beyond-line-cap-token", modified: nil)
+        XCTAssertNil(hit, "keyword on line 1001 must be beyond the 1000-line cap")
+
+        var withEarly = lines
+        withEarly.insert(sessionLine(role: "user", contentJSON: textParts("within-line-cap-token")), at: 500)
+        let url2 = writeJSONL("linecap2.jsonl", lines: withEarly)
+        let hit2 = SessionSearch.scan(file: url2, title: "Cap", query: "within-line-cap-token", modified: nil)
+        XCTAssertNotNil(hit2)
+    }
+
+    func testByteCapRespected() {
+        let maxBytes = 10 * 1024 * 1024
+        let fillerLine = sessionLine(role: "user", contentJSON: textParts("filler"))
+        let keywordLine = sessionLine(role: "user", contentJSON: textParts("beyond-byte-cap-token"))
+        var data = Data()
+        while data.count < maxBytes {
+            data.append(Data(fillerLine.utf8))
+            data.append(0x0A)
+        }
+        data.append(Data(keywordLine.utf8))
+        data.append(0x0A)
+        let url = tempDir.appendingPathComponent("bytecap.jsonl")
+        try! data.write(to: url)
+
+        let hit = SessionSearch.scan(file: url, title: "Byte", query: "beyond-byte-cap-token", modified: nil)
+        XCTAssertNil(hit, "keyword beyond the 10MiB window must not be searched")
+    }
+
+    func testTieBreakerDeterministicByPath() {
+        let same = Date(timeIntervalSince1970: 1_700_000_000)
+        let a = writeJSONL("a.jsonl", lines: [
+            sessionLine(role: "user", contentJSON: textParts("tie-token-aaa")),
+        ])
+        let z = writeJSONL("z.jsonl", lines: [
+            sessionLine(role: "user", contentJSON: textParts("tie-token-zzz")),
+        ])
+        let hits = SessionSearch.search(
+            metas: [
+                meta(path: z.path, name: "Z", modified: same),
+                meta(path: a.path, name: "A", modified: same),
+            ],
+            archived: [],
+            query: "tie-token",
+            liveEntries: []
+        )
+        XCTAssertEqual(hits.count, 2)
+        XCTAssertEqual(hits[0].path, a.path, "equal-modified body hits must break ties by path ascending")
+        XCTAssertEqual(hits[1].path, z.path)
+    }
 }
