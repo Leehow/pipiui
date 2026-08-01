@@ -1921,8 +1921,16 @@ struct InputBar: View {
     /// render time. Mirrors SettingsSheet.reloadUsage: detached utility task +
     /// MainActor hop.
     private func reloadBalanceLast30Days() {
+        // 只统计当前余额提供方（deepseek/moonshot/siliconflow/openrouter）自己账户的
+        // 消耗：ledger 行按 model id 归属过滤，pi 会话回填按 message.provider 过滤。
+        let bp = session.model?.balanceProvider
         Task.detached(priority: .utility) {
+            guard let bp else {
+                await MainActor.run { balanceLast30Days = 0 }
+                return
+            }
             let records = TokenUsageStats.loadSharedRecords()
+                .filter { bp.matches(modelId: $0.model) }
             let report = TokenUsageStats.aggregate(
                 records: records,
                 period: .last30Days,
@@ -1931,11 +1939,13 @@ struct InputBar: View {
             )
             // 回填从未经 ledger 记账的 pi 主会话消耗（headless/CLI 会话、旧历史）：
             // 凡与 ledger 主通道会话（resume: 精确路径 / new: 时间窗口）对得上的
-            // pi 会话文件被跳过，避免重复计费；其余文件只计 30 天窗口内的用量。
+            // pi 会话文件被跳过，避免重复计费；其余文件只计 30 天窗口内、且属于
+            // 当前余额提供方的用量。
             let meta = PiMainUsageBackfill.ledgerMainSessionMeta()
             let backfill = PiMainUsageBackfill.sumLast30Days(
                 ledgerMainSessions: meta.mainSessions,
-                newSessionFirstTs: meta.newSessionFirstTs
+                newSessionFirstTs: meta.newSessionFirstTs,
+                balanceProvider: bp
             )
             await MainActor.run {
                 balanceLast30Days = report.total.cost + backfill

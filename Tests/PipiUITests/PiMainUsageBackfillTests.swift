@@ -46,18 +46,20 @@ final class PiMainUsageBackfillTests: XCTestCase {
         return url
     }
 
-    private func messageLine(role: String, tsMs: Double, cost: Any? = nil) -> String {
+    private func messageLine(role: String, tsMs: Double, cost: Any? = nil, provider: String? = nil, model: String? = nil) -> String {
         var message: [String: Any] = ["role": role, "timestamp": tsMs]
         if let cost {
             message["usage"] = ["input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": cost]
         }
+        if let provider { message["provider"] = provider }
+        if let model { message["model"] = model }
         let obj: [String: Any] = ["type": "message", "message": message]
         let data = try! JSONSerialization.data(withJSONObject: obj)
         return String(data: data, encoding: .utf8)!
     }
 
-    private func assistantLine(tsMs: Double, cost: Any) -> String {
-        messageLine(role: "assistant", tsMs: tsMs, cost: cost)
+    private func assistantLine(tsMs: Double, cost: Any, provider: String? = nil, model: String? = nil) -> String {
+        messageLine(role: "assistant", tsMs: tsMs, cost: cost, provider: provider, model: model)
     }
 
     private func toolResultLine(tsMs: Double, cost: Double) -> String {
@@ -72,13 +74,15 @@ final class PiMainUsageBackfillTests: XCTestCase {
         root: URL,
         now: Date,
         ledgerMainSessions: Set<String> = [],
-        newSessionFirstTs: [(session: String, firstTs: Date)] = []
+        newSessionFirstTs: [(session: String, firstTs: Date)] = [],
+        balanceProvider: BalanceProvider? = nil
     ) -> Double {
         PiMainUsageBackfill.sumLast30Days(
             now: now,
             ledgerMainSessions: ledgerMainSessions,
             newSessionFirstTs: newSessionFirstTs,
-            rootURL: root
+            rootURL: root,
+            balanceProvider: balanceProvider
         )
     }
 
@@ -187,6 +191,43 @@ final class PiMainUsageBackfillTests: XCTestCase {
         _ = writePiFile(root: root, slug: "other", name: "2026-07-24T16-01-21Z",
                         lines: [assistantLine(tsMs: ms - 60_000, cost: 6)])
         XCTAssertEqual(sum(root: root, now: now), 0)
+    }
+
+    // MARK: - Provider 过滤（余额提供方归属）
+
+    func testProviderFilterSumsOnlyMatchingProviderMessages() {
+        let root = makeTempRoot()
+        let now = iso("2026-07-24T16:31:00Z")
+        let ms = now.timeIntervalSince1970 * 1000
+        let lines = [
+            assistantLine(tsMs: ms - 60_000, cost: 1.0, provider: "deepseek"),
+            assistantLine(tsMs: ms - 120_000, cost: 2.0, provider: "kimi-coding"), // 订阅流量
+            assistantLine(tsMs: ms - 180_000, cost: 4.0, provider: "moonshot"),    // 开放平台
+            assistantLine(tsMs: ms - 240_000, cost: 8.0),                           // 无 provider → 不归属
+        ]
+        _ = writePiFile(root: root, name: "2026-07-24T16-01-21-938Z", lines: lines)
+        XCTAssertEqual(sum(root: root, now: now, balanceProvider: .deepseek), 1.0, accuracy: 1e-9)
+        XCTAssertEqual(sum(root: root, now: now, balanceProvider: .moonshot), 4.0, accuracy: 1e-9)
+        XCTAssertEqual(sum(root: root, now: now, balanceProvider: .siliconflow), 0)
+        XCTAssertEqual(sum(root: root, now: now, balanceProvider: .openrouter), 0)
+        // 不过滤 → 全部计入（保持既有行为）。
+        XCTAssertEqual(sum(root: root, now: now), 15.0, accuracy: 1e-9)
+    }
+
+    func testProviderFallsBackToModelPrefixWhenProviderKeyMissing() {
+        let root = makeTempRoot()
+        let now = iso("2026-07-24T16:31:00Z")
+        let ms = now.timeIntervalSince1970 * 1000
+        let lines = [
+            assistantLine(tsMs: ms - 60_000, cost: 3.0, model: "deepseek/deepseek-v4-flash"),
+            assistantLine(tsMs: ms - 120_000, cost: 5.0, model: "moonshot/moonshot-v8-32k"),
+            assistantLine(tsMs: ms - 180_000, cost: 7.0, model: "kimi-coding/k3-256k"),
+            assistantLine(tsMs: ms - 240_000, cost: 11.0, model: "deepseek-v4-flash"), // 裸 id → 无前缀
+        ]
+        _ = writePiFile(root: root, name: "2026-07-24T16-01-21-938Z", lines: lines)
+        XCTAssertEqual(sum(root: root, now: now, balanceProvider: .deepseek), 3.0, accuracy: 1e-9)
+        XCTAssertEqual(sum(root: root, now: now, balanceProvider: .moonshot), 5.0, accuracy: 1e-9)
+        XCTAssertEqual(sum(root: root, now: now), 26.0, accuracy: 1e-9)
     }
 
     // MARK: - 缺失目录

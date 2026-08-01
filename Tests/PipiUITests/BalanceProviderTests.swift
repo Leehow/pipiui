@@ -69,6 +69,49 @@ final class BalanceProviderTests: XCTestCase {
         XCTAssertEqual(BalanceProvider.siliconflow.apiKeyEnvNames.first, "SILICONFLOW_API_KEY")
     }
 
+    // MARK: - Model-id matcher（余额提供方归属）
+
+    func testMatchesDeepseekIds() {
+        XCTAssertTrue(BalanceProvider.deepseek.matches(modelId: "deepseek-v4-flash"))
+        XCTAssertTrue(BalanceProvider.deepseek.matches(modelId: "deepseek-v4-pro"))
+        XCTAssertTrue(BalanceProvider.deepseek.matches(modelId: "DEEPSEEK-v4-flash"))
+        // "provider/model" 形式走前缀。
+        XCTAssertTrue(BalanceProvider.deepseek.matches(modelId: "deepseek/deepseek-v4-flash"))
+        XCTAssertFalse(BalanceProvider.deepseek.matches(modelId: "k3"))
+        XCTAssertFalse(BalanceProvider.deepseek.matches(modelId: "gpt-5.6-terra"))
+    }
+
+    func testMatchesMoonshotExcludesKimiCodingSubscriptionTraffic() {
+        // 开放平台（moonshotai* 目录）模型计入。
+        XCTAssertTrue(BalanceProvider.moonshot.matches(modelId: "moonshot-v8-32k"))
+        XCTAssertTrue(BalanceProvider.moonshot.matches(modelId: "moonshot/moonshot-v8-32k"))
+        XCTAssertTrue(BalanceProvider.moonshot.matches(modelId: "moonshotai/kimi-k2.5"))
+        XCTAssertTrue(BalanceProvider.moonshot.matches(modelId: "kimi-k2-0905-preview"))
+        XCTAssertTrue(BalanceProvider.moonshot.matches(modelId: "kimi-k3"))
+        // Kimi Code Plan 订阅流量排除：裸 k3/k3-256k 与 kimi-coding 前缀。
+        XCTAssertFalse(BalanceProvider.moonshot.matches(modelId: "kimi-coding/k3-256k"))
+        XCTAssertFalse(BalanceProvider.moonshot.matches(modelId: "k3"))
+        XCTAssertFalse(BalanceProvider.moonshot.matches(modelId: "k3-256k"))
+        XCTAssertFalse(BalanceProvider.moonshot.matches(modelId: "kimi-coding"))
+    }
+
+    func testMatchesOtherBalanceProviders() {
+        XCTAssertTrue(BalanceProvider.openrouter.matches(modelId: "openrouter/meta-llama/llama-4"))
+        XCTAssertTrue(BalanceProvider.openrouter.matches(modelId: "openrouter/auto"))
+        XCTAssertTrue(BalanceProvider.siliconflow.matches(modelId: "siliconflow/deepseek-v3"))
+        XCTAssertFalse(BalanceProvider.openrouter.matches(modelId: "meta-llama/llama-4"))
+        XCTAssertFalse(BalanceProvider.siliconflow.matches(modelId: "deepseek-v3"))
+    }
+
+    func testMatchesNothingForNonBalanceModels() {
+        for id in ["auto", "qmodel_preview", "k3", "k3-256k", "gpt-5.6-terra",
+                   "grok-4.5", "glm-5.2", "claude-opus-4-8", "zai-coding-cn/glm-5.2"] {
+            for bp in BalanceProvider.allCases {
+                XCTAssertFalse(bp.matches(modelId: id), "\(bp) should not match \(id)")
+            }
+        }
+    }
+
     // MARK: - Key resolution (QuotaEnvFallback)
 
     func testBalanceKeyFallsBackToDotEnv() {

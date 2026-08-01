@@ -99,6 +99,43 @@ func balanceProvider(for provider: String) -> BalanceProvider? {
     return nil
 }
 
+// MARK: - Provider-scoped model matching
+
+/// Whether a ledger / pi-session model id belongs to a given balance provider's
+/// prepaid account. Ledger model ids come in two shapes:
+/// - `"provider/model"` (e.g. `kimi-coding/k3-256k`, `moonshot/moonshot-v8-32k`,
+///   `openrouter/meta-llama/...`): the prefix decides, via `balanceProvider(for:)`.
+/// - bare ids (`deepseek-v4-flash`, `kimi-k3`, `k3`): per-provider rules below.
+extension BalanceProvider {
+    func matches(modelId: String) -> Bool {
+        let id = modelId.lowercased()
+        guard !id.isEmpty else { return false }
+        if let slash = id.firstIndex(of: "/") {
+            let prefix = String(id[..<slash])
+            return balanceProvider(for: prefix) == self
+        }
+        switch self {
+        case .deepseek:
+            return id.contains("deepseek")
+        case .moonshot:
+            // 排除 Kimi Code Plan 订阅流量：裸 `k3` / `k3-256k` 与 `kimi-coding`
+            // 前缀都走月度订阅（本机 ~$127），不是开放平台（moonshotai*）预充值余额。
+            // 排除必须先于包含，避免 `kimi-coding/k3-256k` 类 id 命中 kimi-k3 前缀。
+            if id == "k3" || id == "k3-256k" || id.hasPrefix("kimi-coding") { return false }
+            // 开放平台：moonshot 家族前缀 + 目录（moonshotai / moonshotai-cn）里的
+            // kimi-k2* / kimi-k3 系列 id。
+            return id.hasPrefix("moonshot")
+                || id.hasPrefix("moonshotai")
+                || id.hasPrefix("kimi-k2")
+                || id.hasPrefix("kimi-k3")
+        case .siliconflow:
+            return id.contains("siliconflow")
+        case .openrouter:
+            return id.contains("openrouter")
+        }
+    }
+}
+
 // MARK: - Key resolution
 
 /// Resolves prepaid-balance API keys using the same layers as GLM/Kimi quota:

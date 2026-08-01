@@ -26,12 +26,16 @@ enum PiMainUsageBackfill {
 
     /// 回填 30 天窗口内、与 ledger 主通道会话对不上的 pi 主会话消耗（pi USD）。
     /// `rootURL` 缺省为 `~/.pi/agent/sessions`；`now` 可注入以便测试。
+    /// `balanceProvider` 非 nil 时只累计 message.provider（缺省时取
+    /// message.model 的 `/` 前缀）归属该提供方的消息 —— 余额 popover 的
+    /// 「30天内消耗」只显示当前余额账户自己的消耗。
     static func sumLast30Days(
         now: Date = Date(),
         ledgerMainSessions: Set<String>,
         newSessionFirstTs: [(session: String, firstTs: Date)],
         rootURL: URL? = nil,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        balanceProvider: BalanceProvider? = nil
     ) -> Double {
         let root = rootURL ?? fileManager.homeDirectoryForCurrentUser
             .appendingPathComponent(".pi/agent/sessions", isDirectory: true)
@@ -55,7 +59,13 @@ enum PiMainUsageBackfill {
             // Rule B：与任意 new: 会话首条主记录 ts 相距 ≤ 5 分钟 → 视为 app 附加会话。
             if isWithinFiveMinutes(nameDate, of: firstTsSorted) { continue }
             let messages = cachedMessages(for: resolved, fileManager: fileManager)
-            for (ts, cost) in messages where ts >= cutoff && ts < now {
+            for (ts, cost, provider) in messages where ts >= cutoff && ts < now {
+                // 按消息级 provider 归属过滤；无法归属的消息（provider 与 model
+                // 前缀都缺失）不进入任何提供方的统计。
+                if let bp = balanceProvider,
+                   PipiUI.balanceProvider(for: provider ?? "") != bp {
+                    continue
+                }
                 total += cost
             }
         }
@@ -143,7 +153,10 @@ enum PiMainUsageBackfill {
 
     private struct CacheEntry {
         var stamp: FileStamp
-        var messages: [(ts: Date, cost: Double)]
+        // (ts, cost, provider)：provider 在解析时提取（message.provider，缺省取
+        // message.model 的 `/` 前缀），过滤留在聚合时按 balanceProvider 进行，
+        // 因此切换余额提供方不会触发重读文件。
+        var messages: [(ts: Date, cost: Double, provider: String?)]
     }
 
     private static let messagesCacheLock = NSLock()
@@ -159,7 +172,7 @@ enum PiMainUsageBackfill {
     )?
 
     /// 指纹未变则复用已解析的消息级数据；变化（含新文件）才重读该文件。
-    private static func cachedMessages(for url: URL, fileManager: FileManager) -> [(ts: Date, cost: Double)] {
+    private static func cachedMessages(for url: URL, fileManager: FileManager) -> [(ts: Date, cost: Double, provider: String?)] {
         let path = url.path
         let stamp = fileStamp(of: url, fileManager: fileManager)
         messagesCacheLock.lock()
@@ -203,12 +216,14 @@ enum PiMainUsageBackfill {
     }
 
     /// 逐行解析，只保留 `role == "assistant"`、cost > 0、带毫秒时间戳的消息。
+    /// 同时提取 provider（`message["provider"]`；缺省时从 `message["model"]`
+    /// 的第一个 `/` 之前取前缀），供调用方按余额提供方过滤。
     /// 坏行 / 不可读文件直接跳过，不抛错。
-    private static func parseMessages(from url: URL, fileManager: FileManager) -> [(ts: Date, cost: Double)] {
+    private static func parseMessages(from url: URL, fileManager: FileManager) -> [(ts: Date, cost: Double, provider: String?)] {
         guard fileManager.fileExists(atPath: url.path),
               let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8) else { return [] }
-        var messages: [(ts: Date, cost: Double)] = []
+        var messages: [(ts: Date, cost: Double, provider: String?)] = []
         messages.reserveCapacity(min(text.count / 2048 + 16, 100_000))
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             guard let lineData = line.data(using: .utf8),
@@ -223,7 +238,16 @@ enum PiMainUsageBackfill {
                 ?? 0
             guard cost > 0,
                   let ms = message["timestamp"] as? NSNumber else { continue }
-            messages.append((ts: Date(timeIntervalSince1970: ms.doubleValue / 1000), cost: cost))
+            // 真实 pi 文件里带 usage 的 assistant 消息都有 message.provider；
+            // 缺省时退回 message.model 的 `provider/model` 前缀。
+            let provider: String? = {
+                if let p = message["provider"] as? String, !p.isEmpty { return p }
+                guard let model = message["model"] as? String,
+                      let slash = model.firstIndex(of: "/") else { return nil }
+                let prefix = String(model[..<slash])
+                return prefix.isEmpty ? nil : prefix
+            }()
+            messages.append((ts: Date(timeIntervalSince1970: ms.doubleValue / 1000), cost: cost, provider: provider))
         }
         return messages
     }
