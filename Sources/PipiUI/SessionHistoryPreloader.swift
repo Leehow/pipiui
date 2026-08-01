@@ -324,6 +324,7 @@ enum SessionHistoryParser {
         let id: String
         let parentId: String?
         let type: String
+        let timestamp: String?
         let message: [String: Any]?
     }
 
@@ -349,6 +350,7 @@ enum SessionHistoryParser {
                 id: id,
                 parentId: raw["parentId"] as? String,
                 type: type,
+                timestamp: raw["timestamp"] as? String,
                 message: type == "message"
                     ? sanitizedMessage(raw["message"] as? [String: Any])
                     : nil
@@ -389,6 +391,11 @@ enum SessionHistoryParser {
         let activeEntries = Array(chain.reversed())
         let messages = activeEntries.compactMap { entry -> J? in
             guard entry.type == "message", let message = entry.message else { return nil }
+            if let timestamp = entry.timestamp {
+                var timed = message
+                timed["timestamp"] = timestamp
+                return J(timed)
+            }
             return J(message)
         }
         var built = ChatSession.buildTranscript(from: messages, loadImageData: false)
