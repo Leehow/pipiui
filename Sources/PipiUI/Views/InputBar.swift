@@ -1198,6 +1198,9 @@ struct InputBar: View {
     @State private var showQuotaPopover: Bool = false
     @State private var showContextPopover: Bool = false
     @State private var showBalancePopover: Bool = false
+    @State private var showToolStats: Bool = false
+    /// Observes the shared singleton trigger; the sheet computes from the live session.
+    @ObservedObject private var toolStatsPresenter = ToolStatsPresenter.shared
     /// 30-day ledger total (CNY) for the balance popover, refreshed on each open.
     @State private var balanceLast30Days: Double?
     /// Measured width of the status row; drives compact vs wide without ViewThatFits.
@@ -1311,6 +1314,12 @@ struct InputBar: View {
         .onChange(of: session.draftImages.count) { _, _ in
             refreshSlashPalette()
             composerRouter.clearAttachError()
+        }
+        .onChange(of: toolStatsPresenter.requestID) { _, _ in
+            showToolStats = true
+        }
+        .sheet(isPresented: $showToolStats) {
+            ToolStatsSheetView(session: session)
         }
         .onDisappear {
             pasteCatcher.stop()
