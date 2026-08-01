@@ -14,7 +14,11 @@ enum NativePDFIngestion {
     static let manifestFileName = "manifest.json"
     static let documentFileName = "document.md"
     static let pagesDirectoryName = "pages"
-    static let schemaVersion = 2
+    /// Byte-identical visual companion retained inside every complete bundle.
+    /// Pi must use this file—not the mutable path selected by the user—when
+    /// tables, formulas, charts, or other page visuals matter.
+    static let immutablePDFFileName = "source.pdf"
+    static let schemaVersion = 3
     /// Coordinates final cache publication inside this app process. Extraction
     /// itself stays concurrent/off-main; only the short validate/write/rename
     /// critical section is serialized.
@@ -40,7 +44,11 @@ enum NativePDFIngestion {
     }
 
     struct SourceBundle: Equatable {
-        let sourceURL: URL
+        /// The path selected for this ingest invocation. It is provenance only:
+        /// another process may later replace its bytes.
+        let selectedSourceURL: URL
+        /// The byte-identical PDF retained in the content-addressed bundle.
+        let immutablePDFURL: URL
         let directoryURL: URL
         let manifestURL: URL
         let documentURL: URL
@@ -50,15 +58,16 @@ enum NativePDFIngestion {
         let reusedCache: Bool
 
         /// A short, explicit pointer that can be appended to the current draft.
-        /// It gives Pi both the immutable parsed bundle and the original PDF
-        /// without copying the entire document into the prompt body.
-        func draftReference(for originalPDFURL: URL) -> String {
+        /// It gives Pi the immutable parsed bundle and byte-identical visual PDF
+        /// without copying the document body into the prompt.
+        func draftReference() -> String {
             """
             [本地 PDF 已解析]
-            原始 PDF：\(originalPDFURL.path)
+            不可变视觉 PDF（与内容 SHA-256 完全一致；表格、公式、图形请读取此文件）：\(immutablePDFURL.path)
             解析目录：\(directoryURL.path)
             解析文档：\(documentURL.path)
             单页 Markdown：\(pagesDirectoryURL.path)
+            本次选择路径（仅供追溯，外部文件可能已变化，不代表内容 SHA-256）：\(selectedSourceURL.path)
             内容 SHA-256：\(contentSHA256)
             """
         }
@@ -260,7 +269,8 @@ enum NativePDFIngestion {
         progress?(Progress(phase: .writing, completedPages: pageCount, totalPages: pageCount))
         return try writeBundle(
             extractedPages,
-            sourceURL: sourceURL,
+            selectedSourceURL: sourceURL,
+            snapshotURL: snapshotURL,
             sourceByteCount: fingerprint.byteCount,
             contentSHA256: fingerprint.hash,
             rootURL: rootURL,
@@ -285,8 +295,14 @@ enum NativePDFIngestion {
     private struct Manifest: Codable {
         let schemaVersion: Int
         let sourceContentSHA256: String
-        let sourceFileName: String
-        let sourcePath: String
+        /// Historical path when the bundle was first created. This is not a
+        /// claim that the external file still has `sourceContentSHA256`.
+        let selectionTimeSourceFileName: String
+        let selectionTimeSourcePath: String
+        /// The final bundle's byte-identical visual artifact. Both fields make
+        /// the distinction explicit for readers and cache validation.
+        let immutablePDFRelativePath: String
+        let immutablePDFPath: String
         let sourceByteCount: Int64
         let pageCount: Int
         let pages: [ManifestPage]
@@ -320,14 +336,21 @@ enum NativePDFIngestion {
         let fileManager = FileManager.default
         let manifestURL = bundleURL.appendingPathComponent(manifestFileName)
         let documentURL = bundleURL.appendingPathComponent(documentFileName)
+        let immutablePDFURL = bundleURL.appendingPathComponent(immutablePDFFileName)
         guard fileManager.fileExists(atPath: manifestURL.path),
               fileManager.fileExists(atPath: documentURL.path),
               let data = try? Data(contentsOf: manifestURL),
               let manifest = try? JSONDecoder().decode(Manifest.self, from: data),
               manifest.schemaVersion == schemaVersion,
               manifest.sourceContentSHA256 == expectedHash,
+              manifest.immutablePDFRelativePath == immutablePDFFileName,
+              manifest.immutablePDFPath == immutablePDFURL.path,
               manifest.pageCount > 0,
-              manifest.pages.count == manifest.pageCount
+              manifest.pages.count == manifest.pageCount,
+              fileManager.fileExists(atPath: immutablePDFURL.path),
+              let immutableFingerprint = try? sha256(of: immutablePDFURL),
+              immutableFingerprint.hash == expectedHash,
+              immutableFingerprint.byteCount == manifest.sourceByteCount
         else {
             return nil
         }
@@ -355,7 +378,8 @@ enum NativePDFIngestion {
         }
 
         return SourceBundle(
-            sourceURL: sourceURL,
+            selectedSourceURL: sourceURL,
+            immutablePDFURL: immutablePDFURL,
             directoryURL: bundleURL,
             manifestURL: manifestURL,
             documentURL: documentURL,
@@ -368,7 +392,8 @@ enum NativePDFIngestion {
 
     private static func writeBundle(
         _ pages: [ExtractedPage],
-        sourceURL: URL,
+        selectedSourceURL: URL,
+        snapshotURL: URL,
         sourceByteCount: Int64,
         contentSHA256: String,
         rootURL: URL,
@@ -387,7 +412,7 @@ enum NativePDFIngestion {
             try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
             if let cached = completeBundle(
                 at: bundleURL,
-                sourceURL: sourceURL,
+                sourceURL: selectedSourceURL,
                 expectedHash: contentSHA256
             ) {
                 return cached
@@ -400,12 +425,22 @@ enum NativePDFIngestion {
             try fileManager.createDirectory(at: stagingURL, withIntermediateDirectories: true)
             let stagingPagesURL = stagingURL.appendingPathComponent(pagesDirectoryName, isDirectory: true)
             try fileManager.createDirectory(at: stagingPagesURL, withIntermediateDirectories: true)
+            let immutablePDFURL = bundleURL.appendingPathComponent(immutablePDFFileName)
+            let stagingImmutablePDFURL = stagingURL.appendingPathComponent(immutablePDFFileName)
+            try fileManager.copyItem(at: snapshotURL, to: stagingImmutablePDFURL)
+            let persistedFingerprint = try sha256(of: stagingImmutablePDFURL)
+            guard persistedFingerprint.hash == contentSHA256,
+                  persistedFingerprint.byteCount == sourceByteCount
+            else {
+                throw IngestionError.writeFailed("不可变 PDF 快照内容校验失败")
+            }
 
             let manifestPages = try pages.map { page -> ManifestPage in
                 let relativePath = pageRelativePath(number: page.number)
                 let pageURL = stagingURL.appendingPathComponent(relativePath)
                 try pageMarkdown(
-                    sourceURL: sourceURL,
+                    selectedSourceURL: selectedSourceURL,
+                    immutablePDFURL: immutablePDFURL,
                     contentSHA256: contentSHA256,
                     page: page
                 ).write(to: pageURL, atomically: true, encoding: .utf8)
@@ -420,8 +455,10 @@ enum NativePDFIngestion {
             let manifest = Manifest(
                 schemaVersion: schemaVersion,
                 sourceContentSHA256: contentSHA256,
-                sourceFileName: sourceURL.lastPathComponent,
-                sourcePath: sourceURL.path,
+                selectionTimeSourceFileName: selectedSourceURL.lastPathComponent,
+                selectionTimeSourcePath: selectedSourceURL.path,
+                immutablePDFRelativePath: immutablePDFFileName,
+                immutablePDFPath: immutablePDFURL.path,
                 sourceByteCount: sourceByteCount,
                 pageCount: pages.count,
                 pages: manifestPages
@@ -433,7 +470,8 @@ enum NativePDFIngestion {
                 options: .atomic
             )
             try documentMarkdown(
-                sourceURL: sourceURL,
+                selectedSourceURL: selectedSourceURL,
+                immutablePDFURL: immutablePDFURL,
                 contentSHA256: contentSHA256,
                 pages: manifestPages
             ).write(
@@ -449,7 +487,7 @@ enum NativePDFIngestion {
                 // content-addressed bundle. Reuse it if it is intact.
                 if let cached = completeBundle(
                     at: bundleURL,
-                    sourceURL: sourceURL,
+                    sourceURL: selectedSourceURL,
                     expectedHash: contentSHA256
                 ) {
                     try? fileManager.removeItem(at: stagingURL)
@@ -464,7 +502,8 @@ enum NativePDFIngestion {
 
         let pagesURL = bundleURL.appendingPathComponent(pagesDirectoryName, isDirectory: true)
         return SourceBundle(
-            sourceURL: sourceURL,
+            selectedSourceURL: selectedSourceURL,
+            immutablePDFURL: bundleURL.appendingPathComponent(immutablePDFFileName),
             directoryURL: bundleURL,
             manifestURL: bundleURL.appendingPathComponent(manifestFileName),
             documentURL: bundleURL.appendingPathComponent(documentFileName),
@@ -487,14 +526,16 @@ enum NativePDFIngestion {
     }
 
     private static func pageMarkdown(
-        sourceURL: URL,
+        selectedSourceURL: URL,
+        immutablePDFURL: URL,
         contentSHA256: String,
         page: ExtractedPage
     ) -> String {
         var lines = [
-            "# \(sourceURL.lastPathComponent) — 第 \(page.number) 页",
+            "# \(selectedSourceURL.lastPathComponent) — 第 \(page.number) 页",
             "",
-            "- 原始 PDF：\(sourceURL.path)",
+            "- 不可变视觉 PDF（与内容 SHA-256 一致；表格、公式、图形请读取此文件）：\(immutablePDFURL.path)",
+            "- 选取时外部路径（仅供追溯，可能已变化，不代表内容 SHA-256）：\(selectedSourceURL.path)",
             "- 内容 SHA-256：\(contentSHA256)",
             "- 提取来源：\(page.origin.displayName)",
         ]
@@ -503,7 +544,7 @@ enum NativePDFIngestion {
         }
         lines.append("")
         if page.text.isEmpty {
-            lines.append("> 此页未识别到可用文字。请直接查看原 PDF；复杂表格、公式与图形保持原页视觉结构。")
+            lines.append("> 此页未识别到可用文字。请直接查看上述不可变视觉 PDF；复杂表格、公式与图形保持原页视觉结构。")
         } else {
             lines.append(page.text)
         }
@@ -511,14 +552,16 @@ enum NativePDFIngestion {
     }
 
     private static func documentMarkdown(
-        sourceURL: URL,
+        selectedSourceURL: URL,
+        immutablePDFURL: URL,
         contentSHA256: String,
         pages: [ManifestPage]
     ) -> String {
         var lines = [
-            "# \(sourceURL.lastPathComponent)",
+            "# \(selectedSourceURL.lastPathComponent)",
             "",
-            "- 原始 PDF：\(sourceURL.path)",
+            "- 不可变视觉 PDF（与内容 SHA-256 一致；表格、公式、图形请读取此文件）：\(immutablePDFURL.path)",
+            "- 选取时外部路径（仅供追溯，可能已变化，不代表内容 SHA-256）：\(selectedSourceURL.path)",
             "- 内容 SHA-256：\(contentSHA256)",
             "- 页数：\(pages.count)",
             "- 说明：优先使用 PDF 内嵌文字；缺失或无意义文字层的页面使用本机 Vision OCR。复杂表格、公式与图形未做结构化重建。",

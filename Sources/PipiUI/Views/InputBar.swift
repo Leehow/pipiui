@@ -205,7 +205,7 @@ final class ComposerSessionRouter: ObservableObject {
                         }
                     )
                     if target.session != nil {
-                        references.append(bundle.draftReference(for: url))
+                        references.append(bundle.draftReference())
                     }
                 } catch {
                     failures.append("\(url.lastPathComponent)：\(error.localizedDescription)")

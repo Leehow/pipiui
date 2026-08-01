@@ -171,7 +171,10 @@ final class ComposerPDFIngestionRoutingTests: XCTestCase {
         let directoryURL = projectURL
             .appendingPathComponent(".pi/pdf-sources/test-hash", isDirectory: true)
         return NativePDFIngestion.SourceBundle(
-            sourceURL: sourceURL,
+            selectedSourceURL: sourceURL,
+            immutablePDFURL: directoryURL.appendingPathComponent(
+                NativePDFIngestion.immutablePDFFileName
+            ),
             directoryURL: directoryURL,
             manifestURL: directoryURL.appendingPathComponent("manifest.json"),
             documentURL: directoryURL.appendingPathComponent("document.md"),

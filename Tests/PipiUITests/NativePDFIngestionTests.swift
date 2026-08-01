@@ -31,9 +31,13 @@ final class NativePDFIngestionTests: XCTestCase {
         XCTAssertEqual(result.pages.count, 1)
         XCTAssertEqual(result.pages.first?.origin, .visionOCR)
         XCTAssertEqual(result.pages.first?.confidence, 0.91)
+        XCTAssertEqual(result.selectedSourceURL, sourceURL)
+        XCTAssertEqual(result.immutablePDFURL.lastPathComponent, NativePDFIngestion.immutablePDFFileName)
         XCTAssertTrue(FileManager.default.fileExists(atPath: result.manifestURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: result.documentURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: result.pagesDirectoryURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: result.immutablePDFURL.path))
+        XCTAssertEqual(sha256(try Data(contentsOf: result.immutablePDFURL)), result.contentSHA256)
         XCTAssertEqual(
             result.directoryURL.deletingLastPathComponent().lastPathComponent,
             "pdf-sources"
@@ -43,23 +47,33 @@ final class NativePDFIngestionTests: XCTestCase {
         XCTAssertTrue(pageMarkdown.contains("# scanned.pdf — 第 1 页"))
         XCTAssertTrue(pageMarkdown.contains("本机 Vision OCR"))
         XCTAssertTrue(pageMarkdown.contains("扫描 PDF 的本机文字"))
+        XCTAssertTrue(pageMarkdown.contains(result.immutablePDFURL.path))
+        XCTAssertTrue(pageMarkdown.contains("选取时外部路径"))
 
         let documentMarkdown = try String(contentsOf: result.documentURL)
         XCTAssertTrue(documentMarkdown.contains("[第 1 页](pages/page-0001.md)"))
         XCTAssertTrue(documentMarkdown.contains("复杂表格、公式与图形未做结构化重建"))
+        XCTAssertTrue(documentMarkdown.contains(result.immutablePDFURL.path))
+        XCTAssertTrue(documentMarkdown.contains("选取时外部路径"))
 
         let manifest = try manifestDictionary(at: result.manifestURL)
         XCTAssertEqual(manifest["schemaVersion"] as? Int, NativePDFIngestion.schemaVersion)
         XCTAssertEqual(manifest["sourceContentSHA256"] as? String, result.contentSHA256)
-        XCTAssertEqual(manifest["sourcePath"] as? String, sourceURL.path)
+        XCTAssertEqual(manifest["selectionTimeSourceFileName"] as? String, sourceURL.lastPathComponent)
+        XCTAssertEqual(manifest["selectionTimeSourcePath"] as? String, sourceURL.path)
+        XCTAssertEqual(manifest["immutablePDFRelativePath"] as? String, NativePDFIngestion.immutablePDFFileName)
+        XCTAssertEqual(manifest["immutablePDFPath"] as? String, result.immutablePDFURL.path)
+        XCTAssertNil(manifest["sourcePath"])
         let pages = try XCTUnwrap(manifest["pages"] as? [[String: Any]])
         XCTAssertEqual(pages.first?["origin"] as? String, "vision-ocr")
 
-        let reference = result.draftReference(for: sourceURL)
+        let reference = result.draftReference()
+        XCTAssertTrue(reference.contains(result.immutablePDFURL.path))
         XCTAssertTrue(reference.contains(sourceURL.path))
         XCTAssertTrue(reference.contains(result.directoryURL.path))
         XCTAssertTrue(reference.contains(result.documentURL.path))
         XCTAssertTrue(reference.contains(result.pagesDirectoryURL.path))
+        XCTAssertTrue(reference.contains("本次选择路径（仅供追溯"))
         XCTAssertFalse(reference.contains("扫描 PDF 的本机文字"), "composer gets pointers, not the PDF body")
     }
 
@@ -134,11 +148,73 @@ final class NativePDFIngestionTests: XCTestCase {
         XCTAssertNil(mutationError)
         XCTAssertEqual(result.contentSHA256, originalHash)
         XCTAssertNotEqual(result.contentSHA256, sha256(try Data(contentsOf: sourceURL)))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: result.immutablePDFURL.path))
+        XCTAssertEqual(sha256(try Data(contentsOf: result.immutablePDFURL)), originalHash)
         XCTAssertEqual(recognizer.callCount, 1)
         let pageMarkdown = try String(contentsOf: try XCTUnwrap(result.pages.first?.markdownURL))
         XCTAssertTrue(pageMarkdown.contains("snapshot OCR result"))
+        let documentMarkdown = try String(contentsOf: result.documentURL)
+        let draftReference = result.draftReference()
         let manifest = try manifestDictionary(at: result.manifestURL)
         XCTAssertEqual(manifest["sourceContentSHA256"] as? String, originalHash)
+        XCTAssertEqual(manifest["selectionTimeSourcePath"] as? String, sourceURL.path)
+        XCTAssertEqual(manifest["immutablePDFPath"] as? String, result.immutablePDFURL.path)
+
+        for presentation in [draftReference, documentMarkdown, pageMarkdown] {
+            let immutableLine = try XCTUnwrap(
+                presentation
+                    .split(separator: "\n")
+                    .map(String.init)
+                    .first(where: { $0.contains("不可变视觉 PDF") })
+            )
+            XCTAssertTrue(presentation.contains(result.immutablePDFURL.path))
+            XCTAssertTrue(presentation.contains(sourceURL.path))
+            XCTAssertTrue(presentation.contains("可能已变化"))
+            XCTAssertTrue(immutableLine.contains(result.immutablePDFURL.path))
+            XCTAssertFalse(immutableLine.contains(sourceURL.path))
+            XCTAssertFalse(presentation.contains("原始 PDF：\(sourceURL.path)"))
+        }
+    }
+
+    func testMissingOrCorruptImmutablePDFRebuildsExactCacheEntry() throws {
+        let projectURL = try makeTemporaryDirectory("project")
+        let sourceURL = try writeScannedPDF(named: "cache-validation.pdf", color: .systemBrown)
+        let firstRecognizer = CountingRecognizer(text: "first parse")
+        let first = try NativePDFIngestion.ingest(
+            sourceURL: sourceURL,
+            projectURL: projectURL,
+            recognize: firstRecognizer.callAsFunction
+        )
+        XCTAssertEqual(firstRecognizer.callCount, 1)
+
+        try FileManager.default.removeItem(at: first.immutablePDFURL)
+        let missingArtifactRecognizer = CountingRecognizer(text: "rebuilt after missing artifact")
+        let rebuiltMissingArtifact = try NativePDFIngestion.ingest(
+            sourceURL: sourceURL,
+            projectURL: projectURL,
+            recognize: missingArtifactRecognizer.callAsFunction
+        )
+        XCTAssertFalse(rebuiltMissingArtifact.reusedCache)
+        XCTAssertEqual(missingArtifactRecognizer.callCount, 1)
+        XCTAssertEqual(rebuiltMissingArtifact.directoryURL, first.directoryURL)
+        XCTAssertEqual(
+            sha256(try Data(contentsOf: rebuiltMissingArtifact.immutablePDFURL)),
+            rebuiltMissingArtifact.contentSHA256
+        )
+
+        try Data("corrupt immutable PDF".utf8).write(to: rebuiltMissingArtifact.immutablePDFURL)
+        let corruptArtifactRecognizer = CountingRecognizer(text: "rebuilt after corrupt artifact")
+        let rebuiltCorruptArtifact = try NativePDFIngestion.ingest(
+            sourceURL: sourceURL,
+            projectURL: projectURL,
+            recognize: corruptArtifactRecognizer.callAsFunction
+        )
+        XCTAssertFalse(rebuiltCorruptArtifact.reusedCache)
+        XCTAssertEqual(corruptArtifactRecognizer.callCount, 1)
+        XCTAssertEqual(
+            sha256(try Data(contentsOf: rebuiltCorruptArtifact.immutablePDFURL)),
+            rebuiltCorruptArtifact.contentSHA256
+        )
     }
 
     func testEmbeddedPDFTextSkipsOCRFallback() throws {
