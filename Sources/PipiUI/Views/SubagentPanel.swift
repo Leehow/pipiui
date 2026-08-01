@@ -11,6 +11,8 @@ struct SubagentPanel: View {
     /// UI-only recovery action for agents whose normal status observations went silent.
     var onManualStatusCheck: ([String]) -> Void
     var onClose: () -> Void
+    /// 列表贴底跟随：新 agent 到达时若仍贴底则自动滚到最新条目；用户上滚看旧条目即脱离。
+    @State private var pinToBottom = true
 
     /// 上下分栏比例（列表高度 / 可用高度）。拖拽 onChanged 更新，onEnded 持久化。
     @State private var listHeightRatio = LayoutPersistence.subagentListHeightRatio()
@@ -196,23 +198,55 @@ struct SubagentPanel: View {
     }
 
     private var agentList: some View {
-        ScrollView {
-            LazyVStack(spacing: 2) {
-                ForEach(store.displayOrder) { agent in
-                    AgentRow(
-                        agent: agent,
-                        selected: agent.id == store.selectedId,
-                        abortPending: store.abortPending.contains(agent.id),
-                        onAbort: { onAbort(agent.id) }
-                    )
-                        .contentShape(Rectangle())
-                        .onTapGesture { store.selectedId = agent.id }
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(store.displayOrder) { agent in
+                        AgentRow(
+                            agent: agent,
+                            selected: agent.id == store.selectedId,
+                            abortPending: store.abortPending.contains(agent.id),
+                            onAbort: { onAbort(agent.id) }
+                        )
+                            .contentShape(Rectangle())
+                            .onTapGesture { store.selectedId = agent.id }
+                    }
+                    // 透明贴底锚点，与行数据解耦：新行插入/旧行移除不影响锚点位置。
+                    Color.clear
+                        .frame(height: 1)
+                        .id(listBottomAnchorID)
+                        .background(
+                            StickToBottomTracker(
+                                isPinned: $pinToBottom,
+                                pinEdge: .documentEnd
+                            )
+                        )
+                }
+                .padding(8)
+                .overlayScrollers()
+            }
+            .scrollIndicators(.automatic)
+            .onAppear {
+                DispatchQueue.main.async {
+                    jumpToListBottom(proxy)
                 }
             }
-            .padding(8)
-            .overlayScrollers()
+            .onChange(of: store.displayOrder.last?.id) { _, _ in
+                // 新 agent 到达（displayOrder 末尾变化）时跟随；状态/费用等
+                // 元素级更新不触发（末尾 id 不变），避免打扰用户浏览旧条目。
+                DispatchQueue.main.async {
+                    jumpToListBottom(proxy)
+                }
+            }
         }
-        .scrollIndicators(.automatic)
+    }
+
+    private var listBottomAnchorID: String { "subagent-list-bottom" }
+
+    /// 非 flip 列表：可视底 = documentEnd，锚点贴底即显示最新条目。
+    private func jumpToListBottom(_ proxy: ScrollViewProxy) {
+        guard pinToBottom else { return }
+        proxy.scrollTo(listBottomAnchorID, anchor: .bottom)
     }
 
     @ViewBuilder
