@@ -631,8 +631,7 @@ struct SidebarView: View {
                                 title: meta.name,
                                 modelRef: meta.modelRef,
                                 subtitle: "\(store.projectDisplayName(for: project)) · \(Self.relative(meta.modified))",
-                                status: .none,
-                                isRenamePresented: renameTarget != nil
+                                status: .none
                             )
                             .foregroundStyle(.secondary)
                         }
@@ -701,9 +700,7 @@ struct SidebarView: View {
                     fallbackTitle: fallbackTitle,
                     idleSubtitle: idleSubtitle,
                     hideSubtitle: isHovered,
-                    isHovered: isHovered,
-                    reservedTrailingWidth: actionAreaWidth,
-                    isRenamePresented: renameTarget != nil
+                    reservedTrailingWidth: actionAreaWidth
                 )
             } else if let meta {
                 let interrupted = store.interruptedSessionPaths.contains(meta.path)
@@ -713,9 +710,7 @@ struct SidebarView: View {
                     subtitle: interrupted ? "已中断" : idleSubtitle,
                     status: interrupted ? .interrupted : .none,
                     hideSubtitle: isHovered,
-                    isHovered: isHovered,
-                    reservedTrailingWidth: actionAreaWidth,
-                    isRenamePresented: renameTarget != nil
+                    reservedTrailingWidth: actionAreaWidth
                 )
             } else {
                 SessionRow(
@@ -723,9 +718,7 @@ struct SidebarView: View {
                     subtitle: idleSubtitle,
                     status: .none,
                     hideSubtitle: isHovered,
-                    isHovered: isHovered,
-                    reservedTrailingWidth: actionAreaWidth,
-                    isRenamePresented: renameTarget != nil
+                    reservedTrailingWidth: actionAreaWidth
                 )
             }
         }
@@ -1097,28 +1090,22 @@ private struct LiveSessionRow: View {
     let idleSubtitle: String
     /// Hide trailing caption while hover actions occupy that corner.
     var hideSubtitle: Bool = false
-    var isHovered = false
+    /// Reserved action-button width so title text never extends beneath the buttons.
     var reservedTrailingWidth: CGFloat = 0
-    var isRenamePresented = false
-    @State private var isPointerInside = false
 
     init(
         session: ChatSession,
         fallbackTitle: String,
         idleSubtitle: String,
         hideSubtitle: Bool = false,
-        isHovered: Bool = false,
-        reservedTrailingWidth: CGFloat = 0,
-        isRenamePresented: Bool = false
+        reservedTrailingWidth: CGFloat = 0
     ) {
         self.session = session
         self.agents = session.subagents
         self.fallbackTitle = fallbackTitle
         self.idleSubtitle = idleSubtitle
         self.hideSubtitle = hideSubtitle
-        self.isHovered = isHovered
         self.reservedTrailingWidth = reservedTrailingWidth
-        self.isRenamePresented = isRenamePresented
     }
 
     var body: some View {
@@ -1137,17 +1124,11 @@ private struct LiveSessionRow: View {
                 ProviderLogo(model: model, size: 13)
                     .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] }
             }
-            HoverSessionTitle(
-                title: title,
-                isHovered: isHovered || isPointerInside,
-                isRenamePresented: isRenamePresented
-            ) {
-                TypewriterText(
-                    text: title,
-                    animationToken: session.titleAnimationToken,
-                    font: .body
-                )
-            }
+            TypewriterText(
+                text: title,
+                animationToken: session.titleAnimationToken,
+                font: .body
+            )
             Spacer(minLength: 0)
             if !subtitle.isEmpty, !hideSubtitle {
                 Text(subtitle)
@@ -1158,7 +1139,6 @@ private struct LiveSessionRow: View {
         .padding(.trailing, reservedTrailingWidth)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .onHover { isPointerInside = $0 }
     }
 
     @ViewBuilder
@@ -1310,119 +1290,6 @@ private final class PulsingSymbolNSView: NSView {
     }
 }
 
-private struct HoverSessionTitle<Label: View>: View {
-    let title: String
-    let isHovered: Bool
-    let isRenamePresented: Bool
-    @ViewBuilder let label: () -> Label
-
-    @State private var displayedWidth: CGFloat = 0
-    @State private var fullWidth: CGFloat = 0
-    @State private var showPreview = false
-    @State private var previewTask: Task<Void, Never>?
-    @State private var previewGeneration = 0
-
-    private var isTruncated: Bool {
-        fullWidth > 0 && displayedWidth > 0 && fullWidth > displayedWidth + 1
-    }
-
-    var body: some View {
-        label()
-            .background {
-                GeometryReader { proxy in
-                    Color.clear.preference(
-                        key: DisplayedTitleWidthPreferenceKey.self,
-                        value: proxy.size.width
-                    )
-                }
-            }
-            .overlay(alignment: .topLeading) {
-                Text(title)
-                    .font(.body)
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .hidden()
-                    .background {
-                        GeometryReader { proxy in
-                            Color.clear.preference(
-                                key: FullTitleWidthPreferenceKey.self,
-                                value: proxy.size.width
-                            )
-                        }
-                    }
-                    .allowsHitTesting(false)
-            }
-            .onPreferenceChange(DisplayedTitleWidthPreferenceKey.self) { displayedWidth = $0 }
-            .onPreferenceChange(FullTitleWidthPreferenceKey.self) { fullWidth = $0 }
-            .onChange(of: title) { _, _ in updatePreviewVisibility() }
-            .onChange(of: isHovered) { _, _ in updatePreviewVisibility() }
-            .onChange(of: isRenamePresented) { _, _ in updatePreviewVisibility() }
-            .onChange(of: isTruncated) { _, _ in updatePreviewVisibility() }
-            .onDisappear {
-                previewTask?.cancel()
-                showPreview = false
-            }
-            .popover(
-                isPresented: $showPreview,
-                attachmentAnchor: .rect(.bounds),
-                arrowEdge: .leading
-            ) {
-                SessionTitlePreviewCard(title: title)
-            }
-    }
-
-    private func updatePreviewVisibility() {
-        previewGeneration += 1
-        previewTask?.cancel()
-        previewTask = nil
-
-        guard isHovered, isTruncated, !isRenamePresented else {
-            showPreview = false
-            return
-        }
-
-        let generation = previewGeneration
-        previewTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 400_000_000)
-            guard !Task.isCancelled, generation == previewGeneration else { return }
-            showPreview = true
-        }
-    }
-}
-
-private struct DisplayedTitleWidthPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-private struct FullTitleWidthPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-private struct SessionTitlePreviewCard: View {
-    let title: String
-
-    var body: some View {
-        Text(title)
-            .font(.callout)
-            .foregroundStyle(.primary)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(minWidth: 180, maxWidth: 320, alignment: .leading)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .shadow(color: .black.opacity(0.12), radius: 5, y: 2)
-            .padding(4)
-    }
-}
-
 private struct SessionRow: View {
     let title: String
     var modelRef: String? = nil
@@ -1430,10 +1297,8 @@ private struct SessionRow: View {
     var status: SessionRowStatus = .none
     /// Hide trailing caption while hover actions occupy that corner.
     var hideSubtitle: Bool = false
-    var isHovered = false
+    /// Reserved action-button width so title text never extends beneath the buttons.
     var reservedTrailingWidth: CGFloat = 0
-    var isRenamePresented = false
-    @State private var isPointerInside = false
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -1445,15 +1310,9 @@ private struct SessionRow: View {
                 ProviderLogo(modelRef: modelRef, size: 13)
                     .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] }
             }
-            HoverSessionTitle(
-                title: title,
-                isHovered: isHovered || isPointerInside,
-                isRenamePresented: isRenamePresented
-            ) {
-                Text(title)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
+            Text(title)
+                .lineLimit(1)
+                .truncationMode(.tail)
             Spacer(minLength: 0)
             if !subtitle.isEmpty, !hideSubtitle {
                 Text(subtitle)
@@ -1464,7 +1323,6 @@ private struct SessionRow: View {
         .padding(.trailing, reservedTrailingWidth)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .onHover { isPointerInside = $0 }
     }
 
     @ViewBuilder
