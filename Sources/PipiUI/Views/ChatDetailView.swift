@@ -385,6 +385,12 @@ private struct ChatDetailViewBody: View {
             .overlay {
                 TranscriptLoadingOverlay(session: session, streaming: streaming)
             }
+            .onChange(of: session.transcriptVersion) { _, _ in
+                // Background subagent signals (heartbeat / stalled / done re-delivery)
+                // must not yank the viewport: the user may still be reading a summary.
+                if SubagentSignalClassifier.isBackgroundSignal(item: session.transcript.last) { return }
+                jumpToLatest(proxy)
+            }
             .onChange(of: session.rightPanel != nil) { _, _ in
                 recoverPinAfterColumnWidthChange(proxy)
             }
