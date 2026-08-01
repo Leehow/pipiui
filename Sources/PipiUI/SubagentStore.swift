@@ -779,28 +779,71 @@ final class SubagentStore: ObservableObject {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         persistURL = url
 
-        // 后台读 + 解码持久化 JSON，完成后回主线程 assign（避免主线程 IO/解码卡顿）。
-        guard agents.isEmpty else { return }
+        // App restart ⇒ no prior-process worker is still alive. Hot sessions may already
+        // have rows from message replay before this runs; still reconcile ghosts immediately.
+        let needsPersist = applyRestartReconcileToLiveAgents()
+
+        // 后台读 + 解码持久化 JSON，完成后回主线程 assign/merge（避免主线程 IO/解码卡顿）。
         let loadTask = Task.detached(priority: .utility) {
             guard let data = try? Data(contentsOf: url),
                   let persisted = try? JSONDecoder().decode([SubagentInfo].self, from: data) else {
-                return Optional<([SubagentInfo], Int)>.none
+                return Optional<[SubagentInfo]>.none
             }
-            let loaded = Self.reconcileInterruptedAfterRestart(persisted)
-            let maxLogId = loaded.flatMap(\.log).map(\.id).max() ?? 0
-            return (loaded, maxLogId)
+            return Self.reconcileInterruptedAfterRestart(persisted)
         }
         Task { @MainActor [weak self] in
-            guard let (loaded, maxLogId) = await loadTask.value,
-                  let self,
-                  self.persistURL == url,
-                  self.agents.isEmpty else { return }
-            self.agents = loaded
-            self.logCounter = maxLogId
+            guard let self, self.persistURL == url else { return }
+            let loaded = await loadTask.value
+            var didMutate = needsPersist
+
+            if let loaded {
+                if self.agents.isEmpty {
+                    self.agents = loaded
+                    self.logCounter = loaded.flatMap(\.log).map(\.id).max() ?? 0
+                    didMutate = true
+                } else {
+                    // Merge: keep live fields (already restart-reconciled); append missing history.
+                    let liveIds = Set(self.agents.map(\.id))
+                    let extras = loaded.filter { !liveIds.contains($0.id) }
+                    if !extras.isEmpty {
+                        self.agents.append(contentsOf: extras)
+                        let maxLogId = self.agents.flatMap(\.log).map(\.id).max() ?? 0
+                        if maxLogId > self.logCounter { self.logCounter = maxLogId }
+                        didMutate = true
+                    }
+                    // Replay may race during load — reconcile again (idempotent).
+                    if self.applyRestartReconcileToLiveAgents() {
+                        didMutate = true
+                    }
+                }
+            } else if self.applyRestartReconcileToLiveAgents() {
+                didMutate = true
+            }
+
             self.hasLoadedPersistedAgents = true
             if self.selectedId == nil { self.selectedId = self.agents.last?.id }
             self.retryPersistedPendingReviewMergesIfReady()
+
+            // Without an event-driven save, reconciled ghosts stay `.running` on disk forever.
+            if didMutate {
+                self.saveNow()
+            }
         }
+    }
+
+    /// Mark any in-memory `.running` rows as interrupted after process restart.
+    /// Idempotent for terminal states. Returns whether any row changed.
+    @discardableResult
+    private func applyRestartReconcileToLiveAgents() -> Bool {
+        let before = agents
+        let reconciled = Self.reconcileInterruptedAfterRestart(agents)
+        guard reconciled != before else { return false }
+        let hadRunning = before.contains { $0.state == .running }
+        agents = reconciled
+        if hadRunning {
+            onRunningCountMayHaveChanged?()
+        }
+        return true
     }
 
     /// After restart, resume one missed automatic merge for each eligible persisted row.
