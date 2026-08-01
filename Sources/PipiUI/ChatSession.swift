@@ -547,14 +547,14 @@ final class StreamingState: ObservableObject {
     /// counter is a cheap diagnostic/snapshot token and deliberately publishes no
     /// second `objectWillChange` event.
     private(set) var toolOutputVersion: UInt64 = 0
-    /// Changes only when tool result imagery crosses the empty/non-empty boundary.
-    /// That is the sole `ToolRun` property used by settled transcript planning.
+    /// Changes only when a `ToolRun` property used by settled transcript planning
+    /// changes. Today that structural fingerprint is `isRunning` + image presence.
     private(set) var toolStructureVersion: UInt64 = 0
 
     func replaceToolRuns(_ runs: [String: ToolRun]) {
         guard runs != toolRuns else { return }
-        let structureChanged = Self.imageBearingToolIDs(in: runs)
-            != Self.imageBearingToolIDs(in: toolRuns)
+        let structureChanged = Self.structuralToolStates(in: runs)
+            != Self.structuralToolStates(in: toolRuns)
         toolOutputVersion &+= 1
         if structureChanged { toolStructureVersion &+= 1 }
         toolRuns = runs
@@ -571,7 +571,7 @@ final class StreamingState: ObservableObject {
         var changed = false
         var structureChanged = false
         for (id, run) in updates where next[id] != run {
-            if (next[id]?.images.isEmpty == false) != !run.images.isEmpty {
+            if Self.structuralState(for: next[id]) != Self.structuralState(for: run) {
                 structureChanged = true
             }
             next[id] = run
@@ -583,8 +583,25 @@ final class StreamingState: ObservableObject {
         toolRuns = next
     }
 
-    private static func imageBearingToolIDs(in runs: [String: ToolRun]) -> Set<String> {
-        Set(runs.lazy.filter { !$0.value.images.isEmpty }.map(\.key))
+    private struct StructuralToolState: Equatable {
+        var isRunning: Bool
+        var hasImages: Bool
+    }
+
+    private static func structuralState(for run: ToolRun?) -> StructuralToolState {
+        StructuralToolState(
+            isRunning: run?.isRunning ?? false,
+            hasImages: run?.images.isEmpty == false
+        )
+    }
+
+    private static func structuralToolStates(
+        in runs: [String: ToolRun]
+    ) -> [String: StructuralToolState] {
+        runs.compactMapValues { run in
+            let state = structuralState(for: run)
+            return state.isRunning || state.hasImages ? state : nil
+        }
     }
 }
 

@@ -79,11 +79,7 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
     }
 
     func testTranscriptUsesNormalChronologicalLayoutWithoutReverseFlip() throws {
-        let source = try String(
-            contentsOf: repositoryRoot
-                .appendingPathComponent("Sources/PipiUI/Views/ChatDetailView.swift"),
-            encoding: .utf8
-        )
+        let source = try chatDetailSource()
         let start = try XCTUnwrap(
             source.range(of: "private struct StreamingTranscriptRows: View")?.lowerBound
         )
@@ -109,5 +105,56 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         )
         XCTAssertLessThan(history, streaming)
         XCTAssertLessThan(streaming, bottom)
+    }
+
+    func testStreamingFollowObserverIsNarrowAndInsideScrollHierarchy() throws {
+        let source = try chatDetailSource()
+        let contentStart = try XCTUnwrap(
+            source.range(of: "private var transcriptContent: some View")?.lowerBound
+        )
+        let contentEnd = try XCTUnwrap(
+            source.range(
+                of: "private func scheduleChatColumnWidthSettleRepin",
+                range: contentStart..<source.endIndex
+            )?.lowerBound
+        )
+        let content = String(source[contentStart..<contentEnd])
+
+        XCTAssertTrue(content.contains(".background {"))
+        XCTAssertTrue(content.contains("TranscriptFollowObserver(streaming: streaming)"))
+        XCTAssertTrue(content.contains("jumpToLatest(proxy)"))
+        XCTAssertFalse(content.contains(".onChange(of: streaming."))
+
+        let observerStart = try XCTUnwrap(
+            source.range(of: "private struct TranscriptFollowObserver: View")?.lowerBound
+        )
+        let observerEnd = try XCTUnwrap(
+            source.range(
+                of: "private struct StreamingTranscriptRows: View",
+                range: observerStart..<source.endIndex
+            )?.lowerBound
+        )
+        let observer = String(source[observerStart..<observerEnd])
+        XCTAssertTrue(observer.contains("@ObservedObject var streaming: StreamingState"))
+        XCTAssertTrue(observer.contains(".onReceive(streaming.objectWillChange)"))
+        XCTAssertTrue(observer.contains("onFollowNeeded()"))
+
+        let bodyStart = try XCTUnwrap(
+            source.range(of: "private struct ChatDetailViewBody: View")?.lowerBound
+        )
+        let bodyHeaderEnd = try XCTUnwrap(
+            source.range(of: "var body: some View", range: bodyStart..<source.endIndex)?.lowerBound
+        )
+        let bodyHeader = String(source[bodyStart..<bodyHeaderEnd])
+        XCTAssertTrue(bodyHeader.contains("let streaming: StreamingState"))
+        XCTAssertFalse(bodyHeader.contains("@ObservedObject var streaming: StreamingState"))
+    }
+
+    private func chatDetailSource() throws -> String {
+        try String(
+            contentsOf: repositoryRoot
+                .appendingPathComponent("Sources/PipiUI/Views/ChatDetailView.swift"),
+            encoding: .utf8
+        )
     }
 }

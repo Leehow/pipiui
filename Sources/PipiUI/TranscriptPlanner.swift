@@ -7,12 +7,12 @@ import Foundation
 /// 现在计划只随「输入版本」变化重算：
 ///
 /// - `transcriptVersion` — ChatSession 在 `transcript` 每次真实修改时递增（didSet，宁滥勿缺）
-/// - `toolStructureVersion` — changes only when tool result imagery can alter grouping
+/// - `toolStructureVersion` — changes when running state or result imagery alters grouping
 /// - `visibleCount` — 可见窗口（suffix(N)）大小
 ///
 /// Content-only tool output does not invalidate the settled layout. Tool rows still
 /// receive the latest `ToolRun`; only a change between image-free and image-bearing
-/// results can change `AssistantBlockLayout.isGroupable`.
+/// results or running-state transitions can change `AssistantBlockLayout.isGroupable`.
 final class TranscriptPlanner {
     struct InputKey: Equatable {
         var transcriptVersion: UInt64

@@ -314,6 +314,8 @@ enum AssistantBlockLayout {
             return true
         case .toolCall(let call):
             if producesImageResult(call) { return false }
+            // Live tool calls stay on the main transcript so the user can watch output.
+            if let run = toolRuns[call.id], run.isRunning { return false }
             // Any other tool that already carries result thumbnails stays visible too.
             if let run = toolRuns[call.id], !run.images.isEmpty { return false }
             return true

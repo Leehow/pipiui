@@ -358,6 +358,13 @@ private struct ChatDetailViewBody: View {
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .background {
+                // This tiny observer lives inside the scroll hierarchy. The parent
+                // detail chrome intentionally does not observe StreamingState.
+                TranscriptFollowObserver(streaming: streaming) {
+                    jumpToLatest(proxy)
+                }
+            }
             // Same-session identity rebinds may still update session.id without
             // replacing this ScrollView. Never animate that bookkeeping change.
             .animation(nil, value: session.id)
@@ -389,12 +396,6 @@ private struct ChatDetailViewBody: View {
                 jumpToLatest(proxy, retry: true)
             }
             .onChange(of: session.transcriptVersion) { _, _ in
-                jumpToLatest(proxy)
-            }
-            .onChange(of: streaming.streamingItem) { _, _ in
-                jumpToLatest(proxy)
-            }
-            .onChange(of: streaming.toolOutputVersion) { _, _ in
                 jumpToLatest(proxy)
             }
             .onChange(of: session.isWorking) { _, _ in
@@ -596,6 +597,22 @@ private struct FinishedNonTextGroupSheetContent: View {
             if let run = streaming.toolRuns[id] { result[id] = run }
         }
         return result
+    }
+}
+
+/// Narrow high-frequency subscription used only to request bottom follow.
+/// `jumpToLatest` coalesces these requests to at most one scroll every 50 ms.
+private struct TranscriptFollowObserver: View {
+    @ObservedObject var streaming: StreamingState
+    let onFollowNeeded: () -> Void
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onReceive(streaming.objectWillChange) { _ in
+                onFollowNeeded()
+            }
+            .accessibilityHidden(true)
     }
 }
 

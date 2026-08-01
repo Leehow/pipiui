@@ -94,18 +94,59 @@ final class TranscriptPlannerTests: XCTestCase {
             toolRuns: ["c1": ToolRun(isRunning: true, output: "first chunk")],
             visibleCount: 150,
             transcriptVersion: 1,
-            toolStructureVersion: 0
+            toolStructureVersion: 1
         )
         let second = planner.presentation(
             items: items,
             toolRuns: ["c1": ToolRun(isRunning: true, output: "second chunk")],
             visibleCount: 150,
             transcriptVersion: 1,
-            toolStructureVersion: 0
+            toolStructureVersion: 1
         )
 
         XCTAssertEqual(second, first)
         XCTAssertEqual(planner.computationCount, 1)
+    }
+
+    func testRunningStateReplansFinishedToolGrouping() {
+        let planner = TranscriptPlanner()
+        let items = [
+            item("u1"),
+            assistantWithTool("a1", callId: "c1"),
+            assistantWithTool("a2", callId: "c2"),
+        ]
+
+        let initiallyFinished = planner.presentation(
+            items: items,
+            toolRuns: ["c1": ToolRun(output: "done")],
+            visibleCount: 150,
+            transcriptVersion: 1,
+            toolStructureVersion: 0
+        )
+        let running = planner.presentation(
+            items: items,
+            toolRuns: ["c1": ToolRun(isRunning: true, output: "partial")],
+            visibleCount: 150,
+            transcriptVersion: 1,
+            toolStructureVersion: 1
+        )
+        let finishedAgain = planner.presentation(
+            items: items,
+            toolRuns: ["c1": ToolRun(output: "done")],
+            visibleCount: 150,
+            transcriptVersion: 1,
+            toolStructureVersion: 2
+        )
+
+        guard case .assistantRun(_, _, let initialSegments) = initiallyFinished.rows.last,
+              case .assistantRun(_, _, let runningSegments) = running.rows.last,
+              case .assistantRun(_, _, let finalSegments) = finishedAgain.rows.last else {
+            return XCTFail("expected assistant runs")
+        }
+        XCTAssertEqual(initialSegments.count, 1)
+        XCTAssertEqual(runningSegments.count, 2)
+        XCTAssertEqual(finalSegments.count, 1)
+        XCTAssertEqual(planner.computationCount, 3)
     }
 
     /// 扩大可见窗口（visibleCount 变化）后计划必须覆盖更多历史。
@@ -166,11 +207,19 @@ final class TranscriptPlannerTests: XCTestCase {
         let state = StreamingState()
         state.updateToolRun(ToolRun(isRunning: true, output: "one"), for: "tool-1")
         XCTAssertEqual(state.toolOutputVersion, 1)
-        XCTAssertEqual(state.toolStructureVersion, 0)
+        XCTAssertEqual(state.toolStructureVersion, 1)
 
         state.updateToolRun(ToolRun(isRunning: true, output: "two"), for: "tool-1")
         XCTAssertEqual(state.toolOutputVersion, 2)
-        XCTAssertEqual(state.toolStructureVersion, 0)
+        XCTAssertEqual(state.toolStructureVersion, 1)
+
+        state.updateToolRun(ToolRun(output: "finished"), for: "tool-1")
+        XCTAssertEqual(state.toolOutputVersion, 3)
+        XCTAssertEqual(state.toolStructureVersion, 2)
+
+        state.updateToolRun(ToolRun(output: "finished with more text"), for: "tool-1")
+        XCTAssertEqual(state.toolOutputVersion, 4)
+        XCTAssertEqual(state.toolStructureVersion, 2)
 
         let image = ImageBlock(
             id: "image-1",
@@ -178,8 +227,8 @@ final class TranscriptPlannerTests: XCTestCase {
             mimeType: "image/png"
         )
         state.updateToolRun(ToolRun(output: "done", images: [image]), for: "tool-1")
-        XCTAssertEqual(state.toolOutputVersion, 3)
-        XCTAssertEqual(state.toolStructureVersion, 1)
+        XCTAssertEqual(state.toolOutputVersion, 5)
+        XCTAssertEqual(state.toolStructureVersion, 3)
 
         let backfilled = ImageBlock(
             id: "image-1",
@@ -187,8 +236,42 @@ final class TranscriptPlannerTests: XCTestCase {
             mimeType: "image/png"
         )
         state.updateToolRun(ToolRun(output: "done", images: [backfilled]), for: "tool-1")
-        XCTAssertEqual(state.toolOutputVersion, 4)
+        XCTAssertEqual(state.toolOutputVersion, 6)
+        XCTAssertEqual(state.toolStructureVersion, 3)
+    }
+
+    func testStreamingStatePublishesFollowSignalForTokenAndToolUpdates() {
+        let state = StreamingState()
+        var changeCount = 0
+        let observer = state.objectWillChange.sink { changeCount += 1 }
+        defer { observer.cancel() }
+
+        state.streamingItem = item("streaming", role: "assistant", text: "token")
+        state.updateToolRun(ToolRun(isRunning: true, output: "chunk"), for: "tool-1")
+
+        XCTAssertEqual(changeCount, 2)
+    }
+
+    func testReplaceToolRunsUsesRunningAndImageStructuralFingerprint() {
+        let state = StreamingState()
+        state.replaceToolRuns(["tool-1": ToolRun(output: "finished")])
+        XCTAssertEqual(state.toolStructureVersion, 0)
+
+        state.replaceToolRuns(["tool-1": ToolRun(isRunning: true, output: "partial")])
         XCTAssertEqual(state.toolStructureVersion, 1)
+
+        state.replaceToolRuns(["tool-1": ToolRun(isRunning: true, output: "more")])
+        XCTAssertEqual(state.toolStructureVersion, 1)
+
+        state.replaceToolRuns(["tool-1": ToolRun(output: "finished")])
+        XCTAssertEqual(state.toolStructureVersion, 2)
+
+        let image = ImageBlock(id: "img", data: Data([1]), mimeType: "image/png")
+        state.replaceToolRuns(["tool-1": ToolRun(output: "finished", images: [image])])
+        XCTAssertEqual(state.toolStructureVersion, 3)
+
+        state.replaceToolRuns([:])
+        XCTAssertEqual(state.toolStructureVersion, 4)
     }
 
     func testPresentationCachesGroupingJumpAuthorshipAndToolOwnership() {
