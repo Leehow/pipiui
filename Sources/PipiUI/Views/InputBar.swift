@@ -61,12 +61,18 @@ final class ComposerSessionRouter: ObservableObject {
     @Published private(set) var slashSelectedIndex = 0
     @Published private(set) var slashPaletteVisible = false
     @Published private(set) var attachError: String?
+    @Published private(set) var pdfIngestionStatus: String?
+
+    /// Ingestion belongs to the session that selected the PDF, not whichever
+    /// session happens to be visible when background OCR completes.
+    private var pendingPDFIngestions: [ObjectIdentifier: [UUID: String]] = [:]
 
     func bind(to session: ChatSession) {
         guard self.session !== session else { return }
         self.session = session
         dismissSlashPalette()
         attachError = nil
+        refreshPDFIngestionStatus()
     }
 
     func route(images: [DraftImage]) {
@@ -102,6 +108,76 @@ final class ComposerSessionRouter: ObservableObject {
 
     func clearAttachError() {
         attachError = nil
+    }
+
+    /// Start local PDFKit/Vision extraction off the main UI queue. Each selected
+    /// file is handled serially in this batch to keep memory bounded for large
+    /// scans while still leaving the composer responsive.
+    func ingestPDFs(_ urls: [URL]) {
+        guard let session else { return }
+        guard session.composerMode == .chat else {
+            presentAttachError("PDF 仅支持在对话模式中本地解析")
+            return
+        }
+        let pdfURLs = urls.filter(NativePDFIngestion.isPDF)
+        guard !pdfURLs.isEmpty else { return }
+
+        let taskID = UUID()
+        let sessionID = ObjectIdentifier(session)
+        let projectURL = session.projectURL
+        beginPDFIngestion(
+            "正在准备本地 PDF 解析（0/\(pdfURLs.count) 个文件）…",
+            taskID: taskID,
+            sessionID: sessionID
+        )
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, weak session] in
+            var references: [String] = []
+            var failures: [String] = []
+
+            for (fileIndex, url) in pdfURLs.enumerated() {
+                let prefix = pdfURLs.count > 1 ? "PDF \(fileIndex + 1)/\(pdfURLs.count)：" : ""
+                self?.publishPDFIngestionStatus(
+                    "\(prefix)正在准备本地解析…",
+                    taskID: taskID,
+                    sessionID: sessionID
+                )
+                do {
+                    let bundle = try NativePDFIngestion.ingest(
+                        sourceURL: url,
+                        projectURL: projectURL,
+                        progress: { [weak self] progress in
+                            self?.publishPDFIngestionStatus(
+                                "\(prefix)\(progress.localizedDescription)",
+                                taskID: taskID,
+                                sessionID: sessionID
+                            )
+                        }
+                    )
+                    references.append(bundle.draftReference(for: url))
+                } catch {
+                    failures.append("\(url.lastPathComponent)：\(error.localizedDescription)")
+                }
+            }
+
+            DispatchQueue.main.async { [weak self, weak session] in
+                guard let self else { return }
+                self.finishPDFIngestion(taskID: taskID, sessionID: sessionID)
+                guard let session else { return }
+
+                if !references.isEmpty {
+                    let referenceText = references.joined(separator: "\n\n")
+                    if session.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        session.draftText = referenceText
+                    } else {
+                        session.draftText += "\n\n\(referenceText)"
+                    }
+                }
+                if !failures.isEmpty {
+                    self.presentAttachError("PDF 本地解析失败：\(failures.joined(separator: "；"))")
+                }
+            }
+        }
     }
 
     func refreshSlashPalette(disabledSkills: Set<String>) {
@@ -163,7 +239,7 @@ final class ComposerSessionRouter: ObservableObject {
 
     @discardableResult
     func executeSlash(_ command: SlashCommand) -> Bool {
-        guard let session else { return false }
+        guard let session, !hasPendingPDFIngestion(for: session) else { return false }
         let args: String
         if let invocation = BuiltinCommands.parseInvocation(session.draftText),
            invocation.name == command.name {
@@ -189,7 +265,10 @@ final class ComposerSessionRouter: ObservableObject {
     }
 
     var canSend: Bool {
-        guard let session, !session.mediaBusy else { return false }
+        guard let session,
+              !session.mediaBusy,
+              !hasPendingPDFIngestion(for: session)
+        else { return false }
         let hasText = !session.draftText
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty
@@ -204,10 +283,11 @@ final class ComposerSessionRouter: ObservableObject {
 
     @discardableResult
     func send() -> Bool {
+        guard let session, !hasPendingPDFIngestion(for: session) else { return false }
         if executeSelectedSlash() {
             return true
         }
-        guard let session, canSend else { return false }
+        guard canSend else { return false }
         let images = session.draftImages
         // Expand before clearing draftText — onChange prune would otherwise wipe draftPastes.
         let text = session.expandedDraftText(from: session.draftText)
@@ -217,6 +297,63 @@ final class ComposerSessionRouter: ObservableObject {
         attachError = nil
         session.sendPrompt(text, images: images)
         return true
+    }
+
+    private func hasPendingPDFIngestion(for session: ChatSession) -> Bool {
+        !(pendingPDFIngestions[ObjectIdentifier(session)] ?? [:]).isEmpty
+    }
+
+    private func publishPDFIngestionStatus(
+        _ status: String,
+        taskID: UUID,
+        sessionID: ObjectIdentifier
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            self?.setPDFIngestionStatus(status, taskID: taskID, sessionID: sessionID)
+        }
+    }
+
+    private func setPDFIngestionStatus(
+        _ status: String,
+        taskID: UUID,
+        sessionID: ObjectIdentifier
+    ) {
+        guard pendingPDFIngestions[sessionID]?[taskID] != nil else { return }
+        pendingPDFIngestions[sessionID, default: [:]][taskID] = status
+        refreshPDFIngestionStatus()
+    }
+
+    private func beginPDFIngestion(
+        _ status: String,
+        taskID: UUID,
+        sessionID: ObjectIdentifier
+    ) {
+        pendingPDFIngestions[sessionID, default: [:]][taskID] = status
+        refreshPDFIngestionStatus()
+    }
+
+    private func finishPDFIngestion(taskID: UUID, sessionID: ObjectIdentifier) {
+        pendingPDFIngestions[sessionID]?[taskID] = nil
+        if pendingPDFIngestions[sessionID]?.isEmpty == true {
+            pendingPDFIngestions[sessionID] = nil
+        }
+        refreshPDFIngestionStatus()
+    }
+
+    private func refreshPDFIngestionStatus() {
+        guard let session else {
+            pdfIngestionStatus = nil
+            return
+        }
+        pdfIngestionStatus = pendingPDFIngestions[ObjectIdentifier(session)]?.values.first
+    }
+
+    private func presentAttachError(_ message: String) {
+        attachError = message
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard self?.attachError == message else { return }
+            self?.attachError = nil
+        }
     }
 }
 
@@ -992,6 +1129,16 @@ struct InputBar: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            if let status = composerRouter.pdfIngestionStatus {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             if let status = session.mediaStatus {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.mini)
@@ -1239,7 +1386,7 @@ struct InputBar: View {
             Button {
                 pickFiles()
             } label: {
-                Label("上传图片", systemImage: "photo.on.rectangle")
+                Label("上传图片或 PDF", systemImage: "doc.on.doc")
             }
             Divider()
             Button {
@@ -1276,7 +1423,7 @@ struct InputBar: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
-        .help("上传图片 / 生成图像 / 生成视频")
+        .help("上传图片或 PDF / 生成图像 / 生成视频")
         .disabled(session.mediaBusy)
     }
 
@@ -1400,21 +1547,47 @@ struct InputBar: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = [.image]
+        panel.allowedContentTypes = [.image, .pdf]
         panel.prompt = "添加"
-        panel.message = "选择要发送的图片"
+        panel.message = "选择要发送的图片或本地解析的 PDF"
         guard panel.runModal() == .OK else { return }
-        composerRouter.appendResults(panel.urls.map { ImageAttachment.make(from: $0) })
+        let pdfURLs = panel.urls.filter(NativePDFIngestion.isPDF)
+        let imageURLs = panel.urls.filter { !NativePDFIngestion.isPDF($0) }
+        composerRouter.appendResults(imageURLs.map { ImageAttachment.make(from: $0) })
+        composerRouter.ingestPDFs(pdfURLs)
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         var handled = false
         let group = DispatchGroup()
         var results: [Result<DraftImage, ImageAttachment.LoadError>] = []
+        var pdfURLs: [URL] = []
         let lock = NSLock()
 
         for provider in providers {
-            if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+            // A dropped file URL is authoritative. Check its extension before
+            // attempting image decode so PDFs never fall through to the image
+            // attachment path.
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                handled = true
+                group.enter()
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    defer { group.leave() }
+                    let url: URL?
+                    if let data = item as? Data {
+                        url = URL(dataRepresentation: data, relativeTo: nil)
+                    } else {
+                        url = item as? URL
+                    }
+                    lock.lock()
+                    if let url, NativePDFIngestion.isPDF(url) {
+                        pdfURLs.append(url)
+                    } else {
+                        results.append(url.map(ImageAttachment.make(from:)) ?? .failure(.corrupt))
+                    }
+                    lock.unlock()
+                }
+            } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
                 handled = true
                 group.enter()
                 provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
@@ -1427,22 +1600,6 @@ struct InputBar: View {
                     }
                     lock.lock(); results.append(result); lock.unlock()
                 }
-            } else if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                handled = true
-                group.enter()
-                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                    defer { group.leave() }
-                    let result: Result<DraftImage, ImageAttachment.LoadError>
-                    if let data = item as? Data,
-                       let url = URL(dataRepresentation: data, relativeTo: nil) {
-                        result = ImageAttachment.make(from: url)
-                    } else if let url = item as? URL {
-                        result = ImageAttachment.make(from: url)
-                    } else {
-                        result = .failure(.corrupt)
-                    }
-                    lock.lock(); results.append(result); lock.unlock()
-                }
             }
         }
 
@@ -1450,6 +1607,7 @@ struct InputBar: View {
         let router = composerRouter
         group.notify(queue: .main) {
             router.appendResults(results)
+            router.ingestPDFs(pdfURLs)
         }
         return true
     }
