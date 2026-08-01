@@ -132,6 +132,23 @@ final class SubagentContinuityTests: XCTestCase {
                       "a retry must say it is the same event, not a new one")
     }
 
+    /// The same agentId's done used to be deliverable twice (a second notify, a racing double
+    /// resolve, or a retry), and the second followUp landed below the previous turn's wrap-up,
+    /// pushing the summary out of view and making the model answer a duplicate. Each agentId may
+    /// deliver at most one done per run: the latch is armed on the only delivery exit and
+    /// cleared when a new run of the same id starts.
+    func testDoneIsDeliveredAtMostOncePerAgentRun() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains("const deliveredDone = new Set<string>();"),
+                      "a per-agent latch is needed so a second notify/retry cannot re-deliver the same done")
+        XCTAssertTrue(s.contains("if (deliveredDone.has(agentId)) return;"),
+                      "the latch must intercept every later attempt, regardless of which path raised it")
+        XCTAssertTrue(s.contains("deliveredDone.add(agentId);"),
+                      "the first delivery arms the latch")
+        XCTAssertTrue(s.contains("deliveredDone.delete(agentId);"),
+                      "re-dispatching/resuming the same agentId opens a new run, so its own done may deliver again")
+    }
+
     /// A boolean stallNotified pushed once and then went silent until the 15-minute heartbeat.
     /// A boss that chose to keep waiting must hear again: the handle now stamps the last push
     /// and re-pushes once five more minutes of idleness have passed.

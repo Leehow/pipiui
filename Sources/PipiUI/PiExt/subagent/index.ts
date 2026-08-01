@@ -1250,6 +1250,7 @@ function jobPrune(): void {
 
 function jobUpsertRunning(agentId: string, name: string, task: string, title?: string): void {
 	const existing = jobRegistry.get(agentId);
+	deliveredDone.delete(agentId); // 同 agentId 新一轮运行（re-dispatch/续跑）允许投递自己的 done
 	// Resume of the same agentId must reopen a terminal row as running (matches Swift start).
 	const keepLive = existing?.state === "running";
 	jobRegistry.set(agentId, {
@@ -2203,8 +2204,15 @@ interface PendingDoneEntry {
 	lastAttemptAt: number;
 }
 const pendingDone = new Map<string, PendingDoneEntry>();
+// 每 agentId 每轮运行至多投递一次 done：二次 notify/重投直接挡掉，防止同一条
+// [subagent-done] 再次注入聊天、盖掉上一轮完结总结。jobUpsertRunning 开启新一轮时清闩。
+const deliveredDone = new Set<string>();
 
 function sendDoneWithConfirmation(pi: ExtensionAPI, agentId: string, text: string, isRetry: boolean): void {
+	// 已投递门闩：无论第二次来自 notify 还是重投都拦截。sendDoneWithConfirmation 是 done 投递的
+	// 唯一出口（deliverSubagentDone 用于 stall/heartbeat/vanished，不走这里，不受影响）。
+	if (deliveredDone.has(agentId)) return;
+	deliveredDone.add(agentId);
 	const now = Date.now();
 	let entry = pendingDone.get(agentId);
 	if (!entry) {
@@ -3210,6 +3218,7 @@ export default function (pi: ExtensionAPI) {
 
 		// (1) done 重投
 		for (const [agentId, entry] of [...pendingDone]) {
+			if (deliveredDone.has(agentId)) { pendingDone.delete(agentId); continue; } // 已闩条目不再重投，清理防残留
 			if (now - entry.lastAttemptAt < DONE_RETRY_MIN_INTERVAL_MS) continue;
 			sendDoneWithConfirmation(pi, agentId, entry.text, true);
 		}
