@@ -800,6 +800,12 @@ final class ChatSession: ObservableObject, Identifiable {
         subagents.bindMainProject(projectURL)
         // Attribute per-turn usage events to this session in the token ledger.
         subagents.sessionKey = id
+        // App 运行中对账：本会话 pi 进程死后，桥接不再刷新 lastObservedAt，扩展侧
+        // vanished 结算（runningAgents 属父运行时）也不会再跑；由 store 周期扫掉
+        // stale running 幽灵。进程活着时对账直接跳过（那是扩展侧的责任区）。
+        subagents.startOrphanReconciliation { [weak self] in
+            self?.processAlive ?? false
+        }
         subagents.resolveContextWindow = { [weak self] modelId in
             guard let modelId, !modelId.isEmpty else { return nil }
             if let m = self?.availableModels.first(where: { $0.id == modelId }),
@@ -932,6 +938,9 @@ final class ChatSession: ObservableObject, Identifiable {
             )
             self.processAlive = false
             self.isStreaming = false
+            // 进程确认死亡：立即对账一次（已 stale 的幽灵当场结算；新鲜的留给
+            // store 周期 tick 在 10 分钟窗口后处理）。
+            self.subagents.reconcileOrphanedNow()
             self.isStopping = false
             self.isSendingFromQueue = false
             // Exit before the first transcript arrives must not leave the spinner up.
