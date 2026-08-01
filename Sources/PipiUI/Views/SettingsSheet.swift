@@ -1464,6 +1464,9 @@ private struct SubagentModelRow: View, Equatable {
                     HStack(spacing: 6) {
                         ProviderLogo(model: model, size: 12)
                         Text("\(model.name)（\(model.id)）")
+                        if ModelCapabilities.isRecommended(.worker, for: model.id) {
+                            ModelRoleBadge(role: .worker)
+                        }
                     }
                     .tag(model.id)
                 }

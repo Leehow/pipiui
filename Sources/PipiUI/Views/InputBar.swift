@@ -1720,6 +1720,9 @@ struct InputBar: View {
                             HStack(spacing: 6) {
                                 ProviderLogo(model: m, size: 12)
                                 Text(m.name)
+                                if ModelCapabilities.isRecommended(.boss, for: m.id) {
+                                    ModelRoleBadge(role: .boss)
+                                }
                                 if m.id == session.model?.id {
                                     Image(systemName: "checkmark")
                                 }
