@@ -1916,9 +1916,10 @@ struct InputBar: View {
         .onAppear { reloadBalanceLast30Days() }
     }
 
-    /// Lazy, non-blocking refresh of the 30-day ledger total in raw pi USD
-    /// (`.ledger`); the popover converts to the display unit at render time.
-    /// Mirrors SettingsSheet.reloadUsage: detached utility task + MainActor hop.
+    /// Lazy, non-blocking refresh of the 30-day total in raw pi USD (`.ledger`)
+    /// + pi main-session backfill; the popover converts to the display unit at
+    /// render time. Mirrors SettingsSheet.reloadUsage: detached utility task +
+    /// MainActor hop.
     private func reloadBalanceLast30Days() {
         Task.detached(priority: .utility) {
             let records = TokenUsageStats.loadSharedRecords()
@@ -1928,8 +1929,16 @@ struct InputBar: View {
                 groupBy: .model,
                 costMode: .ledger
             )
+            // 回填从未经 ledger 记账的 pi 主会话消耗（headless/CLI 会话、旧历史）：
+            // 凡与 ledger 主通道会话（resume: 精确路径 / new: 时间窗口）对得上的
+            // pi 会话文件被跳过，避免重复计费；其余文件只计 30 天窗口内的用量。
+            let meta = PiMainUsageBackfill.ledgerMainSessionMeta()
+            let backfill = PiMainUsageBackfill.sumLast30Days(
+                ledgerMainSessions: meta.mainSessions,
+                newSessionFirstTs: meta.newSessionFirstTs
+            )
             await MainActor.run {
-                balanceLast30Days = report.total.cost
+                balanceLast30Days = report.total.cost + backfill
             }
         }
     }
