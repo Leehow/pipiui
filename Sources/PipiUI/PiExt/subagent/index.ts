@@ -12,6 +12,7 @@
  * Uses JSON mode to capture structured output from subagents.
  */
 
+import { randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -1054,6 +1055,14 @@ const AUTO_RESUME_MAX = 2;
 const AUTO_RESUME_BACKOFF_MS = [5_000, 15_000] as const;
 /** Context size above which a final retryable failure gets a fresh-redispatch hint. */
 const AUTO_RESUME_CONTEXT_HINT_TOKENS = 100_000;
+/** Context tokens at/above which the session is compacted before an auto-resume re-spawn. */
+const AUTO_COMPACT_BEFORE_RESUME_TOKENS = 80_000;
+/** Keep the most recent tokens across the compaction boundary (pi default keepRecentTokens). */
+const AUTO_COMPACT_KEEP_TOKENS = 20_000;
+/** Min chain messages for a compaction to be meaningful. */
+const AUTO_COMPACT_MIN_MESSAGES = 3;
+/** Max messages kept by compaction (bounds the walk when usage tokens are missing). */
+const AUTO_COMPACT_MAX_MESSAGES = 12;
 
 /**
  * Transient network / upstream API failures worth auto-resuming the worker session.
@@ -1710,6 +1719,123 @@ function agentSessionFiles(dir: string, sessionId: string): string[] {
 			.map((f) => path.join(dir, f));
 	} catch {
 		return [];
+	}
+}
+
+/** 8-char hex id for a compaction entry (matches pi's own compaction id shape). */
+function compactionEntryId(): string {
+	try {
+		return randomBytes(4).toString("hex");
+	} catch {
+		return Math.floor(Math.random() * 0xffffffff)
+			.toString(16)
+			.padStart(8, "0");
+	}
+}
+
+/**
+ * Append a pi-native `{"type":"compaction",...}` entry to the session jsonl before an
+ * auto-resume re-spawn, so the worker restarts from a compacted context instead of dying
+ * on a full one. Append-only: never rewrites the file, never breaks the parent chain —
+ * pi's buildContextEntries drops everything before `firstKeptEntryId` on resume and renders
+ * `summary` as one user text. Any failure returns false: compaction must never block resume.
+ */
+function appendSessionCompaction(
+	sessionDir: string,
+	sessionId: string,
+	taskText: string,
+	lastContextTokens: number,
+): boolean {
+	try {
+		const files = agentSessionFiles(sessionDir, sessionId);
+		if (files.length === 0) return false;
+		const lines = fs.readFileSync(files[files.length - 1], "utf8").split("\n");
+		const entries: any[] = [];
+		for (const line of lines) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+			try {
+				entries.push(JSON.parse(trimmed));
+			} catch {
+				// Bad line: pi's loader skips it, so do we.
+			}
+		}
+		// No parseable header, or first entry is not a session header → treat file as empty.
+		if (entries.length === 0 || entries[0]?.type !== "session") return false;
+
+		// leafId = id of the last non-session entry (message / compaction / branch_summary …).
+		let leafId: string | undefined;
+		for (let i = entries.length - 1; i >= 0; i--) {
+			if (entries[i].type !== "session") {
+				leafId = entries[i].id;
+				break;
+			}
+		}
+		if (!leafId) return false;
+
+		// Walk the parent chain root → leaf once; it serves both the keep-set and the summary.
+		const byId = new Map<string, any>();
+		for (const e of entries) if (e.id) byId.set(e.id, e);
+		const chain: any[] = [];
+		let cur: any = byId.get(leafId);
+		while (cur) {
+			chain.push(cur);
+			cur = cur.parentId ? byId.get(cur.parentId) : undefined;
+		}
+		chain.reverse();
+
+		// Walk the chain backwards from the leaf, accumulating usage.totalTokens (assistant
+		// messages only; 0 otherwise) until we keep KEEP_TOKENS or MAX_MESSAGES messages.
+		const kept: any[] = [];
+		let acc = 0;
+		for (let i = chain.length - 1; i >= 0; i--) {
+			if (chain[i].type !== "message") continue;
+			kept.push(chain[i]);
+			acc += chain[i].message?.usage?.totalTokens ?? 0;
+			if (acc >= AUTO_COMPACT_KEEP_TOKENS || kept.length >= AUTO_COMPACT_MAX_MESSAGES) break;
+		}
+		kept.reverse(); // kept[0] = earliest kept message
+		if (kept.length < AUTO_COMPACT_MIN_MESSAGES) return false;
+		const firstKeptEntryId = kept[0].id;
+
+		// Summary: the chain's first user message (the original task), truncated.
+		// content may be a string or an array of blocks ({type:"text",text} etc.).
+		let summary = "";
+		for (const e of chain) {
+			if (e.type !== "message" || e.message?.role !== "user") continue;
+			const content = e.message.content;
+			if (typeof content === "string") {
+				summary = content;
+			} else if (Array.isArray(content)) {
+				const textBlock = content.find((b: any) => b?.type === "text" && typeof b.text === "string");
+				if (textBlock) summary = textBlock.text;
+			}
+			if (summary) break;
+		}
+		summary = summary.slice(0, 400);
+		if (summary) {
+			summary += "\n[pipiui] 早期上下文已压缩；请基于以上任务描述继续。";
+		} else {
+			summary = "任务描述见上方会话开头（已压缩）。";
+		}
+
+		fs.appendFileSync(
+			files[files.length - 1],
+			"\n" +
+				JSON.stringify({
+					type: "compaction",
+					id: compactionEntryId(),
+					parentId: leafId,
+					timestamp: new Date().toISOString(),
+					summary,
+					firstKeptEntryId,
+					tokensBefore: lastContextTokens,
+				}) +
+				"\n",
+		);
+		return true;
+	} catch {
+		return false;
 	}
 }
 
@@ -2714,6 +2840,21 @@ async function runSingleAgent(
 			const h = runningAgents.get(pipiuiAgentId);
 			if (h) h.pid = undefined;
 			if (isBackground) noteAgentActivity(pipiuiAgentId);
+			// 压缩会话后再 resume：worker 进程已退出（无并发写窗口），满上下文会反复 fetch
+			// failed，append 一条 pi 原生 compaction 条目让 buildContextEntries 丢弃旧上下文。
+			// 只读角色（sessionDir undefined）无会话可压缩，跳过并走原 resume 路径（冷重跑）。
+			if (sessionDir && (currentResult.usage?.contextTokens ?? 0) >= AUTO_COMPACT_BEFORE_RESUME_TOKENS) {
+				const compacted = appendSessionCompaction(
+					sessionDir,
+					sessionId,
+					task,
+					currentResult.usage?.contextTokens ?? 0,
+				);
+				if (compacted) {
+					pipiuiActivity += `；会话已压缩（${((currentResult.usage?.contextTokens ?? 0) / 1000) | 0}k tokens）`;
+					pipiuiUpdate(true);
+				}
+			}
 			pipiuiUpdate(true);
 
 			// Backoff interruptible by abort (foreground tool signal or backgroundAbort).
