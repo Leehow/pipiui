@@ -965,6 +965,9 @@ struct InputBar: View {
     @State private var slashKeyMonitor = ComposerSlashKeyMonitor()
     @State private var showQuotaPopover: Bool = false
     @State private var showContextPopover: Bool = false
+    @State private var showBalancePopover: Bool = false
+    /// 30-day ledger total (CNY) for the balance popover, refreshed on each open.
+    @State private var balanceLast30Days: Double?
     /// Measured width of the status row; drives compact vs wide without ViewThatFits.
     @State private var statusBarWidth: CGFloat = 0
 
@@ -1591,6 +1594,12 @@ struct InputBar: View {
                     .background(Capsule().fill(Color.primary.opacity(0.06)))
                     .help("账户余额")
                     .contentShape(Capsule())
+                    .onTapGesture { showBalancePopover.toggle() }
+                    .popover(isPresented: $showBalancePopover, arrowEdge: .bottom) {
+                        balancePopover
+                            .frame(width: 264)
+                            .padding(10)
+                    }
             }
         }
         .fixedSize(horizontal: true, vertical: false)
@@ -1610,6 +1619,37 @@ struct InputBar: View {
                 ForEach(session.quotaWindows) { w in
                     quotaWindowRow(w)
                 }
+            }
+        }
+    }
+
+    private var balancePopover: some View {
+        let display = BalanceSpendDisplay(
+            sessionCostUSD: session.cost,
+            last30DaysCNY: balanceLast30Days ?? 0
+        )
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("账户余额")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+            contextDetailRow("本会话消耗", display.sessionSpendUSD)
+            contextDetailRow("30天内消耗", balanceLast30Days == nil ? "…" : display.last30DaysCNY)
+        }
+        .onAppear { reloadBalanceLast30Days() }
+    }
+
+    /// Lazy, non-blocking refresh of the 30-day ledger total (mirrors
+    /// SettingsSheet.reloadUsage: detached utility task + MainActor hop).
+    private func reloadBalanceLast30Days() {
+        Task.detached(priority: .utility) {
+            let records = TokenUsageStats.loadSharedRecords()
+            let report = TokenUsageStats.aggregate(
+                records: records,
+                period: .last30Days,
+                groupBy: .model
+            )
+            await MainActor.run {
+                balanceLast30Days = report.total.cost
             }
         }
     }

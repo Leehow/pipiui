@@ -150,4 +150,29 @@ final class BalanceProviderTests: XCTestCase {
         XCTAssertEqual(formatBalance(amount: Decimal(string: "74.754")!, currency: "USD"), "$74.75")
         XCTAssertEqual(formatBalance(amount: Decimal(string: "74.755")!, currency: "USD"), "$74.76")
     }
+
+    // MARK: - Spend display (balance popover)
+
+    func testBalanceSpendDisplayFormatsRows() {
+        let d = BalanceSpendDisplay(sessionCostUSD: 0.123456, last30DaysCNY: 12.3456)
+        XCTAssertEqual(d.sessionSpendUSD, "$0.1235")
+        XCTAssertEqual(d.last30DaysCNY, "¥12.35")
+    }
+
+    func testBalanceSpendDisplayZeroValues() {
+        let d = BalanceSpendDisplay(sessionCostUSD: 0, last30DaysCNY: 0)
+        XCTAssertEqual(d.sessionSpendUSD, "$0.0000")
+        XCTAssertEqual(d.last30DaysCNY, "¥0")
+    }
+
+    func testBalanceSpendDisplayTinyCNYKeepsPrecision() {
+        let d = BalanceSpendDisplay(sessionCostUSD: 1.0, last30DaysCNY: 0.005)
+        XCTAssertEqual(d.last30DaysCNY, "¥0.0050")
+    }
+
+    func testBalanceSpendDisplayRoundsSubCentUSD() {
+        let d = BalanceSpendDisplay(sessionCostUSD: 0.00001234, last30DaysCNY: 0.5)
+        XCTAssertEqual(d.sessionSpendUSD, "$0.0000")
+        XCTAssertEqual(d.last30DaysCNY, "¥0.500")
+    }
 }
