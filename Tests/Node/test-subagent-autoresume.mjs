@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +18,11 @@ const piPackageRoot = join(
   ".npm-global/lib/node_modules/@earendil-works/pi-coding-agent",
 );
 const piNodeModules = join(piPackageRoot, "node_modules");
+
+// Implementation A (subagent/index.ts): hardcoded AUTO_RESUME_MAX=2,
+// AUTO_RESUME_BACKOFF_MS=[5000, 15000]. No env knobs / [subagent-autoresume] notify.
+const BACKOFF_FIRST_MS = 5_000;
+const BACKOFF_SECOND_MS = 15_000;
 
 async function linkRuntimePackages(directory) {
   const scoped = join(directory, "node_modules/@earendil-works");
@@ -48,7 +53,7 @@ async function linkRuntimePackages(directory) {
  * - When re-invoked with --mode (child worker), fail N times with a configured stderr
  *   signature, then succeed (or keep failing).
  * - Parent installs the real subagent extension and runs one foreground dispatch so the
- *   result + captured [subagent-autoresume]/[subagent-done] messages are returned as JSON.
+ *   result + spawn count are returned as JSON.
  */
 async function prepareHarness(directory, { failTimes, failStderr, agentId }) {
   await cp(sourceSubagentDirectory, join(directory, "subagent"), { recursive: true });
@@ -110,19 +115,27 @@ install({
 });
 
 const subagent = globalThis.__tool;
+// Implementation A unref()s auto-resume backoff timers so a quiet host can exit.
+// Keep a ref'd handle so this headless harness survives the 5s/15s sleeps.
+const keepAlive = setInterval(() => {}, 60_000);
 const started = Date.now();
-const result = await subagent.execute(
-  "autoresume-test",
-  {
-    agent: "probe",
-    task: "simulate transient death",
-    agentId,
-    background: false,
-  },
-  new AbortController().signal,
-  undefined,
-  { cwd: process.cwd(), hasUI: false },
-);
+let result;
+try {
+  result = await subagent.execute(
+    "autoresume-test",
+    {
+      agent: "probe",
+      task: "simulate transient death",
+      agentId,
+      background: false,
+    },
+    new AbortController().signal,
+    undefined,
+    { cwd: process.cwd(), hasUI: false },
+  );
+} finally {
+  clearInterval(keepAlive);
+}
 const elapsedMs = Date.now() - started;
 const spawns = Number(readFileSync(counterPath, "utf8") || "0");
 process.stdout.write(
@@ -142,7 +155,7 @@ process.stdout.write(
   return { agentsDirectory, harness, counterPath };
 }
 
-async function runHarness(directory, agentsDirectory, harness, extraEnv = {}) {
+async function runHarness(directory, agentsDirectory, harness, { timeoutMs = 20_000 } = {}) {
   const { stdout } = await execFileAsync(
     process.execPath,
     ["--experimental-strip-types", harness],
@@ -157,19 +170,20 @@ async function runHarness(directory, agentsDirectory, harness, extraEnv = {}) {
         PIPIUI_BRIDGE_PORT: "",
         PIPIUI_SESSION_KEY: "",
         PIPIUI_WORKTREE: "0",
-        // Keep tests fast; production default remains 20s→60s.
-        PIPI_SUBAGENT_AUTORESUME_BACKOFF_MS: "40,80",
-        ...extraEnv,
       },
-      // Exhausted path: 3 spawns + 40+80ms backoff; leave headroom.
-      timeout: 15_000,
+      // Exhaust path needs first+second backoff (5s+15s) plus spawn overhead.
+      timeout: timeoutMs,
       maxBuffer: 5 * 1024 * 1024,
     },
   );
   return JSON.parse(stdout);
 }
 
-test("transient child death triggers auto-resume with backoff then succeeds", async () => {
+function singleResult(out) {
+  return out.details?.results?.[0] ?? null;
+}
+
+test("retryable worker death auto-resumes once then succeeds", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pipiui-autoresume-ok-"));
   try {
     const { agentsDirectory, harness } = await prepareHarness(directory, {
@@ -177,24 +191,30 @@ test("transient child death triggers auto-resume with backoff then succeeds", as
       failStderr: "Error: fetch failed",
       agentId: "resume-ok",
     });
-    const out = await runHarness(directory, agentsDirectory, harness);
+    const out = await runHarness(directory, agentsDirectory, harness, {
+      // 1× first backoff (5s) + headroom
+      timeoutMs: 25_000,
+    });
 
     assert.equal(out.spawns, 2, "initial death + one auto-resume spawn");
     assert.notEqual(out.isError, true, "dispatch should succeed after resume");
     assert.match(out.text, /recovered-ok spawn=2/);
-    const autoresume = out.delivered.filter((m) => m.includes("[subagent-autoresume]"));
-    assert.equal(autoresume.length, 1, "one light auto-resume notify");
-    assert.match(autoresume[0], /attempt=1\/2/);
-    assert.match(autoresume[0], /fetch failed/i);
-    assert.match(autoresume[0], /backoffMs=40/);
-    // Backoff ~40ms should be visible vs an instant double-spawn, without flaking hard.
-    assert.ok(out.elapsedMs >= 30, `expected backoff delay, elapsed=${out.elapsedMs}`);
+    // Implementation A appends resume note on the end report path; success tool text is
+    // the assistant final message (+ verified=). Spawns + backoff prove the resume loop.
+    const single = singleResult(out);
+    assert.ok(single, "details.results[0] present");
+    assert.equal(single.exitCode, 0);
+    assert.match(String(single.stderr ?? ""), /fetch failed/i);
+    assert.ok(
+      out.elapsedMs >= BACKOFF_FIRST_MS - 500,
+      `expected ~${BACKOFF_FIRST_MS}ms first backoff, elapsed=${out.elapsedMs}`,
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("auto-resume exhausts after 2 resumes and reports terminal failure with reason", async () => {
+test("auto-resume caps at AUTO_RESUME_MAX=2 then fails with last retryable error", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pipiui-autoresume-exhaust-"));
   try {
     const { agentsDirectory, harness } = await prepareHarness(directory, {
@@ -202,74 +222,83 @@ test("auto-resume exhausts after 2 resumes and reports terminal failure with rea
       failStderr: "Service temporarily unavailable",
       agentId: "resume-exhaust",
     });
-    const out = await runHarness(directory, agentsDirectory, harness);
+    const out = await runHarness(directory, agentsDirectory, harness, {
+      // 5s + 15s backoff + spawns
+      timeoutMs: 45_000,
+    });
 
-    assert.equal(out.spawns, 3, "initial + 2 auto-resumes");
-    assert.equal(out.isError, true, "must end as failure");
-    assert.match(
-      out.text,
-      /auto-resume exhausted \(2\/2\)/i,
-      "terminal text must include exhausted reason",
-    );
-    assert.match(out.text, /Service temporarily unavailable/i);
-    const autoresume = out.delivered.filter((m) => m.includes("[subagent-autoresume]"));
-    assert.equal(autoresume.length, 2, "notify once per resume attempt");
-    assert.match(autoresume[0], /attempt=1\/2/);
-    assert.match(autoresume[0], /backoffMs=40/);
-    assert.match(autoresume[1], /attempt=2\/2/);
-    assert.match(autoresume[1], /backoffMs=80/);
-    // Foreground path returns the tool result directly; details.results carry the failure.
-    const single = out.details?.results?.[0];
+    assert.equal(out.spawns, 3, "initial + 2 auto-resumes (AUTO_RESUME_MAX=2)");
+    assert.equal(out.isError, true, "must end as failure after budget exhausted");
+    assert.match(out.text, /unavailable/i);
+    // No Implementation-B "auto-resume exhausted" banner; failure text carries stderr.
+    assert.doesNotMatch(out.text, /auto-resume exhausted/i);
+
+    const single = singleResult(out);
     assert.ok(single, "details.results[0] present");
     assert.equal(single.exitCode, 1);
-    assert.match(String(single.errorMessage ?? single.stderr ?? ""), /auto-resume exhausted/i);
-    assert.ok(out.elapsedMs >= 100, `expected 40+80 backoff, elapsed=${out.elapsedMs}`);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
+    const stderr = String(single.stderr ?? "");
+    assert.match(stderr, /Service temporarily unavailable/i);
+    // stderr accumulates across attempts — three child deaths.
+    const hits = stderr.match(/Service temporarily unavailable/gi) ?? [];
+    assert.equal(hits.length, 3, "stderr should accumulate all three failed attempts");
 
-test("401 Unauthorized is non-transient and does not auto-resume", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pipiui-autoresume-401-"));
-  try {
-    const { agentsDirectory, harness } = await prepareHarness(directory, {
-      failTimes: 99,
-      failStderr: "HTTP 401 Unauthorized: invalid api key",
-      agentId: "resume-401",
-    });
-    const out = await runHarness(directory, agentsDirectory, harness);
-
-    assert.equal(out.spawns, 1, "must not retry non-transient auth errors");
-    assert.equal(out.isError, true);
-    assert.equal(
-      out.delivered.filter((m) => m.includes("[subagent-autoresume]")).length,
-      0,
-      "no auto-resume notify",
+    const minBackoff = BACKOFF_FIRST_MS + BACKOFF_SECOND_MS - 1_000;
+    assert.ok(
+      out.elapsedMs >= minBackoff,
+      `expected ~${BACKOFF_FIRST_MS}+${BACKOFF_SECOND_MS}ms backoff, elapsed=${out.elapsedMs}`,
     );
-    assert.doesNotMatch(out.text, /auto-resume exhausted/i);
-    assert.match(out.text, /401|Unauthorized|invalid api key/i);
-    assert.ok(out.elapsedMs < 500, `should fail immediately, elapsed=${out.elapsedMs}`);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("PIPI_SUBAGENT_AUTORESUME=0 disables automatic resume", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pipiui-autoresume-off-"));
+test("quota / billing errors are non-retryable and do not auto-resume", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pipiui-autoresume-quota-"));
   try {
     const { agentsDirectory, harness } = await prepareHarness(directory, {
       failTimes: 99,
-      failStderr: "Connection error",
-      agentId: "resume-off",
+      failStderr: "Error: insufficient_quota — billing hard limit reached",
+      agentId: "resume-quota",
     });
     const out = await runHarness(directory, agentsDirectory, harness, {
-      PIPI_SUBAGENT_AUTORESUME: "0",
+      timeoutMs: 15_000,
     });
 
-    assert.equal(out.spawns, 1);
+    assert.equal(out.spawns, 1, "must not retry non-retryable quota/billing errors");
     assert.equal(out.isError, true);
-    assert.equal(out.delivered.filter((m) => m.includes("[subagent-autoresume]")).length, 0);
-    assert.match(out.text, /Connection error/i);
+    assert.match(out.text, /quota|billing/i);
+    assert.ok(
+      out.elapsedMs < BACKOFF_FIRST_MS,
+      `should fail immediately without ${BACKOFF_FIRST_MS}ms backoff, elapsed=${out.elapsedMs}`,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("first-attempt success does not auto-resume", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pipiui-autoresume-first-ok-"));
+  try {
+    const { agentsDirectory, harness } = await prepareHarness(directory, {
+      failTimes: 0,
+      failStderr: "Error: fetch failed",
+      agentId: "resume-first-ok",
+    });
+    const out = await runHarness(directory, agentsDirectory, harness, {
+      timeoutMs: 15_000,
+    });
+
+    assert.equal(out.spawns, 1, "successful first spawn must not re-run");
+    assert.notEqual(out.isError, true);
+    assert.match(out.text, /recovered-ok spawn=1/);
+    const single = singleResult(out);
+    assert.ok(single);
+    assert.equal(single.exitCode, 0);
+    assert.equal(String(single.stderr ?? "").trim(), "", "no failed-attempt stderr");
+    assert.ok(
+      out.elapsedMs < BACKOFF_FIRST_MS,
+      `no backoff on first success, elapsed=${out.elapsedMs}`,
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
