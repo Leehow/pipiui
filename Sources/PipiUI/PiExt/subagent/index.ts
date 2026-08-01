@@ -1095,7 +1095,8 @@ function jobFinalize(
 /** Dead pid, or no pid attached after NO_PID_VANISH_MS. */
 function isHandleVanished(handle: RunningAgentHandle, now: number): boolean {
 	if (handle.pid !== undefined) return !isProcessAlive(handle.pid);
-	return now - handle.startedAt >= NO_PID_VANISH_MS;
+	// Prefer lastActivityAt so auto-resume backoff (pid cleared + activity noted) is not vanished.
+	return now - Math.max(handle.startedAt, handle.lastActivityAt) >= NO_PID_VANISH_MS;
 }
 
 /**
@@ -2487,6 +2488,9 @@ async function runSingleAgent(
 			currentResult.stopReason = undefined;
 			currentResult.errorMessage = undefined;
 			pipiuiActivity = `auto-resume 第${autoResumeCount}次：前次死于 ${shortErr}`;
+			// Drop dead pid before backoff so zombie-settle does not treat the worker as vanished.
+			const h = runningAgents.get(pipiuiAgentId);
+			if (h) h.pid = undefined;
 			if (isBackground) noteAgentActivity(pipiuiAgentId);
 			pipiuiUpdate(true);
 
