@@ -49,6 +49,40 @@ final class ComposerPasteCatcher {
     deinit { stop() }
 }
 
+/// Immutable ownership captured when a PDF selection/drop begins. Unlike normal
+/// image drops, a late PDF completion must never follow whichever session the
+/// warm-reused composer is displaying later.
+final class ComposerPDFIngestionTarget {
+    weak var session: ChatSession?
+    let projectURL: URL
+
+    init(session: ChatSession) {
+        self.session = session
+        self.projectURL = session.projectURL
+    }
+}
+
+typealias ComposerPDFIngestionExecutor = (
+    _ sourceURL: URL,
+    _ projectURL: URL,
+    _ progress: @escaping (NativePDFIngestion.Progress) -> Void
+) throws -> NativePDFIngestion.SourceBundle
+
+private struct PendingComposerPDFIngestion {
+    let target: ComposerPDFIngestionTarget
+    var status: String
+}
+
+private final class ComposerPDFIngestionError {
+    weak var session: ChatSession?
+    let message: String
+
+    init(session: ChatSession, message: String) {
+        self.session = session
+        self.message = message
+    }
+}
+
 /// Routes composer actions to the currently displayed session.
 ///
 /// `InputBar` is intentionally warm-reused across session switches. Persistent key monitors
@@ -62,17 +96,17 @@ final class ComposerSessionRouter: ObservableObject {
     @Published private(set) var slashPaletteVisible = false
     @Published private(set) var attachError: String?
     @Published private(set) var pdfIngestionStatus: String?
+    @Published private(set) var pdfIngestionError: String?
 
-    /// Ingestion belongs to the session that selected the PDF, not whichever
-    /// session happens to be visible when background OCR completes.
-    private var pendingPDFIngestions: [ObjectIdentifier: [UUID: String]] = [:]
+    private var pendingPDFIngestions: [UUID: PendingComposerPDFIngestion] = [:]
+    private var pdfIngestionErrors: [ObjectIdentifier: ComposerPDFIngestionError] = [:]
 
     func bind(to session: ChatSession) {
         guard self.session !== session else { return }
         self.session = session
         dismissSlashPalette()
         attachError = nil
-        refreshPDFIngestionStatus()
+        refreshPDFIngestionPresentation()
     }
 
     func route(images: [DraftImage]) {
@@ -110,71 +144,99 @@ final class ComposerSessionRouter: ObservableObject {
         attachError = nil
     }
 
+    /// Capture a source session/project before an asynchronous file provider has
+    /// delivered its URL. The target holds the session weakly, so a closed source
+    /// session is discarded rather than being silently retargeted.
+    func makePDFIngestionTarget(for session: ChatSession) -> ComposerPDFIngestionTarget {
+        ComposerPDFIngestionTarget(session: session)
+    }
+
     /// Start local PDFKit/Vision extraction off the main UI queue. Each selected
     /// file is handled serially in this batch to keep memory bounded for large
     /// scans while still leaving the composer responsive.
-    func ingestPDFs(_ urls: [URL]) {
-        guard let session else { return }
-        guard session.composerMode == .chat else {
-            presentAttachError("PDF 仅支持在对话模式中本地解析")
+    func ingestPDFs(
+        _ urls: [URL],
+        target: ComposerPDFIngestionTarget,
+        executor: @escaping ComposerPDFIngestionExecutor = { sourceURL, projectURL, progress in
+            try NativePDFIngestion.ingest(
+                sourceURL: sourceURL,
+                projectURL: projectURL,
+                progress: progress
+            )
+        }
+    ) {
+        guard let sourceSession = target.session else { return }
+        guard sourceSession.composerMode == .chat else {
+            presentPDFIngestionError("PDF 仅支持在对话模式中本地解析", target: target)
             return
         }
         let pdfURLs = urls.filter(NativePDFIngestion.isPDF)
         guard !pdfURLs.isEmpty else { return }
 
         let taskID = UUID()
-        let sessionID = ObjectIdentifier(session)
-        let projectURL = session.projectURL
         beginPDFIngestion(
             "正在准备本地 PDF 解析（0/\(pdfURLs.count) 个文件）…",
             taskID: taskID,
-            sessionID: sessionID
+            target: target
         )
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self, weak session] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var references: [String] = []
             var failures: [String] = []
 
             for (fileIndex, url) in pdfURLs.enumerated() {
+                guard target.session != nil else { break }
                 let prefix = pdfURLs.count > 1 ? "PDF \(fileIndex + 1)/\(pdfURLs.count)：" : ""
                 self?.publishPDFIngestionStatus(
                     "\(prefix)正在准备本地解析…",
                     taskID: taskID,
-                    sessionID: sessionID
+                    target: target
                 )
                 do {
-                    let bundle = try NativePDFIngestion.ingest(
-                        sourceURL: url,
-                        projectURL: projectURL,
-                        progress: { [weak self] progress in
+                    let bundle = try executor(
+                        url,
+                        target.projectURL,
+                        { [weak self] progress in
                             self?.publishPDFIngestionStatus(
                                 "\(prefix)\(progress.localizedDescription)",
                                 taskID: taskID,
-                                sessionID: sessionID
+                                target: target
                             )
                         }
                     )
-                    references.append(bundle.draftReference(for: url))
+                    if target.session != nil {
+                        references.append(bundle.draftReference(for: url))
+                    }
                 } catch {
                     failures.append("\(url.lastPathComponent)：\(error.localizedDescription)")
                 }
             }
 
-            DispatchQueue.main.async { [weak self, weak session] in
+            DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.finishPDFIngestion(taskID: taskID, sessionID: sessionID)
-                guard let session else { return }
+                self.finishPDFIngestion(taskID: taskID)
+                guard let sourceSession = target.session else { return }
 
                 if !references.isEmpty {
-                    let referenceText = references.joined(separator: "\n\n")
-                    if session.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        session.draftText = referenceText
+                    if sourceSession.composerMode == .chat {
+                        let referenceText = references.joined(separator: "\n\n")
+                        if sourceSession.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            sourceSession.draftText = referenceText
+                        } else {
+                            sourceSession.draftText += "\n\n\(referenceText)"
+                        }
                     } else {
-                        session.draftText += "\n\n\(referenceText)"
+                        self.presentPDFIngestionError(
+                            "PDF 已完成本地解析，但未添加引用：会话已切换到图像或视频生成模式",
+                            target: target
+                        )
                     }
                 }
                 if !failures.isEmpty {
-                    self.presentAttachError("PDF 本地解析失败：\(failures.joined(separator: "；"))")
+                    self.presentPDFIngestionError(
+                        "PDF 本地解析失败：\(failures.joined(separator: "；"))",
+                        target: target
+                    )
                 }
             }
         }
@@ -239,7 +301,7 @@ final class ComposerSessionRouter: ObservableObject {
 
     @discardableResult
     func executeSlash(_ command: SlashCommand) -> Bool {
-        guard let session, !hasPendingPDFIngestion(for: session) else { return false }
+        guard let session, !isPDFIngestionPending(for: session) else { return false }
         let args: String
         if let invocation = BuiltinCommands.parseInvocation(session.draftText),
            invocation.name == command.name {
@@ -267,7 +329,7 @@ final class ComposerSessionRouter: ObservableObject {
     var canSend: Bool {
         guard let session,
               !session.mediaBusy,
-              !hasPendingPDFIngestion(for: session)
+              !isPDFIngestionPending(for: session)
         else { return false }
         let hasText = !session.draftText
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -283,7 +345,7 @@ final class ComposerSessionRouter: ObservableObject {
 
     @discardableResult
     func send() -> Bool {
-        guard let session, !hasPendingPDFIngestion(for: session) else { return false }
+        guard let session, !isPDFIngestionPending(for: session) else { return false }
         if executeSelectedSlash() {
             return true
         }
@@ -299,53 +361,86 @@ final class ComposerSessionRouter: ObservableObject {
         return true
     }
 
-    private func hasPendingPDFIngestion(for session: ChatSession) -> Bool {
-        !(pendingPDFIngestions[ObjectIdentifier(session)] ?? [:]).isEmpty
+    func isPDFIngestionPending(for session: ChatSession) -> Bool {
+        pendingPDFIngestions.values.contains { $0.target.session === session }
     }
 
     private func publishPDFIngestionStatus(
         _ status: String,
         taskID: UUID,
-        sessionID: ObjectIdentifier
+        target: ComposerPDFIngestionTarget
     ) {
         DispatchQueue.main.async { [weak self] in
-            self?.setPDFIngestionStatus(status, taskID: taskID, sessionID: sessionID)
+            self?.setPDFIngestionStatus(status, taskID: taskID, target: target)
         }
     }
 
     private func setPDFIngestionStatus(
         _ status: String,
         taskID: UUID,
-        sessionID: ObjectIdentifier
+        target: ComposerPDFIngestionTarget
     ) {
-        guard pendingPDFIngestions[sessionID]?[taskID] != nil else { return }
-        pendingPDFIngestions[sessionID, default: [:]][taskID] = status
-        refreshPDFIngestionStatus()
+        guard var ingestion = pendingPDFIngestions[taskID], ingestion.target === target else { return }
+        ingestion.status = status
+        pendingPDFIngestions[taskID] = ingestion
+        refreshPDFIngestionPresentation()
     }
 
     private func beginPDFIngestion(
         _ status: String,
         taskID: UUID,
-        sessionID: ObjectIdentifier
+        target: ComposerPDFIngestionTarget
     ) {
-        pendingPDFIngestions[sessionID, default: [:]][taskID] = status
-        refreshPDFIngestionStatus()
+        pendingPDFIngestions[taskID] = PendingComposerPDFIngestion(
+            target: target,
+            status: status
+        )
+        refreshPDFIngestionPresentation()
     }
 
-    private func finishPDFIngestion(taskID: UUID, sessionID: ObjectIdentifier) {
-        pendingPDFIngestions[sessionID]?[taskID] = nil
-        if pendingPDFIngestions[sessionID]?.isEmpty == true {
-            pendingPDFIngestions[sessionID] = nil
-        }
-        refreshPDFIngestionStatus()
+    private func finishPDFIngestion(taskID: UUID) {
+        pendingPDFIngestions[taskID] = nil
+        refreshPDFIngestionPresentation()
     }
 
-    private func refreshPDFIngestionStatus() {
+    private func refreshPDFIngestionPresentation() {
         guard let session else {
             pdfIngestionStatus = nil
+            pdfIngestionError = nil
             return
         }
-        pdfIngestionStatus = pendingPDFIngestions[ObjectIdentifier(session)]?.values.first
+        pdfIngestionStatus = pendingPDFIngestions.values.first(where: {
+            $0.target.session === session
+        })?.status
+
+        let identity = ObjectIdentifier(session)
+        if let error = pdfIngestionErrors[identity], error.session === session {
+            pdfIngestionError = error.message
+        } else {
+            pdfIngestionErrors[identity] = nil
+            pdfIngestionError = nil
+        }
+    }
+
+    private func presentPDFIngestionError(
+        _ message: String,
+        target: ComposerPDFIngestionTarget
+    ) {
+        guard let sourceSession = target.session else { return }
+        let identity = ObjectIdentifier(sourceSession)
+        let error = ComposerPDFIngestionError(session: sourceSession, message: message)
+        pdfIngestionErrors[identity] = error
+        refreshPDFIngestionPresentation()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self, weak error] in
+            guard let self,
+                  let error,
+                  self.pdfIngestionErrors[identity] === error
+            else {
+                return
+            }
+            self.pdfIngestionErrors[identity] = nil
+            self.refreshPDFIngestionPresentation()
+        }
     }
 
     private func presentAttachError(_ message: String) {
@@ -1129,6 +1224,13 @@ struct InputBar: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            if let pdfError = composerRouter.pdfIngestionError {
+                Text(pdfError)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             if let status = composerRouter.pdfIngestionStatus {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.mini)
@@ -1424,7 +1526,7 @@ struct InputBar: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help("上传图片或 PDF / 生成图像 / 生成视频")
-        .disabled(session.mediaBusy)
+        .disabled(session.mediaBusy || composerRouter.isPDFIngestionPending(for: session))
     }
 
     private var mediaModeStrip: some View {
@@ -1447,7 +1549,7 @@ struct InputBar: View {
             }
             .buttonStyle(.plain)
             .help("退出生成模式，回到对话")
-            .disabled(session.mediaBusy)
+            .disabled(session.mediaBusy || composerRouter.isPDFIngestionPending(for: session))
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -1543,6 +1645,7 @@ struct InputBar: View {
     // MARK: - Pick / paste / drop
 
     private func pickFiles() {
+        let pdfTarget = composerRouter.makePDFIngestionTarget(for: session)
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -1554,10 +1657,13 @@ struct InputBar: View {
         let pdfURLs = panel.urls.filter(NativePDFIngestion.isPDF)
         let imageURLs = panel.urls.filter { !NativePDFIngestion.isPDF($0) }
         composerRouter.appendResults(imageURLs.map { ImageAttachment.make(from: $0) })
-        composerRouter.ingestPDFs(pdfURLs)
+        composerRouter.ingestPDFs(pdfURLs, target: pdfTarget)
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        // Capture before NSItemProvider's asynchronous callback so an A → B
+        // session switch cannot move a PDF source bundle into B's project.
+        let pdfTarget = composerRouter.makePDFIngestionTarget(for: session)
         var handled = false
         let group = DispatchGroup()
         var results: [Result<DraftImage, ImageAttachment.LoadError>] = []
@@ -1607,7 +1713,7 @@ struct InputBar: View {
         let router = composerRouter
         group.notify(queue: .main) {
             router.appendResults(results)
-            router.ingestPDFs(pdfURLs)
+            router.ingestPDFs(pdfURLs, target: pdfTarget)
         }
         return true
     }

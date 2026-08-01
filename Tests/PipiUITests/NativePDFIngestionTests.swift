@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import PDFKit
 import XCTest
 @testable import PipiUI
@@ -110,6 +111,36 @@ final class NativePDFIngestionTests: XCTestCase {
         XCTAssertEqual(recognizer.callCount, 2, "content hash invalidation must run extraction again")
     }
 
+    func testMutationAfterPrivateSnapshotKeepsHashAndPagesBoundToSnapshot() throws {
+        let projectURL = try makeTemporaryDirectory("project")
+        let sourceURL = try writeScannedPDF(named: "mutating.pdf", color: .systemRed)
+        let originalHash = sha256(try Data(contentsOf: sourceURL))
+        let recognizer = CountingRecognizer(text: "snapshot OCR result")
+        var mutationError: Error?
+
+        let result = try NativePDFIngestion.ingest(
+            sourceURL: sourceURL,
+            projectURL: projectURL,
+            recognize: recognizer.callAsFunction,
+            afterSnapshot: { _ in
+                do {
+                    try self.overwriteScannedPDF(at: sourceURL, color: .systemGreen)
+                } catch {
+                    mutationError = error
+                }
+            }
+        )
+
+        XCTAssertNil(mutationError)
+        XCTAssertEqual(result.contentSHA256, originalHash)
+        XCTAssertNotEqual(result.contentSHA256, sha256(try Data(contentsOf: sourceURL)))
+        XCTAssertEqual(recognizer.callCount, 1)
+        let pageMarkdown = try String(contentsOf: try XCTUnwrap(result.pages.first?.markdownURL))
+        XCTAssertTrue(pageMarkdown.contains("snapshot OCR result"))
+        let manifest = try manifestDictionary(at: result.manifestURL)
+        XCTAssertEqual(manifest["sourceContentSHA256"] as? String, originalHash)
+    }
+
     func testEmbeddedPDFTextSkipsOCRFallback() throws {
         let projectURL = try makeTemporaryDirectory("project")
         let sourceURL = try writeTextPDF(named: "embedded.pdf", text: "Embedded PDF text 中文")
@@ -151,10 +182,13 @@ final class NativePDFIngestionTests: XCTestCase {
         )
         let result = try NativePDFIngestion.ingest(sourceURL: sourceURL, projectURL: projectURL)
         let markdown = try String(contentsOf: try XCTUnwrap(result.pages.first?.markdownURL))
+        let body = markdown.components(separatedBy: "\n\n").last ?? ""
 
         XCTAssertEqual(result.pages.first?.origin, .visionOCR)
-        XCTAssertTrue(markdown.localizedCaseInsensitiveContains("vision"))
-        XCTAssertTrue(markdown.localizedCaseInsensitiveContains("ocr"))
+        XCTAssertTrue(
+            normalizedFixtureText(body).contains("nativevisionocr123"),
+            "Vision body should transcribe the raster fixture, got: \(body)"
+        )
     }
 
     // MARK: - Fixtures
@@ -224,6 +258,16 @@ final class NativePDFIngestionTests: XCTestCase {
     private func manifestDictionary(at url: URL) throws -> [String: Any] {
         let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url))
         return try XCTUnwrap(object as? [String: Any])
+    }
+
+    private func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func normalizedFixtureText(_ text: String) -> String {
+        String(String.UnicodeScalarView(text.unicodeScalars.filter {
+            $0.properties.isAlphabetic || $0.properties.numericType != nil
+        })).lowercased()
     }
 
     private enum FixtureError: Error {

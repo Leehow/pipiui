@@ -14,7 +14,7 @@ enum NativePDFIngestion {
     static let manifestFileName = "manifest.json"
     static let documentFileName = "document.md"
     static let pagesDirectoryName = "pages"
-    static let schemaVersion = 1
+    static let schemaVersion = 2
     /// Coordinates final cache publication inside this app process. Extraction
     /// itself stays concurrent/off-main; only the short validate/write/rename
     /// critical section is serialized.
@@ -105,6 +105,7 @@ enum NativePDFIngestion {
 
     enum IngestionError: LocalizedError {
         case unreadableSource(String)
+        case snapshotFailed(String)
         case invalidPDF
         case noPages
         case missingPage(Int)
@@ -116,6 +117,8 @@ enum NativePDFIngestion {
             switch self {
             case .unreadableSource(let reason):
                 return "无法读取 PDF：\(reason)"
+            case .snapshotFailed(let reason):
+                return "无法创建 PDF 本地解析快照：\(reason)"
             case .invalidPDF:
                 return "无法打开 PDF，文件可能已损坏或不受支持"
             case .noPages:
@@ -148,7 +151,8 @@ enum NativePDFIngestion {
         sourceURL: URL,
         projectURL: URL,
         progress: ((Progress) -> Void)? = nil,
-        recognize: OCRRecognizer? = nil
+        recognize: OCRRecognizer? = nil,
+        afterSnapshot: ((URL) -> Void)? = nil
     ) throws -> SourceBundle {
         progress?(Progress(phase: .hashing, completedPages: 0, totalPages: 0))
 
@@ -159,9 +163,22 @@ enum NativePDFIngestion {
             }
         }
 
+        let snapshotURL: URL
+        do {
+            snapshotURL = try makeSnapshot(of: sourceURL)
+        } catch {
+            throw IngestionError.snapshotFailed(error.localizedDescription)
+        }
+        defer { try? FileManager.default.removeItem(at: snapshotURL) }
+
+        // The snapshot is private and immutable for this ingest. A selected file
+        // can be replaced by a sync client while this runs, but the hash, PDFKit
+        // pages, and eventual cache publication all now refer to these same bytes.
+        afterSnapshot?(snapshotURL)
+
         let fingerprint: (hash: String, byteCount: Int64)
         do {
-            fingerprint = try sha256(of: sourceURL)
+            fingerprint = try sha256(of: snapshotURL)
         } catch {
             throw IngestionError.unreadableSource(error.localizedDescription)
         }
@@ -181,7 +198,7 @@ enum NativePDFIngestion {
             return cached
         }
 
-        guard let document = PDFDocument(url: sourceURL) else {
+        guard let document = PDFDocument(url: snapshotURL) else {
             throw IngestionError.invalidPDF
         }
         let pageCount = document.pageCount
@@ -537,6 +554,21 @@ enum NativePDFIngestion {
         return (digest, byteCount)
     }
 
+    private static func makeSnapshot(of sourceURL: URL) throws -> URL {
+        let fileManager = FileManager.default
+        let rootURL = fileManager.temporaryDirectory
+            .appendingPathComponent("pipiui-native-pdf-snapshots", isDirectory: true)
+        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        let snapshotURL = rootURL.appendingPathComponent("\(UUID().uuidString).pdf")
+        do {
+            try fileManager.copyItem(at: sourceURL, to: snapshotURL)
+        } catch {
+            try? fileManager.removeItem(at: snapshotURL)
+            throw error
+        }
+        return snapshotURL
+    }
+
     private static func normalizedText(_ text: String) -> String {
         text
             .replacingOccurrences(of: "\u{00a0}", with: " ")
@@ -572,8 +604,10 @@ enum NativePDFIngestion {
         context.setFillColor(NSColor.white.cgColor)
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
         context.saveGState()
-        context.translateBy(x: 0, y: CGFloat(height))
-        context.scaleBy(x: scale, y: -scale)
+        // PDFPage and a bitmap CGContext both use Quartz's lower-left drawing
+        // basis here. Do not apply an AppKit-style vertical flip: Vision would
+        // receive upside-down glyphs and transcribe reverse/garbled text.
+        context.scaleBy(x: scale, y: scale)
         context.translateBy(x: -bounds.minX, y: -bounds.minY)
         page.draw(with: .mediaBox, to: context)
         context.restoreGState()
