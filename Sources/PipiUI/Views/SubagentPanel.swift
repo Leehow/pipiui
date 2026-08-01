@@ -206,10 +206,9 @@ struct SubagentPanel: View {
                             agent: agent,
                             selected: agent.id == store.selectedId,
                             abortPending: store.abortPending.contains(agent.id),
+                            onSelect: { store.selectedId = agent.id },
                             onAbort: { onAbort(agent.id) }
                         )
-                            .contentShape(Rectangle())
-                            .onTapGesture { store.selectedId = agent.id }
                     }
                     // 透明贴底锚点，与行数据解耦：新行插入/旧行移除不影响锚点位置。
                     Color.clear
@@ -306,9 +305,42 @@ private struct AgentRow: View {
     let agent: SubagentInfo
     let selected: Bool
     var abortPending: Bool = false
+    let onSelect: () -> Void
     var onAbort: (() -> Void)? = nil
 
     var body: some View {
+        HStack(spacing: 0) {
+            Button(action: onSelect) {
+                selectionArea
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity)
+            .accessibilityLabel("选择 \(agent.name) 子代理")
+            .accessibilityAddTraits(selected ? .isSelected : [])
+
+            if agent.state == .running, let onAbort {
+                Button(action: onAbort) {
+                    Image(systemName: "stop.circle")
+                        .font(.callout)
+                }
+                .buttonStyle(HoverButtonStyle(base: abortPending ? Color.secondary.opacity(0.4) : .secondary, hovered: .red))
+                .disabled(abortPending)
+                .help(abortPending ? "正在中止…" : "中止该 agent（/subagent_abort）")
+                .accessibilityLabel("中止 \(agent.name) 子代理")
+                .padding(.trailing, 8)
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(selected ? Color.accentColor.opacity(0.12) : Color.clear)
+        )
+    }
+
+    private var selectionArea: some View {
         HStack(spacing: 8) {
             // 树形缩进：depth 1 是主会话直接派出的
             if agent.depth > 1 {
@@ -375,22 +407,7 @@ private struct AgentRow: View {
             }
             .font(.caption2.monospacedDigit())
             .foregroundStyle(.tertiary)
-            if agent.state == .running, let onAbort {
-                Button(action: onAbort) {
-                    Image(systemName: "stop.circle")
-                        .font(.callout)
-                }
-                .buttonStyle(HoverButtonStyle(base: abortPending ? Color.secondary.opacity(0.4) : .secondary, hovered: .red))
-                .disabled(abortPending)
-                .help(abortPending ? "正在中止…" : "中止该 agent（/subagent_abort）")
-            }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(selected ? Color.accentColor.opacity(0.12) : Color.clear)
-        )
     }
 
     @ViewBuilder
