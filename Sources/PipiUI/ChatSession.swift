@@ -941,7 +941,9 @@ final class ChatSession: ObservableObject, Identifiable {
     private func startProcess(arguments: [String], environment: [String: String]) {
         guard !processStartCancelled, proc == nil else { return }
         guard let proc = PiProcess(cwd: projectURL, arguments: arguments, extraEnv: environment) else {
-            lastError = "找不到 pi 可执行文件（试过 ~/.npm-global/bin、/opt/homebrew/bin 等）"
+            let message = "找不到 pi 可执行文件（试过 ~/.npm-global/bin、/opt/homebrew/bin 等）"
+            lastError = message
+            notifyError(message)
             processAlive = false
             isInitializing = false
             return
@@ -976,7 +978,9 @@ final class ChatSession: ObservableObject, Identifiable {
                 self.hasUnseenInterruption = true
             }
             if code != 0 {
-                self.lastError = "pi 进程退出 (code \(code))：\(stderr.suffix(300))"
+                let message = "pi 进程退出 (code \(code))：\(stderr.suffix(300))"
+                self.lastError = message
+                self.notifyError(message)
             }
         }
         loadInitialState()
@@ -1588,7 +1592,9 @@ final class ChatSession: ObservableObject, Identifiable {
             lastError = "请求失败，自动重试中 (\(e["attempt"].int ?? 0)/\(e["maxAttempts"].int ?? 0))…"
         case "auto_retry_end":
             if e["success"].bool == false {
-                lastError = "重试失败：\(e["finalError"].string ?? "未知错误")"
+                let message = "重试失败：\(e["finalError"].string ?? "未知错误")"
+                lastError = message
+                notifyError(message)
             } else {
                 lastError = nil
             }
@@ -1823,7 +1829,9 @@ final class ChatSession: ObservableObject, Identifiable {
             if let item = Self.convert(message: message, id: nextItemId(), allowDiskRead: false) {
                 if item.blocks.isEmpty, message["stopReason"].string == "error" {
                     // API returned an error with no content — surface it instead of a blank bubble.
-                    appendSystem("⚠️ 模型请求失败（stopReason=error），请检查扩展冲突或 API 状态。")
+                    let warning = "⚠️ 模型请求失败（stopReason=error），请检查扩展冲突或 API 状态。"
+                    appendSystem(warning)
+                    notifyError(warning)
                 } else {
                     transcript.append(item)
                     scheduleImageBackfill(itemId: item.id)
@@ -2953,6 +2961,7 @@ final class ChatSession: ObservableObject, Identifiable {
                         role: "system",
                         blocks: [.text("\(mode.label)失败：\(error.localizedDescription)")]
                     ))
+                    self.notifyError(error.localizedDescription)
                 }
             }
         }
@@ -3450,6 +3459,23 @@ final class ChatSession: ObservableObject, Identifiable {
             hasUnseenCompletion = false
         } else {
             hasUnseenCompletion = true
+        }
+        // 任务完成提醒：只有用户看不到结果（会话未选中或应用未激活）时才弹。
+        if TaskNotifier.shouldNotifyCompletion(
+            selected: isSelectedCheck?() == true,
+            appActive: NSApp.isActive
+        ) {
+            MainActor.assumeIsolated {
+                TaskNotifier.shared.notifyCompletion(sessionTitle: displayTitle)
+            }
+        }
+    }
+
+    /// 任务失败提醒（错误不分用户是否在观看，始终提醒）。
+    /// PiProcess 的回调与 UI 事件都投递在主线程，此处用 assumeIsolated 直调。
+    private func notifyError(_ message: String) {
+        MainActor.assumeIsolated {
+            TaskNotifier.shared.notifyError(sessionTitle: displayTitle, message: message)
         }
     }
 

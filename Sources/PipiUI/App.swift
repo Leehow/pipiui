@@ -39,7 +39,7 @@ public struct PipiUIApp: App {
 
     public var body: some Scene {
         WindowGroup("Pipi UI") {
-            ComputerUseSceneRoot(store: store)
+            ComputerUseSceneRoot(store: store, notifier: TaskNotifier.shared)
         }
         .windowStyle(.automatic)
         .commands {
@@ -65,6 +65,7 @@ public struct PipiUIApp: App {
 
 private struct ComputerUseSceneRoot: View {
     @ObservedObject var store: AppStore
+    @ObservedObject var notifier: TaskNotifier
 
     var body: some View {
         ContentView()
@@ -76,6 +77,37 @@ private struct ComputerUseSceneRoot: View {
             .frame(minWidth: 800, minHeight: 560)
             .background(WindowSizePersistenceView())
             .background(ComputerUseWindowPresentationView())
+            // 任务提醒横幅：叠在缩放内容之上，按未缩放的窗口坐标绘制（顶部居中）。
+            .overlay(alignment: .top) {
+                if let toast = notifier.toast {
+                    toastBanner(toast)
+                }
+            }
+            .animation(.easeOut(duration: 0.25), value: notifier.toast)
+    }
+
+    /// 小横幅：毛玻璃圆角、图标 + 文本、点击立即关闭。
+    private func toastBanner(_ toast: Toast) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: toast.kind == .completion
+                  ? "checkmark.circle.fill"
+                  : "exclamationmark.triangle.fill")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(toast.kind == .completion ? Color.green : Color.orange)
+            Text(toast.message)
+                .font(.callout)
+                .lineLimit(2)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(.ultraThinMaterial)
+                .shadow(color: .black.opacity(0.15), radius: 8, y: 2)
+        )
+        .padding(.top, 12)
+        .transition(.move(edge: .top).combined(with: .opacity))
+        .onTapGesture { notifier.dismissToast() }
     }
 }
 
