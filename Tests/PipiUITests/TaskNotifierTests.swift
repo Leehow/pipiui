@@ -11,6 +11,80 @@ final class TaskNotifierTests: XCTestCase {
         return (TaskNotifier(defaults: defaults), defaults)
     }
 
+    // MARK: - Boss turn completion lifecycle
+
+    func testCompletionLifecycleWaitsForSubagentThenConsumesOnce() {
+        var lifecycle = TaskCompletionLifecycle()
+        lifecycle.beginMainAgentTurn(existingSubagents: [])
+        lifecycle.observeSubagents([
+            .init(id: "agent-child", state: .running)
+        ])
+        lifecycle.markMainAgentSettled()
+
+        XCTAssertFalse(
+            lifecycle.consumeSuccessfulCompletionIfReady(
+                isWorking: false,
+                hasQueuedPrompt: false,
+                processAlive: true,
+                lastError: nil,
+                runningSubagentCount: 1
+            ),
+            "主 agent 已 settled 但后台 subagent 仍在运行时不得提醒"
+        )
+
+        lifecycle.observeSubagents([
+            .init(id: "agent-child", state: .ok)
+        ])
+
+        XCTAssertTrue(
+            lifecycle.consumeSuccessfulCompletionIfReady(
+                isWorking: false,
+                hasQueuedPrompt: false,
+                processAlive: true,
+                lastError: nil,
+                runningSubagentCount: 0
+            ),
+            "最后一个成功 subagent 结束后应触发一次完成提醒"
+        )
+        XCTAssertFalse(
+            lifecycle.consumeSuccessfulCompletionIfReady(
+                isWorking: false,
+                hasQueuedPrompt: false,
+                processAlive: true,
+                lastError: nil,
+                runningSubagentCount: 0
+            ),
+            "同一 turn 的完成提醒必须去重"
+        )
+    }
+
+    func testCompletionLifecycleRejectsFailedAndInterruptedSubagents() {
+        let terminalFailures: [TaskCompletionLifecycle.Subagent.State] = [.failed, .interrupted]
+
+        for terminalState in terminalFailures {
+            var lifecycle = TaskCompletionLifecycle()
+            lifecycle.beginMainAgentTurn(existingSubagents: [])
+            lifecycle.observeSubagents([
+                .init(id: "agent-child", state: .running)
+            ])
+            lifecycle.markMainAgentSettled()
+            lifecycle.observeSubagents([
+                .init(id: "agent-child", state: terminalState)
+            ])
+
+            XCTAssertFalse(
+                lifecycle.consumeSuccessfulCompletionIfReady(
+                    isWorking: false,
+                    hasQueuedPrompt: false,
+                    processAlive: true,
+                    lastError: nil,
+                    runningSubagentCount: 0
+                ),
+                "\(terminalState) subagent 不得产生任务完成提醒"
+            )
+        }
+    }
+
     // MARK: - shouldNotifyCompletion
 
     func testShouldNotifyCompletionOnlyWhenUserCannotSeeResult() {

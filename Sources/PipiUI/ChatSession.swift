@@ -547,6 +547,113 @@ final class StreamingState: ObservableObject {
     @Published var toolOutputVersion: UInt64 = 0
 }
 
+/// One boss-turn's completion gate. The main agent can settle before its background
+/// subagents, so completion is consumed only after every tracked subagent has ended
+/// successfully. Kept independent from SwiftUI/process state for lifecycle tests.
+struct TaskCompletionLifecycle {
+    struct Subagent: Equatable {
+        enum State: Equatable {
+            case running
+            case ok
+            case failed
+            case aborted
+            case interrupted
+        }
+
+        let id: String
+        let state: State
+    }
+
+    private(set) var mainAgentSettled = false
+    private(set) var completionConsumed = false
+    private var subagentStatesAtTurnStart: [String: Subagent.State] = [:]
+    private var turnSubagentStates: [String: Subagent.State] = [:]
+    private var hasUnsuccessfulTurnSubagent = false
+
+    mutating func beginMainAgentTurn(existingSubagents: [Subagent]) {
+        mainAgentSettled = false
+        completionConsumed = false
+        subagentStatesAtTurnStart = Dictionary(
+            uniqueKeysWithValues: existingSubagents.map { ($0.id, $0.state) }
+        )
+        // A pre-existing terminal row is historical, but a pre-existing running row
+        // still occupies this session's completion boundary and must end successfully.
+        turnSubagentStates = Dictionary(
+            uniqueKeysWithValues: existingSubagents
+                .filter { $0.state == .running }
+                .map { ($0.id, $0.state) }
+        )
+        hasUnsuccessfulTurnSubagent = false
+    }
+
+    mutating func markMainAgentSettled() {
+        mainAgentSettled = true
+    }
+
+    /// Records agents created (or resumed) during the current main-agent turn.
+    /// Historical terminal rows are ignored; every currently running agent remains
+    /// part of the completion boundary until it ends successfully.
+    mutating func observeSubagents(_ subagents: [Subagent]) {
+        for subagent in subagents {
+            let stateAtTurnStart = subagentStatesAtTurnStart[subagent.id]
+            let startedDuringTurn = stateAtTurnStart == nil
+                || (stateAtTurnStart != .running && subagent.state == .running)
+            guard turnSubagentStates[subagent.id] != nil || startedDuringTurn else { continue }
+
+            turnSubagentStates[subagent.id] = subagent.state
+            switch subagent.state {
+            case .failed, .aborted, .interrupted:
+                hasUnsuccessfulTurnSubagent = true
+            case .running, .ok:
+                break
+            }
+        }
+    }
+
+    /// Returns true exactly once when this turn is genuinely complete and successful.
+    /// `runningSubagentCount` intentionally covers all session subagents, matching
+    /// the wall-clock completion gate and preventing a premature user-facing alert.
+    mutating func consumeSuccessfulCompletionIfReady(
+        isWorking: Bool,
+        hasQueuedPrompt: Bool,
+        processAlive: Bool,
+        lastError: String?,
+        runningSubagentCount: Int
+    ) -> Bool {
+        guard mainAgentSettled,
+              !completionConsumed,
+              !isWorking,
+              !hasQueuedPrompt,
+              processAlive,
+              lastError == nil,
+              runningSubagentCount == 0,
+              !hasUnsuccessfulTurnSubagent,
+              turnSubagentStates.values.allSatisfy({ $0 == .ok })
+        else {
+            return false
+        }
+        completionConsumed = true
+        return true
+    }
+}
+
+private extension TaskCompletionLifecycle.Subagent.State {
+    init(subagentState: SubagentInfo.State) {
+        switch subagentState {
+        case .running:
+            self = .running
+        case .ok:
+            self = .ok
+        case .failed:
+            self = .failed
+        case .aborted:
+            self = .aborted
+        case .interrupted:
+            self = .interrupted
+        }
+    }
+}
+
 /// One live pi RPC session bound to a project directory.
 /// Published state is mutated on the main thread (PiProcess delivers callbacks there).
 /// Heavy initial transcript conversion (image disk/base64) may run off-main before a single assign.
@@ -653,6 +760,8 @@ final class ChatSession: ObservableObject, Identifiable {
     /// True between `agent_start` and `agent_settled` (for in-flight persistence).
     /// Background subagents after settle are tracked separately via `subagents.runningCount`.
     private var agentTurnActive = false
+    /// Completion notification lifecycle for the currently running boss turn.
+    private var taskCompletionLifecycle = TaskCompletionLifecycle()
     /// Notifies AppStore to persist / clear interrupted-path badges.
     var onInFlightChange: ((String, Bool) -> Void)?
     /// False after resuming a disk session that already has a real name.
@@ -854,7 +963,9 @@ final class ChatSession: ObservableObject, Identifiable {
         }
         // Keep crash badge while background subagents run after main agent_settled.
         subagents.onRunningCountMayHaveChanged = { [weak self] in
-            self?.syncInFlightMark()
+            guard let self else { return }
+            self.syncInFlightMark()
+            self.reevaluateTaskCompletion()
         }
         if let sessionPath, InterruptedSessionStore.contains(sessionPath) {
             hasUnseenInterruption = true
@@ -1502,6 +1613,9 @@ final class ChatSession: ObservableObject, Identifiable {
 
         switch type {
         case "agent_start":
+            taskCompletionLifecycle.beginMainAgentTurn(
+                existingSubagents: taskCompletionSubagents
+            )
             isStreaming = true
             // Defensive: a stale stop flag must never bleed into the next turn.
             isStopping = false
@@ -1516,6 +1630,7 @@ final class ChatSession: ObservableObject, Identifiable {
             pendingToolRuns.removeAll(keepingCapacity: true)
             streaming.streamingItem = nil
             agentTurnActive = false
+            taskCompletionLifecycle.markMainAgentSettled()
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 await self.subagents.reconcileWorktreeLifecycles(
@@ -1529,10 +1644,7 @@ final class ChatSession: ObservableObject, Identifiable {
             syncEntryIds()
             drainQueueIfIdle()
             syncInFlightMark()
-            // Green badge when still idle after drain (no queued follow-up).
-            if !isWorking && messageQueue.isEmpty {
-                markUnseenCompletionAfterSuccessfulSettle()
-            }
+            reevaluateTaskCompletion()
             proc?.request(["type": "get_state"]) { [weak self] resp in
                 self?.applyState(resp["data"])
                 self?.onSessionMetaChanged?()
@@ -3451,15 +3563,37 @@ final class ChatSession: ObservableObject, Identifiable {
         onInFlightChange?(file, false)
     }
 
-    /// Green = unseen successful settle. Skip if already selected or unhealthy.
-    private func markUnseenCompletionAfterSuccessfulSettle() {
-        let healthy = lastError == nil && processAlive
-        guard healthy else { return }
-        if isSelectedCheck?() == true {
-            hasUnseenCompletion = false
-        } else {
-            hasUnseenCompletion = true
+    private var taskCompletionSubagents: [TaskCompletionLifecycle.Subagent] {
+        subagents.agents.map { agent in
+            TaskCompletionLifecycle.Subagent(
+                id: agent.id,
+                state: .init(subagentState: agent.state)
+            )
         }
+    }
+
+    /// Re-run after `agent_settled` and each subagent start/end. The green sidebar
+    /// dot keeps its existing main-settle semantics; only the user-facing alert waits
+    /// for the lifecycle gate to consume a fully successful boss turn.
+    private func reevaluateTaskCompletion() {
+        taskCompletionLifecycle.observeSubagents(taskCompletionSubagents)
+        guard taskCompletionLifecycle.mainAgentSettled,
+              !isWorking,
+              messageQueue.isEmpty else {
+            return
+        }
+
+        markUnseenCompletionAfterSuccessfulSettle()
+        guard taskCompletionLifecycle.consumeSuccessfulCompletionIfReady(
+            isWorking: isWorking,
+            hasQueuedPrompt: !messageQueue.isEmpty,
+            processAlive: processAlive,
+            lastError: lastError,
+            runningSubagentCount: subagents.runningCount
+        ) else {
+            return
+        }
+
         // 任务完成提醒：只有用户看不到结果（会话未选中或应用未激活）时才弹。
         if TaskNotifier.shouldNotifyCompletion(
             selected: isSelectedCheck?() == true,
@@ -3468,6 +3602,17 @@ final class ChatSession: ObservableObject, Identifiable {
             MainActor.assumeIsolated {
                 TaskNotifier.shared.notifyCompletion(sessionTitle: displayTitle)
             }
+        }
+    }
+
+    /// Green = unseen successful settle. Skip if already selected or unhealthy.
+    private func markUnseenCompletionAfterSuccessfulSettle() {
+        let healthy = lastError == nil && processAlive
+        guard healthy else { return }
+        if isSelectedCheck?() == true {
+            hasUnseenCompletion = false
+        } else {
+            hasUnseenCompletion = true
         }
     }
 
