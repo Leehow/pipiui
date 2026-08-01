@@ -732,13 +732,26 @@ final class SubagentStore: ObservableObject {
     /// Debounce window: merges of one wave land within a second or two of each other.
     private static let verifyCoalesceWindow: TimeInterval = 2.0
     private var logCounter = 0
-    private var persistURL: URL?
+    /// Internal setter so tests can attach a disk target without the restart-reconcile
+    /// side effects of `attachPersistence`.
+    var persistURL: URL?
     private var saveScheduled = false
     /// Serial queue for JSON encode + atomic write (TokenLedger.append 模式：主线程只拷快照)。
     private let persistQueue = DispatchQueue(label: "pipiui.subagentstore.persist")
     /// Panel appearance and main-turn settle can fire close together; Git reconciliation is capped per store.
     private static let worktreeReconcileThrottle: TimeInterval = 10
     private var lastWorktreeReconcileAt: Date?
+    /// 运行中对账 tick：stale 窗口（10min）内至少扫到一次；60s 误差可接受。
+    private static let orphanReconcileInterval: TimeInterval = 60
+    private static let orphanReconcileTolerance: TimeInterval = 10
+    /// 所属会话进程存活判定（ChatSession 注入，读 processAlive）；nil = 未启动对账。
+    private var sessionAlivenessProvider: (() -> Bool)?
+    /// 运行中对账 timer；deinit 失效，生命周期跟随 store，不泄漏。
+    private var orphanReconcileTimer: Timer?
+
+    deinit {
+        orphanReconcileTimer?.invalidate()
+    }
 
     /// Bind the session's main project URL so successful agents can auto-merge.
     func bindMainProject(_ url: URL) {
@@ -762,6 +775,34 @@ final class SubagentStore: ObservableObject {
             loaded[i].ended = loaded[i].ended ?? Date()
             loaded[i].closeoutDisposition = .retained
             loaded[i].closeoutReason = "App 重启时 agent 仍在运行；按中断成果保留"
+            if let path = loaded[i].worktreePath, !path.isEmpty {
+                loaded[i].worktreeLifecycle = .pendingReview
+            }
+        }
+        return loaded
+    }
+
+    /// App 运行中对账：把「所属会话进程已死、且桥接观察静默超过 watchdog 窗口」的
+    /// `.running` 幽灵扫成 `.interrupted`。与 `reconcileInterruptedAfterRestart` 语义一致
+    /// （retained、清 activity、补 ended、worktree 转 pendingReview），区别：只在 App 运行期
+    /// 使用，且要求会话进程已死——进程活着时，扩展侧 vanished 结算（runningAgents 属于父
+    /// 运行时）才是收尸人，App 不越界，避免误伤活 worker。幂等：只动 `.running` 行。
+    static func reconcileOrphaned(
+        _ persisted: [SubagentInfo], now: Date, sessionAlive: Bool
+    ) -> [SubagentInfo] {
+        guard !sessionAlive else { return persisted }
+        let stale = Set(SubagentWatchdog.staleAgentIDs(in: persisted, now: now))
+        guard !stale.isEmpty else { return persisted }
+        var loaded = persisted
+        for i in loaded.indices where loaded[i].state == .running && stale.contains(loaded[i].id) {
+            loaded[i].state = .interrupted
+            loaded[i].activity = ""
+            loaded[i].stalled = false
+            loaded[i].stalledIdleSec = 0
+            loaded[i].ended = loaded[i].ended ?? now
+            loaded[i].closeoutDisposition = .retained
+            loaded[i].closeoutReason =
+                "会话进程已退出且超过 \(Int(SubagentWatchdog.staleThreshold / 60)) 分钟无观察事件；按中断成果保留"
             if let path = loaded[i].worktreePath, !path.isEmpty {
                 loaded[i].worktreeLifecycle = .pendingReview
             }
@@ -844,6 +885,35 @@ final class SubagentStore: ObservableObject {
             onRunningCountMayHaveChanged?()
         }
         return true
+    }
+
+    /// 单次孤儿对账（timer 每 tick 调一次；ChatSession 也会在进程退出时立即调一次）。
+    /// 会话进程活着 → 跳过（扩展侧 vanished 结算负责）；无命中 → 不动磁盘。
+    /// 有命中 → 扫成 interrupted 并 saveNow 直接落盘（不走防抖，保证磁盘不再长期挂幽灵）。
+    @discardableResult
+    func reconcileOrphanedNow(now: Date = Date()) -> Bool {
+        guard sessionAlivenessProvider?() == false else { return false }
+        let before = agents
+        let reconciled = Self.reconcileOrphaned(before, now: now, sessionAlive: false)
+        guard reconciled != before else { return false }
+        agents = reconciled
+        onRunningCountMayHaveChanged?()
+        saveNow()
+        return true
+    }
+
+    /// 启动运行中对账 timer（幂等：重复调用只更新 liveness 闭包，timer 保持单例）。
+    /// `isSessionAlive` 由 ChatSession 注入（读本会话 pi 进程存活状态）。
+    func startOrphanReconciliation(isSessionAlive: @escaping () -> Bool) {
+        sessionAlivenessProvider = isSessionAlive
+        guard orphanReconcileTimer == nil else { return }
+        let timer = Timer(timeInterval: Self.orphanReconcileInterval, repeats: true) {
+            [weak self] _ in
+            self?.reconcileOrphanedNow()
+        }
+        timer.tolerance = Self.orphanReconcileTolerance
+        RunLoop.main.add(timer, forMode: .common)
+        orphanReconcileTimer = timer
     }
 
     /// After restart, resume one missed automatic merge for each eligible persisted row.
