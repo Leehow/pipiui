@@ -826,6 +826,62 @@ const jobRegistry = new Map<string, JobRecord>();
 // ---- Stall watchdog + abort：运行中后台 job 的外部可触达句柄 ----
 const STALL_THRESHOLD_MS = 120_000;
 const STALL_WATCHDOG_INTERVAL_MS = 30_000;
+/** Max automatic re-spawns after a retryable transport/API death (total runs = 1 + this). */
+const AUTO_RESUME_MAX = 2;
+/** Backoff before each auto-resume attempt (ms). Index 0 = first resume. */
+const AUTO_RESUME_BACKOFF_MS = [5_000, 15_000] as const;
+/** Context size above which a final retryable failure gets a fresh-redispatch hint. */
+const AUTO_RESUME_CONTEXT_HINT_TOKENS = 100_000;
+
+/**
+ * Transient network / upstream API failures worth auto-resuming the worker session.
+ * Auth, billing, and unknown-agent failures are excluded first (not retryable).
+ * Matching is lowercase substring — same spirit as pi-ai retry.js.
+ */
+function isRetryableWorkerError(text: string): boolean {
+	const t = (text || "").toLowerCase();
+	if (!t.trim()) return false;
+	const nonRetryable = [
+		"insufficient_quota",
+		"quota",
+		"billing",
+		"credit balance",
+		"invalid api key",
+		"unauthorized",
+		"401",
+		"403",
+		"unknown agent",
+	];
+	for (const s of nonRetryable) {
+		if (t.includes(s)) return false;
+	}
+	const retryable = [
+		"fetch failed",
+		"connection error",
+		"econnreset",
+		"econnrefused",
+		"etimedout",
+		"socket hang up",
+		"network",
+		"timed out",
+		"timeout",
+		"429",
+		"rate limit",
+		"rate_limit",
+		"overloaded",
+		"500",
+		"502",
+		"503",
+		"504",
+		"internal error",
+		"unavailable",
+		"502 bad gateway",
+	];
+	for (const s of retryable) {
+		if (t.includes(s)) return true;
+	}
+	return false;
+}
 /** stall 复推节奏：boss 决定继续等时，最多 5 分钟沉默一次，不必等心跳。 */
 const STALL_RENOTIFY_INTERVAL_MS = 5 * 60 * 1000;
 /** done 重投节奏：30s 扫描每次都看，但同一 agentId 两次投递至少隔 60s，避免轰炸正在处理中的 boss。 */
@@ -2162,193 +2218,257 @@ async function runSingleAgent(
 
 		args.push(`Task: ${task}`);
 		let wasAborted = false;
+		// Auto-resume: transport/API deaths used to mark the job failed with zero recovery even
+		// though `--session-id` already supports resume. Re-spawn up to AUTO_RESUME_MAX times
+		// (same args → session resume for stateful roles; cold restart for --no-session).
+		let autoResumeCount = 0;
+		let exitCode = 1;
 
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const childEnv = pipiuiChildProcessEnv({
-				PIPIUI_AGENT_ID: pipiuiAgentId,
-				PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
-				PIPIUI_AGENT_ROLE: runtimePolicy.role,
-				// Scope marker read by the philosophy package. An agent that delegates needs the
-				// orchestration layers; every other dispatched agent must not get them — depth
-				// alone cannot tell the two apart, and a worker taught to fan out would fight
-				// PIPIUI_AGENT_MAX_DEPTH. Declared by the agent (`delegates: true`), which is
-				// consistent with `tools` already deciding whether it can dispatch at all.
-				PIPI_PHILOSOPHY_ROLE: agent.traits.delegates ? "lead" : "worker",
-				...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
-				// Every dispatched child runs isolated from external skill libraries; an agent
-				// that asks for it (`block-skill-reads: true`) also cannot read SKILL.md at all.
-				PIPIUI_SUBAGENT_SKILL_ISOLATION: "1",
-				PIPIUI_SKILL_READ_BLOCK: agent.traits.blockSkillReads ? "1" : undefined,
-				...(runtimePolicy.worktree === "main-session"
-					? { PIPIUI_WORKTREE: "0", PIPIUI_AGENT_NO_DELEGATION: "1" }
-					: {}),
-				...(placement.worktreePath ? { PIPIUI_WORKTREE_PATH: placement.worktreePath } : {}),
-				...(placement.worktreeBranch ? { PIPIUI_WORKTREE_BRANCH: placement.worktreeBranch } : {}),
-			}, true);
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: spawnCwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				detached: false,
-				// 把 agent 树身份传给子进程：子进程再派 subagent 时 parentId/depth 自动正确
-				// PIPIUI_SUBAGENT_EXT / SEARCH_SCOPE_EXT / grant file / bridge / session
-				// 经 process.env 继承；子进程只读当前真人回合的 grant file。
-				env: childEnv,
+		for (;;) {
+			// Snapshot so retry classification only sees THIS attempt (prior "fetch failed"
+			// text in accumulated messages/stderr must not force another resume).
+			const attemptMessagesFrom = currentResult.messages.length;
+			const attemptStderrFrom = currentResult.stderr.length;
+			exitCode = await new Promise<number>((resolve) => {
+				const invocation = getPiInvocation(args);
+				const childEnv = pipiuiChildProcessEnv({
+					PIPIUI_AGENT_ID: pipiuiAgentId,
+					PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
+					PIPIUI_AGENT_ROLE: runtimePolicy.role,
+					// Scope marker read by the philosophy package. An agent that delegates needs the
+					// orchestration layers; every other dispatched agent must not get them — depth
+					// alone cannot tell the two apart, and a worker taught to fan out would fight
+					// PIPIUI_AGENT_MAX_DEPTH. Declared by the agent (`delegates: true`), which is
+					// consistent with `tools` already deciding whether it can dispatch at all.
+					PIPI_PHILOSOPHY_ROLE: agent.traits.delegates ? "lead" : "worker",
+					...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
+					// Every dispatched child runs isolated from external skill libraries; an agent
+					// that asks for it (`block-skill-reads: true`) also cannot read SKILL.md at all.
+					PIPIUI_SUBAGENT_SKILL_ISOLATION: "1",
+					PIPIUI_SKILL_READ_BLOCK: agent.traits.blockSkillReads ? "1" : undefined,
+					...(runtimePolicy.worktree === "main-session"
+						? { PIPIUI_WORKTREE: "0", PIPIUI_AGENT_NO_DELEGATION: "1" }
+						: {}),
+					...(placement.worktreePath ? { PIPIUI_WORKTREE_PATH: placement.worktreePath } : {}),
+					...(placement.worktreeBranch ? { PIPIUI_WORKTREE_BRANCH: placement.worktreeBranch } : {}),
+				}, true);
+				const proc = spawn(invocation.command, invocation.args, {
+					cwd: spawnCwd,
+					shell: false,
+					stdio: ["ignore", "pipe", "pipe"],
+					detached: false,
+					// 把 agent 树身份传给子进程：子进程再派 subagent 时 parentId/depth 自动正确
+					// PIPIUI_SUBAGENT_EXT / SEARCH_SCOPE_EXT / grant file / bridge / session
+					// 经 process.env 继承；子进程只读当前真人回合的 grant file。
+					env: childEnv,
+				});
+				pipiuiTrackChild(proc);
+				// Recorded so the heartbeat can tell "quiet" from "gone".
+				const liveHandle = runningAgents.get(pipiuiAgentId);
+				if (liveHandle) liveHandle.pid = proc.pid;
+				let buffer = "";
+
+				const processLine = (line: string) => {
+					if (!line.trim()) return;
+					let event: any;
+					try {
+						event = JSON.parse(line);
+					} catch {
+						return;
+					}
+
+					if (event.type === "message_end" && event.message) {
+						const msg = event.message as Message;
+						currentResult.messages.push(msg);
+
+							if (msg.role === "assistant") {
+								currentResult.usage.turns++;
+								const usage = msg.usage;
+								if (usage) {
+									currentResult.usage.input += usage.input || 0;
+									currentResult.usage.output += usage.output || 0;
+									currentResult.usage.cacheRead += usage.cacheRead || 0;
+									currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+									currentResult.usage.cost += usage.cost?.total || 0;
+									currentResult.usage.contextTokens = usage.totalTokens || 0;
+									// Per-turn usage → PipiUI token ledger. Independent of the
+									// cost/turns aggregates above; gives per-turn input/output/cache
+									// breakdown that "end" doesn't carry. Safe to no-op if bridge unset.
+									const toolSet = new Set<string>();
+									for (const part of (msg as any).content ?? []) {
+										if (part?.type === "toolCall" && typeof part.name === "string" && part.name) {
+											toolSet.add(part.name);
+										}
+									}
+									const tools = [...toolSet].sort();
+									pipiuiReport({
+										kind: "usage",
+										agentId: pipiuiAgentId,
+										turn: currentResult.usage.turns,
+										model: msg.model || currentResult.model || null,
+										tools,
+										usage: {
+											input: usage.input || 0,
+											output: usage.output || 0,
+											cacheRead: usage.cacheRead || 0,
+											cacheWrite: usage.cacheWrite || 0,
+											cost: usage.cost?.total || 0,
+											contextTokens: usage.totalTokens || 0,
+										},
+									});
+								}
+							if (!currentResult.model && msg.model) currentResult.model = msg.model;
+							if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+							if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+							// 完整工作流水上报：每轮的思考/文本/工具调用都进 UI 日志
+							const pipiuiItems: Record<string, unknown>[] = [];
+							for (const part of (msg as any).content ?? []) {
+								if (part?.type === "toolCall") {
+									const args = (part.arguments ?? {}) as Record<string, unknown>;
+									const summary = summarizeToolArgsForUI(String(part.name ?? ""), args);
+									pipiuiActivity = `${part.name} ${summary}`;
+									// Edit keeps a bounded, valid JSON payload so the native subagent log can
+									// render the same line diff as the main-agent transcript. Other tools
+									// retain their compact human-readable summary.
+									const text = part.name === "edit" ? boundedEditPayloadForUI(args) : summary;
+									pipiuiItems.push({ itemType: "tool", name: part.name, text });
+								} else if (part?.type === "text" && String(part.text ?? "").trim()) {
+									pipiuiItems.push({ itemType: "text", text: String(part.text).slice(0, 4000) });
+								} else if (part?.type === "thinking" && String(part.thinking ?? "").trim()) {
+									pipiuiItems.push({ itemType: "thinking", text: String(part.thinking).slice(0, 600) });
+								}
+							}
+							if (pipiuiItems.length > 0) {
+								pipiuiReport({ kind: "log", agentId: pipiuiAgentId, items: pipiuiItems });
+							}
+						}
+						emitUpdate();
+						pipiuiUpdate();
+					}
+
+					if (event.type === "tool_result_end" && event.message) {
+						currentResult.messages.push(event.message as Message);
+						const resultMsg: any = event.message;
+						const resultText = (
+							Array.isArray(resultMsg.content)
+								? resultMsg.content
+										.filter((c: any) => c?.type === "text")
+										.map((c: any) => c.text)
+										.join("\n")
+								: ""
+						).slice(-1500);
+						pipiuiReport({
+							kind: "log",
+							agentId: pipiuiAgentId,
+							items: [
+								{
+									itemType: "toolResult",
+									name: resultMsg.toolName ?? "",
+									isError: !!resultMsg.isError,
+									text: resultText,
+								},
+							],
+						});
+						emitUpdate();
+						pipiuiUpdate();
+					}
+				};
+
+				proc.stdout.on("data", (data) => {
+					if (isBackground) noteAgentActivity(pipiuiAgentId);
+					buffer += data.toString();
+					const lines = buffer.split("\n");
+					buffer = lines.pop() || "";
+					for (const line of lines) processLine(line);
+				});
+
+				proc.stderr.on("data", (data) => {
+					if (isBackground) noteAgentActivity(pipiuiAgentId);
+					currentResult.stderr += data.toString();
+				});
+
+				proc.on("close", (code) => {
+					if (buffer.trim()) processLine(buffer);
+					resolve(code ?? 0);
+				});
+
+				proc.on("error", () => {
+					resolve(1);
+				});
+
+				// 后台 job 用外部可触达的 backgroundAbort（subagent_abort）；前台沿用工具调用 signal。
+				const effectiveSignal = signal ?? backgroundAbort?.signal;
+				if (effectiveSignal) {
+					let procExited = false;
+					proc.on("close", () => {
+						procExited = true;
+					});
+					const killProc = () => {
+						wasAborted = true;
+						proc.kill("SIGTERM");
+						const forceKill = setTimeout(() => {
+							if (!procExited) proc.kill("SIGKILL");
+						}, 5000);
+						forceKill.unref?.();
+					};
+					if (effectiveSignal.aborted) killProc();
+					else effectiveSignal.addEventListener("abort", killProc, { once: true });
+				}
 			});
-			pipiuiTrackChild(proc);
-			// Recorded so the heartbeat can tell "quiet" from "gone".
-			const liveHandle = runningAgents.get(pipiuiAgentId);
-			if (liveHandle) liveHandle.pid = proc.pid;
-			let buffer = "";
 
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
+			currentResult.exitCode = exitCode;
+
+			// Decide whether to auto-resume before verify/end (those run once, after the loop).
+			if (wasAborted) break;
+			const runFailed = exitCode !== 0 || Boolean(currentResult.errorMessage);
+			if (!runFailed) break;
+			if (autoResumeCount >= AUTO_RESUME_MAX) break;
+			const attemptMessages = currentResult.messages.slice(attemptMessagesFrom);
+			const attemptStderr = currentResult.stderr.slice(attemptStderrFrom);
+			const classifyText = [
+				currentResult.errorMessage ?? "",
+				currentResult.stopReason ?? "",
+				attemptStderr,
+				getFinalOutput(attemptMessages).slice(-2000),
+			].join("\n");
+			if (!isRetryableWorkerError(classifyText)) break;
+
+			const shortErr = (currentResult.errorMessage || currentResult.stderr || "retryable error")
+				.replace(/\s+/g, " ")
+				.trim()
+				.slice(0, 120);
+			const backoffMs = AUTO_RESUME_BACKOFF_MS[autoResumeCount] ?? 15_000;
+			autoResumeCount++;
+			// Reset per-run failure flags; messages/usage/stderr keep accumulating across resumes.
+			currentResult.stopReason = undefined;
+			currentResult.errorMessage = undefined;
+			pipiuiActivity = `auto-resume 第${autoResumeCount}次：前次死于 ${shortErr}`;
+			if (isBackground) noteAgentActivity(pipiuiAgentId);
+			pipiuiUpdate(true);
+
+			// Backoff interruptible by abort (foreground tool signal or backgroundAbort).
+			const waitSignal = signal ?? backgroundAbort?.signal;
+			const abortedDuringBackoff = await new Promise<boolean>((resolve) => {
+				if (waitSignal?.aborted) {
+					resolve(true);
 					return;
 				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-						if (msg.role === "assistant") {
-							currentResult.usage.turns++;
-							const usage = msg.usage;
-							if (usage) {
-								currentResult.usage.input += usage.input || 0;
-								currentResult.usage.output += usage.output || 0;
-								currentResult.usage.cacheRead += usage.cacheRead || 0;
-								currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-								currentResult.usage.cost += usage.cost?.total || 0;
-								currentResult.usage.contextTokens = usage.totalTokens || 0;
-								// Per-turn usage → PipiUI token ledger. Independent of the
-								// cost/turns aggregates above; gives per-turn input/output/cache
-								// breakdown that "end" doesn't carry. Safe to no-op if bridge unset.
-								const toolSet = new Set<string>();
-								for (const part of (msg as any).content ?? []) {
-									if (part?.type === "toolCall" && typeof part.name === "string" && part.name) {
-										toolSet.add(part.name);
-									}
-								}
-								const tools = [...toolSet].sort();
-								pipiuiReport({
-									kind: "usage",
-									agentId: pipiuiAgentId,
-									turn: currentResult.usage.turns,
-									model: msg.model || currentResult.model || null,
-									tools,
-									usage: {
-										input: usage.input || 0,
-										output: usage.output || 0,
-										cacheRead: usage.cacheRead || 0,
-										cacheWrite: usage.cacheWrite || 0,
-										cost: usage.cost?.total || 0,
-										contextTokens: usage.totalTokens || 0,
-									},
-								});
-							}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-						// 完整工作流水上报：每轮的思考/文本/工具调用都进 UI 日志
-						const pipiuiItems: Record<string, unknown>[] = [];
-						for (const part of (msg as any).content ?? []) {
-							if (part?.type === "toolCall") {
-								const args = (part.arguments ?? {}) as Record<string, unknown>;
-								const summary = summarizeToolArgsForUI(String(part.name ?? ""), args);
-								pipiuiActivity = `${part.name} ${summary}`;
-								// Edit keeps a bounded, valid JSON payload so the native subagent log can
-								// render the same line diff as the main-agent transcript. Other tools
-								// retain their compact human-readable summary.
-								const text = part.name === "edit" ? boundedEditPayloadForUI(args) : summary;
-								pipiuiItems.push({ itemType: "tool", name: part.name, text });
-							} else if (part?.type === "text" && String(part.text ?? "").trim()) {
-								pipiuiItems.push({ itemType: "text", text: String(part.text).slice(0, 4000) });
-							} else if (part?.type === "thinking" && String(part.thinking ?? "").trim()) {
-								pipiuiItems.push({ itemType: "thinking", text: String(part.thinking).slice(0, 600) });
-							}
-						}
-						if (pipiuiItems.length > 0) {
-							pipiuiReport({ kind: "log", agentId: pipiuiAgentId, items: pipiuiItems });
-						}
-					}
-					emitUpdate();
-					pipiuiUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					const resultMsg: any = event.message;
-					const resultText = (
-						Array.isArray(resultMsg.content)
-							? resultMsg.content
-									.filter((c: any) => c?.type === "text")
-									.map((c: any) => c.text)
-									.join("\n")
-							: ""
-					).slice(-1500);
-					pipiuiReport({
-						kind: "log",
-						agentId: pipiuiAgentId,
-						items: [
-							{
-								itemType: "toolResult",
-								name: resultMsg.toolName ?? "",
-								isError: !!resultMsg.isError,
-								text: resultText,
-							},
-						],
-					});
-					emitUpdate();
-					pipiuiUpdate();
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				if (isBackground) noteAgentActivity(pipiuiAgentId);
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				if (isBackground) noteAgentActivity(pipiuiAgentId);
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", () => {
-				resolve(1);
-			});
-
-			// 后台 job 用外部可触达的 backgroundAbort（subagent_abort）；前台沿用工具调用 signal。
-			const effectiveSignal = signal ?? backgroundAbort?.signal;
-			if (effectiveSignal) {
-				let procExited = false;
-				proc.on("close", () => {
-					procExited = true;
-				});
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					const forceKill = setTimeout(() => {
-						if (!procExited) proc.kill("SIGKILL");
-					}, 5000);
-					forceKill.unref?.();
+				const timer = setTimeout(() => {
+					waitSignal?.removeEventListener("abort", onAbort);
+					resolve(false);
+				}, backoffMs);
+				timer.unref?.();
+				const onAbort = () => {
+					clearTimeout(timer);
+					resolve(true);
 				};
-				if (effectiveSignal.aborted) killProc();
-				else effectiveSignal.addEventListener("abort", killProc, { once: true });
+				if (waitSignal) waitSignal.addEventListener("abort", onAbort, { once: true });
+			});
+			if (abortedDuringBackoff || waitSignal?.aborted) {
+				wasAborted = true;
+				break;
 			}
-		});
+		}
 
 		currentResult.exitCode = exitCode;
 		// Attested verify: runs AFTER the agent process exits and BEFORE the "end" report,
@@ -2370,12 +2490,32 @@ async function runSingleAgent(
 		}
 		const endOk = exitCode === 0 && !currentResult.errorMessage && !wasAborted;
 		if (wasAborted) currentResult.stopReason = currentResult.stopReason ?? "aborted";
+		// Notes appended after slice so they survive the -8000 tail trim on long outputs.
+		let endOutput = (getFinalOutput(currentResult.messages) || currentResult.stderr || "").slice(-8000);
+		let endResultText =
+			getResultOutput(currentResult) || currentResult.stderr || getFinalOutput(currentResult.messages) || "(no output)";
+		if (endOk && autoResumeCount > 0) {
+			const note = `\n[pipiui] auto-resumed ${autoResumeCount}× after retryable errors.`;
+			endOutput += note;
+			endResultText += note;
+		} else if (
+			!endOk &&
+			!wasAborted &&
+			(currentResult.usage.contextTokens || 0) >= AUTO_RESUME_CONTEXT_HINT_TOKENS
+		) {
+			const n = Math.round((currentResult.usage.contextTokens || 0) / 1000);
+			const note = `\n[pipiui] 疑似上下文过大（~${n}k tokens）导致请求反复失败：建议 boss 以 fresh 重派该 agentId，缩小任务范围并要求小窗口读取。`;
+			endOutput += note;
+			endResultText += note;
+			// Append only — never replace an existing terminal errorMessage.
+			if (currentResult.errorMessage) currentResult.errorMessage += note;
+		}
 		pipiuiReport({
 			kind: "end",
 			agentId: pipiuiAgentId,
 			ok: endOk,
 			aborted: wasAborted,
-			output: (getFinalOutput(currentResult.messages) || currentResult.stderr || "").slice(-8000),
+			output: endOutput,
 			cost: currentResult.usage.cost,
 			turns: currentResult.usage.turns,
 			contextTokens: currentResult.usage.contextTokens,
@@ -2392,8 +2532,6 @@ async function runSingleAgent(
 		});
 		// Terminal job state before notify/return so status works even if follow-up delivery fails.
 		const endState: JobState = wasAborted ? "aborted" : endOk ? "ok" : "failed";
-		const endResultText =
-			getResultOutput(currentResult) || currentResult.stderr || getFinalOutput(currentResult.messages) || "(no output)";
 		jobFinalize(pipiuiAgentId, {
 			name: agentName,
 			task,
