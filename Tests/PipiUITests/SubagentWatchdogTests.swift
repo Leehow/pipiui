@@ -124,4 +124,64 @@ final class SubagentWatchdogTests: XCTestCase {
         XCTAssertTrue(prompt.contains("不要修改文件、搜索项目"))
         XCTAssertTrue(prompt.contains("状态不可确认"))
     }
+
+    /// Vanished settle sends end with interrupted=true; must map to .interrupted + retained,
+    /// not ordinary failed/aborted (matches reconcileInterruptedAfterRestart).
+    func testEndWithInterruptedFlagMapsToInterruptedRetained() throws {
+        let store = SubagentStore()
+        store.handle(J([
+            "kind": "start",
+            "agentId": "worker-1",
+            "name": "worker",
+            "task": "private task payload",
+            "depth": 1,
+            "worktreePath": "/tmp/pipiui-vanish-wt",
+            "worktreeBranch": "pipiui/worker-1",
+        ] as [String: Any]), observedAt: base)
+
+        store.handle(J([
+            "kind": "end",
+            "agentId": "worker-1",
+            "ok": false,
+            "aborted": true,
+            "interrupted": true,
+            "output": "process gone after 2m, no result reported",
+        ] as [String: Any]), observedAt: base.addingTimeInterval(120))
+
+        let agent = try XCTUnwrap(store.agents.first)
+        XCTAssertEqual(agent.state, .interrupted)
+        XCTAssertEqual(agent.closeoutDisposition, .retained)
+        XCTAssertEqual(agent.worktreeLifecycle, .pendingReview)
+        XCTAssertEqual(agent.output, "process gone after 2m, no result reported")
+
+        // Same agentId resume must show running again (Swift start reopen).
+        store.handle(J([
+            "kind": "start",
+            "agentId": "worker-1",
+            "name": "worker",
+            "task": "continue",
+            "depth": 1,
+        ] as [String: Any]), observedAt: base.addingTimeInterval(200))
+        XCTAssertEqual(try XCTUnwrap(store.agents.first).state, .running)
+        XCTAssertNil(try XCTUnwrap(store.agents.first).ended)
+    }
+
+    func testEndWithVanishedFlagAlsoMapsToInterrupted() throws {
+        let store = SubagentStore()
+        store.handle(J([
+            "kind": "start",
+            "agentId": "worker-2",
+            "name": "worker",
+            "task": "task",
+            "depth": 1,
+        ] as [String: Any]), observedAt: base)
+        store.handle(J([
+            "kind": "end",
+            "agentId": "worker-2",
+            "ok": false,
+            "vanished": true,
+            "output": "gone",
+        ] as [String: Any]), observedAt: base.addingTimeInterval(1))
+        XCTAssertEqual(try XCTUnwrap(store.agents.first).state, .interrupted)
+    }
 }

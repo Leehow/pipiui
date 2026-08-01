@@ -147,28 +147,48 @@ final class SubagentContinuityTests: XCTestCase {
 
     /// A worker whose pid is gone but whose close handler never ran used to wait for the
     /// heartbeat to be noticed. isProcessAlive is only signal 0, so the 30s poll can afford to
-    /// check it every pass and report within half a minute.
+    /// check it every pass and report within half a minute — and must fully settle all ledgers.
     func testVanishedWorkersAreCaughtInTheThirtySecondPoll() throws {
         let s = try source()
-        XCTAssertTrue(s.contains("if (handle.pid === undefined || isProcessAlive(handle.pid)) continue;"),
-                      "a dead pid must surface in the 30s poll, not at the next 5min heartbeat")
-        XCTAssertTrue(s.contains("runningAgents.delete(agentId);"), "report a vanished worker once")
+        XCTAssertTrue(s.contains("if (!isHandleVanished(handle, now)) continue;"),
+                      "a dead (or aged no-pid) handle must surface in the 30s poll")
+        XCTAssertTrue(s.contains("function markWorkerInterrupted(agentId: string, reason: string)"),
+                      "vanished path must share one full-settle helper")
+        XCTAssertTrue(s.contains("markWorkerInterrupted(agentId, reason);"),
+                      "30s poll must settle jobRegistry + pipiuiReport end, not only delete")
         XCTAssertTrue(s.contains("interrupted, not failed"),
                       "a vanished worker still has its context and should be continued by name")
     }
 
     /// Idleness is not death: a worker can be quiet while thinking, and a dead one can leave a
     /// registry entry behind when its close handler never ran — exactly the case that hangs the
-    /// boss. Only asking the OS separates the two.
+    /// boss. Only asking the OS separates the two; no-pid handles age out via NO_PID_VANISH_MS.
     func testVanishedWorkersAreDetectedByLivenessNotByIdleness() throws {
         let s = try source()
         XCTAssertTrue(s.contains("function isProcessAlive(pid: number): boolean"))
         XCTAssertTrue(s.contains("process.kill(pid, 0)"))
         XCTAssertTrue(s.contains(#"=== "EPERM""#), "a process owned by someone else is still alive")
-        XCTAssertTrue(s.contains("if (handle.pid !== undefined && !isProcessAlive(handle.pid))"))
-        XCTAssertTrue(s.contains("runningAgents.delete(agentId);"), "report a vanished worker once")
+        XCTAssertTrue(s.contains("function isHandleVanished(handle: RunningAgentHandle, now: number)"))
+        XCTAssertTrue(s.contains("const NO_PID_VANISH_MS = 5 * 60 * 1000;"),
+                      "handles that never attach a pid must not hang forever")
+        XCTAssertTrue(s.contains("if (isHandleVanished(handle, now))"),
+                      "heartbeat uses the same vanish predicate as the 30s poll")
+        XCTAssertTrue(s.contains("state: \"interrupted\""),
+                      "vanish settle must be interrupted, not a generic failed")
+        XCTAssertTrue(s.contains("interrupted: true"),
+                      "Swift panel must receive an interrupted end flag")
         XCTAssertTrue(s.contains("interrupted, not failed"),
                       "a vanished worker still has its context and should be continued by name")
+    }
+
+    /// Resume of a named worker must reopen the in-process job row so subagent_status matches
+    /// the Swift start reopen (running again, not the previous terminal state).
+    func testJobUpsertRunningReopensTerminalJobs() throws {
+        let s = try source()
+        XCTAssertFalse(s.contains("never reopen a terminal job"),
+                       "terminal rows must reopen on same-agentId resume")
+        XCTAssertTrue(s.contains("Resume of the same agentId must reopen a terminal row as running"))
+        XCTAssertTrue(s.contains("const keepLive = existing?.state === \"running\";"))
     }
 
     /// Handling that only matters when an event fires does not belong in a prefix paid for on
