@@ -1590,6 +1590,7 @@ struct InputBar: View {
                     .padding(.vertical, 3)
                     .background(Capsule().fill(Color.primary.opacity(0.06)))
                     .help("账户余额")
+                    .contentShape(Capsule())
             }
         }
         .fixedSize(horizontal: true, vertical: false)

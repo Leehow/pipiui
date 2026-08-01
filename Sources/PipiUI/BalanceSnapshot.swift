@@ -352,13 +352,6 @@ final class BalanceMonitorCore {
         listeners.removeValue(forKey: id)
     }
 
-    /// Drop cached snapshot (used when ChatSession unbinds / provider changes).
-    /// Does not notify observers — the caller publishes nil itself.
-    func clearSnapshot() {
-        snapshot = nil
-        lastSuccessAt = nil
-    }
-
     func ensureStarted() {
         if timer == nil {
             let t = Timer(timeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
