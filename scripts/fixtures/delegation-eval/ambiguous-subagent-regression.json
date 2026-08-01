@@ -1,0 +1,20 @@
+{
+  "format": "pipiui-delegation-eval-transcript/v1",
+  "caseId": "ambiguous-subagent-regression",
+  "meta": { "fixture": "positive clarification" },
+  "events": [
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "timestamp": 1,
+        "content": [
+          {
+            "type": "text",
+            "text": "Which subagent behavior regressed, what is the smallest reproduction, and what changed recently? Please share the expected versus actual result and any relevant log excerpt before I dispatch a repair."
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,195 @@
+{
+  "schemaVersion": 1,
+  "name": "PipiUI delegation evaluation corpus",
+  "description": "Measures whether a boss agent chooses clarification, fan-out, or an ordered dependency chain under the real PipiUI philosophy and subagent stack.",
+  "cases": [
+    {
+      "id": "ambiguous-subagent-regression",
+      "type": "ambiguous",
+      "title": "Unspecified subagent regression",
+      "prompt": "Something in the PipiUI subagent flow regressed after a recent change. Please fix it.",
+      "expectation": {
+        "maxFirstWaveWidth": 1,
+        "maxDispatches": 1,
+        "clarificationRequired": true,
+        "permitConservativeProbe": true,
+        "conservativeRoles": ["explore", "plan", "reviewer"],
+        "conservativeTaskKeywords": ["inspect", "investigate", "identify", "triage", "report", "reproduce"]
+      },
+      "rubric": [
+        "Ask for a concrete symptom, reproduction, expected versus actual behavior, and the relevant recent change; a clarification with no delegation is ideal.",
+        "A single read-only reconnaissance dispatch is acceptable when it explicitly narrows the regression before proposing a fix.",
+        "Do not fan out speculative implementers or launch a broad parallel search from this evidence-free request."
+      ]
+    },
+    {
+      "id": "ambiguous-transcript-ux",
+      "type": "ambiguous",
+      "title": "Vague multi-agent transcript UX request",
+      "prompt": "Make the PipiUI transcript view less confusing when several agents run at once.",
+      "expectation": {
+        "maxFirstWaveWidth": 1,
+        "maxDispatches": 1,
+        "clarificationRequired": true,
+        "permitConservativeProbe": true,
+        "conservativeRoles": ["explore", "plan", "reviewer"],
+        "conservativeTaskKeywords": ["inspect", "investigate", "identify", "triage", "report", "locate"]
+      },
+      "rubric": [
+        "Clarify the confusing interaction, affected screen/state, desired outcome, and whether a screenshot or concrete transcript exists.",
+        "At most one read-only probe may locate the transcript and subagent-tree rendering path before an implementation plan exists.",
+        "Do not treat the words 'several agents' as permission to dispatch several speculative workers."
+      ]
+    },
+    {
+      "id": "ambiguous-philosophy-ci",
+      "type": "ambiguous",
+      "title": "Unspecified philosophy CI failure",
+      "prompt": "CI is red somewhere around the philosophy package. Make it green.",
+      "expectation": {
+        "maxFirstWaveWidth": 1,
+        "maxDispatches": 1,
+        "clarificationRequired": true,
+        "permitConservativeProbe": true,
+        "conservativeRoles": ["explore", "plan", "reviewer"],
+        "conservativeTaskKeywords": ["inspect", "investigate", "identify", "triage", "report", "log"]
+      },
+      "rubric": [
+        "Request the failing command, full error, platform, and recent change; do not infer a cause from 'somewhere around'.",
+        "One focused, read-only failure-triage dispatch is acceptable if it is framed as evidence gathering rather than a repair.",
+        "Parallel implementation or a chain of edits is over-decomposition because the failing target is not known."
+      ]
+    },
+    {
+      "id": "parallel-spawn-vs-fanout",
+      "type": "parallelizable",
+      "title": "Independent spawn wiring and fan-out audit",
+      "prompt": "Please independently investigate two unrelated questions and give separate findings: (1) how PipiSpawnAssembly decides which -e extensions and environment variables reach the main pi process; and (2) how PiPhilosophy's fanout layer turns its prompt rule into runtime behavior in the patched subagent extension. Do not combine the two investigations.",
+      "expectation": {
+        "minFirstWaveWidth": 2,
+        "minimumTargetCoverage": 2,
+        "parallelTargets": [
+          {
+            "id": "spawn-assembly",
+            "keywords": ["pipispawnassembly", "spawn assembly", "extension arguments", "environment variables", "main pi process"]
+          },
+          {
+            "id": "fanout-runtime",
+            "keywords": ["fanout", "philosophy", "forced background", "patched subagent", "runtime behavior"]
+          }
+        ]
+      },
+      "rubric": [
+        "The first delegation wave has at least two lanes, either one tasks[] call or multiple single subagent calls in the same assistant message.",
+        "One lane owns PipiSpawnAssembly extension/environment wiring; the other owns PiPhilosophy plus patched-subagent fan-out behavior.",
+        "Each brief is independently actionable and asks for separate findings; merging both subjects into one worker loses decomposition quality."
+      ]
+    },
+    {
+      "id": "parallel-event-runtime-composition",
+      "type": "parallelizable",
+      "title": "Three independent read-only architecture audits",
+      "prompt": "Run three independent read-only audits in parallel and report separately: A. which ChatSession paths turn incoming pi JSON events into UI transcript state; B. which PiExt/subagent paths choose background versus chain execution; C. which PiPhilosophy composition paths activate or deactivate orchestration layers.",
+      "expectation": {
+        "minFirstWaveWidth": 3,
+        "minimumTargetCoverage": 3,
+        "parallelTargets": [
+          {
+            "id": "chat-session-events",
+            "keywords": ["chatsession", "json events", "transcript", "ui transcript"]
+          },
+          {
+            "id": "subagent-modes",
+            "keywords": ["piext", "subagent", "background", "chain"]
+          },
+          {
+            "id": "philosophy-composition",
+            "keywords": ["pipiphilosophy", "composition", "orchestration", "layers"]
+          }
+        ]
+      },
+      "rubric": [
+        "The first wave has three independent lanes; read-only work has no dependency that justifies serial dispatch.",
+        "The lanes cover event-to-transcript handling, subagent execution mode selection, and philosophy layer composition separately.",
+        "Use read-only investigation roles and preserve separate reports rather than giving one worker a broad three-part brief."
+      ]
+    },
+    {
+      "id": "parallel-three-local-comments",
+      "type": "parallelizable",
+      "title": "Three isolated comment clarifications",
+      "prompt": "Make these three independent, scoped comment clarifications in parallel: (1) add a concise explanation at the PipiSpawnAssembly bridge-gating branch; (2) clarify the PIPI_PHILOSOPHY_ROLE propagation comment in PiPhilosophy; and (3) clarify the MAX_CONCURRENCY rationale in PiExt/subagent. Each item is in a different region and must stay limited to its own item.",
+      "expectation": {
+        "minFirstWaveWidth": 3,
+        "minimumTargetCoverage": 3,
+        "parallelTargets": [
+          {
+            "id": "bridge-gating",
+            "keywords": ["pipispawnassembly", "bridge", "gating"]
+          },
+          {
+            "id": "philosophy-role",
+            "keywords": ["pipi_philosophy_role", "philosophy", "role propagation"]
+          },
+          {
+            "id": "subagent-concurrency",
+            "keywords": ["max_concurrency", "subagent", "concurrency"]
+          }
+        ]
+      },
+      "rubric": [
+        "The first wave has three lanes because the three regions have no data, ordering, or small-hunk conflict dependency.",
+        "Each implementation brief names only its own file/region and does not merge unrelated comment edits into a single worker.",
+        "A later combined verification step is acceptable; serializing the implementation wave is not."
+      ]
+    },
+    {
+      "id": "dependent-subagent-evaluation-tag",
+      "type": "dependent",
+      "title": "Subagent schema to metadata to tests",
+      "prompt": "Extend the patched subagent tool with a new optional evaluationTag field. First change the parameter schema, then propagate it through dispatch result and job metadata, then add or update focused tests and run them. These steps depend on one another; do not split them into parallel writers.",
+      "expectation": {
+        "minimumChainSteps": 3,
+        "dependencyKeywords": ["schema", "metadata", "test"],
+        "forbidParallelDispatch": true
+      },
+      "rubric": [
+        "Express the schema -> runtime metadata -> tests order as a chain or an equivalently ordered sequence.",
+        "Do not use tasks[] or multiple same-wave writer dispatches: later steps need the prior interface and behavior.",
+        "The briefs preserve the requested dependency boundaries instead of treating tests as an independent parallel task."
+      ]
+    },
+    {
+      "id": "dependent-capability-key-rename",
+      "type": "dependent",
+      "title": "Capability key rename chain",
+      "prompt": "Rename the philosophy capability key delegate_status to delegation_status safely. First change capability data and composition references, then update layers and docs that consume the placeholder, then run the package's focused tests. This is one dependency chain, not independent cleanup.",
+      "expectation": {
+        "minimumChainSteps": 3,
+        "dependencyKeywords": ["capability", "placeholder", "test"],
+        "forbidParallelDispatch": true
+      },
+      "rubric": [
+        "Keep capability data/composition ahead of placeholder consumers, with tests after the rename has propagated.",
+        "Parallel fan-out is wrong because every downstream reference depends on the renamed contract.",
+        "A chain that labels the interface, consumers, and tests separately receives full decomposition credit."
+      ]
+    },
+    {
+      "id": "dependent-spawn-env-contract",
+      "type": "dependent",
+      "title": "Spawn environment contract change",
+      "prompt": "Change PipiSpawnAssembly's subagent environment wiring so a new value reaches subagents. First modify the assembly model, then update callers and behavior tests for the new contract, then run the relevant Swift tests. Preserve the order; later work depends on the prior interface.",
+      "expectation": {
+        "minimumChainSteps": 3,
+        "dependencyKeywords": ["assembly", "callers", "test"],
+        "forbidParallelDispatch": true
+      },
+      "rubric": [
+        "Use a serial chain: assembly contract first, callers/tests after the contract exists, then verification.",
+        "Do not parallelize callers and behavior tests against an undefined new environment contract.",
+        "The dispatch must make the interface dependency visible, not merely avoid fan-out by doing no work."
+      ]
+    }
+  ]
+}
