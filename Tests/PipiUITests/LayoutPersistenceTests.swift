@@ -98,4 +98,67 @@ final class LayoutPersistenceTests: XCTestCase {
         LayoutPersistence.saveSidebarWidthRatio(0.33, defaults: suiteA)
         XCTAssertNil(LayoutPersistence.sidebarWidthRatio(defaults: suiteB))
     }
+
+    // MARK: - Subagent panel list-height ratio
+
+    /// No stored value → nil; a save round-trips through pending + flush.
+    func testSubagentListHeightRatioRoundTrip() {
+        let (suite, suiteName) = makeSuite()
+        defer {
+            LayoutPersistence.flushPendingWrites()
+            suite.removePersistentDomain(forName: suiteName)
+        }
+
+        XCTAssertNil(LayoutPersistence.subagentListHeightRatio(defaults: suite))
+        LayoutPersistence.saveSubagentListHeightRatio(0.62, defaults: suite)
+        XCTAssertEqual(LayoutPersistence.subagentListHeightRatio(defaults: suite), 0.62)
+        LayoutPersistence.flushPendingWrites()
+        XCTAssertEqual(suite.double(forKey: "pipiui.subagentListHeightRatio"), 0.62, accuracy: 0.0001)
+    }
+
+    /// Saves outside the persisted range are rejected and must not overwrite the
+    /// last valid value; the range edges themselves are accepted.
+    func testSubagentListHeightRatioClampRejectsOutOfRange() {
+        let (suite, suiteName) = makeSuite()
+        defer {
+            LayoutPersistence.flushPendingWrites()
+            suite.removePersistentDomain(forName: suiteName)
+        }
+
+        LayoutPersistence.saveSubagentListHeightRatio(0.1, defaults: suite)
+        XCTAssertNil(LayoutPersistence.subagentListHeightRatio(defaults: suite))
+
+        LayoutPersistence.saveSubagentListHeightRatio(0.15, defaults: suite)
+        XCTAssertEqual(LayoutPersistence.subagentListHeightRatio(defaults: suite), 0.15)
+
+        LayoutPersistence.saveSubagentListHeightRatio(0.9, defaults: suite)
+        XCTAssertEqual(LayoutPersistence.subagentListHeightRatio(defaults: suite), 0.15,
+                       "out-of-range save must not overwrite the stored value")
+
+        LayoutPersistence.saveSubagentListHeightRatio(0.85, defaults: suite)
+        XCTAssertEqual(LayoutPersistence.subagentListHeightRatio(defaults: suite), 0.85)
+    }
+
+    /// Non-finite values are rejected instead of being persisted.
+    func testSubagentListHeightRatioRejectsNonFinite() {
+        let (suite, suiteName) = makeSuite()
+        defer {
+            LayoutPersistence.flushPendingWrites()
+            suite.removePersistentDomain(forName: suiteName)
+        }
+
+        LayoutPersistence.saveSubagentListHeightRatio(.nan, defaults: suite)
+        XCTAssertNil(LayoutPersistence.subagentListHeightRatio(defaults: suite))
+        LayoutPersistence.saveSubagentListHeightRatio(.infinity, defaults: suite)
+        XCTAssertNil(LayoutPersistence.subagentListHeightRatio(defaults: suite))
+        LayoutPersistence.saveSubagentListHeightRatio(-0.5, defaults: suite)
+        XCTAssertNil(LayoutPersistence.subagentListHeightRatio(defaults: suite))
+    }
+
+    /// Default fallback is a valid in-range ratio for the first launch.
+    func testSubagentListHeightRatioDefaultIsInRange() {
+        XCTAssertEqual(LayoutPersistence.defaultSubagentListHeightRatio, 0.45)
+        XCTAssertTrue(LayoutPersistence.subagentListRatioRange
+            .contains(LayoutPersistence.defaultSubagentListHeightRatio))
+    }
 }

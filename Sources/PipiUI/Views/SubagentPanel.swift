@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// 右侧 Subagent 面板：上半是 agent 树列表，下半是选中 agent 的实时详情。
 struct SubagentPanel: View {
@@ -11,6 +12,12 @@ struct SubagentPanel: View {
     var onManualStatusCheck: ([String]) -> Void
     var onClose: () -> Void
 
+    /// 上下分栏比例（列表高度 / 可用高度）。拖拽 onChanged 更新，onEnded 持久化。
+    @State private var listHeightRatio = LayoutPersistence.subagentListHeightRatio()
+        ?? LayoutPersistence.defaultSubagentListHeightRatio
+    /// 本次拖拽的起点比例（作为 startListHeight 基数，避免叠加已被更新的比例）。
+    @State private var dragStartListHeightRatio: CGFloat?
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -21,11 +28,19 @@ struct SubagentPanel: View {
             if store.agents.isEmpty {
                 emptyHint
             } else {
-                VSplitView {
-                    agentList
-                        .frame(minHeight: 64, idealHeight: 160)
-                    detail
-                        .frame(minHeight: 56)
+                GeometryReader { geo in
+                    let availableHeight = geo.size.height - Self.subagentDividerHeight
+                    let listHeight = clampedSubagentListHeight(
+                        availableHeight * listHeightRatio,
+                        availableHeight: availableHeight
+                    )
+                    VStack(spacing: 0) {
+                        agentList
+                            .frame(height: listHeight)
+                        subagentListDivider(availableHeight: availableHeight)
+                        detail
+                            .frame(height: max(0, availableHeight - listHeight))
+                    }
                 }
             }
         }
@@ -35,6 +50,72 @@ struct SubagentPanel: View {
                 await store.reconcileWorktreeLifecycles(mainProjectURL: projectURL)
             }
         }
+    }
+
+    // MARK: - 上下分栏高度（镜像 RightPanelDivider / finishRightPanelDrag 先例）
+
+    /// 拖拽手柄高度（含 1pt 视觉线）。
+    private static let subagentDividerHeight: CGFloat = 6
+    private static let minimumSubagentListHeight: CGFloat = 64
+    private static let minimumSubagentDetailHeight: CGFloat = 56
+
+    /// 列表高度钳制：不低于 64，且给 detail 至少留 56。
+    private func clampedSubagentListHeight(_ proposed: CGFloat, availableHeight: CGFloat) -> CGFloat {
+        let maximumListHeight = max(
+            Self.minimumSubagentListHeight,
+            availableHeight - Self.minimumSubagentDetailHeight
+        )
+        return min(max(proposed, Self.minimumSubagentListHeight), maximumListHeight)
+    }
+
+    private func subagentListDivider(availableHeight: CGFloat) -> some View {
+        SubagentListDivider(
+            onChanged: { translation in
+                updateSubagentListDrag(translation: translation, availableHeight: availableHeight)
+            },
+            onEnded: { translation in
+                finishSubagentListDrag(translation: translation, availableHeight: availableHeight)
+            }
+        )
+        .frame(height: Self.subagentDividerHeight)
+    }
+
+    private func updateSubagentListDrag(translation: CGFloat, availableHeight: CGFloat) {
+        guard availableHeight > 0 else { return }
+        if dragStartListHeightRatio == nil {
+            dragStartListHeightRatio = listHeightRatio
+        }
+        guard let startRatio = dragStartListHeightRatio else { return }
+        let startListHeight = clampedSubagentListHeight(
+            availableHeight * startRatio,
+            availableHeight: availableHeight
+        )
+        let newHeight = clampedSubagentListHeight(
+            startListHeight + translation,
+            availableHeight: availableHeight
+        )
+        listHeightRatio = newHeight / availableHeight
+    }
+
+    private func finishSubagentListDrag(translation: CGFloat, availableHeight: CGFloat) {
+        guard availableHeight > 0 else { return }
+        let startRatio = dragStartListHeightRatio ?? listHeightRatio
+        let startListHeight = clampedSubagentListHeight(
+            availableHeight * startRatio,
+            availableHeight: availableHeight
+        )
+        let newHeight = clampedSubagentListHeight(
+            startListHeight + translation,
+            availableHeight: availableHeight
+        )
+
+        if abs(translation) >= 1 {
+            if let validRatio = LayoutPersistence.saveSubagentListHeightRatio(newHeight / availableHeight) {
+                listHeightRatio = validRatio
+            }
+        }
+
+        dragStartListHeightRatio = nil
     }
 
     private var header: some View {
@@ -144,6 +225,46 @@ struct SubagentPanel: View {
                 .foregroundStyle(.tertiary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+}
+
+/// 竖向拖拽手柄：镜像 RightPanelDivider，DragGesture 取 vertical 位移调整上下栏比例。
+private struct SubagentListDivider: View {
+    let onChanged: (CGFloat) -> Void
+    let onEnded: (CGFloat) -> Void
+    @State private var isPointerInside = false
+
+    var body: some View {
+        ZStack {
+            Color.clear
+            Rectangle()
+                .fill(Color.primary.opacity(0.14))
+                .frame(height: 1)
+        }
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(
+                minimumDistance: 1,
+                coordinateSpace: .global
+            )
+                .onChanged { value in
+                    onChanged(value.translation.height)
+                }
+                .onEnded { value in
+                    onEnded(value.translation.height)
+                }
+        )
+        .onHover { isInside in
+            isPointerInside = isInside
+            (isInside ? NSCursor.resizeUpDown : NSCursor.arrow).set()
+        }
+        .onDisappear {
+            if isPointerInside {
+                isPointerInside = false
+                NSCursor.arrow.set()
+            }
+        }
+        .help("拖动调整上下两栏高度比例")
     }
 }
 
