@@ -762,7 +762,7 @@ enum SubagentToolCardStatus {
         case .aborted:
             return "已中止"
         case .interrupted:
-            return "已中断（App 重启）"
+            return "已中断（可续跑）"
         }
     }
 }

@@ -801,7 +801,7 @@ const emptyUsage = (): UsageStats => ({
 });
 
 // ---- In-process job registry (model-visible via subagent_status; independent of App UI) ----
-type JobState = "running" | "ok" | "failed" | "aborted";
+type JobState = "running" | "ok" | "failed" | "aborted" | "interrupted";
 
 interface JobRecord {
 	agentId: string;
@@ -837,6 +837,8 @@ const DONE_RETRY_MIN_INTERVAL_MS = 60_000;
  * 重投 / vanished 检测）承担，心跳只做兜底摘要，故从 15min 降到 5min。
  */
 const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+/** A handle with no pid after this age is treated as vanished (spawn never attached). */
+const NO_PID_VANISH_MS = 5 * 60 * 1000;
 
 /** Signal 0 tests for existence without touching the process. */
 function isProcessAlive(pid: number): boolean {
@@ -961,17 +963,19 @@ function jobPrune(): void {
 
 function jobUpsertRunning(agentId: string, name: string, task: string, title?: string): void {
 	const existing = jobRegistry.get(agentId);
-	if (existing && existing.state !== "running") return; // never reopen a terminal job
+	// Resume of the same agentId must reopen a terminal row as running (matches Swift start).
+	const keepLive = existing?.state === "running";
 	jobRegistry.set(agentId, {
 		agentId,
 		name,
 		task: taskSummary(task),
 		title,
 		state: "running",
-		startedAt: existing?.startedAt ?? Date.now(),
-		activity: existing?.activity,
-		cost: existing?.cost,
-		turns: existing?.turns,
+		startedAt: keepLive ? (existing?.startedAt ?? Date.now()) : Date.now(),
+		// Drop endedAt/resultText/metrics from a prior terminal run; keep live metrics only.
+		activity: keepLive ? existing?.activity : undefined,
+		cost: keepLive ? existing?.cost : undefined,
+		turns: keepLive ? existing?.turns : undefined,
 	});
 	jobPrune();
 }
@@ -1004,7 +1008,7 @@ function jobFinalize(
 	const existing = jobRegistry.get(agentId);
 	const now = Date.now();
 	if (existing && existing.state !== "running") {
-		// Already terminal: fill missing result/metrics only (notify may race with runSingleAgent end)
+		// Already terminal: fill missing result/metrics only (vanished settle may race with close→end).
 		if (!existing.resultText && fields.resultText)
 			existing.resultText = truncateTextHead(fields.resultText, JOB_RESULT_STORE_CAP);
 		if (existing.cost === undefined && fields.cost !== undefined) existing.cost = fields.cost;
@@ -1030,6 +1034,46 @@ function jobFinalize(
 		verify: fields.verify ?? existing?.verify,
 	});
 	jobPrune();
+}
+
+/** Dead pid, or no pid attached after NO_PID_VANISH_MS. */
+function isHandleVanished(handle: RunningAgentHandle, now: number): boolean {
+	if (handle.pid !== undefined) return !isProcessAlive(handle.pid);
+	return now - handle.startedAt >= NO_PID_VANISH_MS;
+}
+
+/**
+ * Settle a vanished worker on every ledger: jobRegistry terminal, Swift panel via
+ * pipiuiReport end (interrupted), then drop the running handle. Idempotent when
+ * already terminal and the handle is gone. A later close→end may still fill metrics
+ * via jobFinalize's terminal-merge path.
+ */
+function markWorkerInterrupted(agentId: string, reason: string): void {
+	const handle = runningAgents.get(agentId);
+	const job = jobRegistry.get(agentId);
+	if (!handle && !job) return;
+	if (!handle && job && job.state !== "running") return;
+
+	jobFinalize(agentId, {
+		name: handle?.name ?? job?.name,
+		task: handle?.task ?? job?.task,
+		state: "interrupted",
+		resultText: reason,
+		activity: job?.activity,
+		cost: job?.cost,
+		turns: job?.turns,
+	});
+	pipiuiReport({
+		kind: "end",
+		agentId,
+		ok: false,
+		aborted: true,
+		interrupted: true,
+		output: reason,
+		...(job?.cost !== undefined ? { cost: job.cost } : {}),
+		...(job?.turns !== undefined ? { turns: job.turns } : {}),
+	});
+	runningAgents.delete(agentId);
 }
 
 function jobStateFromResult(
@@ -2883,19 +2927,23 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// (2) vanished 即时检测（isProcessAlive 只是 signal 0，很便宜）。先于 stall 扫描：
-		// 死掉的进程不该再收到 stall 推送。
+		// 死掉的进程不该再收到 stall 推送。必须 jobFinalize + pipiuiReport(end) 再 delete，
+		// 否则 jobRegistry/Swift 面板会永远停在 running（半结算）。
 		for (const [agentId, handle] of [...runningAgents]) {
-			if (handle.pid === undefined || isProcessAlive(handle.pid)) continue;
-			// 进程已没但没人报告：停止跟踪，这件事只说一次。
-			runningAgents.delete(agentId);
+			if (!isHandleVanished(handle, now)) continue;
 			const title =
 				handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 60) || "(untitled)";
 			const elapsed = formatElapsedMs(now - handle.startedAt);
+			const reason =
+				handle.pid === undefined
+					? `process never attached a pid after ${elapsed}; treated as interrupted (vanished)`
+					: `process gone after ${elapsed}, no result reported`;
+			markWorkerInterrupted(agentId, reason);
 			deliverSubagentDone(
 				pi,
 				[
 					`[subagent-heartbeat] outstanding=${runningAgents.size} vanished=1`,
-					`  ${agentId} (${title}) — process gone after ${elapsed}, no result reported`,
+					`  ${agentId} (${title}) — ${reason}`,
 					"A vanished worker was interrupted, not failed: its stored conversation is intact, so re-dispatch that same agentId to continue where it left off.",
 				].join("\n"),
 			);
@@ -2960,10 +3008,14 @@ export default function (pi: ExtensionAPI) {
 				handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 60) || "(untitled)";
 			const elapsed = formatElapsedMs(now - handle.startedAt);
 			const idle = Math.floor((now - handle.lastActivityAt) / 1000);
-			if (handle.pid !== undefined && !isProcessAlive(handle.pid)) {
-				// Its process is gone but nothing reported it. Stop tracking so this is said once.
-				runningAgents.delete(agentId);
-				vanished.push(`  ${agentId} (${title}) — process gone after ${elapsed}, no result reported`);
+			if (isHandleVanished(handle, now)) {
+				// Process gone (or never attached) without a close report — full settle once.
+				const reason =
+					handle.pid === undefined
+						? `process never attached a pid after ${elapsed}; treated as interrupted (vanished)`
+						: `process gone after ${elapsed}, no result reported`;
+				markWorkerInterrupted(agentId, reason);
+				vanished.push(`  ${agentId} (${title}) — ${reason}`);
 				continue;
 			}
 			alive.push(`  ${agentId} (${title}) — running ${elapsed}, idle ${idle}s`);
@@ -3010,7 +3062,7 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_status",
 		label: "Subagent Status",
 		description: [
-			"Query subagent job status (running / ok / failed / aborted), plus workers that are stopped but still hold their stored context.",
+			"Query subagent job status (running / ok / failed / aborted / interrupted), plus workers that are stopped but still hold their stored context.",
 			"An interrupted worker is not a failed one: re-dispatch its agentId to continue where it left off instead of starting someone cold.",
 			"Use when deciding next action, when the user asks for progress, or before re-dispatching.",
 			"Prefer reading finished results via this tool or [subagent-done] over spawning a new agent for the same work.",
