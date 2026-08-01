@@ -3,6 +3,13 @@ import XCTest
 @testable import PipiUI
 
 final class TranscriptSessionRootIdentityTests: XCTestCase {
+    private var repositoryRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
     func testDifferentSessionKeysProduceDifferentScrollRoots() {
         let first = TranscriptSessionRootIdentity(
             sessionKey: "session-a"
@@ -69,5 +76,38 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
             ),
             before
         )
+    }
+
+    func testTranscriptUsesNormalChronologicalLayoutWithoutReverseFlip() throws {
+        let source = try String(
+            contentsOf: repositoryRoot
+                .appendingPathComponent("Sources/PipiUI/Views/ChatDetailView.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(
+            source.range(of: "private struct StreamingTranscriptRows: View")?.lowerBound
+        )
+        let end = try XCTUnwrap(
+            source.range(
+                of: "private struct TranscriptLoadingOverlay: View",
+                range: start..<source.endIndex
+            )?.lowerBound
+        )
+        let transcript = String(source[start..<end])
+
+        XCTAssertTrue(transcript.contains("ForEach(presentation.rows"))
+        XCTAssertTrue(transcript.contains("pinEdge: .documentEnd"))
+        XCTAssertFalse(transcript.contains(".reversed()"))
+        XCTAssertFalse(transcript.contains(".transcriptFlip()"))
+
+        let history = try XCTUnwrap(transcript.range(of: "ForEach(presentation.rows")?.lowerBound)
+        let streaming = try XCTUnwrap(
+            transcript.range(of: "if let streamingItem = streaming.streamingItem")?.lowerBound
+        )
+        let bottom = try XCTUnwrap(
+            transcript.range(of: ".id(transcriptID(\"bottom\"))")?.lowerBound
+        )
+        XCTAssertLessThan(history, streaming)
+        XCTAssertLessThan(streaming, bottom)
     }
 }

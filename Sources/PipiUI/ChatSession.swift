@@ -542,9 +542,50 @@ enum InitialTranscriptReconciler {
 /// from publishing to composer and sidebar observers of the session itself.
 final class StreamingState: ObservableObject {
     @Published var streamingItem: ChatItem?
-    @Published var toolRuns: [String: ToolRun] = [:]
-    /// Monotonic counter bumped when toolRuns actually changes (UI watches this instead of scanning outputs).
-    @Published var toolOutputVersion: UInt64 = 0
+    @Published private(set) var toolRuns: [String: ToolRun] = [:]
+    /// Monotonic content counter. `toolRuns` itself publishes the render update; this
+    /// counter is a cheap diagnostic/snapshot token and deliberately publishes no
+    /// second `objectWillChange` event.
+    private(set) var toolOutputVersion: UInt64 = 0
+    /// Changes only when tool result imagery crosses the empty/non-empty boundary.
+    /// That is the sole `ToolRun` property used by settled transcript planning.
+    private(set) var toolStructureVersion: UInt64 = 0
+
+    func replaceToolRuns(_ runs: [String: ToolRun]) {
+        guard runs != toolRuns else { return }
+        let structureChanged = Self.imageBearingToolIDs(in: runs)
+            != Self.imageBearingToolIDs(in: toolRuns)
+        toolOutputVersion &+= 1
+        if structureChanged { toolStructureVersion &+= 1 }
+        toolRuns = runs
+    }
+
+    func updateToolRun(_ run: ToolRun, for id: String) {
+        updateToolRuns([id: run])
+    }
+
+    /// Publish one dictionary update for a coalesced partial-output batch.
+    func updateToolRuns(_ updates: [String: ToolRun]) {
+        guard !updates.isEmpty else { return }
+        var next = toolRuns
+        var changed = false
+        var structureChanged = false
+        for (id, run) in updates where next[id] != run {
+            if (next[id]?.images.isEmpty == false) != !run.images.isEmpty {
+                structureChanged = true
+            }
+            next[id] = run
+            changed = true
+        }
+        guard changed else { return }
+        toolOutputVersion &+= 1
+        if structureChanged { toolStructureVersion &+= 1 }
+        toolRuns = next
+    }
+
+    private static func imageBearingToolIDs(in runs: [String: ToolRun]) -> Set<String> {
+        Set(runs.lazy.filter { !$0.value.images.isEmpty }.map(\.key))
+    }
 }
 
 /// One live pi RPC session bound to a project directory.
@@ -576,6 +617,7 @@ final class ChatSession: ObservableObject, Identifiable {
     var streamingItem: ChatItem? { streaming.streamingItem }
     var toolRuns: [String: ToolRun] { streaming.toolRuns }
     var toolOutputVersion: UInt64 { streaming.toolOutputVersion }
+    var toolStructureVersion: UInt64 { streaming.toolStructureVersion }
     @Published var isStreaming = false
     /// True between the user clicking Stop and the turn actually settling.
     /// Drives optimistic 'stopping…' UI so one click is visibly acknowledged.
@@ -863,7 +905,7 @@ final class ChatSession: ObservableObject, Identifiable {
             var stampedItems = initialTranscript.items
             Self.stampToolDurations(&stampedItems, from: initialTranscript.toolRuns)
             transcript = stampedItems
-            streaming.toolRuns = initialTranscript.toolRuns
+            streaming.replaceToolRuns(initialTranscript.toolRuns)
             itemCounter = initialTranscript.itemCounter
             skipNextAssistantIngest = initialTranscript.skipNextAssistantIngest
             initialPreviewItemCount = initialTranscript.items.count
@@ -1217,10 +1259,7 @@ final class ChatSession: ObservableObject, Identifiable {
         )
         itemCounter = reconciled.itemCounter
         skipNextAssistantIngest = built.skipNextAssistantIngest
-        streaming.toolRuns = reconciled.toolRuns
-        if !built.toolRuns.isEmpty || reconciled.appendedLiveItemCount > 0 {
-            streaming.toolOutputVersion &+= 1
-        }
+        streaming.replaceToolRuns(reconciled.toolRuns)
 
         // Stamp durations before the single assignment so the publish carries them.
         var stampedItems = reconciled.items
@@ -1552,8 +1591,7 @@ final class ChatSession: ObservableObject, Identifiable {
         case "tool_execution_start":
             if let tid = e["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
-                streaming.toolRuns[tid] = ToolRun(isRunning: true, startedAt: Date())
-                streaming.toolOutputVersion &+= 1
+                streaming.updateToolRun(ToolRun(isRunning: true, startedAt: Date()), for: tid)
             }
         case "tool_execution_update":
             if let tid = e["toolCallId"].string {
@@ -1572,15 +1610,14 @@ final class ChatSession: ObservableObject, Identifiable {
                 let content = e["result"]["content"]
                 let previous = streaming.toolRuns[tid]
                 let now = Date()
-                streaming.toolRuns[tid] = ToolRun(
+                streaming.updateToolRun(ToolRun(
                     isRunning: false,
                     isError: e["isError"].bool ?? false,
                     output: Self.contentText(content),
                     images: Self.contentImages(content, allowDiskRead: false),
                     startedAt: previous?.startedAt,
                     lastOutputAt: now
-                )
-                streaming.toolOutputVersion &+= 1
+                ), for: tid)
                 Self.stampToolDurations(&transcript, from: streaming.toolRuns)
                 scheduleImageBackfill(toolCallId: tid)
             }
@@ -1747,10 +1784,7 @@ final class ChatSession: ObservableObject, Identifiable {
         guard !pendingToolRuns.isEmpty else { return }
         let batch = pendingToolRuns
         pendingToolRuns.removeAll(keepingCapacity: true)
-        for (tid, run) in batch {
-            streaming.toolRuns[tid] = run
-        }
-        streaming.toolOutputVersion &+= 1
+        streaming.updateToolRuns(batch)
     }
 
     private func scheduleStreamFlush() {
@@ -1834,15 +1868,14 @@ final class ChatSession: ObservableObject, Identifiable {
                 pendingToolRuns.removeValue(forKey: tid)
                 let content = message["content"]
                 let previous = streaming.toolRuns[tid]
-                streaming.toolRuns[tid] = ToolRun(
+                streaming.updateToolRun(ToolRun(
                     isRunning: false,
                     isError: message["isError"].bool ?? false,
                     output: Self.contentText(content),
                     images: Self.contentImages(content, allowDiskRead: false),
                     startedAt: previous?.startedAt,
                     lastOutputAt: previous?.lastOutputAt ?? Date()
-                )
-                streaming.toolOutputVersion &+= 1
+                ), for: tid)
                 Self.stampToolDurations(&transcript, from: streaming.toolRuns)
                 scheduleImageBackfill(toolCallId: tid)
             }
@@ -2227,8 +2260,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 if let toolCallId, let run = self.streaming.toolRuns[toolCallId] {
                     var next = run
                     next.images = Self.backfilledImages(run.images, loaded: loaded)
-                    self.streaming.toolRuns[toolCallId] = next
-                    self.streaming.toolOutputVersion &+= 1
+                    self.streaming.updateToolRun(next, for: toolCallId)
                 }
             }
         }
@@ -2787,8 +2819,7 @@ final class ChatSession: ObservableObject, Identifiable {
                     var stampedItems = built.items
                     Self.stampToolDurations(&stampedItems, from: built.toolRuns)
                     self.transcript = stampedItems
-                    self.streaming.toolRuns = built.toolRuns
-                    self.streaming.toolOutputVersion &+= 1
+                    self.streaming.replaceToolRuns(built.toolRuns)
                     self.itemCounter = built.itemCounter
                     self.skipNextAssistantIngest = built.skipNextAssistantIngest
                     self.cachedBranchMessages = []

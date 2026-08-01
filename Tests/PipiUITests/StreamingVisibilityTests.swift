@@ -52,7 +52,10 @@ final class StreamingVisibilityTests: XCTestCase {
         session.streaming.streamingItem = ChatItem(
             id: "streaming", role: "assistant", blocks: [.text("before")]
         )
-        session.streaming.toolRuns["tool-1"] = ToolRun(isRunning: true, output: "before")
+        session.streaming.updateToolRun(
+            ToolRun(isRunning: true, output: "before"),
+            for: "tool-1"
+        )
 
         // Queue both coalesced flushes while visible, then switch away before the
         // 50 ms deadline. Neither conversion/publication may occur while hidden.
