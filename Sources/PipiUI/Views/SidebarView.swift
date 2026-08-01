@@ -27,6 +27,8 @@ struct SidebarView: View {
     /// Remote connection details are also window-local and never alter project
     /// or session selection.
     @State private var showRemoteConnection = false
+    /// Project whose session-search popover is open (from the ⋯ menu).
+    @State private var sessionSearchTarget: SessionSearchTarget?
 
     /// Shared leading gutter — `.sidebar` List defaults are wider than needed.
     private static let sidebarGutter: CGFloat = 10
@@ -342,6 +344,9 @@ struct SidebarView: View {
             Menu {
                 Text("共 \(sessionCount) 个会话")
                 Divider()
+                Button("搜索会话…") {
+                    sessionSearchTarget = SessionSearchTarget(project: project)
+                }
                 Button(isPinned ? "取消置顶项目" : "置顶项目") {
                     store.toggleProjectPin(project)
                 }
@@ -380,6 +385,40 @@ struct SidebarView: View {
         }
         .padding(.vertical, 5)
         .padding(.horizontal, 6)
+        .popover(item: Binding(
+            get: { sessionSearchTarget?.project.path == project.path ? sessionSearchTarget : nil },
+            set: { sessionSearchTarget = $0 }
+        )) { target in
+            SessionSearchPopover(
+                project: target.project,
+                store: store,
+                liveEntries: {
+                    newSessionEntries(project: target.project).map { key, session in
+                        let name = session.sessionName?
+                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        return (key, name.isEmpty ? "新会话" : name)
+                    }
+                },
+                onOpen: { hit in
+                    expandedProjectPaths.insert(target.project.path)
+                    store.selectedProjectPath = target.project.path
+                    if hit.isLive {
+                        store.selectedSessionKey = hit.path
+                    } else {
+                        let meta = SessionMeta(
+                            path: hit.path,
+                            name: hit.title,
+                            modified: hit.modified ?? Date(),
+                            modelRef: nil
+                        )
+                        store.openSession(meta, project: target.project)
+                    }
+                    sessionSearchTarget = nil
+                },
+                onDismiss: { sessionSearchTarget = nil }
+            )
+            .frame(width: 380, height: 440)
+        }
         .onDrag {
             expandedProjectPaths.removeAll()
             return NSItemProvider(object: project.path as NSString)
@@ -764,6 +803,131 @@ private struct RenameTarget: Identifiable {
 private struct ProjectRenameTarget: Identifiable {
     let project: URL
     var id: String { project.path }
+}
+
+private struct SessionSearchTarget: Identifiable {
+    let project: URL
+    var id: String { project.path }
+}
+
+private struct SessionSearchPopover: View {
+    let project: URL
+    @ObservedObject var store: AppStore
+    let liveEntries: () -> [(String, String)]
+    let onOpen: (SessionSearchHit) -> Void
+    let onDismiss: () -> Void
+
+    @State private var query: String = ""
+    @State private var hits: [SessionSearchHit] = []
+    @State private var searching = false
+    @FocusState private var queryFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("搜索会话")
+                .font(.headline)
+            TextField("关键词", text: $query)
+                .textFieldStyle(.roundedBorder)
+                .focused($queryFocused)
+            if searching {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
+            Group {
+                let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    Text("输入关键词搜索当前项目所有会话")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                } else if !searching && hits.isEmpty {
+                    Text("无匹配会话")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                } else {
+                    List(hits) { hit in
+                        Button {
+                            onOpen(hit)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Text(hit.title)
+                                        .font(.body)
+                                        .lineLimit(1)
+                                    if hit.isArchived {
+                                        Text("已归档")
+                                            .font(.caption2)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Color.secondary.opacity(0.15), in: Capsule())
+                                    }
+                                    if hit.isLive {
+                                        Text("新会话")
+                                            .font(.caption2)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Color.accentColor.opacity(0.15), in: Capsule())
+                                    }
+                                    Spacer(minLength: 0)
+                                    if let modified = hit.modified {
+                                        Text(SidebarView.relative(modified))
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                }
+                                Text(hit.snippet ?? "仅标题匹配")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .listStyle(.plain)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .padding(14)
+        .onAppear {
+            store.refreshSessions(for: project)
+            queryFocused = true
+        }
+        .task(id: query) {
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                hits = []
+                searching = false
+                return
+            }
+            searching = true
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+
+            let metas = store.sessionsByProject[project.path] ?? []
+            let archived = store.archivedByProject[project.path] ?? []
+            let live = liveEntries()
+            let q = trimmed
+            let results = await Task.detached(priority: .userInitiated) {
+                SessionSearch.search(
+                    metas: metas,
+                    archived: archived,
+                    query: q,
+                    liveEntries: live
+                )
+            }.value
+            guard !Task.isCancelled else { return }
+            hits = results
+            searching = false
+        }
+        .onExitCommand {
+            onDismiss()
+        }
+    }
 }
 
 private struct ProjectDropDelegate: DropDelegate {
