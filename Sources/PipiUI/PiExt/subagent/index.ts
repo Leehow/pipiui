@@ -2817,6 +2817,17 @@ export default function (pi: ExtensionAPI) {
 			const hasSingle = Boolean(params.agent && params.task);
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 			const isChain = hasChain;
+			const makeDetails =
+				(mode: "single" | "parallel" | "chain", extra?: { background?: boolean; agentIds?: string[] }) =>
+				(results: SingleResult[]): SubagentDetails => ({
+					mode,
+					agentScope,
+					projectAgentsDir: discovery.projectAgentsDir,
+					results,
+					...(extra?.background ? { background: true } : {}),
+					...(extra?.agentIds ? { agentIds: extra.agentIds } : {}),
+				});
+
 			// Caller-chosen ids are the addressing scheme for continuing a worker, so a bad one
 			// is reported back to the model to fix rather than silently replaced — a silently
 			// replaced id becomes a different worker with an empty head.
@@ -2848,17 +2859,6 @@ export default function (pi: ExtensionAPI) {
 					: params.background === false && forcedBackground
 						? "Warning: background:false ignored — the fan-out philosophy layer is active, and it requires dispatch to stay asynchronous. Do not wait here: keep dispatching independent work, then read [subagent-done]. Use chain if you genuinely need ordered synchronous steps, or turn off the 瀑布流 layer in Settings.\n\n"
 						: "";
-
-			const makeDetails =
-				(mode: "single" | "parallel" | "chain", extra?: { background?: boolean; agentIds?: string[] }) =>
-				(results: SingleResult[]): SubagentDetails => ({
-					mode,
-					agentScope,
-					projectAgentsDir: discovery.projectAgentsDir,
-					results,
-					...(extra?.background ? { background: true } : {}),
-					...(extra?.agentIds ? { agentIds: extra.agentIds } : {}),
-				});
 
 			// action=abort：中止运行中的后台 job（不占 single/parallel/chain 的 mode 名额）
 			if (params.action === "abort") {
