@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { afterEach, test } from "node:test";
 import WebSocket from "ws";
 import { createRelayServer, optionsFromEnvironment } from "../src/server.js";
-import { MAX_RESPONSE_BYTES } from "../src/protocol.js";
+import { COMMANDS, MAX_RESPONSE_BYTES } from "../src/protocol.js";
 
 const publicOrigin = "https://pipi.aichattrpg.com";
 const deviceID = randomUUID();
@@ -185,6 +185,46 @@ test("response frame near 8 MiB is accepted", async () => {
   const response = await fetchIndex(relay.port);
   assert.equal(response.status, 200);
   assert.equal((await response.json() as { payload: string }).payload.length, payload.length);
+});
+
+test("model commands are allowlisted and forwarded unchanged", async () => {
+  assert(COMMANDS.has("models.get"));
+  assert(COMMANDS.has("model.set"));
+  assert(COMMANDS.has("subagentModel.set"));
+  const relay = await start();
+  const seen: Array<{ command: unknown; body: unknown }> = [];
+  await connectHost(relay.port, (request, ws, epoch) => {
+    seen.push({ command: request.command, body: request.body });
+    ws.send(JSON.stringify({
+      v: 1, type: "response", requestID: request.requestID, hostEpoch: epoch,
+      status: 200, body: { accepted: true },
+    }));
+  });
+  const common = {
+    "x-forwarded-host": new URL(publicOrigin).host,
+    "cf-access-authenticated-user-email": "user@example.test",
+  };
+  const page = await fetch(`http://127.0.0.1:${relay.port}/`, { headers: common });
+  const csrf = page.headers.get("set-cookie")?.match(/pipiui_csrf=([^;]+)/)?.[1];
+  assert(csrf);
+  for (const [path, body] of [
+    ["/api/models", { sessionID: "session" }],
+    ["/api/model", { sessionID: "session", modelId: "xai/grok" }],
+    ["/api/subagent-model", { agent: "explore", model: "" }],
+  ] as const) {
+    const response = await fetch(`http://127.0.0.1:${relay.port}${path}`, {
+      method: "POST",
+      headers: { ...common, "content-type": "application/json", origin: publicOrigin,
+        cookie: `pipiui_csrf=${csrf}`, "x-pipiui-csrf": csrf },
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 200);
+  }
+  assert.deepEqual(seen, [
+    { command: "models.get", body: { sessionID: "session" } },
+    { command: "model.set", body: { sessionID: "session", modelId: "xai/grok" } },
+    { command: "subagentModel.set", body: { agent: "explore", model: "" } },
+  ]);
 });
 
 test("response above 8 MiB is rejected by websocket transport", async () => {

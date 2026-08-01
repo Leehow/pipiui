@@ -16,12 +16,15 @@ enum RemoteRelayCommand: String, Codable, CaseIterable, Sendable {
     case snapshot
     case promptSend = "prompt.send"
     case generationStop = "generation.stop"
+    case modelsGet = "models.get"
+    case modelSet = "model.set"
+    case subagentModelSet = "subagentModel.set"
 
     var isMutation: Bool {
         switch self {
-        case .index, .snapshot:
+        case .index, .snapshot, .modelsGet:
             return false
-        case .sessionCreate, .sessionOpen, .promptSend, .generationStop:
+        case .sessionCreate, .sessionOpen, .promptSend, .generationStop, .modelSet, .subagentModelSet:
             return true
         }
     }
@@ -34,6 +37,9 @@ enum RemoteRelayCommand: String, Codable, CaseIterable, Sendable {
         case ("POST", "/api/snapshot"): .snapshot
         case ("POST", "/api/send"): .promptSend
         case ("POST", "/api/stop"): .generationStop
+        case ("POST", "/api/models"): .modelsGet
+        case ("POST", "/api/model"): .modelSet
+        case ("POST", "/api/subagent-model"): .subagentModelSet
         default: nil
         }
     }
@@ -200,9 +206,22 @@ enum RemoteCommandSchema {
         case .sessionCreate:
             return exactKeys(dictionary, ["projectID"])
                 && nonemptyString(dictionary["projectID"], maximumBytes: 256)
-        case .sessionOpen, .generationStop:
+        case .sessionOpen, .generationStop, .modelsGet:
             return exactKeys(dictionary, ["sessionID"])
                 && nonemptyString(dictionary["sessionID"], maximumBytes: 256)
+        case .modelSet:
+            return exactKeys(dictionary, ["sessionID", "modelId"])
+                && nonemptyString(dictionary["sessionID"], maximumBytes: 256)
+                && nonemptyString(dictionary["modelId"], maximumBytes: 256)
+        case .subagentModelSet:
+            guard Set(dictionary.keys) == Set(["agent", "model"])
+                    || Set(dictionary.keys) == Set(["agent", "model", "thinking"]) else {
+                return false
+            }
+            return nonemptyString(dictionary["agent"], maximumBytes: 128)
+                && string(dictionary["model"], maximumBytes: 256)
+                && (dictionary["thinking"] == nil
+                    || string(dictionary["thinking"], maximumBytes: 128))
         case .snapshot:
             guard Set(dictionary.keys).isSubset(of: ["sessionID", "revision"]),
                   dictionary.keys.contains("sessionID"),

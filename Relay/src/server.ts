@@ -136,6 +136,9 @@ export function createRelayServer(options: RelayOptions) {
       "POST /api/snapshot": "snapshot",
       "POST /api/send": "prompt.send",
       "POST /api/stop": "generation.stop",
+      "POST /api/models": "models.get",
+      "POST /api/model": "model.set",
+      "POST /api/subagent-model": "subagentModel.set",
     };
     const command = routes[`${req.method} ${url.pathname}`];
     if (!command || !COMMANDS.has(command)) return json(res, 404, { error: "not found" });

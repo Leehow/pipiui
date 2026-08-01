@@ -29,6 +29,15 @@ final class RemoteRelayTests: XCTestCase {
         XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(
             method: "POST", path: "/api/send"
         ), .promptSend)
+        XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(
+            method: "POST", path: "/api/models"
+        ), .modelsGet)
+        XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(
+            method: "POST", path: "/api/model"
+        ), .modelSet)
+        XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(
+            method: "POST", path: "/api/subagent-model"
+        ), .subagentModelSet)
         XCTAssertNil(RemoteRelayCommand.localHTTPCommand(
             method: "POST", path: "/rpc"
         ))
@@ -42,6 +51,9 @@ final class RemoteRelayTests: XCTestCase {
             "snapshot",
             "prompt.send",
             "generation.stop",
+            "models.get",
+            "model.set",
+            "subagentModel.set",
         ])
     }
 
@@ -117,6 +129,22 @@ final class RemoteRelayTests: XCTestCase {
                 "text": String(repeating: "x", count: 64 * 1024 + 1),
                 "commandID": UUID().uuidString,
             ])
+        ))
+        XCTAssertTrue(RemoteCommandSchema.validate(
+            command: .modelsGet,
+            body: Data(#"{"sessionID":"opaque"}"#.utf8)
+        ))
+        XCTAssertTrue(RemoteCommandSchema.validate(
+            command: .modelSet,
+            body: Data(#"{"sessionID":"opaque","modelId":"xai/grok"}"#.utf8)
+        ))
+        XCTAssertTrue(RemoteCommandSchema.validate(
+            command: .subagentModelSet,
+            body: Data(#"{"agent":"explore","model":""}"#.utf8)
+        ))
+        XCTAssertFalse(RemoteCommandSchema.validate(
+            command: .subagentModelSet,
+            body: Data(#"{"agent":"explore","model":"","extra":true}"#.utf8)
         ))
     }
 

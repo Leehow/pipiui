@@ -185,6 +185,71 @@ final class RemoteHostController {
             }
             respond(.json(status: 202, ["accepted": true]))
 
+        case .modelsGet:
+            guard let sessionID = stringField("sessionID", in: request.body),
+                  let session = liveSession(for: sessionID, store: store) else {
+                respond(.json([
+                    "main": NSNull(),
+                    "available": [],
+                    "subagents": subagentModelsDTO()
+                ]))
+                return
+            }
+            let projectPath = session.projectURL.path
+            let main: Any = session.model.map { model in
+                [
+                    "id": model.id,
+                    "name": sanitizedRemoteText(model.name, projectPath: projectPath),
+                    "thinkingLevel": sanitizedRemoteText(session.thinkingLevel, projectPath: projectPath)
+                ]
+            } ?? NSNull()
+            let available = session.availableModels.map { model in
+                [
+                    "id": model.id,
+                    "name": sanitizedRemoteText(model.name, projectPath: projectPath)
+                ]
+            }
+            respond(.json(["main": main, "available": available, "subagents": subagentModelsDTO()]))
+
+        case .modelSet:
+            guard let body = decodeObject(request.body),
+                  let sessionID = body["sessionID"] as? String,
+                  let modelID = body["modelId"] as? String,
+                  let session = liveSession(for: sessionID, store: store) else {
+                respond(.json(status: 409, ["error": "session is not open"]))
+                return
+            }
+            guard let model = session.availableModels.first(where: { $0.id == modelID }) else {
+                respond(.json(status: 422, ["error": "unknown modelId"]))
+                return
+            }
+            session.setModel(model)
+            respond(.json(status: 202, ["accepted": true]))
+
+        case .subagentModelSet:
+            guard let body = decodeObject(request.body),
+                  let agent = body["agent"] as? String,
+                  let model = body["model"] as? String,
+                  AgentCatalog.load().contains(where: { $0.name == agent }) else {
+                respond(.json(status: 422, ["error": "unknown subagent"]))
+                return
+            }
+            let thinking = body["thinking"] as? String
+            SubagentModelSettings.setOverride(model, thinking: thinking, for: agent)
+            respond(.json(status: 202, ["accepted": true]))
+
+        }
+    }
+
+    private func subagentModelsDTO() -> [[String: String]] {
+        let overrides = SubagentModelSettings.allSettings()
+        return AgentCatalog.load().map { agent in
+            let override = overrides[agent.name]
+            return [
+                "agent": sanitizedRemoteText(agent.name, projectPath: ""),
+                "model": override?.model ?? "",
+                "thinking": override?.thinking ?? ""
+            ]
         }
     }
 

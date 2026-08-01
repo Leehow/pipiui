@@ -9,10 +9,14 @@ export const COMMANDS = new Set([
   "snapshot",
   "prompt.send",
   "generation.stop",
+  "models.get",
+  "model.set",
+  "subagentModel.set",
 ]);
 
 export type Command = "index" | "session.create" | "session.open" | "snapshot"
-  | "prompt.send" | "generation.stop";
+  | "prompt.send" | "generation.stop" | "models.get" | "model.set"
+  | "subagentModel.set";
 
 export interface HostHello {
   v: 1;
