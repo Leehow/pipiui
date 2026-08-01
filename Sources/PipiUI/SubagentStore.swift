@@ -1018,7 +1018,12 @@ final class SubagentStore: ObservableObject {
             runningCountMayHaveChanged = true
             clearStalled(i)
             abortPending.remove(id)
-            if e["aborted"].bool == true {
+            // Vanished/interrupted is not a user abort and not a failed answer — keep
+            // resumable context (same disposition as reconcileInterruptedAfterRestart).
+            let interruptedFlag = e["interrupted"].bool == true || e["vanished"].bool == true
+            if interruptedFlag {
+                agents[i].state = .interrupted
+            } else if e["aborted"].bool == true {
                 agents[i].state = .aborted
             } else {
                 agents[i].state = (e["ok"].bool == true) ? .ok : .failed
@@ -1055,7 +1060,7 @@ final class SubagentStore: ObservableObject {
                 agents[i].closeoutReason = "无隔离 worktree；运行时无需机械清理"
             }
             // Product default: successful agent + worktree → auto-merge into main + remove wt.
-            // failed/aborted/interrupted keep pendingReview for续作; UI buttons remain as fallback.
+            // failed/aborted/interrupted (incl. vanished settle) keep pendingReview for续作.
             // Attested verify FAILED in the worktree (verifyExit present and ≠ 0): keep
             // pendingReview and skip auto-merge — merging would knowingly break main and
             // delete the worktree the failure-recovery loop needs.
