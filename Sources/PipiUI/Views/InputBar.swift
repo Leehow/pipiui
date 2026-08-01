@@ -1726,7 +1726,6 @@ struct InputBar: View {
                 contextDetailRow("输入", TokenFormat.compact(u.input))
                 contextDetailRow("输出", TokenFormat.compact(u.output))
                 contextDetailRow("缓存读取", TokenFormat.compact(u.cacheRead))
-                contextDetailRow("缓存写入", TokenFormat.compact(u.cacheWrite))
                 let denom = u.input + u.cacheRead + u.cacheWrite
                 if denom > 0 {
                     let hit = Double(u.cacheRead) / Double(denom)
@@ -1739,7 +1738,6 @@ struct InputBar: View {
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
             contextDetailRow("累计缓存读取", TokenFormat.compact(session.sessionCacheRead))
-            contextDetailRow("累计缓存写入", TokenFormat.compact(session.sessionCacheWrite))
             contextDetailRow(
                 "累计花费",
                 formatSpend(
@@ -1748,6 +1746,20 @@ struct InputBar: View {
                     rate: ModelPricing.Catalog.shared.exchangeRate
                 )
             )
+            if let stats = session.currentModelSpeed {
+                Divider()
+                HStack {
+                    Text("当前模型")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(stats.sampleCount) 次采样")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary.opacity(0.7))
+                }
+                contextDetailRow("平均首字", formatTTFT(stats.avgTTFT))
+                contextDetailRow("生成速度", formatTokensPerSecond(stats.avgTokensPerSecond))
+            }
         }
     }
 

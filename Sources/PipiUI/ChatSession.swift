@@ -672,6 +672,10 @@ final class ChatSession: ObservableObject, Identifiable {
         return "\(TurnDurationFormat.completedAt(endedAt))完成，用时\(TurnDurationFormat.elapsed(endedAt.timeIntervalSince(startedAt)))"
     }
 
+    /// Speed stats for the current model (输入栏上下文浮层「当前模型」section).
+    /// Republished after every recorded assistant turn and on model switch.
+    @Published private(set) var currentModelSpeed: ModelSpeedStats?
+
     /// Provided by AppStore so settle can skip green when this session is already selected.
     var isSelectedCheck: (() -> Bool)?
 
@@ -736,6 +740,14 @@ final class ChatSession: ObservableObject, Identifiable {
     // 流式更新节流：每个 token delta 都刷 UI 会卡，按 50ms 合并
     private var pendingStreamMessage: J?
     private var streamFlushScheduled = false
+    /// Speed-stat instrumentation (ModelSpeedTracker): t0 = `prompt` RPC send in
+    /// sendPromptNow (covers direct + queue-drain sends; excludes queue wait and
+    /// vision pre-captioning, which are not model latency), t1 = first visible
+    /// text token, end = message_end. Per-stream; reset on each send and after
+    /// message_end. Main-thread only.
+    private let speedTracker = ModelSpeedTracker()
+    private var streamRequestStartedAt: Date?
+    private var streamFirstTokenAt: Date?
     // 工具输出分片同样节流：高频 tool_execution_update 直接刷 toolRuns 会拖垮布局
     private var pendingToolRuns: [String: ToolRun] = [:]
     private var toolRunFlushScheduled = false
@@ -1260,6 +1272,9 @@ final class ChatSession: ObservableObject, Identifiable {
             if let id = model?.id {
                 SubagentModelSettings.writeMainModel(id)
             }
+            // Speed stats follow the model the session is actually on (setModel's
+            // get_state round-trip lands here too; idempotent).
+            currentModelSpeed = speedTracker.stats(for: mid)
             // Update window immediately from get_state model; keep existing tokens, re-derive %.
             if let w = data["model"]["contextWindow"].int, w > 0 {
                 contextWindow = w
@@ -1409,6 +1424,42 @@ final class ChatSession: ObservableObject, Identifiable {
             "main turn \(turn) usage ↑\(usage.input) ↓\(usage.output) R\(usage.cacheRead) W\(usage.cacheWrite) $\(String(format: "%.4f", usage.cost)) ctx:\(usage.contextTokens) — \(model)",
             category: .token
         )
+
+        // Speed stats: one sample per completed assistant turn with output tokens.
+        // decodeDuration runs from the first visible token (t1) to message_end (now),
+        // so tokens/s never includes TTFT.
+        if usage.output > 0,
+           let t0 = streamRequestStartedAt,
+           let t1 = streamFirstTokenAt,
+           t1 >= t0 {
+            let ttft = t1.timeIntervalSince(t0)
+            let decode = Date().timeIntervalSince(t1)
+            if decode > 0 {
+                let modelId = self.model?.modelId ?? "unknown"
+                speedTracker.record(ModelSpeedSample(
+                    modelId: modelId,
+                    ttft: ttft,
+                    outputTokens: usage.output,
+                    decodeDuration: decode
+                ))
+                currentModelSpeed = speedTracker.stats(for: modelId)
+            }
+        }
+        // Per-stream state; the next sendPromptNow sets fresh values.
+        streamRequestStartedAt = nil
+        streamFirstTokenAt = nil
+    }
+
+    /// Earliest real assistant text in this stream marks t1 (TTFT end).
+    /// `message_start` normally carries an empty content stub; `message_update`
+    /// chunks carry the actual text, so the first non-empty arrival wins. Hooked at
+    /// event arrival (not the 50ms flush) so hidden sessions still get a timestamp.
+    private func markStreamFirstTokenIfNeeded(_ message: J) {
+        guard streamFirstTokenAt == nil, streamRequestStartedAt != nil else { return }
+        let text = Self.contentText(message["content"])
+        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            streamFirstTokenAt = Date()
+        }
     }
 
     // MARK: - Event handling
@@ -1473,8 +1524,10 @@ final class ChatSession: ObservableObject, Identifiable {
         case "message_start":
             if e["message"]["role"].string == "assistant" {
                 streaming.streamingItem = Self.convert(message: e["message"], id: "streaming", allowDiskRead: false)
+                markStreamFirstTokenIfNeeded(e["message"])
             }
         case "message_update":
+            markStreamFirstTokenIfNeeded(e["message"])
             pendingStreamMessage = e["message"]
             scheduleStreamFlush()
         case "message_end":
@@ -3024,6 +3077,10 @@ final class ChatSession: ObservableObject, Identifiable {
         }
         // Pin sidebar session to top on user submit (don't wait for agent_settled / disk mtime).
         onUserSubmitted?()
+        // Speed stats t0: the actual prompt RPC send. Set here (not at user submit)
+        // so queued prompts and vision pre-captioning don't inflate TTFT.
+        streamRequestStartedAt = Date()
+        streamFirstTokenAt = nil
         // Never set streamingBehavior: "steer" — busy delivery is local queue + idle drain.
         proc?.request(cmd) { [weak self] resp in
             guard let self else { return }
@@ -3141,6 +3198,8 @@ final class ChatSession: ObservableObject, Identifiable {
             guard let self else { return }
             if resp["success"].bool == true {
                 self.model = m
+                // Speed stats follow the newly selected model (its own samples if any).
+                self.currentModelSpeed = self.speedTracker.stats(for: m.modelId)
                 // Keep「跟随主 Agent」aligned with composer/bottom-bar selection.
                 SubagentModelSettings.writeMainModel(m.id)
                 // Apply new model's context window immediately (re-derive % from existing tokens)
