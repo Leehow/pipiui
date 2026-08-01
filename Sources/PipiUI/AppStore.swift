@@ -116,6 +116,9 @@ final class AppStore: ObservableObject {
             Self.lastSwitchAt = CFAbsoluteTimeGetCurrent()
             let warm = openSessions[key] != nil
             Log.info("switch start → \(key) warm=\(warm)", category: .session)
+            // A background session retains raw stream/tool updates; materialize once
+            // before its detail view observes StreamingState for the first frame.
+            openSessions[key]?.flushPendingStreamingForSelection()
             openSessions[key]?.markCompletionSeen()
         }
     }

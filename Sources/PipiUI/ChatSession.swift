@@ -1292,7 +1292,7 @@ final class ChatSession: ObservableObject, Identifiable {
 
     // MARK: - Event handling
 
-    private func handleEvent(_ e: J) {
+    package func handleEvent(_ e: J) {
         let type = e["type"].string ?? ""
 
         // Defer transcript/stream/tool mutations until initial history is applied once.
@@ -1519,37 +1519,73 @@ final class ChatSession: ObservableObject, Identifiable {
         }
     }
 
+    /// Materialize retained live state for a remote snapshot. Background sessions keep
+    /// raw updates until this demand path (or selection) so they do not spend main-thread
+    /// time rebuilding `ChatItem` / tool output at the 20 Hz UI cadence.
+    package func materializeStreamingForSnapshot() {
+        materializePendingStreamMessage()
+        materializePendingToolRuns()
+    }
+
+    /// A newly selected chat needs its accumulated background updates before SwiftUI draws
+    /// the first live frame. The AppStore calls this immediately after changing selection.
+    package func flushPendingStreamingForSelection() {
+        guard isStreamingVisible else { return }
+        materializeStreamingForSnapshot()
+    }
+
+    private var isStreamingVisible: Bool {
+        // Standalone sessions and unit tests without AppStore wiring retain the
+        // historical behavior: treat a missing check as visible.
+        isSelectedCheck?() ?? true
+    }
+
+    private func materializePendingStreamMessage() {
+        guard let message = pendingStreamMessage else { return }
+        pendingStreamMessage = nil
+        streaming.streamingItem = Self.convert(
+            message: message,
+            id: "streaming",
+            allowDiskRead: false
+        )
+    }
+
+    private func materializePendingToolRuns() {
+        guard !pendingToolRuns.isEmpty else { return }
+        let batch = pendingToolRuns
+        pendingToolRuns.removeAll(keepingCapacity: true)
+        for (tid, run) in batch {
+            streaming.toolRuns[tid] = run
+        }
+        streaming.toolOutputVersion &+= 1
+    }
+
     private func scheduleStreamFlush() {
-        guard !streamFlushScheduled else { return }
+        // Hidden sessions retain only the newest raw message. No timer is needed:
+        // selection and remote snapshot reads materialize it on demand.
+        guard !streamFlushScheduled, isStreamingVisible else { return }
         streamFlushScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             guard let self else { return }
             self.streamFlushScheduled = false
-            if let message = self.pendingStreamMessage {
-                self.pendingStreamMessage = nil
-                self.streaming.streamingItem = Self.convert(
-                    message: message,
-                    id: "streaming",
-                    allowDiskRead: false
-                )
-            }
+            // Selection can change while the coalescing timer is pending.
+            guard self.isStreamingVisible else { return }
+            self.materializePendingStreamMessage()
         }
     }
 
     /// Merge high-frequency tool partials into `toolRuns` at most ~every 50ms.
     private func scheduleToolRunFlush() {
-        guard !toolRunFlushScheduled else { return }
+        // As with assistant deltas, leave hidden-session partials raw until a
+        // visible consumer (or remote snapshot) actually asks for them.
+        guard !toolRunFlushScheduled, isStreamingVisible else { return }
         toolRunFlushScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             guard let self else { return }
             self.toolRunFlushScheduled = false
-            guard !self.pendingToolRuns.isEmpty else { return }
-            let batch = self.pendingToolRuns
-            self.pendingToolRuns.removeAll(keepingCapacity: true)
-            for (tid, run) in batch {
-                self.streaming.toolRuns[tid] = run
-            }
-            self.streaming.toolOutputVersion &+= 1
+            // Selection can change while the coalescing timer is pending.
+            guard self.isStreamingVisible else { return }
+            self.materializePendingToolRuns()
         }
     }
 

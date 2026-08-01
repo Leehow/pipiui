@@ -20,6 +20,9 @@ struct RemoteSnapshotCacheInput {
         session: ChatSession,
         homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path
     ) {
+        // Hidden sessions defer expensive live-message conversion until a consumer
+        // requests it; snapshots are that consumer for remote viewers.
+        session.materializeStreamingForSnapshot()
         self.sessionID = sessionID
         title = session.displayTitle
         transcriptVersion = session.transcriptVersion
