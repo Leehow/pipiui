@@ -52,6 +52,13 @@ struct SettingsSheet: View {
     @State private var webSearchApiKey: String = ""
     /// 当前后端 key 是否已在 .env 配置（驱动 placeholder /「清除」按钮）。
     @State private var webSearchKeyConfigured = false
+    /// 图片转文字（非多模态模型看图）
+    @State private var visionFallbackMode: VisionFallbackSettings.Mode = VisionFallbackSettings.mode()
+    @State private var visionFallbackBaseURL: String = VisionFallbackSettings.load().baseURL
+    @State private var visionFallbackApiKey: String = ""
+    @State private var visionFallbackModelId: String = VisionFallbackSettings.load().modelId
+    @State private var visionFallbackMaxTokens: String = String(VisionFallbackSettings.load().maxTokens)
+    @State private var visionFallbackKeyConfigured = !(VisionFallbackSettings.load().apiKey.isEmpty)
     /// .env 中已配置 key 的 provider 集合（用于 auth.json 残留冲突警告）。
     @State private var envConfiguredProviders: Set<String> = []
     /// .env 存取（placeholder 查询、清除、删除凭据时可选的同步移除）。
@@ -218,6 +225,8 @@ struct SettingsSheet: View {
             localRemoteSection
             Divider()
             webSearchSection
+            Divider()
+            visionFallbackSection
         }
     }
 
@@ -1187,6 +1196,91 @@ struct SettingsSheet: View {
         }
     }
 
+    // MARK: - Vision Fallback (图片转文字)
+
+    private var visionFallbackSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("图片转文字（非多模态模型看图）")
+                .font(.title3.weight(.semibold))
+            Text("DeepSeek 等不支持直接看图的模型：发送带图消息时，自动用本地 OCR（可选再加云端视觉模型描述）把图片转成文字注入消息。缩略图与 RPC 图片附件保持不变。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Picker("模式", selection: $visionFallbackMode) {
+                    ForEach(VisionFallbackSettings.Mode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .onChange(of: visionFallbackMode) { _, newValue in
+                    VisionFallbackSettings.setMode(newValue)
+                    statusMessage = "图片转文字已切换为\(newValue.title)"
+                }
+
+                if visionFallbackMode == .ocrAndCloud {
+                    TextField("服务地址（OpenAI 兼容 base URL）", text: $visionFallbackBaseURL)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveVisionFallbackCloud() }
+                    HStack(spacing: 8) {
+                        SecureField(
+                            visionFallbackKeyConfigured ? "已配置 API Key，输入以替换" : "API Key（可选）",
+                            text: $visionFallbackApiKey
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveVisionFallbackCloud() }
+                        if visionFallbackKeyConfigured {
+                            Button("清除 Key") {
+                                VisionFallbackSettings.setApiKey("")
+                                visionFallbackApiKey = ""
+                                visionFallbackKeyConfigured = false
+                                statusMessage = "已清除图片描述 API Key"
+                            }
+                        }
+                    }
+                    TextField("模型 ID", text: $visionFallbackModelId)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveVisionFallbackCloud() }
+                    TextField("最大 Token 数", text: $visionFallbackMaxTokens)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveVisionFallbackCloud() }
+                    Button("保存云端设置") { saveVisionFallbackCloud() }
+                    Text("base URL 形如 https://api.openai.com/v1；会自动补 /chat/completions。API Key 仅存本机 UserDefaults。云端失败时自动退回仅 OCR。")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+
+            Text("默认「仅本地 OCR」零配置；当前模型若本身支持图片则不会注入。设置立即生效，无需重启会话。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func saveVisionFallbackCloud() {
+        let base = visionFallbackBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let modelId = visionFallbackModelId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tokens = Int(visionFallbackMaxTokens.trimmingCharacters(in: .whitespacesAndNewlines))
+            ?? VisionFallbackSettings.defaultMaxTokens
+        var snap = VisionFallbackSettings.load()
+        snap.mode = visionFallbackMode
+        snap.baseURL = base
+        snap.modelId = modelId.isEmpty ? VisionFallbackSettings.defaultModelId : modelId
+        snap.maxTokens = tokens > 0 ? tokens : VisionFallbackSettings.defaultMaxTokens
+        let keyTrim = visionFallbackApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !keyTrim.isEmpty {
+            snap.apiKey = keyTrim
+            visionFallbackKeyConfigured = true
+            visionFallbackApiKey = ""
+        }
+        VisionFallbackSettings.save(snap)
+        visionFallbackBaseURL = snap.baseURL
+        visionFallbackModelId = snap.modelId
+        visionFallbackMaxTokens = String(snap.maxTokens)
+        statusMessage = "已保存图片转文字云端设置"
+    }
+
     /// 显式「保存」/ 回车提交：留空 = 不修改。
     private func saveWebSearchKey() {
         let trimmed = webSearchApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1283,6 +1377,7 @@ struct SettingsSheet: View {
         var webSearchBackend: String
         var webSearchKeyConfigured: Bool
         var envConfiguredProviders: Set<String>
+        var visionFallback: VisionFallbackSettings.Snapshot
     }
 
     /// 磁盘 I/O 集中在后台：auth.json、agents 目录（已有进程级缓存）、UserDefaults、.env 读取。
@@ -1306,7 +1401,8 @@ struct SettingsSheet: View {
             builtInDisabled: BuiltInFeatureSettings.disabledIDs(),
             webSearchBackend: backend,
             webSearchKeyConfigured: WebSearchSettings.isKeyConfigured(for: backend, store: envStore),
-            envConfiguredProviders: envConfigured
+            envConfiguredProviders: envConfigured,
+            visionFallback: VisionFallbackSettings.load()
         )
     }
 
@@ -1331,6 +1427,11 @@ struct SettingsSheet: View {
         webSearchBackend = snapshot.webSearchBackend
         webSearchKeyConfigured = snapshot.webSearchKeyConfigured
         envConfiguredProviders = snapshot.envConfiguredProviders
+        visionFallbackMode = snapshot.visionFallback.mode
+        visionFallbackBaseURL = snapshot.visionFallback.baseURL
+        visionFallbackModelId = snapshot.visionFallback.modelId
+        visionFallbackMaxTokens = String(snapshot.visionFallback.maxTokens)
+        visionFallbackKeyConfigured = !snapshot.visionFallback.apiKey.isEmpty
         // 输入缓冲不回显已存 key；reload 不动用户可能正在输入的值。
 
         if restartSessions {

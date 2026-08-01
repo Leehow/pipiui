@@ -11,6 +11,8 @@ struct ModelInfo: Identifiable, Hashable {
     var reasoning: Bool? = nil
     /// A present key with a nil value represents Pi's explicit JSON `null`.
     var thinkingLevelMap: [String: String?]? = nil
+    /// Whether the model accepts image input. From pi-ai `input` when present; else heuristic.
+    var supportsImages: Bool = true
     var id: String { provider + "/" + modelId }
 
     /// Shared behavior-level parsing seam used by helper and in-process model discovery.
@@ -20,6 +22,7 @@ struct ModelInfo: Identifiable, Hashable {
         else {
             return nil
         }
+        let supportsImages = parseSupportsImages(input: row["input"], modelId: modelId, provider: provider)
         return ModelInfo(
             provider: provider,
             modelId: modelId,
@@ -28,8 +31,44 @@ struct ModelInfo: Identifiable, Hashable {
             reasoning: row["reasoning"] as? Bool,
             thinkingLevelMap: ThinkingCapability.parseThinkingLevelMap(
                 row["thinkingLevelMap"] as? [String: Any]
-            )
+            ),
+            supportsImages: supportsImages
         )
+    }
+
+    /// `input` array from pi-ai when present; otherwise `supportsImages(modelId:provider:)`.
+    static func parseSupportsImages(input: Any?, modelId: String, provider: String) -> Bool {
+        if let arr = input as? [String] {
+            return arr.contains { $0 == "image" }
+        }
+        if let arr = input as? [Any] {
+            return arr.contains { ($0 as? String) == "image" }
+        }
+        // absent / null / unexpected type → heuristic
+        return supportsImages(modelId: modelId, provider: provider)
+    }
+
+    /// Unit-testable fallback when pi-ai does not expose `input`.
+    /// DeepSeek → false; known multimodal id tokens → true; everything else → true.
+    static func supportsImages(modelId: String, provider: String) -> Bool {
+        let p = provider.lowercased()
+        let m = modelId.lowercased()
+        if p.contains("deepseek") || m.contains("deepseek") {
+            return false
+        }
+        let visionHints = [
+            "gpt-4o", "claude-3", "claude-4", "claude-5",
+            "gemini", "qwen-vl", "glm-4v", "glm-5v",
+            "llava", "moondream", "vision",
+        ]
+        if visionHints.contains(where: { p.contains($0) || m.contains($0) }) {
+            return true
+        }
+        // Bare "vl" token (qwen2.5-vl, internvl, …) without matching longer hints above.
+        if m.contains("vl") || p.contains("vl") {
+            return true
+        }
+        return true
     }
 
     /// Whether this model belongs to a Grok/xAI provider (used to gate Grok account credit display).
@@ -1129,11 +1168,15 @@ final class ChatSession: ObservableObject, Identifiable {
 
     private func applyState(_ data: J) {
         if let pid = data["model"]["provider"].string, let mid = data["model"]["id"].string {
+            let knownSupports = availableModels.first(where: {
+                $0.provider == pid && $0.modelId == mid
+            })?.supportsImages
             model = ModelInfo(
                 provider: pid,
                 modelId: mid,
                 name: data["model"]["name"].string ?? mid,
-                contextWindow: data["model"]["contextWindow"].int
+                contextWindow: data["model"]["contextWindow"].int,
+                supportsImages: knownSupports ?? ModelInfo.supportsImages(modelId: mid, provider: pid)
             )
             // Composer / bottom-bar model — source of truth for「跟随主 Agent」.
             if let id = model?.id {
@@ -2390,7 +2433,11 @@ final class ChatSession: ObservableObject, Identifiable {
                         )
                     } else {
                         let prepared = self.prepareMessage(text: text, images: images)
-                        self.sendPromptNow(message: prepared.message, images: prepared.images)
+                        self.deliverAfterOptionalVisionFallback(
+                            preparedMessage: prepared.message,
+                            images: prepared.images,
+                            delivery: .sendNowOnly
+                        )
                     }
                 }
             }
@@ -2568,19 +2615,8 @@ final class ChatSession: ObservableObject, Identifiable {
 
         let prepared = prepareMessage(text: trimmed, images: images)
         beginTurnWallClock()
-
-        // Busy while streaming OR in the gap after drain popped until agent_start.
-        if isStreaming || isSendingFromQueue {
-            let ok = queue.enqueue(
-                text: prepared.message,
-                images: prepared.images,
-                searchGrantPolicy: searchGrantPolicy
-            )
-            if ok { publishQueue() }
-            return
-        }
-        sendPromptNow(
-            message: prepared.message,
+        deliverAfterOptionalVisionFallback(
+            preparedMessage: prepared.message,
             images: prepared.images,
             searchGrantPolicy: searchGrantPolicy
         )
@@ -2752,6 +2788,108 @@ final class ChatSession: ObservableObject, Identifiable {
             message = ImageAttachment.messageWithAttachmentPaths(text: text, paths: paths)
         }
         return (message, images)
+    }
+
+    private enum VisionFallbackDelivery {
+        /// Composer path: enqueue when busy, otherwise send now.
+        case queueOrSend
+        /// Fork/resend path: `isSendingFromQueue` is already true; always `sendPromptNow`.
+        case sendNowOnly
+    }
+
+    /// When the session model cannot accept images, OCR (+ optional cloud VLM) and inject text
+    /// into the user message before queue/RPC. Images stay on the payload and in the transcript.
+    private func deliverAfterOptionalVisionFallback(
+        preparedMessage: String,
+        images: [DraftImage],
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths,
+        delivery: VisionFallbackDelivery = .queueOrSend
+    ) {
+        let supportsImages = model?.supportsImages
+            ?? ModelInfo.supportsImages(
+                modelId: model?.modelId ?? "",
+                provider: model?.provider ?? ""
+            )
+        let settings = VisionFallbackSettings.load()
+        let needsCaption = VisionFallback.shouldCaption(
+            supportsImages: supportsImages,
+            hasImages: !images.isEmpty
+        ) && settings.mode != .off
+
+        guard needsCaption else {
+            finishVisionFallbackDelivery(
+                message: preparedMessage,
+                images: images,
+                searchGrantPolicy: searchGrantPolicy,
+                delivery: delivery
+            )
+            return
+        }
+
+        let cloudConfig = settings.mode == .ocrAndCloud ? settings.captionConfig : nil
+        let mode = settings.mode
+        let imagePairs = images.map { ($0.data, $0.mimeType) }
+        Task { [weak self] in
+            let finalMessage = await VisionFallback.enrichMessage(
+                userText: preparedMessage,
+                images: imagePairs,
+                mode: mode,
+                cloudConfig: cloudConfig
+            )
+            guard let self else { return }
+            await MainActor.run {
+                self.finishVisionFallbackDelivery(
+                    message: finalMessage,
+                    images: images,
+                    searchGrantPolicy: searchGrantPolicy,
+                    delivery: delivery
+                )
+            }
+        }
+    }
+
+    private func finishVisionFallbackDelivery(
+        message: String,
+        images: [DraftImage],
+        searchGrantPolicy: PromptSearchGrantPolicy,
+        delivery: VisionFallbackDelivery
+    ) {
+        switch delivery {
+        case .queueOrSend:
+            deliverPreparedPrompt(
+                message: message,
+                images: images,
+                searchGrantPolicy: searchGrantPolicy
+            )
+        case .sendNowOnly:
+            sendPromptNow(
+                message: message,
+                images: images,
+                searchGrantPolicy: searchGrantPolicy
+            )
+        }
+    }
+
+    private func deliverPreparedPrompt(
+        message: String,
+        images: [DraftImage],
+        searchGrantPolicy: PromptSearchGrantPolicy
+    ) {
+        // Busy while streaming OR in the gap after drain popped until agent_start.
+        if isStreaming || isSendingFromQueue {
+            let ok = queue.enqueue(
+                text: message,
+                images: images,
+                searchGrantPolicy: searchGrantPolicy
+            )
+            if ok { publishQueue() }
+            return
+        }
+        sendPromptNow(
+            message: message,
+            images: images,
+            searchGrantPolicy: searchGrantPolicy
+        )
     }
 
     @discardableResult
@@ -3232,7 +3370,13 @@ extension ChatSession: BuiltinCommandHost {
         if let known = availableModels.first(where: { $0.provider == provider && $0.modelId == modelId }) {
             setModel(known)
         } else {
-            setModel(ModelInfo(provider: provider, modelId: modelId, name: modelId, contextWindow: nil))
+            setModel(ModelInfo(
+                provider: provider,
+                modelId: modelId,
+                name: modelId,
+                contextWindow: nil,
+                supportsImages: ModelInfo.supportsImages(modelId: modelId, provider: provider)
+            ))
         }
     }
 }
