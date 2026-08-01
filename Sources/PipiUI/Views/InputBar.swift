@@ -1582,6 +1582,14 @@ struct InputBar: View {
                             .frame(width: 264)
                             .padding(10)
                     }
+            } else if let balance = session.accountBalance {
+                Text(balance)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.primary.opacity(0.06)))
+                    .help("账户余额")
             }
         }
         .fixedSize(horizontal: true, vertical: false)

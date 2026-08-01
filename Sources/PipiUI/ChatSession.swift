@@ -69,6 +69,14 @@ struct ModelInfo: Identifiable, Hashable {
     var shouldShowAccountQuota: Bool {
         quotaProvider != nil
     }
+
+    /// Pay-per-token balance source for this model, if any.
+    /// Subscription-quota providers keep the quota pill; ChatSession suppresses
+    /// balance whenever `quotaProvider != nil`. Relays → nil.
+    var balanceProvider: BalanceProvider? {
+        if isRelayProvider { return nil }
+        return PipiUI.balanceProvider(for: provider)
+    }
 }
 
 struct ToolCallBlock: Identifiable, Equatable {
@@ -558,6 +566,8 @@ final class ChatSession: ObservableObject, Identifiable {
     @Published private(set) var quotaSelectedWindowId: String?
     /// When the current billing window resets (popover detail).
     @Published var quotaResetsAt: Date?
+    /// Pre-formatted pay-per-token balance for the input-bar capsule (nil = hidden).
+    @Published var accountBalance: String?
     @Published var sessionName: String?
     @Published var sessionFile: String?
     @Published var lastError: String?
@@ -694,6 +704,11 @@ final class ChatSession: ObservableObject, Identifiable {
     private var quotaObserverID: UUID?
     /// The monitor currently subscribed to (so model switches can unbind/rebind).
     private var currentQuotaMonitor: QuotaMonitor?
+    /// Pay-per-token balance monitor subscription (shared per BalanceProvider).
+    private var balanceObserverID: UUID?
+    private var currentBalanceMonitor: BalanceMonitor?
+    /// Which balance provider is currently bound (for idempotent rebind).
+    private var boundBalanceProvider: BalanceProvider?
 
     /// Bumped when a new initial `get_messages` load starts; stale background builds are dropped.
     private var initialLoadGeneration: UInt64 = 0
@@ -909,6 +924,13 @@ final class ChatSession: ObservableObject, Identifiable {
                 mon.removeObserver(id)
             }
         }
+        if let balanceObserverID, let monitor = currentBalanceMonitor {
+            let id = balanceObserverID
+            let mon = monitor
+            DispatchQueue.main.async {
+                mon.removeObserver(id)
+            }
+        }
     }
 
     /// Bind the quota monitor matching the session's current model provider, if any.
@@ -921,6 +943,8 @@ final class ChatSession: ObservableObject, Identifiable {
         // Already bound to this provider → no-op (preserve selection, no churn).
         if quotaProvider == provider, currentQuotaMonitor != nil || provider == nil {
             if provider == nil { applyQuotaSnapshot(nil) }
+            // Still re-evaluate balance: deepseek → moonshot both have nil quota.
+            bindBalanceMonitor()
             return
         }
         unbindQuotaMonitor()
@@ -928,6 +952,7 @@ final class ChatSession: ObservableObject, Identifiable {
             quotaProvider = nil
             quotaWindows = []
             applyQuotaSnapshot(nil)
+            bindBalanceMonitor()
             return
         }
         let monitor = provider.monitor
@@ -941,6 +966,40 @@ final class ChatSession: ObservableObject, Identifiable {
             let persisted = LayoutPersistence.quotaSelectedWindow(provider: provider)
             self.applyQuotaSnapshot(snap?.copy(selectedWindowId: persisted ?? snap?.selectedWindowId))
         }
+        // Subscription quota wins over prepaid balance for the same slot.
+        bindBalanceMonitor()
+    }
+
+    /// Bind a pay-per-token balance monitor when there is no subscription quota pill.
+    private func bindBalanceMonitor() {
+        let bp: BalanceProvider? = {
+            if model?.quotaProvider != nil { return nil }
+            return model?.balanceProvider
+        }()
+        if boundBalanceProvider == bp, currentBalanceMonitor != nil || bp == nil {
+            if bp == nil { accountBalance = nil }
+            return
+        }
+        unbindBalanceMonitor()
+        guard let bp else {
+            boundBalanceProvider = nil
+            accountBalance = nil
+            return
+        }
+        let monitor = bp.monitor
+        currentBalanceMonitor = monitor
+        boundBalanceProvider = bp
+        balanceObserverID = monitor.observe { [weak self] snap in
+            self?.applyBalanceSnapshot(snap)
+        }
+    }
+
+    private func applyBalanceSnapshot(_ snap: BalanceSnapshot?) {
+        guard let snap else {
+            // Soft-fail: keep last good formatted text; only clear on unbind.
+            return
+        }
+        accountBalance = formatBalance(amount: snap.amount, currency: snap.currency)
     }
 
     /// Map a snapshot to the published capsule fields, honoring the selected window.
@@ -972,6 +1031,16 @@ final class ChatSession: ObservableObject, Identifiable {
         // Clear immediately so a previous provider's value never flashes while the
         // new provider's snapshot is in flight.
         applyQuotaSnapshot(nil)
+    }
+
+    private func unbindBalanceMonitor() {
+        if let balanceObserverID, let monitor = currentBalanceMonitor {
+            monitor.removeObserver(balanceObserverID)
+        }
+        balanceObserverID = nil
+        currentBalanceMonitor = nil
+        boundBalanceProvider = nil
+        accountBalance = nil
     }
 
     private func nextItemId() -> String {
@@ -2938,9 +3007,10 @@ final class ChatSession: ObservableObject, Identifiable {
                 self.proc?.request(["type": "get_state"]) { [weak self] r in self?.applyState(r["data"]) }
                 // Authoritative refresh: get_session_stats re-reads current model's window + tokens
                 self.refreshStats()
-                // Re-bind quota monitor for the new provider, then force-refresh it.
+                // Re-bind quota/balance monitors for the new provider, then force-refresh.
                 self.bindQuotaMonitor()
                 self.currentQuotaMonitor?.refreshIfNeeded(force: true)
+                self.currentBalanceMonitor?.refreshIfNeeded(force: true)
             } else {
                 self.lastError = resp["error"].string ?? "切换模型失败"
             }
@@ -2977,6 +3047,7 @@ final class ChatSession: ObservableObject, Identifiable {
         processStartCancelled = true
         cancelSideChannelTitle()
         unbindQuotaMonitor()
+        unbindBalanceMonitor()
         subagents.saveNow()
         ComputerCoordinator.shared.release(
             sessionKey: bridgeRoutingKey,
@@ -3158,6 +3229,7 @@ extension ChatSession: BuiltinCommandHost {
     func runShowSessionStats() {
         // Refresh then flash current snapshot (callbacks update published fields).
         currentQuotaMonitor?.refreshIfNeeded(force: true)
+        currentBalanceMonitor?.refreshIfNeeded(force: true)
         proc?.request(["type": "get_session_stats"]) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool == true {
