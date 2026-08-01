@@ -52,9 +52,229 @@ type DispatchStatsTask = {
 	title?: string;
 };
 
+type DispatchValidatorAction = "nudge" | "enforce";
+
+type DispatchValidatorFinding = {
+	/** tasks[] index, or 0 for single-mode brief. */
+	taskIndex: number;
+	briefItems: number;
+	/** Short human-readable split hint (list item previews). */
+	splitHint: string;
+};
+
+type DispatchValidatorStats = {
+	triggered: true;
+	action: DispatchValidatorAction;
+	findings: Array<{ task_index: number; brief_items: number }>;
+};
+
 /** Heuristic only: count brief lines that look like list items. */
 function estimateBriefItems(brief: string): number {
 	return brief.split(/\r?\n/).filter((line) => /^\s*([-*•]|\d+[.)])\s/.test(line)).length;
+}
+
+/** List-item line body capture (same bullet/number forms as estimateBriefItems). */
+const DISPATCH_LIST_ITEM_RE = /^\s*(?:[-*•]|\d+[.)])\s+(.*)$/;
+
+/**
+ * Heuristic serial-dependency cues. When these dominate the brief, a long list is
+ * more likely one ordered workflow than independent parallel goals — do not flag.
+ */
+const DISPATCH_SERIAL_SIGNAL_RE =
+	/先|然后|接着|其次|之后|基于|再|随后|最后|\bfirst\b|\bfinally\b|\bbefore\b|\bafter\b|\bthen\b|\bnext\b|\bonce\b|\bbased\s+on\b|\bdepending\s+on\b|\bfollowed\s+by\b|\bstep\s*\d/gi;
+
+/**
+ * Heuristic independent-goal cues inside list lines / free text:
+ * action-ish openers and multi-goal conjunctions (和/以及/并且/+ /and /also).
+ * Not a parser — false positives/negatives are expected; default behavior is nudge-only.
+ */
+const DISPATCH_ACTIONISH_RE =
+	/^(实现|添加|增加|修复|检查|验证|更新|删除|创建|修改|重构|测试|调研|调查|审查|write|add|fix|check|verify|update|delete|create|implement|test|review|investigate|build|run|refactor|ensure|confirm)\b/i;
+const DISPATCH_INDEPENDENT_CONJ_RE = /以及|并且|\+|\band\b|\balso\b|和/g;
+
+function countRegExpMatches(text: string, re: RegExp): number {
+	const flags = re.flags.includes("g") ? re.flags : `${re.flags}g`;
+	const global = new RegExp(re.source, flags);
+	return [...text.matchAll(global)].length;
+}
+
+function listItemBodies(brief: string): string[] {
+	const bodies: string[] = [];
+	for (const line of brief.split(/\r?\n/)) {
+		const m = DISPATCH_LIST_ITEM_RE.exec(line);
+		if (m?.[1]?.trim()) bodies.push(m[1].trim());
+	}
+	return bodies;
+}
+
+/**
+ * Heuristic: does this brief pack multiple independent goals into one worker?
+ * All of the following must hold:
+ *   1. brief_items >= 6 (same list-line heuristic as telemetry)
+ *   2. independent enumeration signals (standalone-ish list rows and/or multi-goal conjunctions)
+ *   3. serial dependency words do NOT dominate those independent signals
+ */
+function looksLikeMergedIndependentGoals(brief: string): {
+	merged: boolean;
+	briefItems: number;
+	splitHint: string;
+} {
+	const briefItems = estimateBriefItems(brief);
+	if (briefItems < 6) {
+		return { merged: false, briefItems, splitHint: "" };
+	}
+
+	const bodies = listItemBodies(brief);
+	let independentItems = 0;
+	let serialOnItems = 0;
+	for (const body of bodies) {
+		const serialOnLine = countRegExpMatches(body, DISPATCH_SERIAL_SIGNAL_RE);
+		if (serialOnLine > 0) {
+			serialOnItems += 1;
+			continue;
+		}
+		// Standalone-ish row: action opener, sentence punctuation, or a substantial clause.
+		const standalone =
+			DISPATCH_ACTIONISH_RE.test(body) ||
+			/[.!?。！？;；]$/.test(body) ||
+			body.length >= 10;
+		if (standalone) independentItems += 1;
+	}
+
+	const serialHits =
+		countRegExpMatches(brief, DISPATCH_SERIAL_SIGNAL_RE) + serialOnItems;
+	const conjHits = countRegExpMatches(brief, DISPATCH_INDEPENDENT_CONJ_RE);
+	// Independent score: standalone list rows plus capped conjunction evidence.
+	const independentScore = independentItems + Math.min(conjHits, 3);
+
+	// Serial dominates → ordered workflow, not a merge anti-pattern.
+	if (serialHits > 0 && serialHits >= Math.max(independentItems, 1) && serialHits >= independentScore / 2) {
+		return { merged: false, briefItems, splitHint: "" };
+	}
+
+	const hasIndependentSignal = independentItems >= 4 || (independentItems >= 3 && conjHits >= 1);
+	if (!hasIndependentSignal && independentItems < 6) {
+		return { merged: false, briefItems, splitHint: "" };
+	}
+
+	// Prefer flagging when most of the 6+ items look independently actionable.
+	if (independentItems < 4 && briefItems >= 6 && independentScore < 4) {
+		return { merged: false, briefItems, splitHint: "" };
+	}
+
+	const preview = bodies
+		.slice(0, 8)
+		.map((b, i) => `${i + 1}) ${b.length > 60 ? `${b.slice(0, 60)}…` : b}`)
+		.join("; ");
+	return {
+		merged: true,
+		briefItems,
+		splitHint: preview || `${briefItems} list items`,
+	};
+}
+
+type DispatchShapeAssessment = {
+	findings: DispatchValidatorFinding[];
+	/** Prepended to successful tool results when nudge is active. */
+	nudgeText: string;
+	/** Full tool-result error body when enforce blocks the dispatch. */
+	enforceError: string;
+	stats: DispatchValidatorStats | null;
+};
+
+function dispatchValidatorMode(): "off" | "nudge" | "enforce" {
+	if (process.env.PIPI_SUBAGENT_DISPATCH_ENFORCE === "1") return "enforce";
+	if (process.env.PIPI_SUBAGENT_DISPATCH_NUDGE === "0") return "off";
+	return "nudge";
+}
+
+/**
+ * Pre-flight shape check for single / tasks[] dispatches.
+ * - chain mode: never runs (caller skips)
+ * - same-agentId resume (agentId set, fresh !== true): skipped per task / single
+ * - default nudge: non-blocking reminder
+ * - PIPI_SUBAGENT_DISPATCH_ENFORCE=1: block and ask for tasks[] / multiple dispatches
+ * - PIPI_SUBAGENT_DISPATCH_NUDGE=0: disable even the reminder (unless enforce)
+ */
+function assessDispatchShape(input: {
+	mode: "single" | "tasks";
+	tasks: readonly { task: string; agentId?: string; fresh?: boolean; title?: string }[];
+}): DispatchShapeAssessment {
+	const empty: DispatchShapeAssessment = {
+		findings: [],
+		nudgeText: "",
+		enforceError: "",
+		stats: null,
+	};
+	const level = dispatchValidatorMode();
+	if (level === "off") return empty;
+
+	const findings: DispatchValidatorFinding[] = [];
+	for (let i = 0; i < input.tasks.length; i++) {
+		const t = input.tasks[i];
+		// Resume / continue the same worker: do not second-guess an in-flight brief.
+		const agentId = t.agentId?.trim();
+		if (agentId && t.fresh !== true) continue;
+
+		const verdict = looksLikeMergedIndependentGoals(t.task);
+		if (!verdict.merged) continue;
+		findings.push({
+			taskIndex: i,
+			briefItems: verdict.briefItems,
+			splitHint: verdict.splitHint,
+		});
+	}
+	if (findings.length === 0) return empty;
+
+	const action: DispatchValidatorAction = level === "enforce" ? "enforce" : "nudge";
+	const stats: DispatchValidatorStats = {
+		triggered: true,
+		action,
+		findings: findings.map((f) => ({
+			task_index: f.taskIndex,
+			brief_items: f.briefItems,
+		})),
+	};
+
+	const scopeLabel =
+		input.mode === "single"
+			? "single brief"
+			: findings.length === 1
+				? `tasks[${findings[0].taskIndex}] brief`
+				: `${findings.length} tasks[] briefs`;
+	const itemsLabel = findings.map((f) => f.briefItems).join(",");
+	const splitLines = findings
+		.map((f) =>
+			input.mode === "single"
+				? `- suggested split preview: ${f.splitHint}`
+				: `- tasks[${f.taskIndex}] (${f.briefItems} items): ${f.splitHint}`,
+		)
+		.join("\n");
+
+	if (action === "enforce") {
+		return {
+			findings,
+			nudgeText: "",
+			enforceError: [
+				`Dispatch shape rejected (PIPI_SUBAGENT_DISPATCH_ENFORCE=1): expected parallel tasks[] / multiple dispatches, got merged ${input.mode === "single" ? "single" : "task brief"}.`,
+				`Detected ${scopeLabel} with brief_items=[${itemsLabel}] that look like independent goals packed together.`,
+				"missing: split independent goals into tasks:[{agent,task},…] (or multiple subagent calls) and re-send this turn.",
+				"NEVER merge independent goals into one brief.",
+				splitLines,
+			].join("\n"),
+			stats,
+		};
+	}
+
+	const nudgeText = [
+		`[dispatch-shape] Detected ${scopeLabel} with brief_items=[${itemsLabel}].`,
+		"If these items are mutually independent, split them into tasks[] multi-element fan-out (or multiple dispatches) instead of one worker.",
+		"Reference: NEVER merge independent goals into one brief.",
+		splitLines,
+		"",
+	].join("\n");
+
+	return { findings, nudgeText, enforceError: "", stats };
 }
 
 /** Best-effort, fire-and-forget dispatch-shape telemetry. Never affects a dispatch. */
@@ -62,6 +282,7 @@ function recordSubagentDispatchStats(
 	mode: DispatchStatsMode,
 	tasks: readonly DispatchStatsTask[],
 	background: boolean,
+	validator?: DispatchValidatorStats | null,
 ): void {
 	try {
 		const configuredPath = process.env.PIPI_SUBAGENT_STATS_PATH;
@@ -84,6 +305,7 @@ function recordSubagentDispatchStats(
 				brief_chars: task.task.length,
 				brief_items: estimateBriefItems(task.task),
 			})),
+			...(validator ? { validator } : {}),
 		})}\n`;
 		void fs.promises
 			.mkdir(path.dirname(statsPath), { recursive: true })
@@ -3229,10 +3451,53 @@ export default function (pi: ExtensionAPI) {
 				: hasTasks
 					? params.tasks!
 					: [{ agent: params.agent!, task: params.task!, title: params.title }];
+			const dispatchMode: DispatchStatsMode = hasChain ? "chain" : hasTasks ? "tasks" : "single";
+
+			// Shape validator: single / tasks[] only. chain and same-agentId resume are exempt.
+			let dispatchNudgePrefix = "";
+			let dispatchValidatorStats: DispatchValidatorStats | null = null;
+			if (!hasChain) {
+				const shapeTasks = hasTasks
+					? (params.tasks ?? []).map((t) => ({
+							task: t.task,
+							agentId: t.agentId,
+							fresh: t.fresh,
+							title: t.title,
+						}))
+					: [
+							{
+								task: params.task!,
+								agentId: params.agentId,
+								fresh: params.fresh,
+								title: params.title,
+							},
+						];
+				const assessment = assessDispatchShape({
+					mode: hasTasks ? "tasks" : "single",
+					tasks: shapeTasks,
+				});
+				dispatchValidatorStats = assessment.stats;
+				if (assessment.enforceError) {
+					recordSubagentDispatchStats(
+						dispatchMode,
+						dispatchStatsTasks,
+						useBackground,
+						dispatchValidatorStats,
+					);
+					return {
+						content: [{ type: "text", text: assessment.enforceError }],
+						details: makeDetails(hasTasks ? "parallel" : "single")([]),
+						isError: true,
+					};
+				}
+				dispatchNudgePrefix = assessment.nudgeText;
+			}
+
 			recordSubagentDispatchStats(
-				hasChain ? "chain" : hasTasks ? "tasks" : "single",
+				dispatchMode,
 				dispatchStatsTasks,
 				useBackground,
+				dispatchValidatorStats,
 			);
 
 			if (params.chain && params.chain.length > 0) {
@@ -3402,7 +3667,9 @@ export default function (pi: ExtensionAPI) {
 					});
 
 					return {
-						content: [{ type: "text", text: formatStartedMessage(startedItems) }],
+						content: [
+							{ type: "text", text: dispatchNudgePrefix + formatStartedMessage(startedItems) },
+						],
 						details: makeDetails("parallel", { background: true, agentIds })(placeholders),
 					};
 				}
@@ -3479,6 +3746,7 @@ export default function (pi: ExtensionAPI) {
 						{
 							type: "text",
 							text:
+								dispatchNudgePrefix +
 								bgIgnoredWarning +
 								`Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
 						},
@@ -3521,9 +3789,11 @@ export default function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: formatStartedMessage([
-									{ agentId, name: params.agent, task: params.task, title: params.title },
-								]),
+								text:
+									dispatchNudgePrefix +
+									formatStartedMessage([
+										{ agentId, name: params.agent, task: params.task, title: params.title },
+									]),
 							},
 						],
 						details: makeDetails("single", { background: true, agentIds: [agentId] })([
@@ -3552,7 +3822,7 @@ export default function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: `${bgIgnoredWarning}Agent ${result.stopReason || "failed"}: ${errorMsg}`,
+								text: `${dispatchNudgePrefix}${bgIgnoredWarning}Agent ${result.stopReason || "failed"}: ${errorMsg}`,
 							},
 						],
 						details: makeDetails("single")([result]),
@@ -3564,6 +3834,7 @@ export default function (pi: ExtensionAPI) {
 						{
 							type: "text",
 							text:
+								dispatchNudgePrefix +
 								bgIgnoredWarning +
 								(getFinalOutput(result.messages) || "(no output)") +
 								// Same attestation surface as [subagent-done]: verified field + Verify line.
