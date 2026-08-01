@@ -267,6 +267,12 @@ private struct ChatDetailViewBody: View {
                 ) {
                     session.rightPanel = nil
                 }
+                // Same session-identity convention as the transcript root (see
+                // TranscriptSessionRootIdentity): warm session switch reuses the
+                // ChatDetailView chrome, so without a per-session id the panel would
+                // stay bound to the previous session's SubagentStore. bridgeRoutingKey
+                // is stable across persisted-id rebinding of one logical session.
+                .id(session.bridgeRoutingKey)
             case .document:
                 DocumentPanel(store: session.documents) {
                     session.rightPanel = nil
