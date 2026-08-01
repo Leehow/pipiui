@@ -39,6 +39,7 @@ final class RemoteHostController {
     private let registry = RemoteObjectIDRegistry()
     private var idempotency = RemotePromptIdempotencyCache()
     private let snapshotCache = RemoteSnapshotCache()
+    private var remoteDocuments: [String: (sessionID: String, url: URL)] = [:]
 
     init(store: AppStore) {
         self.store = store
@@ -238,7 +239,114 @@ final class RemoteHostController {
             SubagentModelSettings.setOverride(model, thinking: thinking, for: agent)
             respond(.json(status: 202, ["accepted": true]))
 
+        case .agentsList:
+            guard let sessionID = stringField("sessionID", in: request.body),
+                  let session = liveSession(for: sessionID, store: store) else {
+                respond(.json(status: 409, ["error": "session is not open"]))
+                return
+            }
+            respond(.json(["agents": agentsDTO(session.subagents.agents, projectPath: session.projectURL.path)]))
+
+        case .agentsDetail:
+            guard let body = decodeObject(request.body),
+                  let sessionID = body["sessionID"] as? String,
+                  let agentID = body["agentID"] as? String,
+                  let session = liveSession(for: sessionID, store: store),
+                  let agent = session.subagents.agents.first(where: { $0.id == agentID }) else {
+                respond(.json(status: 404, ["error": "subagent not found"]))
+                return
+            }
+            var detail = agentDTO(agent, projectPath: session.projectURL.path)
+            let log = agent.log.map { "[\($0.kind)] \($0.name): \($0.text)" }.joined(separator: "\n")
+            let tail = String(log.suffix(4_000))
+            detail["log"] = sanitizedDocumentText(tail, projectPath: session.projectURL.path)
+            detail["truncated"] = log.count > tail.count
+            respond(.json(detail))
+
+        case .panelState:
+            guard let sessionID = stringField("sessionID", in: request.body),
+                  let session = liveSession(for: sessionID, store: store) else {
+                respond(.json(status: 409, ["error": "session is not open"]))
+                return
+            }
+            let web: Any = session.webView.urlString.isEmpty ? NSNull() : [
+                "url": sanitizedDocumentText(session.webView.urlString, projectPath: session.projectURL.path),
+                "title": sanitizedRemoteText(session.webView.title, projectPath: session.projectURL.path),
+                "isLoading": session.webView.isLoading
+            ]
+            respond(.json(["web": web, "documents": documentsDTO(session: session, sessionID: sessionID)]))
+
+        case .documentGet:
+            guard let body = decodeObject(request.body),
+                  let sessionID = body["sessionID"] as? String,
+                  let documentID = body["documentID"] as? String,
+                  let session = liveSession(for: sessionID, store: store),
+                  let record = remoteDocuments[documentID], record.sessionID == sessionID else {
+                respond(.json(status: 404, ["error": "document not found"]))
+                return
+            }
+            let kind = remoteDocumentKind(record.url)
+            let name = sanitizedRemoteText(record.url.lastPathComponent, projectPath: session.projectURL.path)
+            guard kind == "text" else {
+                respond(.json(["name": name, "kind": kind, "content": NSNull(), "note": "此文件不能远程预览内容"]))
+                return
+            }
+            guard let data = try? Data(contentsOf: record.url, options: [.mappedIfSafe]) else {
+                respond(.json(status: 404, ["error": "document unavailable"]))
+                return
+            }
+            let prefix = data.prefix(64 * 1024)
+            let content = sanitizedDocumentText(String(decoding: prefix, as: UTF8.self), projectPath: session.projectURL.path)
+            respond(.json(["name": name, "kind": kind, "content": content, "truncated": data.count > prefix.count]))
+
         }
+    }
+
+    private func agentDTO(_ agent: SubagentInfo, projectPath: String) -> [String: Any] {
+        [
+            "agentID": agent.id,
+            "name": sanitizedRemoteText(agent.name, projectPath: projectPath),
+            "title": sanitizedRemoteText(agent.displayTitle, projectPath: projectPath),
+            "task": sanitizedDocumentText(String(agent.task.prefix(200)), projectPath: projectPath),
+            "state": agent.state.rawValue,
+            "model": sanitizedRemoteText(agent.model ?? "", projectPath: projectPath),
+            "cost": agent.cost,
+            "turns": agent.turns,
+            "activity": sanitizedRemoteText(agent.activity, projectPath: projectPath)
+        ]
+    }
+
+    private func agentsDTO(_ agents: [SubagentInfo], projectPath: String) -> [[String: Any]] {
+        agents.map { agentDTO($0, projectPath: projectPath) }
+    }
+
+    private func remoteDocumentKind(_ url: URL) -> String {
+        switch DocumentDetector.kind(for: url) {
+        case .some(.markdown), .some(.plain): return "text"
+        case .some(.pdf): return "pdf"
+        case nil: return "other"
+        }
+    }
+
+    private func documentsDTO(session: ChatSession, sessionID: String) -> [[String: Any]] {
+        guard let url = session.documents.currentURL else { return [] }
+        let id = UUID().uuidString.lowercased()
+        remoteDocuments[id] = (sessionID, url)
+        let size = ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber)?.intValue ?? 0
+        return [[
+            "id": id,
+            "name": sanitizedRemoteText(url.lastPathComponent, projectPath: session.projectURL.path),
+            "kind": remoteDocumentKind(url),
+            "size": size
+        ]]
+    }
+
+    private func sanitizedDocumentText(_ value: String, projectPath: String) -> String {
+        RemoteTranscriptNormalizer.redactKnownLocalPaths(
+            value,
+            projectPath: projectPath,
+            homeDirectory: FileManager.default.homeDirectoryForCurrentUser.path
+        )
     }
 
     private func subagentModelsDTO() -> [[String: String]] {

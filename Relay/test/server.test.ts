@@ -191,6 +191,10 @@ test("model commands are allowlisted and forwarded unchanged", async () => {
   assert(COMMANDS.has("models.get"));
   assert(COMMANDS.has("model.set"));
   assert(COMMANDS.has("subagentModel.set"));
+  assert(COMMANDS.has("agents.list"));
+  assert(COMMANDS.has("agents.detail"));
+  assert(COMMANDS.has("panel.state"));
+  assert(COMMANDS.has("document.get"));
   const relay = await start();
   const seen: Array<{ command: unknown; body: unknown }> = [];
   await connectHost(relay.port, (request, ws, epoch) => {
@@ -211,6 +215,10 @@ test("model commands are allowlisted and forwarded unchanged", async () => {
     ["/api/models", { sessionID: "session" }],
     ["/api/model", { sessionID: "session", modelId: "xai/grok" }],
     ["/api/subagent-model", { agent: "explore", model: "" }],
+    ["/api/agents", { sessionID: "session" }],
+    ["/api/agent", { sessionID: "session", agentID: "agent" }],
+    ["/api/panel-state", { sessionID: "session" }],
+    ["/api/document", { sessionID: "session", documentID: "document" }],
   ] as const) {
     const response = await fetch(`http://127.0.0.1:${relay.port}${path}`, {
       method: "POST",
@@ -224,6 +232,10 @@ test("model commands are allowlisted and forwarded unchanged", async () => {
     { command: "models.get", body: { sessionID: "session" } },
     { command: "model.set", body: { sessionID: "session", modelId: "xai/grok" } },
     { command: "subagentModel.set", body: { agent: "explore", model: "" } },
+    { command: "agents.list", body: { sessionID: "session" } },
+    { command: "agents.detail", body: { sessionID: "session", agentID: "agent" } },
+    { command: "panel.state", body: { sessionID: "session" } },
+    { command: "document.get", body: { sessionID: "session", documentID: "document" } },
   ]);
 });
 

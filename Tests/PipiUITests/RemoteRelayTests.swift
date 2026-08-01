@@ -38,6 +38,10 @@ final class RemoteRelayTests: XCTestCase {
         XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(
             method: "POST", path: "/api/subagent-model"
         ), .subagentModelSet)
+        XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(method: "POST", path: "/api/agents"), .agentsList)
+        XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(method: "POST", path: "/api/agent"), .agentsDetail)
+        XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(method: "POST", path: "/api/panel-state"), .panelState)
+        XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(method: "POST", path: "/api/document"), .documentGet)
         XCTAssertNil(RemoteRelayCommand.localHTTPCommand(
             method: "POST", path: "/rpc"
         ))
@@ -54,6 +58,10 @@ final class RemoteRelayTests: XCTestCase {
             "models.get",
             "model.set",
             "subagentModel.set",
+            "agents.list",
+            "agents.detail",
+            "panel.state",
+            "document.get",
         ])
     }
 
@@ -146,6 +154,10 @@ final class RemoteRelayTests: XCTestCase {
             command: .subagentModelSet,
             body: Data(#"{"agent":"explore","model":"","extra":true}"#.utf8)
         ))
+        XCTAssertTrue(RemoteCommandSchema.validate(command: .agentsList, body: Data(#"{"sessionID":"opaque"}"#.utf8)))
+        XCTAssertTrue(RemoteCommandSchema.validate(command: .agentsDetail, body: Data(#"{"sessionID":"opaque","agentID":"agent"}"#.utf8)))
+        XCTAssertTrue(RemoteCommandSchema.validate(command: .panelState, body: Data(#"{"sessionID":"opaque"}"#.utf8)))
+        XCTAssertTrue(RemoteCommandSchema.validate(command: .documentGet, body: Data(#"{"sessionID":"opaque","documentID":"document"}"#.utf8)))
     }
 
     func testSettingsRequireSecureSchemesAndExactHostPath() throws {

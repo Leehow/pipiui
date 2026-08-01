@@ -320,6 +320,10 @@ enum LocalRemoteRoutes {
         "/api/models": "POST",
         "/api/model": "POST",
         "/api/subagent-model": "POST",
+        "/api/agents": "POST",
+        "/api/agent": "POST",
+        "/api/panel-state": "POST",
+        "/api/document": "POST",
     ]
 
     static func rejection(for request: LocalRemoteHTTPRequest) -> LocalRemoteHTTPResponse? {

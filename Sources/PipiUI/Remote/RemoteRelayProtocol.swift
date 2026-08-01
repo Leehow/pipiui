@@ -19,10 +19,14 @@ enum RemoteRelayCommand: String, Codable, CaseIterable, Sendable {
     case modelsGet = "models.get"
     case modelSet = "model.set"
     case subagentModelSet = "subagentModel.set"
+    case agentsList = "agents.list"
+    case agentsDetail = "agents.detail"
+    case panelState = "panel.state"
+    case documentGet = "document.get"
 
     var isMutation: Bool {
         switch self {
-        case .index, .snapshot, .modelsGet:
+        case .index, .snapshot, .modelsGet, .agentsList, .agentsDetail, .panelState, .documentGet:
             return false
         case .sessionCreate, .sessionOpen, .promptSend, .generationStop, .modelSet, .subagentModelSet:
             return true
@@ -40,6 +44,10 @@ enum RemoteRelayCommand: String, Codable, CaseIterable, Sendable {
         case ("POST", "/api/models"): .modelsGet
         case ("POST", "/api/model"): .modelSet
         case ("POST", "/api/subagent-model"): .subagentModelSet
+        case ("POST", "/api/agents"): .agentsList
+        case ("POST", "/api/agent"): .agentsDetail
+        case ("POST", "/api/panel-state"): .panelState
+        case ("POST", "/api/document"): .documentGet
         default: nil
         }
     }
@@ -206,11 +214,18 @@ enum RemoteCommandSchema {
         case .sessionCreate:
             return exactKeys(dictionary, ["projectID"])
                 && nonemptyString(dictionary["projectID"], maximumBytes: 256)
-        case .sessionOpen, .generationStop, .modelsGet:
+        case .sessionOpen, .generationStop, .modelsGet, .agentsList, .panelState:
             return exactKeys(dictionary, ["sessionID"])
                 && nonemptyString(dictionary["sessionID"], maximumBytes: 256)
-        case .modelSet:
-            return exactKeys(dictionary, ["sessionID", "modelId"])
+        case .agentsDetail:
+            return exactKeys(dictionary, ["sessionID", "agentID"])
+                && nonemptyString(dictionary["sessionID"], maximumBytes: 256)
+                && nonemptyString(dictionary["agentID"], maximumBytes: 256)
+        case .documentGet:
+            return exactKeys(dictionary, ["sessionID", "documentID"])
+                && nonemptyString(dictionary["sessionID"], maximumBytes: 256)
+                && nonemptyString(dictionary["documentID"], maximumBytes: 256)
+        case .modelSet:            return exactKeys(dictionary, ["sessionID", "modelId"])
                 && nonemptyString(dictionary["sessionID"], maximumBytes: 256)
                 && nonemptyString(dictionary["modelId"], maximumBytes: 256)
         case .subagentModelSet:
