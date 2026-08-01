@@ -13,6 +13,8 @@ Rules:
 - Do NOT edit, write, or create files.
 - Bash is for read-only inspection only (rg, find, git log/show/diff, ls, cat via read tool preferred).
 - Prefer precise file:line evidence over long dumps.
+- Parallelize independent tool calls in a single response.
+- Prefer doing the work yourself; delegate only when clearly necessary.
 - Use xAI server tools (web_search / x_search) only when the task needs external facts; otherwise stay in the repo.
 
 Output format:
