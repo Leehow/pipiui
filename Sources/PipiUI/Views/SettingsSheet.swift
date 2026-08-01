@@ -59,6 +59,11 @@ struct SettingsSheet: View {
     @State private var visionFallbackModelId: String = VisionFallbackSettings.load().modelId
     @State private var visionFallbackMaxTokens: String = String(VisionFallbackSettings.load().maxTokens)
     @State private var visionFallbackKeyConfigured = !(VisionFallbackSettings.load().apiKey.isEmpty)
+    /// 显示价格单位（USD 内部记账，仅影响展示）+ 汇率刷新状态。
+    @State private var priceUnit: PriceUnit = PricingSettings.unit()
+    @State private var fxRefreshing = false
+    @State private var fxMessage: String?
+    @State private var fxError: String?
     /// .env 中已配置 key 的 provider 集合（用于 auth.json 残留冲突警告）。
     @State private var envConfiguredProviders: Set<String> = []
     /// .env 存取（placeholder 查询、清除、删除凭据时可选的同步移除）。
@@ -79,6 +84,8 @@ struct SettingsSheet: View {
     @State private var usageExpanded: Set<String> = []
     @State private var usageLoading = false
     @State private var usageRequestID = 0
+    /// reloadUsage 时的显示单位快照（决定聚合 costMode 与金额格式化）。
+    @State private var usageUnit: PriceUnit = PricingSettings.unit()
 
     init(initialTab: SettingsTab = .general) {
         _tab = State(initialValue: initialTab)
@@ -227,8 +234,104 @@ struct SettingsSheet: View {
             webSearchSection
             Divider()
             visionFallbackSection
+            Divider()
+            priceSection
         }
     }
+
+    // MARK: - Price display unit + FX rate
+
+    private var priceSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("显示价格单位")
+                .font(.title3.weight(.semibold))
+            Text("pi 内部始终以 USD 记账；这里只决定花费的显示单位。切换后输入栏余额弹窗、上下文弹窗的「累计花费」以及「用量」页汇总统一按所选单位显示。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Picker("单位", selection: $priceUnit) {
+                    Text("美金").tag(PriceUnit.usd)
+                    Text("人民币").tag(PriceUnit.cny)
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: priceUnit) { _, newValue in
+                    PricingSettings.setUnit(newValue)
+                    statusMessage = "显示价格单位已切换为\(newValue.label)"
+                }
+
+                HStack(spacing: 8) {
+                    Text("1 USD ≈ ¥\(String(format: "%.2f", ModelPricing.Catalog.shared.exchangeRate))")
+                        .font(.callout.monospacedDigit())
+                    Spacer()
+                    Button {
+                        refreshExchangeRate()
+                    } label: {
+                        if fxRefreshing {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Label("刷新汇率", systemImage: "arrow.clockwise")
+                        }
+                    }
+                    .disabled(fxRefreshing)
+                }
+
+                if let fetchedAt = FXRateStore.fetchedAt() {
+                    let stale = Date().timeIntervalSince(fetchedAt) > 48 * 3600
+                    Text("更新于 \(Self.rateDateFmt.string(from: fetchedAt))\(stale ? " · 可能已过期" : "")")
+                        .font(.caption2)
+                        .foregroundStyle(stale ? Color.orange : Color.secondary)
+                } else {
+                    Text("尚未获取过汇率，当前使用默认值 \(String(format: "%.2f", ModelPricing.defaultUsdToCny))。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let fxMessage {
+                    Text(fxMessage)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if let fxError {
+                    Text(fxError)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
+            }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+
+            Text("汇率数据来自 \(FXRateStore.source() ?? "Exchange Rate API")（每日更新；失败时保留上次汇率）。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func refreshExchangeRate() {
+        guard !fxRefreshing else { return }
+        fxRefreshing = true
+        fxMessage = nil
+        fxError = nil
+        Task {
+            // Single-writer refresh: fetch → persist (FXRateStore) → memory (Catalog).
+            let rate = await ModelPricing.Catalog.shared.refreshExchangeRateFromWeb()
+            await MainActor.run {
+                fxRefreshing = false
+                if let rate {
+                    fxMessage = "已更新汇率 \(String(format: "%.4f", rate))"
+                } else {
+                    fxError = "获取汇率失败，请稍后重试（保留上次汇率）"
+                }
+            }
+        }
+    }
+
+    private static let rateDateFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm"
+        return f
+    }()
 
     private var localRemoteSection: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -509,7 +612,7 @@ struct SettingsSheet: View {
                 .disabled(usageLoading)
             }
 
-            Text("Tokens = input + output + cacheWrite（不含 cacheRead）。Cost 按官网/API 牌价从 token 重算为人民币（含缓存与 >200k/272k 长上下文档）；美元牌价按约 \(String(format: "%.2f", ModelPricing.Catalog.shared.exchangeRate)) 汇率换算。订阅套餐模型按对应 API 牌价估算等价花费，非账单实扣。")
+            Text(usageHelpText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -597,7 +700,11 @@ struct SettingsSheet: View {
         HStack(spacing: 16) {
             usageTotalItem(icon: "number", label: "Calls", value: "\(usageReport.total.calls)")
             usageTotalItem(icon: "text.word.spacing", label: "Tokens", value: TokenFormat.compact(usageReport.total.tokens))
-            usageTotalItem(icon: "yensign.circle", label: "Cost", value: usageCostText(usageReport.total.cost))
+            usageTotalItem(
+                icon: usageUnit == .usd ? "dollarsign.circle" : "yensign.circle",
+                label: "Cost",
+                value: usageCostText(usageReport.total.cost)
+            )
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -880,8 +987,19 @@ struct SettingsSheet: View {
         }
     }
 
+    /// 用量页说明：USD 单位 = pi 账本实耗；CNY 单位 = 牌价重算估计（原说明）。
+    private var usageHelpText: String {
+        if PricingSettings.unit() == .usd {
+            return "Tokens = input + output + cacheWrite（不含 cacheRead）。Cost 为 pi 账本（get_session_stats）上报的美元实耗，非按牌价重算；订阅套餐模型按实际上报值计。"
+        }
+        return "Tokens = input + output + cacheWrite（不含 cacheRead）。Cost 按官网/API 牌价从 token 重算为人民币（含缓存与 >200k/272k 长上下文档）；美元牌价按约 \(String(format: "%.2f", ModelPricing.Catalog.shared.exchangeRate)) 汇率换算。订阅套餐模型按对应 API 牌价估算等价花费，非账单实扣。"
+    }
+
     private func usageCostText(_ cost: Double) -> String {
-        ModelPricing.formatCNY(cost)
+        switch usageUnit {
+        case .usd: return formatUSD(cost)
+        case .cny: return ModelPricing.formatCNY(cost)
+        }
     }
 
     private func reloadUsage() {
@@ -890,11 +1008,20 @@ struct SettingsSheet: View {
         usageLoading = true
         let period = usagePeriod
         let groupBy = usageGroupBy
+        // USD 显示单位 → 账本实耗；CNY → 牌价重算估计（原行为）。
+        let unit = PricingSettings.unit()
+        let costMode: TokenUsageStats.CostMode = unit == .usd ? .ledger : .estimateCNY
         Task.detached(priority: .utility) {
             let records = TokenUsageStats.loadSharedRecords()
-            let report = TokenUsageStats.aggregate(records: records, period: period, groupBy: groupBy)
+            let report = TokenUsageStats.aggregate(
+                records: records,
+                period: period,
+                groupBy: groupBy,
+                costMode: costMode
+            )
             await MainActor.run {
                 guard requestID == usageRequestID else { return }
+                usageUnit = unit
                 usageReport = report
                 usageLoading = false
             }

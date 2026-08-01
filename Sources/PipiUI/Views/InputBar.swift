@@ -1624,29 +1624,36 @@ struct InputBar: View {
     }
 
     private var balancePopover: some View {
+        // Re-read unit + rate at render time so a settings change shows up
+        // immediately on the next popover open.
+        let unit = PricingSettings.unit()
         let display = BalanceSpendDisplay(
             sessionCostUSD: session.cost,
-            last30DaysCNY: balanceLast30Days ?? 0
+            last30DaysUSD: balanceLast30Days ?? 0,
+            unit: unit,
+            rate: ModelPricing.Catalog.shared.exchangeRate
         )
         return VStack(alignment: .leading, spacing: 8) {
             Text("账户余额")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
-            contextDetailRow("本会话消耗", display.sessionSpendUSD)
-            contextDetailRow("30天内消耗", balanceLast30Days == nil ? "…" : display.last30DaysCNY)
+            contextDetailRow("本会话消耗", display.sessionSpend)
+            contextDetailRow("30天内消耗", balanceLast30Days == nil ? "…" : display.last30DaysSpend)
         }
         .onAppear { reloadBalanceLast30Days() }
     }
 
-    /// Lazy, non-blocking refresh of the 30-day ledger total (mirrors
-    /// SettingsSheet.reloadUsage: detached utility task + MainActor hop).
+    /// Lazy, non-blocking refresh of the 30-day ledger total in raw pi USD
+    /// (`.ledger`); the popover converts to the display unit at render time.
+    /// Mirrors SettingsSheet.reloadUsage: detached utility task + MainActor hop.
     private func reloadBalanceLast30Days() {
         Task.detached(priority: .utility) {
             let records = TokenUsageStats.loadSharedRecords()
             let report = TokenUsageStats.aggregate(
                 records: records,
                 period: .last30Days,
-                groupBy: .model
+                groupBy: .model,
+                costMode: .ledger
             )
             await MainActor.run {
                 balanceLast30Days = report.total.cost
@@ -1733,7 +1740,14 @@ struct InputBar: View {
                 .foregroundStyle(.secondary)
             contextDetailRow("累计缓存读取", TokenFormat.compact(session.sessionCacheRead))
             contextDetailRow("累计缓存写入", TokenFormat.compact(session.sessionCacheWrite))
-            contextDetailRow("累计花费", String(format: "$%.4f", session.cost))
+            contextDetailRow(
+                "累计花费",
+                formatSpend(
+                    usdCost: session.cost,
+                    unit: PricingSettings.unit(),
+                    rate: ModelPricing.Catalog.shared.exchangeRate
+                )
+            )
         }
     }
 

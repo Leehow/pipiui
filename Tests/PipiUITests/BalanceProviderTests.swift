@@ -153,26 +153,27 @@ final class BalanceProviderTests: XCTestCase {
 
     // MARK: - Spend display (balance popover)
 
-    func testBalanceSpendDisplayFormatsRows() {
-        let d = BalanceSpendDisplay(sessionCostUSD: 0.123456, last30DaysCNY: 12.3456)
-        XCTAssertEqual(d.sessionSpendUSD, "$0.1235")
-        XCTAssertEqual(d.last30DaysCNY, "¥12.35")
+    func testBalanceSpendDisplayFormatsRowsInUSD() {
+        let d = BalanceSpendDisplay(sessionCostUSD: 0.123456, last30DaysUSD: 12.3456, unit: .usd, rate: 6.8)
+        XCTAssertEqual(d.sessionSpend, "$0.123")
+        XCTAssertEqual(d.last30DaysSpend, "$12.35")
     }
 
     func testBalanceSpendDisplayZeroValues() {
-        let d = BalanceSpendDisplay(sessionCostUSD: 0, last30DaysCNY: 0)
-        XCTAssertEqual(d.sessionSpendUSD, "$0.0000")
-        XCTAssertEqual(d.last30DaysCNY, "¥0")
+        let d = BalanceSpendDisplay(sessionCostUSD: 0, last30DaysUSD: 0, unit: .usd, rate: 6.8)
+        XCTAssertEqual(d.sessionSpend, "$0")
+        XCTAssertEqual(d.last30DaysSpend, "$0")
     }
 
-    func testBalanceSpendDisplayTinyCNYKeepsPrecision() {
-        let d = BalanceSpendDisplay(sessionCostUSD: 1.0, last30DaysCNY: 0.005)
-        XCTAssertEqual(d.last30DaysCNY, "¥0.0050")
+    func testBalanceSpendDisplayConvertsBothRowsToCNY() {
+        let d = BalanceSpendDisplay(sessionCostUSD: 1.0, last30DaysUSD: 0.001, unit: .cny, rate: 6.8)
+        XCTAssertEqual(d.sessionSpend, "¥6.80")
+        XCTAssertEqual(d.last30DaysSpend, "¥0.0068")
     }
 
     func testBalanceSpendDisplayRoundsSubCentUSD() {
-        let d = BalanceSpendDisplay(sessionCostUSD: 0.00001234, last30DaysCNY: 0.5)
-        XCTAssertEqual(d.sessionSpendUSD, "$0.0000")
-        XCTAssertEqual(d.last30DaysCNY, "¥0.500")
+        let d = BalanceSpendDisplay(sessionCostUSD: 0.00001234, last30DaysUSD: 0.5, unit: .usd, rate: 6.8)
+        XCTAssertEqual(d.sessionSpend, "$0.0000")
+        XCTAssertEqual(d.last30DaysSpend, "$0.500")
     }
 }

@@ -36,16 +36,16 @@ func formatBalance(amount: Decimal, currency: String) -> String {
 
 // MARK: - Spend display (balance popover)
 
-/// Pure formatting for the balance popover's two spend rows. Session spend is raw
-/// USD from pi `get_session_stats` (same `$%.4f` style as the context popover's
-/// 累计花费); the 30-day total is a ledger aggregate in CNY (`formatCNY`).
+/// Pure formatting for the balance popover's two spend rows. Both inputs are
+/// raw pi ledger USD (session cost + 30-day aggregate); `unit` / `rate` decide
+/// the display currency for both rows.
 struct BalanceSpendDisplay: Equatable {
-    var sessionSpendUSD: String
-    var last30DaysCNY: String
+    var sessionSpend: String
+    var last30DaysSpend: String
 
-    init(sessionCostUSD: Double, last30DaysCNY: Double) {
-        sessionSpendUSD = String(format: "$%.4f", sessionCostUSD)
-        self.last30DaysCNY = ModelPricing.formatCNY(last30DaysCNY)
+    init(sessionCostUSD: Double, last30DaysUSD: Double, unit: PriceUnit, rate: Double) {
+        sessionSpend = formatSpend(usdCost: sessionCostUSD, unit: unit, rate: rate)
+        last30DaysSpend = formatSpend(usdCost: last30DaysUSD, unit: unit, rate: rate)
     }
 }
 
