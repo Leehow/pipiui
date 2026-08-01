@@ -11,11 +11,14 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 const HOME = process.env.HOME || process.env.USERPROFILE;
 const PI_AGENT = path.join(HOME, ".pi", "agent");
 const PRIMARY_ROOT = "/Users/haoli/leehow/code/pipiui";
 const REPORT_DIR = path.join(PRIMARY_ROOT, ".pi", "boss");
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const REGISTRY_PATH = path.join(REPO_ROOT, "Sources", "PipiUI", "Resources", "ModelCapabilities.json");
 const RUNS = 3;
 const TIMEOUT_MS = 60_000;
 const TARGETS = [
@@ -33,22 +36,24 @@ const PARALLEL_HINT = "If you intend to call multiple tools and there are no dep
 const BOSS_SYSTEM = "You are a boss agent. Delegate research work with the subagent tool. Use independent delegates when goals are independent.";
 
 function usage() {
-  console.log("Usage: node scripts/probe-parallel-toolcalls.mjs [--list] [--only provider/model] [--resume raw.json]");
+  console.log("Usage: node scripts/probe-parallel-toolcalls.mjs [--list] [--only provider/model] [--resume raw.json] [--emit-registry]");
 }
 
 function parseArgs(argv) {
   let list = false;
   let only;
   let resume;
+  let emitRegistry = false;
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "--list") list = true;
     else if (argv[i] === "--only") only = argv[++i];
     else if (argv[i] === "--resume") resume = argv[++i];
+    else if (argv[i] === "--emit-registry") emitRegistry = true;
     else if (argv[i] === "--help" || argv[i] === "-h") { usage(); process.exit(0); }
     else throw new Error(`Unknown argument: ${argv[i]}`);
   }
   if (only && !/^[-\w]+\/[\w.-]+$/.test(only)) throw new Error("--only must be provider/model");
-  return { list, only, resume };
+  return { list, only, resume, emitRegistry };
 }
 
 async function readJson(name) {
@@ -357,6 +362,105 @@ function interpretation(summary) {
   return "Poor boss candidate for native parallel delegation; enforce batching in orchestration.";
 }
 
+function modelContextWindow(store, item) {
+  const model = findModel(store, item.provider, item.model);
+  const contextWindow = model?.contextWindow ?? model?.limit?.context;
+  return typeof contextWindow === "number" ? contextWindow : null;
+}
+
+function attemptedRuns(metric, status) {
+  if (metric) return metric.completed + metric.errors;
+  return status === "skipped" ? 0 : RUNS;
+}
+
+function probeARegistryValue(item) {
+  const metric = item.metrics?.A;
+  return {
+    status: item.status,
+    rate: metric?.parallelRate ?? null,
+    completed_runs: metric?.completed ?? 0,
+    attempted_runs: attemptedRuns(metric, item.status),
+    mean_calls: metric?.meanCalls ?? null,
+    mean_city_coverage: metric?.meanCoverage ?? null,
+    ...(item.status === "completed" ? {} : { reason: item.reason ?? "no probe result" }),
+  };
+}
+
+function probeCRegistryValue(item) {
+  const metric = item.metrics?.C;
+  return {
+    status: item.status,
+    rate: metric?.batchRate ?? null,
+    completed_runs: metric?.completed ?? 0,
+    attempted_runs: attemptedRuns(metric, item.status),
+    distribution: metric?.distribution ?? {},
+    ...(item.status === "completed" ? {} : { reason: item.reason ?? "no probe result" }),
+  };
+}
+
+function recommendedRoles(item) {
+  if (item.status !== "completed") return [];
+  const a = item.metrics?.A?.parallelRate ?? 0;
+  const c = item.metrics?.C;
+  const supportsTasksBatch = (c?.batchRate ?? 0) >= 2 / 3;
+  const supportsMultipleCalls = (c?.distribution?.["multiple single calls"] ?? 0) >= 2;
+  return [
+    ...(a >= 2 / 3 && (supportsTasksBatch || supportsMultipleCalls) ? ["boss"] : []),
+    "worker",
+  ];
+}
+
+function registryNotes(item) {
+  if (item.status !== "completed") return `Probe ${item.status}: ${item.reason ?? "no probe result"}`;
+  const a = item.metrics.A;
+  const c = item.metrics.C;
+  const distribution = Object.entries(c.distribution)
+    .filter(([, count]) => count)
+    .map(([kind, count]) => `${kind}: ${count}`)
+    .join(", ");
+  return `Probe A: ${pct(a.parallelRate)} parallel tool calls across ${a.completed}/${attemptedRuns(a, item.status)} completed runs. Probe C: ${pct(c.batchRate)} tasks[] batches (${distribution || "none"}).`;
+}
+
+async function emitRegistry(results, store, startedAt) {
+  let existing = {};
+  try {
+    existing = JSON.parse(await readFile(REGISTRY_PATH, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const models = existing.models && typeof existing.models === "object" && !Array.isArray(existing.models)
+    ? { ...existing.models }
+    : {};
+  for (const item of results) {
+    const key = `${item.provider}/${item.model}`;
+    models[key] = {
+      provider: item.provider,
+      model: item.model,
+      parallel_tool_calls: probeARegistryValue(item),
+      tasks_batch: probeCRegistryValue(item),
+      context_window: modelContextWindow(store, item),
+      recommended_roles: recommendedRoles(item),
+      notes: registryNotes(item),
+      probed_at: item.supplementalAt ?? startedAt,
+    };
+  }
+  const registry = {
+    ...existing,
+    schema_version: 1,
+    updated_at: startedAt,
+    probe: {
+      runs_per_probe: RUNS,
+      timeout_ms: TIMEOUT_MS,
+      parallel_tool_calls: "Probe A: spontaneous independent weather tool calls.",
+      tasks_batch: "Probe C: subagent tasks[] batch preference.",
+    },
+    models,
+  };
+  await mkdir(path.dirname(REGISTRY_PATH), { recursive: true });
+  await writeFile(REGISTRY_PATH, `${JSON.stringify(registry, null, 2)}\n`, "utf8");
+  return REGISTRY_PATH;
+}
+
 function markdown(results, rawPath, startedAt) {
   const lines = [
     "# Model multi-tool-call capability matrix",
@@ -408,6 +512,12 @@ async function main() {
     console.log(`Total planned requests: ${targets.filter((target) => !target.skip).length * RUNS * 3}`);
     return;
   }
+  if (args.emitRegistry && resumed) {
+    const resumedResults = resumed.results.filter((item) => !args.only || `${item.provider}/${item.model}` === args.only);
+    if (args.only && resumedResults.length === 0) throw new Error(`No saved result for ${args.only}`);
+    console.log(`Updated ${await emitRegistry(resumedResults, store, resumed.generatedAt ?? new Date().toISOString())}`);
+    return;
+  }
 
   const startedAt = new Date().toISOString();
   const results = (resumed?.results || []).filter((item) => !targets.some((target) => target.provider === item.provider && target.id === item.model));
@@ -425,6 +535,7 @@ async function main() {
     const allFailed = records.every((record) => record.status === "error");
     results.push({
       provider: target.provider, model: target.id, api: target.model.api,
+      contextWindow: target.model.contextWindow ?? target.model.limit?.context ?? null,
       status: allFailed ? "unavailable" : "completed", supplementalAt: startedAt,
       ...(allFailed ? { reason: `all ${records.length} requests failed: ${records[0].error}` } : {}),
       credentialSource: target.credential.source,
@@ -442,6 +553,7 @@ async function main() {
   await writeFile(reportPath, markdown(results, rawPath, startedAt), "utf8");
   console.log(`Wrote ${reportPath}`);
   console.log(`Wrote ${rawPath}`);
+  if (args.emitRegistry) console.log(`Updated ${await emitRegistry(results, store, startedAt)}`);
 }
 
 main().catch((error) => { console.error(`probe failed: ${cleanError(error?.message)}`); process.exitCode = 1; });
