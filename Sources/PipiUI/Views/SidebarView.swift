@@ -10,15 +10,18 @@ struct SidebarView: View {
     @State private var projectRenameTarget: ProjectRenameTarget?
     @State private var projectRenameText: String = ""
     @State private var archivedExpanded = false
-    @State private var projectsExpanded = false
-    @State private var pinnedExpanded = false
+    /// Visible row counts for the 项目/置顶 sections: each 「更多」 click adds
+    /// `SidebarListLimits.pageSize` rows until everything is shown, then the
+    /// same button reads 「收起」 and collapses back to the initial cap.
+    @State private var projectsShown = SidebarListLimits.projects
+    @State private var pinnedShown = SidebarListLimits.pinned
     /// Project folders can be opened independently. The selected project is
     /// always opened when it is selected, but opening one folder never closes
     /// another.
     @State private var expandedProjectPaths: Set<String> = []
     /// The active-session cap is applied independently inside each project
     /// folder, so one project's "更多" does not affect the others.
-    @State private var sessionsExpandedByProject: [String: Bool] = [:]
+    @State private var sessionsShownByProject: [String: Int] = [:]
     /// Settings sheet is presented from this sidebar (window-local): opening it in
     /// one window never opens settings in another window of the same app.
     @State private var showSettings = false
@@ -275,10 +278,9 @@ struct SidebarView: View {
     private func syncProjectsExpansion() {
         guard let path = store.selectedProjectPath else { return }
         expandedProjectPaths.insert(path)
-        guard !projectsExpanded else { return }
         guard let index = store.orderedProjects.firstIndex(where: { $0.path == path }) else { return }
-        if index >= SidebarListLimits.projects {
-            projectsExpanded = true
+        if index + 1 > projectsShown {
+            projectsShown = index + 1
         }
     }
 
@@ -296,7 +298,7 @@ struct SidebarView: View {
             let capped = SidebarListLimits.visiblePrefix(
                 of: store.orderedProjects,
                 limit: SidebarListLimits.projects,
-                expanded: projectsExpanded
+                shown: projectsShown
             )
             ForEach(capped.items, id: \.path) { project in
                 projectFolderRow(project)
@@ -305,7 +307,12 @@ struct SidebarView: View {
                 }
             }
             if capped.showsToggle {
-                moreToggle(expanded: $projectsExpanded, sectionName: "项目")
+                moreToggle(
+                    shown: $projectsShown,
+                    total: store.orderedProjects.count,
+                    limit: SidebarListLimits.projects,
+                    sectionName: "项目"
+                )
             }
         }
     }
@@ -401,9 +408,9 @@ struct SidebarView: View {
                 },
                 onOpen: { hit in
                     expandedProjectPaths.insert(target.project.path)
-                    // Show the full session list of the project (expand 更多 toggle)
-                    // so the selected row is visible beyond the first 10 sessions.
-                    sessionsExpandedByProject[target.project.path] = true
+                    // Show the full session list of the project (clamped to the
+                    // total) so the selected row is visible beyond the cap.
+                    sessionsShownByProject[target.project.path] = Int.max
                     store.selectedProjectPath = target.project.path
                     switch SessionSearch.openAction(for: hit) {
                     case .selectLive(let key):
@@ -460,7 +467,7 @@ struct SidebarView: View {
                 let capped = SidebarListLimits.visiblePrefix(
                     of: pinned,
                     limit: SidebarListLimits.pinned,
-                    expanded: pinnedExpanded
+                    shown: pinnedShown
                 )
                 ForEach(capped.items, id: \.0.path) { meta, project in
                     let openKey = openKeyFor(meta: meta) ?? "resume:\(meta.path)"
@@ -482,7 +489,12 @@ struct SidebarView: View {
                     )
                 }
                 if capped.showsToggle {
-                    moreToggle(expanded: $pinnedExpanded, sectionName: "置顶")
+                    moreToggle(
+                        shown: $pinnedShown,
+                        total: pinned.count,
+                        limit: SidebarListLimits.pinned,
+                        sectionName: "置顶"
+                    )
                 }
             }
         }
@@ -496,15 +508,15 @@ struct SidebarView: View {
             excludingPinned: store.userPinnedSessionPaths
         )
         let news = newSessionEntries(project: project)
-        let sessionsExpanded = Binding(
-            get: { sessionsExpandedByProject[project.path] ?? false },
-            set: { sessionsExpandedByProject[project.path] = $0 }
+        let sessionsShown = Binding(
+            get: { sessionsShownByProject[project.path] ?? SidebarListLimits.sessions },
+            set: { sessionsShownByProject[project.path] = $0 }
         )
         let visibleCounts = SidebarListLimits.splitVisibleCounts(
             leadingCount: news.count,
             trailingCount: metas.count,
             limit: SidebarListLimits.sessions,
-            expanded: sessionsExpanded.wrappedValue
+            shown: sessionsShown.wrappedValue
         )
         let visibleNews = Array(news.prefix(visibleCounts.leading))
         let visibleMetas = Array(metas.prefix(visibleCounts.trailing))
@@ -542,7 +554,12 @@ struct SidebarView: View {
                 )
             }
             if visibleCounts.showsToggle {
-                moreToggle(expanded: sessionsExpanded, sectionName: "\(store.projectDisplayName(for: project)) 会话")
+                moreToggle(
+                    shown: sessionsShown,
+                    total: news.count + metas.count,
+                    limit: SidebarListLimits.sessions,
+                    sectionName: "\(store.projectDisplayName(for: project)) 会话"
+                )
             }
         }
     }
@@ -573,10 +590,17 @@ struct SidebarView: View {
         }
     }
 
+    /// 「更多」 reveals one page (10 rows) per click until everything is shown;
+    /// at that point the same button reads 「收起」 and collapses back to the cap.
     @ViewBuilder
-    private func moreToggle(expanded: Binding<Bool>, sectionName: String) -> some View {
-        Button(expanded.wrappedValue ? "收起" : "更多") {
-            expanded.wrappedValue.toggle()
+    private func moreToggle(shown: Binding<Int>, total: Int, limit: Int, sectionName: String) -> some View {
+        let collapsed = total > limit && shown.wrappedValue >= total
+        Button(collapsed ? "收起" : "更多") {
+            if shown.wrappedValue >= total, total > limit {
+                shown.wrappedValue = limit
+            } else {
+                shown.wrappedValue = min(total, shown.wrappedValue + SidebarListLimits.pageSize)
+            }
         }
         .buttonStyle(.plain)
         .font(.caption)
@@ -585,7 +609,7 @@ struct SidebarView: View {
         .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .accessibilityLabel(expanded.wrappedValue ? "收起\(sectionName)" : "展开更多\(sectionName)")
+        .accessibilityLabel(collapsed ? "收起\(sectionName)" : "展开更多\(sectionName)")
         .pointingHandCursor()
     }
 
