@@ -1004,16 +1004,19 @@ private struct LiveSessionRow: View {
 }
 
 /// Distinct from main-agent ProgressView spinner: people icon + mild pulse.
+/// Pulse runs on CALayer (WindowServer), not SwiftUI's render loop — avoids a
+/// permanent main-thread DisplayList walk while any subagent badge is visible.
 private struct SubagentsRunningIndicator: View {
     let count: Int
-    @State private var pulse = false
 
     var body: some View {
         ZStack {
-            Image(systemName: "person.2.fill")
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(Color.orange)
-                .opacity(pulse ? 0.45 : 1.0)
+            LayerOpacityPulsingSymbol(
+                systemName: "person.2.fill",
+                pointSize: 9,
+                weight: .semibold,
+                tint: .systemOrange
+            )
             if count > 1 {
                 Text("\(min(count, 9))")
                     .font(.system(size: 6, weight: .bold, design: .rounded))
@@ -1024,12 +1027,101 @@ private struct SubagentsRunningIndicator: View {
             }
         }
         .frame(width: 12, height: 12)
-        .onAppear {
-            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
-                pulse = true
-            }
-        }
         .accessibilityLabel(count > 1 ? "\(count) 个子任务运行中" : "子任务运行中")
+    }
+}
+
+/// SF Symbol whose layer opacity pulses 1.0 ↔ 0.45 via CABasicAnimation.
+/// Layer animations do not drive SwiftUI's per-frame DisplayList updates.
+private struct LayerOpacityPulsingSymbol: NSViewRepresentable {
+    let systemName: String
+    let pointSize: CGFloat
+    let weight: NSFont.Weight
+    let tint: NSColor
+
+    func makeNSView(context: Context) -> PulsingSymbolNSView {
+        let view = PulsingSymbolNSView()
+        view.configure(systemName: systemName, pointSize: pointSize, weight: weight, tint: tint)
+        return view
+    }
+
+    func updateNSView(_ nsView: PulsingSymbolNSView, context: Context) {
+        nsView.configure(systemName: systemName, pointSize: pointSize, weight: weight, tint: tint)
+    }
+
+    static func dismantleNSView(_ nsView: PulsingSymbolNSView, coordinator: ()) {
+        nsView.stopPulse()
+    }
+}
+
+private final class PulsingSymbolNSView: NSView {
+    private static let animationKey = "pipiui.subagentPulse.opacity"
+
+    private let imageView = NSImageView()
+    private var configuredKey: String?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        imageView.wantsLayer = true
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.animates = false
+        addSubview(imageView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layout() {
+        super.layout()
+        imageView.frame = bounds
+        // Layer is created lazily; attach the pulse once the backing layer exists.
+        startPulseIfNeeded()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            stopPulse()
+        } else {
+            startPulseIfNeeded()
+        }
+    }
+
+    func configure(systemName: String, pointSize: CGFloat, weight: NSFont.Weight, tint: NSColor) {
+        let key = "\(systemName)|\(pointSize)|\(weight.rawValue)|\(tint)"
+        if configuredKey != key {
+            configuredKey = key
+            let config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: weight)
+            imageView.image = NSImage(systemSymbolName: systemName, accessibilityDescription: nil)?
+                .withSymbolConfiguration(config)
+            imageView.contentTintColor = tint
+        }
+        startPulseIfNeeded()
+    }
+
+    func startPulseIfNeeded() {
+        guard window != nil else { return }
+        imageView.wantsLayer = true
+        guard let layer = imageView.layer else { return }
+        guard layer.animation(forKey: Self.animationKey) == nil else { return }
+
+        // Match prior SwiftUI pulse: opacity 1.0 ↔ 0.45, easeInOut 0.9s, autoreverse forever.
+        layer.opacity = 1.0
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.fromValue = 1.0
+        anim.toValue = 0.45
+        anim.duration = 0.9
+        anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        anim.autoreverses = true
+        anim.repeatCount = .infinity
+        anim.isRemovedOnCompletion = false
+        layer.add(anim, forKey: Self.animationKey)
+    }
+
+    func stopPulse() {
+        imageView.layer?.removeAnimation(forKey: Self.animationKey)
+        imageView.layer?.opacity = 1.0
     }
 }
 
