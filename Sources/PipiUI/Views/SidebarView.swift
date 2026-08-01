@@ -43,9 +43,10 @@ struct SidebarView: View {
                 .padding(.horizontal, Self.sidebarGutter + 2)
                 .padding(.top, 14)
                 .padding(.bottom, 10)
-            // SwiftUI hides the indicator, while the sidebar-only AppKit
-            // installer below also disables any legacy reserved scroller track.
-            // Selection chrome is drawn by SessionRowContainer.background.
+            // Thin overlay scroller with automatic indicators, matching the
+            // main transcript: it appears/flashes while scrolling and hides
+            // when idle. Selection chrome is drawn by
+            // SessionRowContainer.background.
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     pinnedSection
@@ -54,9 +55,9 @@ struct SidebarView: View {
                 }
                 .padding(.horizontal, Self.sidebarGutter)
                 .padding(.vertical, 8)
-                .sidebarHiddenVerticalScroller()
+                .overlayScrollers()
             }
-            .scrollIndicators(.hidden)
+            .scrollIndicators(.automatic)
             .clipShape(Rectangle())
         }
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
