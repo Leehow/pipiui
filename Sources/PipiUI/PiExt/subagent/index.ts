@@ -44,6 +44,56 @@ const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
+type DispatchStatsMode = "single" | "tasks" | "chain";
+
+type DispatchStatsTask = {
+	agent: string;
+	task: string;
+	title?: string;
+};
+
+/** Heuristic only: count brief lines that look like list items. */
+function estimateBriefItems(brief: string): number {
+	return brief.split(/\r?\n/).filter((line) => /^\s*([-*•]|\d+[.)])\s/.test(line)).length;
+}
+
+/** Best-effort, fire-and-forget dispatch-shape telemetry. Never affects a dispatch. */
+function recordSubagentDispatchStats(
+	mode: DispatchStatsMode,
+	tasks: readonly DispatchStatsTask[],
+	background: boolean,
+): void {
+	try {
+		const configuredPath = process.env.PIPI_SUBAGENT_STATS_PATH;
+		const statsPath =
+			configuredPath === undefined
+				? path.join(os.homedir(), ".pi", "agent", "subagent-stats.jsonl")
+				: configuredPath.trim();
+		if (!statsPath) return;
+
+		const line = `${JSON.stringify({
+			ts: new Date().toISOString(),
+			pid: process.pid,
+			depth: PIPIUI_DEPTH,
+			mode,
+			task_count: tasks.length,
+			background,
+			tasks: tasks.map((task) => ({
+				agent: task.agent,
+				title: task.title ?? null,
+				brief_chars: task.task.length,
+				brief_items: estimateBriefItems(task.task),
+			})),
+		})}\n`;
+		void fs.promises
+			.mkdir(path.dirname(statsPath), { recursive: true })
+			.then(() => fs.promises.appendFile(statsPath, line, "utf8"))
+			.catch(() => {});
+	} catch {
+		// Telemetry must remain completely isolated from dispatch.
+	}
+}
+
 // ---- Pipi UI 集成：向 App 桥接服务上报 subagent 生命周期（无环境变量时完全静默） ----
 const PIPIUI_PORT = process.env.PIPIUI_BRIDGE_PORT;
 const PIPIUI_SESSION = process.env.PIPIUI_SESSION_KEY;
@@ -2981,6 +3031,17 @@ export default function (pi: ExtensionAPI) {
 						};
 				}
 			}
+
+			const dispatchStatsTasks = hasChain
+				? params.chain!
+				: hasTasks
+					? params.tasks!
+					: [{ agent: params.agent!, task: params.task!, title: params.title }];
+			recordSubagentDispatchStats(
+				hasChain ? "chain" : hasTasks ? "tasks" : "single",
+				dispatchStatsTasks,
+				useBackground,
+			);
 
 			if (params.chain && params.chain.length > 0) {
 				const results: SingleResult[] = [];
