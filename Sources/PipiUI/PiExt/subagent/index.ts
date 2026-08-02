@@ -32,6 +32,8 @@ import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import {
 	resolveSubagentToolSelection,
+	resolveDesktopGrant,
+	DESKTOP_GRANT_CHILD_POLICY,
 	sanitizeDisabledToolNames,
 } from "./desktop-tool-policy.mjs";
 import {
@@ -344,7 +346,8 @@ const PIPIUI_AGENT_ROLE = process.env.PIPIUI_AGENT_ROLE;
 const PIPIUI_MAX_DEPTH = Number.parseInt(process.env.PIPIUI_AGENT_MAX_DEPTH || "2", 10);
 // App 注入的补丁版 subagent 扩展目录；嵌套 spawn 时再传 `-e`，保持上报/护栏一致
 const PIPIUI_SUBAGENT_EXT = process.env.PIPIUI_SUBAGENT_EXT;
-// Globally enabled Computer Use is mounted in dispatched Pi processes too.
+// Globally enabled Computer Use strategy path; mounted in a dispatched Pi
+// process only when that task carries an explicit per-task desktop grant.
 const PIPIUI_COMPUTER_EXT = process.env.PIPIUI_COMPUTER_EXT;
 // App-owned search guard; children load the same code and inherit the human-turn grant file.
 const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
@@ -726,6 +729,8 @@ interface RunSingleAgentOptions {
 	verify?: string;
 	/** Discard this worker's stored conversation and start it cold. */
 	fresh?: boolean;
+	/** Explicit per-task Computer Use grant; omission = no desktop tools. */
+	desktop?: "user-requested" | "ui-verify";
 }
 
 /** Format ExtensionAPI ctx.model → `provider/id`. */
@@ -2919,6 +2924,32 @@ async function runSingleAgent(
 	try {
 
 	const runtimePolicy = runtimeRolePolicyForAgent(agentName);
+	// Per-task desktop gate: a worker gets computer/open_application (plus the
+	// strategy extension and capability env) ONLY when the boss attached an
+	// explicit grant AND the host capability is live. A requested grant with no
+	// host capability fails fast with a clear reason — never a silent no-op.
+	const desktopGrant = resolveDesktopGrant({
+		desktop: options?.desktop,
+		hostAvailable:
+			!!PIPIUI_COMPUTER_EXT && !!process.env.PIPIUI_COMPUTER_CAPABILITY,
+	});
+	if (desktopGrant.problem) {
+		const message = desktopGrant.problem;
+		return {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			title: options?.title,
+			exitCode: 1,
+			messages: [],
+			stderr: message,
+			errorMessage: message,
+			usage: emptyUsage(),
+			step,
+			agentId: pipiuiAgentId,
+			stopReason: "error",
+		};
+	}
 	const placement = resolveSubagentWorktree({
 		agentId: pipiuiAgentId,
 		defaultCwd,
@@ -3013,7 +3044,7 @@ async function runSingleAgent(
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
 	if (PIPIUI_SEARCH_SCOPE_EXT) args.push("-e", PIPIUI_SEARCH_SCOPE_EXT);
 	if (PIPIUI_WEBSEARCH_EXT) args.push("-e", PIPIUI_WEBSEARCH_EXT);
-	if (PIPIUI_COMPUTER_EXT && process.env.PIPIUI_COMPUTER_CAPABILITY) {
+	if (desktopGrant.granted && PIPIUI_COMPUTER_EXT) {
 		args.push("-e", PIPIUI_COMPUTER_EXT);
 	}
 	// A new explicit thinking override wins over Pi's older `model:thinking` shorthand.
@@ -3027,9 +3058,7 @@ async function runSingleAgent(
 			(t) => runtimePolicy.allowRecursiveDelegation || t !== "subagent",
 		),
 		disabledTools: loadDisabledTools(),
-		hasDesktopCapability:
-			!!PIPIUI_COMPUTER_EXT &&
-			!!process.env.PIPIUI_COMPUTER_CAPABILITY,
+		hasDesktopCapability: desktopGrant.granted,
 		allowRecursiveDelegation: runtimePolicy.allowRecursiveDelegation,
 	});
 	if (toolSelection.flag === "--no-tools") {
@@ -3120,8 +3149,17 @@ async function runSingleAgent(
 	};
 
 	try {
-		if (agent.systemPrompt.trim()) {
-			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
+		// Central child prompt: the agent's own system prompt plus, for desktop-
+		// granted dispatches only, the shared Computer Use policy (applies to ALL
+		// subagents — a grant never turns desktop into a general-purpose tool).
+		const promptParts: string[] = [];
+		if (agent.systemPrompt.trim()) promptParts.push(agent.systemPrompt);
+		if (desktopGrant.granted) promptParts.push(DESKTOP_GRANT_CHILD_POLICY);
+		if (promptParts.length > 0) {
+			const tmp = await writePromptToTempFile(
+				agent.name,
+				promptParts.join("\n\n"),
+			);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
 			args.push("--append-system-prompt", tmpPromptPath);
@@ -3162,7 +3200,7 @@ async function runSingleAgent(
 						: {}),
 					...(placement.worktreePath ? { PIPIUI_WORKTREE_PATH: placement.worktreePath } : {}),
 					...(placement.worktreeBranch ? { PIPIUI_WORKTREE_BRANCH: placement.worktreeBranch } : {}),
-				}, true);
+				}, desktopGrant.granted);
 				const proc = spawn(invocation.command, invocation.args, {
 					cwd: spawnCwd,
 					shell: false,
@@ -3502,6 +3540,8 @@ const AGENT_ID_DESCRIPTION =
 	"Short semantic name for the worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\". Re-dispatching the same agentId continues a writable worker with its previous conversation, worktree and branch — use it for one vertical slice (implement, verify, debug, fix, re-verify). Read-only roles are one-shot and do not create a worktree. Omit for one-off work and a name is generated. Also the target id for action=\"abort\".";
 const FRESH_DESCRIPTION =
 	"Discard this agentId's stored conversation and start it cold. Use when its context went wrong, not routinely.";
+const DESKTOP_PARAM_DESCRIPTION =
+	'Explicit per-task Computer Use authorization. Omitted by default — desktop tools are NEVER injected without it, even when the global toggle is on. Only two values exist: "user-requested" (the user explicitly asked to operate an external app, or named Chrome/Safari/another external browser / "my browser" — then you MUST use exactly that external browser via open_application + computer, never swap in the built-in browser) and "ui-verify" (this task built/changed an app and genuinely needs a visual UI acceptance check). Ordinary web research → built-in browser tool, not desktop. Waiting, polling logs, reading files, and build/test verification never use desktop. Do not grant for convenience; each task is authorized independently and never inherits another task\'s grant.';
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
@@ -3516,6 +3556,11 @@ const TaskItem = Type.Object({
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
+	desktop: Type.Optional(
+		StringEnum(["user-requested", "ui-verify"] as const, {
+			description: DESKTOP_PARAM_DESCRIPTION,
+		}),
+	),
 });
 
 const ChainItem = Type.Object({
@@ -3529,6 +3574,11 @@ const ChainItem = Type.Object({
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
+	desktop: Type.Optional(
+		StringEnum(["user-requested", "ui-verify"] as const, {
+			description: DESKTOP_PARAM_DESCRIPTION,
+		}),
+	),
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -3566,6 +3616,11 @@ const SubagentParams = Type.Object({
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
+	desktop: Type.Optional(
+		StringEnum(["user-requested", "ui-verify"] as const, {
+			description: DESKTOP_PARAM_DESCRIPTION,
+		}),
+	),
 	background: Type.Optional(
 		Type.Boolean({
 			description:
@@ -4004,6 +4059,7 @@ export default function (pi: ExtensionAPI) {
 				title: string | undefined,
 				verify: string | undefined,
 				fresh?: boolean,
+				desktop?: "user-requested" | "ui-verify",
 			): void => {
 				void runSingleAgent(
 					ctx.cwd,
@@ -4015,7 +4071,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ background: true, agentId, title, sessionModel, verify, fresh },
+					{ background: true, agentId, title, sessionModel, verify, fresh, desktop },
 				)
 					.then((result) => {
 						notifySubagentDone(pi, result);
@@ -4242,6 +4298,7 @@ export default function (pi: ExtensionAPI) {
 							sessionModel,
 							verify: step.verify,
 							agentId: generatePipiuiAgentId(requestAgentIds),
+							desktop: step.desktop,
 						},
 					);
 					results.push(result);
@@ -4348,7 +4405,7 @@ export default function (pi: ExtensionAPI) {
 								undefined, // no parent abort binding
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ background: true, agentId, title: t.title, sessionModel, verify: t.verify, fresh: t.fresh },
+								{ background: true, agentId, title: t.title, sessionModel, verify: t.verify, fresh: t.fresh, desktop: t.desktop },
 							);
 							notifySubagentDone(pi, result);
 						} catch (err) {
@@ -4436,6 +4493,7 @@ export default function (pi: ExtensionAPI) {
 							verify: t.verify,
 							agentId: t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
 							fresh: t.fresh,
+							desktop: t.desktop,
 						},
 					);
 					allResults[index] = result;
@@ -4486,7 +4544,7 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 					const agentId = params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
-					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.fresh);
+					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.fresh, params.desktop);
 					const placeholder: SingleResult = {
 						agent: params.agent,
 						agentId,
@@ -4533,6 +4591,7 @@ export default function (pi: ExtensionAPI) {
 						verify: params.verify,
 						agentId: params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
 						fresh: params.fresh,
+						desktop: params.desktop,
 					},
 				);
 				const isError = isFailedResult(result);

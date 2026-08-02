@@ -303,7 +303,10 @@ final class SubagentModelSettingsTests: XCTestCase {
         XCTAssertTrue(source.contains("if (event.toolName !== \"read\") return"))
         XCTAssertTrue(source.contains("isSkillReadPath(requestedPath)"))
         XCTAssertTrue(source.contains("cannot load SKILL.md files or files under a skills directory"))
-        XCTAssertTrue(source.contains("writePromptToTempFile(agent.name, agent.systemPrompt)"))
+        XCTAssertTrue(source.contains("promptParts.push(agent.systemPrompt)"))
+        // Desktop grants append the shared Computer Use child policy to the same prompt file.
+        XCTAssertTrue(source.contains("if (desktopGrant.granted) promptParts.push(DESKTOP_GRANT_CHILD_POLICY)"))
+        XCTAssertTrue(source.contains("promptParts.join(\"\\n\\n\")"))
         XCTAssertTrue(source.contains("if (PIPIUI_SUBAGENT_EXT) args.push(\"-e\", PIPIUI_SUBAGENT_EXT);"))
         // `--no-extensions` would also cut the provider server-tool extensions workers use.
         XCTAssertFalse(source.contains("args.push(\"--no-extensions\")"))
