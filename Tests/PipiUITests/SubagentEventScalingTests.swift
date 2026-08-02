@@ -287,6 +287,39 @@ final class SubagentEventScalingTests: XCTestCase {
         XCTAssertEqual(store.agent(forID: "c")?.state, .running)
     }
 
+    func testDisplayOrderPutsFinishedFirstThenRunningByActivity() throws {
+        let store = SubagentStore()
+        let t = Date(timeIntervalSince1970: 100)
+        store.handle(event(kind: "start", id: "a", extra: ["name": "alpha", "task": "t"]), observedAt: t)
+        store.handle(event(kind: "start", id: "b", extra: ["name": "beta", "task": "t"]), observedAt: t + 1)
+        store.handle(event(kind: "start", id: "c", extra: ["name": "gamma", "task": "t"]), observedAt: t + 2)
+        store.handle(event(kind: "update", id: "b", extra: ["output": "x"]), observedAt: t + 3)
+        store.handle(event(kind: "update", id: "c", extra: ["output": "y"]), observedAt: t + 4)
+        // a 最后结束：end 是它的最后一次观测 → 已完成部分的最顶端
+        store.handle(event(kind: "end", id: "a", extra: ["ok": true]), observedAt: t + 5)
+
+        XCTAssertEqual(store.displayOrder.map(\.id), ["a", "c", "b"])
+        XCTAssertTrue(store.displayOrder.dropFirst().allSatisfy { $0.state == .running })
+    }
+
+    func testDisplayOrderRunningGroupReordersByActivityAndFinishingAgentLeavesRunningTail() throws {
+        let store = SubagentStore()
+        let t = Date(timeIntervalSince1970: 200)
+        store.handle(event(kind: "start", id: "a", extra: ["name": "alpha"]), observedAt: t)
+        store.handle(event(kind: "start", id: "b", extra: ["name": "beta"]), observedAt: t + 1)
+        store.handle(event(kind: "start", id: "c", extra: ["name": "gamma"]), observedAt: t + 2)
+        XCTAssertEqual(store.displayOrder.map(\.id), ["c", "b", "a"])
+
+        // a 最后动 → 排到运行组最前
+        store.handle(event(kind: "update", id: "a", extra: ["output": "z"]), observedAt: t + 3)
+        XCTAssertEqual(store.displayOrder.map(\.id), ["a", "c", "b"])
+
+        // c 结束：离开运行组，跳到已完成顶端（end 即其最近观测）
+        store.handle(event(kind: "end", id: "c", extra: ["ok": true]), observedAt: t + 4)
+        XCTAssertEqual(store.displayOrder.map(\.id), ["c", "a", "b"])
+        XCTAssertEqual(store.displayOrder.filter { $0.state == .running }.map(\.id), ["a", "b"])
+    }
+
     private func event(
         kind: String,
         id: String,

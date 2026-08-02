@@ -681,6 +681,8 @@ struct SubagentToolCardView: View {
 
     var body: some View {
         let presentation = SubagentPresentationScale.cardPresentation(for: agents)
+        let unit = PricingSettings.unit()
+        let rate = ModelPricing.Catalog.shared.exchangeRate
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "person.2")
@@ -692,7 +694,7 @@ struct SubagentToolCardView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 if presentation.totalCost > 0 {
-                    Text(String(format: "$%.3f", presentation.totalCost))
+                    Text(formatSpend(usdCost: presentation.totalCost, unit: unit, rate: rate))
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
@@ -1023,7 +1025,11 @@ enum SubagentToolCardStatus {
             let title = agent.listSubtitle.trimmingCharacters(in: .whitespacesAndNewlines)
             return title.isEmpty ? "思考中…" : title
         case .ok:
-            return "完成 · \(agent.turns) turns · " + String(format: "$%.3f", agent.cost)
+            return "完成 · \(agent.turns) turns · " + formatSpend(
+                usdCost: agent.cost,
+                unit: PricingSettings.unit(),
+                rate: ModelPricing.Catalog.shared.exchangeRate
+            )
         case .failed:
             return "失败 · " + String(agent.listSubtitle.prefix(60))
         case .aborted:
@@ -1538,7 +1544,15 @@ struct SubagentDoneBubbleView: View {
         guard let parsed else { return "子任务完成" }
         var parts = ["子任务完成", parsed.name, outcomeLabel]
         if let cost = parsed.cost, !cost.isEmpty {
-            parts.append("cost \(cost)")
+            if let usdCost = Double(cost) {
+                parts.append("cost " + formatSpend(
+                    usdCost: usdCost,
+                    unit: PricingSettings.unit(),
+                    rate: ModelPricing.Catalog.shared.exchangeRate
+                ))
+            } else {
+                parts.append("cost \(cost)") // 非数字兜底，原样显示
+            }
         }
         return parts.filter { !$0.isEmpty }.joined(separator: " · ")
     }

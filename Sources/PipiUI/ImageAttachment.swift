@@ -353,7 +353,9 @@ package enum ImageAttachment {
     }
 
     /// Remove path footnotes added by `messageWithAttachmentPaths` for UI display.
-    /// Keeps the user's real prose; safe no-op if no footer present.
+    /// Finds the footnote block anywhere in the text — not only at the end — because
+    /// the Vision fallback appends an OCR caption block after the note. Keeps the
+    /// user's real prose (and any OCR block); safe no-op if no valid footer present.
     package static func stripAttachmentPathsForDisplay(_ text: String) -> String {
         var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         // Tolerate trailing blank lines when matching the footer.
@@ -362,60 +364,61 @@ package enum ImageAttachment {
         }
         guard !lines.isEmpty else { return text }
 
-        let last = lines[lines.count - 1].trimmingCharacters(in: .whitespaces)
-        let isNote = last == attachmentDisplayNote
-            || last.hasPrefix("(Images are also embedded multimodally")
-        guard isNote else { return text }
-
-        lines.removeLast()
-
-        // Optional blank line before the note (after path block).
-        if lines.last?.trimmingCharacters(in: .whitespaces).isEmpty == true {
-            lines.removeLast()
-        }
-
-        // Single: "Attached image file: <path>"
-        // Multi:  "Attached image files:" then one or more "- <path>" lines
-        if let idx = lines.lastIndex(where: { line in
+        // Find the note line anywhere in the text (last occurrence wins),
+        // not necessarily at the end (OCR block may follow).
+        guard let noteIdx = lines.lastIndex(where: { line in
             let t = line.trimmingCharacters(in: .whitespaces)
-            return t.hasPrefix("Attached image file: ") || t == "Attached image files:"
-        }) {
-            let header = lines[idx].trimmingCharacters(in: .whitespaces)
-            if header.hasPrefix("Attached image file: ") {
-                // Ensure nothing but optional blanks between header and note.
-                let between = lines[(idx + 1)...]
-                let onlyBlanks = between.allSatisfy { $0.trimmingCharacters(in: .whitespaces).isEmpty }
-                if onlyBlanks {
-                    lines.removeSubrange(idx...)
-                } else {
-                    return text
-                }
-            } else {
-                // Multi-file header; following non-empty lines must be "- " paths.
-                var end = idx + 1
-                while end < lines.count {
-                    let t = lines[end].trimmingCharacters(in: .whitespaces)
-                    if t.isEmpty { break }
-                    if t.hasPrefix("- ") {
-                        end += 1
-                    } else {
-                        return text
-                    }
-                }
-                // Require at least one path line for multi header.
-                guard end > idx + 1 else { return text }
-                let afterPaths = lines[end...]
-                let onlyBlanks = afterPaths.allSatisfy { $0.trimmingCharacters(in: .whitespaces).isEmpty }
-                guard onlyBlanks else { return text }
-                lines.removeSubrange(idx...)
-            }
+            return t == attachmentDisplayNote
+                || t.hasPrefix("(Images are also embedded multimodally")
+        }) else { return text }
+
+        // Walk backwards from the note over blank lines to the path header.
+        var headerIdx = noteIdx - 1
+        while headerIdx >= 0, lines[headerIdx].trimmingCharacters(in: .whitespaces).isEmpty {
+            headerIdx -= 1
+        }
+        guard headerIdx >= 0 else { return text }
+        let header = lines[headerIdx].trimmingCharacters(in: .whitespaces)
+
+        let isSingle = header.hasPrefix("Attached image file: ")
+        let isMulti = header == "Attached image files:"
+        guard isSingle || isMulti else { return text }
+
+        if isSingle {
+            // Single: only blank lines allowed between header and note.
+            let between = lines[(headerIdx + 1)..<noteIdx]
+            guard between.allSatisfy({ $0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return text }
         } else {
-            return text
+            // Multi: non-empty lines between header and note must be "- " paths, at least one.
+            var idx = headerIdx + 1
+            var pathCount = 0
+            while idx < noteIdx {
+                let t = lines[idx].trimmingCharacters(in: .whitespaces)
+                if t.isEmpty { break }
+                guard t.hasPrefix("- ") else { return text }
+                pathCount += 1
+                idx += 1
+            }
+            guard pathCount > 0 else { return text }
+            // Paths may be followed only by blank lines up to the note.
+            let afterPaths = lines[idx..<noteIdx]
+            guard afterPaths.allSatisfy({ $0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return text }
         }
 
-        // Remove one preceding empty line left by the appender.
-        if lines.last?.trimmingCharacters(in: .whitespaces).isEmpty == true {
-            lines.removeLast()
+        // Remove the whole block (header…note), plus one preceding blank line left by the appender.
+        lines.removeSubrange(headerIdx...noteIdx)
+        let blankBefore = headerIdx - 1
+        if blankBefore >= 0, blankBefore < lines.count,
+           lines[blankBefore].trimmingCharacters(in: .whitespaces).isEmpty {
+            lines.remove(at: blankBefore)
+        }
+
+        // Image-only messages: the footer was the very first content; drop the
+        // separator blank left in front of the trailing OCR caption block.
+        if headerIdx == 0 {
+            while lines.first?.trimmingCharacters(in: .whitespaces).isEmpty == true {
+                lines.removeFirst()
+            }
         }
 
         // Rejoin; trim only trailing whitespace/newlines from the result.

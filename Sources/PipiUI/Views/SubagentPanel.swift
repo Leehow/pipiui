@@ -59,6 +59,8 @@ struct SubagentPanel: View {
 
     private var header: some View {
         let summary = SubagentPresentationScale.summary(for: store.agents)
+        let unit = PricingSettings.unit()
+        let rate = ModelPricing.Catalog.shared.exchangeRate
         return HStack(spacing: 8) {
             Label("Subagents", systemImage: "person.2")
                 .font(.callout.weight(.semibold))
@@ -77,7 +79,7 @@ struct SubagentPanel: View {
             }
             Spacer()
             if summary.totalCost > 0 {
-                Text(String(format: "$%.4f", summary.totalCost))
+                Text(formatSpend(usdCost: summary.totalCost, unit: unit, rate: rate))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -212,9 +214,10 @@ struct SubagentPanel: View {
                     jumpToListBottom(proxy)
                 }
             }
-            .onChange(of: displayOrder.last?.id) { _, _ in
-                // 新 agent 到达（displayOrder 末尾变化）时跟随；状态/费用等
-                // 元素级更新不触发（末尾 id 不变），避免打扰用户浏览旧条目。
+            .onChange(of: displayOrder.max(by: { $0.started < $1.started })?.id) { _, _ in
+                // 新 agent 到达（最新启动者变化）时跟随；列表按活动排序后末尾不再代表新到者，
+                // 故以最新启动者为锚。状态/费用/活动重排等元素级更新不触发（started 不变），
+                // 避免打扰用户浏览旧条目。
                 DispatchQueue.main.async {
                     jumpToListBottom(proxy)
                 }
@@ -535,7 +538,9 @@ private struct AgentRow: View {
     }
 
     private var selectionArea: some View {
-        HStack(spacing: 8) {
+        let unit = PricingSettings.unit()
+        let rate = ModelPricing.Catalog.shared.exchangeRate
+        return HStack(spacing: 8) {
             // 树形缩进：depth 1 是主会话直接派出的
             if agent.depth > 1 {
                 Rectangle().fill(.clear)
@@ -595,7 +600,7 @@ private struct AgentRow: View {
             Spacer()
             VStack(alignment: .trailing, spacing: 1) {
                 if agent.cost > 0 {
-                    Text(String(format: "$%.3f", agent.cost))
+                    Text(formatSpend(usdCost: agent.cost, unit: unit, rate: rate))
                 }
                 durationText
             }

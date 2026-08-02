@@ -44,6 +44,54 @@ final class ImagePathResolverTests: XCTestCase {
         XCTAssertEqual(ImagePathResolver.attachmentPaths(fromMessageText: "普通文本"), [])
     }
 
+    // MARK: - Display strip when Vision fallback appends an OCR block after the footer
+
+    private static let attachmentNote = "(Images are also embedded multimodally; prefer viewing them directly. If you use the read tool, use the paths above — do not invent paths like /home/workdir/attachments/.)"
+
+    func testStripWhenOCRBlockFollowsFooter() {
+        // Mirrors VisionFallback.mergeIntoMessage: annotated footer + "\n\n" + caption block.
+        let text = """
+        看图
+
+        Attached image file: /Users/me/proj/.pi/attachments/a.png
+        \(Self.attachmentNote)
+
+        [图片已自动转为文字，当前模型不支持直接查看图片]
+        图片1：
+        [图片中的文字]
+        OCR 出来的内容
+        """
+        let stripped = ImageAttachment.stripAttachmentPathsForDisplay(text)
+        XCTAssertFalse(stripped.contains("Attached image file:"))
+        XCTAssertFalse(stripped.contains("do not invent paths"))
+        XCTAssertTrue(stripped.contains("看图"))
+        XCTAssertTrue(stripped.contains("[图片已自动转为文字"))
+        XCTAssertTrue(stripped.contains("OCR 出来的内容"))
+        XCTAssertEqual(
+            stripped,
+            "看图\n\n[图片已自动转为文字，当前模型不支持直接查看图片]\n图片1：\n[图片中的文字]\nOCR 出来的内容"
+        )
+    }
+
+    func testStripImageOnlyWhenOCRBlockFollowsFooter() {
+        let text = """
+        Attached image file: /Users/me/proj/.pi/attachments/a.png
+        \(Self.attachmentNote)
+
+        [图片已自动转为文字，当前模型不支持直接查看图片]
+        图片1：
+        [图片中的文字]
+        OCR 出来的内容
+        """
+        let stripped = ImageAttachment.stripAttachmentPathsForDisplay(text)
+        XCTAssertFalse(stripped.contains("Attached image file:"))
+        XCTAssertFalse(stripped.contains("do not invent paths"))
+        XCTAssertEqual(
+            stripped,
+            "[图片已自动转为文字，当前模型不支持直接查看图片]\n图片1：\n[图片中的文字]\nOCR 出来的内容"
+        )
+    }
+
     // MARK: - resolve order
 
     func testResolvePrefersKnownPathWhenExists() throws {

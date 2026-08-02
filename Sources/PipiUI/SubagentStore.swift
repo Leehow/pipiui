@@ -1587,23 +1587,21 @@ final class SubagentStore: ObservableObject {
         return (didMutate, lifecycleChanged)
     }
 
-    /// 按树序展开（父节点后紧跟其子孙），用于列表显示。
+    /// 活动序（与主会话按 modified 排序一致）：已完成在前、谁最后动谁排前，
+    /// 运行中整体垫底（组内同样按最近活动排序）。依据 UI 观测到的最近一次
+    /// 桥接事件 lastObservedAt；agent 终态后不再有事件，已完成部分的相对顺序稳定。
     var displayOrder: [SubagentInfo] {
-        var byParent: [String?: [SubagentInfo]] = [:]
-        for agent in agents {
-            byParent[agent.parentId, default: []].append(agent)
+        agents.sorted { lhs, rhs in
+            let lhsRunning = lhs.state == .running
+            let rhsRunning = rhs.state == .running
+            if lhsRunning != rhsRunning {
+                return !lhsRunning // 运行中放最下面
+            }
+            if lhs.lastObservedAt != rhs.lastObservedAt {
+                return lhs.lastObservedAt > rhs.lastObservedAt
+            }
+            return lhs.id < rhs.id
         }
-        // 根：parentId 为空，或父节点不在本树里（例如更上层是主会话）
-        let knownIds = Set(agents.map(\.id))
-        var result: [SubagentInfo] = []
-        func append(_ node: SubagentInfo) {
-            result.append(node)
-            for child in byParent[node.id] ?? [] { append(child) }
-        }
-        for agent in agents where agent.parentId == nil || !knownIds.contains(agent.parentId!) {
-            append(agent)
-        }
-        return result
     }
 
     func clearFinished() {
