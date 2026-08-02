@@ -668,6 +668,15 @@ final class ChatSession: ObservableObject, Identifiable {
     /// True between the user clicking Stop and the turn actually settling.
     /// Drives optimistic 'stopping…' UI so one click is visibly acknowledged.
     @Published var isStopping = false
+    /// True between `compaction_start` and `compaction_end`（或远端 get_state.isCompacting）。
+    /// 压缩占位据此显示「正在压缩上下文…」而不是「AI 正在思考…」。
+    @Published private(set) var isCompacting = false
+    /// 压缩开始时间（占位计时器）。
+    @Published private(set) var compactionStartedAt: Date?
+    /// 压缩触发原因：manual / threshold / overflow。
+    @Published private(set) var compactionReason: String?
+    /// 最近一次 compaction_end 的时间；get_state 采纳 isCompacting=true 前的过期窗口。
+    private var compactionEndedAt: Date?
     @Published var model: ModelInfo?
     @Published var availableModels: [ModelInfo] = []
     @Published var thinkingLevel = "off"
@@ -768,6 +777,16 @@ final class ChatSession: ObservableObject, Identifiable {
     static var stopEscalationSigtermDelay: TimeInterval = 6
     static var stopEscalationSigkillDelay: TimeInterval = 10
     static var stopEscalationShutdownDelay: TimeInterval = 16
+    /// 压缩中 Stop 的升级时间线（远短于前台 turn）：upstream 的 RPC abort 不中止
+    /// compaction（agent-session.abort() 不调 abortCompaction()），只能靠进程级兜底。
+    /// 目标数秒内复位且不损坏已落盘 session：compaction 条目只在结束时写入，
+    /// 中途杀进程 = 丢弃未完成的压缩，磁盘会话保持压缩前状态。
+    static var compactionStopSigtermDelay: TimeInterval = 1.5
+    static var compactionStopSigkillDelay: TimeInterval = 2.5
+    static var compactionStopShutdownDelay: TimeInterval = 4
+    /// get_state 的 isCompacting=true 快照若在最后一次 compaction_end 后不久到达
+    /// （请求早于压缩、响应晚于结束），视为过期，避免把已结束的压缩重新点亮。
+    static var compactionStateStaleWindow: TimeInterval = 3
     /// Notifies AppStore to persist / clear interrupted-path badges.
     var onInFlightChange: ((String, Bool) -> Void)?
     /// False after resuming a disk session that already has a real name.
@@ -1109,6 +1128,7 @@ final class ChatSession: ObservableObject, Identifiable {
             self.subagents.reconcileOrphanedNow()
             self.isStopping = false
             self.cancelStopEscalation()
+            self.clearCompactionState()
             self.isSendingFromQueue = false
             // Exit before the first transcript arrives must not leave the spinner up.
             self.isInitializing = false
@@ -1414,7 +1434,10 @@ final class ChatSession: ObservableObject, Identifiable {
         }
     }
 
-    private func applyState(_ data: J) {
+    /// 解析 `get_state` 响应。`isCompacting` 仅在本地未压缩时采纳远端值，且
+    /// 在最后一次 compaction_end 后的过期窗口内不采纳远端 true（请求早于压缩、
+    /// 响应晚于结束的过期快照会把已结束的压缩重新点亮）。
+    package func applyState(_ data: J) {
         if let pid = data["model"]["provider"].string, let mid = data["model"]["id"].string {
             let knownSupports = availableModels.first(where: {
                 $0.provider == pid && $0.modelId == mid
@@ -1450,6 +1473,21 @@ final class ChatSession: ObservableObject, Identifiable {
         if !isWorking, let remoteStreaming = data["isStreaming"].bool {
             isStreaming = remoteStreaming
             if !remoteStreaming { isStopping = false }
+        }
+        // 压缩态同理：只采纳远端 true；过期窗口内的 true 快照视为 stale（见上）。
+        if !isCompacting, let remoteCompacting = data["isCompacting"].bool {
+            let staleTrue = remoteCompacting
+                && compactionEndedAt.map { Date().timeIntervalSince($0) < Self.compactionStateStaleWindow }
+                    ?? false
+            if !staleTrue {
+                isCompacting = remoteCompacting
+                if remoteCompacting {
+                    if compactionStartedAt == nil { compactionStartedAt = Date() }
+                } else {
+                    compactionStartedAt = nil
+                    compactionReason = nil
+                }
+            }
         }
         // Prefer local non-placeholder over empty/stale get_state while optimistic auto-title is in flight.
         if let incoming = data["sessionName"].string {
@@ -1650,6 +1688,9 @@ final class ChatSession: ObservableObject, Identifiable {
             // Defensive: a stale stop flag must never bleed into the next turn.
             isStopping = false
             cancelStopEscalation()
+            // 压缩不可能与新 turn 重叠（pi 在 agent 循环内同步压缩）；防御性清理，
+            // 防止漏发的 compaction_end 把压缩态残留到新 turn。
+            clearCompactionState()
             isSendingFromQueue = false
             lastError = nil
             agentTurnActive = true
@@ -1658,6 +1699,9 @@ final class ChatSession: ObservableObject, Identifiable {
             isStreaming = false
             isStopping = false
             cancelStopEscalation()
+            // 防御性清理：正常流中 compaction_end 先于 settle 到达；若缺失（例如
+            // 压缩被进程级兜底中断后的残流），settle 必须收掉压缩态。
+            clearCompactionState()
             pendingStreamMessage = nil
             pendingToolRuns.removeAll(keepingCapacity: true)
             streaming.streamingItem = nil
@@ -1757,9 +1801,47 @@ final class ChatSession: ObservableObject, Identifiable {
         case "extension_error":
             appendSystem("扩展错误：\(e["error"].string ?? "?")")
         case "compaction_start":
-            appendSystem("正在压缩上下文…")
+            isCompacting = true
+            compactionStartedAt = Date()
+            compactionReason = e["reason"].string
+            appendSystem("正在压缩上下文…\(Self.compactionReasonLabel(compactionReason))")
+            Log.info("compaction_start reason=\(e["reason"].string ?? "?")", category: .session)
         case "compaction_end":
-            appendSystem("上下文压缩完成")
+            let aborted = e["aborted"].bool ?? false
+            let errorMessage = e["errorMessage"].string
+            let willRetry = e["willRetry"].bool ?? false
+            let reason = e["reason"].string ?? compactionReason ?? "?"
+            let duration = compactionStartedAt.map { Int(Date().timeIntervalSince($0)) } ?? 0
+            clearCompactionState()
+            // 竞态修复：压缩中 Stop 武装的是压缩专用短时间线（1.5s/2.5s/4s）。
+            // 若 compaction_end 先到而 turn 尚未 settle（isStopping 仍为 true），旧
+            // 短时间线会继续生效，把已离开压缩阶段的正常 post-compaction 工作过早
+            // restart。清掉压缩态后重排升级：token 自增作废旧闭包，且 isCompacting
+            // 已为 false，自动选回正常长时间线。settle / onExit / shutdown 仍照常取消。
+            if isStopping {
+                scheduleStopEscalation()
+            }
+            compactionEndedAt = Date()
+            if aborted {
+                appendSystem("上下文压缩已取消")
+                Log.warn(
+                    "compaction_end aborted reason=\(reason) duration=\(duration)s willRetry=\(willRetry)",
+                    category: .session
+                )
+            } else if let errorMessage, !errorMessage.isEmpty {
+                let short = String(errorMessage.prefix(300))
+                appendSystem("上下文压缩失败：\(short)")
+                Log.error(
+                    "compaction_end failed reason=\(reason) duration=\(duration)s error=\(errorMessage)",
+                    category: .session
+                )
+            } else {
+                appendSystem("上下文压缩完成")
+                Log.info(
+                    "compaction_end success reason=\(reason) duration=\(duration)s willRetry=\(willRetry)",
+                    category: .session
+                )
+            }
             // Compaction often reports null tokens/percent; refresh so footer drops stale %.
             refreshStats()
         default:
@@ -1941,6 +2023,22 @@ final class ChatSession: ObservableObject, Identifiable {
 
     private func appendSystem(_ text: String) {
         transcript.append(ChatItem(id: nextItemId(), role: "system", blocks: [.text(text)]))
+    }
+
+    /// 压缩生命周期清理：compaction_end / 新 turn / 进程退出 / shutdown。
+    private func clearCompactionState() {
+        isCompacting = false
+        compactionStartedAt = nil
+        compactionReason = nil
+    }
+
+    private static func compactionReasonLabel(_ reason: String?) -> String {
+        switch reason {
+        case "manual": return "（手动触发）"
+        case "threshold": return "（上下文超限）"
+        case "overflow": return "（上下文溢出恢复）"
+        default: return ""
+        }
     }
 
     // MARK: - Message conversion
@@ -3151,6 +3249,7 @@ final class ChatSession: ObservableObject, Identifiable {
         isStreaming = false
         isStopping = false
         cancelStopEscalation()
+        clearCompactionState()
         editingItemId = nil
         pendingStreamMessage = nil
         pendingToolRuns.removeAll(keepingCapacity: false)
@@ -3696,30 +3795,54 @@ final class ChatSession: ObservableObject, Identifiable {
         // Backstop: pi's abort can hang forever when the in-flight tool child ignores
         // its AbortSignal — tiered escalation (descendants SIGTERM → SIGKILL → kill+respawn)
         // guarantees `isStopping` never sticks past the shutdown delay.
+        // 压缩中 upstream 不会 abortCompaction，scheduleStopEscalation 自动改用压缩专用
+        // 短时间线（数秒内杀 pi + 按原会话重开，磁盘会话保持压缩前状态）。
         if proc?.isRunning == true {
+            if isCompacting {
+                Log.warn("stop during compaction: compaction-specific escalation armed", category: .session)
+            }
             scheduleStopEscalation()
         }
     }
 
     // MARK: - Stop escalation (foreground-turn backstop)
 
+    /// 压缩感知的时间线选择：压缩中 Stop 走数秒级短上限（upstream 无法中止
+    /// compaction，只能靠进程级兜底），否则走前台 turn 时间线。
+    func stopEscalationTimeline() -> (sigterm: TimeInterval, sigkill: TimeInterval, shutdown: TimeInterval) {
+        if isCompacting {
+            return (
+                Self.compactionStopSigtermDelay,
+                Self.compactionStopSigkillDelay,
+                Self.compactionStopShutdownDelay
+            )
+        }
+        return (
+            Self.stopEscalationSigtermDelay,
+            Self.stopEscalationSigkillDelay,
+            Self.stopEscalationShutdownDelay
+        )
+    }
+
     /// 前台 turn 停止超时兜底时间线。pi 的 abort 依赖工具自身的 AbortSignal，bash 工具
     /// 子进程无视信号（长 build/git/test）时 pi 永不 settle，`isStopping` 会一直挂着。
     /// 每级触发前双重校验：调度令牌仍当前（settle / 新 turn / 重载 / 退出已作废旧闭包）
     /// + `isStopping` 仍为真。Tier-1/2 只对后代进程发信号，绝不动 pi 进程本身。
     /// 可重复调度：连点 Stop 会用新令牌重排时间线，旧闭包自然作废。
+    /// 压缩中自动切换压缩专用短时间线（见 stopEscalationTimeline）。
     func scheduleStopEscalation() {
+        let timeline = stopEscalationTimeline()
         stopEscalationToken &+= 1
         let token = stopEscalationToken
-        scheduleStopEscalationStage(Self.stopEscalationSigtermDelay, token: token) { [weak self] in
+        scheduleStopEscalationStage(timeline.sigterm, token: token) { [weak self] in
             guard let self else { return }
             self.stopEscalationSignal(SIGTERM)
             self.flash("停止超时，正在强制终止后台命令")
         }
-        scheduleStopEscalationStage(Self.stopEscalationSigkillDelay, token: token) { [weak self] in
+        scheduleStopEscalationStage(timeline.sigkill, token: token) { [weak self] in
             self?.stopEscalationSignal(SIGKILL)
         }
-        scheduleStopEscalationStage(Self.stopEscalationShutdownDelay, token: token) { [weak self] in
+        scheduleStopEscalationStage(timeline.shutdown, token: token) { [weak self] in
             self?.stopEscalationRestart()
         }
     }
@@ -3867,6 +3990,7 @@ final class ChatSession: ObservableObject, Identifiable {
         // Any pending stop escalation must not outlive the kill path it triggers.
         cancelStopEscalation()
         isStopping = false
+        clearCompactionState()
         processStartCancelled = true
         cancelSideChannelTitle()
         unbindQuotaMonitor()

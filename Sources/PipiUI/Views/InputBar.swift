@@ -1506,7 +1506,7 @@ struct InputBar: View {
                 .layoutPriority(1)
                 .padding(.vertical, 6)
 
-            if session.isStreaming || session.isSendingFromQueue || session.isStopping {
+            if session.isStreaming || session.isSendingFromQueue || session.isStopping || session.isCompacting {
                 Button(action: { session.abort() }) {
                     Group {
                         if session.isStopping {
@@ -1526,7 +1526,9 @@ struct InputBar: View {
                 .buttonStyle(.plain)
                 .help(session.isStopping
                       ? "正在停止…"
-                      : (session.messageQueue.isEmpty ? "中止当前回复" : "中止并发送队首"))
+                      : (session.isCompacting
+                          ? "停止压缩（数秒内恢复）"
+                          : (session.messageQueue.isEmpty ? "中止当前回复" : "中止并发送队首")))
             }
 
             Button(action: { [router = composerRouter] in router.send() }) {

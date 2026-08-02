@@ -30,6 +30,8 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { registerMainSessionCompactionHook } from "./main-compaction.ts";
+import { registerQoderContextWindowCompat } from "./qoder-context-window.ts";
 import {
 	resolveSubagentToolSelection,
 	resolveDesktopGrant,
@@ -1458,6 +1460,40 @@ function formatElapsedMs(ms: number): string {
 	const h = Math.floor(m / 60);
 	const rm = m % 60;
 	return `${h}h${rm}m`;
+}
+
+/** Compact live snapshot of in-flight background workers, for the boss system prompt.
+ *  Returns null when nothing is in flight (zero cost in the normal case). */
+function formatInFlightWorkersBlock(now: number): string | null {
+	if (runningAgents.size === 0) return null;
+	const lines: string[] = ["## Background workers in flight (live this turn)"];
+	let anyStalledOrVanished = false;
+	for (const [agentId, handle] of runningAgents) {
+		const idleSec = Math.floor((now - handle.lastActivityAt) / 1000);
+		const elapsed = formatElapsedMs(now - handle.startedAt);
+		const title = (handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 60)) || "(untitled)";
+		let state: string;
+		if (isHandleVanished(handle, now)) {
+			anyStalledOrVanished = true;
+			state = "VANISHED — process gone with no report";
+		} else if (idleSec * 1000 >= STALL_THRESHOLD_MS) {
+			anyStalledOrVanished = true;
+			state = `STALLED — idle ${idleSec}s`;
+		} else {
+			state = `running ${elapsed}, idle ${idleSec}s`;
+		}
+		lines.push(`- \`${agentId}\` (${title}) — ${state}`);
+	}
+	if (anyStalledOrVanished) {
+		lines.push(
+			"A stalled or vanished worker is NOT fine and NOT \"everything is normal\". Before answering the user or declaring anything done, account for every worker above: call `subagent_status`, then recover each stalled/vanished one (abort + re-dispatch by a materially different route, or continue the same agentId). Do not claim success or normalcy while any worker above is stalled or vanished.",
+		);
+	} else {
+		lines.push(
+			"All still running. If the user asks about progress, call `subagent_status` rather than answering from memory.",
+		);
+	}
+	return lines.join("\n");
 }
 
 /**
@@ -3785,6 +3821,13 @@ const SecretaryCommitParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	// 主会话上下文压缩走有界快路径（thinking off 的 LLM 摘要 → 确定性摘要 → pi 内置兜底）。
+	// 见 main-compaction.ts：不覆盖 worker（PIPIUI_AGENT_DEPTH 守卫）。
+	registerMainSessionCompactionHook(pi);
+	// Qoder CN / Qwen 3.8-Max-Preview contextWindow 修复：按 API default tier
+	// 归一化 model.contextWindow（真实影响 pi shouldCompact/session stats），
+	// 并用 vendored stream 保持请求 model_config 的 API 默认档。
+	registerQoderContextWindowCompat(pi);
 	pi.on("session_start", (_event, ctx) => {
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
 		initializeDoneDeliveryStore(pi, piSessionId);
@@ -3802,6 +3845,7 @@ export default function (pi: ExtensionAPI) {
 				systemPrompt: `${systemPrompt}\n\n${isolation}`,
 			};
 		});
+
 
 		// The PipiUI extension is supplied explicitly with -e and loads before global
 		// extensions. Superpowers sees this marker in its later context handler and uses
@@ -3874,6 +3918,18 @@ export default function (pi: ExtensionAPI) {
 			};
 		});
 	}
+
+	// Live in-flight worker reminder, registered unconditionally (not under the isolation
+	// env-var flag, which children only set for their own process): the boss process must
+	// see it. runningAgents is only populated in a dispatching process, so this is naturally
+	// self-scoping — empty when nothing is in flight, and every boss turn while a background
+	// worker is outstanding gets a fresh snapshot of what is still owed, so the boss can
+	// never answer "fine" over a stalled or vanished worker.
+	pi.on("before_agent_start", (event) => {
+		const inflight = formatInFlightWorkersBlock(Date.now());
+		if (!inflight) return;
+		return { systemPrompt: `${event.systemPrompt.trimEnd()}\n\n${inflight}` };
+	});
 
 	// Prompt text is not a security boundary. The runtime-owned closeout secretary
 	// may write only its state records and may not perform destructive cleanup.

@@ -2528,6 +2528,38 @@ struct TurnElapsedText: View {
     }
 }
 
+/// 等待占位文案选择（可测）：压缩中显示压缩态而不是「AI 正在思考」；Stop 优先。
+enum WaitingPlaceholderChoice: Equatable {
+    case media(String)
+    case stopping
+    case compacting
+    case thinking
+
+    init(mediaBusy: Bool, mediaStatus: String?, isStopping: Bool, isCompacting: Bool) {
+        if mediaBusy {
+            self = .media(mediaStatus ?? "正在处理…")
+        } else if isStopping {
+            self = .stopping
+        } else if isCompacting {
+            self = .compacting
+        } else {
+            self = .thinking
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .media(let status): return status
+        case .stopping: return "正在停止…"
+        case .compacting: return "正在压缩上下文…"
+        case .thinking: return "AI 正在思考…"
+        }
+    }
+
+    /// 压缩态使用 compactionStartedAt 计时，其余使用 turnWallClockStartedAt。
+    var usesCompactionTimer: Bool { self == .compacting }
+}
+
 /// 用户已发送、assistant 尚无可展示 block 时的轻量等待提示。
 struct WaitingPlaceholderView: View {
     let message: String

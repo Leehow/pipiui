@@ -2,9 +2,9 @@ import XCTest
 @testable import PipiUI
 
 final class StickToBottomLogicTests: XCTestCase {
-    func testLiveScrollUnpinsInsideSoftBand() {
-        // 20pt off bottom is inside the 72pt re-pin band but must still unpin on wheel,
-        // otherwise scrollToBottom fights every notch.
+    func testLiveScrollUnpinsBeyondEdgeEpsilon() {
+        // A real wheel/trackpad move beyond the edge epsilon must unpin before
+        // scrollToBottom can fight the gesture.
         let desired = StickToBottomLogic.desiredPin(
             currentlyPinned: true,
             distanceFromBottom: 20,
@@ -48,24 +48,54 @@ final class StickToBottomLogicTests: XCTestCase {
         XCTAssertNil(desired)
     }
 
-    func testFarFromBottomUnpinsEvenWithoutLiveScrollFlag() {
+    func testProgrammaticGeometryFarFromBottomDoesNotUnpin() {
         let desired = StickToBottomLogic.desiredPin(
             currentlyPinned: true,
             distanceFromBottom: 100,
             userLiveScroll: false,
             allowUnpin: true
         )
-        XCTAssertEqual(desired, false)
+        XCTAssertNil(desired)
     }
 
-    func testNearBottomRepinsWhenUnpinned() {
+    func testProgrammaticGeometryNearBottomDoesNotRepinWhenUnpinned() {
         let desired = StickToBottomLogic.desiredPin(
             currentlyPinned: false,
-            distanceFromBottom: 10,
+            distanceFromBottom: 0,
             userLiveScroll: false,
             allowUnpin: true
         )
+        XCTAssertNil(desired)
+    }
+
+    func testUserLiveScrollAtBottomRepinsWhenUnpinned() {
+        let desired = StickToBottomLogic.desiredPin(
+            currentlyPinned: false,
+            distanceFromBottom: StickToBottomLogic.rePinThreshold,
+            userLiveScroll: true,
+            allowUnpin: true
+        )
         XCTAssertEqual(desired, true)
+    }
+
+    func testEndOfUpwardLiveScrollCannotReverseItsUnpinInsideFormerSoftBand() {
+        let unpin = StickToBottomLogic.desiredPin(
+            currentlyPinned: true,
+            distanceFromBottom: 20,
+            userLiveScroll: true,
+            allowUnpin: true
+        )
+        XCTAssertEqual(unpin, false)
+
+        // didEndLiveScroll can report the same gesture again. At 20pt from the
+        // bottom it must remain unpinned rather than re-entering the old 72pt band.
+        let endOfSameGesture = StickToBottomLogic.desiredPin(
+            currentlyPinned: false,
+            distanceFromBottom: 20,
+            userLiveScroll: true,
+            allowUnpin: true
+        )
+        XCTAssertNil(endOfSameGesture)
     }
 
     func testDistanceDocumentEndFlipped() {

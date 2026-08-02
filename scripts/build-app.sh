@@ -12,8 +12,8 @@ for arg in "$@"; do
       cat <<'EOF'
 Usage: ./scripts/build-app.sh [--skip-tests]
 
-  Runs swift test (unless --skip-tests), then ./make-app.sh
-  (release → build/PipiUI.app).
+  Runs swift test + the node gates (qoder 200K compat, main compaction),
+  unless --skip-tests, then ./make-app.sh (release → build/PipiUI.app).
 
   Canonical ship path per CONSTITUTION.md. For debug-only iteration use: swift run
 EOF
@@ -31,6 +31,16 @@ if [[ "$SKIP_TESTS" -eq 0 ]]; then
   if ! swift test; then
     echo "swift test failed; if XCTest is unavailable try: swift run PipiUITestRunner" >&2
     echo "Re-run with --skip-tests to package without tests." >&2
+    exit 1
+  fi
+  # Node gate: qoder 200K context-window compat + main-session compaction
+  # (real extension loaded through the installed pi runtime). A failure here
+  # must block packaging just like a swift test failure.
+  echo "==> node --test Tests/Node/test-qoder-context-window.mjs Tests/Node/test-main-compaction.mjs"
+  if ! node --test \
+    Tests/Node/test-qoder-context-window.mjs \
+    Tests/Node/test-main-compaction.mjs; then
+    echo "node tests failed; Re-run with --skip-tests to package without tests." >&2
     exit 1
   fi
 else

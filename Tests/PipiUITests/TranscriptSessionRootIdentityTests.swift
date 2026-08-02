@@ -336,6 +336,16 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
 
     func testInitialOffsetBottomAnchorIsRoleScoped() throws {
         let source = try chatDetailSource()
+        let anchorStart = try XCTUnwrap(
+            source.range(of: "private struct InitialBottomOffsetAnchor: ViewModifier")?.lowerBound
+        )
+        let anchorEnd = try XCTUnwrap(
+            source.range(
+                of: "private struct TranscriptViewportHeightKey: PreferenceKey",
+                range: anchorStart..<source.endIndex
+            )?.lowerBound
+        )
+        let initialAnchor = String(source[anchorStart..<anchorEnd])
         let contentStart = try XCTUnwrap(
             source.range(of: "private var transcriptContent: some View")?.lowerBound
         )
@@ -347,12 +357,19 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         )
         let content = String(source[contentStart..<contentEnd])
 
-        // macOS 15+: role-scoped initial-offset anchor, availability-gated and
-        // pin-gated (unpinned warm-history keeps its natural top first frame).
-        XCTAssertTrue(source.contains("#available(macOS 15.0, *)"))
-        XCTAssertTrue(source.contains(".defaultScrollAnchor(.bottom, for: .initialOffset)"))
-        XCTAssertFalse(source.contains(".defaultScrollAnchor(.bottom)"))
-        XCTAssertFalse(source.contains("defaultScrollAnchor(_ anchor"))
+        // macOS 15+: one role-scoped modifier shape stays mounted across pin
+        // changes. Only its initial anchor value changes, so the native scroll
+        // root is not replaced; warm unpinned history starts naturally at top.
+        XCTAssertTrue(initialAnchor.contains("#available(macOS 15.0, *)"))
+        XCTAssertTrue(
+            initialAnchor.contains(
+                ".defaultScrollAnchor(pinned ? .bottom : .top, for: .initialOffset)"
+            )
+        )
+        XCTAssertFalse(initialAnchor.contains("#available(macOS 15.0, *), pinned"))
+        XCTAssertFalse(initialAnchor.contains("if pinned"))
+        XCTAssertFalse(initialAnchor.contains(".defaultScrollAnchor(.bottom)"))
+        XCTAssertFalse(initialAnchor.contains("defaultScrollAnchor(_ anchor"))
         // macOS 14 fallback: the settled-key cover hides the fresh root until the
         // explicit pinned jump lands.
         XCTAssertTrue(content.contains(".opacity(transcriptCoveredByBottomSettle ? 0 : 1)"))

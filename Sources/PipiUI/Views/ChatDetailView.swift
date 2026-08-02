@@ -614,9 +614,11 @@ private struct ChatDetailViewBody: View {
             // AppKit exact-top edge in `StickToBottomTracker`, never by row ids.
             // macOS 15+: pin only the *initial* offset of a fresh scroll root to
             // the bottom (role-scoped — unlike the bare `.defaultScrollAnchor`,
-            // it never re-applies while the user scrolls through history). Gated
-            // on pin so an unpinned warm-history session keeps its natural top
-            // first frame. macOS 14 has no public API for the role, so the
+            // it never re-applies while the user scrolls through history). The
+            // modifier stays mounted when pin changes; only its initial anchor
+            // value changes, so the native scroll root keeps its identity. An
+            // unpinned warm-history session uses a natural top first frame.
+            // macOS 14 has no public API for the role, so the
             // settled-key cover below hides the first frame instead.
             .modifier(InitialBottomOffsetAnchor(pinned: session.pinTranscriptToBottom))
             // macOS 14 fallback: hide a fresh pinned scroll root until the
@@ -1144,12 +1146,18 @@ private struct StreamingTranscriptRows: View {
                     TurnElapsedText(startedAt: startedAt)
                         .id(transcriptID("streaming-turn-elapsed"))
                 }
-            } else if !browsingHistory && (session.isWorking || session.mediaBusy) {
+            } else if !browsingHistory && (session.isWorking || session.isCompacting || session.mediaBusy) {
+                let placeholder = WaitingPlaceholderChoice(
+                    mediaBusy: session.mediaBusy,
+                    mediaStatus: session.mediaStatus,
+                    isStopping: session.isStopping,
+                    isCompacting: session.isCompacting
+                )
                 WaitingPlaceholderView(
-                    message: session.mediaBusy
-                        ? (session.mediaStatus ?? "正在处理…")
-                        : (session.isStopping ? "正在停止…" : "AI 正在思考…"),
-                    turnStartedAt: session.turnWallClockStartedAt
+                    message: placeholder.message,
+                    turnStartedAt: placeholder.usesCompactionTimer
+                        ? session.compactionStartedAt
+                        : session.turnWallClockStartedAt
                 )
                 .id(transcriptID("waiting-placeholder"))
             }
@@ -1332,14 +1340,15 @@ private struct RightPanelDivider: View {
 /// through history and fights the wheel — `.bottom for .initialOffset` only
 /// pins the very first frame of a fresh scroll root. macOS 14 has no public
 /// API for the role, so the fallback cover (`BottomSettledCover`) hides the
-/// transcript until the explicit pinned scroll lands. Gated on the pin state:
-/// an unpinned warm-history session keeps its natural top first frame.
+/// transcript until the explicit pinned scroll lands. On macOS 15+, keep one
+/// stable modifier shape across pin changes: only the initial anchor value
+/// changes, while an unpinned warm-history root starts naturally at the top.
 private struct InitialBottomOffsetAnchor: ViewModifier {
     let pinned: Bool
 
     func body(content: Content) -> some View {
-        if #available(macOS 15.0, *), pinned {
-            content.defaultScrollAnchor(.bottom, for: .initialOffset)
+        if #available(macOS 15.0, *) {
+            content.defaultScrollAnchor(pinned ? .bottom : .top, for: .initialOffset)
         } else {
             content
         }
@@ -1412,10 +1421,12 @@ enum StickPinEdge: Equatable {
 
 /// Pure pin/unpin decision for stick-to-bottom (unit-tested).
 enum StickToBottomLogic {
-    /// Soft band used to *re*-pin when the user scrolls back near the end.
-    static let rePinThreshold: CGFloat = 72
+    /// Strict edge epsilon used to *re*-pin after an explicit user scroll.
+    /// Keep this aligned with the release distance so one upward gesture cannot
+    /// unpin and then re-pin itself at `didEndLiveScroll` inside a wider band.
+    static let rePinThreshold: CGFloat = 4
     /// On wheel/trackpad live scroll, leave the absolute bottom by more than this → unpin
-    /// immediately. A 72pt band let `scrollToBottom` win against small wheel ticks.
+    /// immediately. The tiny epsilon filters elastic/rounding noise at the edge.
     static let liveScrollUnpinDistance: CGFloat = 4
 
     /// Distance from the pin edge in document coordinates.
@@ -1479,15 +1490,16 @@ enum StickToBottomLogic {
         userLiveScroll: Bool,
         allowUnpin: Bool
     ) -> Bool? {
-        if userLiveScroll, allowUnpin, currentlyPinned, distanceFromBottom > liveScrollUnpinDistance {
+        // Geometry changes from content growth, layout, or tracker attachment
+        // are observations, not user intent. They must never change pin state.
+        guard userLiveScroll else { return nil }
+
+        if allowUnpin, currentlyPinned, distanceFromBottom > liveScrollUnpinDistance {
             return false
         }
         let nearBottom = distanceFromBottom <= rePinThreshold
-        if nearBottom {
-            return currentlyPinned ? nil : true
-        }
-        if allowUnpin, currentlyPinned {
-            return false
+        if !currentlyPinned, nearBottom {
+            return true
         }
         return nil
     }
@@ -1875,7 +1887,8 @@ struct StickToBottomTracker: NSViewRepresentable {
                     self.anchorLayoutObserved = true
                     self.scheduleTopEdgeEvaluation()
                 }
-                // 安装时只允许「确认在底部 → pin」，避免布局未完成时误 unpin
+                // Attachment only seeds geometry. It must preserve the current pin
+                // state; layout-time distances are not evidence of user intent.
                 updatePinFromUserScroll(allowUnpin: false)
                 // Seed the exact-top edge with the current geometry; later
                 // frame/bounds notifications re-evaluate it continuously. The
