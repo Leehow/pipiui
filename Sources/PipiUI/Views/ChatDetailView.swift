@@ -136,6 +136,32 @@ enum ShortTranscriptGravity {
     }
 }
 
+/// macOS 14 fallback decision for the session-switch first-frame flash
+/// (unit-tested). A fresh pinned scroll root renders its first frame at the
+/// window head before the explicit bottom scroll lands (~50ms later), so on
+/// macOS 14 — which has no role-scoped initial-offset anchor — the transcript
+/// is covered until the current root's pinned bottom jump has been applied.
+/// macOS 15+ uses `.defaultScrollAnchor(.bottom, for: .initialOffset)` instead
+/// and never needs the cover (`fallbackNeeded == false`).
+enum BottomSettledCover {
+    /// - Parameters:
+    ///   - pinned: session currently pinned to the bottom.
+    ///   - settledSessionKey: bridge key of the last scroll root whose pinned
+    ///     bottom scroll already landed; `nil` before the first settle.
+    ///   - currentSessionKey: current scroll root's bridge key.
+    ///   - fallbackNeeded: false on macOS 15+ (the role API owns the initial
+    ///     offset, so the cover would be pointless).
+    static func needsCover(
+        pinned: Bool,
+        settledSessionKey: String?,
+        currentSessionKey: String,
+        fallbackNeeded: Bool
+    ) -> Bool {
+        guard fallbackNeeded, pinned else { return false }
+        return settledSessionKey != currentSessionKey
+    }
+}
+
 struct ChatDetailView: View {
     @EnvironmentObject var store: AppStore
     let session: ChatSession
@@ -177,6 +203,14 @@ private struct ChatDetailViewBody: View {
     /// `StickToBottomTracker`); it only keeps the anchored row in place while a
     /// page is prepended above it.
     @State private var scrollTopID: String? = nil
+    /// macOS 14 fallback: bridge key of the scroll root whose first pinned
+    /// bottom scroll has already landed. `nil` until the current root settles,
+    /// so a fresh root's first body hides immediately (key mismatch) without
+    /// waiting for an onChange round-trip. Reset when the outer `.id` root is
+    /// recreated (bridge key change) — returning to an earlier key must also
+    /// re-settle. Stale async callbacks are key-guarded and can never reveal a
+    /// newer session early.
+    @State private var bottomSettledSessionKey: String?
     /// Hosted above the lazy transcript so row recycling cannot dismiss or corrupt it.
     @State private var finishedGroupPresentation: AssistantBlockLayout.FinishedGroupPresentation?
     @State private var runningToolDetail: RunningToolDetailPresentation?
@@ -206,6 +240,28 @@ private struct ChatDetailViewBody: View {
     /// so the right panel does not flash as an overlay on ordinary launches.
     private var effectiveDetailLayoutWidth: CGFloat {
         detailLayoutWidth > 1 ? detailLayoutWidth : 1000
+    }
+
+    /// macOS 14 lacks the role-scoped initial-offset anchor; the settled-key
+    /// cover must hide a fresh pinned scroll root until its explicit bottom
+    /// scroll lands. macOS 15+ delegates the first frame to the role API.
+    private var bottomSettledFallbackNeeded: Bool {
+        if #available(macOS 15.0, *) { return false }
+        return true
+    }
+
+    /// macOS 14 first-frame cover for session switches: a key mismatch means the
+    /// current scroll root has not yet landed at the bottom, so the transcript
+    /// stays hidden (background color only) until `markBottomSettledIfCurrent`
+    /// records the current key after the explicit jump. Unpinned warm-history
+    /// sessions never cover and are never forced to the bottom.
+    private var transcriptCoveredByBottomSettle: Bool {
+        BottomSettledCover.needsCover(
+            pinned: session.pinTranscriptToBottom,
+            settledSessionKey: bottomSettledSessionKey,
+            currentSessionKey: session.bridgeRoutingKey,
+            fallbackNeeded: bottomSettledFallbackNeeded
+        )
     }
 
     init(session: ChatSession, streaming: StreamingState, agentStore: SubagentStore) {
@@ -314,6 +370,9 @@ private struct ChatDetailViewBody: View {
             runningToolDetail = nil
             // A fresh scroll root (outer `.id`) will re-report its top row id.
             scrollTopID = nil
+            // The fresh root must re-settle before the macOS 14 cover lifts;
+            // re-entering an earlier key also needs a fresh settle.
+            bottomSettledSessionKey = nil
         }
         .onChange(of: session.id) { _, _ in
             // The detail chrome is reused across sessions. Reset only transient view state;
@@ -566,6 +625,17 @@ private struct ChatDetailViewBody: View {
             // the user while browsing history. The `.top` anchor only reports the
             // top-visible row and keeps it in place while a page is prepended.
             .scrollPosition(id: $scrollTopID, anchor: .top)
+            // macOS 15+: pin only the *initial* offset of a fresh scroll root to
+            // the bottom (role-scoped — unlike the bare `.defaultScrollAnchor`,
+            // it never re-applies while the user scrolls through history). Gated
+            // on pin so an unpinned warm-history session keeps its natural top
+            // first frame. macOS 14 has no public API for the role, so the
+            // settled-key cover below hides the first frame instead.
+            .modifier(InitialBottomOffsetAnchor(pinned: session.pinTranscriptToBottom))
+            // macOS 14 fallback: hide a fresh pinned scroll root until the
+            // explicit bottom scroll lands (~50ms), so the window head never
+            // flashes before the jump. The loading veil overlay stays visible.
+            .opacity(transcriptCoveredByBottomSettle ? 0 : 1)
             .overlay(alignment: .bottomTrailing) {
                 if !session.pinTranscriptToBottom {
                     Button {
@@ -660,9 +730,12 @@ private struct ChatDetailViewBody: View {
         guard session.pinTranscriptToBottom else { return }
         widthRecoverGeneration += 1
         let generation = widthRecoverGeneration
+        let key = session.bridgeRoutingKey
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 32_000_000)
-            guard generation == widthRecoverGeneration, session.pinTranscriptToBottom else { return }
+            guard generation == widthRecoverGeneration,
+                  session.pinTranscriptToBottom,
+                  session.bridgeRoutingKey == key else { return }
             applyJumpToLatest(proxy)
         }
     }
@@ -674,16 +747,20 @@ private struct ChatDetailViewBody: View {
         if retry { scrollNeedsRetry = true }
         guard !scrollCoalesceScheduled else { return }
         scrollCoalesceScheduled = true
+        // Stale guards: the scroll root is recreated per bridge key, so a jump
+        // scheduled for an earlier session must never scroll (or settle) a newer
+        // session's root.
+        let key = session.bridgeRoutingKey
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             scrollCoalesceScheduled = false
             let needsRetry = scrollNeedsRetry
             scrollNeedsRetry = false
-            guard session.pinTranscriptToBottom else { return }
+            guard session.pinTranscriptToBottom, session.bridgeRoutingKey == key else { return }
             applyJumpToLatest(proxy)
             if needsRetry {
                 for delay in [0.05, 0.2] as [TimeInterval] {
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                        guard session.pinTranscriptToBottom else { return }
+                        guard session.pinTranscriptToBottom, session.bridgeRoutingKey == key else { return }
                         applyJumpToLatest(proxy)
                     }
                 }
@@ -696,6 +773,24 @@ private struct ChatDetailViewBody: View {
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             proxy.scrollTo(transcriptID("bottom"), anchor: .bottom)
+        }
+        markBottomSettledIfCurrent()
+    }
+
+    /// Records the current scroll root as bottom-settled on the next main runloop
+    /// so the macOS 14 cover lifts only after `scrollTo` has been applied, not in
+    /// the same frame it was scheduled. Key-guarded: a stale callback from a
+    /// previous session must never settle (and thus reveal) a newer session's
+    /// cover. Disables implicit animation on the reveal.
+    private func markBottomSettledIfCurrent() {
+        let key = session.bridgeRoutingKey
+        DispatchQueue.main.async {
+            guard self.session.bridgeRoutingKey == key else { return }
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                self.bottomSettledSessionKey = key
+            }
         }
     }
 
@@ -1223,6 +1318,25 @@ private struct RightPanelDivider: View {
             }
         }
         .help("拖动调整右侧面板宽度")
+    }
+}
+
+/// macOS 15+ role-scoped initial-offset bottom anchor. Unlike the bare,
+/// role-less default bottom anchor — which re-applies while the user scrolls
+/// through history and fights the wheel — `.bottom for .initialOffset` only
+/// pins the very first frame of a fresh scroll root. macOS 14 has no public
+/// API for the role, so the fallback cover (`BottomSettledCover`) hides the
+/// transcript until the explicit pinned scroll lands. Gated on the pin state:
+/// an unpinned warm-history session keeps its natural top first frame.
+private struct InitialBottomOffsetAnchor: ViewModifier {
+    let pinned: Bool
+
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *), pinned {
+            content.defaultScrollAnchor(.bottom, for: .initialOffset)
+        } else {
+            content
+        }
     }
 }
 

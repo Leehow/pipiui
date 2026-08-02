@@ -191,9 +191,11 @@ final class ShortTranscriptGravityTests: XCTestCase {
         // weakened by the gravity change. The unconditional default bottom
         // anchor is gone — bottom pinning is owned by the explicit
         // `scrollTo("bottom")` + StickToBottomTracker, so it cannot fight the
-        // user while browsing history (scroll-oscillation fix).
+        // user while browsing history (scroll-oscillation fix). Only the
+        // macOS 15+ role-scoped *initial-offset* anchor is allowed.
         XCTAssertTrue(content.contains(".scrollPosition(id: $scrollTopID, anchor: .top)"))
-        XCTAssertFalse(content.contains("defaultScrollAnchor"))
+        XCTAssertFalse(content.contains(".defaultScrollAnchor(.bottom)"))
+        XCTAssertTrue(source.contains(".defaultScrollAnchor(.bottom, for: .initialOffset)"))
         XCTAssertTrue(source.contains("scrollTo(transcriptID(\"bottom\"), anchor: .bottom)"))
         XCTAssertTrue(content.contains(".id(TranscriptSessionRootIdentity(sessionKey: session.bridgeRoutingKey))"))
     }

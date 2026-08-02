@@ -319,11 +319,45 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         // scrollTopID survives purely as the prepend anchor; it no longer feeds
         // a loading trigger (see testHistoryTopLoadingUsesClipGeometryEdgeNotRowIds).
         XCTAssertFalse(content.contains("handleScrollTopReport"))
-        // Bottom pinning must not compete with the user while browsing history.
+        // Bottom pinning must not compete with the user while browsing history:
+        // the bare default bottom anchor is banned; only the macOS 15+ role-scoped
+        // *initial-offset* anchor is allowed (see testInitialOffsetBottomAnchorIsRoleScoped).
         XCTAssertFalse(content.contains(".defaultScrollAnchor(.bottom)"))
-        XCTAssertFalse(content.contains("defaultScrollAnchor"))
+        XCTAssertTrue(source.contains(".defaultScrollAnchor(.bottom, for: .initialOffset)"))
         XCTAssertFalse(content.contains("historyWindowEnd"))
         XCTAssertFalse(content.contains("transcriptHistoryWindowEnd"))
+    }
+
+    func testInitialOffsetBottomAnchorIsRoleScoped() throws {
+        let source = try chatDetailSource()
+        let contentStart = try XCTUnwrap(
+            source.range(of: "private var transcriptContent: some View")?.lowerBound
+        )
+        let contentEnd = try XCTUnwrap(
+            source.range(
+                of: "private func scheduleChatColumnWidthSettleRepin",
+                range: contentStart..<source.endIndex
+            )?.lowerBound
+        )
+        let content = String(source[contentStart..<contentEnd])
+
+        // macOS 15+: role-scoped initial-offset anchor, availability-gated and
+        // pin-gated (unpinned warm-history keeps its natural top first frame).
+        XCTAssertTrue(source.contains("#available(macOS 15.0, *)"))
+        XCTAssertTrue(source.contains(".defaultScrollAnchor(.bottom, for: .initialOffset)"))
+        XCTAssertFalse(source.contains(".defaultScrollAnchor(.bottom)"))
+        XCTAssertFalse(source.contains("defaultScrollAnchor(_ anchor"))
+        // macOS 14 fallback: the settled-key cover hides the fresh root until the
+        // explicit pinned jump lands; the top anchor stays unchanged.
+        XCTAssertTrue(content.contains(".opacity(transcriptCoveredByBottomSettle ? 0 : 1)"))
+        XCTAssertTrue(content.contains(".modifier(InitialBottomOffsetAnchor"))
+        XCTAssertTrue(content.contains(".scrollPosition(id: $scrollTopID, anchor: .top)"))
+        XCTAssertTrue(source.contains("BottomSettledCover.needsCover"))
+        XCTAssertTrue(source.contains("bottomSettledSessionKey"))
+        XCTAssertTrue(source.contains("proxy.scrollTo(transcriptID(\"bottom\"), anchor: .bottom)"))
+        XCTAssertTrue(source.contains("markBottomSettledIfCurrent"))
+        // Stale jump/settle callbacks must be key-guarded.
+        XCTAssertTrue(source.contains("session.bridgeRoutingKey == key"))
     }
 
     func testStreamingFollowUsesAppKitContentGrowthInsteadOfObjectWillChangeScrollTo() throws {
