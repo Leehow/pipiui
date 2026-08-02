@@ -288,7 +288,7 @@ final class ComputerContractTests: XCTestCase {
         let childEnvBlock = subagent[
             childEnvStart.lowerBound..<childSpawnStart.lowerBound
         ]
-        XCTAssertTrue(childEnvBlock.contains("}, true);"))
+        XCTAssertTrue(childEnvBlock.contains("}, desktopGrant.granted);"))
         XCTAssertTrue(assembly.contains(
             #"env["PIPIUI_COMPUTER_EXT"] = p"#
         ))

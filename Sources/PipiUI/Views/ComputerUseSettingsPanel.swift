@@ -26,7 +26,7 @@ struct ComputerUseSettingsPanel: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
             }
-            Text("默认关闭。打开后进入无限制模式：所有顶层会话和 subagent 都可调用 computer / open_application，不做会话、应用、高风险或写操作确认。")
+            Text("默认关闭。打开后主会话可用 computer / open_application（无会话、应用、高风险或写操作确认）。全局开关只提供能力：subagent 仍须在派发任务时显式设置 desktop 授权（user-requested / ui-verify），未授权则完全不注入桌面工具。", )
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
