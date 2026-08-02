@@ -1,0 +1,19 @@
+[
+  {
+    "name": "initial snapshot omits revision",
+    "sessionID": "session-1",
+    "revision": null,
+    "expectedBody": {
+      "sessionID": "session-1"
+    }
+  },
+  {
+    "name": "snapshot includes nonnegative revision",
+    "sessionID": "session-2",
+    "revision": 42,
+    "expectedBody": {
+      "sessionID": "session-2",
+      "revision": 42
+    }
+  }
+]
