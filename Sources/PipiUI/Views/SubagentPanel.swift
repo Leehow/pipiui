@@ -61,42 +61,61 @@ struct SubagentPanel: View {
         let summary = SubagentPresentationScale.summary(for: store.agents)
         let unit = PricingSettings.unit()
         let rate = ModelPricing.Catalog.shared.exchangeRate
+        // 单行布局：窄面板时左簇（标题/计数）优先截断隐藏，右簇（费用/清空/关闭）
+        // fixedSize + 高 layoutPriority 保持完整可用，绝不换行成两排。
         return HStack(spacing: 8) {
             Label("Subagents", systemImage: "person.2")
                 .font(.callout.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.tail)
             Text("\(summary.totalCount) 个")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
             if summary.runningCount > 0 {
                 Text("\(summary.runningCount) 运行中")
                     .font(.caption)
                     .foregroundStyle(.green)
+                    .lineLimit(1)
             }
             if summary.failedCount > 0 {
                 Text("\(summary.failedCount) 失败")
                     .font(.caption)
                     .foregroundStyle(.red)
+                    .lineLimit(1)
             }
-            Spacer()
+            Spacer(minLength: 4)
             if summary.totalCost > 0 {
                 Text(formatSpend(usdCost: summary.totalCost, unit: unit, rate: rate))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
             }
-            Button("清空已完成") {
+            Button {
                 panelPageFromNewest = 0
                 store.clearFinished()
+            } label: {
+                Text("清空已完成")
+                    .font(.caption)
+                    .lineLimit(1)
             }
-                .buttonStyle(.plain)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .disabled(summary.finishedCount == 0)
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .disabled(summary.finishedCount == 0)
+            .fixedSize(horizontal: true, vertical: false)
+            .layoutPriority(1)
             Button(action: onClose) {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
+            .fixedSize()
+            .layoutPriority(1)
         }
+        .clipped()
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
     }
