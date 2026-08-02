@@ -1217,10 +1217,16 @@ struct InputBar: View {
     @State private var showToolStats: Bool = false
     /// Observes the shared singleton trigger; the sheet computes from the live session.
     @ObservedObject private var toolStatsPresenter = ToolStatsPresenter.shared
-    /// 30-day ledger total (CNY) for the balance popover, refreshed on each open.
+    /// 30-day ledger total (CNY) for the balance popover, refreshed on each open
+    /// and every few seconds while the popover stays open.
     @State private var balanceLast30Days: Double?
+    /// Guards against overlapping refreshes when the periodic popover timer fires
+    /// while a previous reload is still computing.
+    @State private var balanceReloadInFlight: Bool = false
     /// Measured width of the status row; drives compact vs wide without ViewThatFits.
     @State private var statusBarWidth: CGFloat = 0
+    /// Whether the queue strip preview shows the full head text instead of the one-liner.
+    @State private var queuePreviewExpanded = false
 
     init(session: ChatSession) {
         self.session = session
@@ -1318,6 +1324,12 @@ struct InputBar: View {
             composerRouter.bind(to: session)
             refreshSlashPalette()
         }
+        .onChange(of: session.messageQueue.count) { _, _ in
+            queuePreviewExpanded = false
+        }
+        .onChange(of: session.messageQueue.first?.id) { _, _ in
+            queuePreviewExpanded = false
+        }
         .onChange(of: draftState.text) { _, _ in
             session.pruneOrphanDraftPastes()
             refreshSlashPalette()
@@ -1358,10 +1370,27 @@ struct InputBar: View {
                 Text("排队 \(session.messageQueue.count) 条")
                     .font(.caption.weight(.semibold))
                 if let preview = queuePreview {
-                    Text(preview)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    Button {
+                        queuePreviewExpanded.toggle()
+                    } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: 4) {
+                            Text(queuePreviewExpanded ? queueFullText : preview)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(queuePreviewExpanded ? nil : 1)
+                                .multilineTextAlignment(.leading)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundStyle(.tertiary)
+                                .rotationEffect(.degrees(queuePreviewExpanded ? 180 : 0))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("队首消息预览")
+                    .accessibilityValue(queuePreviewExpanded ? "已展开" : "已收起")
+                    .accessibilityHint("点击展开或收起队首完整内容")
                 }
             }
             Spacer()
@@ -1401,6 +1430,18 @@ struct InputBar: View {
         }
         if trimmed.count <= 40 { return "「\(trimmed)」" }
         return "「\(trimmed.prefix(40))…」"
+    }
+
+    /// Full head queued text for the expanded strip, with attachment path footnotes
+    /// stripped the same way `restoreQueueToDraft` does for the composer.
+    private var queueFullText: String {
+        guard let text = session.messageQueue.first?.text else { return "" }
+        let stripped = ImageAttachment.stripAttachmentPathsForDisplay(text)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if stripped.isEmpty {
+            return session.messageQueue.first?.images.isEmpty == false ? "(图片)" : ""
+        }
+        return "「\(stripped)」"
     }
 
     // MARK: - Attachment strip
@@ -1938,7 +1979,14 @@ struct InputBar: View {
             contextDetailRow("本会话消耗", display.sessionSpend)
             contextDetailRow("30天内消耗", balanceLast30Days == nil ? "…" : display.last30DaysSpend)
         }
-        .onAppear { reloadBalanceLast30Days() }
+        // 只在 popover 打开期间刷新：任务随 popover 关闭自动取消，未开 popover
+        // 的会话不产生任何计算；同时打开多个 popover 也各自只刷新自己的数字。
+        .task {
+            while !Task.isCancelled {
+                reloadBalanceLast30Days()
+                try? await Task.sleep(for: .seconds(15))
+            }
+        }
     }
 
     /// Lazy, non-blocking refresh of the 30-day total in raw pi USD (`.ledger`)
@@ -1946,12 +1994,17 @@ struct InputBar: View {
     /// render time. Mirrors SettingsSheet.reloadUsage: detached utility task +
     /// MainActor hop.
     private func reloadBalanceLast30Days() {
+        guard !balanceReloadInFlight else { return }
+        balanceReloadInFlight = true
         // 只统计当前余额提供方（deepseek/moonshot/siliconflow/openrouter）自己账户的
         // 消耗：ledger 行按 model id 归属过滤，pi 会话回填按 message.provider 过滤。
         let bp = session.model?.balanceProvider
         Task.detached(priority: .utility) {
             guard let bp else {
-                await MainActor.run { balanceLast30Days = 0 }
+                await MainActor.run {
+                    balanceLast30Days = 0
+                    balanceReloadInFlight = false
+                }
                 return
             }
             let records = TokenUsageStats.loadSharedRecords()
@@ -1974,6 +2027,7 @@ struct InputBar: View {
             )
             await MainActor.run {
                 balanceLast30Days = report.total.cost + backfill
+                balanceReloadInFlight = false
             }
         }
     }
