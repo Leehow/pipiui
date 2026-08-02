@@ -79,6 +79,51 @@ final class StickToBottomLogicTests: XCTestCase {
         XCTAssertEqual(d, 500) // 1000 - 500
     }
 
+    func testDistanceFromDocumentStartFlippedTopIsZero() {
+        // Normal flipped transcript: document start at y=0; fully scrolled up → 0.
+        let visible = CGRect(x: 0, y: 0, width: 300, height: 400)
+        let d = StickToBottomLogic.distanceFromDocumentStart(
+            visible: visible,
+            contentHeight: 1000,
+            documentIsFlipped: true
+        )
+        XCTAssertEqual(d, 0)
+    }
+
+    func testDistanceFromDocumentStartFlippedGrowsWithScroll() {
+        // Scrolled 42pt down the flipped document → 42pt from the document start.
+        let visible = CGRect(x: 0, y: 42, width: 300, height: 400)
+        let d = StickToBottomLogic.distanceFromDocumentStart(
+            visible: visible,
+            contentHeight: 1000,
+            documentIsFlipped: true
+        )
+        XCTAssertEqual(d, 42)
+    }
+
+    func testDistanceFromDocumentStartNonFlippedTopIsZero() {
+        // Non-flipped origin is bottom-left: at the document top the viewport's
+        // maxY equals the content height.
+        let visible = CGRect(x: 0, y: 600, width: 300, height: 400)
+        let d = StickToBottomLogic.distanceFromDocumentStart(
+            visible: visible,
+            contentHeight: 1000,
+            documentIsFlipped: false
+        )
+        XCTAssertEqual(d, 0)
+    }
+
+    func testDistanceFromDocumentStartNonFlippedGrowsWithScroll() {
+        // 42pt of scroll leaves the top 42pt of the document unreachable.
+        let visible = CGRect(x: 0, y: 558, width: 300, height: 400)
+        let d = StickToBottomLogic.distanceFromDocumentStart(
+            visible: visible,
+            contentHeight: 1000,
+            documentIsFlipped: false
+        )
+        XCTAssertEqual(d, 42)
+    }
+
     func testDistanceDocumentStartFlipped() {
         let visible = CGRect(x: 0, y: 40, width: 300, height: 400)
         let d = StickToBottomLogic.distanceFromPinEdge(

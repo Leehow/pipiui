@@ -230,7 +230,7 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertTrue(transcript.contains("ForEach(presentation.rows"))
         XCTAssertTrue(transcript.contains("Array(items[window.range])"))
         XCTAssertTrue(transcript.contains("visibleCount: windowItems.count"))
-        XCTAssertTrue(transcript.contains("TranscriptRenderWindow.pageSize"))
+        XCTAssertTrue(transcript.contains("TranscriptRenderWindow.resolve"))
         XCTAssertTrue(transcript.contains("VStack(alignment: .leading"))
         XCTAssertFalse(transcript.contains("LazyVStack"))
         XCTAssertFalse(transcript.contains("LazyStack"))
@@ -256,9 +256,9 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertFalse(transcript.contains("trackPlannedWindow"))
         XCTAssertTrue(transcript.contains("transcriptOldestLoadedPage"))
         XCTAssertTrue(transcript.contains("TranscriptHistoryPrepender.prepend"))
-        // Scroll reports may only act while unpinned.
+        // History loading may only act while unpinned (the near-top gate).
         XCTAssertTrue(transcript.contains("guard !session.pinTranscriptToBottom"))
-        XCTAssertTrue(transcript.contains("scrollTopID"))
+        XCTAssertTrue(transcript.contains("topLoadingEnabled"))
 
         let history = try XCTUnwrap(transcript.range(of: "ForEach(presentation.rows")?.lowerBound)
         let streaming = try XCTUnwrap(
@@ -269,6 +269,37 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         )
         XCTAssertLessThan(history, streaming)
         XCTAssertLessThan(streaming, bottom)
+    }
+
+    func testHistoryTopLoadingUsesClipGeometryEdgeNotRowIds() throws {
+        let source = try chatDetailSource()
+        let start = try XCTUnwrap(
+            source.range(of: "private struct StreamingTranscriptRows: View")?.lowerBound
+        )
+        let end = try XCTUnwrap(
+            source.range(
+                of: "private struct TranscriptLoadingOverlay: View",
+                range: start..<source.endIndex
+            )?.lowerBound
+        )
+        let transcript = String(source[start..<end])
+
+        // The id-report loading pipeline is gone entirely: no handler, no
+        // per-anchor dedupe key, no id→page mapping, no scrollTopID observation.
+        XCTAssertFalse(transcript.contains("handleScrollTopReport"))
+        XCTAssertFalse(transcript.contains("lastPrependTriggerID"))
+        XCTAssertFalse(transcript.contains("visiblePage(from:"))
+        XCTAssertFalse(transcript.contains(".onChange(of: scrollTopID)"))
+        // The tracker receives the top-loading gate and the one-page prepend edge.
+        XCTAssertTrue(transcript.contains("topLoadingEnabled:"))
+        XCTAssertTrue(transcript.contains("onNearTop:"))
+        XCTAssertTrue(transcript.contains("StickToBottomTracker("))
+        XCTAssertTrue(transcript.contains("pinEdge: .documentEnd"))
+        // The callback still goes through the pure one-way prepender and guards pin.
+        XCTAssertTrue(transcript.contains("TranscriptHistoryPrepender.prepend"))
+        XCTAssertTrue(transcript.contains("guard !session.pinTranscriptToBottom"))
+        XCTAssertTrue(transcript.contains("transcriptOldestLoadedPage"))
+        XCTAssertTrue(transcript.contains("latestStartPage(itemCount: items.count)"))
     }
 
     func testScrollPositionReportsTopRowWithoutWindowReplacement() throws {
@@ -285,7 +316,9 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         let content = String(source[contentStart..<contentEnd])
 
         XCTAssertTrue(content.contains(".scrollPosition(id: $scrollTopID, anchor: .top)"))
-        XCTAssertTrue(content.contains("scrollTopID: scrollTopID"))
+        // scrollTopID survives purely as the prepend anchor; it no longer feeds
+        // a loading trigger (see testHistoryTopLoadingUsesClipGeometryEdgeNotRowIds).
+        XCTAssertFalse(content.contains("handleScrollTopReport"))
         // Bottom pinning must not compete with the user while browsing history.
         XCTAssertFalse(content.contains(".defaultScrollAnchor(.bottom)"))
         XCTAssertFalse(content.contains("defaultScrollAnchor"))

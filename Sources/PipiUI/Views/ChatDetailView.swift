@@ -84,9 +84,11 @@ struct TranscriptRenderWindow: Equatable {
 
 /// One-step prepend decision for history browsing. Pure and unit-tested so the
 /// feedback-breaking rule can never regress into a bidirectional window again:
-/// the top-visible page may only pull **one** older page in, never remove pages at
-/// the newest end, and repeated reports of the same visible page are idempotent
-/// (after the first decrement the new start lies below the reported page).
+/// the reached top page may only pull **one** older page in, never remove pages
+/// at the newest end, and once the start moves the call is naturally idempotent
+/// (the reached top then lies below the new start). The trigger is the AppKit
+/// clip-geometry near-top edge; the caller reports the oldest loaded page as the
+/// reached page, so `prepend(currentStartPage: 5, visiblePage: 5) == 4`.
 enum TranscriptHistoryPrepender {
     /// - Returns: the new oldest loaded page (`currentStartPage - 1`) when the
     ///   top-visible page has reached the oldest loaded page and older pages
@@ -171,8 +173,9 @@ private struct ChatDetailViewBody: View {
     /// Real user prompt ids whose complete assistant turn is folded.
     @State private var collapsedUserTurnIDs: Set<String> = []
     /// Top-most visible transcript row id, reported by `.scrollPosition(id:anchor:)`.
-    /// Deriving the visible page from this id lets the sliding window follow the
-    /// viewport without any pagination buttons or whole-tree window replacement.
+    /// It no longer drives history loading (that is the AppKit near-top edge in
+    /// `StickToBottomTracker`); it only keeps the anchored row in place while a
+    /// page is prepended above it.
     @State private var scrollTopID: String? = nil
     /// Hosted above the lazy transcript so row recycling cannot dismiss or corrupt it.
     @State private var finishedGroupPresentation: AssistantBlockLayout.FinishedGroupPresentation?
@@ -505,7 +508,6 @@ private struct ChatDetailViewBody: View {
                     streaming: streaming,
                     agentStore: agentStore,
                     collapsedUserTurnIDs: $collapsedUserTurnIDs,
-                    scrollTopID: scrollTopID,
                     viewportHeight: transcriptViewportHeight,
                     onOpenFinishedGroup: presentFinishedGroup,
                     onOpenRunningTool: presentRunningTool,
@@ -828,8 +830,6 @@ private struct StreamingTranscriptRows: View {
     @ObservedObject var streaming: StreamingState
     @ObservedObject var agentStore: SubagentStore
     @Binding var collapsedUserTurnIDs: Set<String>
-    /// Top-most visible row id, mirrored from the parent's `.scrollPosition(id:)`.
-    let scrollTopID: String?
     /// Transcript viewport height measured at the scroll-container level by the
     /// parent. Drives the pinned short-content bottom gravity.
     let viewportHeight: CGFloat
@@ -841,13 +841,8 @@ private struct StreamingTranscriptRows: View {
     /// History head while unpinned: the oldest rendered page, or `nil` for the
     /// default latest two pages (pinned/live or not yet browsed). Only ever
     /// decreases via one-page prepends; the newest end is never deleted, so a
-    /// scroll report cannot shrink the window and feed back into itself.
+    /// geometry trigger cannot shrink the window and feed back into itself.
     @State private var transcriptOldestLoadedPage: Int?
-    /// The scroll report that caused the last prepend. Repeated reports of the
-    /// same top row must not prepend twice (the anchored row is maintained above
-    /// the newly inserted page by `.scrollPosition`). Reset on re-pin / session
-    /// switch so the same row can trigger again after a fresh latest window.
-    @State private var lastPrependTriggerID: String?
 
     var body: some View {
         let items = session.transcript
@@ -862,6 +857,12 @@ private struct StreamingTranscriptRows: View {
         let windowItems = Array(items[window.range])
         // History pages were prepended; the window end still includes the newest item.
         let browsingHistory = !session.pinTranscriptToBottom && transcriptOldestLoadedPage != nil
+        // History-top loading gate for the AppKit near-top edge: unpinned and
+        // older pages still exist. True even before the first prepend, so the
+        // very first scroll to the top starts history loading.
+        let effectiveStartPage = transcriptOldestLoadedPage
+            ?? TranscriptRenderWindow.latestStartPage(itemCount: items.count)
+        let topLoadingEnabled = !session.pinTranscriptToBottom && effectiveStartPage > 0
         let presentation = session.transcriptPlanner.presentation(
             items: windowItems,
             toolRuns: streaming.toolRuns,
@@ -1058,19 +1059,20 @@ private struct StreamingTranscriptRows: View {
                 .frame(height: 1)
                 .id(transcriptID("bottom"))
                 .background {
-                    // Always mounted: it also owns the "scrolled back near the
-                    // bottom → re-pin" decision while history pages are loaded.
+                    // Always mounted: it owns the "scrolled back near the bottom →
+                    // re-pin" decision and the near-top history-prepend edge.
                     StickToBottomTracker(
                         isPinned: $session.pinTranscriptToBottom,
-                        pinEdge: .documentEnd
+                        pinEdge: .documentEnd,
+                        topLoadingEnabled: topLoadingEnabled,
+                        onNearTop: requestHistoryPrepend
                     )
                 }
         }
         // No window-replacement identity: the container must stay alive across
         // window prepends so `.scrollPosition` can anchor the top-visible row.
-        .onChange(of: scrollTopID) { _, newValue in
-            handleScrollTopReport(newValue)
-        }
+        // History loading no longer reads row ids: the AppKit near-top edge in
+        // `StickToBottomTracker` fires `requestHistoryPrepend`.
         .onChange(of: session.pinTranscriptToBottom) { _, newValue in
             if newValue {
                 // Explicit transition: history browsing ends (jump-to-latest button
@@ -1078,70 +1080,36 @@ private struct StreamingTranscriptRows: View {
                 // pages; the viewport is already bottom-pinned by the explicit
                 // scroll / StickToBottomTracker, so deleting above is safe.
                 transcriptOldestLoadedPage = nil
-                lastPrependTriggerID = nil
                 session.transcriptPlanner.invalidate()
             }
         }
         .onChange(of: session.id) { _, _ in
             transcriptOldestLoadedPage = nil
-            lastPrependTriggerID = nil
             session.transcriptPlanner.invalidate()
         }
         .onChange(of: session.bridgeRoutingKey) { _, _ in
             transcriptOldestLoadedPage = nil
-            lastPrependTriggerID = nil
         }
     }
 
-    /// Prepends exactly one older page when the top-visible row reaches the oldest
-    /// loaded page — and only while unpinned. Repeated reports of the same row are
-    /// idempotent (the anchored row stays put above the inserted page, and
-    /// `TranscriptHistoryPrepender` no-ops once the start moved below the report).
-    /// This is the only place a scroll report may grow the window; it can never
-    /// delete pages, so `scrollPosition` cannot feed a shrink back into layout.
-    private func handleScrollTopReport(_ scopedID: String?) {
+    /// Prepends exactly one older page when the user reaches the document top —
+    /// and only while unpinned. Called by `StickToBottomTracker`'s near-top edge
+    /// (AppKit clip geometry), never from row ids, so it fires regardless of which
+    /// row sits at the viewport top (or whether the 16pt padding leaves the anchor
+    /// id nil). The document top is the oldest loaded page, so the pure prepender
+    /// gets `visiblePage == startPage`: one page per edge, stops at page 0, and
+    /// the newest end is never deleted.
+    private func requestHistoryPrepend() {
         guard !session.pinTranscriptToBottom else { return }
-        guard scopedID != lastPrependTriggerID else { return }
         let items = session.transcript
-        guard let visiblePage = visiblePage(from: scopedID, items: items) else { return }
-        // Marker rows map to the latest page and never sit at the window head, so
-        // they can never trigger a prepend (visible > start).
         let startPage = transcriptOldestLoadedPage
             ?? TranscriptRenderWindow.latestStartPage(itemCount: items.count)
         guard let newStart = TranscriptHistoryPrepender.prepend(
             currentStartPage: startPage,
-            visiblePage: visiblePage
+            visiblePage: startPage
         ) else { return }
-        lastPrependTriggerID = scopedID
         transcriptOldestLoadedPage = newStart
         session.transcriptPlanner.invalidate()
-    }
-
-    /// Map the reported top-most row id back to a transcript page. Every rendered
-    /// row id is a `ChatItem.id` (`planTranscript` coalesces assistant spans under
-    /// their last item id), so an id → index lookup is exact for every row.
-    private func visiblePage(from scopedID: String?, items: [ChatItem]) -> Int? {
-        guard let scopedID,
-              let localID = TranscriptRenderIdentity.local(
-                  fromScoped: scopedID,
-                  sessionKey: session.bridgeRoutingKey
-              ) else { return nil }
-        // Marker rows only exist at the transcript end.
-        switch localID {
-        case "bottom", "streaming", "streaming-turn-elapsed", "waiting-placeholder":
-            return TranscriptRenderWindow.latestPage(itemCount: items.count)
-        default:
-            break
-        }
-        // Fast path: sequential `item-N` ids map 1:1 onto transcript indices.
-        if localID.hasPrefix("item-"),
-           let serial = Int(localID.dropFirst("item-".count)),
-           serial >= 1, serial <= items.count,
-           items[serial - 1].id == localID {
-            return (serial - 1) / TranscriptRenderWindow.pageSize
-        }
-        guard let index = items.firstIndex(where: { $0.id == localID }) else { return nil }
-        return index / TranscriptRenderWindow.pageSize
     }
 
     private func transcriptID(_ localID: String) -> String {
@@ -1351,6 +1319,22 @@ enum StickToBottomLogic {
         }
     }
 
+    /// Distance from the document start (oldest content) in document coordinates.
+    /// The normal flipped transcript starts at y=0 and the visible rect's minY
+    /// grows as the user scrolls down; non-flipped documents start at the
+    /// maximum y, so the distance is `contentHeight - visible.maxY`. At the
+    /// document top the distance is 0 and it grows with scroll.
+    static func distanceFromDocumentStart(
+        visible: CGRect,
+        contentHeight: CGFloat,
+        documentIsFlipped: Bool
+    ) -> CGFloat {
+        if documentIsFlipped {
+            return visible.minY
+        }
+        return contentHeight - visible.maxY
+    }
+
     /// Clip-view origin that places the requested document edge at the viewport edge.
     /// Keeping this geometry pure makes AppKit content-growth following testable.
     static func pinnedOriginY(
@@ -1389,16 +1373,70 @@ enum StickToBottomLogic {
     }
 }
 
+/// Pure edge state machine for the near-top history trigger (unit-tested).
+///
+/// The transcript's `StickToBottomTracker` feeds every clip/document geometry
+/// change into `step`. A prepend grows the document upward, so the distance from
+/// the document start can never be used as a level trigger — the *edge* is: fire
+/// exactly once when the viewport enters the top band, never again while it stays
+/// inside, and only after it has left the band may the next entry fire again.
+/// Disabled (pinned, or no older page left) resets the state and never fires.
+enum TranscriptNearTopTrigger {
+    /// Viewport is "near the document top" when within this many points of the
+    /// document start. Tolerates the transcript's 16pt padding plus slack; never
+    /// requires an exact 0.
+    static let nearTopThreshold: CGFloat = 96
+
+    struct State: Equatable {
+        var isNearTop = false
+    }
+
+    /// - Parameters:
+    ///   - state: persistent edge state, owned by the coordinator (never written
+    ///     into SwiftUI state).
+    ///   - distanceFromDocumentStart: `StickToBottomLogic.distanceFromDocumentStart`.
+    ///   - enabled: false while pinned or when the effective start page is 0.
+    ///   - threshold: top band size; defaults to `nearTopThreshold`.
+    /// - Returns: `true` exactly once per `false → true` near-top edge while enabled.
+    static func step(
+        state: inout State,
+        distanceFromDocumentStart: CGFloat,
+        enabled: Bool,
+        threshold: CGFloat = nearTopThreshold
+    ) -> Bool {
+        guard enabled else {
+            state.isNearTop = false
+            return false
+        }
+        let isNear = distanceFromDocumentStart <= threshold
+        defer { state.isNearTop = isNear }
+        return isNear && !state.isNearTop
+    }
+}
+
 /// 挂到 ScrollView 贴底锚点：用户手势更新 pin 状态；内容增高时，如果仍
 /// pinned，直接移动 AppKit clip view。这样流式增长不再触发 SwiftUI scrollTo，
-/// 也不会把新的状态写回动态高度布局图。
+/// 也不会把新的状态写回动态高度布局图。同一定位还承担历史顶部加载：通过
+/// clip/document 几何边沿触发 `onNearTop`（见 `TranscriptNearTopTrigger`）。
 struct StickToBottomTracker: NSViewRepresentable {
     @Binding var isPinned: Bool
     var threshold: CGFloat = StickToBottomLogic.rePinThreshold
     var pinEdge: StickPinEdge = .documentEnd
+    /// History-top loading gate: `true` while unpinned and the effective window
+    /// start page is above 0. While false the near-top edge state is reset and
+    /// `onNearTop` never fires.
+    var topLoadingEnabled: Bool = false
+    /// Fired exactly once per false→true near-top edge while `topLoadingEnabled`.
+    var onNearTop: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(isPinned: $isPinned, threshold: threshold, pinEdge: pinEdge)
+        Coordinator(
+            isPinned: $isPinned,
+            threshold: threshold,
+            pinEdge: pinEdge,
+            topLoadingEnabled: topLoadingEnabled,
+            onNearTop: onNearTop
+        )
     }
 
     func makeNSView(context: Context) -> NSView {
@@ -1411,8 +1449,20 @@ struct StickToBottomTracker: NSViewRepresentable {
         context.coordinator.isPinned = $isPinned
         context.coordinator.threshold = threshold
         context.coordinator.pinEdge = pinEdge
+        // Refresh the history-top gate and callback on every body pass so a
+        // session rebind/switch can never leave a stale closure behind.
+        let loadingGateChanged = context.coordinator.topLoadingEnabled != topLoadingEnabled
+        context.coordinator.topLoadingEnabled = topLoadingEnabled
+        context.coordinator.onNearTop = onNearTop
         // Do not re-attach on every SwiftUI body pass — only when not yet wired.
         context.coordinator.ensureAttached(from: nsView)
+        // The gate just flipped (e.g. the user unpinned while already at the
+        // document top, or re-pinned): re-evaluate the near-top edge once with
+        // the current geometry so the first prepend does not depend on another
+        // scroll event arriving.
+        if loadingGateChanged {
+            context.coordinator.scheduleNearTopEvaluation()
+        }
         // Re-apply only if SwiftUI reset style to legacy (applyIfNeeded is a no-op otherwise).
         if let sv = context.coordinator.attachedScrollView {
             OverlayScrollers.applyIfNeeded(to: sv)
@@ -1427,6 +1477,11 @@ struct StickToBottomTracker: NSViewRepresentable {
         var isPinned: Binding<Bool>
         var threshold: CGFloat
         var pinEdge: StickPinEdge
+        /// History-top loading gate, refreshed by `updateNSView` each body pass.
+        var topLoadingEnabled: Bool
+        /// Near-top edge callback, refreshed by `updateNSView` each body pass so a
+        /// rebind can never fire a stale session's closure.
+        var onNearTop: (() -> Void)?
         private weak var scrollView: NSScrollView?
         /// Exposed so `updateNSView` can re-apply overlay style after SwiftUI resets it.
         var attachedScrollView: NSScrollView? { scrollView }
@@ -1445,14 +1500,27 @@ struct StickToBottomTracker: NSViewRepresentable {
         /// Content can publish more than one frame/bounds notification per layout
         /// pass. Follow at most once per main-loop turn and never mutate SwiftUI.
         private var contentFollowScheduled = false
+        /// Near-top evaluation is coalesced the same way: one edge-state entry per
+        /// main-loop turn keeps a prepend-triggered layout pass from cascading.
+        private var nearTopEvaluationScheduled = false
+        /// Edge state owned by the coordinator; scroll positions never enter SwiftUI.
+        private var nearTopState = TranscriptNearTopTrigger.State()
         /// Invalidates a queued bounds update if this coordinator is detached and
         /// later attached to another scroll view before the next main-loop turn.
         private var boundsUpdateGeneration = 0
 
-        init(isPinned: Binding<Bool>, threshold: CGFloat, pinEdge: StickPinEdge) {
+        init(
+            isPinned: Binding<Bool>,
+            threshold: CGFloat,
+            pinEdge: StickPinEdge,
+            topLoadingEnabled: Bool,
+            onNearTop: (() -> Void)?
+        ) {
             self.isPinned = isPinned
             self.threshold = threshold
             self.pinEdge = pinEdge
+            self.topLoadingEnabled = topLoadingEnabled
+            self.onNearTop = onNearTop
         }
 
         deinit { detach() }
@@ -1479,6 +1547,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                 ) { [weak self] _ in
                     guard self?.scrollView?.window?.inLiveResize != true else { return }
                     self?.updatePinFromUserScroll(userLiveScroll: true)
+                    self?.scheduleNearTopEvaluation()
                 }
                 endScrollObs = center.addObserver(
                     forName: NSScrollView.didEndLiveScrollNotification,
@@ -1487,6 +1556,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                 ) { [weak self] _ in
                     guard self?.scrollView?.window?.inLiveResize != true else { return }
                     self?.updatePinFromUserScroll(userLiveScroll: true)
+                    self?.scheduleNearTopEvaluation()
                 }
                 // Catches scroller-knob drags, which post no live-scroll notification.
                 let clip = sv.contentView
@@ -1496,7 +1566,11 @@ struct StickToBottomTracker: NSViewRepresentable {
                     object: clip,
                     queue: .main
                 ) { [weak self] _ in
-                    let inLiveResize = self?.scrollView?.window?.inLiveResize == true
+                    guard let self else { return }
+                    // Near-top evaluation is geometry-based and origin-agnostic:
+                    // programmatic anchoring after a prepend must also re-arm it.
+                    self.scheduleNearTopEvaluation()
+                    let inLiveResize = self.scrollView?.window?.inLiveResize == true
                     let origin = ScrollOrigin.classify(
                         mouseButtonsDown: Int(NSEvent.pressedMouseButtons),
                         windowInLiveResize: inLiveResize
@@ -1509,7 +1583,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                     // can pull the thumb back. Bounds notifications are high
                     // frequency, so coalesce them to one state-machine entry per
                     // runloop.
-                    self?.scheduleKnobDragPinUpdate()
+                    self.scheduleKnobDragPinUpdate()
                 }
                 if let document = sv.documentView {
                     document.postsFrameChangedNotifications = true
@@ -1520,6 +1594,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                         queue: .main
                     ) { [weak self] _ in
                         self?.schedulePinnedContentFollow()
+                        self?.scheduleNearTopEvaluation()
                     }
                     documentBoundsObs = center.addObserver(
                         forName: NSView.boundsDidChangeNotification,
@@ -1527,10 +1602,14 @@ struct StickToBottomTracker: NSViewRepresentable {
                         queue: .main
                     ) { [weak self] _ in
                         self?.schedulePinnedContentFollow()
+                        self?.scheduleNearTopEvaluation()
                     }
                 }
                 // 安装时只允许「确认在底部 → pin」，避免布局未完成时误 unpin
                 updatePinFromUserScroll(allowUnpin: false)
+                // Seed the near-top edge with the current geometry; later
+                // frame/bounds notifications re-evaluate it continuously.
+                scheduleNearTopEvaluation()
             } else if attachAttempts < 8 {
                 attachAttempts += 1
                 DispatchQueue.main.async { [weak self] in
@@ -1556,6 +1635,7 @@ struct StickToBottomTracker: NSViewRepresentable {
             pendingPinValue = nil
             knobDragUpdateScheduled = false
             contentFollowScheduled = false
+            nearTopEvaluationScheduled = false
             boundsUpdateGeneration += 1
         }
 
@@ -1567,6 +1647,42 @@ struct StickToBottomTracker: NSViewRepresentable {
                 guard let self, self.boundsUpdateGeneration == generation else { return }
                 self.contentFollowScheduled = false
                 self.followPinnedContentGrowth()
+            }
+        }
+
+        /// Near-top evaluation is coalesced to one entry per main-loop turn like
+        /// the knob-drag path: geometry notifications are high frequency, and the
+        /// prepend it may trigger mutates SwiftUI state. Internal so `updateNSView`
+        /// can force a re-evaluation when the loading gate flips.
+        func scheduleNearTopEvaluation() {
+            guard !nearTopEvaluationScheduled else { return }
+            nearTopEvaluationScheduled = true
+            let generation = boundsUpdateGeneration
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.boundsUpdateGeneration == generation else { return }
+                self.nearTopEvaluationScheduled = false
+                self.evaluateNearTop()
+            }
+        }
+
+        /// Feeds the current clip/document geometry into the near-top edge state
+        /// machine. Fires `onNearTop` exactly once per false→true edge while
+        /// `topLoadingEnabled`. A prepend grows the document, so the distance from
+        /// the document start grows past the threshold and the edge re-arms — one
+        /// layout pass can never cascade into multiple prepends.
+        private func evaluateNearTop() {
+            guard let sv = scrollView, let doc = sv.documentView else { return }
+            let distance = StickToBottomLogic.distanceFromDocumentStart(
+                visible: sv.documentVisibleRect,
+                contentHeight: doc.bounds.height,
+                documentIsFlipped: doc.isFlipped
+            )
+            if TranscriptNearTopTrigger.step(
+                state: &nearTopState,
+                distanceFromDocumentStart: distance,
+                enabled: topLoadingEnabled
+            ) {
+                onNearTop?()
             }
         }
 
