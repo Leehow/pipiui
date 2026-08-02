@@ -240,7 +240,10 @@ struct SubagentPanel: View {
     @ViewBuilder
     private var detail: some View {
         if let agent = store.agents.first(where: { $0.id == store.selectedId }) {
+            // Per-agent identity: every @State (pin, top-visible page, expanded
+            // groups, diff dialog) is scoped to one agent and resets on switch.
             AgentDetailView(agent: agent, store: store, projectURL: projectURL)
+                .id(agent.id)
         } else {
             Text("选择一个 agent 查看详情")
                 .font(.caption)
@@ -643,7 +646,12 @@ private struct AgentDetailView: View {
     @ObservedObject var store: SubagentStore
     var projectURL: URL
     @State private var pinToBottom = true
-    @State private var logVisibleCount = 100
+    /// Top-most visible log segment id, reported by `.scrollPosition(id:anchor:)`.
+    /// Deriving the visible page from this id lets the sliding window follow the
+    /// viewport without any pagination buttons.
+    @State private var scrollTopID: String? = nil
+    /// Chrono page of the top-visible log item; the unpinned window anchor.
+    @State private var topVisiblePage = 0
     @State private var worktreeBusy = false
     @State private var showDiscardConfirm = false
     @State private var showDiffStat = false
@@ -652,10 +660,17 @@ private struct AgentDetailView: View {
     @State private var expandedToolGroupIDs: Set<Int> = []
 
     var body: some View {
-        let window = Array(agent.log.suffix(logVisibleCount))
-        let hidden = max(0, agent.log.count - logVisibleCount)
-        let segmentsOldest = SubagentLogLayout.plan(window)
-        let segmentsNewestFirst = segmentsOldest.reversed()
+        // Pinned live mode anchors the window at the newest page so appended rows
+        // are always rendered; unpinned scrolling anchors it at the top-visible
+        // page. Normal document order (oldest top → newest bottom), no flip.
+        let anchorPage = pinToBottom
+            ? SubagentLogRenderWindow.latestPage(itemCount: agent.log.count)
+            : topVisiblePage
+        let window = SubagentLogRenderWindow.resolve(
+            itemCount: agent.log.count,
+            topVisiblePage: anchorPage
+        )
+        let segments = SubagentLogLayout.plan(Array(agent.log[window.range]))
 
         VStack(alignment: .leading, spacing: 0) {
             metricsHeader
@@ -674,53 +689,38 @@ private struct AgentDetailView: View {
             }
             ScrollViewReader { proxy in
                 ScrollView {
-                    // Newest-first stack. The scroll view flip maps document start to
-                    // the visual bottom, while each rendered row flips back upright.
-                    LazyVStack(alignment: .leading, spacing: 8) {
+                    // Eager stack: the window slides by dropping/adding a whole page
+                    // while `.scrollPosition` keeps the top-visible row anchored;
+                    // NSTextView-backed markdown rows need exact heights before the
+                    // anchor can settle, so lazy height estimation is avoided (same
+                    // choice as the main transcript; ≤ 400 rows).
+                    VStack(alignment: .leading, spacing: 8) {
+                        if segments.isEmpty {
+                            waitingForFirstLog
+                        } else {
+                            ForEach(segments) { segment in
+                                segmentRow(segment)
+                                    .id(segmentRowID(segment))
+                            }
+                        }
+
+                        // 透明贴底锚点，与行数据解耦：新行插入/旧行移除不影响锚点位置。
                         Color.clear
                             .frame(height: 1)
                             .id(logAnchorID)
                             .background(
                                 StickToBottomTracker(
                                     isPinned: $pinToBottom,
-                                    pinEdge: .documentStart
+                                    pinEdge: .documentEnd
                                 )
                             )
-                            .transcriptFlip()
-
-                        if window.isEmpty {
-                            waitingForFirstLog
-                                .transcriptFlip()
-                        } else {
-                            ForEach(segmentsNewestFirst) { segment in
-                                switch segment {
-                                case .item(let item):
-                                    AgentLogRow(item: item, base: documentBase)
-                                        .transcriptFlip()
-                                case .toolGroup(let items):
-                                    // Flip the group once: its children retain their
-                                    // planned oldest-to-newest order without double flips.
-                                    toolGroup(items)
-                                        .transcriptFlip()
-                                }
-                            }
-                        }
-
-                        if hidden > 0 {
-                            Button("显示更早的 \(hidden) 条日志") {
-                                logVisibleCount += 100
-                            }
-                            .buttonStyle(.link)
-                            .frame(maxWidth: .infinity)
-                            .transcriptFlip()
-                        }
                     }
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .overlayScrollers()
                 }
                 .scrollIndicators(.automatic)
-                .transcriptFlip()
+                .scrollPosition(id: $scrollTopID, anchor: .top)
                 .overlay(alignment: .bottomTrailing) {
                     if !pinToBottom {
                         Button {
@@ -747,14 +747,10 @@ private struct AgentDetailView: View {
                         jumpToLatest(proxy)
                     }
                 }
-                .onChange(of: agent.id) { _, _ in
-                    logVisibleCount = 100
-                    expandedToolGroupIDs.removeAll()
-                    pinToBottom = true
-                    showDiffStat = false
-                    diffStatText = nil
-                    DispatchQueue.main.async {
-                        jumpToLatest(proxy)
+                .onChange(of: scrollTopID) { _, newValue in
+                    guard let page = topVisiblePage(from: newValue, log: agent.log) else { return }
+                    if page != topVisiblePage {
+                        topVisiblePage = page
                     }
                 }
             }
@@ -910,17 +906,50 @@ private struct AgentDetailView: View {
     }
 
     private var logAnchorID: String {
-        "agent-bottom-\(agent.id)"
+        "agent-log-bottom-\(agent.id)"
     }
 
-    /// The flipped scroll view maps layout top to the visual bottom / latest edge.
+    /// Normal top-down layout: the latest edge is the document end, so the anchor
+    /// sits at the content end and the jump aligns its bottom to the viewport.
     private func jumpToLatest(_ proxy: ScrollViewProxy) {
         guard pinToBottom else { return }
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            proxy.scrollTo(logAnchorID, anchor: .top)
+            proxy.scrollTo(logAnchorID, anchor: .bottom)
         }
+    }
+
+    @ViewBuilder
+    private func segmentRow(_ segment: SubagentLogLayout.Segment) -> some View {
+        switch segment {
+        case .item(let item):
+            AgentLogRow(item: item, base: documentBase)
+        case .toolGroup(let items):
+            toolGroup(items)
+        }
+    }
+
+    /// Stable scroll-position id: a segment id is its first log item id, so the
+    /// top-visible page derives from a plain `agent.log.firstIndex(id:)` lookup.
+    private func segmentRowID(_ segment: SubagentLogLayout.Segment) -> String {
+        "agent-log-\(agent.id)-\(segment.id)"
+    }
+
+    /// Map the reported top-visible segment id back to a log page. Segment ids
+    /// stay valid while the window slides (the window always contains the page of
+    /// the anchored row); ids evicted by the store's 800-item cap return nil and
+    /// keep the last known page, which `resolve` safely clamps into range.
+    private func topVisiblePage(from scrollTopID: String?, log: [AgentLogItem]) -> Int? {
+        guard let scrollTopID else { return nil }
+        if scrollTopID == logAnchorID {
+            return SubagentLogRenderWindow.latestPage(itemCount: log.count)
+        }
+        let prefix = "agent-log-\(agent.id)-"
+        guard scrollTopID.hasPrefix(prefix),
+              let segmentID = Int(scrollTopID.dropFirst(prefix.count)),
+              let index = log.firstIndex(where: { $0.id == segmentID }) else { return nil }
+        return index / SubagentLogRenderWindow.pageSize
     }
 
     @ViewBuilder
