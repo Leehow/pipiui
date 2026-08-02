@@ -26,6 +26,30 @@ struct SubagentLogRenderWindow: Equatable {
         return max(0, (count + pageSize - 1) / pageSize - 1)
     }
 
+    /// Deterministic window anchor from the current pin state and the live
+    /// top-visible item:
+    /// - pinned → the newest page, independent of `.scrollPosition` reporting
+    ///   (AppKit's pinned clip push can skip SwiftUI position callbacks);
+    /// - a resolvable top-visible item index → that item's *current* page, so
+    ///   a store-cap eviction that shifts the anchored row moves the window
+    ///   with it instead of going stale until the next scroll event;
+    /// - otherwise (nil id, bottom anchor, or an anchor evicted by the cap) →
+    ///   `previousTopVisiblePage` clamped into [0, newest page]. Right after
+    ///   unpinning the caller keeps the previous value at the newest page (the
+    ///   user just left the bottom, so the newest window covers the viewport);
+    ///   mid-history eviction instead keeps the user's place, never an
+    ///   uninvited jump to the newest page.
+    static func anchorPage(
+        pinned: Bool,
+        topVisibleItemIndex: Int?,
+        previousTopVisiblePage: Int,
+        itemCount: Int
+    ) -> Int {
+        if pinned { return latestPage(itemCount: itemCount) }
+        if let index = topVisibleItemIndex { return index / pageSize }
+        return min(max(0, previousTopVisiblePage), latestPage(itemCount: itemCount))
+    }
+
     /// Window invariant: pages [N-1 … N+2] ∩ [0 … p], except N == 0 which renders
     /// only pages [0, 1]. N is clamped into [0, p] so a log that shrank (store cap
     /// eviction) between a scroll event and this render cannot produce an invalid

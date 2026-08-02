@@ -651,6 +651,9 @@ private struct AgentDetailView: View {
     /// viewport without any pagination buttons.
     @State private var scrollTopID: String? = nil
     /// Chrono page of the top-visible log item; the unpinned window anchor.
+    /// Synced to the newest page while pinned and re-resolved from the live
+    /// scroll id on unpin; used as the clamped fallback when the anchor id is
+    /// unknown or evicted by the store cap.
     @State private var topVisiblePage = 0
     @State private var worktreeBusy = false
     @State private var showDiscardConfirm = false
@@ -662,10 +665,15 @@ private struct AgentDetailView: View {
     var body: some View {
         // Pinned live mode anchors the window at the newest page so appended rows
         // are always rendered; unpinned scrolling anchors it at the top-visible
-        // page. Normal document order (oldest top → newest bottom), no flip.
-        let anchorPage = pinToBottom
-            ? SubagentLogRenderWindow.latestPage(itemCount: agent.log.count)
-            : topVisiblePage
+        // item, re-resolved from the live log on every pass so cap evictions that
+        // shift or drop the anchored row move the window deterministically.
+        // Normal document order (oldest top → newest bottom), no flip.
+        let anchorPage = SubagentLogRenderWindow.anchorPage(
+            pinned: pinToBottom,
+            topVisibleItemIndex: topItemIndex(from: scrollTopID, log: agent.log),
+            previousTopVisiblePage: topVisiblePage,
+            itemCount: agent.log.count
+        )
         let window = SubagentLogRenderWindow.resolve(
             itemCount: agent.log.count,
             topVisiblePage: anchorPage
@@ -748,10 +756,41 @@ private struct AgentDetailView: View {
                     }
                 }
                 .onChange(of: scrollTopID) { _, newValue in
-                    guard let page = topVisiblePage(from: newValue, log: agent.log) else { return }
+                    // Pinned: the anchor is the newest page by definition; the
+                    // AppKit pinned clip push does not reliably feed
+                    // scrollPosition, so its reports must not overwrite the
+                    // synced page.
+                    guard !pinToBottom else { return }
+                    let page = SubagentLogRenderWindow.anchorPage(
+                        pinned: false,
+                        topVisibleItemIndex: topItemIndex(from: newValue, log: agent.log),
+                        previousTopVisiblePage: topVisiblePage,
+                        itemCount: agent.log.count
+                    )
                     if page != topVisiblePage {
                         topVisiblePage = page
                     }
+                }
+                .onChange(of: agent.log.count) { _, newCount in
+                    // Pinned live growth: keep the cached page deterministically
+                    // synced to the newest page so an unpin never inherits a page
+                    // cached from before the growth (one-frame stale slice).
+                    guard pinToBottom else { return }
+                    topVisiblePage = SubagentLogRenderWindow.latestPage(itemCount: newCount)
+                }
+                .onChange(of: pinToBottom) { _, newValue in
+                    // Unpin: re-resolve the anchor from the live scroll id right
+                    // away instead of trusting the cached page; an unresolvable id
+                    // (bottom anchor / cap-evicted / nil) falls back to the newest
+                    // page — the user just left the bottom, so that window covers
+                    // the viewport.
+                    guard !newValue else { return }
+                    topVisiblePage = SubagentLogRenderWindow.anchorPage(
+                        pinned: false,
+                        topVisibleItemIndex: topItemIndex(from: scrollTopID, log: agent.log),
+                        previousTopVisiblePage: SubagentLogRenderWindow.latestPage(itemCount: agent.log.count),
+                        itemCount: agent.log.count
+                    )
                 }
             }
             // Replace the scroll hierarchy when changing agents so AppKit does not
@@ -936,20 +975,19 @@ private struct AgentDetailView: View {
         "agent-log-\(agent.id)-\(segment.id)"
     }
 
-    /// Map the reported top-visible segment id back to a log page. Segment ids
-    /// stay valid while the window slides (the window always contains the page of
-    /// the anchored row); ids evicted by the store's 800-item cap return nil and
-    /// keep the last known page, which `resolve` safely clamps into range.
-    private func topVisiblePage(from scrollTopID: String?, log: [AgentLogItem]) -> Int? {
-        guard let scrollTopID else { return nil }
-        if scrollTopID == logAnchorID {
-            return SubagentLogRenderWindow.latestPage(itemCount: log.count)
-        }
+    /// Map the reported top-visible segment id back to its log item index. The
+    /// bottom anchor, an unknown id, and an id evicted by the store's 800-item
+    /// cap all return nil; `SubagentLogRenderWindow.anchorPage` then decides the
+    /// fallback (newest page right after unpinning, clamped previous page while
+    /// browsing history). Re-run on every body pass, so the anchor follows the
+    /// item's current index without waiting for the next scroll event.
+    private func topItemIndex(from scrollTopID: String?, log: [AgentLogItem]) -> Int? {
+        guard let scrollTopID, scrollTopID != logAnchorID else { return nil }
         let prefix = "agent-log-\(agent.id)-"
         guard scrollTopID.hasPrefix(prefix),
               let segmentID = Int(scrollTopID.dropFirst(prefix.count)),
               let index = log.firstIndex(where: { $0.id == segmentID }) else { return nil }
-        return index / SubagentLogRenderWindow.pageSize
+        return index
     }
 
     @ViewBuilder

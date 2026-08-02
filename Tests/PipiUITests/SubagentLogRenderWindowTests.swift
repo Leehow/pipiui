@@ -120,4 +120,99 @@ final class SubagentLogRenderWindowTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - Anchor resolution (pinned growth / unpin / cap eviction)
+
+    func testPinnedGrowthResolvesNewestPageRegardlessOfStaleCachedPage() {
+        // Pinned across multi-page growth: an arbitrarily stale cached previous
+        // page must resolve to the newest page.
+        let page = SubagentLogRenderWindow.anchorPage(
+            pinned: true,
+            topVisibleItemIndex: 2,
+            previousTopVisiblePage: 0,
+            itemCount: 1500
+        )
+        XCTAssertEqual(page, 14)
+        XCTAssertEqual(page, SubagentLogRenderWindow.latestPage(itemCount: 1500))
+        // Empty log while pinned: newest page is 0.
+        XCTAssertEqual(
+            SubagentLogRenderWindow.anchorPage(
+                pinned: true, topVisibleItemIndex: nil, previousTopVisiblePage: 3, itemCount: 0
+            ),
+            0
+        )
+    }
+
+    func testUnpinnedResolvesLiveItemToItsCurrentPage() {
+        // Pin→unpin with a valid live item id → the page of its current index.
+        XCTAssertEqual(
+            SubagentLogRenderWindow.anchorPage(
+                pinned: false, topVisibleItemIndex: 450, previousTopVisiblePage: 14, itemCount: 1000
+            ),
+            4
+        )
+        // Page boundaries of the index→page mapping.
+        XCTAssertEqual(
+            SubagentLogRenderWindow.anchorPage(
+                pinned: false, topVisibleItemIndex: 199, previousTopVisiblePage: 0, itemCount: 1000
+            ),
+            1
+        )
+        XCTAssertEqual(
+            SubagentLogRenderWindow.anchorPage(
+                pinned: false, topVisibleItemIndex: 200, previousTopVisiblePage: 0, itemCount: 1000
+            ),
+            2
+        )
+        // Cap eviction that shifts the anchor (item 350 after 50 evictions):
+        // keep the anchor's new index page (3), not the stale cached page (5).
+        XCTAssertEqual(
+            SubagentLogRenderWindow.anchorPage(
+                pinned: false, topVisibleItemIndex: 350, previousTopVisiblePage: 5, itemCount: 800
+            ),
+            3
+        )
+    }
+
+    func testUnpinnedUnresolvableAnchorFallsBackDeterministically() {
+        // Pin→unpin with an unresolvable id (nil / bottom anchor / cap-evicted):
+        // the caller passes the newest page as the previous value, so the clamp
+        // lands on the newest page — the viewport was at the bottom.
+        let newest = SubagentLogRenderWindow.latestPage(itemCount: 812)
+        XCTAssertEqual(
+            SubagentLogRenderWindow.anchorPage(
+                pinned: false, topVisibleItemIndex: nil, previousTopVisiblePage: newest, itemCount: 812
+            ),
+            newest
+        )
+        // Mid-history eviction: keep the previous page (clamped into range),
+        // never an uninvited jump to the newest page.
+        XCTAssertEqual(
+            SubagentLogRenderWindow.anchorPage(
+                pinned: false, topVisibleItemIndex: nil, previousTopVisiblePage: 5, itemCount: 800
+            ),
+            5
+        )
+        // Out-of-range previous pages clamp deterministically.
+        XCTAssertEqual(
+            SubagentLogRenderWindow.anchorPage(
+                pinned: false, topVisibleItemIndex: nil, previousTopVisiblePage: 99, itemCount: 800
+            ),
+            7
+        )
+        XCTAssertEqual(
+            SubagentLogRenderWindow.anchorPage(
+                pinned: false, topVisibleItemIndex: nil, previousTopVisiblePage: -3, itemCount: 800
+            ),
+            0
+        )
+        // An anchor resolved on a log that shrank out from under it still maps
+        // to an existing page (no crash; `resolve` clamps the window too).
+        XCTAssertEqual(
+            SubagentLogRenderWindow.anchorPage(
+                pinned: false, topVisibleItemIndex: 1, previousTopVisiblePage: 1, itemCount: 0
+            ),
+            0
+        )
+    }
 }
