@@ -37,6 +37,10 @@ import {
 	sanitizeDisabledToolNames,
 } from "./desktop-tool-policy.mjs";
 import {
+	DeliveryObligationStore,
+	type DeliveryObligation,
+} from "./delivery-obligation.ts";
+import {
 	formatSecretaryCommitResult,
 	runSecretaryCommit,
 } from "./secretary-commit.ts";
@@ -1071,6 +1075,8 @@ type JobState = "running" | "ok" | "failed" | "aborted" | "interrupted";
 
 interface JobRecord {
 	agentId: string;
+	/** Unique dispatch/run identity; agentId may be deliberately reused for a later completion. */
+	runId: string;
 	name: string;
 	task: string; // truncated summary
 	/** Short UI title (optional). */
@@ -1298,14 +1304,11 @@ function jobPrune(): void {
 
 function jobUpsertRunning(agentId: string, name: string, task: string, title?: string): void {
 	const existing = jobRegistry.get(agentId);
-	// Same agentId, new run: detach any old delivery state. A stale in-flight completion may
-	// settle later, but identity checking prevents it from arming this run's delivered latch.
-	pendingDone.delete(agentId);
-	deliveredDone.delete(agentId);
 	// Resume of the same agentId must reopen a terminal row as running (matches Swift start).
 	const keepLive = existing?.state === "running";
 	jobRegistry.set(agentId, {
 		agentId,
+		runId: keepLive ? (existing?.runId ?? DeliveryObligationStore.runId()) : DeliveryObligationStore.runId(),
 		name,
 		task: taskSummary(task),
 		title,
@@ -1358,6 +1361,7 @@ function jobFinalize(
 	}
 	jobRegistry.set(agentId, {
 		agentId,
+		runId: existing?.runId ?? DeliveryObligationStore.runId(),
 		name: fields.name ?? existing?.name ?? "?",
 		task: fields.task ? taskSummary(fields.task) : (existing?.task ?? ""),
 		state: fields.state,
@@ -2615,57 +2619,181 @@ function deliverSubagentDone(pi: ExtensionAPI, text: string): void {
 	void trySendUserMessage(pi, text);
 }
 
-/** done 消息在 promise resolve 前都视为未确认；未确认的由 30s 轮询按 ≥60s 节奏重投。进程内存即可，不持久化。 */
+/** done 消息在 promise resolve 前都视为未确认；持久 obligation 让新进程恢复未确认投递。 */
 interface PendingDoneEntry {
-	text: string;
+	obligation: DeliveryObligation;
 	firstFailedAt: number;
-	attempts: number;
-	lastAttemptAt: number;
 	inFlight: boolean;
+	recoveredAmbiguous: boolean;
 }
 const pendingDone = new Map<string, PendingDoneEntry>();
-// Confirmed delivery is distinct from in-flight delivery. This latch is armed only after
-// sendUserMessage resolves successfully; failed sends remain eligible for bounded retry.
-const deliveredDone = new Set<string>();
+let doneDeliveryStore: DeliveryObligationStore | undefined;
+let doneDeliveryPiSessionId: string | undefined;
 
-function sendDoneWithConfirmation(pi: ExtensionAPI, agentId: string, text: string, isRetry: boolean): void {
-	if (deliveredDone.has(agentId)) return;
+function logDonePersistenceFailure(action: string, obligationId: string, err: unknown): void {
+	const code = (err as NodeJS.ErrnoException)?.code;
+	console.error(
+		`[pipiui-subagent] done delivery persistence ${action} failed` +
+			` id=${obligationId || "unassigned"}${code ? ` code=${code}` : ""}`,
+	);
+}
+
+function volatileObligation(agentId: string, runId: string, text: string): DeliveryObligation {
 	const now = Date.now();
-	let entry = pendingDone.get(agentId);
-	if (!entry) {
-		entry = { text, firstFailedAt: 0, attempts: 0, lastAttemptAt: 0, inFlight: false };
-		pendingDone.set(agentId, entry);
+	return {
+		version: 1,
+		id: `volatile-${runId}-${randomBytes(6).toString("hex")}`,
+		routingKeyHash: "unavailable",
+		agentId,
+		runId,
+		payloadHash: "unavailable",
+		text,
+		state: "pending",
+		attempts: 0,
+		createdAt: now,
+		updatedAt: now,
+		lastAttemptAt: 0,
+	};
+}
+
+/** Persist pending BEFORE attempting send; persistence failure degrades to the old in-memory path. */
+function createDoneObligation(agentId: string, runId: string, text: string): DeliveryObligation {
+	if (!doneDeliveryStore) return volatileObligation(agentId, runId, text);
+	try {
+		return doneDeliveryStore.create(agentId, runId, text);
+	} catch (err) {
+		logDonePersistenceFailure("create", "", err);
+		return volatileObligation(agentId, runId, text);
 	}
-	if (entry.inFlight || entry.attempts >= DONE_MAX_ATTEMPTS) return;
+}
+
+function sendDoneWithConfirmation(
+	pi: ExtensionAPI,
+	entry: PendingDoneEntry,
+	isRetry: boolean,
+): void {
+	let obligation = entry.obligation;
+	if (obligation.state === "delivered" || entry.inFlight || obligation.attempts >= DONE_MAX_ATTEMPTS) return;
+	const now = Date.now();
+	if (doneDeliveryStore && !obligation.id.startsWith("volatile-")) {
+		try {
+			const persisted = doneDeliveryStore.beginAttempt(obligation.id);
+			if (persisted) {
+				obligation = persisted;
+			} else if (doneDeliveryStore.read(obligation.id)) {
+				// Another live process/extension instance owns this exact obligation.
+				return;
+			} else {
+				// The row vanished/corrupted after create: do not suppress the actual completion.
+				logDonePersistenceFailure("missing-before-send", obligation.id, undefined);
+				obligation = volatileObligation(obligation.agentId, obligation.runId, obligation.text);
+			}
+		} catch (err) {
+			logDonePersistenceFailure("begin", obligation.id, err);
+			obligation = {
+				...obligation,
+				state: "attempting",
+				attempts: obligation.attempts + 1,
+				lastAttemptAt: now,
+			};
+		}
+	} else {
+		obligation = {
+			...obligation,
+			state: "attempting",
+			attempts: obligation.attempts + 1,
+			lastAttemptAt: now,
+		};
+	}
+	entry.obligation = obligation;
 	entry.inFlight = true;
-	entry.attempts += 1;
-	entry.lastAttemptAt = now;
-	// 重投沿用同一 text，首行前加一行说明这是重复投递，防止 boss 当成新事件。
-	const outText = isRetry
-		? `(re-delivery #${entry.attempts}: the previous [subagent-done] below was not confirmed delivered; treat it as the same event, not a new one.)\n${entry.text}`
-		: entry.text;
+	const prefix = entry.recoveredAmbiguous
+		? "(recovered delivery: this [subagent-done] may already have been delivered before restart; treat it as the same completion, not a new event.)"
+		: isRetry
+			? `(re-delivery #${obligation.attempts}: the previous [subagent-done] below was not confirmed delivered; treat it as the same event, not a new one.)`
+			: "";
+	const outText = prefix ? `${prefix}\n${obligation.text}` : obligation.text;
 	void trySendUserMessage(pi, outText).then((ok) => {
-		// A new run can replace this entry while the old promise is settling.
-		if (pendingDone.get(agentId) !== entry) return;
+		if (pendingDone.get(obligation.id) !== entry) return;
 		entry.inFlight = false;
+		let settled = { ...entry.obligation, state: ok ? "delivered" as const : "failed" as const };
+		if (doneDeliveryStore && !obligation.id.startsWith("volatile-")) {
+			try {
+				settled = doneDeliveryStore.finishAttempt(obligation.id, ok) ?? settled;
+			} catch (err) {
+				logDonePersistenceFailure(ok ? "confirm" : "fail", obligation.id, err);
+			}
+		}
+		entry.obligation = settled;
 		if (ok) {
-			deliveredDone.add(agentId);
-			pendingDone.delete(agentId);
+			pendingDone.delete(obligation.id);
 		} else if (entry.firstFailedAt === 0) {
 			entry.firstFailedAt = now;
 		}
-		if (!ok && entry.attempts >= DONE_MAX_ATTEMPTS) {
-			pendingDone.delete(agentId);
+		if (!ok && settled.attempts >= DONE_MAX_ATTEMPTS) {
+			pendingDone.delete(obligation.id);
 			console.error(
-				`[pipiui-subagent] giving up done delivery after ${entry.attempts} attempts: ${agentId}`,
+				`[pipiui-subagent] giving up done delivery after ${settled.attempts} attempts: ${settled.agentId}`,
 			);
 		}
 	});
 }
 
 /** [subagent-done] 专用：带送达确认 + 失败重投。job 此时已 terminal，重投只依赖保存的 text。 */
-function deliverConfirmedDone(pi: ExtensionAPI, agentId: string, text: string): void {
-	sendDoneWithConfirmation(pi, agentId, text, false);
+function deliverConfirmedDone(pi: ExtensionAPI, agentId: string, runId: string, text: string): void {
+	const obligation = createDoneObligation(agentId, runId, text);
+	if (obligation.state === "delivered") return;
+	// Duplicate close/finalize callbacks for the same completion share one in-flight promise.
+	const existing = pendingDone.get(obligation.id);
+	if (existing) {
+		if (!existing.inFlight) sendDoneWithConfirmation(pi, existing, true);
+		return;
+	}
+	const entry: PendingDoneEntry = {
+		obligation,
+		firstFailedAt: 0,
+		inFlight: false,
+		recoveredAmbiguous: false,
+	};
+	pendingDone.set(obligation.id, entry);
+	sendDoneWithConfirmation(pi, entry, false);
+}
+
+/** Bind persistence to Pi's durable session identity, then restore delivery only (not execution). */
+function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string): void {
+	if (!PIPIUI_MAIN_CWD || PIPIUI_DEPTH !== 0 || !piSessionId) return;
+	if (doneDeliveryPiSessionId === piSessionId && doneDeliveryStore) return;
+	if (doneDeliveryPiSessionId && doneDeliveryPiSessionId !== piSessionId) {
+		// A runtime session switch must not retry the previous session's messages here.
+		// Their durable rows remain for that Pi session's next startup.
+		pendingDone.clear();
+		doneDeliveryStore = undefined;
+	}
+	doneDeliveryPiSessionId = piSessionId;
+	try {
+		doneDeliveryStore = new DeliveryObligationStore(
+			path.join(
+				PIPIUI_MAIN_CWD,
+				".pi",
+				"subagent-delivery-obligations",
+				DeliveryObligationStore.routingDirectory(piSessionId),
+			),
+			{ routingKey: piSessionId },
+		);
+		for (const recovered of doneDeliveryStore.recoverable()) {
+			const entry: PendingDoneEntry = {
+				obligation: recovered.record,
+				firstFailedAt: recovered.record.state === "failed" ? recovered.record.updatedAt : 0,
+				inFlight: false,
+				recoveredAmbiguous: recovered.ambiguous,
+			};
+			pendingDone.set(recovered.record.id, entry);
+			sendDoneWithConfirmation(pi, entry, recovered.record.attempts > 0);
+		}
+	} catch (err) {
+		logDonePersistenceFailure("restore", "", err);
+		doneDeliveryStore = undefined;
+	}
 }
 
 function notifySubagentDone(
@@ -2678,7 +2806,8 @@ function notifySubagentDone(
 	const text = formatSubagentDoneMessage(result, extra);
 	// 前台 job 可能没有 bridge agentId；那种情况下投递确认无从挂起，退化为一次性投递。
 	if (result.agentId) {
-		deliverConfirmedDone(pi, result.agentId, text);
+		const runId = jobRegistry.get(result.agentId)?.runId ?? DeliveryObligationStore.runId();
+		deliverConfirmedDone(pi, result.agentId, runId, text);
 	} else {
 		deliverSubagentDone(pi, text);
 	}
@@ -3656,6 +3785,10 @@ const SecretaryCommitParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	pi.on("session_start", (_event, ctx) => {
+		const piSessionId = ctx.sessionManager.getSessionId().trim();
+		initializeDoneDeliveryStore(pi, piSessionId);
+	});
 	if (PIPIUI_SUBAGENT_SKILL_ISOLATION) {
 		// Pi still accepts extension-contributed skillPaths under --no-skills. Remove the
 		// generated model-visible skill catalog and make this child extension the sole
@@ -3776,7 +3909,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ---- 统一轮询（30s）：承载三条按节奏补推的路径 ——
 	// 1) done 重投：sendUserMessage 的 promise 未确认（reject 或未 settle）的 [subagent-done]，
-	//    同一 agentId 至少隔 60s 重投一次，直到确认。job 已 terminal，重投只依赖 pendingDone 里的 text。
+	//    同一 obligation 至少隔 60s 重投一次，直到确认。job 已 terminal，重投只依赖持久化 text。
 	// 2) vanished 即时检测：pid 已死但没人报告 → 立刻推（不等 5min 心跳），推一次后从 runningAgents 删除。
 	// 3) stall 复推：idle ≥ 120s 即推 [subagent-stalled]，boss 若继续等，每 5 分钟复推一次（idle 秒数更新）；
 	//    有新活动后 noteAgentActivity 复位 lastStallNotifyAt=0，重新武装。
@@ -3789,10 +3922,10 @@ export default function (pi: ExtensionAPI) {
 		const now = Date.now();
 
 		// (1) done 重投
-		for (const [agentId, entry] of [...pendingDone]) {
-			if (deliveredDone.has(agentId)) { pendingDone.delete(agentId); continue; } // 已闩条目不再重投，清理防残留
-			if (now - entry.lastAttemptAt < DONE_RETRY_MIN_INTERVAL_MS) continue;
-			sendDoneWithConfirmation(pi, agentId, entry.text, true);
+		for (const [obligationId, entry] of [...pendingDone]) {
+			if (entry.obligation.state === "delivered") { pendingDone.delete(obligationId); continue; }
+			if (now - entry.obligation.lastAttemptAt < DONE_RETRY_MIN_INTERVAL_MS) continue;
+			sendDoneWithConfirmation(pi, entry, true);
 		}
 
 		// (2) vanished 即时检测（isProcessAlive 只是 signal 0，很便宜）。先于 stall 扫描：

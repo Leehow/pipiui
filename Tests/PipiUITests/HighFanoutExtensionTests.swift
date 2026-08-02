@@ -76,10 +76,32 @@ final class HighFanoutExtensionTests: XCTestCase {
         let s = try source()
         XCTAssertTrue(s.contains("inFlight: boolean;"))
         XCTAssertTrue(s.contains("const DONE_MAX_ATTEMPTS = 5;"))
-        XCTAssertTrue(s.contains("if (entry.inFlight || entry.attempts >= DONE_MAX_ATTEMPTS) return;"))
-        XCTAssertTrue(s.contains("if (pendingDone.get(agentId) !== entry) return;"),
-                      "an old run must not arm a replacement run's latch")
-        XCTAssertTrue(s.contains("if (ok) {\n\t\t\tdeliveredDone.add(agentId);"))
+        XCTAssertTrue(s.contains("obligation.state === \"delivered\" || entry.inFlight || obligation.attempts >= DONE_MAX_ATTEMPTS"),
+                      "in-flight and retry bounds belong to the exact completion obligation")
+        XCTAssertTrue(s.contains("if (pendingDone.get(obligation.id) !== entry) return;"),
+                      "a stale promise must not settle a different run/payload obligation")
+
+        let durableSettle = try XCTUnwrap(
+            s.range(of: "settled = doneDeliveryStore.finishAttempt(obligation.id, ok) ?? settled;")
+        )
+        let memoryRemoval = try XCTUnwrap(
+            s.range(of: "pendingDone.delete(obligation.id);", range: durableSettle.upperBound..<s.endIndex)
+        )
+        XCTAssertLessThan(durableSettle.lowerBound, memoryRemoval.lowerBound,
+                          "confirmed delivery must be persisted before its in-memory retry row is removed")
+
+        XCTAssertTrue(s.contains("const obligation = createDoneObligation(agentId, runId, text);"))
+        XCTAssertTrue(s.contains("runId: keepLive ?"),
+                      "reusing one semantic agent id must create a distinct run identity")
+
+        let bundled = try XCTUnwrap(PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil))
+        let obligationSource = try String(
+            contentsOf: bundled.appendingPathComponent("subagent/delivery-obligation.ts"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(obligationSource.contains("const payloadHash = sha256(text);"))
+        XCTAssertTrue(obligationSource.contains(#"sha256(`${this.routingKeyHash}\0${agentId}\0${runId}\0${payloadHash}`)"#),
+                      "agent-id reuse cannot suppress a distinct run or payload")
     }
 
     func testCallerIdsRejectDuplicatesAndCrossRequestActiveCollisions() throws {

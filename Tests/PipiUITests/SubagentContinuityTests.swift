@@ -9,6 +9,13 @@ final class SubagentContinuityTests: XCTestCase {
         return try String(contentsOf: bundled.appendingPathComponent("subagent/index.ts"), encoding: .utf8)
     }
 
+    private func repositoryRoot() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
     /// The id is retyped by a model to continue a worker, and lands verbatim in a git branch
     /// and a session filename. Long random ids drift; a drifted id is silently a new worker.
     func testAgentIdIsShortSemanticAndValidated() throws {
@@ -127,32 +134,248 @@ final class SubagentContinuityTests: XCTestCase {
                       "only await turns an async rejection into a caught failure")
         XCTAssertTrue(s.contains("const pendingDone = new Map<string, PendingDoneEntry>();"),
                       "a done is unconfirmed until its promise resolves, so it must be tracked for retry")
-        XCTAssertTrue(s.contains("if (pendingDone.get(agentId) !== entry) return;"),
+        XCTAssertTrue(s.contains("if (pendingDone.get(obligation.id) !== entry) return;"),
                       "a stale promise must not clear replacement delivery state")
-        XCTAssertTrue(s.contains("if (ok) {\n\t\t\tdeliveredDone.add(agentId);\n\t\t\tpendingDone.delete(agentId);"),
+        XCTAssertTrue(s.contains("settled = doneDeliveryStore.finishAttempt(obligation.id, ok) ?? settled;"),
                       "only a confirmed resolve may clear the retry state")
-        XCTAssertTrue(s.contains("if (now - entry.lastAttemptAt < DONE_RETRY_MIN_INTERVAL_MS) continue;"),
+        XCTAssertTrue(s.contains("if (now - entry.obligation.lastAttemptAt < DONE_RETRY_MIN_INTERVAL_MS) continue;"),
                       "retries ride the 30s scan but no more than once a minute per worker")
         XCTAssertTrue(s.contains("(re-delivery #"),
                       "a retry must say it is the same event, not a new one")
+        XCTAssertTrue(s.contains("createDoneObligation(agentId, runId, text)"),
+                      "the durable obligation must exist before first send")
+        XCTAssertTrue(s.contains("initializeDoneDeliveryStore(pi, piSessionId);"),
+                      "session_start must restore retryable obligations after Pi identity is available")
+        XCTAssertTrue(s.contains("recovered delivery: this [subagent-done] may already have been delivered before restart"),
+                      "ambiguous recovery must be visible to the receiving model")
+        XCTAssertTrue(s.contains("return volatileObligation(agentId, runId, text);"),
+                      "persistence failure must degrade to best-effort in-memory delivery")
     }
 
-    /// A racing notify must not start a second send, but a failed first send must remain retryable.
-    /// The delivered latch therefore arms only after confirmation, separately from in-flight state.
+    /// A racing notify must not start a second send, but names may be reused for distinct runs.
+    /// Identity is therefore completion-scoped rather than an agentId-only delivered latch.
     func testDoneIsDeliveredAtMostOncePerAgentRun() throws {
         let s = try source()
-        XCTAssertTrue(s.contains("const deliveredDone = new Set<string>();"),
-                      "confirmed delivery needs a per-agent latch")
-        XCTAssertTrue(s.contains("if (deliveredDone.has(agentId)) return;"),
-                      "confirmed delivery must intercept every later attempt")
-        XCTAssertTrue(s.contains("if (entry.inFlight || entry.attempts >= DONE_MAX_ATTEMPTS) return;"),
+        XCTAssertFalse(s.contains("const deliveredDone = new Set<string>();"),
+                       "an agentId-only latch suppresses a later distinct completion")
+        XCTAssertTrue(s.contains("runId: keepLive ?"),
+                      "each distinct dispatch gets an explicit run identity")
+        XCTAssertTrue(s.contains("obligation.state === \"delivered\" || entry.inFlight || obligation.attempts >= DONE_MAX_ATTEMPTS"),
                       "an unresolved send must block duplicate concurrent sends")
-        XCTAssertTrue(s.contains("if (ok) {\n\t\t\tdeliveredDone.add(agentId);"),
-                      "only a successful send may arm the delivered latch")
-        XCTAssertTrue(s.contains("deliveredDone.add(agentId);"),
-                      "confirmed delivery arms the latch")
-        XCTAssertTrue(s.contains("deliveredDone.delete(agentId);"),
-                      "re-dispatching/resuming the same agentId opens a new run, so its own done may deliver again")
+        XCTAssertTrue(s.contains("if (obligation.state === \"delivered\") return;"),
+                      "persisted confirmation suppresses the same completion")
+    }
+
+    /// Bridge routing credentials are regenerated with ChatSession and cannot name durable state.
+    /// Recovery must bind to Pi's persisted session id, while bridge reports keep their capability.
+    func testDoneDeliveryUsesStablePiSessionIdentityNotBridgeCapability() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains(#"pi.on("session_start", (_event, ctx) => {"#))
+        XCTAssertTrue(s.contains("const piSessionId = ctx.sessionManager.getSessionId().trim();"))
+        XCTAssertTrue(s.contains("DeliveryObligationStore.routingDirectory(piSessionId)"))
+        XCTAssertTrue(s.contains("{ routingKey: piSessionId }"))
+        XCTAssertTrue(s.contains("if (doneDeliveryPiSessionId === piSessionId && doneDeliveryStore) return;"),
+                      "repeated session_start/reload must not launch duplicate concurrent delivery")
+        XCTAssertTrue(s.contains("pendingDone.clear();"),
+                      "switching Pi sessions must leave old durable rows for their own later resume")
+        XCTAssertFalse(s.contains("DeliveryObligationStore.routingDirectory(PIPIUI_SESSION)"))
+        XCTAssertFalse(s.contains("{ routingKey: PIPIUI_SESSION }"))
+        XCTAssertTrue(s.contains("body: JSON.stringify({ sessionKey: PIPIUI_SESSION, action: \"agent_event\", ...payload })"),
+                      "ephemeral capability remains exclusively on bridge authorization/reporting")
+    }
+
+    /// Drive the real persistence module in separate store instances (fresh extension processes),
+    /// rather than checking only source strings. This covers crash ambiguity, acknowledgement,
+    /// agent-id reuse, corruption, bounded rows, and a write-failure degradation boundary.
+    func testDoneDeliveryObligationRestartStateMachine() throws {
+        let node = Process()
+        node.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        let module = repositoryRoot().appendingPathComponent(
+            "Sources/PipiUI/PiExt/subagent/delivery-obligation.ts"
+        )
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "pipiui-done-obligations-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        node.arguments = [
+            "node",
+            "--experimental-strip-types",
+            "--input-type=module",
+            "--eval",
+            #"""
+            import assert from "node:assert/strict";
+            import fs from "node:fs";
+            import path from "node:path";
+            const { DeliveryObligationStore } = await import(process.env.DELIVERY_MODULE);
+            const dir = process.env.DELIVERY_DIR;
+            let now = 1_000_000;
+            const options = (pid, alive = () => false, extra = {}) => ({
+              now: () => now,
+              pid,
+              ownerToken: `owner-${pid}`,
+              processAlive: alive,
+              ...extra,
+            });
+
+            // A stable Pi session id survives changing bridge capabilities; a different Pi
+            // session under the same project has a disjoint directory and cannot cross-deliver.
+            const routingRoot = `${dir}-routing`;
+            const piSessionA = "persisted-pi-session-a";
+            const piSessionB = "persisted-pi-session-b";
+            const bridgeCapabilityA = "ephemeral-capability-a";
+            const bridgeCapabilityB = "ephemeral-capability-b";
+            assert.notEqual(bridgeCapabilityA, bridgeCapabilityB);
+            const routeDir = sessionId => path.join(routingRoot, DeliveryObligationStore.routingDirectory(sessionId));
+            const routeAFirst = new DeliveryObligationStore(routeDir(piSessionA), options(91, () => false, { routingKey: piSessionA }));
+            const routed = routeAFirst.create("routed-worker", "run-1", "routed payload");
+            const routeAAfterRestart = new DeliveryObligationStore(routeDir(piSessionA), options(92, () => false, { routingKey: piSessionA }));
+            assert.deepEqual(routeAAfterRestart.recoverable().map(x => x.record.id), [routed.id]);
+            const routeB = new DeliveryObligationStore(routeDir(piSessionB), options(93, () => false, { routingKey: piSessionB }));
+            assert.notEqual(routeDir(piSessionA), routeDir(piSessionB));
+            assert.equal(routeB.recoverable().length, 0);
+
+            // Every cross-process recovery is conservatively ambiguity-labelled. A pending row
+            // may be the residue of a failed begin-attempt write followed by best-effort send.
+            const first = new DeliveryObligationStore(dir, options(101));
+            const pending = first.create("worker-a", "run-1", "[subagent-done] payload one");
+            assert.equal(first.read(pending.id).state, "pending");
+            let fresh = new DeliveryObligationStore(dir, options(202));
+            assert.deepEqual(fresh.recoverable().map(x => [x.record.id, x.ambiguous]), [[pending.id, true]]);
+
+            // If begin-attempt persistence fails, index.ts still sends best-effort. The durable
+            // pending residue must therefore recover as possibly duplicated, never as pristine.
+            const beginFailDir = `${dir}-begin-fail`;
+            const beginFail = new DeliveryObligationStore(beginFailDir, options(111));
+            const beginFailRow = beginFail.create("begin-fail", "run-1", "payload");
+            fs.chmodSync(beginFailDir, 0o500);
+            assert.throws(() => beginFail.beginAttempt(beginFailRow.id));
+            fs.chmodSync(beginFailDir, 0o700);
+            const beginFailRecovery = new DeliveryObligationStore(beginFailDir, options(112));
+            assert.deepEqual(beginFailRecovery.recoverable().map(x => x.ambiguous), [true]);
+
+            // A crash after beginning send is ambiguous and must be visibly re-delivered.
+            first.beginAttempt(pending.id);
+            fresh = new DeliveryObligationStore(dir, options(202));
+            assert.deepEqual(fresh.recoverable().map(x => [x.record.id, x.ambiguous]), [[pending.id, true]]);
+            fresh.beginAttempt(pending.id);
+            fresh.finishAttempt(pending.id, true);
+            const afterAck = new DeliveryObligationStore(dir, options(303));
+            assert.equal(afterAck.recoverable().length, 0);
+            assert.equal(afterAck.read(pending.id).state, "delivered");
+
+            // Same agent id with a distinct run or payload is a distinct completion.
+            const runTwo = afterAck.create("worker-a", "run-2", "[subagent-done] payload one");
+            const payloadTwo = afterAck.create("worker-a", "run-2", "[subagent-done] payload two");
+            assert.notEqual(runTwo.id, pending.id);
+            assert.notEqual(payloadTwo.id, runTwo.id);
+
+            // A live recent owner is protected, but a reused/live PID cannot block forever once
+            // the bounded claim lease expires.
+            const leaseDir = `${dir}-lease`;
+            const leaseOwner = new DeliveryObligationStore(leaseDir, options(303, () => true, { claimLeaseMs: 100 }));
+            const leased = leaseOwner.create("leased", "run-1", "payload");
+            leaseOwner.beginAttempt(leased.id);
+            let observer = new DeliveryObligationStore(leaseDir, options(404, () => true, { claimLeaseMs: 100 }));
+            assert.equal(observer.recoverable().length, 0);
+            assert.equal(observer.beginAttempt(leased.id), undefined);
+            now += 101;
+            observer = new DeliveryObligationStore(leaseDir, options(404, () => true, { claimLeaseMs: 100 }));
+            assert.deepEqual(observer.recoverable().map(x => x.ambiguous), [true]);
+            assert.equal(observer.beginAttempt(leased.id).ownerPid, 404);
+
+            // Corrupt rows are quarantined and never block healthy rows.
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(path.join(dir, `${"a".repeat(64)}.json`), "{broken", "utf8");
+            assert.doesNotThrow(() => afterAck.recoverable());
+            assert.ok(fs.readdirSync(dir).some(name => name.includes(".corrupt-")));
+
+            // Old auxiliary artifacts are cleaned, while a recent live claim is preserved.
+            const artifactsDir = `${dir}-artifacts`;
+            const artifacts = new DeliveryObligationStore(artifactsDir, options(515, pid => pid === 515, {
+              claimLeaseMs: 100,
+              auxiliaryMaxAgeMs: 100,
+              maxAuxiliaryFiles: 4,
+            }));
+            const activeArtifactRow = artifacts.create("active", "run-1", "payload");
+            artifacts.beginAttempt(activeArtifactRow.id);
+            const liveClaim = `${activeArtifactRow.id}.claim`;
+            for (const name of [
+              `${"b".repeat(64)}.json.corrupt-old`,
+              `${"c".repeat(64)}.claim.stale-old`,
+              `${"d".repeat(64)}.json.tmp-old`,
+              `${"e".repeat(64)}.claim`,
+            ]) {
+              const file = path.join(artifactsDir, name);
+              fs.writeFileSync(file, name.endsWith(".claim")
+                ? JSON.stringify({ pid: 999, ownerToken: "old", createdAt: now - 1000 })
+                : "old", "utf8");
+              fs.utimesSync(file, new Date(now - 1000), new Date(now - 1000));
+            }
+            now += 101;
+            // Keep the real owner recent for this cleanup pass; age the junk relative to mtime.
+            const cleanup = new DeliveryObligationStore(artifactsDir, options(616, pid => pid === 515, {
+              claimLeaseMs: 1000,
+              auxiliaryMaxAgeMs: 100,
+              maxAuxiliaryFiles: 4,
+            }));
+            cleanup.recoverable();
+            const auxiliaryNames = fs.readdirSync(artifactsDir).filter(name => !name.endsWith(".json"));
+            assert.ok(auxiliaryNames.includes(liveClaim));
+            assert.equal(auxiliaryNames.some(name => name.includes("corrupt-old") || name.includes("stale-old") || name.includes("tmp-old") || name.startsWith("e".repeat(64))), false);
+            for (let i = 0; i < 10; i++) fs.writeFileSync(path.join(artifactsDir, `${"f".repeat(64)}.json.tmp-fresh-${i}`), "fresh");
+            cleanup.recoverable();
+            assert.ok(fs.readdirSync(artifactsDir).filter(name => !name.endsWith(".json")).length <= 4);
+            assert.ok(fs.existsSync(path.join(artifactsDir, liveClaim)));
+
+            // Row pruning must not strand/delete a recent live attempt, even at row/attempt caps.
+            const activeDir = `${dir}-active-prune`;
+            const activeStore = new DeliveryObligationStore(activeDir, options(717, pid => pid === 717, {
+              maxRows: 1,
+              maxAttempts: 1,
+              claimLeaseMs: 1000,
+            }));
+            const active = activeStore.create("active-prune", "run-1", "payload");
+            activeStore.beginAttempt(active.id);
+            activeStore.create("new-row", "run-2", "payload");
+            assert.equal(activeStore.read(active.id).state, "attempting");
+            assert.ok(fs.existsSync(path.join(activeDir, `${active.id}.claim`)));
+
+            // Retention has a hard row cap.
+            const boundedDir = `${dir}-bounded`;
+            const bounded = new DeliveryObligationStore(boundedDir, options(505, () => false, { maxRows: 3 }));
+            for (let i = 0; i < 6; i++) { now += 1; bounded.create(`w-${i}`, `r-${i}`, `payload-${i}`); }
+            assert.ok(fs.readdirSync(boundedDir).filter(name => name.endsWith(".json")).length <= 3);
+
+            // Attempt count is also bounded across fresh processes.
+            const retryDir = `${dir}-retry`;
+            const retrying = new DeliveryObligationStore(retryDir, options(707, () => false, { maxAttempts: 2 }));
+            const retryRow = retrying.create("retry-worker", "retry-run", "retry payload");
+            retrying.beginAttempt(retryRow.id); retrying.finishAttempt(retryRow.id, false);
+            retrying.beginAttempt(retryRow.id); retrying.finishAttempt(retryRow.id, false);
+            assert.equal(new DeliveryObligationStore(retryDir, options(808, () => false, { maxAttempts: 2 })).recoverable().length, 0);
+
+            // A non-directory path produces a diagnosable throw; index.ts catches it and sends in-memory.
+            const blocked = `${dir}-blocked`;
+            fs.writeFileSync(blocked, "not a directory", "utf8");
+            const degraded = new DeliveryObligationStore(path.join(blocked, "child"), options(606));
+            assert.throws(() => degraded.create("w", "r", "payload"));
+            """#,
+        ]
+        var environment = ProcessInfo.processInfo.environment
+        environment["DELIVERY_MODULE"] = module.absoluteString
+        environment["DELIVERY_DIR"] = directory.path
+        node.environment = environment
+        let stderr = Pipe()
+        node.standardError = stderr
+        try node.run()
+        node.waitUntilExit()
+        let errorText = String(
+            data: stderr.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+        XCTAssertEqual(node.terminationStatus, 0, errorText)
     }
 
     /// A boolean stallNotified pushed once and then went silent until the 15-minute heartbeat.
