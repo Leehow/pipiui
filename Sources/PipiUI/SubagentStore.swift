@@ -1616,6 +1616,16 @@ final class SubagentStore: ObservableObject {
         onAgentCloseoutMayHaveChanged?()
     }
 
+    /// 用户手动把失败项标记为已处理：closeout 置为 `.cleaned`，不再计入「需关注」。
+    /// `agents` 的 in-place 修改访问器在批外自动发布 objectWillChange，无需手动发送。
+    func markCleaned(id: String) {
+        guard let i = index(forAgentID: id) else { return }
+        agents[i].closeoutDisposition = .cleaned
+        agents[i].closeoutReason = "用户标记为已处理"
+        scheduleSave()
+        onAgentCloseoutMayHaveChanged?()
+    }
+
     /// Reconcile terminal agent rows with Git after the worktree was handled outside this panel.
     /// This is observation-only: it never removes a worktree, branch, or file. Synchronous Git
     /// probes run on the serialized main-repo background queue; only state updates run on main.

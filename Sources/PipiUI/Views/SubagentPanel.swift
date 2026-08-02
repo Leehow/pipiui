@@ -15,6 +15,8 @@ struct SubagentPanel: View {
     @State private var pinToBottom = true
     /// UI window only: zero is the newest fixed-size page; mounted agent rows never grow with use.
     @State private var panelPageFromNewest = 0
+    /// agentList 内 ScrollViewReader 的代理快照：header 徽章点击时滚动列表（reader 只存在于列表分支内）。
+    @State private var listScrollProxy: ScrollViewProxy?
 
     /// 上下分栏比例（列表高度 / 可用高度）。拖拽 onChanged 更新，onEnded 持久化。
     @State private var listHeightRatio = LayoutPersistence.subagentListHeightRatio()
@@ -85,12 +87,15 @@ struct SubagentPanel: View {
                         .fixedSize(horizontal: true, vertical: false)
                 }
                 if summary.failedCount > 0 {
-                    Text(SubagentPresentationScale.failureText(summary))
-                        .font(.caption)
-                        .foregroundStyle(summary.failedAttentionCount > 0 ? Color.red : Color.orange)
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
-                        .help(SubagentPresentationScale.failureHelp(summary))
+                    Button(action: focusOnFailedAgent) {
+                        Text(SubagentPresentationScale.failureText(summary))
+                            .font(.caption)
+                            .foregroundStyle(summary.failedAttentionCount > 0 ? Color.red : Color.orange)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .buttonStyle(.plain)
+                    .help(SubagentPresentationScale.failureHelp(summary))
                 }
             }
             .lineLimit(1)
@@ -195,7 +200,8 @@ struct SubagentPanel: View {
                             selected: agent.id == store.selectedId,
                             abortPending: store.abortPending.contains(agent.id),
                             onSelect: { store.selectedId = agent.id },
-                            onAbort: { onAbort(agent.id) }
+                            onAbort: { onAbort(agent.id) },
+                            onMarkCleaned: { store.markCleaned(id: agent.id) }
                         )
                     }
                     if window.pageCount > 1 {
@@ -242,6 +248,7 @@ struct SubagentPanel: View {
             .scrollIndicators(.automatic)
             .onAppear {
                 DispatchQueue.main.async {
+                    listScrollProxy = proxy
                     jumpToListBottom(proxy)
                 }
             }
@@ -264,6 +271,18 @@ struct SubagentPanel: View {
     }
 
     private var listBottomAnchorID: String { "subagent-list-bottom" }
+
+    /// 失败徽章点击：选中并滚动到第一个需关注的失败 agent；全部已清理时回退到第一个失败项。
+    /// 失败/需关注行是列表优先行，任何分页下都渲染，故 scrollTo 总能命中，无需翻页。
+    private func focusOnFailedAgent() {
+        let order = store.displayOrder
+        let target = order.first(where: {
+            $0.state == .failed && !SubagentPresentationScale.isCleaned($0)
+        }) ?? order.first(where: { $0.state == .failed })
+        guard let target else { return }
+        store.selectedId = target.id
+        listScrollProxy?.scrollTo(target.id, anchor: .center)
+    }
 
     /// 非 flip 列表：可视底 = documentEnd，锚点贴底即显示最新条目。
     private func jumpToListBottom(_ proxy: ScrollViewProxy) {
@@ -535,8 +554,21 @@ private struct AgentRow: View {
     var abortPending: Bool = false
     let onSelect: () -> Void
     var onAbort: (() -> Void)? = nil
+    var onMarkCleaned: (() -> Void)? = nil
 
     var body: some View {
+        if agent.state == .failed, !SubagentPresentationScale.isCleaned(agent) {
+            rowContent.contextMenu {
+                Button("标记已处理") {
+                    onMarkCleaned?()
+                }
+            }
+        } else {
+            rowContent
+        }
+    }
+
+    private var rowContent: some View {
         HStack(spacing: 0) {
             Button(action: onSelect) {
                 selectionArea
