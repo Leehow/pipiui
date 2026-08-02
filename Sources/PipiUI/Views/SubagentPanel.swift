@@ -87,7 +87,7 @@ struct SubagentPanel: View {
                 if summary.failedCount > 0 {
                     Text(SubagentPresentationScale.failureText(summary))
                         .font(.caption)
-                        .foregroundStyle(summary.failedPendingCount > 0 ? Color.red : Color.orange)
+                        .foregroundStyle(summary.failedAttentionCount > 0 ? Color.red : Color.orange)
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
                         .help(SubagentPresentationScale.failureHelp(summary))

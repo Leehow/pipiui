@@ -798,10 +798,10 @@ enum SubagentPresentationScale {
         let runningCount: Int
         let failedCount: Int
         let totalCost: Double
-        /// 失败中已有最终系统处置（closeout 为 cleaned/retained）的数量。
-        let failedDisposedCount: Int
-        /// 失败中仍待处理（closeout 为 unclassified/needsFixer/needsUser）的数量。
-        let failedPendingCount: Int
+        /// 失败中 closeout 为 `.cleaned`（失败项/worktree 清理已完成）的数量。
+        let failedCleanedCount: Int
+        /// 失败中仍需关注（closeout 为 retained/unclassified/needsFixer/needsUser）的数量。
+        let failedAttentionCount: Int
 
         var finishedCount: Int { totalCount - runningCount }
     }
@@ -846,8 +846,8 @@ enum SubagentPresentationScale {
         let limit = max(0, rowLimit)
         var runningCount = 0
         var failedCount = 0
-        var failedDisposedCount = 0
-        var failedPendingCount = 0
+        var failedCleanedCount = 0
+        var failedAttentionCount = 0
         var totalCost = 0.0
         var problems: [SubagentInfo] = []
         var running: [SubagentInfo] = []
@@ -860,10 +860,10 @@ enum SubagentPresentationScale {
             if agent.state == .running { runningCount += 1 }
             if agent.state == .failed {
                 failedCount += 1
-                if isDisposed(agent) {
-                    failedDisposedCount += 1
+                if isCleaned(agent) {
+                    failedCleanedCount += 1
                 } else {
-                    failedPendingCount += 1
+                    failedAttentionCount += 1
                 }
             }
             totalCost += agent.cost
@@ -888,8 +888,8 @@ enum SubagentPresentationScale {
             runningCount: runningCount,
             failedCount: failedCount,
             totalCost: totalCost,
-            failedDisposedCount: failedDisposedCount,
-            failedPendingCount: failedPendingCount
+            failedCleanedCount: failedCleanedCount,
+            failedAttentionCount: failedAttentionCount
         )
         return CardPresentation(
             summary: summary,
@@ -903,17 +903,17 @@ enum SubagentPresentationScale {
     static func summary(for agents: [SubagentInfo]) -> Summary {
         var runningCount = 0
         var failedCount = 0
-        var failedDisposedCount = 0
-        var failedPendingCount = 0
+        var failedCleanedCount = 0
+        var failedAttentionCount = 0
         var totalCost = 0.0
         for agent in agents {
             if agent.state == .running { runningCount += 1 }
             if agent.state == .failed {
                 failedCount += 1
-                if isDisposed(agent) {
-                    failedDisposedCount += 1
+                if isCleaned(agent) {
+                    failedCleanedCount += 1
                 } else {
-                    failedPendingCount += 1
+                    failedAttentionCount += 1
                 }
             }
             totalCost += agent.cost
@@ -923,15 +923,15 @@ enum SubagentPresentationScale {
             runningCount: runningCount,
             failedCount: failedCount,
             totalCost: totalCost,
-            failedDisposedCount: failedDisposedCount,
-            failedPendingCount: failedPendingCount
+            failedCleanedCount: failedCleanedCount,
+            failedAttentionCount: failedAttentionCount
         )
     }
 
-    /// 保守的系统处置判定：只有 closeout 为 `.cleaned` 才算「已处置」（失败项清理已完成）；
+    /// closeout 分类判定：只有 `.cleaned` 计入「已清理」（失败项/worktree 清理已完成）。
     /// `.retained` 可能是验证失败或自动合并/清理被禁止而保留待复核，因此与未分类/需 fixer/
-    /// 需用户一样一律「待处理」。绝不代表用户已确认。
-    static func isDisposed(_ agent: SubagentInfo) -> Bool {
+    /// 需用户一样一律计入「需关注」。不代表底层失败已修复或用户已确认。
+    static func isCleaned(_ agent: SubagentInfo) -> Bool {
         switch agent.closeoutDisposition {
         case .cleaned:
             return true
@@ -940,22 +940,22 @@ enum SubagentPresentationScale {
         }
     }
 
-    /// 失败徽标单行文案：全部已处置 => 「N 失败·已处置」；
-    /// 有待处理 => 「N 失败·待处理」（全部待处理）或「N 失败·M 待处理」。
+    /// 失败徽标单行文案：全部已清理 => 「N 失败·已清理」；
+    /// 有需关注 => 「N 失败·需关注」（全部需关注）或「N 失败·M 需关注」。
     static func failureText(_ summary: Summary) -> String {
         guard summary.failedCount > 0 else { return "" }
-        if summary.failedPendingCount == 0 {
-            return "\(summary.failedCount) 失败·已处置"
+        if summary.failedAttentionCount == 0 {
+            return "\(summary.failedCount) 失败·已清理"
         }
-        if summary.failedPendingCount == summary.failedCount {
-            return "\(summary.failedCount) 失败·待处理"
+        if summary.failedAttentionCount == summary.failedCount {
+            return "\(summary.failedCount) 失败·需关注"
         }
-        return "\(summary.failedCount) 失败·\(summary.failedPendingCount) 待处理"
+        return "\(summary.failedCount) 失败·\(summary.failedAttentionCount) 需关注"
     }
 
-    /// 失败徽标 help：明确 已处置/待处理 语义，不暗示用户确认。
+    /// 失败徽标 help：明确 已清理/需关注 语义；不暗示底层失败已修复或用户已确认。
     static func failureHelp(_ summary: Summary) -> String {
-        "失败 \(summary.failedCount) 个：已处置 \(summary.failedDisposedCount)（失败项清理已完成）；待处理 \(summary.failedPendingCount)（未分类、保留待复核、需 fixer 或需用户介入）。不代表用户已确认。"
+        "失败 \(summary.failedCount) 个：已清理 \(summary.failedCleanedCount)（关联失败项/worktree 清理已完成）；需关注 \(summary.failedAttentionCount)（未分类、保留待复核、需 fixer 或需用户介入）。不代表底层失败已修复或用户已确认。"
     }
 
     /// Keeps every page under a fixed hard cap and in original tree order. Selected and recent
