@@ -64,6 +64,9 @@ struct SettingsSheet: View {
     @State private var fxRefreshing = false
     @State private var fxMessage: String?
     @State private var fxError: String?
+    /// 任务提醒开关（通用 → 提醒；缺省开启）。
+    @State private var notifyCompletionEnabled = TaskNotifierSettings.completionEnabled()
+    @State private var notifyErrorEnabled = TaskNotifierSettings.errorEnabled()
     /// .env 中已配置 key 的 provider 集合（用于 auth.json 残留冲突警告）。
     @State private var envConfiguredProviders: Set<String> = []
     /// .env 存取（placeholder 查询、清除、删除凭据时可选的同步移除）。
@@ -235,7 +238,46 @@ struct SettingsSheet: View {
             Divider()
             visionFallbackSection
             Divider()
+            notificationSection
+            Divider()
             priceSection
+        }
+    }
+
+    // MARK: - 任务提醒
+
+    private var notificationSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("提醒")
+                .font(.title3.weight(.semibold))
+            Text("任务完成或出错时提醒你（打包运行时走系统通知；开发运行时用应用内横幅 + 提示音）。任务完成提醒只在你看不到结果（会话未选中或应用不在前台）时弹出。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(
+                    "任务完成时提醒",
+                    isOn: Binding(
+                        get: { notifyCompletionEnabled },
+                        set: { newValue in
+                            notifyCompletionEnabled = newValue
+                            TaskNotifierSettings.setCompletionEnabled(newValue)
+                        }
+                    )
+                )
+                Toggle(
+                    "任务出错时提醒",
+                    isOn: Binding(
+                        get: { notifyErrorEnabled },
+                        set: { newValue in
+                            notifyErrorEnabled = newValue
+                            TaskNotifierSettings.setErrorEnabled(newValue)
+                        }
+                    )
+                )
+            }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
         }
     }
 

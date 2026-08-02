@@ -23,8 +23,8 @@ final class SubagentContinuityTests: XCTestCase {
     /// substituting a generated id would hand back a worker the boss cannot address again.
     func testInvalidAgentIdIsReportedToTheModelNotSilentlyReplaced() throws {
         let s = try source()
-        XCTAssertTrue(s.contains("const problem = validateAgentId(candidate.trim());"))
-        XCTAssertTrue(s.contains("content: [{ type: \"text\", text: problem }]"))
+        XCTAssertTrue(s.contains("const invalid = validateAgentId(normalized);"))
+        XCTAssertTrue(s.contains("content: [{ type: \"text\", text: callerSelection.problem }]"))
         XCTAssertTrue(s.contains("isError: true"))
     }
 
@@ -64,14 +64,14 @@ final class SubagentContinuityTests: XCTestCase {
         let s = try source()
         XCTAssertTrue(s.contains("agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION }))"))
         XCTAssertTrue(s.contains("fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION }))"))
-        XCTAssertTrue(s.contains("const agentId = t.agentId?.trim() || generatePipiuiAgentId();"),
+        XCTAssertTrue(s.contains("const agentId = t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);"),
                       "parallel tasks must be nameable too")
-        XCTAssertTrue(s.contains("const agentId = params.agentId?.trim() || generatePipiuiAgentId();"))
+        XCTAssertTrue(s.contains("const agentId = params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);"))
         // Regression: the synchronous paths minted their own id, so a named worker silently
         // became an anonymous one whenever the dispatch was not backgrounded.
-        XCTAssertTrue(s.contains("agentId: t.agentId?.trim(), fresh: t.fresh }"),
+        XCTAssertTrue(s.contains("agentId: t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),"),
                       "synchronous parallel must honour the caller's name")
-        XCTAssertTrue(s.contains("agentId: params.agentId?.trim(), fresh: params.fresh }"),
+        XCTAssertTrue(s.contains("agentId: params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),"),
                       "synchronous single must honour the caller's name")
     }
 
@@ -94,11 +94,14 @@ final class SubagentContinuityTests: XCTestCase {
     func testSessionRetentionIsConservativeAndNeverTouchesRunningWorkers() throws {
         let s = try source()
         XCTAssertTrue(s.contains("const SESSION_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;"))
-        XCTAssertTrue(s.contains("const SESSION_MAX_KEEP = 50;"))
+        XCTAssertTrue(s.contains("const SESSION_MAX_KEEP = 1000;"))
         XCTAssertTrue(s.contains("function selectStaleSessions("), "the rule must be pure and testable")
         XCTAssertTrue(s.contains("entries.filter((e) => !opts.running.has(e.agentId))"),
                       "a running worker's conversation must never be a deletion candidate")
-        XCTAssertTrue(s.contains("if (prunedThisProcess) return;"), "housekeeping runs once, not per dispatch")
+        XCTAssertTrue(s.contains("const SESSION_PRUNE_COMPLETION_INTERVAL = 256;"),
+                      "housekeeping must be amortized rather than scanning per worker")
+        XCTAssertTrue(s.contains("pruneAgentSessions(sessionDir, \"completed\");"),
+                      "later waves must keep advancing retention")
         // Cleanup must never be able to fail a dispatch.
         XCTAssertTrue(s.contains("// A file we cannot remove only costs disk; never fail a dispatch over housekeeping."))
     }
@@ -124,7 +127,9 @@ final class SubagentContinuityTests: XCTestCase {
                       "only await turns an async rejection into a caught failure")
         XCTAssertTrue(s.contains("const pendingDone = new Map<string, PendingDoneEntry>();"),
                       "a done is unconfirmed until its promise resolves, so it must be tracked for retry")
-        XCTAssertTrue(s.contains("if (pendingDone.get(agentId) === entry) pendingDone.delete(agentId);"),
+        XCTAssertTrue(s.contains("if (pendingDone.get(agentId) !== entry) return;"),
+                      "a stale promise must not clear replacement delivery state")
+        XCTAssertTrue(s.contains("if (ok) {\n\t\t\tdeliveredDone.add(agentId);\n\t\t\tpendingDone.delete(agentId);"),
                       "only a confirmed resolve may clear the retry state")
         XCTAssertTrue(s.contains("if (now - entry.lastAttemptAt < DONE_RETRY_MIN_INTERVAL_MS) continue;"),
                       "retries ride the 30s scan but no more than once a minute per worker")
@@ -132,19 +137,20 @@ final class SubagentContinuityTests: XCTestCase {
                       "a retry must say it is the same event, not a new one")
     }
 
-    /// The same agentId's done used to be deliverable twice (a second notify, a racing double
-    /// resolve, or a retry), and the second followUp landed below the previous turn's wrap-up,
-    /// pushing the summary out of view and making the model answer a duplicate. Each agentId may
-    /// deliver at most one done per run: the latch is armed on the only delivery exit and
-    /// cleared when a new run of the same id starts.
+    /// A racing notify must not start a second send, but a failed first send must remain retryable.
+    /// The delivered latch therefore arms only after confirmation, separately from in-flight state.
     func testDoneIsDeliveredAtMostOncePerAgentRun() throws {
         let s = try source()
         XCTAssertTrue(s.contains("const deliveredDone = new Set<string>();"),
-                      "a per-agent latch is needed so a second notify/retry cannot re-deliver the same done")
+                      "confirmed delivery needs a per-agent latch")
         XCTAssertTrue(s.contains("if (deliveredDone.has(agentId)) return;"),
-                      "the latch must intercept every later attempt, regardless of which path raised it")
+                      "confirmed delivery must intercept every later attempt")
+        XCTAssertTrue(s.contains("if (entry.inFlight || entry.attempts >= DONE_MAX_ATTEMPTS) return;"),
+                      "an unresolved send must block duplicate concurrent sends")
+        XCTAssertTrue(s.contains("if (ok) {\n\t\t\tdeliveredDone.add(agentId);"),
+                      "only a successful send may arm the delivered latch")
         XCTAssertTrue(s.contains("deliveredDone.add(agentId);"),
-                      "the first delivery arms the latch")
+                      "confirmed delivery arms the latch")
         XCTAssertTrue(s.contains("deliveredDone.delete(agentId);"),
                       "re-dispatching/resuming the same agentId opens a new run, so its own done may deliver again")
     }

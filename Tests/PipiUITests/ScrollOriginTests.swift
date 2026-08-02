@@ -20,8 +20,8 @@ final class ScrollOriginTests: XCTestCase {
         XCTAssertFalse(ScrollOrigin.classify(mouseButtonsDown: 0).allowsUnpin)
     }
 
-    /// The app scrolls to the bottom roughly every 50 ms while streaming. Those
-    /// moves must never be mistaken for the user letting go of the bottom.
+    /// AppKit content-growth following may move the clip view while streaming.
+    /// Those moves must never be mistaken for the user releasing the bottom pin.
     func testStreamingScrollsNeverUnpin() {
         for _ in 0..<100 {
             XCTAssertFalse(ScrollOrigin.classify(mouseButtonsDown: 0).allowsUnpin)

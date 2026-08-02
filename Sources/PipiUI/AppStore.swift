@@ -215,13 +215,30 @@ final class AppStore: ObservableObject {
         LocalRemoteSettings.isLANEnabledForNewLaunch
     @Published private(set) var localRemoteLANURL: URL?
     @Published private(set) var localRemoteLANStatus = "已关闭"
+    /// Session-scoped WebRTC viability spike. It is never persisted and serves
+    /// only a loopback Chrome harness backed by a retained WKWebView host.
+    @Published private(set) var remotePeerTestEnabled = false
+    @Published private(set) var remotePeerTestURL: URL?
+    @Published private(set) var remotePeerTestStatus = "已关闭"
+    @Published private(set) var remotePeerTestEchoVerified = false
     @Published private(set) var remoteRelayConfiguration = RemoteRelaySettings.load()
     @Published private(set) var remoteRelayState: RemoteRelayConnectionState = .disabled
+    @Published private(set) var remotePeerProductionState: RemotePeerProductionState = .disabled
+    @Published private(set) var remotePairingPayload: String?
+    @Published private(set) var remotePairingMessage = ""
+    @Published private(set) var remotePairingPairID: String?
+    @Published private(set) var remotePairingFingerprint: String?
+    @Published private(set) var remotePairingExpiresAt: Date?
+    @Published private(set) var remoteLegacyMigrationRequired = false
     private var localRemoteHost: RemoteHostService?
     private var localRemoteHostGeneration = UUID()
+    private var remotePeerTransport: WebKitRemotePeerTransport?
+    private var remotePeerGeneration = UUID()
     private lazy var remoteHostController = RemoteHostController(store: self)
     private var remoteRelayClient: RemoteRelayClient?
+    private var remoteRelayPeerTransport: WebKitRemotePeerTransport?
     private var remoteRelayGeneration = UUID()
+    private var remotePairingExpiryWorkItem: DispatchWorkItem?
 
     /// Bumped when model picker visibility preferences change so InputBar refreshes.
     @Published var modelVisibilityRevision: Int = 0
@@ -315,6 +332,7 @@ final class AppStore: ObservableObject {
         if enabled {
             startLocalRemoteHost()
         } else {
+            stopRemotePeerTest()
             localRemoteHostGeneration = UUID()
             localRemoteHost?.stop()
             localRemoteHost = nil
@@ -324,6 +342,53 @@ final class AppStore: ObservableObject {
             localRemoteLANURL = nil
             localRemoteLANStatus = "已关闭"
         }
+    }
+
+    func setRemotePeerTestEnabled(_ enabled: Bool) {
+        guard enabled != remotePeerTestEnabled
+                || (enabled && remotePeerTransport == nil) else {
+            return
+        }
+        if !enabled {
+            stopRemotePeerTest()
+            return
+        }
+
+        let generation = UUID()
+        remotePeerGeneration = generation
+        remotePeerTestEnabled = true
+        remotePeerTestURL = localRemoteURL?.appendingPathComponent(
+            "p2p-test",
+            isDirectory: true
+        )
+        remotePeerTestStatus = "正在载入 WKWebView host…"
+        remotePeerTestEchoVerified = false
+        let transport = WebKitRemotePeerTransport { [weak self] state in
+            guard let self,
+                  self.remotePeerGeneration == generation,
+                  self.remotePeerTestEnabled else {
+                return
+            }
+            self.remotePeerTestStatus = state.displayText
+            self.remotePeerTestEchoVerified = state == .echoVerified
+        }
+        remotePeerTransport = transport
+        localRemoteHost?.setPeerTransport(transport)
+        transport.start()
+        if !localRemoteEnabled {
+            setLocalRemoteEnabled(true)
+        }
+    }
+
+    private func stopRemotePeerTest() {
+        remotePeerGeneration = UUID()
+        remotePeerTestEnabled = false
+        remotePeerTestURL = nil
+        remotePeerTestStatus = "已关闭"
+        remotePeerTestEchoVerified = false
+        localRemoteHost?.setPeerTransport(nil)
+        remotePeerTransport?.stop()
+        remotePeerTransport = nil
     }
 
     func setLocalRemoteLANEnabled(_ enabled: Bool) {
@@ -353,10 +418,58 @@ final class AppStore: ObservableObject {
             startRemoteRelay()
         } else {
             remoteRelayGeneration = UUID()
+            clearRemotePairing()
             remoteRelayClient?.stop()
             remoteRelayClient = nil
+            remoteRelayPeerTransport?.stop()
+            remoteRelayPeerTransport = nil
             remoteRelayState = .disabled
+            remotePeerProductionState = .disabled
         }
+    }
+
+    func beginRemotePairing() {
+        guard let remoteRelayClient else {
+            remotePairingPayload = nil
+            remotePairingMessage = "配对创建失败，请先启用 Relay"
+            return
+        }
+        remotePairingMessage = "正在创建一次性配对链接…"
+        // Lifecycle events carry ownership of visible pairing state. A delayed
+        // completion from a replaced request must never clear the replacement QR.
+        remoteRelayClient.beginPairing { _ in }
+    }
+
+    func cancelRemotePairing() {
+        remoteRelayClient?.cancelPairing()
+        clearRemotePairing(message: "配对已取消")
+    }
+
+    func refreshRemoteLegacyMigrationStatus() {
+        remoteLegacyMigrationRequired = RemoteRelaySettings.needsLegacyMigration(
+            remoteRelayConfiguration,
+            hasLegacyCredentials: false
+        )
+    }
+
+    @discardableResult
+    func migrateLegacyRemoteConfiguration() -> Bool {
+        let deletion = RemoteRelayCredentialStore.deleteAll()
+        remoteRelayConfiguration = RemoteRelaySettings.migratedFromLegacy(
+            remoteRelayConfiguration
+        )
+        RemoteRelaySettings.save(remoteRelayConfiguration)
+        remoteLegacyMigrationRequired = false
+        clearRemotePairing(message: deletion.succeeded
+            ? "旧试点配置和凭据已清理，已切换到服务器隧道默认地址"
+            : "已切换现代地址，但旧 Keychain 凭据清理未完成")
+        if remoteRelayConfiguration.enabled {
+            startRemoteRelay()
+        } else {
+            remoteRelayState = .disabled
+            remotePeerProductionState = .disabled
+        }
+        return deletion.succeeded
     }
 
     @discardableResult
@@ -369,6 +482,7 @@ final class AppStore: ObservableObject {
             webSocketURL: webSocketURL,
             publicURL: publicURL
         ),
+              webSocketURL.path == "/tunnel/ws",
               !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return false
         }
@@ -420,21 +534,62 @@ final class AppStore: ObservableObject {
     }
 
     func deleteRemoteRelayCredentials() {
-        RemoteRelayCredentialStore.deleteAll()
+        _ = RemoteRelayCredentialStore.deleteAll()
         remoteRelayClient?.stop()
         remoteRelayClient = nil
+        remoteRelayPeerTransport?.stop()
+        remoteRelayPeerTransport = nil
+        remoteLegacyMigrationRequired = false
         if remoteRelayConfiguration.enabled {
-            remoteRelayState = .authenticationFailed
+            startRemoteRelay()
         }
     }
 
     private func startRemoteRelay() {
+        if remoteRelayConfiguration.webSocketURL.path != "/tunnel/ws" {
+            remoteRelayConfiguration = RemoteRelaySettings.migratedFromLegacy(
+                remoteRelayConfiguration
+            )
+            RemoteRelaySettings.save(remoteRelayConfiguration)
+        }
         let generation = UUID()
         remoteRelayGeneration = generation
+        clearRemotePairing()
         remoteRelayClient?.stop()
+        remoteRelayPeerTransport?.stop()
+        remoteRelayPeerTransport = nil
+        remotePeerProductionState = .disabled
+        let peerTransport: WebKitRemotePeerTransport?
+        if remoteRelayConfiguration.webSocketURL.path == "/tunnel/ws" {
+            let transport = WebKitRemotePeerTransport(
+                productionStateChanged: { [weak self] state in
+                    DispatchQueue.main.async {
+                        guard let self,
+                              self.remoteRelayGeneration == generation,
+                              self.remoteRelayPeerTransport != nil else { return }
+                        self.remotePeerProductionState = state
+                    }
+                },
+                stateChanged: { _ in }
+            )
+            transport.start()
+            remoteRelayPeerTransport = transport
+            peerTransport = transport
+        } else {
+            peerTransport = nil
+        }
         let client = RemoteRelayClient(
             controller: remoteHostController,
             configuration: remoteRelayConfiguration,
+            peerTransport: peerTransport,
+            pairingChanged: { [weak self] event in
+                DispatchQueue.main.async {
+                    guard let self,
+                          self.remoteRelayGeneration == generation,
+                          self.remoteRelayClient != nil else { return }
+                    self.handleRemotePairingEvent(event)
+                }
+            },
             stateChanged: { [weak self] state in
                 DispatchQueue.main.async {
                     guard let self,
@@ -446,6 +601,45 @@ final class AppStore: ObservableObject {
         )
         remoteRelayClient = client
         client.start()
+    }
+
+    func handleRemotePairingEvent(_ event: RemotePairingLifecycleEvent) {
+        switch event {
+        case .created(let pairing):
+            remotePairingPayload = pairing.url.absoluteString
+            remotePairingPairID = pairing.pairID
+            remotePairingFingerprint = pairing.fingerprint
+            remotePairingExpiresAt = pairing.expiresAt
+            remotePairingMessage = "一次性配对链接已生成"
+            remotePairingExpiryWorkItem?.cancel()
+            let pairID = pairing.pairID
+            let item = DispatchWorkItem { [weak self] in
+                guard let self, self.remotePairingPairID == pairID else { return }
+                self.remoteRelayClient?.cancelPairing()
+                self.clearRemotePairing(message: "配对链接已过期")
+            }
+            remotePairingExpiryWorkItem = item
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + max(0, pairing.expiresAt.timeIntervalSinceNow),
+                execute: item
+            )
+        case .claimed:
+            clearRemotePairing(message: "浏览器已完成配对")
+        case .cancelled:
+            clearRemotePairing(message: "配对已取消")
+        case .invalidated:
+            clearRemotePairing(message: "配对链接已失效")
+        }
+    }
+
+    private func clearRemotePairing(message: String = "") {
+        remotePairingExpiryWorkItem?.cancel()
+        remotePairingExpiryWorkItem = nil
+        remotePairingPayload = nil
+        remotePairingPairID = nil
+        remotePairingFingerprint = nil
+        remotePairingExpiresAt = nil
+        remotePairingMessage = message
     }
 
     private func startLocalRemoteHost() {
@@ -474,6 +668,7 @@ final class AppStore: ObservableObject {
         guard let host = RemoteHostService(
             controller: remoteHostController,
             accessMode: accessMode,
+            peerTransport: remotePeerTransport,
             stateChanged: { [weak self] state in
                 guard let self,
                       self.localRemoteHostGeneration == generation else { return }
@@ -485,6 +680,12 @@ final class AppStore: ObservableObject {
                 case .listening(let loopbackURL, let lanURL):
                     self.localRemoteURL = loopbackURL
                     self.localRemoteLANURL = lanURL
+                    self.remotePeerTestURL = self.remotePeerTestEnabled
+                        ? loopbackURL.appendingPathComponent(
+                            "p2p-test",
+                            isDirectory: true
+                        )
+                        : nil
                     if lanURL != nil {
                         self.localRemoteStatus = "本机与受信任局域网可访问"
                         self.localRemoteLANStatus = "仅限受信任局域网测试"
@@ -498,6 +699,7 @@ final class AppStore: ObservableObject {
                     self.localRemoteStatus = "启动失败：\(message)"
                     self.localRemoteURL = nil
                     self.localRemoteLANURL = nil
+                    self.remotePeerTestURL = nil
                     if self.localRemoteLANEnabled {
                         self.localRemoteLANStatus = "启动失败：\(message)"
                     }
@@ -507,6 +709,7 @@ final class AppStore: ObservableObject {
                     }
                     self.localRemoteURL = nil
                     self.localRemoteLANURL = nil
+                    self.remotePeerTestURL = nil
                 }
             }
         ) else {
@@ -609,9 +812,8 @@ final class AppStore: ObservableObject {
             }
             let action = request["action"].string ?? ""
             if action == "agent_event" {
-                session.subagents.handle(request)
-                if session.rightPanel == nil {
-                    session.subagents.selectLatest()
+                let shouldAutoOpen = session.subagents.enqueue(request)
+                if shouldAutoOpen, session.rightPanel == nil {
                     session.rightPanel = .agents
                 }
                 respond(["ok": true])
@@ -1738,10 +1940,15 @@ final class AppStore: ObservableObject {
 
     func shutdown() {
         pendingHistoricalSessionOpens.removeAll()
+        stopRemotePeerTest()
         localRemoteHost?.stop()
         localRemoteHost = nil
         remoteRelayClient?.stop()
         remoteRelayClient = nil
+        clearRemotePairing()
+        remoteRelayPeerTransport?.stop()
+        remoteRelayPeerTransport = nil
+        remotePeerProductionState = .disabled
         remoteHostController.resetRuntimeState()
         ComputerCoordinator.shared.releaseAll(revokeConsent: true)
         ComputerCoordinator.shared.shutdownInputMonitoring()

@@ -423,6 +423,137 @@ final class ComposerTextViewTests: XCTestCase {
         XCTAssertEqual(boundText, "")
     }
 
+    func testUnchangedSessionDoesNotDiscardMarkedText() {
+        var boundText = "draft"
+        var isFocused = false
+        var boundHeight = ComposerTextViewLayout.minimumHeight(
+            for: .systemFont(ofSize: NSFont.systemFontSize)
+        )
+        let identity = NSObject()
+
+        func parent() -> ComposerTextView {
+            ComposerTextView(
+                text: Binding(get: { boundText }, set: { boundText = $0 }),
+                isFocused: Binding(get: { isFocused }, set: { isFocused = $0 }),
+                height: Binding(get: { boundHeight }, set: { boundHeight = $0 }),
+                sessionIdentity: ObjectIdentifier(identity),
+                placeholder: "输入消息…",
+                onSubmit: {}
+            )
+        }
+
+        let coordinator = ComposerTextView.Coordinator(parent: parent())
+        let host = ComposerTextViewHost()
+        host.textView.delegate = coordinator
+        coordinator.host = host
+        var discardCount = 0
+        coordinator.discardMarkedText = { _ in discardCount += 1 }
+
+        coordinator.synchronize(host)
+        coordinator.parent = parent()
+        coordinator.synchronize(host)
+
+        XCTAssertEqual(discardCount, 0)
+        XCTAssertEqual(host.textView.string, "draft")
+        XCTAssertEqual(boundText, "draft")
+    }
+
+    func testSessionSwitchWithoutMarkedTextDoesNotContactIME() {
+        var boundText = "old draft"
+        var isFocused = false
+        var boundHeight = ComposerTextViewLayout.minimumHeight(
+            for: .systemFont(ofSize: NSFont.systemFontSize)
+        )
+        let firstIdentity = NSObject()
+        let secondIdentity = NSObject()
+        var activeIdentity = ObjectIdentifier(firstIdentity)
+
+        func parent() -> ComposerTextView {
+            ComposerTextView(
+                text: Binding(get: { boundText }, set: { boundText = $0 }),
+                isFocused: Binding(get: { isFocused }, set: { isFocused = $0 }),
+                height: Binding(get: { boundHeight }, set: { boundHeight = $0 }),
+                sessionIdentity: activeIdentity,
+                placeholder: "输入消息…",
+                onSubmit: {}
+            )
+        }
+
+        let coordinator = ComposerTextView.Coordinator(parent: parent())
+        let host = ComposerTextViewHost()
+        host.textView.delegate = coordinator
+        coordinator.host = host
+        coordinator.synchronize(host)
+        var discardCount = 0
+        coordinator.discardMarkedText = { _ in discardCount += 1 }
+
+        activeIdentity = ObjectIdentifier(secondIdentity)
+        boundText = "new draft"
+        coordinator.parent = parent()
+        coordinator.synchronize(host)
+
+        XCTAssertEqual(discardCount, 0)
+        XCTAssertEqual(host.textView.string, "new draft")
+        XCTAssertEqual(boundText, "new draft")
+    }
+
+    func testWarmSessionSwitchDiscardsOnlyMarkedTextAndKeepsDraftOwnership() {
+        var oldDraft = "old draft"
+        var newDraft = "new draft"
+        var isFocused = false
+        var boundHeight = ComposerTextViewLayout.minimumHeight(
+            for: .systemFont(ofSize: NSFont.systemFontSize)
+        )
+        let firstIdentity = NSObject()
+        let secondIdentity = NSObject()
+
+        func parent(identity: ObjectIdentifier, draft: Binding<String>) -> ComposerTextView {
+            ComposerTextView(
+                text: draft,
+                isFocused: Binding(get: { isFocused }, set: { isFocused = $0 }),
+                height: Binding(get: { boundHeight }, set: { boundHeight = $0 }),
+                sessionIdentity: identity,
+                placeholder: "输入消息…",
+                onSubmit: {}
+            )
+        }
+
+        let oldBinding = Binding(get: { oldDraft }, set: { oldDraft = $0 })
+        let coordinator = ComposerTextView.Coordinator(
+            parent: parent(identity: ObjectIdentifier(firstIdentity), draft: oldBinding)
+        )
+        let host = ComposerTextViewHost()
+        host.textView.delegate = coordinator
+        host.textView.onDidChangeText = { coordinator.textViewDidChangeText($0) }
+        coordinator.host = host
+        coordinator.synchronize(host)
+        host.textView.setMarkedText(
+            "旧会话拼音",
+            selectedRange: NSRange(location: 5, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+        XCTAssertTrue(host.textView.hasMarkedText())
+        XCTAssertTrue(oldDraft.contains("旧会话拼音"))
+
+        var discardCount = 0
+        coordinator.discardMarkedText = { textView in
+            discardCount += 1
+            textView.unmarkText()
+        }
+        let newBinding = Binding(get: { newDraft }, set: { newDraft = $0 })
+        coordinator.parent = parent(
+            identity: ObjectIdentifier(secondIdentity),
+            draft: newBinding
+        )
+        coordinator.synchronize(host)
+
+        XCTAssertEqual(discardCount, 1)
+        XCTAssertFalse(host.textView.hasMarkedText())
+        XCTAssertEqual(host.textView.string, "new draft")
+        XCTAssertEqual(newDraft, "new draft")
+        XCTAssertTrue(oldDraft.contains("旧会话拼音"))
+    }
+
     func testSessionRebindResetsOldSessionTypingUndoBoundary() {
         var boundText = ""
         var isFocused = false

@@ -38,6 +38,7 @@ struct MessageRow: View, Equatable {
     var onFlash: ((String) -> Void)? = nil
     var onSelectAgent: ((String) -> Void)?
     var onOpenFinishedGroup: ((AssistantBlockLayout.FinishedGroupPresentation) -> Void)?
+    var onOpenRunningTool: ((RunningToolDetailPresentation) -> Void)?
     var onCopy: (() -> Void)? = nil
     var onResend: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
@@ -220,6 +221,7 @@ struct MessageRow: View, Equatable {
             sessionKey: sessionKey,
             presentationScopeID: presentationScopeID,
             onOpenFinishedGroup: onOpenFinishedGroup,
+            onOpenRunningTool: onOpenRunningTool,
             entryId: item.entryId,
             isWorking: isWorking,
             onCopy: onCopy,
@@ -290,6 +292,7 @@ struct AssistantSegmentsView: View, Equatable {
     var sessionKey: String = ""
     var presentationScopeID: String = ""
     var onOpenFinishedGroup: ((AssistantBlockLayout.FinishedGroupPresentation) -> Void)?
+    var onOpenRunningTool: ((RunningToolDetailPresentation) -> Void)?
     var entryId: String? = nil
     var isWorking: Bool = false
     var completionText: String? = nil
@@ -480,7 +483,10 @@ struct AssistantSegmentsView: View, Equatable {
                     run: toolRuns[call.id],
                     isStreaming: isStreaming,
                     projectURL: projectURL,
-                    onFlash: onFlash
+                    onFlash: onFlash,
+                    onOpenDetail: onOpenRunningTool.map { open in
+                        { open(RunningToolDetailPresentation(call: call)) }
+                    }
                 )
             }
         case .text, .image, .video:
@@ -673,26 +679,24 @@ struct SubagentToolCardView: View {
     let agents: [SubagentInfo]
     var onSelect: ((String) -> Void)?
 
-    private var runningCount: Int { agents.filter { $0.state == .running }.count }
-    private var totalCost: Double { agents.reduce(0) { $0 + $1.cost } }
-
     var body: some View {
+        let presentation = SubagentPresentationScale.cardPresentation(for: agents)
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "person.2")
-                    .foregroundStyle(runningCount > 0 ? Color.blue : Color.green)
+                    .foregroundStyle(presentation.runningCount > 0 ? Color.blue : Color.green)
                 Text("subagent")
                     .font(.callout.weight(.semibold).monospaced())
-                Text(runningCount > 0 ? "\(runningCount)/\(agents.count) 运行中" : "\(agents.count) 个完成")
+                Text("共 \(presentation.totalCount) · 运行 \(presentation.runningCount) · 失败 \(presentation.failedCount)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                if totalCost > 0 {
-                    Text(String(format: "$%.3f", totalCost))
+                if presentation.totalCost > 0 {
+                    Text(String(format: "$%.3f", presentation.totalCost))
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
-                if runningCount > 0 {
+                if presentation.runningCount > 0 {
                     ProgressView().controlSize(.mini)
                 }
             }
@@ -702,7 +706,7 @@ struct SubagentToolCardView: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 0) {
-                ForEach(agents) { agent in
+                ForEach(presentation.visibleAgents) { agent in
                     HStack(spacing: 8) {
                         if agent.depth > 1 {
                             Image(systemName: "arrow.turn.down.right")
@@ -730,10 +734,42 @@ struct SubagentToolCardView: View {
                     .onTapGesture { onSelect?(agent.id) }
                     .pointingHandCursor(onSelect != nil)
                 }
+
+                if presentation.hiddenCount > 0 {
+                    if let onSelect, let selectionID = presentation.panelSelectionID {
+                        Button {
+                            onSelect(selectionID)
+                        } label: {
+                            hiddenAgentsLabel(presentation)
+                        }
+                        .buttonStyle(.plain)
+                        .pointingHandCursor()
+                        .accessibilityLabel("打开 Subagents 面板查看另外 \(presentation.hiddenCount) 个子代理")
+                    } else {
+                        hiddenAgentsLabel(presentation)
+                    }
+                }
             }
         }
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.03)))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.08)))
+    }
+
+    private func hiddenAgentsLabel(_ presentation: SubagentPresentationScale.CardPresentation) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "ellipsis.circle")
+            Text("当前优先显示 \(presentation.visibleAgents.count) 个，另有 \(presentation.hiddenCount) 个")
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Text("在 Subagents 面板查看全部")
+            Image(systemName: "sidebar.right")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder
@@ -745,6 +781,237 @@ struct SubagentToolCardView: View {
         case .aborted: Image(systemName: "stop.circle.fill").foregroundStyle(.orange).font(.caption)
         case .interrupted: Image(systemName: "bolt.slash.circle.fill").foregroundStyle(.orange).font(.caption)
         }
+    }
+}
+
+/// Pure, deterministic presentation policy for large subagent fan-outs.
+/// It bounds mounted rows without changing execution, aggregate accounting, or access to agents.
+enum SubagentPresentationScale {
+    static let cardRowLimit = 12
+    static let panelRowCap = 100
+    private static let panelPriorityReserve = 40
+
+    struct Summary: Equatable {
+        let totalCount: Int
+        let runningCount: Int
+        let failedCount: Int
+        let totalCost: Double
+
+        var finishedCount: Int { totalCount - runningCount }
+    }
+
+    struct CardPresentation: Equatable {
+        let summary: Summary
+        let visibleAgents: [SubagentInfo]
+        let hiddenCount: Int
+        let panelSelectionID: String?
+
+        var totalCount: Int { summary.totalCount }
+        var runningCount: Int { summary.runningCount }
+        var failedCount: Int { summary.failedCount }
+        var totalCost: Double { summary.totalCost }
+    }
+
+    struct PanelWindow: Equatable {
+        let agents: [SubagentInfo]
+        let totalCount: Int
+        let hiddenCount: Int
+        let pageFromNewest: Int
+        let pageCount: Int
+        let listIdentity: PanelListIdentity
+
+        var canShowNewer: Bool { pageFromNewest > 0 }
+        var canShowOlder: Bool { pageFromNewest + 1 < pageCount }
+    }
+
+    struct PanelListIdentity: Equatable {
+        let count: Int
+        let idFingerprint: UInt64
+
+        static let empty = PanelListIdentity(count: 0, idFingerprint: 0)
+    }
+
+    /// One pass computes exact aggregate counts/cost while retaining only bounded priority buckets.
+    /// Within each bucket the newest input row wins; priority is problems, running, then other/recent.
+    static func cardPresentation(
+        for agents: [SubagentInfo],
+        rowLimit: Int = cardRowLimit
+    ) -> CardPresentation {
+        let limit = max(0, rowLimit)
+        var runningCount = 0
+        var failedCount = 0
+        var totalCost = 0.0
+        var problems: [SubagentInfo] = []
+        var running: [SubagentInfo] = []
+        var other: [SubagentInfo] = []
+        problems.reserveCapacity(limit)
+        running.reserveCapacity(limit)
+        other.reserveCapacity(limit)
+
+        for agent in agents.reversed() {
+            if agent.state == .running { runningCount += 1 }
+            if agent.state == .failed { failedCount += 1 }
+            totalCost += agent.cost
+
+            if isProblematic(agent) {
+                if problems.count < limit { problems.append(agent) }
+            } else if agent.state == .running {
+                if running.count < limit { running.append(agent) }
+            } else if other.count < limit {
+                other.append(agent)
+            }
+        }
+
+        var visible: [SubagentInfo] = []
+        visible.reserveCapacity(limit)
+        appendPrefix(problems, to: &visible, limit: limit)
+        appendPrefix(running, to: &visible, limit: limit)
+        appendPrefix(other, to: &visible, limit: limit)
+
+        let summary = Summary(
+            totalCount: agents.count,
+            runningCount: runningCount,
+            failedCount: failedCount,
+            totalCost: totalCost
+        )
+        return CardPresentation(
+            summary: summary,
+            visibleAgents: visible,
+            hiddenCount: max(0, agents.count - visible.count),
+            panelSelectionID: visible.first?.id ?? agents.last?.id
+        )
+    }
+
+    /// Exact summary used by panel chrome, with no parallel filter/reduce passes.
+    static func summary(for agents: [SubagentInfo]) -> Summary {
+        var runningCount = 0
+        var failedCount = 0
+        var totalCost = 0.0
+        for agent in agents {
+            if agent.state == .running { runningCount += 1 }
+            if agent.state == .failed { failedCount += 1 }
+            totalCost += agent.cost
+        }
+        return Summary(
+            totalCount: agents.count,
+            runningCount: runningCount,
+            failedCount: failedCount,
+            totalCost: totalCost
+        )
+    }
+
+    /// Keeps every page under a fixed hard cap and in original tree order. Selected and recent
+    /// priority rows repeat across pages; all remaining rows are partitioned into bounded pages.
+    static func panelWindow(
+        for displayOrder: [SubagentInfo],
+        pageFromNewest requestedPage: Int,
+        selectedID: String?
+    ) -> PanelWindow {
+        let listIdentity = panelListIdentity(for: displayOrder)
+        guard !displayOrder.isEmpty else {
+            return PanelWindow(
+                agents: [],
+                totalCount: 0,
+                hiddenCount: 0,
+                pageFromNewest: 0,
+                pageCount: 0,
+                listIdentity: listIdentity
+            )
+        }
+
+        if displayOrder.count <= panelRowCap {
+            return PanelWindow(
+                agents: displayOrder,
+                totalCount: displayOrder.count,
+                hiddenCount: 0,
+                pageFromNewest: 0,
+                pageCount: 1,
+                listIdentity: listIdentity
+            )
+        }
+
+        var mandatoryIndices: Set<Int> = []
+        if let selectedID,
+           let selectedIndex = displayOrder.firstIndex(where: { $0.id == selectedID }) {
+            mandatoryIndices.insert(selectedIndex)
+        }
+
+        let priorityLimit = min(Self.panelPriorityReserve, panelRowCap - mandatoryIndices.count)
+        let prioritized = displayOrder.indices
+            .filter { isProblematic(displayOrder[$0]) || displayOrder[$0].state == .running }
+            .sorted {
+                let lhs = displayOrder[$0]
+                let rhs = displayOrder[$1]
+                if lhs.lastObservedAt != rhs.lastObservedAt {
+                    return lhs.lastObservedAt > rhs.lastObservedAt
+                }
+                return $0 > $1
+            }
+            .prefix(priorityLimit)
+        mandatoryIndices.formUnion(prioritized)
+
+        let ordinaryIndices = displayOrder.indices.filter { !mandatoryIndices.contains($0) }
+        let pageCapacity = max(1, panelRowCap - mandatoryIndices.count)
+        let pageCount = max(1, (ordinaryIndices.count + pageCapacity - 1) / pageCapacity)
+        let pageFromNewest = min(max(0, requestedPage), pageCount - 1)
+        let pageEnd = ordinaryIndices.count - pageFromNewest * pageCapacity
+        let pageStart = max(0, pageEnd - pageCapacity)
+        let pageIndices = ordinaryIndices[pageStart..<pageEnd]
+
+        var visibleIndices = mandatoryIndices
+        visibleIndices.formUnion(pageIndices)
+        let visible = visibleIndices.sorted().map { displayOrder[$0] }
+        assert(visible.count <= panelRowCap)
+        return PanelWindow(
+            agents: visible,
+            totalCount: displayOrder.count,
+            hiddenCount: displayOrder.count - visible.count,
+            pageFromNewest: pageFromNewest,
+            pageCount: pageCount,
+            listIdentity: listIdentity
+        )
+    }
+
+    static func panelPageAfterListChange(
+        currentPage: Int,
+        previousIdentity: PanelListIdentity,
+        newIdentity: PanelListIdentity
+    ) -> Int {
+        previousIdentity == newIdentity ? max(0, currentPage) : 0
+    }
+
+    private static func panelListIdentity(for agents: [SubagentInfo]) -> PanelListIdentity {
+        guard !agents.isEmpty else { return .empty }
+        // Stable FNV-1a over IDs catches replacement waves even when count/edge IDs are unchanged.
+        var fingerprint: UInt64 = 14_695_981_039_346_656_037
+        for agent in agents {
+            for byte in agent.id.utf8 {
+                fingerprint ^= UInt64(byte)
+                fingerprint &*= 1_099_511_628_211
+            }
+            fingerprint ^= 0xff
+            fingerprint &*= 1_099_511_628_211
+        }
+        return PanelListIdentity(count: agents.count, idFingerprint: fingerprint)
+    }
+
+    private static func isProblematic(_ agent: SubagentInfo) -> Bool {
+        if agent.state == .failed || agent.state == .aborted || agent.state == .interrupted {
+            return true
+        }
+        if agent.stalled || !(agent.worktreeError ?? "").isEmpty || (agent.verifyExit ?? 0) != 0 {
+            return true
+        }
+        return agent.closeoutDisposition == .needsFixer || agent.closeoutDisposition == .needsUser
+    }
+
+    private static func appendPrefix(
+        _ source: [SubagentInfo],
+        to destination: inout [SubagentInfo],
+        limit: Int
+    ) {
+        guard destination.count < limit else { return }
+        destination.append(contentsOf: source.prefix(limit - destination.count))
     }
 }
 
@@ -2367,6 +2634,8 @@ struct ToolCardView: View {
     var onFlash: ((String) -> Void)? = nil
     /// Present only inside the detached finished-group detail.
     var onSelectFileChange: (() -> Void)? = nil
+    /// Open the live run detail sheet (main-transcript running cards).
+    var onOpenDetail: (() -> Void)? = nil
     @State private var expanded = false
 
     private var statusColor: Color {
@@ -2416,7 +2685,14 @@ struct ToolCardView: View {
                         .layoutPriority(1)
                 }
                 Spacer(minLength: 0)
-                if isLive {
+                if run?.isRunning == true {
+                    ProgressView().controlSize(.mini)
+                    if onOpenDetail != nil {
+                        Image(systemName: "arrow.up.right.square")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                } else if isLive {
                     ProgressView().controlSize(.mini)
                 } else if run != nil {
                     Image(systemName: run!.isError ? "xmark.circle.fill" : "checkmark.circle.fill")
@@ -2424,7 +2700,8 @@ struct ToolCardView: View {
                         .font(.caption)
                 }
                 // The complete header is the disclosure target; the chevron remains an affordance.
-                if hasTextOutput {
+                // Running cards keep the inline preview open and use the detail sheet instead.
+                if hasTextOutput, run?.isRunning != true {
                     Image(systemName: expanded ? "chevron.up" : "chevron.down")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -2434,17 +2711,30 @@ struct ToolCardView: View {
             .padding(.vertical, 8)
             .contentShape(Rectangle())
             .onTapGesture {
-                if let onSelectFileChange {
+                if run?.isRunning == true, let onOpenDetail {
+                    onOpenDetail()
+                } else if let onSelectFileChange {
                     onSelectFileChange()
                 } else if hasTextOutput {
                     expanded.toggle()
                 }
             }
-            .pointingHandCursor(hasTextOutput || onSelectFileChange != nil)
-            .accessibilityAddTraits(
-                hasTextOutput || onSelectFileChange != nil ? .isButton : []
+            .pointingHandCursor(
+                (run?.isRunning == true && onOpenDetail != nil)
+                    || hasTextOutput
+                    || onSelectFileChange != nil
             )
-            .accessibilityValue(hasTextOutput ? (expanded ? "已展开" : "已折叠") : "")
+            .accessibilityAddTraits(
+                (run?.isRunning == true && onOpenDetail != nil)
+                    || hasTextOutput
+                    || onSelectFileChange != nil
+                    ? .isButton : []
+            )
+            .accessibilityValue(
+                run?.isRunning == true && onOpenDetail != nil
+                    ? "打开详情"
+                    : (hasTextOutput ? (expanded ? "已展开" : "已折叠") : "")
+            )
 
             // Always show tool result thumbnails (even when collapsed).
             if !toolImages.isEmpty {

@@ -542,9 +542,81 @@ enum InitialTranscriptReconciler {
 /// from publishing to composer and sidebar observers of the session itself.
 final class StreamingState: ObservableObject {
     @Published var streamingItem: ChatItem?
-    @Published var toolRuns: [String: ToolRun] = [:]
-    /// Monotonic counter bumped when toolRuns actually changes (UI watches this instead of scanning outputs).
-    @Published var toolOutputVersion: UInt64 = 0
+    @Published private(set) var toolRuns: [String: ToolRun] = [:]
+    /// Monotonic content counter. `toolRuns` itself publishes the render update; this
+    /// counter is a cheap diagnostic/snapshot token and deliberately publishes no
+    /// second `objectWillChange` event.
+    private(set) var toolOutputVersion: UInt64 = 0
+    /// Changes only when a `ToolRun` property used by settled transcript planning
+    /// changes. Today that structural fingerprint is `isRunning` + image presence.
+    private(set) var toolStructureVersion: UInt64 = 0
+
+    func replaceToolRuns(_ runs: [String: ToolRun]) {
+        guard runs != toolRuns else { return }
+        let structureChanged = Self.structuralToolStates(in: runs)
+            != Self.structuralToolStates(in: toolRuns)
+        toolOutputVersion &+= 1
+        if structureChanged { toolStructureVersion &+= 1 }
+        toolRuns = runs
+    }
+
+    func updateToolRun(_ run: ToolRun, for id: String) {
+        updateToolRuns([id: run])
+    }
+
+    /// Publish one dictionary update for a coalesced partial-output batch.
+    func updateToolRuns(_ updates: [String: ToolRun]) {
+        guard !updates.isEmpty else { return }
+        var next = toolRuns
+        var changed = false
+        var structureChanged = false
+        for (id, run) in updates where next[id] != run {
+            if Self.structuralState(for: next[id]) != Self.structuralState(for: run) {
+                structureChanged = true
+            }
+            next[id] = run
+            changed = true
+        }
+        guard changed else { return }
+        toolOutputVersion &+= 1
+        if structureChanged { toolStructureVersion &+= 1 }
+        toolRuns = next
+    }
+
+    private struct StructuralToolState: Equatable {
+        var isRunning: Bool
+        var hasImages: Bool
+    }
+
+    private static func structuralState(for run: ToolRun?) -> StructuralToolState {
+        StructuralToolState(
+            isRunning: run?.isRunning ?? false,
+            hasImages: run?.images.isEmpty == false
+        )
+    }
+
+    private static func structuralToolStates(
+        in runs: [String: ToolRun]
+    ) -> [String: StructuralToolState] {
+        runs.compactMapValues { run in
+            let state = structuralState(for: run)
+            return state.isRunning || state.hasImages ? state : nil
+        }
+    }
+}
+
+/// High-frequency composer text observed only by the input bar.
+///
+/// Keeping draft edits out of `ChatSession.objectWillChange` prevents every
+/// keystroke from invalidating transcript and sidebar views that observe the
+/// session. `ChatSession.draftText` remains the compatibility API for callers
+/// that restore, send, or otherwise mutate the current draft.
+final class ComposerDraftState: ObservableObject {
+    @Published var text: String
+
+    init(text: String = "") {
+        self.text = text
+    }
 }
 
 /// One live pi RPC session bound to a project directory.
@@ -576,6 +648,7 @@ final class ChatSession: ObservableObject, Identifiable {
     var streamingItem: ChatItem? { streaming.streamingItem }
     var toolRuns: [String: ToolRun] { streaming.toolRuns }
     var toolOutputVersion: UInt64 { streaming.toolOutputVersion }
+    var toolStructureVersion: UInt64 { streaming.toolStructureVersion }
     @Published var isStreaming = false
     /// True between the user clicking Stop and the turn actually settling.
     /// Drives optimistic 'stopping…' UI so one click is visibly acknowledged.
@@ -615,7 +688,11 @@ final class ChatSession: ObservableObject, Identifiable {
     @Published var accountBalance: String?
     @Published var sessionName: String?
     @Published var sessionFile: String?
-    @Published var lastError: String?
+    @Published var lastError: String? {
+        didSet { lastErrorCanRetry = false }
+    }
+    /// 请求失败类错误（pi auto_retry 最终失败）才可重试；任何其他 lastError 写入自动复位。
+    @Published private(set) var lastErrorCanRetry = false
     @Published var processAlive = true
     /// True from spawn until the first `get_messages` load settles. Drives the
     /// "正在启动会话…" placeholder so a new/resuming session shows progress instead
@@ -627,8 +704,14 @@ final class ChatSession: ObservableObject, Identifiable {
     @Published var hasUnseenInterruption = false
     /// Local follow-up queue mirror for SwiftUI (busy Enter enqueues here).
     @Published private(set) var messageQueue: [QueuedMessage] = []
+    /// Isolated high-frequency composer state. InputBar observes this directly.
+    let composerDraft = ComposerDraftState()
     /// In-memory composer draft (per session; not persisted).
-    @Published var draftText: String = ""
+    /// Compatibility forwarding deliberately does not publish ChatSession changes.
+    var draftText: String {
+        get { composerDraft.text }
+        set { composerDraft.text = newValue }
+    }
     @Published var draftImages: [DraftImage] = []
     /// Large ⌘V bodies collapsed to `[paste #N …]` markers in `draftText` (pi TUI–style).
     private(set) var draftPastes: [Int: String] = [:]
@@ -863,7 +946,7 @@ final class ChatSession: ObservableObject, Identifiable {
             var stampedItems = initialTranscript.items
             Self.stampToolDurations(&stampedItems, from: initialTranscript.toolRuns)
             transcript = stampedItems
-            streaming.toolRuns = initialTranscript.toolRuns
+            streaming.replaceToolRuns(initialTranscript.toolRuns)
             itemCounter = initialTranscript.itemCounter
             skipNextAssistantIngest = initialTranscript.skipNextAssistantIngest
             initialPreviewItemCount = initialTranscript.items.count
@@ -941,7 +1024,9 @@ final class ChatSession: ObservableObject, Identifiable {
     private func startProcess(arguments: [String], environment: [String: String]) {
         guard !processStartCancelled, proc == nil else { return }
         guard let proc = PiProcess(cwd: projectURL, arguments: arguments, extraEnv: environment) else {
-            lastError = "找不到 pi 可执行文件（试过 ~/.npm-global/bin、/opt/homebrew/bin 等）"
+            let message = "找不到 pi 可执行文件（试过 ~/.npm-global/bin、/opt/homebrew/bin 等）"
+            lastError = message
+            notifyError(message)
             processAlive = false
             isInitializing = false
             return
@@ -976,7 +1061,9 @@ final class ChatSession: ObservableObject, Identifiable {
                 self.hasUnseenInterruption = true
             }
             if code != 0 {
-                self.lastError = "pi 进程退出 (code \(code))：\(stderr.suffix(300))"
+                let message = "pi 进程退出 (code \(code))：\(stderr.suffix(300))"
+                self.lastError = message
+                self.notifyError(message)
             }
         }
         loadInitialState()
@@ -1217,10 +1304,7 @@ final class ChatSession: ObservableObject, Identifiable {
         )
         itemCounter = reconciled.itemCounter
         skipNextAssistantIngest = built.skipNextAssistantIngest
-        streaming.toolRuns = reconciled.toolRuns
-        if !built.toolRuns.isEmpty || reconciled.appendedLiveItemCount > 0 {
-            streaming.toolOutputVersion &+= 1
-        }
+        streaming.replaceToolRuns(reconciled.toolRuns)
 
         // Stamp durations before the single assignment so the publish carries them.
         var stampedItems = reconciled.items
@@ -1552,8 +1636,7 @@ final class ChatSession: ObservableObject, Identifiable {
         case "tool_execution_start":
             if let tid = e["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
-                streaming.toolRuns[tid] = ToolRun(isRunning: true, startedAt: Date())
-                streaming.toolOutputVersion &+= 1
+                streaming.updateToolRun(ToolRun(isRunning: true, startedAt: Date()), for: tid)
             }
         case "tool_execution_update":
             if let tid = e["toolCallId"].string {
@@ -1572,15 +1655,14 @@ final class ChatSession: ObservableObject, Identifiable {
                 let content = e["result"]["content"]
                 let previous = streaming.toolRuns[tid]
                 let now = Date()
-                streaming.toolRuns[tid] = ToolRun(
+                streaming.updateToolRun(ToolRun(
                     isRunning: false,
                     isError: e["isError"].bool ?? false,
                     output: Self.contentText(content),
                     images: Self.contentImages(content, allowDiskRead: false),
                     startedAt: previous?.startedAt,
                     lastOutputAt: now
-                )
-                streaming.toolOutputVersion &+= 1
+                ), for: tid)
                 Self.stampToolDurations(&transcript, from: streaming.toolRuns)
                 scheduleImageBackfill(toolCallId: tid)
             }
@@ -1588,7 +1670,10 @@ final class ChatSession: ObservableObject, Identifiable {
             lastError = "请求失败，自动重试中 (\(e["attempt"].int ?? 0)/\(e["maxAttempts"].int ?? 0))…"
         case "auto_retry_end":
             if e["success"].bool == false {
-                lastError = "重试失败：\(e["finalError"].string ?? "未知错误")"
+                let message = "重试失败：\(e["finalError"].string ?? "未知错误")"
+                lastError = message
+                notifyError(message)
+                lastErrorCanRetry = true
             } else {
                 lastError = nil
             }
@@ -1747,10 +1832,7 @@ final class ChatSession: ObservableObject, Identifiable {
         guard !pendingToolRuns.isEmpty else { return }
         let batch = pendingToolRuns
         pendingToolRuns.removeAll(keepingCapacity: true)
-        for (tid, run) in batch {
-            streaming.toolRuns[tid] = run
-        }
-        streaming.toolOutputVersion &+= 1
+        streaming.updateToolRuns(batch)
     }
 
     private func scheduleStreamFlush() {
@@ -1822,8 +1904,14 @@ final class ChatSession: ObservableObject, Identifiable {
             }
             if let item = Self.convert(message: message, id: nextItemId(), allowDiskRead: false) {
                 if item.blocks.isEmpty, message["stopReason"].string == "error" {
-                    // API returned an error with no content — surface it instead of a blank bubble.
-                    appendSystem("⚠️ 模型请求失败（stopReason=error），请检查扩展冲突或 API 状态。")
+                    // API returned an error with no content — surface a concise, actionable reason.
+                    let warning = Self.modelFailureWarning(for: message)
+                    transcript.append(ChatItem(
+                        id: item.id,
+                        role: "system",
+                        blocks: [.text(warning)]
+                    ))
+                    notifyError(warning)
                 } else {
                     transcript.append(item)
                     scheduleImageBackfill(itemId: item.id)
@@ -1834,15 +1922,14 @@ final class ChatSession: ObservableObject, Identifiable {
                 pendingToolRuns.removeValue(forKey: tid)
                 let content = message["content"]
                 let previous = streaming.toolRuns[tid]
-                streaming.toolRuns[tid] = ToolRun(
+                streaming.updateToolRun(ToolRun(
                     isRunning: false,
                     isError: message["isError"].bool ?? false,
                     output: Self.contentText(content),
                     images: Self.contentImages(content, allowDiskRead: false),
                     startedAt: previous?.startedAt,
                     lastOutputAt: previous?.lastOutputAt ?? Date()
-                )
-                streaming.toolOutputVersion &+= 1
+                ), for: tid)
                 Self.stampToolDurations(&transcript, from: streaming.toolRuns)
                 scheduleImageBackfill(toolCallId: tid)
             }
@@ -1937,6 +2024,194 @@ final class ChatSession: ObservableObject, Identifiable {
             ?? entryTimestampFormatterNoFractional.date(from: raw)
     }
 
+    /// Concise user-facing explanation for an empty assistant message that ended in error.
+    /// This formatter is deliberately pure so live ingest and restored history cannot drift.
+    package static func modelFailureWarning(for message: J) -> String {
+        let rawError = message["errorMessage"].string ?? ""
+        let searchable = rawError.lowercased()
+        let detail = modelFailureDetail(from: rawError)
+        let subject = modelFailureSubject(from: message)
+
+        if searchable.contains("429")
+            || searchable.contains("rate_limit")
+            || searchable.contains("rate limit")
+            || searchable.contains("overloaded")
+            || searchable.contains("访问量过大") {
+            return "⚠️ \(subject)服务当前繁忙或过载，请稍后重试或切换模型。"
+        }
+
+        if searchable.contains("timed out") || searchable.contains("timeout") {
+            return "⚠️ \(subject)请求超时，请稍后重试。"
+        }
+
+        if searchable.contains("connection error")
+            || searchable.contains("fetch failed")
+            || searchable.contains("network") {
+            return "⚠️ \(subject)网络或连接失败，请检查网络后重试。"
+        }
+
+        if searchable.contains("401")
+            || searchable.contains("invalid api key")
+            || searchable.contains("no api key")
+            || searchable.contains("unauthorized") {
+            return "⚠️ \(subject)认证失败，请检查 API Key 或登录状态。"
+        }
+
+        if searchable.contains("duplicate tool names")
+            || searchable.contains("schema validation")
+            || searchable.contains("invalid request content") {
+            return warning(
+                subject: subject,
+                summary: "扩展/工具兼容性冲突",
+                detail: detail
+            )
+        }
+
+        return warning(subject: subject, summary: "模型请求失败", detail: detail)
+    }
+
+    private static func warning(subject: String, summary: String, detail: String?) -> String {
+        guard let detail, !detail.isEmpty else {
+            return "⚠️ \(subject)\(summary)。"
+        }
+        return "⚠️ \(subject)\(summary)：\(detail)"
+    }
+
+    private static func modelFailureSubject(from message: J) -> String {
+        let provider = compactModelIdentifier(message["provider"].string)
+        let model = compactModelIdentifier(
+            message["model"].string ?? message["model"]["id"].string
+        )
+
+        switch (provider, model) {
+        case let (provider?, model?) where model.hasPrefix("\(provider)/"):
+            return "\(model) "
+        case let (provider?, model?):
+            return "\(provider)/\(model) "
+        case let (provider?, nil):
+            return "\(provider) "
+        case let (nil, model?):
+            return "\(model) "
+        case (nil, nil):
+            return ""
+        }
+    }
+
+    private static func compactModelIdentifier(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = normalizeModelFailureWhitespace(value)
+        guard !normalized.isEmpty else { return nil }
+        return String(normalized.prefix(80))
+    }
+
+    private static func modelFailureDetail(from rawError: String) -> String? {
+        let normalizedRaw = normalizeModelFailureWhitespace(rawError)
+        guard !normalizedRaw.isEmpty else { return nil }
+
+        var candidate = extractModelFailureMessage(from: normalizedRaw)
+        if candidate == nil {
+            // Avoid reflecting an opaque JSON blob when no useful message can be extracted.
+            if normalizedRaw.contains("{") || normalizedRaw.contains("[") {
+                candidate = "服务返回了无法解析的错误信息"
+            } else {
+                candidate = normalizedRaw
+            }
+        }
+
+        guard var sanitized = candidate else { return nil }
+        sanitized = sanitized.replacingOccurrences(
+            of: #"(?i)\b(request[_ -]?id|req(?:uest)?[_ -]?id)\s*[:=]\s*["']?[^\s,"'}]+"#,
+            with: "",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: #"(?i)\breq_[A-Za-z0-9_-]+\b"#,
+            with: "",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: #"(?i)\bbearer\s+[A-Za-z0-9._~+/\-=]+"#,
+            with: "Bearer [已隐藏]",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: #"(?i)\b(api[_ -]?key|access[_ -]?token|authorization|secret)\s*[:=]\s*["']?[^\s,"'}]+"#,
+            with: "$1=[已隐藏]",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: #"(?i)\b(sk|key|token|secret)[-_][A-Za-z0-9_-]{8,}\b"#,
+            with: "[已隐藏]",
+            options: .regularExpression
+        )
+        sanitized = normalizeModelFailureWhitespace(sanitized)
+            .trimmingCharacters(in: CharacterSet(charactersIn: " ,;:"))
+        guard !sanitized.isEmpty else { return nil }
+
+        let detailLimit = 300
+        if sanitized.count > detailLimit {
+            return String(sanitized.prefix(detailLimit - 1)) + "…"
+        }
+        return sanitized
+    }
+
+    private static func extractModelFailureMessage(from rawError: String) -> String? {
+        var jsonCandidates = [rawError]
+        if let start = rawError.firstIndex(of: "{"),
+           let end = rawError.lastIndex(of: "}"),
+           start <= end {
+            jsonCandidates.append(String(rawError[start...end]))
+        }
+
+        for candidate in jsonCandidates {
+            guard let data = candidate.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) else {
+                continue
+            }
+            if let message = preferredModelFailureMessage(in: object) {
+                return normalizeModelFailureWhitespace(message)
+            }
+        }
+        return nil
+    }
+
+    private static func preferredModelFailureMessage(in object: Any) -> String? {
+        if let dictionary = object as? [String: Any] {
+            for key in ["message", "detail", "error_description"] {
+                if let value = dictionary[key] as? String, !value.isEmpty {
+                    return value
+                }
+            }
+            if let error = dictionary["error"] {
+                if let value = error as? String, !value.isEmpty {
+                    return value
+                }
+                if let nested = preferredModelFailureMessage(in: error) {
+                    return nested
+                }
+            }
+            for (key, value) in dictionary
+                where !["request_id", "requestId", "id"].contains(key) {
+                if let nested = preferredModelFailureMessage(in: value) {
+                    return nested
+                }
+            }
+        } else if let array = object as? [Any] {
+            for value in array {
+                if let nested = preferredModelFailureMessage(in: value) {
+                    return nested
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func normalizeModelFailureWhitespace(_ value: String) -> String {
+        value
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+    }
+
     /// Pure history build for `get_messages` (call off main: disk read + base64 in `parseImageBlock` / hydrate).
     /// Preserves message order; mirrors `ingest` including ghost-title skip and toolResult → toolRuns.
     package static func buildTranscript(
@@ -2012,7 +2287,15 @@ final class ChatSession: ObservableObject, Identifiable {
                             }
                         }
                     }
-                    items.append(item)
+                    if item.blocks.isEmpty, message["stopReason"].string == "error" {
+                        items.append(ChatItem(
+                            id: item.id,
+                            role: "system",
+                            blocks: [.text(modelFailureWarning(for: message))]
+                        ))
+                    } else {
+                        items.append(item)
+                    }
                 }
             case "toolResult":
                 if let tid = message["toolCallId"].string {
@@ -2227,8 +2510,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 if let toolCallId, let run = self.streaming.toolRuns[toolCallId] {
                     var next = run
                     next.images = Self.backfilledImages(run.images, loaded: loaded)
-                    self.streaming.toolRuns[toolCallId] = next
-                    self.streaming.toolOutputVersion &+= 1
+                    self.streaming.updateToolRun(next, for: toolCallId)
                 }
             }
         }
@@ -2595,6 +2877,34 @@ final class ChatSession: ObservableObject, Identifiable {
         )
     }
 
+    /// 重试最近一次失败的请求：按原文本/原图重新投递最后一条用户消息。
+    func retryLastRequest() {
+        guard lastErrorCanRetry, lastError != nil else { return }
+        guard !isWorking else {
+            flash("请等待当前任务结束")
+            return
+        }
+        guard proc != nil else {
+            flash("pi 未运行，无法重试")
+            return
+        }
+        guard let item = transcript.last(where: {
+            $0.role == "user" && MessageActions.isUserAuthoredMessage($0)
+        }) else {
+            flash("没有可重试的消息")
+            return
+        }
+        let text = MessageActions.copyableText(from: item)
+        guard MessageActions.isEditDraftSendable(text) else {
+            flash("消息为空，无法重试")
+            return
+        }
+        lastError = nil  // didSet 同步复位 lastErrorCanRetry
+        let images = draftImages(from: item)
+        let prepared = prepareMessage(text: text, images: images)
+        deliverAfterOptionalVisionFallback(preparedMessage: prepared.message, images: prepared.images)
+    }
+
     /// 把消息里的 image block 还原成 DraftImage（撤回修改 / 重发时原样携带图片）。
     private func draftImages(from item: ChatItem) -> [DraftImage] {
         item.blocks.compactMap { block -> DraftImage? in
@@ -2787,8 +3097,7 @@ final class ChatSession: ObservableObject, Identifiable {
                     var stampedItems = built.items
                     Self.stampToolDurations(&stampedItems, from: built.toolRuns)
                     self.transcript = stampedItems
-                    self.streaming.toolRuns = built.toolRuns
-                    self.streaming.toolOutputVersion &+= 1
+                    self.streaming.replaceToolRuns(built.toolRuns)
                     self.itemCounter = built.itemCounter
                     self.skipNextAssistantIngest = built.skipNextAssistantIngest
                     self.cachedBranchMessages = []
@@ -2947,12 +3256,14 @@ final class ChatSession: ObservableObject, Identifiable {
                 await MainActor.run {
                     self.mediaBusy = false
                     self.mediaStatus = nil
-                    self.lastError = error.localizedDescription
+                    let message = error.localizedDescription
+                    self.lastError = message
                     self.transcript.append(ChatItem(
                         id: self.nextItemId(),
                         role: "system",
-                        blocks: [.text("\(mode.label)失败：\(error.localizedDescription)")]
+                        blocks: [.text("\(mode.label)失败：\(message)")]
                     ))
+                    self.notifyError(message)
                 }
             }
         }
@@ -3450,6 +3761,23 @@ final class ChatSession: ObservableObject, Identifiable {
             hasUnseenCompletion = false
         } else {
             hasUnseenCompletion = true
+        }
+        // 任务完成提醒：只有用户看不到结果（会话未选中或应用未激活）时才弹。
+        if TaskNotifier.shouldNotifyCompletion(
+            selected: isSelectedCheck?() == true,
+            appActive: NSApp.isActive
+        ) {
+            MainActor.assumeIsolated {
+                TaskNotifier.shared.notifyCompletion(sessionTitle: displayTitle)
+            }
+        }
+    }
+
+    /// 任务失败提醒（错误不分用户是否在观看，始终提醒）。
+    /// PiProcess 的回调与 UI 事件都投递在主线程，此处用 assumeIsolated 直调。
+    private func notifyError(_ message: String) {
+        MainActor.assumeIsolated {
+            TaskNotifier.shared.notifyError(sessionTitle: displayTitle, message: message)
         }
     }
 

@@ -48,7 +48,10 @@ struct SidebarView: View {
             // when idle. Selection chrome is drawn by
             // SessionRowContainer.background.
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
+                // The sidebar has bounded, paged content. A plain stack avoids
+                // LazyVStack's repeated size-estimation cycle when scrolling an
+                // expanded project tree containing dynamic hoverable rows.
+                VStack(alignment: .leading, spacing: 0) {
                     pinnedSection
                     projectsSection
                     archivedSessionsSection
@@ -127,7 +130,7 @@ struct SidebarView: View {
                 .accessibilityLabel(RemoteConnectionAccessibility.sidebarButtonLabel)
                 .accessibilityValue(
                     store.remoteRelayConfiguration.enabled
-                        ? store.remoteRelayState.displayText
+                        ? "Signaling WSS：\(store.remoteRelayState.displayText)；浏览器：\(store.remotePeerProductionState.displayText)"
                         : store.localRemoteStatus
                 )
 
@@ -226,10 +229,13 @@ struct SidebarView: View {
     }
 
     private var remoteConnectionIndicator: LocalRemoteConnectionIndicator {
-        if store.remoteRelayState == .connected {
+        if store.remotePeerProductionState == .connected {
             return .listening
         }
         if store.remoteRelayConfiguration.enabled {
+            if case .failed = store.remotePeerProductionState {
+                return .failed
+            }
             switch store.remoteRelayState {
             case .authenticationFailed, .invalidConfiguration, .protocolMismatch:
                 return .failed
@@ -332,10 +338,11 @@ struct SidebarView: View {
                 selectAndToggleProject(project, wasSelected: isSelected, wasExpanded: isExpanded)
             } label: {
                 HStack(spacing: 6) {
+                    // Project folders are containers, not primary selection targets:
+                    // keep open/toggle behavior but never paint selected-row chrome.
                     Image(systemName: isExpanded ? "folder.fill" : "folder")
-                        .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                        .foregroundStyle(.secondary)
                     Text(displayName)
-                        .fontWeight(isSelected ? .semibold : .regular)
                     if isPinned {
                         Image(systemName: "pin.fill")
                             .font(.caption)
@@ -432,10 +439,6 @@ struct SidebarView: View {
             return NSItemProvider(object: project.path as NSString)
         }
         .onDrop(of: [UTType.plainText], delegate: ProjectDropDelegate(project: project, store: store))
-        .background {
-            RoundedRectangle(cornerRadius: 7)
-                .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
-        }
         .hoverRowBackground(cornerRadius: 7)
     }
 

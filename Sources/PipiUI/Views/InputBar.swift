@@ -852,6 +852,12 @@ struct ComposerTextView: NSViewRepresentable {
             textView in
             window.makeFirstResponder(textView)
         }
+        /// `discardMarkedText()` can synchronously wait on the selected IME's XPC
+        /// service. Keep it off the common session-rebind path and injectable so the
+        /// marked-text ownership boundary is executable without timing-based tests.
+        var discardMarkedText: (NSTextView) -> Void = { textView in
+            textView.inputContext?.discardMarkedText()
+        }
 
         init(parent: ComposerTextView) {
             self.parent = parent
@@ -901,11 +907,17 @@ struct ComposerTextView: NSViewRepresentable {
             var needsLayout = widthChanged || selectionChanged
             if sessionChanged {
                 // The InputBar is warm-reused. Never let marked text from the old
-                // session commit into the newly rebound draft.
+                // session commit into the newly rebound draft. A normal session switch
+                // is identity-scoped at the SwiftUI call site and creates a fresh native
+                // host; this guarded branch is only the fallback for an unexpectedly
+                // warm-reused coordinator. Do not synchronously contact the IME when
+                // there is no marked text to discard.
                 boundSessionIdentity = parent.sessionIdentity
                 pendingExternalText = nil
                 applyingProgrammaticText = true
-                host.textView.inputContext?.discardMarkedText()
+                if host.textView.hasMarkedText() {
+                    discardMarkedText(host.textView)
+                }
                 apply(parent.text, to: host.textView, moveCursorToEnd: true)
                 applyingProgrammaticText = false
                 lastKnownText = parent.text
@@ -1188,6 +1200,10 @@ final class ComposerSlashKeyMonitor {
 struct InputBar: View {
     @EnvironmentObject var store: AppStore
     @ObservedObject var session: ChatSession
+    /// Draft typing is intentionally isolated from `ChatSession.objectWillChange`.
+    /// Observe the session-owned composer state so external restores/sends still
+    /// update this warm-reused input bar without invalidating the transcript.
+    @ObservedObject private var draftState: ComposerDraftState
     @State private var focused = false
     @State private var composerTextHeight = ComposerTextViewLayout.minimumHeight(
         for: .systemFont(ofSize: NSFont.systemFontSize)
@@ -1205,6 +1221,11 @@ struct InputBar: View {
     @State private var balanceLast30Days: Double?
     /// Measured width of the status row; drives compact vs wide without ViewThatFits.
     @State private var statusBarWidth: CGFloat = 0
+
+    init(session: ChatSession) {
+        self.session = session
+        _draftState = ObservedObject(wrappedValue: session.composerDraft)
+    }
 
     var body: some View {
         VStack(spacing: 8) {
@@ -1297,7 +1318,7 @@ struct InputBar: View {
             composerRouter.bind(to: session)
             refreshSlashPalette()
         }
-        .onChange(of: session.draftText) { _, _ in
+        .onChange(of: draftState.text) { _, _ in
             session.pruneOrphanDraftPastes()
             refreshSlashPalette()
             composerRouter.clearAttachError()
@@ -1426,7 +1447,7 @@ struct InputBar: View {
             plusMenu
 
             ComposerTextView(
-                text: $session.draftText,
+                text: $draftState.text,
                 isFocused: $focused,
                 height: $composerTextHeight,
                 sessionIdentity: ObjectIdentifier(session),
@@ -1435,6 +1456,10 @@ struct InputBar: View {
                     router.send()
                 }
             )
+                // A session owns its native editor and NSTextInputContext. Replacing the
+                // representable host on a real switch avoids synchronously rebinding the
+                // previous session's IME context on SwiftUI's update pass.
+                .id(ObjectIdentifier(session))
                 .frame(maxWidth: .infinity)
                 .frame(height: composerTextHeight, alignment: .leading)
                 .layoutPriority(1)

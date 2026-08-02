@@ -169,6 +169,60 @@ final class AssistantBlockLayoutTests: XCTestCase {
         )
     }
 
+    /// In-flight tool calls stay visible as singletons even when the assistant item is settled.
+    func testRunningToolCallStaysSingletonWhileSiblingsGroup() {
+        let blocks: [ChatBlock] = [
+            .thinking("a"),
+            tool("1", "read"),
+            tool("2", "bash"),
+            tool("3", "grep"),
+            .thinking("b"),
+        ]
+        let runs: [String: ToolRun] = [
+            "2": ToolRun(isRunning: true, output: "partial…"),
+        ]
+        let plan = AssistantBlockLayout.plan(blocks: blocks, groupFinished: true, toolRuns: runs)
+        XCTAssertEqual(plan, [
+            .finishedGroup([.thinking("a"), tool("1", "read")]),
+            .singleton(tool("2", "bash")),
+            .finishedGroup([tool("3", "grep"), .thinking("b")]),
+        ])
+    }
+
+    /// When the only non-text neighbors of a running tool are finished, they still collapse together
+    /// once the runner is peeled out as a singleton.
+    func testRunningToolCallAloneBreaksFinishedGroup() {
+        let blocks: [ChatBlock] = [
+            tool("1", "read"),
+            tool("2", "bash"),
+        ]
+        let runs: [String: ToolRun] = [
+            "2": ToolRun(isRunning: true),
+        ]
+        XCTAssertEqual(
+            AssistantBlockLayout.plan(blocks: blocks, groupFinished: true, toolRuns: runs),
+            [
+                .singleton(tool("1", "read")),
+                .singleton(tool("2", "bash")),
+            ]
+        )
+    }
+
+    /// Finished runs group normally again after isRunning clears.
+    func testFinishedToolCallGroupsAfterRunEnds() {
+        let blocks: [ChatBlock] = [
+            tool("1", "read"),
+            tool("2", "bash"),
+        ]
+        let runs: [String: ToolRun] = [
+            "2": ToolRun(isRunning: false, output: "done"),
+        ]
+        XCTAssertEqual(
+            AssistantBlockLayout.plan(blocks: blocks, groupFinished: true, toolRuns: runs),
+            [.finishedGroup([tool("1", "read"), tool("2", "bash")])]
+        )
+    }
+
     /// Tool result thumbnails live on ToolRun — those toolCalls must stay outside finished groups.
     func testToolCallWithImagesBreaksGroup() {
         let shot = tool("shot", "browser")

@@ -40,8 +40,8 @@ import {
 } from "./secretary-commit.ts";
 import { secretaryToolCallBlock } from "./secretary-policy.ts";
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
+const MAX_PARALLEL_TASKS = 1000;
+const MAX_CONCURRENCY = 1000;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
@@ -422,13 +422,50 @@ process.on("exit", pipiuiKillAllChildren);
 // 当前正在执行的 subagent 工具调用 id（同一次调用内的 single/parallel/chain 共享）
 let pipiuiCurrentToolCall: string | null = null;
 
-function pipiuiReport(payload: Record<string, unknown>): void {
+const PIPIUI_REPORT_TIMEOUT_MS = 5000;
+
+async function postPipiuiReport(payload: Record<string, unknown>): Promise<void> {
 	if (!PIPIUI_PORT || !PIPIUI_SESSION) return;
-	fetch(`http://127.0.0.1:${PIPIUI_PORT}/rpc`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ sessionKey: PIPIUI_SESSION, action: "agent_event", ...payload }),
-	}).catch(() => {});
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), PIPIUI_REPORT_TIMEOUT_MS);
+	timeout.unref?.();
+	try {
+		await fetch(`http://127.0.0.1:${PIPIUI_PORT}/rpc`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ sessionKey: PIPIUI_SESSION, action: "agent_event", ...payload }),
+			signal: controller.signal,
+		});
+	} catch {
+		// Bridge reporting is observability, never a reason to crash the worker.
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+function pipiuiReport(payload: Record<string, unknown>): void {
+	void postPipiuiReport(payload);
+}
+
+const terminalPipiuiReportFlights = new Map<string, Promise<void>>();
+
+/** Serialize terminal UI events per bare ID; the lease owner awaits the queue before release. */
+function postTerminalPipiuiReport(payload: Record<string, unknown> & { agentId: string }): Promise<void> {
+	const previous = terminalPipiuiReportFlights.get(payload.agentId) ?? Promise.resolve();
+	const flight = previous.catch(() => {}).then(() => postPipiuiReport(payload));
+	terminalPipiuiReportFlights.set(payload.agentId, flight);
+	void flight.finally(() => {
+		if (terminalPipiuiReportFlights.get(payload.agentId) === flight) {
+			terminalPipiuiReportFlights.delete(payload.agentId);
+		}
+	});
+	return flight;
+}
+
+async function awaitTerminalPipiuiReports(agentId: string): Promise<void> {
+	while (terminalPipiuiReportFlights.has(agentId)) {
+		await terminalPipiuiReportFlights.get(agentId);
+	}
 }
 
 function formatTokens(count: number): string {
@@ -840,7 +877,7 @@ interface WorktreePlacement {
 	cwd: string;
 	worktreePath?: string;
 	worktreeBranch?: string;
-	/** Set when worktree was requested but creation failed (spawn falls back). */
+	/** Set when required worktree isolation failed. Writable workers must not spawn. */
 	worktreeError?: string;
 }
 
@@ -882,7 +919,8 @@ const ERROR_DONE_CAP = 6000;
 // done message advertises it as the escape hatch.
 const JOB_RESULT_STORE_CAP = 32000;
 const JOB_RESULT_DISPLAY_CAP = 8000;
-const MAX_JOB_RECORDS = 40;
+/** Terminal history is bounded independently; running jobs are never pruning candidates. */
+const MAX_TERMINAL_JOB_RECORDS = 1000;
 
 // ---- Attested verify (system testimony): the runtime runs `verify` in the agent's cwd ----
 const VERIFY_TIMEOUT_MS = 120_000;
@@ -1045,6 +1083,8 @@ interface JobRecord {
 }
 
 const jobRegistry = new Map<string, JobRecord>();
+/** Immediate in-process reservations close the selector-to-dispatch await/confirmation gap. */
+const localAgentReservations = new Set<string>();
 
 // ---- Stall watchdog + abort：运行中后台 job 的外部可触达句柄 ----
 const STALL_THRESHOLD_MS = 120_000;
@@ -1053,6 +1093,8 @@ const STALL_WATCHDOG_INTERVAL_MS = 30_000;
 const AUTO_RESUME_MAX = 2;
 /** Backoff before each auto-resume attempt (ms). Index 0 = first resume. */
 const AUTO_RESUME_BACKOFF_MS = [5_000, 15_000] as const;
+/** Spread retry waves across a +/-25% window instead of synchronizing thousands of workers. */
+const AUTO_RESUME_JITTER_RATIO = 0.25;
 /** Context size above which a final retryable failure gets a fresh-redispatch hint. */
 const AUTO_RESUME_CONTEXT_HINT_TOKENS = 100_000;
 /** Context tokens at/above which the session is compacted before an auto-resume re-spawn. */
@@ -1113,10 +1155,18 @@ function isRetryableWorkerError(text: string): boolean {
 	}
 	return false;
 }
+
+function jitteredRetryBackoffMs(baseMs: number, random = Math.random): number {
+	const unit = Math.max(0, Math.min(1, random()));
+	const multiplier = 1 - AUTO_RESUME_JITTER_RATIO + unit * AUTO_RESUME_JITTER_RATIO * 2;
+	return Math.max(1, Math.round(baseMs * multiplier));
+}
 /** stall 复推节奏：boss 决定继续等时，最多 5 分钟沉默一次，不必等心跳。 */
 const STALL_RENOTIFY_INTERVAL_MS = 5 * 60 * 1000;
 /** done 重投节奏：30s 扫描每次都看，但同一 agentId 两次投递至少隔 60s，避免轰炸正在处理中的 boss。 */
 const DONE_RETRY_MIN_INTERVAL_MS = 60_000;
+/** Initial delivery plus four retries; a broken follow-up channel must not retry forever. */
+const DONE_MAX_ATTEMPTS = 5;
 /**
  * How long the boss may hear nothing at all while work is outstanding. Chosen to be far longer
  * than the stall threshold: this is the last line of defence against silence, not a progress
@@ -1232,25 +1282,21 @@ function taskSummary(task: string, cap = 200): string {
 }
 
 function jobPrune(): void {
-	if (jobRegistry.size <= MAX_JOB_RECORDS) return;
 	const finished = [...jobRegistry.entries()]
 		.filter(([, j]) => j.state !== "running")
 		.sort((a, b) => (a[1].endedAt ?? a[1].startedAt) - (b[1].endedAt ?? b[1].startedAt));
-	for (const [id] of finished) {
-		if (jobRegistry.size <= MAX_JOB_RECORDS) break;
-		jobRegistry.delete(id);
-	}
-	if (jobRegistry.size <= MAX_JOB_RECORDS) return;
-	const all = [...jobRegistry.entries()].sort((a, b) => a[1].startedAt - b[1].startedAt);
-	for (const [id] of all) {
-		if (jobRegistry.size <= MAX_JOB_RECORDS) break;
-		jobRegistry.delete(id);
+	const excess = finished.length - MAX_TERMINAL_JOB_RECORDS;
+	for (let i = 0; i < excess; i++) {
+		jobRegistry.delete(finished[i][0]);
 	}
 }
 
 function jobUpsertRunning(agentId: string, name: string, task: string, title?: string): void {
 	const existing = jobRegistry.get(agentId);
-	deliveredDone.delete(agentId); // 同 agentId 新一轮运行（re-dispatch/续跑）允许投递自己的 done
+	// Same agentId, new run: detach any old delivery state. A stale in-flight completion may
+	// settle later, but identity checking prevents it from arming this run's delivered latch.
+	pendingDone.delete(agentId);
+	deliveredDone.delete(agentId);
 	// Resume of the same agentId must reopen a terminal row as running (matches Swift start).
 	const keepLive = existing?.state === "running";
 	jobRegistry.set(agentId, {
@@ -1352,7 +1398,7 @@ function markWorkerInterrupted(agentId: string, reason: string): void {
 		cost: job?.cost,
 		turns: job?.turns,
 	});
-	pipiuiReport({
+	void postTerminalPipiuiReport({
 		kind: "end",
 		agentId,
 		ok: false,
@@ -1529,8 +1575,21 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 	);
 }
 
-function generatePipiuiAgentId(): string {
-	return `agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+function generatePipiuiAgentId(reserved: Set<string> = new Set()): string {
+	// 64 random bits keeps generated ids collision-resistant while staying inside the 24-char
+	// semantic-id contract. The loop turns probabilistic uniqueness into a checked invariant.
+	for (let attempt = 0; attempt < 100; attempt++) {
+		const candidate = `agent-${randomBytes(8).toString("hex")}`;
+		const active =
+			localAgentReservations.has(candidate) ||
+			runningAgents.has(candidate) ||
+			jobRegistry.get(candidate)?.state === "running";
+		if (reserved.has(candidate) || active) continue;
+		reserved.add(candidate);
+		localAgentReservations.add(candidate);
+		return candidate;
+	}
+	throw new Error("Unable to allocate a unique subagent id after 100 attempts.");
 }
 
 /**
@@ -1542,6 +1601,7 @@ function generatePipiuiAgentId(): string {
  * Also lands verbatim in a git branch (`pipiui/<id>`) and a session filename, so the character
  * set is the intersection of "safe there" and "hard to mistype".
  */
+// PIPIUI_PURE_AGENT_ID_BEGIN
 const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{1,23}$/;
 const RESERVED_AGENT_IDS = new Set(["root", "main", "head", "master"]);
 
@@ -1559,6 +1619,54 @@ function validateAgentId(id: string): string | null {
 	return null;
 }
 
+interface CallerAgentIdSelection {
+	ids: string[];
+	problem?: string;
+}
+
+/** Pure request gate: validates, de-duplicates, and excludes every currently active id. */
+function selectCallerAgentIds(
+	candidates: readonly (string | undefined)[],
+	activeIds: ReadonlySet<string>,
+): CallerAgentIdSelection {
+	const ids: string[] = [];
+	const seen = new Set<string>();
+	for (const candidate of candidates) {
+		if (candidate === undefined) continue;
+		const normalized = candidate.trim();
+		const invalid = validateAgentId(normalized);
+		if (invalid) return { ids, problem: invalid };
+		if (seen.has(normalized)) {
+			return {
+				ids,
+				problem: `Duplicate agentId ${JSON.stringify(normalized)} in one request. Each dispatched worker must have a unique id.`,
+			};
+		}
+		if (activeIds.has(normalized)) {
+			return {
+				ids,
+				problem: `agentId ${JSON.stringify(normalized)} is already running. Wait for it to finish or abort it before resuming that worker.`,
+			};
+		}
+		seen.add(normalized);
+		ids.push(normalized);
+	}
+	return { ids };
+}
+
+/** Selector + synchronous reservation is one operation from the event loop's perspective. */
+function selectAndReserveCallerAgentIds(
+	candidates: readonly (string | undefined)[],
+	activeIds: ReadonlySet<string>,
+	reservations: Set<string>,
+): CallerAgentIdSelection {
+	const selection = selectCallerAgentIds(candidates, activeIds);
+	if (selection.problem) return selection;
+	for (const id of selection.ids) reservations.add(id);
+	return selection;
+}
+// PIPIUI_PURE_AGENT_ID_END
+
 /**
  * Where a reusable worker's conversation lives. Deliberately under the main project rather
  * than the worker's own cwd: that cwd is a worktree, and a successful merge deletes it — which
@@ -1573,8 +1681,11 @@ function validateAgentId(id: string): string | null {
  * touched in two weeks is reasoning about code that has since moved on. The count cap only
  * exists so a burst of short-lived workers cannot grow the directory without bound.
  */
+// PIPIUI_PURE_SESSION_RETENTION_BEGIN
 const SESSION_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
-const SESSION_MAX_KEEP = 50;
+const SESSION_MAX_KEEP = 1000;
+const SESSION_PRUNE_COMPLETION_INTERVAL = 256;
+const SESSION_PRUNE_TIME_INTERVAL_MS = 5 * 60 * 1000;
 
 interface StoredSession {
 	name: string;
@@ -1599,47 +1710,206 @@ function selectStaleSessions(
 	return [...stale];
 }
 
-function readStoredSessions(dir: string): StoredSession[] {
+interface SessionPruneSchedule {
+	hasPruned: boolean;
+	completionsSincePrune: number;
+	lastPrunedAt: number;
+}
+
+/** Pure amortization policy: first access, every completed wave slice, or elapsed interval. */
+function nextSessionPruneSchedule(
+	state: SessionPruneSchedule,
+	trigger: "access" | "completed",
+	now: number,
+): { state: SessionPruneSchedule; shouldPrune: boolean } {
+	const completionsSincePrune =
+		state.completionsSincePrune + (trigger === "completed" ? 1 : 0);
+	const shouldPrune =
+		!state.hasPruned ||
+		completionsSincePrune >= SESSION_PRUNE_COMPLETION_INTERVAL ||
+		now - state.lastPrunedAt >= SESSION_PRUNE_TIME_INTERVAL_MS;
+	return {
+		shouldPrune,
+		state: shouldPrune
+			? { hasPruned: true, completionsSincePrune: 0, lastPrunedAt: now }
+			: { ...state, completionsSincePrune },
+	};
+}
+// PIPIUI_PURE_SESSION_RETENTION_END
+
+const SESSION_PRUNE_IO_BATCH = 64;
+
+function yieldSessionPruneIO(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}
+
+// PIPIUI_PURE_ASYNC_BATCH_BEGIN
+async function mapSessionPruneBatches<T, R>(
+	items: readonly T[],
+	batchSize: number,
+	fn: (item: T) => Promise<R>,
+	yieldBetween: () => Promise<void>,
+): Promise<R[]> {
+	const results: R[] = [];
+	for (let offset = 0; offset < items.length; offset += batchSize) {
+		results.push(...(await Promise.all(items.slice(offset, offset + batchSize).map(fn))));
+		await yieldBetween();
+	}
+	return results;
+}
+// PIPIUI_PURE_ASYNC_BATCH_END
+
+// PIPIUI_PURE_SESSION_REMOVE_GUARD_BEGIN
+async function removeSessionWithLeaseGuard<TLease>(
+	entry: StoredSession,
+	isLocallyActive: () => boolean,
+	acquireLease: () => TLease | undefined,
+	releaseLease: (lease: TLease) => void,
+	readCurrentMtime: () => Promise<number | undefined>,
+	remove: () => Promise<void>,
+): Promise<boolean> {
+	// Close both race windows: activity may begin after the original directory snapshot,
+	// and another Pi process may begin between this local check and deletion.
+	if (isLocallyActive()) return false;
+	const lease = acquireLease();
+	if (!lease) return false;
 	try {
-		return fs
-			.readdirSync(dir)
-			.map((name) => {
-				const agentId = /_pipiui-(.+)\.jsonl$/.exec(name)?.[1];
-				if (!agentId) return undefined;
-				try {
-					return { name, agentId, mtimeMs: fs.statSync(path.join(dir, name)).mtimeMs };
-				} catch {
-					return undefined;
-				}
-			})
-			.filter((e): e is StoredSession => Boolean(e));
+		if (isLocallyActive()) return false;
+		if ((await readCurrentMtime()) !== entry.mtimeMs) return false;
+		await remove();
+		return true;
+	} finally {
+		releaseLease(lease);
+	}
+}
+// PIPIUI_PURE_SESSION_REMOVE_GUARD_END
+
+async function readStoredSessions(dir: string): Promise<StoredSession[]> {
+	let names: string[];
+	try {
+		names = await fs.promises.readdir(dir);
 	} catch {
 		return [];
 	}
+	const entries = await mapSessionPruneBatches(
+		names,
+		SESSION_PRUNE_IO_BATCH,
+		async (name) => {
+				const agentId = /_pipiui-(.+)\.jsonl$/.exec(name)?.[1];
+				if (!agentId) return undefined;
+				try {
+					return { name, agentId, mtimeMs: (await fs.promises.stat(path.join(dir, name))).mtimeMs };
+				} catch {
+					return undefined;
+				}
+		},
+		yieldSessionPruneIO,
+	);
+	return entries.filter((entry): entry is StoredSession => Boolean(entry));
 }
 
-let prunedThisProcess = false;
+async function leasedAgentIds(): Promise<Set<string>> {
+	if (!PIPIUI_MAIN_CWD) return new Set();
+	try {
+		const names = await fs.promises.readdir(path.join(PIPIUI_MAIN_CWD, ".pi", "agent-leases"));
+		return new Set(
+			names
+				.map((name) => /^(.*)\.lease$/.exec(name)?.[1])
+				.filter((id): id is string => Boolean(id)),
+		);
+	} catch {
+		return new Set();
+	}
+}
+
+function isAgentLocallyActiveForSessionPrune(agentId: string): boolean {
+	return (
+		localAgentReservations.has(agentId) ||
+		runningAgents.has(agentId) ||
+		jobRegistry.get(agentId)?.state === "running"
+	);
+}
+
+let sessionPruneSchedule: SessionPruneSchedule = {
+	hasPruned: false,
+	completionsSincePrune: 0,
+	lastPrunedAt: 0,
+};
+let sessionPruneFlight: Promise<void> | undefined;
+let sessionPruneRerun = false;
+let sessionPruneRerunDir: string | undefined;
 let seededLedger = false;
 
-/** Once per process: this is housekeeping, not something to redo on every dispatch. */
-function pruneAgentSessions(dir: string): void {
-	if (prunedThisProcess) return;
-	prunedThisProcess = true;
-	const running = new Set(
-		[...jobRegistry.values()].filter((j) => j.state === "running").map((j) => j.agentId),
-	);
-	for (const name of selectStaleSessions(readStoredSessions(dir), {
+async function performAgentSessionPrune(dir: string): Promise<void> {
+	if (!PIPIUI_MAIN_CWD) return;
+	const running = new Set<string>([
+		...localAgentReservations,
+		...runningAgents.keys(),
+		...[...jobRegistry.values()]
+			.filter((j) => j.state === "running")
+			.map((j) => j.agentId),
+		...(await leasedAgentIds()),
+	]);
+	const stored = await readStoredSessions(dir);
+	const staleNames = selectStaleSessions(stored, {
 		now: Date.now(),
 		maxAgeMs: SESSION_MAX_AGE_MS,
 		maxKeep: SESSION_MAX_KEEP,
 		running,
-	})) {
-		try {
-			fs.rmSync(path.join(dir, name));
-		} catch {
-			// A file we cannot remove only costs disk; never fail a dispatch over housekeeping.
-		}
+	});
+	const stale = stored.filter((entry) => staleNames.includes(entry.name));
+	await mapSessionPruneBatches(
+		stale,
+		SESSION_PRUNE_IO_BATCH,
+		async (entry) => {
+			const file = path.join(dir, entry.name);
+			try {
+				await removeSessionWithLeaseGuard(
+					entry,
+					() => isAgentLocallyActiveForSessionPrune(entry.agentId),
+					() => acquireAgentLease(path.resolve(PIPIUI_MAIN_CWD), entry.agentId).lease,
+					releaseAgentLease,
+					async () => {
+						try {
+							return (await fs.promises.stat(file)).mtimeMs;
+						} catch {
+							return undefined;
+						}
+					},
+					async () => fs.promises.rm(file),
+				);
+			} catch {
+					// A file we cannot remove only costs disk; never fail a dispatch over housekeeping.
+				}
+		},
+		yieldSessionPruneIO,
+	);
+}
+
+function launchAgentSessionPrune(dir: string): void {
+	sessionPruneFlight = performAgentSessionPrune(dir)
+		.catch((err) => console.error("[pipiui-subagent] session housekeeping failed:", err))
+		.finally(() => {
+			sessionPruneFlight = undefined;
+			if (!sessionPruneRerun) return;
+			sessionPruneRerun = false;
+			const rerunDir = sessionPruneRerunDir ?? dir;
+			sessionPruneRerunDir = undefined;
+			launchAgentSessionPrune(rerunDir);
+		});
+}
+
+/** Amortized, single-flight housekeeping: no synchronous directory scan blocks dispatch. */
+function pruneAgentSessions(dir: string, trigger: "access" | "completed"): void {
+	const decision = nextSessionPruneSchedule(sessionPruneSchedule, trigger, Date.now());
+	sessionPruneSchedule = decision.state;
+	if (!decision.shouldPrune) return;
+	if (sessionPruneFlight) {
+		sessionPruneRerun = true;
+		sessionPruneRerunDir = dir;
+		return;
 	}
+	launchAgentSessionPrune(dir);
 }
 
 /**
@@ -1696,7 +1966,7 @@ function agentSessionDir(): string | undefined {
 	const dir = path.join(PIPIUI_MAIN_CWD, ".pi", "agent-sessions");
 	try {
 		fs.mkdirSync(dir, { recursive: true });
-		pruneAgentSessions(dir);
+		pruneAgentSessions(dir, "access");
 		return dir;
 	} catch {
 		return undefined;
@@ -1845,6 +2115,144 @@ function safeId(agentId: string): string {
 	return agentId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) || "agent";
 }
 
+// PIPIUI_PURE_AGENT_LEASE_BEGIN
+interface AgentLeaseRecord {
+	agentId: string;
+	pid: number;
+	processIdentity?: string;
+	token: string;
+	createdAt: number;
+}
+
+interface AgentLease {
+	filePath: string;
+	token: string;
+}
+
+type AgentLeaseResult = { lease: AgentLease; problem?: never } | { lease?: never; problem: string };
+const AGENT_LEASE_INVALID_GRACE_MS = 30_000;
+
+function leaseProcessIdentity(pid: number): string | undefined {
+	try {
+		const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+			encoding: "utf8",
+			shell: false,
+		});
+		const value = result.status === 0 ? result.stdout.trim() : "";
+		return value || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+let ownLeaseProcessIdentityResolved = false;
+let ownLeaseProcessIdentity: string | undefined;
+function currentLeaseProcessIdentity(): string | undefined {
+	if (!ownLeaseProcessIdentityResolved) {
+		ownLeaseProcessIdentity = leaseProcessIdentity(process.pid);
+		ownLeaseProcessIdentityResolved = true;
+	}
+	return ownLeaseProcessIdentity;
+}
+
+function leaseProcessIsAlive(record: AgentLeaseRecord): boolean {
+	try {
+		process.kill(record.pid, 0);
+	} catch (err) {
+		return (err as NodeJS.ErrnoException)?.code === "EPERM";
+	}
+	if (!record.processIdentity) return true;
+	const currentIdentity = leaseProcessIdentity(record.pid);
+	// If ps is unavailable, fail safe: an apparently live pid keeps its lease.
+	return currentIdentity === undefined || currentIdentity === record.processIdentity;
+}
+
+function agentLeaseFile(mainCwd: string, agentId: string): string {
+	return path.join(mainCwd, ".pi", "agent-leases", `${agentId}.lease`);
+}
+
+function createAgentLeaseFile(filePath: string, agentId: string): AgentLease {
+	const token = randomBytes(16).toString("hex");
+	const record: AgentLeaseRecord = {
+		agentId,
+		pid: process.pid,
+		processIdentity: currentLeaseProcessIdentity(),
+		token,
+		createdAt: Date.now(),
+	};
+	const fd = fs.openSync(filePath, "wx", 0o600);
+	try {
+		fs.writeFileSync(fd, JSON.stringify(record), "utf8");
+	} finally {
+		fs.closeSync(fd);
+	}
+	return { filePath, token };
+}
+
+/** Atomic cross-process bare-ID lease with dead-owner/aged-invalid recovery. */
+function acquireAgentLease(mainCwd: string, agentId: string): AgentLeaseResult {
+	const filePath = agentLeaseFile(mainCwd, agentId);
+	try {
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	} catch (err) {
+		return { problem: `Cannot create global agentId lease directory: ${err instanceof Error ? err.message : String(err)}` };
+	}
+
+	for (let attempt = 0; attempt < 4; attempt++) {
+		try {
+			return { lease: createAgentLeaseFile(filePath, agentId) };
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") {
+				return { problem: `Cannot acquire global lease for agentId ${JSON.stringify(agentId)}: ${err instanceof Error ? err.message : String(err)}` };
+			}
+		}
+
+		let record: AgentLeaseRecord | undefined;
+		let ageMs = 0;
+		try {
+			const stat = fs.statSync(filePath);
+			ageMs = Math.max(0, Date.now() - stat.mtimeMs);
+			record = JSON.parse(fs.readFileSync(filePath, "utf8")) as AgentLeaseRecord;
+		} catch {
+			// A fresh invalid/partial file can be between exclusive open and close. Never steal it.
+		}
+		if (record && leaseProcessIsAlive(record)) {
+			return { problem: `agentId ${JSON.stringify(agentId)} is already running in Pi process ${record.pid}.` };
+		}
+		if (!record && ageMs < AGENT_LEASE_INVALID_GRACE_MS) {
+			return { problem: `agentId ${JSON.stringify(agentId)} lease is still initializing; retry later.` };
+		}
+
+		// Only dead-owner or aged-invalid files reach here. Rename is the atomic stale claim:
+		// exactly one contender wins, and every other contender retries exclusive create.
+		const tomb = `${filePath}.stale-${process.pid}-${randomBytes(6).toString("hex")}`;
+		try {
+			fs.renameSync(filePath, tomb);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+			return { problem: `Cannot reclaim stale lease for agentId ${JSON.stringify(agentId)}: ${err instanceof Error ? err.message : String(err)}` };
+		}
+		try {
+			fs.rmSync(tomb, { force: true });
+		} catch {
+			// The tomb is unaddressable as a live lease; later housekeeping may remove it.
+		}
+	}
+	return { problem: `Could not acquire global lease for agentId ${JSON.stringify(agentId)} after concurrent retries.` };
+}
+
+/** Token check prevents an old owner from unlinking a newer owner's lease. */
+function releaseAgentLease(lease: AgentLease): void {
+	try {
+		const record = JSON.parse(fs.readFileSync(lease.filePath, "utf8")) as AgentLeaseRecord;
+		if (record.token !== lease.token) return;
+		fs.unlinkSync(lease.filePath);
+	} catch {
+		// Already reclaimed/removed or unreadable: never unlink without proving ownership.
+	}
+}
+// PIPIUI_PURE_AGENT_LEASE_END
+
 function gitSpawnSync(
 	args: string[],
 	cwd?: string,
@@ -1923,7 +2331,9 @@ function parseWorktreeListPorcelain(output: string): Array<{ path: string; branc
  * - effective cwd is not inside a git work tree
  *
  * TS never auto remove / commit / merge (Swift SubagentStore owns lifecycle).
- * On failure creating wt, fall back to original cwd + worktreeError.
+ * On failure creating required isolation, return worktreeError; runSingleAgent fails closed
+ * before spawning a child. Read-only, explicit-cwd and explicit PIPIUI_WORKTREE=0 paths remain
+ * deliberate shared-cwd semantics rather than isolation failures.
  * Never auto-merge in TS or Swift end handlers — GUI confirms merge/discard.
  * failed/aborted/interrupted writable workers → keep pendingReview for续作; GUI merge/discard remains as fallback.
  */
@@ -1952,7 +2362,11 @@ function resolveSubagentWorktree(opts: {
 	const effectiveCwd = opts.defaultCwd;
 	const inside = gitSpawnSync(["-C", effectiveCwd, "rev-parse", "--is-inside-work-tree"]);
 	if (!inside.ok || inside.stdout !== "true") {
-		return { cwd: effectiveCwd };
+		return {
+			cwd: effectiveCwd,
+			worktreeError:
+				inside.stderr || "writable isolation requires a git work tree; refusing shared-cwd fallback",
+		};
 	}
 
 	const top = gitSpawnSync(["-C", effectiveCwd, "rev-parse", "--show-toplevel"]);
@@ -2090,7 +2504,7 @@ function resolveSubagentWorktree(opts: {
 		.join("; ");
 	return {
 		cwd: effectiveCwd,
-		worktreeError: errParts || "git worktree add failed",
+		worktreeError: errParts || "git worktree add failed; refusing shared-cwd fallback",
 	};
 }
 
@@ -2202,23 +2616,23 @@ interface PendingDoneEntry {
 	firstFailedAt: number;
 	attempts: number;
 	lastAttemptAt: number;
+	inFlight: boolean;
 }
 const pendingDone = new Map<string, PendingDoneEntry>();
-// 每 agentId 每轮运行至多投递一次 done：二次 notify/重投直接挡掉，防止同一条
-// [subagent-done] 再次注入聊天、盖掉上一轮完结总结。jobUpsertRunning 开启新一轮时清闩。
+// Confirmed delivery is distinct from in-flight delivery. This latch is armed only after
+// sendUserMessage resolves successfully; failed sends remain eligible for bounded retry.
 const deliveredDone = new Set<string>();
 
 function sendDoneWithConfirmation(pi: ExtensionAPI, agentId: string, text: string, isRetry: boolean): void {
-	// 已投递门闩：无论第二次来自 notify 还是重投都拦截。sendDoneWithConfirmation 是 done 投递的
-	// 唯一出口（deliverSubagentDone 用于 stall/heartbeat/vanished，不走这里，不受影响）。
 	if (deliveredDone.has(agentId)) return;
-	deliveredDone.add(agentId);
 	const now = Date.now();
 	let entry = pendingDone.get(agentId);
 	if (!entry) {
-		entry = { text, firstFailedAt: 0, attempts: 0, lastAttemptAt: 0 };
+		entry = { text, firstFailedAt: 0, attempts: 0, lastAttemptAt: 0, inFlight: false };
 		pendingDone.set(agentId, entry);
 	}
+	if (entry.inFlight || entry.attempts >= DONE_MAX_ATTEMPTS) return;
+	entry.inFlight = true;
 	entry.attempts += 1;
 	entry.lastAttemptAt = now;
 	// 重投沿用同一 text，首行前加一行说明这是重复投递，防止 boss 当成新事件。
@@ -2226,11 +2640,20 @@ function sendDoneWithConfirmation(pi: ExtensionAPI, agentId: string, text: strin
 		? `(re-delivery #${entry.attempts}: the previous [subagent-done] below was not confirmed delivered; treat it as the same event, not a new one.)\n${entry.text}`
 		: entry.text;
 	void trySendUserMessage(pi, outText).then((ok) => {
+		// A new run can replace this entry while the old promise is settling.
+		if (pendingDone.get(agentId) !== entry) return;
+		entry.inFlight = false;
 		if (ok) {
-			// 只在自己仍是当前 entry 时删除，避免与并发重投交错误删新状态。
-			if (pendingDone.get(agentId) === entry) pendingDone.delete(agentId);
+			deliveredDone.add(agentId);
+			pendingDone.delete(agentId);
 		} else if (entry.firstFailedAt === 0) {
 			entry.firstFailedAt = now;
+		}
+		if (!ok && entry.attempts >= DONE_MAX_ATTEMPTS) {
+			pendingDone.delete(agentId);
+			console.error(
+				`[pipiui-subagent] giving up done delivery after ${entry.attempts} attempts: ${agentId}`,
+			);
 		}
 	});
 }
@@ -2323,6 +2746,25 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 	});
 	await Promise.all(workers);
 	return results;
+}
+
+/** Background fan-out finalizes each item and drops its full result immediately. */
+async function forEachWithConcurrencyLimit<TIn>(
+	items: TIn[],
+	concurrency: number,
+	fn: (item: TIn, index: number) => Promise<void>,
+): Promise<void> {
+	if (items.length === 0) return;
+	const limit = Math.max(1, Math.min(concurrency, items.length));
+	let nextIndex = 0;
+	const workers = new Array(limit).fill(null).map(async () => {
+		while (true) {
+			const current = nextIndex++;
+			if (current >= items.length) return;
+			await fn(items[current], current);
+		}
+	});
+	await Promise.all(workers);
 }
 
 async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
@@ -2428,6 +2870,7 @@ async function runSingleAgent(
 	const agent = agents.find((a) => a.name === agentName);
 	const pipiuiAgentId = options?.agentId ?? generatePipiuiAgentId();
 	const isBackground = options?.background === true;
+	localAgentReservations.add(pipiuiAgentId);
 
 	if (!agent) {
 		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
@@ -2450,8 +2893,30 @@ async function runSingleAgent(
 			state: "failed",
 			resultText: fail.stderr,
 		});
+		localAgentReservations.delete(pipiuiAgentId);
 		return fail;
 	}
+	const leaseResult = acquireAgentLease(path.resolve(PIPIUI_MAIN_CWD || defaultCwd), pipiuiAgentId);
+	if (!leaseResult.lease) {
+		const message = leaseResult.problem;
+		localAgentReservations.delete(pipiuiAgentId);
+		return {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			title: options?.title,
+			exitCode: 1,
+			messages: [],
+			stderr: message,
+			errorMessage: message,
+			usage: emptyUsage(),
+			step,
+			agentId: pipiuiAgentId,
+			stopReason: "error",
+		};
+	}
+	const agentLease = leaseResult.lease;
+	try {
 
 	const runtimePolicy = runtimeRolePolicyForAgent(agentName);
 	const placement = resolveSubagentWorktree({
@@ -2461,11 +2926,56 @@ async function runSingleAgent(
 		readOnly: agent.traits.readOnly,
 		policy: runtimePolicy,
 	});
-	const spawnCwd = placement.cwd;
-
 	const resolvedModel = resolveAgentModel(agentName, agent.model, options?.sessionModel);
 	const resolvedThinking = resolveAgentThinking(agentName);
 	const mainModelForChild = inheritMainModel(options?.sessionModel);
+	if (placement.worktreeError) {
+		const message = `Writable subagent isolation failed before spawn: ${placement.worktreeError}`;
+		const fail: SingleResult = {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			title: options?.title,
+			exitCode: 1,
+			messages: [],
+			stderr: message,
+			errorMessage: message,
+			usage: emptyUsage(),
+			model: resolvedModel,
+			step,
+			agentId: pipiuiAgentId,
+			stopReason: "error",
+		};
+		await postPipiuiReport({
+			kind: "start",
+			agentId: pipiuiAgentId,
+			parentId: PIPIUI_PARENT,
+			toolCallId: pipiuiCurrentToolCall,
+			name: agentName,
+			task,
+			depth: PIPIUI_DEPTH + 1,
+			model: resolvedModel ?? null,
+			...(options?.title ? { title: options.title } : {}),
+			...(options?.background ? { background: true } : {}),
+			worktreeError: placement.worktreeError,
+		});
+		jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title);
+		jobFinalize(pipiuiAgentId, {
+			name: agentName,
+			task,
+			state: "failed",
+			resultText: message,
+		});
+		await postTerminalPipiuiReport({
+			kind: "end",
+			agentId: pipiuiAgentId,
+			ok: false,
+			output: message,
+			worktreeError: placement.worktreeError,
+		});
+		return fail;
+	}
+	const spawnCwd = placement.cwd;
 
 	// A worker keeps its conversation across re-dispatches so a vertical slice — implement,
 	// verify, debug, fix, re-verify — is done by someone who remembers writing the code, rather
@@ -2550,7 +3060,7 @@ async function runSingleAgent(
 
 	let pipiuiLastUpdate = 0;
 	let pipiuiActivity = "";
-	pipiuiReport({
+	await postPipiuiReport({
 		kind: "start",
 		agentId: pipiuiAgentId,
 		parentId: PIPIUI_PARENT,
@@ -2838,7 +3348,8 @@ async function runSingleAgent(
 				.replace(/\s+/g, " ")
 				.trim()
 				.slice(0, 120);
-			const backoffMs = AUTO_RESUME_BACKOFF_MS[autoResumeCount] ?? 15_000;
+			const baseBackoffMs = AUTO_RESUME_BACKOFF_MS[autoResumeCount] ?? 15_000;
+			const backoffMs = jitteredRetryBackoffMs(baseBackoffMs);
 			autoResumeCount++;
 			// Reset per-run failure flags; messages/usage/stderr keep accumulating across resumes.
 			currentResult.stopReason = undefined;
@@ -2927,7 +3438,7 @@ async function runSingleAgent(
 			// Append only — never replace an existing terminal errorMessage.
 			if (currentResult.errorMessage) currentResult.errorMessage += note;
 		}
-		pipiuiReport({
+		await postTerminalPipiuiReport({
 			kind: "end",
 			agentId: pipiuiAgentId,
 			ok: endOk,
@@ -2963,6 +3474,7 @@ async function runSingleAgent(
 		return currentResult;
 	} finally {
 		if (isBackground) runningAgents.delete(pipiuiAgentId);
+		if (sessionDir) pruneAgentSessions(sessionDir, "completed");
 		if (tmpPromptPath)
 			try {
 				fs.unlinkSync(tmpPromptPath);
@@ -2973,8 +3485,13 @@ async function runSingleAgent(
 			try {
 				fs.rmdirSync(tmpPromptDir);
 			} catch {
-				/* ignore */
-			}
+					/* ignore */
+				}
+	}
+	} finally {
+		await awaitTerminalPipiuiReports(pipiuiAgentId);
+		releaseAgentLease(agentLease);
+		localAgentReservations.delete(pipiuiAgentId);
 	}
 }
 
@@ -3442,23 +3959,7 @@ export default function (pi: ExtensionAPI) {
 					...(extra?.agentIds ? { agentIds: extra.agentIds } : {}),
 				});
 
-			// Caller-chosen ids are the addressing scheme for continuing a worker, so a bad one
-			// is reported back to the model to fix rather than silently replaced — a silently
-			// replaced id becomes a different worker with an empty head.
-			for (const candidate of [
-				...(params.action !== "abort" ? [params.agentId] : []),
-				...(params.tasks ?? []).map((t) => t.agentId),
-			]) {
-				if (candidate === undefined) continue;
-				const problem = validateAgentId(candidate.trim());
-				if (problem) {
-					return {
-						content: [{ type: "text", text: problem }],
-						details: makeDetails(isChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-						isError: true,
-					};
-				}
-			}
+			const requestAgentIds = new Set<string>();
 			// Default background at boss depth for single/parallel; chain and nested always sync.
 			// While the fan-out layer is on, background is not the caller's to switch off: a boss
 			// that blocks on every dispatch is running a fake fan-out, and the guard has to be
@@ -3640,7 +4141,59 @@ export default function (pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
-				dispatchNudgePrefix = assessment.nudgeText;
+					dispatchNudgePrefix = assessment.nudgeText;
+				}
+
+			if (hasTasks && (params.tasks?.length ?? 0) > MAX_PARALLEL_TASKS) {
+				return {
+					content: [{ type: "text", text: `Too many parallel tasks (${params.tasks!.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
+					details: makeDetails("parallel")([]),
+					isError: true,
+				};
+			}
+			const requestedNames = hasChain
+				? (params.chain ?? []).map((step) => step.agent)
+				: hasTasks
+					? (params.tasks ?? []).map((task) => task.agent)
+					: [params.agent!];
+			const unknownNames = [...new Set(requestedNames.filter((name) => !agents.some((agent) => agent.name === name)))];
+			if (unknownNames.length > 0) {
+				const available = agents.map((agent) => `"${agent.name}"`).join(", ") || "none";
+				return {
+					content: [{ type: "text", text: `Unknown agent(s): ${unknownNames.map((name) => `"${name}"`).join(", ")}. Available agents: ${available}.` }],
+					details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+					isError: true,
+				};
+			}
+
+			// This is deliberately after the final await/validation and immediately before
+			// dispatch. Add to the module reservation set synchronously so a concurrent tool call
+			// cannot pass the same selector during any later async setup.
+			const activeAgentIds = new Set<string>([
+				...localAgentReservations,
+				...runningAgents.keys(),
+				...[...jobRegistry.values()]
+					.filter((job) => job.state === "running")
+					.map((job) => job.agentId),
+			]);
+			const callerSelection = selectAndReserveCallerAgentIds(
+				hasTasks
+					? (params.tasks ?? []).map((task) => task.agentId)
+					: hasSingle
+						? [params.agentId]
+						: [],
+				activeAgentIds,
+				localAgentReservations,
+			);
+			if (callerSelection.problem) {
+				return {
+					content: [{ type: "text", text: callerSelection.problem }],
+					details: makeDetails(isChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+					isError: true,
+				};
+			}
+			for (const id of callerSelection.ids) {
+				requestAgentIds.add(id);
 			}
 
 			recordSubagentDispatchStats(
@@ -3684,7 +4237,12 @@ export default function (pi: ExtensionAPI) {
 						chainUpdate,
 						makeDetails("chain"),
 
-						{ title: step.title, sessionModel, verify: step.verify },
+						{
+							title: step.title,
+							sessionModel,
+							verify: step.verify,
+							agentId: generatePipiuiAgentId(requestAgentIds),
+						},
 					);
 					results.push(result);
 
@@ -3757,7 +4315,7 @@ export default function (pi: ExtensionAPI) {
 
 					for (const t of params.tasks) {
 						const agentCfg = agents.find((a) => a.name === t.agent)!;
-						const agentId = t.agentId?.trim() || generatePipiuiAgentId();
+						const agentId = t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
 						agentIds.push(agentId);
 						startedItems.push({ agentId, name: t.agent, task: t.task, title: t.title });
 						placeholders.push({
@@ -3774,8 +4332,10 @@ export default function (pi: ExtensionAPI) {
 						});
 					}
 
-					// Fire-and-forget with the same concurrency cap; each task notifies on its own completion.
-					void mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
+					// Fire-and-forget with the same concurrency cap. Per-item notification is the
+					// finalization boundary, so completed full results are not retained until the
+					// slowest sibling settles.
+					void forEachWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
 						const agentId = agentIds[index];
 						try {
 							const result = await runSingleAgent(
@@ -3791,7 +4351,6 @@ export default function (pi: ExtensionAPI) {
 								{ background: true, agentId, title: t.title, sessionModel, verify: t.verify, fresh: t.fresh },
 							);
 							notifySubagentDone(pi, result);
-							return result;
 						} catch (err) {
 							const msg = err instanceof Error ? err.message : String(err);
 							console.error("[pipiui-subagent] background parallel agent error:", agentId, msg);
@@ -3810,7 +4369,6 @@ export default function (pi: ExtensionAPI) {
 								stopReason: aborted ? "aborted" : "error",
 							};
 							notifySubagentDone(pi, failResult, { aborted, error: msg });
-							return failResult;
 						}
 					}).catch((err) => {
 						console.error("[pipiui-subagent] background parallel runner error:", err);
@@ -3872,7 +4430,13 @@ export default function (pi: ExtensionAPI) {
 						},
 						makeDetails("parallel"),
 
-						{ title: t.title, sessionModel, verify: t.verify, agentId: t.agentId?.trim(), fresh: t.fresh },
+						{
+							title: t.title,
+							sessionModel,
+							verify: t.verify,
+							agentId: t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
+							fresh: t.fresh,
+						},
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -3921,7 +4485,7 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					const agentId = params.agentId?.trim() || generatePipiuiAgentId();
+					const agentId = params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
 					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.fresh);
 					const placeholder: SingleResult = {
 						agent: params.agent,
@@ -3963,7 +4527,13 @@ export default function (pi: ExtensionAPI) {
 					onUpdate,
 					makeDetails("single"),
 
-					{ title: params.title, sessionModel, verify: params.verify, agentId: params.agentId?.trim(), fresh: params.fresh },
+					{
+						title: params.title,
+						sessionModel,
+						verify: params.verify,
+						agentId: params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
+						fresh: params.fresh,
+					},
 				);
 				const isError = isFailedResult(result);
 				if (isError) {

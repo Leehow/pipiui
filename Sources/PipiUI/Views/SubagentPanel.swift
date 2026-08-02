@@ -13,12 +13,12 @@ struct SubagentPanel: View {
     var onClose: () -> Void
     /// 列表贴底跟随：新 agent 到达时若仍贴底则自动滚到最新条目；用户上滚看旧条目即脱离。
     @State private var pinToBottom = true
+    /// UI window only: zero is the newest fixed-size page; mounted agent rows never grow with use.
+    @State private var panelPageFromNewest = 0
 
     /// 上下分栏比例（列表高度 / 可用高度）。拖拽 onChanged 更新，onEnded 持久化。
     @State private var listHeightRatio = LayoutPersistence.subagentListHeightRatio()
         ?? LayoutPersistence.defaultSubagentListHeightRatio
-    /// 本次拖拽的起点比例（作为 startListHeight 基数，避免叠加已被更新的比例）。
-    @State private var dragStartListHeightRatio: CGFloat?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -30,20 +30,21 @@ struct SubagentPanel: View {
             if store.agents.isEmpty {
                 emptyHint
             } else {
-                GeometryReader { geo in
-                    let availableHeight = geo.size.height - Self.subagentDividerHeight
-                    let listHeight = clampedSubagentListHeight(
-                        availableHeight * listHeightRatio,
-                        availableHeight: availableHeight
-                    )
-                    VStack(spacing: 0) {
-                        agentList
-                            .frame(height: listHeight)
-                        subagentListDivider(availableHeight: availableHeight)
-                        detail
-                            .frame(height: max(0, availableHeight - listHeight))
+                StableSubagentSplitView(
+                    ratio: listHeightRatio,
+                    onDragEnded: { ratio, translation in
+                        listHeightRatio = ratio
+                        if abs(translation) >= 1,
+                           let saved = LayoutPersistence.saveSubagentListHeightRatio(ratio) {
+                            listHeightRatio = saved
+                        }
                     }
+                ) {
+                    agentList
+                } detail: {
+                    detail
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .background(Color(nsColor: .textBackgroundColor))
@@ -54,92 +55,40 @@ struct SubagentPanel: View {
         }
     }
 
-    // MARK: - 上下分栏高度（镜像 RightPanelDivider / finishRightPanelDrag 先例）
-
-    /// 拖拽手柄高度（含 1pt 视觉线）。
-    private static let subagentDividerHeight: CGFloat = 6
-    private static let minimumSubagentListHeight: CGFloat = 64
-    private static let minimumSubagentDetailHeight: CGFloat = 56
-
-    /// 列表高度钳制：不低于 64，且给 detail 至少留 56。
-    private func clampedSubagentListHeight(_ proposed: CGFloat, availableHeight: CGFloat) -> CGFloat {
-        let maximumListHeight = max(
-            Self.minimumSubagentListHeight,
-            availableHeight - Self.minimumSubagentDetailHeight
-        )
-        return min(max(proposed, Self.minimumSubagentListHeight), maximumListHeight)
-    }
-
-    private func subagentListDivider(availableHeight: CGFloat) -> some View {
-        SubagentListDivider(
-            onChanged: { translation in
-                updateSubagentListDrag(translation: translation, availableHeight: availableHeight)
-            },
-            onEnded: { translation in
-                finishSubagentListDrag(translation: translation, availableHeight: availableHeight)
-            }
-        )
-        .frame(height: Self.subagentDividerHeight)
-    }
-
-    private func updateSubagentListDrag(translation: CGFloat, availableHeight: CGFloat) {
-        guard availableHeight > 0 else { return }
-        if dragStartListHeightRatio == nil {
-            dragStartListHeightRatio = listHeightRatio
-        }
-        guard let startRatio = dragStartListHeightRatio else { return }
-        let startListHeight = clampedSubagentListHeight(
-            availableHeight * startRatio,
-            availableHeight: availableHeight
-        )
-        let newHeight = clampedSubagentListHeight(
-            startListHeight + translation,
-            availableHeight: availableHeight
-        )
-        listHeightRatio = newHeight / availableHeight
-    }
-
-    private func finishSubagentListDrag(translation: CGFloat, availableHeight: CGFloat) {
-        guard availableHeight > 0 else { return }
-        let startRatio = dragStartListHeightRatio ?? listHeightRatio
-        let startListHeight = clampedSubagentListHeight(
-            availableHeight * startRatio,
-            availableHeight: availableHeight
-        )
-        let newHeight = clampedSubagentListHeight(
-            startListHeight + translation,
-            availableHeight: availableHeight
-        )
-
-        if abs(translation) >= 1 {
-            if let validRatio = LayoutPersistence.saveSubagentListHeightRatio(newHeight / availableHeight) {
-                listHeightRatio = validRatio
-            }
-        }
-
-        dragStartListHeightRatio = nil
-    }
+    // MARK: - 上下分栏
 
     private var header: some View {
-        HStack(spacing: 8) {
+        let summary = SubagentPresentationScale.summary(for: store.agents)
+        return HStack(spacing: 8) {
             Label("Subagents", systemImage: "person.2")
                 .font(.callout.weight(.semibold))
-            if store.runningCount > 0 {
-                Text("\(store.runningCount) 运行中")
+            Text("\(summary.totalCount) 个")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if summary.runningCount > 0 {
+                Text("\(summary.runningCount) 运行中")
                     .font(.caption)
                     .foregroundStyle(.green)
             }
+            if summary.failedCount > 0 {
+                Text("\(summary.failedCount) 失败")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
             Spacer()
-            if store.totalCost > 0 {
-                Text(String(format: "$%.4f", store.totalCost))
+            if summary.totalCost > 0 {
+                Text(String(format: "$%.4f", summary.totalCost))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Button("清空已完成") { store.clearFinished() }
+            Button("清空已完成") {
+                panelPageFromNewest = 0
+                store.clearFinished()
+            }
                 .buttonStyle(.plain)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .disabled(store.agents.allSatisfy { $0.state == .running })
+                .disabled(summary.finishedCount == 0)
             Button(action: onClose) {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundStyle(.secondary)
@@ -198,18 +147,50 @@ struct SubagentPanel: View {
     }
 
     private var agentList: some View {
-        ScrollViewReader { proxy in
+        let displayOrder = store.displayOrder
+        let window = SubagentPresentationScale.panelWindow(
+            for: displayOrder,
+            pageFromNewest: panelPageFromNewest,
+            selectedID: store.selectedId
+        )
+        return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 2) {
-                    ForEach(store.displayOrder) { agent in
+                    ForEach(window.agents) { agent in
                         AgentRow(
                             agent: agent,
                             selected: agent.id == store.selectedId,
                             abortPending: store.abortPending.contains(agent.id),
+                            onSelect: { store.selectedId = agent.id },
                             onAbort: { onAbort(agent.id) }
                         )
-                            .contentShape(Rectangle())
-                            .onTapGesture { store.selectedId = agent.id }
+                    }
+                    if window.pageCount > 1 {
+                        HStack(spacing: 10) {
+                            Button {
+                                panelPageFromNewest = max(0, window.pageFromNewest - 1)
+                            } label: {
+                                Label("较新的", systemImage: "chevron.down")
+                            }
+                            .disabled(!window.canShowNewer)
+
+                            Spacer(minLength: 0)
+                            Text("从最新起第 \(window.pageFromNewest + 1)/\(window.pageCount) 页")
+                                .foregroundStyle(.tertiary)
+                            Spacer(minLength: 0)
+
+                            Button {
+                                panelPageFromNewest = window.pageFromNewest + 1
+                            } label: {
+                                Label("较早的", systemImage: "chevron.up")
+                            }
+                            .disabled(!window.canShowOlder)
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 7)
                     }
                     // 透明贴底锚点，与行数据解耦：新行插入/旧行移除不影响锚点位置。
                     Color.clear
@@ -231,12 +212,19 @@ struct SubagentPanel: View {
                     jumpToListBottom(proxy)
                 }
             }
-            .onChange(of: store.displayOrder.last?.id) { _, _ in
+            .onChange(of: displayOrder.last?.id) { _, _ in
                 // 新 agent 到达（displayOrder 末尾变化）时跟随；状态/费用等
                 // 元素级更新不触发（末尾 id 不变），避免打扰用户浏览旧条目。
                 DispatchQueue.main.async {
                     jumpToListBottom(proxy)
                 }
+            }
+            .onChange(of: window.listIdentity) { previous, current in
+                panelPageFromNewest = SubagentPresentationScale.panelPageAfterListChange(
+                    currentPage: panelPageFromNewest,
+                    previousIdentity: previous,
+                    newIdentity: current
+                )
             }
         }
     }
@@ -262,43 +250,245 @@ struct SubagentPanel: View {
     }
 }
 
-/// 竖向拖拽手柄：镜像 RightPanelDivider，DragGesture 取 vertical 位移调整上下栏比例。
-private struct SubagentListDivider: View {
-    let onChanged: (CGFloat) -> Void
-    let onEnded: (CGFloat) -> Void
-    @State private var isPointerInside = false
+/// Pure sizing for the AppKit-backed split. Keeping this independent from the
+/// SwiftUI graph makes clamping executable in tests and prevents size feedback.
+struct SubagentPanelSplitSizing {
+    static let dividerHeight: CGFloat = 6
+    static let minimumListHeight: CGFloat = 64
+    static let minimumDetailHeight: CGFloat = 56
 
-    var body: some View {
-        ZStack {
-            Color.clear
-            Rectangle()
-                .fill(Color.primary.opacity(0.14))
-                .frame(height: 1)
+    struct Resolved: Equatable {
+        let availableHeight: CGFloat
+        let listHeight: CGFloat
+        let detailHeight: CGFloat
+    }
+
+    static func resolve(containerHeight: CGFloat, ratio: CGFloat) -> Resolved {
+        let finiteHeight = containerHeight.isFinite ? max(0, containerHeight) : 0
+        let actualDividerHeight = min(dividerHeight, finiteHeight)
+        let availableHeight = max(0, finiteHeight - actualDividerHeight)
+        guard availableHeight > 0 else {
+            return Resolved(availableHeight: 0, listHeight: 0, detailHeight: 0)
         }
-        .contentShape(Rectangle())
-        .gesture(
-            DragGesture(
-                minimumDistance: 1,
-                coordinateSpace: .global
-            )
-                .onChanged { value in
-                    onChanged(value.translation.height)
-                }
-                .onEnded { value in
-                    onEnded(value.translation.height)
-                }
+
+        let finiteRatio = ratio.isFinite ? ratio : LayoutPersistence.defaultSubagentListHeightRatio
+        let proposedListHeight = availableHeight * min(max(finiteRatio, 0), 1)
+
+        // When the container can satisfy both minimums, enforce both. At very
+        // small heights the list keeps as much of its 64pt minimum as exists;
+        // the detail receives the remaining non-negative space.
+        let minimumListHeight = min(Self.minimumListHeight, availableHeight)
+        let maximumListHeight = max(
+            minimumListHeight,
+            availableHeight - Self.minimumDetailHeight
         )
-        .onHover { isInside in
-            isPointerInside = isInside
-            (isInside ? NSCursor.resizeUpDown : NSCursor.arrow).set()
+        let listHeight = min(max(proposedListHeight, minimumListHeight), maximumListHeight)
+        return Resolved(
+            availableHeight: availableHeight,
+            listHeight: listHeight,
+            detailHeight: max(0, availableHeight - listHeight)
+        )
+    }
+
+    static func draggedRatio(
+        startRatio: CGFloat,
+        translation: CGFloat,
+        containerHeight: CGFloat
+    ) -> CGFloat {
+        let start = resolve(containerHeight: containerHeight, ratio: startRatio)
+        guard start.availableHeight > 0 else { return startRatio }
+        let proposedRatio = (start.listHeight + translation) / start.availableHeight
+        let resolved = resolve(containerHeight: containerHeight, ratio: proposedRatio)
+        return resolved.listHeight / resolved.availableHeight
+    }
+}
+
+/// Hosts the two SwiftUI panes in a frame-driven AppKit container. The AppKit
+/// parent owns measurement and divider movement, so SwiftUI never reads its
+/// proposed height and writes that value back into child `.frame(height:)`.
+private struct StableSubagentSplitView<ListContent: View, DetailContent: View>: NSViewRepresentable {
+    let ratio: CGFloat
+    let onDragEnded: (CGFloat, CGFloat) -> Void
+    let listContent: ListContent
+    let detailContent: DetailContent
+
+    init(
+        ratio: CGFloat,
+        onDragEnded: @escaping (CGFloat, CGFloat) -> Void,
+        @ViewBuilder list: () -> ListContent,
+        @ViewBuilder detail: () -> DetailContent
+    ) {
+        self.ratio = ratio
+        self.onDragEnded = onDragEnded
+        self.listContent = list()
+        self.detailContent = detail()
+    }
+
+    func makeNSView(context: Context) -> StableSubagentSplitContainer<ListContent, DetailContent> {
+        StableSubagentSplitContainer(
+            ratio: ratio,
+            listContent: listContent,
+            detailContent: detailContent,
+            onDragEnded: onDragEnded
+        )
+    }
+
+    func updateNSView(
+        _ nsView: StableSubagentSplitContainer<ListContent, DetailContent>,
+        context: Context
+    ) {
+        nsView.update(
+            ratio: ratio,
+            listContent: listContent,
+            detailContent: detailContent,
+            onDragEnded: onDragEnded
+        )
+    }
+}
+
+private protocol StableSubagentSplitDragging: AnyObject {
+    func beginDividerDrag(windowY: CGFloat)
+    func continueDividerDrag(windowY: CGFloat)
+    func endDividerDrag(windowY: CGFloat)
+}
+
+private final class StableSubagentSplitContainer<ListContent: View, DetailContent: View>: NSView,
+    StableSubagentSplitDragging
+{
+    private let listHost: NSHostingView<ListContent>
+    private let detailHost: NSHostingView<DetailContent>
+    private let divider = StableSubagentSplitDivider()
+    private var ratio: CGFloat
+    private var onDragEnded: (CGFloat, CGFloat) -> Void
+    private var dragStartRatio: CGFloat?
+    private var dragStartWindowY: CGFloat?
+
+    override var isFlipped: Bool { true }
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
+
+    init(
+        ratio: CGFloat,
+        listContent: ListContent,
+        detailContent: DetailContent,
+        onDragEnded: @escaping (CGFloat, CGFloat) -> Void
+    ) {
+        self.ratio = ratio
+        self.onDragEnded = onDragEnded
+        self.listHost = NSHostingView(rootView: listContent)
+        self.detailHost = NSHostingView(rootView: detailContent)
+        super.init(frame: .zero)
+
+        listHost.translatesAutoresizingMaskIntoConstraints = true
+        detailHost.translatesAutoresizingMaskIntoConstraints = true
+        divider.translatesAutoresizingMaskIntoConstraints = true
+        addSubview(listHost)
+        addSubview(divider)
+        addSubview(detailHost)
+        divider.container = self
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func update(
+        ratio: CGFloat,
+        listContent: ListContent,
+        detailContent: DetailContent,
+        onDragEnded: @escaping (CGFloat, CGFloat) -> Void
+    ) {
+        listHost.rootView = listContent
+        detailHost.rootView = detailContent
+        self.onDragEnded = onDragEnded
+        if dragStartRatio == nil, self.ratio != ratio {
+            self.ratio = ratio
+            needsLayout = true
         }
-        .onDisappear {
-            if isPointerInside {
-                isPointerInside = false
-                NSCursor.arrow.set()
-            }
-        }
-        .help("拖动调整上下两栏高度比例")
+    }
+
+    override func layout() {
+        super.layout()
+        let sizing = SubagentPanelSplitSizing.resolve(
+            containerHeight: bounds.height,
+            ratio: ratio
+        )
+        let dividerHeight = min(SubagentPanelSplitSizing.dividerHeight, bounds.height)
+        listHost.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: bounds.width,
+            height: sizing.listHeight
+        )
+        divider.frame = NSRect(
+            x: 0,
+            y: sizing.listHeight,
+            width: bounds.width,
+            height: dividerHeight
+        )
+        detailHost.frame = NSRect(
+            x: 0,
+            y: sizing.listHeight + dividerHeight,
+            width: bounds.width,
+            height: sizing.detailHeight
+        )
+    }
+
+    fileprivate func beginDividerDrag(windowY: CGFloat) {
+        dragStartRatio = ratio
+        dragStartWindowY = windowY
+    }
+
+    fileprivate func continueDividerDrag(windowY: CGFloat) {
+        guard let dragStartRatio, let dragStartWindowY else { return }
+        let translation = dragStartWindowY - windowY
+        ratio = SubagentPanelSplitSizing.draggedRatio(
+            startRatio: dragStartRatio,
+            translation: translation,
+            containerHeight: bounds.height
+        )
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+    }
+
+    fileprivate func endDividerDrag(windowY: CGFloat) {
+        guard let dragStartWindowY else { return }
+        continueDividerDrag(windowY: windowY)
+        let translation = dragStartWindowY - windowY
+        dragStartRatio = nil
+        self.dragStartWindowY = nil
+        onDragEnded(ratio, translation)
+    }
+}
+
+private final class StableSubagentSplitDivider: NSView {
+    weak var container: (any StableSubagentSplitDragging)?
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        NSColor.separatorColor.withAlphaComponent(0.65).setFill()
+        NSRect(x: 0, y: floor((bounds.height - 1) / 2), width: bounds.width, height: 1).fill()
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .resizeUpDown)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+        container?.beginDividerDrag(windowY: event.locationInWindow.y)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        container?.continueDividerDrag(windowY: event.locationInWindow.y)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        container?.endDividerDrag(windowY: event.locationInWindow.y)
     }
 }
 
@@ -306,9 +496,42 @@ private struct AgentRow: View {
     let agent: SubagentInfo
     let selected: Bool
     var abortPending: Bool = false
+    let onSelect: () -> Void
     var onAbort: (() -> Void)? = nil
 
     var body: some View {
+        HStack(spacing: 0) {
+            Button(action: onSelect) {
+                selectionArea
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity)
+            .accessibilityLabel("选择 \(agent.name) 子代理")
+            .accessibilityAddTraits(selected ? .isSelected : [])
+
+            if agent.state == .running, let onAbort {
+                Button(action: onAbort) {
+                    Image(systemName: "stop.circle")
+                        .font(.callout)
+                }
+                .buttonStyle(HoverButtonStyle(base: abortPending ? Color.secondary.opacity(0.4) : .secondary, hovered: .red))
+                .disabled(abortPending)
+                .help(abortPending ? "正在中止…" : "中止该 agent（/subagent_abort）")
+                .accessibilityLabel("中止 \(agent.name) 子代理")
+                .padding(.trailing, 8)
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(selected ? Color.accentColor.opacity(0.12) : Color.clear)
+        )
+    }
+
+    private var selectionArea: some View {
         HStack(spacing: 8) {
             // 树形缩进：depth 1 是主会话直接派出的
             if agent.depth > 1 {
@@ -375,22 +598,7 @@ private struct AgentRow: View {
             }
             .font(.caption2.monospacedDigit())
             .foregroundStyle(.tertiary)
-            if agent.state == .running, let onAbort {
-                Button(action: onAbort) {
-                    Image(systemName: "stop.circle")
-                        .font(.callout)
-                }
-                .buttonStyle(HoverButtonStyle(base: abortPending ? Color.secondary.opacity(0.4) : .secondary, hovered: .red))
-                .disabled(abortPending)
-                .help(abortPending ? "正在中止…" : "中止该 agent（/subagent_abort）")
-            }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(selected ? Color.accentColor.opacity(0.12) : Color.clear)
-        )
     }
 
     @ViewBuilder

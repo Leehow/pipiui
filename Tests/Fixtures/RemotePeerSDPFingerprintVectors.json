@@ -1,0 +1,132 @@
+[
+  {
+    "name": "lowercase algorithm and hex with one space",
+    "sdp": "v=0\r\na=fingerprint:sha-256 ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab\r\n",
+    "expected": "sha-256 AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB"
+  },
+  {
+    "name": "uppercase algorithm",
+    "sdp": "v=0\na=fingerprint:SHA-256 AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB\n",
+    "expected": "sha-256 AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB"
+  },
+  {
+    "name": "multiple ASCII spaces",
+    "sdp": "v=0\ra=fingerprint:SHA-256   ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab\r",
+    "expected": "sha-256 AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB"
+  },
+  {
+    "name": "surrounding SDP horizontal whitespace",
+    "sdp": "v=0\r\na=fingerprint:\tSHA-256 AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB\t\r\n",
+    "expected": "sha-256 AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB"
+  },
+  {
+    "name": "repeated identical occurrences",
+    "sdp": "v=0\r\na=fingerprint:sha-256 AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB\r\na=fingerprint:SHA-256 ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab:ab\r\n",
+    "expected": "sha-256 AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB"
+  },
+  {
+    "name": "tab separator",
+    "sdp": "v=0\r\na=fingerprint:SHA-256\tAB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB\r\n",
+    "expected": null
+  },
+  {
+    "name": "vertical tab after colon",
+    "sdp": "v=0\r\na=fingerprint:\u000bSHA-256 {{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "vertical tab separator",
+    "sdp": "v=0\r\na=fingerprint:SHA-256\u000b{{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "form feed after colon",
+    "sdp": "v=0\r\na=fingerprint:\u000cSHA-256 {{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "form feed separator",
+    "sdp": "v=0\r\na=fingerprint:SHA-256\u000c{{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "NUL after colon",
+    "sdp": "v=0\r\na=fingerprint:\u0000SHA-256 {{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "NUL separator",
+    "sdp": "v=0\r\na=fingerprint:SHA-256\u0000{{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "NEL after colon",
+    "sdp": "v=0\r\na=fingerprint:\u0085SHA-256 {{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "NEL separator",
+    "sdp": "v=0\r\na=fingerprint:SHA-256\u0085{{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "nonbreaking space after colon",
+    "sdp": "v=0\r\na=fingerprint:\u00a0SHA-256 {{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "nonbreaking space separator",
+    "sdp": "v=0\r\na=fingerprint:SHA-256\u00a0{{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "Unicode line separator after colon",
+    "sdp": "v=0\r\na=fingerprint:\u2028SHA-256 {{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "Unicode line separator between algorithm and digest",
+    "sdp": "v=0\r\na=fingerprint:SHA-256\u2028{{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "Unicode paragraph separator after colon",
+    "sdp": "v=0\r\na=fingerprint:\u2029SHA-256 {{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "Unicode paragraph separator between algorithm and digest",
+    "sdp": "v=0\r\na=fingerprint:SHA-256\u2029{{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "DEL separator",
+    "sdp": "v=0\r\na=fingerprint:SHA-256\u007f{{AB32}}\r\n",
+    "expected": null
+  },
+  {
+    "name": "missing fingerprint",
+    "sdp": "v=0\r\ns=-\r\n",
+    "expected": null
+  },
+  {
+    "name": "other algorithm",
+    "sdp": "v=0\r\na=fingerprint:sha-1 AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB\r\n",
+    "expected": null
+  },
+  {
+    "name": "malformed byte length",
+    "sdp": "v=0\r\na=fingerprint:sha-256 AB:AB:AB\r\n",
+    "expected": null
+  },
+  {
+    "name": "non ASCII hexadecimal characters",
+    "sdp": "v=0\r\na=fingerprint:sha-256 ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ:ＡＢ\r\n",
+    "expected": null
+  },
+  {
+    "name": "conflicting occurrences",
+    "sdp": "v=0\r\na=fingerprint:sha-256 AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB:AB\r\na=fingerprint:sha-256 CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD:CD\r\n",
+    "expected": null
+  }
+]

@@ -24,6 +24,7 @@ export class HostBroker {
   private socket?: WebSocket;
   private epoch?: string;
   private pending = new Map<string, Pending>();
+  private requests = 0;
 
   replace(socket: WebSocket, epoch: string): void {
     const previous = this.socket;
@@ -56,6 +57,10 @@ export class HostBroker {
     return this.epoch;
   }
 
+  requestCount(): number {
+    return this.requests;
+  }
+
   receive(text: string): void {
     if (Buffer.byteLength(text) > MAX_RESPONSE_BYTES) {
       this.socket?.close(1009, "response too large");
@@ -72,6 +77,7 @@ export class HostBroker {
 
   request(command: Command, body: unknown, timeoutMs = 12_000):
     Promise<{ status: number; body: unknown }> {
+    this.requests += 1;
     const socket = this.socket;
     const epoch = this.epoch;
     if (!socket || socket.readyState !== WebSocket.OPEN || !epoch) {

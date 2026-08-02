@@ -30,8 +30,10 @@ enum RemoteConnectionAccessibility {
     static let openBrowserLabel = "在浏览器打开本地测试地址"
     static let copyLANAddressLabel = "复制局域网测试地址"
     static let openLANBrowserLabel = "在浏览器打开局域网测试地址"
-    static let unavailablePairingActionLabel = "生成二维码（需开启局域网测试或 Relay）"
-    static let relayToggleLabel = "启用公网 Relay"
+    static let copyPairingLinkLabel = "复制一次性配对链接"
+    static let openPairingLinkLabel = "在浏览器打开一次性配对链接"
+    static let unavailablePairingActionLabel = "生成配对链接（需开启局域网测试或 Relay）"
+    static let relayToggleLabel = "启用远程服务器隧道"
 }
 
 enum RemotePairingPayloadPolicy {

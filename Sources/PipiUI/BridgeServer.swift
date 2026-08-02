@@ -88,6 +88,35 @@ final class BridgeRequestLifecycle: @unchecked Sendable {
     }
 }
 
+/// Small FIFO with bounded pops. The head offset avoids shifting the full request burst
+/// for every main-thread yield; processed storage is compacted only amortized.
+struct BridgeFIFOBuffer<Element> {
+    private var storage: [Element] = []
+    private var head = 0
+
+    var count: Int { storage.count - head }
+    var isEmpty: Bool { count == 0 }
+
+    mutating func append(_ element: Element) {
+        storage.append(element)
+    }
+
+    mutating func popFirst(maxCount: Int) -> [Element] {
+        guard maxCount > 0, head < storage.count else { return [] }
+        let end = min(storage.count, head + maxCount)
+        let chunk = Array(storage[head..<end])
+        head = end
+        if head == storage.count {
+            storage.removeAll(keepingCapacity: true)
+            head = 0
+        } else if head >= 4_096, head * 2 >= storage.count {
+            storage.removeFirst(head)
+            head = 0
+        }
+        return chunk
+    }
+}
+
 /// Minimal HTTP/1.1 JSON server on 127.0.0.1 used by app-owned pi extensions.
 /// Single endpoint: POST /rpc with a bounded JSON body.
 final class BridgeServer {
@@ -106,6 +135,16 @@ final class BridgeServer {
     private var activeConnections: [
         ObjectIdentifier: (NWConnection, BridgeRequestLifecycle)
     ] = [:]
+    /// Requests arrive on `queue`. Main-queue drains process bounded FIFO chunks so
+    /// high-fanout telemetry neither enqueues one block per socket nor monopolizes main.
+    private struct PendingMainRequest {
+        let json: J
+        let connection: NWConnection
+        let lifecycle: BridgeRequestLifecycle
+    }
+    private var pendingMainRequests = BridgeFIFOBuffer<PendingMainRequest>()
+    private var mainDrainScheduled = false
+    static let maximumMainRequestsPerDrain = 256
     private(set) var port: UInt16 = 0
 
     init?(
@@ -262,7 +301,34 @@ final class BridgeServer {
             )
             return
         }
-        DispatchQueue.main.async { [authorize, handler] in
+        pendingMainRequests.append(PendingMainRequest(
+            json: json,
+            connection: connection,
+            lifecycle: lifecycle
+        ))
+        guard !mainDrainScheduled else { return }
+        mainDrainScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.drainPendingRequestsOnMain()
+        }
+    }
+
+    /// Main-thread isolation is retained for authorization and session routing. Each
+    /// invocation handles one bounded FIFO chunk, then yields before scheduling the next.
+    private func drainPendingRequestsOnMain() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let (batch, hasMore): ([PendingMainRequest], Bool) = queue.sync {
+            let batch = pendingMainRequests.popFirst(
+                maxCount: Self.maximumMainRequestsPerDrain
+            )
+            let hasMore = !pendingMainRequests.isEmpty
+            if !hasMore { mainDrainScheduled = false }
+            return (batch, hasMore)
+        }
+        for pending in batch {
+            let json = pending.json
+            let connection = pending.connection
+            let lifecycle = pending.lifecycle
             if let authorize, !authorize(json) {
                 self.queue.async {
                     let action = json["action"].string ?? ""
@@ -281,7 +347,7 @@ final class BridgeServer {
                         response
                     )
                 }
-                return
+                continue
             }
             handler(
                 json,
@@ -298,6 +364,11 @@ final class BridgeServer {
                     lifecycle.registerCancellation(cancellation)
                 }
             )
+        }
+        if hasMore {
+            DispatchQueue.main.async { [weak self] in
+                self?.drainPendingRequestsOnMain()
+            }
         }
     }
 

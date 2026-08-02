@@ -643,34 +643,116 @@ private final class LockedBool {
     func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
 
-/// 每个会话一棵 subagent 树；agent_event 桥接事件在主线程进来。
+/// 每个会话一棵 subagent 树；agent_event 先进入短时 mailbox，再在主线程批量应用。
 final class SubagentStore: ObservableObject {
-    /// didSet 版本计数：任何 agents 写入（含元素级 in-place 修改）都会 bump，
-    /// 下方的 toolCallId/parentId 索引按此惰性重建。宁滥勿缺。
-    @Published private(set) var agents: [SubagentInfo] = [] {
-        didSet { agentsGeneration &+= 1 }
+    /// Agent rows publish manually so a mailbox drain can apply many mutations with one
+    /// `objectWillChange`. Mutations outside a batch retain the old one-write/one-publish
+    /// behavior through the in-place modifying accessor.
+    private var agentStorage: [SubagentInfo] = []
+    private(set) var agents: [SubagentInfo] {
+        get { agentStorage }
+        _modify {
+            if agentPublicationBatchDepth == 0 {
+                objectWillChange.send()
+            }
+            defer { agentsGeneration &+= 1 }
+            yield &agentStorage
+        }
     }
+    private var agentPublicationBatchDepth = 0
     /// 随 agents 每次写入单调递增（非 @Published：agents 本身已负责触发刷新）。
     private(set) var agentsGeneration: UInt64 = 0
 
-    // MARK: - T6 消息卡片查询索引（agents 变化时惰性重建，查询 O(结果数)）
-    private var indexedGeneration: UInt64 = 0
-    private var agentIndicesByToolCallId: [String: [Int]] = [:]
+    // MARK: - Agent lookup and tree query indices
+    /// Stable field updates do not invalidate structural indices. This is separate from
+    /// `agentsGeneration`, which intentionally still tracks every row mutation.
+    private var agentStructureGeneration: UInt64 = 0
+    private var indexedStructureGeneration: UInt64 = .max
+    private(set) var agentIndexRebuildCount = 0
+    private var agentIndexByID: [String: Int] = [:]
+    private var agentIndicesByToolCallId: [String: Set<Int>] = [:]
     private var childIndicesByParentId: [String: [Int]] = [:]
 
     private func rebuildAgentIndicesIfNeeded() {
-        guard indexedGeneration != agentsGeneration else { return }
+        guard indexedStructureGeneration != agentStructureGeneration else { return }
+        agentIndexRebuildCount &+= 1
+        agentIndexByID.removeAll(keepingCapacity: true)
         agentIndicesByToolCallId.removeAll(keepingCapacity: true)
         childIndicesByParentId.removeAll(keepingCapacity: true)
         for (index, agent) in agents.enumerated() {
+            agentIndexByID[agent.id] = index
             if let toolCallId = agent.toolCallId {
-                agentIndicesByToolCallId[toolCallId, default: []].append(index)
+                agentIndicesByToolCallId[toolCallId, default: []].insert(index)
             }
             if let parentId = agent.parentId {
                 childIndicesByParentId[parentId, default: []].append(index)
             }
         }
-        indexedGeneration = agentsGeneration
+        indexedStructureGeneration = agentStructureGeneration
+    }
+
+    private func markAgentStructureChanged() {
+        agentStructureGeneration &+= 1
+    }
+
+    private func rebuildAgentDerivedState() {
+        markAgentStructureChanged()
+        rebuildAgentIndicesIfNeeded()
+        cachedRunningCount = agents.lazy.filter { $0.state == .running }.count
+        cachedTotalCost = agents.reduce(0) { $0 + $1.cost }
+        if cachedRunningCount == 0 {
+            autoOpenWaveActive = false
+        }
+    }
+
+    private func index(forAgentID id: String) -> Int? {
+        rebuildAgentIndicesIfNeeded()
+        guard let index = agentIndexByID[id] else { return nil }
+        guard agents.indices.contains(index), agents[index].id == id else {
+            // Defensive recovery for any future structural mutation that forgets to mark.
+            markAgentStructureChanged()
+            rebuildAgentIndicesIfNeeded()
+            return agentIndexByID[id]
+        }
+        return index
+    }
+
+    func agent(forID id: String) -> SubagentInfo? {
+        guard let index = index(forAgentID: id) else { return nil }
+        return agents[index]
+    }
+
+    private func appendAgent(_ agent: SubagentInfo) {
+        rebuildAgentIndicesIfNeeded()
+        let newIndex = agents.endIndex
+        agents.append(agent)
+        agentStructureGeneration &+= 1
+        agentIndexByID[agent.id] = newIndex
+        if let toolCallId = agent.toolCallId {
+            agentIndicesByToolCallId[toolCallId, default: []].insert(newIndex)
+        }
+        if let parentId = agent.parentId {
+            childIndicesByParentId[parentId, default: []].append(newIndex)
+        }
+        indexedStructureGeneration = agentStructureGeneration
+    }
+
+    /// A resume keeps the row index stable, so update the tool-call index in place rather
+    /// than invalidating and rebuilding every structural index for the whole tree.
+    private func updateToolCallID(_ toolCallId: String, at index: Int) {
+        rebuildAgentIndicesIfNeeded()
+        let previous = agents[index].toolCallId
+        guard previous != toolCallId else { return }
+        if let previous {
+            agentIndicesByToolCallId[previous]?.remove(index)
+            if agentIndicesByToolCallId[previous]?.isEmpty == true {
+                agentIndicesByToolCallId.removeValue(forKey: previous)
+            }
+        }
+        agents[index].toolCallId = toolCallId
+        agentIndicesByToolCallId[toolCallId, default: []].insert(index)
+        agentStructureGeneration &+= 1
+        indexedStructureGeneration = agentStructureGeneration
     }
 
     /// toolCallId → 该 subagent 工具调用派出的 agent（含子孙），按 agents 原顺序返回。
@@ -732,10 +814,52 @@ final class SubagentStore: ObservableObject {
     /// Debounce window: merges of one wave land within a second or two of each other.
     private static let verifyCoalesceWindow: TimeInterval = 2.0
     private var logCounter = 0
+    private var cachedRunningCount = 0
+    private var cachedTotalCost: Double = 0
+
+    // MARK: - High-fanout event mailbox
+    private struct PendingAgentEvent {
+        let event: J
+        let observedAt: Date
+    }
+    private var pendingAgentEvents: [PendingAgentEvent] = []
+    /// Latest replaceable telemetry slot per agent/kind, cleared at every per-agent segment barrier.
+    private var replaceablePendingEventIndex: [String: Int] = [:]
+    private var pendingLastEventKindByAgent: [String: String] = [:]
+    /// Lifecycle projection for events waiting in the mailbox. Auto-open decisions must
+    /// observe enqueue order, not the last published tree, because an end and the next
+    /// root start can arrive inside the same 16ms window.
+    private var projectedRunningByAgentID: [String: Bool] = [:]
+    private var projectedRunningCount: Int?
+    private var pendingEventDrain: DispatchWorkItem?
+    private static let eventCoalesceWindow: TimeInterval = 0.016
+    private var autoOpenWaveActive = false
+
     /// Internal setter so tests can attach a disk target without the restart-reconcile
     /// side effects of `attachPersistence`.
     var persistURL: URL?
-    private var saveScheduled = false
+    private enum PersistencePriority: Int {
+        case telemetry = 0
+        case lifecycle = 1
+
+        var delay: TimeInterval {
+            switch self {
+            case .telemetry: return 0.5
+            case .lifecycle: return 0.05
+            }
+        }
+    }
+    private var pendingSaveWorkItem: DispatchWorkItem?
+    private var pendingSavePriority: PersistencePriority?
+    private var persistWriteInFlight = false
+    private var dirtyWhilePersistingPriority: PersistencePriority?
+    private var persistenceToken: UInt64 = 0
+    private var consecutivePersistenceFailures = 0
+    private static let maximumAutomaticPersistenceRetries = 2
+    private(set) var persistenceWriteCount = 0
+    var hasPendingPersistenceWrite: Bool {
+        pendingSaveWorkItem != nil || persistWriteInFlight || dirtyWhilePersistingPriority != nil
+    }
     /// Serial queue for JSON encode + atomic write (TokenLedger.append 模式：主线程只拷快照)。
     private let persistQueue = DispatchQueue(label: "pipiui.subagentstore.persist")
     /// Panel appearance and main-turn settle can fire close together; Git reconciliation is capped per store.
@@ -750,6 +874,8 @@ final class SubagentStore: ObservableObject {
     private var orphanReconcileTimer: Timer?
 
     deinit {
+        pendingEventDrain?.cancel()
+        pendingSaveWorkItem?.cancel()
         orphanReconcileTimer?.invalidate()
     }
 
@@ -841,6 +967,7 @@ final class SubagentStore: ObservableObject {
                 if self.agents.isEmpty {
                     self.agents = loaded
                     self.logCounter = loaded.flatMap(\.log).map(\.id).max() ?? 0
+                    self.rebuildAgentDerivedState()
                     didMutate = true
                 } else {
                     // Merge: keep live fields (already restart-reconciled); append missing history.
@@ -848,6 +975,7 @@ final class SubagentStore: ObservableObject {
                     let extras = loaded.filter { !liveIds.contains($0.id) }
                     if !extras.isEmpty {
                         self.agents.append(contentsOf: extras)
+                        self.rebuildAgentDerivedState()
                         let maxLogId = self.agents.flatMap(\.log).map(\.id).max() ?? 0
                         if maxLogId > self.logCounter { self.logCounter = maxLogId }
                         didMutate = true
@@ -881,6 +1009,7 @@ final class SubagentStore: ObservableObject {
         guard reconciled != before else { return false }
         let hadRunning = before.contains { $0.state == .running }
         agents = reconciled
+        rebuildAgentDerivedState()
         if hadRunning {
             onRunningCountMayHaveChanged?()
         }
@@ -897,6 +1026,7 @@ final class SubagentStore: ObservableObject {
         let reconciled = Self.reconcileOrphaned(before, now: now, sessionAlive: false)
         guard reconciled != before else { return false }
         agents = reconciled
+        rebuildAgentDerivedState()
         onRunningCountMayHaveChanged?()
         saveNow()
         return true
@@ -939,22 +1069,69 @@ final class SubagentStore: ObservableObject {
         }
     }
 
-    private func scheduleSave() {
-        guard persistURL != nil, !saveScheduled else { return }
-        saveScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.saveScheduled = false
-            self?.persistSnapshotAsync()
+    private func scheduleSave(priority: PersistencePriority = .lifecycle) {
+        guard persistURL != nil else { return }
+        if persistWriteInFlight {
+            if priority.rawValue > (dirtyWhilePersistingPriority?.rawValue ?? -1) {
+                dirtyWhilePersistingPriority = priority
+            }
+            return
+        }
+        if let existing = pendingSavePriority, existing.rawValue >= priority.rawValue {
+            return
+        }
+        pendingSaveWorkItem?.cancel()
+        pendingSavePriority = priority
+        let item = DispatchWorkItem { [weak self] in
+            self?.beginPersistenceWrite()
+        }
+        pendingSaveWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + priority.delay, execute: item)
+    }
+
+    /// At most one full snapshot is encoding/writing. Events arriving during that write
+    /// set one dirty bit (with lifecycle priority) instead of queueing more snapshots.
+    private func beginPersistenceWrite() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        pendingSaveWorkItem = nil
+        pendingSavePriority = nil
+        guard let persistURL, !persistWriteInFlight else { return }
+        persistWriteInFlight = true
+        persistenceToken &+= 1
+        let token = persistenceToken
+        let snapshot = agents
+        persistenceWriteCount &+= 1
+        persistQueue.async { [weak self] in
+            let succeeded: Bool
+            do {
+                let data = try JSONEncoder().encode(snapshot)
+                try data.write(to: persistURL, options: .atomic)
+                succeeded = true
+            } catch {
+                succeeded = false
+            }
+            DispatchQueue.main.async {
+                self?.finishPersistenceWrite(token: token, succeeded: succeeded)
+            }
         }
     }
 
-    /// 主线程只拷贝值类型快照；encode + 原子写挪到串行 persistQueue（不阻塞主线程）。
-    private func persistSnapshotAsync() {
-        guard let persistURL else { return }
-        let snapshot = agents
-        persistQueue.async {
-            guard let data = try? JSONEncoder().encode(snapshot) else { return }
-            try? data.write(to: persistURL, options: .atomic)
+    private func finishPersistenceWrite(token: UInt64, succeeded: Bool) {
+        guard token == persistenceToken else { return }
+        persistWriteInFlight = false
+        if succeeded {
+            consecutivePersistenceFailures = 0
+        } else {
+            consecutivePersistenceFailures += 1
+        }
+        var followUp = dirtyWhilePersistingPriority
+        dirtyWhilePersistingPriority = nil
+        if !succeeded,
+           consecutivePersistenceFailures <= Self.maximumAutomaticPersistenceRetries {
+            followUp = .lifecycle
+        }
+        if let followUp {
+            scheduleSave(priority: followUp)
         }
     }
 
@@ -962,19 +1139,29 @@ final class SubagentStore: ObservableObject {
     /// 用于退出路径（AppStore.shutdown → applicationWillTerminate、ChatSession.shutdown）。
     func saveNow() {
         guard let persistURL else { return }
+        pendingSaveWorkItem?.cancel()
+        pendingSaveWorkItem = nil
+        pendingSavePriority = nil
+        dirtyWhilePersistingPriority = nil
+        // Invalidate completion callbacks from a previous asynchronous write. The sync
+        // below waits behind that write, then persists the newest lifecycle state.
+        persistenceToken &+= 1
         let snapshot = agents
         persistQueue.sync {
             guard let data = try? JSONEncoder().encode(snapshot) else { return }
             try? data.write(to: persistURL, options: .atomic)
         }
+        persistWriteInFlight = false
+        consecutivePersistenceFailures = 0
+        persistenceWriteCount &+= 1
     }
 
     var runningCount: Int {
-        agents.lazy.filter { $0.state == .running }.count
+        cachedRunningCount
     }
 
     var totalCost: Double {
-        agents.reduce(0) { $0 + $1.cost }
+        cachedTotalCost
     }
 
     /// Running agents whose UI bridge observation has been silent for the
@@ -1005,32 +1192,160 @@ final class SubagentStore: ObservableObject {
     }
 
     private func markObserved(_ index: Int, at date: Date) {
-        agents[index].lastObservedAt = date
+        if date > agents[index].lastObservedAt {
+            agents[index].lastObservedAt = date
+        }
     }
 
+    /// Advances the mailbox's lifecycle projection and returns whether this event starts
+    /// a new root wave. The projection is updated before later events are considered, so
+    /// `end(A) -> start(B)` in one mailbox window correctly opens B's new wave.
+    private func projectAutoOpenDecision(for event: J, agentID id: String) -> Bool {
+        if projectedRunningCount == nil {
+            projectedRunningCount = cachedRunningCount
+        }
+        let wasRunning = projectedRunningByAgentID[id]
+            ?? index(forAgentID: id).map { agents[$0].state == .running }
+            ?? false
+        let kind = event["kind"].string ?? ""
+        let willRun: Bool
+        switch kind {
+        case "start": willRun = true
+        case "end": willRun = false
+        default: willRun = wasRunning
+        }
+
+        let startsNewRootWave = kind == "start"
+            && event["parentId"].string == nil
+            && projectedRunningCount == 0
+            && !autoOpenWaveActive
+        if wasRunning != willRun {
+            projectedRunningCount = max(
+                0,
+                (projectedRunningCount ?? 0) + (willRun ? 1 : -1)
+            )
+            projectedRunningByAgentID[id] = willRun
+        }
+        if projectedRunningCount == 0 {
+            autoOpenWaveActive = false
+        }
+        if startsNewRootWave {
+            autoOpenWaveActive = true
+            selectedId = id
+        }
+        return startsNewRootWave
+    }
+
+    /// O(1) bridge ingress. Replaceable telemetry is collapsed within one frame; log and
+    /// usage records remain lossless, and start/end events form ordering barriers per agent.
+    /// The return value is true exactly once when a root event begins a projected wave.
+    @discardableResult
+    func enqueue(_ event: J, observedAt: Date = Date()) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let id = event["agentId"].string, !id.isEmpty else { return false }
+        let shouldAutoOpen = projectAutoOpenDecision(for: event, agentID: id)
+        let kind = event["kind"].string ?? ""
+        let replacementKey = "\(id)|\(kind)"
+        // Coalesce only one consecutive same-kind segment. Any intervening event for
+        // this agent is an ordering barrier, including lossless log/usage records.
+        if pendingLastEventKindByAgent[id] != kind {
+            replaceablePendingEventIndex.removeValue(forKey: "\(id)|update")
+            replaceablePendingEventIndex.removeValue(forKey: "\(id)|stalled")
+        }
+        pendingLastEventKindByAgent[id] = kind
+        if kind == "update" || kind == "stalled" {
+            if let index = replaceablePendingEventIndex[replacementKey] {
+                pendingAgentEvents[index] = PendingAgentEvent(
+                    event: event,
+                    observedAt: observedAt
+                )
+            } else {
+                replaceablePendingEventIndex[replacementKey] = pendingAgentEvents.count
+                pendingAgentEvents.append(PendingAgentEvent(event: event, observedAt: observedAt))
+            }
+        } else {
+            pendingAgentEvents.append(PendingAgentEvent(event: event, observedAt: observedAt))
+        }
+        guard pendingEventDrain == nil else { return shouldAutoOpen }
+        let item = DispatchWorkItem { [weak self] in
+            self?.flushPendingAgentEvents()
+        }
+        pendingEventDrain = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.eventCoalesceWindow, execute: item)
+        return shouldAutoOpen
+    }
+
+    func flushPendingAgentEvents() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        pendingEventDrain?.cancel()
+        pendingEventDrain = nil
+        let batch = pendingAgentEvents
+        pendingAgentEvents.removeAll(keepingCapacity: true)
+        replaceablePendingEventIndex.removeAll(keepingCapacity: true)
+        pendingLastEventKindByAgent.removeAll(keepingCapacity: true)
+        projectedRunningByAgentID.removeAll(keepingCapacity: true)
+        projectedRunningCount = nil
+        applyAgentEvents(batch)
+    }
+
+    var pendingAgentEventCount: Int { pendingAgentEvents.count }
+
     func handle(_ e: J, observedAt: Date = Date()) {
-        guard let id = e["agentId"].string, !id.isEmpty else { return }
+        applyAgentEvents([PendingAgentEvent(event: e, observedAt: observedAt)])
+    }
+
+    private func applyAgentEvents(_ events: [PendingAgentEvent]) {
+        guard !events.isEmpty else { return }
+        objectWillChange.send()
+        agentPublicationBatchDepth += 1
+        var didMutate = false
+        var lifecycleChanged = false
+        for pending in events {
+            let result = applyAgentEvent(pending.event, observedAt: pending.observedAt)
+            didMutate = didMutate || result.didMutate
+            lifecycleChanged = lifecycleChanged || result.lifecycleChanged
+        }
+        agentPublicationBatchDepth -= 1
+        guard didMutate else { return }
+        scheduleSave(priority: lifecycleChanged ? .lifecycle : .telemetry)
+        if lifecycleChanged {
+            onRunningCountMayHaveChanged?()
+        }
+        if cachedRunningCount == 0 {
+            autoOpenWaveActive = false
+        }
+    }
+
+    private func applyAgentEvent(
+        _ e: J,
+        observedAt: Date
+    ) -> (didMutate: Bool, lifecycleChanged: Bool) {
+        guard let id = e["agentId"].string, !id.isEmpty else { return (false, false) }
         let kind = e["kind"].string ?? ""
+        let oldIndex = index(forAgentID: id)
+        let oldState = oldIndex.map { agents[$0].state }
+        let oldCost = oldIndex.map { agents[$0].cost } ?? 0
         // For every event tied to an existing agent, record that the UI-side
         // status channel itself is still delivering. `start` also covers a new row.
-        if kind != "start", let i = agents.firstIndex(where: { $0.id == id }) {
+        if kind != "start", let i = oldIndex {
             markObserved(i, at: observedAt)
         }
-        var runningCountMayHaveChanged = false
+        var lifecycleChanged = false
+        var didMutate = true
         switch kind {
         case "start":
-            runningCountMayHaveChanged = true
+            lifecycleChanged = true
             // Same agentId may resume (续作) after end — refresh running state + worktree meta.
-            if let i = agents.firstIndex(where: { $0.id == id }) {
+            if let i = oldIndex {
                 markObserved(i, at: observedAt)
                 agents[i].state = .running
                 agents[i].activity = ""
                 clearStalled(i)
-                abortPending.remove(id)
+                if abortPending.contains(id) { abortPending.remove(id) }
                 agents[i].ended = nil
                 agents[i].closeoutDisposition = .unclassified
                 agents[i].closeoutReason = nil
-                if let tc = e["toolCallId"].string { agents[i].toolCallId = tc }
+                if let tc = e["toolCallId"].string { updateToolCallID(tc, at: i) }
                 if let t = e["title"].string { agents[i].title = t }
                 if let path = e["worktreePath"].string { agents[i].worktreePath = path }
                 if let branch = e["worktreeBranch"].string { agents[i].worktreeBranch = branch }
@@ -1062,17 +1377,17 @@ final class SubagentStore: ObservableObject {
             if let path = info.worktreePath, !path.isEmpty {
                 info.worktreeLifecycle = .active
             }
-            agents.append(info)
+            appendAgent(info)
             if selectedId == nil { selectedId = id }
         case "update":
-            guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
+            guard let i = oldIndex else { return (false, false) }
             clearStalled(i)
             if let output = e["output"].string, !output.isEmpty { agents[i].output = output }
             agents[i].activity = e["activity"].string ?? agents[i].activity
             agents[i].cost = e["cost"].double ?? agents[i].cost
             agents[i].turns = e["turns"].int ?? agents[i].turns
         case "log":
-            guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
+            guard let i = oldIndex else { return (false, false) }
             clearStalled(i)
             for item in e["items"].array {
                 logCounter += 1
@@ -1090,7 +1405,7 @@ final class SubagentStore: ObservableObject {
         case "usage":
             // Per-turn usage from the subagent extension (`index.ts` message_end →
             // pipiuiReport kind:"usage"). Updates detail metrics + token ledger.
-            guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
+            guard let i = oldIndex else { return (false, false) }
             clearStalled(i)
             let usage = TokenLedger.UsageSnapshot.from(e["usage"])
             let model = e["model"].string ?? agents[i].model ?? "?"
@@ -1118,7 +1433,7 @@ final class SubagentStore: ObservableObject {
             )
         case "stalled":
             // Stall watchdog：120s+ 无流式事件 → 面板黄标；后续 update/log/usage 自动解除。
-            guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
+            guard let i = oldIndex else { return (false, false) }
             if agents[i].state == .running {
                 agents[i].stalled = true
                 agents[i].stalledIdleSec = e["idle"].int ?? agents[i].stalledIdleSec
@@ -1127,10 +1442,10 @@ final class SubagentStore: ObservableObject {
                 }
             }
         case "end":
-            guard let i = agents.firstIndex(where: { $0.id == id }) else { return }
-            runningCountMayHaveChanged = true
+            guard let i = oldIndex else { return (false, false) }
+            lifecycleChanged = true
             clearStalled(i)
-            abortPending.remove(id)
+            if abortPending.contains(id) { abortPending.remove(id) }
             // Vanished/interrupted is not a user abort and not a failed answer — keep
             // resumable context (same disposition as reconcileInterruptedAfterRestart).
             let interruptedFlag = e["interrupted"].bool == true || e["vanished"].bool == true
@@ -1186,12 +1501,20 @@ final class SubagentStore: ObservableObject {
                 scheduleAutomaticMerge(agentId: aid, mainProjectURL: main)
             }
         default:
-            break
+            didMutate = false
         }
-        scheduleSave()
-        if runningCountMayHaveChanged {
-            onRunningCountMayHaveChanged?()
+
+        if didMutate, let newIndex = index(forAgentID: id) {
+            let newState = agents[newIndex].state
+            let newCost = agents[newIndex].cost
+            if oldState == .running, newState != .running {
+                cachedRunningCount -= 1
+            } else if oldState != .running, newState == .running {
+                cachedRunningCount += 1
+            }
+            cachedTotalCost += newCost - oldCost
         }
+        return (didMutate, lifecycleChanged)
     }
 
     /// 按树序展开（父节点后紧跟其子孙），用于列表显示。
@@ -1215,8 +1538,9 @@ final class SubagentStore: ObservableObject {
 
     func clearFinished() {
         agents.removeAll { $0.state != .running }
+        rebuildAgentDerivedState()
         abortPending.formIntersection(agents.map(\.id))
-        if let selected = selectedId, !agents.contains(where: { $0.id == selected }) {
+        if let selected = selectedId, index(forAgentID: selected) == nil {
             selectedId = agents.first?.id
         }
         scheduleSave()
@@ -1287,9 +1611,7 @@ final class SubagentStore: ObservableObject {
 
         var didChange = false
         for result in results {
-            guard let index = agents.firstIndex(where: {
-                $0.id == result.candidate.agentId
-            }) else { continue }
+            guard let index = index(forAgentID: result.candidate.agentId) else { continue }
             let trimmedCurrentPath = agents[index].worktreePath?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let currentPath = trimmedCurrentPath.flatMap { $0.isEmpty ? nil : $0 }
@@ -1336,7 +1658,7 @@ final class SubagentStore: ObservableObject {
     @discardableResult
     func mergeWorktree(agentId: String, mainProjectURL: URL) async -> String? {
         worktreeActionError = nil
-        guard let i = agents.firstIndex(where: { $0.id == agentId }) else {
+        guard let i = index(forAgentID: agentId) else {
             return setWorktreeError("找不到 agent")
         }
         let agent = agents[i]
@@ -1416,7 +1738,7 @@ final class SubagentStore: ObservableObject {
         // 回到主线程：git 期间 agent 可能已被清空/移除，写状态前 re-check。
         switch outcome {
         case .zeroChangeCleaned:
-            guard let idx = agents.firstIndex(where: { $0.id == agentId }) else { return nil }
+            guard let idx = index(forAgentID: agentId) else { return nil }
             agents[idx].worktreeLifecycle = .merged
             agents[idx].worktreeError = nil
             agents[idx].closeoutDisposition = .cleaned
@@ -1424,7 +1746,7 @@ final class SubagentStore: ObservableObject {
             scheduleSave()
             return nil
         case .ok:
-            guard let idx = agents.firstIndex(where: { $0.id == agentId }) else { return nil }
+            guard let idx = index(forAgentID: agentId) else { return nil }
             agents[idx].worktreeLifecycle = .merged
             agents[idx].worktreeError = nil
             markIntegratedAwaitingVerifyOrCleaned(index: idx)
@@ -1435,7 +1757,7 @@ final class SubagentStore: ObservableObject {
         case .mergeFailed(let msg):
             let dirtyPrefix = GitRepo.probe(workTree: main).isDirty ? "主仓有未提交改动;" : ""
             let full = "\(dirtyPrefix)合并失败（worktree 未删除）: \(msg)"
-            if let idx = agents.firstIndex(where: { $0.id == agentId }) {
+            if let idx = index(forAgentID: agentId) {
                 agents[idx].closeoutDisposition = .needsFixer
                 agents[idx].closeoutReason = full
                 notifyMergeFailed(agent: agents[idx], error: full)
@@ -1444,7 +1766,7 @@ final class SubagentStore: ObservableObject {
         case .removeFailed(let msg):
             // Merge already succeeded — preserve integration, retain actionable cleanup state,
             // and still run post-merge verify.
-            if let idx = agents.firstIndex(where: { $0.id == agentId }) {
+            if let idx = index(forAgentID: agentId) {
                 let warning = "已合并，但删除 worktree 失败: \(msg)"
                 agents[idx].worktreeLifecycle = .mergedCleanupPending
                 agents[idx].worktreeError = warning
@@ -1457,7 +1779,7 @@ final class SubagentStore: ObservableObject {
         case .cleanupFailed(let msg):
             // Merge + worktree removal succeeded. The ref remains because safe cleanup
             // could not prove deletion eligibility or `git branch -d` failed.
-            if let idx = agents.firstIndex(where: { $0.id == agentId }) {
+            if let idx = index(forAgentID: agentId) {
                 let warning = "已合并并删除 worktree，但 \(msg)"
                 agents[idx].worktreeLifecycle = .mergedCleanupPending
                 agents[idx].worktreeError = warning
@@ -1490,7 +1812,7 @@ final class SubagentStore: ObservableObject {
     @discardableResult
     func discardWorktree(agentId: String, mainProjectURL: URL) async -> String? {
         worktreeActionError = nil
-        guard let i = agents.firstIndex(where: { $0.id == agentId }) else {
+        guard let i = index(forAgentID: agentId) else {
             return setWorktreeError("找不到 agent")
         }
         let agent = agents[i]
@@ -1536,7 +1858,7 @@ final class SubagentStore: ObservableObject {
         if let errorMsg = discardOutcome.error {
             return setWorktreeError(errorMsg)
         }
-        if let idx = agents.firstIndex(where: { $0.id == agentId }) {
+        if let idx = index(forAgentID: agentId) {
             agents[idx].worktreeLifecycle = .discarded
             if let warning = discardOutcome.warning, !warning.isEmpty {
                 agents[idx].worktreeError = "worktree 已按确认丢弃；\(warning)"
@@ -1556,7 +1878,7 @@ final class SubagentStore: ObservableObject {
     /// Threading: 主线程取 branch 后，`probe` + `diff --stat` 后台执行。
     @MainActor
     func worktreeDiffStat(agentId: String, mainProjectURL: URL) async -> String? {
-        guard let agent = agents.first(where: { $0.id == agentId }),
+        guard let agent = agent(forID: agentId),
               let branch = agent.worktreeBranch, !branch.isEmpty else {
             return nil
         }
@@ -1619,7 +1941,7 @@ final class SubagentStore: ObservableObject {
                     Log.info("post-merge verify passed: \(command)", category: .session)
                     await MainActor.run {
                         guard let self,
-                              let index = self.agents.firstIndex(where: { $0.id == agent.id }),
+                              let index = self.index(forAgentID: agent.id),
                               self.agents[index].worktreeLifecycle == .merged,
                               self.agents[index].closeoutDisposition == .unclassified else {
                             return
@@ -1648,7 +1970,7 @@ final class SubagentStore: ObservableObject {
     func notifyPostMergeVerifyFailed(
         agent: SubagentInfo, failure: PostMergeVerifyFailure, mainDirty: Bool = false
     ) {
-        if let index = agents.firstIndex(where: { $0.id == agent.id }) {
+        if let index = index(forAgentID: agent.id) {
             agents[index].closeoutDisposition = mainDirty ? .needsUser : .needsFixer
             agents[index].closeoutReason = mainDirty
                 ? "主仓验证失败且含未提交改动；需确认失败归属"

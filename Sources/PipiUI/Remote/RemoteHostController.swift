@@ -36,6 +36,10 @@ struct RemoteCommandRequest: Equatable, Sendable {
 /// adapter and the outbound Relay client.
 final class RemoteHostController {
     private weak var store: AppStore?
+    private let testingHandler: ((
+        RemoteCommandRequest,
+        @escaping (RemoteCommandResponse) -> Void
+    ) -> Void)?
     private let registry = RemoteObjectIDRegistry()
     private var idempotency = RemotePromptIdempotencyCache()
     private let snapshotCache = RemoteSnapshotCache()
@@ -43,6 +47,15 @@ final class RemoteHostController {
 
     init(store: AppStore) {
         self.store = store
+        testingHandler = nil
+    }
+
+    init(testingHandler: @escaping (
+        RemoteCommandRequest,
+        @escaping (RemoteCommandResponse) -> Void
+    ) -> Void) {
+        store = nil
+        self.testingHandler = testingHandler
     }
 
     func resetRuntimeState() {
@@ -63,6 +76,10 @@ final class RemoteHostController {
         }
         guard RemoteCommandSchema.validate(command: request.command, body: request.body) else {
             respond(.json(status: 422, ["error": "invalid command schema"]))
+            return
+        }
+        if let testingHandler {
+            testingHandler(request, respond)
             return
         }
         guard let store else {

@@ -182,6 +182,29 @@ final class UserTurnCollapseGuardTests: XCTestCase {
         ))
     }
 
+    /// 普通 isRunning 工具调用 id（非 subagent）同样保护其所属用户回合。
+    /// 调用点把 streaming.toolRuns 里 isRunning 的 id 并入 running 集合。
+    func testRunningOrdinaryToolCallGuardsItsTurn() {
+        let items = [
+            user("u1"),
+            ChatItem(id: "a1", role: "assistant", blocks: [
+                .toolCall(ToolCallBlock(id: "bash-1", name: "bash", argsSummary: "sleep 240")),
+            ]),
+        ]
+        let r = rows(items)
+        let g = groups(r)
+
+        let guarded = UserTurnCollapseGuard.runningGuardedGroupIDs(
+            rows: r, groups: g, runningSubagentToolCallIds: ["bash-1"]
+        )
+        XCTAssertEqual(guarded, ["u1"])
+        XCTAssertFalse(UserTurnCollapseGuard.isCollapsed(
+            groupID: "u1",
+            collapsedUserTurnIDs: ["u1"],
+            guardedGroupIDs: guarded
+        ))
+    }
+
     // MARK: - 端到端：guard 释放后沿用既有折叠
 
     /// 关键验收路径：运行中 → 强制展开；agent 结束（运行集合清空）→ 沿用用户既有的折叠意图。

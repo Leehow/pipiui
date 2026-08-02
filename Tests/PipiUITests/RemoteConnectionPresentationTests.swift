@@ -129,12 +129,24 @@ final class RemoteConnectionPresentationTests: XCTestCase {
         )
         XCTAssertEqual(
             RemoteConnectionAccessibility.unavailablePairingActionLabel,
-            "生成二维码（需开启局域网测试或 Relay）"
+            "生成配对链接（需开启局域网测试或 Relay）"
         )
         XCTAssertEqual(RemoteConnectionAccessibility.lanToggleLabel, "启用局域网测试")
         XCTAssertEqual(
+            RemoteConnectionAccessibility.relayToggleLabel,
+            "启用远程服务器隧道"
+        )
+        XCTAssertEqual(
             RemoteConnectionAccessibility.copyLANAddressLabel,
             "复制局域网测试地址"
+        )
+        XCTAssertEqual(
+            RemoteConnectionAccessibility.copyPairingLinkLabel,
+            "复制一次性配对链接"
+        )
+        XCTAssertEqual(
+            RemoteConnectionAccessibility.openPairingLinkLabel,
+            "在浏览器打开一次性配对链接"
         )
     }
 
@@ -177,5 +189,8 @@ final class RemoteConnectionPresentationTests: XCTestCase {
                 ".accessibilityLabel(RemoteConnectionAccessibility.copyLANAddressLabel)"
             )
         )
+        XCTAssertTrue(sheet.contains("Button(\"生成一次性配对链接\")"))
+        XCTAssertTrue(sheet.contains("Button(\"复制配对链接\")"))
+        XCTAssertTrue(sheet.contains("Button(\"在浏览器打开配对链接\")"))
     }
 }

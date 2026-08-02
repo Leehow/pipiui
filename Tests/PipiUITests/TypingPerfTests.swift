@@ -33,7 +33,7 @@ final class TypingPerfTests: XCTestCase {
             ("baseline composer / IME setMarkedText + commit", baselineIME),
             ("stream load / English insertText + didChangeText", loaded.english),
             ("stream load / IME setMarkedText + commit", loaded.ime),
-            ("ChatSession.draftText publish (one Combine subscriber)", draftPublish),
+            ("ComposerDraftState publish (one Combine subscriber)", draftPublish),
             ("ComposerTextViewHost.refreshLayout (dirty TextKit layout)", layout),
             ("ComposerTextViewHost.updatePlaceholder", placeholder),
             ("ChatSession.convert(long markdown)", conversion),
@@ -141,11 +141,21 @@ final class TypingPerfTests: XCTestCase {
 
     private func measureDraftPublication(iterations: Int) -> [Double] {
         let session = makeSession()
-        var notificationCount = 0
-        let token = session.objectWillChange.sink { _ in notificationCount += 1 }
-        defer { token.cancel() }
+        var draftNotificationCount = 0
+        var sessionNotificationCount = 0
+        let draftToken = session.composerDraft.objectWillChange.sink { _ in
+            draftNotificationCount += 1
+        }
+        let sessionToken = session.objectWillChange.sink { _ in
+            sessionNotificationCount += 1
+        }
+        defer {
+            draftToken.cancel()
+            sessionToken.cancel()
+        }
         let samples = (0..<iterations).map { index in elapsed { session.draftText = "draft-\(index)" } }
-        XCTAssertGreaterThanOrEqual(notificationCount, iterations)
+        XCTAssertGreaterThanOrEqual(draftNotificationCount, iterations)
+        XCTAssertEqual(sessionNotificationCount, 0)
         return samples
     }
 

@@ -4,6 +4,23 @@
 
 **Read and follow [`CONSTITUTION.md`](./CONSTITUTION.md).**
 
+### Product priority: usability first (binding)
+
+- The first milestone must be a real, end-to-end usable product flow. Get the
+  core workflow working before adding optional security hardening.
+- MVP flows must not require accounts, email/OTP verification, manually entered
+  credentials, or infrastructure knowledge unless they are strictly necessary
+  for the core function.
+- Prefer the fewest understandable user steps. If a random link can complete the
+  task directly, do not replace it with layered login, authorization, and pairing
+  ceremonies.
+- Keep the minimum safeguards needed to avoid obvious credential disclosure,
+  destructive actions, and unauthorized access. Defer defense-in-depth, complex
+  key governance, and additional identity layers until the usable flow is
+  accepted.
+- Any security design that adds a user step must identify a concrete,
+  non-deferrable threat first. Otherwise it must not block the usable MVP.
+
 Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may create a runnable App.** All other linked/temporary worktrees must verify with `swift build` / `swift test` only and must never create `build/PipiUI.app`.
 
 ```bash

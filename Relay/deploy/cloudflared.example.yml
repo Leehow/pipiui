@@ -2,6 +2,19 @@ tunnel: replace-with-tunnel-uuid
 credentials-file: /etc/cloudflared/replace-with-tunnel-uuid.json
 
 ingress:
+  # Exact in-memory capability-tunnel route.
+  - hostname: signal.aichattrpg.com
+    path: ^/tunnel/ws$
+    service: http://127.0.0.1:8787
+    originRequest:
+      httpHostHeader: signal.aichattrpg.com
+  - hostname: signal.aichattrpg.com
+    service: http_status:404
+
+  # The browser surface is accountless. The 256-bit password is in the URL
+  # fragment, which browsers do not include in this HTTP request.
   - hostname: pipi.aichattrpg.com
     service: http://127.0.0.1:8787
+    originRequest:
+      httpHostHeader: pipi.aichattrpg.com
   - service: http_status:404

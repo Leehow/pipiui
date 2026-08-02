@@ -1,0 +1,42 @@
+[
+  {
+    "name": "canonical",
+    "fragment": "v=1&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&fp=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "accepted": true
+  },
+  {
+    "name": "reordered",
+    "fragment": "v=1&fp=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "accepted": false
+  },
+  {
+    "name": "trailing-separator",
+    "fragment": "v=1&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&fp=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&",
+    "accepted": false
+  },
+  {
+    "name": "percent-encoded",
+    "fragment": "v=1&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%41&fp=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "accepted": false
+  },
+  {
+    "name": "duplicate",
+    "fragment": "v=1&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&fp=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "accepted": false
+  },
+  {
+    "name": "padded-secret",
+    "fragment": "v=1&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=&fp=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "accepted": false
+  },
+  {
+    "name": "noncanonical-secret-tail-bits",
+    "fragment": "v=1&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB&fp=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "accepted": false
+  },
+  {
+    "name": "uppercase-fingerprint",
+    "fragment": "v=1&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&fp=0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+    "accepted": false
+  }
+]

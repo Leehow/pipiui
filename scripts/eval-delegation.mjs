@@ -959,6 +959,11 @@ async function runPiCase(item, workspace, stack, options) {
     PIPIUI_AGENT_DEPTH: "0",
     PIPIUI_AGENT_MAX_DEPTH: "2",
     PIPI_PHILOSOPHY_ROLE: "main",
+    // Never leak headless eval dispatches into a live PipiUI app: no bridge
+    // agent_event reports (ghost panel entries) and no product stats pollution.
+    PIPIUI_BRIDGE_PORT: "",
+    PIPIUI_SESSION_KEY: "",
+    PIPI_SUBAGENT_STATS_PATH: "",
   };
 
   return new Promise((resolve, reject) => {

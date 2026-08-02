@@ -2,7 +2,7 @@ import XCTest
 import Combine
 @testable import PipiUI
 
-/// T6 transcript 布局记忆化：版本 key 驱动失效，输入版本未变不重算。
+/// Settled transcript planning: structural versions invalidate; content updates do not.
 final class TranscriptPlannerTests: XCTestCase {
 
     private func item(_ id: String, role: String = "user", text: String = "hi") -> ChatItem {
@@ -21,15 +21,16 @@ final class TranscriptPlannerTests: XCTestCase {
         let planner = TranscriptPlanner()
         let first = planner.rows(
             items: [item("1")], toolRuns: [:], visibleCount: 150,
-            transcriptVersion: 1, toolOutputVersion: 0
+            transcriptVersion: 1, toolStructureVersion: 0
         )
         // 内容变了但版本没 bump —— 调用方契约不允许，但这里用来证明确实走了缓存。
         let second = planner.rows(
             items: [item("1"), item("2")], toolRuns: [:], visibleCount: 150,
-            transcriptVersion: 1, toolOutputVersion: 0
+            transcriptVersion: 1, toolStructureVersion: 0
         )
         XCTAssertEqual(second, first)
         XCTAssertEqual(second.count, 1)
+        XCTAssertEqual(planner.computationCount, 1)
     }
 
     /// 追加消息（transcriptVersion bump）后计划必须更新。
@@ -37,18 +38,18 @@ final class TranscriptPlannerTests: XCTestCase {
         let planner = TranscriptPlanner()
         let before = planner.rows(
             items: [item("1")], toolRuns: [:], visibleCount: 150,
-            transcriptVersion: 1, toolOutputVersion: 0
+            transcriptVersion: 1, toolStructureVersion: 0
         )
         let after = planner.rows(
             items: [item("1"), item("2", text: "第二條")], toolRuns: [:], visibleCount: 150,
-            transcriptVersion: 2, toolOutputVersion: 0
+            transcriptVersion: 2, toolStructureVersion: 0
         )
         XCTAssertEqual(before.count, 1)
         XCTAssertEqual(after.count, 2)
         XCTAssertEqual(after.last?.id, "2")
     }
 
-    /// toolRuns 变化（toolOutputVersion bump）后计划必须反映新 run。
+    /// Image-bearing membership is structural and must invalidate the plan.
     /// generate_image 有结果图后从 finishedGroup 里拿出来单独展示。
     func testToolRunsChangeRecomputes() {
         let planner = TranscriptPlanner()
@@ -59,7 +60,7 @@ final class TranscriptPlannerTests: XCTestCase {
         ]
         let before = planner.rows(
             items: items, toolRuns: [:], visibleCount: 150,
-            transcriptVersion: 1, toolOutputVersion: 0
+            transcriptVersion: 1, toolStructureVersion: 0
         )
         guard case .assistantRun(_, _, let segmentsBefore) = before.last else {
             return XCTFail("expected assistantRun")
@@ -71,7 +72,7 @@ final class TranscriptPlannerTests: XCTestCase {
         let run = ToolRun(isRunning: false, isError: false, output: "", images: [image])
         let after = planner.rows(
             items: items, toolRuns: ["c2": run], visibleCount: 150,
-            transcriptVersion: 1, toolOutputVersion: 1
+            transcriptVersion: 1, toolStructureVersion: 1
         )
         guard case .assistantRun(_, _, let segmentsAfter) = after.last else {
             return XCTFail("expected assistantRun")
@@ -82,6 +83,70 @@ final class TranscriptPlannerTests: XCTestCase {
             if case .finishedGroup = $0 { return true }
             return false
         })
+        XCTAssertEqual(planner.computationCount, 2)
+    }
+
+    func testContentOnlyToolUpdatesHitStructuralCache() {
+        let planner = TranscriptPlanner()
+        let items = [item("u1"), assistantWithTool("a1", callId: "c1")]
+        let first = planner.presentation(
+            items: items,
+            toolRuns: ["c1": ToolRun(isRunning: true, output: "first chunk")],
+            visibleCount: 150,
+            transcriptVersion: 1,
+            toolStructureVersion: 1
+        )
+        let second = planner.presentation(
+            items: items,
+            toolRuns: ["c1": ToolRun(isRunning: true, output: "second chunk")],
+            visibleCount: 150,
+            transcriptVersion: 1,
+            toolStructureVersion: 1
+        )
+
+        XCTAssertEqual(second, first)
+        XCTAssertEqual(planner.computationCount, 1)
+    }
+
+    func testRunningStateReplansFinishedToolGrouping() {
+        let planner = TranscriptPlanner()
+        let items = [
+            item("u1"),
+            assistantWithTool("a1", callId: "c1"),
+            assistantWithTool("a2", callId: "c2"),
+        ]
+
+        let initiallyFinished = planner.presentation(
+            items: items,
+            toolRuns: ["c1": ToolRun(output: "done")],
+            visibleCount: 150,
+            transcriptVersion: 1,
+            toolStructureVersion: 0
+        )
+        let running = planner.presentation(
+            items: items,
+            toolRuns: ["c1": ToolRun(isRunning: true, output: "partial")],
+            visibleCount: 150,
+            transcriptVersion: 1,
+            toolStructureVersion: 1
+        )
+        let finishedAgain = planner.presentation(
+            items: items,
+            toolRuns: ["c1": ToolRun(output: "done")],
+            visibleCount: 150,
+            transcriptVersion: 1,
+            toolStructureVersion: 2
+        )
+
+        guard case .assistantRun(_, _, let initialSegments) = initiallyFinished.rows.last,
+              case .assistantRun(_, _, let runningSegments) = running.rows.last,
+              case .assistantRun(_, _, let finalSegments) = finishedAgain.rows.last else {
+            return XCTFail("expected assistant runs")
+        }
+        XCTAssertEqual(initialSegments.count, 1)
+        XCTAssertEqual(runningSegments.count, 2)
+        XCTAssertEqual(finalSegments.count, 1)
+        XCTAssertEqual(planner.computationCount, 3)
     }
 
     /// 扩大可见窗口（visibleCount 变化）后计划必须覆盖更多历史。
@@ -90,12 +155,12 @@ final class TranscriptPlannerTests: XCTestCase {
         let items = (1...5).map { item("\($0)") }
         let windowed = planner.rows(
             items: items, toolRuns: [:], visibleCount: 2,
-            transcriptVersion: 1, toolOutputVersion: 0
+            transcriptVersion: 1, toolStructureVersion: 0
         )
         XCTAssertEqual(windowed.count, 2)
         let full = planner.rows(
             items: items, toolRuns: [:], visibleCount: 150,
-            transcriptVersion: 1, toolOutputVersion: 0
+            transcriptVersion: 1, toolStructureVersion: 0
         )
         XCTAssertEqual(full.count, 5)
     }
@@ -127,13 +192,124 @@ final class TranscriptPlannerTests: XCTestCase {
 
         let item = ChatItem(id: "streaming", role: "assistant", blocks: [.text("partial")])
         session.streaming.streamingItem = item
-        session.streaming.toolRuns["tool-1"] = ToolRun(isRunning: true, output: "partial output")
-        session.streaming.toolOutputVersion &+= 1
+        session.streaming.updateToolRun(
+            ToolRun(isRunning: true, output: "partial output"),
+            for: "tool-1"
+        )
 
         XCTAssertEqual(session.streamingItem, item)
         XCTAssertEqual(session.toolRuns["tool-1"]?.output, "partial output")
         XCTAssertEqual(session.toolOutputVersion, 1)
         XCTAssertEqual(sessionChangeCount, 0)
+    }
+
+    func testStreamingStateSeparatesContentAndStructuralToolVersions() {
+        let state = StreamingState()
+        state.updateToolRun(ToolRun(isRunning: true, output: "one"), for: "tool-1")
+        XCTAssertEqual(state.toolOutputVersion, 1)
+        XCTAssertEqual(state.toolStructureVersion, 1)
+
+        state.updateToolRun(ToolRun(isRunning: true, output: "two"), for: "tool-1")
+        XCTAssertEqual(state.toolOutputVersion, 2)
+        XCTAssertEqual(state.toolStructureVersion, 1)
+
+        state.updateToolRun(ToolRun(output: "finished"), for: "tool-1")
+        XCTAssertEqual(state.toolOutputVersion, 3)
+        XCTAssertEqual(state.toolStructureVersion, 2)
+
+        state.updateToolRun(ToolRun(output: "finished with more text"), for: "tool-1")
+        XCTAssertEqual(state.toolOutputVersion, 4)
+        XCTAssertEqual(state.toolStructureVersion, 2)
+
+        let image = ImageBlock(
+            id: "image-1",
+            data: Data([0x89, 0x50]),
+            mimeType: "image/png"
+        )
+        state.updateToolRun(ToolRun(output: "done", images: [image]), for: "tool-1")
+        XCTAssertEqual(state.toolOutputVersion, 5)
+        XCTAssertEqual(state.toolStructureVersion, 3)
+
+        let backfilled = ImageBlock(
+            id: "image-1",
+            data: Data([0x89, 0x50, 0x4e, 0x47]),
+            mimeType: "image/png"
+        )
+        state.updateToolRun(ToolRun(output: "done", images: [backfilled]), for: "tool-1")
+        XCTAssertEqual(state.toolOutputVersion, 6)
+        XCTAssertEqual(state.toolStructureVersion, 3)
+    }
+
+    func testStreamingStatePublishesFollowSignalForTokenAndToolUpdates() {
+        let state = StreamingState()
+        var changeCount = 0
+        let observer = state.objectWillChange.sink { changeCount += 1 }
+        defer { observer.cancel() }
+
+        state.streamingItem = item("streaming", role: "assistant", text: "token")
+        state.updateToolRun(ToolRun(isRunning: true, output: "chunk"), for: "tool-1")
+
+        XCTAssertEqual(changeCount, 2)
+    }
+
+    func testReplaceToolRunsUsesRunningAndImageStructuralFingerprint() {
+        let state = StreamingState()
+        state.replaceToolRuns(["tool-1": ToolRun(output: "finished")])
+        XCTAssertEqual(state.toolStructureVersion, 0)
+
+        state.replaceToolRuns(["tool-1": ToolRun(isRunning: true, output: "partial")])
+        XCTAssertEqual(state.toolStructureVersion, 1)
+
+        state.replaceToolRuns(["tool-1": ToolRun(isRunning: true, output: "more")])
+        XCTAssertEqual(state.toolStructureVersion, 1)
+
+        state.replaceToolRuns(["tool-1": ToolRun(output: "finished")])
+        XCTAssertEqual(state.toolStructureVersion, 2)
+
+        let image = ImageBlock(id: "img", data: Data([1]), mimeType: "image/png")
+        state.replaceToolRuns(["tool-1": ToolRun(output: "finished", images: [image])])
+        XCTAssertEqual(state.toolStructureVersion, 3)
+
+        state.replaceToolRuns([:])
+        XCTAssertEqual(state.toolStructureVersion, 4)
+    }
+
+    func testPresentationCachesGroupingJumpAuthorshipAndToolOwnership() {
+        let planner = TranscriptPlanner()
+        let internalSignal = item(
+            "signal", role: "user", text: "[subagent-done] agentId=worker-1"
+        )
+        let presentation = planner.presentation(
+            items: [
+                item("u1", text: "first"),
+                assistantWithTool("a1", callId: "c1", tool: "subagent"),
+                internalSignal,
+                item("u2", text: "second"),
+                assistantWithTool("a2", callId: "c2"),
+            ],
+            toolRuns: [:],
+            visibleCount: 150,
+            transcriptVersion: 1,
+            toolStructureVersion: 0
+        )
+
+        XCTAssertEqual(presentation.userTurnGroups.groupIDForRowID["a1"], "u1")
+        XCTAssertEqual(presentation.userTurnGroups.groupIDForRowID["signal"], "u1")
+        XCTAssertEqual(presentation.jumpTargetForAssistantRunID["a1"], "u1")
+        XCTAssertEqual(presentation.jumpTargetForAssistantRunID["a2"], "u2")
+        XCTAssertEqual(presentation.userAuthoredLeafIDs, ["u1", "u2"])
+        XCTAssertEqual(presentation.groupIDForToolCallID["c1"], "u1")
+        XCTAssertEqual(presentation.groupIDForToolCallID["c2"], "u2")
+        XCTAssertEqual(presentation.toolCallIDsForRowID["a1"], ["c1"])
+        XCTAssertEqual(presentation.toolCallIDsForRowID["a2"], ["c2"])
+        XCTAssertEqual(presentation.lastAssistantRunID, "a2")
+        XCTAssertEqual(
+            UserTurnCollapseGuard.runningGuardedGroupIDs(
+                groupIDForToolCallID: presentation.groupIDForToolCallID,
+                runningSubagentToolCallIds: ["c1"]
+            ),
+            ["u1"]
+        )
     }
 }
 

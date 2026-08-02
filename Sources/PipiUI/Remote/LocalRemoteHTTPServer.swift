@@ -255,7 +255,16 @@ enum LocalRemoteRequestPolicy {
         }
 
         let routePath = routePath(for: request.path)
-        if routePath == "/" {
+        if routePath == "/p2p-test/" {
+            guard requestHost == loopbackHost,
+                  request.method == "GET",
+                  request.path == "/p2p-test/" else {
+                return .json(
+                    status: requestHost == loopbackHost ? 400 : 403,
+                    ["error": "P2P viability page is loopback-only"]
+                )
+            }
+        } else if routePath == "/" {
             if requestHost == lanHost {
                 guard let expectedPairingSecret = accessMode.pairingSecret,
                       let candidate = exactPairingSecret(from: request.path),
@@ -272,7 +281,7 @@ enum LocalRemoteRequestPolicy {
 
         // The initial document request cannot carry a custom browser header.
         // Every API request requires the independent per-launch token.
-        if routePath != "/" {
+        if routePath != "/" && routePath != "/p2p-test/" {
             let candidate = request.headers[LocalRemoteWebPage.tokenHeader.lowercased()] ?? ""
             guard BridgeCapabilityToken.matches(candidate, expected: expectedToken) else {
                 return .json(status: 401, ["error": "unauthorized"])
@@ -324,6 +333,10 @@ enum LocalRemoteRoutes {
         "/api/agent": "POST",
         "/api/panel-state": "POST",
         "/api/document": "POST",
+        "/p2p-test/": "GET",
+        "/p2p-test/config": "GET",
+        "/p2p-test/offer": "POST",
+        "/p2p-test/answer": "GET",
     ]
 
     static func rejection(for request: LocalRemoteHTTPRequest) -> LocalRemoteHTTPResponse? {
@@ -479,6 +492,8 @@ final class LocalRemoteHTTPServer {
         case 415: reason = "Unsupported Media Type"
         case 422: reason = "Unprocessable Content"
         case 431: reason = "Request Header Fields Too Large"
+        case 500: reason = "Internal Server Error"
+        case 503: reason = "Service Unavailable"
         default: reason = "Internal Server Error"
         }
         var headers = response.headers

@@ -5,6 +5,15 @@ Binding rules for humans and coding agents. Short and enforceable.
 
 ---
 
+## 0. 易用性优先，先走通再加固（强制）
+
+**The first milestone is a real, end-to-end usable product flow. Optional security hardening must not block that milestone.**
+
+- MVP 首先保证普通用户无需理解基础设施即可完成核心任务；默认流程不得额外要求账号、邮箱验证码、手工填写凭据或服务器知识，除非这些步骤是核心功能不可替代的必要条件。
+- 产品验收优先看真实用户步骤是否最短、是否真的能用。能用随机链接直接完成的流程，不得改成多层登录、授权和配对仪式。
+- 首版只保留避免明显凭据泄露、破坏性操作和越权访问所必需的最小边界；纵深防御、复杂密钥治理、额外身份层和高级安全策略放到核心流程跑通之后。
+- 任何会增加用户步骤的安全设计，必须先给出具体威胁和不可替代性；否则默认延后，不得以“更安全”为由阻塞可用版本。
+
 ## 1. 唯一可运行包与唯一打包地点（强制）
 
 **The only permitted runnable App is `/Users/haoli/leehow/code/pipiui/build/PipiUI.app`. Only this primary checkout may package it.**
