@@ -185,7 +185,85 @@ final class SubagentModelSettingsTests: XCTestCase {
         XCTAssertTrue(source.contains("stripModelThinkingSuffix(resolvedModel)"))
     }
 
-    func testPlanSubagentDeterministicallyIsolatesSkillsAndKeepsExtensions() throws {
+    func testModelInfoParsesCapabilityMetadataWithoutCollapsingUnknownToFalse() throws {
+        let data = Data(
+            """
+            [
+              {
+                "provider": "missing",
+                "id": "unknown",
+                "name": "Unknown",
+                "contextWindow": 123456,
+                "thinkingLevelMap": {
+                  "off": null,
+                  "xhigh": "provider_high",
+                  "low": 42
+                }
+              },
+              {
+                "provider": "known",
+                "id": "non-reasoning",
+                "reasoning": false
+              },
+              {
+                "provider": "known",
+                "id": "reasoning",
+                "reasoning": true
+              }
+            ]
+            """.utf8
+        )
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+        let models = rows.compactMap(ModelInfo.parseModelListRow)
+
+        XCTAssertEqual(models.count, 3)
+        XCTAssertNil(models[0].reasoning)
+        XCTAssertEqual(models[0].contextWindow, 123456)
+        XCTAssertEqual(models[0].thinkingLevelMap?.keys.contains("off"), true)
+        XCTAssertNil(models[0].thinkingLevelMap?["off"] ?? nil)
+        XCTAssertEqual(models[0].thinkingLevelMap?["xhigh"] ?? nil, "provider_high")
+        XCTAssertEqual(models[0].thinkingLevelMap?.keys.contains("low"), false)
+        XCTAssertFalse(try XCTUnwrap(models[1].reasoning))
+        XCTAssertNil(models[1].thinkingLevelMap)
+        XCTAssertTrue(try XCTUnwrap(models[2].reasoning))
+    }
+
+    func testModelInfoInitializerDefaultsCapabilityToUnknownAndHashingIncludesTriStateMap() {
+        let legacy = ModelInfo(provider: "p", modelId: "m", name: "M", contextWindow: nil)
+        XCTAssertNil(legacy.reasoning)
+        XCTAssertNil(legacy.thinkingLevelMap)
+
+        let first = ModelInfo(
+            provider: "p",
+            modelId: "m",
+            name: "M",
+            contextWindow: 1,
+            reasoning: true,
+            thinkingLevelMap: ["off": nil, "xhigh": "high"]
+        )
+        let reordered = ModelInfo(
+            provider: "p",
+            modelId: "m",
+            name: "M",
+            contextWindow: 1,
+            reasoning: true,
+            thinkingLevelMap: ["xhigh": "high", "off": nil]
+        )
+        let absentOff = ModelInfo(
+            provider: "p",
+            modelId: "m",
+            name: "M",
+            contextWindow: 1,
+            reasoning: true,
+            thinkingLevelMap: ["xhigh": "high"]
+        )
+
+        XCTAssertEqual(first, reordered)
+        XCTAssertEqual(Set([first, reordered]).count, 1)
+        XCTAssertNotEqual(first, absentOff)
+    }
+
+    func testEverySubagentIsolatesSkillsAndKeepsExtensions() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent() // PipiUITests
             .deletingLastPathComponent() // Tests
@@ -195,31 +273,85 @@ final class SubagentModelSettingsTests: XCTestCase {
             encoding: .utf8
         )
 
-        XCTAssertTrue(source.contains("if (agentName === \"plan\") args.push(\"--no-skills\");"))
+        // Skills are off for every dispatched role, not only `plan`: a worker that finds a
+        // process skill on its own turns a scoped brief into a design-and-plan ceremony.
+        XCTAssertTrue(source.contains("args.push(\"--no-skills\");"))
         XCTAssertEqual(source.components(separatedBy: "args.push(\"--no-skills\")").count - 1, 1)
-        XCTAssertTrue(source.contains("PIPIUI_PLAN_SKILL_ISOLATION: agentName === \"plan\" ? \"1\" : undefined"))
-        XCTAssertTrue(source.contains("process.env.PIPIUI_PLAN_SKILL_ISOLATION === \"1\""))
-        XCTAssertTrue(source.contains("if (PIPIUI_PLAN_SKILL_ISOLATION)"))
+        XCTAssertFalse(source.contains("if (agentName === \"plan\") args.push(\"--no-skills\")"))
+        XCTAssertTrue(source.contains("PIPIUI_SUBAGENT_SKILL_ISOLATION: \"1\""))
+        XCTAssertTrue(source.contains("process.env.PIPIUI_SUBAGENT_SKILL_ISOLATION === \"1\""))
+        XCTAssertTrue(source.contains("if (PIPIUI_SUBAGENT_SKILL_ISOLATION)"))
         XCTAssertTrue(source.contains("pi.on(\"before_agent_start\""))
         XCTAssertTrue(source.contains("stripPiSkillsFromSystemPrompt(event.systemPrompt)"))
         XCTAssertTrue(source.contains("The following skills provide specialized instructions for specific tasks."))
         XCTAssertTrue(source.contains("<available_skills>"))
         XCTAssertTrue(source.contains("<\\/available_skills>"))
-        XCTAssertTrue(source.contains("Honor Superpowers' <SUBAGENT-STOP>"))
-        XCTAssertTrue(source.contains("using-superpowers, writing-plans, brainstorming, or any other skill"))
+        XCTAssertTrue(source.contains("[DISPATCHED SUBAGENT ISOLATION — HIGHEST PRIORITY]"))
+        XCTAssertTrue(source.contains(
+            "using-superpowers, brainstorming, writing-plans, subagent-driven-development, or any other SKILL.md"
+        ))
+        XCTAssertTrue(source.contains("no skill may add gates, approvals, or extra process on top of your brief"))
+        XCTAssertTrue(source.contains("MUST NOT write a spec or plan document unless your brief names its exact path"))
         XCTAssertTrue(source.contains("MUST NOT create or save plan artifacts"))
-        XCTAssertTrue(source.contains("Return only the lightweight plan format defined by this agent's own system prompt"))
         XCTAssertTrue(source.contains("pi.on(\"context\""))
         XCTAssertTrue(source.contains("superpowers:using-superpowers bootstrap for pi"))
-        XCTAssertTrue(source.contains("Superpowers bootstrap is intentionally suppressed for this specialized plan subagent"))
-        XCTAssertTrue(source.contains("text: PLAN_BOOTSTRAP_SUPPRESSION_NOTE"))
-        XCTAssertTrue(source.contains("pi.on(\"tool_call\""))
+        XCTAssertTrue(source.contains("text: SUBAGENT_BOOTSTRAP_SUPPRESSION_NOTE"))
+        // The read block is scoped to read-only planners: an implementer may legitimately
+        // need to read a skills/ path that belongs to the user's own repository.
+        XCTAssertTrue(source.contains("PIPIUI_SKILL_READ_BLOCK: agentName === \"plan\" ? \"1\" : undefined"))
+        XCTAssertTrue(source.contains("if (PIPIUI_SKILL_READ_BLOCK) {"))
         XCTAssertTrue(source.contains("if (event.toolName !== \"read\") return"))
         XCTAssertTrue(source.contains("isSkillReadPath(requestedPath)"))
         XCTAssertTrue(source.contains("cannot load SKILL.md files or files under a skills directory"))
         XCTAssertTrue(source.contains("writePromptToTempFile(agent.name, agent.systemPrompt)"))
         XCTAssertTrue(source.contains("if (PIPIUI_SUBAGENT_EXT) args.push(\"-e\", PIPIUI_SUBAGENT_EXT);"))
+        // `--no-extensions` would also cut the provider server-tool extensions workers use.
         XCTAssertFalse(source.contains("args.push(\"--no-extensions\")"))
+    }
+
+    /// The main session keeps skills discoverable for an explicit request, but the
+    /// "invoke a skill before any response" bootstrap is suppressed — otherwise it
+    /// competes with the Boss protocol for ownership of the session's process.
+    func testMainSessionSuppressesSkillBootstrapWithStableSentinel() throws {
+        let source = try subagentExtensionSource()
+
+        XCTAssertTrue(source.contains("MAIN_BOOTSTRAP_SUPPRESSION_NOTE"))
+        XCTAssertTrue(source.contains("The skill-library auto-bootstrap is suppressed in this session"))
+        XCTAssertTrue(source.contains("may be loaded when the user explicitly asks for one by name"))
+        XCTAssertTrue(source.contains("messagesContainSuperpowersMarker(event.messages)"))
+        // A per-turn timestamp on an always-present front message would read as fresh
+        // content to the prompt cache.
+        XCTAssertTrue(source.contains("const MAIN_SUPPRESSION_TIMESTAMP = Date.now();"))
+        XCTAssertTrue(source.contains("timestamp: MAIN_SUPPRESSION_TIMESTAMP"))
+        XCTAssertFalse(source.contains("text: MAIN_BOOTSTRAP_SUPPRESSION_NOTE }],\n\t\t\t\t\t\ttimestamp: Date.now()"))
+    }
+
+    /// The structural defect behind the plan loop: a read-only role was handed a `verify`
+    /// that only a file write could satisfy, so it failed, got re-dispatched, failed again,
+    /// and burned the two-attempts budget before any code was written.
+    func testReadOnlyAgentsNeverRunAnUnattestableVerify() throws {
+        let source = try subagentExtensionSource()
+
+        XCTAssertTrue(source.contains("const READ_ONLY_AGENTS = new Set([\"plan\", \"explore\", \"reviewer\"]);"))
+        XCTAssertTrue(source.contains(
+            "const attestableVerify = READ_ONLY_AGENTS.has(agentName) ? undefined : options?.verify;"
+        ))
+        XCTAssertTrue(source.contains("currentResult.verifyDropped = true;"))
+        XCTAssertTrue(source.contains("verifyDropped?: boolean;"))
+        XCTAssertTrue(source.contains("Verification: not applicable"))
+        XCTAssertTrue(source.contains("do not re-dispatch to make a verify pass"))
+        XCTAssertTrue(source.contains("the runtime drops any verify they are given"))
+    }
+
+    private func subagentExtensionSource() throws -> String {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // PipiUITests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // repository root
+        return try String(
+            contentsOf: root.appendingPathComponent("Sources/PipiUI/PiExt/subagent/index.ts"),
+            encoding: .utf8
+        )
     }
 }
 

@@ -7,7 +7,30 @@ struct ModelInfo: Identifiable, Hashable {
     let modelId: String
     let name: String
     let contextWindow: Int?
+    /// `nil` means the model-list source did not provide this capability.
+    var reasoning: Bool? = nil
+    /// A present key with a nil value represents Pi's explicit JSON `null`.
+    var thinkingLevelMap: [String: String?]? = nil
     var id: String { provider + "/" + modelId }
+
+    /// Shared behavior-level parsing seam used by helper and in-process model discovery.
+    static func parseModelListRow(_ row: [String: Any]) -> ModelInfo? {
+        guard let provider = row["provider"] as? String,
+              let modelId = row["id"] as? String
+        else {
+            return nil
+        }
+        return ModelInfo(
+            provider: provider,
+            modelId: modelId,
+            name: (row["name"] as? String) ?? modelId,
+            contextWindow: (row["contextWindow"] as? NSNumber)?.intValue,
+            reasoning: row["reasoning"] as? Bool,
+            thinkingLevelMap: ThinkingCapability.parseThinkingLevelMap(
+                row["thinkingLevelMap"] as? [String: Any]
+            )
+        )
+    }
 
     /// Whether this model belongs to a Grok/xAI provider (used to gate Grok account credit display).
     var isGrokProvider: Bool {
@@ -72,6 +95,10 @@ enum ToolCallSummary {
             return (args["url"].string ?? "…", 0)
         case "browser":
             return (browserSummary(args), 0)
+        case "find":
+            return (findSummary(args), 0)
+        case "grep":
+            return (grepSummary(args), 0)
         default:
             return (legacySummary(name: name, args: args), 0)
         }
@@ -85,6 +112,17 @@ enum ToolCallSummary {
         }
         if let data = trimmed.data(using: .utf8), let j = J.parse(data), j.dict != nil {
             return summarize(name: name, args: j)
+        }
+        // find always renders a readable `<pattern> in <path>` summary (pattern
+        // defaults to `*`) and never echoes raw JSON braces — even for malformed,
+        // truncated, or doubly-escaped input. find args are often embedded in
+        // activity logs as a JSON string, so unescape lives inside find's own scrape
+        // path; other tools keep their prior behavior (no find-specific rescrape).
+        if name == "find" {
+            return (findScrapedSummary(from: trimmed), 0)
+        }
+        if name == "grep" {
+            return (grepScrapedSummary(from: trimmed), 0)
         }
         // Subagent bridge truncates args (edit/write → invalid JSON). Scrape known fields.
         if let scraped = scrapeSummary(name: name, from: trimmed) {
@@ -182,6 +220,98 @@ enum ToolCallSummary {
         if let path = args["path"].string, !path.isEmpty { return path }
         if let path = args["file_path"].string, !path.isEmpty { return path }
         return "…"
+    }
+
+    /// `find` → `<pattern> in <path>`; a missing/empty pattern collapses to `*`.
+    private static func findSummary(_ args: J) -> String {
+        let pattern: String
+        if let p = args["pattern"].string, !p.isEmpty {
+            pattern = p
+        } else {
+            pattern = "*"
+        }
+        if let path = args["path"].string, !path.isEmpty {
+            return "\(pattern) in \(path)"
+        }
+        return pattern
+    }
+
+    /// `grep` → `/<pattern>/ in <path>`; a missing/empty pattern collapses to `…`.
+    private static func grepSummary(_ args: J) -> String {
+        let pattern: String
+        if let p = args["pattern"].string, !p.isEmpty {
+            pattern = p
+        } else {
+            pattern = "…"
+        }
+        if let path = args["path"].string, !path.isEmpty {
+            return "/\(pattern)/ in \(path)"
+        }
+        return "/\(pattern)/"
+    }
+
+    /// find scrape that never fails: pattern defaults to `*` and a scraped path
+    /// is appended when present. Doubly-escaped activity-log args are unescaped
+    /// first so they still scrape. Used for malformed/truncated find args so the
+    /// summary never exposes raw braces.
+    private static func findScrapedSummary(from text: String) -> String {
+        var pattern = scrapeJSONString(key: "pattern", from: text)
+        var path = scrapeJSONString(key: "path", from: text)
+        if pattern == nil, path == nil, text.contains("\\") {
+            let unescaped = unescapeJSONString(text)
+            if unescaped != text {
+                pattern = scrapeJSONString(key: "pattern", from: unescaped)
+                path = scrapeJSONString(key: "path", from: unescaped)
+            }
+        }
+        let patternValue = (pattern?.isEmpty ?? true) ? "*" : pattern!
+        if let path = path, !path.isEmpty {
+            return "\(patternValue) in \(path)"
+        }
+        return patternValue
+    }
+
+    /// grep scrape that never fails: pattern defaults to `…` and a scraped path
+    /// is appended when present. Its unescape fallback is deliberately grep-scoped
+    /// so malformed args for other tools retain their existing behavior.
+    private static func grepScrapedSummary(from text: String) -> String {
+        var pattern = scrapeJSONString(key: "pattern", from: text)
+        var path = scrapeJSONString(key: "path", from: text)
+        if pattern == nil, path == nil, text.contains("\\") {
+            let unescaped = unescapeJSONString(text)
+            if unescaped != text {
+                pattern = scrapeJSONString(key: "pattern", from: unescaped)
+                path = scrapeJSONString(key: "path", from: unescaped)
+            }
+        }
+        let patternValue = (pattern?.isEmpty ?? true) ? "…" : pattern!
+        if let path = path, !path.isEmpty {
+            return "/\(patternValue)/ in \(path)"
+        }
+        return "/\(patternValue)/"
+    }
+
+    /// Undo common JSON string escapes (`\"` → `"`, `\\` → `\`) so doubly-escaped
+    /// tool-arg strings (embedded in an activity log) can be scraped like normal JSON.
+    private static func unescapeJSONString(_ s: String) -> String {
+        var out = ""
+        out.reserveCapacity(s.count)
+        var i = s.startIndex
+        while i < s.endIndex {
+            let c = s[i]
+            if c == "\\", s.index(after: i) < s.endIndex {
+                let next = s.index(after: i)
+                let d = s[next]
+                if d == "\"" || d == "\\" {
+                    out.append(d)
+                    i = s.index(after: next)
+                    continue
+                }
+            }
+            out.append(c)
+            i = s.index(after: i)
+        }
+        return out
     }
 
     private static func editPayloadChars(_ args: J) -> Int {
@@ -553,7 +683,6 @@ final class ChatSession: ObservableObject, Identifiable {
          gitExtension: String? = nil,
          reloadExtension: String? = nil,
          webSearchExtension: String? = nil,
-         skillTierExtension: String? = nil,
          codexServerToolsExtension: String? = nil,
          claudeServerToolsExtension: String? = nil,
          subagentDir: String? = nil,
@@ -636,7 +765,6 @@ final class ChatSession: ObservableObject, Identifiable {
         if let gitExtension { args += ["-e", gitExtension] }
         if let reloadExtension { args += ["-e", reloadExtension] }
         if let webSearchExtension { args += ["-e", webSearchExtension] }
-        if let skillTierExtension { args += ["-e", skillTierExtension] }
         if let searchScopeExtension = PiPlugin.searchScopeExtensionPath {
             args += ["-e", searchScopeExtension]
         }
@@ -646,7 +774,6 @@ final class ChatSession: ObservableObject, Identifiable {
         args += ToolSkillSettings.excludeToolsCLIArgs()
         var extraEnv: [String: String] = [:]
         extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"] = WebSearchSettings.configFileURL().path
-        extraEnv["PIPIUI_MODEL_TIERS_FILE"] = ModelTierSettings.tiersFileURL().path
         extraEnv["PIPIUI_SEARCH_GRANT_FILE"] =
             SearchScopeExtension.grantFileURL(sessionKey: id).path
         if let searchScopeExtension = PiPlugin.searchScopeExtensionPath {
@@ -816,8 +943,8 @@ final class ChatSession: ObservableObject, Identifiable {
         }
         proc?.request(["type": "get_available_models"]) { [weak self] resp in
             self?.availableModels = resp["data"]["models"].array.compactMap { m in
-                guard let pid = m["provider"].string, let mid = m["id"].string else { return nil }
-                return ModelInfo(provider: pid, modelId: mid, name: m["name"].string ?? mid, contextWindow: m["contextWindow"].int)
+                guard let row = m.dict else { return nil }
+                return ModelInfo.parseModelListRow(row)
             }
         }
         refreshThinkingLevels()
@@ -2373,7 +2500,9 @@ final class ChatSession: ObservableObject, Identifiable {
                     referenceImages: images,
                     projectURL: self.projectURL,
                     progress: { [weak self] status in
-                        DispatchQueue.main.async { self?.mediaStatus = status }
+                        Task { @MainActor [weak self] in
+                            self?.mediaStatus = status
+                        }
                     }
                 )
                 await MainActor.run {

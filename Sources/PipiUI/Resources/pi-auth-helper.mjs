@@ -107,6 +107,8 @@ async function listModels() {
         id: m.id,
         name: m.name ?? m.id,
         contextWindow: m.contextWindow ?? null,
+        reasoning: m.reasoning ?? null,
+        thinkingLevelMap: m.thinkingLevelMap ?? null,
       })),
     });
   });

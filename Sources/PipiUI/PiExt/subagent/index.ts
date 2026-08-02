@@ -56,7 +56,11 @@ const PIPIUI_MAX_DEPTH = Number.parseInt(process.env.PIPIUI_AGENT_MAX_DEPTH || "
 const PIPIUI_SUBAGENT_EXT = process.env.PIPIUI_SUBAGENT_EXT;
 // App-owned search guard; children load the same code and inherit the human-turn grant file.
 const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
-const PIPIUI_PLAN_SKILL_ISOLATION = process.env.PIPIUI_PLAN_SKILL_ISOLATION === "1";
+// Every dispatched subagent runs with the external skill library switched off: a worker
+// follows its own agent prompt plus the brief, never a skill SOP it discovered on its own.
+const PIPIUI_SUBAGENT_SKILL_ISOLATION = process.env.PIPIUI_SUBAGENT_SKILL_ISOLATION === "1";
+// Read-only planners additionally cannot pull SKILL.md through the read tool.
+const PIPIUI_SKILL_READ_BLOCK = process.env.PIPIUI_SKILL_READ_BLOCK === "1";
 
 // 跟踪本扩展 spawn 出的子 pi，父进程退出时尽量收割，避免孤儿继续打桥接
 const pipiuiChildProcs = new Set<ReturnType<typeof spawn>>();
@@ -259,6 +263,8 @@ interface SingleResult {
 	verify?: VerifyAttestation;
 	/** Brief carried `verify` but it was not run because the agent was aborted. */
 	verifySkipped?: boolean;
+	/** Brief carried `verify` for a read-only agent; the runtime dropped it as unattestable. */
+	verifyDropped?: boolean;
 }
 
 interface SubagentDetails {
@@ -1216,7 +1222,13 @@ function formatSubagentDoneMessage(
 		`Title: ${title}`,
 	];
 	if (verified === "none") {
-		if (!att && result.verifySkipped) {
+		if (!att && result.verifyDropped) {
+			// Read-only role: the report IS the deliverable, so re-dispatching to make a
+			// shell command pass would loop forever. Say so instead of failing the agent.
+			lines.push(
+				`Verification: not applicable — \`${result.agent}\` is read-only, so the runtime dropped the brief's verify command. Judge this report on its content; do not re-dispatch to make a verify pass.`,
+			);
+		} else if (!att && result.verifySkipped) {
 			// Brief carried a verify command but it was not run (agent aborted).
 			lines.push("Verification: skipped (agent aborted)");
 		} else {
@@ -1371,8 +1383,13 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
-const PLAN_SUBAGENT_SKILL_ISOLATION = `[PLAN SUBAGENT ISOLATION — HIGHEST PRIORITY]
-This is a specialized dispatched plan subagent. Honor Superpowers' <SUBAGENT-STOP>: you MUST NOT load or invoke using-superpowers, writing-plans, brainstorming, or any other skill. You MUST NOT create or save plan artifacts. Return only the lightweight plan format defined by this agent's own system prompt.`;
+const SUBAGENT_SKILL_ISOLATION = `[DISPATCHED SUBAGENT ISOLATION — HIGHEST PRIORITY]
+This session is a dispatched subagent. External skill libraries are switched off here: you MUST NOT load, read, or follow using-superpowers, brainstorming, writing-plans, subagent-driven-development, or any other SKILL.md, and no skill may add gates, approvals, or extra process on top of your brief. You MUST NOT write a spec or plan document unless your brief names its exact path. Follow only this agent's own system prompt and the brief.`;
+
+const PLAN_SUBAGENT_ARTIFACT_BAN = `You are read-only: you MUST NOT create or save plan artifacts. Your deliverable is the plan text in your final message.`;
+
+/** Read-only roles: their deliverable is a report, so a shell verify has nothing to attest. */
+const READ_ONLY_AGENTS = new Set(["plan", "explore", "reviewer"]);
 
 const PI_SKILLS_PREAMBLE = [
 	"The following skills provide specialized instructions for specific tasks.",
@@ -1394,11 +1411,37 @@ function isSkillReadPath(requestedPath: unknown): boolean {
 }
 
 // Superpowers' Pi extension skips bootstrap injection when any context message contains
-// this stable marker. The explicit PipiUI extension loads first, so a plan-only sentinel
-// reaches Superpowers' messageContainsBootstrap guard without disabling other extensions.
+// this stable marker. The explicit PipiUI extension loads first, so this sentinel reaches
+// Superpowers' messageContainsBootstrap guard without disabling other extensions —
+// `--no-extensions` would also cut the provider server-tool extensions workers rely on.
 const SUPERPOWERS_BOOTSTRAP_MARKER = "superpowers:using-superpowers bootstrap for pi";
-const PLAN_BOOTSTRAP_SUPPRESSION_NOTE = `[PipiUI plan isolation sentinel: ${SUPERPOWERS_BOOTSTRAP_MARKER}
-Superpowers bootstrap is intentionally suppressed for this specialized plan subagent. This sentinel is not a skill instruction; follow only the lightweight plan system prompt.]`;
+const SUBAGENT_BOOTSTRAP_SUPPRESSION_NOTE = `[PipiUI subagent isolation sentinel: ${SUPERPOWERS_BOOTSTRAP_MARKER}
+The skill-library bootstrap is intentionally suppressed for this dispatched subagent. This sentinel is not a skill instruction; follow only this agent's own system prompt and its brief.]`;
+// The Boss session keeps skills discoverable for an explicit user request, but the
+// "invoke a skill before any response" auto-bootstrap is not the session's process owner:
+// the Boss protocol is. Suppressing it is what makes the skill library opt-in.
+const MAIN_BOOTSTRAP_SUPPRESSION_NOTE = `[PipiUI session skill policy: ${SUPERPOWERS_BOOTSTRAP_MARKER}
+The skill-library auto-bootstrap is suppressed in this session. Skills remain available and may be loaded when the user explicitly asks for one by name; they are never a mandatory step and never add gates or approvals on top of this session's own protocol. This sentinel is not a skill instruction.]`;
+// Fixed at module load: a per-turn timestamp on an always-present message would look like
+// fresh content to the prompt cache.
+const MAIN_SUPPRESSION_TIMESTAMP = Date.now();
+
+/** True once any context message already carries the bootstrap marker (ours or theirs). */
+function messagesContainSuperpowersMarker(messages: unknown[]): boolean {
+	return messages.some((message) => {
+		const content = (message as { content?: unknown }).content;
+		if (typeof content === "string") return content.includes(SUPERPOWERS_BOOTSTRAP_MARKER);
+		if (!Array.isArray(content)) return false;
+		return content.some(
+			(part) =>
+				part &&
+				typeof part === "object" &&
+				(part as { type?: unknown }).type === "text" &&
+				typeof (part as { text?: unknown }).text === "string" &&
+				(part as { text: string }).text.includes(SUPERPOWERS_BOOTSTRAP_MARKER),
+		);
+	});
+}
 
 async function runSingleAgent(
 	defaultCwd: string,
@@ -1454,7 +1497,9 @@ async function runSingleAgent(
 	const mainModelForChild = inheritMainModel(options?.sessionModel);
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (agentName === "plan") args.push("--no-skills");
+	// Skill libraries are off for every dispatched role, not just plan: a worker that
+	// discovers a process skill on its own turns a scoped brief into someone else's SOP.
+	args.push("--no-skills");
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
 	if (PIPIUI_SEARCH_SCOPE_EXT) args.push("-e", PIPIUI_SEARCH_SCOPE_EXT);
@@ -1581,8 +1626,10 @@ async function runSingleAgent(
 					PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
 					PIPIUI_AGENT_ROLE: runtimePolicy.role,
 					...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
-					// Override a possibly inherited marker so only plan children activate the hooks.
-					PIPIUI_PLAN_SKILL_ISOLATION: agentName === "plan" ? "1" : undefined,
+					// Every dispatched child runs isolated from external skill libraries; only
+					// read-only planners also get the SKILL.md read block.
+					PIPIUI_SUBAGENT_SKILL_ISOLATION: "1",
+					PIPIUI_SKILL_READ_BLOCK: agentName === "plan" ? "1" : undefined,
 					...(runtimePolicy.worktree === "main-session"
 						? { PIPIUI_WORKTREE: "0", PIPIUI_AGENT_NO_DELEGATION: "1" }
 						: {}),
@@ -1742,9 +1789,16 @@ async function runSingleAgent(
 		// Attested verify: runs AFTER the agent process exits and BEFORE the "end" report,
 		// because Swift auto-merges and removes the worktree on "end". Skipped on abort
 		// (user interrupted; don't block up to VERIFY_TIMEOUT_MS on a dead task).
-		if (options?.verify && options.verify.trim() && !wasAborted) {
-			currentResult.verify = await runVerifyCommand(options.verify.trim(), spawnCwd);
-		} else if (options?.verify && options.verify.trim()) {
+		// A read-only role delivers a report, not a file: running a verify against it can
+		// only ever fail, which used to burn the two-attempts budget on a re-dispatch that
+		// was structurally incapable of passing. `verifyDropped` tells the boss why.
+		const attestableVerify = READ_ONLY_AGENTS.has(agentName) ? undefined : options?.verify;
+		if (READ_ONLY_AGENTS.has(agentName) && options?.verify && options.verify.trim()) {
+			currentResult.verifyDropped = true;
+		}
+		if (attestableVerify && attestableVerify.trim() && !wasAborted) {
+			currentResult.verify = await runVerifyCommand(attestableVerify.trim(), spawnCwd);
+		} else if (attestableVerify && attestableVerify.trim()) {
 			// Aborted: verify was in the brief but intentionally not run — record that
 			// so the done message can say "skipped" instead of "no verify in brief".
 			currentResult.verifySkipped = true;
@@ -1805,7 +1859,7 @@ async function runSingleAgent(
 }
 
 const VERIFY_PARAM_DESCRIPTION =
-	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Boss must fill this for implementation tasks.";
+	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Boss must fill this for implementation tasks. Omit it for read-only agents (plan/explore/reviewer) — they deliver a report, not files, and the runtime drops any verify they are given.";
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
@@ -1899,14 +1953,17 @@ const SecretaryCommitParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
-	if (PIPIUI_PLAN_SKILL_ISOLATION) {
+	if (PIPIUI_SUBAGENT_SKILL_ISOLATION) {
 		// Pi still accepts extension-contributed skillPaths under --no-skills. Remove the
 		// generated model-visible skill catalog and make this child extension the sole
-		// authority for the lightweight plan isolation instruction.
+		// authority for the dispatched-subagent isolation instruction.
 		pi.on("before_agent_start", (event) => {
 			const systemPrompt = stripPiSkillsFromSystemPrompt(event.systemPrompt).trimEnd();
+			const isolation = PIPIUI_SKILL_READ_BLOCK
+				? `${SUBAGENT_SKILL_ISOLATION}\n${PLAN_SUBAGENT_ARTIFACT_BAN}`
+				: SUBAGENT_SKILL_ISOLATION;
 			return {
-				systemPrompt: `${systemPrompt}\n\n${PLAN_SUBAGENT_SKILL_ISOLATION}`,
+				systemPrompt: `${systemPrompt}\n\n${isolation}`,
 			};
 		});
 
@@ -1914,20 +1971,7 @@ export default function (pi: ExtensionAPI) {
 		// extensions. Superpowers sees this marker in its later context handler and uses
 		// its own messageContainsBootstrap guard instead of injecting using-superpowers.
 		pi.on("context", (event) => {
-			const markerPresent = event.messages.some((message) => {
-				const content = (message as { content?: unknown }).content;
-				if (typeof content === "string") return content.includes(SUPERPOWERS_BOOTSTRAP_MARKER);
-				if (!Array.isArray(content)) return false;
-				return content.some(
-					(part) =>
-						part &&
-						typeof part === "object" &&
-						(part as { type?: unknown }).type === "text" &&
-						typeof (part as { text?: unknown }).text === "string" &&
-						(part as { text: string }).text.includes(SUPERPOWERS_BOOTSTRAP_MARKER),
-				);
-			});
-			if (markerPresent) return;
+			if (messagesContainSuperpowersMarker(event.messages)) return;
 
 			const taskIndex = event.messages.findIndex(
 				(message) => (message as { role?: unknown }).role === "user",
@@ -1939,12 +1983,15 @@ export default function (pi: ExtensionAPI) {
 			if (typeof taskMessage.content === "string") {
 				messages[taskIndex] = {
 					...messages[taskIndex],
-					content: `${taskMessage.content}\n\n${PLAN_BOOTSTRAP_SUPPRESSION_NOTE}`,
+					content: `${taskMessage.content}\n\n${SUBAGENT_BOOTSTRAP_SUPPRESSION_NOTE}`,
 				};
 			} else if (Array.isArray(taskMessage.content)) {
 				messages[taskIndex] = {
 					...messages[taskIndex],
-					content: [...taskMessage.content, { type: "text", text: PLAN_BOOTSTRAP_SUPPRESSION_NOTE }],
+					content: [
+						...taskMessage.content,
+						{ type: "text", text: SUBAGENT_BOOTSTRAP_SUPPRESSION_NOTE },
+					],
 				};
 			} else {
 				return;
@@ -1952,16 +1999,42 @@ export default function (pi: ExtensionAPI) {
 			return { messages };
 		});
 
-		// Even if another extension registers skill paths, the plan child cannot load the
-		// discovered instructions through Pi's read tool.
-		pi.on("tool_call", (event) => {
-			if (event.toolName !== "read") return;
-			const input = event.input as { path?: unknown; file_path?: unknown };
-			const requestedPath = input.path ?? input.file_path;
-			if (!isSkillReadPath(requestedPath)) return;
+		// Even if another extension registers skill paths, a read-only planner cannot load
+		// the discovered instructions through Pi's read tool. Deliberately not applied to
+		// implementers: their own repository may legitimately contain a skills/ directory.
+		if (PIPIUI_SKILL_READ_BLOCK) {
+			pi.on("tool_call", (event) => {
+				if (event.toolName !== "read") return;
+				const input = event.input as { path?: unknown; file_path?: unknown };
+				const requestedPath = input.path ?? input.file_path;
+				if (!isSkillReadPath(requestedPath)) return;
+				return {
+					block: true,
+					reason: "Plan subagents cannot load SKILL.md files or files under a skills directory.",
+				};
+			});
+		}
+	} else {
+		// Main session: the same sentinel makes the skill library opt-in. Skills stay
+		// discoverable for an explicit user request; what is suppressed is the injected
+		// "invoke a skill before any response" bootstrap, which otherwise competes with
+		// the session's own protocol and pulls trivial work into a heavyweight SOP.
+		pi.on("context", (event) => {
+			if (messagesContainSuperpowersMarker(event.messages)) return;
+			let insertAt = 0;
+			while ((event.messages[insertAt] as { role?: unknown } | undefined)?.role === "compactionSummary") {
+				insertAt += 1;
+			}
 			return {
-				block: true,
-				reason: "Plan subagents cannot load SKILL.md files or files under a skills directory.",
+				messages: [
+					...event.messages.slice(0, insertAt),
+					{
+						role: "user" as const,
+						content: [{ type: "text" as const, text: MAIN_BOOTSTRAP_SUPPRESSION_NOTE }],
+						timestamp: MAIN_SUPPRESSION_TIMESTAMP,
+					},
+					...event.messages.slice(insertAt),
+				],
 			};
 		});
 	}

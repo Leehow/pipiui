@@ -17,6 +17,9 @@ struct SidebarView: View {
     /// The active-session cap is applied independently inside each project
     /// folder, so one project's "更多" does not affect the others.
     @State private var sessionsExpandedByProject: [String: Bool] = [:]
+    /// Settings sheet is presented from this sidebar (window-local): opening it in
+    /// one window never opens settings in another window of the same app.
+    @State private var showSettings = false
 
     /// Shared leading gutter — `.sidebar` List defaults are wider than needed.
     private static let sidebarGutter: CGFloat = 10
@@ -48,7 +51,7 @@ struct SidebarView: View {
         .safeAreaInset(edge: .bottom) {
             HStack {
                 Button {
-                    store.showSettings = true
+                    showSettings = true
                 } label: {
                     Image(systemName: "gearshape")
                         .font(.body)
@@ -119,6 +122,11 @@ struct SidebarView: View {
             }
             .padding(20)
             .frame(width: 360)
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsSheet()
+                .environmentObject(store)
+                .accessibilityIdentifier("PipiUI.SettingsPanel")
         }
     }
 

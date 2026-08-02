@@ -32,6 +32,19 @@ final class DocumentDetectorTests: XCTestCase {
             XCTAssertFalse(DocumentDetector.isDocument(url(name)), name)
         }
     }
+
+    func testPdfExtensionDetectedCaseInsensitively() {
+        for name in ["a.pdf", "b.PDF", "c.Pdf"] {
+            XCTAssertEqual(DocumentDetector.kind(for: url(name)), .pdf, name)
+            XCTAssertTrue(DocumentDetector.isDocument(url(name)), name)
+        }
+    }
+
+    func testPdfDoesNotBroadenCodeAndConfigWhitelist() {
+        for name in ["a.swift", "b.py", "c.json", "d.yaml", "e.toml"] {
+            XCTAssertNil(DocumentDetector.kind(for: url(name)), name)
+        }
+    }
 }
 
 @MainActor
@@ -132,6 +145,55 @@ final class DocumentStoreTests: XCTestCase {
         }
         XCTAssertEqual(path, url.path)
         XCTAssertEqual(size, DocumentStore.maxFileSize + 1)
+    }
+
+    func testPdfLoadsWithEmptyTextWithoutDecodingBytes() async throws {
+        let store = DocumentStore()
+        let url = try write("doc.pdf", "%PDF-1.4 arbitrary test bytes")
+        store.open(url)
+        await waitForSettled(store)
+
+        guard case .loaded(let doc) = store.loadState else {
+            return XCTFail("expected .loaded, got \(store.loadState)")
+        }
+        XCTAssertEqual(doc.kind, .pdf)
+        XCTAssertEqual(doc.text, "")
+        XCTAssertEqual(doc.url, url)
+    }
+
+    func testPdfAboveTextCapButBelowPdfCapLoads() async throws {
+        let store = DocumentStore()
+        let url = tempDir.appendingPathComponent("big.pdf")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(3 * 1024 * 1024))
+        try handle.close()
+
+        store.open(url)
+        await waitForSettled(store)
+        guard case .loaded(let doc) = store.loadState else {
+            return XCTFail("3 MB PDF must use the PDF cap, got \(store.loadState)")
+        }
+        XCTAssertEqual(doc.kind, .pdf)
+        XCTAssertGreaterThan(doc.fileSize, DocumentStore.maxFileSize)
+        XCTAssertLessThanOrEqual(doc.fileSize, DocumentStore.pdfMaxFileSize)
+    }
+
+    func testPdfAbovePdfCapRejected() async throws {
+        let store = DocumentStore()
+        let url = tempDir.appendingPathComponent("huge.pdf")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(DocumentStore.pdfMaxFileSize + 1))
+        try handle.close()
+
+        store.open(url)
+        await waitForSettled(store)
+        guard case .tooLarge(let path, let size) = store.loadState else {
+            return XCTFail("expected .tooLarge, got \(store.loadState)")
+        }
+        XCTAssertEqual(path, url.path)
+        XCTAssertEqual(size, DocumentStore.pdfMaxFileSize + 1)
     }
 
     func testCloseResetsState() async throws {

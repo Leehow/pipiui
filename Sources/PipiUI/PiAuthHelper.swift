@@ -115,12 +115,7 @@ enum PiAuthHelper {
         guard let models = json["models"] as? [[String: Any]] else {
             throw HelperError.failed("无效的 models 响应")
         }
-        return models.compactMap { row in
-            guard let provider = row["provider"] as? String, let id = row["id"] as? String else { return nil }
-            let name = (row["name"] as? String) ?? id
-            let ctx = row["contextWindow"] as? Int
-            return ModelInfo(provider: provider, modelId: id, name: name, contextWindow: ctx)
-        }
+        return models.compactMap(ModelInfo.parseModelListRow)
     }
 
     static func login(providerId: String, authType: String, apiKey: String? = nil) async throws {

@@ -129,7 +129,11 @@ struct MessageRow: View, Equatable {
             // System signal from background worker — collapse by default (avoid PathLinkedText on ~8k Result).
             VStack(alignment: .trailing, spacing: 8) {
                 userImageThumbnails
-                SubagentDoneBubbleView(text: userDisplayText, onFlash: onFlash)
+                SubagentDoneBubbleView(
+                    text: userDisplayText,
+                    base: subagentDoneDocumentBase,
+                    onFlash: onFlash
+                )
             }
         } else if userDisplayText.hasPrefix("[worktree-merge-failed]") {
             VStack(alignment: .trailing, spacing: 8) {
@@ -231,6 +235,17 @@ struct MessageRow: View, Equatable {
     /// User bubble text without attachment path footnotes (still sent to the model).
     private var userDisplayText: String {
         ImageAttachment.stripAttachmentPathsForDisplay(plainText)
+    }
+
+    private var subagentDoneDocumentBase: URL? {
+        guard let agentId = SubagentDoneMessage.parse(userDisplayText)?.agentId else {
+            return projectURL?.standardizedFileURL
+        }
+        let worktreePath = subagents.first(where: { $0.id == agentId })?.worktreePath
+        return DocumentReferenceScanner.effectiveBase(
+            worktreePath: worktreePath,
+            projectURL: projectURL
+        )
     }
 
     /// Footnote paths from the full (unstripped) user message for image path resolution.
@@ -342,7 +357,20 @@ struct AssistantSegmentsView: View, Equatable {
                     )
                 }
             }
+            if !documentCards.isEmpty {
+                DocumentFileCardStack(references: documentCards)
+            }
         }
+    }
+
+    /// Pure candidate scan. Disk existence and summary reads are deferred to the card stack's
+    /// off-main store so SwiftUI body evaluation performs no filesystem IO.
+    private var documentCards: [DocumentReference] {
+        let text = segments.compactMap { segment -> String? in
+            guard case .text(let text) = segment else { return nil }
+            return text
+        }.joined(separator: "\n")
+        return DocumentReferenceScanner.references(in: text, base: projectURL)
     }
 
     /// 助手消息空闲时的操作可见性（复制/分支/折叠/跳转共用此门）。
@@ -447,6 +475,167 @@ struct AssistantSegmentsView: View, Equatable {
             frontier = Set(children.map(\.id))
         }
         return result
+    }
+}
+
+/// One document reference rendered as a whole-card open target.
+private struct DocumentFileCardView: View {
+    let reference: DocumentReference
+    @ObservedObject var store: DocumentSummaryStore
+    @Environment(\.openDocument) private var openDocument
+
+    private var entry: DocumentSummaryStore.Entry {
+        store.entry(for: reference.id)
+    }
+
+    var body: some View {
+        Button {
+            openDocument?(reference.url)
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 7) {
+                    Image(systemName: reference.url.pathExtension.lowercased() == "pdf"
+                        ? "doc"
+                        : "doc.text")
+                        .foregroundStyle(.secondary)
+                    Text(reference.title)
+                        .font(.callout.weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 0)
+                    Image(systemName: "arrow.up.forward.app")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+
+                Text(reference.url.path)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                summaryBody
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Color.primary.opacity(0.035))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.09))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .pointingHandCursor(openDocument != nil)
+        .accessibilityLabel("打开文档 \(reference.title)")
+        .accessibilityValue(reference.url.path)
+    }
+
+    @ViewBuilder
+    private var summaryBody: some View {
+        switch entry.state {
+        case .loading:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("读取中…")
+            }
+        case .loaded(let summary):
+            Text(summary.text.isEmpty ? "空文档" : summary.text)
+        case .missing:
+            Text("文件不存在")
+                .foregroundStyle(.red)
+        case .tooLarge(let size):
+            Text("文件过大（\(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))）")
+        case .unreadable:
+            Text("无法读取（权限?）")
+                .foregroundStyle(.red)
+        }
+    }
+}
+
+/// Sibling card stack shown below transcript text.
+///
+/// The stack itself prefetches every candidate before filtering visible cards. That is
+/// essential for speculative relative references: they begin hidden while `.loading`, then
+/// become visible when the off-main request confirms a present file.
+@MainActor
+package struct DocumentFileCardStack: View {
+    package let references: [DocumentReference]
+    @ObservedObject private var store: DocumentSummaryStore
+
+    package init(references: [DocumentReference]) {
+        self.references = references
+        self.store = .shared
+    }
+
+    package init(
+        references: [DocumentReference],
+        summaryStore: DocumentSummaryStore
+    ) {
+        self.references = references
+        self.store = summaryStore
+    }
+
+    package var body: some View {
+        let visible = Self.visibleCards(references) { store.entry(for: $0) }
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(visible) { reference in
+                DocumentFileCardView(reference: reference, store: store)
+            }
+        }
+        .onAppear(perform: prefetchAll)
+        .onChange(of: references) { _, _ in prefetchAll() }
+    }
+
+    /// Pure visibility policy used by unit tests and body rendering.
+    package static func visibleCards(
+        _ candidates: [DocumentReference],
+        entry: (String) -> DocumentSummaryStore.Entry
+    ) -> [DocumentReference] {
+        var seen: Set<String> = []
+        return candidates.filter { reference in
+            guard seen.insert(reference.id).inserted else { return false }
+            switch reference.origin {
+            case .absolute, .fileURL, .tilde:
+                return true
+            case .relativeResolved, .uiFallback:
+                switch entry(reference.id).state {
+                case .loaded, .tooLarge, .unreadable:
+                    return true
+                case .loading, .missing:
+                    return false
+                }
+            }
+        }
+    }
+
+    /// Visits every unique candidate before visibility filtering, including speculative
+    /// references whose initial `.loading` state keeps their card hidden.
+    package static func prefetchCandidates(
+        _ candidates: [DocumentReference],
+        request: (URL, DocumentKind) -> Void
+    ) {
+        var seen: Set<String> = []
+        for reference in candidates {
+            guard seen.insert(reference.id).inserted,
+                  let kind = DocumentDetector.kind(for: reference.url)
+            else { continue }
+            request(reference.url, kind)
+        }
+    }
+
+    private func prefetchAll() {
+        Self.prefetchCandidates(references) { url, kind in
+            store.request(for: url, kind: kind)
+        }
     }
 }
 
@@ -803,6 +992,7 @@ struct SubagentDoneMessage: Equatable {
 /// Collapsed card for `[subagent-done]` — avoids rendering full Result until expanded.
 struct SubagentDoneBubbleView: View {
     let text: String
+    var base: URL? = nil
     var onFlash: ((String) -> Void)? = nil
     @State private var expanded = false
 
@@ -842,6 +1032,11 @@ struct SubagentDoneBubbleView: View {
             parts.append("cost \(cost)")
         }
         return parts.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    private var documentCards: [DocumentReference] {
+        let bodyText = parsed.map { $0.result.isEmpty ? text : $0.result } ?? text
+        return DocumentReferenceScanner.references(in: bodyText, base: base)
     }
 
     var body: some View {
@@ -894,6 +1089,9 @@ struct SubagentDoneBubbleView: View {
                         .foregroundStyle(.primary.opacity(0.85))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if !documentCards.isEmpty {
+                    DocumentFileCardStack(references: documentCards)
                 }
             }
             .padding(.top, 6)

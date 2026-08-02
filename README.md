@@ -31,7 +31,9 @@
 
 - **Subagent 面板**（工具栏 👥）：pi 通过 `subagent` 工具派出的所有子 agent 实时显示为树（lead 组长带其工人缩进展示），点击每个 agent 看任务、当前动作、流式输出、费用和用时。上报来自 `~/.pi/agent/extensions/subagent/index.ts` 的 Pipi 集成补丁（无环境变量时完全静默，不影响终端使用）。
 - **多层 subagent**：子进程通过 `PIPIUI_AGENT_ID/DEPTH` 环境变量继承树身份，`lead` agent（`~/.pi/agent/agents/lead.md`，tools 含 subagent）可再派工人；`PIPIUI_AGENT_MAX_DEPTH`（默认 2）防递归失控，即 Boss(0) → lead(1) → worker(2) 封顶。
-- **Boss 模式**（侧栏 👑 开关，默认开）：新会话注入大组长协议（`--append-system-prompt`）——主 agent 不下基层，按难度派工：简单派单兵监工、复杂拆工作流派多个 lead、调研按广度扇出 explore；配合失败恢复协议（同方案最多两次、BLOCKED 白名单、验收要新鲜证据）防早停防摆烂；与已安装的 superpowers 技能（subagent-driven-development / verification-before-completion / systematic-debugging 等）对接作为 SOP。
+- **Boss 模式**（侧栏 👑 开关，默认开）：新会话注入大组长协议（`--append-system-prompt`）——主 agent 不下基层，按难度派工：简单派单兵监工、复杂拆工作流派多个 lead、调研按广度扇出 explore；配合失败恢复协议（同方案最多两次、BLOCKED 白名单、验收要新鲜证据）防早停防摆烂。
+- **与外部技能库解耦**：Boss 协议自己就是会话的流程主人，设计/计划文档只在用户明确要求时才产出——计划是一串可派工的编号步骤，不是一篇文档。外部技能库降级为 opt-in：主会话不再被注入「回答前必须先调技能」的 bootstrap，只有用户点名时才加载；派出去的 subagent 一律 `--no-skills` 且运行时屏蔽技能 bootstrap，worker 只认自己的 agent 提示词 + brief。只读角色（plan / explore / reviewer）交付的是报告，运行时会丢弃 brief 里给它们的 `verify`，不会再出现「要求落盘却禁止写文件 → 验收必然失败 → 反复重派」的死循环。
+- **技能库翻译规则**：技能是为别的 harness 写的，Boss 协议要求「翻译而非照做」——要求中途找用户确认的，brief 即确认（worker 没有对话通道，等人就是挂死）；说用 `Task`/`Agent` 派工的，映射到 `subagent`（评审→`reviewer`，实现→`general-purpose`，双轴并行评审=一次调用派两个 reviewer）；需要 issue/工单/PRD/label 的，本项目没有，状态记在 ledger 里；要求「先有复现再动手」的照做，但拿不到复现不等于 BLOCKED，先走两条实质不同的路线。
 
 ## 斜杠命令（`/`）
 

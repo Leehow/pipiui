@@ -21,7 +21,6 @@ enum PiPlugin {
         var gitExtension: String?     // -e git_status / git_diff + prompt snapshot
         var reloadExtension: String?  // -e 内部 pipiui_reload 命令
         var webSearchExtension: String? // -e web_search / web_fetch
-        var skillTierExtension: String? // -e 按模型档位注入 Superpowers 指令 + 派工闸门
         var searchScopeExtension: String? // -e 项目内搜索边界 + 当轮外部路径授权
         var codexServerToolsExtension: String? // -e openai-codex hosted web_search
         var claudeServerToolsExtension: String? // -e anthropic hosted web_search
@@ -110,7 +109,6 @@ enum PiPlugin {
             ("pipiui-git.ts", \.gitExtension),
             ("pipiui-reload.ts", \.reloadExtension),
             ("pipiui-websearch.ts", \.webSearchExtension),
-            ("pipiui-skilltier.ts", \.skillTierExtension),
             ("pipiui-search-scope.ts", \.searchScopeExtension),
             ("pipiui-codex-server-tools.ts", \.codexServerToolsExtension),
             ("pipiui-claude-server-tools.ts", \.claudeServerToolsExtension),
@@ -175,10 +173,6 @@ enum PiPlugin {
 
         // 5.5 通用网络搜索 + 网页抓取（web_search / web_fetch）
         result.webSearchExtension = WebSearchExtension.install(into: root)
-
-        // 5.6 模型档位 → Superpowers 强度（强模型作参考，弱模型强制走 SOP）
-        result.skillTierExtension = SkillTierExtension.install(into: root)
-        ModelTierSettings.syncJSONFile()
 
         // 5.65 项目搜索边界：内建 find/grep/ls + 明确的递归 bash 搜索
         result.searchScopeExtension = SearchScopeExtension.install(into: root)
