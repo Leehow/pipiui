@@ -14,6 +14,13 @@ enum TranscriptRenderIdentity {
     static func scoped(sessionKey: String, localID: String) -> String {
         "\(sessionKey):\(localID)"
     }
+
+    /// Inverse of `scoped`; `nil` when the id belongs to another session.
+    static func local(fromScoped scopedID: String, sessionKey: String) -> String? {
+        let prefix = sessionKey + ":"
+        guard scopedID.hasPrefix(prefix) else { return nil }
+        return String(scopedID.dropFirst(prefix.count))
+    }
 }
 
 /// Identity for the complete transcript scroll hierarchy.
@@ -26,44 +33,47 @@ struct TranscriptSessionRootIdentity: Hashable {
     let sessionKey: String
 }
 
-/// Fixed-size settled-history page rendered by the eager transcript stack.
+/// Sliding settled-history window rendered by the eager transcript stack.
 ///
-/// A small eager page gives native NSTextView-backed markdown enough room to settle
-/// its exact height without reintroducing lazy-stack height estimation. Older pages
-/// replace, rather than accumulate ahead of, the current page.
+/// A small eager window (2-4 fixed pages) gives native NSTextView-backed markdown
+/// enough room to settle its exact height without reintroducing lazy-stack height
+/// estimation. The window is a pure function of the top-visible page: pages
+/// [N-1, N, N+1, N+2] clipped to the existing pages and the item count, with the
+/// oldest page (N == 0) rendering only the top two pages. At the latest page the
+/// clipping naturally leaves the bottom two pages, so pinned live mode renders
+/// exactly the pages that can be seen.
 struct TranscriptRenderWindow: Equatable {
     static let pageSize = 32
 
     let range: Range<Int>
     let totalCount: Int
 
-    var hiddenEarlier: Int { range.lowerBound }
-    var hiddenLater: Int { max(0, totalCount - range.upperBound) }
-    var isLatest: Bool { hiddenLater == 0 }
+    var isLatest: Bool { range.upperBound == totalCount }
     var renderedCount: Int { range.count }
 
-    /// `nil` means the latest page. A non-nil end remains stable if new items arrive
-    /// while the user is reading an older page.
-    static func resolve(itemCount: Int, preferredEnd: Int?) -> Self {
+    /// Index of the newest page (`p`); 0 for an empty transcript.
+    static func latestPage(itemCount: Int) -> Int {
         let count = max(0, itemCount)
-        let end = min(max(0, preferredEnd ?? count), count)
-        let start = max(0, end - pageSize)
+        return max(0, (count + pageSize - 1) / pageSize - 1)
+    }
+
+    /// Window invariant: pages [N-1 … N+2] ∩ [0 … p], except N == 0 which renders
+    /// only pages [0, 1]. N is clamped into [0, p] so a transcript that shrank
+    /// between a scroll event and this render cannot produce an invalid window.
+    static func resolve(itemCount: Int, topVisiblePage: Int) -> Self {
+        let count = max(0, itemCount)
+        let lastPage = latestPage(itemCount: count)
+        let top = min(max(0, topVisiblePage), lastPage)
+        let startPage = max(0, top - 1)
+        let endPage: Int
+        if top == 0 {
+            endPage = min(lastPage + 1, 2)
+        } else {
+            endPage = min(lastPage + 1, top + 3)
+        }
+        let start = startPage * pageSize
+        let end = min(count, endPage * pageSize)
         return Self(range: start..<end, totalCount: count)
-    }
-
-    var earlierPreferredEnd: Int? {
-        hiddenEarlier > 0 ? range.lowerBound : nil
-    }
-
-    /// Returning `nil` selects the latest page.
-    var laterPreferredEnd: Int? {
-        guard hiddenLater > 0 else { return nil }
-        let end = min(totalCount, range.upperBound + Self.pageSize)
-        return end == totalCount ? nil : end
-    }
-
-    var renderIdentity: String {
-        isLatest ? "window-latest" : "window-\(range.lowerBound)-\(range.upperBound)"
     }
 }
 
@@ -103,8 +113,10 @@ private struct ChatDetailViewBody: View {
     @State private var rightPanelDragWidth: CGFloat?
     /// Real user prompt ids whose complete assistant turn is folded.
     @State private var collapsedUserTurnIDs: Set<String> = []
-    /// `nil` renders the latest fixed page; a concrete end browses older history.
-    @State private var transcriptHistoryWindowEnd: Int? = nil
+    /// Top-most visible transcript row id, reported by `.scrollPosition(id:anchor:)`.
+    /// Deriving the visible page from this id lets the sliding window follow the
+    /// viewport without any pagination buttons or whole-tree window replacement.
+    @State private var scrollTopID: String? = nil
     /// Hosted above the lazy transcript so row recycling cannot dismiss or corrupt it.
     @State private var finishedGroupPresentation: AssistantBlockLayout.FinishedGroupPresentation?
     @State private var runningToolDetail: RunningToolDetailPresentation?
@@ -236,18 +248,20 @@ private struct ChatDetailViewBody: View {
             // rebinding keeps the key stable and must not dismiss an open detail.
             finishedGroupPresentation = nil
             runningToolDetail = nil
+            // A fresh scroll root (outer `.id`) will re-report its top row id.
+            scrollTopID = nil
         }
         .onChange(of: session.id) { _, _ in
             // The detail chrome is reused across sessions. Reset only transient view state;
-            // draft, panel selection, and pin state live on ChatSession. The fixed
-            // history page is transient view state and must reset here.
+            // draft, panel selection, and pin state live on ChatSession. The top-visible
+            // scroll anchor is transient view state and must reset here.
             gitBranches.bind(projectURL: session.projectURL)
             scrollCoalesceScheduled = false
             scrollNeedsRetry = false
             rightPanelDragStartWidth = nil
             rightPanelDragWidth = nil
             collapsedUserTurnIDs = []
-            transcriptHistoryWindowEnd = nil
+            scrollTopID = nil
             settledChatColumnWidth = nil
             pendingChatColumnWidth = nil
             chatColumnWidthSettleWork?.cancel()
@@ -430,12 +444,11 @@ private struct ChatDetailViewBody: View {
                     streaming: streaming,
                     agentStore: agentStore,
                     collapsedUserTurnIDs: $collapsedUserTurnIDs,
-                    historyWindowEnd: $transcriptHistoryWindowEnd,
+                    scrollTopID: scrollTopID,
                     onOpenFinishedGroup: presentFinishedGroup,
                     onOpenRunningTool: presentRunningTool,
                     onReturnLatest: {
                         session.transcriptPlanner.invalidate()
-                        transcriptHistoryWindowEnd = nil
                         session.pinTranscriptToBottom = true
                         jumpToLatest(proxy, retry: true)
                     },
@@ -455,11 +468,13 @@ private struct ChatDetailViewBody: View {
             .animation(nil, value: session.id)
             .scrollIndicators(.automatic)
             .defaultScrollAnchor(.bottom)
+            // The sliding window follows the top-most visible row. The `.top` anchor
+            // both reports that row and keeps it pinned while window pages slide.
+            .scrollPosition(id: $scrollTopID, anchor: .top)
             .overlay(alignment: .bottomTrailing) {
                 if !session.pinTranscriptToBottom {
                     Button {
                         session.transcriptPlanner.invalidate()
-                        transcriptHistoryWindowEnd = nil
                         session.pinTranscriptToBottom = true
                         jumpToLatest(proxy, retry: true)
                     } label: {
@@ -720,19 +735,32 @@ private struct StreamingTranscriptRows: View {
     @ObservedObject var streaming: StreamingState
     @ObservedObject var agentStore: SubagentStore
     @Binding var collapsedUserTurnIDs: Set<String>
-    @Binding var historyWindowEnd: Int?
+    /// Top-most visible row id, mirrored from the parent's `.scrollPosition(id:)`.
+    let scrollTopID: String?
     let onOpenFinishedGroup: (AssistantBlockLayout.FinishedGroupPresentation) -> Void
     let onOpenRunningTool: (RunningToolDetailPresentation) -> Void
     let onReturnLatest: () -> Void
     let onJump: (String) -> Void
     @Environment(\.chatTypography) private var chatTypography
+    /// Page of the top-most visible row (unpinned derivation of `scrollTopID`).
+    @State private var topVisiblePage = 0
+    /// Last window range fed to the planner. The planner caches by
+    /// (transcriptVersion, toolStructureVersion, visibleCount), so a scroll-driven
+    /// window slide at an unchanged transcript version must invalidate it — done
+    /// here, before `presentation(...)` recomputes in the same body pass.
+    @State private var lastPlannedRange: Range<Int> = 0..<0
 
     var body: some View {
         let items = session.transcript
-        let window = TranscriptRenderWindow.resolve(
+        // Pinned live mode anchors the window at the newest page so appended items
+        // are always rendered; unpinned scrolling anchors it at the top-visible page.
+        let anchorPage = session.pinTranscriptToBottom
+            ? TranscriptRenderWindow.latestPage(itemCount: items.count)
+            : topVisiblePage
+        let window = trackPlannedWindow(TranscriptRenderWindow.resolve(
             itemCount: items.count,
-            preferredEnd: historyWindowEnd
-        )
+            topVisiblePage: anchorPage
+        ))
         let windowItems = Array(items[window.range])
         let presentation = session.transcriptPlanner.presentation(
             items: windowItems,
@@ -758,17 +786,21 @@ private struct StreamingTranscriptRows: View {
             runningSubagentToolCallIds: runningSubagentToolCallIds.union(runningOrdinaryToolCallIds)
         )
 
-        // Intentionally eager but fixed to at most 32 settled items. Page navigation
-        // replaces this stack instead of accumulating hundreds of native text rows.
+        // Intentionally eager but bounded to at most 4 fixed pages. The sliding
+        // window swaps only boundary pages; rows keep stable ids so SwiftUI diffs
+        // incrementally instead of rebuilding the stack (never lazy).
         VStack(alignment: .leading, spacing: chatTypography.messageSpacing) {
-            if let earlierEnd = window.earlierPreferredEnd {
-                Button("显示更早的 \(min(TranscriptRenderWindow.pageSize, window.hiddenEarlier)) 条消息") {
-                    session.transcriptPlanner.invalidate()
-                    historyWindowEnd = earlierEnd
-                    session.pinTranscriptToBottom = false
+            if topVisiblePage == 0, session.isInitializing {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在刷新…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
                 }
-                .buttonStyle(.link)
-                .frame(maxWidth: .infinity)
+                .padding(.vertical, 2)
+                .transition(.opacity)
             }
 
             ForEach(presentation.rows, id: \.id) { row in
@@ -900,25 +932,12 @@ private struct StreamingTranscriptRows: View {
                 .id(transcriptID("waiting-placeholder"))
             }
 
-            if window.hiddenLater > 0 {
+            if !window.isLatest {
                 HStack(spacing: 16) {
-                    Button("显示后面的 \(min(TranscriptRenderWindow.pageSize, window.hiddenLater)) 条消息") {
-                        session.transcriptPlanner.invalidate()
-                        if let laterEnd = window.laterPreferredEnd {
-                            historyWindowEnd = laterEnd
-                            session.pinTranscriptToBottom = false
-                        } else {
-                            historyWindowEnd = nil
-                            onReturnLatest()
-                        }
-                    }
-                    .buttonStyle(.link)
-
                     Spacer(minLength: 0)
 
                     Button("返回最新消息") {
                         session.transcriptPlanner.invalidate()
-                        historyWindowEnd = nil
                         onReturnLatest()
                     }
                     .buttonStyle(.link)
@@ -937,7 +956,52 @@ private struct StreamingTranscriptRows: View {
                     }
                 }
         }
-        .id(transcriptID(window.renderIdentity))
+        // No window-replacement identity: the container must stay alive across
+        // window slides so `.scrollPosition` can anchor the top-visible row.
+        .onChange(of: scrollTopID) { _, newValue in
+            guard let page = topVisiblePage(from: newValue, items: session.transcript) else { return }
+            if page != topVisiblePage {
+                topVisiblePage = page
+            }
+        }
+    }
+
+    /// Planner cache invalidation must run before `presentation(...)` recomputes in
+    /// the same body pass, so it is folded into a single expression (ViewBuilder
+    /// bodies cannot host multi-statement `if` side effects).
+    private func trackPlannedWindow(_ window: TranscriptRenderWindow) -> TranscriptRenderWindow {
+        if window.range != lastPlannedRange {
+            lastPlannedRange = window.range
+            session.transcriptPlanner.invalidate()
+        }
+        return window
+    }
+
+    /// Map the reported top-most row id back to a transcript page. Every rendered
+    /// row id is a `ChatItem.id` (`planTranscript` coalesces assistant spans under
+    /// their last item id), so an id → index lookup is exact for every row.
+    private func topVisiblePage(from scopedID: String?, items: [ChatItem]) -> Int? {
+        guard let scopedID,
+              let localID = TranscriptRenderIdentity.local(
+                  fromScoped: scopedID,
+                  sessionKey: session.bridgeRoutingKey
+              ) else { return nil }
+        // Marker rows only exist at the transcript end.
+        switch localID {
+        case "bottom", "streaming", "streaming-turn-elapsed", "waiting-placeholder":
+            return TranscriptRenderWindow.latestPage(itemCount: items.count)
+        default:
+            break
+        }
+        // Fast path: sequential `item-N` ids map 1:1 onto transcript indices.
+        if localID.hasPrefix("item-"),
+           let serial = Int(localID.dropFirst("item-".count)),
+           serial >= 1, serial <= items.count,
+           items[serial - 1].id == localID {
+            return (serial - 1) / TranscriptRenderWindow.pageSize
+        }
+        guard let index = items.firstIndex(where: { $0.id == localID }) else { return nil }
+        return index / TranscriptRenderWindow.pageSize
     }
 
     private func transcriptID(_ localID: String) -> String {
