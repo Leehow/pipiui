@@ -63,6 +63,12 @@ enum OverlayScrollers {
 /// Idempotent installer. Prefer `.background` on **scroll content** so
 /// `enclosingScrollView` resolves (List/ScrollView chrome is often a sibling).
 private struct OverlayScrollerInstaller: NSViewRepresentable {
+    /// Post-attachment re-apply window length (50 ms ticks). Bounded: SwiftUI
+    /// can reset scroller flags during the layout pass right after install with
+    /// no following body pass to re-apply from. Same budget the old
+    /// `SidebarVerticalScrollerHider` used (16 × 50 ms).
+    fileprivate static let postSuccessTicks = 16
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> InstallerView {
@@ -98,17 +104,50 @@ private struct OverlayScrollerInstaller: NSViewRepresentable {
     }
 
     final class Coordinator {
+        /// Discovery retries while the scroll view is not yet in the hierarchy.
         private var attempts = 0
+        /// Strictly bounded post-layout re-apply window (ticks), re-armed only by
+        /// direct SwiftUI passes (attach hooks / updateNSView). Retry ticks
+        /// consume it without re-arming, so the chain stops while the sidebar is
+        /// idle — never a self-perpetuating timer.
+        private var reapplyTicksRemaining = 0
         private var workItem: DispatchWorkItem?
         private var styled = Set<ObjectIdentifier>()
+        /// Weakly retained targets so every pass re-applies without depending on
+        /// re-discovery (mirrors `StickToBottomTracker.attachedScrollView`). Weak
+        /// references — AppKit owns the scroll views, so there is no retain cycle.
+        private var retained: [WeakScrollViewBox] = []
 
         func ensureInstalled(from view: NSView) {
-            let scrollViews = OverlayScrollers.collect(from: view)
-            if scrollViews.isEmpty {
+            ensureInstalled(from: view, rearmPostWindow: true)
+        }
+
+        private func ensureInstalled(from view: NSView, rearmPostWindow: Bool) {
+            var scrollViews = OverlayScrollers.collect(from: view)
+            // Merge retained targets back in: during a content rebuild the
+            // installer can sit between hierarchies where collect() alone would
+            // miss the scroll view SwiftUI just restyled.
+            for box in retained {
+                guard let sv = box.scrollView, sv.window != nil else { continue }
+                if !scrollViews.contains(where: { $0 === sv }) {
+                    scrollViews.append(sv)
+                }
+            }
+            guard !scrollViews.isEmpty else {
                 scheduleRetry(from: view)
                 return
             }
-            attempts = 0
+            if rearmPostWindow {
+                attempts = 0
+                // SwiftUI can reset the AppKit scroller flags shortly after
+                // attachment (scroll-indicator materialization) with no body pass
+                // after it. The transcript survives that via StickToBottomTracker's
+                // per-pass re-apply; here re-apply briefly through the same single
+                // bounded timer — idempotent, no extra timers.
+                reapplyTicksRemaining = OverlayScrollerInstaller.postSuccessTicks
+            }
+            retained = scrollViews.map(WeakScrollViewBox.init)
+            let ids = Set(scrollViews.map(ObjectIdentifier.init))
             for sv in scrollViews {
                 let id = ObjectIdentifier(sv)
                 if styled.contains(id),
@@ -120,7 +159,11 @@ private struct OverlayScrollerInstaller: NSViewRepresentable {
                     styled.insert(id)
                 }
             }
-            styled = styled.intersection(Set(scrollViews.map(ObjectIdentifier.init)))
+            styled.formIntersection(ids)
+            if reapplyTicksRemaining > 0 {
+                reapplyTicksRemaining -= 1
+                scheduleRetry(from: view)
+            }
         }
 
         private func scheduleRetry(from view: NSView) {
@@ -129,7 +172,9 @@ private struct OverlayScrollerInstaller: NSViewRepresentable {
             workItem?.cancel()
             let item = DispatchWorkItem { [weak self, weak view] in
                 guard let self, let view else { return }
-                self.ensureInstalled(from: view)
+                // Retry ticks never re-arm the post-layout window: the chain
+                // always terminates on its own while nothing keeps updating.
+                self.ensureInstalled(from: view, rearmPostWindow: false)
             }
             workItem = item
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: item)
@@ -139,10 +184,17 @@ private struct OverlayScrollerInstaller: NSViewRepresentable {
             workItem?.cancel()
             workItem = nil
             styled.removeAll()
+            retained.removeAll()
         }
 
         deinit { cancel() }
     }
+}
+
+/// Weak box so `Coordinator` can retain target scroll views without a cycle.
+private final class WeakScrollViewBox {
+    weak var scrollView: NSScrollView?
+    init(_ scrollView: NSScrollView) { self.scrollView = scrollView }
 }
 
 extension View {
