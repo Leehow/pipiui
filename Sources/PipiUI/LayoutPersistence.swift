@@ -8,6 +8,7 @@ enum LayoutPersistence {
         static let sidebarWidthRatio = "pipiui.sidebarWidthRatio"
         static let rightPanelWidthRatio = "pipiui.rightPanelWidthRatio"
         static let subagentListHeightRatio = "pipiui.subagentListHeightRatio"
+        static let expandedProjectPaths = "pipiui.expandedProjectPaths"
     }
 
     static let minimumWindowContentSize = NSSize(width: 800, height: 560)
@@ -62,6 +63,16 @@ enum LayoutPersistence {
 
     static func subagentListHeightRatio(defaults: UserDefaults = .standard) -> CGFloat? {
         storedRatio(forKey: Key.subagentListHeightRatio, in: subagentListRatioRange, defaults: defaults)
+    }
+
+    /// Sidebar project-folder expansion state. Discrete clicks, not per-frame
+    /// drag events, so writes go straight to UserDefaults (no T23 debounce).
+    static func expandedProjectPaths(defaults: UserDefaults = .standard) -> Set<String> {
+        Set(defaults.stringArray(forKey: Key.expandedProjectPaths) ?? [])
+    }
+
+    static func saveExpandedProjectPaths(_ paths: Set<String>, defaults: UserDefaults = .standard) {
+        defaults.set(paths.sorted(), forKey: Key.expandedProjectPaths)
     }
 
     @discardableResult

@@ -161,4 +161,29 @@ final class LayoutPersistenceTests: XCTestCase {
         XCTAssertTrue(LayoutPersistence.subagentListRatioRange
             .contains(LayoutPersistence.defaultSubagentListHeightRatio))
     }
+
+    // MARK: - Sidebar project-folder expansion persistence
+
+    /// No stored value → empty set.
+    func testExpandedProjectPathsEmptyByDefault() {
+        let (suite, suiteName) = makeSuite()
+        defer { suite.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertEqual(LayoutPersistence.expandedProjectPaths(defaults: suite), [])
+    }
+
+    /// A multi-path set round-trips through UserDefaults (sorted on disk,
+    /// restored as an equal set).
+    func testExpandedProjectPathsRoundTrip() {
+        let (suite, suiteName) = makeSuite()
+        defer { suite.removePersistentDomain(forName: suiteName) }
+
+        let paths: Set<String> = [
+            "/Users/alice/projects/alpha",
+            "/Users/alice/projects/beta",
+            "/Users/alice/projects/gamma",
+        ]
+        LayoutPersistence.saveExpandedProjectPaths(paths, defaults: suite)
+        XCTAssertEqual(LayoutPersistence.expandedProjectPaths(defaults: suite), paths)
+    }
 }

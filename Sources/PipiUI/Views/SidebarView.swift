@@ -18,7 +18,7 @@ struct SidebarView: View {
     /// Project folders can be opened independently. The selected project is
     /// always opened when it is selected, but opening one folder never closes
     /// another.
-    @State private var expandedProjectPaths: Set<String> = []
+    @State private var expandedProjectPaths: Set<String> = LayoutPersistence.expandedProjectPaths()
     /// The active-session cap is applied independently inside each project
     /// folder, so one project's "更多" does not affect the others.
     @State private var sessionsShownByProject: [String: Int] = [:]
@@ -196,6 +196,9 @@ struct SidebarView: View {
         .onChange(of: store.projects.map(\.path)) { _, _ in
             syncProjectsExpansion()
         }
+        .onChange(of: expandedProjectPaths) { _, newValue in
+            LayoutPersistence.saveExpandedProjectPaths(newValue)
+        }
         .sheet(item: $renameTarget) { target in
             VStack(alignment: .leading, spacing: 16) {
                 Text("修改标题")
@@ -320,6 +323,13 @@ struct SidebarView: View {
     /// came from search/restore rather than a currently visible folder row.
     private func syncProjectsExpansion() {
         guard let path = store.selectedProjectPath else { return }
+        // Drop persisted folders that no longer exist. Only prune once the
+        // project list has loaded so a still-empty list cannot clear the
+        // stored preference; the mutation persists via onChange below.
+        let knownProjectPaths = Set(store.projects.map(\.path))
+        if !knownProjectPaths.isEmpty {
+            expandedProjectPaths.formIntersection(knownProjectPaths)
+        }
         expandedProjectPaths.insert(path)
         guard let index = store.orderedProjects.firstIndex(where: { $0.path == path }) else { return }
         if index + 1 > projectsShown {
@@ -452,7 +462,6 @@ struct SidebarView: View {
             .frame(width: 380, height: 440)
         }
         .onDrag {
-            expandedProjectPaths.removeAll()
             return NSItemProvider(object: project.path as NSString)
         }
         .onDrop(of: [UTType.plainText], delegate: ProjectDropDelegate(project: project, store: store))
