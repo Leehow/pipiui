@@ -72,6 +72,10 @@ enum ToolCallSummary {
             return (args["url"].string ?? "…", 0)
         case "browser":
             return (browserSummary(args), 0)
+        case "find":
+            return (findSummary(args), 0)
+        case "grep":
+            return (grepSummary(args), 0)
         default:
             return (legacySummary(name: name, args: args), 0)
         }
@@ -85,6 +89,17 @@ enum ToolCallSummary {
         }
         if let data = trimmed.data(using: .utf8), let j = J.parse(data), j.dict != nil {
             return summarize(name: name, args: j)
+        }
+        // find always renders a readable `<pattern> in <path>` summary (pattern
+        // defaults to `*`) and never echoes raw JSON braces — even for malformed,
+        // truncated, or doubly-escaped input. find args are often embedded in
+        // activity logs as a JSON string, so unescape lives inside find's own scrape
+        // path; other tools keep their prior behavior (no find-specific rescrape).
+        if name == "find" {
+            return (findScrapedSummary(from: trimmed), 0)
+        }
+        if name == "grep" {
+            return (grepScrapedSummary(from: trimmed), 0)
         }
         // Subagent bridge truncates args (edit/write → invalid JSON). Scrape known fields.
         if let scraped = scrapeSummary(name: name, from: trimmed) {
@@ -182,6 +197,98 @@ enum ToolCallSummary {
         if let path = args["path"].string, !path.isEmpty { return path }
         if let path = args["file_path"].string, !path.isEmpty { return path }
         return "…"
+    }
+
+    /// `find` → `<pattern> in <path>`; a missing/empty pattern collapses to `*`.
+    private static func findSummary(_ args: J) -> String {
+        let pattern: String
+        if let p = args["pattern"].string, !p.isEmpty {
+            pattern = p
+        } else {
+            pattern = "*"
+        }
+        if let path = args["path"].string, !path.isEmpty {
+            return "\(pattern) in \(path)"
+        }
+        return pattern
+    }
+
+    /// `grep` → `/<pattern>/ in <path>`; a missing/empty pattern collapses to `…`.
+    private static func grepSummary(_ args: J) -> String {
+        let pattern: String
+        if let p = args["pattern"].string, !p.isEmpty {
+            pattern = p
+        } else {
+            pattern = "…"
+        }
+        if let path = args["path"].string, !path.isEmpty {
+            return "/\(pattern)/ in \(path)"
+        }
+        return "/\(pattern)/"
+    }
+
+    /// find scrape that never fails: pattern defaults to `*` and a scraped path
+    /// is appended when present. Doubly-escaped activity-log args are unescaped
+    /// first so they still scrape. Used for malformed/truncated find args so the
+    /// summary never exposes raw braces.
+    private static func findScrapedSummary(from text: String) -> String {
+        var pattern = scrapeJSONString(key: "pattern", from: text)
+        var path = scrapeJSONString(key: "path", from: text)
+        if pattern == nil, path == nil, text.contains("\\") {
+            let unescaped = unescapeJSONString(text)
+            if unescaped != text {
+                pattern = scrapeJSONString(key: "pattern", from: unescaped)
+                path = scrapeJSONString(key: "path", from: unescaped)
+            }
+        }
+        let patternValue = (pattern?.isEmpty ?? true) ? "*" : pattern!
+        if let path = path, !path.isEmpty {
+            return "\(patternValue) in \(path)"
+        }
+        return patternValue
+    }
+
+    /// grep scrape that never fails: pattern defaults to `…` and a scraped path
+    /// is appended when present. Its unescape fallback is deliberately grep-scoped
+    /// so malformed args for other tools retain their existing behavior.
+    private static func grepScrapedSummary(from text: String) -> String {
+        var pattern = scrapeJSONString(key: "pattern", from: text)
+        var path = scrapeJSONString(key: "path", from: text)
+        if pattern == nil, path == nil, text.contains("\\") {
+            let unescaped = unescapeJSONString(text)
+            if unescaped != text {
+                pattern = scrapeJSONString(key: "pattern", from: unescaped)
+                path = scrapeJSONString(key: "path", from: unescaped)
+            }
+        }
+        let patternValue = (pattern?.isEmpty ?? true) ? "…" : pattern!
+        if let path = path, !path.isEmpty {
+            return "/\(patternValue)/ in \(path)"
+        }
+        return "/\(patternValue)/"
+    }
+
+    /// Undo common JSON string escapes (`\"` → `"`, `\\` → `\`) so doubly-escaped
+    /// tool-arg strings (embedded in an activity log) can be scraped like normal JSON.
+    private static func unescapeJSONString(_ s: String) -> String {
+        var out = ""
+        out.reserveCapacity(s.count)
+        var i = s.startIndex
+        while i < s.endIndex {
+            let c = s[i]
+            if c == "\\", s.index(after: i) < s.endIndex {
+                let next = s.index(after: i)
+                let d = s[next]
+                if d == "\"" || d == "\\" {
+                    out.append(d)
+                    i = s.index(after: next)
+                    continue
+                }
+            }
+            out.append(c)
+            i = s.index(after: i)
+        }
+        return out
     }
 
     private static func editPayloadChars(_ args: J) -> Int {
