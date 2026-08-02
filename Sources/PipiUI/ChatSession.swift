@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import AppKit
+import Darwin
 
 struct ModelInfo: Identifiable, Hashable {
     let provider: String
@@ -761,6 +762,12 @@ final class ChatSession: ObservableObject, Identifiable {
     /// 完成判定已挂起（等子 agent 事件队列清空后再重评）；期间到达的 start 仍计入本轮。
     private var completionDecisionDeferred = false
     private var completionDeferWorkItem: DispatchWorkItem?
+    /// 前台停止升级时间线（从 `abort()` 起算的绝对偏移，主队列调度）：
+    /// 6s → SIGTERM pi 的全部后代（stuck 的 bash 工具链）；10s → SIGKILL 全部后代；
+    /// 16s → 杀 pi 并按原会话重开。可注入，测试调小。
+    static var stopEscalationSigtermDelay: TimeInterval = 6
+    static var stopEscalationSigkillDelay: TimeInterval = 10
+    static var stopEscalationShutdownDelay: TimeInterval = 16
     /// Notifies AppStore to persist / clear interrupted-path badges.
     var onInFlightChange: ((String, Bool) -> Void)?
     /// False after resuming a disk session that already has a real name.
@@ -771,6 +778,16 @@ final class ChatSession: ObservableObject, Identifiable {
     private var didRequestLLMTitle = false
     /// In-flight side-channel title Task; cancelled on abort/shutdown.
     private var titleLLMTask: Task<Void, Never>?
+
+    /// 前台停止升级调度令牌：每次取消事件（settle / 新 turn / 重载 / 退出 / shutdown）
+    /// 自增；升级闭包捕获调度时的令牌值，过期即不执行（陈旧闭包不可能在新 turn 后生效）。
+    private var stopEscalationToken = 0
+    /// 停止升级测试替身（生产为 nil）：Tier-1/2 的信号投递，真实路径 = proc.signalDescendants。
+    var stopEscalationSignalSink: ((Int32) -> Void)?
+    /// 停止升级测试替身（生产为 nil）：Tier-3 的重启动作，真实路径 = onRequestRestart/shutdown。
+    var stopEscalationRestartSink: (() -> Void)?
+    /// AppStore 注入：Tier-3 兜底经此复用 kill+respawn 路径（restartSession）。
+    var onRequestRestart: (() -> Void)?
 
     /// Streaming or prompt dispatch in flight (first send / queue drain until agent_start).
     /// Depends on @Published isStreaming + isSendingFromQueue so observers refresh.
@@ -1091,6 +1108,7 @@ final class ChatSession: ObservableObject, Identifiable {
             // store 周期 tick 在 10 分钟窗口后处理）。
             self.subagents.reconcileOrphanedNow()
             self.isStopping = false
+            self.cancelStopEscalation()
             self.isSendingFromQueue = false
             // Exit before the first transcript arrives must not leave the spinner up.
             self.isInitializing = false
@@ -1631,6 +1649,7 @@ final class ChatSession: ObservableObject, Identifiable {
             isStreaming = true
             // Defensive: a stale stop flag must never bleed into the next turn.
             isStopping = false
+            cancelStopEscalation()
             isSendingFromQueue = false
             lastError = nil
             agentTurnActive = true
@@ -1638,6 +1657,7 @@ final class ChatSession: ObservableObject, Identifiable {
         case "agent_settled":
             isStreaming = false
             isStopping = false
+            cancelStopEscalation()
             pendingStreamMessage = nil
             pendingToolRuns.removeAll(keepingCapacity: true)
             streaming.streamingItem = nil
@@ -3130,6 +3150,7 @@ final class ChatSession: ObservableObject, Identifiable {
         streaming.streamingItem = nil
         isStreaming = false
         isStopping = false
+        cancelStopEscalation()
         editingItemId = nil
         pendingStreamMessage = nil
         pendingToolRuns.removeAll(keepingCapacity: false)
@@ -3186,6 +3207,7 @@ final class ChatSession: ObservableObject, Identifiable {
 
         // Defensive: a stale stop flag must never bleed into the next turn.
         isStopping = false
+        cancelStopEscalation()
 
         // Media generation modes bypass pi RPC and hit local relays (Grok Build Imagine path).
         if composerMode == .generateImage || composerMode == .generateVideo {
@@ -3589,6 +3611,7 @@ final class ChatSession: ObservableObject, Identifiable {
         isSendingFromQueue = true
         // Defensive: a stale stop flag must never bleed into the next turn.
         isStopping = false
+        cancelStopEscalation()
         var cmd: [String: Any] = ["type": "prompt", "message": message]
         if !images.isEmpty {
             cmd["images"] = ImageAttachment.rpcPayload(from: images)
@@ -3670,6 +3693,79 @@ final class ChatSession: ObservableObject, Identifiable {
         cancelSideChannelTitle()
         // intercept flag only; items stay until idle drain
         proc?.send(["type": "abort"])
+        // Backstop: pi's abort can hang forever when the in-flight tool child ignores
+        // its AbortSignal — tiered escalation (descendants SIGTERM → SIGKILL → kill+respawn)
+        // guarantees `isStopping` never sticks past the shutdown delay.
+        if proc?.isRunning == true {
+            scheduleStopEscalation()
+        }
+    }
+
+    // MARK: - Stop escalation (foreground-turn backstop)
+
+    /// 前台 turn 停止超时兜底时间线。pi 的 abort 依赖工具自身的 AbortSignal，bash 工具
+    /// 子进程无视信号（长 build/git/test）时 pi 永不 settle，`isStopping` 会一直挂着。
+    /// 每级触发前双重校验：调度令牌仍当前（settle / 新 turn / 重载 / 退出已作废旧闭包）
+    /// + `isStopping` 仍为真。Tier-1/2 只对后代进程发信号，绝不动 pi 进程本身。
+    /// 可重复调度：连点 Stop 会用新令牌重排时间线，旧闭包自然作废。
+    func scheduleStopEscalation() {
+        stopEscalationToken &+= 1
+        let token = stopEscalationToken
+        scheduleStopEscalationStage(Self.stopEscalationSigtermDelay, token: token) { [weak self] in
+            guard let self else { return }
+            self.stopEscalationSignal(SIGTERM)
+            self.flash("停止超时，正在强制终止后台命令")
+        }
+        scheduleStopEscalationStage(Self.stopEscalationSigkillDelay, token: token) { [weak self] in
+            self?.stopEscalationSignal(SIGKILL)
+        }
+        scheduleStopEscalationStage(Self.stopEscalationShutdownDelay, token: token) { [weak self] in
+            self?.stopEscalationRestart()
+        }
+    }
+
+    /// 单个升级级：delay 后（主队列）若令牌仍当前且仍在停止中才执行。
+    private func scheduleStopEscalationStage(
+        _ delay: TimeInterval,
+        token: Int,
+        action: @escaping () -> Void
+    ) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self,
+                  token == self.stopEscalationToken,
+                  self.isStopping else { return }
+            action()
+        }
+    }
+
+    /// 取消事件自增令牌：所有已调度的升级闭包捕获的是旧令牌，触发时直接作废。
+    private func cancelStopEscalation() {
+        stopEscalationToken &+= 1
+    }
+
+    /// Tier-1/2 动作：对 pi 的后代进程发信号。生产走 `proc.signalDescendants`
+    /// （内部有 isRunning 守卫，nil/死进程均安全 no-op）；测试注入记录器。
+    private func stopEscalationSignal(_ sig: Int32) {
+        if let stopEscalationSignalSink {
+            stopEscalationSignalSink(sig)
+            return
+        }
+        proc?.signalDescendants(sig)
+    }
+
+    /// Tier-3 动作：复用现有 kill+respawn 路径。AppStore 注入的 `onRequestRestart` 走
+    /// `restartSession`：`shutdown`（杀 pi、等退出 ≤2.5s）→ `makeSession` 按原 sessionFile
+    /// 重开并重载转录；旧进程 `onExit` 顺带清掉 `isStopping`。无注入时退化为 `shutdown()`。
+    private func stopEscalationRestart() {
+        if let stopEscalationRestartSink {
+            stopEscalationRestartSink()
+            return
+        }
+        if let onRequestRestart {
+            onRequestRestart()
+        } else {
+            shutdown()
+        }
     }
 
     /// Remote Stop is narrower than the local method because the webpage keeps
@@ -3768,6 +3864,8 @@ final class ChatSession: ObservableObject, Identifiable {
     /// If `onExited` is provided, it runs once on the main thread after the process exits or after ~2s timeout
     /// (so restart can spawn without concurrent .jsonl writers).
     func shutdown(onExited: (() -> Void)? = nil) {
+        // Any pending stop escalation must not outlive the kill path it triggers.
+        cancelStopEscalation()
         processStartCancelled = true
         cancelSideChannelTitle()
         unbindQuotaMonitor()

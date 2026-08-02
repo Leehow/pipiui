@@ -232,6 +232,19 @@ final class PiProcess {
         failAllPending(error: "process exited")
     }
 
+    /// Best-effort signal to descendant processes ONLY (a stuck foreground tool child
+    /// that ignored pi's abort, plus its children) — never the pi process itself.
+    /// Dispatches the blocking pgrep sweep onto `signalQueue` so the caller (main
+    /// thread) never stalls. Idempotent and safe to call repeatedly (rapid double
+    /// Stop clicks); no-ops once the process is dead.
+    func signalDescendants(_ sig: Int32) {
+        guard isRunning else { return }
+        let pid = process.processIdentifier
+        Self.signalQueue.async { [process] in
+            Self.signalChildren(of: pid, signal: sig)
+        }
+    }
+
     /// Last-resort kill when a graceful terminate does not exit in time.
     func forceKill() {
         let pid = process.processIdentifier

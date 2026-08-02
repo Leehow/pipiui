@@ -1161,6 +1161,15 @@ final class AppStore: ObservableObject {
             }
             self.closeSession(key: currentKey)
         }
+        // 停止升级 Tier-3 兜底：复用 restartSession 的 kill+respawn 路径（shutdown →
+        // 等旧进程退出 → 按原 sessionFile 重开），恢复卡死的前台 turn。
+        session.onRequestRestart = { [weak self, weak session] in
+            guard let self, let session,
+                  let currentKey = self.openSessions.first(where: { $0.value === session })?.key else {
+                return
+            }
+            self.restartSession(key: currentKey)
+        }
         session.onRequestScheduleDraft = { [weak self] prompt in
             self?.presentAutomationDraft(prefilledPrompt: prompt)
         }
