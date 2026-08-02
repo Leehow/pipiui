@@ -113,13 +113,40 @@ final class TaskNotifier: ObservableObject {
 
     // MARK: - Alerts
 
-    func notifyCompletion(sessionTitle: String) {
+    func notifyCompletion(sessionTitle: String, subagentTitles: [String] = []) {
         guard notifyCompletionEnabled else { return }
+        var body = "「\(sessionTitle)」任务已完成"
+        if !subagentTitles.isEmpty {
+            let listed = subagentTitles.prefix(3).joined(separator: "、")
+            let more = subagentTitles.count > 3 ? " 等\(subagentTitles.count)项" : ""
+            body += "（子任务：\(listed)\(more)）"
+        }
         deliver(TaskAlert(
             kind: .completion,
             title: "任务完成",
-            body: "「\(sessionTitle)」任务已完成"
+            body: body
         ))
+    }
+
+    /// 本轮子任务出错/需人工介入：单个直接点名；多个至少列出前 3 个并显示剩余数量。
+    /// 剩余数量放在列表前，避免被正文截断吞掉。
+    func notifySubagentError(sessionTitle: String, issues: [(title: String, reason: String)]) {
+        guard notifyErrorEnabled, !issues.isEmpty else { return }
+        let body: String
+        if issues.count == 1 {
+            body = "「\(sessionTitle)」子任务「\(issues[0].title)」\(issues[0].reason)"
+        } else {
+            let marks = ["①", "②", "③"]
+            let listed = issues.prefix(3).enumerated().map { index, issue in
+                "\(marks[index])「\(issue.title)」\(issue.reason)"
+            }.joined(separator: "；")
+            var text = "「\(sessionTitle)」\(issues.count) 项子任务需人工介入"
+            if issues.count > 3 {
+                text += "（另有 \(issues.count - 3) 项）"
+            }
+            body = text + "：\(listed)"
+        }
+        deliver(TaskAlert(kind: .error, title: "任务出错", body: Self.truncated(body)))
     }
 
     func notifyError(sessionTitle: String, message: String) {

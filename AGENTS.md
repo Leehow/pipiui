@@ -23,6 +23,17 @@
 
 Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may create a runnable App.** All other linked/temporary worktrees must verify with `swift build` / `swift test` only and must never create `build/PipiUI.app`.
 
+### Worktree ownership adapter (binding)
+
+- `.pi/worktrees/*` worktrees on `pipiui/*` branches are owned by the in-app
+  `SubagentStore`. External Codex cleanup must not adopt, race, or close them,
+  especially while a persisted agent is active.
+- External Codex and Team Lead worktrees (including sibling `pipiui-wt/*` or
+  `.worktrees/*` paths on `codex/*` branches) must be created, audited, and
+  closed through `/Users/haoli/.codex/scripts/codex-worktree-lifecycle`.
+- Linked worktrees remain build/test-only. The primary checkout below remains
+  the sole location allowed to package `build/PipiUI.app`.
+
 ```bash
 cd /Users/haoli/leehow/code/pipiui
 ./make-app.sh              # the sole release .app location

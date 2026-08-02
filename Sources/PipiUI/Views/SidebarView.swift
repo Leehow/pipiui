@@ -30,10 +30,13 @@ struct SidebarView: View {
     /// Remote connection details are also window-local and never alter project
     /// or session selection.
     @State private var showRemoteConnection = false
-    /// Global search is always reachable; project menus reuse the same indexed
-    /// search UI with their project fixed as the scope.
-    @State private var showGlobalSearch = false
-    @State private var sessionSearchTarget: SessionSearchTarget?
+    /// Session search stays in the sidebar: a nonempty global query replaces
+    /// the normal tree below this field with its matching sessions.
+    @State private var sessionSearchQuery = ""
+    @State private var sessionSearchHits: [SessionSearchHit] = []
+    @State private var sessionSearchInProgress = false
+    @State private var sessionSearchError: String?
+    @FocusState private var sessionSearchFocused: Bool
 
     /// Shared leading gutter — `.sidebar` List defaults are wider than needed.
     private static let sidebarGutter: CGFloat = 10
@@ -45,40 +48,7 @@ struct SidebarView: View {
                 .padding(.horizontal, Self.sidebarGutter + 2)
                 .padding(.top, 14)
                 .padding(.bottom, 10)
-            Button {
-                showGlobalSearch = true
-            } label: {
-                HStack(spacing: 7) {
-                    Image(systemName: "magnifyingglass")
-                    Text("搜索所有会话")
-                    Spacer(minLength: 0)
-                    Text("⌘K")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 7)
-                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
-            }
-            .buttonStyle(.plain)
-            .keyboardShortcut("k", modifiers: .command)
-            .help("跨项目搜索活跃和已归档会话")
-            .accessibilityLabel("搜索所有会话")
-            .padding(.horizontal, Self.sidebarGutter)
-            .padding(.bottom, 4)
-            .popover(isPresented: $showGlobalSearch) {
-                SessionSearchPopover(
-                    fixedProject: nil,
-                    store: store,
-                    onOpen: { hit in
-                        openSearchHit(hit, fallbackProject: nil)
-                        showGlobalSearch = false
-                    },
-                    onDismiss: { showGlobalSearch = false }
-                )
-                .frame(width: 430, height: 500)
-            }
+            sessionSearchField
             // Thin overlay scroller with automatic indicators, matching the
             // main transcript: it appears/flashes while scrolling and hides
             // when idle. Selection chrome is drawn by
@@ -88,9 +58,13 @@ struct SidebarView: View {
                 // LazyVStack's repeated size-estimation cycle when scrolling an
                 // expanded project tree containing dynamic hoverable rows.
                 VStack(alignment: .leading, spacing: 0) {
-                    pinnedSection
-                    projectsSection
-                    archivedSessionsSection
+                    if sessionSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        pinnedSection
+                        projectsSection
+                        archivedSessionsSection
+                    } else {
+                        sessionSearchResults
+                    }
                 }
                 .padding(.horizontal, Self.sidebarGutter)
                 .padding(.vertical, 8)
@@ -198,6 +172,12 @@ struct SidebarView: View {
         }
         .onChange(of: expandedProjectPaths) { _, newValue in
             LayoutPersistence.saveExpandedProjectPaths(newValue)
+        }
+        .task(id: sessionSearchIdentity) {
+            await updateSessionSearch()
+        }
+        .onExitCommand {
+            clearSessionSearch()
         }
         .sheet(item: $renameTarget) { target in
             VStack(alignment: .leading, spacing: 16) {
@@ -405,9 +385,6 @@ struct SidebarView: View {
             Menu {
                 Text("共 \(sessionCount) 个会话")
                 Divider()
-                Button("搜索会话…") {
-                    sessionSearchTarget = SessionSearchTarget(project: project)
-                }
                 Button(isPinned ? "取消置顶项目" : "置顶项目") {
                     store.toggleProjectPin(project)
                 }
@@ -446,21 +423,6 @@ struct SidebarView: View {
         }
         .padding(.vertical, 5)
         .padding(.horizontal, 6)
-        .popover(item: Binding(
-            get: { sessionSearchTarget?.project.path == project.path ? sessionSearchTarget : nil },
-            set: { sessionSearchTarget = $0 }
-        )) { target in
-            SessionSearchPopover(
-                fixedProject: target.project,
-                store: store,
-                onOpen: { hit in
-                    openSearchHit(hit, fallbackProject: target.project)
-                    sessionSearchTarget = nil
-                },
-                onDismiss: { sessionSearchTarget = nil }
-            )
-            .frame(width: 380, height: 440)
-        }
         .onDrag {
             return NSItemProvider(object: project.path as NSString)
         }
@@ -474,10 +436,10 @@ struct SidebarView: View {
         store.refreshSessions(for: project)
     }
 
-    private func openSearchHit(_ hit: SessionSearchHit, fallbackProject: URL?) {
+    private func openSearchHit(_ hit: SessionSearchHit) {
         let project = hit.projectPath.flatMap { path in
             store.projects.first(where: { $0.path == path })
-        } ?? fallbackProject
+        }
         guard let project else { return }
         expandedProjectPaths.insert(project.path)
         sessionsShownByProject[project.path] = Int.max
@@ -846,6 +808,225 @@ struct SidebarView: View {
             .sorted { $0.key < $1.key }
     }
 
+    private var sessionSearchField: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("搜索所有会话", text: $sessionSearchQuery)
+                .textFieldStyle(.plain)
+                .focused($sessionSearchFocused)
+                .accessibilityLabel("搜索所有会话")
+            if sessionSearchQuery.isEmpty {
+                Text("⌘K")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            } else {
+                Button(action: clearSessionSearch) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("清除搜索")
+                .accessibilityLabel("清除搜索")
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
+        .overlay {
+            Button(action: focusSessionSearch) { EmptyView() }
+                .keyboardShortcut("k", modifiers: .command)
+                .frame(width: 0, height: 0)
+                .accessibilityHidden(true)
+        }
+        .help("跨项目搜索活跃和已归档会话")
+        .padding(.horizontal, Self.sidebarGutter)
+        .padding(.bottom, 4)
+    }
+
+    @ViewBuilder
+    private var sessionSearchResults: some View {
+        if let sessionSearchError {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("搜索暂不可用").font(.callout.weight(.medium))
+                Text(sessionSearchError).font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 8)
+        } else if sessionSearchInProgress {
+            HStack(spacing: 7) {
+                ProgressView().controlSize(.small)
+                Text("正在更新索引并搜索…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.vertical, 18)
+        } else if sessionSearchHits.isEmpty {
+            Text("无匹配会话")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .padding(.vertical, 8)
+        } else {
+            ForEach(sessionSearchHits) { hit in
+                Button {
+                    openSearchHit(hit)
+                    clearSessionSearch()
+                } label: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text(hit.title).font(.body).lineLimit(1)
+                            if hit.isArchived { sessionSearchBadge("已归档", color: .secondary) }
+                            if hit.isLive { sessionSearchBadge("新会话", color: .accentColor) }
+                            if let role = hit.role {
+                                sessionSearchBadge(role == "user" ? "用户" : "助手", color: .secondary)
+                            }
+                            Spacer(minLength: 0)
+                            if let modified = hit.messageTimestamp ?? hit.modified {
+                                Text(Self.relative(modified))
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        if let projectName = hit.projectName {
+                            Text(projectName)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+                        Text(hit.snippet ?? "标题或项目匹配")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.vertical, 6)
+                .padding(.horizontal, 6)
+                .hoverRowBackground(cornerRadius: 7)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sessionSearchBadge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(color.opacity(0.15), in: Capsule())
+    }
+
+    private var sessionSearchSourceGeneration: String {
+        store.projects.map { project in
+            let active = store.sessionsByProject[project.path] ?? []
+            let archived = store.archivedByProject[project.path] ?? []
+            let fileStates = (active + archived)
+                .map { "\($0.path):\($0.modified.timeIntervalSince1970)" }
+                .sorted()
+                .joined(separator: ",")
+            return "\(project.path):\(store.projectDisplayName(for: project)):\(active.count):\(archived.count):\(fileStates)"
+        }.joined(separator: "|")
+    }
+
+    private var sessionSearchIdentity: String {
+        "\(sessionSearchQuery)|\(sessionSearchSourceGeneration)"
+    }
+
+    private func focusSessionSearch() {
+        for project in store.projects {
+            store.refreshSessions(for: project)
+        }
+        sessionSearchFocused = true
+    }
+
+    private func clearSessionSearch() {
+        sessionSearchQuery = ""
+        sessionSearchHits = []
+        sessionSearchInProgress = false
+        sessionSearchError = nil
+        sessionSearchFocused = false
+    }
+
+    @MainActor
+    private func updateSessionSearch() async {
+        let query = sessionSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            sessionSearchHits = []
+            sessionSearchInProgress = false
+            sessionSearchError = nil
+            return
+        }
+
+        sessionSearchInProgress = true
+        sessionSearchError = nil
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        guard !Task.isCancelled else { return }
+        let sources = sessionSearchSources()
+        let live = sessionSearchLiveSources()
+        do {
+            try await SessionSearchIndex.shared.synchronize(sources: sources)
+            var results = try await SessionSearchIndex.shared.search(query: query, projectPath: nil)
+            let liveHits = live.compactMap { entry -> SessionSearchHit? in
+                guard entry.title.range(of: query, options: .caseInsensitive) != nil else { return nil }
+                return SessionSearchHit(
+                    path: entry.key,
+                    title: entry.title,
+                    modified: nil,
+                    snippet: nil,
+                    isTitleMatch: true,
+                    isArchived: false,
+                    isLive: true,
+                    projectPath: entry.projectPath,
+                    projectName: entry.projectName
+                )
+            }
+            results = Array((liveHits + results).prefix(SessionSearchIndex.resultCap))
+            guard !Task.isCancelled else { return }
+            sessionSearchHits = results
+            sessionSearchInProgress = false
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled else { return }
+            sessionSearchError = error.localizedDescription
+            sessionSearchInProgress = false
+        }
+    }
+
+    private func sessionSearchSources() -> [SessionSearchSource] {
+        store.projects.flatMap { project -> [SessionSearchSource] in
+            let projectName = store.projectDisplayName(for: project)
+            let archivedPaths = Set((store.archivedByProject[project.path] ?? []).map(\.path))
+            let all = (store.sessionsByProject[project.path] ?? []) + (store.archivedByProject[project.path] ?? [])
+            return Dictionary(all.map { ($0.path, $0) }, uniquingKeysWith: { _, newer in newer }).values.map { meta in
+                SessionSearchSource(
+                    projectPath: project.path,
+                    projectName: projectName,
+                    sessionPath: meta.path,
+                    title: meta.name,
+                    modified: meta.modified,
+                    isArchived: archivedPaths.contains(meta.path)
+                )
+            }
+        }
+    }
+
+    private func sessionSearchLiveSources() -> [SessionSearchLiveSource] {
+        store.openSessions.compactMap { key, session in
+            guard key.hasPrefix("new:") else { return nil }
+            let project = session.projectURL
+            let title = session.sessionName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return SessionSearchLiveSource(
+                projectPath: project.path,
+                projectName: store.projectDisplayName(for: project),
+                key: key,
+                title: title.isEmpty ? "新会话" : title
+            )
+        }
+    }
+
     private func openKeyFor(meta: SessionMeta) -> String? {
         store.openSessions.first { $0.value.sessionFile == meta.path }?.key
             ?? (store.openSessions["resume:\(meta.path)"] != nil ? "resume:\(meta.path)" : nil)
@@ -868,236 +1049,6 @@ private struct RenameTarget: Identifiable {
 private struct ProjectRenameTarget: Identifiable {
     let project: URL
     var id: String { project.path }
-}
-
-private struct SessionSearchTarget: Identifiable {
-    let project: URL
-    var id: String { project.path }
-}
-
-private enum SessionSearchScope: String, CaseIterable, Identifiable {
-    case all
-    case current
-
-    var id: String { rawValue }
-}
-
-private struct SessionSearchPopover: View {
-    let fixedProject: URL?
-    @ObservedObject var store: AppStore
-    let onOpen: (SessionSearchHit) -> Void
-    let onDismiss: () -> Void
-
-    @State private var query = ""
-    @State private var scope: SessionSearchScope = .all
-    @State private var hits: [SessionSearchHit] = []
-    @State private var searching = false
-    @State private var errorMessage: String?
-    @FocusState private var queryFocused: Bool
-
-    private var scopedProjectPath: String? {
-        if let fixedProject { return fixedProject.path }
-        return scope == .current ? store.selectedProjectPath : nil
-    }
-
-    private var sourceGeneration: String {
-        store.projects.map { project in
-            let active = store.sessionsByProject[project.path] ?? []
-            let archived = store.archivedByProject[project.path] ?? []
-            let fileStates = (active + archived)
-                .map { "\($0.path):\($0.modified.timeIntervalSince1970)" }
-                .sorted()
-                .joined(separator: ",")
-            return "\(project.path):\(store.projectDisplayName(for: project)):\(active.count):\(archived.count):\(fileStates)"
-        }.joined(separator: "|")
-    }
-
-    private var searchIdentity: String {
-        "\(query)|\(scope.rawValue)|\(scopedProjectPath ?? "*")|\(sourceGeneration)"
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text(fixedProject == nil ? "搜索所有会话" : "搜索会话")
-                    .font(.headline)
-                Spacer()
-                if fixedProject == nil, store.selectedProjectPath != nil {
-                    Picker("范围", selection: $scope) {
-                        Text("所有项目").tag(SessionSearchScope.all)
-                        Text("当前项目").tag(SessionSearchScope.current)
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 180)
-                }
-            }
-            TextField("关键词", text: $query)
-                .textFieldStyle(.roundedBorder)
-                .focused($queryFocused)
-            if searching {
-                HStack(spacing: 7) {
-                    ProgressView().controlSize(.small)
-                    Text("正在更新索引并搜索…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .center)
-            }
-            Group {
-                let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let errorMessage {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("搜索暂不可用").font(.callout.weight(.medium))
-                        Text(errorMessage).font(.caption).foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                } else if trimmed.isEmpty {
-                    Text(fixedProject == nil ? "输入关键词搜索所有项目的活跃和已归档会话" : "输入关键词搜索当前项目所有会话")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                } else if !searching && hits.isEmpty {
-                    Text("无匹配会话")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                } else {
-                    List(hits) { hit in
-                        Button { onOpen(hit) } label: {
-                            VStack(alignment: .leading, spacing: 3) {
-                                HStack(spacing: 6) {
-                                    Text(hit.title).font(.body).lineLimit(1)
-                                    if hit.isArchived { searchBadge("已归档", color: .secondary) }
-                                    if hit.isLive { searchBadge("新会话", color: .accentColor) }
-                                    if let role = hit.role {
-                                        searchBadge(role == "user" ? "用户" : "助手", color: .secondary)
-                                    }
-                                    Spacer(minLength: 0)
-                                    if let modified = hit.messageTimestamp ?? hit.modified {
-                                        Text(SidebarView.relative(modified))
-                                            .font(.caption2)
-                                            .foregroundStyle(.tertiary)
-                                    }
-                                }
-                                if fixedProject == nil, let projectName = hit.projectName {
-                                    Text(projectName)
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                        .lineLimit(1)
-                                }
-                                Text(hit.snippet ?? "标题或项目匹配")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .listStyle(.plain)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .padding(14)
-        .onAppear {
-            for project in fixedProject.map({ [$0] }) ?? store.projects {
-                store.refreshSessions(for: project)
-            }
-            if fixedProject != nil { scope = .current }
-            queryFocused = true
-        }
-        .task(id: searchIdentity) {
-            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else {
-                hits = []
-                searching = false
-                errorMessage = nil
-                return
-            }
-            searching = true
-            errorMessage = nil
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            guard !Task.isCancelled else { return }
-            let sources = searchSources()
-            let live = liveSources()
-            do {
-                try await SessionSearchIndex.shared.synchronize(sources: sources)
-                var results = try await SessionSearchIndex.shared.search(
-                    query: trimmed,
-                    projectPath: scopedProjectPath
-                )
-                let liveHits = live.compactMap { entry -> SessionSearchHit? in
-                    guard (scopedProjectPath == nil || entry.projectPath == scopedProjectPath),
-                          entry.title.range(of: trimmed, options: .caseInsensitive) != nil else { return nil }
-                    return SessionSearchHit(
-                        path: entry.key,
-                        title: entry.title,
-                        modified: nil,
-                        snippet: nil,
-                        isTitleMatch: true,
-                        isArchived: false,
-                        isLive: true,
-                        projectPath: entry.projectPath,
-                        projectName: entry.projectName
-                    )
-                }
-                results = Array((liveHits + results).prefix(SessionSearchIndex.resultCap))
-                guard !Task.isCancelled else { return }
-                hits = results
-                searching = false
-            } catch is CancellationError {
-                return
-            } catch {
-                guard !Task.isCancelled else { return }
-                errorMessage = error.localizedDescription
-                searching = false
-            }
-        }
-        .onExitCommand { onDismiss() }
-    }
-
-    @ViewBuilder
-    private func searchBadge(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(.caption2)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
-            .background(color.opacity(0.15), in: Capsule())
-    }
-
-    private func searchSources() -> [SessionSearchSource] {
-        store.projects.flatMap { project -> [SessionSearchSource] in
-            let projectName = store.projectDisplayName(for: project)
-            let archivedPaths = Set((store.archivedByProject[project.path] ?? []).map(\.path))
-            let all = (store.sessionsByProject[project.path] ?? []) + (store.archivedByProject[project.path] ?? [])
-            return Dictionary(all.map { ($0.path, $0) }, uniquingKeysWith: { _, newer in newer }).values.map { meta in
-                SessionSearchSource(
-                    projectPath: project.path,
-                    projectName: projectName,
-                    sessionPath: meta.path,
-                    title: meta.name,
-                    modified: meta.modified,
-                    isArchived: archivedPaths.contains(meta.path)
-                )
-            }
-        }
-    }
-
-    private func liveSources() -> [SessionSearchLiveSource] {
-        store.openSessions.compactMap { key, session in
-            guard key.hasPrefix("new:") else { return nil }
-            let project = session.projectURL
-            let trimmed = session.sessionName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return SessionSearchLiveSource(
-                projectPath: project.path,
-                projectName: store.projectDisplayName(for: project),
-                key: key,
-                title: trimmed.isEmpty ? "新会话" : trimmed
-            )
-        }
-    }
 }
 
 private struct ProjectDropDelegate: DropDelegate {

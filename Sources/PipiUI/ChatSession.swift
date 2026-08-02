@@ -432,6 +432,13 @@ enum SessionTaskNotificationMode: Equatable {
     var allowsGenericNotifications: Bool { self == .standard }
 }
 
+/// 一轮延后发送的任务提醒：记录本轮关联子 agent id 集合——主 turn 活动期间派出的
+/// 子 agent（含续作）+ settle 时仍在运行的集合（并集）。全部 closeout 可判定后聚合
+/// 结果再决定发完成还是出错/需介入提醒（只发一次）。
+private struct PendingRoundNotification {
+    var agentIDs: Set<String>
+}
+
 struct ChatItem: Identifiable, Equatable {
     let id: String
     let role: String // user / assistant / system
@@ -743,6 +750,9 @@ final class ChatSession: ObservableObject, Identifiable {
     /// True between `agent_start` and `agent_settled` (for in-flight persistence).
     /// Background subagents after settle are tracked separately via `subagents.runningCount`.
     private var agentTurnActive = false
+    /// 主 settle 时仍有子 agent 运行 → 记一次「待发送的本轮通知」：等主会话空闲、
+    /// 消息队列为空、且本轮关联子 agent 全部进入终态后补发一次（成功/出错按终态聚合）。
+    private var pendingRoundNotification: PendingRoundNotification?
     /// Notifies AppStore to persist / clear interrupted-path badges.
     var onInFlightChange: ((String, Bool) -> Void)?
     /// False after resuming a disk session that already has a real name.
@@ -950,7 +960,19 @@ final class ChatSession: ObservableObject, Identifiable {
         }
         // Keep crash badge while background subagents run after main agent_settled.
         subagents.onRunningCountMayHaveChanged = { [weak self] in
-            self?.syncInFlightMark()
+            guard let self else { return }
+            self.syncInFlightMark()
+            // 子 agent 生命周期变化 → 若补发条件齐备（空闲 + 空队列 + 全终态）则补发本轮通知。
+            self.flushPendingRoundNotificationIfDue()
+        }
+        // 本轮关联子 agent 集合：主 turn 活动期间派出的子 agent（含续作）都记入，
+        // 不扫历史，避免旧失败污染当前轮。
+        subagents.onAgentStarted = { [weak self] agentID in
+            self?.collectRoundAgentIfStarted(agentID)
+        }
+        // auto-merge / post-merge verify 成功或失败的终点 → 重新尝试补发本轮通知（不轮询）。
+        subagents.onAgentCloseoutMayHaveChanged = { [weak self] in
+            self?.flushPendingRoundNotificationIfDue()
         }
         if let sessionPath, InterruptedSessionStore.contains(sessionPath) {
             hasUnseenInterruption = true
@@ -1625,7 +1647,21 @@ final class ChatSession: ObservableObject, Identifiable {
             syncInFlightMark()
             // Green badge when still idle after drain (no queued follow-up).
             if !isWorking && messageQueue.isEmpty {
-                markUnseenCompletionAfterSuccessfulSettle()
+                if subagents.runningCount > 0 {
+                    // 子 agent 仍在工作：不早发完成通知；记录本轮关联集合，全部终态后补发。
+                    // 关联集合取并集：既覆盖 settle 时仍在运行的子 agent，也保留上一轮
+                    // 已记录但尚未发出（主 agent 已再次工作）的关联子 agent。
+                    let runningIDs = Set(subagents.agents.filter { $0.state == .running }.map(\.id))
+                    pendingRoundNotification = PendingRoundNotification(
+                        agentIDs: (pendingRoundNotification?.agentIDs ?? []).union(runningIDs)
+                    )
+                    markUnseenCompletionAfterSuccessfulSettle(sendNotification: false)
+                } else if pendingRoundNotification != nil {
+                    // 主 agent 在子 agent 终态前又跑了一轮：此刻条件齐备，补发上一轮通知。
+                    flushPendingRoundNotificationIfDue()
+                } else {
+                    markUnseenCompletionAfterSuccessfulSettle()
+                }
             }
             proc?.request(["type": "get_state"]) { [weak self] resp in
                 self?.applyState(resp["data"])
@@ -3821,7 +3857,8 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     /// Green = unseen successful settle. Skip if already selected or unhealthy.
-    private func markUnseenCompletionAfterSuccessfulSettle() {
+    /// `sendNotification: false` 用于子 agent 仍在运行时：绿标照常挂，提醒延后到补发路径。
+    private func markUnseenCompletionAfterSuccessfulSettle(sendNotification: Bool = true) {
         let healthy = lastError == nil && processAlive
         guard healthy else { return }
         if isSelectedCheck?() == true {
@@ -3829,6 +3866,7 @@ final class ChatSession: ObservableObject, Identifiable {
         } else {
             hasUnseenCompletion = true
         }
+        guard sendNotification else { return }
         // 任务完成提醒：只有用户看不到结果（会话未选中或应用未激活）时才弹。
         if taskNotificationMode.allowsGenericNotifications,
            TaskNotifier.shouldNotifyCompletion(
@@ -3839,6 +3877,63 @@ final class ChatSession: ObservableObject, Identifiable {
                 TaskNotifier.shared.notifyCompletion(sessionTitle: displayTitle)
             }
         }
+    }
+
+    /// 本轮所有关联子 agent closeout 已可判定、主会话空闲且队列为空 → 补发一次本轮通知。
+    /// 全部成功：完成提醒（与无子 agent 路径一致的健康 + 前台可见性门控，绿标照常挂）；
+    /// 任一失败/需人工介入：出错提醒（与 notifyError 一致，用户是否在观看都发）。
+    private func flushPendingRoundNotificationIfDue() {
+        guard let pending = pendingRoundNotification else { return }
+        guard !isWorking, messageQueue.isEmpty, subagents.runningCount == 0 else { return }
+        let roundAgents = subagents.agents.filter { pending.agentIDs.contains($0.id) }
+        guard !roundAgents.isEmpty else {
+            // 本轮关联 agent 已全部被清理（如 clearFinished）→ 清掉 pending，避免永久挂起。
+            pendingRoundNotification = nil
+            return
+        }
+        // 等本轮所有关联子 agent 的 closeout/auto-merge/post-merge verify 真正可判定再消费：
+        // 否则会先发成功、清空 pending，后到的 .needsFixer/.needsUser 就失去通知。
+        guard roundAgents.allSatisfy({ subagents.isCloseoutDecidable($0) }) else { return }
+        // 只发一次：无论后续门控是否放行都先消费掉，避免下一次生命周期变化重复发。
+        pendingRoundNotification = nil
+        guard taskNotificationMode.allowsGenericNotifications else { return }
+        let issues = roundAgents.compactMap { agent -> (title: String, reason: String)? in
+            guard let reason = SubagentRoundAggregator.issueReason(for: agent) else { return nil }
+            return (agent.displayTitle, reason)
+        }
+        if issues.isEmpty {
+            // 本轮全部成功：只聚合本轮关联子 agent，历史失败不误报当前轮。
+            let healthy = lastError == nil && processAlive
+            guard healthy,
+                  TaskNotifier.shouldNotifyCompletion(
+                    selected: isSelectedCheck?() == true,
+                    appActive: NSApp.isActive
+                  ) else { return }
+            markUnseenCompletionAfterSuccessfulSettle(sendNotification: false)
+            MainActor.assumeIsolated {
+                TaskNotifier.shared.notifyCompletion(
+                    sessionTitle: displayTitle,
+                    subagentTitles: roundAgents.map(\.displayTitle)
+                )
+            }
+        } else {
+            // 出错/需人工介入：文案含具体子任务名与原因，多个失败至少列出前 3 个。
+            MainActor.assumeIsolated {
+                TaskNotifier.shared.notifySubagentError(
+                    sessionTitle: displayTitle,
+                    issues: issues
+                )
+            }
+        }
+    }
+
+    /// 主 turn 进行中（或已有待发轮次）派出的子 agent → 记入本轮关联集合。
+    /// 主会话完全空闲且无待发轮次时忽略（历史/后台无关派发，不污染本轮）。
+    private func collectRoundAgentIfStarted(_ agentID: String) {
+        guard agentTurnActive || isWorking || pendingRoundNotification != nil else { return }
+        var ids = pendingRoundNotification?.agentIDs ?? []
+        guard ids.insert(agentID).inserted else { return }
+        pendingRoundNotification = PendingRoundNotification(agentIDs: ids)
     }
 
     /// 任务失败提醒（错误不分用户是否在观看，始终提醒）。
