@@ -1,28 +1,33 @@
 import XCTest
 import AppKit
 import SwiftUI
+@testable import PipiUI
 
 /// Integration probe for the internal-anchor prepend-compensation geometry.
 ///
-/// This is a *probe, not a fix*: it reproduces the production transcript shape
-/// (eager VStack, settled ForEach of fixed-height rows, a bottom-aligned
-/// NSViewRepresentable tracker overlay on that ForEach, fixed-height bottom
-/// extras after it) inside a real `NSScrollView` with an `NSHostingView`
-/// document, then records the raw geometry of the representable's host NSView
-/// across (a) an initial settled window, (b) a K-row prepend at the head, and
-/// (c) a bottom-extra-only height churn.
+/// Two scenes, both run inside a real `NSScrollView` with an `NSHostingView`
+/// document:
 ///
-/// Observed structure (measured by this probe, mirroring production):
-/// SwiftUI flattens `ForEach { rows }.overlay { tracker }` inside the VStack
-/// into ONE overlay host **per row**, each filling exactly its own row. The
-/// production coordinator's `anchorView` is the representable NSView of the
-/// last `updateNSView` call, which this probe measures as the top-most row
-/// host (updateNSView fires bottom-row-first).
+/// 1. **Legacy** (`LegacyProbeTranscriptContent`) — the previous production
+///    shape: `ForEach { rows }.overlay { tracker }` flattened directly into
+///    the eager outer VStack. SwiftUI expands that into ONE overlay host **per
+///    row**, and the production coordinator's `anchorView` (the last
+///    `updateNSView` call = the top-most row host) is REBOUND to a new host on
+///    every prepend, so the tracked converted minY/maxY never move. This is
+///    the measured reason the old compensation could never apply; kept as a
+///    deterministic reproducer of the non-production contract.
+///
+/// 2. **Production** (`ProbeTranscriptContent`) — the settled `ForEach` lives
+///    inside its own real eager `VStack` container and the tracker overlay is
+///    attached to THAT container (exactly ONE overlay host), with an explicit
+///    zero-height `sizeThatFits` on the representable. One tracker NSView,
+///    stable identity across prepends, converted minY == maxY at the settled
+///    container bottom, moving by exactly the prepended height.
 ///
 /// Measured per phase, exactly like the production coordinator samples them:
 /// - the tracked anchor's `frame` / `bounds` / `convert(bounds, to: document)`
-/// - every per-row overlay host's converted rect (before AND after, keeping
-///   the view objects so their displacement is observable across the prepend)
+/// - every overlay host's converted rect (before AND after, keeping the view
+///   objects so identity and displacement are observable across the prepend)
 /// - document `frame` / `bounds` / `isFlipped`, clip bounds origin
 /// - `frameDidChange` / `boundsDidChange` notification counts on the tracked
 ///   anchor, the document, and the clip
@@ -36,39 +41,91 @@ final class OverlayAnchorGeometryIntegrationTests: XCTestCase {
         _ = NSApplication.shared
     }
 
-    // MARK: - The probe
+    // MARK: - Legacy reproducer (non-production contract)
 
-    func testSettledForEachOverlayAnchorGeometry() throws {
+    /// The legacy shape (`ForEach { rows }.overlay { tracker }` inside the
+    /// outer VStack) is measured to produce one overlay host PER ROW and to
+    /// REBIND the tracked anchor to a new top-row host on every prepend — so
+    /// the tracked converted minY/maxY never move and the prepend compensation
+    /// can never apply. This test pins those facts as the non-production
+    /// contract; the production-shape test below is the fix contract.
+    func testLegacyForEachOverlayContractProducesPerRowHostsAndRebind() throws {
+        let settled: [Int] = [1, 2, 3, 4, 5]
+        let prepended: [Int] = [-2, -1, 0]
+
+        let harness = try makeLegacyHarness()
+        defer { harness.teardown() }
+
+        harness.setRows(settled)
+        let before = harness.settleAndSnapshot()
+        let trackedBefore = before.allHosts.first?.view
+        XCTAssertNotNil(trackedBefore, "legacy tracked anchor (top row host) must exist")
+
+        let counter = NotificationCounter()
+        defer { counter.teardown() }
+        counter.observe(anchor: trackedBefore!, document: harness.host, clip: harness.scrollView.contentView)
+
+        harness.setRows(prepended + settled)
+        let after = harness.settleAndSnapshot()
+        let trackedAfter = after.allHosts.first?.view
+
+        print("LEGACY PROBE route: \(harness.routeDescription)")
+        print("LEGACY PROBE hosts before=\(before.allHosts.count) after=\(after.allHosts.count)")
+        print("LEGACY PROBE tracked identity: \(trackedAfter === trackedBefore ? "same view" : "REBOUND to a new (top row) host")")
+        print("LEGACY PROBE converted before=\(NSStringFromRect(before.anchorConvertedRect)) after=\(NSStringFromRect(after.anchorConvertedRect))")
+        print("LEGACY PROBE document frame notifications during prepend=\(counter.documentFrameCount)")
+
+        // The legacy shape is the KNOWN-BROKEN non-production contract:
+        XCTAssertEqual(
+            before.allHosts.count, settled.count,
+            "legacy ForEach.overlay must flatten into one overlay host per row"
+        )
+        XCTAssertFalse(
+            trackedAfter === trackedBefore,
+            "legacy tracked anchor must REBIND to a new top-row host after a prepend"
+        )
+        XCTAssertEqual(
+            after.convertedMinY, before.convertedMinY, accuracy: 0.5,
+            "legacy tracked anchor converted minY must not move under a head prepend"
+        )
+        XCTAssertEqual(
+            after.convertedMaxY, before.convertedMaxY, accuracy: 0.5,
+            "legacy tracked anchor converted maxY must not move under a head prepend"
+        )
+        XCTAssertGreaterThan(counter.documentFrameCount, 0, "document frameDidChange must fire on prepend")
+    }
+
+    // MARK: - Production-shape probe (the fix contract)
+
+    /// Production contract: the settled `ForEach` sits inside its own real
+    /// eager `VStack` and the tracker overlay chains to THAT container with an
+    /// explicit zero-height representable. Exactly one tracker host/NSView,
+    /// stable identity across a prepend, converted anchor point moving by
+    /// exactly K * (row + spacing), and bottom-extras churn never moving it.
+    func testProductionShapedSettledContainerOverlayAnchorGeometry() throws {
         let rowHeight = ProbeConstants.rowHeight
         let spacing = ProbeConstants.spacing
         let settled: [Int] = [1, 2, 3, 4, 5]
         let prepended: [Int] = [-2, -1, 0]
 
-        let harness = try makeHarness()
+        let harness = try makeHarness(scene: .production)
         defer { harness.teardown() }
 
         // Phase A — initial settled window of 5 rows.
         harness.setRows(settled)
         let before = harness.settleAndSnapshot()
-
-        // Keep the Phase-A host objects: after the prepend they keep their
-        // identity and shift down, so their live rects expose the true
-        // displacement even though the *tracked* anchor may be rebound.
-        let originalHosts = before.allHosts.map(\.view)
         let trackedBefore = before.allHosts.first?.view
-        XCTAssertNotNil(trackedBefore, "tracked anchor (top row host) must exist")
-        XCTAssertEqual(
-            before.allHosts.count, settled.count,
-            "SwiftUI must place one overlay host per settled row (ForEach flattens into the VStack)"
-        )
+        XCTAssertNotNil(trackedBefore, "production tracker host must exist")
+        XCTAssertEqual(before.allHosts.count, 1, "production shape must mount exactly ONE tracker host")
 
-        // Attach notification counters to the tracked anchor, document, clip.
+        // Attach notification counters before the prepend so the prepend's own
+        // document frameDidChange is observable.
         let counter = NotificationCounter()
         defer { counter.teardown() }
         counter.observe(anchor: trackedBefore!, document: harness.host, clip: harness.scrollView.contentView)
 
-        // Phase B — prepend K = 3 older rows at the head; existing rows keep
-        // their identity and shift down by the prepended height.
+        // Phase B — prepend K = 3 older rows at the head; the settled rows keep
+        // their identity and shift down by exactly K * (row + gap).
         harness.setRows(prepended + settled)
         let afterPrepend = harness.settleAndSnapshot()
         let trackedAfter = afterPrepend.allHosts.first?.view
@@ -78,100 +135,101 @@ final class OverlayAnchorGeometryIntegrationTests: XCTestCase {
         harness.setBottomExtraHeight(ProbeConstants.bottomExtraHeight + 150)
         let afterChurn = harness.settleAndSnapshot()
 
-        // ---- Raw numbers for the fix decision ----
+        // ---- Raw numbers for the report ----
+        let expectedDelta = CGFloat(prepended.count) * (rowHeight + spacing) // 3 * 39 = 117
+        let actualDelta = afterPrepend.convertedMinY - before.convertedMinY
         print("PROBE route: \(harness.routeDescription)")
-        print("PROBE constants: rowHeight=\(rowHeight) spacing=\(spacing) settled=\(settled.count) prepended=\(prepended.count)")
-        print("PROBE tracked-anchor object after prepend: \(trackedAfter === trackedBefore ? "same view" : "REBOUND to a new (top row) host")")
+        print("PROBE constants: rowHeight=\(rowHeight) spacing=\(spacing) settled=\(settled.count) prepended=\(prepended.count) expectedDelta=\(expectedDelta)")
+        print("PROBE tracked-anchor object after prepend: \(trackedAfter === trackedBefore ? "SAME view" : "REBOUND to a new host")")
         print("PROBE BEFORE (settled \(settled.count) rows):\n\(before)")
         print("PROBE AFTER-PREPEND (+\(prepended.count) rows):\n\(afterPrepend)")
         print("PROBE AFTER-BOTTOM-CHURN (extra +150):\n\(afterChurn)")
-        for (index, host) in originalHosts.enumerated() {
-            let rect = host.convert(host.bounds, to: harness.host)
-            let beforeRect = before.allHosts[index].rect
-            let superview = host.superview
-            print("PROBE originalHost[\(index)] frame \(NSStringFromRect(beforeRect)) → \(NSStringFromRect(rect)) "
-                + "(delta \(rect.minY - beforeRect.minY)) "
-                + "superview=\(type(of: superview ?? NSView())) "
-                + "superviewFrame=\(superview.map { NSStringFromRect($0.frame) } ?? "none")")
-        }
-        print("PROBE notifications during prepend: tracked-anchor frame=\(counter.anchorFrameCount) bounds=\(counter.anchorBoundsCount), "
-            + "document frame=\(counter.documentFrameCount) bounds=\(counter.documentBoundsCount), clip bounds=\(counter.clipBoundsCount)")
-        print("PROBE notifications during churn: tracked-anchor frame=\(counter.anchorFrameCount) bounds=\(counter.anchorBoundsCount), "
-            + "document frame=\(counter.documentFrameCount) bounds=\(counter.documentBoundsCount), clip bounds=\(counter.clipBoundsCount)")
+        print("PROBE anchor delta on prepend: \(actualDelta) (expected \(expectedDelta))")
+        print("PROBE notifications during prepend: document frame=\(counter.documentFrameCount) bounds=\(counter.documentBoundsCount), "
+            + "anchor frame=\(counter.anchorFrameCount) bounds=\(counter.anchorBoundsCount), clip bounds=\(counter.clipBoundsCount)")
+        print("PROBE notifications during churn: document frame=\(counter.documentFrameCount) bounds=\(counter.documentBoundsCount), "
+            + "anchor frame=\(counter.anchorFrameCount) bounds=\(counter.anchorBoundsCount), clip bounds=\(counter.clipBoundsCount)")
 
         // ---- Physical invariants ----
 
         // 1. Flipped, top-anchored document (NSHostingView is flipped).
         XCTAssertTrue(before.documentIsFlipped, "document must be flipped like a SwiftUI hosting document")
 
-        // 2. Per-row overlay hosts: each fills exactly its own row, stacked with
-        //    the VStack spacing; the first row sits at the document top.
-        XCTAssertEqual(before.allHosts.count, settled.count)
-        for host in before.allHosts {
-            XCTAssertEqual(host.rect.height, rowHeight, accuracy: 0.5, "host must fill its own row")
-            XCTAssertEqual(host.rect.width, before.anchorConvertedRect.width, accuracy: 0.5)
-        }
-        XCTAssertEqual(before.allHosts.first?.rect.minY ?? CGFloat.nan, 0, accuracy: 0.5, "top row host must sit at the document top")
-        for (index, host) in before.allHosts.enumerated().dropFirst() {
-            XCTAssertEqual(
-                host.rect.minY, before.allHosts[index - 1].rect.minY + rowHeight + spacing, accuracy: 0.5,
-                "rows must stack with the VStack spacing"
-            )
-        }
+        // 2. Exactly ONE tracker host/NSView in every phase — the overlay must
+        //    attach to the single settled container, not the ForEach.
+        XCTAssertEqual(before.allHosts.count, 1, "production shape must mount exactly one tracker host")
+        XCTAssertEqual(afterPrepend.allHosts.count, 1, "production shape must keep exactly one tracker host after a prepend")
+        XCTAssertEqual(afterChurn.allHosts.count, 1, "production shape must keep exactly one tracker host after bottom churn")
 
-        // 3. Prepend: the document grows; every kept row shifts down by exactly
-        //    the document growth (flipped), and the settled region's visual
-        //    bottom (the bottom-most kept host's maxY) moves by the same amount.
-        let docDelta = afterPrepend.documentHeight - before.documentHeight
-        let rawRows = CGFloat(prepended.count) * rowHeight
-        XCTAssertGreaterThan(docDelta, 0, "prepend must grow the document")
-        XCTAssertGreaterThanOrEqual(docDelta, rawRows, "document must grow by at least the raw row heights")
-        XCTAssertLessThanOrEqual(
-            docDelta, rawRows + CGFloat(prepended.count) * spacing + spacing,
-            "document growth must not exceed rows + their gaps"
+        // 3. Anchor object identity is stable across the prepend.
+        XCTAssertTrue(
+            trackedAfter === trackedBefore,
+            "production tracked anchor must be the SAME NSView after a prepend"
         )
-        for (index, host) in originalHosts.enumerated() {
-            let rect = host.convert(host.bounds, to: harness.host)
-            XCTAssertEqual(
-                rect.minY - before.allHosts[index].rect.minY, docDelta, accuracy: 0.5,
-                "kept row \(index) must shift down by exactly the prepended height"
-            )
-        }
-        let settledBottomBefore = before.allHosts.map(\.rect.maxY).max() ?? 0
-        let settledBottomAfter = originalHosts.map { $0.convert($0.bounds, to: harness.host).maxY }.max() ?? 0
-        XCTAssertEqual(
-            settledBottomAfter - settledBottomBefore, docDelta, accuracy: 0.5,
-            "settled region visual bottom must move by exactly the prepended height"
+        XCTAssertTrue(
+            afterChurn.allHosts.first?.view === trackedBefore,
+            "production tracked anchor must stay the SAME NSView through bottom churn"
         )
 
-        // 4. THE REGRESSION: the *tracked* anchor (last `updateNSView` = the top
-        //    row host, the production sampling point) reports the same converted
-        //    rect before and after the prepend — sampling its minY (current
-        //    production code) yields delta 0, so compensation never applies.
+        // 4. Explicit zero height: anchor bounds height == 0 (converted rect
+        //    height 0 too), so minY == maxY at the settled container bottom.
+        XCTAssertEqual(before.anchorBounds.height, 0, accuracy: 0.5, "anchor bounds height must be exactly 0")
+        XCTAssertEqual(afterPrepend.anchorConvertedRect.height, 0, accuracy: 0.5, "converted anchor rect height must be exactly 0")
+        XCTAssertEqual(before.convertedMinY, before.convertedMaxY, accuracy: 0.5, "minY must equal maxY with zero height")
+        XCTAssertEqual(afterPrepend.convertedMinY, afterPrepend.convertedMaxY, accuracy: 0.5, "minY must equal maxY with zero height")
+
+        // 5. Prepend K=3 (row 30, spacing 9): the converted anchor point moves
+        //    by exactly 3 * 39 = 117, and `targetOriginY` equals the old clip
+        //    origin + 117 (unclamped: viewport 220 < content 372 after prepend).
         XCTAssertEqual(
-            afterPrepend.convertedMinY, before.convertedMinY, accuracy: 0.5,
-            "tracked anchor's converted minY must not move under a head prepend"
+            actualDelta, expectedDelta, accuracy: 0.5,
+            "converted anchor delta under a K=3 prepend must equal K * (row + spacing)"
         )
         XCTAssertEqual(
-            afterPrepend.convertedMaxY, before.convertedMaxY, accuracy: 0.5,
-            "tracked anchor's converted maxY must not move under a head prepend"
+            afterPrepend.documentHeight - before.documentHeight, expectedDelta, accuracy: 0.5,
+            "document must grow by exactly the prepended rows + their gaps"
+        )
+        let clipOriginBefore: CGFloat = 20
+        let target = PrependAnchorCompensation.targetOriginY(
+            clipOriginYBefore: clipOriginBefore,
+            anchorYBefore: before.convertedMinY,
+            anchorYNow: afterPrepend.convertedMinY,
+            contentHeight: afterPrepend.documentHeight,
+            viewportHeight: harness.scrollView.contentView.bounds.height
+        )
+        XCTAssertEqual(
+            target ?? .nan, clipOriginBefore + expectedDelta, accuracy: 0.5,
+            "targetOriginY must equal the pre-prepend clip origin plus the anchor displacement"
         )
 
-        // 5. Notification path: the *document* frameDidChange fires when the
-        //    prepend layout lands (production schedules top-edge evaluation on
-        //    it). The tracked anchor's own frameDidChange does NOT fire because
-        //    SwiftUI keeps the inner NSView's frame and moves its container
-        //    instead — printed as a finding for the fix decision.
-        XCTAssertGreaterThan(counter.documentFrameCount, 0, "document frameDidChange must fire on prepend")
-
-        // 6. Bottom-extra churn: document grows by exactly the extra height,
-        //    but neither the tracked anchor nor the settled rows move a point.
+        // 6. Bottom-extra churn (+150): the document grows by exactly 150 but
+        //    the anchor converted Y delta is 0, and the pure compensation must
+        //    refuse to apply (returns nil).
         XCTAssertEqual(afterChurn.documentHeight - afterPrepend.documentHeight, 150, accuracy: 0.5)
-        XCTAssertEqual(afterChurn.convertedMinY, afterPrepend.convertedMinY, accuracy: 0.02)
-        XCTAssertEqual(afterChurn.convertedMaxY, afterPrepend.convertedMaxY, accuracy: 0.02)
         XCTAssertEqual(
-            counter.anchorFrameCount, 0,
-            "tracked anchor must not fire frameDidChange when only bottom extras change"
+            afterChurn.convertedMinY, afterPrepend.convertedMinY, accuracy: 0.02,
+            "bottom-extras churn must never move the anchor"
+        )
+        XCTAssertNil(
+            PrependAnchorCompensation.targetOriginY(
+                clipOriginYBefore: clipOriginBefore,
+                anchorYBefore: afterPrepend.convertedMinY,
+                anchorYNow: afterChurn.convertedMinY,
+                contentHeight: afterChurn.documentHeight,
+                viewportHeight: harness.scrollView.contentView.bounds.height
+            ),
+            "a bottom-only churn must yield no compensation target"
+        )
+
+        // 7. Notification path: the *document* frameDidChange fires when the
+        //    prepend layout lands (production schedules the top-edge evaluation
+        //    / compensation attempt on it). The anchor's own frame notification
+        //    is deliberately NOT required: SwiftUI moves the single overlay
+        //    host, and the coordinator reads the anchor position live from the
+        //    document coordinate at evaluation time.
+        XCTAssertGreaterThan(
+            counter.documentFrameCount, 0,
+            "document frameDidChange must fire on prepend (schedules the compensation layout attempt)"
         )
     }
 
@@ -182,18 +240,37 @@ final class OverlayAnchorGeometryIntegrationTests: XCTestCase {
     /// mutation never re-renders, retry once, then switch to route 2: an
     /// offscreen borderless window attached to the window server. At most two
     /// attempts per route.
-    private func makeHarness() throws -> ProbeHarness {
+    private func makeHarness(scene: ProbeScene) throws -> ProbeHarness<ProbeTranscriptContent> {
         for _ in 0..<2 {
-            let harness = ProbeHarness(useWindow: false)
+            let model = ProbeModel()
+            let harness = ProbeHarness(useWindow: false, model: model, rootView: ProbeTranscriptContent(model: model), sceneName: scene.rawValue)
             if harness.sanityPasses() { return harness }
             harness.teardown()
         }
         for _ in 0..<2 {
-            let harness = ProbeHarness(useWindow: true)
+            let model = ProbeModel()
+            let harness = ProbeHarness(useWindow: true, model: model, rootView: ProbeTranscriptContent(model: model), sceneName: scene.rawValue)
             if harness.sanityPasses() { return harness }
             harness.teardown()
         }
         XCTFail("probe harness could not lay out the anchor without a window (route 1) nor in an offscreen window (route 2)")
+        throw ProbeError.harnessUnusable
+    }
+
+    private func makeLegacyHarness() throws -> ProbeHarness<LegacyProbeTranscriptContent> {
+        for _ in 0..<2 {
+            let model = ProbeModel()
+            let harness = ProbeHarness(useWindow: false, model: model, rootView: LegacyProbeTranscriptContent(model: model), sceneName: "legacy")
+            if harness.sanityPasses() { return harness }
+            harness.teardown()
+        }
+        for _ in 0..<2 {
+            let model = ProbeModel()
+            let harness = ProbeHarness(useWindow: true, model: model, rootView: LegacyProbeTranscriptContent(model: model), sceneName: "legacy")
+            if harness.sanityPasses() { return harness }
+            harness.teardown()
+        }
+        XCTFail("legacy probe harness could not lay out the anchor without a window (route 1) nor in an offscreen window (route 2)")
         throw ProbeError.harnessUnusable
     }
 }
@@ -226,10 +303,10 @@ private struct ProbeRowView: View {
     }
 }
 
-/// Mirror of production `StickToBottomTracker.makeNSView`: a zero-frame,
-/// hidden NSView whose SwiftUI-placement is what we are measuring. Hidden
-/// views are also what the probe's subview walk uses to find the anchors.
-private struct ProbeAnchorRepresentable: NSViewRepresentable {
+/// Mirror of the LEGACY production `StickToBottomTracker.makeNSView`: a
+/// zero-frame, hidden NSView with NO explicit size — SwiftUI's overlay host
+/// sizes it from the row, so the legacy ForEach.overlay flattens per row.
+private struct ProbeLegacyAnchorRepresentable: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
         view.isHidden = true
@@ -239,10 +316,28 @@ private struct ProbeAnchorRepresentable: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
-/// Mirror of the production transcript content: eager VStack, settled ForEach
-/// of fixed-height rows with a bottom-aligned representable overlay, then
-/// bottom extras after it.
-private struct ProbeTranscriptContent: View {
+/// Mirror of the FIXED production `StickToBottomTracker`: explicit zero-height
+/// `sizeThatFits` (width follows the proposal). The overlay host is sized from
+/// this answer, so the anchor has height 0 and minY == maxY at the settled
+/// container bottom.
+private struct ProbeAnchorRepresentable: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        view.isHidden = true
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSView, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? 0, height: 0)
+    }
+}
+
+/// The LEGACY transcript content: eager VStack with the settled ForEach +
+/// bottom-aligned representable overlay DIRECTLY on the ForEach, then bottom
+/// extras. Kept only as the non-production reproducer scene.
+private struct LegacyProbeTranscriptContent: View {
     @ObservedObject var model: ProbeModel
 
     var body: some View {
@@ -251,7 +346,7 @@ private struct ProbeTranscriptContent: View {
                 ProbeRowView(index: index)
             }
             .overlay(alignment: .bottom) {
-                ProbeAnchorRepresentable()
+                ProbeLegacyAnchorRepresentable()
             }
             // Bottom extras — after the settled ForEach, mirrors production's
             // streaming item / return button / bottom sentinel.
@@ -263,26 +358,59 @@ private struct ProbeTranscriptContent: View {
     }
 }
 
+/// Mirror of the FIXED production transcript content: the settled `ForEach`
+/// lives inside its own real eager `VStack` container (same spacing as the
+/// outer VStack), the tracker overlay attaches to THAT container, and bottom
+/// extras follow after it in the outer VStack.
+private struct ProbeTranscriptContent: View {
+    @ObservedObject var model: ProbeModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: ProbeConstants.spacing) {
+            VStack(alignment: .leading, spacing: ProbeConstants.spacing) {
+                ForEach(model.rows, id: \.self) { index in
+                    ProbeRowView(index: index)
+                }
+            }
+            .overlay(alignment: .bottom) {
+                ProbeAnchorRepresentable()
+            }
+            // Bottom extras — after the settled container, mirrors production's
+            // streaming item / return button / bottom sentinel.
+            Rectangle()
+                .fill(Color.green.opacity(0.25))
+                .frame(width: 300, height: model.bottomExtraHeight)
+                .overlay(Text("bottom-extra").font(.system(size: 9)))
+        }
+    }
+}
+
 // MARK: - Harness
 
+private enum ProbeScene: String {
+    case legacy
+    case production
+}
+
+/// One overlay host + its converted rect, sorted top→bottom.
+private struct AnchorHost {
+    let view: NSView
+    let rect: CGRect
+}
+
 @MainActor
-private final class ProbeHarness {
-    let model = ProbeModel()
+private final class ProbeHarness<Content: View> {
+    let model: ProbeModel
     let scrollView: NSScrollView
-    let host: NSHostingView<ProbeTranscriptContent>
+    let host: NSHostingView<Content>
     let window: NSWindow?
     let routeDescription: String
 
-    /// One overlay host + its converted rect, sorted top→bottom.
-    struct AnchorHost {
-        let view: NSView
-        let rect: CGRect
-    }
-
-    init(useWindow: Bool) {
-        routeDescription = useWindow ? "route2-offscreen-window" : "route1-no-window"
-        scrollView = NSScrollView(frame: CGRect(x: 0, y: 0, width: 520, height: 420))
-        host = NSHostingView(rootView: ProbeTranscriptContent(model: model))
+    init(useWindow: Bool, model: ProbeModel, rootView: Content, sceneName: String) {
+        routeDescription = (useWindow ? "route2-offscreen-window" : "route1-no-window") + "/\(sceneName)"
+        self.model = model
+        scrollView = NSScrollView(frame: CGRect(x: 0, y: 0, width: 520, height: 220))
+        host = NSHostingView(rootView: rootView)
         host.autoresizingMask = []
         host.setFrameSize(NSSize(width: 300, height: 200))
         scrollView.documentView = host
@@ -290,7 +418,7 @@ private final class ProbeHarness {
         scrollView.contentView.postsBoundsChangedNotifications = true
         if useWindow {
             let w = NSWindow(
-                contentRect: CGRect(x: -20_000, y: -20_000, width: 520, height: 420),
+                contentRect: CGRect(x: -20_000, y: -20_000, width: 520, height: 220),
                 styleMask: [.borderless],
                 backing: .buffered,
                 defer: false
@@ -407,7 +535,7 @@ private struct AnchorGeometrySnapshot: CustomStringConvertible {
     var anchorFrame: CGRect
     var anchorBounds: CGRect
     var anchorConvertedRect: CGRect
-    var allHosts: [ProbeHarness.AnchorHost]
+    var allHosts: [AnchorHost]
     var anchorSuperviews: [String]
     var clipOrigin: CGPoint
 

@@ -462,6 +462,29 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertLessThan(tracker, bottomSentinel, "anchor must precede the bottom sentinel")
         // The sentinel no longer hosts the tracker in its background.
         XCTAssertFalse(transcript.contains(".background {\n                    // Always mounted"))
+
+        // The settled ForEach must live inside its own real eager VStack
+        // container (same spacing as the outer VStack) and the tracker overlay
+        // must chain to THAT container, never directly to the ForEach: a direct
+        // ForEach.overlay flattens into one per-row host that rebinds on
+        // prepends (measured by the OverlayAnchorGeometryIntegrationTests
+        // legacy probe), so the anchor could never move in document
+        // coordinates. Exactly one tracker may be mounted in the transcript.
+        XCTAssertTrue(
+            source.contains(
+                "VStack(alignment: .leading, spacing: chatTypography.messageSpacing) {\n"
+                    + "                ForEach(presentation.rows, id: \\.id)"
+            ),
+            "the settled ForEach must sit inside its own eager VStack container"
+        )
+        XCTAssertEqual(
+            transcript.components(separatedBy: "StickToBottomTracker(").count - 1, 1,
+            "exactly one tracker overlay must be mounted in the transcript content"
+        )
+        // The zero-height representable contract: the overlay host is sized
+        // from an explicit sizeThatFits (height 0), not from a bare zero frame.
+        XCTAssertTrue(source.contains("func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSView, context: Context) -> CGSize?"))
+        XCTAssertTrue(source.contains("CGSize(width: proposal.width ?? 0, height: 0)"))
     }
 
     func testStreamingFollowUsesAppKitContentGrowthInsteadOfObjectWillChangeScrollTo() throws {
