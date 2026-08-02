@@ -89,4 +89,49 @@ final class StickToBottomLogicTests: XCTestCase {
         )
         XCTAssertEqual(d, 40)
     }
+
+    func testPinnedOriginForChronologicalFlippedDocumentEnd() {
+        XCTAssertEqual(
+            StickToBottomLogic.pinnedOriginY(
+                contentHeight: 1000,
+                visibleHeight: 400,
+                documentIsFlipped: true,
+                pinEdge: .documentEnd
+            ),
+            600
+        )
+    }
+
+    func testPinnedOriginClampsShortDocumentAtZero() {
+        XCTAssertEqual(
+            StickToBottomLogic.pinnedOriginY(
+                contentHeight: 200,
+                visibleHeight: 400,
+                documentIsFlipped: true,
+                pinEdge: .documentEnd
+            ),
+            0
+        )
+    }
+
+    func testPinnedOriginSupportsNonFlippedEdges() {
+        XCTAssertEqual(
+            StickToBottomLogic.pinnedOriginY(
+                contentHeight: 1000,
+                visibleHeight: 400,
+                documentIsFlipped: false,
+                pinEdge: .documentEnd
+            ),
+            0
+        )
+        XCTAssertEqual(
+            StickToBottomLogic.pinnedOriginY(
+                contentHeight: 1000,
+                visibleHeight: 400,
+                documentIsFlipped: false,
+                pinEdge: .documentStart
+            ),
+            600
+        )
+    }
 }

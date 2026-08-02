@@ -78,6 +78,57 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         )
     }
 
+    func testLatestRenderWindowIsExplicitlyBounded() {
+        let window = TranscriptRenderWindow.resolve(
+            itemCount: 1_085,
+            preferredEnd: nil
+        )
+
+        XCTAssertEqual(TranscriptRenderWindow.pageSize, 32)
+        XCTAssertEqual(window.range, 1_053..<1_085)
+        XCTAssertEqual(window.renderedCount, 32)
+        XCTAssertEqual(window.hiddenEarlier, 1_053)
+        XCTAssertEqual(window.hiddenLater, 0)
+        XCTAssertTrue(window.isLatest)
+        XCTAssertEqual(window.earlierPreferredEnd, 1_053)
+    }
+
+    func testOlderRenderWindowDoesNotGrowWhenNewItemsArrive() {
+        let older = TranscriptRenderWindow.resolve(
+            itemCount: 1_085,
+            preferredEnd: 1_053
+        )
+        let afterAppend = TranscriptRenderWindow.resolve(
+            itemCount: 1_100,
+            preferredEnd: 1_053
+        )
+
+        XCTAssertEqual(older.range, 1_021..<1_053)
+        XCTAssertEqual(afterAppend.range, older.range)
+        XCTAssertEqual(afterAppend.renderedCount, 32)
+        XCTAssertEqual(afterAppend.hiddenLater, 47)
+        XCTAssertFalse(afterAppend.isLatest)
+    }
+
+    func testRenderWindowPaginationReachesOlderAndLatestPages() {
+        let latest = TranscriptRenderWindow.resolve(itemCount: 70, preferredEnd: nil)
+        let middle = TranscriptRenderWindow.resolve(
+            itemCount: 70,
+            preferredEnd: latest.earlierPreferredEnd
+        )
+        let oldest = TranscriptRenderWindow.resolve(
+            itemCount: 70,
+            preferredEnd: middle.earlierPreferredEnd
+        )
+
+        XCTAssertEqual(latest.range, 38..<70)
+        XCTAssertEqual(middle.range, 6..<38)
+        XCTAssertEqual(oldest.range, 0..<6)
+        XCTAssertNil(oldest.earlierPreferredEnd)
+        XCTAssertEqual(oldest.laterPreferredEnd, 38)
+        XCTAssertNil(middle.laterPreferredEnd)
+    }
+
     func testTranscriptUsesNormalChronologicalLayoutWithoutReverseFlip() throws {
         let source = try chatDetailSource()
         let start = try XCTUnwrap(
@@ -92,13 +143,25 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         let transcript = String(source[start..<end])
 
         XCTAssertTrue(transcript.contains("ForEach(presentation.rows"))
+        XCTAssertTrue(transcript.contains("Array(items[window.range])"))
+        XCTAssertTrue(transcript.contains("visibleCount: windowItems.count"))
+        XCTAssertTrue(transcript.contains("TranscriptRenderWindow.pageSize"))
+        XCTAssertTrue(transcript.contains(".id(transcriptID(window.renderIdentity))"))
+        XCTAssertTrue(transcript.contains("session.transcriptPlanner.invalidate()"))
+        XCTAssertTrue(transcript.contains("if let laterEnd = window.laterPreferredEnd"))
+        XCTAssertTrue(transcript.contains("onReturnLatest()"))
+        XCTAssertTrue(transcript.contains("VStack(alignment: .leading"))
+        XCTAssertFalse(transcript.contains("LazyVStack"))
+        XCTAssertFalse(transcript.contains("LazyStack"))
+        XCTAssertFalse(transcript.contains("session.transcriptVisibleCount"))
+        XCTAssertFalse(transcript.contains("+= 200"))
         XCTAssertTrue(transcript.contains("pinEdge: .documentEnd"))
         XCTAssertFalse(transcript.contains(".reversed()"))
         XCTAssertFalse(transcript.contains(".transcriptFlip()"))
 
         let history = try XCTUnwrap(transcript.range(of: "ForEach(presentation.rows")?.lowerBound)
         let streaming = try XCTUnwrap(
-            transcript.range(of: "if let streamingItem = streaming.streamingItem")?.lowerBound
+            transcript.range(of: "let streamingItem = streaming.streamingItem")?.lowerBound
         )
         let bottom = try XCTUnwrap(
             transcript.range(of: ".id(transcriptID(\"bottom\"))")?.lowerBound
@@ -107,7 +170,7 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertLessThan(streaming, bottom)
     }
 
-    func testStreamingFollowObserverIsNarrowAndInsideScrollHierarchy() throws {
+    func testStreamingFollowUsesAppKitContentGrowthInsteadOfObjectWillChangeScrollTo() throws {
         let source = try chatDetailSource()
         let contentStart = try XCTUnwrap(
             source.range(of: "private var transcriptContent: some View")?.lowerBound
@@ -120,24 +183,18 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         )
         let content = String(source[contentStart..<contentEnd])
 
-        XCTAssertTrue(content.contains(".background {"))
-        XCTAssertTrue(content.contains("TranscriptFollowObserver(streaming: streaming)"))
-        XCTAssertTrue(content.contains("jumpToLatest(proxy)"))
+        XCTAssertFalse(content.contains("TranscriptFollowObserver"))
+        XCTAssertFalse(content.contains("streaming.objectWillChange"))
         XCTAssertFalse(content.contains(".onChange(of: streaming."))
 
-        let observerStart = try XCTUnwrap(
-            source.range(of: "private struct TranscriptFollowObserver: View")?.lowerBound
+        let trackerStart = try XCTUnwrap(
+            source.range(of: "struct StickToBottomTracker: NSViewRepresentable")?.lowerBound
         )
-        let observerEnd = try XCTUnwrap(
-            source.range(
-                of: "private struct StreamingTranscriptRows: View",
-                range: observerStart..<source.endIndex
-            )?.lowerBound
-        )
-        let observer = String(source[observerStart..<observerEnd])
-        XCTAssertTrue(observer.contains("@ObservedObject var streaming: StreamingState"))
-        XCTAssertTrue(observer.contains(".onReceive(streaming.objectWillChange)"))
-        XCTAssertTrue(observer.contains("onFollowNeeded()"))
+        let tracker = String(source[trackerStart..<source.endIndex])
+        XCTAssertTrue(tracker.contains("NSView.frameDidChangeNotification"))
+        XCTAssertTrue(tracker.contains("schedulePinnedContentFollow()"))
+        XCTAssertTrue(tracker.contains("clip.scroll(to:"))
+        XCTAssertFalse(tracker.contains("ScrollViewProxy"))
 
         let bodyStart = try XCTUnwrap(
             source.range(of: "private struct ChatDetailViewBody: View")?.lowerBound

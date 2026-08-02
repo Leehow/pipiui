@@ -505,95 +505,325 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
     var onOpenDocument: ((URL) -> Void)? = nil
     var onFlash: ((String) -> Void)? = nil
 
-    func makeNSView(context: Context) -> NSTextView {
-        let textView = PathClickTextView(frame: .zero)
+    func makeNSView(context: Context) -> MarkdownNativeLayoutView {
+        let host = MarkdownNativeLayoutView(frame: .zero)
+        update(host)
+        return host
+    }
+
+    func updateNSView(_ host: MarkdownNativeLayoutView, context: Context) {
+        update(host)
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        nsView host: MarkdownNativeLayoutView,
+        context: Context
+    ) -> CGSize? {
+        // A nil/infinite proposal is an unconstrained ideal-size query, not permission
+        // to reuse the native view's previous frame width. Returning that old width after
+        // a right-panel transition lets SwiftUI preserve a stale row height.
+        guard let width = proposal.width,
+              width.isFinite,
+              width > 0 else { return nil }
+        return CGSize(
+            width: width,
+            height: host.measuredHeight(
+                for: width,
+                backingScale: backingScale(for: host)
+            )
+        )
+    }
+
+    private func update(_ host: MarkdownNativeLayoutView) {
+        host.update(
+            attributedText: attributedText,
+            bodyFont: bodyFont,
+            maximumNumberOfLines: maximumNumberOfLines,
+            onOpenDocument: onOpenDocument,
+            onFlash: onFlash,
+            backingScale: backingScale(for: host)
+        )
+    }
+
+    private func backingScale(for host: NSView) -> CGFloat {
+        host.window?.backingScaleFactor
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 2
+    }
+}
+
+/// A non-resizing, clipping host makes native text height an explicit SwiftUI contract.
+///
+/// A vertically resizable bare NSTextView mutates its own frame when TextKit lays out new
+/// content, while reporting no intrinsic or fitting height. SwiftUI can therefore retain an
+/// old row height as the native view grows and paints into following rows. This wrapper owns
+/// the only height calculation, invalidates its intrinsic size for every height-affecting
+/// change, and keeps the child exactly inside the frame SwiftUI reserved.
+final class MarkdownNativeLayoutView: NSView {
+    private struct Measurement {
+        let width: CGFloat
+        let backingScale: CGFloat
+        let height: CGFloat
+    }
+
+    private let textView: PathClickTextView
+    /// Proposal measurement is intentionally detached from the displayed NSTextView.
+    /// Mutating the displayed TextKit container from SwiftUI's size query can schedule
+    /// another AppKit layout, which feeds native layout back into AttributeGraph.
+    private let measurementStorage = NSTextStorage()
+    private let measurementLayoutManager = NSLayoutManager()
+    private let measurementContainer = NSTextContainer()
+    private var measurement: Measurement?
+    private var lastMeasuredWidth: CGFloat?
+    private var preferredBackingScale: CGFloat = 2
+    private(set) var measurementPassCount = 0
+    private(set) var measurementInvalidationCount = 0
+    private(set) var intrinsicInvalidationCount = 0
+
+    override init(frame frameRect: NSRect) {
+        textView = PathClickTextView(frame: .zero)
+        super.init(frame: frameRect)
+
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = false
         textView.textContainerInset = .zero
         textView.textContainer?.lineFragmentPadding = 0
         textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.heightTracksTextView = false
         textView.isHorizontallyResizable = false
-        textView.isVerticallyResizable = true
-        textView.autoresizingMask = [.width]
-        applyContent(to: textView)
-        applyLineLimit(to: textView)
-        applyWire(to: textView)
-        return textView
+        // The wrapper, not NSTextView, owns height. Otherwise assigning content makes
+        // NSTextView grow its frame independently of SwiftUI's reserved row.
+        textView.isVerticallyResizable = false
+        textView.autoresizingMask = [.width, .height]
+        addSubview(textView)
+
+        measurementContainer.lineFragmentPadding = 0
+        measurementContainer.widthTracksTextView = false
+        measurementContainer.heightTracksTextView = false
+        measurementStorage.addLayoutManager(measurementLayoutManager)
+        measurementLayoutManager.addTextContainer(measurementContainer)
     }
 
-    func updateNSView(_ textView: NSTextView, context: Context) {
-        applyContent(to: textView)
-        applyLineLimit(to: textView)
-        applyWire(to: textView)
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
-        guard let container = textView.textContainer,
-              textView.bounds.width > 0 else {
-            return
-        }
-        if MarkdownLayoutSizing.updateContainerIfNeeded(
-            container,
-            proposedWidth: textView.bounds.width,
-            backingScale: backingScale(for: textView)
-        ) {
-            textView.invalidateIntrinsicContentSize()
+    override var isFlipped: Bool { true }
+
+    /// Secondary containment guard. Correctness comes from exact measurement; clipping
+    /// only prevents a transient stale frame from drawing over sibling transcript rows.
+    override var wantsDefaultClipping: Bool { true }
+
+    override func layout() {
+        super.layout()
+        textView.frame = bounds
+        // Display layout follows the frame SwiftUI already chose. Never invalidate the
+        // host's intrinsic size from inside AppKit layout: that closes a feedback loop
+        // (SwiftUI layout -> AppKit layout -> intrinsic invalidation -> SwiftUI layout)
+        // which AttributeGraph detects during simultaneous transcript-row reflow.
+        if let container = textView.textContainer,
+           bounds.width.isFinite,
+           bounds.width > 0 {
+            MarkdownLayoutSizing.updateContainerIfNeeded(
+                container,
+                proposedWidth: bounds.width,
+                backingScale: preferredBackingScale
+            )
         }
     }
 
-    private func applyWire(to textView: NSTextView) {
-        guard let textView = textView as? PathClickTextView else { return }
+    override var intrinsicContentSize: NSSize {
+        let width = bounds.width.isFinite && bounds.width > 0
+            ? bounds.width
+            : (lastMeasuredWidth ?? 0)
+        guard width > 0 else {
+            return NSSize(
+                width: NSView.noIntrinsicMetric,
+                height: NSView.noIntrinsicMetric
+            )
+        }
+        return NSSize(
+            width: NSView.noIntrinsicMetric,
+            height: measuredHeight(for: width, backingScale: preferredBackingScale)
+        )
+    }
+
+    override var fittingSize: NSSize {
+        let intrinsic = intrinsicContentSize
+        guard intrinsic.height != NSView.noIntrinsicMetric else {
+            return super.fittingSize
+        }
+        return NSSize(
+            width: bounds.width.isFinite && bounds.width > 0
+                ? bounds.width
+                : (lastMeasuredWidth ?? 0),
+            height: intrinsic.height
+        )
+    }
+
+    @discardableResult
+    func update(
+        attributedText: NSAttributedString,
+        bodyFont: NSFont,
+        maximumNumberOfLines: Int?,
+        onOpenDocument: ((URL) -> Void)?,
+        onFlash: ((String) -> Void)?,
+        backingScale: CGFloat
+    ) -> Bool {
+        var heightChanged = false
+
+        if textView.font?.isEqual(bodyFont) != true {
+            textView.font = bodyFont
+            heightChanged = true
+        }
+        if !textView.attributedString().isEqual(to: attributedText) {
+            // Set the fallback before installing attributed runs; assigning textColor on
+            // every update could overwrite path accent colors in unchanged storage.
+            textView.textColor = .labelColor
+            textView.textStorage?.setAttributedString(attributedText)
+            measurementStorage.setAttributedString(attributedText)
+            heightChanged = true
+        }
+
+        let limit = max(0, maximumNumberOfLines ?? 0)
+        let lineBreakMode: NSLineBreakMode = limit > 0 ? .byTruncatingTail : .byWordWrapping
+        for container in [textView.textContainer, measurementContainer].compactMap({ $0 }) {
+            if container.maximumNumberOfLines != limit || container.lineBreakMode != lineBreakMode {
+                container.maximumNumberOfLines = limit
+                container.lineBreakMode = lineBreakMode
+                heightChanged = true
+            }
+        }
+
+        let scale = MarkdownLayoutSizing.validBackingScale(backingScale)
+        if preferredBackingScale != scale {
+            preferredBackingScale = scale
+            heightChanged = true
+        }
+
         textView.onOpenDocument = onOpenDocument
         textView.onFlash = onFlash
+
+        if heightChanged {
+            invalidateMeasuredHeight()
+        }
+        return heightChanged
     }
 
-    func sizeThatFits(_ proposal: ProposedViewSize, nsView textView: NSTextView, context: Context) -> CGSize? {
-        guard let width = proposal.width, width > 0 else { return nil }
-        let container = textView.textContainer!
-        MarkdownLayoutSizing.updateContainerIfNeeded(
-            container,
-            proposedWidth: max(width, MarkdownLayoutSizing.minimumMeasurementWidth),
-            backingScale: backingScale(for: textView)
+    func measuredHeight(for proposedWidth: CGFloat, backingScale: CGFloat) -> CGFloat {
+        guard proposedWidth.isFinite, proposedWidth > 0 else {
+            return 0
+        }
+        let scale = MarkdownLayoutSizing.validBackingScale(backingScale)
+        let width = MarkdownLayoutSizing.normalizedWidth(
+            proposedWidth,
+            backingScale: scale
         )
-        textView.layoutManager?.ensureLayout(for: container)
-        let used = textView.layoutManager?.usedRect(for: container) ?? .zero
-        return CGSize(width: width, height: ceil(used.height))
+        if let measurement,
+           measurement.width == width,
+           measurement.backingScale == scale {
+            return measurement.height
+        }
+
+        MarkdownLayoutSizing.updateContainerIfNeeded(
+            measurementContainer,
+            proposedWidth: width,
+            backingScale: scale
+        )
+        measurementLayoutManager.ensureLayout(for: measurementContainer)
+        let height = MarkdownLayoutSizing.fullContentHeight(
+            usedRect: measurementLayoutManager.usedRect(for: measurementContainer),
+            verticalInset: textView.textContainerInset.height,
+            backingScale: scale
+        )
+        measurement = Measurement(width: width, backingScale: scale, height: height)
+        lastMeasuredWidth = width
+        preferredBackingScale = scale
+        measurementPassCount += 1
+        return height
     }
 
-    private func applyContent(to textView: NSTextView) {
-        guard textView.attributedString() != attributedText else { return }
-        textView.font = bodyFont
-        textView.textColor = .labelColor
-        textView.textStorage?.setAttributedString(attributedText)
+    /// Test/diagnostic surface for the exact TextKit height at the current container width.
+    var currentTextKitHeight: CGFloat {
+        measurementLayoutManager.ensureLayout(for: measurementContainer)
+        return MarkdownLayoutSizing.fullContentHeight(
+            usedRect: measurementLayoutManager.usedRect(for: measurementContainer),
+            verticalInset: textView.textContainerInset.height,
+            backingScale: preferredBackingScale
+        )
     }
 
-    private func applyLineLimit(to textView: NSTextView) {
-        guard let container = textView.textContainer else { return }
-        let limit = max(0, maximumNumberOfLines ?? 0)
-        guard container.maximumNumberOfLines != limit else { return }
-        container.maximumNumberOfLines = limit
-        container.lineBreakMode = limit > 0 ? .byTruncatingTail : .byWordWrapping
+    /// The displayed stack is separate from proposal measurement; this catches a stale
+    /// display container even when detached measurement returned the correct SwiftUI size.
+    var displayedTextKitHeight: CGFloat {
+        guard let container = textView.textContainer,
+              let layoutManager = textView.layoutManager else { return 0 }
+        layoutManager.ensureLayout(for: container)
+        return MarkdownLayoutSizing.fullContentHeight(
+            usedRect: layoutManager.usedRect(for: container),
+            verticalInset: textView.textContainerInset.height,
+            backingScale: preferredBackingScale
+        )
     }
 
-    private func backingScale(for textView: NSTextView) -> CGFloat {
-        textView.window?.backingScaleFactor
-            ?? NSScreen.main?.backingScaleFactor
-            ?? 2
+    var nativeTextFrame: NSRect { textView.frame }
+    var nativeTextIsVerticallyResizable: Bool { textView.isVerticallyResizable }
+    var maximumNumberOfLines: Int { textView.textContainer?.maximumNumberOfLines ?? 0 }
+
+    private func invalidateMeasuredHeight() {
+        measurement = nil
+        measurementInvalidationCount += 1
+        if measurementStorage.length > 0 {
+            measurementLayoutManager.invalidateLayout(
+                forCharacterRange: NSRange(location: 0, length: measurementStorage.length),
+                actualCharacterRange: nil
+            )
+        }
+        invalidateHostIntrinsicContentSize()
+        needsLayout = true
+    }
+
+    private func invalidateHostIntrinsicContentSize() {
+        intrinsicInvalidationCount += 1
+        invalidateIntrinsicContentSize()
     }
 }
 
 enum MarkdownLayoutSizing {
-    /// Reject transient near-zero SwiftUI proposals during the first layout pass.
-    static let minimumMeasurementWidth: CGFloat = 120
+    static func validBackingScale(_ backingScale: CGFloat) -> CGFloat {
+        backingScale.isFinite && backingScale > 0 ? backingScale : 1
+    }
 
     static func normalizedWidth(
         _ width: CGFloat,
         backingScale: CGFloat
     ) -> CGFloat {
         guard width.isFinite, width > 0 else { return 1 }
-        let scale = backingScale.isFinite && backingScale > 0
-            ? backingScale
-            : 1
+        let scale = validBackingScale(backingScale)
         return max(1, floor(width * scale) / scale)
+    }
+
+    static func normalizedHeight(
+        _ height: CGFloat,
+        backingScale: CGFloat
+    ) -> CGFloat {
+        guard height.isFinite, height > 0 else { return 0 }
+        let scale = validBackingScale(backingScale)
+        return ceil(height * scale) / scale
+    }
+
+    static func fullContentHeight(
+        usedRect: NSRect,
+        verticalInset: CGFloat,
+        backingScale: CGFloat
+    ) -> CGFloat {
+        normalizedHeight(
+            max(0, usedRect.height) + max(0, verticalInset) * 2,
+            backingScale: backingScale
+        )
     }
 
     static func containerNeedsUpdate(

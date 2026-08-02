@@ -26,6 +26,47 @@ struct TranscriptSessionRootIdentity: Hashable {
     let sessionKey: String
 }
 
+/// Fixed-size settled-history page rendered by the eager transcript stack.
+///
+/// A small eager page gives native NSTextView-backed markdown enough room to settle
+/// its exact height without reintroducing lazy-stack height estimation. Older pages
+/// replace, rather than accumulate ahead of, the current page.
+struct TranscriptRenderWindow: Equatable {
+    static let pageSize = 32
+
+    let range: Range<Int>
+    let totalCount: Int
+
+    var hiddenEarlier: Int { range.lowerBound }
+    var hiddenLater: Int { max(0, totalCount - range.upperBound) }
+    var isLatest: Bool { hiddenLater == 0 }
+    var renderedCount: Int { range.count }
+
+    /// `nil` means the latest page. A non-nil end remains stable if new items arrive
+    /// while the user is reading an older page.
+    static func resolve(itemCount: Int, preferredEnd: Int?) -> Self {
+        let count = max(0, itemCount)
+        let end = min(max(0, preferredEnd ?? count), count)
+        let start = max(0, end - pageSize)
+        return Self(range: start..<end, totalCount: count)
+    }
+
+    var earlierPreferredEnd: Int? {
+        hiddenEarlier > 0 ? range.lowerBound : nil
+    }
+
+    /// Returning `nil` selects the latest page.
+    var laterPreferredEnd: Int? {
+        guard hiddenLater > 0 else { return nil }
+        let end = min(totalCount, range.upperBound + Self.pageSize)
+        return end == totalCount ? nil : end
+    }
+
+    var renderIdentity: String {
+        isLatest ? "window-latest" : "window-\(range.lowerBound)-\(range.upperBound)"
+    }
+}
+
 struct ChatDetailView: View {
     @EnvironmentObject var store: AppStore
     let session: ChatSession
@@ -52,8 +93,9 @@ private struct ChatDetailViewBody: View {
     @ObservedObject var agentStore: SubagentStore
     @Environment(\.chatTypography) private var chatTypography
 
-    /// Coalesce jump-to-latest `scrollTo` (not streaming follow — flipped list grows
-    /// at the pin edge). Transient; reset on session switch.
+    /// Coalesce explicit/recovery jump-to-latest `scrollTo` operations. Streaming
+    /// growth is followed by `StickToBottomTracker` at the AppKit clip-view layer.
+    /// Transient; reset on session switch.
     @State private var scrollCoalesceScheduled = false
     @State private var scrollNeedsRetry = false
     @State private var rightPanelWidthRatio: CGFloat?
@@ -61,6 +103,8 @@ private struct ChatDetailViewBody: View {
     @State private var rightPanelDragWidth: CGFloat?
     /// Real user prompt ids whose complete assistant turn is folded.
     @State private var collapsedUserTurnIDs: Set<String> = []
+    /// `nil` renders the latest fixed page; a concrete end browses older history.
+    @State private var transcriptHistoryWindowEnd: Int? = nil
     /// Hosted above the lazy transcript so row recycling cannot dismiss or corrupt it.
     @State private var finishedGroupPresentation: AssistantBlockLayout.FinishedGroupPresentation?
     @StateObject private var gitBranches = GitBranchStore()
@@ -157,19 +201,21 @@ private struct ChatDetailViewBody: View {
         }
         .onChange(of: session.id) { _, _ in
             // The detail chrome is reused across sessions. Reset only transient view state;
-            // draft, panel selection, transcript window and pin state live on ChatSession.
+            // Draft, panel selection, and pin state live on ChatSession. The fixed
+            // history page is transient view state and must reset here.
             gitBranches.bind(projectURL: session.projectURL)
             scrollCoalesceScheduled = false
             scrollNeedsRetry = false
             rightPanelDragStartWidth = nil
             rightPanelDragWidth = nil
             collapsedUserTurnIDs = []
+            transcriptHistoryWindowEnd = nil
             settledChatColumnWidth = nil
             pendingChatColumnWidth = nil
             chatColumnWidthSettleWork?.cancel()
             chatColumnWidthSettleWork = nil
             widthRecoverGeneration += 1
-            // draft / rightPanel / pinTranscriptToBottom / transcriptVisibleCount live on ChatSession.
+            // draft / rightPanel / pinTranscriptToBottom remain session-owned.
         }
         .environment(\.openDocument, { url in
             // ⌘+点击聊天中的文档路径 → 右侧文档面板渲染（非文档路径仍走访达）。
@@ -346,7 +392,14 @@ private struct ChatDetailViewBody: View {
                     streaming: streaming,
                     agentStore: agentStore,
                     collapsedUserTurnIDs: $collapsedUserTurnIDs,
+                    historyWindowEnd: $transcriptHistoryWindowEnd,
                     onOpenFinishedGroup: presentFinishedGroup,
+                    onReturnLatest: {
+                        session.transcriptPlanner.invalidate()
+                        transcriptHistoryWindowEnd = nil
+                        session.pinTranscriptToBottom = true
+                        jumpToLatest(proxy, retry: true)
+                    },
                     onJump: { target in
                         var transaction = Transaction()
                         transaction.disablesAnimations = true
@@ -358,13 +411,6 @@ private struct ChatDetailViewBody: View {
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .background {
-                // This tiny observer lives inside the scroll hierarchy. The parent
-                // detail chrome intentionally does not observe StreamingState.
-                TranscriptFollowObserver(streaming: streaming) {
-                    jumpToLatest(proxy)
-                }
-            }
             // Same-session identity rebinds may still update session.id without
             // replacing this ScrollView. Never animate that bookkeeping change.
             .animation(nil, value: session.id)
@@ -373,6 +419,8 @@ private struct ChatDetailViewBody: View {
             .overlay(alignment: .bottomTrailing) {
                 if !session.pinTranscriptToBottom {
                     Button {
+                        session.transcriptPlanner.invalidate()
+                        transcriptHistoryWindowEnd = nil
                         session.pinTranscriptToBottom = true
                         jumpToLatest(proxy, retry: true)
                     } label: {
@@ -600,22 +648,6 @@ private struct FinishedNonTextGroupSheetContent: View {
     }
 }
 
-/// Narrow high-frequency subscription used only to request bottom follow.
-/// `jumpToLatest` coalesces these requests to at most one scroll every 50 ms.
-private struct TranscriptFollowObserver: View {
-    @ObservedObject var streaming: StreamingState
-    let onFollowNeeded: () -> Void
-
-    var body: some View {
-        Color.clear
-            .frame(width: 0, height: 0)
-            .onReceive(streaming.objectWillChange) { _ in
-                onFollowNeeded()
-            }
-            .accessibilityHidden(true)
-    }
-}
-
 /// The only transcript subtree that subscribes to high-frequency stream/tool updates.
 /// Its parent scroll container and the sibling InputBar receive no StreamingState invalidations.
 private struct StreamingTranscriptRows: View {
@@ -623,18 +655,23 @@ private struct StreamingTranscriptRows: View {
     @ObservedObject var streaming: StreamingState
     @ObservedObject var agentStore: SubagentStore
     @Binding var collapsedUserTurnIDs: Set<String>
+    @Binding var historyWindowEnd: Int?
     let onOpenFinishedGroup: (AssistantBlockLayout.FinishedGroupPresentation) -> Void
+    let onReturnLatest: () -> Void
     let onJump: (String) -> Void
     @Environment(\.chatTypography) private var chatTypography
 
     var body: some View {
         let items = session.transcript
-        let visibleCount = session.transcriptVisibleCount
-        let hidden = max(0, items.count - visibleCount)
+        let window = TranscriptRenderWindow.resolve(
+            itemCount: items.count,
+            preferredEnd: historyWindowEnd
+        )
+        let windowItems = Array(items[window.range])
         let presentation = session.transcriptPlanner.presentation(
-            items: items,
+            items: windowItems,
             toolRuns: streaming.toolRuns,
-            visibleCount: visibleCount,
+            visibleCount: windowItems.count,
             transcriptVersion: session.transcriptVersion,
             toolStructureVersion: streaming.toolStructureVersion
         )
@@ -649,10 +686,14 @@ private struct StreamingTranscriptRows: View {
             runningSubagentToolCallIds: runningSubagentToolCallIds
         )
 
-        LazyVStack(alignment: .leading, spacing: chatTypography.messageSpacing) {
-            if hidden > 0 {
-                Button("显示更早的 \(hidden) 条消息") {
-                    session.transcriptVisibleCount += 200
+        // Intentionally eager but fixed to at most 32 settled items. Page navigation
+        // replaces this stack instead of accumulating hundreds of native text rows.
+        VStack(alignment: .leading, spacing: chatTypography.messageSpacing) {
+            if let earlierEnd = window.earlierPreferredEnd {
+                Button("显示更早的 \(min(TranscriptRenderWindow.pageSize, window.hiddenEarlier)) 条消息") {
+                    session.transcriptPlanner.invalidate()
+                    historyWindowEnd = earlierEnd
+                    session.pinTranscriptToBottom = false
                 }
                 .buttonStyle(.link)
                 .frame(maxWidth: .infinity)
@@ -711,7 +752,7 @@ private struct StreamingTranscriptRows: View {
                             onOpenFinishedGroup: onOpenFinishedGroup,
                             entryId: entryId,
                             isWorking: session.isWorking,
-                            completionText: id == presentation.lastAssistantRunID
+                            completionText: window.isLatest && id == presentation.lastAssistantRunID
                                 ? session.turnCompletionText : nil,
                             onCopy: { session.copySegmentsText(segments) },
                             onBranch: {
@@ -739,7 +780,9 @@ private struct StreamingTranscriptRows: View {
                 }
             }
 
-            if let streamingItem = streaming.streamingItem, hasVisibleContent(streamingItem) {
+            if window.isLatest,
+               let streamingItem = streaming.streamingItem,
+               hasVisibleContent(streamingItem) {
                 MessageRow(
                     item: streamingItem,
                     toolRuns: runs(for: streamingItem),
@@ -772,7 +815,7 @@ private struct StreamingTranscriptRows: View {
                     TurnElapsedText(startedAt: startedAt)
                         .id(transcriptID("streaming-turn-elapsed"))
                 }
-            } else if session.isWorking || session.mediaBusy {
+            } else if window.isLatest && (session.isWorking || session.mediaBusy) {
                 WaitingPlaceholderView(
                     message: session.mediaBusy
                         ? (session.mediaStatus ?? "正在处理…")
@@ -782,16 +825,44 @@ private struct StreamingTranscriptRows: View {
                 .id(transcriptID("waiting-placeholder"))
             }
 
+            if window.hiddenLater > 0 {
+                HStack(spacing: 16) {
+                    Button("显示后面的 \(min(TranscriptRenderWindow.pageSize, window.hiddenLater)) 条消息") {
+                        session.transcriptPlanner.invalidate()
+                        if let laterEnd = window.laterPreferredEnd {
+                            historyWindowEnd = laterEnd
+                            session.pinTranscriptToBottom = false
+                        } else {
+                            historyWindowEnd = nil
+                            onReturnLatest()
+                        }
+                    }
+                    .buttonStyle(.link)
+
+                    Spacer(minLength: 0)
+
+                    Button("返回最新消息") {
+                        session.transcriptPlanner.invalidate()
+                        historyWindowEnd = nil
+                        onReturnLatest()
+                    }
+                    .buttonStyle(.link)
+                }
+            }
+
             Color.clear
                 .frame(height: 1)
                 .id(transcriptID("bottom"))
-                .background(
-                    StickToBottomTracker(
-                        isPinned: $session.pinTranscriptToBottom,
-                        pinEdge: .documentEnd
-                    )
-                )
+                .background {
+                    if window.isLatest {
+                        StickToBottomTracker(
+                            isPinned: $session.pinTranscriptToBottom,
+                            pinEdge: .documentEnd
+                        )
+                    }
+                }
         }
+        .id(transcriptID(window.renderIdentity))
     }
 
     private func transcriptID(_ localID: String) -> String {
@@ -936,7 +1007,7 @@ enum ScrollOrigin {
     /// - Parameter windowInLiveResize: AppKit window chrome drag. The mouse button
     ///   is held (same signal as a scroller-knob drag) while transcript width/height
     ///   reflows — that must not unpin, or settle-time `scrollTo("bottom")` is skipped
-    ///   and the viewport lands mid-history after LazyVStack re-estimates row heights.
+    ///   and the viewport lands mid-history after transcript row heights reflow.
     static func classify(mouseButtonsDown: Int, windowInLiveResize: Bool = false) -> ScrollOrigin {
         if windowInLiveResize { return .programmaticOrUnknown }
         return mouseButtonsDown != 0 ? .user : .programmaticOrUnknown
@@ -984,6 +1055,23 @@ enum StickToBottomLogic {
         }
     }
 
+    /// Clip-view origin that places the requested document edge at the viewport edge.
+    /// Keeping this geometry pure makes AppKit content-growth following testable.
+    static func pinnedOriginY(
+        contentHeight: CGFloat,
+        visibleHeight: CGFloat,
+        documentIsFlipped: Bool,
+        pinEdge: StickPinEdge
+    ) -> CGFloat {
+        let maximumOrigin = max(0, contentHeight - visibleHeight)
+        switch pinEdge {
+        case .documentEnd:
+            return documentIsFlipped ? maximumOrigin : 0
+        case .documentStart:
+            return documentIsFlipped ? 0 : maximumOrigin
+        }
+    }
+
     /// - Returns: `true`/`false` to write pin, or `nil` for no change.
     static func desiredPin(
         currentlyPinned: Bool,
@@ -1005,8 +1093,9 @@ enum StickToBottomLogic {
     }
 }
 
-/// 挂到 ScrollView 贴底锚点：只在用户手势滚动时更新 pin 状态。
-/// 内容增高导致的「暂时离底」不会取消 pin（由上层 scrollTo 拉回）。
+/// 挂到 ScrollView 贴底锚点：用户手势更新 pin 状态；内容增高时，如果仍
+/// pinned，直接移动 AppKit clip view。这样流式增长不再触发 SwiftUI scrollTo，
+/// 也不会把新的状态写回动态高度布局图。
 struct StickToBottomTracker: NSViewRepresentable {
     @Binding var isPinned: Bool
     var threshold: CGFloat = StickToBottomLogic.rePinThreshold
@@ -1048,6 +1137,8 @@ struct StickToBottomTracker: NSViewRepresentable {
         private var liveScrollObs: NSObjectProtocol?
         private var endScrollObs: NSObjectProtocol?
         private var boundsObs: NSObjectProtocol?
+        private var documentFrameObs: NSObjectProtocol?
+        private var documentBoundsObs: NSObjectProtocol?
         private var attachAttempts = 0
         private var pinWriteScheduled = false
         private var pendingPinValue: Bool?
@@ -1055,6 +1146,9 @@ struct StickToBottomTracker: NSViewRepresentable {
         /// most one attributed drag update per main-loop turn so the pin state
         /// machine cannot feed SwiftUI layout back into the drag continuously.
         private var knobDragUpdateScheduled = false
+        /// Content can publish more than one frame/bounds notification per layout
+        /// pass. Follow at most once per main-loop turn and never mutate SwiftUI.
+        private var contentFollowScheduled = false
         /// Invalidates a queued bounds update if this coordinator is detached and
         /// later attached to another scroll view before the next main-loop turn.
         private var boundsUpdateGeneration = 0
@@ -1121,6 +1215,24 @@ struct StickToBottomTracker: NSViewRepresentable {
                     // runloop.
                     self?.scheduleKnobDragPinUpdate()
                 }
+                if let document = sv.documentView {
+                    document.postsFrameChangedNotifications = true
+                    document.postsBoundsChangedNotifications = true
+                    documentFrameObs = center.addObserver(
+                        forName: NSView.frameDidChangeNotification,
+                        object: document,
+                        queue: .main
+                    ) { [weak self] _ in
+                        self?.schedulePinnedContentFollow()
+                    }
+                    documentBoundsObs = center.addObserver(
+                        forName: NSView.boundsDidChangeNotification,
+                        object: document,
+                        queue: .main
+                    ) { [weak self] _ in
+                        self?.schedulePinnedContentFollow()
+                    }
+                }
                 // 安装时只允许「确认在底部 → pin」，避免布局未完成时误 unpin
                 updatePinFromUserScroll(allowUnpin: false)
             } else if attachAttempts < 8 {
@@ -1136,14 +1248,46 @@ struct StickToBottomTracker: NSViewRepresentable {
             if let liveScrollObs { center.removeObserver(liveScrollObs) }
             if let endScrollObs { center.removeObserver(endScrollObs) }
             if let boundsObs { center.removeObserver(boundsObs) }
+            if let documentFrameObs { center.removeObserver(documentFrameObs) }
+            if let documentBoundsObs { center.removeObserver(documentBoundsObs) }
             liveScrollObs = nil
             endScrollObs = nil
             boundsObs = nil
+            documentFrameObs = nil
+            documentBoundsObs = nil
             scrollView = nil
             pinWriteScheduled = false
             pendingPinValue = nil
             knobDragUpdateScheduled = false
+            contentFollowScheduled = false
             boundsUpdateGeneration += 1
+        }
+
+        private func schedulePinnedContentFollow() {
+            guard isPinned.wrappedValue, !contentFollowScheduled else { return }
+            contentFollowScheduled = true
+            let generation = boundsUpdateGeneration
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.boundsUpdateGeneration == generation else { return }
+                self.contentFollowScheduled = false
+                self.followPinnedContentGrowth()
+            }
+        }
+
+        private func followPinnedContentGrowth() {
+            guard isPinned.wrappedValue,
+                  let scrollView,
+                  let document = scrollView.documentView else { return }
+            let clip = scrollView.contentView
+            let targetY = StickToBottomLogic.pinnedOriginY(
+                contentHeight: document.bounds.height,
+                visibleHeight: clip.bounds.height,
+                documentIsFlipped: document.isFlipped,
+                pinEdge: pinEdge
+            )
+            guard abs(clip.bounds.origin.y - targetY) > 0.5 else { return }
+            clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: targetY))
+            scrollView.reflectScrolledClipView(clip)
         }
 
         private func scheduleKnobDragPinUpdate() {
