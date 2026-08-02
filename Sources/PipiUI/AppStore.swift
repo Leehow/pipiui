@@ -473,7 +473,7 @@ final class AppStore: ObservableObject {
             remotePairingMessage = "配对创建失败，请先启用 Relay"
             return
         }
-        remotePairingMessage = "正在创建一次性配对链接…"
+        remotePairingMessage = "正在创建配对链接…"
         // Lifecycle events carry ownership of visible pairing state. A delayed
         // completion from a replaced request must never clear the replacement QR.
         remoteRelayClient.beginPairing { _ in }
@@ -649,26 +649,46 @@ final class AppStore: ObservableObject {
             remotePairingPairID = pairing.pairID
             remotePairingFingerprint = pairing.fingerprint
             remotePairingExpiresAt = pairing.expiresAt
-            remotePairingMessage = "一次性配对链接已生成"
-            remotePairingExpiryWorkItem?.cancel()
-            let pairID = pairing.pairID
-            let item = DispatchWorkItem { [weak self] in
-                guard let self, self.remotePairingPairID == pairID else { return }
-                self.remoteRelayClient?.cancelPairing()
-                self.clearRemotePairing(message: "配对链接已过期")
-            }
-            remotePairingExpiryWorkItem = item
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + max(0, pairing.expiresAt.timeIntervalSinceNow),
-                execute: item
+            remotePairingMessage = "配对链接已生成（1 小时内可多次使用）"
+            scheduleRemotePairingExpiry(
+                expiresAt: pairing.expiresAt,
+                pairID: pairing.pairID
             )
         case .claimed:
-            clearRemotePairing(message: "浏览器已完成配对")
+            // The link stays visible: other browsers can still pair with it.
+            // A renewed expiry (if the Relay confirmed one) refreshes the
+            // countdown and its scheduled teardown.
+            if let pairID = remotePairingPairID,
+               let renewedExpiry = remoteRelayClient?.currentPairingExpiry() {
+                remotePairingExpiresAt = renewedExpiry
+                scheduleRemotePairingExpiry(
+                    expiresAt: renewedExpiry,
+                    pairID: pairID
+                )
+            }
+            remotePairingMessage = "已有浏览器配对，链接持续可用"
         case .cancelled:
             clearRemotePairing(message: "配对已取消")
         case .invalidated:
             clearRemotePairing(message: "配对链接已失效")
         }
+    }
+
+    private func scheduleRemotePairingExpiry(
+        expiresAt: Date,
+        pairID: String
+    ) {
+        remotePairingExpiryWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.remotePairingPairID == pairID else { return }
+            self.remoteRelayClient?.cancelPairing()
+            self.clearRemotePairing(message: "配对链接已过期")
+        }
+        remotePairingExpiryWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + max(0, expiresAt.timeIntervalSinceNow),
+            execute: item
+        )
     }
 
     private func clearRemotePairing(message: String = "") {

@@ -291,6 +291,15 @@ final class RemoteRelayClient: @unchecked Sendable {
         }
     }
 
+    /// Latest expiry of the active pairing link, if any. Call from outside
+    /// the lifecycle queue (e.g. the main thread) to read the value the Relay
+    /// most recently confirmed.
+    func currentPairingExpiry() -> Date? {
+        lifecycleQueue.sync {
+            pairingSession?.expiresAt
+        }
+    }
+
     func cancelPairing() {
         lifecycleQueue.async { [self] in
             if self.usesTunnel {
@@ -531,8 +540,14 @@ final class RemoteRelayClient: @unchecked Sendable {
                     pairingChanged(.invalidated)
                 }
             case "pair.claimed":
-                session.invalidate()
-                pairingSession = nil
+                // A claim does not consume the link: keep the pairing session
+                // alive so other browsers can still pair, and slide the
+                // countdown forward to the Relay-renewed expiry.
+                if let expiryMS = pair.expiresAt {
+                    session.extendExpiry(to: Date(
+                        timeIntervalSince1970: TimeInterval(expiryMS) / 1_000
+                    ))
+                }
                 pendingPairURL = nil
                 pairingCompletion = nil
                 commandAuthorized = true

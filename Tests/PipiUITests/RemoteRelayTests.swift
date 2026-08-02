@@ -4,7 +4,7 @@ import XCTest
 
 final class RemoteRelayTests: XCTestCase {
     @MainActor
-    func testClaimedPairingCancelsScheduledExpiry() async throws {
+    func testClaimedPairingKeepsLinkUntilScheduledExpiry() async throws {
         let store = AppStore.shared
         store.handleRemotePairingEvent(.cancelled)
         let pairID = UUID().uuidString.lowercased()
@@ -19,11 +19,18 @@ final class RemoteRelayTests: XCTestCase {
             expiresAt: Date().addingTimeInterval(0.05)
         )))
         XCTAssertEqual(store.remotePairingPairID, pairID)
+        // A claimed link stays visible: other browsers can still pair with it.
         store.handleRemotePairingEvent(.claimed)
-        XCTAssertNil(store.remotePairingExpiresAt)
-        XCTAssertNil(store.remotePairingPairID)
+        XCTAssertEqual(store.remotePairingPayload, url.absoluteString)
+        XCTAssertEqual(store.remotePairingPairID, pairID)
+        XCTAssertNotNil(store.remotePairingExpiresAt)
+        XCTAssertEqual(store.remotePairingMessage, "已有浏览器配对，链接持续可用")
+        // The scheduled expiry still tears the link down when an hour passes
+        // without a browser pairing.
         try await Task.sleep(nanoseconds: 150_000_000)
-        XCTAssertEqual(store.remotePairingMessage, "浏览器已完成配对")
+        XCTAssertNil(store.remotePairingPayload)
+        XCTAssertNil(store.remotePairingExpiresAt)
+        XCTAssertEqual(store.remotePairingMessage, "配对链接已过期")
     }
 
     private func repositoryRoot() -> URL {
@@ -682,14 +689,16 @@ final class RemoteRelayTests: XCTestCase {
         XCTAssertTrue(RemoteRelayConnectionState.protocolMismatch.displayText.contains("协议"))
     }
 
-    func testRelayQRCodeIsOneTimeFragmentPairingAndLegacyIsExplicit() throws {
+    func testRelayQRCodeIsReusablePairingLinkAndLegacyIsExplicit() throws {
         let sheet = try String(
             contentsOf: repositoryRoot()
                 .appendingPathComponent("Sources/PipiUI/Views/RemoteConnectionSheet.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(sheet.contains("只可使用一次的配对链接"))
+        XCTAssertTrue(sheet.contains("可被多个浏览器反复使用"))
         XCTAssertTrue(sheet.contains("密钥只存在于 URL fragment"))
+        XCTAssertFalse(sheet.contains("只可使用一次"))
+        XCTAssertFalse(sheet.contains("一次性配对链接"))
         XCTAssertFalse(sheet.contains("发现旧版远程连接试点配置"))
         XCTAssertFalse(sheet.contains("SecureField("))
     }

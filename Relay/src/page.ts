@@ -25,5 +25,5 @@ export const unpairedPageHTML = `<!doctype html>
 <title>PipiUI Remote</title>
 <style nonce="{{NONCE}}">body{font:15px system-ui;margin:0;background:#f5f5f7;color:#1d1d1f}main{max-width:620px;margin:64px auto;padding:24px}section{background:white;border-radius:14px;padding:22px}.muted{color:#666;line-height:1.6}</style>
 </head><body><main><section><h1>PipiUI Remote</h1>
-<p class="muted">请在 Mac 上打开 PipiUI 的“远程连接”，生成一次性配对链接，然后在此浏览器中打开该链接。</p>
+<p class="muted">请在 Mac 上打开 PipiUI 的“远程连接”，生成配对链接，然后在此浏览器中打开该链接。</p>
 </section></main></body></html>`;

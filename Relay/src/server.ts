@@ -306,7 +306,7 @@ function csrfAccepted(req: IncomingMessage, publicOrigin: string): boolean {
 
 function pairPageHTML(nonce: string): string {
   return `<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer">
-<title>PipiUI 配对</title><main><h1>PipiUI 配对</h1><p id="status">正在打开一次性配对链接…</p></main>
+<title>PipiUI 配对</title><main><h1>PipiUI 配对</h1><p id="status">正在打开配对链接…</p></main>
 <script nonce="${nonce}">(()=>{"use strict";
 const raw=location.hash.slice(1);history.replaceState(null,"",location.pathname);
 const match=new RegExp(${JSON.stringify(PAIRING_FRAGMENT_PATTERN_SOURCE)}).exec(raw);

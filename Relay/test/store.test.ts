@@ -8,6 +8,7 @@ import { test } from "node:test";
 import {
   DEFAULT_PENDING_DEVICE_TTL_MS,
   DeviceStore,
+  PAIR_MAX_TTL_MS,
 } from "../src/store.js";
 
 function record(suffix: string) {
@@ -163,42 +164,78 @@ test("pair caps survive restart and release only after durable records expire", 
   restarted.close();
 });
 
-test("claimed pair tombstones reject replay until the retention boundary", () => {
+test("pair is reusable across subjects with sliding one-hour renewal", () => {
   let now = 50_000;
-  const store = new DeviceStore(":memory:", () => now, {
-    pairTombstoneRetentionMS: 100,
-  });
+  const store = new DeviceStore(":memory:", () => now);
   const device = record("b");
   const pairID = randomUUID();
-  const expiresAt = now + 50;
+  const secretHash = "2".repeat(64);
+  const firstExpiry = now + 50;
   assert(store.registerOrVerifyDevice(device));
   assert(store.createPair({
     pairID,
     deviceID: device.deviceID,
     fingerprint: device.fingerprint,
-    secretHash: "2".repeat(64),
-    expiresAt,
+    secretHash,
+    expiresAt: firstExpiry,
   }));
-  assert(store.claimPair({
+
+  const first = store.claimPair({
     pairID,
-    pairSecretHash: "2".repeat(64),
+    pairSecretHash: secretHash,
     fingerprint: device.fingerprint,
-    subject: "cf:subject",
-  }));
-  now = expiresAt + 99;
-  assert.equal(store.pair(pairID, device.deviceID)?.state, "claimed");
+    subject: "cf:first",
+  });
+  assert(first);
+  assert.equal(first.state, "pending", "claim must not consume the pair");
+  assert.equal(first.expiresAt, now + PAIR_MAX_TTL_MS);
+  assert.equal(store.isBound("cf:first", device.deviceID), true);
+
+  // A second browser can claim the same pair while the sliding TTL is alive.
+  const second = store.claimPair({
+    pairID,
+    pairSecretHash: secretHash,
+    fingerprint: device.fingerprint,
+    subject: "cf:second",
+  });
+  assert(second);
+  assert.equal(second.state, "pending");
+  assert.equal(second.expiresAt, now + PAIR_MAX_TTL_MS);
+  assert.equal(store.pair(pairID, device.deviceID)?.state, "pending");
+  assert.equal(store.isBound("cf:second", device.deviceID), true);
+
+  // Renewal reset the clock: a claim after the original expiry succeeds.
+  now = firstExpiry + 99;
+  const renewed = store.claimPair({
+    pairID,
+    pairSecretHash: secretHash,
+    fingerprint: device.fingerprint,
+    subject: "cf:third",
+  });
+  assert(renewed);
+  assert.equal(renewed.expiresAt, now + PAIR_MAX_TTL_MS);
+
+  // Wrong secret still rejects.
   assert.equal(store.claimPair({
     pairID,
-    pairSecretHash: "2".repeat(64),
+    pairSecretHash: "3".repeat(64),
     fingerprint: device.fingerprint,
-    subject: "cf:attacker",
+    subject: "cf:fourth",
   }), null);
-  now += 2;
+  // A pair untouched for a full hour rejects and is garbage collected.
+  now = renewed.expiresAt + 1;
+  assert.equal(store.claimPair({
+    pairID,
+    pairSecretHash: secretHash,
+    fingerprint: device.fingerprint,
+    subject: "cf:fourth",
+  }), null);
+  assert.equal(store.expirePairs(now), 1);
   assert.equal(store.pair(pairID, device.deviceID), null);
   store.close();
 });
 
-test("device pending-pair revocation is selective and preserves finalized pairs", () => {
+test("device pending-pair revocation is selective per device", () => {
   const now = 60_000;
   const store = new DeviceStore(":memory:", () => now);
   const deviceA = record("c");
@@ -206,10 +243,10 @@ test("device pending-pair revocation is selective and preserves finalized pairs"
   assert(store.registerOrVerifyDevice(deviceA));
   assert(store.registerOrVerifyDevice(deviceB));
   const pendingA = randomUUID();
-  const claimedA = randomUUID();
+  const reusedA = randomUUID();
   const pendingB = randomUUID();
   for (const [pairID, device] of [
-    [claimedA, deviceA],
+    [reusedA, deviceA],
     [pendingB, deviceB],
   ] as const) {
     assert(store.createPair({
@@ -221,11 +258,13 @@ test("device pending-pair revocation is selective and preserves finalized pairs"
     }));
   }
   assert(store.claimPair({
-    pairID: claimedA,
-    pairSecretHash: claimedA.replaceAll("-", "").padEnd(64, "0").slice(0, 64),
+    pairID: reusedA,
+    pairSecretHash: reusedA.replaceAll("-", "").padEnd(64, "0").slice(0, 64),
     fingerprint: deviceA.fingerprint,
     subject: "cf:subject",
   }));
+  // A claim no longer finalizes the pair: it stays pending and reusable.
+  assert.equal(store.pair(reusedA, deviceA.deviceID)?.state, "pending");
   assert(store.createPair({
     pairID: pendingA,
     deviceID: deviceA.deviceID,
@@ -234,9 +273,11 @@ test("device pending-pair revocation is selective and preserves finalized pairs"
     expiresAt: now + 60_000,
   }));
 
+  // Creating a replacement pair revokes every earlier pending pair of the
+  // same device, including one browsers already claimed.
+  assert.equal(store.pair(reusedA, deviceA.deviceID)?.state, "revoked");
   assert.equal(store.revokePendingPairsForDevice(deviceA.deviceID, now), 1);
   assert.equal(store.pair(pendingA, deviceA.deviceID)?.state, "revoked");
-  assert.equal(store.pair(claimedA, deviceA.deviceID)?.state, "claimed");
   assert.equal(store.pair(pendingB, deviceB.deviceID)?.state, "pending");
   store.close();
 });

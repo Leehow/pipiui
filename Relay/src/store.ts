@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
-export const PAIR_MAX_TTL_MS = 5 * 60 * 1_000;
+export const PAIR_MAX_TTL_MS = 60 * 60 * 1_000;
 const SCHEMA_VERSION = 2;
 export const DEFAULT_PENDING_DEVICE_TTL_MS = 24 * 60 * 60 * 1_000;
 export const DEFAULT_PAIR_TOMBSTONE_RETENTION_MS = 5 * 60 * 1_000;
@@ -349,12 +349,16 @@ export class DeviceStore {
         this.db.exec("ROLLBACK");
         return null;
       }
-      const consumed = this.db.prepare(`
+      // Pairing links are reusable: a claim does not consume the pair. Each
+      // successful claim slides the expiry forward to now + TTL, so the link
+      // survives until a full hour passes without any browser pairing.
+      const renewedExpiresAt = now + PAIR_MAX_TTL_MS;
+      const renewed = this.db.prepare(`
         UPDATE pairs
-        SET state = 'claimed', claimed_subject = ?, claimed_at = ?, finalized_at = ?
+        SET expires_at = ?
         WHERE pair_id = ? AND state = 'pending' AND expires_at > ?
-      `).run(input.subject, now, now, input.pairID, now);
-      if (consumed.changes !== 1) {
+      `).run(renewedExpiresAt, input.pairID, now);
+      if (renewed.changes !== 1) {
         this.db.exec("ROLLBACK");
         return null;
       }
@@ -374,9 +378,8 @@ export class DeviceStore {
         pairID: input.pairID,
         deviceID: row.device_id,
         fingerprint: row.fingerprint,
-        expiresAt: row.expires_at,
-        state: "claimed",
-        claimedSubject: input.subject,
+        expiresAt: renewedExpiresAt,
+        state: "pending",
       };
     } catch {
       this.db.exec("ROLLBACK");

@@ -389,6 +389,39 @@ final class RemoteDeviceIdentityTests: XCTestCase {
         )!)))
         XCTAssertTrue(waitUntil { states.value.contains(.connected) })
         XCTAssertTrue(waitUntil { pairingEvents.value.contains(.claimed) })
+
+        // A claim renews the session instead of destroying it: the link stays
+        // usable by other browsers and the Mac keeps its pairing secret.
+        XCTAssertNotNil(client.currentPairingExpiry())
+        let renewedExpiry = Int64(
+            Date().addingTimeInterval(50 * 60).timeIntervalSince1970 * 1_000
+        )
+        let renewedClaim = RemotePairServerFrame(
+            v: 1,
+            type: "pair.claimed",
+            pairID: pair.pairID,
+            expiresAt: renewedExpiry,
+            state: nil
+        )
+        XCTAssertTrue(waitUntil { task.receiveCount == 1 })
+        task.deliver(.success(.string(String(
+            data: try JSONEncoder().encode(renewedClaim),
+            encoding: .utf8
+        )!)))
+        XCTAssertTrue(waitUntil {
+            guard let expiry = client.currentPairingExpiry() else { return false }
+            return Int64((expiry.timeIntervalSince1970 * 1_000).rounded(.down))
+                == renewedExpiry
+        })
+        XCTAssertTrue(waitUntil {
+            states.value.filter { $0 == .connected }.count == 2
+        })
+        XCTAssertTrue(waitUntil {
+            pairingEvents.value.filter {
+                if case .claimed = $0 { return true }
+                return false
+            }.count == 2
+        })
         client.stop()
         XCTAssertTrue(waitUntil { task.cancelCount == 1 })
     }
@@ -575,13 +608,46 @@ final class RemoteDeviceIdentityTests: XCTestCase {
         client.stop()
     }
 
+    func testPairingSessionExtendsExpiryWithinOneHourCapAndKeepsSecret() throws {
+        let identity = try ephemeralIdentity()
+        let now = Date(timeIntervalSince1970: 40_000)
+        let secret = Data(repeating: 7, count: 32)
+        let session = try RemotePairingSession(
+            identity: identity,
+            now: now,
+            ttl: 300,
+            randomBytes: { secret }
+        )
+        XCTAssertEqual(RemotePairingSession.maximumTTL, 60 * 60)
+        XCTAssertEqual(session.expiresAt, now.addingTimeInterval(300))
+
+        let renewed = now.addingTimeInterval(59 * 60)
+        session.extendExpiry(to: renewed, now: now)
+        XCTAssertEqual(session.expiresAt, renewed)
+
+        // Beyond the one-hour ceiling from `now` is rejected.
+        session.extendExpiry(to: now.addingTimeInterval(61 * 60), now: now)
+        XCTAssertEqual(session.expiresAt, renewed)
+        // Backdated renewals are rejected.
+        session.extendExpiry(to: now.addingTimeInterval(-60), now: now)
+        XCTAssertEqual(session.expiresAt, renewed)
+
+        // The secret survives renewal: the same link still resolves mid-window.
+        XCTAssertFalse(session.isInvalidated)
+        let url = try session.claimURL(
+            publicURL: try XCTUnwrap(URL(string: "https://pipi.aichattrpg.com/")),
+            now: now.addingTimeInterval(30 * 60)
+        )
+        XCTAssertTrue(url.absoluteString.contains(secret.base64URLEncodedString()))
+    }
+
     func testPairingRejectsExpiredTTLWrongOriginQueryAndUnknownFragmentField() throws {
         let identity = try ephemeralIdentity()
         let now = Date(timeIntervalSince1970: 30_000)
         XCTAssertThrowsError(try RemotePairingSession(
             identity: identity,
             now: now,
-            ttl: 301
+            ttl: 3601
         ))
         let session = try RemotePairingSession(
             identity: identity,
@@ -594,7 +660,7 @@ final class RemoteDeviceIdentityTests: XCTestCase {
         ))
         XCTAssertThrowsError(try session.claimURL(
             publicURL: XCTUnwrap(URL(string: "https://pipi.aichattrpg.com/")),
-            now: now.addingTimeInterval(301)
+            now: now.addingTimeInterval(3601)
         ))
 
         let valid = try session.claimURL(

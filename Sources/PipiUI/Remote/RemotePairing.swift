@@ -63,14 +63,23 @@ final class ZeroizingSecretBuffer: @unchecked Sendable {
 }
 
 final class RemotePairingSession: @unchecked Sendable {
-    static let maximumTTL: TimeInterval = 5 * 60
+    static let maximumTTL: TimeInterval = 60 * 60
 
     let pairID: String
     let deviceID: String
     let fingerprint: String
-    let expiresAt: Date
     private let lock = NSLock()
     private var secret: ZeroizingSecretBuffer?
+    private var expiresAtStorage: Date
+
+    /// Current expiry. Renewed by `extendExpiry` each time the Relay confirms
+    /// another browser paired; the link stays usable while a browser pairs at
+    /// least once per hour.
+    var expiresAt: Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return expiresAtStorage
+    }
 
     init(
         identity: RemoteDeviceIdentity,
@@ -95,8 +104,20 @@ final class RemotePairingSession: @unchecked Sendable {
         pairID = UUID().uuidString.lowercased()
         deviceID = identity.deviceID
         fingerprint = identity.fingerprint
-        expiresAt = now.addingTimeInterval(ttl)
+        expiresAtStorage = now.addingTimeInterval(ttl)
         secret = ZeroizingSecretBuffer(copying: generated)
+    }
+
+    /// Slides the expiry forward after the Relay confirms a browser claim.
+    /// Rejects values outside the bounded window (not after `now`, not more
+    /// than `maximumTTL` ahead) so a compromised or buggy Relay cannot push
+    /// the countdown arbitrarily far.
+    func extendExpiry(to newExpiry: Date, now: Date = Date()) {
+        lock.lock()
+        defer { lock.unlock() }
+        let upperBound = now.addingTimeInterval(Self.maximumTTL)
+        guard newExpiry > now, newExpiry <= upperBound else { return }
+        expiresAtStorage = newExpiry
     }
 
     func claimURL(publicURL: URL, now: Date = Date()) throws -> URL {
@@ -171,7 +192,7 @@ final class RemotePairingSession: @unchecked Sendable {
     private func activeSecret(now: Date) throws -> Data {
         lock.lock()
         defer { lock.unlock() }
-        guard now < expiresAt else { throw RemotePairingError.expired }
+        guard now < expiresAtStorage else { throw RemotePairingError.expired }
         guard let secret else { throw RemotePairingError.invalidated }
         guard let copy = secret.copyData() else {
             throw RemotePairingError.invalidated

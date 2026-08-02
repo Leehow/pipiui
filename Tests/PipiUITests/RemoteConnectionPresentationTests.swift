@@ -142,11 +142,11 @@ final class RemoteConnectionPresentationTests: XCTestCase {
         )
         XCTAssertEqual(
             RemoteConnectionAccessibility.copyPairingLinkLabel,
-            "复制一次性配对链接"
+            "复制配对链接"
         )
         XCTAssertEqual(
             RemoteConnectionAccessibility.openPairingLinkLabel,
-            "在浏览器打开一次性配对链接"
+            "在浏览器打开配对链接"
         )
     }
 
@@ -189,7 +189,7 @@ final class RemoteConnectionPresentationTests: XCTestCase {
                 ".accessibilityLabel(RemoteConnectionAccessibility.copyLANAddressLabel)"
             )
         )
-        XCTAssertTrue(sheet.contains("Button(\"生成一次性配对链接\")"))
+        XCTAssertTrue(sheet.contains("Button(\"生成配对链接\")"))
         XCTAssertTrue(sheet.contains("Button(\"复制配对链接\")"))
         XCTAssertTrue(sheet.contains("Button(\"在浏览器打开配对链接\")"))
     }

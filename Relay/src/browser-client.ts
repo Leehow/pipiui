@@ -1246,7 +1246,7 @@ export async function bootstrapBrowser(options = {}) {
       ledger: uncertainty,
     });
     await devices();
-    setStatus("配对已解除；如需再次连接，请打开新的一次性配对链接");
+    setStatus("配对已解除；如需再次连接，请打开新的配对链接");
   }
 
   async function command(name, body, mutation = false) {

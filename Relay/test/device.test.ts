@@ -397,7 +397,7 @@ test("pair page removes the fragment before exact same-origin claim", async () =
     publicKeyX963: string,
     fragment = `v=1&s=${secret}&fp=${pairIdentity.fingerprint}`,
   ) {
-    const status = { textContent: "正在打开一次性配对链接…" };
+    const status = { textContent: "正在打开配对链接…" };
     let cleared = false;
     let replaced = false;
     let fetchCount = 0;
@@ -439,7 +439,7 @@ test("pair page removes the fragment before exact same-origin claim", async () =
       Promise,
     };
     vm.runInNewContext(script, context);
-    await waitUntil(() => status.textContent !== "正在打开一次性配对链接…");
+    await waitUntil(() => status.textContent !== "正在打开配对链接…");
     return { text: status.textContent, fetchCount, replaced };
   }
   const accepted = await runPairPage(pairIdentity.publicKeyX963);
@@ -574,7 +574,7 @@ test("a failed first auth frame consumes the socket even when a valid proof is q
   assert.equal(relay.store.device(id.deviceID), null);
 });
 
-test("pair claim is one-time, subject-bound, and wrong secret/fingerprint reject", async () => {
+test("pair claim is reusable across browsers and wrong secret/fingerprint reject", async () => {
   let clock = 50_000;
   const relay = await start({ now: () => clock });
   const id = identity();
@@ -617,10 +617,16 @@ test("pair claim is one-time, subject-bound, and wrong secret/fingerprint reject
       fingerprint: id.fingerprint,
     }],
   });
+  // The same link stays claimable by another browser after the first
+  // pairing: claims do not consume the pair and each claim renews the
+  // sliding one-hour TTL.
   const replay = await claim(relay.port, tokenB, frame, secret);
-  assert.equal(replay.status, 403);
+  assert.equal(replay.status, 200);
   assert.equal(relay.store.isBound(`cf:${subjectA}`, id.deviceID), true);
-  assert.equal(relay.store.isBound(`cf:${subjectB}`, id.deviceID), false);
+  assert.equal(relay.store.isBound(`cf:${subjectB}`, id.deviceID), true);
+  const renewed = relay.store.pair(frame.pairID, id.deviceID);
+  assert.equal(renewed?.state, "pending");
+  assert.equal(renewed?.expiresAt, clock + 60 * 60 * 1_000);
 });
 
 test("accountless pair claim issues a hash-bound browser cookie and revoke invalidates it", async () => {
@@ -634,7 +640,7 @@ test("accountless pair claim issues a hash-bound browser cookie and revoke inval
   });
   assert.equal(unpaired.status, 200);
   const unpairedHTML = await unpaired.text();
-  assert.match(unpairedHTML, /生成一次性配对链接/);
+  assert.match(unpairedHTML, /生成配对链接/);
   assert.doesNotMatch(unpairedHTML, /id="devices"/);
 
   const anonymousDevices = await fetch(
@@ -669,8 +675,9 @@ test("accountless pair claim issues a hash-bound browser cookie and revoke inval
   assert.equal(relay.store.isBound(sessionSubject, id.deviceID), true);
   assert.equal(relay.store.isBound(sessionToken, id.deviceID), false);
   assert.equal(
-    relay.store.pair(created.frame.pairID, id.deviceID)?.claimedSubject,
-    sessionSubject,
+    relay.store.pair(created.frame.pairID, id.deviceID)?.state,
+    "pending",
+    "a successful claim must keep the pair reusable",
   );
 
   const sessionCookie = `pipiui_session=${sessionToken}`;
@@ -696,10 +703,11 @@ test("accountless pair claim issues a hash-bound browser cookie and revoke inval
     },
   );
   assert.equal(crossBinding.status, 401);
-  assert.equal(
-    (await claim(relay.port, "", created.frame, created.secret)).status,
-    403,
-  );
+  // The same link still works for another browser: the anonymous claim binds
+  // a fresh session subject instead of being rejected.
+  const secondAccepted = await claim(relay.port, "", created.frame, created.secret);
+  assert.equal(secondAccepted.status, 200);
+  assert(secondAccepted.headers.get("set-cookie")?.includes("pipiui_session=") === true);
 
   const page = await fetch(`http://127.0.0.1:${relay.port}/`, {
     headers: {
