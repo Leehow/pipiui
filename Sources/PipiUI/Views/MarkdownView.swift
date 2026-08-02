@@ -17,11 +17,8 @@ struct MarkdownTextView: View {
         // paragraph/list/code boundary. One NSTextView keeps all rendered blocks in one
         // NSTextStorage, which is the unit AppKit uses for native drag selection.
         SelectableMarkdownTextView(
-            attributedText: MarkdownSelectionContent.attributedString(
-                for: text,
-                typography: chatTypography
-            ),
-            bodyFont: chatTypography.bodyNSFont,
+            markdownText: text,
+            typography: chatTypography,
             maximumNumberOfLines: lineLimit,
             onOpenDocument: openDocument,
             onFlash: onFlash
@@ -48,7 +45,7 @@ struct MarkdownTextView: View {
         return blocks
     }
 
-    enum Block {
+    enum Block: Equatable {
         case paragraph(String)
         case heading(Int, String)
         case code(String)
@@ -59,7 +56,7 @@ struct MarkdownTextView: View {
         case rule
     }
 
-    struct ListItem {
+    struct ListItem: Equatable {
         let marker: String
         let text: String
         let indent: Int
@@ -279,15 +276,38 @@ enum MarkdownSelectionContent {
         for text: String,
         typography: ChatTypography = .make(fontSize: ChatTypography.defaultFontSize)
     ) -> NSAttributedString {
+        attributedString(for: MarkdownTextView.cachedParse(text), typography: typography)
+    }
+
+    static func attributedString(
+        for blocks: [MarkdownTextView.Block],
+        typography: ChatTypography = .make(fontSize: ChatTypography.defaultFontSize)
+    ) -> NSAttributedString {
         let result = NSMutableAttributedString()
-        let blocks = MarkdownTextView.cachedParse(text)
+        append(blocks, to: result, typography: typography)
+        return result
+    }
+
+    static func append(
+        _ blocks: ArraySlice<MarkdownTextView.Block>,
+        to result: NSMutableAttributedString,
+        typography: ChatTypography
+    ) {
+        append(Array(blocks), to: result, typography: typography)
+    }
+
+    static func append(
+        _ blocks: [MarkdownTextView.Block],
+        to result: NSMutableAttributedString,
+        typography: ChatTypography
+    ) {
         let bodyStyle = paragraphStyle(for: typography, role: .body)
         let listStyle = paragraphStyle(for: typography, role: .list)
         let headingStyle = paragraphStyle(for: typography, role: .heading)
         let codeStyle = paragraphStyle(for: typography, role: .code)
 
-        for (index, block) in blocks.enumerated() {
-            if index > 0 {
+        for block in blocks {
+            if result.length > 0 {
                 result.append(blockSeparator(typography: typography))
             }
             switch block {
@@ -345,7 +365,6 @@ enum MarkdownSelectionContent {
                 ))
             }
         }
-        return result
     }
 
     /// NSTextView ignores SwiftUI `.lineSpacing`; spacing must live on `NSParagraphStyle`.
@@ -373,7 +392,7 @@ enum MarkdownSelectionContent {
     }
 
     /// Empty paragraph between markdown blocks; height is exactly `blockSpacing`.
-    private static func blockSeparator(typography: ChatTypography) -> NSAttributedString {
+    static func blockSeparator(typography: ChatTypography) -> NSAttributedString {
         let style = NSMutableParagraphStyle()
         style.minimumLineHeight = typography.blockSpacing
         style.maximumLineHeight = typography.blockSpacing
@@ -495,12 +514,143 @@ enum MarkdownSelectionContent {
     }
 }
 
+/// Per-native-host append lineage. Immutable/remounted messages still use the exact-string
+/// caches above; only a strict append with unchanged typography is allowed to reuse blocks.
+final class MarkdownStreamingRenderer {
+    enum Update {
+        case unchanged
+        case full(NSAttributedString)
+        case replace(range: NSRange, tail: NSAttributedString)
+    }
+
+    private var previousText = ""
+    private var typography: ChatTypography?
+    private var stableBlocks: [MarkdownTextView.Block] = []
+    private let stableAttributed = NSMutableAttributedString()
+    private var renderedLength = 0
+
+    func update(text: String, typography newTypography: ChatTypography) -> Update {
+        if text == previousText, typography == newTypography {
+            return .unchanged
+        }
+        let isAppend = text.count > previousText.count && text.hasPrefix(previousText)
+        guard isAppend, typography == newTypography else {
+            return reset(text: text, typography: newTypography)
+        }
+
+        let parts = Self.parts(for: text)
+        guard stableBlocks.count <= parts.stableBlocks.count,
+              Array(parts.stableBlocks.prefix(stableBlocks.count)) == stableBlocks else {
+            return reset(text: text, typography: newTypography)
+        }
+
+        let replacementStart = stableAttributed.length
+        if parts.stableBlocks.count > stableBlocks.count {
+            MarkdownSelectionContent.append(
+                parts.stableBlocks[stableBlocks.count...],
+                to: stableAttributed,
+                typography: newTypography
+            )
+        }
+        stableBlocks = parts.stableBlocks
+
+        let replacement = NSMutableAttributedString()
+        if stableAttributed.length > replacementStart {
+            replacement.append(stableAttributed.attributedSubstring(
+                from: NSRange(
+                    location: replacementStart,
+                    length: stableAttributed.length - replacementStart
+                )
+            ))
+        }
+        if !stableBlocks.isEmpty, !parts.tailBlocks.isEmpty {
+            replacement.append(MarkdownSelectionContent.blockSeparator(typography: newTypography))
+        }
+        replacement.append(MarkdownSelectionContent.attributedString(
+            for: parts.tailBlocks,
+            typography: newTypography
+        ))
+
+        let oldLength = renderedLength
+        renderedLength = replacementStart + replacement.length
+        previousText = text
+        return .replace(
+            range: NSRange(location: replacementStart, length: oldLength - replacementStart),
+            tail: replacement
+        )
+    }
+
+    func reset(text: String, typography newTypography: ChatTypography) -> Update {
+        let parts = Self.parts(for: text)
+        stableBlocks = parts.stableBlocks
+        stableAttributed.setAttributedString(MarkdownSelectionContent.attributedString(
+            for: stableBlocks,
+            typography: newTypography
+        ))
+        let full = MarkdownSelectionContent.attributedString(for: text, typography: newTypography)
+        previousText = text
+        typography = newTypography
+        renderedLength = full.length
+        return .full(full)
+    }
+
+    private struct Parts {
+        let stableBlocks: [MarkdownTextView.Block]
+        let tailBlocks: [MarkdownTextView.Block]
+    }
+
+    private static func parts(for text: String) -> Parts {
+        guard let boundary = stablePrefixBoundary(in: text) else {
+            return Parts(stableBlocks: [], tailBlocks: MarkdownTextView.cachedParse(text))
+        }
+        return Parts(
+            stableBlocks: MarkdownTextView.cachedParse(String(text[..<boundary])),
+            tailBlocks: MarkdownTextView.cachedParse(String(text[boundary...]))
+        )
+    }
+
+    /// Returns the start of the penultimate blank-line-delimited content region. Blank lines
+    /// inside an open fence are deliberately ignored, so tables/fences/lists/quotes/ASCII-art
+    /// cannot reinterpret anything promoted into the stable prefix.
+    static func stablePrefixBoundary(in text: String) -> String.Index? {
+        var regionStarts: [String.Index] = [text.startIndex]
+        var lineStart = text.startIndex
+        var inFence = false
+        var sawSafeBlank = false
+
+        while lineStart < text.endIndex {
+            let newline = text[lineStart...].firstIndex(of: "\n")
+            let lineEnd = newline ?? text.endIndex
+            let trimmed = text[lineStart..<lineEnd].trimmingCharacters(in: .whitespaces)
+
+            if trimmed.hasPrefix("```") {
+                if sawSafeBlank, !inFence, lineStart != text.startIndex {
+                    regionStarts.append(lineStart)
+                }
+                sawSafeBlank = false
+                inFence.toggle()
+            } else if !inFence, trimmed.isEmpty {
+                sawSafeBlank = true
+            } else if !inFence, sawSafeBlank {
+                regionStarts.append(lineStart)
+                sawSafeBlank = false
+            }
+
+            guard let newline else { break }
+            lineStart = text.index(after: newline)
+        }
+
+        guard regionStarts.count >= 3 else { return nil }
+        return regionStarts[regionStarts.count - 2]
+    }
+}
+
 /// AppKit selection host for a complete markdown message. `NSTextView` owns one text storage,
 /// so dragging from one paragraph/block into another keeps a continuous selection and copies
 /// the full range correctly.
 private struct SelectableMarkdownTextView: NSViewRepresentable {
-    let attributedText: NSAttributedString
-    let bodyFont: NSFont
+    let markdownText: String
+    let typography: ChatTypography
     var maximumNumberOfLines: Int? = nil
     var onOpenDocument: ((URL) -> Void)? = nil
     var onFlash: ((String) -> Void)? = nil
@@ -537,8 +687,8 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
 
     private func update(_ host: MarkdownNativeLayoutView) {
         host.update(
-            attributedText: attributedText,
-            bodyFont: bodyFont,
+            markdownText: markdownText,
+            typography: typography,
             maximumNumberOfLines: maximumNumberOfLines,
             onOpenDocument: onOpenDocument,
             onFlash: onFlash,
@@ -576,10 +726,13 @@ final class MarkdownNativeLayoutView: NSView {
     private let measurementContainer = NSTextContainer()
     private var measurement: Measurement?
     private var lastMeasuredWidth: CGFloat?
+    private var preferredBodyFont: NSFont?
     private var preferredBackingScale: CGFloat = 2
     private(set) var measurementPassCount = 0
     private(set) var measurementInvalidationCount = 0
     private(set) var intrinsicInvalidationCount = 0
+    private let streamingRenderer = MarkdownStreamingRenderer()
+    private(set) var tailReplacementCount = 0
 
     override init(frame frameRect: NSRect) {
         textView = PathClickTextView(frame: .zero)
@@ -666,6 +819,33 @@ final class MarkdownNativeLayoutView: NSView {
 
     @discardableResult
     func update(
+        markdownText: String,
+        typography: ChatTypography,
+        maximumNumberOfLines: Int?,
+        onOpenDocument: ((URL) -> Void)?,
+        onFlash: ((String) -> Void)?,
+        backingScale: CGFloat
+    ) -> Bool {
+        var renderUpdate = streamingRenderer.update(text: markdownText, typography: typography)
+        if case .replace(let range, _) = renderUpdate,
+           NSMaxRange(range) > (textView.textStorage?.length ?? 0)
+            || NSMaxRange(range) > measurementStorage.length {
+            // A host/storage discontinuity is not an append lineage. Re-establish the exact
+            // full renderer state instead of risking a partial or out-of-range edit.
+            renderUpdate = streamingRenderer.reset(text: markdownText, typography: typography)
+        }
+        return update(
+            renderUpdate: renderUpdate,
+            bodyFont: typography.bodyNSFont,
+            maximumNumberOfLines: maximumNumberOfLines,
+            onOpenDocument: onOpenDocument,
+            onFlash: onFlash,
+            backingScale: backingScale
+        )
+    }
+
+    @discardableResult
+    func update(
         attributedText: NSAttributedString,
         bodyFont: NSFont,
         maximumNumberOfLines: Int?,
@@ -673,19 +853,52 @@ final class MarkdownNativeLayoutView: NSView {
         onFlash: ((String) -> Void)?,
         backingScale: CGFloat
     ) -> Bool {
-        var heightChanged = false
+        update(
+            renderUpdate: .full(attributedText),
+            bodyFont: bodyFont,
+            maximumNumberOfLines: maximumNumberOfLines,
+            onOpenDocument: onOpenDocument,
+            onFlash: onFlash,
+            backingScale: backingScale
+        )
+    }
 
-        if textView.font?.isEqual(bodyFont) != true {
+    private func update(
+        renderUpdate: MarkdownStreamingRenderer.Update,
+        bodyFont: NSFont,
+        maximumNumberOfLines: Int?,
+        onOpenDocument: ((URL) -> Void)?,
+        onFlash: ((String) -> Void)?,
+        backingScale: CGFloat
+    ) -> Bool {
+        var heightChanged = false
+        var invalidatedRange: NSRange?
+
+        if preferredBodyFont?.isEqual(bodyFont) != true {
+            preferredBodyFont = bodyFont
             textView.font = bodyFont
             heightChanged = true
         }
-        if !textView.attributedString().isEqual(to: attributedText) {
+        switch renderUpdate {
+        case .unchanged:
+            break
+        case .full(let attributedText) where !textView.attributedString().isEqual(to: attributedText):
             // Set the fallback before installing attributed runs; assigning textColor on
             // every update could overwrite path accent colors in unchanged storage.
             textView.textColor = .labelColor
             textView.textStorage?.setAttributedString(attributedText)
             measurementStorage.setAttributedString(attributedText)
             heightChanged = true
+        case .replace(let range, let tail)
+            where NSMaxRange(range) <= (textView.textStorage?.length ?? 0)
+                && NSMaxRange(range) <= measurementStorage.length:
+            textView.textStorage?.replaceCharacters(in: range, with: tail)
+            measurementStorage.replaceCharacters(in: range, with: tail)
+            invalidatedRange = NSRange(location: range.location, length: tail.length)
+            tailReplacementCount += 1
+            heightChanged = true
+        default:
+            break
         }
 
         let limit = max(0, maximumNumberOfLines ?? 0)
@@ -708,7 +921,7 @@ final class MarkdownNativeLayoutView: NSView {
         textView.onFlash = onFlash
 
         if heightChanged {
-            invalidateMeasuredHeight()
+            invalidateMeasuredHeight(characterRange: invalidatedRange)
         }
         return heightChanged
     }
@@ -772,13 +985,23 @@ final class MarkdownNativeLayoutView: NSView {
     var nativeTextFrame: NSRect { textView.frame }
     var nativeTextIsVerticallyResizable: Bool { textView.isVerticallyResizable }
     var maximumNumberOfLines: Int { textView.textContainer?.maximumNumberOfLines ?? 0 }
+    var nativeSelectedRange: NSRange {
+        get { textView.selectedRange() }
+        set { textView.setSelectedRange(newValue) }
+    }
 
-    private func invalidateMeasuredHeight() {
+    private func invalidateMeasuredHeight(characterRange: NSRange? = nil) {
         measurement = nil
         measurementInvalidationCount += 1
         if measurementStorage.length > 0 {
+            let range = characterRange.map {
+                NSRange(
+                    location: min($0.location, measurementStorage.length),
+                    length: min($0.length, measurementStorage.length - min($0.location, measurementStorage.length))
+                )
+            } ?? NSRange(location: 0, length: measurementStorage.length)
             measurementLayoutManager.invalidateLayout(
-                forCharacterRange: NSRange(location: 0, length: measurementStorage.length),
+                forCharacterRange: range,
                 actualCharacterRange: nil
             )
         }
