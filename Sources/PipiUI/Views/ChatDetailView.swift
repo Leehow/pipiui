@@ -996,108 +996,116 @@ private struct StreamingTranscriptRows: View {
                 .transition(.opacity)
             }
 
-            VStack(alignment: .leading, spacing: chatTypography.messageSpacing) {
-                ForEach(presentation.rows, id: \.id) { row in
-                    switch row {
-                    case .leaf(let item):
-                        let groupID = userTurnGroups.groupIDForRowID[item.id]
-                        let isInternalSignal = groupID != nil
-                            && !presentation.userAuthoredLeafIDs.contains(item.id)
-                        let isFoldedSignal = isInternalSignal
-                            && isUserTurnCollapsed(groupID, guarded: runningGuardedGroupIDs)
-                        if !isFoldedSignal {
-                            MessageRow(
-                                item: item,
-                                toolRuns: runs(forToolCallIds:
-                                    presentation.toolCallIDsForRowID[item.id] ?? []),
-                                subagents: subagents(forToolCallIds:
-                                    presentation.toolCallIDsForRowID[item.id] ?? []),
-                                projectURL: session.projectURL,
-                                chatFontSize: chatTypography.fontSize,
-                                sessionKey: session.bridgeRoutingKey,
-                                presentationScopeID: transcriptID(item.id),
-                                isWorking: session.isWorking,
-                                isEditing: session.editingItemId == item.id,
-                                onFlash: { session.flash($0) },
-                                onSelectAgent: selectAgent,
-                                onOpenFinishedGroup: onOpenFinishedGroup,
-                                onOpenRunningTool: onOpenRunningTool,
-                                onCopy: { session.copyItemText(item) },
-                                onResend: { session.resendUserMessage(itemId: item.id) },
-                                onBeginEdit: { session.beginEditingUserMessage(itemId: item.id) },
-                                onCancelEdit: { session.cancelEditingUserMessage() },
-                                onCommitEdit: { session.commitEditingUserMessage(newText: $0) }
-                            )
-                            .equatable()
-                            .id(transcriptID(item.id))
-                        }
-                    case .assistantRun(let id, let entryId, let segments):
-                        let groupID = userTurnGroups.groupIDForRowID[id]
-                        let isFolded = isUserTurnCollapsed(groupID, guarded: runningGuardedGroupIDs)
-                        let isGroupLastAssistant = groupID.flatMap {
-                            userTurnGroups.lastAssistantRunIDForGroupID[$0]
-                        } == id
-                        if !isFolded || isGroupLastAssistant {
-                            let callIds = presentation.toolCallIDsForRowID[id] ?? []
-                            AssistantSegmentsView(
-                                segments: segments,
-                                toolRuns: runs(forToolCallIds: callIds),
-                                subagents: subagents(forToolCallIds: callIds),
-                                projectURL: session.projectURL,
-                                onFlash: { session.flash($0) },
-                                onSelectAgent: selectAgent,
-                                sessionKey: session.bridgeRoutingKey,
-                                presentationScopeID: transcriptID(id),
-                                onOpenFinishedGroup: onOpenFinishedGroup,
-                                onOpenRunningTool: onOpenRunningTool,
-                                entryId: entryId,
-                                isWorking: session.isWorking,
-                                completionText: !browsingHistory && id == presentation.lastAssistantRunID
-                                    ? session.turnCompletionText : nil,
-                                onCopy: { session.copySegmentsText(segments) },
-                                onBranch: {
-                                    guard let entryId else { return }
-                                    session.branchFromAssistant(runLastEntryId: entryId)
-                                },
-                                onJump: {
-                                    onJump(transcriptID(
-                                        presentation.jumpTargetForAssistantRunID[id] ?? id
-                                    ))
-                                },
-                                collapsedOverride: isFolded,
-                                onCollapseToggle: {
-                                    guard let groupID else { return }
-                                    if collapsedUserTurnIDs.contains(groupID) {
-                                        collapsedUserTurnIDs.remove(groupID)
-                                    } else {
-                                        collapsedUserTurnIDs.insert(groupID)
+            // Empty production rows (the reachable initialization state) must not
+            // mount the settled container or its tracker at all: an always-declared
+            // zero-height VStack is still a real child of the outer VStack and would
+            // be counted for outer spacing, adding an extra gap of `messageSpacing`
+            // under the initializing state. With rows present this block is
+            // byte-identical to the single-anchor settled-container shape.
+            if !presentation.rows.isEmpty {
+                VStack(alignment: .leading, spacing: chatTypography.messageSpacing) {
+                    ForEach(presentation.rows, id: \.id) { row in
+                        switch row {
+                        case .leaf(let item):
+                            let groupID = userTurnGroups.groupIDForRowID[item.id]
+                            let isInternalSignal = groupID != nil
+                                && !presentation.userAuthoredLeafIDs.contains(item.id)
+                            let isFoldedSignal = isInternalSignal
+                                && isUserTurnCollapsed(groupID, guarded: runningGuardedGroupIDs)
+                            if !isFoldedSignal {
+                                MessageRow(
+                                    item: item,
+                                    toolRuns: runs(forToolCallIds:
+                                        presentation.toolCallIDsForRowID[item.id] ?? []),
+                                    subagents: subagents(forToolCallIds:
+                                        presentation.toolCallIDsForRowID[item.id] ?? []),
+                                    projectURL: session.projectURL,
+                                    chatFontSize: chatTypography.fontSize,
+                                    sessionKey: session.bridgeRoutingKey,
+                                    presentationScopeID: transcriptID(item.id),
+                                    isWorking: session.isWorking,
+                                    isEditing: session.editingItemId == item.id,
+                                    onFlash: { session.flash($0) },
+                                    onSelectAgent: selectAgent,
+                                    onOpenFinishedGroup: onOpenFinishedGroup,
+                                    onOpenRunningTool: onOpenRunningTool,
+                                    onCopy: { session.copyItemText(item) },
+                                    onResend: { session.resendUserMessage(itemId: item.id) },
+                                    onBeginEdit: { session.beginEditingUserMessage(itemId: item.id) },
+                                    onCancelEdit: { session.cancelEditingUserMessage() },
+                                    onCommitEdit: { session.commitEditingUserMessage(newText: $0) }
+                                )
+                                .equatable()
+                                .id(transcriptID(item.id))
+                            }
+                        case .assistantRun(let id, let entryId, let segments):
+                            let groupID = userTurnGroups.groupIDForRowID[id]
+                            let isFolded = isUserTurnCollapsed(groupID, guarded: runningGuardedGroupIDs)
+                            let isGroupLastAssistant = groupID.flatMap {
+                                userTurnGroups.lastAssistantRunIDForGroupID[$0]
+                            } == id
+                            if !isFolded || isGroupLastAssistant {
+                                let callIds = presentation.toolCallIDsForRowID[id] ?? []
+                                AssistantSegmentsView(
+                                    segments: segments,
+                                    toolRuns: runs(forToolCallIds: callIds),
+                                    subagents: subagents(forToolCallIds: callIds),
+                                    projectURL: session.projectURL,
+                                    onFlash: { session.flash($0) },
+                                    onSelectAgent: selectAgent,
+                                    sessionKey: session.bridgeRoutingKey,
+                                    presentationScopeID: transcriptID(id),
+                                    onOpenFinishedGroup: onOpenFinishedGroup,
+                                    onOpenRunningTool: onOpenRunningTool,
+                                    entryId: entryId,
+                                    isWorking: session.isWorking,
+                                    completionText: !browsingHistory && id == presentation.lastAssistantRunID
+                                        ? session.turnCompletionText : nil,
+                                    onCopy: { session.copySegmentsText(segments) },
+                                    onBranch: {
+                                        guard let entryId else { return }
+                                        session.branchFromAssistant(runLastEntryId: entryId)
+                                    },
+                                    onJump: {
+                                        onJump(transcriptID(
+                                            presentation.jumpTargetForAssistantRunID[id] ?? id
+                                        ))
+                                    },
+                                    collapsedOverride: isFolded,
+                                    onCollapseToggle: {
+                                        guard let groupID else { return }
+                                        if collapsedUserTurnIDs.contains(groupID) {
+                                            collapsedUserTurnIDs.remove(groupID)
+                                        } else {
+                                            collapsedUserTurnIDs.insert(groupID)
+                                        }
                                     }
-                                }
-                            )
-                            .equatable()
-                            .id(transcriptID(id))
+                                )
+                                .equatable()
+                                .id(transcriptID(id))
+                            }
                         }
                     }
                 }
-            }
-            // Stable internal anchor: the zero-height representable view sits at
-            // the bottom edge of the settled rows — the overlay chains to the
-            // settled container (the eager VStack that owns the ForEach), never
-            // to the ForEach itself, so exactly one tracker host exists and the
-            // anchor NSView keeps its identity across prepends. It precedes all
-            // bottom extras (streaming item, waiting placeholder,
-            // return-to-latest button, bottom sentinel); prepending an older
-            // page is the only thing that shifts it along the document
-            // coordinate, and bottom churn (browsingHistory toggle, token
-            // appends) never moves it. `StickToBottomTracker` finds its
-            // enclosingScrollView regardless of its own position.
-            .overlay(alignment: .bottom) {
-                StickToBottomTracker(
-                    isPinned: $session.pinTranscriptToBottom,
-                    pinEdge: .documentEnd,
-                    topLoadingEnabled: topLoadingEnabled,
-                    onReachedTop: requestHistoryPrepend
-                )
+                // Stable internal anchor: the zero-height representable view sits at
+                // the bottom edge of the settled rows — the overlay chains to the
+                // settled container (the eager VStack that owns the ForEach), never
+                // to the ForEach itself, so exactly one tracker host exists and the
+                // anchor NSView keeps its identity across prepends. It precedes all
+                // bottom extras (streaming item, waiting placeholder,
+                // return-to-latest button, bottom sentinel); prepending an older
+                // page is the only thing that shifts it along the document
+                // coordinate, and bottom churn (browsingHistory toggle, token
+                // appends) never moves it. `StickToBottomTracker` finds its
+                // enclosingScrollView regardless of its own position.
+                .overlay(alignment: .bottom) {
+                    StickToBottomTracker(
+                        isPinned: $session.pinTranscriptToBottom,
+                        pinEdge: .documentEnd,
+                        topLoadingEnabled: topLoadingEnabled,
+                        onReachedTop: requestHistoryPrepend
+                    )
+                }
             }
 
             if !browsingHistory,

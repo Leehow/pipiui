@@ -233,6 +233,62 @@ final class OverlayAnchorGeometryIntegrationTests: XCTestCase {
         )
     }
 
+    // MARK: - Empty production shape (the reviewer's spacing gap)
+
+    /// Empty production rows (the reachable initialization state) must not
+    /// mount the settled container or its tracker: with the guard, `rows == []`
+    /// yields exactly ONE outer spacing (before marker ↔ bottom-extra marker),
+    /// while the pre-fix always-declared zero-height container was still a real
+    /// outer-VStack child and added a SECOND spacing gap (the 16-28pt reviewer
+    /// finding). Once rows become non-empty the same production probe must
+    /// mount exactly one tracker; identity / +117 / churn-0 stay pinned by
+    /// `testProductionShapedSettledContainerOverlayAnchorGeometry`.
+    func testEmptyProductionShapeOmitsSettledContainerAndExtraOuterSpacing() throws {
+        let harness = try makeHarness(scene: .production)
+        defer { harness.teardown() }
+
+        // Phase A — empty rows: zero tracker hosts, and the document height is
+        // exactly before-marker + bottom-extra + ONE outer spacing. The
+        // pre-fix shape would add the empty container (height 0) as a third
+        // child and measure +`spacing` taller.
+        harness.setRows([])
+        let empty = harness.settleAndSnapshot()
+        let singleSpacingHeight = ProbeConstants.beforeMarkerHeight
+            + ProbeConstants.bottomExtraHeight
+            + ProbeConstants.spacing
+        print("EMPTY PROBE route: \(harness.routeDescription)")
+        print("EMPTY PROBE hosts=\(empty.allHosts.count) docHeight=\(empty.documentHeight) "
+            + "(single-spacing expected \(singleSpacingHeight))")
+        XCTAssertEqual(
+            empty.allHosts.count, 0,
+            "empty production rows must mount ZERO tracker hosts"
+        )
+        XCTAssertEqual(
+            empty.documentHeight, singleSpacingHeight, accuracy: 1.0,
+            "empty shape must keep exactly ONE outer spacing — an always-declared zero-height settled container would add a second one"
+        )
+
+        // Phase B — rows arrive: exactly one tracker mounts and the document
+        // grows by rows * (row + spacing): the settled window (5 rows + 4 inner
+        // gaps) plus the one outer gap the container now legitimately gets.
+        harness.setRows([1, 2, 3, 4, 5])
+        let populated = harness.settleAndSnapshot()
+        print("EMPTY PROBE populated hosts=\(populated.allHosts.count) "
+            + "docHeight=\(populated.documentHeight) "
+            + "delta=\(populated.documentHeight - empty.documentHeight) "
+            + "(expected \(5 * (ProbeConstants.rowHeight + ProbeConstants.spacing)))")
+        XCTAssertEqual(
+            populated.allHosts.count, 1,
+            "non-empty rows must mount exactly ONE tracker host"
+        )
+        XCTAssertEqual(
+            populated.documentHeight - empty.documentHeight,
+            5 * (ProbeConstants.rowHeight + ProbeConstants.spacing),
+            accuracy: 1.0,
+            "populating 5 rows must add exactly 5 * (row + spacing)"
+        )
+    }
+
     // MARK: - Harness routing
 
     /// Route 1: plain `NSHostingView` document, no window (repo precedent in
@@ -284,6 +340,7 @@ private enum ProbeError: Error {
 private enum ProbeConstants {
     static let rowHeight: CGFloat = 30
     static let spacing: CGFloat = 9
+    static let beforeMarkerHeight: CGFloat = 40
     static let bottomExtraHeight: CGFloat = 60
 }
 
@@ -358,22 +415,34 @@ private struct LegacyProbeTranscriptContent: View {
     }
 }
 
-/// Mirror of the FIXED production transcript content: the settled `ForEach`
-/// lives inside its own real eager `VStack` container (same spacing as the
-/// outer VStack), the tracker overlay attaches to THAT container, and bottom
-/// extras follow after it in the outer VStack.
+/// Mirror of the FIXED production transcript content: a fixed outer marker,
+/// then the settled `ForEach` inside its own real eager `VStack` container
+/// (same spacing as the outer VStack) guarded by `if !presentation.rows.isEmpty`
+/// — empty rows (the reachable initialization state) must not mount the
+/// container or its tracker at all, otherwise the outer VStack counts the
+/// zero-height container as a real child and adds one extra spacing gap — and
+/// the tracker overlay attaches to THAT container, with bottom extras
+/// following after it in the outer VStack.
 private struct ProbeTranscriptContent: View {
     @ObservedObject var model: ProbeModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: ProbeConstants.spacing) {
-            VStack(alignment: .leading, spacing: ProbeConstants.spacing) {
-                ForEach(model.rows, id: \.self) { index in
-                    ProbeRowView(index: index)
+            // Fixed before marker — always present above the settled window,
+            // mirrors the outer VStack's pinned-gravity spacer / init state.
+            Rectangle()
+                .fill(Color.purple.opacity(0.25))
+                .frame(width: 300, height: ProbeConstants.beforeMarkerHeight)
+                .overlay(Text("before-marker").font(.system(size: 9)))
+            if !model.rows.isEmpty {
+                VStack(alignment: .leading, spacing: ProbeConstants.spacing) {
+                    ForEach(model.rows, id: \.self) { index in
+                        ProbeRowView(index: index)
+                    }
                 }
-            }
-            .overlay(alignment: .bottom) {
-                ProbeAnchorRepresentable()
+                .overlay(alignment: .bottom) {
+                    ProbeAnchorRepresentable()
+                }
             }
             // Bottom extras — after the settled container, mirrors production's
             // streaming item / return button / bottom sentinel.

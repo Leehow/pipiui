@@ -456,6 +456,16 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
             transcript.range(of: ".id(transcriptID(\"bottom\"))")?.lowerBound
         )
         XCTAssertLessThan(rows, tracker, "anchor must follow the settled rows")
+        // Empty production rows (the reachable initialization state) must not
+        // mount the settled container at all: an always-declared zero-height
+        // VStack is still a real child of the outer VStack and would be counted
+        // for outer spacing (an extra `messageSpacing` gap). The guard must sit
+        // before the container, and the tracker overlay must stay inside it.
+        let emptyRowsGuard = try XCTUnwrap(
+            transcript.range(of: "if !presentation.rows.isEmpty {")?.lowerBound
+        )
+        XCTAssertLessThan(emptyRowsGuard, rows, "the empty-rows guard must precede the settled container")
+        XCTAssertLessThan(emptyRowsGuard, tracker, "the empty-rows guard must precede the tracker overlay")
         XCTAssertLessThan(tracker, streaming, "anchor must precede the streaming item")
         XCTAssertLessThan(tracker, waiting, "anchor must precede the waiting placeholder")
         XCTAssertLessThan(tracker, returnButton, "anchor must precede the return button")
@@ -472,10 +482,11 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         // coordinates. Exactly one tracker may be mounted in the transcript.
         XCTAssertTrue(
             source.contains(
-                "VStack(alignment: .leading, spacing: chatTypography.messageSpacing) {\n"
-                    + "                ForEach(presentation.rows, id: \\.id)"
+                "if !presentation.rows.isEmpty {\n"
+                    + "                VStack(alignment: .leading, spacing: chatTypography.messageSpacing) {\n"
+                    + "                    ForEach(presentation.rows, id: \\.id)"
             ),
-            "the settled ForEach must sit inside its own eager VStack container"
+            "the settled ForEach must sit inside its own eager VStack container behind the empty-rows guard"
         )
         XCTAssertEqual(
             transcript.components(separatedBy: "StickToBottomTracker(").count - 1, 1,
