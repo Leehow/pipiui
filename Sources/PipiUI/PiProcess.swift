@@ -240,7 +240,7 @@ final class PiProcess {
     func signalDescendants(_ sig: Int32) {
         guard isRunning else { return }
         let pid = process.processIdentifier
-        Self.signalQueue.async { [process] in
+        Self.signalQueue.async {
             Self.signalChildren(of: pid, signal: sig)
         }
     }

@@ -3866,6 +3866,7 @@ final class ChatSession: ObservableObject, Identifiable {
     func shutdown(onExited: (() -> Void)? = nil) {
         // Any pending stop escalation must not outlive the kill path it triggers.
         cancelStopEscalation()
+        isStopping = false
         processStartCancelled = true
         cancelSideChannelTitle()
         unbindQuotaMonitor()
