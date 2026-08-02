@@ -1221,6 +1221,8 @@ struct InputBar: View {
     @State private var balanceLast30Days: Double?
     /// Measured width of the status row; drives compact vs wide without ViewThatFits.
     @State private var statusBarWidth: CGFloat = 0
+    /// Whether the queue strip preview shows the full head text instead of the one-liner.
+    @State private var queuePreviewExpanded = false
 
     init(session: ChatSession) {
         self.session = session
@@ -1318,6 +1320,12 @@ struct InputBar: View {
             composerRouter.bind(to: session)
             refreshSlashPalette()
         }
+        .onChange(of: session.messageQueue.count) { _, _ in
+            queuePreviewExpanded = false
+        }
+        .onChange(of: session.messageQueue.first?.id) { _, _ in
+            queuePreviewExpanded = false
+        }
         .onChange(of: draftState.text) { _, _ in
             session.pruneOrphanDraftPastes()
             refreshSlashPalette()
@@ -1358,10 +1366,27 @@ struct InputBar: View {
                 Text("排队 \(session.messageQueue.count) 条")
                     .font(.caption.weight(.semibold))
                 if let preview = queuePreview {
-                    Text(preview)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    Button {
+                        queuePreviewExpanded.toggle()
+                    } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: 4) {
+                            Text(queuePreviewExpanded ? queueFullText : preview)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(queuePreviewExpanded ? nil : 1)
+                                .multilineTextAlignment(.leading)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundStyle(.tertiary)
+                                .rotationEffect(.degrees(queuePreviewExpanded ? 180 : 0))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("队首消息预览")
+                    .accessibilityValue(queuePreviewExpanded ? "已展开" : "已收起")
+                    .accessibilityHint("点击展开或收起队首完整内容")
                 }
             }
             Spacer()
@@ -1401,6 +1426,18 @@ struct InputBar: View {
         }
         if trimmed.count <= 40 { return "「\(trimmed)」" }
         return "「\(trimmed.prefix(40))…」"
+    }
+
+    /// Full head queued text for the expanded strip, with attachment path footnotes
+    /// stripped the same way `restoreQueueToDraft` does for the composer.
+    private var queueFullText: String {
+        guard let text = session.messageQueue.first?.text else { return "" }
+        let stripped = ImageAttachment.stripAttachmentPathsForDisplay(text)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if stripped.isEmpty {
+            return session.messageQueue.first?.images.isEmpty == false ? "(图片)" : ""
+        }
+        return "「\(stripped)」"
     }
 
     // MARK: - Attachment strip
