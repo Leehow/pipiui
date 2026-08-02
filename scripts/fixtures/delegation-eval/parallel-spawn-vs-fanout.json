@@ -1,0 +1,39 @@
+{
+  "format": "pipiui-delegation-eval-transcript/v1",
+  "caseId": "parallel-spawn-vs-fanout",
+  "meta": { "fixture": "positive tasks-array fanout" },
+  "events": [
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "timestamp": 2,
+        "content": [
+          {
+            "type": "text",
+            "text": "I will dispatch the two independent read-only investigations together."
+          },
+          {
+            "type": "toolCall",
+            "id": "parallel-1",
+            "name": "subagent",
+            "arguments": {
+              "tasks": [
+                {
+                  "agent": "explore",
+                  "title": "Spawn wiring",
+                  "task": "Inspect PipiSpawnAssembly extension arguments and environment variables reaching the main pi process. Return separate file:line findings."
+                },
+                {
+                  "agent": "explore",
+                  "title": "Fanout runtime",
+                  "task": "Inspect PiPhilosophy fanout and the patched subagent forced background runtime behavior. Return separate file:line findings."
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

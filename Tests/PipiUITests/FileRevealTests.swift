@@ -285,9 +285,18 @@ final class FileRevealTests: XCTestCase {
         let file = dir.appendingPathComponent("sample.txt")
         try Data("hello".utf8).write(to: file)
 
-        // activateFileViewerSelecting should succeed for an existing file
+        // Stub the seam: asserting on the real Finder would leave stray windows
+        // behind, because the reveal is async and `defer` deletes `dir` first.
+        let previous = FileReveal.revealHandler
+        defer { FileReveal.revealHandler = previous }
+        var revealed: [[URL]] = []
+        FileReveal.revealHandler = { revealed.append($0) }
+
         XCTAssertTrue(FileReveal.revealInFinder(path: file.path))
         XCTAssertTrue(FileReveal.revealInFinder(url: file))
+        XCTAssertEqual(revealed.count, 2)
+        XCTAssertEqual(revealed.first?.first?.path, file.path)
+        XCTAssertEqual(revealed.last?.first?.path, file.path)
     }
 
     func testMissingPathMessage() {

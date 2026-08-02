@@ -1,0 +1,21 @@
+[Unit]
+Description=PipiUI Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pipiui-relay
+Group=pipiui-relay
+WorkingDirectory=/opt/pipiui-relay
+EnvironmentFile=/etc/pipiui-relay.env
+ExecStart=/usr/bin/node /opt/pipiui-relay/dist/tunnel-server.js
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

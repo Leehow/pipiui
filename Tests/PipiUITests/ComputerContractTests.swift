@@ -147,7 +147,7 @@ final class ComputerContractTests: XCTestCase {
     }
 
     func testProviderAndMountContractsRemainSeparated() throws {
-        let source = ComputerUseExtension.source
+        let source = try ComputerUseStrategyResource.bundledSource()
         XCTAssertTrue(source.contains(#"type: "computer_20251124""#))
         XCTAssertTrue(source.contains("computer-use-2025-11-24"))
         XCTAssertTrue(source.contains("mergeBeta("))
@@ -158,6 +158,9 @@ final class ComputerContractTests: XCTestCase {
         XCTAssertTrue(source.contains("result.screenshotId"))
         XCTAssertTrue(source.contains("injectInMemoryScreenshots("))
         XCTAssertTrue(source.contains("PIPIUI_COMPUTER_CAPABILITY"))
+        XCTAssertTrue(source.contains(#"action: "computer_runtime_capabilities""#))
+        XCTAssertTrue(source.contains("protocolVersion: RUNTIME_VERSION"))
+        XCTAssertTrue(source.contains("export async function negotiateRuntime"))
         XCTAssertTrue(source.contains("computerCapability: COMPUTER_CAPABILITY"))
         XCTAssertTrue(source.contains(#"action: "computer_cancel""#))
         XCTAssertTrue(source.contains("externalSignal?: AbortSignal"))
@@ -248,6 +251,8 @@ final class ComputerContractTests: XCTestCase {
             .deletingLastPathComponent()
         let chat = try String(contentsOf:
             root.appendingPathComponent("Sources/PipiUI/ChatSession.swift"))
+        let assembly = try String(contentsOf:
+            root.appendingPathComponent("Sources/PipiUI/PipiSpawnAssembly.swift"))
         let coordinator = try String(contentsOf:
             root.appendingPathComponent(
                 "Sources/PipiUI/Computer/ComputerCoordinatorExecution.swift"
@@ -260,11 +265,11 @@ final class ComputerContractTests: XCTestCase {
         let audit = try String(contentsOf:
             root.appendingPathComponent("Sources/PipiUI/Computer/ComputerAudit.swift"))
 
-        XCTAssertTrue(chat.contains(
-            "if computerCaptureDescriptor != nil, let computerUseExtension"
+        XCTAssertTrue(assembly.contains(
+            "input.computerDescriptor != nil,"
         ))
-        XCTAssertTrue(chat.contains(
-            "args += ToolSkillSettings.excludeToolsCLIArgs()"
+        XCTAssertTrue(assembly.contains(
+            "args += input.excludeToolsArgs"
         ))
         XCTAssertTrue(subagent.contains("PIPIUI_COMPUTER_EXT"))
         XCTAssertTrue(subagent.contains("resolveSubagentToolSelection({"))
@@ -284,8 +289,8 @@ final class ComputerContractTests: XCTestCase {
             childEnvStart.lowerBound..<childSpawnStart.lowerBound
         ]
         XCTAssertTrue(childEnvBlock.contains("}, true);"))
-        XCTAssertTrue(chat.contains(
-            #"extraEnv["PIPIUI_COMPUTER_EXT"] = computerUseExtension"#
+        XCTAssertTrue(assembly.contains(
+            #"env["PIPIUI_COMPUTER_EXT"] = p"#
         ))
         XCTAssertTrue(coordinator.contains(
             "Every non-cancelled accepted batch returns one fresh in-memory screenshot"
@@ -299,7 +304,7 @@ final class ComputerContractTests: XCTestCase {
         XCTAssertFalse(audit.contains("pngData"))
     }
 
-    func testGeneratedExtensionProviderAndMemoryOnlyTransforms() throws {
+    func testBundledStrategyProviderAndMemoryOnlyTransforms() throws {
         let jiti = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(
                 ".npm-global/lib/node_modules/@earendil-works/"
@@ -324,7 +329,11 @@ final class ComputerContractTests: XCTestCase {
             at: temporaryNodeModules.appendingPathComponent("typebox"),
             withDestinationURL: installedNodeModules.appendingPathComponent("typebox")
         )
-        _ = try XCTUnwrap(ComputerUseExtension.install(into: directory))
+        try ComputerUseStrategyResource.bundledSource().write(
+            to: directory.appendingPathComponent("pipiui-computer-use.ts"),
+            atomically: true,
+            encoding: .utf8
+        )
         let harness = directory.appendingPathComponent("harness.ts")
         let script = #"""
 import computerExtension, {
@@ -431,6 +440,14 @@ const bridgedBodies: any[] = [];
   }
   return {
     async json() {
+      if (bridgedBody.action === "computer_runtime_capabilities") {
+        return {
+          ok: true,
+          protocol: { name: "pipiui-computer-runtime", version: 1 },
+          display: { id: 7, width: 1440, height: 900 },
+          features: { nativeOpenAIComputerCall: false },
+        };
+      }
       const opened = bridgedBody.action === "computer_open_application";
       return {
         ok: true,
@@ -470,8 +487,19 @@ const bridgedBodies: any[] = [];
     "open-call-id",
     { bundle_identifier: "com.google.Chrome" },
   );
-  const batchBody = bridgedBodies[0];
-  const openBody = bridgedBodies[1];
+  const capabilitiesBody = bridgedBodies.find(
+    (body) => body.action === "computer_runtime_capabilities",
+  );
+  const batchBody = bridgedBodies.find(
+    (body) =>
+      body.action === "computer_batch"
+      && body.actions?.[0]?.type === "screenshot",
+  );
+  const openBody = bridgedBodies.find(
+    (body) =>
+      body.action === "computer_open_application"
+      && body.bundle_identifier === "com.google.Chrome",
+  );
   const batchAbortController = new AbortController();
   const batchAbortPromise = computerTool.execute(
     "batch-abort-call-id",
@@ -541,8 +569,12 @@ const bridgedBodies: any[] = [];
       mergeBeta("x,computer-use-2025-11-24", "computer-use-2025-11-24")
         === "x,computer-use-2025-11-24",
     bridgeCapabilities:
-      batchBody.sessionKey === "test-capability"
+      capabilitiesBody.protocolVersion === 1
+      && capabilitiesBody.sessionKey === "test-capability"
+      && capabilitiesBody.computerCapability === "test-computer-capability"
+      && batchBody.sessionKey === "test-capability"
       && batchBody.computerCapability === "test-computer-capability"
+      && batchBody.protocolVersion === 1
       && batchBody.displayID === 7
       && batchBody.displayWidth === 1440
       && batchBody.displayHeight === 900
@@ -567,6 +599,7 @@ const bridgedBodies: any[] = [];
       && !("url" in openBody)
       && openBody.sessionKey === "test-capability"
       && openBody.computerCapability === "test-computer-capability"
+      && openBody.protocolVersion === 1
       && openBody.displayID === 7
       && typeof openBody.requestID === "string"
       && openBody.requestID.length > 20,
@@ -622,14 +655,16 @@ const bridgedBodies: any[] = [];
       && batchCancelBody?.requestID === abortedBatchBody.requestID
       && batchCancelBody?.sessionKey === "test-capability"
       && batchCancelBody?.computerCapability
-        === "test-computer-capability",
+        === "test-computer-capability"
+      && batchCancelBody?.protocolVersion === 1,
     openAbortSignal:
       openAbortRejected
       && typeof abortedOpenBody?.requestID === "string"
       && openCancelBody?.requestID === abortedOpenBody.requestID
       && openCancelBody?.sessionKey === "test-capability"
       && openCancelBody?.computerCapability
-        === "test-computer-capability",
+        === "test-computer-capability"
+      && openCancelBody?.protocolVersion === 1,
     resultMarkerOnly:
       executed.content.length === 1
       && executed.content[0].type === "text"
@@ -672,7 +707,6 @@ const bridgedBodies: any[] = [];
                 "PIPIUI_SESSION_KEY": "test-capability",
                 "PIPIUI_COMPUTER_CAPABILITY": "test-computer-capability",
                 "PIPIUI_COMPUTER_DISPLAY_ID": "7",
-                // Pin geometry so host PIPIUI_COMPUTER_* env cannot flake the contract.
                 "PIPIUI_COMPUTER_WIDTH": "1440",
                 "PIPIUI_COMPUTER_HEIGHT": "900",
             ],

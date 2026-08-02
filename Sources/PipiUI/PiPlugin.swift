@@ -2,8 +2,8 @@ import Foundation
 
 /// App 自有的 pi 插件集合，安装到 Application Support 后通过 `-e` 加载。
 ///
-/// 设计目标：所有对 pi 行为的扩展都由 App 拥有并在每次启动时重装，
-/// 完全独立于 `~/.pi`——pi 升级、重装示例、重置用户配置都不影响我们。
+/// 设计目标：内置扩展以资源形式随 App 发布并安装到 Application Support。
+/// Computer Use 还允许用户选择外部 Pi strategy；外部路径不会被复制或覆盖。
 ///
 /// - 补丁版 subagent 扩展（生命周期上报 + 深度护栏 + agent 树身份），通过 `-e` 加载。
 ///   注意：pi 对同名工具是**硬失败**（重名 → error 诊断 → `process.exit(1)`），
@@ -30,18 +30,14 @@ enum PiPlugin {
         var claudeServerToolsExtension: String? // -e anthropic hosted web_search
         var computerUseExtension: String? // -e opt-in desktop computer harness
         var agentsDir: String?     // PIPIUI_AGENTS_DIR
+        /// Set when the PiExt copy did not happen, so the fingerprint is not persisted and the
+        /// next launch retries instead of trusting a stale tree.
+        var piExtFailure: String?
     }
 
     private static var root: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("PipiUI")
-    }
-
-    /// ChatSession is constructed from an Installed value in AppStore, but keeping this
-    /// path app-owned avoids widening that already-large initializer solely for one guard.
-    static var searchScopeExtensionPath: String? {
-        let path = root.appendingPathComponent("pipiui-search-scope.ts").path
-        return FileManager.default.fileExists(atPath: path) ? path : nil
     }
 
     /// 启动指纹标记：上次完整安装时的插件指纹，未变更则整轮跳过（第二次启动基本零 I/O）。
@@ -65,15 +61,36 @@ enum PiPlugin {
             return existing
         }
         let result = performInstall()
-        try? fingerprint.write(to: markerURL, atomically: true, encoding: .utf8)
+        // The marker means "this fingerprint is installed". Writing it after a failed copy is
+        // what turned a one-off error into a permanent one: the next launch matched the marker,
+        // took the skip path, and adopted the stale tree as if it were current.
+        if result.piExtFailure == nil {
+            try? fingerprint.write(to: markerURL, atomically: true, encoding: .utf8)
+        } else {
+            try? fm.removeItem(at: markerURL)
+        }
         return result
     }
 
+    /// Pure startup gate: both the built-in master and the legacy
+    /// auto-register preference must allow registration, and the installed
+    /// extension must exist. This prevents an old/missing auto-register key from
+    /// resurrecting philosophy after the new master switch is off.
+    static func shouldSyncPhilosophyRegistration(
+        defaults: UserDefaults = .standard,
+        extensionAvailable: Bool
+    ) -> Bool {
+        BuiltInFeatureSettings.isEnabled(.philosophy, defaults: defaults)
+            && PhilosophyPackage.autoRegisterEnabled(defaults: defaults)
+            && extensionAvailable
+    }
+
     /// Keep pi's package list in step with the user's choice. A deliberate "移除" is remembered,
-    /// so this never re-adds what the user removed.
+    /// and the built-in master is the hard upper bound.
     private static func syncPhilosophyRegistration() {
-        guard PhilosophyPackage.autoRegisterEnabled() else { return }
-        guard PhilosophyPackage.extensionPath != nil else { return }
+        guard shouldSyncPhilosophyRegistration(
+            extensionAvailable: PhilosophyPackage.extensionPath != nil
+        ) else { return }
         try? PhilosophyPackage.register()
     }
 
@@ -133,13 +150,17 @@ enum PiPlugin {
             ("pipiui-search-scope.ts", \.searchScopeExtension),
             ("pipiui-codex-server-tools.ts", \.codexServerToolsExtension),
             ("pipiui-claude-server-tools.ts", \.claudeServerToolsExtension),
-            ("pipiui-computer-use.ts", \.computerUseExtension),
         ]
         for (name, keyPath) in files {
             let path = root.appendingPathComponent(name).path
             guard fm.fileExists(atPath: path) else { return nil }
             result[keyPath: keyPath] = path
         }
+        let builtInComputerStrategy = root
+            .appendingPathComponent("pi-ext")
+            .appendingPathComponent(ComputerUseStrategyResource.fileName)
+        guard fm.fileExists(atPath: builtInComputerStrategy.path) else { return nil }
+        result.computerUseExtension = builtInComputerStrategy.path
         guard PhilosophyPackage.extensionPath != nil else { return nil }
         return result
     }
@@ -154,7 +175,24 @@ enum PiPlugin {
             ?? PipiResourceBundle.shared.resourceURL?.appendingPathComponent("PiExt", isDirectory: true)
         if let bundled = bundledPiExt, fm.fileExists(atPath: bundled.path) {
             let dest = root.appendingPathComponent("pi-ext")
-            try? fm.removeItem(at: dest)
+            // A single undeletable file — one `chflags uchg` is enough — fails the remove, and
+            // then the copy fails because dest still exists. Both used to be swallowed. Sessions
+            // survived on the bundle fallbacks below, but nothing said so: the install failed on
+            // every launch for six days, in silence, and left a stale tree that read like the
+            // live one. A fallback that quietly becomes the permanent path is not a fallback.
+            do {
+                try fm.removeItem(at: dest)
+            } catch CocoaError.fileNoSuchFile {
+                // Nothing installed yet; the copy below is the first install.
+            } catch {
+                result.piExtFailure = "无法清除旧的 pi-ext（\(error.localizedDescription)）"
+                Log.error(
+                    "pi-ext install: cannot remove \(dest.path): \(error). "
+                        + "A locked or unwritable file there pins the extension at its old version; "
+                        + "check `ls -lO` for a uchg flag.",
+                    category: .process
+                )
+            }
             do {
                 try fm.copyItem(at: bundled, to: dest)
                 let subagent = dest.appendingPathComponent("subagent")
@@ -165,8 +203,23 @@ enum PiPlugin {
                 if fm.fileExists(atPath: agents.path) {
                     result.agentsDir = agents.path
                 }
+                let computerStrategy = dest.appendingPathComponent(
+                    ComputerUseStrategyResource.fileName
+                )
+                if fm.fileExists(atPath: computerStrategy.path) {
+                    result.computerUseExtension = computerStrategy.path
+                }
             } catch {
-                // 拷贝失败时降级：subagent 面板仍能用（依赖用户自装的），只是没补丁
+                // 降级到下面的 bundle 路径，会话仍是当前代码；但必须留痕，
+                // 否则 Application Support 里那份陈旧副本会一直冒充在跑的版本。
+                result.piExtFailure = result.piExtFailure
+                    ?? "无法安装 pi-ext（\(error.localizedDescription)）"
+                Log.error(
+                    "pi-ext install: copy \(bundled.path) -> \(dest.path) failed: \(error). "
+                        + "Falling back to the bundle copy; the tree under Application Support "
+                        + "is now stale and must not be read as what sessions run.",
+                    category: .process
+                )
             }
         }
         // If Application Support is stale/incomplete, still point at the bundle agents.
@@ -179,6 +232,13 @@ enum PiPlugin {
            let bundledSub = bundledPiExt?.appendingPathComponent("subagent"),
            fm.fileExists(atPath: bundledSub.path) {
             result.subagentDir = bundledSub.path
+        }
+        if result.computerUseExtension == nil,
+           let bundledComputerStrategy = bundledPiExt?.appendingPathComponent(
+                ComputerUseStrategyResource.fileName
+           ),
+           fm.fileExists(atPath: bundledComputerStrategy.path) {
+            result.computerUseExtension = bundledComputerStrategy.path
         }
 
         // 2. 内置浏览器扩展（字符串生成，无外部依赖）
@@ -208,8 +268,8 @@ enum PiPlugin {
         // 5.8 官方 anthropic-messages hosted web_search
         result.claudeServerToolsExtension = ClaudeServerToolsExtension.install(into: root)
 
-        // 5.9 macOS Computer Use（仅安装；独立 opt-in 决定 ChatSession 是否 -e 挂载）
-        result.computerUseExtension = ComputerUseExtension.install(into: root)
+        // 5.9 macOS Computer Use 的默认策略已随 PiExt 资源复制。Swift 不生成、
+        // 不覆盖策略源码；独立 opt-in 与策略选择决定 ChatSession 挂载哪个 -e。
 
         // 6. 工作哲学：随包快照落盘（注册进 pi 由 syncPhilosophyRegistration 负责）
         PhilosophyPackage.install()

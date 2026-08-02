@@ -84,6 +84,10 @@ enum ModelPricing {
         init(bundledJSON: Data? = nil) {
             loadBundled(bundledJSON)
             applyHardcodedOverrides()
+            // Seed a web-refreshed rate when one was persisted (Settings → 通用).
+            if let stored = FXRateStore.storedRate() {
+                usdToCny = stored
+            }
         }
 
         var exchangeRate: Double {
@@ -94,6 +98,13 @@ enum ModelPricing {
         func setExchangeRate(_ rate: Double) {
             guard rate > 0, rate.isFinite else { return }
             lock.lock(); usdToCny = rate; lock.unlock()
+        }
+
+        /// Web refresh path: fetch → persist → update in-memory rate (single writer).
+        func refreshExchangeRateFromWeb() async -> Double? {
+            guard let rate = await FXRateStore.refreshFromWeb() else { return nil }
+            setExchangeRate(rate)
+            return rate
         }
 
         /// Resolve a rate card for a ledger `model` string (`provider/id` or bare id).

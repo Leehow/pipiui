@@ -69,8 +69,158 @@ final class AssistantBlockLayoutTests: XCTestCase {
         XCTAssertEqual(plan, [
             .finishedGroup([tool("1", "read"), tool("2", "bash")]),
             .image(img),
-            .finishedGroup([tool("3", "edit"), tool("4", "read")]),
+            .singleton(tool("3", "edit")),
+            .singleton(tool("4", "read")),
         ])
+    }
+
+    func testTranscriptEditsEndIndependentGroupsAcrossAssistantMessages() {
+        let items: [ChatItem] = [
+            ChatItem(id: "a1", role: "assistant", blocks: [
+                .thinking("before first"),
+                tool("edit-1", "edit"),
+            ]),
+            ChatItem(id: "a2", role: "assistant", blocks: [
+                tool("status", "subagent_status"),
+                .thinking("before second"),
+            ]),
+            ChatItem(id: "a3", role: "assistant", blocks: [
+                tool("edit-2", "edit"),
+                tool("subagent", "subagent"),
+            ]),
+        ]
+
+        let rows = AssistantBlockLayout.planTranscript(items: items)
+
+        XCTAssertEqual(rows.count, 1)
+        guard case .assistantRun(let id, _, let segments)? = rows.first else {
+            return XCTFail("expected one coalesced assistant run")
+        }
+        XCTAssertEqual(id, "a3")
+        XCTAssertEqual(segments, [
+            .finishedGroup([
+                .thinking("before first"),
+                tool("edit-1", "edit"),
+            ]),
+            .finishedGroup([
+                tool("status", "subagent_status"),
+                .thinking("before second"),
+                tool("edit-2", "edit"),
+            ]),
+            .singleton(tool("subagent", "subagent")),
+        ])
+    }
+
+    func testEditIsIncludedAtEndOfPrecedingSegment() {
+        let blocks: [ChatBlock] = [
+            tool("read", "read"),
+            .thinking("editing"),
+            tool("edit", "edit"),
+            tool("after", "bash"),
+            .thinking("after edit"),
+        ]
+
+        XCTAssertEqual(
+            AssistantBlockLayout.plan(blocks: blocks, groupFinished: true),
+            [
+                .finishedGroup([
+                    tool("read", "read"),
+                    .thinking("editing"),
+                    tool("edit", "edit"),
+                ]),
+                .finishedGroup([
+                    tool("after", "bash"),
+                    .thinking("after edit"),
+                ]),
+            ]
+        )
+    }
+
+    func testWriteDoesNotEndFinishedGroup() {
+        let blocks: [ChatBlock] = [
+            .thinking("before"),
+            tool("write", "write"),
+            tool("read", "read"),
+            .thinking("after"),
+        ]
+
+        XCTAssertEqual(
+            AssistantBlockLayout.plan(blocks: blocks, groupFinished: true),
+            [.finishedGroup(blocks)]
+        )
+    }
+
+    func testEditLeavesSingleTrailingGroupableBlockAsSingleton() {
+        let blocks: [ChatBlock] = [
+            .thinking("before"),
+            tool("edit", "edit"),
+            tool("after", "subagent_status"),
+        ]
+
+        XCTAssertEqual(
+            AssistantBlockLayout.plan(blocks: blocks, groupFinished: true),
+            [
+                .finishedGroup([
+                    .thinking("before"),
+                    tool("edit", "edit"),
+                ]),
+                .singleton(tool("after", "subagent_status")),
+            ]
+        )
+    }
+
+    /// In-flight tool calls stay visible as singletons even when the assistant item is settled.
+    func testRunningToolCallStaysSingletonWhileSiblingsGroup() {
+        let blocks: [ChatBlock] = [
+            .thinking("a"),
+            tool("1", "read"),
+            tool("2", "bash"),
+            tool("3", "grep"),
+            .thinking("b"),
+        ]
+        let runs: [String: ToolRun] = [
+            "2": ToolRun(isRunning: true, output: "partial…"),
+        ]
+        let plan = AssistantBlockLayout.plan(blocks: blocks, groupFinished: true, toolRuns: runs)
+        XCTAssertEqual(plan, [
+            .finishedGroup([.thinking("a"), tool("1", "read")]),
+            .singleton(tool("2", "bash")),
+            .finishedGroup([tool("3", "grep"), .thinking("b")]),
+        ])
+    }
+
+    /// When the only non-text neighbors of a running tool are finished, they still collapse together
+    /// once the runner is peeled out as a singleton.
+    func testRunningToolCallAloneBreaksFinishedGroup() {
+        let blocks: [ChatBlock] = [
+            tool("1", "read"),
+            tool("2", "bash"),
+        ]
+        let runs: [String: ToolRun] = [
+            "2": ToolRun(isRunning: true),
+        ]
+        XCTAssertEqual(
+            AssistantBlockLayout.plan(blocks: blocks, groupFinished: true, toolRuns: runs),
+            [
+                .singleton(tool("1", "read")),
+                .singleton(tool("2", "bash")),
+            ]
+        )
+    }
+
+    /// Finished runs group normally again after isRunning clears.
+    func testFinishedToolCallGroupsAfterRunEnds() {
+        let blocks: [ChatBlock] = [
+            tool("1", "read"),
+            tool("2", "bash"),
+        ]
+        let runs: [String: ToolRun] = [
+            "2": ToolRun(isRunning: false, output: "done"),
+        ]
+        XCTAssertEqual(
+            AssistantBlockLayout.plan(blocks: blocks, groupFinished: true, toolRuns: runs),
+            [.finishedGroup([tool("1", "read"), tool("2", "bash")])]
+        )
     }
 
     /// Tool result thumbnails live on ToolRun — those toolCalls must stay outside finished groups.

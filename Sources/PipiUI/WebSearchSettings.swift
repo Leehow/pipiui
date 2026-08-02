@@ -92,9 +92,17 @@ enum WebSearchSettings {
 
     static func syncJSONFile(
         defaults: UserDefaults = .standard,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        to explicitURL: URL? = nil
     ) {
-        let url = configFileURL(fileManager: fileManager)
+        // Only the live app may write the shared file. A suite mirroring its own (usually
+        // unset, therefore default) backend resets the user's real choice, and the failure is
+        // invisible: the Settings panel keeps showing Tavily because the selection lives in
+        // UserDefaults, while every search silently runs on the default backend. Same guard,
+        // same reason as ToolSkillSettings and SubagentModelSettings. An explicit `to:` is a
+        // caller-chosen target and always honoured.
+        guard SharedConfigWriteGuard.mayWriteSharedFile(explicitURL: explicitURL) else { return }
+        let url = explicitURL ?? configFileURL(fileManager: fileManager)
         let dir = url.deletingLastPathComponent()
         try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
         guard let data = try? JSONSerialization.data(withJSONObject: jsonPayload(defaults: defaults), options: [.prettyPrinted, .sortedKeys]) else {

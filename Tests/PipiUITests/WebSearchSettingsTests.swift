@@ -131,4 +131,69 @@ final class WebSearchSettingsTests: XCTestCase {
         XCTAssertFalse(WebSearchSettings.isNativeSearchModel(provider: "coding-relay", modelId: "gpt-5.4"))
         XCTAssertFalse(WebSearchSettings.isNativeSearchModel(provider: "kimi-coding", modelId: "kimi-k2"))
     }
+
+    /// DuckDuckGo answers bot detection with a 2xx challenge page, so `res.ok` is true and the
+    /// parser simply finds no links. Reporting that as "no results" is worse than failing: a
+    /// caller cross-validating a design against prior art would read "nothing exists" when the
+    /// truth is "the search never ran", and a design would pass validation it never got.
+    func testBlockedSearchBackendFailsLoudlyInsteadOfReportingNoResults() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-ws-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let path = try XCTUnwrap(WebSearchExtension.install(into: dir))
+        let source = try String(contentsOfFile: path, encoding: .utf8)
+
+        XCTAssertTrue(source.contains(#"/anomaly|challenge|captcha/i.test(html)"#))
+        XCTAssertTrue(source.contains("bot challenge"))
+        // A genuinely empty result page must still report "no results", not an error.
+        XCTAssertTrue(source.contains(#"!/class="result-link"/i.test(html) &&"#),
+                      "the guard must require BOTH no links AND a challenge marker")
+        XCTAssertTrue(source.contains("No results found for:"))
+    }
+
+    /// Native-search detection is a guess from the provider and model name. A relay that fronts
+    /// grok or codex matches the name while the hosted tools are not loaded, so the model is
+    /// told "use your built-in search" when it has none — and with a hard skip that leaves a
+    /// worker with no search at all. The skip must therefore be recoverable.
+    func testNativeSearchSkipIsRecoverableSoAWrongGuessIsNotFatal() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-ws-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let path = try XCTUnwrap(WebSearchExtension.install(into: dir))
+        let source = try String(contentsOfFile: path, encoding: .utf8)
+
+        XCTAssertTrue(source.contains("hasNativeSearch(model) && !params.force"),
+                      "force must bypass the guess")
+        XCTAssertTrue(source.contains("force: Type.Optional("), "the escape has to be callable")
+        XCTAssertTrue(source.contains("call web_search again"),
+                      "the skip message must tell the caller how to recover")
+        // The old wording forbade the tool outright, leaving no way back.
+        XCTAssertFalse(source.contains("Use your built-in search capability directly instead of this tool."))
+    }
+
+    /// The user picks Tavily; a suite mirrors its own unset (therefore default) backend over
+    /// the shared file; every search silently runs on DuckDuckGo while Settings still shows
+    /// Tavily, because the selection lives in UserDefaults and only the mirror was reset.
+    func testOnlyLiveAppDefaultsMayWriteTheSharedSearchConfig() throws {
+        let suite = "pipiui.test.websearch-guard.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let shared = WebSearchSettings.configFileURL()
+        let before = try? Data(contentsOf: shared)
+
+        WebSearchSettings.setBackend("duckduckgo", defaults: defaults)
+        WebSearchSettings.syncJSONFile(defaults: defaults)
+
+        XCTAssertEqual(before, try? Data(contentsOf: shared),
+                       "a test suite must not rewrite the user's search backend")
+        XCTAssertEqual(WebSearchSettings.backend(defaults: defaults), "duckduckgo",
+                       "the suite still records its own choice; only the shared mirror is withheld")
+
+        let own = FileManager.default.temporaryDirectory
+            .appendingPathComponent("websearch-\(UUID().uuidString).json")
+        addTeardownBlock { try? FileManager.default.removeItem(at: own) }
+        WebSearchSettings.syncJSONFile(defaults: defaults, to: own)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: own.path))
+    }
 }

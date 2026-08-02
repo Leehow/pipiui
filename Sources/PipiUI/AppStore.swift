@@ -6,7 +6,55 @@ struct SessionMeta: Identifiable, Hashable {
     let path: String
     let name: String
     let modified: Date
+    /// `provider/modelId` of the latest main-agent model selection in the session file.
+    let modelRef: String?
+
+    init(path: String, name: String, modified: Date, modelRef: String? = nil) {
+        self.path = path
+        self.name = name
+        self.modified = modified
+        self.modelRef = modelRef
+    }
+
     var id: String { path }
+}
+
+/// Extracts the newest main-agent model selection from a pi session JSONL tail.
+enum SessionModelReferenceParser {
+    static func latestModelRef(in jsonlTail: Data) -> String? {
+        guard let text = String(data: jsonlTail, encoding: .utf8) else { return nil }
+
+        // The first line can be truncated because callers read only a tail window.
+        // Work backwards so the first valid model record is the latest selection.
+        for line in text.split(separator: "\n").reversed() {
+            guard let entry = J.parse(Data(line.utf8)),
+                  let type = entry["type"].string,
+                  type == "model_change" || type == "set_model"
+            else {
+                continue
+            }
+
+            let provider = entry["provider"].string ?? entry["model"]["provider"].string
+            let modelId = entry["modelId"].string
+                ?? entry["model"]["modelId"].string
+                ?? entry["model"]["id"].string
+            guard let normalizedProvider = normalized(provider),
+                  let normalizedModelId = normalized(modelId)
+            else {
+                continue
+            }
+            return "\(normalizedProvider)/\(normalizedModelId)"
+        }
+        return nil
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
 }
 
 enum SessionInitialTranscriptSeed {
@@ -68,6 +116,9 @@ final class AppStore: ObservableObject {
             Self.lastSwitchAt = CFAbsoluteTimeGetCurrent()
             let warm = openSessions[key] != nil
             Log.info("switch start → \(key) warm=\(warm)", category: .session)
+            // A background session retains raw stream/tool updates; materialize once
+            // before its detail view observes StreamingState for the first frame.
+            openSessions[key]?.flushPendingStreamingForSelection()
             openSessions[key]?.markCompletionSeen()
         }
     }
@@ -82,6 +133,9 @@ final class AppStore: ObservableObject {
 
     /// 撞名扩展（会让 pi 直接 exit(1)），按会话 key 记录，供 UI 提示与一键修复
     @Published private(set) var extensionConflicts: [String: [PiExtensionConflict]] = [:]
+    /// Async conflict scans are keyed to one makeSession generation. Restarting,
+    /// rebinding, closing, or disabling subagent invalidates old callbacks.
+    private var extensionConflictScanGenerations: [String: UUID] = [:]
     /// 用户选择忽略的冲突入口，本次运行内不再提示
     private var ignoredConflicts: Set<String> = []
 
@@ -150,6 +204,42 @@ final class AppStore: ObservableObject {
     /// use `setComputerUseEnabled` so lifecycle side effects cannot diverge.
     @Published private(set) var computerUseEnabled = ComputerUseSettings.isEnabled()
 
+    /// Independent default-off loopback web test host. This never changes the
+    /// BridgeServer listener or exposes either bridge capability.
+    @Published private(set) var localRemoteEnabled = LocalRemoteSettings.isEnabled()
+    @Published private(set) var localRemoteURL: URL?
+    @Published private(set) var localRemoteStatus = "已关闭"
+    /// Session-scoped and intentionally never persisted. Every launch returns
+    /// to loopback-only even if the local web host itself is enabled.
+    @Published private(set) var localRemoteLANEnabled =
+        LocalRemoteSettings.isLANEnabledForNewLaunch
+    @Published private(set) var localRemoteLANURL: URL?
+    @Published private(set) var localRemoteLANStatus = "已关闭"
+    /// Session-scoped WebRTC viability spike. It is never persisted and serves
+    /// only a loopback Chrome harness backed by a retained WKWebView host.
+    @Published private(set) var remotePeerTestEnabled = false
+    @Published private(set) var remotePeerTestURL: URL?
+    @Published private(set) var remotePeerTestStatus = "已关闭"
+    @Published private(set) var remotePeerTestEchoVerified = false
+    @Published private(set) var remoteRelayConfiguration = RemoteRelaySettings.load()
+    @Published private(set) var remoteRelayState: RemoteRelayConnectionState = .disabled
+    @Published private(set) var remotePeerProductionState: RemotePeerProductionState = .disabled
+    @Published private(set) var remotePairingPayload: String?
+    @Published private(set) var remotePairingMessage = ""
+    @Published private(set) var remotePairingPairID: String?
+    @Published private(set) var remotePairingFingerprint: String?
+    @Published private(set) var remotePairingExpiresAt: Date?
+    @Published private(set) var remoteLegacyMigrationRequired = false
+    private var localRemoteHost: RemoteHostService?
+    private var localRemoteHostGeneration = UUID()
+    private var remotePeerTransport: WebKitRemotePeerTransport?
+    private var remotePeerGeneration = UUID()
+    private lazy var remoteHostController = RemoteHostController(store: self)
+    private var remoteRelayClient: RemoteRelayClient?
+    private var remoteRelayPeerTransport: WebKitRemotePeerTransport?
+    private var remoteRelayGeneration = UUID()
+    private var remotePairingExpiryWorkItem: DispatchWorkItem?
+
     /// Bumped when model picker visibility preferences change so InputBar refreshes.
     @Published var modelVisibilityRevision: Int = 0
     /// Bumped when skill enable/disable toggles change so slash menu refreshes.
@@ -160,6 +250,26 @@ final class AppStore: ObservableObject {
         for key in Array(openSessions.keys) {
             restartSession(key: key)
         }
+    }
+
+    /// Persist one non-transactional built-in master switch and restart all
+    /// sessions. Subagent-off invalidates every in-flight conflict scan
+    /// immediately — before UserDefaults changes or asynchronous restarts — so a
+    /// rapid off→on cannot revive an old callback against the same key.
+    func setBuiltInFeatureEnabled(
+        _ enabled: Bool,
+        id: BuiltInFeatureSettings.FeatureID
+    ) {
+        // Philosophy must go through BuiltInPhilosophyTransition because its pi
+        // settings mutation is fallible.
+        guard id != .philosophy else { return }
+        let persisted = BuiltInFeatureSettings.isEnabled(id)
+        guard persisted != enabled else { return }
+        if id == .subagent, !enabled {
+            extensionConflictScanGenerations.removeAll()
+        }
+        BuiltInFeatureSettings.setEnabled(enabled, id: id)
+        restartAllOpenSessions()
     }
 
     /// Mount or unmount the desktop harness for every open top-level session.
@@ -203,6 +313,431 @@ final class AppStore: ObservableObject {
             return
         }
         setComputerUseEnabled(!computerUseEnabled)
+    }
+
+    func setComputerUseStrategyKind(_ kind: ComputerUseStrategyKind) {
+        guard ComputerUseSettings.strategyKind() != kind else { return }
+        ComputerUseSettings.setStrategyKind(kind)
+        if computerUseEnabled {
+            restartAllOpenSessions()
+        }
+    }
+
+    func setLocalRemoteEnabled(_ enabled: Bool) {
+        guard enabled != localRemoteEnabled || (enabled && localRemoteHost == nil) else {
+            return
+        }
+        LocalRemoteSettings.setEnabled(enabled)
+        localRemoteEnabled = enabled
+        if enabled {
+            startLocalRemoteHost()
+        } else {
+            stopRemotePeerTest()
+            localRemoteHostGeneration = UUID()
+            localRemoteHost?.stop()
+            localRemoteHost = nil
+            localRemoteURL = nil
+            localRemoteStatus = "已关闭"
+            localRemoteLANEnabled = false
+            localRemoteLANURL = nil
+            localRemoteLANStatus = "已关闭"
+        }
+    }
+
+    func setRemotePeerTestEnabled(_ enabled: Bool) {
+        guard enabled != remotePeerTestEnabled
+                || (enabled && remotePeerTransport == nil) else {
+            return
+        }
+        if !enabled {
+            stopRemotePeerTest()
+            return
+        }
+
+        let generation = UUID()
+        remotePeerGeneration = generation
+        remotePeerTestEnabled = true
+        remotePeerTestURL = localRemoteURL?.appendingPathComponent(
+            "p2p-test",
+            isDirectory: true
+        )
+        remotePeerTestStatus = "正在载入 WKWebView host…"
+        remotePeerTestEchoVerified = false
+        let transport = WebKitRemotePeerTransport { [weak self] state in
+            guard let self,
+                  self.remotePeerGeneration == generation,
+                  self.remotePeerTestEnabled else {
+                return
+            }
+            self.remotePeerTestStatus = state.displayText
+            self.remotePeerTestEchoVerified = state == .echoVerified
+        }
+        remotePeerTransport = transport
+        localRemoteHost?.setPeerTransport(transport)
+        transport.start()
+        if !localRemoteEnabled {
+            setLocalRemoteEnabled(true)
+        }
+    }
+
+    private func stopRemotePeerTest() {
+        remotePeerGeneration = UUID()
+        remotePeerTestEnabled = false
+        remotePeerTestURL = nil
+        remotePeerTestStatus = "已关闭"
+        remotePeerTestEchoVerified = false
+        localRemoteHost?.setPeerTransport(nil)
+        remotePeerTransport?.stop()
+        remotePeerTransport = nil
+    }
+
+    func setLocalRemoteLANEnabled(_ enabled: Bool) {
+        guard enabled != localRemoteLANEnabled else { return }
+        guard localRemoteEnabled else {
+            localRemoteLANEnabled = false
+            localRemoteLANURL = nil
+            localRemoteLANStatus = "请先启用本机网页测试"
+            return
+        }
+        if enabled, LocalRemoteNetwork.currentPrivateIPv4() == nil {
+            localRemoteLANEnabled = false
+            localRemoteLANURL = nil
+            localRemoteLANStatus = "未找到可用的私有 IPv4 地址"
+            return
+        }
+        localRemoteLANEnabled = enabled
+        localRemoteLANURL = nil
+        localRemoteLANStatus = enabled ? "正在启动…" : "已关闭"
+        startLocalRemoteHost()
+    }
+
+    func setRemoteRelayEnabled(_ enabled: Bool) {
+        remoteRelayConfiguration.enabled = enabled
+        RemoteRelaySettings.save(remoteRelayConfiguration)
+        if enabled {
+            startRemoteRelay()
+        } else {
+            remoteRelayGeneration = UUID()
+            clearRemotePairing()
+            remoteRelayClient?.stop()
+            remoteRelayClient = nil
+            remoteRelayPeerTransport?.stop()
+            remoteRelayPeerTransport = nil
+            remoteRelayState = .disabled
+            remotePeerProductionState = .disabled
+        }
+    }
+
+    func beginRemotePairing() {
+        guard let remoteRelayClient else {
+            remotePairingPayload = nil
+            remotePairingMessage = "配对创建失败，请先启用 Relay"
+            return
+        }
+        remotePairingMessage = "正在创建一次性配对链接…"
+        // Lifecycle events carry ownership of visible pairing state. A delayed
+        // completion from a replaced request must never clear the replacement QR.
+        remoteRelayClient.beginPairing { _ in }
+    }
+
+    func cancelRemotePairing() {
+        remoteRelayClient?.cancelPairing()
+        clearRemotePairing(message: "配对已取消")
+    }
+
+    func refreshRemoteLegacyMigrationStatus() {
+        remoteLegacyMigrationRequired = RemoteRelaySettings.needsLegacyMigration(
+            remoteRelayConfiguration,
+            hasLegacyCredentials: false
+        )
+    }
+
+    @discardableResult
+    func migrateLegacyRemoteConfiguration() -> Bool {
+        let deletion = RemoteRelayCredentialStore.deleteAll()
+        remoteRelayConfiguration = RemoteRelaySettings.migratedFromLegacy(
+            remoteRelayConfiguration
+        )
+        RemoteRelaySettings.save(remoteRelayConfiguration)
+        remoteLegacyMigrationRequired = false
+        clearRemotePairing(message: deletion.succeeded
+            ? "旧试点配置和凭据已清理，已切换到服务器隧道默认地址"
+            : "已切换现代地址，但旧 Keychain 凭据清理未完成")
+        if remoteRelayConfiguration.enabled {
+            startRemoteRelay()
+        } else {
+            remoteRelayState = .disabled
+            remotePeerProductionState = .disabled
+        }
+        return deletion.succeeded
+    }
+
+    @discardableResult
+    func updateRemoteRelayConfiguration(
+        webSocketURL: String,
+        publicURL: String,
+        displayName: String
+    ) -> Bool {
+        guard let (webSocketURL, publicURL) = RemoteRelaySettings.validatedURLPair(
+            webSocketURL: webSocketURL,
+            publicURL: publicURL
+        ),
+              webSocketURL.path == "/tunnel/ws",
+              !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        remoteRelayConfiguration.webSocketURL = webSocketURL
+        remoteRelayConfiguration.publicURL = publicURL
+        remoteRelayConfiguration.displayName = String(
+            displayName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80)
+        )
+        RemoteRelaySettings.save(remoteRelayConfiguration)
+        if remoteRelayConfiguration.enabled {
+            startRemoteRelay()
+        }
+        return true
+    }
+
+    @discardableResult
+    func saveRemoteRelayCredentials(
+        accessClientID: String,
+        accessClientSecret: String,
+        deviceSecret: String
+    ) -> Bool {
+        guard RemoteRelaySettings.validatedURLPair(
+            webSocketURL: remoteRelayConfiguration.webSocketURL,
+            publicURL: remoteRelayConfiguration.publicURL
+        ) != nil else {
+            return false
+        }
+        let values = [
+            (RemoteRelayCredential.accessClientID, accessClientID),
+            (RemoteRelayCredential.accessClientSecret, accessClientSecret),
+            (RemoteRelayCredential.deviceSecret, deviceSecret),
+        ]
+        guard values.allSatisfy({
+            let count = $0.1.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count
+            return (16...4_096).contains(count)
+        }) else {
+            return false
+        }
+        let written = values.allSatisfy {
+            RemoteRelayCredentialStore.write(
+                $0.1.trimmingCharacters(in: .whitespacesAndNewlines),
+                credential: $0.0
+            )
+        }
+        if written, remoteRelayConfiguration.enabled {
+            startRemoteRelay()
+        }
+        return written
+    }
+
+    func deleteRemoteRelayCredentials() {
+        _ = RemoteRelayCredentialStore.deleteAll()
+        remoteRelayClient?.stop()
+        remoteRelayClient = nil
+        remoteRelayPeerTransport?.stop()
+        remoteRelayPeerTransport = nil
+        remoteLegacyMigrationRequired = false
+        if remoteRelayConfiguration.enabled {
+            startRemoteRelay()
+        }
+    }
+
+    private func startRemoteRelay() {
+        if remoteRelayConfiguration.webSocketURL.path != "/tunnel/ws" {
+            remoteRelayConfiguration = RemoteRelaySettings.migratedFromLegacy(
+                remoteRelayConfiguration
+            )
+            RemoteRelaySettings.save(remoteRelayConfiguration)
+        }
+        let generation = UUID()
+        remoteRelayGeneration = generation
+        clearRemotePairing()
+        remoteRelayClient?.stop()
+        remoteRelayPeerTransport?.stop()
+        remoteRelayPeerTransport = nil
+        remotePeerProductionState = .disabled
+        let peerTransport: WebKitRemotePeerTransport?
+        if remoteRelayConfiguration.webSocketURL.path == "/tunnel/ws" {
+            let transport = WebKitRemotePeerTransport(
+                productionStateChanged: { [weak self] state in
+                    DispatchQueue.main.async {
+                        guard let self,
+                              self.remoteRelayGeneration == generation,
+                              self.remoteRelayPeerTransport != nil else { return }
+                        self.remotePeerProductionState = state
+                    }
+                },
+                stateChanged: { _ in }
+            )
+            transport.start()
+            remoteRelayPeerTransport = transport
+            peerTransport = transport
+        } else {
+            peerTransport = nil
+        }
+        let client = RemoteRelayClient(
+            controller: remoteHostController,
+            configuration: remoteRelayConfiguration,
+            peerTransport: peerTransport,
+            pairingChanged: { [weak self] event in
+                DispatchQueue.main.async {
+                    guard let self,
+                          self.remoteRelayGeneration == generation,
+                          self.remoteRelayClient != nil else { return }
+                    self.handleRemotePairingEvent(event)
+                }
+            },
+            stateChanged: { [weak self] state in
+                DispatchQueue.main.async {
+                    guard let self,
+                          self.remoteRelayGeneration == generation,
+                          self.remoteRelayClient != nil else { return }
+                    self.remoteRelayState = state
+                }
+            }
+        )
+        remoteRelayClient = client
+        client.start()
+    }
+
+    func handleRemotePairingEvent(_ event: RemotePairingLifecycleEvent) {
+        switch event {
+        case .created(let pairing):
+            remotePairingPayload = pairing.url.absoluteString
+            remotePairingPairID = pairing.pairID
+            remotePairingFingerprint = pairing.fingerprint
+            remotePairingExpiresAt = pairing.expiresAt
+            remotePairingMessage = "一次性配对链接已生成"
+            remotePairingExpiryWorkItem?.cancel()
+            let pairID = pairing.pairID
+            let item = DispatchWorkItem { [weak self] in
+                guard let self, self.remotePairingPairID == pairID else { return }
+                self.remoteRelayClient?.cancelPairing()
+                self.clearRemotePairing(message: "配对链接已过期")
+            }
+            remotePairingExpiryWorkItem = item
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + max(0, pairing.expiresAt.timeIntervalSinceNow),
+                execute: item
+            )
+        case .claimed:
+            clearRemotePairing(message: "浏览器已完成配对")
+        case .cancelled:
+            clearRemotePairing(message: "配对已取消")
+        case .invalidated:
+            clearRemotePairing(message: "配对链接已失效")
+        }
+    }
+
+    private func clearRemotePairing(message: String = "") {
+        remotePairingExpiryWorkItem?.cancel()
+        remotePairingExpiryWorkItem = nil
+        remotePairingPayload = nil
+        remotePairingPairID = nil
+        remotePairingFingerprint = nil
+        remotePairingExpiresAt = nil
+        remotePairingMessage = message
+    }
+
+    private func startLocalRemoteHost() {
+        let generation = UUID()
+        localRemoteHostGeneration = generation
+        localRemoteHost?.stop()
+        localRemoteHost = nil
+        localRemoteURL = nil
+        localRemoteLANURL = nil
+        localRemoteStatus = "正在启动…"
+        let accessMode: LocalRemoteAccessMode
+        if localRemoteLANEnabled {
+            guard let address = LocalRemoteNetwork.currentPrivateIPv4() else {
+                localRemoteLANEnabled = false
+                localRemoteLANStatus = "未找到可用的私有 IPv4 地址"
+                startLocalRemoteHost()
+                return
+            }
+            accessMode = .trustedLAN(
+                privateIPv4: address,
+                pairingSecret: BridgeCapabilityToken.generate()
+            )
+        } else {
+            accessMode = .loopbackOnly
+        }
+        guard let host = RemoteHostService(
+            controller: remoteHostController,
+            accessMode: accessMode,
+            peerTransport: remotePeerTransport,
+            stateChanged: { [weak self] state in
+                guard let self,
+                      self.localRemoteHostGeneration == generation else { return }
+                switch state {
+                case .starting:
+                    self.localRemoteStatus = "正在启动…"
+                    self.localRemoteURL = nil
+                    self.localRemoteLANURL = nil
+                case .listening(let loopbackURL, let lanURL):
+                    self.localRemoteURL = loopbackURL
+                    self.localRemoteLANURL = lanURL
+                    self.remotePeerTestURL = self.remotePeerTestEnabled
+                        ? loopbackURL.appendingPathComponent(
+                            "p2p-test",
+                            isDirectory: true
+                        )
+                        : nil
+                    if lanURL != nil {
+                        self.localRemoteStatus = "本机与受信任局域网可访问"
+                        self.localRemoteLANStatus = "仅限受信任局域网测试"
+                    } else {
+                        self.localRemoteStatus = "仅监听 127.0.0.1"
+                        if !self.localRemoteLANEnabled {
+                            self.localRemoteLANStatus = "已关闭"
+                        }
+                    }
+                case .failed(let message):
+                    self.localRemoteStatus = "启动失败：\(message)"
+                    self.localRemoteURL = nil
+                    self.localRemoteLANURL = nil
+                    self.remotePeerTestURL = nil
+                    if self.localRemoteLANEnabled {
+                        self.localRemoteLANStatus = "启动失败：\(message)"
+                    }
+                case .stopped:
+                    if !self.localRemoteEnabled {
+                        self.localRemoteStatus = "已关闭"
+                    }
+                    self.localRemoteURL = nil
+                    self.localRemoteLANURL = nil
+                    self.remotePeerTestURL = nil
+                }
+            }
+        ) else {
+            localRemoteEnabled = false
+            localRemoteLANEnabled = false
+            LocalRemoteSettings.setEnabled(false)
+            localRemoteStatus = "启动失败"
+            localRemoteLANStatus = "启动失败"
+            return
+        }
+        localRemoteHost = host
+    }
+
+    func setExternalComputerUseStrategyPath(_ path: String) {
+        let decision = ComputerUseSettings.externalStrategyApplyDecision(
+            submittedPath: path,
+            currentPath: ComputerUseSettings.externalStrategyPath(),
+            computerUseEnabled: computerUseEnabled,
+            strategyKind: ComputerUseSettings.strategyKind()
+        )
+        if decision.shouldPersist {
+            ComputerUseSettings.setExternalStrategyPath(
+                decision.normalizedPath
+            )
+        }
+        if decision.shouldRestartSessions {
+            restartAllOpenSessions()
+        }
     }
 
     /// 会话 key 形如 "resume:<session 文件路径>"，选中时尚未 spawn 完也能拿到文件路径。
@@ -277,27 +812,50 @@ final class AppStore: ObservableObject {
             }
             let action = request["action"].string ?? ""
             if action == "agent_event" {
-                session.subagents.handle(request)
-                if session.rightPanel == nil {
-                    session.subagents.selectLatest()
+                let shouldAutoOpen = session.subagents.enqueue(request)
+                if shouldAutoOpen, session.rightPanel == nil {
                     session.rightPanel = .agents
                 }
                 respond(["ok": true])
                 return
             }
-            if action == "computer_batch"
-                || action == "computer_open_application"
-                || action == "computer_cancel" {
+            if ComputerRuntimeContract.operations.contains(action) {
                 let computerCapability = request["computerCapability"].string ?? ""
                 guard BridgeCapabilityToken.matches(
                     computerCapability,
                     expected: session.computerRoutingKey
                 ) else {
-                    respond([
-                        "ok": false,
-                        "error": "unauthorized computer capability",
-                    ])
+                    respond(ComputerRuntimeContract.failure(
+                        code: "unauthorized_computer_capability",
+                        message: "unauthorized computer capability",
+                        retryable: false,
+                        requiresObservation: false
+                    ))
                     return
+                }
+                if let versionFailure = ComputerRuntimeContract.validateVersion(request) {
+                    respond(versionFailure)
+                    return
+                }
+                if action == ComputerRuntimeContract.capabilitiesAction {
+                    do {
+                        let descriptor = try ComputerUseSettings.captureDescriptor()
+                        respond(ComputerRuntimeContract.capabilities(
+                            descriptor: descriptor,
+                            permissions: ComputerPermissions.snapshot()
+                        ))
+                    } catch {
+                        respond(ComputerRuntimeContract.failure(
+                            code: "runtime_unavailable",
+                            message: error.localizedDescription,
+                            retryable: false,
+                            requiresObservation: false
+                        ))
+                    }
+                    return
+                }
+                let computerRespond: ([String: Any]) -> Void = {
+                    respond(ComputerRuntimeContract.compatibilityEnvelope($0))
                 }
                 let requestID = request["requestID"].string ?? ""
                 if action == "computer_cancel" {
@@ -306,7 +864,7 @@ final class AppStore: ObservableObject {
                         sessionKey: session.bridgeRoutingKey,
                         reason: "computer request cancelled by the pi extension"
                     )
-                    respond(["ok": true])
+                    computerRespond(["ok": true])
                     return
                 }
                 guard registerCancellation({
@@ -318,23 +876,25 @@ final class AppStore: ObservableObject {
                         )
                     }
                 }) else {
-                    respond([
-                        "ok": false,
-                        "error": "computer bridge request was already cancelled",
-                    ])
+                    computerRespond(ComputerRuntimeContract.failure(
+                        code: "request_cancelled",
+                        message: "computer bridge request was already cancelled",
+                        retryable: true,
+                        requiresObservation: true
+                    ))
                     return
                 }
                 if action == "computer_open_application" {
                     ComputerCoordinator.shared.handleOpenApplication(
                         request: request,
                         sessionKey: session.bridgeRoutingKey,
-                        respond: respond
+                        respond: computerRespond
                     )
                 } else {
                     ComputerCoordinator.shared.handle(
                         request: request,
                         sessionKey: session.bridgeRoutingKey,
-                        respond: respond
+                        respond: computerRespond
                     )
                 }
                 return
@@ -356,6 +916,16 @@ final class AppStore: ObservableObject {
                 }
             }
         }
+        if localRemoteEnabled {
+            DispatchQueue.main.async { [weak self] in
+                self?.startLocalRemoteHost()
+            }
+        }
+        if remoteRelayConfiguration.enabled {
+            DispatchQueue.main.async { [weak self] in
+                self?.startRemoteRelay()
+            }
+        }
     }
 
     private func makeSession(
@@ -367,18 +937,73 @@ final class AppStore: ObservableObject {
         // spawn 前自检：撞名扩展会让 pi 直接退出，先把它变成可修复的提示而不是一行崩溃日志。
         // T11: 主路径只做便宜的 stamp 检查 + 缓存命中；未缓存时先放行 spawn，
         // 全量扫描挪后台，结果回来真有冲突再把会话切成 blocked 态提示修复。
-        let cachedConflicts = PiExtensionConflicts.cached(projectDir: project)
+        // Master on/off snapshot for PipiUI-owned extensions. Computed once per
+        // session spawn so the whole assembly sees a consistent view; the
+        // "内置" settings tab is the only writer.
+        let builtInFeatures = BuiltInFeatureSettings.enabledSet()
+
+        // Conflict detection matters only for the patched subagent (-e) that can
+        // collide with a user-installed same-name extension. When the built-in
+        // subagent feature is off, no PipiUI `-e` can collide, so skip the check
+        // and never block the session on a phantom conflict.
+        let conflictDetectionEnabled = PipiSpawnAssembly.shouldDetectSubagentConflicts(
+            subagentDir: plugin.subagentDir,
+            features: builtInFeatures
+        )
+        let conflictScanGeneration = UUID()
+        let cachedConflicts: [PiExtensionConflict]?
+        if conflictDetectionEnabled {
+            // Always advance the generation, even on a cache hit, to invalidate
+            // any older async callback for the same key.
+            extensionConflictScanGenerations[key] = conflictScanGeneration
+            cachedConflicts = PiExtensionConflicts.cached(projectDir: project)
+        } else {
+            extensionConflictScanGenerations.removeValue(forKey: key)
+            cachedConflicts = nil
+            extensionConflicts.removeValue(forKey: key)
+        }
         let conflicts = (cachedConflicts ?? []).filter { !ignoredConflicts.contains($0.entryPath) }
         if conflicts.isEmpty {
             extensionConflicts.removeValue(forKey: key)
         } else {
             extensionConflicts[key] = conflicts
         }
-        if cachedConflicts == nil {
+        if conflictDetectionEnabled, cachedConflicts == nil {
             PiExtensionConflicts.detectAsync(projectDir: project) { [weak self] found in
-                self?.applyLateDetectedConflicts(found, key: key)
+                self?.applyLateDetectedConflicts(
+                    found,
+                    key: key,
+                    generation: conflictScanGeneration
+                )
             }
         }
+
+        // Computer Use strategy resolution is gated by BOTH the standalone
+        // authorization and the built-in capability switch. Turning the
+        // capability off must not even parse/validate a configured strategy.
+        let selectedComputerStrategy: ComputerUseStrategySelection?
+        let computerStrategyError: String?
+        if ComputerUseSettings.isEnabled() && builtInFeatures.isEnabled(.computerUse) {
+            do {
+                selectedComputerStrategy = try ComputerUseSettings.resolveStrategy(
+                    builtInPath: plugin.computerUseExtension
+                )
+                computerStrategyError = nil
+            } catch {
+                selectedComputerStrategy = nil
+                computerStrategyError =
+                    "Computer Use 策略无法加载：\(error.localizedDescription)"
+            }
+        } else {
+            selectedComputerStrategy = nil
+            computerStrategyError = nil
+        }
+        let sessionBlockedReason = [
+            conflicts.isEmpty
+                ? nil
+                : "扩展撞名，pi 未启动。修复上方冲突后会自动重启会话。",
+            computerStrategyError,
+        ].compactMap { $0 }.joined(separator: "\n")
 
         let cachedTranscript = preloadedTranscript ?? sessionPath.flatMap {
             historyPreloader.snapshotIfCurrent(path: $0)?.transcript
@@ -387,24 +1012,37 @@ final class AppStore: ObservableObject {
             sessionPath: sessionPath,
             cachedTranscript: cachedTranscript
         )
+        // Resolve every App-owned path to explicit nil/path values before
+        // constructing ChatSession. In particular, disabled subagent does not
+        // receive its extension/agents dir, and disabled philosophy does not
+        // even inspect package registration for a fallback path.
+        let philosophyExtension = builtInFeatures.isEnabled(.philosophy)
+            ? PhilosophyPackage.fallbackExtensionPath : nil
+        let paths = PipiSpawnAssembly.Paths.resolved(
+            installed: plugin,
+            features: builtInFeatures,
+            philosophyExtension: philosophyExtension,
+            computerUseExtension: selectedComputerStrategy?.extensionPath
+        )
         let session = ChatSession(
             id: key, projectURL: project, sessionPath: sessionPath,
             bridgePort: bridge?.port ?? 0,
-            webviewExtension: plugin.webviewExtension,
-            mediaExtension: plugin.mediaExtension,
-            gitExtension: plugin.gitExtension,
-            reloadExtension: plugin.reloadExtension,
-            webSearchExtension: plugin.webSearchExtension,
-            skillLoaderExtension: plugin.skillLoaderExtension,
-            codexServerToolsExtension: plugin.codexServerToolsExtension,
-            claudeServerToolsExtension: plugin.claudeServerToolsExtension,
-            computerUseExtension: ComputerUseSettings.isEnabled()
-                ? plugin.computerUseExtension : nil,
-            subagentDir: plugin.subagentDir,
-            agentsDir: plugin.agentsDir,
-            philosophyExtension: PhilosophyPackage.fallbackExtensionPath,
-            blockedReason: conflicts.isEmpty ? nil
-                : "扩展撞名，pi 未启动。修复上方冲突后会自动重启会话。",
+            webviewExtension: paths.webview,
+            mediaExtension: paths.media,
+            gitExtension: paths.git,
+            reloadExtension: paths.reload,
+            webSearchExtension: paths.webSearch,
+            skillLoaderExtension: paths.skillLoader,
+            codexServerToolsExtension: paths.codexServerTools,
+            claudeServerToolsExtension: paths.claudeServerTools,
+            computerUseExtension: paths.computerUse,
+            subagentDir: paths.subagentDir,
+            agentsDir: paths.agentsDir,
+            philosophyExtension: paths.philosophy,
+            searchScopeExtension: paths.searchScope,
+            builtInFeatures: builtInFeatures,
+            blockedReason: sessionBlockedReason.isEmpty
+                ? nil : sessionBlockedReason,
             initialTranscript: initialTranscript
         )
         session.onSessionMetaChanged = { [weak self, weak session] in
@@ -475,6 +1113,10 @@ final class AppStore: ObservableObject {
 
         if openSessions[oldKey] === session {
             openSessions.removeValue(forKey: oldKey)
+            // Late scan callbacks capture oldKey; invalidate them rather than
+            // letting a pre-rebind result attach to either identity.
+            extensionConflictScanGenerations.removeValue(forKey: oldKey)
+            extensionConflictScanGenerations.removeValue(forKey: newKey)
             session.rebindIdentity(to: newKey)
             openSessions[newKey] = session
             if selectedSessionKey == oldKey {
@@ -730,9 +1372,9 @@ final class AppStore: ObservableObject {
             .appendingPathComponent(".pi/agent/sessions/--\(escaped)--")
     }
 
-    /// T7: 增量扫描缓存——projectPath → (session 文件路径 → (mtime, name, ephemeral))。
-    /// 只有新增或 mtime 变化的文件才重新读内容解析 name/ephemeral，其余复用上次结果。
-    private var sessionScanCache: [String: [String: (mtime: Date, name: String, ephemeral: Bool)]] = [:]
+    /// T7: 增量扫描缓存——projectPath → (session 文件路径 → (mtime, name, modelRef, ephemeral))。
+    /// 只有新增或 mtime 变化的文件才重新读内容解析元数据，其余复用上次结果。
+    private var sessionScanCache: [String: [String: (mtime: Date, name: String, modelRef: String?, ephemeral: Bool)]] = [:]
     private let sessionScanCacheLock = NSLock()
     /// Projects with at least one completed metadata scan may warm independently.
     private var completedSessionScans: Set<String> = []
@@ -792,24 +1434,38 @@ final class AppStore: ObservableObject {
                 .filter { $0.pathExtension == "jsonl" } ?? []
             var active: [SessionMeta] = []
             var archivedMetas: [SessionMeta] = []
-            var newCache: [String: (mtime: Date, name: String, ephemeral: Bool)] = [:]
+            var newCache: [String: (mtime: Date, name: String, modelRef: String?, ephemeral: Bool)] = [:]
             newCache.reserveCapacity(files.count)
             for url in files {
                 let path = url.path
                 let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                // 增量：mtime 未变直接复用上次的 name/ephemeral，不重复读文件内容
-                let entry: (name: String, ephemeral: Bool)
+                // 增量：mtime 未变直接复用上次的元数据，不重复读文件内容。
+                let entry: (name: String, modelRef: String?, ephemeral: Bool)
                 if let hit = cachedEntries[path], hit.mtime == mtime {
-                    entry = (hit.name, hit.ephemeral)
+                    entry = (hit.name, hit.modelRef, hit.ephemeral)
                 } else if Self.isEphemeralTitlePromptSession(url) {
-                    entry = ("", true)
+                    entry = ("", nil, true)
                 } else {
-                    entry = (Self.sessionDisplayName(url), false)
+                    entry = (
+                        Self.sessionDisplayName(url),
+                        Self.sessionModelRef(url),
+                        false
+                    )
                 }
-                newCache[path] = (mtime: mtime, name: entry.name, ephemeral: entry.ephemeral)
+                newCache[path] = (
+                    mtime: mtime,
+                    name: entry.name,
+                    modelRef: entry.modelRef,
+                    ephemeral: entry.ephemeral
+                )
                 // Skip orphan side-channel title-gen sessions (pi ran without --no-session).
                 if entry.ephemeral { continue }
-                let meta = SessionMeta(path: path, name: entry.name, modified: mtime)
+                let meta = SessionMeta(
+                    path: path,
+                    name: entry.name,
+                    modified: mtime,
+                    modelRef: entry.modelRef
+                )
                 if archived.contains(path) {
                     archivedMetas.append(meta)
                 } else {
@@ -908,6 +1564,22 @@ final class AppStore: ObservableObject {
         return false
     }
 
+    /// Reads only the final 64 KiB: enough to find a recent pi `model_change`,
+    /// while keeping session discovery bounded even for very large transcripts.
+    private static func sessionModelRef(_ url: URL) -> String? {
+        let tailWindowBytes: UInt64 = 64 * 1024
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        do {
+            let endOffset = try handle.seekToEnd()
+            try handle.seek(toOffset: endOffset > tailWindowBytes ? endOffset - tailWindowBytes : 0)
+            guard let tail = try handle.readToEnd() else { return nil }
+            return SessionModelReferenceParser.latestModelRef(in: tail)
+        } catch {
+            return nil
+        }
+    }
+
     /// 会话显示名：最后一条非 junk session_info name，否则第一条非 internal user 消息，否则「新会话」（不回退 ISO 文件名）。
     private static func sessionDisplayName(_ url: URL) -> String {
         let fileBase = url.deletingPathExtension().lastPathComponent
@@ -969,46 +1641,88 @@ final class AppStore: ObservableObject {
     // MARK: - Open / create sessions
 
     func openSession(_ meta: SessionMeta, project: URL) {
+        selectedSessionKey = openSessionInBackground(meta, project: project)
+    }
+
+    /// Loads/opens a historical session without touching either desktop
+    /// selection. Disk parsing remains in SessionHistoryPreloader's utility queue.
+    @discardableResult
+    func openSessionInBackground(
+        _ meta: SessionMeta,
+        project: URL
+    ) -> String {
+        RemoteSelectionNeutralMutation.perform(selection: { [self] in
+            RemoteDesktopSelectionState(
+                projectPath: self.selectedProjectPath,
+                sessionKey: self.selectedSessionKey
+            )
+        }) { [self] in
+            self.openSessionInBackgroundUnchecked(meta, project: project)
+        }
+    }
+
+    private func openSessionInBackgroundUnchecked(
+        _ meta: SessionMeta,
+        project: URL
+    ) -> String {
         let key = "resume:\(meta.path)"
         // 历史会话第一次打开后始终使用这个稳定 key；重复点击不必扫描所有 live session。
-        if openSessions[key] != nil {
-            selectedSessionKey = key
-            return
-        }
+        if openSessions[key] != nil { return key }
         // 已经有进程挂着这个会话文件时直接切换过去
         if let existing = openSessions.first(where: { $0.value.sessionFile == meta.path }) {
-            selectedSessionKey = existing.key
-            return
+            return existing.key
         }
 
-        // 先让 List/详情区域消费新的 selection；首次启动 pi 和扩展冲突扫描
-        // 会在下一次主循环执行。已加载过的会话已经在 openSessions 中，会走上面的
-        // 立即返回路径，不会重启 pi 或再次 get_messages。
-        selectedSessionKey = key
-        guard pendingHistoricalSessionOpens[key] == nil else { return }
+        guard pendingHistoricalSessionOpens[key] == nil else { return key }
         let token = UUID()
         pendingHistoricalSessionOpens[key] = (token, project.path)
         historyPreloader.loadPrioritized(path: meta.path) { [weak self] snapshot in
             guard let self,
-                  self.pendingHistoricalSessionOpens[key]?.token == token else { return }
+                  self.pendingHistoricalSessionOpens[key]?.token == token else {
+                return
+            }
             self.pendingHistoricalSessionOpens.removeValue(forKey: key)
             // 归档、移除项目或关闭会话可能发生在这个短暂的排队窗口内。
             guard !self.archivedSessionPaths.contains(meta.path),
                   self.projects.contains(where: { $0.path == project.path }),
                   self.openSessions[key] == nil else { return }
-            self.openSessions[key] = self.makeSession(
+            let session = self.makeSession(
                 key: key,
                 project: project,
                 sessionPath: meta.path,
                 preloadedTranscript: snapshot?.transcript
             )
+            RemoteSelectionNeutralMutation.perform(selection: { [self] in
+                RemoteDesktopSelectionState(
+                    projectPath: self.selectedProjectPath,
+                    sessionKey: self.selectedSessionKey
+                )
+            }) { [self] in
+                self.openSessions[key] = session
+            }
         }
+        return key
     }
 
     func newSession(project: URL) {
-        let key = "new:\(UUID().uuidString)"
-        openSessions[key] = makeSession(key: key, project: project, sessionPath: nil)
+        let (key, _) = createSessionInBackground(project: project)
         selectedSessionKey = key
+    }
+
+    /// Creates a live Pi session without changing desktop selection.
+    @discardableResult
+    func createSessionInBackground(project: URL) -> (key: String, session: ChatSession) {
+        RemoteSelectionNeutralMutation.perform(selection: { [self] in
+            RemoteDesktopSelectionState(
+                projectPath: self.selectedProjectPath,
+                sessionKey: self.selectedSessionKey
+            )
+        }) { [self] in
+            let key = "new:\(UUID().uuidString)"
+            let session = self.makeSession(key: key, project: project, sessionPath: nil)
+            self.openSessions[key] = session
+            return (key, session)
+        }
     }
 
     func openBranchedSession(path: String, project: URL, suggestedName: String) {
@@ -1051,8 +1765,17 @@ final class AppStore: ObservableObject {
     /// 后台全量检测结果回流（主线程）：真有冲突时弹出可修复提示。
     /// 会话此时已经 spawn——真冲突下 pi 会自己 exit(1)，这里只负责给出修复入口，
     /// 不再杀进程重启，避免保守检测的误报打断健康会话。
-    private func applyLateDetectedConflicts(_ found: [PiExtensionConflict], key: String) {
-        guard openSessions[key] != nil else { return }
+    private func applyLateDetectedConflicts(
+        _ found: [PiExtensionConflict],
+        key: String,
+        generation: UUID
+    ) {
+        guard PipiSpawnAssembly.shouldApplySubagentConflictResult(
+            expectedGeneration: generation,
+            currentGeneration: extensionConflictScanGenerations[key],
+            subagentEnabled: BuiltInFeatureSettings.isEnabled(.subagent),
+            sessionExists: openSessions[key] != nil
+        ) else { return }
         let conflicts = found.filter { !ignoredConflicts.contains($0.entryPath) }
         if conflicts.isEmpty {
             extensionConflicts.removeValue(forKey: key)
@@ -1100,6 +1823,7 @@ final class AppStore: ObservableObject {
     }
 
     func closeSession(key: String) {
+        extensionConflictScanGenerations.removeValue(forKey: key)
         pendingHistoricalSessionOpens.removeValue(forKey: key)
         if let file = openSessions[key]?.sessionFile {
             pinnedToTop.removeValue(forKey: file)
@@ -1216,6 +1940,16 @@ final class AppStore: ObservableObject {
 
     func shutdown() {
         pendingHistoricalSessionOpens.removeAll()
+        stopRemotePeerTest()
+        localRemoteHost?.stop()
+        localRemoteHost = nil
+        remoteRelayClient?.stop()
+        remoteRelayClient = nil
+        clearRemotePairing()
+        remoteRelayPeerTransport?.stop()
+        remoteRelayPeerTransport = nil
+        remotePeerProductionState = .disabled
+        remoteHostController.resetRuntimeState()
         ComputerCoordinator.shared.releaseAll(revokeConsent: true)
         ComputerCoordinator.shared.shutdownInputMonitoring()
         for session in openSessions.values {

@@ -1,0 +1,383 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-07-31T18:23:35.885Z",
+  "probe": {
+    "runs_per_probe": 3,
+    "timeout_ms": 60000,
+    "parallel_tool_calls": "Probe A: spontaneous independent weather tool calls.",
+    "tasks_batch": "Probe C: subagent tasks[] batch preference."
+  },
+  "models": {
+    "kimi-coding/k3": {
+      "provider": "kimi-coding",
+      "model": "k3",
+      "parallel_tool_calls": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "mean_calls": 3,
+        "mean_city_coverage": 3
+      },
+      "tasks_batch": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "distribution": {
+          "tasks[len>=2]": 3,
+          "multiple single calls": 0,
+          "single merged brief": 0,
+          "other": 0
+        }
+      },
+      "context_window": 1048576,
+      "recommended_roles": [
+        "boss",
+        "worker"
+      ],
+      "notes": "Probe A: 100% parallel tool calls across 3/3 completed runs. Probe C: 100% tasks[] batches (tasks[len>=2]: 3).",
+      "probed_at": "2026-07-31T18:19:53.998Z"
+    },
+    "kimi-coding/k3-256k": {
+      "provider": "kimi-coding",
+      "model": "k3-256k",
+      "parallel_tool_calls": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "mean_calls": 3,
+        "mean_city_coverage": 3
+      },
+      "tasks_batch": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "distribution": {
+          "tasks[len>=2]": 3,
+          "multiple single calls": 0,
+          "single merged brief": 0,
+          "other": 0
+        }
+      },
+      "context_window": 262144,
+      "recommended_roles": [
+        "boss",
+        "worker"
+      ],
+      "notes": "Probe A: 100% parallel tool calls across 3/3 completed runs. Probe C: 100% tasks[] batches (tasks[len>=2]: 3).",
+      "probed_at": "2026-07-31T18:21:32.970Z"
+    },
+    "deepseek/deepseek-v4-flash": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "parallel_tool_calls": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "mean_calls": 3,
+        "mean_city_coverage": 3
+      },
+      "tasks_batch": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "distribution": {
+          "tasks[len>=2]": 3,
+          "multiple single calls": 0,
+          "single merged brief": 0,
+          "other": 0
+        }
+      },
+      "context_window": 1000000,
+      "recommended_roles": [
+        "boss",
+        "worker"
+      ],
+      "notes": "Probe A: 100% parallel tool calls across 3/3 completed runs. Probe C: 100% tasks[] batches (tasks[len>=2]: 3).",
+      "probed_at": "2026-07-31T18:22:28.096Z"
+    },
+    "deepseek/deepseek-v4-pro": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-pro",
+      "parallel_tool_calls": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "mean_calls": 3,
+        "mean_city_coverage": 3
+      },
+      "tasks_batch": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "distribution": {
+          "tasks[len>=2]": 3,
+          "multiple single calls": 0,
+          "single merged brief": 0,
+          "other": 0
+        }
+      },
+      "context_window": 1000000,
+      "recommended_roles": [
+        "boss",
+        "worker"
+      ],
+      "notes": "Probe A: 100% parallel tool calls across 3/3 completed runs. Probe C: 100% tasks[] batches (tasks[len>=2]: 3).",
+      "probed_at": "2026-07-31T18:22:49.194Z"
+    },
+    "openai-codex/gpt-5.3-codex-spark": {
+      "provider": "openai-codex",
+      "model": "gpt-5.3-codex-spark",
+      "parallel_tool_calls": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "mean_calls": 3,
+        "mean_city_coverage": 3
+      },
+      "tasks_batch": {
+        "status": "completed",
+        "rate": 0,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "distribution": {
+          "tasks[len>=2]": 0,
+          "multiple single calls": 3,
+          "single merged brief": 0,
+          "other": 0
+        }
+      },
+      "context_window": 128000,
+      "recommended_roles": [
+        "boss",
+        "worker"
+      ],
+      "notes": "Probe A: 100% parallel tool calls across 3/3 completed runs. Probe C: 0% tasks[] batches (multiple single calls: 3).",
+      "probed_at": "2026-07-31T18:23:35.885Z"
+    },
+    "openai-codex/gpt-5.6-luna": {
+      "provider": "openai-codex",
+      "model": "gpt-5.6-luna",
+      "parallel_tool_calls": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "mean_calls": 3,
+        "mean_city_coverage": 3
+      },
+      "tasks_batch": {
+        "status": "completed",
+        "rate": 0.6666666666666666,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "distribution": {
+          "tasks[len>=2]": 2,
+          "multiple single calls": 1,
+          "single merged brief": 0,
+          "other": 0
+        }
+      },
+      "context_window": 272000,
+      "recommended_roles": [
+        "boss",
+        "worker"
+      ],
+      "notes": "Probe A: 100% parallel tool calls across 3/3 completed runs. Probe C: 67% tasks[] batches (tasks[len>=2]: 2, multiple single calls: 1).",
+      "probed_at": "2026-07-31T18:23:35.885Z"
+    },
+    "openai-codex/gpt-5.6-sol": {
+      "provider": "openai-codex",
+      "model": "gpt-5.6-sol",
+      "parallel_tool_calls": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "mean_calls": 3,
+        "mean_city_coverage": 3
+      },
+      "tasks_batch": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "distribution": {
+          "tasks[len>=2]": 3,
+          "multiple single calls": 0,
+          "single merged brief": 0,
+          "other": 0
+        }
+      },
+      "context_window": 272000,
+      "recommended_roles": [
+        "boss",
+        "worker"
+      ],
+      "notes": "Probe A: 100% parallel tool calls across 3/3 completed runs. Probe C: 100% tasks[] batches (tasks[len>=2]: 3).",
+      "probed_at": "2026-07-31T18:23:35.885Z"
+    },
+    "openai-codex/gpt-5.6-terra": {
+      "provider": "openai-codex",
+      "model": "gpt-5.6-terra",
+      "parallel_tool_calls": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "mean_calls": 3,
+        "mean_city_coverage": 3
+      },
+      "tasks_batch": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "distribution": {
+          "tasks[len>=2]": 3,
+          "multiple single calls": 0,
+          "single merged brief": 0,
+          "other": 0
+        }
+      },
+      "context_window": 272000,
+      "recommended_roles": [
+        "boss",
+        "worker"
+      ],
+      "notes": "Probe A: 100% parallel tool calls across 3/3 completed runs. Probe C: 100% tasks[] batches (tasks[len>=2]: 3).",
+      "probed_at": "2026-07-31T18:23:35.885Z"
+    },
+    "xai/grok-4.5": {
+      "provider": "xai",
+      "model": "grok-4.5",
+      "parallel_tool_calls": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "mean_calls": 3,
+        "mean_city_coverage": 3
+      },
+      "tasks_batch": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "distribution": {
+          "tasks[len>=2]": 3,
+          "multiple single calls": 0,
+          "single merged brief": 0,
+          "other": 0
+        }
+      },
+      "context_window": 500000,
+      "recommended_roles": [
+        "boss",
+        "worker"
+      ],
+      "notes": "Probe A: 100% parallel tool calls across 3/3 completed runs. Probe C: 100% tasks[] batches (tasks[len>=2]: 3).",
+      "probed_at": "2026-07-31T18:23:35.885Z"
+    },
+    "zai-coding-cn/glm-5-turbo": {
+      "provider": "zai-coding-cn",
+      "model": "glm-5-turbo",
+      "parallel_tool_calls": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "mean_calls": 3,
+        "mean_city_coverage": 3
+      },
+      "tasks_batch": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "distribution": {
+          "tasks[len>=2]": 3,
+          "multiple single calls": 0,
+          "single merged brief": 0,
+          "other": 0
+        }
+      },
+      "context_window": 200000,
+      "recommended_roles": [
+        "boss",
+        "worker"
+      ],
+      "notes": "Probe A: 100% parallel tool calls across 3/3 completed runs. Probe C: 100% tasks[] batches (tasks[len>=2]: 3).",
+      "probed_at": "2026-07-31T18:23:35.885Z"
+    },
+    "zai-coding-cn/glm-5.2": {
+      "provider": "zai-coding-cn",
+      "model": "glm-5.2",
+      "parallel_tool_calls": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "mean_calls": 3,
+        "mean_city_coverage": 3
+      },
+      "tasks_batch": {
+        "status": "completed",
+        "rate": 1,
+        "completed_runs": 3,
+        "attempted_runs": 3,
+        "distribution": {
+          "tasks[len>=2]": 3,
+          "multiple single calls": 0,
+          "single merged brief": 0,
+          "other": 0
+        }
+      },
+      "context_window": 1000000,
+      "recommended_roles": [
+        "boss",
+        "worker"
+      ],
+      "notes": "Probe A: 100% parallel tool calls across 3/3 completed runs. Probe C: 100% tasks[] batches (tasks[len>=2]: 3).",
+      "probed_at": "2026-07-31T18:23:35.885Z"
+    },
+    "zai-coding-cn/glm-5v-turbo": {
+      "provider": "zai-coding-cn",
+      "model": "glm-5v-turbo",
+      "parallel_tool_calls": {
+        "status": "unavailable",
+        "rate": null,
+        "completed_runs": 0,
+        "attempted_runs": 3,
+        "mean_calls": null,
+        "mean_city_coverage": null,
+        "reason": "all 9 requests failed because the current subscription does not grant GLM-5V-Turbo access"
+      },
+      "tasks_batch": {
+        "status": "unavailable",
+        "rate": null,
+        "completed_runs": 0,
+        "attempted_runs": 3,
+        "distribution": {
+          "tasks[len>=2]": 0,
+          "multiple single calls": 0,
+          "single merged brief": 0,
+          "other": 0
+        },
+        "reason": "all 9 requests failed because the current subscription does not grant GLM-5V-Turbo access"
+      },
+      "context_window": 200000,
+      "recommended_roles": [],
+      "notes": "Probe unavailable: all 9 requests failed because the current subscription does not grant GLM-5V-Turbo access.",
+      "probed_at": "2026-07-31T18:23:35.885Z"
+    }
+  }
+}

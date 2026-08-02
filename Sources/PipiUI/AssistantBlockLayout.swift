@@ -65,6 +65,22 @@ enum AssistantBlockLayout {
         var lastAssistantRunIDForGroupID: [String: String]
     }
 
+    /// Structural presentation metadata derived from settled transcript rows.
+    ///
+    /// These maps are intentionally planned beside `TranscriptRow`s instead of in a
+    /// SwiftUI body. Streaming text and tool output can repaint the live row without
+    /// rescanning every settled message for grouping, authored-message detection, or
+    /// jump targets.
+    struct TranscriptPresentation: Equatable {
+        var rows: [TranscriptRow]
+        var userTurnGroups: UserTurnGroups
+        var userAuthoredLeafIDs: Set<String>
+        var jumpTargetForAssistantRunID: [String: String]
+        var groupIDForToolCallID: [String: String]
+        var toolCallIDsForRowID: [String: Set<String>]
+        var lastAssistantRunID: String?
+    }
+
     static func userTurnGroups(rows: [TranscriptRow]) -> UserTurnGroups {
         var groupIDForRowID: [String: String] = [:]
         var lastAssistantRunIDForGroupID: [String: String] = [:]
@@ -91,6 +107,66 @@ enum AssistantBlockLayout {
         return UserTurnGroups(
             groupIDForRowID: groupIDForRowID,
             lastAssistantRunIDForGroupID: lastAssistantRunIDForGroupID
+        )
+    }
+
+    /// Build all settled-row structural metadata in one oldest-to-newest pass.
+    static func transcriptPresentation(rows: [TranscriptRow]) -> TranscriptPresentation {
+        var groupIDForRowID: [String: String] = [:]
+        var lastAssistantRunIDForGroupID: [String: String] = [:]
+        var userAuthoredLeafIDs: Set<String> = []
+        var jumpTargetForAssistantRunID: [String: String] = [:]
+        var groupIDForToolCallID: [String: String] = [:]
+        var toolCallIDsForRowID: [String: Set<String>] = [:]
+        var currentGroupID: String?
+        var lastUserLeafID: String?
+        var lastAssistantRunID: String?
+
+        for row in rows {
+            switch row {
+            case .leaf(let item):
+                let callIDs = toolCallIds(in: item.blocks)
+                if !callIDs.isEmpty { toolCallIDsForRowID[item.id] = callIDs }
+                guard item.role == "user" else { continue }
+                if MessageActions.isUserAuthoredMessage(item) {
+                    currentGroupID = item.id
+                    lastUserLeafID = item.id
+                    userAuthoredLeafIDs.insert(item.id)
+                }
+                if let currentGroupID {
+                    groupIDForRowID[item.id] = currentGroupID
+                    for callID in callIDs {
+                        groupIDForToolCallID[callID] = currentGroupID
+                    }
+                }
+            case .assistantRun(let id, _, let segments):
+                let callIDs = toolCallIds(in: segments)
+                if !callIDs.isEmpty { toolCallIDsForRowID[id] = callIDs }
+                lastAssistantRunID = id
+                if let lastUserLeafID {
+                    jumpTargetForAssistantRunID[id] = lastUserLeafID
+                }
+                if let currentGroupID {
+                    groupIDForRowID[id] = currentGroupID
+                    lastAssistantRunIDForGroupID[currentGroupID] = id
+                    for callID in callIDs {
+                        groupIDForToolCallID[callID] = currentGroupID
+                    }
+                }
+            }
+        }
+
+        return TranscriptPresentation(
+            rows: rows,
+            userTurnGroups: UserTurnGroups(
+                groupIDForRowID: groupIDForRowID,
+                lastAssistantRunIDForGroupID: lastAssistantRunIDForGroupID
+            ),
+            userAuthoredLeafIDs: userAuthoredLeafIDs,
+            jumpTargetForAssistantRunID: jumpTargetForAssistantRunID,
+            groupIDForToolCallID: groupIDForToolCallID,
+            toolCallIDsForRowID: toolCallIDsForRowID,
+            lastAssistantRunID: lastAssistantRunID
         )
     }
 
@@ -121,6 +197,12 @@ enum AssistantBlockLayout {
         for block in merged {
             if isGroupable(block, toolRuns: toolRuns) {
                 pending.append(block)
+                // A settled edit closes the current tool/thinking package. Include
+                // the edit itself, then let the following groupable block start a
+                // fresh segment with its own file-change summary and detail scope.
+                if case .toolCall(let call) = block, call.name == "edit" {
+                    flushPending()
+                }
             } else {
                 flushPending()
                 result.append(segment(for: block))
@@ -232,6 +314,8 @@ enum AssistantBlockLayout {
             return true
         case .toolCall(let call):
             if producesImageResult(call) { return false }
+            // Live tool calls stay on the main transcript so the user can watch output.
+            if let run = toolRuns[call.id], run.isRunning { return false }
             // Any other tool that already carries result thumbnails stays visible too.
             if let run = toolRuns[call.id], !run.images.isEmpty { return false }
             return true
@@ -312,6 +396,15 @@ enum AssistantBlockLayout {
 /// `toolCallId`s whose dispatched agent is `.running`), keeping this helper free of
 /// store/UI dependencies and fully unit-testable.
 enum UserTurnCollapseGuard {
+    /// Fast path for render-time guard updates. The transcript planner precomputes
+    /// tool-call ownership, so a streaming repaint only visits currently running ids.
+    static func runningGuardedGroupIDs(
+        groupIDForToolCallID: [String: String],
+        runningSubagentToolCallIds: Set<String>
+    ) -> Set<String> {
+        Set(runningSubagentToolCallIds.compactMap { groupIDForToolCallID[$0] })
+    }
+
     /// Group ids that must NOT be folded because at least one of their rows owns a
     /// tool call whose dispatched subagent is still running.
     static func runningGuardedGroupIDs(

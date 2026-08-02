@@ -29,6 +29,7 @@ public enum ProviderEnvMap {
         "openai": ["OPENAI_API_KEY"],
         "openai-codex": ["OPENAI_API_KEY"],
         "deepseek": ["DEEPSEEK_API_KEY"],
+        "siliconflow": ["SILICONFLOW_API_KEY"],
         "nvidia": ["NVIDIA_API_KEY"],
         "google": ["GEMINI_API_KEY"],
         "amazon-bedrock": ["AWS_BEARER_TOKEN_BEDROCK"],

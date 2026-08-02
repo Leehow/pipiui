@@ -118,7 +118,7 @@ package enum AgentBranchCleanupDisposition: Equatable, Sendable {
     case alreadyAbsent
     /// Internal, detached from all registered worktrees, and merged into integration HEAD.
     case eligible
-    /// Branch is outside the runtime-owned `pipiui/agent-*` namespace.
+    /// Branch is outside the runtime-owned `pipiui/` namespace.
     case retainedNonInternal
     /// A real registered worktree still owns the branch. Dirty is captured explicitly.
     case retainedRegisteredWorktree(path: String, dirty: Bool)
@@ -569,6 +569,23 @@ package enum GitRepo {
         _ = try run(gitArgs: ["merge", "--no-edit", name], in: workTree)
     }
 
+    /// Whether `branch` is already reachable from `integrationRef`.
+    /// Invalid refs and Git failures conservatively return false.
+    package static func isAncestor(
+        _ branch: String,
+        of integrationRef: String = "HEAD",
+        in workTree: URL
+    ) -> Bool {
+        guard let name = try? validatedRefName(branch, label: "分支名"),
+              let integration = try? validatedRefName(integrationRef, label: "integration ref") else {
+            return false
+        }
+        return (try? run(
+            gitArgs: ["merge-base", "--is-ancestor", name, integration],
+            in: workTree
+        )) != nil
+    }
+
     /// Remove a linked worktree at `path`. Run from the main worktree.
     /// Default `force: true` discards uncommitted changes in that worktree.
     package static func worktreeRemove(at path: URL, in mainWorkTree: URL, force: Bool = true) throws {
@@ -629,7 +646,7 @@ package enum GitRepo {
     /// Reconcile one persisted agent branch against the real Git worktree/ref graph.
     ///
     /// Safety gate for automatic cleanup:
-    /// `pipiui/agent-*` + no registered worktree + ancestor of integration HEAD.
+    /// `pipiui/` + no registered worktree + ancestor of integration HEAD.
     package static func reconcileAgentBranch(
         _ branch: String,
         persistedWorktreePath: String? = nil,
@@ -646,7 +663,7 @@ package enum GitRepo {
                 .resolvingSymlinksInPath()
                 .path
         }
-        let isInternal = trimmedBranch.hasPrefix("pipiui/agent-")
+        let isInternal = trimmedBranch.hasPrefix("pipiui/")
 
         guard !trimmedBranch.isEmpty, !trimmedBranch.hasPrefix("-") else {
             return AgentBranchReconciliation(
@@ -863,7 +880,7 @@ package enum GitRepo {
                 return "显式丢弃后的内部分支删除失败；已保留: \(detail)"
             }
         case .retainedNonInternal:
-            return "分支不属于 pipiui/agent-*；已保留供人工处置"
+            return "分支不属于 pipiui/；已保留供人工处置"
         case .retainedRegisteredWorktree(let path, let dirty):
             let suffix = dirty ? "且含未提交改动" : ""
             return "分支仍注册在 worktree \(path)\(suffix)；已保留"
@@ -879,7 +896,7 @@ package enum GitRepo {
         case .alreadyAbsent, .eligible:
             return ""
         case .retainedNonInternal:
-            return "已集成，但分支不属于 pipiui/agent-*；已保留供人工处置"
+            return "已集成，但分支不属于 pipiui/；已保留供人工处置"
         case .retainedRegisteredWorktree(let path, let dirty):
             let suffix = dirty ? "且含未提交改动" : ""
             return "已集成，但分支仍注册在 worktree \(path)\(suffix)；已保留"

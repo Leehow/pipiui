@@ -127,6 +127,11 @@ final class FinishedNonTextGroupPresentationTests: XCTestCase {
         XCTAssertTrue(summary.contains("Text(title)"))
         XCTAssertTrue(summary.contains("已编辑"))
         XCTAssertFalse(summary.contains("? title"))
+        XCTAssertTrue(summary.contains("@Environment(\\.openDocument)"))
+        XCTAssertTrue(summary.contains("FileChangeDocumentTarget.url("))
+        XCTAssertTrue(summary.contains("openDocument?(documentURL)"))
+        XCTAssertTrue(summary.contains("Button {"))
+        XCTAssertFalse(summary.contains(".onTapGesture"))
         XCTAssertFalse(summary.contains("ScrollView"))
         XCTAssertFalse(summary.contains("@State private var expanded"))
         XCTAssertFalse(summary.contains("if expanded"))
@@ -168,6 +173,29 @@ final class FinishedNonTextGroupPresentationTests: XCTestCase {
         )
         XCTAssertTrue(thinking.contains("@State private var expanded = false"))
         XCTAssertTrue(toolCard.contains("@State private var expanded = false"))
+    }
+
+    func testFileChangeDocumentTargetResolvesAbsoluteAndProjectRelativePaths() {
+        XCTAssertEqual(
+            FileChangeDocumentTarget.url(
+                path: "/tmp/project/./notes/file.md",
+                projectURL: URL(fileURLWithPath: "/ignored")
+            )?.path,
+            "/tmp/project/notes/file.md"
+        )
+        XCTAssertEqual(
+            FileChangeDocumentTarget.url(
+                path: ".pi/boss/ledger.md",
+                projectURL: URL(fileURLWithPath: "/tmp/project")
+            )?.path,
+            "/tmp/project/.pi/boss/ledger.md"
+        )
+        XCTAssertNil(
+            FileChangeDocumentTarget.url(
+                path: ".pi/boss/ledger.md",
+                projectURL: nil
+            )
+        )
     }
 
     func testSheetIsHostedAboveLazyTranscriptAndClearedByBridgeKeyOnly() throws {

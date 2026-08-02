@@ -1,0 +1,27 @@
+{
+  "name": "pipiui-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bundle": "esbuild src/tunnel-browser.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/assets/tunnel-browser.js && esbuild src/tunnel-host.ts --bundle --format=iife --platform=browser --target=safari16 --outfile=../Sources/PipiUI/Resources/RemoteP2P/tunnel-host.js",
+    "build": "tsc -p tsconfig.json && npm run bundle",
+    "start": "node dist/tunnel-server.js",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@trystero-p2p/ws-relay": "0.25.3",
+    "jose": "6.2.5",
+    "ws": "8.21.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@types/ws": "8.18.1",
+    "esbuild": "0.25.8",
+    "tsx": "4.23.1",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

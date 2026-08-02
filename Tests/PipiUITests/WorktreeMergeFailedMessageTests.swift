@@ -210,18 +210,20 @@ final class WorktreeMergeFailedMessageTests: XCTestCase {
         XCTAssertEqual(calls.map(\.1), ["err-a", "err-b"])
     }
 
-    func testFanoutLayerMentionsMergeFailedSelfHandle() throws {
+    /// The don't-bother-the-user discipline (dispatch a fixer, adjudicate three ways, never
+    /// forward a raw git error) is asserted against the message itself in
+    /// `testFormatUsesFixerDispatchDiscipline` — that is where it now lives, so it costs
+    /// nothing on the turns where nothing failed. What the layer still owes is the pointer:
+    /// signals carry their own handling, and the boss follows the message it received.
+    func testFanoutLayerDefersSignalHandlingToTheMessage() throws {
         let text = try PhilosophyLayerFixture.normalizedBody("fanout")
-        XCTAssertTrue(text.contains("[worktree-merge-failed]"))
-        // The don't-bother-the-user discipline: on a failed merge the boss dispatches a
-        // fixer by default and only adjudicates — accept / discard / ask the user, one
-        // sentence, one concrete choice — and never forwards a raw git error. The same
-        // discipline covers post-merge verify failures.
-        XCTAssertTrue(text.contains("Default action: dispatch"))
-        XCTAssertTrue(text.contains("dispatch a fixer whose brief carries the branch name"))
-        XCTAssertTrue(text.contains("one sentence with one concrete choice"))
-        XCTAssertTrue(text.contains("Never forward a raw Git error"))
-        XCTAssertTrue(text.contains("[post-merge-verify-failed]"))
+        XCTAssertTrue(text.contains("each one carries its own handling instructions"))
+        XCTAssertTrue(text.contains("Follow the instructions in the message you actually received"))
+        XCTAssertTrue(text.contains("never pull raw artifacts"),
+                      "the cross-signal rule stays resident; only the per-signal recipes moved")
+        // Duplicating a recipe here would mean paying for it on every turn.
+        XCTAssertFalse(text.contains("Default action: dispatch"))
+        XCTAssertFalse(text.contains(PhilosophyLayerFixture.normalize("Never forward a raw Git error")))
     }
 
     /// A `verified=fail` worker is not merged and keeps its worktree, so the fix must

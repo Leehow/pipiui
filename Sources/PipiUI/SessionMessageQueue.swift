@@ -1,14 +1,32 @@
 import Foundation
 
+enum PromptSearchGrantPolicy: Equatable {
+    /// Direct local human input replaces the grant with paths in this prompt.
+    case localHumanRecordPromptPaths
+    /// App-generated orchestration text is not human authorization and leaves
+    /// the latest human grant untouched.
+    case appAuthoredPreserveLatestHumanGrant
+    /// Remote input is not local human authorization and explicitly revokes
+    /// any grant inherited from an earlier local turn.
+    case remoteClearGrant
+}
+
 struct QueuedMessage: Identifiable {
     let id: UUID
     var text: String
     var images: [DraftImage]
+    var searchGrantPolicy: PromptSearchGrantPolicy
 
-    init(id: UUID = UUID(), text: String, images: [DraftImage] = []) {
+    init(
+        id: UUID = UUID(),
+        text: String,
+        images: [DraftImage] = [],
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths
+    ) {
         self.id = id
         self.text = text
         self.images = images
+        self.searchGrantPolicy = searchGrantPolicy
     }
 }
 
@@ -22,10 +40,18 @@ struct SessionMessageQueue {
 
     /// Enqueue a follow-up. `text` should already include attachment path footnotes if any.
     @discardableResult
-    mutating func enqueue(text: String, images: [DraftImage] = []) -> Bool {
+    mutating func enqueue(
+        text: String,
+        images: [DraftImage] = [],
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths
+    ) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !images.isEmpty else { return false }
-        items.append(QueuedMessage(text: text, images: images))
+        items.append(QueuedMessage(
+            text: text,
+            images: images,
+            searchGrantPolicy: searchGrantPolicy
+        ))
         return true
     }
 

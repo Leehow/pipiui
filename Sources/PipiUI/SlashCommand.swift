@@ -149,6 +149,7 @@ package protocol BuiltinCommandHost: AnyObject {
     func runReload()
     func runSetSessionName(_ name: String)
     func runShowSessionStats()
+    func runShowToolStats()
     func runExportHTML()
     func runCopyLastAssistant()
     func runSetModel(providerSlashId: String)
@@ -162,6 +163,7 @@ package enum BuiltinCommands {
         SlashCommand(name: "new", description: "新建会话", source: .builtin, argumentHint: nil),
         SlashCommand(name: "name", description: "重命名会话", source: .builtin, argumentHint: "<name>"),
         SlashCommand(name: "session", description: "显示会话统计", source: .builtin, argumentHint: nil),
+        SlashCommand(name: "stats", description: "工具耗时统计", source: .builtin, argumentHint: nil),
         SlashCommand(name: "export", description: "导出 HTML", source: .builtin, argumentHint: nil),
         SlashCommand(name: "copy", description: "复制最后一条助手回复", source: .builtin, argumentHint: nil),
         SlashCommand(name: "quit", description: "关闭当前会话", source: .builtin, argumentHint: nil),
@@ -214,6 +216,8 @@ package enum BuiltinCommands {
             }
         case "session":
             host.runShowSessionStats()
+        case "stats":
+            host.runShowToolStats()
         case "export":
             host.runExportHTML()
         case "copy":

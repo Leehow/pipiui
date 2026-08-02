@@ -102,6 +102,7 @@ async function listModels() {
         contextWindow: m.contextWindow ?? null,
         reasoning: m.reasoning ?? null,
         thinkingLevelMap: m.thinkingLevelMap ?? null,
+        input: m.input ?? null,
       })),
     });
   });

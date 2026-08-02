@@ -12,6 +12,7 @@
  * Uses JSON mode to capture structured output from subagents.
  */
 
+import { randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -39,10 +40,282 @@ import {
 } from "./secretary-commit.ts";
 import { secretaryToolCallBlock } from "./secretary-policy.ts";
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
+const MAX_PARALLEL_TASKS = 1000;
+const MAX_CONCURRENCY = 1000;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+
+type DispatchStatsMode = "single" | "tasks" | "chain";
+
+type DispatchStatsTask = {
+	agent: string;
+	task: string;
+	title?: string;
+};
+
+type DispatchValidatorAction = "nudge" | "enforce";
+
+type DispatchValidatorFinding = {
+	/** tasks[] index, or 0 for single-mode brief. */
+	taskIndex: number;
+	briefItems: number;
+	/** Short human-readable split hint (list item previews). */
+	splitHint: string;
+};
+
+type DispatchValidatorStats = {
+	triggered: true;
+	action: DispatchValidatorAction;
+	findings: Array<{ task_index: number; brief_items: number }>;
+};
+
+/** Heuristic only: count brief lines that look like list items. */
+function estimateBriefItems(brief: string): number {
+	return brief.split(/\r?\n/).filter((line) => /^\s*([-*•]|\d+[.)])\s/.test(line)).length;
+}
+
+/** List-item line body capture (same bullet/number forms as estimateBriefItems). */
+const DISPATCH_LIST_ITEM_RE = /^\s*(?:[-*•]|\d+[.)])\s+(.*)$/;
+
+/**
+ * Heuristic serial-dependency cues. When these dominate the brief, a long list is
+ * more likely one ordered workflow than independent parallel goals — do not flag.
+ */
+const DISPATCH_SERIAL_SIGNAL_RE =
+	/先|然后|接着|其次|之后|基于|再|随后|最后|\bfirst\b|\bfinally\b|\bbefore\b|\bafter\b|\bthen\b|\bnext\b|\bonce\b|\bbased\s+on\b|\bdepending\s+on\b|\bfollowed\s+by\b|\bstep\s*\d/gi;
+
+/**
+ * Heuristic independent-goal cues inside list lines / free text:
+ * action-ish openers and multi-goal conjunctions (和/以及/并且/+ /and /also).
+ * Not a parser — false positives/negatives are expected; default behavior is nudge-only.
+ */
+const DISPATCH_ACTIONISH_RE =
+	/^(实现|添加|增加|修复|检查|验证|更新|删除|创建|修改|重构|测试|调研|调查|审查|write|add|fix|check|verify|update|delete|create|implement|test|review|investigate|build|run|refactor|ensure|confirm)\b/i;
+const DISPATCH_INDEPENDENT_CONJ_RE = /以及|并且|\+|\band\b|\balso\b|和/g;
+
+function countRegExpMatches(text: string, re: RegExp): number {
+	const flags = re.flags.includes("g") ? re.flags : `${re.flags}g`;
+	const global = new RegExp(re.source, flags);
+	return [...text.matchAll(global)].length;
+}
+
+function listItemBodies(brief: string): string[] {
+	const bodies: string[] = [];
+	for (const line of brief.split(/\r?\n/)) {
+		const m = DISPATCH_LIST_ITEM_RE.exec(line);
+		if (m?.[1]?.trim()) bodies.push(m[1].trim());
+	}
+	return bodies;
+}
+
+/**
+ * Heuristic: does this brief pack multiple independent goals into one worker?
+ * All of the following must hold:
+ *   1. brief_items >= 6 (same list-line heuristic as telemetry)
+ *   2. independent enumeration signals (standalone-ish list rows and/or multi-goal conjunctions)
+ *   3. serial dependency words do NOT dominate those independent signals
+ */
+function looksLikeMergedIndependentGoals(brief: string): {
+	merged: boolean;
+	briefItems: number;
+	splitHint: string;
+} {
+	const briefItems = estimateBriefItems(brief);
+	if (briefItems < 6) {
+		return { merged: false, briefItems, splitHint: "" };
+	}
+
+	const bodies = listItemBodies(brief);
+	let independentItems = 0;
+	let serialOnItems = 0;
+	for (const body of bodies) {
+		const serialOnLine = countRegExpMatches(body, DISPATCH_SERIAL_SIGNAL_RE);
+		if (serialOnLine > 0) {
+			serialOnItems += 1;
+			continue;
+		}
+		// Standalone-ish row: action opener, sentence punctuation, or a substantial clause.
+		const standalone =
+			DISPATCH_ACTIONISH_RE.test(body) ||
+			/[.!?。！？;；]$/.test(body) ||
+			body.length >= 10;
+		if (standalone) independentItems += 1;
+	}
+
+	const serialHits =
+		countRegExpMatches(brief, DISPATCH_SERIAL_SIGNAL_RE) + serialOnItems;
+	const conjHits = countRegExpMatches(brief, DISPATCH_INDEPENDENT_CONJ_RE);
+	// Independent score: standalone list rows plus capped conjunction evidence.
+	const independentScore = independentItems + Math.min(conjHits, 3);
+
+	// Serial dominates → ordered workflow, not a merge anti-pattern.
+	if (serialHits > 0 && serialHits >= Math.max(independentItems, 1) && serialHits >= independentScore / 2) {
+		return { merged: false, briefItems, splitHint: "" };
+	}
+
+	const hasIndependentSignal = independentItems >= 4 || (independentItems >= 3 && conjHits >= 1);
+	if (!hasIndependentSignal && independentItems < 6) {
+		return { merged: false, briefItems, splitHint: "" };
+	}
+
+	// Prefer flagging when most of the 6+ items look independently actionable.
+	if (independentItems < 4 && briefItems >= 6 && independentScore < 4) {
+		return { merged: false, briefItems, splitHint: "" };
+	}
+
+	const preview = bodies
+		.slice(0, 8)
+		.map((b, i) => `${i + 1}) ${b.length > 60 ? `${b.slice(0, 60)}…` : b}`)
+		.join("; ");
+	return {
+		merged: true,
+		briefItems,
+		splitHint: preview || `${briefItems} list items`,
+	};
+}
+
+type DispatchShapeAssessment = {
+	findings: DispatchValidatorFinding[];
+	/** Prepended to successful tool results when nudge is active. */
+	nudgeText: string;
+	/** Full tool-result error body when enforce blocks the dispatch. */
+	enforceError: string;
+	stats: DispatchValidatorStats | null;
+};
+
+function dispatchValidatorMode(): "off" | "nudge" | "enforce" {
+	if (process.env.PIPI_SUBAGENT_DISPATCH_ENFORCE === "1") return "enforce";
+	if (process.env.PIPI_SUBAGENT_DISPATCH_NUDGE === "0") return "off";
+	return "nudge";
+}
+
+/**
+ * Pre-flight shape check for single / tasks[] dispatches.
+ * - chain mode: never runs (caller skips)
+ * - same-agentId resume (agentId set, fresh !== true): skipped per task / single
+ * - default nudge: non-blocking reminder
+ * - PIPI_SUBAGENT_DISPATCH_ENFORCE=1: block and ask for tasks[] / multiple dispatches
+ * - PIPI_SUBAGENT_DISPATCH_NUDGE=0: disable even the reminder (unless enforce)
+ */
+function assessDispatchShape(input: {
+	mode: "single" | "tasks";
+	tasks: readonly { task: string; agentId?: string; fresh?: boolean; title?: string }[];
+}): DispatchShapeAssessment {
+	const empty: DispatchShapeAssessment = {
+		findings: [],
+		nudgeText: "",
+		enforceError: "",
+		stats: null,
+	};
+	const level = dispatchValidatorMode();
+	if (level === "off") return empty;
+
+	const findings: DispatchValidatorFinding[] = [];
+	for (let i = 0; i < input.tasks.length; i++) {
+		const t = input.tasks[i];
+		// Resume / continue the same worker: do not second-guess an in-flight brief.
+		const agentId = t.agentId?.trim();
+		if (agentId && t.fresh !== true) continue;
+
+		const verdict = looksLikeMergedIndependentGoals(t.task);
+		if (!verdict.merged) continue;
+		findings.push({
+			taskIndex: i,
+			briefItems: verdict.briefItems,
+			splitHint: verdict.splitHint,
+		});
+	}
+	if (findings.length === 0) return empty;
+
+	const action: DispatchValidatorAction = level === "enforce" ? "enforce" : "nudge";
+	const stats: DispatchValidatorStats = {
+		triggered: true,
+		action,
+		findings: findings.map((f) => ({
+			task_index: f.taskIndex,
+			brief_items: f.briefItems,
+		})),
+	};
+
+	const scopeLabel =
+		input.mode === "single"
+			? "single brief"
+			: findings.length === 1
+				? `tasks[${findings[0].taskIndex}] brief`
+				: `${findings.length} tasks[] briefs`;
+	const itemsLabel = findings.map((f) => f.briefItems).join(",");
+	const splitLines = findings
+		.map((f) =>
+			input.mode === "single"
+				? `- suggested split preview: ${f.splitHint}`
+				: `- tasks[${f.taskIndex}] (${f.briefItems} items): ${f.splitHint}`,
+		)
+		.join("\n");
+
+	if (action === "enforce") {
+		return {
+			findings,
+			nudgeText: "",
+			enforceError: [
+				`Dispatch shape rejected (PIPI_SUBAGENT_DISPATCH_ENFORCE=1): expected parallel tasks[] / multiple dispatches, got merged ${input.mode === "single" ? "single" : "task brief"}.`,
+				`Detected ${scopeLabel} with brief_items=[${itemsLabel}] that look like independent goals packed together.`,
+				"missing: split independent goals into tasks:[{agent,task},…] (or multiple subagent calls) and re-send this turn.",
+				"NEVER merge independent goals into one brief.",
+				splitLines,
+			].join("\n"),
+			stats,
+		};
+	}
+
+	const nudgeText = [
+		`[dispatch-shape] Detected ${scopeLabel} with brief_items=[${itemsLabel}].`,
+		"If these items are mutually independent, split them into tasks[] multi-element fan-out (or multiple dispatches) instead of one worker.",
+		"Reference: NEVER merge independent goals into one brief.",
+		splitLines,
+		"",
+	].join("\n");
+
+	return { findings, nudgeText, enforceError: "", stats };
+}
+
+/** Best-effort, fire-and-forget dispatch-shape telemetry. Never affects a dispatch. */
+function recordSubagentDispatchStats(
+	mode: DispatchStatsMode,
+	tasks: readonly DispatchStatsTask[],
+	background: boolean,
+	validator?: DispatchValidatorStats | null,
+): void {
+	try {
+		const configuredPath = process.env.PIPI_SUBAGENT_STATS_PATH;
+		const statsPath =
+			configuredPath === undefined
+				? path.join(os.homedir(), ".pi", "agent", "subagent-stats.jsonl")
+				: configuredPath.trim();
+		if (!statsPath) return;
+
+		const line = `${JSON.stringify({
+			ts: new Date().toISOString(),
+			pid: process.pid,
+			depth: PIPIUI_DEPTH,
+			mode,
+			task_count: tasks.length,
+			background,
+			tasks: tasks.map((task) => ({
+				agent: task.agent,
+				title: task.title ?? null,
+				brief_chars: task.task.length,
+				brief_items: estimateBriefItems(task.task),
+			})),
+			...(validator ? { validator } : {}),
+		})}\n`;
+		void fs.promises
+			.mkdir(path.dirname(statsPath), { recursive: true })
+			.then(() => fs.promises.appendFile(statsPath, line, "utf8"))
+			.catch(() => {});
+	} catch {
+		// Telemetry must remain completely isolated from dispatch.
+	}
+}
 
 // ---- Pipi UI 集成：向 App 桥接服务上报 subagent 生命周期（无环境变量时完全静默） ----
 const PIPIUI_PORT = process.env.PIPIUI_BRIDGE_PORT;
@@ -75,6 +348,10 @@ const PIPIUI_SUBAGENT_EXT = process.env.PIPIUI_SUBAGENT_EXT;
 const PIPIUI_COMPUTER_EXT = process.env.PIPIUI_COMPUTER_EXT;
 // App-owned search guard; children load the same code and inherit the human-turn grant file.
 const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
+// Generic web_search / web_fetch. Provider-hosted search already reaches workers through pi's
+// own extension discovery, but only when the worker's model has a provider that ships it —
+// this is the fallback that makes research delegable no matter which model runs it.
+const PIPIUI_WEBSEARCH_EXT = process.env.PIPIUI_WEBSEARCH_EXT;
 // Every dispatched subagent runs with the external skill library switched off: a worker
 // follows its own agent prompt plus the brief, never a skill SOP it discovered on its own.
 const PIPIUI_SUBAGENT_SKILL_ISOLATION = process.env.PIPIUI_SUBAGENT_SKILL_ISOLATION === "1";
@@ -145,13 +422,50 @@ process.on("exit", pipiuiKillAllChildren);
 // 当前正在执行的 subagent 工具调用 id（同一次调用内的 single/parallel/chain 共享）
 let pipiuiCurrentToolCall: string | null = null;
 
-function pipiuiReport(payload: Record<string, unknown>): void {
+const PIPIUI_REPORT_TIMEOUT_MS = 5000;
+
+async function postPipiuiReport(payload: Record<string, unknown>): Promise<void> {
 	if (!PIPIUI_PORT || !PIPIUI_SESSION) return;
-	fetch(`http://127.0.0.1:${PIPIUI_PORT}/rpc`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ sessionKey: PIPIUI_SESSION, action: "agent_event", ...payload }),
-	}).catch(() => {});
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), PIPIUI_REPORT_TIMEOUT_MS);
+	timeout.unref?.();
+	try {
+		await fetch(`http://127.0.0.1:${PIPIUI_PORT}/rpc`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ sessionKey: PIPIUI_SESSION, action: "agent_event", ...payload }),
+			signal: controller.signal,
+		});
+	} catch {
+		// Bridge reporting is observability, never a reason to crash the worker.
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+function pipiuiReport(payload: Record<string, unknown>): void {
+	void postPipiuiReport(payload);
+}
+
+const terminalPipiuiReportFlights = new Map<string, Promise<void>>();
+
+/** Serialize terminal UI events per bare ID; the lease owner awaits the queue before release. */
+function postTerminalPipiuiReport(payload: Record<string, unknown> & { agentId: string }): Promise<void> {
+	const previous = terminalPipiuiReportFlights.get(payload.agentId) ?? Promise.resolve();
+	const flight = previous.catch(() => {}).then(() => postPipiuiReport(payload));
+	terminalPipiuiReportFlights.set(payload.agentId, flight);
+	void flight.finally(() => {
+		if (terminalPipiuiReportFlights.get(payload.agentId) === flight) {
+			terminalPipiuiReportFlights.delete(payload.agentId);
+		}
+	});
+	return flight;
+}
+
+async function awaitTerminalPipiuiReports(agentId: string): Promise<void> {
+	while (terminalPipiuiReportFlights.has(agentId)) {
+		await terminalPipiuiReportFlights.get(agentId);
+	}
 }
 
 function formatTokens(count: number): string {
@@ -188,6 +502,68 @@ function formatUsageStats(
 }
 
 /** Plain summary for PipiUI bridge (no theme codes) — matches main-agent ToolCallSummary. */
+const PIPIUI_EDIT_PAYLOAD_LIMIT = 20_000;
+
+/**
+ * Keep enough edit arguments for the native log to render a diff, while ensuring
+ * the bridge never retains an unbounded tool payload. Every returned value is
+ * complete JSON: oversized replacements are shortened or omitted as whole items.
+ */
+function boundedEditPayloadForUI(args: Record<string, unknown>): string {
+	const rawPath = String(args.path ?? args.file_path ?? "");
+	let path = rawPath;
+	while (JSON.stringify({ path }).length > PIPIUI_EDIT_PAYLOAD_LIMIT && path.length > 0) {
+		path = path.slice(0, Math.max(0, path.length - Math.ceil(path.length / 4)));
+	}
+
+	const source = Array.isArray(args.edits)
+		? args.edits
+		: [{ oldText: args.oldText, newText: args.newText }];
+	const edits = source.flatMap((value) => {
+		if (!value || typeof value !== "object") return [];
+		const edit = value as Record<string, unknown>;
+		return typeof edit.oldText === "string" && typeof edit.newText === "string"
+			? [{ oldText: edit.oldText, newText: edit.newText }]
+			: [];
+	});
+
+	const retained: Array<{ oldText: string; newText: string }> = [];
+	for (const edit of edits) {
+		const full = [...retained, edit];
+		if (JSON.stringify({ path, edits: full }).length <= PIPIUI_EDIT_PAYLOAD_LIMIT) {
+			retained.push(edit);
+			continue;
+		}
+
+		// Retain as much of the first overflowing replacement as fits, without
+		// ever slicing serialized JSON (which would corrupt escaping/structure).
+		if (JSON.stringify({ path, edits: [...retained, { oldText: "", newText: "" }] }).length
+			> PIPIUI_EDIT_PAYLOAD_LIMIT) break;
+		let low = 0;
+		let high = edit.oldText.length + edit.newText.length;
+		while (low < high) {
+			const count = Math.ceil((low + high + 1) / 2);
+			const oldCount = Math.min(edit.oldText.length, count);
+			const candidate = {
+				oldText: edit.oldText.slice(0, oldCount),
+				newText: edit.newText.slice(0, Math.max(0, count - oldCount)),
+			};
+			if (JSON.stringify({ path, edits: [...retained, candidate] }).length <= PIPIUI_EDIT_PAYLOAD_LIMIT) {
+				low = count;
+			} else {
+				high = count - 1;
+			}
+		}
+		const oldCount = Math.min(edit.oldText.length, low);
+		retained.push({
+			oldText: edit.oldText.slice(0, oldCount),
+			newText: edit.newText.slice(0, Math.max(0, low - oldCount)),
+		});
+		break;
+	}
+	return JSON.stringify(retained.length > 0 ? { path, edits: retained } : { path });
+}
+
 function summarizeToolArgsForUI(toolName: string, args: Record<string, unknown>): string {
 	const pathOf = () => String(args.file_path || args.path || "…");
 	switch (toolName) {
@@ -321,6 +697,8 @@ interface SingleResult {
 	verifySkipped?: boolean;
 	/** Brief carried `verify` for a read-only agent; the runtime dropped it as unattestable. */
 	verifyDropped?: boolean;
+	/** Declared `deliverable: report`: the done message carries a report, capped higher. */
+	reportsInFull?: boolean;
 	/** Continued an existing worker's conversation instead of starting it cold. */
 	resumed?: boolean;
 }
@@ -499,7 +877,7 @@ interface WorktreePlacement {
 	cwd: string;
 	worktreePath?: string;
 	worktreeBranch?: string;
-	/** Set when worktree was requested but creation failed (spawn falls back). */
+	/** Set when required worktree isolation failed. Writable workers must not spawn. */
 	worktreeError?: string;
 }
 
@@ -512,6 +890,12 @@ interface AgentRuntimeRolePolicy {
 /**
  * Runtime-owned policy: agent markdown/prompt text cannot opt the closeout secretary
  * back into a worktree or recursive delegation.
+ *
+ * This is deliberately the one policy that stayed keyed on the name while the rest moved to
+ * AgentTraits. The traits an agent declares only ever narrow it — read-only drops its verify,
+ * a skill block takes reads away — so a definition that lies costs it capability. These two
+ * grant: a main-session worktree and the right to delegate. A project-scoped `secretary.md`
+ * must not be able to hand itself either by editing its own frontmatter.
  */
 function runtimeRolePolicyForAgent(agentName: string): AgentRuntimeRolePolicy {
 	if (agentName === "secretary") {
@@ -535,7 +919,8 @@ const ERROR_DONE_CAP = 6000;
 // done message advertises it as the escape hatch.
 const JOB_RESULT_STORE_CAP = 32000;
 const JOB_RESULT_DISPLAY_CAP = 8000;
-const MAX_JOB_RECORDS = 40;
+/** Terminal history is bounded independently; running jobs are never pruning candidates. */
+const MAX_TERMINAL_JOB_RECORDS = 1000;
 
 // ---- Attested verify (system testimony): the runtime runs `verify` in the agent's cwd ----
 const VERIFY_TIMEOUT_MS = 120_000;
@@ -677,7 +1062,7 @@ const emptyUsage = (): UsageStats => ({
 });
 
 // ---- In-process job registry (model-visible via subagent_status; independent of App UI) ----
-type JobState = "running" | "ok" | "failed" | "aborted";
+type JobState = "running" | "ok" | "failed" | "aborted" | "interrupted";
 
 interface JobRecord {
 	agentId: string;
@@ -698,10 +1083,110 @@ interface JobRecord {
 }
 
 const jobRegistry = new Map<string, JobRecord>();
+/** Immediate in-process reservations close the selector-to-dispatch await/confirmation gap. */
+const localAgentReservations = new Set<string>();
 
 // ---- Stall watchdog + abort：运行中后台 job 的外部可触达句柄 ----
 const STALL_THRESHOLD_MS = 120_000;
 const STALL_WATCHDOG_INTERVAL_MS = 30_000;
+/** Max automatic re-spawns after a retryable transport/API death (total runs = 1 + this). */
+const AUTO_RESUME_MAX = 2;
+/** Backoff before each auto-resume attempt (ms). Index 0 = first resume. */
+const AUTO_RESUME_BACKOFF_MS = [5_000, 15_000] as const;
+/** Spread retry waves across a +/-25% window instead of synchronizing thousands of workers. */
+const AUTO_RESUME_JITTER_RATIO = 0.25;
+/** Context size above which a final retryable failure gets a fresh-redispatch hint. */
+const AUTO_RESUME_CONTEXT_HINT_TOKENS = 100_000;
+/** Context tokens at/above which the session is compacted before an auto-resume re-spawn. */
+const AUTO_COMPACT_BEFORE_RESUME_TOKENS = 80_000;
+/** Keep the most recent tokens across the compaction boundary (pi default keepRecentTokens). */
+const AUTO_COMPACT_KEEP_TOKENS = 20_000;
+/** Min chain messages for a compaction to be meaningful. */
+const AUTO_COMPACT_MIN_MESSAGES = 3;
+/** Max messages kept by compaction (bounds the walk when usage tokens are missing). */
+const AUTO_COMPACT_MAX_MESSAGES = 12;
+
+/**
+ * Transient network / upstream API failures worth auto-resuming the worker session.
+ * Auth, billing, and unknown-agent failures are excluded first (not retryable).
+ * Matching is lowercase substring — same spirit as pi-ai retry.js.
+ */
+function isRetryableWorkerError(text: string): boolean {
+	const t = (text || "").toLowerCase();
+	if (!t.trim()) return false;
+	const nonRetryable = [
+		"insufficient_quota",
+		"quota",
+		"billing",
+		"credit balance",
+		"invalid api key",
+		"unauthorized",
+		"401",
+		"403",
+		"unknown agent",
+	];
+	for (const s of nonRetryable) {
+		if (t.includes(s)) return false;
+	}
+	const retryable = [
+		"fetch failed",
+		"connection error",
+		"econnreset",
+		"econnrefused",
+		"etimedout",
+		"socket hang up",
+		"network",
+		"timed out",
+		"timeout",
+		"429",
+		"rate limit",
+		"rate_limit",
+		"overloaded",
+		"500",
+		"502",
+		"503",
+		"504",
+		"internal error",
+		"unavailable",
+		"502 bad gateway",
+	];
+	for (const s of retryable) {
+		if (t.includes(s)) return true;
+	}
+	return false;
+}
+
+function jitteredRetryBackoffMs(baseMs: number, random = Math.random): number {
+	const unit = Math.max(0, Math.min(1, random()));
+	const multiplier = 1 - AUTO_RESUME_JITTER_RATIO + unit * AUTO_RESUME_JITTER_RATIO * 2;
+	return Math.max(1, Math.round(baseMs * multiplier));
+}
+/** stall 复推节奏：boss 决定继续等时，最多 5 分钟沉默一次，不必等心跳。 */
+const STALL_RENOTIFY_INTERVAL_MS = 5 * 60 * 1000;
+/** done 重投节奏：30s 扫描每次都看，但同一 agentId 两次投递至少隔 60s，避免轰炸正在处理中的 boss。 */
+const DONE_RETRY_MIN_INTERVAL_MS = 60_000;
+/** Initial delivery plus four retries; a broken follow-up channel must not retry forever. */
+const DONE_MAX_ATTEMPTS = 5;
+/**
+ * How long the boss may hear nothing at all while work is outstanding. Chosen to be far longer
+ * than the stall threshold: this is the last line of defence against silence, not a progress
+ * report, and every heartbeat costs the boss a turn. 即时性已由 30s 轮询（stall 复推 / done
+ * 重投 / vanished 检测）承担，心跳只做兜底摘要，故从 15min 降到 5min。
+ */
+const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+/** A handle with no pid after this age is treated as vanished (spawn never attached). */
+const NO_PID_VANISH_MS = 5 * 60 * 1000;
+
+/** Signal 0 tests for existence without touching the process. */
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		// EPERM means it exists but belongs to someone else — alive for our purposes.
+		return (err as NodeJS.ErrnoException)?.code === "EPERM";
+	}
+}
 
 interface RunningAgentHandle {
 	/** 外部中止入口（action=abort / subagent_abort 命令）；走 killProc SIGTERM→SIGKILL。 */
@@ -711,8 +1196,16 @@ interface RunningAgentHandle {
 	title?: string;
 	/** 最后一次有任何流式事件/输出（stdout/stderr）的时间戳。 */
 	lastActivityAt: number;
-	/** 当前卡死片段是否已推送过（有新活动后重新武装）。 */
-	stallNotified: boolean;
+	/** 上次推送 [subagent-stalled] 的时间戳；0 = 本卡死片段尚未推过（有新活动后复位为 0）。 */
+	lastStallNotifyAt: number;
+	/** When this worker was dispatched; the heartbeat reports elapsed time. */
+	startedAt: number;
+	/**
+	 * Child pid, so liveness can be checked directly. Idleness is not death: a worker can be
+	 * quiet while thinking, and a dead one can leave a registry entry behind if its close
+	 * handler never ran — which is precisely when the boss would otherwise wait forever.
+	 */
+	pid?: number;
 }
 
 /** 仅后台 job 注册；前台 job 由工具调用自身的 abort signal 负责。 */
@@ -722,7 +1215,7 @@ function noteAgentActivity(agentId: string): void {
 	const handle = runningAgents.get(agentId);
 	if (!handle) return;
 	handle.lastActivityAt = Date.now();
-	handle.stallNotified = false;
+	handle.lastStallNotifyAt = 0;
 }
 
 function stalledInfoFor(agentId: string, now: number): { stalled: boolean; idleSec: number } {
@@ -789,35 +1282,34 @@ function taskSummary(task: string, cap = 200): string {
 }
 
 function jobPrune(): void {
-	if (jobRegistry.size <= MAX_JOB_RECORDS) return;
 	const finished = [...jobRegistry.entries()]
 		.filter(([, j]) => j.state !== "running")
 		.sort((a, b) => (a[1].endedAt ?? a[1].startedAt) - (b[1].endedAt ?? b[1].startedAt));
-	for (const [id] of finished) {
-		if (jobRegistry.size <= MAX_JOB_RECORDS) break;
-		jobRegistry.delete(id);
-	}
-	if (jobRegistry.size <= MAX_JOB_RECORDS) return;
-	const all = [...jobRegistry.entries()].sort((a, b) => a[1].startedAt - b[1].startedAt);
-	for (const [id] of all) {
-		if (jobRegistry.size <= MAX_JOB_RECORDS) break;
-		jobRegistry.delete(id);
+	const excess = finished.length - MAX_TERMINAL_JOB_RECORDS;
+	for (let i = 0; i < excess; i++) {
+		jobRegistry.delete(finished[i][0]);
 	}
 }
 
 function jobUpsertRunning(agentId: string, name: string, task: string, title?: string): void {
 	const existing = jobRegistry.get(agentId);
-	if (existing && existing.state !== "running") return; // never reopen a terminal job
+	// Same agentId, new run: detach any old delivery state. A stale in-flight completion may
+	// settle later, but identity checking prevents it from arming this run's delivered latch.
+	pendingDone.delete(agentId);
+	deliveredDone.delete(agentId);
+	// Resume of the same agentId must reopen a terminal row as running (matches Swift start).
+	const keepLive = existing?.state === "running";
 	jobRegistry.set(agentId, {
 		agentId,
 		name,
 		task: taskSummary(task),
 		title,
 		state: "running",
-		startedAt: existing?.startedAt ?? Date.now(),
-		activity: existing?.activity,
-		cost: existing?.cost,
-		turns: existing?.turns,
+		startedAt: keepLive ? (existing?.startedAt ?? Date.now()) : Date.now(),
+		// Drop endedAt/resultText/metrics from a prior terminal run; keep live metrics only.
+		activity: keepLive ? existing?.activity : undefined,
+		cost: keepLive ? existing?.cost : undefined,
+		turns: keepLive ? existing?.turns : undefined,
 	});
 	jobPrune();
 }
@@ -850,7 +1342,7 @@ function jobFinalize(
 	const existing = jobRegistry.get(agentId);
 	const now = Date.now();
 	if (existing && existing.state !== "running") {
-		// Already terminal: fill missing result/metrics only (notify may race with runSingleAgent end)
+		// Already terminal: fill missing result/metrics only (vanished settle may race with close→end).
 		if (!existing.resultText && fields.resultText)
 			existing.resultText = truncateTextHead(fields.resultText, JOB_RESULT_STORE_CAP);
 		if (existing.cost === undefined && fields.cost !== undefined) existing.cost = fields.cost;
@@ -876,6 +1368,47 @@ function jobFinalize(
 		verify: fields.verify ?? existing?.verify,
 	});
 	jobPrune();
+}
+
+/** Dead pid, or no pid attached after NO_PID_VANISH_MS. */
+function isHandleVanished(handle: RunningAgentHandle, now: number): boolean {
+	if (handle.pid !== undefined) return !isProcessAlive(handle.pid);
+	// Prefer lastActivityAt so auto-resume backoff (pid cleared + activity noted) is not vanished.
+	return now - Math.max(handle.startedAt, handle.lastActivityAt) >= NO_PID_VANISH_MS;
+}
+
+/**
+ * Settle a vanished worker on every ledger: jobRegistry terminal, Swift panel via
+ * pipiuiReport end (interrupted), then drop the running handle. Idempotent when
+ * already terminal and the handle is gone. A later close→end may still fill metrics
+ * via jobFinalize's terminal-merge path.
+ */
+function markWorkerInterrupted(agentId: string, reason: string): void {
+	const handle = runningAgents.get(agentId);
+	const job = jobRegistry.get(agentId);
+	if (!handle && !job) return;
+	if (!handle && job && job.state !== "running") return;
+
+	jobFinalize(agentId, {
+		name: handle?.name ?? job?.name,
+		task: handle?.task ?? job?.task,
+		state: "interrupted",
+		resultText: reason,
+		activity: job?.activity,
+		cost: job?.cost,
+		turns: job?.turns,
+	});
+	void postTerminalPipiuiReport({
+		kind: "end",
+		agentId,
+		ok: false,
+		aborted: true,
+		interrupted: true,
+		output: reason,
+		...(job?.cost !== undefined ? { cost: job.cost } : {}),
+		...(job?.turns !== undefined ? { turns: job.turns } : {}),
+	});
+	runningAgents.delete(agentId);
 }
 
 function jobStateFromResult(
@@ -1042,8 +1575,21 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 	);
 }
 
-function generatePipiuiAgentId(): string {
-	return `agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+function generatePipiuiAgentId(reserved: Set<string> = new Set()): string {
+	// 64 random bits keeps generated ids collision-resistant while staying inside the 24-char
+	// semantic-id contract. The loop turns probabilistic uniqueness into a checked invariant.
+	for (let attempt = 0; attempt < 100; attempt++) {
+		const candidate = `agent-${randomBytes(8).toString("hex")}`;
+		const active =
+			localAgentReservations.has(candidate) ||
+			runningAgents.has(candidate) ||
+			jobRegistry.get(candidate)?.state === "running";
+		if (reserved.has(candidate) || active) continue;
+		reserved.add(candidate);
+		localAgentReservations.add(candidate);
+		return candidate;
+	}
+	throw new Error("Unable to allocate a unique subagent id after 100 attempts.");
 }
 
 /**
@@ -1055,6 +1601,7 @@ function generatePipiuiAgentId(): string {
  * Also lands verbatim in a git branch (`pipiui/<id>`) and a session filename, so the character
  * set is the intersection of "safe there" and "hard to mistype".
  */
+// PIPIUI_PURE_AGENT_ID_BEGIN
 const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{1,23}$/;
 const RESERVED_AGENT_IDS = new Set(["root", "main", "head", "master"]);
 
@@ -1072,6 +1619,54 @@ function validateAgentId(id: string): string | null {
 	return null;
 }
 
+interface CallerAgentIdSelection {
+	ids: string[];
+	problem?: string;
+}
+
+/** Pure request gate: validates, de-duplicates, and excludes every currently active id. */
+function selectCallerAgentIds(
+	candidates: readonly (string | undefined)[],
+	activeIds: ReadonlySet<string>,
+): CallerAgentIdSelection {
+	const ids: string[] = [];
+	const seen = new Set<string>();
+	for (const candidate of candidates) {
+		if (candidate === undefined) continue;
+		const normalized = candidate.trim();
+		const invalid = validateAgentId(normalized);
+		if (invalid) return { ids, problem: invalid };
+		if (seen.has(normalized)) {
+			return {
+				ids,
+				problem: `Duplicate agentId ${JSON.stringify(normalized)} in one request. Each dispatched worker must have a unique id.`,
+			};
+		}
+		if (activeIds.has(normalized)) {
+			return {
+				ids,
+				problem: `agentId ${JSON.stringify(normalized)} is already running. Wait for it to finish or abort it before resuming that worker.`,
+			};
+		}
+		seen.add(normalized);
+		ids.push(normalized);
+	}
+	return { ids };
+}
+
+/** Selector + synchronous reservation is one operation from the event loop's perspective. */
+function selectAndReserveCallerAgentIds(
+	candidates: readonly (string | undefined)[],
+	activeIds: ReadonlySet<string>,
+	reservations: Set<string>,
+): CallerAgentIdSelection {
+	const selection = selectCallerAgentIds(candidates, activeIds);
+	if (selection.problem) return selection;
+	for (const id of selection.ids) reservations.add(id);
+	return selection;
+}
+// PIPIUI_PURE_AGENT_ID_END
+
 /**
  * Where a reusable worker's conversation lives. Deliberately under the main project rather
  * than the worker's own cwd: that cwd is a worktree, and a successful merge deletes it — which
@@ -1086,8 +1681,11 @@ function validateAgentId(id: string): string | null {
  * touched in two weeks is reasoning about code that has since moved on. The count cap only
  * exists so a burst of short-lived workers cannot grow the directory without bound.
  */
+// PIPIUI_PURE_SESSION_RETENTION_BEGIN
 const SESSION_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
-const SESSION_MAX_KEEP = 50;
+const SESSION_MAX_KEEP = 1000;
+const SESSION_PRUNE_COMPLETION_INTERVAL = 256;
+const SESSION_PRUNE_TIME_INTERVAL_MS = 5 * 60 * 1000;
 
 interface StoredSession {
 	name: string;
@@ -1112,45 +1710,254 @@ function selectStaleSessions(
 	return [...stale];
 }
 
-function readStoredSessions(dir: string): StoredSession[] {
+interface SessionPruneSchedule {
+	hasPruned: boolean;
+	completionsSincePrune: number;
+	lastPrunedAt: number;
+}
+
+/** Pure amortization policy: first access, every completed wave slice, or elapsed interval. */
+function nextSessionPruneSchedule(
+	state: SessionPruneSchedule,
+	trigger: "access" | "completed",
+	now: number,
+): { state: SessionPruneSchedule; shouldPrune: boolean } {
+	const completionsSincePrune =
+		state.completionsSincePrune + (trigger === "completed" ? 1 : 0);
+	const shouldPrune =
+		!state.hasPruned ||
+		completionsSincePrune >= SESSION_PRUNE_COMPLETION_INTERVAL ||
+		now - state.lastPrunedAt >= SESSION_PRUNE_TIME_INTERVAL_MS;
+	return {
+		shouldPrune,
+		state: shouldPrune
+			? { hasPruned: true, completionsSincePrune: 0, lastPrunedAt: now }
+			: { ...state, completionsSincePrune },
+	};
+}
+// PIPIUI_PURE_SESSION_RETENTION_END
+
+const SESSION_PRUNE_IO_BATCH = 64;
+
+function yieldSessionPruneIO(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}
+
+// PIPIUI_PURE_ASYNC_BATCH_BEGIN
+async function mapSessionPruneBatches<T, R>(
+	items: readonly T[],
+	batchSize: number,
+	fn: (item: T) => Promise<R>,
+	yieldBetween: () => Promise<void>,
+): Promise<R[]> {
+	const results: R[] = [];
+	for (let offset = 0; offset < items.length; offset += batchSize) {
+		results.push(...(await Promise.all(items.slice(offset, offset + batchSize).map(fn))));
+		await yieldBetween();
+	}
+	return results;
+}
+// PIPIUI_PURE_ASYNC_BATCH_END
+
+// PIPIUI_PURE_SESSION_REMOVE_GUARD_BEGIN
+async function removeSessionWithLeaseGuard<TLease>(
+	entry: StoredSession,
+	isLocallyActive: () => boolean,
+	acquireLease: () => TLease | undefined,
+	releaseLease: (lease: TLease) => void,
+	readCurrentMtime: () => Promise<number | undefined>,
+	remove: () => Promise<void>,
+): Promise<boolean> {
+	// Close both race windows: activity may begin after the original directory snapshot,
+	// and another Pi process may begin between this local check and deletion.
+	if (isLocallyActive()) return false;
+	const lease = acquireLease();
+	if (!lease) return false;
 	try {
-		return fs
-			.readdirSync(dir)
-			.map((name) => {
-				const agentId = /_pipiui-(.+)\.jsonl$/.exec(name)?.[1];
-				if (!agentId) return undefined;
-				try {
-					return { name, agentId, mtimeMs: fs.statSync(path.join(dir, name)).mtimeMs };
-				} catch {
-					return undefined;
-				}
-			})
-			.filter((e): e is StoredSession => Boolean(e));
+		if (isLocallyActive()) return false;
+		if ((await readCurrentMtime()) !== entry.mtimeMs) return false;
+		await remove();
+		return true;
+	} finally {
+		releaseLease(lease);
+	}
+}
+// PIPIUI_PURE_SESSION_REMOVE_GUARD_END
+
+async function readStoredSessions(dir: string): Promise<StoredSession[]> {
+	let names: string[];
+	try {
+		names = await fs.promises.readdir(dir);
 	} catch {
 		return [];
 	}
+	const entries = await mapSessionPruneBatches(
+		names,
+		SESSION_PRUNE_IO_BATCH,
+		async (name) => {
+				const agentId = /_pipiui-(.+)\.jsonl$/.exec(name)?.[1];
+				if (!agentId) return undefined;
+				try {
+					return { name, agentId, mtimeMs: (await fs.promises.stat(path.join(dir, name))).mtimeMs };
+				} catch {
+					return undefined;
+				}
+		},
+		yieldSessionPruneIO,
+	);
+	return entries.filter((entry): entry is StoredSession => Boolean(entry));
 }
 
-let prunedThisProcess = false;
+async function leasedAgentIds(): Promise<Set<string>> {
+	if (!PIPIUI_MAIN_CWD) return new Set();
+	try {
+		const names = await fs.promises.readdir(path.join(PIPIUI_MAIN_CWD, ".pi", "agent-leases"));
+		return new Set(
+			names
+				.map((name) => /^(.*)\.lease$/.exec(name)?.[1])
+				.filter((id): id is string => Boolean(id)),
+		);
+	} catch {
+		return new Set();
+	}
+}
 
-/** Once per process: this is housekeeping, not something to redo on every dispatch. */
-function pruneAgentSessions(dir: string): void {
-	if (prunedThisProcess) return;
-	prunedThisProcess = true;
-	const running = new Set(
-		[...jobRegistry.values()].filter((j) => j.state === "running").map((j) => j.agentId),
+function isAgentLocallyActiveForSessionPrune(agentId: string): boolean {
+	return (
+		localAgentReservations.has(agentId) ||
+		runningAgents.has(agentId) ||
+		jobRegistry.get(agentId)?.state === "running"
 	);
-	for (const name of selectStaleSessions(readStoredSessions(dir), {
+}
+
+let sessionPruneSchedule: SessionPruneSchedule = {
+	hasPruned: false,
+	completionsSincePrune: 0,
+	lastPrunedAt: 0,
+};
+let sessionPruneFlight: Promise<void> | undefined;
+let sessionPruneRerun = false;
+let sessionPruneRerunDir: string | undefined;
+let seededLedger = false;
+
+async function performAgentSessionPrune(dir: string): Promise<void> {
+	if (!PIPIUI_MAIN_CWD) return;
+	const running = new Set<string>([
+		...localAgentReservations,
+		...runningAgents.keys(),
+		...[...jobRegistry.values()]
+			.filter((j) => j.state === "running")
+			.map((j) => j.agentId),
+		...(await leasedAgentIds()),
+	]);
+	const stored = await readStoredSessions(dir);
+	const staleNames = selectStaleSessions(stored, {
 		now: Date.now(),
 		maxAgeMs: SESSION_MAX_AGE_MS,
 		maxKeep: SESSION_MAX_KEEP,
 		running,
-	})) {
-		try {
-			fs.rmSync(path.join(dir, name));
-		} catch {
-			// A file we cannot remove only costs disk; never fail a dispatch over housekeeping.
-		}
+	});
+	const stale = stored.filter((entry) => staleNames.includes(entry.name));
+	await mapSessionPruneBatches(
+		stale,
+		SESSION_PRUNE_IO_BATCH,
+		async (entry) => {
+			const file = path.join(dir, entry.name);
+			try {
+				await removeSessionWithLeaseGuard(
+					entry,
+					() => isAgentLocallyActiveForSessionPrune(entry.agentId),
+					() => acquireAgentLease(path.resolve(PIPIUI_MAIN_CWD), entry.agentId).lease,
+					releaseAgentLease,
+					async () => {
+						try {
+							return (await fs.promises.stat(file)).mtimeMs;
+						} catch {
+							return undefined;
+						}
+					},
+					async () => fs.promises.rm(file),
+				);
+			} catch {
+					// A file we cannot remove only costs disk; never fail a dispatch over housekeeping.
+				}
+		},
+		yieldSessionPruneIO,
+	);
+}
+
+function launchAgentSessionPrune(dir: string): void {
+	sessionPruneFlight = performAgentSessionPrune(dir)
+		.catch((err) => console.error("[pipiui-subagent] session housekeeping failed:", err))
+		.finally(() => {
+			sessionPruneFlight = undefined;
+			if (!sessionPruneRerun) return;
+			sessionPruneRerun = false;
+			const rerunDir = sessionPruneRerunDir ?? dir;
+			sessionPruneRerunDir = undefined;
+			launchAgentSessionPrune(rerunDir);
+		});
+}
+
+/** Amortized, single-flight housekeeping: no synchronous directory scan blocks dispatch. */
+function pruneAgentSessions(dir: string, trigger: "access" | "completed"): void {
+	const decision = nextSessionPruneSchedule(sessionPruneSchedule, trigger, Date.now());
+	sessionPruneSchedule = decision.state;
+	if (!decision.shouldPrune) return;
+	if (sessionPruneFlight) {
+		sessionPruneRerun = true;
+		sessionPruneRerunDir = dir;
+		return;
+	}
+	launchAgentSessionPrune(dir);
+}
+
+/**
+ * Seed the boss ledger the first time this session actually dispatches.
+ *
+ * The layout used to live in the system prompt — roughly 380 tokens of template resident on
+ * every turn so that it would be correct on the few turns that write it. Creating the file
+ * with its sections already laid out puts the format where it is used and costs nothing per
+ * turn. Never overwrites: an existing ledger is the session's own state.
+ */
+function seedBossLedger(): void {
+	if (seededLedger || !PIPIUI_MAIN_CWD) return;
+	seededLedger = true;
+	const key = PIPIUI_SESSION?.trim() || "terminal";
+	const dir = path.join(PIPIUI_MAIN_CWD, ".pi", "boss");
+	const file = path.join(dir, `ledger-${key}.md`);
+	try {
+		if (fs.existsSync(file)) return;
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(
+			file,
+			[
+				"# Ledger",
+				"<one-line session goal>",
+				"",
+				"## Decisions",
+				"<!-- user mid-course changes / additions / cancellations: time + content + affected task IDs -->",
+				"",
+				"## Tasks",
+				"| ID | title | status | agent | wave | notes |",
+				"| -- | ----- | ------ | ----- | ---- | ----- |",
+				"<!-- status: pending | in-flight | blocked | done | cancelled -->",
+				"",
+				"## Done",
+				"<!-- one line per finished task: conclusion + key evidence (file paths / command results) -->",
+				"",
+				"## Risks & open questions",
+				"",
+				"## Closeout dispositions",
+				"| item | disposition | evidence/reason |",
+				"| ---- | ----------- | --------------- |",
+				"<!-- disposition: cleaned | retained | needs-fixer | needs-user -->",
+				"",
+			].join("\n"),
+			"utf-8",
+		);
+	} catch {
+		// The boss can still create it itself; never fail a dispatch over bookkeeping.
 	}
 }
 
@@ -1159,7 +1966,7 @@ function agentSessionDir(): string | undefined {
 	const dir = path.join(PIPIUI_MAIN_CWD, ".pi", "agent-sessions");
 	try {
 		fs.mkdirSync(dir, { recursive: true });
-		pruneAgentSessions(dir);
+		pruneAgentSessions(dir, "access");
 		return dir;
 	} catch {
 		return undefined;
@@ -1186,10 +1993,265 @@ function agentSessionFiles(dir: string, sessionId: string): string[] {
 	}
 }
 
+/** 8-char hex id for a compaction entry (matches pi's own compaction id shape). */
+function compactionEntryId(): string {
+	try {
+		return randomBytes(4).toString("hex");
+	} catch {
+		return Math.floor(Math.random() * 0xffffffff)
+			.toString(16)
+			.padStart(8, "0");
+	}
+}
+
+/**
+ * Append a pi-native `{"type":"compaction",...}` entry to the session jsonl before an
+ * auto-resume re-spawn, so the worker restarts from a compacted context instead of dying
+ * on a full one. Append-only: never rewrites the file, never breaks the parent chain —
+ * pi's buildContextEntries drops everything before `firstKeptEntryId` on resume and renders
+ * `summary` as one user text. Any failure returns false: compaction must never block resume.
+ */
+function appendSessionCompaction(
+	sessionDir: string,
+	sessionId: string,
+	taskText: string,
+	lastContextTokens: number,
+): boolean {
+	try {
+		const files = agentSessionFiles(sessionDir, sessionId);
+		if (files.length === 0) return false;
+		const lines = fs.readFileSync(files[files.length - 1], "utf8").split("\n");
+		const entries: any[] = [];
+		for (const line of lines) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+			try {
+				entries.push(JSON.parse(trimmed));
+			} catch {
+				// Bad line: pi's loader skips it, so do we.
+			}
+		}
+		// No parseable header, or first entry is not a session header → treat file as empty.
+		if (entries.length === 0 || entries[0]?.type !== "session") return false;
+
+		// leafId = id of the last non-session entry (message / compaction / branch_summary …).
+		let leafId: string | undefined;
+		for (let i = entries.length - 1; i >= 0; i--) {
+			if (entries[i].type !== "session") {
+				leafId = entries[i].id;
+				break;
+			}
+		}
+		if (!leafId) return false;
+
+		// Walk the parent chain root → leaf once; it serves both the keep-set and the summary.
+		const byId = new Map<string, any>();
+		for (const e of entries) if (e.id) byId.set(e.id, e);
+		const chain: any[] = [];
+		let cur: any = byId.get(leafId);
+		while (cur) {
+			chain.push(cur);
+			cur = cur.parentId ? byId.get(cur.parentId) : undefined;
+		}
+		chain.reverse();
+
+		// Walk the chain backwards from the leaf, accumulating usage.totalTokens (assistant
+		// messages only; 0 otherwise) until we keep KEEP_TOKENS or MAX_MESSAGES messages.
+		const kept: any[] = [];
+		let acc = 0;
+		for (let i = chain.length - 1; i >= 0; i--) {
+			if (chain[i].type !== "message") continue;
+			kept.push(chain[i]);
+			acc += chain[i].message?.usage?.totalTokens ?? 0;
+			if (acc >= AUTO_COMPACT_KEEP_TOKENS || kept.length >= AUTO_COMPACT_MAX_MESSAGES) break;
+		}
+		kept.reverse(); // kept[0] = earliest kept message
+		if (kept.length < AUTO_COMPACT_MIN_MESSAGES) return false;
+		const firstKeptEntryId = kept[0].id;
+
+		// Summary: the chain's first user message (the original task), truncated.
+		// content may be a string or an array of blocks ({type:"text",text} etc.).
+		let summary = "";
+		for (const e of chain) {
+			if (e.type !== "message" || e.message?.role !== "user") continue;
+			const content = e.message.content;
+			if (typeof content === "string") {
+				summary = content;
+			} else if (Array.isArray(content)) {
+				const textBlock = content.find((b: any) => b?.type === "text" && typeof b.text === "string");
+				if (textBlock) summary = textBlock.text;
+			}
+			if (summary) break;
+		}
+		summary = summary.slice(0, 400);
+		if (summary) {
+			summary += "\n[pipiui] 早期上下文已压缩；请基于以上任务描述继续。";
+		} else {
+			summary = "任务描述见上方会话开头（已压缩）。";
+		}
+
+		fs.appendFileSync(
+			files[files.length - 1],
+			"\n" +
+				JSON.stringify({
+					type: "compaction",
+					id: compactionEntryId(),
+					parentId: leafId,
+					timestamp: new Date().toISOString(),
+					summary,
+					firstKeptEntryId,
+					tokensBefore: lastContextTokens,
+				}) +
+				"\n",
+		);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /** Sanitize agentId for branch/dir names (filesystem + git ref safe). */
 function safeId(agentId: string): string {
 	return agentId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) || "agent";
 }
+
+// PIPIUI_PURE_AGENT_LEASE_BEGIN
+interface AgentLeaseRecord {
+	agentId: string;
+	pid: number;
+	processIdentity?: string;
+	token: string;
+	createdAt: number;
+}
+
+interface AgentLease {
+	filePath: string;
+	token: string;
+}
+
+type AgentLeaseResult = { lease: AgentLease; problem?: never } | { lease?: never; problem: string };
+const AGENT_LEASE_INVALID_GRACE_MS = 30_000;
+
+function leaseProcessIdentity(pid: number): string | undefined {
+	try {
+		const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+			encoding: "utf8",
+			shell: false,
+		});
+		const value = result.status === 0 ? result.stdout.trim() : "";
+		return value || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+let ownLeaseProcessIdentityResolved = false;
+let ownLeaseProcessIdentity: string | undefined;
+function currentLeaseProcessIdentity(): string | undefined {
+	if (!ownLeaseProcessIdentityResolved) {
+		ownLeaseProcessIdentity = leaseProcessIdentity(process.pid);
+		ownLeaseProcessIdentityResolved = true;
+	}
+	return ownLeaseProcessIdentity;
+}
+
+function leaseProcessIsAlive(record: AgentLeaseRecord): boolean {
+	try {
+		process.kill(record.pid, 0);
+	} catch (err) {
+		return (err as NodeJS.ErrnoException)?.code === "EPERM";
+	}
+	if (!record.processIdentity) return true;
+	const currentIdentity = leaseProcessIdentity(record.pid);
+	// If ps is unavailable, fail safe: an apparently live pid keeps its lease.
+	return currentIdentity === undefined || currentIdentity === record.processIdentity;
+}
+
+function agentLeaseFile(mainCwd: string, agentId: string): string {
+	return path.join(mainCwd, ".pi", "agent-leases", `${agentId}.lease`);
+}
+
+function createAgentLeaseFile(filePath: string, agentId: string): AgentLease {
+	const token = randomBytes(16).toString("hex");
+	const record: AgentLeaseRecord = {
+		agentId,
+		pid: process.pid,
+		processIdentity: currentLeaseProcessIdentity(),
+		token,
+		createdAt: Date.now(),
+	};
+	const fd = fs.openSync(filePath, "wx", 0o600);
+	try {
+		fs.writeFileSync(fd, JSON.stringify(record), "utf8");
+	} finally {
+		fs.closeSync(fd);
+	}
+	return { filePath, token };
+}
+
+/** Atomic cross-process bare-ID lease with dead-owner/aged-invalid recovery. */
+function acquireAgentLease(mainCwd: string, agentId: string): AgentLeaseResult {
+	const filePath = agentLeaseFile(mainCwd, agentId);
+	try {
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	} catch (err) {
+		return { problem: `Cannot create global agentId lease directory: ${err instanceof Error ? err.message : String(err)}` };
+	}
+
+	for (let attempt = 0; attempt < 4; attempt++) {
+		try {
+			return { lease: createAgentLeaseFile(filePath, agentId) };
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") {
+				return { problem: `Cannot acquire global lease for agentId ${JSON.stringify(agentId)}: ${err instanceof Error ? err.message : String(err)}` };
+			}
+		}
+
+		let record: AgentLeaseRecord | undefined;
+		let ageMs = 0;
+		try {
+			const stat = fs.statSync(filePath);
+			ageMs = Math.max(0, Date.now() - stat.mtimeMs);
+			record = JSON.parse(fs.readFileSync(filePath, "utf8")) as AgentLeaseRecord;
+		} catch {
+			// A fresh invalid/partial file can be between exclusive open and close. Never steal it.
+		}
+		if (record && leaseProcessIsAlive(record)) {
+			return { problem: `agentId ${JSON.stringify(agentId)} is already running in Pi process ${record.pid}.` };
+		}
+		if (!record && ageMs < AGENT_LEASE_INVALID_GRACE_MS) {
+			return { problem: `agentId ${JSON.stringify(agentId)} lease is still initializing; retry later.` };
+		}
+
+		// Only dead-owner or aged-invalid files reach here. Rename is the atomic stale claim:
+		// exactly one contender wins, and every other contender retries exclusive create.
+		const tomb = `${filePath}.stale-${process.pid}-${randomBytes(6).toString("hex")}`;
+		try {
+			fs.renameSync(filePath, tomb);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+			return { problem: `Cannot reclaim stale lease for agentId ${JSON.stringify(agentId)}: ${err instanceof Error ? err.message : String(err)}` };
+		}
+		try {
+			fs.rmSync(tomb, { force: true });
+		} catch {
+			// The tomb is unaddressable as a live lease; later housekeeping may remove it.
+		}
+	}
+	return { problem: `Could not acquire global lease for agentId ${JSON.stringify(agentId)} after concurrent retries.` };
+}
+
+/** Token check prevents an old owner from unlinking a newer owner's lease. */
+function releaseAgentLease(lease: AgentLease): void {
+	try {
+		const record = JSON.parse(fs.readFileSync(lease.filePath, "utf8")) as AgentLeaseRecord;
+		if (record.token !== lease.token) return;
+		fs.unlinkSync(lease.filePath);
+	} catch {
+		// Already reclaimed/removed or unreadable: never unlink without proving ownership.
+	}
+}
+// PIPIUI_PURE_AGENT_LEASE_END
 
 function gitSpawnSync(
 	args: string[],
@@ -1252,7 +2314,8 @@ function parseWorktreeListPorcelain(output: string): Array<{ path: string; branc
 
 /**
  * Default: create an isolated git worktree under <toplevel>/.pi/worktrees/<safeId>
- * on branch pipiui/<safeId> so subagents write without polluting the main dirty tree.
+ * on branch pipiui/<safeId> so non-read-only subagents write without polluting the main dirty tree.
+ * Read-only roles run directly in their fallback cwd and never create a worktree or branch.
  *
  * Resume / continue same agentId:
  * - Reuses preferred path when it is already a valid git worktree.
@@ -1262,19 +2325,23 @@ function parseWorktreeListPorcelain(output: string): Array<{ path: string; branc
  *   conversation (see agentSessionDir), so cwd, branch AND context all continue.
  *
  * Off when:
+ * - agent is read-only
  * - PIPIUI_WORKTREE=0
  * - caller passed explicit cwd (respect; do not wrap)
  * - effective cwd is not inside a git work tree
  *
  * TS never auto remove / commit / merge (Swift SubagentStore owns lifecycle).
- * On failure creating wt, fall back to original cwd + worktreeError.
+ * On failure creating required isolation, return worktreeError; runSingleAgent fails closed
+ * before spawning a child. Read-only, explicit-cwd and explicit PIPIUI_WORKTREE=0 paths remain
+ * deliberate shared-cwd semantics rather than isolation failures.
  * Never auto-merge in TS or Swift end handlers — GUI confirms merge/discard.
- * failed/aborted/interrupted → keep pendingReview for续作; GUI merge/discard remains as fallback.
+ * failed/aborted/interrupted writable workers → keep pendingReview for续作; GUI merge/discard remains as fallback.
  */
 function resolveSubagentWorktree(opts: {
 	agentId: string;
 	defaultCwd: string;
 	explicitCwd?: string;
+	readOnly: boolean;
 	policy: AgentRuntimeRolePolicy;
 }): WorktreePlacement {
 	const fallbackCwd = opts.explicitCwd ?? opts.defaultCwd;
@@ -1284,7 +2351,7 @@ function resolveSubagentWorktree(opts: {
 		// role and must not manufacture another branch/worktree while closing them out.
 		return { cwd: path.resolve(PIPIUI_MAIN_CWD || opts.defaultCwd) };
 	}
-	if (process.env.PIPIUI_WORKTREE === "0") {
+	if (opts.readOnly || process.env.PIPIUI_WORKTREE === "0") {
 		return { cwd: fallbackCwd };
 	}
 	// Explicit cwd from tool caller → respect, no worktree wrap
@@ -1295,7 +2362,11 @@ function resolveSubagentWorktree(opts: {
 	const effectiveCwd = opts.defaultCwd;
 	const inside = gitSpawnSync(["-C", effectiveCwd, "rev-parse", "--is-inside-work-tree"]);
 	if (!inside.ok || inside.stdout !== "true") {
-		return { cwd: effectiveCwd };
+		return {
+			cwd: effectiveCwd,
+			worktreeError:
+				inside.stderr || "writable isolation requires a git work tree; refusing shared-cwd fallback",
+		};
 	}
 
 	const top = gitSpawnSync(["-C", effectiveCwd, "rev-parse", "--show-toplevel"]);
@@ -1433,16 +2504,18 @@ function resolveSubagentWorktree(opts: {
 		.join("; ");
 	return {
 		cwd: effectiveCwd,
-		worktreeError: errParts || "git worktree add failed",
+		worktreeError: errParts || "git worktree add failed; refusing shared-cwd fallback",
 	};
 }
 
-/** Done-message cap by agent name; error/abort overrides to ERROR_DONE_CAP. */
-function doneCapForAgent(agentName: string, isError: boolean): number {
+/**
+ * Done-message cap. The agent declares whether its deliverable is a report (`deliverable:
+ * report`); a verdict is the default, including for an agent whose definition never loaded.
+ * Error/abort overrides both.
+ */
+function doneCapForResult(result: { reportsInFull?: boolean }, isError: boolean): number {
 	if (isError) return ERROR_DONE_CAP;
-	if (agentName === "explore" || agentName === "plan") return REPORT_DONE_CAP;
-	// general-purpose / reviewer / lead, and the default for unknown names
-	return VERDICT_DONE_CAP;
+	return result.reportsInFull ? REPORT_DONE_CAP : VERDICT_DONE_CAP;
 }
 
 function formatSubagentDoneMessage(
@@ -1459,7 +2532,7 @@ function formatSubagentDoneMessage(
 	// truncation would drop exactly those sections once the report exceeds the cap.
 	const output = truncateTextHead(
 		extra?.error || getResultOutput(result) || result.stderr || "(no output)",
-		doneCapForAgent(result.agent, isError),
+		doneCapForResult(result, isError),
 	);
 	const cost =
 		typeof result.usage.cost === "number" ? result.usage.cost.toFixed(4) : String(result.usage.cost ?? 0);
@@ -1512,16 +2585,82 @@ function formatChainVerifyPrefix(results: SingleResult[]): string {
 	return `${truncateTextHead(lines.join("\n"), REPORT_DONE_CAP)}\n`;
 }
 
-function deliverSubagentDone(pi: ExtensionAPI, text: string): void {
+/**
+ * 低层投递：带 options 失败则降级为裸发；两级都用 await 接住 sync throw 和 async rejection，
+ * 返回是否确认送达，自身永不 reject（调用方可以放心 void，不会产生 unhandled rejection）。
+ */
+async function trySendUserMessage(pi: ExtensionAPI, text: string): Promise<boolean> {
 	try {
-		pi.sendUserMessage(text, { deliverAs: "followUp" });
+		await pi.sendUserMessage(text, { deliverAs: "followUp" });
+		return true;
 	} catch {
-		try {
-			pi.sendUserMessage(text);
-		} catch (err) {
-			console.error("[pipiui-subagent] failed to deliver [subagent-done]:", err);
-		}
+		// 降级到不带 options 的形式（旧版 pi 可能不认识 deliverAs）。
 	}
+	try {
+		await pi.sendUserMessage(text);
+		return true;
+	} catch (err) {
+		console.error("[pipiui-subagent] failed to deliver message:", err);
+		return false;
+	}
+}
+
+/** 一次性通知（stall / heartbeat / vanished）：投出去即可，失败由各自的重推节奏兜底。 */
+function deliverSubagentDone(pi: ExtensionAPI, text: string): void {
+	void trySendUserMessage(pi, text);
+}
+
+/** done 消息在 promise resolve 前都视为未确认；未确认的由 30s 轮询按 ≥60s 节奏重投。进程内存即可，不持久化。 */
+interface PendingDoneEntry {
+	text: string;
+	firstFailedAt: number;
+	attempts: number;
+	lastAttemptAt: number;
+	inFlight: boolean;
+}
+const pendingDone = new Map<string, PendingDoneEntry>();
+// Confirmed delivery is distinct from in-flight delivery. This latch is armed only after
+// sendUserMessage resolves successfully; failed sends remain eligible for bounded retry.
+const deliveredDone = new Set<string>();
+
+function sendDoneWithConfirmation(pi: ExtensionAPI, agentId: string, text: string, isRetry: boolean): void {
+	if (deliveredDone.has(agentId)) return;
+	const now = Date.now();
+	let entry = pendingDone.get(agentId);
+	if (!entry) {
+		entry = { text, firstFailedAt: 0, attempts: 0, lastAttemptAt: 0, inFlight: false };
+		pendingDone.set(agentId, entry);
+	}
+	if (entry.inFlight || entry.attempts >= DONE_MAX_ATTEMPTS) return;
+	entry.inFlight = true;
+	entry.attempts += 1;
+	entry.lastAttemptAt = now;
+	// 重投沿用同一 text，首行前加一行说明这是重复投递，防止 boss 当成新事件。
+	const outText = isRetry
+		? `(re-delivery #${entry.attempts}: the previous [subagent-done] below was not confirmed delivered; treat it as the same event, not a new one.)\n${entry.text}`
+		: entry.text;
+	void trySendUserMessage(pi, outText).then((ok) => {
+		// A new run can replace this entry while the old promise is settling.
+		if (pendingDone.get(agentId) !== entry) return;
+		entry.inFlight = false;
+		if (ok) {
+			deliveredDone.add(agentId);
+			pendingDone.delete(agentId);
+		} else if (entry.firstFailedAt === 0) {
+			entry.firstFailedAt = now;
+		}
+		if (!ok && entry.attempts >= DONE_MAX_ATTEMPTS) {
+			pendingDone.delete(agentId);
+			console.error(
+				`[pipiui-subagent] giving up done delivery after ${entry.attempts} attempts: ${agentId}`,
+			);
+		}
+	});
+}
+
+/** [subagent-done] 专用：带送达确认 + 失败重投。job 此时已 terminal，重投只依赖保存的 text。 */
+function deliverConfirmedDone(pi: ExtensionAPI, agentId: string, text: string): void {
+	sendDoneWithConfirmation(pi, agentId, text, false);
 }
 
 function notifySubagentDone(
@@ -1531,7 +2670,13 @@ function notifySubagentDone(
 ): void {
 	// Finalize job BEFORE deliver: status must work even if sendUserMessage fails.
 	ensureJobTerminalFromResult(result, extra);
-	deliverSubagentDone(pi, formatSubagentDoneMessage(result, extra));
+	const text = formatSubagentDoneMessage(result, extra);
+	// 前台 job 可能没有 bridge agentId；那种情况下投递确认无从挂起，退化为一次性投递。
+	if (result.agentId) {
+		deliverConfirmedDone(pi, result.agentId, text);
+	} else {
+		deliverSubagentDone(pi, text);
+	}
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -1603,6 +2748,25 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 	return results;
 }
 
+/** Background fan-out finalizes each item and drops its full result immediately. */
+async function forEachWithConcurrencyLimit<TIn>(
+	items: TIn[],
+	concurrency: number,
+	fn: (item: TIn, index: number) => Promise<void>,
+): Promise<void> {
+	if (items.length === 0) return;
+	const limit = Math.max(1, Math.min(concurrency, items.length));
+	let nextIndex = 0;
+	const workers = new Array(limit).fill(null).map(async () => {
+		while (true) {
+			const current = nextIndex++;
+			if (current >= items.length) return;
+			await fn(items[current], current);
+		}
+	});
+	await Promise.all(workers);
+}
+
 async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 	const safeName = agentName.replace(/[^\w.-]+/g, "_");
@@ -1636,8 +2800,8 @@ This session is a dispatched subagent. External skill libraries are switched off
 
 const PLAN_SUBAGENT_ARTIFACT_BAN = `You are read-only: you MUST NOT create or save plan artifacts. Your deliverable is the plan text in your final message.`;
 
-/** Read-only roles: their deliverable is a report, so a shell verify has nothing to attest. */
-const READ_ONLY_AGENTS = new Set(["plan", "explore", "reviewer"]);
+// Read-only-ness now travels on the agent definition (`read-only: true`), so a new agent
+// declares it instead of being remembered here. See AgentTraits in ./agents.ts.
 
 const PI_SKILLS_PREAMBLE = [
 	"The following skills provide specialized instructions for specific tasks.",
@@ -1706,6 +2870,7 @@ async function runSingleAgent(
 	const agent = agents.find((a) => a.name === agentName);
 	const pipiuiAgentId = options?.agentId ?? generatePipiuiAgentId();
 	const isBackground = options?.background === true;
+	localAgentReservations.add(pipiuiAgentId);
 
 	if (!agent) {
 		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
@@ -1728,28 +2893,99 @@ async function runSingleAgent(
 			state: "failed",
 			resultText: fail.stderr,
 		});
+		localAgentReservations.delete(pipiuiAgentId);
 		return fail;
 	}
+	const leaseResult = acquireAgentLease(path.resolve(PIPIUI_MAIN_CWD || defaultCwd), pipiuiAgentId);
+	if (!leaseResult.lease) {
+		const message = leaseResult.problem;
+		localAgentReservations.delete(pipiuiAgentId);
+		return {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			title: options?.title,
+			exitCode: 1,
+			messages: [],
+			stderr: message,
+			errorMessage: message,
+			usage: emptyUsage(),
+			step,
+			agentId: pipiuiAgentId,
+			stopReason: "error",
+		};
+	}
+	const agentLease = leaseResult.lease;
+	try {
 
 	const runtimePolicy = runtimeRolePolicyForAgent(agentName);
 	const placement = resolveSubagentWorktree({
 		agentId: pipiuiAgentId,
 		defaultCwd,
 		explicitCwd: cwd, // only when caller passed cwd; undefined → auto worktree
+		readOnly: agent.traits.readOnly,
 		policy: runtimePolicy,
 	});
-	const spawnCwd = placement.cwd;
-
 	const resolvedModel = resolveAgentModel(agentName, agent.model, options?.sessionModel);
 	const resolvedThinking = resolveAgentThinking(agentName);
 	const mainModelForChild = inheritMainModel(options?.sessionModel);
+	if (placement.worktreeError) {
+		const message = `Writable subagent isolation failed before spawn: ${placement.worktreeError}`;
+		const fail: SingleResult = {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			title: options?.title,
+			exitCode: 1,
+			messages: [],
+			stderr: message,
+			errorMessage: message,
+			usage: emptyUsage(),
+			model: resolvedModel,
+			step,
+			agentId: pipiuiAgentId,
+			stopReason: "error",
+		};
+		await postPipiuiReport({
+			kind: "start",
+			agentId: pipiuiAgentId,
+			parentId: PIPIUI_PARENT,
+			toolCallId: pipiuiCurrentToolCall,
+			name: agentName,
+			task,
+			depth: PIPIUI_DEPTH + 1,
+			model: resolvedModel ?? null,
+			...(options?.title ? { title: options.title } : {}),
+			...(options?.background ? { background: true } : {}),
+			worktreeError: placement.worktreeError,
+		});
+		jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title);
+		jobFinalize(pipiuiAgentId, {
+			name: agentName,
+			task,
+			state: "failed",
+			resultText: message,
+		});
+		await postTerminalPipiuiReport({
+			kind: "end",
+			agentId: pipiuiAgentId,
+			ok: false,
+			output: message,
+			worktreeError: placement.worktreeError,
+		});
+		return fail;
+	}
+	const spawnCwd = placement.cwd;
 
 	// A worker keeps its conversation across re-dispatches so a vertical slice — implement,
 	// verify, debug, fix, re-verify — is done by someone who remembers writing the code, rather
 	// than by a stranger who re-reads the files and re-derives the same wrong assumption every
 	// round. Read-only roles stay ephemeral: their deliverable is a one-shot report, and stale
 	// context would bias the next one.
-	const sessionDir = READ_ONLY_AGENTS.has(agentName) ? undefined : agentSessionDir();
+	// First real dispatch is exactly when the ledger becomes relevant (see the lazy-discovery
+	// rule the orchestration layer states), so seed it here rather than on every session start.
+	seedBossLedger();
+	const sessionDir = agent.traits.readOnly ? undefined : agentSessionDir();
 	const sessionId = `pipiui-${pipiuiAgentId}`;
 	const resumingSession = Boolean(
 		sessionDir && !options?.fresh && agentSessionExists(sessionDir, sessionId),
@@ -1776,6 +3012,7 @@ async function runSingleAgent(
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
 	if (PIPIUI_SEARCH_SCOPE_EXT) args.push("-e", PIPIUI_SEARCH_SCOPE_EXT);
+	if (PIPIUI_WEBSEARCH_EXT) args.push("-e", PIPIUI_WEBSEARCH_EXT);
 	if (PIPIUI_COMPUTER_EXT && process.env.PIPIUI_COMPUTER_CAPABILITY) {
 		args.push("-e", PIPIUI_COMPUTER_EXT);
 	}
@@ -1807,6 +3044,8 @@ async function runSingleAgent(
 	const currentResult: SingleResult = {
 		agent: agentName,
 		agentSource: agent.source,
+		// Carried on the result because the done formatter runs far from the agent definition.
+		reportsInFull: agent.traits.reportsInFull,
 		task,
 		title: options?.title,
 		exitCode: 0,
@@ -1821,7 +3060,7 @@ async function runSingleAgent(
 
 	let pipiuiLastUpdate = 0;
 	let pipiuiActivity = "";
-	pipiuiReport({
+	await postPipiuiReport({
 		kind: "start",
 		agentId: pipiuiAgentId,
 		parentId: PIPIUI_PARENT,
@@ -1848,7 +3087,8 @@ async function runSingleAgent(
 			task,
 			title: options?.title,
 			lastActivityAt: Date.now(),
-			stallNotified: false,
+			lastStallNotifyAt: 0,
+			startedAt: Date.now(),
 		});
 	}
 	const pipiuiUpdate = (force = false) => {
@@ -1889,196 +3129,284 @@ async function runSingleAgent(
 
 		args.push(`Task: ${task}`);
 		let wasAborted = false;
+		// Auto-resume: transport/API deaths used to mark the job failed with zero recovery even
+		// though `--session-id` already supports resume. Re-spawn up to AUTO_RESUME_MAX times
+		// (same args → session resume for stateful roles; cold restart for --no-session).
+		let autoResumeCount = 0;
+		let exitCode = 1;
 
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const childEnv = pipiuiChildProcessEnv({
-				PIPIUI_AGENT_ID: pipiuiAgentId,
-				PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
-				PIPIUI_AGENT_ROLE: runtimePolicy.role,
-				// Scope marker read by the philosophy package. A `lead` delegates, so it needs
-				// the orchestration layers; every other dispatched agent must not get them —
-				// depth alone cannot tell the two apart, and a worker taught to fan out would
-				// fight PIPIUI_AGENT_MAX_DEPTH.
-				PIPI_PHILOSOPHY_ROLE: agentName === "lead" ? "lead" : "worker",
-				...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
-				// Every dispatched child runs isolated from external skill libraries; only
-				// read-only planners also get the SKILL.md read block.
-				PIPIUI_SUBAGENT_SKILL_ISOLATION: "1",
-				PIPIUI_SKILL_READ_BLOCK: agentName === "plan" ? "1" : undefined,
-				...(runtimePolicy.worktree === "main-session"
-					? { PIPIUI_WORKTREE: "0", PIPIUI_AGENT_NO_DELEGATION: "1" }
-					: {}),
-				...(placement.worktreePath ? { PIPIUI_WORKTREE_PATH: placement.worktreePath } : {}),
-				...(placement.worktreeBranch ? { PIPIUI_WORKTREE_BRANCH: placement.worktreeBranch } : {}),
-			}, true);
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: spawnCwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				detached: false,
-				// 把 agent 树身份传给子进程：子进程再派 subagent 时 parentId/depth 自动正确
-				// PIPIUI_SUBAGENT_EXT / SEARCH_SCOPE_EXT / grant file / bridge / session
-				// 经 process.env 继承；子进程只读当前真人回合的 grant file。
-				env: childEnv,
+		for (;;) {
+			// Snapshot so retry classification only sees THIS attempt (prior "fetch failed"
+			// text in accumulated messages/stderr must not force another resume).
+			const attemptMessagesFrom = currentResult.messages.length;
+			const attemptStderrFrom = currentResult.stderr.length;
+			exitCode = await new Promise<number>((resolve) => {
+				const invocation = getPiInvocation(args);
+				const childEnv = pipiuiChildProcessEnv({
+					PIPIUI_AGENT_ID: pipiuiAgentId,
+					PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
+					PIPIUI_AGENT_ROLE: runtimePolicy.role,
+					// Scope marker read by the philosophy package. An agent that delegates needs the
+					// orchestration layers; every other dispatched agent must not get them — depth
+					// alone cannot tell the two apart, and a worker taught to fan out would fight
+					// PIPIUI_AGENT_MAX_DEPTH. Declared by the agent (`delegates: true`), which is
+					// consistent with `tools` already deciding whether it can dispatch at all.
+					PIPI_PHILOSOPHY_ROLE: agent.traits.delegates ? "lead" : "worker",
+					...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
+					// Every dispatched child runs isolated from external skill libraries; an agent
+					// that asks for it (`block-skill-reads: true`) also cannot read SKILL.md at all.
+					PIPIUI_SUBAGENT_SKILL_ISOLATION: "1",
+					PIPIUI_SKILL_READ_BLOCK: agent.traits.blockSkillReads ? "1" : undefined,
+					...(runtimePolicy.worktree === "main-session"
+						? { PIPIUI_WORKTREE: "0", PIPIUI_AGENT_NO_DELEGATION: "1" }
+						: {}),
+					...(placement.worktreePath ? { PIPIUI_WORKTREE_PATH: placement.worktreePath } : {}),
+					...(placement.worktreeBranch ? { PIPIUI_WORKTREE_BRANCH: placement.worktreeBranch } : {}),
+				}, true);
+				const proc = spawn(invocation.command, invocation.args, {
+					cwd: spawnCwd,
+					shell: false,
+					stdio: ["ignore", "pipe", "pipe"],
+					detached: false,
+					// 把 agent 树身份传给子进程：子进程再派 subagent 时 parentId/depth 自动正确
+					// PIPIUI_SUBAGENT_EXT / SEARCH_SCOPE_EXT / grant file / bridge / session
+					// 经 process.env 继承；子进程只读当前真人回合的 grant file。
+					env: childEnv,
+				});
+				pipiuiTrackChild(proc);
+				// Recorded so the heartbeat can tell "quiet" from "gone".
+				const liveHandle = runningAgents.get(pipiuiAgentId);
+				if (liveHandle) liveHandle.pid = proc.pid;
+				let buffer = "";
+
+				const processLine = (line: string) => {
+					if (!line.trim()) return;
+					let event: any;
+					try {
+						event = JSON.parse(line);
+					} catch {
+						return;
+					}
+
+					if (event.type === "message_end" && event.message) {
+						const msg = event.message as Message;
+						currentResult.messages.push(msg);
+
+							if (msg.role === "assistant") {
+								currentResult.usage.turns++;
+								const usage = msg.usage;
+								if (usage) {
+									currentResult.usage.input += usage.input || 0;
+									currentResult.usage.output += usage.output || 0;
+									currentResult.usage.cacheRead += usage.cacheRead || 0;
+									currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+									currentResult.usage.cost += usage.cost?.total || 0;
+									currentResult.usage.contextTokens = usage.totalTokens || 0;
+									// Per-turn usage → PipiUI token ledger. Independent of the
+									// cost/turns aggregates above; gives per-turn input/output/cache
+									// breakdown that "end" doesn't carry. Safe to no-op if bridge unset.
+									const toolSet = new Set<string>();
+									for (const part of (msg as any).content ?? []) {
+										if (part?.type === "toolCall" && typeof part.name === "string" && part.name) {
+											toolSet.add(part.name);
+										}
+									}
+									const tools = [...toolSet].sort();
+									pipiuiReport({
+										kind: "usage",
+										agentId: pipiuiAgentId,
+										turn: currentResult.usage.turns,
+										model: msg.model || currentResult.model || null,
+										tools,
+										usage: {
+											input: usage.input || 0,
+											output: usage.output || 0,
+											cacheRead: usage.cacheRead || 0,
+											cacheWrite: usage.cacheWrite || 0,
+											cost: usage.cost?.total || 0,
+											contextTokens: usage.totalTokens || 0,
+										},
+									});
+								}
+							if (!currentResult.model && msg.model) currentResult.model = msg.model;
+							if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+							if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+							// 完整工作流水上报：每轮的思考/文本/工具调用都进 UI 日志
+							const pipiuiItems: Record<string, unknown>[] = [];
+							for (const part of (msg as any).content ?? []) {
+								if (part?.type === "toolCall") {
+									const args = (part.arguments ?? {}) as Record<string, unknown>;
+									const summary = summarizeToolArgsForUI(String(part.name ?? ""), args);
+									pipiuiActivity = `${part.name} ${summary}`;
+									// Edit keeps a bounded, valid JSON payload so the native subagent log can
+									// render the same line diff as the main-agent transcript. Other tools
+									// retain their compact human-readable summary.
+									const text = part.name === "edit" ? boundedEditPayloadForUI(args) : summary;
+									pipiuiItems.push({ itemType: "tool", name: part.name, text });
+								} else if (part?.type === "text" && String(part.text ?? "").trim()) {
+									pipiuiItems.push({ itemType: "text", text: String(part.text).slice(0, 4000) });
+								} else if (part?.type === "thinking" && String(part.thinking ?? "").trim()) {
+									pipiuiItems.push({ itemType: "thinking", text: String(part.thinking).slice(0, 600) });
+								}
+							}
+							if (pipiuiItems.length > 0) {
+								pipiuiReport({ kind: "log", agentId: pipiuiAgentId, items: pipiuiItems });
+							}
+						}
+						emitUpdate();
+						pipiuiUpdate();
+					}
+
+					if (event.type === "tool_result_end" && event.message) {
+						currentResult.messages.push(event.message as Message);
+						const resultMsg: any = event.message;
+						const resultText = (
+							Array.isArray(resultMsg.content)
+								? resultMsg.content
+										.filter((c: any) => c?.type === "text")
+										.map((c: any) => c.text)
+										.join("\n")
+								: ""
+						).slice(-1500);
+						pipiuiReport({
+							kind: "log",
+							agentId: pipiuiAgentId,
+							items: [
+								{
+									itemType: "toolResult",
+									name: resultMsg.toolName ?? "",
+									isError: !!resultMsg.isError,
+									text: resultText,
+								},
+							],
+						});
+						emitUpdate();
+						pipiuiUpdate();
+					}
+				};
+
+				proc.stdout.on("data", (data) => {
+					if (isBackground) noteAgentActivity(pipiuiAgentId);
+					buffer += data.toString();
+					const lines = buffer.split("\n");
+					buffer = lines.pop() || "";
+					for (const line of lines) processLine(line);
+				});
+
+				proc.stderr.on("data", (data) => {
+					if (isBackground) noteAgentActivity(pipiuiAgentId);
+					currentResult.stderr += data.toString();
+				});
+
+				proc.on("close", (code) => {
+					if (buffer.trim()) processLine(buffer);
+					resolve(code ?? 0);
+				});
+
+				proc.on("error", () => {
+					resolve(1);
+				});
+
+				// 后台 job 用外部可触达的 backgroundAbort（subagent_abort）；前台沿用工具调用 signal。
+				const effectiveSignal = signal ?? backgroundAbort?.signal;
+				if (effectiveSignal) {
+					let procExited = false;
+					proc.on("close", () => {
+						procExited = true;
+					});
+					const killProc = () => {
+						wasAborted = true;
+						proc.kill("SIGTERM");
+						const forceKill = setTimeout(() => {
+							if (!procExited) proc.kill("SIGKILL");
+						}, 5000);
+						forceKill.unref?.();
+					};
+					if (effectiveSignal.aborted) killProc();
+					else effectiveSignal.addEventListener("abort", killProc, { once: true });
+				}
 			});
-			pipiuiTrackChild(proc);
-			let buffer = "";
 
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
+			currentResult.exitCode = exitCode;
+
+			// Decide whether to auto-resume before verify/end (those run once, after the loop).
+			if (wasAborted) break;
+			const runFailed = exitCode !== 0 || Boolean(currentResult.errorMessage);
+			if (!runFailed) break;
+			if (autoResumeCount >= AUTO_RESUME_MAX) break;
+			const attemptMessages = currentResult.messages.slice(attemptMessagesFrom);
+			const attemptStderr = currentResult.stderr.slice(attemptStderrFrom);
+			const classifyText = [
+				currentResult.errorMessage ?? "",
+				currentResult.stopReason ?? "",
+				attemptStderr,
+				getFinalOutput(attemptMessages).slice(-2000),
+			].join("\n");
+			if (!isRetryableWorkerError(classifyText)) break;
+
+			const shortErr = (currentResult.errorMessage || currentResult.stderr || "retryable error")
+				.replace(/\s+/g, " ")
+				.trim()
+				.slice(0, 120);
+			const baseBackoffMs = AUTO_RESUME_BACKOFF_MS[autoResumeCount] ?? 15_000;
+			const backoffMs = jitteredRetryBackoffMs(baseBackoffMs);
+			autoResumeCount++;
+			// Reset per-run failure flags; messages/usage/stderr keep accumulating across resumes.
+			currentResult.stopReason = undefined;
+			currentResult.errorMessage = undefined;
+			pipiuiActivity = `auto-resume 第${autoResumeCount}次：前次死于 ${shortErr}`;
+			// Drop dead pid before backoff so zombie-settle does not treat the worker as vanished.
+			const h = runningAgents.get(pipiuiAgentId);
+			if (h) h.pid = undefined;
+			if (isBackground) noteAgentActivity(pipiuiAgentId);
+			// 压缩会话后再 resume：worker 进程已退出（无并发写窗口），满上下文会反复 fetch
+			// failed，append 一条 pi 原生 compaction 条目让 buildContextEntries 丢弃旧上下文。
+			// 只读角色（sessionDir undefined）无会话可压缩，跳过并走原 resume 路径（冷重跑）。
+			if (sessionDir && (currentResult.usage?.contextTokens ?? 0) >= AUTO_COMPACT_BEFORE_RESUME_TOKENS) {
+				const compacted = appendSessionCompaction(
+					sessionDir,
+					sessionId,
+					task,
+					currentResult.usage?.contextTokens ?? 0,
+				);
+				if (compacted) {
+					pipiuiActivity += `；会话已压缩（${((currentResult.usage?.contextTokens ?? 0) / 1000) | 0}k tokens）`;
+					pipiuiUpdate(true);
+				}
+			}
+			pipiuiUpdate(true);
+
+			// Backoff interruptible by abort (foreground tool signal or backgroundAbort).
+			const waitSignal = signal ?? backgroundAbort?.signal;
+			const abortedDuringBackoff = await new Promise<boolean>((resolve) => {
+				if (waitSignal?.aborted) {
+					resolve(true);
 					return;
 				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-						if (msg.role === "assistant") {
-							currentResult.usage.turns++;
-							const usage = msg.usage;
-							if (usage) {
-								currentResult.usage.input += usage.input || 0;
-								currentResult.usage.output += usage.output || 0;
-								currentResult.usage.cacheRead += usage.cacheRead || 0;
-								currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-								currentResult.usage.cost += usage.cost?.total || 0;
-								currentResult.usage.contextTokens = usage.totalTokens || 0;
-								// Per-turn usage → PipiUI token ledger. Independent of the
-								// cost/turns aggregates above; gives per-turn input/output/cache
-								// breakdown that "end" doesn't carry. Safe to no-op if bridge unset.
-								const toolSet = new Set<string>();
-								for (const part of (msg as any).content ?? []) {
-									if (part?.type === "toolCall" && typeof part.name === "string" && part.name) {
-										toolSet.add(part.name);
-									}
-								}
-								const tools = [...toolSet].sort();
-								pipiuiReport({
-									kind: "usage",
-									agentId: pipiuiAgentId,
-									turn: currentResult.usage.turns,
-									model: msg.model || currentResult.model || null,
-									tools,
-									usage: {
-										input: usage.input || 0,
-										output: usage.output || 0,
-										cacheRead: usage.cacheRead || 0,
-										cacheWrite: usage.cacheWrite || 0,
-										cost: usage.cost?.total || 0,
-										contextTokens: usage.totalTokens || 0,
-									},
-								});
-							}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-						// 完整工作流水上报：每轮的思考/文本/工具调用都进 UI 日志
-						const pipiuiItems: Record<string, unknown>[] = [];
-						for (const part of (msg as any).content ?? []) {
-							if (part?.type === "toolCall") {
-								const args = (part.arguments ?? {}) as Record<string, unknown>;
-								const summary = summarizeToolArgsForUI(String(part.name ?? ""), args);
-								pipiuiActivity = `${part.name} ${summary}`;
-								// Send human summary (path/command), not truncated JSON — matches main agent.
-								pipiuiItems.push({ itemType: "tool", name: part.name, text: summary });
-							} else if (part?.type === "text" && String(part.text ?? "").trim()) {
-								pipiuiItems.push({ itemType: "text", text: String(part.text).slice(0, 4000) });
-							} else if (part?.type === "thinking" && String(part.thinking ?? "").trim()) {
-								pipiuiItems.push({ itemType: "thinking", text: String(part.thinking).slice(0, 600) });
-							}
-						}
-						if (pipiuiItems.length > 0) {
-							pipiuiReport({ kind: "log", agentId: pipiuiAgentId, items: pipiuiItems });
-						}
-					}
-					emitUpdate();
-					pipiuiUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					const resultMsg: any = event.message;
-					const resultText = (
-						Array.isArray(resultMsg.content)
-							? resultMsg.content
-									.filter((c: any) => c?.type === "text")
-									.map((c: any) => c.text)
-									.join("\n")
-							: ""
-					).slice(-1500);
-					pipiuiReport({
-						kind: "log",
-						agentId: pipiuiAgentId,
-						items: [
-							{
-								itemType: "toolResult",
-								name: resultMsg.toolName ?? "",
-								isError: !!resultMsg.isError,
-								text: resultText,
-							},
-						],
-					});
-					emitUpdate();
-					pipiuiUpdate();
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				if (isBackground) noteAgentActivity(pipiuiAgentId);
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				if (isBackground) noteAgentActivity(pipiuiAgentId);
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", () => {
-				resolve(1);
-			});
-
-			// 后台 job 用外部可触达的 backgroundAbort（subagent_abort）；前台沿用工具调用 signal。
-			const effectiveSignal = signal ?? backgroundAbort?.signal;
-			if (effectiveSignal) {
-				let procExited = false;
-				proc.on("close", () => {
-					procExited = true;
-				});
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					const forceKill = setTimeout(() => {
-						if (!procExited) proc.kill("SIGKILL");
-					}, 5000);
-					forceKill.unref?.();
+				const timer = setTimeout(() => {
+					waitSignal?.removeEventListener("abort", onAbort);
+					resolve(false);
+				}, backoffMs);
+				timer.unref?.();
+				const onAbort = () => {
+					clearTimeout(timer);
+					resolve(true);
 				};
-				if (effectiveSignal.aborted) killProc();
-				else effectiveSignal.addEventListener("abort", killProc, { once: true });
-			}
-		});
+				if (waitSignal) waitSignal.addEventListener("abort", onAbort, { once: true });
+			});
+			if (abortedDuringBackoff || waitSignal?.aborted) {
+				wasAborted = true;
+				break;
+			}		}
 
-		currentResult.exitCode = exitCode;
 		// Attested verify: runs AFTER the agent process exits and BEFORE the "end" report,
 		// because Swift auto-merges and removes the worktree on "end". Skipped on abort
 		// (user interrupted; don't block up to VERIFY_TIMEOUT_MS on a dead task).
 		// A read-only role delivers a report, not a file: running a verify against it can
 		// only ever fail, which used to burn the two-attempts budget on a re-dispatch that
 		// was structurally incapable of passing. `verifyDropped` tells the boss why.
-		const attestableVerify = READ_ONLY_AGENTS.has(agentName) ? undefined : options?.verify;
-		if (READ_ONLY_AGENTS.has(agentName) && options?.verify && options.verify.trim()) {
+		const attestableVerify = agent.traits.readOnly ? undefined : options?.verify;
+		if (agent.traits.readOnly && options?.verify && options.verify.trim()) {
 			currentResult.verifyDropped = true;
 		}
 		if (attestableVerify && attestableVerify.trim() && !wasAborted) {
@@ -2090,12 +3418,32 @@ async function runSingleAgent(
 		}
 		const endOk = exitCode === 0 && !currentResult.errorMessage && !wasAborted;
 		if (wasAborted) currentResult.stopReason = currentResult.stopReason ?? "aborted";
-		pipiuiReport({
+		// Notes appended after slice so they survive the -8000 tail trim on long outputs.
+		let endOutput = (getFinalOutput(currentResult.messages) || currentResult.stderr || "").slice(-8000);
+		let endResultText =
+			getResultOutput(currentResult) || currentResult.stderr || getFinalOutput(currentResult.messages) || "(no output)";
+		if (endOk && autoResumeCount > 0) {
+			const note = `\n[pipiui] auto-resumed ${autoResumeCount}× after retryable errors.`;
+			endOutput += note;
+			endResultText += note;
+		} else if (
+			!endOk &&
+			!wasAborted &&
+			(currentResult.usage.contextTokens || 0) >= AUTO_RESUME_CONTEXT_HINT_TOKENS
+		) {
+			const n = Math.round((currentResult.usage.contextTokens || 0) / 1000);
+			const note = `\n[pipiui] 疑似上下文过大（~${n}k tokens）导致请求反复失败：建议 boss 以 fresh 重派该 agentId，缩小任务范围并要求小窗口读取。`;
+			endOutput += note;
+			endResultText += note;
+			// Append only — never replace an existing terminal errorMessage.
+			if (currentResult.errorMessage) currentResult.errorMessage += note;
+		}
+		await postTerminalPipiuiReport({
 			kind: "end",
 			agentId: pipiuiAgentId,
 			ok: endOk,
 			aborted: wasAborted,
-			output: (getFinalOutput(currentResult.messages) || currentResult.stderr || "").slice(-8000),
+			output: endOutput,
 			cost: currentResult.usage.cost,
 			turns: currentResult.usage.turns,
 			contextTokens: currentResult.usage.contextTokens,
@@ -2112,8 +3460,6 @@ async function runSingleAgent(
 		});
 		// Terminal job state before notify/return so status works even if follow-up delivery fails.
 		const endState: JobState = wasAborted ? "aborted" : endOk ? "ok" : "failed";
-		const endResultText =
-			getResultOutput(currentResult) || currentResult.stderr || getFinalOutput(currentResult.messages) || "(no output)";
 		jobFinalize(pipiuiAgentId, {
 			name: agentName,
 			task,
@@ -2128,6 +3474,7 @@ async function runSingleAgent(
 		return currentResult;
 	} finally {
 		if (isBackground) runningAgents.delete(pipiuiAgentId);
+		if (sessionDir) pruneAgentSessions(sessionDir, "completed");
 		if (tmpPromptPath)
 			try {
 				fs.unlinkSync(tmpPromptPath);
@@ -2138,16 +3485,21 @@ async function runSingleAgent(
 			try {
 				fs.rmdirSync(tmpPromptDir);
 			} catch {
-				/* ignore */
-			}
+					/* ignore */
+				}
+	}
+	} finally {
+		await awaitTerminalPipiuiReports(pipiuiAgentId);
+		releaseAgentLease(agentLease);
+		localAgentReservations.delete(pipiuiAgentId);
 	}
 }
 
 const VERIFY_PARAM_DESCRIPTION =
-	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Boss must fill this for implementation tasks. Omit it for read-only agents (plan/explore/reviewer) — they deliver a report, not files, and the runtime drops any verify they are given.";
+	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Boss must fill this for implementation tasks. Omit it for read-only agents — they deliver a report, not files, and the runtime drops any verify they are given.";
 
 const AGENT_ID_DESCRIPTION =
-	"Short semantic name for the worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\". Re-dispatching the same agentId continues that worker with its previous conversation, worktree and branch — use it for one vertical slice (implement, verify, debug, fix, re-verify). Omit for one-off work and a name is generated. Also the target id for action=\"abort\".";
+	"Short semantic name for the worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\". Re-dispatching the same agentId continues a writable worker with its previous conversation, worktree and branch — use it for one vertical slice (implement, verify, debug, fix, re-verify). Read-only roles are one-shot and do not create a worktree. Omit for one-off work and a name is generated. Also the target id for action=\"abort\".";
 const FRESH_DESCRIPTION =
 	"Discard this agentId's stored conversation and start it cold. Use when its context went wrong, not routinely.";
 
@@ -2201,7 +3553,12 @@ const SubagentParams = Type.Object({
 				"Short one-line title shown in the Subagents panel list instead of the full task (single mode); omit to fall back to task text",
 		}),
 	),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task, title?, cwd?, verify?} for parallel execution" })),
+	tasks: Type.Optional(
+		Type.Array(TaskItem, {
+			description:
+				'Array of {agent, task, title?, cwd?, verify?} for parallel execution. Put each independent workflow in its own array element; NEVER merge independent goals into one brief.\nExample: [{"agent":"explore","task":"map auth"},{"agent":"explore","task":"map billing"}].\nAnti-pattern: one task brief listing A; B; C.',
+		}),
+	),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task, title?, cwd?, verify?} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
@@ -2362,21 +3719,57 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ---- Stall watchdog：后台 job 超过 120s 无任何流式事件/输出 → 向 boss 会话推一条 ----
-	// [subagent-stalled] agentId=<id> title=<title> idle=<秒>s last=<最后一行动作摘要>
-	// 每个卡死片段只推一次（有新活动后重新武装）；复用 [subagent-done] 的 followUp 通道。
-	// 30s interval 扫描；无 PIPIUI_* 环境变量时桥接上报自动静默（pipiuiReport no-op）。
+	// ---- 统一轮询（30s）：承载三条按节奏补推的路径 ——
+	// 1) done 重投：sendUserMessage 的 promise 未确认（reject 或未 settle）的 [subagent-done]，
+	//    同一 agentId 至少隔 60s 重投一次，直到确认。job 已 terminal，重投只依赖 pendingDone 里的 text。
+	// 2) vanished 即时检测：pid 已死但没人报告 → 立刻推（不等 5min 心跳），推一次后从 runningAgents 删除。
+	// 3) stall 复推：idle ≥ 120s 即推 [subagent-stalled]，boss 若继续等，每 5 分钟复推一次（idle 秒数更新）；
+	//    有新活动后 noteAgentActivity 复位 lastStallNotifyAt=0，重新武装。
+	// 复用 [subagent-done] 的 followUp 通道。无 PIPIUI_* 环境变量时桥接上报自动静默（pipiuiReport no-op）。
 	const STALL_WATCHDOG_KEY = "__pipiuiSubagentStallWatchdog";
 	const g = globalThis as Record<string, unknown>;
 	const prevWatchdog = g[STALL_WATCHDOG_KEY] as ReturnType<typeof setInterval> | undefined;
 	if (prevWatchdog) clearInterval(prevWatchdog); // 防扩展 reload 后旧定时器泄漏
 	const stallWatchdog = setInterval(() => {
 		const now = Date.now();
+
+		// (1) done 重投
+		for (const [agentId, entry] of [...pendingDone]) {
+			if (deliveredDone.has(agentId)) { pendingDone.delete(agentId); continue; } // 已闩条目不再重投，清理防残留
+			if (now - entry.lastAttemptAt < DONE_RETRY_MIN_INTERVAL_MS) continue;
+			sendDoneWithConfirmation(pi, agentId, entry.text, true);
+		}
+
+		// (2) vanished 即时检测（isProcessAlive 只是 signal 0，很便宜）。先于 stall 扫描：
+		// 死掉的进程不该再收到 stall 推送。必须 jobFinalize + pipiuiReport(end) 再 delete，
+		// 否则 jobRegistry/Swift 面板会永远停在 running（半结算）。
+		for (const [agentId, handle] of [...runningAgents]) {
+			if (!isHandleVanished(handle, now)) continue;
+			const title =
+				handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 60) || "(untitled)";
+			const elapsed = formatElapsedMs(now - handle.startedAt);
+			const reason =
+				handle.pid === undefined
+					? `process never attached a pid after ${elapsed}; treated as interrupted (vanished)`
+					: `process gone after ${elapsed}, no result reported`;
+			markWorkerInterrupted(agentId, reason);
+			deliverSubagentDone(
+				pi,
+				[
+					`[subagent-heartbeat] outstanding=${runningAgents.size} vanished=1`,
+					`  ${agentId} (${title}) — ${reason}`,
+					"A vanished worker was interrupted, not failed: its stored conversation is intact, so re-dispatch that same agentId to continue where it left off.",
+				].join("\n"),
+			);
+		}
+
+		// (3) stall 推送 / 复推
 		for (const [agentId, handle] of runningAgents) {
-			if (handle.stallNotified) continue;
 			const idleMs = now - handle.lastActivityAt;
 			if (idleMs < STALL_THRESHOLD_MS) continue;
-			handle.stallNotified = true;
+			// 本片段推过且距上次不足 5 分钟：boss 可能正在处理，保持沉默。
+			if (handle.lastStallNotifyAt > 0 && now - handle.lastStallNotifyAt < STALL_RENOTIFY_INTERVAL_MS) continue;
+			handle.lastStallNotifyAt = now;
 			const idleSec = Math.floor(idleMs / 1000);
 			const job = jobRegistry.get(agentId);
 			const title =
@@ -2385,7 +3778,13 @@ export default function (pi: ExtensionAPI) {
 			const lastLine = (activityRaw.split("\n").pop() ?? "").trim().slice(0, 120) || "(no activity)";
 			deliverSubagentDone(
 				pi,
-				`[subagent-stalled] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine}`,
+				// Handling rides with the event rather than sitting in the cached prefix all
+				// session waiting for a stall that may never happen — and it is more likely to
+				// be followed here, next to the thing it is about.
+				[
+					`[subagent-stalled] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine}`,
+					`Query it first with subagent_status({agentId:"${agentId}"}), then choose exactly one: keep waiting (say why) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent still reports [subagent-done], and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
+				].join("\n"),
 			);
 			pipiuiReport({
 				kind: "stalled",
@@ -2398,6 +3797,61 @@ export default function (pi: ExtensionAPI) {
 	}, STALL_WATCHDOG_INTERVAL_MS);
 	stallWatchdog.unref?.();
 	g[STALL_WATCHDOG_KEY] = stallWatchdog;
+
+	// Heartbeat. Background dispatch ends the boss's turn, so from then on the session only
+	// moves again when something pushes it. Every push so far fires at most once per worker:
+	// [subagent-done] on exit, [subagent-stalled] once per idle episode. If any of those is
+	// missed — the close handler never ran, the extension reloaded mid-flight, delivery failed
+	// — nothing ever wakes the boss and it waits forever on work that is already over.
+	//
+	// Codex avoids this by making the wait itself bounded: `wait_agent` takes a timeout and
+	// returns an empty status when it expires, so control always comes back. We cannot bound a
+	// wait the boss never issued, so we bound the silence instead: while anything is
+	// outstanding, the boss hears from us at least this often, whatever else did or did not
+	// happen.
+	const HEARTBEAT_KEY = "__pipiuiSubagentHeartbeat";
+	const prevHeartbeat = g[HEARTBEAT_KEY] as ReturnType<typeof setInterval> | undefined;
+	if (prevHeartbeat) clearInterval(prevHeartbeat);
+	const heartbeat = setInterval(() => {
+		if (runningAgents.size === 0) return; // nothing outstanding: stay quiet
+		const now = Date.now();
+		const alive: string[] = [];
+		const vanished: string[] = [];
+		for (const [agentId, handle] of [...runningAgents]) {
+			const title =
+				handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 60) || "(untitled)";
+			const elapsed = formatElapsedMs(now - handle.startedAt);
+			const idle = Math.floor((now - handle.lastActivityAt) / 1000);
+			if (isHandleVanished(handle, now)) {
+				// Process gone (or never attached) without a close report — full settle once.
+				const reason =
+					handle.pid === undefined
+						? `process never attached a pid after ${elapsed}; treated as interrupted (vanished)`
+						: `process gone after ${elapsed}, no result reported`;
+				markWorkerInterrupted(agentId, reason);
+				vanished.push(`  ${agentId} (${title}) — ${reason}`);
+				continue;
+			}
+			alive.push(`  ${agentId} (${title}) — running ${elapsed}, idle ${idle}s`);
+		}
+		if (alive.length === 0 && vanished.length === 0) return;
+		const lines = [
+			`[subagent-heartbeat] outstanding=${alive.length} vanished=${vanished.length}`,
+			...alive,
+			...vanished,
+		];
+		if (vanished.length > 0) {
+			lines.push(
+				"A vanished worker was interrupted, not failed: its stored conversation is intact, so re-dispatch that same agentId to continue where it left off.",
+			);
+		}
+		lines.push(
+			"Silence is not progress: it means one of still thinking, died without reporting, or its report was lost. Decide which and act — keep waiting (say why), pull one report with subagent_status, or recover a vanished worker. Do not re-dispatch a worker that is still running; that puts two agents in the same files.",
+		);
+		deliverSubagentDone(pi, lines.join("\n"));
+	}, HEARTBEAT_INTERVAL_MS);
+	heartbeat.unref?.();
+	g[HEARTBEAT_KEY] = heartbeat;
 	// 进程退出时清理定时器（unref 已保证不拖住退出；这里是显式清理）。
 	process.on("exit", () => {
 		clearInterval(stallWatchdog);
@@ -2422,7 +3876,7 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_status",
 		label: "Subagent Status",
 		description: [
-			"Query subagent job status (running / ok / failed / aborted), plus workers that are stopped but still hold their stored context.",
+			"Query subagent job status (running / ok / failed / aborted / interrupted), plus workers that are stopped but still hold their stored context.",
 			"An interrupted worker is not a failed one: re-dispatch its agentId to continue where it left off instead of starting someone cold.",
 			"Use when deciding next action, when the user asks for progress, or before re-dispatching.",
 			"Prefer reading finished results via this tool or [subagent-done] over spawning a new agent for the same work.",
@@ -2456,12 +3910,12 @@ export default function (pi: ExtensionAPI) {
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
 			"While the fan-out philosophy layer is active, background=false is ignored at boss depth — asynchronous dispatch is that layer's premise, not a preference. Use chain for genuinely ordered synchronous steps.",
-			"By default each worker writes in an isolated git worktree under .pi/worktrees/ on a pipiui/agent-* branch; pass explicit cwd or set PIPIUI_WORKTREE=0 to disable. The runtime-owned secretary role is the exception: it always runs in PIPIUI_MAIN_CWD with recursive delegation disabled and never creates a worktree. On successful worker end the app auto-merges into the main project, removes the worktree, and safely deletes only a merged internal branch with git branch -d. If merge or cleanup fails, the main session retains actionable state; failed/aborted keeps worktree for resume (GUI merge/discard fallback).",
+			"By default writable workers run in an isolated git worktree under .pi/worktrees/ on a pipiui/<agentId> branch; read-only roles run directly in the caller cwd and never create a worktree. Pass explicit cwd or set PIPIUI_WORKTREE=0 to disable worktree isolation. The runtime-owned secretary role is also an exception: it always runs in PIPIUI_MAIN_CWD with recursive delegation disabled and never creates a worktree. On successful writable-worker end the app auto-merges into the main project, removes the worktree, and safely deletes only a merged internal branch with git branch -d. If merge or cleanup fails, the main session retains actionable state; failed/aborted keeps worktree for resume (GUI merge/discard fallback).",
 			"Track jobs with subagent_status(agentId?). Never re-spawn a finished task without reading its result via [subagent-done] or subagent_status.",
 			'Abort a running background job with action:"abort" + agentId (equivalent to /subagent_abort); it ends as aborted and still reports [subagent-done].',
 			"Background jobs with no output for 120s are pushed as [subagent-stalled] and marked stalled (with idle seconds) in subagent_status.",
 			"Do not busy-loop poll; one status check per decision is correct.",
-			"chain and nested (depth>0) are always synchronous. Set background:false to await a single/parallel result.",
+			"chain and nested (depth>0) are always synchronous. Background dispatches automatically wake you with a [subagent-done] signal; continue other work rather than waiting or polling.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
@@ -2494,23 +3948,18 @@ export default function (pi: ExtensionAPI) {
 			const hasSingle = Boolean(params.agent && params.task);
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 			const isChain = hasChain;
-			// Caller-chosen ids are the addressing scheme for continuing a worker, so a bad one
-			// is reported back to the model to fix rather than silently replaced — a silently
-			// replaced id becomes a different worker with an empty head.
-			for (const candidate of [
-				...(params.action !== "abort" ? [params.agentId] : []),
-				...(params.tasks ?? []).map((t) => t.agentId),
-			]) {
-				if (candidate === undefined) continue;
-				const problem = validateAgentId(candidate.trim());
-				if (problem) {
-					return {
-						content: [{ type: "text", text: problem }],
-						details: makeDetails(isChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-						isError: true,
-					};
-				}
-			}
+			const makeDetails =
+				(mode: "single" | "parallel" | "chain", extra?: { background?: boolean; agentIds?: string[] }) =>
+				(results: SingleResult[]): SubagentDetails => ({
+					mode,
+					agentScope,
+					projectAgentsDir: discovery.projectAgentsDir,
+					results,
+					...(extra?.background ? { background: true } : {}),
+					...(extra?.agentIds ? { agentIds: extra.agentIds } : {}),
+				});
+
+			const requestAgentIds = new Set<string>();
 			// Default background at boss depth for single/parallel; chain and nested always sync.
 			// While the fan-out layer is on, background is not the caller's to switch off: a boss
 			// that blocks on every dispatch is running a fake fan-out, and the guard has to be
@@ -2525,17 +3974,6 @@ export default function (pi: ExtensionAPI) {
 					: params.background === false && forcedBackground
 						? "Warning: background:false ignored — the fan-out philosophy layer is active, and it requires dispatch to stay asynchronous. Do not wait here: keep dispatching independent work, then read [subagent-done]. Use chain if you genuinely need ordered synchronous steps, or turn off the 瀑布流 layer in Settings.\n\n"
 						: "";
-
-			const makeDetails =
-				(mode: "single" | "parallel" | "chain", extra?: { background?: boolean; agentIds?: string[] }) =>
-				(results: SingleResult[]): SubagentDetails => ({
-					mode,
-					agentScope,
-					projectAgentsDir: discovery.projectAgentsDir,
-					results,
-					...(extra?.background ? { background: true } : {}),
-					...(extra?.agentIds ? { agentIds: extra.agentIds } : {}),
-				});
 
 			// action=abort：中止运行中的后台 job（不占 single/parallel/chain 的 mode 名额）
 			if (params.action === "abort") {
@@ -2659,6 +4097,112 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			const dispatchStatsTasks = hasChain
+				? params.chain!
+				: hasTasks
+					? params.tasks!
+					: [{ agent: params.agent!, task: params.task!, title: params.title }];
+			const dispatchMode: DispatchStatsMode = hasChain ? "chain" : hasTasks ? "tasks" : "single";
+
+			// Shape validator: single / tasks[] only. chain and same-agentId resume are exempt.
+			let dispatchNudgePrefix = "";
+			let dispatchValidatorStats: DispatchValidatorStats | null = null;
+			if (!hasChain) {
+				const shapeTasks = hasTasks
+					? (params.tasks ?? []).map((t) => ({
+							task: t.task,
+							agentId: t.agentId,
+							fresh: t.fresh,
+							title: t.title,
+						}))
+					: [
+							{
+								task: params.task!,
+								agentId: params.agentId,
+								fresh: params.fresh,
+								title: params.title,
+							},
+						];
+				const assessment = assessDispatchShape({
+					mode: hasTasks ? "tasks" : "single",
+					tasks: shapeTasks,
+				});
+				dispatchValidatorStats = assessment.stats;
+				if (assessment.enforceError) {
+					recordSubagentDispatchStats(
+						dispatchMode,
+						dispatchStatsTasks,
+						useBackground,
+						dispatchValidatorStats,
+					);
+					return {
+						content: [{ type: "text", text: assessment.enforceError }],
+						details: makeDetails(hasTasks ? "parallel" : "single")([]),
+						isError: true,
+					};
+				}
+					dispatchNudgePrefix = assessment.nudgeText;
+				}
+
+			if (hasTasks && (params.tasks?.length ?? 0) > MAX_PARALLEL_TASKS) {
+				return {
+					content: [{ type: "text", text: `Too many parallel tasks (${params.tasks!.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
+					details: makeDetails("parallel")([]),
+					isError: true,
+				};
+			}
+			const requestedNames = hasChain
+				? (params.chain ?? []).map((step) => step.agent)
+				: hasTasks
+					? (params.tasks ?? []).map((task) => task.agent)
+					: [params.agent!];
+			const unknownNames = [...new Set(requestedNames.filter((name) => !agents.some((agent) => agent.name === name)))];
+			if (unknownNames.length > 0) {
+				const available = agents.map((agent) => `"${agent.name}"`).join(", ") || "none";
+				return {
+					content: [{ type: "text", text: `Unknown agent(s): ${unknownNames.map((name) => `"${name}"`).join(", ")}. Available agents: ${available}.` }],
+					details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+					isError: true,
+				};
+			}
+
+			// This is deliberately after the final await/validation and immediately before
+			// dispatch. Add to the module reservation set synchronously so a concurrent tool call
+			// cannot pass the same selector during any later async setup.
+			const activeAgentIds = new Set<string>([
+				...localAgentReservations,
+				...runningAgents.keys(),
+				...[...jobRegistry.values()]
+					.filter((job) => job.state === "running")
+					.map((job) => job.agentId),
+			]);
+			const callerSelection = selectAndReserveCallerAgentIds(
+				hasTasks
+					? (params.tasks ?? []).map((task) => task.agentId)
+					: hasSingle
+						? [params.agentId]
+						: [],
+				activeAgentIds,
+				localAgentReservations,
+			);
+			if (callerSelection.problem) {
+				return {
+					content: [{ type: "text", text: callerSelection.problem }],
+					details: makeDetails(isChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+					isError: true,
+				};
+			}
+			for (const id of callerSelection.ids) {
+				requestAgentIds.add(id);
+			}
+
+			recordSubagentDispatchStats(
+				dispatchMode,
+				dispatchStatsTasks,
+				useBackground,
+				dispatchValidatorStats,
+			);
+
 			if (params.chain && params.chain.length > 0) {
 				const results: SingleResult[] = [];
 				let previousOutput = "";
@@ -2693,7 +4237,12 @@ export default function (pi: ExtensionAPI) {
 						chainUpdate,
 						makeDetails("chain"),
 
-						{ title: step.title, sessionModel, verify: step.verify },
+						{
+							title: step.title,
+							sessionModel,
+							verify: step.verify,
+							agentId: generatePipiuiAgentId(requestAgentIds),
+						},
 					);
 					results.push(result);
 
@@ -2718,7 +4267,7 @@ export default function (pi: ExtensionAPI) {
 				// cap, head-keep (templates put the key sections first).
 				const chainOutput = truncateTextHead(
 					getFinalOutput(lastChainResult.messages) || "(no output)",
-					doneCapForAgent(lastChainResult.agent, false),
+					doneCapForResult(lastChainResult, false),
 				);
 				return {
 					content: [
@@ -2766,7 +4315,7 @@ export default function (pi: ExtensionAPI) {
 
 					for (const t of params.tasks) {
 						const agentCfg = agents.find((a) => a.name === t.agent)!;
-						const agentId = t.agentId?.trim() || generatePipiuiAgentId();
+						const agentId = t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
 						agentIds.push(agentId);
 						startedItems.push({ agentId, name: t.agent, task: t.task, title: t.title });
 						placeholders.push({
@@ -2783,8 +4332,10 @@ export default function (pi: ExtensionAPI) {
 						});
 					}
 
-					// Fire-and-forget with the same concurrency cap; each task notifies on its own completion.
-					void mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
+					// Fire-and-forget with the same concurrency cap. Per-item notification is the
+					// finalization boundary, so completed full results are not retained until the
+					// slowest sibling settles.
+					void forEachWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
 						const agentId = agentIds[index];
 						try {
 							const result = await runSingleAgent(
@@ -2800,7 +4351,6 @@ export default function (pi: ExtensionAPI) {
 								{ background: true, agentId, title: t.title, sessionModel, verify: t.verify, fresh: t.fresh },
 							);
 							notifySubagentDone(pi, result);
-							return result;
 						} catch (err) {
 							const msg = err instanceof Error ? err.message : String(err);
 							console.error("[pipiui-subagent] background parallel agent error:", agentId, msg);
@@ -2819,14 +4369,15 @@ export default function (pi: ExtensionAPI) {
 								stopReason: aborted ? "aborted" : "error",
 							};
 							notifySubagentDone(pi, failResult, { aborted, error: msg });
-							return failResult;
 						}
 					}).catch((err) => {
 						console.error("[pipiui-subagent] background parallel runner error:", err);
 					});
 
 					return {
-						content: [{ type: "text", text: formatStartedMessage(startedItems) }],
+						content: [
+							{ type: "text", text: dispatchNudgePrefix + formatStartedMessage(startedItems) },
+						],
 						details: makeDetails("parallel", { background: true, agentIds })(placeholders),
 					};
 				}
@@ -2879,7 +4430,13 @@ export default function (pi: ExtensionAPI) {
 						},
 						makeDetails("parallel"),
 
-						{ title: t.title, sessionModel, verify: t.verify, agentId: t.agentId?.trim(), fresh: t.fresh },
+						{
+							title: t.title,
+							sessionModel,
+							verify: t.verify,
+							agentId: t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
+							fresh: t.fresh,
+						},
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -2903,6 +4460,7 @@ export default function (pi: ExtensionAPI) {
 						{
 							type: "text",
 							text:
+								dispatchNudgePrefix +
 								bgIgnoredWarning +
 								`Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
 						},
@@ -2927,7 +4485,7 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					const agentId = params.agentId?.trim() || generatePipiuiAgentId();
+					const agentId = params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
 					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.fresh);
 					const placeholder: SingleResult = {
 						agent: params.agent,
@@ -2945,9 +4503,11 @@ export default function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: formatStartedMessage([
-									{ agentId, name: params.agent, task: params.task, title: params.title },
-								]),
+								text:
+									dispatchNudgePrefix +
+									formatStartedMessage([
+										{ agentId, name: params.agent, task: params.task, title: params.title },
+									]),
 							},
 						],
 						details: makeDetails("single", { background: true, agentIds: [agentId] })([
@@ -2967,7 +4527,13 @@ export default function (pi: ExtensionAPI) {
 					onUpdate,
 					makeDetails("single"),
 
-					{ title: params.title, sessionModel, verify: params.verify, agentId: params.agentId?.trim(), fresh: params.fresh },
+					{
+						title: params.title,
+						sessionModel,
+						verify: params.verify,
+						agentId: params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
+						fresh: params.fresh,
+					},
 				);
 				const isError = isFailedResult(result);
 				if (isError) {
@@ -2976,7 +4542,7 @@ export default function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: `${bgIgnoredWarning}Agent ${result.stopReason || "failed"}: ${errorMsg}`,
+								text: `${dispatchNudgePrefix}${bgIgnoredWarning}Agent ${result.stopReason || "failed"}: ${errorMsg}`,
 							},
 						],
 						details: makeDetails("single")([result]),
@@ -2988,6 +4554,7 @@ export default function (pi: ExtensionAPI) {
 						{
 							type: "text",
 							text:
+								dispatchNudgePrefix +
 								bgIgnoredWarning +
 								(getFinalOutput(result.messages) || "(no output)") +
 								// Same attestation surface as [subagent-done]: verified field + Verify line.

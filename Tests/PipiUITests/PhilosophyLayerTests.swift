@@ -91,8 +91,21 @@ final class PhilosophyLayerTests: XCTestCase {
         assertContains(t, "## Planning")
         assertContains(t, "the plan is a short numbered list of dispatchable steps")
         assertContains(t, "lightweight `plan` worker")
+        // "whichever is proportionate" put self-service first and gave no criterion, so the
+        // boss always wrote it. The criterion is what it already knows, not how big it feels.
+        assertContains(t, "Who writes it follows from what you already know, never from how large the goal feels")
+        assertContains(t, "if working out the decomposition means reading code nobody has read yet, that is a lightweight `plan` worker, not a longer think")
+        // "if a brief is complete enough to dispatch, no plan is needed" was always true —
+        // briefs are required to be complete — so it read as a standing ban on the agent.
+        assertContains(t, "It never rules out dispatching a `plan` worker to work the steps out in the first place")
+        assertContains(t, "you cannot put steps in a brief that nobody has established yet")
         assertContains(t, "MUST NOT present, relay, or ask the user to choose an execution-mode menu")
-        assertContains(t, "third worker before any code is written")
+        assertContains(t, "third round of workers before any code is written")
+        // Counting workers rather than rounds made a wide research fan-out illegal, which the
+        // research route and the lead's ≥4 trigger both assume is legal.
+        assertContains(t, "capped at two rounds, not at two workers")
+        assertContains(t, "A wave of parallel `explore`s is one round however wide it is")
+        assertContains(t, "more independent questions means more workers at once, never more rounds")
 
         let all = try PhilosophyLayerFixture.allNormalizedBodies()
         for tier in ["weak model", "strong model", "model-tier", "model tier", "capable model"] {
@@ -133,16 +146,15 @@ final class PhilosophyLayerTests: XCTestCase {
         )
         assertContains(
             orchestration,
-            "The trigger is this session actually deciding to dispatch/delegate or otherwise entering real multi-worker coordination"
+            "The trigger is this session actually deciding to dispatch or otherwise entering real multi-worker coordination"
         )
+        // The runtime now creates the file at that same trigger, so the layer points at it
+        // instead of carrying ~380 tokens of layout on every turn.
         assertContains(
             orchestration,
-            "Before the first dispatch or coordination action, initialize the ledger under `.pi/boss/`"
+            "the runtime has already created your ledger under `.pi/boss/`"
         )
-        assertContains(
-            orchestration,
-            "read it once at this trigger, then stop re-reading it"
-        )
+        assertContains(orchestration, "Find it, fill it in, and keep it current")
         assertContains(
             orchestration,
             "From that point onward, update the ledger BEFORE acting"
@@ -171,7 +183,9 @@ final class PhilosophyLayerTests: XCTestCase {
         assertContains(t, "anchors you to")
         assertContains(t, "{{search}}")
         assertContains(t, "{{fetch}}")
-        assertContains(t, "it is triage, not floor work")
+        // "triage, not floor work" was the blanket permission to search personally; who runs
+        // the search is now decided by the size of the question.
+        assertContains(t, "Who does the searching follows the size of the question")
         assertContains(t, "Skip it when you already know the fix")
         assertContains(t, "probably not unique to this codebase")
         assertContains(t, "prior art would sharpen or overturn your plan")
@@ -208,14 +222,97 @@ final class PhilosophyLayerTests: XCTestCase {
         }
     }
 
-    /// A dispatched `lead` delegates, so it must be marked as a lead rather than a worker;
-    /// depth alone cannot tell them apart, and a plain worker taught to fan out would fight
-    /// the recursion guard.
+    /// An agent that delegates must be marked as a lead rather than a worker; depth alone
+    /// cannot tell them apart, and a plain worker taught to fan out would fight the recursion
+    /// guard. Which agents those are is declared by them (`delegates: true`), not remembered
+    /// by name here — see AgentTraitsTests.
     func testSubagentExtensionMarksLeadsSeparatelyFromWorkers() throws {
         let bundled = try XCTUnwrap(PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil))
         let source = try String(
             contentsOf: bundled.appendingPathComponent("subagent/index.ts"), encoding: .utf8)
-        XCTAssertTrue(source.contains("PIPI_PHILOSOPHY_ROLE: agentName === \"lead\" ? \"lead\" : \"worker\""))
+        XCTAssertTrue(source.contains("PIPI_PHILOSOPHY_ROLE: agent.traits.delegates ? \"lead\" : \"worker\""))
+
+        let lead = try String(
+            contentsOf: bundled.appendingPathComponent("agents/lead.md"), encoding: .utf8)
+        XCTAssertTrue(lead.contains("delegates: true"), "the roster's only orchestrator must say so")
+    }
+
+    /// Dropping the tier table took the only route that named `explore` with it, leaving four
+    /// rules arguing against recon and none for it — so the boss grepped everything itself.
+    /// The routing has to be stated where delegation lives, not inferred from a cost model.
+    func testInvestigationIsRoutedToExploreNotDoneByTheBoss() throws {
+        let t = try text("orchestration")
+        assertContains(t, "a handful of locating reads to size a goal or answer the user")
+        assertContains(t, "Past a handful of reads, that is an `explore`, not your own grep")
+        assertContains(t, "a sweep across directories, call sites, or naming conventions")
+        assertContains(t, "it is never a reason to run a search yourself")
+        // The cost model priced the worker's report and left self-service looking free, which
+        // is the arithmetic that made "do it myself" win every weighing.
+        assertContains(t, "reading files yourself spends that same resource")
+        assertContains(t, "Self-service is not the cheap option")
+        assertContains(t, "A research or analysis-only goal is delegated like any other")
+        assertContains(t, "one `explore` for a contained question, several over non-overlapping partitions")
+        assertContains(t, "before answering about code you have not read")
+    }
+
+    /// "One worker for a contained change" next to a section headed "One worker per vertical
+    /// slice" outvoted the fan-out layer, which the boss only reaches ~7k tokens later.
+    func testWorkerCountFollowsIndependenceNotSize() throws {
+        let t = try text("orchestration")
+        assertContains(t, "Two unrelated changes are two workers in one dispatch")
+        assertContains(t, "never one worker told to do both")
+        assertContains(t, "independence decides the count, size does not")
+
+        let fanout = try text("fanout")
+        assertContains(fanout, "Two unrelated small changes are two workers")
+        assertContains(fanout, "one worker told to cover several independent sub-items")
+    }
+
+    /// `{{agents}}` used to render five bare names, so a rule saying "delegate this" left the
+    /// boss without a way to answer "to whom" — and an unrecognized name resolves as "do it
+    /// myself". Each entry now carries when to reach for it, written for the boss routing a
+    /// task rather than for the agent describing itself.
+    func testRosterTellsTheBossWhenToReachForEachAgent() throws {
+        let table = try capabilityTable()
+        let agents = try XCTUnwrap(table["agents"] as? [[String: String]],
+                                   "the roster must be entries with a `use`, not bare strings")
+        let byName = Dictionary(uniqueKeysWithValues: agents.compactMap { entry in
+            entry["name"].map { ($0, entry["use"] ?? "") }
+        })
+
+        for required in ["explore", "plan", "general-purpose", "reviewer", "lead", "secretary"] {
+            let use = try XCTUnwrap(byName[required], "\(required) is missing from the roster")
+            XCTAssertFalse(use.isEmpty, "\(required) has no `use` text")
+        }
+        // The two the boss could not infer from the name alone are the whole point.
+        XCTAssertTrue(byName["plan"]?.contains("depends on code nobody has read yet") == true)
+        XCTAssertTrue(byName["lead"]?.contains("keep a wide wave out of your context") == true)
+
+        let body = try PhilosophyLayerFixture.normalizedBody("orchestration")
+        assertContains(body, "Your roster: {{agents}}")
+        assertContains(body, "A name whose purpose you cannot recall is one to look up here")
+    }
+
+    /// The roster is hand-written in capabilities.json because the philosophy package cannot
+    /// reach PiExt's agent directory. Nothing stops the two drifting, so the names are pinned
+    /// to the definitions that actually ship.
+    func testEveryRosterNameHasAnAgentDefinition() throws {
+        let table = try capabilityTable()
+        let agents = try XCTUnwrap(table["agents"] as? [[String: String]])
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        for entry in agents {
+            let name = try XCTUnwrap(entry["name"])
+            let definition = root.appendingPathComponent("Sources/PipiUI/PiExt/agents/\(name).md")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: definition.path),
+                          "roster names \(name) but no agents/\(name).md ships")
+        }
+    }
+
+    private func capabilityTable() throws -> [String: Any] {
+        let bundled = try XCTUnwrap(PhilosophyPackage.bundledURL)
+        let data = try Data(contentsOf: bundled.appendingPathComponent("capabilities.json"))
+        return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
     /// Layer bodies sit in the cached prefix of every request; English is roughly half the

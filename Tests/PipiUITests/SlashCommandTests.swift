@@ -185,9 +185,9 @@ final class SlashCommandTests: XCTestCase {
     // MARK: - Builtin table + parse
 
     func testBuiltinAllHasNineCommands() {
-        XCTAssertEqual(BuiltinCommands.all.count, 9)
+        XCTAssertEqual(BuiltinCommands.all.count, 10)
         let names = Set(BuiltinCommands.all.map(\.name))
-        XCTAssertEqual(names, ["compact", "new", "name", "session", "export", "copy", "quit", "model", "reload"])
+        XCTAssertEqual(names, ["compact", "new", "name", "session", "export", "copy", "quit", "model", "reload", "stats"])
         XCTAssertTrue(BuiltinCommands.all.allSatisfy { $0.source == .builtin })
         XCTAssertEqual(BuiltinCommands.command(named: "model")?.argumentHint, "<provider/model>")
         XCTAssertEqual(BuiltinCommands.command(named: "name")?.argumentHint, "<name>")

@@ -49,6 +49,40 @@ final class ComposerPasteCatcher {
     deinit { stop() }
 }
 
+/// Immutable ownership captured when a PDF selection/drop begins. Unlike normal
+/// image drops, a late PDF completion must never follow whichever session the
+/// warm-reused composer is displaying later.
+final class ComposerPDFIngestionTarget {
+    weak var session: ChatSession?
+    let projectURL: URL
+
+    init(session: ChatSession) {
+        self.session = session
+        self.projectURL = session.projectURL
+    }
+}
+
+typealias ComposerPDFIngestionExecutor = (
+    _ sourceURL: URL,
+    _ projectURL: URL,
+    _ progress: @escaping (NativePDFIngestion.Progress) -> Void
+) throws -> NativePDFIngestion.SourceBundle
+
+private struct PendingComposerPDFIngestion {
+    let target: ComposerPDFIngestionTarget
+    var status: String
+}
+
+private final class ComposerPDFIngestionError {
+    weak var session: ChatSession?
+    let message: String
+
+    init(session: ChatSession, message: String) {
+        self.session = session
+        self.message = message
+    }
+}
+
 /// Routes composer actions to the currently displayed session.
 ///
 /// `InputBar` is intentionally warm-reused across session switches. Persistent key monitors
@@ -61,12 +95,18 @@ final class ComposerSessionRouter: ObservableObject {
     @Published private(set) var slashSelectedIndex = 0
     @Published private(set) var slashPaletteVisible = false
     @Published private(set) var attachError: String?
+    @Published private(set) var pdfIngestionStatus: String?
+    @Published private(set) var pdfIngestionError: String?
+
+    private var pendingPDFIngestions: [UUID: PendingComposerPDFIngestion] = [:]
+    private var pdfIngestionErrors: [ObjectIdentifier: ComposerPDFIngestionError] = [:]
 
     func bind(to session: ChatSession) {
         guard self.session !== session else { return }
         self.session = session
         dismissSlashPalette()
         attachError = nil
+        refreshPDFIngestionPresentation()
     }
 
     func route(images: [DraftImage]) {
@@ -102,6 +142,104 @@ final class ComposerSessionRouter: ObservableObject {
 
     func clearAttachError() {
         attachError = nil
+    }
+
+    /// Capture a source session/project before an asynchronous file provider has
+    /// delivered its URL. The target holds the session weakly, so a closed source
+    /// session is discarded rather than being silently retargeted.
+    func makePDFIngestionTarget(for session: ChatSession) -> ComposerPDFIngestionTarget {
+        ComposerPDFIngestionTarget(session: session)
+    }
+
+    /// Start local PDFKit/Vision extraction off the main UI queue. Each selected
+    /// file is handled serially in this batch to keep memory bounded for large
+    /// scans while still leaving the composer responsive.
+    func ingestPDFs(
+        _ urls: [URL],
+        target: ComposerPDFIngestionTarget,
+        executor: @escaping ComposerPDFIngestionExecutor = { sourceURL, projectURL, progress in
+            try NativePDFIngestion.ingest(
+                sourceURL: sourceURL,
+                projectURL: projectURL,
+                progress: progress
+            )
+        }
+    ) {
+        guard let sourceSession = target.session else { return }
+        guard sourceSession.composerMode == .chat else {
+            presentPDFIngestionError("PDF 仅支持在对话模式中本地解析", target: target)
+            return
+        }
+        let pdfURLs = urls.filter(NativePDFIngestion.isPDF)
+        guard !pdfURLs.isEmpty else { return }
+
+        let taskID = UUID()
+        beginPDFIngestion(
+            "正在准备本地 PDF 解析（0/\(pdfURLs.count) 个文件）…",
+            taskID: taskID,
+            target: target
+        )
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var references: [String] = []
+            var failures: [String] = []
+
+            for (fileIndex, url) in pdfURLs.enumerated() {
+                guard target.session != nil else { break }
+                let prefix = pdfURLs.count > 1 ? "PDF \(fileIndex + 1)/\(pdfURLs.count)：" : ""
+                self?.publishPDFIngestionStatus(
+                    "\(prefix)正在准备本地解析…",
+                    taskID: taskID,
+                    target: target
+                )
+                do {
+                    let bundle = try executor(
+                        url,
+                        target.projectURL,
+                        { [weak self] progress in
+                            self?.publishPDFIngestionStatus(
+                                "\(prefix)\(progress.localizedDescription)",
+                                taskID: taskID,
+                                target: target
+                            )
+                        }
+                    )
+                    if target.session != nil {
+                        references.append(bundle.draftReference())
+                    }
+                } catch {
+                    failures.append("\(url.lastPathComponent)：\(error.localizedDescription)")
+                }
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.finishPDFIngestion(taskID: taskID)
+                guard let sourceSession = target.session else { return }
+
+                if !references.isEmpty {
+                    if sourceSession.composerMode == .chat {
+                        let referenceText = references.joined(separator: "\n\n")
+                        if sourceSession.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            sourceSession.draftText = referenceText
+                        } else {
+                            sourceSession.draftText += "\n\n\(referenceText)"
+                        }
+                    } else {
+                        self.presentPDFIngestionError(
+                            "PDF 已完成本地解析，但未添加引用：会话已切换到图像或视频生成模式",
+                            target: target
+                        )
+                    }
+                }
+                if !failures.isEmpty {
+                    self.presentPDFIngestionError(
+                        "PDF 本地解析失败：\(failures.joined(separator: "；"))",
+                        target: target
+                    )
+                }
+            }
+        }
     }
 
     func refreshSlashPalette(disabledSkills: Set<String>) {
@@ -163,7 +301,7 @@ final class ComposerSessionRouter: ObservableObject {
 
     @discardableResult
     func executeSlash(_ command: SlashCommand) -> Bool {
-        guard let session else { return false }
+        guard let session, !isPDFIngestionPending(for: session) else { return false }
         let args: String
         if let invocation = BuiltinCommands.parseInvocation(session.draftText),
            invocation.name == command.name {
@@ -189,7 +327,10 @@ final class ComposerSessionRouter: ObservableObject {
     }
 
     var canSend: Bool {
-        guard let session, !session.mediaBusy else { return false }
+        guard let session,
+              !session.mediaBusy,
+              !isPDFIngestionPending(for: session)
+        else { return false }
         let hasText = !session.draftText
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty
@@ -204,10 +345,11 @@ final class ComposerSessionRouter: ObservableObject {
 
     @discardableResult
     func send() -> Bool {
+        guard let session, !isPDFIngestionPending(for: session) else { return false }
         if executeSelectedSlash() {
             return true
         }
-        guard let session, canSend else { return false }
+        guard canSend else { return false }
         let images = session.draftImages
         // Expand before clearing draftText — onChange prune would otherwise wipe draftPastes.
         let text = session.expandedDraftText(from: session.draftText)
@@ -217,6 +359,96 @@ final class ComposerSessionRouter: ObservableObject {
         attachError = nil
         session.sendPrompt(text, images: images)
         return true
+    }
+
+    func isPDFIngestionPending(for session: ChatSession) -> Bool {
+        pendingPDFIngestions.values.contains { $0.target.session === session }
+    }
+
+    private func publishPDFIngestionStatus(
+        _ status: String,
+        taskID: UUID,
+        target: ComposerPDFIngestionTarget
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            self?.setPDFIngestionStatus(status, taskID: taskID, target: target)
+        }
+    }
+
+    private func setPDFIngestionStatus(
+        _ status: String,
+        taskID: UUID,
+        target: ComposerPDFIngestionTarget
+    ) {
+        guard var ingestion = pendingPDFIngestions[taskID], ingestion.target === target else { return }
+        ingestion.status = status
+        pendingPDFIngestions[taskID] = ingestion
+        refreshPDFIngestionPresentation()
+    }
+
+    private func beginPDFIngestion(
+        _ status: String,
+        taskID: UUID,
+        target: ComposerPDFIngestionTarget
+    ) {
+        pendingPDFIngestions[taskID] = PendingComposerPDFIngestion(
+            target: target,
+            status: status
+        )
+        refreshPDFIngestionPresentation()
+    }
+
+    private func finishPDFIngestion(taskID: UUID) {
+        pendingPDFIngestions[taskID] = nil
+        refreshPDFIngestionPresentation()
+    }
+
+    private func refreshPDFIngestionPresentation() {
+        guard let session else {
+            pdfIngestionStatus = nil
+            pdfIngestionError = nil
+            return
+        }
+        pdfIngestionStatus = pendingPDFIngestions.values.first(where: {
+            $0.target.session === session
+        })?.status
+
+        let identity = ObjectIdentifier(session)
+        if let error = pdfIngestionErrors[identity], error.session === session {
+            pdfIngestionError = error.message
+        } else {
+            pdfIngestionErrors[identity] = nil
+            pdfIngestionError = nil
+        }
+    }
+
+    private func presentPDFIngestionError(
+        _ message: String,
+        target: ComposerPDFIngestionTarget
+    ) {
+        guard let sourceSession = target.session else { return }
+        let identity = ObjectIdentifier(sourceSession)
+        let error = ComposerPDFIngestionError(session: sourceSession, message: message)
+        pdfIngestionErrors[identity] = error
+        refreshPDFIngestionPresentation()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self, weak error] in
+            guard let self,
+                  let error,
+                  self.pdfIngestionErrors[identity] === error
+            else {
+                return
+            }
+            self.pdfIngestionErrors[identity] = nil
+            self.refreshPDFIngestionPresentation()
+        }
+    }
+
+    private func presentAttachError(_ message: String) {
+        attachError = message
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard self?.attachError == message else { return }
+            self?.attachError = nil
+        }
     }
 }
 
@@ -319,6 +551,19 @@ enum ComposerTextViewLayout {
 
 final class ComposerNSTextView: NSTextView {
     var onSubmit: () -> Void = {}
+    var onDidChangeText: (ComposerNSTextView) -> Void = { _ in }
+
+    override func didChangeText() {
+        super.didChangeText()
+
+        // AppKit suppresses NSTextDidChangeNotification while an input method owns
+        // marked text, so the delegate cannot update the binding or placeholder.
+        // Limit this hook to composition changes to avoid duplicating ordinary
+        // delegate notifications.
+        if hasMarkedText() {
+            onDidChangeText(self)
+        }
+    }
 
     override func doCommand(by commandSelector: Selector) {
         if commandSelector == #selector(insertNewlineIgnoringFieldEditor(_:)) {
@@ -549,6 +794,9 @@ struct ComposerTextView: NSViewRepresentable {
         let host = ComposerTextViewHost()
         context.coordinator.host = host
         host.textView.delegate = context.coordinator
+        host.textView.onDidChangeText = { [weak coordinator = context.coordinator] textView in
+            coordinator?.textViewDidChangeText(textView)
+        }
         host.onHeightChange = { [weak coordinator = context.coordinator] height in
             coordinator?.receiveHeight(height)
         }
@@ -568,6 +816,7 @@ struct ComposerTextView: NSViewRepresentable {
     static func dismantleNSView(_ host: ComposerTextViewHost, coordinator: Coordinator) {
         host.textView.delegate = nil
         host.textView.onSubmit = {}
+        host.textView.onDidChangeText = { _ in }
         host.onHeightChange = { _ in }
         host.onMoveToWindow = {}
         coordinator.dismantle()
@@ -579,6 +828,17 @@ struct ComposerTextView: NSViewRepresentable {
 
         private var boundSessionIdentity: ObjectIdentifier
         private var pendingExternalText: String?
+        /// The last value coordinated between AppKit and the SwiftUI binding. While an
+        /// IME owns marked text, a matching binding value is a stale render echo, not
+        /// an external draft replacement.
+        private var lastKnownText: String
+        /// State last handled by `synchronize`. A ChatSession draft write re-renders
+        /// InputBar, but should not force TextKit layout when AppKit already owns the
+        /// matching text/selection/geometry.
+        private var lastSynchronizedPlaceholder: String?
+        private var lastSynchronizedFocus: Bool?
+        private var lastSynchronizedViewportWidth: CGFloat?
+        private var lastSynchronizedSelection: NSRange?
         private var pendingHeight: CGFloat?
         private var pendingTextApplicationScheduled = false
         private var focusRequestScheduled = false
@@ -592,10 +852,17 @@ struct ComposerTextView: NSViewRepresentable {
             textView in
             window.makeFirstResponder(textView)
         }
+        /// `discardMarkedText()` can synchronously wait on the selected IME's XPC
+        /// service. Keep it off the common session-rebind path and injectable so the
+        /// marked-text ownership boundary is executable without timing-based tests.
+        var discardMarkedText: (NSTextView) -> Void = { textView in
+            textView.inputContext?.discardMarkedText()
+        }
 
         init(parent: ComposerTextView) {
             self.parent = parent
             boundSessionIdentity = parent.sessionIdentity
+            lastKnownText = parent.text
             super.init()
             composerUndoManager.onUndoOrRedo = { [weak self] in
                 self?.synchronizeAfterUndoOrRedo()
@@ -605,34 +872,85 @@ struct ComposerTextView: NSViewRepresentable {
         func synchronize(_ host: ComposerTextViewHost) {
             guard !isDismantled else { return }
             self.host = host
+
+            let sessionChanged = boundSessionIdentity != parent.sessionIdentity
+            let placeholderChanged = lastSynchronizedPlaceholder != parent.placeholder
+            let viewportWidth = host.scrollView.contentSize.width
+            let widthChanged = lastSynchronizedViewportWidth.map {
+                abs($0 - viewportWidth) > 0.5
+            } ?? true
+            let selectionChanged = lastSynchronizedSelection.map {
+                !NSEqualRanges($0, host.textView.selectedRange())
+            } ?? true
+            let textNeedsSynchronization = host.textView.string != parent.text
+            let focusNeedsSynchronization = needsFocusSynchronization(host)
+
+            // A keystroke first changes TextKit and then writes the binding. Its
+            // resulting ChatSession publish must not re-run ensureLayout/scrolling
+            // when text, width, placeholder, focus, and selection are unchanged.
+            guard sessionChanged
+                    || placeholderChanged
+                    || widthChanged
+                    || selectionChanged
+                    || textNeedsSynchronization
+                    || pendingExternalText != nil
+                    || focusNeedsSynchronization
+            else { return }
+
             host.textView.onSubmit = { [weak self] in
                 self?.parent.onSubmit()
             }
-            host.updatePlaceholder(parent.placeholder)
+            if placeholderChanged {
+                host.updatePlaceholder(parent.placeholder)
+            }
 
-            if boundSessionIdentity != parent.sessionIdentity {
+            var needsLayout = widthChanged || selectionChanged
+            if sessionChanged {
                 // The InputBar is warm-reused. Never let marked text from the old
-                // session commit into the newly rebound draft.
+                // session commit into the newly rebound draft. A normal session switch
+                // is identity-scoped at the SwiftUI call site and creates a fresh native
+                // host; this guarded branch is only the fallback for an unexpectedly
+                // warm-reused coordinator. Do not synchronously contact the IME when
+                // there is no marked text to discard.
                 boundSessionIdentity = parent.sessionIdentity
                 pendingExternalText = nil
                 applyingProgrammaticText = true
-                host.textView.inputContext?.discardMarkedText()
+                if host.textView.hasMarkedText() {
+                    discardMarkedText(host.textView)
+                }
                 apply(parent.text, to: host.textView, moveCursorToEnd: true)
                 applyingProgrammaticText = false
-            } else if host.textView.string != parent.text {
+                lastKnownText = parent.text
+                needsLayout = true
+            } else if textNeedsSynchronization {
                 if host.textView.hasMarkedText() {
-                    // SwiftUI may re-render for unrelated state while IME owns a marked
-                    // range. Defer external replacement until composition completes.
-                    pendingExternalText = parent.text
+                    // NSTextView.string includes the IME-owned marked range. A render
+                    // with the text we last synchronized is therefore a stale binding
+                    // echo, not an external replacement; keep the binding current so
+                    // subsequent streaming renders cannot queue that stale value.
+                    if parent.text == lastKnownText {
+                        synchronizeBinding(with: host.textView.string)
+                    } else {
+                        // A different value was written by code while composition is
+                        // active. Preserve it and apply it after the IME commits.
+                        pendingExternalText = parent.text
+                    }
                 } else {
                     let replacement = pendingExternalText ?? parent.text
                     pendingExternalText = nil
                     apply(replacement, to: host.textView, moveCursorToEnd: false)
+                    lastKnownText = replacement
+                    needsLayout = true
                 }
             }
 
-            host.refreshLayout(scrollSelection: true)
-            synchronizeFocus(host)
+            if needsLayout {
+                refreshLayout(host, scrollSelection: true)
+            }
+            if focusNeedsSynchronization || lastSynchronizedFocus != parent.isFocused {
+                synchronizeFocus(host)
+            }
+            recordSynchronizedState(for: host)
         }
 
         func textDidBeginEditing(_ notification: Notification) {
@@ -652,23 +970,30 @@ struct ComposerTextView: NSViewRepresentable {
         }
 
         func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            textViewDidChangeText(textView)
+        }
+
+        func textViewDidChangeText(_ textView: NSTextView) {
             guard !isDismantled,
                   !applyingProgrammaticText,
-                  let textView = notification.object as? NSTextView,
-                  let host else { return }
+                  let host,
+                  host.textView === textView else { return }
 
-            if pendingExternalText != nil {
-                if !textView.hasMarkedText() {
-                    // NSTextView can notify delegates before an IME unmark operation
-                    // finishes mutating storage. Apply on the next run loop so the
-                    // committed marked string cannot overwrite the external update.
-                    schedulePendingTextApplication(on: host)
-                }
-            } else if parent.text != textView.string {
-                parent.text = textView.string
+            // Keep SwiftUI current even during composition. NSTextView.string includes
+            // marked text, and writing it back prevents a high-frequency unrelated
+            // render (such as streaming output) from mistaking an old binding value
+            // for an external replacement.
+            synchronizeBinding(with: textView.string)
+
+            if pendingExternalText != nil, !textView.hasMarkedText() {
+                // NSTextView can notify delegates before an IME unmark operation
+                // finishes mutating storage. Apply on the next run loop so the
+                // committed marked string cannot overwrite the external update.
+                schedulePendingTextApplication(on: host)
             }
 
-            host.refreshLayout(scrollSelection: true)
+            refreshLayout(host, scrollSelection: true)
         }
 
         func undoManager(for view: NSTextView) -> UndoManager? {
@@ -677,10 +1002,39 @@ struct ComposerTextView: NSViewRepresentable {
 
         private func synchronizeAfterUndoOrRedo() {
             guard !isDismantled, !applyingProgrammaticText, let host else { return }
-            if parent.text != host.textView.string {
-                parent.text = host.textView.string
+            synchronizeBinding(with: host.textView.string)
+            refreshLayout(host, scrollSelection: true)
+        }
+
+        private func refreshLayout(
+            _ host: ComposerTextViewHost,
+            scrollSelection: Bool
+        ) {
+            host.refreshLayout(scrollSelection: scrollSelection)
+            recordSynchronizedState(for: host)
+        }
+
+        private func recordSynchronizedState(for host: ComposerTextViewHost) {
+            lastSynchronizedPlaceholder = parent.placeholder
+            lastSynchronizedFocus = parent.isFocused
+            lastSynchronizedViewportWidth = host.scrollView.contentSize.width
+            lastSynchronizedSelection = host.textView.selectedRange()
+        }
+
+        private func needsFocusSynchronization(_ host: ComposerTextViewHost) -> Bool {
+            if lastSynchronizedFocus != parent.isFocused { return true }
+            guard let window = host.window else { return false }
+            if parent.isFocused {
+                return window.firstResponder !== host.textView
             }
-            host.refreshLayout(scrollSelection: true)
+            return window.firstResponder === host.textView
+        }
+
+        private func synchronizeBinding(with text: String) {
+            lastKnownText = text
+            if parent.text != text {
+                parent.text = text
+            }
         }
 
         func receiveHeight(_ newHeight: CGFloat) {
@@ -714,10 +1068,8 @@ struct ComposerTextView: NSViewRepresentable {
                     to: host.textView,
                     moveCursorToEnd: false
                 )
-                if self.parent.text != pendingExternalText {
-                    self.parent.text = pendingExternalText
-                }
-                host.refreshLayout(scrollSelection: true)
+                self.synchronizeBinding(with: pendingExternalText)
+                self.refreshLayout(host, scrollSelection: true)
             }
         }
 
@@ -848,6 +1200,10 @@ final class ComposerSlashKeyMonitor {
 struct InputBar: View {
     @EnvironmentObject var store: AppStore
     @ObservedObject var session: ChatSession
+    /// Draft typing is intentionally isolated from `ChatSession.objectWillChange`.
+    /// Observe the session-owned composer state so external restores/sends still
+    /// update this warm-reused input bar without invalidating the transcript.
+    @ObservedObject private var draftState: ComposerDraftState
     @State private var focused = false
     @State private var composerTextHeight = ComposerTextViewLayout.minimumHeight(
         for: .systemFont(ofSize: NSFont.systemFontSize)
@@ -857,8 +1213,19 @@ struct InputBar: View {
     @State private var slashKeyMonitor = ComposerSlashKeyMonitor()
     @State private var showQuotaPopover: Bool = false
     @State private var showContextPopover: Bool = false
+    @State private var showBalancePopover: Bool = false
+    @State private var showToolStats: Bool = false
+    /// Observes the shared singleton trigger; the sheet computes from the live session.
+    @ObservedObject private var toolStatsPresenter = ToolStatsPresenter.shared
+    /// 30-day ledger total (CNY) for the balance popover, refreshed on each open.
+    @State private var balanceLast30Days: Double?
     /// Measured width of the status row; drives compact vs wide without ViewThatFits.
     @State private var statusBarWidth: CGFloat = 0
+
+    init(session: ChatSession) {
+        self.session = session
+        _draftState = ObservedObject(wrappedValue: session.composerDraft)
+    }
 
     var body: some View {
         VStack(spacing: 8) {
@@ -879,6 +1246,23 @@ struct InputBar: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if let pdfError = composerRouter.pdfIngestionError {
+                Text(pdfError)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if let status = composerRouter.pdfIngestionStatus {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             if let status = session.mediaStatus {
@@ -934,7 +1318,7 @@ struct InputBar: View {
             composerRouter.bind(to: session)
             refreshSlashPalette()
         }
-        .onChange(of: session.draftText) { _, _ in
+        .onChange(of: draftState.text) { _, _ in
             session.pruneOrphanDraftPastes()
             refreshSlashPalette()
             composerRouter.clearAttachError()
@@ -951,6 +1335,12 @@ struct InputBar: View {
         .onChange(of: session.draftImages.count) { _, _ in
             refreshSlashPalette()
             composerRouter.clearAttachError()
+        }
+        .onChange(of: toolStatsPresenter.requestID) { _, _ in
+            showToolStats = true
+        }
+        .sheet(isPresented: $showToolStats) {
+            ToolStatsSheetView(session: session)
         }
         .onDisappear {
             pasteCatcher.stop()
@@ -1057,7 +1447,7 @@ struct InputBar: View {
             plusMenu
 
             ComposerTextView(
-                text: $session.draftText,
+                text: $draftState.text,
                 isFocused: $focused,
                 height: $composerTextHeight,
                 sessionIdentity: ObjectIdentifier(session),
@@ -1066,6 +1456,10 @@ struct InputBar: View {
                     router.send()
                 }
             )
+                // A session owns its native editor and NSTextInputContext. Replacing the
+                // representable host on a real switch avoids synchronously rebinding the
+                // previous session's IME context on SwiftUI's update pass.
+                .id(ObjectIdentifier(session))
                 .frame(maxWidth: .infinity)
                 .frame(height: composerTextHeight, alignment: .leading)
                 .layoutPriority(1)
@@ -1128,7 +1522,7 @@ struct InputBar: View {
             Button {
                 pickFiles()
             } label: {
-                Label("上传图片", systemImage: "photo.on.rectangle")
+                Label("上传图片或 PDF", systemImage: "doc.on.doc")
             }
             Divider()
             Button {
@@ -1165,8 +1559,8 @@ struct InputBar: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
-        .help("上传图片 / 生成图像 / 生成视频")
-        .disabled(session.mediaBusy)
+        .help("上传图片或 PDF / 生成图像 / 生成视频")
+        .disabled(session.mediaBusy || composerRouter.isPDFIngestionPending(for: session))
     }
 
     private var mediaModeStrip: some View {
@@ -1189,7 +1583,7 @@ struct InputBar: View {
             }
             .buttonStyle(.plain)
             .help("退出生成模式，回到对话")
-            .disabled(session.mediaBusy)
+            .disabled(session.mediaBusy || composerRouter.isPDFIngestionPending(for: session))
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -1285,25 +1679,55 @@ struct InputBar: View {
     // MARK: - Pick / paste / drop
 
     private func pickFiles() {
+        let pdfTarget = composerRouter.makePDFIngestionTarget(for: session)
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = [.image]
+        panel.allowedContentTypes = [.image, .pdf]
         panel.prompt = "添加"
-        panel.message = "选择要发送的图片"
+        panel.message = "选择要发送的图片或本地解析的 PDF"
         guard panel.runModal() == .OK else { return }
-        composerRouter.appendResults(panel.urls.map { ImageAttachment.make(from: $0) })
+        let pdfURLs = panel.urls.filter(NativePDFIngestion.isPDF)
+        let imageURLs = panel.urls.filter { !NativePDFIngestion.isPDF($0) }
+        composerRouter.appendResults(imageURLs.map { ImageAttachment.make(from: $0) })
+        composerRouter.ingestPDFs(pdfURLs, target: pdfTarget)
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        // Capture before NSItemProvider's asynchronous callback so an A → B
+        // session switch cannot move a PDF source bundle into B's project.
+        let pdfTarget = composerRouter.makePDFIngestionTarget(for: session)
         var handled = false
         let group = DispatchGroup()
         var results: [Result<DraftImage, ImageAttachment.LoadError>] = []
+        var pdfURLs: [URL] = []
         let lock = NSLock()
 
         for provider in providers {
-            if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+            // A dropped file URL is authoritative. Check its extension before
+            // attempting image decode so PDFs never fall through to the image
+            // attachment path.
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                handled = true
+                group.enter()
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    defer { group.leave() }
+                    let url: URL?
+                    if let data = item as? Data {
+                        url = URL(dataRepresentation: data, relativeTo: nil)
+                    } else {
+                        url = item as? URL
+                    }
+                    lock.lock()
+                    if let url, NativePDFIngestion.isPDF(url) {
+                        pdfURLs.append(url)
+                    } else {
+                        results.append(url.map(ImageAttachment.make(from:)) ?? .failure(.corrupt))
+                    }
+                    lock.unlock()
+                }
+            } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
                 handled = true
                 group.enter()
                 provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
@@ -1316,22 +1740,6 @@ struct InputBar: View {
                     }
                     lock.lock(); results.append(result); lock.unlock()
                 }
-            } else if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                handled = true
-                group.enter()
-                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                    defer { group.leave() }
-                    let result: Result<DraftImage, ImageAttachment.LoadError>
-                    if let data = item as? Data,
-                       let url = URL(dataRepresentation: data, relativeTo: nil) {
-                        result = ImageAttachment.make(from: url)
-                    } else if let url = item as? URL {
-                        result = ImageAttachment.make(from: url)
-                    } else {
-                        result = .failure(.corrupt)
-                    }
-                    lock.lock(); results.append(result); lock.unlock()
-                }
             }
         }
 
@@ -1339,6 +1747,7 @@ struct InputBar: View {
         let router = composerRouter
         group.notify(queue: .main) {
             router.appendResults(results)
+            router.ingestPDFs(pdfURLs, target: pdfTarget)
         }
         return true
     }
@@ -1474,6 +1883,21 @@ struct InputBar: View {
                             .frame(width: 264)
                             .padding(10)
                     }
+            } else if let balance = session.accountBalance {
+                Text(balance)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.primary.opacity(0.06)))
+                    .help("账户余额")
+                    .contentShape(Capsule())
+                    .onTapGesture { showBalancePopover.toggle() }
+                    .popover(isPresented: $showBalancePopover, arrowEdge: .bottom) {
+                        balancePopover
+                            .frame(width: 264)
+                            .padding(10)
+                    }
             }
         }
         .fixedSize(horizontal: true, vertical: false)
@@ -1493,6 +1917,63 @@ struct InputBar: View {
                 ForEach(session.quotaWindows) { w in
                     quotaWindowRow(w)
                 }
+            }
+        }
+    }
+
+    private var balancePopover: some View {
+        // Re-read unit + rate at render time so a settings change shows up
+        // immediately on the next popover open.
+        let unit = PricingSettings.unit()
+        let display = BalanceSpendDisplay(
+            sessionCostUSD: session.cost,
+            last30DaysUSD: balanceLast30Days ?? 0,
+            unit: unit,
+            rate: ModelPricing.Catalog.shared.exchangeRate
+        )
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("账户余额")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+            contextDetailRow("本会话消耗", display.sessionSpend)
+            contextDetailRow("30天内消耗", balanceLast30Days == nil ? "…" : display.last30DaysSpend)
+        }
+        .onAppear { reloadBalanceLast30Days() }
+    }
+
+    /// Lazy, non-blocking refresh of the 30-day total in raw pi USD (`.ledger`)
+    /// + pi main-session backfill; the popover converts to the display unit at
+    /// render time. Mirrors SettingsSheet.reloadUsage: detached utility task +
+    /// MainActor hop.
+    private func reloadBalanceLast30Days() {
+        // 只统计当前余额提供方（deepseek/moonshot/siliconflow/openrouter）自己账户的
+        // 消耗：ledger 行按 model id 归属过滤，pi 会话回填按 message.provider 过滤。
+        let bp = session.model?.balanceProvider
+        Task.detached(priority: .utility) {
+            guard let bp else {
+                await MainActor.run { balanceLast30Days = 0 }
+                return
+            }
+            let records = TokenUsageStats.loadSharedRecords()
+                .filter { bp.matches(modelId: $0.model) }
+            let report = TokenUsageStats.aggregate(
+                records: records,
+                period: .last30Days,
+                groupBy: .model,
+                costMode: .ledger
+            )
+            // 回填从未经 ledger 记账的 pi 主会话消耗（headless/CLI 会话、旧历史）：
+            // 凡与 ledger 主通道会话（resume: 精确路径 / new: 时间窗口）对得上的
+            // pi 会话文件被跳过，避免重复计费；其余文件只计 30 天窗口内、且属于
+            // 当前余额提供方的用量。
+            let meta = PiMainUsageBackfill.ledgerMainSessionMeta()
+            let backfill = PiMainUsageBackfill.sumLast30Days(
+                ledgerMainSessions: meta.mainSessions,
+                newSessionFirstTs: meta.newSessionFirstTs,
+                balanceProvider: bp
+            )
+            await MainActor.run {
+                balanceLast30Days = report.total.cost + backfill
             }
         }
     }
@@ -1562,7 +2043,6 @@ struct InputBar: View {
                 contextDetailRow("输入", TokenFormat.compact(u.input))
                 contextDetailRow("输出", TokenFormat.compact(u.output))
                 contextDetailRow("缓存读取", TokenFormat.compact(u.cacheRead))
-                contextDetailRow("缓存写入", TokenFormat.compact(u.cacheWrite))
                 let denom = u.input + u.cacheRead + u.cacheWrite
                 if denom > 0 {
                     let hit = Double(u.cacheRead) / Double(denom)
@@ -1575,8 +2055,28 @@ struct InputBar: View {
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
             contextDetailRow("累计缓存读取", TokenFormat.compact(session.sessionCacheRead))
-            contextDetailRow("累计缓存写入", TokenFormat.compact(session.sessionCacheWrite))
-            contextDetailRow("累计花费", String(format: "$%.4f", session.cost))
+            contextDetailRow(
+                "累计花费",
+                formatSpend(
+                    usdCost: session.cost,
+                    unit: PricingSettings.unit(),
+                    rate: ModelPricing.Catalog.shared.exchangeRate
+                )
+            )
+            if let stats = session.currentModelSpeed {
+                Divider()
+                HStack {
+                    Text("当前模型")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(stats.sampleCount) 次采样")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary.opacity(0.7))
+                }
+                contextDetailRow("平均首字", formatTTFT(stats.avgTTFT))
+                contextDetailRow("生成速度", formatTokensPerSecond(stats.avgTokensPerSecond))
+            }
         }
     }
 
@@ -1612,6 +2112,9 @@ struct InputBar: View {
                             HStack(spacing: 6) {
                                 ProviderLogo(model: m, size: 12)
                                 Text(m.name)
+                                if ModelCapabilities.isRecommended(.boss, for: m.id) {
+                                    ModelRoleBadge(role: .boss)
+                                }
                                 if m.id == session.model?.id {
                                     Image(systemName: "checkmark")
                                 }

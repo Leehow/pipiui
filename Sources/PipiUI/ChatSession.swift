@@ -11,6 +11,8 @@ struct ModelInfo: Identifiable, Hashable {
     var reasoning: Bool? = nil
     /// A present key with a nil value represents Pi's explicit JSON `null`.
     var thinkingLevelMap: [String: String?]? = nil
+    /// Whether the model accepts image input. From pi-ai `input` when present; else heuristic.
+    var supportsImages: Bool = true
     var id: String { provider + "/" + modelId }
 
     /// Shared behavior-level parsing seam used by helper and in-process model discovery.
@@ -20,6 +22,7 @@ struct ModelInfo: Identifiable, Hashable {
         else {
             return nil
         }
+        let supportsImages = parseSupportsImages(input: row["input"], modelId: modelId, provider: provider)
         return ModelInfo(
             provider: provider,
             modelId: modelId,
@@ -28,8 +31,44 @@ struct ModelInfo: Identifiable, Hashable {
             reasoning: row["reasoning"] as? Bool,
             thinkingLevelMap: ThinkingCapability.parseThinkingLevelMap(
                 row["thinkingLevelMap"] as? [String: Any]
-            )
+            ),
+            supportsImages: supportsImages
         )
+    }
+
+    /// `input` array from pi-ai when present; otherwise `supportsImages(modelId:provider:)`.
+    static func parseSupportsImages(input: Any?, modelId: String, provider: String) -> Bool {
+        if let arr = input as? [String] {
+            return arr.contains { $0 == "image" }
+        }
+        if let arr = input as? [Any] {
+            return arr.contains { ($0 as? String) == "image" }
+        }
+        // absent / null / unexpected type → heuristic
+        return supportsImages(modelId: modelId, provider: provider)
+    }
+
+    /// Unit-testable fallback when pi-ai does not expose `input`.
+    /// DeepSeek → false; known multimodal id tokens → true; everything else → true.
+    static func supportsImages(modelId: String, provider: String) -> Bool {
+        let p = provider.lowercased()
+        let m = modelId.lowercased()
+        if p.contains("deepseek") || m.contains("deepseek") {
+            return false
+        }
+        let visionHints = [
+            "gpt-4o", "claude-3", "claude-4", "claude-5",
+            "gemini", "qwen-vl", "glm-4v", "glm-5v",
+            "llava", "moondream", "vision",
+        ]
+        if visionHints.contains(where: { p.contains($0) || m.contains($0) }) {
+            return true
+        }
+        // Bare "vl" token (qwen2.5-vl, internvl, …) without matching longer hints above.
+        if m.contains("vl") || p.contains("vl") {
+            return true
+        }
+        return true
     }
 
     /// Whether this model belongs to a Grok/xAI provider (used to gate Grok account credit display).
@@ -69,6 +108,14 @@ struct ModelInfo: Identifiable, Hashable {
     var shouldShowAccountQuota: Bool {
         quotaProvider != nil
     }
+
+    /// Pay-per-token balance source for this model, if any.
+    /// Subscription-quota providers keep the quota pill; ChatSession suppresses
+    /// balance whenever `quotaProvider != nil`. Relays → nil.
+    var balanceProvider: BalanceProvider? {
+        if isRelayProvider { return nil }
+        return PipiUI.balanceProvider(for: provider)
+    }
 }
 
 struct ToolCallBlock: Identifiable, Equatable {
@@ -79,6 +126,8 @@ struct ToolCallBlock: Identifiable, Equatable {
     var payloadChars: Int = 0
     /// Bounded, UI-safe subset of write/edit arguments used to explain finished changes.
     var fileChangePayload: FileChangePayload? = nil
+    /// Wall-clock duration of a finished tool execution; nil while running or unknown.
+    var durationSeconds: TimeInterval? = nil
 }
 
 /// Path + payload size for tool-call headers. write/edit never fall back to JSON dumps.
@@ -390,6 +439,10 @@ struct ToolRun: Equatable {
     var isError = false
     var output = ""
     var images: [ImageBlock] = []
+    /// Wall-clock start of this tool execution (set on `tool_execution_start`).
+    var startedAt: Date? = nil
+    /// Last time partial/final output was observed (start has no output yet).
+    var lastOutputAt: Date? = nil
 }
 
 /// Pure merge of `get_session_stats` / `contextUsage` into current context fields.
@@ -483,6 +536,89 @@ enum InitialTranscriptReconciler {
     }
 }
 
+/// High-frequency state observed only by views that render the live transcript.
+///
+/// Keeping this separate from `ChatSession` prevents every streamed token/tool chunk
+/// from publishing to composer and sidebar observers of the session itself.
+final class StreamingState: ObservableObject {
+    @Published var streamingItem: ChatItem?
+    @Published private(set) var toolRuns: [String: ToolRun] = [:]
+    /// Monotonic content counter. `toolRuns` itself publishes the render update; this
+    /// counter is a cheap diagnostic/snapshot token and deliberately publishes no
+    /// second `objectWillChange` event.
+    private(set) var toolOutputVersion: UInt64 = 0
+    /// Changes only when a `ToolRun` property used by settled transcript planning
+    /// changes. Today that structural fingerprint is `isRunning` + image presence.
+    private(set) var toolStructureVersion: UInt64 = 0
+
+    func replaceToolRuns(_ runs: [String: ToolRun]) {
+        guard runs != toolRuns else { return }
+        let structureChanged = Self.structuralToolStates(in: runs)
+            != Self.structuralToolStates(in: toolRuns)
+        toolOutputVersion &+= 1
+        if structureChanged { toolStructureVersion &+= 1 }
+        toolRuns = runs
+    }
+
+    func updateToolRun(_ run: ToolRun, for id: String) {
+        updateToolRuns([id: run])
+    }
+
+    /// Publish one dictionary update for a coalesced partial-output batch.
+    func updateToolRuns(_ updates: [String: ToolRun]) {
+        guard !updates.isEmpty else { return }
+        var next = toolRuns
+        var changed = false
+        var structureChanged = false
+        for (id, run) in updates where next[id] != run {
+            if Self.structuralState(for: next[id]) != Self.structuralState(for: run) {
+                structureChanged = true
+            }
+            next[id] = run
+            changed = true
+        }
+        guard changed else { return }
+        toolOutputVersion &+= 1
+        if structureChanged { toolStructureVersion &+= 1 }
+        toolRuns = next
+    }
+
+    private struct StructuralToolState: Equatable {
+        var isRunning: Bool
+        var hasImages: Bool
+    }
+
+    private static func structuralState(for run: ToolRun?) -> StructuralToolState {
+        StructuralToolState(
+            isRunning: run?.isRunning ?? false,
+            hasImages: run?.images.isEmpty == false
+        )
+    }
+
+    private static func structuralToolStates(
+        in runs: [String: ToolRun]
+    ) -> [String: StructuralToolState] {
+        runs.compactMapValues { run in
+            let state = structuralState(for: run)
+            return state.isRunning || state.hasImages ? state : nil
+        }
+    }
+}
+
+/// High-frequency composer text observed only by the input bar.
+///
+/// Keeping draft edits out of `ChatSession.objectWillChange` prevents every
+/// keystroke from invalidating transcript and sidebar views that observe the
+/// session. `ChatSession.draftText` remains the compatibility API for callers
+/// that restore, send, or otherwise mutate the current draft.
+final class ComposerDraftState: ObservableObject {
+    @Published var text: String
+
+    init(text: String = "") {
+        self.text = text
+    }
+}
+
 /// One live pi RPC session bound to a project directory.
 /// Published state is mutated on the main thread (PiProcess delivers callbacks there).
 /// Heavy initial transcript conversion (image disk/base64) may run off-main before a single assign.
@@ -491,8 +627,8 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Immutable capability used by bridge extensions spawned with this process.
     /// Unlike the open-session key, this survives edit-fork file rebinding.
     package let bridgeRoutingKey = BridgeCapabilityToken.generate()
-    /// Separate desktop-write capability. It is mounted only in the top-level
-    /// computer extension and forwarded only to dispatched Pi subagent processes.
+    /// Separate desktop-write capability. It is exposed through the Pi process
+    /// environment, so every trusted extension loaded in that process can read it.
     package let computerRoutingKey = BridgeCapabilityToken.generate()
     let projectURL: URL
 
@@ -506,10 +642,13 @@ final class ChatSession: ObservableObject, Identifiable {
     private(set) var transcriptVersion: UInt64 = 0
     /// T6 transcript 布局记忆化（planTranscript 结果缓存，body 里只读缓存）。
     let transcriptPlanner = TranscriptPlanner()
-    @Published var streamingItem: ChatItem?
-    @Published var toolRuns: [String: ToolRun] = [:]
-    /// Monotonic counter bumped when toolRuns actually changes (UI watches this instead of scanning outputs).
-    @Published private(set) var toolOutputVersion: UInt64 = 0
+    /// Isolated publisher for high-frequency stream and tool-output updates.
+    let streaming = StreamingState()
+    /// Read-only compatibility forwarding; deliberately does not publish `ChatSession.objectWillChange`.
+    var streamingItem: ChatItem? { streaming.streamingItem }
+    var toolRuns: [String: ToolRun] { streaming.toolRuns }
+    var toolOutputVersion: UInt64 { streaming.toolOutputVersion }
+    var toolStructureVersion: UInt64 { streaming.toolStructureVersion }
     @Published var isStreaming = false
     /// True between the user clicking Stop and the turn actually settling.
     /// Drives optimistic 'stopping…' UI so one click is visibly acknowledged.
@@ -545,9 +684,15 @@ final class ChatSession: ObservableObject, Identifiable {
     @Published private(set) var quotaSelectedWindowId: String?
     /// When the current billing window resets (popover detail).
     @Published var quotaResetsAt: Date?
+    /// Pre-formatted pay-per-token balance for the input-bar capsule (nil = hidden).
+    @Published var accountBalance: String?
     @Published var sessionName: String?
     @Published var sessionFile: String?
-    @Published var lastError: String?
+    @Published var lastError: String? {
+        didSet { lastErrorCanRetry = false }
+    }
+    /// 请求失败类错误（pi auto_retry 最终失败）才可重试；任何其他 lastError 写入自动复位。
+    @Published private(set) var lastErrorCanRetry = false
     @Published var processAlive = true
     /// True from spawn until the first `get_messages` load settles. Drives the
     /// "正在启动会话…" placeholder so a new/resuming session shows progress instead
@@ -559,8 +704,14 @@ final class ChatSession: ObservableObject, Identifiable {
     @Published var hasUnseenInterruption = false
     /// Local follow-up queue mirror for SwiftUI (busy Enter enqueues here).
     @Published private(set) var messageQueue: [QueuedMessage] = []
+    /// Isolated high-frequency composer state. InputBar observes this directly.
+    let composerDraft = ComposerDraftState()
     /// In-memory composer draft (per session; not persisted).
-    @Published var draftText: String = ""
+    /// Compatibility forwarding deliberately does not publish ChatSession changes.
+    var draftText: String {
+        get { composerDraft.text }
+        set { composerDraft.text = newValue }
+    }
     @Published var draftImages: [DraftImage] = []
     /// Large ⌘V bodies collapsed to `[paste #N …]` markers in `draftText` (pi TUI–style).
     private(set) var draftPastes: [Int: String] = [:]
@@ -599,6 +750,20 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Streaming or prompt dispatch in flight (first send / queue drain until agent_start).
     /// Depends on @Published isStreaming + isSendingFromQueue so observers refresh.
     var isWorking: Bool { isStreaming || isSendingFromQueue }
+
+    /// Wall-clock bounds for the most recently submitted boss turn, including its subagents.
+    @Published private(set) var turnWallClockStartedAt: Date?
+    @Published private(set) var turnWallClockEndedAt: Date?
+
+    var turnCompletionText: String? {
+        guard let startedAt = turnWallClockStartedAt,
+              let endedAt = turnWallClockEndedAt else { return nil }
+        return "\(TurnDurationFormat.completedAt(endedAt))完成，用时\(TurnDurationFormat.elapsed(endedAt.timeIntervalSince(startedAt)))"
+    }
+
+    /// Speed stats for the current model (输入栏上下文浮层「当前模型」section).
+    /// Republished after every recorded assistant turn and on model switch.
+    @Published private(set) var currentModelSpeed: ModelSpeedStats?
 
     /// Provided by AppStore so settle can skip green when this session is already selected.
     var isSelectedCheck: (() -> Bool)?
@@ -647,10 +812,15 @@ final class ChatSession: ObservableObject, Identifiable {
     /// injected into every spawned pi process environment at session start.
     private static let dotEnvStore = EnvFileStore()
 
-    /// Merge `.env` pairs as the base layer under PipiUI-internal keys:
-    /// internal `PIPIUI_*` keys always win and can never be overridden by `.env`.
-    static func mergedSpawnEnv(dotEnv: [String: String], internal internalEnv: [String: String]) -> [String: String] {
-        var env = dotEnv
+    /// Merge `.env` pairs as the base layer under PipiUI-internal keys.
+    /// Built-in-managed names are first removed from `.env`, so a disabled
+    /// feature cannot be resurrected by stale PIPIUI_* entries; the current
+    /// assembly's internal values are then authoritative.
+    static func mergedSpawnEnv(
+        dotEnv: [String: String],
+        internal internalEnv: [String: String]
+    ) -> [String: String] {
+        var env = PipiSpawnEnvironmentPolicy.sanitized(dotEnv)
         env.merge(internalEnv) { _, new in new }
         return env
     }
@@ -659,6 +829,14 @@ final class ChatSession: ObservableObject, Identifiable {
     // 流式更新节流：每个 token delta 都刷 UI 会卡，按 50ms 合并
     private var pendingStreamMessage: J?
     private var streamFlushScheduled = false
+    /// Speed-stat instrumentation (ModelSpeedTracker): t0 = `prompt` RPC send in
+    /// sendPromptNow (covers direct + queue-drain sends; excludes queue wait and
+    /// vision pre-captioning, which are not model latency), t1 = first visible
+    /// text token, end = message_end. Per-stream; reset on each send and after
+    /// message_end. Main-thread only.
+    private let speedTracker = ModelSpeedTracker()
+    private var streamRequestStartedAt: Date?
+    private var streamFirstTokenAt: Date?
     // 工具输出分片同样节流：高频 tool_execution_update 直接刷 toolRuns 会拖垮布局
     private var pendingToolRuns: [String: ToolRun] = [:]
     private var toolRunFlushScheduled = false
@@ -666,6 +844,11 @@ final class ChatSession: ObservableObject, Identifiable {
     private var quotaObserverID: UUID?
     /// The monitor currently subscribed to (so model switches can unbind/rebind).
     private var currentQuotaMonitor: QuotaMonitor?
+    /// Pay-per-token balance monitor subscription (shared per BalanceProvider).
+    private var balanceObserverID: UUID?
+    private var currentBalanceMonitor: BalanceMonitor?
+    /// Which balance provider is currently bound (for idempotent rebind).
+    private var boundBalanceProvider: BalanceProvider?
 
     /// Bumped when a new initial `get_messages` load starts; stale background builds are dropped.
     private var initialLoadGeneration: UInt64 = 0
@@ -678,8 +861,6 @@ final class ChatSession: ObservableObject, Identifiable {
     private var deferredInitialEvents: [J] = []
     private var cachedBranchMessages: [J] = []
     private var cachedLeafId: String?
-    /// Exact app-generated prompts that must neither create nor revoke a human path grant.
-    private var searchGrantSuppressedMessages: [String: Int] = [:]
     /// Offline preview state is replaced (not appended as optimistic live content) once
     /// authoritative get_messages completes.
     private var initialPreviewItemCount = 0
@@ -700,17 +881,32 @@ final class ChatSession: ObservableObject, Identifiable {
          subagentDir: String? = nil,
          agentsDir: String? = nil,
          philosophyExtension: String? = nil,
+         searchScopeExtension: String? = nil,
+         builtInFeatures: BuiltInFeatureSettings.EnabledSet = .init(),
          blockedReason: String? = nil,
          initialTranscript: InitialTranscriptBuild? = nil) {
         self.id = id
         self.projectURL = projectURL
         self.resumedFromDisk = sessionPath != nil
-        // A restarted/resumed session never inherits a stale external-search grant.
-        SearchScopeExtension.resetTurnGrant(sessionKey: id, projectRoot: projectURL)
+        // A restarted/resumed session never inherits a stale external-search
+        // grant — but only when the SearchScope capability is actually mounted.
+        // Bare-pi mode must not create/reset PipiUI grant files at all.
+        if PipiSpawnAssembly.shouldResetSearchGrant(
+            searchScopeExtension: searchScopeExtension,
+            features: builtInFeatures
+        ) {
+            SearchScopeExtension.resetTurnGrant(sessionKey: id, projectRoot: projectURL)
+        }
         // Worktree auto-merge target (successful subagents → merge into session project root).
         subagents.bindMainProject(projectURL)
         // Attribute per-turn usage events to this session in the token ledger.
         subagents.sessionKey = id
+        // App 运行中对账：本会话 pi 进程死后，桥接不再刷新 lastObservedAt，扩展侧
+        // vanished 结算（runningAgents 属父运行时）也不会再跑；由 store 周期扫掉
+        // stale running 幽灵。进程活着时对账直接跳过（那是扩展侧的责任区）。
+        subagents.startOrphanReconciliation { [weak self] in
+            self?.processAlive ?? false
+        }
         subagents.resolveContextWindow = { [weak self] modelId in
             guard let modelId, !modelId.isEmpty else { return nil }
             if let m = self?.availableModels.first(where: { $0.id == modelId }),
@@ -747,8 +943,10 @@ final class ChatSession: ObservableObject, Identifiable {
             hasUnseenInterruption = true
         }
         if let initialTranscript {
-            transcript = initialTranscript.items
-            toolRuns = initialTranscript.toolRuns
+            var stampedItems = initialTranscript.items
+            Self.stampToolDurations(&stampedItems, from: initialTranscript.toolRuns)
+            transcript = stampedItems
+            streaming.replaceToolRuns(initialTranscript.toolRuns)
             itemCounter = initialTranscript.itemCounter
             skipNextAssistantIngest = initialTranscript.skipNextAssistantIngest
             initialPreviewItemCount = initialTranscript.items.count
@@ -767,80 +965,49 @@ final class ChatSession: ObservableObject, Identifiable {
             return
         }
 
+        // Computer Use also depends on the built-in capability switch: even if the
+        // standalone authorization (`ComputerUseSettings.isEnabled()`) is on, the
+        // harness is never mounted when the master feature is off.
         let computerCaptureDescriptor: ComputerCaptureDescriptor? =
-            ComputerUseSettings.isEnabled()
+            (ComputerUseSettings.isEnabled() && builtInFeatures.isEnabled(.computerUse))
                 ? try? ComputerUseSettings.captureDescriptor()
                 : nil
-        var args: [String] = []
-        if let sessionPath { args += ["--session", sessionPath] }
-        // Philosophy normally arrives through pi's own package list, so every frontend and every
-        // dispatched worker gets it. This `-e` is only the fallback for when that registration
-        // is missing; it is deliberately NOT `--append-system-prompt`, which would suppress
-        // pi's discovery of the user's own ~/.pi/agent/APPEND_SYSTEM.md entirely.
-        if let philosophyExtension { args += ["-e", philosophyExtension] }
-        // 对话内 generate_image / git / reload：不依赖 bridge
-        if let mediaExtension { args += ["-e", mediaExtension] }
-        if let gitExtension { args += ["-e", gitExtension] }
-        if let reloadExtension { args += ["-e", reloadExtension] }
-        if let webSearchExtension { args += ["-e", webSearchExtension] }
-        // Main session only: dispatched workers stay fully skill-free.
-        if let skillLoaderExtension { args += ["-e", skillLoaderExtension] }
-        if let searchScopeExtension = PiPlugin.searchScopeExtensionPath {
-            args += ["-e", searchScopeExtension]
-        }
-        if let codexServerToolsExtension { args += ["-e", codexServerToolsExtension] }
-        if let claudeServerToolsExtension { args += ["-e", claudeServerToolsExtension] }
-        // Independent opt-in: when disabled the extension is not mounted at all, so the
-        // `computer` tool does not exist and contributes zero tool-prefix cost.
-        if computerCaptureDescriptor != nil, let computerUseExtension {
-            args += ["-e", computerUseExtension]
-        }
-        // Settings → 工具开关：禁用项走 pi --exclude-tools（会话重启后生效）
-        args += ToolSkillSettings.excludeToolsCLIArgs()
-        var extraEnv: [String: String] = [:]
-        extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"] = WebSearchSettings.configFileURL().path
-        extraEnv["PIPIUI_SEARCH_GRANT_FILE"] =
-            SearchScopeExtension.grantFileURL(sessionKey: id).path
-        if let searchScopeExtension = PiPlugin.searchScopeExtensionPath {
-            // Nested subagent Pi processes inherit this and pass the same guard via -e.
-            extraEnv["PIPIUI_SEARCH_SCOPE_EXT"] = searchScopeExtension
-        }
-        // App 自有插件通过 -e 加载：webview 工具 + 补丁版 subagent（覆盖自动发现的官方版）
-        if bridgePort > 0 {
-            if let webviewExtension { args += ["-e", webviewExtension] }
-            if let subagentDir {
-                args += ["-e", subagentDir]
-                // Nested subagent pi processes re-read this to pass `-e` again (#3).
-                extraEnv["PIPIUI_SUBAGENT_EXT"] = subagentDir
-            }
-            extraEnv["PIPIUI_BRIDGE_PORT"] = String(bridgePort)
-            extraEnv["PIPIUI_SESSION_KEY"] = bridgeRoutingKey
-            if let descriptor = computerCaptureDescriptor,
-               computerUseExtension != nil {
-                extraEnv["PIPIUI_COMPUTER_EXT"] = computerUseExtension
-                extraEnv["PIPIUI_COMPUTER_CAPABILITY"] = computerRoutingKey
-                extraEnv["PIPIUI_COMPUTER_DISPLAY_ID"] =
-                    String(descriptor.displayID)
-                extraEnv["PIPIUI_COMPUTER_WIDTH"] =
-                    String(descriptor.outputSize.width)
-                extraEnv["PIPIUI_COMPUTER_HEIGHT"] =
-                    String(descriptor.outputSize.height)
-            }
-            // Authoritative session root inherited by nested processes. Management
-            // roles such as secretary must never mistake a worker worktree for main.
-            extraEnv["PIPIUI_MAIN_CWD"] = projectURL.path
-            // 补丁版 subagent 从 App 自有目录读 agent 定义，不碰 ~/.pi/agent/agents
-            if let agentsDir { extraEnv["PIPIUI_AGENTS_DIR"] = agentsDir }
-            // Subagent 模型设置（热读 JSON）+ 主会话模型（跟随主 Agent = 底栏/composer）
-            extraEnv["PIPIUI_SUBAGENT_MODELS_FILE"] =
-                SubagentModelSettings.overridesFileURL().path
-            extraEnv["PIPIUI_MAIN_MODEL_FILE"] =
-                SubagentModelSettings.mainModelFileURL().path
-            let mainId = model?.id ?? SubagentModelSettings.readMainModel()
-            if let mid = mainId, !mid.isEmpty {
-                extraEnv["PIPIUI_MAIN_MODEL"] = mid
-            }
-        }
+        // Spawn argument assembly is centralized in `PipiSpawnAssembly` so the
+        // "disabled feature ⇒ no -e / env" and "all off ⇒ bare pi" rules are
+        // unit-testable without launching a subprocess. Every PipiUI-owned `-e`
+        // and `PIPIUI_*` key is gated by the built-in feature snapshot there.
+        let assembly = PipiSpawnAssembly.assemble(
+            PipiSpawnAssembly.Input(
+                sessionPath: sessionPath,
+                bridgePort: bridgePort,
+                bridgeRoutingKey: bridgeRoutingKey,
+                computerRoutingKey: computerRoutingKey,
+                grantSessionKey: id,
+                mainCWD: projectURL.path,
+                paths: PipiSpawnAssembly.Paths(
+                    philosophy: philosophyExtension,
+                    media: mediaExtension,
+                    git: gitExtension,
+                    reload: reloadExtension,
+                    webSearch: webSearchExtension,
+                    skillLoader: skillLoaderExtension,
+                    searchScope: searchScopeExtension,
+                    codexServerTools: codexServerToolsExtension,
+                    claudeServerTools: claudeServerToolsExtension,
+                    computerUse: computerUseExtension,
+                    webview: webviewExtension,
+                    subagentDir: subagentDir,
+                    agentsDir: agentsDir
+                ),
+                features: builtInFeatures,
+                computerDescriptor: computerCaptureDescriptor,
+                mainModelId: model?.id ?? SubagentModelSettings.readMainModel(),
+                excludeToolsArgs: ToolSkillSettings.excludeToolsCLIArgs(),
+                webSearchConfigFile: WebSearchSettings.configFileURL().path
+            )
+        )
+        let args = assembly.args
+        let extraEnv = assembly.extraEnv
         // T17: ~/.pi/agent/.env 注入（GUI app 从 Finder 启动没有 shell 环境）。
         // .env 在底层，PIPIUI_* 内部键绝不被 .env 覆盖；不得在日志打印这些键值。
         let spawnEnv = Self.mergedSpawnEnv(dotEnv: Self.dotEnvStore.all(), internal: extraEnv)
@@ -857,7 +1024,9 @@ final class ChatSession: ObservableObject, Identifiable {
     private func startProcess(arguments: [String], environment: [String: String]) {
         guard !processStartCancelled, proc == nil else { return }
         guard let proc = PiProcess(cwd: projectURL, arguments: arguments, extraEnv: environment) else {
-            lastError = "找不到 pi 可执行文件（试过 ~/.npm-global/bin、/opt/homebrew/bin 等）"
+            let message = "找不到 pi 可执行文件（试过 ~/.npm-global/bin、/opt/homebrew/bin 等）"
+            lastError = message
+            notifyError(message)
             processAlive = false
             isInitializing = false
             return
@@ -874,6 +1043,9 @@ final class ChatSession: ObservableObject, Identifiable {
             )
             self.processAlive = false
             self.isStreaming = false
+            // 进程确认死亡：立即对账一次（已 stale 的幽灵当场结算；新鲜的留给
+            // store 周期 tick 在 10 分钟窗口后处理）。
+            self.subagents.reconcileOrphanedNow()
             self.isStopping = false
             self.isSendingFromQueue = false
             // Exit before the first transcript arrives must not leave the spinner up.
@@ -889,7 +1061,9 @@ final class ChatSession: ObservableObject, Identifiable {
                 self.hasUnseenInterruption = true
             }
             if code != 0 {
-                self.lastError = "pi 进程退出 (code \(code))：\(stderr.suffix(300))"
+                let message = "pi 进程退出 (code \(code))：\(stderr.suffix(300))"
+                self.lastError = message
+                self.notifyError(message)
             }
         }
         loadInitialState()
@@ -901,6 +1075,13 @@ final class ChatSession: ObservableObject, Identifiable {
             let id = quotaObserverID
             let mon = monitor
             // deinit may leave the main thread; hop back before touching the monitor.
+            DispatchQueue.main.async {
+                mon.removeObserver(id)
+            }
+        }
+        if let balanceObserverID, let monitor = currentBalanceMonitor {
+            let id = balanceObserverID
+            let mon = monitor
             DispatchQueue.main.async {
                 mon.removeObserver(id)
             }
@@ -917,6 +1098,8 @@ final class ChatSession: ObservableObject, Identifiable {
         // Already bound to this provider → no-op (preserve selection, no churn).
         if quotaProvider == provider, currentQuotaMonitor != nil || provider == nil {
             if provider == nil { applyQuotaSnapshot(nil) }
+            // Still re-evaluate balance: deepseek → moonshot both have nil quota.
+            bindBalanceMonitor()
             return
         }
         unbindQuotaMonitor()
@@ -924,6 +1107,7 @@ final class ChatSession: ObservableObject, Identifiable {
             quotaProvider = nil
             quotaWindows = []
             applyQuotaSnapshot(nil)
+            bindBalanceMonitor()
             return
         }
         let monitor = provider.monitor
@@ -937,6 +1121,40 @@ final class ChatSession: ObservableObject, Identifiable {
             let persisted = LayoutPersistence.quotaSelectedWindow(provider: provider)
             self.applyQuotaSnapshot(snap?.copy(selectedWindowId: persisted ?? snap?.selectedWindowId))
         }
+        // Subscription quota wins over prepaid balance for the same slot.
+        bindBalanceMonitor()
+    }
+
+    /// Bind a pay-per-token balance monitor when there is no subscription quota pill.
+    private func bindBalanceMonitor() {
+        let bp: BalanceProvider? = {
+            if model?.quotaProvider != nil { return nil }
+            return model?.balanceProvider
+        }()
+        if boundBalanceProvider == bp, currentBalanceMonitor != nil || bp == nil {
+            if bp == nil { accountBalance = nil }
+            return
+        }
+        unbindBalanceMonitor()
+        guard let bp else {
+            boundBalanceProvider = nil
+            accountBalance = nil
+            return
+        }
+        let monitor = bp.monitor
+        currentBalanceMonitor = monitor
+        boundBalanceProvider = bp
+        balanceObserverID = monitor.observe { [weak self] snap in
+            self?.applyBalanceSnapshot(snap)
+        }
+    }
+
+    private func applyBalanceSnapshot(_ snap: BalanceSnapshot?) {
+        guard let snap else {
+            // Soft-fail: keep last good formatted text; only clear on unbind.
+            return
+        }
+        accountBalance = formatBalance(amount: snap.amount, currency: snap.currency)
     }
 
     /// Map a snapshot to the published capsule fields, honoring the selected window.
@@ -968,6 +1186,16 @@ final class ChatSession: ObservableObject, Identifiable {
         // Clear immediately so a previous provider's value never flashes while the
         // new provider's snapshot is in flight.
         applyQuotaSnapshot(nil)
+    }
+
+    private func unbindBalanceMonitor() {
+        if let balanceObserverID, let monitor = currentBalanceMonitor {
+            monitor.removeObserver(balanceObserverID)
+        }
+        balanceObserverID = nil
+        currentBalanceMonitor = nil
+        boundBalanceProvider = nil
+        accountBalance = nil
     }
 
     private func nextItemId() -> String {
@@ -1069,20 +1297,21 @@ final class ChatSession: ObservableObject, Identifiable {
         let reconciled = InitialTranscriptReconciler.reconcile(
             authoritative: built,
             currentItems: transcript,
-            currentToolRuns: toolRuns,
+            currentToolRuns: streaming.toolRuns,
             currentItemCounter: itemCounter,
             previewItemCount: initialPreviewItemCount,
             previewToolRunIDs: initialPreviewToolRunIDs
         )
         itemCounter = reconciled.itemCounter
         skipNextAssistantIngest = built.skipNextAssistantIngest
-        toolRuns = reconciled.toolRuns
-        if !built.toolRuns.isEmpty || reconciled.appendedLiveItemCount > 0 {
-            toolOutputVersion &+= 1
-        }
+        streaming.replaceToolRuns(reconciled.toolRuns)
+
+        // Stamp durations before the single assignment so the publish carries them.
+        var stampedItems = reconciled.items
+        Self.stampToolDurations(&stampedItems, from: reconciled.toolRuns)
 
         // Single assignment — avoid per-message @Published churn.
-        transcript = reconciled.items
+        transcript = stampedItems
         initialPreviewItemCount = 0
         initialPreviewToolRunIDs.removeAll(keepingCapacity: false)
 
@@ -1125,16 +1354,23 @@ final class ChatSession: ObservableObject, Identifiable {
 
     private func applyState(_ data: J) {
         if let pid = data["model"]["provider"].string, let mid = data["model"]["id"].string {
+            let knownSupports = availableModels.first(where: {
+                $0.provider == pid && $0.modelId == mid
+            })?.supportsImages
             model = ModelInfo(
                 provider: pid,
                 modelId: mid,
                 name: data["model"]["name"].string ?? mid,
-                contextWindow: data["model"]["contextWindow"].int
+                contextWindow: data["model"]["contextWindow"].int,
+                supportsImages: knownSupports ?? ModelInfo.supportsImages(modelId: mid, provider: pid)
             )
             // Composer / bottom-bar model — source of truth for「跟随主 Agent」.
             if let id = model?.id {
                 SubagentModelSettings.writeMainModel(id)
             }
+            // Speed stats follow the model the session is actually on (setModel's
+            // get_state round-trip lands here too; idempotent).
+            currentModelSpeed = speedTracker.stats(for: mid)
             // Update window immediately from get_state model; keep existing tokens, re-derive %.
             if let w = data["model"]["contextWindow"].int, w > 0 {
                 contextWindow = w
@@ -1284,11 +1520,47 @@ final class ChatSession: ObservableObject, Identifiable {
             "main turn \(turn) usage ↑\(usage.input) ↓\(usage.output) R\(usage.cacheRead) W\(usage.cacheWrite) $\(String(format: "%.4f", usage.cost)) ctx:\(usage.contextTokens) — \(model)",
             category: .token
         )
+
+        // Speed stats: one sample per completed assistant turn with output tokens.
+        // decodeDuration runs from the first visible token (t1) to message_end (now),
+        // so tokens/s never includes TTFT.
+        if usage.output > 0,
+           let t0 = streamRequestStartedAt,
+           let t1 = streamFirstTokenAt,
+           t1 >= t0 {
+            let ttft = t1.timeIntervalSince(t0)
+            let decode = Date().timeIntervalSince(t1)
+            if decode > 0 {
+                let modelId = self.model?.modelId ?? "unknown"
+                speedTracker.record(ModelSpeedSample(
+                    modelId: modelId,
+                    ttft: ttft,
+                    outputTokens: usage.output,
+                    decodeDuration: decode
+                ))
+                currentModelSpeed = speedTracker.stats(for: modelId)
+            }
+        }
+        // Per-stream state; the next sendPromptNow sets fresh values.
+        streamRequestStartedAt = nil
+        streamFirstTokenAt = nil
+    }
+
+    /// Earliest real assistant text in this stream marks t1 (TTFT end).
+    /// `message_start` normally carries an empty content stub; `message_update`
+    /// chunks carry the actual text, so the first non-empty arrival wins. Hooked at
+    /// event arrival (not the 50ms flush) so hidden sessions still get a timestamp.
+    private func markStreamFirstTokenIfNeeded(_ message: J) {
+        guard streamFirstTokenAt == nil, streamRequestStartedAt != nil else { return }
+        let text = Self.contentText(message["content"])
+        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            streamFirstTokenAt = Date()
+        }
     }
 
     // MARK: - Event handling
 
-    private func handleEvent(_ e: J) {
+    package func handleEvent(_ e: J) {
         let type = e["type"].string ?? ""
 
         // Defer transcript/stream/tool mutations until initial history is applied once.
@@ -1320,14 +1592,23 @@ final class ChatSession: ObservableObject, Identifiable {
         case "agent_settled":
             isStreaming = false
             isStopping = false
-            streamingItem = nil
+            pendingStreamMessage = nil
+            pendingToolRuns.removeAll(keepingCapacity: true)
+            streaming.streamingItem = nil
             agentTurnActive = false
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.subagents.reconcileWorktreeLifecycles(
+                    mainProjectURL: self.projectURL
+                )
+            }
             // Do not clear while background subagents are still running.
             syncInFlightMark()
             hasUnseenInterruption = false
             refreshStats()
             syncEntryIds()
             drainQueueIfIdle()
+            syncInFlightMark()
             // Green badge when still idle after drain (no queued follow-up).
             if !isWorking && messageQueue.isEmpty {
                 markUnseenCompletionAfterSuccessfulSettle()
@@ -1338,30 +1619,33 @@ final class ChatSession: ObservableObject, Identifiable {
             }
         case "message_start":
             if e["message"]["role"].string == "assistant" {
-                streamingItem = Self.convert(message: e["message"], id: "streaming", allowDiskRead: false)
+                streaming.streamingItem = Self.convert(message: e["message"], id: "streaming", allowDiskRead: false)
+                markStreamFirstTokenIfNeeded(e["message"])
             }
         case "message_update":
+            markStreamFirstTokenIfNeeded(e["message"])
             pendingStreamMessage = e["message"]
             scheduleStreamFlush()
         case "message_end":
             ingest(message: e["message"])
             if e["message"]["role"].string == "assistant" {
                 pendingStreamMessage = nil
-                streamingItem = nil
+                streaming.streamingItem = nil
                 recordTurnUsage(for: e["message"])
             }
         case "tool_execution_start":
             if let tid = e["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
-                toolRuns[tid] = ToolRun(isRunning: true)
-                toolOutputVersion &+= 1
+                streaming.updateToolRun(ToolRun(isRunning: true, startedAt: Date()), for: tid)
             }
         case "tool_execution_update":
             if let tid = e["toolCallId"].string {
                 // Coalesce partial chunks; flush on main ~50ms (same idea as scheduleStreamFlush).
-                var run = pendingToolRuns[tid] ?? toolRuns[tid] ?? ToolRun()
+                var run = pendingToolRuns[tid] ?? streaming.toolRuns[tid] ?? ToolRun()
                 run.isRunning = true
+                if run.startedAt == nil { run.startedAt = Date() }
                 run.output = Self.contentText(e["partialResult"]["content"])
+                run.lastOutputAt = Date()
                 pendingToolRuns[tid] = run
                 scheduleToolRunFlush()
             }
@@ -1369,20 +1653,27 @@ final class ChatSession: ObservableObject, Identifiable {
             if let tid = e["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
                 let content = e["result"]["content"]
-                toolRuns[tid] = ToolRun(
+                let previous = streaming.toolRuns[tid]
+                let now = Date()
+                streaming.updateToolRun(ToolRun(
                     isRunning: false,
                     isError: e["isError"].bool ?? false,
                     output: Self.contentText(content),
-                    images: Self.contentImages(content, allowDiskRead: false)
-                )
-                toolOutputVersion &+= 1
+                    images: Self.contentImages(content, allowDiskRead: false),
+                    startedAt: previous?.startedAt,
+                    lastOutputAt: now
+                ), for: tid)
+                Self.stampToolDurations(&transcript, from: streaming.toolRuns)
                 scheduleImageBackfill(toolCallId: tid)
             }
         case "auto_retry_start":
             lastError = "请求失败，自动重试中 (\(e["attempt"].int ?? 0)/\(e["maxAttempts"].int ?? 0))…"
         case "auto_retry_end":
             if e["success"].bool == false {
-                lastError = "重试失败：\(e["finalError"].string ?? "未知错误")"
+                let message = "重试失败：\(e["finalError"].string ?? "未知错误")"
+                lastError = message
+                notifyError(message)
+                lastErrorCanRetry = true
             } else {
                 lastError = nil
             }
@@ -1506,33 +1797,70 @@ final class ChatSession: ObservableObject, Identifiable {
         }
     }
 
+    /// Materialize retained live state for a remote snapshot. Background sessions keep
+    /// raw updates until this demand path (or selection) so they do not spend main-thread
+    /// time rebuilding `ChatItem` / tool output at the 20 Hz UI cadence.
+    package func materializeStreamingForSnapshot() {
+        materializePendingStreamMessage()
+        materializePendingToolRuns()
+    }
+
+    /// A newly selected chat needs its accumulated background updates before SwiftUI draws
+    /// the first live frame. The AppStore calls this immediately after changing selection.
+    package func flushPendingStreamingForSelection() {
+        guard isStreamingVisible else { return }
+        materializeStreamingForSnapshot()
+    }
+
+    private var isStreamingVisible: Bool {
+        // Standalone sessions and unit tests without AppStore wiring retain the
+        // historical behavior: treat a missing check as visible.
+        isSelectedCheck?() ?? true
+    }
+
+    private func materializePendingStreamMessage() {
+        guard let message = pendingStreamMessage else { return }
+        pendingStreamMessage = nil
+        streaming.streamingItem = Self.convert(
+            message: message,
+            id: "streaming",
+            allowDiskRead: false
+        )
+    }
+
+    private func materializePendingToolRuns() {
+        guard !pendingToolRuns.isEmpty else { return }
+        let batch = pendingToolRuns
+        pendingToolRuns.removeAll(keepingCapacity: true)
+        streaming.updateToolRuns(batch)
+    }
+
     private func scheduleStreamFlush() {
-        guard !streamFlushScheduled else { return }
+        // Hidden sessions retain only the newest raw message. No timer is needed:
+        // selection and remote snapshot reads materialize it on demand.
+        guard !streamFlushScheduled, isStreamingVisible else { return }
         streamFlushScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             guard let self else { return }
             self.streamFlushScheduled = false
-            if let message = self.pendingStreamMessage {
-                self.pendingStreamMessage = nil
-                self.streamingItem = Self.convert(message: message, id: "streaming")
-            }
+            // Selection can change while the coalescing timer is pending.
+            guard self.isStreamingVisible else { return }
+            self.materializePendingStreamMessage()
         }
     }
 
     /// Merge high-frequency tool partials into `toolRuns` at most ~every 50ms.
     private func scheduleToolRunFlush() {
-        guard !toolRunFlushScheduled else { return }
+        // As with assistant deltas, leave hidden-session partials raw until a
+        // visible consumer (or remote snapshot) actually asks for them.
+        guard !toolRunFlushScheduled, isStreamingVisible else { return }
         toolRunFlushScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             guard let self else { return }
             self.toolRunFlushScheduled = false
-            guard !self.pendingToolRuns.isEmpty else { return }
-            let batch = self.pendingToolRuns
-            self.pendingToolRuns.removeAll(keepingCapacity: true)
-            for (tid, run) in batch {
-                self.toolRuns[tid] = run
-            }
-            self.toolOutputVersion &+= 1
+            // Selection can change while the coalescing timer is pending.
+            guard self.isStreamingVisible else { return }
+            self.materializePendingToolRuns()
         }
     }
 
@@ -1576,8 +1904,14 @@ final class ChatSession: ObservableObject, Identifiable {
             }
             if let item = Self.convert(message: message, id: nextItemId(), allowDiskRead: false) {
                 if item.blocks.isEmpty, message["stopReason"].string == "error" {
-                    // API returned an error with no content — surface it instead of a blank bubble.
-                    appendSystem("⚠️ 模型请求失败（stopReason=error），请检查扩展冲突或 API 状态。")
+                    // API returned an error with no content — surface a concise, actionable reason.
+                    let warning = Self.modelFailureWarning(for: message)
+                    transcript.append(ChatItem(
+                        id: item.id,
+                        role: "system",
+                        blocks: [.text(warning)]
+                    ))
+                    notifyError(warning)
                 } else {
                     transcript.append(item)
                     scheduleImageBackfill(itemId: item.id)
@@ -1587,13 +1921,16 @@ final class ChatSession: ObservableObject, Identifiable {
             if let tid = message["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
                 let content = message["content"]
-                toolRuns[tid] = ToolRun(
+                let previous = streaming.toolRuns[tid]
+                streaming.updateToolRun(ToolRun(
                     isRunning: false,
                     isError: message["isError"].bool ?? false,
                     output: Self.contentText(content),
-                    images: Self.contentImages(content, allowDiskRead: false)
-                )
-                toolOutputVersion &+= 1
+                    images: Self.contentImages(content, allowDiskRead: false),
+                    startedAt: previous?.startedAt,
+                    lastOutputAt: previous?.lastOutputAt ?? Date()
+                ), for: tid)
+                Self.stampToolDurations(&transcript, from: streaming.toolRuns)
                 scheduleImageBackfill(toolCallId: tid)
             }
         case "bashExecution":
@@ -1649,6 +1986,232 @@ final class ChatSession: ObservableObject, Identifiable {
         return ChatItem(id: id, role: role, blocks: blocks)
     }
 
+    /// Stamp finished wall-clock durations onto toolCall blocks from live toolRuns.
+    /// A block is stamped only when its run has both a start and a later last-output time;
+    /// unknown or non-positive deltas leave `durationSeconds` nil (never cleared once set).
+    package static func stampToolDurations(
+        _ items: inout [ChatItem],
+        from toolRuns: [String: ToolRun]
+    ) {
+        guard !toolRuns.isEmpty else { return }
+        for itemIndex in items.indices {
+            for blockIndex in items[itemIndex].blocks.indices {
+                guard case .toolCall(let block) = items[itemIndex].blocks[blockIndex],
+                      let run = toolRuns[block.id],
+                      let startedAt = run.startedAt,
+                      let lastOutputAt = run.lastOutputAt else { continue }
+                let delta = lastOutputAt.timeIntervalSince(startedAt)
+                guard delta > 0 else { continue }
+                var stamped = block
+                stamped.durationSeconds = delta
+                items[itemIndex].blocks[blockIndex] = .toolCall(stamped)
+            }
+        }
+    }
+
+    private static let entryTimestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let entryTimestampFormatterNoFractional = ISO8601DateFormatter()
+
+    /// Entry-level ISO8601 timestamp from pi session JSONL; nil when absent or unparsable.
+    private static func entryTimestamp(of message: J) -> Date? {
+        guard let raw = message["timestamp"].string else { return nil }
+        return entryTimestampFormatter.date(from: raw)
+            ?? entryTimestampFormatterNoFractional.date(from: raw)
+    }
+
+    /// Concise user-facing explanation for an empty assistant message that ended in error.
+    /// This formatter is deliberately pure so live ingest and restored history cannot drift.
+    package static func modelFailureWarning(for message: J) -> String {
+        let rawError = message["errorMessage"].string ?? ""
+        let searchable = rawError.lowercased()
+        let detail = modelFailureDetail(from: rawError)
+        let subject = modelFailureSubject(from: message)
+
+        if searchable.contains("429")
+            || searchable.contains("rate_limit")
+            || searchable.contains("rate limit")
+            || searchable.contains("overloaded")
+            || searchable.contains("访问量过大") {
+            return "⚠️ \(subject)服务当前繁忙或过载，请稍后重试或切换模型。"
+        }
+
+        if searchable.contains("timed out") || searchable.contains("timeout") {
+            return "⚠️ \(subject)请求超时，请稍后重试。"
+        }
+
+        if searchable.contains("connection error")
+            || searchable.contains("fetch failed")
+            || searchable.contains("network") {
+            return "⚠️ \(subject)网络或连接失败，请检查网络后重试。"
+        }
+
+        if searchable.contains("401")
+            || searchable.contains("invalid api key")
+            || searchable.contains("no api key")
+            || searchable.contains("unauthorized") {
+            return "⚠️ \(subject)认证失败，请检查 API Key 或登录状态。"
+        }
+
+        if searchable.contains("duplicate tool names")
+            || searchable.contains("schema validation")
+            || searchable.contains("invalid request content") {
+            return warning(
+                subject: subject,
+                summary: "扩展/工具兼容性冲突",
+                detail: detail
+            )
+        }
+
+        return warning(subject: subject, summary: "模型请求失败", detail: detail)
+    }
+
+    private static func warning(subject: String, summary: String, detail: String?) -> String {
+        guard let detail, !detail.isEmpty else {
+            return "⚠️ \(subject)\(summary)。"
+        }
+        return "⚠️ \(subject)\(summary)：\(detail)"
+    }
+
+    private static func modelFailureSubject(from message: J) -> String {
+        let provider = compactModelIdentifier(message["provider"].string)
+        let model = compactModelIdentifier(
+            message["model"].string ?? message["model"]["id"].string
+        )
+
+        switch (provider, model) {
+        case let (provider?, model?) where model.hasPrefix("\(provider)/"):
+            return "\(model) "
+        case let (provider?, model?):
+            return "\(provider)/\(model) "
+        case let (provider?, nil):
+            return "\(provider) "
+        case let (nil, model?):
+            return "\(model) "
+        case (nil, nil):
+            return ""
+        }
+    }
+
+    private static func compactModelIdentifier(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = normalizeModelFailureWhitespace(value)
+        guard !normalized.isEmpty else { return nil }
+        return String(normalized.prefix(80))
+    }
+
+    private static func modelFailureDetail(from rawError: String) -> String? {
+        let normalizedRaw = normalizeModelFailureWhitespace(rawError)
+        guard !normalizedRaw.isEmpty else { return nil }
+
+        var candidate = extractModelFailureMessage(from: normalizedRaw)
+        if candidate == nil {
+            // Avoid reflecting an opaque JSON blob when no useful message can be extracted.
+            if normalizedRaw.contains("{") || normalizedRaw.contains("[") {
+                candidate = "服务返回了无法解析的错误信息"
+            } else {
+                candidate = normalizedRaw
+            }
+        }
+
+        guard var sanitized = candidate else { return nil }
+        sanitized = sanitized.replacingOccurrences(
+            of: #"(?i)\b(request[_ -]?id|req(?:uest)?[_ -]?id)\s*[:=]\s*["']?[^\s,"'}]+"#,
+            with: "",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: #"(?i)\breq_[A-Za-z0-9_-]+\b"#,
+            with: "",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: #"(?i)\bbearer\s+[A-Za-z0-9._~+/\-=]+"#,
+            with: "Bearer [已隐藏]",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: #"(?i)\b(api[_ -]?key|access[_ -]?token|authorization|secret)\s*[:=]\s*["']?[^\s,"'}]+"#,
+            with: "$1=[已隐藏]",
+            options: .regularExpression
+        )
+        sanitized = sanitized.replacingOccurrences(
+            of: #"(?i)\b(sk|key|token|secret)[-_][A-Za-z0-9_-]{8,}\b"#,
+            with: "[已隐藏]",
+            options: .regularExpression
+        )
+        sanitized = normalizeModelFailureWhitespace(sanitized)
+            .trimmingCharacters(in: CharacterSet(charactersIn: " ,;:"))
+        guard !sanitized.isEmpty else { return nil }
+
+        let detailLimit = 300
+        if sanitized.count > detailLimit {
+            return String(sanitized.prefix(detailLimit - 1)) + "…"
+        }
+        return sanitized
+    }
+
+    private static func extractModelFailureMessage(from rawError: String) -> String? {
+        var jsonCandidates = [rawError]
+        if let start = rawError.firstIndex(of: "{"),
+           let end = rawError.lastIndex(of: "}"),
+           start <= end {
+            jsonCandidates.append(String(rawError[start...end]))
+        }
+
+        for candidate in jsonCandidates {
+            guard let data = candidate.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) else {
+                continue
+            }
+            if let message = preferredModelFailureMessage(in: object) {
+                return normalizeModelFailureWhitespace(message)
+            }
+        }
+        return nil
+    }
+
+    private static func preferredModelFailureMessage(in object: Any) -> String? {
+        if let dictionary = object as? [String: Any] {
+            for key in ["message", "detail", "error_description"] {
+                if let value = dictionary[key] as? String, !value.isEmpty {
+                    return value
+                }
+            }
+            if let error = dictionary["error"] {
+                if let value = error as? String, !value.isEmpty {
+                    return value
+                }
+                if let nested = preferredModelFailureMessage(in: error) {
+                    return nested
+                }
+            }
+            for (key, value) in dictionary
+                where !["request_id", "requestId", "id"].contains(key) {
+                if let nested = preferredModelFailureMessage(in: value) {
+                    return nested
+                }
+            }
+        } else if let array = object as? [Any] {
+            for value in array {
+                if let nested = preferredModelFailureMessage(in: value) {
+                    return nested
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func normalizeModelFailureWhitespace(_ value: String) -> String {
+        value
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+    }
+
     /// Pure history build for `get_messages` (call off main: disk read + base64 in `parseImageBlock` / hydrate).
     /// Preserves message order; mirrors `ingest` including ghost-title skip and toolResult → toolRuns.
     package static func buildTranscript(
@@ -1659,13 +2222,37 @@ final class ChatSession: ObservableObject, Identifiable {
         var toolRuns: [String: ToolRun] = [:]
         var itemCounter = 0
         var skipNextAssistantIngest = false
+        // toolCall id → wall-clock start (entry timestamp of the assistant message that declares it).
+        var toolCallStart: [String: Date] = [:]
 
         func nextId() -> String {
             itemCounter += 1
             return "item-\(itemCounter)"
         }
 
+        /// Stamps `durationSeconds` on the already-built block for `tid` when the
+        /// result timestamp is strictly after the recorded start.
+        func applyTiming(tid: String, start: Date, resultTimestamp: Date) {
+            let delta = resultTimestamp.timeIntervalSince(start)
+            guard delta > 0 else { return }
+            guard let itemIndex = items.firstIndex(where: { item in
+                item.blocks.contains { block in
+                    if case .toolCall(let call) = block { return call.id == tid }
+                    return false
+                }
+            }),
+            let blockIndex = items[itemIndex].blocks.firstIndex(where: { block in
+                if case .toolCall(let call) = block { return call.id == tid }
+                return false
+            }) else { return }
+            guard case .toolCall(let block) = items[itemIndex].blocks[blockIndex] else { return }
+            var stamped = block
+            stamped.durationSeconds = delta
+            items[itemIndex].blocks[blockIndex] = .toolCall(stamped)
+        }
+
         for message in messages {
+            let timestamp = entryTimestamp(of: message)
             switch message["role"].string ?? "" {
             case "user":
                 let text = contentText(message["content"])
@@ -1693,7 +2280,22 @@ final class ChatSession: ObservableObject, Identifiable {
                     id: nextId(),
                     allowDiskRead: loadImageData
                 ) {
-                    items.append(item)
+                    if let timestamp {
+                        for block in item.blocks {
+                            if case .toolCall(let call) = block {
+                                toolCallStart[call.id] = timestamp
+                            }
+                        }
+                    }
+                    if item.blocks.isEmpty, message["stopReason"].string == "error" {
+                        items.append(ChatItem(
+                            id: item.id,
+                            role: "system",
+                            blocks: [.text(modelFailureWarning(for: message))]
+                        ))
+                    } else {
+                        items.append(item)
+                    }
                 }
             case "toolResult":
                 if let tid = message["toolCallId"].string {
@@ -1704,6 +2306,11 @@ final class ChatSession: ObservableObject, Identifiable {
                         output: contentText(content),
                         images: contentImages(content, allowDiskRead: loadImageData)
                     )
+                    if let timestamp, let start = toolCallStart[tid] {
+                        applyTiming(tid: tid, start: start, resultTimestamp: timestamp)
+                        toolRuns[tid]?.startedAt = start
+                        toolRuns[tid]?.lastOutputAt = timestamp
+                    }
                 }
             case "bashExecution":
                 let cmd = message["command"].string ?? ""
@@ -1879,7 +2486,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 if case .image(let img) = block { return img }
                 return nil
             })
-        } else if let toolCallId, let run = toolRuns[toolCallId] {
+        } else if let toolCallId, let run = streaming.toolRuns[toolCallId] {
             targets = Self.placeholderImageTargets(in: run.images)
         } else {
             return
@@ -1900,11 +2507,10 @@ final class ChatSession: ObservableObject, Identifiable {
                     item.blocks = Self.backfilledBlocks(item.blocks, loaded: loaded)
                     self.transcript[idx] = item
                 }
-                if let toolCallId, let run = self.toolRuns[toolCallId] {
+                if let toolCallId, let run = self.streaming.toolRuns[toolCallId] {
                     var next = run
                     next.images = Self.backfilledImages(run.images, loaded: loaded)
-                    self.toolRuns[toolCallId] = next
-                    self.toolOutputVersion &+= 1
+                    self.streaming.updateToolRun(next, for: toolCallId)
                 }
             }
         }
@@ -2271,6 +2877,34 @@ final class ChatSession: ObservableObject, Identifiable {
         )
     }
 
+    /// 重试最近一次失败的请求：按原文本/原图重新投递最后一条用户消息。
+    func retryLastRequest() {
+        guard lastErrorCanRetry, lastError != nil else { return }
+        guard !isWorking else {
+            flash("请等待当前任务结束")
+            return
+        }
+        guard proc != nil else {
+            flash("pi 未运行，无法重试")
+            return
+        }
+        guard let item = transcript.last(where: {
+            $0.role == "user" && MessageActions.isUserAuthoredMessage($0)
+        }) else {
+            flash("没有可重试的消息")
+            return
+        }
+        let text = MessageActions.copyableText(from: item)
+        guard MessageActions.isEditDraftSendable(text) else {
+            flash("消息为空，无法重试")
+            return
+        }
+        lastError = nil  // didSet 同步复位 lastErrorCanRetry
+        let images = draftImages(from: item)
+        let prepared = prepareMessage(text: text, images: images)
+        deliverAfterOptionalVisionFallback(preparedMessage: prepared.message, images: prepared.images)
+    }
+
     /// 把消息里的 image block 还原成 DraftImage（撤回修改 / 重发时原样携带图片）。
     private func draftImages(from item: ChatItem) -> [DraftImage] {
         item.blocks.compactMap { block -> DraftImage? in
@@ -2337,7 +2971,11 @@ final class ChatSession: ObservableObject, Identifiable {
                         )
                     } else {
                         let prepared = self.prepareMessage(text: text, images: images)
-                        self.sendPromptNow(message: prepared.message, images: prepared.images)
+                        self.deliverAfterOptionalVisionFallback(
+                            preparedMessage: prepared.message,
+                            images: prepared.images,
+                            delivery: .sendNowOnly
+                        )
                     }
                 }
             }
@@ -2434,7 +3072,7 @@ final class ChatSession: ObservableObject, Identifiable {
     private func reloadTranscriptAfterSessionReplace(
         completion: @escaping (String?) -> Void
     ) {
-        streamingItem = nil
+        streaming.streamingItem = nil
         isStreaming = false
         isStopping = false
         editingItemId = nil
@@ -2456,9 +3094,10 @@ final class ChatSession: ObservableObject, Identifiable {
                 let built = Self.buildTranscript(from: messages)
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    self.transcript = built.items
-                    self.toolRuns = built.toolRuns
-                    self.toolOutputVersion &+= 1
+                    var stampedItems = built.items
+                    Self.stampToolDurations(&stampedItems, from: built.toolRuns)
+                    self.transcript = stampedItems
+                    self.streaming.replaceToolRuns(built.toolRuns)
                     self.itemCounter = built.itemCounter
                     self.skipNextAssistantIngest = built.skipNextAssistantIngest
                     self.cachedBranchMessages = []
@@ -2472,6 +3111,18 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     func sendPrompt(_ text: String, images: [DraftImage] = []) {
+        sendPrompt(
+            text,
+            images: images,
+            searchGrantPolicy: .localHumanRecordPromptPaths
+        )
+    }
+
+    private func sendPrompt(
+        _ text: String,
+        images: [DraftImage],
+        searchGrantPolicy: PromptSearchGrantPolicy
+    ) {
         let expanded = expandedDraftText(from: text)
         // Bodies are now in `expanded`; drop map so markers cannot be re-expanded later.
         clearDraftPastes()
@@ -2502,22 +3153,62 @@ final class ChatSession: ObservableObject, Identifiable {
         }
 
         let prepared = prepareMessage(text: trimmed, images: images)
+        beginTurnWallClock()
+        deliverAfterOptionalVisionFallback(
+            preparedMessage: prepared.message,
+            images: prepared.images,
+            searchGrantPolicy: searchGrantPolicy
+        )
+    }
 
-        // Busy while streaming OR in the gap after drain popped until agent_start.
-        if isStreaming || isSendingFromQueue {
-            let ok = queue.enqueue(text: prepared.message, images: prepared.images)
-            if ok { publishQueue() }
-            return
+    enum RemotePromptSubmissionResult: Equatable {
+        case accepted
+        case empty
+        case rejectedBuiltin(String)
+        case unavailable
+    }
+
+    /// Explicit remote-text seam. It shares the normal local queue, optimistic
+    /// transcript and Pi abort behavior, while refusing every PipiUI-local
+    /// builtin and never treating remote text as local filesystem authorization.
+    func submitRemotePrompt(_ text: String) -> RemotePromptSubmissionResult {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .empty }
+        if let builtinName = RemotePromptPolicy.rejectedBuiltinName(in: trimmed) {
+            return .rejectedBuiltin(builtinName)
         }
-        sendPromptNow(message: prepared.message, images: prepared.images)
+        guard processAlive, proc != nil else { return .unavailable }
+
+        let prepared = prepareMessage(text: trimmed, images: [])
+        if isStreaming || isSendingFromQueue {
+            guard queue.enqueue(
+                text: prepared.message,
+                images: [],
+                searchGrantPolicy: .remoteClearGrant
+            ) else {
+                return .empty
+            }
+            publishQueue()
+        } else {
+            guard sendPromptNow(
+                message: prepared.message,
+                images: [],
+                searchGrantPolicy: .remoteClearGrant
+            ) else {
+                return .unavailable
+            }
+        }
+        return .accepted
     }
 
     /// App-authored user-role messages are useful orchestration input, but are not
     /// human authorization. Preserve the latest human grant without widening it.
     private func sendAppGeneratedPrompt(_ text: String) {
-        let key = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        searchGrantSuppressedMessages[key, default: 0] += 1
-        sendPrompt(text)
+        sendPrompt(
+            text,
+            images: [],
+            searchGrantPolicy: .appAuthoredPreserveLatestHumanGrant
+        )
     }
 
     /// Run image/video generation via grok-relay / coding-relay REST (same APIs as Grok Build).
@@ -2565,12 +3256,14 @@ final class ChatSession: ObservableObject, Identifiable {
                 await MainActor.run {
                     self.mediaBusy = false
                     self.mediaStatus = nil
-                    self.lastError = error.localizedDescription
+                    let message = error.localizedDescription
+                    self.lastError = message
                     self.transcript.append(ChatItem(
                         id: self.nextItemId(),
                         role: "system",
-                        blocks: [.text("\(mode.label)失败：\(error.localizedDescription)")]
+                        blocks: [.text("\(mode.label)失败：\(message)")]
                     ))
+                    self.notifyError(message)
                 }
             }
         }
@@ -2638,22 +3331,133 @@ final class ChatSession: ObservableObject, Identifiable {
         return (message, images)
     }
 
-    private func sendPromptNow(message: String, images: [DraftImage], requeueOnFailure: QueuedMessage? = nil) {
-        let suppressionCount = searchGrantSuppressedMessages[message] ?? 0
-        if suppressionCount > 0 {
-            if suppressionCount == 1 {
-                searchGrantSuppressedMessages.removeValue(forKey: message)
-            } else {
-                searchGrantSuppressedMessages[message] = suppressionCount - 1
+    private enum VisionFallbackDelivery {
+        /// Composer path: enqueue when busy, otherwise send now.
+        case queueOrSend
+        /// Fork/resend path: `isSendingFromQueue` is already true; always `sendPromptNow`.
+        case sendNowOnly
+    }
+
+    /// When the session model cannot accept images, OCR (+ optional cloud VLM) and inject text
+    /// into the user message before queue/RPC. Images stay on the payload and in the transcript.
+    private func deliverAfterOptionalVisionFallback(
+        preparedMessage: String,
+        images: [DraftImage],
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths,
+        delivery: VisionFallbackDelivery = .queueOrSend
+    ) {
+        let supportsImages = model?.supportsImages
+            ?? ModelInfo.supportsImages(
+                modelId: model?.modelId ?? "",
+                provider: model?.provider ?? ""
+            )
+        let settings = VisionFallbackSettings.load()
+        let needsCaption = VisionFallback.shouldCaption(
+            supportsImages: supportsImages,
+            hasImages: !images.isEmpty
+        ) && settings.mode != .off
+
+        guard needsCaption else {
+            finishVisionFallbackDelivery(
+                message: preparedMessage,
+                images: images,
+                searchGrantPolicy: searchGrantPolicy,
+                delivery: delivery
+            )
+            return
+        }
+
+        let cloudConfig = settings.mode == .ocrAndCloud ? settings.captionConfig : nil
+        let mode = settings.mode
+        let imagePairs = images.map { ($0.data, $0.mimeType) }
+        Task { [weak self] in
+            let finalMessage = await VisionFallback.enrichMessage(
+                userText: preparedMessage,
+                images: imagePairs,
+                mode: mode,
+                cloudConfig: cloudConfig
+            )
+            guard let self else { return }
+            await MainActor.run {
+                self.finishVisionFallbackDelivery(
+                    message: finalMessage,
+                    images: images,
+                    searchGrantPolicy: searchGrantPolicy,
+                    delivery: delivery
+                )
             }
-        } else {
-            // Replace the grant before Pi sees this human-composer turn. A prompt without
-            // an explicit path writes an empty list, expiring any permission from last turn.
-            try? SearchScopeExtension.recordUserTurn(
-                message,
+        }
+    }
+
+    private func finishVisionFallbackDelivery(
+        message: String,
+        images: [DraftImage],
+        searchGrantPolicy: PromptSearchGrantPolicy,
+        delivery: VisionFallbackDelivery
+    ) {
+        switch delivery {
+        case .queueOrSend:
+            deliverPreparedPrompt(
+                message: message,
+                images: images,
+                searchGrantPolicy: searchGrantPolicy
+            )
+        case .sendNowOnly:
+            sendPromptNow(
+                message: message,
+                images: images,
+                searchGrantPolicy: searchGrantPolicy
+            )
+        }
+    }
+
+    private func deliverPreparedPrompt(
+        message: String,
+        images: [DraftImage],
+        searchGrantPolicy: PromptSearchGrantPolicy
+    ) {
+        // Busy while streaming OR in the gap after drain popped until agent_start.
+        if isStreaming || isSendingFromQueue {
+            let ok = queue.enqueue(
+                text: message,
+                images: images,
+                searchGrantPolicy: searchGrantPolicy
+            )
+            if ok { publishQueue() }
+            return
+        }
+        sendPromptNow(
+            message: message,
+            images: images,
+            searchGrantPolicy: searchGrantPolicy
+        )
+    }
+
+    @discardableResult
+    private func sendPromptNow(
+        message: String,
+        images: [DraftImage],
+        requeueOnFailure: QueuedMessage? = nil,
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths
+    ) -> Bool {
+        do {
+            try SearchScopeExtension.applyPromptPolicy(
+                searchGrantPolicy,
+                prompt: message,
                 sessionKey: id,
                 projectRoot: projectURL
             )
+        } catch {
+            if searchGrantPolicy == .remoteClearGrant {
+                lastError = "远程消息未发送：无法清除上一轮本地路径授权"
+                if let requeueOnFailure {
+                    queue.requeueFront(requeueOnFailure)
+                    publishQueue()
+                }
+                return false
+            }
+            // Preserve the existing local-composer behavior if grant persistence
+            // is unavailable; the Pi extension itself still fails closed outside cwd.
         }
 
         // Provisional title + at most one side-channel LLM refine (first user message only).
@@ -2683,6 +3487,10 @@ final class ChatSession: ObservableObject, Identifiable {
         }
         // Pin sidebar session to top on user submit (don't wait for agent_settled / disk mtime).
         onUserSubmitted?()
+        // Speed stats t0: the actual prompt RPC send. Set here (not at user submit)
+        // so queued prompts and vision pre-captioning don't inflate TTFT.
+        streamRequestStartedAt = Date()
+        streamFirstTokenAt = nil
         // Never set streamingBehavior: "steer" — busy delivery is local queue + idle drain.
         proc?.request(cmd) { [weak self] resp in
             guard let self else { return }
@@ -2702,6 +3510,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 }
             }
         }
+        return true
     }
 
     /// Local user row before pi `message_end` (deduped on ingest).
@@ -2745,11 +3554,23 @@ final class ChatSession: ObservableObject, Identifiable {
     func abort() {
         // Optimistic: acknowledge the click immediately. Cleared on settle / exit / new turn.
         isStopping = true
+        pendingStreamMessage = nil
+        pendingToolRuns.removeAll(keepingCapacity: true)
+        streaming.streamingItem = nil
         queue.noteAbort()
         publishQueue()
         cancelSideChannelTitle()
         // intercept flag only; items stay until idle drain
         proc?.send(["type": "abort"])
+    }
+
+    /// Remote Stop is narrower than the local method because the webpage keeps
+    /// a persistent button. An idle click must not leave `isStopping` stuck.
+    @discardableResult
+    func abortRemoteGeneration() -> Bool {
+        guard isStreaming || isSendingFromQueue else { return false }
+        abort()
+        return true
     }
 
     /// 插队 / 阻截：中止当前 run（若在生成），settle 后发送队首；FIFO 剩余项不变。不恢复到 draft。
@@ -2774,7 +3595,12 @@ final class ChatSession: ObservableObject, Identifiable {
             return
         }
         publishQueue()
-        sendPromptNow(message: msg.text, images: msg.images, requeueOnFailure: msg)
+        sendPromptNow(
+            message: msg.text,
+            images: msg.images,
+            requeueOnFailure: msg,
+            searchGrantPolicy: msg.searchGrantPolicy
+        )
     }
 
     func setModel(_ m: ModelInfo) {
@@ -2782,6 +3608,8 @@ final class ChatSession: ObservableObject, Identifiable {
             guard let self else { return }
             if resp["success"].bool == true {
                 self.model = m
+                // Speed stats follow the newly selected model (its own samples if any).
+                self.currentModelSpeed = self.speedTracker.stats(for: m.modelId)
                 // Keep「跟随主 Agent」aligned with composer/bottom-bar selection.
                 SubagentModelSettings.writeMainModel(m.id)
                 // Apply new model's context window immediately (re-derive % from existing tokens)
@@ -2795,9 +3623,10 @@ final class ChatSession: ObservableObject, Identifiable {
                 self.proc?.request(["type": "get_state"]) { [weak self] r in self?.applyState(r["data"]) }
                 // Authoritative refresh: get_session_stats re-reads current model's window + tokens
                 self.refreshStats()
-                // Re-bind quota monitor for the new provider, then force-refresh it.
+                // Re-bind quota/balance monitors for the new provider, then force-refresh.
                 self.bindQuotaMonitor()
                 self.currentQuotaMonitor?.refreshIfNeeded(force: true)
+                self.currentBalanceMonitor?.refreshIfNeeded(force: true)
             } else {
                 self.lastError = resp["error"].string ?? "切换模型失败"
             }
@@ -2834,6 +3663,7 @@ final class ChatSession: ObservableObject, Identifiable {
         processStartCancelled = true
         cancelSideChannelTitle()
         unbindQuotaMonitor()
+        unbindBalanceMonitor()
         subagents.saveNow()
         ComputerCoordinator.shared.release(
             sessionKey: bridgeRoutingKey,
@@ -2885,6 +3715,7 @@ final class ChatSession: ObservableObject, Identifiable {
 
     /// Mark / clear interrupted-path badge for main turn **or** running background subagents.
     private func syncInFlightMark() {
+        updateTurnWallClockCompletionIfNeeded()
         if InterruptedSessionStore.shouldPersistMark(
             agentTurnActive: agentTurnActive,
             isWorking: isWorking,
@@ -2894,6 +3725,20 @@ final class ChatSession: ObservableObject, Identifiable {
         } else {
             clearInFlightMark()
         }
+    }
+
+    private func beginTurnWallClock() {
+        turnWallClockStartedAt = Date()
+        turnWallClockEndedAt = nil
+    }
+
+    private func updateTurnWallClockCompletionIfNeeded() {
+        guard turnWallClockStartedAt != nil,
+              turnWallClockEndedAt == nil,
+              !isWorking,
+              messageQueue.isEmpty,
+              subagents.runningCount == 0 else { return }
+        turnWallClockEndedAt = Date()
     }
 
     private func persistInFlightMark() {
@@ -2916,6 +3761,23 @@ final class ChatSession: ObservableObject, Identifiable {
             hasUnseenCompletion = false
         } else {
             hasUnseenCompletion = true
+        }
+        // 任务完成提醒：只有用户看不到结果（会话未选中或应用未激活）时才弹。
+        if TaskNotifier.shouldNotifyCompletion(
+            selected: isSelectedCheck?() == true,
+            appActive: NSApp.isActive
+        ) {
+            MainActor.assumeIsolated {
+                TaskNotifier.shared.notifyCompletion(sessionTitle: displayTitle)
+            }
+        }
+    }
+
+    /// 任务失败提醒（错误不分用户是否在观看，始终提醒）。
+    /// PiProcess 的回调与 UI 事件都投递在主线程，此处用 assumeIsolated 直调。
+    private func notifyError(_ message: String) {
+        MainActor.assumeIsolated {
+            TaskNotifier.shared.notifyError(sessionTitle: displayTitle, message: message)
         }
     }
 
@@ -3000,6 +3862,7 @@ extension ChatSession: BuiltinCommandHost {
     func runShowSessionStats() {
         // Refresh then flash current snapshot (callbacks update published fields).
         currentQuotaMonitor?.refreshIfNeeded(force: true)
+        currentBalanceMonitor?.refreshIfNeeded(force: true)
         proc?.request(["type": "get_session_stats"]) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool == true {
@@ -3074,7 +3937,13 @@ extension ChatSession: BuiltinCommandHost {
         if let known = availableModels.first(where: { $0.provider == provider && $0.modelId == modelId }) {
             setModel(known)
         } else {
-            setModel(ModelInfo(provider: provider, modelId: modelId, name: modelId, contextWindow: nil))
+            setModel(ModelInfo(
+                provider: provider,
+                modelId: modelId,
+                name: modelId,
+                contextWindow: nil,
+                supportsImages: ModelInfo.supportsImages(modelId: modelId, provider: provider)
+            ))
         }
     }
 }

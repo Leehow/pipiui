@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PipiUI WebRTC 可行性测试</title>
+  <style nonce="__NONCE__">
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { max-width: 720px; margin: 48px auto; padding: 0 20px; line-height: 1.5; }
+    .card { border: 1px solid #8886; border-radius: 12px; padding: 20px; }
+    dt { color: #888; margin-top: 12px; }
+    dd { margin: 2px 0 0; font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+    button { margin-top: 20px; padding: 8px 14px; }
+    .ok { color: #20a060; }
+    .error { color: #d07030; }
+  </style>
+</head>
+<body>
+  <h1>PipiUI WebRTC 可行性测试</h1>
+  <p>仅测试本机 Chrome ↔ App 内 WKWebView 的 ordered/reliable DataChannel echo；这不是远程登录或设备配对。</p>
+  <div class="card">
+    <dl>
+      <dt>Host engine</dt><dd id="engine">WKWebView (native app retained host)</dd>
+      <dt>Negotiation</dt><dd id="state">等待开始</dd>
+      <dt>Echo</dt><dd id="echo">尚未发送</dd>
+    </dl>
+    <button id="start" type="button">开始本机 DataChannel 测试</button>
+  </div>
+  <script nonce="__NONCE__">
+    window.__PIPI_REMOTE_PEER_CONFIG__ = Object.freeze({
+      token: "__TOKEN__",
+      tokenHeader: "__TOKEN_HEADER__"
+    });
+  </script>
+  <script nonce="__NONCE__">__BUNDLED_SCRIPT__</script>
+</body>
+</html>

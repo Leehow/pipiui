@@ -38,6 +38,7 @@ struct MessageRow: View, Equatable {
     var onFlash: ((String) -> Void)? = nil
     var onSelectAgent: ((String) -> Void)?
     var onOpenFinishedGroup: ((AssistantBlockLayout.FinishedGroupPresentation) -> Void)?
+    var onOpenRunningTool: ((RunningToolDetailPresentation) -> Void)?
     var onCopy: (() -> Void)? = nil
     var onResend: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
@@ -140,6 +141,11 @@ struct MessageRow: View, Equatable {
                     onFlash: onFlash
                 )
             }
+        } else if SubagentHeartbeatMessage.parse(userDisplayText) != nil {
+            VStack(alignment: .trailing, spacing: 8) {
+                userImageThumbnails
+                SubagentHeartbeatBubbleView(text: userDisplayText, onFlash: onFlash)
+            }
         } else if userDisplayText.hasPrefix("[worktree-merge-failed]") {
             VStack(alignment: .trailing, spacing: 8) {
                 userImageThumbnails
@@ -215,6 +221,7 @@ struct MessageRow: View, Equatable {
             sessionKey: sessionKey,
             presentationScopeID: presentationScopeID,
             onOpenFinishedGroup: onOpenFinishedGroup,
+            onOpenRunningTool: onOpenRunningTool,
             entryId: item.entryId,
             isWorking: isWorking,
             onCopy: onCopy,
@@ -285,8 +292,10 @@ struct AssistantSegmentsView: View, Equatable {
     var sessionKey: String = ""
     var presentationScopeID: String = ""
     var onOpenFinishedGroup: ((AssistantBlockLayout.FinishedGroupPresentation) -> Void)?
+    var onOpenRunningTool: ((RunningToolDetailPresentation) -> Void)?
     var entryId: String? = nil
     var isWorking: Bool = false
+    var completionText: String? = nil
     var onCopy: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
     var onJump: (() -> Void)? = nil
@@ -308,6 +317,7 @@ struct AssistantSegmentsView: View, Equatable {
             && lhs.presentationScopeID == rhs.presentationScopeID
             && lhs.entryId == rhs.entryId
             && lhs.isWorking == rhs.isWorking
+            && lhs.completionText == rhs.completionText
             && lhs.collapsedOverride == rhs.collapsedOverride
         // Callbacks intentionally excluded.
     }
@@ -331,6 +341,11 @@ struct AssistantSegmentsView: View, Equatable {
                     onToggleCollapse: showsCollapseAction ? { toggleCollapse() } : nil,
                     onJump: onJump
                 )
+            }
+            if let completionText {
+                Text(completionText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -468,7 +483,10 @@ struct AssistantSegmentsView: View, Equatable {
                     run: toolRuns[call.id],
                     isStreaming: isStreaming,
                     projectURL: projectURL,
-                    onFlash: onFlash
+                    onFlash: onFlash,
+                    onOpenDetail: onOpenRunningTool.map { open in
+                        { open(RunningToolDetailPresentation(call: call)) }
+                    }
                 )
             }
         case .text, .image, .video:
@@ -661,26 +679,24 @@ struct SubagentToolCardView: View {
     let agents: [SubagentInfo]
     var onSelect: ((String) -> Void)?
 
-    private var runningCount: Int { agents.filter { $0.state == .running }.count }
-    private var totalCost: Double { agents.reduce(0) { $0 + $1.cost } }
-
     var body: some View {
+        let presentation = SubagentPresentationScale.cardPresentation(for: agents)
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "person.2")
-                    .foregroundStyle(runningCount > 0 ? Color.blue : Color.green)
+                    .foregroundStyle(presentation.runningCount > 0 ? Color.blue : Color.green)
                 Text("subagent")
                     .font(.callout.weight(.semibold).monospaced())
-                Text(runningCount > 0 ? "\(runningCount)/\(agents.count) 运行中" : "\(agents.count) 个完成")
+                Text("共 \(presentation.totalCount) · 运行 \(presentation.runningCount) · 失败 \(presentation.failedCount)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                if totalCost > 0 {
-                    Text(String(format: "$%.3f", totalCost))
+                if presentation.totalCost > 0 {
+                    Text(String(format: "$%.3f", presentation.totalCost))
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
-                if runningCount > 0 {
+                if presentation.runningCount > 0 {
                     ProgressView().controlSize(.mini)
                 }
             }
@@ -690,7 +706,7 @@ struct SubagentToolCardView: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 0) {
-                ForEach(agents) { agent in
+                ForEach(presentation.visibleAgents) { agent in
                     HStack(spacing: 8) {
                         if agent.depth > 1 {
                             Image(systemName: "arrow.turn.down.right")
@@ -701,6 +717,7 @@ struct SubagentToolCardView: View {
                         statusIcon(agent.state)
                         Text(agent.name)
                             .font(.caption.weight(.semibold))
+                            .foregroundStyle(.primary)
                         Text(SubagentToolCardStatus.line(for: agent))
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -717,21 +734,284 @@ struct SubagentToolCardView: View {
                     .onTapGesture { onSelect?(agent.id) }
                     .pointingHandCursor(onSelect != nil)
                 }
+
+                if presentation.hiddenCount > 0 {
+                    if let onSelect, let selectionID = presentation.panelSelectionID {
+                        Button {
+                            onSelect(selectionID)
+                        } label: {
+                            hiddenAgentsLabel(presentation)
+                        }
+                        .buttonStyle(.plain)
+                        .pointingHandCursor()
+                        .accessibilityLabel("打开 Subagents 面板查看另外 \(presentation.hiddenCount) 个子代理")
+                    } else {
+                        hiddenAgentsLabel(presentation)
+                    }
+                }
             }
         }
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.03)))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.08)))
     }
 
+    private func hiddenAgentsLabel(_ presentation: SubagentPresentationScale.CardPresentation) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "ellipsis.circle")
+            Text("当前优先显示 \(presentation.visibleAgents.count) 个，另有 \(presentation.hiddenCount) 个")
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Text("在 Subagents 面板查看全部")
+            Image(systemName: "sidebar.right")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+
     @ViewBuilder
     private func statusIcon(_ state: SubagentInfo.State) -> some View {
         switch state {
-        case .running: ProgressView().controlSize(.mini)
+        case .running: ProgressView().controlSize(.mini).tint(.secondary)
         case .ok: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
         case .failed: Image(systemName: "xmark.circle.fill").foregroundStyle(.red).font(.caption)
         case .aborted: Image(systemName: "stop.circle.fill").foregroundStyle(.orange).font(.caption)
         case .interrupted: Image(systemName: "bolt.slash.circle.fill").foregroundStyle(.orange).font(.caption)
         }
+    }
+}
+
+/// Pure, deterministic presentation policy for large subagent fan-outs.
+/// It bounds mounted rows without changing execution, aggregate accounting, or access to agents.
+enum SubagentPresentationScale {
+    static let cardRowLimit = 12
+    static let panelRowCap = 100
+    private static let panelPriorityReserve = 40
+
+    struct Summary: Equatable {
+        let totalCount: Int
+        let runningCount: Int
+        let failedCount: Int
+        let totalCost: Double
+
+        var finishedCount: Int { totalCount - runningCount }
+    }
+
+    struct CardPresentation: Equatable {
+        let summary: Summary
+        let visibleAgents: [SubagentInfo]
+        let hiddenCount: Int
+        let panelSelectionID: String?
+
+        var totalCount: Int { summary.totalCount }
+        var runningCount: Int { summary.runningCount }
+        var failedCount: Int { summary.failedCount }
+        var totalCost: Double { summary.totalCost }
+    }
+
+    struct PanelWindow: Equatable {
+        let agents: [SubagentInfo]
+        let totalCount: Int
+        let hiddenCount: Int
+        let pageFromNewest: Int
+        let pageCount: Int
+        let listIdentity: PanelListIdentity
+
+        var canShowNewer: Bool { pageFromNewest > 0 }
+        var canShowOlder: Bool { pageFromNewest + 1 < pageCount }
+    }
+
+    struct PanelListIdentity: Equatable {
+        let count: Int
+        let idFingerprint: UInt64
+
+        static let empty = PanelListIdentity(count: 0, idFingerprint: 0)
+    }
+
+    /// One pass computes exact aggregate counts/cost while retaining only bounded priority buckets.
+    /// Within each bucket the newest input row wins; priority is problems, running, then other/recent.
+    static func cardPresentation(
+        for agents: [SubagentInfo],
+        rowLimit: Int = cardRowLimit
+    ) -> CardPresentation {
+        let limit = max(0, rowLimit)
+        var runningCount = 0
+        var failedCount = 0
+        var totalCost = 0.0
+        var problems: [SubagentInfo] = []
+        var running: [SubagentInfo] = []
+        var other: [SubagentInfo] = []
+        problems.reserveCapacity(limit)
+        running.reserveCapacity(limit)
+        other.reserveCapacity(limit)
+
+        for agent in agents.reversed() {
+            if agent.state == .running { runningCount += 1 }
+            if agent.state == .failed { failedCount += 1 }
+            totalCost += agent.cost
+
+            if isProblematic(agent) {
+                if problems.count < limit { problems.append(agent) }
+            } else if agent.state == .running {
+                if running.count < limit { running.append(agent) }
+            } else if other.count < limit {
+                other.append(agent)
+            }
+        }
+
+        var visible: [SubagentInfo] = []
+        visible.reserveCapacity(limit)
+        appendPrefix(problems, to: &visible, limit: limit)
+        appendPrefix(running, to: &visible, limit: limit)
+        appendPrefix(other, to: &visible, limit: limit)
+
+        let summary = Summary(
+            totalCount: agents.count,
+            runningCount: runningCount,
+            failedCount: failedCount,
+            totalCost: totalCost
+        )
+        return CardPresentation(
+            summary: summary,
+            visibleAgents: visible,
+            hiddenCount: max(0, agents.count - visible.count),
+            panelSelectionID: visible.first?.id ?? agents.last?.id
+        )
+    }
+
+    /// Exact summary used by panel chrome, with no parallel filter/reduce passes.
+    static func summary(for agents: [SubagentInfo]) -> Summary {
+        var runningCount = 0
+        var failedCount = 0
+        var totalCost = 0.0
+        for agent in agents {
+            if agent.state == .running { runningCount += 1 }
+            if agent.state == .failed { failedCount += 1 }
+            totalCost += agent.cost
+        }
+        return Summary(
+            totalCount: agents.count,
+            runningCount: runningCount,
+            failedCount: failedCount,
+            totalCost: totalCost
+        )
+    }
+
+    /// Keeps every page under a fixed hard cap and in original tree order. Selected and recent
+    /// priority rows repeat across pages; all remaining rows are partitioned into bounded pages.
+    static func panelWindow(
+        for displayOrder: [SubagentInfo],
+        pageFromNewest requestedPage: Int,
+        selectedID: String?
+    ) -> PanelWindow {
+        let listIdentity = panelListIdentity(for: displayOrder)
+        guard !displayOrder.isEmpty else {
+            return PanelWindow(
+                agents: [],
+                totalCount: 0,
+                hiddenCount: 0,
+                pageFromNewest: 0,
+                pageCount: 0,
+                listIdentity: listIdentity
+            )
+        }
+
+        if displayOrder.count <= panelRowCap {
+            return PanelWindow(
+                agents: displayOrder,
+                totalCount: displayOrder.count,
+                hiddenCount: 0,
+                pageFromNewest: 0,
+                pageCount: 1,
+                listIdentity: listIdentity
+            )
+        }
+
+        var mandatoryIndices: Set<Int> = []
+        if let selectedID,
+           let selectedIndex = displayOrder.firstIndex(where: { $0.id == selectedID }) {
+            mandatoryIndices.insert(selectedIndex)
+        }
+
+        let priorityLimit = min(Self.panelPriorityReserve, panelRowCap - mandatoryIndices.count)
+        let prioritized = displayOrder.indices
+            .filter { isProblematic(displayOrder[$0]) || displayOrder[$0].state == .running }
+            .sorted {
+                let lhs = displayOrder[$0]
+                let rhs = displayOrder[$1]
+                if lhs.lastObservedAt != rhs.lastObservedAt {
+                    return lhs.lastObservedAt > rhs.lastObservedAt
+                }
+                return $0 > $1
+            }
+            .prefix(priorityLimit)
+        mandatoryIndices.formUnion(prioritized)
+
+        let ordinaryIndices = displayOrder.indices.filter { !mandatoryIndices.contains($0) }
+        let pageCapacity = max(1, panelRowCap - mandatoryIndices.count)
+        let pageCount = max(1, (ordinaryIndices.count + pageCapacity - 1) / pageCapacity)
+        let pageFromNewest = min(max(0, requestedPage), pageCount - 1)
+        let pageEnd = ordinaryIndices.count - pageFromNewest * pageCapacity
+        let pageStart = max(0, pageEnd - pageCapacity)
+        let pageIndices = ordinaryIndices[pageStart..<pageEnd]
+
+        var visibleIndices = mandatoryIndices
+        visibleIndices.formUnion(pageIndices)
+        let visible = visibleIndices.sorted().map { displayOrder[$0] }
+        assert(visible.count <= panelRowCap)
+        return PanelWindow(
+            agents: visible,
+            totalCount: displayOrder.count,
+            hiddenCount: displayOrder.count - visible.count,
+            pageFromNewest: pageFromNewest,
+            pageCount: pageCount,
+            listIdentity: listIdentity
+        )
+    }
+
+    static func panelPageAfterListChange(
+        currentPage: Int,
+        previousIdentity: PanelListIdentity,
+        newIdentity: PanelListIdentity
+    ) -> Int {
+        previousIdentity == newIdentity ? max(0, currentPage) : 0
+    }
+
+    private static func panelListIdentity(for agents: [SubagentInfo]) -> PanelListIdentity {
+        guard !agents.isEmpty else { return .empty }
+        // Stable FNV-1a over IDs catches replacement waves even when count/edge IDs are unchanged.
+        var fingerprint: UInt64 = 14_695_981_039_346_656_037
+        for agent in agents {
+            for byte in agent.id.utf8 {
+                fingerprint ^= UInt64(byte)
+                fingerprint &*= 1_099_511_628_211
+            }
+            fingerprint ^= 0xff
+            fingerprint &*= 1_099_511_628_211
+        }
+        return PanelListIdentity(count: agents.count, idFingerprint: fingerprint)
+    }
+
+    private static func isProblematic(_ agent: SubagentInfo) -> Bool {
+        if agent.state == .failed || agent.state == .aborted || agent.state == .interrupted {
+            return true
+        }
+        if agent.stalled || !(agent.worktreeError ?? "").isEmpty || (agent.verifyExit ?? 0) != 0 {
+            return true
+        }
+        return agent.closeoutDisposition == .needsFixer || agent.closeoutDisposition == .needsUser
+    }
+
+    private static func appendPrefix(
+        _ source: [SubagentInfo],
+        to destination: inout [SubagentInfo],
+        limit: Int
+    ) {
+        guard destination.count < limit else { return }
+        destination.append(contentsOf: source.prefix(limit - destination.count))
     }
 }
 
@@ -749,7 +1029,7 @@ enum SubagentToolCardStatus {
         case .aborted:
             return "已中止"
         case .interrupted:
-            return "已中断（App 重启）"
+            return "已中断（可续跑）"
         }
     }
 }
@@ -909,6 +1189,220 @@ struct CollapsibleUserBubbleView: View {
             fullReady = false
             fullOpacity = 0
         }
+    }
+}
+
+// MARK: - [subagent-heartbeat] user message (collapsed by default)
+
+/// Parsed shape of the periodic background-worker heartbeat injected via `pi.sendUserMessage`.
+struct SubagentHeartbeatMessage: Equatable {
+    struct WorkerSummary: Equatable {
+        enum Status: Equatable {
+            case running, vanished
+        }
+
+        let agentId: String
+        let title: String
+        let status: Status
+        let elapsed: String
+        let idleSeconds: Int?
+        let rawLine: String
+
+        var state: Status { status }
+    }
+
+    let headerLine: String
+    let outstanding: Int
+    let vanished: Int
+    let workers: [WorkerSummary]
+    let remainingText: String
+    let fullText: String
+
+    var workerSummaries: [WorkerSummary] { workers }
+
+    /// Returns nil for non-heartbeats or malformed headers/worker summary lines.
+    static func parse(_ text: String) -> SubagentHeartbeatMessage? {
+        guard text.hasPrefix("[subagent-heartbeat]") else { return nil }
+
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let headerLine = lines.first else { return nil }
+
+        let prefix = "[subagent-heartbeat]"
+        guard headerLine == prefix || headerLine.hasPrefix(prefix + " ") else { return nil }
+        let fieldsText = headerLine.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
+        var fields: [String: String] = [:]
+        for token in fieldsText.split(separator: " ", omittingEmptySubsequences: true) {
+            guard let equals = token.firstIndex(of: "=") else { return nil }
+            let key = String(token[..<equals])
+            let value = String(token[token.index(after: equals)...])
+            guard !key.isEmpty, !value.isEmpty else { return nil }
+            fields[key] = value
+        }
+        guard let outstandingText = fields["outstanding"],
+              let outstanding = Int(outstandingText), outstanding >= 0,
+              let vanishedText = fields["vanished"],
+              let vanished = Int(vanishedText), vanished >= 0 else {
+            return nil
+        }
+
+        var workers: [WorkerSummary] = []
+        var index = 1
+        while index < lines.count {
+            let line = lines[index]
+            guard line.hasPrefix("  "), !line.trimmingCharacters(in: .whitespaces).isEmpty else {
+                break
+            }
+            guard let worker = parseWorkerSummary(line) else { return nil }
+            workers.append(worker)
+            index += 1
+        }
+
+        let remainingText = index < lines.count ? lines[index...].joined(separator: "\n") : ""
+        return SubagentHeartbeatMessage(
+            headerLine: headerLine,
+            outstanding: outstanding,
+            vanished: vanished,
+            workers: workers,
+            remainingText: remainingText,
+            fullText: text
+        )
+    }
+
+    private static func parseWorkerSummary(_ rawLine: String) -> WorkerSummary? {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        guard let titleStart = line.range(of: " ("),
+              let detailStart = line.range(of: ") — ", options: .backwards),
+              titleStart.upperBound <= detailStart.lowerBound else {
+            return nil
+        }
+
+        let agentId = String(line[..<titleStart.lowerBound])
+        let title = String(line[titleStart.upperBound..<detailStart.lowerBound])
+        let detail = String(line[detailStart.upperBound...])
+        guard !agentId.isEmpty,
+              !agentId.contains(where: { $0.isWhitespace }),
+              !title.isEmpty else {
+            return nil
+        }
+
+        if detail.hasPrefix("running "),
+           let idleRange = detail.range(of: ", idle ", options: .backwards) {
+            let elapsed = String(detail[detail.index(detail.startIndex, offsetBy: "running ".count)..<idleRange.lowerBound])
+            let idleText = String(detail[idleRange.upperBound...])
+            guard !elapsed.isEmpty,
+                  idleText.hasSuffix("s"),
+                  let idleSeconds = Int(idleText.dropLast()),
+                  idleSeconds >= 0 else {
+                return nil
+            }
+            return WorkerSummary(
+                agentId: agentId,
+                title: title,
+                status: .running,
+                elapsed: elapsed,
+                idleSeconds: idleSeconds,
+                rawLine: rawLine
+            )
+        }
+
+        let vanishedPrefix = "process gone after "
+        let vanishedSuffix = ", no result reported"
+        guard detail.hasPrefix(vanishedPrefix), detail.hasSuffix(vanishedSuffix) else { return nil }
+        let elapsedStart = detail.index(detail.startIndex, offsetBy: vanishedPrefix.count)
+        let elapsedEnd = detail.index(detail.endIndex, offsetBy: -vanishedSuffix.count)
+        let elapsed = String(detail[elapsedStart..<elapsedEnd])
+        guard !elapsed.isEmpty else { return nil }
+        return WorkerSummary(
+            agentId: agentId,
+            title: title,
+            status: .vanished,
+            elapsed: elapsed,
+            idleSeconds: nil,
+            rawLine: rawLine
+        )
+    }
+}
+
+/// Compact heartbeat card. The operational guidance remains available only after expansion.
+struct SubagentHeartbeatBubbleView: View {
+    let text: String
+    var onFlash: ((String) -> Void)? = nil
+    @State private var expanded = false
+
+    private var parsed: SubagentHeartbeatMessage? { SubagentHeartbeatMessage.parse(text) }
+    private var hasVanishedWorkers: Bool { (parsed?.vanished ?? 0) > 0 }
+
+    private var summaryTitle: String {
+        guard let parsed else { return "心跳" }
+        var parts = ["心跳", "运行中 \(parsed.outstanding)"]
+        if parsed.vanished > 0 {
+            parts.append("失联 \(parsed.vanished)")
+        }
+        if let worker = parsed.workers.first {
+            parts.append("\(worker.agentId) \(worker.elapsed)")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var statusColor: Color {
+        hasVanishedWorkers ? .orange : .secondary
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "heart.fill")
+                    .foregroundStyle(statusColor)
+                    .imageScale(.medium)
+                Text(summaryTitle)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(statusColor)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { expanded.toggle() }
+            .pointingHandCursor()
+            .accessibilityAddTraits(.isButton)
+            .accessibilityValue(expanded ? "已展开" : "已折叠")
+
+            if expanded {
+                PathLinkedText(
+                    text: text,
+                    base: {
+                        var c = AttributeContainer()
+                        c.foregroundColor = Color.primary.opacity(0.85)
+                        return c
+                    }(),
+                    monospaced: true,
+                    onFlash: onFlash
+                )
+                .font(.caption.monospaced())
+                .padding(.top, 6)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 420, alignment: .trailing)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(hasVanishedWorkers ? Color.orange.opacity(0.08) : Color.primary.opacity(0.06))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(
+                            hasVanishedWorkers ? Color.orange.opacity(0.2) : Color.primary.opacity(0.08),
+                            lineWidth: 1
+                        )
+                )
+        )
+        .accessibilityLabel(summaryTitle)
     }
 }
 
@@ -1418,11 +1912,23 @@ private extension View {
 }
 
 /// Collapsed summary for consecutive finished thinking/toolCall rows between text/media.
+enum FileChangeDocumentTarget {
+    static func url(path: String, projectURL: URL?) -> URL? {
+        let expanded = (path as NSString).expandingTildeInPath
+        if (expanded as NSString).isAbsolutePath {
+            return URL(fileURLWithPath: expanded).standardizedFileURL
+        }
+        guard let projectURL else { return nil }
+        return projectURL.appendingPathComponent(expanded).standardizedFileURL
+    }
+}
+
 struct FinishedNonTextGroupView: View {
     let presentation: AssistantBlockLayout.FinishedGroupPresentation
     var toolRuns: [String: ToolRun] = [:]
     var projectURL: URL? = nil
     var onOpen: ((AssistantBlockLayout.FinishedGroupPresentation) -> Void)?
+    @Environment(\.openDocument) private var openDocument
 
     private var title: String {
         AssistantBlockLayout.summaryTitle(for: presentation.blocks)
@@ -1438,61 +1944,89 @@ struct FinishedNonTextGroupView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 7) {
-                Image(systemName: "rectangle.stack")
-                    .foregroundStyle(.secondary)
-                    .imageScale(.medium)
-                Text(title)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer(minLength: 0)
-                Image(systemName: "arrow.up.right.square")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+            Button {
+                onOpen?(presentation)
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "rectangle.stack")
+                        .foregroundStyle(.secondary)
+                        .imageScale(.medium)
+                    Text(title)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 0)
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .buttonStyle(.plain)
+            .accessibilityLabel(title)
+            .accessibilityValue("打开详情")
 
             if !fileChanges.files.isEmpty {
                 Divider()
-                HStack(spacing: 7) {
-                    Image(systemName: "doc.badge.gearshape")
-                        .foregroundStyle(.secondary)
-                    Text("已编辑 \(fileChanges.files.count) 个文件")
-                        .font(.caption.weight(.semibold))
-                    compactChangeCount(fileChanges.additions, color: .green, prefix: "+")
-                    compactChangeCount(fileChanges.deletions, color: .red, prefix: "−")
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                ForEach(fileChanges.files) { file in
-                    HStack(spacing: 8) {
-                        Text(file.displayPath)
-                            .font(.caption.monospaced())
+                Button {
+                    onOpen?(presentation)
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "doc.badge.gearshape")
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Spacer(minLength: 8)
-                        compactChangeCount(file.additions, color: .green, prefix: "+")
-                        compactChangeCount(file.deletions, color: .red, prefix: "−")
+                        Text("已编辑 \(fileChanges.files.count) 个文件")
+                            .font(.caption.weight(.semibold))
+                        compactChangeCount(fileChanges.additions, color: .green, prefix: "+")
+                        compactChangeCount(fileChanges.deletions, color: .red, prefix: "−")
+                        Spacer(minLength: 0)
                     }
+                    .contentShape(Rectangle())
                     .padding(.horizontal, 12)
                     .padding(.vertical, 7)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    "已编辑 \(fileChanges.files.count) 个文件，新增 \(fileChanges.additions) 行，删除 \(fileChanges.deletions) 行"
+                )
+                .accessibilityValue("打开详情")
+
+                ForEach(fileChanges.files) { file in
+                    Button {
+                        guard let documentURL = FileChangeDocumentTarget.url(
+                            path: file.path,
+                            projectURL: projectURL
+                        ) else { return }
+                        openDocument?(documentURL)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text(file.displayPath)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 8)
+                            compactChangeCount(file.additions, color: .green, prefix: "+")
+                            compactChangeCount(file.deletions, color: .red, prefix: "−")
+                        }
+                        .contentShape(Rectangle())
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(
+                        "\(file.displayPath)，新增 \(file.additions) 行，删除 \(file.deletions) 行"
+                    )
+                    .accessibilityValue("打开文档")
                     if file.id != fileChanges.files.last?.id {
                         Divider()
                     }
                 }
             }
         }
-        .contentShape(Rectangle())
-        .onTapGesture { onOpen?(presentation) }
         .pointingHandCursor()
-        .accessibilityAddTraits(.isButton)
-        .accessibilityLabel(title)
-        .accessibilityValue("打开详情")
         .background(
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color.primary.opacity(0.035))
@@ -1912,9 +2446,22 @@ private struct FileChangeDiffInspector: View {
     }
 }
 
+struct TurnElapsedText: View {
+    let startedAt: Date
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            Text("已用时 \(TurnDurationFormat.elapsed(context.date.timeIntervalSince(startedAt)))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
 /// 用户已发送、assistant 尚无可展示 block 时的轻量等待提示。
 struct WaitingPlaceholderView: View {
     let message: String
+    var turnStartedAt: Date? = nil
 
     var body: some View {
         HStack(spacing: 8) {
@@ -1923,6 +2470,9 @@ struct WaitingPlaceholderView: View {
             Text(message)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            if let turnStartedAt {
+                TurnElapsedText(startedAt: turnStartedAt)
+            }
         }
         .padding(.vertical, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2084,6 +2634,8 @@ struct ToolCardView: View {
     var onFlash: ((String) -> Void)? = nil
     /// Present only inside the detached finished-group detail.
     var onSelectFileChange: (() -> Void)? = nil
+    /// Open the live run detail sheet (main-transcript running cards).
+    var onOpenDetail: (() -> Void)? = nil
     @State private var expanded = false
 
     private var statusColor: Color {
@@ -2133,7 +2685,14 @@ struct ToolCardView: View {
                         .layoutPriority(1)
                 }
                 Spacer(minLength: 0)
-                if isLive {
+                if run?.isRunning == true {
+                    ProgressView().controlSize(.mini)
+                    if onOpenDetail != nil {
+                        Image(systemName: "arrow.up.right.square")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                } else if isLive {
                     ProgressView().controlSize(.mini)
                 } else if run != nil {
                     Image(systemName: run!.isError ? "xmark.circle.fill" : "checkmark.circle.fill")
@@ -2141,7 +2700,8 @@ struct ToolCardView: View {
                         .font(.caption)
                 }
                 // The complete header is the disclosure target; the chevron remains an affordance.
-                if hasTextOutput {
+                // Running cards keep the inline preview open and use the detail sheet instead.
+                if hasTextOutput, run?.isRunning != true {
                     Image(systemName: expanded ? "chevron.up" : "chevron.down")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -2151,17 +2711,30 @@ struct ToolCardView: View {
             .padding(.vertical, 8)
             .contentShape(Rectangle())
             .onTapGesture {
-                if let onSelectFileChange {
+                if run?.isRunning == true, let onOpenDetail {
+                    onOpenDetail()
+                } else if let onSelectFileChange {
                     onSelectFileChange()
                 } else if hasTextOutput {
                     expanded.toggle()
                 }
             }
-            .pointingHandCursor(hasTextOutput || onSelectFileChange != nil)
-            .accessibilityAddTraits(
-                hasTextOutput || onSelectFileChange != nil ? .isButton : []
+            .pointingHandCursor(
+                (run?.isRunning == true && onOpenDetail != nil)
+                    || hasTextOutput
+                    || onSelectFileChange != nil
             )
-            .accessibilityValue(hasTextOutput ? (expanded ? "已展开" : "已折叠") : "")
+            .accessibilityAddTraits(
+                (run?.isRunning == true && onOpenDetail != nil)
+                    || hasTextOutput
+                    || onSelectFileChange != nil
+                    ? .isButton : []
+            )
+            .accessibilityValue(
+                run?.isRunning == true && onOpenDetail != nil
+                    ? "打开详情"
+                    : (hasTextOutput ? (expanded ? "已展开" : "已折叠") : "")
+            )
 
             // Always show tool result thumbnails (even when collapsed).
             if !toolImages.isEmpty {
@@ -2208,6 +2781,19 @@ struct ToolCardView: View {
                     }
                 }
                 .background(Color.primary.opacity(0.025))
+            }
+
+            // Finished calls show wall-clock duration; running calls keep the spinner only.
+            if let duration = call.durationSeconds, !isLive {
+                Divider()
+                HStack(spacing: 4) {
+                    Text("耗时 \(DurationFormat.compact(duration))")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
             }
         }
         .background(

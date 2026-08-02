@@ -29,15 +29,18 @@ dispatch them in **one** call in the **same** turn:
 {{delegate}}({ tasks: [ {agent, task, title}, {agent, task, title}, ... ] })
 ```
 
-- Serialize only for a real dependency or a genuine write conflict on the same files.
-  Read-only work always parallelizes.
-- When workers write in parallel, their briefs must name non-overlapping paths.
+- Serialize only for a real dependency or a genuine write conflict in the same small code region
+  (the same function or neighboring hunk), not merely the same file. Read-only work always parallelizes.
+- Writable workers run in isolated git worktrees and the runtime auto-merges them, so Git handles
+  file-level overlap; different regions of one file are not a reason to serialize.
+- When workers write in parallel, their briefs must name the code regions they touch so the boss
+  can judge real overlap.
 - Two unrelated small changes are two workers, not one vague task and not two turns.
 - Once dispatch is acknowledged, immediately dispatch the remaining independent items rather
   than waiting.
 
-Named anti-patterns: dispatching A and then "B after A is done" when their paths do not
-overlap; one worker told to cover several independent sub-items; idling on a single worker
+Named anti-patterns: dispatching A and then "B after A is done" when they have no real
+dependency or shared code-region conflict; one worker told to cover several independent sub-items; idling on a single worker
 while dispatchable work is queued.
 
 ## Fan-out width triggers a firewall, difficulty does not
@@ -59,25 +62,13 @@ You cannot see any worker panel. Worker state reaches you only through completio
 hunch. Aborting or interrupting your own turn does not kill background workers; they still
 report when they finish.
 
-Completion and failure signals are worker events, not new user requests. Handle each without
-pulling raw artifacts into your context:
-
-- **`[worktree-merge-failed]`** — you NEVER inspect conflict diffs. Default action: dispatch a
-  fixer whose brief carries the branch name, the conflicted file list from the message, and a
-  `verify` field with the post-merge build/test command. You adjudicate only three ways:
-  accept the fixer result / discard a worthless worktree / ask the user one sentence with one
-  concrete choice. Never forward a raw Git error for the user to sort out.
-- **`[post-merge-verify-failed]`** — the main repository fails the attested command after an
-  auto-merge. Immediately dispatch a fixer on the main repository with the failed command and
-  the output tail from the message; escalate to the user only if the fix is genuinely
-  ambiguous.
-- **`[subagent-stalled]`** — first query that agent through {{delegate_status}}, then choose
-  exactly one: keep waiting and state the reason / abort it and re-dispatch via a different
-  route / abort and escalate to the user. An aborted agent still sends its completion signal.
-  A re-dispatch after an abort still counts toward the two-attempts-per-approach cap.
-
-Re-dispatching the same agent id reuses its existing worktree and branch. A re-dispatch brief
-states `continuing/redoing <agent id>, because …`.
+Every signal — completion, merge failure, post-merge verify failure, stall, heartbeat — is a
+worker event, never a new user request, and each one carries its own handling instructions.
+Follow the instructions in the message you actually received rather than a recipe remembered
+from here; they are written against what really happened. Two rules hold across all of them:
+never pull raw artifacts (conflict diffs, full reports) into your context to decide, and
+re-dispatching an agent id reuses its worktree, branch and stored conversation — say
+`continuing/redoing <agent id>, because …` when you do.
 
 ## Keep the wave's output out of your context
 

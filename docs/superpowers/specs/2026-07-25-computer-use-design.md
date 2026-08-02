@@ -3,6 +3,7 @@
 > Final product contract revised 2026-07-26. This supersedes the earlier approval/lease/takeover design.
 >
 > Runtime and manual acceptance details: [`docs/computer-use.md`](../../computer-use.md).
+> Replaceable strategy contract: [`docs/computer-runtime-v1.md`](../../computer-runtime-v1.md).
 
 ## Decision
 
@@ -23,8 +24,8 @@ It does not create session/app/high-risk/write approvals, persisted policy enfor
 top-level Pi or subagent Pi
         │ computer / open_application
         ▼
-pipiui-computer-use.ts
-        │ loopback route + desktop capability
+selected Pi strategy (`PiExt/computer-use-strategy.ts` by default)
+        │ versioned loopback Runtime v1 + ephemeral capabilities
         ▼
 BridgeServer
         ▼
@@ -108,7 +109,12 @@ Every accepted, non-cancelled batch returns a fresh screenshot. PNG stays in ext
 
 ## Subagent exposure
 
-When globally enabled, `ChatSession` exports `PIPIUI_COMPUTER_EXT`, display fields, session route and desktop capability. The subagent extension loads that Computer Use extension in the child Pi and adds `computer` / `open_application` to explicit tool allowlists unless the user's tool settings explicitly disable them.
+When globally enabled, `ChatSession` exports the exact selected
+`PIPIUI_COMPUTER_EXT`, Runtime v1, display hints, session route and desktop
+capability. The subagent extension loads that same strategy path in the child
+Pi and adds `computer` / `open_application` to explicit tool allowlists.
+Selecting an external strategy suppresses the built-in strategy rather than
+mounting both.
 
 The child Pi alone preserves the desktop capability. Shell verification and git helper processes still use the default stripped environment. Nested Pi agents inherit the same extension path/route, while the process-global coordinator serializes all callers.
 
@@ -129,6 +135,6 @@ Only the primary checkout may create `build/PipiUI.app`. `swift build` / `swift 
 | mutex lifetime | concurrent real operation busy; success/failure/cancel clear ownership; committed launch quarantine retained |
 | exact target correctness | PID/code identity/focus/window/activation drift suites |
 | subagent tools | Swift source contract plus Node contract for extension path, capability and allowlist |
-| provider/memory screenshots | generated extension execution contract |
+| provider/memory screenshots | bundled strategy resource execution contract |
 
 Real App/TCC/keyboard/mouse acceptance remains a separate manual gate and must not be inferred from Swift build/test success.

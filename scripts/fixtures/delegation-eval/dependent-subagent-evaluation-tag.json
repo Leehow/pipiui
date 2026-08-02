@@ -1,0 +1,35 @@
+{
+  "format": "pipiui-delegation-eval-transcript/v1",
+  "caseId": "dependent-subagent-evaluation-tag",
+  "meta": { "fixture": "negative parallel dependency violation" },
+  "events": [
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "timestamp": 3,
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "dependent-bad-1",
+            "name": "subagent",
+            "arguments": {
+              "tasks": [
+                {
+                  "agent": "general-purpose",
+                  "title": "Schema and metadata",
+                  "task": "Add evaluationTag to the schema and dispatch metadata now."
+                },
+                {
+                  "agent": "general-purpose",
+                  "title": "Tests now",
+                  "task": "Write tests for evaluationTag immediately, independently of the schema implementation."
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

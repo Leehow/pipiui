@@ -95,8 +95,15 @@ final class SkillLoaderExtensionTests: XCTestCase {
             contentsOf: root.appendingPathComponent("Sources/PipiUI/ChatSession.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(chat.contains("if let skillLoaderExtension { args += [\"-e\", skillLoaderExtension] }"))
-        XCTAssertTrue(chat.contains("Main session only: dispatched workers stay fully skill-free."))
+        let assembly = try String(
+            contentsOf: root.appendingPathComponent("Sources/PipiUI/PipiSpawnAssembly.swift"),
+            encoding: .utf8
+        )
+        // The skill loader is mounted in the main session only and gated by the
+        // built-in feature snapshot; both now live in the pure spawn assembly.
+        XCTAssertTrue(assembly.contains("skillLoaderExtension"))
+        XCTAssertTrue(assembly.contains("Main session only: dispatched workers stay fully skill-free."))
+        XCTAssertTrue(chat.contains("skillLoaderExtension"))
 
         let subagent = try String(
             contentsOf: root.appendingPathComponent("Sources/PipiUI/PiExt/subagent/index.ts"),

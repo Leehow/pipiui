@@ -30,11 +30,25 @@ final class PiProcess {
         return candidates.first { fm.isExecutableFile(atPath: $0) }
     }
 
+    /// Parent-process environment is another stale-state source (especially for
+    /// GUI apps launched from a shell). Strip all built-in-managed keys there,
+    /// then overlay the already-sanitized/current `extraEnv` from ChatSession.
+    static func mergedProcessEnvironment(
+        parent: [String: String],
+        extraEnv: [String: String]
+    ) -> [String: String] {
+        var env = PipiSpawnEnvironmentPolicy.sanitized(parent)
+        env.merge(extraEnv) { _, new in new }
+        return env
+    }
+
     init?(cwd: URL, arguments: [String], extraEnv: [String: String] = [:]) {
         guard let pi = Self.findPiExecutable() else { return nil }
 
-        var env = ProcessInfo.processInfo.environment
-        env.merge(extraEnv) { _, new in new }
+        var env = Self.mergedProcessEnvironment(
+            parent: ProcessInfo.processInfo.environment,
+            extraEnv: extraEnv
+        )
         let extraDirs = [
             (pi as NSString).deletingLastPathComponent,
             "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",

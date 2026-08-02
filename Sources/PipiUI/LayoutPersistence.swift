@@ -7,12 +7,15 @@ enum LayoutPersistence {
         static let windowHeight = "pipiui.windowHeight"
         static let sidebarWidthRatio = "pipiui.sidebarWidthRatio"
         static let rightPanelWidthRatio = "pipiui.rightPanelWidthRatio"
+        static let subagentListHeightRatio = "pipiui.subagentListHeightRatio"
     }
 
     static let minimumWindowContentSize = NSSize(width: 800, height: 560)
     static let sidebarRatioRange: ClosedRange<CGFloat> = 0.03...0.75
     static let rightPanelRatioRange: ClosedRange<CGFloat> = 0.03...0.75
     static let defaultRightPanelWidthRatio: CGFloat = 0.46
+    static let subagentListRatioRange: ClosedRange<CGFloat> = 0.15...0.85
+    static let defaultSubagentListHeightRatio: CGFloat = 0.45
 
     static func storedWindowContentSize(defaults: UserDefaults = .standard) -> NSSize? {
         let pendingWidth = pendingValue(forKey: Key.windowWidth, defaults: defaults)
@@ -55,6 +58,15 @@ enum LayoutPersistence {
     @discardableResult
     static func saveRightPanelWidthRatio(_ ratio: CGFloat, defaults: UserDefaults = .standard) -> CGFloat? {
         saveRatio(ratio, forKey: Key.rightPanelWidthRatio, in: rightPanelRatioRange, defaults: defaults)
+    }
+
+    static func subagentListHeightRatio(defaults: UserDefaults = .standard) -> CGFloat? {
+        storedRatio(forKey: Key.subagentListHeightRatio, in: subagentListRatioRange, defaults: defaults)
+    }
+
+    @discardableResult
+    static func saveSubagentListHeightRatio(_ ratio: CGFloat, defaults: UserDefaults = .standard) -> CGFloat? {
+        saveRatio(ratio, forKey: Key.subagentListHeightRatio, in: subagentListRatioRange, defaults: defaults)
     }
 
     /// Per-provider selected quota window (so a Grok user's pick doesn't affect GLM).

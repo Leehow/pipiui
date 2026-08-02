@@ -1,16 +1,29 @@
 import SwiftUI
+import AppKit
 
-private enum SettingsTab: String, CaseIterable, Identifiable {
+enum SettingsTab: String, CaseIterable, Identifiable {
     case general = "通用"
+    case builtIn = "内置"
     case models = "模型"
     case usage = "用量"
-    case toolsSkills = "工具与 Skills"
-    case subagentModels = "Subagent 模型"
+    case toolsSkills = "工具"
+    case subagentModels = "Subagent"
     var id: String { rawValue }
+
+    /// Full name for VoiceOver / tooltip; the segmented picker shows the short
+    /// `rawValue` so six tabs fit the 640pt sheet without truncation.
+    var accessibilityName: String {
+        switch self {
+        case .toolsSkills: return "工具与 Skills"
+        case .subagentModels: return "Subagent 模型"
+        default: return rawValue
+        }
+    }
 
     var systemImage: String {
         switch self {
         case .general: return "slider.horizontal.3"
+        case .builtIn: return "shippingbox"
         case .models: return "cpu"
         case .usage: return "chart.bar.fill"
         case .toolsSkills: return "wrench.and.screwdriver"
@@ -23,7 +36,7 @@ struct SettingsSheet: View {
     @EnvironmentObject var store: AppStore
     @Environment(\.dismiss) private var dismiss
 
-    @State private var tab: SettingsTab = .general
+    @State private var tab: SettingsTab
     @State private var models: [ModelInfo] = []
     @State private var credentials: [PiAuthStore.CredentialInfo] = []
     @State private var hiddenIds: Set<String> = ModelVisibility.hiddenModelIds()
@@ -31,11 +44,29 @@ struct SettingsSheet: View {
     @State private var subagentSettings: [String: SubagentModelSettings.Override] = SubagentModelSettings.allSettings()
     @State private var disabledTools: Set<String> = ToolSkillSettings.disabledTools()
     @State private var disabledSkills: Set<String> = ToolSkillSettings.disabledSkills()
+    /// Master on/off snapshot for the「内置」tab. Missing = enabled; mirrors
+    /// `BuiltInFeatureSettings` defaults so first launch shows everything on.
+    @State private var builtInDisabled: Set<String> = BuiltInFeatureSettings.disabledIDs()
     @State private var webSearchBackend: String = WebSearchSettings.backend()
     /// 输入缓冲：永不回显已存 key；留空 = 不修改。
     @State private var webSearchApiKey: String = ""
     /// 当前后端 key 是否已在 .env 配置（驱动 placeholder /「清除」按钮）。
     @State private var webSearchKeyConfigured = false
+    /// 图片转文字（非多模态模型看图）
+    @State private var visionFallbackMode: VisionFallbackSettings.Mode = VisionFallbackSettings.mode()
+    @State private var visionFallbackBaseURL: String = VisionFallbackSettings.load().baseURL
+    @State private var visionFallbackApiKey: String = ""
+    @State private var visionFallbackModelId: String = VisionFallbackSettings.load().modelId
+    @State private var visionFallbackMaxTokens: String = String(VisionFallbackSettings.load().maxTokens)
+    @State private var visionFallbackKeyConfigured = !(VisionFallbackSettings.load().apiKey.isEmpty)
+    /// 显示价格单位（USD 内部记账，仅影响展示）+ 汇率刷新状态。
+    @State private var priceUnit: PriceUnit = PricingSettings.unit()
+    @State private var fxRefreshing = false
+    @State private var fxMessage: String?
+    @State private var fxError: String?
+    /// 任务提醒开关（通用 → 提醒；缺省开启）。
+    @State private var notifyCompletionEnabled = TaskNotifierSettings.completionEnabled()
+    @State private var notifyErrorEnabled = TaskNotifierSettings.errorEnabled()
     /// .env 中已配置 key 的 provider 集合（用于 auth.json 残留冲突警告）。
     @State private var envConfiguredProviders: Set<String> = []
     /// .env 存取（placeholder 查询、清除、删除凭据时可选的同步移除）。
@@ -56,6 +87,12 @@ struct SettingsSheet: View {
     @State private var usageExpanded: Set<String> = []
     @State private var usageLoading = false
     @State private var usageRequestID = 0
+    /// reloadUsage 时的显示单位快照（决定聚合 costMode 与金额格式化）。
+    @State private var usageUnit: PriceUnit = PricingSettings.unit()
+
+    init(initialTab: SettingsTab = .general) {
+        _tab = State(initialValue: initialTab)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -68,8 +105,8 @@ struct SettingsSheet: View {
                     // the icon is preserved for assistive tech via .help/a11y label.
                     Text(t.rawValue)
                         .tag(t)
-                        .help(t.rawValue)
-                        .accessibilityLabel(t.rawValue)
+                        .help(t.accessibilityName)
+                        .accessibilityLabel(t.accessibilityName)
                 }
             }
             .pickerStyle(.segmented)
@@ -101,6 +138,10 @@ struct SettingsSheet: View {
             }
         }
         .frame(width: 640, height: 620)
+        // Click on the dimmed parent / overlay area dismisses the sheet, in
+        // addition to「完成」 and Esc. Attached here so both presentation sites
+        // (SidebarView, ComputerConsentBar) get it for free.
+        .dismissOnOutsideClick { dismiss() }
         .task { await reload() }
         .onChange(of: tab) { _, newValue in
             if newValue == .usage { reloadUsage() }
@@ -115,6 +156,10 @@ struct SettingsSheet: View {
                 Task { await reload(restartSessions: true) }
             }
             .environmentObject(store)
+            // Key-window check in OverlayDismiss keeps this nested sheet safe:
+            // while Add Model is key, a click outside closes only it, never the
+            // parent SettingsSheet.
+            .dismissOnOutsideClick { showAddSheet = false }
         }
         .confirmationDialog(
             "删除凭据？",
@@ -145,6 +190,8 @@ struct SettingsSheet: View {
         switch tab {
         case .general:
             generalSection
+        case .builtIn:
+            builtInSection
         case .usage:
             usageSection
         case .toolsSkills:
@@ -185,8 +232,291 @@ struct SettingsSheet: View {
                 PhilosophySection(store: store)
             }
             Divider()
+            localRemoteSection
+            Divider()
             webSearchSection
+            Divider()
+            visionFallbackSection
+            Divider()
+            notificationSection
+            Divider()
+            priceSection
         }
+    }
+
+    // MARK: - 任务提醒
+
+    private var notificationSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("提醒")
+                .font(.title3.weight(.semibold))
+            Text("任务完成或出错时提醒你（打包运行时走系统通知；开发运行时用应用内横幅 + 提示音）。任务完成提醒只在你看不到结果（会话未选中或应用不在前台）时弹出。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(
+                    "任务完成时提醒",
+                    isOn: Binding(
+                        get: { notifyCompletionEnabled },
+                        set: { newValue in
+                            notifyCompletionEnabled = newValue
+                            TaskNotifierSettings.setCompletionEnabled(newValue)
+                        }
+                    )
+                )
+                Toggle(
+                    "任务出错时提醒",
+                    isOn: Binding(
+                        get: { notifyErrorEnabled },
+                        set: { newValue in
+                            notifyErrorEnabled = newValue
+                            TaskNotifierSettings.setErrorEnabled(newValue)
+                        }
+                    )
+                )
+            }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+        }
+    }
+
+    // MARK: - Price display unit + FX rate
+
+    private var priceSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("显示价格单位")
+                .font(.title3.weight(.semibold))
+            Text("pi 内部始终以 USD 记账；这里只决定花费的显示单位。切换后输入栏余额弹窗、上下文弹窗的「累计花费」以及「用量」页汇总统一按所选单位显示。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Picker("单位", selection: $priceUnit) {
+                    Text("美金").tag(PriceUnit.usd)
+                    Text("人民币").tag(PriceUnit.cny)
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: priceUnit) { _, newValue in
+                    PricingSettings.setUnit(newValue)
+                    statusMessage = "显示价格单位已切换为\(newValue.label)"
+                }
+
+                HStack(spacing: 8) {
+                    Text("1 USD ≈ ¥\(String(format: "%.2f", ModelPricing.Catalog.shared.exchangeRate))")
+                        .font(.callout.monospacedDigit())
+                    Spacer()
+                    Button {
+                        refreshExchangeRate()
+                    } label: {
+                        if fxRefreshing {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Label("刷新汇率", systemImage: "arrow.clockwise")
+                        }
+                    }
+                    .disabled(fxRefreshing)
+                }
+
+                if let fetchedAt = FXRateStore.fetchedAt() {
+                    let stale = Date().timeIntervalSince(fetchedAt) > 48 * 3600
+                    Text("更新于 \(Self.rateDateFmt.string(from: fetchedAt))\(stale ? " · 可能已过期" : "")")
+                        .font(.caption2)
+                        .foregroundStyle(stale ? Color.orange : Color.secondary)
+                } else {
+                    Text("尚未获取过汇率，当前使用默认值 \(String(format: "%.2f", ModelPricing.defaultUsdToCny))。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let fxMessage {
+                    Text(fxMessage)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if let fxError {
+                    Text(fxError)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
+            }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+
+            Text("汇率数据来自 \(FXRateStore.source() ?? "Exchange Rate API")（每日更新；失败时保留上次汇率）。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func refreshExchangeRate() {
+        guard !fxRefreshing else { return }
+        fxRefreshing = true
+        fxMessage = nil
+        fxError = nil
+        Task {
+            // Single-writer refresh: fetch → persist (FXRateStore) → memory (Catalog).
+            let rate = await ModelPricing.Catalog.shared.refreshExchangeRateFromWeb()
+            await MainActor.run {
+                fxRefreshing = false
+                if let rate {
+                    fxMessage = "已更新汇率 \(String(format: "%.4f", rate))"
+                } else {
+                    fxError = "获取汇率失败，请稍后重试（保留上次汇率）"
+                }
+            }
+        }
+    }
+
+    private static let rateDateFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm"
+        return f
+    }()
+
+    private var localRemoteSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("本地远程网页测试")
+                        .font(.title3.weight(.semibold))
+                    Text("默认关闭；仅在本机 127.0.0.1 的随机端口启动独立网页服务。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { store.localRemoteEnabled },
+                        set: { store.setLocalRemoteEnabled($0) }
+                    )
+                )
+                .labelsHidden()
+            }
+
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(store.localRemoteURL == nil ? Color.secondary : Color.green)
+                    .frame(width: 8, height: 8)
+                Text(store.localRemoteStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let url = store.localRemoteURL {
+                    Button("在浏览器打开") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            }
+            if let url = store.localRemoteURL {
+                Text(url.absoluteString)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Text("此阶段只支持项目/会话列表、文本 transcript、发送和 Stop；不含 LAN、账号、附件、Relay 或 E2EE。关闭开关会立即停止 listener 和现有连接。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Built-in features (master controls)
+
+    private var builtInSection: some View {
+        LazyVStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("内置")
+                    .font(.title3.weight(.semibold))
+                Text("PipiUI 自带的扩展 / agents / 提示层 / Computer Use。每项默认开启；关闭后重启会话生效。「通用」「工具」里仍可做细粒度配置，但这里是总开关。全部关闭后新建/重启的会话等价于裸 pi（仅保留模型凭据、RPC、历史与 UI）。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            ForEach(BuiltInFeatureSettings.Section.allCases, id: \.rawValue) { section in
+                builtInGroup(section)
+            }
+
+            if BuiltInFeatureSettings.EnabledSet(disabled: builtInDisabled).allDisabled {
+                Label("全部已关闭：新建/重启会话将不挂载任何 PipiUI 自有能力。", systemImage: "moon.zzz")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private func builtInGroup(_ section: BuiltInFeatureSettings.Section) -> some View {
+        let entries = BuiltInFeatureSettings.catalog.filter { $0.section == section }
+        return VStack(alignment: .leading, spacing: 8) {
+            Text(section.rawValue)
+                .font(.subheadline.weight(.semibold))
+            ForEach(entries) { entry in
+                Toggle(isOn: builtInBinding(entry)) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(entry.title)
+                            .font(.callout)
+                        Text(entry.summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.checkbox)
+                .padding(.vertical, 2)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+    }
+
+    private func builtInBinding(_ entry: BuiltInFeatureSettings.Entry) -> Binding<Bool> {
+        Binding(
+            get: { !builtInDisabled.contains(entry.id.rawValue) },
+            set: { enabled in setBuiltInFeature(enabled, id: entry.id) }
+        )
+    }
+
+    /// Master toggle for one built-in capability. Philosophy is special-cased so
+    /// the pi package registration / auto-register / config stay in sync.
+    private func setBuiltInFeature(_ enabled: Bool, id: BuiltInFeatureSettings.FeatureID) {
+        guard id != .philosophy else {
+            setBuiltInPhilosophy(enabled)
+            return
+        }
+        store.setBuiltInFeatureEnabled(enabled, id: id)
+        errorMessage = nil
+        statusMessage = enabled
+            ? "已启用内置能力「\(title(for: id))」（将重启会话）"
+            : "已关闭内置能力「\(title(for: id))」（将重启会话）"
+        builtInDisabled = BuiltInFeatureSettings.disabledIDs()
+    }
+
+    /// Philosophy is transactional because settings.json mutation can fail.
+    /// Register/unregister completes first; only success commits the master,
+    /// config, auto-register state and restarts sessions. Failure leaves the
+    /// checkbox and actual package state unchanged.
+    private func setBuiltInPhilosophy(_ enabled: Bool) {
+        statusMessage = nil
+        errorMessage = nil
+        do {
+            try BuiltInPhilosophyTransition.apply(enabled: enabled)
+            builtInDisabled = BuiltInFeatureSettings.disabledIDs()
+            statusMessage = enabled
+                ? "已启用工作哲学并装回 pi（将重启会话）"
+                : "已关闭工作哲学：已从 pi 移除并跳过 fallback 注入（将重启会话）"
+            store.philosophyRevision &+= 1
+            store.restartAllOpenSessions()
+        } catch {
+            // Refresh from persisted truth: the transaction committed nothing.
+            builtInDisabled = BuiltInFeatureSettings.disabledIDs()
+            statusMessage = "工作哲学未更改。"
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func title(for id: BuiltInFeatureSettings.FeatureID) -> String {
+        BuiltInFeatureSettings.catalog.first(where: { $0.id == id })?.title ?? id.rawValue
     }
 
     // MARK: - Models
@@ -324,7 +654,7 @@ struct SettingsSheet: View {
                 .disabled(usageLoading)
             }
 
-            Text("Tokens = input + output + cacheWrite（不含 cacheRead）。Cost 按官网/API 牌价从 token 重算为人民币（含缓存与 >200k/272k 长上下文档）；美元牌价按约 \(String(format: "%.2f", ModelPricing.Catalog.shared.exchangeRate)) 汇率换算。订阅套餐模型按对应 API 牌价估算等价花费，非账单实扣。")
+            Text(usageHelpText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -412,7 +742,11 @@ struct SettingsSheet: View {
         HStack(spacing: 16) {
             usageTotalItem(icon: "number", label: "Calls", value: "\(usageReport.total.calls)")
             usageTotalItem(icon: "text.word.spacing", label: "Tokens", value: TokenFormat.compact(usageReport.total.tokens))
-            usageTotalItem(icon: "yensign.circle", label: "Cost", value: usageCostText(usageReport.total.cost))
+            usageTotalItem(
+                icon: usageUnit == .usd ? "dollarsign.circle" : "yensign.circle",
+                label: "Cost",
+                value: usageCostText(usageReport.total.cost)
+            )
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -695,8 +1029,19 @@ struct SettingsSheet: View {
         }
     }
 
+    /// 用量页说明：USD 单位 = pi 账本实耗；CNY 单位 = 牌价重算估计（原说明）。
+    private var usageHelpText: String {
+        if PricingSettings.unit() == .usd {
+            return "Tokens = input + output + cacheWrite（不含 cacheRead）。Cost 为 pi 账本（get_session_stats）上报的美元实耗，非按牌价重算；订阅套餐模型按实际上报值计。"
+        }
+        return "Tokens = input + output + cacheWrite（不含 cacheRead）。Cost 按官网/API 牌价从 token 重算为人民币（含缓存与 >200k/272k 长上下文档）；美元牌价按约 \(String(format: "%.2f", ModelPricing.Catalog.shared.exchangeRate)) 汇率换算。订阅套餐模型按对应 API 牌价估算等价花费，非账单实扣。"
+    }
+
     private func usageCostText(_ cost: Double) -> String {
-        ModelPricing.formatCNY(cost)
+        switch usageUnit {
+        case .usd: return formatUSD(cost)
+        case .cny: return ModelPricing.formatCNY(cost)
+        }
     }
 
     private func reloadUsage() {
@@ -705,11 +1050,20 @@ struct SettingsSheet: View {
         usageLoading = true
         let period = usagePeriod
         let groupBy = usageGroupBy
+        // USD 显示单位 → 账本实耗；CNY → 牌价重算估计（原行为）。
+        let unit = PricingSettings.unit()
+        let costMode: TokenUsageStats.CostMode = unit == .usd ? .ledger : .estimateCNY
         Task.detached(priority: .utility) {
             let records = TokenUsageStats.loadSharedRecords()
-            let report = TokenUsageStats.aggregate(records: records, period: period, groupBy: groupBy)
+            let report = TokenUsageStats.aggregate(
+                records: records,
+                period: period,
+                groupBy: groupBy,
+                costMode: costMode
+            )
             await MainActor.run {
                 guard requestID == usageRequestID else { return }
+                usageUnit = unit
                 usageReport = report
                 usageLoading = false
             }
@@ -1011,6 +1365,91 @@ struct SettingsSheet: View {
         }
     }
 
+    // MARK: - Vision Fallback (图片转文字)
+
+    private var visionFallbackSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("图片转文字（非多模态模型看图）")
+                .font(.title3.weight(.semibold))
+            Text("DeepSeek 等不支持直接看图的模型：发送带图消息时，自动用本地 OCR（可选再加云端视觉模型描述）把图片转成文字注入消息。缩略图与 RPC 图片附件保持不变。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Picker("模式", selection: $visionFallbackMode) {
+                    ForEach(VisionFallbackSettings.Mode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .onChange(of: visionFallbackMode) { _, newValue in
+                    VisionFallbackSettings.setMode(newValue)
+                    statusMessage = "图片转文字已切换为\(newValue.title)"
+                }
+
+                if visionFallbackMode == .ocrAndCloud {
+                    TextField("服务地址（OpenAI 兼容 base URL）", text: $visionFallbackBaseURL)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveVisionFallbackCloud() }
+                    HStack(spacing: 8) {
+                        SecureField(
+                            visionFallbackKeyConfigured ? "已配置 API Key，输入以替换" : "API Key（可选）",
+                            text: $visionFallbackApiKey
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveVisionFallbackCloud() }
+                        if visionFallbackKeyConfigured {
+                            Button("清除 Key") {
+                                VisionFallbackSettings.setApiKey("")
+                                visionFallbackApiKey = ""
+                                visionFallbackKeyConfigured = false
+                                statusMessage = "已清除图片描述 API Key"
+                            }
+                        }
+                    }
+                    TextField("模型 ID", text: $visionFallbackModelId)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveVisionFallbackCloud() }
+                    TextField("最大 Token 数", text: $visionFallbackMaxTokens)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveVisionFallbackCloud() }
+                    Button("保存云端设置") { saveVisionFallbackCloud() }
+                    Text("base URL 形如 https://api.openai.com/v1；会自动补 /chat/completions。API Key 仅存本机 UserDefaults。云端失败时自动退回仅 OCR。")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(10)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+
+            Text("默认「仅本地 OCR」零配置；当前模型若本身支持图片则不会注入。设置立即生效，无需重启会话。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func saveVisionFallbackCloud() {
+        let base = visionFallbackBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let modelId = visionFallbackModelId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tokens = Int(visionFallbackMaxTokens.trimmingCharacters(in: .whitespacesAndNewlines))
+            ?? VisionFallbackSettings.defaultMaxTokens
+        var snap = VisionFallbackSettings.load()
+        snap.mode = visionFallbackMode
+        snap.baseURL = base
+        snap.modelId = modelId.isEmpty ? VisionFallbackSettings.defaultModelId : modelId
+        snap.maxTokens = tokens > 0 ? tokens : VisionFallbackSettings.defaultMaxTokens
+        let keyTrim = visionFallbackApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !keyTrim.isEmpty {
+            snap.apiKey = keyTrim
+            visionFallbackKeyConfigured = true
+            visionFallbackApiKey = ""
+        }
+        VisionFallbackSettings.save(snap)
+        visionFallbackBaseURL = snap.baseURL
+        visionFallbackModelId = snap.modelId
+        visionFallbackMaxTokens = String(snap.maxTokens)
+        statusMessage = "已保存图片转文字云端设置"
+    }
+
     /// 显式「保存」/ 回车提交：留空 = 不修改。
     private func saveWebSearchKey() {
         let trimmed = webSearchApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1103,9 +1542,11 @@ struct SettingsSheet: View {
         var subagentSettings: [String: SubagentModelSettings.Override]
         var disabledTools: Set<String>
         var disabledSkills: Set<String>
+        var builtInDisabled: Set<String>
         var webSearchBackend: String
         var webSearchKeyConfigured: Bool
         var envConfiguredProviders: Set<String>
+        var visionFallback: VisionFallbackSettings.Snapshot
     }
 
     /// 磁盘 I/O 集中在后台：auth.json、agents 目录（已有进程级缓存）、UserDefaults、.env 读取。
@@ -1126,9 +1567,11 @@ struct SettingsSheet: View {
             subagentSettings: SubagentModelSettings.allSettings(),
             disabledTools: ToolSkillSettings.disabledTools(),
             disabledSkills: ToolSkillSettings.disabledSkills(),
+            builtInDisabled: BuiltInFeatureSettings.disabledIDs(),
             webSearchBackend: backend,
             webSearchKeyConfigured: WebSearchSettings.isKeyConfigured(for: backend, store: envStore),
-            envConfiguredProviders: envConfigured
+            envConfiguredProviders: envConfigured,
+            visionFallback: VisionFallbackSettings.load()
         )
     }
 
@@ -1149,9 +1592,15 @@ struct SettingsSheet: View {
         subagentSettings = snapshot.subagentSettings
         disabledTools = snapshot.disabledTools
         disabledSkills = snapshot.disabledSkills
+        builtInDisabled = snapshot.builtInDisabled
         webSearchBackend = snapshot.webSearchBackend
         webSearchKeyConfigured = snapshot.webSearchKeyConfigured
         envConfiguredProviders = snapshot.envConfiguredProviders
+        visionFallbackMode = snapshot.visionFallback.mode
+        visionFallbackBaseURL = snapshot.visionFallback.baseURL
+        visionFallbackModelId = snapshot.visionFallback.modelId
+        visionFallbackMaxTokens = String(snapshot.visionFallback.maxTokens)
+        visionFallbackKeyConfigured = !snapshot.visionFallback.apiKey.isEmpty
         // 输入缓冲不回显已存 key；reload 不动用户可能正在输入的值。
 
         if restartSessions {
@@ -1285,6 +1734,9 @@ private struct SubagentModelRow: View, Equatable {
                     HStack(spacing: 6) {
                         ProviderLogo(model: model, size: 12)
                         Text("\(model.name)（\(model.id)）")
+                        if ModelCapabilities.isRecommended(.worker, for: model.id) {
+                            ModelRoleBadge(role: .worker)
+                        }
                     }
                     .tag(model.id)
                 }

@@ -83,7 +83,7 @@ enum ComputerScreenshotMemoryCache {
     }
 }
 
-/// Opaque toolResult marker shared with `ComputerUseExtension` Node source.
+/// Opaque toolResult marker shared with the bundled Computer Use strategy.
 enum ComputerScreenshotMarker {
     static let name = "PIPIUI_COMPUTER_SCREENSHOT"
 

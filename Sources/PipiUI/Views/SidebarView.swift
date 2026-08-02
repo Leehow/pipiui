@@ -10,18 +10,28 @@ struct SidebarView: View {
     @State private var projectRenameTarget: ProjectRenameTarget?
     @State private var projectRenameText: String = ""
     @State private var archivedExpanded = false
-    @State private var projectsExpanded = false
-    @State private var pinnedExpanded = false
+    /// Visible row counts for the 项目/置顶 sections: each 「更多」 click adds
+    /// `SidebarListLimits.pageSize` rows until everything is shown, then the
+    /// same button reads 「收起」 and collapses back to the initial cap.
+    @State private var projectsShown = SidebarListLimits.projects
+    @State private var pinnedShown = SidebarListLimits.pinned
     /// Project folders can be opened independently. The selected project is
     /// always opened when it is selected, but opening one folder never closes
     /// another.
     @State private var expandedProjectPaths: Set<String> = []
     /// The active-session cap is applied independently inside each project
     /// folder, so one project's "更多" does not affect the others.
-    @State private var sessionsExpandedByProject: [String: Bool] = [:]
+    @State private var sessionsShownByProject: [String: Int] = [:]
     /// Settings sheet is presented from this sidebar (window-local): opening it in
     /// one window never opens settings in another window of the same app.
     @State private var showSettings = false
+    /// Subagent settings are window-local and open directly to the model tab.
+    @State private var showSubagentSettings = false
+    /// Remote connection details are also window-local and never alter project
+    /// or session selection.
+    @State private var showRemoteConnection = false
+    /// Project whose session-search popover is open (from the ⋯ menu).
+    @State private var sessionSearchTarget: SessionSearchTarget?
 
     /// Shared leading gutter — `.sidebar` List defaults are wider than needed.
     private static let sidebarGutter: CGFloat = 10
@@ -33,20 +43,24 @@ struct SidebarView: View {
                 .padding(.horizontal, Self.sidebarGutter + 2)
                 .padding(.top, 14)
                 .padding(.bottom, 10)
-            // SwiftUI hides the indicator, while the sidebar-only AppKit
-            // installer below also disables any legacy reserved scroller track.
-            // Selection chrome is drawn by SessionRowContainer.background.
+            // Thin overlay scroller with automatic indicators, matching the
+            // main transcript: it appears/flashes while scrolling and hides
+            // when idle. Selection chrome is drawn by
+            // SessionRowContainer.background.
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
+                // The sidebar has bounded, paged content. A plain stack avoids
+                // LazyVStack's repeated size-estimation cycle when scrolling an
+                // expanded project tree containing dynamic hoverable rows.
+                VStack(alignment: .leading, spacing: 0) {
                     pinnedSection
                     projectsSection
                     archivedSessionsSection
                 }
                 .padding(.horizontal, Self.sidebarGutter)
                 .padding(.vertical, 8)
-                .sidebarHiddenVerticalScroller()
+                .overlayScrollers()
             }
-            .scrollIndicators(.hidden)
+            .scrollIndicators(.automatic)
             .clipShape(Rectangle())
         }
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
@@ -97,6 +111,40 @@ struct SidebarView: View {
                     ? "已急停"
                     : (store.computerUseEnabled ? "已开启" : "已关闭"))
 
+                Button {
+                    showRemoteConnection = true
+                } label: {
+                    Image(systemName: "qrcode")
+                        .font(.body)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(HoverButtonStyle(
+                    base: remoteConnectionButtonColor,
+                    hovered: remoteConnectionIndicator == .off ? .primary : remoteConnectionButtonColor
+                ))
+                .background {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(remoteConnectionButtonBackground)
+                }
+                .help(RemoteConnectionAccessibility.sidebarButtonLabel)
+                .accessibilityLabel(RemoteConnectionAccessibility.sidebarButtonLabel)
+                .accessibilityValue(
+                    store.remoteRelayConfiguration.enabled
+                        ? "Signaling WSS：\(store.remoteRelayState.displayText)；浏览器：\(store.remotePeerProductionState.displayText)"
+                        : store.localRemoteStatus
+                )
+
+                Button {
+                    showSubagentSettings = true
+                } label: {
+                    Image(systemName: "person.2")
+                        .font(.body)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(HoverButtonStyle())
+                .help("Subagent 模型")
+                .accessibilityLabel("Subagent 模型")
+
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, Self.sidebarGutter + 2)
@@ -137,6 +185,8 @@ struct SidebarView: View {
             }
             .padding(20)
             .frame(width: 360)
+            // Click on the dimmed overlay discards unsaved input, same as Esc/取消.
+            .dismissOnOutsideClick { renameTarget = nil }
         }
         .sheet(item: $projectRenameTarget) { target in
             VStack(alignment: .leading, spacing: 16) {
@@ -158,11 +208,75 @@ struct SidebarView: View {
             }
             .padding(20)
             .frame(width: 360)
+            // Click on the dimmed overlay discards unsaved input, same as Esc/取消.
+            .dismissOnOutsideClick { projectRenameTarget = nil }
         }
         .sheet(isPresented: $showSettings) {
             SettingsSheet()
                 .environmentObject(store)
                 .accessibilityIdentifier("PipiUI.SettingsPanel")
+        }
+        .sheet(isPresented: $showSubagentSettings) {
+            SettingsSheet(initialTab: .subagentModels)
+                .environmentObject(store)
+                .accessibilityIdentifier("PipiUI.SettingsPanel")
+        }
+        .sheet(isPresented: $showRemoteConnection) {
+            RemoteConnectionSheet()
+                .environmentObject(store)
+                .dismissOnOutsideClick { showRemoteConnection = false }
+        }
+    }
+
+    private var remoteConnectionIndicator: LocalRemoteConnectionIndicator {
+        if store.remotePeerProductionState == .connected {
+            return .listening
+        }
+        if store.remoteRelayConfiguration.enabled {
+            if case .failed = store.remotePeerProductionState {
+                return .failed
+            }
+            switch store.remoteRelayState {
+            case .authenticationFailed, .invalidConfiguration, .protocolMismatch:
+                return .failed
+            case .disabled:
+                break
+            case .connecting, .retrying:
+                return .starting
+            case .connected:
+                return .listening
+            }
+        }
+        return .resolve(
+            enabled: store.localRemoteEnabled,
+            url: store.localRemoteURL,
+            status: store.localRemoteStatus
+        )
+    }
+
+    private var remoteConnectionButtonColor: Color {
+        switch remoteConnectionIndicator {
+        case .off:
+            return .secondary
+        case .starting:
+            return .accentColor
+        case .listening:
+            return .green
+        case .failed:
+            return .orange
+        }
+    }
+
+    private var remoteConnectionButtonBackground: Color {
+        switch remoteConnectionIndicator {
+        case .off:
+            return .clear
+        case .starting:
+            return Color.accentColor.opacity(0.10)
+        case .listening:
+            return Color.green.opacity(0.12)
+        case .failed:
+            return Color.orange.opacity(0.10)
         }
     }
 
@@ -171,10 +285,9 @@ struct SidebarView: View {
     private func syncProjectsExpansion() {
         guard let path = store.selectedProjectPath else { return }
         expandedProjectPaths.insert(path)
-        guard !projectsExpanded else { return }
         guard let index = store.orderedProjects.firstIndex(where: { $0.path == path }) else { return }
-        if index >= SidebarListLimits.projects {
-            projectsExpanded = true
+        if index + 1 > projectsShown {
+            projectsShown = index + 1
         }
     }
 
@@ -192,7 +305,7 @@ struct SidebarView: View {
             let capped = SidebarListLimits.visiblePrefix(
                 of: store.orderedProjects,
                 limit: SidebarListLimits.projects,
-                expanded: projectsExpanded
+                shown: projectsShown
             )
             ForEach(capped.items, id: \.path) { project in
                 projectFolderRow(project)
@@ -201,7 +314,12 @@ struct SidebarView: View {
                 }
             }
             if capped.showsToggle {
-                moreToggle(expanded: $projectsExpanded, sectionName: "项目")
+                moreToggle(
+                    shown: $projectsShown,
+                    total: store.orderedProjects.count,
+                    limit: SidebarListLimits.projects,
+                    sectionName: "项目"
+                )
             }
         }
     }
@@ -220,10 +338,11 @@ struct SidebarView: View {
                 selectAndToggleProject(project, wasSelected: isSelected, wasExpanded: isExpanded)
             } label: {
                 HStack(spacing: 6) {
+                    // Project folders are containers, not primary selection targets:
+                    // keep open/toggle behavior but never paint selected-row chrome.
                     Image(systemName: isExpanded ? "folder.fill" : "folder")
-                        .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                        .foregroundStyle(.secondary)
                     Text(displayName)
-                        .fontWeight(isSelected ? .semibold : .regular)
                     if isPinned {
                         Image(systemName: "pin.fill")
                             .font(.caption)
@@ -240,6 +359,9 @@ struct SidebarView: View {
             Menu {
                 Text("共 \(sessionCount) 个会话")
                 Divider()
+                Button("搜索会话…") {
+                    sessionSearchTarget = SessionSearchTarget(project: project)
+                }
                 Button(isPinned ? "取消置顶项目" : "置顶项目") {
                     store.toggleProjectPin(project)
                 }
@@ -278,15 +400,45 @@ struct SidebarView: View {
         }
         .padding(.vertical, 5)
         .padding(.horizontal, 6)
+        .popover(item: Binding(
+            get: { sessionSearchTarget?.project.path == project.path ? sessionSearchTarget : nil },
+            set: { sessionSearchTarget = $0 }
+        )) { target in
+            SessionSearchPopover(
+                project: target.project,
+                store: store,
+                liveEntries: {
+                    newSessionEntries(project: target.project).map { key, session in
+                        let name = session.sessionName?
+                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        return (key, name.isEmpty ? "新会话" : name)
+                    }
+                },
+                onOpen: { hit in
+                    expandedProjectPaths.insert(target.project.path)
+                    // Show the full session list of the project (clamped to the
+                    // total) so the selected row is visible beyond the cap.
+                    sessionsShownByProject[target.project.path] = Int.max
+                    store.selectedProjectPath = target.project.path
+                    switch SessionSearch.openAction(for: hit) {
+                    case .selectLive(let key):
+                        store.selectedSessionKey = key
+                    case .openDisk(let meta):
+                        store.openSession(meta, project: target.project)
+                    case .restoreArchived(let meta):
+                        store.restoreSession(meta, project: target.project)
+                    }
+                    sessionSearchTarget = nil
+                },
+                onDismiss: { sessionSearchTarget = nil }
+            )
+            .frame(width: 380, height: 440)
+        }
         .onDrag {
             expandedProjectPaths.removeAll()
             return NSItemProvider(object: project.path as NSString)
         }
         .onDrop(of: [UTType.plainText], delegate: ProjectDropDelegate(project: project, store: store))
-        .background {
-            RoundedRectangle(cornerRadius: 7)
-                .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
-        }
         .hoverRowBackground(cornerRadius: 7)
     }
 
@@ -319,7 +471,7 @@ struct SidebarView: View {
                 let capped = SidebarListLimits.visiblePrefix(
                     of: pinned,
                     limit: SidebarListLimits.pinned,
-                    expanded: pinnedExpanded
+                    shown: pinnedShown
                 )
                 ForEach(capped.items, id: \.0.path) { meta, project in
                     let openKey = openKeyFor(meta: meta) ?? "resume:\(meta.path)"
@@ -341,7 +493,12 @@ struct SidebarView: View {
                     )
                 }
                 if capped.showsToggle {
-                    moreToggle(expanded: $pinnedExpanded, sectionName: "置顶")
+                    moreToggle(
+                        shown: $pinnedShown,
+                        total: pinned.count,
+                        limit: SidebarListLimits.pinned,
+                        sectionName: "置顶"
+                    )
                 }
             }
         }
@@ -355,15 +512,15 @@ struct SidebarView: View {
             excludingPinned: store.userPinnedSessionPaths
         )
         let news = newSessionEntries(project: project)
-        let sessionsExpanded = Binding(
-            get: { sessionsExpandedByProject[project.path] ?? false },
-            set: { sessionsExpandedByProject[project.path] = $0 }
+        let sessionsShown = Binding(
+            get: { sessionsShownByProject[project.path] ?? SidebarListLimits.sessions },
+            set: { sessionsShownByProject[project.path] = $0 }
         )
         let visibleCounts = SidebarListLimits.splitVisibleCounts(
             leadingCount: news.count,
             trailingCount: metas.count,
             limit: SidebarListLimits.sessions,
-            expanded: sessionsExpanded.wrappedValue
+            shown: sessionsShown.wrappedValue
         )
         let visibleNews = Array(news.prefix(visibleCounts.leading))
         let visibleMetas = Array(metas.prefix(visibleCounts.trailing))
@@ -401,7 +558,12 @@ struct SidebarView: View {
                 )
             }
             if visibleCounts.showsToggle {
-                moreToggle(expanded: sessionsExpanded, sectionName: "\(store.projectDisplayName(for: project)) 会话")
+                moreToggle(
+                    shown: sessionsShown,
+                    total: news.count + metas.count,
+                    limit: SidebarListLimits.sessions,
+                    sectionName: "\(store.projectDisplayName(for: project)) 会话"
+                )
             }
         }
     }
@@ -432,10 +594,17 @@ struct SidebarView: View {
         }
     }
 
+    /// 「更多」 reveals one page (10 rows) per click until everything is shown;
+    /// at that point the same button reads 「收起」 and collapses back to the cap.
     @ViewBuilder
-    private func moreToggle(expanded: Binding<Bool>, sectionName: String) -> some View {
-        Button(expanded.wrappedValue ? "收起" : "更多") {
-            expanded.wrappedValue.toggle()
+    private func moreToggle(shown: Binding<Int>, total: Int, limit: Int, sectionName: String) -> some View {
+        let collapsed = total > limit && shown.wrappedValue >= total
+        Button(collapsed ? "收起" : "更多") {
+            if shown.wrappedValue >= total, total > limit {
+                shown.wrappedValue = limit
+            } else {
+                shown.wrappedValue = min(total, shown.wrappedValue + SidebarListLimits.pageSize)
+            }
         }
         .buttonStyle(.plain)
         .font(.caption)
@@ -444,7 +613,7 @@ struct SidebarView: View {
         .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .accessibilityLabel(expanded.wrappedValue ? "收起\(sectionName)" : "展开更多\(sectionName)")
+        .accessibilityLabel(collapsed ? "收起\(sectionName)" : "展开更多\(sectionName)")
         .pointingHandCursor()
     }
 
@@ -488,6 +657,7 @@ struct SidebarView: View {
                         } label: {
                             SessionRow(
                                 title: meta.name,
+                                modelRef: meta.modelRef,
                                 subtitle: "\(store.projectDisplayName(for: project)) · \(Self.relative(meta.modified))",
                                 status: .none
                             )
@@ -551,28 +721,32 @@ struct SidebarView: View {
             onArchive: archivePath.map { path in
                 { store.archiveSession(path: path, project: project) }
             }
-        ) { isHovered in
+        ) { isHovered, actionAreaWidth in
             if let live {
                 LiveSessionRow(
                     session: live,
                     fallbackTitle: fallbackTitle,
                     idleSubtitle: idleSubtitle,
-                    hideSubtitle: isHovered
+                    hideSubtitle: isHovered,
+                    reservedTrailingWidth: actionAreaWidth
                 )
             } else if let meta {
                 let interrupted = store.interruptedSessionPaths.contains(meta.path)
                 SessionRow(
                     title: displayTitle(meta: meta, openKey: openKey),
+                    modelRef: meta.modelRef,
                     subtitle: interrupted ? "已中断" : idleSubtitle,
                     status: interrupted ? .interrupted : .none,
-                    hideSubtitle: isHovered
+                    hideSubtitle: isHovered,
+                    reservedTrailingWidth: actionAreaWidth
                 )
             } else {
                 SessionRow(
                     title: fallbackTitle,
                     subtitle: idleSubtitle,
                     status: .none,
-                    hideSubtitle: isHovered
+                    hideSubtitle: isHovered,
+                    reservedTrailingWidth: actionAreaWidth
                 )
             }
         }
@@ -652,6 +826,152 @@ private struct ProjectRenameTarget: Identifiable {
     var id: String { project.path }
 }
 
+private struct SessionSearchTarget: Identifiable {
+    let project: URL
+    var id: String { project.path }
+}
+
+private struct SessionSearchPopover: View {
+    let project: URL
+    @ObservedObject var store: AppStore
+    let liveEntries: () -> [(String, String)]
+    let onOpen: (SessionSearchHit) -> Void
+    let onDismiss: () -> Void
+
+    @State private var query: String = ""
+    @State private var hits: [SessionSearchHit] = []
+    @State private var searching = false
+    /// The in-flight background scan. Cancelled on .task re-entry and popover
+    /// dismissal so obsolete scans stop instead of overlapping with the new one.
+    @State private var scanTask: Task<[SessionSearchHit], Never>?
+    /// Bumped whenever the project session lists publish (refresh completed),
+    /// so the search re-runs against fresh snapshots.
+    @State private var refreshGeneration = 0
+    @FocusState private var queryFocused: Bool
+
+    private var searchIdentity: String { "\(query)|\(refreshGeneration)" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("搜索会话")
+                .font(.headline)
+            TextField("关键词", text: $query)
+                .textFieldStyle(.roundedBorder)
+                .focused($queryFocused)
+            if searching {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
+            Group {
+                let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    Text("输入关键词搜索当前项目所有会话")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                } else if !searching && hits.isEmpty {
+                    Text("无匹配会话")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                } else {
+                    List(hits) { hit in
+                        Button {
+                            onOpen(hit)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Text(hit.title)
+                                        .font(.body)
+                                        .lineLimit(1)
+                                    if hit.isArchived {
+                                        Text("已归档")
+                                            .font(.caption2)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Color.secondary.opacity(0.15), in: Capsule())
+                                    }
+                                    if hit.isLive {
+                                        Text("新会话")
+                                            .font(.caption2)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Color.accentColor.opacity(0.15), in: Capsule())
+                                    }
+                                    Spacer(minLength: 0)
+                                    if let modified = hit.modified {
+                                        Text(SidebarView.relative(modified))
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                }
+                                Text(hit.snippet ?? "仅标题匹配")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .listStyle(.plain)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .padding(14)
+        .onAppear {
+            store.refreshSessions(for: project)
+            queryFocused = true
+        }
+        .onChange(of: store.sessionsByProject[project.path]) { _, _ in
+            refreshGeneration += 1
+        }
+        .onChange(of: store.archivedByProject[project.path]) { _, _ in
+            refreshGeneration += 1
+        }
+        .task(id: searchIdentity) {
+            scanTask?.cancel()
+            scanTask = nil
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                hits = []
+                searching = false
+                return
+            }
+            searching = true
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+
+            let metas = store.sessionsByProject[project.path] ?? []
+            let archived = store.archivedByProject[project.path] ?? []
+            let live = liveEntries()
+            let q = trimmed
+            let task = Task.detached(priority: .userInitiated) {
+                SessionSearch.search(
+                    metas: metas,
+                    archived: archived,
+                    query: q,
+                    liveEntries: live
+                )
+            }
+            scanTask = task
+            let results = await task.value
+            guard !Task.isCancelled else { return }
+            hits = results
+            searching = false
+        }
+        .onDisappear {
+            scanTask?.cancel()
+        }
+        .onExitCommand {
+            onDismiss()
+        }
+    }
+}
+
 private struct ProjectDropDelegate: DropDelegate {
     let project: URL
     let store: AppStore
@@ -685,14 +1005,20 @@ private struct SessionRowContainer<Content: View>: View {
     let isPinned: Bool
     let onRename: () -> Void
     let onArchive: (() -> Void)?
-    @ViewBuilder var content: (_ isHovered: Bool) -> Content
+    @ViewBuilder var content: (_ isHovered: Bool, _ actionAreaWidth: CGFloat) -> Content
 
     @State private var isHovered = false
 
+    /// Includes the buttons' spacing and right inset so title text never extends beneath them.
+    private var actionAreaWidth: CGFloat {
+        let count = 1 + (onPin == nil ? 0 : 1) + (onArchive == nil ? 0 : 1)
+        return CGFloat(count * 20 + max(count - 1, 0) * 4 + 6)
+    }
+
     var body: some View {
         // Non-Button hit target + overlay action Buttons (no nested Button).
-        // On hover, content hides its trailing subtitle so actions own that corner.
-        content(isHovered)
+        // On hover, content hides its trailing subtitle and reserves the action area.
+        content(isHovered, isHovered ? actionAreaWidth : 0)
             .frame(maxWidth: .infinity, alignment: .leading)
             // padding 先于 contentShape：命中范围扩展到含 padding 的整圈
             .padding(.vertical, 5)
@@ -792,18 +1118,22 @@ private struct LiveSessionRow: View {
     let idleSubtitle: String
     /// Hide trailing caption while hover actions occupy that corner.
     var hideSubtitle: Bool = false
+    /// Reserved action-button width so title text never extends beneath the buttons.
+    var reservedTrailingWidth: CGFloat = 0
 
     init(
         session: ChatSession,
         fallbackTitle: String,
         idleSubtitle: String,
-        hideSubtitle: Bool = false
+        hideSubtitle: Bool = false,
+        reservedTrailingWidth: CGFloat = 0
     ) {
         self.session = session
         self.agents = session.subagents
         self.fallbackTitle = fallbackTitle
         self.idleSubtitle = idleSubtitle
         self.hideSubtitle = hideSubtitle
+        self.reservedTrailingWidth = reservedTrailingWidth
     }
 
     var body: some View {
@@ -813,10 +1143,15 @@ private struct LiveSessionRow: View {
         // Prefer non-empty live name so disk meta still shows when sessionName unset.
         let title = session.sessionName.flatMap { $0.isEmpty ? nil : $0 } ?? fallbackTitle
         let subtitle = status.subtitleOverride ?? idleSubtitle
-        HStack(spacing: 8) {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
             // Keep status column width stable so titles don't shift
             statusIndicator(status)
                 .frame(width: 12, height: 12)
+                .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] }
+            if let model = session.model {
+                ProviderLogo(model: model, size: 13)
+                    .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] }
+            }
             TypewriterText(
                 text: title,
                 animationToken: session.titleAnimationToken,
@@ -829,6 +1164,7 @@ private struct LiveSessionRow: View {
                     .foregroundStyle(.secondary)
             }
         }
+        .padding(.trailing, reservedTrailingWidth)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
     }
@@ -861,16 +1197,19 @@ private struct LiveSessionRow: View {
 }
 
 /// Distinct from main-agent ProgressView spinner: people icon + mild pulse.
+/// Pulse runs on CALayer (WindowServer), not SwiftUI's render loop — avoids a
+/// permanent main-thread DisplayList walk while any subagent badge is visible.
 private struct SubagentsRunningIndicator: View {
     let count: Int
-    @State private var pulse = false
 
     var body: some View {
         ZStack {
-            Image(systemName: "person.2.fill")
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(Color.orange)
-                .opacity(pulse ? 0.45 : 1.0)
+            LayerOpacityPulsingSymbol(
+                systemName: "person.2.fill",
+                pointSize: 9,
+                weight: .semibold,
+                tint: .systemOrange
+            )
             if count > 1 {
                 Text("\(min(count, 9))")
                     .font(.system(size: 6, weight: .bold, design: .rounded))
@@ -881,29 +1220,127 @@ private struct SubagentsRunningIndicator: View {
             }
         }
         .frame(width: 12, height: 12)
-        .onAppear {
-            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
-                pulse = true
-            }
-        }
         .accessibilityLabel(count > 1 ? "\(count) 个子任务运行中" : "子任务运行中")
+    }
+}
+
+/// SF Symbol whose layer opacity pulses 1.0 ↔ 0.45 via CABasicAnimation.
+/// Layer animations do not drive SwiftUI's per-frame DisplayList updates.
+private struct LayerOpacityPulsingSymbol: NSViewRepresentable {
+    let systemName: String
+    let pointSize: CGFloat
+    let weight: NSFont.Weight
+    let tint: NSColor
+
+    func makeNSView(context: Context) -> PulsingSymbolNSView {
+        let view = PulsingSymbolNSView()
+        view.configure(systemName: systemName, pointSize: pointSize, weight: weight, tint: tint)
+        return view
+    }
+
+    func updateNSView(_ nsView: PulsingSymbolNSView, context: Context) {
+        nsView.configure(systemName: systemName, pointSize: pointSize, weight: weight, tint: tint)
+    }
+
+    static func dismantleNSView(_ nsView: PulsingSymbolNSView, coordinator: ()) {
+        nsView.stopPulse()
+    }
+}
+
+private final class PulsingSymbolNSView: NSView {
+    private static let animationKey = "pipiui.subagentPulse.opacity"
+
+    private let imageView = NSImageView()
+    private var configuredKey: String?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        imageView.wantsLayer = true
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.animates = false
+        addSubview(imageView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layout() {
+        super.layout()
+        imageView.frame = bounds
+        // Layer is created lazily; attach the pulse once the backing layer exists.
+        startPulseIfNeeded()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            stopPulse()
+        } else {
+            startPulseIfNeeded()
+        }
+    }
+
+    func configure(systemName: String, pointSize: CGFloat, weight: NSFont.Weight, tint: NSColor) {
+        let key = "\(systemName)|\(pointSize)|\(weight.rawValue)|\(tint)"
+        if configuredKey != key {
+            configuredKey = key
+            let config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: weight)
+            imageView.image = NSImage(systemSymbolName: systemName, accessibilityDescription: nil)?
+                .withSymbolConfiguration(config)
+            imageView.contentTintColor = tint
+        }
+        startPulseIfNeeded()
+    }
+
+    func startPulseIfNeeded() {
+        guard window != nil else { return }
+        imageView.wantsLayer = true
+        guard let layer = imageView.layer else { return }
+        guard layer.animation(forKey: Self.animationKey) == nil else { return }
+
+        // Match prior SwiftUI pulse: opacity 1.0 ↔ 0.45, easeInOut 0.9s, autoreverse forever.
+        layer.opacity = 1.0
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.fromValue = 1.0
+        anim.toValue = 0.45
+        anim.duration = 0.9
+        anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        anim.autoreverses = true
+        anim.repeatCount = .infinity
+        anim.isRemovedOnCompletion = false
+        layer.add(anim, forKey: Self.animationKey)
+    }
+
+    func stopPulse() {
+        imageView.layer?.removeAnimation(forKey: Self.animationKey)
+        imageView.layer?.opacity = 1.0
     }
 }
 
 private struct SessionRow: View {
     let title: String
+    var modelRef: String? = nil
     let subtitle: String
     var status: SessionRowStatus = .none
     /// Hide trailing caption while hover actions occupy that corner.
     var hideSubtitle: Bool = false
+    /// Reserved action-button width so title text never extends beneath the buttons.
+    var reservedTrailingWidth: CGFloat = 0
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
             // Keep status column width stable so titles don't shift
             statusIndicator
                 .frame(width: 12, height: 12)
+                .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] }
+            if let modelRef {
+                ProviderLogo(modelRef: modelRef, size: 13)
+                    .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] }
+            }
             Text(title)
                 .lineLimit(1)
+                .truncationMode(.tail)
             Spacer(minLength: 0)
             if !subtitle.isEmpty, !hideSubtitle {
                 Text(subtitle)
@@ -911,6 +1348,7 @@ private struct SessionRow: View {
                     .foregroundStyle(.secondary)
             }
         }
+        .padding(.trailing, reservedTrailingWidth)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
     }
