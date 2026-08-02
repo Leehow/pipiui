@@ -77,6 +77,43 @@ struct TranscriptRenderWindow: Equatable {
     }
 }
 
+/// Layout gravity contract for short pinned transcripts (fold/unfold jump fix).
+///
+/// A pinned session whose rendered content is shorter than the visible viewport
+/// must keep its rows glued to the bottom composer. `StickToBottomTracker` can
+/// only express that with clip offsets while the document is taller than the
+/// viewport; once contentHeight <= viewport there is no offset to write, so the
+/// top anchor of `.scrollPosition(id:anchor:.top)` wins and a fold/unfold height
+/// change bounces the whole block between viewport top and bottom.
+///
+/// The fix is layout-level gravity gated on the pin state: a viewport min-height
+/// on the transcript plus a top flexible space. Both must appear together — one
+/// without the other would either leave rows at the document top or stranded
+/// mid-document — and both must disappear when the user has scrolled away
+/// (unpinned) so short content keeps its natural top-aligned layout.
+enum ShortTranscriptGravity {
+    /// Viewport min-height applied to the transcript. `nil` keeps natural layout:
+    /// the unpinned case, and any viewport measurement that is not a real height.
+    static func viewportMinHeight(
+        pinned: Bool,
+        viewportHeight: CGFloat?
+    ) -> CGFloat? {
+        guard pinned,
+              let viewportHeight,
+              viewportHeight.isFinite,
+              viewportHeight > 1 else { return nil }
+        return viewportHeight
+    }
+
+    /// The top flexible space must exist exactly when the min-height exists.
+    static func usesTopFlexibleSpace(
+        pinned: Bool,
+        viewportHeight: CGFloat?
+    ) -> Bool {
+        viewportMinHeight(pinned: pinned, viewportHeight: viewportHeight) != nil
+    }
+}
+
 struct ChatDetailView: View {
     @EnvironmentObject var store: AppStore
     let session: ChatSession
@@ -133,6 +170,10 @@ private struct ChatDetailViewBody: View {
     /// Detail column width measured inside the safe area (not via a root GeometryReader,
     /// which expands under the window toolbar and lets transcript chrome overlap the title).
     @State private var detailLayoutWidth: CGFloat = 0
+    /// Visible transcript viewport height, measured at the scroll-container level
+    /// (parent-driven frame, not a content proposal) and passed explicitly into the
+    /// rows so pinned short transcripts get layout-level bottom gravity.
+    @State private var transcriptViewportHeight: CGFloat = 0
 
     private let minimumChatWidth: CGFloat = 360
     private let minimumRightPanelWidth: CGFloat = 300
@@ -445,6 +486,7 @@ private struct ChatDetailViewBody: View {
                     agentStore: agentStore,
                     collapsedUserTurnIDs: $collapsedUserTurnIDs,
                     scrollTopID: scrollTopID,
+                    viewportHeight: transcriptViewportHeight,
                     onOpenFinishedGroup: presentFinishedGroup,
                     onOpenRunningTool: presentRunningTool,
                     onReturnLatest: {
@@ -461,12 +503,42 @@ private struct ChatDetailViewBody: View {
                     }
                 )
                 .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                // Pinned short transcripts must hug the bottom composer at the layout
+                // level: a viewport min-height with bottom-leading alignment (plus the
+                // top flexible space inside the rows) leaves no clip travel for the
+                // `.top` scroll anchor to steal. Unpinned sessions get `minHeight: 0`
+                // and keep the natural top-anchored layout unchanged.
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: ShortTranscriptGravity.viewportMinHeight(
+                        pinned: session.pinTranscriptToBottom,
+                        viewportHeight: transcriptViewportHeight
+                    ) ?? 0,
+                    alignment: .bottomLeading
+                )
             }
             // Same-session identity rebinds may still update session.id without
             // replacing this ScrollView. Never animate that bookkeeping change.
             .animation(nil, value: session.id)
             .scrollIndicators(.automatic)
+            // Measure the transcript viewport from the scroll container's own
+            // parent-driven frame. An in-content GeometryReader would be sized by
+            // the content proposal, which is unstable for short transcripts;
+            // bottom gravity must never depend on that.
+            .background {
+                GeometryReader { geo in
+                    Color.clear.preference(
+                        key: TranscriptViewportHeightKey.self,
+                        value: geo.size.height
+                    )
+                }
+            }
+            .onPreferenceChange(TranscriptViewportHeightKey.self) { height in
+                guard height.isFinite, height > 1 else { return }
+                if abs(height - transcriptViewportHeight) >= 0.5 {
+                    transcriptViewportHeight = height
+                }
+            }
             .defaultScrollAnchor(.bottom)
             // The sliding window follows the top-most visible row. The `.top` anchor
             // both reports that row and keeps it pinned while window pages slide.
@@ -737,6 +809,9 @@ private struct StreamingTranscriptRows: View {
     @Binding var collapsedUserTurnIDs: Set<String>
     /// Top-most visible row id, mirrored from the parent's `.scrollPosition(id:)`.
     let scrollTopID: String?
+    /// Transcript viewport height measured at the scroll-container level by the
+    /// parent. Drives the pinned short-content bottom gravity.
+    let viewportHeight: CGFloat
     let onOpenFinishedGroup: (AssistantBlockLayout.FinishedGroupPresentation) -> Void
     let onOpenRunningTool: (RunningToolDetailPresentation) -> Void
     let onReturnLatest: () -> Void
@@ -790,6 +865,16 @@ private struct StreamingTranscriptRows: View {
         // window swaps only boundary pages; rows keep stable ids so SwiftUI diffs
         // incrementally instead of rebuilding the stack (never lazy).
         VStack(alignment: .leading, spacing: chatTypography.messageSpacing) {
+            // Pinned-to-bottom sessions get a top flexible space: with the parent's
+            // viewport min-height this is layout-level bottom gravity for short
+            // transcripts, so fold/unfold height changes cannot bounce the block
+            // between viewport top and bottom. Unpinned sessions never get it.
+            if ShortTranscriptGravity.usesTopFlexibleSpace(
+                pinned: session.pinTranscriptToBottom,
+                viewportHeight: viewportHeight
+            ) {
+                Spacer(minLength: 0)
+            }
             if topVisiblePage == 0, session.isInitializing {
                 HStack(spacing: 6) {
                     ProgressView()
@@ -1115,6 +1200,15 @@ private struct RightPanelDivider: View {
             }
         }
         .help("拖动调整右侧面板宽度")
+    }
+}
+
+/// Visible transcript viewport height (the scroll container's parent-driven
+/// frame). Fed to `ShortTranscriptGravity` for pinned bottom alignment.
+private struct TranscriptViewportHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 
