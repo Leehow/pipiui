@@ -8,14 +8,16 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case usage = "用量"
     case toolsSkills = "工具"
     case subagentModels = "Subagent"
+    case memory = "记忆"
     var id: String { rawValue }
 
     /// Full name for VoiceOver / tooltip; the segmented picker shows the short
-    /// `rawValue` so six tabs fit the 640pt sheet without truncation.
+    /// `rawValue` so the compact tabs fit the 640pt sheet without truncation.
     var accessibilityName: String {
         switch self {
         case .toolsSkills: return "工具与 Skills"
         case .subagentModels: return "Subagent 模型"
+        case .memory: return "可控记忆"
         default: return rawValue
         }
     }
@@ -28,6 +30,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .usage: return "chart.bar.fill"
         case .toolsSkills: return "wrench.and.screwdriver"
         case .subagentModels: return "person.2"
+        case .memory: return "brain.head.profile"
         }
     }
 }
@@ -198,6 +201,8 @@ struct SettingsSheet: View {
             toolsSkillsSection
         case .subagentModels:
             subagentModelsSection
+        case .memory:
+            ControlledMemoryView()
         case .models:
             EmptyView()
         }

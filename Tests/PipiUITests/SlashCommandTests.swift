@@ -184,15 +184,16 @@ final class SlashCommandTests: XCTestCase {
 
     // MARK: - Builtin table + parse
 
-    func testBuiltinAllHasNineCommands() {
-        XCTAssertEqual(BuiltinCommands.all.count, 10)
+    func testBuiltinInventory() {
+        XCTAssertEqual(BuiltinCommands.all.count, 11)
         let names = Set(BuiltinCommands.all.map(\.name))
-        XCTAssertEqual(names, ["compact", "new", "name", "session", "export", "copy", "quit", "model", "reload", "stats"])
+        XCTAssertEqual(names, ["compact", "new", "name", "session", "export", "copy", "quit", "model", "reload", "stats", "schedule"])
         XCTAssertTrue(BuiltinCommands.all.allSatisfy { $0.source == .builtin })
         XCTAssertEqual(BuiltinCommands.command(named: "model")?.argumentHint, "<provider/model>")
         XCTAssertEqual(BuiltinCommands.command(named: "name")?.argumentHint, "<name>")
         XCTAssertNil(BuiltinCommands.command(named: "compact")?.argumentHint)
         XCTAssertNil(BuiltinCommands.command(named: "reload")?.argumentHint)
+        XCTAssertEqual(BuiltinCommands.command(named: "schedule")?.argumentHint, "<prompt>")
     }
 
     func testParseInvocation() {
@@ -255,6 +256,14 @@ final class SlashCommandTests: XCTestCase {
         let host = BuiltinHostMock()
         XCTAssertTrue(BuiltinCommands.execute(name: "model", args: "openai/gpt-4o", host: host))
         XCTAssertEqual(host.setModels, ["openai/gpt-4o"])
+    }
+
+    func testExecuteScheduleOnlyOpensConfirmationDraft() {
+        let host = BuiltinHostMock()
+        XCTAssertTrue(BuiltinCommands.execute(name: "schedule", args: "  总结今天  ", host: host))
+        XCTAssertEqual(host.schedulePrompts, ["总结今天"])
+        XCTAssertTrue(BuiltinCommands.execute(name: "schedule", args: "", host: host))
+        XCTAssertEqual(host.schedulePrompts, ["总结今天", ""])
     }
 
     func testExecuteNewWithoutClosureFlashes() {

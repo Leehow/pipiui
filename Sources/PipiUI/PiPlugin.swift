@@ -26,6 +26,7 @@ enum PiPlugin {
         var webSearchExtension: String? // -e web_search / web_fetch
         var skillLoaderExtension: String? // -e 技能按需加载（名字索引 + skill_search / skill_load）
         var searchScopeExtension: String? // -e 项目内搜索边界 + 当轮外部路径授权
+        var memoryExtension: String? // -e 默认关闭、仅提案、会话冻结的可控记忆
         var codexServerToolsExtension: String? // -e openai-codex hosted web_search
         var claudeServerToolsExtension: String? // -e anthropic hosted web_search
         var computerUseExtension: String? // -e opt-in desktop computer harness
@@ -148,6 +149,7 @@ enum PiPlugin {
             ("pipiui-websearch.ts", \.webSearchExtension),
             ("pipiui-skillloader.ts", \.skillLoaderExtension),
             ("pipiui-search-scope.ts", \.searchScopeExtension),
+            (MemoryExtension.fileName, \.memoryExtension),
             ("pipiui-codex-server-tools.ts", \.codexServerToolsExtension),
             ("pipiui-claude-server-tools.ts", \.claudeServerToolsExtension),
         ]
@@ -261,6 +263,9 @@ enum PiPlugin {
 
         // 5.65 项目搜索边界：内建 find/grep/ls + 明确的递归 bash 搜索
         result.searchScopeExtension = SearchScopeExtension.install(into: root)
+
+        // 5.66 可控记忆：模型只写 pending，批准存储只由原生确认修改
+        result.memoryExtension = MemoryExtension.install(into: root)
 
         // 5.7 官方 openai-codex Responses hosted web_search
         result.codexServerToolsExtension = CodexServerToolsExtension.install(into: root)

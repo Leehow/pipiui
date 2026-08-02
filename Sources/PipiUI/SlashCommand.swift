@@ -153,8 +153,15 @@ package protocol BuiltinCommandHost: AnyObject {
     func runExportHTML()
     func runCopyLastAssistant()
     func runSetModel(providerSlashId: String)
+    func runScheduleDraft(_ prompt: String)
     var onRequestNewSession: (() -> Void)? { get }
     var onRequestClose: (() -> Void)? { get }
+}
+
+package extension BuiltinCommandHost {
+    func runScheduleDraft(_ prompt: String) {
+        flash("无法打开自动任务（未接入 AppStore）")
+    }
 }
 
 package enum BuiltinCommands {
@@ -169,6 +176,7 @@ package enum BuiltinCommands {
         SlashCommand(name: "quit", description: "关闭当前会话", source: .builtin, argumentHint: nil),
         SlashCommand(name: "model", description: "切换模型", source: .builtin, argumentHint: "<provider/model>"),
         SlashCommand(name: "reload", description: "重载扩展 / skills / prompts / 上下文", source: .builtin, argumentHint: nil),
+        SlashCommand(name: "schedule", description: "创建自动任务草稿", source: .builtin, argumentHint: "<prompt>"),
     ]
 
     private static let byName: [String: SlashCommand] = {
@@ -234,6 +242,8 @@ package enum BuiltinCommands {
             } else {
                 host.runSetModel(providerSlashId: trimmedArgs)
             }
+        case "schedule":
+            host.runScheduleDraft(trimmedArgs)
         default:
             return false
         }

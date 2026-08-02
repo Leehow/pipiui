@@ -131,6 +131,24 @@ final class TaskNotifier: ObservableObject {
         ))
     }
 
+    func notifyAutomationCompletion(title: String, summary: String) {
+        guard notifyCompletionEnabled else { return }
+        deliver(TaskAlert(
+            kind: .completion,
+            title: "自动任务完成",
+            body: "「\(title)」：\(Self.truncated(summary))"
+        ))
+    }
+
+    func notifyAutomationError(title: String, message: String) {
+        guard notifyErrorEnabled else { return }
+        deliver(TaskAlert(
+            kind: .error,
+            title: "自动任务出错",
+            body: "「\(title)」：\(Self.truncated(message))"
+        ))
+    }
+
     /// 立即收起应用内横幅（点击横幅时调用；自动收起走内部定时任务）。
     func dismissToast() {
         toastDismissTask?.cancel()

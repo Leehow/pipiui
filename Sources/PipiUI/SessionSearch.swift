@@ -8,8 +8,50 @@ struct SessionSearchHit: Identifiable, Equatable {
     let isTitleMatch: Bool
     let isArchived: Bool
     let isLive: Bool
+    /// Project/session/message provenance retained by the global index.  The
+    /// sidebar currently opens the session; `messageID` is the stable anchor a
+    /// transcript jump can consume without changing the search schema later.
+    let projectPath: String?
+    let projectName: String?
+    let messageID: String?
+    let messageLineOffset: Int64?
+    let role: String?
+    let messageTimestamp: Date?
 
-    var id: String { path }
+    init(
+        path: String,
+        title: String,
+        modified: Date?,
+        snippet: String?,
+        isTitleMatch: Bool,
+        isArchived: Bool,
+        isLive: Bool,
+        projectPath: String? = nil,
+        projectName: String? = nil,
+        messageID: String? = nil,
+        messageLineOffset: Int64? = nil,
+        role: String? = nil,
+        messageTimestamp: Date? = nil
+    ) {
+        self.path = path
+        self.title = title
+        self.modified = modified
+        self.snippet = snippet
+        self.isTitleMatch = isTitleMatch
+        self.isArchived = isArchived
+        self.isLive = isLive
+        self.projectPath = projectPath
+        self.projectName = projectName
+        self.messageID = messageID
+        self.messageLineOffset = messageLineOffset
+        self.role = role
+        self.messageTimestamp = messageTimestamp
+    }
+
+    var id: String {
+        [path, messageID ?? messageLineOffset.map { "line:\($0)" } ?? "title", role ?? ""]
+            .joined(separator: "\u{1f}")
+    }
 }
 
 /// What the sidebar should do when a search hit is clicked. Pure and

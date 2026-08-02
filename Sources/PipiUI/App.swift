@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ScrollDiagnostics.shared.install()
         #endif
         LaunchDiagnostics.scheduleSnapshots()
+        AppStore.shared.startAutomations()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -45,6 +46,9 @@ public struct PipiUIApp: App {
         .commands {
             LogCommands()
             CommandGroup(after: .toolbar) {
+                Button("自动任务…") { store.presentAutomations() }
+                    .keyboardShortcut("a", modifiers: [.command, .shift])
+                Divider()
                 Button("放大") { store.setUIScale(store.uiScale + 0.1) }
                     .keyboardShortcut("=", modifiers: .command)
                 Button("缩小") { store.setUIScale(store.uiScale - 0.1) }
@@ -84,6 +88,12 @@ private struct ComputerUseSceneRoot: View {
                 }
             }
             .animation(.easeOut(duration: 0.25), value: notifier.toast)
+            .sheet(isPresented: $store.isAutomationsPresented) {
+                AutomationsView(
+                    scheduler: store.automations
+                )
+                .environmentObject(store)
+            }
     }
 
     /// 小横幅：毛玻璃圆角、图标 + 文本、点击立即关闭。

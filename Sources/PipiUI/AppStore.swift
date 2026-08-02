@@ -102,6 +102,32 @@ final class AppStore: ObservableObject {
     /// 各项目下已归档会话（扫盘得到，path 在 archivedSessionPaths 且文件仍存在）
     @Published var archivedByProject: [String: [SessionMeta]] = [:]
     @Published var openSessions: [String: ChatSession] = [:]
+    @Published var isAutomationsPresented = false
+    @Published var automationDraftRequest: AutomationDraftRequest?
+    private var automationSchedulerStorage: AutomationScheduler?
+
+    @MainActor var automations: AutomationScheduler {
+        if let automationSchedulerStorage { return automationSchedulerStorage }
+        let scheduler = AutomationScheduler { [weak self] job in
+            guard let self else { return .failure("Pipi 已关闭") }
+            return await self.executeAutomation(job)
+        }
+        scheduler.onOutcome = { job, outcome in
+            if outcome.status == .succeeded {
+                TaskNotifier.shared.notifyAutomationCompletion(
+                    title: job.title,
+                    summary: outcome.summary
+                )
+            } else {
+                TaskNotifier.shared.notifyAutomationError(
+                    title: job.title,
+                    message: outcome.summary
+                )
+            }
+        }
+        automationSchedulerStorage = scheduler
+        return scheduler
+    }
     @Published var selectedSessionKey: String? {
         didSet {
             // 记住最后选中的会话，下次启动直接恢复；新会话尚无文件时保留上一条记录。
@@ -945,7 +971,8 @@ final class AppStore: ObservableObject {
         key: String,
         project: URL,
         sessionPath: String?,
-        preloadedTranscript: InitialTranscriptBuild? = nil
+        preloadedTranscript: InitialTranscriptBuild? = nil,
+        taskNotificationMode: SessionTaskNotificationMode = .standard
     ) -> ChatSession {
         // spawn 前自检：撞名扩展会让 pi 直接退出，先把它变成可修复的提示而不是一行崩溃日志。
         // T11: 主路径只做便宜的 stamp 检查 + 缓存命中；未缓存时先放行 spawn，
@@ -1035,7 +1062,8 @@ final class AppStore: ObservableObject {
             installed: plugin,
             features: builtInFeatures,
             philosophyExtension: philosophyExtension,
-            computerUseExtension: selectedComputerStrategy?.extensionPath
+            computerUseExtension: selectedComputerStrategy?.extensionPath,
+            memoryEnabled: ControlledMemoryStore.isEnabledOnDisk()
         )
         let session = ChatSession(
             id: key, projectURL: project, sessionPath: sessionPath,
@@ -1053,7 +1081,9 @@ final class AppStore: ObservableObject {
             agentsDir: paths.agentsDir,
             philosophyExtension: paths.philosophy,
             searchScopeExtension: paths.searchScope,
+            memoryExtension: paths.memory,
             builtInFeatures: builtInFeatures,
+            taskNotificationMode: taskNotificationMode,
             blockedReason: sessionBlockedReason.isEmpty
                 ? nil : sessionBlockedReason,
             initialTranscript: initialTranscript
@@ -1110,6 +1140,9 @@ final class AppStore: ObservableObject {
                 return
             }
             self.closeSession(key: currentKey)
+        }
+        session.onRequestScheduleDraft = { [weak self] prompt in
+            self?.presentAutomationDraft(prefilledPrompt: prompt)
         }
         return session
     }
@@ -1724,7 +1757,10 @@ final class AppStore: ObservableObject {
 
     /// Creates a live Pi session without changing desktop selection.
     @discardableResult
-    func createSessionInBackground(project: URL) -> (key: String, session: ChatSession) {
+    func createSessionInBackground(
+        project: URL,
+        taskNotificationMode: SessionTaskNotificationMode = .standard
+    ) -> (key: String, session: ChatSession) {
         RemoteSelectionNeutralMutation.perform(selection: { [self] in
             RemoteDesktopSelectionState(
                 projectPath: self.selectedProjectPath,
@@ -1732,7 +1768,12 @@ final class AppStore: ObservableObject {
             )
         }) { [self] in
             let key = "new:\(UUID().uuidString)"
-            let session = self.makeSession(key: key, project: project, sessionPath: nil)
+            let session = self.makeSession(
+                key: key,
+                project: project,
+                sessionPath: nil,
+                taskNotificationMode: taskNotificationMode
+            )
             self.openSessions[key] = session
             return (key, session)
         }
@@ -1952,6 +1993,9 @@ final class AppStore: ObservableObject {
     }
 
     func shutdown() {
+        MainActor.assumeIsolated {
+            automationSchedulerStorage?.stop()
+        }
         pendingHistoricalSessionOpens.removeAll()
         stopRemotePeerTest()
         localRemoteHost?.stop()
@@ -1971,6 +2015,127 @@ final class AppStore: ObservableObject {
         }
         bridge?.stop()
         bridge = nil
+    }
+
+    @MainActor func startAutomations() {
+        automations.start()
+    }
+
+    func presentAutomations() {
+        automationDraftRequest = nil
+        isAutomationsPresented = true
+    }
+
+    func presentAutomationDraft(prefilledPrompt: String) {
+        automationDraftRequest = AutomationDraftRequestCoordinator.issue(prompt: prefilledPrompt)
+        isAutomationsPresented = true
+    }
+
+    @MainActor
+    private func executeAutomation(_ job: AutomationJob) async -> AutomationExecutionResult {
+        guard projects.contains(where: { $0.path == job.projectPath }),
+              FileManager.default.fileExists(atPath: job.projectPath) else {
+            return .failure("项目不存在或已从 Pipi 移除：\(job.projectPath)", shouldPause: true)
+        }
+
+        let selectionBefore = RemoteDesktopSelectionState(
+            projectPath: selectedProjectPath,
+            sessionKey: selectedSessionKey
+        )
+        let (key, session) = createSessionInBackground(
+            project: URL(fileURLWithPath: job.projectPath),
+            taskNotificationMode: .schedulerOnly
+        )
+        let selectionImmediatelyAfterCreation = RemoteDesktopSelectionState(
+            projectPath: selectedProjectPath,
+            sessionKey: selectedSessionKey
+        )
+        guard AutomationSelectionGuard.remainedNeutral(
+            before: selectionBefore,
+            immediatelyAfterCreation: selectionImmediatelyAfterCreation
+        ) else {
+            return .failure("创建后台任务会话时改变了桌面选择", sessionKey: key, sessionPath: session.sessionFile)
+        }
+        let readinessDeadline = Date().addingTimeInterval(30)
+        while session.isInitializing && session.processAlive && Date() < readinessDeadline {
+            guard !Task.isCancelled else {
+                return .failure("自动任务已取消", sessionKey: key, sessionPath: session.sessionFile)
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard !session.isInitializing, session.processAlive else {
+            return .failure(session.lastError ?? "后台会话启动超时", sessionKey: key, sessionPath: session.sessionFile)
+        }
+        var prompt = job.prompt
+        if let skill = job.skillName?.trimmingCharacters(in: .whitespacesAndNewlines), !skill.isEmpty {
+            let skillDeadline = Date().addingTimeInterval(5)
+            while !session.availableCommands.contains(where: { $0.source == .skill && $0.name == skill }),
+                  session.processAlive,
+                  Date() < skillDeadline {
+                guard !Task.isCancelled else {
+                    return .failure("自动任务已取消", sessionKey: key, sessionPath: session.sessionFile)
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            guard session.availableCommands.contains(where: { $0.source == .skill && $0.name == skill }) else {
+                return .failure(
+                    "所选 Skill 当前不可用：\(skill)",
+                    sessionKey: key,
+                    sessionPath: session.sessionFile,
+                    shouldPause: true
+                )
+            }
+            prompt = "/\(skill) \(prompt)"
+        }
+
+        let initialCount = session.transcript.count
+        switch session.submitAutomationPrompt(prompt) {
+        case .accepted:
+            break
+        case .empty:
+            return .failure("自动任务提示词为空", sessionKey: key, sessionPath: session.sessionFile, shouldPause: true)
+        case .rejectedBuiltin(let name):
+            return .failure("自动任务不能执行 PipiUI 本地命令：/\(name)", sessionKey: key, sessionPath: session.sessionFile, shouldPause: true)
+        case .grantResetFailed:
+            return .failure("自动任务未发送：无法清除上一轮路径授权", sessionKey: key, sessionPath: session.sessionFile, shouldPause: true)
+        case .unavailable:
+            return .failure("后台会话尚不可用", sessionKey: key, sessionPath: session.sessionFile)
+        }
+
+        let deadline = Date().addingTimeInterval(30 * 60)
+        var observedWork = false
+        while Date() < deadline {
+            guard !Task.isCancelled else {
+                session.abort()
+                return .failure("自动任务已取消", sessionKey: key, sessionPath: session.sessionFile)
+            }
+            if !session.processAlive {
+                return .failure(session.lastError ?? "后台 pi 进程已退出", sessionKey: key, sessionPath: session.sessionFile)
+            }
+            observedWork = observedWork || session.isWorking || session.transcript.count > initialCount
+            if observedWork,
+               !session.isWorking,
+               session.messageQueue.isEmpty,
+               session.subagents.runningCount == 0 {
+                if let error = session.lastError, !error.isEmpty {
+                    return .failure(error, sessionKey: key, sessionPath: session.sessionFile)
+                }
+                return .success(
+                    session.automationResultSummary(afterTranscriptCount: initialCount) ?? "任务已完成",
+                    sessionKey: key,
+                    sessionPath: session.sessionFile
+                )
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        session.abort()
+        return AutomationExecutionResult(
+            status: .timedOut,
+            summary: "任务运行超过 30 分钟，已停止等待。",
+            sessionKey: key,
+            sessionPath: session.sessionFile,
+            shouldPause: true
+        )
     }
 
     static let markdownDemo = """

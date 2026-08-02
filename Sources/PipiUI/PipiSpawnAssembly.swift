@@ -57,6 +57,7 @@ enum PipiSpawnAssembly {
         var webSearch: String?
         var skillLoader: String?
         var searchScope: String?
+        var memory: String? = nil
         var codexServerTools: String?
         var claudeServerTools: String?
         var computerUse: String?
@@ -73,7 +74,8 @@ enum PipiSpawnAssembly {
             installed: PiPlugin.Installed,
             features: BuiltInFeatureSettings.EnabledSet,
             philosophyExtension: String?,
-            computerUseExtension: String?
+            computerUseExtension: String?,
+            memoryEnabled: Bool = false
         ) -> Paths {
             Paths(
                 philosophy: features.isEnabled(.philosophy) ? philosophyExtension : nil,
@@ -83,6 +85,7 @@ enum PipiSpawnAssembly {
                 webSearch: features.isEnabled(.webSearch) ? installed.webSearchExtension : nil,
                 skillLoader: features.isEnabled(.skillLoader) ? installed.skillLoaderExtension : nil,
                 searchScope: features.isEnabled(.searchScope) ? installed.searchScopeExtension : nil,
+                memory: memoryEnabled ? installed.memoryExtension : nil,
                 codexServerTools: features.isEnabled(.codexServerTools)
                     ? installed.codexServerToolsExtension : nil,
                 claudeServerTools: features.isEnabled(.claudeServerTools)
@@ -177,6 +180,10 @@ enum PipiSpawnAssembly {
 
         // Main session only: dispatched workers stay fully skill-free.
         if f.isEnabled(.skillLoader), let p = input.paths.skillLoader { args += ["-e", p] }
+
+        // Controlled Memory has its own explicit, default-off native setting.
+        // AppStore resolves this path to nil unless enabled for the new session.
+        if let p = input.paths.memory { args += ["-e", p] }
 
         // Project search boundary: -e + grant file + nested-process re-export env.
         if f.isEnabled(.searchScope), let p = input.paths.searchScope {

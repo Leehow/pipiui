@@ -425,6 +425,13 @@ enum ChatBlock: Equatable {
     case video(VideoBlock)
 }
 
+enum SessionTaskNotificationMode: Equatable {
+    case standard
+    case schedulerOnly
+
+    var allowsGenericNotifications: Bool { self == .standard }
+}
+
 struct ChatItem: Identifiable, Equatable {
     let id: String
     let role: String // user / assistant / system
@@ -775,6 +782,9 @@ final class ChatSession: ObservableObject, Identifiable {
     var onRequestNewSession: (() -> Void)?
     /// Injected by AppStore for `/quit`.
     var onRequestClose: (() -> Void)?
+    /// Injected by AppStore for `/schedule`; always opens a confirmation draft.
+    var onRequestScheduleDraft: ((String) -> Void)?
+    private let taskNotificationMode: SessionTaskNotificationMode
 
     /// 右侧面板：内置浏览器 / subagent 树 / 文档预览
     enum RightPanel: Equatable { case web, agents, document }
@@ -882,11 +892,14 @@ final class ChatSession: ObservableObject, Identifiable {
          agentsDir: String? = nil,
          philosophyExtension: String? = nil,
          searchScopeExtension: String? = nil,
+         memoryExtension: String? = nil,
          builtInFeatures: BuiltInFeatureSettings.EnabledSet = .init(),
+         taskNotificationMode: SessionTaskNotificationMode = .standard,
          blockedReason: String? = nil,
          initialTranscript: InitialTranscriptBuild? = nil) {
         self.id = id
         self.projectURL = projectURL
+        self.taskNotificationMode = taskNotificationMode
         self.resumedFromDisk = sessionPath != nil
         // A restarted/resumed session never inherits a stale external-search
         // grant — but only when the SearchScope capability is actually mounted.
@@ -992,6 +1005,7 @@ final class ChatSession: ObservableObject, Identifiable {
                     webSearch: webSearchExtension,
                     skillLoader: skillLoaderExtension,
                     searchScope: searchScopeExtension,
+                    memory: memoryExtension,
                     codexServerTools: codexServerToolsExtension,
                     claudeServerTools: claudeServerToolsExtension,
                     computerUse: computerUseExtension,
@@ -3168,6 +3182,59 @@ final class ChatSession: ObservableObject, Identifiable {
         case unavailable
     }
 
+    enum AutomationPromptSubmissionResult: Equatable {
+        case accepted
+        case empty
+        case rejectedBuiltin(String)
+        case grantResetFailed
+        case unavailable
+    }
+
+    /// Explicit app-generated automation seam. Unlike a local composer send it
+    /// clears any prior human path grant before dispatch, and unlike the remote
+    /// seam it is only called by the persisted local scheduler.
+    func submitAutomationPrompt(_ text: String) -> AutomationPromptSubmissionResult {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .empty }
+        if let builtinName = RemotePromptPolicy.rejectedBuiltinName(in: trimmed) {
+            return .rejectedBuiltin(builtinName)
+        }
+        guard processAlive, proc != nil, !isInitializing,
+              !isStreaming, !isSendingFromQueue else { return .unavailable }
+
+        do {
+            try SearchScopeExtension.applyPromptPolicy(
+                .remoteClearGrant,
+                prompt: "",
+                sessionKey: id,
+                projectRoot: projectURL
+            )
+        } catch {
+            return .grantResetFailed
+        }
+
+        let prepared = prepareMessage(text: trimmed, images: [])
+        beginTurnWallClock()
+        guard sendPromptNow(
+            message: prepared.message,
+            images: [],
+            searchGrantPolicy: .appAuthoredPreserveLatestHumanGrant
+        ) else { return .unavailable }
+        return .accepted
+    }
+
+    func automationResultSummary(afterTranscriptCount initialCount: Int) -> String? {
+        guard transcript.count > initialCount else { return nil }
+        for item in transcript.suffix(from: initialCount).reversed() where item.role == "assistant" {
+            let text = item.blocks.compactMap { block -> String? in
+                if case .text(let value) = block { return value }
+                return nil
+            }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { return String(text.prefix(500)) }
+        }
+        return nil
+    }
+
     /// Explicit remote-text seam. It shares the normal local queue, optimistic
     /// transcript and Pi abort behavior, while refusing every PipiUI-local
     /// builtin and never treating remote text as local filesystem authorization.
@@ -3763,7 +3830,8 @@ final class ChatSession: ObservableObject, Identifiable {
             hasUnseenCompletion = true
         }
         // 任务完成提醒：只有用户看不到结果（会话未选中或应用未激活）时才弹。
-        if TaskNotifier.shouldNotifyCompletion(
+        if taskNotificationMode.allowsGenericNotifications,
+           TaskNotifier.shouldNotifyCompletion(
             selected: isSelectedCheck?() == true,
             appActive: NSApp.isActive
         ) {
@@ -3776,6 +3844,7 @@ final class ChatSession: ObservableObject, Identifiable {
     /// 任务失败提醒（错误不分用户是否在观看，始终提醒）。
     /// PiProcess 的回调与 UI 事件都投递在主线程，此处用 assumeIsolated 直调。
     private func notifyError(_ message: String) {
+        guard taskNotificationMode.allowsGenericNotifications else { return }
         MainActor.assumeIsolated {
             TaskNotifier.shared.notifyError(sessionTitle: displayTitle, message: message)
         }
@@ -3852,6 +3921,14 @@ extension ChatSession: BuiltinCommandHost {
                 }
                 self.flash("已重载扩展 / skills / prompts / 上下文")
             }
+        }
+    }
+
+    func runScheduleDraft(_ prompt: String) {
+        if let onRequestScheduleDraft {
+            onRequestScheduleDraft(prompt)
+        } else {
+            flash("无法打开自动任务（未接入 AppStore）")
         }
     }
 

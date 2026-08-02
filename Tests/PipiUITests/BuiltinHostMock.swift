@@ -12,6 +12,7 @@ final class BuiltinHostMock: BuiltinCommandHost {
     var setModels: [String] = []
     var newCount = 0
     var quitCount = 0
+    var schedulePrompts: [String] = []
 
     var onRequestNewSession: (() -> Void)?
     var onRequestClose: (() -> Void)?
@@ -24,6 +25,7 @@ final class BuiltinHostMock: BuiltinCommandHost {
     func runExportHTML() { exportCount += 1 }
     func runCopyLastAssistant() { copyCount += 1 }
     func runSetModel(providerSlashId: String) { setModels.append(providerSlashId) }
+    func runScheduleDraft(_ prompt: String) { schedulePrompts.append(prompt) }
 
     func enableNew() {
         onRequestNewSession = { [weak self] in self?.newCount += 1 }
