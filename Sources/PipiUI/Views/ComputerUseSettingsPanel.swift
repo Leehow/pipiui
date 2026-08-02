@@ -121,7 +121,7 @@ struct ComputerUseSettingsPanel: View {
             Text("保留的闸门只有：全局开关、macOS TCC、手动急停，以及目标进程/焦点/截图/坐标/event-post 校验和 held-input 清理。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            Text("会话结束或关闭 Computer Use 会终止对应 Pi 进程，使内存 capability 失效；急停会阻断执行、取消当前操作并清理输入，但不会旋转仍存活会话的 token。")
+            Text("关闭 Computer Use 只取消进行中的桌面操作并拒绝新的 computer / open_application 调用，不会终止或重启任何 Pi 会话，也不影响普通对话、coding subagent 与构建测试；重新打开即可继续使用，无需重启。急停会额外中断相关会话的当前生成。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             Text("截图只驻留内存；审计日志不记录截图、输入文本或 capability token。")

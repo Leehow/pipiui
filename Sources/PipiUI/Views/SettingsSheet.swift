@@ -486,9 +486,17 @@ struct SettingsSheet: View {
         }
         store.setBuiltInFeatureEnabled(enabled, id: id)
         errorMessage = nil
-        statusMessage = enabled
-            ? "已启用内置能力「\(title(for: id))」（将重启会话）"
-            : "已关闭内置能力「\(title(for: id))」（将重启会话）"
+        if id == .computerUse {
+            // Hot-swappable: no session restart. Existing sessions are rejected
+            // by the host guard immediately; new spawns follow the switch.
+            statusMessage = enabled
+                ? "已启用 Computer Use 能力：新会话将挂载桌面控制，已挂载的会话立即恢复可用。"
+                : "已关闭 Computer Use 能力：进行中的桌面操作已取消，新的桌面调用会被拒绝（不重启会话）。"
+        } else {
+            statusMessage = enabled
+                ? "已启用内置能力「\(title(for: id))」（将重启会话）"
+                : "已关闭内置能力「\(title(for: id))」（将重启会话）"
+        }
         builtInDisabled = BuiltInFeatureSettings.disabledIDs()
     }
 

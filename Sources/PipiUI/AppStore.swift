@@ -256,6 +256,12 @@ final class AppStore: ObservableObject {
     /// sessions. Subagent-off invalidates every in-flight conflict scan
     /// immediately — before UserDefaults changes or asynchronous restarts — so a
     /// rapid off→on cannot revive an old callback against the same key.
+    /// `.computerUse` is the one hot-swappable exception: the coordinator host
+    /// guard reads it live (see `ComputerCoordinator.computerUseEnabledProvider`)
+    /// and spawn-time mounting reads it per session, so no restart is needed —
+    /// turning it off cancels in-flight desktop work and rejects every further
+    /// computer/open_application call; turning it on applies to new spawns and
+    /// re-admits already-mounted harnesses.
     func setBuiltInFeatureEnabled(
         _ enabled: Bool,
         id: BuiltInFeatureSettings.FeatureID
@@ -269,6 +275,15 @@ final class AppStore: ObservableObject {
             extensionConflictScanGenerations.removeAll()
         }
         BuiltInFeatureSettings.setEnabled(enabled, id: id)
+        if id == .computerUse {
+            // Hot swap: never restart sessions. Existing sessions keep their
+            // mounted harness but the host guard rejects every call until the
+            // master switch is on again.
+            if !enabled {
+                ComputerCoordinator.shared.cancelAllDesktopOperations()
+            }
+            return
+        }
         restartAllOpenSessions()
     }
 
@@ -276,34 +291,32 @@ final class AppStore: ObservableObject {
     /// Turning it on is the only PipiUI authorization gate for all current and
     /// future sessions and subagents. macOS TCC, the in-flight mutex, technical
     /// target validation, cleanup, and emergency stop remain independent.
+    ///
+    /// This toggle is hot-swappable and never touches open sessions: enabling
+    /// clears the emergency latch and re-arms global authorization + input
+    /// monitoring; disabling cancels only in-flight desktop work and stops new
+    /// computer/open_application calls via the host guard. Normal main turns,
+    /// tools, coding subagents and build/test keep running. The red 急停 button
+    /// keeps its forced semantics (`emergencyStop` may abort affected sessions).
     func setComputerUseEnabled(_ enabled: Bool) {
-        let persisted = ComputerUseSettings.isEnabled()
-        if enabled, persisted,
-           ComputerCoordinator.shared.emergencyStopped {
-            ComputerCoordinator.shared.enableGlobalAuthorization()
-            computerUseEnabled = true
-            return
-        }
-        guard enabled != persisted else {
-            // Repair an in-memory observation mismatch without restarting pi.
-            if computerUseEnabled != persisted {
-                computerUseEnabled = persisted
+        let coordinator = ComputerCoordinator.shared
+        ComputerUseTogglePolicy(
+            isEnabled: { ComputerUseSettings.isEnabled() },
+            isEmergencyStopped: { coordinator.emergencyStopped },
+            currentPublished: { self.computerUseEnabled },
+            persist: { ComputerUseSettings.setEnabled($0) },
+            publish: { self.computerUseEnabled = $0 },
+            onEnable: {
+                coordinator.enableGlobalAuthorization()
+                coordinator.refreshInputMonitoring(
+                    permissionSnapshot: ComputerPermissions.snapshot()
+                )
+            },
+            onDisable: {
+                coordinator.cancelAllDesktopOperations()
+                coordinator.shutdownInputMonitoring()
             }
-            return
-        }
-
-        ComputerUseSettings.setEnabled(enabled)
-        computerUseEnabled = enabled
-        if enabled {
-            ComputerCoordinator.shared.enableGlobalAuthorization()
-            ComputerCoordinator.shared.refreshInputMonitoring(
-                permissionSnapshot: ComputerPermissions.snapshot()
-            )
-        } else {
-            ComputerCoordinator.shared.emergencyStop()
-            ComputerCoordinator.shared.shutdownInputMonitoring()
-        }
-        restartAllOpenSessions()
+        ).set(enabled)
     }
 
     func toggleComputerUse() {

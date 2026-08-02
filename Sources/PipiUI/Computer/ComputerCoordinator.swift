@@ -266,7 +266,13 @@ final class ComputerCoordinator: ObservableObject {
                 )
             },
         computerUseEnabledProvider: @escaping @Sendable () -> Bool = {
+            // Read live at guard time: both the standalone authorization opt-in
+            // AND the built-in master capability switch. The built-in switch is
+            // hot-swappable, so an already-mounted harness in an old session is
+            // rejected immediately when the master capability is turned off,
+            // without restarting the session.
             ComputerUseSettings.isEnabled()
+                && BuiltInFeatureSettings.isEnabled(.computerUse)
         },
         activationGenerationProvider: @escaping @Sendable () -> UInt64 = {
             ComputerActivationGenerationMonitor.shared.generation

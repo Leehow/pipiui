@@ -135,6 +135,18 @@ extension ComputerCoordinator {
         refreshInputMonitoring()
     }
 
+    /// Desktop-scoped shutdown used by the settings toggle (never the red
+    /// 急停 button): cancels every in-flight CUA/legacy/open-application
+    /// operation, pending approvals and consent, and releases held input — but
+    /// does NOT set `emergencyStopped` and never invokes the `onEmergencyStop`
+    /// session-abort callback, so normal main turns, tools and coding subagents
+    /// keep running. New desktop calls are rejected by `guardSessionAuthorization`
+    /// once the `computerUseEnabledProvider` reads the off state.
+    func cancelAllDesktopOperations() {
+        releaseAll(revokeConsent: true)
+        statusMessage = "Computer Use 已关闭：已取消进行中的桌面操作，新的桌面调用会被拒绝。"
+    }
+
     func emergencyStop(sessionKey: String? = nil) {
         _ = sessionKey
         let affected = affectedSessionKeys()
