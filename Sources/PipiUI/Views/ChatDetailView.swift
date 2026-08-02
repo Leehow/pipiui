@@ -33,21 +33,24 @@ struct TranscriptSessionRootIdentity: Hashable {
     let sessionKey: String
 }
 
-/// Sliding settled-history window rendered by the eager transcript stack.
+/// Settled-history window rendered by the eager transcript stack.
 ///
-/// A small eager window (2-4 fixed pages) gives native NSTextView-backed markdown
+/// A small eager window (2+ fixed pages) gives native NSTextView-backed markdown
 /// enough room to settle its exact height without reintroducing lazy-stack height
-/// estimation. The window is a pure function of the top-visible page: pages
-/// [N-1, N, N+1, N+2] clipped to the existing pages and the item count, with the
-/// oldest page (N == 0) rendering only the top two pages. At the latest page the
-/// clipping naturally leaves the bottom two pages, so pinned live mode renders
-/// exactly the pages that can be seen.
+/// estimation. The window is **one-way**: it always ends at the newest transcript
+/// item and only ever grows backward while the user browses history. A scroll
+/// report can never delete pages, so the old feedback loop
+/// `scrollPosition → window shrink → new scrollPosition` is structurally
+/// impossible. Pinned/live mode renders the latest two pages (`nil` head);
+/// unpinned history prepends one older page at a time.
 struct TranscriptRenderWindow: Equatable {
     static let pageSize = 32
 
     let range: Range<Int>
     let totalCount: Int
 
+    /// The window always includes the newest item (`end == itemCount`) — history
+    /// browsing prepends at the old end and never drops the latest end.
     var isLatest: Bool { range.upperBound == totalCount }
     var renderedCount: Int { range.count }
 
@@ -57,23 +60,40 @@ struct TranscriptRenderWindow: Equatable {
         return max(0, (count + pageSize - 1) / pageSize - 1)
     }
 
-    /// Window invariant: pages [N-1 … N+2] ∩ [0 … p], except N == 0 which renders
-    /// only pages [0, 1]. N is clamped into [0, p] so a transcript that shrank
-    /// between a scroll event and this render cannot produce an invalid window.
-    static func resolve(itemCount: Int, topVisiblePage: Int) -> Self {
+    /// Default (pinned / freshly reset) window start: the newest page minus one.
+    static func latestStartPage(itemCount: Int) -> Int {
+        max(0, latestPage(itemCount: itemCount) - 1)
+    }
+
+    /// Window from `oldestLoadedPage` (history head) through the newest item.
+    /// `nil` and out-of-range values clamp to the latest two pages, so a stale
+    /// head (transcript reload / session switch) can never render invalid items.
+    static func resolve(itemCount: Int, oldestLoadedPage: Int?) -> Self {
         let count = max(0, itemCount)
         let lastPage = latestPage(itemCount: count)
-        let top = min(max(0, topVisiblePage), lastPage)
-        let startPage = max(0, top - 1)
-        let endPage: Int
-        if top == 0 {
-            endPage = min(lastPage + 1, 2)
+        let startPage: Int
+        if let oldestLoadedPage, (0...lastPage).contains(oldestLoadedPage) {
+            startPage = oldestLoadedPage
         } else {
-            endPage = min(lastPage + 1, top + 3)
+            startPage = latestStartPage(itemCount: count)
         }
         let start = startPage * pageSize
-        let end = min(count, endPage * pageSize)
-        return Self(range: start..<end, totalCount: count)
+        return Self(range: start..<count, totalCount: count)
+    }
+}
+
+/// One-step prepend decision for history browsing. Pure and unit-tested so the
+/// feedback-breaking rule can never regress into a bidirectional window again:
+/// the top-visible page may only pull **one** older page in, never remove pages at
+/// the newest end, and repeated reports of the same visible page are idempotent
+/// (after the first decrement the new start lies below the reported page).
+enum TranscriptHistoryPrepender {
+    /// - Returns: the new oldest loaded page (`currentStartPage - 1`) when the
+    ///   top-visible page has reached the oldest loaded page and older pages
+    ///   exist; `nil` otherwise.
+    static func prepend(currentStartPage: Int, visiblePage: Int) -> Int? {
+        guard currentStartPage > 0, visiblePage <= currentStartPage else { return nil }
+        return currentStartPage - 1
     }
 }
 
@@ -539,9 +559,10 @@ private struct ChatDetailViewBody: View {
                     transcriptViewportHeight = height
                 }
             }
-            .defaultScrollAnchor(.bottom)
-            // The sliding window follows the top-most visible row. The `.top` anchor
-            // both reports that row and keeps it pinned while window pages slide.
+            // Bottom pinning is owned by the explicit `scrollTo("bottom")` +
+            // StickToBottomTracker; no default bottom anchor, which would fight
+            // the user while browsing history. The `.top` anchor only reports the
+            // top-visible row and keeps it in place while a page is prepended.
             .scrollPosition(id: $scrollTopID, anchor: .top)
             .overlay(alignment: .bottomTrailing) {
                 if !session.pinTranscriptToBottom {
@@ -817,26 +838,30 @@ private struct StreamingTranscriptRows: View {
     let onReturnLatest: () -> Void
     let onJump: (String) -> Void
     @Environment(\.chatTypography) private var chatTypography
-    /// Page of the top-most visible row (unpinned derivation of `scrollTopID`).
-    @State private var topVisiblePage = 0
-    /// Last window range fed to the planner. The planner caches by
-    /// (transcriptVersion, toolStructureVersion, visibleCount), so a scroll-driven
-    /// window slide at an unchanged transcript version must invalidate it — done
-    /// here, before `presentation(...)` recomputes in the same body pass.
-    @State private var lastPlannedRange: Range<Int> = 0..<0
+    /// History head while unpinned: the oldest rendered page, or `nil` for the
+    /// default latest two pages (pinned/live or not yet browsed). Only ever
+    /// decreases via one-page prepends; the newest end is never deleted, so a
+    /// scroll report cannot shrink the window and feed back into itself.
+    @State private var transcriptOldestLoadedPage: Int?
+    /// The scroll report that caused the last prepend. Repeated reports of the
+    /// same top row must not prepend twice (the anchored row is maintained above
+    /// the newly inserted page by `.scrollPosition`). Reset on re-pin / session
+    /// switch so the same row can trigger again after a fresh latest window.
+    @State private var lastPrependTriggerID: String?
 
     var body: some View {
         let items = session.transcript
-        // Pinned live mode anchors the window at the newest page so appended items
-        // are always rendered; unpinned scrolling anchors it at the top-visible page.
-        let anchorPage = session.pinTranscriptToBottom
-            ? TranscriptRenderWindow.latestPage(itemCount: items.count)
-            : topVisiblePage
-        let window = trackPlannedWindow(TranscriptRenderWindow.resolve(
+        // Pinned/live mode always renders the latest two pages and ignores scroll
+        // reports. Unpinned history browsing prepends one page at a time at the old
+        // end (`transcriptOldestLoadedPage`); the newest end always stays at the
+        // last item, so the window only grows and can never oscillate.
+        let window = TranscriptRenderWindow.resolve(
             itemCount: items.count,
-            topVisiblePage: anchorPage
-        ))
+            oldestLoadedPage: session.pinTranscriptToBottom ? nil : transcriptOldestLoadedPage
+        )
         let windowItems = Array(items[window.range])
+        // History pages were prepended; the window end still includes the newest item.
+        let browsingHistory = !session.pinTranscriptToBottom && transcriptOldestLoadedPage != nil
         let presentation = session.transcriptPlanner.presentation(
             items: windowItems,
             toolRuns: streaming.toolRuns,
@@ -875,7 +900,7 @@ private struct StreamingTranscriptRows: View {
             ) {
                 Spacer(minLength: 0)
             }
-            if topVisiblePage == 0, session.isInitializing {
+            if window.range.lowerBound == 0, session.isInitializing {
                 HStack(spacing: 6) {
                     ProgressView()
                         .controlSize(.small)
@@ -943,7 +968,7 @@ private struct StreamingTranscriptRows: View {
                             onOpenRunningTool: onOpenRunningTool,
                             entryId: entryId,
                             isWorking: session.isWorking,
-                            completionText: window.isLatest && id == presentation.lastAssistantRunID
+                            completionText: !browsingHistory && id == presentation.lastAssistantRunID
                                 ? session.turnCompletionText : nil,
                             onCopy: { session.copySegmentsText(segments) },
                             onBranch: {
@@ -971,7 +996,7 @@ private struct StreamingTranscriptRows: View {
                 }
             }
 
-            if window.isLatest,
+            if !browsingHistory,
                let streamingItem = streaming.streamingItem,
                hasVisibleContent(streamingItem) {
                 MessageRow(
@@ -1007,7 +1032,7 @@ private struct StreamingTranscriptRows: View {
                     TurnElapsedText(startedAt: startedAt)
                         .id(transcriptID("streaming-turn-elapsed"))
                 }
-            } else if window.isLatest && (session.isWorking || session.mediaBusy) {
+            } else if !browsingHistory && (session.isWorking || session.mediaBusy) {
                 WaitingPlaceholderView(
                     message: session.mediaBusy
                         ? (session.mediaStatus ?? "正在处理…")
@@ -1017,7 +1042,7 @@ private struct StreamingTranscriptRows: View {
                 .id(transcriptID("waiting-placeholder"))
             }
 
-            if !window.isLatest {
+            if browsingHistory {
                 HStack(spacing: 16) {
                     Spacer(minLength: 0)
 
@@ -1033,39 +1058,69 @@ private struct StreamingTranscriptRows: View {
                 .frame(height: 1)
                 .id(transcriptID("bottom"))
                 .background {
-                    if window.isLatest {
-                        StickToBottomTracker(
-                            isPinned: $session.pinTranscriptToBottom,
-                            pinEdge: .documentEnd
-                        )
-                    }
+                    // Always mounted: it also owns the "scrolled back near the
+                    // bottom → re-pin" decision while history pages are loaded.
+                    StickToBottomTracker(
+                        isPinned: $session.pinTranscriptToBottom,
+                        pinEdge: .documentEnd
+                    )
                 }
         }
         // No window-replacement identity: the container must stay alive across
-        // window slides so `.scrollPosition` can anchor the top-visible row.
+        // window prepends so `.scrollPosition` can anchor the top-visible row.
         .onChange(of: scrollTopID) { _, newValue in
-            guard let page = topVisiblePage(from: newValue, items: session.transcript) else { return }
-            if page != topVisiblePage {
-                topVisiblePage = page
+            handleScrollTopReport(newValue)
+        }
+        .onChange(of: session.pinTranscriptToBottom) { _, newValue in
+            if newValue {
+                // Explicit transition: history browsing ends (jump-to-latest button
+                // or scrolled back near the bottom). Drop back to the latest two
+                // pages; the viewport is already bottom-pinned by the explicit
+                // scroll / StickToBottomTracker, so deleting above is safe.
+                transcriptOldestLoadedPage = nil
+                lastPrependTriggerID = nil
+                session.transcriptPlanner.invalidate()
             }
+        }
+        .onChange(of: session.id) { _, _ in
+            transcriptOldestLoadedPage = nil
+            lastPrependTriggerID = nil
+            session.transcriptPlanner.invalidate()
+        }
+        .onChange(of: session.bridgeRoutingKey) { _, _ in
+            transcriptOldestLoadedPage = nil
+            lastPrependTriggerID = nil
         }
     }
 
-    /// Planner cache invalidation must run before `presentation(...)` recomputes in
-    /// the same body pass, so it is folded into a single expression (ViewBuilder
-    /// bodies cannot host multi-statement `if` side effects).
-    private func trackPlannedWindow(_ window: TranscriptRenderWindow) -> TranscriptRenderWindow {
-        if window.range != lastPlannedRange {
-            lastPlannedRange = window.range
-            session.transcriptPlanner.invalidate()
-        }
-        return window
+    /// Prepends exactly one older page when the top-visible row reaches the oldest
+    /// loaded page — and only while unpinned. Repeated reports of the same row are
+    /// idempotent (the anchored row stays put above the inserted page, and
+    /// `TranscriptHistoryPrepender` no-ops once the start moved below the report).
+    /// This is the only place a scroll report may grow the window; it can never
+    /// delete pages, so `scrollPosition` cannot feed a shrink back into layout.
+    private func handleScrollTopReport(_ scopedID: String?) {
+        guard !session.pinTranscriptToBottom else { return }
+        guard scopedID != lastPrependTriggerID else { return }
+        let items = session.transcript
+        guard let visiblePage = visiblePage(from: scopedID, items: items) else { return }
+        // Marker rows map to the latest page and never sit at the window head, so
+        // they can never trigger a prepend (visible > start).
+        let startPage = transcriptOldestLoadedPage
+            ?? TranscriptRenderWindow.latestStartPage(itemCount: items.count)
+        guard let newStart = TranscriptHistoryPrepender.prepend(
+            currentStartPage: startPage,
+            visiblePage: visiblePage
+        ) else { return }
+        lastPrependTriggerID = scopedID
+        transcriptOldestLoadedPage = newStart
+        session.transcriptPlanner.invalidate()
     }
 
     /// Map the reported top-most row id back to a transcript page. Every rendered
     /// row id is a `ChatItem.id` (`planTranscript` coalesces assistant spans under
     /// their last item id), so an id → index lookup is exact for every row.
-    private func topVisiblePage(from scopedID: String?, items: [ChatItem]) -> Int? {
+    private func visiblePage(from scopedID: String?, items: [ChatItem]) -> Int? {
         guard let scopedID,
               let localID = TranscriptRenderIdentity.local(
                   fromScoped: scopedID,
