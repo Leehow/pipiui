@@ -294,13 +294,11 @@ private struct ChatDetailViewBody: View {
                 }
             }
             .navigationTitle(session.displayTitle)
+            .navigationSubtitle(session.projectURL.lastPathComponent)
             // Opaque toolbar band so residual underlap cannot show through the title.
             .toolbarBackground(Color(nsColor: .windowBackgroundColor), for: .windowToolbar)
             .toolbarBackground(.visible, for: .windowToolbar)
             .toolbar {
-            ToolbarItem(placement: .principal) {
-                SessionTitleSubtitleView(session: session)
-            }
             ToolbarItemGroup(placement: .primaryAction) {
                 GitBranchMenu(store: gitBranches) { session.lastError = $0 }
 
@@ -1887,51 +1885,6 @@ struct StickToBottomTracker: NSViewRepresentable {
                 current = c.superview
             }
             return nil
-        }
-    }
-}
-
-/// Custom principal titlebar stack. `.navigationTitle` still sets the window
-/// title; the subtitle is the first real user message — one line, `…`-truncated,
-/// clickable to reveal the full text in a popover — or the project basename when
-/// the transcript has no user message yet.
-private struct SessionTitleSubtitleView: View {
-    @ObservedObject var session: ChatSession
-    @State private var showsFullMessage = false
-
-    var body: some View {
-        VStack(spacing: 1) {
-            Text(session.displayTitle)
-                .font(.system(size: 13))
-            if let fullMessage = SessionSubtitleLogic.firstUserMessageText(from: session.transcript) {
-                Button {
-                    showsFullMessage = true
-                } label: {
-                    Text(SessionSubtitleLogic.oneLine(fullMessage))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                .buttonStyle(.plain)
-                .onHover { hovering in
-                    if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-                }
-                .popover(isPresented: $showsFullMessage, arrowEdge: .bottom) {
-                    ScrollView {
-                        Text(fullMessage)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(12)
-                    }
-                    .frame(width: 420, height: 260)
-                }
-                .help("查看完整消息")
-            } else {
-                Text(session.projectURL.lastPathComponent)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
         }
     }
 }
