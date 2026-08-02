@@ -61,31 +61,42 @@ struct SubagentPanel: View {
         let summary = SubagentPresentationScale.summary(for: store.agents)
         let unit = PricingSettings.unit()
         let rate = ModelPricing.Catalog.shared.exchangeRate
-        // 单行布局：窄面板时左簇（标题/计数）优先截断隐藏，右簇（费用/清空/关闭）
-        // fixedSize + 高 layoutPriority 保持完整可用，绝不换行成两排。
+        // 单行布局：左簇（标题/计数/失败处置）占满剩余宽度并在自身内横向裁切；
+        // 右簇（费用/清空/关闭）fixedSize + 高 layoutPriority 保持完整可见。
+        // 宽度不足时溢出从左簇右缘消失，绝不换行成两排。
         return HStack(spacing: 8) {
-            Label("Subagents", systemImage: "person.2")
-                .font(.callout.weight(.semibold))
-                .lineLimit(1)
-                .truncationMode(.tail)
-            Text("\(summary.totalCount) 个")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            if summary.runningCount > 0 {
-                Text("\(summary.runningCount) 运行中")
-                    .font(.caption)
-                    .foregroundStyle(.green)
+            HStack(spacing: 8) {
+                Label("Subagents", systemImage: "person.2")
+                    .font(.callout.weight(.semibold))
                     .lineLimit(1)
-            }
-            if summary.failedCount > 0 {
-                Text("\(summary.failedCount) 失败")
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: true, vertical: false)
+                Text("\(summary.totalCount) 个")
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: true, vertical: false)
+                if summary.runningCount > 0 {
+                    Text("\(summary.runningCount) 运行中")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                if summary.failedCount > 0 {
+                    Text(SubagentPresentationScale.failureText(summary))
+                        .font(.caption)
+                        .foregroundStyle(summary.failedPendingCount > 0 ? Color.orange : Color.red)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .help(SubagentPresentationScale.failureHelp(summary))
+                }
             }
-            Spacer(minLength: 4)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .clipped()
             if summary.totalCost > 0 {
                 Text(formatSpend(usdCost: summary.totalCost, unit: unit, rate: rate))
                     .font(.caption.monospacedDigit())
@@ -98,7 +109,7 @@ struct SubagentPanel: View {
                 panelPageFromNewest = 0
                 store.clearFinished()
             } label: {
-                Text("清空已完成")
+                Text("清空")
                     .font(.caption)
                     .lineLimit(1)
             }
@@ -107,6 +118,7 @@ struct SubagentPanel: View {
             .disabled(summary.finishedCount == 0)
             .fixedSize(horizontal: true, vertical: false)
             .layoutPriority(1)
+            .help("清空已完成")
             Button(action: onClose) {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundStyle(.secondary)

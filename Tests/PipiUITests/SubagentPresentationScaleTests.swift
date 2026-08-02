@@ -10,7 +10,10 @@ final class SubagentPresentationScaleTests: XCTestCase {
             selectedID: nil
         )
 
-        XCTAssertEqual(card.summary, .init(totalCount: 0, runningCount: 0, failedCount: 0, totalCost: 0))
+        XCTAssertEqual(
+            card.summary,
+            .init(totalCount: 0, runningCount: 0, failedCount: 0, totalCost: 0, failedDisposedCount: 0, failedPendingCount: 0)
+        )
         XCTAssertTrue(card.visibleAgents.isEmpty)
         XCTAssertEqual(card.hiddenCount, 0)
         XCTAssertNil(card.panelSelectionID)
@@ -186,6 +189,102 @@ final class SubagentPresentationScaleTests: XCTestCase {
             0
         )
         XCTAssertLessThanOrEqual(replacementWindow.agents.count, SubagentPresentationScale.panelRowCap)
+    }
+
+    // MARK: - 失败处置分类（已处置 / 待处理）
+
+    func testFailedCleanedOrRetainedAreDisposed() {
+        var cleaned = agent(0, state: .failed)
+        cleaned.closeoutDisposition = .cleaned
+        var retained = agent(1, state: .failed)
+        retained.closeoutDisposition = .retained
+
+        let summary = SubagentPresentationScale.summary(for: [cleaned, retained])
+
+        XCTAssertEqual(summary.failedCount, 2)
+        XCTAssertEqual(summary.failedDisposedCount, 2)
+        XCTAssertEqual(summary.failedPendingCount, 0)
+    }
+
+    func testFailedUnclassifiedFixerUserArePending() {
+        let dispositions: [AgentCloseoutDisposition] = [.unclassified, .needsFixer, .needsUser]
+        let agents = dispositions.enumerated().map { index, disposition in
+            var a = agent(index, state: .failed)
+            a.closeoutDisposition = disposition
+            return a
+        }
+
+        let summary = SubagentPresentationScale.summary(for: agents)
+
+        XCTAssertEqual(summary.failedCount, 3)
+        XCTAssertEqual(summary.failedDisposedCount, 0)
+        XCTAssertEqual(summary.failedPendingCount, 3)
+    }
+
+    func testNonFailedAgentsDoNotEnterDispositionCounts() {
+        var failedUnclassified = agent(0, state: .failed)
+        failedUnclassified.closeoutDisposition = .unclassified
+        var failedCleaned = agent(1, state: .failed)
+        failedCleaned.closeoutDisposition = .cleaned
+        var running = agent(2, state: .running)
+        running.closeoutDisposition = .cleaned
+        var ok = agent(3, state: .ok)
+        ok.closeoutDisposition = .retained
+        var aborted = agent(4, state: .aborted)
+        aborted.closeoutDisposition = .needsUser
+
+        let summary = SubagentPresentationScale.summary(
+            for: [failedUnclassified, failedCleaned, running, ok, aborted]
+        )
+
+        XCTAssertEqual(summary.failedCount, 2)
+        XCTAssertEqual(summary.failedDisposedCount, 1)
+        XCTAssertEqual(summary.failedPendingCount, 1)
+    }
+
+    func testDisposedPlusPendingAlwaysEqualsFailed() {
+        let dispositions: [AgentCloseoutDisposition] = [
+            .cleaned, .retained, .unclassified, .needsFixer, .needsUser,
+        ]
+        var agents: [SubagentInfo] = []
+        for (index, disposition) in dispositions.enumerated() {
+            var a = agent(index, state: index.isMultiple(of: 2) ? .failed : .ok)
+            a.closeoutDisposition = disposition
+            agents.append(a)
+        }
+
+        let summary = SubagentPresentationScale.summary(for: agents)
+        let card = SubagentPresentationScale.cardPresentation(for: agents)
+
+        XCTAssertEqual(summary.failedDisposedCount + summary.failedPendingCount, summary.failedCount)
+        XCTAssertEqual(
+            card.summary.failedDisposedCount + card.summary.failedPendingCount,
+            card.summary.failedCount
+        )
+    }
+
+    func testFailureTextCoversDisposedAndPendingCopy() {
+        var cleaned = agent(0, state: .failed)
+        cleaned.closeoutDisposition = .cleaned
+        var retained = agent(1, state: .failed)
+        retained.closeoutDisposition = .retained
+        var pending = agent(2, state: .failed)
+        pending.closeoutDisposition = .unclassified
+        var pendingUser = agent(3, state: .failed)
+        pendingUser.closeoutDisposition = .needsUser
+
+        let allDisposed = SubagentPresentationScale.summary(for: [cleaned, retained])
+        XCTAssertEqual(SubagentPresentationScale.failureText(allDisposed), "2 失败·已处置")
+
+        let mixed = SubagentPresentationScale.summary(for: [cleaned, retained, pending])
+        XCTAssertEqual(SubagentPresentationScale.failureText(mixed), "3 失败·1 待处理")
+
+        let allPending = SubagentPresentationScale.summary(for: [pending, pendingUser])
+        XCTAssertEqual(SubagentPresentationScale.failureText(allPending), "2 失败·待处理")
+
+        XCTAssertTrue(SubagentPresentationScale.failureHelp(mixed).contains("不代表用户已确认"))
+        XCTAssertTrue(SubagentPresentationScale.failureHelp(mixed).contains("已处置 2"))
+        XCTAssertTrue(SubagentPresentationScale.failureHelp(mixed).contains("待处理 1"))
     }
 
     private func agent(

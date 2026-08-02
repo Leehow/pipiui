@@ -798,6 +798,10 @@ enum SubagentPresentationScale {
         let runningCount: Int
         let failedCount: Int
         let totalCost: Double
+        /// 失败中已有最终系统处置（closeout 为 cleaned/retained）的数量。
+        let failedDisposedCount: Int
+        /// 失败中仍待处理（closeout 为 unclassified/needsFixer/needsUser）的数量。
+        let failedPendingCount: Int
 
         var finishedCount: Int { totalCount - runningCount }
     }
@@ -842,6 +846,8 @@ enum SubagentPresentationScale {
         let limit = max(0, rowLimit)
         var runningCount = 0
         var failedCount = 0
+        var failedDisposedCount = 0
+        var failedPendingCount = 0
         var totalCost = 0.0
         var problems: [SubagentInfo] = []
         var running: [SubagentInfo] = []
@@ -852,7 +858,14 @@ enum SubagentPresentationScale {
 
         for agent in agents.reversed() {
             if agent.state == .running { runningCount += 1 }
-            if agent.state == .failed { failedCount += 1 }
+            if agent.state == .failed {
+                failedCount += 1
+                if isDisposed(agent) {
+                    failedDisposedCount += 1
+                } else {
+                    failedPendingCount += 1
+                }
+            }
             totalCost += agent.cost
 
             if isProblematic(agent) {
@@ -874,7 +887,9 @@ enum SubagentPresentationScale {
             totalCount: agents.count,
             runningCount: runningCount,
             failedCount: failedCount,
-            totalCost: totalCost
+            totalCost: totalCost,
+            failedDisposedCount: failedDisposedCount,
+            failedPendingCount: failedPendingCount
         )
         return CardPresentation(
             summary: summary,
@@ -888,18 +903,59 @@ enum SubagentPresentationScale {
     static func summary(for agents: [SubagentInfo]) -> Summary {
         var runningCount = 0
         var failedCount = 0
+        var failedDisposedCount = 0
+        var failedPendingCount = 0
         var totalCost = 0.0
         for agent in agents {
             if agent.state == .running { runningCount += 1 }
-            if agent.state == .failed { failedCount += 1 }
+            if agent.state == .failed {
+                failedCount += 1
+                if isDisposed(agent) {
+                    failedDisposedCount += 1
+                } else {
+                    failedPendingCount += 1
+                }
+            }
             totalCost += agent.cost
         }
         return Summary(
             totalCount: agents.count,
             runningCount: runningCount,
             failedCount: failedCount,
-            totalCost: totalCost
+            totalCost: totalCost,
+            failedDisposedCount: failedDisposedCount,
+            failedPendingCount: failedPendingCount
         )
+    }
+
+    /// 保守的系统处置判定：只有持久化 closeout 为 `.cleaned` 或 `.retained` 才算
+    /// 「已处置」（有最终系统处置结果）；其余（未分类/需 fixer/需用户）一律「待处理」。
+    /// 绝不代表用户已确认。
+    static func isDisposed(_ agent: SubagentInfo) -> Bool {
+        switch agent.closeoutDisposition {
+        case .cleaned, .retained:
+            return true
+        case .unclassified, .needsFixer, .needsUser:
+            return false
+        }
+    }
+
+    /// 失败徽标单行文案：全部已处置 => 「N 失败·已处置」；
+    /// 有待处理 => 「N 失败·待处理」（全部待处理）或「N 失败·M 待处理」。
+    static func failureText(_ summary: Summary) -> String {
+        guard summary.failedCount > 0 else { return "" }
+        if summary.failedPendingCount == 0 {
+            return "\(summary.failedCount) 失败·已处置"
+        }
+        if summary.failedPendingCount == summary.failedCount {
+            return "\(summary.failedCount) 失败·待处理"
+        }
+        return "\(summary.failedCount) 失败·\(summary.failedPendingCount) 待处理"
+    }
+
+    /// 失败徽标 help：明确 已处置/待处理 语义，不暗示用户确认。
+    static func failureHelp(_ summary: Summary) -> String {
+        "失败 \(summary.failedCount) 个：已处置 \(summary.failedDisposedCount)（清理或保留已有最终系统处置，不代表用户已确认）；待处理 \(summary.failedPendingCount)（未分类，或需 fixer / 用户介入）。"
     }
 
     /// Keeps every page under a fixed hard cap and in original tree order. Selected and recent
