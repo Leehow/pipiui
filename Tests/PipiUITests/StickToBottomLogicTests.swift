@@ -179,4 +179,145 @@ final class StickToBottomLogicTests: XCTestCase {
             600
         )
     }
+
+    // MARK: - Prepend compensation geometry (exact-top history loading)
+
+    func testDistanceFromDocumentEndFlipped() {
+        // Flipped (top = 0): viewport bottom edge is 500pt above the document end.
+        let visible = CGRect(x: 0, y: 100, width: 300, height: 400)
+        XCTAssertEqual(
+            StickToBottomLogic.distanceFromDocumentEnd(
+                visible: visible,
+                contentHeight: 1000,
+                documentIsFlipped: true
+            ),
+            500
+        )
+    }
+
+    func testDistanceFromDocumentEndNonFlipped() {
+        // Non-flipped (bottom = 0): the viewport's bottom edge sits at minY.
+        let visible = CGRect(x: 0, y: 200, width: 300, height: 400)
+        XCTAssertEqual(
+            StickToBottomLogic.distanceFromDocumentEnd(
+                visible: visible,
+                contentHeight: 1000,
+                documentIsFlipped: false
+            ),
+            200
+        )
+    }
+
+    func testDistanceFromDocumentEndClampsElasticOverscrollAtZero() {
+        // Non-flipped elastic overscroll at the bottom pushes minY negative.
+        let visible = CGRect(x: 0, y: -6, width: 300, height: 400)
+        XCTAssertEqual(
+            StickToBottomLogic.distanceFromDocumentEnd(
+                visible: visible,
+                contentHeight: 1000,
+                documentIsFlipped: false
+            ),
+            0
+        )
+        // Flipped elastic overscroll at the top: maxY may exceed content height.
+        let overTop = CGRect(x: 0, y: -8, width: 300, height: 400)
+        XCTAssertEqual(
+            StickToBottomLogic.distanceFromDocumentEnd(
+                visible: overTop,
+                contentHeight: 1000,
+                documentIsFlipped: true
+            ),
+            608
+        )
+    }
+
+    func testRestoredOriginFlippedKeepsSnapshotDistance() {
+        // Snapshot: 200pt from the newest edge. After the prepend the document
+        // grew by 300pt (700 → 1000); the origin must move down by exactly 300
+        // so the *same content* stays under the cursor.
+        let distance = StickToBottomLogic.distanceFromDocumentEnd(
+            visible: CGRect(x: 0, y: 100, width: 300, height: 400),
+            contentHeight: 700,
+            documentIsFlipped: true
+        )
+        XCTAssertEqual(distance, 200)
+        let origin = StickToBottomLogic.restoredOriginY(
+            snapshotDistanceFromEnd: distance,
+            contentHeight: 1000,
+            viewportHeight: 400,
+            documentIsFlipped: true
+        )
+        XCTAssertEqual(origin, 400)
+        // The restored geometry reports exactly the snapshot's distance.
+        let restored = CGRect(x: 0, y: origin, width: 300, height: 400)
+        XCTAssertEqual(
+            StickToBottomLogic.distanceFromDocumentEnd(
+                visible: restored,
+                contentHeight: 1000,
+                documentIsFlipped: true
+            ),
+            distance
+        )
+    }
+
+    func testRestoredOriginNonFlippedKeepsSnapshotDistance() {
+        // Snapshot: 200pt from the newest (bottom) edge. Prepending above never
+        // shifts non-flipped content, so the origin stays at the distance.
+        let distance = StickToBottomLogic.distanceFromDocumentEnd(
+            visible: CGRect(x: 0, y: 200, width: 300, height: 400),
+            contentHeight: 1000,
+            documentIsFlipped: false
+        )
+        XCTAssertEqual(distance, 200)
+        let origin = StickToBottomLogic.restoredOriginY(
+            snapshotDistanceFromEnd: distance,
+            contentHeight: 1300,
+            viewportHeight: 400,
+            documentIsFlipped: false
+        )
+        XCTAssertEqual(origin, 200)
+        let restored = CGRect(x: 0, y: origin, width: 300, height: 400)
+        XCTAssertEqual(
+            StickToBottomLogic.distanceFromDocumentEnd(
+                visible: restored,
+                contentHeight: 1300,
+                documentIsFlipped: false
+            ),
+            distance
+        )
+    }
+
+    func testRestoredOriginClampsToLegalScrollRange() {
+        // Short document (content 300 < viewport 400): nothing to scroll — the
+        // flipped origin must land at 0, never negative.
+        XCTAssertEqual(
+            StickToBottomLogic.restoredOriginY(
+                snapshotDistanceFromEnd: 200,
+                contentHeight: 300,
+                viewportHeight: 400,
+                documentIsFlipped: true
+            ),
+            0
+        )
+        // Flipped: a snapshot distance larger than the document clamps to origin 0.
+        XCTAssertEqual(
+            StickToBottomLogic.restoredOriginY(
+                snapshotDistanceFromEnd: 1500,
+                contentHeight: 1000,
+                viewportHeight: 400,
+                documentIsFlipped: true
+            ),
+            0
+        )
+        // Non-flipped: an unreachable distance clamps to the maximum origin.
+        XCTAssertEqual(
+            StickToBottomLogic.restoredOriginY(
+                snapshotDistanceFromEnd: 1500,
+                contentHeight: 1000,
+                viewportHeight: 400,
+                documentIsFlipped: false
+            ),
+            600
+        )
+    }
 }

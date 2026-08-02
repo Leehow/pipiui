@@ -7,9 +7,9 @@ import XCTest
 /// Root cause of the fold/unfold jump: a short transcript had no layout-level
 /// bottom alignment, so `StickToBottomTracker` could not express "glued to the
 /// bottom" (no clip offset exists when contentHeight <= viewport) and the
-/// `.top` anchor of `.scrollPosition(id:anchor:)` grabbed gravity after a
-/// height change. The fix gates a viewport min-height + top flexible space on
-/// the pin state inside `ChatDetailView`.
+/// natural top-anchored layout grabbed gravity after a height change. The fix
+/// gates a viewport min-height + top flexible space on the pin state inside
+/// `ChatDetailView`.
 final class ShortTranscriptGravityTests: XCTestCase {
     private var repositoryRoot: URL {
         URL(fileURLWithPath: #filePath)
@@ -186,14 +186,15 @@ final class ShortTranscriptGravityTests: XCTestCase {
         XCTAssertTrue(content.contains("GeometryReader"))
         XCTAssertTrue(content.contains(".onPreferenceChange(TranscriptViewportHeightKey.self)"))
 
-        // Unrelated scroll-identity guarantees stay intact: the top-id anchor,
+        // Unrelated scroll-identity guarantees stay intact: no id-based anchor,
         // the explicit bottom jump, and the per-session scroll root must not be
         // weakened by the gravity change. The unconditional default bottom
         // anchor is gone — bottom pinning is owned by the explicit
         // `scrollTo("bottom")` + StickToBottomTracker, so it cannot fight the
         // user while browsing history (scroll-oscillation fix). Only the
         // macOS 15+ role-scoped *initial-offset* anchor is allowed.
-        XCTAssertTrue(content.contains(".scrollPosition(id: $scrollTopID, anchor: .top)"))
+        XCTAssertFalse(content.contains(".scrollPosition(id:"))
+        XCTAssertFalse(content.contains("scrollTopID"))
         XCTAssertFalse(content.contains(".defaultScrollAnchor(.bottom)"))
         XCTAssertTrue(source.contains(".defaultScrollAnchor(.bottom, for: .initialOffset)"))
         XCTAssertTrue(source.contains("scrollTo(transcriptID(\"bottom\"), anchor: .bottom)"))
