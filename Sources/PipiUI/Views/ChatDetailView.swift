@@ -35,9 +35,9 @@ struct TranscriptSessionRootIdentity: Hashable {
 
 /// Settled-history window rendered by the eager transcript stack.
 ///
-/// A small eager window (2+ fixed pages) gives native NSTextView-backed markdown
-/// enough room to settle its exact height without reintroducing lazy-stack height
-/// estimation. The window is **one-way**: it always ends at the newest transcript
+/// A small eager window (one fixed page of 32 rows at the newest end) gives
+/// native NSTextView-backed markdown enough room to settle its exact height
+/// without reintroducing lazy-stack height estimation. The window is **one-way**: it always ends at the newest transcript
 /// item and only ever grows backward while the user browses history. A scroll
 /// report can never delete pages, so the old feedback loop
 /// `scrollPosition → window shrink → new scrollPosition` is structurally
@@ -921,14 +921,14 @@ private struct StreamingTranscriptRows: View {
     let onJump: (String) -> Void
     @Environment(\.chatTypography) private var chatTypography
     /// History head while unpinned: the oldest rendered page, or `nil` for the
-    /// default latest two pages (pinned/live or not yet browsed). Only ever
+    /// default latest page (pinned/live or not yet browsed). Only ever
     /// decreases via one-page prepends; the newest end is never deleted, so a
     /// geometry trigger cannot shrink the window and feed back into itself.
     @State private var transcriptOldestLoadedPage: Int?
 
     var body: some View {
         let items = session.transcript
-        // Pinned/live mode always renders the latest two pages and ignores scroll
+        // Pinned/live mode always renders the latest page and ignores scroll
         // reports. Unpinned history browsing prepends one page at a time at the old
         // end (`transcriptOldestLoadedPage`); the newest end always stays at the
         // last item, so the window only grows and can never oscillate.
@@ -1078,6 +1078,22 @@ private struct StreamingTranscriptRows: View {
                     }
                 }
             }
+            // Stable internal anchor: the zero-height representable view sits at
+            // the bottom edge of the settled window rows — after the settled
+            // ForEach, before all bottom extras (streaming item, waiting
+            // placeholder, return-to-latest button, bottom sentinel). Prepending
+            // an older page shifts it along the document coordinate; bottom
+            // extras appearing/disappearing (browsingHistory toggle, token
+            // appends) never move it. `StickToBottomTracker` finds its
+            // enclosingScrollView regardless of its own position.
+            .overlay(alignment: .bottom) {
+                StickToBottomTracker(
+                    isPinned: $session.pinTranscriptToBottom,
+                    pinEdge: .documentEnd,
+                    topLoadingEnabled: topLoadingEnabled,
+                    onReachedTop: requestHistoryPrepend
+                )
+            }
 
             if !browsingHistory,
                let streamingItem = streaming.streamingItem,
@@ -1140,27 +1156,17 @@ private struct StreamingTranscriptRows: View {
             Color.clear
                 .frame(height: 1)
                 .id(transcriptID("bottom"))
-                .background {
-                    // Always mounted: it owns the "scrolled back near the bottom →
-                    // re-pin" decision and the exact-top history-prepend edge
-                    // (with clip-offset compensation while the prepend lands).
-                    StickToBottomTracker(
-                        isPinned: $session.pinTranscriptToBottom,
-                        pinEdge: .documentEnd,
-                        topLoadingEnabled: topLoadingEnabled,
-                        onReachedTop: requestHistoryPrepend
-                    )
-                }
         }
         // No window-replacement identity: the container must stay alive across
         // window prepends. History loading never reads row ids: the AppKit
         // exact-top edge in `StickToBottomTracker` fires `requestHistoryPrepend`
-        // and the coordinator compensates the clip offset after each prepend.
+        // and the coordinator compensates the clip offset from the internal
+        // anchor displacement after each prepend.
         .onChange(of: session.pinTranscriptToBottom) { _, newValue in
             if newValue {
                 // Explicit transition: history browsing ends (jump-to-latest button
-                // or scrolled back near the bottom). Drop back to the latest two
-                // pages; the viewport is already bottom-pinned by the explicit
+                // or scrolled back near the bottom). Drop back to the latest
+                // page; the viewport is already bottom-pinned by the explicit
                 // scroll / StickToBottomTracker, so deleting above is safe.
                 transcriptOldestLoadedPage = nil
                 session.transcriptPlanner.invalidate()
@@ -1436,44 +1442,6 @@ enum StickToBottomLogic {
         return contentHeight - visible.maxY
     }
 
-    /// Distance from the document end (newest edge) in document coordinates,
-    /// clamped to ≥ 0 (elastic overscroll may push it briefly negative). This is
-    /// the invariant preserved across a history prepend: the snapshot taken
-    /// before the prepend is restored exactly after the layout lands, so the
-    /// same content stays under the user's cursor.
-    static func distanceFromDocumentEnd(
-        visible: CGRect,
-        contentHeight: CGFloat,
-        documentIsFlipped: Bool
-    ) -> CGFloat {
-        max(0, distanceFromPinEdge(
-            visible: visible,
-            contentHeight: contentHeight,
-            documentIsFlipped: documentIsFlipped,
-            pinEdge: .documentEnd
-        ))
-    }
-
-    /// Clip origin that restores a snapshot's distance-from-end after a top
-    /// prepend grew the document. A prepend adds height above the viewport, so
-    /// keeping `snapshotDistanceFromEnd` identical keeps the exact same content
-    /// under the user's cursor — no page-height estimation. Flipped documents
-    /// (top = 0) restore at `contentHeight − distance − viewportHeight`;
-    /// non-flipped documents (bottom = 0) restore at `distance`. The result is
-    /// clamped to the legal scroll range (short documents land at origin 0).
-    static func restoredOriginY(
-        snapshotDistanceFromEnd: CGFloat,
-        contentHeight: CGFloat,
-        viewportHeight: CGFloat,
-        documentIsFlipped: Bool
-    ) -> CGFloat {
-        let maximumOrigin = max(0, contentHeight - viewportHeight)
-        let target = documentIsFlipped
-            ? contentHeight - snapshotDistanceFromEnd - viewportHeight
-            : snapshotDistanceFromEnd
-        return min(max(0, target), maximumOrigin)
-    }
-
     /// Clip-view origin that places the requested document edge at the viewport edge.
     /// Keeping this geometry pure makes AppKit content-growth following testable.
     static func pinnedOriginY(
@@ -1535,7 +1503,9 @@ enum TranscriptExactTopTrigger {
     ///   - state: persistent edge state, owned by the coordinator (never written
     ///     into SwiftUI state).
     ///   - distanceFromDocumentStart: `StickToBottomLogic.distanceFromDocumentStart`.
-    ///   - enabled: false while pinned or when the effective start page is 0.
+    ///   - enabled: false while pinned, when the effective start page is 0, or
+    ///     before the user has actually scrolled in this attachment (attach seed
+    ///     and programmatic bottom scrolls must never auto-load).
     ///   - threshold: top epsilon; defaults to `exactTopThreshold`.
     /// - Returns: `true` exactly once per `false → true` exact-top edge while enabled.
     static func step(
@@ -1554,12 +1524,61 @@ enum TranscriptExactTopTrigger {
     }
 }
 
+/// Pure geometry for the internal-anchor prepend compensation (unit-tested).
+///
+/// The prepend signal is not the total document height (bottom extras — the
+/// streaming item, the return-to-latest button, token appends — churn the
+/// document end while a page loads). Instead the coordinator tracks a stable
+/// zero-height NSView placed *after* the settled window rows and *before* all
+/// bottom extras: prepending an older page is the only thing that moves it
+/// along the document coordinate. The clip origin follows the anchor's
+/// displacement exactly, which is valid in both flipped and non-flipped
+/// documents (the delta is computed in document coordinates).
+enum PrependAnchorCompensation {
+    /// Anchor movement below this is float noise, not a laid-out prepend.
+    static let applyEpsilon: CGFloat = 0.5
+
+    /// - Parameters:
+    ///   - clipOriginYBefore: clip origin captured before the prepend.
+    ///   - anchorYBefore/anchorYNow: internal anchor position (document
+    ///     coordinates) before/after the prepend layout.
+    ///   - contentHeight/viewportHeight: used only to clamp the result to the
+    ///     legal scroll range — never as the movement source.
+    /// - Returns: the origin that keeps the pre-prepend viewport stable, or
+    ///   `nil` when the anchor has not moved (settled rows not yet laid out; a
+    ///   bottom-only document change must never apply).
+    static func targetOriginY(
+        clipOriginYBefore: CGFloat,
+        anchorYBefore: CGFloat,
+        anchorYNow: CGFloat,
+        contentHeight: CGFloat,
+        viewportHeight: CGFloat
+    ) -> CGFloat? {
+        let delta = anchorYNow - anchorYBefore
+        guard abs(delta) > applyEpsilon else { return nil }
+        let maximumOrigin = max(0, contentHeight - viewportHeight)
+        return min(max(0, clipOriginYBefore + delta), maximumOrigin)
+    }
+}
+
+/// Pure one-shot cleanup decision for the pending-prepend safety timer
+/// (unit-tested). The timer captures the token of the pending it was armed for;
+/// a newer pending (new arm) or a cleared state must never be touched by an old
+/// timer.
+enum PendingCleanupGuard {
+    static func shouldClear(timerToken: Int, currentToken: Int, hasPending: Bool) -> Bool {
+        hasPending && timerToken == currentToken
+    }
+}
+
 /// 挂到 ScrollView 贴底锚点：用户手势更新 pin 状态；内容增高时，如果仍
 /// pinned，直接移动 AppKit clip view。这样流式增长不再触发 SwiftUI scrollTo，
-/// 也不会把新的状态写回动态高度布局图。同一定位还承担历史顶部加载：仅在
-/// 真正到达 document 顶部（exact epsilon）时触发 `onReachedTop`（见
-/// `TranscriptExactTopTrigger`），并在 prepend 布局落定后补偿 clip offset，
-/// 让视口到最新端的距离与 prepend 前完全一致。
+/// 也不会把新的状态写回动态高度布局图。这个 view 本身同时是稳定的内部
+/// anchor：它位于 settled rows 之后、所有 bottom extras 之前，prepend 旧页
+/// 只会把它沿 document 坐标移动（见 `PrependAnchorCompensation`）。历史
+/// 顶部加载仅在真正到达 document 顶部（exact epsilon）且本 attachment 已
+/// 观察到用户滚动时触发 `onReachedTop`（见 `TranscriptExactTopTrigger`），
+/// 并在 prepend 布局落定后按 anchor 位移补偿 clip offset。
 struct StickToBottomTracker: NSViewRepresentable {
     @Binding var isPinned: Bool
     var threshold: CGFloat = StickToBottomLogic.rePinThreshold
@@ -1568,11 +1587,12 @@ struct StickToBottomTracker: NSViewRepresentable {
     /// start page is above 0. While false the exact-top edge state is reset and
     /// `onReachedTop` never fires.
     var topLoadingEnabled: Bool = false
-    /// Fired exactly once per false→true exact-top edge while `topLoadingEnabled`.
-    /// Returns `true` when the SwiftUI side actually prepended one older page
-    /// (start page decremented); `false` when pinned or no older page exists.
-    /// The coordinator snapshots the clip geometry *before* the callback and
-    /// restores the viewport's distance-from-end after the prepend layout lands.
+    /// Fired exactly once per false→true exact-top edge while `topLoadingEnabled`
+    /// and the user has scrolled in this attachment. Returns `true` when the
+    /// SwiftUI side actually prepended one older page (start page decremented);
+    /// `false` when pinned or no older page exists. The coordinator snapshots
+    /// the anchor/clip geometry *before* the callback and restores the viewport
+    /// from the anchor displacement after the prepend layout lands.
     var onReachedTop: (() -> Bool)? = nil
 
     func makeCoordinator() -> Coordinator {
@@ -1595,6 +1615,9 @@ struct StickToBottomTracker: NSViewRepresentable {
         context.coordinator.isPinned = $isPinned
         context.coordinator.threshold = threshold
         context.coordinator.pinEdge = pinEdge
+        // The representable's own view is the stable internal anchor; refresh
+        // the weak reference every body pass (a rebind may replace it).
+        context.coordinator.anchorView = nsView
         // Refresh the history-top gate and callback on every body pass so a
         // session rebind/switch can never leave a stale closure behind.
         let loadingGateChanged = context.coordinator.topLoadingEnabled != topLoadingEnabled
@@ -1608,7 +1631,7 @@ struct StickToBottomTracker: NSViewRepresentable {
         // deliberately keeps the just-armed snapshot so that last prepend still
         // compensates.
         if context.coordinator.isPinned.wrappedValue {
-            context.coordinator.cancelPendingCompensation()
+            context.coordinator.clearPendingCompensation()
         }
         // The gate just flipped (e.g. the user unpinned while already at the
         // document top, or the start page reached 0): re-evaluate the exact-top
@@ -1638,6 +1661,11 @@ struct StickToBottomTracker: NSViewRepresentable {
         /// when the SwiftUI side actually prepended a page.
         var onReachedTop: (() -> Bool)?
         private weak var scrollView: NSScrollView?
+        /// The representable's own NSView. Placed after the settled window rows
+        /// and before all bottom extras, it is the stable internal anchor: only
+        /// a prepend of older pages moves it along the document coordinate. Weak
+        /// — SwiftUI owns it; identity-compared against the pending snapshot.
+        weak var anchorView: NSView?
         /// Exposed so `updateNSView` can re-apply overlay style after SwiftUI resets it.
         var attachedScrollView: NSScrollView? { scrollView }
         private var liveScrollObs: NSObjectProtocol?
@@ -1660,30 +1688,43 @@ struct StickToBottomTracker: NSViewRepresentable {
         private var topEdgeEvaluationScheduled = false
         /// Edge state owned by the coordinator; scroll positions never enter SwiftUI.
         private var topEdgeState = TranscriptExactTopTrigger.State()
-        /// Snapshot of the clip/document geometry taken immediately before a
-        /// SwiftUI one-page prepend. Applied once the prepend layout grows the
-        /// document, then cleared. A live pending blocks new exact-top edges.
+        /// Snapshot taken immediately before a SwiftUI one-page prepend. The
+        /// compensation signal is the internal anchor's displacement in document
+        /// coordinates — never the total document height, which bottom extras
+        /// (streaming item / return button / token appends) churn while a page
+        /// loads. A live pending blocks new exact-top edges.
         private struct PendingPrependSnapshot {
-            /// Document identity: a replaced documentView must never receive a
-            /// stale snapshot's compensation.
+            /// Identity guards: a stale snapshot must never move a newer
+            /// session's scroll view, document, or anchor.
+            let scrollView: NSScrollView
             let document: NSView
+            let anchor: NSView
             /// Bumped on detach: queued/stale snapshots die with their session.
             let generation: Int
-            let documentHeight: CGFloat
-            let viewportHeight: CGFloat
+            /// Anchor position (document coordinates) before the prepend.
+            let anchorYBefore: CGFloat
             /// Clip origin at snapshot time; a user scroll during the pending
             /// window supersedes the compensation.
-            let originY: CGFloat
-            /// The invariant preserved by the compensation.
-            let distanceFromDocumentEnd: CGFloat
-            let documentIsFlipped: Bool
+            let clipOriginYBefore: CGFloat
         }
         /// Set exactly when a prepend is in flight. Cleared by compensation,
-        /// session/document identity guards, gate flips, a user scroll, or the
-        /// one-shot safety timer. Never survives a session switch.
+        /// identity guards, re-pin, a user scroll, or the one-shot safety timer.
+        /// Never survives a session switch.
         private var pendingPrepend: PendingPrependSnapshot?
         /// One-shot safety timer per pending snapshot; never a repeat loader.
         private var pendingCleanupScheduled = false
+        /// Monotonic token for the safety timer: bumped on every arm/clear, so
+        /// an old timer can never clear a newer pending.
+        private var pendingCleanupToken = 0
+        /// The user must actually scroll in this attachment before the exact-top
+        /// edge may load anything. Attach seed, initial layout, and programmatic
+        /// bottom scrolls must never auto-prepend.
+        private var hasObservedUserScroll = false
+        /// True once SwiftUI has laid out the anchor at least once (frame/bounds
+        /// notification observed), so a snapshot never reads a pre-layout zero.
+        private var anchorLayoutObserved = false
+        private var anchorFrameObs: NSObjectProtocol?
+        private var anchorBoundsObs: NSObjectProtocol?
         /// Invalidates a queued bounds update if this coordinator is detached and
         /// later attached to another scroll view before the next main-loop turn.
         private var boundsUpdateGeneration = 0
@@ -1725,6 +1766,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                     queue: .main
                 ) { [weak self] _ in
                     guard self?.scrollView?.window?.inLiveResize != true else { return }
+                    self?.hasObservedUserScroll = true
                     self?.updatePinFromUserScroll(userLiveScroll: true)
                     self?.scheduleTopEdgeEvaluation()
                 }
@@ -1734,6 +1776,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                     queue: .main
                 ) { [weak self] _ in
                     guard self?.scrollView?.window?.inLiveResize != true else { return }
+                    self?.hasObservedUserScroll = true
                     self?.updatePinFromUserScroll(userLiveScroll: true)
                     self?.scheduleTopEdgeEvaluation()
                 }
@@ -1762,6 +1805,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                     // can pull the thumb back. Bounds notifications are high
                     // frequency, so coalesce them to one state-machine entry per
                     // runloop.
+                    self.hasObservedUserScroll = true
                     self.scheduleKnobDragPinUpdate()
                 }
                 if let document = sv.documentView {
@@ -1784,10 +1828,35 @@ struct StickToBottomTracker: NSViewRepresentable {
                         self?.scheduleTopEdgeEvaluation()
                     }
                 }
+                // The anchor view itself: its frame is the prepend signal. SwiftUI
+                // moves it exactly when the settled rows re-lay out; bottom-only
+                // changes never do.
+                view.postsFrameChangedNotifications = true
+                view.postsBoundsChangedNotifications = true
+                anchorFrameObs = center.addObserver(
+                    forName: NSView.frameDidChangeNotification,
+                    object: view,
+                    queue: .main
+                ) { [weak self] _ in
+                    guard let self else { return }
+                    self.anchorLayoutObserved = true
+                    self.scheduleTopEdgeEvaluation()
+                }
+                anchorBoundsObs = center.addObserver(
+                    forName: NSView.boundsDidChangeNotification,
+                    object: view,
+                    queue: .main
+                ) { [weak self] _ in
+                    guard let self else { return }
+                    self.anchorLayoutObserved = true
+                    self.scheduleTopEdgeEvaluation()
+                }
                 // 安装时只允许「确认在底部 → pin」，避免布局未完成时误 unpin
                 updatePinFromUserScroll(allowUnpin: false)
                 // Seed the exact-top edge with the current geometry; later
-                // frame/bounds notifications re-evaluate it continuously.
+                // frame/bounds notifications re-evaluate it continuously. The
+                // trigger itself is gated on `hasObservedUserScroll`, so this
+                // seed can never auto-prepend.
                 scheduleTopEdgeEvaluation()
             } else if attachAttempts < 8 {
                 attachAttempts += 1
@@ -1804,19 +1873,26 @@ struct StickToBottomTracker: NSViewRepresentable {
             if let boundsObs { center.removeObserver(boundsObs) }
             if let documentFrameObs { center.removeObserver(documentFrameObs) }
             if let documentBoundsObs { center.removeObserver(documentBoundsObs) }
+            if let anchorFrameObs { center.removeObserver(anchorFrameObs) }
+            if let anchorBoundsObs { center.removeObserver(anchorBoundsObs) }
             liveScrollObs = nil
             endScrollObs = nil
             boundsObs = nil
             documentFrameObs = nil
             documentBoundsObs = nil
+            anchorFrameObs = nil
+            anchorBoundsObs = nil
             scrollView = nil
             pinWriteScheduled = false
             pendingPinValue = nil
             knobDragUpdateScheduled = false
             contentFollowScheduled = false
             topEdgeEvaluationScheduled = false
+            hasObservedUserScroll = false
+            anchorLayoutObserved = false
             pendingPrepend = nil
             pendingCleanupScheduled = false
+            pendingCleanupToken += 1
             boundsUpdateGeneration += 1
         }
 
@@ -1862,98 +1938,116 @@ struct StickToBottomTracker: NSViewRepresentable {
                 contentHeight: doc.bounds.height,
                 documentIsFlipped: doc.isFlipped
             )
+            // `hasObservedUserScroll` gates the edge: attach seed, initial
+            // layout, and programmatic bottom scrolls must never auto-prepend.
             if TranscriptExactTopTrigger.step(
                 state: &topEdgeState,
                 distanceFromDocumentStart: distance,
-                enabled: topLoadingEnabled
+                enabled: topLoadingEnabled && hasObservedUserScroll
             ) {
                 beginHistoryPrepend(sv: sv, doc: doc)
             }
         }
 
-        /// Snapshot the clip/document geometry *before* the SwiftUI prepend, then
+        /// Snapshot the anchor/clip geometry *before* the SwiftUI prepend, then
         /// ask the SwiftUI side to decrement the oldest loaded page. Only a `true`
         /// answer (a page was actually prepended) arms the pending compensation;
         /// `false` (pinned meanwhile / no older page) leaves no pending at all.
+        /// If the internal anchor has not been laid out yet, the page still loads
+        /// but without compensation.
         private func beginHistoryPrepend(sv: NSScrollView, doc: NSView) {
-            let visible = sv.documentVisibleRect
-            let snapshot = PendingPrependSnapshot(
-                document: doc,
-                generation: boundsUpdateGeneration,
-                documentHeight: doc.bounds.height,
-                viewportHeight: sv.contentView.bounds.height,
-                originY: visible.minY,
-                distanceFromDocumentEnd: StickToBottomLogic.distanceFromDocumentEnd(
-                    visible: visible,
-                    contentHeight: doc.bounds.height,
-                    documentIsFlipped: doc.isFlipped
-                ),
-                documentIsFlipped: doc.isFlipped
-            )
+            guard let anchor = anchorView else {
+                _ = onReachedTop?()
+                return
+            }
+            let anchorY = anchor.convert(anchor.bounds, to: doc).minY
+            // A pre-layout zero frame is not a usable anchor position.
+            let anchorUsable = anchorLayoutObserved
+                || (anchorY.isFinite && abs(anchorY) > 0.5)
             guard onReachedTop?() == true else { return }
-            pendingPrepend = snapshot
+            guard anchorUsable else { return }
+            pendingPrepend = PendingPrependSnapshot(
+                scrollView: sv,
+                document: doc,
+                anchor: anchor,
+                generation: boundsUpdateGeneration,
+                anchorYBefore: anchorY,
+                clipOriginYBefore: sv.contentView.bounds.origin.y
+            )
             schedulePendingCleanup()
         }
 
-        /// Once the prepend layout has grown the document, move the clip origin
-        /// so the distance from the newest edge matches the pre-prepend snapshot
-        /// exactly (flipped: origin = height − distance − viewport; non-flipped:
-        /// origin = distance), then clear the pending state. Session/document
-        /// identity guards and a user-scroll guard abort instead of yanking a
-        /// newer session or fighting the wheel.
+        /// Once the prepend layout has moved the internal anchor, move the clip
+        /// origin by exactly the anchor's document-coordinate displacement, then
+        /// clear the pending state. The anchor sits after the settled rows, so
+        /// bottom churn (streaming item toggling, return button, token appends)
+        /// can never pollute the delta. Session/document/anchor identity guards
+        /// and a user-scroll guard abort instead of yanking a newer session or
+        /// fighting the wheel.
         private func applyPendingCompensation(sv: NSScrollView, doc: NSView) {
             guard let pending = pendingPrepend else { return }
-            // A stale snapshot from a previous session/document must never move
-            // the current scroll view.
+            // A stale snapshot from a previous session/document/anchor must
+            // never move the current scroll view.
             guard pending.generation == boundsUpdateGeneration,
-                  pending.document === doc else {
-                pendingPrepend = nil
+                  pending.scrollView === sv,
+                  pending.document === doc,
+                  pending.anchor === anchorView else {
+                clearPendingCompensation()
                 return
             }
             let clip = sv.contentView
             // The user moved the viewport while the prepend was in flight: their
             // gesture supersedes the snapshot — never yank them back.
-            if abs(clip.bounds.origin.y - pending.originY) > 4 {
-                pendingPrepend = nil
+            if abs(clip.bounds.origin.y - pending.clipOriginYBefore) > 4 {
+                clearPendingCompensation()
                 return
             }
-            let newHeight = doc.bounds.height
-            // Prepend layout has not grown the document yet: keep waiting.
-            // Unrelated frames and streaming body passes must not clear the
-            // snapshot (the one-shot safety timer covers a never-growing page).
-            guard newHeight > pending.documentHeight + 0.5 else { return }
-            let targetY = StickToBottomLogic.restoredOriginY(
-                snapshotDistanceFromEnd: pending.distanceFromDocumentEnd,
-                contentHeight: newHeight,
-                viewportHeight: clip.bounds.height,
-                documentIsFlipped: pending.documentIsFlipped
-            )
+            let anchorYNow = pending.anchor.convert(pending.anchor.bounds, to: doc).minY
+            guard let targetY = PrependAnchorCompensation.targetOriginY(
+                clipOriginYBefore: pending.clipOriginYBefore,
+                anchorYBefore: pending.anchorYBefore,
+                anchorYNow: anchorYNow,
+                contentHeight: doc.bounds.height,
+                viewportHeight: clip.bounds.height
+            ) else {
+                // Anchor has not moved: the settled rows are not laid out yet
+                // (or only bottom extras changed). Keep waiting — the one-shot
+                // safety timer covers a never-moving anchor.
+                return
+            }
             if abs(clip.bounds.origin.y - targetY) > 0.5 {
                 clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: targetY))
                 sv.reflectScrolledClipView(clip)
             }
-            pendingPrepend = nil
+            clearPendingCompensation()
         }
 
-        /// Gate flipped to disabled (re-pinned / no older page left): drop any
-        /// pending snapshot so a later browsing session starts clean.
-        func cancelPendingCompensation() {
+        /// Drop the pending snapshot and reset the safety-timer state so a later
+        /// browsing session (or the next pending) starts clean. Bumping the
+        /// cleanup token invalidates any in-flight old timer.
+        func clearPendingCompensation() {
             pendingPrepend = nil
+            pendingCleanupScheduled = false
+            pendingCleanupToken += 1
         }
 
-        /// One-shot safety net per pending snapshot: if the prepend layout never
-        /// grows the document, the snapshot must not linger forever or the
-        /// exact-top edge would never re-arm. Not a repeat loader — a fresh
-        /// exact-top arrival starts a new cycle.
+        /// One-shot safety net per pending snapshot: if the anchor never moves
+        /// (prepend layout never lands), the snapshot must not linger forever or
+        /// the exact-top edge would never re-arm. Token-guarded — an old timer
+        /// can never clear a newer pending, and each arm schedules its own timer.
         private func schedulePendingCleanup() {
-            guard !pendingCleanupScheduled else { return }
             pendingCleanupScheduled = true
+            pendingCleanupToken += 1
             let generation = boundsUpdateGeneration
+            let token = pendingCleanupToken
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 guard let self, self.boundsUpdateGeneration == generation else { return }
-                self.pendingCleanupScheduled = false
-                if self.pendingPrepend != nil {
-                    self.pendingPrepend = nil
+                if PendingCleanupGuard.shouldClear(
+                    timerToken: token,
+                    currentToken: self.pendingCleanupToken,
+                    hasPending: self.pendingPrepend != nil
+                ) {
+                    self.clearPendingCompensation()
                 }
             }
         }

@@ -165,4 +165,32 @@ final class TranscriptExactTopTriggerTests: XCTestCase {
             )
         )
     }
+
+    func testAttachSeedAndProgrammaticScrollsCannotAutoLoad() {
+        // The coordinator passes `enabled: topLoadingEnabled && hasObservedUserScroll`:
+        // an attachment that has not yet observed a real user scroll (attach seed,
+        // initial layout, programmatic bottom scrolls) behaves exactly like a
+        // disabled gate — even at the very top it must not fire, and it resets
+        // the state so the first real user scroll to the top fires afresh.
+        var state = TranscriptExactTopTrigger.State(isAtExactTop: true)
+        for _ in 0..<3 {
+            XCTAssertFalse(
+                TranscriptExactTopTrigger.step(
+                    state: &state,
+                    distanceFromDocumentStart: 0,
+                    enabled: false
+                ),
+                "no user scroll observed yet: seed evaluations must never prepend"
+            )
+            XCTAssertFalse(state.isAtExactTop)
+        }
+        // The user scrolls (wheel/trackpad/knob) and reaches the top: fires once.
+        XCTAssertTrue(
+            TranscriptExactTopTrigger.step(
+                state: &state,
+                distanceFromDocumentStart: 0,
+                enabled: true
+            )
+        )
+    }
 }

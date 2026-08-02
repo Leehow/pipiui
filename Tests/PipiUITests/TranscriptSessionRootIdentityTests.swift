@@ -393,22 +393,75 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         // the enum is declared before the tracker struct).
         XCTAssertTrue(source.contains("exactTopThreshold"))
         XCTAssertFalse(source.contains("nearTopThreshold"))
-        // Pending prepend compensation: snapshot before, restore after.
+        // Pending prepend compensation: the stable internal anchor displacement
+        // (never the document height — bottom churn must not pollute the delta).
         XCTAssertTrue(tracker.contains("PendingPrependSnapshot"))
-        XCTAssertTrue(tracker.contains("distanceFromDocumentEnd"))
-        XCTAssertTrue(tracker.contains("restoredOriginY"))
+        XCTAssertTrue(tracker.contains("anchorYBefore"))
+        XCTAssertTrue(tracker.contains("clipOriginYBefore"))
+        XCTAssertTrue(tracker.contains("PrependAnchorCompensation.targetOriginY"))
         XCTAssertTrue(tracker.contains("applyPendingCompensation"))
         XCTAssertTrue(tracker.contains("reflectScrolledClipView"))
         XCTAssertTrue(tracker.contains("clip.scroll(to:"))
-        XCTAssertTrue(tracker.contains("cancelPendingCompensation"))
-        // Session/document identity guards clear stale snapshots.
+        XCTAssertTrue(tracker.contains("clearPendingCompensation"))
+        XCTAssertFalse(source.contains("distanceFromDocumentEnd"))
+        XCTAssertFalse(source.contains("restoredOriginY"))
+        // The prepend signal is the anchor's document-coordinate displacement.
+        XCTAssertTrue(tracker.contains("anchor.convert(anchor.bounds, to: doc).minY"))
+        // Identity guards clear stale snapshots on session/document/anchor change.
+        XCTAssertTrue(tracker.contains("pending.scrollView === sv"))
         XCTAssertTrue(tracker.contains("pending.document === doc"))
+        XCTAssertTrue(tracker.contains("pending.anchor === anchorView"))
         XCTAssertTrue(tracker.contains("boundsUpdateGeneration"))
+        // User-scroll gating: attach seed / programmatic scrolls never auto-load.
+        XCTAssertTrue(tracker.contains("hasObservedUserScroll"))
+        XCTAssertTrue(tracker.contains("enabled: topLoadingEnabled && hasObservedUserScroll"))
+        // The anchor view itself is observed for frame/bounds changes.
+        XCTAssertTrue(tracker.contains("anchorFrameObs"))
+        XCTAssertTrue(tracker.contains("anchorLayoutObserved"))
         // Dismantle must detach and drop pending state.
         XCTAssertTrue(tracker.contains("static func dismantleNSView"))
         XCTAssertTrue(tracker.contains("coordinator.detach()"))
-        // The one-shot safety net is not a repeat loader.
+        // The one-shot safety net is token-guarded, not a repeat loader.
         XCTAssertTrue(tracker.contains("schedulePendingCleanup"))
+        XCTAssertTrue(tracker.contains("PendingCleanupGuard.shouldClear"))
+        XCTAssertTrue(tracker.contains("pendingCleanupToken"))
+    }
+
+    func testTopAnchorSitsAfterSettledRowsBeforeBottomExtras() throws {
+        let source = try chatDetailSource()
+        let start = try XCTUnwrap(
+            source.range(of: "private struct StreamingTranscriptRows: View")?.lowerBound
+        )
+        let end = try XCTUnwrap(
+            source.range(
+                of: "private struct TranscriptLoadingOverlay: View",
+                range: start..<source.endIndex
+            )?.lowerBound
+        )
+        let transcript = String(source[start..<end])
+
+        // The tracker/anchor must sit after the settled rows and before every
+        // bottom extra, so its document-coordinate displacement can only come
+        // from a prepend of older pages.
+        let rows = try XCTUnwrap(transcript.range(of: "ForEach(presentation.rows")?.lowerBound)
+        let tracker = try XCTUnwrap(transcript.range(of: "StickToBottomTracker(")?.lowerBound)
+        let streaming = try XCTUnwrap(
+            transcript.range(of: "let streamingItem = streaming.streamingItem")?.lowerBound
+        )
+        let returnButton = try XCTUnwrap(transcript.range(of: "返回最新消息")?.lowerBound)
+        let waiting = try XCTUnwrap(
+            transcript.range(of: "WaitingPlaceholderView(")?.lowerBound
+        )
+        let bottomSentinel = try XCTUnwrap(
+            transcript.range(of: ".id(transcriptID(\"bottom\"))")?.lowerBound
+        )
+        XCTAssertLessThan(rows, tracker, "anchor must follow the settled rows")
+        XCTAssertLessThan(tracker, streaming, "anchor must precede the streaming item")
+        XCTAssertLessThan(tracker, waiting, "anchor must precede the waiting placeholder")
+        XCTAssertLessThan(tracker, returnButton, "anchor must precede the return button")
+        XCTAssertLessThan(tracker, bottomSentinel, "anchor must precede the bottom sentinel")
+        // The sentinel no longer hosts the tracker in its background.
+        XCTAssertFalse(transcript.contains(".background {\n                    // Always mounted"))
     }
 
     func testStreamingFollowUsesAppKitContentGrowthInsteadOfObjectWillChangeScrollTo() throws {
