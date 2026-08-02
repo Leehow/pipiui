@@ -187,10 +187,14 @@ final class ShortTranscriptGravityTests: XCTestCase {
         XCTAssertTrue(content.contains(".onPreferenceChange(TranscriptViewportHeightKey.self)"))
 
         // Unrelated scroll-identity guarantees stay intact: the top-id anchor,
-        // the default bottom anchor, and the per-session scroll root must not be
-        // weakened by the gravity change.
+        // the explicit bottom jump, and the per-session scroll root must not be
+        // weakened by the gravity change. The unconditional default bottom
+        // anchor is gone — bottom pinning is owned by the explicit
+        // `scrollTo("bottom")` + StickToBottomTracker, so it cannot fight the
+        // user while browsing history (scroll-oscillation fix).
         XCTAssertTrue(content.contains(".scrollPosition(id: $scrollTopID, anchor: .top)"))
-        XCTAssertTrue(content.contains("defaultScrollAnchor(.bottom)"))
+        XCTAssertFalse(content.contains("defaultScrollAnchor"))
+        XCTAssertTrue(source.contains("scrollTo(transcriptID(\"bottom\"), anchor: .bottom)"))
         XCTAssertTrue(content.contains(".id(TranscriptSessionRootIdentity(sessionKey: session.bridgeRoutingKey))"))
     }
 
