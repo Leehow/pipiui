@@ -1266,8 +1266,9 @@ struct SettingsSheet: View {
     }
 
     /// reload 的同步 I/O 前缀快照（后台线程执行，主线程只赋值）。
-    /// 注意：不再调 SubagentModelSettings.syncJSONFile() / ToolSkillSettings.syncJSONFile()——
-    /// 它们的 setter 在真正编辑时已各自同步；reload 无编辑场景不应重写文件。
+    /// SubagentModelSettings.syncJSONFile() is intentionally re-run here to heal
+    /// UD → JSON desync (saved-not-read). ToolSkillSettings is not re-synced on
+    /// reload — its setters already mirror on edit.
     private struct ReloadSnapshot {
         var credentials: [PiAuthStore.CredentialInfo]
         var hiddenIds: Set<String>
@@ -1292,6 +1293,8 @@ struct SettingsSheet: View {
                 ProviderEnvMap.envVars(forProvider: pid).contains { envStore.isConfigured(forKey: $0) }
             }
         )
+        // Heal Application Support mirror from UserDefaults before the UI reads it.
+        SubagentModelSettings.syncJSONFile()
         return ReloadSnapshot(
             credentials: credentials,
             hiddenIds: ModelVisibility.hiddenModelIds(),

@@ -364,10 +364,34 @@ interface SubagentModelOverride {
 	thinking?: string;
 }
 
+/** Normalize a parsed overrides object (file or spawn-time env snapshot). */
+function parseSubagentModelOverrides(parsed: unknown): Record<string, SubagentModelOverride> {
+	const result: Record<string, SubagentModelOverride> = {};
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return result;
+	for (const [agentName, value] of Object.entries(parsed as Record<string, unknown>)) {
+		if (typeof value === "string" && value.trim()) {
+			result[agentName] = { model: value.trim() };
+		} else if (value && typeof value === "object" && !Array.isArray(value)) {
+			const candidate = value as { model?: unknown; thinking?: unknown };
+			if (typeof candidate.model === "string" && candidate.model.trim()) {
+				const thinking =
+					typeof candidate.thinking === "string" && candidate.thinking.trim()
+						? candidate.thinking.trim()
+						: undefined;
+				result[agentName] = { model: candidate.model.trim(), ...(thinking ? { thinking } : {}) };
+			}
+		}
+	}
+	return result;
+}
+
 /** Hot-read PipiUI settings JSON (UserDefaults mirror). Missing / empty = follow main.
  *
- * Legacy values are model strings. New values are `{ model, thinking? }`; normalizing
- * both shapes here lets a running extension immediately see settings saved by the app.
+ * Prefer the Application Support file when it has any override. If the file is
+ * missing, unreadable, or `{}` (dual-store desync / mid-session wipe), fall back
+ * to the spawn-time `PIPIUI_SUBAGENT_MODELS_JSON` snapshot injected by Swift.
+ *
+ * Legacy values are model strings. New values are `{ model, thinking? }`.
  */
 function loadSubagentModelOverrides(): Record<string, SubagentModelOverride> {
 	const file =
@@ -375,27 +399,18 @@ function loadSubagentModelOverrides(): Record<string, SubagentModelOverride> {
 		path.join(os.homedir(), "Library/Application Support/PipiUI/subagent-models.json");
 	try {
 		const raw = fs.readFileSync(file, "utf-8");
-		const parsed = JSON.parse(raw) as unknown;
-		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-			const result: Record<string, SubagentModelOverride> = {};
-			for (const [agentName, value] of Object.entries(parsed)) {
-				if (typeof value === "string" && value.trim()) {
-					result[agentName] = { model: value.trim() };
-				} else if (value && typeof value === "object" && !Array.isArray(value)) {
-					const candidate = value as { model?: unknown; thinking?: unknown };
-					if (typeof candidate.model === "string" && candidate.model.trim()) {
-						const thinking =
-							typeof candidate.thinking === "string" && candidate.thinking.trim()
-								? candidate.thinking.trim()
-								: undefined;
-						result[agentName] = { model: candidate.model.trim(), ...(thinking ? { thinking } : {}) };
-					}
-				}
-			}
-			return result;
-		}
+		const fromFile = parseSubagentModelOverrides(JSON.parse(raw) as unknown);
+		if (Object.keys(fromFile).length > 0) return fromFile;
 	} catch {
-		// absent or unreadable → all follow main
+		// absent or unreadable → try env snapshot
+	}
+	const snap = process.env.PIPIUI_SUBAGENT_MODELS_JSON;
+	if (snap && snap.trim()) {
+		try {
+			return parseSubagentModelOverrides(JSON.parse(snap) as unknown);
+		} catch {
+			// malformed snapshot
+		}
 	}
 	return {};
 }

@@ -231,6 +231,10 @@ enum PipiSpawnAssembly {
             }
             env["PIPIUI_SUBAGENT_MODELS_FILE"] =
                 SubagentModelSettings.overridesFileURL().path
+            // Spawn-time snapshot so Node can still resolve overrides if the
+            // hot-read JSON is empty/wiped mid-session after a bad sync.
+            env["PIPIUI_SUBAGENT_MODELS_JSON"] =
+                SubagentModelSettings.jsonString()
             env["PIPIUI_MAIN_MODEL_FILE"] =
                 SubagentModelSettings.mainModelFileURL().path
             if let mid = input.mainModelId, !mid.isEmpty {

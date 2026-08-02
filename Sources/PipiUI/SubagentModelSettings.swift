@@ -160,7 +160,12 @@ enum SubagentModelSettings {
             )
         }
         defaults.set(encodeForDefaults(map), forKey: defaultsKey)
-        syncJSONFile(map: map, fileManager: fileManager, to: url)
+        // Only mirror into Application Support for the live app defaults domain
+        // (avoid test suites / wrong domains clobbering production JSON to `{}`).
+        // Tests that need a file pass an explicit `to:` URL.
+        if url != nil || defaults === UserDefaults.standard {
+            syncJSONFile(map: map, defaults: defaults, fileManager: fileManager, to: url)
+        }
     }
 
     /// Resolve the model id that should be used for `agentName`.
@@ -183,20 +188,34 @@ enum SubagentModelSettings {
     }
 
     /// Ensure the hot-read JSON matches UserDefaults (call on launch / after edits).
+    /// When `to` is nil (production Application Support path), only `.standard` defaults
+    /// may write — non-standard empty domains must never clobber a real overrides file.
     static func syncJSONFile(
         map: [String: Override]? = nil,
         defaults: UserDefaults = .standard,
         fileManager: FileManager = .default,
         to url: URL? = nil
     ) {
+        if url == nil && defaults !== UserDefaults.standard {
+            return
+        }
         let payload = map.map(encodeForDefaults) ?? serializedPayload(defaults: defaults)
         let target = url ?? overridesFileURL(fileManager: fileManager)
         let dir = target.deletingLastPathComponent()
-        try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
-        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) else {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.prettyPrinted, .sortedKeys]
+        ) else {
             return
         }
-        try? data.write(to: target, options: .atomic)
+        do {
+            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+            try data.write(to: target, options: .atomic)
+        } catch {
+            // Atomic write can fail on some volumes; fall back once without options.
+            try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? data.write(to: target)
+        }
     }
 
     /// Encode overrides for tests / diagnostics.
