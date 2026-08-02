@@ -229,13 +229,14 @@ enum TokenUsageStats {
     // MARK: - Per-session cache totals (resume rehydration)
 
     /// Footer/popover values reconstructed from persisted main-chat turns for one session.
-    /// `lastTurnUsage` and `contextTokens` come from the newest record by timestamp;
-    /// aggregate fields cover every valid main-chat record for that same session.
+    /// `contextTokens` comes from the newest record by timestamp; aggregate fields
+    /// (input/output/cacheRead/cacheWrite/cost) cover every valid main-chat record.
     struct SessionUsage {
+        var input = 0
+        var output = 0
         var cacheRead = 0
         var cacheWrite = 0
         var cost: Double = 0
-        var lastTurnUsage: TokenLedger.UsageSnapshot?
         var contextTokens: Int?
     }
 
@@ -261,7 +262,7 @@ enum TokenUsageStats {
         fileManager: FileManager = .default
     ) -> SessionUsage {
         var summary = SessionUsage()
-        var latest: (record: Record, contextTokens: Int?)?
+        var latestContext: (date: Date, contextTokens: Int?)?
 
         for url in urls {
             guard fileManager.fileExists(atPath: url.path),
@@ -275,27 +276,21 @@ enum TokenUsageStats {
                       (obj["channel"] as? String) == "main",
                       let record = parseLine(String(line)) else { continue }
 
+                summary.input += record.input
+                summary.output += record.output
                 summary.cacheRead += record.cacheRead
                 summary.cacheWrite += record.cacheWrite
                 summary.cost += record.cost
-                if latest == nil || record.date > latest!.record.date {
+                if latestContext == nil || record.date > latestContext!.date {
                     // Older ledgers may predate contextTokens. Do not invent a zero
                     // context value for the footer when that field was never written.
-                    latest = (record, obj["contextTokens"] as? Int)
+                    latestContext = (record.date, obj["contextTokens"] as? Int)
                 }
             }
         }
 
-        if let latest {
-            summary.lastTurnUsage = TokenLedger.UsageSnapshot(
-                input: latest.record.input,
-                output: latest.record.output,
-                cacheRead: latest.record.cacheRead,
-                cacheWrite: latest.record.cacheWrite,
-                cost: latest.record.cost,
-                contextTokens: latest.record.contextTokens
-            )
-            summary.contextTokens = latest.contextTokens
+        if let latestContext {
+            summary.contextTokens = latestContext.contextTokens
         }
         return summary
     }

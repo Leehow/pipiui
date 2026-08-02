@@ -32,10 +32,13 @@ final class SubagentNotificationTimingTests: XCTestCase {
         }
         // post-merge verify 合流窗口调小：合流逻辑不变，只是测试不用等 2 秒。
         SubagentStore.verifyCoalesceWindow = 0.02
+        // 完成判定延迟窗口调小：逻辑不变，只是测试不用等 50ms。
+        ChatSession.completionDeferWindow = 0.02
     }
 
     override func tearDown() {
         SubagentStore.verifyCoalesceWindow = 2.0
+        ChatSession.completionDeferWindow = 0.05
         TaskNotifier.shared.deliver = originalDeliver ?? { _ in }
         if let enabled = originalCompletionEnabled {
             TaskNotifierSettings.setCompletionEnabled(enabled)
@@ -512,6 +515,106 @@ final class SubagentNotificationTimingTests: XCTestCase {
         XCTAssertTrue(body.contains("②「失败任务2」"))
         XCTAssertTrue(body.contains("③「失败任务3」"))
         XCTAssertTrue(body.contains("需人工介入"))
+    }
+
+    // MARK: - 桥接合流队列：start 事件在途时不得提前发完成
+
+    /// 主 agent settle 先于子 agent start 事件（桥接合流队列）到达：
+    /// 不得把「还没有子 agent」误判为任务完成；start 应用后计入本轮，终态后补发一次。
+    func testQueuedSubagentStartAtSettleDefersCompletionUntilSubagentEnds() {
+        let session = makeSession()
+        session.handleEvent(J(["type": "agent_start"]))
+        // 子 agent 已派出，但 start 事件还停在合流队列（16ms 窗口）里。
+        session.subagents.enqueue(startEvent(id: "a1", title: "修复登录"))
+
+        settled(session)
+
+        XCTAssertTrue(delivered.isEmpty, "子 agent start 在途 → 不得发任务完成")
+
+        // 队列合流：start 应用 → 记入本轮（即使主会话已空闲）。
+        session.subagents.flushPendingAgentEvents()
+        XCTAssertTrue(delivered.isEmpty, "子 agent 已记入本轮但仍在运行 → 不得发任务完成")
+
+        session.subagents.handle(endEvent(id: "a1", ok: true))
+
+        XCTAssertEqual(delivered.count, 1, "子 agent 终态后补发一次完成通知")
+        XCTAssertEqual(delivered[0].kind, .completion)
+        XCTAssertTrue(delivered[0].body.contains("修复登录"))
+    }
+
+    /// 第一波子 agent 的 end 已应用、第二波 start 仍在合流队列：不得提前发完成；
+    /// 两波全部终态后整轮只发一次完成通知（点名两个子任务）。
+    func testQueuedStartOfNextWaveDoesNotFireCompletionEarly() {
+        let session = makeSession()
+        session.handleEvent(J(["type": "agent_start"]))
+        session.subagents.handle(startEvent(id: "a1", title: "修复登录"))
+        settled(session)
+        XCTAssertTrue(delivered.isEmpty)
+
+        // 第二波子 agent 的 start 事件停在队列里时，第一波 end 先应用。
+        session.subagents.enqueue(startEvent(id: "a2", title: "翻译文档"))
+        session.subagents.handle(endEvent(id: "a1", ok: true))
+        XCTAssertTrue(delivered.isEmpty, "a2 start 在途 → 不得提前发任务完成")
+
+        session.subagents.flushPendingAgentEvents()
+        XCTAssertTrue(delivered.isEmpty, "a2 已记入本轮但仍在运行 → 不得发任务完成")
+
+        session.subagents.handle(endEvent(id: "a2", ok: true))
+
+        XCTAssertEqual(delivered.count, 1, "全部终态后整轮只发一次完成通知")
+        XCTAssertEqual(delivered[0].kind, .completion)
+        XCTAssertTrue(delivered[0].body.contains("修复登录"))
+        XCTAssertTrue(delivered[0].body.contains("翻译文档"))
+    }
+
+    /// 合流队列里只有无关遥测（非 start）：延迟窗口过后仍要补发完成，不能卡死。
+    func testQueuedTelemetryDoesNotStickCompletionDeferral() async {
+        let session = makeSession()
+        session.handleEvent(J(["type": "agent_start"]))
+        session.subagents.enqueue(J([
+            "agentId": "ghost",
+            "kind": "update",
+            "activity": "…",
+            "output": "…",
+        ]))
+
+        settled(session)
+        XCTAssertTrue(delivered.isEmpty, "队列非空 → 不得立即判定完成")
+
+        session.subagents.flushPendingAgentEvents()
+        // 遥测不产生生命周期回调：只能靠延迟窗口重评。
+        try? await Task.sleep(nanoseconds: 80_000_000)
+
+        XCTAssertEqual(delivered.count, 1, "队列清空且无子 agent → 补发一次完成通知")
+        XCTAssertEqual(delivered[0].kind, .completion)
+    }
+
+    /// 真实 16ms auto-flush / 50ms recheck 定时关系（不手动 flush、不手动重评，跑真实定时器）：
+    /// start 在 settle 时已进入合流队列 → 16ms auto-flush 先把 start 应用（runningCount=1），
+    /// 50ms recheck 后运行（主队列 FIFO：flush 工作项先于 recheck 排入，顺序有保证）→
+    /// 看到的是已应用后的状态 → 记入本轮待发，绝不在子 agent 运行中提前发完成；end 后整轮只发一次。
+    /// 若有人把 recheck 提前到 flush 之前、或删掉「start 在队列中」的挂起判定，此测试会先于窗口误发。
+    func testRealFlushAndRecheckTimingNeverNotifiesBeforeRoundCloses() async {
+        let session = makeSession()
+        session.handleEvent(J(["type": "agent_start"]))
+        // 子 agent 已派出，start 进入真实 16ms 合流队列（auto-flush 定时器已排，不手动 flush）。
+        session.subagents.enqueue(startEvent(id: "a1", title: "修复登录"))
+
+        settled(session)
+        XCTAssertTrue(delivered.isEmpty, "start 尚在合流队列 → 不得发通知")
+
+        // 跑真实定时器：16ms auto-flush 应用 start；50ms recheck 判定「子 agent 仍在运行」→ 挂起。
+        // 睡眠 + run-loop 泵保证慢机器上两个定时器都已执行（recheck 依赖 flush 先跑，FIFO 有保证）。
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        XCTAssertTrue(delivered.isEmpty, "start 已应用、子 agent 仍在运行 → 50ms recheck 不得提前发完成")
+
+        session.subagents.handle(endEvent(id: "a1", ok: true))
+
+        XCTAssertEqual(delivered.count, 1, "子 agent 终态后整轮只发一次完成通知")
+        XCTAssertEqual(delivered[0].kind, .completion)
+        XCTAssertTrue(delivered[0].body.contains("修复登录"))
     }
 
     // MARK: - 终态聚合纯函数（文案）

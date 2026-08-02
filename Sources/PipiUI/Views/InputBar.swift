@@ -2089,26 +2089,18 @@ struct InputBar: View {
                     .foregroundStyle(.secondary)
             }
 
-            if let u = session.lastTurnUsage {
-                Divider()
-                Text("上一轮用量")
-                    .font(.caption.bold())
-                    .foregroundStyle(.secondary)
-                contextDetailRow("输入", TokenFormat.compact(u.input))
-                contextDetailRow("输出", TokenFormat.compact(u.output))
-                contextDetailRow("缓存读取", TokenFormat.compact(u.cacheRead))
-                let denom = u.input + u.cacheRead + u.cacheWrite
-                if denom > 0 {
-                    let hit = Double(u.cacheRead) / Double(denom)
-                    contextDetailRow("缓存命中率", "\(Int((hit * 100).rounded()))%")
-                }
-            }
-
             Divider()
             Text("本次会话")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
-            contextDetailRow("累计缓存读取", TokenFormat.compact(session.sessionCacheRead))
+            contextDetailRow("输入", TokenFormat.compact(session.sessionInput))
+            contextDetailRow("输出", TokenFormat.compact(session.sessionOutput))
+            contextDetailRow("缓存读取", TokenFormat.compact(session.sessionCacheRead))
+            let cacheDenom = session.sessionInput + session.sessionCacheRead + session.sessionCacheWrite
+            if cacheDenom > 0 {
+                let hit = Double(session.sessionCacheRead) / Double(cacheDenom)
+                contextDetailRow("缓存命中率", "\(Int((hit * 100).rounded()))%")
+            }
             contextDetailRow(
                 "累计花费",
                 formatSpend(

@@ -315,10 +315,8 @@ final class TokenUsageStatsTests: XCTestCase {
         XCTAssertEqual(usage.cacheRead, 2300)
         XCTAssertEqual(usage.cacheWrite, 230)
         XCTAssertEqual(usage.cost, 2.3, accuracy: 1e-9)
-        XCTAssertEqual(usage.lastTurnUsage?.input, 120)
-        XCTAssertEqual(usage.lastTurnUsage?.output, 12)
-        XCTAssertEqual(usage.lastTurnUsage?.cacheRead, 1200)
-        XCTAssertEqual(usage.lastTurnUsage?.contextTokens, 12000)
+        XCTAssertEqual(usage.input, 230)
+        XCTAssertEqual(usage.output, 23)
         XCTAssertEqual(usage.contextTokens, 12000)
     }
 }

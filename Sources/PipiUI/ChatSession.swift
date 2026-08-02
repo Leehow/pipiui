@@ -677,7 +677,8 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Model context window size in tokens.
     @Published var contextWindow: Int?
     @Published var contextPercent: Double?
-    @Published private(set) var lastTurnUsage: TokenLedger.UsageSnapshot?
+    @Published private(set) var sessionInput: Int = 0
+    @Published private(set) var sessionOutput: Int = 0
     @Published private(set) var sessionCacheRead: Int = 0
     @Published private(set) var sessionCacheWrite: Int = 0
     /// A successful live stats response owns its corresponding restored fields,
@@ -753,6 +754,13 @@ final class ChatSession: ObservableObject, Identifiable {
     /// 主 settle 时仍有子 agent 运行 → 记一次「待发送的本轮通知」：等主会话空闲、
     /// 消息队列为空、且本轮关联子 agent 全部进入终态后补发一次（成功/出错按终态聚合）。
     private var pendingRoundNotification: PendingRoundNotification?
+    /// 完成判定延迟窗口：主 turn 事件（stdout）可能先于子 agent start 事件（桥接通道）
+    /// 到达，立即判定会把「start 尚在合流队列」误判成「没有子 agent」→ 提前发完成。
+    /// 该窗口等合流队列（约 16ms）清空后再重评。可注入，测试调小。
+    static var completionDeferWindow: TimeInterval = 0.05
+    /// 完成判定已挂起（等子 agent 事件队列清空后再重评）；期间到达的 start 仍计入本轮。
+    private var completionDecisionDeferred = false
+    private var completionDeferWorkItem: DispatchWorkItem?
     /// Notifies AppStore to persist / clear interrupted-path badges.
     var onInFlightChange: ((String, Bool) -> Void)?
     /// False after resuming a disk session that already has a real name.
@@ -1482,7 +1490,8 @@ final class ChatSession: ObservableObject, Identifiable {
             let usage = TokenUsageStats.sessionUsage(for: sid)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.lastTurnUsage = usage.lastTurnUsage
+                self.sessionInput = usage.input
+                self.sessionOutput = usage.output
                 self.sessionCacheRead = usage.cacheRead
                 self.sessionCacheWrite = usage.cacheWrite
                 if !self.hasLiveSessionCost {
@@ -1536,7 +1545,8 @@ final class ChatSession: ObservableObject, Identifiable {
         let u = message["usage"]
         guard u["input"].int != nil || u["output"].int != nil else { return }
         let usage = TokenLedger.UsageSnapshot.from(u)
-        lastTurnUsage = usage
+        sessionInput += usage.input
+        sessionOutput += usage.output
         sessionCacheRead += usage.cacheRead
         sessionCacheWrite += usage.cacheWrite
         let model = message["model"].string ?? self.model?.id ?? "?"
@@ -1649,18 +1659,13 @@ final class ChatSession: ObservableObject, Identifiable {
             if !isWorking && messageQueue.isEmpty {
                 if subagents.runningCount > 0 {
                     // 子 agent 仍在工作：不早发完成通知；记录本轮关联集合，全部终态后补发。
-                    // 关联集合取并集：既覆盖 settle 时仍在运行的子 agent，也保留上一轮
-                    // 已记录但尚未发出（主 agent 已再次工作）的关联子 agent。
-                    let runningIDs = Set(subagents.agents.filter { $0.state == .running }.map(\.id))
-                    pendingRoundNotification = PendingRoundNotification(
-                        agentIDs: (pendingRoundNotification?.agentIDs ?? []).union(runningIDs)
-                    )
-                    markUnseenCompletionAfterSuccessfulSettle(sendNotification: false)
-                } else if pendingRoundNotification != nil {
-                    // 主 agent 在子 agent 终态前又跑了一轮：此刻条件齐备，补发上一轮通知。
-                    flushPendingRoundNotificationIfDue()
+                    decideCompletionAfterSettle()
+                } else if subagents.pendingAgentEventCount > 0 {
+                    // 子 agent 事件（桥接通道）可能晚于主 turn 事件到达：start 还在合流
+                    // 队列时立即判定会漏收本轮子 agent 或提前发完成 → 短暂延迟后重评。
+                    deferCompletionDecision()
                 } else {
-                    markUnseenCompletionAfterSuccessfulSettle()
+                    decideCompletionAfterSettle()
                 }
             }
             proc?.request(["type": "get_state"]) { [weak self] resp in
@@ -3879,15 +3884,79 @@ final class ChatSession: ObservableObject, Identifiable {
         }
     }
 
+    /// 主 turn 收尾后的完成判定（settle 与延迟重评共用）：
+    /// - 有运行中的子 agent → 记入本轮关联集合（不早发完成），全部终态后补发；
+    /// - 已有 pending → 条件齐备则补发（flush 内部还要求子 agent 事件队列已清空）；
+    /// - 无任何关联子 agent → 立即发（历史行为不变）。
+    private func decideCompletionAfterSettle() {
+        if subagents.runningCount > 0 {
+            // 子 agent 仍在工作：不早发完成通知；记录本轮关联集合，全部终态后补发。
+            // 关联集合取并集：既覆盖 settle 时仍在运行的子 agent，也保留上一轮
+            // 已记录但尚未发出（主 agent 已再次工作）的关联子 agent。
+            let runningIDs = Set(subagents.agents.filter { $0.state == .running }.map(\.id))
+            pendingRoundNotification = PendingRoundNotification(
+                agentIDs: (pendingRoundNotification?.agentIDs ?? []).union(runningIDs)
+            )
+            markUnseenCompletionAfterSuccessfulSettle(sendNotification: false)
+        } else if pendingRoundNotification != nil {
+            // 主 agent 在子 agent 终态前又跑了一轮：此刻条件齐备，补发上一轮通知。
+            flushPendingRoundNotificationIfDue()
+        } else {
+            markUnseenCompletionAfterSuccessfulSettle()
+        }
+    }
+
+    /// 挂起完成判定：子 agent 事件仍在合流队列（可能还有 start 在途）时延后一个窗口重评。
+    private func deferCompletionDecision() {
+        guard !completionDecisionDeferred else { return }
+        completionDecisionDeferred = true
+        completionDeferWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.recheckDeferredCompletion() }
+        }
+        completionDeferWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.completionDeferWindow,
+            execute: item
+        )
+    }
+
+    private func clearDeferredCompletionDecision() {
+        completionDeferWorkItem?.cancel()
+        completionDeferWorkItem = nil
+        completionDecisionDeferred = false
+    }
+
+    private func recheckDeferredCompletion() {
+        completionDeferWorkItem = nil
+        // 挂起期间其它路径（如 end 事件触发的 flush）已消费掉本轮 → 不得重复判定。
+        guard completionDecisionDeferred else { return }
+        completionDecisionDeferred = false
+        guard !isWorking, messageQueue.isEmpty else { return }
+        if subagents.pendingAgentEventCount > 0 {
+            // 事件仍在合流（连续事件流）→ 再延一个窗口。
+            deferCompletionDecision()
+            return
+        }
+        decideCompletionAfterSettle()
+    }
+
     /// 本轮所有关联子 agent closeout 已可判定、主会话空闲且队列为空 → 补发一次本轮通知。
     /// 全部成功：完成提醒（与无子 agent 路径一致的健康 + 前台可见性门控，绿标照常挂）；
     /// 任一失败/需人工介入：出错提醒（与 notifyError 一致，用户是否在观看都发）。
     private func flushPendingRoundNotificationIfDue() {
         guard let pending = pendingRoundNotification else { return }
         guard !isWorking, messageQueue.isEmpty, subagents.runningCount == 0 else { return }
+        guard subagents.pendingAgentEventCount == 0 else {
+            // 可能还有下一波子 agent 的 start 事件停在合流队列（跨波次早发）：
+            // 本轮判定延后，等队列清空后重评，避免先发完成、后到的 start 漏报/早报。
+            deferCompletionDecision()
+            return
+        }
         let roundAgents = subagents.agents.filter { pending.agentIDs.contains($0.id) }
         guard !roundAgents.isEmpty else {
             // 本轮关联 agent 已全部被清理（如 clearFinished）→ 清掉 pending，避免永久挂起。
+            clearDeferredCompletionDecision()
             pendingRoundNotification = nil
             return
         }
@@ -3895,6 +3964,7 @@ final class ChatSession: ObservableObject, Identifiable {
         // 否则会先发成功、清空 pending，后到的 .needsFixer/.needsUser 就失去通知。
         guard roundAgents.allSatisfy({ subagents.isCloseoutDecidable($0) }) else { return }
         // 只发一次：无论后续门控是否放行都先消费掉，避免下一次生命周期变化重复发。
+        clearDeferredCompletionDecision()
         pendingRoundNotification = nil
         guard taskNotificationMode.allowsGenericNotifications else { return }
         let issues = roundAgents.compactMap { agent -> (title: String, reason: String)? in
@@ -3930,7 +4000,9 @@ final class ChatSession: ObservableObject, Identifiable {
     /// 主 turn 进行中（或已有待发轮次）派出的子 agent → 记入本轮关联集合。
     /// 主会话完全空闲且无待发轮次时忽略（历史/后台无关派发，不污染本轮）。
     private func collectRoundAgentIfStarted(_ agentID: String) {
-        guard agentTurnActive || isWorking || pendingRoundNotification != nil else { return }
+        // 完成判定延迟窗口内（settle 先于 start 事件到达）到达的 start 也必须计入本轮。
+        guard agentTurnActive || isWorking || pendingRoundNotification != nil
+                || completionDecisionDeferred else { return }
         var ids = pendingRoundNotification?.agentIDs ?? []
         guard ids.insert(agentID).inserted else { return }
         pendingRoundNotification = PendingRoundNotification(agentIDs: ids)
