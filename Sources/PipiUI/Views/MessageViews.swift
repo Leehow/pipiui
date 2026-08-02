@@ -928,14 +928,14 @@ enum SubagentPresentationScale {
         )
     }
 
-    /// 保守的系统处置判定：只有持久化 closeout 为 `.cleaned` 或 `.retained` 才算
-    /// 「已处置」（有最终系统处置结果）；其余（未分类/需 fixer/需用户）一律「待处理」。
-    /// 绝不代表用户已确认。
+    /// 保守的系统处置判定：只有 closeout 为 `.cleaned` 才算「已处置」（失败项清理已完成）；
+    /// `.retained` 可能是验证失败或自动合并/清理被禁止而保留待复核，因此与未分类/需 fixer/
+    /// 需用户一样一律「待处理」。绝不代表用户已确认。
     static func isDisposed(_ agent: SubagentInfo) -> Bool {
         switch agent.closeoutDisposition {
-        case .cleaned, .retained:
+        case .cleaned:
             return true
-        case .unclassified, .needsFixer, .needsUser:
+        case .retained, .unclassified, .needsFixer, .needsUser:
             return false
         }
     }
@@ -955,7 +955,7 @@ enum SubagentPresentationScale {
 
     /// 失败徽标 help：明确 已处置/待处理 语义，不暗示用户确认。
     static func failureHelp(_ summary: Summary) -> String {
-        "失败 \(summary.failedCount) 个：已处置 \(summary.failedDisposedCount)（清理或保留已有最终系统处置，不代表用户已确认）；待处理 \(summary.failedPendingCount)（未分类，或需 fixer / 用户介入）。"
+        "失败 \(summary.failedCount) 个：已处置 \(summary.failedDisposedCount)（失败项清理已完成）；待处理 \(summary.failedPendingCount)（未分类、保留待复核、需 fixer 或需用户介入）。不代表用户已确认。"
     }
 
     /// Keeps every page under a fixed hard cap and in original tree order. Selected and recent
