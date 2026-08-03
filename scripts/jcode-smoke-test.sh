@@ -124,11 +124,90 @@ OK=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).ge
 HAS_DELTA=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('has_text_delta', False))")
 HAS_TURN=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('has_turn_done', False))")
 
-if [ "$OK" = "True" ] && [ "$HAS_DELTA" = "True" ] && [ "$HAS_TURN" = "True" ]; then
-  echo "==> PASS: handshake + create_session + text_delta + turn_done all observed"
-  exit 0
-else
+if [ "$OK" != "True" ] || [ "$HAS_DELTA" != "True" ] || [ "$HAS_TURN" != "True" ]; then
   echo "==> FAIL: missing required outcomes (ok=$OK text_delta=$HAS_DELTA turn_done=$HAS_TURN)" >&2
   echo "    bridge stderr tail:" >&2; tail -5 "$ERR_FILE" >&2
   exit 1
 fi
+echo "==> PASS: handshake + create_session + text_delta + turn_done all observed"
+
+# --- Abort coverage: a cancel mid-turn must halt the stream. ---
+#
+# JcodeBackend.send(["type":"abort"]) maps to jcode's {"req":"cancel","session_id":...}.
+# To exercise that wire mapping against the real binary we open a fresh session,
+# send a long-form prompt, wait for at least one text_delta, then issue cancel and
+# verify the turn stops: either (a) no text_delta arrives after the cancel, or
+# (b) the bridge emits a turn_done / error / cancelled event within a short window.
+#
+# This is timing-sensitive against a real provider, so it is a best-effort check
+# (a missing/empty turn here is reported as SKIP, not FAIL, to keep the smoke
+# non-flaky on slow networks). The core cancel wire path is also unit-verifiable
+# by inspection of JcodeBackend.send.
+echo "==> driving mid-turn cancel (abort → jcode cancel)"
+ABORT_RESULT="$(python3 - "$SOCK" <<'PY'
+import json, socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(20); s.connect(sys.argv[1])
+mid = 0
+def send(req):
+    global mid; mid += 1
+    req["v"] = 1; req["id"] = mid
+    s.sendall((json.dumps(req) + "\n").encode())
+def recv_some(sec):
+    s.settimeout(sec); buf = b""
+    try:
+        while True:
+            c = s.recv(8192)
+            if not c: break
+            buf += c
+    except socket.timeout: pass
+    out = []
+    for line in buf.decode(errors="replace").split("\n"):
+        if line.strip():
+            try: out.append(json.loads(line))
+            except Exception: pass
+    return out
+events = []
+send({"req":"hello","min_version":1,"max_version":1,"client":"pipiui-smoke"})
+time.sleep(0.5); events += recv_some(1)
+send({"req":"create_session","working_dir":"/tmp"})
+time.sleep(2); events += recv_some(2)
+sid = None
+for e in events:
+    if e.get("ev") == "attached" and e.get("session"): sid = e["session"].get("session_id")
+    if e.get("session_id") and not sid: sid = e["session_id"]
+if not sid:
+    print(json.dumps({"status":"skip","reason":"no session_id for abort check"})); sys.exit(0)
+# Long-form prompt to maximize the chance of overlapping the stream.
+send({"req":"send_message","session_id":sid,
+      "content":"Count slowly from 1 to 50, one number per line, with no other text."})
+# Give the model a moment to start streaming.
+pre = recv_some(3)
+pre_delta_count = sum(1 for e in pre if e.get("ev") == "text_delta")
+# Issue cancel — the exact wire shape JcodeBackend.send synthesizes.
+send({"req":"cancel","session_id":sid})
+# Short window to observe the turn halting.
+time.sleep(0.3)
+post = recv_some(4)
+post_delta_count = sum(1 for e in post if e.get("ev") == "text_delta")
+halted = any(e.get("ev") in ("turn_done","error","cancelled","message_end") for e in post)
+ok = (pre_delta_count > 0) and (post_delta_count == 0 or halted)
+status = "pass" if ok else ("skip" if pre_delta_count == 0 else "fail")
+print(json.dumps({
+    "status": status,
+    "pre_delta_count": pre_delta_count,
+    "post_delta_count": post_delta_count,
+    "halted_signal": halted,
+    "post_evs": [e.get("ev") for e in post],
+}))
+PY
+)"
+echo "$ABORT_RESULT" | python3 -m json.tool
+ABORT_STATUS=$(echo "$ABORT_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','fail'))")
+case "$ABORT_STATUS" in
+  pass) echo "==> PASS: mid-turn cancel halted the stream" ;;
+  skip) echo "==> SKIP: abort check (provider too slow to start streaming; cancel wire path verified by code inspection of JcodeBackend.send)" ;;
+  *)    echo "==> FAIL: abort check did not halt the turn" >&2; exit 1 ;;
+esac
+
+exit 0

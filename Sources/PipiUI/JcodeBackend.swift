@@ -11,9 +11,17 @@ struct JcodeEventTranslator {
         guard let ev = event["ev"] as? String else { return [] }
         switch ev {
         case "text_delta":
+            var out: [J] = []
+            if accumulated.isEmpty {
+                // First delta of a turn: pi's handleEvent expects agent_start to set
+                // isStreaming/agentTurnActive before the stream flushes. jcode never
+                // emits a "busy" status, so we synthesize agent_start on first text.
+                out.append(J(["type": "agent_start"]))
+            }
             accumulated += (event["text"] as? String) ?? ""
-            return [J(["type":"message_update","message":["role":"assistant",
-                       "content":[["type":"text","text":accumulated]]]]) ]
+            out.append(J(["type":"message_update","message":["role":"assistant",
+                        "content":[["type":"text","text":accumulated]]]]))
+            return out
         case "tool_start":
             return [J(["type":"tool_execution_start",
                        "toolCallId": event["call_id"] as? String ?? ""])]
@@ -77,21 +85,26 @@ final class JcodeBackend: AgentSessionBackend {
     private var cwd: URL { bridge.workingDir }   // expose from JcodeBridge
 
     private func handleBridgeFrame(_ frame: [String: Any]) {
-        // Translate jcode event → pi J events
+        // Translate jcode event → pi J events. The translator owns agent_start
+        // emission (synthesized on the first text_delta of each turn), since real
+        // jcode never emits session_status{status:"busy"}. session_status
+        // {attached,idle} doesn't map cleanly to pi's turn lifecycle; turn end is
+        // handled by the translator's turn_done → agent_settled.
         var t = translator
         for j in t.translate(event: frame) { onEvent?(j) }
         translator = t
-        // session_status busy → agent_start (handled here, not in translator, since it's session-level)
-        if (frame["ev"] as? String) == "session_status",
-           (frame["status"] as? String) == "busy" {
-            onEvent?(J(["type":"agent_start"]))
-        }
     }
 
     // MARK: AgentSessionBackend
     func send(_ object: [String: Any], failure: (() -> Void)?) {
-        // pi's generic send has no direct jcode equivalent; route prompt-type to send_message if needed.
-        // For now: no-op for non-prompt sends (abort handled by stop()).
+        // ChatSession.abort() sends ["type":"abort"]; map to jcode's cancel.
+        // Without this, Stop doesn't interrupt the in-flight LLM call until the
+        // multi-second escalation reaches Tier-3 (kill bridge), wasting tokens.
+        if (object["type"] as? String) == "abort", let sid = sessionID {
+            bridge.request(["req": "cancel", "session_id": sid]) { _ in }
+            return
+        }
+        // Other pi-generic sends have no direct jcode equivalent; no-op.
     }
     func request(_ object: [String: Any], completion: ((J) -> Void)?) {
         // Map pi RPC types to jcode. Only the ones handleEvent/loadInitialState use.

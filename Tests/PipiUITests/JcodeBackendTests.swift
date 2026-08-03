@@ -55,9 +55,12 @@ final class JcodeEventTranslatorTests: XCTestCase {
         // jcode 发 delta 流：先 "Hel"，再 "lo"
         let r1 = t.translate(event: ["ev":"text_delta","text":"Hel"])
         let r2 = t.translate(event: ["ev":"text_delta","text":"lo"])
-        // pi 的 message_update 是快照式：每次发完整累积
-        XCTAssertEqual(r1.first?["type"].string, "message_update")
-        XCTAssertEqual(r1[0]["message"]["content"][0]["text"].string, "Hel")
+        // 第一个 delta 现在先发 agent_start 再发 message_update（见
+        // testFirstTextDeltaOfTurnEmitsAgentStart）；快照式累积行为不变。
+        XCTAssertEqual(r1.last?["type"].string, "message_update")
+        XCTAssertEqual(r1.last?["message"]["content"][0]["text"].string, "Hel")
+        // 后续 delta 只发 message_update
+        XCTAssertEqual(r2.map { $0["type"].string }, ["message_update"])
         XCTAssertEqual(r2[0]["message"]["content"][0]["text"].string, "Hello")
     }
 
@@ -83,6 +86,21 @@ final class JcodeEventTranslatorTests: XCTestCase {
         var t = JcodeEventTranslator()
         let r = t.translate(event: ["ev":"some_future_event","x":1])
         XCTAssertTrue(r.isEmpty)   // 协议允许 v1 内未知事件，静默忽略
+    }
+
+    func testFirstTextDeltaOfTurnEmitsAgentStart() {
+        var t = JcodeEventTranslator()
+        // First delta of turn 1: agent_start + message_update. jcode never emits
+        // session_status{busy}, so agent_start is synthesized on the first text_delta.
+        let r1 = t.translate(event: ["ev":"text_delta","text":"Hel"])
+        XCTAssertEqual(r1.map { $0["type"].string }, ["agent_start", "message_update"])
+        // Second delta: just message_update (accumulated non-empty).
+        let r2 = t.translate(event: ["ev":"text_delta","text":"lo"])
+        XCTAssertEqual(r2.map { $0["type"].string }, ["message_update"])
+        // turn_done resets; next turn's first delta emits agent_start again.
+        _ = t.translate(event: ["ev":"turn_done"])
+        let r3 = t.translate(event: ["ev":"text_delta","text":"x"])
+        XCTAssertEqual(r3.map { $0["type"].string }, ["agent_start", "message_update"])
     }
 }
 
