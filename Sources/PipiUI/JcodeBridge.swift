@@ -3,15 +3,21 @@ import Foundation
 /// NDJSON line framing over a byte stream (mirrors jcode's sdk/typescript/src/framing.ts).
 /// Encode: `JSON.stringify(frame) + "\n"`. Decode: buffer, split on "\n", trim, skip blanks.
 struct NdjsonCodec {
-    private var buffer = ""
+    private var buffer = Data()
 
     mutating func push(_ data: Data) -> [[String: Any]] {
-        buffer += String(data: data, encoding: .utf8) ?? ""
+        buffer.append(data)
         var out: [[String: Any]] = []
-        while let nl = buffer.firstIndex(of: "\n") {
-            let line = String(buffer[..<nl]).trimmingCharacters(in: .whitespaces)
-            buffer = String(buffer[buffer.index(after: nl)...])
-            guard !line.isEmpty,
+        while let nlRange = buffer.range(of: Data([0x0A])) {  // "\n"
+            let lineData = buffer[..<nlRange.lowerBound]       // before the newline
+            // Half-open range: nlRange.upperBound is already one past the newline
+            // byte, so this consumes exactly the line content + the single "\n".
+            // (A closed range ...nlRange.upperBound over-removes and crashes
+            // Foundation's inline Data representation on this toolchain.)
+            buffer.removeSubrange(buffer.startIndex..<nlRange.upperBound)
+            guard let line = String(data: lineData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespaces),
+                  !line.isEmpty,
                   let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)),
                   let dict = obj as? [String: Any] else { continue }
             out.append(dict)
@@ -21,8 +27,9 @@ struct NdjsonCodec {
 
     static func encode(_ frame: [String: Any]) -> String {
         guard JSONSerialization.isValidJSONObject(frame),
-              let data = try? JSONSerialization.data(withJSONObject: frame) else { return "" }
-        return String(data: data, encoding: .utf8)! + "\n"
+              let data = try? JSONSerialization.data(withJSONObject: frame),
+              let s = String(data: data, encoding: .utf8) else { return "" }
+        return s + "\n"
     }
 }
 
@@ -86,13 +93,15 @@ final class JcodeBridge {
         process.arguments = args
         process.currentDirectoryURL = cwd
         process.environment = env
-        process.standardError = Pipe()  // captured via readabilityHandler below
         let errPipe = Pipe()
         process.standardError = errPipe
         errPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
             let t = String(data: h.availableData, encoding: .utf8) ?? ""
             guard !t.isEmpty else { return }
-            DispatchQueue.main.async { self?.stderrTail = String((self!.stderrTail + t).suffix(4000)) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.stderrTail = String((self.stderrTail + t).suffix(4000))
+            }
         }
         process.terminationHandler = { [weak self] p in
             DispatchQueue.main.async {
