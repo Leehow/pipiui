@@ -409,16 +409,29 @@ struct SidebarView: View {
             .accessibilityLabel("项目菜单\(displayName)")
             .pointingHandCursor()
 
-            Button {
-                selectProject(project)
-                store.newSession(project: project)
+            // Split button: a plain click keeps the fast path (default pi
+            // session) while the chevron opens an engine picker for jcode.
+            // `primaryAction` lands on macOS 14+, matching the package floor.
+            Menu {
+                Button("新 pi 会话") {
+                    selectProject(project)
+                    store.newSession(project: project, engine: .pi)
+                }
+                Button("新 jcode 会话") {
+                    selectProject(project)
+                    store.newSession(project: project, engine: .jcode)
+                }
             } label: {
                 Image(systemName: "plus")
                     .font(.caption.weight(.semibold))
                     .frame(width: 20, height: 20)
+            } primaryAction: {
+                selectProject(project)
+                store.newSession(project: project, engine: .pi)
             }
             .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
-            .help("新建会话")
+            .menuIndicator(.visible)
+            .help("新建会话（默认 pi；点按箭头选 jcode）")
             .accessibilityLabel("在\(displayName)中新建会话")
         }
         .padding(.vertical, 5)
@@ -665,7 +678,8 @@ struct SidebarView: View {
                                 title: meta.name,
                                 modelRef: meta.modelRef,
                                 subtitle: "\(store.projectDisplayName(for: project)) · \(Self.relative(meta.modified))",
-                                status: .none
+                                status: .none,
+                                engineKind: meta.engineKind
                             )
                             .foregroundStyle(.secondary)
                         }
@@ -743,6 +757,7 @@ struct SidebarView: View {
                     modelRef: meta.modelRef,
                     subtitle: interrupted ? "已中断" : idleSubtitle,
                     status: interrupted ? .interrupted : .none,
+                    engineKind: meta.engineKind,
                     hideSubtitle: isHovered,
                     reservedTrailingWidth: actionAreaWidth
                 )
@@ -1236,6 +1251,9 @@ private struct LiveSessionRow: View {
                 animationToken: session.titleAnimationToken,
                 font: .body
             )
+            if session.engineKind == .jcode {
+                EngineBadge.jcode
+            }
             Spacer(minLength: 0)
             if !subtitle.isEmpty, !hideSubtitle {
                 Text(subtitle)
@@ -1397,11 +1415,32 @@ private final class PulsingSymbolNSView: NSView {
     }
 }
 
+/// Trailing engine marker shown next to a session title. Only `.jcode`
+/// renders anything (pi is the default/legacy majority case — a badge there
+/// would just add noise). Styled as a low-key capsule matching the search
+/// result badges so live and idle rows read the same.
+private enum EngineBadge {
+    static var jcode: some View {
+        Text("jc")
+            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(
+                Capsule().fill(Color.secondary.opacity(0.15))
+            )
+            .accessibilityLabel("jcode 引擎")
+    }
+}
+
 private struct SessionRow: View {
     let title: String
     var modelRef: String? = nil
     let subtitle: String
     var status: SessionRowStatus = .none
+    /// Which engine backs this session; `.jcode` shows a small trailing badge.
+    /// Defaults to `.pi` (no badge) for the legacy/majority case.
+    var engineKind: EngineKind = .pi
     /// Hide trailing caption while hover actions occupy that corner.
     var hideSubtitle: Bool = false
     /// Reserved action-button width so title text never extends beneath the buttons.
@@ -1420,6 +1459,9 @@ private struct SessionRow: View {
             Text(title)
                 .lineLimit(1)
                 .truncationMode(.tail)
+            if engineKind == .jcode {
+                EngineBadge.jcode
+            }
             Spacer(minLength: 0)
             if !subtitle.isEmpty, !hideSubtitle {
                 Text(subtitle)
