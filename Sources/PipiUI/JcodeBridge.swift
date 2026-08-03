@@ -132,9 +132,18 @@ final class JcodeBridge {
 
     /// Poll for the socket file, then connect NWConnection, then send hello.
     /// completion fires once on the main thread: true on hello_ok, false on any failure.
+    /// A one-shot guard guards against NWConnection firing the stateUpdateHandler
+    /// through both `.failed` and `.cancelled` (e.g. connection fails, then
+    /// `terminate()` cancels) which would otherwise double-fire the completion.
     func connectAndHandshake(completion: @escaping (Bool) -> Void) {
         let deadline = Date().addingTimeInterval(30)  // match jcode SDK startupTimeoutMs 30s
-        attemptConnect(deadline: deadline, completion: completion)
+        var hasFired = false
+        let once: (Bool) -> Void = { ok in
+            guard !hasFired else { return }
+            hasFired = true
+            DispatchQueue.main.async { completion(ok) }
+        }
+        attemptConnect(deadline: deadline, completion: once)
     }
 
     private func attemptConnect(deadline: Date, completion: @escaping (Bool) -> Void) {
@@ -151,14 +160,24 @@ final class JcodeBridge {
     private func doConnect(completion: @escaping (Bool) -> Void) {
         let conn = NWConnection(to: .unix(path: socketURL.path), using: .tcp)
         connection = conn
+        // `conn.start(queue: .global())` runs this handler on a background queue.
+        // `startReceiving()` only schedules an async `receive(...)` whose callback
+        // hops to main, so it's safe to call from here. `sendHello` synchronously
+        // mutates nextID/pending (via `request`), so it must run on main to keep
+        // those fields main-thread-confined (handleFrame reads them on main).
+        // `completion` here is the one-shot `once` wrapper from
+        // `connectAndHandshake`, which delivers on main and guards against
+        // double-fire (`.failed` then `.cancelled`).
         conn.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
             case .ready:
                 self.startReceiving()
-                self.sendHello(completion: completion)
+                DispatchQueue.main.async { [weak self] in
+                    self?.sendHello(completion: completion)
+                }
             case .failed, .cancelled:
-                DispatchQueue.main.async { completion(false) }
+                completion(false)
             default: break
             }
         }
