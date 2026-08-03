@@ -51,6 +51,12 @@ final class JcodeBridge {
     /// The cwd passed to init; JcodeBackend reads it to send `create_session`'s working_dir.
     let workingDir: URL
 
+    // MARK: - Task 2: socket connect + hello handshake + request/reply correlation
+
+    private var nextID: Int = 0
+    private var pending: [Int: ([String: Any]) -> Void] = [:]   // reply_to -> completion (main thread)
+    private(set) var isReady = false                             // hello_ok received
+
     /// Resolve jcode binary: honor JCODE_BINARY, else PATH lookups matching the installer
     /// (`~/.local/bin/jcode`, /opt/homebrew/bin, /usr/local/bin, $PATH).
     static func findJcodeExecutable() -> String? {
@@ -120,6 +126,87 @@ final class JcodeBridge {
         let line = NdjsonCodec.encode(frame)
         guard let data = line.data(using: .utf8) else { return }
         connection?.send(content: data, completion: .contentProcessed { _ in })
+    }
+
+    // MARK: - Connect + handshake (Task 2)
+
+    /// Poll for the socket file, then connect NWConnection, then send hello.
+    /// completion fires once on the main thread: true on hello_ok, false on any failure.
+    func connectAndHandshake(completion: @escaping (Bool) -> Void) {
+        let deadline = Date().addingTimeInterval(30)  // match jcode SDK startupTimeoutMs 30s
+        attemptConnect(deadline: deadline, completion: completion)
+    }
+
+    private func attemptConnect(deadline: Date, completion: @escaping (Bool) -> Void) {
+        guard Date() < deadline else { completion(false); return }
+        if FileManager.default.fileExists(atPath: socketURL.path) {
+            doConnect(completion: completion)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.attemptConnect(deadline: deadline, completion: completion)
+            }
+        }
+    }
+
+    private func doConnect(completion: @escaping (Bool) -> Void) {
+        let conn = NWConnection(to: .unix(path: socketURL.path), using: .tcp)
+        connection = conn
+        conn.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.startReceiving()
+                self.sendHello(completion: completion)
+            case .failed, .cancelled:
+                DispatchQueue.main.async { completion(false) }
+            default: break
+            }
+        }
+        conn.start(queue: .global())
+    }
+
+    private func startReceiving() {
+        receiveLoop()
+    }
+
+    private func receiveLoop() {
+        connection?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, error in
+            guard let self, let data, error == nil else { return }
+            let frames = self.codec.push(data)
+            DispatchQueue.main.async {
+                for f in frames { self.handleFrame(f) }
+            }
+            self.receiveLoop()
+        }
+    }
+
+    /// Dispatch one parsed frame on the main thread. If it carries a `reply_to`
+    /// matching a pending request, fire that completion; always deliver to `onEvent`.
+    private func handleFrame(_ frame: [String: Any]) {
+        // Reply to a request?
+        if let replyTo = frame["reply_to"] as? Int, let cb = pending.removeValue(forKey: replyTo) {
+            cb(frame)
+        }
+        // Always deliver (events + replies; JcodeBackend decides what's interesting)
+        onEvent?(frame)
+    }
+
+    private func sendHello(completion: @escaping (Bool) -> Void) {
+        request(["req": "hello", "min_version": 1, "max_version": 1, "client": "pipiui"]) { [weak self] resp in
+            let ok = resp["ev"] as? String == "hello_ok"
+            self?.isReady = ok
+            completion(ok)
+        }
+    }
+
+    /// Send a request with an auto-incremented id; completion fires on main thread when
+    /// the matching `reply_to` frame arrives (or never if the bridge dies first).
+    func request(_ req: [String: Any], completion: @escaping ([String: Any]) -> Void) {
+        nextID += 1
+        let id = nextID
+        var frame = req; frame["v"] = 1; frame["id"] = id
+        pending[id] = completion
+        sendFrame(frame)
     }
 
     /// Tear down: cancel connection, terminate process. Idempotent.
