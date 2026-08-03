@@ -1115,56 +1115,94 @@ final class ChatSession: ObservableObject, Identifiable {
 
     private func startProcess(arguments: [String], environment: [String: String]) {
         guard !processStartCancelled, backend == nil else { return }
-        guard let proc = PiProcess(cwd: projectURL, arguments: arguments, extraEnv: environment) else {
-            let message = "找不到 pi 可执行文件（试过 ~/.npm-global/bin、/opt/homebrew/bin 等）"
+        switch engineKind {
+        case .pi:
+            guard let proc = PiProcess(cwd: projectURL, arguments: arguments, extraEnv: environment) else {
+                let message = "找不到 pi 可执行文件（试过 ~/.npm-global/bin、/opt/homebrew/bin 等）"
+                lastError = message
+                notifyError(message)
+                processAlive = false
+                isInitializing = false
+                return
+            }
+            // Construct as the concrete PiProcess, then store as the existential
+            // `any AgentSessionBackend`. Local `proc` keeps concrete type so the
+            // optional-binding above and the closure captures stay unchanged.
+            backend = proc
+            proc.onEvent = { [weak self] event in self?.handleEvent(event) }
+            proc.onExit = { [weak self] code, stderr in
+                self?.handleExit(code: code, stderr: stderr)
+            }
+            loadInitialState()
+            bindQuotaMonitor()
+        case .jcode:
+            guard let jb = JcodeBackend(cwd: projectURL, extraEnv: environment) else {
+                let message = "找不到 jcode 可执行文件（试过 ~/.local/bin、/opt/homebrew/bin、PATH）"
+                lastError = message
+                notifyError(message)
+                processAlive = false
+                isInitializing = false
+                return
+            }
+            backend = jb
+            jb.onEvent = { [weak self] event in self?.handleEvent(event) }
+            jb.onExit = { [weak self] code, stderr in
+                self?.handleExit(code: code, stderr: stderr)
+            }
+            jb.start { [weak self] ok in
+                guard let self else { return }
+                if ok {
+                    self.processAlive = true
+                    self.loadInitialState()
+                    // jcode has no pi quota monitor binding; skip bindQuotaMonitor
+                } else {
+                    self.lastError = "jcode 会话启动失败（握手或建会话失败）"
+                    self.notifyError(self.lastError!)
+                    self.processAlive = false
+                    self.isInitializing = false
+                }
+            }
+        }
+    }
+
+    /// Unified termination path for both `.pi` and `.jcode` engines. Extracted
+    /// verbatim from the former `proc.onExit` closure so the two `startProcess`
+    /// branches share identical exit semantics. The closure used `[weak self]`
+    /// + `guard let self`; as a private instance method the same fields are
+    /// referenced via plain `self.`.
+    private func handleExit(code: Int32, stderr: String) {
+        // Main turn OR background subagents waiting → red "已中断" after unexpected quit.
+        let cutOff = InterruptedSessionStore.shouldPersistMark(
+            agentTurnActive: agentTurnActive,
+            isWorking: isWorking,
+            runningSubagents: subagents.runningCount
+        )
+        processAlive = false
+        isStreaming = false
+        // 进程确认死亡：立即对账一次（已 stale 的幽灵当场结算；新鲜的留给
+        // store 周期 tick 在 10 分钟窗口后处理）。
+        subagents.reconcileOrphanedNow()
+        isStopping = false
+        cancelStopEscalation()
+        clearCompactionState()
+        isSendingFromQueue = false
+        // Exit before the first transcript arrives must not leave the spinner up.
+        isInitializing = false
+        titleLLMTask?.cancel()
+        titleLLMTask = nil
+        ComputerCoordinator.shared.release(
+            sessionKey: bridgeRoutingKey,
+            revokeConsent: true
+        )
+        if cutOff {
+            persistInFlightMark()
+            hasUnseenInterruption = true
+        }
+        if code != 0 {
+            let message = "pi 进程退出 (code \(code))：\(stderr.suffix(300))"
             lastError = message
             notifyError(message)
-            processAlive = false
-            isInitializing = false
-            return
         }
-        // Construct as the concrete PiProcess, then store as the existential
-        // `any AgentSessionBackend`. Local `proc` keeps concrete type so the
-        // optional-binding above and the closure captures stay unchanged.
-        backend = proc
-        proc.onEvent = { [weak self] event in self?.handleEvent(event) }
-        proc.onExit = { [weak self] code, stderr in
-            guard let self else { return }
-            // Main turn OR background subagents waiting → red "已中断" after unexpected quit.
-            let cutOff = InterruptedSessionStore.shouldPersistMark(
-                agentTurnActive: self.agentTurnActive,
-                isWorking: self.isWorking,
-                runningSubagents: self.subagents.runningCount
-            )
-            self.processAlive = false
-            self.isStreaming = false
-            // 进程确认死亡：立即对账一次（已 stale 的幽灵当场结算；新鲜的留给
-            // store 周期 tick 在 10 分钟窗口后处理）。
-            self.subagents.reconcileOrphanedNow()
-            self.isStopping = false
-            self.cancelStopEscalation()
-            self.clearCompactionState()
-            self.isSendingFromQueue = false
-            // Exit before the first transcript arrives must not leave the spinner up.
-            self.isInitializing = false
-            self.titleLLMTask?.cancel()
-            self.titleLLMTask = nil
-            ComputerCoordinator.shared.release(
-                sessionKey: self.bridgeRoutingKey,
-                revokeConsent: true
-            )
-            if cutOff {
-                self.persistInFlightMark()
-                self.hasUnseenInterruption = true
-            }
-            if code != 0 {
-                let message = "pi 进程退出 (code \(code))：\(stderr.suffix(300))"
-                self.lastError = message
-                self.notifyError(message)
-            }
-        }
-        loadInitialState()
-        bindQuotaMonitor()
     }
 
     deinit {
