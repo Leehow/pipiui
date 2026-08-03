@@ -49,6 +49,43 @@ final class NdjsonCodecTests: XCTestCase {
     }
 }
 
+final class JcodeEventTranslatorTests: XCTestCase {
+    func testTextDeltaAccumulatesToSnapshotUpdate() {
+        var t = JcodeEventTranslator()
+        // jcode 发 delta 流：先 "Hel"，再 "lo"
+        let r1 = t.translate(event: ["ev":"text_delta","text":"Hel"])
+        let r2 = t.translate(event: ["ev":"text_delta","text":"lo"])
+        // pi 的 message_update 是快照式：每次发完整累积
+        XCTAssertEqual(r1.first?["type"].string, "message_update")
+        XCTAssertEqual(r1[0]["message"]["content"][0]["text"].string, "Hel")
+        XCTAssertEqual(r2[0]["message"]["content"][0]["text"].string, "Hello")
+    }
+
+    func testToolStartThenDoneEmitsPiToolEvents() {
+        var t = JcodeEventTranslator()
+        let s = t.translate(event: ["ev":"tool_start","call_id":"c1","name":"bash"])
+        XCTAssertEqual(s.first?["type"].string, "tool_execution_start")
+        XCTAssertEqual(s[0]["toolCallId"].string, "c1")
+        let e = t.translate(event: ["ev":"tool_done","call_id":"c1","name":"bash","output":"done"])
+        XCTAssertEqual(e.last?["type"].string, "tool_execution_end")
+        XCTAssertEqual(e.last?["toolCallId"].string, "c1")
+    }
+
+    func testTurnDoneEmitsMessageEndThenSettled() {
+        var t = JcodeEventTranslator()
+        _ = t.translate(event: ["ev":"text_delta","text":"hi"])
+        let r = t.translate(event: ["ev":"turn_done"])
+        XCTAssertEqual(r.map { $0["type"].string }, ["message_end", "agent_settled"])
+        XCTAssertEqual(r[0]["message"]["content"][0]["text"].string, "hi")
+    }
+
+    func testUnknownEventIgnored() {
+        var t = JcodeEventTranslator()
+        let r = t.translate(event: ["ev":"some_future_event","x":1])
+        XCTAssertTrue(r.isEmpty)   // 协议允许 v1 内未知事件，静默忽略
+    }
+}
+
 final class JcodeBridgeRequestTests: XCTestCase {
     /// Verify id auto-increments and reply_to correlation via the codec only
     /// (no real socket). We drive handleFrame indirectly by encoding a fake reply
