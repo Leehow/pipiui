@@ -433,6 +433,14 @@ enum SessionTaskNotificationMode: Equatable {
     var allowsGenericNotifications: Bool { self == .standard }
 }
 
+/// Which agent engine backs a session. Pinned at creation; switching means
+/// starting a new session. Plan A only ever produces `.pi`; `.jcode` arrives in
+/// Plan B (JcodeBackend).
+package enum EngineKind: String {
+    case pi
+    case jcode
+}
+
 /// 一轮延后发送的任务提醒：记录本轮关联子 agent id 集合——主 turn 活动期间派出的
 /// 子 agent（含续作）+ settle 时仍在运行的集合（并集）。全部 closeout 可判定后聚合
 /// 结果再决定发完成还是出错/需介入提醒（只发一次）。
@@ -646,6 +654,8 @@ final class ChatSession: ObservableObject, Identifiable {
     /// environment, so every trusted extension loaded in that process can read it.
     package let computerRoutingKey = BridgeCapabilityToken.generate()
     let projectURL: URL
+    /// Which agent engine backs this session. Pinned at init; Plan A always `.pi`.
+    let engineKind: EngineKind
 
     /// didSet 版本计数：任何 transcript 写入（append / 整体替换 / 元素修改）都会 bump，
     /// TranscriptPlanner 以此判断是否重算布局。宁滥勿缺——不确定的修改路径走属性写入即自动覆盖。
@@ -950,9 +960,11 @@ final class ChatSession: ObservableObject, Identifiable {
          builtInFeatures: BuiltInFeatureSettings.EnabledSet = .init(),
          taskNotificationMode: SessionTaskNotificationMode = .standard,
          blockedReason: String? = nil,
-         initialTranscript: InitialTranscriptBuild? = nil) {
+         initialTranscript: InitialTranscriptBuild? = nil,
+         engineKind: EngineKind = .pi) {
         self.id = id
         self.projectURL = projectURL
+        self.engineKind = engineKind
         self.taskNotificationMode = taskNotificationMode
         self.resumedFromDisk = sessionPath != nil
         // A restarted/resumed session never inherits a stale external-search

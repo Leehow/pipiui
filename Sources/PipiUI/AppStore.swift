@@ -8,12 +8,18 @@ struct SessionMeta: Identifiable, Hashable {
     let modified: Date
     /// `provider/modelId` of the latest main-agent model selection in the session file.
     let modelRef: String?
+    /// Which engine backs this session. Plan A only ever produces `.pi`;
+    /// disk persistence of `engine_kind` is deferred to Plan B, so sessions
+    /// read from disk default to `.pi`.
+    var engineKind: EngineKind = .pi
 
-    init(path: String, name: String, modified: Date, modelRef: String? = nil) {
+    init(path: String, name: String, modified: Date, modelRef: String? = nil,
+         engineKind: EngineKind = .pi) {
         self.path = path
         self.name = name
         self.modified = modified
         self.modelRef = modelRef
+        self.engineKind = engineKind
     }
 
     var id: String { path }
@@ -992,7 +998,8 @@ final class AppStore: ObservableObject {
         project: URL,
         sessionPath: String?,
         preloadedTranscript: InitialTranscriptBuild? = nil,
-        taskNotificationMode: SessionTaskNotificationMode = .standard
+        taskNotificationMode: SessionTaskNotificationMode = .standard,
+        engine: EngineKind = .pi
     ) -> ChatSession {
         // spawn 前自检：撞名扩展会让 pi 直接退出，先把它变成可修复的提示而不是一行崩溃日志。
         // T11: 主路径只做便宜的 stamp 检查 + 缓存命中；未缓存时先放行 spawn，
@@ -1106,7 +1113,8 @@ final class AppStore: ObservableObject {
             taskNotificationMode: taskNotificationMode,
             blockedReason: sessionBlockedReason.isEmpty
                 ? nil : sessionBlockedReason,
-            initialTranscript: initialTranscript
+            initialTranscript: initialTranscript,
+            engineKind: engine
         )
         session.onSessionMetaChanged = { [weak self, weak session] in
             guard let self, let session else { return }
@@ -1539,7 +1547,8 @@ final class AppStore: ObservableObject {
                     path: path,
                     name: entry.name,
                     modified: mtime,
-                    modelRef: entry.modelRef
+                    modelRef: entry.modelRef,
+                    engineKind: .pi
                 )
                 if archived.contains(path) {
                     archivedMetas.append(meta)
@@ -1568,7 +1577,8 @@ final class AppStore: ObservableObject {
                         merged.append(SessionMeta(
                             path: file,
                             name: (name?.isEmpty == false ? name! : "新会话"),
-                            modified: Date()
+                            modified: Date(),
+                            engineKind: .pi
                         ))
                     }
                 }
@@ -1788,6 +1798,7 @@ final class AppStore: ObservableObject {
     @discardableResult
     func createSessionInBackground(
         project: URL,
+        engine: EngineKind = .pi,
         taskNotificationMode: SessionTaskNotificationMode = .standard
     ) -> (key: String, session: ChatSession) {
         RemoteSelectionNeutralMutation.perform(selection: { [self] in
@@ -1801,7 +1812,8 @@ final class AppStore: ObservableObject {
                 key: key,
                 project: project,
                 sessionPath: nil,
-                taskNotificationMode: taskNotificationMode
+                taskNotificationMode: taskNotificationMode,
+                engine: engine
             )
             self.openSessions[key] = session
             return (key, session)
