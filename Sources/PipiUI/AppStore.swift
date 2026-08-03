@@ -1123,7 +1123,8 @@ final class AppStore: ObservableObject {
                 self.upsertLiveSessionMeta(
                     project: project,
                     file: file,
-                    name: session.sessionName ?? "新会话"
+                    name: session.sessionName ?? "新会话",
+                    engine: session.engineKind
                 )
             }
             self.refreshSessions(for: project)
@@ -1213,7 +1214,8 @@ final class AppStore: ObservableObject {
         upsertLiveSessionMeta(
             project: session.projectURL,
             file: newPath,
-            name: session.sessionName ?? "新会话"
+            name: session.sessionName ?? "新会话",
+            engine: session.engineKind
         )
         refreshSessions(for: session.projectURL)
     }
@@ -1578,7 +1580,7 @@ final class AppStore: ObservableObject {
                             path: file,
                             name: (name?.isEmpty == false ? name! : "新会话"),
                             modified: Date(),
-                            engineKind: .pi
+                            engineKind: open.engineKind
                         ))
                     }
                 }
@@ -1611,7 +1613,7 @@ final class AppStore: ObservableObject {
 
     /// 立刻把 live session 的文件路径写进侧边栏 metas（主线程），异步 refresh 会用真实 mtime/name 覆盖。
     /// Does NOT bump modified for existing sessions — ordering changes only via user submit pin or disk mtime.
-    func upsertLiveSessionMeta(project: URL, file: String, name: String) {
+    func upsertLiveSessionMeta(project: URL, file: String, name: String, engine: EngineKind = .pi) {
         guard !archivedSessionPaths.contains(file) else { return }
         let projectPath = project.path
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1621,10 +1623,19 @@ final class AppStore: ObservableObject {
             let old = metas[idx]
             // Don't clobber a real title with placeholder / "新会话".
             let keptName = SessionTitleLogic.isPlaceholderName(displayName) ? old.name : displayName
-            metas[idx] = SessionMeta(path: file, name: keptName, modified: old.modified)
+            metas[idx] = SessionMeta(
+                path: file,
+                name: keptName,
+                modified: old.modified,
+                modelRef: old.modelRef,
+                engineKind: engine
+            )
         } else {
             // New session: optimistic insert at top with fresh timestamp.
-            metas.insert(SessionMeta(path: file, name: displayName, modified: Date()), at: 0)
+            metas.insert(
+                SessionMeta(path: file, name: displayName, modified: Date(), engineKind: engine),
+                at: 0
+            )
         }
         sessionsByProject[projectPath] = metas
     }
@@ -1789,8 +1800,8 @@ final class AppStore: ObservableObject {
         return key
     }
 
-    func newSession(project: URL) {
-        let (key, _) = createSessionInBackground(project: project)
+    func newSession(project: URL, engine: EngineKind = .pi) {
+        let (key, _) = createSessionInBackground(project: project, engine: engine)
         selectedSessionKey = key
     }
 
@@ -1827,7 +1838,12 @@ final class AppStore: ObservableObject {
             openSessions[key] = makeSession(key: key, project: project, sessionPath: path)
         }
         selectedSessionKey = key
-        upsertLiveSessionMeta(project: project, file: path, name: suggestedName)
+        upsertLiveSessionMeta(
+            project: project,
+            file: path,
+            name: suggestedName,
+            engine: openSessions[key]?.engineKind ?? .pi
+        )
         refreshSessions(for: project)
 
         // The resumed process needs a moment to finish startup before accepting rename RPCs.
