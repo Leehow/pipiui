@@ -274,3 +274,9 @@ final class PiProcess {
         failAllPending(error: "process exited")
     }
 }
+
+/// PiProcess satisfies `AgentSessionBackend` with no changes: every protocol
+/// requirement (`onEvent`/`onExit`/`isRunning`/`send`/`request`/`terminate`/
+/// `signalDescendants`/`forceKill`) already exists on this class with a matching
+/// signature. This empty extension only declares conformance.
+extension PiProcess: AgentSessionBackend {}
