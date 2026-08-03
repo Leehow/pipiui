@@ -801,7 +801,7 @@ final class ChatSession: ObservableObject, Identifiable {
     /// 前台停止升级调度令牌：每次取消事件（settle / 新 turn / 重载 / 退出 / shutdown）
     /// 自增；升级闭包捕获调度时的令牌值，过期即不执行（陈旧闭包不可能在新 turn 后生效）。
     private var stopEscalationToken = 0
-    /// 停止升级测试替身（生产为 nil）：Tier-1/2 的信号投递，真实路径 = proc.signalDescendants。
+    /// 停止升级测试替身（生产为 nil）：Tier-1/2 的信号投递，真实路径 = backend.signalDescendants。
     var stopEscalationSignalSink: ((Int32) -> Void)?
     /// 停止升级测试替身（生产为 nil）：Tier-3 的重启动作，真实路径 = onRequestRestart/shutdown。
     var stopEscalationRestartSink: (() -> Void)?
@@ -865,12 +865,12 @@ final class ChatSession: ObservableObject, Identifiable {
     var onSessionFileRebound: ((String, String) -> Void)?
     /// AppStore opens the cloned/forked file as a separate sidebar session.
     var onBranchedSessionReady: ((String) -> Void)?
-    private var proc: PiProcess?
+    private var backend: (any AgentSessionBackend)?
     private var itemCounter = 0
     private var queue = SessionMessageQueue()
     /// True from prompt dispatch until agent_start (or failure / process death).
     @Published private(set) var isSendingFromQueue = false
-    /// Historical ghost title prompts in old session files (ingest skip only; never sent on main proc).
+    /// Historical ghost title prompts in old session files (ingest skip only; never sent on main backend).
     package static let sessionTitleJobMarker = "[PipiUI internal — session title"
     /// T17: shared reader for `~/.pi/agent/.env` (provider API keys etc.),
     /// injected into every spawned pi process environment at session start.
@@ -1102,7 +1102,7 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     private func startProcess(arguments: [String], environment: [String: String]) {
-        guard !processStartCancelled, proc == nil else { return }
+        guard !processStartCancelled, backend == nil else { return }
         guard let proc = PiProcess(cwd: projectURL, arguments: arguments, extraEnv: environment) else {
             let message = "找不到 pi 可执行文件（试过 ~/.npm-global/bin、/opt/homebrew/bin 等）"
             lastError = message
@@ -1111,7 +1111,10 @@ final class ChatSession: ObservableObject, Identifiable {
             isInitializing = false
             return
         }
-        self.proc = proc
+        // Construct as the concrete PiProcess, then store as the existential
+        // `any AgentSessionBackend`. Local `proc` keeps concrete type so the
+        // optional-binding above and the closure captures stay unchanged.
+        backend = proc
         proc.onEvent = { [weak self] event in self?.handleEvent(event) }
         proc.onExit = { [weak self] code, stderr in
             guard let self else { return }
@@ -1288,10 +1291,10 @@ final class ChatSession: ObservableObject, Identifiable {
     // MARK: - Initial load
 
     private func loadInitialState() {
-        proc?.request(["type": "get_state"]) { [weak self] resp in
+        backend?.request(["type": "get_state"]) { [weak self] resp in
             self?.applyState(resp["data"])
         }
-        proc?.request(["type": "get_available_models"]) { [weak self] resp in
+        backend?.request(["type": "get_available_models"]) { [weak self] resp in
             self?.availableModels = resp["data"]["models"].array.compactMap { m in
                 guard let row = m.dict else { return nil }
                 return ModelInfo.parseModelListRow(row)
@@ -1303,7 +1306,7 @@ final class ChatSession: ObservableObject, Identifiable {
         // pi 的 get_session_stats 不含上一轮和累计缓存；从本地 TokenLedger 按 session id
         // 恢复完整 footer/popover 快照（off-main）。实时 RPC 回包仍优先于恢复值。
         rehydrateSessionUsage()
-        proc?.request(["type": "get_commands"]) { [weak self] resp in
+        backend?.request(["type": "get_commands"]) { [weak self] resp in
             guard let self else { return }
             // Failure/empty → leave availableCommands empty; builtins still work. No flash.
             self.availableCommands = SlashCommandParser.parseGetCommandsResponse(resp)
@@ -1317,7 +1320,7 @@ final class ChatSession: ObservableObject, Identifiable {
         awaitingInitialTranscript = true
         deferredInitialEvents.removeAll(keepingCapacity: true)
 
-        guard proc != nil else {
+        guard backend != nil else {
             // No process (should not reach here on normal spawn path) — do not gate events forever.
             applyInitialTranscript(
                 InitialTranscriptBuild(items: [], toolRuns: [:], itemCounter: 0, skipNextAssistantIngest: false),
@@ -1327,7 +1330,7 @@ final class ChatSession: ObservableObject, Identifiable {
         }
 
         let requestedAt = DispatchTime.now()
-        proc?.request(["type": "get_messages"]) { [weak self] resp in
+        backend?.request(["type": "get_messages"]) { [weak self] resp in
             guard let self else { return }
             // Capture JSON messages on main (resp is only valid for this callback), build off-main.
             let messages = resp["data"]["messages"].array
@@ -1411,7 +1414,7 @@ final class ChatSession: ObservableObject, Identifiable {
     private func syncEntryIds(completion: (() -> Void)? = nil) {
         entryIdSyncGeneration &+= 1
         let generation = entryIdSyncGeneration
-        proc?.request(["type": "get_entries"]) { [weak self] resp in
+        backend?.request(["type": "get_entries"]) { [weak self] resp in
             guard let self else { return }
             guard generation == self.entryIdSyncGeneration else {
                 completion?()
@@ -1524,14 +1527,14 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     private func refreshThinkingLevels() {
-        proc?.request(["type": "get_available_thinking_levels"]) { [weak self] resp in
+        backend?.request(["type": "get_available_thinking_levels"]) { [weak self] resp in
             let levels = resp["data"]["levels"].array.compactMap(\.string)
             self?.thinkingLevels = levels.isEmpty ? ["off"] : levels
         }
     }
 
     private func refreshStats() {
-        proc?.request(["type": "get_session_stats"]) { [weak self] resp in
+        backend?.request(["type": "get_session_stats"]) { [weak self] resp in
             guard let self, resp["success"].bool == true else { return }
             self.applySessionStats(resp["data"])
         }
@@ -1732,7 +1735,7 @@ final class ChatSession: ObservableObject, Identifiable {
                     decideCompletionAfterSettle()
                 }
             }
-            proc?.request(["type": "get_state"]) { [weak self] resp in
+            backend?.request(["type": "get_state"]) { [weak self] resp in
                 self?.applyState(resp["data"])
                 self?.onSessionMetaChanged?()
             }
@@ -1890,7 +1893,7 @@ final class ChatSession: ObservableObject, Identifiable {
             }
         }
         refreshDisplayTitle()
-        proc?.request(["type": "set_session_name", "name": trimmed]) { [weak self] resp in
+        backend?.request(["type": "set_session_name", "name": trimmed]) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool == true {
                 self.onSessionMetaChanged?()
@@ -1941,12 +1944,12 @@ final class ChatSession: ObservableObject, Identifiable {
         case "confirm":
             // 无人值守时安全默认：拒绝
             if let rid = e["id"].string {
-                proc?.send(["type": "extension_ui_response", "id": rid, "confirmed": false])
+                backend?.send(["type": "extension_ui_response", "id": rid, "confirmed": false], failure: nil)
                 appendSystem("扩展请求确认「\(e["title"].string ?? "")」— 已自动拒绝（UI 暂不支持交互对话框）")
             }
         case "select", "input", "editor":
             if let rid = e["id"].string {
-                proc?.send(["type": "extension_ui_response", "id": rid, "cancelled": true])
+                backend?.send(["type": "extension_ui_response", "id": rid, "cancelled": true], failure: nil)
                 appendSystem("扩展对话框「\(e["title"].string ?? method)」已自动取消")
             }
         default:
@@ -2810,13 +2813,13 @@ final class ChatSession: ObservableObject, Identifiable {
             flash("会话尚未保存，稍后再试")
             return
         }
-        guard let proc else {
+        guard let backend else {
             flash("pi 未运行，无法创建分支")
             return
         }
 
         isSendingFromQueue = true
-        proc.request(["type": "get_entries"]) { [weak self] response in
+        backend.request(["type": "get_entries"]) { [weak self] response in
             guard let self else { return }
             guard response["success"].bool == true else {
                 self.isSendingFromQueue = false
@@ -2850,7 +2853,7 @@ final class ChatSession: ObservableObject, Identifiable {
             case .fork(let nextUserEntryId):
                 request = ["type": "fork", "entryId": nextUserEntryId]
             }
-            proc.request(request) { [weak self] branchResponse in
+            backend.request(request) { [weak self] branchResponse in
                 guard let self else { return }
                 guard branchResponse["success"].bool == true,
                       branchResponse["data"]["cancelled"].bool != true else {
@@ -2859,7 +2862,7 @@ final class ChatSession: ObservableObject, Identifiable {
                     return
                 }
 
-                proc.request(["type": "get_state"]) { [weak self] stateResponse in
+                backend.request(["type": "get_state"]) { [weak self] stateResponse in
                     guard let self else { return }
                     let newPath = stateResponse["data"]["sessionFile"].string
                     guard stateResponse["success"].bool != false,
@@ -2901,16 +2904,16 @@ final class ChatSession: ObservableObject, Identifiable {
         path: String,
         completion: @escaping (String?) -> Void
     ) {
-        guard let proc else {
+        guard let backend else {
             completion("pi 未运行，无法恢复原会话")
             return
         }
-        proc.request(["type": "switch_session", "sessionPath": path]) { [weak self] response in
+        backend.request(["type": "switch_session", "sessionPath": path]) { [weak self] response in
             guard let self else { return }
             guard response["success"].bool == true,
                   response["data"]["cancelled"].bool != true else {
                 let switchError = response["error"].string ?? "未知错误"
-                proc.request(["type": "get_state"]) { [weak self] stateResponse in
+                backend.request(["type": "get_state"]) { [weak self] stateResponse in
                     guard let self else { return }
                     let stateRefreshed = stateResponse["success"].bool != false
                     if stateRefreshed {
@@ -2931,7 +2934,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 return
             }
             self.bindSessionFileAfterConfirmedSwitch(path)
-            proc.request(["type": "get_state"]) { [weak self] stateResponse in
+            backend.request(["type": "get_state"]) { [weak self] stateResponse in
                 guard let self else { return }
                 let stateError: String?
                 if stateResponse["success"].bool == false {
@@ -2982,7 +2985,7 @@ final class ChatSession: ObservableObject, Identifiable {
             flash("请等待当前任务结束")
             return
         }
-        guard proc != nil else {
+        guard backend != nil else {
             flash("pi 未运行，无法编辑消息")
             editingItemId = nil
             return
@@ -3037,7 +3040,7 @@ final class ChatSession: ObservableObject, Identifiable {
             flash("会话尚未保存，稍后再试")
             return
         }
-        guard proc != nil else {
+        guard backend != nil else {
             flash("pi 未运行，无法重发消息")
             return
         }
@@ -3057,7 +3060,7 @@ final class ChatSession: ObservableObject, Identifiable {
             flash("请等待当前任务结束")
             return
         }
-        guard proc != nil else {
+        guard backend != nil else {
             flash("pi 未运行，无法重试")
             return
         }
@@ -3100,12 +3103,12 @@ final class ChatSession: ObservableObject, Identifiable {
         previousPath: String,
         actionNoun: String
     ) {
-        guard let proc else {
+        guard let backend else {
             flash("pi 未运行，无法\(actionNoun)消息")
             return
         }
         isSendingFromQueue = true
-        proc.request(["type": "fork", "entryId": entryId]) { [weak self] response in
+        backend.request(["type": "fork", "entryId": entryId]) { [weak self] response in
             guard let self else { return }
             guard response["success"].bool == true,
                   response["data"]["cancelled"].bool != true else {
@@ -3113,7 +3116,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 self.flash(response["error"].string ?? "\(actionNoun)失败")
                 return
             }
-            self.proc?.request(["type": "get_state"]) { [weak self] stateResponse in
+            self.backend?.request(["type": "get_state"]) { [weak self] stateResponse in
                 guard let self else { return }
                 guard stateResponse["success"].bool != false else {
                     self.restorePreviousSessionAfterFailedEdit(
@@ -3184,12 +3187,12 @@ final class ChatSession: ObservableObject, Identifiable {
         reason: String,
         actionNoun: String = "编辑"
     ) {
-        guard let proc else {
+        guard let backend else {
             isSendingFromQueue = false
             flash("\(actionNoun)未发送：\(reason)；pi 未运行，无法恢复原会话")
             return
         }
-        proc.request(["type": "switch_session", "sessionPath": previousPath]) { [weak self] response in
+        backend.request(["type": "switch_session", "sessionPath": previousPath]) { [weak self] response in
             guard let self else { return }
             let switchedBack = response["success"].bool == true
                 && response["data"]["cancelled"].bool != true
@@ -3211,7 +3214,7 @@ final class ChatSession: ObservableObject, Identifiable {
         switchError: String?,
         actionNoun: String = "编辑"
     ) {
-        proc?.request(["type": "get_state"]) { [weak self] stateResponse in
+        backend?.request(["type": "get_state"]) { [weak self] stateResponse in
             guard let self else { return }
             let stateRefreshed = stateResponse["success"].bool != false
             if stateRefreshed {
@@ -3254,11 +3257,11 @@ final class ChatSession: ObservableObject, Identifiable {
         pendingStreamMessage = nil
         pendingToolRuns.removeAll(keepingCapacity: false)
 
-        guard let proc else {
+        guard let backend else {
             completion("pi 未运行，无法刷新会话")
             return
         }
-        proc.request(["type": "get_messages"]) { [weak self] response in
+        backend.request(["type": "get_messages"]) { [weak self] response in
             guard let self else { return }
             guard response["success"].bool != false else {
                 completion(response["error"].string ?? "无法刷新编辑后的会话")
@@ -3361,7 +3364,7 @@ final class ChatSession: ObservableObject, Identifiable {
         if let builtinName = RemotePromptPolicy.rejectedBuiltinName(in: trimmed) {
             return .rejectedBuiltin(builtinName)
         }
-        guard processAlive, proc != nil, !isInitializing,
+        guard processAlive, backend != nil, !isInitializing,
               !isStreaming, !isSendingFromQueue else { return .unavailable }
 
         do {
@@ -3406,7 +3409,7 @@ final class ChatSession: ObservableObject, Identifiable {
         if let builtinName = RemotePromptPolicy.rejectedBuiltinName(in: trimmed) {
             return .rejectedBuiltin(builtinName)
         }
-        guard processAlive, proc != nil else { return .unavailable }
+        guard processAlive, backend != nil else { return .unavailable }
 
         let prepared = prepareMessage(text: trimmed, images: [])
         if isStreaming || isSendingFromQueue {
@@ -3722,7 +3725,7 @@ final class ChatSession: ObservableObject, Identifiable {
         streamRequestStartedAt = Date()
         streamFirstTokenAt = nil
         // Never set streamingBehavior: "steer" — busy delivery is local queue + idle drain.
-        proc?.request(cmd) { [weak self] resp in
+        backend?.request(cmd) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool != true {
                 self.lastError = resp["error"].string ?? "发送失败"
@@ -3791,13 +3794,13 @@ final class ChatSession: ObservableObject, Identifiable {
         publishQueue()
         cancelSideChannelTitle()
         // intercept flag only; items stay until idle drain
-        proc?.send(["type": "abort"])
+        backend?.send(["type": "abort"], failure: nil)
         // Backstop: pi's abort can hang forever when the in-flight tool child ignores
         // its AbortSignal — tiered escalation (descendants SIGTERM → SIGKILL → kill+respawn)
         // guarantees `isStopping` never sticks past the shutdown delay.
         // 压缩中 upstream 不会 abortCompaction，scheduleStopEscalation 自动改用压缩专用
         // 短时间线（数秒内杀 pi + 按原会话重开，磁盘会话保持压缩前状态）。
-        if proc?.isRunning == true {
+        if backend?.isRunning == true {
             if isCompacting {
                 Log.warn("stop during compaction: compaction-specific escalation armed", category: .session)
             }
@@ -3866,14 +3869,14 @@ final class ChatSession: ObservableObject, Identifiable {
         stopEscalationToken &+= 1
     }
 
-    /// Tier-1/2 动作：对 pi 的后代进程发信号。生产走 `proc.signalDescendants`
+    /// Tier-1/2 动作：对 pi 的后代进程发信号。生产走 `backend.signalDescendants`
     /// （内部有 isRunning 守卫，nil/死进程均安全 no-op）；测试注入记录器。
     private func stopEscalationSignal(_ sig: Int32) {
         if let stopEscalationSignalSink {
             stopEscalationSignalSink(sig)
             return
         }
-        proc?.signalDescendants(sig)
+        backend?.signalDescendants(sig)
     }
 
     /// Tier-3 动作：复用现有 kill+respawn 路径。AppStore 注入的 `onRequestRestart` 走
@@ -3931,7 +3934,7 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     func setModel(_ m: ModelInfo) {
-        proc?.request(["type": "set_model", "provider": m.provider, "modelId": m.modelId]) { [weak self] resp in
+        backend?.request(["type": "set_model", "provider": m.provider, "modelId": m.modelId]) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool == true {
                 self.model = m
@@ -3947,7 +3950,7 @@ final class ChatSession: ObservableObject, Identifiable {
                     }
                 }
                 self.refreshThinkingLevels()
-                self.proc?.request(["type": "get_state"]) { [weak self] r in self?.applyState(r["data"]) }
+                self.backend?.request(["type": "get_state"]) { [weak self] r in self?.applyState(r["data"]) }
                 // Authoritative refresh: get_session_stats re-reads current model's window + tokens
                 self.refreshStats()
                 // Re-bind quota/balance monitors for the new provider, then force-refresh.
@@ -3961,7 +3964,7 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     func setThinkingLevel(_ level: String) {
-        proc?.request(["type": "set_thinking_level", "level": level]) { [weak self] resp in
+        backend?.request(["type": "set_thinking_level", "level": level]) { [weak self] resp in
             if resp["success"].bool == true { self?.thinkingLevel = level }
         }
     }
@@ -3971,7 +3974,7 @@ final class ChatSession: ObservableObject, Identifiable {
         guard !trimmed.isEmpty else { return }
         // Any public rename path stops auto title jobs (slash / AppStore / UI).
         markUserRenamedTitle()
-        proc?.request(["type": "set_session_name", "name": trimmed]) { [weak self] resp in
+        backend?.request(["type": "set_session_name", "name": trimmed]) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool == true {
                 self.sessionName = trimmed
@@ -4000,15 +4003,15 @@ final class ChatSession: ObservableObject, Identifiable {
             sessionKey: bridgeRoutingKey,
             revokeConsent: true
         )
-        guard let proc else {
+        guard let backend else {
             onExited?()
             return
         }
         guard let onExited else {
-            proc.terminate()
+            backend.terminate()
             return
         }
-        if !proc.isRunning {
+        if !backend.isRunning {
             onExited()
             return
         }
@@ -4018,15 +4021,15 @@ final class ChatSession: ObservableObject, Identifiable {
             settled = true
             onExited()
         }
-        let previous = proc.onExit
-        proc.onExit = { code, stderr in
+        let previous = backend.onExit
+        backend.onExit = { code, stderr in
             previous?(code, stderr)
             finish()
         }
-        proc.terminate()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak proc] in
+        backend.terminate()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak backend] in
             if !settled {
-                proc?.forceKill()
+                backend?.forceKill()
             }
             // Force-kill should still trip terminationHandler; hard cap so restart always proceeds.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -4257,7 +4260,7 @@ extension ChatSession {
     /// （与 pipiui_reload 同一传输通道）。面板不本地改状态——agent 以 aborted 结束后
     /// 经生命周期上报自然落终态；这里只置 abortPending 让按钮置灰防重复点击。
     func abortSubagent(_ agentId: String) {
-        guard let proc else {
+        guard let backend else {
             flash("pi 未运行，无法中止 subagent")
             return
         }
@@ -4268,7 +4271,7 @@ extension ChatSession {
             return
         }
         subagents.markAbortPending(agentId)
-        proc.request(["type": "prompt", "message": "/subagent_abort \(agentId)"]) { [weak self] resp in
+        backend.request(["type": "prompt", "message": "/subagent_abort \(agentId)"]) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool != true {
                 self.subagents.clearAbortPending(agentId)
@@ -4282,7 +4285,7 @@ extension ChatSession {
 
 extension ChatSession: BuiltinCommandHost {
     func runCompact() {
-        proc?.request(["type": "compact"]) { [weak self] resp in
+        backend?.request(["type": "compact"]) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool != true {
                 self.flash(resp["error"].string ?? "压缩失败")
@@ -4292,19 +4295,19 @@ extension ChatSession: BuiltinCommandHost {
     }
 
     func runReload() {
-        guard let proc else {
+        guard let backend else {
             flash("pi 未运行，无法重载")
             return
         }
         // Direct RPC prompt → extension command; do not use sendPrompt (builtin gate / queue).
-        proc.request(["type": "prompt", "message": "/pipiui_reload"]) { [weak self] resp in
+        backend.request(["type": "prompt", "message": "/pipiui_reload"]) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool != true {
                 self.flash(resp["error"].string ?? "重载失败")
                 return
             }
             // Refresh command list (extension commands may have changed).
-            proc.request(["type": "get_commands"]) { [weak self] r2 in
+            backend.request(["type": "get_commands"]) { [weak self] r2 in
                 guard let self else { return }
                 if r2["success"].bool == true {
                     self.availableCommands = SlashCommandParser.parseGetCommandsResponse(r2)
@@ -4330,12 +4333,12 @@ extension ChatSession: BuiltinCommandHost {
         // Refresh then flash current snapshot (callbacks update published fields).
         currentQuotaMonitor?.refreshIfNeeded(force: true)
         currentBalanceMonitor?.refreshIfNeeded(force: true)
-        proc?.request(["type": "get_session_stats"]) { [weak self] resp in
+        backend?.request(["type": "get_session_stats"]) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool == true {
                 self.applySessionStats(resp["data"])
             }
-            self.proc?.request(["type": "get_state"]) { [weak self] stateResp in
+            self.backend?.request(["type": "get_state"]) { [weak self] stateResp in
                 guard let self else { return }
                 self.applyState(stateResp["data"])
                 let modelName = self.model?.id ?? "(无模型)"
@@ -4359,7 +4362,7 @@ extension ChatSession: BuiltinCommandHost {
     }
 
     func runExportHTML() {
-        proc?.request(["type": "export_html"]) { [weak self] resp in
+        backend?.request(["type": "export_html"]) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool == true, let path = resp["data"]["path"].string {
                 self.flash("已导出 HTML：\(path)")
