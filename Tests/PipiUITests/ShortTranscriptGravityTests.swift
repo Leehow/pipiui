@@ -111,7 +111,7 @@ final class ShortTranscriptGravityTests: XCTestCase {
                 contentHeight: documentHeight,
                 visibleHeight: viewport,
                 documentIsFlipped: true,
-                pinEdge: .documentEnd
+                pinEdge: .documentStart
             ),
             0
         )
@@ -196,8 +196,9 @@ final class ShortTranscriptGravityTests: XCTestCase {
         XCTAssertFalse(content.contains(".scrollPosition(id:"))
         XCTAssertFalse(content.contains("scrollTopID"))
         XCTAssertFalse(content.contains(".defaultScrollAnchor(.bottom)"))
-        XCTAssertTrue(source.contains(".defaultScrollAnchor(.bottom, for: .initialOffset)"))
-        XCTAssertTrue(source.contains("scrollTo(transcriptID(\"bottom\"), anchor: .bottom)"))
+        XCTAssertTrue(source.contains(".defaultScrollAnchor(pinned ? .top : .bottom, for: .initialOffset)"))
+        XCTAssertTrue(source.contains("scrollTo(transcriptID(\"bottom\"), anchor: .top)"))
+        XCTAssertTrue(content.contains(".transcriptFlip()"))
         XCTAssertTrue(content.contains(".id(TranscriptSessionRootIdentity(sessionKey: session.bridgeRoutingKey))"))
     }
 

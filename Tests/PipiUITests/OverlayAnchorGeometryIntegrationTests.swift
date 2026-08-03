@@ -3,7 +3,8 @@ import AppKit
 import SwiftUI
 @testable import PipiUI
 
-/// Integration probe for the internal-anchor prepend-compensation geometry.
+/// Historical overlay-host geometry plus the independent empty-spacing contract.
+/// Production no longer uses this geometry to preserve history position.
 ///
 /// Two scenes, both run inside a real `NSScrollView` with an `NSHostingView`
 /// document:
@@ -13,8 +14,8 @@ import SwiftUI
 ///    the eager outer VStack. SwiftUI expands that into ONE overlay host **per
 ///    row**, and the production coordinator's `anchorView` (the last
 ///    `updateNSView` call = the top-most row host) is REBOUND to a new host on
-///    every prepend, so the tracked converted minY/maxY never move. This is
-///    the measured reason the old compensation could never apply; kept as a
+///    every prepend, so the tracked converted minY/maxY never move. This is a
+///    measured distinction from a single container overlay; kept as a
 ///    deterministic reproducer of the non-production contract.
 ///
 /// 2. **Production** (`ProbeTranscriptContent`) — the settled `ForEach` lives
@@ -46,8 +47,7 @@ final class OverlayAnchorGeometryIntegrationTests: XCTestCase {
     /// The legacy shape (`ForEach { rows }.overlay { tracker }` inside the
     /// outer VStack) is measured to produce one overlay host PER ROW and to
     /// REBIND the tracked anchor to a new top-row host on every prepend — so
-    /// the tracked converted minY/maxY never move and the prepend compensation
-    /// can never apply. This test pins those facts as the non-production
+    /// the tracked converted minY/maxY never move. This test pins those facts as the non-production
     /// contract; the production-shape test below is the fix contract.
     func testLegacyForEachOverlayContractProducesPerRowHostsAndRebind() throws {
         let settled: [Int] = [1, 2, 3, 4, 5]
@@ -179,8 +179,8 @@ final class OverlayAnchorGeometryIntegrationTests: XCTestCase {
         XCTAssertEqual(afterPrepend.convertedMinY, afterPrepend.convertedMaxY, accuracy: 0.5, "minY must equal maxY with zero height")
 
         // 5. Prepend K=3 (row 30, spacing 9): the converted anchor point moves
-        //    by exactly 3 * 39 = 117, and `targetOriginY` equals the old clip
-        //    origin + 117 (unclamped: viewport 220 < content 372 after prepend).
+        //    by exactly 3 * 39 = 117. This remains useful geometry coverage;
+        //    production no longer uses this displacement to move the clip.
         XCTAssertEqual(
             actualDelta, expectedDelta, accuracy: 0.5,
             "converted anchor delta under a K=3 prepend must equal K * (row + spacing)"
@@ -189,47 +189,18 @@ final class OverlayAnchorGeometryIntegrationTests: XCTestCase {
             afterPrepend.documentHeight - before.documentHeight, expectedDelta, accuracy: 0.5,
             "document must grow by exactly the prepended rows + their gaps"
         )
-        let clipOriginBefore: CGFloat = 20
-        let target = PrependAnchorCompensation.targetOriginY(
-            clipOriginYBefore: clipOriginBefore,
-            anchorYBefore: before.convertedMinY,
-            anchorYNow: afterPrepend.convertedMinY,
-            contentHeight: afterPrepend.documentHeight,
-            viewportHeight: harness.scrollView.contentView.bounds.height
-        )
-        XCTAssertEqual(
-            target ?? .nan, clipOriginBefore + expectedDelta, accuracy: 0.5,
-            "targetOriginY must equal the pre-prepend clip origin plus the anchor displacement"
-        )
-
         // 6. Bottom-extra churn (+150): the document grows by exactly 150 but
-        //    the anchor converted Y delta is 0, and the pure compensation must
-        //    refuse to apply (returns nil).
+        //    the settled-container anchor remains stationary.
         XCTAssertEqual(afterChurn.documentHeight - afterPrepend.documentHeight, 150, accuracy: 0.5)
         XCTAssertEqual(
             afterChurn.convertedMinY, afterPrepend.convertedMinY, accuracy: 0.02,
             "bottom-extras churn must never move the anchor"
         )
-        XCTAssertNil(
-            PrependAnchorCompensation.targetOriginY(
-                clipOriginYBefore: clipOriginBefore,
-                anchorYBefore: afterPrepend.convertedMinY,
-                anchorYNow: afterChurn.convertedMinY,
-                contentHeight: afterChurn.documentHeight,
-                viewportHeight: harness.scrollView.contentView.bounds.height
-            ),
-            "a bottom-only churn must yield no compensation target"
-        )
-
-        // 7. Notification path: the *document* frameDidChange fires when the
-        //    prepend layout lands (production schedules the top-edge evaluation
-        //    / compensation attempt on it). The anchor's own frame notification
-        //    is deliberately NOT required: SwiftUI moves the single overlay
-        //    host, and the coordinator reads the anchor position live from the
-        //    document coordinate at evaluation time.
+        // 7. Notification path: document frameDidChange remains observable when
+        //    the eager settled container grows.
         XCTAssertGreaterThan(
             counter.documentFrameCount, 0,
-            "document frameDidChange must fire on prepend (schedules the compensation layout attempt)"
+            "document frameDidChange must fire when the eager container grows"
         )
     }
 

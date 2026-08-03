@@ -130,7 +130,7 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertTrue(after.isLatest)
     }
 
-    func testHistoryPrependOnlyGrowsOldestEndOnePageAtATime() {
+    func testHistoryExpansionOnlyGrowsOldestEndOnePageAtATime() {
         // 200 items, latest page 6. Each exact-top arrival adds exactly one older
         // page and the newest end (200) is never dropped while browsing.
         let first = TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: 5)
@@ -151,14 +151,14 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         }
     }
 
-    func testPrependerAddsExactlyOnePageUntilPageZero() {
+    func testExpanderAddsExactlyOnePageUntilPageZero() {
         // Each exact-top arrival decrements the start page by exactly one.
-        XCTAssertEqual(TranscriptHistoryPrepender.prepend(currentStartPage: 6), 5)
-        XCTAssertEqual(TranscriptHistoryPrepender.prepend(currentStartPage: 2), 1)
-        XCTAssertEqual(TranscriptHistoryPrepender.prepend(currentStartPage: 1), 0)
+        XCTAssertEqual(TranscriptHistoryExpander.expand(currentStartPage: 6), 5)
+        XCTAssertEqual(TranscriptHistoryExpander.expand(currentStartPage: 2), 1)
+        XCTAssertEqual(TranscriptHistoryExpander.expand(currentStartPage: 1), 0)
         // No older page: stop. No visible-page bookkeeping exists anymore.
-        XCTAssertNil(TranscriptHistoryPrepender.prepend(currentStartPage: 0))
-        XCTAssertNil(TranscriptHistoryPrepender.prepend(currentStartPage: -1))
+        XCTAssertNil(TranscriptHistoryExpander.expand(currentStartPage: 0))
+        XCTAssertNil(TranscriptHistoryExpander.expand(currentStartPage: -1))
     }
 
     func testInitialWindowGrowsOnePagePerTopArrival() {
@@ -171,7 +171,7 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
                 TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: head).range
             )
             let current = head ?? TranscriptRenderWindow.latestStartPage(itemCount: 200)
-            head = TranscriptHistoryPrepender.prepend(currentStartPage: current)
+            head = TranscriptHistoryExpander.expand(currentStartPage: current)
         }
         XCTAssertEqual(ranges[0], 192..<200)
         XCTAssertEqual(ranges[1], 160..<200)
@@ -247,9 +247,9 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertFalse(transcript.contains("LazyStack"))
         XCTAssertFalse(transcript.contains("session.transcriptVisibleCount"))
         XCTAssertFalse(transcript.contains("+= 200"))
-        XCTAssertTrue(transcript.contains("pinEdge: .documentEnd"))
-        XCTAssertFalse(transcript.contains(".reversed()"))
-        XCTAssertFalse(transcript.contains(".transcriptFlip()"))
+        XCTAssertTrue(transcript.contains("pinEdge: .documentStart"))
+        XCTAssertTrue(transcript.contains("ForEach(presentation.rows.reversed()"))
+        XCTAssertTrue(transcript.contains(".transcriptFlip()"))
         // One-way window: no page buttons, no whole-window replacement id.
         XCTAssertFalse(transcript.contains("renderIdentity"))
         XCTAssertFalse(transcript.contains("transcriptHistoryWindowEnd"))
@@ -266,14 +266,13 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertFalse(transcript.contains("lastPlannedRange"))
         XCTAssertFalse(transcript.contains("trackPlannedWindow"))
         XCTAssertTrue(transcript.contains("transcriptOldestLoadedPage"))
-        XCTAssertTrue(transcript.contains("TranscriptHistoryPrepender.prepend"))
-        // History loading may only act while unpinned (the exact-top gate).
-        XCTAssertTrue(transcript.contains("guard !session.pinTranscriptToBottom"))
-        XCTAssertTrue(transcript.contains("topLoadingEnabled"))
-        // No preload band and no page-seam/visible-page estimation anywhere.
+        // One explicit pager owns both non-scrollable safety backfill and
+        // user-driven near-top prefetch.
+        XCTAssertTrue(transcript.contains("TranscriptHistoryPager.begin"))
+        XCTAssertTrue(transcript.contains("historyPageLoadState"))
+        XCTAssertTrue(transcript.contains("historyLoadingEnabled"))
         XCTAssertTrue(transcript.contains("onReachedTop:"))
         XCTAssertFalse(transcript.contains("onNearTop"))
-        XCTAssertFalse(transcript.contains("nearTopThreshold"))
         XCTAssertFalse(transcript.contains("visiblePage"))
         XCTAssertFalse(transcript.contains("lastPrependTriggerID"))
 
@@ -284,11 +283,19 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         let bottom = try XCTUnwrap(
             transcript.range(of: ".id(transcriptID(\"bottom\"))")?.lowerBound
         )
-        XCTAssertLessThan(history, streaming)
-        XCTAssertLessThan(streaming, bottom)
+        let elapsed = try XCTUnwrap(transcript.range(of: "TurnElapsedText(")?.lowerBound)
+        let streamingRow = try XCTUnwrap(
+            transcript.range(of: "MessageRow(", range: streaming..<transcript.endIndex)?.lowerBound
+        )
+        // Inverted layout is bottom-to-top: bottom extras first, newest-first
+        // settled rows later. Older history appends at the layout end.
+        XCTAssertLessThan(bottom, streaming)
+        XCTAssertLessThan(streaming, elapsed)
+        XCTAssertLessThan(elapsed, streamingRow)
+        XCTAssertLessThan(streamingRow, history)
     }
 
-    func testHistoryTopLoadingUsesExactTopEdgeNotRowIds() throws {
+    func testHistoryLoadingUsesNearTopGeometryNotRowIds() throws {
         let source = try chatDetailSource()
         let start = try XCTUnwrap(
             source.range(of: "private struct StreamingTranscriptRows: View")?.lowerBound
@@ -308,29 +315,33 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertFalse(transcript.contains("visiblePage(from:"))
         XCTAssertFalse(transcript.contains("scrollTopID"))
         XCTAssertFalse(transcript.contains(".scrollPosition("))
-        // The tracker receives the loading gate and the exact-top callback.
+        // The tracker receives the loading gate and near-top callback.
         XCTAssertTrue(transcript.contains("topLoadingEnabled:"))
         XCTAssertTrue(transcript.contains("onReachedTop:"))
         XCTAssertTrue(transcript.contains("StickToBottomTracker("))
-        XCTAssertTrue(transcript.contains("pinEdge: .documentEnd"))
-        // The callback still goes through the pure one-way prepender and guards pin.
-        XCTAssertTrue(transcript.contains("TranscriptHistoryPrepender.prepend"))
-        XCTAssertTrue(transcript.contains("guard !session.pinTranscriptToBottom"))
+        XCTAssertTrue(transcript.contains("pinEdge: .documentStart"))
+        XCTAssertTrue(source.contains("distanceFromDocumentEnd("))
+        // The callback goes through the one-page pager. Pinned non-scrollable
+        // windows are intentionally allowed to safety-backfill.
+        XCTAssertTrue(transcript.contains("TranscriptHistoryPager.begin"))
+        XCTAssertFalse(transcript.contains("guard !session.pinTranscriptToBottom"))
         XCTAssertTrue(transcript.contains("transcriptOldestLoadedPage"))
         XCTAssertTrue(transcript.contains("latestStartPage(itemCount: items.count)"))
+        XCTAssertTrue(transcript.contains("正在加载更早消息…"))
+        XCTAssertTrue(transcript.contains("还没有消息"))
+        XCTAssertTrue(transcript.contains("forcedVisibleSettledRowID"))
     }
 
     func testMainTranscriptHasNoScrollPositionAnchorOrMessageIDTrigger() throws {
         let source = try chatDetailSource()
-        // The SwiftUI id-based anchor is fully removed: it has repeatedly been
-        // measured to jump during prepends. The AppKit exact-top edge plus
-        // clip-offset compensation in StickToBottomTracker own history loading.
+        // No identity or offset compensation route remains. The inverted eager
+        // stack preserves position structurally by appending older rows.
         XCTAssertFalse(source.contains(".scrollPosition(id:"))
         XCTAssertFalse(source.contains("scrollTopID"))
         XCTAssertFalse(source.contains("onNearTop"))
         XCTAssertFalse(source.contains("TranscriptNearTopTrigger"))
         // Explicit ScrollViewReader jumps (bottom / message targets) remain.
-        XCTAssertTrue(source.contains("proxy.scrollTo(transcriptID(\"bottom\"), anchor: .bottom)"))
+        XCTAssertTrue(source.contains("proxy.scrollTo(transcriptID(\"bottom\"), anchor: .top)"))
         XCTAssertTrue(source.contains("proxy.scrollTo(target, anchor: jumpAnchor)"))
     }
 
@@ -363,7 +374,7 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertTrue(initialAnchor.contains("#available(macOS 15.0, *)"))
         XCTAssertTrue(
             initialAnchor.contains(
-                ".defaultScrollAnchor(pinned ? .bottom : .top, for: .initialOffset)"
+                ".defaultScrollAnchor(pinned ? .top : .bottom, for: .initialOffset)"
             )
         )
         XCTAssertFalse(initialAnchor.contains("#available(macOS 15.0, *), pinned"))
@@ -376,7 +387,7 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertTrue(content.contains(".modifier(InitialBottomOffsetAnchor"))
         XCTAssertTrue(source.contains("BottomSettledCover.needsCover"))
         XCTAssertTrue(source.contains("bottomSettledSessionKey"))
-        XCTAssertTrue(source.contains("proxy.scrollTo(transcriptID(\"bottom\"), anchor: .bottom)"))
+        XCTAssertTrue(source.contains("proxy.scrollTo(transcriptID(\"bottom\"), anchor: .top)"))
         XCTAssertTrue(source.contains("markBottomSettledIfCurrent"))
         // Stale jump/settle callbacks must be key-guarded.
         XCTAssertTrue(source.contains("session.bridgeRoutingKey == key"))
@@ -394,57 +405,45 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         )
     }
 
-    func testTrackerOwnsExactTopEdgeAndPendingPrependCompensation() throws {
+    func testTrackerOwnsInvertedHistoryPrefetchWithoutAppendCompensation() throws {
         let source = try chatDetailSource()
         let trackerStart = try XCTUnwrap(
             source.range(of: "struct StickToBottomTracker: NSViewRepresentable")?.lowerBound
         )
         let tracker = String(source[trackerStart..<source.endIndex])
 
-        // Exact-top callback reports whether a page was actually prepended.
+        // Near-top callback reports whether one older page was admitted.
         XCTAssertTrue(tracker.contains("var onReachedTop: (() -> Bool)?"))
-        XCTAssertTrue(tracker.contains("TranscriptExactTopTrigger"))
+        XCTAssertTrue(tracker.contains("TranscriptHistoryPrefetchTrigger"))
         XCTAssertFalse(tracker.contains("onNearTop"))
         XCTAssertFalse(tracker.contains("TranscriptNearTopTrigger"))
-        // The exact-top epsilon lives with the pure trigger (whole-file check:
-        // the enum is declared before the tracker struct).
-        XCTAssertTrue(source.contains("exactTopThreshold"))
-        XCTAssertFalse(source.contains("nearTopThreshold"))
-        // Pending prepend compensation: the stable internal anchor displacement
-        // (never the document height — bottom churn must not pollute the delta).
-        XCTAssertTrue(tracker.contains("PendingPrependSnapshot"))
-        XCTAssertTrue(tracker.contains("anchorYBefore"))
-        XCTAssertTrue(tracker.contains("clipOriginYBefore"))
-        XCTAssertTrue(tracker.contains("PrependAnchorCompensation.targetOriginY"))
-        XCTAssertTrue(tracker.contains("applyPendingCompensation"))
-        XCTAssertTrue(tracker.contains("reflectScrolledClipView"))
+        XCTAssertTrue(source.contains("approachThreshold"))
+        XCTAssertTrue(source.contains("distanceFromDocumentEnd("))
+        XCTAssertTrue(tracker.contains("case .documentStart:"))
+        XCTAssertFalse(tracker.contains("PendingPrependSnapshot"))
+        XCTAssertFalse(tracker.contains("anchorYBefore"))
+        XCTAssertFalse(tracker.contains("clipOriginYBefore"))
+        XCTAssertFalse(tracker.contains("PrependAnchorCompensation"))
+        XCTAssertFalse(tracker.contains("applyPendingCompensation"))
+        // One clip mutation remains exclusively for pinned latest-content growth.
         XCTAssertTrue(tracker.contains("clip.scroll(to:"))
-        XCTAssertTrue(tracker.contains("clearPendingCompensation"))
-        XCTAssertFalse(source.contains("distanceFromDocumentEnd"))
+        XCTAssertFalse(tracker.contains("clearPendingCompensation"))
         XCTAssertFalse(source.contains("restoredOriginY"))
-        // The prepend signal is the anchor's document-coordinate displacement.
-        XCTAssertTrue(tracker.contains("anchor.convert(anchor.bounds, to: doc).minY"))
-        // Identity guards clear stale snapshots on session/document/anchor change.
-        XCTAssertTrue(tracker.contains("pending.scrollView === sv"))
-        XCTAssertTrue(tracker.contains("pending.document === doc"))
-        XCTAssertTrue(tracker.contains("pending.anchor === anchorView"))
         XCTAssertTrue(tracker.contains("boundsUpdateGeneration"))
-        // User-scroll gating: attach seed / programmatic scrolls never auto-load.
+        // User-scroll gating applies after content becomes scrollable; a raw
+        // window too short to scroll must auto-backfill instead.
         XCTAssertTrue(tracker.contains("hasObservedUserScroll"))
-        XCTAssertTrue(tracker.contains("enabled: topLoadingEnabled && hasObservedUserScroll"))
-        // The anchor view itself is observed for frame/bounds changes.
-        XCTAssertTrue(tracker.contains("anchorFrameObs"))
-        XCTAssertTrue(tracker.contains("anchorLayoutObserved"))
-        // Dismantle must detach and drop pending state.
+        XCTAssertTrue(tracker.contains("documentNeedsBackfill"))
+        XCTAssertTrue(tracker.contains("hasObservedUserScroll || documentNeedsBackfill"))
+        XCTAssertFalse(tracker.contains("anchorFrameObs"))
+        XCTAssertFalse(tracker.contains("anchorLayoutObserved"))
         XCTAssertTrue(tracker.contains("static func dismantleNSView"))
         XCTAssertTrue(tracker.contains("coordinator.detach()"))
-        // The one-shot safety net is token-guarded, not a repeat loader.
-        XCTAssertTrue(tracker.contains("schedulePendingCleanup"))
-        XCTAssertTrue(tracker.contains("PendingCleanupGuard.shouldClear"))
-        XCTAssertTrue(tracker.contains("pendingCleanupToken"))
+        XCTAssertFalse(tracker.contains("schedulePendingCleanup"))
+        XCTAssertFalse(tracker.contains("pendingCleanupToken"))
     }
 
-    func testTopAnchorSitsAfterSettledRowsBeforeBottomExtras() throws {
+    func testInvertedLayoutPlacesBottomExtrasBeforeNewestFirstSettledRows() throws {
         let source = try chatDetailSource()
         let start = try XCTUnwrap(
             source.range(of: "private struct StreamingTranscriptRows: View")?.lowerBound
@@ -457,9 +456,8 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         )
         let transcript = String(source[start..<end])
 
-        // The tracker/anchor must sit after the settled rows and before every
-        // bottom extra, so its document-coordinate displacement can only come
-        // from a prepend of older pages.
+        // Layout order is the reverse of visual order: bottom extras precede
+        // settled rows, and the observer follows the newest-first ForEach.
         let rows = try XCTUnwrap(transcript.range(of: "ForEach(presentation.rows")?.lowerBound)
         let tracker = try XCTUnwrap(transcript.range(of: "StickToBottomTracker(")?.lowerBound)
         let streaming = try XCTUnwrap(
@@ -483,10 +481,10 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         )
         XCTAssertLessThan(emptyRowsGuard, rows, "the empty-rows guard must precede the settled container")
         XCTAssertLessThan(emptyRowsGuard, tracker, "the empty-rows guard must precede the tracker overlay")
-        XCTAssertLessThan(tracker, streaming, "anchor must precede the streaming item")
-        XCTAssertLessThan(tracker, waiting, "anchor must precede the waiting placeholder")
-        XCTAssertLessThan(tracker, returnButton, "anchor must precede the return button")
-        XCTAssertLessThan(tracker, bottomSentinel, "anchor must precede the bottom sentinel")
+        XCTAssertLessThan(streaming, tracker, "streaming extra must precede rows in inverted layout")
+        XCTAssertLessThan(waiting, tracker, "waiting extra must precede rows in inverted layout")
+        XCTAssertLessThan(returnButton, tracker, "return control must precede rows in inverted layout")
+        XCTAssertLessThan(bottomSentinel, tracker, "bottom sentinel must start inverted layout")
         // The sentinel no longer hosts the tracker in its background.
         XCTAssertFalse(transcript.contains(".background {\n                    // Always mounted"))
 
@@ -494,14 +492,14 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         // container (same spacing as the outer VStack) and the tracker overlay
         // must chain to THAT container, never directly to the ForEach: a direct
         // ForEach.overlay flattens into one per-row host that rebinds on
-        // prepends (measured by the OverlayAnchorGeometryIntegrationTests
+        // head insertions (measured by the OverlayAnchorGeometryIntegrationTests
         // legacy probe), so the anchor could never move in document
         // coordinates. Exactly one tracker may be mounted in the transcript.
         XCTAssertTrue(
             source.contains(
                 "if !presentation.rows.isEmpty {\n"
                     + "                VStack(alignment: .leading, spacing: chatTypography.messageSpacing) {\n"
-                    + "                    ForEach(presentation.rows, id: \\.id)"
+                    + "                    ForEach(presentation.rows.reversed(), id: \\.id)"
             ),
             "the settled ForEach must sit inside its own eager VStack container behind the empty-rows guard"
         )
