@@ -55,6 +55,12 @@ final class JcodeBackend: AgentSessionBackend {
     private let bridge: JcodeBridge
     private var translator = JcodeEventTranslator()
     private var sessionID: String?
+    /// Provider name from runtime_info (e.g. "Claude"/"DeepSeek"), folded onto
+    /// each model id when synthesizing pi-style model list rows. Empty until the
+    /// first runtime_info reply lands.
+    private var providerName: String = ""
+    /// Last-known current model id, refreshed by set_model and runtime_info.
+    private var currentModel: String = ""
     // pending RPCs awaiting reply_to
     private var pending: [Int: (J) -> Void] = [:]
 
@@ -77,6 +83,14 @@ final class JcodeBackend: AgentSessionBackend {
                 if let s = resp["session"] as? [String:Any], let id = s["session_id"] as? String {
                     self.sessionID = id
                     self.isRunning = true
+                    // Best-effort: learn the provider name so model-list rows can
+                    // carry it. Fire-and-forget; loadInitialState re-queries anyway.
+                    self.bridge.request(["req":"get_runtime_info","session_id":id]) { rt in
+                        if (rt["ev"] as? String) == "runtime_info" {
+                            self.providerName = (rt["provider"] as? String) ?? ""
+                            self.currentModel = (rt["model"] as? String) ?? ""
+                        }
+                    }
                     completion(true)
                 } else { completion(false) }
             }
@@ -93,6 +107,13 @@ final class JcodeBackend: AgentSessionBackend {
         var t = translator
         for j in t.translate(event: frame) { onEvent?(j) }
         translator = t
+        // Keep provider/model fresh from pushed events so get_available_models
+        // (which folds providerName onto each id) and get_state stay accurate
+        // after a /model switch.
+        if (frame["ev"] as? String) == "model_info" || (frame["ev"] as? String) == "runtime_info" {
+            if let p = frame["provider"] as? String, !p.isEmpty { providerName = p }
+            if let m = frame["model"] as? String, !m.isEmpty { currentModel = m }
+        }
     }
 
     // MARK: AgentSessionBackend
@@ -113,9 +134,52 @@ final class JcodeBackend: AgentSessionBackend {
         case "prompt":
             sendPrompt(object["message"] as? String ?? "", images: [], completion: { _ in completion?(J(["success":true])) })
         case "get_messages":
-            loadHistory(completion: { items in completion?(J(["success":true,"data":["messages":[]]])) })  // Task 4 refines
+            loadHistory(completion: { items in completion?(J(["success":true,"data":["messages":[]]])) })
         case "get_state":
-            completion?(J(["success":true,"data":[:]]))  // Task 4 fills from runtime_info
+            // jcode has no direct get_state; runtime_info gives the current provider+model.
+            // Translate to pi's expected shape: data.model.{provider,id,name}.
+            guard let sid = sessionID else { completion?(J(["success":true,"data":[:] as [String:Any]])); return }
+            bridge.request(["req":"get_runtime_info","session_id":sid]) { resp in
+                let provider = resp["provider"] as? String ?? ""
+                let model = resp["model"] as? String ?? ""
+                let data: [String: Any] = (resp["ev"] as? String) == "runtime_info"
+                    ? ["model": ["provider": provider, "id": model, "name": model] as [String:Any]]
+                    : [:]
+                completion?(J(["success":true,"data":data]))
+            }
+        case "get_available_models":
+            // jcode's runtime_info carries `routes`: one entry per model with its
+            // own provider + availability. Prefer it over list_models (which is a
+            // flat id[] with no per-model provider and includes models whose
+            // credentials aren't configured). Filter to available routes so the
+            // picker only offers models the user can actually select.
+            guard let sid = sessionID else { completion?(J(["success":true,"data":["models":[]] as [String:Any]])); return }
+            bridge.request(["req":"get_runtime_info","session_id":sid]) { resp in
+                let routes = (resp["routes"] as? [[String:Any]]) ?? []
+                let rows: [[String:Any]] = routes.compactMap { r in
+                    guard (r["available"] as? Bool) == true,
+                          let id = r["model"] as? String else { return nil }
+                    return [
+                        "provider": (r["provider"] as? String) ?? self.providerName,
+                        "id": id,
+                        "name": id,
+                    ]
+                }
+                completion?(J(["success":true,"data":["models":rows] as [String:Any]]))
+            }
+        case "set_model":
+            // pi sends provider + modelId; jcode wants session_id + model (id string).
+            guard let sid = sessionID else { completion?(J(["success":false,"error":"no session"])); return }
+            let modelId = (object["modelId"] as? String) ?? ""
+            bridge.request(["req":"set_model","session_id":sid,"model":modelId]) { resp in
+                let ok = (resp["ev"] as? String) != "error"
+                if ok { self.currentModel = modelId }
+                completion?(J(["success":ok]))
+            }
+        case "get_available_thinking_levels":
+            // jcode uses set_reasoning_effort with a different vocabulary; expose a
+            // minimal set so the picker isn't empty. Mapping refinement is Plan C.
+            completion?(J(["success":true,"data":["levels":["off","low","medium","high"]] as [String:Any]]))
         default:
             completion?(J(["success":true]))  // ack for pi-only RPCs jcode doesn't have
         }
