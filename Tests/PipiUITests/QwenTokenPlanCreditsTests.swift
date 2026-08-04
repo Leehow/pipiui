@@ -1,5 +1,6 @@
 import XCTest
 @testable import PipiUI
+import WebKit
 
 /// Tests for the Aliyun Bailian Qwen Token Plan personal-plan quota integration.
 /// All tests are offline: parsing uses a fixture, and the no-cookie path uses an
@@ -99,5 +100,42 @@ final class QwenTokenPlanCreditsTests: XCTestCase {
 
     func testAccountLabelNonEmpty() {
         XCTAssertEqual(QuotaProvider.qwenTokenPlan.accountLabel, "Qwen Token Plan 额度")
+    }
+
+    // MARK: - Cookie persistence (offline)
+
+    /// WebKit store empty + persisted cache present → cookieString returns the cache.
+    func testCookieStringFallsBackToCacheWhenWebKitEmpty() async throws {
+        let cached = "aliyun_session=abc123; aliyun_identity=xyz"
+        QwenTokenPlanAuthStore.persistCookie(cached)
+        defer {
+            UserDefaults.standard.removeObject(forKey: "qwenTokenPlanCookie")
+        }
+
+        // An empty WKWebsiteDataStore yields no cookies → falls back to cache.
+        let store = WKWebsiteDataStore.nonPersistent()
+        let result = await QwenTokenPlanAuthStore.cookieString(store: store)
+        XCTAssertEqual(result, cached)
+    }
+
+    /// Persist + read helpers round-trip correctly.
+    func testCookieCacheRoundTrip() {
+        defer {
+            UserDefaults.standard.removeObject(forKey: "qwenTokenPlanCookie")
+        }
+        XCTAssertNil(QwenTokenPlanAuthStore.cachedCookie())
+        QwenTokenPlanAuthStore.persistCookie("k=v; k2=v2")
+        XCTAssertEqual(QwenTokenPlanAuthStore.cachedCookie(), "k=v; k2=v2")
+    }
+
+    /// No cache and empty WebKit store → nil.
+    func testCookieStringReturnsNilWhenBothEmpty() async throws {
+        UserDefaults.standard.removeObject(forKey: "qwenTokenPlanCookie")
+        defer {
+            UserDefaults.standard.removeObject(forKey: "qwenTokenPlanCookie")
+        }
+        let store = WKWebsiteDataStore.nonPersistent()
+        let result = await QwenTokenPlanAuthStore.cookieString(store: store)
+        XCTAssertNil(result)
     }
 }

@@ -13,9 +13,33 @@ let bailianTokenPlanURL = "https://bailian.console.aliyun.com/cn-beijing?tab=pla
 /// session cookies (including httpOnly) land in `WKWebsiteDataStore.default()`.
 /// We read those cookies and forward them to the usage API. No API key is used.
 enum QwenTokenPlanAuthStore {
+    /// UserDefaults key holding the last-seen session cookie string.
+    ///
+    /// WebKit's `WKWebsiteDataStore.default()` does not persist cookies to disk on
+    /// macOS (only LocalStorage/IndexedDB survive a restart), so we cache the cookie
+    /// ourselves to survive App restarts. Plaintext UserDefaults is fine for this
+    /// single-user macOS MVP; a future hardening pass could move this to the Keychain.
+    private static let cookieCacheKey = "qwenTokenPlanCookie"
+
+    /// Writes the session cookie string to the persistence cache.
+    static func persistCookie(_ cookie: String) {
+        UserDefaults.standard.set(cookie, forKey: cookieCacheKey)
+    }
+
+    /// Reads the cached session cookie string, if any.
+    static func cachedCookie() -> String? {
+        UserDefaults.standard.string(forKey: cookieCacheKey)
+    }
+
     /// Builds a `name=value; ...` Cookie header value from every cookie whose
-    /// domain contains `aliyun.com` or `alibabacloud.com`. Returns nil when none
-    /// are present (user hasn't logged in).
+    /// domain contains `aliyun.com` or `alibabacloud.com`.
+    ///
+    /// When the WebKit store holds cookies (logged in just now, or this session),
+    /// we persist the resulting string so it survives a restart, then return it.
+    /// When the WebKit store is empty (fresh launch before WebKit loads cookies),
+    /// we fall back to the persisted cache. Returns nil only when neither source
+    /// has a cookie (user never logged in, or the cached cookie has expired and
+    /// was cleared).
     static func cookieString(
         store: WKWebsiteDataStore? = nil
     ) async -> String? {
@@ -29,11 +53,17 @@ enum QwenTokenPlanAuthStore {
             let domain = cookie.domain.lowercased()
             return domain.contains("aliyun.com") || domain.contains("alibabacloud.com")
         }
-        guard !filtered.isEmpty else { return nil }
-        let joined = filtered
-            .map { "\($0.name)=\($0.value)" }
-            .joined(separator: "; ")
-        return joined.isEmpty ? nil : joined
+        if !filtered.isEmpty {
+            let joined = filtered
+                .map { "\($0.name)=\($0.value)" }
+                .joined(separator: "; ")
+            if !joined.isEmpty {
+                persistCookie(joined)
+                return joined
+            }
+        }
+        // WebKit store empty (restart before WebKit loaded cookies) → fall back to cache.
+        return cachedCookie()
     }
 }
 
