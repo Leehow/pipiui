@@ -45,6 +45,8 @@ public enum ProviderEnvMap {
         "zai-coding-cn": ["ZAI_CODING_CN_API_KEY"],
         // Repo-internal alias for Zhipu/GLM endpoints (see ChatSession.swift).
         "zhipu": ["ZAI_API_KEY"],
+        // PipiUI local extension for Volcengine Ark Coding Plan (provider added in ~/.pi/agent/models.json).
+        "volcengine": ["VOLCENGINE_API_KEY"],
         "opencode": ["OPENCODE_API_KEY"],
         "opencode-go": ["OPENCODE_API_KEY"],
         "radius": ["RADIUS_API_KEY"],
