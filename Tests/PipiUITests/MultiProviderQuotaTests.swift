@@ -63,6 +63,8 @@ final class MultiProviderQuotaTests: XCTestCase {
         XCTAssertEqual(QuotaProvider.claude.accountLabel, "Claude 账号额度")
         XCTAssertEqual(QuotaProvider.codex.accountLabel, "Codex 账号额度")
         XCTAssertEqual(QuotaProvider.kimi.accountLabel, "Kimi 账号额度")
+        XCTAssertEqual(QuotaProvider.qoder.accountLabel, "Qoder 账号额度")
+        XCTAssertEqual(QuotaProvider.qwenTokenPlan.accountLabel, "Qwen Token Plan 额度")
     }
 
     // MARK: - GLM parsing

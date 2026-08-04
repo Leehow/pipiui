@@ -102,6 +102,10 @@ struct ModelInfo: Identifiable, Hashable {
         if p.contains("kimi") { return .kimi }
         // Qoder subscription (pi-provider-qoder extension: `qoder` / `qoder-cn`).
         if p.contains("qoder") { return .qoder }
+        // Aliyun Bailian Qwen Token Plan personal plan (`qwen-token-plan` /
+        // `qwen-token-plan-cn`). Substring match is intentional — other qwen
+        // models (e.g. `qwen-vl`) must NOT map here.
+        if p.contains("qwen-token-plan") { return .qwenTokenPlan }
         return nil
     }
 
