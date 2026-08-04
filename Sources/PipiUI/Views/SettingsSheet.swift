@@ -641,12 +641,12 @@ struct SettingsSheet: View {
                     .font(.title3.weight(.semibold))
                 Spacer()
                 Button {
-                    Task { await reload(restartSessions: true) }
+                    Task { await refreshWithDiscovery() }
                 } label: {
                     Label("刷新", systemImage: "arrow.clockwise")
                 }
                 .disabled(isLoading)
-                .help("重新读取 models.json 并刷新所有会话,无需重启 App")
+                .help("检测 provider 在线模型目录、合并新模型,并重读 models.json 刷新会话")
                 Button {
                     showAddSheet = true
                 } label: {
@@ -1819,6 +1819,23 @@ struct SettingsSheet: View {
     /// 确认 key 有效、端点可达。失败以 alert 提示（不阻断保存，跳过 reload）；
     /// 成功按原流程 reload 刷新会话与模型列表。内置 oauth provider 走同一条路，
     /// 认证通过即不弹出提示。
+    /// 刷新按钮：先尝试检测各 provider 的在线模型目录并合并新模型（失败则静默跳过），
+    /// 再按原流程 reload 重读 models.json 刷新会话；若检测到新模型，把提示拼到状态前。
+    @MainActor
+    private func refreshWithDiscovery() async {
+        var note = ""
+        if let results = (try? await PiAuthHelper.discoverModels())?["results"] as? [[String: Any]] {
+            let totalAdded = results.reduce(0) { $0 + (($1["added"] as? [Any])?.count ?? 0) }
+            if totalAdded > 0 {
+                note = "检测到 \(totalAdded) 个新模型,"
+            }
+        }
+        await reload(restartSessions: true)
+        if !note.isEmpty {
+            statusMessage = note + (statusMessage ?? "")
+        }
+    }
+
     @MainActor
     private func verifyAfterSave(restartSessions: Bool = true) async {
         isLoading = true

@@ -118,6 +118,11 @@ enum PiAuthHelper {
         return models.compactMap(ModelInfo.parseModelListRow)
     }
 
+    static func discoverModels() async throws -> [String: Any] {
+        let dotEnv = EnvFileStore().all()
+        return try await run(arguments: ["discover-models"], environmentOverlay: dotEnv)
+    }
+
     static func login(providerId: String, authType: String, apiKey: String? = nil) async throws {
         var args = ["login", providerId, authType]
         if let apiKey, !apiKey.isEmpty { args.append(apiKey) }

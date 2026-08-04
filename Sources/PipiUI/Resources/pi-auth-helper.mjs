@@ -7,6 +7,7 @@
  * Commands:
  *   list-providers          → JSON { providers: [{id,name,authTypes,loginLabel?}] }
  *   list-models             → JSON { models: [{provider,id,name,contextWindow}] }
+ *   discover-models         → scan provider online model catalogs, merge new models into models.json
  *   login <provider> <oauth|api_key> [apiKey]
  *   logout <provider>
  */
@@ -16,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { openURL } from "./pi-auth-open-url.mjs";
 import { createInterface } from "node:readline";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 function findPiModuleRoot() {
   const which = (() => {
@@ -178,6 +179,110 @@ async function logout(providerId) {
   });
 }
 
+// Discover online model catalog for each provider that has a baseUrl + resolvable
+// apiKey, then append unknown models into that provider's models in models.json.
+// Uses only fetch + fs so it runs standalone without the pi SDK.
+async function discoverModels() {
+  const modelsPath = join(process.env.HOME || "", ".pi/agent/models.json");
+  let root;
+  try {
+    root = JSON.parse(readFileSync(modelsPath, "utf8"));
+  } catch (err) {
+    throw new Error(`无法读取 ${modelsPath}: ${err.message}`);
+  }
+  const providersOut = root.providers || {};
+  const results = [];
+  const banned = /embedding|seedance|seedream|hitem3d|hyper3d|smart-router|translation/i;
+
+  for (const [providerId, provider] of Object.entries(providersOut)) {
+    const baseUrl = provider && provider.baseUrl;
+    const apiKeyRaw = provider && provider.apiKey;
+    if (!baseUrl || typeof apiKeyRaw !== "string") {
+      results.push({ provider: providerId, added: [], total: 0, skipped: "no baseUrl/apiKey" });
+      continue;
+    }
+    let key;
+    if (apiKeyRaw.startsWith("$")) {
+      key = process.env[apiKeyRaw.slice(1)];
+      if (!key) {
+        results.push({ provider: providerId, added: [], total: 0, skipped: "env var not set" });
+        continue;
+      }
+    } else {
+      key = apiKeyRaw;
+    }
+    const api = provider.api ?? "";
+    const modelsUrl =
+      api === "anthropic-messages" ? `${baseUrl}/v1/models` : `${baseUrl}/models`;
+    const headers = { Authorization: `Bearer ${key}` };
+    if (api === "anthropic-messages") headers["anthropic-version"] = "2023-06-01";
+
+    let resp;
+    try {
+      resp = await fetch(modelsUrl, { headers });
+    } catch (err) {
+      results.push({ provider: providerId, added: [], total: 0, skipped: `fetch failed: ${err.message}` });
+      continue;
+    }
+    if (!resp.ok) {
+      results.push({ provider: providerId, added: [], total: 0, skipped: `HTTP ${resp.status}` });
+      continue;
+    }
+    let data;
+    try {
+      data = await resp.json();
+    } catch (err) {
+      results.push({ provider: providerId, added: [], total: 0, skipped: `bad json: ${err.message}` });
+      continue;
+    }
+    const rows = (data && Array.isArray(data.data)) ? data.data : [];
+    const byName = new Map();
+    for (const row of rows) {
+      const status = row && row.status;
+      if (
+        status !== null &&
+        status !== undefined &&
+        !(typeof status === "string" && status.toLowerCase() === "active")
+      ) {
+        continue; // non-null, non-active => shutting down / retired
+      }
+      const id = row.id;
+      if (!id || banned.test(id)) continue;
+      const nameKey =
+        typeof row.name === "string" && row.name ? row.name : id;
+      const created = typeof row.created === "number" ? row.created : 0;
+      const existing = byName.get(nameKey);
+      if (!existing || created > existing.created) {
+        byName.set(nameKey, { id: nameKey, created });
+      }
+    }
+    const existingIds = new Set((provider.models || []).map((m) => m && m.id));
+    const added = [];
+    for (const m of byName.values()) {
+      if (existingIds.has(m.id)) continue;
+      added.push(m.id);
+      if (!Array.isArray(provider.models)) provider.models = [];
+      provider.models.push({
+        id: m.id,
+        name: m.id,
+        reasoning: false,
+        input: ["text"],
+        contextWindow: 200000,
+        maxTokens: 16384,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      });
+    }
+    results.push({ provider: providerId, added, total: provider.models.length });
+  }
+
+  try {
+    writeFileSync(modelsPath, JSON.stringify(root, null, 2) + "\n");
+  } catch (err) {
+    throw new Error(`写入 ${modelsPath} 失败: ${err.message}`);
+  }
+  emit({ ok: true, results });
+}
+
 const [cmd, ...args] = process.argv.slice(2);
 
 try {
@@ -193,6 +298,8 @@ try {
     const [providerId] = args;
     if (!providerId) throw new Error("Usage: logout <providerId>");
     await logout(providerId);
+  } else if (cmd === "discover-models") {
+    await discoverModels();
   } else {
     throw new Error(`Unknown command: ${cmd ?? "(none)"}`);
   }
