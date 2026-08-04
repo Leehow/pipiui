@@ -9,6 +9,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case toolsSkills = "工具"
     case subagentModels = "Subagent"
     case memory = "记忆"
+    case experimental = "实验"
     var id: String { rawValue }
 
     /// Full name for VoiceOver / tooltip; the segmented picker shows the short
@@ -31,6 +32,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .toolsSkills: return "wrench.and.screwdriver"
         case .subagentModels: return "person.2"
         case .memory: return "brain.head.profile"
+        case .experimental: return "flask"
         }
     }
 }
@@ -59,6 +61,10 @@ struct SettingsSheet: View {
     @State private var visionFallbackMode: VisionFallbackSettings.Mode = VisionFallbackSettings.mode()
     @State private var visionFallbackBaseURL: String = VisionFallbackSettings.load().baseURL
     @State private var visionFallbackApiKey: String = ""
+    /// 实验 tab: jcode 已配置 provider 探测结果 + 探测中状态 + 启用确认弹窗。
+    @State private var jcodeConfiguredProviders: [String] = []
+    @State private var jcodeProbing = false
+    @State private var showJcodeEnableConfirm = false
     @State private var visionFallbackModelId: String = VisionFallbackSettings.load().modelId
     @State private var visionFallbackMaxTokens: String = String(VisionFallbackSettings.load().maxTokens)
     @State private var visionFallbackKeyConfigured = !(VisionFallbackSettings.load().apiKey.isEmpty)
@@ -203,8 +209,87 @@ struct SettingsSheet: View {
             subagentModelsSection
         case .memory:
             ControlledMemoryView()
+        case .experimental:
+            experimentalSection
         case .models:
             EmptyView()
+        }
+    }
+
+    // MARK: - Experimental (jcode)
+
+    private var experimentalSection: some View {
+        GroupBox("jcode 引擎（实验性）") {
+            VStack(alignment: .leading, spacing: 12) {
+                let jcodeInstalled = JcodeBridge.findJcodeExecutable() != nil
+
+                Toggle("启用 jcode 模式", isOn: Binding(
+                    get: { JcodeSettings.isEnabled },
+                    set: { newValue in
+                        if newValue { showJcodeEnableConfirm = true }
+                        else { JcodeSettings.isEnabled = false }
+                    }
+                ))
+                .disabled(!jcodeInstalled)
+
+                Text("勾选后，新建会话将使用 jcode 引擎（独立凭证体系，需先在下方配置）。jcode 自带 swarm 编排。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if !jcodeInstalled {
+                    Label("未检测到 jcode，请先安装：curl -fsSL https://jcode.sh/install | bash", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+
+                Divider()
+
+                Text("凭证配置").font(.headline)
+                Text("jcode 使用独立的凭证体系，不与 pi 共享。点击下方按钮在终端完成 provider 登录。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Button("在终端配置 jcode 凭证…") {
+                    JcodeLoginLauncher.openLoginInTerminal()
+                }
+
+                HStack {
+                    if jcodeProbing {
+                        ProgressView().controlSize(.mini)
+                        Text("正在检测…").font(.caption).foregroundStyle(.secondary)
+                    } else if jcodeConfiguredProviders.isEmpty {
+                        Label("未检测到已配置的 provider", systemImage: "exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(.orange)
+                    } else {
+                        Label("检测到 \(jcodeConfiguredProviders.count) 个 provider：\(jcodeConfiguredProviders.joined(separator: ", "))", systemImage: "checkmark.circle")
+                            .font(.caption).foregroundStyle(.green)
+                    }
+                    Spacer()
+                    Button("刷新") { refreshJcodeProviders() }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .onAppear { refreshJcodeProviders() }
+        .confirmationDialog(
+            "切换到 jcode 模式？",
+            isPresented: $showJcodeEnableConfirm
+        ) {
+            Button("切换到 jcode") { JcodeSettings.isEnabled = true }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("之后新建的会话将使用 jcode 引擎。jcode 使用独立凭证体系，需先配置 provider。已存在的 pi 会话不受影响。")
+        }
+    }
+
+    private func refreshJcodeProviders() {
+        jcodeProbing = true
+        JcodeSettings.detectConfiguredProviders { ids in
+            jcodeConfiguredProviders = ids
+            jcodeProbing = false
         }
     }
 
