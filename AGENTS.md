@@ -40,6 +40,16 @@ cd /Users/haoli/leehow/code/pipiui
 ./scripts/build-app.sh     # test (optional skip) then make-app.sh
 ```
 
+### 快速打包（快速迭代）
+
+- `make-app.sh` 本身**不跑测试**，直接 release 打包 → 就是快速打包。
+- 需要跳过测试时用 `./scripts/build-app.sh --skip-tests`（等价快速打包）。
+- 依赖 SwiftPM **增量缓存**：不要每次 `swift clean`/删 `.build`。首次全量编译慢（约 90s+），之后只重编改动文件，秒级。
+- **增量只对公共接口未变的小改动有效**：重构/大范围改动会触发全量重编，耗时不可避免（无捷径，除非分布式构建/更强硬件）。
+- **并行 agent 构建已隔离**：可写 worker 各在独立 worktree，`.build` 各自独立，互不干扰；主仓打包用主仓自己的 `.build`。不要假设共享增量会产生冲突。
+- 耗时来源：release 编译（首次或重构）为主；`cua-driver` 下载与 `make-icon` 均有缓存，非瓶颈。
+- 只验证代码能否编译、不打包时，用 `swift build`（增量，最快），不要跑 `make-app.sh`。
+
 Do **not** report "done / open the app" if only `.build/*` is fresh and `build/PipiUI.app` is older than sources.
 
 Verify after package:
@@ -58,6 +68,7 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 | Build / run docs | `README.md` → 构建运行 |
 | Package App (primary checkout only) | `./make-app.sh` → `build/PipiUI.app` |
 | Test + package (primary checkout only) | `./scripts/build-app.sh` |
+| 快速打包（跳过测试） | `./scripts/build-app.sh --skip-tests`（或 `./make-app.sh`） |
 | Worker/dev verification | `swift run` / `swift build` / `swift test` |
 
 macOS 14+ · SwiftPM · the only product bundle is `/Users/haoli/leehow/code/pipiui/build/PipiUI.app`.
