@@ -9,12 +9,35 @@ enum SubagentModelSettings {
     /// Picker sentinel: omit `--thinking` and let Pi/the selected model choose its default.
     static let defaultThinkingSentinel = ""
 
-    /// An explicit per-agent override. Legacy persisted values are strings containing just
-    /// `model`; newer values can add `thinking`. Keeping the two fields separate avoids
-    /// treating Pi's optional `model:thinking` shorthand as part of a model id.
-    struct Override: Equatable {
+    /// One link of an agent's ordered fallback chain. Keeping `thinking` separate from
+    /// `model` avoids treating Pi's optional `model:thinking` shorthand as part of a model id.
+    struct Entry: Equatable, Hashable {
         let model: String
         let thinking: String?
+    }
+
+    /// An explicit per-agent override: an ordered fallback chain tried head-first.
+    /// Persisted shapes (shared contract with the Node subagent extension):
+    /// 1. legacy string `"provider/id"` — single model, no thinking.
+    /// 2. object `{"model": ..., "thinking": ...}` — single model with thinking.
+    /// 3. chain `{"models": [{"model": ..., "thinking"?}, ...]}` — ordered chain,
+    ///    per-entry thinking optional.
+    struct Override: Equatable {
+        let entries: [Entry]
+
+        init(entries: [Entry]) {
+            self.entries = entries
+        }
+
+        init(model: String, thinking: String?) {
+            self.entries = [Entry(model: model, thinking: thinking)]
+        }
+
+        /// Chain head — compatibility surface for pre-chain callers.
+        var model: String { entries.first?.model ?? "" }
+        /// Chain head thinking; `nil` = Pi/model default. Never inherited from the main agent.
+        var thinking: String? { entries.first?.thinking }
+        var primary: Entry? { entries.first }
     }
 
     /// Application Support JSON consumed by the Node subagent extension at spawn time.
@@ -84,17 +107,27 @@ enum SubagentModelSettings {
             } else if let s = value as? NSString {
                 let model = (s as String).trimmingCharacters(in: .whitespacesAndNewlines)
                 if !model.isEmpty { result[key] = Override(model: model, thinking: nil) }
-            } else if let dict = value as? [String: Any],
-                      let rawModel = dict["model"] as? String {
-                let model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
-                let thinking = (dict["thinking"] as? String)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !model.isEmpty {
-                    result[key] = Override(model: model, thinking: thinking?.isEmpty == false ? thinking : nil)
+            } else if let dict = value as? [String: Any] {
+                if let models = dict["models"] as? [[String: Any]] {
+                    // Chain shape: ordered entries, per-entry thinking optional.
+                    let entries = models.compactMap(Self.parseEntry)
+                    if !entries.isEmpty { result[key] = Override(entries: entries) }
+                } else if let entry = Self.parseEntry(dict) {
+                    // Object shape: single model with optional thinking.
+                    result[key] = Override(entries: [entry])
                 }
             }
         }
         return result
+    }
+
+    private static func parseEntry(_ dict: [String: Any]) -> Entry? {
+        guard let rawModel = dict["model"] as? String else { return nil }
+        let model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else { return nil }
+        let thinking = (dict["thinking"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Entry(model: model, thinking: thinking?.isEmpty == false ? thinking : nil)
     }
 
     /// Model-only compatibility surface for existing callers.
@@ -140,6 +173,8 @@ enum SubagentModelSettings {
         )
     }
 
+    /// Compatibility API (Remote panel / single-model callers): replaces the whole chain
+    /// with a single entry, or clears the override when `modelId` is nil/empty.
     static func setOverride(
         _ modelId: String?,
         thinking: String?,
@@ -148,16 +183,32 @@ enum SubagentModelSettings {
         fileManager: FileManager = .default,
         to url: URL? = nil
     ) {
-        var map = allSettings(defaults: defaults)
         let trimmed = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if trimmed.isEmpty {
+        let entries = trimmed.isEmpty ? [] : [Entry(model: trimmed, thinking: thinking)]
+        setChain(entries, for: agentName, defaults: defaults, fileManager: fileManager, to: url)
+    }
+
+    /// Replace `agentName`'s ordered fallback chain. Empty (or all-empty-model) input
+    /// removes the override so the agent follows the main agent again. Entries are
+    /// normalized: blank models are dropped, blank thinking becomes `nil`.
+    static func setChain(
+        _ entries: [Entry],
+        for agentName: String,
+        defaults: UserDefaults = .standard,
+        fileManager: FileManager = .default,
+        to url: URL? = nil
+    ) {
+        var map = allSettings(defaults: defaults)
+        let normalized = entries.compactMap { entry -> Entry? in
+            let model = entry.model.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !model.isEmpty else { return nil }
+            let thinking = entry.thinking?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return Entry(model: model, thinking: thinking?.isEmpty == false ? thinking : nil)
+        }
+        if normalized.isEmpty {
             map.removeValue(forKey: agentName)
         } else {
-            let normalizedThinking = thinking?.trimmingCharacters(in: .whitespacesAndNewlines)
-            map[agentName] = Override(
-                model: trimmed,
-                thinking: normalizedThinking?.isEmpty == false ? normalizedThinking : nil
-            )
+            map[agentName] = Override(entries: normalized)
         }
         defaults.set(encodeForDefaults(map), forKey: defaultsKey)
         // Pass `defaults` through: without it the mirror runs as if it were the live app and a
@@ -165,7 +216,8 @@ enum SubagentModelSettings {
         syncJSONFile(map: map, defaults: defaults, fileManager: fileManager, to: url)
     }
 
-    /// Resolve the model id that should be used for `agentName`.
+    /// Resolve the model id that should be used for `agentName`. An override resolves to
+    /// its chain head; the rest of the chain is consumed by the dispatch runtime.
     /// - Parameters:
     ///   - mainModelId: current session model (`provider/modelId`), used when following.
     ///   - frontmatterFallback: `model` from agent.md when main is also unknown.
@@ -217,18 +269,34 @@ enum SubagentModelSettings {
         return s
     }
 
-    /// Write no-thinking entries as legacy strings so older extensions remain able to read
-    /// them. Only an explicitly selected strength upgrades that agent's JSON value to an object.
+    /// Encoding rules (shared contract with the Node subagent extension):
+    /// - chain length 1 without thinking → legacy string so older extensions keep reading it;
+    /// - chain length 1 with thinking → `{"model", "thinking"}` object;
+    /// - chain length > 1 → `{"models": [...]}` ordered chain, per-entry `thinking` omitted
+    ///   when it is the default ("").
     private static func encodeForDefaults(_ settings: [String: Override]) -> [String: Any] {
         var encoded: [String: Any] = [:]
         for (agentName, setting) in settings {
-            if let thinking = setting.thinking, !thinking.isEmpty {
-                encoded[agentName] = ["model": setting.model, "thinking": thinking]
-            } else {
-                encoded[agentName] = setting.model
-            }
+            encoded[agentName] = encode(setting)
         }
         return encoded
+    }
+
+    private static func encode(_ setting: Override) -> Any {
+        guard let head = setting.entries.first else { return followMainSentinel }
+        if setting.entries.count == 1 {
+            if let thinking = head.thinking, !thinking.isEmpty {
+                return ["model": head.model, "thinking": thinking]
+            }
+            return head.model
+        }
+        return ["models": setting.entries.map { entry -> [String: String] in
+            var item = ["model": entry.model]
+            if let thinking = entry.thinking, !thinking.isEmpty {
+                item["thinking"] = thinking
+            }
+            return item
+        }]
     }
 
     private static func serializedPayload(defaults: UserDefaults) -> [String: Any] {

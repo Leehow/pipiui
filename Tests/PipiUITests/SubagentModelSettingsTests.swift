@@ -71,6 +71,267 @@ final class SubagentModelSettingsTests: XCTestCase {
         )
     }
 
+    // MARK: - Fallback chain schema (three persisted shapes, shared contract with TS)
+
+    func testParsesObjectShapeWithThinking() {
+        let (name, suite) = tempSuite()
+        defer { suite.removePersistentDomain(forName: name) }
+
+        suite.set(
+            ["explore": ["model": "anthropic/claude-opus-4-6", "thinking": "high"]],
+            forKey: SubagentModelSettings.defaultsKey
+        )
+
+        let override = SubagentModelSettings.allSettings(defaults: suite)["explore"]
+        XCTAssertEqual(
+            override?.entries,
+            [SubagentModelSettings.Entry(model: "anthropic/claude-opus-4-6", thinking: "high")]
+        )
+        XCTAssertEqual(
+            SubagentModelSettings.modelOverride(for: "explore", defaults: suite),
+            "anthropic/claude-opus-4-6"
+        )
+        XCTAssertEqual(
+            SubagentModelSettings.thinkingOverride(for: "explore", defaults: suite),
+            "high"
+        )
+    }
+
+    func testParsesChainShapeInOrderWithPrimaryAtHead() {
+        let (name, suite) = tempSuite()
+        defer { suite.removePersistentDomain(forName: name) }
+
+        suite.set(
+            [
+                "explore": [
+                    "models": [
+                        ["model": "xai/grok-4"],
+                        ["model": "anthropic/claude-sonnet-4-6", "thinking": "max"],
+                    ],
+                ],
+            ],
+            forKey: SubagentModelSettings.defaultsKey
+        )
+
+        let override = SubagentModelSettings.allSettings(defaults: suite)["explore"]
+        XCTAssertEqual(
+            override?.entries.map(\.model),
+            ["xai/grok-4", "anthropic/claude-sonnet-4-6"]
+        )
+        XCTAssertNil(override?.entries[0].thinking)
+        XCTAssertEqual(override?.entries[1].thinking, "max")
+        // Primary compatibility surface = chain head.
+        XCTAssertEqual(override?.model, "xai/grok-4")
+        XCTAssertNil(override?.thinking)
+        XCTAssertEqual(override?.primary, override?.entries[0])
+        XCTAssertEqual(
+            SubagentModelSettings.resolveModel(
+                for: "explore",
+                mainModelId: "xai/grok-4.5",
+                frontmatterFallback: nil,
+                defaults: suite
+            ),
+            "xai/grok-4"
+        )
+    }
+
+    func testChainParseSkipsInvalidEntries() {
+        let (name, suite) = tempSuite()
+        defer { suite.removePersistentDomain(forName: name) }
+
+        suite.set(
+            [
+                "explore": [
+                    "models": [
+                        ["model": ""],
+                        ["thinking": "high"],
+                        ["model": "xai/grok-4", "thinking": ""],
+                    ],
+                ],
+            ],
+            forKey: SubagentModelSettings.defaultsKey
+        )
+
+        let override = SubagentModelSettings.allSettings(defaults: suite)["explore"]
+        XCTAssertEqual(
+            override?.entries,
+            [SubagentModelSettings.Entry(model: "xai/grok-4", thinking: nil)]
+        )
+    }
+
+    func testEncodingRoundTripsAllThreeShapes() throws {
+        let (name, suite) = tempSuite()
+        defer { suite.removePersistentDomain(forName: name) }
+
+        // Shape 1: single entry without thinking → legacy string.
+        SubagentModelSettings.setChain(
+            [SubagentModelSettings.Entry(model: "xai/grok-4", thinking: nil)],
+            for: "one", defaults: suite
+        )
+        // Shape 2: single entry with thinking → object.
+        SubagentModelSettings.setChain(
+            [SubagentModelSettings.Entry(model: "anthropic/claude-sonnet-4-6", thinking: "high")],
+            for: "two", defaults: suite
+        )
+        // Shape 3: chain → models array; default ("") thinking is omitted per entry.
+        SubagentModelSettings.setChain(
+            [
+                SubagentModelSettings.Entry(model: "xai/grok-4", thinking: ""),
+                SubagentModelSettings.Entry(model: "anthropic/claude-sonnet-4-6", thinking: "max"),
+            ],
+            for: "three", defaults: suite
+        )
+
+        let raw = try XCTUnwrap(suite.dictionary(forKey: SubagentModelSettings.defaultsKey))
+        XCTAssertEqual(raw["one"] as? String, "xai/grok-4")
+        let two = try XCTUnwrap(raw["two"] as? [String: String])
+        XCTAssertEqual(two, ["model": "anthropic/claude-sonnet-4-6", "thinking": "high"])
+        let three = try XCTUnwrap(raw["three"] as? [String: Any])
+        let models = try XCTUnwrap(three["models"] as? [[String: String]])
+        XCTAssertEqual(models, [
+            ["model": "xai/grok-4"],
+            ["model": "anthropic/claude-sonnet-4-6", "thinking": "max"],
+        ])
+
+        // Round-trip: parsing the persisted values returns exactly what was written.
+        let parsed = SubagentModelSettings.allSettings(defaults: suite)
+        XCTAssertEqual(
+            parsed["one"]?.entries,
+            [SubagentModelSettings.Entry(model: "xai/grok-4", thinking: nil)]
+        )
+        XCTAssertEqual(
+            parsed["two"]?.entries,
+            [SubagentModelSettings.Entry(model: "anthropic/claude-sonnet-4-6", thinking: "high")]
+        )
+        XCTAssertEqual(
+            parsed["three"]?.entries,
+            [
+                SubagentModelSettings.Entry(model: "xai/grok-4", thinking: nil),
+                SubagentModelSettings.Entry(model: "anthropic/claude-sonnet-4-6", thinking: "max"),
+            ]
+        )
+    }
+
+    func testLegacyStringMigratesAndStaysCompact() throws {
+        let (name, suite) = tempSuite()
+        defer { suite.removePersistentDomain(forName: name) }
+
+        suite.set(["explore": "xai/grok-4"], forKey: SubagentModelSettings.defaultsKey)
+        XCTAssertEqual(
+            SubagentModelSettings.allSettings(defaults: suite)["explore"]?.entries,
+            [SubagentModelSettings.Entry(model: "xai/grok-4", thinking: nil)]
+        )
+
+        // Rewriting a single thinking-less entry keeps the legacy string shape so older
+        // extensions keep reading the JSON mirror.
+        SubagentModelSettings.setChain(
+            [SubagentModelSettings.Entry(model: "xai/grok-4.5", thinking: nil)],
+            for: "explore", defaults: suite
+        )
+        let raw = try XCTUnwrap(suite.dictionary(forKey: SubagentModelSettings.defaultsKey))
+        XCTAssertEqual(raw["explore"] as? String, "xai/grok-4.5")
+    }
+
+    func testSetOverrideReplacesWholeChainWithSingleEntry() throws {
+        let (name, suite) = tempSuite()
+        defer { suite.removePersistentDomain(forName: name) }
+
+        SubagentModelSettings.setChain(
+            [
+                SubagentModelSettings.Entry(model: "xai/grok-4", thinking: nil),
+                SubagentModelSettings.Entry(model: "anthropic/claude-sonnet-4-6", thinking: "max"),
+            ],
+            for: "explore", defaults: suite
+        )
+
+        SubagentModelSettings.setOverride(
+            "anthropic/claude-opus-4-6",
+            thinking: nil,
+            for: "explore",
+            defaults: suite
+        )
+
+        let override = SubagentModelSettings.allSettings(defaults: suite)["explore"]
+        XCTAssertEqual(
+            override?.entries,
+            [SubagentModelSettings.Entry(model: "anthropic/claude-opus-4-6", thinking: nil)]
+        )
+        let raw = try XCTUnwrap(suite.dictionary(forKey: SubagentModelSettings.defaultsKey))
+        XCTAssertEqual(raw["explore"] as? String, "anthropic/claude-opus-4-6")
+    }
+
+    func testSetChainAddAndRemoveProducesCorrectShapes() throws {
+        let (name, suite) = tempSuite()
+        defer { suite.removePersistentDomain(forName: name) }
+
+        var entries = [SubagentModelSettings.Entry(model: "xai/grok-4", thinking: nil)]
+        SubagentModelSettings.setChain(entries, for: "explore", defaults: suite)
+        var raw = try XCTUnwrap(suite.dictionary(forKey: SubagentModelSettings.defaultsKey))
+        XCTAssertEqual(raw["explore"] as? String, "xai/grok-4")
+
+        // Add a fallback → chain shape.
+        entries.append(SubagentModelSettings.Entry(model: "anthropic/claude-sonnet-4-6", thinking: "high"))
+        SubagentModelSettings.setChain(entries, for: "explore", defaults: suite)
+        raw = try XCTUnwrap(suite.dictionary(forKey: SubagentModelSettings.defaultsKey))
+        let obj = try XCTUnwrap(raw["explore"] as? [String: Any])
+        let models = try XCTUnwrap(obj["models"] as? [[String: String]])
+        XCTAssertEqual(models, [
+            ["model": "xai/grok-4"],
+            ["model": "anthropic/claude-sonnet-4-6", "thinking": "high"],
+        ])
+
+        // Remove back to a single thinking-less entry → legacy string again.
+        entries.removeLast()
+        SubagentModelSettings.setChain(entries, for: "explore", defaults: suite)
+        raw = try XCTUnwrap(suite.dictionary(forKey: SubagentModelSettings.defaultsKey))
+        XCTAssertEqual(raw["explore"] as? String, "xai/grok-4")
+
+        // Empty chain clears the override → follow main.
+        SubagentModelSettings.setChain([], for: "explore", defaults: suite)
+        raw = try XCTUnwrap(suite.dictionary(forKey: SubagentModelSettings.defaultsKey))
+        XCTAssertNil(raw["explore"])
+        XCTAssertNil(SubagentModelSettings.modelOverride(for: "explore", defaults: suite))
+        XCTAssertEqual(
+            SubagentModelSettings.resolveModel(
+                for: "explore",
+                mainModelId: "xai/grok-4.5",
+                frontmatterFallback: nil,
+                defaults: suite
+            ),
+            "xai/grok-4.5"
+        )
+    }
+
+    func testChainMirrorsToJSONFile() throws {
+        let fm = FileManager.default
+        let tmpRoot = fm.temporaryDirectory.appendingPathComponent("pipiui-chain-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: tmpRoot, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tmpRoot) }
+        let url = tmpRoot.appendingPathComponent("subagent-models.json")
+
+        let (name, suite) = tempSuite()
+        defer { suite.removePersistentDomain(forName: name) }
+
+        SubagentModelSettings.setChain(
+            [
+                SubagentModelSettings.Entry(model: "xai/grok-4", thinking: nil),
+                SubagentModelSettings.Entry(model: "anthropic/claude-sonnet-4-6", thinking: "max"),
+            ],
+            for: "explore",
+            defaults: suite,
+            to: url
+        )
+
+        let data = try Data(contentsOf: url)
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let explore = try XCTUnwrap(obj["explore"] as? [String: Any])
+        let models = try XCTUnwrap(explore["models"] as? [[String: String]])
+        XCTAssertEqual(models, [
+            ["model": "xai/grok-4"],
+            ["model": "anthropic/claude-sonnet-4-6", "thinking": "max"],
+        ])
+    }
+
     func testExplicitThinkingPersistsSeparatelyFromModel() throws {
         let (name, suite) = tempSuite()
         defer { suite.removePersistentDomain(forName: name) }

@@ -1298,7 +1298,7 @@ struct SettingsSheet: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Subagent 模型")
                 .font(.title3.weight(.semibold))
-            Text("默认「跟随主 Agent」= 输入框下方 / 底栏当前选中的模型；也可为 explore / plan / general-purpose 等类型指定固定模型和思考强度。未指定思考强度时使用 Pi / 模型默认值；下次派出即生效。")
+            Text("默认「跟随主 Agent」= 输入框下方 / 底栏当前选中的模型；也可为 explore / plan / general-purpose 等类型指定固定模型和思考强度，并用「添加备用模型」追加有序 fallback 链（链首为主选，其余按顺序备用）。未指定思考强度时使用 Pi / 模型默认值；下次派出即生效。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -1319,13 +1319,20 @@ struct SettingsSheet: View {
                 SubagentModelRow(
                     agent: agent,
                     pickerModels: pickerModels,
-                    selection: subagentSettings[agent.name]?.model ?? SubagentModelSettings.followMainSentinel,
-                    thinking: subagentSettings[agent.name]?.thinking ?? SubagentModelSettings.defaultThinkingSentinel
-                ) { newValue in
-                    setSubagentModelOverride(newValue, for: agent.name)
-                } onSelectThinking: { newValue in
-                    setSubagentThinkingOverride(newValue, for: agent.name)
-                }
+                    entries: subagentSettings[agent.name]?.entries ?? [],
+                    onSelectModel: { index, newValue in
+                        setSubagentModelOverride(newValue, at: index, for: agent.name)
+                    },
+                    onSelectThinking: { index, newValue in
+                        setSubagentThinkingOverride(newValue, at: index, for: agent.name)
+                    },
+                    onRemoveEntry: { index in
+                        removeSubagentModelEntry(at: index, for: agent.name)
+                    },
+                    onAddEntry: {
+                        addSubagentModelEntry(for: agent.name)
+                    }
+                )
             }
         }
     }
@@ -1334,7 +1341,9 @@ struct SettingsSheet: View {
     /// 全量 hiddenModelIds()+filter，切 tab 会卡）。调用时机：reload 完成、
     /// 可见性勾选变化、subagent override 变化。
     private func recomputePickerModels() {
-        let selectedIds = Set(subagentSettings.values.map(\.model))
+        // Chain-aware: every model referenced anywhere in any agent's chain must stay
+        // selectable in the pickers, not only each agent's primary.
+        let selectedIds = Set(subagentSettings.values.flatMap { $0.entries.map(\.model) })
         pickerModels = models.filter { model in
             if selectedIds.contains(model.id) { return true }
             return !hiddenIds.contains(model.id)
@@ -1350,20 +1359,39 @@ struct SettingsSheet: View {
         return (model.reasoning, model.thinkingLevelMap)
     }
 
-    private func setSubagentModelOverride(_ newValue: String, for agentName: String) {
+    private func subagentEntries(for agentName: String) -> [SubagentModelSettings.Entry] {
+        subagentSettings[agentName]?.entries ?? []
+    }
+
+    private func setSubagentModelOverride(_ newValue: String, at index: Int, for agentName: String) {
         let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        var entries = subagentEntries(for: agentName)
+        if trimmed.isEmpty {
+            // followMainSentinel: only the chain head can follow main, and a following head
+            // cannot be persisted — selecting it clears the whole override (all backups too).
+            guard index == 0 else { return }
+            SubagentModelSettings.setChain([], for: agentName)
+            subagentSettings = SubagentModelSettings.allSettings()
+            recomputePickerModels()
+            statusMessage = "已恢复 \(agentName) 跟随主 Agent"
+            return
+        }
+        if entries.isEmpty {
+            entries = [SubagentModelSettings.Entry(model: "", thinking: nil)]
+        }
+        guard index >= 0, index < entries.count else { return }
         let cap = capability(forModelId: trimmed)
         let resolution = ThinkingCapability.resolveSelection(
             newModelId: trimmed,
-            persistedThinking: subagentSettings[agentName]?.thinking,
+            persistedThinking: entries[index].thinking,
             reasoning: cap.reasoning,
             thinkingLevelMap: cap.thinkingLevelMap
         )
-        SubagentModelSettings.setOverride(
-            resolution.modelId,
-            thinking: resolution.thinking,
-            for: agentName
+        entries[index] = SubagentModelSettings.Entry(
+            model: resolution.modelId ?? trimmed,
+            thinking: resolution.thinking
         )
+        SubagentModelSettings.setChain(entries, for: agentName)
         subagentSettings = SubagentModelSettings.allSettings()
         recomputePickerModels()
         statusMessage = resolution.didReset
@@ -1375,17 +1403,24 @@ struct SettingsSheet: View {
     private func normalizeSubagentThinkingIfNeeded() {
         var changed = false
         for (agent, override) in subagentSettings {
-            let cap = capability(forModelId: override.model)
-            guard ThinkingCapability.normalizationDecision(
-                modelId: override.model,
-                persistedThinking: override.thinking,
-                reasoning: cap.reasoning,
-                thinkingLevelMap: cap.thinkingLevelMap
-            ) == .reset
-            else {
-                continue
+            var entries = override.entries
+            var didReset = false
+            for (index, entry) in entries.enumerated() {
+                let cap = capability(forModelId: entry.model)
+                guard ThinkingCapability.normalizationDecision(
+                    modelId: entry.model,
+                    persistedThinking: entry.thinking,
+                    reasoning: cap.reasoning,
+                    thinkingLevelMap: cap.thinkingLevelMap
+                ) == .reset
+                else {
+                    continue
+                }
+                entries[index] = SubagentModelSettings.Entry(model: entry.model, thinking: nil)
+                didReset = true
             }
-            SubagentModelSettings.setOverride(override.model, thinking: nil, for: agent)
+            guard didReset else { continue }
+            SubagentModelSettings.setChain(entries, for: agent)
             changed = true
         }
         if changed {
@@ -1393,16 +1428,40 @@ struct SettingsSheet: View {
         }
     }
 
-    private func setSubagentThinkingOverride(_ newValue: String, for agentName: String) {
-        guard let model = subagentSettings[agentName]?.model else { return }
+    private func setSubagentThinkingOverride(_ newValue: String, at index: Int, for agentName: String) {
+        var entries = subagentEntries(for: agentName)
+        guard index >= 0, index < entries.count else { return }
         let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        SubagentModelSettings.setOverride(
-            model,
-            thinking: trimmed.isEmpty ? nil : trimmed,
-            for: agentName
+        entries[index] = SubagentModelSettings.Entry(
+            model: entries[index].model,
+            thinking: trimmed.isEmpty ? nil : trimmed
         )
+        SubagentModelSettings.setChain(entries, for: agentName)
         subagentSettings = SubagentModelSettings.allSettings()
         statusMessage = "已保存 \(agentName) 的思考强度"
+    }
+
+    private func removeSubagentModelEntry(at index: Int, for agentName: String) {
+        var entries = subagentEntries(for: agentName)
+        guard entries.count > 1, index >= 0, index < entries.count else { return }
+        let removed = entries.remove(at: index)
+        SubagentModelSettings.setChain(entries, for: agentName)
+        subagentSettings = SubagentModelSettings.allSettings()
+        recomputePickerModels()
+        statusMessage = "已移除 \(agentName) 的备用模型 \(removed.model)"
+    }
+
+    private func addSubagentModelEntry(for agentName: String) {
+        var entries = subagentEntries(for: agentName)
+        let used = Set(entries.map(\.model))
+        guard let candidate = pickerModels.first(where: { !used.contains($0.id) }) ?? pickerModels.first else {
+            return
+        }
+        entries.append(SubagentModelSettings.Entry(model: candidate.id, thinking: nil))
+        SubagentModelSettings.setChain(entries, for: agentName)
+        subagentSettings = SubagentModelSettings.allSettings()
+        recomputePickerModels()
+        statusMessage = "已为 \(agentName) 添加备用模型 \(candidate.id)"
     }
 
     // MARK: - Web Search
@@ -1786,37 +1845,35 @@ private struct ProviderModelGroup: Identifiable {
 
 /// Subagent 模型 tab 的单行。抽成独立 Equatable View 后，父视图其它状态变化
 /// （statusMessage、usage 等）只按身份 diff，不再整行重建 ~30 项的 Picker 内容。
+/// 每个 agent 渲染一条有序 fallback 链：行 0 为链首（可选「跟随主 Agent」），
+/// 行 >0 为备用模型；行数 >1 时每行带删除按钮。
 private struct SubagentModelRow: View, Equatable {
     let agent: AgentDefinition
     let pickerModels: [ModelInfo]
-    let selection: String
-    let thinking: String
-    let onSelect: (String) -> Void
-    let onSelectThinking: (String) -> Void
-
-    private var selectedCapability: (reasoning: Bool?, thinkingLevelMap: [String: String?]?) {
-        guard let model = pickerModels.first(where: { $0.id == selection }) else {
-            return (nil, nil)
-        }
-        return (model.reasoning, model.thinkingLevelMap)
-    }
-
-    private var isNonReasoning: Bool {
-        selectedCapability.reasoning == .some(false)
-    }
-
-    private var allowedThinkingTags: [String] {
-        ThinkingCapability.allowedLevels(
-            reasoning: selectedCapability.reasoning,
-            thinkingLevelMap: selectedCapability.thinkingLevelMap
-        )
-    }
+    /// Empty = no override, rendered as a single "follow main" row.
+    let entries: [SubagentModelSettings.Entry]
+    let onSelectModel: (Int, String) -> Void
+    let onSelectThinking: (Int, String) -> Void
+    let onRemoveEntry: (Int) -> Void
+    let onAddEntry: () -> Void
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.agent == rhs.agent
             && lhs.pickerModels == rhs.pickerModels
-            && lhs.selection == rhs.selection
-            && lhs.thinking == rhs.thinking
+            && lhs.entries == rhs.entries
+    }
+
+    /// Displayed chain rows. Empty `entries` renders one following row.
+    private var displayedRows: [(model: String, thinking: String)] {
+        if entries.isEmpty {
+            return [(
+                SubagentModelSettings.followMainSentinel,
+                SubagentModelSettings.defaultThinkingSentinel
+            )]
+        }
+        return entries.map {
+            ($0.model, $0.thinking ?? SubagentModelSettings.defaultThinkingSentinel)
+        }
     }
 
     var body: some View {
@@ -1825,48 +1882,114 @@ private struct SubagentModelRow: View, Equatable {
                 selectionLogo
                 Text(agent.name)
                     .font(.subheadline.weight(.semibold))
+                if entries.count > 1 {
+                    Text("fallback ×\(entries.count)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
             Text(agent.description)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
+
+            ForEach(Array(displayedRows.enumerated()), id: \.offset) { index, row in
+                chainRow(index: index, model: row.model, thinking: row.thinking)
+            }
+
+            Button {
+                onAddEntry()
+            } label: {
+                Label("添加备用模型", systemImage: "plus")
+                    .font(.caption)
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+    }
+
+    @ViewBuilder
+    private func chainRow(index: Int, model: String, thinking: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if index > 0 || entries.count > 1 {
+                HStack(spacing: 6) {
+                    Text(index == 0 ? "主选" : "备用 \(index)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    if entries.count > 1 {
+                        Button {
+                            onRemoveEntry(index)
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("从 fallback 链中移除该模型")
+                    }
+                }
+            }
             Picker(
                 "模型",
-                selection: Binding(get: { selection }, set: { onSelect($0) })
+                selection: Binding(get: { model }, set: { onSelectModel(index, $0) })
             ) {
-                Text("跟随主 Agent").tag(SubagentModelSettings.followMainSentinel)
-                ForEach(pickerModels) { model in
+                if index == 0 {
+                    Text("跟随主 Agent").tag(SubagentModelSettings.followMainSentinel)
+                }
+                ForEach(pickerModels) { pickerModel in
                     HStack(spacing: 6) {
-                        ProviderLogo(model: model, size: 12)
-                        Text("\(model.name)（\(model.id)）")
-                        if ModelCapabilities.isRecommended(.worker, for: model.id) {
+                        ProviderLogo(model: pickerModel, size: 12)
+                        Text("\(pickerModel.name)（\(pickerModel.id)）")
+                        if ModelCapabilities.isRecommended(.worker, for: pickerModel.id) {
                             ModelRoleBadge(role: .worker)
                         }
                     }
-                    .tag(model.id)
+                    .tag(pickerModel.id)
                 }
             }
             .labelsHidden()
 
-            if isNonReasoning {
+            if isNonReasoning(modelId: model) {
                 Text("该模型为非推理模型，思考强度由模型决定。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
                 Picker(
                     "思考强度",
-                    selection: Binding(get: { thinking }, set: { onSelectThinking($0) })
+                    selection: Binding(get: { thinking }, set: { onSelectThinking(index, $0) })
                 ) {
-                    ForEach(allowedThinkingTags, id: \.self) { tag in
+                    ForEach(allowedThinkingTags(for: model), id: \.self) { tag in
                         Text(thinkingLabel(for: tag)).tag(tag)
                     }
                 }
-                .disabled(selection.isEmpty)
-                .help(selection.isEmpty ? "跟随主 Agent 时仅跟随当前底栏模型" : "仅对这个 Subagent 的新进程生效")
+                .disabled(model.isEmpty || model == SubagentModelSettings.followMainSentinel)
+                .help(model.isEmpty || model == SubagentModelSettings.followMainSentinel
+                    ? "跟随主 Agent 时仅跟随当前底栏模型"
+                    : "仅对这个 Subagent 的新进程生效")
             }
         }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+    }
+
+    private func capability(
+        forModelId modelId: String
+    ) -> (reasoning: Bool?, thinkingLevelMap: [String: String?]?) {
+        guard let model = pickerModels.first(where: { $0.id == modelId }) else {
+            return (nil, nil)
+        }
+        return (model.reasoning, model.thinkingLevelMap)
+    }
+
+    private func isNonReasoning(modelId: String) -> Bool {
+        capability(forModelId: modelId).reasoning == .some(false)
+    }
+
+    private func allowedThinkingTags(for modelId: String) -> [String] {
+        let cap = capability(forModelId: modelId)
+        return ThinkingCapability.allowedLevels(
+            reasoning: cap.reasoning,
+            thinkingLevelMap: cap.thinkingLevelMap
+        )
     }
 
     private func thinkingLabel(for tag: String) -> String {
@@ -1885,13 +2008,13 @@ private struct SubagentModelRow: View, Equatable {
 
     @ViewBuilder
     private var selectionLogo: some View {
-        if selection == SubagentModelSettings.followMainSentinel || selection.isEmpty {
+        if entries.isEmpty {
             Image(systemName: "arrow.triangle.branch")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(width: 14, height: 14)
         } else {
-            ProviderLogo(modelRef: selection, size: 14)
+            ProviderLogo(modelRef: entries[0].model, size: 14)
         }
     }
 }
