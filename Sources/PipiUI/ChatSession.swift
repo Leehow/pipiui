@@ -2268,6 +2268,15 @@ final class ChatSession: ObservableObject, Identifiable {
         let detail = modelFailureDetail(from: rawError)
         let subject = modelFailureSubject(from: message)
 
+        if searchable.contains("insufficient_quota")
+            || searchable.contains("quota exceeded")
+            || searchable.contains("allocated quota")
+            || searchable.contains("out of budget")
+            || searchable.contains("usage limit")
+            || searchable.contains("available balance") {
+            return "⚠️ \(subject)额度已用完或受限，请切换模型或等待额度重置。"
+        }
+
         if searchable.contains("429")
             || searchable.contains("rate_limit")
             || searchable.contains("rate limit")

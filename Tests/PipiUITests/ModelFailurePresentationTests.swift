@@ -16,6 +16,42 @@ final class ModelFailurePresentationTests: XCTestCase {
         XCTAssertFalse(warning.contains("{"))
     }
 
+    func testQuotaExceededIsDistinctFromBusy() {
+        let message = errorMessage(
+            provider: "acme",
+            model: "m-1",
+            error: #"429: {"message":"Allocated quota exceeded, please increase your quota limit...","code":"insufficient_quota"}"#
+        )
+
+        let warning = ChatSession.modelFailureWarning(for: message)
+
+        XCTAssertEqual(warning, "⚠️ acme/m-1 额度已用完或受限，请切换模型或等待额度重置。")
+    }
+
+    func testQuotaExceededMatchesOtherQuotaWording() {
+        let warning = ChatSession.modelFailureWarning(
+            for: errorMessage(error: "your available balance is insufficient for this request")
+        )
+
+        XCTAssertEqual(warning, "⚠️ 额度已用完或受限，请切换模型或等待额度重置。")
+    }
+
+    func testPlainRateLimitStillMapsToBusy() {
+        let warning = ChatSession.modelFailureWarning(
+            for: errorMessage(error: "429 rate limit exceeded, please try again later")
+        )
+
+        XCTAssertEqual(warning, "⚠️ 服务当前繁忙或过载，请稍后重试或切换模型。")
+    }
+
+    func testOverloadedStillMapsToBusy() {
+        let warning = ChatSession.modelFailureWarning(
+            for: errorMessage(error: "The engine is currently overloaded, please try again later")
+        )
+
+        XCTAssertEqual(warning, "⚠️ 服务当前繁忙或过载，请稍后重试或切换模型。")
+    }
+
     func testTimeoutHasDedicatedMessage() {
         let warning = ChatSession.modelFailureWarning(
             for: errorMessage(error: "The upstream request timed out after 30 seconds")
