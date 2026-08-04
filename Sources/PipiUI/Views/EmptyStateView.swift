@@ -45,6 +45,10 @@ struct EmptyStateView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+            Text("或从左侧选择项目并新建会话")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
         }
     }
 
@@ -143,14 +147,19 @@ final class EmptyStateAccountStatusModel: ObservableObject {
 
     private var quotaObserverIDs: [QuotaProvider: UUID] = [:]
     private var balanceObserverIDs: [BalanceProvider: UUID] = [:]
+    /// Bumped by `tearDown()`. Lets an in-flight `reload()`'s detached load
+    /// notice the screen went away before it applies results / rebinds
+    /// monitors on a torn-down model (e.g. rapid appear/disappear cycles).
+    private var generation = 0
 
     /// Disk-scans configured providers, then (re)binds live monitors. Safe to
     /// call repeatedly (e.g. on appear, after adding a model).
     func reload() {
+        let requestedGeneration = generation
         Task.detached(priority: .userInitiated) { [weak self] in
             let loaded = EmptyStateCredentialSummary.load()
             await MainActor.run { [weak self] in
-                guard let self else { return }
+                guard let self, self.generation == requestedGeneration else { return }
                 self.providers = loaded
                 var seed: [String: String] = [:]
                 for p in loaded { seed[p.providerId] = "已配置" }
@@ -160,9 +169,15 @@ final class EmptyStateAccountStatusModel: ObservableObject {
         }
     }
 
-    /// Removes all observers. Call on disappear and before every rebind so
-    /// stale providers don't keep pushing updates into a torn-down screen.
+    /// Invalidates any in-flight `reload()` and removes all observers. Call
+    /// on disappear so stale providers don't keep pushing updates into (or
+    /// re-binding monitors onto) a torn-down screen.
     func tearDown() {
+        generation += 1
+        clearObservers()
+    }
+
+    private func clearObservers() {
         for (qp, id) in quotaObserverIDs {
             qp.monitor.removeObserver(id)
         }
@@ -179,7 +194,7 @@ final class EmptyStateAccountStatusModel: ObservableObject {
     /// failures are silent: the monitor keeps its last good snapshot (or nil),
     /// and `statusText` falls back to "已配置".
     private func bindMonitors(for providers: [EmptyStateConfiguredProvider]) {
-        tearDown()
+        clearObservers()
         var seenQuota = Set<QuotaProvider>()
         var seenBalance = Set<BalanceProvider>()
 

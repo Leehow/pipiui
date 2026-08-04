@@ -69,6 +69,27 @@ final class EmptyStateCredentialSummaryTests: XCTestCase {
         XCTAssertEqual(ids, ["deepseek", "xai"])
     }
 
+    func testOpenAIKeyAloneCollapsesToOpenAINotCodex() throws {
+        try envStore.setSync("sk-test", forKey: "OPENAI_API_KEY")
+        let ids = EmptyStateCredentialSummary.load(envStore: envStore, authURL: authURL)
+            .map(\.providerId)
+        XCTAssertEqual(ids, ["openai"])
+    }
+
+    func testZaiKeyAloneCollapsesToZaiNotZhipu() throws {
+        try envStore.setSync("zai-test", forKey: "ZAI_API_KEY")
+        let ids = EmptyStateCredentialSummary.load(envStore: envStore, authURL: authURL)
+            .map(\.providerId)
+        XCTAssertEqual(ids, ["zai"])
+    }
+
+    func testKimiKeyAloneCollapsesToKimiCodingNotMoonshot() throws {
+        try envStore.setSync("kimi-test", forKey: "KIMI_API_KEY")
+        let ids = EmptyStateCredentialSummary.load(envStore: envStore, authURL: authURL)
+            .map(\.providerId)
+        XCTAssertEqual(ids, ["kimi-coding"])
+    }
+
     func testStatusTextPrefersQuotaOverBalance() {
         XCTAssertEqual(
             EmptyStateCredentialSummary.statusText(quotaUsedPercent: 42, balanceText: "¥10.00"),
