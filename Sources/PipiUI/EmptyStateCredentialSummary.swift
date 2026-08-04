@@ -8,6 +8,7 @@ struct EmptyStateConfiguredProvider: Equatable, Identifiable, Sendable {
 /// Loads configured AI providers for the empty-state landing page.
 /// Search-only env keys are ignored; see `ProviderEnvMap.searchEnvVars`.
 enum EmptyStateCredentialSummary {
+    /// Disk I/O; call off main thread.
     static func load(
         envStore: EnvFileStore = EnvFileStore(),
         authURL: URL = PiAuthStore.defaultAuthURL()
