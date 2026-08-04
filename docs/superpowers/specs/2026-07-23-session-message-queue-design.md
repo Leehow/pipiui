@@ -33,6 +33,7 @@ pi RPC supports `follow_up` / `steer` and emits `queue_update`, but **does not e
 | Default delivery while busy | **followUp** (after full agent settle), not steer |
 | Edit / withdraw granularity | **Bulk only** (align pi TUI), not per-item |
 | Stop / 阻截 | **Abort → wait idle → send queue head**; rest remain queued |
+| 插队 cut-in (re-baseline) | **One click joins ALL queued messages into one prompt**; subagent followUp signals hold one turn behind it |
 | Queue ownership | **Client-side** in `ChatSession` (not pi `follow_up`) |
 
 ## Approach
@@ -65,6 +66,27 @@ Stop (queue non-empty)
 ```
 
 Stop with empty queue: `abort()` only (current behavior).
+
+**Cut-in path (re-baseline, supersedes “cut-in sends queue head only”):**
+
+The old behavior let one click advance only the head message while pending
+subagent `[subagent-done]` / stall followUp signals kept winning the next turn,
+starving the user’s queued messages. New semantics:
+
+```
+插队 (queue non-empty)
+  → queue.armCutInJoin() + write tmpdir hold marker pipiui-cutin-<bridgeRoutingKey>.json
+  → busy ? abort({type:"abort", cutIn:true}) : drain immediately
+  → on idle: popAllForCutIn() → join ALL items (joinTexts "\n\n" separator,
+    images merged FIFO, policy = last human-authored item else app-preserve)
+  → sendPromptNow(joined) + delete hold marker → queue empty
+```
+
+- Stop and normal settle drains keep the **single-head** semantics (`popForIdleDrain`).
+- The subagent extension holds automatic followUp deliveries (`trySendUserMessage`
+  awaits `awaitCutInHoldRelease`) while a fresh marker exists (≤15s staleness
+  fallback), releasing early when a non-extension `input` event starts a turn.
+  Signals are delayed at most one turn, never dropped.
 
 ## Why not pi `follow_up`?
 

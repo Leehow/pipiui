@@ -1399,7 +1399,7 @@ struct InputBar: View {
                     session.cutInQueueHead()
                 }
                 .font(.caption.weight(.medium))
-                .help("中止当前回复并发送队首")
+                .help("中止当前回复并批量发送全部排队消息")
 
                 Button("撤回编辑") {
                     let restored = session.restoreQueueToDraft()
