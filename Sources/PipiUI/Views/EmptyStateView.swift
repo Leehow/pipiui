@@ -3,14 +3,10 @@ import SwiftUI
 struct EmptyStateView: View {
     @EnvironmentObject var store: AppStore
 
+    @StateObject private var accountStatus = EmptyStateAccountStatusModel()
     @State private var showAddModelSheet = false
-    @State private var providers: [EmptyStateConfiguredProvider] = []
-    /// providerId → status trailing text
-    @State private var statusByProvider: [String: String] = [:]
-    @State private var quotaObserverIDs: [QuotaProvider: UUID] = [:]
-    @State private var balanceObserverIDs: [BalanceProvider: UUID] = [:]
 
-    private var hasCredentials: Bool { !providers.isEmpty }
+    private var hasCredentials: Bool { !accountStatus.providers.isEmpty }
 
     var body: some View {
         ScrollView {
@@ -28,11 +24,11 @@ struct EmptyStateView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .textBackgroundColor))
-        .onAppear { refreshCredentials() }
-        .onDisappear { tearDownMonitors() }
+        .onAppear { accountStatus.reload() }
+        .onDisappear { accountStatus.tearDown() }
         .sheet(isPresented: $showAddModelSheet) {
             AddModelSheet {
-                refreshCredentials()
+                accountStatus.reload()
             }
             .environmentObject(store)
             .dismissOnOutsideClick { showAddModelSheet = false }
@@ -80,12 +76,12 @@ struct EmptyStateView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("已配置的 AI 提供商")
                 .font(.subheadline.weight(.semibold))
-            ForEach(providers) { row in
+            ForEach(accountStatus.providers) { row in
                 HStack {
                     Text(row.providerId)
                         .font(.body.monospaced())
                     Spacer()
-                    Text(statusByProvider[row.providerId] ?? "已配置")
+                    Text(accountStatus.statusByProvider[row.providerId] ?? "已配置")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
@@ -132,28 +128,41 @@ struct EmptyStateView: View {
             }
         }
     }
+}
 
-    private func refreshCredentials() {
-        Task.detached(priority: .userInitiated) {
+/// Owns the empty-state provider list plus live quota/balance status text.
+/// A `StateObject`-held class (rather than plain `@State` in `EmptyStateView`)
+/// so the escaping `QuotaMonitor`/`BalanceMonitor` observer closures can hop
+/// back with a plain `weak self` instead of fighting SwiftUI View-struct
+/// capture semantics.
+@MainActor
+final class EmptyStateAccountStatusModel: ObservableObject {
+    @Published private(set) var providers: [EmptyStateConfiguredProvider] = []
+    /// providerId → status trailing text.
+    @Published private(set) var statusByProvider: [String: String] = [:]
+
+    private var quotaObserverIDs: [QuotaProvider: UUID] = [:]
+    private var balanceObserverIDs: [BalanceProvider: UUID] = [:]
+
+    /// Disk-scans configured providers, then (re)binds live monitors. Safe to
+    /// call repeatedly (e.g. on appear, after adding a model).
+    func reload() {
+        Task.detached(priority: .userInitiated) { [weak self] in
             let loaded = EmptyStateCredentialSummary.load()
-            await MainActor.run {
-                providers = loaded
-                // Seed defaults; Task 4 overwrites with live monitors.
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.providers = loaded
                 var seed: [String: String] = [:]
                 for p in loaded { seed[p.providerId] = "已配置" }
-                statusByProvider = seed
-                bindMonitors(for: loaded)
+                self.statusByProvider = seed
+                self.bindMonitors(for: loaded)
             }
         }
     }
 
-    // Stubs filled in Task 4 — must compile:
-    private func bindMonitors(for providers: [EmptyStateConfiguredProvider]) {
-        tearDownMonitors()
-        // Task 4 implements observe + refreshIfNeeded
-    }
-
-    private func tearDownMonitors() {
+    /// Removes all observers. Call on disappear and before every rebind so
+    /// stale providers don't keep pushing updates into a torn-down screen.
+    func tearDown() {
         for (qp, id) in quotaObserverIDs {
             qp.monitor.removeObserver(id)
         }
@@ -162,5 +171,57 @@ struct EmptyStateView: View {
             bp.monitor.removeObserver(id)
         }
         balanceObserverIDs.removeAll()
+    }
+
+    /// Binds one monitor per distinct `QuotaProvider`/`BalanceProvider` backing
+    /// the given rows. Quota takes priority over balance for a given provider
+    /// row (mirrors `EmptyStateCredentialSummary.statusText`). Monitor
+    /// failures are silent: the monitor keeps its last good snapshot (or nil),
+    /// and `statusText` falls back to "已配置".
+    private func bindMonitors(for providers: [EmptyStateConfiguredProvider]) {
+        tearDown()
+        var seenQuota = Set<QuotaProvider>()
+        var seenBalance = Set<BalanceProvider>()
+
+        for row in providers {
+            if let qp = quotaProvider(for: row.providerId) {
+                if seenQuota.insert(qp).inserted {
+                    let id = qp.monitor.observe { [weak self] snapshot in
+                        Task { @MainActor [weak self] in
+                            self?.applyQuota(qp, usedPercent: snapshot?.capsule?.usedPercent)
+                        }
+                    }
+                    quotaObserverIDs[qp] = id
+                }
+                continue
+            }
+
+            if let bp = balanceProvider(for: row.providerId) {
+                if seenBalance.insert(bp).inserted {
+                    let id = bp.monitor.observe { [weak self] snapshot in
+                        let balanceText = snapshot.map { formatBalance(amount: $0.amount, currency: $0.currency) }
+                        Task { @MainActor [weak self] in
+                            self?.applyBalance(bp, balanceText: balanceText)
+                        }
+                    }
+                    balanceObserverIDs[bp] = id
+                }
+            }
+        }
+    }
+
+    private func applyQuota(_ provider: QuotaProvider, usedPercent: Double?) {
+        let text = EmptyStateCredentialSummary.statusText(quotaUsedPercent: usedPercent, balanceText: nil)
+        for row in providers where quotaProvider(for: row.providerId) == provider {
+            statusByProvider[row.providerId] = text
+        }
+    }
+
+    private func applyBalance(_ provider: BalanceProvider, balanceText: String?) {
+        let text = EmptyStateCredentialSummary.statusText(quotaUsedPercent: nil, balanceText: balanceText)
+        for row in providers
+        where balanceProvider(for: row.providerId) == provider && quotaProvider(for: row.providerId) == nil {
+            statusByProvider[row.providerId] = text
+        }
     }
 }
