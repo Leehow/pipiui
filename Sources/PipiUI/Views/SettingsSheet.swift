@@ -629,6 +629,13 @@ struct SettingsSheet: View {
                     .font(.title3.weight(.semibold))
                 Spacer()
                 Button {
+                    Task { await reload(restartSessions: true) }
+                } label: {
+                    Label("刷新", systemImage: "arrow.clockwise")
+                }
+                .disabled(isLoading)
+                .help("重新读取 models.json 并刷新所有会话,无需重启 App")
+                Button {
                     showAddSheet = true
                 } label: {
                     Label("添加模型", systemImage: "plus")
