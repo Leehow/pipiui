@@ -1718,9 +1718,10 @@ struct SettingsSheet: View {
         let backend = WebSearchSettings.backend()
         let envStore = EnvFileStore()
         let credentials = PiAuthStore.list()
-        // .env 已配置 key 的 provider：仅 auth.json 在列的 provider 才需要冲突检测。
+        // .env 已配置 key 的 provider：.env-only 凭据的 provider 也需要
+        // 「同时从 .env 移除」选项，故遍历 ProviderEnvMap 全表（而非仅 auth.json 在列）。
         let envConfigured = Set(
-            credentials.map(\.providerId).filter { pid in
+            ProviderEnvMap.envVarsByProvider.keys.filter { pid in
                 ProviderEnvMap.envVars(forProvider: pid).contains { envStore.isConfigured(forKey: $0) }
             }
         )
