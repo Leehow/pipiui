@@ -622,26 +622,3 @@ private final class SidebarDividerTrackingView: NSView {
     }
 }
 
-struct EmptyStateView: View {
-    @EnvironmentObject var store: AppStore
-
-    var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "terminal")
-                .font(.system(size: 44, weight: .light))
-                .foregroundStyle(.tertiary)
-            BrandMark(size: .hero)
-            Text("选择左侧项目并新建会话，或点击下方按钮添加项目文件夹")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Button {
-                store.addProjectViaPanel()
-            } label: {
-                Label("添加项目文件夹", systemImage: "folder.badge.plus")
-            }
-            .controlSize(.large)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .textBackgroundColor))
-    }
-}
