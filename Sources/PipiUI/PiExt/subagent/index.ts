@@ -751,12 +751,58 @@ interface SubagentModelOverride {
 	thinking?: string;
 }
 
+interface SubagentModelChain {
+	/** Ordered fallback chain; index 0 is the primary model. Never empty. */
+	models: SubagentModelOverride[];
+}
+
+/**
+ * Parse one agent override value into an ordered model chain. All three shapes are
+ * compatible (must stay parse-compatible with the Swift side):
+ * 1. legacy string `"provider/id"` → chain = [{ model }]
+ * 2. `{ model, thinking? }` → chain = [{ model, thinking? }]
+ * 3. `{ models: [{ model, thinking? }, ...] }` → ordered chain (invalid entries skipped)
+ * Returns an empty array when nothing parseable — caller falls back to the main model.
+ */
+function parseSubagentModelChain(value: unknown): SubagentModelOverride[] {
+	const parseEntry = (
+		candidate: { model?: unknown; thinking?: unknown },
+	): SubagentModelOverride | undefined => {
+		if (typeof candidate.model !== "string" || !candidate.model.trim()) return undefined;
+		const thinking =
+			typeof candidate.thinking === "string" && candidate.thinking.trim()
+				? candidate.thinking.trim()
+				: undefined;
+		return { model: candidate.model.trim(), ...(thinking ? { thinking } : {}) };
+	};
+	if (typeof value === "string" && value.trim()) {
+		return [{ model: value.trim() }];
+	}
+	if (value && typeof value === "object" && !Array.isArray(value)) {
+		const candidate = value as { model?: unknown; thinking?: unknown; models?: unknown };
+		if (Array.isArray(candidate.models)) {
+			const chain: SubagentModelOverride[] = [];
+			for (const item of candidate.models) {
+				if (item && typeof item === "object" && !Array.isArray(item)) {
+					const entry = parseEntry(item as { model?: unknown; thinking?: unknown });
+					if (entry) chain.push(entry);
+				}
+			}
+			if (chain.length > 0) return chain;
+		}
+		const single = parseEntry(candidate);
+		if (single) return [single];
+	}
+	return [];
+}
+
 /** Hot-read PipiUI settings JSON (UserDefaults mirror). Missing / empty = follow main.
  *
- * Legacy values are model strings. New values are `{ model, thinking? }`; normalizing
- * both shapes here lets a running extension immediately see settings saved by the app.
+ * Legacy values are model strings; newer values are `{ model, thinking? }` or an ordered
+ * fallback chain `{ models: [...] }`. Normalizing all shapes here lets a running extension
+ * immediately see settings saved by the app.
  */
-function loadSubagentModelOverrides(): Record<string, SubagentModelOverride> {
+function loadSubagentModelOverrides(): Record<string, SubagentModelChain> {
 	const file =
 		process.env.PIPIUI_SUBAGENT_MODELS_FILE ||
 		path.join(os.homedir(), "Library/Application Support/PipiUI/subagent-models.json");
@@ -764,20 +810,10 @@ function loadSubagentModelOverrides(): Record<string, SubagentModelOverride> {
 		const raw = fs.readFileSync(file, "utf-8");
 		const parsed = JSON.parse(raw) as unknown;
 		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-			const result: Record<string, SubagentModelOverride> = {};
+			const result: Record<string, SubagentModelChain> = {};
 			for (const [agentName, value] of Object.entries(parsed)) {
-				if (typeof value === "string" && value.trim()) {
-					result[agentName] = { model: value.trim() };
-				} else if (value && typeof value === "object" && !Array.isArray(value)) {
-					const candidate = value as { model?: unknown; thinking?: unknown };
-					if (typeof candidate.model === "string" && candidate.model.trim()) {
-						const thinking =
-							typeof candidate.thinking === "string" && candidate.thinking.trim()
-								? candidate.thinking.trim()
-								: undefined;
-						result[agentName] = { model: candidate.model.trim(), ...(thinking ? { thinking } : {}) };
-					}
-				}
+				const chain = parseSubagentModelChain(value);
+				if (chain.length > 0) result[agentName] = { models: chain };
 			}
 			return result;
 		}
@@ -794,6 +830,25 @@ function stripModelThinkingSuffix(modelRef: string): string {
 	const colon = modelRef.lastIndexOf(":");
 	if (colon <= 0) return modelRef;
 	return PI_THINKING_LEVELS.has(modelRef.slice(colon + 1)) ? modelRef.slice(0, colon) : modelRef;
+}
+
+/**
+ * Rewrite already-assembled spawn args for a fallback chain entry. Same session
+ * (--session-id untouched): only --model / --thinking change. An entry without an
+ * explicit thinking level removes --thinking instead of keeping the previous one.
+ */
+function rewriteSpawnModelArgs(args: string[], model: string, thinking: string | undefined): void {
+	const modelValue = thinking ? stripModelThinkingSuffix(model) : model;
+	const mi = args.indexOf("--model");
+	if (mi >= 0 && mi + 1 < args.length) args[mi + 1] = modelValue;
+	else args.push("--model", modelValue);
+	const ti = args.indexOf("--thinking");
+	if (ti >= 0 && ti + 1 < args.length) {
+		if (thinking) args[ti + 1] = thinking;
+		else args.splice(ti, 2);
+	} else if (thinking) {
+		args.push("--thinking", thinking);
+	}
 }
 
 /**
@@ -853,7 +908,7 @@ function resolveAgentModel(
 	sessionModel: string | undefined,
 ): string | undefined {
 	const overrides = loadSubagentModelOverrides();
-	const explicit = overrides[agentName];
+	const explicit = overrides[agentName]?.models[0];
 	if (explicit?.model) {
 		return explicit.model;
 	}
@@ -870,7 +925,15 @@ function resolveAgentModel(
 
 /** Only explicit per-subagent settings receive a `--thinking` argument. */
 function resolveAgentThinking(agentName: string): string | undefined {
-	return loadSubagentModelOverrides()[agentName]?.thinking;
+	return loadSubagentModelOverrides()[agentName]?.models[0]?.thinking;
+}
+
+/** Chain entry by index (0-based); undefined past the end or without an explicit override. */
+function resolveAgentModelChainEntry(
+	agentName: string,
+	index: number,
+): SubagentModelOverride | undefined {
+	return loadSubagentModelOverrides()[agentName]?.models[index];
 }
 
 /** Main-agent model to stamp onto child env so nested agents still「跟随主」. */
@@ -1164,6 +1227,30 @@ function isRetryableWorkerError(text: string): boolean {
 		"502 bad gateway",
 	];
 	for (const s of retryable) {
+		if (t.includes(s)) return true;
+	}
+	return false;
+}
+
+/**
+ * Quota/budget exhaustion worth switching to the next fallback model immediately.
+ * Separate from isRetryableWorkerError: same-model retries cannot fix a depleted
+ * quota, so these never consume the same-model resume budget. Lowercase substring.
+ */
+const QUOTA_FALLBACK_MARKERS = [
+	"insufficient_quota",
+	"quota exceeded",
+	"allocated quota",
+	"out of budget",
+	"usage limit",
+	"available balance",
+	"billing",
+];
+
+function isQuotaLikeWorkerError(text: string): boolean {
+	const t = (text || "").toLowerCase();
+	if (!t.trim()) return false;
+	for (const s of QUOTA_FALLBACK_MARKERS) {
 		if (t.includes(s)) return true;
 	}
 	return false;
@@ -3337,6 +3424,10 @@ async function runSingleAgent(
 		// (same args → session resume for stateful roles; cold restart for --no-session).
 		let autoResumeCount = 0;
 		let exitCode = 1;
+		// Model fallback chain: only advances when Settings gave this agent an explicit
+		// multi-model chain (index 0 is the primary model, i.e. resolvedModel).
+		let modelChainIndex = 0;
+		const modelFallbackNotes: string[] = [];
 
 		for (;;) {
 			// Snapshot so retry classification only sees THIS attempt (prior "fetch failed"
@@ -3536,7 +3627,6 @@ async function runSingleAgent(
 			if (wasAborted) break;
 			const runFailed = exitCode !== 0 || Boolean(currentResult.errorMessage);
 			if (!runFailed) break;
-			if (autoResumeCount >= AUTO_RESUME_MAX) break;
 			const attemptMessages = currentResult.messages.slice(attemptMessagesFrom);
 			const attemptStderr = currentResult.stderr.slice(attemptStderrFrom);
 			const classifyText = [
@@ -3545,7 +3635,27 @@ async function runSingleAgent(
 				attemptStderr,
 				getFinalOutput(attemptMessages).slice(-2000),
 			].join("\n");
-			if (!isRetryableWorkerError(classifyText)) break;
+			// Fallback chain classification:
+			// a) quota family (isQuotaLikeWorkerError) → never consumes the same-model resume
+			//    budget; switch to the next chain model immediately when one exists;
+			// b) transient family (isRetryableWorkerError) → same-model auto-resume first
+			//    (AUTO_RESUME_MAX budget); once exhausted, switch model if the chain has a
+			//    next entry (the new model resets its own resume budget);
+			// c) any other non-retryable (auth 401/403, unknown agent, …) → never switch;
+			//    fall through to the existing failed path.
+			const nextChainEntry = resolveAgentModelChainEntry(agentName, modelChainIndex + 1);
+			let fallbackReason: string | undefined;
+			if (isQuotaLikeWorkerError(currentResult.errorMessage ?? "")) {
+				if (!nextChainEntry) break;
+				fallbackReason = "quota";
+			} else if (isRetryableWorkerError(classifyText)) {
+				if (autoResumeCount >= AUTO_RESUME_MAX) {
+					if (!nextChainEntry) break;
+					fallbackReason = "retry budget exhausted";
+				}
+			} else {
+				break;
+			}
 
 			const shortErr = (currentResult.errorMessage || currentResult.stderr || "retryable error")
 				.replace(/\s+/g, " ")
@@ -3553,11 +3663,33 @@ async function runSingleAgent(
 				.slice(0, 120);
 			const baseBackoffMs = AUTO_RESUME_BACKOFF_MS[autoResumeCount] ?? 15_000;
 			const backoffMs = jitteredRetryBackoffMs(baseBackoffMs);
-			autoResumeCount++;
 			// Reset per-run failure flags; messages/usage/stderr keep accumulating across resumes.
 			currentResult.stopReason = undefined;
 			currentResult.errorMessage = undefined;
-			pipiuiActivity = `auto-resume 第${autoResumeCount}次：前次死于 ${shortErr}`;
+			if (fallbackReason && nextChainEntry) {
+				// Model switch = same agentId / same session resume: --session-id untouched,
+				// only --model / --thinking rewritten. Index only advances, so total switches
+				// are naturally bounded by chain length - 1.
+				const oldModel = resolveAgentModelChainEntry(agentName, modelChainIndex)?.model ?? "?";
+				modelChainIndex++;
+				rewriteSpawnModelArgs(args, nextChainEntry.model, nextChainEntry.thinking);
+				currentResult.model = nextChainEntry.thinking
+					? stripModelThinkingSuffix(nextChainEntry.model)
+					: nextChainEntry.model;
+				autoResumeCount = 0; // the new model gets its own same-model resume budget
+				const fallbackNote = `model fallback: ${oldModel} -> ${nextChainEntry.model} (${fallbackReason})`;
+				modelFallbackNotes.push(`\n[pipiui] ${fallbackNote}`);
+				pipiuiActivity = `auto-resume 换模：${fallbackNote}；前次死于 ${shortErr}`;
+				pipiuiReport({
+					kind: "log",
+					agentId: pipiuiAgentId,
+					items: [{ itemType: "text", text: `[pipiui] ${fallbackNote}` }],
+				});
+				pipiuiUpdate(true);
+			} else {
+				autoResumeCount++;
+				pipiuiActivity = `auto-resume 第${autoResumeCount}次：前次死于 ${shortErr}`;
+			}
 			// Drop dead pid before backoff so zombie-settle does not treat the worker as vanished.
 			const h = runningAgents.get(pipiuiAgentId);
 			if (h) h.pid = undefined;
@@ -3625,6 +3757,11 @@ async function runSingleAgent(
 		let endOutput = (getFinalOutput(currentResult.messages) || currentResult.stderr || "").slice(-8000);
 		let endResultText =
 			getResultOutput(currentResult) || currentResult.stderr || getFinalOutput(currentResult.messages) || "(no output)";
+		if (modelFallbackNotes.length > 0) {
+			const note = modelFallbackNotes.join("");
+			endOutput += note;
+			endResultText += note;
+		}
 		if (endOk && autoResumeCount > 0) {
 			const note = `\n[pipiui] auto-resumed ${autoResumeCount}× after retryable errors.`;
 			endOutput += note;
