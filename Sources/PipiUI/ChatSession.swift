@@ -93,20 +93,7 @@ struct ModelInfo: Identifiable, Hashable {
     /// `anthropic`, `openai-codex`, `kimi-coding`).
     var quotaProvider: QuotaProvider? {
         if isRelayProvider { return nil }
-        let p = provider.lowercased()
-        if p == "xai" || p.contains("grok") { return .grok }
-        if p.contains("zai") || p.contains("zhipu") || p.contains("bigmodel") { return .glm }
-        if p == "anthropic" || p.contains("claude") { return .claude }
-        if p.contains("openai") || p.contains("codex") { return .codex }
-        // Kimi Code Plan (`kimi-coding`); not Moonshot open-platform balance.
-        if p.contains("kimi") { return .kimi }
-        // Qoder subscription (pi-provider-qoder extension: `qoder` / `qoder-cn`).
-        if p.contains("qoder") { return .qoder }
-        // Aliyun Bailian Qwen Token Plan personal plan (`qwen-token-plan` /
-        // `qwen-token-plan-cn`). Substring match is intentional — other qwen
-        // models (e.g. `qwen-vl`) must NOT map here.
-        if p.contains("qwen-token-plan") { return .qwenTokenPlan }
-        return nil
+        return PipiUI.quotaProvider(for: provider)
     }
 
     /// Whether the account-quota pill should be shown for this model.

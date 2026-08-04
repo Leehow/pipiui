@@ -27,4 +27,16 @@ enum EmptyStateCredentialSummary {
 
         return ids.sorted().map { EmptyStateConfiguredProvider(providerId: $0) }
     }
+
+    /// Pure formatter for a row's trailing status.
+    /// Prefer quota over balance when both are available.
+    static func statusText(quotaUsedPercent: Double?, balanceText: String?) -> String {
+        if let q = quotaUsedPercent {
+            return "已用 \(Int(q.rounded()))%"
+        }
+        if let b = balanceText, !b.isEmpty {
+            return b
+        }
+        return "已配置"
+    }
 }

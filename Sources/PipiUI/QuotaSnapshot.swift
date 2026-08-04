@@ -79,6 +79,21 @@ enum QuotaProvider: String, CaseIterable {
     }
 }
 
+/// Map a pi provider id → account-quota source. Relay / unknown → nil.
+/// Keep in sync with former `ModelInfo.quotaProvider` rules.
+func quotaProvider(for provider: String) -> QuotaProvider? {
+    let p = provider.lowercased()
+    if p.contains("relay") { return nil }
+    if p == "xai" || p.contains("grok") { return .grok }
+    if p.contains("zai") || p.contains("zhipu") || p.contains("bigmodel") { return .glm }
+    if p == "anthropic" || p.contains("claude") { return .claude }
+    if p.contains("openai") || p.contains("codex") { return .codex }
+    if p.contains("kimi") { return .kimi }
+    if p.contains("qoder") { return .qoder }
+    if p.contains("qwen-token-plan") { return .qwenTokenPlan }
+    return nil
+}
+
 /// Common interface every per-provider quota monitor conforms to. The contract
 /// mirrors the original `GrokQuotaMonitor`: callers/handlers on the main thread,
 /// failures are silent (last good snapshot kept), `observe` delivers the cache

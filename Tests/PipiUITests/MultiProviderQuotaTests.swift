@@ -57,6 +57,28 @@ final class MultiProviderQuotaTests: XCTestCase {
         XCTAssertFalse(ModelInfo(provider: "grok-relay", modelId: "grok-4.5", name: "g", contextWindow: nil).shouldShowAccountQuota)
     }
 
+    func testModelInfoQuotaProviderMatchesSharedRouting() {
+        let providers = [
+            "xai", "grok-relay", "zai-coding-cn", "zhipu-coding", "bigmodel",
+            "anthropic", "claude-code", "openai-codex", "kimi-coding",
+            "qoder-cn", "qwen-token-plan-cn", "deepseek", "acme",
+        ]
+
+        for provider in providers {
+            let model = ModelInfo(
+                provider: provider,
+                modelId: "test-model",
+                name: "Test",
+                contextWindow: nil
+            )
+            XCTAssertEqual(
+                model.quotaProvider,
+                quotaProvider(for: provider),
+                "routing mismatch for \(provider)"
+            )
+        }
+    }
+
     func testQuotaProviderAccountLabel() {
         XCTAssertEqual(QuotaProvider.grok.accountLabel, "Grok 账号额度")
         XCTAssertEqual(QuotaProvider.glm.accountLabel, "GLM 账号额度")

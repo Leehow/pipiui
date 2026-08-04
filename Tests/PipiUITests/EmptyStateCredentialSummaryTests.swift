@@ -68,4 +68,39 @@ final class EmptyStateCredentialSummaryTests: XCTestCase {
             .map(\.providerId)
         XCTAssertEqual(ids, ["deepseek", "xai"])
     }
+
+    func testStatusTextPrefersQuotaOverBalance() {
+        XCTAssertEqual(
+            EmptyStateCredentialSummary.statusText(quotaUsedPercent: 42, balanceText: "¥10.00"),
+            "已用 42%"
+        )
+    }
+
+    func testStatusTextBalanceWhenNoQuota() {
+        XCTAssertEqual(
+            EmptyStateCredentialSummary.statusText(quotaUsedPercent: nil, balanceText: "$1.25"),
+            "$1.25"
+        )
+    }
+
+    func testStatusTextConfiguredFallback() {
+        XCTAssertEqual(
+            EmptyStateCredentialSummary.statusText(quotaUsedPercent: nil, balanceText: nil),
+            "已配置"
+        )
+    }
+
+    func testStatusTextRoundsPercent() {
+        XCTAssertEqual(
+            EmptyStateCredentialSummary.statusText(quotaUsedPercent: 41.6, balanceText: nil),
+            "已用 42%"
+        )
+    }
+
+    func testQuotaProviderRoutingMatchesModelInfo() {
+        XCTAssertEqual(quotaProvider(for: "xai"), .grok)
+        XCTAssertEqual(quotaProvider(for: "kimi-coding"), .kimi)
+        XCTAssertEqual(quotaProvider(for: "deepseek"), nil) // balance-only
+        XCTAssertNil(quotaProvider(for: "openai-relay"))
+    }
 }
