@@ -409,29 +409,19 @@ struct SidebarView: View {
             .accessibilityLabel("项目菜单\(displayName)")
             .pointingHandCursor()
 
-            // Split button: a plain click keeps the fast path (default pi
-            // session) while the chevron opens an engine picker for jcode.
-            // `primaryAction` lands on macOS 14+, matching the package floor.
-            Menu {
-                Button("新 pi 会话") {
-                    selectProject(project)
-                    store.newSession(project: project, engine: .pi)
-                }
-                Button("新 jcode 会话") {
-                    selectProject(project)
-                    store.newSession(project: project, engine: .jcode)
-                }
+            // New-session button: creates a default pi session. Engine selection
+            // (pi/jcode) lives in the chat panel's centered switcher, shown while
+            // the session is empty — see EngineSwitcherOverlay.
+            Button {
+                selectProject(project)
+                store.newSession(project: project)
             } label: {
                 Image(systemName: "plus")
                     .font(.caption.weight(.semibold))
                     .frame(width: 20, height: 20)
-            } primaryAction: {
-                selectProject(project)
-                store.newSession(project: project, engine: .pi)
             }
             .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
-            .menuIndicator(.visible)
-            .help("新建会话（默认 pi；点按箭头选 jcode）")
+            .help("新建会话")
             .accessibilityLabel("在\(displayName)中新建会话")
         }
         .padding(.vertical, 5)

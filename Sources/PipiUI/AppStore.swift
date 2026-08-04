@@ -1933,6 +1933,22 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Switch the engine of an empty session by closing it and creating a fresh
+    /// empty session with the chosen engine. No-op (returns) if the session has
+    /// any real (non-local-only) message — the EngineSwitcherOverlay only shows
+    /// on empty sessions, and this guard makes that contract robust. Preserves
+    /// project and selection: the new session becomes the selected one.
+    func switchEngine(for session: ChatSession, to engine: EngineKind) {
+        // Safety: never discard a session that has real history.
+        guard !session.transcript.contains(where: { !$0.isLocalOnly }) else { return }
+        guard engine != session.engineKind else { return }
+        guard let key = openSessions.first(where: { $0.value === session })?.key else { return }
+        let project = session.projectURL
+        closeSession(key: key)
+        let (newKey, _) = createSessionInBackground(project: project, engine: engine)
+        selectedSessionKey = newKey
+    }
+
     func closeSession(key: String) {
         extensionConflictScanGenerations.removeValue(forKey: key)
         pendingHistoricalSessionOpens.removeValue(forKey: key)
