@@ -83,6 +83,7 @@ struct SettingsSheet: View {
     @State private var isLoading = false
     @State private var statusMessage: String?
     @State private var errorMessage: String?
+    @State private var verifyAlertMessage: String?
     @State private var pendingDeleteProvider: String?
     @State private var showAddSheet = false
     /// T9/T-tab 减负：pickerModels 改为缓存 @State，仅在 models/hiddenIds/subagentSettings 变化时重算。
@@ -162,7 +163,7 @@ struct SettingsSheet: View {
         }
         .sheet(isPresented: $showAddSheet) {
             AddModelSheet {
-                Task { await reload(restartSessions: true) }
+                Task { await verifyAfterSave() }
             }
             .environmentObject(store)
             // Key-window check in OverlayDismiss keeps this nested sheet safe:
@@ -191,6 +192,17 @@ struct SettingsSheet: View {
             Button("取消", role: .cancel) { pendingDeleteProvider = nil }
         } message: {
             Text("将从 ~/.pi/agent/auth.json 移除该 provider 的凭据（与 pi /logout 相同）。默认不影响 ~/.pi/agent/.env 中的同名 key——若 .env 也配置了该 provider 的 key，模型仍可用，可选「同时从 .env 移除」一并删除。models.json 不受影响。删除后该 provider 下所有模型会从列表消失。")
+        }
+        .alert(
+            "验证未通过",
+            isPresented: Binding(
+                get: { verifyAlertMessage != nil },
+                set: { if !$0 { verifyAlertMessage = nil } }
+            )
+        ) {
+            Button("知道了", role: .cancel) { verifyAlertMessage = nil }
+        } message: {
+            Text(verifyAlertMessage ?? "")
         }
     }
 
@@ -1801,6 +1813,24 @@ struct SettingsSheet: View {
         recomputeGroupedModels()
         recomputePickerModels()
         normalizeSubagentThinkingIfNeeded()
+    }
+
+    /// 保存 API key 后的即时验证：重加载前用 pi runtime listModels 做轻量抽查，
+    /// 确认 key 有效、端点可达。失败以 alert 提示（不阻断保存，跳过 reload）；
+    /// 成功按原流程 reload 刷新会话与模型列表。内置 oauth provider 走同一条路，
+    /// 认证通过即不弹出提示。
+    @MainActor
+    private func verifyAfterSave(restartSessions: Bool = true) async {
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        do {
+            _ = try await PiAuthHelper.listModels()
+        } catch {
+            verifyAlertMessage = "API key 已保存，但验证未通过：\(error.localizedDescription)\n\n可能原因：key 不正确、网络不通、或套餐/额度未生效。模型暂未刷新，可重试或重新保存 key。"
+            return
+        }
+        await reload(restartSessions: restartSessions)
     }
 
     @MainActor
