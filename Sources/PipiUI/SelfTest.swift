@@ -268,14 +268,50 @@ enum SelfTest {
         check("intercept cleared after pop", q.interceptSendFirst == false)
         check("queue empty", q.isEmpty)
 
-        // Cut-in while idle: same drain path without needing streaming abort
-        // (ChatSession.cutInQueueHead → drainQueueIfIdle → popForIdleDrain)
+        // Cut-in 批量语义：arm 后一次弹出全部，join 成一条 prompt；未 arm 时保持单条
+        // (ChatSession.cutInQueueHead → drainQueueIfIdle → popAllForCutIn)
         _ = q.enqueue(text: "cut-a")
         _ = q.enqueue(text: "cut-b")
-        let cutHead = q.popForIdleDrain(isStreaming: false, processAlive: true)
-        check("cut-in idle pops head only", cutHead?.text == "cut-a")
-        check("cut-in leaves FIFO tail", q.count == 1 && q.items.first?.text == "cut-b")
+        check("no batch pop without arm",
+              q.popAllForCutIn(isStreaming: false, processAlive: true) == nil)
+        q.armCutInJoin()
+        check("cut-in armed", q.cutInJoinArmed)
+        check("no batch pop while streaming",
+              q.popAllForCutIn(isStreaming: true, processAlive: true) == nil)
+        check("still armed while streaming", q.cutInJoinArmed)
+        let cutBatch = q.popAllForCutIn(isStreaming: false, processAlive: true)
+        check("cut-in pops all FIFO", cutBatch?.count == 2
+              && cutBatch?[0].text == "cut-a" && cutBatch?[1].text == "cut-b")
+        check("cut-in clears flag and queue", q.cutInJoinArmed == false && q.isEmpty)
+        // Joined prompt: joinTexts separator + policy of last human-authored item
+        if let cutBatch {
+            let joined = SessionMessageQueue.joinedCutIn(cutBatch)
+            check("cut-in join separator", joined.text == "cut-a\n\ncut-b")
+            check("cut-in join local policy", joined.searchGrantPolicy == .localHumanRecordPromptPaths)
+        }
+        // Policy: last human-authored wins; app-only batch falls back to preserve-grant
+        let mixed = SessionMessageQueue.joinedCutIn([
+            QueuedMessage(text: "h1", searchGrantPolicy: .localHumanRecordPromptPaths),
+            QueuedMessage(text: "app", searchGrantPolicy: .appAuthoredPreserveLatestHumanGrant),
+            QueuedMessage(text: "remote", searchGrantPolicy: .remoteClearGrant),
+            QueuedMessage(text: "app2", searchGrantPolicy: .appAuthoredPreserveLatestHumanGrant),
+        ])
+        check("cut-in policy last human-authored", mixed.searchGrantPolicy == .remoteClearGrant)
+        let appOnly = SessionMessageQueue.joinedCutIn([
+            QueuedMessage(text: "app", searchGrantPolicy: .appAuthoredPreserveLatestHumanGrant),
+        ])
+        check("cut-in policy app fallback",
+              appOnly.searchGrantPolicy == .appAuthoredPreserveLatestHumanGrant)
+        // Unarmed idle drain still single-item (Stop / settle path unchanged)
+        _ = q.enqueue(text: "cut-c")
+        _ = q.enqueue(text: "cut-d")
+        let singleHead = q.popForIdleDrain(isStreaming: false, processAlive: true)
+        check("unarmed drain pops head only", singleHead?.text == "cut-c")
+        check("unarmed drain leaves FIFO tail", q.count == 1 && q.items.first?.text == "cut-d")
+        // restoreAll disarms a pending cut-in
+        q.armCutInJoin()
         _ = q.restoreAll()
+        check("restoreAll disarms cut-in", q.cutInJoinArmed == false && q.isEmpty)
 
         // noteAbort on empty is no-op
         q.noteAbort()

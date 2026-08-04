@@ -3835,6 +3835,8 @@ final class ChatSession: ObservableObject, Identifiable {
     func restoreQueueToDraft() -> (text: String, images: [DraftImage]) {
         let snapshot = queue.items
         let restored = queue.restoreAll()
+        // restoreAll disarms the cut-in join; the hold marker must not outlive the queue.
+        clearCutInHoldMarker()
         publishQueue()
         // Strip each item then re-join — joined annotated blocks only have one trailing footer.
         let displayParts = snapshot
@@ -3844,7 +3846,7 @@ final class ChatSession: ObservableObject, Identifiable {
         return (SessionMessageQueue.joinTexts(displayParts), restored.images)
     }
 
-    func abort() {
+    func abort(cutIn: Bool = false) {
         // Optimistic: acknowledge the click immediately. Cleared on settle / exit / new turn.
         isStopping = true
         pendingStreamMessage = nil
@@ -3853,8 +3855,12 @@ final class ChatSession: ObservableObject, Identifiable {
         queue.noteAbort()
         publishQueue()
         cancelSideChannelTitle()
-        // intercept flag only; items stay until idle drain
-        backend?.send(["type": "abort"], failure: nil)
+        // intercept flag only; items stay until idle drain. `cutIn: true` is protocol
+        // documentation for now — pi's RPC loop ignores unknown fields, so the extension
+        // observes the cut-in through the tmpdir hold marker (see armCutInHoldMarker).
+        var abortCmd: [String: Any] = ["type": "abort"]
+        if cutIn { abortCmd["cutIn"] = true }
+        backend?.send(abortCmd, failure: nil)
         // Backstop: pi's abort can hang forever when the in-flight tool child ignores
         // its AbortSignal — tiered escalation (descendants SIGTERM → SIGKILL → kill+respawn)
         // guarantees `isStopping` never sticks past the shutdown delay.
@@ -3963,22 +3969,73 @@ final class ChatSession: ObservableObject, Identifiable {
         return true
     }
 
-    /// 插队 / 阻截：中止当前 run（若在生成），settle 后发送队首；FIFO 剩余项不变。不恢复到 draft。
-    /// Same path as Stop-with-queue when streaming; when idle, drains head immediately.
+    /// 插队 / 阻截：中止当前 run（若在生成），settle 后把**全部**排队消息 join 成一条
+    /// prompt 发送（队列清空）；闲时立即执行。不恢复到 draft。hold marker 让扩展侧待发
+    /// followUp 信号让路一个 turn，保证 cut-in prompt 先发。
+    /// Same path as Stop-with-queue when streaming; when idle, drains immediately.
     func cutInQueueHead() {
         guard !queue.isEmpty else { return }
+        // Idempotent: rapid double-clicks re-arm the same flag and rewrite the marker,
+        // never enqueue a second join or double-send.
+        queue.armCutInJoin()
+        publishQueue()
+        armCutInHoldMarker()
         if isStreaming {
-            abort()
+            abort(cutIn: true)
         } else {
             drainQueueIfIdle()
         }
     }
 
-    /// Drain queue head when agent is idle. Call from agent_settled or cut-in when already idle.
+    /// Cut-in hold marker (tmpdir file keyed by this session's bridge routing key, which
+    /// the pi process sees as PIPIUI_SESSION_KEY). The subagent extension holds automatic
+    /// followUp deliveries while a fresh marker exists, so the joined cut-in prompt wins
+    /// the next turn instead of racing [subagent-done]/stall signals. Swift clears it the
+    /// moment the joined prompt is dispatched; a stale marker (>15s) is ignored anyway.
+    private var cutInHoldFileURL: URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-cutin-\(bridgeRoutingKey).json")
+    }
+
+    private func armCutInHoldMarker() {
+        let payload: [String: Any] = [
+            "at": Int64(Date().timeIntervalSince1970 * 1000),
+            "sessionKey": id,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        try? data.write(to: cutInHoldFileURL, options: .atomic)
+    }
+
+    private func clearCutInHoldMarker() {
+        try? FileManager.default.removeItem(at: cutInHoldFileURL)
+    }
+
+    /// Drain queue when agent is idle. Call from agent_settled or cut-in when already idle.
+    /// Armed cut-in joins ALL queued messages into one prompt; otherwise pops the head only.
     private func drainQueueIfIdle() {
         // Stale flag if prior drain never saw agent_start (e.g. odd settle path).
         if isSendingFromQueue && !isStreaming {
             isSendingFromQueue = false
+        }
+        let cutInArmed = queue.cutInJoinArmed
+        if let batch = queue.popAllForCutIn(isStreaming: isStreaming, processAlive: processAlive) {
+            publishQueue()
+            clearCutInHoldMarker()
+            let joined = SessionMessageQueue.joinedCutIn(batch)
+            sendPromptNow(
+                message: joined.text,
+                images: joined.images,
+                requeueOnFailure: joined,
+                searchGrantPolicy: joined.searchGrantPolicy
+            )
+            return
+        }
+        if cutInArmed && !queue.cutInJoinArmed {
+            // Armed but consumed empty (queue drained/restored between click and settle):
+            // nothing to send — release the extension hold and republish.
+            clearCutInHoldMarker()
+            publishQueue()
+            return
         }
         guard let msg = queue.popForIdleDrain(isStreaming: isStreaming, processAlive: processAlive) else {
             publishQueue()

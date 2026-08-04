@@ -34,6 +34,9 @@ struct QueuedMessage: Identifiable {
 struct SessionMessageQueue {
     private(set) var items: [QueuedMessage] = []
     private(set) var interceptSendFirst = false
+    /// Cut-in armed: the next idle drain joins ALL queued messages into one prompt
+    /// instead of popping the head. Normal Stop / settle drains stay single-item.
+    private(set) var cutInJoinArmed = false
 
     var isEmpty: Bool { items.isEmpty }
     var count: Int { items.count }
@@ -60,6 +63,7 @@ struct SessionMessageQueue {
         let images = items.flatMap(\.images)
         items.removeAll()
         interceptSendFirst = false
+        cutInJoinArmed = false
         return (Self.joinTexts(texts), images)
     }
 
@@ -88,5 +92,40 @@ struct SessionMessageQueue {
 
     mutating func requeueFront(_ msg: QueuedMessage) {
         items.insert(msg, at: 0)
+    }
+
+    /// Arm the cut-in batch join (idempotent; rapid double-clicks must not double-send).
+    mutating func armCutInJoin() {
+        cutInJoinArmed = true
+    }
+
+    /// Cut-in batch pop: only when armed. Returns ALL queued items FIFO and clears the
+    /// armed flag + intercept. nil when not armed, still streaming, or process dead;
+    /// armed-but-empty consumes the flag and also returns nil.
+    mutating func popAllForCutIn(isStreaming: Bool, processAlive: Bool) -> [QueuedMessage]? {
+        guard cutInJoinArmed else { return nil }
+        guard processAlive, !isStreaming else { return nil }
+        cutInJoinArmed = false
+        interceptSendFirst = false
+        guard !items.isEmpty else { return nil }
+        let all = items
+        items.removeAll()
+        return all
+    }
+
+    /// Merge a cut-in batch into one prompt: joinTexts separator, images appended in FIFO
+    /// order, and the policy of the last human-authored item (local or remote) — falling
+    /// back to app-authored preserve-grant when the batch is purely app-generated.
+    static func joinedCutIn(_ batch: [QueuedMessage]) -> QueuedMessage {
+        var policy = PromptSearchGrantPolicy.appAuthoredPreserveLatestHumanGrant
+        for msg in batch.reversed() where msg.searchGrantPolicy != .appAuthoredPreserveLatestHumanGrant {
+            policy = msg.searchGrantPolicy
+            break
+        }
+        return QueuedMessage(
+            text: joinTexts(batch.map(\.text)),
+            images: batch.flatMap(\.images),
+            searchGrantPolicy: policy
+        )
     }
 }

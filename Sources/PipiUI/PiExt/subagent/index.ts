@@ -477,6 +477,51 @@ async function awaitTerminalPipiuiReports(agentId: string): Promise<void> {
 	}
 }
 
+// ---- Cut-in hold：GUI「插队」后，批量 join 的用户消息必须先进入 turn ----
+// Swift（ChatSession.cutInQueueHead）在插队时写 marker 文件，joined prompt 发出后删除。
+// 扩展见到新鲜 marker 时暂缓所有自动 followUp 投递（done/stall/heartbeat 都经
+// trySendUserMessage），让 cut-in prompt 先赢下一个 turn；信号只晚一个 turn，绝不丢。
+// 兜底释放：marker 超过 15s（Swift 崩溃 / 未发出）自动失效，或 input 事件见到真实
+// 用户消息进 turn 时提前删除。
+const PIPIUI_CUTIN_HOLD_MS = 15_000;
+const PIPIUI_CUTIN_HOLD_FILE = PIPIUI_SESSION
+	? path.join(os.tmpdir(), `pipiui-cutin-${PIPIUI_SESSION}.json`)
+	: null;
+
+function cutInHoldActive(): boolean {
+	if (!PIPIUI_CUTIN_HOLD_FILE) return false;
+	try {
+		const raw = JSON.parse(fs.readFileSync(PIPIUI_CUTIN_HOLD_FILE, "utf-8")) as { at?: unknown };
+		if (typeof raw.at !== "number") return false;
+		return Date.now() - raw.at < PIPIUI_CUTIN_HOLD_MS;
+	} catch {
+		return false;
+	}
+}
+
+/** Release the hold: called on a real user turn start; also clears stale markers. */
+function releaseCutInHold(): void {
+	if (!PIPIUI_CUTIN_HOLD_FILE) return;
+	try {
+		fs.unlinkSync(PIPIUI_CUTIN_HOLD_FILE);
+	} catch {
+		/* already gone */
+	}
+}
+
+/** Block automatic delivery while a fresh cut-in hold marker exists (≤15s fallback). */
+async function awaitCutInHoldRelease(): Promise<void> {
+	if (!PIPIUI_CUTIN_HOLD_FILE || !cutInHoldActive()) return;
+	const deadline = Date.now() + PIPIUI_CUTIN_HOLD_MS + 2_000;
+	while (cutInHoldActive()) {
+		if (Date.now() >= deadline) {
+			releaseCutInHold();
+			return;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 200));
+	}
+}
+
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
@@ -2635,6 +2680,8 @@ function formatChainVerifyPrefix(results: SingleResult[]): string {
  * 返回是否确认送达，自身永不 reject（调用方可以放心 void，不会产生 unhandled rejection）。
  */
 async function trySendUserMessage(pi: ExtensionAPI, text: string): Promise<boolean> {
+	// 插队保护：用户批量消息未进 turn 前，自动信号不得抢跑（超时自动释放）。
+	await awaitCutInHoldRelease();
 	try {
 		await pi.sendUserMessage(text, { deliverAs: "followUp" });
 		return true;
@@ -3831,6 +3878,11 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
 		initializeDoneDeliveryStore(pi, piSessionId);
+	});
+	// Cut-in hold 提前释放：真实用户消息（本地/远程，非扩展自己的 followUp）已进入
+	// turn，说明 cut-in prompt 抢到了先手，暂缓的自动信号可以按原逻辑继续投递。
+	pi.on("input", (event) => {
+		if (event.source !== "extension") releaseCutInHold();
 	});
 	if (PIPIUI_SUBAGENT_SKILL_ISOLATION) {
 		// Pi still accepts extension-contributed skillPaths under --no-skills. Remove the
