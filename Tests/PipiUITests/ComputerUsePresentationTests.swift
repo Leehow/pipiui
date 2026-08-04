@@ -1,4 +1,6 @@
 import XCTest
+import AppKit
+import SwiftUI
 @testable import PipiUI
 
 @MainActor
@@ -146,6 +148,51 @@ final class ComputerUsePresentationTests: XCTestCase {
         XCTAssertFalse(window.isVisible)
     }
 
+    func testRestorationReinsetsSwiftUIContentBelowTitlebar() {
+        // Regression: after Computer Use the window's SwiftUI content view was
+        // swapped out (mini full-size-content chrome) and swapped back, but
+        // nothing forced a fresh layout pass, so the reattached content kept
+        // its stale safe-area insets from the mini geometry and the transcript
+        // painted under the title/toolbar. restoreMainWindow() now forces a
+        // layout pass; assert it actually runs and that the restored content
+        // ends up re-inset below the titlebar.
+        let coordinator = ComputerCoordinator(computerUseEnabledProvider: { true })
+        let controller = ComputerUseWindowPresentation()
+        let window = NonOrderingTestWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.toolbar = NSToolbar(identifier: "RestorationReinsetTests")
+        window.toolbar?.isVisible = true
+        window.titleVisibility = .visible
+        window.titlebarAppearsTransparent = false
+        let hosting = LayoutCountingHostingView(rootView: Text("transcript"))
+        window.contentView = hosting
+        window.layoutIfNeeded()
+        let titlebarSafeArea = hosting.safeAreaInsets.top
+        XCTAssertGreaterThan(titlebarSafeArea, 0, "fixture must model a unified titlebar+toolbar inset")
+
+        controller.attach(to: window)
+        coordinator.isDesktopOperationActive = true
+        coordinator.statusMessage = "正在操作 测试应用…"
+        controller.update(for: coordinator)
+        // Mini mode collapses the titlebar/toolbar inset.
+        XCTAssertLessThan(window.contentView?.safeAreaInsets.top ?? .greatestFiniteMagnitude,
+                          titlebarSafeArea)
+
+        coordinator.isDesktopOperationActive = false
+        let layoutsBeforeRestore = hosting.layoutCallCount
+        controller.update(for: coordinator)
+        // The restore itself must force at least one layout pass on the
+        // reattached SwiftUI root — without it the stale mini-geometry insets
+        // survive and the transcript overlaps the title.
+        XCTAssertTrue(window.contentView === hosting)
+        XCTAssertGreaterThan(hosting.layoutCallCount, layoutsBeforeRestore)
+        XCTAssertEqual(hosting.safeAreaInsets.top, titlebarSafeArea)
+    }
+
     func testUnattachedPresentationLeavesStrayVisibleWindowAlone() {
         // A host process (the XCTest target) never attaches a PipiUI main
         // window to the presentation. The old presentMiniWindow() fallback
@@ -213,5 +260,15 @@ private final class NonOrderingTestWindow: NSWindow {
 
     override func orderFront(_ sender: Any?) {
         orderFrontCallCount += 1
+    }
+}
+
+/// `NSHostingView` that counts `layout()` invocations so a test can prove a
+/// forced layout pass ran as part of the presentation restore.
+private final class LayoutCountingHostingView: NSHostingView<Text> {
+    var layoutCallCount = 0
+    override func layout() {
+        layoutCallCount += 1
+        super.layout()
     }
 }

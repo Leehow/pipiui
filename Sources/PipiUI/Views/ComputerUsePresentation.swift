@@ -125,6 +125,15 @@ final class ComputerUseWindowPresentation: NSObject {
         for (type, hidden) in normalButtonHidden {
             window.standardWindowButton(type)?.isHidden = hidden
         }
+        // The SwiftUI root content view was detached while the window sat in mini
+        // full-size-content mode (titlebar hidden, toolbar off, tiny frame). Its
+        // safe-area insets were staled to that geometry; AppKit does not always
+        // re-derive them on reattach, so the transcript paints under the title/
+        // toolbar. Force a full layout + redraw pass so the restored content is
+        // re-inset below the titlebar instead of overlapping it.
+        window.contentView?.needsLayout = true
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.contentView?.needsDisplay = true
         normalFrame = nil
         normalContentSize = nil
         normalContentMinSize = nil

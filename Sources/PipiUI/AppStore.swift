@@ -655,7 +655,7 @@ final class AppStore: ObservableObject {
             remotePairingPairID = pairing.pairID
             remotePairingFingerprint = pairing.fingerprint
             remotePairingExpiresAt = pairing.expiresAt
-            remotePairingMessage = "配对链接已生成（1 小时内可多次使用）"
+            remotePairingMessage = "配对链接已生成（24 小时内有效）"
             scheduleRemotePairingExpiry(
                 expiresAt: pairing.expiresAt,
                 pairID: pairing.pairID

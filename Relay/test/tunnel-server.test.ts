@@ -138,7 +138,7 @@ test("tunnel product defaults expose only exact static and WSS routes", async ()
   }
 });
 
-test("wrong secret and role do not consume the one-time browser slot", async () => {
+test("wrong secret and role are rejected without breaking a later valid attach", async () => {
   const relay = await fixture();
   const wrongRole = await connect(relay.socketURL);
   const host = await connect(relay.socketURL);
@@ -194,15 +194,22 @@ test("null array and scalar JSON close only the sender and leave Relay healthy",
     hello(browser, "browser");
     await hostReady;
     await browserReady;
-    const hostClosed = once(host, "close");
     const browserClosed = once(browser, "close");
     browser.send("null");
     await browserClosed;
+    // Malformed authenticated frame closes only the sender; the room and host
+    // survive (browser disconnect no longer kills the room).
+    assert.equal(relay.instance.getRoomCount(), 1);
+    assert.equal(relay.instance.getClientCount(), 1);
+    assert.deepEqual(await (await fetch(`${relay.origin}/healthz`)).json(), { ok: true });
+    // Host teardown is what ends the room.
+    const hostClosed = once(host, "close");
+    host.close(1000, "done");
     await hostClosed;
     await waitUntil(
       () => relay.instance.getClientCount() === 0
         && relay.instance.getRoomCount() === 0,
-      "authenticated malformed frame retained a client or room",
+      "host teardown retained a client or room",
     );
     assert.deepEqual(await (await fetch(`${relay.origin}/healthz`)).json(), { ok: true });
   } finally {
@@ -210,7 +217,7 @@ test("null array and scalar JSON close only the sender and leave Relay healthy",
   }
 });
 
-test("tunnel relays bounded request/response frames and invalidates on disconnect", async () => {
+test("tunnel relays frames and browser disconnect does not kill the room", async () => {
   const relay = await fixture();
   const host = await connect(relay.socketURL);
   const browser = await connect(relay.socketURL);
@@ -240,25 +247,87 @@ test("tunnel relays bounded request/response frames and invalidates on disconnec
       body: { projects: [], sessions: [] },
     });
     const browserClosed = once(browser, "close");
-    const hostClosed = once(host, "close");
     browser.close(1000, "done");
     await browserClosed;
-    await hostClosed;
-    assert.equal(relay.instance.getRoomCount(), 0);
+    // Browser disconnect must NOT kill the room: the pairID stays connectable.
+    assert.equal(relay.instance.getRoomCount(), 1);
 
     const second = await connect(relay.socketURL);
-    const secondClosed = once(second, "close");
+    const secondReady = nextFrame(second);
+    const hostReadySecond = nextFrame(host);
     hello(second, "browser");
-    const replacementHost = await connect(relay.socketURL);
-    const replacementClosed = once(replacementHost, "close");
-    hello(replacementHost, "host");
-    await replacementClosed;
+    await secondReady;
+    await hostReadySecond;
+
+    // Host leaving still ends the room (existing host-side teardown semantics).
+    const hostClosed = once(host, "close");
+    const secondClosed = once(second, "close");
+    host.close(1000, "done");
+    await hostClosed;
     await secondClosed;
+    assert.equal(relay.instance.getRoomCount(), 0);
     second.close();
-    replacementHost.close();
   } finally {
     host.close();
     browser.close();
+    await relay.close();
+  }
+});
+
+test("last browser wins and disconnect does not kill the room", async () => {
+  const relay = await fixture();
+  const host = await connect(relay.socketURL);
+  const browserA = await connect(relay.socketURL);
+  try {
+    hello(host, "host");
+    await nextFrame(host);
+    const aReady = nextFrame(browserA);
+    const hostReadyA = nextFrame(host);
+    hello(browserA, "browser");
+    await aReady;
+    await hostReadyA;
+
+    // Browser B attaches with the same correct secret -> A is closed, B is active.
+    const browserB = await connect(relay.socketURL);
+    const aClosed = once(browserA, "close");
+    const bReady = nextFrame(browserB);
+    const hostReadyB = nextFrame(host);
+    hello(browserB, "browser");
+    await bReady;
+    await hostReadyB;
+    await aClosed;
+
+    // B is now THE browser and can relay requests.
+    const requestID = "c88d9390-b890-4928-930b-015f56498cb0";
+    const forwarded = nextFrame(host);
+    browserB.send(JSON.stringify({
+      v: 1, type: "request", requestID, command: "index", body: {},
+    }));
+    assert.deepEqual(await forwarded, {
+      v: 1, type: "request", requestID, command: "index", body: {},
+    });
+    const response = nextFrame(browserB);
+    host.send(JSON.stringify({
+      v: 1, type: "response", requestID, status: 200, body: { projects: [] },
+    }));
+    assert.deepEqual(await response, {
+      v: 1, type: "response", requestID, status: 200, body: { projects: [] },
+    });
+
+    // B disconnects -> room stays; C reattaches successfully within the TTL.
+    const bClosed = once(browserB, "close");
+    browserB.close(1000, "done");
+    await bClosed;
+    assert.equal(relay.instance.getRoomCount(), 1);
+
+    const browserC = await connect(relay.socketURL);
+    const cReady = nextFrame(browserC);
+    const hostReadyC = nextFrame(host);
+    hello(browserC, "browser");
+    await cReady;
+    await hostReadyC;
+  } finally {
+    host.close();
     await relay.close();
   }
 });

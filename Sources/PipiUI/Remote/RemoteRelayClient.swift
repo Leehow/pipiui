@@ -222,7 +222,7 @@ final class RemoteRelayClient: @unchecked Sendable {
                     return
                 }
                 self.tunnelPairID = pairID
-                let expiresAt = Date().addingTimeInterval(30 * 60)
+                let expiresAt = Date().addingTimeInterval(24 * 60 * 60)
                 DispatchQueue.main.async {
                     transport.startTunnelLink(
                         roomID: pairID,

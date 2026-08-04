@@ -648,13 +648,13 @@ final class WebKitRemotePeerTransport: NSObject, RemotePeerTransport, RemotePeer
         case "tunnelClosed":
             guard Set(object.keys) == ["v", "type", "generation"],
                   tunnelController != nil else { return }
-            productionStateChanged(.closed("一次性服务器隧道已断开"))
+            productionStateChanged(.closed("服务器隧道已断开"))
             tunnelEvent?(.closed)
 
         case "tunnelInvalidated":
             guard Set(object.keys) == ["v", "type", "generation"],
                   tunnelController != nil else { return }
-            productionStateChanged(.closed("一次性链接已作废"))
+            productionStateChanged(.closed("链接已失效"))
             tunnelEvent?(.closed)
 
         case "tunnelError":

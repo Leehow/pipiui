@@ -695,7 +695,8 @@ final class RemoteRelayTests: XCTestCase {
                 .appendingPathComponent("Sources/PipiUI/Views/RemoteConnectionSheet.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(sheet.contains("可被多个浏览器反复使用"))
+        XCTAssertTrue(sheet.contains("24 小时内有效"))
+        XCTAssertTrue(sheet.contains("顶掉已连接的"))
         XCTAssertTrue(sheet.contains("密钥只存在于 URL fragment"))
         XCTAssertFalse(sheet.contains("只可使用一次"))
         XCTAssertFalse(sheet.contains("一次性配对链接"))
