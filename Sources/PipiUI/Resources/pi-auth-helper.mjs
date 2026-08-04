@@ -192,7 +192,7 @@ async function discoverModels() {
   }
   const providersOut = root.providers || {};
   const results = [];
-  const banned = /embedding|seedance|seedream|hitem3d|hyper3d|smart-router|translation/i;
+  const banned = /embedding|seedance|seedream|seed3d|hitem3d|hyper3d|smart-router|translation/i;
 
   for (const [providerId, provider] of Object.entries(providersOut)) {
     const baseUrl = provider && provider.baseUrl;
