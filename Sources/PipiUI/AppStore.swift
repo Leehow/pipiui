@@ -1800,8 +1800,9 @@ final class AppStore: ObservableObject {
         return key
     }
 
-    func newSession(project: URL, engine: EngineKind = .pi) {
-        let (key, _) = createSessionInBackground(project: project, engine: engine)
+    func newSession(project: URL, engine: EngineKind? = nil) {
+        let resolved = engine ?? (JcodeSettings.isEnabled ? .jcode : .pi)
+        let (key, _) = createSessionInBackground(project: project, engine: resolved)
         selectedSessionKey = key
     }
 
