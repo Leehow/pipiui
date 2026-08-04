@@ -1,6 +1,9 @@
 import Foundation
 import WebKit
 
+/// 阿里云百炼 Qwen Token Plan 个人版登录页。
+let bailianTokenPlanURL = "https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/token-plan/personal"
+
 // MARK: - Auth
 
 /// Resolves 阿里云百炼 (Aliyun Bailian) Qwen Token Plan 个人版 session cookies from
@@ -134,7 +137,7 @@ enum QwenTokenPlanBilling {
             "Data": [
                 "cornerstoneParam": [
                     "feTraceId": UUID().uuidString,
-                    "feURL": "https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/token-plan/personal",
+                    "feURL": bailianTokenPlanURL,
                     "protocol": "V2",
                     "console": "ONE_CONSOLE",
                     "productCode": "p_efm",

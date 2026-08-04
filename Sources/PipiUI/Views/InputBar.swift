@@ -1941,6 +1941,19 @@ struct InputBar: View {
                             .frame(width: 264)
                             .padding(10)
                     }
+            } else if session.quotaProvider == .qwenTokenPlan
+                    && session.model?.shouldShowAccountQuota == true
+                    && session.quotaPercent == nil {
+                // 未登录（无账号配额数据）时显示「登录 Token Plan」胶囊，点击打开内置浏览器到百炼登录页。
+                Text("Token Plan 登录")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.primary.opacity(0.06)))
+                    .help("登录阿里云百炼以查看 Token Plan 额度")
+                    .contentShape(Capsule())
+                    .onTapGesture { session.openEmbeddedBrowser(url: bailianTokenPlanURL) }
             }
         }
         .fixedSize(horizontal: true, vertical: false)

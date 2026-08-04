@@ -866,6 +866,12 @@ final class ChatSession: ObservableObject, Identifiable {
     /// 内置浏览器，pi 的 browser_* 工具通过桥接服务驱动它
     lazy var webView = WebViewStore()
 
+    /// Opens the target URL in the embedded browser panel (right panel).
+    func openEmbeddedBrowser(url: String) {
+        rightPanel = .web
+        _ = webView.navigate(url)
+    }
+
     /// 文档预览面板（⌘+点击聊天中的 md/txt 文档路径在此打开）
     lazy var documents = DocumentStore()
 
