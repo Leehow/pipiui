@@ -685,13 +685,6 @@ private struct ChatDetailViewBody: View {
             .overlay {
                 TranscriptLoadingOverlay(session: session, streaming: streaming)
             }
-            // Empty-session engine picker, centered over the transcript. Only
-            // renders when the session is empty+idle (EngineSwitcherOverlay
-            // returns EmptyView otherwise), and only after the loading overlay
-            // above has dismissed (isInitializing flips the empty-state guard).
-            .overlay {
-                EngineSwitcherOverlay(session: session)
-            }
             .onAppear {
                 jumpToLatest(proxy, retry: true)
             }

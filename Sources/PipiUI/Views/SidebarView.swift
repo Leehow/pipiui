@@ -409,9 +409,8 @@ struct SidebarView: View {
             .accessibilityLabel("项目菜单\(displayName)")
             .pointingHandCursor()
 
-            // New-session button: creates a default pi session. Engine selection
-            // (pi/jcode) lives in the chat panel's centered switcher, shown while
-            // the session is empty — see EngineSwitcherOverlay.
+            // New-session button: default engine is resolved by AppStore.newSession
+            // from the global JcodeSettings toggle (设置 → 实验 tab).
             Button {
                 selectProject(project)
                 store.newSession(project: project)
