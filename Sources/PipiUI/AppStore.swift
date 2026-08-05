@@ -1341,7 +1341,11 @@ final class AppStore: ObservableObject {
             selectedProjectPath = url.path
             return
         }
-        projects.append(url)
+        // 新项目插入到未固定分组的最顶部（紧跟所有固定项目之后），
+        // 这样用户添加后立即在侧边栏顶部看到新项目，而不是被追加到底部。
+        let insertIndex = projects.firstIndex { !pinnedProjectPaths.contains($0.path) }
+            ?? projects.endIndex
+        projects.insert(url, at: insertIndex)
         selectedProjectPath = url.path
         persistProjects()
         refreshSessions(for: url)
