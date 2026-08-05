@@ -119,11 +119,12 @@ test("tunnel product defaults expose only exact static and WSS routes", async ()
     assert.ok(html.indexOf("location.hash") < html.indexOf('import("/assets/tunnel-browser.js")'));
     assert.doesNotMatch(html, /history\.replaceState/);
     assert.doesNotMatch(html, /trystero|RTCPeerConnection|pair\/claim|api\/devices/i);
-    assert.match(html, /服务器隧道尚未连接/);
     assert.match(html, /PipiUI 远程会话/);
-    assert.match(html, /id="project-list"/);
-    assert.match(html, /id="session-list"/);
+    assert.match(html, /id="root"/);
+    assert.match(html, /id="boot-status"/);
+    assert.match(html, /\/assets\/tunnel-browser\.css/);
     assert.equal((await fetch(`${relay.origin}/assets/tunnel-browser.js`)).status, 200);
+    assert.equal((await fetch(`${relay.origin}/assets/tunnel-browser.css`)).status, 200);
     assert.equal((await fetch(`${relay.origin}/assets/trystero-browser.js`)).status, 404);
     assert.equal((await fetch(`${relay.origin}/api/index`)).status, 404);
     assert.equal((await fetch(`${relay.origin}/api/pair/claim`)).status, 404);
