@@ -86,6 +86,14 @@ final class RemoteRelayClient: @unchecked Sendable {
         configuration.webSocketURL.path == "/tunnel/ws"
     }
     private var tunnelPairID: String?
+    // lifecycleQueue-owned. Cached so the Swift fallback can re-arm the tunnel
+    // link with the same room/secret after the JS watchdog gives up, without
+    // rotating the pairing URL the user already opened.
+    private var tunnelRoomID: String?
+    private var tunnelSecret: String?
+    private var tunnelFallbackWorkItem: DispatchWorkItem?
+    private var tunnelFallbackAttempt = 0
+    private let tunnelFallbackMaxAttempts = 4
 
     // lifecycleQueue-owned state.
     private var socket: (any RemoteRelayWebSocketTask)?
@@ -187,6 +195,11 @@ final class RemoteRelayClient: @unchecked Sendable {
         lifecycleQueue.async { [self] in
             if self.usesTunnel {
                 self.tunnelPairID = nil
+                self.tunnelRoomID = nil
+                self.tunnelSecret = nil
+                self.tunnelFallbackWorkItem?.cancel()
+                self.tunnelFallbackWorkItem = nil
+                self.tunnelFallbackAttempt = 0
                 DispatchQueue.main.async {
                     (self.peerTransport as? WebKitRemotePeerTransport)?
                         .stopTunnelLink()
@@ -222,6 +235,11 @@ final class RemoteRelayClient: @unchecked Sendable {
                     return
                 }
                 self.tunnelPairID = pairID
+                self.tunnelRoomID = pairID
+                self.tunnelSecret = password
+                self.tunnelFallbackAttempt = 0
+                self.tunnelFallbackWorkItem?.cancel()
+                self.tunnelFallbackWorkItem = nil
                 let expiresAt = Date().addingTimeInterval(24 * 60 * 60)
                 DispatchQueue.main.async {
                     transport.startTunnelLink(
@@ -235,13 +253,23 @@ final class RemoteRelayClient: @unchecked Sendable {
                             guard self.tunnelPairID == pairID else { return }
                             switch event {
                             case .ready:
+                                self.tunnelFallbackAttempt = 0
+                                self.tunnelFallbackWorkItem?.cancel()
+                                self.tunnelFallbackWorkItem = nil
                                 self.publish(.connected)
                             case .accepted:
                                 self.pairingChanged(.claimed)
+                            case .reconnecting(let attempt, let delaySeconds):
+                                self.publish(.retrying(seconds: delaySeconds))
+                                _ = attempt
                             case .failed:
                                 self.pairingChanged(.invalidated)
-                            case .closed:
-                                break
+                            case .closed(let reason):
+                                self.scheduleTunnelFallbackLocked(
+                                    reason: reason,
+                                    pairID: pairID,
+                                    password: password
+                                )
                             }
                         }
                     }
@@ -300,11 +328,89 @@ final class RemoteRelayClient: @unchecked Sendable {
         }
     }
 
+    /// Swift-side fallback after the JS tunnel watchdog exhausts its own
+    /// reconnect attempts (e.g. prolonged network loss). Re-arms the tunnel
+    /// link with the cached room/secret so the user's existing pairing URL
+    /// stays valid. Runs on lifecycleQueue. `reason == "invalidated"` means the
+    /// server explicitly retired the room; do not loop on that.
+    private func scheduleTunnelFallbackLocked(
+        reason: String,
+        pairID: String,
+        password: String
+    ) {
+        dispatchPrecondition(condition: .onQueue(lifecycleQueue))
+        guard tunnelPairID == pairID, !stopped, reason != "invalidated" else {
+            publish(.disabled)
+            return
+        }
+        guard tunnelFallbackAttempt < tunnelFallbackMaxAttempts else {
+            tunnelFallbackAttempt = 0
+            tunnelFallbackWorkItem = nil
+            publish(.disabled)
+            return
+        }
+        tunnelFallbackAttempt += 1
+        let attempt = tunnelFallbackAttempt
+        // Match the JS curve's ceiling so the Swift fallback doesn't spin faster
+        // than the JS watchdog it is replacing: 5s, 10s, 20s, 30s.
+        let delay = min(30, 5 * (1 << (attempt - 1)))
+        publish(.retrying(seconds: delay))
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.tunnelFallbackWorkItem = nil
+            guard self.tunnelPairID == pairID, !self.stopped,
+                  let transport = self.peerTransport as? WebKitRemotePeerTransport,
+                  let roomID = self.tunnelRoomID,
+                  let secret = self.tunnelSecret else {
+                self.publish(.disabled)
+                return
+            }
+            self.publish(.connecting)
+            DispatchQueue.main.async {
+                transport.startTunnelLink(
+                    roomID: roomID,
+                    secret: secret,
+                    tunnelURL: self.configuration.webSocketURL,
+                    controller: self.controller
+                ) { [weak self] event in
+                    guard let self else { return }
+                    self.lifecycleQueue.async {
+                        guard self.tunnelPairID == pairID else { return }
+                        switch event {
+                        case .ready:
+                            self.tunnelFallbackAttempt = 0
+                            self.publish(.connected)
+                        case .accepted:
+                            self.pairingChanged(.claimed)
+                        case .reconnecting(_, let delaySeconds):
+                            self.publish(.retrying(seconds: delaySeconds))
+                        case .failed:
+                            self.pairingChanged(.invalidated)
+                        case .closed(let nextReason):
+                            self.scheduleTunnelFallbackLocked(
+                                reason: nextReason,
+                                pairID: pairID,
+                                password: password
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        tunnelFallbackWorkItem = workItem
+        retryScheduler(workItem, TimeInterval(delay))
+    }
+
     func cancelPairing() {
         lifecycleQueue.async { [self] in
             if self.usesTunnel {
                 guard self.tunnelPairID != nil else { return }
                 self.tunnelPairID = nil
+                self.tunnelRoomID = nil
+                self.tunnelSecret = nil
+                self.tunnelFallbackWorkItem?.cancel()
+                self.tunnelFallbackWorkItem = nil
+                self.tunnelFallbackAttempt = 0
                 DispatchQueue.main.async {
                     (self.peerTransport as? WebKitRemotePeerTransport)?
                         .stopTunnelLink()

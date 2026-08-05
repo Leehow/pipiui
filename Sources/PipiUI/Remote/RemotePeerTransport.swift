@@ -37,6 +37,7 @@ enum RemotePeerProductionState: Equatable, Sendable {
     case ready
     case negotiating
     case connected
+    case reconnecting(attempt: Int, delaySeconds: Int)
     case closed(String)
     case failed(String)
 
@@ -46,6 +47,8 @@ enum RemotePeerProductionState: Equatable, Sendable {
         case .ready: "浏览器尚未连接"
         case .negotiating: "正在等待浏览器连接服务器隧道…"
         case .connected: "服务器隧道已连接"
+        case .reconnecting(let attempt, let delaySeconds):
+            "服务器隧道断开，\(delaySeconds) 秒后第 \(attempt) 次重连…"
         case .closed(let reason): "服务器隧道已断开：\(reason)"
         case .failed(let reason): "服务器隧道失败：\(reason)"
         }
