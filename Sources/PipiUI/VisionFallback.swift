@@ -18,6 +18,51 @@ enum VisionFallback {
         models.filter { $0.supportsImages }
     }
 
+    /// 扁平化单 Picker 的选中 tag ↔ 设置快照映射。
+    /// tag 取值：`model:<id>`（已配置多模态模型）/ `"ocr"` / `"off"` / `"manual"`。
+    static func unifiedSelection(for snapshot: VisionFallbackSettings.Snapshot) -> String {
+        switch snapshot.mode {
+        case .off: return "off"
+        case .ocrOnly: return "ocr"
+        case .ocrAndCloud:
+            switch snapshot.cloudSource {
+            case .manual: return "manual"
+            case .configuredModel:
+                // configuredModel 但 ref 为空 → 显示为 ocr（只影响显示，不写盘）。
+                guard snapshot.hasConfiguredModel else { return "ocr" }
+                return "model:\(snapshot.cloudModelRef)"
+            }
+        }
+    }
+
+    /// 把单 Picker 的 tag 应用到快照（返回新快照），供 onChange 持久化与单测。
+    /// `model:` 之外的 `ocr`/`off` 只改 mode；`manual` 改 mode+source。
+    /// 不清理已选 modelRef（切回模型列表时仍保留上次选择）。
+    static func applyUnifiedSelection(
+        _ tag: String,
+        to snapshot: VisionFallbackSettings.Snapshot
+    ) -> VisionFallbackSettings.Snapshot {
+        var s = snapshot
+        if tag.hasPrefix("model:") {
+            s.mode = .ocrAndCloud
+            s.cloudSource = .configuredModel
+            s.cloudModelRef = String(tag.dropFirst("model:".count))
+        } else {
+            switch tag {
+            case "ocr":
+                s.mode = .ocrOnly
+            case "off":
+                s.mode = .off
+            case "manual":
+                s.mode = .ocrAndCloud
+                s.cloudSource = .manual
+            default:
+                break
+            }
+        }
+        return s
+    }
+
     /// 是否需要在 caption 注入后，把出站 RPC 的 `images` 字段剥掉（避免
     /// DeepSeek 等拒图 provider 硬失败）。尽管 transcript 缩略图保留，RPC 只发文字。
     static func shouldCaptionAndStripImages(

@@ -270,6 +270,78 @@ final class VisionFallbackTests: XCTestCase {
         XCTAssertFalse(vision.contains { $0.provider == "deepseek" })
     }
 
+    // MARK: - Unified flat Picker (single selection tag ↔ snapshot)
+
+    func testUnifiedSelectionInitialDerivation() {
+        // off → "off"
+        XCTAssertEqual(VisionFallback.unifiedSelection(for: snapshot(mode: .off, source: .configuredModel, ref: "xai/grok-4.3")), "off")
+        // ocrOnly → "ocr"
+        XCTAssertEqual(VisionFallback.unifiedSelection(for: snapshot(mode: .ocrOnly, source: .manual, ref: "")), "ocr")
+        // ocrAndCloud + manual → "manual"
+        XCTAssertEqual(VisionFallback.unifiedSelection(for: snapshot(mode: .ocrAndCloud, source: .manual, ref: "openai/gpt-4o")), "manual")
+        // ocrAndCloud + configuredModel + ref → "model:<ref>"
+        XCTAssertEqual(VisionFallback.unifiedSelection(for: snapshot(mode: .ocrAndCloud, source: .configuredModel, ref: "xai/grok-4.3")), "model:xai/grok-4.3")
+        // configuredModel 但 ref 为空 → 显示为 ocr（不写盘，仅展示回退）
+        XCTAssertEqual(VisionFallback.unifiedSelection(for: snapshot(mode: .ocrAndCloud, source: .configuredModel, ref: "")), "ocr")
+    }
+
+    func testApplyUnifiedSelectionPerTag() {
+        // model:<id> → ocrAndCloud + configuredModel + ref
+        let model = VisionFallback.applyUnifiedSelection("model:xai/grok-4.3", to: snapshot(mode: .ocrOnly, source: .manual, ref: ""))
+        XCTAssertEqual(model.mode, .ocrAndCloud)
+        XCTAssertEqual(model.cloudSource, .configuredModel)
+        XCTAssertEqual(model.cloudModelRef, "xai/grok-4.3")
+
+        // ocr → ocrOnly（保留原 modelRef，便于切回）
+        let ocr = VisionFallback.applyUnifiedSelection("ocr", to: snapshot(mode: .ocrAndCloud, source: .configuredModel, ref: "xai/grok-4.3"))
+        XCTAssertEqual(ocr.mode, .ocrOnly)
+        XCTAssertEqual(ocr.cloudSource, .configuredModel)
+        XCTAssertEqual(ocr.cloudModelRef, "xai/grok-4.3")
+
+        // off → off
+        let off = VisionFallback.applyUnifiedSelection("off", to: snapshot(mode: .ocrAndCloud, source: .configuredModel, ref: "xai/grok-4.3"))
+        XCTAssertEqual(off.mode, .off)
+
+        // manual → ocrAndCloud + manual
+        let manual = VisionFallback.applyUnifiedSelection("manual", to: snapshot(mode: .off, source: .configuredModel, ref: ""))
+        XCTAssertEqual(manual.mode, .ocrAndCloud)
+        XCTAssertEqual(manual.cloudSource, .manual)
+    }
+
+    func testUnifiedSelectionRoundTrip() {
+        // 每个 tag 的映射 + snapshot 各形态的初始推导互为逆过程。
+        let cases: [(String, VisionFallbackSettings.Mode, VisionFallbackSettings.CloudSource, String)] = [
+            ("model:xai/grok-4.3", .ocrAndCloud, .configuredModel, "xai/grok-4.3"),
+            ("ocr", .ocrOnly, .manual, ""),
+            ("off", .off, .manual, ""),
+            ("manual", .ocrAndCloud, .manual, ""),
+        ]
+        for (tag, mode, source, ref) in cases {
+            let applied = VisionFallback.applyUnifiedSelection(tag, to: snapshot(mode: .off, source: .manual, ref: ""))
+            XCTAssertEqual(VisionFallback.unifiedSelection(for: applied), tag, "round-trip failed for tag \(tag)")
+            XCTAssertEqual(applied.mode, mode)
+            XCTAssertEqual(applied.cloudSource, source)
+            XCTAssertEqual(applied.cloudModelRef, ref)
+        }
+    }
+
+    private func snapshot(
+        mode: VisionFallbackSettings.Mode,
+        source: VisionFallbackSettings.CloudSource,
+        ref: String
+    ) -> VisionFallbackSettings.Snapshot {
+        VisionFallbackSettings.Snapshot(
+            mode: mode,
+            baseURL: "",
+            apiKey: "",
+            modelId: "",
+            prompt: "",
+            maxTokens: VisionFallbackSettings.defaultMaxTokens,
+            cloudSource: source,
+            cloudModelRef: ref
+        )
+    }
+
     func testShouldCaptionAndStripImages() {
         // Non-vision model with images + cloud/ocr mode → caption + strip RPC images.
         XCTAssertTrue(VisionFallback.shouldCaptionAndStripImages(supportsImages: false, hasImages: true, mode: .ocrAndCloud))

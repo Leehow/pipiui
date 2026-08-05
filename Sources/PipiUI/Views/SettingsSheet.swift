@@ -58,7 +58,7 @@ struct SettingsSheet: View {
     /// 当前后端 key 是否已在 .env 配置（驱动 placeholder /「清除」按钮）。
     @State private var webSearchKeyConfigured = false
     /// 图片转文字（非多模态模型看图）
-    @State private var visionFallbackMode: VisionFallbackSettings.Mode = VisionFallbackSettings.mode()
+    @State private var visionFallbackSelection: String = VisionFallback.unifiedSelection(for: VisionFallbackSettings.load())
     @State private var visionFallbackBaseURL: String = VisionFallbackSettings.load().baseURL
     @State private var visionFallbackApiKey: String = ""
     /// 实验 tab: jcode 已配置 provider 探测结果 + 探测中状态 + 启用确认弹窗。
@@ -1552,90 +1552,61 @@ struct SettingsSheet: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("图片转文字（非多模态模型看图）")
                 .font(.title3.weight(.semibold))
-            Text("DeepSeek 等不支持直接看图的模型：发送带图消息时，自动用本地 OCR（可选再加云端视觉模型描述）把图片转成文字注入消息。缩略图与 RPC 图片附件保持不变。")
+            Text("DeepSeek 等不支持直接看图的模型：发送带图消息时，自动把图片转成文字注入消息。直接选一个已配置的多模态模型作为图像识别模型，或仅用本地 OCR。缩略图与 RPC 图片附件保持不变。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             VStack(alignment: .leading, spacing: 10) {
-                Picker("模式", selection: $visionFallbackMode) {
-                    ForEach(VisionFallbackSettings.Mode.allCases) { mode in
-                        Text(mode.title).tag(mode)
+                Picker("图片转文字", selection: $visionFallbackSelection) {
+                    ForEach(VisionFallback.visionModels(from: pickerModels)) { m in
+                        Text(m.name).tag("model:\(m.id)")
                     }
+                    Text("仅本地 OCR（不用云端模型）").tag("ocr")
+                    Text("关闭（不转换）").tag("off")
+                    Text("手动 endpoint…").tag("manual")
                 }
-                .onChange(of: visionFallbackMode) { _, newValue in
-                    VisionFallbackSettings.setMode(newValue)
-                    statusMessage = "图片转文字已切换为\(newValue.title)"
+                .onChange(of: visionFallbackSelection) { _, tag in
+                    applyVisionFallbackSelection(tag)
                 }
 
-                if visionFallbackMode == .ocrAndCloud {
-                    Picker("云端视觉模型来源", selection: $visionFallbackCloudSource) {
-                        ForEach(VisionFallbackSettings.CloudSource.allCases) { src in
-                            Text(src.title).tag(src)
-                        }
-                    }
-                    .onChange(of: visionFallbackCloudSource) { _, newValue in
-                        VisionFallbackSettings.setCloudSource(newValue)
-                        if newValue == .configuredModel {
-                            verifyVisionFallbackConfiguredModel()
-                        } else {
-                            visionFallbackCloudModelError = nil
-                        }
-                    }
+                if visionFallbackCloudModelError != nil {
+                    Text(visionFallbackCloudModelError!)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
 
-                    if visionFallbackCloudSource == .manual {
-                        TextField("服务地址（OpenAI 兼容 base URL）", text: $visionFallbackBaseURL)
-                            .textFieldStyle(.roundedBorder)
-                            .onSubmit { saveVisionFallbackCloud() }
-                        HStack(spacing: 8) {
-                            SecureField(
-                                visionFallbackKeyConfigured ? "已配置 API Key，输入以替换" : "API Key（可选）",
-                                text: $visionFallbackApiKey
-                            )
-                            .textFieldStyle(.roundedBorder)
-                            .onSubmit { saveVisionFallbackCloud() }
-                            if visionFallbackKeyConfigured {
-                                Button("清除 Key") {
-                                    VisionFallbackSettings.setApiKey("")
-                                    visionFallbackApiKey = ""
-                                    visionFallbackKeyConfigured = false
-                                    statusMessage = "已清除图片描述 API Key"
-                                }
+                if visionFallbackCloudSource == .manual {
+                    TextField("服务地址（OpenAI 兼容 base URL）", text: $visionFallbackBaseURL)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveVisionFallbackCloud() }
+                    HStack(spacing: 8) {
+                        SecureField(
+                            visionFallbackKeyConfigured ? "已配置 API Key，输入以替换" : "API Key（可选）",
+                            text: $visionFallbackApiKey
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveVisionFallbackCloud() }
+                        if visionFallbackKeyConfigured {
+                            Button("清除 Key") {
+                                VisionFallbackSettings.setApiKey("")
+                                visionFallbackApiKey = ""
+                                visionFallbackKeyConfigured = false
+                                statusMessage = "已清除图片描述 API Key"
                             }
-                        }
-                        TextField("模型 ID", text: $visionFallbackModelId)
-                            .textFieldStyle(.roundedBorder)
-                            .onSubmit { saveVisionFallbackCloud() }
-                    } else {
-                        Picker("图像识别模型", selection: $visionFallbackCloudModelRef) {
-                            Text("请选择").tag("")
-                            ForEach(VisionFallback.visionModels(from: pickerModels)) { m in
-                                Text(m.name).tag(m.id)
-                            }
-                        }
-                        .onChange(of: visionFallbackCloudModelRef) { _, newValue in
-                            VisionFallbackSettings.setCloudModelRef(newValue)
-                            if !newValue.isEmpty {
-                                verifyVisionFallbackConfiguredModel()
-                            } else {
-                                visionFallbackCloudModelError = nil
-                            }
-                        }
-                        if let err = visionFallbackCloudModelError {
-                            Text(err)
-                                .font(.caption2)
-                                .foregroundStyle(.red)
-                        } else {
-                            Text("给非多模态模型（如 DeepSeek）加入图像识别能力：从已配置模型里选一个支持图片的模型，发送带图消息时用它生成文字描述。仅列出支持图像的已配置模型。")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
                         }
                     }
-
+                    TextField("模型 ID", text: $visionFallbackModelId)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveVisionFallbackCloud() }
                     TextField("最大 Token 数", text: $visionFallbackMaxTokens)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { saveVisionFallbackCloud() }
                     Button("保存云端设置") { saveVisionFallbackCloud() }
-                    Text("手填 base URL 形如 https://api.openai.com/v1；会自动补 /chat/completions。选已配置模型时直接用其 OpenAI 兼容端点与凭据。API Key 仅存本机 UserDefaults。云端失败（网络/超时/4xx/5xx 或凭据解析不到）自动退回仅 OCR。")
+                    Text("base URL 形如 https://api.openai.com/v1；会自动补 /chat/completions。API Key 仅存本机 UserDefaults。云端失败（网络/超时/4xx/5xx 或凭据解析不到）自动退回仅 OCR。")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                } else if visionFallbackCloudSource == .configuredModel {
+                    Text("已选模型会在发送带图消息时被用作图像识别模型；解析不到其 OpenAI 兼容端点/凭据时自动降级为仅 OCR。")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -1649,18 +1620,34 @@ struct SettingsSheet: View {
         }
     }
 
+    /// 单 Picker 选中 → 写盘（复用现有 setters）+ 更新本地状态 + 触发现有解析校验。
+    private func applyVisionFallbackSelection(_ tag: String) {
+        let snap = VisionFallback.applyUnifiedSelection(tag, to: VisionFallbackSettings.load())
+        VisionFallbackSettings.setMode(snap.mode)
+        VisionFallbackSettings.setCloudSource(snap.cloudSource)
+        VisionFallbackSettings.setCloudModelRef(snap.cloudModelRef)
+        visionFallbackCloudSource = snap.cloudSource
+        visionFallbackCloudModelRef = snap.cloudModelRef
+        if tag.hasPrefix("model:") {
+            verifyVisionFallbackConfiguredModel()
+        } else {
+            visionFallbackCloudModelError = nil
+        }
+    }
+
     private func saveVisionFallbackCloud() {
         let base = visionFallbackBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let modelId = visionFallbackModelId.trimmingCharacters(in: .whitespacesAndNewlines)
         let tokens = Int(visionFallbackMaxTokens.trimmingCharacters(in: .whitespacesAndNewlines))
             ?? VisionFallbackSettings.defaultMaxTokens
         var snap = VisionFallbackSettings.load()
-        snap.mode = visionFallbackMode
+        // 手填 endpoint 隐含 OCR+云端模式。
+        snap.mode = .ocrAndCloud
+        snap.cloudSource = .manual
         snap.baseURL = base
         snap.modelId = modelId.isEmpty ? VisionFallbackSettings.defaultModelId : modelId
         snap.maxTokens = tokens > 0 ? tokens : VisionFallbackSettings.defaultMaxTokens
-        snap.cloudSource = visionFallbackCloudSource
-        snap.cloudModelRef = visionFallbackCloudModelRef
+        snap.cloudModelRef = ""
         let keyTrim = visionFallbackApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if !keyTrim.isEmpty {
             snap.apiKey = keyTrim
@@ -1843,7 +1830,7 @@ struct SettingsSheet: View {
         webSearchBackend = snapshot.webSearchBackend
         webSearchKeyConfigured = snapshot.webSearchKeyConfigured
         envConfiguredProviders = snapshot.envConfiguredProviders
-        visionFallbackMode = snapshot.visionFallback.mode
+        visionFallbackSelection = VisionFallback.unifiedSelection(for: snapshot.visionFallback)
         visionFallbackBaseURL = snapshot.visionFallback.baseURL
         visionFallbackModelId = snapshot.visionFallback.modelId
         visionFallbackMaxTokens = String(snapshot.visionFallback.maxTokens)
