@@ -79,7 +79,7 @@ struct RemoteConnectionSheet: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("远程服务器隧道")
                             .font(.headline)
-                        Text("浏览器与 Mac 通过配对链接接入服务器隧道；链接在 1 小时内可被多个浏览器反复使用。服务器仅转发有界命令帧，不保存账号、设备或会话数据。")
+                        Text("浏览器与 Mac 通过配对链接接入服务器隧道；链接 24 小时内有效，任何浏览器可随时打开，新打开的浏览器会顶掉已连接的。服务器仅转发有界命令帧，不保存账号、设备或会话数据。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -334,7 +334,7 @@ struct RemoteConnectionSheet: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     } else if validatedPairingPayload != nil {
-                        Text("配对链接在 1 小时内可被多个浏览器反复使用，每次成功配对都会把有效期续到 1 小时；密钥只存在于 URL fragment，不会进入初始请求或普通访问日志。")
+                        Text("配对链接 24 小时内有效，任何浏览器可随时打开，新打开的浏览器会顶掉已连接的；密钥只存在于 URL fragment，不会进入初始请求或普通访问日志。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         if let expiresAt = store.remotePairingExpiresAt {

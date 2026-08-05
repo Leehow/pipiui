@@ -11,7 +11,7 @@ declare global {
 
 const boot = window.__PIPI_TUNNEL_BOOT__;
 if (!boot || !/^[0-9a-f]{64}$/.test(boot.secret)) {
-  throw new Error("一次性链接无效");
+  throw new Error("链接无效或密钥缺失");
 }
 delete window.__PIPI_TUNNEL_BOOT__;
 
@@ -367,11 +367,16 @@ socket.onopen = () => socket.send(JSON.stringify({
   v: 1, type: "hello", roomID: boot.roomID, secret: boot.secret, role: "browser",
 }));
 socket.onerror = () => setStatus("服务器隧道连接失败", true);
-socket.onclose = () => {
+socket.onclose = (event) => {
   connected = false;
   setConnection(false);
-  failPending("一次性连接已断开");
-  if (!revoked) setStatus("一次性连接已断开；请在 Mac 上生成新链接。", true);
+  failPending("连接已断开");
+  if (revoked) return;
+  if (event?.reason === "replaced") {
+    setStatus("已被其他浏览器接管；重新打开或刷新此链接即可恢复连接。", true);
+    return;
+  }
+  setStatus("连接已断开；重新打开或刷新此链接即可重新连接。", true);
 };
 socket.onmessage = (event) => {
   let frame: Record<string, any>;
@@ -380,14 +385,20 @@ socket.onmessage = (event) => {
   if (frame.type === "ready") {
     connected = true;
     setConnection(true);
-    setStatus("Mac 已连接；此链接已经使用，不能再连接第二个浏览器。");
+    setStatus("Mac 已连接；新打开的浏览器会顶替当前连接。");
     void loadIndex().catch((error) => setStatus(error.message, true));
+    return;
+  }
+  if (frame.type === "replaced") {
+    connected = false;
+    setConnection(false);
+    setStatus("已被其他浏览器接管；重新打开或刷新此链接即可恢复连接。", true);
     return;
   }
   if (frame.type === "invalidated") {
     connected = false;
     setConnection(false);
-    setStatus("此一次性链接已作废；请在 Mac 上生成新链接。", true);
+    setStatus("此链接已失效；请在 Mac 上重新生成链接。", true);
     return;
   }
   if (frame.type === "error" && typeof frame.requestID === "string") {
@@ -436,7 +447,7 @@ byID<HTMLButtonElement>("revoke").onclick = () => {
   connected = false;
   setConnection(false);
   socket.close(1000, "revoked by browser");
-  setStatus("此一次性链接已作废。");
+  setStatus("已断开连接；重新打开此链接即可重新连接。");
 };
 window.setInterval(() => void pollSnapshot(), 900);
 window.addEventListener("pagehide", () => socket.close(1000, "page closed"), { once: true });
