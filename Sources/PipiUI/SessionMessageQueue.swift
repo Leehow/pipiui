@@ -16,17 +16,21 @@ struct QueuedMessage: Identifiable {
     var text: String
     var images: [DraftImage]
     var searchGrantPolicy: PromptSearchGrantPolicy
+    /// 该消息已注入非视觉模型 caption：出站 RPC 需剥掉 `images`（缩略图仍保留）。
+    var stripImagesForRPC: Bool
 
     init(
         id: UUID = UUID(),
         text: String,
         images: [DraftImage] = [],
-        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths,
+        stripImagesForRPC: Bool = false
     ) {
         self.id = id
         self.text = text
         self.images = images
         self.searchGrantPolicy = searchGrantPolicy
+        self.stripImagesForRPC = stripImagesForRPC
     }
 }
 
@@ -46,14 +50,16 @@ struct SessionMessageQueue {
     mutating func enqueue(
         text: String,
         images: [DraftImage] = [],
-        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths,
+        stripImagesForRPC: Bool = false
     ) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !images.isEmpty else { return false }
         items.append(QueuedMessage(
             text: text,
             images: images,
-            searchGrantPolicy: searchGrantPolicy
+            searchGrantPolicy: searchGrantPolicy,
+            stripImagesForRPC: stripImagesForRPC
         ))
         return true
     }
@@ -125,7 +131,9 @@ struct SessionMessageQueue {
         return QueuedMessage(
             text: joinTexts(batch.map(\.text)),
             images: batch.flatMap(\.images),
-            searchGrantPolicy: policy
+            searchGrantPolicy: policy,
+            // 同一会话模型能力一致：仅当整批都经 caption 注入才剥图，避免误伤未注入消息。
+            stripImagesForRPC: !batch.isEmpty && batch.allSatisfy(\.stripImagesForRPC)
         )
     }
 }

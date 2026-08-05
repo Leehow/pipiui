@@ -13,6 +13,43 @@ enum VisionFallback {
         !supportsImages && hasImages
     }
 
+    /// 仅列出支持图片输入的已配置模型，作为图像识别模型选择器的候选。
+    static func visionModels(from models: [ModelInfo]) -> [ModelInfo] {
+        models.filter { $0.supportsImages }
+    }
+
+    /// 是否需要在 caption 注入后，把出站 RPC 的 `images` 字段剥掉（避免
+    /// DeepSeek 等拒图 provider 硬失败）。尽管 transcript 缩略图保留，RPC 只发文字。
+    static func shouldCaptionAndStripImages(
+        supportsImages: Bool,
+        hasImages: Bool,
+        mode: VisionFallbackSettings.Mode
+    ) -> Bool {
+        shouldCaption(supportsImages: supportsImages, hasImages: hasImages) && mode != .off
+    }
+
+    /// 从选中的已配置模型（`provider/modelId`）解析 OpenAI 兼容 endpoint 并构造
+    /// caption 配置。解析失败（无 baseUrl / 无 key / 非 OpenAI 兼容）返回 nil，
+    /// 调用方据此降级到 OCR-only，绝不 crash。
+    static func configuredModelConfig(modelRef: String, maxTokens: Int) async -> VisionCaptionConfig? {
+        guard let slash = modelRef.firstIndex(of: "/") else { return nil }
+        let provider = String(modelRef[..<slash]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let modelId = String(modelRef[modelRef.index(after: slash)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !provider.isEmpty, !modelId.isEmpty else { return nil }
+        guard let ep = try? await PiAuthHelper.providerEndpoint(provider: provider, modelId: modelId),
+              !ep.baseURL.isEmpty else {
+            return nil
+        }
+        return VisionCaptionConfig(
+            baseURL: ep.baseURL,
+            apiKey: ep.apiKey,
+            modelId: modelId,
+            prompt: "",
+            maxTokens: maxTokens
+        )
+    }
+
     /// Chinese caption block injected into the user message. Omits empty subsections.
     static func captionBlock(for captions: [ImageCaption]) -> String {
         let sorted = captions.sorted { $0.index < $1.index }

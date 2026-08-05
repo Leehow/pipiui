@@ -68,6 +68,10 @@ struct SettingsSheet: View {
     @State private var visionFallbackModelId: String = VisionFallbackSettings.load().modelId
     @State private var visionFallbackMaxTokens: String = String(VisionFallbackSettings.load().maxTokens)
     @State private var visionFallbackKeyConfigured = !(VisionFallbackSettings.load().apiKey.isEmpty)
+    /// 云端视觉模型来源（手填 / 已配置模型）+ 选中的模型 id + 解析提示。
+    @State private var visionFallbackCloudSource: VisionFallbackSettings.CloudSource = VisionFallbackSettings.load().cloudSource
+    @State private var visionFallbackCloudModelRef: String = VisionFallbackSettings.load().cloudModelRef
+    @State private var visionFallbackCloudModelError: String?
     /// 显示价格单位（USD 内部记账，仅影响展示）+ 汇率刷新状态。
     @State private var priceUnit: PriceUnit = PricingSettings.unit()
     @State private var fxRefreshing = false
@@ -1564,33 +1568,74 @@ struct SettingsSheet: View {
                 }
 
                 if visionFallbackMode == .ocrAndCloud {
-                    TextField("服务地址（OpenAI 兼容 base URL）", text: $visionFallbackBaseURL)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { saveVisionFallbackCloud() }
-                    HStack(spacing: 8) {
-                        SecureField(
-                            visionFallbackKeyConfigured ? "已配置 API Key，输入以替换" : "API Key（可选）",
-                            text: $visionFallbackApiKey
-                        )
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { saveVisionFallbackCloud() }
-                        if visionFallbackKeyConfigured {
-                            Button("清除 Key") {
-                                VisionFallbackSettings.setApiKey("")
-                                visionFallbackApiKey = ""
-                                visionFallbackKeyConfigured = false
-                                statusMessage = "已清除图片描述 API Key"
-                            }
+                    Picker("云端视觉模型来源", selection: $visionFallbackCloudSource) {
+                        ForEach(VisionFallbackSettings.CloudSource.allCases) { src in
+                            Text(src.title).tag(src)
                         }
                     }
-                    TextField("模型 ID", text: $visionFallbackModelId)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { saveVisionFallbackCloud() }
+                    .onChange(of: visionFallbackCloudSource) { _, newValue in
+                        VisionFallbackSettings.setCloudSource(newValue)
+                        if newValue == .configuredModel {
+                            verifyVisionFallbackConfiguredModel()
+                        } else {
+                            visionFallbackCloudModelError = nil
+                        }
+                    }
+
+                    if visionFallbackCloudSource == .manual {
+                        TextField("服务地址（OpenAI 兼容 base URL）", text: $visionFallbackBaseURL)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { saveVisionFallbackCloud() }
+                        HStack(spacing: 8) {
+                            SecureField(
+                                visionFallbackKeyConfigured ? "已配置 API Key，输入以替换" : "API Key（可选）",
+                                text: $visionFallbackApiKey
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { saveVisionFallbackCloud() }
+                            if visionFallbackKeyConfigured {
+                                Button("清除 Key") {
+                                    VisionFallbackSettings.setApiKey("")
+                                    visionFallbackApiKey = ""
+                                    visionFallbackKeyConfigured = false
+                                    statusMessage = "已清除图片描述 API Key"
+                                }
+                            }
+                        }
+                        TextField("模型 ID", text: $visionFallbackModelId)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { saveVisionFallbackCloud() }
+                    } else {
+                        Picker("图像识别模型", selection: $visionFallbackCloudModelRef) {
+                            Text("请选择").tag("")
+                            ForEach(VisionFallback.visionModels(from: pickerModels)) { m in
+                                Text(m.name).tag(m.id)
+                            }
+                        }
+                        .onChange(of: visionFallbackCloudModelRef) { _, newValue in
+                            VisionFallbackSettings.setCloudModelRef(newValue)
+                            if !newValue.isEmpty {
+                                verifyVisionFallbackConfiguredModel()
+                            } else {
+                                visionFallbackCloudModelError = nil
+                            }
+                        }
+                        if let err = visionFallbackCloudModelError {
+                            Text(err)
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                        } else {
+                            Text("给非多模态模型（如 DeepSeek）加入图像识别能力：从已配置模型里选一个支持图片的模型，发送带图消息时用它生成文字描述。仅列出支持图像的已配置模型。")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+
                     TextField("最大 Token 数", text: $visionFallbackMaxTokens)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { saveVisionFallbackCloud() }
                     Button("保存云端设置") { saveVisionFallbackCloud() }
-                    Text("base URL 形如 https://api.openai.com/v1；会自动补 /chat/completions。API Key 仅存本机 UserDefaults。云端失败时自动退回仅 OCR。")
+                    Text("手填 base URL 形如 https://api.openai.com/v1；会自动补 /chat/completions。选已配置模型时直接用其 OpenAI 兼容端点与凭据。API Key 仅存本机 UserDefaults。云端失败（网络/超时/4xx/5xx 或凭据解析不到）自动退回仅 OCR。")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -1614,6 +1659,8 @@ struct SettingsSheet: View {
         snap.baseURL = base
         snap.modelId = modelId.isEmpty ? VisionFallbackSettings.defaultModelId : modelId
         snap.maxTokens = tokens > 0 ? tokens : VisionFallbackSettings.defaultMaxTokens
+        snap.cloudSource = visionFallbackCloudSource
+        snap.cloudModelRef = visionFallbackCloudModelRef
         let keyTrim = visionFallbackApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if !keyTrim.isEmpty {
             snap.apiKey = keyTrim
@@ -1625,6 +1672,28 @@ struct SettingsSheet: View {
         visionFallbackModelId = snap.modelId
         visionFallbackMaxTokens = String(snap.maxTokens)
         statusMessage = "已保存图片转文字云端设置"
+    }
+
+    /// 尝试解析选中的已配置模型为 OpenAI 兼容 endpoint；失败则显示红字提示，
+    /// 运行时自动降级为仅 OCR（不 crash、不静默发错请求）。
+    private func verifyVisionFallbackConfiguredModel() {
+        let ref = visionFallbackCloudModelRef
+        guard !ref.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            visionFallbackCloudModelError = nil
+            return
+        }
+        visionFallbackCloudModelError = nil
+        Task {
+            let config = await VisionFallback.configuredModelConfig(
+                modelRef: ref,
+                maxTokens: VisionFallbackSettings.defaultMaxTokens
+            )
+            await MainActor.run {
+                visionFallbackCloudModelError = config == nil
+                    ? "无法解析此模型的 OpenAI 兼容地址/凭据，发送时将自动降级为仅 OCR。"
+                    : nil
+            }
+        }
     }
 
     /// 显式「保存」/ 回车提交：留空 = 不修改。
@@ -1779,6 +1848,9 @@ struct SettingsSheet: View {
         visionFallbackModelId = snapshot.visionFallback.modelId
         visionFallbackMaxTokens = String(snapshot.visionFallback.maxTokens)
         visionFallbackKeyConfigured = !snapshot.visionFallback.apiKey.isEmpty
+        visionFallbackCloudSource = snapshot.visionFallback.cloudSource
+        visionFallbackCloudModelRef = snapshot.visionFallback.cloudModelRef
+        visionFallbackCloudModelError = nil
         // 输入缓冲不回显已存 key；reload 不动用户可能正在输入的值。
 
         if restartSessions {

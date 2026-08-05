@@ -3653,25 +3653,42 @@ final class ChatSession: ObservableObject, Identifiable {
                 provider: model?.provider ?? ""
             )
         let settings = VisionFallbackSettings.load()
-        let needsCaption = VisionFallback.shouldCaption(
+        let needsCaption = VisionFallback.shouldCaptionAndStripImages(
             supportsImages: supportsImages,
-            hasImages: !images.isEmpty
-        ) && settings.mode != .off
+            hasImages: !images.isEmpty,
+            mode: settings.mode
+        )
 
         guard needsCaption else {
             finishVisionFallbackDelivery(
                 message: preparedMessage,
                 images: images,
                 searchGrantPolicy: searchGrantPolicy,
-                delivery: delivery
+                delivery: delivery,
+                stripImagesForRPC: false
             )
             return
         }
 
-        let cloudConfig = settings.mode == .ocrAndCloud ? settings.captionConfig : nil
         let mode = settings.mode
         let imagePairs = images.map { ($0.data, $0.mimeType) }
         Task { [weak self] in
+            // 云端配置在后台解析：手填 endpoint 直接用；已配置模型走 helper 解析（可能
+            // 无 baseUrl / 无 key / 非 OpenAI 兼容）。解析失败 → nil → 降级 OCR-only，不 crash。
+            var cloudConfig: VisionCaptionConfig?
+            if mode == .ocrAndCloud {
+                if settings.cloudSource == .manual {
+                    cloudConfig = settings.captionConfig
+                } else if settings.hasConfiguredModel {
+                    cloudConfig = await VisionFallback.configuredModelConfig(
+                        modelRef: settings.cloudModelRef,
+                        maxTokens: settings.maxTokens
+                    )
+                    if cloudConfig == nil {
+                        Log.warn("vision fallback: 解析已配置模型 \(settings.cloudModelRef) 失败，降级 OCR-only", category: .session)
+                    }
+                }
+            }
             let finalMessage = await VisionFallback.enrichMessage(
                 userText: preparedMessage,
                 images: imagePairs,
@@ -3684,7 +3701,8 @@ final class ChatSession: ObservableObject, Identifiable {
                     message: finalMessage,
                     images: images,
                     searchGrantPolicy: searchGrantPolicy,
-                    delivery: delivery
+                    delivery: delivery,
+                    stripImagesForRPC: true
                 )
             }
         }
@@ -3694,20 +3712,23 @@ final class ChatSession: ObservableObject, Identifiable {
         message: String,
         images: [DraftImage],
         searchGrantPolicy: PromptSearchGrantPolicy,
-        delivery: VisionFallbackDelivery
+        delivery: VisionFallbackDelivery,
+        stripImagesForRPC: Bool
     ) {
         switch delivery {
         case .queueOrSend:
             deliverPreparedPrompt(
                 message: message,
                 images: images,
-                searchGrantPolicy: searchGrantPolicy
+                searchGrantPolicy: searchGrantPolicy,
+                stripImagesForRPC: stripImagesForRPC
             )
         case .sendNowOnly:
             sendPromptNow(
                 message: message,
                 images: images,
-                searchGrantPolicy: searchGrantPolicy
+                searchGrantPolicy: searchGrantPolicy,
+                stripImagesForRPC: stripImagesForRPC
             )
         }
     }
@@ -3715,14 +3736,16 @@ final class ChatSession: ObservableObject, Identifiable {
     private func deliverPreparedPrompt(
         message: String,
         images: [DraftImage],
-        searchGrantPolicy: PromptSearchGrantPolicy
+        searchGrantPolicy: PromptSearchGrantPolicy,
+        stripImagesForRPC: Bool
     ) {
         // Busy while streaming OR in the gap after drain popped until agent_start.
         if isStreaming || isSendingFromQueue {
             let ok = queue.enqueue(
                 text: message,
                 images: images,
-                searchGrantPolicy: searchGrantPolicy
+                searchGrantPolicy: searchGrantPolicy,
+                stripImagesForRPC: stripImagesForRPC
             )
             if ok { publishQueue() }
             return
@@ -3730,7 +3753,8 @@ final class ChatSession: ObservableObject, Identifiable {
         sendPromptNow(
             message: message,
             images: images,
-            searchGrantPolicy: searchGrantPolicy
+            searchGrantPolicy: searchGrantPolicy,
+            stripImagesForRPC: stripImagesForRPC
         )
     }
 
@@ -3739,7 +3763,8 @@ final class ChatSession: ObservableObject, Identifiable {
         message: String,
         images: [DraftImage],
         requeueOnFailure: QueuedMessage? = nil,
-        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths,
+        stripImagesForRPC: Bool = false
     ) -> Bool {
         do {
             try SearchScopeExtension.applyPromptPolicy(
@@ -3784,7 +3809,9 @@ final class ChatSession: ObservableObject, Identifiable {
         isStopping = false
         cancelStopEscalation()
         var cmd: [String: Any] = ["type": "prompt", "message": message]
-        if !images.isEmpty {
+        // 非视觉模型且已注入 caption 时，出站 RPC 不再带 images（避免 DeepSeek 等拒图）。
+        // transcript 缩略图与 .pi/attachments 落盘仍由 appendOptimisticUserMessage 保留。
+        if !images.isEmpty, !stripImagesForRPC {
             cmd["images"] = ImageAttachment.rpcPayload(from: images)
         }
         // Pin sidebar session to top on user submit (don't wait for agent_settled / disk mtime).
@@ -4035,7 +4062,8 @@ final class ChatSession: ObservableObject, Identifiable {
                 message: joined.text,
                 images: joined.images,
                 requeueOnFailure: joined,
-                searchGrantPolicy: joined.searchGrantPolicy
+                searchGrantPolicy: joined.searchGrantPolicy,
+                stripImagesForRPC: joined.stripImagesForRPC
             )
             return
         }
@@ -4055,7 +4083,8 @@ final class ChatSession: ObservableObject, Identifiable {
             message: msg.text,
             images: msg.images,
             requeueOnFailure: msg,
-            searchGrantPolicy: msg.searchGrantPolicy
+            searchGrantPolicy: msg.searchGrantPolicy,
+            stripImagesForRPC: msg.stripImagesForRPC
         )
     }
 

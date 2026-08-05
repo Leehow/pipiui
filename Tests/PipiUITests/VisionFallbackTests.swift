@@ -212,6 +212,9 @@ final class VisionFallbackTests: XCTestCase {
         var snap = VisionFallbackSettings.load(defaults: suite)
         XCTAssertEqual(snap.mode, .ocrOnly)
         XCTAssertFalse(snap.isCloudConfigured)
+        // New keys default to manual / empty.
+        XCTAssertEqual(snap.cloudSource, .manual)
+        XCTAssertFalse(snap.hasConfiguredModel)
 
         snap.mode = .ocrAndCloud
         snap.baseURL = "https://example.com/v1"
@@ -227,5 +230,55 @@ final class VisionFallbackTests: XCTestCase {
         XCTAssertEqual(loaded.modelId, "gpt-4o-mini")
         XCTAssertEqual(loaded.maxTokens, 400)
         XCTAssertTrue(loaded.isCloudConfigured)
+    }
+
+    // MARK: - New keys: cloudSource + cloudModelRef (configured vision model)
+
+    func testCloudSourceAndModelRefRoundTrip() {
+        let name = "pipiui.test.visionFallback.cloud.\(UUID().uuidString)"
+        let suite = UserDefaults(suiteName: name)!
+        defer { suite.removePersistentDomain(forName: name) }
+
+        var snap = VisionFallbackSettings.load(defaults: suite)
+        snap.cloudSource = .configuredModel
+        snap.cloudModelRef = "xai/grok-4.3"
+        VisionFallbackSettings.save(snap, defaults: suite)
+
+        let loaded = VisionFallbackSettings.load(defaults: suite)
+        XCTAssertEqual(loaded.cloudSource, .configuredModel)
+        XCTAssertEqual(loaded.cloudModelRef, "xai/grok-4.3")
+        XCTAssertTrue(loaded.hasConfiguredModel)
+
+        // Independent setters.
+        VisionFallbackSettings.setCloudSource(.manual, defaults: suite)
+        XCTAssertEqual(VisionFallbackSettings.load(defaults: suite).cloudSource, .manual)
+        VisionFallbackSettings.setCloudModelRef("openai/gpt-4o", defaults: suite)
+        XCTAssertEqual(VisionFallbackSettings.load(defaults: suite).cloudModelRef, "openai/gpt-4o")
+    }
+
+    // MARK: - Configured vision model picker filtering + RPC strip decision
+
+    func testVisionModelsFiltersToImageCapableOnly() {
+        let models = [
+            ModelInfo(provider: "deepseek", modelId: "deepseek-chat", name: "DeepSeek", contextWindow: nil, supportsImages: false),
+            ModelInfo(provider: "xai", modelId: "grok-4.3", name: "Grok", contextWindow: nil, supportsImages: true),
+            ModelInfo(provider: "openai", modelId: "gpt-4o", name: "GPT-4o", contextWindow: nil, supportsImages: true),
+            ModelInfo(provider: "acme", modelId: "mystery", name: "Mystery", contextWindow: nil, supportsImages: true),
+        ]
+        let vision = VisionFallback.visionModels(from: models)
+        XCTAssertEqual(vision.map(\.id), ["xai/grok-4.3", "openai/gpt-4o", "acme/mystery"])
+        XCTAssertFalse(vision.contains { $0.provider == "deepseek" })
+    }
+
+    func testShouldCaptionAndStripImages() {
+        // Non-vision model with images + cloud/ocr mode → caption + strip RPC images.
+        XCTAssertTrue(VisionFallback.shouldCaptionAndStripImages(supportsImages: false, hasImages: true, mode: .ocrAndCloud))
+        XCTAssertTrue(VisionFallback.shouldCaptionAndStripImages(supportsImages: false, hasImages: true, mode: .ocrOnly))
+        // Off mode → no caption, no strip.
+        XCTAssertFalse(VisionFallback.shouldCaptionAndStripImages(supportsImages: false, hasImages: true, mode: .off))
+        // Vision model with images → no strip.
+        XCTAssertFalse(VisionFallback.shouldCaptionAndStripImages(supportsImages: true, hasImages: true, mode: .ocrAndCloud))
+        // No images → no strip.
+        XCTAssertFalse(VisionFallback.shouldCaptionAndStripImages(supportsImages: false, hasImages: false, mode: .ocrAndCloud))
     }
 }

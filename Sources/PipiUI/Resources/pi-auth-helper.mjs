@@ -179,6 +179,124 @@ async function logout(providerId) {
   });
 }
 
+// Resolve an OpenAI-compatible endpoint (baseUrl + apiKey) for a configured provider
+// so the UI can call a vision model's chat/completions directly for image captioning.
+// Priority: models-store.json/model per-model baseUrl → models.json provider baseUrl.
+// apiKey priority: models.json provider.apiKey (plain or $ENV) → auth.json api_key/
+// oauth access → known env var. Returns { ok, baseURL, apiKey, api, provider, modelId }.
+async function providerEndpoint(providerId, modelId) {
+  const home = process.env.HOME || "";
+  const storePath = join(home, ".pi/agent/models-store.json");
+  const modelsPath = join(home, ".pi/agent/models.json");
+  const authPath = join(home, ".pi/agent/auth.json");
+
+  let baseUrl = "";
+  let api = "";
+  let foundModelId = modelId || "";
+
+  // 1) models-store.json: per-model baseUrl + api (richest).
+  try {
+    const store = JSON.parse(readFileSync(storePath, "utf8"));
+    const section = store && store[providerId];
+    const rows = (section && section.models) || [];
+    const pick =
+      (modelId && rows.find((m) => m && (m.id === modelId || m.name === modelId))) ||
+      rows[0];
+    if (pick) {
+      baseUrl = pick.baseUrl || "";
+      api = pick.api || "";
+      foundModelId = modelId || pick.id || "";
+    }
+  } catch {
+    // fall through to models.json
+  }
+
+  // 2) models.json: provider-level fallback.
+  if (!baseUrl) {
+    try {
+      const root = JSON.parse(readFileSync(modelsPath, "utf8"));
+      const provider = root.providers && root.providers[providerId];
+      if (provider) {
+        baseUrl = provider.baseUrl || "";
+        api = provider.api || api;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  let apiKey = "";
+  // a) models.json provider.apiKey (plain or $ENV).
+  try {
+    const root = JSON.parse(readFileSync(modelsPath, "utf8"));
+    const provider = root.providers && root.providers[providerId];
+    const raw = provider && provider.apiKey;
+    if (typeof raw === "string") {
+      apiKey =
+        raw.startsWith("$") ? (process.env[raw.slice(1)] || "") : raw;
+    }
+  } catch {
+    // ignore
+  }
+  // b) auth.json api_key / oauth access token.
+  if (!apiKey) {
+    try {
+      const auth = JSON.parse(readFileSync(authPath, "utf8"));
+      const entry = auth && auth[providerId];
+      if (entry && typeof entry.key === "string" && entry.key) {
+        apiKey = entry.key;
+      } else if (entry && typeof entry.access === "string" && entry.access) {
+        apiKey = entry.access;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  // c) known env vars.
+  if (!apiKey) {
+    const envMap = {
+      anthropic: ["ANTHROPIC_API_KEY"],
+      openai: ["OPENAI_API_KEY"],
+      "openai-codex": ["OPENAI_API_KEY"],
+      deepseek: ["DEEPSEEK_API_KEY"],
+      google: ["GEMINI_API_KEY"],
+      xai: ["XAI_API_KEY"],
+      groq: ["GROQ_API_KEY"],
+      openrouter: ["OPENROUTER_API_KEY"],
+      glhf: ["GLHF_API_KEY"],
+      zai: ["ZAI_API_KEY"],
+      "zai-coding-cn": ["ZAI_CODING_CN_API_KEY"],
+      kimi: ["KIMI_API_KEY"],
+      moonshot: ["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+      mistral: ["MISTRAL_API_KEY"],
+      siliconflow: ["SILICONFLOW_API_KEY"],
+      nvidia: ["NVIDIA_API_KEY"],
+      cerebras: ["CEREBRAS_API_KEY"],
+      volcengine: ["VOLCENGINE_API_KEY"],
+      qwen: ["QWEN_API_KEY", "DASHSCOPE_API_KEY"],
+      dashscope: ["DASHSCOPE_API_KEY"],
+    };
+    for (const v of envMap[providerId] || []) {
+      if (process.env[v]) {
+        apiKey = process.env[v];
+        break;
+      }
+    }
+  }
+
+  if (!baseUrl) {
+    throw new Error(`未找到 ${providerId} 的 baseUrl（请先配置该 provider）`);
+  }
+  if (!apiKey) {
+    throw new Error(`未能解析 ${providerId} 的 API Key`);
+  }
+  const isOpenAICompat = !api || api === "openai-completions" || api === "openai-responses";
+  if (!isOpenAICompat) {
+    throw new Error(`${providerId} 的接口格式 ${api} 非 OpenAI 兼容，无法用于图片描述`);
+  }
+  emit({ ok: true, baseURL: baseUrl, apiKey, api: api || "openai-completions", provider: providerId, modelId: foundModelId });
+}
+
 // Discover online model catalog for each provider that has a baseUrl + resolvable
 // apiKey, then append unknown models into that provider's models in models.json.
 // Uses only fetch + fs so it runs standalone without the pi SDK.
@@ -300,6 +418,10 @@ try {
     await logout(providerId);
   } else if (cmd === "discover-models") {
     await discoverModels();
+  } else if (cmd === "provider-endpoint") {
+    const [providerId, modelId] = args;
+    if (!providerId) throw new Error("Usage: provider-endpoint <provider> [modelId]");
+    await providerEndpoint(providerId, modelId);
   } else {
     throw new Error(`Unknown command: ${cmd ?? "(none)"}`);
   }
