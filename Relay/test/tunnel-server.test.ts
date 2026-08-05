@@ -114,10 +114,10 @@ test("tunnel product defaults expose only exact static and WSS routes", async ()
     const response = await fetch(`${relay.origin}/pair/${roomID}`);
     assert.equal(response.status, 200);
     const html = await response.text();
-    assert.ok(
-      html.indexOf("history.replaceState")
-        < html.indexOf('import("/assets/tunnel-browser.js")'),
-    );
+    // The 64-hex secret must stay in the URL fragment so one copied link works
+    // everywhere; the page must not strip it via history.replaceState.
+    assert.ok(html.indexOf("location.hash") < html.indexOf('import("/assets/tunnel-browser.js")'));
+    assert.doesNotMatch(html, /history\.replaceState/);
     assert.doesNotMatch(html, /trystero|RTCPeerConnection|pair\/claim|api\/devices/i);
     assert.match(html, /服务器隧道尚未连接/);
     assert.match(html, /PipiUI 远程会话/);
@@ -200,7 +200,10 @@ test("null array and scalar JSON close only the sender and leave Relay healthy",
     // Malformed authenticated frame closes only the sender; the room and host
     // survive (browser disconnect no longer kills the room).
     assert.equal(relay.instance.getRoomCount(), 1);
-    assert.equal(relay.instance.getClientCount(), 1);
+    await waitUntil(
+      () => relay.instance.getClientCount() === 1,
+      "malformed authenticated frame retained the host too",
+    );
     assert.deepEqual(await (await fetch(`${relay.origin}/healthz`)).json(), { ok: true });
     // Host teardown is what ends the room.
     const hostClosed = once(host, "close");
