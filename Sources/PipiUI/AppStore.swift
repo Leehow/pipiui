@@ -1100,6 +1100,7 @@ final class AppStore: ObservableObject {
             gitExtension: paths.git,
             reloadExtension: paths.reload,
             webSearchExtension: paths.webSearch,
+            mcpExtension: paths.mcp,
             skillLoaderExtension: paths.skillLoader,
             codexServerToolsExtension: paths.codexServerTools,
             claudeServerToolsExtension: paths.claudeServerTools,

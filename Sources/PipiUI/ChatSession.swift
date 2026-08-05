@@ -958,6 +958,7 @@ final class ChatSession: ObservableObject, Identifiable {
          gitExtension: String? = nil,
          reloadExtension: String? = nil,
          webSearchExtension: String? = nil,
+         mcpExtension: String? = nil,
          skillLoaderExtension: String? = nil,
          codexServerToolsExtension: String? = nil,
          claudeServerToolsExtension: String? = nil,
@@ -1091,6 +1092,7 @@ final class ChatSession: ObservableObject, Identifiable {
                     git: gitExtension,
                     reload: reloadExtension,
                     webSearch: webSearchExtension,
+                    mcp: mcpExtension,
                     skillLoader: skillLoaderExtension,
                     searchScope: searchScopeExtension,
                     memory: memoryExtension,
@@ -1105,7 +1107,8 @@ final class ChatSession: ObservableObject, Identifiable {
                 computerDescriptor: computerCaptureDescriptor,
                 mainModelId: model?.id ?? SubagentModelSettings.readMainModel(),
                 excludeToolsArgs: ToolSkillSettings.excludeToolsCLIArgs(),
-                webSearchConfigFile: WebSearchSettings.configFileURL().path
+                webSearchConfigFile: WebSearchSettings.configFileURL().path,
+                mcpConfigFile: McpServerSettings.configFileURL().path
             )
         )
         let args = assembly.args

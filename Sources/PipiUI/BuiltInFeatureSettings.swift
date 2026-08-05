@@ -61,6 +61,8 @@ enum BuiltInFeatureSettings {
         case reload
         /// PipiUI's own web_search / web_fetch extension (not a native model tool).
         case webSearch
+        /// User-added MCP servers (stdio / HTTP) exposed as local tools.
+        case mcp
         /// On-demand skill loader (name index + skill_search / skill_load).
         case skillLoader
         /// Project search boundary + per-turn external path grant.
@@ -113,6 +115,10 @@ enum BuiltInFeatureSettings {
               section: .extensionTool,
               title: "web_search / web_fetch",
               summary: "为不带联网搜索的模型补充搜索/抓取工具（Firecrawl 免 key 搜索，无需配置）。"),
+        .init(id: .mcp,
+              section: .extensionTool,
+              title: "MCP 服务器",
+              summary: "用户自添的 MCP 服务器（搜索类 MCP 如 firecrawl-mcp / brave-mcp / 智谱 MCP）。工具以 mcp_<服务器名>_<工具名> 暴露给 agent；在「通用」页配置。"),
         .init(id: .codexServerTools,
               section: .extensionTool,
               title: "Codex hosted 搜索",

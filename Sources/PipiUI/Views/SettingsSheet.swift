@@ -53,6 +53,12 @@ struct SettingsSheet: View {
     /// `BuiltInFeatureSettings` defaults so first launch shows everything on.
     @State private var builtInDisabled: Set<String> = BuiltInFeatureSettings.disabledIDs()
     @State private var webSearchBackend: String = WebSearchSettings.backend()
+    /// User-added MCP servers (canonical store read at open).
+    @State private var mcpServers: [McpServer] = McpServerSettings.servers()
+    @State private var editingMcpServer: McpServer?
+    @State private var showMcpEditor = false
+    @State private var mcpTestResult: String?
+    @State private var mcpTestInProgress = false
     /// 图片转文字（非多模态模型看图）
     @State private var visionFallbackSelection: String = VisionFallback.unifiedSelection(for: VisionFallbackSettings.load())
     @State private var visionFallbackBaseURL: String = VisionFallbackSettings.load().baseURL
@@ -337,6 +343,8 @@ struct SettingsSheet: View {
             localRemoteSection
             Divider()
             webSearchSection
+            Divider()
+            mcpSection
             Divider()
             visionFallbackSection
             Divider()
@@ -1499,6 +1507,128 @@ struct SettingsSheet: View {
         }
     }
 
+    // MARK: - MCP Servers
+
+    private var mcpSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("MCP 服务器")
+                .font(.title3.weight(.semibold))
+            Text("添加你自己的 MCP 服务器（如 firecrawl-mcp / brave-mcp / 智谱 MCP），其工具会以 mcp_<服务器名>_<工具名> 暴露给 agent。环境变量用 ${VAR} 引用 ~/.pi/agent/.env 中的值。新增/删除后在下一个会话（或 /pipiui_reload）生效。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if mcpServers.isEmpty {
+                Text("尚未添加任何 MCP 服务器。")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(Array(mcpServers.enumerated()), id: \.element.id) { index, server in
+                    HStack(alignment: .center, spacing: 10) {
+                        Toggle("", isOn: Binding(
+                            get: { mcpServers[index].enabled },
+                            set: { on in
+                                mcpServers[index].enabled = on
+                                saveMcpServers()
+                            }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(server.name)
+                                .font(.callout)
+                                .lineLimit(1)
+                            Text(mcpServerSubtitle(server))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+
+                        Button("测试") {
+                            testMcp(server)
+                        }
+                        .font(.caption)
+                        .disabled(mcpTestInProgress)
+
+                        Button("编辑") {
+                            editingMcpServer = server
+                            showMcpEditor = true
+                        }
+                        .font(.caption)
+
+                        Button("删除") {
+                            mcpServers.removeAll { $0.id == server.id }
+                            saveMcpServers()
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+
+            Button {
+                editingMcpServer = nil
+                showMcpEditor = true
+            } label: {
+                Label("添加服务器", systemImage: "plus")
+            }
+            .font(.callout)
+
+            if mcpTestInProgress {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("测试连接中…").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if let result = mcpTestResult {
+                Text(result)
+                    .font(.caption)
+                    .foregroundStyle(result.hasPrefix("❌") ? .red : .secondary)
+            }
+        }
+        .sheet(isPresented: $showMcpEditor) {
+            McpServerEditor(server: editingMcpServer) { server in
+                if let i = mcpServers.firstIndex(where: { $0.id == server.name }) {
+                    mcpServers[i] = server
+                } else {
+                    mcpServers.append(server)
+                }
+                saveMcpServers()
+            }
+        }
+    }
+
+    private func mcpServerSubtitle(_ server: McpServer) -> String {
+        switch server.transport {
+        case .stdio:
+            let args = server.args.joined(separator: " ")
+            return args.isEmpty ? "stdio: \(server.command)" : "stdio: \(server.command) \(args)"
+        case .http:
+            return "http: \(server.url)"
+        }
+    }
+
+    private func saveMcpServers() {
+        McpServerSettings.save(mcpServers)
+        mcpTestResult = "已保存。新增/删除服务器后需在下一会话或 /pipiui_reload 生效。"
+    }
+
+    private func testMcp(_ server: McpServer) {
+        mcpTestInProgress = true
+        mcpTestResult = nil
+        let variables = EnvFileStore().all()
+        Task {
+            let result = await McpServerSettings.testConnection(server, variables: variables)
+            await MainActor.run {
+                mcpTestResult = result.display
+                mcpTestInProgress = false
+            }
+        }
+    }
+
     // MARK: - Vision Fallback (图片转文字)
 
     private var visionFallbackSection: some View {
@@ -2179,6 +2309,200 @@ struct AddModelSheet: View {
         } catch {
             errorMessage = error.localizedDescription
             statusMessage = nil
+        }
+    }
+}
+
+/// A key/value row edited in the MCP server editor (env / headers).
+private struct McpKVRow: Identifiable {
+    let id = UUID()
+    var key: String = ""
+    var value: String = ""
+    var obfuscated: Bool = false
+}
+
+/// Editor sheet for one MCP server. stdio: command + args + env; http: url + headers.
+private struct McpServerEditor: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let server: McpServer?
+    let onSave: (McpServer) -> Void
+
+    @State private var name: String
+    @State private var transport: McpTransport
+    @State private var command: String
+    @State private var argsText: String
+    @State private var url: String
+    @State private var envRows: [McpKVRow]
+    @State private var headerRows: [McpKVRow]
+    @State private var errorMessage: String?
+    @State private var testInProgress = false
+    @State private var testResult: String?
+
+    init(server: McpServer?, onSave: @escaping (McpServer) -> Void) {
+        self.server = server
+        self.onSave = onSave
+        _name = State(initialValue: server?.name ?? "")
+        _transport = State(initialValue: server?.transport ?? .stdio)
+        _command = State(initialValue: server?.command ?? "")
+        _argsText = State(initialValue: server?.args.joined(separator: " ") ?? "")
+        _url = State(initialValue: server?.url ?? "")
+        _envRows = State(initialValue: McpServerEditor.kvRows(server?.env ?? [:] , obfuscated: true))
+        _headerRows = State(initialValue: McpServerEditor.kvRows(server?.headers ?? [:], obfuscated: true))
+    }
+
+    private static func kvRows(_ dict: [String: String], obfuscated: Bool) -> [McpKVRow] {
+        dict.map { McpKVRow(key: $0.key, value: $0.value, obfuscated: obfuscated) }
+    }
+
+    private var builtServer: McpServer {
+        McpServer(
+            name: name,
+            enabled: server?.enabled ?? true,
+            transport: transport,
+            command: command,
+            args: McpServerEditor.splitArgs(argsText),
+            env: McpServerEditor.dict(rows: envRows),
+            url: url,
+            headers: McpServerEditor.dict(rows: headerRows)
+        )
+    }
+
+    /// Last-wins dict from rows, ignoring empty keys (duplicate keys must not crash).
+    private static func dict(rows: [McpKVRow]) -> [String: String] {
+        var out: [String: String] = [:]
+        for row in rows where !row.key.isEmpty {
+            out[row.key] = row.value
+        }
+        return out
+    }
+
+    private static func splitArgs(_ text: String) -> [String] {
+        text.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).map(String.init)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text(server == nil ? "添加 MCP 服务器" : "编辑 MCP 服务器")
+                    .font(.headline)
+                Spacer()
+                Button("完成") { save() }
+                    .keyboardShortcut(.defaultAction)
+                Button("取消") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+
+            TextField("服务器名", text: $name)
+                .textFieldStyle(.roundedBorder)
+
+            Picker("传输方式", selection: $transport) {
+                Text("stdio").tag(McpTransport.stdio)
+                Text("http").tag(McpTransport.http)
+            }
+            .pickerStyle(.segmented)
+
+            if transport == .stdio {
+                TextField("command（如 npx）", text: $command)
+                    .textFieldStyle(.roundedBorder)
+                TextField("args（空格分隔，如 -y firecrawl-mcp）", text: $argsText)
+                    .textFieldStyle(.roundedBorder)
+                McpKVEditor(title: "环境变量 env（值用 ${VAR} 引用 .env）",
+                            rows: $envRows, obfuscated: true)
+            } else {
+                TextField("url（如 https:// …/mcp）", text: $url)
+                    .textFieldStyle(.roundedBorder)
+                McpKVEditor(title: "请求头 headers（值用 ${VAR} 引用 .env）",
+                            rows: $headerRows, obfuscated: true)
+            }
+
+            if let errorMessage {
+                Text(errorMessage).font(.caption).foregroundStyle(.red)
+            }
+
+            HStack {
+                Button("测试连接") {
+                    testConnection()
+                }
+                .disabled(testInProgress)
+                if testInProgress { ProgressView().controlSize(.small) }
+                if let testResult {
+                    Text(testResult).font(.caption)
+                        .foregroundStyle(testResult.hasPrefix("❌") ? .red : .secondary)
+                }
+                Spacer()
+            }
+
+            Text("密钥请写在 ~/.pi/agent/.env，这里用 ${VAR} 引用；App 不代管这些 key。新增/删除服务器后需在下一会话或 /pipiui_reload 生效。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(20)
+        .frame(width: 520)
+    }
+
+    private func testConnection() {
+        let candidate = builtServer
+        if let err = McpServerSettings.validationError(candidate) {
+            errorMessage = err
+            return
+        }
+        errorMessage = nil
+        testInProgress = true
+        testResult = nil
+        let variables = EnvFileStore().all()
+        Task {
+            let result = await McpServerSettings.testConnection(candidate, variables: variables)
+            await MainActor.run {
+                testResult = result.display
+                testInProgress = false
+            }
+        }
+    }
+
+    private func save() {
+        let candidate = builtServer
+        if let err = McpServerSettings.validationError(candidate) {
+            errorMessage = err
+            return
+        }
+        errorMessage = nil
+        onSave(candidate)
+        dismiss()
+    }
+}
+
+/// Editable list of key/value rows (env / headers) with add/remove.
+private struct McpKVEditor: View {
+    let title: String
+    @Binding var rows: [McpKVRow]
+    let obfuscated: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            ForEach($rows) { $row in
+                HStack(spacing: 6) {
+                    TextField("键", text: $row.key)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 160)
+                    TextField(obfuscated ? "值（${VAR}）" : "值", text: $row.value)
+                        .textFieldStyle(.roundedBorder)
+                    Button {
+                        rows.removeAll { $0.id == row.id }
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.red)
+                }
+            }
+            Button {
+                rows.append(McpKVRow(obfuscated: obfuscated))
+            } label: {
+                Label("添加键值", systemImage: "plus")
+            }
+            .font(.caption)
         }
     }
 }

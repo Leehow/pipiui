@@ -361,6 +361,9 @@ const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
 // own extension discovery, but only when the worker's model has a provider that ships it —
 // this is the fallback that makes research delegable no matter which model runs it.
 const PIPIUI_WEBSEARCH_EXT = process.env.PIPIUI_WEBSEARCH_EXT;
+// User-added MCP servers (stdio / HTTP). Re-exported so a dispatched worker also sees the
+// user's MCP tools; the hot-read config file is inherited through the child env too.
+const PIPIUI_MCP_EXT = process.env.PIPIUI_MCP_EXT;
 // Every dispatched subagent runs with the external skill library switched off: a worker
 // follows its own agent prompt plus the brief, never a skill SOP it discovered on its own.
 const PIPIUI_SUBAGENT_SKILL_ISOLATION = process.env.PIPIUI_SUBAGENT_SKILL_ISOLATION === "1";
@@ -3343,6 +3346,7 @@ async function runSingleAgent(
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
 	if (PIPIUI_SEARCH_SCOPE_EXT) args.push("-e", PIPIUI_SEARCH_SCOPE_EXT);
 	if (PIPIUI_WEBSEARCH_EXT) args.push("-e", PIPIUI_WEBSEARCH_EXT);
+	if (PIPIUI_MCP_EXT) args.push("-e", PIPIUI_MCP_EXT);
 	if (desktopGrant.granted && PIPIUI_COMPUTER_EXT) {
 		args.push("-e", PIPIUI_COMPUTER_EXT);
 	}

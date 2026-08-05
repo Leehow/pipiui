@@ -62,6 +62,7 @@ final class SpawnEnvMergeTests: XCTestCase {
                     git: "/p/git.ts",
                     reload: "/p/reload.ts",
                     webSearch: "/p/websearch.ts",
+                    mcp: "/p/mcp.ts",
                     skillLoader: "/p/skills.ts",
                     searchScope: "/p/search.ts",
                     codexServerTools: "/p/codex.ts",
@@ -75,7 +76,8 @@ final class SpawnEnvMergeTests: XCTestCase {
                 computerDescriptor: nil,
                 mainModelId: nil,
                 excludeToolsArgs: [],
-                webSearchConfigFile: "/p/websearch.json"
+                webSearchConfigFile: "/p/websearch.json",
+                mcpConfigFile: "/p/mcp.json"
             )
         )
         var dotEnv = stale
@@ -118,6 +120,7 @@ final class SpawnEnvMergeTests: XCTestCase {
                     git: nil,
                     reload: nil,
                     webSearch: nil,
+                    mcp: nil,
                     skillLoader: nil,
                     searchScope: "/current/search.ts",
                     codexServerTools: nil,
@@ -131,7 +134,8 @@ final class SpawnEnvMergeTests: XCTestCase {
                 computerDescriptor: descriptor,
                 mainModelId: "current/model",
                 excludeToolsArgs: [],
-                webSearchConfigFile: "/current/websearch.json"
+                webSearchConfigFile: "/current/websearch.json",
+                mcpConfigFile: "/current/mcp.json"
             )
         )
         let stale: [String: String] = [

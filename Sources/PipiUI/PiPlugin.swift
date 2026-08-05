@@ -24,6 +24,7 @@ enum PiPlugin {
         var gitExtension: String?     // -e git_status / git_diff + prompt snapshot
         var reloadExtension: String?  // -e 内部 pipiui_reload 命令
         var webSearchExtension: String? // -e web_search / web_fetch
+        var mcpExtension: String? // -e user-added MCP servers (stdio/http)
         var skillLoaderExtension: String? // -e 技能按需加载（名字索引 + skill_search / skill_load）
         var searchScopeExtension: String? // -e 项目内搜索边界 + 当轮外部路径授权
         var memoryExtension: String? // -e 默认关闭、仅提案、会话冻结的可控记忆
@@ -147,6 +148,7 @@ enum PiPlugin {
             ("pipiui-git.ts", \.gitExtension),
             ("pipiui-reload.ts", \.reloadExtension),
             ("pipiui-websearch.ts", \.webSearchExtension),
+            ("pipiui-mcp.ts", \.mcpExtension),
             ("pipiui-skillloader.ts", \.skillLoaderExtension),
             ("pipiui-search-scope.ts", \.searchScopeExtension),
             (MemoryExtension.fileName, \.memoryExtension),
@@ -257,6 +259,9 @@ enum PiPlugin {
 
         // 5.5 通用网络搜索 + 网页抓取（web_search / web_fetch）
         result.webSearchExtension = WebSearchExtension.install(into: root)
+
+        // 5.55 用户自添 MCP 服务器（stdio / HTTP）→ 本地工具
+        result.mcpExtension = McpBridgeExtension.install(into: root)
 
         // 5.6 技能按需加载：提示里只留名字，描述/正文走 skill_search / skill_load
         result.skillLoaderExtension = SkillLoaderExtension.install(into: root)

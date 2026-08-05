@@ -12,6 +12,7 @@ final class PipiSpawnAssemblyTests: XCTestCase {
             git: "/p/git.ts",
             reload: "/p/reload.ts",
             webSearch: "/p/websearch.ts",
+            mcp: "/p/mcp.ts",
             skillLoader: "/p/skills.ts",
             searchScope: "/p/searchscope.ts",
             codexServerTools: "/p/codex.ts",
@@ -40,7 +41,8 @@ final class PipiSpawnAssemblyTests: XCTestCase {
             ),
             mainModelId: "provider/model",
             excludeToolsArgs: [],
-            webSearchConfigFile: "/p/websearch-config.json"
+            webSearchConfigFile: "/p/websearch-config.json",
+            mcpConfigFile: "/p/mcp-config.json"
         )
     }
 
@@ -53,6 +55,7 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         installed.gitExtension = "/p/git.ts"
         installed.reloadExtension = "/p/reload.ts"
         installed.webSearchExtension = "/p/websearch.ts"
+        installed.mcpExtension = "/p/mcp.ts"
         installed.skillLoaderExtension = "/p/skills.ts"
         installed.searchScopeExtension = "/p/searchscope.ts"
         installed.codexServerToolsExtension = "/p/codex.ts"
@@ -77,6 +80,7 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertNil(paths.git)
         XCTAssertNil(paths.reload)
         XCTAssertNil(paths.webSearch)
+        XCTAssertNil(paths.mcp)
         XCTAssertNil(paths.skillLoader)
         XCTAssertNil(paths.searchScope)
         XCTAssertNil(paths.codexServerTools)
@@ -207,7 +211,20 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertEqual(out.extraEnv["PIPIUI_MAIN_CWD"], "/proj")
         XCTAssertEqual(out.extraEnv["PIPIUI_MAIN_MODEL"], "provider/model")
         XCTAssertEqual(out.extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"], "/p/websearch-config.json")
+        XCTAssertEqual(out.extraEnv["PIPIUI_MCP_CONFIG_FILE"], "/p/mcp-config.json")
+        XCTAssertEqual(out.extraEnv["PIPIUI_MCP_EXT"], "/p/mcp.ts")
+        XCTAssertTrue(out.args.contains("/p/mcp.ts"))
         XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_EXT"], "/p/computer.ts")
+    }
+
+    func testMCPDisabledDropsExtensionAndEnv() {
+        var input = allEnabledInput(paths: fullyPopulatedPaths())
+        input.features = .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.mcp.rawValue])
+
+        let out = PipiSpawnAssembly.assemble(input)
+        XCTAssertFalse(out.args.contains("/p/mcp.ts"))
+        XCTAssertNil(out.extraEnv["PIPIUI_MCP_CONFIG_FILE"])
+        XCTAssertNil(out.extraEnv["PIPIUI_MCP_EXT"])
     }
 
     func testSearchScopeDisabledDropsEverything() {
@@ -269,6 +286,7 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertNil(out.extraEnv["PIPIUI_AGENTS_DIR"])
         XCTAssertNil(out.extraEnv["PIPIUI_COMPUTER_EXT"])
         XCTAssertNil(out.extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"])
+        XCTAssertNil(out.extraEnv["PIPIUI_MCP_CONFIG_FILE"])
         XCTAssertNil(out.extraEnv["PIPIUI_SUBAGENT_MODELS_FILE"])
         XCTAssertNil(out.extraEnv["PIPIUI_MAIN_CWD"])
         // Session path still threaded.
