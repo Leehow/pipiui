@@ -48,6 +48,7 @@ const pending = new Map<string, {
 let connected = false;
 let revoked = false;
 let activeSession: string | null = null;
+let selectedProject: string | null = null;
 let revision: string | number | null = null;
 let models: any = null;
 let currentModelName: string | null = null;
@@ -130,42 +131,79 @@ async function loadIndex() {
   projectSelect.replaceChildren();
   sessionSelect.replaceChildren();
 
-  for (const project of value?.projects ?? []) {
-    const option = new Option(project.name, project.id);
-    projectSelect.append(option);
+  const projects = value?.projects ?? [];
+  const sessions = value?.sessions ?? [];
+  const sessionCountByProject = new Map<string, number>();
+  for (const session of sessions) {
+    if (typeof session.projectID !== "string") continue;
+    sessionCountByProject.set(
+      session.projectID,
+      (sessionCountByProject.get(session.projectID) ?? 0) + 1,
+    );
+  }
+
+  for (const project of projects) {
+    projectSelect.append(new Option(project.name, project.id));
     const row = document.createElement("div");
-    row.className = "row card";
+    row.className = "row card" + (project.id === selectedProject ? " selected" : "");
+    const main = document.createElement("button");
+    main.type = "button";
+    main.className = "row-main";
     const titleWrap = document.createElement("div");
     titleWrap.className = "row-title";
     titleWrap.append(label("span", project.name, "row-name"));
-    row.append(titleWrap);
+    titleWrap.append(label("span", String(sessionCountByProject.get(project.id) ?? 0), "badge"));
+    main.append(titleWrap);
+    main.onclick = () => {
+      selectedProject = selectedProject === project.id ? null : project.id;
+      void loadIndex();
+    };
+    row.append(main);
     const button = label("button", "新建") as HTMLButtonElement;
-    button.onclick = () => void (async () => {
-      try {
-        const created = await command("session.create", { projectID: project.id });
-        await loadIndex();
-        await openSession(created.sessionID, false);
-      } catch (error) {
-        setStatus(String((error as Error).message || error), true);
-      }
-    })();
+    button.onclick = (event) => {
+      event.stopPropagation();
+      void (async () => {
+        try {
+          const created = await command("session.create", { projectID: project.id });
+          selectedProject = project.id;
+          await loadIndex();
+          await openSession(created.sessionID, false);
+        } catch (error) {
+          setStatus(String((error as Error).message || error), true);
+        }
+      })();
+    };
     row.append(button);
     projectList.append(row);
   }
 
-  for (const session of value?.sessions ?? []) {
+  const visibleSessions = selectedProject === null
+    ? sessions
+    : sessions.filter((s: any) => s.projectID === selectedProject);
+  for (const session of visibleSessions) {
     sessionSelect.append(new Option(session.title, session.id));
     const row = document.createElement("div");
     row.className = "row card" + (session.id === activeSession ? " selected" : "");
+    const main = document.createElement("button");
+    main.type = "button";
+    main.className = "row-main";
     const titleWrap = document.createElement("div");
     titleWrap.className = "row-title";
     titleWrap.append(label("span", session.title, "row-name"));
     if (session.isGenerating) titleWrap.append(label("span", "生成中", "badge"));
-    row.append(titleWrap);
+    main.append(titleWrap);
+    main.onclick = () => void openSession(session.id, true);
+    row.append(main);
     const button = label("button", "打开") as HTMLButtonElement;
-    button.onclick = () => void openSession(session.id, true);
+    button.onclick = (event) => {
+      event.stopPropagation();
+      void openSession(session.id, true);
+    };
     row.append(button);
     sessionList.append(row);
+  }
+  if (visibleSessions.length === 0 && selectedProject !== null) {
+    sessionList.append(label("div", "该项目暂无会话", "list-empty"));
   }
 }
 
