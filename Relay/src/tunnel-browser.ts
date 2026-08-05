@@ -50,6 +50,7 @@ let revoked = false;
 let activeSession: string | null = null;
 let revision: string | number | null = null;
 let models: any = null;
+let currentModelName: string | null = null;
 let activePanel: "agents" | "web" | "documents" | null = null;
 
 function setStatus(message: string, error = false) {
@@ -110,6 +111,7 @@ function showList() {
   modelsToggle.disabled = true;
   modelsPanel.hidden = true;
   models = null;
+  currentModelName = null;
   activePanel = null;
   remotePanel.hidden = true;
   for (const toggle of Object.values(panelToggles)) toggle.disabled = true;
@@ -283,11 +285,19 @@ function renderModels() {
 async function loadModels() {
   if (!activeSession) {
     models = { main: null, available: [], subagents: [] };
+    currentModelName = null;
     renderModels();
     return;
   }
   models = await command("models.get", { sessionID: activeSession });
+  currentModelName = models?.main?.name ?? null;
   renderModels();
+  if (activeSession) title.textContent = sessionTitle();
+}
+
+function sessionTitle(base?: string) {
+  const titleText = base ?? "会话";
+  return currentModelName ? `${titleText} · ${currentModelName}` : titleText;
 }
 
 function roleLabel(role: string) {
@@ -316,7 +326,7 @@ function renderSnapshot(value: any) {
   if (!snapshot) return;
   revision = value.revision ?? null;
   showDetail();
-  title.textContent = snapshot.title || "会话";
+  title.textContent = sessionTitle(snapshot.title);
   sendButton.disabled = !snapshot.processAlive;
   stopButton.disabled = !(snapshot.isGenerating || snapshot.isStopping);
   transcript.replaceChildren();
