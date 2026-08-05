@@ -205,9 +205,9 @@ test("null array and scalar JSON close only the sender and leave Relay healthy",
       "malformed authenticated frame retained the host too",
     );
     assert.deepEqual(await (await fetch(`${relay.origin}/healthz`)).json(), { ok: true });
-    // Host teardown is what ends the room.
+    // Intentional host teardown (explicit end frame) is what ends the room.
     const hostClosed = once(host, "close");
-    host.close(1000, "done");
+    host.send(JSON.stringify({ v: 1, type: "end" }));
     await hostClosed;
     await waitUntil(
       () => relay.instance.getClientCount() === 0
@@ -220,7 +220,7 @@ test("null array and scalar JSON close only the sender and leave Relay healthy",
   }
 });
 
-test("tunnel relays frames and browser disconnect does not kill the room", async () => {
+test("tunnel relays frames; browser and host disconnect do not kill the room", async () => {
   const relay = await fixture();
   const host = await connect(relay.socketURL);
   const browser = await connect(relay.socketURL);
@@ -262,17 +262,123 @@ test("tunnel relays frames and browser disconnect does not kill the room", async
     await secondReady;
     await hostReadySecond;
 
-    // Host leaving still ends the room (existing host-side teardown semantics).
+    // Host drop without an explicit end frame only clears room.host; the room
+    // stays connectable so the host can rejoin within the TTL.
     const hostClosed = once(host, "close");
-    const secondClosed = once(second, "close");
     host.close(1000, "done");
     await hostClosed;
+    assert.equal(relay.instance.getRoomCount(), 1);
+
+    // A new host re-joins the same room; the attached browser reconnects.
+    const host2 = await connect(relay.socketURL);
+    const host2Ready = nextFrame(host2);
+    const secondReady2 = nextFrame(second);
+    hello(host2, "host");
+    assert.equal((await host2Ready).type, "host-ready");
+    assert.equal((await secondReady2).type, "ready");
+
+    // Intentional end from the (new) host invalidates + tombstones the room.
+    const host2Closed = once(host2, "close");
+    const secondClosed = once(second, "close");
+    host2.send(JSON.stringify({ v: 1, type: "end" }));
+    await host2Closed;
     await secondClosed;
     assert.equal(relay.instance.getRoomCount(), 0);
     second.close();
+    host2.close();
   } finally {
     host.close();
     browser.close();
+    await relay.close();
+  }
+});
+
+test("host drop without end survives; browser fails gracefully until host rejoins", async () => {
+  const relay = await fixture();
+  const hostA = await connect(relay.socketURL);
+  try {
+    hello(hostA, "host");
+    await nextFrame(hostA);
+
+    const browser = await connect(relay.socketURL);
+    const bReady = nextFrame(browser);
+    const hostReadyA = nextFrame(hostA);
+    hello(browser, "browser");
+    await bReady;
+    await hostReadyA;
+
+    // Host A drops without an end frame: room survives, host cleared.
+    const hostAClosed = once(hostA, "close");
+    hostA.close(1000, "drop");
+    await hostAClosed;
+    assert.equal(relay.instance.getRoomCount(), 1);
+
+    // Browser request while host is offline fails gracefully (no hang/crash).
+    const requestID = "c88d9390-b890-4928-930b-015f56498cb0";
+    const offlineError = nextFrame(browser);
+    browser.send(JSON.stringify({
+      v: 1, type: "request", requestID, command: "index", body: {},
+    }));
+    assert.deepEqual(await offlineError, {
+      v: 1, type: "error", requestID, message: "host offline",
+    });
+
+    // Host B rejoins the same room; it gets host-ready then ready (the browser
+    // is already attached), and the attached browser gets ready again too.
+    const hostB = await connect(relay.socketURL);
+    const hostBReady = nextFrame(hostB);
+    const hostBAccepted = nextFrame(hostB);
+    const bReady2 = nextFrame(browser);
+    hello(hostB, "host");
+    assert.equal((await hostBReady).type, "host-ready");
+    assert.equal((await hostBAccepted).type, "ready");
+    assert.equal((await bReady2).type, "ready");
+
+    // Requests relay again after the host rejoins.
+    const requestID2 = "c88d9390-b890-4928-930b-015f56498cb1";
+    const forwarded = nextFrame(hostB);
+    browser.send(JSON.stringify({
+      v: 1, type: "request", requestID: requestID2, command: "index", body: {},
+    }));
+    assert.deepEqual(await forwarded, {
+      v: 1, type: "request", requestID: requestID2, command: "index", body: {},
+    });
+    const response = nextFrame(browser);
+    hostB.send(JSON.stringify({
+      v: 1, type: "response", requestID: requestID2, status: 200, body: { sessions: [] },
+    }));
+    assert.deepEqual(await response, {
+      v: 1, type: "response", requestID: requestID2, status: 200, body: { sessions: [] },
+    });
+  } finally {
+    hostA.close();
+    await relay.close();
+  }
+});
+
+test("host re-hello replaces the previous host socket; wrong secret rejected", async () => {
+  const relay = await fixture();
+  const hostA = await connect(relay.socketURL);
+  try {
+    hello(hostA, "host");
+    await nextFrame(hostA);
+
+    const hostAClosed = once(hostA, "close");
+    const hostB = await connect(relay.socketURL);
+    const hostBReady = nextFrame(hostB);
+    hello(hostB, "host");
+    assert.equal((await hostBReady).type, "host-ready");
+    await hostAClosed; // A is closed (replaced).
+    assert.equal(relay.instance.getRoomCount(), 1);
+
+    // Mismatched secret on an existing room is still rejected.
+    const hostC = await connect(relay.socketURL);
+    const hostCClosed = once(hostC, "close");
+    hello(hostC, "host", wrongSecret);
+    await hostCClosed;
+    assert.equal(relay.instance.getRoomCount(), 1);
+  } finally {
+    hostA.close();
     await relay.close();
   }
 });

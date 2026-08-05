@@ -3,7 +3,12 @@
   // src/tunnel-host.ts
   var socket = null;
   var generation = "";
+  var config = null;
+  var stopped = true;
+  var attempt = 0;
+  var retryTimer = null;
   var pending = /* @__PURE__ */ new Set();
+  var MAX_RETRY_DELAY_MS = 15e3;
   function post(type, extra = {}) {
     window.webkit?.messageHandlers?.pipiRemotePeer?.postMessage({
       v: 1,
@@ -12,32 +17,40 @@
       ...extra
     });
   }
-  function leave() {
-    const current = socket;
-    socket = null;
-    pending.clear();
-    if (current && current.readyState < WebSocket.CLOSING) {
-      current.close(1e3, "host stopped");
+  function clearRetry() {
+    if (retryTimer !== null) {
+      window.clearTimeout(retryTimer);
+      retryTimer = null;
     }
   }
-  function start(config) {
-    leave();
-    generation = config.generation;
+  function scheduleReconnect() {
+    if (stopped || !config) return;
+    const delay = Math.min(1e3 * 2 ** attempt, MAX_RETRY_DELAY_MS);
+    attempt += 1;
+    retryTimer = window.setTimeout(connect, delay);
+  }
+  function connect() {
+    if (stopped || !config) return;
     const next = new WebSocket(config.tunnelURL);
     socket = next;
-    next.onopen = () => next.send(JSON.stringify({
-      v: 1,
-      type: "hello",
-      roomID: config.roomID,
-      secret: config.secret,
-      role: "host"
-    }));
-    next.onerror = () => post("tunnelError", { message: "\u670D\u52A1\u5668\u96A7\u9053\u8FDE\u63A5\u5931\u8D25" });
+    next.onopen = () => {
+      attempt = 0;
+      next.send(JSON.stringify({
+        v: 1,
+        type: "hello",
+        roomID: config.roomID,
+        secret: config.secret,
+        role: "host"
+      }));
+    };
+    next.onerror = () => {
+    };
     next.onclose = () => {
       if (socket !== next) return;
       socket = null;
       pending.clear();
-      post("tunnelClosed");
+      if (stopped) return;
+      scheduleReconnect();
     };
     next.onmessage = (event) => {
       let frame;
@@ -51,7 +64,11 @@
       }
       if (frame.type === "host-ready") return post("tunnelReady");
       if (frame.type === "ready") return post("tunnelBrowserAccepted");
-      if (frame.type === "invalidated") return post("tunnelInvalidated");
+      if (frame.type === "replaced" || frame.type === "invalidated") {
+        stopped = true;
+        clearRetry();
+        return post("tunnelInvalidated");
+      }
       if (frame.type !== "request" || typeof frame.requestID !== "string" || typeof frame.command !== "string" || !frame.body || typeof frame.body !== "object" || Array.isArray(frame.body) || pending.size >= 32 || pending.has(frame.requestID)) {
         return next.close(1008, "invalid request");
       }
@@ -62,6 +79,34 @@
         body: frame.body
       });
     };
+  }
+  function leave() {
+    stopped = true;
+    config = null;
+    clearRetry();
+    const current = socket;
+    socket = null;
+    pending.clear();
+    if (current && current.readyState === WebSocket.OPEN) {
+      current.send(JSON.stringify({ v: 1, type: "end" }));
+    }
+    if (current && current.readyState < WebSocket.CLOSING) {
+      current.close(1e3, "host stopped");
+    }
+  }
+  function start(incoming) {
+    stopped = false;
+    config = incoming;
+    generation = incoming.generation;
+    attempt = 0;
+    clearRetry();
+    const current = socket;
+    socket = null;
+    pending.clear();
+    if (current && current.readyState < WebSocket.CLOSING) {
+      current.close(1e3, "restart");
+    }
+    connect();
   }
   function resolveRequest(requestID, response, errorMessage) {
     if (!pending.delete(requestID) || !socket || socket.readyState !== WebSocket.OPEN) return;

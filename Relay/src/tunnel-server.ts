@@ -31,7 +31,7 @@ type Client = {
 type Room = {
   roomID: string;
   secretHash: Buffer;
-  host: Client;
+  host: Client | null;
   browser: Client | null;
   expiresAt: number;
   expiryTimer: NodeJS.Timeout;
@@ -196,9 +196,9 @@ export function createTunnelServer(options: TunnelServerOptions) {
       timer.unref();
       invalidatedRooms.set(room.roomID, timer);
     }
-    send(room.host, { v: 1, type: "invalidated", reason });
+    if (room.host) send(room.host, { v: 1, type: "invalidated", reason });
     if (room.browser) send(room.browser, { v: 1, type: "invalidated", reason });
-    closeClient(room.host, 1000, "link invalidated");
+    if (room.host) closeClient(room.host, 1000, "link invalidated");
     if (room.browser) closeClient(room.browser, 1000, "link invalidated");
   };
   // Last-opener-wins: a new browser with the correct secret becomes THE
@@ -212,7 +212,7 @@ export function createTunnelServer(options: TunnelServerOptions) {
       send(previous, { v: 1, type: "replaced" });
       closeClient(previous, 1000, "replaced");
     }
-    send(room.host, { v: 1, type: "ready" });
+    if (room.host) send(room.host, { v: 1, type: "ready" });
     send(browser, { v: 1, type: "ready" });
   };
 
@@ -271,10 +271,29 @@ export function createTunnelServer(options: TunnelServerOptions) {
         client.roomID = frame.roomID.toLowerCase();
         client.secretHash = secretHash(frame.secret);
         if (client.role === "host") {
-          if (rooms.size >= MAX_ROOMS || rooms.has(client.roomID)
-            || invalidatedRooms.has(client.roomID)) {
-            return closeClient(client);
+          if (invalidatedRooms.has(client.roomID)) return closeClient(client);
+          const existing = rooms.get(client.roomID);
+          if (existing) {
+            // Host rejoin/replace for an existing room: the new host becomes
+            // THE host (last-opener-wins), the old socket is closed. Room,
+            // browser and inflight state are preserved.
+            if (!exactSecret(client.secretHash, existing.secretHash)) {
+              return closeClient(client);
+            }
+            const previous = existing.host;
+            existing.host = client;
+            if (previous) {
+              send(previous, { v: 1, type: "replaced" });
+              closeClient(previous, 1000, "replaced");
+            }
+            send(client, { v: 1, type: "host-ready", expiresAt: existing.expiresAt });
+            if (existing.browser) {
+              send(client, { v: 1, type: "ready" });
+              send(existing.browser, { v: 1, type: "ready" });
+            }
+            return;
           }
+          if (rooms.size >= MAX_ROOMS) return closeClient(client);
           const room: Room = {
             roomID: client.roomID,
             secretHash: client.secretHash,
@@ -324,7 +343,7 @@ export function createTunnelServer(options: TunnelServerOptions) {
         return;
       }
       if (client.role === "browser") {
-        if (room.browser !== client || room.host.socket.readyState !== WebSocket.OPEN
+        if (room.browser !== client
           || Object.keys(frame).sort().join(",") !== "body,command,requestID,type,v"
           || frame.v !== 1 || frame.type !== "request"
           || typeof frame.requestID !== "string" || !REQUEST_ID.test(frame.requestID)
@@ -332,6 +351,11 @@ export function createTunnelServer(options: TunnelServerOptions) {
           || !frame.body || typeof frame.body !== "object" || Array.isArray(frame.body)
           || room.inflight.size >= MAX_INFLIGHT || room.inflight.has(frame.requestID)) {
           return closeClient(client);
+        }
+        if (!room.host || room.host.socket.readyState !== WebSocket.OPEN) {
+          // Host dropped; fail the request gracefully instead of hanging.
+          send(client, { v: 1, type: "error", requestID: frame.requestID, message: "host offline" });
+          return;
         }
         const requestID = frame.requestID;
         const timer = setTimeout(() => {
@@ -343,8 +367,13 @@ export function createTunnelServer(options: TunnelServerOptions) {
         send(room.host, frame);
         return;
       }
-      if (room.host !== client
-        || Object.keys(frame).sort().join(",") !== "body,requestID,status,type,v"
+      if (room.host !== client) return closeClient(client);
+      if (frame.type === "end" && frame.v === 1) {
+        // Intentional host teardown: invalidate + tombstone the room.
+        invalidateRoom(room, "host ended");
+        return;
+      }
+      if (Object.keys(frame).sort().join(",") !== "body,requestID,status,type,v"
         || frame.v !== 1 || frame.type !== "response"
         || typeof frame.requestID !== "string" || !REQUEST_ID.test(frame.requestID)
         || typeof frame.status !== "number" || !Number.isInteger(frame.status)
@@ -371,13 +400,14 @@ export function createTunnelServer(options: TunnelServerOptions) {
       }
       const room = client.roomID ? rooms.get(client.roomID) : undefined;
       if (!room) return;
-      // Browser disconnect must not kill the room: the pairID stays connectable
-      // until the 24h TTL or the host leaving. Host teardown keeps its existing
-      // semantics (invalidate + tombstone the roomID).
-      if (room.host === client) {
-        invalidateRoom(room, "host disconnected");
-      } else if (room.browser === client) {
+      // Browser disconnect must not kill the room. A host drop without an
+      // explicit "end" frame only clears room.host so the host can rejoin the
+      // same room within the TTL; the room and browser stay. Only an explicit
+      // "end" frame (or TTL expiry / server stop) invalidates + tombstones.
+      if (room.browser === client) {
         room.browser = null;
+      } else if (room.host === client) {
+        room.host = null;
       }
     });
     socket.on("pong", () => { client.alive = true; });
