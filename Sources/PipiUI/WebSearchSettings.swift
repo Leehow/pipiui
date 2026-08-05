@@ -11,9 +11,9 @@ import Foundation
 /// execution time — no session restart needed.
 enum WebSearchSettings {
     static let backendKey = "pipiui.webSearch.backend"
-    static let defaultBackend = "duckduckgo"
+    static let defaultBackend = "browser"
 
-    static let availableBackends = ["tavily", "brave", "serpapi", "exa", "kimi", "duckduckgo"]
+    static let availableBackends = ["browser", "tavily", "brave", "serpapi", "exa", "kimi", "duckduckgo"]
 
     /// 共享的 .env 存取实例（默认路径 `~/.pi/agent/.env`）。
     static let defaultEnvStore = EnvFileStore()

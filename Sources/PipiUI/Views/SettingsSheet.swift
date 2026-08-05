@@ -1488,6 +1488,7 @@ struct SettingsSheet: View {
 
             VStack(alignment: .leading, spacing: 10) {
                 Picker("搜索后端", selection: $webSearchBackend) {
+                    Text("内置浏览器（built-in browser）").tag("browser")
                     Text("DuckDuckGo（免费，无需 key）").tag("duckduckgo")
                     Text("Tavily").tag("tavily")
                     Text("Brave Search").tag("brave")

@@ -8,10 +8,13 @@ final class WebSearchSettingsTests: XCTestCase {
         return (name, suite)
     }
 
-    func testDefaultBackendIsDuckDuckGo() {
+    func testDefaultBackendIsBuiltInBrowser() {
         let (name, suite) = tempSuite()
         defer { suite.removePersistentDomain(forName: name) }
-        XCTAssertEqual(WebSearchSettings.backend(defaults: suite), "duckduckgo")
+        XCTAssertEqual(WebSearchSettings.defaultBackend, "browser")
+        XCTAssertEqual(WebSearchSettings.backend(defaults: suite), "browser")
+        XCTAssertTrue(WebSearchSettings.availableBackends.first == "browser")
+        XCTAssertTrue(WebSearchSettings.availableBackends.contains("duckduckgo"))
     }
 
     func testSetAndGetBackend() {
@@ -25,7 +28,7 @@ final class WebSearchSettingsTests: XCTestCase {
         let (name, suite) = tempSuite()
         defer { suite.removePersistentDomain(forName: name) }
         suite.set("  ", forKey: WebSearchSettings.backendKey)
-        XCTAssertEqual(WebSearchSettings.backend(defaults: suite), "duckduckgo")
+        XCTAssertEqual(WebSearchSettings.backend(defaults: suite), "browser")
     }
 
     func testApiKeyRoundTripViaEnvStore() throws {
@@ -149,6 +152,23 @@ final class WebSearchSettingsTests: XCTestCase {
         XCTAssertTrue(source.contains(#"!/class="result-link"/i.test(html) &&"#),
                       "the guard must require BOTH no links AND a challenge marker")
         XCTAssertTrue(source.contains("No results found for:"))
+    }
+
+    /// The built-in browser backend is the default and must fall back to DuckDuckGo on bridge
+    /// failure, with an honest result header. It needs no API key.
+    func testBuiltInBrowserBackendIsDefaultAndFallbackPresent() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pipiui-ws-browser-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let path = try XCTUnwrap(WebSearchExtension.install(into: dir))
+        let source = try String(contentsOfFile: path, encoding: .utf8)
+
+        XCTAssertTrue(source.contains(#"let backend = "browser""#), "TS config default must be browser")
+        XCTAssertTrue(source.contains(#"case "browser":"#))
+        XCTAssertTrue(source.contains("searchViaBuiltInBrowser"))
+        XCTAssertTrue(source.contains("browser→duckduckgo fallback"), "fallback header must be honest")
+        XCTAssertTrue(source.contains("no bridge env"), "missing bridge env must trigger fallback")
+        XCTAssertTrue(source.contains(#"backend !== "browser""#), "browser must not require an API key")
     }
 
     /// Native-search detection is a guess from the provider and model name. A relay that fronts

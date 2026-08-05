@@ -79,11 +79,11 @@ function loadConfig(): WebSearchConfig {
   const file =
     process.env.PIPIUI_WEBSEARCH_CONFIG_FILE ||
     path.join(os.homedir(), "Library/Application Support/PipiUI/websearch-config.json");
-  let backend = "duckduckgo";
+  let backend = "browser";
   let keys: Record<string, string> = {};
   try {
     const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
-    backend = typeof raw.backend === "string" && raw.backend ? raw.backend : "duckduckgo";
+    backend = typeof raw.backend === "string" && raw.backend ? raw.backend : "browser";
     keys = raw.keys && typeof raw.keys === "object" ? raw.keys : {};
   } catch {
     // keep defaults
@@ -311,6 +311,98 @@ async function searchDuckDuckGo(query: string, maxResults: number): Promise<Sear
 }
 
 // ---------------------------------------------------------------------------
+// Built-in browser backend (via the per-session loopback bridge RPC)
+// ---------------------------------------------------------------------------
+
+// Runs in-page inside the built-in WebView (DDG html results page). Returns a
+// JSON string { results, challenge }. DDG redirect links look like
+// //duckduckgo.com/l/?uddg=<urlencoded>; decode them back to the real URL.
+const BROWSER_EXTRACT_JS = `(() => {
+  const cap = 10;
+  const clean = (s) => String(s || "").trim()
+    .replace(/<[^>]*>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, "/")
+    .replace(/&nbsp;/g, " ");
+  const decodeRedirect = (href) => {
+    if (!href) return "";
+    if (href.indexOf("//duckduckgo.com/l/?uddg=") !== -1) {
+      const m = href.match(/[?&]uddg=([^&]+)/);
+      if (m) { try { return decodeURIComponent(m[1]); } catch (e) { return href; } }
+    }
+    return href;
+  };
+  const results = [];
+  const anchors = Array.from(document.querySelectorAll("a.result__a"));
+  const snippets = Array.from(document.querySelectorAll(".result__snippet"));
+  for (let i = 0; i < anchors.length && results.length < cap; i++) {
+    const a = anchors[i];
+    const title = clean(a.textContent);
+    const url = a.href ? a.href : "";
+    const snippet = snippets[i] ? clean(snippets[i].textContent || "") : "";
+    if (title && url) results.push({ title, url: decodeRedirect(url), snippet });
+  }
+  if (results.length === 0) {
+    const generic = Array.from(document.querySelectorAll("article a[href]"));
+    for (let i = 0; i < generic.length && results.length < cap; i++) {
+      const a = generic[i];
+      const title = clean(a.textContent);
+      const url = a.href ? a.href : "";
+      if (title && url && !url.startsWith("#")) results.push({ title, url, snippet: "" });
+    }
+  }
+  const body = document.body ? document.body.innerText : "";
+  return JSON.stringify({ results, challenge: /anomaly|challenge|captcha/i.test(body) });
+})()`;
+
+async function postBridge(action: string, body: Record<string, unknown>): Promise<any> {
+  const res = await fetch(
+    `http://127.0.0.1:${process.env.PIPIUI_BRIDGE_PORT}/rpc`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionKey: process.env.PIPIUI_SESSION_KEY, action, ...body }),
+    },
+  );
+  const json: any = await res.json();
+  if (!json.ok) throw new Error(json.error || `bridge action ${action} failed`);
+  return json;
+}
+
+async function searchViaBuiltInBrowser(query: string, maxResults: number): Promise<SearchResult[]> {
+  const port = process.env.PIPIUI_BRIDGE_PORT;
+  const key = process.env.PIPIUI_SESSION_KEY;
+  if (!port || !key) throw new Error("built-in browser unavailable: no bridge env");
+  await postBridge("navigate", {
+    url: "https://duckduckgo.com/html/?q=" + encodeURIComponent(query),
+  });
+  const evalRes = await postBridge("eval", { js: BROWSER_EXTRACT_JS });
+  let parsed: any;
+  try {
+    parsed = JSON.parse(evalRes.result ?? "null");
+  } catch {
+    throw new Error("built-in browser returned unparseable eval result");
+  }
+  const rows: any[] = parsed?.results;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error("built-in browser returned no results");
+  }
+  if (parsed?.challenge) {
+    throw new Error("built-in browser hit a bot/captcha challenge");
+  }
+  return rows.slice(0, maxResults).map((r: any) => ({
+    title: String(r?.title || ""),
+    url: String(r?.url || ""),
+    snippet: String(r?.snippet || ""),
+  }));
+}
+
+// ---------------------------------------------------------------------------
 // HTML utilities (for web_fetch + DDG parsing)
 // ---------------------------------------------------------------------------
 
@@ -385,7 +477,7 @@ export default function (pi: ExtensionAPI) {
     label: "Web Search",
     description:
       "Search the internet for current information, recent events, documentation, or any facts " +
-      "beyond the local codebase. Uses the configured search backend (Tavily/Brave/SerpAPI/Exa/Kimi/DuckDuckGo). " +
+      "beyond the local codebase. Uses the configured search backend (built-in browser / Tavily/Brave/SerpAPI/Exa/Kimi/DuckDuckGo). " +
       "Returns titles, URLs, and snippets. Use web_fetch to read a specific result in full.",
     promptSnippet: "Search the web for current/external information",
     promptGuidelines: [
@@ -431,7 +523,8 @@ export default function (pi: ExtensionAPI) {
       if (!query) return text("web_search: query is empty.", true);
 
       // Check API key for keyed backends (kimi can also use auth.json).
-      if (backend !== "duckduckgo") {
+      // `browser` and `duckduckgo` need no key.
+      if (backend !== "duckduckgo" && backend !== "browser") {
         const key = (config.keys[backend] || "").trim();
         if (!key) {
           const hint =
@@ -446,9 +539,21 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      let headerLabel = backend;
       try {
         let results: SearchResult[];
         switch (backend) {
+          case "browser":
+            try {
+              results = await searchViaBuiltInBrowser(query, maxResults);
+            } catch (browserErr: any) {
+              console.error(
+                `web_search built-in browser failed (${browserErr?.message || String(browserErr)}), falling back to duckduckgo`,
+              );
+              results = await searchDuckDuckGo(query, maxResults);
+              headerLabel = "browser→duckduckgo fallback";
+            }
+            break;
           case "tavily":
             results = await searchTavily(query, maxResults, config.keys[backend].trim());
             break;
@@ -476,9 +581,9 @@ export default function (pi: ExtensionAPI) {
         const lines = results.map(
           (r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`,
         );
-        return text(`Search results for "${query}" (${backend}, ${results.length} results):\n\n${lines.join("\n\n")}`);
+        return text(`Search results for "${query}" (${headerLabel}, ${results.length} results):\n\n${lines.join("\n\n")}`);
       } catch (err: any) {
-        return text(`web_search failed (${backend}): ${err?.message || String(err)}`, true);
+        return text(`web_search failed (${headerLabel}): ${err?.message || String(err)}`, true);
       }
     },
   });
