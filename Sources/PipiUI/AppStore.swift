@@ -277,6 +277,14 @@ final class AppStore: ObservableObject {
     /// Bumped when skill enable/disable toggles change so slash menu refreshes.
     @Published var skillVisibilityRevision: Int = 0
 
+    // MARK: - pi 更新检查
+
+    @Published private(set) var piUpdateInfo = PiVersionInfo()
+    @Published private(set) var piIsChecking = false
+    @Published private(set) var piIsUpdating = false
+    @Published private(set) var piUpdateLog = ""
+    @Published var isPiUpdatePresented = false
+
     /// Restart every open pi RPC process so auth.json changes take effect.
     func restartAllOpenSessions() {
         for key in Array(openSessions.keys) {
@@ -2082,6 +2090,106 @@ final class AppStore: ObservableObject {
 
     @MainActor func startAutomations() {
         automations.start()
+        checkPiUpdateNow()
+    }
+
+    // MARK: - pi 更新检查
+
+    /// Check the installed pi version against the npm registry latest. Swift/async,
+    /// runs on the main actor; network failure just records an error (never blocks UI).
+    @MainActor
+    func checkPiUpdateNow() {
+        guard !piIsChecking else { return }
+        piIsChecking = true
+        Task {
+            let installed = PiVersionChecker.installedVersion()
+            let latest = await PiVersionChecker.latestVersion()
+            let now = Date()
+            let error = installed == nil
+                ? "未能定位已安装的 pi 可执行文件"
+                : (latest == nil ? "无法获取最新版本（网络失败或超时）" : nil)
+            piUpdateInfo = PiVersionInfo(
+                installed: installed,
+                latest: latest,
+                checkedAt: now,
+                error: error
+            )
+            piIsChecking = false
+            Log.info(
+                "pi update check -> installed=\(installed ?? "nil") latest=\(latest ?? "nil") update=\(piUpdateInfo.updateAvailable)",
+                category: .app
+            )
+        }
+    }
+
+    /// Re-run the pi update check.
+    @MainActor
+    func refreshPiUpdate() {
+        checkPiUpdateNow()
+    }
+
+    /// Run `pi update -na` to update pi itself, capturing output into `piUpdateLog`.
+    @MainActor
+    func runPiUpdate() {
+        guard !piIsUpdating, let executable = PiProcess.findPiExecutable() else { return }
+        piIsUpdating = true
+        piUpdateLog = ""
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: executable)
+        proc.arguments = ["update", "-na"]
+        proc.environment = ProcessInfo.processInfo.environment
+
+        let out = Pipe()
+        let err = Pipe()
+        proc.standardOutput = out
+        proc.standardError = err
+        out.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let text = String(data: handle.availableData, encoding: .utf8) ?? ""
+            guard !text.isEmpty else { return }
+            DispatchQueue.main.async { self?.appendPiUpdateLog(text) }
+        }
+        err.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let text = String(data: handle.availableData, encoding: .utf8) ?? ""
+            guard !text.isEmpty else { return }
+            DispatchQueue.main.async { self?.appendPiUpdateLog(text) }
+        }
+
+        let timeoutItem = DispatchWorkItem {
+            if proc.isRunning { proc.terminate() }
+        }
+
+        proc.terminationHandler = { [weak self] p in
+            DispatchQueue.main.async {
+                timeoutItem.cancel()
+                guard let self else { return }
+                if p.terminationStatus == 0 {
+                    self.appendPiUpdateLog("\n[完成] pi 更新成功")
+                } else {
+                    self.appendPiUpdateLog("\n[结束] pi 更新进程退出码 \(p.terminationStatus)")
+                }
+                self.piIsUpdating = false
+                self.checkPiUpdateNow()
+            }
+        }
+
+        do {
+            try proc.run()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 120, execute: timeoutItem)
+        } catch {
+            timeoutItem.cancel()
+            piUpdateLog += "\n[错误] 无法启动 pi 更新：\(error.localizedDescription)"
+            piIsUpdating = false
+        }
+    }
+
+    /// Append incremental output to the update log (main thread).
+    @MainActor
+    private func appendPiUpdateLog(_ text: String) {
+        if piUpdateLog.isEmpty {
+            piUpdateLog = text
+        } else {
+            piUpdateLog += text
+        }
     }
 
     func presentAutomations() {

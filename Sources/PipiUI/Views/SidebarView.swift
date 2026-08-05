@@ -155,6 +155,8 @@ struct SidebarView: View {
                 .help("Subagent 模型")
                 .accessibilityLabel("Subagent 模型")
 
+                piUpdateIndicatorButton
+
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, Self.sidebarGutter + 2)
@@ -244,6 +246,39 @@ struct SidebarView: View {
             RemoteConnectionSheet()
                 .environmentObject(store)
                 .dismissOnOutsideClick { showRemoteConnection = false }
+        }
+        .sheet(isPresented: $store.isPiUpdatePresented) {
+            PiUpdateSheet()
+                .environmentObject(store)
+        }
+    }
+
+    /// Bottom sidebar indicator for pi update availability.
+    @ViewBuilder
+    private var piUpdateIndicatorButton: some View {
+        if store.piIsChecking {
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 22, height: 22)
+                .accessibilityLabel("正在检查 pi 更新")
+        } else if store.piUpdateInfo.updateAvailable, let latest = store.piUpdateInfo.latest {
+            Button {
+                store.isPiUpdatePresented = true
+            } label: {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.body)
+                    .frame(width: 22, height: 22)
+                    .foregroundStyle(Color.orange)
+                    .background(alignment: .topTrailing) {
+                        Circle()
+                            .fill(Color.red)
+                            .frame(width: 7, height: 7)
+                            .offset(x: 2, y: -2)
+                    }
+            }
+            .buttonStyle(HoverButtonStyle())
+            .help("pi 有新版本可用 (最新 \(latest))")
+            .accessibilityLabel("pi 有新版本可用，点击更新")
         }
     }
 
