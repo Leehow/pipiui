@@ -73,6 +73,25 @@ enum VisionFallback {
         shouldCaption(supportsImages: supportsImages, hasImages: hasImages) && mode != .off
     }
 
+    /// 超时竞速：返回 `primary` 的结果；若 `nanoseconds` 内未完成则返回 `fallback`。
+    /// 供发送链兜底，保证 caption 解析/描述任何情况下都不会阻塞 deliver（全白根因）。
+    static func raceCaptioned(
+        _ primary: @escaping () async -> String,
+        fallback: String,
+        nanoseconds deadline: UInt64
+    ) async -> String {
+        await withThrowingTaskGroup(of: String.self) { group -> String in
+            group.addTask { await primary() }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: deadline)
+                return fallback
+            }
+            let first = (try? await group.next()) ?? fallback
+            group.cancelAll()
+            return first
+        }
+    }
+
     /// 从选中的已配置模型（`provider/modelId`）解析 OpenAI 兼容 endpoint 并构造
     /// caption 配置。解析失败（无 baseUrl / 无 key / 非 OpenAI 兼容）返回 nil，
     /// 调用方据此降级到 OCR-only，绝不 crash。

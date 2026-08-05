@@ -3632,6 +3632,10 @@ final class ChatSession: ObservableObject, Identifiable {
         return (message, images)
     }
 
+    /// 硬超时：caption 全链路（helper 解析 + 云端描述）整体上限，超时用原文兜底，
+    /// 保证发送链绝不会静默卡死（全白无气泡/无 SSE 的根因修复）。
+    private static let captionWithDeadlineNanos: UInt64 = 20_000_000_000
+
     private enum VisionFallbackDelivery {
         /// Composer path: enqueue when busy, otherwise send now.
         case queueOrSend
@@ -3672,40 +3676,70 @@ final class ChatSession: ObservableObject, Identifiable {
 
         let mode = settings.mode
         let imagePairs = images.map { ($0.data, $0.mimeType) }
+        // 关键时序修复：用户气泡在 caption 开始前就发射，与「仅 OCR / 关闭」一致，
+        // 避免发送链被 caption 的异步等待拖住导致全白无输出。caption 只影响最终
+        // 文本（RPC message），气泡先显示用户原文，caption 完成后原地更新。
+        let optimisticId = appendOptimisticUserMessage(message: preparedMessage, images: images)
         Task { [weak self] in
-            // 云端配置在后台解析：手填 endpoint 直接用；已配置模型走 helper 解析（可能
-            // 无 baseUrl / 无 key / 非 OpenAI 兼容）。解析失败 → nil → 降级 OCR-only，不 crash。
-            var cloudConfig: VisionCaptionConfig?
-            if mode == .ocrAndCloud {
-                if settings.cloudSource == .manual {
-                    cloudConfig = settings.captionConfig
-                } else if settings.hasConfiguredModel {
-                    cloudConfig = await VisionFallback.configuredModelConfig(
-                        modelRef: settings.cloudModelRef,
-                        maxTokens: settings.maxTokens
-                    )
-                    if cloudConfig == nil {
-                        Log.warn("vision fallback: 解析已配置模型 \(settings.cloudModelRef) 失败，降级 OCR-only", category: .session)
-                    }
-                }
-            }
-            let finalMessage = await VisionFallback.enrichMessage(
-                userText: preparedMessage,
-                images: imagePairs,
-                mode: mode,
-                cloudConfig: cloudConfig
-            )
             guard let self else { return }
+            let finalMessage = await self.captionWithDeadline(
+                preparedMessage: preparedMessage,
+                imagePairs: imagePairs,
+                mode: mode,
+                settings: settings
+            )
             await MainActor.run {
+                // 把气泡文本更新为最终（可能带 caption 的）消息，保证与 RPC 一致、
+                // 与之后 pi 回显的 user 消息 dedup 命中。
+                self.updateOptimisticText(id: optimisticId, text: finalMessage)
                 self.finishVisionFallbackDelivery(
                     message: finalMessage,
                     images: images,
                     searchGrantPolicy: searchGrantPolicy,
                     delivery: delivery,
-                    stripImagesForRPC: true
+                    stripImagesForRPC: true,
+                    appendOptimisticBubble: false
                 )
             }
         }
+    }
+
+    /// 硬超时包装：把云端解析 + OCR/cloud caption 整体限制在 deadline 内，超时则
+    /// 用原始 `preparedMessage` 兜底返回，保证 deliver 必然执行（绝不全白卡死）。
+    private func captionWithDeadline(
+        preparedMessage: String,
+        imagePairs: [(Data, String)],
+        mode: VisionFallbackSettings.Mode,
+        settings: VisionFallbackSettings.Snapshot
+    ) async -> String {
+        await VisionFallback.raceCaptioned(
+            {
+                // 云端配置后台解析：手填 endpoint 直接用；已配置模型走 helper 解析
+                // （可能无 baseUrl / 无 key / 非 OpenAI 兼容）。失败 → nil → 降级 OCR-only。
+                var cloudConfig: VisionCaptionConfig?
+                if mode == .ocrAndCloud {
+                    if settings.cloudSource == .manual {
+                        cloudConfig = settings.captionConfig
+                    } else if settings.hasConfiguredModel {
+                        cloudConfig = await VisionFallback.configuredModelConfig(
+                            modelRef: settings.cloudModelRef,
+                            maxTokens: settings.maxTokens
+                        )
+                        if cloudConfig == nil {
+                            Log.warn("vision fallback: 解析已配置模型 \(settings.cloudModelRef) 失败，降级 OCR-only", category: .session)
+                        }
+                    }
+                }
+                return await VisionFallback.enrichMessage(
+                    userText: preparedMessage,
+                    images: imagePairs,
+                    mode: mode,
+                    cloudConfig: cloudConfig
+                )
+            },
+            fallback: preparedMessage,
+            nanoseconds: Self.captionWithDeadlineNanos
+        )
     }
 
     private func finishVisionFallbackDelivery(
@@ -3713,7 +3747,8 @@ final class ChatSession: ObservableObject, Identifiable {
         images: [DraftImage],
         searchGrantPolicy: PromptSearchGrantPolicy,
         delivery: VisionFallbackDelivery,
-        stripImagesForRPC: Bool
+        stripImagesForRPC: Bool,
+        appendOptimisticBubble: Bool = true
     ) {
         switch delivery {
         case .queueOrSend:
@@ -3721,14 +3756,16 @@ final class ChatSession: ObservableObject, Identifiable {
                 message: message,
                 images: images,
                 searchGrantPolicy: searchGrantPolicy,
-                stripImagesForRPC: stripImagesForRPC
+                stripImagesForRPC: stripImagesForRPC,
+                appendOptimisticBubble: appendOptimisticBubble
             )
         case .sendNowOnly:
             sendPromptNow(
                 message: message,
                 images: images,
                 searchGrantPolicy: searchGrantPolicy,
-                stripImagesForRPC: stripImagesForRPC
+                stripImagesForRPC: stripImagesForRPC,
+                appendOptimisticBubble: appendOptimisticBubble
             )
         }
     }
@@ -3737,7 +3774,8 @@ final class ChatSession: ObservableObject, Identifiable {
         message: String,
         images: [DraftImage],
         searchGrantPolicy: PromptSearchGrantPolicy,
-        stripImagesForRPC: Bool
+        stripImagesForRPC: Bool,
+        appendOptimisticBubble: Bool = true
     ) {
         // Busy while streaming OR in the gap after drain popped until agent_start.
         if isStreaming || isSendingFromQueue {
@@ -3745,7 +3783,8 @@ final class ChatSession: ObservableObject, Identifiable {
                 text: message,
                 images: images,
                 searchGrantPolicy: searchGrantPolicy,
-                stripImagesForRPC: stripImagesForRPC
+                stripImagesForRPC: stripImagesForRPC,
+                appendOptimisticBubble: appendOptimisticBubble
             )
             if ok { publishQueue() }
             return
@@ -3754,7 +3793,8 @@ final class ChatSession: ObservableObject, Identifiable {
             message: message,
             images: images,
             searchGrantPolicy: searchGrantPolicy,
-            stripImagesForRPC: stripImagesForRPC
+            stripImagesForRPC: stripImagesForRPC,
+            appendOptimisticBubble: appendOptimisticBubble
         )
     }
 
@@ -3764,7 +3804,8 @@ final class ChatSession: ObservableObject, Identifiable {
         images: [DraftImage],
         requeueOnFailure: QueuedMessage? = nil,
         searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths,
-        stripImagesForRPC: Bool = false
+        stripImagesForRPC: Bool = false,
+        appendOptimisticBubble: Bool = true
     ) -> Bool {
         do {
             try SearchScopeExtension.applyPromptPolicy(
@@ -3801,7 +3842,10 @@ final class ChatSession: ObservableObject, Identifiable {
         }
 
         // Optimistic user bubble (text + images) so thumbnails appear before message_end.
-        appendOptimisticUserMessage(message: message, images: images)
+        // Vision-caption path already emitted the bubble up front (appendOptimisticBubble=false).
+        if appendOptimisticBubble {
+            appendOptimisticUserMessage(message: message, images: images)
+        }
 
         // Cover first-send / drain gap before agent_start so sidebar shows spinner, not green.
         isSendingFromQueue = true
@@ -3843,7 +3887,9 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     /// Local user row before pi `message_end` (deduped on ingest).
-    private func appendOptimisticUserMessage(message: String, images: [DraftImage]) {
+    /// Returns the appended item's id so the caption path can update its text in place.
+    @discardableResult
+    private func appendOptimisticUserMessage(message: String, images: [DraftImage]) -> String {
         var blocks: [ChatBlock] = []
         let paths = ImageAttachment.attachmentPaths(fromMessageText: message)
         for (i, img) in images.enumerated() {
@@ -3858,8 +3904,35 @@ final class ChatSession: ObservableObject, Identifiable {
         if !message.isEmpty {
             blocks.append(.text(message))
         }
-        guard !blocks.isEmpty else { return }
-        transcript.append(ChatItem(id: nextItemId(), role: "user", blocks: blocks))
+        guard !blocks.isEmpty else { return "" }
+        let id = nextItemId()
+        transcript.append(ChatItem(id: id, role: "user", blocks: blocks))
+        return id
+    }
+
+    /// In-place replace the optimistic bubble's text block with the final (captioned) text,
+    /// keeping image thumbnails. No-op if the item is gone (e.g. already replaced on ingest).
+    private func updateOptimisticText(id: String, text: String) {
+        guard let idx = transcript.firstIndex(where: { $0.id == id }) else { return }
+        var item = transcript[idx]
+        var blocks: [ChatBlock] = []
+        var textWritten = false
+        for block in item.blocks {
+            switch block {
+            case .text:
+                if !textWritten {
+                    blocks.append(.text(text))
+                    textWritten = true
+                }
+            default:
+                blocks.append(block)
+            }
+        }
+        if !textWritten, !text.isEmpty {
+            blocks.append(.text(text))
+        }
+        item.blocks = blocks
+        transcript[idx] = item
     }
 
     private func publishQueue() {
@@ -4063,7 +4136,8 @@ final class ChatSession: ObservableObject, Identifiable {
                 images: joined.images,
                 requeueOnFailure: joined,
                 searchGrantPolicy: joined.searchGrantPolicy,
-                stripImagesForRPC: joined.stripImagesForRPC
+                stripImagesForRPC: joined.stripImagesForRPC,
+                appendOptimisticBubble: joined.appendOptimisticBubble
             )
             return
         }
@@ -4084,7 +4158,8 @@ final class ChatSession: ObservableObject, Identifiable {
             images: msg.images,
             requeueOnFailure: msg,
             searchGrantPolicy: msg.searchGrantPolicy,
-            stripImagesForRPC: msg.stripImagesForRPC
+            stripImagesForRPC: msg.stripImagesForRPC,
+            appendOptimisticBubble: msg.appendOptimisticBubble
         )
     }
 
