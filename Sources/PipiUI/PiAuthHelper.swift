@@ -131,7 +131,8 @@ enum PiAuthHelper {
     /// no resolvable baseUrl / key or its wire format is not OpenAI-compatible.
     static func providerEndpoint(provider: String, modelId: String) async throws -> ProviderEndpoint {
         let dotEnv = EnvFileStore().all()
-        let json = try await run(arguments: ["provider-endpoint", provider, modelId], environmentOverlay: dotEnv)
+        // 纯 fs 读取，应为毫秒级；5s 硬超时兜底，避免 node 进程异常挂起。
+        let json = try await run(arguments: ["provider-endpoint", provider, modelId], timeout: 5, environmentOverlay: dotEnv)
         guard let baseURL = json["baseURL"] as? String, !baseURL.isEmpty else {
             throw HelperError.failed("provider-endpoint 未返回 baseURL")
         }

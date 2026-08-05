@@ -342,6 +342,46 @@ final class VisionFallbackTests: XCTestCase {
         )
     }
 
+    // MARK: - caption 超时/失败仍 deliver（发送链不得静默卡死）
+
+    func testRaceCaptionedFallsBackOnSlowCaption() async {
+        let result = await VisionFallback.raceCaptioned(
+            {
+                try? await Task.sleep(nanoseconds: 200_000_000) // 200ms 慢 caption
+                return "CAPTIONED"
+            },
+            fallback: "ORIGINAL",
+            nanoseconds: 50_000_000 // 50ms 超时
+        )
+        XCTAssertEqual(result, "ORIGINAL", "超时应回退原文，保证 deliver 不等待")
+    }
+
+    func testRaceCaptionedUsesFastCaption() async {
+        let result = await VisionFallback.raceCaptioned(
+            { "CAPTIONED_FAST" },
+            fallback: "ORIGINAL",
+            nanoseconds: 5_000_000_000
+        )
+        XCTAssertEqual(result, "CAPTIONED_FAST")
+    }
+
+    func testStripDecisionIndependentOfCaptionResolution() {
+        // 非视觉模型带图：无论云端配置能否解析、caption 是否注入，出站 RPC 一律剥图
+        // （避免 DeepSeek 拒图），且发送链必须 deliver（不允许被 caption 阻塞静默）。
+        for mode in [VisionFallbackSettings.Mode.ocrOnly, .ocrAndCloud] {
+            XCTAssertTrue(
+                VisionFallback.shouldCaptionAndStripImages(supportsImages: false, hasImages: true, mode: mode),
+                "mode=\(mode) 应剥图"
+            )
+        }
+        // 超时/失败兜底：caption 为空时原文直接作为最终消息，仍可送达。
+        XCTAssertEqual(VisionFallback.mergeIntoMessage(userText: "原文", captionBlock: ""), "原文")
+        // 视觉模型 / 无图 / 关闭：不剥图。
+        XCTAssertFalse(VisionFallback.shouldCaptionAndStripImages(supportsImages: true, hasImages: true, mode: .ocrAndCloud))
+        XCTAssertFalse(VisionFallback.shouldCaptionAndStripImages(supportsImages: false, hasImages: false, mode: .ocrAndCloud))
+        XCTAssertFalse(VisionFallback.shouldCaptionAndStripImages(supportsImages: false, hasImages: true, mode: .off))
+    }
+
     func testShouldCaptionAndStripImages() {
         // Non-vision model with images + cloud/ocr mode → caption + strip RPC images.
         XCTAssertTrue(VisionFallback.shouldCaptionAndStripImages(supportsImages: false, hasImages: true, mode: .ocrAndCloud))
