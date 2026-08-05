@@ -45,13 +45,7 @@ Pipi UI 把所有 API key 集中存放在 `~/.pi/agent/.env` 一个文件里，�
 
 搜索后端（`ProviderEnvMap.searchEnvVars`）：
 
-| 后端 | 环境变量 |
-|---|---|
-| Tavily | `TAVILY_API_KEY` |
-| Brave | `BRAVE_API_KEY` |
-| SerpAPI | `SERPAPI_API_KEY` |
-| Exa | `EXA_API_KEY` |
-| Kimi | `KIMI_API_KEY`（也可复用 auth.json `kimi-coding`） |
+web_search 已改 Firecrawl 免 key 搜索，无搜索后端 API key 需要管理（表为空）。
 
 ## 各链路如何消费 .env
 
@@ -59,10 +53,7 @@ Pipi UI 把所有 API key 集中存放在 `~/.pi/agent/.env` 一个文件里，�
   把 `.env` 全量键值注入子进程环境作为**底层**；`PIPIUI_*` 开头的内部键
   永远在顶层、不可被 `.env` 覆盖。因此**改模型 key 需要重启会话才生效**
   （环境变量只在 spawn 那一刻确定）。密钥键值不会进日志。
-- **搜索 key**：`WebSearchExtension.swift` 每次执行搜索时**热读** `.env`
-  （文件小于 1KB，同步小读），改完立即生效、不用重启会话。过渡期内
-  `~/Library/Application Support/PipiUI/websearch-config.json` 里的旧
-  `keys` 字段仍作为 fallback（`.env` 优先），过渡期结束后移除。
+- **搜索 key**：`WebSearchExtension.swift` 使用 Firecrawl 免 key 搜索，无需任何 key 或后端配置。过渡期内 `~/Library/Application Support/PipiUI/websearch-config.json` 里的 backend 值被忽略（固定 firecrawl）。
 - **OAuth 凭据**：`type: "oauth"` 的条目**永远留在** `~/.pi/agent/auth.json`，
   迁移不碰、添加模型不碰、清理冲突也不碰——refresh token 会轮转，必须
   留在 pi 自己管理的 auth.json 里。`.env` 只装 `api_key` 类型的静态密钥。
@@ -90,8 +81,10 @@ Pipi UI 把所有 API key 集中存放在 `~/.pi/agent/.env` 一个文件里，�
    权限 0600）；
 2. 把 auth.json 里所有 `type: "api_key"` 的条目按映射表写入 `.env`
    （**`.env` 已有非空值时保留用户手改，绝不覆盖**）；
-3. 同时合并旧位置的搜索 key：UserDefaults `pipiui.webSearch.keys` 和
-   `websearch-config.json` 的 `keys` 字段（先到先得，`.env` 已有值仍赢）；
+3. 同时合并旧位置的搜索 key（UserDefaults `pipiui.webSearch.keys` 和
+   `websearch-config.json` 的 `keys` 字段）写入 `.env`（先到先得，`.env`
+   已有值仍赢）；搜索已改 Firecrawl 免 key，此步骤仅清理旧数据，不再有
+   实际搜索后端消费这些 key；
 4. 从 auth.json 删除已迁移的 `api_key` 条目（oauth 永不动），清空上述
    两个旧存储；
 5. 写 UserDefaults 标记 `pipiui.authMigration.v1.done`（幂等，之后启动

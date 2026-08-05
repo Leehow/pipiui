@@ -64,6 +64,8 @@ final class AuthMigrationTests: XCTestCase {
         ])
         defaults.set(["tavily": "tvly-1", "brave": "brave-ud"], forKey: AuthMigration.legacyWebSearchKeysKey)
         try writeConfigJSON([
+            // Legacy search keys are no longer mapped (Firecrawl keyless); migration
+            // clears these stores but does not write them to .env.
             "backend": "tavily",
             "keys": ["brave": "brave-json", "serpapi": "serp-9"],
         ])
@@ -75,15 +77,15 @@ final class AuthMigrationTests: XCTestCase {
         try seedFullFixture()
         let result = AuthMigration.migrateIfNeeded(options: options)
 
-        // .env content: auth.json keys + UserDefaults keys win over JSON keys
+        // .env content: only model provider keys (auth.json); legacy search keys are
+        // no longer mapped to any env var because web_search is Firecrawl keyless.
         let env = envStore.all()
         XCTAssertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-123")
         XCTAssertEqual(env["XAI_API_KEY"], "xai-abc")
-        XCTAssertEqual(env["TAVILY_API_KEY"], "tvly-1")
-        XCTAssertEqual(env["BRAVE_API_KEY"], "brave-ud") // UserDefaults before JSON
-        XCTAssertEqual(env["SERPAPI_API_KEY"], "serp-9")
-        XCTAssertEqual(Set(result.envWritten),
-                       ["ANTHROPIC_API_KEY", "XAI_API_KEY", "TAVILY_API_KEY", "BRAVE_API_KEY", "SERPAPI_API_KEY"])
+        XCTAssertNil(env["TAVILY_API_KEY"])
+        XCTAssertNil(env["BRAVE_API_KEY"])
+        XCTAssertNil(env["SERPAPI_API_KEY"])
+        XCTAssertEqual(Set(result.envWritten), ["ANTHROPIC_API_KEY", "XAI_API_KEY"])
 
         // auth.json: only oauth + unknown-provider api_key remain
         let auth = readJSON(authURL)

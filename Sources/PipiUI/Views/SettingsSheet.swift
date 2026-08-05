@@ -53,10 +53,6 @@ struct SettingsSheet: View {
     /// `BuiltInFeatureSettings` defaults so first launch shows everything on.
     @State private var builtInDisabled: Set<String> = BuiltInFeatureSettings.disabledIDs()
     @State private var webSearchBackend: String = WebSearchSettings.backend()
-    /// 输入缓冲：永不回显已存 key；留空 = 不修改。
-    @State private var webSearchApiKey: String = ""
-    /// 当前后端 key 是否已在 .env 配置（驱动 placeholder /「清除」按钮）。
-    @State private var webSearchKeyConfigured = false
     /// 图片转文字（非多模态模型看图）
     @State private var visionFallbackSelection: String = VisionFallback.unifiedSelection(for: VisionFallbackSettings.load())
     @State private var visionFallbackBaseURL: String = VisionFallbackSettings.load().baseURL
@@ -1486,52 +1482,9 @@ struct SettingsSheet: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("网络搜索")
                 .font(.title3.weight(.semibold))
-            Text("为不带联网搜索的模型（Kimi 等）提供 web_search / web_fetch 工具。当前模型若自带搜索（Grok、GLM、官方 Codex、Claude），web_search 会自动跳过。")
+            Text("为不带联网搜索的模型（Kimi 等）提供 web_search / web_fetch 工具。web_search 使用 Firecrawl 免 key 搜索，无需任何配置。当前模型若自带搜索（Grok、GLM、官方 Codex、Claude），web_search 会自动跳过；必要时可用 force 参数强制执行。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-
-            VStack(alignment: .leading, spacing: 10) {
-                Picker("搜索后端", selection: $webSearchBackend) {
-                    Text("内置浏览器（built-in browser）").tag("browser")
-                    Text("DuckDuckGo（免费，无需 key）").tag("duckduckgo")
-                    Text("Tavily").tag("tavily")
-                    Text("Brave Search").tag("brave")
-                    Text("SerpAPI (Google)").tag("serpapi")
-                    Text("Exa AI").tag("exa")
-                    Text("Kimi Code").tag("kimi")
-                }
-                .onChange(of: webSearchBackend) { _, newValue in
-                    WebSearchSettings.setBackend(newValue)
-                    // 输入缓冲不回显：切后端后清空，仅刷新「已配置」状态。
-                    webSearchApiKey = ""
-                    webSearchKeyConfigured = WebSearchSettings.isKeyConfigured(for: newValue, store: envStore)
-                    statusMessage = "搜索后端已切换为 \(newValue)（立即生效，无需重启会话）"
-                }
-
-                if webSearchBackend != "duckduckgo" {
-                    HStack(spacing: 8) {
-                        SecureField(
-                            webSearchKeyConfigured ? "已配置，输入以替换" : "未配置",
-                            text: $webSearchApiKey
-                        )
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { saveWebSearchKey() }
-                        Button("保存") { saveWebSearchKey() }
-                            .disabled(webSearchApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        if webSearchKeyConfigured {
-                            Button("清除") { clearWebSearchKey() }
-                        }
-                    }
-                    Text("留空 = 不修改；key 保存在 ~/.pi/agent/.env（\(WebSearchSettings.envVar(for: webSearchBackend) ?? "")）。")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                    Text(backendHelpText)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            .padding(10)
-            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
 
             if let model = store.currentSession?.model,
                WebSearchSettings.isNativeSearchModel(provider: model.provider, modelId: model.modelId) {
@@ -1540,7 +1493,7 @@ struct SettingsSheet: View {
                     .foregroundStyle(.orange)
             }
 
-            Text("设置修改后立即对新的工具调用生效（热读取），无需重启会话。后端选择存于 websearch-config.json；API key 以 0600 权限存于 ~/.pi/agent/.env。")
+            Text("web_search 通过 Firecrawl 免 key 执行，无需 API key 或后端配置。")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
@@ -1684,30 +1637,6 @@ struct SettingsSheet: View {
     }
 
     /// 显式「保存」/ 回车提交：留空 = 不修改。
-    private func saveWebSearchKey() {
-        let trimmed = webSearchApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        do {
-            try WebSearchSettings.setApiKey(trimmed, for: webSearchBackend, store: envStore)
-            webSearchApiKey = ""
-            webSearchKeyConfigured = true
-            statusMessage = "已保存 \(webSearchBackend) 的 API key 到 ~/.pi/agent/.env"
-        } catch {
-            errorMessage = "保存搜索 key 失败：\(error.localizedDescription)"
-        }
-    }
-
-    private func clearWebSearchKey() {
-        do {
-            try WebSearchSettings.setApiKey(nil, for: webSearchBackend, store: envStore)
-            webSearchApiKey = ""
-            webSearchKeyConfigured = false
-            statusMessage = "已从 .env 清除 \(webSearchBackend) 的 API key"
-        } catch {
-            errorMessage = "清除搜索 key 失败：\(error.localizedDescription)"
-        }
-    }
-
     /// 冲突警告的「清理」：删除 auth.json 中该 provider 的 api_key 残留（oauth 不动）。
     @MainActor
     private func cleanupStaleAuthKey(_ providerId: String) async {
@@ -1722,18 +1651,6 @@ struct SettingsSheet: View {
             }
         } catch {
             errorMessage = "清理失败：\(error.localizedDescription)"
-        }
-    }
-
-    private var backendHelpText: String {
-        switch webSearchBackend {
-        case "tavily": return "在 tavily.com 注册获取 API key（免费 1000 次/月）。"
-        case "brave": return "在 brave.com/search/api 注册获取 Subscription Token（免费 2000 次/月）。"
-        case "serpapi": return "在 serpapi.com 注册获取 API key（免费 100 次/月）。"
-        case "exa": return "在 exa.ai 注册获取 API key（免费 1000 次/月，语义搜索）。"
-        case "kimi":
-            return "使用 Kimi Code 会员搜索（api.kimi.com/coding/v1/search）。可写 .env 的 KIMI_API_KEY，或复用已登录的 kimi-coding（auth.json）。"
-        default: return ""
         }
     }
 
@@ -1777,7 +1694,6 @@ struct SettingsSheet: View {
         var disabledSkills: Set<String>
         var builtInDisabled: Set<String>
         var webSearchBackend: String
-        var webSearchKeyConfigured: Bool
         var envConfiguredProviders: Set<String>
         var visionFallback: VisionFallbackSettings.Snapshot
     }
@@ -1803,7 +1719,6 @@ struct SettingsSheet: View {
             disabledSkills: ToolSkillSettings.disabledSkills(),
             builtInDisabled: BuiltInFeatureSettings.disabledIDs(),
             webSearchBackend: backend,
-            webSearchKeyConfigured: WebSearchSettings.isKeyConfigured(for: backend, store: envStore),
             envConfiguredProviders: envConfigured,
             visionFallback: VisionFallbackSettings.load()
         )
@@ -1828,7 +1743,6 @@ struct SettingsSheet: View {
         disabledSkills = snapshot.disabledSkills
         builtInDisabled = snapshot.builtInDisabled
         webSearchBackend = snapshot.webSearchBackend
-        webSearchKeyConfigured = snapshot.webSearchKeyConfigured
         envConfiguredProviders = snapshot.envConfiguredProviders
         visionFallbackSelection = VisionFallback.unifiedSelection(for: snapshot.visionFallback)
         visionFallbackBaseURL = snapshot.visionFallback.baseURL

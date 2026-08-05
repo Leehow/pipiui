@@ -27,7 +27,7 @@ enum ToolSkillCatalog {
         .init(name: "browser_*", group: "扩展", summary: "应用内 WebView 浏览器工具（browser）"),
         .init(name: "computer", group: "扩展", summary: "安全闸门控制的 macOS 屏幕与输入（默认关闭）"),
         .init(name: "git", group: "扩展", summary: "结构化 git status / capped diff"),
-        .init(name: "web_search", group: "扩展", summary: "联网搜索（Tavily / Brave / SerpAPI / Exa / Kimi / DuckDuckGo）"),
+        .init(name: "web_search", group: "扩展", summary: "联网搜索（Firecrawl 免 key）"),
         .init(name: "web_fetch", group: "扩展", summary: "抓取网页正文文本"),
     ]
 

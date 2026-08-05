@@ -176,12 +176,6 @@ enum PipiSpawnAssembly {
             // whose provider ships it; this is the fallback that makes an `explore` worker
             // able to search regardless of which model it happens to run on.
             env["PIPIUI_WEBSEARCH_EXT"] = p
-            // Let the embedded web_search backend reach the per-session built-in browser
-            // over the loopback bridge RPC (mirrors the webview-extension pattern).
-            if input.bridgePort > 0 {
-                env["PIPIUI_BRIDGE_PORT"] = String(input.bridgePort)
-                env["PIPIUI_SESSION_KEY"] = input.bridgeRoutingKey
-            }
         }
 
         // Main session only: dispatched workers stay fully skill-free.

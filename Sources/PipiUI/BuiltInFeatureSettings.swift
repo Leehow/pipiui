@@ -112,7 +112,7 @@ enum BuiltInFeatureSettings {
         .init(id: .webSearch,
               section: .extensionTool,
               title: "web_search / web_fetch",
-              summary: "为不带联网搜索的模型补充搜索/抓取工具（后端在「通用」里配置）。"),
+              summary: "为不带联网搜索的模型补充搜索/抓取工具（Firecrawl 免 key 搜索，无需配置）。"),
         .init(id: .codexServerTools,
               section: .extensionTool,
               title: "Codex hosted 搜索",
