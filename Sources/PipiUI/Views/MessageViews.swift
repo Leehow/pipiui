@@ -35,6 +35,8 @@ struct MessageRow: View, Equatable {
     var presentationScopeID: String = ""
     var isWorking: Bool = false
     var isEditing: Bool = false
+    /// Vision-fallback caption 刚落地的那条用户气泡：本次默认展开，caption 不被折叠预览吞掉。
+    var forceExpandedUserBubble: Bool = false
     var onFlash: ((String) -> Void)? = nil
     var onSelectAgent: ((String) -> Void)?
     var onOpenFinishedGroup: ((AssistantBlockLayout.FinishedGroupPresentation) -> Void)?
@@ -59,6 +61,7 @@ struct MessageRow: View, Equatable {
             && lhs.presentationScopeID == rhs.presentationScopeID
             && lhs.isWorking == rhs.isWorking
             && lhs.isEditing == rhs.isEditing
+            && lhs.forceExpandedUserBubble == rhs.forceExpandedUserBubble
         // Callbacks intentionally excluded.
     }
 
@@ -155,7 +158,11 @@ struct MessageRow: View, Equatable {
             VStack(alignment: .trailing, spacing: 8) {
                 userImageThumbnails
                 if !userDisplayText.isEmpty {
-                    CollapsibleUserBubbleView(text: userDisplayText, onFlash: onFlash)
+                    CollapsibleUserBubbleView(
+                        text: userDisplayText,
+                        forceExpandedUserBubble: forceExpandedUserBubble,
+                        onFlash: onFlash
+                    )
                 }
             }
             .padding(.horizontal, 14)
@@ -1137,6 +1144,9 @@ enum ThinkingTokenEstimate {
 /// (not `PathLinkedText`) so path-scan / AttributedString work stays off the hot path.
 struct CollapsibleUserBubbleView: View {
     let text: String
+    /// Vision-fallback caption 刚落地时置位：气泡本次默认展开，让追加在末尾的
+    /// caption（折叠预览只取头部，兜不住）直接可见；用户仍可手动收起。
+    var forceExpandedUserBubble: Bool = false
     var onFlash: ((String) -> Void)? = nil
 
     @State private var expanded = false
@@ -1155,6 +1165,16 @@ struct CollapsibleUserBubbleView: View {
     var body: some View {
         if collapses {
             collapsibleBody
+                .onAppear {
+                    if forceExpandedUserBubble && !expanded {
+                        forceExpand()
+                    }
+                }
+                .onChange(of: forceExpandedUserBubble) { _, nowForced in
+                    if nowForced && !expanded {
+                        forceExpand()
+                    }
+                }
         } else {
             PathLinkedText(
                 text: text,
@@ -1240,6 +1260,13 @@ struct CollapsibleUserBubbleView: View {
             guard expanded else { return }
             fullReady = true
         }
+    }
+
+    /// Caption 落地：直接展示全文（跳过「展开中…」动画），用户仍可手动收起。
+    private func forceExpand() {
+        expanded = true
+        fullReady = true
+        fullOpacity = 1
     }
 
     private func collapse() {
@@ -2533,15 +2560,18 @@ enum WaitingPlaceholderChoice: Equatable {
     case media(String)
     case stopping
     case compacting
+    case captioning
     case thinking
 
-    init(mediaBusy: Bool, mediaStatus: String?, isStopping: Bool, isCompacting: Bool) {
+    init(mediaBusy: Bool, mediaStatus: String?, isStopping: Bool, isCompacting: Bool, isCaptioning: Bool = false) {
         if mediaBusy {
             self = .media(mediaStatus ?? "正在处理…")
         } else if isStopping {
             self = .stopping
         } else if isCompacting {
             self = .compacting
+        } else if isCaptioning {
+            self = .captioning
         } else {
             self = .thinking
         }
@@ -2552,6 +2582,7 @@ enum WaitingPlaceholderChoice: Equatable {
         case .media(let status): return status
         case .stopping: return "正在停止…"
         case .compacting: return "正在压缩上下文…"
+        case .captioning: return "正在识别图片…"
         case .thinking: return "AI 正在思考…"
         }
     }

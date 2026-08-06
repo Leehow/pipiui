@@ -254,6 +254,51 @@ final class CompactionLifecycleTests: XCTestCase {
         XCTAssertEqual(choice.message, "正在生成图片")
     }
 
+    func testWaitingPlaceholderChoiceShowsCaptioningDuringVisionFallback() {
+        let choice = WaitingPlaceholderChoice(
+            mediaBusy: false,
+            mediaStatus: nil,
+            isStopping: false,
+            isCompacting: false,
+            isCaptioning: true
+        )
+        XCTAssertEqual(choice, .captioning)
+        XCTAssertEqual(choice.message, "正在识别图片…")
+        XCTAssertFalse(choice.usesCompactionTimer, "caption placeholder must use the turn timer")
+    }
+
+    func testWaitingPlaceholderChoiceKeepsStoppingOverCaptioning() {
+        let choice = WaitingPlaceholderChoice(
+            mediaBusy: false,
+            mediaStatus: nil,
+            isStopping: true,
+            isCompacting: false,
+            isCaptioning: true
+        )
+        XCTAssertEqual(choice.message, "正在停止…")
+    }
+
+    func testWaitingPlaceholderChoiceKeepsCompactingOverCaptioning() {
+        let choice = WaitingPlaceholderChoice(
+            mediaBusy: false,
+            mediaStatus: nil,
+            isStopping: false,
+            isCompacting: true,
+            isCaptioning: true
+        )
+        XCTAssertEqual(choice.message, "正在压缩上下文…")
+    }
+
+    func testWaitingPlaceholderChoiceFallsBackToThinkingWithoutCaptioning() {
+        let choice = WaitingPlaceholderChoice(
+            mediaBusy: false,
+            mediaStatus: nil,
+            isStopping: false,
+            isCompacting: false
+        )
+        XCTAssertEqual(choice.message, "AI 正在思考…")
+    }
+
     // MARK: - 压缩中 Stop 的短升级时间线
 
     func testStopEscalationDuringCompactionUsesShortTimeline() async throws {

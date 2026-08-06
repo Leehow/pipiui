@@ -826,6 +826,14 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Depends on @Published isStreaming + isSendingFromQueue so observers refresh.
     var isWorking: Bool { isStreaming || isSendingFromQueue }
 
+    /// Vision-fallback 图片识别（OCR + 可选云端描述）进行中：RPC 尚未发出，`isWorking`
+    /// 仍为 false，但聊天区需要「正在识别图片…」的进行中反馈。
+    @Published private(set) var visionCaptionInProgress = false
+    /// 刚完成 caption 的用户气泡 transcript item id：让该气泡默认展开一次，保证追加在
+    /// 消息末尾的 caption（长文本折叠预览兜不住）对用户可见；服务端回显该消息
+    /// （ingest 替换乐观气泡）后清除。
+    @Published private(set) var visionCaptionOptimisticID: String?
+
     /// Wall-clock bounds for the most recently submitted boss turn, including its subagents.
     @Published private(set) var turnWallClockStartedAt: Date?
     @Published private(set) var turnWallClockEndedAt: Date?
@@ -2130,6 +2138,10 @@ final class ChatSession: ObservableObject, Identifiable {
                     let keepId = transcript[lastIdx].id
                     transcript[lastIdx] = ChatItem(id: keepId, role: item.role, blocks: item.blocks)
                     appliedId = keepId
+                    // 服务端已回显该消息：caption 展开标记不再需要（气泡本次默认展开已生效）。
+                    if visionCaptionOptimisticID == keepId {
+                        visionCaptionOptimisticID = nil
+                    }
                 } else {
                     transcript.append(item)
                     appliedId = item.id
@@ -3639,7 +3651,7 @@ final class ChatSession: ObservableObject, Identifiable {
     /// 保证发送链绝不会静默卡死（全白无气泡/无 SSE 的根因修复）。
     private static let captionWithDeadlineNanos: UInt64 = 20_000_000_000
 
-    private enum VisionFallbackDelivery {
+    package enum VisionFallbackDelivery {
         /// Composer path: enqueue when busy, otherwise send now.
         case queueOrSend
         /// Fork/resend path: `isSendingFromQueue` is already true; always `sendPromptNow`.
@@ -3648,7 +3660,8 @@ final class ChatSession: ObservableObject, Identifiable {
 
     /// When the session model cannot accept images, OCR (+ optional cloud VLM) and inject text
     /// into the user message before queue/RPC. Images stay on the payload and in the transcript.
-    private func deliverAfterOptionalVisionFallback(
+    /// `package` for the state-transition test (caption in-progress placeholder).
+    package func deliverAfterOptionalVisionFallback(
         preparedMessage: String,
         images: [DraftImage],
         searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths,
@@ -3683,6 +3696,10 @@ final class ChatSession: ObservableObject, Identifiable {
         // 避免发送链被 caption 的异步等待拖住导致全白无输出。caption 只影响最终
         // 文本（RPC message），气泡先显示用户原文，caption 完成后原地更新。
         let optimisticId = appendOptimisticUserMessage(message: preparedMessage, images: images)
+        // 识别中状态：等位占位「正在识别图片…」据此点亮（此时 RPC 未发，isWorking 为 false）。
+        visionCaptionInProgress = true
+        // 记录该乐观气泡 id：caption 落地后让它的气泡默认展开，caption 内容不被折叠预览吞掉。
+        visionCaptionOptimisticID = optimisticId
         Task { [weak self] in
             guard let self else { return }
             let finalMessage = await self.captionWithDeadline(
@@ -3695,6 +3712,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 // 把气泡文本更新为最终（可能带 caption 的）消息，保证与 RPC 一致、
                 // 与之后 pi 回显的 user 消息 dedup 命中。
                 self.updateOptimisticText(id: optimisticId, text: finalMessage)
+                self.visionCaptionInProgress = false
                 self.finishVisionFallbackDelivery(
                     message: finalMessage,
                     images: images,
