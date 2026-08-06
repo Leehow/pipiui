@@ -115,6 +115,22 @@ const MODELS = {
   ],
 };
 
+// ---- per-session runtime state ----
+// Messages are seeded lazily from the canned snapshot so sessions render
+// identically on first open, then grow as prompts are sent. Reply timers are
+// keyed by session so `generation.stop` can cancel the pending fixture reply.
+const MESSAGE_STORE = new Map();
+const REPLY_TIMERS = new Map();
+
+function messagesFor(sessionID) {
+  let messages = MESSAGE_STORE.get(sessionID);
+  if (!messages) {
+    messages = [...snapshotsFor(sessionID).messages];
+    MESSAGE_STORE.set(sessionID, messages);
+  }
+  return messages;
+}
+
 function ok(body) {
   return { status: 200, body };
 }
@@ -131,11 +147,29 @@ function handlers() {
       return ok({ sessionID: id });
     },
     snapshot({ sessionID }) {
-      return ok({ snapshot: snapshotsFor(sessionID), revision: Date.now() });
+      return ok({
+        snapshot: { ...snapshotsFor(sessionID), messages: messagesFor(sessionID) },
+        revision: Date.now(),
+      });
     },
     "models.get"() { return ok(MODELS); },
-    "model.set"() { return ok({ accepted: true }); },
-    "subagentModel.set"() { return ok({ accepted: true }); },
+    "model.set"({ modelId }) {
+      if (modelId) {
+        const next = MODELS.available.find((m) => m.id === modelId);
+        if (next) MODELS.main = next;
+      }
+      // Empty selection: keep the current main model. The UI never sends an
+      // empty modelId for the main model, and "" already renders unselected.
+      return ok({ accepted: true });
+    },
+    "subagentModel.set"({ agent, model, thinking }) {
+      const entry = MODELS.subagents.find((s) => s.agent === agent);
+      if (entry) {
+        if (typeof model === "string") entry.model = model;
+        if (typeof thinking === "string") entry.thinking = thinking;
+      }
+      return ok({ accepted: true });
+    },
     "agents.list"() { return ok({ agents: AGENTS }); },
     "agents.detail"({ agentID }) {
       return ok(AGENT_DETAIL[agentID] ?? AGENT_DETAIL.code);
@@ -156,8 +190,27 @@ function handlers() {
         content: DOCUMENT_CONTENT[documentID] ?? "无法显示内容",
       });
     },
-    "prompt.send"() { return ok({ accepted: true }); },
-    "generation.stop"() { return ok({ accepted: true }); },
+    "prompt.send"({ sessionID, text }) {
+      const messages = messagesFor(sessionID);
+      messages.push({ role: "user", text });
+      const timer = setTimeout(() => {
+        messages.push({
+          role: "assistant",
+          text: `（假宿主流式回复）${text.slice(0, 20)}`,
+        });
+        REPLY_TIMERS.delete(sessionID);
+      }, 800);
+      REPLY_TIMERS.set(sessionID, timer);
+      return ok({ accepted: true });
+    },
+    "generation.stop"({ sessionID }) {
+      const timer = REPLY_TIMERS.get(sessionID);
+      if (timer) {
+        clearTimeout(timer);
+        REPLY_TIMERS.delete(sessionID);
+      }
+      return ok({ accepted: true });
+    },
   };
 }
 
