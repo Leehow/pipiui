@@ -139,13 +139,26 @@ const HELP = [
   "                        invalidate the prior snapshot and return a fresh observation.",
   "                        Password, OTP, and payment fields require user handoff in the panel.",
   "content {mode?}         Raw fallback. mode='text' (default) or 'html'; may be large.",
+  "                        WARNING: bypasses structured redaction — may expose credentials,",
+  "                        tokens, and payment details. Avoid on auth/checkout pages.",
   "eval {js}               Debug fallback. Runs page-world JS and bypasses structured guarantees.",
+  "                        WARNING: can read DOM values and secrets directly. Avoid on",
+  "                        auth/checkout pages; prefer observe/click/input.",
   "console {clear?}        Console output (log/info/warn/error), JS exceptions and failed",
   "                        navigations since the last clear. clear=true empties the buffer.",
   "screenshot              Screenshot of the current page, returned as an image you can look at.",
+  "                        WARNING: pixels are not redacted — passwords/OTP/card numbers visible",
+  "                        on screen will appear in the image. Avoid capturing auth/checkout UI",
+  "                        unless the user explicitly needs a visual check.",
   "",
   "Structured DOM covers the main document, open shadow roots, and one same-origin iframe level.",
   "Use screenshot or Computer Use for cross-origin iframes, closed shadow roots, Canvas/WebGL.",
+  "JS dialogs (alert/confirm/prompt) are suppressed and not controllable — if a page needs a",
+  "dialog response, stop and use screenshot or ask the user (handoff).",
+  "file inputs cannot receive local paths from this tool — use user handoff or Computer Use",
+  "for uploads.",
+  "Sensitive-field heuristics cover password/OTP/payment-ish controls but do NOT guarantee",
+  "capture of SSN, ID numbers, cardholder name, or CAPTCHA fields; when unsure, hand off.",
   "This tool always controls the built-in WebView. For Chrome, use open_application then computer;",
   "the user selects the tab and you must re-observe title/URL/screenshot/AX before each write batch.",
   "help                    This text.",
@@ -162,6 +175,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Drive the built-in WebView with structured observations and typed DOM actions. " +
       "actions: navigate, observe, wait, click, input, select, scroll, content, eval, console, screenshot, help. " +
+      "Fallbacks content/eval/screenshot bypass structured redaction and may expose credentials — avoid on auth/checkout pages. " +
       'Call with action:"help" for full parameter docs.',
     parameters: Type.Object({
       action: Type.String({

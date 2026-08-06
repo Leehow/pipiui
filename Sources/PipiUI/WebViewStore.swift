@@ -482,6 +482,7 @@ final class WebViewStore: NSObject, ObservableObject {
             "ok": false,
             "error": reason,
             "code": "request_cancelled",
+            "retryable": true,
             "requiresObservation": true,
         ])
     }

@@ -997,6 +997,7 @@ final class AppStore: ObservableObject {
                         "ok": false,
                         "error": "browser bridge request was already cancelled",
                         "code": "request_cancelled",
+                        "retryable": true,
                         "requiresObservation": true,
                     ])
                     return

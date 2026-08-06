@@ -216,6 +216,8 @@ final class BrowserDOMControllerTests: XCTestCase {
         XCTAssertTrue(limitations.contains { $0.contains("cross_origin_iframe") })
         XCTAssertTrue(limitations.contains { $0.contains("canvas_or_webgl") })
         XCTAssertTrue(limitations.contains { $0.contains("closed_shadow_roots") })
+        XCTAssertTrue(limitations.contains { $0.contains("js_dialogs_not_handled") })
+        XCTAssertTrue(limitations.contains { $0.contains("file_input_paths_not_supported") })
 
         let password = try element(named: "Password", tag: "input", in: response)
         XCTAssertEqual(password["valueHint"] as? String, "sensitive value hidden")
@@ -1601,6 +1603,53 @@ final class BrowserDOMControllerTests: XCTestCase {
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
         XCTAssertEqual(responses.count, 1)
         XCTAssertEqual(responses.first?["code"] as? String, "request_cancelled")
+        XCTAssertEqual(responses.first?["retryable"] as? Bool, true)
         XCTAssertEqual(store.browserActivity, .idle)
+    }
+
+    func testObservationURLRedactsSensitiveQueryParameters() throws {
+        let handler = BrowserFixtureSchemeHandler(pages: [
+            "/secret-page": """
+            <!doctype html>
+            <html><head><meta charset="utf-8"><title>Secret query fixture</title></head>
+            <body>
+              <h1>Query redaction</h1>
+              <label for="bare-pass">Account password recovery</label>
+              <input id="bare-pass" name="user_password" placeholder="password recovery">
+              <input id="upload" type="file" aria-label="Upload document">
+            </body></html>
+            """,
+        ])
+        let store = WebViewStore(testSchemeHandler: handler)
+        let secret = "SECRET_RESET_TOKEN_VALUE_9f3a"
+        let observed = try call(store, action: "navigate", request: [
+            "url": "pipiui-test://fixture/secret-page?reset_token=\(secret)&ok=1&api_key=ANOTHER_SECRET",
+        ], timeout: 5)
+        XCTAssertEqual(observed["ok"] as? Bool, true, "\(observed)")
+        let url = try XCTUnwrap(observed["url"] as? String)
+        XCTAssertFalse(url.contains(secret), "reset_token value must not appear in observation URL: \(url)")
+        XCTAssertFalse(url.contains("ANOTHER_SECRET"), "api_key value must not appear: \(url)")
+        XCTAssertTrue(url.contains("reset_token=%5Bredacted%5D") || url.contains("reset_token=[redacted]"), url)
+        XCTAssertTrue(url.contains("api_key=%5Bredacted%5D") || url.contains("api_key=[redacted]"), url)
+        XCTAssertTrue(url.contains("ok=1"), "non-sensitive params must remain: \(url)")
+
+        let encoded = try serialized(observed)
+        XCTAssertFalse(encoded.contains(secret))
+        XCTAssertFalse(encoded.contains("ANOTHER_SECRET"))
+
+        let limitations = observed["limitations"] as? [String] ?? []
+        XCTAssertTrue(limitations.contains { $0.contains("js_dialogs_not_handled") })
+        XCTAssertTrue(limitations.contains { $0.contains("file_input") })
+
+        // Bare password keyword in name/label/placeholder → sensitive handoff path.
+        let bare = try element(named: "Account password recovery", tag: "input", in: observed)
+        XCTAssertEqual(bare["valueHint"] as? String, "sensitive value hidden")
+        let handoff = try call(store, action: "input", request: [
+            "snapshot_id": try XCTUnwrap(observed["snapshotID"] as? String),
+            "element_token": try XCTUnwrap(bare["token"] as? String),
+            "text": "should-not-type",
+        ])
+        XCTAssertEqual(handoff["ok"] as? Bool, false)
+        XCTAssertEqual(handoff["code"] as? String, "user_handoff_required")
     }
 }

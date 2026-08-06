@@ -9,6 +9,9 @@
   const MAX_REDACTION_VALUE_UNITS = 4096;
   const MAX_REDACTION_TOTAL_UNITS = 16384;
   const SENSITIVE_AUTOCOMPLETE_TOKEN = /^(current-password|new-password|one-time-code|cc(?:-|$))/i;
+  // Query/hash parameter names whose values must never appear in public observations.
+  const SENSITIVE_URL_PARAM = /(?:^|[._-])(?:token|password|passwd|secret|key|reset|auth|otp|code|session|sig|signature|credential|bearer)(?:[._-]|$)|^(?:token|password|passwd|secret|key|reset|auth|otp|code|session|sig|signature|credential|bearer)$/i;
+  const BARE_PASSWORD_SEMANTICS = /\b(?:password|passcode|passwd)\b|密码|密碼|口令/i;
   const STRING_LIMITS = Object.freeze({
     url: 4096,
     title: 512,
@@ -311,6 +314,8 @@
 
     const semantics = semanticFieldText(element);
     if (!semantics) return false;
+    // Defense in depth: bare password keywords in name/id/label/placeholder.
+    if (BARE_PASSWORD_SEMANTICS.test(semantics)) return true;
     const inputMode = normalizedText(element.getAttribute("inputmode")).toLowerCase();
     const numericEntry = ["numeric", "decimal", "tel"].includes(inputMode)
       || ["number", "tel"].includes(type);
@@ -328,6 +333,38 @@
       || cardExpirySemantics.test(semantics)
       || numericAuthenticationSemantics
       || numericPaymentSemantics;
+  }
+
+  function redactURLForObservation(href) {
+    const raw = String(href || "");
+    try {
+      const url = new URL(raw, String(location.href));
+      let changed = false;
+      const redactParams = (params) => {
+        for (const key of [...params.keys()]) {
+          if (SENSITIVE_URL_PARAM.test(key)) {
+            params.set(key, "[redacted]");
+            changed = true;
+          }
+        }
+      };
+      redactParams(url.searchParams);
+      if (url.hash && url.hash.length > 1) {
+        const hashBody = url.hash.slice(1);
+        if (hashBody.includes("=")) {
+          const hashParams = new URLSearchParams(hashBody);
+          const before = hashParams.toString();
+          redactParams(hashParams);
+          if (hashParams.toString() !== before) {
+            url.hash = hashParams.toString();
+            changed = true;
+          }
+        }
+      }
+      return changed ? url.toString() : raw;
+    } catch (_) {
+      return raw;
+    }
   }
 
   function controlValue(element) {
@@ -505,8 +542,14 @@
 
   function collect(scope) {
     const candidates = [];
-    const limitations = ["closed_shadow_roots_not_structured; use screenshot or Computer Use"];
+    const limitations = [
+      "closed_shadow_roots_not_structured; use screenshot or Computer Use",
+      // Platform gaps: declared so the model falls back to screenshot/user handoff.
+      "js_dialogs_not_handled; alert/confirm/prompt are suppressed — use screenshot or user handoff if a dialog is required",
+      "file_input_paths_not_supported; cannot supply local file paths — use screenshot or user handoff for uploads",
+    ];
     let iframeCounter = 0;
+    let sawFileInput = false;
 
     function walkContainer(root, frame, iframeDepth, offsetX, offsetY) {
       const children = root.nodeType === Node.DOCUMENT_NODE
@@ -539,6 +582,11 @@
           }
         }
 
+        if (current.localName === "input"
+          && (current.getAttribute("type") || "").toLowerCase() === "file") {
+          sawFileInput = true;
+        }
+
         if (current.shadowRoot) walkContainer(current.shadowRoot, frame, iframeDepth, offsetX, offsetY);
         if (current.localName === "iframe") {
           const childFrame = `${frame}/iframe[${iframeCounter}]`;
@@ -564,6 +612,9 @@
     }
 
     walkContainer(document, "main", 0, 0, 0);
+    if (sawFileInput) {
+      limitations.push("file_input_present; structured browser cannot set file paths — use user handoff or Computer Use");
+    }
     return { candidates, limitations };
   }
 
@@ -595,7 +646,8 @@
     const envelope = sanitizePublic({
       ok: true,
       snapshotID,
-      url: String(location.href),
+      // Public URL only — keep the raw href in activeSnapshot for stale checks.
+      url: redactURLForObservation(String(location.href)),
       title: String(document.title || ""),
       loading: document.readyState !== "complete",
       viewport: viewportInfo(),
