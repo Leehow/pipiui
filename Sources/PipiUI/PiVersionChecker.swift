@@ -93,3 +93,44 @@ enum PiVersionChecker {
         return (numbers + [0, 0, 0]).prefix(3).map { $0 }
     }
 }
+
+/// Pre-flight compatibility checks run before spawning `pi update`, so a broken
+/// environment surfaces a clear message instead of a cryptic
+/// `env: node: No such file or directory` (exit 127) from inside the update.
+enum PiUpdatePreflight {
+    /// Returns human-readable problems; empty means the environment is ready.
+    /// Probes run off the main thread (each spawns a tiny `node`/`npm --version`).
+    static func problems(environment: [String: String]) async -> [String] {
+        var problems: [String] = []
+        if !(await commandResolves("node", environment: environment)) {
+            problems.append("未找到 node——pi 依赖 node 运行，请先安装 node 并确认它在 PATH 中。")
+        }
+        if !(await commandResolves("npm", environment: environment)) {
+            problems.append("未找到 npm——pi update 通过 npm 安装新版本，请先安装 npm 并确认它在 PATH 中。")
+        }
+        return problems
+    }
+
+    /// True if `env <cmd> --version` exits 0 in the given environment.
+    private static func commandResolves(
+        _ cmd: String,
+        environment: [String: String]
+    ) async -> Bool {
+        await withCheckedContinuation { cont in
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            p.arguments = [cmd, "--version"]
+            p.environment = environment
+            p.standardOutput = Pipe()
+            p.standardError = Pipe()
+            p.terminationHandler = { proc in
+                cont.resume(returning: proc.terminationStatus == 0)
+            }
+            do {
+                try p.run()
+            } catch {
+                cont.resume(returning: false)
+            }
+        }
+    }
+}

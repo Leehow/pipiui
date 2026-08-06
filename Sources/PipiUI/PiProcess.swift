@@ -42,9 +42,17 @@ final class PiProcess {
         return env
     }
 
-    init?(cwd: URL, arguments: [String], extraEnv: [String: String] = [:]) {
-        guard let pi = Self.findPiExecutable() else { return nil }
-
+    /// Sanitized spawn environment with well-known tool dirs prepended to PATH
+    /// (npm-global bin, homebrew, /usr/local, /usr/bin, /bin). Finder/Dock-launched
+    /// apps have a minimal PATH, so pi's `#!/usr/bin/env node` shebang and any
+    /// `npm`/`node` child (e.g. `pi update`) need these dirs to resolve.
+    static func spawnEnvironment(extraEnv: [String: String]) -> [String: String] {
+        guard let pi = Self.findPiExecutable() else {
+            return Self.mergedProcessEnvironment(
+                parent: ProcessInfo.processInfo.environment,
+                extraEnv: extraEnv
+            )
+        }
         var env = Self.mergedProcessEnvironment(
             parent: ProcessInfo.processInfo.environment,
             extraEnv: extraEnv
@@ -55,6 +63,13 @@ final class PiProcess {
         ]
         let existing = env["PATH"] ?? ""
         env["PATH"] = (extraDirs + [existing]).joined(separator: ":")
+        return env
+    }
+
+    init?(cwd: URL, arguments: [String], extraEnv: [String: String] = [:]) {
+        guard let pi = Self.findPiExecutable() else { return nil }
+
+        let env = Self.spawnEnvironment(extraEnv: extraEnv)
 
         process.executableURL = URL(fileURLWithPath: pi)
         process.arguments = ["--mode", "rpc"] + arguments
@@ -89,6 +104,7 @@ final class PiProcess {
         do {
             try process.run()
             isRunning = true
+            DiagnosticsStream.reset()
         } catch {
             return nil
         }
@@ -107,6 +123,7 @@ final class PiProcess {
     }
 
     private func dispatch(_ json: J) {
+        DiagnosticsStream.append("EVT \(json["type"].string ?? "?")")
         if json["type"].string == "response", let id = json["id"].string,
            let completion = pending.removeValue(forKey: id) {
             completion(json)

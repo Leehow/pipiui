@@ -2129,22 +2129,43 @@ final class AppStore: ObservableObject {
     }
 
     /// Run `pi update -na` to update pi itself, capturing output into `piUpdateLog`.
+    /// Runs a pre-flight environment check first so a broken setup (e.g. missing
+    /// node/npm for a Finder-launched app) surfaces a clear message before the
+    /// update is attempted.
     @MainActor
     func runPiUpdate() {
         guard !piIsUpdating, let executable = PiProcess.findPiExecutable() else { return }
         piIsUpdating = true
+        piUpdateLog = "正在检查更新环境…\n"
+        let environment = PiProcess.spawnEnvironment(extraEnv: [:])
+        Task {
+            let problems = await PiUpdatePreflight.problems(environment: environment)
+            guard problems.isEmpty else {
+                await MainActor.run {
+                    self.piUpdateLog = "兼容性检测未通过：\n\n" + problems.joined(separator: "\n\n")
+                    self.piIsUpdating = false
+                }
+                return
+            }
+            await MainActor.run {
+                self.spawnPiUpdate(executable: executable, environment: environment)
+            }
+        }
+    }
+
+    /// Spawn the actual `pi update -na` process (called only after pre-flight passes).
+    @MainActor
+    private func spawnPiUpdate(executable: String, environment: [String: String]) {
         piUpdateLog = ""
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: executable)
         proc.arguments = ["update", "-na"]
         // Finder/Dock-launched apps have a minimal PATH (no /usr/local/bin, no
         // npm-global), but `pi update` shells out to `npm install -g` and the pi
-        // shebang needs `node`. Reuse the pi-session environment so the update
+        // shebang needs `node`. Use the pi-session spawn environment (which
+        // prepends npm-global/homebrew//usr/local/bin to PATH) so the update
         // command can actually find npm/node — same as PiProcess.init.
-        proc.environment = PiProcess.mergedProcessEnvironment(
-            parent: ProcessInfo.processInfo.environment,
-            extraEnv: [:]
-        )
+        proc.environment = environment
 
         let out = Pipe()
         let err = Pipe()

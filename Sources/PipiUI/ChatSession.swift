@@ -1742,6 +1742,40 @@ final class ChatSession: ObservableObject, Identifiable {
         // Defer transcript/stream/tool mutations until initial history is applied once.
         // Assumption to runtime-verify: cold open can interleave agent_* / message_* / tool_*
         // with the get_messages response; replaying after assign preserves order vs wiping.
+        let wouldDeferInitial: Bool = {
+            guard awaitingInitialTranscript else { return false }
+            switch type {
+            case "agent_start", "agent_settled",
+                 "message_start", "message_update", "message_end",
+                 "tool_execution_start", "tool_execution_update", "tool_execution_end",
+                 "auto_retry_start", "auto_retry_end",
+                 "compaction_start", "compaction_end":
+                return true
+            default:
+                return false
+            }
+        }()
+        switch type {
+        case "message_update":
+            DiagnosticsStream.append(
+                "HD msg_update deferred=\(wouldDeferInitial) deferredCount=\(deferredInitialEvents.count) visible=\(isStreamingVisible)"
+            )
+        case "message_end":
+            DiagnosticsStream.append(
+                "HD msg_end deferred=\(wouldDeferInitial) deferredCount=\(deferredInitialEvents.count) visible=\(isStreamingVisible)"
+            )
+        case "message_start":
+            DiagnosticsStream.append(
+                "HD msg_start deferred=\(wouldDeferInitial) deferredCount=\(deferredInitialEvents.count) visible=\(isStreamingVisible)"
+            )
+        case "agent_start":
+            DiagnosticsStream.append(
+                "HD agent_start deferred=\(wouldDeferInitial) deferredCount=\(deferredInitialEvents.count) visible=\(isStreamingVisible)"
+            )
+        default:
+            break
+        }
+
         if awaitingInitialTranscript {
             switch type {
             case "agent_start", "agent_settled",
@@ -1820,7 +1854,9 @@ final class ChatSession: ObservableObject, Identifiable {
             pendingStreamMessage = e["message"]
             scheduleStreamFlush()
         case "message_end":
+            let transcriptBefore = transcript.count
             ingest(message: e["message"])
+            DiagnosticsStream.append("INGEST len=\(transcript.count - transcriptBefore)")
             if e["message"]["role"].string == "assistant" {
                 pendingStreamMessage = nil
                 streaming.streamingItem = nil
@@ -2050,6 +2086,8 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     private func materializePendingStreamMessage() {
+        let hasContent = pendingStreamMessage != nil
+        DiagnosticsStream.append("FLUSH materialize hasContent=\(hasContent)")
         guard let message = pendingStreamMessage else { return }
         pendingStreamMessage = nil
         streaming.streamingItem = Self.convert(
@@ -2069,6 +2107,8 @@ final class ChatSession: ObservableObject, Identifiable {
     private func scheduleStreamFlush() {
         // Hidden sessions retain only the newest raw message. No timer is needed:
         // selection and remote snapshot reads materialize it on demand.
+        let armed = !streamFlushScheduled && isStreamingVisible
+        DiagnosticsStream.append("FLUSH armed=\(armed)")
         guard !streamFlushScheduled, isStreamingVisible else { return }
         streamFlushScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in

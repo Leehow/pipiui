@@ -62,6 +62,8 @@ enum LocalRemoteWebPage {
             }
             .conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
             .conn-pill.is-connected { color: var(--ok); }
+            .conn-pill.is-idle { color: var(--accent-text); border-color: rgba(121, 184, 255, .4); }
+            .conn-pill.is-idle .conn-dot { background: var(--accent-text); }
             .conn-pill.is-disconnected { color: var(--warn); border-color: rgba(255, 176, 32, .4); }
             .conn-pill.is-disconnected .conn-dot { background: var(--warn); animation: conn-pulse 1.1s ease-in-out infinite; }
             @keyframes conn-pulse {
@@ -93,6 +95,10 @@ enum LocalRemoteWebPage {
             .badge {
               flex: none; font-size: 11px; line-height: 1; padding: 4px 8px; border-radius: 999px;
               background: var(--accent-soft); color: var(--accent-text);
+            }
+            .empty-hint {
+              margin: 0; padding: 18px 14px; border: 1px dashed var(--border); border-radius: 12px;
+              color: var(--muted); font-size: 13px; text-align: center; line-height: 1.55;
             }
 
             section#session-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -188,9 +194,9 @@ enum LocalRemoteWebPage {
         <body>
           <header class="app-header">
             <h1>PipiUI 远程会话</h1>
-            <div id="conn-pill" class="conn-pill is-connected" role="status" aria-live="polite">
+            <div id="conn-pill" class="conn-pill is-idle" role="status" aria-live="polite">
               <span class="conn-dot" aria-hidden="true"></span>
-              <span id="conn-label">已连接</span>
+              <span id="conn-label">已连接 · 暂无会话</span>
             </div>
           </header>
           <main id="remote-main" data-mobile-view="list">
@@ -225,7 +231,8 @@ enum LocalRemoteWebPage {
             let sessionPage = 0;
             let pollTimer = null;
             let connFailures = 0;
-            let connState = "connected";
+            let connState = "idle";
+            let hasSessions = false;
             const el = id => document.getElementById(id);
             const label = (tag, text, className) => {
               const node = document.createElement(tag);
@@ -237,22 +244,28 @@ enum LocalRemoteWebPage {
               connState = state;
               const pill = el("conn-pill");
               pill.classList.toggle("is-connected", state === "connected");
-              pill.classList.toggle("is-disconnected", state !== "connected");
+              pill.classList.toggle("is-idle", state === "idle");
+              pill.classList.toggle("is-disconnected", state === "disconnected");
               el("conn-label").textContent =
-                state === "connected" ? "已连接" : "连接中断，重试中…";
+                state === "connected" ? "已连接" :
+                state === "idle" ? "已连接 · 暂无会话" :
+                "连接中断，重试中…";
             }
-            function noteConnSuccess() {
+            function noteConnReachable() {
               connFailures = 0;
-              if (connState !== "connected") setConn("connected");
+              if (connState === "disconnected") setConn(hasSessions ? "connected" : "idle");
+            }
+            function noteSessionAvailability(count) {
+              hasSessions = count > 0;
+              if (connFailures >= 2) return;
+              const next = hasSessions ? "connected" : "idle";
+              if (connState !== next) setConn(next);
             }
             function noteConnFailure() {
               connFailures += 1;
-              if (connFailures >= 2 || navigator.onLine === false) setConn("disconnected");
+              if (connFailures >= 2) setConn("disconnected");
             }
-            window.addEventListener("offline", () => {
-              connFailures = 2;
-              setConn("disconnected");
-            });
+            window.addEventListener("offline", () => { pollSnapshot(); });
             window.addEventListener("online", () => { pollSnapshot(); });
             async function api(path, body) {
               let response;
@@ -271,7 +284,7 @@ enum LocalRemoteWebPage {
                 noteConnFailure();
                 throw new Error("网络连接失败");
               }
-              noteConnSuccess();
+              noteConnReachable();
               if (response.status === 304) return {unchanged: true};
               const data = await response.json().catch(() => ({error: "响应不是 JSON"}));
               if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
@@ -310,6 +323,7 @@ enum LocalRemoteWebPage {
             }
             async function loadIndex() {
               const data = await api("/api/index");
+              noteSessionAvailability(data.sessions.length);
               const projects = el("projects");
               const sessions = el("sessions");
               projects.replaceChildren();
@@ -320,6 +334,10 @@ enum LocalRemoteWebPage {
                 sessionPage * SESSION_PAGE_SIZE + SESSION_PAGE_SIZE
               );
               sessions.replaceChildren();
+              if (data.sessions.length === 0) {
+                const hint = label("p", "暂无会话，可在上方项目区点击「新建」", "empty-hint");
+                sessions.append(hint);
+              }
               renderPager(sessionPage, totalPages, data.sessions.length);
               for (const project of data.projects) {
                 const row = document.createElement("div"); row.className = "row card";
@@ -663,11 +681,15 @@ enum LocalRemoteWebPage {
                 snapshot.processAlive ? `空闲 · 队列 ${snapshot.queuedPromptCount}` : "进程已退出");
             }
             async function pollSnapshot() {
-              if (!activeSession) return;
-              try {
-                const data = await api("/api/snapshot", {sessionID: activeSession, revision});
-                if (!data.unchanged) renderSnapshot(data);
-              } catch (error) { setStatus(error.message); }
+              if (activeSession) {
+                try {
+                  const data = await api("/api/snapshot", {sessionID: activeSession, revision});
+                  if (!data.unchanged) renderSnapshot(data);
+                } catch (error) { setStatus(error.message); }
+                return;
+              }
+              try { await loadIndex(); }
+              catch (error) { setStatus(error.message); }
             }
             el("send").addEventListener("click", async () => {
               const text = el("prompt").value;
