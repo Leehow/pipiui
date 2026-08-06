@@ -47,6 +47,25 @@ import {
 	runSecretaryCommit,
 } from "./secretary-commit.ts";
 import { secretaryToolCallBlock } from "./secretary-policy.ts";
+import {
+	type VerifyAttestation,
+	truncateTextHead,
+	formatVerifyExit,
+	formatVerifyLine,
+	verifiedStateFor,
+	doneCapForResult,
+	formatSubagentDoneMessage,
+	formatChainVerifyPrefix,
+	getFinalOutput,
+	isFailedResult,
+	getResultOutput,
+} from "./done-message.ts";
+import { seedBossLedger } from "./boss-ledger.ts";
+import {
+	acquireAgentLease,
+	releaseAgentLease,
+} from "./agent-lease.ts";
+import { resolveSubagentWorktree } from "./worktree.ts";
 
 const MAX_PARALLEL_TASKS = 1000;
 const MAX_CONCURRENCY = 1000;
@@ -995,16 +1014,6 @@ function inheritMainModel(sessionModel: string | undefined): string | undefined 
 	return process.env.PIPIUI_MAIN_MODEL || fileMain || sessionModel || undefined;
 }
 
-/** Optional worktree isolation metadata reported to the App bridge. */
-interface WorktreePlacement {
-	/** Effective spawn cwd (worktree path or original). */
-	cwd: string;
-	worktreePath?: string;
-	worktreeBranch?: string;
-	/** Set when required worktree isolation failed. Writable workers must not spawn. */
-	worktreeError?: string;
-}
-
 interface AgentRuntimeRolePolicy {
 	role: "worker" | "closeout-secretary";
 	worktree: "isolated" | "main-session";
@@ -1032,16 +1041,6 @@ function runtimeRolePolicyForAgent(agentName: string): AgentRuntimeRolePolicy {
 	return { role: "worker", worktree: "isolated", allowRecursiveDelegation: true };
 }
 
-// Done-message caps (clean-context orchestration):
-// - Injected [subagent-done] Result body is a TLDR slice (TLDR_DONE_CAP); full text
-//   lives only in the job registry and is pulled via subagent_status full:true.
-// - VERDICT/REPORT/ERROR caps still size chain/foreground aggregates and error paths
-//   that embed more than the TLDR pointer message.
-const TLDR_DONE_CAP = 2500;
-const TLDR_FALLBACK_NON_EMPTY_LINES = 15;
-const VERDICT_DONE_CAP = 1500;
-const REPORT_DONE_CAP = 6000;
-const ERROR_DONE_CAP = 6000;
 // Store cap for the pull path (`subagent_status full:true`). Must comfortably hold a
 // whole explore/plan report: this is the only place the full text survives, and every
 // done message advertises it as the escape hatch.
@@ -1054,17 +1053,10 @@ const MAX_TERMINAL_JOB_RECORDS = 1000;
 const VERIFY_TIMEOUT_MS = 120_000;
 const VERIFY_TAIL_CHARS = 2000;
 const VERIFY_TAIL_LINES = 20;
-const VERIFY_DONE_TAIL_LINES = 12;
 /** Rolling collection cap while verify runs: retain only this tail so a chatty
  * command cannot buffer unbounded output for up to VERIFY_TIMEOUT_MS. */
 const VERIFY_COLLECT_TAIL_CHARS = 64 * 1024;
 
-interface VerifyAttestation {
-	command: string;
-	exitCode: number | null;
-	timedOut: boolean;
-	tail: string;
-}
 
 function tailText(text: string, maxChars: number, maxLines: number): string {
 	const trimmed = text.replace(/\s+$/g, "");
@@ -1156,28 +1148,6 @@ function runVerifyCommand(command: string, cwd: string): Promise<VerifyAttestati
 	});
 }
 
-function formatVerifyExit(att: VerifyAttestation): string {
-	if (att.timedOut) return "null (timed out)";
-	return String(att.exitCode ?? "null");
-}
-
-/** `Verify: $ ... → exit N (attested)` line for a runtime attestation. */
-function formatVerifyLine(att: VerifyAttestation): string {
-	return `Verify: $ ${att.command} → exit ${formatVerifyExit(att)} (attested)`;
-}
-
-/**
- * `verified` tri-state shared by done messages and foreground aggregates.
- * Abort/error short-circuits to none — no testimony was gathered for a synthesized failure.
- */
-function verifiedStateFor(
-	result: SingleResult,
-	extra?: { aborted?: boolean; error?: string | boolean },
-): "pass" | "fail" | "none" {
-	const aborted = extra?.aborted ?? result.stopReason === "aborted";
-	const att = result.verify;
-	return aborted || extra?.error || !att ? "none" : !att.timedOut && att.exitCode === 0 ? "pass" : "fail";
-}
 
 const emptyUsage = (): UsageStats => ({
 	input: 0,
@@ -1445,18 +1415,6 @@ function abortRunningAgent(agentId: string): { ok: boolean; message: string } {
 	};
 }
 
-/**
- * Head-keeping truncation for job-store and status display (and chain aggregates).
- * [subagent-done] injects extractDoneTldr instead; full text stays in the registry.
- * Worker templates put key sections FIRST, so keep the head and mark the omission in
- * the same bracketed style as truncateParallelOutput. Store and status must truncate
- * the SAME direction — mixing head-keep and tail-keep makes full:true return a
- * disjoint slice of what the boss already saw.
- */
-function truncateTextHead(text: string, cap: number): string {
-	if (text.length <= cap) return text;
-	return `${text.slice(0, cap)}\n\n[Output truncated: ${text.length - cap} chars omitted.]`;
-}
 
 function taskSummary(task: string, cap = 200): string {
 	const t = task.replace(/\s+/g, " ").trim();
@@ -2079,7 +2037,6 @@ let sessionPruneSchedule: SessionPruneSchedule = {
 let sessionPruneFlight: Promise<void> | undefined;
 let sessionPruneRerun = false;
 let sessionPruneRerunDir: string | undefined;
-let seededLedger = false;
 
 async function performAgentSessionPrune(dir: string): Promise<void> {
 	if (!PIPIUI_MAIN_CWD) return;
@@ -2153,55 +2110,6 @@ function pruneAgentSessions(dir: string, trigger: "access" | "completed"): void 
 	launchAgentSessionPrune(dir);
 }
 
-/**
- * Seed the boss ledger the first time this session actually dispatches.
- *
- * The layout used to live in the system prompt — roughly 380 tokens of template resident on
- * every turn so that it would be correct on the few turns that write it. Creating the file
- * with its sections already laid out puts the format where it is used and costs nothing per
- * turn. Never overwrites: an existing ledger is the session's own state.
- */
-function seedBossLedger(): void {
-	if (seededLedger || !PIPIUI_MAIN_CWD) return;
-	seededLedger = true;
-	const key = PIPIUI_SESSION?.trim() || "terminal";
-	const dir = path.join(PIPIUI_MAIN_CWD, ".pi", "boss");
-	const file = path.join(dir, `ledger-${key}.md`);
-	try {
-		if (fs.existsSync(file)) return;
-		fs.mkdirSync(dir, { recursive: true });
-		fs.writeFileSync(
-			file,
-			[
-				"# Ledger",
-				"<one-line session goal>",
-				"",
-				"## Decisions",
-				"<!-- user mid-course changes / additions / cancellations: time + content + affected task IDs -->",
-				"",
-				"## Tasks",
-				"| ID | title | status | agent | wave | notes | blocked-by |",
-				"| -- | ----- | ------ | ----- | ---- | ----- | ---------- |",
-				"<!-- status: pending | in-flight | blocked | done | cancelled -->",
-				"<!-- blocked-by: machine-readable dependency tags (task/agentId short names); informational only -->",
-				"",
-				"## Done",
-				"<!-- one line per finished task: conclusion + key evidence (file paths / command results) -->",
-				"",
-				"## Risks & open questions",
-				"",
-				"## Closeout dispositions",
-				"| item | disposition | evidence/reason |",
-				"| ---- | ----------- | --------------- |",
-				"<!-- disposition: cleaned | retained | needs-fixer | needs-user -->",
-				"",
-			].join("\n"),
-			"utf-8",
-		);
-	} catch {
-		// The boss can still create it itself; never fail a dispatch over bookkeeping.
-	}
-}
 
 function agentSessionDir(): string | undefined {
 	if (!PIPIUI_MAIN_CWD) return undefined;
@@ -2352,530 +2260,7 @@ function appendSessionCompaction(
 	}
 }
 
-/** Sanitize agentId for branch/dir names (filesystem + git ref safe). */
-function safeId(agentId: string): string {
-	return agentId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) || "agent";
-}
 
-// PIPIUI_PURE_AGENT_LEASE_BEGIN
-interface AgentLeaseRecord {
-	agentId: string;
-	pid: number;
-	processIdentity?: string;
-	token: string;
-	createdAt: number;
-}
-
-interface AgentLease {
-	filePath: string;
-	token: string;
-}
-
-type AgentLeaseResult = { lease: AgentLease; problem?: never } | { lease?: never; problem: string };
-const AGENT_LEASE_INVALID_GRACE_MS = 30_000;
-
-function leaseProcessIdentity(pid: number): string | undefined {
-	try {
-		const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
-			encoding: "utf8",
-			shell: false,
-		});
-		const value = result.status === 0 ? result.stdout.trim() : "";
-		return value || undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-let ownLeaseProcessIdentityResolved = false;
-let ownLeaseProcessIdentity: string | undefined;
-function currentLeaseProcessIdentity(): string | undefined {
-	if (!ownLeaseProcessIdentityResolved) {
-		ownLeaseProcessIdentity = leaseProcessIdentity(process.pid);
-		ownLeaseProcessIdentityResolved = true;
-	}
-	return ownLeaseProcessIdentity;
-}
-
-function leaseProcessIsAlive(record: AgentLeaseRecord): boolean {
-	try {
-		process.kill(record.pid, 0);
-	} catch (err) {
-		return (err as NodeJS.ErrnoException)?.code === "EPERM";
-	}
-	if (!record.processIdentity) return true;
-	const currentIdentity = leaseProcessIdentity(record.pid);
-	// If ps is unavailable, fail safe: an apparently live pid keeps its lease.
-	return currentIdentity === undefined || currentIdentity === record.processIdentity;
-}
-
-function agentLeaseFile(mainCwd: string, agentId: string): string {
-	return path.join(mainCwd, ".pi", "agent-leases", `${agentId}.lease`);
-}
-
-function createAgentLeaseFile(filePath: string, agentId: string): AgentLease {
-	const token = randomBytes(16).toString("hex");
-	const record: AgentLeaseRecord = {
-		agentId,
-		pid: process.pid,
-		processIdentity: currentLeaseProcessIdentity(),
-		token,
-		createdAt: Date.now(),
-	};
-	const fd = fs.openSync(filePath, "wx", 0o600);
-	try {
-		fs.writeFileSync(fd, JSON.stringify(record), "utf8");
-	} finally {
-		fs.closeSync(fd);
-	}
-	return { filePath, token };
-}
-
-/** Atomic cross-process bare-ID lease with dead-owner/aged-invalid recovery. */
-function acquireAgentLease(mainCwd: string, agentId: string): AgentLeaseResult {
-	const filePath = agentLeaseFile(mainCwd, agentId);
-	try {
-		fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	} catch (err) {
-		return { problem: `Cannot create global agentId lease directory: ${err instanceof Error ? err.message : String(err)}` };
-	}
-
-	for (let attempt = 0; attempt < 4; attempt++) {
-		try {
-			return { lease: createAgentLeaseFile(filePath, agentId) };
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") {
-				return { problem: `Cannot acquire global lease for agentId ${JSON.stringify(agentId)}: ${err instanceof Error ? err.message : String(err)}` };
-			}
-		}
-
-		let record: AgentLeaseRecord | undefined;
-		let ageMs = 0;
-		try {
-			const stat = fs.statSync(filePath);
-			ageMs = Math.max(0, Date.now() - stat.mtimeMs);
-			record = JSON.parse(fs.readFileSync(filePath, "utf8")) as AgentLeaseRecord;
-		} catch {
-			// A fresh invalid/partial file can be between exclusive open and close. Never steal it.
-		}
-		if (record && leaseProcessIsAlive(record)) {
-			return { problem: `agentId ${JSON.stringify(agentId)} is already running in Pi process ${record.pid}.` };
-		}
-		if (!record && ageMs < AGENT_LEASE_INVALID_GRACE_MS) {
-			return { problem: `agentId ${JSON.stringify(agentId)} lease is still initializing; retry later.` };
-		}
-
-		// Only dead-owner or aged-invalid files reach here. Rename is the atomic stale claim:
-		// exactly one contender wins, and every other contender retries exclusive create.
-		const tomb = `${filePath}.stale-${process.pid}-${randomBytes(6).toString("hex")}`;
-		try {
-			fs.renameSync(filePath, tomb);
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException)?.code === "ENOENT") continue;
-			return { problem: `Cannot reclaim stale lease for agentId ${JSON.stringify(agentId)}: ${err instanceof Error ? err.message : String(err)}` };
-		}
-		try {
-			fs.rmSync(tomb, { force: true });
-		} catch {
-			// The tomb is unaddressable as a live lease; later housekeeping may remove it.
-		}
-	}
-	return { problem: `Could not acquire global lease for agentId ${JSON.stringify(agentId)} after concurrent retries.` };
-}
-
-/** Token check prevents an old owner from unlinking a newer owner's lease. */
-function releaseAgentLease(lease: AgentLease): void {
-	try {
-		const record = JSON.parse(fs.readFileSync(lease.filePath, "utf8")) as AgentLeaseRecord;
-		if (record.token !== lease.token) return;
-		fs.unlinkSync(lease.filePath);
-	} catch {
-		// Already reclaimed/removed or unreadable: never unlink without proving ownership.
-	}
-}
-// PIPIUI_PURE_AGENT_LEASE_END
-
-function gitSpawnSync(
-	args: string[],
-	cwd?: string,
-): { ok: boolean; stdout: string; stderr: string; status: number | null } {
-	const result = spawnSync("git", args, {
-		cwd,
-		encoding: "utf8",
-		shell: false,
-		env: pipiuiChildProcessEnv(),
-	});
-	const stdout = typeof result.stdout === "string" ? result.stdout : "";
-	const stderr = typeof result.stderr === "string" ? result.stderr : "";
-	return {
-		ok: result.status === 0 && !result.error,
-		stdout: stdout.trim(),
-		stderr: (stderr || result.error?.message || "").trim(),
-		status: result.status,
-	};
-}
-
-/**
- * Parse `git worktree list --porcelain` into { path, branch? } rows.
- * branch is short name (refs/heads/ stripped); detached → branch undefined.
- */
-function parseWorktreeListPorcelain(output: string): Array<{ path: string; branch?: string }> {
-	const results: Array<{ path: string; branch?: string }> = [];
-	let currentPath: string | undefined;
-	let currentBranch: string | undefined;
-
-	const flush = () => {
-		if (!currentPath) {
-			currentPath = undefined;
-			currentBranch = undefined;
-			return;
-		}
-		results.push({ path: currentPath, branch: currentBranch });
-		currentPath = undefined;
-		currentBranch = undefined;
-	};
-
-	for (const raw of output.split(/\r?\n/)) {
-		const line = raw;
-		if (line.startsWith("worktree ")) {
-			flush();
-			currentPath = line.slice("worktree ".length);
-		} else if (line.startsWith("branch ")) {
-			let ref = line.slice("branch ".length).trim();
-			if (ref.startsWith("refs/heads/")) ref = ref.slice("refs/heads/".length);
-			currentBranch = ref || undefined;
-		} else if (line === "detached") {
-			currentBranch = undefined;
-		} else if (line.trim() === "") {
-			flush();
-		}
-	}
-	flush();
-	return results;
-}
-
-/**
- * Default: create an isolated git worktree under <toplevel>/.pi/worktrees/<safeId>
- * on branch pipiui/<safeId> so non-read-only subagents write without polluting the main dirty tree.
- * Read-only roles run directly in their fallback cwd and never create a worktree or branch.
- *
- * Resume / continue same agentId:
- * - Reuses preferred path when it is already a valid git worktree.
- * - If branch `pipiui/<safeId>` is already checked out in *any* registered worktree
- *   (even when preferred path differs), reuses that path so续作 lands on the same tree.
- * - The process is a fresh spawn, but a non-read-only worker resumes its own stored
- *   conversation (see agentSessionDir), so cwd, branch AND context all continue.
- *
- * Off when:
- * - agent is read-only
- * - PIPIUI_WORKTREE=0
- * - caller passed explicit cwd (respect; do not wrap)
- * - effective cwd is not inside a git work tree
- *
- * TS never auto remove / commit / merge (Swift SubagentStore owns lifecycle).
- * On failure creating required isolation, return worktreeError; runSingleAgent fails closed
- * before spawning a child. Read-only, explicit-cwd and explicit PIPIUI_WORKTREE=0 paths remain
- * deliberate shared-cwd semantics rather than isolation failures.
- * TS end handlers do not merge. Swift SubagentStore auto-merges a writable worker when it
- * ends ok with verifyExit==0 (or verifyExit absent); verifyExit≠0 keeps pendingReview.
- * failed/aborted/interrupted writable workers → keep pendingReview for续作; GUI merge/discard remains as fallback.
- */
-function resolveSubagentWorktree(opts: {
-	agentId: string;
-	defaultCwd: string;
-	explicitCwd?: string;
-	readOnly: boolean;
-	policy: AgentRuntimeRolePolicy;
-}): WorktreePlacement {
-	const fallbackCwd = opts.explicitCwd ?? opts.defaultCwd;
-
-	if (opts.policy.worktree === "main-session") {
-		// Ignore caller cwd and nested worker cwd: secretary is a session-management
-		// role and must not manufacture another branch/worktree while closing them out.
-		return { cwd: path.resolve(PIPIUI_MAIN_CWD || opts.defaultCwd) };
-	}
-	if (opts.readOnly || process.env.PIPIUI_WORKTREE === "0") {
-		return { cwd: fallbackCwd };
-	}
-	// Explicit cwd from tool caller → respect, no worktree wrap
-	if (opts.explicitCwd) {
-		return { cwd: opts.explicitCwd };
-	}
-
-	const effectiveCwd = opts.defaultCwd;
-	const inside = gitSpawnSync(["-C", effectiveCwd, "rev-parse", "--is-inside-work-tree"]);
-	if (!inside.ok || inside.stdout !== "true") {
-		return {
-			cwd: effectiveCwd,
-			worktreeError:
-				inside.stderr || "writable isolation requires a git work tree; refusing shared-cwd fallback",
-		};
-	}
-
-	const top = gitSpawnSync(["-C", effectiveCwd, "rev-parse", "--show-toplevel"]);
-	if (!top.ok || !top.stdout) {
-		return {
-			cwd: effectiveCwd,
-			worktreeError: top.stderr || "git rev-parse --show-toplevel failed",
-		};
-	}
-	const toplevel = path.resolve(top.stdout);
-	const id = safeId(opts.agentId);
-	const worktreesRoot = path.join(toplevel, ".pi", "worktrees");
-	try {
-		fs.mkdirSync(worktreesRoot, { recursive: true });
-	} catch (err) {
-		const msg = err instanceof Error ? err.message : String(err);
-		return { cwd: effectiveCwd, worktreeError: `mkdir .pi/worktrees: ${msg}` };
-	}
-
-	const preferredPath = path.resolve(worktreesRoot, id);
-	const preferredBranch = `pipiui/${id}`;
-
-	// 1) Reuse existing directory if it is already a valid worktree
-	if (fs.existsSync(preferredPath)) {
-		const reuse = gitSpawnSync(["-C", preferredPath, "rev-parse", "--is-inside-work-tree"]);
-		if (reuse.ok && reuse.stdout === "true") {
-			const br = gitSpawnSync(["-C", preferredPath, "rev-parse", "--abbrev-ref", "HEAD"]);
-			const branch =
-				br.ok && br.stdout && br.stdout !== "HEAD" ? br.stdout : preferredBranch;
-			return {
-				cwd: preferredPath,
-				worktreePath: preferredPath,
-				worktreeBranch: branch,
-			};
-		}
-	}
-
-	// 2) Resume by branch: if pipiui/<id> is already attached somewhere in worktree list, reuse that path
-	//    (even when preferred path differs — e.g. previous alt path/suffix).
-	const listOut = gitSpawnSync(["-C", toplevel, "worktree", "list", "--porcelain"], toplevel);
-	if (listOut.ok && listOut.stdout) {
-		const rows = parseWorktreeListPorcelain(listOut.stdout);
-		const hit = rows.find((r) => r.branch === preferredBranch && r.path);
-		if (hit) {
-			const abs = path.resolve(hit.path);
-			const still = gitSpawnSync(["-C", abs, "rev-parse", "--is-inside-work-tree"]);
-			if (still.ok && still.stdout === "true") {
-				return {
-					cwd: abs,
-					worktreePath: abs,
-					worktreeBranch: preferredBranch,
-				};
-			}
-		}
-		// Also match any pipiui/<id>-* suffix branch already checked out (prior collision rename)
-		const prefix = `pipiui/${id}`;
-		const prefixed = rows.find(
-			(r) =>
-				r.branch &&
-				(r.branch === prefix || r.branch.startsWith(`${prefix}-`)) &&
-				r.path,
-		);
-		if (prefixed && prefixed.branch) {
-			const abs = path.resolve(prefixed.path);
-			const still = gitSpawnSync(["-C", abs, "rev-parse", "--is-inside-work-tree"]);
-			if (still.ok && still.stdout === "true") {
-				return {
-					cwd: abs,
-					worktreePath: abs,
-					worktreeBranch: prefixed.branch,
-				};
-			}
-		}
-	}
-
-	const tryAdd = (absPath: string, branch: string): { ok: boolean; error: string } => {
-		const r = gitSpawnSync(
-			["-C", toplevel, "worktree", "add", "-b", branch, absPath, "HEAD"],
-			toplevel,
-		);
-		if (r.ok) return { ok: true, error: "" };
-		return { ok: false, error: r.stderr || r.stdout || "git worktree add failed" };
-	};
-
-	// 3) Create new worktree on preferred path/branch
-	let add = tryAdd(preferredPath, preferredBranch);
-	if (add.ok) {
-		return {
-			cwd: preferredPath,
-			worktreePath: preferredPath,
-			worktreeBranch: preferredBranch,
-		};
-	}
-
-	// Branch (or path) collision → unique suffix
-	const suffix = Date.now().toString(36).slice(-6);
-	const altBranch = `pipiui/${id}-${suffix}`;
-	// Clean a failed non-git leftover at preferred path when possible
-	if (fs.existsSync(preferredPath)) {
-		const stillGit = gitSpawnSync(["-C", preferredPath, "rev-parse", "--is-inside-work-tree"]);
-		if (!(stillGit.ok && stillGit.stdout === "true")) {
-			try {
-				fs.rmSync(preferredPath, { recursive: true, force: true });
-			} catch {
-				/* ignore */
-			}
-		}
-	}
-
-	// Spec: worktree add ${absPath} -b pipiui/${id}-${suffix} HEAD
-	const altAddSamePath = gitSpawnSync(
-		["-C", toplevel, "worktree", "add", preferredPath, "-b", altBranch, "HEAD"],
-		toplevel,
-	);
-	if (altAddSamePath.ok) {
-		return {
-			cwd: preferredPath,
-			worktreePath: preferredPath,
-			worktreeBranch: altBranch,
-		};
-	}
-
-	const altPath = path.resolve(worktreesRoot, `${id}-${suffix}`);
-	add = tryAdd(altPath, altBranch);
-	if (add.ok) {
-		return {
-			cwd: altPath,
-			worktreePath: altPath,
-			worktreeBranch: altBranch,
-		};
-	}
-
-	const errParts = [add.error, altAddSamePath.stderr || altAddSamePath.stdout]
-		.filter(Boolean)
-		.join("; ");
-	return {
-		cwd: effectiveCwd,
-		worktreeError: errParts || "git worktree add failed; refusing shared-cwd fallback",
-	};
-}
-
-/**
- * Done-message / chain aggregate cap. The agent declares whether its deliverable is a
- * report (`deliverable: report`); a verdict is the default, including for an agent whose
- * definition never loaded. Error/abort overrides both.
- * Note: background [subagent-done] injects extractDoneTldr (TLDR_DONE_CAP), not this cap.
- */
-function doneCapForResult(result: { reportsInFull?: boolean }, isError: boolean): number {
-	if (isError) return ERROR_DONE_CAP;
-	return result.reportsInFull ? REPORT_DONE_CAP : VERDICT_DONE_CAP;
-}
-
-/** Match a `## Heading` block from its line through the line before the next `## ` heading. */
-function extractMarkdownSection(text: string, heading: string): string | null {
-	const startRe = new RegExp(`^## ${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\s|$)`, "im");
-	const match = startRe.exec(text);
-	if (!match || match.index === undefined) return null;
-	const start = match.index;
-	const after = start + match[0].length;
-	const next = /^## /m.exec(text.slice(after));
-	const end = next ? after + next.index : text.length;
-	return text.slice(start, end).replace(/\s+$/g, "");
-}
-
-/**
- * Boss-facing slice of a worker's final text for [subagent-done].
- * Prefer `## TLDR` (+ optional `## What I did not check`); else the first ~15 non-empty lines.
- * Full text stays in the job registry for `subagent_status full:true`.
- */
-function extractDoneTldr(text: string, cap = TLDR_DONE_CAP): string {
-	const raw = text.replace(/\s+$/g, "");
-	if (!raw) return "(no output)";
-
-	let body: string;
-	const tldr = extractMarkdownSection(raw, "TLDR");
-	if (tldr) {
-		const parts = [tldr];
-		const notChecked = extractMarkdownSection(raw, "What I did not check");
-		if (notChecked && notChecked !== tldr) parts.push(notChecked);
-		body = parts.join("\n\n");
-	} else {
-		const picked: string[] = [];
-		let nonEmpty = 0;
-		for (const line of raw.split("\n")) {
-			picked.push(line);
-			if (line.trim().length > 0) {
-				nonEmpty++;
-				if (nonEmpty >= TLDR_FALLBACK_NON_EMPTY_LINES) break;
-			}
-		}
-		body = picked.join("\n").replace(/\s+$/g, "");
-	}
-
-	if (!body) return "(no output)";
-	if (body.length <= cap) return body;
-	return `${body.slice(0, Math.max(0, cap - 1))}…`;
-}
-
-function formatSubagentDoneMessage(
-	result: SingleResult,
-	extra?: { aborted?: boolean; error?: string },
-): string {
-	const aborted = extra?.aborted ?? result.stopReason === "aborted";
-	const ok = !isFailedResult(result) && !aborted && !extra?.error;
-	const att = result.verify;
-	// `ok` stays process-level; `verified` reflects only the runtime-attested verify command.
-	const verified = verifiedStateFor(result, extra);
-	// Inject only a TLDR slice — full worker text is stored on the job and pulled on demand.
-	const output = extractDoneTldr(
-		extra?.error || getResultOutput(result) || result.stderr || "(no output)",
-	);
-	const cost =
-		typeof result.usage.cost === "number" ? result.usage.cost.toFixed(4) : String(result.usage.cost ?? 0);
-	const title =
-		result.title?.trim() || (result.task.split("\n")[0] ?? "").trim().slice(0, 80) || "(untitled)";
-	const lines = [
-		`[subagent-done] agentId=${result.agentId ?? "?"} name=${result.agent} ok=${ok} verified=${verified} cost=${cost} turns=${result.usage.turns ?? 0}${result.resumed ? " resumed=true" : ""}`,
-		`Title: ${title}`,
-	];
-	if (verified === "none") {
-		if (!att && result.verifyDropped) {
-			// Read-only role: the report IS the deliverable, so re-dispatching to make a
-			// shell command pass would loop forever. Say so instead of failing the agent.
-			lines.push(
-				`Verification: not applicable — \`${result.agent}\` is read-only, so the runtime dropped the brief's verify command. Judge this report on its content; do not re-dispatch to make a verify pass.`,
-			);
-		} else if (!att && result.verifySkipped) {
-			// Brief carried a verify command but it was not run (agent aborted).
-			lines.push("Verification: skipped (agent aborted)");
-		} else {
-			lines.push("Verification: worker-claimed only (no verify in brief)");
-		}
-	} else if (att) {
-		lines.push(formatVerifyLine(att));
-		for (const tailLine of att.tail.split("\n").slice(-VERIFY_DONE_TAIL_LINES)) {
-			lines.push(`  ${tailLine}`);
-		}
-	}
-	lines.push(
-		"Result:",
-		output,
-		`Full report: subagent_status({agentId:"${result.agentId ?? "?"}", full:true})`,
-	);
-	return lines.join("\n");
-}
-
-/** Per-step attested verify blocks for chain results: `Verify[i/n]: $ ... → exit N (attested)`. */
-function formatChainVerifyPrefix(results: SingleResult[]): string {
-	const lines: string[] = [];
-	results.forEach((r, i) => {
-		if (!r.verify) return;
-		lines.push(`Verify[${i + 1}/${results.length}]: $ ${r.verify.command} → exit ${formatVerifyExit(r.verify)} (attested)`);
-		for (const tailLine of r.verify.tail.split("\n").slice(-VERIFY_DONE_TAIL_LINES)) {
-			lines.push(`  ${tailLine}`);
-		}
-	});
-	if (lines.length === 0) return "";
-	// Cap the aggregated prefix (REPORT_DONE_CAP): unbounded chain length × ~2000
-	// chars/step must not blow up the tool result. Head-keep, earliest steps first.
-	return `${truncateTextHead(lines.join("\n"), REPORT_DONE_CAP)}\n`;
-}
-
-/**
- * 低层投递：带 options 失败则降级为裸发；两级都用 await 接住 sync throw 和 async rejection，
- * 返回是否确认送达，自身永不 reject（调用方可以放心 void，不会产生 unhandled rejection）。
- */
 async function trySendUserMessage(pi: ExtensionAPI, text: string): Promise<boolean> {
 	// 插队保护：用户批量消息未进 turn 前，自动信号不得抢跑（超时自动释放）。
 	await awaitCutInHoldRelease();
@@ -3093,28 +2478,6 @@ function notifySubagentDone(
 	}
 }
 
-function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
-}
-
-function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-}
-
-function getResultOutput(result: SingleResult): string {
-	if (isFailedResult(result)) {
-		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
-	}
-	return getFinalOutput(result.messages) || "(no output)";
-}
 
 function truncateParallelOutput(output: string): string {
 	const byteLength = Buffer.byteLength(output, "utf8");
@@ -3360,6 +2723,7 @@ async function runSingleAgent(
 		};
 	}
 	const placement = resolveSubagentWorktree({
+		mainCwd: PIPIUI_MAIN_CWD,
 		agentId: pipiuiAgentId,
 		defaultCwd,
 		explicitCwd: cwd, // only when caller passed cwd; undefined → auto worktree
@@ -3424,7 +2788,7 @@ async function runSingleAgent(
 	// context would bias the next one.
 	// First real dispatch is exactly when the ledger becomes relevant (see the lazy-discovery
 	// rule the orchestration layer states), so seed it here rather than on every session start.
-	seedBossLedger();
+	seedBossLedger(PIPIUI_MAIN_CWD, PIPIUI_SESSION);
 	const sessionDir = agent.traits.readOnly ? undefined : agentSessionDir();
 	const sessionId = `pipiui-${pipiuiAgentId}`;
 	const resumingSession = Boolean(
