@@ -335,10 +335,6 @@ struct SettingsSheet: View {
                 PhilosophySection(store: store)
             }
             Divider()
-            localRemoteSection
-            Divider()
-            webSearchSection
-            Divider()
             visionFallbackSection
             Divider()
             notificationSection
@@ -477,53 +473,6 @@ struct SettingsSheet: View {
         f.dateFormat = "MM-dd HH:mm"
         return f
     }()
-
-    private var localRemoteSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("本地远程网页测试")
-                        .font(.title3.weight(.semibold))
-                    Text("默认关闭；仅在本机 127.0.0.1 的随机端口启动独立网页服务。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Toggle(
-                    "",
-                    isOn: Binding(
-                        get: { store.localRemoteEnabled },
-                        set: { store.setLocalRemoteEnabled($0) }
-                    )
-                )
-                .labelsHidden()
-            }
-
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(store.localRemoteURL == nil ? Color.secondary : Color.green)
-                    .frame(width: 8, height: 8)
-                Text(store.localRemoteStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if let url = store.localRemoteURL {
-                    Button("在浏览器打开") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
-            }
-            if let url = store.localRemoteURL {
-                Text(url.absoluteString)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-            Text("此阶段只支持项目/会话列表、文本 transcript、发送和 Stop；不含 LAN、账号、附件、Relay 或 E2EE。关闭开关会立即停止 listener 和现有连接。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
 
     // MARK: - Built-in features (master controls)
 
@@ -1480,29 +1429,6 @@ struct SettingsSheet: View {
         subagentSettings = SubagentModelSettings.allSettings()
         recomputePickerModels()
         statusMessage = "已为 \(agentName) 添加备用模型 \(candidate.id)"
-    }
-
-    // MARK: - Web Search
-
-    private var webSearchSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("网络搜索")
-                .font(.title3.weight(.semibold))
-            Text("为不带联网搜索的模型（Kimi 等）提供 web_search / web_fetch 工具。web_search 使用 Firecrawl 免 key 搜索，无需任何配置。当前模型若自带搜索（Grok、GLM、官方 Codex、Claude），web_search 会自动跳过；必要时可用 force 参数强制执行。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            if let model = store.currentSession?.model,
-               WebSearchSettings.isNativeSearchModel(provider: model.provider, modelId: model.modelId) {
-                Label("当前模型（\(model.name)）自带联网搜索，web_search 工具会自动跳过。", systemImage: "info.circle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            }
-
-            Text("web_search 通过 Firecrawl 免 key 执行，无需 API key 或后端配置。")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
     }
 
     // MARK: - MCP Servers
