@@ -93,6 +93,11 @@ final class SearchScopeExtensionTests: XCTestCase {
             installedSource.contains("event.prompt"),
             "a Pi/subagent prompt must never create its own external-path grant"
         )
+        // Built-in grep/find/ls must be additively activated (default active set omits them).
+        XCTAssertTrue(installedSource.contains("pi.on(\"session_start\""))
+        XCTAssertTrue(installedSource.contains("const wanted = [\"grep\", \"find\", \"ls\"]"))
+        XCTAssertTrue(installedSource.contains("pi.getActiveTools()"))
+        XCTAssertTrue(installedSource.contains("pi.setActiveTools([...active, ...missing])"))
         let harness = dir.appendingPathComponent("harness.ts")
         let script = """
         import { evaluateSearchPath, bashBlockReason } from "./pipiui-search-scope.ts";

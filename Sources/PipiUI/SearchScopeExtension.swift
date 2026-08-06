@@ -443,6 +443,17 @@ function blockReason(detail: string): string {
 }
 
 export default function (pi: ExtensionAPI) {
+  // Activate built-in discovery tools additively. Pi's default active set is only
+  // read/bash/edit/write; grep/find/ls stay registered but inactive unless enabled.
+  // setActiveTools is a notInitialized stub during loader registration, so wait for
+  // session_start (documented lifecycle event). Idempotent for nested sessions.
+  pi.on("session_start", () => {
+    const wanted = ["grep", "find", "ls"];
+    const active = pi.getActiveTools();
+    const missing = wanted.filter((name) => !active.includes(name));
+    if (missing.length > 0) pi.setActiveTools([...active, ...missing]);
+  });
+
   pi.on("before_agent_start", (event) => {
     // Stable, depth-independent policy text keeps prompt caching deterministic.
     // PIPIUI_AGENT_DEPTH is intentionally not used to create grants: only the App's
