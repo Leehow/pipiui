@@ -1089,12 +1089,13 @@ private struct StreamingTranscriptRows: View {
                 .equatable()
                 .id(transcriptID("streaming"))
                 .transcriptFlip()
-            } else if !browsingHistory && (session.isWorking || session.isCompacting || session.mediaBusy) {
+            } else if !browsingHistory && (session.isWorking || session.isCompacting || session.mediaBusy || session.visionCaptionInProgress) {
                 let placeholder = WaitingPlaceholderChoice(
                     mediaBusy: session.mediaBusy,
                     mediaStatus: session.mediaStatus,
                     isStopping: session.isStopping,
-                    isCompacting: session.isCompacting
+                    isCompacting: session.isCompacting,
+                    isCaptioning: session.visionCaptionInProgress
                 )
                 WaitingPlaceholderView(
                     message: placeholder.message,
@@ -1135,6 +1136,7 @@ private struct StreamingTranscriptRows: View {
                                     presentationScopeID: transcriptID(item.id),
                                     isWorking: session.isWorking,
                                     isEditing: session.editingItemId == item.id,
+                                    forceExpandedUserBubble: session.visionCaptionOptimisticID == item.id,
                                     onFlash: { session.flash($0) },
                                     onSelectAgent: selectAgent,
                                     onOpenFinishedGroup: onOpenFinishedGroup,
