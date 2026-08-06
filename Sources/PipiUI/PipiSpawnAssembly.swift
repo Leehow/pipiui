@@ -15,6 +15,9 @@ enum PipiSpawnEnvironmentPolicy {
         "PIPIUI_SESSION_KEY",
         "PIPIUI_SKILL_READ_BLOCK",
         "PIPIUI_WEBSEARCH_CONFIG_FILE",
+        "PIPIUI_WEBSEARCH_EXT",
+        "PIPIUI_MCP_CONFIG_FILE",
+        "PIPIUI_MCP_EXT",
         "PIPIUI_WORKTREE",
     ]
 
@@ -55,6 +58,7 @@ enum PipiSpawnAssembly {
         var git: String?
         var reload: String?
         var webSearch: String?
+        var mcp: String?
         var skillLoader: String?
         var searchScope: String?
         var memory: String? = nil
@@ -83,6 +87,7 @@ enum PipiSpawnAssembly {
                 git: features.isEnabled(.git) ? installed.gitExtension : nil,
                 reload: features.isEnabled(.reload) ? installed.reloadExtension : nil,
                 webSearch: features.isEnabled(.webSearch) ? installed.webSearchExtension : nil,
+                mcp: features.isEnabled(.mcp) ? installed.mcpExtension : nil,
                 skillLoader: features.isEnabled(.skillLoader) ? installed.skillLoaderExtension : nil,
                 searchScope: features.isEnabled(.searchScope) ? installed.searchScopeExtension : nil,
                 memory: memoryEnabled ? installed.memoryExtension : nil,
@@ -111,6 +116,7 @@ enum PipiSpawnAssembly {
         var mainModelId: String?
         var excludeToolsArgs: [String]
         var webSearchConfigFile: String
+        var mcpConfigFile: String
     }
 
     struct Output: Equatable, Sendable {
@@ -176,6 +182,14 @@ enum PipiSpawnAssembly {
             // whose provider ships it; this is the fallback that makes an `explore` worker
             // able to search regardless of which model it happens to run on.
             env["PIPIUI_WEBSEARCH_EXT"] = p
+        }
+
+        // MCP: user-added servers + hot-read config env travel together. The extension is
+        // re-exported (`PIPIUI_MCP_EXT`) so dispatched workers can also use user MCP tools.
+        if f.isEnabled(.mcp), let p = input.paths.mcp {
+            args += ["-e", p]
+            env["PIPIUI_MCP_CONFIG_FILE"] = input.mcpConfigFile
+            env["PIPIUI_MCP_EXT"] = p
         }
 
         // Main session only: dispatched workers stay fully skill-free.

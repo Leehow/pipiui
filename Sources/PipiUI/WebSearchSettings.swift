@@ -1,29 +1,22 @@
 import Foundation
 
-/// Web search tool configuration: backend selection + per-backend API keys.
+/// Web search tool configuration: Firecrawl keyless search (single backend, no API keys).
 ///
-/// T19 (.env 方案):
-/// - Backend 选择仍走 UserDefaults + JSON 热读镜像（不变）。
-/// - 各后端 API key 统一写入 `~/.pi/agent/.env`（键名见
-///   `ProviderEnvMap.searchEnvVars`），不再做 UserDefaults/JSON 双写。
-/// - UI 层约定：输入框永不回显已存值；留空 = 不修改；传 nil/空白 = 删除。
-/// The TS extension hot-reads the JSON mirror (backend) and .env (keys) at
-/// execution time — no session restart needed.
+/// Backend selection still goes through UserDefaults + JSON hot-read mirror for
+/// compatibility, but is fixed to "firecrawl". The TS extension always uses
+/// Firecrawl keyless search — no key needed, no session restart required.
 enum WebSearchSettings {
     static let backendKey = "pipiui.webSearch.backend"
-    static let defaultBackend = "duckduckgo"
+    static let defaultBackend = "firecrawl"
 
-    static let availableBackends = ["tavily", "brave", "serpapi", "exa", "kimi", "duckduckgo"]
+    static let availableBackends = ["firecrawl"]
 
-    /// 共享的 .env 存取实例（默认路径 `~/.pi/agent/.env`）。
-    static let defaultEnvStore = EnvFileStore()
-
-    // MARK: - Backend selection (unchanged: UserDefaults + JSON mirror)
+    // MARK: - Backend selection (fixed to firecrawl)
 
     static func backend(defaults: UserDefaults = .standard) -> String {
-        let raw = defaults.string(forKey: backendKey) ?? ""
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? defaultBackend : trimmed
+        // Ignore any persisted/user-set value; only "firecrawl" is supported now.
+        let _ = defaults.string(forKey: backendKey)
+        return defaultBackend
     }
 
     static func setBackend(_ value: String, defaults: UserDefaults = .standard, fileManager: FileManager = .default) {
@@ -31,50 +24,29 @@ enum WebSearchSettings {
         syncJSONFile(defaults: defaults, fileManager: fileManager)
     }
 
-    // MARK: - API keys (.env)
+    // MARK: - API keys (removed — Firecrawl is keyless)
 
-    /// 该后端 key 在 .env 中的键名；duckduckgo 等无需 key 的后端返回 nil。
+    /// Firecrawl keyless search needs no API key; always nil.
     static func envVar(for backend: String) -> String? {
-        ProviderEnvMap.searchEnvVars[backend]
+        nil
     }
 
-    /// 是否已在 .env 配置该后端的 key（仅用于 placeholder，不回显值）。
-    /// Kimi 还可复用 `auth.json` 的 `kimi-coding` 凭据（与配额同源）。
+    /// Firecrawl keyless search needs no API key; always false.
     static func isKeyConfigured(
         for backend: String,
-        store: EnvFileStore = defaultEnvStore,
-        kimiAuthURL: URL? = nil
+        store: EnvFileStore
     ) -> Bool {
-        if backend == "kimi" {
-            if store.isConfigured(forKey: "KIMI_API_KEY")
-                || store.isConfigured(forKey: "KIMI_CODE_API_KEY")
-                || store.isConfigured(forKey: "KIMI_SEARCH_API_KEY")
-            {
-                return true
-            }
-            let authURL = kimiAuthURL ?? KimiAuthStore.defaultAuthURL()
-            return KimiAuthStore.loadFromPiAuth(authURL: authURL) != nil
-        }
-        guard let envVar = envVar(for: backend) else { return false }
-        return store.isConfigured(forKey: envVar)
+        false
     }
 
-    /// 写入/替换该后端的 key；传 nil 或空白字符串 = 从 .env 移除。
-    /// 返回 false 表示该后端无对应 .env 键名（未做任何修改）。
+    /// Firecrawl keyless search needs no API key; reported as not writable.
     @discardableResult
     static func setApiKey(
         _ key: String?,
         for backend: String,
-        store: EnvFileStore = defaultEnvStore
+        store: EnvFileStore
     ) throws -> Bool {
-        guard let envVar = envVar(for: backend) else { return false }
-        let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if trimmed.isEmpty {
-            try store.removeSync(forKey: envVar)
-        } else {
-            try store.setSync(trimmed, forKey: envVar)
-        }
-        return true
+        false
     }
 
     // MARK: - Hot-read JSON mirror (backend only)
@@ -85,7 +57,7 @@ enum WebSearchSettings {
         return dir.appendingPathComponent("websearch-config.json")
     }
 
-    /// JSON 镜像内容（T19 起只含 backend；key 一律从 .env 热读）。
+    /// JSON 镜像内容（只含 backend；固定 firecrawl）。
     static func jsonPayload(defaults: UserDefaults = .standard) -> [String: Any] {
         ["backend": backend(defaults: defaults)]
     }

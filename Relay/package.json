@@ -4,18 +4,23 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "bundle": "esbuild src/tunnel-browser.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/assets/tunnel-browser.js && esbuild src/trystero-browser.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/assets/trystero-browser.js && esbuild src/tunnel-host.ts --bundle --format=iife --platform=browser --target=safari16 --outfile=../Sources/PipiUI/Resources/RemoteP2P/tunnel-host.js",
+    "bundle": "esbuild src/tunnel-browser.tsx --bundle --minify --format=esm --platform=browser --target=es2022 --jsx=automatic --outfile=dist/assets/tunnel-browser.js && esbuild src/trystero-browser.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/assets/trystero-browser.js && esbuild src/tunnel-host.ts --bundle --format=iife --platform=browser --target=safari16 --outfile=../Sources/PipiUI/Resources/RemoteP2P/tunnel-host.js",
     "build": "tsc -p tsconfig.json && npm run bundle",
     "start": "node dist/tunnel-server.js",
     "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@trystero-p2p/ws-relay": "0.25.3",
+    "antd-mobile": "^5.36.0",
     "jose": "6.2.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
     "ws": "8.21.1"
   },
   "devDependencies": {
     "@types/node": "24.13.3",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
     "@types/ws": "8.18.1",
     "esbuild": "0.25.8",
     "tsx": "4.23.1",

@@ -61,6 +61,8 @@ enum BuiltInFeatureSettings {
         case reload
         /// PipiUI's own web_search / web_fetch extension (not a native model tool).
         case webSearch
+        /// User-added MCP servers (stdio / HTTP) exposed as local tools.
+        case mcp
         /// On-demand skill loader (name index + skill_search / skill_load).
         case skillLoader
         /// Project search boundary + per-turn external path grant.
@@ -112,7 +114,11 @@ enum BuiltInFeatureSettings {
         .init(id: .webSearch,
               section: .extensionTool,
               title: "web_search / web_fetch",
-              summary: "为不带联网搜索的模型补充搜索/抓取工具（后端在「通用」里配置）。"),
+              summary: "为不带联网搜索的模型补充搜索/抓取工具（Firecrawl 免 key 搜索，无需配置）。"),
+        .init(id: .mcp,
+              section: .extensionTool,
+              title: "MCP 服务器",
+              summary: "用户自添的 MCP 服务器（搜索类 MCP 如 firecrawl-mcp / brave-mcp / 智谱 MCP）。工具以 mcp_<服务器名>_<工具名> 暴露给 agent；在「工具/mcp」页配置。"),
         .init(id: .codexServerTools,
               section: .extensionTool,
               title: "Codex hosted 搜索",
@@ -124,7 +130,7 @@ enum BuiltInFeatureSettings {
         .init(id: .computerUse,
               section: .extensionTool,
               title: "Computer Use 能力",
-              summary: "PipiUI 桌面控制能力是否可用。关闭后即便「工具」里的授权为开也不挂载；授权与策略仍在「工具」中独立设置。"),
+              summary: "PipiUI 桌面控制能力是否可用。关闭后即便「工具」里的授权为开也不挂载；授权与策略仍在「内置」中独立设置。"),
         .init(id: .philosophy,
               section: .constraint,
               title: "工作哲学",

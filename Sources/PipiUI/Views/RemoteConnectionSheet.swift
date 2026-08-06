@@ -498,6 +498,8 @@ struct RemoteConnectionSheet: View {
             return .green
         case .negotiating:
             return .yellow
+        case .reconnecting:
+            return .accentColor
         case .failed:
             return .orange
         case .disabled, .ready, .closed:

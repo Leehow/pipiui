@@ -624,6 +624,7 @@ private final class SidebarDividerTrackingView: NSView {
 
 struct EmptyStateView: View {
     @EnvironmentObject var store: AppStore
+    @State private var showAddModel = false
 
     var body: some View {
         VStack(spacing: 14) {
@@ -640,8 +641,21 @@ struct EmptyStateView: View {
                 Label("添加项目文件夹", systemImage: "folder.badge.plus")
             }
             .controlSize(.large)
+            Button {
+                showAddModel = true
+            } label: {
+                Label("添加 API key / 登录", systemImage: "key.fill")
+            }
+            .controlSize(.large)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .textBackgroundColor))
+        .sheet(isPresented: $showAddModel) {
+            // 复用 SettingsSheet 里的 AddModelSheet：API key 直写 ~/.pi/agent/.env，
+            // 或走 OAuth 浏览器授权（等同 pi /login）。空白页保存后无需刷新凭据列表。
+            AddModelSheet { /* saved; sheet dismisses itself */ }
+                .environmentObject(store)
+                .dismissOnOutsideClick { showAddModel = false }
+        }
     }
 }

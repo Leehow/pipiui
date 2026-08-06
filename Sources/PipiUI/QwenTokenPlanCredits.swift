@@ -34,12 +34,14 @@ enum QwenTokenPlanAuthStore {
     /// Builds a `name=value; ...` Cookie header value from every cookie whose
     /// domain contains `aliyun.com` or `alibabacloud.com`.
     ///
-    /// When the WebKit store holds cookies (logged in just now, or this session),
-    /// we persist the resulting string so it survives a restart, then return it.
-    /// When the WebKit store is empty (fresh launch before WebKit loads cookies),
-    /// we fall back to the persisted cache. Returns nil only when neither source
-    /// has a cookie (user never logged in, or the cached cookie has expired and
-    /// was cleared).
+    /// Only a WebKit set that looks fully logged in (contains the
+    /// `login_aliyunid_ticket` session ticket) is adopted; a partial set (e.g.
+    /// tracking cookies like `cna`/`isg` without the ticket) is never persisted
+    /// over the last-known-good cache. Persisting to the cache happens in
+    /// `QwenTokenPlanBilling.fetchSnapshot` only after a response parses
+    /// successfully, so a stale/expired ticket cannot clobber the good cache
+    /// either. Returns nil only when neither source has a cookie (user never
+    /// logged in, or the cached cookie was cleared).
     static func cookieString(
         store: WKWebsiteDataStore? = nil
     ) async -> String? {
@@ -54,16 +56,44 @@ enum QwenTokenPlanAuthStore {
             return domain.contains("aliyun.com") || domain.contains("alibabacloud.com")
         }
         if !filtered.isEmpty {
-            let joined = filtered
-                .map { "\($0.name)=\($0.value)" }
-                .joined(separator: "; ")
-            if !joined.isEmpty {
-                persistCookie(joined)
-                return joined
+            // Adopt only a logged-in session set (has the login ticket).
+            let hasTicket = filtered.contains { $0.name == "login_aliyunid_ticket" }
+            if hasTicket {
+                let joined = filtered
+                    .map { "\($0.name)=\($0.value)" }
+                    .joined(separator: "; ")
+                if !joined.isEmpty {
+                    return joined
+                }
             }
+            // Partial / not-logged-in WebKit set → never adopt or persist; keep the cache.
+            return cachedCookie()
         }
         // WebKit store empty (restart before WebKit loaded cookies) → fall back to cache.
         return cachedCookie()
+    }
+}
+
+// MARK: - Snapshot persistence
+
+/// Persists the last successful Qwen Token Plan quota snapshot to UserDefaults so
+/// a cold start can show the last known quota immediately (before the network
+/// refresh lands). Plaintext is acceptable for this single-user macOS MVP.
+enum QwenTokenPlanSnapshotStore {
+    static let snapshotCacheKey = "qwenTokenPlanLastSnapshot"
+
+    static func persist(_ snapshot: QuotaSnapshot) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        guard let data = try? encoder.encode(snapshot) else { return }
+        UserDefaults.standard.set(data, forKey: snapshotCacheKey)
+    }
+
+    static func load() -> QuotaSnapshot? {
+        guard let data = UserDefaults.standard.data(forKey: snapshotCacheKey) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        return try? decoder.decode(QuotaSnapshot.self, from: data)
     }
 }
 
@@ -81,6 +111,8 @@ enum QwenTokenPlanAuthStore {
 enum QwenTokenPlanBilling {
     enum BillingError: Error {
         case apiError(String)
+        /// Gateway returned HTTP 200 with `errorCode: BailianGateway.Login.NotLogined`.
+        case notLogined
         case parseFailed(String)
     }
 
@@ -136,6 +168,9 @@ enum QwenTokenPlanBilling {
 
         var request = URLRequest(url: usageURL)
         request.httpMethod = "POST"
+        // The cookie is set explicitly below; URLSession's own cookie storage must
+        // not inject or rewrite anything on our behalf.
+        request.httpShouldHandleCookies = false
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         request.setValue(cookie, forHTTPHeaderField: "Cookie")
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
@@ -156,7 +191,27 @@ enum QwenTokenPlanBilling {
         guard http.statusCode == 200 else {
             throw BillingError.apiError("HTTP \(http.statusCode)")
         }
-        return try parseSnapshot(from: data)
+        // The gateway reports stale/absent sessions as HTTP 200 + a NotLogined
+        // errorCode body. That is a distinct, logged failure — never a successful
+        // fetch, and the cookie used for it must never be persisted over the cache.
+        if detectNotLogined(data) {
+            Log.warn("qwen token plan: gateway NotLogined; keeping cached session and quota", category: .network)
+            throw BillingError.notLogined
+        }
+        let snapshot = try parseSnapshot(from: data)
+        // Only a genuinely successful fetch updates the persisted session cookie
+        // and the last-known-good quota snapshot.
+        QwenTokenPlanAuthStore.persistCookie(cookie)
+        QwenTokenPlanSnapshotStore.persist(snapshot)
+        return snapshot
+    }
+
+    /// Matches the gateway's NotLogined error body (HTTP 200): a JSON object with
+    /// `errorCode` containing `NotLogined` (e.g. `BailianGateway.Login.NotLogined`).
+    private static func detectNotLogined(_ data: Data) -> Bool {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let code = root["errorCode"] as? String else { return false }
+        return code.contains("NotLogined")
     }
 
     /// Form-urlencoded body with the `params` JSON (url-encoded).
@@ -223,6 +278,10 @@ final class QwenTokenPlanQuotaMonitor: QuotaMonitor {
     private let core = QuotaMonitorCore()
 
     private init() {
+        // Seed the last-known-good snapshot (persisted after the previous
+        // successful fetch) so the pill shows real quota immediately on cold
+        // start; the normal refresh then replaces it with a fresh network value.
+        core.seed(QwenTokenPlanSnapshotStore.load())
         core.fetcher = { [weak self] _ in try await self?.fetchQwen() }
     }
 

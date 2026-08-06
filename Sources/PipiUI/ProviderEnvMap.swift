@@ -69,16 +69,8 @@ public enum ProviderEnvMap {
     // MARK: - Search backends
 
     /// Search/web backends used by extensions; keyed by backend name.
-    public static let searchEnvVars: [String: String] = [
-        "tavily": "TAVILY_API_KEY",
-        "brave": "BRAVE_API_KEY",
-        "serpapi": "SERPAPI_API_KEY",
-        "exa": "EXA_API_KEY",
-        // Kimi Code membership search (`api.kimi.com/coding/v1/search`).
-        // Shares KIMI_API_KEY with the kimi-coding chat provider; TS also
-        // accepts KIMI_CODE_API_KEY / KIMI_SEARCH_API_KEY and auth.json.
-        "kimi": "KIMI_API_KEY",
-    ]
+    /// Empty: web_search is now Firecrawl keyless — no backend API keys to map.
+    public static let searchEnvVars: [String: String] = [:]
 
     // MARK: - Lookups
 
@@ -93,7 +85,6 @@ public enum ProviderEnvMap {
     }
 
     /// Reverse lookup: provider IDs whose canonical env var matches.
-    /// (Search backends are included via `searchEnvVars`.)
     public static func providers(forEnvVar envVar: String) -> [String] {
         var hits = envVarsByProvider
             .filter { $0.value.contains(envVar) }

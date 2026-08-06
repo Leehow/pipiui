@@ -67,7 +67,8 @@ final class MemoryExtensionTests: XCTestCase {
             computerDescriptor: nil,
             mainModelId: nil,
             excludeToolsArgs: [],
-            webSearchConfigFile: "/tmp/web.json"
+            webSearchConfigFile: "/tmp/web.json",
+            mcpConfigFile: "/tmp/mcp.json"
         ))
         XCTAssertTrue(output.args.contains("/p/memory.ts"))
     }

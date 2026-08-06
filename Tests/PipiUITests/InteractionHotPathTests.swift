@@ -48,6 +48,25 @@ final class InteractionHotPathTests: XCTestCase {
         )
     }
 
+    func testComposerMouseMovedHotPathDoesNotForwardToNSTextView() throws {
+        let source = try source(named: "InputBar.swift")
+        guard let composerRange = source.range(of: "final class ComposerNSTextView: NSTextView"),
+              let nextTypeRange = source.range(
+                  of: "final class ComposerPlaceholderLabel",
+                  range: composerRange.lowerBound..<source.endIndex
+              ) else {
+            return XCTFail("ComposerNSTextView definition is missing")
+        }
+        let composerSource = String(source[composerRange.lowerBound..<nextTypeRange.lowerBound])
+
+        XCTAssertTrue(composerSource.contains("override func mouseMoved(with event: NSEvent)"))
+        XCTAssertTrue(composerSource.contains("NSCursor.iBeam.set()"))
+        XCTAssertFalse(
+            composerSource.contains("super.mouseMoved(with: event)"),
+            "Composer hover must not enter NSTextView.mouseMoved/sharing-service lookup"
+        )
+    }
+
     private func source(named name: String) throws -> String {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

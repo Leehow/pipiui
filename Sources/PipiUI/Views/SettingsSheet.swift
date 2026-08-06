@@ -6,9 +6,8 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case builtIn = "内置"
     case models = "模型"
     case usage = "用量"
-    case toolsSkills = "工具"
+    case toolsSkills = "工具/mcp"
     case subagentModels = "Subagent"
-    case memory = "记忆"
     case experimental = "实验"
     var id: String { rawValue }
 
@@ -18,7 +17,6 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         switch self {
         case .toolsSkills: return "工具与 Skills"
         case .subagentModels: return "Subagent 模型"
-        case .memory: return "可控记忆"
         default: return rawValue
         }
     }
@@ -31,7 +29,6 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .usage: return "chart.bar.fill"
         case .toolsSkills: return "wrench.and.screwdriver"
         case .subagentModels: return "person.2"
-        case .memory: return "brain.head.profile"
         case .experimental: return "flask"
         }
     }
@@ -53,12 +50,14 @@ struct SettingsSheet: View {
     /// `BuiltInFeatureSettings` defaults so first launch shows everything on.
     @State private var builtInDisabled: Set<String> = BuiltInFeatureSettings.disabledIDs()
     @State private var webSearchBackend: String = WebSearchSettings.backend()
-    /// 输入缓冲：永不回显已存 key；留空 = 不修改。
-    @State private var webSearchApiKey: String = ""
-    /// 当前后端 key 是否已在 .env 配置（驱动 placeholder /「清除」按钮）。
-    @State private var webSearchKeyConfigured = false
+    /// User-added MCP servers (canonical store read at open).
+    @State private var mcpServers: [McpServer] = McpServerSettings.servers()
+    @State private var editingMcpServer: McpServer?
+    @State private var showMcpEditor = false
+    @State private var mcpTestResult: String?
+    @State private var mcpTestInProgress = false
     /// 图片转文字（非多模态模型看图）
-    @State private var visionFallbackMode: VisionFallbackSettings.Mode = VisionFallbackSettings.mode()
+    @State private var visionFallbackSelection: String = VisionFallback.unifiedSelection(for: VisionFallbackSettings.load())
     @State private var visionFallbackBaseURL: String = VisionFallbackSettings.load().baseURL
     @State private var visionFallbackApiKey: String = ""
     /// 实验 tab: jcode 已配置 provider 探测结果 + 探测中状态 + 启用确认弹窗。
@@ -68,6 +67,10 @@ struct SettingsSheet: View {
     @State private var visionFallbackModelId: String = VisionFallbackSettings.load().modelId
     @State private var visionFallbackMaxTokens: String = String(VisionFallbackSettings.load().maxTokens)
     @State private var visionFallbackKeyConfigured = !(VisionFallbackSettings.load().apiKey.isEmpty)
+    /// 云端视觉模型来源（手填 / 已配置模型）+ 选中的模型 id + 解析提示。
+    @State private var visionFallbackCloudSource: VisionFallbackSettings.CloudSource = VisionFallbackSettings.load().cloudSource
+    @State private var visionFallbackCloudModelRef: String = VisionFallbackSettings.load().cloudModelRef
+    @State private var visionFallbackCloudModelError: String?
     /// 显示价格单位（USD 内部记账，仅影响展示）+ 汇率刷新状态。
     @State private var priceUnit: PriceUnit = PricingSettings.unit()
     @State private var fxRefreshing = false
@@ -219,8 +222,6 @@ struct SettingsSheet: View {
             toolsSkillsSection
         case .subagentModels:
             subagentModelsSection
-        case .memory:
-            ControlledMemoryView()
         case .experimental:
             experimentalSection
         case .models:
@@ -539,6 +540,9 @@ struct SettingsSheet: View {
             ForEach(BuiltInFeatureSettings.Section.allCases, id: \.rawValue) { section in
                 builtInGroup(section)
             }
+
+            Divider()
+            ComputerUseSettingsPanel()
 
             if BuiltInFeatureSettings.EnabledSet(disabled: builtInDisabled).allDisabled {
                 Label("全部已关闭：新建/重启会话将不挂载任何 PipiUI 自有能力。", systemImage: "moon.zzz")
@@ -1191,15 +1195,17 @@ struct SettingsSheet: View {
 
     private var toolsSkillsSection: some View {
         LazyVStack(alignment: .leading, spacing: 16) {
-            Text("工具与 Skills")
+            Text("工具 / MCP")
                 .font(.title3.weight(.semibold))
-            Text("普通工具关闭后通过 `--exclude-tools` 在会话重启后生效。Computer Use 是独立 opt-in：关闭时扩展完全不挂载。Skills 会立即从斜杠菜单隐藏。")
+            Text("普通工具关闭后通过 `--exclude-tools` 在会话重启后生效。Skills 会立即从斜杠菜单隐藏。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            ComputerUseSettingsPanel()
             catalogGroup(title: "内置工具", entries: ToolSkillCatalog.builtinTools)
             catalogGroup(title: "扩展工具", entries: ToolSkillCatalog.extensionTools)
+
+            Divider()
+            mcpSection
 
             LazyVStack(alignment: .leading, spacing: 8) {
                 Text("Skills")
@@ -1482,51 +1488,9 @@ struct SettingsSheet: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("网络搜索")
                 .font(.title3.weight(.semibold))
-            Text("为不带联网搜索的模型（Kimi 等）提供 web_search / web_fetch 工具。当前模型若自带搜索（Grok、GLM、官方 Codex、Claude），web_search 会自动跳过。")
+            Text("为不带联网搜索的模型（Kimi 等）提供 web_search / web_fetch 工具。web_search 使用 Firecrawl 免 key 搜索，无需任何配置。当前模型若自带搜索（Grok、GLM、官方 Codex、Claude），web_search 会自动跳过；必要时可用 force 参数强制执行。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-
-            VStack(alignment: .leading, spacing: 10) {
-                Picker("搜索后端", selection: $webSearchBackend) {
-                    Text("DuckDuckGo（免费，无需 key）").tag("duckduckgo")
-                    Text("Tavily").tag("tavily")
-                    Text("Brave Search").tag("brave")
-                    Text("SerpAPI (Google)").tag("serpapi")
-                    Text("Exa AI").tag("exa")
-                    Text("Kimi Code").tag("kimi")
-                }
-                .onChange(of: webSearchBackend) { _, newValue in
-                    WebSearchSettings.setBackend(newValue)
-                    // 输入缓冲不回显：切后端后清空，仅刷新「已配置」状态。
-                    webSearchApiKey = ""
-                    webSearchKeyConfigured = WebSearchSettings.isKeyConfigured(for: newValue, store: envStore)
-                    statusMessage = "搜索后端已切换为 \(newValue)（立即生效，无需重启会话）"
-                }
-
-                if webSearchBackend != "duckduckgo" {
-                    HStack(spacing: 8) {
-                        SecureField(
-                            webSearchKeyConfigured ? "已配置，输入以替换" : "未配置",
-                            text: $webSearchApiKey
-                        )
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { saveWebSearchKey() }
-                        Button("保存") { saveWebSearchKey() }
-                            .disabled(webSearchApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        if webSearchKeyConfigured {
-                            Button("清除") { clearWebSearchKey() }
-                        }
-                    }
-                    Text("留空 = 不修改；key 保存在 ~/.pi/agent/.env（\(WebSearchSettings.envVar(for: webSearchBackend) ?? "")）。")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                    Text(backendHelpText)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            .padding(10)
-            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
 
             if let model = store.currentSession?.model,
                WebSearchSettings.isNativeSearchModel(provider: model.provider, modelId: model.modelId) {
@@ -1535,9 +1499,131 @@ struct SettingsSheet: View {
                     .foregroundStyle(.orange)
             }
 
-            Text("设置修改后立即对新的工具调用生效（热读取），无需重启会话。后端选择存于 websearch-config.json；API key 以 0600 权限存于 ~/.pi/agent/.env。")
+            Text("web_search 通过 Firecrawl 免 key 执行，无需 API key 或后端配置。")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
+        }
+    }
+
+    // MARK: - MCP Servers
+
+    private var mcpSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("MCP 服务器")
+                .font(.title3.weight(.semibold))
+            Text("添加你自己的 MCP 服务器（如 firecrawl-mcp / brave-mcp / 智谱 MCP），其工具会以 mcp_<服务器名>_<工具名> 暴露给 agent。环境变量用 ${VAR} 引用 ~/.pi/agent/.env 中的值。新增/删除后在下一个会话（或 /pipiui_reload）生效。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if mcpServers.isEmpty {
+                Text("尚未添加任何 MCP 服务器。")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(Array(mcpServers.enumerated()), id: \.element.id) { index, server in
+                    HStack(alignment: .center, spacing: 10) {
+                        Toggle("", isOn: Binding(
+                            get: { mcpServers[index].enabled },
+                            set: { on in
+                                mcpServers[index].enabled = on
+                                saveMcpServers()
+                            }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(server.name)
+                                .font(.callout)
+                                .lineLimit(1)
+                            Text(mcpServerSubtitle(server))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+
+                        Button("测试") {
+                            testMcp(server)
+                        }
+                        .font(.caption)
+                        .disabled(mcpTestInProgress)
+
+                        Button("编辑") {
+                            editingMcpServer = server
+                            showMcpEditor = true
+                        }
+                        .font(.caption)
+
+                        Button("删除") {
+                            mcpServers.removeAll { $0.id == server.id }
+                            saveMcpServers()
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+
+            Button {
+                editingMcpServer = nil
+                showMcpEditor = true
+            } label: {
+                Label("添加服务器", systemImage: "plus")
+            }
+            .font(.callout)
+
+            if mcpTestInProgress {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("测试连接中…").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if let result = mcpTestResult {
+                Text(result)
+                    .font(.caption)
+                    .foregroundStyle(result.hasPrefix("❌") ? .red : .secondary)
+            }
+        }
+        .sheet(isPresented: $showMcpEditor) {
+            McpServerEditor(server: editingMcpServer) { server in
+                if let i = mcpServers.firstIndex(where: { $0.id == server.name }) {
+                    mcpServers[i] = server
+                } else {
+                    mcpServers.append(server)
+                }
+                saveMcpServers()
+            }
+        }
+    }
+
+    private func mcpServerSubtitle(_ server: McpServer) -> String {
+        switch server.transport {
+        case .stdio:
+            let args = server.args.joined(separator: " ")
+            return args.isEmpty ? "stdio: \(server.command)" : "stdio: \(server.command) \(args)"
+        case .http:
+            return "http: \(server.url)"
+        }
+    }
+
+    private func saveMcpServers() {
+        McpServerSettings.save(mcpServers)
+        mcpTestResult = "已保存。新增/删除服务器后需在下一会话或 /pipiui_reload 生效。"
+    }
+
+    private func testMcp(_ server: McpServer) {
+        mcpTestInProgress = true
+        mcpTestResult = nil
+        let variables = EnvFileStore().all()
+        Task {
+            let result = await McpServerSettings.testConnection(server, variables: variables)
+            await MainActor.run {
+                mcpTestResult = result.display
+                mcpTestInProgress = false
+            }
         }
     }
 
@@ -1547,22 +1633,30 @@ struct SettingsSheet: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("图片转文字（非多模态模型看图）")
                 .font(.title3.weight(.semibold))
-            Text("DeepSeek 等不支持直接看图的模型：发送带图消息时，自动用本地 OCR（可选再加云端视觉模型描述）把图片转成文字注入消息。缩略图与 RPC 图片附件保持不变。")
+            Text("DeepSeek 等不支持直接看图的模型：发送带图消息时，自动把图片转成文字注入消息。直接选一个已配置的多模态模型作为图像识别模型，或仅用本地 OCR。缩略图与 RPC 图片附件保持不变。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             VStack(alignment: .leading, spacing: 10) {
-                Picker("模式", selection: $visionFallbackMode) {
-                    ForEach(VisionFallbackSettings.Mode.allCases) { mode in
-                        Text(mode.title).tag(mode)
+                Picker("图片转文字", selection: $visionFallbackSelection) {
+                    ForEach(VisionFallback.visionModels(from: pickerModels)) { m in
+                        Text(m.name).tag("model:\(m.id)")
                     }
+                    Text("仅本地 OCR（不用云端模型）").tag("ocr")
+                    Text("关闭（不转换）").tag("off")
+                    Text("手动 endpoint…").tag("manual")
                 }
-                .onChange(of: visionFallbackMode) { _, newValue in
-                    VisionFallbackSettings.setMode(newValue)
-                    statusMessage = "图片转文字已切换为\(newValue.title)"
+                .onChange(of: visionFallbackSelection) { _, tag in
+                    applyVisionFallbackSelection(tag)
                 }
 
-                if visionFallbackMode == .ocrAndCloud {
+                if visionFallbackCloudModelError != nil {
+                    Text(visionFallbackCloudModelError!)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
+
+                if visionFallbackCloudSource == .manual {
                     TextField("服务地址（OpenAI 兼容 base URL）", text: $visionFallbackBaseURL)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { saveVisionFallbackCloud() }
@@ -1589,7 +1683,11 @@ struct SettingsSheet: View {
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { saveVisionFallbackCloud() }
                     Button("保存云端设置") { saveVisionFallbackCloud() }
-                    Text("base URL 形如 https://api.openai.com/v1；会自动补 /chat/completions。API Key 仅存本机 UserDefaults。云端失败时自动退回仅 OCR。")
+                    Text("base URL 形如 https://api.openai.com/v1；会自动补 /chat/completions。API Key 仅存本机 UserDefaults。云端失败（网络/超时/4xx/5xx 或凭据解析不到）自动退回仅 OCR。")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                } else if visionFallbackCloudSource == .configuredModel {
+                    Text("已选模型会在发送带图消息时被用作图像识别模型；解析不到其 OpenAI 兼容端点/凭据时自动降级为仅 OCR。")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -1603,16 +1701,34 @@ struct SettingsSheet: View {
         }
     }
 
+    /// 单 Picker 选中 → 写盘（复用现有 setters）+ 更新本地状态 + 触发现有解析校验。
+    private func applyVisionFallbackSelection(_ tag: String) {
+        let snap = VisionFallback.applyUnifiedSelection(tag, to: VisionFallbackSettings.load())
+        VisionFallbackSettings.setMode(snap.mode)
+        VisionFallbackSettings.setCloudSource(snap.cloudSource)
+        VisionFallbackSettings.setCloudModelRef(snap.cloudModelRef)
+        visionFallbackCloudSource = snap.cloudSource
+        visionFallbackCloudModelRef = snap.cloudModelRef
+        if tag.hasPrefix("model:") {
+            verifyVisionFallbackConfiguredModel()
+        } else {
+            visionFallbackCloudModelError = nil
+        }
+    }
+
     private func saveVisionFallbackCloud() {
         let base = visionFallbackBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let modelId = visionFallbackModelId.trimmingCharacters(in: .whitespacesAndNewlines)
         let tokens = Int(visionFallbackMaxTokens.trimmingCharacters(in: .whitespacesAndNewlines))
             ?? VisionFallbackSettings.defaultMaxTokens
         var snap = VisionFallbackSettings.load()
-        snap.mode = visionFallbackMode
+        // 手填 endpoint 隐含 OCR+云端模式。
+        snap.mode = .ocrAndCloud
+        snap.cloudSource = .manual
         snap.baseURL = base
         snap.modelId = modelId.isEmpty ? VisionFallbackSettings.defaultModelId : modelId
         snap.maxTokens = tokens > 0 ? tokens : VisionFallbackSettings.defaultMaxTokens
+        snap.cloudModelRef = ""
         let keyTrim = visionFallbackApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if !keyTrim.isEmpty {
             snap.apiKey = keyTrim
@@ -1626,31 +1742,29 @@ struct SettingsSheet: View {
         statusMessage = "已保存图片转文字云端设置"
     }
 
+    /// 尝试解析选中的已配置模型为 OpenAI 兼容 endpoint；失败则显示红字提示，
+    /// 运行时自动降级为仅 OCR（不 crash、不静默发错请求）。
+    private func verifyVisionFallbackConfiguredModel() {
+        let ref = visionFallbackCloudModelRef
+        guard !ref.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            visionFallbackCloudModelError = nil
+            return
+        }
+        visionFallbackCloudModelError = nil
+        Task {
+            let config = await VisionFallback.configuredModelConfig(
+                modelRef: ref,
+                maxTokens: VisionFallbackSettings.defaultMaxTokens
+            )
+            await MainActor.run {
+                visionFallbackCloudModelError = config == nil
+                    ? "无法解析此模型的 OpenAI 兼容地址/凭据，发送时将自动降级为仅 OCR。"
+                    : nil
+            }
+        }
+    }
+
     /// 显式「保存」/ 回车提交：留空 = 不修改。
-    private func saveWebSearchKey() {
-        let trimmed = webSearchApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        do {
-            try WebSearchSettings.setApiKey(trimmed, for: webSearchBackend, store: envStore)
-            webSearchApiKey = ""
-            webSearchKeyConfigured = true
-            statusMessage = "已保存 \(webSearchBackend) 的 API key 到 ~/.pi/agent/.env"
-        } catch {
-            errorMessage = "保存搜索 key 失败：\(error.localizedDescription)"
-        }
-    }
-
-    private func clearWebSearchKey() {
-        do {
-            try WebSearchSettings.setApiKey(nil, for: webSearchBackend, store: envStore)
-            webSearchApiKey = ""
-            webSearchKeyConfigured = false
-            statusMessage = "已从 .env 清除 \(webSearchBackend) 的 API key"
-        } catch {
-            errorMessage = "清除搜索 key 失败：\(error.localizedDescription)"
-        }
-    }
-
     /// 冲突警告的「清理」：删除 auth.json 中该 provider 的 api_key 残留（oauth 不动）。
     @MainActor
     private func cleanupStaleAuthKey(_ providerId: String) async {
@@ -1665,18 +1779,6 @@ struct SettingsSheet: View {
             }
         } catch {
             errorMessage = "清理失败：\(error.localizedDescription)"
-        }
-    }
-
-    private var backendHelpText: String {
-        switch webSearchBackend {
-        case "tavily": return "在 tavily.com 注册获取 API key（免费 1000 次/月）。"
-        case "brave": return "在 brave.com/search/api 注册获取 Subscription Token（免费 2000 次/月）。"
-        case "serpapi": return "在 serpapi.com 注册获取 API key（免费 100 次/月）。"
-        case "exa": return "在 exa.ai 注册获取 API key（免费 1000 次/月，语义搜索）。"
-        case "kimi":
-            return "使用 Kimi Code 会员搜索（api.kimi.com/coding/v1/search）。可写 .env 的 KIMI_API_KEY，或复用已登录的 kimi-coding（auth.json）。"
-        default: return ""
         }
     }
 
@@ -1720,7 +1822,6 @@ struct SettingsSheet: View {
         var disabledSkills: Set<String>
         var builtInDisabled: Set<String>
         var webSearchBackend: String
-        var webSearchKeyConfigured: Bool
         var envConfiguredProviders: Set<String>
         var visionFallback: VisionFallbackSettings.Snapshot
     }
@@ -1746,7 +1847,6 @@ struct SettingsSheet: View {
             disabledSkills: ToolSkillSettings.disabledSkills(),
             builtInDisabled: BuiltInFeatureSettings.disabledIDs(),
             webSearchBackend: backend,
-            webSearchKeyConfigured: WebSearchSettings.isKeyConfigured(for: backend, store: envStore),
             envConfiguredProviders: envConfigured,
             visionFallback: VisionFallbackSettings.load()
         )
@@ -1771,13 +1871,15 @@ struct SettingsSheet: View {
         disabledSkills = snapshot.disabledSkills
         builtInDisabled = snapshot.builtInDisabled
         webSearchBackend = snapshot.webSearchBackend
-        webSearchKeyConfigured = snapshot.webSearchKeyConfigured
         envConfiguredProviders = snapshot.envConfiguredProviders
-        visionFallbackMode = snapshot.visionFallback.mode
+        visionFallbackSelection = VisionFallback.unifiedSelection(for: snapshot.visionFallback)
         visionFallbackBaseURL = snapshot.visionFallback.baseURL
         visionFallbackModelId = snapshot.visionFallback.modelId
         visionFallbackMaxTokens = String(snapshot.visionFallback.maxTokens)
         visionFallbackKeyConfigured = !snapshot.visionFallback.apiKey.isEmpty
+        visionFallbackCloudSource = snapshot.visionFallback.cloudSource
+        visionFallbackCloudModelRef = snapshot.visionFallback.cloudModelRef
+        visionFallbackCloudModelError = nil
         // 输入缓冲不回显已存 key；reload 不动用户可能正在输入的值。
 
         if restartSessions {
@@ -2205,6 +2307,200 @@ struct AddModelSheet: View {
         } catch {
             errorMessage = error.localizedDescription
             statusMessage = nil
+        }
+    }
+}
+
+/// A key/value row edited in the MCP server editor (env / headers).
+private struct McpKVRow: Identifiable {
+    let id = UUID()
+    var key: String = ""
+    var value: String = ""
+    var obfuscated: Bool = false
+}
+
+/// Editor sheet for one MCP server. stdio: command + args + env; http: url + headers.
+private struct McpServerEditor: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let server: McpServer?
+    let onSave: (McpServer) -> Void
+
+    @State private var name: String
+    @State private var transport: McpTransport
+    @State private var command: String
+    @State private var argsText: String
+    @State private var url: String
+    @State private var envRows: [McpKVRow]
+    @State private var headerRows: [McpKVRow]
+    @State private var errorMessage: String?
+    @State private var testInProgress = false
+    @State private var testResult: String?
+
+    init(server: McpServer?, onSave: @escaping (McpServer) -> Void) {
+        self.server = server
+        self.onSave = onSave
+        _name = State(initialValue: server?.name ?? "")
+        _transport = State(initialValue: server?.transport ?? .stdio)
+        _command = State(initialValue: server?.command ?? "")
+        _argsText = State(initialValue: server?.args.joined(separator: " ") ?? "")
+        _url = State(initialValue: server?.url ?? "")
+        _envRows = State(initialValue: McpServerEditor.kvRows(server?.env ?? [:] , obfuscated: true))
+        _headerRows = State(initialValue: McpServerEditor.kvRows(server?.headers ?? [:], obfuscated: true))
+    }
+
+    private static func kvRows(_ dict: [String: String], obfuscated: Bool) -> [McpKVRow] {
+        dict.map { McpKVRow(key: $0.key, value: $0.value, obfuscated: obfuscated) }
+    }
+
+    private var builtServer: McpServer {
+        McpServer(
+            name: name,
+            enabled: server?.enabled ?? true,
+            transport: transport,
+            command: command,
+            args: McpServerEditor.splitArgs(argsText),
+            env: McpServerEditor.dict(rows: envRows),
+            url: url,
+            headers: McpServerEditor.dict(rows: headerRows)
+        )
+    }
+
+    /// Last-wins dict from rows, ignoring empty keys (duplicate keys must not crash).
+    private static func dict(rows: [McpKVRow]) -> [String: String] {
+        var out: [String: String] = [:]
+        for row in rows where !row.key.isEmpty {
+            out[row.key] = row.value
+        }
+        return out
+    }
+
+    private static func splitArgs(_ text: String) -> [String] {
+        text.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).map(String.init)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text(server == nil ? "添加 MCP 服务器" : "编辑 MCP 服务器")
+                    .font(.headline)
+                Spacer()
+                Button("完成") { save() }
+                    .keyboardShortcut(.defaultAction)
+                Button("取消") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+
+            TextField("服务器名", text: $name)
+                .textFieldStyle(.roundedBorder)
+
+            Picker("传输方式", selection: $transport) {
+                Text("stdio").tag(McpTransport.stdio)
+                Text("http").tag(McpTransport.http)
+            }
+            .pickerStyle(.segmented)
+
+            if transport == .stdio {
+                TextField("command（如 npx）", text: $command)
+                    .textFieldStyle(.roundedBorder)
+                TextField("args（空格分隔，如 -y firecrawl-mcp）", text: $argsText)
+                    .textFieldStyle(.roundedBorder)
+                McpKVEditor(title: "环境变量 env（值用 ${VAR} 引用 .env）",
+                            rows: $envRows, obfuscated: true)
+            } else {
+                TextField("url（如 https:// …/mcp）", text: $url)
+                    .textFieldStyle(.roundedBorder)
+                McpKVEditor(title: "请求头 headers（值用 ${VAR} 引用 .env）",
+                            rows: $headerRows, obfuscated: true)
+            }
+
+            if let errorMessage {
+                Text(errorMessage).font(.caption).foregroundStyle(.red)
+            }
+
+            HStack {
+                Button("测试连接") {
+                    testConnection()
+                }
+                .disabled(testInProgress)
+                if testInProgress { ProgressView().controlSize(.small) }
+                if let testResult {
+                    Text(testResult).font(.caption)
+                        .foregroundStyle(testResult.hasPrefix("❌") ? .red : .secondary)
+                }
+                Spacer()
+            }
+
+            Text("密钥请写在 ~/.pi/agent/.env，这里用 ${VAR} 引用；App 不代管这些 key。新增/删除服务器后需在下一会话或 /pipiui_reload 生效。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(20)
+        .frame(width: 520)
+    }
+
+    private func testConnection() {
+        let candidate = builtServer
+        if let err = McpServerSettings.validationError(candidate) {
+            errorMessage = err
+            return
+        }
+        errorMessage = nil
+        testInProgress = true
+        testResult = nil
+        let variables = EnvFileStore().all()
+        Task {
+            let result = await McpServerSettings.testConnection(candidate, variables: variables)
+            await MainActor.run {
+                testResult = result.display
+                testInProgress = false
+            }
+        }
+    }
+
+    private func save() {
+        let candidate = builtServer
+        if let err = McpServerSettings.validationError(candidate) {
+            errorMessage = err
+            return
+        }
+        errorMessage = nil
+        onSave(candidate)
+        dismiss()
+    }
+}
+
+/// Editable list of key/value rows (env / headers) with add/remove.
+private struct McpKVEditor: View {
+    let title: String
+    @Binding var rows: [McpKVRow]
+    let obfuscated: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            ForEach($rows) { $row in
+                HStack(spacing: 6) {
+                    TextField("键", text: $row.key)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 160)
+                    TextField(obfuscated ? "值（${VAR}）" : "值", text: $row.value)
+                        .textFieldStyle(.roundedBorder)
+                    Button {
+                        rows.removeAll { $0.id == row.id }
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.red)
+                }
+            }
+            Button {
+                rows.append(McpKVRow(obfuscated: obfuscated))
+            } label: {
+                Label("添加键值", systemImage: "plus")
+            }
+            .font(.caption)
         }
     }
 }

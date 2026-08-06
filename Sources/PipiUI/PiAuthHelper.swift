@@ -118,6 +118,32 @@ enum PiAuthHelper {
         return models.compactMap(ModelInfo.parseModelListRow)
     }
 
+    /// Resolved OpenAI-compatible endpoint for a configured provider, used to call a
+    /// vision model's chat/completions directly for image captioning.
+    struct ProviderEndpoint: Equatable {
+        let baseURL: String
+        let apiKey: String
+        let api: String
+        let modelId: String
+    }
+
+    /// Ask the helper for a provider's baseURL + apiKey. Throws when the provider has
+    /// no resolvable baseUrl / key or its wire format is not OpenAI-compatible.
+    static func providerEndpoint(provider: String, modelId: String) async throws -> ProviderEndpoint {
+        let dotEnv = EnvFileStore().all()
+        // 纯 fs 读取，应为毫秒级；5s 硬超时兜底，避免 node 进程异常挂起。
+        let json = try await run(arguments: ["provider-endpoint", provider, modelId], timeout: 5, environmentOverlay: dotEnv)
+        guard let baseURL = json["baseURL"] as? String, !baseURL.isEmpty else {
+            throw HelperError.failed("provider-endpoint 未返回 baseURL")
+        }
+        return ProviderEndpoint(
+            baseURL: baseURL,
+            apiKey: (json["apiKey"] as? String) ?? "",
+            api: (json["api"] as? String) ?? "openai-completions",
+            modelId: (json["modelId"] as? String) ?? modelId
+        )
+    }
+
     static func discoverModels() async throws -> [String: Any] {
         let dotEnv = EnvFileStore().all()
         return try await run(arguments: ["discover-models"], environmentOverlay: dotEnv)

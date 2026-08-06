@@ -553,6 +553,15 @@ final class ComposerNSTextView: NSTextView {
     var onSubmit: () -> Void = {}
     var onDidChangeText: (ComposerNSTextView) -> Void = { _ in }
 
+    override func mouseMoved(with event: NSEvent) {
+        // NSTextView's default hover handling asks AppKit for sharing services.
+        // That lookup can synchronously wait on extension XPC, freezing the
+        // composer while the pointer is over it. The composer has no hover
+        // affordances, so retain its normal text cursor without forwarding the
+        // event into NSTextView.
+        NSCursor.iBeam.set()
+    }
+
     override func didChangeText() {
         super.didChangeText()
 

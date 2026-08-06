@@ -1,6 +1,6 @@
 import Foundation
 
-/// Pi extension: `web_search` (multi-backend internet search) + `web_fetch` (URL content extraction).
+/// Pi extension: `web_search` (Firecrawl keyless search) + `web_fetch` (URL content extraction).
 /// Written to Application Support at launch and loaded via `pi -e <path>`.
 enum WebSearchExtension {
     static func install(into dir: URL) -> String? {
@@ -19,115 +19,20 @@ enum WebSearchExtension {
 // Universal web search + fetch tools for models without native internet access.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import * as os from "node:os";
 
 // ---------------------------------------------------------------------------
-// Config hot-read
+// Config
 // ---------------------------------------------------------------------------
 
 interface WebSearchConfig {
   backend: string;
-  keys: Record<string, string>;
 }
 
-// Search backend → env var name in ~/.pi/agent/.env.
-// Keep in sync with ProviderEnvMap.searchEnvVars (Sources/PipiUI/ProviderEnvMap.swift).
-const SEARCH_ENV_VARS: Record<string, string> = {
-  tavily: "TAVILY_API_KEY",
-  brave: "BRAVE_API_KEY",
-  serpapi: "SERPAPI_API_KEY",
-  exa: "EXA_API_KEY",
-  kimi: "KIMI_API_KEY",
-};
-
-// Read ~/.pi/agent/.env (<1KB, synchronous small read on every call so key
-// edits take effect without restarting the session). Parses the same dotenv
-// subset as EnvFileStore.swift: KEY=VALUE lines, `#` comment lines, blank
-// lines, optional single/double quotes around values, later duplicates win.
-function loadEnvFile(): Record<string, string> {
-  const file =
-    process.env.PIPIUI_ENV_FILE || path.join(os.homedir(), ".pi", "agent", ".env");
-  const out: Record<string, string> = {};
-  let content: string;
-  try {
-    content = fs.readFileSync(file, "utf-8");
-  } catch {
-    return out; // missing .env is fine — callers fall back to legacy JSON keys
-  }
-  for (const rawLine of content.split("\n")) {
-    const raw = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
-    const trimmed = raw.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = raw.indexOf("=");
-    if (eq < 0) continue;
-    const key = raw.slice(0, eq).trim();
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-    let value = raw.slice(eq + 1).trim();
-    if (value.length >= 2) {
-      const f = value[0];
-      const l = value[value.length - 1];
-      if ((f === '"' || f === "'") && l === f) value = value.slice(1, -1);
-    }
-    out[key] = value;
-  }
-  return out;
-}
-
+// Firecrawl keyless search is the only backend (api.firecrawl.dev/v2/search,
+// no API key required). The legacy config file is kept read for compatibility
+// but its backend value is ignored — always "firecrawl".
 function loadConfig(): WebSearchConfig {
-  const file =
-    process.env.PIPIUI_WEBSEARCH_CONFIG_FILE ||
-    path.join(os.homedir(), "Library/Application Support/PipiUI/websearch-config.json");
-  let backend = "duckduckgo";
-  let keys: Record<string, string> = {};
-  try {
-    const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
-    backend = typeof raw.backend === "string" && raw.backend ? raw.backend : "duckduckgo";
-    keys = raw.keys && typeof raw.keys === "object" ? raw.keys : {};
-  } catch {
-    // keep defaults
-  }
-  // T18: API keys are hot-read from ~/.pi/agent/.env and override the legacy
-  // websearch-config.json keys. The JSON keys remain as a fallback during the
-  // transition period (one version) for users whose keys were saved before
-  // the .env migration; drop the fallback after the transition window.
-  const env = loadEnvFile();
-  for (const [b, envVar] of Object.entries(SEARCH_ENV_VARS)) {
-    const v = (env[envVar] || "").trim();
-    if (v) keys[b] = v;
-  }
-  // Kimi search accepts alternate env names + auth.json fallback.
-  if (!(keys.kimi || "").trim()) {
-    const kimi = resolveKimiKeyFromEnv(env);
-    if (kimi) keys.kimi = kimi;
-  }
-  return { backend, keys };
-}
-
-function resolveKimiKeyFromEnv(env: Record<string, string>): string {
-  for (const name of ["KIMI_SEARCH_API_KEY", "KIMI_CODE_API_KEY", "KIMI_API_KEY"]) {
-    const v = (env[name] || "").trim();
-    if (v) return v;
-  }
-  try {
-    const authPath =
-      process.env.PIPIUI_AUTH_FILE || path.join(os.homedir(), ".pi", "agent", "auth.json");
-    const root = JSON.parse(fs.readFileSync(authPath, "utf-8")) as Record<string, any>;
-    const entry = root["kimi-coding"];
-    if (entry && typeof entry === "object") {
-      if (entry.type === "api_key" && entry.key) return String(entry.key).trim();
-      const oauth =
-        (entry.access && String(entry.access).trim()) ||
-        (entry.access_token && String(entry.access_token).trim()) ||
-        "";
-      if (oauth) return oauth;
-      if (entry.key) return String(entry.key).trim();
-    }
-  } catch {
-    // missing/unreadable auth.json is fine
-  }
-  return "";
+  return { backend: "firecrawl" };
 }
 
 // ---------------------------------------------------------------------------
@@ -172,146 +77,43 @@ interface SearchResult {
 }
 
 // ---------------------------------------------------------------------------
-// Search backends
+// Search backend: Firecrawl (keyless)
 // ---------------------------------------------------------------------------
 
-async function searchTavily(query: string, maxResults: number, key: string): Promise<SearchResult[]> {
-  const res = await fetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${key}`,
-    },
-    body: JSON.stringify({ query, max_results: maxResults, include_answer: false }),
-  });
-  if (!res.ok) throw new Error(`Tavily HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const data = (await res.json()) as any;
-  return (data.results || []).slice(0, maxResults).map((r: any) => ({
-    title: r.title || "",
-    url: r.url || "",
-    snippet: r.content || "",
-  }));
-}
-
-async function searchBrave(query: string, maxResults: number, key: string): Promise<SearchResult[]> {
-  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${maxResults}`;
-  const res = await fetch(url, {
-    headers: { Accept: "application/json", "X-Subscription-Token": key },
-  });
-  if (!res.ok) throw new Error(`Brave HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const data = (await res.json()) as any;
-  return (data.web?.results || []).slice(0, maxResults).map((r: any) => ({
-    title: r.title || "",
-    url: r.url || "",
-    snippet: r.description || "",
-  }));
-}
-
-async function searchSerpApi(query: string, maxResults: number, key: string): Promise<SearchResult[]> {
-  const url = `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(query)}&num=${maxResults}&api_key=${encodeURIComponent(key)}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`SerpAPI HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const data = (await res.json()) as any;
-  return (data.organic_results || []).slice(0, maxResults).map((r: any) => ({
-    title: r.title || "",
-    url: r.link || "",
-    snippet: r.snippet || "",
-  }));
-}
-
-async function searchExa(query: string, maxResults: number, key: string): Promise<SearchResult[]> {
-  const res = await fetch("https://api.exa.ai/search", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": key,
-    },
-    body: JSON.stringify({
-      query,
-      numResults: maxResults,
-      contents: { text: { maxCharacters: 500 } },
-    }),
-  });
-  if (!res.ok) throw new Error(`Exa HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const data = (await res.json()) as any;
-  return (data.results || []).slice(0, maxResults).map((r: any) => ({
-    title: r.title || "",
-    url: r.url || "",
-    snippet: r.text || "",
-  }));
-}
-
-async function searchKimi(query: string, maxResults: number, key: string): Promise<SearchResult[]> {
-  // Kimi Code membership search — same endpoint as Kimi CLI SearchWeb / oh-my-pi.
-  const res = await fetch("https://api.kimi.com/coding/v1/search", {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${key}`,
-      "User-Agent": "PipiUI/1.0",
-    },
-    body: JSON.stringify({
-      text_query: query,
-      limit: maxResults,
-      enable_page_crawling: false,
-      timeout_seconds: 30,
-    }),
-  });
-  if (!res.ok) throw new Error(`Kimi search HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const data = (await res.json()) as any;
-  const rows = data.search_results || data.results || [];
-  return rows.slice(0, maxResults).map((r: any) => ({
-    title: r.title || "",
-    url: r.url || r.link || "",
-    snippet: r.snippet || r.content || r.text || "",
-  }));
-}
-
-async function searchDuckDuckGo(query: string, maxResults: number): Promise<SearchResult[]> {
-  const res = await fetch("https://lite.duckduckgo.com/lite/", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `q=${encodeURIComponent(query)}`,
-  });
-  if (!res.ok) throw new Error(`DuckDuckGo HTTP ${res.status}`);
-  const html = await res.text();
-  // DuckDuckGo answers bot detection with 200/202 and a challenge page, not an error status.
-  // Parsing that yields zero links, which is indistinguishable from "nothing matched" — and a
-  // silent empty result is worse than a failure here: a caller cross-validating a design would
-  // read "no prior art" when the truth is "the search never ran".
-  if (!/class="result-link"/i.test(html) && /anomaly|challenge|captcha/i.test(html)) {
-    throw new Error(
-      "DuckDuckGo refused the query (bot challenge). Configure a real backend — set `backend` " +
-        "and its API key in websearch-config.json (tavily, brave, serpapi, exa or kimi).",
-    );
-  }
-  const results: SearchResult[] = [];
-  // Lite DDG: results are in <a class="result-link"> and snippet in <td class="result-snippet">
-  const linkRe = /<a[^>]+class="result-link"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
-  const snippetRe = /<td[^>]+class="result-snippet"[^>]*>([\s\S]*?)<\/td>/gi;
-  const links: { url: string; title: string }[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = linkRe.exec(html)) !== null) {
-    links.push({ url: decodeEntities(m[1]), title: stripTags(m[2]).trim() });
-  }
-  const snippets: string[] = [];
-  while ((m = snippetRe.exec(html)) !== null) {
-    snippets.push(stripTags(m[1]).trim());
-  }
-  for (let i = 0; i < links.length && results.length < maxResults; i++) {
-    if (!links[i].url || links[i].url.startsWith("//duckduckgo.com")) continue;
-    results.push({
-      title: links[i].title,
-      url: links[i].url,
-      snippet: snippets[i] || "",
+async function searchFirecrawl(query: string, maxResults: number): Promise<SearchResult[]> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  try {
+    const res = await fetch("https://api.firecrawl.dev/v2/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, limit: maxResults }),
+      signal: controller.signal,
     });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    }
+    const data = (await res.json()) as any;
+    if (!data || data.success !== true) {
+      const msg = data?.error ? String(data.error) : "unexpected response shape";
+      throw new Error(msg);
+    }
+    const web = data.data?.web;
+    if (!Array.isArray(web)) return [];
+    return web.slice(0, maxResults).map((r: any) => ({
+      title: r.title || "",
+      url: r.url || "",
+      snippet: r.description || r.snippet || "",
+    }));
+  } catch (err: any) {
+    throw new Error(err?.name === "AbortError" ? "request timed out (30s)" : err?.message || String(err));
+  } finally {
+    clearTimeout(timeout);
   }
-  return results;
 }
 
 // ---------------------------------------------------------------------------
-// HTML utilities (for web_fetch + DDG parsing)
+// HTML utilities (for web_fetch)
 // ---------------------------------------------------------------------------
 
 function stripTags(html: string): string {
@@ -385,7 +187,7 @@ export default function (pi: ExtensionAPI) {
     label: "Web Search",
     description:
       "Search the internet for current information, recent events, documentation, or any facts " +
-      "beyond the local codebase. Uses the configured search backend (Tavily/Brave/SerpAPI/Exa/Kimi/DuckDuckGo). " +
+      "beyond the local codebase. Uses Firecrawl keyless search (no API key required). " +
       "Returns titles, URLs, and snippets. Use web_fetch to read a specific result in full.",
     promptSnippet: "Search the web for current/external information",
     promptGuidelines: [
@@ -396,7 +198,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       query: Type.String({ description: "Search query (be specific for better results)." }),
       max_results: Type.Optional(
-        Type.Number({ description: "Maximum number of results to return (default 5, max 10)." }),
+        Type.Number({ description: "Maximum number of results to return (default 5, max 100)." }),
       ),
       force: Type.Optional(
         Type.Boolean({
@@ -424,61 +226,21 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      const config = loadConfig();
-      const backend = config.backend;
-      const maxResults = Math.min(Math.max(Math.round(params.max_results || 5), 1), 10);
+      const maxResults = Math.min(Math.max(Math.round(params.max_results || 5), 1), 100);
       const query = (params.query || "").trim();
       if (!query) return text("web_search: query is empty.", true);
 
-      // Check API key for keyed backends (kimi can also use auth.json).
-      if (backend !== "duckduckgo") {
-        const key = (config.keys[backend] || "").trim();
-        if (!key) {
-          const hint =
-            backend === "kimi"
-              ? `Open PipiUI → 设置 → 网络搜索 to enter KIMI_API_KEY, or log in kimi-coding (auth.json).`
-              : `Open PipiUI → 设置 → 网络搜索 to enter your ${backend} API key, ` +
-                `or switch the backend to DuckDuckGo (no key needed).`;
-          return text(
-            `web_search is not configured: the "${backend}" backend requires an API key. ${hint}`,
-            true,
-          );
-        }
-      }
-
       try {
-        let results: SearchResult[];
-        switch (backend) {
-          case "tavily":
-            results = await searchTavily(query, maxResults, config.keys[backend].trim());
-            break;
-          case "brave":
-            results = await searchBrave(query, maxResults, config.keys[backend].trim());
-            break;
-          case "serpapi":
-            results = await searchSerpApi(query, maxResults, config.keys[backend].trim());
-            break;
-          case "exa":
-            results = await searchExa(query, maxResults, config.keys[backend].trim());
-            break;
-          case "kimi":
-            results = await searchKimi(query, maxResults, config.keys[backend].trim());
-            break;
-          default:
-            results = await searchDuckDuckGo(query, maxResults);
-            break;
-        }
-
+        const results = await searchFirecrawl(query, maxResults);
         if (results.length === 0) {
           return text(`No results found for: ${query}`);
         }
-
         const lines = results.map(
           (r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`,
         );
-        return text(`Search results for "${query}" (${backend}, ${results.length} results):\n\n${lines.join("\n\n")}`);
+        return text(`Search results for "${query}" (firecrawl, ${results.length} results):\n\n${lines.join("\n\n")}`);
       } catch (err: any) {
-        return text(`web_search failed (${backend}): ${err?.message || String(err)}`, true);
+        return text(`web_search failed (firecrawl): ${err?.message || String(err)}`, true);
       }
     },
   });
@@ -514,7 +276,7 @@ export default function (pi: ExtensionAPI) {
         const res = await fetch(url, {
           headers: {
             "User-Agent":
-              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           },
           signal: controller.signal,

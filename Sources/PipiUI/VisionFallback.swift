@@ -13,6 +13,107 @@ enum VisionFallback {
         !supportsImages && hasImages
     }
 
+    /// 仅列出支持图片输入的已配置模型，作为图像识别模型选择器的候选。
+    static func visionModels(from models: [ModelInfo]) -> [ModelInfo] {
+        models.filter { $0.supportsImages }
+    }
+
+    /// 扁平化单 Picker 的选中 tag ↔ 设置快照映射。
+    /// tag 取值：`model:<id>`（已配置多模态模型）/ `"ocr"` / `"off"` / `"manual"`。
+    static func unifiedSelection(for snapshot: VisionFallbackSettings.Snapshot) -> String {
+        switch snapshot.mode {
+        case .off: return "off"
+        case .ocrOnly: return "ocr"
+        case .ocrAndCloud:
+            switch snapshot.cloudSource {
+            case .manual: return "manual"
+            case .configuredModel:
+                // configuredModel 但 ref 为空 → 显示为 ocr（只影响显示，不写盘）。
+                guard snapshot.hasConfiguredModel else { return "ocr" }
+                return "model:\(snapshot.cloudModelRef)"
+            }
+        }
+    }
+
+    /// 把单 Picker 的 tag 应用到快照（返回新快照），供 onChange 持久化与单测。
+    /// `model:` 之外的 `ocr`/`off` 只改 mode；`manual` 改 mode+source。
+    /// 不清理已选 modelRef（切回模型列表时仍保留上次选择）。
+    static func applyUnifiedSelection(
+        _ tag: String,
+        to snapshot: VisionFallbackSettings.Snapshot
+    ) -> VisionFallbackSettings.Snapshot {
+        var s = snapshot
+        if tag.hasPrefix("model:") {
+            s.mode = .ocrAndCloud
+            s.cloudSource = .configuredModel
+            s.cloudModelRef = String(tag.dropFirst("model:".count))
+        } else {
+            switch tag {
+            case "ocr":
+                s.mode = .ocrOnly
+            case "off":
+                s.mode = .off
+            case "manual":
+                s.mode = .ocrAndCloud
+                s.cloudSource = .manual
+            default:
+                break
+            }
+        }
+        return s
+    }
+
+    /// 是否需要在 caption 注入后，把出站 RPC 的 `images` 字段剥掉（避免
+    /// DeepSeek 等拒图 provider 硬失败）。尽管 transcript 缩略图保留，RPC 只发文字。
+    static func shouldCaptionAndStripImages(
+        supportsImages: Bool,
+        hasImages: Bool,
+        mode: VisionFallbackSettings.Mode
+    ) -> Bool {
+        shouldCaption(supportsImages: supportsImages, hasImages: hasImages) && mode != .off
+    }
+
+    /// 超时竞速：返回 `primary` 的结果；若 `nanoseconds` 内未完成则返回 `fallback`。
+    /// 供发送链兜底，保证 caption 解析/描述任何情况下都不会阻塞 deliver（全白根因）。
+    static func raceCaptioned(
+        _ primary: @escaping () async -> String,
+        fallback: String,
+        nanoseconds deadline: UInt64
+    ) async -> String {
+        await withThrowingTaskGroup(of: String.self) { group -> String in
+            group.addTask { await primary() }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: deadline)
+                return fallback
+            }
+            let first = (try? await group.next()) ?? fallback
+            group.cancelAll()
+            return first
+        }
+    }
+
+    /// 从选中的已配置模型（`provider/modelId`）解析 OpenAI 兼容 endpoint 并构造
+    /// caption 配置。解析失败（无 baseUrl / 无 key / 非 OpenAI 兼容）返回 nil，
+    /// 调用方据此降级到 OCR-only，绝不 crash。
+    static func configuredModelConfig(modelRef: String, maxTokens: Int) async -> VisionCaptionConfig? {
+        guard let slash = modelRef.firstIndex(of: "/") else { return nil }
+        let provider = String(modelRef[..<slash]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let modelId = String(modelRef[modelRef.index(after: slash)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !provider.isEmpty, !modelId.isEmpty else { return nil }
+        guard let ep = try? await PiAuthHelper.providerEndpoint(provider: provider, modelId: modelId),
+              !ep.baseURL.isEmpty else {
+            return nil
+        }
+        return VisionCaptionConfig(
+            baseURL: ep.baseURL,
+            apiKey: ep.apiKey,
+            modelId: modelId,
+            prompt: "",
+            maxTokens: maxTokens
+        )
+    }
+
     /// Chinese caption block injected into the user message. Omits empty subsections.
     static func captionBlock(for captions: [ImageCaption]) -> String {
         let sorted = captions.sorted { $0.index < $1.index }

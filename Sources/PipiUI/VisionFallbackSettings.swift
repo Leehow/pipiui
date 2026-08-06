@@ -9,6 +9,24 @@ enum VisionFallbackSettings {
     static let modelIdKey = "pipiui.visionFallback.modelId"
     static let promptKey = "pipiui.visionFallback.prompt"
     static let maxTokensKey = "pipiui.visionFallback.maxTokens"
+    /// 云端描述来源：手填 endpoint 或已配置模型（存完整模型 id `provider/modelId`）。
+    static let cloudSourceKey = "pipiui.visionFallback.cloudSource"
+    static let cloudModelRefKey = "pipiui.visionFallback.cloudModelRef"
+
+    /// 云端视觉模型的来源：手填 endpoint 还是从已配置模型里选一个多模态模型。
+    enum CloudSource: String, CaseIterable, Identifiable, Equatable {
+        case manual
+        case configuredModel
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .manual: return "手填服务地址"
+            case .configuredModel: return "从已配置模型选择"
+            }
+        }
+    }
 
     enum Mode: String, CaseIterable, Identifiable, Equatable {
         case off
@@ -33,10 +51,18 @@ enum VisionFallbackSettings {
         var modelId: String
         var prompt: String
         var maxTokens: Int
+        /// 云端描述来源：手填 endpoint 或已配置模型。
+        var cloudSource: CloudSource
+        /// 选中的已配置图像识别模型（完整 id `provider/modelId`）。
+        var cloudModelRef: String
 
         var isCloudConfigured: Bool {
             !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && !modelId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        var hasConfiguredModel: Bool {
+            !cloudModelRef.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
 
         var captionConfig: VisionCaptionConfig? {
@@ -72,7 +98,9 @@ enum VisionFallbackSettings {
             apiKey: defaults.string(forKey: apiKeyKey) ?? "",
             modelId: modelId.isEmpty ? defaultModelId : modelId,
             prompt: defaults.string(forKey: promptKey) ?? "",
-            maxTokens: maxTokens
+            maxTokens: maxTokens,
+            cloudSource: CloudSource(rawValue: defaults.string(forKey: cloudSourceKey) ?? "") ?? .manual,
+            cloudModelRef: defaults.string(forKey: cloudModelRefKey) ?? ""
         )
     }
 
@@ -87,6 +115,8 @@ enum VisionFallbackSettings {
         defaults.set(snapshot.modelId, forKey: modelIdKey)
         defaults.set(snapshot.prompt, forKey: promptKey)
         defaults.set(snapshot.maxTokens, forKey: maxTokensKey)
+        defaults.set(snapshot.cloudSource.rawValue, forKey: cloudSourceKey)
+        defaults.set(snapshot.cloudModelRef, forKey: cloudModelRefKey)
     }
 
     static func setMode(_ mode: Mode, defaults: UserDefaults = .standard) {
@@ -122,6 +152,18 @@ enum VisionFallbackSettings {
     static func setMaxTokens(_ value: Int, defaults: UserDefaults = .standard) {
         var s = load(defaults: defaults)
         s.maxTokens = value > 0 ? value : defaultMaxTokens
+        save(s, defaults: defaults)
+    }
+
+    static func setCloudSource(_ value: CloudSource, defaults: UserDefaults = .standard) {
+        var s = load(defaults: defaults)
+        s.cloudSource = value
+        save(s, defaults: defaults)
+    }
+
+    static func setCloudModelRef(_ value: String, defaults: UserDefaults = .standard) {
+        var s = load(defaults: defaults)
+        s.cloudModelRef = value
         save(s, defaults: defaults)
     }
 }

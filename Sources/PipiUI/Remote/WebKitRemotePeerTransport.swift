@@ -37,7 +37,8 @@ final class WebKitRemotePeerTransport: NSObject, RemotePeerTransport, RemotePeer
     enum TunnelEvent {
         case ready
         case accepted
-        case closed
+        case reconnecting(attempt: Int, delaySeconds: Int)
+        case closed(reason: String)
         case failed
     }
     private var tunnelController: RemoteHostController?
@@ -645,17 +646,41 @@ final class WebKitRemotePeerTransport: NSObject, RemotePeerTransport, RemotePeer
             productionStateChanged(.connected)
             tunnelEvent?(.accepted)
 
+        case "tunnelReconnecting":
+            guard Set(object.keys) == ["v", "type", "generation", "attempt", "delayMs"],
+                  tunnelController != nil,
+                  let attemptNumber = object["attempt"] as? NSNumber,
+                  CFGetTypeID(attemptNumber) != CFBooleanGetTypeID(),
+                  attemptNumber.doubleValue == Double(attemptNumber.intValue),
+                  (1...999).contains(attemptNumber.intValue),
+                  let delayMs = object["delayMs"] as? NSNumber,
+                  CFGetTypeID(delayMs) != CFBooleanGetTypeID(),
+                  delayMs.doubleValue == Double(delayMs.intValue),
+                  (0...300_000).contains(delayMs.intValue) else { return }
+            let delaySeconds = max(0, Int((Double(delayMs.intValue) / 1000).rounded()))
+            productionStateChanged(.reconnecting(
+                attempt: attemptNumber.intValue,
+                delaySeconds: delaySeconds
+            ))
+            tunnelEvent?(.reconnecting(
+                attempt: attemptNumber.intValue,
+                delaySeconds: delaySeconds
+            ))
+
         case "tunnelClosed":
-            guard Set(object.keys) == ["v", "type", "generation"],
-                  tunnelController != nil else { return }
-            productionStateChanged(.closed("服务器隧道已断开"))
-            tunnelEvent?(.closed)
+            guard Set(object.keys) == ["v", "type", "generation", "reason"],
+                  tunnelController != nil,
+                  let reason = object["reason"] as? String,
+                  !reason.isEmpty,
+                  reason.utf8.count <= 256 else { return }
+            productionStateChanged(.closed(reason))
+            tunnelEvent?(.closed(reason: reason))
 
         case "tunnelInvalidated":
             guard Set(object.keys) == ["v", "type", "generation"],
                   tunnelController != nil else { return }
             productionStateChanged(.closed("链接已失效"))
-            tunnelEvent?(.closed)
+            tunnelEvent?(.closed(reason: "invalidated"))
 
         case "tunnelError":
             guard Set(object.keys) == ["v", "type", "generation", "message"],

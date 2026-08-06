@@ -59,14 +59,12 @@ final class ProviderEnvMapTests: XCTestCase {
         XCTAssertTrue(ProviderEnvMap.providers(forEnvVar: "KIMI_API_KEY").contains("moonshot"))
     }
 
-    func testSearchBackends() {
-        XCTAssertEqual(ProviderEnvMap.searchEnvVars["tavily"], "TAVILY_API_KEY")
-        XCTAssertEqual(ProviderEnvMap.searchEnvVars["brave"], "BRAVE_API_KEY")
-        XCTAssertEqual(ProviderEnvMap.searchEnvVars["serpapi"], "SERPAPI_API_KEY")
-        XCTAssertEqual(ProviderEnvMap.searchEnvVars["exa"], "EXA_API_KEY")
-        XCTAssertEqual(ProviderEnvMap.searchEnvVars["kimi"], "KIMI_API_KEY")
-        XCTAssertTrue(ProviderEnvMap.providers(forEnvVar: "TAVILY_API_KEY").contains("tavily"))
-        XCTAssertTrue(ProviderEnvMap.providers(forEnvVar: "KIMI_API_KEY").contains("kimi"))
+    func testSearchBackendsAreEmptyForFirecrawlKeyless() {
+        // web_search is now Firecrawl keyless — no search backend env-var map entries.
+        XCTAssertTrue(ProviderEnvMap.searchEnvVars.isEmpty, "no search backend env vars remain")
+        XCTAssertFalse(ProviderEnvMap.providers(forEnvVar: "TAVILY_API_KEY").contains("tavily"))
+        XCTAssertFalse(ProviderEnvMap.providers(forEnvVar: "KIMI_API_KEY").contains("kimi"),
+                       "kimi search backend removed; KIMI_API_KEY now only maps kimi-coding/moonshot chat providers")
     }
 
     func testNoDuplicateEnvVarEntriesWithinProvider() {

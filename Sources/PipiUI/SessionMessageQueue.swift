@@ -16,17 +16,25 @@ struct QueuedMessage: Identifiable {
     var text: String
     var images: [DraftImage]
     var searchGrantPolicy: PromptSearchGrantPolicy
+    /// 该消息已注入非视觉模型 caption：出站 RPC 需剥掉 `images`（缩略图仍保留）。
+    var stripImagesForRPC: Bool
+    /// 气泡是否仍由 sendPromptNow 发射。vision caption 路径已提前发射气泡，置 false。
+    var appendOptimisticBubble: Bool
 
     init(
         id: UUID = UUID(),
         text: String,
         images: [DraftImage] = [],
-        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths,
+        stripImagesForRPC: Bool = false,
+        appendOptimisticBubble: Bool = true
     ) {
         self.id = id
         self.text = text
         self.images = images
         self.searchGrantPolicy = searchGrantPolicy
+        self.stripImagesForRPC = stripImagesForRPC
+        self.appendOptimisticBubble = appendOptimisticBubble
     }
 }
 
@@ -46,14 +54,18 @@ struct SessionMessageQueue {
     mutating func enqueue(
         text: String,
         images: [DraftImage] = [],
-        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths
+        searchGrantPolicy: PromptSearchGrantPolicy = .localHumanRecordPromptPaths,
+        stripImagesForRPC: Bool = false,
+        appendOptimisticBubble: Bool = true
     ) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !images.isEmpty else { return false }
         items.append(QueuedMessage(
             text: text,
             images: images,
-            searchGrantPolicy: searchGrantPolicy
+            searchGrantPolicy: searchGrantPolicy,
+            stripImagesForRPC: stripImagesForRPC,
+            appendOptimisticBubble: appendOptimisticBubble
         ))
         return true
     }
@@ -125,7 +137,11 @@ struct SessionMessageQueue {
         return QueuedMessage(
             text: joinTexts(batch.map(\.text)),
             images: batch.flatMap(\.images),
-            searchGrantPolicy: policy
+            searchGrantPolicy: policy,
+            // 同一会话模型能力一致：仅当整批都经 caption 注入才剥图，避免误伤未注入消息。
+            stripImagesForRPC: !batch.isEmpty && batch.allSatisfy(\.stripImagesForRPC),
+            // 任一消息仍需发射气泡则发射（为整批补上）；全已提前发射则不再重复。
+            appendOptimisticBubble: batch.contains { $0.appendOptimisticBubble }
         )
     }
 }

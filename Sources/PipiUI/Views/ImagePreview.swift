@@ -206,6 +206,10 @@ struct ImageThumbnailView: View {
 enum ImageLightboxPresenter {
     private static var activePanel: NSPanel?
     private static var activeMonitor: Any?
+    /// On-screen frame of the centered aspect-fit image (global screen coords,
+    /// origin bottom-left — same space as `NSEvent.mouseLocation`). Used to
+    /// hit-test backdrop clicks; clicks inside it keep the lightbox open.
+    private static var activeImageFrame: CGRect = .zero
 
     static func present(image: NSImage) {
         dismiss()
@@ -236,16 +240,50 @@ enum ImageLightboxPresenter {
         hosting.autoresizingMask = [.width, .height]
         panel.contentView = hosting
 
-        positionAndShow(panel)
+        let screenFrame = positionAndShow(panel)
         activePanel = panel
 
-        // Local Esc in case SwiftUI key handling misses focus races.
-        activeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            if event.keyCode == 53 { // Escape
+        // On-screen frame of the centered aspect-fit image, in the same
+        // coordinate space as NSEvent.mouseLocation (screen/global, bottom-left).
+        let fitted = ImageLightboxChrome.fittedSize(
+            imageSize: image.size,
+            in: CGSize(
+                width: max(0, screenFrame.width - 64),
+                height: max(0, screenFrame.height - 64)
+            )
+        )
+        activeImageFrame = CGRect(
+            x: screenFrame.midX - fitted.width / 2,
+            y: screenFrame.midY - fitted.height / 2,
+            width: fitted.width,
+            height: fitted.height
+        )
+
+        // Local Esc + backdrop-click dismissal at the NSEvent level (the SwiftUI
+        // backdrop .onTapGesture is unreliable in this borderless panel).
+        activeMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown]) { event in
+            switch event.type {
+            case .keyDown:
+                if event.keyCode == 53 { // Escape
+                    dismiss()
+                    return nil
+                }
+                return event
+            case .leftMouseDown:
+                // Only act on clicks that land on our panel.
+                guard event.window === activePanel else { return event }
+                if activeImageFrame.contains(NSEvent.mouseLocation) {
+                    // Click on the image itself: keep the lightbox open.
+                    return event
+                }
+                // Click on the dimmed backdrop: dismiss. Return the event
+                // unchanged so the SwiftUI X button keeps working; dismiss() is
+                // idempotent.
                 dismiss()
-                return nil
+                return event
+            default:
+                return event
             }
-            return event
         }
     }
 
@@ -254,13 +292,14 @@ enum ImageLightboxPresenter {
             NSEvent.removeMonitor(monitor)
             activeMonitor = nil
         }
+        activeImageFrame = .zero
         guard let panel = activePanel else { return }
         activePanel = nil
         panel.orderOut(nil)
         panel.contentView = nil
     }
 
-    private static func positionAndShow(_ panel: NSPanel) {
+    private static func positionAndShow(_ panel: NSPanel) -> NSRect {
         let screenFrame: NSRect
         if let key = NSApp.keyWindow, let screen = key.screen {
             // Cover the screen that hosts the key window for a true lightbox feel.
@@ -274,6 +313,7 @@ enum ImageLightboxPresenter {
         panel.setFrame(screenFrame, display: true)
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        return screenFrame
     }
 }
 
