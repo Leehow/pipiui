@@ -1030,9 +1030,13 @@ function runtimeRolePolicyForAgent(agentName: string): AgentRuntimeRolePolicy {
 	return { role: "worker", worktree: "isolated", allowRecursiveDelegation: true };
 }
 
-// Done-message caps (clean-context orchestration): verdict agents get a tight cap
-// (code is the product; the report is evidence), explore/plan keep a larger one
-// (the report IS the deliverable), errors/aborts always get the error cap.
+// Done-message caps (clean-context orchestration):
+// - Injected [subagent-done] Result body is a TLDR slice (TLDR_DONE_CAP); full text
+//   lives only in the job registry and is pulled via subagent_status full:true.
+// - VERDICT/REPORT/ERROR caps still size chain/foreground aggregates and error paths
+//   that embed more than the TLDR pointer message.
+const TLDR_DONE_CAP = 2500;
+const TLDR_FALLBACK_NON_EMPTY_LINES = 15;
 const VERDICT_DONE_CAP = 1500;
 const REPORT_DONE_CAP = 6000;
 const ERROR_DONE_CAP = 6000;
@@ -1438,12 +1442,12 @@ function abortRunningAgent(agentId: string): { ok: boolean; message: string } {
 }
 
 /**
- * Head-keeping truncation for every report surface (done message, job store, status
- * display): worker templates put the key sections (summary / Files / Verification /
- * Notes) FIRST, so keep the head and mark the omission in the same bracketed style as
- * truncateParallelOutput. All three surfaces must truncate the SAME direction —
- * mixing head-keep and tail-keep makes the advertised "full report" pull return a
- * disjoint slice of the report the done message showed.
+ * Head-keeping truncation for job-store and status display (and chain aggregates).
+ * [subagent-done] injects extractDoneTldr instead; full text stays in the registry.
+ * Worker templates put key sections FIRST, so keep the head and mark the omission in
+ * the same bracketed style as truncateParallelOutput. Store and status must truncate
+ * the SAME direction — mixing head-keep and tail-keep makes full:true return a
+ * disjoint slice of what the boss already saw.
  */
 function truncateTextHead(text: string, cap: number): string {
 	if (text.length <= cap) return text;
@@ -2540,7 +2544,8 @@ function parseWorktreeListPorcelain(output: string): Array<{ path: string; branc
  * On failure creating required isolation, return worktreeError; runSingleAgent fails closed
  * before spawning a child. Read-only, explicit-cwd and explicit PIPIUI_WORKTREE=0 paths remain
  * deliberate shared-cwd semantics rather than isolation failures.
- * Never auto-merge in TS or Swift end handlers — GUI confirms merge/discard.
+ * TS end handlers do not merge. Swift SubagentStore auto-merges a writable worker when it
+ * ends ok with verifyExit==0 (or verifyExit absent); verifyExit≠0 keeps pendingReview.
  * failed/aborted/interrupted writable workers → keep pendingReview for续作; GUI merge/discard remains as fallback.
  */
 function resolveSubagentWorktree(opts: {
@@ -2715,13 +2720,60 @@ function resolveSubagentWorktree(opts: {
 }
 
 /**
- * Done-message cap. The agent declares whether its deliverable is a report (`deliverable:
- * report`); a verdict is the default, including for an agent whose definition never loaded.
- * Error/abort overrides both.
+ * Done-message / chain aggregate cap. The agent declares whether its deliverable is a
+ * report (`deliverable: report`); a verdict is the default, including for an agent whose
+ * definition never loaded. Error/abort overrides both.
+ * Note: background [subagent-done] injects extractDoneTldr (TLDR_DONE_CAP), not this cap.
  */
 function doneCapForResult(result: { reportsInFull?: boolean }, isError: boolean): number {
 	if (isError) return ERROR_DONE_CAP;
 	return result.reportsInFull ? REPORT_DONE_CAP : VERDICT_DONE_CAP;
+}
+
+/** Match a `## Heading` block from its line through the line before the next `## ` heading. */
+function extractMarkdownSection(text: string, heading: string): string | null {
+	const startRe = new RegExp(`^## ${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\s|$)`, "im");
+	const match = startRe.exec(text);
+	if (!match || match.index === undefined) return null;
+	const start = match.index;
+	const after = start + match[0].length;
+	const next = /^## /m.exec(text.slice(after));
+	const end = next ? after + next.index : text.length;
+	return text.slice(start, end).replace(/\s+$/g, "");
+}
+
+/**
+ * Boss-facing slice of a worker's final text for [subagent-done].
+ * Prefer `## TLDR` (+ optional `## What I did not check`); else the first ~15 non-empty lines.
+ * Full text stays in the job registry for `subagent_status full:true`.
+ */
+function extractDoneTldr(text: string, cap = TLDR_DONE_CAP): string {
+	const raw = text.replace(/\s+$/g, "");
+	if (!raw) return "(no output)";
+
+	let body: string;
+	const tldr = extractMarkdownSection(raw, "TLDR");
+	if (tldr) {
+		const parts = [tldr];
+		const notChecked = extractMarkdownSection(raw, "What I did not check");
+		if (notChecked && notChecked !== tldr) parts.push(notChecked);
+		body = parts.join("\n\n");
+	} else {
+		const picked: string[] = [];
+		let nonEmpty = 0;
+		for (const line of raw.split("\n")) {
+			picked.push(line);
+			if (line.trim().length > 0) {
+				nonEmpty++;
+				if (nonEmpty >= TLDR_FALLBACK_NON_EMPTY_LINES) break;
+			}
+		}
+		body = picked.join("\n").replace(/\s+$/g, "");
+	}
+
+	if (!body) return "(no output)";
+	if (body.length <= cap) return body;
+	return `${body.slice(0, Math.max(0, cap - 1))}…`;
 }
 
 function formatSubagentDoneMessage(
@@ -2730,15 +2782,12 @@ function formatSubagentDoneMessage(
 ): string {
 	const aborted = extra?.aborted ?? result.stopReason === "aborted";
 	const ok = !isFailedResult(result) && !aborted && !extra?.error;
-	const isError = aborted || Boolean(extra?.error) || isFailedResult(result);
 	const att = result.verify;
 	// `ok` stays process-level; `verified` reflects only the runtime-attested verify command.
 	const verified = verifiedStateFor(result, extra);
-	// Head-keep: templates put summary/Files/Verification/Notes first — a tail-keep
-	// truncation would drop exactly those sections once the report exceeds the cap.
-	const output = truncateTextHead(
+	// Inject only a TLDR slice — full worker text is stored on the job and pulled on demand.
+	const output = extractDoneTldr(
 		extra?.error || getResultOutput(result) || result.stderr || "(no output)",
-		doneCapForResult(result, isError),
 	);
 	const cost =
 		typeof result.usage.cost === "number" ? result.usage.cost.toFixed(4) : String(result.usage.cost ?? 0);

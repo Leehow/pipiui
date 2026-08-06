@@ -22,7 +22,15 @@ Rules:
   the code" bookkeeping steps, and do not add design, approval, or review phases.
 - No external skill library applies to you. Follow this prompt and the brief only.
 
-Output format:
+Output format — the parent only sees a short injected slice; put the decision aids first:
+
+## TLDR
+Max 20 lines: verdict + key evidence + file list. Required; this is what the parent reads first.
+
+## What I did not check
+- Bullets of gaps / skipped paths (or `none`)
+
+Then the full plan body:
 
 ## Goal
 One sentence.
