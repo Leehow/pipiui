@@ -4,7 +4,7 @@ import AppKit
 /// One usage window surfaced by a provider: e.g. a 5-hour cap, a weekly cap, a
 /// monthly cap. A snapshot may carry several; the capsule shows one (user-picked
 /// or default), the popover lists all.
-struct QuotaWindow: Equatable, Identifiable {
+struct QuotaWindow: Equatable, Identifiable, Codable {
     /// Stable id within a snapshot so SwiftUI ForEach + selection works. Providers
     /// set this from their native window kind (e.g. "fiveHour", "weekly", a typeRaw).
     let id: String
@@ -25,7 +25,7 @@ struct QuotaWindow: Equatable, Identifiable {
 /// Each provider (Grok, GLM, Claude, Codex) fetches its own data and maps it into
 /// one or more `QuotaWindow`s. The capsule renders the selected (or default)
 /// window; the popover lists them all so the user can pick which to show.
-struct QuotaSnapshot: Equatable {
+struct QuotaSnapshot: Equatable, Codable {
     /// All windows this provider reports (5h / 周 / 月 …). Always ≥1 when present.
     var windows: [QuotaWindow]
     /// Which window id to surface in the capsule. Defaults to the highest-usage one
@@ -109,6 +109,13 @@ final class QuotaMonitorCore {
     /// The per-provider fetch: returns a snapshot or throws. `force` is the
     /// caller's force flag; the core has already applied its own throttle.
     var fetcher: ((Bool) async throws -> QuotaSnapshot?)?
+
+    /// Seeds the initial snapshot before any observer subscribes (e.g. restoring
+    /// the last-known-good value from disk). Observers deliver it immediately;
+    /// the normal refresh still runs and replaces it with a fresh network value.
+    func seed(_ snapshot: QuotaSnapshot?) {
+        self.snapshot = snapshot
+    }
 
     func observe(_ handler: @escaping (QuotaSnapshot?) -> Void) -> UUID {
         let id = UUID()
