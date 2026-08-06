@@ -214,10 +214,26 @@ final class RemoteRelayTests: XCTestCase {
             webSocketURL: "wss://remote.deepwood.cn/host/ws",
             publicURL: "https://remote.deepwood.cn/"
         ))
+        // /tunnel/ws: same host (self-hosted single domain) is allowed.
+        XCTAssertNotNil(RemoteRelaySettings.validatedURLPair(
+            webSocketURL: "wss://remote.example/tunnel/ws",
+            publicURL: "https://remote.example/"
+        ))
+        // /tunnel/ws: distinct tunnel host remains allowed (legacy dual-domain).
+        XCTAssertNotNil(RemoteRelaySettings.validatedURLPair(
+            webSocketURL: "wss://tunnel.deepwood.cn/tunnel/ws",
+            publicURL: "https://remote.deepwood.cn/"
+        ))
+        // /trystero/ws follows the same same-or-split host rule.
+        XCTAssertNotNil(RemoteRelaySettings.validatedURLPair(
+            webSocketURL: "wss://remote.example/trystero/ws",
+            publicURL: "https://remote.example/"
+        ))
         XCTAssertNotNil(RemoteRelaySettings.validatedURLPair(
             webSocketURL: "wss://tunnel.deepwood.cn/device/ws",
             publicURL: "https://remote.deepwood.cn/"
         ))
+        // /device/ws must keep signaling off the browser page origin.
         XCTAssertNil(RemoteRelaySettings.validatedURLPair(
             webSocketURL: "wss://remote.deepwood.cn/device/ws",
             publicURL: "https://remote.deepwood.cn/"
@@ -236,6 +252,39 @@ final class RemoteRelayTests: XCTestCase {
             ),
             "https://tunnel.deepwood.cn"
         )
+    }
+
+    func testDerivedTunnelWebSocketURLFromPublicOrigin() throws {
+        XCTAssertEqual(
+            RemoteRelaySettings.derivedTunnelWebSocketURL(
+                publicURL: try XCTUnwrap(URL(string: "https://remote.example/"))
+            )?.absoluteString,
+            "wss://remote.example/tunnel/ws"
+        )
+        XCTAssertEqual(
+            RemoteRelaySettings.derivedTunnelWebSocketURL(
+                publicURL: try XCTUnwrap(URL(string: "https://remote.example:8443/pair"))
+            )?.absoluteString,
+            "wss://remote.example:8443/tunnel/ws"
+        )
+        XCTAssertEqual(
+            RemoteRelaySettings.derivedTunnelWebSocketURL(
+                publicURL: try XCTUnwrap(URL(string: "https://remote.example:443/"))
+            )?.absoluteString,
+            "wss://remote.example:443/tunnel/ws"
+        )
+        XCTAssertNil(RemoteRelaySettings.derivedTunnelWebSocketURL(
+            publicURL: try XCTUnwrap(URL(string: "http://remote.example/"))
+        ))
+        XCTAssertNil(RemoteRelaySettings.derivedTunnelWebSocketURL(
+            publicURL: try XCTUnwrap(URL(string: "wss://remote.example/tunnel/ws"))
+        ))
+        XCTAssertNil(RemoteRelaySettings.derivedTunnelWebSocketURL(
+            publicURL: try XCTUnwrap(URL(string: "https://same.example./"))
+        ))
+        XCTAssertNil(RemoteRelaySettings.derivedTunnelWebSocketURL(
+            publicURL: try XCTUnwrap(URL(string: "not-a-url"))
+        ))
     }
 
     func testSecurityHostnameCanonicalizesDNSIPv4AndIPv6() throws {

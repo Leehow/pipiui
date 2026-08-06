@@ -137,13 +137,39 @@ enum RemoteRelaySettings {
               validatedPublicURL(publicURL.absoluteString) != nil else {
             return nil
         }
-        if ["/tunnel/ws", "/trystero/ws", "/device/ws"]
-            .contains(webSocketURL.path) {
+        // /device/ws is P2P signaling: must stay off the browser page origin.
+        // /tunnel/ws and /trystero/ws may share the public host (self-hosted
+        // single-domain nginx) or use a dedicated tunnel host.
+        // /host/ws (legacy) requires the same host as the public page.
+        switch webSocketURL.path {
+        case "/device/ws":
             guard webSocketHost != publicHost else { return nil }
-        } else {
+        case "/tunnel/ws", "/trystero/ws":
+            break
+        default:
             guard webSocketHost == publicHost else { return nil }
         }
         return (webSocketURL, publicURL)
+    }
+
+    /// Derive `wss://host[:port]/tunnel/ws` from an https public origin.
+    /// Preserves non-default ports; returns nil when the input cannot become a
+    /// valid tunnel WebSocket URL.
+    static func derivedTunnelWebSocketURL(publicURL: URL) -> URL? {
+        guard var components = URLComponents(url: publicURL, resolvingAgainstBaseURL: false),
+              components.scheme?.lowercased() == "https",
+              components.host != nil,
+              canonicalSecurityHostname(publicURL) != nil else {
+            return nil
+        }
+        components.scheme = "wss"
+        components.path = "/tunnel/ws"
+        components.query = nil
+        components.fragment = nil
+        components.user = nil
+        components.password = nil
+        guard let url = components.url else { return nil }
+        return validatedWebSocketURL(url.absoluteString)
     }
 
     static func canonicalSecurityHostname(_ url: URL) -> String? {

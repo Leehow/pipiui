@@ -11,7 +11,6 @@ struct RemoteConnectionSheet: View {
     /// use only the separately validated, explicitly enabled LAN pairing URL;
     /// it must never derive a phone QR payload from the loopback URL.
     let pairingPayload: String?
-    @State private var relayWebSocketURL = ""
     @State private var relayPublicURL = ""
     @State private var relayDisplayName = ""
     @State private var relayMessage = ""
@@ -65,7 +64,8 @@ struct RemoteConnectionSheet: View {
         .frame(maxHeight: 760)
         .accessibilityIdentifier(RemoteConnectionAccessibility.sheetIdentifier)
         .onAppear {
-            relayWebSocketURL = store.remoteRelayConfiguration.webSocketURL.absoluteString
+            // Show the public/page URL; legacy dual-host configs still load here.
+            // Saving re-derives wss://…/tunnel/ws from this single domain field.
             relayPublicURL = store.remoteRelayConfiguration.publicURL.absoluteString
             relayDisplayName = store.remoteRelayConfiguration.displayName
             store.refreshRemoteLegacyMigrationStatus()
@@ -114,32 +114,29 @@ struct RemoteConnectionSheet: View {
                     Spacer()
                 }
 
-                TextField("wss://…/tunnel/ws", text: $relayWebSocketURL)
+                TextField("https://your-server.example", text: $relayPublicURL)
                     .textFieldStyle(.roundedBorder)
-                    .accessibilityLabel("Relay WSS 地址")
-                TextField("https://…/", text: $relayPublicURL)
-                    .textFieldStyle(.roundedBorder)
-                    .accessibilityLabel("Relay 公网配对地址")
+                    .accessibilityLabel("服务器域名")
                 TextField("设备显示名称", text: $relayDisplayName)
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("设备显示名称")
 
                 HStack {
                     Button("保存地址") {
-                        relayMessage = store.updateRemoteRelayConfiguration(
-                            webSocketURL: relayWebSocketURL,
-                            publicURL: relayPublicURL,
-                            displayName: relayDisplayName
-                        ) ? "地址已保存" : "地址无效（产品界面仅接受独立主机的 /tunnel/ws）"
+                        saveRelayServerDomain()
                     }
+                    .accessibilityLabel("保存服务器域名")
                     Button("复制网页地址") {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(relayPublicURL, forType: .string)
                     }
+                    .accessibilityLabel("复制网页地址")
                     Button("浏览器打开") {
                         if let url = RemoteRelaySettings.validatedPublicURL(relayPublicURL) {
                             NSWorkspace.shared.open(url)
                         }
                     }
+                    .accessibilityLabel("浏览器打开网页地址")
                     Spacer()
                 }
 
@@ -151,7 +148,27 @@ struct RemoteConnectionSheet: View {
                                 ? Color.orange : .secondary
                         )
                 }
-                Text("无需账号、验证码、设备注册、手工配对码或长期 token；命令不会降级到 HTTP API。")
+
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("自托管部署说明")
+                            .font(.caption.weight(.semibold))
+                        Text("不需要公钥私钥：配对密钥由本机随机生成，只存在于链接 fragment；TLS 证书用 certbot 自动签发。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text("部署：把项目 Relay/ 目录复制到服务器 → npm ci && npm run build → 用 deploy/pipiui-relay.service 跑 dist/tunnel-server.js → nginx 把 443 反代到 127.0.0.1:8787（含 WebSocket upgrade）→ certbot --nginx 签证书 → DNS 加一条 A 记录指向服务器。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text("详细步骤见仓库 Relay/README.md。")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("自托管部署说明")
+
+                Text("无需账号、验证码、设备注册、手工配对码或长期 token；命令不会降级到 HTTP API。WSS 地址由服务器域名自动推导为 /tunnel/ws。")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -557,6 +574,27 @@ struct RemoteConnectionSheet: View {
             return .green
         case .authenticationFailed, .invalidConfiguration, .protocolMismatch:
             return .orange
+        }
+    }
+
+    private func saveRelayServerDomain() {
+        let trimmed = relayPublicURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let publicURL = RemoteRelaySettings.validatedPublicURL(trimmed),
+              let derived = RemoteRelaySettings.derivedTunnelWebSocketURL(publicURL: publicURL)
+        else {
+            relayMessage = "域名无效：请输入 https:// 开头的服务器域名"
+            return
+        }
+        let ok = store.updateRemoteRelayConfiguration(
+            webSocketURL: derived.absoluteString,
+            publicURL: publicURL.absoluteString,
+            displayName: relayDisplayName
+        )
+        if ok {
+            relayPublicURL = publicURL.absoluteString
+            relayMessage = "地址已保存（WSS 已推导为 \(derived.host ?? "")/tunnel/ws）"
+        } else {
+            relayMessage = "域名无效：请输入 https:// 开头的服务器域名"
         }
     }
 
