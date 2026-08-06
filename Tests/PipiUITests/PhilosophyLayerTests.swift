@@ -176,16 +176,19 @@ final class PhilosophyLayerTests: XCTestCase {
     }
 
     /// Search is for cross-checking a hypothesis you already formed — not a first move and not
-    /// a mandatory step. Tool names must be placeholders so a pi rename stays a one-line edit.
+    /// a mandatory step. Who runs it follows tooling first (native → explore → {{search}}
+    /// fallback). Tool names must be placeholders so a pi rename stays a one-line edit.
     func testSearchComesAfterThinkingAndIsNeverMandatory() throws {
         let t = try text("method")
         assertContains(t, "Form your own read of the problem before you search")
         assertContains(t, "anchors you to")
         assertContains(t, "{{search}}")
         assertContains(t, "{{fetch}}")
-        // "triage, not floor work" was the blanket permission to search personally; who runs
-        // the search is now decided by the size of the question.
-        assertContains(t, "Who does the searching follows the size of the question")
+        // Who runs the search follows tooling first, then question size; direct {{search}}
+        // is only the last-resort fallback when there is no native search and explore failed.
+        assertContains(t, "Who does the searching follows your tooling first")
+        assertContains(t, "No native search: delegate first")
+        assertContains(t, "only as the last resort")
         assertContains(t, "Skip it when you already know the fix")
         assertContains(t, "probably not unique to this codebase")
         assertContains(t, "prior art would sharpen or overturn your plan")
