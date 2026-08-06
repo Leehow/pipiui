@@ -6,9 +6,8 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case builtIn = "内置"
     case models = "模型"
     case usage = "用量"
-    case toolsSkills = "工具"
+    case toolsSkills = "工具/mcp"
     case subagentModels = "Subagent"
-    case memory = "记忆"
     case experimental = "实验"
     var id: String { rawValue }
 
@@ -18,7 +17,6 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         switch self {
         case .toolsSkills: return "工具与 Skills"
         case .subagentModels: return "Subagent 模型"
-        case .memory: return "可控记忆"
         default: return rawValue
         }
     }
@@ -31,7 +29,6 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .usage: return "chart.bar.fill"
         case .toolsSkills: return "wrench.and.screwdriver"
         case .subagentModels: return "person.2"
-        case .memory: return "brain.head.profile"
         case .experimental: return "flask"
         }
     }
@@ -225,8 +222,6 @@ struct SettingsSheet: View {
             toolsSkillsSection
         case .subagentModels:
             subagentModelsSection
-        case .memory:
-            ControlledMemoryView()
         case .experimental:
             experimentalSection
         case .models:
@@ -343,8 +338,6 @@ struct SettingsSheet: View {
             localRemoteSection
             Divider()
             webSearchSection
-            Divider()
-            mcpSection
             Divider()
             visionFallbackSection
             Divider()
@@ -547,6 +540,9 @@ struct SettingsSheet: View {
             ForEach(BuiltInFeatureSettings.Section.allCases, id: \.rawValue) { section in
                 builtInGroup(section)
             }
+
+            Divider()
+            ComputerUseSettingsPanel()
 
             if BuiltInFeatureSettings.EnabledSet(disabled: builtInDisabled).allDisabled {
                 Label("全部已关闭：新建/重启会话将不挂载任何 PipiUI 自有能力。", systemImage: "moon.zzz")
@@ -1199,15 +1195,17 @@ struct SettingsSheet: View {
 
     private var toolsSkillsSection: some View {
         LazyVStack(alignment: .leading, spacing: 16) {
-            Text("工具与 Skills")
+            Text("工具 / MCP")
                 .font(.title3.weight(.semibold))
-            Text("普通工具关闭后通过 `--exclude-tools` 在会话重启后生效。Computer Use 是独立 opt-in：关闭时扩展完全不挂载。Skills 会立即从斜杠菜单隐藏。")
+            Text("普通工具关闭后通过 `--exclude-tools` 在会话重启后生效。Skills 会立即从斜杠菜单隐藏。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            ComputerUseSettingsPanel()
             catalogGroup(title: "内置工具", entries: ToolSkillCatalog.builtinTools)
             catalogGroup(title: "扩展工具", entries: ToolSkillCatalog.extensionTools)
+
+            Divider()
+            mcpSection
 
             LazyVStack(alignment: .leading, spacing: 8) {
                 Text("Skills")
