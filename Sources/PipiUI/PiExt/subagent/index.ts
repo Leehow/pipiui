@@ -777,6 +777,8 @@ interface RunSingleAgentOptions {
 	agentId?: string;
 	/** Short one-line title for the Subagents panel list; falls back to task text if omitted. */
 	title?: string;
+	/** Informational dependency tags (task/agentId short names); display-only. */
+	blockedBy?: string[];
 	/** Current session model as `provider/id` (depth 0 `ctx.model`); used for「跟随主 Agent」. */
 	sessionModel?: string;
 	/** Shell command the runtime runs in the agent's cwd after the process ends (attested verify). */
@@ -1194,6 +1196,8 @@ interface JobRecord {
 	task: string; // truncated summary
 	/** Short UI title (optional). */
 	title?: string;
+	/** Informational dependency tags (task/agentId short names); display-only, no scheduler. */
+	blockedBy?: string[];
 	state: JobState;
 	startedAt: number;
 	endedAt?: number;
@@ -1439,16 +1443,29 @@ function jobPrune(): void {
 	}
 }
 
-function jobUpsertRunning(agentId: string, name: string, task: string, title?: string): void {
+function jobUpsertRunning(
+	agentId: string,
+	name: string,
+	task: string,
+	title?: string,
+	blockedBy?: string[],
+): void {
 	const existing = jobRegistry.get(agentId);
 	// Resume of the same agentId must reopen a terminal row as running (matches Swift start).
 	const keepLive = existing?.state === "running";
+	const deps =
+		blockedBy && blockedBy.length > 0
+			? blockedBy
+			: keepLive
+				? existing?.blockedBy
+				: undefined;
 	jobRegistry.set(agentId, {
 		agentId,
 		runId: keepLive ? (existing?.runId ?? DeliveryObligationStore.runId()) : DeliveryObligationStore.runId(),
 		name,
 		task: taskSummary(task),
 		title,
+		...(deps && deps.length > 0 ? { blockedBy: deps } : {}),
 		state: "running",
 		startedAt: keepLive ? (existing?.startedAt ?? Date.now()) : Date.now(),
 		// Drop endedAt/resultText/metrics from a prior terminal run; keep live metrics only.
@@ -1501,6 +1518,9 @@ function jobFinalize(
 		runId: existing?.runId ?? DeliveryObligationStore.runId(),
 		name: fields.name ?? existing?.name ?? "?",
 		task: fields.task ? taskSummary(fields.task) : (existing?.task ?? ""),
+		...(existing?.blockedBy && existing.blockedBy.length > 0
+			? { blockedBy: existing.blockedBy }
+			: {}),
 		state: fields.state,
 		startedAt: existing?.startedAt ?? now,
 		endedAt: now,
@@ -1691,6 +1711,9 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 			`agentId: ${job.agentId}`,
 			`name: ${job.name}`,
 			...(job.title ? [`title: ${job.title}`] : []),
+			...(job.blockedBy && job.blockedBy.length > 0
+				? [`blocked-by: ${job.blockedBy.join(", ")}`]
+				: []),
 			`state: ${formatJobStateWithStall(job, now)}`,
 			`turns: ${turns}`,
 			`cost: ${cost}`,
@@ -1747,7 +1770,15 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 			j.state === "running"
 				? j.activity || j.task || ""
 				: j.resultText || j.task || "";
-		const preview = previewRaw.replace(/\s+/g, " ").trim().slice(0, 80);
+		const blockedByNote =
+			j.blockedBy && j.blockedBy.length > 0 ? `blocked-by: ${j.blockedBy.join(", ")}` : "";
+		const previewBase = previewRaw.replace(/\s+/g, " ").trim();
+		const preview = (blockedByNote
+			? previewBase
+				? `${blockedByNote} · ${previewBase}`
+				: blockedByNote
+			: previewBase
+		).slice(0, 80);
 		return `| ${j.agentId} | ${j.name} | ${formatJobStateWithStall(j, now)} | ${turns} | ${cost} | ${elapsed} | ${preview || "-"} |`;
 	});
 	return [header, sep, ...rows, ...formatResumableSection(new Set(jobs.map((j) => j.agentId)))].join(
@@ -2119,9 +2150,10 @@ function seedBossLedger(): void {
 				"<!-- user mid-course changes / additions / cancellations: time + content + affected task IDs -->",
 				"",
 				"## Tasks",
-				"| ID | title | status | agent | wave | notes |",
-				"| -- | ----- | ------ | ----- | ---- | ----- |",
+				"| ID | title | status | agent | wave | notes | blocked-by |",
+				"| -- | ----- | ------ | ----- | ---- | ----- | ---------- |",
 				"<!-- status: pending | in-flight | blocked | done | cancelled -->",
+				"<!-- blocked-by: machine-readable dependency tags (task/agentId short names); informational only -->",
 				"",
 				"## Done",
 				"<!-- one line per finished task: conclusion + key evidence (file paths / command results) -->",
@@ -3292,7 +3324,7 @@ async function runSingleAgent(
 			...(options?.background ? { background: true } : {}),
 			worktreeError: placement.worktreeError,
 		});
-		jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title);
+		jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy);
 		jobFinalize(pipiuiAgentId, {
 			name: agentName,
 			task,
@@ -3407,7 +3439,7 @@ async function runSingleAgent(
 		...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
 		...(placement.worktreeError ? { worktreeError: placement.worktreeError } : {}),
 	});
-	jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title);
+	jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy);
 	// 后台 job：注册外部可触达的 AbortController（subagent_abort / action=abort 入口），
 	// 同一句柄也是 stall watchdog 的活动时间戳载体。前台 job 不注册（父 abort 已可杀）。
 	let backgroundAbort: AbortController | undefined;
@@ -3895,6 +3927,36 @@ const FRESH_DESCRIPTION =
 	"Discard this agentId's stored conversation and start it cold. Use when its context went wrong, not routinely.";
 const DESKTOP_PARAM_DESCRIPTION =
 	'Explicit per-task Computer Use authorization. Omitted by default — desktop tools are NEVER injected without it, even when the global toggle is on. Only two values exist: "user-requested" (the user explicitly asked to operate an external app, or named Chrome/Safari/another external browser / "my browser" — then you MUST use exactly that external browser via open_application + computer, never swap in the built-in browser) and "ui-verify" (this task built/changed an app and genuinely needs a visual UI acceptance check). Ordinary web research → built-in browser tool, not desktop. Waiting, polling logs, reading files, and build/test verification never use desktop. Do not grant for convenience; each task is authorized independently and never inherits another task\'s grant.';
+const BLOCKED_BY_DESCRIPTION =
+	'Optional dependency tags (task/agentId short names this task depends on), e.g. ["tldr-done-report"]; informational display only — does not delay or gate scheduling.';
+
+/** Runtime shape check for blockedBy: array of strings, max 10, each ≤ 40 chars. */
+function validateBlockedBy(value: unknown, label: string): string | null {
+	if (value === undefined || value === null) return null;
+	if (!Array.isArray(value)) {
+		return `Invalid blockedBy on ${label}: must be an array of strings (got ${typeof value}).`;
+	}
+	if (value.length > 10) {
+		return `Invalid blockedBy on ${label}: at most 10 entries (got ${value.length}).`;
+	}
+	for (let i = 0; i < value.length; i++) {
+		const entry = value[i];
+		if (typeof entry !== "string") {
+			return `Invalid blockedBy on ${label}: entry [${i}] must be a string (got ${typeof entry}).`;
+		}
+		if (entry.length > 40) {
+			return `Invalid blockedBy on ${label}: entry [${i}] must be ≤ 40 characters (got ${entry.length}).`;
+		}
+	}
+	return null;
+}
+
+const BlockedByParam = Type.Optional(
+	Type.Array(Type.String({ maxLength: 40 }), {
+		description: BLOCKED_BY_DESCRIPTION,
+		maxItems: 10,
+	}),
+);
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
@@ -3905,6 +3967,7 @@ const TaskItem = Type.Object({
 				"Short one-line title shown in the Subagents panel list instead of the full task; omit to fall back to task text",
 		}),
 	),
+	blockedBy: BlockedByParam,
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
@@ -3956,10 +4019,11 @@ const SubagentParams = Type.Object({
 				"Short one-line title shown in the Subagents panel list instead of the full task (single mode); omit to fall back to task text",
 		}),
 	),
+	blockedBy: BlockedByParam,
 	tasks: Type.Optional(
 		Type.Array(TaskItem, {
 			description:
-				'Array of {agent, task, title?, cwd?, verify?} for parallel execution. Put each independent workflow in its own array element; NEVER merge independent goals into one brief.\nExample: [{"agent":"explore","task":"map auth"},{"agent":"explore","task":"map billing"}].\nAnti-pattern: one task brief listing A; B; C.',
+				'Array of {agent, task, title?, blockedBy?, cwd?, verify?} for parallel execution. Put each independent workflow in its own array element; NEVER merge independent goals into one brief.\nExample: [{"agent":"explore","task":"map auth"},{"agent":"explore","task":"map billing"}].\nAnti-pattern: one task brief listing A; B; C.',
 		}),
 	),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task, title?, cwd?, verify?} for sequential execution" })),
@@ -4349,6 +4413,7 @@ export default function (pi: ExtensionAPI) {
 			"While the fan-out philosophy layer is active, background=false is ignored at boss depth — asynchronous dispatch is that layer's premise, not a preference. Use chain for genuinely ordered synchronous steps.",
 			"By default writable workers run in an isolated git worktree under .pi/worktrees/ on a pipiui/<agentId> branch; read-only roles run directly in the caller cwd and never create a worktree. Pass explicit cwd or set PIPIUI_WORKTREE=0 to disable worktree isolation. The runtime-owned secretary role is also an exception: it always runs in PIPIUI_MAIN_CWD with recursive delegation disabled and never creates a worktree. On successful writable-worker end the app auto-merges into the main project, removes the worktree, and safely deletes only a merged internal branch with git branch -d. If merge or cleanup fails, the main session retains actionable state; failed/aborted keeps worktree for resume (GUI merge/discard fallback).",
 			"Track jobs with subagent_status(agentId?). Never re-spawn a finished task without reading its result via [subagent-done] or subagent_status.",
+			"Optional blockedBy on single/parallel tasks records dependency tags for status and ledger display only (no scheduler gating).",
 			'Abort a running background job with action:"abort" + agentId (equivalent to /subagent_abort); it ends as aborted and still reports [subagent-done].',
 			"Background jobs with no output for 120s are pushed as [subagent-stalled] and marked stalled (with idle seconds) in subagent_status.",
 			"Do not busy-loop poll; one status check per decision is correct.",
@@ -4442,6 +4507,7 @@ export default function (pi: ExtensionAPI) {
 				verify: string | undefined,
 				fresh?: boolean,
 				desktop?: "user-requested" | "ui-verify",
+				blockedBy?: string[],
 			): void => {
 				void runSingleAgent(
 					ctx.cwd,
@@ -4453,7 +4519,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ background: true, agentId, title, sessionModel, verify, fresh, desktop },
+					{ background: true, agentId, title, sessionModel, verify, fresh, desktop, blockedBy },
 				)
 					.then((result) => {
 						notifySubagentDone(pi, result);
@@ -4508,6 +4574,30 @@ export default function (pi: ExtensionAPI) {
 					],
 					details: makeDetails("single")([]),
 				};
+			}
+
+			// blockedBy is display-only dependency metadata; reject malformed values early.
+			if (hasSingle) {
+				const blockedByErr = validateBlockedBy(params.blockedBy, "single");
+				if (blockedByErr) {
+					return {
+						content: [{ type: "text", text: blockedByErr }],
+						details: makeDetails("single")([]),
+						isError: true,
+					};
+				}
+			}
+			if (hasTasks && params.tasks) {
+				for (let i = 0; i < params.tasks.length; i++) {
+					const blockedByErr = validateBlockedBy(params.tasks[i].blockedBy, `tasks[${i}]`);
+					if (blockedByErr) {
+						return {
+							content: [{ type: "text", text: blockedByErr }],
+							details: makeDetails("parallel")([]),
+							isError: true,
+						};
+					}
+				}
 			}
 
 			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
@@ -4787,7 +4877,7 @@ export default function (pi: ExtensionAPI) {
 								undefined, // no parent abort binding
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ background: true, agentId, title: t.title, sessionModel, verify: t.verify, fresh: t.fresh, desktop: t.desktop },
+								{ background: true, agentId, title: t.title, sessionModel, verify: t.verify, fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy },
 							);
 							notifySubagentDone(pi, result);
 						} catch (err) {
@@ -4876,6 +4966,7 @@ export default function (pi: ExtensionAPI) {
 							agentId: t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
 							fresh: t.fresh,
 							desktop: t.desktop,
+							blockedBy: t.blockedBy,
 						},
 					);
 					allResults[index] = result;
@@ -4926,7 +5017,7 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 					const agentId = params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
-					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.fresh, params.desktop);
+					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.fresh, params.desktop, params.blockedBy);
 					const placeholder: SingleResult = {
 						agent: params.agent,
 						agentId,
@@ -4974,6 +5065,7 @@ export default function (pi: ExtensionAPI) {
 						agentId: params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
 						fresh: params.fresh,
 						desktop: params.desktop,
+						blockedBy: params.blockedBy,
 					},
 				);
 				const isError = isFailedResult(result);
