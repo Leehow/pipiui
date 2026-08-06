@@ -59,6 +59,12 @@ final class WebViewStore: NSObject, ObservableObject {
 
     private static let productionFrameNavigationTimeout: TimeInterval = 20
     private static let productionFrameNavigationTimeoutNote = "iframe navigation timed out after 20s"
+    /// Quiet window after the latest completed resource/navigation timing entry.
+    private static let productionNetworkIdleQuietMs: Double = 400
+    /// Cap extra wait after didFinish so idle settle cannot stall ordinary navigations.
+    private static let productionNavigationIdleMaxSeconds: TimeInterval = 2.5
+    private static let defaultWaitTimeoutSeconds: TimeInterval = 10
+    private static let maxWaitTimeoutSeconds: TimeInterval = 30
 
     private static let browserDOMWorld = WKContentWorld.world(name: BrowserDOMControllerResource.contentWorldName)
 
@@ -218,6 +224,70 @@ final class WebViewStore: NSObject, ObservableObject {
             ) { [weak self] response in
                 self?.completeRequest(ifGeneration: generation, response)
             }
+        case "wait":
+            let generation = beginRequest(
+                requestID: requestID,
+                activity: .observing,
+                navigation: false,
+                respond: respond
+            )
+            let scope = normalizedScope(request["scope"].string)
+            let selector = request["selector"].string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let hasSelector = !selector.isEmpty
+            let hasIndex = request["element_index"].int != nil
+            let hasToken = !(request["element_token"].string ?? "").isEmpty
+            let hasElementTarget = hasIndex || hasToken || !(request["snapshot_id"].string ?? "").isEmpty
+            let requestedMode = (request["mode"].string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let mode: String
+            if requestedMode == "idle" || requestedMode == "selector" {
+                mode = requestedMode
+            } else if hasSelector || hasElementTarget {
+                mode = "selector"
+            } else if requestedMode.isEmpty {
+                mode = "idle"
+            } else {
+                completeRequest(ifGeneration: generation, [
+                    "ok": false,
+                    "error": "wait mode must be 'selector' or 'idle'",
+                    "code": "invalid_browser_wait",
+                ])
+                return
+            }
+            if mode == "selector", !hasSelector, !hasElementTarget {
+                completeRequest(ifGeneration: generation, [
+                    "ok": false,
+                    "error": "wait selector mode requires selector or a snapshot element target",
+                    "code": "invalid_browser_wait",
+                ])
+                return
+            }
+            if mode == "selector", hasSelector, hasElementTarget {
+                completeRequest(ifGeneration: generation, [
+                    "ok": false,
+                    "error": "wait selector mode accepts selector or a snapshot element target, not both",
+                    "code": "invalid_browser_wait",
+                ])
+                return
+            }
+            let timeoutSeconds = Self.clampedWaitTimeout(request["timeout"].double)
+            let idleMs = Self.clampedIdleQuietMs(request["idle_ms"].double)
+            var payload: [String: Any] = [
+                "action": "wait_check",
+                "mode": mode,
+                "scope": scope,
+                "idle_ms": idleMs,
+            ]
+            if hasSelector { payload["selector"] = selector }
+            if let snapshotID = request["snapshot_id"].string { payload["snapshot_id"] = snapshotID }
+            if let token = request["element_token"].string { payload["element_token"] = token }
+            if let index = request["element_index"].int { payload["element_index"] = index }
+            scheduleWaitPoll(
+                generation: generation,
+                payload: payload,
+                scope: scope,
+                mode: mode,
+                deadline: Date().addingTimeInterval(timeoutSeconds)
+            )
         case "click", "input", "select", "scroll":
             let generation = beginRequest(
                 requestID: requestID,
@@ -343,6 +413,16 @@ final class WebViewStore: NSObject, ObservableObject {
 
     private func normalizedScope(_ scope: String?) -> String {
         scope == "page" ? "page" : "viewport"
+    }
+
+    private static func clampedWaitTimeout(_ raw: Double?) -> TimeInterval {
+        let value = raw ?? defaultWaitTimeoutSeconds
+        return min(max(value, 0.05), maxWaitTimeoutSeconds)
+    }
+
+    private static func clampedIdleQuietMs(_ raw: Double?) -> Double {
+        let value = raw ?? productionNetworkIdleQuietMs
+        return min(max(value, 50), 5_000)
     }
 
     @discardableResult
@@ -504,6 +584,131 @@ final class WebViewStore: NSObject, ObservableObject {
             if let note { result["note"] = note }
             self?.completeRequest(ifGeneration: generation, result)
         }
+    }
+
+    /// After didFinish, wait briefly for resource timing to go quiet before observing.
+    /// Soft-cap keeps static pages fast; never fails navigate solely for missing idle.
+    private func finishNavigationAfterNetworkIdle(generation: UInt64) {
+        let deadline = Date().addingTimeInterval(Self.productionNavigationIdleMaxSeconds)
+        scheduleNavigationIdlePoll(generation: generation, deadline: deadline, delay: 0)
+    }
+
+    private func scheduleNavigationIdlePoll(
+        generation: UInt64,
+        deadline: Date,
+        delay: TimeInterval
+    ) {
+        actionGrace?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  generation == self.requestGeneration,
+                  self.activeRespond != nil,
+                  self.activeIsNavigation else { return }
+            if Date() >= deadline {
+                self.finishNavigationWithObservation(generation: generation)
+                return
+            }
+            self.evaluateBrowserDOM([
+                "action": "wait_check",
+                "mode": "idle",
+                "idle_ms": Self.productionNetworkIdleQuietMs,
+            ]) { [weak self] response in
+                guard let self,
+                      generation == self.requestGeneration,
+                      self.activeRespond != nil,
+                      self.activeIsNavigation else { return }
+                if response["ok"] as? Bool == true, response["ready"] as? Bool == true {
+                    self.finishNavigationWithObservation(generation: generation)
+                    return
+                }
+                if Date() >= deadline {
+                    self.finishNavigationWithObservation(generation: generation)
+                    return
+                }
+                self.scheduleNavigationIdlePoll(generation: generation, deadline: deadline, delay: 0.05)
+            }
+        }
+        actionGrace = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func scheduleWaitPoll(
+        generation: UInt64,
+        payload: [String: Any],
+        scope: String,
+        mode: String,
+        deadline: Date,
+        delay: TimeInterval = 0
+    ) {
+        actionGrace?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  generation == self.requestGeneration,
+                  self.activeRespond != nil,
+                  !self.activeIsNavigation else { return }
+            if Date() >= deadline {
+                self.completeRequest(ifGeneration: generation, [
+                    "ok": false,
+                    "error": mode == "idle"
+                        ? "network idle was not reached before timeout"
+                        : "wait condition was not met before timeout",
+                    "code": "browser_wait_timeout",
+                    "requiresObservation": true,
+                    "mode": mode,
+                ])
+                return
+            }
+            self.evaluateBrowserDOM(payload) { [weak self] response in
+                guard let self,
+                      generation == self.requestGeneration,
+                      self.activeRespond != nil else { return }
+                if response["ok"] as? Bool != true {
+                    self.completeRequest(ifGeneration: generation, response)
+                    return
+                }
+                if response["ready"] as? Bool == true {
+                    var observePayload: [String: Any] = [
+                        "action": "observe",
+                        "scope": scope,
+                        "action_metadata": [
+                            "kind": "wait",
+                            "mode": mode,
+                        ],
+                    ]
+                    if let selector = payload["selector"] as? String {
+                        var metadata = observePayload["action_metadata"] as? [String: Any] ?? [:]
+                        metadata["selector"] = selector
+                        observePayload["action_metadata"] = metadata
+                    }
+                    self.evaluateBrowserDOM(observePayload) { [weak self] observation in
+                        self?.completeRequest(ifGeneration: generation, observation)
+                    }
+                    return
+                }
+                if Date() >= deadline {
+                    self.completeRequest(ifGeneration: generation, [
+                        "ok": false,
+                        "error": mode == "idle"
+                            ? "network idle was not reached before timeout"
+                            : "wait condition was not met before timeout",
+                        "code": "browser_wait_timeout",
+                        "requiresObservation": true,
+                        "mode": mode,
+                    ])
+                    return
+                }
+                self.scheduleWaitPoll(
+                    generation: generation,
+                    payload: payload,
+                    scope: scope,
+                    mode: mode,
+                    deadline: deadline,
+                    delay: 0.05
+                )
+            }
+        }
+        actionGrace = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     static func foundationSerializedUTF16Length(_ value: [String: Any]) -> Int? {
@@ -692,7 +897,7 @@ extension WebViewStore: WKNavigationDelegate {
         urlString = webView.url?.absoluteString ?? urlString
         title = webView.title ?? ""
         guard isCurrentNavigation(navigation) else { return }
-        finishNavigationWithObservation(generation: requestGeneration)
+        finishNavigationAfterNetworkIdle(generation: requestGeneration)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

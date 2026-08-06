@@ -1355,4 +1355,252 @@ final class BrowserDOMControllerTests: XCTestCase {
         XCTAssertEqual(parts.dropFirst().first, "b")
         XCTAssertGreaterThan(Int(parts.last ?? "0") ?? 0, 0)
     }
+
+    func testWaitSelectorAppearsAfterDelayAndReturnsObservation() throws {
+        let html = #"""
+        <!doctype html>
+        <html><head><meta charset="utf-8"><title>Wait selector fixture</title></head>
+        <body>
+          <h1>Waiting room</h1>
+          <script>
+            setTimeout(() => {
+              const button = document.createElement('button');
+              button.id = 'late-button';
+              button.textContent = 'Late button';
+              document.body.appendChild(button);
+            }, 350);
+          </script>
+        </body></html>
+        """#
+        let store = WebViewStore()
+        try loadHTML(html, in: store, expectedTitle: "Wait selector fixture")
+
+        let started = Date()
+        let waited = try call(store, action: "wait", request: [
+            "mode": "selector",
+            "selector": "#late-button",
+            "timeout": 3,
+        ], timeout: 5)
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertEqual(waited["ok"] as? Bool, true, "\(waited)")
+        XCTAssertGreaterThanOrEqual(elapsed, 0.30)
+        XCTAssertEqual((waited["action"] as? [String: Any])?["kind"] as? String, "wait")
+        XCTAssertEqual((waited["action"] as? [String: Any])?["mode"] as? String, "selector")
+        XCTAssertTrue(elements(waited).contains { $0["name"] as? String == "Late button" })
+        XCTAssertNotNil(waited["snapshotID"] as? String)
+    }
+
+    func testWaitSelectorTimeoutReturnsStructuredError() throws {
+        let html = #"""
+        <!doctype html>
+        <html><head><meta charset="utf-8"><title>Wait timeout fixture</title></head>
+        <body><h1>Nothing arrives</h1></body></html>
+        """#
+        let store = WebViewStore()
+        try loadHTML(html, in: store, expectedTitle: "Wait timeout fixture")
+
+        let started = Date()
+        let timedOut = try call(store, action: "wait", request: [
+            "mode": "selector",
+            "selector": "#never-appears",
+            "timeout": 0.35,
+        ], timeout: 3)
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertEqual(timedOut["ok"] as? Bool, false, "\(timedOut)")
+        XCTAssertEqual(timedOut["code"] as? String, "browser_wait_timeout")
+        XCTAssertEqual(timedOut["requiresObservation"] as? Bool, true)
+        XCTAssertEqual(timedOut["mode"] as? String, "selector")
+        XCTAssertGreaterThanOrEqual(elapsed, 0.30)
+        XCTAssertEqual(store.browserActivity, .idle)
+    }
+
+    func testWaitNetworkIdleSettlesAfterSlowResource() throws {
+        final class WaitResourceSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable {
+            func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
+                guard let url = urlSchemeTask.request.url else {
+                    urlSchemeTask.didFailWithError(URLError(.badURL))
+                    return
+                }
+                if url.path == "/page" {
+                    let html = """
+                    <!doctype html>
+                    <html><head><meta charset="utf-8"><title>Idle wait fixture</title></head>
+                    <body>
+                      <h1>Idle host</h1>
+                      <button id="ready-control">Ready control</button>
+                      <img id="slow" src="pipiui-test://fixture/slow.png" width="10" height="10">
+                    </body></html>
+                    """
+                    let data = Data(html.utf8)
+                    let response = URLResponse(
+                        url: url,
+                        mimeType: "text/html",
+                        expectedContentLength: data.count,
+                        textEncodingName: "utf-8"
+                    )
+                    urlSchemeTask.didReceive(response)
+                    urlSchemeTask.didReceive(data)
+                    urlSchemeTask.didFinish()
+                    return
+                }
+                if url.path == "/slow.png" {
+                    // 1x1 PNG
+                    let png = Data(base64Encoded:
+                        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+                    )!
+                    let response = URLResponse(
+                        url: url,
+                        mimeType: "image/png",
+                        expectedContentLength: png.count,
+                        textEncodingName: nil
+                    )
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+                        urlSchemeTask.didReceive(response)
+                        urlSchemeTask.didReceive(png)
+                        urlSchemeTask.didFinish()
+                    }
+                    return
+                }
+                urlSchemeTask.didFailWithError(URLError(.fileDoesNotExist))
+            }
+
+            func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
+        }
+
+        let handler = WaitResourceSchemeHandler()
+        let store = WebViewStore(testSchemeHandler: handler)
+
+        let navigated = try call(
+            store,
+            action: "navigate",
+            request: ["url": "pipiui-test://fixture/page"],
+            timeout: 5
+        )
+        XCTAssertEqual(navigated["ok"] as? Bool, true, "\(navigated)")
+        XCTAssertEqual(navigated["title"] as? String, "Idle wait fixture")
+        XCTAssertTrue(elements(navigated).contains { $0["name"] as? String == "Ready control" })
+
+        // Explicit idle wait on an already-settled page should return quickly with observation.
+        let started = Date()
+        let idle = try call(store, action: "wait", request: [
+            "mode": "idle",
+            "idle_ms": 200,
+            "timeout": 3,
+        ], timeout: 4)
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertEqual(idle["ok"] as? Bool, true, "\(idle)")
+        XCTAssertEqual((idle["action"] as? [String: Any])?["kind"] as? String, "wait")
+        XCTAssertEqual((idle["action"] as? [String: Any])?["mode"] as? String, "idle")
+        XCTAssertLessThan(elapsed, 1.5)
+        XCTAssertNotNil(idle["snapshotID"] as? String)
+    }
+
+    func testWaitIdleTimeoutWhenResourcesNeverQuiet() throws {
+        final class ForeverBusySchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable {
+            func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
+                guard let url = urlSchemeTask.request.url else {
+                    urlSchemeTask.didFailWithError(URLError(.badURL))
+                    return
+                }
+                if url.path == "/busy" {
+                    let html = """
+                    <!doctype html>
+                    <html><head><meta charset="utf-8"><title>Busy idle fixture</title></head>
+                    <body><h1>Idle host</h1><div id="mount"></div></body></html>
+                    """
+                    let data = Data(html.utf8)
+                    let response = URLResponse(
+                        url: url,
+                        mimeType: "text/html",
+                        expectedContentLength: data.count,
+                        textEncodingName: "utf-8"
+                    )
+                    urlSchemeTask.didReceive(response)
+                    urlSchemeTask.didReceive(data)
+                    urlSchemeTask.didFinish()
+                    return
+                }
+                if url.path == "/hang.png" {
+                    // Intentionally remain pending so document.images stay incomplete.
+                    return
+                }
+                urlSchemeTask.didFailWithError(URLError(.fileDoesNotExist))
+            }
+
+            func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
+        }
+
+        let store = WebViewStore(testSchemeHandler: ForeverBusySchemeHandler())
+        let page = try call(
+            store,
+            action: "navigate",
+            request: ["url": "pipiui-test://fixture/busy"],
+            timeout: 5
+        )
+        XCTAssertEqual(page["ok"] as? Bool, true, "\(page)")
+
+        // Attach the hanging image after navigation settles so didFinish is not blocked.
+        let attached = try call(store, action: "eval", request: [
+            "js": """
+            (() => {
+              const img = document.createElement('img');
+              img.id = 'hang';
+              img.width = 10;
+              img.height = 10;
+              img.src = 'pipiui-test://fixture/hang.png';
+              document.getElementById('mount').appendChild(img);
+              return String(!img.complete);
+            })()
+            """,
+        ])
+        XCTAssertEqual(attached["result"] as? String, "true", "hanging image fixture must stay incomplete")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+
+        let timedOut = try call(store, action: "wait", request: [
+            "mode": "idle",
+            "idle_ms": 200,
+            "timeout": 0.4,
+        ], timeout: 3)
+        XCTAssertEqual(timedOut["ok"] as? Bool, false, "\(timedOut)")
+        XCTAssertEqual(timedOut["code"] as? String, "browser_wait_timeout")
+        XCTAssertEqual(timedOut["requiresObservation"] as? Bool, true)
+        XCTAssertEqual(timedOut["mode"] as? String, "idle")
+    }
+
+    func testWaitInvalidArgumentsAndCancellation() throws {
+        let store = WebViewStore()
+        try loadHTML(
+            "<!doctype html><html><head><title>Wait args</title></head><body><button id='x'>X</button></body></html>",
+            in: store,
+            expectedTitle: "Wait args"
+        )
+
+        let invalid = try call(store, action: "wait", request: [
+            "mode": "selector",
+            "timeout": 1,
+        ])
+        XCTAssertEqual(invalid["ok"] as? Bool, false)
+        XCTAssertEqual(invalid["code"] as? String, "invalid_browser_wait")
+
+        let requestID = UUID().uuidString
+        let once = expectation(description: "wait cancellation responds once")
+        var responses: [[String: Any]] = []
+        store.handle(action: "wait", request: J([
+            "requestID": requestID,
+            "mode": "selector",
+            "selector": "#never",
+            "timeout": 5,
+        ])) { response in
+            responses.append(response)
+            if responses.count == 1 { once.fulfill() }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            store.cancelRequest(requestID: requestID, reason: "test wait cancellation")
+        }
+        wait(for: [once], timeout: 2)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        XCTAssertEqual(responses.count, 1)
+        XCTAssertEqual(responses.first?["code"] as? String, "request_cancelled")
+        XCTAssertEqual(store.browserActivity, .idle)
+    }
 }

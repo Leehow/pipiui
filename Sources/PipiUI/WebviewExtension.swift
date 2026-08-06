@@ -121,8 +121,16 @@ const HELP = [
   "browser actions:",
   "",
   "navigate {url}          Open a URL in the panel and wait for load. Scheme optional;",
-  "                        localhost defaults to http. Returns a fresh structured observation.",
+  "                        localhost defaults to http. Settles on didFinish + a short network-idle",
+  "                        window (resource timing heuristic). Returns a fresh observation.",
   "observe {scope?}        Snapshot interactive DOM. scope='viewport' (default) or 'page'.",
+  "wait {mode?, selector?, timeout?, idle_ms?, snapshot_id?, element_index|element_token?}",
+  "                        mode='selector' (default when selector/target given): wait until a CSS",
+  "                        selector is visible, or a snapshot element target is valid again.",
+  "                        mode='idle' (default otherwise): wait until document.readyState is",
+  "                        complete and Performance resource timing stays quiet for idle_ms",
+  "                        (default 400ms). timeout is seconds (default 10, max 30). On success",
+  "                        returns a fresh observation; on timeout code=browser_wait_timeout.",
   "click {snapshot_id, element_index|element_token}",
   "input {snapshot_id, element_index|element_token, text}",
   "select {snapshot_id, element_index|element_token, option}",
@@ -153,15 +161,17 @@ export default function (pi: ExtensionAPI) {
     label: "Browser",
     description:
       "Drive the built-in WebView with structured observations and typed DOM actions. " +
-      "actions: navigate, observe, click, input, select, scroll, content, eval, console, screenshot, help. " +
+      "actions: navigate, observe, wait, click, input, select, scroll, content, eval, console, screenshot, help. " +
       'Call with action:"help" for full parameter docs.',
     parameters: Type.Object({
       action: Type.String({
-        description: "navigate | observe | click | input | select | scroll | content | eval | console | screenshot | help",
+        description: "navigate | observe | wait | click | input | select | scroll | content | eval | console | screenshot | help",
       }),
       url: Type.Optional(Type.String()),
       js: Type.Optional(Type.String()),
-      mode: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("html")])),
+      mode: Type.Optional(Type.Union([
+        Type.Literal("text"), Type.Literal("html"), Type.Literal("selector"), Type.Literal("idle"),
+      ])),
       clear: Type.Optional(Type.Boolean()),
       scope: Type.Optional(Type.Union([Type.Literal("viewport"), Type.Literal("page")])),
       snapshot_id: Type.Optional(Type.String()),
@@ -173,6 +183,9 @@ export default function (pi: ExtensionAPI) {
         Type.Literal("up"), Type.Literal("down"), Type.Literal("left"), Type.Literal("right"),
       ])),
       amount: Type.Optional(Type.Number({ minimum: 0.1, maximum: 10 })),
+      selector: Type.Optional(Type.String()),
+      timeout: Type.Optional(Type.Number({ minimum: 0.05, maximum: 30 })),
+      idle_ms: Type.Optional(Type.Number({ minimum: 50, maximum: 5000 })),
     }),
     async execute(_id, params, signal) {
       switch (params.action) {
@@ -183,6 +196,43 @@ export default function (pi: ExtensionAPI) {
         }
         case "observe": {
           const r = await bridge("observe", { scope: params.scope ?? "viewport" }, signal);
+          return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
+        }
+        case "wait": {
+          const mode = params.mode === "idle" || params.mode === "selector"
+            ? params.mode
+            : (typeof params.selector === "string" && params.selector.trim()
+              || typeof params.element_index === "number"
+              || (typeof params.element_token === "string" && params.element_token.length > 0)
+                ? "selector"
+                : "idle");
+          if (mode === "selector") {
+            const hasSelector = typeof params.selector === "string" && params.selector.trim().length > 0;
+            const hasIndex = typeof params.element_index === "number";
+            const hasToken = typeof params.element_token === "string" && params.element_token.length > 0;
+            if (!hasSelector && hasIndex === hasToken) {
+              return text(`browser wait selector mode requires selector or exactly one of element_index or element_token.\n\n${HELP}`);
+            }
+            if (hasSelector && (hasIndex || hasToken || params.snapshot_id)) {
+              return text(`browser wait selector mode accepts selector or a snapshot element target, not both.\n\n${HELP}`);
+            }
+            if (!hasSelector && !params.snapshot_id) {
+              return text(`browser wait with an element target requires snapshot_id.\n\n${HELP}`);
+            }
+          } else if (params.mode && params.mode !== "idle" && params.mode !== "selector"
+            && params.mode !== "text" && params.mode !== "html") {
+            return text(`browser wait mode must be "selector" or "idle".\n\n${HELP}`);
+          }
+          const r = await bridge("wait", {
+            mode,
+            scope: params.scope ?? "viewport",
+            ...(typeof params.selector === "string" ? { selector: params.selector } : {}),
+            ...(typeof params.timeout === "number" ? { timeout: params.timeout } : {}),
+            ...(typeof params.idle_ms === "number" ? { idle_ms: params.idle_ms } : {}),
+            ...(typeof params.snapshot_id === "string" ? { snapshot_id: params.snapshot_id } : {}),
+            ...(typeof params.element_index === "number" ? { element_index: params.element_index } : {}),
+            ...(typeof params.element_token === "string" ? { element_token: params.element_token } : {}),
+          }, signal);
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
         case "click":

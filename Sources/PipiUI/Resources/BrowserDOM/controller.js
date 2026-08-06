@@ -722,10 +722,151 @@
     );
   }
 
+  function queryVisibleSelector(selector) {
+    if (typeof selector !== "string" || !selector.trim()) return null;
+    let matched = null;
+    try {
+      matched = document.querySelector(selector);
+    } catch (_) {
+      return { error: failure("Invalid CSS selector.", "invalid_browser_wait") };
+    }
+    if (!matched) return { element: null };
+    if (isHiddenComposed(matched) || !hasVisibleBox(matched)) return { element: null };
+    return { element: matched };
+  }
+
+  function hasUnresolvedDocumentResources() {
+    try {
+      const images = document.images;
+      for (let i = 0; i < images.length; i += 1) {
+        if (!images[i].complete) return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function networkIdleStatus(quietMs) {
+    const quiet = Math.min(5000, Math.max(50, Number(quietMs) || 500));
+    const now = performance.now();
+    let lastEnd = 0;
+    let inflight = false;
+    try {
+      const navigationEntries = performance.getEntriesByType("navigation") || [];
+      for (const entry of navigationEntries) {
+        const end = entry.loadEventEnd || entry.domComplete || entry.responseEnd || 0;
+        if (end > lastEnd) lastEnd = end;
+      }
+      const resources = performance.getEntriesByType("resource") || [];
+      for (const entry of resources) {
+        // Incomplete resource timings keep responseEnd at 0 in WebKit while in flight.
+        if (!(entry.responseEnd > 0)) {
+          inflight = true;
+          continue;
+        }
+        if (entry.responseEnd > lastEnd) lastEnd = entry.responseEnd;
+      }
+    } catch (_) {}
+    // Performance entries alone miss in-flight images on some WebKit builds; DOM complete flags cover that gap without page-world fetch/XHR patches.
+    if (hasUnresolvedDocumentResources()) inflight = true;
+    const readyState = String(document.readyState || "");
+    if (readyState !== "complete") {
+      return {
+        ready: false,
+        reason: "document_loading",
+        readyState,
+        lastActivityAgeMs: lastEnd > 0 ? Math.max(0, now - lastEnd) : 0,
+        quietMs: quiet,
+      };
+    }
+    if (inflight) {
+      return {
+        ready: false,
+        reason: "resource_inflight",
+        readyState,
+        lastActivityAgeMs: 0,
+        quietMs: quiet,
+      };
+    }
+    if (!(lastEnd > 0)) {
+      return {
+        ready: true,
+        reason: "idle",
+        readyState,
+        lastActivityAgeMs: quiet,
+        quietMs: quiet,
+      };
+    }
+    const age = Math.max(0, now - lastEnd);
+    return {
+      ready: age >= quiet,
+      reason: age >= quiet ? "idle" : "quiet_window",
+      readyState,
+      lastActivityAgeMs: age,
+      quietMs: quiet,
+    };
+  }
+
+  function waitCheck(params, scope) {
+    const mode = String(params?.mode || "");
+    if (mode === "idle") {
+      const status = networkIdleStatus(params.idle_ms);
+      return enforceEnvelopeBudget({
+        ok: true,
+        ready: status.ready === true,
+        mode: "idle",
+        ...status,
+      }, activeRedactionVariants());
+    }
+
+    if (mode !== "selector") {
+      return failure("wait requires mode 'selector' or 'idle'.", "invalid_browser_wait");
+    }
+
+    const hasSelector = typeof params.selector === "string" && params.selector.trim().length > 0;
+    const hasIndex = Number.isInteger(params.element_index);
+    const hasToken = typeof params.element_token === "string" && params.element_token.length > 0;
+    if (hasSelector && (hasIndex || hasToken || typeof params.snapshot_id === "string")) {
+      return failure("wait selector mode accepts selector or a snapshot element target, not both.", "invalid_browser_wait");
+    }
+    if (hasSelector) {
+      const matched = queryVisibleSelector(params.selector);
+      if (matched.error) return matched.error;
+      return enforceEnvelopeBudget({
+        ok: true,
+        ready: Boolean(matched.element),
+        mode: "selector",
+        selector: truncateUTF16(params.selector, 512),
+      }, activeRedactionVariants());
+    }
+    if (!hasIndex && !hasToken) {
+      return failure("wait selector mode requires selector or a snapshot element target.", "invalid_browser_wait");
+    }
+    const resolved = resolveTarget(params);
+    if (resolved.error) {
+      // Stale/missing targets are "not ready yet" while the document may still be updating.
+      // Hard validation errors (invalid_browser_target) stay terminal.
+      const code = resolved.error.code;
+      if (code === "invalid_browser_target" || code === "invalid_browser_wait") return resolved.error;
+      return enforceEnvelopeBudget({
+        ok: true,
+        ready: false,
+        mode: "selector",
+        pendingReason: code || "target_not_ready",
+      }, activeRedactionVariants());
+    }
+    return enforceEnvelopeBudget({
+      ok: true,
+      ready: true,
+      mode: "selector",
+      scope,
+    }, activeRedactionVariants());
+  }
+
   function dispatch(params) {
     const action = String(params?.action || "");
     const scope = params?.scope === "page" ? "page" : "viewport";
     if (action === "observe") return observe(scope, params.action_metadata || null, []);
+    if (action === "wait_check") return waitCheck(params, scope);
     if (action === "clear") {
       invalidateSnapshot();
       clearPendingFrameClick();

@@ -55,7 +55,7 @@ final class PromptCacheDisciplineTests: XCTestCase {
         XCTAssertEqual(registrations, 1, "browser actions must stay behind a single tool")
         XCTAssertTrue(source.contains("name: \"browser\""))
         for action in [
-            "navigate", "observe", "click", "input", "select", "scroll",
+            "navigate", "observe", "wait", "click", "input", "select", "scroll",
             "content", "eval", "console", "screenshot", "help",
         ] {
             XCTAssertTrue(source.contains("case \"\(action)\":"), "missing browser action \(action)")
@@ -63,9 +63,13 @@ final class PromptCacheDisciplineTests: XCTestCase {
         for field in [
             "scope:", "snapshot_id:", "element_index:", "element_token:",
             "text:", "option:", "direction:", "amount:",
+            "selector:", "timeout:", "idle_ms:",
         ] {
             XCTAssertTrue(source.contains(field), "missing browser schema field \(field)")
         }
+        XCTAssertTrue(source.contains("Type.Literal(\"selector\")"), "wait mode selector must be in schema")
+        XCTAssertTrue(source.contains("Type.Literal(\"idle\")"), "wait mode idle must be in schema")
+        XCTAssertTrue(source.contains("mode='idle'"), "help text must document idle wait")
         XCTAssertFalse(source.contains("target: Type."), "browser must remain embedded-WebView only")
         XCTAssertTrue(source.contains("async execute(_id, params, signal)"))
         XCTAssertTrue(source.contains("requestID"))
