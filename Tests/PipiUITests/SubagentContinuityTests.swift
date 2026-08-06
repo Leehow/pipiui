@@ -500,10 +500,10 @@ final class SubagentContinuityTests: XCTestCase {
     /// it is a search.
     func testMethodLayerRoutesResearchOutAndKeepsLookupsInline() throws {
         let t = try PhilosophyLayerFixture.normalizedBody("method")
-        XCTAssertTrue(t.contains("Who does the searching follows the size of the question"))
-        XCTAssertTrue(t.contains("retrieving a fact you can already name"))
-        XCTAssertTrue(t.contains("Delegate to research"))
-        XCTAssertTrue(t.contains("Cross-validating a design you just formed is almost always the second kind"))
+        XCTAssertTrue(t.contains("Who does the searching follows your tooling first, then the size of the question"))
+        XCTAssertTrue(t.contains("Native search"))
+        XCTAssertTrue(t.contains("No native search: delegate first"))
+        XCTAssertTrue(t.contains("Cross-validating a design you just formed is almost always the delegate-first kind"))
         XCTAssertFalse(t.contains("you may run it yourself"),
                        "the blanket permission to search personally is what this replaced")
     }
