@@ -83,13 +83,13 @@ final class RemoteDeviceIdentityTests: XCTestCase {
             "type": "auth.challenge",
             "connectionID": UUID().uuidString.lowercased(),
             "nonce": Data(repeating: 7, count: 32).base64URLEncodedString(),
-            "audience": "https://pipi.aichattrpg.com",
+            "audience": "https://remote.deepwood.cn",
             "expiresAt": 10_004_000,
         ]
         let challengeData = try JSONSerialization.data(withJSONObject: challengeObject)
         let challenge = try RemoteSignalingProtocol.decodeChallenge(
             challengeData,
-            expectedAudience: "https://pipi.aichattrpg.com",
+            expectedAudience: "https://remote.deepwood.cn",
             now: now
         )
         let hostEpoch = UUID().uuidString.lowercased()
@@ -114,7 +114,7 @@ final class RemoteDeviceIdentityTests: XCTestCase {
         unknown["token"] = "forbidden"
         XCTAssertThrowsError(try RemoteSignalingProtocol.decodeChallenge(
             JSONSerialization.data(withJSONObject: unknown),
-            expectedAudience: "https://pipi.aichattrpg.com",
+            expectedAudience: "https://remote.deepwood.cn",
             now: now
         )) {
             XCTAssertEqual(
@@ -131,7 +131,7 @@ final class RemoteDeviceIdentityTests: XCTestCase {
 
     func testChallengeFutureToleranceAcceptsClockSkewButRejectsExpiredOrTooFar() throws {
         let now = Date(timeIntervalSince1970: 10_000)
-        let audience = "https://signal.aichattrpg.com"
+        let audience = "https://tunnel.deepwood.cn"
         func challenge(expiresAt: Int64) throws -> Data {
             try JSONSerialization.data(withJSONObject: [
                 "v": 1,
@@ -177,7 +177,7 @@ final class RemoteDeviceIdentityTests: XCTestCase {
             type: "auth.challenge",
             connectionID: UUID().uuidString.lowercased(),
             nonce: Data(repeating: 1, count: 32).base64URLEncodedString(),
-            audience: "https://pipi.aichattrpg.com",
+            audience: "https://remote.deepwood.cn",
             expiresAt: Int64(Date().addingTimeInterval(4).timeIntervalSince1970 * 1_000)
         )
         let clientVersion = String(repeating: "版本", count: 30)
@@ -252,10 +252,10 @@ final class RemoteDeviceIdentityTests: XCTestCase {
         let configuration = RemoteRelayConfiguration(
             enabled: true,
             webSocketURL: try XCTUnwrap(
-                URL(string: "wss://signal.aichattrpg.com/device/ws")
+                URL(string: "wss://tunnel.deepwood.cn/device/ws")
             ),
             publicURL: try XCTUnwrap(
-                URL(string: "https://pipi.aichattrpg.com/")
+                URL(string: "https://remote.deepwood.cn/")
             ),
             deviceID: UUID().uuidString.lowercased(),
             displayName: "Identity Test"
@@ -294,7 +294,7 @@ final class RemoteDeviceIdentityTests: XCTestCase {
             type: "auth.challenge",
             connectionID: UUID().uuidString.lowercased(),
             nonce: Data(repeating: 3, count: 32).base64URLEncodedString(),
-            audience: "https://signal.aichattrpg.com",
+            audience: "https://tunnel.deepwood.cn",
             expiresAt: Int64((now.addingTimeInterval(4).timeIntervalSince1970 * 1_000)
                 .rounded(.down))
         )
@@ -436,7 +436,7 @@ final class RemoteDeviceIdentityTests: XCTestCase {
             ttl: 300,
             randomBytes: { secret }
         )
-        let origin = try XCTUnwrap(URL(string: "https://pipi.aichattrpg.com/"))
+        let origin = try XCTUnwrap(URL(string: "https://remote.deepwood.cn/"))
         let url = try session.claimURL(publicURL: origin, now: now)
         let components = try XCTUnwrap(
             URLComponents(url: url, resolvingAgainstBaseURL: false)
@@ -506,8 +506,8 @@ final class RemoteDeviceIdentityTests: XCTestCase {
         let task = IdentityTestWebSocketTask()
         let configuration = RemoteRelayConfiguration(
             enabled: true,
-            webSocketURL: URL(string: "wss://pipi.aichattrpg.com/device/ws")!,
-            publicURL: URL(string: "https://pipi.aichattrpg.com/")!,
+            webSocketURL: URL(string: "wss://remote.deepwood.cn/device/ws")!,
+            publicURL: URL(string: "https://remote.deepwood.cn/")!,
             deviceID: UUID().uuidString.lowercased(),
             displayName: "Pairing Race"
         )
@@ -526,7 +526,7 @@ final class RemoteDeviceIdentityTests: XCTestCase {
             type: "auth.challenge",
             connectionID: UUID().uuidString.lowercased(),
             nonce: Data(repeating: 4, count: 32).base64URLEncodedString(),
-            audience: "https://pipi.aichattrpg.com",
+            audience: "https://remote.deepwood.cn",
             expiresAt: Int64(Date().addingTimeInterval(4).timeIntervalSince1970 * 1_000)
         )
         task.deliver(.success(.string(String(
@@ -635,7 +635,7 @@ final class RemoteDeviceIdentityTests: XCTestCase {
         // The secret survives renewal: the same link still resolves mid-window.
         XCTAssertFalse(session.isInvalidated)
         let url = try session.claimURL(
-            publicURL: try XCTUnwrap(URL(string: "https://pipi.aichattrpg.com/")),
+            publicURL: try XCTUnwrap(URL(string: "https://remote.deepwood.cn/")),
             now: now.addingTimeInterval(30 * 60)
         )
         XCTAssertTrue(url.absoluteString.contains(secret.base64URLEncodedString()))
@@ -655,20 +655,20 @@ final class RemoteDeviceIdentityTests: XCTestCase {
             randomBytes: { Data(repeating: 9, count: 32) }
         )
         XCTAssertThrowsError(try session.claimURL(
-            publicURL: XCTUnwrap(URL(string: "http://pipi.aichattrpg.com/")),
+            publicURL: XCTUnwrap(URL(string: "http://remote.deepwood.cn/")),
             now: now
         ))
         XCTAssertThrowsError(try session.claimURL(
-            publicURL: XCTUnwrap(URL(string: "https://pipi.aichattrpg.com/")),
+            publicURL: XCTUnwrap(URL(string: "https://remote.deepwood.cn/")),
             now: now.addingTimeInterval(3601)
         ))
 
         let valid = try session.claimURL(
-            publicURL: XCTUnwrap(URL(string: "https://pipi.aichattrpg.com/")),
+            publicURL: XCTUnwrap(URL(string: "https://remote.deepwood.cn/")),
             now: now
         ).absoluteString
         let expectedOrigin = try XCTUnwrap(
-            URL(string: "https://pipi.aichattrpg.com/")
+            URL(string: "https://remote.deepwood.cn/")
         )
         XCTAssertNil(P2PPairingPayloadPolicy.validatedPayload(
             valid.replacingOccurrences(of: "#", with: "?leak=1#"),
@@ -680,7 +680,7 @@ final class RemoteDeviceIdentityTests: XCTestCase {
         ))
         XCTAssertNil(P2PPairingPayloadPolicy.validatedPayload(
             valid.replacingOccurrences(
-                of: "pipi.aichattrpg.com",
+                of: "remote.deepwood.cn",
                 with: "evil.example"
             ),
             expectedOrigin: expectedOrigin
@@ -703,7 +703,7 @@ final class RemoteDeviceIdentityTests: XCTestCase {
                 "Tests/Fixtures/P2PPairingFragmentVectors.json"
             ))
         )
-        let origin = try XCTUnwrap(URL(string: "https://pipi.aichattrpg.com/"))
+        let origin = try XCTUnwrap(URL(string: "https://remote.deepwood.cn/"))
         let pairID = UUID().uuidString.lowercased()
         for vector in vectors {
             let candidate = "\(origin.absoluteString)pair/\(pairID)#\(vector.fragment)"
@@ -719,10 +719,10 @@ final class RemoteDeviceIdentityTests: XCTestCase {
     }
 
     func testTunnelPairingPayloadAcceptsOnlyExact256BitFragment() throws {
-        let origin = try XCTUnwrap(URL(string: "https://pipi.aichattrpg.com/"))
+        let origin = try XCTUnwrap(URL(string: "https://remote.deepwood.cn/"))
         let room = "21c5b03d-98cf-4da0-8b5c-17a20d557663"
         let secret = String(repeating: "a1", count: 32)
-        let valid = "https://pipi.aichattrpg.com/pair/\(room)#\(secret)"
+        let valid = "https://remote.deepwood.cn/pair/\(room)#\(secret)"
         XCTAssertEqual(
             P2PPairingPayloadPolicy.validatedPayload(
                 valid,

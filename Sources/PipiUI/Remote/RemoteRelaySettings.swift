@@ -17,9 +17,9 @@ enum RemoteRelaySettings {
     private static let displayNameKey = "pipiui.remoteRelay.displayName"
 
     static let defaultWebSocketURL = URL(
-        string: "wss://signal.aichattrpg.com/tunnel/ws"
+        string: "wss://tunnel.deepwood.cn/tunnel/ws"
     )!
-    static let defaultPublicURL = URL(string: "https://pipi.aichattrpg.com/")!
+    static let defaultPublicURL = URL(string: "https://remote.deepwood.cn/")!
 
     static func isLegacyConfiguration(_ configuration: RemoteRelayConfiguration) -> Bool {
         configuration.webSocketURL.path != "/tunnel/ws"

@@ -521,9 +521,9 @@ final class RemotePeerConnectionTests: XCTestCase {
         let configuration = RemoteRelayConfiguration(
             enabled: true,
             webSocketURL: URL(
-                string: "wss://signal.aichattrpg.com/device/ws"
+                string: "wss://tunnel.deepwood.cn/device/ws"
             )!,
-            publicURL: URL(string: "https://pipi.aichattrpg.com/")!,
+            publicURL: URL(string: "https://remote.deepwood.cn/")!,
             deviceID: identity.deviceID,
             displayName: "Peer signaling test"
         )
@@ -544,7 +544,7 @@ final class RemotePeerConnectionTests: XCTestCase {
             type: "auth.challenge",
             connectionID: UUID().uuidString.lowercased(),
             nonce: Data(repeating: 6, count: 32).base64URLEncodedString(),
-            audience: "https://signal.aichattrpg.com",
+            audience: "https://tunnel.deepwood.cn",
             expiresAt: Int64(Date().addingTimeInterval(4).timeIntervalSince1970 * 1_000)
         )
         socket.deliver(.string(String(

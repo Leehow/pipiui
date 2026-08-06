@@ -9,7 +9,7 @@ final class RemoteRelayTests: XCTestCase {
         store.handleRemotePairingEvent(.cancelled)
         let pairID = UUID().uuidString.lowercased()
         let url = try XCTUnwrap(URL(
-            string: "https://pipi.aichattrpg.com/pair/\(pairID)#" +
+            string: "https://remote.deepwood.cn/pair/\(pairID)#" +
                 String(repeating: "a1", count: 32)
         ))
         store.handleRemotePairingEvent(.created(RemotePairingPresentation(
@@ -193,34 +193,34 @@ final class RemoteRelayTests: XCTestCase {
 
     func testSettingsRequireSecureSchemesAndSeparatedDeviceSignalHost() throws {
         XCTAssertNotNil(RemoteRelaySettings.validatedWebSocketURL(
-            "wss://pipi.aichattrpg.com/host/ws"
+            "wss://remote.deepwood.cn/host/ws"
         ))
         XCTAssertNil(RemoteRelaySettings.validatedWebSocketURL(
-            "ws://pipi.aichattrpg.com/host/ws"
+            "ws://remote.deepwood.cn/host/ws"
         ))
         XCTAssertNil(RemoteRelaySettings.validatedWebSocketURL(
-            "wss://pipi.aichattrpg.com/arbitrary"
+            "wss://remote.deepwood.cn/arbitrary"
         ))
         XCTAssertNotNil(RemoteRelaySettings.validatedPublicURL(
-            "https://pipi.aichattrpg.com/"
+            "https://remote.deepwood.cn/"
         ))
         XCTAssertNil(RemoteRelaySettings.validatedPublicURL(
-            "http://pipi.aichattrpg.com/"
+            "http://remote.deepwood.cn/"
         ))
         XCTAssertNil(RemoteRelaySettings.validatedPublicURL(
-            "https://user:password@pipi.aichattrpg.com/"
+            "https://user:password@remote.deepwood.cn/"
         ))
         XCTAssertNotNil(RemoteRelaySettings.validatedURLPair(
-            webSocketURL: "wss://pipi.aichattrpg.com/host/ws",
-            publicURL: "https://pipi.aichattrpg.com/"
+            webSocketURL: "wss://remote.deepwood.cn/host/ws",
+            publicURL: "https://remote.deepwood.cn/"
         ))
         XCTAssertNotNil(RemoteRelaySettings.validatedURLPair(
-            webSocketURL: "wss://signal.aichattrpg.com/device/ws",
-            publicURL: "https://pipi.aichattrpg.com/"
+            webSocketURL: "wss://tunnel.deepwood.cn/device/ws",
+            publicURL: "https://remote.deepwood.cn/"
         ))
         XCTAssertNil(RemoteRelaySettings.validatedURLPair(
-            webSocketURL: "wss://pipi.aichattrpg.com/device/ws",
-            publicURL: "https://pipi.aichattrpg.com/"
+            webSocketURL: "wss://remote.deepwood.cn/device/ws",
+            publicURL: "https://remote.deepwood.cn/"
         ))
         XCTAssertNil(RemoteRelaySettings.validatedURLPair(
             webSocketURL: "wss://same.example:444/device/ws",
@@ -228,13 +228,13 @@ final class RemoteRelayTests: XCTestCase {
         ))
         XCTAssertNil(RemoteRelaySettings.validatedURLPair(
             webSocketURL: "wss://evil.example/host/ws",
-            publicURL: "https://pipi.aichattrpg.com/"
+            publicURL: "https://remote.deepwood.cn/"
         ))
         XCTAssertEqual(
             RemoteRelaySettings.signalingAudience(
-                URL(string: "wss://signal.aichattrpg.com/device/ws")!
+                URL(string: "wss://tunnel.deepwood.cn/device/ws")!
             ),
-            "https://signal.aichattrpg.com"
+            "https://tunnel.deepwood.cn"
         )
     }
 
@@ -392,7 +392,7 @@ final class RemoteRelayTests: XCTestCase {
             forKey: "pipiui.remoteRelay.webSocketURL"
         )
         defaults.set(
-            "https://pipi.aichattrpg.com/",
+            "https://remote.deepwood.cn/",
             forKey: "pipiui.remoteRelay.publicURL"
         )
         let loaded = RemoteRelaySettings.load(defaults: defaults)
@@ -406,11 +406,11 @@ final class RemoteRelayTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(true, forKey: "pipiui.remoteRelay.enabled")
         defaults.set(
-            "wss://signal.aichattrpg.com/device/ws",
+            "wss://tunnel.deepwood.cn/device/ws",
             forKey: "pipiui.remoteRelay.webSocketURL"
         )
         defaults.set(
-            "https://pipi.aichattrpg.com/",
+            "https://remote.deepwood.cn/",
             forKey: "pipiui.remoteRelay.publicURL"
         )
         let loaded = RemoteRelaySettings.load(defaults: defaults)
@@ -436,11 +436,11 @@ final class RemoteRelayTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(true, forKey: "pipiui.remoteRelay.enabled")
         defaults.set(
-            "wss://pipi.aichattrpg.com/host/ws",
+            "wss://remote.deepwood.cn/host/ws",
             forKey: "pipiui.remoteRelay.webSocketURL"
         )
         defaults.set(
-            "https://pipi.aichattrpg.com/",
+            "https://remote.deepwood.cn/",
             forKey: "pipiui.remoteRelay.publicURL"
         )
         let loaded = RemoteRelaySettings.load(defaults: defaults)
@@ -458,11 +458,11 @@ final class RemoteRelayTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(true, forKey: "pipiui.remoteRelay.enabled")
         defaults.set(
-            "wss://signal.aichattrpg.com/trystero/ws",
+            "wss://tunnel.deepwood.cn/trystero/ws",
             forKey: "pipiui.remoteRelay.webSocketURL"
         )
         defaults.set(
-            "https://pipi.aichattrpg.com/",
+            "https://remote.deepwood.cn/",
             forKey: "pipiui.remoteRelay.publicURL"
         )
         let loaded = RemoteRelaySettings.load(defaults: defaults)
@@ -483,7 +483,7 @@ final class RemoteRelayTests: XCTestCase {
             configuration: RemoteRelayConfiguration(
                 enabled: true,
                 webSocketURL: URL(string: "wss://evil.example/host/ws")!,
-                publicURL: URL(string: "https://pipi.aichattrpg.com/")!,
+                publicURL: URL(string: "https://remote.deepwood.cn/")!,
                 deviceID: UUID().uuidString.lowercased(),
                 displayName: "Mismatch"
             ),
