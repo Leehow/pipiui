@@ -999,6 +999,8 @@ final class ChatSession: ObservableObject, Identifiable {
         subagents.bindMainProject(projectURL)
         // Attribute per-turn usage events to this session in the token ledger.
         subagents.sessionKey = id
+        // Boss ledger path uses PIPIUI_SESSION_KEY (= bridge capability), not the chat file id.
+        subagents.bridgeRoutingKey = bridgeRoutingKey
         // App 运行中对账：本会话 pi 进程死后，桥接不再刷新 lastObservedAt，扩展侧
         // vanished 结算（runningAgents 属父运行时）也不会再跑；由 store 周期扫掉
         // stale running 幽灵。进程活着时对账直接跳过（那是扩展侧的责任区）。
@@ -2884,6 +2886,7 @@ final class ChatSession: ObservableObject, Identifiable {
         guard !sessionKey.isEmpty, sessionKey != id else { return }
         id = sessionKey
         subagents.sessionKey = sessionKey
+        // bridgeRoutingKey stays process-local for this ChatSession instance.
     }
 
     func copyItemText(_ item: ChatItem) {

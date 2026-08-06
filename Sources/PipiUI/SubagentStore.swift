@@ -90,6 +90,9 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
     /// secretary mirrors/summarizes it into the Boss ledger rather than creating a second ledger.
     var closeoutDisposition: AgentCloseoutDisposition = .unclassified
     var closeoutReason: String? = nil
+    /// Mark-only dormancy hint: terminal/dormant longer than the reap TTL. Never auto-deletes
+    /// worktrees/branches; UI may surface this later. Defaults false so old JSON still decodes.
+    var cleanupSuggested: Bool = false
     /// Latest turn context occupancy (from usage.totalTokens / contextTokens).
     var contextTokens: Int = 0
     /// Model context window when known.
@@ -145,7 +148,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         case stalled, stalledIdleSec
         case worktreePath, worktreeBranch, worktreeError, worktreeLifecycle
         case verifyCommand, verifyExit
-        case closeoutDisposition, closeoutReason
+        case closeoutDisposition, closeoutReason, cleanupSuggested
         case contextTokens, contextWindow
         case totalInput, totalOutput, totalCacheRead, totalCacheWrite
     }
@@ -178,6 +181,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         verifyExit: Int? = nil,
         closeoutDisposition: AgentCloseoutDisposition = .unclassified,
         closeoutReason: String? = nil,
+        cleanupSuggested: Bool = false,
         contextTokens: Int = 0,
         contextWindow: Int? = nil,
         totalInput: Int = 0,
@@ -212,6 +216,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         self.verifyExit = verifyExit
         self.closeoutDisposition = closeoutDisposition
         self.closeoutReason = closeoutReason
+        self.cleanupSuggested = cleanupSuggested
         self.contextTokens = contextTokens
         self.contextWindow = contextWindow
         self.totalInput = totalInput
@@ -258,6 +263,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
             forKey: .closeoutDisposition
         ) ?? .unclassified
         closeoutReason = try c.decodeIfPresent(String.self, forKey: .closeoutReason)
+        cleanupSuggested = try c.decodeIfPresent(Bool.self, forKey: .cleanupSuggested) ?? false
         contextTokens = try c.decodeIfPresent(Int.self, forKey: .contextTokens) ?? 0
         contextWindow = try c.decodeIfPresent(Int.self, forKey: .contextWindow)
         totalInput = try c.decodeIfPresent(Int.self, forKey: .totalInput) ?? 0
@@ -295,6 +301,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         try c.encodeIfPresent(verifyExit, forKey: .verifyExit)
         try c.encode(closeoutDisposition, forKey: .closeoutDisposition)
         try c.encodeIfPresent(closeoutReason, forKey: .closeoutReason)
+        try c.encode(cleanupSuggested, forKey: .cleanupSuggested)
         try c.encode(contextTokens, forKey: .contextTokens)
         try c.encodeIfPresent(contextWindow, forKey: .contextWindow)
         try c.encode(totalInput, forKey: .totalInput)
@@ -415,6 +422,112 @@ enum MergeGitOutcome: Sendable {
     case mergeFailed(String)
     case removeFailed(String)
     case cleanupFailed(String)
+}
+
+/// Best-effort upsert into an existing Boss ledger `## Closeout dispositions` table.
+/// Never creates ledgers or missing sections — seeding is owned by the pi extension.
+enum BossLedgerCloseoutMirror {
+    /// Ledger labels use dashes (`needs-fixer`) to match secretary.md / seeded tables.
+    static func dispositionLabel(_ disposition: AgentCloseoutDisposition) -> String {
+        switch disposition {
+        case .unclassified: return "unclassified"
+        case .cleaned: return "cleaned"
+        case .retained: return "retained"
+        case .needsFixer: return "needs-fixer"
+        case .needsUser: return "needs-user"
+        }
+    }
+
+    /// Returns updated markdown when the Closeout dispositions table exists; nil if the
+    /// section/table is missing (caller must not create it).
+    static func upsertRow(
+        in content: String,
+        agentId: String,
+        dispositionLabel: String,
+        evidence: String
+    ) -> String? {
+        let normalized = content.replacingOccurrences(of: "\r\n", with: "\n")
+        var lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let sectionIdx = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespaces).hasPrefix("## Closeout dispositions")
+        }) else {
+            return nil
+        }
+
+        var headerIdx: Int?
+        var separatorIdx: Int?
+        var idx = sectionIdx + 1
+        while idx < lines.count {
+            let trimmed = lines[idx].trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("## ") { break }
+            if trimmed.hasPrefix("|") {
+                if headerIdx == nil {
+                    headerIdx = idx
+                } else if separatorIdx == nil, trimmed.contains("---") {
+                    separatorIdx = idx
+                    break
+                }
+            }
+            idx += 1
+        }
+        guard let separatorIdx else { return nil }
+
+        let safeId = sanitizeCell(agentId)
+        let newRow = "| \(safeId) | \(sanitizeCell(dispositionLabel)) | \(sanitizeCell(evidence)) |"
+
+        var existingRowIdx: Int?
+        var lastDataRowIdx: Int?
+        var insertAt = separatorIdx + 1
+        var cursor = separatorIdx + 1
+        while cursor < lines.count {
+            let trimmed = lines[cursor].trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("## ") { break }
+            if trimmed.hasPrefix("|") {
+                let first = firstTableCell(trimmed)
+                if first == safeId {
+                    existingRowIdx = cursor
+                }
+                lastDataRowIdx = cursor
+                insertAt = cursor + 1
+                cursor += 1
+                continue
+            }
+            // Blank lines / HTML comments after the header: insert before the first of them
+            // when no data rows exist yet; otherwise stop after the last data row.
+            if lastDataRowIdx == nil {
+                insertAt = cursor
+            }
+            break
+        }
+
+        if let existingRowIdx {
+            lines[existingRowIdx] = newRow
+        } else {
+            lines.insert(newRow, at: insertAt)
+        }
+        var result = lines.joined(separator: "\n")
+        if content.hasSuffix("\n"), !result.hasSuffix("\n") {
+            result += "\n"
+        }
+        return result
+    }
+
+    private static func firstTableCell(_ line: String) -> String {
+        let parts = line.split(separator: "|", omittingEmptySubsequences: false).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        // Leading split yields an empty first element for lines starting with `|`.
+        if parts.count >= 2 { return parts[1] }
+        return parts.first ?? ""
+    }
+
+    private static func sanitizeCell(_ raw: String) -> String {
+        raw
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "|", with: "/")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
 
 private struct WorktreeReconcileCandidate: Sendable {
@@ -829,6 +942,9 @@ final class SubagentStore: ObservableObject {
     /// Owning chat session key; set by ChatSession so per-turn usage events can be
     /// attributed to the right session in the token ledger.
     var sessionKey: String?
+    /// Child pi `PIPIUI_SESSION_KEY` / bridge capability. Boss ledger path is
+    /// `.pi/boss/ledger-<bridgeRoutingKey>.md` — distinct from `sessionKey` (chat id).
+    var bridgeRoutingKey: String?
     /// Resolve model id (`provider/id`) → context window; set by ChatSession from availableModels.
     var resolveContextWindow: ((String?) -> Int?)?
     /// Fired when merge fails (auto or manual); ChatSession injects `[worktree-merge-failed]`.
@@ -927,17 +1043,26 @@ final class SubagentStore: ObservableObject {
     private var sessionAlivenessProvider: (() -> Bool)?
     /// 运行中对账 timer；deinit 失效，生命周期跟随 store，不泄漏。
     private var orphanReconcileTimer: Timer?
+    /// Dormancy TTL scan: mark stale terminal agents + purge only no-unique-work artifacts.
+    private static let dormantReapInterval: TimeInterval = 6 * 60 * 60
+    private static let dormantTTL: TimeInterval = 7 * 24 * 60 * 60
+    private var dormantReapTimer: Timer?
 
     deinit {
         pendingEventDrain?.cancel()
         pendingSaveWorkItem?.cancel()
         orphanReconcileTimer?.invalidate()
+        dormantReapTimer?.invalidate()
     }
 
     /// Bind the session's main project URL so successful agents can auto-merge.
     func bindMainProject(_ url: URL) {
         mainProjectURL = url
         retryPersistedPendingReviewMergesIfReady()
+        startDormantReaping()
+        if hasLoadedPersistedAgents {
+            reapDormantState()
+        }
     }
 
     // MARK: - 持久化（跟随 pi 会话文件，App 崩溃/重启后恢复 agent 树）
@@ -1047,6 +1172,11 @@ final class SubagentStore: ObservableObject {
             self.hasLoadedPersistedAgents = true
             if self.selectedId == nil { self.selectedId = self.agents.last?.id }
             self.retryPersistedPendingReviewMergesIfReady()
+            self.startDormantReaping()
+            // Mark long-dormant rows + purge only no-unique-work artifacts (session/delivery files).
+            if self.reapDormantState() {
+                didMutate = true
+            }
 
             // Without an event-driven save, reconciled ghosts stay `.running` on disk forever.
             if didMutate {
@@ -1065,6 +1195,7 @@ final class SubagentStore: ObservableObject {
         let hadRunning = before.contains { $0.state == .running }
         agents = reconciled
         rebuildAgentDerivedState()
+        mirrorCloseoutChanges(before: before, after: reconciled)
         if hadRunning {
             onRunningCountMayHaveChanged?()
             onAgentCloseoutMayHaveChanged?()
@@ -1083,6 +1214,7 @@ final class SubagentStore: ObservableObject {
         guard reconciled != before else { return false }
         agents = reconciled
         rebuildAgentDerivedState()
+        mirrorCloseoutChanges(before: before, after: reconciled)
         onRunningCountMayHaveChanged?()
         onAgentCloseoutMayHaveChanged?()
         saveNow()
@@ -1101,6 +1233,192 @@ final class SubagentStore: ObservableObject {
         timer.tolerance = Self.orphanReconcileTolerance
         RunLoop.main.add(timer, forMode: .common)
         orphanReconcileTimer = timer
+    }
+
+    /// 6h dormancy scan timer (idempotent). Marks stale terminal agents; never deletes
+    /// worktrees/branches. Safe artifact purge is mark-gated inside `reapDormantState`.
+    func startDormantReaping() {
+        guard dormantReapTimer == nil else { return }
+        let timer = Timer(timeInterval: Self.dormantReapInterval, repeats: true) {
+            [weak self] _ in
+            _ = self?.reapDormantState()
+        }
+        timer.tolerance = 15 * 60
+        RunLoop.main.add(timer, forMode: .common)
+        dormantReapTimer = timer
+    }
+
+    /// Terminal/dormant rows eligible for the mark-only cleanup suggestion.
+    static func isDormantForCleanupSuggestion(_ agent: SubagentInfo) -> Bool {
+        if agent.state == .running { return false }
+        if agent.state == .interrupted { return true }
+        switch agent.closeoutDisposition {
+        case .retained, .cleaned:
+            return true
+        case .unclassified, .needsFixer, .needsUser:
+            break
+        }
+        return agent.worktreeLifecycle == .mergedCleanupPending
+    }
+
+    /// On load/startup and every 6h: set `cleanupSuggested` when dormant > 7 days.
+    /// Auto-delete is allowed ONLY for no-unique-work artifacts (merged+cleaned agent
+    /// session files, and delivery-obligation files older than 7 days). Worktrees/branches
+    /// are mark-only. Returns whether any agent row was newly marked (caller may persist).
+    @discardableResult
+    func reapDormantState(now: Date = Date()) -> Bool {
+        let ttl = Self.dormantTTL
+        var didMark = false
+        for i in agents.indices {
+            guard Self.isDormantForCleanupSuggestion(agents[i]) else { continue }
+            let lastActivity = agents[i].ended ?? agents[i].lastObservedAt
+            guard now.timeIntervalSince(lastActivity) >= ttl else { continue }
+            if !agents[i].cleanupSuggested {
+                agents[i].cleanupSuggested = true
+                didMark = true
+            }
+        }
+        if didMark {
+            scheduleSave()
+        }
+
+        // Artifact purge is best-effort and never touches worktrees/branches.
+        if let main = mainProjectURL {
+            let sessionAgentIds: Set<String> = Set(agents.compactMap { agent in
+                guard agent.closeoutDisposition == .cleaned,
+                      agent.worktreeLifecycle == .merged || agent.worktreeLifecycle == .discarded
+                else { return nil }
+                let lastActivity = agent.ended ?? agent.lastObservedAt
+                guard now.timeIntervalSince(lastActivity) >= ttl else { return nil }
+                return agent.id
+            })
+            let mainPath = main
+            let cutoff = now.addingTimeInterval(-ttl)
+            DispatchQueue.global(qos: .utility).async {
+                Self.purgeStaleAgentSessionFiles(in: mainPath, agentIds: sessionAgentIds)
+                Self.purgeStaleDeliveryObligationFiles(in: mainPath, olderThan: cutoff)
+            }
+        }
+        return didMark
+    }
+
+    /// Delete `.pi/agent-sessions/*_pipiui-<id>.jsonl` only for agents proven merged+cleaned
+    /// and older than the dormancy TTL. Never touches worktrees or branches.
+    private static func purgeStaleAgentSessionFiles(in main: URL, agentIds: Set<String>) {
+        guard !agentIds.isEmpty else { return }
+        let dir = main.appendingPathComponent(".pi/agent-sessions", isDirectory: true)
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
+        for name in names {
+            guard name.hasSuffix(".jsonl") else { continue }
+            // pi writes `<timestamp>_pipiui-<agentId>.jsonl`
+            guard let range = name.range(of: "_pipiui-") else { continue }
+            let idPart = String(name[range.upperBound...])
+            guard idPart.hasSuffix(".jsonl") else { continue }
+            let agentId = String(idPart.dropLast(".jsonl".count))
+            guard agentIds.contains(agentId) else { continue }
+            let url = dir.appendingPathComponent(name)
+            try? fm.removeItem(at: url)
+        }
+    }
+
+    /// Delete delivery-obligation JSON files (and claim sidecars) whose mtime is older than cutoff.
+    private static func purgeStaleDeliveryObligationFiles(in main: URL, olderThan cutoff: Date) {
+        let root = main.appendingPathComponent(".pi/subagent-delivery-obligations", isDirectory: true)
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        for case let fileURL as URL in enumerator {
+            guard fileURL.isFileURL else { continue }
+            let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
+            guard values?.isRegularFile == true,
+                  let mtime = values?.contentModificationDate,
+                  mtime < cutoff else { continue }
+            try? fm.removeItem(at: fileURL)
+        }
+    }
+
+    /// Apply a mechanical closeout on an existing row and best-effort mirror into the boss ledger.
+    private func setCloseoutDisposition(
+        at index: Int,
+        _ disposition: AgentCloseoutDisposition,
+        reason: String?
+    ) {
+        agents[index].closeoutDisposition = disposition
+        agents[index].closeoutReason = reason
+        mirrorCloseoutDispositionToBossLedger(
+            agentId: agents[index].id,
+            disposition: disposition,
+            reason: reason
+        )
+    }
+
+    private func mirrorCloseoutChanges(before: [SubagentInfo], after: [SubagentInfo]) {
+        let beforeById = Dictionary(uniqueKeysWithValues: before.map { ($0.id, $0) })
+        for agent in after {
+            let previous = beforeById[agent.id]
+            let changed = previous?.closeoutDisposition != agent.closeoutDisposition
+                || previous?.closeoutReason != agent.closeoutReason
+            guard changed, agent.closeoutDisposition != .unclassified else { continue }
+            mirrorCloseoutDispositionToBossLedger(
+                agentId: agent.id,
+                disposition: agent.closeoutDisposition,
+                reason: agent.closeoutReason
+            )
+        }
+    }
+
+    /// Upsert one row into `.pi/boss/ledger-<bridgeRoutingKey>.md` when the file and
+    /// `## Closeout dispositions` table already exist. Best-effort: log + swallow IO errors.
+    private func mirrorCloseoutDispositionToBossLedger(
+        agentId: String,
+        disposition: AgentCloseoutDisposition,
+        reason: String?
+    ) {
+        guard disposition != .unclassified else { return }
+        guard let main = mainProjectURL else { return }
+        let key = bridgeRoutingKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !key.isEmpty, !key.contains("/") else { return }
+
+        let label = BossLedgerCloseoutMirror.dispositionLabel(disposition)
+        let shortReason = (reason ?? "")
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let clipped: String
+        if shortReason.count > 160 {
+            clipped = String(shortReason.prefix(157)) + "..."
+        } else {
+            clipped = shortReason
+        }
+        let iso = ISO8601DateFormatter().string(from: Date())
+        let evidence = clipped.isEmpty ? iso : "\(clipped) \(iso)"
+        let ledgerURL = main
+            .appendingPathComponent(".pi/boss", isDirectory: true)
+            .appendingPathComponent("ledger-\(key).md")
+
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                guard FileManager.default.fileExists(atPath: ledgerURL.path) else { return }
+                let content = try String(contentsOf: ledgerURL, encoding: .utf8)
+                guard let updated = BossLedgerCloseoutMirror.upsertRow(
+                    in: content,
+                    agentId: agentId,
+                    dispositionLabel: label,
+                    evidence: evidence
+                ) else { return }
+                guard updated != content else { return }
+                try updated.write(to: ledgerURL, atomically: true, encoding: .utf8)
+            } catch {
+                Log.info(
+                    "boss ledger closeout mirror failed for \(agentId): \(error.localizedDescription)",
+                    category: .session
+                )
+            }
+        }
     }
 
     /// After restart, resume one missed automatic merge for each eligible persisted row.
@@ -1410,8 +1728,7 @@ final class SubagentStore: ObservableObject {
                 clearStalled(i)
                 if abortPending.contains(id) { abortPending.remove(id) }
                 agents[i].ended = nil
-                agents[i].closeoutDisposition = .unclassified
-                agents[i].closeoutReason = nil
+                setCloseoutDisposition(at: i, .unclassified, reason: nil)
                 if let tc = e["toolCallId"].string { updateToolCallID(tc, at: i) }
                 if let t = e["title"].string { agents[i].title = t }
                 if let path = e["worktreePath"].string { agents[i].worktreePath = path }
@@ -1544,15 +1861,24 @@ final class SubagentStore: ObservableObject {
             }
             let verifyFailed = (agents[i].verifyExit ?? 0) != 0
             if agents[i].state != .ok {
-                agents[i].closeoutDisposition = .retained
-                agents[i].closeoutReason = "agent \(agents[i].state.rawValue)；成果与 worktree 保留审核"
+                setCloseoutDisposition(
+                    at: i,
+                    .retained,
+                    reason: "agent \(agents[i].state.rawValue)；成果与 worktree 保留审核"
+                )
             } else if verifyFailed {
-                agents[i].closeoutDisposition = .retained
-                agents[i].closeoutReason = "agent worktree 验证失败；禁止自动合并或清理"
+                setCloseoutDisposition(
+                    at: i,
+                    .retained,
+                    reason: "agent worktree 验证失败；禁止自动合并或清理"
+                )
             } else if agents[i].worktreePath?.isEmpty != false {
                 // Explicit-main-cwd roles (notably secretary) have no branch/worktree to clean.
-                agents[i].closeoutDisposition = .cleaned
-                agents[i].closeoutReason = "无隔离 worktree；运行时无需机械清理"
+                setCloseoutDisposition(
+                    at: i,
+                    .cleaned,
+                    reason: "无隔离 worktree；运行时无需机械清理"
+                )
             }
             // Product default: successful agent + worktree → auto-merge into main + remove wt.
             // failed/aborted/interrupted (incl. vanished settle) keep pendingReview for续作.
@@ -1620,8 +1946,7 @@ final class SubagentStore: ObservableObject {
     /// `agents` 的 in-place 修改访问器在批外自动发布 objectWillChange，无需手动发送。
     func markCleaned(id: String) {
         guard let i = index(forAgentID: id) else { return }
-        agents[i].closeoutDisposition = .cleaned
-        agents[i].closeoutReason = "用户标记为已处理"
+        setCloseoutDisposition(at: i, .cleaned, reason: "用户标记为已处理")
         scheduleSave()
         onAgentCloseoutMayHaveChanged?()
     }
@@ -1708,13 +2033,19 @@ final class SubagentStore: ObservableObject {
             case .merged:
                 agents[index].worktreeLifecycle = .merged
                 agents[index].worktreeError = nil
-                agents[index].closeoutDisposition = .cleaned
-                agents[index].closeoutReason = "外部已集成（非本面板合并）；worktree 已清理"
+                setCloseoutDisposition(
+                    at: index,
+                    .cleaned,
+                    reason: "外部已集成（非本面板合并）；worktree 已清理"
+                )
             case .discarded:
                 agents[index].worktreeLifecycle = .discarded
                 agents[index].worktreeError = nil
-                agents[index].closeoutDisposition = .cleaned
-                agents[index].closeoutReason = "外部已清理 worktree 与分支"
+                setCloseoutDisposition(
+                    at: index,
+                    .cleaned,
+                    reason: "外部已清理 worktree 与分支"
+                )
             }
             didChange = true
         }
@@ -1833,8 +2164,7 @@ final class SubagentStore: ObservableObject {
             if let idx = index(forAgentID: agentId) {
                 agents[idx].worktreeLifecycle = .merged
                 agents[idx].worktreeError = nil
-                agents[idx].closeoutDisposition = .cleaned
-                agents[idx].closeoutReason = "零改动,已直接清理"
+                setCloseoutDisposition(at: idx, .cleaned, reason: "零改动,已直接清理")
                 scheduleSave()
             }
         case .ok:
@@ -1850,8 +2180,7 @@ final class SubagentStore: ObservableObject {
             let dirtyPrefix = GitRepo.probe(workTree: main).isDirty ? "主仓有未提交改动;" : ""
             let full = "\(dirtyPrefix)合并失败（worktree 未删除）: \(msg)"
             if let idx = index(forAgentID: agentId) {
-                agents[idx].closeoutDisposition = .needsFixer
-                agents[idx].closeoutReason = full
+                setCloseoutDisposition(at: idx, .needsFixer, reason: full)
                 notifyMergeFailed(agent: agents[idx], error: full)
             }
             result = setWorktreeError(full)
@@ -1862,8 +2191,7 @@ final class SubagentStore: ObservableObject {
                 let warning = "已合并，但删除 worktree 失败: \(msg)"
                 agents[idx].worktreeLifecycle = .mergedCleanupPending
                 agents[idx].worktreeError = warning
-                agents[idx].closeoutDisposition = .needsFixer
-                agents[idx].closeoutReason = warning
+                setCloseoutDisposition(at: idx, .needsFixer, reason: warning)
                 scheduleSave()
                 schedulePostMergeVerify(agent: agents[idx], mainProjectURL: main)
             }
@@ -1875,8 +2203,7 @@ final class SubagentStore: ObservableObject {
                 let warning = "已合并并删除 worktree，但 \(msg)"
                 agents[idx].worktreeLifecycle = .mergedCleanupPending
                 agents[idx].worktreeError = warning
-                agents[idx].closeoutDisposition = .needsFixer
-                agents[idx].closeoutReason = warning
+                setCloseoutDisposition(at: idx, .needsFixer, reason: warning)
                 scheduleSave()
                 schedulePostMergeVerify(agent: agents[idx], mainProjectURL: main)
             }
@@ -1897,11 +2224,17 @@ final class SubagentStore: ObservableObject {
         let verify = agents[index].verifyCommand?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if verify?.isEmpty == false {
-            agents[index].closeoutDisposition = .unclassified
-            agents[index].closeoutReason = "已集成并完成机械清理；等待主仓验证"
+            setCloseoutDisposition(
+                at: index,
+                .unclassified,
+                reason: "已集成并完成机械清理；等待主仓验证"
+            )
         } else {
-            agents[index].closeoutDisposition = .cleaned
-            agents[index].closeoutReason = "已集成，worktree 与内部分支已安全清理"
+            setCloseoutDisposition(
+                at: index,
+                .cleaned,
+                reason: "已集成，worktree 与内部分支已安全清理"
+            )
         }
     }
 
@@ -1963,12 +2296,14 @@ final class SubagentStore: ObservableObject {
             agents[idx].worktreeLifecycle = .discarded
             if let warning = discardOutcome.warning, !warning.isEmpty {
                 agents[idx].worktreeError = "worktree 已按确认丢弃；\(warning)"
-                agents[idx].closeoutDisposition = .retained
-                agents[idx].closeoutReason = agents[idx].worktreeError
+                setCloseoutDisposition(at: idx, .retained, reason: agents[idx].worktreeError)
             } else {
                 agents[idx].worktreeError = nil
-                agents[idx].closeoutDisposition = .cleaned
-                agents[idx].closeoutReason = "已按用户确认丢弃 worktree，并删除对应内部分支"
+                setCloseoutDisposition(
+                    at: idx,
+                    .cleaned,
+                    reason: "已按用户确认丢弃 worktree，并删除对应内部分支"
+                )
             }
             scheduleSave()
             onAgentCloseoutMayHaveChanged?()
@@ -2070,9 +2405,11 @@ final class SubagentStore: ObservableObject {
                             if let index = self.index(forAgentID: agent.id),
                                self.agents[index].worktreeLifecycle == .merged,
                                self.agents[index].closeoutDisposition == .unclassified {
-                                self.agents[index].closeoutDisposition = .cleaned
-                                self.agents[index].closeoutReason =
-                                    "已集成、主仓验证通过，worktree 与内部分支已清理"
+                                self.setCloseoutDisposition(
+                                    at: index,
+                                    .cleaned,
+                                    reason: "已集成、主仓验证通过，worktree 与内部分支已清理"
+                                )
                                 self.scheduleSave()
                             }
                         }
@@ -2097,10 +2434,13 @@ final class SubagentStore: ObservableObject {
         agent: SubagentInfo, failure: PostMergeVerifyFailure, mainDirty: Bool = false
     ) {
         if let index = index(forAgentID: agent.id) {
-            agents[index].closeoutDisposition = mainDirty ? .needsUser : .needsFixer
-            agents[index].closeoutReason = mainDirty
-                ? "主仓验证失败且含未提交改动；需确认失败归属"
-                : "主仓验证失败；需 fixer 修复后重新验证"
+            setCloseoutDisposition(
+                at: index,
+                mainDirty ? .needsUser : .needsFixer,
+                reason: mainDirty
+                    ? "主仓验证失败且含未提交改动；需确认失败归属"
+                    : "主仓验证失败；需 fixer 修复后重新验证"
+            )
             scheduleSave()
         }
         closeoutPendingAgentIDs.remove(agent.id)

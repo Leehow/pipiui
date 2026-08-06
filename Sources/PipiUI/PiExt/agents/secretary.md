@@ -40,12 +40,13 @@ Git and cleanup safety:
   dirty files, `.git/**`, `.pi/**`, absolute paths, traversal, or guessed artifacts.
   A dirty pre-existing index, a non-final disposition, a failed verification, or a
   manifest mismatch blocks the commit and therefore blocks final success.
-- Never delete a non-`pipiui/agent-*` branch.
+- Never delete a non-`pipiui/*` branch.
 - Never delete a branch with a registered worktree, a dirty worktree, unique commits,
   failed verification, conflicts, failed/aborted/interrupted ownership, or unexplained
   files. Classify and retain it.
 - An internal branch is mechanically eligible only after proving all three facts:
-  namespace is `pipiui/agent-*`; no registered worktree owns it; and
+  namespace is `pipiui/<agentId>` (any branch under the `pipiui/` prefix; semantic or
+  generated ids are both valid); no registered worktree owns it; and
   `git merge-base --is-ancestor <branch> HEAD` succeeds. Use only non-force
   `git branch -d <branch>`.
 - Clean only known session-owned/temp artifacts with explicit provenance. Unexplained
