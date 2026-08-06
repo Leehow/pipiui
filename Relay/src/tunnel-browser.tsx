@@ -1,10 +1,11 @@
 import {
   Button,
   Dialog,
-  DotLoading,
   List,
   Popup,
   Selector,
+  Skeleton,
+  SpinLoading,
   Tag,
   TextArea,
   Toast,
@@ -58,6 +59,25 @@ function statusText(status: TunnelStatus): { text: string; tone: string } {
   }
 }
 
+const THEME_KEY = "pipiui-remote-theme";
+
+function SunIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+    </svg>
+  );
+}
+
+function MoonIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+    </svg>
+  );
+}
+
 function roleLabel(role: string): string {
   return role === "user" ? "你" : role === "assistant" ? "助手" : "系统";
 }
@@ -109,6 +129,10 @@ function App() {
   const [text, setText] = useState("");
   const [panelData, setPanelData] = useState<any>(null);
   const [panelDetail, setPanelDetail] = useState<any>(null);
+  const [panelDetailLoading, setPanelDetailLoading] = useState(false);
+  const [indexPending, setIndexPending] = useState(false);
+  const [sessionLoading, setSessionLoading] = useState(false);
+  const [sending, setSending] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const logicRef = useRef<LogicRef>({
@@ -122,6 +146,27 @@ function App() {
   logicRef.current.connected = status.kind === "connected";
 
   const pill = statusText(status);
+  const statusLine = status.kind === "error" && status.message ? status.message : pill.text;
+  const [theme, setTheme] = useState<"dark" | "light">(() => {
+    const attr = document.documentElement.dataset.theme;
+    if (attr === "dark" || attr === "light") return attr;
+    try {
+      const stored = window.localStorage.getItem(THEME_KEY);
+      if (stored === "dark" || stored === "light") return stored;
+    } catch {}
+    try {
+      return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    } catch {
+      return "dark";
+    }
+  });
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      window.localStorage.setItem(THEME_KEY, theme);
+    } catch {}
+  }, [theme]);
+  const toggleTheme = () => setTheme((prev) => (prev === "dark" ? "light" : "dark"));
 
   // ---- protocol bootstrap ----
   useEffect(() => {
@@ -151,12 +196,15 @@ function App() {
 
   // ---- data loading ----
   const loadIndex = useCallback(async () => {
+    setIndexPending(true);
     let value: any;
     try {
       value = await logic()!.command("index", {});
     } catch (error) {
       showError(error);
       return;
+    } finally {
+      setIndexPending(false);
     }
     const nextProjects = value?.projects ?? [];
     const nextSessions = value?.sessions ?? [];
@@ -188,18 +236,19 @@ function App() {
     }
   }, [status.kind, loadIndex]);
 
-  const refreshPanel = useCallback(async () => {
+  const refreshPanel = useCallback(async (kind?: PanelKind) => {
     const { activeSession: as, activePanel: ap } = logicRef.current;
-    if (!as || !ap) return;
+    const target = kind ?? ap;
+    if (!as || !target) return;
     try {
-      if (ap === "agents") {
+      if (target === "agents") {
         const value = await logic()!.command("agents.list", { sessionID: as });
         setPanelData({ kind: "agents", agents: value?.agents ?? [] });
         return;
       }
       const value = await logic()!.command("panel.state", { sessionID: as });
-      if (ap === "web") setPanelData({ kind: "web", web: value?.web ?? null });
-      else if (ap === "documents") {
+      if (target === "web") setPanelData({ kind: "web", web: value?.web ?? null });
+      else if (target === "documents") {
         setPanelData({ kind: "documents", documents: value?.documents ?? [] });
       }
     } catch (error) {
@@ -269,6 +318,8 @@ function App() {
   };
 
   const openSession = useCallback(async (sessionID: string, requestOpen: boolean) => {
+    setSessionLoading(true);
+    setPanelDetailLoading(false);
     try {
       if (requestOpen) await logic()!.command("session.open", { sessionID });
       logicRef.current.activeSession = sessionID;
@@ -283,6 +334,8 @@ function App() {
       await loadIndex();
     } catch (error) {
       showError(error);
+    } finally {
+      setSessionLoading(false);
     }
   }, [loadModels, loadIndex, pollSnapshot, showError]);
 
@@ -308,6 +361,8 @@ function App() {
     setActivePanel(null);
     setPanelData(null);
     setPanelDetail(null);
+    setPanelDetailLoading(false);
+    setSessionLoading(false);
     setSessionTitle("请选择会话");
     void loadIndex();
   };
@@ -329,6 +384,7 @@ function App() {
   const send = async () => {
     const as = logicRef.current.activeSession;
     if (!as) return;
+    setSending(true);
     try {
       await logic()!.command("prompt.send", {
         sessionID: as,
@@ -340,6 +396,8 @@ function App() {
       await pollSnapshot();
     } catch (error) {
       showError(error);
+    } finally {
+      setSending(false);
     }
   };
 
@@ -401,7 +459,11 @@ function App() {
     setActivePanel((prev) => {
       const next = prev === kind ? null : kind;
       setPanelDetail(null);
-      if (next) void refreshPanel();
+      setPanelDetailLoading(false);
+      if (next) {
+        setPanelData(null);
+        void refreshPanel(next);
+      }
       return next;
     });
   };
@@ -409,6 +471,8 @@ function App() {
   const openAgentDetail = async (agent: any) => {
     const as = logicRef.current.activeSession;
     if (!as) return;
+    setPanelDetail(null);
+    setPanelDetailLoading(true);
     try {
       const detail = await logic()!.command("agents.detail", {
         sessionID: as, agentID: agent.agentID,
@@ -420,12 +484,16 @@ function App() {
       });
     } catch (error) {
       showError(error);
+    } finally {
+      setPanelDetailLoading(false);
     }
   };
 
   const openDocument = async (document: any) => {
     const as = logicRef.current.activeSession;
     if (!as) return;
+    setPanelDetail(null);
+    setPanelDetailLoading(true);
     try {
       const detail = await logic()!.command("document.get", {
         sessionID: as, documentID: document.id,
@@ -436,6 +504,8 @@ function App() {
       });
     } catch (error) {
       showError(error);
+    } finally {
+      setPanelDetailLoading(false);
     }
   };
 
@@ -452,6 +522,9 @@ function App() {
 
   const messages = (snapshot?.messages ?? []) as any[];
   const liveTail = Boolean(snapshot?.isGenerating);
+  // Panel data is keyed by kind so a stale response for a closed/switched
+  // panel never renders; `null` means the request is in flight or not started.
+  const activePanelData = panelData?.kind === activePanel ? panelData : null;
 
   return (
     <div className="app">
@@ -460,6 +533,14 @@ function App() {
           <Button size="small" onClick={showList}>‹ 返回</Button>
         ) : null}
         <div className="header-title">{view === "detail" ? sessionTitle : "PipiUI 远程会话"}</div>
+        <button
+          type="button"
+          className="theme-toggle"
+          aria-label={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
+          onClick={toggleTheme}
+        >
+          {theme === "dark" ? <SunIcon /> : <MoonIcon />}
+        </button>
         <div className={`conn-pill ${pill.tone}`} role="status">
           <span className="conn-dot" />
           <span>{pill.text}</span>
@@ -467,10 +548,24 @@ function App() {
       </header>
 
       {view === "list" ? (
+        status.kind !== "connected" ? (
+          <div className="center-block fill">
+            <SpinLoading color="primary" />
+            <span>{statusLine}</span>
+          </div>
+        ) : (
         <div className="list-view">
           <div className="list-section">
             <div className="list-section-title">项目</div>
             <List>
+              {indexPending && projects.length === 0 ? (
+                <div className="skeleton-list">
+                  <Skeleton animated className="skeleton-row" />
+                  <Skeleton animated className="skeleton-row" />
+                  <Skeleton animated className="skeleton-row" />
+                </div>
+              ) : (
+                <>
               {projects.map((project) => {
                 const count = visibleSessions.filter((s: any) => s.projectID === project.id).length;
                 return (
@@ -502,6 +597,8 @@ function App() {
               {projects.length === 0 ? (
                 <div className="list-empty">暂无项目</div>
               ) : null}
+                </>
+              )}
             </List>
           </div>
 
@@ -510,6 +607,14 @@ function App() {
               <span>会话{selectedProject !== null ? `（已筛选）` : ""}</span>
               <span className="spacer" />
             </div>
+            {indexPending && sessions.length === 0 ? (
+              <div className="skeleton-list">
+                <Skeleton animated className="skeleton-row" />
+                <Skeleton animated className="skeleton-row" />
+                <Skeleton animated className="skeleton-row" />
+              </div>
+            ) : (
+              <>
             <List>
               {pageSessions.map((session) => (
                 <List.Item
@@ -544,8 +649,11 @@ function App() {
                 </Button>
               </div>
             ) : null}
+              </>
+            )}
           </div>
         </div>
+        )
       ) : (
         <div className="chat-view">
           <div className="chat-tabs">
@@ -564,18 +672,31 @@ function App() {
           </div>
 
           <div className="transcript" ref={scrollRef} aria-live="polite">
-            {messages.map((message: any, index: number) => (
-              <MessageView
-                key={index}
-                message={message}
-                live={liveTail
-                  && (message.kind === "tool" || message.kind === "thinking")
-                  && index === messages.length - 1}
-              />
-            ))}
-            {messages.length === 0 ? (
-              <div className="list-empty">暂无消息</div>
-            ) : null}
+            {sessionLoading ? (
+              <div className="center-block fill">
+                <SpinLoading color="primary" />
+                <span>正在加载会话…</span>
+              </div>
+            ) : messages.length === 0 ? (
+              status.kind !== "connected" ? (
+                <div className="center-block fill">
+                  <SpinLoading color="primary" />
+                  <span>{statusLine}</span>
+                </div>
+              ) : (
+                <div className="list-empty">暂无消息</div>
+              )
+            ) : (
+              messages.map((message: any, index: number) => (
+                <MessageView
+                  key={index}
+                  message={message}
+                  live={liveTail
+                    && (message.kind === "tool" || message.kind === "thinking")
+                    && index === messages.length - 1}
+                />
+              ))
+            )}
           </div>
 
           <div className="composer">
@@ -587,7 +708,12 @@ function App() {
             />
             <div className="actions">
               <span className="composer-status">{snapshotStatus(snapshot)}</span>
-              <Button color="primary" disabled={!canSend} onClick={() => void send()}>
+              <Button
+                color="primary"
+                loading={sending}
+                disabled={!canSend || sending}
+                onClick={() => void send()}
+              >
                 发送
               </Button>
               <Button
@@ -617,6 +743,12 @@ function App() {
             <Button size="small" onClick={() => setModelOpen(false)}>关闭</Button>
           </div>
           <div className="panel-scroll">
+            {models === null ? (
+              <div className="center-block scroll-fill">
+                <SpinLoading color="primary" />
+                <span>正在加载…</span>
+              </div>
+            ) : (
             <div className="model-panel-grid">
               <div className="model-row">
                 <label>主模型</label>
@@ -651,6 +783,7 @@ function App() {
                 </div>
               ))}
             </div>
+            )}
           </div>
         </div>
       </Popup>
@@ -676,7 +809,12 @@ function App() {
             <Button size="small" onClick={() => setActivePanel(null)}>关闭</Button>
           </div>
           <div className="panel-scroll">
-            {panelDetail ? (
+            {panelDetailLoading ? (
+              <div className="center-block scroll-fill">
+                <SpinLoading color="primary" />
+                <span>正在加载…</span>
+              </div>
+            ) : panelDetail ? (
               <>
                 {panelDetail.meta ? <pre className="panel-meta">{panelDetail.meta}</pre> : null}
                 {panelDetail.content ? (
@@ -685,9 +823,14 @@ function App() {
                   <pre className="panel-detail">{panelDetail.log}</pre>
                 )}
               </>
+            ) : activePanelData === null ? (
+              <div className="center-block scroll-fill">
+                <SpinLoading color="primary" />
+                <span>正在加载…</span>
+              </div>
             ) : activePanel === "agents" ? (
               <div className="model-panel-grid">
-                {(panelData?.agents ?? []).map((agent: any) => (
+                {activePanelData.agents.map((agent: any) => (
                   <Button
                     key={agent.agentID}
                     className="panel-item"
@@ -697,20 +840,20 @@ function App() {
                     {agent.name} · {agent.state} · {agent.title}
                   </Button>
                 ))}
-                {(panelData?.agents ?? []).length === 0 ? (
+                {activePanelData.agents.length === 0 ? (
                   <div className="list-empty">暂无 Subagent</div>
                 ) : null}
               </div>
             ) : activePanel === "web" ? (
               <div className="web-frame-wrap">
-                {panelData?.web ? (
+                {activePanelData.web ? (
                   <>
                     <span className="web-status">
-                      {panelData.web.isLoading
+                      {activePanelData.web.isLoading
                         ? "加载中…"
                         : (() => {
                             try {
-                              return new URL(panelData.web.url).href;
+                              return new URL(activePanelData.web.url).href;
                             } catch {
                               return "网页地址不可远程显示";
                             }
@@ -718,7 +861,7 @@ function App() {
                     </span>
                     {(() => {
                       try {
-                        const url = new URL(panelData.web.url);
+                        const url = new URL(activePanelData.web.url);
                         if (url.protocol !== "http:" && url.protocol !== "https:") {
                           throw new Error("invalid url");
                         }
@@ -741,7 +884,7 @@ function App() {
               </div>
             ) : (
               <div className="model-panel-grid">
-                {(panelData?.documents ?? []).map((document: any) => (
+                {activePanelData.documents.map((document: any) => (
                   <Button
                     key={document.id}
                     className="panel-item"
@@ -751,15 +894,11 @@ function App() {
                     {document.name} · {document.kind} · {document.size} B
                   </Button>
                 ))}
-                {(panelData?.documents ?? []).length === 0 ? (
+                {activePanelData.documents.length === 0 ? (
                   <div className="list-empty">未打开文档</div>
                 ) : null}
               </div>
             )}
-            {activePanel === "agents" && !panelDetail
-              && (panelData?.agents ?? []).length === 0
-              ? <DotLoading />
-              : null}
           </div>
         </div>
       </Popup>

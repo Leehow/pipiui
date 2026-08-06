@@ -115,6 +115,17 @@ function pairPage(roomID: string, tunnelURL: string, nonce: string): string {
 <div id="boot-status" role="status">连接服务器隧道…</div>
 <script nonce="${nonce}">
 (() => {
+  try {
+    const stored = localStorage.getItem("pipiui-remote-theme");
+    document.documentElement.dataset.theme = stored === "dark" || stored === "light"
+      ? stored
+      : (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+  } catch {
+    try {
+      document.documentElement.dataset.theme =
+        matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    } catch {}
+  }
   const secret = location.hash.startsWith("#") ? location.hash.slice(1) : "";
   window.__PIPI_TUNNEL_BOOT__ = Object.freeze({...${boot}, secret});
   if (!/^[0-9a-f]{64}$/.test(secret)) {
