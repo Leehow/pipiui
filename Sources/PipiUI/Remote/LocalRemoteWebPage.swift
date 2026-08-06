@@ -80,8 +80,16 @@ enum LocalRemoteWebPage {
             }
             .row.card:hover { background: var(--surface-2); border-color: #354554; }
             .row.card.selected { border-color: var(--accent); background: var(--accent-soft); }
-            .row-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+            .row-title { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; }
+            .row.card > button { flex: none; }
             .row-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .pager {
+              display: flex; align-items: center; justify-content: center; gap: 12px;
+              margin: 2px 0 24px; padding-top: 4px;
+            }
+            .pager button { padding: 5px 12px; font-size: 12.5px; }
+            .pager button:disabled { visibility: hidden; }
+            .pager-info { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
             .badge {
               flex: none; font-size: 11px; line-height: 1; padding: 4px 8px; border-radius: 999px;
               background: var(--accent-soft); color: var(--accent-text);
@@ -189,6 +197,7 @@ enum LocalRemoteWebPage {
             <aside id="list-pane" aria-label="项目与会话列表">
               <h2>项目</h2><div id="projects" class="list"></div>
               <h2>会话</h2><div id="sessions" class="list"></div>
+              <div id="session-pagination" class="pager"></div>
             </aside>
             <section id="session-pane" aria-label="会话详情">
               <div class="session-head">
@@ -212,6 +221,8 @@ enum LocalRemoteWebPage {
             const token = "__TOKEN__";
             let activeSession = null;
             let revision = null;
+            const SESSION_PAGE_SIZE = 10;
+            let sessionPage = 0;
             let pollTimer = null;
             let connFailures = 0;
             let connState = "connected";
@@ -278,12 +289,38 @@ enum LocalRemoteWebPage {
             function showDetail() {
               el("remote-main").dataset.mobileView = "detail";
             }
+            function renderPager(page, totalPages, total) {
+              const pager = el("session-pagination");
+              pager.replaceChildren();
+              if (totalPages <= 1) return;
+              const prev = label("button", "‹ 上一页");
+              prev.disabled = page <= 0;
+              prev.addEventListener("click", () => {
+                sessionPage = Math.max(0, sessionPage - 1);
+                loadIndex().catch(error => setStatus(error.message));
+              });
+              const next = label("button", "下一页 ›");
+              next.disabled = page >= totalPages - 1;
+              next.addEventListener("click", () => {
+                sessionPage = Math.min(totalPages - 1, sessionPage + 1);
+                loadIndex().catch(error => setStatus(error.message));
+              });
+              const info = label("span", `${page + 1} / ${totalPages} 页 · 共 ${total} 个`, "pager-info");
+              pager.append(prev, info, next);
+            }
             async function loadIndex() {
               const data = await api("/api/index");
               const projects = el("projects");
               const sessions = el("sessions");
               projects.replaceChildren();
+              const totalPages = Math.max(1, Math.ceil(data.sessions.length / SESSION_PAGE_SIZE));
+              if (sessionPage >= totalPages) sessionPage = totalPages - 1;
+              const pageSessions = data.sessions.slice(
+                sessionPage * SESSION_PAGE_SIZE,
+                sessionPage * SESSION_PAGE_SIZE + SESSION_PAGE_SIZE
+              );
               sessions.replaceChildren();
+              renderPager(sessionPage, totalPages, data.sessions.length);
               for (const project of data.projects) {
                 const row = document.createElement("div"); row.className = "row card";
                 const titleWrap = document.createElement("div"); titleWrap.className = "row-title";
@@ -298,7 +335,7 @@ enum LocalRemoteWebPage {
                 });
                 row.append(button); projects.append(row);
               }
-              for (const session of data.sessions) {
+              for (const session of pageSessions) {
                 const row = document.createElement("div");
                 row.className = "row card" + (session.id === activeSession ? " selected" : "");
                 const titleWrap = document.createElement("div"); titleWrap.className = "row-title";
