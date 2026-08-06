@@ -1204,6 +1204,13 @@ interface JobRecord {
 	resultText?: string;
 	/** Runtime-attested verify (when the brief carried `verify`). */
 	verify?: VerifyAttestation;
+	/**
+	 * [subagent-interrupted-reminder] pushes for terminal jobs that still hold stored context.
+	 * 0/undefined = never nudged this terminal episode; max 2 then silence. Reset on re-dispatch.
+	 */
+	nudgeCount?: number;
+	/** Timestamp of the last interrupted-reminder push; undefined/0 = never this episode. */
+	lastNudgeAt?: number;
 }
 
 const jobRegistry = new Map<string, JobRecord>();
@@ -1311,6 +1318,25 @@ function jitteredRetryBackoffMs(baseMs: number, random = Math.random): number {
 }
 /** stall 复推节奏：boss 决定继续等时，最多 5 分钟沉默一次，不必等心跳。 */
 const STALL_RENOTIFY_INTERVAL_MS = 5 * 60 * 1000;
+/**
+ * Terminal interrupted/aborted/failed jobs that still hold stored context: first boss reminder
+ * after this many seconds idle in that state, then one re-nudge at the renudge threshold.
+ * Override via PIPIUI_INTERRUPTED_NUDGE_SECS / PIPIUI_INTERRUPTED_RENUDGE_SECS.
+ */
+const INTERRUPTED_NUDGE_SECS_DEFAULT = 1200;
+const INTERRUPTED_RENUDGE_SECS_DEFAULT = 3600;
+function envPositiveSecs(name: string, fallback: number): number {
+	const raw = Number.parseInt(process.env[name] || "", 10);
+	return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+const INTERRUPTED_NUDGE_SECS = envPositiveSecs(
+	"PIPIUI_INTERRUPTED_NUDGE_SECS",
+	INTERRUPTED_NUDGE_SECS_DEFAULT,
+);
+const INTERRUPTED_RENUDGE_SECS = envPositiveSecs(
+	"PIPIUI_INTERRUPTED_RENUDGE_SECS",
+	INTERRUPTED_RENUDGE_SECS_DEFAULT,
+);
 /** done 重投节奏：30s 扫描每次都看，但同一 agentId 两次投递至少隔 60s，避免轰炸正在处理中的 boss。 */
 const DONE_RETRY_MIN_INTERVAL_MS = 60_000;
 /** Initial delivery plus four retries; a broken follow-up channel must not retry forever. */
@@ -4156,12 +4182,14 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ---- 统一轮询（30s）：承载三条按节奏补推的路径 ——
+	// ---- 统一轮询（30s）：承载四条按节奏补推的路径 ——
 	// 1) done 重投：sendUserMessage 的 promise 未确认（reject 或未 settle）的 [subagent-done]，
 	//    同一 obligation 至少隔 60s 重投一次，直到确认。job 已 terminal，重投只依赖持久化 text。
 	// 2) vanished 即时检测：pid 已死但没人报告 → 立刻推（不等 5min 心跳），推一次后从 runningAgents 删除。
 	// 3) stall 复推：idle ≥ 120s 即推 [subagent-stalled]，boss 若继续等，每 5 分钟复推一次（idle 秒数更新）；
 	//    有新活动后 noteAgentActivity 复位 lastStallNotifyAt=0，重新武装。
+	// 4) interrupted/aborted/failed + stored context：idle ≥ NUDGE_SECS 推 [subagent-interrupted-reminder]，
+	//    再于 RENUDGE_SECS 复推一次后沉默；同 agentId 再 dispatch 为 running 时字段被清零。
 	// 复用 [subagent-done] 的 followUp 通道。无 PIPIUI_* 环境变量时桥接上报自动静默（pipiuiReport no-op）。
 	const STALL_WATCHDOG_KEY = "__pipiuiSubagentStallWatchdog";
 	const g = globalThis as Record<string, unknown>;
@@ -4230,6 +4258,30 @@ export default function (pi: ExtensionAPI) {
 				idle: idleSec,
 				activity: lastLine,
 			});
+		}
+
+		// (4) interrupted/aborted/failed + intact stored context → remind boss to re-dispatch
+		const resumableIds = new Set(resumableAgentIds());
+		for (const job of jobRegistry.values()) {
+			if (job.state !== "interrupted" && job.state !== "aborted" && job.state !== "failed") continue;
+			if (!resumableIds.has(job.agentId)) continue; // no session on disk → nothing to resume
+			const nudgeCount = job.nudgeCount ?? 0;
+			if (nudgeCount >= 2) continue; // first + one re-nudge, then silence this terminal episode
+			const endedAt = job.endedAt ?? job.startedAt;
+			const idleSec = Math.max(0, Math.floor((now - endedAt) / 1000));
+			const thresholdSec = nudgeCount === 0 ? INTERRUPTED_NUDGE_SECS : INTERRUPTED_RENUDGE_SECS;
+			if (idleSec < thresholdSec) continue;
+			job.nudgeCount = nudgeCount + 1;
+			job.lastNudgeAt = now;
+			const title =
+				job.title?.trim() || (job.task.split("\n")[0] ?? "").trim().slice(0, 80) || "(untitled)";
+			deliverSubagentDone(
+				pi,
+				[
+					`[subagent-interrupted-reminder] agentId=${job.agentId} state=${job.state} title=${title} idle=${idleSec}s nudge=${job.nudgeCount}/2`,
+					`This worker is ${job.state} but its stored context is intact. Re-dispatch the same agentId to continue where it left off, or pass fresh:true to abandon that context. Do not treat this message as a new user request.`,
+				].join("\n"),
+			);
 		}
 	}, STALL_WATCHDOG_INTERVAL_MS);
 	stallWatchdog.unref?.();
