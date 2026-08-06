@@ -2,6 +2,37 @@ import Foundation
 import WebKit
 import AppKit
 
+enum BrowserActivity: String {
+    case idle
+    case observing
+    case acting
+
+    var label: String {
+        switch self {
+        case .idle: ""
+        case .observing: "正在观察"
+        case .acting: "正在操作"
+        }
+    }
+}
+
+enum BrowserDOMControllerResource {
+    static let contentWorldName = "PipiUIBrowserDOM"
+
+    static func bundledURL(bundle: Bundle = PipiResourceBundle.shared) -> URL? {
+        bundle.url(forResource: "Resources", withExtension: nil)?
+            .appendingPathComponent("BrowserDOM", isDirectory: true)
+            .appendingPathComponent("controller.js")
+    }
+
+    static func bundledSource(bundle: Bundle = PipiResourceBundle.shared) throws -> String {
+        guard let url = bundledURL(bundle: bundle) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        return try String(contentsOf: url, encoding: .utf8)
+    }
+}
+
 /// Per-session embedded browser: wraps a WKWebView, captures console output,
 /// and executes bridge commands from the pi webview extension. Main thread only.
 final class WebViewStore: NSObject, ObservableObject {
@@ -9,16 +40,27 @@ final class WebViewStore: NSObject, ObservableObject {
     @Published var urlString = ""
     @Published var title = ""
     @Published var isLoading = false
+    @Published private(set) var browserActivity: BrowserActivity = .idle
 
     private var consoleLogs: [String] = []
-    /// Pending bridge respond for the in-flight navigate/reload. Invoked exactly once.
-    private var navCompletion: (([String: Any]) -> Void)?
+    private var requestGeneration: UInt64 = 0
+    private var activeRequestID: String?
+    private var activeRespond: (([String: Any]) -> Void)?
+    private var activeIsNavigation = false
     private var navTimeout: DispatchWorkItem?
-    /// Bumped on every `awaitNavigation`. Timeout / settle paths capture it so a stale
-    /// callback cannot complete a newer pending respond.
-    private var navGeneration: UInt64 = 0
-    /// The `WKNavigation` produced by the load/reload we are waiting on (identity match).
+    private var actionGrace: DispatchWorkItem?
     private var pendingWKNavigation: WKNavigation?
+    private var pendingNavigationScope = "viewport"
+    private var pendingActionMetadata: [String: Any]?
+    private var pendingTypedClick = false
+    private var pendingFrameNavigationDeadline: Date?
+    private let frameNavigationTimeout: TimeInterval
+    private let browserDOMSourceAvailable: Bool
+
+    private static let productionFrameNavigationTimeout: TimeInterval = 20
+    private static let productionFrameNavigationTimeoutNote = "iframe navigation timed out after 20s"
+
+    private static let browserDOMWorld = WKContentWorld.world(name: BrowserDOMControllerResource.contentWorldName)
 
     private static let consoleScript = """
     (function () {
@@ -47,7 +89,16 @@ final class WebViewStore: NSObject, ObservableObject {
     })();
     """
 
-    override init() {
+    override convenience init() {
+        self.init(testSchemeHandler: nil)
+    }
+
+    /// Test-only scheme and frame-timeout injection keep navigation fixtures deterministic
+    /// without changing the production 20-second boundary or public browser interface.
+    init(
+        testSchemeHandler: WKURLSchemeHandler?,
+        frameNavigationTimeout: TimeInterval = WebViewStore.productionFrameNavigationTimeout
+    ) {
         let config = WKWebViewConfiguration()
         let controller = WKUserContentController()
         controller.addUserScript(WKUserScript(
@@ -55,9 +106,23 @@ final class WebViewStore: NSObject, ObservableObject {
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
         ))
+        let browserDOMSource = try? BrowserDOMControllerResource.bundledSource()
+        if let browserDOMSource {
+            controller.addUserScript(WKUserScript(
+                source: browserDOMSource,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true,
+                in: Self.browserDOMWorld
+            ))
+        }
         config.userContentController = controller
+        if let testSchemeHandler {
+            config.setURLSchemeHandler(testSchemeHandler, forURLScheme: "pipiui-test")
+        }
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
         webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 1024, height: 768), configuration: config)
+        self.frameNavigationTimeout = max(0.05, frameNavigationTimeout)
+        browserDOMSourceAvailable = browserDOMSource != nil
         super.init()
         controller.add(WeakScriptHandler(self), name: "pipiConsole")
         webView.navigationDelegate = self
@@ -82,6 +147,8 @@ final class WebViewStore: NSObject, ObservableObject {
     @discardableResult
     func navigate(_ input: String) -> Bool {
         guard let url = resolvedURL(from: input) else { return false }
+        cancelActiveRequest(reason: "superseded by browser panel navigation", stopLoading: true)
+        clearBrowserDOMState(preservingRedactions: true)
         webView.load(URLRequest(url: url))
         return true
     }
@@ -89,6 +156,7 @@ final class WebViewStore: NSObject, ObservableObject {
     // MARK: - Bridge commands (invoked on main thread)
 
     func handle(action: String, request: J, respond: @escaping ([String: Any]) -> Void) {
+        let requestID = request["requestID"].string ?? UUID().uuidString
         switch action {
         case "navigate":
             guard let url = request["url"].string, !url.isEmpty else {
@@ -99,45 +167,130 @@ final class WebViewStore: NSObject, ObservableObject {
                 respond(["ok": false, "error": "invalid url"])
                 return
             }
-            awaitNavigation(respond: respond)
+            let generation = beginRequest(
+                requestID: requestID,
+                activity: .acting,
+                navigation: true,
+                respond: respond
+            )
+            pendingNavigationScope = normalizedScope(request["scope"].string)
+            clearBrowserDOMState(preservingRedactions: true)
             let nav = webView.load(URLRequest(url: resolved))
-            bindPendingNavigation(nav)
+            pendingWKNavigation = nav
             if nav == nil {
-                completeNavigation(["ok": false, "error": "failed to start load"])
+                completeRequest(ifGeneration: generation, ["ok": false, "error": "failed to start load"])
+            } else {
+                scheduleNavigationTimeout(generation: generation)
             }
         case "reload":
-            awaitNavigation(respond: respond)
+            let generation = beginRequest(
+                requestID: requestID,
+                activity: .acting,
+                navigation: true,
+                respond: respond
+            )
+            pendingNavigationScope = normalizedScope(request["scope"].string)
+            clearBrowserDOMState(preservingRedactions: true)
             let nav = webView.reload()
-            bindPendingNavigation(nav)
+            pendingWKNavigation = nav
             if nav == nil {
-                completeNavigation(["ok": false, "error": "failed to start reload"])
+                completeRequest(ifGeneration: generation, ["ok": false, "error": "failed to start reload"])
+            } else {
+                scheduleNavigationTimeout(generation: generation)
             }
         case "back":
+            clearBrowserDOMState(preservingRedactions: true)
             webView.goBack()
             respond(["ok": true])
         case "forward":
+            clearBrowserDOMState(preservingRedactions: true)
             webView.goForward()
             respond(["ok": true])
+        case "observe":
+            let generation = beginRequest(
+                requestID: requestID,
+                activity: .observing,
+                navigation: false,
+                respond: respond
+            )
+            evaluateBrowserDOM(
+                ["action": "observe", "scope": normalizedScope(request["scope"].string)]
+            ) { [weak self] response in
+                self?.completeRequest(ifGeneration: generation, response)
+            }
+        case "click", "input", "select", "scroll":
+            let generation = beginRequest(
+                requestID: requestID,
+                activity: .acting,
+                navigation: false,
+                respond: respond
+            )
+            if action == "click" {
+                pendingTypedClick = true
+                pendingNavigationScope = normalizedScope(request["scope"].string)
+                pendingActionMetadata = ["kind": "click"]
+            }
+            var payload: [String: Any] = [
+                "action": action,
+                "scope": normalizedScope(request["scope"].string),
+            ]
+            for key in ["snapshot_id", "element_token", "text", "option", "direction"] {
+                if let value = request[key].string { payload[key] = value }
+            }
+            if let value = request["element_index"].int { payload["element_index"] = value }
+            if let value = request["amount"].double { payload["amount"] = value }
+            evaluateBrowserDOM(payload) { [weak self] response in
+                guard let self, generation == self.requestGeneration, self.activeRespond != nil else { return }
+                if action == "click", response["ok"] as? Bool == true,
+                   response["deferObservation"] as? Bool == true {
+                    if self.activeIsNavigation { return }
+                    let targetFrame = response["targetFrame"] as? String ?? "main"
+                    self.scheduleActionObservation(
+                        generation: generation,
+                        scope: self.pendingNavigationScope,
+                        iframeTarget: targetFrame != "main",
+                        iframeNavigationBearing: response["navigationBearing"] as? Bool == true
+                    )
+                } else if action == "click", self.activeIsNavigation {
+                    // A main-frame navigation may replace the JS world before its click
+                    // callback returns. The adopted WKNavigation owns the single response.
+                    return
+                } else {
+                    self.completeRequest(ifGeneration: generation, response)
+                }
+            }
         case "eval":
             guard let js = request["js"].string else {
                 respond(["ok": false, "error": "missing js"])
                 return
             }
-            webView.evaluateJavaScript(js) { result, error in
+            let generation = beginRequest(
+                requestID: requestID,
+                activity: .acting,
+                navigation: false,
+                respond: respond
+            )
+            webView.evaluateJavaScript(js) { [weak self] result, error in
                 if let error {
-                    respond(["ok": false, "error": Self.describeJSError(error)])
+                    self?.completeRequest(ifGeneration: generation, ["ok": false, "error": Self.describeJSError(error)])
                 } else {
-                    respond(["ok": true, "result": Self.stringify(result)])
+                    self?.completeRequest(ifGeneration: generation, ["ok": true, "result": Self.stringify(result)])
                 }
             }
         case "content":
+            let generation = beginRequest(
+                requestID: requestID,
+                activity: .observing,
+                navigation: false,
+                respond: respond
+            )
             let mode = request["mode"].string ?? "text"
             let js = mode == "html"
                 ? "document.documentElement.outerHTML"
                 : "document.body ? document.body.innerText : ''"
-            webView.evaluateJavaScript(js) { result, error in
+            webView.evaluateJavaScript(js) { [weak self] result, error in
                 if let error {
-                    respond(["ok": false, "error": Self.describeJSError(error)])
+                    self?.completeRequest(ifGeneration: generation, ["ok": false, "error": Self.describeJSError(error)])
                 } else {
                     var text = (result as? String) ?? ""
                     var truncated = false
@@ -145,7 +298,7 @@ final class WebViewStore: NSObject, ObservableObject {
                         text = String(text.prefix(100_000))
                         truncated = true
                     }
-                    respond(["ok": true, "content": text, "truncated": truncated])
+                    self?.completeRequest(ifGeneration: generation, ["ok": true, "content": text, "truncated": truncated])
                 }
             }
         case "console":
@@ -153,17 +306,23 @@ final class WebViewStore: NSObject, ObservableObject {
             if request["clear"].bool == true { consoleLogs = [] }
             respond(["ok": true, "logs": logs])
         case "screenshot":
+            let generation = beginRequest(
+                requestID: requestID,
+                activity: .observing,
+                navigation: false,
+                respond: respond
+            )
             let config = WKSnapshotConfiguration()
             config.snapshotWidth = 1024
-            webView.takeSnapshot(with: config) { image, error in
+            webView.takeSnapshot(with: config) { [weak self] image, error in
                 guard let image,
                       let tiff = image.tiffRepresentation,
                       let rep = NSBitmapImageRep(data: tiff),
                       let png = rep.representation(using: .png, properties: [:]) else {
-                    respond(["ok": false, "error": error?.localizedDescription ?? "snapshot failed (面板可能未显示)"])
+                    self?.completeRequest(ifGeneration: generation, ["ok": false, "error": error?.localizedDescription ?? "snapshot failed (面板可能未显示)"])
                     return
                 }
-                respond(["ok": true, "base64": png.base64EncodedString(), "mimeType": "image/png"])
+                self?.completeRequest(ifGeneration: generation, ["ok": true, "base64": png.base64EncodedString(), "mimeType": "image/png"])
             }
         case "info":
             respond([
@@ -177,33 +336,303 @@ final class WebViewStore: NSObject, ObservableObject {
         }
     }
 
-    /// Fail any in-flight navigation wait so its bridge client is not left hanging.
-    private func cancelPendingNavigation(reason: String) {
-        completeNavigation(["ok": false, "error": reason])
+    func cancelRequest(requestID: String, reason: String = "browser request cancelled") {
+        guard !requestID.isEmpty, activeRequestID == requestID else { return }
+        cancelActiveRequest(reason: reason, stopLoading: activeIsNavigation)
     }
 
-    /// Deliver at most one response for the current pending navigation (success, failure, timeout, or supersede).
-    private func completeNavigation(_ response: [String: Any]) {
+    private func normalizedScope(_ scope: String?) -> String {
+        scope == "page" ? "page" : "viewport"
+    }
+
+    @discardableResult
+    private func beginRequest(
+        requestID: String,
+        activity: BrowserActivity,
+        navigation: Bool,
+        respond: @escaping ([String: Any]) -> Void
+    ) -> UInt64 {
+        cancelActiveRequest(reason: "superseded by newer browser request", stopLoading: activeIsNavigation)
+        requestGeneration &+= 1
+        activeRequestID = requestID
+        activeRespond = respond
+        activeIsNavigation = navigation
+        browserActivity = activity
+        return requestGeneration
+    }
+
+    private func completeRequest(ifGeneration generation: UInt64, _ response: [String: Any]) {
+        guard generation == requestGeneration, let respond = activeRespond else { return }
         navTimeout?.cancel()
         navTimeout = nil
+        actionGrace?.cancel()
+        actionGrace = nil
         pendingWKNavigation = nil
-        guard let respond = navCompletion else { return }
-        navCompletion = nil
-        respond(response)
+        pendingActionMetadata = nil
+        pendingTypedClick = false
+        pendingFrameNavigationDeadline = nil
+        activeRespond = nil
+        activeRequestID = nil
+        activeIsNavigation = false
+        browserActivity = .idle
+        respond(Self.boundedStructuredBrowserResponse(response))
     }
 
-    /// Like `completeNavigation`, but no-ops when `generation` is no longer current
-    /// (stale timeout or late WK callback after supersede).
-    private func completeNavigation(ifGeneration generation: UInt64, _ response: [String: Any]) {
-        guard generation == navGeneration else { return }
-        completeNavigation(response)
+    private func cancelActiveRequest(reason: String, stopLoading: Bool) {
+        guard let respond = activeRespond else {
+            browserActivity = .idle
+            return
+        }
+        requestGeneration &+= 1
+        if stopLoading { webView.stopLoading() }
+        navTimeout?.cancel()
+        navTimeout = nil
+        actionGrace?.cancel()
+        actionGrace = nil
+        pendingWKNavigation = nil
+        pendingActionMetadata = nil
+        pendingTypedClick = false
+        pendingFrameNavigationDeadline = nil
+        activeRespond = nil
+        activeRequestID = nil
+        activeIsNavigation = false
+        browserActivity = .idle
+        clearBrowserDOMState(preservingRedactions: true)
+        respond([
+            "ok": false,
+            "error": reason,
+            "code": "request_cancelled",
+            "requiresObservation": true,
+        ])
+    }
+
+    private func scheduleNavigationTimeout(generation: UInt64) {
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, generation == self.requestGeneration else { return }
+            self.finishNavigationWithObservation(
+                generation: generation,
+                note: "load did not finish within 20s (page may still be loading)"
+            )
+        }
+        navTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: timeout)
+    }
+
+    private func scheduleActionObservation(
+        generation: UInt64,
+        scope: String,
+        iframeTarget: Bool,
+        iframeNavigationBearing: Bool
+    ) {
+        if iframeTarget, iframeNavigationBearing {
+            pendingFrameNavigationDeadline = Date().addingTimeInterval(frameNavigationTimeout)
+            scheduleFrameNavigationPoll(generation: generation, scope: scope, delay: 0.05)
+            return
+        }
+        actionGrace?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  generation == self.requestGeneration,
+                  self.activeRespond != nil,
+                  !self.activeIsNavigation else { return }
+            let action = iframeTarget ? "finalize_click" : "observe"
+            self.evaluateBrowserDOM([
+                "action": action,
+                "scope": scope,
+                "action_metadata": self.pendingActionMetadata ?? ["kind": "click"],
+            ]) { [weak self] response in
+                self?.completeRequest(ifGeneration: generation, response)
+            }
+        }
+        actionGrace = work
+        let delay: TimeInterval = iframeTarget ? 0.10 : 0.25
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func scheduleFrameNavigationPoll(
+        generation: UInt64,
+        scope: String,
+        delay: TimeInterval
+    ) {
+        actionGrace?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  generation == self.requestGeneration,
+                  self.activeRespond != nil,
+                  !self.activeIsNavigation else { return }
+            guard let deadline = self.pendingFrameNavigationDeadline, Date() < deadline else {
+                self.clearBrowserDOMState(preservingRedactions: true)
+                let productionTimeout = self.frameNavigationTimeout == Self.productionFrameNavigationTimeout
+                self.completeRequest(ifGeneration: generation, [
+                    "ok": false,
+                    "error": productionTimeout
+                        ? "iframe navigation did not finish within 20s"
+                        : "iframe navigation did not finish before the configured test timeout",
+                    "code": "browser_navigation_timeout",
+                    "requiresObservation": true,
+                    "note": productionTimeout
+                        ? Self.productionFrameNavigationTimeoutNote
+                        : "iframe navigation timed out after the configured test interval",
+                ])
+                return
+            }
+            self.evaluateBrowserDOM([
+                "action": "finalize_click",
+                "scope": scope,
+                "action_metadata": self.pendingActionMetadata ?? ["kind": "click"],
+            ]) { [weak self] response in
+                guard let self,
+                      generation == self.requestGeneration,
+                      self.activeRespond != nil else { return }
+                if response["ok"] as? Bool == true,
+                   response["pendingFrameNavigation"] as? Bool == true {
+                    self.scheduleFrameNavigationPoll(generation: generation, scope: scope, delay: 0.05)
+                } else {
+                    self.completeRequest(ifGeneration: generation, response)
+                }
+            }
+        }
+        actionGrace = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func finishNavigationWithObservation(generation: UInt64, note: String? = nil) {
+        var payload: [String: Any] = ["action": "observe", "scope": pendingNavigationScope]
+        if let pendingActionMetadata { payload["action_metadata"] = pendingActionMetadata }
+        evaluateBrowserDOM(payload) { [weak self] response in
+            var result = response
+            if let note { result["note"] = note }
+            self?.completeRequest(ifGeneration: generation, result)
+        }
+    }
+
+    static func foundationSerializedUTF16Length(_ value: [String: Any]) -> Int? {
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value),
+              let string = String(data: data, encoding: .utf8) else { return nil }
+        return string.utf16.count
+    }
+
+    /// Apply the public structured-browser budget with the exact Foundation serializer
+    /// used by BridgeServer. Removing the largest element first preserves later small,
+    /// actionable entries instead of letting slash-heavy early entries starve them.
+    static func boundedStructuredBrowserResponse(_ response: [String: Any]) -> [String: Any] {
+        let isStructured = response["snapshotID"] != nil
+            || response["observation"] != nil
+            || response["deferObservation"] != nil
+            || response["pendingFrameNavigation"] != nil
+        guard isStructured else { return response }
+
+        var result = response
+        func length() -> Int { foundationSerializedUTF16Length(result) ?? .max }
+        func serializedSize(_ value: Any) -> Int {
+            guard JSONSerialization.isValidJSONObject(value),
+                  let data = try? JSONSerialization.data(withJSONObject: value),
+                  let string = String(data: data, encoding: .utf8) else { return .max }
+            return string.utf16.count
+        }
+
+        while length() > 20_000 {
+            var topElements = result["elements"] as? [[String: Any]] ?? []
+            var nested = result["observation"] as? [String: Any]
+            var nestedElements = nested?["elements"] as? [[String: Any]] ?? []
+
+            let topLargest = topElements.enumerated().max {
+                serializedSize($0.element) < serializedSize($1.element)
+            }
+            let nestedLargest = nestedElements.enumerated().max {
+                serializedSize($0.element) < serializedSize($1.element)
+            }
+            let topSize = topLargest.map { serializedSize($0.element) } ?? -1
+            let nestedSize = nestedLargest.map { serializedSize($0.element) } ?? -1
+            if topSize >= 0 || nestedSize >= 0 {
+                if topSize >= nestedSize, let index = topLargest?.offset {
+                    topElements.remove(at: index)
+                    result["elements"] = topElements
+                    result["truncated"] = true
+                } else if let index = nestedLargest?.offset {
+                    nestedElements.remove(at: index)
+                    nested?["elements"] = nestedElements
+                    nested?["truncated"] = true
+                    result["observation"] = nested
+                }
+                continue
+            }
+
+            var topLimitations = result["limitations"] as? [String] ?? []
+            var nestedLimitations = nested?["limitations"] as? [String] ?? []
+            if !topLimitations.isEmpty {
+                topLimitations.removeLast()
+                result["limitations"] = topLimitations
+                result["truncated"] = true
+                continue
+            }
+            if !nestedLimitations.isEmpty {
+                nestedLimitations.removeLast()
+                nested?["limitations"] = nestedLimitations
+                nested?["truncated"] = true
+                result["observation"] = nested
+                continue
+            }
+
+            return [
+                "ok": false,
+                "error": "browser response exceeded the Foundation serialization budget",
+                "code": "browser_output_truncated",
+                "requiresObservation": true,
+                "truncated": true,
+            ]
+        }
+        return result
+    }
+
+    private func evaluateBrowserDOM(
+        _ payload: [String: Any],
+        completion: @escaping ([String: Any]) -> Void
+    ) {
+        guard browserDOMSourceAvailable else {
+            completion([
+                "ok": false,
+                "error": "structured browser controller resource is unavailable",
+                "code": "browser_controller_unavailable",
+            ])
+            return
+        }
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8) else {
+            completion(["ok": false, "error": "invalid browser controller request"])
+            return
+        }
+        let js = "globalThis.__pipiBrowserDOM ? globalThis.__pipiBrowserDOM.dispatch(\(json)) : null"
+        webView.evaluateJavaScript(js, in: nil, in: Self.browserDOMWorld) { result in
+            switch result {
+            case .success(let value):
+                if let response = value as? [String: Any] {
+                    completion(response)
+                } else {
+                    completion([
+                        "ok": false,
+                        "error": "structured browser controller did not initialize",
+                        "code": "browser_controller_unavailable",
+                    ])
+                }
+            case .failure(let error):
+                completion(["ok": false, "error": Self.describeJSError(error)])
+            }
+        }
+    }
+
+    private func clearBrowserDOMState(preservingRedactions: Bool = false) {
+        guard browserDOMSourceAvailable else { return }
+        let action = preservingRedactions ? "invalidate" : "clear"
+        let js = "globalThis.__pipiBrowserDOM?.dispatch({action:'\(action)'})"
+        webView.evaluateJavaScript(js, in: nil, in: Self.browserDOMWorld) { _ in }
     }
 
     /// Whether a WK callback's navigation object is the one we are waiting on.
-    /// Requires a bound `pendingWKNavigation` and identity match — never settle on a
-    /// guess (stale didFinish from a prior about:blank must not complete a new pending).
     private func isCurrentNavigation(_ navigation: WKNavigation?) -> Bool {
-        guard navCompletion != nil else { return false }
+        guard activeRespond != nil, activeIsNavigation else { return false }
         guard let pending = pendingWKNavigation, let navigation else { return false }
         return navigation === pending
     }
@@ -211,41 +640,6 @@ final class WebViewStore: NSObject, ObservableObject {
     private static func isURLCancelled(_ error: Error) -> Bool {
         let ns = error as NSError
         return ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled
-    }
-
-    /// Register a pending navigation; respond when didFinish/didFail fires or after timeout.
-    /// If a previous navigate/reload is still waiting, it is failed first (never dropped).
-    private func awaitNavigation(respond: @escaping ([String: Any]) -> Void) {
-        cancelPendingNavigation(reason: "superseded by newer navigation")
-        navGeneration += 1
-        let generation = navGeneration
-        pendingWKNavigation = nil
-        navCompletion = respond
-        let timeout = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.completeNavigation(ifGeneration: generation, [
-                "ok": true,
-                "url": self.webView.url?.absoluteString ?? "",
-                "title": self.webView.title ?? "",
-                "note": "load did not finish within 20s (page may still be loading)",
-            ])
-        }
-        navTimeout = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: timeout)
-    }
-
-    private func finishPendingNavigationSuccess(ifGeneration generation: UInt64) {
-        completeNavigation(ifGeneration: generation, [
-            "ok": true,
-            "url": webView.url?.absoluteString ?? "",
-            "title": webView.title ?? "",
-        ])
-    }
-
-    /// Bind the WKNavigation returned by `load`/`reload` so late callbacks from a
-    /// superseded load cannot settle the new pending respond.
-    private func bindPendingNavigation(_ navigation: WKNavigation?) {
-        pendingWKNavigation = navigation
     }
 
     private static func stringify(_ value: Any?) -> String {
@@ -271,15 +665,34 @@ final class WebViewStore: NSObject, ObservableObject {
 extension WebViewStore: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         isLoading = true
+        if activeRespond != nil, pendingTypedClick, !activeIsNavigation {
+            actionGrace?.cancel()
+            actionGrace = nil
+            activeIsNavigation = true
+            pendingWKNavigation = navigation
+            scheduleNavigationTimeout(generation: requestGeneration)
+            clearBrowserDOMState(preservingRedactions: true)
+            return
+        }
+        let replacedPendingNavigation = activeIsNavigation
+            && pendingWKNavigation != nil
+            && pendingWKNavigation !== navigation
+        if activeRespond != nil,
+           !activeIsNavigation || replacedPendingNavigation {
+            cancelActiveRequest(
+                reason: "page navigation invalidated the active browser request",
+                stopLoading: false
+            )
+        }
+        clearBrowserDOMState(preservingRedactions: true)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         isLoading = false
         urlString = webView.url?.absoluteString ?? urlString
         title = webView.title ?? ""
-        // Ignore finishes for a superseded load (identity + generation).
         guard isCurrentNavigation(navigation) else { return }
-        finishPendingNavigationSuccess(ifGeneration: navGeneration)
+        finishNavigationWithObservation(generation: requestGeneration)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -294,25 +707,11 @@ extension WebViewStore: WKNavigationDelegate {
     }
 
     /// Settle or ignore a WK failure callback. Cancelled (-999) from a superseded load must
-    /// not complete the *new* pending with ok:true; real failures report ok:false.
+    /// not complete the newer pending request.
     fileprivate func settleNavigationFailure(navigation: WKNavigation?, error: Error) {
-        // Stale callback for a navigation we are no longer waiting on.
         guard isCurrentNavigation(navigation) else { return }
-        let generation = navGeneration
-        // NSURLErrorCancelled means this load was replaced/stopped — not success.
-        // After supersede the old load's cancel is already filtered by isCurrentNavigation;
-        // if the *current* load is cancelled, fail the pending respond once.
-        if Self.isURLCancelled(error) {
-            completeNavigation(ifGeneration: generation, [
-                "ok": false,
-                "error": error.localizedDescription,
-            ])
-            return
-        }
-        completeNavigation(ifGeneration: generation, [
-            "ok": false,
-            "error": error.localizedDescription,
-        ])
+        let message = Self.isURLCancelled(error) ? "navigation cancelled" : error.localizedDescription
+        completeRequest(ifGeneration: requestGeneration, ["ok": false, "error": message])
     }
 }
 

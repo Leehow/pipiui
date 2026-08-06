@@ -54,15 +54,83 @@ final class PromptCacheDisciplineTests: XCTestCase {
         let registrations = source.components(separatedBy: "registerTool(").count - 1
         XCTAssertEqual(registrations, 1, "browser actions must stay behind a single tool")
         XCTAssertTrue(source.contains("name: \"browser\""))
-        for action in ["navigate", "content", "eval", "console", "screenshot", "help"] {
+        for action in [
+            "navigate", "observe", "click", "input", "select", "scroll",
+            "content", "eval", "console", "screenshot", "help",
+        ] {
             XCTAssertTrue(source.contains("case \"\(action)\":"), "missing browser action \(action)")
         }
+        for field in [
+            "scope:", "snapshot_id:", "element_index:", "element_token:",
+            "text:", "option:", "direction:", "amount:",
+        ] {
+            XCTAssertTrue(source.contains(field), "missing browser schema field \(field)")
+        }
+        XCTAssertFalse(source.contains("target: Type."), "browser must remain embedded-WebView only")
+        XCTAssertTrue(source.contains("async execute(_id, params, signal)"))
+        XCTAssertTrue(source.contains("requestID"))
+        XCTAssertTrue(source.contains("browser_cancel"))
+        XCTAssertTrue(source.contains("Raw fallback"))
+        XCTAssertTrue(source.contains("Debug fallback"))
     }
 
     /// Settings still store the `browser_*` group id; it has to resolve to the real tool name
     /// or `--exclude-tools` would silently stop disabling the browser.
     func testBrowserGroupExpandsToRealToolName() {
         XCTAssertEqual(ToolSkillSettings.browserToolNames, ["browser"])
+    }
+
+    func testSensitiveBrowserHandoffTargetsIssuingSession() throws {
+        XCTAssertTrue(AppStore.browserResponseRequiresWebPanel([
+            "code": "user_handoff_required",
+        ]))
+        XCTAssertFalse(AppStore.browserResponseRequiresWebPanel(["ok": true]))
+
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repository.appendingPathComponent("Sources/PipiUI/AppStore.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("session.rightPanel = .web"))
+        XCTAssertTrue(source.contains("browserResponseRequiresWebPanel(response)"))
+        XCTAssertFalse(source.contains("currentSession?.rightPanel = .web"))
+    }
+
+    func testBrowserFoundationBudgetAndTimeoutExplanationContract() throws {
+        let slash = String(repeating: "/", count: 1_000)
+        let oversized: [String: Any] = [
+            "ok": true,
+            "snapshotID": "snapshot-test",
+            "elements": (0..<30).map { index in
+                ["index": index, "token": "token-\(index)", "name": slash] as [String: Any]
+            } + [["index": 30, "token": "later", "name": "Later useful element"]],
+            "limitations": [],
+            "truncated": false,
+            "note": "load did not finish within 20s (page may still be loading)",
+        ]
+        let bounded = WebViewStore.boundedStructuredBrowserResponse(oversized)
+        XCTAssertLessThanOrEqual(try XCTUnwrap(WebViewStore.foundationSerializedUTF16Length(bounded)), 20_000)
+        XCTAssertEqual(bounded["truncated"] as? Bool, true)
+        let names = (bounded["elements"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String }
+        XCTAssertTrue(names.contains("Later useful element"))
+        XCTAssertEqual(
+            bounded["note"] as? String,
+            "load did not finish within 20s (page may still be loading)"
+        )
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repository.appendingPathComponent("Sources/PipiUI/WebViewStore.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("note: \"load did not finish within 20s (page may still be loading)\""))
+        XCTAssertTrue(source.contains("private static let productionFrameNavigationTimeout: TimeInterval = 20"))
+        XCTAssertTrue(source.contains("private static let productionFrameNavigationTimeoutNote = \"iframe navigation timed out after 20s\""))
     }
 
     /// Layer bodies sit in the cached prefix of every request; English is roughly half the

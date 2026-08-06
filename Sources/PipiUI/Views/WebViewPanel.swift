@@ -58,6 +58,20 @@ struct WebViewPanel: View {
                 ProgressView().controlSize(.small)
             }
 
+            if store.browserActivity != .idle {
+                HStack(spacing: 4) {
+                    ProgressView().controlSize(.mini)
+                    Text(store.browserActivity.label)
+                        .font(.caption2)
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(Color.primary.opacity(0.06)))
+                .accessibilityLabel("浏览器\(store.browserActivity.label)")
+                .allowsHitTesting(false)
+            }
+
             Button(action: onClose) {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundStyle(.secondary)
