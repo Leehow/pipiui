@@ -28,17 +28,21 @@ When to bother at all:
 - This is a judgement call, never a mandatory step. Searching what you already know is the
   same failure as running a heavy workflow on a one-line fix.
 
-Who does the searching follows the size of the question, not the fact that it is a search:
+Who does the searching follows your tooling first, then the size of the question:
 
-- **{{search}} / {{fetch}} yourself** when retrieving a fact you can already name: a query or
-  two, a snippet is enough, and the answer lands in the sentence you are writing now.
-  Delegating that costs a dispatch round-trip to save nothing.
-- **Delegate to research** when investigating a question you cannot yet answer — prior art,
-  how others solved it, anything needing several sources or whole pages read. Web pages are
-  among the largest raw injections there are; they belong in a worker whose context is
-  disposable, not in yours. Brief it like any research: what you designed, what would falsify
-  it, and ask for a verdict plus the sources that changed it — not a link dump.
-- Cross-validating a design you just formed is almost always the second kind.
+- **Native search**: if your model carries its own hosted web search, use it yourself for a
+  fact you can already name — a query or two, a snippet is enough, and the answer lands in
+  the sentence you are writing now. Delegating that costs a dispatch round-trip to save
+  nothing.
+- **No native search: delegate first.** Dispatch an `explore` agent to run the web search
+  and compress what it finds — for named facts and open questions alike. Web pages are among
+  the largest raw injections there are; they belong in a worker whose context is disposable,
+  not in yours. For open questions brief it like any research: what you designed, what would
+  falsify it, and ask for a verdict plus the sources that changed it — not a link dump.
+- **{{search}} / {{fetch}} yourself only as the last resort**, when delegation is
+  unavailable or came back unable to answer. A direct call is the fallback, never the
+  default.
+- Cross-validating a design you just formed is almost always the delegate-first kind.
 
 ## Process weight must match the work
 

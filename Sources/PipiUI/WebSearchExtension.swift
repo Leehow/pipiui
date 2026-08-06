@@ -194,6 +194,7 @@ export default function (pi: ExtensionAPI) {
       "Use web_search when the user asks about recent events, external facts, or documentation not in the repo.",
       "Cite source URLs in your response after using web_search.",
       "Do not call web_search if your model already has native/built-in web search — use that instead.",
+      "If your model has no native web search, prefer delegating the search to an explore subagent first; call web_search directly only when delegation is unavailable or has failed — it is the Firecrawl fallback.",
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Search query (be specific for better results)." }),
