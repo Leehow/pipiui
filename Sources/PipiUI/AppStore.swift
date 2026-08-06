@@ -82,6 +82,9 @@ enum SessionInitialTranscriptSeed {
 
 /// Global app state: project folders, discovered pi sessions, open RPC sessions.
 final class AppStore: ObservableObject {
+    static func browserResponseRequiresWebPanel(_ response: [String: Any]) -> Bool {
+        response["code"] as? String == "user_handoff_required"
+    }
     static let shared = AppStore()
     private static let projectsKey = "pipiui.projects"
     private static let archivedSessionsKey = "pipiui.archivedSessions"
@@ -972,10 +975,45 @@ final class AppStore: ObservableObject {
                 }
                 return
             }
+            let browserRequestID = request["requestID"].string ?? ""
+            if action == "browser_cancel" {
+                session.webView.cancelRequest(
+                    requestID: browserRequestID,
+                    reason: "browser request cancelled by the pi extension"
+                )
+                respond(["ok": true])
+                return
+            }
+            if !browserRequestID.isEmpty {
+                guard registerCancellation({
+                    Task { @MainActor in
+                        session.webView.cancelRequest(
+                            requestID: browserRequestID,
+                            reason: "browser bridge disconnected or timed out"
+                        )
+                    }
+                }) else {
+                    respond([
+                        "ok": false,
+                        "error": "browser bridge request was already cancelled",
+                        "code": "request_cancelled",
+                        "retryable": true,
+                        "requiresObservation": true,
+                    ])
+                    return
+                }
+            }
             if action == "navigate", session.rightPanel != .web {
                 session.rightPanel = .web
             }
-            session.webView.handle(action: action, request: request, respond: respond)
+            session.webView.handle(action: action, request: request) { response in
+                // Route handoff UI to the exact session that issued this bridge call.
+                // Do not select that session or disturb the user's current transcript.
+                if Self.browserResponseRequiresWebPanel(response), session.rightPanel != .web {
+                    session.rightPanel = .web
+                }
+                respond(response)
+            }
         }
 
         // 调试/自动化钩子：启动时自动打开指定项目并新建会话
