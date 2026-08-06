@@ -2137,7 +2137,14 @@ final class AppStore: ObservableObject {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: executable)
         proc.arguments = ["update", "-na"]
-        proc.environment = ProcessInfo.processInfo.environment
+        // Finder/Dock-launched apps have a minimal PATH (no /usr/local/bin, no
+        // npm-global), but `pi update` shells out to `npm install -g` and the pi
+        // shebang needs `node`. Reuse the pi-session environment so the update
+        // command can actually find npm/node — same as PiProcess.init.
+        proc.environment = PiProcess.mergedProcessEnvironment(
+            parent: ProcessInfo.processInfo.environment,
+            extraEnv: [:]
+        )
 
         let out = Pipe()
         let err = Pipe()
