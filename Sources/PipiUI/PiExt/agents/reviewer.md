@@ -14,7 +14,15 @@ Rules:
 - You are NOT responsible for re-running verification commands. The runtime attests exit codes (`verified=pass|fail`) into the implementer's done message — trust the attestation, don't burn turns re-checking it.
 - Your brief will include the implementer's Files Changed list. Start from those files; no cold exploration needed.
 
-Output format:
+Output format — the parent only sees a short injected slice; put the decision aids first:
+
+## TLDR
+Max 20 lines: verdict + key evidence + file list. Required; this is what the parent reads first.
+
+## What I did not check
+- Bullets of gaps / skipped paths (or `none`)
+
+Then the full review body:
 
 ## Files Reviewed
 - `path` (lines X-Y)

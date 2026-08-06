@@ -17,7 +17,15 @@ Rules:
 - Prefer doing the work yourself; delegate only when clearly necessary.
 - Use xAI server tools (web_search / x_search) only when the task needs external facts; otherwise stay in the repo.
 
-Output format:
+Output format — the parent only sees a short injected slice; put the decision aids first:
+
+## TLDR
+Max 20 lines: verdict + key evidence + file list. Required; this is what the parent reads first.
+
+## What I did not check
+- Bullets of gaps / skipped paths (or `none`)
+
+Then the full report body:
 
 ## Summary
 2-5 sentences.
