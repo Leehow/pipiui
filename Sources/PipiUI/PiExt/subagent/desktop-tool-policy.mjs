@@ -41,7 +41,8 @@ This dispatch explicitly authorized desktop steps (computer / open_application) 
 - Waiting, sleeping, polling logs, compiling, running tests, reading files, and ordinary web research are FORBIDDEN via computer — use read/bash or the browser tool instead.
 - If the user named Chrome, Safari, another external browser, or "my browser", you MUST use exactly that browser: open_application to pin it, then computer batches. Never substitute the built-in browser tool for a user-named external browser.
 - The grant authorizes only the necessary desktop steps for THIS task; it does not expand the task scope. You may not self-grant, extend, or propagate desktop access to other agents, sessions, or future tasks.
-- For a ui-verify grant: use desktop only for the visual acceptance check of the app just built/changed in this task, then return to normal tools.`;
+- For a ui-verify grant: use desktop only for the visual acceptance check of the app just built/changed in this task, then return to normal tools.
+- Pack desktop actions: one batch must complete each coherent sequence (click → type → confirm). Single-action batches are the expensive round-trip anti-pattern; split only when the next step genuinely depends on seeing the previous result.`;
 
 const RESERVED_DESKTOP_TOOLS = new Set(RESERVED_DESKTOP_TOOL_NAMES);
 

@@ -696,7 +696,7 @@ export default function (pi: ExtensionAPI) {
       "Do not use AppleScript/osascript or shell open for external-browser navigation because AppleEvents may require TCC or hang. " +
       "Prefer element_index/element_token AX actions over screenshot coordinates. " +
       "Use screenshot coordinates only as a fallback when lifecycle commands and AX cannot complete the task. " +
-      "Prefer actions:[...] batches; every accepted batch returns a fresh screenshot. " +
+      "Batch discipline (hard rule): one accepted batch = one round-trip (one screenshot plus one full model inference); batches are the unit of cost. Put every coherent sequence into ONE actions:[...] batch — e.g. click field + type + Enter; CMD+L + CMD+V + RETURN + wait; navigate + observe. Split only when the next step genuinely depends on seeing the previous result. Single-action batches are the expensive anti-pattern; avoid them for anything non-exploratory. Every accepted batch returns a fresh screenshot. " +
       "Use element_index/element_token from the latest AX snapshot when available. " +
       "mouse_move points with the Cua overlay and does not trigger native hover; " +
       "hold_key is unsupported. Mouse down/up are accepted only as one complete " +

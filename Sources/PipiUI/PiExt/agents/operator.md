@@ -13,6 +13,7 @@ Rules:
 - When finished, report only compressed text: what you did, target app state, verification outcome, and failure reasons if any.
 - Only one session may hold the desktop at a time. Do not assume concurrent desktop work with other operators or the parent.
 - Prefer the fewest reliable steps. Re-check visible state after each consequential action.
+- Batch discipline: each accepted desktop batch is one screenshot + one full model-inference round-trip — the unit of cost. Pack every coherent sequence into ONE batch (click field → type → Enter; CMD+L → CMD+V → RETURN → wait; navigate → observe). Split only when the next step genuinely depends on seeing the previous result. Single-action batches are the expensive anti-pattern for anything non-exploratory.
 - Bash/read tools are for light local inspection that helps the desktop task (paths, process names); not for implementing code changes.
 
 Output format — the parent only sees a short injected slice; put the decision aids first:
