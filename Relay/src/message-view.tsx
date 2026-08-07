@@ -57,6 +57,11 @@ function isToolOrThinking(message: any): boolean {
   return message?.kind === "tool" || message?.kind === "thinking";
 }
 
+/** Thinking body from DTO; empty for old hosts / still-streaming placeholder. */
+function thinkingBody(message: any): string {
+  return typeof message?.text === "string" ? message.text.trim() : "";
+}
+
 function stepShortLabel(message: any): string {
   if (message?.kind === "thinking") return "思考";
   const name = typeof message?.toolName === "string" && message.toolName
@@ -66,7 +71,10 @@ function stepShortLabel(message: any): string {
 }
 
 function stepExpandedLabel(message: any): string {
-  if (message?.kind === "thinking") return "💭 思考中";
+  if (message?.kind === "thinking") {
+    // Body present → stable chip; empty (old app / streaming) → 思考中.
+    return thinkingBody(message) ? "💭 思考" : "💭 思考中";
+  }
   const name = typeof message?.toolName === "string" && message.toolName
     ? message.toolName
     : "tool";
@@ -74,6 +82,16 @@ function stepExpandedLabel(message: any): string {
     ? message.toolSummary
     : "";
   return summary ? `⚙︎ ${name} · ${summary}` : `⚙︎ ${name}`;
+}
+
+function ThinkingStepBody({ message }: { message: any }) {
+  const body = thinkingBody(message);
+  return (
+    <div className="thinking-step">
+      <div className="thinking-step-label">{stepExpandedLabel(message)}</div>
+      {body ? <div className="thinking-body">{body}</div> : null}
+    </div>
+  );
 }
 
 /** Collapsed chip text: lone row keeps detail; groups use `N 步 · first · …`. */
@@ -223,9 +241,11 @@ export function ToolThinkingGroup({
           {items.map((item, index) => (
             <div
               key={index}
-              className={`tool-entry nested${live && index === items.length - 1 ? " live" : ""}`}
+              className={`tool-entry nested${live && index === items.length - 1 ? " live" : ""}${item?.kind === "thinking" ? " thinking" : ""}`}
             >
-              {stepExpandedLabel(item)}
+              {item?.kind === "thinking"
+                ? <ThinkingStepBody message={item} />
+                : stepExpandedLabel(item)}
             </div>
           ))}
         </div>

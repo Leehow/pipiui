@@ -743,6 +743,32 @@ input {
   background: transparent;
   border-style: dashed;
 }
+.tool-entry.thinking {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.thinking-step {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.thinking-step-label {
+  color: var(--muted);
+}
+/* Mirror local ThinkingBlockView: italic muted body, height-clamped scroll. */
+.thinking-body {
+  margin: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: italic 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  color: var(--muted);
+}
 
 /* Collapsible tool / thinking groups */
 .tool-group {

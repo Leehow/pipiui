@@ -23,10 +23,11 @@ struct RemoteTranscriptMessageDTO: Codable, Equatable, Sendable {
         /// Conversational text (user/assistant/system).
         case text
         /// A tool call record. Only the tool name and the redacted argument
-        /// summary leave the Mac; payloads never do.
+        /// summary leave the Mac; payloads (full args, output/result, status,
+        /// duration) never do.
         case tool
-        /// The mere fact that the assistant is/was thinking. The thinking
-        /// content itself never leaves the Mac.
+        /// Assistant reasoning/thinking text. The thinking body may leave the
+        /// Mac for the authorized browser; tool payloads still never do.
         case thinking
     }
 
@@ -127,10 +128,10 @@ enum RemoteTranscriptNormalizer {
 
             // Assistant entries expose the in-between progress in block order:
             // text stays text, tool calls become name + redacted summary
-            // records, thinking becomes a content-free indicator. Tool
-            // payloads, thinking content, media bytes and local media paths
-            // never leave the Mac. Split rows share the parent ChatItem's
-            // entryId/timestamp.
+            // records, thinking carries its body text (local paths redacted).
+            // Tool payloads (full args/output/status/duration), media bytes and
+            // local media paths never leave the Mac. Split rows share the parent
+            // ChatItem's entryId/timestamp.
             var entries: [RemoteTranscriptMessageDTO] = []
             for block in item.blocks {
                 let entryID = "\(baseID)-\(entries.count)"
@@ -165,12 +166,17 @@ enum RemoteTranscriptNormalizer {
                         timestamp: itemTimestamp,
                         entryId: itemEntryId
                     ))
-                case .thinking:
+                case .thinking(let rawText):
+                    let text = redactKnownLocalPaths(
+                        rawText,
+                        projectPath: projectPath,
+                        homeDirectory: homeDirectory
+                    ).trimmingCharacters(in: .whitespacesAndNewlines)
                     entries.append(RemoteTranscriptMessageDTO(
                         id: entryID,
                         role: role,
                         kind: .thinking,
-                        text: "",
+                        text: text,
                         timestamp: itemTimestamp,
                         entryId: itemEntryId
                     ))

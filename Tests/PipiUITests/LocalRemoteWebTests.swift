@@ -745,10 +745,11 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertEqual(messages[0].entryId, "entry-user-1")
         XCTAssertEqual(messages[0].timestamp, "2024-06-01T12:00:00.000Z")
 
-        // Thinking is exposed only as a content-free indicator.
+        // Thinking text is sent to the authorized browser; local paths redacted.
         XCTAssertEqual(messages[1].kind, .thinking)
-        XCTAssertEqual(messages[1].text, "")
+        XCTAssertEqual(messages[1].text, "secret chain of thought about [local path]")
         XCTAssertNil(messages[1].toolName)
+        XCTAssertNil(messages[1].toolSummary)
         XCTAssertEqual(messages[1].entryId, "entry-assistant-1")
         XCTAssertEqual(messages[1].timestamp, "2024-06-01T12:00:05.123Z")
 
@@ -765,11 +766,11 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertEqual(messages[3].entryId, "entry-assistant-1")
         XCTAssertEqual(messages[3].timestamp, "2024-06-01T12:00:05.123Z")
 
-        // No payload, thinking content, media path, or local path leaks anywhere.
+        // No tool payload, media path, or local path leaks. Thinking body is intentional.
         let encoded = try! JSONEncoder().encode(messages)
         let json = String(data: encoded, encoding: .utf8)!
         XCTAssertFalse(json.contains("/Users/alice"))
-        XCTAssertFalse(json.contains("secret chain of thought"))
+        XCTAssertTrue(json.contains("secret chain of thought about"))
         XCTAssertFalse(json.contains("image.png"))
         XCTAssertFalse(json.contains("tool-internal-id"))
         XCTAssertFalse(json.contains("internal-user-id"))
@@ -801,9 +802,11 @@ final class LocalRemoteWebTests: XCTestCase {
             XCTAssertNil(message.timestamp)
             XCTAssertNil(message.entryId)
         }
+        XCTAssertEqual(messages[1].kind, .thinking)
+        XCTAssertEqual(messages[1].text, "hidden")
         let encoded = try! JSONEncoder().encode(messages)
         let json = String(data: encoded, encoding: .utf8)!
-        XCTAssertFalse(json.contains("hidden"))
+        XCTAssertTrue(json.contains("hidden"))
     }
 
     func testAssistantProgressEntriesKeepBlockOrderWithStableIDs() {
@@ -838,8 +841,13 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertEqual(messages.map(\.id), ["m-0-0", "m-0-1", "m-0-2", "m-0-3", "m-0-4"])
         XCTAssertEqual(messages[1].toolName, "Bash")
         XCTAssertEqual(messages[1].toolSummary, "Bash · ls -la")
+        XCTAssertEqual(messages[1].text, "")
+        XCTAssertEqual(messages[2].kind, .thinking)
+        XCTAssertEqual(messages[2].text, "...")
+        XCTAssertNil(messages[2].toolName)
         XCTAssertEqual(messages[3].toolName, "read")
         XCTAssertEqual(messages[3].toolSummary, "Sources/App.swift")
+        XCTAssertEqual(messages[3].text, "")
         XCTAssertEqual(messages[4].text, "完成")
     }
 
@@ -876,10 +884,14 @@ final class LocalRemoteWebTests: XCTestCase {
         let messages = decoded.snapshot.messages
         XCTAssertEqual(messages.map(\.id), ["m-0", "m-1-0", "m-1-1", "m-1-2"])
         XCTAssertEqual(messages.map(\.kind), [.text, .thinking, .tool, .text])
+        XCTAssertEqual(messages[1].kind, .thinking)
+        XCTAssertEqual(messages[1].text, "hidden reasoning")
+        XCTAssertNil(messages[1].toolName)
         XCTAssertEqual(messages[2].toolName, "Bash")
         XCTAssertEqual(messages[2].toolSummary, "Bash · ls [local path]")
+        XCTAssertEqual(messages[2].text, "")
         let json = String(data: data, encoding: .utf8)!
-        XCTAssertFalse(json.contains("hidden reasoning"))
+        XCTAssertTrue(json.contains("hidden reasoning"))
     }
 
     func testSnapshotCacheReturns304WithoutRenormalizingFinalizedTranscript() throws {
