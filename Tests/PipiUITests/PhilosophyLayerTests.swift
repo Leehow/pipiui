@@ -102,7 +102,7 @@ final class PhilosophyLayerTests: XCTestCase {
         assertContains(t, "MUST NOT present, relay, or ask the user to choose an execution-mode menu")
         assertContains(t, "third round of workers before any code is written")
         // Counting workers rather than rounds made a wide research fan-out illegal, which the
-        // research route and the lead's ≥4 trigger both assume is legal.
+        // research route assumes is legal at any width under the boss.
         assertContains(t, "capped at two rounds, not at two workers")
         assertContains(t, "A wave of parallel `explore`s is one round however wide it is")
         assertContains(t, "more independent questions means more workers at once, never more rounds")
@@ -225,19 +225,31 @@ final class PhilosophyLayerTests: XCTestCase {
         }
     }
 
-    /// An agent that delegates must be marked as a lead rather than a worker; depth alone
-    /// cannot tell them apart, and a plain worker taught to fan out would fight the recursion
-    /// guard. Which agents those are is declared by them (`delegates: true`), not remembered
-    /// by name here — see AgentTraitsTests.
-    func testSubagentExtensionMarksLeadsSeparatelyFromWorkers() throws {
+    /// Philosophy role "lead" is assigned by the runtime ternary when an agent declares
+    /// `delegates: true` — that role name is orthogonal to any agent named lead. The
+    /// mechanism must keep working so a future `delegates: true` agent gets the lead role.
+    /// Built-in agent defs (other than the removed `lead` agent, which a parallel worker
+    /// deletes) must not declare delegates.
+    func testSubagentExtensionAssignsLeadRoleFromDelegatesTrait() throws {
         let bundled = try XCTUnwrap(PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil))
         let source = try String(
             contentsOf: bundled.appendingPathComponent("subagent/index.ts"), encoding: .utf8)
         XCTAssertTrue(source.contains("PIPI_PHILOSOPHY_ROLE: agent.traits.delegates ? \"lead\" : \"worker\""))
 
-        let lead = try String(
-            contentsOf: bundled.appendingPathComponent("agents/lead.md"), encoding: .utf8)
-        XCTAssertTrue(lead.contains("delegates: true"), "the roster's only orchestrator must say so")
+        let agentsDir = bundled.appendingPathComponent("agents")
+        let agentFiles = try FileManager.default.contentsOfDirectory(
+            at: agentsDir, includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "md" }
+        XCTAssertFalse(agentFiles.isEmpty, "expected bundled agent definitions")
+        for url in agentFiles {
+            // `lead.md` is deleted by the parallel agent-catalog worker; ignore it if still present.
+            if url.deletingPathExtension().lastPathComponent == "lead" { continue }
+            let body = try String(contentsOf: url, encoding: .utf8)
+            XCTAssertFalse(
+                body.contains("delegates:"),
+                "\(url.lastPathComponent) must not declare delegates (no built-in orchestrator agent)"
+            )
+        }
     }
 
     /// Dropping the tier table took the only route that named `explore` with it, leaving four
@@ -283,13 +295,18 @@ final class PhilosophyLayerTests: XCTestCase {
             entry["name"].map { ($0, entry["use"] ?? "") }
         })
 
-        for required in ["explore", "plan", "general-purpose", "reviewer", "lead", "secretary"] {
+        for required in ["explore", "plan", "general-purpose", "reviewer", "operator", "secretary"] {
             let use = try XCTUnwrap(byName[required], "\(required) is missing from the roster")
             XCTAssertFalse(use.isEmpty, "\(required) has no `use` text")
         }
         // The two the boss could not infer from the name alone are the whole point.
         XCTAssertTrue(byName["plan"]?.contains("depends on code nobody has read yet") == true)
-        XCTAssertTrue(byName["lead"]?.contains("keep a wide wave out of your context") == true)
+        let operatorUse = try XCTUnwrap(byName["operator"])
+        XCTAssertTrue(
+            operatorUse.lowercased().contains("desktop")
+                || operatorUse.lowercased().contains("computer"),
+            "operator use text must mention desktop/computer use: \(operatorUse)"
+        )
 
         let body = try PhilosophyLayerFixture.normalizedBody("orchestration")
         assertContains(body, "Your roster: {{agents}}")

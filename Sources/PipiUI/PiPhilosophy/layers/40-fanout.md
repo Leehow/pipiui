@@ -1,7 +1,7 @@
 ---
 id: fanout
 name: 瀑布流哲学
-summary: 无依赖的活一次全派出去；扇出宽了先过 lead；异步信号自己收，不回头看原始产物。
+summary: 无依赖的活一次全派出去；宽 wave 用清晰 brief 与分组管；异步信号自己收，不回头看原始产物。
 order: 40
 requires: [orchestration]
 requires-capabilities: [delegate]
@@ -43,17 +43,17 @@ Named anti-patterns: dispatching A and then "B after A is done" when they have n
 dependency or shared code-region conflict; one worker told to cover several independent sub-items; idling on a single worker
 while dispatchable work is queued.
 
-## Fan-out width triggers a firewall, difficulty does not
+## Wide waves stay under the boss
 
-A `lead` exists to protect your context from wide waves, not to handle hard tasks.
+There is no intermediate agent that must own a wide wave. You dispatch any width directly.
 
-- A wave of ≥6 workers (implementation or research) must be funneled through one `lead` who
-  consolidates; you read only the lead's report.
-- Research waves of ≥4 must also use a `lead` — their reports are deliverables and the
-  largest context injections in the system.
-- Implementation waves where every task carries an attested `verify` are exempt below 6.
-- When briefing a lead, embed sub-task briefs as verbatim blocks marked "forward verbatim, do
-  not paraphrase".
+- When a wave is large, protect your context with crisp briefs, non-overlapping partitions, and
+  grouped titles — not by inserting another orchestration layer between you and the workers.
+- Implementation waves where every task carries an attested `verify` scale the same way as
+  research waves: width is fine; what matters is that each worker's report stays out of your
+  context until you pull a verdict.
+- Prefer several focused dispatches over one vague mega-brief when partitions are natural.
+  Group related items in the same call when they share acceptance criteria; split when they do not.
 
 ## Worker state arrives as signals
 

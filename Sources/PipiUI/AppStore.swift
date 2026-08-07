@@ -301,10 +301,11 @@ final class AppStore: ObservableObject {
     /// rapid off→on cannot revive an old callback against the same key.
     /// `.computerUse` is the one hot-swappable exception: the coordinator host
     /// guard reads it live (see `ComputerCoordinator.computerUseEnabledProvider`)
-    /// and spawn-time mounting reads it per session, so no restart is needed —
+    /// and spawn-time assembly exports `PIPIUI_COMPUTER_*` env per session without
+    /// mounting the extension on the main process, so no restart is needed —
     /// turning it off cancels in-flight desktop work and rejects every further
     /// computer/open_application call; turning it on applies to new spawns and
-    /// re-admits already-mounted harnesses.
+    /// re-admits desktop-authorized subagents that receive the tools via grant.
     func setBuiltInFeatureEnabled(
         _ enabled: Bool,
         id: BuiltInFeatureSettings.FeatureID
@@ -319,9 +320,9 @@ final class AppStore: ObservableObject {
         }
         BuiltInFeatureSettings.setEnabled(enabled, id: id)
         if id == .computerUse {
-            // Hot swap: never restart sessions. Existing sessions keep their
-            // mounted harness but the host guard rejects every call until the
-            // master switch is on again.
+            // Hot swap: never restart sessions. Main sessions only export desktop
+            // env (tools go only to desktop-authorized subagents); the host guard
+            // rejects every call until the master switch is on again.
             if !enabled {
                 ComputerCoordinator.shared.cancelAllDesktopOperations()
             }
@@ -330,10 +331,12 @@ final class AppStore: ObservableObject {
         restartAllOpenSessions()
     }
 
-    /// Mount or unmount the desktop harness for every open top-level session.
-    /// Turning it on is the only PipiUI authorization gate for all current and
-    /// future sessions and subagents. macOS TCC, the in-flight mutex, technical
-    /// target validation, cleanup, and emergency stop remain independent.
+    /// Global Computer Use master switch. When on, main sessions export
+    /// `PIPIUI_COMPUTER_*` env so nested dispatch can host-check; computer /
+    /// open_application tools are injected only into desktop-authorized
+    /// subagents (operator), never into the main session tool list. macOS TCC,
+    /// the in-flight mutex, technical target validation, cleanup, and emergency
+    /// stop remain independent.
     ///
     /// This toggle is hot-swappable and never touches open sessions: enabling
     /// clears the emergency latch and re-arms global authorization + input

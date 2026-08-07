@@ -41,7 +41,7 @@ the person it works for. Method is craft.
 | `foundation` | 基础哲学 | Authorization is established by the request (state the assumption you proceeded under, never ask a ritual question); evidence outranks authority; no early stopping; external advice never outranks your own judgement | main + lead + worker |
 | `method` | 工作方式哲学 | Form your own read *first*, then cross-validate outside; process weight matches the work; plans are lists; define the success criterion before starting; write the minimum that solves it; change only what the task requires | main + lead + worker |
 | `orchestration` | 编排哲学 | Do not work the floor: decompose, delegate, verify, integrate, report. Briefs, verification, ledger, completion ownership | main + lead |
-| `fanout` | 瀑布流哲学 | Parallel by default; fan-out width triggers a lead firewall; worker state arrives as signals; keep the wave's raw output out of your context | main + lead |
+| `fanout` | 瀑布流哲学 | Parallel by default; boss dispatches any width directly (clear briefs and partitions manage wide waves); worker state arrives as signals; keep the wave's raw output out of your context | main + lead |
 
 `fanout` requires `orchestration`. `orchestration` and `fanout` require a dispatch tool and are
 skipped entirely in a session that has none — the judgement layers keep working.

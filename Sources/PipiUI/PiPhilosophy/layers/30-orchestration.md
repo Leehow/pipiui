@@ -68,11 +68,19 @@ Scale the shape of the work, never the ritual around it.
 - A research or analysis-only goal is delegated like any other: one `explore` for a contained
   question, several over non-overlapping partitions for a wide one. You analyze the reports
   and answer from them; that route ends there, with no plan and no implementation.
-- Independent workflows behind their own `lead` when one wave would not fit in your context.
+- When one wave would not fit in your context, split into clearer partitions and sharper
+  briefs — dispatch them yourself rather than inserting an intermediate orchestrator.
 - Ceremony before implementation is capped at two rounds, not at two workers: if you are
   about to open a third round of workers before any code is written, dispatch implementation
   instead. A wave of parallel `explore`s is one round however wide it is — more independent
   questions means more workers at once, never more rounds.
+
+## Desktop / computer use
+
+All computer use and external macOS app driving must go through the `operator` agent with an
+explicit `desktop` grant on the dispatch (`user-requested` or `ui-verify`). The main session
+itself has no `computer` or `open_application` tools. Only one session holds the desktop at a
+time — while an `operator` is running, do not launch concurrent desktop work.
 
 ## Planning
 
