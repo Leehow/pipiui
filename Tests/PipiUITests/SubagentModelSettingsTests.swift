@@ -408,12 +408,12 @@ final class SubagentModelSettingsTests: XCTestCase {
 
         let (name, suite) = tempSuite()
         defer { suite.removePersistentDomain(forName: name) }
-        suite.set(["lead": "anthropic/claude-sonnet-4-6", "explore": ""], forKey: SubagentModelSettings.defaultsKey)
+        suite.set(["operator": "anthropic/claude-sonnet-4-6", "explore": ""], forKey: SubagentModelSettings.defaultsKey)
         let url = tmpRoot.appendingPathComponent("subagent-models.json")
         SubagentModelSettings.syncJSONFile(defaults: suite, to: url)
         let data = try Data(contentsOf: url)
         let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
-        XCTAssertEqual(obj["lead"], "anthropic/claude-sonnet-4-6")
+        XCTAssertEqual(obj["operator"], "anthropic/claude-sonnet-4-6")
         XCTAssertEqual(obj["explore"], "")
     }
 
@@ -595,6 +595,7 @@ final class SubagentModelSettingsTests: XCTestCase {
     /// and burned the two-attempts budget before any code was written.
     func testReadOnlyAgentsNeverRunAnUnattestableVerify() throws {
         let source = try subagentExtensionSource()
+        let done = try subagentDoneMessageSource()
 
         // Read-only-ness is declared by the agent now, so a new read-only agent gets this
         // protection by saying so rather than by being remembered in a set here.
@@ -604,18 +605,29 @@ final class SubagentModelSettingsTests: XCTestCase {
         XCTAssertFalse(source.contains("READ_ONLY_AGENTS"), "the name set must be gone")
         XCTAssertTrue(source.contains("currentResult.verifyDropped = true;"))
         XCTAssertTrue(source.contains("verifyDropped?: boolean;"))
-        XCTAssertTrue(source.contains("Verification: not applicable"))
-        XCTAssertTrue(source.contains("do not re-dispatch to make a verify pass"))
+        XCTAssertTrue(done.contains("Verification: not applicable"))
+        XCTAssertTrue(done.contains("do not re-dispatch to make a verify pass"))
         XCTAssertTrue(source.contains("the runtime drops any verify they are given"))
     }
 
-    private func subagentExtensionSource() throws -> String {
-        let root = URL(fileURLWithPath: #filePath)
+    private func subagentExtensionRoot() -> URL {
+        URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent() // PipiUITests
             .deletingLastPathComponent() // Tests
             .deletingLastPathComponent() // repository root
-        return try String(
-            contentsOf: root.appendingPathComponent("Sources/PipiUI/PiExt/subagent/index.ts"),
+            .appendingPathComponent("Sources/PipiUI/PiExt/subagent")
+    }
+
+    private func subagentExtensionSource() throws -> String {
+        try String(
+            contentsOf: subagentExtensionRoot().appendingPathComponent("index.ts"),
+            encoding: .utf8
+        )
+    }
+
+    private func subagentDoneMessageSource() throws -> String {
+        try String(
+            contentsOf: subagentExtensionRoot().appendingPathComponent("done-message.ts"),
             encoding: .utf8
         )
     }
@@ -653,11 +665,11 @@ final class AgentCatalogTests: XCTestCase {
 
     func testPreferredSort() {
         let agents = [
-            AgentDefinition(name: "lead", description: "", tools: [], frontmatterModel: nil, filePath: ""),
+            AgentDefinition(name: "operator", description: "", tools: [], frontmatterModel: nil, filePath: ""),
             AgentDefinition(name: "explore", description: "", tools: [], frontmatterModel: nil, filePath: ""),
             AgentDefinition(name: "zzz", description: "", tools: [], frontmatterModel: nil, filePath: ""),
         ]
-        XCTAssertEqual(AgentCatalog.sort(agents).map(\.name), ["explore", "lead", "zzz"])
+        XCTAssertEqual(AgentCatalog.sort(agents).map(\.name), ["explore", "operator", "zzz"])
     }
 
     func testLoadFromTempDirectory() throws {

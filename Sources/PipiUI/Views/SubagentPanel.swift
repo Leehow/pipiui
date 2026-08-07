@@ -175,7 +175,7 @@ struct SubagentPanel: View {
                 .foregroundStyle(.tertiary)
             Text("还没有 subagent")
                 .font(.callout.weight(.medium))
-            Text("让 pi 用 subagent 工具委派任务后，这里会实时显示 agent 树。\n例如：「用 lead 组织两个 explore 并行调研 …」")
+            Text("让 pi 用 subagent 工具委派任务后，这里会实时显示 agent 树。\n例如：「用 explore 并行调研，或派 operator 执行桌面操作 …」")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -619,14 +619,6 @@ private struct AgentRow: View {
                     Text(agent.name)
                         .font(.callout.weight(.medium))
                         .foregroundStyle(.primary)
-                    if agent.name == "lead" {
-                        Text("组长")
-                            .font(.caption2)
-                            .foregroundStyle(Color.accentColor)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(Capsule().fill(Color.accentColor.opacity(0.15)))
-                    }
                     if agent.name == "secretary" {
                         Text("收尾")
                             .font(.caption2)

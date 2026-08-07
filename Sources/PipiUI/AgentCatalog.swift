@@ -14,7 +14,7 @@ struct AgentDefinition: Identifiable, Equatable, Hashable, Sendable {
 enum AgentCatalog {
     /// Preferred display order for built-in PipiUI agents.
     static let preferredOrder = [
-        "explore", "plan", "general-purpose", "reviewer", "lead", "secretary",
+        "explore", "plan", "general-purpose", "reviewer", "operator", "secretary",
     ]
 
     /// Hardcoded fallbacks so Settings never shows an empty Subagent tab when
@@ -49,9 +49,9 @@ enum AgentCatalog {
             filePath: ""
         ),
         .init(
-            name: "lead",
-            description: "Team-lead orchestrator. Breaks a goal into subtasks, delegates them to other subagents, tracks results, and integrates a final answer.",
-            tools: ["read", "grep", "find", "ls", "subagent"],
+            name: "operator",
+            description: "Computer-use desktop worker. Performs macOS desktop operations and returns a compressed text verdict; does not edit code files.",
+            tools: ["read", "grep", "find", "ls", "bash"],
             frontmatterModel: "xai/grok-4.5:high",
             filePath: ""
         ),

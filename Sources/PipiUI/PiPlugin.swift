@@ -9,7 +9,7 @@ import Foundation
 ///   注意：pi 对同名工具是**硬失败**（重名 → error 诊断 → `process.exit(1)`），
 ///   `-e` 并不会覆盖自动发现的官方 subagent。用户 `~/.pi/agent/extensions` 里存在同名扩展时，
 ///   由 `PiExtensionConflicts` 在 spawn 前检出并提示修复。
-/// - App 自有 agent 目录（lead + 反摆烂版 explore/plan/reviewer/general-purpose），
+/// - App 自有 agent 目录（operator + 反摆烂版 explore/plan/reviewer/general-purpose），
 ///   通过 `PIPIUI_AGENTS_DIR` 让补丁版 subagent 读取，不碰 `~/.pi/agent/agents`。
 /// - 内置浏览器扩展。
 ///

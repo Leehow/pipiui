@@ -1107,7 +1107,6 @@ struct SettingsSheet: View {
         case "plan": return "map"
         case "general-purpose": return "wrench.and.screwdriver"
         case "reviewer": return "eye"
-        case "lead": return "flag.fill"
         case "subagent": return "person.2"
         default: return "person.crop.circle"
         }

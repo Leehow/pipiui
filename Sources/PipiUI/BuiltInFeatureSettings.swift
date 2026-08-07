@@ -49,7 +49,7 @@ enum BuiltInFeatureSettings {
     enum FeatureID: String, CaseIterable, Codable, Sendable {
         /// Working philosophy package (prompt + dispatch protocol).
         case philosophy
-        /// Patched subagent extension + App-owned agents dir (lead / explore / plan …) + secretary.
+        /// Patched subagent extension + App-owned agents dir (explore / plan / operator …) + secretary.
         case subagent
         /// Built-in in-conversation browser extension.
         case browser
@@ -94,7 +94,7 @@ enum BuiltInFeatureSettings {
         .init(id: .subagent,
               section: .extensionTool,
               title: "Subagent / 内置 agents",
-              summary: "补丁版 subagent（生命周期上报、深度护栏、agent 树身份）+ App 自有 agent 目录（lead / explore / plan / reviewer / secretary）。关闭后派工回退到 pi 原生 subagent。"),
+              summary: "补丁版 subagent（生命周期上报、深度护栏、agent 树身份）+ App 自有 agent 目录（explore / plan / operator / reviewer / secretary）。关闭后派工回退到 pi 原生 subagent。"),
         .init(id: .browser,
               section: .extensionTool,
               title: "内置浏览器",

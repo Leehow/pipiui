@@ -65,8 +65,12 @@ final class AgentTraitsTests: XCTestCase {
         XCTAssertNil(try frontmatter("reviewer")["deliverable"])
         XCTAssertEqual(try frontmatter("plan")["block-skill-reads"], "true")
         XCTAssertNil(try frontmatter("explore")["block-skill-reads"])
-        XCTAssertEqual(try frontmatter("lead")["delegates"], "true")
-        for plain in ["general-purpose", "reviewer", "explore", "plan", "secretary"] {
+        XCTAssertNil(try frontmatter("operator")["delegates"], "operator must not get orchestration layers")
+        let operatorTools = (try frontmatter("operator")["tools"] ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        XCTAssertFalse(operatorTools.contains("subagent"), "operator tools must not include subagent")
+        for plain in ["general-purpose", "reviewer", "explore", "plan", "secretary", "operator"] {
             XCTAssertNil(try frontmatter(plain)["delegates"], "\(plain) must not get orchestration layers")
         }
     }
@@ -79,7 +83,7 @@ final class AgentTraitsTests: XCTestCase {
         XCTAssertTrue(s.contains(#"if (agentName === "secretary")"#))
         XCTAssertTrue(s.contains("must not be able to hand itself either by editing its own frontmatter"))
 
-        for name in ["explore", "plan", "reviewer", "lead", "general-purpose"] {
+        for name in ["explore", "plan", "reviewer", "operator", "general-purpose"] {
             XCTAssertFalse(s.contains("agentName === \"\(name)\""),
                            "\(name) must be decided by its traits, not by its name")
         }
@@ -89,10 +93,11 @@ final class AgentTraitsTests: XCTestCase {
 
     /// The done formatter runs far from the definition, so the trait rides on the result.
     func testDoneCapFollowsTheDeclaredDeliverable() throws {
-        let s = try source("Sources/PipiUI/PiExt/subagent/index.ts")
-        XCTAssertTrue(s.contains("reportsInFull?: boolean;"))
-        XCTAssertTrue(s.contains("reportsInFull: agent.traits.reportsInFull,"))
-        XCTAssertTrue(s.contains("return result.reportsInFull ? REPORT_DONE_CAP : VERDICT_DONE_CAP;"))
-        XCTAssertTrue(s.contains("doneCapForResult(result, isError)"))
+        let index = try source("Sources/PipiUI/PiExt/subagent/index.ts")
+        let done = try source("Sources/PipiUI/PiExt/subagent/done-message.ts")
+        XCTAssertTrue(index.contains("reportsInFull?: boolean;"))
+        XCTAssertTrue(index.contains("reportsInFull: agent.traits.reportsInFull,"))
+        XCTAssertTrue(done.contains("return result.reportsInFull ? REPORT_DONE_CAP : VERDICT_DONE_CAP;"))
+        XCTAssertTrue(done.contains("export function doneCapForResult(result: { reportsInFull?: boolean }, isError: boolean): number"))
     }
 }

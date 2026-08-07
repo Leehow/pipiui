@@ -511,7 +511,7 @@ final class SubagentContinuityTests: XCTestCase {
     /// pi parses agent frontmatter as real YAML, so `read-only: true` arrives as a boolean.
     /// The old `Record<string, string>` annotation made the compiler vouch for a shape the
     /// runtime never produced, and `raw?.trim()` then threw for every agent declaring a flag —
-    /// explore, plan, reviewer and lead were all un-dispatchable while general-purpose worked.
+    /// explore, plan, and reviewer were all un-dispatchable while general-purpose worked.
     func testAgentFrontmatterIsCoercedNotAssumedToBeStrings() throws {
         let bundled = try XCTUnwrap(PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil))
         let s = try String(
