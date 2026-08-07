@@ -193,6 +193,77 @@ final class ComputerUsePresentationTests: XCTestCase {
         XCTAssertEqual(hosting.safeAreaInsets.top, titlebarSafeArea)
     }
 
+    func testHighlightPanelDoesNotResurfaceAfterStopDrainsPendingTicks() {
+        // Regression: a 30 Hz timer tick used to hop via `Task { @MainActor in
+        // positionHighlight }` unconditionally. stopHighlight() could then run
+        // (timer killed, panel ordered out) while a tick was already enqueued;
+        // that tick's later orderFrontRegardless() left the cyan frame frozen
+        // until quit. Generation fence + same-turn clear must keep it gone
+        // after any drained pending main-queue work.
+        let coordinator = ComputerCoordinator(computerUseEnabledProvider: { true })
+        let controller = ComputerUseWindowPresentation()
+
+        // On-screen target so targetBounds succeeds and positionHighlight can
+        // actually orderFront the border (off-screen windows are filtered out).
+        let screen = NSScreen.screens.first!.frame
+        let target = NSPanel(
+            contentRect: NSRect(
+                x: screen.midX - 40,
+                y: screen.midY - 40,
+                width: 80,
+                height: 80
+            ),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        target.isOpaque = false
+        target.backgroundColor = .clear
+        target.alphaValue = 0.01
+        target.ignoresMouseEvents = true
+        target.orderFrontRegardless()
+        defer { target.orderOut(nil) }
+
+        let pid = ProcessInfo.processInfo.processIdentifier
+        coordinator.activeApplication = ComputerApplicationIdentity(
+            bundleID: "com.leehow.pipiui.tests",
+            name: "HighlightFenceTest",
+            processID: pid,
+            windowTitle: nil
+        )
+        coordinator.isDesktopOperationActive = true
+        controller.update(for: coordinator)
+
+        let panel = controller.highlightPanel
+        XCTAssertNotNil(panel, "active desktop op must create the highlight panel")
+        // Allow the first placement (+ any immediate runloop work) to run.
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+        XCTAssertTrue(
+            panel?.isVisible == true,
+            "highlight must be showing while the desktop operation is active"
+        )
+
+        // End the operation the same way production clearLeasePresentation does:
+        // flip the flag then update — stopHighlight bumps the generation fence
+        // and orders the panel out.
+        coordinator.isDesktopOperationActive = false
+        controller.update(for: coordinator)
+        XCTAssertFalse(panel?.isVisible ?? true, "stop must hide the highlight immediately")
+
+        // Drain pending main-queue / runloop work long enough for several 30 Hz
+        // ticks and any stale Task hops to execute if they were enqueued.
+        let drainUntil = Date(timeIntervalSinceNow: 0.2)
+        while Date() < drainUntil {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+        }
+
+        XCTAssertFalse(
+            panel?.isVisible ?? true,
+            "drained late ticks must not orderFront the highlight after stop"
+        )
+        XCTAssertEqual(controller.highlightPanel?.isVisible, false)
+    }
+
     func testUnattachedPresentationLeavesStrayVisibleWindowAlone() {
         // A host process (the XCTest target) never attaches a PipiUI main
         // window to the presentation. The old presentMiniWindow() fallback

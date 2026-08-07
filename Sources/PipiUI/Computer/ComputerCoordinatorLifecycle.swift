@@ -204,8 +204,16 @@ extension ComputerCoordinator {
         activeWindowID = nil
         isDesktopOperationActive = false
         remainingActions = nil
-        Task { @MainActor in
-            ComputerUseWindowPresentation.shared.update(for: self)
+        // Tear down mini chrome + highlight in the same turn when the finish/
+        // cancel path is already on the main actor; otherwise hop.
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                ComputerUseWindowPresentation.shared.update(for: self)
+            }
+        } else {
+            Task { @MainActor in
+                ComputerUseWindowPresentation.shared.update(for: self)
+            }
         }
     }
 

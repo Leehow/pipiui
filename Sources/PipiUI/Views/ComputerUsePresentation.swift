@@ -20,9 +20,13 @@ final class ComputerUseWindowPresentation: NSObject {
     private var normalToolbarIsVisible: Bool?
     private var normalButtonHidden: [NSWindow.ButtonType: Bool] = [:]
     private var normalContentView: NSView?
-    private var highlightPanel: NSPanel?
+    /// Readable for tests that assert the border does not resurface after stop.
+    private(set) var highlightPanel: NSPanel?
     private var timer: Timer?
     private var highlightedTarget: (processID: Int32, windowID: UInt32?)?
+    /// Bumped in `stopHighlight` so any already-enqueued tick cannot
+    /// `orderFrontRegardless` the panel after highlighting has ended.
+    private var highlightGeneration: UInt64 = 0
 
     func attach(to window: NSWindow?) {
         // Replacing the main content view intentionally dismantles the
@@ -161,18 +165,27 @@ final class ComputerUseWindowPresentation: NSObject {
         if highlightPanel == nil {
             highlightPanel = Self.makeHighlightPanel()
         }
-        positionHighlight(processID: processID, windowID: windowID)
+        let generation = highlightGeneration
+        positionHighlight(processID: processID, windowID: windowID, generation: generation)
         if timer == nil {
+            // Already @MainActor; call directly so a tick cannot outlive
+            // `stopHighlight` via an enqueued Task hop.
             timer = Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) {
                 [weak self] _ in
-                Task { @MainActor in
-                    self?.positionHighlight(processID: processID, windowID: windowID)
+                guard let self else { return }
+                MainActor.assumeIsolated {
+                    self.positionHighlight(
+                        processID: processID,
+                        windowID: windowID,
+                        generation: generation
+                    )
                 }
             }
         }
     }
 
-    private func positionHighlight(processID: Int32, windowID: UInt32?) {
+    private func positionHighlight(processID: Int32, windowID: UInt32?, generation: UInt64) {
+        guard generation == highlightGeneration, highlightedTarget != nil else { return }
         guard let bounds = Self.targetBounds(processID: processID, windowID: windowID) else {
             highlightPanel?.orderOut(nil)
             return
@@ -182,6 +195,9 @@ final class ComputerUseWindowPresentation: NSObject {
     }
 
     private func stopHighlight() {
+        // Fence first so any tick already past the timer callback entry — or
+        // still queued from a prior async hop — bails before orderFront.
+        highlightGeneration &+= 1
         timer?.invalidate()
         timer = nil
         highlightedTarget = nil
