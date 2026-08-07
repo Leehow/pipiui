@@ -923,6 +923,10 @@ final class ChatSession: ObservableObject, Identifiable {
     private var skipNextAssistantIngest = false
     // 流式更新节流：每个 token delta 都刷 UI 会卡，按 50ms 合并
     private var pendingStreamMessage: J?
+    /// pi 0.84+: assemble partial assistant message from assistantMessageEvent deltas.
+    private let streamAssembler = StreamingMessageAssembler()
+    /// Legacy snapshot path only: last known content char count (avoids O(n) rescan).
+    private var pendingStreamCharCount = 0
     private var streamFlushScheduled = false
     /// Speed-stat instrumentation (ModelSpeedTracker): t0 = `prompt` RPC send in
     /// sendPromptNow (covers direct + queue-drain sends; excludes queue wait and
@@ -1739,6 +1743,12 @@ final class ChatSession: ObservableObject, Identifiable {
         }
     }
 
+    /// Delta-path TTFT marker when the assembler already knows text arrived.
+    private func markStreamFirstTokenArrived() {
+        guard streamFirstTokenAt == nil, streamRequestStartedAt != nil else { return }
+        streamFirstTokenAt = Date()
+    }
+
     // MARK: - Event handling
 
     package func handleEvent(_ e: J) {
@@ -1816,6 +1826,8 @@ final class ChatSession: ObservableObject, Identifiable {
             // 压缩被进程级兜底中断后的残流），settle 必须收掉压缩态。
             clearCompactionState()
             pendingStreamMessage = nil
+            streamAssembler.reset()
+            pendingStreamCharCount = 0
             pendingToolRuns.removeAll(keepingCapacity: true)
             streaming.streamingItem = nil
             agentTurnActive = false
@@ -1851,19 +1863,48 @@ final class ChatSession: ObservableObject, Identifiable {
             }
         case "message_start":
             if e["message"]["role"].string == "assistant" {
-                streaming.streamingItem = Self.convert(message: e["message"], id: "streaming", allowDiskRead: false)
+                // Reset delta assembler for the new turn. Do not convert/publish here —
+                // route through the same 50 ms coalesce bucket as message_update to avoid
+                // a synchronous main-thread spike at stream open.
+                streamAssembler.reset()
+                pendingStreamCharCount = 0
+                pendingStreamMessage = e["message"]
                 markStreamFirstTokenIfNeeded(e["message"])
+                scheduleStreamFlush()
             }
         case "message_update":
-            markStreamFirstTokenIfNeeded(e["message"])
-            pendingStreamMessage = e["message"]
-            scheduleStreamFlush()
+            if Self.hasLegacyStreamSnapshot(e["message"]) {
+                // Old protocol / jcode bridge: cumulative message snapshot.
+                markStreamFirstTokenIfNeeded(e["message"])
+                pendingStreamMessage = e["message"]
+                // O(1) utf8 length for plain-string snapshots (jcode / TypingPerf path).
+                pendingStreamCharCount = Self.fastContentLength(e["message"])
+            } else if e["assistantMessageEvent"].exists {
+                // pi 0.84+: delta-only updates. Apply cheaply; materialize at 50 ms flush.
+                streamAssembler.apply(e["assistantMessageEvent"])
+                if streamAssembler.hasVisibleText {
+                    markStreamFirstTokenArrived()
+                }
+                // Drop any stale empty stub from message_start — assembler is authoritative.
+                pendingStreamMessage = nil
+                pendingStreamCharCount = streamAssembler.characterCount
+            } else if e["message"].exists {
+                // Defensive fallback (empty stub snapshot).
+                markStreamFirstTokenIfNeeded(e["message"])
+                pendingStreamMessage = e["message"]
+                pendingStreamCharCount = Self.fastContentLength(e["message"])
+            }
+            if pendingStreamMessage != nil || streamAssembler.isDirty {
+                scheduleStreamFlush()
+            }
         case "message_end":
             let transcriptBefore = transcript.count
             ingest(message: e["message"])
             DiagnosticsStream.append("INGEST len=\(transcript.count - transcriptBefore)")
             if e["message"]["role"].string == "assistant" {
                 pendingStreamMessage = nil
+                streamAssembler.reset()
+                pendingStreamCharCount = 0
                 streaming.streamingItem = nil
                 recordTurnUsage(for: e["message"])
             }
@@ -2091,8 +2132,22 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     private func materializePendingStreamMessage() {
+        // Delta path: only materialize when new deltas arrived since the last flush.
+        // `isDirty` is the pending bit (mirrors clearing `pendingStreamMessage` below).
+        if streamAssembler.isDirty {
+            DiagnosticsStream.append(
+                "FLUSH materialize hasContent=true source=assembler clen=\(streamAssembler.characterCount)"
+            )
+            streamAssembler.consumePending()
+            pendingStreamMessage = nil
+            // Build ChatItem with tool presentation caches — no full convert re-parse.
+            streaming.streamingItem = streamAssembler.makeStreamingItem(id: "streaming")
+            return
+        }
         let hasContent = pendingStreamMessage != nil
-        DiagnosticsStream.append("FLUSH materialize hasContent=\(hasContent)")
+        DiagnosticsStream.append(
+            "FLUSH materialize hasContent=\(hasContent) clen=\(pendingStreamCharCount)"
+        )
         guard let message = pendingStreamMessage else { return }
         pendingStreamMessage = nil
         streaming.streamingItem = Self.convert(
@@ -2249,6 +2304,41 @@ final class ChatSession: ObservableObject, Identifiable {
     /// - `allowDiskRead: true` (history build, off-main): path-only blocks read the file now.
     /// - `allowDiskRead: false` (live main-thread ingest): path-only blocks become zero-byte
     ///   placeholders carrying their path; the caller backfills bytes off the main thread.
+    /// True when `message_update` still carries a cumulative assistant snapshot
+    /// (pre-0.84 pi / jcode bridge). Empty stubs do not count — those must go through
+    /// the assistantMessageEvent assembler path.
+    package static func hasLegacyStreamSnapshot(_ message: J) -> Bool {
+        guard message.exists else { return false }
+        if let s = message["content"].string { return !s.isEmpty }
+        return !message["content"].array.isEmpty
+    }
+
+    /// Content length without walking every block string when the payload is a plain string
+    /// (legacy / jcode cumulative snapshots). Array form still scans once per call — callers
+    /// on the hot path should prefer the assembler's incremental `characterCount`.
+    package static func contentLength(_ message: J) -> Int {
+        fastContentLength(message)
+    }
+
+    /// Hot-path length for diagnostics / bookkeeping. Prefer UTF-8 byte length so a
+    /// cumulative legacy snapshot does not pay `String.count` (O(n) Character walk)
+    /// on every `message_update`.
+    fileprivate static func fastContentLength(_ message: J) -> Int {
+        let c = message["content"]
+        if let s = c.string { return s.utf8.count }
+        let arr = c.array
+        guard !arr.isEmpty else { return 0 }
+        var total = 0
+        for b in arr {
+            if let t = b["text"].string {
+                total += t.utf8.count
+            } else if let t = b["thinking"].string {
+                total += t.utf8.count
+            }
+        }
+        return total
+    }
+
     package static func convert(message: J, id: String, allowDiskRead: Bool = true) -> ChatItem? {
         guard let role = message["role"].string else { return nil }
         var blocks: [ChatBlock] = []
@@ -2266,7 +2356,26 @@ final class ChatSession: ObservableObject, Identifiable {
                 case "toolCall":
                     let name = block["name"].string ?? "tool"
                     let arguments = block["arguments"]
-                    let summary = ToolCallSummary.summarize(name: name, args: arguments)
+                    // Partial toolcall_delta args may arrive as a JSON string; prefer the
+                    // argsJSON path so truncated JSON cannot trip object-key access.
+                    let summary: (summary: String, payloadChars: Int)
+                    let fileArgs: J
+                    if arguments.dict != nil {
+                        summary = ToolCallSummary.summarize(name: name, args: arguments)
+                        fileArgs = arguments
+                    } else if let raw = arguments.string {
+                        summary = ToolCallSummary.summarize(name: name, argsJSON: raw)
+                        if let data = raw.data(using: .utf8),
+                           let parsed = J.parse(data),
+                           parsed.dict != nil {
+                            fileArgs = parsed
+                        } else {
+                            fileArgs = J([:] as [String: Any])
+                        }
+                    } else {
+                        summary = ToolCallSummary.summarize(name: name, args: arguments)
+                        fileArgs = arguments
+                    }
                     blocks.append(.toolCall(ToolCallBlock(
                         id: block["id"].string ?? UUID().uuidString,
                         name: name,
@@ -2274,7 +2383,7 @@ final class ChatSession: ObservableObject, Identifiable {
                         payloadChars: summary.payloadChars,
                         fileChangePayload: FileChangePayload.parse(
                             toolName: name,
-                            arguments: arguments
+                            arguments: fileArgs
                         )
                     )))
                 case "image":
@@ -3404,6 +3513,8 @@ final class ChatSession: ObservableObject, Identifiable {
         clearCompactionState()
         editingItemId = nil
         pendingStreamMessage = nil
+        streamAssembler.reset()
+        pendingStreamCharCount = 0
         pendingToolRuns.removeAll(keepingCapacity: false)
 
         guard let backend else {
@@ -4168,6 +4279,8 @@ final class ChatSession: ObservableObject, Identifiable {
         // Optimistic: acknowledge the click immediately. Cleared on settle / exit / new turn.
         isStopping = true
         pendingStreamMessage = nil
+        streamAssembler.reset()
+        pendingStreamCharCount = 0
         pendingToolRuns.removeAll(keepingCapacity: true)
         streaming.streamingItem = nil
         queue.noteAbort()

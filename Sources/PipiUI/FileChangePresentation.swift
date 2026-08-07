@@ -24,6 +24,12 @@ enum FileChangePayload: Equatable {
 
         if toolName == "write" {
             guard let content = arguments["content"].string else { return nil }
+            // Fast path: UTF-8 byte length upper-bounds Character count. When the
+            // payload is under the cap in bytes it cannot exceed the char limit,
+            // so skip the O(n) `String.count` walk on every stream flush.
+            if content.utf8.count <= characterLimit {
+                return .write(path: path, content: content, isTruncated: false)
+            }
             let bounded = bounded(content, remaining: characterLimit)
             return .write(path: path, content: bounded.text, isTruncated: bounded.truncated)
         }
