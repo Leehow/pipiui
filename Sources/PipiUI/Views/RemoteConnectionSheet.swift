@@ -12,7 +12,6 @@ struct RemoteConnectionSheet: View {
     /// it must never derive a phone QR payload from the loopback URL.
     let pairingPayload: String?
     @State private var relayPublicURL = ""
-    @State private var relayDisplayName = ""
     @State private var relayMessage = ""
 
     init(pairingPayload: String? = nil) {
@@ -51,10 +50,7 @@ struct RemoteConnectionSheet: View {
             VStack(alignment: .leading, spacing: 18) {
                 header
                 relaySection
-                localTestSection
-#if DEBUG
-                peerViabilitySection
-#endif
+                debugSection
                 pairingSection
                 footer
             }
@@ -67,7 +63,6 @@ struct RemoteConnectionSheet: View {
             // Show the public/page URL; legacy dual-host configs still load here.
             // Saving re-derives wss://…/tunnel/ws from this single domain field.
             relayPublicURL = store.remoteRelayConfiguration.publicURL.absoluteString
-            relayDisplayName = store.remoteRelayConfiguration.displayName
             store.refreshRemoteLegacyMigrationStatus()
         }
     }
@@ -117,9 +112,6 @@ struct RemoteConnectionSheet: View {
                 TextField("https://your-server.example", text: $relayPublicURL)
                     .textFieldStyle(.roundedBorder)
                     .accessibilityLabel("服务器域名")
-                TextField("设备显示名称", text: $relayDisplayName)
-                    .textFieldStyle(.roundedBorder)
-                    .accessibilityLabel("设备显示名称")
 
                 HStack {
                     Button("保存地址") {
@@ -174,6 +166,22 @@ struct RemoteConnectionSheet: View {
             }
             .padding(4)
         }
+    }
+
+    private var debugSection: some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 18) {
+                localTestSection
+#if DEBUG
+                peerViabilitySection
+#endif
+            }
+            .padding(.top, 8)
+        } label: {
+            Label("调试（本机网页测试 · 局域网测试）", systemImage: "wrench.and.screwdriver")
+                .font(.subheadline.weight(.medium))
+        }
+        .accessibilityLabel("调试（本机网页测试 · 局域网测试）")
     }
 
     private var header: some View {
@@ -588,7 +596,7 @@ struct RemoteConnectionSheet: View {
         let ok = store.updateRemoteRelayConfiguration(
             webSocketURL: derived.absoluteString,
             publicURL: publicURL.absoluteString,
-            displayName: relayDisplayName
+            displayName: store.remoteRelayConfiguration.displayName
         )
         if ok {
             relayPublicURL = publicURL.absoluteString
