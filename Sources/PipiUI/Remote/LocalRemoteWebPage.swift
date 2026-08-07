@@ -265,7 +265,7 @@ enum LocalRemoteWebPage {
               connFailures += 1;
               if (connFailures >= 2) setConn("disconnected");
             }
-            window.addEventListener("offline", () => { pollSnapshot(); });
+            window.addEventListener("offline", () => { setConn("disconnected"); });
             window.addEventListener("online", () => { pollSnapshot(); });
             async function api(path, body) {
               let response;
@@ -681,6 +681,7 @@ enum LocalRemoteWebPage {
                 snapshot.processAlive ? `空闲 · 队列 ${snapshot.queuedPromptCount}` : "进程已退出");
             }
             async function pollSnapshot() {
+              if (!navigator.onLine) { setConn("disconnected"); return; }
               if (activeSession) {
                 try {
                   const data = await api("/api/snapshot", {sessionID: activeSession, revision});
