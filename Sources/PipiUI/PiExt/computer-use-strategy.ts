@@ -19,7 +19,12 @@ const DISPLAY_WIDTH = Number.parseInt(process.env.PIPIUI_COMPUTER_WIDTH || "1440
 const DISPLAY_HEIGHT = Number.parseInt(process.env.PIPIUI_COMPUTER_HEIGHT || "900", 10);
 const REQUEST_TIMEOUT_MS = 35_000;
 const CANCEL_TIMEOUT_MS = 1_500;
-const MAX_IN_MEMORY_SCREENSHOTS = 12;
+// Model-context screenshot stream cap (aligns with Anthropic computer-use default N=3).
+// Independent of the Swift UI transcript thumbnail cache
+// (ComputerScreenshotMemoryCache.maxCount) — two separate pipelines.
+const MAX_IN_MEMORY_SCREENSHOTS = 3;
+/** Hard cap on AX elements serialized into model-facing toolResult text. */
+export const MAX_ACCESSIBILITY_ELEMENTS_IN_CONTEXT = 48;
 const SCREENSHOT_MARKER = "PIPIUI_COMPUTER_SCREENSHOT";
 
 const screenshots = new Map<string, {
@@ -489,18 +494,81 @@ export function retainScreenshot(
   return screenshotId;
 }
 
+// Cua structured elements expose role / label / value / frame / element_token
+// (see get_window_state). Prefer clickable/typeable controls; drop pure layout
+// containers and static text so model context stays bounded.
+const INTERACTIVE_AX_ROLES = new Set([
+  "button", "textfield", "textarea", "textbox", "checkbox", "radiobutton",
+  "radio", "popupbutton", "combobox", "menuitem", "menubutton", "link",
+  "slider", "incrementor", "stepper", "tab", "disclosuretriangle",
+  "searchfield", "securetextfield", "switch", "menubaritem", "colorwell",
+  "datefield", "levelindicator", "handle", "row", "cell", "toolbarbutton",
+  "sortbutton", "valueindicator", "splitter", "growarea", "menu",
+]);
+
+const NON_INTERACTIVE_AX_ROLES = new Set([
+  "statictext", "group", "scrollarea", "splitgroup", "toolbar", "window",
+  "image", "heading", "progressindicator", "busyindicator", "layoutarea",
+  "list", "outline", "table", "browser", "webarea", "application",
+  "scrollbar", "ruler", "rulermarker", "relevanceindicator", "sheet",
+  "drawer", "dialog", "layoutitem", "matte", "generic", "unknown",
+]);
+
+function normalizeAxRole(role: unknown): string {
+  if (typeof role !== "string") return "";
+  return role.trim().toLowerCase().replace(/^ax/, "");
+}
+
+function elementHasOperableActions(element: Record<string, unknown>): boolean {
+  const actions = element.actions;
+  if (!Array.isArray(actions)) return false;
+  return actions.some((action) => {
+    const name = String(action ?? "").toLowerCase();
+    return /press|open|showmenu|pick|confirm|increment|decrement|cancel|raise|edit/
+      .test(name);
+  });
+}
+
+export function elementIsInteractive(element: unknown): boolean {
+  if (!isRecord(element)) return false;
+  if (elementHasOperableActions(element)) return true;
+  const role = normalizeAxRole(element.role);
+  if (role && INTERACTIVE_AX_ROLES.has(role)) return true;
+  if (role && NON_INTERACTIVE_AX_ROLES.has(role)) return false;
+  // Unknown / missing role: Cua only indexes actionable rows, so keep tokenized
+  // entries rather than blanking the snapshot.
+  return typeof element.element_token === "string"
+    && element.element_token.length > 0;
+}
+
 export function compactAccessibility(value: unknown): Record<string, unknown> | undefined {
   if (!isRecord(value)) return undefined;
   const elements = Array.isArray(value.elements) ? value.elements : [];
-  const compact: Record<string, unknown> = { elements };
-  for (const key of ["truncated", "focused_element_index"]) {
-    const field = value[key];
-    if (
-      typeof field === "boolean"
-      || typeof field === "number"
-      || typeof field === "string"
-    ) compact[key] = field;
-  }
+  const elementCount = elements.length;
+  const interactive = elements.filter(elementIsInteractive);
+  // Prefer interactive controls; if none matched, fall back to the raw list so
+  // the model is not left without any AX handles.
+  const preferred = interactive.length > 0 ? interactive : elements;
+  const limited = preferred.slice(0, MAX_ACCESSIBILITY_ELEMENTS_IN_CONTEXT);
+  const wasTrimmed = limited.length < elementCount;
+  const compact: Record<string, unknown> = {
+    elements: limited,
+    // Always the pre-trim total so the model knows more elements exist.
+    elementCount,
+  };
+  const sourceTruncated = value.truncated;
+  const truncated = sourceTruncated === true || wasTrimmed
+    ? true
+    : typeof sourceTruncated === "boolean"
+      ? sourceTruncated
+      : undefined;
+  if (truncated !== undefined) compact.truncated = truncated;
+  const focused = value.focused_element_index;
+  if (
+    typeof focused === "boolean"
+    || typeof focused === "number"
+    || typeof focused === "string"
+  ) compact.focused_element_index = focused;
   return compact;
 }
 
@@ -520,8 +588,13 @@ export function compactToolDetails(
     const elements = Array.isArray(accessibility.elements)
       ? accessibility.elements
       : [];
+    const elementCount =
+      typeof accessibility.elementCount === "number"
+      && Number.isFinite(accessibility.elementCount)
+        ? accessibility.elementCount
+        : elements.length;
     details.accessibility = {
-      elementCount: elements.length,
+      elementCount,
       ...(accessibility.truncated !== undefined
         ? { truncated: accessibility.truncated }
         : {}),
@@ -697,6 +770,7 @@ export default function (pi: ExtensionAPI) {
       "Prefer element_index/element_token AX actions over screenshot coordinates. " +
       "Use screenshot coordinates only as a fallback when lifecycle commands and AX cannot complete the task. " +
       "Batch discipline (hard rule): one accepted batch = one round-trip (one screenshot plus one full model inference); batches are the unit of cost. Put every coherent sequence into ONE actions:[...] batch — e.g. click field + type + Enter; CMD+L + CMD+V + RETURN + wait; navigate + observe. Split only when the next step genuinely depends on seeing the previous result. Single-action batches are the expensive anti-pattern; avoid them for anything non-exploratory. Every accepted batch returns a fresh screenshot. " +
+      "Failure discipline: when a coordinate is reported out-of-bounds or an element_token is stale, that input is permanent-fail until you re-observe. Do not retry the same coordinate or token. Re-capture a fresh screenshot / AX snapshot first, recompute, then act. " +
       "Use element_index/element_token from the latest AX snapshot when available. " +
       "mouse_move points with the Cua overlay and does not trigger native hover; " +
       "hold_key is unsupported. Mouse down/up are accepted only as one complete " +
