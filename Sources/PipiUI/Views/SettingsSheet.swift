@@ -490,6 +490,42 @@ struct SettingsSheet: View {
                 builtInGroup(section)
             }
 
+            VStack(alignment: .leading, spacing: 8) {
+                Text("桌面控制与远程连接")
+                    .font(.subheadline.weight(.semibold))
+                Toggle(isOn: Binding(
+                    get: { store.computerUseEnabled },
+                    set: { store.setComputerUseEnabled($0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Computer Use（桌面控制）")
+                            .font(.callout)
+                        Text("桌面控制开关；详细设置见左下角 Computer Use 图标")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.checkbox)
+                .padding(.vertical, 2)
+                Toggle(isOn: Binding(
+                    get: { store.remoteRelayConfiguration.enabled },
+                    set: { store.setRemoteRelayEnabled($0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("远程链接（服务器隧道）")
+                            .font(.callout)
+                        Text("通过服务器隧道从手机/浏览器远程连接 Mac；详细设置见左下角二维码图标")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.checkbox)
+                .padding(.vertical, 2)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+
             if BuiltInFeatureSettings.EnabledSet(disabled: builtInDisabled).allDisabled {
                 Label("全部已关闭：新建/重启会话将不挂载任何 PipiUI 自有能力。", systemImage: "moon.zzz")
                     .font(.caption)
