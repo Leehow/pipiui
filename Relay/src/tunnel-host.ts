@@ -120,6 +120,20 @@ function leave() {
   }
 }
 
+// Drop the host socket without ending the room. Used on app quit / client
+// restart so the same roomID+secret can re-hello within the server TTL.
+function disconnect() {
+  stopped = true;
+  config = null;
+  clearRetry();
+  const current = socket;
+  socket = null;
+  pending.clear();
+  if (current && current.readyState < WebSocket.CLOSING) {
+    current.close(1000, "host disconnected");
+  }
+}
+
 function start(incoming: StartConfig) {
   stopped = false;
   config = incoming;
@@ -157,5 +171,5 @@ function resolveRequest(
 }
 
 Object.assign(window, {
-  pipiTunnelHost: Object.freeze({ start, leave, resolveRequest }),
+  pipiTunnelHost: Object.freeze({ start, leave, disconnect, resolveRequest }),
 });
