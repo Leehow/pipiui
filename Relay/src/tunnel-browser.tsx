@@ -72,23 +72,6 @@ function statusText(status: TunnelStatus): { text: string; tone: string } {
 
 const THEME_KEY = "pipiui-remote-theme";
 
-function SunIcon() {
-  return (
-    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-      <circle cx="12" cy="12" r="4" />
-      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
-    </svg>
-  );
-}
-
-function MoonIcon() {
-  return (
-    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
-    </svg>
-  );
-}
-
 function SendIcon() {
   return (
     <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
@@ -113,10 +96,18 @@ function ChevronDownIcon() {
   );
 }
 
-function ModelChevronIcon() {
+function BackIcon() {
   return (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M6 9l6 6 6-6" />
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M15 18l-6-6 6-6" />
+    </svg>
+  );
+}
+
+function MenuIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+      <path d="M4 7h16M4 12h16M4 17h16" />
     </svg>
   );
 }
@@ -145,6 +136,7 @@ function App() {
   const [models, setModels] = useState<any>(null);
   const [currentModelName, setCurrentModelName] = useState<string | null>(null);
   const [activePanel, setActivePanel] = useState<PanelKind | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
   const [text, setText] = useState("");
   const [panelData, setPanelData] = useState<any>(null);
@@ -410,6 +402,7 @@ function App() {
     setPanelDetail(null);
     setPanelDetailLoading(false);
     setSessionLoading(false);
+    setMenuOpen(false);
     setModelOpen(false);
     setQueueOverride(null);
     setQueueBusy(false);
@@ -536,6 +529,21 @@ function App() {
     });
   };
 
+  // Close the header menu first, then run the chosen action.
+  const menuAction = (action: () => void) => {
+    setMenuOpen(false);
+    action();
+  };
+
+  const openPanelFromMenu = (kind: PanelKind) => {
+    setMenuOpen(false);
+    setPanelDetail(null);
+    setPanelDetailLoading(false);
+    setPanelData(null);
+    setActivePanel(kind);
+    void refreshPanel(kind);
+  };
+
   const setMainModel = async (modelId: string) => {
     const as = logicRef.current.activeSession;
     if (!as || !modelId) return;
@@ -557,19 +565,6 @@ function App() {
   };
 
   // ---- remote panels ----
-  const togglePanel = (kind: PanelKind) => {
-    setActivePanel((prev) => {
-      const next = prev === kind ? null : kind;
-      setPanelDetail(null);
-      setPanelDetailLoading(false);
-      if (next) {
-        setPanelData(null);
-        void refreshPanel(next);
-      }
-      return next;
-    });
-  };
-
   const openAgentDetail = async (agent: any) => {
     const as = logicRef.current.activeSession;
     if (!as) return;
@@ -632,34 +627,86 @@ function App() {
     <div className="app">
       <header className="app-header">
         {view === "detail" ? (
-          <Button size="small" onClick={showList}>‹ 返回</Button>
-        ) : null}
-        <div className="header-title">{view === "detail" ? sessionTitle : "PipiUI 远程会话"}</div>
-        {view === "detail" ? (
           <button
             type="button"
-            className="model-pill"
-            disabled={!activeSession || status.kind !== "connected"}
-            onClick={toggleModel}
-            aria-label={currentModelName ? `当前模型 ${currentModelName}` : "选择模型"}
+            className="header-icon-btn"
+            aria-label="返回会话列表"
+            onClick={showList}
           >
-            <span className="model-pill-label">{currentModelName || "模型"}</span>
-            <ModelChevronIcon />
+            <BackIcon />
           </button>
-        ) : null}
+        ) : (
+          <span className="header-icon-spacer" aria-hidden="true" />
+        )}
+        <div className="header-title">{view === "detail" ? sessionTitle : "PipiUI 远程会话"}</div>
         <button
           type="button"
-          className="theme-toggle"
-          aria-label={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
-          onClick={toggleTheme}
+          className="header-icon-btn"
+          aria-label="菜单"
+          aria-expanded={menuOpen}
+          onClick={() => setMenuOpen((open) => !open)}
         >
-          {theme === "dark" ? <SunIcon /> : <MoonIcon />}
+          <MenuIcon />
+          <span className={`menu-status-dot ${pill.tone}`} aria-hidden="true" />
         </button>
-        <div className={`conn-pill ${pill.tone}`} role="status">
-          <span className="conn-dot" />
-          <span>{pill.text}</span>
-        </div>
       </header>
+
+      {menuOpen ? (
+        <div className="menu-backdrop" onClick={() => setMenuOpen(false)}>
+          <div className="menu-card" role="menu" onClick={(event) => event.stopPropagation()}>
+            {view === "detail" ? (
+              <>
+                <button
+                  type="button"
+                  className="menu-item"
+                  role="menuitem"
+                  onClick={() => menuAction(toggleModel)}
+                >
+                  <span className="menu-item-label">模型</span>
+                  <span className="menu-item-value">{currentModelName || "未设置"}</span>
+                </button>
+                <button
+                  type="button"
+                  className="menu-item"
+                  role="menuitem"
+                  onClick={() => menuAction(() => openPanelFromMenu("agents"))}
+                >
+                  <span className="menu-item-label">Subagents</span>
+                </button>
+                <button
+                  type="button"
+                  className="menu-item"
+                  role="menuitem"
+                  onClick={() => menuAction(() => openPanelFromMenu("web"))}
+                >
+                  <span className="menu-item-label">Web</span>
+                </button>
+                <button
+                  type="button"
+                  className="menu-item"
+                  role="menuitem"
+                  onClick={() => menuAction(() => openPanelFromMenu("documents"))}
+                >
+                  <span className="menu-item-label">文档</span>
+                </button>
+              </>
+            ) : null}
+            <button
+              type="button"
+              className="menu-item"
+              role="menuitem"
+              onClick={() => menuAction(toggleTheme)}
+            >
+              <span className="menu-item-label">外观模式</span>
+              <span className="menu-item-value">{theme === "dark" ? "深色" : "浅色"}</span>
+            </button>
+            <div className={`conn-pill menu-conn ${pill.tone}`} role="status">
+              <span className="conn-dot" />
+              <span>{pill.text}</span>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {view === "list" ? (
         status.kind !== "connected" ? (
@@ -770,18 +817,6 @@ function App() {
         )
       ) : (
         <div className="chat-view">
-          <div className="chat-tabs">
-            <Button size="small" onClick={() => togglePanel("agents")} disabled={!activeSession}>
-              Subagents
-            </Button>
-            <Button size="small" onClick={() => togglePanel("web")} disabled={!activeSession}>
-              Web
-            </Button>
-            <Button size="small" onClick={() => togglePanel("documents")} disabled={!activeSession}>
-              文档
-            </Button>
-          </div>
-
           <div className="transcript-wrap">
             <div
               className="transcript"

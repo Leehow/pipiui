@@ -78,6 +78,13 @@ body,
   height: 100%;
 }
 
+/* Long unbroken tokens (URLs / paths / code) must never scroll the page
+   horizontally; inner containers provide their own scrolling instead. */
+html,
+body {
+  overflow-x: hidden;
+}
+
 body {
   margin: 0;
   background: var(--bg);
@@ -120,10 +127,11 @@ input {
 
 .app-header {
   flex: none;
-  display: flex;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) 40px;
   align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
+  gap: 8px;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   background: var(--header-bg);
   backdrop-filter: blur(12px);
@@ -132,13 +140,124 @@ input {
 }
 
 .app-header .header-title {
-  flex: 1;
   min-width: 0;
   font-size: 16px;
   font-weight: 650;
+  text-align: center;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.header-icon-btn {
+  position: relative;
+  width: 40px;
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.header-icon-btn:active {
+  background: var(--surface-2);
+}
+.header-icon-btn svg {
+  display: block;
+}
+
+.header-icon-spacer {
+  width: 40px;
+  height: 40px;
+}
+
+/* Connection dot on the hamburger button mirrors the conn-pill tone. */
+.menu-status-dot {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.menu-status-dot.connected {
+  background: var(--ok);
+}
+.menu-status-dot.bad,
+.menu-status-dot.error {
+  background: var(--warn);
+}
+
+/* ---- Header dropdown menu ---- */
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: rgba(0, 0, 0, 0.22);
+}
+.menu-card {
+  position: absolute;
+  top: 58px;
+  right: 10px;
+  min-width: 220px;
+  max-width: min(86vw, 300px);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.3);
+}
+:root[data-theme="light"] .menu-card {
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.12);
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.menu-item:active {
+  background: var(--surface-2);
+}
+.menu-item-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.menu-item-value {
+  flex: none;
+  max-width: 46%;
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.menu-conn {
+  align-self: stretch;
+  justify-content: center;
+  max-width: none;
+  margin: 6px 6px 4px;
 }
 
 .conn-pill {
@@ -268,63 +387,16 @@ input {
 .chat-view {
   flex: 1;
   min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-}
-
-.chat-tabs {
-  flex: none;
-  display: flex;
-  gap: 8px;
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--border);
-  overflow-x: auto;
-}
-.chat-tabs .adm-button {
-  flex: none;
-}
-
-/* Header model capsule (detail view) */
-.model-pill {
-  flex: none;
-  max-width: min(38vw, 160px);
-  min-height: 32px;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 10px 4px 12px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
-}
-.model-pill:active:not(:disabled) {
-  background: var(--surface-2);
-}
-.model-pill:disabled {
-  opacity: 0.55;
-  cursor: default;
-}
-.model-pill-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--accent-text);
-}
-.model-pill svg {
-  flex: none;
-  color: var(--muted);
 }
 
 .transcript-wrap {
   position: relative;
   flex: 1;
   min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
 }
@@ -332,7 +404,9 @@ input {
 .transcript {
   flex: 1;
   min-height: 0;
+  min-width: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 12px 14px 18px;
   display: flex;
   flex-direction: column;
@@ -371,6 +445,7 @@ input {
 
 .message {
   max-width: 82%;
+  min-width: 0;
   padding: 10px 14px;
   border-radius: 16px;
   white-space: pre-wrap;
@@ -408,6 +483,7 @@ input {
 
 /* Assistant markdown (react-markdown + remark-gfm). No inline styles. */
 .message.assistant .markdown-body {
+  min-width: 0;
   white-space: normal;
   font-size: 15px;
   line-height: 1.55;
@@ -483,6 +559,7 @@ input {
   border-radius: 8px;
   background: var(--surface);
   border: 1px solid var(--border);
+  max-width: 100%;
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
 }
@@ -536,12 +613,14 @@ input {
 .tool-entry {
   align-self: flex-start;
   max-width: 90%;
+  min-width: 0;
   padding: 6px 12px;
   border-radius: 10px;
   background: var(--surface);
   border: 1px solid var(--border);
   font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
 .tool-entry.live {
   border-color: var(--accent);
@@ -710,6 +789,7 @@ input {
 .panel-body {
   background: var(--bg);
   height: 100%;
+  min-width: 0;
   display: flex;
   flex-direction: column;
 }
@@ -730,6 +810,7 @@ input {
 .panel-scroll {
   flex: 1;
   min-height: 0;
+  min-width: 0;
   overflow-y: auto;
   padding: 12px 16px 24px;
 }
@@ -737,6 +818,7 @@ input {
   font-size: 12px;
   color: var(--muted);
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   margin: 0 0 10px;
 }
 .panel-detail,
@@ -765,6 +847,7 @@ input {
 .web-status {
   color: var(--muted);
   font-size: 12px;
+  overflow-wrap: anywhere;
 }
 .web-frame {
   flex: 1;
@@ -821,29 +904,6 @@ input {
 }
 .adm-popup-body {
   background: var(--bg);
-}
-
-/* ---- Theme toggle ---- */
-.theme-toggle {
-  flex: none;
-  min-width: 40px;
-  height: 40px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
-}
-.theme-toggle:active {
-  background: var(--surface-2);
-}
-.theme-toggle svg {
-  display: block;
 }
 
 /* ---- Loading / waiting states ---- */
