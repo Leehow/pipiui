@@ -18,6 +18,8 @@ export const COMMANDS = new Set([
   "snapshot",
   "prompt.send",
   "generation.stop",
+  "queue.restore",
+  "queue.cutIn",
   "models.get",
   "model.set",
   "subagentModel.set",
@@ -28,7 +30,8 @@ export const COMMANDS = new Set([
 ]);
 
 export type Command = "index" | "session.create" | "session.open" | "snapshot"
-  | "prompt.send" | "generation.stop" | "models.get" | "model.set"
+  | "prompt.send" | "generation.stop" | "queue.restore" | "queue.cutIn"
+  | "models.get" | "model.set"
   | "subagentModel.set" | "agents.list" | "agents.detail" | "panel.state"
   | "document.get";
 

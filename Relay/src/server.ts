@@ -676,6 +676,8 @@ export function createRelayServer(options: RelayOptions) {
       "POST /api/snapshot": "snapshot",
       "POST /api/send": "prompt.send",
       "POST /api/stop": "generation.stop",
+      "POST /api/queue/restore": "queue.restore",
+      "POST /api/queue/cut-in": "queue.cutIn",
       "POST /api/models": "models.get",
       "POST /api/model": "model.set",
       "POST /api/subagent-model": "subagentModel.set",

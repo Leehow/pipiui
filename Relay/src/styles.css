@@ -547,6 +547,86 @@ input {
   border-color: var(--accent);
 }
 
+/* ---- Message queue strip (between transcript and composer) ---- */
+.queue-strip {
+  flex: none;
+  max-height: min(28vh, 180px);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.queue-strip-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 0 2px;
+}
+
+.queue-strip-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--accent-soft);
+  min-height: 40px;
+}
+
+.queue-item-index {
+  flex: none;
+  width: 18px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--accent-text);
+}
+
+.queue-item-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 1.35;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-item-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.queue-item-actions .adm-button {
+  min-height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+  --text-color: var(--accent-text);
+}
+
 .composer {
   flex: none;
   display: grid;
@@ -576,6 +656,13 @@ input {
 .composer-input-wrap {
   flex: 1;
   min-width: 0;
+}
+
+.composer-actions {
+  flex: none;
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
 }
 
 .composer .adm-text-area {
