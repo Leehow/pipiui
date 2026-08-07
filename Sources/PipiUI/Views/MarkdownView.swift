@@ -7,6 +7,9 @@ import SwiftUI
 struct MarkdownTextView: View {
     let text: String
     var lineLimit: Int? = nil
+    /// Streaming rows may defer expensive inline markdown on the unstable tail.
+    /// Settled messages leave this `false` so rendering stays bit-identical.
+    var isStreaming: Bool = false
     var onFlash: ((String) -> Void)? = nil
     @Environment(\.chatTypography) private var chatTypography
     /// 文档路径 ⌘+点击 → 右侧文档面板（ChatDetailView 注入；nil 时回退访达显示）。
@@ -20,6 +23,7 @@ struct MarkdownTextView: View {
             markdownText: text,
             typography: chatTypography,
             maximumNumberOfLines: lineLimit,
+            isStreaming: isStreaming,
             onOpenDocument: openDocument,
             onFlash: onFlash
         )
@@ -143,7 +147,7 @@ struct MarkdownTextView: View {
         return blocks
     }
 
-    private static func headingLevel(_ line: String) -> (Int, String)? {
+    fileprivate static func headingLevel(_ line: String) -> (Int, String)? {
         guard line.hasPrefix("#") else { return nil }
         let hashes = line.prefix(while: { $0 == "#" })
         guard hashes.count <= 6 else { return nil }
@@ -152,14 +156,14 @@ struct MarkdownTextView: View {
         return (hashes.count, rest.trimmingCharacters(in: .whitespaces))
     }
 
-    private static func isTableSeparator(_ line: String) -> Bool {
+    fileprivate static func isTableSeparator(_ line: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         guard trimmed.hasPrefix("|") || trimmed.contains("-") else { return false }
         let stripped = trimmed.filter { !" |:-".contains($0) }
         return stripped.isEmpty && trimmed.contains("-")
     }
 
-    private static func tableCells(_ line: String) -> [String] {
+    fileprivate static func tableCells(_ line: String) -> [String] {
         var cells = line.split(separator: "|", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespaces) }
         if cells.first?.isEmpty == true { cells.removeFirst() }
@@ -167,7 +171,7 @@ struct MarkdownTextView: View {
         return cells
     }
 
-    private static func listItem(_ line: String) -> ListItem? {
+    fileprivate static func listItem(_ line: String) -> ListItem? {
         let leading = line.prefix(while: { $0 == " " }).count
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         for bullet in ["- ", "* ", "+ "] where trimmed.hasPrefix(bullet) {
@@ -187,7 +191,7 @@ struct MarkdownTextView: View {
     }
 
     /// 含框线字符或多行大量空格对齐的段落按等宽渲染，避免简图错位。
-    private static func looksLikeAsciiArt(_ text: String) -> Bool {
+    fileprivate static func looksLikeAsciiArt(_ text: String) -> Bool {
         let artChars = CharacterSet(charactersIn: "│┌┐└┘├┤┬┴┼─═║╔╗╚╝▼▲◄►")
         if text.unicodeScalars.contains(where: { artChars.contains($0) }) { return true }
         let lines = text.components(separatedBy: "\n")
@@ -281,25 +285,28 @@ enum MarkdownSelectionContent {
 
     static func attributedString(
         for blocks: [MarkdownTextView.Block],
-        typography: ChatTypography = .make(fontSize: ChatTypography.defaultFontSize)
+        typography: ChatTypography = .make(fontSize: ChatTypography.defaultFontSize),
+        inlineHighlight: Bool = true
     ) -> NSAttributedString {
         let result = NSMutableAttributedString()
-        append(blocks, to: result, typography: typography)
+        append(blocks, to: result, typography: typography, inlineHighlight: inlineHighlight)
         return result
     }
 
     static func append(
         _ blocks: ArraySlice<MarkdownTextView.Block>,
         to result: NSMutableAttributedString,
-        typography: ChatTypography
+        typography: ChatTypography,
+        inlineHighlight: Bool = true
     ) {
-        append(Array(blocks), to: result, typography: typography)
+        append(Array(blocks), to: result, typography: typography, inlineHighlight: inlineHighlight)
     }
 
     static func append(
         _ blocks: [MarkdownTextView.Block],
         to result: NSMutableAttributedString,
-        typography: ChatTypography
+        typography: ChatTypography,
+        inlineHighlight: Bool = true
     ) {
         let bodyStyle = paragraphStyle(for: typography, role: .body)
         let listStyle = paragraphStyle(for: typography, role: .list)
@@ -313,14 +320,14 @@ enum MarkdownSelectionContent {
             switch block {
             case .paragraph(let paragraph):
                 result.append(rendered(
-                    MarkdownTextView.inlineWithPaths(paragraph),
+                    proseAttributed(paragraph, inlineHighlight: inlineHighlight),
                     font: typography.bodyNSFont,
                     codeFont: typography.codeNSFont,
                     style: bodyStyle
                 ))
             case .heading(let level, let title):
                 result.append(rendered(
-                    MarkdownTextView.inlineWithPaths(title),
+                    proseAttributed(title, inlineHighlight: inlineHighlight),
                     font: typography.headingNSFont(level: level),
                     codeFont: typography.codeNSFont,
                     style: headingStyle
@@ -335,14 +342,14 @@ enum MarkdownSelectionContent {
                 ))
             case .list(let items):
                 result.append(rendered(
-                    MarkdownTextView.listAttributed(items),
+                    listAttributed(items, inlineHighlight: inlineHighlight),
                     font: typography.bodyNSFont,
                     codeFont: typography.codeNSFont,
                     style: listStyle
                 ))
             case .quote(let quote):
                 result.append(rendered(
-                    MarkdownTextView.inlineWithPaths(quote),
+                    proseAttributed(quote, inlineHighlight: inlineHighlight),
                     font: typography.bodyNSFont,
                     codeFont: typography.codeNSFont,
                     style: bodyStyle,
@@ -350,7 +357,7 @@ enum MarkdownSelectionContent {
                 ))
             case .table(let header, let rows):
                 result.append(rendered(
-                    tableAttributed(header: header, rows: rows),
+                    tableAttributed(header: header, rows: rows, inlineHighlight: inlineHighlight),
                     font: typography.bodyNSFont,
                     codeFont: typography.codeNSFont,
                     style: bodyStyle
@@ -365,6 +372,32 @@ enum MarkdownSelectionContent {
                 ))
             }
         }
+    }
+
+    /// Streaming tail path: skip `AttributedString(markdown:)` until the block settles.
+    private static func proseAttributed(_ string: String, inlineHighlight: Bool) -> AttributedString {
+        inlineHighlight ? MarkdownTextView.inlineWithPaths(string) : AttributedString(string)
+    }
+
+    private static func listAttributed(
+        _ items: [MarkdownTextView.ListItem],
+        inlineHighlight: Bool
+    ) -> AttributedString {
+        guard inlineHighlight else {
+            var result = AttributedString()
+            for (index, item) in items.enumerated() {
+                if index > 0 { result.append(AttributedString("\n")) }
+                if item.indent > 0 {
+                    result.append(AttributedString(String(repeating: "  ", count: item.indent)))
+                }
+                var marker = AttributedString(item.marker + " ")
+                marker.foregroundColor = Color.secondary
+                result.append(marker)
+                result.append(AttributedString(item.text))
+            }
+            return result
+        }
+        return MarkdownTextView.listAttributed(items)
     }
 
     /// NSTextView ignores SwiftUI `.lineSpacing`; spacing must live on `NSParagraphStyle`.
@@ -406,14 +439,18 @@ enum MarkdownSelectionContent {
     }
 
     /// Tab/newline join of table cells, preserving per-cell inline markdown (bold/code/…).
-    private static func tableAttributed(header: [String], rows: [[String]]) -> AttributedString {
+    private static func tableAttributed(
+        header: [String],
+        rows: [[String]],
+        inlineHighlight: Bool = true
+    ) -> AttributedString {
         var result = AttributedString()
         let allRows = [header] + rows
         for (rowIndex, row) in allRows.enumerated() {
             if rowIndex > 0 { result.append(AttributedString("\n")) }
             for (cellIndex, cell) in row.enumerated() {
                 if cellIndex > 0 { result.append(AttributedString("\t")) }
-                result.append(MarkdownTextView.inlineWithPaths(cell))
+                result.append(proseAttributed(cell, inlineHighlight: inlineHighlight))
             }
         }
         return result
@@ -514,8 +551,276 @@ enum MarkdownSelectionContent {
     }
 }
 
+/// Forward-only block parser for the streaming tail.
+///
+/// Complete lines (ending in `\n`) commit into parser state. The trailing partial line is
+/// held and only applied during `snapshotBlocks()` (EOF flush), matching `MarkdownTextView.parse`
+/// which always processes the final component. Append cost is O(new complete lines).
+private final class IncrementalMarkdownBlockParser {
+    private var blocks: [MarkdownTextView.Block] = []
+    private var paragraph: [String] = []
+    private var listItems: [MarkdownTextView.ListItem] = []
+    private var quoteLines: [String] = []
+    private var codeLines: [String]?
+    /// Incomplete trailing line (no terminating newline yet).
+    private var partialLine = ""
+    /// `components(separatedBy: "\n")` yields a final `""` when the source ends with `\n`.
+    /// Track that without committing it until `snapshotBlocks()`, so a later append can still
+    /// continue the line after the trailing newline of an intermediate chunk.
+    private var committedEndsWithNewline = false
+    /// One-line lookahead: a `|` line waits for the separator before becoming a table.
+    private var pendingTableHeader: String?
+    private var tableHeader: [String]?
+    private var tableRows: [[String]] = []
+
+    func reset() {
+        blocks = []
+        paragraph = []
+        listItems = []
+        quoteLines = []
+        codeLines = nil
+        partialLine = ""
+        committedEndsWithNewline = false
+        pendingTableHeader = nil
+        tableHeader = nil
+        tableRows = []
+    }
+
+    func replaceAll(with text: String) {
+        reset()
+        append(text)
+    }
+
+    func append(_ text: String) {
+        guard !text.isEmpty else { return }
+        var start = text.startIndex
+        if !partialLine.isEmpty {
+            // Resume the unfinished line.
+            if let nl = text.firstIndex(of: "\n") {
+                let line = partialLine + text[start..<nl]
+                partialLine = ""
+                processLine(line)
+                start = text.index(after: nl)
+                committedEndsWithNewline = start == text.endIndex
+            } else {
+                partialLine += text
+                committedEndsWithNewline = false
+                return
+            }
+        }
+        while start < text.endIndex {
+            if let nl = text[start...].firstIndex(of: "\n") {
+                processLine(String(text[start..<nl]))
+                start = text.index(after: nl)
+                committedEndsWithNewline = start == text.endIndex
+            } else {
+                partialLine = String(text[start...])
+                committedEndsWithNewline = false
+                return
+            }
+        }
+    }
+
+    /// Apply pending partial line + open-block flushes without mutating committed state.
+    func snapshotBlocks() -> [MarkdownTextView.Block] {
+        let savedBlocks = blocks
+        let savedParagraph = paragraph
+        let savedList = listItems
+        let savedQuote = quoteLines
+        let savedCode = codeLines
+        let savedPartial = partialLine
+        let savedEndsWithNewline = committedEndsWithNewline
+        let savedPendingHeader = pendingTableHeader
+        let savedTableHeader = tableHeader
+        let savedTableRows = tableRows
+
+        if !partialLine.isEmpty {
+            processLine(partialLine)
+            partialLine = ""
+        } else if committedEndsWithNewline {
+            // Match `"a\n".components(separatedBy:)` → `["a", ""]`.
+            processLine("")
+        }
+        flushAll()
+
+        let result = blocks
+
+        blocks = savedBlocks
+        paragraph = savedParagraph
+        listItems = savedList
+        quoteLines = savedQuote
+        codeLines = savedCode
+        partialLine = savedPartial
+        committedEndsWithNewline = savedEndsWithNewline
+        pendingTableHeader = savedPendingHeader
+        tableHeader = savedTableHeader
+        tableRows = savedTableRows
+        return result
+    }
+
+    private func flushParagraph() {
+        guard !paragraph.isEmpty else { return }
+        let joined = paragraph.joined(separator: "\n")
+        blocks.append(
+            MarkdownTextView.looksLikeAsciiArt(joined) ? .mono(joined) : .paragraph(joined)
+        )
+        paragraph = []
+    }
+
+    private func flushList() {
+        if !listItems.isEmpty {
+            blocks.append(.list(listItems))
+            listItems = []
+        }
+    }
+
+    private func flushQuote() {
+        if !quoteLines.isEmpty {
+            blocks.append(.quote(quoteLines.joined(separator: "\n")))
+            quoteLines = []
+        }
+    }
+
+    private func flushTable() {
+        if let header = tableHeader {
+            blocks.append(.table(header: header, rows: tableRows))
+        }
+        tableHeader = nil
+        tableRows = []
+    }
+
+    private func flushPendingTableHeaderAsProse() {
+        guard let header = pendingTableHeader else { return }
+        pendingTableHeader = nil
+        // Re-process as a normal content line (not a table).
+        processContentLine(header)
+    }
+
+    private func flushAll() {
+        flushPendingTableHeaderAsProse()
+        flushTable()
+        flushParagraph()
+        flushList()
+        flushQuote()
+        if let codeLines {
+            blocks.append(.code(codeLines.joined(separator: "\n")))
+            self.codeLines = nil
+        }
+    }
+
+    private func processLine(_ line: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+        if codeLines != nil {
+            if trimmed.hasPrefix("```") {
+                blocks.append(.code(codeLines!.joined(separator: "\n")))
+                codeLines = nil
+            } else {
+                codeLines!.append(line)
+            }
+            return
+        }
+
+        // Resolve one-line table lookahead.
+        if let header = pendingTableHeader {
+            pendingTableHeader = nil
+            if MarkdownTextView.isTableSeparator(line) {
+                flushParagraph()
+                flushList()
+                flushQuote()
+                tableHeader = MarkdownTextView.tableCells(
+                    header.trimmingCharacters(in: .whitespaces)
+                )
+                tableRows = []
+                return
+            }
+            processContentLine(header)
+            // Fall through to process `line`.
+        }
+
+        if tableHeader != nil {
+            if trimmed.hasPrefix("|") {
+                tableRows.append(MarkdownTextView.tableCells(trimmed))
+                return
+            }
+            flushTable()
+            // Fall through.
+        }
+
+        if trimmed.hasPrefix("```") {
+            flushParagraph()
+            flushList()
+            flushQuote()
+            flushTable()
+            codeLines = []
+            return
+        }
+
+        if trimmed.hasPrefix("|") {
+            // Need the next line to know if this opens a table.
+            pendingTableHeader = line
+            return
+        }
+
+        processContentLine(line)
+    }
+
+    private func processContentLine(_ line: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+        if trimmed.isEmpty {
+            flushParagraph()
+            flushList()
+            flushQuote()
+            flushTable()
+            return
+        }
+        if let (level, title) = MarkdownTextView.headingLevel(trimmed) {
+            flushParagraph()
+            flushList()
+            flushQuote()
+            flushTable()
+            blocks.append(.heading(level, title))
+            return
+        }
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            flushParagraph()
+            flushList()
+            flushQuote()
+            flushTable()
+            blocks.append(.rule)
+            return
+        }
+        if trimmed.hasPrefix(">") {
+            flushParagraph()
+            flushList()
+            flushTable()
+            quoteLines.append(
+                String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces)
+            )
+            return
+        }
+        if let item = MarkdownTextView.listItem(line) {
+            flushParagraph()
+            flushQuote()
+            flushTable()
+            listItems.append(item)
+            return
+        }
+        flushList()
+        flushQuote()
+        flushTable()
+        paragraph.append(line)
+    }
+}
+
 /// Per-native-host append lineage. Immutable/remounted messages still use the exact-string
 /// caches above; only a strict append with unchanged typography is allowed to reuse blocks.
+///
+/// Streaming hot path:
+/// - stable prefix blocks are fully highlighted once and never reparsed on append
+/// - tail is scanned with a forward line cursor (O(new lines), not O(tail))
+/// - optional lightweight tail skips inline markdown until the row settles
 final class MarkdownStreamingRenderer {
     enum Update {
         case unchanged
@@ -523,13 +828,24 @@ final class MarkdownStreamingRenderer {
         case replace(range: NSRange, tail: NSAttributedString)
     }
 
+    /// When true, only stable blocks pay for `AttributedString(markdown:)`. Tail prose is plain
+    /// until promoted into the stable prefix or the host leaves streaming mode.
+    var prefersLightweightTail = false
+
+    /// True when the latest `.replace` only mutated the unstable tail (layout may throttle).
+    private(set) var lastReplaceThrottleable = false
+
     private var previousText = ""
     private var typography: ChatTypography?
     private var stableBlocks: [MarkdownTextView.Block] = []
     private let stableAttributed = NSMutableAttributedString()
     private var renderedLength = 0
+    /// UTF-16 offset where the current unstable tail begins in `previousText`.
+    private var tailStartUTF16 = 0
+    private let tailParser = IncrementalMarkdownBlockParser()
 
     func update(text: String, typography newTypography: ChatTypography) -> Update {
+        lastReplaceThrottleable = false
         if text == previousText, typography == newTypography {
             return .unchanged
         }
@@ -538,22 +854,43 @@ final class MarkdownStreamingRenderer {
             return reset(text: text, typography: newTypography)
         }
 
-        let parts = Self.parts(for: text)
-        guard stableBlocks.count <= parts.stableBlocks.count,
-              Array(parts.stableBlocks.prefix(stableBlocks.count)) == stableBlocks else {
+        let boundary = Self.stablePrefixBoundary(in: text)
+        let newTailStartUTF16 = boundary.map { Self.utf16Offset(of: $0, in: text) } ?? 0
+        guard newTailStartUTF16 >= tailStartUTF16 else {
             return reset(text: text, typography: newTypography)
         }
 
         let replacementStart = stableAttributed.length
-        if parts.stableBlocks.count > stableBlocks.count {
-            MarkdownSelectionContent.append(
-                parts.stableBlocks[stableBlocks.count...],
-                to: stableAttributed,
-                typography: newTypography
-            )
-        }
-        stableBlocks = parts.stableBlocks
+        var stableGrew = false
 
+        if newTailStartUTF16 > tailStartUTF16 {
+            guard let boundary else {
+                return reset(text: text, typography: newTypography)
+            }
+            let newStableBlocks = MarkdownTextView.cachedParse(String(text[..<boundary]))
+            guard newStableBlocks.count >= stableBlocks.count,
+                  Array(newStableBlocks.prefix(stableBlocks.count)) == stableBlocks else {
+                return reset(text: text, typography: newTypography)
+            }
+            if newStableBlocks.count > stableBlocks.count {
+                MarkdownSelectionContent.append(
+                    newStableBlocks[stableBlocks.count...],
+                    to: stableAttributed,
+                    typography: newTypography,
+                    inlineHighlight: true
+                )
+                stableGrew = true
+            }
+            stableBlocks = newStableBlocks
+            tailStartUTF16 = newTailStartUTF16
+            tailParser.replaceAll(with: String(text[boundary...]))
+        } else {
+            // Pure tail growth: feed only the newly appended characters.
+            let suffixStart = text.index(text.startIndex, offsetBy: previousText.count)
+            tailParser.append(String(text[suffixStart...]))
+        }
+
+        let tailBlocks = tailParser.snapshotBlocks()
         let replacement = NSMutableAttributedString()
         if stableAttributed.length > replacementStart {
             replacement.append(stableAttributed.attributedSubstring(
@@ -563,17 +900,19 @@ final class MarkdownStreamingRenderer {
                 )
             ))
         }
-        if !stableBlocks.isEmpty, !parts.tailBlocks.isEmpty {
+        if !stableBlocks.isEmpty, !tailBlocks.isEmpty {
             replacement.append(MarkdownSelectionContent.blockSeparator(typography: newTypography))
         }
         replacement.append(MarkdownSelectionContent.attributedString(
-            for: parts.tailBlocks,
-            typography: newTypography
+            for: tailBlocks,
+            typography: newTypography,
+            inlineHighlight: !prefersLightweightTail
         ))
 
         let oldLength = renderedLength
         renderedLength = replacementStart + replacement.length
         previousText = text
+        lastReplaceThrottleable = prefersLightweightTail && !stableGrew
         return .replace(
             range: NSRange(location: replacementStart, length: oldLength - replacementStart),
             tail: replacement
@@ -581,32 +920,49 @@ final class MarkdownStreamingRenderer {
     }
 
     func reset(text: String, typography newTypography: ChatTypography) -> Update {
-        let parts = Self.parts(for: text)
-        stableBlocks = parts.stableBlocks
+        lastReplaceThrottleable = false
+        let boundary = Self.stablePrefixBoundary(in: text)
+        if let boundary {
+            stableBlocks = MarkdownTextView.cachedParse(String(text[..<boundary]))
+            tailStartUTF16 = Self.utf16Offset(of: boundary, in: text)
+            tailParser.replaceAll(with: String(text[boundary...]))
+        } else {
+            stableBlocks = []
+            tailStartUTF16 = 0
+            tailParser.replaceAll(with: text)
+        }
         stableAttributed.setAttributedString(MarkdownSelectionContent.attributedString(
             for: stableBlocks,
-            typography: newTypography
+            typography: newTypography,
+            inlineHighlight: true
         ))
-        let full = MarkdownSelectionContent.attributedString(for: text, typography: newTypography)
+
+        let full: NSAttributedString
+        if prefersLightweightTail {
+            let combined = NSMutableAttributedString(attributedString: stableAttributed)
+            let tailBlocks = tailParser.snapshotBlocks()
+            if !stableBlocks.isEmpty, !tailBlocks.isEmpty {
+                combined.append(MarkdownSelectionContent.blockSeparator(typography: newTypography))
+            }
+            combined.append(MarkdownSelectionContent.attributedString(
+                for: tailBlocks,
+                typography: newTypography,
+                inlineHighlight: false
+            ))
+            full = combined
+        } else {
+            // Settled / exact path: one monolithic parse so storage matches non-streaming hosts.
+            full = MarkdownSelectionContent.attributedString(for: text, typography: newTypography)
+        }
+
         previousText = text
         typography = newTypography
         renderedLength = full.length
         return .full(full)
     }
 
-    private struct Parts {
-        let stableBlocks: [MarkdownTextView.Block]
-        let tailBlocks: [MarkdownTextView.Block]
-    }
-
-    private static func parts(for text: String) -> Parts {
-        guard let boundary = stablePrefixBoundary(in: text) else {
-            return Parts(stableBlocks: [], tailBlocks: MarkdownTextView.cachedParse(text))
-        }
-        return Parts(
-            stableBlocks: MarkdownTextView.cachedParse(String(text[..<boundary])),
-            tailBlocks: MarkdownTextView.cachedParse(String(text[boundary...]))
-        )
+    private static func utf16Offset(of index: String.Index, in text: String) -> Int {
+        text[..<index].utf16.count
     }
 
     /// Returns the start of the penultimate blank-line-delimited content region. Blank lines
@@ -652,6 +1008,7 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
     let markdownText: String
     let typography: ChatTypography
     var maximumNumberOfLines: Int? = nil
+    var isStreaming: Bool = false
     var onOpenDocument: ((URL) -> Void)? = nil
     var onFlash: ((String) -> Void)? = nil
 
@@ -690,6 +1047,7 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
             markdownText: markdownText,
             typography: typography,
             maximumNumberOfLines: maximumNumberOfLines,
+            isStreaming: isStreaming,
             onOpenDocument: onOpenDocument,
             onFlash: onFlash,
             backingScale: backingScale(for: host)
@@ -733,6 +1091,11 @@ final class MarkdownNativeLayoutView: NSView {
     private(set) var intrinsicInvalidationCount = 0
     private let streamingRenderer = MarkdownStreamingRenderer()
     private(set) var tailReplacementCount = 0
+    private var isStreamingContent = false
+    /// ~30 Hz ceiling for tail-only measure/invalidate while streaming (coalesce is ~50ms).
+    private static let tailLayoutCooldown: TimeInterval = 1.0 / 30.0
+    private var lastTailLayoutAt: TimeInterval = 0
+    private var pendingTailLayoutWork: DispatchWorkItem?
 
     override init(frame frameRect: NSRect) {
         textView = PathClickTextView(frame: .zero)
@@ -822,10 +1185,27 @@ final class MarkdownNativeLayoutView: NSView {
         markdownText: String,
         typography: ChatTypography,
         maximumNumberOfLines: Int?,
+        isStreaming: Bool = false,
         onOpenDocument: ((URL) -> Void)?,
         onFlash: ((String) -> Void)?,
         backingScale: CGFloat
     ) -> Bool {
+        let streamingChanged = isStreamingContent != isStreaming
+        isStreamingContent = isStreaming
+        streamingRenderer.prefersLightweightTail = isStreaming
+        // Leaving stream mode must rebuild with full inline highlight so settled pixels match.
+        if streamingChanged, !isStreaming, !markdownText.isEmpty {
+            let renderUpdate = streamingRenderer.reset(text: markdownText, typography: typography)
+            return update(
+                renderUpdate: renderUpdate,
+                bodyFont: typography.bodyNSFont,
+                maximumNumberOfLines: maximumNumberOfLines,
+                onOpenDocument: onOpenDocument,
+                onFlash: onFlash,
+                backingScale: backingScale,
+                throttleLayout: false
+            )
+        }
         var renderUpdate = streamingRenderer.update(text: markdownText, typography: typography)
         if case .replace(let range, _) = renderUpdate,
            NSMaxRange(range) > (textView.textStorage?.length ?? 0)
@@ -840,7 +1220,8 @@ final class MarkdownNativeLayoutView: NSView {
             maximumNumberOfLines: maximumNumberOfLines,
             onOpenDocument: onOpenDocument,
             onFlash: onFlash,
-            backingScale: backingScale
+            backingScale: backingScale,
+            throttleLayout: isStreaming && streamingRenderer.lastReplaceThrottleable
         )
     }
 
@@ -859,7 +1240,8 @@ final class MarkdownNativeLayoutView: NSView {
             maximumNumberOfLines: maximumNumberOfLines,
             onOpenDocument: onOpenDocument,
             onFlash: onFlash,
-            backingScale: backingScale
+            backingScale: backingScale,
+            throttleLayout: false
         )
     }
 
@@ -869,7 +1251,8 @@ final class MarkdownNativeLayoutView: NSView {
         maximumNumberOfLines: Int?,
         onOpenDocument: ((URL) -> Void)?,
         onFlash: ((String) -> Void)?,
-        backingScale: CGFloat
+        backingScale: CGFloat,
+        throttleLayout: Bool
     ) -> Bool {
         var heightChanged = false
         var invalidatedRange: NSRange?
@@ -921,9 +1304,62 @@ final class MarkdownNativeLayoutView: NSView {
         textView.onFlash = onFlash
 
         if heightChanged {
-            invalidateMeasuredHeight(characterRange: invalidatedRange)
+            noteHeightAffectingChange(
+                characterRange: invalidatedRange,
+                throttleable: throttleLayout
+            )
         }
         return heightChanged
+    }
+
+    /// Tail-only streaming edits may coalesce measure/intrinsic invalidation to ~30 Hz.
+    /// Text storage still updates immediately so glyphs keep streaming; only layout cost drops.
+    private func noteHeightAffectingChange(characterRange: NSRange?, throttleable: Bool) {
+        if !throttleable || !isStreamingContent {
+            pendingTailLayoutWork?.cancel()
+            pendingTailLayoutWork = nil
+            lastTailLayoutAt = ProcessInfo.processInfo.systemUptime
+            invalidateMeasuredHeight(characterRange: characterRange)
+            return
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastTailLayoutAt >= Self.tailLayoutCooldown {
+            pendingTailLayoutWork?.cancel()
+            pendingTailLayoutWork = nil
+            lastTailLayoutAt = now
+            invalidateMeasuredHeight(characterRange: characterRange)
+            return
+        }
+
+        // Keep measurement storage dirty for the next allowed pass without thrashing SwiftUI.
+        if let characterRange, measurementStorage.length > 0 {
+            let range = NSRange(
+                location: min(characterRange.location, measurementStorage.length),
+                length: min(
+                    characterRange.length,
+                    measurementStorage.length - min(characterRange.location, measurementStorage.length)
+                )
+            )
+            measurementLayoutManager.invalidateLayout(
+                forCharacterRange: range,
+                actualCharacterRange: nil
+            )
+        }
+        // Drop the cached height so the next unthrottled measure is fresh, but do not
+        // bounce intrinsicContentSize every coalesce tick.
+        measurement = nil
+
+        pendingTailLayoutWork?.cancel()
+        let delay = max(0, Self.tailLayoutCooldown - (now - lastTailLayoutAt))
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lastTailLayoutAt = ProcessInfo.processInfo.systemUptime
+            self.pendingTailLayoutWork = nil
+            self.invalidateMeasuredHeight(characterRange: nil)
+        }
+        pendingTailLayoutWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     func measuredHeight(for proposedWidth: CGFloat, backingScale: CGFloat) -> CGFloat {
