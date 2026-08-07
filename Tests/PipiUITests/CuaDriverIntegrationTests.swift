@@ -775,7 +775,12 @@ final class CuaDriverIntegrationTests: XCTestCase {
             "computer_cancelled"
         )
         XCTAssertEqual(driver.cancellations, 1)
-        XCTAssertNil(coordinator.activeSessionKey)
+        // Mutex must free immediately so a retry can begin; presentation stays
+        // in the grace window (activeSessionKey retained) until hard clear.
+        XCTAssertNil(coordinator.cuaInFlightOperation)
+        XCTAssertTrue(coordinator.isPresentingDesktopOperation)
+        XCTAssertEqual(coordinator.activeSessionKey, "session-a")
+        XCTAssertNotNil(coordinator.presentationGraceWork)
     }
 
     func testBatchReportsObservedForegroundAndFocusDrift() async throws {

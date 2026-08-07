@@ -150,6 +150,9 @@ final class ComputerCoordinator: ObservableObject {
     var pendingWriteExpiryWork: DispatchWorkItem?
     var pendingWriteRefocusWork: DispatchWorkItem?
     var expiryWork: DispatchWorkItem?
+    /// Collapses mini chrome after a quiet gap between desktop batches.
+    /// Cancelled when a new batch begins or when presentation is force-cleared.
+    var presentationGraceWork: DispatchWorkItem?
     var globalMonitor: Any?
     var localMonitor: Any?
     var monitorAccessibilityState: Bool?
@@ -194,6 +197,10 @@ final class ComputerCoordinator: ObservableObject {
     let openApplicationVerificationTimeout: TimeInterval
     let openApplicationPollInterval: TimeInterval
     let openApplicationQuarantineDelay: TimeInterval
+    /// Quiet window after a batch ends before mini chrome restores.
+    /// 45s covers typical model thinking between successive CUA batches so the
+    /// main window does not flash mini→full→mini on every batch boundary.
+    let desktopPresentationGraceInterval: TimeInterval
     let cuaDriver: CuaDriverTransport?
     let cuaTargetValidator: @Sendable (CuaComputerTarget) -> Bool
 
@@ -287,6 +294,10 @@ final class ComputerCoordinator: ObservableObject {
         openApplicationVerificationTimeout: TimeInterval = 5,
         openApplicationPollInterval: TimeInterval = 0.05,
         openApplicationQuarantineDelay: TimeInterval = 0.15,
+        /// 45s covers typical model thinking between successive CUA batches so
+        /// mini chrome stays put instead of flashing per batch. Tests inject a
+        /// short interval (or 0) instead of waiting out the production value.
+        desktopPresentationGraceInterval: TimeInterval = 45,
         cuaDriver: CuaDriverTransport? = nil,
         cuaTargetValidator:
             @escaping @Sendable (CuaComputerTarget) -> Bool = { target in
@@ -336,6 +347,10 @@ final class ComputerCoordinator: ObservableObject {
         self.openApplicationQuarantineDelay = max(
             0.01,
             openApplicationQuarantineDelay
+        )
+        self.desktopPresentationGraceInterval = max(
+            0,
+            desktopPresentationGraceInterval
         )
         self.cuaDriver = cuaDriver
         self.cuaTargetValidator = cuaTargetValidator

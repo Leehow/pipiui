@@ -20,6 +20,9 @@ final class ComputerUseWindowPresentation: NSObject {
     private var normalToolbarIsVisible: Bool?
     private var normalButtonHidden: [NSWindow.ButtonType: Bool] = [:]
     private var normalContentView: NSView?
+    /// Session that last entered mini mode. Same-session begin reuses chrome
+    /// without another `orderFrontRegardless` (avoids grace-window micro-flash).
+    private var miniPresentedSessionKey: String?
     /// Readable for tests that assert the border does not resurface after stop.
     private(set) var highlightPanel: NSPanel?
     private var timer: Timer?
@@ -43,12 +46,24 @@ final class ComputerUseWindowPresentation: NSObject {
 
     func update(for coordinator: ComputerCoordinator) {
         if coordinator.isPresentingDesktopOperation {
-            presentMiniWindow()
+            let sessionKey = coordinator.activeSessionKey
+            let alreadyMiniForSession = normalContentSize != nil
+                && miniPresentedSessionKey != nil
+                && miniPresentedSessionKey == sessionKey
+            if !alreadyMiniForSession {
+                presentMiniWindow()
+                // Only record the session when chrome actually attached. An
+                // unattached controller must not sticky-skip a later present.
+                if normalContentSize != nil {
+                    miniPresentedSessionKey = sessionKey
+                }
+            }
             updateHighlight(processID: coordinator.activeApplication?.processID,
                             windowID: coordinator.activeWindowID)
         } else {
             stopHighlight()
             restoreMainWindow()
+            miniPresentedSessionKey = nil
         }
     }
 
@@ -108,6 +123,7 @@ final class ComputerUseWindowPresentation: NSObject {
     }
 
     private func restoreMainWindow() {
+        miniPresentedSessionKey = nil
         guard let window = mainWindow else { return }
         if let normalStyleMask { window.styleMask = normalStyleMask }
         if let normalTitleVisibility { window.titleVisibility = normalTitleVisibility }

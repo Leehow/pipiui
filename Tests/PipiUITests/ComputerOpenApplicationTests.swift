@@ -376,7 +376,11 @@ final class ComputerOpenApplicationTests: XCTestCase {
             openApplicationTimeout: 0.5,
             openApplicationVerificationTimeout: verificationTimeout,
             openApplicationPollInterval: 0.002,
-            openApplicationQuarantineDelay: quarantineDelay
+            openApplicationQuarantineDelay: quarantineDelay,
+            // Mutex/lifecycle assertions here expect presentation keys cleared
+            // when the open slot frees. Production uses a 45s grace window;
+            // presentation-grace semantics are covered by ComputerUsePresentationTests.
+            desktopPresentationGraceInterval: 0
         )
     }
 
@@ -1614,7 +1618,8 @@ final class ComputerOpenApplicationTests: XCTestCase {
             openApplicationTimeout: 1,
             openApplicationVerificationTimeout: 0.04,
             openApplicationPollInterval: 0.002,
-            openApplicationQuarantineDelay: 0.03
+            openApplicationQuarantineDelay: 0.03,
+            desktopPresentationGraceInterval: 0
         )
         authorize(target, sessionKey: "first", coordinator: coordinator)
         authorize(target, sessionKey: "second", coordinator: coordinator)
@@ -1668,7 +1673,7 @@ final class ComputerOpenApplicationTests: XCTestCase {
         XCTAssertNil(coordinator.activeSessionKey)
         XCTAssertTrue(coordinator.pausedSessionKeys.isEmpty)
         XCTAssertTrue(
-            coordinator.statusMessage?.contains("互斥槽已释放")
+            coordinator.statusMessage?.contains("取消")
                 == true
         )
         XCTAssertTrue(

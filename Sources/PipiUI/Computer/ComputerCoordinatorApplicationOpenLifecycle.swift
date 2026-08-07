@@ -34,7 +34,9 @@ extension ComputerCoordinator {
         // surprise a later session through this operation.
         execution.sideEffectsSettled = true
         guard clearOpenApplicationExecution(execution) else {
-            clearLeasePresentation()
+            scheduleDesktopPresentationGrace(
+                statusMessage: "已打开 \(application.name)，等待下一步…"
+            )
             return
         }
         recordOpenApplicationAudit(
@@ -45,7 +47,7 @@ extension ComputerCoordinator {
             cancelled: false
         )
         statusMessage =
-            "已打开 \(application.name)，验证目标并释放桌面互斥槽。"
+            "已打开 \(application.name)，等待下一步…"
         var response: [String: Any] = [
             "ok": true,
             "openedApplication": true,
@@ -108,7 +110,7 @@ extension ComputerCoordinator {
               !execution.launchCommitted
                 || execution.sideEffectsSettled else { return }
         if execution.launchCommitted {
-            clearLeasePresentation()
+            scheduleDesktopPresentationGrace(statusMessage: reason)
             inputSynth.releaseAll()
         }
         guard clearOpenApplicationExecution(execution) else { return }
@@ -136,7 +138,8 @@ extension ComputerCoordinator {
             execution.timeoutWork?.cancel()
             execution.timeoutWork = nil
             if activeSessionKey == execution.sessionKey {
-                clearLeasePresentation()
+                // Soft cancel — session release / emergency clear immediately.
+                scheduleDesktopPresentationGrace(statusMessage: reason)
             }
             inputSynth.releaseAll()
             recordOpenApplicationCancellationRequestAudit(
@@ -194,13 +197,16 @@ extension ComputerCoordinator {
             callbackFailed: callbackFailed
         )
         if activeSessionKey == execution.sessionKey {
-            clearLeasePresentation()
+            scheduleDesktopPresentationGrace(
+                statusMessage:
+                    "Launch Services 回调已落定；取消请求未返回截图，等待下一步…"
+            )
         }
         inputSynth.releaseAll()
         execution.task = nil
         _ = clearOpenApplicationExecution(execution)
         statusMessage =
-            "Launch Services 回调已落定；取消请求未返回截图或成功，互斥槽已释放。"
+            "Launch Services 回调已落定；取消请求未返回截图，等待下一步…"
     }
 
     @MainActor
@@ -276,7 +282,8 @@ extension ComputerCoordinator {
         execution.task = nil
         inFlightApplicationOpen = nil
         if activeSessionKey == execution.sessionKey {
-            clearLeasePresentation()
+            // Soft end of open_application; hard teardown overrides via clear.
+            scheduleDesktopPresentationGrace()
         }
         refreshInputMonitoring()
         return true

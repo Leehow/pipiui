@@ -60,8 +60,162 @@ final class ComputerUsePresentationTests: XCTestCase {
         coordinator.isDesktopOperationActive = true
         XCTAssertTrue(coordinator.isPresentingDesktopOperation)
         coordinator.inFlightExecution = nil
+        // Hard clear (session release / emergency) collapses immediately.
         coordinator.clearLeasePresentation()
         XCTAssertFalse(coordinator.isPresentingDesktopOperation)
+    }
+
+    func testBatchEndKeepsPresentationDuringGraceWindow() {
+        // Soft batch end must not restore the main window; mini chrome stays
+        // through the model-thinking gap until grace expires or a hard clear.
+        let coordinator = ComputerCoordinator(
+            computerUseEnabledProvider: { true },
+            desktopPresentationGraceInterval: 45
+        )
+        coordinator.activeSessionKey = "session-a"
+        coordinator.activeApplication = ComputerApplicationIdentity(
+            bundleID: "com.example.app",
+            name: "Example",
+            processID: 42,
+            windowTitle: nil
+        )
+        coordinator.activeWindowID = 7
+        coordinator.isDesktopOperationActive = true
+
+        coordinator.scheduleDesktopPresentationGrace(
+            statusMessage: "桌面操作已完成，等待下一步…"
+        )
+
+        XCTAssertTrue(coordinator.isPresentingDesktopOperation)
+        XCTAssertEqual(coordinator.activeSessionKey, "session-a")
+        XCTAssertEqual(coordinator.activeWindowID, 7)
+        XCTAssertEqual(
+            coordinator.statusMessage,
+            "桌面操作已完成，等待下一步…"
+        )
+        XCTAssertNotNil(coordinator.presentationGraceWork)
+    }
+
+    func testNewBatchCancelsPresentationGrace() {
+        let coordinator = ComputerCoordinator(
+            computerUseEnabledProvider: { true },
+            desktopPresentationGraceInterval: 45
+        )
+        coordinator.activeSessionKey = "session-a"
+        coordinator.isDesktopOperationActive = true
+        coordinator.scheduleDesktopPresentationGrace(
+            statusMessage: "桌面操作已完成，等待下一步…"
+        )
+        XCTAssertNotNil(coordinator.presentationGraceWork)
+
+        // beginCuaOperation / beginExecution cancel grace then re-arm chrome.
+        coordinator.cancelDesktopPresentationGrace()
+        coordinator.activeSessionKey = "session-a"
+        coordinator.isDesktopOperationActive = true
+        coordinator.statusMessage = "正在操作 Example…"
+
+        XCTAssertNil(coordinator.presentationGraceWork)
+        XCTAssertTrue(coordinator.isPresentingDesktopOperation)
+        XCTAssertEqual(coordinator.statusMessage, "正在操作 Example…")
+    }
+
+    func testPresentationGraceExpiryRestoresMainWindowState() {
+        let coordinator = ComputerCoordinator(
+            computerUseEnabledProvider: { true },
+            // 0 collapses on the scheduling turn so tests do not sleep 45s.
+            desktopPresentationGraceInterval: 0
+        )
+        coordinator.activeSessionKey = "session-a"
+        coordinator.activeApplication = ComputerApplicationIdentity(
+            bundleID: "com.example.app",
+            name: "Example",
+            processID: 42,
+            windowTitle: nil
+        )
+        coordinator.isDesktopOperationActive = true
+
+        coordinator.scheduleDesktopPresentationGrace(
+            statusMessage: "桌面操作已完成，等待下一步…"
+        )
+
+        XCTAssertFalse(coordinator.isPresentingDesktopOperation)
+        XCTAssertNil(coordinator.activeSessionKey)
+        XCTAssertNil(coordinator.activeApplication)
+        XCTAssertNil(coordinator.presentationGraceWork)
+        XCTAssertEqual(
+            coordinator.statusMessage,
+            "桌面操作已完成，等待下一步…"
+        )
+    }
+
+    func testEmergencyStopClearsPresentationImmediatelyWithoutGrace() {
+        let coordinator = ComputerCoordinator(
+            computerUseEnabledProvider: { true },
+            desktopPresentationGraceInterval: 45
+        )
+        coordinator.activeSessionKey = "session-a"
+        coordinator.isDesktopOperationActive = true
+        coordinator.scheduleDesktopPresentationGrace(
+            statusMessage: "桌面操作已完成，等待下一步…"
+        )
+        XCTAssertTrue(coordinator.isPresentingDesktopOperation)
+        XCTAssertNotNil(coordinator.presentationGraceWork)
+
+        coordinator.emergencyStop()
+
+        XCTAssertFalse(coordinator.isPresentingDesktopOperation)
+        XCTAssertNil(coordinator.activeSessionKey)
+        XCTAssertNil(coordinator.presentationGraceWork)
+        XCTAssertTrue(coordinator.emergencyStopped)
+    }
+
+    func testMasterToggleOffClearsPresentationImmediatelyWithoutGrace() {
+        let coordinator = ComputerCoordinator(
+            computerUseEnabledProvider: { true },
+            desktopPresentationGraceInterval: 45
+        )
+        coordinator.activeSessionKey = "session-a"
+        coordinator.isDesktopOperationActive = true
+        coordinator.scheduleDesktopPresentationGrace(
+            statusMessage: "桌面操作已完成，等待下一步…"
+        )
+        XCTAssertTrue(coordinator.isPresentingDesktopOperation)
+
+        coordinator.cancelAllDesktopOperations()
+
+        XCTAssertFalse(coordinator.isPresentingDesktopOperation)
+        XCTAssertNil(coordinator.activeSessionKey)
+        XCTAssertNil(coordinator.presentationGraceWork)
+        XCTAssertFalse(coordinator.emergencyStopped)
+    }
+
+    func testPresentMiniWindowIsIdempotentForSameSession() {
+        let coordinator = ComputerCoordinator(computerUseEnabledProvider: { true })
+        let controller = ComputerUseWindowPresentation()
+        let window = NonOrderingTestWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 1000, height: 700))
+        controller.attach(to: window)
+
+        coordinator.activeSessionKey = "session-a"
+        coordinator.isDesktopOperationActive = true
+        coordinator.statusMessage = "正在操作 Example…"
+        controller.update(for: coordinator)
+        XCTAssertEqual(window.orderFrontRegardlessCallCount, 1)
+
+        // Same session begin during grace must not re-front / reshape.
+        coordinator.statusMessage = "正在操作 Example…"
+        controller.update(for: coordinator)
+        XCTAssertEqual(window.orderFrontRegardlessCallCount, 1)
+
+        // Different session is allowed to re-present.
+        coordinator.activeSessionKey = "session-b"
+        controller.update(for: coordinator)
+        XCTAssertEqual(window.orderFrontRegardlessCallCount, 2)
     }
 
     func testPresentationReplacesAndRestoresMainWindowContent() {
