@@ -13,6 +13,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { TunnelClient, type TunnelStatus } from "./tunnel-client.js";
+import { MessageView } from "./message-view.js";
 import "antd-mobile/es/global/global.css";
 import "./styles.css";
 
@@ -75,29 +76,6 @@ function MoonIcon() {
     <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
     </svg>
-  );
-}
-
-function roleLabel(role: string): string {
-  return role === "user" ? "你" : role === "assistant" ? "助手" : "系统";
-}
-
-function MessageView({ message, live }: { message: any; live: boolean }) {
-  if (message.kind === "tool" || message.kind === "thinking") {
-    return (
-      <div className={`tool-entry${live ? " live" : ""}`}>
-        {message.kind === "thinking"
-          ? "💭 思考中"
-          : `⚙︎ ${message.toolName || "tool"}${message.toolSummary ? ` · ${message.toolSummary}` : ""}`}
-      </div>
-    );
-  }
-  const role = message.role || "system";
-  return (
-    <div className={`message ${role}`}>
-      <span className="role">{roleLabel(role)}</span>
-      <span>{typeof message.text === "string" ? message.text : ""}</span>
-    </div>
   );
 }
 
