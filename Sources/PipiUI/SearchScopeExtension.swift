@@ -202,10 +202,13 @@ const SEARCH_DISCIPLINE = `
 
 ## Local search scope
 Search the current project first. Prefer targeted directories and globs over broad
-discovery. The find, grep, and ls tools are restricted to this process's project or
-worktree root. Do not automatically widen searches to the home directory, Music,
-Pictures, or photo libraries. If project evidence is insufficient, explain the
-evidence gap and ask the user to name the exact external path in the current turn.`;
+discovery. Prefer the dedicated grep, find, and ls tools over bash equivalents:
+use grep for file-content search (not bash grep/rg), find for locating files by
+name (not bash find), and ls for directory listings (not bash ls). The find, grep,
+and ls tools are restricted to this process's project or worktree root. Do not
+automatically widen searches to the home directory, Music, Pictures, or photo
+libraries. If project evidence is insufficient, explain the evidence gap and ask
+the user to name the exact external path in the current turn.`;
 
 export interface SearchPathDecision {
   allowed: boolean;
