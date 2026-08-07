@@ -30,6 +30,8 @@ struct SidebarView: View {
     /// Remote connection details are also window-local and never alter project
     /// or session selection.
     @State private var showRemoteConnection = false
+    /// Computer Use settings open as a window-local sheet, like remote connection.
+    @State private var showComputerUseSettings = false
     /// Session search stays in the sidebar: a nonempty global query replaces
     /// the normal tree below this field with its matching sessions.
     @State private var sessionSearchQuery = ""
@@ -88,7 +90,7 @@ struct SidebarView: View {
                 .accessibilityLabel("设置")
 
                 Button {
-                    store.toggleComputerUse()
+                    showComputerUseSettings = true
                 } label: {
                     Image(systemName: computerCoordinator.emergencyStopped
                         ? "desktopcomputer.trianglebadge.exclamationmark"
@@ -111,12 +113,8 @@ struct SidebarView: View {
                             ? Color.accentColor.opacity(0.14)
                             : .clear)
                 }
-                .help(computerCoordinator.emergencyStopped
-                    ? "重新开启桌面控制"
-                    : (store.computerUseEnabled ? "关闭桌面控制" : "开启桌面控制"))
-                .accessibilityLabel(computerCoordinator.emergencyStopped
-                    ? "重新开启桌面控制"
-                    : (store.computerUseEnabled ? "关闭桌面控制" : "开启桌面控制"))
+                .help("桌面控制设置")
+                .accessibilityLabel("桌面控制设置")
                 .accessibilityValue(computerCoordinator.emergencyStopped
                     ? "已急停"
                     : (store.computerUseEnabled ? "已开启" : "已关闭"))
@@ -246,6 +244,16 @@ struct SidebarView: View {
             RemoteConnectionSheet()
                 .environmentObject(store)
                 .dismissOnOutsideClick { showRemoteConnection = false }
+        }
+        .sheet(isPresented: $showComputerUseSettings) {
+            ScrollView {
+                ComputerUseSettingsPanel()
+                    .environmentObject(store)
+                    .padding(22)
+            }
+            .frame(width: 560)
+            .frame(maxHeight: 760)
+            .dismissOnOutsideClick { showComputerUseSettings = false }
         }
         .sheet(isPresented: $store.isPiUpdatePresented) {
             PiUpdateSheet()

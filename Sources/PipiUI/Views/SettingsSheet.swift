@@ -490,9 +490,6 @@ struct SettingsSheet: View {
                 builtInGroup(section)
             }
 
-            Divider()
-            ComputerUseSettingsPanel()
-
             if BuiltInFeatureSettings.EnabledSet(disabled: builtInDisabled).allDisabled {
                 Label("全部已关闭：新建/重启会话将不挂载任何 PipiUI 自有能力。", systemImage: "moon.zzz")
                     .font(.caption)
