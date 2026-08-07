@@ -13,8 +13,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   canSendPrompt,
-  composerActionMode,
+  composerButtons,
+  draftFromQueueRestore,
   isNearBottom,
+  mergeRestoredDraft,
+  normalizeQueue,
+  queueItemSummary,
+  queueSourceKey,
+  type QueueItem,
 } from "./chat-ui.js";
 import { TunnelClient, type TunnelStatus } from "./tunnel-client.js";
 import { MessageView } from "./message-view.js";
@@ -147,9 +153,12 @@ function App() {
   const [indexPending, setIndexPending] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sending, setSending] = useState(false);
+  const [queueBusy, setQueueBusy] = useState(false);
+  const [queueOverride, setQueueOverride] = useState<QueueItem[] | null>(null);
   const [stickToBottom, setStickToBottom] = useState(true);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const composerTextAreaRef = useRef<HTMLTextAreaElement | null>(null);
   const stickToBottomRef = useRef(true);
   const logicRef = useRef<LogicRef>({
     activeSession: null,
@@ -362,6 +371,8 @@ function App() {
       setActiveSession(sessionID);
       setRevision(null);
       setSnapshot(null);
+      setQueueOverride(null);
+      setQueueBusy(false);
       setActivePanel(null);
       setPanelData(null);
       setPanelDetail(null);
@@ -400,6 +411,8 @@ function App() {
     setPanelDetailLoading(false);
     setSessionLoading(false);
     setModelOpen(false);
+    setQueueOverride(null);
+    setQueueBusy(false);
     setSessionTitle("请选择会话");
     resetStickToBottom();
     void loadIndex();
@@ -415,7 +428,19 @@ function App() {
   }, [sessionPage, status.kind, loadIndex]);
 
   // ---- chat actions ----
-  const actionMode = composerActionMode(snapshot);
+  const snapshotQueue = normalizeQueue(snapshot);
+  const snapshotQueueKey = queueSourceKey(snapshotQueue);
+  useEffect(() => {
+    // Host snapshot is authoritative once it changes (or session switches).
+    setQueueOverride(null);
+  }, [snapshotQueueKey, activeSession]);
+  const queueItems = queueOverride ?? snapshotQueue;
+
+  const buttons = composerButtons({
+    isGenerating: snapshot?.isGenerating,
+    isStopping: snapshot?.isStopping,
+    hasText: text.trim().length > 0,
+  });
   const canSend = canSendPrompt({
     connected: status.kind === "connected",
     hasSession: !!logicRef.current.activeSession,
@@ -423,6 +448,14 @@ function App() {
     processAlive: snapshot?.processAlive,
     sending,
   });
+
+  const focusComposer = () => {
+    window.requestAnimationFrame(() => {
+      const el = composerTextAreaRef.current
+        ?? document.querySelector<HTMLTextAreaElement>(".composer textarea");
+      el?.focus();
+    });
+  };
 
   const send = async () => {
     const as = logicRef.current.activeSession;
@@ -457,9 +490,41 @@ function App() {
     }
   };
 
-  const onComposerAction = () => {
-    if (actionMode === "stop") void stop();
-    else void send();
+  const restoreQueue = async () => {
+    const as = logicRef.current.activeSession;
+    if (!as || queueBusy || queueItems.length === 0) return;
+    const prior = queueItems;
+    setQueueBusy(true);
+    try {
+      const body = await logic()!.command("queue.restore", { sessionID: as });
+      const restored = draftFromQueueRestore(body, prior);
+      setText((current) => mergeRestoredDraft(current, restored));
+      setQueueOverride([]);
+      setRevision(null);
+      await pollSnapshot();
+      focusComposer();
+    } catch (error) {
+      showError(error);
+    } finally {
+      setQueueBusy(false);
+    }
+  };
+
+  const cutInQueue = async () => {
+    const as = logicRef.current.activeSession;
+    if (!as || queueBusy || queueItems.length === 0) return;
+    setQueueBusy(true);
+    resetStickToBottom();
+    try {
+      await logic()!.command("queue.cutIn", { sessionID: as });
+      setQueueOverride([]);
+      setRevision(null);
+      await pollSnapshot();
+    } catch (error) {
+      showError(error);
+    } finally {
+      setQueueBusy(false);
+    }
   };
 
   // ---- model panel ----
@@ -762,6 +827,51 @@ function App() {
             ) : null}
           </div>
 
+          {queueItems.length > 0 ? (
+            <div className="queue-strip" aria-label="消息队列">
+              <div className="queue-strip-head">
+                排队 {queueItems.length} 条
+              </div>
+              <div className="queue-strip-list" role="list">
+                {queueItems.map((item, index) => (
+                  <div className="queue-item" role="listitem" key={item.id}>
+                    <span className="queue-item-index" aria-hidden="true">
+                      {index + 1}
+                    </span>
+                    <div className="queue-item-text" title={item.text}>
+                      {queueItemSummary(item.text)}
+                    </div>
+                    <div className="queue-item-actions">
+                      <Button
+                        size="mini"
+                        fill="outline"
+                        disabled={queueBusy || status.kind !== "connected"}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void restoreQueue();
+                        }}
+                      >
+                        撤回
+                      </Button>
+                      <Button
+                        size="mini"
+                        color="primary"
+                        fill="outline"
+                        disabled={queueBusy || status.kind !== "connected"}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void cutInQueue();
+                        }}
+                      >
+                        插队
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
           <div className="composer">
             <div className="composer-status">{snapshotStatus(snapshot)}</div>
             <div className="composer-row">
@@ -772,17 +882,41 @@ function App() {
                   placeholder="输入消息"
                   autoSize={{ minRows: 1, maxRows: 6 }}
                   rows={1}
+                  ref={(node) => {
+                    // antd-mobile TextArea may forward to the wrapper; prefer native textarea.
+                    const el = (node as unknown as { nativeElement?: HTMLTextAreaElement } | null)
+                      ?.nativeElement
+                      ?? (node as unknown as HTMLTextAreaElement | null);
+                    composerTextAreaRef.current =
+                      el && "tagName" in el && el.tagName === "TEXTAREA"
+                        ? el
+                        : document.querySelector<HTMLTextAreaElement>(".composer textarea");
+                  }}
                 />
               </div>
-              <button
-                type="button"
-                className={`composer-action${actionMode === "stop" ? " stop" : ""}`}
-                disabled={actionMode === "send" ? !canSend : false}
-                aria-label={actionMode === "stop" ? "停止" : "发送"}
-                onClick={onComposerAction}
-              >
-                {actionMode === "stop" ? <StopIcon /> : <SendIcon />}
-              </button>
+              <div className="composer-actions">
+                {buttons.showStop ? (
+                  <button
+                    type="button"
+                    className="composer-action stop"
+                    aria-label="停止"
+                    onClick={() => void stop()}
+                  >
+                    <StopIcon />
+                  </button>
+                ) : null}
+                {buttons.showSend ? (
+                  <button
+                    type="button"
+                    className="composer-action"
+                    disabled={!canSend}
+                    aria-label="发送"
+                    onClick={() => void send()}
+                  >
+                    <SendIcon />
+                  </button>
+                ) : null}
+              </div>
             </div>
           </div>
         </div>
