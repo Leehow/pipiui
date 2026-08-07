@@ -189,16 +189,80 @@ extension ComputerCoordinator {
         _ = leaseController.release(sessionKey: execution.sessionKey)
         expiryWork?.cancel()
         expiryWork = nil
-        clearLeasePresentation()
+        // Soft end: model may retry. Session release / emergency / master-off
+        // call clearLeasePresentation() after this and collapse immediately.
+        scheduleDesktopPresentationGrace(statusMessage: reason)
         inputSynth.releaseAll()
         if respond {
             execution.reply.respond(Self.failure(reason))
         }
-        statusMessage = reason
         refreshInputMonitoring()
     }
 
+    /// Drop any pending grace collapse. Begin-paths call this so a new batch
+    /// keeps mini chrome without racing a stale timer into restore.
+    func cancelDesktopPresentationGrace() {
+        presentationGraceWork?.cancel()
+        presentationGraceWork = nil
+    }
+
+    /// Keep mini chrome + target highlight alive briefly after a desktop batch
+    /// ends. A follow-up batch (after model thinking) cancels the timer and
+    /// stays presented; only a quiet gap of `desktopPresentationGraceInterval`
+    /// actually restores the main window. Hard teardown paths must call
+    /// `clearLeasePresentation()` instead (emergency stop, master toggle off,
+    /// session release).
+    func scheduleDesktopPresentationGrace(
+        statusMessage waitingMessage: String? = nil
+    ) {
+        cancelDesktopPresentationGrace()
+        if let waitingMessage {
+            statusMessage = waitingMessage
+        }
+        // Nothing was showing — do not resurrect chrome. Still drop residual
+        // lease keys so mutex-level observers see the desktop as free.
+        guard isDesktopOperationActive else {
+            activeSessionKey = nil
+            activeApplication = nil
+            activeWindowID = nil
+            remainingActions = nil
+            return
+        }
+
+        let interval = desktopPresentationGraceInterval
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            // Only the currently scheduled item may collapse chrome. begin /
+            // hard-clear cancel + nil the handle before the deadline.
+            guard self.presentationGraceWork != nil else { return }
+            self.presentationGraceWork = nil
+            // Refuse to collapse while any desktop slot is occupied again.
+            guard self.cuaInFlightOperation == nil,
+                  self.inFlightExecution == nil,
+                  self.inFlightApplicationOpen == nil,
+                  self.isDesktopOperationActive else { return }
+            self.clearLeasePresentation()
+        }
+        presentationGraceWork = work
+        if interval <= 0 {
+            // Tests inject 0 to exercise expiry without sleeping 45s.
+            if Thread.isMainThread {
+                work.perform()
+            } else {
+                DispatchQueue.main.async(execute: work)
+            }
+        } else {
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + interval,
+                execute: work
+            )
+        }
+    }
+
+    /// Immediate presentation teardown. Cancels any grace timer first.
+    /// Used by emergency stop, Computer Use master-off, and session release.
     func clearLeasePresentation() {
+        cancelDesktopPresentationGrace()
         activeSessionKey = nil
         activeApplication = nil
         activeWindowID = nil

@@ -401,6 +401,8 @@ extension ComputerCoordinator {
             sessionKey: sessionKey,
             reply: reply
         )
+        // A prior batch may still be inside the presentation grace window.
+        cancelDesktopPresentationGrace()
         cuaInFlightOperation = operation
         activeSessionKey = sessionKey
         activeApplication = cuaSessionTargets[sessionKey]?.applicationIdentity
@@ -487,7 +489,9 @@ extension ComputerCoordinator {
         operation.task = nil
         cuaDriver?.cancelAndStop()
         cuaInFlightOperation = nil
-        clearLeasePresentation()
+        // Soft cancel: model may retry the next batch. Session release overrides
+        // with an immediate clearLeasePresentation() below.
+        scheduleDesktopPresentationGrace(statusMessage: reason)
         refreshInputMonitoring()
         if respond {
             operation.reply.respond(Self.cuaFailure(
@@ -495,7 +499,6 @@ extension ComputerCoordinator {
                 message: reason
             ))
         }
-        statusMessage = reason
         return true
     }
 
@@ -509,7 +512,12 @@ extension ComputerCoordinator {
                 reason: "computer session was released",
                 respond: true
             )
+            // Session teardown must not leave mini chrome in the grace window.
+            clearLeasePresentation()
             return
+        }
+        if activeSessionKey == sessionKey {
+            clearLeasePresentation()
         }
         guard hadTarget, let cuaDriver else { return }
         Task {
@@ -537,8 +545,10 @@ extension ComputerCoordinator {
         guard cuaInFlightOperation === operation else { return }
         operation.task = nil
         cuaInFlightOperation = nil
-        clearLeasePresentation()
-        statusMessage = "Cua Driver 桌面操作已完成，互斥槽已释放。"
+        // Keep mini chrome through the model-thinking gap; next begin cancels.
+        scheduleDesktopPresentationGrace(
+            statusMessage: "桌面操作已完成，等待下一步…"
+        )
         refreshInputMonitoring()
     }
 
@@ -549,7 +559,9 @@ extension ComputerCoordinator {
         operation.task = nil
         cuaInFlightOperation = nil
         cuaDriver?.cancelAndStop()
-        clearLeasePresentation()
+        scheduleDesktopPresentationGrace(
+            statusMessage: "桌面操作已取消，等待下一步…"
+        )
         refreshInputMonitoring()
     }
 

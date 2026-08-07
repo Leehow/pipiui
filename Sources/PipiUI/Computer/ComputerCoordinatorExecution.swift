@@ -173,7 +173,12 @@ extension ComputerCoordinator {
             execution.watchdog?.cancel()
             execution.markNoLongerCurrent()
             inFlightExecution = nil
-            clearLeasePresentation()
+            // Soft end: keep mini chrome through the model-thinking gap.
+            scheduleDesktopPresentationGrace(
+                statusMessage: result.error == nil
+                    ? "桌面操作已完成，等待下一步…"
+                    : "桌面操作已结束，等待下一步…"
+            )
             _ = leaseController.release(sessionKey: execution.sessionKey)
             inputSynth.releaseAll()
         }
@@ -190,9 +195,6 @@ extension ComputerCoordinator {
         // Lost ownership: never cache, never respond (abort/cancel already settled).
         guard ownsExecution else { return }
 
-        statusMessage = result.error == nil
-            ? "Computer Use 批次已完成，桌面互斥槽已释放。"
-            : "Computer Use 批次已结束，桌面互斥槽与输入状态已释放。"
         refreshInputMonitoring()
 
         guard let screenshot = result.screenshot else {

@@ -244,12 +244,19 @@ extension ComputerCoordinator {
             target: target,
             reply: reply
         )
+        // A prior batch may still be inside the presentation grace window.
+        cancelDesktopPresentationGrace()
         inFlightApplicationOpen = execution
         activeSessionKey = sessionKey
         activeApplication = target.authorizationIdentity
+        activeWindowID = nil
+        isDesktopOperationActive = true
         remainingActions = nil
         scheduleOpenApplicationTimeout(execution)
         statusMessage = "正在通过 NSWorkspace 打开 \(target.name)。"
+        Task { @MainActor in
+            ComputerUseWindowPresentation.shared.update(for: self)
+        }
         refreshInputMonitoring()
 
         execution.task = Task { @MainActor [weak self, weak execution] in

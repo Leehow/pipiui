@@ -56,6 +56,8 @@ extension ComputerCoordinator {
             return
         }
 
+        // A prior batch may still be inside the presentation grace window.
+        cancelDesktopPresentationGrace()
         activeSessionKey = sessionKey
         activeApplication = application
         activeWindowID = nil
