@@ -280,13 +280,42 @@ final class AppStore: ObservableObject {
     /// Bumped when skill enable/disable toggles change so slash menu refreshes.
     @Published var skillVisibilityRevision: Int = 0
 
-    // MARK: - pi 更新检查
+    // MARK: - 更新中心
 
-    @Published private(set) var piUpdateInfo = PiVersionInfo()
-    @Published private(set) var piIsChecking = false
+    @Published private(set) var productUpdates: [UpdateProductID: ProductUpdateInfo] = [:]
+    @Published private(set) var updateCheckingProducts: Set<UpdateProductID> = []
     @Published private(set) var piIsUpdating = false
     @Published private(set) var piUpdateLog = ""
-    @Published var isPiUpdatePresented = false
+    @Published var isUpdateCenterPresented = false
+
+    /// Persisted ignore list (`UpdateProductID.rawValue` → version string).
+    private var ignoredVersions: [UpdateProductID: String] = [:]
+    private static let ignoredVersionsKey = "updateCenter.ignoredVersions"
+
+    /// True while any product version check is in flight.
+    var isAnyUpdateChecking: Bool { !updateCheckingProducts.isEmpty }
+
+    /// True when any product has a non-ignored update available.
+    var anyUpdateAvailable: Bool {
+        productUpdates.values.contains { $0.updateAvailable }
+    }
+
+    /// Products with a non-ignored update, for indicator tooltips.
+    var productsWithUpdates: [ProductUpdateInfo] {
+        UpdateProductID.allCases.compactMap { id in
+            guard let info = productUpdates[id], info.updateAvailable else { return nil }
+            return info
+        }
+    }
+
+    /// Compatibility shim: pi-only checking flag.
+    var piIsChecking: Bool { updateCheckingProducts.contains(.pi) }
+
+    /// Compatibility shim for older presentation call sites.
+    var isPiUpdatePresented: Bool {
+        get { isUpdateCenterPresented }
+        set { isUpdateCenterPresented = newValue }
+    }
 
     /// Restart every open pi RPC process so auth.json changes take effect.
     func restartAllOpenSessions() {
@@ -841,6 +870,11 @@ final class AppStore: ObservableObject {
     }
 
     private init() {
+        loadIgnoredVersions()
+        productUpdates = Dictionary(uniqueKeysWithValues: UpdateProductID.allCases.map { id in
+            (id, ProductUpdateInfo.placeholder(for: id, ignoredVersion: ignoredVersions[id]))
+        })
+
         let paths = UserDefaults.standard.stringArray(forKey: Self.projectsKey) ?? []
         projects = paths.map { URL(fileURLWithPath: $0) }
         let projectPaths = Set(projects.map(\.path))
@@ -2148,42 +2182,164 @@ final class AppStore: ObservableObject {
 
     @MainActor func startAutomations() {
         automations.start()
-        checkPiUpdateNow()
+        checkAllUpdatesNow()
     }
 
-    // MARK: - pi 更新检查
+    // MARK: - 更新中心
 
-    /// Check the installed pi version against the npm registry latest. Swift/async,
-    /// runs on the main actor; network failure just records an error (never blocks UI).
+    /// Check every registered product concurrently.
+    @MainActor
+    func checkAllUpdatesNow() {
+        for id in UpdateProductID.allCases {
+            checkUpdates(for: id)
+        }
+    }
+
+    /// Compatibility entry point — checks pi only.
     @MainActor
     func checkPiUpdateNow() {
-        guard !piIsChecking else { return }
-        piIsChecking = true
-        Task {
-            let installed = PiVersionChecker.installedVersion()
-            let latest = await PiVersionChecker.latestVersion()
-            let now = Date()
-            let error = installed == nil
-                ? "未能定位已安装的 pi 可执行文件"
-                : (latest == nil ? "无法获取最新版本（网络失败或超时）" : nil)
-            piUpdateInfo = PiVersionInfo(
-                installed: installed,
-                latest: latest,
-                checkedAt: now,
-                error: error
-            )
-            piIsChecking = false
-            Log.info(
-                "pi update check -> installed=\(installed ?? "nil") latest=\(latest ?? "nil") update=\(piUpdateInfo.updateAvailable)",
-                category: .app
-            )
-        }
+        checkUpdates(for: .pi)
+    }
+
+    /// Re-check every product (sheet footer).
+    @MainActor
+    func refreshAllUpdates() {
+        checkAllUpdatesNow()
     }
 
     /// Re-run the pi update check.
     @MainActor
     func refreshPiUpdate() {
-        checkPiUpdateNow()
+        checkUpdates(for: .pi)
+    }
+
+    /// Check one product. Network work is off the main actor path via Task; failures
+    /// only set `error` (never crash).
+    @MainActor
+    func checkUpdates(for id: UpdateProductID) {
+        guard !updateCheckingProducts.contains(id) else { return }
+        var checking = updateCheckingProducts
+        checking.insert(id)
+        updateCheckingProducts = checking
+        Task {
+            switch id {
+            case .pi:
+                let installed = PiVersionChecker.installedVersion()
+                let latest = await PiVersionChecker.latestVersion()
+                let notes = UpdateProductID.pi.defaultReleaseNotesURL
+                let error: String?
+                if installed == nil {
+                    error = "未能定位已安装的 pi 可执行文件"
+                } else if latest == nil {
+                    error = "无法获取最新版本（网络失败或超时）"
+                } else {
+                    error = nil
+                }
+                await MainActor.run {
+                    self.applyCheckResult(
+                        id: .pi,
+                        installed: installed,
+                        latest: latest,
+                        releaseNotesURL: notes,
+                        error: error
+                    )
+                }
+            case .cuaDriver:
+                let installed = CuaDriverVersionChecker.installedVersion()
+                let result = await CuaDriverVersionChecker.latestVersion()
+                let error: String?
+                if installed == nil && result.version == nil {
+                    error = "未能读取 cua-driver 版本（未找到本地助手且网络查询失败）"
+                } else if result.version == nil {
+                    error = "无法获取 cua-driver 最新版本（网络失败或超时）"
+                } else if installed == nil {
+                    error = "未能读取已安装的 cua-driver 版本"
+                } else {
+                    error = nil
+                }
+                await MainActor.run {
+                    self.applyCheckResult(
+                        id: .cuaDriver,
+                        installed: installed,
+                        latest: result.version,
+                        releaseNotesURL: result.releaseNotesURL
+                            ?? UpdateProductID.cuaDriver.defaultReleaseNotesURL,
+                        error: error
+                    )
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func applyCheckResult(
+        id: UpdateProductID,
+        installed: String?,
+        latest: String?,
+        releaseNotesURL: URL?,
+        error: String?
+    ) {
+        var next = productUpdates
+        var info = next[id] ?? .placeholder(for: id, ignoredVersion: ignoredVersions[id])
+        info.installedVersion = installed
+        info.latestVersion = latest
+        info.releaseNotesURL = releaseNotesURL ?? id.defaultReleaseNotesURL
+        info.checkedAt = Date()
+        info.error = error
+        info.ignoredVersion = ignoredVersions[id]
+        next[id] = info
+        productUpdates = next
+        var checking = updateCheckingProducts
+        checking.remove(id)
+        updateCheckingProducts = checking
+        Log.info(
+            "update check \(id.rawValue) -> installed=\(installed ?? "nil") latest=\(latest ?? "nil") update=\(info.updateAvailable) ignored=\(info.isIgnored)",
+            category: .app
+        )
+    }
+
+    /// Persist "ignore this version" for a product and refresh live card state.
+    @MainActor
+    func ignoreVersion(_ product: UpdateProductID, _ version: String) {
+        ignoredVersions[product] = version
+        persistIgnoredVersions()
+        var next = productUpdates
+        var info = next[product] ?? .placeholder(for: product, ignoredVersion: version)
+        info.ignoredVersion = version
+        next[product] = info
+        productUpdates = next
+    }
+
+    /// Clear ignore for a product.
+    @MainActor
+    func unignoreVersion(_ product: UpdateProductID) {
+        ignoredVersions.removeValue(forKey: product)
+        persistIgnoredVersions()
+        var next = productUpdates
+        var info = next[product] ?? .placeholder(for: product)
+        info.ignoredVersion = nil
+        next[product] = info
+        productUpdates = next
+    }
+
+    private func loadIgnoredVersions() {
+        guard let data = UserDefaults.standard.data(forKey: Self.ignoredVersionsKey),
+              let decoded = try? JSONDecoder().decode([String: String].self, from: data)
+        else {
+            ignoredVersions = [:]
+            return
+        }
+        ignoredVersions = Dictionary(uniqueKeysWithValues: decoded.compactMap { key, value in
+            guard let id = UpdateProductID(rawValue: key) else { return nil }
+            return (id, value)
+        })
+    }
+
+    private func persistIgnoredVersions() {
+        let encoded = Dictionary(uniqueKeysWithValues: ignoredVersions.map { ($0.key.rawValue, $0.value) })
+        if let data = try? JSONEncoder().encode(encoded) {
+            UserDefaults.standard.set(data, forKey: Self.ignoredVersionsKey)
+        }
     }
 
     /// Run `pi update -na` to update pi itself, capturing output into `piUpdateLog`.
@@ -2254,7 +2410,7 @@ final class AppStore: ObservableObject {
                     self.appendPiUpdateLog("\n[结束] pi 更新进程退出码 \(p.terminationStatus)")
                 }
                 self.piIsUpdating = false
-                self.checkPiUpdateNow()
+                self.checkUpdates(for: .pi)
             }
         }
 

@@ -255,23 +255,28 @@ struct SidebarView: View {
             .frame(maxHeight: 760)
             .dismissOnOutsideClick { showComputerUseSettings = false }
         }
-        .sheet(isPresented: $store.isPiUpdatePresented) {
-            PiUpdateSheet()
+        .sheet(isPresented: $store.isUpdateCenterPresented) {
+            UpdateCenterSheet()
                 .environmentObject(store)
         }
     }
 
-    /// Bottom sidebar indicator for pi update availability.
+    /// Bottom sidebar indicator for any-product update availability.
     @ViewBuilder
     private var piUpdateIndicatorButton: some View {
-        if store.piIsChecking {
+        if store.isAnyUpdateChecking {
             ProgressView()
                 .controlSize(.small)
                 .frame(width: 22, height: 22)
-                .accessibilityLabel("正在检查 pi 更新")
-        } else if store.piUpdateInfo.updateAvailable, let latest = store.piUpdateInfo.latest {
+                .accessibilityLabel("正在检查更新")
+        } else if store.anyUpdateAvailable {
+            let names = store.productsWithUpdates.map(\.displayName).joined(separator: "、")
+            let detail = store.productsWithUpdates.compactMap { info -> String? in
+                guard let latest = info.latestVersion else { return info.displayName }
+                return "\(info.displayName) \(latest)"
+            }.joined(separator: "、")
             Button {
-                store.isPiUpdatePresented = true
+                store.isUpdateCenterPresented = true
             } label: {
                 Image(systemName: "arrow.down.circle.fill")
                     .font(.body)
@@ -285,8 +290,8 @@ struct SidebarView: View {
                     }
             }
             .buttonStyle(HoverButtonStyle())
-            .help("pi 有新版本可用 (最新 \(latest))")
-            .accessibilityLabel("pi 有新版本可用，点击更新")
+            .help("有可用更新 (\(detail))")
+            .accessibilityLabel("有可用更新 (\(names))，点击打开更新中心")
         }
     }
 

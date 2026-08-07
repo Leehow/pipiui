@@ -40,6 +40,8 @@ cp -R .build/release/PipiUI_PipiUI.bundle/. "$RESOURCE_BUNDLE/Contents/Resources
 CUA_HELPER="$APP/Contents/Helpers/cua-driver"
 ./scripts/fetch-cua-driver.sh "$CUA_HELPER"
 chmod 755 "$CUA_HELPER"
+CUA_VERSION="$(grep -E '^VERSION=' scripts/fetch-cua-driver.sh | head -1 | cut -d= -f2 | tr -d '"')"
+echo -n "$CUA_VERSION" > "$APP/Contents/Helpers/cua-driver.version"
 mkdir -p "$APP/Contents/Resources/ThirdPartyNotices"
 cp ThirdPartyNotices/CuaDriver-LICENSE.txt \
   "$APP/Contents/Resources/ThirdPartyNotices/CuaDriver-LICENSE.txt"
