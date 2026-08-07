@@ -1,5 +1,6 @@
 import {
   Button,
+  Dialog,
   List,
   Popup,
   Selector,
@@ -23,7 +24,7 @@ import {
   type QueueItem,
 } from "./chat-ui.js";
 import { TunnelClient, type TunnelStatus } from "./tunnel-client.js";
-import { MessageView } from "./message-view.js";
+import { TranscriptMessages } from "./message-view.js";
 import "antd-mobile/es/global/global.css";
 import "./styles.css";
 
@@ -520,6 +521,55 @@ function App() {
     }
   };
 
+  const resendMessage = async (entryId: string) => {
+    const as = logicRef.current.activeSession;
+    if (!as || !entryId) return;
+    if (snapshot?.isGenerating || snapshot?.isStopping) return;
+    if (status.kind !== "connected") return;
+    try {
+      await Dialog.confirm({
+        content: "确定重发这条消息？其后的回复会被替换。",
+        confirmText: "重发",
+        cancelText: "取消",
+      });
+    } catch {
+      return; // cancelled
+    }
+    try {
+      await logic()!.command("message.resend", {
+        sessionID: as,
+        messageID: entryId,
+        commandID: crypto.randomUUID(),
+      });
+      setRevision(null);
+      await pollSnapshot();
+    } catch (error) {
+      showError(error);
+    }
+  };
+
+  const editMessage = async (entryId: string, nextText: string) => {
+    const as = logicRef.current.activeSession;
+    if (!as || !entryId) return;
+    if (snapshot?.isGenerating || snapshot?.isStopping) return;
+    if (status.kind !== "connected") return;
+    const trimmed = nextText.trim();
+    if (!trimmed) return;
+    try {
+      await logic()!.command("message.edit", {
+        sessionID: as,
+        messageID: entryId,
+        text: trimmed,
+        commandID: crypto.randomUUID(),
+      });
+      setRevision(null);
+      await pollSnapshot();
+    } catch (error) {
+      showError(error);
+      throw error;
+    }
+  };
+
   // ---- model panel ----
   const toggleModel = () => {
     setModelOpen((open) => {
@@ -839,15 +889,16 @@ function App() {
                   <div className="list-empty">暂无消息</div>
                 )
               ) : (
-                messages.map((message: any, index: number) => (
-                  <MessageView
-                    key={index}
-                    message={message}
-                    live={liveTail
-                      && (message.kind === "tool" || message.kind === "thinking")
-                      && index === messages.length - 1}
-                  />
-                ))
+                <TranscriptMessages
+                  messages={messages}
+                  liveTail={liveTail}
+                  actionsDisabled={
+                    Boolean(snapshot?.isGenerating || snapshot?.isStopping)
+                    || status.kind !== "connected"
+                  }
+                  onResend={resendMessage}
+                  onEdit={editMessage}
+                />
               )}
             </div>
             {!stickToBottom ? (
