@@ -21,6 +21,89 @@ enum MessageTextBlocks {
     }
 }
 
+/// Streaming-row plan memo: `AssistantBlockLayout.plan` with `groupFinished: false` is cheap
+/// structurally but still rebuilds merged text strings on every ~50ms flush. Cache by item id
+/// and reuse the previous segment list when only the trailing text block grows.
+enum StreamingAssistantPlanCache {
+    private struct Entry {
+        var blocks: [ChatBlock]
+        var segments: [AssistantBlockLayout.Segment]
+    }
+
+    private static let lock = NSLock()
+    private static var entries: [String: Entry] = [:]
+
+    static func plan(
+        itemID: String,
+        blocks: [ChatBlock],
+        groupFinished: Bool,
+        toolRuns: [String: ToolRun]
+    ) -> [AssistantBlockLayout.Segment] {
+        if groupFinished {
+            lock.lock()
+            entries.removeValue(forKey: itemID)
+            lock.unlock()
+            return AssistantBlockLayout.plan(
+                blocks: blocks,
+                groupFinished: true,
+                toolRuns: toolRuns
+            )
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let entry = entries[itemID], entry.blocks == blocks {
+            return entry.segments
+        }
+
+        if let entry = entries[itemID],
+           let segments = incrementalStreamingSegments(
+               previousBlocks: entry.blocks,
+               previousSegments: entry.segments,
+               newBlocks: blocks
+           ) {
+            entries[itemID] = Entry(blocks: blocks, segments: segments)
+            return segments
+        }
+
+        let segments = AssistantBlockLayout.plan(
+            blocks: blocks,
+            groupFinished: false,
+            toolRuns: toolRuns
+        )
+        entries[itemID] = Entry(blocks: blocks, segments: segments)
+        return segments
+    }
+
+    /// Fast path when only the last `.text` block grew/shrunk via stream append.
+    private static func incrementalStreamingSegments(
+        previousBlocks: [ChatBlock],
+        previousSegments: [AssistantBlockLayout.Segment],
+        newBlocks: [ChatBlock]
+    ) -> [AssistantBlockLayout.Segment]? {
+        guard !previousBlocks.isEmpty,
+              previousBlocks.count == newBlocks.count,
+              case .text(let oldLast) = previousBlocks.last,
+              case .text(let newLast) = newBlocks.last,
+              newLast.hasPrefix(oldLast) || oldLast.hasPrefix(newLast)
+        else { return nil }
+
+        for index in 0..<(newBlocks.count - 1) where newBlocks[index] != previousBlocks[index] {
+            return nil
+        }
+
+        guard case .text(let previousSegText) = previousSegments.last,
+              previousSegText.hasSuffix(oldLast)
+        else { return nil }
+
+        let kept = previousSegText.dropLast(oldLast.count)
+        var segments = previousSegments
+        segments[segments.count - 1] = .text(String(kept) + newLast)
+        return segments
+    }
+}
+
 /// 单条消息行。只依赖自己的 item 和相关 toolRuns/subagents（Equatable），
 /// 流式更新时未变化的行不会重新计算 body。
 struct MessageRow: View, Equatable {
@@ -214,7 +297,8 @@ struct MessageRow: View, Equatable {
 
     private var assistantView: some View {
         AssistantSegmentsView(
-            segments: AssistantBlockLayout.plan(
+            segments: StreamingAssistantPlanCache.plan(
+                itemID: item.id,
                 blocks: item.blocks,
                 groupFinished: !isStreaming,
                 toolRuns: toolRuns
@@ -366,7 +450,7 @@ struct AssistantSegmentsView: View, Equatable {
             ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
                 switch segment {
                 case .text(let text):
-                    MarkdownTextView(text: text, onFlash: onFlash)
+                    MarkdownTextView(text: text, isStreaming: isStreaming, onFlash: onFlash)
                 case .image(let img):
                     ImageThumbnailView(
                         data: img.data,
