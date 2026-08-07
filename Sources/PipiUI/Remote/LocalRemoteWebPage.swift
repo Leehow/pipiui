@@ -228,6 +228,11 @@ enum LocalRemoteWebPage {
             let activeSession = null;
             let revision = null;
             const SESSION_PAGE_SIZE = 10;
+            // Web/touch slack for "near bottom" (desktop StickToBottomLogic uses 4pt;
+            // Relay chat-ui uses 80px — match the web threshold here).
+            const STICK_BOTTOM_THRESHOLD_PX = 80;
+            // Default pinned so first load / no user scroll still follows the tail.
+            let stickToBottom = true;
             let sessionPage = 0;
             let pollTimer = null;
             let connFailures = 0;
@@ -291,10 +296,19 @@ enum LocalRemoteWebPage {
               return data;
             }
             function setStatus(text) { el("status").textContent = text; }
+            function isNearBottom(node) {
+              return node.scrollHeight - (node.scrollTop + node.clientHeight) <= STICK_BOTTOM_THRESHOLD_PX;
+            }
+            function updateStickToBottomFromScroll() {
+              const transcript = el("transcript");
+              if (!transcript) return;
+              stickToBottom = isNearBottom(transcript);
+            }
             function showList() {
               el("remote-main").dataset.mobileView = "list";
               activeSession = null;
               revision = null;
+              stickToBottom = true;
               el("send").disabled = true;
               el("stop").disabled = true;
               setStatus("未连接会话");
@@ -369,6 +383,7 @@ enum LocalRemoteWebPage {
               try {
                 if (requestOpen) await api("/api/sessions/open", {sessionID});
                 activeSession = sessionID; revision = null;
+                stickToBottom = true;
                 el("send").disabled = false; el("stop").disabled = false;
                 await pollSnapshot();
                 await loadIndex();
@@ -666,6 +681,9 @@ enum LocalRemoteWebPage {
               el("send").disabled = !snapshot.processAlive;
               el("stop").disabled = !(snapshot.isGenerating || snapshot.isStopping);
               const transcript = el("transcript");
+              // Full rebuild resets native scroll; capture so unpinned readers keep place.
+              const previousScrollTop = transcript.scrollTop;
+              const shouldStick = stickToBottom;
               transcript.replaceChildren();
               snapshot.messages.forEach((message, index) => {
                 const isProgress = message.kind === "tool" || message.kind === "thinking";
@@ -674,7 +692,11 @@ enum LocalRemoteWebPage {
                   && index === snapshot.messages.length - 1;
                 transcript.append(renderEntry(message, live));
               });
-              transcript.scrollTop = transcript.scrollHeight;
+              if (shouldStick) {
+                transcript.scrollTop = transcript.scrollHeight;
+              } else {
+                transcript.scrollTop = previousScrollTop;
+              }
               setStatus(snapshot.isStopping ? "正在停止…" :
                 snapshot.isGenerating ? "生成中" :
                 snapshot.isInitializing ? "正在加载…" :
@@ -710,6 +732,7 @@ enum LocalRemoteWebPage {
               try { await loadIndex(); }
               catch (error) { setStatus(error.message); }
             });
+            el("transcript").addEventListener("scroll", updateStickToBottomFromScroll, {passive: true});
             loadIndex().catch(error => setStatus(error.message));
             pollTimer = window.setInterval(pollSnapshot, 900);
             window.addEventListener("pagehide", () => window.clearInterval(pollTimer), {once: true});
