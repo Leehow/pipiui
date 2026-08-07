@@ -16,6 +16,8 @@ enum RemoteRelayCommand: String, Codable, CaseIterable, Sendable {
     case snapshot
     case promptSend = "prompt.send"
     case generationStop = "generation.stop"
+    case queueRestore = "queue.restore"
+    case queueCutIn = "queue.cutIn"
     case modelsGet = "models.get"
     case modelSet = "model.set"
     case subagentModelSet = "subagentModel.set"
@@ -28,7 +30,7 @@ enum RemoteRelayCommand: String, Codable, CaseIterable, Sendable {
         switch self {
         case .index, .snapshot, .modelsGet, .agentsList, .agentsDetail, .panelState, .documentGet:
             return false
-        case .sessionCreate, .sessionOpen, .promptSend, .generationStop, .modelSet, .subagentModelSet:
+        case .sessionCreate, .sessionOpen, .promptSend, .generationStop, .queueRestore, .queueCutIn, .modelSet, .subagentModelSet:
             return true
         }
     }
@@ -41,6 +43,8 @@ enum RemoteRelayCommand: String, Codable, CaseIterable, Sendable {
         case ("POST", "/api/snapshot"): .snapshot
         case ("POST", "/api/send"): .promptSend
         case ("POST", "/api/stop"): .generationStop
+        case ("POST", "/api/queue/restore"): .queueRestore
+        case ("POST", "/api/queue/cut-in"): .queueCutIn
         case ("POST", "/api/models"): .modelsGet
         case ("POST", "/api/model"): .modelSet
         case ("POST", "/api/subagent-model"): .subagentModelSet
@@ -214,7 +218,7 @@ enum RemoteCommandSchema {
         case .sessionCreate:
             return exactKeys(dictionary, ["projectID"])
                 && nonemptyString(dictionary["projectID"], maximumBytes: 256)
-        case .sessionOpen, .generationStop, .modelsGet, .agentsList, .panelState:
+        case .sessionOpen, .generationStop, .queueRestore, .queueCutIn, .modelsGet, .agentsList, .panelState:
             return exactKeys(dictionary, ["sessionID"])
                 && nonemptyString(dictionary["sessionID"], maximumBytes: 256)
         case .agentsDetail:

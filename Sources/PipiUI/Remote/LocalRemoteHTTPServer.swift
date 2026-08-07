@@ -326,6 +326,8 @@ enum LocalRemoteRoutes {
         "/api/snapshot": "POST",
         "/api/send": "POST",
         "/api/stop": "POST",
+        "/api/queue/restore": "POST",
+        "/api/queue/cut-in": "POST",
         "/api/models": "POST",
         "/api/model": "POST",
         "/api/subagent-model": "POST",

@@ -54,6 +54,12 @@ struct RemoteTranscriptMessageDTO: Codable, Equatable, Sendable {
     }
 }
 
+/// One follow-up still waiting in the session queue (composer-facing text only).
+struct RemoteQueuedPromptDTO: Codable, Equatable, Sendable {
+    let id: String
+    let text: String
+}
+
 struct RemoteSessionSnapshotPayload: Codable, Equatable, Sendable {
     let sessionID: String
     let title: String
@@ -63,6 +69,8 @@ struct RemoteSessionSnapshotPayload: Codable, Equatable, Sendable {
     let isInitializing: Bool
     let processAlive: Bool
     let queuedPromptCount: Int
+    /// FIFO queue contents. `queuedPromptCount` remains for older clients and equals `queue.count`.
+    let queue: [RemoteQueuedPromptDTO]
     let error: String?
 }
 

@@ -73,6 +73,12 @@ final class RemoteRelayTests: XCTestCase {
         XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(method: "POST", path: "/api/agent"), .agentsDetail)
         XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(method: "POST", path: "/api/panel-state"), .panelState)
         XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(method: "POST", path: "/api/document"), .documentGet)
+        XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(
+            method: "POST", path: "/api/queue/restore"
+        ), .queueRestore)
+        XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(
+            method: "POST", path: "/api/queue/cut-in"
+        ), .queueCutIn)
         XCTAssertNil(RemoteRelayCommand.localHTTPCommand(
             method: "POST", path: "/rpc"
         ))
@@ -86,6 +92,8 @@ final class RemoteRelayTests: XCTestCase {
             "snapshot",
             "prompt.send",
             "generation.stop",
+            "queue.restore",
+            "queue.cutIn",
             "models.get",
             "model.set",
             "subagentModel.set",
@@ -94,6 +102,8 @@ final class RemoteRelayTests: XCTestCase {
             "panel.state",
             "document.get",
         ])
+        XCTAssertTrue(RemoteRelayCommand.queueRestore.isMutation)
+        XCTAssertTrue(RemoteRelayCommand.queueCutIn.isMutation)
     }
 
     func testStrictRequestDecoderAcceptsV1AndRejectsUnknownFieldsAndVersions() throws {
@@ -189,6 +199,22 @@ final class RemoteRelayTests: XCTestCase {
         XCTAssertTrue(RemoteCommandSchema.validate(command: .agentsDetail, body: Data(#"{"sessionID":"opaque","agentID":"agent"}"#.utf8)))
         XCTAssertTrue(RemoteCommandSchema.validate(command: .panelState, body: Data(#"{"sessionID":"opaque"}"#.utf8)))
         XCTAssertTrue(RemoteCommandSchema.validate(command: .documentGet, body: Data(#"{"sessionID":"opaque","documentID":"document"}"#.utf8)))
+        XCTAssertTrue(RemoteCommandSchema.validate(
+            command: .queueRestore,
+            body: Data(#"{"sessionID":"opaque"}"#.utf8)
+        ))
+        XCTAssertTrue(RemoteCommandSchema.validate(
+            command: .queueCutIn,
+            body: Data(#"{"sessionID":"opaque"}"#.utf8)
+        ))
+        XCTAssertFalse(RemoteCommandSchema.validate(
+            command: .queueRestore,
+            body: Data(#"{"sessionID":"opaque","extra":true}"#.utf8)
+        ))
+        XCTAssertFalse(RemoteCommandSchema.validate(
+            command: .queueCutIn,
+            body: Data(#"{}"#.utf8)
+        ))
     }
 
     func testSettingsRequireSecureSchemesAndSeparatedDeviceSignalHost() throws {
@@ -722,6 +748,22 @@ final class RemoteRelayTests: XCTestCase {
             expectation.fulfill()
         }
         wait(for: [expectation], timeout: 1)
+    }
+
+    func testQueueCommandsRejectUnknownSession() {
+        let controller = RemoteHostController(store: AppStore.shared)
+        for command in [RemoteRelayCommand.queueRestore, .queueCutIn] {
+            let expectation = expectation(description: "\(command.rawValue) unknown session")
+            controller.handle(RemoteCommandRequest(
+                command: command,
+                body: Data(#"{"sessionID":"s_missing_queue_command"}"#.utf8),
+                deadline: nil
+            )) { response in
+                XCTAssertEqual(response.status, 409, command.rawValue)
+                expectation.fulfill()
+            }
+            wait(for: [expectation], timeout: 1)
+        }
     }
 
     func testConnectionStatesExposeRequiredPresentation() {

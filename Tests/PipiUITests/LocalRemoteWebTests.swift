@@ -99,6 +99,161 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertTrue(session.isStopping)
     }
 
+    /// queue.restore maps to restoreQueueToDraft + composer merge (InputBar「撤回编辑」).
+    func testRemoteQueueRestoreFillsDraftAndClearsQueue() {
+        let session = ChatSession(
+            id: "remote-queue-restore-session",
+            projectURL: URL(fileURLWithPath: "/tmp/remote-queue-restore"),
+            sessionPath: nil,
+            blockedReason: "test-only"
+        )
+        defer { session.shutdown() }
+
+        session.isStreaming = true
+        session.sendPrompt("queued one")
+        session.sendPrompt("queued two")
+        XCTAssertEqual(session.messageQueue.count, 2)
+
+        // Empty draft → replace.
+        let restored = session.restoreQueueToDraft()
+        XCTAssertTrue(session.messageQueue.isEmpty)
+        XCTAssertTrue(session.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        if session.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            session.draftText = restored.text
+        } else if !restored.text.isEmpty {
+            session.draftText = session.draftText + "\n\n" + restored.text
+        }
+        session.draftImages.append(contentsOf: restored.images)
+        XCTAssertEqual(session.draftText, "queued one\n\nqueued two")
+
+        // Empty queue restore is a no-op for both queue and draft.
+        let before = session.draftText
+        let emptyRestore = session.restoreQueueToDraft()
+        XCTAssertTrue(emptyRestore.text.isEmpty)
+        XCTAssertTrue(session.messageQueue.isEmpty)
+        XCTAssertEqual(session.draftText, before)
+
+        // Non-empty draft → append with blank line separator (controller merge rule).
+        session.isStreaming = true
+        session.sendPrompt("more")
+        let again = session.restoreQueueToDraft()
+        if session.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            session.draftText = again.text
+        } else if !again.text.isEmpty {
+            session.draftText = session.draftText + "\n\n" + again.text
+        }
+        XCTAssertEqual(session.draftText, "queued one\n\nqueued two\n\nmore")
+        XCTAssertTrue(session.messageQueue.isEmpty)
+    }
+
+    /// queue.cutIn maps to cutInQueueHead: abort while streaming; empty queue no-op.
+    func testRemoteQueueCutInAbortsWhenStreamingAndNoopsWhenEmpty() {
+        let session = ChatSession(
+            id: "remote-queue-cutin-session",
+            projectURL: URL(fileURLWithPath: "/tmp/remote-queue-cutin"),
+            sessionPath: nil,
+            blockedReason: "test-only"
+        )
+        defer { session.shutdown() }
+
+        // Empty queue: no-op, must not stick stopping.
+        session.cutInQueueHead()
+        XCTAssertFalse(session.isStopping)
+        XCTAssertTrue(session.messageQueue.isEmpty)
+
+        session.isStreaming = true
+        session.sendPrompt("cut-me-1")
+        session.sendPrompt("cut-me-2")
+        XCTAssertEqual(session.messageQueue.count, 2)
+
+        session.cutInQueueHead()
+        XCTAssertTrue(session.isStopping, "cut-in while streaming must abort current generation")
+        // Queue stays until settle drain joins the batch; items must still be present.
+        XCTAssertEqual(session.messageQueue.count, 2)
+    }
+
+    func testSnapshotPayloadIncludesQueueContentsAndCount() throws {
+        let session = ChatSession(
+            id: "remote-queue-snapshot-session",
+            projectURL: URL(fileURLWithPath: "/Users/test/project"),
+            sessionPath: nil,
+            blockedReason: "test-only"
+        )
+        defer { session.shutdown() }
+
+        session.isStreaming = true
+        session.sendPrompt("follow up A")
+        session.sendPrompt("path leak /Users/test/secret.txt")
+        XCTAssertEqual(session.messageQueue.count, 2)
+
+        let input = RemoteSnapshotCacheInput(
+            sessionID: "s_queue_snapshot",
+            session: session,
+            homeDirectory: "/Users/test"
+        )
+        XCTAssertEqual(input.queuedPromptCount, 2)
+        XCTAssertEqual(input.queue.count, 2)
+        XCTAssertEqual(input.queue[0].text, "follow up A")
+        XCTAssertTrue(
+            input.queue[1].text.contains("[local path]"),
+            "queue text must redact home/project paths: \(input.queue[1].text)"
+        )
+        XCTAssertFalse(input.queue[0].id.isEmpty)
+        XCTAssertNotEqual(input.queue[0].id, input.queue[1].id)
+
+        let cache = RemoteSnapshotCache()
+        guard case .response(let data, _) = cache.resolve(input, requestedRevision: nil) else {
+            return XCTFail("snapshot with queue should encode")
+        }
+        let decoded = try JSONDecoder().decode(RemoteSessionSnapshotDTO.self, from: data)
+        XCTAssertEqual(decoded.snapshot.queuedPromptCount, 2)
+        XCTAssertEqual(decoded.snapshot.queue.count, 2)
+        XCTAssertEqual(decoded.snapshot.queue.map(\.text), input.queue.map(\.text))
+        XCTAssertEqual(decoded.snapshot.queue.map(\.id), input.queue.map(\.id))
+
+        // Queue content change with same count must bump revision (not just count).
+        let mutatedQueue = [
+            RemoteQueuedPromptDTO(id: input.queue[0].id, text: "edited A"),
+            input.queue[1],
+        ]
+        let mutated = RemoteSnapshotCacheInput(
+            sessionID: "s_queue_snapshot",
+            title: input.title,
+            transcriptVersion: input.transcriptVersion,
+            finalizedItems: input.finalizedItems,
+            streamingItem: input.streamingItem,
+            isGenerating: true,
+            queue: mutatedQueue,
+            projectPath: input.projectPath,
+            homeDirectory: input.homeDirectory
+        )
+        guard case .response(_, let revision) = cache.resolve(mutated, requestedRevision: nil) else {
+            return XCTFail("queue text edit should invalidate cache")
+        }
+        XCTAssertEqual(revision, 2)
+    }
+
+    func testSnapshotQueueDefaultsEmptyWhenOmitted() throws {
+        let cache = RemoteSnapshotCache()
+        let input = RemoteSnapshotCacheInput(
+            sessionID: "empty-queue-session",
+            title: "t",
+            transcriptVersion: 1,
+            finalizedItems: [],
+            streamingItem: nil,
+            projectPath: "/project",
+            homeDirectory: "/Users/test"
+        )
+        XCTAssertEqual(input.queue, [])
+        XCTAssertEqual(input.queuedPromptCount, 0)
+        guard case .response(let data, _) = cache.resolve(input, requestedRevision: nil) else {
+            return XCTFail("empty queue snapshot should encode")
+        }
+        let decoded = try JSONDecoder().decode(RemoteSessionSnapshotDTO.self, from: data)
+        XCTAssertEqual(decoded.snapshot.queue, [])
+        XCTAssertEqual(decoded.snapshot.queuedPromptCount, 0)
+    }
+
     func testIdempotencyCacheIsBoundedAndExpires() {
         var cache = RemotePromptIdempotencyCache(capacity: 2, lifetime: 10)
         let start = Date(timeIntervalSince1970: 100)

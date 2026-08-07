@@ -11,6 +11,7 @@ struct RemoteSnapshotCacheInput {
     let isInitializing: Bool
     let processAlive: Bool
     let queuedPromptCount: Int
+    let queue: [RemoteQueuedPromptDTO]
     let error: String?
     let projectPath: String
     let homeDirectory: String
@@ -32,10 +33,15 @@ struct RemoteSnapshotCacheInput {
         isStopping = session.isStopping
         isInitializing = session.isInitializing
         processAlive = session.processAlive
-        queuedPromptCount = session.messageQueue.count
-        error = session.lastError
         projectPath = session.projectURL.path
         self.homeDirectory = homeDirectory
+        queue = Self.normalizedQueue(
+            session.messageQueue,
+            projectPath: projectPath,
+            homeDirectory: homeDirectory
+        )
+        queuedPromptCount = queue.count
+        error = session.lastError
     }
 
     init(
@@ -48,7 +54,8 @@ struct RemoteSnapshotCacheInput {
         isStopping: Bool = false,
         isInitializing: Bool = false,
         processAlive: Bool = true,
-        queuedPromptCount: Int = 0,
+        queuedPromptCount: Int? = nil,
+        queue: [RemoteQueuedPromptDTO] = [],
         error: String? = nil,
         projectPath: String,
         homeDirectory: String
@@ -62,10 +69,32 @@ struct RemoteSnapshotCacheInput {
         self.isStopping = isStopping
         self.isInitializing = isInitializing
         self.processAlive = processAlive
-        self.queuedPromptCount = queuedPromptCount
+        self.queue = queue
+        self.queuedPromptCount = queuedPromptCount ?? queue.count
         self.error = error
         self.projectPath = projectPath
         self.homeDirectory = homeDirectory
+    }
+
+    /// Composer-facing queue rows: strip attachment footnotes and redact local paths.
+    static func normalizedQueue(
+        _ items: [QueuedMessage],
+        projectPath: String,
+        homeDirectory: String
+    ) -> [RemoteQueuedPromptDTO] {
+        items.map { item in
+            let display = ImageAttachment.stripAttachmentPathsForDisplay(item.text)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = RemoteTranscriptNormalizer.redactKnownLocalPaths(
+                display,
+                projectPath: projectPath,
+                homeDirectory: homeDirectory
+            )
+            return RemoteQueuedPromptDTO(
+                id: item.id.uuidString.lowercased(),
+                text: text
+            )
+        }
     }
 }
 
@@ -88,6 +117,7 @@ final class RemoteSnapshotCache {
         let isInitializing: Bool
         let processAlive: Bool
         let queuedPromptCount: Int
+        let queue: [RemoteQueuedPromptDTO]
         let error: String?
         let projectPath: String
         let homeDirectory: String
@@ -119,6 +149,7 @@ final class RemoteSnapshotCache {
             isInitializing: input.isInitializing,
             processAlive: input.processAlive,
             queuedPromptCount: input.queuedPromptCount,
+            queue: input.queue,
             error: input.error,
             projectPath: input.projectPath,
             homeDirectory: input.homeDirectory
@@ -187,6 +218,7 @@ final class RemoteSnapshotCache {
             isInitializing: input.isInitializing,
             processAlive: input.processAlive,
             queuedPromptCount: input.queuedPromptCount,
+            queue: input.queue,
             error: error
         )
         let revision = (previous?.revision ?? 0) &+ 1

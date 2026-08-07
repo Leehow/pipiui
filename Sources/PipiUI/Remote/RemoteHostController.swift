@@ -203,6 +203,26 @@ final class RemoteHostController {
             }
             respond(.json(status: 202, ["accepted": true]))
 
+        case .queueRestore:
+            guard let sessionID = stringField("sessionID", in: request.body),
+                  let session = liveSession(for: sessionID, store: store) else {
+                respond(.json(status: 409, ["error": "session is not open"]))
+                return
+            }
+            // Empty queue is a no-op (still accepted). Mirrors local「撤回编辑」.
+            applyRestoredQueueToDraft(session: session, restored: session.restoreQueueToDraft())
+            respond(.json(status: 202, ["accepted": true]))
+
+        case .queueCutIn:
+            guard let sessionID = stringField("sessionID", in: request.body),
+                  let session = liveSession(for: sessionID, store: store) else {
+                respond(.json(status: 409, ["error": "session is not open"]))
+                return
+            }
+            // Empty queue is a no-op (still accepted). Mirrors local「插队」.
+            session.cutInQueueHead()
+            respond(.json(status: 202, ["accepted": true]))
+
         case .modelsGet:
             guard let sessionID = stringField("sessionID", in: request.body),
                   let session = liveSession(for: sessionID, store: store) else {
@@ -483,6 +503,19 @@ final class RemoteHostController {
 
     private func stringField(_ field: String, in data: Data) -> String? {
         decodeObject(data)?[field] as? String
+    }
+
+    /// Same composer merge as InputBar「撤回编辑」: empty draft replaces; non-empty appends.
+    private func applyRestoredQueueToDraft(
+        session: ChatSession,
+        restored: (text: String, images: [DraftImage])
+    ) {
+        if session.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            session.draftText = restored.text
+        } else if !restored.text.isEmpty {
+            session.draftText = session.draftText + "\n\n" + restored.text
+        }
+        session.draftImages.append(contentsOf: restored.images)
     }
 
     private func encode<T: Encodable>(_ value: T, status: Int = 200) -> RemoteCommandResponse {
