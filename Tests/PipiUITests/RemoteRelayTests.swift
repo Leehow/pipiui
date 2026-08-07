@@ -91,6 +91,8 @@ final class RemoteRelayTests: XCTestCase {
             "session.open",
             "snapshot",
             "prompt.send",
+            "message.edit",
+            "message.resend",
             "generation.stop",
             "queue.restore",
             "queue.cutIn",
@@ -104,6 +106,14 @@ final class RemoteRelayTests: XCTestCase {
         ])
         XCTAssertTrue(RemoteRelayCommand.queueRestore.isMutation)
         XCTAssertTrue(RemoteRelayCommand.queueCutIn.isMutation)
+        XCTAssertTrue(RemoteRelayCommand.messageEdit.isMutation)
+        XCTAssertTrue(RemoteRelayCommand.messageResend.isMutation)
+        XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(
+            method: "POST", path: "/api/message/edit"
+        ), .messageEdit)
+        XCTAssertEqual(RemoteRelayCommand.localHTTPCommand(
+            method: "POST", path: "/api/message/resend"
+        ), .messageResend)
     }
 
     func testStrictRequestDecoderAcceptsV1AndRejectsUnknownFieldsAndVersions() throws {
@@ -214,6 +224,36 @@ final class RemoteRelayTests: XCTestCase {
         XCTAssertFalse(RemoteCommandSchema.validate(
             command: .queueCutIn,
             body: Data(#"{}"#.utf8)
+        ))
+        XCTAssertTrue(RemoteCommandSchema.validate(
+            command: .messageResend,
+            body: try JSONSerialization.data(withJSONObject: [
+                "sessionID": "opaque",
+                "messageID": "entry-1",
+                "commandID": UUID().uuidString,
+            ])
+        ))
+        XCTAssertTrue(RemoteCommandSchema.validate(
+            command: .messageEdit,
+            body: try JSONSerialization.data(withJSONObject: [
+                "sessionID": "opaque",
+                "messageID": "entry-1",
+                "text": "revised",
+                "commandID": UUID().uuidString,
+            ])
+        ))
+        XCTAssertFalse(RemoteCommandSchema.validate(
+            command: .messageResend,
+            body: Data(#"{"sessionID":"opaque","messageID":"entry-1"}"#.utf8)
+        ))
+        XCTAssertFalse(RemoteCommandSchema.validate(
+            command: .messageEdit,
+            body: try JSONSerialization.data(withJSONObject: [
+                "sessionID": "opaque",
+                "messageID": "entry-1",
+                "text": "revised",
+                "commandID": "not-a-uuid",
+            ])
         ))
     }
 

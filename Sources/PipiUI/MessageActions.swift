@@ -140,6 +140,10 @@ enum MessageActions {
         var stamped = clearingEntryIds(items)
         for (itemIndex, entry) in zip(candidateIndices, branchMessages) {
             stamped[itemIndex].entryId = entry["id"].string
+            // Prefer entry-level JSONL timestamp; fall back to message-level.
+            if let ts = entry["timestamp"].string ?? entry["message"]["timestamp"].string {
+                stamped[itemIndex].timestamp = ts
+            }
         }
         return stamped
     }

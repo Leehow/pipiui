@@ -83,6 +83,105 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertTrue(session.transcript.isEmpty)
     }
 
+    func testRemoteMessageEditAndResendGuardIdleFoundAndEmpty() {
+        let session = ChatSession(
+            id: "remote-message-action-session",
+            projectURL: URL(fileURLWithPath: "/tmp/remote-message-action"),
+            sessionPath: nil,
+            blockedReason: "test-only"
+        )
+        defer { session.shutdown() }
+
+        // No backend / process → unavailable before lookup side effects.
+        XCTAssertEqual(
+            session.resendRemoteUserMessage(messageID: "missing"),
+            .unavailable
+        )
+        XCTAssertEqual(
+            session.editRemoteUserMessage(messageID: "missing", text: "hi"),
+            .unavailable
+        )
+        XCTAssertEqual(
+            session.editRemoteUserMessage(messageID: "missing", text: "   "),
+            .empty
+        )
+
+        // Complete fork with failure so isSendingFromQueue does not stick across calls.
+        final class CompletingFakeBackend: AgentSessionBackend {
+            var onEvent: ((J) -> Void)?
+            var onExit: ((Int32, String) -> Void)?
+            var isRunning = true
+            private(set) var requested: [[String: Any]] = []
+            func send(_ object: [String: Any], failure: (() -> Void)?) {}
+            func request(_ object: [String: Any], completion: ((J) -> Void)?) {
+                requested.append(object)
+                completion?(J(["success": false, "error": "test-stub"]))
+            }
+            func terminate() { isRunning = false }
+            func signalDescendants(_ sig: Int32) {}
+            func forceKill() { isRunning = false }
+        }
+        let fake = CompletingFakeBackend()
+        session.attachTestingBackend(fake)
+        session.sessionFile = "/tmp/remote-message-action/session.jsonl"
+        session.transcript = [
+            ChatItem(
+                id: "item-user",
+                role: "user",
+                blocks: [.text("original prompt")],
+                entryId: "entry-user-1",
+                timestamp: "2024-06-01T12:00:00.000Z"
+            ),
+            ChatItem(
+                id: "item-assistant",
+                role: "assistant",
+                blocks: [.text("reply")],
+                entryId: "entry-assistant-1"
+            ),
+        ]
+
+        XCTAssertEqual(session.resendRemoteUserMessage(messageID: "nope"), .notFound)
+        XCTAssertEqual(
+            session.editRemoteUserMessage(messageID: "nope", text: "x"),
+            .notFound
+        )
+
+        session.isStreaming = true
+        XCTAssertEqual(
+            session.resendRemoteUserMessage(messageID: "entry-user-1"),
+            .notIdle
+        )
+        XCTAssertEqual(
+            session.editRemoteUserMessage(messageID: "entry-user-1", text: "new"),
+            .notIdle
+        )
+        session.isStreaming = false
+
+        // Success: resolve by entryId and kick the shared fork path.
+        XCTAssertEqual(
+            session.resendRemoteUserMessage(messageID: "entry-user-1"),
+            .accepted
+        )
+        XCTAssertEqual(
+            session.editRemoteUserMessage(messageID: "entry-user-1", text: "edited prompt"),
+            .accepted
+        )
+        // Id fallback also works.
+        XCTAssertEqual(
+            session.resendRemoteUserMessage(messageID: "item-user"),
+            .accepted
+        )
+
+        let forkTypes = fake.requested.compactMap { $0["type"] as? String }
+        XCTAssertTrue(forkTypes.contains("fork"))
+        XCTAssertTrue(
+            fake.requested.contains(where: {
+                ($0["type"] as? String) == "fork" && ($0["entryId"] as? String) == "entry-user-1"
+            })
+        )
+        XCTAssertFalse(session.isWorking)
+    }
+
     func testRemoteStopCannotStickIdleSessionInStoppingState() {
         let session = ChatSession(
             id: "remote-stop-test-session",
@@ -610,7 +709,9 @@ final class LocalRemoteWebTests: XCTestCase {
                         mimeType: "image/png",
                         path: "/Users/alice/project/image.png"
                     )),
-                ]
+                ],
+                entryId: "entry-user-1",
+                timestamp: "2024-06-01T12:00:00.000Z"
             ),
             ChatItem(
                 id: "internal-assistant-id",
@@ -625,7 +726,9 @@ final class LocalRemoteWebTests: XCTestCase {
                         fileChangePayload: nil
                     )),
                     .text("stored under /Users/alice/other"),
-                ]
+                ],
+                entryId: "entry-assistant-1",
+                timestamp: "2024-06-01T12:00:05.123Z"
             ),
         ]
         let messages = RemoteTranscriptNormalizer.normalizedMessages(
@@ -639,20 +742,28 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertFalse(messages[0].text.contains("/Users/alice"))
         XCTAssertFalse(messages[0].text.contains("image.png"))
         XCTAssertEqual(messages[0].text, "inspect [local path]")
+        XCTAssertEqual(messages[0].entryId, "entry-user-1")
+        XCTAssertEqual(messages[0].timestamp, "2024-06-01T12:00:00.000Z")
 
         // Thinking is exposed only as a content-free indicator.
         XCTAssertEqual(messages[1].kind, .thinking)
         XCTAssertEqual(messages[1].text, "")
         XCTAssertNil(messages[1].toolName)
+        XCTAssertEqual(messages[1].entryId, "entry-assistant-1")
+        XCTAssertEqual(messages[1].timestamp, "2024-06-01T12:00:05.123Z")
 
         // Tool calls expose only the name and the redacted argument summary.
         XCTAssertEqual(messages[2].kind, .tool)
         XCTAssertEqual(messages[2].toolName, "Bash")
         XCTAssertEqual(messages[2].toolSummary, "Bash · ls [local path]")
         XCTAssertEqual(messages[2].text, "")
+        XCTAssertEqual(messages[2].entryId, "entry-assistant-1")
+        XCTAssertEqual(messages[2].timestamp, "2024-06-01T12:00:05.123Z")
 
         XCTAssertEqual(messages[3].kind, .text)
         XCTAssertEqual(messages[3].text, "stored under [local path]")
+        XCTAssertEqual(messages[3].entryId, "entry-assistant-1")
+        XCTAssertEqual(messages[3].timestamp, "2024-06-01T12:00:05.123Z")
 
         // No payload, thinking content, media path, or local path leaks anywhere.
         let encoded = try! JSONEncoder().encode(messages)
@@ -663,6 +774,36 @@ final class LocalRemoteWebTests: XCTestCase {
         XCTAssertFalse(json.contains("tool-internal-id"))
         XCTAssertFalse(json.contains("internal-user-id"))
         XCTAssertFalse(json.contains("internal-assistant-id"))
+        XCTAssertTrue(json.contains("entry-user-1"))
+        XCTAssertTrue(json.contains("entry-assistant-1"))
+        XCTAssertTrue(json.contains("2024-06-01T12:00:00.000Z"))
+    }
+
+    func testTranscriptNormalizationOmitsTimestampAndEntryIdWhenAbsent() {
+        let items = [
+            ChatItem(id: "u", role: "user", blocks: [.text("hello")]),
+            ChatItem(
+                id: "a",
+                role: "assistant",
+                blocks: [
+                    .thinking("hidden"),
+                    .text("world"),
+                ]
+            ),
+        ]
+        let messages = RemoteTranscriptNormalizer.normalizedMessages(
+            items,
+            projectPath: "/project",
+            homeDirectory: "/Users/test"
+        )
+        XCTAssertEqual(messages.count, 3)
+        for message in messages {
+            XCTAssertNil(message.timestamp)
+            XCTAssertNil(message.entryId)
+        }
+        let encoded = try! JSONEncoder().encode(messages)
+        let json = String(data: encoded, encoding: .utf8)!
+        XCTAssertFalse(json.contains("hidden"))
     }
 
     func testAssistantProgressEntriesKeepBlockOrderWithStableIDs() {

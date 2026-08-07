@@ -15,6 +15,8 @@ enum RemoteRelayCommand: String, Codable, CaseIterable, Sendable {
     case sessionOpen = "session.open"
     case snapshot
     case promptSend = "prompt.send"
+    case messageEdit = "message.edit"
+    case messageResend = "message.resend"
     case generationStop = "generation.stop"
     case queueRestore = "queue.restore"
     case queueCutIn = "queue.cutIn"
@@ -30,7 +32,8 @@ enum RemoteRelayCommand: String, Codable, CaseIterable, Sendable {
         switch self {
         case .index, .snapshot, .modelsGet, .agentsList, .agentsDetail, .panelState, .documentGet:
             return false
-        case .sessionCreate, .sessionOpen, .promptSend, .generationStop, .queueRestore, .queueCutIn, .modelSet, .subagentModelSet:
+        case .sessionCreate, .sessionOpen, .promptSend, .messageEdit, .messageResend,
+                .generationStop, .queueRestore, .queueCutIn, .modelSet, .subagentModelSet:
             return true
         }
     }
@@ -42,6 +45,8 @@ enum RemoteRelayCommand: String, Codable, CaseIterable, Sendable {
         case ("POST", "/api/sessions/open"): .sessionOpen
         case ("POST", "/api/snapshot"): .snapshot
         case ("POST", "/api/send"): .promptSend
+        case ("POST", "/api/message/edit"): .messageEdit
+        case ("POST", "/api/message/resend"): .messageResend
         case ("POST", "/api/stop"): .generationStop
         case ("POST", "/api/queue/restore"): .queueRestore
         case ("POST", "/api/queue/cut-in"): .queueCutIn
@@ -259,6 +264,17 @@ enum RemoteCommandSchema {
             return exactKeys(dictionary, ["sessionID", "text", "commandID"])
                 && nonemptyString(dictionary["sessionID"], maximumBytes: 256)
                 && string(dictionary["text"], maximumBytes: 64 * 1024)
+                && ((dictionary["commandID"] as? String).flatMap(UUID.init(uuidString:)) != nil)
+        case .messageEdit:
+            return exactKeys(dictionary, ["sessionID", "messageID", "text", "commandID"])
+                && nonemptyString(dictionary["sessionID"], maximumBytes: 256)
+                && nonemptyString(dictionary["messageID"], maximumBytes: 256)
+                && string(dictionary["text"], maximumBytes: 64 * 1024)
+                && ((dictionary["commandID"] as? String).flatMap(UUID.init(uuidString:)) != nil)
+        case .messageResend:
+            return exactKeys(dictionary, ["sessionID", "messageID", "commandID"])
+                && nonemptyString(dictionary["sessionID"], maximumBytes: 256)
+                && nonemptyString(dictionary["messageID"], maximumBytes: 256)
                 && ((dictionary["commandID"] as? String).flatMap(UUID.init(uuidString:)) != nil)
         }
     }

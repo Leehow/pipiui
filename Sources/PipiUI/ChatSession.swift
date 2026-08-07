@@ -457,6 +457,8 @@ struct ChatItem: Identifiable, Equatable {
     let role: String // user / assistant / system
     var blocks: [ChatBlock]
     var entryId: String? = nil
+    /// ISO8601 entry timestamp from pi session JSONL when available.
+    var timestamp: String? = nil
     /// App-only bubble with no corresponding pi session entry (for example media generation).
     var isLocalOnly = false
 }
@@ -547,6 +549,7 @@ enum InitialTranscriptReconciler {
                 role: item.role,
                 blocks: item.blocks,
                 entryId: item.entryId,
+                timestamp: item.timestamp,
                 isLocalOnly: item.isLocalOnly
             )
         }
@@ -2178,7 +2181,14 @@ final class ChatSession: ObservableObject, Identifiable {
                 if let lastIdx = transcript.indices.last,
                    Self.shouldReplaceOptimisticUser(existing: transcript[lastIdx], incoming: item) {
                     let keepId = transcript[lastIdx].id
-                    transcript[lastIdx] = ChatItem(id: keepId, role: item.role, blocks: item.blocks)
+                    transcript[lastIdx] = ChatItem(
+                        id: keepId,
+                        role: item.role,
+                        blocks: item.blocks,
+                        entryId: item.entryId,
+                        timestamp: item.timestamp,
+                        isLocalOnly: item.isLocalOnly
+                    )
                     appliedId = keepId
                     // 服务端已回显该消息：caption 展开标记不再需要（气泡本次默认展开已生效）。
                     if visionCaptionOptimisticID == keepId {
@@ -2276,7 +2286,12 @@ final class ChatSession: ObservableObject, Identifiable {
                 }
             }
         }
-        return ChatItem(id: id, role: role, blocks: blocks)
+        return ChatItem(
+            id: id,
+            role: role,
+            blocks: blocks,
+            timestamp: message["timestamp"].string
+        )
     }
 
     /// Stamp finished wall-clock durations onto toolCall blocks from live toolRuns.
@@ -2745,7 +2760,14 @@ final class ChatSession: ObservableObject, Identifiable {
         // Prefer images-first layout (matches optimistic send).
         var blocks: [ChatBlock] = imageBlocks.map { .image($0) }
         blocks.append(contentsOf: nonImage)
-        return ChatItem(id: item.id, role: item.role, blocks: blocks)
+        return ChatItem(
+            id: item.id,
+            role: item.role,
+            blocks: blocks,
+            entryId: item.entryId,
+            timestamp: item.timestamp,
+            isLocalOnly: item.isLocalOnly
+        )
     }
 
     // MARK: - Live image backfill (T4: keep disk reads off the main-thread ingest path)
@@ -3472,6 +3494,129 @@ final class ChatSession: ObservableObject, Identifiable {
         case empty
         case rejectedBuiltin(String)
         case unavailable
+    }
+
+    /// Result of remote `message.edit` / `message.resend`.
+    enum RemoteMessageActionResult: Equatable {
+        case accepted
+        case empty
+        case notIdle
+        case notFound
+        case notUserMessage
+        case notReady
+        case unavailable
+    }
+
+    /// Test-only backend attachment so remote edit/resend can exercise the fork path
+    /// without spawning a real pi process.
+    package func attachTestingBackend(_ backend: (any AgentSessionBackend)?) {
+        self.backend = backend
+        if backend != nil {
+            processAlive = true
+            if lastError != nil { lastError = nil }
+        }
+    }
+
+    /// Resolve a user message for remote edit/resend. `messageID` is the pi entry id;
+    /// ChatItem.id is accepted as a fallback (matches local UI item ids).
+    private func resolveRemoteUserMessage(messageID: String) -> ChatItem? {
+        if let byEntry = transcript.first(where: {
+            $0.entryId == messageID && $0.role == "user"
+        }) {
+            return byEntry
+        }
+        return transcript.first(where: { $0.id == messageID && $0.role == "user" })
+    }
+
+    /// Remote `message.resend`: fork at the user entry and resend original text/images.
+    func resendRemoteUserMessage(messageID: String) -> RemoteMessageActionResult {
+        guard !isWorking else { return .notIdle }
+        guard processAlive, backend != nil else { return .unavailable }
+        guard let item = resolveRemoteUserMessage(messageID: messageID) else {
+            return .notFound
+        }
+        guard MessageActions.isUserAuthoredMessage(item) else { return .notUserMessage }
+        let text = MessageActions.copyableText(from: item)
+        guard MessageActions.isEditDraftSendable(text) else { return .empty }
+        guard let previousPath = sessionFile, !previousPath.isEmpty else { return .notReady }
+
+        if item.entryId != nil {
+            resendUserMessageNow(itemId: item.id)
+            return .accepted
+        }
+        // Ids stamp asynchronously after settle; sync once like the local UI path.
+        let itemId = item.id
+        syncEntryIds { [weak self] in
+            guard let self else { return }
+            self.resendUserMessageNow(itemId: itemId)
+        }
+        return .accepted
+    }
+
+    /// Remote `message.edit`: fork at the user entry and resend the new text (images kept).
+    func editRemoteUserMessage(messageID: String, text: String) -> RemoteMessageActionResult {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard MessageActions.isEditDraftSendable(trimmed) else { return .empty }
+        guard !isWorking else { return .notIdle }
+        guard processAlive, backend != nil else { return .unavailable }
+        guard let item = resolveRemoteUserMessage(messageID: messageID) else {
+            return .notFound
+        }
+        guard MessageActions.isUserAuthoredMessage(item) else { return .notUserMessage }
+        guard let previousPath = sessionFile, !previousPath.isEmpty else { return .notReady }
+
+        if let entryId = item.entryId {
+            return commitRemoteEdit(
+                item: item,
+                entryId: entryId,
+                text: trimmed,
+                previousPath: previousPath
+            )
+        }
+        let itemId = item.id
+        syncEntryIds { [weak self] in
+            guard let self else { return }
+            guard !self.isWorking else { return }
+            guard let refreshed = self.transcript.first(where: { $0.id == itemId }),
+                  let entryId = refreshed.entryId,
+                  let path = self.sessionFile, !path.isEmpty else {
+                self.flash("无法编辑：消息尚未就绪")
+                return
+            }
+            _ = self.commitRemoteEdit(
+                item: refreshed,
+                entryId: entryId,
+                text: trimmed,
+                previousPath: path
+            )
+        }
+        return .accepted
+    }
+
+    private func commitRemoteEdit(
+        item: ChatItem,
+        entryId: String,
+        text: String,
+        previousPath: String
+    ) -> RemoteMessageActionResult {
+        let original = MessageActions.copyableText(from: item)
+        if MessageActions.shouldNoOpEdit(
+            originalText: original,
+            newText: text,
+            itemEntryId: entryId,
+            branchMessages: cachedBranchMessages
+        ) {
+            return .accepted
+        }
+        guard backend != nil else { return .unavailable }
+        forkAndResendPrompt(
+            entryId: entryId,
+            text: text,
+            images: draftImages(from: item),
+            previousPath: previousPath,
+            actionNoun: "编辑"
+        )
+        return .accepted
     }
 
     enum AutomationPromptSubmissionResult: Equatable {
