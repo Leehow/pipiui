@@ -191,6 +191,87 @@ final class RemoteHostController {
                 respond(.json(status: 409, ["error": "session process is unavailable"]))
             }
 
+        case .messageEdit:
+            guard let body = decodeObject(request.body),
+                  let sessionID = body["sessionID"] as? String,
+                  let messageID = body["messageID"] as? String,
+                  let text = body["text"] as? String,
+                  let commandID = body["commandID"] as? String,
+                  UUID(uuidString: commandID) != nil else {
+                respond(.json(status: 422, [
+                    "error": "sessionID, messageID, text and UUID commandID required"
+                ]))
+                return
+            }
+            guard text.utf8.count <= 64 * 1024 else {
+                respond(.json(status: 413, ["error": "prompt exceeds 64 KiB"]))
+                return
+            }
+            guard let session = liveSession(for: sessionID, store: store) else {
+                respond(.json(status: 409, ["error": "session is not open"]))
+                return
+            }
+            let cacheKey = "\(sessionID):message.edit:\(commandID.lowercased())"
+            if idempotency.contains(cacheKey) {
+                respond(.json(["accepted": true, "duplicate": true]))
+                return
+            }
+            switch session.editRemoteUserMessage(messageID: messageID, text: text) {
+            case .accepted:
+                idempotency.insert(cacheKey)
+                respond(.json(status: 202, ["accepted": true, "duplicate": false]))
+            case .empty:
+                respond(.json(status: 422, ["error": "message text is empty"]))
+            case .notIdle:
+                respond(.json(status: 409, ["error": "session is busy"]))
+            case .notFound:
+                respond(.json(status: 404, ["error": "message not found"]))
+            case .notUserMessage:
+                respond(.json(status: 422, ["error": "message is not a user message"]))
+            case .notReady:
+                respond(.json(status: 409, ["error": "message is not ready"]))
+            case .unavailable:
+                respond(.json(status: 409, ["error": "session process is unavailable"]))
+            }
+
+        case .messageResend:
+            guard let body = decodeObject(request.body),
+                  let sessionID = body["sessionID"] as? String,
+                  let messageID = body["messageID"] as? String,
+                  let commandID = body["commandID"] as? String,
+                  UUID(uuidString: commandID) != nil else {
+                respond(.json(status: 422, [
+                    "error": "sessionID, messageID and UUID commandID required"
+                ]))
+                return
+            }
+            guard let session = liveSession(for: sessionID, store: store) else {
+                respond(.json(status: 409, ["error": "session is not open"]))
+                return
+            }
+            let cacheKey = "\(sessionID):message.resend:\(commandID.lowercased())"
+            if idempotency.contains(cacheKey) {
+                respond(.json(["accepted": true, "duplicate": true]))
+                return
+            }
+            switch session.resendRemoteUserMessage(messageID: messageID) {
+            case .accepted:
+                idempotency.insert(cacheKey)
+                respond(.json(status: 202, ["accepted": true, "duplicate": false]))
+            case .empty:
+                respond(.json(status: 422, ["error": "message is empty"]))
+            case .notIdle:
+                respond(.json(status: 409, ["error": "session is busy"]))
+            case .notFound:
+                respond(.json(status: 404, ["error": "message not found"]))
+            case .notUserMessage:
+                respond(.json(status: 422, ["error": "message is not a user message"]))
+            case .notReady:
+                respond(.json(status: 409, ["error": "message is not ready"]))
+            case .unavailable:
+                respond(.json(status: 409, ["error": "session process is unavailable"]))
+            }
+
         case .generationStop:
             guard let sessionID = stringField("sessionID", in: request.body),
                   let session = liveSession(for: sessionID, store: store) else {

@@ -36,6 +36,10 @@ struct RemoteTranscriptMessageDTO: Codable, Equatable, Sendable {
     let text: String
     let toolName: String?
     let toolSummary: String?
+    /// ISO8601 entry timestamp from pi session JSONL; nil when unavailable.
+    let timestamp: String?
+    /// Pi session entry id from `ChatItem.entryId`; nil when absent.
+    let entryId: String?
 
     init(
         id: String,
@@ -43,7 +47,9 @@ struct RemoteTranscriptMessageDTO: Codable, Equatable, Sendable {
         kind: Kind = .text,
         text: String,
         toolName: String? = nil,
-        toolSummary: String? = nil
+        toolSummary: String? = nil,
+        timestamp: String? = nil,
+        entryId: String? = nil
     ) {
         self.id = id
         self.role = role
@@ -51,6 +57,8 @@ struct RemoteTranscriptMessageDTO: Codable, Equatable, Sendable {
         self.text = text
         self.toolName = toolName
         self.toolSummary = toolSummary
+        self.timestamp = timestamp
+        self.entryId = entryId
     }
 }
 
@@ -93,6 +101,8 @@ enum RemoteTranscriptNormalizer {
         items.enumerated().flatMap { index, item -> [RemoteTranscriptMessageDTO] in
             let role = sanitizedRole(item.role)
             let baseID = "m-\(startingIndex + index)"
+            let itemTimestamp = item.timestamp
+            let itemEntryId = item.entryId
             guard role == "assistant" else {
                 // User/system entries keep the original behavior: text blocks
                 // joined into a single message, everything else stays local.
@@ -106,14 +116,21 @@ enum RemoteTranscriptNormalizer {
                     homeDirectory: homeDirectory
                 ).trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !text.isEmpty else { return [] }
-                return [RemoteTranscriptMessageDTO(id: baseID, role: role, text: text)]
+                return [RemoteTranscriptMessageDTO(
+                    id: baseID,
+                    role: role,
+                    text: text,
+                    timestamp: itemTimestamp,
+                    entryId: itemEntryId
+                )]
             }
 
             // Assistant entries expose the in-between progress in block order:
             // text stays text, tool calls become name + redacted summary
             // records, thinking becomes a content-free indicator. Tool
             // payloads, thinking content, media bytes and local media paths
-            // never leave the Mac.
+            // never leave the Mac. Split rows share the parent ChatItem's
+            // entryId/timestamp.
             var entries: [RemoteTranscriptMessageDTO] = []
             for block in item.blocks {
                 let entryID = "\(baseID)-\(entries.count)"
@@ -128,7 +145,9 @@ enum RemoteTranscriptNormalizer {
                     entries.append(RemoteTranscriptMessageDTO(
                         id: entryID,
                         role: role,
-                        text: text
+                        text: text,
+                        timestamp: itemTimestamp,
+                        entryId: itemEntryId
                     ))
                 case .toolCall(let tool):
                     let summary = redactKnownLocalPaths(
@@ -142,14 +161,18 @@ enum RemoteTranscriptNormalizer {
                         kind: .tool,
                         text: "",
                         toolName: tool.name,
-                        toolSummary: summary.isEmpty ? nil : summary
+                        toolSummary: summary.isEmpty ? nil : summary,
+                        timestamp: itemTimestamp,
+                        entryId: itemEntryId
                     ))
                 case .thinking:
                     entries.append(RemoteTranscriptMessageDTO(
                         id: entryID,
                         role: role,
                         kind: .thinking,
-                        text: ""
+                        text: "",
+                        timestamp: itemTimestamp,
+                        entryId: itemEntryId
                     ))
                 case .image, .video:
                     continue
