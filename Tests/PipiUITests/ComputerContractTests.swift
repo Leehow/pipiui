@@ -152,7 +152,7 @@ final class ComputerContractTests: XCTestCase {
         XCTAssertTrue(source.contains("computer-use-2025-11-24"))
         XCTAssertTrue(source.contains("mergeBeta("))
         XCTAssertTrue(source.contains("actions: Type.Optional(Type.Array"))
-        XCTAssertTrue(source.contains("every accepted batch returns a fresh screenshot"))
+        XCTAssertTrue(source.contains("Every accepted batch returns a fresh screenshot"))
         XCTAssertTrue(source.contains(#"pi.on("context""#))
         XCTAssertTrue(source.contains("retainScreenshot("))
         XCTAssertTrue(source.contains("result.screenshotId"))
@@ -265,12 +265,36 @@ final class ComputerContractTests: XCTestCase {
         let audit = try String(contentsOf:
             root.appendingPathComponent("Sources/PipiUI/Computer/ComputerAudit.swift"))
 
+        // Main session exports desktop env for nested hostAvailable/grant injection,
+        // but never mounts the computer-use extension itself (`-e`).
+        XCTAssertTrue(assembly.contains("computerEnvReady"))
         XCTAssertTrue(assembly.contains(
             "input.computerDescriptor != nil,"
         ))
         XCTAssertTrue(assembly.contains(
             "args += input.excludeToolsArgs"
         ))
+        XCTAssertTrue(assembly.contains(
+            #"env["PIPIUI_COMPUTER_EXT"] = p"#
+        ))
+        XCTAssertTrue(assembly.contains(
+            #"env["PIPIUI_COMPUTER_CAPABILITY"] = input.computerRoutingKey"#
+        ))
+        XCTAssertFalse(
+            assembly.contains("args += [\"-e\", p]\n            computerEnvReady"),
+            "main session must not -e-mount computer-use alongside env export"
+        )
+        // Belt-and-suspenders: the computer-use gate must not pair path binding with -e.
+        if let gateRange = assembly.range(of: "// Computer Use:") {
+            let gateRegion = String(assembly[gateRange.lowerBound...].prefix(900))
+            XCTAssertFalse(
+                gateRegion.contains("args += [\"-e\""),
+                "computer-use assembly gate must export env only, never -e mount"
+            )
+            XCTAssertTrue(gateRegion.contains("computerEnvReady"))
+        } else {
+            XCTFail("missing Computer Use assembly gate comment")
+        }
         XCTAssertTrue(subagent.contains("PIPIUI_COMPUTER_EXT"))
         XCTAssertTrue(subagent.contains("resolveSubagentToolSelection({"))
         XCTAssertTrue(subagent.contains("sanitizeDisabledToolNames(out)"))
@@ -289,9 +313,6 @@ final class ComputerContractTests: XCTestCase {
             childEnvStart.lowerBound..<childSpawnStart.lowerBound
         ]
         XCTAssertTrue(childEnvBlock.contains("}, desktopGrant.granted);"))
-        XCTAssertTrue(assembly.contains(
-            #"env["PIPIUI_COMPUTER_EXT"] = p"#
-        ))
         XCTAssertTrue(coordinator.contains(
             "Every non-cancelled accepted batch returns one fresh in-memory screenshot"
         ))
