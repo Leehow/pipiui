@@ -41,11 +41,18 @@ struct CuaScreenshotTransform: Equatable, Sendable {
     func advertisedToSource(
         _ point: ComputerImagePoint
     ) throws -> ComputerImagePoint {
+        let xMax = offsetX + Double(sourceSize.width) * scale
+        let yMax = offsetY + Double(sourceSize.height) * scale
         guard point.x >= offsetX,
               point.y >= offsetY,
-              point.x < offsetX + Double(sourceSize.width) * scale,
-              point.y < offsetY + Double(sourceSize.height) * scale else {
-            throw CuaIntegrationError.coordinateOutsideScreenshot
+              point.x < xMax,
+              point.y < yMax else {
+            // Symmetric letterbox: xMax == advertisedWidth - offsetX (same for y).
+            let validRange =
+                "x in [\(offsetX), \(xMax)), y in [\(offsetY), \(yMax))"
+            throw CuaIntegrationError.coordinateOutsideScreenshot(
+                validRange: validRange
+            )
         }
         return ComputerImagePoint(
             x: min(
@@ -132,7 +139,7 @@ struct CuaScreenshotTransform: Equatable, Sendable {
 enum CuaIntegrationError: LocalizedError, Equatable {
     case invalidScreenshotDimensions
     case invalidScreenshotData
-    case coordinateOutsideScreenshot
+    case coordinateOutsideScreenshot(validRange: String)
     case targetMissing
     case targetLost
     case invalidLaunchResult
@@ -145,8 +152,11 @@ enum CuaIntegrationError: LocalizedError, Equatable {
             return "Cua Driver returned invalid screenshot dimensions."
         case .invalidScreenshotData:
             return "Cua Driver returned invalid in-memory screenshot data."
-        case .coordinateOutsideScreenshot:
-            return "Action coordinate falls inside the letterbox margin, outside the target screenshot."
+        case .coordinateOutsideScreenshot(let validRange):
+            return "Action coordinate falls inside the letterbox margin, outside the target screenshot. "
+                + "valid coordinate range: \(validRange). "
+                + "Re-capture a fresh screenshot and recompute coordinates before retrying; "
+                + "do not reuse this coordinate."
         case .targetMissing:
             return "No desktop target is selected for this session; call open_application first."
         case .targetLost:

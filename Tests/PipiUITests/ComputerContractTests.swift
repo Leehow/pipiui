@@ -73,6 +73,99 @@ final class ComputerContractTests: XCTestCase {
         XCTAssertEqual(boundary.duration, 10)
     }
 
+    func testLetterboxOutsideCoordinateErrorIncludesValidRangeAndNoRetryGuidance() throws {
+        let transform = try CuaScreenshotTransform(
+            sourceSize: ComputerImageSize(width: 200, height: 100),
+            advertisedSize: ComputerImageSize(width: 300, height: 300)
+        )
+        // Margin point (y=20) is inside the top letterbox band (offsetY=75).
+        XCTAssertThrowsError(
+            try transform.advertisedToSource(ComputerImagePoint(x: 150, y: 20))
+        ) { error in
+            let description = (error as? LocalizedError)?.errorDescription
+                ?? String(describing: error)
+            XCTAssertTrue(
+                description.contains("valid coordinate range"),
+                "expected valid range in: \(description)"
+            )
+            XCTAssertTrue(
+                description.contains("x in ["),
+                "expected x range in: \(description)"
+            )
+            XCTAssertTrue(
+                description.contains("y in ["),
+                "expected y range in: \(description)"
+            )
+            XCTAssertTrue(
+                description.localizedCaseInsensitiveContains("re-capture")
+                    || description.localizedCaseInsensitiveContains("fresh screenshot"),
+                "expected re-observe guidance in: \(description)"
+            )
+            XCTAssertTrue(
+                description.localizedCaseInsensitiveContains("do not reuse")
+                    || description.localizedCaseInsensitiveContains("do not retry"),
+                "expected no-retry guidance in: \(description)"
+            )
+            guard case CuaIntegrationError.coordinateOutsideScreenshot(
+                let validRange
+            ) = error else {
+                return XCTFail("expected coordinateOutsideScreenshot, got \(error)")
+            }
+            XCTAssertTrue(validRange.contains("x in ["))
+            XCTAssertTrue(validRange.contains("y in ["))
+        }
+    }
+
+    func testStaleElementIndexErrorIncludesReobserveAndNoRetryGuidance() throws {
+        let transform = try CuaScreenshotTransform(
+            sourceSize: ComputerImageSize(width: 200, height: 100),
+            advertisedSize: ComputerImageSize(width: 200, height: 100)
+        )
+        let target = CuaComputerTarget(
+            id: UUID(),
+            bundleID: "com.example.Editor",
+            name: "Editor",
+            processID: 4242,
+            windowIDs: [7],
+            primaryWindowID: 7,
+            revision: 0,
+            screenshotIdentity: "shot-1",
+            elementTokens: [0: "token-alive"],
+            transform: transform
+        )
+        let action = try ComputerAction.parse(J([
+            "type": "click",
+            "element_index": 99,
+        ]))
+        XCTAssertThrowsError(
+            try CuaActionMapper.steps(
+                actions: [action],
+                target: target,
+                session: "session-test"
+            )
+        ) { error in
+            let description = (error as? LocalizedError)?.errorDescription
+                ?? String(describing: error)
+            XCTAssertTrue(
+                description.localizedCaseInsensitiveContains("stale"),
+                "expected stale keyword in: \(description)"
+            )
+            XCTAssertTrue(
+                description.localizedCaseInsensitiveContains("fresh observation")
+                    || description.localizedCaseInsensitiveContains("re-observe"),
+                "expected re-observe guidance in: \(description)"
+            )
+            XCTAssertTrue(
+                description.localizedCaseInsensitiveContains("do not retry"),
+                "expected no-retry guidance in: \(description)"
+            )
+            XCTAssertTrue(
+                description.contains("element_index") || description.contains("element_token"),
+                "expected element identity mention in: \(description)"
+            )
+        }
+    }
+
     func testCapabilityTokenGenerationAndValidation() {
         let token = BridgeCapabilityToken.generate()
         let desktopToken = BridgeCapabilityToken.generate()

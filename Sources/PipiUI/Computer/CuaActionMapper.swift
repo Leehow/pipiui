@@ -125,9 +125,10 @@ enum CuaActionMapper {
         if let elementIndex = action.elementIndex {
             guard let token = target.elementTokens[elementIndex] else {
                 throw CuaIntegrationError.invalidAction(
-                    "element_index \(elementIndex) is not present in this "
-                        + "session's pinned screenshot; use its element_token "
-                        + "or capture a fresh observation"
+                    "This element_index/token is stale (from an older pinned "
+                        + "screenshot). Capture a fresh observation and use "
+                        + "the new element_token; do not retry the same index "
+                        + "or token. (missing element_index \(elementIndex))"
                 )
             }
             arguments["element_token"] = token
