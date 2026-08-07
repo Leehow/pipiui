@@ -251,7 +251,11 @@ final class ComputerUsePresentationTests: XCTestCase {
 
         XCTAssertEqual(window.level, .floating)
         XCTAssertEqual(window.frame.size, ComputerUseWindowPresentation.miniContentSize)
-        XCTAssertFalse(window.contentView === originalContent)
+        // Mini takes over via an opaque overlay; original content stays attached.
+        XCTAssertTrue(window.contentView === originalContent)
+        let overlay = controller.miniOverlayView
+        XCTAssertNotNil(overlay)
+        XCTAssertTrue(window.contentView?.subviews.contains(where: { $0 === overlay }) ?? false)
         XCTAssertTrue(window.styleMask.contains(.fullSizeContentView))
         XCTAssertEqual(window.titleVisibility, .hidden)
         XCTAssertTrue(window.titlebarAppearsTransparent)
@@ -278,14 +282,16 @@ final class ComputerUsePresentationTests: XCTestCase {
         XCTAssertEqual(window.orderFrontCallCount, 0)
         XCTAssertFalse(window.isVisible)
 
-        // SwiftUI dismantles the attachment as a consequence of the deliberate
-        // content swap. This must not immediately undo mini mode.
-        controller.attach(to: nil)
-        XCTAssertFalse(window.contentView === originalContent)
+        // Overlay remains present for the duration of the mini cycle (no content
+        // swap, so no false dismantle to survive).
+        XCTAssertNotNil(controller.miniOverlayView)
+        XCTAssertTrue(window.contentView === originalContent)
 
         coordinator.isDesktopOperationActive = false
         controller.update(for: coordinator)
         XCTAssertTrue(window.contentView === originalContent)
+        XCTAssertNil(controller.miniOverlayView)
+        XCTAssertFalse(window.contentView?.subviews.contains(where: { $0 === overlay }) ?? false)
         XCTAssertEqual(window.frame, originalFrame)
         XCTAssertEqual(window.contentRect(forFrameRect: window.frame).size, originalContentSize)
         XCTAssertEqual(window.minSize, originalMinSize)
@@ -303,13 +309,11 @@ final class ComputerUsePresentationTests: XCTestCase {
     }
 
     func testRestorationReinsetsSwiftUIContentBelowTitlebar() {
-        // Regression: after Computer Use the window's SwiftUI content view was
-        // swapped out (mini full-size-content chrome) and swapped back, but
-        // nothing forced a fresh layout pass, so the reattached content kept
-        // its stale safe-area insets from the mini geometry and the transcript
-        // painted under the title/toolbar. restoreMainWindow() now forces a
-        // layout pass; assert it actually runs and that the restored content
-        // ends up re-inset below the titlebar.
+        // Regression: swapping out the SwiftUI content view for mini chrome
+        // staled its unified-titlebar safe-area insets so the transcript painted
+        // under the title after restore. The content view now stays attached for
+        // the whole CU cycle (mini is an overlay), so safe-area tracking remains
+        // continuous — assert never-swapped + safe-area round-trip.
         let coordinator = ComputerCoordinator(computerUseEnabledProvider: { true })
         let controller = ComputerUseWindowPresentation()
         let window = NonOrderingTestWindow(
@@ -332,18 +336,16 @@ final class ComputerUsePresentationTests: XCTestCase {
         coordinator.isDesktopOperationActive = true
         coordinator.statusMessage = "正在操作 测试应用…"
         controller.update(for: coordinator)
-        // Mini mode collapses the titlebar/toolbar inset.
-        XCTAssertLessThan(window.contentView?.safeAreaInsets.top ?? .greatestFiniteMagnitude,
-                          titlebarSafeArea)
+        // Content view never swapped; mini is an overlay on top.
+        XCTAssertTrue(window.contentView === hosting)
+        XCTAssertNotNil(controller.miniOverlayView)
+        // Mini mode collapses the titlebar/toolbar inset on the attached host.
+        XCTAssertLessThan(hosting.safeAreaInsets.top, titlebarSafeArea)
 
         coordinator.isDesktopOperationActive = false
-        let layoutsBeforeRestore = hosting.layoutCallCount
         controller.update(for: coordinator)
-        // The restore itself must force at least one layout pass on the
-        // reattached SwiftUI root — without it the stale mini-geometry insets
-        // survive and the transcript overlaps the title.
         XCTAssertTrue(window.contentView === hosting)
-        XCTAssertGreaterThan(hosting.layoutCallCount, layoutsBeforeRestore)
+        XCTAssertNil(controller.miniOverlayView)
         XCTAssertEqual(hosting.safeAreaInsets.top, titlebarSafeArea)
     }
 

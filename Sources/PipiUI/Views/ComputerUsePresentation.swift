@@ -19,7 +19,11 @@ final class ComputerUseWindowPresentation: NSObject {
     private var normalTitlebarAppearsTransparent: Bool?
     private var normalToolbarIsVisible: Bool?
     private var normalButtonHidden: [NSWindow.ButtonType: Bool] = [:]
-    private var normalContentView: NSView?
+    /// Opaque mini-progress overlay kept on top of the attached main content.
+    /// Never swap `window.contentView` — detaching the SwiftUI hosting view
+    /// stales its unified-titlebar safe-area insets and the transcript paints
+    /// under the title after restore.
+    private(set) var miniOverlayView: NSView?
     /// Session that last entered mini mode. Same-session begin reuses chrome
     /// without another `orderFrontRegardless` (avoids grace-window micro-flash).
     private var miniPresentedSessionKey: String?
@@ -32,12 +36,6 @@ final class ComputerUseWindowPresentation: NSObject {
     private var highlightGeneration: UInt64 = 0
 
     func attach(to window: NSWindow?) {
-        // Replacing the main content view intentionally dismantles the
-        // attachment representable. Keep the saved full UI alive until the
-        // operation ends instead of interpreting that detach as window loss.
-        if window == nil, normalContentView != nil {
-            return
-        }
         guard mainWindow !== window else { return }
         restoreMainWindow()
         if window == nil { stopHighlight() }
@@ -93,8 +91,18 @@ final class ComputerUseWindowPresentation: NSObject {
                     window.standardWindowButton(type).map { (type, $0.isHidden) }
                 }
             )
-            normalContentView = window.contentView
-            window.contentView = NSHostingView(rootView: ComputerUseMiniProgressView())
+            // Keep the main SwiftUI content view attached for the whole CU
+            // cycle. Present mini progress as an opaque overlay so safe-area
+            // tracking stays continuous (no stale titlebar inset on restore).
+            if miniOverlayView == nil, let contentView = window.contentView {
+                let overlay = NSHostingView(rootView: ComputerUseMiniProgressView())
+                overlay.wantsLayer = true
+                overlay.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+                overlay.autoresizingMask = [.width, .height]
+                overlay.frame = contentView.bounds
+                contentView.addSubview(overlay)
+                miniOverlayView = overlay
+            }
         }
         // AppKit derives frame minSize from contentMinSize (including the
         // title-bar height). Mutating both creates an inconsistent pair that
@@ -131,7 +139,9 @@ final class ComputerUseWindowPresentation: NSObject {
             window.titlebarAppearsTransparent = normalTitlebarAppearsTransparent
         }
         if let normalToolbarIsVisible { window.toolbar?.isVisible = normalToolbarIsVisible }
-        if let normalContentView { window.contentView = normalContentView }
+        // Tear down the mini overlay; the original content view stayed attached.
+        miniOverlayView?.removeFromSuperview()
+        miniOverlayView = nil
         if let normalFrame {
             window.setFrame(normalFrame, display: true)
         } else if let normalContentSize {
@@ -145,12 +155,8 @@ final class ComputerUseWindowPresentation: NSObject {
         for (type, hidden) in normalButtonHidden {
             window.standardWindowButton(type)?.isHidden = hidden
         }
-        // The SwiftUI root content view was detached while the window sat in mini
-        // full-size-content mode (titlebar hidden, toolbar off, tiny frame). Its
-        // safe-area insets were staled to that geometry; AppKit does not always
-        // re-derive them on reattach, so the transcript paints under the title/
-        // toolbar. Force a full layout + redraw pass so the restored content is
-        // re-inset below the titlebar instead of overlapping it.
+        // Belt-and-suspenders redraw. Continuity of the attached content view
+        // is what keeps titlebar safe-area insets correct; this is not the fix.
         window.contentView?.needsLayout = true
         window.contentView?.layoutSubtreeIfNeeded()
         window.contentView?.needsDisplay = true
@@ -164,7 +170,6 @@ final class ComputerUseWindowPresentation: NSObject {
         normalTitlebarAppearsTransparent = nil
         normalToolbarIsVisible = nil
         normalButtonHidden = [:]
-        normalContentView = nil
     }
 
     private static let standardButtonTypes: [NSWindow.ButtonType] = [
