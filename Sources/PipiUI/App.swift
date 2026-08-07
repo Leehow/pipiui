@@ -62,6 +62,13 @@ public struct PipiUIApp: App {
                     .keyboardShortcut("-", modifiers: [.command, .shift])
                 Button("聊天字号默认") { store.setChatFontSize(Double(ChatTypography.defaultFontSize)) }
                     .keyboardShortcut("0", modifiers: [.command, .shift])
+                Divider()
+                // Debug / experimental: NSTableView transcript POC (phase-1).
+                Button(TableTranscriptFeature.isEnabled
+                       ? "使用经典 Transcript"
+                       : "实验性表格 Transcript") {
+                    TableTranscriptFeature.setEnabled(!TableTranscriptFeature.isEnabled)
+                }
             }
         }
     }

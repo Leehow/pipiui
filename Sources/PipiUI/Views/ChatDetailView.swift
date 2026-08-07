@@ -254,6 +254,9 @@ private struct ChatDetailViewBody: View {
     @State private var chatColumnWidthSettleWork: DispatchWorkItem?
     /// Cancels in-flight width-recovery scrolls when another width change arrives.
     @State private var widthRecoverGeneration = 0
+    /// Bumped when the experimental table-transcript debug gate toggles so the
+    /// branch in `transcriptContent` re-evaluates without a process restart.
+    @State private var tableTranscriptRenderEpoch = 0
     /// Detail column width measured inside the safe area (not via a root GeometryReader,
     /// which expands under the window toolbar and lets transcript chrome overlap the title).
     @State private var detailLayoutWidth: CGFloat = 0
@@ -428,6 +431,15 @@ private struct ChatDetailViewBody: View {
         VStack(spacing: 0) {
             ComputerConsentBar(sessionKey: session.bridgeRoutingKey)
             transcriptContent
+                // Rebuild dependency only — do not `.id` the legacy scroll root (that would
+                // change production identity). Epoch is read inside `transcriptContent`.
+                .onReceive(
+                    NotificationCenter.default.publisher(
+                        for: .pipiuiTableTranscriptFeatureDidChange
+                    )
+                ) { _ in
+                    tableTranscriptRenderEpoch &+= 1
+                }
             if let conflicts = store.extensionConflicts[session.id], !conflicts.isEmpty {
                 conflictBanner(conflicts)
             }
@@ -584,7 +596,29 @@ private struct ChatDetailViewBody: View {
 
     /// The scroll container remains a sibling of InputBar. Only its row subtree observes
     /// StreamingState, so 20 Hz token/tool updates do not call ComposerTextView.updateNSView.
+    @ViewBuilder
     private var transcriptContent: some View {
+        // Touch epoch so a menu toggle invalidates this body without wrapping the
+        // production scroll root in an extra `.id`.
+        let _ = tableTranscriptRenderEpoch
+        if TableTranscriptFeature.isEnabled {
+            // Experimental phase-1 NSTableView path (debug gate). Default remains below.
+            TableTranscriptHost(
+                session: session,
+                streaming: streaming,
+                agentStore: agentStore,
+                collapsedUserTurnIDs: $collapsedUserTurnIDs,
+                onOpenFinishedGroup: presentFinishedGroup,
+                onOpenRunningTool: presentRunningTool
+            )
+            .id(TranscriptSessionRootIdentity(sessionKey: session.bridgeRoutingKey))
+        } else {
+            legacyInvertedScrollTranscript
+        }
+    }
+
+    /// Production inverted ScrollView + eager VStack transcript (unchanged default path).
+    private var legacyInvertedScrollTranscript: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 StreamingTranscriptRows(
