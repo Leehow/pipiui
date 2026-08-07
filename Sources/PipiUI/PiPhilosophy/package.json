@@ -1,6 +1,6 @@
 {
   "name": "pipi-philosophy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Layered, toggleable working philosophy for the pi coding agent: foundation, method, orchestration, fan-out.",
   "type": "module",
   "license": "Apache-2.0",

@@ -25,7 +25,7 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         XCTAssertTrue(runtime.contains("agentName === \"secretary\""))
         XCTAssertTrue(runtime.contains("worktree: \"main-session\""))
         XCTAssertTrue(runtime.contains("allowRecursiveDelegation: false"))
-        XCTAssertTrue(runtime.contains("PIPIUI_MAIN_CWD || opts.defaultCwd"))
+        XCTAssertTrue(runtime.contains("PIPIUI_MAIN_CWD || defaultCwd"))
         XCTAssertTrue(runtime.contains("t !== \"subagent\""))
         XCTAssertTrue(runtime.contains("PIPIUI_AGENT_NO_DELEGATION: \"1\""))
         XCTAssertTrue(runtime.contains("secretaryToolCallBlock"))

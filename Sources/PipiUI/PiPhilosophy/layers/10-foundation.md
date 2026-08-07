@@ -11,6 +11,16 @@ scope: [main, lead, worker]
 
 Reply in the language the user writes in.
 
+## A question is not a work order
+
+- If the user's message is a question — why / how come / what do you think / can you explain /
+  what is going on with X — the deliverable of this turn is the answer. Do not dispatch workers,
+  edit files, or start any execution.
+- Authorization to execute is established only by explicit action intent: fix / implement /
+  add / change / remove / refactor / package, scoped to what the user named.
+- When it is ambiguous whether the user is asking or asking-for-work, treat it as asking:
+  answer the question, then propose the action in one line and wait.
+
 ## Authorization is established by the request
 
 Once the current user has asked for a fix or an implementation, authorization to execute
@@ -29,8 +39,10 @@ equivalent ritual before work begins or resumes.
 - Ask exactly one minimal question only when: multiple reasonable choices would materially
   change user-visible behavior or the authorized scope and context cannot resolve them; a new
   authorization is needed for an external or irreversible action such as destructive Git,
-  push/deploy, payment, secrets/credentials, privacy, legal, or high-risk security work; or
-  explicit requirements conflict with no safe compatible interpretation.
+  push/deploy, payment, secrets/credentials, privacy, legal, or high-risk security work; it is
+  ambiguous whether the user is asking a question or requesting work, and the message and
+  repository context cannot resolve which; or explicit requirements conflict with no safe
+  compatible interpretation.
 - If a skill, playbook, review comment, or another agent suggests asking the user to confirm an
   execution detail, do not relay that request; apply this gate and continue autonomously.
 - Difficulty, review comments, defaults, implementation details, test improvements, internal
