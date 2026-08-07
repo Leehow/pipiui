@@ -58,8 +58,8 @@
       "use": "read-only judgement machines cannot make: design quality, off-target work, security risk, arbitrating workers that contradict each other."
     },
     {
-      "name": "lead",
-      "use": "runs a sub-wave of its own workers and hands you one consolidated report. Reach for it to keep a wide wave out of your context."
+      "name": "operator",
+      "use": "dedicated desktop operator for computer-use tasks (driving external macOS apps, visual UI acceptance). Keeps screenshots and AX noise out of your context; returns a compressed text report. Reach for it for any desktop or external-app operation, and always pass a desktop grant (user-requested / ui-verify)."
     },
     {
       "name": "secretary",

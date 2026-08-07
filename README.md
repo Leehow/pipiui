@@ -29,7 +29,7 @@
 
 ## Computer Use（macOS 桌面控制，opt-in）
 
-设置 → 工具与 Skills 中可显式开启 `computer`。默认关闭时扩展不会通过 `-e` 挂载，因此工具不存在、没有前缀成本。开启后，顶层会话和其 subagent 都会加载 `computer` 与 `open_application`。
+设置 → 工具与 Skills 中可显式开启 Computer Use。默认关闭时不导出桌面能力，工具不存在、没有前缀成本。开启后主会话只导出 `PIPIUI_COMPUTER_*` 环境（供嵌套派发 host-check），**不**挂载 `computer` / `open_application`；桌面工具仅注入给带 desktop 授权的 subagent（`operator`）。
 
 底部 `desktopcomputer` 按钮是 PipiUI 唯一的产品授权开关。打开即进入无限制模式：PipiUI 不做逐会话、逐应用、高风险、敏感文本/快捷键或破坏性写操作确认；PipiUI 自身、Terminal、System Settings、密码管理器、未知应用以及历史持久 deny 都走同一条无提示路径。普通鼠标、键盘和滚动输入不会暂停或取消操作。只保留 macOS Screen Recording/Accessibility TCC、手动/`⌥⇧Esc` 急停、实际执行期间的 process-global mutex，以及目标 PID/焦点/动态代码身份、窗口截图、坐标、event-post、取消和 held-input 清理等技术校验。每个 batch 或 `open_application` 成功、失败或取消落定后都会释放互斥槽；每批动作结束给模型一张新截图，PNG 只保存在进程内存中，不写入 pi 会话 JSONL。
 
@@ -39,9 +39,9 @@ Anthropic `anthropic-messages` 请求会把同名自定义工具替换为官方 
 
 ## Subagent 面板 + Boss 模式
 
-- **Subagent 面板**（工具栏 👥）：pi 通过 `subagent` 工具派出的所有子 agent 实时显示为树（lead 组长带其工人缩进展示），点击每个 agent 看任务、当前动作、流式输出、费用和用时。上报来自 `~/.pi/agent/extensions/subagent/index.ts` 的 Pipi 集成补丁（无环境变量时完全静默，不影响终端使用）。
-- **多层 subagent**：子进程通过 `PIPIUI_AGENT_ID/DEPTH` 环境变量继承树身份，`lead` agent（`~/.pi/agent/agents/lead.md`，tools 含 subagent）可再派工人；`PIPIUI_AGENT_MAX_DEPTH`（默认 2）防递归失控，即 Boss(0) → lead(1) → worker(2) 封顶。
-- **Boss 模式**（侧栏 👑 开关，默认开）：新会话注入大组长协议（`--append-system-prompt`）——主 agent 不下基层，全部派工：简单派单兵监工、复杂拆工作流派多个 lead、调研按广度扇出 explore；配合失败恢复协议（同方案最多两次、BLOCKED 白名单、验收要新鲜证据）防早停防摆烂。
+- **Subagent 面板**（工具栏 👥）：pi 通过 `subagent` 工具派出的所有子 agent 实时显示为树，点击每个 agent 看任务、当前动作、流式输出、费用和用时。上报来自 `~/.pi/agent/extensions/subagent/index.ts` 的 Pipi 集成补丁（无环境变量时完全静默，不影响终端使用）。
+- **多层 subagent**：子进程通过 `PIPIUI_AGENT_ID/DEPTH` 环境变量继承树身份；`PIPIUI_AGENT_MAX_DEPTH`（默认 2）防递归失控。桌面操作派给专用 `operator` agent（派发时带 desktop 授权），由它持有 `computer` / `open_application`，主会话不下桌面。
+- **Boss 模式**（侧栏 👑 开关，默认开）：新会话注入大组长协议（`--append-system-prompt`）——主 agent 不下基层，全部派工：简单派单兵监工、复杂按独立切片直接扇出、调研按广度扇出 explore、桌面/外部 App 操作派 `operator`；配合失败恢复协议（同方案最多两次、BLOCKED 白名单、验收要新鲜证据）防早停防摆烂。
 - **没有难度分级，也没有模型强弱分档**：协议不再要求先给任务贴 `[T0..T3]` 标签再按级别执行，也不再按模型档位切换规划路线（原 `SkillTierExtension` / `ModelTierSettings` 与设置里的「弱模型」勾选已整体移除）。取而代之的是一条判断原则——流程重量必须匹配工作量，加一步之前要能说出它能抓到上一步没抓到的什么；路线不明就先走便宜的那条，让失败的 worker 把证据交上来，比一上来铺五个 worker 便宜也好收拾。剩下的由模型自己决定。
 - **先想再查**：协议鼓励主 agent 在形成自己的判断**之后**用 `web_search` / `web_fetch` 交叉验证或找灵感（先搜会被别人对问题的框定带跑），并明确划线——已经知道怎么修且只涉及本仓库的直接动手；只有当问题大概不只出现在这个代码库（库/系统行为反常、别人也会撞到的报错、API 或版本可能变了、平台怪癖、「这思路对不对」这类需要前人方案的设计选择），或者结论依赖一个未经验证的第三方行为假设时才检索。检索结果是证据不是权威——仓库证据、复现、attested 命令都排在任何帖子之上；真的因为某个来源改了决定就给出 URL，只是印证了自己就别堆链接。这是判断题，不是必经步骤。
 - **与外部技能库解耦**：Boss 协议自己就是会话的流程主人，设计/计划文档只在用户明确要求时才产出——计划是一串可派工的编号步骤，不是一篇文档。外部技能库降级为 opt-in：主会话不再被注入「回答前必须先调技能」的 bootstrap，只有用户点名时才加载；派出去的 subagent 一律 `--no-skills` 且运行时屏蔽技能 bootstrap，worker 只认自己的 agent 提示词 + brief。只读角色（plan / explore / reviewer）交付的是报告，运行时会丢弃 brief 里给它们的 `verify`，不会再出现「要求落盘却禁止写文件 → 验收必然失败 → 反复重派」的死循环。

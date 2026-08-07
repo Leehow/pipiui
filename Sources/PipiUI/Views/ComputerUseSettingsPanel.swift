@@ -26,7 +26,7 @@ struct ComputerUseSettingsPanel: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
             }
-            Text("默认关闭。打开后主会话可用 computer / open_application（无会话、应用、高风险或写操作确认）。全局开关只提供能力：subagent 仍须在派发任务时显式设置 desktop 授权（user-requested / ui-verify），未授权则完全不注入桌面工具。", )
+            Text("默认关闭。打开后桌面工具只注入给带 desktop 授权的 subagent（operator）；主会话本身不持有 computer / open_application。全局开关仍是总闸：未打开时任何会话都没有桌面能力；打开后 subagent 仍须在派发时显式设置 desktop 授权（user-requested / ui-verify），未授权则完全不注入桌面工具。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -121,7 +121,7 @@ struct ComputerUseSettingsPanel: View {
             Text("保留的闸门只有：全局开关、macOS TCC、手动急停，以及目标进程/焦点/截图/坐标/event-post 校验和 held-input 清理。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            Text("关闭 Computer Use 只取消进行中的桌面操作并拒绝新的 computer / open_application 调用，不会终止或重启任何 Pi 会话，也不影响普通对话、coding subagent 与构建测试；重新打开即可继续使用，无需重启。急停会额外中断相关会话的当前生成。")
+            Text("关闭 Computer Use 只取消进行中的桌面操作并拒绝新的 computer / open_application 调用（含 operator subagent），不会终止或重启任何 Pi 会话，也不影响普通对话、coding subagent 与构建测试；重新打开即可继续使用，无需重启。急停会额外中断相关会话的当前生成。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             Text("截图只驻留内存；审计日志不记录截图、输入文本或 capability token。")

@@ -214,7 +214,33 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertEqual(out.extraEnv["PIPIUI_MCP_CONFIG_FILE"], "/p/mcp-config.json")
         XCTAssertEqual(out.extraEnv["PIPIUI_MCP_EXT"], "/p/mcp.ts")
         XCTAssertTrue(out.args.contains("/p/mcp.ts"))
+        // Main session exports desktop env for nested hostAvailable / grant injection,
+        // but never mounts the computer-use extension itself.
+        XCTAssertFalse(out.args.contains("/p/computer.ts"),
+                       "main session must not -e computer-use: \(out.args)")
         XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_EXT"], "/p/computer.ts")
+        XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_CAPABILITY"], "computer")
+        XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_DISPLAY_ID"], "1")
+        XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_WIDTH"], "100")
+        XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_HEIGHT"], "100")
+    }
+
+    /// Global Computer Use on ⇒ env exported for nested subagents; main args never get `-e`.
+    func testComputerUseExportsEnvWithoutMountingMainExtension() {
+        let out = PipiSpawnAssembly.assemble(allEnabledInput(paths: fullyPopulatedPaths()))
+        XCTAssertFalse(out.args.contains("/p/computer.ts"))
+        // Ensure no -e pairs the computer path (belt-and-suspenders with contains above).
+        for (index, arg) in out.args.enumerated() where arg == "-e" {
+            let next = index + 1 < out.args.count ? out.args[index + 1] : ""
+            XCTAssertNotEqual(next, "/p/computer.ts",
+                              "main session must not pass -e computer-use")
+        }
+        XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_EXT"], "/p/computer.ts")
+        XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_CAPABILITY"], "computer")
+        XCTAssertNotNil(out.extraEnv["PIPIUI_COMPUTER_RUNTIME_PROTOCOL"])
+        XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_DISPLAY_ID"], "1")
+        XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_WIDTH"], "100")
+        XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_HEIGHT"], "100")
     }
 
     func testMCPDisabledDropsExtensionAndEnv() {

@@ -211,15 +211,17 @@ enum PipiSpawnAssembly {
         if f.isEnabled(.claudeServerTools), let p = input.paths.claudeServerTools { args += ["-e", p] }
 
         // Computer Use: requires both the feature flag AND a resolved capture
-        // descriptor (TCC/geometry may be unavailable). Mount exactly one path.
-        let computerMounted: Bool
+        // descriptor (TCC/geometry may be unavailable). The main session never
+        // mounts the extension (`-e`); it only exports `PIPIUI_COMPUTER_*` env so
+        // nested pi can host-check and inject computer/open_application into
+        // desktop-authorized subagents (operator). Tools stay off the main tool list.
+        let computerEnvReady: Bool
         if f.isEnabled(.computerUse),
            input.computerDescriptor != nil,
-           let p = input.paths.computerUse {
-            args += ["-e", p]
-            computerMounted = true
+           input.paths.computerUse != nil {
+            computerEnvReady = true
         } else {
-            computerMounted = false
+            computerEnvReady = false
         }
 
         // Fine-grained tool denylist (--exclude-tools) is orthogonal to feature mounting.
@@ -239,7 +241,7 @@ enum PipiSpawnAssembly {
         env["PIPIUI_BRIDGE_PORT"] = String(input.bridgePort)
         env["PIPIUI_SESSION_KEY"] = input.bridgeRoutingKey
 
-        if computerMounted, let descriptor = input.computerDescriptor, let p = input.paths.computerUse {
+        if computerEnvReady, let descriptor = input.computerDescriptor, let p = input.paths.computerUse {
             env["PIPIUI_COMPUTER_EXT"] = p
             env["PIPIUI_COMPUTER_CAPABILITY"] = input.computerRoutingKey
             env["PIPIUI_COMPUTER_RUNTIME_PROTOCOL"] = String(ComputerRuntimeContract.version)
