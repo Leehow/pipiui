@@ -448,13 +448,22 @@ function blockReason(detail: string): string {
 export default function (pi: ExtensionAPI) {
   // Activate built-in discovery tools additively. Pi's default active set is only
   // read/bash/edit/write; grep/find/ls stay registered but inactive unless enabled.
-  // setActiveTools is a notInitialized stub during loader registration, so wait for
-  // session_start (documented lifecycle event). Idempotent for nested sessions.
+  // Order search tools before bash so Available tools / API tool defs list grep/find/ls
+  // ahead of bash (which advertises "ls, grep, find"). Deterministic order keeps
+  // prompt-cache stable. setActiveTools is a notInitialized stub during loader
+  // registration, so wait for session_start. Idempotent for nested sessions.
   pi.on("session_start", () => {
-    const wanted = ["grep", "find", "ls"];
     const active = pi.getActiveTools();
-    const missing = wanted.filter((name) => !active.includes(name));
-    if (missing.length > 0) pi.setActiveTools([...active, ...missing]);
+    const head = [];
+    if (active.includes("read")) head.push("read");
+    head.push("grep", "find", "ls");
+    if (active.includes("bash")) head.push("bash");
+    const headSet = new Set(head);
+    const rest = active.filter((name) => !headSet.has(name));
+    const next = [...head, ...rest];
+    const unchanged =
+      next.length === active.length && next.every((name, i) => name === active[i]);
+    if (!unchanged) pi.setActiveTools(next);
   });
 
   pi.on("before_agent_start", (event) => {
