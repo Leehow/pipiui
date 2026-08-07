@@ -478,7 +478,11 @@ final class AppStore: ObservableObject {
         } else {
             remoteRelayGeneration = UUID()
             clearRemotePairing()
-            remoteRelayClient?.stop()
+            // Explicit remote-off: end the room on the main thread first so a
+            // subsequent transport teardown cannot race a deferred disconnect
+            // and skip the `{type:"end"}` frame.
+            remoteRelayPeerTransport?.stopTunnelLink(invalidate: true)
+            remoteRelayClient?.stop(invalidatePairing: true)
             remoteRelayClient = nil
             remoteRelayPeerTransport?.stop()
             remoteRelayPeerTransport = nil
@@ -487,16 +491,23 @@ final class AppStore: ObservableObject {
         }
     }
 
-    func beginRemotePairing() {
+    func beginRemotePairing(forceNew: Bool = false) {
         guard let remoteRelayClient else {
             remotePairingPayload = nil
             remotePairingMessage = "配对创建失败，请先启用 Relay"
             return
         }
-        remotePairingMessage = "正在创建配对链接…"
+        remotePairingMessage = forceNew ? "正在重新生成配对链接…" : "正在创建配对链接…"
         // Lifecycle events carry ownership of visible pairing state. A delayed
         // completion from a replaced request must never clear the replacement QR.
-        remoteRelayClient.beginPairing { _ in }
+        // Without forceNew, durable roomID+secret are reused so the same link
+        // survives app restart.
+        remoteRelayClient.beginPairing(forceNew: forceNew) { _ in }
+    }
+
+    /// Explicitly rotate roomID+secret and tombstone the previous room.
+    func regenerateRemotePairing() {
+        beginRemotePairing(forceNew: true)
     }
 
     func cancelRemotePairing() {
@@ -594,7 +605,8 @@ final class AppStore: ObservableObject {
 
     func deleteRemoteRelayCredentials() {
         _ = RemoteRelayCredentialStore.deleteAll()
-        remoteRelayClient?.stop()
+        // Legacy pilot wipe is unrelated to tunnel pairing; keep the room alive.
+        remoteRelayClient?.stop(invalidatePairing: false)
         remoteRelayClient = nil
         remoteRelayPeerTransport?.stop()
         remoteRelayPeerTransport = nil
@@ -613,8 +625,11 @@ final class AppStore: ObservableObject {
         }
         let generation = UUID()
         remoteRelayGeneration = generation
+        // Keep durable pairing credentials across client restarts; only clear the
+        // visible sheet until the restored .created event repopulates it.
         clearRemotePairing()
-        remoteRelayClient?.stop()
+        // Disconnect without ending the room so the same link can rejoin.
+        remoteRelayClient?.stop(invalidatePairing: false)
         remoteRelayPeerTransport?.stop()
         remoteRelayPeerTransport = nil
         remotePeerProductionState = .disabled
@@ -659,6 +674,7 @@ final class AppStore: ObservableObject {
             }
         )
         remoteRelayClient = client
+        // start() auto-restores Keychain pairing credentials when present.
         client.start()
     }
 
@@ -2112,7 +2128,8 @@ final class AppStore: ObservableObject {
         stopRemotePeerTest()
         localRemoteHost?.stop()
         localRemoteHost = nil
-        remoteRelayClient?.stop()
+        // App quit: disconnect without `end` so the room survives for rejoin.
+        remoteRelayClient?.stop(invalidatePairing: false)
         remoteRelayClient = nil
         clearRemotePairing()
         remoteRelayPeerTransport?.stop()

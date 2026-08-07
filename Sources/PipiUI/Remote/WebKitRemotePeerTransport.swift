@@ -75,7 +75,9 @@ final class WebKitRemotePeerTransport: NSObject, RemotePeerTransport, RemotePeer
     func stop() {
         dispatchPrecondition(condition: .onQueue(.main))
         didRequestStop = true
-        stopTunnelLink()
+        // Engine teardown is not an intentional room end; drop the socket so the
+        // relay keeps the room for host rejoin after app restart.
+        stopTunnelLink(invalidate: false)
         finishProductionConnection(reason: "peer engine stopped")
         generation = BridgeCapabilityToken.generate(byteCount: 18)
         clearNegotiationOwnership()
@@ -102,7 +104,9 @@ final class WebKitRemotePeerTransport: NSObject, RemotePeerTransport, RemotePeer
             event(.failed)
             return
         }
-        stopTunnelLink()
+        // Replacing the local host socket must not send `end` — the room stays
+        // and the new generation re-hellos with the same room/secret.
+        stopTunnelLink(invalidate: false)
         tunnelController = controller
         tunnelEvent = event
         pendingTunnelStart = [
@@ -114,13 +118,19 @@ final class WebKitRemotePeerTransport: NSObject, RemotePeerTransport, RemotePeer
         evaluatePendingTunnelStart()
     }
 
-    func stopTunnelLink() {
+    /// - Parameter invalidate: when true, JS `leave()` sends `{type:"end"}` so
+    ///   the relay tombstones the room. When false, JS `disconnect()` only drops
+    ///   the WebSocket so the room remains joinable with the same secret.
+    func stopTunnelLink(invalidate: Bool = false) {
         dispatchPrecondition(condition: .onQueue(.main))
         pendingTunnelStart = nil
         tunnelRequestIDs.removeAll()
         tunnelController = nil
         tunnelEvent = nil
-        webView?.evaluateJavaScript("window.pipiTunnelHost?.leave(); true")
+        let script = invalidate
+            ? "window.pipiTunnelHost?.leave(); true"
+            : "window.pipiTunnelHost?.disconnect(); true"
+        webView?.evaluateJavaScript(script)
     }
 
     private func evaluatePendingTunnelStart() {

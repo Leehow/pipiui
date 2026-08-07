@@ -747,10 +747,250 @@ final class RemoteRelayTests: XCTestCase {
         XCTAssertTrue(sheet.contains("24 小时内有效"))
         XCTAssertTrue(sheet.contains("顶掉已连接的"))
         XCTAssertTrue(sheet.contains("密钥只存在于 URL fragment"))
+        XCTAssertTrue(sheet.contains("重新生成链接"))
+        XCTAssertTrue(sheet.contains("作废链接"))
+        XCTAssertTrue(sheet.contains("regenerateRemotePairing"))
         XCTAssertFalse(sheet.contains("只可使用一次"))
         XCTAssertFalse(sheet.contains("一次性配对链接"))
         XCTAssertFalse(sheet.contains("发现旧版远程连接试点配置"))
         XCTAssertFalse(sheet.contains("SecureField("))
+    }
+
+    func testTunnelPairingResolverReusesActiveCredentialsUntilForced() {
+        let roomID = UUID().uuidString.lowercased()
+        let secret = String(repeating: "ab", count: 32)
+        let stored = RemoteTunnelPairingCredentials(
+            roomID: roomID,
+            secret: secret,
+            expiresAt: Date().addingTimeInterval(3_600)
+        )
+        let reused = RemoteTunnelPairingResolver.resolve(
+            forceNew: false,
+            stored: stored,
+            now: Date(),
+            makeRoomID: { UUID().uuidString },
+            makeSecret: { String(repeating: "cd", count: 32) }
+        )
+        XCTAssertTrue(reused.reused)
+        XCTAssertEqual(reused.credentials, stored)
+
+        let forced = RemoteTunnelPairingResolver.resolve(
+            forceNew: true,
+            stored: stored,
+            now: Date(),
+            makeRoomID: { "11111111-1111-1111-1111-111111111111" },
+            makeSecret: { String(repeating: "ef", count: 32) }
+        )
+        XCTAssertFalse(forced.reused)
+        XCTAssertNotEqual(forced.credentials.roomID, roomID)
+        XCTAssertEqual(forced.credentials.secret, String(repeating: "ef", count: 32))
+
+        let expired = RemoteTunnelPairingResolver.resolve(
+            forceNew: false,
+            stored: RemoteTunnelPairingCredentials(
+                roomID: roomID,
+                secret: secret,
+                expiresAt: Date().addingTimeInterval(-1)
+            ),
+            now: Date(),
+            makeRoomID: { "22222222-2222-2222-2222-222222222222" },
+            makeSecret: { String(repeating: "11", count: 32) }
+        )
+        XCTAssertFalse(expired.reused)
+        XCTAssertEqual(expired.credentials.roomID, "22222222-2222-2222-2222-222222222222")
+    }
+
+    func testTunnelPairingMemoryStoreRoundTripAndClear() {
+        let store = RemoteTunnelPairingStore.memory()
+        let credentials = RemoteTunnelPairingCredentials(
+            roomID: UUID().uuidString.lowercased(),
+            secret: String(repeating: "a1", count: 32),
+            expiresAt: Date().addingTimeInterval(24 * 60 * 60)
+        )
+        XCTAssertNil(store.load())
+        XCTAssertTrue(store.save(credentials))
+        XCTAssertEqual(store.load(), credentials)
+        store.clear()
+        XCTAssertNil(store.load())
+        XCTAssertFalse(store.save(RemoteTunnelPairingCredentials(
+            roomID: "not-a-uuid",
+            secret: "short",
+            expiresAt: Date()
+        )))
+    }
+
+    func testTunnelPairingKeychainStoreRoundTrip() throws {
+        let service = "com.pipiui.tests.tunnel-pairing.\(UUID().uuidString)"
+        let store = RemoteTunnelPairingStore.keychainForTesting(service: service)
+        defer { store.clear() }
+        let credentials = RemoteTunnelPairingCredentials(
+            roomID: UUID().uuidString.lowercased(),
+            secret: String(repeating: "b2", count: 32),
+            expiresAt: Date(timeIntervalSince1970: 1_900_000_000)
+        )
+        XCTAssertTrue(store.save(credentials))
+        XCTAssertEqual(store.load(), credentials)
+        store.clear()
+        XCTAssertNil(store.load())
+    }
+
+    func testTunnelPairingPersistsAcrossClientRestartAndStopDoesNotInvalidate() {
+        let store = RemoteTunnelPairingStore.memory()
+        let tunnel = FakeRemoteTunnelLinkController()
+        let lifecycleQueue = DispatchQueue(label: "RemoteRelayTests.tunnel-persist")
+        let configuration = RemoteRelayConfiguration(
+            enabled: true,
+            webSocketURL: URL(string: "wss://tunnel.deepwood.cn/tunnel/ws")!,
+            publicURL: URL(string: "https://remote.deepwood.cn/")!,
+            deviceID: UUID().uuidString.lowercased(),
+            displayName: "Persist Test"
+        )
+        let events = LockedTestBox<[RemotePairingLifecycleEvent]>([])
+        func makeClient() -> RemoteRelayClient {
+            RemoteRelayClient(
+                controller: RemoteHostController(store: AppStore.shared),
+                configuration: configuration,
+                tunnelLink: tunnel,
+                pairingStore: store,
+                lifecycleQueue: lifecycleQueue,
+                pairingChanged: { event in
+                    events.withValue { $0.append(event) }
+                },
+                stateChanged: { _ in }
+            )
+        }
+
+        let first = makeClient()
+        first.start()
+        first.beginPairing { result in
+            XCTAssertNotNil(try? result.get())
+        }
+        XCTAssertTrue(waitUntil {
+            if case .created = events.value.last { return true }
+            return false
+        })
+        guard case .created(let created) = events.value.last else {
+            return XCTFail("expected created pairing")
+        }
+        let originalRoom = created.pairID
+        let originalURL = created.url
+        XCTAssertEqual(tunnel.starts.count, 1)
+        XCTAssertEqual(tunnel.starts[0].roomID, originalRoom)
+        XCTAssertEqual(store.load()?.roomID, originalRoom)
+
+        // Normal stop (app quit / client replace): disconnect only, keep credentials.
+        first.stop(invalidatePairing: false)
+        XCTAssertTrue(waitUntil { tunnel.stops.contains(false) })
+        XCTAssertFalse(tunnel.stops.contains(true))
+        XCTAssertEqual(store.load()?.roomID, originalRoom)
+
+        events.withValue { $0.removeAll() }
+        tunnel.reset()
+        let second = makeClient()
+        second.start()
+        XCTAssertTrue(waitUntil {
+            if case .created(let pairing) = events.value.last {
+                return pairing.pairID == originalRoom
+            }
+            return false
+        })
+        XCTAssertEqual(tunnel.starts.count, 1)
+        XCTAssertEqual(tunnel.starts[0].roomID, originalRoom)
+        XCTAssertEqual(tunnel.starts[0].secret, store.load()?.secret)
+        if case .created(let restored) = events.value.last {
+            XCTAssertEqual(restored.url, originalURL)
+        } else {
+            XCTFail("restart must republish the same pairing URL")
+        }
+
+        // Generate again without forceNew must reuse the same room.
+        events.withValue { $0.removeAll() }
+        let startsBefore = tunnel.starts.count
+        second.beginPairing(forceNew: false) { _ in }
+        XCTAssertTrue(waitUntil {
+            if case .created(let pairing) = events.value.last {
+                return pairing.pairID == originalRoom
+            }
+            return false
+        })
+        XCTAssertEqual(
+            tunnel.starts.count,
+            startsBefore,
+            "idempotent reuse must not bounce an already-active tunnel link"
+        )
+
+        second.stop(invalidatePairing: true)
+        XCTAssertTrue(waitUntil { tunnel.stops.contains(true) })
+        XCTAssertNil(store.load())
+    }
+
+    func testForceNewPairingInvalidatesPreviousRoom() {
+        let store = RemoteTunnelPairingStore.memory()
+        let tunnel = FakeRemoteTunnelLinkController()
+        let lifecycleQueue = DispatchQueue(label: "RemoteRelayTests.tunnel-force-new")
+        let configuration = RemoteRelayConfiguration(
+            enabled: true,
+            webSocketURL: URL(string: "wss://tunnel.deepwood.cn/tunnel/ws")!,
+            publicURL: URL(string: "https://remote.deepwood.cn/")!,
+            deviceID: UUID().uuidString.lowercased(),
+            displayName: "Force New"
+        )
+        let events = LockedTestBox<[RemotePairingLifecycleEvent]>([])
+        let client = RemoteRelayClient(
+            controller: RemoteHostController(store: AppStore.shared),
+            configuration: configuration,
+            tunnelLink: tunnel,
+            pairingStore: store,
+            lifecycleQueue: lifecycleQueue,
+            pairingChanged: { event in events.withValue { $0.append(event) } },
+            stateChanged: { _ in }
+        )
+        client.start()
+        client.beginPairing(forceNew: false) { _ in }
+        XCTAssertTrue(waitUntil {
+            if case .created = events.value.last { return true }
+            return false
+        })
+        guard case .created(let first) = events.value.last else {
+            return XCTFail("missing first pairing")
+        }
+
+        events.withValue { $0.removeAll() }
+        client.beginPairing(forceNew: true) { _ in }
+        XCTAssertTrue(waitUntil {
+            if case .created(let pairing) = events.value.last {
+                return pairing.pairID != first.pairID
+            }
+            return false
+        })
+        XCTAssertTrue(tunnel.stops.contains(true), "forceNew must end the previous room")
+        XCTAssertNotEqual(store.load()?.roomID, first.pairID)
+        client.stop(invalidatePairing: true)
+    }
+
+    func testTunnelHostScriptExposesDisconnectWithoutEnd() throws {
+        let script = try String(
+            contentsOf: repositoryRoot()
+                .appendingPathComponent(
+                    "Sources/PipiUI/Resources/RemoteP2P/tunnel-host.js"
+                ),
+            encoding: .utf8
+        )
+        XCTAssertTrue(script.contains("function disconnect"))
+        XCTAssertTrue(script.contains("host disconnected"))
+        XCTAssertTrue(script.contains("disconnect, resolveRequest")
+            || script.contains("leave, disconnect, resolveRequest"))
+        // leave keeps the intentional end frame; disconnect must not send it.
+        let leaveRange = try XCTUnwrap(script.range(of: "function leave"))
+        let disconnectRange = try XCTUnwrap(script.range(of: "function disconnect"))
+        let leaveBody = String(script[leaveRange.lowerBound..<disconnectRange.lowerBound])
+        XCTAssertTrue(leaveBody.contains("type: \"end\"") || leaveBody.contains("type:\"end\""))
+        let afterDisconnect = String(script[disconnectRange.lowerBound...])
+        let nextFn = afterDisconnect.range(of: "function start")?.lowerBound
+            ?? afterDisconnect.endIndex
+        let disconnectBody = String(afterDisconnect[..<nextFn])
+        XCTAssertFalse(disconnectBody.contains("type: \"end\""))
+        XCTAssertFalse(disconnectBody.contains("type:\"end\""))
     }
 
     func testStaleCallbacksCannotCancelReplacementSocketOrScheduleDuplicateRetry() {
@@ -938,6 +1178,58 @@ private final class LockedTestBox<Value>: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return body(&storage)
+    }
+}
+
+private final class FakeRemoteTunnelLinkController:
+    RemoteTunnelLinkControlling,
+    @unchecked Sendable
+{
+    struct Start: Equatable {
+        var roomID: String
+        var secret: String
+    }
+
+    private let lock = NSLock()
+    private var startRecords: [Start] = []
+    private var stopRecords: [Bool] = []
+
+    var starts: [Start] {
+        lock.lock()
+        defer { lock.unlock() }
+        return startRecords
+    }
+
+    var stops: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopRecords
+    }
+
+    func reset() {
+        lock.lock()
+        startRecords = []
+        stopRecords = []
+        lock.unlock()
+    }
+
+    func startTunnelLink(
+        roomID: String,
+        secret: String,
+        tunnelURL: URL,
+        controller: RemoteHostController,
+        event: @escaping (WebKitRemotePeerTransport.TunnelEvent) -> Void
+    ) {
+        lock.lock()
+        startRecords.append(Start(roomID: roomID, secret: secret))
+        lock.unlock()
+        event(.ready)
+    }
+
+    func stopTunnelLink(invalidate: Bool) {
+        lock.lock()
+        stopRecords.append(invalidate)
+        lock.unlock()
     }
 }
 

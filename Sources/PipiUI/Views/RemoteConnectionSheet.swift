@@ -393,8 +393,13 @@ struct RemoteConnectionSheet: View {
                                 RemoteConnectionAccessibility.openPairingLinkLabel
                             )
                         }
-                        Button("取消配对", role: .destructive) {
-                            store.cancelRemotePairing()
+                        HStack {
+                            Button("重新生成链接") {
+                                store.regenerateRemotePairing()
+                            }
+                            Button("作废链接", role: .destructive) {
+                                store.cancelRemotePairing()
+                            }
                         }
                     } else {
                         Label {

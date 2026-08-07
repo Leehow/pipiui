@@ -94,6 +94,17 @@
       current.close(1e3, "host stopped");
     }
   }
+  function disconnect() {
+    stopped = true;
+    config = null;
+    clearRetry();
+    const current = socket;
+    socket = null;
+    pending.clear();
+    if (current && current.readyState < WebSocket.CLOSING) {
+      current.close(1e3, "host disconnected");
+    }
+  }
   function start(incoming) {
     stopped = false;
     config = incoming;
@@ -120,6 +131,6 @@
     }));
   }
   Object.assign(window, {
-    pipiTunnelHost: Object.freeze({ start, leave, resolveRequest })
+    pipiTunnelHost: Object.freeze({ start, leave, disconnect, resolveRequest })
   });
 })();
