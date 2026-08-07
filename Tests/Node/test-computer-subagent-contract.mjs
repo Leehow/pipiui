@@ -205,10 +205,11 @@ test("no-grant worker cannot reach desktop tools (anti-regression)", async () =>
   assert.equal(selection.names.includes("computer"), false);
   assert.equal(selection.names.includes("open_application"), false);
 
-  // Host-side wiring stays as-is (env + runtime protocol + top-level mount).
+  // Host-side wiring: main exports env/runtime protocol; tools mount only via grant.
   assert.match(assembly, /env\["PIPIUI_COMPUTER_EXT"\]\s*=\s*p/);
   assert.match(assembly, /env\["PIPIUI_COMPUTER_RUNTIME_PROTOCOL"\]\s*=/);
   assert.match(assembly, /env\["PIPIUI_COMPUTER_CAPABILITY"\]\s*=\s*input\.computerRoutingKey/);
+  assert.match(assembly, /computerEnvReady/);
 });
 
 test("selected strategy path and runtime capabilities reach nested Pi without duplicate mounting", async () => {
@@ -217,13 +218,24 @@ test("selected strategy path and runtime capabilities reach nested Pi without du
     readFile(spawnAssemblyURL, "utf8"),
     readFile(chatSessionURL, "utf8"),
   ]);
-  const topLevelMounts = assembly.match(
-    /if f\.isEnabled\(\.computerUse\),\s*input\.computerDescriptor != nil,\s*let p = input\.paths\.computerUse \{\s*args \+= \["-e", p\]/g,
-  ) ?? [];
+  // Main session must never -e-mount computer-use; only export PIPIUI_COMPUTER_*.
+  const gateStart = assembly.indexOf("// Computer Use:");
+  assert.notEqual(gateStart, -1, "missing Computer Use assembly gate comment");
+  const computerGate = assembly.slice(gateStart, gateStart + 900);
+  assert.doesNotMatch(
+    computerGate,
+    /args \+= \["-e"/,
+    "computer-use assembly gate exports env only",
+  );
+  assert.match(computerGate, /computerEnvReady/);
+  assert.doesNotMatch(
+    assembly,
+    /paths\.computerUse[\s\S]{0,120}args \+= \["-e", p\]/,
+    "main session must not -e-mount computerUse path",
+  );
   const nestedMounts = subagent.match(
     /args\.push\("-e", PIPIUI_COMPUTER_EXT\)/g,
   ) ?? [];
-  assert.equal(topLevelMounts.length, 1);
   assert.equal(nestedMounts.length, 1, "only the grant-gated mount site remains");
   assert.match(chatSession, /let assembly = PipiSpawnAssembly\.assemble\(/);
   assert.match(
