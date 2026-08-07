@@ -231,6 +231,10 @@ private struct ChatDetailViewBody: View {
     @State private var rightPanelWidthRatio: CGFloat?
     @State private var rightPanelDragStartWidth: CGFloat?
     @State private var rightPanelDragWidth: CGFloat?
+    /// Pre-drag chat-column content width. While non-`nil`, transcript/markdown
+    /// layout stays frozen (panel chrome still tracks the cursor). Mirrors
+    /// `settledLogicalSize` freeze during window live-resize in `App.swift`.
+    @State private var frozenChatColumnWidthDuringRightPanelDrag: CGFloat?
     /// Real user prompt ids whose complete assistant turn is folded.
     @State private var collapsedUserTurnIDs: Set<String> = []
     /// macOS 14 fallback: bridge key of the scroll root whose first pinned
@@ -412,6 +416,7 @@ private struct ChatDetailViewBody: View {
             scrollNeedsRetry = false
             rightPanelDragStartWidth = nil
             rightPanelDragWidth = nil
+            frozenChatColumnWidthDuringRightPanelDrag = nil
             collapsedUserTurnIDs = []
             settledChatColumnWidth = nil
             pendingChatColumnWidth = nil
@@ -448,12 +453,20 @@ private struct ChatDetailViewBody: View {
             }
             InputBar(session: session)
         }
+        // Right-panel drag: keep content at the pre-drag width so markdown wrap
+        // does not remeasure every frame. Outer flexible frame still follows the
+        // HStack slot (divider/panel stay live); overflow is clipped.
+        .frame(
+            width: frozenChatColumnWidthDuringRightPanelDrag,
+            alignment: .leading
+        )
+        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .clipped()
         .background(
             GeometryReader { geo in
                 Color.clear.preference(key: ChatColumnWidthKey.self, value: geo.size.width)
             }
         )
-        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
         .layoutPriority(1)
     }
 
@@ -567,7 +580,15 @@ private struct ChatDetailViewBody: View {
 
     private func updateRightPanelDrag(translation: CGFloat, availableWidth: CGFloat) {
         if rightPanelDragStartWidth == nil {
-            rightPanelDragStartWidth = wideRightPanelWidth(for: availableWidth)
+            let startWidth = wideRightPanelWidth(for: availableWidth)
+            rightPanelDragStartWidth = startWidth
+            // Freeze chat content width for the whole drag (App.swift
+            // `settledLogicalSize` / `shouldUpdateSettledLayout(inLiveResize:)`).
+            // Panel frame still uses `rightPanelDragWidth` so the divider tracks.
+            frozenChatColumnWidthDuringRightPanelDrag = max(
+                availableWidth - startWidth - rightPanelDividerWidth,
+                minimumChatWidth
+            )
         }
         guard let rightPanelDragStartWidth else { return }
         rightPanelDragWidth = clampedRightPanelWidth(
@@ -592,6 +613,9 @@ private struct ChatDetailViewBody: View {
 
         rightPanelDragStartWidth = nil
         rightPanelDragWidth = nil
+        // Release freeze → one layout pass at final chat width; preference path
+        // settle-repins (same flush idea as `didEndLiveResizeNotification`).
+        frozenChatColumnWidthDuringRightPanelDrag = nil
     }
 
     /// The scroll container remains a sibling of InputBar. Only its row subtree observes
@@ -746,22 +770,44 @@ private struct ChatDetailViewBody: View {
                 }
                 recoverPinAfterColumnWidthChange(proxy)
             }
+            // Right-panel divider drag ended: same flush as didEndLiveResize.
+            // Preference may not re-fire if the slot width already matches the last
+            // pending frame, so apply pending + re-pin explicitly when freeze lifts.
+            .onChange(of: frozenChatColumnWidthDuringRightPanelDrag) { previous, current in
+                guard previous != nil, current == nil else { return }
+                chatColumnWidthSettleWork?.cancel()
+                chatColumnWidthSettleWork = nil
+                if let pending = pendingChatColumnWidth {
+                    settledChatColumnWidth = pending
+                    pendingChatColumnWidth = nil
+                }
+                recoverPinAfterColumnWidthChange(proxy)
+            }
         }
         // Replace the entire transcript scroll hierarchy across ChatSession objects.
         .id(TranscriptSessionRootIdentity(sessionKey: session.bridgeRoutingKey))
     }
 
-    /// Debounce chat-column width changes, then re-pin — but **never** while the window
-    /// is in live resize. Mid-drag `scrollTo("bottom")` races transcript reflow and
-    /// makes the transcript tremble; window drags only re-pin on `didEndLiveResize`.
-    /// Right-panel toggles (not live resize) still settle-then-repin here.
+    /// True while chat content width must not drive markdown reflow / re-pin:
+    /// AppKit window live-resize **or** right-panel divider drag. Same freeze
+    /// contract as `ResizeThrottle.shouldUpdateSettledLayout(inLiveResize:)`.
+    private var isChatColumnContentWidthFrozen: Bool {
+        frozenChatColumnWidthDuringRightPanelDrag != nil
+            || NSApp.keyWindow?.inLiveResize == true
+    }
+
+    /// Debounce chat-column width changes, then re-pin — but **never** while layout
+    /// is frozen for a live drag (window chrome or right-panel divider). Mid-drag
+    /// `scrollTo("bottom")` races transcript reflow and makes the transcript tremble;
+    /// window drags flush on `didEndLiveResize`, right-panel drags flush when
+    /// `frozenChatColumnWidthDuringRightPanelDrag` clears. Toggles still settle-then-repin.
     private func scheduleChatColumnWidthSettleRepin(_ proxy: ScrollViewProxy, width: CGFloat) {
         guard width.isFinite, width > 1 else { return }
         // Ignore sub-point / layout jitter — recovering on noise fights the wheel.
         if let settled = settledChatColumnWidth, abs(settled - width) < 12 {
             return
         }
-        if NSApp.keyWindow?.inLiveResize == true {
+        if isChatColumnContentWidthFrozen {
             pendingChatColumnWidth = width
             chatColumnWidthSettleWork?.cancel()
             chatColumnWidthSettleWork = nil
@@ -770,12 +816,13 @@ private struct ChatDetailViewBody: View {
         chatColumnWidthSettleWork?.cancel()
         let work = DispatchWorkItem {
             // Drag may have started after this work was scheduled.
-            if NSApp.keyWindow?.inLiveResize == true {
+            if isChatColumnContentWidthFrozen {
                 pendingChatColumnWidth = width
                 return
             }
             let previous = settledChatColumnWidth
             settledChatColumnWidth = width
+            pendingChatColumnWidth = nil
             // First layout pass only records width — do not yank an initial scroll.
             guard previous != nil else { return }
             recoverPinAfterColumnWidthChange(proxy)
