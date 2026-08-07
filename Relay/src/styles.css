@@ -284,6 +284,51 @@ input {
   flex: none;
 }
 
+/* Header model capsule (detail view) */
+.model-pill {
+  flex: none;
+  max-width: min(38vw, 160px);
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.model-pill:active:not(:disabled) {
+  background: var(--surface-2);
+}
+.model-pill:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.model-pill-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-text);
+}
+.model-pill svg {
+  flex: none;
+  color: var(--muted);
+}
+
+.transcript-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .transcript {
   flex: 1;
   min-height: 0;
@@ -293,6 +338,35 @@ input {
   flex-direction: column;
   gap: 10px;
   -webkit-overflow-scrolling: touch;
+}
+
+.scroll-bottom-btn {
+  position: absolute;
+  right: 14px;
+  bottom: 12px;
+  z-index: 5;
+  width: 40px;
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.scroll-bottom-btn:active {
+  background: var(--surface-2);
+}
+.scroll-bottom-btn svg {
+  display: block;
+}
+:root[data-theme="light"] .scroll-bottom-btn {
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.10);
 }
 
 .message {
@@ -476,31 +550,13 @@ input {
 .composer {
   flex: none;
   display: grid;
-  gap: 8px;
+  gap: 6px;
   padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
   background: var(--bg);
   border-top: 1px solid var(--border);
 }
 
-.composer .adm-text-area {
-  --adm-color-background: var(--surface);
-  --adm-color-border: var(--border);
-  border-radius: 12px;
-  border: 1px solid var(--border);
-  padding: 8px 10px;
-}
-.composer textarea {
-  font-size: 15px;
-  line-height: 1.4;
-}
-
-.actions {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-.actions .composer-status {
-  flex: 1;
+.composer-status {
   min-width: 0;
   color: var(--muted);
   font-size: 12px;
@@ -508,6 +564,59 @@ input {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  padding: 0 2px;
+}
+
+.composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.composer-input-wrap {
+  flex: 1;
+  min-width: 0;
+}
+
+.composer .adm-text-area {
+  --adm-color-background: var(--surface);
+  --adm-color-border: var(--border);
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  padding: 8px 14px;
+}
+.composer textarea {
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+.composer-action {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.composer-action:active:not(:disabled) {
+  filter: brightness(0.92);
+}
+.composer-action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.composer-action.stop {
+  background: var(--adm-color-danger);
+}
+.composer-action svg {
+  display: block;
 }
 
 /* ---- Panels (antd-mobile Popup) ---- */

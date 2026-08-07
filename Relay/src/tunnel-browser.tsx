@@ -1,6 +1,5 @@
 import {
   Button,
-  Dialog,
   List,
   Popup,
   Selector,
@@ -12,6 +11,11 @@ import {
 } from "antd-mobile";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import {
+  canSendPrompt,
+  composerActionMode,
+  isNearBottom,
+} from "./chat-ui.js";
 import { TunnelClient, type TunnelStatus } from "./tunnel-client.js";
 import { MessageView } from "./message-view.js";
 import "antd-mobile/es/global/global.css";
@@ -79,6 +83,38 @@ function MoonIcon() {
   );
 }
 
+function SendIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
+      <path d="M3.4 20.4 20.85 12.9a1 1 0 0 0 0-1.8L3.4 3.6a.9.9 0 0 0-1.25 1.08l2.4 7.02a1 1 0 0 0 .74.68l8.21 1.62-8.21 1.62a1 1 0 0 0-.74.68L2.15 19.32A.9.9 0 0 0 3.4 20.4z" />
+    </svg>
+  );
+}
+
+function StopIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
+      <rect x="6" y="6" width="12" height="12" rx="2" />
+    </svg>
+  );
+}
+
+function ChevronDownIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M6 9l6 6 6-6" />
+    </svg>
+  );
+}
+
+function ModelChevronIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M6 9l6 6 6-6" />
+    </svg>
+  );
+}
+
 function snapshotStatus(snapshot: any): string {
   if (!snapshot) return "—";
   if (snapshot.isStopping) return "正在停止…";
@@ -111,8 +147,10 @@ function App() {
   const [indexPending, setIndexPending] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sending, setSending] = useState(false);
+  const [stickToBottom, setStickToBottom] = useState(true);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
   const logicRef = useRef<LogicRef>({
     activeSession: null,
     revision: null,
@@ -239,12 +277,9 @@ function App() {
     if (!snapshotValue) return;
     setRevision(value.revision ?? null);
     setView("detail");
-    const modelName = currentModelName;
-    setSessionTitle(
-      modelName ? `${snapshotValue.title} · ${modelName}` : snapshotValue.title,
-    );
+    setSessionTitle(typeof snapshotValue.title === "string" ? snapshotValue.title : "会话");
     setSnapshot(snapshotValue);
-  }, [currentModelName]);
+  }, []);
 
   const pollSnapshot = useCallback(async () => {
     const { activeSession: as, revision: rev, activePanel: ap, connected: conn } = logicRef.current;
@@ -266,11 +301,33 @@ function App() {
     return () => window.clearInterval(timer);
   }, [pollSnapshot]);
 
-  // auto-scroll transcript on snapshot change
+  // Stick-to-bottom: only auto-scroll when user is already near the bottom.
   useEffect(() => {
+    if (!stickToBottomRef.current) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [snapshot]);
+
+  const onTranscriptScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const near = isNearBottom(el.scrollTop, el.clientHeight, el.scrollHeight);
+    stickToBottomRef.current = near;
+    setStickToBottom(near);
+  };
+
+  const scrollToBottom = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickToBottomRef.current = true;
+    setStickToBottom(true);
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  };
+
+  const resetStickToBottom = () => {
+    stickToBottomRef.current = true;
+    setStickToBottom(true);
+  };
 
   const loadModels = useCallback(async () => {
     const as = logicRef.current.activeSession;
@@ -298,6 +355,7 @@ function App() {
   const openSession = useCallback(async (sessionID: string, requestOpen: boolean) => {
     setSessionLoading(true);
     setPanelDetailLoading(false);
+    resetStickToBottom();
     try {
       if (requestOpen) await logic()!.command("session.open", { sessionID });
       logicRef.current.activeSession = sessionID;
@@ -341,7 +399,9 @@ function App() {
     setPanelDetail(null);
     setPanelDetailLoading(false);
     setSessionLoading(false);
+    setModelOpen(false);
     setSessionTitle("请选择会话");
+    resetStickToBottom();
     void loadIndex();
   };
 
@@ -355,14 +415,20 @@ function App() {
   }, [sessionPage, status.kind, loadIndex]);
 
   // ---- chat actions ----
-  const canSend =
-    status.kind === "connected" && !!logicRef.current.activeSession
-    && text.trim().length > 0 && snapshot?.processAlive === true;
+  const actionMode = composerActionMode(snapshot);
+  const canSend = canSendPrompt({
+    connected: status.kind === "connected",
+    hasSession: !!logicRef.current.activeSession,
+    text,
+    processAlive: snapshot?.processAlive,
+    sending,
+  });
 
   const send = async () => {
     const as = logicRef.current.activeSession;
-    if (!as) return;
+    if (!as || !canSend) return;
     setSending(true);
+    resetStickToBottom();
     try {
       await logic()!.command("prompt.send", {
         sessionID: as,
@@ -391,16 +457,9 @@ function App() {
     }
   };
 
-  const revoke = () => {
-    Dialog.confirm({
-      content: "确认断开与 Mac 的连接？重新打开此链接即可重新连接。",
-      confirmText: "断开",
-      cancelText: "取消",
-      onConfirm: () => {
-        logic()!.revoke();
-        setStatus({ kind: "closed" });
-      },
-    });
+  const onComposerAction = () => {
+    if (actionMode === "stop") void stop();
+    else void send();
   };
 
   // ---- model panel ----
@@ -511,6 +570,18 @@ function App() {
           <Button size="small" onClick={showList}>‹ 返回</Button>
         ) : null}
         <div className="header-title">{view === "detail" ? sessionTitle : "PipiUI 远程会话"}</div>
+        {view === "detail" ? (
+          <button
+            type="button"
+            className="model-pill"
+            disabled={!activeSession || status.kind !== "connected"}
+            onClick={toggleModel}
+            aria-label={currentModelName ? `当前模型 ${currentModelName}` : "选择模型"}
+          >
+            <span className="model-pill-label">{currentModelName || "模型"}</span>
+            <ModelChevronIcon />
+          </button>
+        ) : null}
         <button
           type="button"
           className="theme-toggle"
@@ -635,9 +706,6 @@ function App() {
       ) : (
         <div className="chat-view">
           <div className="chat-tabs">
-            <Button size="small" onClick={toggleModel} disabled={!activeSession}>
-              模型{currentModelName ? ` · ${currentModelName}` : ""}
-            </Button>
             <Button size="small" onClick={() => togglePanel("agents")} disabled={!activeSession}>
               Subagents
             </Button>
@@ -649,60 +717,72 @@ function App() {
             </Button>
           </div>
 
-          <div className="transcript" ref={scrollRef} aria-live="polite">
-            {sessionLoading ? (
-              <div className="center-block fill">
-                <SpinLoading color="primary" />
-                <span>正在加载会话…</span>
-              </div>
-            ) : messages.length === 0 ? (
-              status.kind !== "connected" ? (
+          <div className="transcript-wrap">
+            <div
+              className="transcript"
+              ref={scrollRef}
+              onScroll={onTranscriptScroll}
+              aria-live="polite"
+            >
+              {sessionLoading ? (
                 <div className="center-block fill">
                   <SpinLoading color="primary" />
-                  <span>{statusLine}</span>
+                  <span>正在加载会话…</span>
                 </div>
+              ) : messages.length === 0 ? (
+                status.kind !== "connected" ? (
+                  <div className="center-block fill">
+                    <SpinLoading color="primary" />
+                    <span>{statusLine}</span>
+                  </div>
+                ) : (
+                  <div className="list-empty">暂无消息</div>
+                )
               ) : (
-                <div className="list-empty">暂无消息</div>
-              )
-            ) : (
-              messages.map((message: any, index: number) => (
-                <MessageView
-                  key={index}
-                  message={message}
-                  live={liveTail
-                    && (message.kind === "tool" || message.kind === "thinking")
-                    && index === messages.length - 1}
-                />
-              ))
-            )}
+                messages.map((message: any, index: number) => (
+                  <MessageView
+                    key={index}
+                    message={message}
+                    live={liveTail
+                      && (message.kind === "tool" || message.kind === "thinking")
+                      && index === messages.length - 1}
+                  />
+                ))
+              )}
+            </div>
+            {!stickToBottom ? (
+              <button
+                type="button"
+                className="scroll-bottom-btn"
+                onClick={scrollToBottom}
+                aria-label="回到底部"
+              >
+                <ChevronDownIcon />
+              </button>
+            ) : null}
           </div>
 
           <div className="composer">
-            <TextArea
-              value={text}
-              onChange={setText}
-              placeholder="输入消息"
-              autoSize={{ minRows: 2, maxRows: 8 }}
-            />
-            <div className="actions">
-              <span className="composer-status">{snapshotStatus(snapshot)}</span>
-              <Button
-                color="primary"
-                loading={sending}
-                disabled={!canSend || sending}
-                onClick={() => void send()}
+            <div className="composer-status">{snapshotStatus(snapshot)}</div>
+            <div className="composer-row">
+              <div className="composer-input-wrap">
+                <TextArea
+                  value={text}
+                  onChange={setText}
+                  placeholder="输入消息"
+                  autoSize={{ minRows: 1, maxRows: 6 }}
+                  rows={1}
+                />
+              </div>
+              <button
+                type="button"
+                className={`composer-action${actionMode === "stop" ? " stop" : ""}`}
+                disabled={actionMode === "send" ? !canSend : false}
+                aria-label={actionMode === "stop" ? "停止" : "发送"}
+                onClick={onComposerAction}
               >
-                发送
-              </Button>
-              <Button
-                disabled={!(snapshot?.isGenerating || snapshot?.isStopping)}
-                onClick={() => void stop()}
-              >
-                停止
-              </Button>
-              <Button color="danger" fill="outline" onClick={revoke}>
-                断开
-              </Button>
+                {actionMode === "stop" ? <StopIcon /> : <SendIcon />}
+              </button>
             </div>
           </div>
         </div>
