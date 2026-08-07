@@ -42,8 +42,12 @@ final class PromptCacheDisciplineTests: XCTestCase {
         let source = try install(GitExtension.install(into:))
         XCTAssertEqual(source.components(separatedBy: "registerTool(").count - 1, 1)
         XCTAssertTrue(source.contains("name: \"git\""))
-        for action in ["status", "diff", "help"] {
+        for action in ["status", "diff", "log", "show", "help"] {
             XCTAssertTrue(source.contains("case \"\(action)\":"), "missing git action \(action)")
+        }
+        XCTAssertTrue(source.contains("actions: status | diff | log | show | help"))
+        for field in ["n:", "ref:", "full:"] {
+            XCTAssertTrue(source.contains(field), "missing git schema field \(field)")
         }
     }
 
