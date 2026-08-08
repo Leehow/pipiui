@@ -31,6 +31,8 @@ final class StreamingMessageAssembler {
     private var orderedIndices: [Int] = []
     /// Incremental text + thinking character count (tool args excluded).
     private(set) var characterCount: Int = 0
+    /// Body-text only count (thinking excluded). Used for TTFT parity with legacy `contentText`.
+    private(set) var textCharacterCount: Int = 0
     /// True after any apply since the last `consumePending` / reset.
     private(set) var isDirty: Bool = false
 
@@ -38,13 +40,15 @@ final class StreamingMessageAssembler {
         blocks.removeAll(keepingCapacity: true)
         orderedIndices.removeAll(keepingCapacity: true)
         characterCount = 0
+        textCharacterCount = 0
         isDirty = false
     }
 
     var isEmpty: Bool { blocks.isEmpty }
 
-    /// Non-empty assistant text or thinking has arrived (TTFT marker, no full scan).
-    var hasVisibleText: Bool { characterCount > 0 }
+    /// Non-empty assistant body text has arrived (TTFT marker; thinking does not count).
+    /// Matches legacy `markStreamFirstTokenIfNeeded` → `contentText` (type == "text" only).
+    var hasVisibleText: Bool { textCharacterCount > 0 }
 
     func apply(_ event: J) {
         guard let type = event["type"].string else { return }
@@ -59,6 +63,7 @@ final class StreamingMessageAssembler {
             if case .text(let existing) = blocks[index] {
                 blocks[index] = .text(existing + delta)
                 characterCount += delta.count
+                textCharacterCount += delta.count
             } else {
                 replaceText(index, delta)
             }
@@ -224,16 +229,19 @@ final class StreamingMessageAssembler {
     private func replaceText(_ index: Int, _ text: String) {
         if case .text(let old) = blocks[index] {
             characterCount -= old.count
+            textCharacterCount -= old.count
         } else if case .thinking(let old) = blocks[index] {
             characterCount -= old.count
         }
         characterCount += text.count
+        textCharacterCount += text.count
         setBlock(index, .text(text))
     }
 
     private func replaceThinking(_ index: Int, _ text: String) {
         if case .text(let old) = blocks[index] {
             characterCount -= old.count
+            textCharacterCount -= old.count
         } else if case .thinking(let old) = blocks[index] {
             characterCount -= old.count
         }

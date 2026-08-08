@@ -2313,13 +2313,6 @@ final class ChatSession: ObservableObject, Identifiable {
         return !message["content"].array.isEmpty
     }
 
-    /// Content length without walking every block string when the payload is a plain string
-    /// (legacy / jcode cumulative snapshots). Array form still scans once per call — callers
-    /// on the hot path should prefer the assembler's incremental `characterCount`.
-    package static func contentLength(_ message: J) -> Int {
-        fastContentLength(message)
-    }
-
     /// Hot-path length for diagnostics / bookkeeping. Prefer UTF-8 byte length so a
     /// cumulative legacy snapshot does not pay `String.count` (O(n) Character walk)
     /// on every `message_update`.
