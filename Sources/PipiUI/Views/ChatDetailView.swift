@@ -341,6 +341,24 @@ private struct ChatDetailViewBody: View {
                 if ComputerUseSettings.isEnabled() {
                     ComputerToolbarControl(sessionKey: session.bridgeRoutingKey)
                 }
+
+                Button {
+                    if session.rightPanel != nil {
+                        session.rightPanel = nil
+                    } else if let last = session.lastRightPanel {
+                        if last == .agents {
+                            session.subagents.selectLatest()
+                        }
+                        session.rightPanel = last
+                    }
+                } label: {
+                    Image(systemName: session.rightPanel != nil
+                          ? "rectangle.righthalf.inset.filled.arrow.right"
+                          : "sidebar.right")
+                        .foregroundStyle(session.rightPanel != nil ? Color.accentColor : Color.secondary)
+                }
+                .help(session.rightPanel != nil ? "收起右侧栏" : "展开右侧栏")
+                .disabled(session.rightPanel == nil && session.lastRightPanel == nil)
             }
         }
         .sheet(item: $finishedGroupPresentation) { presentation in
@@ -483,24 +501,6 @@ private struct ChatDetailViewBody: View {
             ) {
                 session.rightPanel = session.rightPanel == .terminal ? nil : .terminal
             }
-
-            railButton(
-                systemName: session.rightPanel != nil
-                    ? "rectangle.righthalf.inset.filled.arrow.right"
-                    : "sidebar.right",
-                isActive: session.rightPanel != nil,
-                help: session.rightPanel != nil ? "收起右侧栏" : "展开右侧栏"
-            ) {
-                if session.rightPanel != nil {
-                    session.rightPanel = nil
-                } else if let last = session.lastRightPanel {
-                    if last == .agents {
-                        session.subagents.selectLatest()
-                    }
-                    session.rightPanel = last
-                }
-            }
-            .disabled(session.rightPanel == nil && session.lastRightPanel == nil)
         }
         .padding(.vertical, 6)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
