@@ -338,10 +338,6 @@ private struct ChatDetailViewBody: View {
             ToolbarItemGroup(placement: .primaryAction) {
                 GitBranchMenu(store: gitBranches) { session.lastError = $0 }
 
-                if ComputerUseSettings.isEnabled() {
-                    ComputerToolbarControl(sessionKey: session.bridgeRoutingKey)
-                }
-
                 Button {
                     if session.rightPanel != nil {
                         session.rightPanel = nil
@@ -509,6 +505,9 @@ private struct ChatDetailViewBody: View {
                 .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.10), radius: 8, y: 2)
+        // Rail floats over selectable transcript text; without an explicit cursor
+        // the underlying I-beam bleeds through on hover.
+        .pointingHandCursor()
     }
 
     private func railButton(
