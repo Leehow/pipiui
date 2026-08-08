@@ -987,6 +987,10 @@ final class SubagentStore: ObservableObject {
     private var logCounter = 0
     private var cachedRunningCount = 0
     private var cachedTotalCost: Double = 0
+    /// Live stream slots: agentId → contentIndex → AgentLogItem.id.
+    /// Filled by `log_delta` (cumulative text/thinking upserts); cleared on `log`/`end`/`start`
+    /// so the next turn opens new rows instead of overwriting the previous message.
+    private var streamingLogItemIDs: [String: [Int: Int]] = [:]
 
     // MARK: - High-fanout event mailbox
     private struct PendingAgentEvent {
@@ -1575,6 +1579,54 @@ final class SubagentStore: ObservableObject {
         agents[index].stalledIdleSec = 0
     }
 
+    /// Upsert a streaming log row for one contentIndex. Payload uses cumulative `text`
+    /// (not a pure append delta) so mailbox coalescing can keep only the latest snapshot.
+    private func applyLogDelta(agentIndex i: Int, agentID id: String, event e: J) {
+        let contentIndex = e["contentIndex"].int ?? 0
+        let itemType = e["itemType"].string ?? "text"
+        let text = e["text"].string ?? ""
+        let name = e["name"].string ?? ""
+        var slots = streamingLogItemIDs[id] ?? [:]
+        if let itemID = slots[contentIndex],
+           let logIdx = agents[i].log.firstIndex(where: { $0.id == itemID }) {
+            let old = agents[i].log[logIdx]
+            agents[i].log[logIdx] = AgentLogItem(
+                id: old.id,
+                kind: itemType,
+                name: name.isEmpty ? old.name : name,
+                text: text,
+                isError: old.isError
+            )
+            return
+        }
+        // Skip empty placeholders (text_start before first delta) so the panel
+        // doesn't flash a blank row.
+        if text.isEmpty && itemType != "tool" { return }
+        logCounter += 1
+        let itemID = logCounter
+        slots[contentIndex] = itemID
+        streamingLogItemIDs[id] = slots
+        agents[i].log.append(AgentLogItem(
+            id: itemID,
+            kind: itemType,
+            name: name,
+            text: text,
+            isError: false
+        ))
+        trimAgentLog(at: i, agentID: id)
+    }
+
+    /// Cap log at 800 items; drop stream-slot entries whose rows were evicted.
+    private func trimAgentLog(at index: Int, agentID id: String) {
+        let overflow = agents[index].log.count - 800
+        guard overflow > 0 else { return }
+        let removedIDs = Set(agents[index].log.prefix(overflow).map(\.id))
+        agents[index].log.removeFirst(overflow)
+        guard var slots = streamingLogItemIDs[id], !slots.isEmpty else { return }
+        slots = slots.filter { !removedIDs.contains($0.value) }
+        streamingLogItemIDs[id] = slots
+    }
+
     private func markObserved(_ index: Int, at date: Date) {
         if date > agents[index].lastObservedAt {
             agents[index].lastObservedAt = date
@@ -1629,15 +1681,27 @@ final class SubagentStore: ObservableObject {
         guard let id = event["agentId"].string, !id.isEmpty else { return false }
         let shouldAutoOpen = projectAutoOpenDecision(for: event, agentID: id)
         let kind = event["kind"].string ?? ""
-        let replacementKey = "\(id)|\(kind)"
         // Coalesce only one consecutive same-kind segment. Any intervening event for
         // this agent is an ordering barrier, including lossless log/usage records.
+        // log_delta is replaceable per contentIndex (cumulative snapshot upserts).
         if pendingLastEventKindByAgent[id] != kind {
-            replaceablePendingEventIndex.removeValue(forKey: "\(id)|update")
-            replaceablePendingEventIndex.removeValue(forKey: "\(id)|stalled")
+            clearReplaceablePendingSlots(forAgentID: id)
         }
         pendingLastEventKindByAgent[id] = kind
         if kind == "update" || kind == "stalled" {
+            let replacementKey = "\(id)|\(kind)"
+            if let index = replaceablePendingEventIndex[replacementKey] {
+                pendingAgentEvents[index] = PendingAgentEvent(
+                    event: event,
+                    observedAt: observedAt
+                )
+            } else {
+                replaceablePendingEventIndex[replacementKey] = pendingAgentEvents.count
+                pendingAgentEvents.append(PendingAgentEvent(event: event, observedAt: observedAt))
+            }
+        } else if kind == "log_delta" {
+            let contentIndex = event["contentIndex"].int ?? 0
+            let replacementKey = "\(id)|log_delta|\(contentIndex)"
             if let index = replaceablePendingEventIndex[replacementKey] {
                 pendingAgentEvents[index] = PendingAgentEvent(
                     event: event,
@@ -1673,6 +1737,15 @@ final class SubagentStore: ObservableObject {
     }
 
     var pendingAgentEventCount: Int { pendingAgentEvents.count }
+
+    /// Drop coalesce slots for one agent (prefix `id|`). Pending events already in the
+    /// mailbox stay; only future same-key merges are affected.
+    private func clearReplaceablePendingSlots(forAgentID id: String) {
+        let prefix = "\(id)|"
+        replaceablePendingEventIndex = replaceablePendingEventIndex.filter {
+            !$0.key.hasPrefix(prefix)
+        }
+    }
 
     func handle(_ e: J, observedAt: Date = Date()) {
         applyAgentEvents([PendingAgentEvent(event: e, observedAt: observedAt)])
@@ -1726,6 +1799,8 @@ final class SubagentStore: ObservableObject {
                 agents[i].state = .running
                 agents[i].activity = ""
                 clearStalled(i)
+                // Fresh run/resume: stream slots must not rewrite prior-turn rows.
+                streamingLogItemIDs[id] = [:]
                 if abortPending.contains(id) { abortPending.remove(id) }
                 agents[i].ended = nil
                 setCloseoutDisposition(at: i, .unclassified, reason: nil)
@@ -1770,9 +1845,18 @@ final class SubagentStore: ObservableObject {
             agents[i].activity = e["activity"].string ?? agents[i].activity
             agents[i].cost = e["cost"].double ?? agents[i].cost
             agents[i].turns = e["turns"].int ?? agents[i].turns
+        case "log_delta":
+            // Cumulative live preview from the TS bridge (pi 0.84+ assistantMessageEvent).
+            // Upserts one log row per contentIndex; message_end `log` remains authoritative
+            // for tools and non-streamed fallbacks (and resets stream slots).
+            guard let i = oldIndex else { return (false, false) }
+            clearStalled(i)
+            applyLogDelta(agentIndex: i, agentID: id, event: e)
         case "log":
             guard let i = oldIndex else { return (false, false) }
             clearStalled(i)
+            // Turn boundary: next stream deltas open new rows.
+            streamingLogItemIDs[id] = [:]
             for item in e["items"].array {
                 logCounter += 1
                 agents[i].log.append(AgentLogItem(
@@ -1783,9 +1867,7 @@ final class SubagentStore: ObservableObject {
                     isError: item["isError"].bool ?? false
                 ))
             }
-            if agents[i].log.count > 800 {
-                agents[i].log.removeFirst(agents[i].log.count - 800)
-            }
+            trimAgentLog(at: i, agentID: id)
         case "usage":
             // Per-turn usage from the subagent extension (`index.ts` message_end →
             // pipiuiReport kind:"usage"). Updates detail metrics + token ledger.
@@ -1829,6 +1911,7 @@ final class SubagentStore: ObservableObject {
             guard let i = oldIndex else { return (false, false) }
             lifecycleChanged = true
             clearStalled(i)
+            streamingLogItemIDs[id] = nil
             if abortPending.contains(id) { abortPending.remove(id) }
             // Vanished/interrupted is not a user abort and not a failed answer — keep
             // resumable context (same disposition as reconcileInterruptedAfterRestart).

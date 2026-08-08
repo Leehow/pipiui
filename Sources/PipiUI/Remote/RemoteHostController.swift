@@ -447,7 +447,7 @@ final class RemoteHostController {
     }
 
     private func documentsDTO(session: ChatSession, sessionID: String) -> [[String: Any]] {
-        guard let url = session.documents.currentURL else { return [] }
+        guard let url = session.documentTabs.activeStore?.currentURL else { return [] }
         let id = UUID().uuidString.lowercased()
         remoteDocuments[id] = (sessionID, url)
         let size = ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber)?.intValue ?? 0

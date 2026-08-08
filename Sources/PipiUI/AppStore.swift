@@ -147,6 +147,7 @@ final class AppStore: ObservableObject {
                                           forKey: Self.lastSessionProjectKey)
             }
             guard selectedSessionKey != oldValue, let key = selectedSessionKey else { return }
+            DiagnosticsStream.append("SEL key=\(key) current=\(openSessions[key]?.id ?? "nil")")
             // TEMP SWITCH PERF: measure how long a sidebar switch blocks the main thread.
             Self.lastSwitchAt = CFAbsoluteTimeGetCurrent()
             let warm = openSessions[key] != nil

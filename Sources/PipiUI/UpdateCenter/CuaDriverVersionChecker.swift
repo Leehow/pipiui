@@ -80,7 +80,16 @@ enum CuaDriverVersionChecker {
     // MARK: - Installed resolution
 
     private static func resolveInstalledVersion() -> String? {
+        // Packaging marker lives in the app bundle's Resources (plain data, not
+        // nested code). Prefer it before spawning the helper.
+        if let versionURL = Bundle.main.url(forResource: "cua-driver", withExtension: "version"),
+           let text = try? String(contentsOf: versionURL, encoding: .utf8) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
         if let helperPath = resolveHelperPath() {
+            // Legacy sibling-of-helper fallback (older packages wrote it next to
+            // the executable in Contents/Helpers).
             let versionFile = URL(fileURLWithPath: helperPath)
                 .deletingLastPathComponent()
                 .appendingPathComponent("cua-driver.version")

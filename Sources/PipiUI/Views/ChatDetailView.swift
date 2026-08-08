@@ -341,41 +341,6 @@ private struct ChatDetailViewBody: View {
                 if ComputerUseSettings.isEnabled() {
                     ComputerToolbarControl(sessionKey: session.bridgeRoutingKey)
                 }
-
-                Button {
-                    if session.rightPanel == .agents {
-                        session.rightPanel = nil
-                    } else {
-                        session.subagents.selectLatest()
-                        session.rightPanel = .agents
-                    }
-                } label: {
-                    Image(systemName: "person.2")
-                        .foregroundStyle(session.rightPanel == .agents ? Color.accentColor : Color.secondary)
-                        .overlay(alignment: .topTrailing) {
-                            if session.subagents.runningCount > 0 {
-                                Circle().fill(Color.green).frame(width: 7, height: 7)
-                                    .offset(x: 3, y: -3)
-                            }
-                        }
-                }
-                .help("Subagent 面板（pi 派出的子 agent 树）")
-
-                Button {
-                    session.rightPanel = session.rightPanel == .web ? nil : .web
-                } label: {
-                    Image(systemName: "globe")
-                        .foregroundStyle(session.rightPanel == .web ? Color.accentColor : Color.secondary)
-                }
-                .help("内置浏览器面板（pi 可通过 browser 工具驱动）")
-
-                Button {
-                    session.rightPanel = session.rightPanel == .document ? nil : .document
-                } label: {
-                    Image(systemName: "doc.text")
-                        .foregroundStyle(session.rightPanel == .document ? Color.accentColor : Color.secondary)
-                }
-                .help("文档面板（⌘+点击聊天中的 md/txt 文档路径在此预览）")
             }
         }
         .sheet(item: $finishedGroupPresentation) { presentation in
@@ -427,7 +392,7 @@ private struct ChatDetailViewBody: View {
         }
         .environment(\.openDocument, { url in
             // ⌘+点击聊天中的文档路径 → 右侧文档面板渲染（非文档路径仍走访达）。
-            session.documents.open(url)
+            session.documentTabs.open(url)
             session.rightPanel = .document
         })
     }
@@ -462,12 +427,87 @@ private struct ChatDetailViewBody: View {
         )
         .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .clipped()
+        .overlay(alignment: .topTrailing) {
+            panelQuickRail.padding(12)
+        }
         .background(
             GeometryReader { geo in
                 Color.clear.preference(key: ChatColumnWidthKey.self, value: geo.size.width)
             }
         )
         .layoutPriority(1)
+    }
+
+    /// 聊天栏右上角的竖向快捷栏：右面板开关（Subagents / 浏览器 / 文档）+ 终端。
+    private var panelQuickRail: some View {
+        VStack(spacing: 4) {
+            railButton(
+                systemName: "person.2",
+                isActive: session.rightPanel == .agents,
+                help: "Subagent 面板（pi 派出的子 agent 树）"
+            ) {
+                if session.rightPanel == .agents {
+                    session.rightPanel = nil
+                } else {
+                    session.subagents.selectLatest()
+                    session.rightPanel = .agents
+                }
+            }
+            .overlay(alignment: .topTrailing) {
+                if session.subagents.runningCount > 0 {
+                    Circle().fill(Color.green).frame(width: 7, height: 7)
+                        .offset(x: 2, y: -2)
+                }
+            }
+
+            railButton(
+                systemName: "globe",
+                isActive: session.rightPanel == .web,
+                help: "内置浏览器面板（pi 可通过 browser 工具驱动）"
+            ) {
+                session.rightPanel = session.rightPanel == .web ? nil : .web
+            }
+
+            railButton(
+                systemName: "doc.text",
+                isActive: session.rightPanel == .document,
+                help: "文档面板（⌘+点击聊天中的 md/txt 文档路径在此预览）"
+            ) {
+                session.rightPanel = session.rightPanel == .document ? nil : .document
+            }
+
+            railButton(
+                systemName: "terminal",
+                isActive: false,
+                help: "在项目目录打开系统终端"
+            ) {
+                ProjectTerminalLauncher.open(at: session.projectURL)
+            }
+        }
+        .padding(.vertical, 6)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.10), radius: 8, y: 2)
+    }
+
+    private func railButton(
+        systemName: String,
+        isActive: Bool,
+        help: LocalizedStringKey,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
+                .frame(width: 30, height: 26)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 
     @ViewBuilder
@@ -524,7 +564,7 @@ private struct ChatDetailViewBody: View {
         Group {
             switch panel {
             case .web:
-                WebViewPanel(store: session.webView) {
+                WebViewPanel(store: session.webTabs) {
                     session.rightPanel = nil
                 }
             case .agents:
@@ -545,7 +585,7 @@ private struct ChatDetailViewBody: View {
                 // is stable across persisted-id rebinding of one logical session.
                 .id(session.bridgeRoutingKey)
             case .document:
-                DocumentPanel(store: session.documents) {
+                DocumentPanel(store: session.documentTabs) {
                     session.rightPanel = nil
                 }
             }

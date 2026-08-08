@@ -15,10 +15,98 @@ extension EnvironmentValues {
     }
 }
 
-/// 右侧文档面板：预览 Markdown / 纯文本文档。
-/// Markdown 走聊天同款 MarkdownTextView（标题/表格/代码块/引用），
-/// 纯文本走等宽可选中原文；头部提供访达 / 外部打开 / 刷新 / 关闭。
+/// 右侧文档面板：多 tab 预览 Markdown / 纯文本 / PDF 文档。
+/// 顶部 tab 条切换已打开的文档（⌘+点击聊天中的文档路径追加 tab），
+/// 内容区沿用单文档视图：访达 / 外部打开 / 刷新 / 关闭。
 struct DocumentPanel: View {
+    @ObservedObject var store: DocumentTabsStore
+    var onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if !store.tabs.isEmpty {
+                tabStrip
+                Divider()
+            }
+            if let active = store.activeStore {
+                DocumentTabContent(store: active, onClose: onClose)
+            } else {
+                emptyState
+            }
+        }
+        .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    // MARK: - Tab strip
+
+    private var tabStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                ForEach(store.tabs) { tab in
+                    PanelTabChip(
+                        icon: tabIcon(for: tab.url),
+                        title: tab.url.lastPathComponent,
+                        isSelected: tab.id == store.selectedTabID,
+                        onSelect: { store.select(id: tab.id) },
+                        onClose: { store.closeTab(id: tab.id) }
+                    )
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func tabIcon(for url: URL) -> String {
+        switch DocumentDetector.kind(for: url) {
+        case .markdown: return "doc.richtext"
+        case .plain: return "doc.plaintext"
+        case .pdf: return "doc"
+        case nil: return "doc.text"
+        }
+    }
+
+    // MARK: - Empty state
+
+    private var emptyState: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                Button(action: onClose) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                        .help("关闭文档面板")
+                }
+                .buttonStyle(HoverButtonStyle())
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            Divider()
+            VStack(spacing: 10) {
+                Image(systemName: "doc.text.magnifyingglass")
+                    .font(.system(size: 34, weight: .light))
+                    .foregroundStyle(.tertiary)
+                Text("没有打开的文档")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Text("在聊天中 ⌘+点击 Markdown / 文本文档路径，即可在此预览")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 20)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+}
+
+/// 单个文档 tab 的内容：Markdown 走聊天同款 MarkdownTextView（标题/表格/代码块/引用），
+/// 纯文本走等宽可选中原文；头部提供访达 / 外部打开 / 刷新 / 关闭。
+struct DocumentTabContent: View {
     @ObservedObject var store: DocumentStore
     var onClose: () -> Void
     @Environment(\.chatTypography) private var chatTypography
@@ -29,7 +117,6 @@ struct DocumentPanel: View {
             Divider()
             content
         }
-        .background(Color(nsColor: .textBackgroundColor))
     }
 
     // MARK: - Toolbar

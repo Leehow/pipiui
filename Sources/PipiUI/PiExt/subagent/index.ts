@@ -2994,6 +2994,80 @@ async function runSingleAgent(
 				const liveHandle = runningAgents.get(pipiuiAgentId);
 				if (liveHandle) liveHandle.pid = proc.pid;
 				let buffer = "";
+				// pi 0.84+: message_update carries assistantMessageEvent deltas only.
+				// Assemble text/thinking by contentIndex and push throttled cumulative
+				// snapshots (kind: log_delta) so the native panel streams live.
+				// message_end remains authoritative for tools + non-streamed fallback.
+				type StreamPart = { itemType: "text" | "thinking" | "tool"; text: string; name: string };
+				const streamParts = new Map<number, StreamPart>();
+				const streamDirty = new Set<number>();
+				let streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
+				const STREAM_FLUSH_MS = 50;
+				const STREAM_TEXT_CAP = 4000;
+				const STREAM_THINKING_CAP = 600;
+
+				const flushStreamParts = () => {
+					if (streamDirty.size === 0) return;
+					const indices = [...streamDirty].sort((a, b) => a - b);
+					streamDirty.clear();
+					for (const idx of indices) {
+						const part = streamParts.get(idx);
+						if (!part) continue;
+						// Skip empty placeholders (e.g. bare text_start) until first delta.
+						if (!part.text && part.itemType !== "tool") continue;
+						pipiuiReport({
+							kind: "log_delta",
+							agentId: pipiuiAgentId,
+							contentIndex: idx,
+							itemType: part.itemType,
+							text: part.text,
+							...(part.name ? { name: part.name } : {}),
+						});
+					}
+					pipiuiUpdate();
+				};
+
+				const scheduleStreamFlush = () => {
+					if (streamFlushTimer) return;
+					streamFlushTimer = setTimeout(() => {
+						streamFlushTimer = null;
+						flushStreamParts();
+					}, STREAM_FLUSH_MS);
+					streamFlushTimer.unref?.();
+				};
+
+				const forceFlushStreamParts = () => {
+					if (streamFlushTimer) {
+						clearTimeout(streamFlushTimer);
+						streamFlushTimer = null;
+					}
+					flushStreamParts();
+				};
+
+				const upsertStreamPart = (
+					contentIndex: number,
+					itemType: StreamPart["itemType"],
+					delta: string,
+					name?: string,
+					replaceText?: string,
+				) => {
+					let part = streamParts.get(contentIndex);
+					if (!part) {
+						part = { itemType, text: "", name: name ?? "" };
+						streamParts.set(contentIndex, part);
+					} else if (part.itemType !== itemType) {
+						part.itemType = itemType;
+					}
+					if (name) part.name = name;
+					const cap = itemType === "thinking" ? STREAM_THINKING_CAP : STREAM_TEXT_CAP;
+					if (typeof replaceText === "string") {
+						part.text = replaceText.slice(0, cap);
+					} else if (delta && part.text.length < cap) {
+						part.text = (part.text + delta).slice(0, cap);
+					}
+					streamDirty.add(contentIndex);
+					scheduleStreamFlush();
+				};
 
 				const processLine = (line: string) => {
 					if (!line.trim()) return;
@@ -3004,11 +3078,81 @@ async function runSingleAgent(
 						return;
 					}
 
+					// Live deltas (pi 0.84+). Do not wait for message_end.
+					if (event.type === "message_update") {
+						const ame = event.assistantMessageEvent;
+						if (ame && typeof ame === "object") {
+							const ctype = String(ame.type ?? "");
+							const contentIndex =
+								typeof ame.contentIndex === "number" && Number.isFinite(ame.contentIndex)
+									? ame.contentIndex
+									: 0;
+							if (ctype === "text_start") {
+								upsertStreamPart(contentIndex, "text", "");
+							} else if (ctype === "text_delta") {
+								upsertStreamPart(contentIndex, "text", String(ame.delta ?? ""));
+							} else if (ctype === "text_end") {
+								const finalText =
+									typeof ame.content === "string"
+										? ame.content
+										: typeof ame.text === "string"
+											? ame.text
+											: undefined;
+								if (typeof finalText === "string") {
+									upsertStreamPart(contentIndex, "text", "", undefined, finalText);
+								}
+								forceFlushStreamParts();
+							} else if (ctype === "thinking_start") {
+								upsertStreamPart(contentIndex, "thinking", "");
+							} else if (ctype === "thinking_delta") {
+								upsertStreamPart(contentIndex, "thinking", String(ame.delta ?? ""));
+							} else if (ctype === "thinking_end") {
+								const finalThinking =
+									typeof ame.thinking === "string"
+										? ame.thinking
+										: typeof ame.content === "string"
+											? ame.content
+											: undefined;
+								if (typeof finalThinking === "string") {
+									upsertStreamPart(contentIndex, "thinking", "", undefined, finalThinking);
+								}
+								forceFlushStreamParts();
+							} else if (ctype === "toolcall_start") {
+								// Activity-only placeholder; tools still land authoritatively on message_end.
+								const toolName = String(ame.name ?? "tool");
+								pipiuiActivity = `${toolName} …`;
+								pipiuiUpdate();
+							}
+							// toolcall_delta / toolcall_end: ignore (message_end owns final tool rows)
+							return;
+						}
+						// Legacy cumulative snapshot message_update (pre-0.84 / jcode-style).
+						const snap = event.message;
+						if (snap?.role === "assistant" && Array.isArray(snap.content)) {
+							for (let idx = 0; idx < snap.content.length; idx++) {
+								const part = snap.content[idx];
+								if (part?.type === "text" && typeof part.text === "string") {
+									upsertStreamPart(idx, "text", "", undefined, part.text);
+								} else if (part?.type === "thinking" && typeof part.thinking === "string") {
+									upsertStreamPart(idx, "thinking", "", undefined, part.thinking);
+								}
+							}
+						}
+						return;
+					}
+
 					if (event.type === "message_end" && event.message) {
 						const msg = event.message as Message;
 						currentResult.messages.push(msg);
 
 							if (msg.role === "assistant") {
+								// Drain any pending live preview before authoritative tool rows.
+								forceFlushStreamParts();
+								const didStreamTextOrThinking = [...streamParts.values()].some(
+									(p) =>
+										(p.itemType === "text" || p.itemType === "thinking") &&
+										p.text.trim().length > 0,
+								);
 								currentResult.usage.turns++;
 								const usage = msg.usage;
 								if (usage) {
@@ -3047,7 +3191,9 @@ async function runSingleAgent(
 							if (!currentResult.model && msg.model) currentResult.model = msg.model;
 							if (msg.stopReason) currentResult.stopReason = msg.stopReason;
 							if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-							// 完整工作流水上报：每轮的思考/文本/工具调用都进 UI 日志
+							// 完整工作流水上报：每轮的思考/文本/工具调用都进 UI 日志。
+							// 若本回合已通过 log_delta 流式预览过 text/thinking，则不再整块追加，
+							// 避免面板重复；tool 仍以 message_end 为权威落盘。
 							const pipiuiItems: Record<string, unknown>[] = [];
 							for (const part of (msg as any).content ?? []) {
 								if (part?.type === "toolCall") {
@@ -3060,14 +3206,23 @@ async function runSingleAgent(
 									const text = part.name === "edit" ? boundedEditPayloadForUI(args) : summary;
 									pipiuiItems.push({ itemType: "tool", name: part.name, text });
 								} else if (part?.type === "text" && String(part.text ?? "").trim()) {
+									if (didStreamTextOrThinking) continue;
 									pipiuiItems.push({ itemType: "text", text: String(part.text).slice(0, 4000) });
 								} else if (part?.type === "thinking" && String(part.thinking ?? "").trim()) {
+									if (didStreamTextOrThinking) continue;
 									pipiuiItems.push({ itemType: "thinking", text: String(part.thinking).slice(0, 600) });
 								}
 							}
-							if (pipiuiItems.length > 0) {
+							// Always emit log when we streamed text/thinking so Swift resets
+							// contentIndex→row slots even if tools array is empty (otherwise the
+							// next turn would overwrite the previous message's live rows).
+							if (pipiuiItems.length > 0 || didStreamTextOrThinking) {
 								pipiuiReport({ kind: "log", agentId: pipiuiAgentId, items: pipiuiItems });
 							}
+							// Next assistant turn starts fresh contentIndex mapping on the Swift side
+							// after kind:"log"; clear local assembly state here.
+							streamParts.clear();
+							streamDirty.clear();
 						}
 						emitUpdate();
 						pipiuiUpdate();

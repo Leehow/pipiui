@@ -79,6 +79,8 @@ struct SettingsSheet: View {
     /// 任务提醒开关（通用 → 提醒；缺省开启）。
     @State private var notifyCompletionEnabled = TaskNotifierSettings.completionEnabled()
     @State private var notifyErrorEnabled = TaskNotifierSettings.errorEnabled()
+    /// 面板 tab（浏览器页面 / 文档）保留时长（通用 → 面板；缺省 72 小时，0 = 永久）。
+    @State private var panelRetentionHours = PanelTabSettings.retentionHours()
     /// .env 中已配置 key 的 provider 集合（用于 auth.json 残留冲突警告）。
     @State private var envConfiguredProviders: Set<String> = []
     /// .env 存取（placeholder 查询、清除、删除凭据时可选的同步移除）。
@@ -343,6 +345,8 @@ struct SettingsSheet: View {
             Divider()
             notificationSection
             Divider()
+            panelRetentionSection
+            Divider()
             priceSection
             Divider()
             updateCenterSection
@@ -418,6 +422,37 @@ struct SettingsSheet: View {
             return ("已是最新", .secondary)
         }
         return ("未知", .secondary)
+    }
+
+    // MARK: - 面板 tab 保留时长
+
+    private var panelRetentionSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("面板页签保留")
+                .font(.title3.weight(.semibold))
+            Text("会话里打开过的浏览器页面和文档会随会话保存，下次回到会话自动恢复；超过保留时长的不再恢复。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Picker(
+                "保留时长",
+                selection: Binding(
+                    get: { panelRetentionHours },
+                    set: { newValue in
+                        panelRetentionHours = newValue
+                        PanelTabSettings.setRetentionHours(newValue)
+                    }
+                )
+            ) {
+                Text("24 小时").tag(24.0)
+                Text("72 小时").tag(72.0)
+                Text("7 天").tag(168.0)
+                Text("30 天").tag(720.0)
+                Text("永久").tag(PanelTabSettings.foreverHours)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+        }
     }
 
     // MARK: - 任务提醒

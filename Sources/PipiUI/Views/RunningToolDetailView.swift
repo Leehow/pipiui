@@ -16,6 +16,9 @@ struct RunningToolDetailPresentation: Equatable, Identifiable {
 /// Presented by `ChatDetailView` outside the transcript lazy stack so opening it
 /// never changes row height. Reads `toolRuns[call.id]` from StreamingState so
 /// partial output keeps updating while the sheet is open.
+///
+/// Bash/shell tools use `StreamingTerminalTextView` (incremental NSTextView) so
+/// partial stdout paints like a real terminal instead of a rebuilt Text blob.
 struct RunningToolDetailView: View {
     let call: ToolCallBlock
     let run: ToolRun?
@@ -25,6 +28,14 @@ struct RunningToolDetailView: View {
 
     private var isRunning: Bool { run?.isRunning == true }
     private var isError: Bool { run?.isError == true }
+
+    /// Terminal-style tools get the streaming NSTextView surface.
+    private var usesStreamingTerminal: Bool {
+        switch call.name {
+        case "bash", "shell": return true
+        default: return false
+        }
+    }
 
     private var statusColor: Color {
         if isRunning { return .blue }
@@ -50,20 +61,35 @@ struct RunningToolDetailView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    commandSection
-                    activitySection
-                    outputSection
+            if usesStreamingTerminal {
+                terminalBody
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        commandSection
+                        activitySection
+                        plainOutputSection
+                    }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .frame(minWidth: 520, idealWidth: 680, maxWidth: 900, minHeight: 360, idealHeight: 560, maxHeight: 760)
         .background(Color(nsColor: .textBackgroundColor))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("工具运行详情 \(call.name)")
+    }
+
+    /// Bash/shell layout: fixed header meta + terminal surface that owns scrolling.
+    private var terminalBody: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            commandSection
+            activitySection
+            streamingOutputSection
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var header: some View {
@@ -158,7 +184,81 @@ struct RunningToolDetailView: View {
         }
     }
 
-    private var outputSection: some View {
+    /// Streaming terminal surface for bash/shell. Empty-running shows a waiting
+    /// line with elapsed seconds so the sheet is never just a spinner.
+    private var streamingOutputSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("输出")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if !displayOutput.isEmpty,
+                   displayOutput.utf16.count > TerminalOutputSanitizer.displayUTF16Limit {
+                    Text("显示已截断")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            if displayOutput.isEmpty {
+                emptyStreamingPlaceholder
+            } else {
+                StreamingTerminalTextView(
+                    text: displayOutput,
+                    isLive: isRunning
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minHeight: 180)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(Color.primary.opacity(0.08))
+                )
+                .accessibilityLabel("流式终端输出")
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    @ViewBuilder
+    private var emptyStreamingPlaceholder: some View {
+        Group {
+            if isRunning {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    let seconds: Int = {
+                        if let startedAt = run?.startedAt {
+                            return max(0, Int(context.date.timeIntervalSince(startedAt)))
+                        }
+                        return 0
+                    }()
+                    Text("运行中 · 已等待 \(seconds)s")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .padding(12)
+                }
+            } else {
+                Text("（无输出）")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .padding(12)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(minHeight: 180)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.primary.opacity(0.03))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.primary.opacity(0.08))
+        )
+    }
+
+    private var plainOutputSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("输出")
@@ -172,7 +272,7 @@ struct RunningToolDetailView: View {
                 }
             }
             if displayOutput.isEmpty {
-                Text(isRunning ? "等待输出…" : "（无输出）")
+                Text(isRunning ? runningWaitLabel : "（无输出）")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -210,6 +310,15 @@ struct RunningToolDetailView: View {
         }
     }
 
+    /// Non-terminal empty-running label (kept simple; terminal path uses TimelineView).
+    private var runningWaitLabel: String {
+        if let startedAt = run?.startedAt {
+            let seconds = max(0, Int(Date().timeIntervalSince(startedAt)))
+            return "运行中 · 已等待 \(seconds)s"
+        }
+        return "运行中 · 等待输出…"
+    }
+
     private func elapsedLine(now: Date, startedAt: Date) -> String {
         let label = DurationFormat.compact(now.timeIntervalSince(startedAt))
         if isRunning {
@@ -232,7 +341,7 @@ struct RunningToolDetailView: View {
 
     private var iconName: String {
         switch call.name {
-        case "bash": return "terminal"
+        case "bash", "shell": return "terminal"
         case "read": return "doc.text"
         case "edit", "write": return "pencil"
         case "generate_image": return "wand.and.stars"

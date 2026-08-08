@@ -139,4 +139,165 @@ final class StreamingVisibilityTests: XCTestCase {
 
         XCTAssertEqual(streamText(session), "visible by default")
     }
+
+    // MARK: - pi 0.84+ assistantMessageEvent deltas
+
+    private func assistantMessageStart() -> J {
+        J([
+            "type": "message_start",
+            "message": [
+                "role": "assistant",
+                "content": [] as [Any],
+            ],
+        ])
+    }
+
+    private func deltaEvent(_ event: [String: Any]) -> J {
+        J([
+            "type": "message_update",
+            "assistantMessageEvent": event,
+        ])
+    }
+
+    func testAssistantMessageEventDeltasAccumulateIntoStreamingItem() throws {
+        let session = makeSession()
+        session.handleEvent(assistantMessageStart())
+
+        session.handleEvent(deltaEvent(["type": "text_start", "contentIndex": 0]))
+        session.handleEvent(deltaEvent([
+            "type": "text_delta", "contentIndex": 0, "delta": "Hel",
+        ]))
+        waitForDeferredFlush()
+        XCTAssertEqual(streamText(session), "Hel")
+
+        session.handleEvent(deltaEvent([
+            "type": "text_delta", "contentIndex": 0, "delta": "lo",
+        ]))
+        session.handleEvent(deltaEvent([
+            "type": "thinking_start", "contentIndex": 1,
+        ]))
+        session.handleEvent(deltaEvent([
+            "type": "thinking_delta", "contentIndex": 1, "delta": "plan",
+        ]))
+        waitForDeferredFlush()
+
+        let item = try XCTUnwrap(session.streamingItem)
+        XCTAssertEqual(ChatSession.plainText(of: item), "Hello")
+        // thinking block should also be present in the live stream item
+        let hasThinking = item.blocks.contains {
+            if case .thinking(let t) = $0 { return t == "plan" }
+            return false
+        }
+        XCTAssertTrue(hasThinking)
+
+        session.handleEvent(deltaEvent([
+            "type": "text_end", "contentIndex": 0, "content": "Hello",
+        ]))
+        session.handleEvent(J([
+            "type": "message_end",
+            "message": [
+                "role": "assistant",
+                "content": [
+                    ["type": "text", "text": "Hello"],
+                    ["type": "thinking", "thinking": "plan"],
+                ],
+            ],
+        ]))
+
+        XCTAssertNil(session.streamingItem)
+        XCTAssertEqual(session.transcript.count, 1)
+        XCTAssertEqual(ChatSession.plainText(of: session.transcript[0]), "Hello")
+    }
+
+    func testLegacyCumulativeMessageUpdateStillStreams() {
+        let session = makeSession()
+        session.handleEvent(assistantMessageStart())
+        session.handleEvent(messageUpdate("partial"))
+        waitForDeferredFlush()
+        XCTAssertEqual(streamText(session), "partial")
+
+        session.handleEvent(messageUpdate("partial answer"))
+        waitForDeferredFlush()
+        XCTAssertEqual(streamText(session), "partial answer")
+
+        session.handleEvent(J([
+            "type": "message_end",
+            "message": [
+                "role": "assistant",
+                "content": "final legacy",
+            ],
+        ]))
+        XCTAssertNil(session.streamingItem)
+        XCTAssertEqual(session.transcript.count, 1)
+        XCTAssertEqual(ChatSession.plainText(of: session.transcript[0]), "final legacy")
+    }
+
+    func testToolcallDeltasDoNotCrashAndShowPlaceholderThenFinal() throws {
+        let session = makeSession()
+        session.handleEvent(assistantMessageStart())
+
+        session.handleEvent(deltaEvent([
+            "type": "toolcall_start", "contentIndex": 0, "name": "bash", "id": "call-1",
+        ]))
+        // Truncated / partial JSON args must not crash convert / ToolCallSummary.
+        session.handleEvent(deltaEvent([
+            "type": "toolcall_delta",
+            "contentIndex": 0,
+            "delta": "{\"command\":\"ec",
+        ]))
+        waitForDeferredFlush()
+
+        let partial = try XCTUnwrap(session.streamingItem)
+        XCTAssertTrue(partial.blocks.contains {
+            if case .toolCall(let call) = $0 {
+                return call.id == "call-1" && call.name == "bash"
+            }
+            return false
+        })
+
+        session.handleEvent(deltaEvent([
+            "type": "toolcall_delta",
+            "contentIndex": 0,
+            "delta": "ho hi\"}",
+        ]))
+        session.handleEvent(deltaEvent([
+            "type": "toolcall_end",
+            "contentIndex": 0,
+            "toolCall": [
+                "type": "toolCall",
+                "id": "call-1",
+                "name": "bash",
+                "arguments": ["command": "echo hi"],
+            ] as [String: Any],
+        ]))
+        waitForDeferredFlush()
+
+        let finalLive = try XCTUnwrap(session.streamingItem)
+        guard case .toolCall(let call) = finalLive.blocks.first else {
+            return XCTFail("expected toolCall block")
+        }
+        XCTAssertEqual(call.id, "call-1")
+        XCTAssertEqual(call.name, "bash")
+        XCTAssertTrue(call.argsSummary.contains("echo hi") || call.argsSummary == "echo hi")
+    }
+
+    func testEmptyMessageWithAssistantMessageEventUsesAssemblerNotEmptySnapshot() {
+        // Regression: presence of an empty `message` stub must not win over deltas.
+        let session = makeSession()
+        session.handleEvent(assistantMessageStart())
+        session.handleEvent(J([
+            "type": "message_update",
+            "message": [
+                "role": "assistant",
+                "content": [] as [Any],
+            ],
+            "assistantMessageEvent": [
+                "type": "text_delta",
+                "contentIndex": 0,
+                "delta": "from-delta",
+            ] as [String: Any],
+        ]))
+        waitForDeferredFlush()
+        XCTAssertEqual(streamText(session), "from-delta")
+    }
 }

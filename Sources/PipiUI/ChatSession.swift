@@ -874,8 +874,11 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Per-session stick-to-bottom preference.
     @Published var pinTranscriptToBottom: Bool = true
 
-    /// 内置浏览器，pi 的 browser_* 工具通过桥接服务驱动它
-    lazy var webView = WebViewStore()
+    /// 内置浏览器多 tab 容器，pi 的 browser 工具经桥接服务驱动选中 tab
+    lazy var webTabs = WebTabsStore()
+
+    /// 内置浏览器（选中 tab）：桥接 / 远端面板维持单入口语义。
+    var webView: WebViewStore { webTabs.active }
 
     /// Opens the target URL in the embedded browser panel (right panel).
     func openEmbeddedBrowser(url: String) {
@@ -883,8 +886,11 @@ final class ChatSession: ObservableObject, Identifiable {
         _ = webView.navigate(url)
     }
 
-    /// 文档预览面板（⌘+点击聊天中的 md/txt 文档路径在此打开）
-    lazy var documents = DocumentStore()
+    /// 文档预览多 tab 容器（⌘+点击聊天中的 md/txt 文档路径在此打开）
+    lazy var documentTabs = DocumentTabsStore()
+
+    /// 浏览器 / 文档 tab 持久化（默认保留 72 小时，见 PanelTabSettings）
+    private lazy var panelTabsPersistence = PanelTabPersistence(webTabs: webTabs, documentTabs: documentTabs)
 
     /// pi 派出的 subagent 树（扩展通过桥接上报）
     let subagents = SubagentStore()
@@ -1603,6 +1609,7 @@ final class ChatSession: ObservableObject, Identifiable {
         // 会话文件确定后挂载 subagent 树持久化（恢复历史 + 后续落盘）
         if let file = sessionFile {
             subagents.attachPersistence(sessionFile: file)
+            panelTabsPersistence.attach(sessionFile: file)
         }
     }
 
@@ -1773,19 +1780,19 @@ final class ChatSession: ObservableObject, Identifiable {
         switch type {
         case "message_update":
             DiagnosticsStream.append(
-                "HD msg_update deferred=\(wouldDeferInitial) deferredCount=\(deferredInitialEvents.count) visible=\(isStreamingVisible)"
+                "HD msg_update session=\(id) deferred=\(wouldDeferInitial) deferredCount=\(deferredInitialEvents.count) visible=\(isStreamingVisible)"
             )
         case "message_end":
             DiagnosticsStream.append(
-                "HD msg_end deferred=\(wouldDeferInitial) deferredCount=\(deferredInitialEvents.count) visible=\(isStreamingVisible)"
+                "HD msg_end session=\(id) deferred=\(wouldDeferInitial) deferredCount=\(deferredInitialEvents.count) visible=\(isStreamingVisible)"
             )
         case "message_start":
             DiagnosticsStream.append(
-                "HD msg_start deferred=\(wouldDeferInitial) deferredCount=\(deferredInitialEvents.count) visible=\(isStreamingVisible)"
+                "HD msg_start session=\(id) deferred=\(wouldDeferInitial) deferredCount=\(deferredInitialEvents.count) visible=\(isStreamingVisible)"
             )
         case "agent_start":
             DiagnosticsStream.append(
-                "HD agent_start deferred=\(wouldDeferInitial) deferredCount=\(deferredInitialEvents.count) visible=\(isStreamingVisible)"
+                "HD agent_start session=\(id) deferred=\(wouldDeferInitial) deferredCount=\(deferredInitialEvents.count) visible=\(isStreamingVisible)"
             )
         default:
             break
@@ -1894,6 +1901,9 @@ final class ChatSession: ObservableObject, Identifiable {
                 pendingStreamMessage = e["message"]
                 pendingStreamCharCount = Self.fastContentLength(e["message"])
             }
+            DiagnosticsStream.append(
+                "LEN session=\(id) clen=\(pendingStreamCharCount)"
+            )
             if pendingStreamMessage != nil || streamAssembler.isDirty {
                 scheduleStreamFlush()
             }
@@ -3425,6 +3435,7 @@ final class ChatSession: ObservableObject, Identifiable {
         let previousPath = sessionFile
         sessionFile = path
         subagents.attachPersistence(sessionFile: path)
+        panelTabsPersistence.attach(sessionFile: path)
         onSessionMetaChanged?()
         if let previousPath, !previousPath.isEmpty {
             onSessionFileRebound?(previousPath, path)

@@ -320,6 +320,111 @@ final class SubagentEventScalingTests: XCTestCase {
         XCTAssertEqual(store.displayOrder.filter { $0.state == .running }.map(\.id), ["a", "b"])
     }
 
+    // MARK: - log_delta live streaming
+
+    func testLogDeltaUpsertsSameContentIndexAndPreservesSingleRow() throws {
+        let store = startedStore()
+        store.handle(event(kind: "log_delta", id: "a", extra: [
+            "contentIndex": 0,
+            "itemType": "text",
+            "text": "Hel",
+        ]))
+        store.handle(event(kind: "log_delta", id: "a", extra: [
+            "contentIndex": 0,
+            "itemType": "text",
+            "text": "Hello",
+        ]))
+
+        let agent = try XCTUnwrap(store.agent(forID: "a"))
+        XCTAssertEqual(agent.log.count, 1)
+        XCTAssertEqual(agent.log[0].kind, "text")
+        XCTAssertEqual(agent.log[0].text, "Hello")
+    }
+
+    func testLogDeltaSeparateContentIndicesCreateDistinctRows() throws {
+        let store = startedStore()
+        store.handle(event(kind: "log_delta", id: "a", extra: [
+            "contentIndex": 0,
+            "itemType": "text",
+            "text": "answer",
+        ]))
+        store.handle(event(kind: "log_delta", id: "a", extra: [
+            "contentIndex": 1,
+            "itemType": "thinking",
+            "text": "plan",
+        ]))
+
+        let agent = try XCTUnwrap(store.agent(forID: "a"))
+        XCTAssertEqual(agent.log.map(\.kind), ["text", "thinking"])
+        XCTAssertEqual(agent.log.map(\.text), ["answer", "plan"])
+    }
+
+    func testLogAfterStreamDoesNotDuplicateWhenOnlyToolsArrive() throws {
+        // Bridge contract: after log_delta text, message_end only ships tools.
+        let store = startedStore()
+        store.handle(event(kind: "log_delta", id: "a", extra: [
+            "contentIndex": 0,
+            "itemType": "text",
+            "text": "I will run bash",
+        ]))
+        store.handle(event(kind: "log", id: "a", extra: [
+            "items": [["itemType": "tool", "name": "bash", "text": "echo hi"]],
+        ]))
+
+        let agent = try XCTUnwrap(store.agent(forID: "a"))
+        XCTAssertEqual(agent.log.map(\.kind), ["text", "tool"])
+        XCTAssertEqual(agent.log.map(\.text), ["I will run bash", "echo hi"])
+    }
+
+    func testLogResetsStreamSlotsSoNextTurnOpensNewRow() throws {
+        let store = startedStore()
+        store.handle(event(kind: "log_delta", id: "a", extra: [
+            "contentIndex": 0,
+            "itemType": "text",
+            "text": "turn-1",
+        ]))
+        // Empty log still acts as a turn boundary (stream slot reset).
+        store.handle(event(kind: "log", id: "a", extra: [
+            "items": [] as [[String: Any]],
+        ]))
+        store.handle(event(kind: "log_delta", id: "a", extra: [
+            "contentIndex": 0,
+            "itemType": "text",
+            "text": "turn-2",
+        ]))
+
+        let agent = try XCTUnwrap(store.agent(forID: "a"))
+        XCTAssertEqual(agent.log.map(\.text), ["turn-1", "turn-2"])
+    }
+
+    func testLogDeltaMailboxCoalescesSameContentIndex() throws {
+        let store = startedStore()
+        for value in 1...50 {
+            store.enqueue(event(kind: "log_delta", id: "a", extra: [
+                "contentIndex": 0,
+                "itemType": "text",
+                "text": "v\(value)",
+            ]))
+        }
+        // One coalesce slot for contentIndex 0 (latest wins).
+        XCTAssertEqual(store.pendingAgentEventCount, 1)
+        store.flushPendingAgentEvents()
+
+        let agent = try XCTUnwrap(store.agent(forID: "a"))
+        XCTAssertEqual(agent.log.count, 1)
+        XCTAssertEqual(agent.log[0].text, "v50")
+    }
+
+    func testEmptyLogDeltaDoesNotCreateRow() throws {
+        let store = startedStore()
+        store.handle(event(kind: "log_delta", id: "a", extra: [
+            "contentIndex": 0,
+            "itemType": "text",
+            "text": "",
+        ]))
+        XCTAssertEqual(store.agent(forID: "a")?.log.count, 0)
+    }
+
     private func event(
         kind: String,
         id: String,
