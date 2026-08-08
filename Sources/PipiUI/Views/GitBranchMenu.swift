@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 
 /// Chat toolbar control: branch icon + name, local branch checkout, optional GitHub link.
+/// Compact, borderless chrome — not a floating capsule.
 struct GitBranchMenu: View {
     @ObservedObject var store: GitBranchStore
     var onError: (String) -> Void
@@ -36,18 +37,33 @@ struct GitBranchMenu: View {
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 12, weight: .medium))
+                        .imageScale(.medium)
                     if store.isBusy {
                         ProgressView()
                             .controlSize(.mini)
                     } else {
                         Text(store.status.toolbarTitle)
+                            .font(.system(size: 12, weight: .medium))
                             .lineLimit(1)
+                            .truncationMode(.middle)
                     }
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.tertiary)
                 }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .frame(height: 28)
+                .frame(maxWidth: 200, alignment: .leading)
+                .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
             .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .buttonStyle(.plain)
             .disabled(store.isBusy)
             .help(branchHelpText)
+            .pointingHandCursor()
             .onAppear {
                 store.startAppActiveRefresh()
                 store.refresh()

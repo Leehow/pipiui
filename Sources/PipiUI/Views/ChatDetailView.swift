@@ -335,28 +335,12 @@ private struct ChatDetailViewBody: View {
             .toolbarBackground(Color(nsColor: .windowBackgroundColor), for: .windowToolbar)
             .toolbarBackground(.visible, for: .windowToolbar)
             .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                GitBranchMenu(store: gitBranches) { session.lastError = $0 }
-
-                Button {
-                    if session.rightPanel != nil {
-                        session.rightPanel = nil
-                    } else if let last = session.lastRightPanel {
-                        if last == .agents {
-                            session.subagents.selectLatest()
-                        }
-                        session.rightPanel = last
-                    }
-                } label: {
-                    Image(systemName: session.rightPanel != nil
-                          ? "rectangle.righthalf.inset.filled.arrow.right"
-                          : "sidebar.right")
-                        .foregroundStyle(session.rightPanel != nil ? Color.accentColor : Color.secondary)
+                // One ToolbarItem (not a Group of separate pills) so branch +
+                // collapse read as a single compact flat control cluster.
+                ToolbarItem(placement: .primaryAction) {
+                    detailTopTrailingChrome
                 }
-                .help(session.rightPanel != nil ? "收起右侧栏" : "展开右侧栏")
-                .disabled(session.rightPanel == nil && session.lastRightPanel == nil)
             }
-        }
         .sheet(item: $finishedGroupPresentation) { presentation in
             FinishedNonTextGroupSheetContent(
                 presentation: presentation,
@@ -442,7 +426,8 @@ private struct ChatDetailViewBody: View {
         .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .clipped()
         .overlay(alignment: .topTrailing) {
-            panelQuickRail.padding(12)
+            // 8pt keeps the rail in rhythm with compact panel headers / top chrome.
+            panelQuickRail.padding(.top, 8).padding(.trailing, 8)
         }
         .background(
             GeometryReader { geo in
@@ -452,9 +437,52 @@ private struct ChatDetailViewBody: View {
         .layoutPriority(1)
     }
 
+    /// Top-trailing branch + panel collapse/expand. Flat, borderless, ~28pt hits —
+    /// one visual group instead of separate oversized toolbar pills. No Computer Use
+    /// control here (bottom-left indicator remains the only CU surface).
+    private var detailTopTrailingChrome: some View {
+        HStack(spacing: 2) {
+            GitBranchMenu(store: gitBranches) { session.lastError = $0 }
+
+            // Light hairline between branch and collapse when both are present.
+            if gitBranches.status.isRepo {
+                Rectangle()
+                    .fill(Color.primary.opacity(0.10))
+                    .frame(width: 1, height: 14)
+                    .padding(.horizontal, 2)
+            }
+
+            Button {
+                if session.rightPanel != nil {
+                    session.rightPanel = nil
+                } else if let last = session.lastRightPanel {
+                    if last == .agents {
+                        session.subagents.selectLatest()
+                    }
+                    session.rightPanel = last
+                }
+            } label: {
+                Image(systemName: session.rightPanel != nil
+                      ? "rectangle.righthalf.inset.filled.arrow.right"
+                      : "sidebar.right")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(session.rightPanel != nil ? Color.accentColor : Color.secondary)
+                    .frame(width: 28, height: 28)
+                    .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+            .buttonStyle(ChromeIconButtonStyle(
+                isEmphasized: session.rightPanel != nil
+            ))
+            .help(session.rightPanel != nil ? "收起右侧栏" : "展开右侧栏")
+            .disabled(session.rightPanel == nil && session.lastRightPanel == nil)
+        }
+        .padding(.horizontal, 2)
+    }
+
     /// 聊天栏右上角的竖向快捷栏：右面板开关（Subagents / 浏览器 / 文档 / 终端）。
+    /// Flat narrow strip — matches the compact top chrome (no floating capsule/shadow).
     private var panelQuickRail: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 2) {
             railButton(
                 systemName: "person.2",
                 isActive: session.rightPanel == .agents,
@@ -470,7 +498,7 @@ private struct ChatDetailViewBody: View {
             .overlay(alignment: .topTrailing) {
                 if session.subagents.runningCount > 0 {
                     Circle().fill(Color.green).frame(width: 7, height: 7)
-                        .offset(x: 2, y: -2)
+                        .offset(x: 1, y: -1)
                 }
             }
 
@@ -498,13 +526,16 @@ private struct ChatDetailViewBody: View {
                 session.rightPanel = session.rightPanel == .terminal ? nil : .terminal
             }
         }
-        .padding(.vertical, 6)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+        .padding(.vertical, 4)
+        .padding(.horizontal, 3)
+        .background(
+            Color(nsColor: .windowBackgroundColor).opacity(0.94),
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
         )
-        .shadow(color: .black.opacity(0.10), radius: 8, y: 2)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        )
         // Rail floats over selectable transcript text; without an explicit cursor
         // the underlying I-beam bleeds through on hover.
         .pointingHandCursor()
@@ -520,8 +551,14 @@ private struct ChatDetailViewBody: View {
             Image(systemName: systemName)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
-                .frame(width: 30, height: 26)
-                .contentShape(Rectangle())
+                .frame(width: 28, height: 28)
+                .background {
+                    if isActive {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.accentColor.opacity(0.12))
+                    }
+                }
+                .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
         .buttonStyle(.plain)
         .help(help)

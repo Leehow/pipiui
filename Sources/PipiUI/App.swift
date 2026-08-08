@@ -43,6 +43,9 @@ public struct PipiUIApp: App {
             ComputerUseSceneRoot(store: store, notifier: TaskNotifier.shared)
         }
         .windowStyle(.automatic)
+        // Compact unified titlebar: shortens the empty band above the right panel
+        // without changing drag regions or Computer Use mini-mode titlebar swaps.
+        .windowToolbarStyle(.unifiedCompact)
         .commands {
             LogCommands()
             CommandGroup(after: .toolbar) {

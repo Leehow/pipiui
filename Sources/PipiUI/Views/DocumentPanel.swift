@@ -138,7 +138,7 @@ struct DocumentTabContent: View {
             }
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.vertical, 6)
     }
 
     /// 头部图标按钮：悬停加深+手型（HoverButtonStyle），提示文字放在 label 上——

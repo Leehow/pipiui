@@ -41,7 +41,7 @@ struct TerminalPanel: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.vertical, 6)
     }
 
     private var headerSubtitle: String {

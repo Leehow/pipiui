@@ -52,7 +52,7 @@ struct WebViewPanel: View {
                 .buttonStyle(HoverButtonStyle())
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 5)
+            .padding(.vertical, 4)
         }
         .fixedSize(horizontal: false, vertical: true)
     }

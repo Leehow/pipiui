@@ -126,7 +126,8 @@ struct SubagentPanel: View {
         }
         .clipped()
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        // 6pt matches compact top chrome / panel rail rhythm (was 8 — felt like a dead band).
+        .padding(.vertical, 6)
     }
 
     @ViewBuilder

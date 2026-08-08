@@ -13,6 +13,52 @@ struct HoverButtonStyle: ButtonStyle {
     }
 }
 
+/// Flat ~28pt chrome icon button: subtle hover/press fill, max 6pt corners.
+/// Used by top-trailing collapse/expand so it is not a floating blue pill.
+struct ChromeIconButtonStyle: ButtonStyle {
+    var isEmphasized: Bool = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        ChromeIconButtonBody(
+            isEmphasized: isEmphasized,
+            isPressed: configuration.isPressed,
+            label: configuration.label
+        )
+    }
+}
+
+private struct ChromeIconButtonBody<Label: View>: View {
+    let isEmphasized: Bool
+    let isPressed: Bool
+    let label: Label
+    @State private var isHovered = false
+
+    var body: some View {
+        label
+            .background {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(fillColor)
+            }
+            .animation(.easeInOut(duration: 0.12), value: isHovered)
+            .animation(.easeInOut(duration: 0.08), value: isPressed)
+            .onHover { isHovered = $0 }
+            .pointingHandCursor()
+    }
+
+    private var fillColor: Color {
+        if isPressed {
+            return Color.primary.opacity(0.10)
+        }
+        if isHovered {
+            return Color.primary.opacity(0.06)
+        }
+        if isEmphasized {
+            return Color.accentColor.opacity(0.10)
+        }
+        return .clear
+    }
+}
+
 struct HoverForeground<Content: View>: View {
     let base: Color
     let hovered: Color
