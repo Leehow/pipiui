@@ -80,10 +80,11 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         )
     }
 
-    // MARK: - One-way window: newest end is never deleted
+    // MARK: - Bounded one-way window (maxPages hard cap)
 
     func testPageSizeAndLatestPageMath() {
         XCTAssertEqual(TranscriptRenderWindow.pageSize, 32)
+        XCTAssertEqual(TranscriptRenderWindow.maxPages, 4)
         XCTAssertEqual(TranscriptRenderWindow.latestPage(itemCount: 0), 0)
         XCTAssertEqual(TranscriptRenderWindow.latestPage(itemCount: 1), 0)
         XCTAssertEqual(TranscriptRenderWindow.latestPage(itemCount: 32), 0)
@@ -130,25 +131,55 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertTrue(after.isLatest)
     }
 
-    func testHistoryExpansionOnlyGrowsOldestEndOnePageAtATime() {
-        // 200 items, latest page 6. Each exact-top arrival adds exactly one older
-        // page and the newest end (200) is never dropped while browsing.
+    func testHistoryExpansionGrowsOldestEndUntilMaxPagesThenSlides() {
+        // 200 items, latest page 6. Near the newest end the window still ends at
+        // itemCount; past maxPages the capped window slides and drops the newest.
         let first = TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: 5)
         XCTAssertEqual(first.range, 160..<200)
+        XCTAssertTrue(first.isLatest)
 
         let second = TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: 4)
         XCTAssertEqual(second.range, 128..<200)
+        XCTAssertTrue(second.isLatest)
 
-        let third = TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: 3)
-        XCTAssertEqual(third.range, 96..<200)
+        let atCap = TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: 3)
+        XCTAssertEqual(atCap.range, 96..<200)
+        XCTAssertEqual(atCap.renderedCount, 104)
+        XCTAssertTrue(atCap.isLatest)
+
+        let slid = TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: 2)
+        XCTAssertEqual(slid.range, 64..<192)
+        XCTAssertEqual(slid.renderedCount, TranscriptRenderWindow.maxPages * TranscriptRenderWindow.pageSize)
+        XCTAssertFalse(slid.isLatest)
 
         let oldest = TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: 0)
-        XCTAssertEqual(oldest.range, 0..<200)
+        XCTAssertEqual(oldest.range, 0..<128)
+        XCTAssertEqual(oldest.renderedCount, 128)
+        XCTAssertFalse(oldest.isLatest)
+    }
 
-        for window in [first, second, third, oldest] {
-            XCTAssertEqual(window.range.upperBound, 200, "newest end must never be deleted")
-            XCTAssertTrue(window.isLatest)
+    func testLargeItemCountWindowNeverExceedsMaxPages() {
+        // Continuous history expansion across a long session must stay bounded.
+        let count = 1_085
+        let lastPage = TranscriptRenderWindow.latestPage(itemCount: count)
+        var head: Int? = nil
+        var sawNonLatest = false
+        for _ in 0...(lastPage + 2) {
+            let window = TranscriptRenderWindow.resolve(itemCount: count, oldestLoadedPage: head)
+            XCTAssertLessThanOrEqual(
+                window.renderedCount,
+                TranscriptRenderWindow.maxPages * TranscriptRenderWindow.pageSize,
+                "head=\(String(describing: head))"
+            )
+            XCTAssertLessThanOrEqual(window.range.upperBound, count)
+            if !window.isLatest { sawNonLatest = true }
+            let current = head ?? TranscriptRenderWindow.latestStartPage(itemCount: count)
+            head = TranscriptHistoryExpander.expand(currentStartPage: current)
         }
+        XCTAssertTrue(sawNonLatest, "deep history must eventually leave the latest end")
+        let deepest = TranscriptRenderWindow.resolve(itemCount: count, oldestLoadedPage: 0)
+        XCTAssertEqual(deepest.range, 0..<128)
+        XCTAssertFalse(deepest.isLatest)
     }
 
     func testExpanderAddsExactlyOnePageUntilPageZero() {
@@ -193,9 +224,9 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertTrue(empty.range.isEmpty)
     }
 
-    func testAppendsKeepStartPageAndExtendEndWhileBrowsing() {
-        // Unpinned at page 2; appended messages grow the newest end but must never
-        // move the history head.
+    func testAppendsKeepStartPageAndExtendEndWhileBrowsingWithinCap() {
+        // Unpinned at page 2 within the cap; appended messages grow the newest end
+        // but must never move the history head.
         let before = TranscriptRenderWindow.resolve(itemCount: 100, oldestLoadedPage: 2)
         let after = TranscriptRenderWindow.resolve(itemCount: 150, oldestLoadedPage: 2)
 
@@ -205,7 +236,19 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertTrue(after.isLatest)
     }
 
-    func testWindowNeverExceedsItemCountForAnyHead() {
+    func testAppendsDoNotGrowCappedMidHistoryWindow() {
+        // Deep history already at maxPages: new arrivals at the newest end must
+        // not enlarge the eager window past the cap or move the head.
+        let before = TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: 0)
+        let after = TranscriptRenderWindow.resolve(itemCount: 260, oldestLoadedPage: 0)
+        XCTAssertEqual(before.range, 0..<128)
+        XCTAssertEqual(after.range, 0..<128)
+        XCTAssertEqual(before.renderedCount, after.renderedCount)
+        XCTAssertFalse(after.isLatest)
+    }
+
+    func testWindowNeverExceedsItemCountOrMaxPagesForAnyHead() {
+        let maxRendered = TranscriptRenderWindow.maxPages * TranscriptRenderWindow.pageSize
         for count in [0, 1, 31, 32, 33, 64, 65, 70, 200, 1_085] {
             let lastPage = TranscriptRenderWindow.latestPage(itemCount: count)
             let heads: [Int?] = [nil, -1, 0, lastPage, lastPage + 1] + (
@@ -219,6 +262,7 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
                 XCTAssertGreaterThanOrEqual(window.range.lowerBound, 0)
                 XCTAssertLessThanOrEqual(window.range.upperBound, max(0, count))
                 XCTAssertLessThanOrEqual(window.renderedCount, max(0, count))
+                XCTAssertLessThanOrEqual(window.renderedCount, maxRendered)
             }
         }
     }
@@ -250,7 +294,7 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertTrue(transcript.contains("pinEdge: .documentStart"))
         XCTAssertTrue(transcript.contains("ForEach(presentation.rows.reversed()"))
         XCTAssertTrue(transcript.contains(".transcriptFlip()"))
-        // One-way window: no page buttons, no whole-window replacement id.
+        // Bounded head-driven window: no page buttons, no whole-window replacement id.
         XCTAssertFalse(transcript.contains("renderIdentity"))
         XCTAssertFalse(transcript.contains("transcriptHistoryWindowEnd"))
         XCTAssertFalse(transcript.contains("earlierPreferredEnd"))
@@ -260,6 +304,9 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertFalse(transcript.contains("显示后面的"))
         XCTAssertTrue(transcript.contains("返回最新消息"))
         XCTAssertTrue(transcript.contains("正在刷新…"))
+        // Hard eager ceiling — continuous history load cannot mount the session.
+        XCTAssertTrue(source.contains("static let maxPages = 4"))
+        XCTAssertTrue(source.contains("start + maxPages * pageSize"))
         // The old top-visible-page-driven bidirectional window and its body side
         // effects are gone.
         XCTAssertFalse(transcript.contains("topVisiblePage"))
@@ -425,8 +472,12 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertFalse(tracker.contains("clipOriginYBefore"))
         XCTAssertFalse(tracker.contains("PrependAnchorCompensation"))
         XCTAssertFalse(tracker.contains("applyPendingCompensation"))
-        // One clip mutation remains exclusively for pinned latest-content growth.
+        // One clip mutation remains exclusively for pinned latest-content growth,
+        // gated so a scroller-knob drag cannot be fought by streaming reflow.
         XCTAssertTrue(tracker.contains("clip.scroll(to:"))
+        XCTAssertTrue(tracker.contains("allowsPinnedContentFollow"))
+        XCTAssertTrue(tracker.contains("allowRepin: false"))
+        XCTAssertTrue(source.contains("static func allowsPinnedContentFollow"))
         XCTAssertFalse(tracker.contains("clearPendingCompensation"))
         XCTAssertFalse(source.contains("restoredOriginY"))
         XCTAssertTrue(tracker.contains("boundsUpdateGeneration"))

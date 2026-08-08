@@ -37,19 +37,25 @@ struct TranscriptSessionRootIdentity: Hashable {
 ///
 /// A small eager window (one fixed page of 32 rows at the newest end) gives
 /// native NSTextView-backed markdown enough room to settle its exact height
-/// without reintroducing lazy-stack height estimation. The window is **one-way**: it always ends at the newest transcript
-/// item and only ever grows backward while the user browses history. The
-/// newest-first presentation reverses this storage slice, so each older page
-/// appends at the inverted layout end. Pinned/live mode renders the latest page
-/// (`nil` head); unpinned history expands one older page at a time.
+/// without reintroducing lazy-stack height estimation. History browsing expands
+/// one older page at a time from the latest end, but the eager stack is hard-capped
+/// at `maxPages` so continuous top-prefetch can never mount the entire session.
+/// While the head stays within `maxPages` of the newest item the window still ends
+/// at `itemCount` (live/latest); deeper history slides the capped window so the
+/// newest end drops. Newest-first presentation reverses this storage slice, so
+/// each older page appends at the inverted layout end. Pinned/live mode renders
+/// the latest page (`nil` head).
 struct TranscriptRenderWindow: Equatable {
     static let pageSize = 32
+    /// Hard ceiling on eagerly mounted pages (32 × 4 = 128 rows). Mirrors the
+    /// subagent log's bounded window so long sessions stay scrollable without
+    /// growing the inverted VStack without bound.
+    static let maxPages = 4
 
     let range: Range<Int>
     let totalCount: Int
 
-    /// The window always includes the newest item (`end == itemCount`) — history
-    /// browsing expands the old end and never drops the latest end.
+    /// `true` when the window still includes the newest transcript item.
     var isLatest: Bool { range.upperBound == totalCount }
     var renderedCount: Int { range.count }
 
@@ -65,9 +71,11 @@ struct TranscriptRenderWindow: Equatable {
         max(0, latestPage(itemCount: itemCount))
     }
 
-    /// Window from `oldestLoadedPage` (history head) through the newest item.
-    /// `nil` and out-of-range values clamp to the latest page, so a stale
-    /// head (transcript reload / session switch) can never render invalid items.
+    /// Window from `oldestLoadedPage` (history head), spanning at most `maxPages`.
+    /// `nil` and out-of-range values clamp to the latest page, so a stale head
+    /// (transcript reload / session switch) can never render invalid items.
+    /// When the head is near the newest end the range still ends at `itemCount`;
+    /// once history walks past the cap the window slides and drops the newest end.
     static func resolve(itemCount: Int, oldestLoadedPage: Int?) -> Self {
         let count = max(0, itemCount)
         let lastPage = latestPage(itemCount: count)
@@ -78,14 +86,15 @@ struct TranscriptRenderWindow: Equatable {
             startPage = latestStartPage(itemCount: count)
         }
         let start = startPage * pageSize
-        return Self(range: start..<count, totalCount: count)
+        let end = min(count, start + maxPages * pageSize)
+        return Self(range: start..<end, totalCount: count)
     }
 }
 
-/// One-step expansion decision for history browsing. Pure and unit-tested so the
-/// feedback-breaking rule can never regress into a bidirectional window again:
-/// the history prefetch edge may only pull **one** older page in, never remove
-/// pages at the newest end, and each admitted request decrements once.
+/// One-step expansion decision for history browsing. Pure and unit-tested:
+/// the history prefetch edge may only pull **one** older page in per admitted
+/// request (decrement the head). Capping / sliding the newest end is owned by
+/// `TranscriptRenderWindow.resolve`, not by this expander.
 enum TranscriptHistoryExpander {
     /// - Returns: the new oldest loaded page (`currentStartPage - 1`) when an
     ///   older page exists; `nil` when already at page 0.
@@ -1136,9 +1145,9 @@ private struct StreamingTranscriptRows: View {
     let onJump: (String) -> Void
     @Environment(\.chatTypography) private var chatTypography
     /// History head while unpinned: the oldest rendered page, or `nil` for the
-    /// default latest page (pinned/live or not yet browsed). Only ever
-    /// decreases via one-page expansions; the newest end is never deleted, so a
-    /// geometry trigger cannot shrink the window and feed back into itself.
+    /// default latest page (pinned/live or not yet browsed). Only ever decreases
+    /// via one-page expansions. `TranscriptRenderWindow.resolve` hard-caps the
+    /// mounted span at `maxPages` (sliding off the newest end when needed).
     @State private var transcriptOldestLoadedPage: Int?
     /// Explicit one-page admission state for near-top asynchronous prefetch.
     @State private var historyPageLoadState = TranscriptHistoryPager.State.idle
@@ -1147,10 +1156,9 @@ private struct StreamingTranscriptRows: View {
 
     var body: some View {
         let items = session.transcript
-        // Pinned/live mode always renders the latest page and ignores scroll
-        // reports. Unpinned history browsing expands one page at a time at the old
-        // end (`transcriptOldestLoadedPage`); the newest end always stays at the
-        // last item, so the window only grows and can never oscillate.
+        // Pinned/live mode always renders the latest page. Unpinned history
+        // browsing expands one page at a time at the old end; resolve hard-caps
+        // the eager span at maxPages so deep prefetch cannot mount the session.
         let window = TranscriptRenderWindow.resolve(
             itemCount: items.count,
             // A pinned raw page can collapse to one tiny presentation row. Keep
@@ -1158,7 +1166,7 @@ private struct StreamingTranscriptRows: View {
             oldestLoadedPage: transcriptOldestLoadedPage
         )
         let windowItems = Array(items[window.range])
-        // History expanded backward; the window end still includes the newest item.
+        // History expanded backward (head moved); return-to-latest uses pin reset.
         let browsingHistory = !session.pinTranscriptToBottom && transcriptOldestLoadedPage != nil
         // History loading gate for AppKit near-top prefetch and non-scrollable
         // safety backfill. The explicit pager closes it while one page is loading.
@@ -1717,6 +1725,11 @@ enum ScrollOrigin {
     /// Only a scroll we can attribute to the user may release the bottom pin;
     /// anything else keeps the old, conservative behaviour (pin-only updates).
     var allowsUnpin: Bool { self == .user }
+
+    /// Held mouse button on the scroller (not window chrome resize). While true,
+    /// pinned content-growth follow and automatic re-pin must not move the clip
+    /// origin under the thumb; unpin on drag-away remains allowed.
+    var isKnobDrag: Bool { self == .user }
 }
 
 /// Which document edge holds the “latest” chat content for pin tracking.
@@ -1804,12 +1817,36 @@ enum StickToBottomLogic {
         }
     }
 
+    /// Whether pinned content-growth may rewrite the clip origin.
+    ///
+    /// A scroller-knob drag holds a mouse button without `didLiveScroll`. Content
+    /// frame notifications still fire while streaming; following them mid-drag
+    /// yanks the thumb back to the pin edge. Pure and unit-tested so the gate
+    /// cannot drift into a time-based throttle.
+    static func allowsPinnedContentFollow(
+        isPinned: Bool,
+        mouseButtonsDown: Int,
+        windowInLiveResize: Bool
+    ) -> Bool {
+        guard isPinned else { return false }
+        let origin = ScrollOrigin.classify(
+            mouseButtonsDown: mouseButtonsDown,
+            windowInLiveResize: windowInLiveResize
+        )
+        return !origin.isKnobDrag
+    }
+
+    /// - Parameters:
+    ///   - allowRepin: when `false` (scroller-knob drag), distance may still unpin
+    ///     but must not write `true` — re-pin waits until the mouse is released
+    ///     and a later live gesture/geometry pass re-evaluates.
     /// - Returns: `true`/`false` to write pin, or `nil` for no change.
     static func desiredPin(
         currentlyPinned: Bool,
         distanceFromBottom: CGFloat,
         userLiveScroll: Bool,
-        allowUnpin: Bool
+        allowUnpin: Bool,
+        allowRepin: Bool = true
     ) -> Bool? {
         // Geometry changes from content growth, layout, or tracker attachment
         // are observations, not user intent. They must never change pin state.
@@ -1819,7 +1856,7 @@ enum StickToBottomLogic {
             return false
         }
         let nearBottom = distanceFromBottom <= rePinThreshold
-        if !currentlyPinned, nearBottom {
+        if allowRepin, !currentlyPinned, nearBottom {
             return true
         }
         return nil
@@ -2112,6 +2149,9 @@ struct StickToBottomTracker: NSViewRepresentable {
 
         private func schedulePinnedContentFollow() {
             guard isPinned.wrappedValue, !contentFollowScheduled else { return }
+            // Freeze follow while the scroller knob is held so streaming reflow
+            // cannot steal the origin mid-drag. Re-check inside the async hop.
+            guard allowsContentFollowNow() else { return }
             contentFollowScheduled = true
             let generation = boundsUpdateGeneration
             DispatchQueue.main.async { [weak self] in
@@ -2119,6 +2159,15 @@ struct StickToBottomTracker: NSViewRepresentable {
                 self.contentFollowScheduled = false
                 self.followPinnedContentGrowth()
             }
+        }
+
+        private func allowsContentFollowNow() -> Bool {
+            let inLiveResize = scrollView?.window?.inLiveResize == true
+            return StickToBottomLogic.allowsPinnedContentFollow(
+                isPinned: isPinned.wrappedValue,
+                mouseButtonsDown: Int(NSEvent.pressedMouseButtons),
+                windowInLiveResize: inLiveResize
+            )
         }
 
         /// Exact-top evaluation is coalesced to one entry per main-loop turn like
@@ -2172,7 +2221,7 @@ struct StickToBottomTracker: NSViewRepresentable {
         }
 
         private func followPinnedContentGrowth() {
-            guard isPinned.wrappedValue,
+            guard allowsContentFollowNow(),
                   let scrollView,
                   let document = scrollView.documentView else { return }
             let clip = scrollView.contentView
@@ -2194,11 +2243,17 @@ struct StickToBottomTracker: NSViewRepresentable {
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.boundsUpdateGeneration == generation else { return }
                 self.knobDragUpdateScheduled = false
-                self.updatePinFromUserScroll(userLiveScroll: true)
+                // Knob drag may unpin when the user leaves the bottom, but must
+                // not auto re-pin while the button is still held.
+                self.updatePinFromUserScroll(userLiveScroll: true, allowRepin: false)
             }
         }
 
-        private func updatePinFromUserScroll(allowUnpin: Bool = true, userLiveScroll: Bool = false) {
+        private func updatePinFromUserScroll(
+            allowUnpin: Bool = true,
+            userLiveScroll: Bool = false,
+            allowRepin: Bool = true
+        ) {
             guard let sv = scrollView, let doc = sv.documentView else { return }
             let visible = sv.documentVisibleRect
             let contentHeight = doc.bounds.height
@@ -2212,7 +2267,8 @@ struct StickToBottomTracker: NSViewRepresentable {
                 currentlyPinned: isPinned.wrappedValue,
                 distanceFromBottom: distance,
                 userLiveScroll: userLiveScroll,
-                allowUnpin: allowUnpin
+                allowUnpin: allowUnpin,
+                allowRepin: allowRepin
             )
             guard let desired else { return }
             // Unpin from a live wheel/trackpad scroll synchronously so in-flight
