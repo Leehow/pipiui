@@ -816,6 +816,13 @@ struct SettingsSheet: View {
                     .background(Capsule().fill(Color.primary.opacity(0.08)))
             }
             Spacer()
+            Button {
+                clearProviderModels(group)
+            } label: {
+                Image(systemName: "xmark.circle")
+            }
+            .buttonStyle(.borderless)
+            .help("取消该供应商所有模型的勾选（从底栏模型菜单隐藏）")
             Button(role: .destructive) {
                 pendingDeleteProvider = group.provider
             } label: {
@@ -824,6 +831,15 @@ struct SettingsSheet: View {
             .buttonStyle(.borderless)
             .help("删除该 provider 凭据")
         }
+    }
+
+    private func clearProviderModels(_ group: ProviderModelGroup) {
+        for model in group.models {
+            ModelVisibility.setHidden(true, modelId: model.id)
+        }
+        hiddenIds = ModelVisibility.hiddenModelIds()
+        recomputePickerModels()
+        store.modelVisibilityRevision &+= 1
     }
 
     private func modelSettingsRow(_ model: ModelInfo) -> some View {
