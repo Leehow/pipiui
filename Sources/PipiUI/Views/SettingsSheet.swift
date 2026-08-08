@@ -42,6 +42,7 @@ struct SettingsSheet: View {
     @State private var models: [ModelInfo] = []
     @State private var credentials: [PiAuthStore.CredentialInfo] = []
     @State private var hiddenIds: Set<String> = ModelVisibility.hiddenModelIds()
+    @State private var collapsedProviders: Set<String> = []
     @State private var agents: [AgentDefinition] = []
     @State private var subagentSettings: [String: SubagentModelSettings.Override] = SubagentModelSettings.allSettings()
     @State private var disabledTools: Set<String> = ToolSkillSettings.disabledTools()
@@ -788,8 +789,10 @@ struct SettingsSheet: View {
                                     .font(.caption)
                                 }
                             }
-                            ForEach(group.models) { model in
-                                modelSettingsRow(model)
+                            if !collapsedProviders.contains(group.provider) {
+                                ForEach(group.models) { model in
+                                    modelSettingsRow(model)
+                                }
                             }
                         } header: {
                             modelProviderHeader(group)
@@ -805,6 +808,14 @@ struct SettingsSheet: View {
 
     private func modelProviderHeader(_ group: ProviderModelGroup) -> some View {
         HStack {
+            Button {
+                toggleCollapsed(group.provider)
+            } label: {
+                Image(systemName: collapsedProviders.contains(group.provider) ? "chevron.right" : "chevron.down")
+                    .font(.caption)
+            }
+            .buttonStyle(.borderless)
+            .help(collapsedProviders.contains(group.provider) ? "展开该供应商的模型列表" : "折叠该供应商的模型列表")
             ProviderLogo(provider: group.provider, size: 14)
             Text(group.provider)
                 .font(.subheadline.weight(.semibold))
@@ -830,6 +841,14 @@ struct SettingsSheet: View {
             }
             .buttonStyle(.borderless)
             .help("删除该 provider 凭据")
+        }
+    }
+
+    private func toggleCollapsed(_ provider: String) {
+        if collapsedProviders.contains(provider) {
+            collapsedProviders.remove(provider)
+        } else {
+            collapsedProviders.insert(provider)
         }
     }
 
