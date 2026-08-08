@@ -1,7 +1,8 @@
 import SwiftUI
 import AppKit
 
-/// Multi-product update sheet (pi, cua-driver).
+/// Multi-product update notification sheet (pi, cua-driver).
+/// Detects available versions only — never executes updates.
 struct UpdateCenterSheet: View {
     @EnvironmentObject var store: AppStore
 
@@ -47,23 +48,10 @@ struct UpdateCenterSheet: View {
                 .disabled(store.isAnyUpdateChecking)
             }
 
-            if store.piIsUpdating || !store.piUpdateLog.isEmpty {
-                ScrollView {
-                    Text(store.piUpdateLog.isEmpty ? "正在运行 pi update…" : store.piUpdateLog)
-                        .font(.caption)
-                        .monospaced()
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(minHeight: 100, maxHeight: 160)
-                .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-            }
-
             Spacer(minLength: 0)
         }
         .padding(20)
-        .frame(width: 460, height: 440)
+        .frame(width: 460, height: 360)
     }
 
     @ViewBuilder
@@ -81,8 +69,6 @@ struct UpdateCenterSheet: View {
             statusLine(info: info, checking: checking)
 
             HStack(spacing: 10) {
-                updateButton(for: id, info: info)
-
                 Button {
                     if let url = info.releaseNotesURL {
                         NSWorkspace.shared.open(url)
@@ -116,37 +102,6 @@ struct UpdateCenterSheet: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
         .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    @ViewBuilder
-    private func updateButton(for id: UpdateProductID, info: ProductUpdateInfo) -> some View {
-        switch id {
-        case .pi:
-            Button {
-                store.runPiUpdate()
-            } label: {
-                if store.piIsUpdating {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text("更新中…")
-                    }
-                } else {
-                    Text("更新")
-                }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(store.piIsUpdating || !info.updateAvailable)
-
-        case .cuaDriver:
-            Button {
-                // Intentionally stubbed — live download/swap pending product decision.
-            } label: {
-                Text("更新")
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(true)
-            .help("cua-driver 更新方式待定")
-        }
     }
 
     @ViewBuilder

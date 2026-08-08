@@ -284,8 +284,6 @@ final class AppStore: ObservableObject {
 
     @Published private(set) var productUpdates: [UpdateProductID: ProductUpdateInfo] = [:]
     @Published private(set) var updateCheckingProducts: Set<UpdateProductID> = []
-    @Published private(set) var piIsUpdating = false
-    @Published private(set) var piUpdateLog = ""
     @Published var isUpdateCenterPresented = false
 
     /// Persisted ignore list (`UpdateProductID.rawValue` → version string).
@@ -2207,12 +2205,6 @@ final class AppStore: ObservableObject {
         checkAllUpdatesNow()
     }
 
-    /// Re-run the pi update check.
-    @MainActor
-    func refreshPiUpdate() {
-        checkUpdates(for: .pi)
-    }
-
     /// Check one product. Network work is off the main actor path via Task; failures
     /// only set `error` (never crash).
     @MainActor
@@ -2339,98 +2331,6 @@ final class AppStore: ObservableObject {
         let encoded = Dictionary(uniqueKeysWithValues: ignoredVersions.map { ($0.key.rawValue, $0.value) })
         if let data = try? JSONEncoder().encode(encoded) {
             UserDefaults.standard.set(data, forKey: Self.ignoredVersionsKey)
-        }
-    }
-
-    /// Run `pi update -na` to update pi itself, capturing output into `piUpdateLog`.
-    /// Runs a pre-flight environment check first so a broken setup (e.g. missing
-    /// node/npm for a Finder-launched app) surfaces a clear message before the
-    /// update is attempted.
-    @MainActor
-    func runPiUpdate() {
-        guard !piIsUpdating, let executable = PiProcess.findPiExecutable() else { return }
-        piIsUpdating = true
-        piUpdateLog = "正在检查更新环境…\n"
-        let environment = PiProcess.spawnEnvironment(extraEnv: [:])
-        Task {
-            let problems = await PiUpdatePreflight.problems(environment: environment)
-            guard problems.isEmpty else {
-                await MainActor.run {
-                    self.piUpdateLog = "兼容性检测未通过：\n\n" + problems.joined(separator: "\n\n")
-                    self.piIsUpdating = false
-                }
-                return
-            }
-            await MainActor.run {
-                self.spawnPiUpdate(executable: executable, environment: environment)
-            }
-        }
-    }
-
-    /// Spawn the actual `pi update -na` process (called only after pre-flight passes).
-    @MainActor
-    private func spawnPiUpdate(executable: String, environment: [String: String]) {
-        piUpdateLog = ""
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: executable)
-        proc.arguments = ["update", "-na"]
-        // Finder/Dock-launched apps have a minimal PATH (no /usr/local/bin, no
-        // npm-global), but `pi update` shells out to `npm install -g` and the pi
-        // shebang needs `node`. Use the pi-session spawn environment (which
-        // prepends npm-global/homebrew//usr/local/bin to PATH) so the update
-        // command can actually find npm/node — same as PiProcess.init.
-        proc.environment = environment
-
-        let out = Pipe()
-        let err = Pipe()
-        proc.standardOutput = out
-        proc.standardError = err
-        out.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let text = String(data: handle.availableData, encoding: .utf8) ?? ""
-            guard !text.isEmpty else { return }
-            DispatchQueue.main.async { self?.appendPiUpdateLog(text) }
-        }
-        err.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let text = String(data: handle.availableData, encoding: .utf8) ?? ""
-            guard !text.isEmpty else { return }
-            DispatchQueue.main.async { self?.appendPiUpdateLog(text) }
-        }
-
-        let timeoutItem = DispatchWorkItem {
-            if proc.isRunning { proc.terminate() }
-        }
-
-        proc.terminationHandler = { [weak self] p in
-            DispatchQueue.main.async {
-                timeoutItem.cancel()
-                guard let self else { return }
-                if p.terminationStatus == 0 {
-                    self.appendPiUpdateLog("\n[完成] pi 更新成功")
-                } else {
-                    self.appendPiUpdateLog("\n[结束] pi 更新进程退出码 \(p.terminationStatus)")
-                }
-                self.piIsUpdating = false
-                self.checkUpdates(for: .pi)
-            }
-        }
-
-        do {
-            try proc.run()
-            DispatchQueue.global().asyncAfter(deadline: .now() + 120, execute: timeoutItem)
-        } catch {
-            timeoutItem.cancel()
-            piUpdateLog += "\n[错误] 无法启动 pi 更新：\(error.localizedDescription)"
-            piIsUpdating = false
-        }
-    }
-
-    /// Append incremental output to the update log (main thread).
-    @MainActor
-    private func appendPiUpdateLog(_ text: String) {
-        if piUpdateLog.isEmpty {
-            piUpdateLog = text
-        } else {
-            piUpdateLog += text
         }
     }
 
