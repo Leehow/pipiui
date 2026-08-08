@@ -865,8 +865,8 @@ final class ChatSession: ObservableObject, Identifiable {
     var onRequestScheduleDraft: ((String) -> Void)?
     private let taskNotificationMode: SessionTaskNotificationMode
 
-    /// 右侧面板：内置浏览器 / subagent 树 / 文档预览
-    enum RightPanel: Equatable { case web, agents, document }
+    /// 右侧面板：内置浏览器 / subagent 树 / 文档预览 / 内嵌终端
+    enum RightPanel: Equatable { case web, agents, document, terminal }
     @Published var rightPanel: RightPanel? {
         didSet {
             if let rightPanel {
@@ -896,6 +896,9 @@ final class ChatSession: ObservableObject, Identifiable {
 
     /// 文档预览多 tab 容器（⌘+点击聊天中的 md/txt 文档路径在此打开）
     lazy var documentTabs = DocumentTabsStore()
+
+    /// 内嵌终端（SwiftTerm）：会话级缓存，收起/展开右栏复用同一 shell
+    lazy var terminalStore = TerminalSessionStore(projectURL: projectURL)
 
     /// 浏览器 / 文档 tab 持久化（默认保留 72 小时，见 PanelTabSettings）
     private lazy var panelTabsPersistence = PanelTabPersistence(webTabs: webTabs, documentTabs: documentTabs)

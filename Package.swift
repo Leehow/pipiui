@@ -8,9 +8,15 @@ let package = Package(
         // Product name stays `PipiUI` so `swift run` / make-app keep familiar paths.
         .executable(name: "PipiUI", targets: ["PipiUIApp"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", from: "1.16.0"),
+    ],
     targets: [
         .target(
             name: "PipiUI",
+            dependencies: [
+                .product(name: "SwiftTerm", package: "SwiftTerm"),
+            ],
             path: "Sources/PipiUI",
             resources: [
                 // App 自有的 pi 插件（补丁版 subagent + 我们的 agents），

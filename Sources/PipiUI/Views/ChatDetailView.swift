@@ -438,7 +438,7 @@ private struct ChatDetailViewBody: View {
         .layoutPriority(1)
     }
 
-    /// 聊天栏右上角的竖向快捷栏：右面板开关（Subagents / 浏览器 / 文档）+ 终端。
+    /// 聊天栏右上角的竖向快捷栏：右面板开关（Subagents / 浏览器 / 文档 / 终端）。
     private var panelQuickRail: some View {
         VStack(spacing: 4) {
             railButton(
@@ -477,6 +477,14 @@ private struct ChatDetailViewBody: View {
             }
 
             railButton(
+                systemName: "terminal",
+                isActive: session.rightPanel == .terminal,
+                help: "内嵌终端（项目目录）"
+            ) {
+                session.rightPanel = session.rightPanel == .terminal ? nil : .terminal
+            }
+
+            railButton(
                 systemName: session.rightPanel != nil
                     ? "rectangle.righthalf.inset.filled.arrow.right"
                     : "sidebar.right",
@@ -493,14 +501,6 @@ private struct ChatDetailViewBody: View {
                 }
             }
             .disabled(session.rightPanel == nil && session.lastRightPanel == nil)
-
-            railButton(
-                systemName: "terminal",
-                isActive: false,
-                help: "在项目目录打开系统终端"
-            ) {
-                ProjectTerminalLauncher.open(at: session.projectURL)
-            }
         }
         .padding(.vertical, 6)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
@@ -600,6 +600,12 @@ private struct ChatDetailViewBody: View {
                 .id(session.bridgeRoutingKey)
             case .document:
                 DocumentPanel(store: session.documentTabs)
+            case .terminal:
+                TerminalPanel(store: session.terminalStore)
+                    // Same session-identity convention as SubagentPanel: warm session
+                    // switch reuses ChatDetailView chrome, so pin the terminal host to
+                    // this session's routing key.
+                    .id(session.bridgeRoutingKey)
             }
         }
         .overlayScrollers()
