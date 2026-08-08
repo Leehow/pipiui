@@ -293,19 +293,6 @@ final class AppStore: ObservableObject {
     /// True while any product version check is in flight.
     var isAnyUpdateChecking: Bool { !updateCheckingProducts.isEmpty }
 
-    /// True when any product has a non-ignored update available.
-    var anyUpdateAvailable: Bool {
-        productUpdates.values.contains { $0.updateAvailable }
-    }
-
-    /// Products with a non-ignored update, for indicator tooltips.
-    var productsWithUpdates: [ProductUpdateInfo] {
-        UpdateProductID.allCases.compactMap { id in
-            guard let info = productUpdates[id], info.updateAvailable else { return nil }
-            return info
-        }
-    }
-
     /// Compatibility shim: pi-only checking flag.
     var piIsChecking: Bool { updateCheckingProducts.contains(.pi) }
 
