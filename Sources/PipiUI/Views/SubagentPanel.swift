@@ -714,6 +714,8 @@ private struct AgentDetailView: View {
     @State private var diffStatText: String?
     @State private var diffBusy = false
     @State private var expandedToolGroupIDs: Set<Int> = []
+    /// Collapsed by default; resets when the detail view identity changes (`.id(agent.id)`).
+    @State private var finalResultExpanded = false
 
     var body: some View {
         // Pinned live mode anchors the window at the newest page so appended rows
@@ -731,7 +733,16 @@ private struct AgentDetailView: View {
             itemCount: agent.log.count,
             topVisiblePage: anchorPage
         )
-        let segments = SubagentLogLayout.plan(Array(agent.log[window.range]))
+        // Drop only a terminal text row that duplicates agent.output (card owns it).
+        let suppressLogID = SubagentFinalResultPresentation.terminalTextLogItemIDToSuppress(
+            log: agent.log,
+            output: agent.output
+        )
+        let windowItems = Array(agent.log[window.range]).filter { item in
+            suppressLogID.map { $0 != item.id } ?? true
+        }
+        let segments = SubagentLogLayout.plan(windowItems)
+        let showFinalResult = SubagentFinalResultPresentation.shouldShowCard(output: agent.output)
 
         VStack(alignment: .leading, spacing: 0) {
             metricsHeader
@@ -756,13 +767,18 @@ private struct AgentDetailView: View {
                     // anchor can settle, so lazy height estimation is avoided (same
                     // choice as the main transcript; ≤ 400 rows).
                     VStack(alignment: .leading, spacing: 8) {
-                        if segments.isEmpty {
+                        if segments.isEmpty && !showFinalResult {
                             waitingForFirstLog
                         } else {
                             ForEach(segments) { segment in
                                 segmentRow(segment)
                                     .id(segmentRowID(segment))
                             }
+                        }
+
+                        if showFinalResult {
+                            finalResultCard
+                                .id("agent-final-result-\(agent.id)")
                         }
 
                         // 透明贴底锚点，与行数据解耦：新行插入/旧行移除不影响锚点位置。
@@ -947,6 +963,61 @@ private struct AgentDetailView: View {
         }
         .frame(maxWidth: .infinity, minHeight: 120)
         .padding(10)
+    }
+
+    /// Dedicated final-result card: collapsed ~8-line Markdown preview; expand shows
+    /// all stored `agent.output` (no further UI truncation). Own header + expand control.
+    private var finalResultCard: some View {
+        let stripped = SubagentFinalResultPresentation.displayBody(from: agent.output)
+        let markdown = stripped.isEmpty ? agent.output : stripped
+        let expanded = finalResultExpanded
+        let cards = DocumentReferenceScanner.references(in: markdown, base: documentBase)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "flag.checkered")
+                    .foregroundStyle(.secondary)
+                    .imageScale(.medium)
+                Text("最终结果")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                Button {
+                    finalResultExpanded.toggle()
+                } label: {
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(minWidth: 20, minHeight: 20)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(expanded ? "收起结果" : "展开完整结果")
+                .accessibilityLabel(expanded ? "收起结果" : "展开完整结果")
+            }
+
+            MarkdownTextView(
+                text: markdown,
+                lineLimit: expanded ? nil : SubagentFinalResultPresentation.collapsedLineLimit
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if !cards.isEmpty {
+                DocumentFileCardStack(references: cards)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.primary.opacity(0.035))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.primary.opacity(0.08))
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("最终结果")
     }
 
     private func toolGroup(_ items: [AgentLogItem]) -> some View {
