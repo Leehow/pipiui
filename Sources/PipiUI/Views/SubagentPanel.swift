@@ -10,7 +10,6 @@ struct SubagentPanel: View {
     var onAbort: (String) -> Void
     /// UI-only recovery action for agents whose normal status observations went silent.
     var onManualStatusCheck: ([String]) -> Void
-    var onClose: () -> Void
     /// 列表贴底跟随：新 agent 到达时若仍贴底则自动滚到最新条目；用户上滚看旧条目即脱离。
     @State private var pinToBottom = true
     /// UI window only: zero is the newest fixed-size page; mounted agent rows never grow with use.
@@ -64,7 +63,7 @@ struct SubagentPanel: View {
         let unit = PricingSettings.unit()
         let rate = ModelPricing.Catalog.shared.exchangeRate
         // 单行布局：左簇（标题/计数/失败处置）占满剩余宽度并在自身内横向裁切；
-        // 右簇（费用/清空/关闭）fixedSize + 高 layoutPriority 保持完整可见。
+        // 右簇（费用/清空）fixedSize + 高 layoutPriority 保持完整可见。
         // 宽度不足时溢出从左簇右缘消失，绝不换行成两排。
         return HStack(spacing: 8) {
             HStack(spacing: 8) {
@@ -124,13 +123,6 @@ struct SubagentPanel: View {
             .fixedSize(horizontal: true, vertical: false)
             .layoutPriority(1)
             .help("清空已完成")
-            Button(action: onClose) {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .fixedSize()
-            .layoutPriority(1)
         }
         .clipped()
         .padding(.horizontal, 12)

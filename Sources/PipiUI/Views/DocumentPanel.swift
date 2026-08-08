@@ -17,10 +17,9 @@ extension EnvironmentValues {
 
 /// 右侧文档面板：多 tab 预览 Markdown / 纯文本 / PDF 文档。
 /// 顶部 tab 条切换已打开的文档（⌘+点击聊天中的文档路径追加 tab），
-/// 内容区沿用单文档视图：访达 / 外部打开 / 刷新 / 关闭。
+/// 内容区沿用单文档视图：访达 / 外部打开 / 刷新。
 struct DocumentPanel: View {
     @ObservedObject var store: DocumentTabsStore
-    var onClose: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,7 +28,7 @@ struct DocumentPanel: View {
                 Divider()
             }
             if let active = store.activeStore {
-                DocumentTabContent(store: active, onClose: onClose)
+                DocumentTabContent(store: active)
             } else {
                 emptyState
             }
@@ -71,20 +70,6 @@ struct DocumentPanel: View {
 
     private var emptyState: some View {
         VStack(spacing: 0) {
-            HStack {
-                Spacer()
-                Button(action: onClose) {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                        .frame(width: 22, height: 22)
-                        .contentShape(Rectangle())
-                        .help("关闭文档面板")
-                }
-                .buttonStyle(HoverButtonStyle())
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            Divider()
             VStack(spacing: 10) {
                 Image(systemName: "doc.text.magnifyingglass")
                     .font(.system(size: 34, weight: .light))
@@ -105,10 +90,9 @@ struct DocumentPanel: View {
 }
 
 /// 单个文档 tab 的内容：Markdown 走聊天同款 MarkdownTextView（标题/表格/代码块/引用），
-/// 纯文本走等宽可选中原文；头部提供访达 / 外部打开 / 刷新 / 关闭。
+/// 纯文本走等宽可选中原文；头部提供访达 / 外部打开 / 刷新。
 struct DocumentTabContent: View {
     @ObservedObject var store: DocumentStore
-    var onClose: () -> Void
     @Environment(\.chatTypography) private var chatTypography
 
     var body: some View {
@@ -152,8 +136,6 @@ struct DocumentTabContent: View {
                     store.reload()
                 }
             }
-
-            iconButton("xmark.circle.fill", tip: "关闭文档面板", action: onClose)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)

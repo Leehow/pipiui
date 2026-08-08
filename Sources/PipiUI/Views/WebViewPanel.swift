@@ -5,7 +5,6 @@ import WebKit
 /// 作用于选中 tab；pi 的 browser 工具同样驱动选中 tab。
 struct WebViewPanel: View {
     @ObservedObject var store: WebTabsStore
-    var onClose: () -> Void
     @State private var addressText = ""
 
     var body: some View {
@@ -112,13 +111,6 @@ struct WebViewPanel: View {
                 .accessibilityLabel("浏览器\(store.active.browserActivity.label)")
                 .allowsHitTesting(false)
             }
-
-            Button(action: onClose) {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("关闭浏览器面板")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)

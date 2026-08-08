@@ -477,6 +477,24 @@ private struct ChatDetailViewBody: View {
             }
 
             railButton(
+                systemName: session.rightPanel != nil
+                    ? "rectangle.righthalf.inset.filled.arrow.right"
+                    : "sidebar.right",
+                isActive: session.rightPanel != nil,
+                help: session.rightPanel != nil ? "收起右侧栏" : "展开右侧栏"
+            ) {
+                if session.rightPanel != nil {
+                    session.rightPanel = nil
+                } else if let last = session.lastRightPanel {
+                    if last == .agents {
+                        session.subagents.selectLatest()
+                    }
+                    session.rightPanel = last
+                }
+            }
+            .disabled(session.rightPanel == nil && session.lastRightPanel == nil)
+
+            railButton(
                 systemName: "terminal",
                 isActive: false,
                 help: "在项目目录打开系统终端"
@@ -564,9 +582,7 @@ private struct ChatDetailViewBody: View {
         Group {
             switch panel {
             case .web:
-                WebViewPanel(store: session.webTabs) {
-                    session.rightPanel = nil
-                }
+                WebViewPanel(store: session.webTabs)
             case .agents:
                 SubagentPanel(
                     store: session.subagents,
@@ -575,9 +591,7 @@ private struct ChatDetailViewBody: View {
                     onManualStatusCheck: { agentIDs in
                         requestManualSubagentStatusCheck(agentIDs)
                     }
-                ) {
-                    session.rightPanel = nil
-                }
+                )
                 // Same session-identity convention as the transcript root (see
                 // TranscriptSessionRootIdentity): warm session switch reuses the
                 // ChatDetailView chrome, so without a per-session id the panel would
@@ -585,9 +599,7 @@ private struct ChatDetailViewBody: View {
                 // is stable across persisted-id rebinding of one logical session.
                 .id(session.bridgeRoutingKey)
             case .document:
-                DocumentPanel(store: session.documentTabs) {
-                    session.rightPanel = nil
-                }
+                DocumentPanel(store: session.documentTabs)
             }
         }
         .overlayScrollers()
