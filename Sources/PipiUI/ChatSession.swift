@@ -867,7 +867,15 @@ final class ChatSession: ObservableObject, Identifiable {
 
     /// 右侧面板：内置浏览器 / subagent 树 / 文档预览
     enum RightPanel: Equatable { case web, agents, document }
-    @Published var rightPanel: RightPanel?
+    @Published var rightPanel: RightPanel? {
+        didSet {
+            if let rightPanel {
+                lastRightPanel = rightPanel
+            }
+        }
+    }
+    /// Last non-nil right panel; restore target after collapse (in-memory per session).
+    private(set) var lastRightPanel: RightPanel?
 
     /// Per-session transcript window (survives detail view reuse when switching sessions).
     @Published var transcriptVisibleCount: Int = 150

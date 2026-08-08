@@ -3,7 +3,6 @@ import WebKit
 
 struct WebViewPanel: View {
     @ObservedObject var store: WebViewStore
-    var onClose: () -> Void
     @State private var addressText = ""
 
     var body: some View {
@@ -71,13 +70,6 @@ struct WebViewPanel: View {
                 .accessibilityLabel("浏览器\(store.browserActivity.label)")
                 .allowsHitTesting(false)
             }
-
-            Button(action: onClose) {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("关闭浏览器面板")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)

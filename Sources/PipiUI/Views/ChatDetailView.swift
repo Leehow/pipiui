@@ -376,6 +376,24 @@ private struct ChatDetailViewBody: View {
                         .foregroundStyle(session.rightPanel == .document ? Color.accentColor : Color.secondary)
                 }
                 .help("文档面板（⌘+点击聊天中的 md/txt 文档路径在此预览）")
+
+                Button {
+                    if session.rightPanel != nil {
+                        session.rightPanel = nil
+                    } else if let last = session.lastRightPanel {
+                        if last == .agents {
+                            session.subagents.selectLatest()
+                        }
+                        session.rightPanel = last
+                    }
+                } label: {
+                    Image(systemName: session.rightPanel != nil
+                          ? "rectangle.righthalf.inset.filled.arrow.right"
+                          : "sidebar.right")
+                        .foregroundStyle(session.rightPanel != nil ? Color.accentColor : Color.secondary)
+                }
+                .help(session.rightPanel != nil ? "收起右侧栏" : "展开右侧栏")
+                .disabled(session.rightPanel == nil && session.lastRightPanel == nil)
             }
         }
         .sheet(item: $finishedGroupPresentation) { presentation in
@@ -524,9 +542,7 @@ private struct ChatDetailViewBody: View {
         Group {
             switch panel {
             case .web:
-                WebViewPanel(store: session.webView) {
-                    session.rightPanel = nil
-                }
+                WebViewPanel(store: session.webView)
             case .agents:
                 SubagentPanel(
                     store: session.subagents,
@@ -535,9 +551,7 @@ private struct ChatDetailViewBody: View {
                     onManualStatusCheck: { agentIDs in
                         requestManualSubagentStatusCheck(agentIDs)
                     }
-                ) {
-                    session.rightPanel = nil
-                }
+                )
                 // Same session-identity convention as the transcript root (see
                 // TranscriptSessionRootIdentity): warm session switch reuses the
                 // ChatDetailView chrome, so without a per-session id the panel would
@@ -545,9 +559,7 @@ private struct ChatDetailViewBody: View {
                 // is stable across persisted-id rebinding of one logical session.
                 .id(session.bridgeRoutingKey)
             case .document:
-                DocumentPanel(store: session.documents) {
-                    session.rightPanel = nil
-                }
+                DocumentPanel(store: session.documents)
             }
         }
         .overlayScrollers()

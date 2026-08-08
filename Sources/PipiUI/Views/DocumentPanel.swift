@@ -17,10 +17,9 @@ extension EnvironmentValues {
 
 /// 右侧文档面板：预览 Markdown / 纯文本文档。
 /// Markdown 走聊天同款 MarkdownTextView（标题/表格/代码块/引用），
-/// 纯文本走等宽可选中原文；头部提供访达 / 外部打开 / 刷新 / 关闭。
+/// 纯文本走等宽可选中原文；头部提供访达 / 外部打开 / 刷新。
 struct DocumentPanel: View {
     @ObservedObject var store: DocumentStore
-    var onClose: () -> Void
     @Environment(\.chatTypography) private var chatTypography
 
     var body: some View {
@@ -65,8 +64,6 @@ struct DocumentPanel: View {
                     store.reload()
                 }
             }
-
-            iconButton("xmark.circle.fill", tip: "关闭文档面板", action: onClose)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
