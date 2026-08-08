@@ -9,6 +9,7 @@ final class ScrollOriginTests: XCTestCase {
     func testHeldMouseButtonMeansUser() {
         XCTAssertEqual(ScrollOrigin.classify(mouseButtonsDown: 1), .user)
         XCTAssertTrue(ScrollOrigin.classify(mouseButtonsDown: 1).allowsUnpin)
+        XCTAssertTrue(ScrollOrigin.classify(mouseButtonsDown: 1).isKnobDrag)
     }
 
     func testAnySecondaryButtonAlsoCounts() {
@@ -18,6 +19,7 @@ final class ScrollOriginTests: XCTestCase {
     func testNoButtonMeansProgrammaticOrUnknown() {
         XCTAssertEqual(ScrollOrigin.classify(mouseButtonsDown: 0), .programmaticOrUnknown)
         XCTAssertFalse(ScrollOrigin.classify(mouseButtonsDown: 0).allowsUnpin)
+        XCTAssertFalse(ScrollOrigin.classify(mouseButtonsDown: 0).isKnobDrag)
     }
 
     /// AppKit content-growth following may move the clip view while streaming.
@@ -34,6 +36,7 @@ final class ScrollOriginTests: XCTestCase {
         let origin = ScrollOrigin.classify(mouseButtonsDown: 1, windowInLiveResize: true)
         XCTAssertEqual(origin, .programmaticOrUnknown)
         XCTAssertFalse(origin.allowsUnpin)
+        XCTAssertFalse(origin.isKnobDrag)
     }
 
     func testProgrammaticBoundsChangeNeverStartsKnobDragTracking() {

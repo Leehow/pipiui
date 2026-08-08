@@ -78,6 +78,90 @@ final class StickToBottomLogicTests: XCTestCase {
         XCTAssertEqual(desired, true)
     }
 
+    func testKnobDragDoesNotRepinWhileButtonHeld() {
+        // Scroller-knob path: unpin on drag-away is fine, but auto re-pin while
+        // the thumb is still held would yank the origin back under the cursor.
+        let unpin = StickToBottomLogic.desiredPin(
+            currentlyPinned: true,
+            distanceFromBottom: 40,
+            userLiveScroll: true,
+            allowUnpin: true,
+            allowRepin: false
+        )
+        XCTAssertEqual(unpin, false)
+
+        let noRepin = StickToBottomLogic.desiredPin(
+            currentlyPinned: false,
+            distanceFromBottom: 0,
+            userLiveScroll: true,
+            allowUnpin: true,
+            allowRepin: false
+        )
+        XCTAssertNil(noRepin)
+    }
+
+    func testAfterKnobReleaseRepinAllowedAgain() {
+        // Mouse-up restores the normal live-scroll contract: near-bottom may re-pin.
+        let desired = StickToBottomLogic.desiredPin(
+            currentlyPinned: false,
+            distanceFromBottom: 0,
+            userLiveScroll: true,
+            allowUnpin: true,
+            allowRepin: true
+        )
+        XCTAssertEqual(desired, true)
+    }
+
+    func testPinnedContentFollowBlockedDuringKnobDrag() {
+        XCTAssertFalse(
+            StickToBottomLogic.allowsPinnedContentFollow(
+                isPinned: true,
+                mouseButtonsDown: 1,
+                windowInLiveResize: false
+            )
+        )
+        // Secondary button also counts as a held-button knob interaction.
+        XCTAssertFalse(
+            StickToBottomLogic.allowsPinnedContentFollow(
+                isPinned: true,
+                mouseButtonsDown: 2,
+                windowInLiveResize: false
+            )
+        )
+    }
+
+    func testPinnedContentFollowAllowedWhenPinnedAndNotDragging() {
+        XCTAssertTrue(
+            StickToBottomLogic.allowsPinnedContentFollow(
+                isPinned: true,
+                mouseButtonsDown: 0,
+                windowInLiveResize: false
+            )
+        )
+    }
+
+    func testPinnedContentFollowDeniedWhenUnpinnedEvenWithoutDrag() {
+        XCTAssertFalse(
+            StickToBottomLogic.allowsPinnedContentFollow(
+                isPinned: false,
+                mouseButtonsDown: 0,
+                windowInLiveResize: false
+            )
+        )
+    }
+
+    func testPinnedContentFollowAllowedDuringLiveWindowResizeWithMouseDown() {
+        // Window chrome drag holds a button but must keep pin-edge follow so
+        // width reflow does not leave the viewport mid-history.
+        XCTAssertTrue(
+            StickToBottomLogic.allowsPinnedContentFollow(
+                isPinned: true,
+                mouseButtonsDown: 1,
+                windowInLiveResize: true
+            )
+        )
+    }
+
     func testEndOfUpwardLiveScrollCannotReverseItsUnpinInsideFormerSoftBand() {
         let unpin = StickToBottomLogic.desiredPin(
             currentlyPinned: true,
