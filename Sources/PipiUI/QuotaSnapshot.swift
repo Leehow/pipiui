@@ -49,7 +49,7 @@ struct QuotaSnapshot: Equatable, Codable {
 
 /// The provider kind backing an account-quota pill.
 enum QuotaProvider: String, CaseIterable {
-    case grok, glm, claude, codex, kimi, qoder, qwenTokenPlan
+    case grok, glm, claude, codex, kimi, qoder, qwenTokenPlan, opencodeGo
 
     /// Human-readable name for the popover title, e.g. "Grok 账号额度".
     var accountLabel: String {
@@ -61,6 +61,8 @@ enum QuotaProvider: String, CaseIterable {
         case .kimi: return "Kimi 账号额度"
         case .qoder: return "Qoder 账号额度"
         case .qwenTokenPlan: return "Qwen Token Plan 额度"
+        // Local OpenCode DB only — never claim official cross-device balance.
+        case .opencodeGo: return "OpenCode Go 本机用量"
         }
     }
 
@@ -75,6 +77,7 @@ enum QuotaProvider: String, CaseIterable {
         case .kimi: return KimiQuotaMonitor.shared
         case .qoder: return QoderQuotaMonitor.shared
         case .qwenTokenPlan: return QwenTokenPlanQuotaMonitor.shared
+        case .opencodeGo: return OpenCodeGoQuotaMonitor.shared
         }
     }
 }

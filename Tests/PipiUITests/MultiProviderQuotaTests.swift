@@ -41,6 +41,7 @@ final class MultiProviderQuotaTests: XCTestCase {
         XCTAssertEqual(ModelInfo(provider: "anthropic", modelId: "claude-sonnet-4-5", name: "Claude", contextWindow: nil).quotaProvider, .claude)
         XCTAssertEqual(ModelInfo(provider: "openai-codex", modelId: "gpt-5.4", name: "GPT", contextWindow: nil).quotaProvider, .codex)
         XCTAssertEqual(ModelInfo(provider: "kimi-coding", modelId: "kimi-for-coding", name: "Kimi", contextWindow: nil).quotaProvider, .kimi)
+        XCTAssertEqual(ModelInfo(provider: "opencode-go", modelId: "gpt-5.6-luna", name: "Luna", contextWindow: nil).quotaProvider, .opencodeGo)
 
         // Relays → nil (never show quota).
         XCTAssertNil(ModelInfo(provider: "grok-relay", modelId: "grok-4.5", name: "Grok", contextWindow: nil).quotaProvider)
@@ -65,6 +66,7 @@ final class MultiProviderQuotaTests: XCTestCase {
         XCTAssertEqual(QuotaProvider.kimi.accountLabel, "Kimi 账号额度")
         XCTAssertEqual(QuotaProvider.qoder.accountLabel, "Qoder 账号额度")
         XCTAssertEqual(QuotaProvider.qwenTokenPlan.accountLabel, "Qwen Token Plan 额度")
+        XCTAssertEqual(QuotaProvider.opencodeGo.accountLabel, "OpenCode Go 本机用量")
     }
 
     // MARK: - GLM parsing

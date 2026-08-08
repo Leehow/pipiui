@@ -106,6 +106,9 @@ struct ModelInfo: Identifiable, Hashable {
         // `qwen-token-plan-cn`). Substring match is intentional — other qwen
         // models (e.g. `qwen-vl`) must NOT map here.
         if p.contains("qwen-token-plan") { return .qwenTokenPlan }
+        // OpenCode Go subscription (`opencode-go`). Must not match bare
+        // `opencode` (Zen pay-as-you-go) — only the Go plan has 5h/week/month caps.
+        if p == "opencode-go" || p.contains("opencode-go") { return .opencodeGo }
         return nil
     }
 
