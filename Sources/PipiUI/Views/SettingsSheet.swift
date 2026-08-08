@@ -207,6 +207,10 @@ struct SettingsSheet: View {
         } message: {
             Text(verifyAlertMessage ?? "")
         }
+        .sheet(isPresented: $store.isUpdateCenterPresented) {
+            UpdateCenterSheet()
+                .environmentObject(store)
+        }
     }
 
     @ViewBuilder
@@ -340,7 +344,80 @@ struct SettingsSheet: View {
             notificationSection
             Divider()
             priceSection
+            Divider()
+            updateCenterSection
         }
+    }
+
+    // MARK: - 更新中心
+
+    private var updateCenterSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("更新中心")
+                .font(.title3.weight(.semibold))
+            Text("检测 pi 与 cua-driver 的可用更新；有新版会在此提示。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(UpdateProductID.allCases, id: \.self) { id in
+                    updateCenterProductRow(id)
+                }
+
+                HStack(spacing: 10) {
+                    Button("打开更新中心") {
+                        store.isUpdateCenterPresented = true
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button {
+                        store.refreshAllUpdates()
+                    } label: {
+                        if store.isAnyUpdateChecking {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("刷新中…")
+                            }
+                        } else {
+                            Text("刷新")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(store.isAnyUpdateChecking)
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+        }
+    }
+
+    private func updateCenterProductRow(_ id: UpdateProductID) -> some View {
+        let info = store.productUpdates[id] ?? .placeholder(for: id)
+        let current = info.installedVersion ?? "未知"
+        let latest = info.latestVersion ?? "未知"
+        let status = updateCenterStatusText(for: info)
+        return HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text("\(info.displayName) · 当前 \(current) · 最新 \(latest) ·")
+                .font(.callout)
+            Text(status.text)
+                .font(.callout)
+                .foregroundStyle(status.color)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func updateCenterStatusText(for info: ProductUpdateInfo) -> (text: String, color: Color) {
+        if info.updateAvailable {
+            return ("有新版可用", .orange)
+        }
+        if info.isIgnored {
+            return ("已忽略此版本", .secondary)
+        }
+        if info.installedVersion != nil, info.latestVersion != nil {
+            return ("已是最新", .secondary)
+        }
+        return ("未知", .secondary)
     }
 
     // MARK: - 任务提醒

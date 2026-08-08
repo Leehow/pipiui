@@ -46,6 +46,12 @@ struct UpdateCenterSheet: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(store.isAnyUpdateChecking)
+
+                Button("知道了") {
+                    store.isUpdateCenterPresented = false
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
             }
 
             Spacer(minLength: 0)

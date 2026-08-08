@@ -153,8 +153,6 @@ struct SidebarView: View {
                 .help("Subagent 模型")
                 .accessibilityLabel("Subagent 模型")
 
-                piUpdateIndicatorButton
-
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, Self.sidebarGutter + 2)
@@ -254,44 +252,6 @@ struct SidebarView: View {
             .frame(width: 560)
             .frame(maxHeight: 760)
             .dismissOnOutsideClick { showComputerUseSettings = false }
-        }
-        .sheet(isPresented: $store.isUpdateCenterPresented) {
-            UpdateCenterSheet()
-                .environmentObject(store)
-        }
-    }
-
-    /// Bottom sidebar indicator for any-product update availability.
-    @ViewBuilder
-    private var piUpdateIndicatorButton: some View {
-        if store.isAnyUpdateChecking {
-            ProgressView()
-                .controlSize(.small)
-                .frame(width: 22, height: 22)
-                .accessibilityLabel("正在检查更新")
-        } else if store.anyUpdateAvailable {
-            let names = store.productsWithUpdates.map(\.displayName).joined(separator: "、")
-            let detail = store.productsWithUpdates.compactMap { info -> String? in
-                guard let latest = info.latestVersion else { return info.displayName }
-                return "\(info.displayName) \(latest)"
-            }.joined(separator: "、")
-            Button {
-                store.isUpdateCenterPresented = true
-            } label: {
-                Image(systemName: "arrow.down.circle.fill")
-                    .font(.body)
-                    .frame(width: 22, height: 22)
-                    .foregroundStyle(Color.orange)
-                    .background(alignment: .topTrailing) {
-                        Circle()
-                            .fill(Color.red)
-                            .frame(width: 7, height: 7)
-                            .offset(x: 2, y: -2)
-                    }
-            }
-            .buttonStyle(HoverButtonStyle())
-            .help("有可用更新 (\(detail))")
-            .accessibilityLabel("有可用更新 (\(names))，点击打开更新中心")
         }
     }
 
