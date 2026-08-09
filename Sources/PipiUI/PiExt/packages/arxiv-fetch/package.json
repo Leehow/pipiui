@@ -1,0 +1,13 @@
+{
+  "name": "pipiui-arxiv-fetch",
+  "version": "0.1.0",
+  "description": "PipiUI official local Pi package for arXiv metadata and paper retrieval.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": ["pi-package", "pi-extension", "arxiv"],
+  "exports": { ".": { "types": "./extensions/arxiv-fetch.ts", "default": "./extensions/arxiv-fetch.ts" } },
+  "types": "./extensions/arxiv-fetch.ts",
+  "pi": { "extensions": ["./extensions/arxiv-fetch.ts"] },
+  "files": ["extensions/arxiv-fetch.ts", "README.md", "LICENSE"],
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*", "typebox": "*" }
+}
