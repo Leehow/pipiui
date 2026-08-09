@@ -25,6 +25,13 @@ struct SessionMeta: Identifiable, Hashable {
     var id: String { path }
 }
 
+private struct SessionScanCacheEntry {
+    let mtime: Date
+    let name: String
+    let modelRef: String?
+    let ephemeral: Bool
+}
+
 /// Extracts the newest main-agent model selection from a pi session JSONL tail.
 enum SessionModelReferenceParser {
     static func latestModelRef(in jsonlTail: Data) -> String? {
@@ -1549,7 +1556,9 @@ final class AppStore: ObservableObject {
 
     /// T7: 增量扫描缓存——projectPath → (session 文件路径 → (mtime, name, modelRef, ephemeral))。
     /// 只有新增或 mtime 变化的文件才重新读内容解析元数据，其余复用上次结果。
-    private var sessionScanCache: [String: [String: (mtime: Date, name: String, modelRef: String?, ephemeral: Bool)]] = [:]
+    private var sessionScanCache: [String: [String: SessionScanCacheEntry]] = [:]
+    /// Incremented per project so a slow scan can never overwrite a newer refresh.
+    private var sessionScanGenerations: [String: UInt] = [:]
     private let sessionScanCacheLock = NSLock()
     /// Projects with at least one completed metadata scan may warm independently.
     private var completedSessionScans: Set<String> = []
@@ -1600,105 +1609,155 @@ final class AppStore: ObservableObject {
         let dir = Self.sessionDirectory(forCwd: project.path)
         let projectPath = project.path
         let archived = archivedSessionPaths
+        let pinned = userPinnedSessionPaths
+        completedSessionScans.remove(projectPath)
         sessionScanCacheLock.lock()
         let cachedEntries = sessionScanCache[projectPath] ?? [:]
+        let generation = (sessionScanGenerations[projectPath] ?? 0) &+ 1
+        sessionScanGenerations[projectPath] = generation
         sessionScanCacheLock.unlock()
+
         DispatchQueue.global(qos: .userInitiated).async {
             let fm = FileManager.default
             let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]))?
                 .filter { $0.pathExtension == "jsonl" } ?? []
-            var active: [SessionMeta] = []
-            var archivedMetas: [SessionMeta] = []
-            var newCache: [String: (mtime: Date, name: String, modelRef: String?, ephemeral: Bool)] = [:]
-            newCache.reserveCapacity(files.count)
-            for url in files {
-                let path = url.path
+            let plannedFiles = files.map { url -> SessionMetadataProgressiveLoadPlan.File in
                 let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                // 增量：mtime 未变直接复用上次的元数据，不重复读文件内容。
-                let entry: (name: String, modelRef: String?, ephemeral: Bool)
-                if let hit = cachedEntries[path], hit.mtime == mtime {
-                    entry = (hit.name, hit.modelRef, hit.ephemeral)
+                return .init(
+                    path: url.path,
+                    modified: mtime,
+                    isArchived: archived.contains(url.path),
+                    isPinned: pinned.contains(url.path)
+                )
+            }
+            let urlsByPath = Dictionary(uniqueKeysWithValues: files.map { ($0.path, $0) })
+            let cacheMisses = plannedFiles.filter { cachedEntries[$0.path]?.mtime != $0.modified }
+            let batches = SessionMetadataProgressiveLoadPlan.batches(files: cacheMisses)
+            var entries: [String: SessionScanCacheEntry] = [:]
+            entries.reserveCapacity(files.count)
+
+            func parse(_ file: SessionMetadataProgressiveLoadPlan.File) {
+                guard let url = urlsByPath[file.path] else { return }
+                if let hit = cachedEntries[file.path], hit.mtime == file.modified {
+                    entries[file.path] = hit
                 } else if Self.isEphemeralTitlePromptSession(url) {
-                    entry = ("", nil, true)
+                    entries[file.path] = .init(mtime: file.modified, name: "", modelRef: nil, ephemeral: true)
                 } else {
-                    entry = (
-                        Self.sessionDisplayName(url),
-                        Self.sessionModelRef(url),
-                        false
+                    entries[file.path] = .init(
+                        mtime: file.modified,
+                        name: Self.sessionDisplayName(url),
+                        modelRef: Self.sessionModelRef(url),
+                        ephemeral: false
                     )
                 }
-                newCache[path] = (
-                    mtime: mtime,
-                    name: entry.name,
-                    modelRef: entry.modelRef,
-                    ephemeral: entry.ephemeral
-                )
-                // Skip orphan side-channel title-gen sessions (pi ran without --no-session).
-                if entry.ephemeral { continue }
-                let meta = SessionMeta(
-                    path: path,
-                    name: entry.name,
-                    modified: mtime,
-                    modelRef: entry.modelRef,
-                    engineKind: .pi
-                )
-                if archived.contains(path) {
-                    archivedMetas.append(meta)
-                } else {
-                    active.append(meta)
-                }
             }
-            self.sessionScanCacheLock.lock()
-            self.sessionScanCache[projectPath] = newCache
-            self.sessionScanCacheLock.unlock()
-            active.sort { $0.modified > $1.modified }
-            archivedMetas.sort { $0.modified > $1.modified }
-            DispatchQueue.main.async {
-                // 合并仍 open 但磁盘扫描尚未见到的 sessionFile（扫盘竞态），避免乐观行被刷掉
-                var merged = active
-                let scannedPaths = Set(active.map(\.path))
-                let previous = self.sessionsByProject[projectPath] ?? []
-                for open in self.openSessions.values where open.projectURL.path == projectPath {
-                    guard let file = open.sessionFile,
-                          !scannedPaths.contains(file),
-                          !archived.contains(file) else { continue }
-                    if let keep = previous.first(where: { $0.path == file }) {
-                        merged.append(keep)
-                    } else {
-                        let name = open.sessionName?.trimmingCharacters(in: .whitespacesAndNewlines)
-                        merged.append(SessionMeta(
-                            path: file,
-                            name: (name?.isEmpty == false ? name! : "新会话"),
-                            modified: Date(),
-                            engineKind: open.engineKind
-                        ))
+
+            // Cache hits are already cheap and complete, even if they are outside
+            // the first parse batch. Only cache misses are deferred.
+            for file in plannedFiles where cachedEntries[file.path]?.mtime == file.modified {
+                parse(file)
+            }
+
+            func publish(isComplete: Bool) {
+                let snapshot = entries
+                DispatchQueue.main.async {
+                    guard self.acceptsSessionScan(generation, for: projectPath) else { return }
+                    self.applySessionScan(
+                        entries: snapshot,
+                        projectPath: projectPath,
+                        archivedAtStart: archived,
+                        isComplete: isComplete
+                    )
+                    if isComplete {
+                        self.sessionScanCacheLock.lock()
+                        defer { self.sessionScanCacheLock.unlock() }
+                        guard SessionMetadataProgressiveLoadPlan.acceptsPublish(
+                            candidateGeneration: generation,
+                            currentGeneration: self.sessionScanGenerations[projectPath] ?? 0
+                        ) else { return }
+                        self.sessionScanCache[projectPath] = snapshot
                     }
                 }
-                merged.sort { self.effectiveModified($0) > self.effectiveModified($1) }
-                // 主线程 apply 时用最新 archived 再滤，避免乱序 refresh 把已归档会话写回列表
-                let liveArchived = self.archivedSessionPaths
-                merged.removeAll { liveArchived.contains($0.path) }
-                self.sessionsByProject[projectPath] = merged
+            }
 
-                // 归档列表：扫盘结果 + 最新 archived 校正（只含本项目扫到的文件）
-                var archivedList = archivedMetas.filter { liveArchived.contains($0.path) }
-                // 乐观归档后扫盘尚未含该文件时，保留上一轮/乐观条目
-                let archivedScanned = Set(archivedList.map(\.path))
-                let previousArchived = self.archivedByProject[projectPath] ?? []
-                for keep in previousArchived where liveArchived.contains(keep.path) && !archivedScanned.contains(keep.path) {
-                    archivedList.append(keep)
+            guard !batches.isEmpty else {
+                publish(isComplete: true)
+                return
+            }
+            for (index, batch) in batches.enumerated() {
+                for file in batch where entries[file.path] == nil {
+                    parse(file)
                 }
-                // 从 previous 活跃列表补上刚被 liveArchived 滤掉、扫盘还没进归档侧的 path
-                let archivedPathsNow = Set(archivedList.map(\.path))
-                for prev in previous where liveArchived.contains(prev.path) && !archivedPathsNow.contains(prev.path) {
-                    archivedList.append(prev)
-                }
-                archivedList.sort { self.effectiveModified($0) > self.effectiveModified($1) }
-                self.archivedByProject[projectPath] = archivedList
-                self.completedSessionScans.insert(projectPath)
-                self.scheduleHistoryPreload()
+                publish(isComplete: index == batches.count - 1)
             }
         }
+    }
+
+    private func acceptsSessionScan(_ generation: UInt, for projectPath: String) -> Bool {
+        sessionScanCacheLock.lock()
+        defer { sessionScanCacheLock.unlock() }
+        return SessionMetadataProgressiveLoadPlan.acceptsPublish(
+            candidateGeneration: generation,
+            currentGeneration: sessionScanGenerations[projectPath] ?? 0
+        )
+    }
+
+    private func applySessionScan(
+        entries: [String: SessionScanCacheEntry],
+        projectPath: String,
+        archivedAtStart: Set<String>,
+        isComplete: Bool
+    ) {
+        var active: [SessionMeta] = []
+        var archivedMetas: [SessionMeta] = []
+        for (path, entry) in entries where !entry.ephemeral {
+            let meta = SessionMeta(path: path, name: entry.name, modified: entry.mtime, modelRef: entry.modelRef, engineKind: .pi)
+            if archivedAtStart.contains(path) {
+                archivedMetas.append(meta)
+            } else {
+                active.append(meta)
+            }
+        }
+        active.sort { $0.modified > $1.modified }
+        archivedMetas.sort { $0.modified > $1.modified }
+
+        // 合并仍 open 但磁盘扫描尚未见到的 sessionFile（扫盘竞态），避免乐观行被刷掉
+        var merged = active
+        let scannedPaths = Set(active.map(\.path))
+        let previous = sessionsByProject[projectPath] ?? []
+        for open in openSessions.values where open.projectURL.path == projectPath {
+            guard let file = open.sessionFile,
+                  !scannedPaths.contains(file),
+                  !archivedAtStart.contains(file) else { continue }
+            if let keep = previous.first(where: { $0.path == file }) {
+                merged.append(keep)
+            } else {
+                let name = open.sessionName?.trimmingCharacters(in: .whitespacesAndNewlines)
+                merged.append(SessionMeta(path: file, name: (name?.isEmpty == false ? name! : "新会话"), modified: Date(), engineKind: open.engineKind))
+            }
+        }
+        merged.sort { effectiveModified($0) > effectiveModified($1) }
+        // 主线程 apply 时用最新 archived 再滤，避免乱序 refresh 把已归档会话写回列表
+        let liveArchived = archivedSessionPaths
+        merged.removeAll { liveArchived.contains($0.path) }
+        sessionsByProject[projectPath] = merged
+
+        // 归档列表：扫盘结果 + 最新 archived 校正（只含本项目扫到的文件）
+        var archivedList = archivedMetas.filter { liveArchived.contains($0.path) }
+        let archivedScanned = Set(archivedList.map(\.path))
+        let previousArchived = archivedByProject[projectPath] ?? []
+        for keep in previousArchived where liveArchived.contains(keep.path) && !archivedScanned.contains(keep.path) {
+            archivedList.append(keep)
+        }
+        let archivedPathsNow = Set(archivedList.map(\.path))
+        for prev in previous where liveArchived.contains(prev.path) && !archivedPathsNow.contains(prev.path) {
+            archivedList.append(prev)
+        }
+        archivedList.sort { effectiveModified($0) > effectiveModified($1) }
+        archivedByProject[projectPath] = archivedList
+        guard isComplete else { return }
+        completedSessionScans.insert(projectPath)
+        scheduleHistoryPreload()
     }
 
     /// 立刻把 live session 的文件路径写进侧边栏 metas（主线程），异步 refresh 会用真实 mtime/name 覆盖。
