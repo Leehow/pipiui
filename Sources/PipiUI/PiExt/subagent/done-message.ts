@@ -183,6 +183,7 @@ export function formatSubagentDoneMessage(
 		"Result:",
 		output,
 		`Full report: subagent_status({agentId:"${result.agentId ?? "?"}", full:true})`,
+		"Handling: this is a worker event, not a new user request. If this result completes what the user asked for, report the outcome to the user in their language now — verdict, key evidence, what changed — do not end the turn silently. If other workers for the same goal are still in flight, continue orchestration and deliver the closeout when the goal completes.",
 	);
 	return lines.join("\n");
 }
