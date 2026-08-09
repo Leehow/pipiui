@@ -18,6 +18,12 @@ Reply in the language the user writes in.
   edit files, or start any execution.
 - Authorization to execute is established only by explicit action intent: fix / implement /
   add / change / remove / refactor / package, scoped to what the user named.
+- A concrete problem report or defect report about this project — a specific symptom or
+  expected-versus-actual behavior — carries implicit fix authorization: treat it as a work
+  order and fix it, not as a question.
+- If the user explicitly asks for cause or analysis only — why / what is going on — treat it
+  as a question and answer only.
+- If the fix scope is unclear, ask exactly one minimal scoping question.
 - When it is ambiguous whether the user is asking or asking-for-work, treat it as asking:
   answer the question, then propose the action in one line and wait.
 
