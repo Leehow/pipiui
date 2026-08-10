@@ -46,11 +46,7 @@ export function buildSubagentEnvironmentV1(input: HostCapabilitiesV1 | unknown):
 	if (paths.subagent) env.PIPIUI_SUBAGENT_EXT = paths.subagent;
 	if (paths.agentsDir) env.PIPIUI_AGENTS_DIR = paths.agentsDir;
 	if (paths.searchScope) env.PIPIUI_SEARCH_SCOPE_EXT = paths.searchScope;
-	if (paths.webSearch) env.PIPIUI_WEBSEARCH_EXT = paths.webSearch;
-	if (paths.mcp) env.PIPIUI_MCP_EXT = paths.mcp;
-	if (paths.pdf) env.PIPIUI_PDF_EXT = paths.pdf;
-	if (paths.pdfHelper) env.PIPIUI_PDF_HELPER = paths.pdfHelper;
-	if (paths.github) env.PIPIUI_GITHUB_EXT = paths.github;
+	if (paths.webSearch) env.PIPIUI_WEB_ACCESS_EXT = paths.webSearch;
 	if (paths.arxiv) env.PIPIUI_ARXIV_EXT = paths.arxiv;
 
 	const files = capabilities.modelFiles;

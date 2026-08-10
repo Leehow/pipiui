@@ -18,7 +18,13 @@ final class McpServerSettingsTests: XCTestCase {
     // MARK: - Interpolation
 
     func testInterpolateSimpleVar() throws {
-        XCTAssertEqual(try McpServerSettings.interpolate("${FIRECRAWL_API_KEY}", variables: ["FIRECRAWL_API_KEY": "sk-123"]), "sk-123")
+        XCTAssertEqual(
+            try McpServerSettings.interpolate(
+                "${FIRECRAWL_API_KEY}",
+                variables: ["FIRECRAWL_API_KEY": "sk-123"]
+            ),
+            "sk-123"
+        )
     }
 
     func testInterpolateMixedText() throws {
@@ -65,82 +71,136 @@ final class McpServerSettingsTests: XCTestCase {
         XCTAssertNotNil(McpServerSettings.validationError(server))
     }
 
-    func testValidationRejectsEmptyOrBadUrlForHttp() {
-        let noUrl = McpServer(name: "srv", transport: .http, url: "")
-        XCTAssertNotNil(McpServerSettings.validationError(noUrl))
-        let badUrl = McpServer(name: "srv", transport: .http, url: "ftp://x")
-        XCTAssertNotNil(McpServerSettings.validationError(badUrl))
+    func testValidationRejectsEmptyOrBadURLForHTTP() {
+        let noURL = McpServer(name: "srv", transport: .http, url: "")
+        XCTAssertNotNil(McpServerSettings.validationError(noURL))
+        let badURL = McpServer(name: "srv", transport: .http, url: "ftp://x")
+        XCTAssertNotNil(McpServerSettings.validationError(badURL))
         let good = McpServer(name: "srv", transport: .http, url: "https://mcp.example.com")
         XCTAssertNil(McpServerSettings.validationError(good))
     }
 
-    // MARK: - JSON schema
+    // MARK: - pi-mcp-extension mapper
 
-    func testJsonPayloadSchemaMatchesBrief() {
+    func testJSONPayloadMapsToPiMcpExtensionSchema() throws {
         let servers = [
-            McpServer(name: "firecrawl", enabled: true, transport: .stdio,
-                      command: "npx", args: ["-y", "firecrawl-mcp"],
-                      env: ["FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"]),
-            McpServer(name: "zhipu", enabled: false, transport: .http,
-                      url: "https://open.bigmodel.cn/api/mcp/web_search_prime/mcp",
-                      headers: ["Authorization": "Bearer ${ZHIPU_API_KEY}"]),
+            McpServer(
+                name: "firecrawl",
+                enabled: true,
+                transport: .stdio,
+                command: "npx",
+                args: ["-y", "firecrawl-mcp"],
+                env: ["FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"]
+            ),
+            McpServer(
+                name: "zhipu",
+                enabled: true,
+                transport: .http,
+                url: "https://open.bigmodel.cn/api/mcp/web_search_prime/mcp",
+                headers: ["Authorization": "Bearer ${ZHIPU_API_KEY}"]
+            ),
+            McpServer(
+                name: "disabled",
+                enabled: false,
+                transport: .stdio,
+                command: "should-not-appear"
+            ),
         ]
-        let payload = McpServerSettings.jsonPayload(servers: servers)
-        let serversDict = payload["servers"] as? [String: Any]
-        XCTAssertNotNil(serversDict)
-        XCTAssertEqual(serversDict?.count, 2)
 
-        let fc = serversDict?["firecrawl"] as? [String: Any]
-        XCTAssertEqual(fc?["enabled"] as? Bool, true)
-        XCTAssertEqual(fc?["transport"] as? String, "stdio")
-        XCTAssertEqual(fc?["command"] as? String, "npx")
-        XCTAssertEqual(fc?["args"] as? [String], ["-y", "firecrawl-mcp"])
-        XCTAssertEqual((fc?["env"] as? [String: String])?["FIRECRAWL_API_KEY"], "${FIRECRAWL_API_KEY}")
+        let payload = try McpServerSettings.jsonPayload(
+            servers: servers,
+            variables: [
+                "FIRECRAWL_API_KEY": "firecrawl-secret",
+                "ZHIPU_API_KEY": "zhipu-secret",
+            ]
+        )
+        XCTAssertEqual((payload["settings"] as? [String: Any])?["toolPrefix"] as? String, "mcp")
+        XCTAssertNil(payload["servers"])
 
-        let zp = serversDict?["zhipu"] as? [String: Any]
-        XCTAssertEqual(zp?["enabled"] as? Bool, false)
-        XCTAssertEqual(zp?["transport"] as? String, "http")
-        XCTAssertEqual(zp?["url"] as? String, "https://open.bigmodel.cn/api/mcp/web_search_prime/mcp")
-        XCTAssertEqual((zp?["headers"] as? [String: String])?["Authorization"], "Bearer ${ZHIPU_API_KEY}")
+        let entries = try XCTUnwrap(payload["mcpServers"] as? [String: Any])
+        XCTAssertEqual(entries.count, 2, "disabled servers are omitted rather than lazily runnable")
+
+        let firecrawl = try XCTUnwrap(entries["firecrawl"] as? [String: Any])
+        XCTAssertEqual(firecrawl["transport"] as? String, "stdio")
+        XCTAssertEqual(firecrawl["command"] as? String, "npx")
+        XCTAssertEqual(firecrawl["args"] as? [String], ["-y", "firecrawl-mcp"])
+        XCTAssertEqual(
+            (firecrawl["env"] as? [String: String])?["FIRECRAWL_API_KEY"],
+            "firecrawl-secret"
+        )
+        XCTAssertEqual(firecrawl["lifecycle"] as? String, "eager")
+        XCTAssertNil(firecrawl["url"])
+        XCTAssertNil(firecrawl["headers"])
+
+        let zhipu = try XCTUnwrap(entries["zhipu"] as? [String: Any])
+        XCTAssertEqual(zhipu["transport"] as? String, "streamable-http")
+        XCTAssertEqual(
+            zhipu["url"] as? String,
+            "https://open.bigmodel.cn/api/mcp/web_search_prime/mcp"
+        )
+        XCTAssertEqual(
+            (zhipu["headers"] as? [String: String])?["Authorization"],
+            "Bearer zhipu-secret"
+        )
+        XCTAssertEqual(zhipu["lifecycle"] as? String, "eager")
+        XCTAssertNil(zhipu["command"])
+        XCTAssertNil(entries["disabled"])
     }
 
-    func testSaveWritesRFC822SchemaFile() throws {
+    func testSaveWritesPiMcpJSONToExplicitTemporaryURL() throws {
         let (name, suite) = tempSuite()
         defer { suite.removePersistentDomain(forName: name) }
         let url = try tempURL()
         let servers = [
-            McpServer(name: "brave", enabled: true, transport: .stdio, command: "npx"),
+            McpServer(
+                name: "brave",
+                enabled: true,
+                transport: .stdio,
+                command: "npx",
+                env: ["BRAVE_API_KEY": "${BRAVE_API_KEY}"]
+            ),
         ]
-        McpServerSettings.save(servers, defaults: suite, to: url)
+
+        XCTAssertNil(McpServerSettings.save(
+            servers,
+            defaults: suite,
+            to: url,
+            variables: ["BRAVE_API_KEY": "brave-secret"]
+        ))
 
         let data = try Data(contentsOf: url)
-        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        let s = (obj?["servers"] as? [String: Any])?["brave"] as? [String: Any]
-        XCTAssertEqual(s?["transport"] as? String, "stdio")
-        XCTAssertEqual(s?["command"] as? String, "npx")
+        let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let server = try XCTUnwrap(
+            (payload["mcpServers"] as? [String: Any])?["brave"] as? [String: Any]
+        )
+        XCTAssertEqual(server["transport"] as? String, "stdio")
+        XCTAssertEqual(server["command"] as? String, "npx")
+        XCTAssertEqual((server["env"] as? [String: String])?["BRAVE_API_KEY"], "brave-secret")
 
-        // Round-trip through the canonical store.
-        let loaded = McpServerSettings.servers(defaults: suite)
-        XCTAssertEqual(loaded, servers)
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        XCTAssertEqual(permissions & 0o777, 0o600, "expanded credentials stay in a user-only file")
+
+        XCTAssertEqual(McpServerSettings.servers(defaults: suite), servers)
     }
 
-    func testEnabledToggleRoundTrip() throws {
+    func testDisabledToggleRoundTripsAndRemovesServerFromMirror() throws {
         let (name, suite) = tempSuite()
         defer { suite.removePersistentDomain(forName: name) }
         let url = try tempURL()
 
         var server = McpServer(name: "srv", transport: .http, url: "https://x/mcp")
-        McpServerSettings.save([server], defaults: suite, to: url)
+        XCTAssertNil(McpServerSettings.save([server], defaults: suite, to: url, variables: [:]))
         XCTAssertTrue(McpServerSettings.servers(defaults: suite).first?.enabled == true)
 
         server.enabled = false
-        McpServerSettings.save([server], defaults: suite, to: url)
+        XCTAssertNil(McpServerSettings.save([server], defaults: suite, to: url, variables: [:]))
         XCTAssertEqual(McpServerSettings.servers(defaults: suite).first?.enabled, false)
 
         let data = try Data(contentsOf: url)
-        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        let s = (obj?["servers"] as? [String: Any])?["srv"] as? [String: Any]
-        XCTAssertEqual(s?["enabled"] as? Bool, false)
+        let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let entries = try XCTUnwrap(payload["mcpServers"] as? [String: Any])
+        XCTAssertNil(entries["srv"])
     }
 
     func testCleanTrimsWhitespaceOnSave() throws {
@@ -148,10 +208,28 @@ final class McpServerSettingsTests: XCTestCase {
         defer { suite.removePersistentDomain(forName: name) }
         let url = try tempURL()
         let server = McpServer(name: "  srv ", transport: .stdio, command: "  npx ")
-        McpServerSettings.save([server], defaults: suite, to: url)
+        XCTAssertNil(McpServerSettings.save([server], defaults: suite, to: url, variables: [:]))
         let loaded = McpServerSettings.servers(defaults: suite).first
         XCTAssertEqual(loaded?.name, "srv")
         XCTAssertEqual(loaded?.command, "npx")
+    }
+
+    func testMissingVariablePreservesExistingMirror() throws {
+        let (name, suite) = tempSuite()
+        defer { suite.removePersistentDomain(forName: name) }
+        let url = try tempURL()
+        let original = Data("{\"original\":true}".utf8)
+        try original.write(to: url)
+
+        let error = McpServerSettings.save(
+            [McpServer(name: "srv", transport: .http, url: "https://x/mcp", headers: ["Authorization": "Bearer ${MISSING}"])],
+            defaults: suite,
+            to: url,
+            variables: [:]
+        )
+
+        XCTAssertNotNil(error)
+        XCTAssertEqual(try Data(contentsOf: url), original)
     }
 
     /// A test suite must not rewrite the user's shared MCP config file.
@@ -161,39 +239,15 @@ final class McpServerSettingsTests: XCTestCase {
         let shared = McpServerSettings.configFileURL()
         let before = try? Data(contentsOf: shared)
 
-        McpServerSettings.save([McpServer(name: "srv", transport: .stdio, command: "npx")], defaults: suite)
+        XCTAssertNil(McpServerSettings.save(
+            [McpServer(name: "srv", transport: .stdio, command: "npx")],
+            defaults: suite
+        ))
 
-        XCTAssertEqual(before, try? Data(contentsOf: shared),
-                       "a test suite must not rewrite the user's MCP server config")
-    }
-
-    // MARK: - Generated TS contract
-
-    private func generatedSource() throws -> String {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("pipiui-mcp-\(UUID().uuidString)", isDirectory: true)
-        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
-        let path = try XCTUnwrap(McpBridgeExtension.install(into: dir))
-        return try String(contentsOfFile: path, encoding: .utf8)
-    }
-
-    func testGeneratedTSHasBothTransportsAndNaming() throws {
-        let source = try generatedSource()
-        XCTAssertTrue(source.contains("child_process"), "stdio transport must use child_process")
-        XCTAssertTrue(source.contains("spawn(command"))
-        XCTAssertTrue(source.contains("tools/call"), "must forward tools/call")
-        XCTAssertTrue(source.contains("tools/list"), "must discover tools")
-        XCTAssertTrue(source.contains("notifications/initialized"))
-        XCTAssertTrue(source.contains("mcp_${name}_${tool.name}"), "tool naming mcp_<server>_<tool>")
-        XCTAssertTrue(source.contains("PIPIUI_MCP_CONFIG_FILE"), "config file env override")
-        XCTAssertTrue(source.contains("expandVars"), "env interpolation")
-        XCTAssertTrue(source.contains("session_shutdown"), "must kill children on shutdown")
-    }
-
-    func testGeneratedTSDoesNotLeakSecrets() throws {
-        let source = try generatedSource()
-        XCTAssertTrue(source.contains("environment variable ${name} is not set"),
-                      "missing var error must name only the variable, not a secret")
-        XCTAssertFalse(source.contains("ZHIPU_API_KEY =\""), "no hardcoded secret assignments")
+        XCTAssertEqual(
+            before,
+            try? Data(contentsOf: shared),
+            "a test suite must not rewrite the user's MCP server config"
+        )
     }
 }

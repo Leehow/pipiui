@@ -59,11 +59,11 @@ enum BuiltInFeatureSettings {
         case git
         /// Internal hot-reload command (`pipiui_reload`).
         case reload
-        /// PipiUI's own web_search / web_fetch extension (not a native model tool).
+        /// Managed pi-web-access tools (not a native model tool).
         case webSearch
-        /// Core local PDF text/OCR extraction bridge (no cloud upload).
+        /// Retired custom PDF agent tool ID retained for saved-preference compatibility.
         case pdfExtract
-        /// Local Pi package for GitHub repository/blob/tree retrieval.
+        /// Retained persisted ID; GitHub retrieval now belongs to fetch_content.
         case githubFetch
         /// Local Pi package for arXiv metadata and HTML retrieval; optional PDF fallback is separate.
         case arxivFetch
@@ -119,20 +119,20 @@ enum BuiltInFeatureSettings {
               summary: "pipiui_reload 命令：热重载扩展、skills、提示与上下文。"),
         .init(id: .webSearch,
               section: .extensionTool,
-              title: "web_search / web_fetch",
-              summary: "为不带联网搜索的模型补充搜索/抓取工具（Firecrawl 免 key 搜索，无需配置）。"),
+              title: "web_search / fetch_content",
+              summary: "pi-web-access 为不带联网能力的模型补充搜索与抓取；默认零配置 Exa，并保留 GitHub clone 与 PDF 提取。"),
         .init(id: .pdfExtract,
               section: .extensionTool,
-              title: "本地 PDF 读取",
-              summary: "本地PDF读取：文本层优先，必要时Vision OCR，无云上传。"),
+              title: "PDF agent 读取（已迁移）",
+              summary: "PipiUI 已移除自研 PDF agent 工具；联网 PDF 由 pi-web-access 的 fetch_content 提供。拖入 composer 的本地 PDF 入库不受影响。"),
         .init(id: .githubFetch,
               section: .extensionTool,
-              title: "GitHub repo / code fetch",
-              summary: "独立本地 Pi package 的 github_fetch：GitHub 仓库、blob、tree 走 Contents API / 安全浅克隆；issue、PR、discussion、wiki、release 仍用 web_fetch。关闭 web_search 不会关闭它。"),
+              title: "GitHub repo / code fetch（已迁移）",
+              summary: "保留旧偏好 ID 的兼容项；不再安装独立 GitHub 抓取扩展。GitHub 仓库、blob、tree clone 由 pi-web-access 的 fetch_content 随 web_search 开关提供。"),
         .init(id: .arxivFetch,
               section: .extensionTool,
               title: "arXiv paper fetch",
-              summary: "独立本地 Pi package 的 arxiv_fetch：arXiv Atom 元数据、官方 HTML 与 ar5iv 单次降级；PDF 降级取决于「本地 PDF 读取」开关，且不上传 PDF。关闭后 arXiv URL 回退 web_fetch。"),
+              summary: "独立本地 Pi package 的 arxiv_fetch：arXiv Atom 元数据、官方 HTML 与 ar5iv 单次降级；PDF 降级取决于「本地 PDF 读取」开关，且不上传 PDF。关闭后 arXiv URL 回退 fetch_content。"),
         .init(id: .mcp,
               section: .extensionTool,
               title: "MCP 服务器",

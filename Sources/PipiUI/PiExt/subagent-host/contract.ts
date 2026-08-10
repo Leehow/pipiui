@@ -59,11 +59,6 @@ export type HostCapabilitiesV1 = {
 		agentsDir?: string;
 		searchScope?: string;
 		webSearch?: string;
-		mcp?: string;
-		pdf?: string;
-		/** Signed/local helper path paired with the PDF extension when available. */
-		pdfHelper?: string;
-		github?: string;
 		arxiv?: string;
 		computer?: string;
 		extensions?: JsonRecord;
@@ -558,7 +553,7 @@ export function decodeHostCapabilitiesV1(raw: unknown): DecodeResult<HostCapabil
 	if (agentDepth !== undefined && maxAgentDepth !== undefined && agentDepth > maxAgentDepth) diagnostics.push(diagnostic("invalid_depth_range", "$.session", "agentDepth must not exceed maxAgentDepth"));
 
 	const extensionResult: Record<string, unknown> = {};
-	for (const key of ["subagent", "agentsDir", "searchScope", "webSearch", "mcp", "pdf", "pdfHelper", "github", "arxiv", "computer"] as const) {
+	for (const key of ["subagent", "agentsDir", "searchScope", "webSearch", "arxiv", "computer"] as const) {
 		const value = absolutePathValue(extensionPaths, key, "$.extensions", diagnostics);
 		if (value !== undefined) extensionResult[key] = value;
 	}
@@ -586,7 +581,7 @@ export function decodeHostCapabilitiesV1(raw: unknown): DecodeResult<HostCapabil
 
 	const bridgeExtensions = extensionsFor(bridge, ["host", "port", "rpcPath", "sessionCapability"], "$.bridge", diagnostics);
 	const sessionExtensions = extensionsFor(session, ["id", "agentDepth", "maxAgentDepth", "skillReadBlock"], "$.session", diagnostics);
-	const extensionExtensions = extensionsFor(extensionPaths, ["subagent", "agentsDir", "searchScope", "webSearch", "mcp", "pdf", "pdfHelper", "github", "arxiv", "computer"], "$.extensions", diagnostics);
+	const extensionExtensions = extensionsFor(extensionPaths, ["subagent", "agentsDir", "searchScope", "webSearch", "arxiv", "computer"], "$.extensions", diagnostics);
 	const modelExtensions = extensionsFor(modelFiles, ["mainModelFile", "subagentModelsFile", "subagentModelCapabilitiesFile"], "$.modelFiles", diagnostics);
 	const extensions = extensionsFor(source, ["schemaVersion", "bridge", "session", "mainCwd", "extensions", "modelFiles", "platform"], "$", diagnostics);
 	if (port === undefined || typeof sessionCapability !== "string") return finish(undefined, diagnostics);

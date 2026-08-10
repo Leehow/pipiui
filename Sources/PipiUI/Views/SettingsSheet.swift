@@ -53,7 +53,6 @@ struct SettingsSheet: View {
     /// Master on/off snapshot for the「内置」tab. Missing = enabled; mirrors
     /// `BuiltInFeatureSettings` defaults so first launch shows everything on.
     @State private var builtInDisabled: Set<String> = BuiltInFeatureSettings.disabledIDs()
-    @State private var webSearchBackend: String = WebSearchSettings.backend()
     /// User-added MCP servers (canonical store read at open).
     @State private var mcpServers: [McpServer] = McpServerSettings.servers()
     @State private var editingMcpServer: McpServer?
@@ -1320,7 +1319,7 @@ struct SettingsSheet: View {
         case "edit": return "pencil"
         case "grep", "find": return "magnifyingglass"
         case "ls": return "folder"
-        case "web_search", "web_fetch", "github_fetch": return "globe"
+        case "web_search", "fetch_content", "source_check", "get_search_content": return "globe"
         case "subagent", "subagent_status": return "person.2"
         case "generate_image": return "photo"
         case "browser", "browser_navigate", "browser_click": return "safari"
@@ -1668,7 +1667,7 @@ struct SettingsSheet: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("MCP 服务器")
                 .font(.title3.weight(.semibold))
-            Text("添加你自己的 MCP 服务器（如 firecrawl-mcp / brave-mcp / 智谱 MCP），其工具会以 mcp_<服务器名>_<工具名> 暴露给 agent。环境变量用 ${VAR} 引用 ~/.pi/agent/.env 中的值。新增/删除后在下一个会话（或 /pipiui_reload）生效。")
+            Text("添加你自己的 MCP 服务器（如 firecrawl-mcp / brave-mcp / 智谱 MCP），其工具会以 mcp_<服务器名>_<工具名> 暴露给 agent。保存时 ${VAR} 会从 ~/.pi/agent/.env 展开到权限 0600 的 ~/.pi/agent/mcp.json；修改 .env 后请重新保存。新增/删除后在下一个会话（或 /pipiui_reload）生效。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -1762,13 +1761,16 @@ struct SettingsSheet: View {
             let args = server.args.joined(separator: " ")
             return args.isEmpty ? "stdio: \(server.command)" : "stdio: \(server.command) \(args)"
         case .http:
-            return "http: \(server.url)"
+            return "streamable-http: \(server.url)"
         }
     }
 
     private func saveMcpServers() {
-        McpServerSettings.save(mcpServers)
-        mcpTestResult = "已保存。新增/删除服务器后需在下一会话或 /pipiui_reload 生效。"
+        if let error = McpServerSettings.save(mcpServers) {
+            mcpTestResult = "已保存，但无法同步 mcp.json：\(error)"
+        } else {
+            mcpTestResult = "已保存。新增/删除服务器后需在下一会话或 /pipiui_reload 生效。"
+        }
     }
 
     private func testMcp(_ server: McpServer) {
@@ -1978,14 +1980,12 @@ struct SettingsSheet: View {
         var disabledTools: Set<String>
         var disabledSkills: Set<String>
         var builtInDisabled: Set<String>
-        var webSearchBackend: String
         var envConfiguredProviders: Set<String>
         var visionFallback: VisionFallbackSettings.Snapshot
     }
 
     /// 磁盘 I/O 集中在后台：auth.json、agents 目录（已有进程级缓存）、UserDefaults、.env 读取。
     nonisolated private static func loadReloadSnapshot() -> ReloadSnapshot {
-        let backend = WebSearchSettings.backend()
         let envStore = EnvFileStore()
         let credentials = PiAuthStore.list()
         // .env 已配置 key 的 provider：.env-only 凭据的 provider 也需要
@@ -2003,7 +2003,6 @@ struct SettingsSheet: View {
             disabledTools: ToolSkillSettings.disabledTools(),
             disabledSkills: ToolSkillSettings.disabledSkills(),
             builtInDisabled: BuiltInFeatureSettings.disabledIDs(),
-            webSearchBackend: backend,
             envConfiguredProviders: envConfigured,
             visionFallback: VisionFallbackSettings.load()
         )
@@ -2027,7 +2026,6 @@ struct SettingsSheet: View {
         disabledTools = snapshot.disabledTools
         disabledSkills = snapshot.disabledSkills
         builtInDisabled = snapshot.builtInDisabled
-        webSearchBackend = snapshot.webSearchBackend
         envConfiguredProviders = snapshot.envConfiguredProviders
         visionFallbackSelection = VisionFallback.unifiedSelection(for: snapshot.visionFallback)
         visionFallbackBaseURL = snapshot.visionFallback.baseURL
@@ -2565,12 +2563,12 @@ private struct McpServerEditor: View {
                     .textFieldStyle(.roundedBorder)
                 TextField("args（空格分隔，如 -y firecrawl-mcp）", text: $argsText)
                     .textFieldStyle(.roundedBorder)
-                McpKVEditor(title: "环境变量 env（值用 ${VAR} 引用 .env）",
+                McpKVEditor(title: "环境变量 env（${VAR} 保存时从 .env 展开）",
                             rows: $envRows, obfuscated: true)
             } else {
                 TextField("url（如 https:// …/mcp）", text: $url)
                     .textFieldStyle(.roundedBorder)
-                McpKVEditor(title: "请求头 headers（值用 ${VAR} 引用 .env）",
+                McpKVEditor(title: "请求头 headers（${VAR} 保存时从 .env 展开）",
                             rows: $headerRows, obfuscated: true)
             }
 
@@ -2591,7 +2589,7 @@ private struct McpServerEditor: View {
                 Spacer()
             }
 
-            Text("密钥请写在 ~/.pi/agent/.env，这里用 ${VAR} 引用；App 不代管这些 key。新增/删除服务器后需在下一会话或 /pipiui_reload 生效。")
+            Text("密钥请写在 ~/.pi/agent/.env，这里可用 ${VAR} 引用；pi-mcp-extension 不会在运行时展开它们，PipiUI 会在保存时写入权限 0600 的 mcp.json。修改 .env 后请重新保存。")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }

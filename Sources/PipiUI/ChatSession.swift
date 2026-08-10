@@ -150,8 +150,8 @@ enum ToolCallSummary {
             return (promptSummary(args), 0)
         case "web_search":
             return (args["query"].string ?? "…", 0)
-        case "web_fetch", "github_fetch":
-            return (args["url"].string ?? "…", 0)
+        case "fetch_content":
+            return (args["url"].string ?? args["urls"].array.first?.string ?? "…", 0)
         case "browser":
             return (browserSummary(args), 0)
         case "computer":
@@ -210,7 +210,7 @@ enum ToolCallSummary {
             return cmd.count > 120 ? String(cmd.prefix(120)) + "…" : cmd
         case "web_search":
             return scrapeJSONString(key: "query", from: text)
-        case "web_fetch", "github_fetch":
+        case "fetch_content":
             return scrapeJSONString(key: "url", from: text)
         case "generate_image":
             guard let prompt = scrapeJSONString(key: "prompt", from: text) else { return nil }
@@ -1060,9 +1060,7 @@ final class ChatSession: ObservableObject, Identifiable {
          gitExtension: String? = nil,
          reloadExtension: String? = nil,
          webSearchExtension: String? = nil,
-         githubFetchPackage: String? = nil,
          arxivFetchPackage: String? = nil,
-         pdfExtractExtension: String? = nil,
          mcpExtension: String? = nil,
          skillLoaderExtension: String? = nil,
          /// Main bridged session plan runtime (`plan_publish` / `plan_task_update`).
@@ -1235,9 +1233,7 @@ final class ChatSession: ObservableObject, Identifiable {
                     gitExtension: gitExtension,
                     reloadExtension: reloadExtension,
                     webSearchExtension: webSearchExtension,
-                    githubFetchPackage: githubFetchPackage,
                     arxivFetchPackage: arxivFetchPackage,
-                    pdfExtractExtension: pdfExtractExtension,
                     mcpExtension: mcpExtension,
                     skillLoaderExtension: skillLoaderExtension,
                     planRuntimeExtension: planRuntimeExtension,
@@ -1254,8 +1250,6 @@ final class ChatSession: ObservableObject, Identifiable {
                 computerDescriptor: computerCaptureDescriptor,
                 mainModelId: model?.id ?? SubagentModelSettings.readMainModel(),
                 excludeToolsArgs: ToolSkillSettings.excludeToolsCLIArgs(),
-                webSearchConfigFile: WebSearchSettings.configFileURL().path,
-                mcpConfigFile: McpServerSettings.configFileURL().path,
                 memoryBrokerStateDirectory: memoryBrokerStateDirectory,
                 memoryBrokerImportFile: memoryBrokerImportFile,
                 memoryBrokerImportReceiptFile: memoryBrokerImportReceiptFile
@@ -1285,9 +1279,7 @@ final class ChatSession: ObservableObject, Identifiable {
         gitExtension: String? = nil,
         reloadExtension: String? = nil,
         webSearchExtension: String? = nil,
-        githubFetchPackage: String? = nil,
         arxivFetchPackage: String? = nil,
-        pdfExtractExtension: String? = nil,
         mcpExtension: String? = nil,
         skillLoaderExtension: String? = nil,
         planRuntimeExtension: String? = nil,
@@ -1306,9 +1298,7 @@ final class ChatSession: ObservableObject, Identifiable {
             git: gitExtension,
             reload: reloadExtension,
             webSearch: webSearchExtension,
-            githubFetchPackage: githubFetchPackage,
             arxivFetchPackage: arxivFetchPackage,
-            pdfExtract: pdfExtractExtension,
             mcp: mcpExtension,
             skillLoader: skillLoaderExtension,
             planRuntime: planRuntimeExtension,

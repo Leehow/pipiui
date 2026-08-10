@@ -503,7 +503,7 @@ final class SubagentContinuityTests: XCTestCase {
     /// routes are only mounted and named when the main session exported their usable path.
     func testWorkersInheritOnlyEnabledSpecialistRoutes() throws {
         let s = try source()
-        for env in ["PIPIUI_WEBSEARCH_EXT", "PIPIUI_PDF_EXT", "PIPIUI_PDF_HELPER", "PIPIUI_GITHUB_EXT", "PIPIUI_ARXIV_EXT"] {
+        for env in ["PIPIUI_WEB_ACCESS_EXT", "PIPIUI_ARXIV_EXT"] {
             XCTAssertTrue(s.contains("const \(env) = process.env.\(env);"), "worker must read \(env)")
         }
         XCTAssertTrue(s.contains("resolvePipiUIExtensionRouting({"))
@@ -514,22 +514,16 @@ final class SubagentContinuityTests: XCTestCase {
         let assembly = try String(
             contentsOf: root.appendingPathComponent("Sources/PipiUI/PipiSpawnAssembly.swift"),
             encoding: .utf8)
-        XCTAssertTrue(assembly.contains(#"env["PIPIUI_WEBSEARCH_EXT"] = p"#),
-                      "re-exported only inside the webSearch feature gate")
-        XCTAssertTrue(assembly.contains(#"env["PIPIUI_GITHUB_EXT"] = p"#),
-                      "GitHub package path is re-exported inside its independent feature gate")
+        XCTAssertTrue(assembly.contains(#"env["PIPIUI_WEB_ACCESS_EXT"] = p"#),
+                      "managed web-access path is re-exported inside the webSearch feature gate")
         XCTAssertTrue(assembly.contains(#"env["PIPIUI_ARXIV_EXT"] = p"#),
                       "arXiv package path must reach workers")
-        XCTAssertTrue(assembly.contains("pdfExtract: features.isEnabled(.pdfExtract)"),
-                      "PDF path must have its own built-in feature gate")
-        XCTAssertTrue(assembly.contains("if f.isEnabled(.pdfExtract), let pdf = input.paths.pdfExtract"),
-                      "PDF helper env must not ride the arXiv gate")
-        XCTAssertTrue(assembly.contains(#"env["PIPIUI_PDF_EXT"] = pdf"#),
-                      "PDF extension path must reach workers alongside its helper")
+        XCTAssertFalse(assembly.contains("PIPIUI_PDF"),
+                       "the retired custom PDF route must not be exported")
     }
 
     func testBuiltInAgentSpecialistToolMatrixIsExplicit() throws {
-        let specialist = Set(["web_search", "web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"])
+        let specialist = Set(["web_search", "fetch_content", "source_check", "get_search_content", "arxiv_fetch"])
         let expected: [String: Set<String>] = [
             "explore": specialist,
             "general-purpose": specialist.subtracting(Set(["web_search"])),

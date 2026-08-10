@@ -82,9 +82,7 @@ final class PlanExecutionIntegrationTests: XCTestCase {
                 features: features,
                 computerDescriptor: nil,
                 mainModelId: nil,
-                excludeToolsArgs: [],
-                webSearchConfigFile: "/tmp/websearch.json",
-                mcpConfigFile: "/tmp/mcp.json"
+                excludeToolsArgs: []
             )
         )
         XCTAssertTrue(
@@ -121,10 +119,7 @@ final class PlanExecutionIntegrationTests: XCTestCase {
                 features: disabled,
                 computerDescriptor: nil,
                 mainModelId: nil,
-                excludeToolsArgs: [],
-                webSearchConfigFile: "/tmp/websearch.json",
-                mcpConfigFile: "/tmp/mcp.json"
-            )
+                excludeToolsArgs: []            )
         )
         XCTAssertFalse(bare.args.contains(planPath), "philosophy-off must not mount plan runtime")
     }

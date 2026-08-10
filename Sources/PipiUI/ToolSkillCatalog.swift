@@ -27,9 +27,10 @@ enum ToolSkillCatalog {
         .init(name: "browser_*", group: "扩展", summary: "应用内 WebView 浏览器工具（browser）"),
         .init(name: "computer", group: "扩展", summary: "安全闸门控制的 macOS 屏幕与输入（默认关闭）"),
         .init(name: "git", group: "扩展", summary: "结构化 git status / diff / log / show"),
-        .init(name: "web_search", group: "扩展", summary: "联网搜索（Firecrawl 免 key）"),
-        .init(name: "web_fetch", group: "扩展", summary: "抓取网页正文文本（GitHub issue / PR / discussion / wiki / release）"),
-        .init(name: "github_fetch", group: "扩展", summary: "GitHub 仓库 / blob / tree 专用安全抓取"),
+        .init(name: "web_search", group: "扩展", summary: "pi-web-access 联网搜索（默认零配置 Exa）"),
+        .init(name: "fetch_content", group: "扩展", summary: "抓取 URL 正文；支持 GitHub clone、PDF 与网页内容提取"),
+        .init(name: "source_check", group: "扩展", summary: "核验搜索结果中的来源与引文"),
+        .init(name: "get_search_content", group: "扩展", summary: "读取 web_search / fetch_content 已保存的内容切片"),
     ]
 
     static var allTools: [ToolEntry] { builtinTools + extensionTools }

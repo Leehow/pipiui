@@ -96,7 +96,6 @@ test("v1 fixtures decode every live agent/plan kind and project the portable env
   assert.equal(environment.value.PIPIUI_SESSION_KEY, capabilities.bridge.sessionCapability, "legacy clients receive the same opaque capability alias");
   assert.equal(environment.value.PIPIUI_MAIN_CWD, capabilities.mainCwd);
   assert.equal(environment.value.PIPIUI_SUBAGENT_EXT, capabilities.extensions.subagent);
-  assert.equal(environment.value.PIPIUI_PDF_HELPER, capabilities.extensions.pdfHelper);
   assert.equal(environment.value.PIPIUI_SKILL_READ_BLOCK, "1");
   assert.equal(environment.value.PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE, capabilities.modelFiles.subagentModelCapabilitiesFile);
   assert.equal(environment.value.PIPIUI_COMPUTER_CAPABILITY, capabilities.platform.computer.routingCapability);
@@ -132,11 +131,9 @@ test("v1 fixtures decode every live agent/plan kind and project the portable env
   assert.equal(decodedSnapshot.value.jobs.find((job) => job.agentId === "closed-worker")?.closeoutDisposition, "cleaned");
 
   const absentOptionalCapabilities = structuredClone(capabilities);
-  delete absentOptionalCapabilities.extensions.pdfHelper;
   delete absentOptionalCapabilities.session.skillReadBlock;
   const absentEnvironment = buildSubagentEnvironmentV1(absentOptionalCapabilities);
   assert.equal(absentEnvironment.ok, true, JSON.stringify(absentEnvironment.diagnostics));
-  assert.equal("PIPIUI_PDF_HELPER" in absentEnvironment.value, false);
   assert.equal("PIPIUI_SKILL_READ_BLOCK" in absentEnvironment.value, false);
 
   const explicitSkillReadAllow = structuredClone(capabilities);
@@ -144,12 +141,6 @@ test("v1 fixtures decode every live agent/plan kind and project the portable env
   const allowEnvironment = buildSubagentEnvironmentV1(explicitSkillReadAllow);
   assert.equal(allowEnvironment.ok, true, JSON.stringify(allowEnvironment.diagnostics));
   assert.equal(allowEnvironment.value.PIPIUI_SKILL_READ_BLOCK, "0");
-
-  const invalidPdfHelper = structuredClone(capabilities);
-  invalidPdfHelper.extensions.pdfHelper = "relative-helper";
-  const invalidCapabilities = decodeHostCapabilitiesV1(invalidPdfHelper);
-  assert.equal(invalidCapabilities.ok, false);
-  assert.ok(invalidCapabilities.diagnostics.some((entry) => entry.path === "$.extensions.pdfHelper" && entry.code === "invalid_absolute_path"));
 });
 
 test("validators fail closed for required/dangerous fields and preserve ordinary unknown fields diagnostically", async () => {

@@ -14,8 +14,10 @@ import Foundation
 /// - 内置浏览器扩展。
 /// - App 自有 built-in skills 安装在 Application Support；不写入 `~/.pi/agent/skills`。
 ///
-/// 唯一的例外是工作哲学（`PhilosophyPackage`）：它注册进 `~/.pi/agent/settings.json`，
-/// 因为它是这里唯一「离开本 App 仍然成立」的东西——裸 TUI 也该吃到。
+/// MCP 的服务器镜像是例外：pi-mcp-extension 按其原生约定读取
+/// `~/.pi/agent/mcp.json`，但 npm 包本身仍不注册到用户的全局 pi 设置。
+/// 另一个例外是工作哲学（`PhilosophyPackage`）：它注册进
+/// `~/.pi/agent/settings.json`，因为它是离开本 App 仍然成立的东西——裸 TUI 也该吃到。
 enum PiPlugin {
     /// 安装结果：spawn pi 时需要的路径与环境变量。
     struct Installed {
@@ -24,11 +26,9 @@ enum PiPlugin {
         var mediaExtension: String?   // -e 对话内 generate_image
         var gitExtension: String?     // -e git_status / git_diff + prompt snapshot
         var reloadExtension: String?  // -e 内部 pipiui_reload 命令
-        var webSearchExtension: String? // -e web_search / web_fetch
-        var githubFetchPackage: String? // -e local Pi package: github_fetch
+        var webSearchExtension: String? // -e pi-web-access (web_search / fetch_content)
         var arxivFetchPackage: String? // -e local Pi package: arxiv_fetch
-        var pdfExtractExtension: String? // -e local pdf_extract helper bridge
-        var mcpExtension: String? // -e user-added MCP servers (stdio/http)
+        var mcpExtension: String? // -e pinned pi-mcp-extension entry point
         var skillLoaderExtension: String? // -e 技能按需加载（名字索引 + skill_search / skill_load）
         var planRuntimeExtension: String? // -e 主会话 plan_publish / plan_task_update
         var searchScopeExtension: String? // -e 项目内搜索边界 + 当轮外部路径授权
@@ -67,9 +67,14 @@ enum PiPlugin {
         if let saved = try? String(contentsOf: markerURL, encoding: .utf8),
            saved == fingerprint,
            let existing = installedIfComplete() {
-            return existing
+            var result = existing
+            result.webSearchExtension = WebAccessPackage.ensureInstalled()
+            result.mcpExtension = McpPackage.ensureInstalled()
+            return result
         }
-        let result = performInstall()
+        var result = performInstall()
+        result.webSearchExtension = WebAccessPackage.ensureInstalled()
+        result.mcpExtension = McpPackage.ensureInstalled()
         // The marker means "this fingerprint is installed". Writing it after a failed copy is
         // what turned a one-off error into a permanent one: the next launch matched the marker,
         // took the skip path, and adopted the stale tree as if it were current.
@@ -151,9 +156,7 @@ enum PiPlugin {
             guard fm.fileExists(atPath: sub), fm.fileExists(atPath: agents) else { return nil }
             result.subagentDir = sub
             result.agentsDir = agents
-            guard let githubFetch = GitHubFetchPackage.installedPath(in: dest),
-                  let arxivFetch = ArxivFetchPackage.installedPath(in: dest) else { return nil }
-            result.githubFetchPackage = githubFetch
+            guard let arxivFetch = ArxivFetchPackage.installedPath(in: dest) else { return nil }
             result.arxivFetchPackage = arxivFetch
         }
         // A shipped skill tree is part of the complete App-owned install. If it is
@@ -167,9 +170,6 @@ enum PiPlugin {
             ("pipiui-media.ts", \.mediaExtension),
             ("pipiui-git.ts", \.gitExtension),
             ("pipiui-reload.ts", \.reloadExtension),
-            ("pipiui-websearch.ts", \.webSearchExtension),
-            (PDFExtractExtension.fileName, \.pdfExtractExtension),
-            ("pipiui-mcp.ts", \.mcpExtension),
             ("pipiui-skillloader.ts", \.skillLoaderExtension),
             (PlanRuntimeExtension.fileName, \.planRuntimeExtension),
             ("pipiui-search-scope.ts", \.searchScopeExtension),
@@ -233,7 +233,6 @@ enum PiPlugin {
                 if fm.fileExists(atPath: agents.path) {
                     result.agentsDir = agents.path
                 }
-                result.githubFetchPackage = GitHubFetchPackage.installedPath(in: dest)
                 result.arxivFetchPackage = ArxivFetchPackage.installedPath(in: dest)
                 let computerStrategy = dest.appendingPathComponent(
                     ComputerUseStrategyResource.fileName
@@ -265,9 +264,6 @@ enum PiPlugin {
            fm.fileExists(atPath: bundledSub.path) {
             result.subagentDir = bundledSub.path
         }
-        if result.githubFetchPackage == nil, let bundledPiExt {
-            result.githubFetchPackage = GitHubFetchPackage.installedPath(in: bundledPiExt)
-        }
         if result.arxivFetchPackage == nil, let bundledPiExt {
             result.arxivFetchPackage = ArxivFetchPackage.installedPath(in: bundledPiExt)
         }
@@ -295,12 +291,11 @@ enum PiPlugin {
         // 5. 热重载扩展/skills/prompts/context（内部命令 pipiui_reload）
         result.reloadExtension = ReloadExtension.install(into: root)
 
-        // 5.5 通用网络搜索 + 网页抓取（web_search / web_fetch）
-        result.webSearchExtension = WebSearchExtension.install(into: root)
-        result.pdfExtractExtension = PDFExtractExtension.install(into: root)
-
-        // 5.55 用户自添 MCP 服务器（stdio / HTTP）→ 本地工具
-        result.mcpExtension = McpBridgeExtension.install(into: root)
+        // 5.5 pi-web-access is installed through ManagedNpmPackage in installAll.
+        // Remove the generated custom web extension left by older builds.
+        try? fm.removeItem(at: root.appendingPathComponent("pipiui-websearch.ts"))
+        // Remove the generated custom PDF agent extension left by older builds.
+        try? fm.removeItem(at: root.appendingPathComponent("pipiui-pdf-extract.ts"))
 
         // 5.6 技能按需加载：提示里只留名字，描述/正文走 skill_search / skill_load
         result.skillLoaderExtension = SkillLoaderExtension.install(into: root)

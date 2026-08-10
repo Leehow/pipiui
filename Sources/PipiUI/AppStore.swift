@@ -981,7 +981,7 @@ final class AppStore: ObservableObject {
         plugin = PiPlugin.installAll()
         SubagentModelSettings.syncJSONFile()
         ToolSkillSettings.syncJSONFile()
-        WebSearchSettings.syncJSONFile()
+        _ = McpServerSettings.syncJSONFile(servers: McpServerSettings.servers())
         // Seed the hot-read capability catalog before the first Boss turn when possible.
         // A live session and Settings reload both refresh it again from their authoritative
         // model-list responses. XCTest skips the subprocess entirely.
@@ -1315,9 +1315,7 @@ final class AppStore: ObservableObject {
             gitExtension: paths.git,
             reloadExtension: paths.reload,
             webSearchExtension: paths.webSearch,
-            githubFetchPackage: paths.githubFetchPackage,
             arxivFetchPackage: paths.arxivFetchPackage,
-            pdfExtractExtension: paths.pdfExtract,
             mcpExtension: paths.mcp,
             skillLoaderExtension: paths.skillLoader,
             // Main bridged plan tools — must not drop paths.planRuntime here.

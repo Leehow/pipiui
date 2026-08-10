@@ -43,7 +43,6 @@ import {
 	resolveSubagentToolSelection,
 	resolvePipiUIExtensionRouting,
 	selectPipiUIExtensionRoutes,
-	shouldMountMcpExtension,
 	resolveDesktopGrant,
 	DESKTOP_GRANT_CHILD_POLICY,
 	sanitizeDisabledToolNames,
@@ -427,21 +426,13 @@ const PIPIUI_SUBAGENT_EXT = process.env.PIPIUI_SUBAGENT_EXT;
 const PIPIUI_COMPUTER_EXT = process.env.PIPIUI_COMPUTER_EXT;
 // App-owned search guard; children load the same code and inherit the human-turn grant file.
 const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
-// Generic web_search / web_fetch. Provider-hosted search already reaches workers through pi's
-// own extension discovery, but only when the worker's model has a provider that ships it —
-// this is the fallback that makes research delegable no matter which model runs it.
-const PIPIUI_WEBSEARCH_EXT = process.env.PIPIUI_WEBSEARCH_EXT;
-// Local PDF bridge: both the generated extension path and signed helper are required before a
-// worker may expose pdf_extract. The helper env itself is inherited into the child process.
-const PIPIUI_PDF_EXT = process.env.PIPIUI_PDF_EXT;
-const PIPIUI_PDF_HELPER = process.env.PIPIUI_PDF_HELPER;
-// Local Pi package roots for specialized URL retrieval. Role allowlists still decide whether a
+// Managed pi-web-access supplies web_search, fetch_content, source_check, and
+// get_search_content. Provider-hosted search may also reach workers through pi's own
+// extension discovery; this pinned route makes research delegable for other providers.
+const PIPIUI_WEB_ACCESS_EXT = process.env.PIPIUI_WEB_ACCESS_EXT;
+// arXiv remains a specialized local Pi package. Role allowlists decide whether a
 // child may call each mounted package tool.
-const PIPIUI_GITHUB_EXT = process.env.PIPIUI_GITHUB_EXT;
 const PIPIUI_ARXIV_EXT = process.env.PIPIUI_ARXIV_EXT;
-// User-added MCP servers (stdio / HTTP). Re-exported so a dispatched worker also sees the
-// user's MCP tools; the hot-read config file is inherited through the child env too.
-const PIPIUI_MCP_EXT = process.env.PIPIUI_MCP_EXT;
 // Every dispatched subagent runs with the external skill library switched off: a worker
 // follows its own agent prompt plus the brief, never a skill SOP it discovered on its own.
 const PIPIUI_SUBAGENT_SKILL_ISOLATION = process.env.PIPIUI_SUBAGENT_SKILL_ISOLATION === "1";
@@ -809,8 +800,8 @@ function summarizeToolArgsForUI(toolName: string, args: Record<string, unknown>)
 		}
 		case "web_search":
 			return String(args.query || "…");
-		case "web_fetch":
-			return String(args.url || "…");
+		case "fetch_content":
+			return String(args.url || args.urls?.[0] || "…");
 		case "generate_image": {
 			const prompt = String(args.prompt || "…").trim();
 			return prompt.length > 80 ? `${prompt.slice(0, 80)}…` : prompt || "…";
@@ -3549,10 +3540,7 @@ async function runSingleAgent(
 	// extension/custom registrations too, so an absent feature path cannot leave a dead name in
 	// a role's allowlist. `web_search` stays independent because it may be provider-native.
 	const pipiuiExtensionRouting = resolvePipiUIExtensionRouting({
-		webSearchExtension: PIPIUI_WEBSEARCH_EXT,
-		pdfExtractExtension: PIPIUI_PDF_EXT,
-		pdfHelper: PIPIUI_PDF_HELPER,
-		githubExtension: PIPIUI_GITHUB_EXT,
+		webAccessExtension: PIPIUI_WEB_ACCESS_EXT,
 		arxivExtension: PIPIUI_ARXIV_EXT,
 	});
 	const toolSelection = resolveSubagentToolSelection({
@@ -3579,9 +3567,6 @@ async function runSingleAgent(
 	for (const route of selectPipiUIExtensionRoutes(pipiuiExtensionRouting, toolSelection)) {
 		args.push("-e", route.path);
 	}
-	// MCP is mounted only when the resolved policy can name at least one exact
-	// MCP tool. Standard packages cannot request an all-server wildcard.
-	if (PIPIUI_MCP_EXT && shouldMountMcpExtension(toolSelection)) args.push("-e", PIPIUI_MCP_EXT);
 	if (desktopGrant.granted && PIPIUI_COMPUTER_EXT) {
 		args.push("-e", PIPIUI_COMPUTER_EXT);
 	}

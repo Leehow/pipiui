@@ -15,14 +15,8 @@ enum PipiSpawnEnvironmentPolicy {
         "PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE",
         "PIPIUI_SESSION_KEY",
         "PIPIUI_SKILL_READ_BLOCK",
-        "PIPIUI_WEBSEARCH_CONFIG_FILE",
-        "PIPIUI_WEBSEARCH_EXT",
-        "PIPIUI_GITHUB_EXT",
+        "PIPIUI_WEB_ACCESS_EXT",
         "PIPIUI_ARXIV_EXT",
-        "PIPIUI_PDF_EXT",
-        "PIPIUI_PDF_HELPER",
-        "PIPIUI_MCP_CONFIG_FILE",
-        "PIPIUI_MCP_EXT",
         "PIPIUI_WORKTREE",
     ]
 
@@ -31,6 +25,10 @@ enum PipiSpawnEnvironmentPolicy {
         "PIPIUI_MEMORY_",
         "PIPIUI_COMPUTER_",
         "PIPIUI_SEARCH_",
+        // Retire the generated web and GitHub extension env names without
+        // letting stale parent/.env values resurrect an old package.
+        "PIPIUI_WEBSEARCH_",
+        "PIPIUI_GITHUB_",
         "PIPIUI_SUBAGENT_",
         "PIPIUI_WORKTREE_",
         // Hermes is main-session-only. Strip any stale inherited values rather
@@ -66,12 +64,10 @@ enum PipiSpawnAssembly {
         var media: String?
         var git: String?
         var reload: String?
+        /// Managed pi-web-access entry point (`web_search` / `fetch_content`).
         var webSearch: String?
-        /// Local Pi package root (`package.json` → github_fetch extension).
-        var githubFetchPackage: String? = nil
         /// Local Pi package root (`package.json` → arxiv_fetch extension).
         var arxivFetchPackage: String? = nil
-        var pdfExtract: String? = nil
         var mcp: String?
         var skillLoader: String?
         /// Main bridged session only; never exported to dispatched workers.
@@ -105,11 +101,8 @@ enum PipiSpawnAssembly {
                 git: features.isEnabled(.git) ? installed.gitExtension : nil,
                 reload: features.isEnabled(.reload) ? installed.reloadExtension : nil,
                 webSearch: features.isEnabled(.webSearch) ? installed.webSearchExtension : nil,
-                githubFetchPackage: features.isEnabled(.githubFetch)
-                    ? installed.githubFetchPackage : nil,
                 arxivFetchPackage: features.isEnabled(.arxivFetch)
                     ? installed.arxivFetchPackage : nil,
-                pdfExtract: features.isEnabled(.pdfExtract) ? installed.pdfExtractExtension : nil,
                 mcp: features.isEnabled(.mcp) ? installed.mcpExtension : nil,
                 skillLoader: features.isEnabled(.skillLoader) ? installed.skillLoaderExtension : nil,
                 // Structured plan feed rides with philosophy / automatic planning.
@@ -141,8 +134,6 @@ enum PipiSpawnAssembly {
         var computerDescriptor: ComputerCaptureDescriptor?
         var mainModelId: String?
         var excludeToolsArgs: [String]
-        var webSearchConfigFile: String
-        var mcpConfigFile: String
         /// App-owned, session-scoped state directory for package status/import receipts.
         var memoryBrokerStateDirectory: String? = nil
         var memoryBrokerImportFile: String? = nil
@@ -203,22 +194,12 @@ enum PipiSpawnAssembly {
         if f.isEnabled(.git), let p = input.paths.git { args += ["-e", p] }
         if f.isEnabled(.reload), let p = input.paths.reload { args += ["-e", p] }
 
-        // Web search: extension + its config-file env travel together.
+        // pi-web-access supplies web_search, fetch_content, GitHub clone, and PDF
+        // extraction. Re-export its resolved entry point so dispatched workers mount
+        // the same pinned package when their role allowlist selects a web tool.
         if f.isEnabled(.webSearch), let p = input.paths.webSearch {
             args += ["-e", p]
-            env["PIPIUI_WEBSEARCH_CONFIG_FILE"] = input.webSearchConfigFile
-            // Re-exported so dispatched workers can mount it too. Provider-hosted search
-            // already reaches them through pi's own extension discovery, but only for models
-            // whose provider ships it; this is the fallback that makes an `explore` worker
-            // able to search regardless of which model it happens to run on.
-            env["PIPIUI_WEBSEARCH_EXT"] = p
-        }
-
-        // GitHub repo/blob/tree retrieval is its own local Pi package, deliberately independent
-        // from generic web search/fetch. Re-export its package root so nested workers can mount it.
-        if f.isEnabled(.githubFetch), let p = input.paths.githubFetchPackage {
-            args += ["-e", p]
-            env["PIPIUI_GITHUB_EXT"] = p
+            env["PIPIUI_WEB_ACCESS_EXT"] = p
         }
 
         // arXiv owns specialized metadata/content routing. Its package path is re-exported
@@ -228,20 +209,10 @@ enum PipiSpawnAssembly {
             env["PIPIUI_ARXIV_EXT"] = p
         }
 
-        // Core local PDF reading has its own feature gate and signed helper. Export both so
-        // workers can mount the same usable route independently of arXiv availability.
-        if f.isEnabled(.pdfExtract), let pdf = input.paths.pdfExtract {
-            args += ["-e", pdf]
-            env["PIPIUI_PDF_EXT"] = pdf
-            env.merge(PDFExtractExtension.helperEnvironment()) { _, current in current }
-        }
-
-        // MCP: user-added servers + hot-read config env travel together. The extension is
-        // re-exported (`PIPIUI_MCP_EXT`) so dispatched workers can also use user MCP tools.
+        // MCP: pi-mcp-extension reads the standard ~/.pi/agent/mcp.json itself.
+        // It is mounted only in the main session; dispatched workers do not inherit it.
         if f.isEnabled(.mcp), let p = input.paths.mcp {
             args += ["-e", p]
-            env["PIPIUI_MCP_CONFIG_FILE"] = input.mcpConfigFile
-            env["PIPIUI_MCP_EXT"] = p
         }
 
         // Main session only: dispatched workers stay fully skill-free.

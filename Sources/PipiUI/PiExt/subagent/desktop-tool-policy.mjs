@@ -48,12 +48,6 @@ This dispatch explicitly authorized desktop steps (computer / open_application) 
 - Pack desktop actions: one batch must complete each coherent sequence (click → type → confirm). Single-action batches are the expensive round-trip anti-pattern; split only when the next step genuinely depends on seeing the previous result.`;
 
 const RESERVED_DESKTOP_TOOLS = new Set(RESERVED_DESKTOP_TOOL_NAMES);
-const MCP_TOOL_NAME = /^mcp_[A-Za-z0-9_-]+_[A-Za-z0-9_.-]+$/;
-
-/** Exact MCP names only: Pi's `--tools` has no safe server-prefix wildcard. */
-export function isExplicitMcpToolName(name) {
-	return typeof name === "string" && MCP_TOOL_NAME.test(name);
-}
 
 /** Remove generic denylist entries that must be controlled only by the global
  * Computer Use button. The returned names are unique and sorted. */
@@ -69,11 +63,11 @@ export function sanitizeDisabledToolNames(names) {
 
 // These tools exist only when PipiUI mounted the corresponding local extension.
 // `web_search` is deliberately absent: it may be provider-native (xAI / GLM /
-// Codex / Claude) even when PipiUI's generic web extension is off.
+// Codex / Claude) even when pi-web-access is off.
 export const PIPIUI_EXTENSION_ONLY_TOOL_NAMES = Object.freeze([
-	"web_fetch",
-	"pdf_extract",
-	"github_fetch",
+	"fetch_content",
+	"source_check",
+	"get_search_content",
 	"arxiv_fetch",
 ]);
 
@@ -83,44 +77,20 @@ function envPath(value) {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-/**
- * Resolve the usable PipiUI extension routes exported by the main process.
- * PDF needs both its extension path and signed local helper; package paths only
- * need their own non-empty `-e` path. The caller inherits the helper env itself.
- */
+/** Resolve the usable PipiUI extension routes exported by the main process. */
 export function resolvePipiUIExtensionRouting({
-	webSearchExtension,
-	pdfExtractExtension,
-	pdfHelper,
-	githubExtension,
+	webAccessExtension,
 	arxivExtension,
 } = {}) {
 	const routes = [];
-	const web = envPath(webSearchExtension);
-	const pdf = envPath(pdfExtractExtension);
-	const helper = envPath(pdfHelper);
-	const github = envPath(githubExtension);
+	const web = envPath(webAccessExtension);
 	const arxiv = envPath(arxivExtension);
 
 	if (web) {
 		routes.push({
 			path: web,
-			toolNames: ["web_search", "web_fetch"],
-			extensionOnlyToolNames: ["web_fetch"],
-		});
-	}
-	if (pdf && helper) {
-		routes.push({
-			path: pdf,
-			toolNames: ["pdf_extract"],
-			extensionOnlyToolNames: ["pdf_extract"],
-		});
-	}
-	if (github) {
-		routes.push({
-			path: github,
-			toolNames: ["github_fetch"],
-			extensionOnlyToolNames: ["github_fetch"],
+			toolNames: ["web_search", "fetch_content", "source_check", "get_search_content"],
+			extensionOnlyToolNames: ["fetch_content", "source_check", "get_search_content"],
 		});
 	}
 	if (arxiv) {
@@ -148,16 +118,6 @@ export function toolSelectionAllows(selection, name) {
 	if (selection.flag === "--tools") return names.has(name);
 	if (selection.flag === "--exclude-tools") return !names.has(name);
 	return false;
-}
-
-/** Whether a selected policy can expose any explicitly named MCP tool. */
-export function shouldMountMcpExtension(selection) {
-	if (!selection || selection.flag === "--no-tools") return false;
-	// Legacy unconstrained policies retain their historical MCP behavior. A v1
-	// package always compiles to --tools and therefore mounts only for an exact
-	// selected MCP name.
-	if (selection.flag === "--exclude-tools") return true;
-	return Array.isArray(selection.names) && selection.names.some(isExplicitMcpToolName);
 }
 
 export function selectPipiUIExtensionRoutes(routing, selection) {

@@ -86,7 +86,7 @@ test("tool allowlist: desktop tools injected only when the host gate passed", ()
   // or global state says. A plain coding worker cannot call computer at all.
   const noGrant = resolveSubagentToolSelection({
     declaredTools: ["read", "bash"],
-    disabledTools: ["web_fetch"],
+    disabledTools: ["fetch_content"],
     hasDesktopCapability: false,
     allowRecursiveDelegation: true,
   });

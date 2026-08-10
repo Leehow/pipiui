@@ -250,8 +250,6 @@ final class MemoryBrokerPackageTests: XCTestCase {
             computerDescriptor: nil,
             mainModelId: nil,
             excludeToolsArgs: [],
-            webSearchConfigFile: "/web.json",
-            mcpConfigFile: "/mcp.json",
             memoryBrokerStateDirectory: "/state",
             memoryBrokerImportFile: "/import.jsonl",
             memoryBrokerImportReceiptFile: "/receipt.json"

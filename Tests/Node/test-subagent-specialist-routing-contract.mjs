@@ -25,16 +25,13 @@ const piNodeModules = join(piPackageRoot, "node_modules");
 
 const SPECIALIST = new Set([
   "web_search",
-  "web_fetch",
-  "pdf_extract",
-  "github_fetch",
+  "fetch_content",
+  "source_check",
+  "get_search_content",
   "arxiv_fetch",
 ]);
 const EXTENSIONS = Object.freeze({
-  web: "/fixture/web.ts",
-  pdf: "/fixture/pdf.ts",
-  helper: "/fixture/pipiui-pdf-helper",
-  github: "/fixture/packages/github-fetch",
+  web: "/fixture/web-access.ts",
   arxiv: "/fixture/packages/arxiv-fetch",
 });
 
@@ -64,10 +61,7 @@ function routePaths(routing, selection) {
 
 function fixtureRouting(overrides = {}) {
   return resolvePipiUIExtensionRouting({
-    webSearchExtension: EXTENSIONS.web,
-    pdfExtractExtension: EXTENSIONS.pdf,
-    pdfHelper: EXTENSIONS.helper,
-    githubExtension: EXTENSIONS.github,
+    webAccessExtension: EXTENSIONS.web,
     arxivExtension: EXTENSIONS.arxiv,
     ...overrides,
   });
@@ -127,10 +121,7 @@ import path from "node:path";
 
 if (process.argv.includes("--mode")) {
   const keep = [
-    "PIPIUI_WEBSEARCH_EXT",
-    "PIPIUI_PDF_EXT",
-    "PIPIUI_PDF_HELPER",
-    "PIPIUI_GITHUB_EXT",
+    "PIPIUI_WEB_ACCESS_EXT",
     "PIPIUI_ARXIV_EXT",
   ];
   const env = Object.fromEntries(keep.map((key) => [key, process.env[key] ?? null]));
@@ -222,13 +213,9 @@ async function runRuntimeHarness(directory, fixture, { specialistEnv = {}, probe
         PIPIUI_SESSION_KEY: "",
         PIPIUI_SUBAGENT_EXT: "",
         PIPIUI_SEARCH_SCOPE_EXT: "",
-        PIPIUI_MCP_EXT: "",
         PIPIUI_COMPUTER_EXT: "",
         PIPIUI_COMPUTER_CAPABILITY: "",
-        PIPIUI_WEBSEARCH_EXT: EXTENSIONS.web,
-        PIPIUI_PDF_EXT: EXTENSIONS.pdf,
-        PIPIUI_PDF_HELPER: EXTENSIONS.helper,
-        PIPIUI_GITHUB_EXT: EXTENSIONS.github,
+        PIPIUI_WEB_ACCESS_EXT: EXTENSIONS.web,
         PIPIUI_ARXIV_EXT: EXTENSIONS.arxiv,
         PIPIUI_ROUTING_PROBE: probe ? "1" : "",
         PIPIUI_CAPTURE_FILE: fixture.capture,
@@ -271,18 +258,17 @@ function extensionPaths(record) {
 
 test("policy resolves the role matrix and only names mounted PipiUI specialist tools", async () => {
   assert.deepEqual(PIPIUI_EXTENSION_ONLY_TOOL_NAMES, [
-    "web_fetch",
-    "pdf_extract",
-    "github_fetch",
+    "fetch_content",
+    "source_check",
+    "get_search_content",
     "arxiv_fetch",
   ]);
   const assembly = await readFile(
     join(repositoryRoot, "Sources/PipiUI/PipiSpawnAssembly.swift"),
     "utf8",
   );
-  assert.match(assembly, /pdfExtract: features\.isEnabled\(\.pdfExtract\)/);
   assert.match(assembly, /if f\.isEnabled\(\.arxivFetch\), let p = input\.paths\.arxivFetchPackage/);
-  assert.match(assembly, /if f\.isEnabled\(\.pdfExtract\), let pdf = input\.paths\.pdfExtract/);
+  assert.doesNotMatch(assembly, /PIPIUI_PDF/);
 
   const sources = await Promise.all(
     ["explore", "general-purpose", "plan", "reviewer", "operator", "secretary", "long-test"].map(
@@ -291,19 +277,17 @@ test("policy resolves the role matrix and only names mounted PipiUI specialist t
   );
   const agents = new Map(sources);
   const all = fixtureRouting();
-  assert.deepEqual(all.extensionOnlyTools, ["web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"]);
+  assert.deepEqual(all.extensionOnlyTools, ["fetch_content", "source_check", "get_search_content", "arxiv_fetch"]);
   assert.deepEqual(all.routes.map((route) => route.path), [
     EXTENSIONS.web,
-    EXTENSIONS.pdf,
-    EXTENSIONS.github,
     EXTENSIONS.arxiv,
   ]);
 
   const expected = new Map([
-    ["explore", new Set(["web_search", "web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"])],
-    ["general-purpose", new Set(["web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"])],
-    ["plan", new Set(["web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"])],
-    ["reviewer", new Set(["web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"])],
+    ["explore", new Set(["web_search", "fetch_content", "source_check", "get_search_content", "arxiv_fetch"])],
+    ["general-purpose", new Set(["fetch_content", "source_check", "get_search_content", "arxiv_fetch"])],
+    ["plan", new Set(["fetch_content", "source_check", "get_search_content", "arxiv_fetch"])],
+    ["reviewer", new Set(["fetch_content", "source_check", "get_search_content", "arxiv_fetch"])],
     ["operator", new Set()],
     ["secretary", new Set()],
     ["long-test", new Set()],
@@ -317,37 +301,19 @@ test("policy resolves the role matrix and only names mounted PipiUI specialist t
   const cases = [
     {
       name: "web only",
-      options: { pdfExtractExtension: "", pdfHelper: "", githubExtension: "", arxivExtension: "" },
+      options: { arxivExtension: "" },
       paths: [EXTENSIONS.web],
-      extensionOnly: ["web_fetch"],
-    },
-    {
-      name: "pdf only",
-      options: { webSearchExtension: "", githubExtension: "", arxivExtension: "" },
-      paths: [EXTENSIONS.pdf],
-      extensionOnly: ["pdf_extract"],
-    },
-    {
-      name: "github only",
-      options: { webSearchExtension: "", pdfExtractExtension: "", pdfHelper: "", arxivExtension: "" },
-      paths: [EXTENSIONS.github],
-      extensionOnly: ["github_fetch"],
+      extensionOnly: ["fetch_content", "source_check", "get_search_content"],
     },
     {
       name: "arxiv only",
-      options: { webSearchExtension: "", pdfExtractExtension: "", pdfHelper: "", githubExtension: "" },
+      options: { webAccessExtension: "" },
       paths: [EXTENSIONS.arxiv],
       extensionOnly: ["arxiv_fetch"],
     },
     {
-      name: "pdf helper absent",
-      options: { webSearchExtension: "", pdfHelper: "", githubExtension: "", arxivExtension: "" },
-      paths: [],
-      extensionOnly: [],
-    },
-    {
       name: "all off",
-      options: { webSearchExtension: "", pdfExtractExtension: "", pdfHelper: "", githubExtension: "", arxivExtension: "" },
+      options: { webAccessExtension: "", arxivExtension: "" },
       paths: [],
       extensionOnly: [],
     },
@@ -374,19 +340,14 @@ test("worker spawn -e paths and --tools stay consistent for every exported route
   try {
     const fixture = await prepareRuntimeHarness(directory);
     const allOff = {
-      PIPIUI_WEBSEARCH_EXT: "",
-      PIPIUI_PDF_EXT: "",
-      PIPIUI_PDF_HELPER: "",
-      PIPIUI_GITHUB_EXT: "",
+      PIPIUI_WEB_ACCESS_EXT: "",
       PIPIUI_ARXIV_EXT: "",
     };
+    const webTools = ["fetch_content", "source_check", "get_search_content"];
     const cases = [
-      { name: "all enabled", env: {}, paths: [EXTENSIONS.web, EXTENSIONS.pdf, EXTENSIONS.github, EXTENSIONS.arxiv], tools: ["web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"] },
-      { name: "web only", env: { ...allOff, PIPIUI_WEBSEARCH_EXT: EXTENSIONS.web }, paths: [EXTENSIONS.web], tools: ["web_fetch"] },
-      { name: "pdf only", env: { ...allOff, PIPIUI_PDF_EXT: EXTENSIONS.pdf, PIPIUI_PDF_HELPER: EXTENSIONS.helper }, paths: [EXTENSIONS.pdf], tools: ["pdf_extract"] },
-      { name: "github only", env: { ...allOff, PIPIUI_GITHUB_EXT: EXTENSIONS.github }, paths: [EXTENSIONS.github], tools: ["github_fetch"] },
+      { name: "all enabled", env: {}, paths: [EXTENSIONS.web, EXTENSIONS.arxiv], tools: [...webTools, "arxiv_fetch"] },
+      { name: "web only", env: { ...allOff, PIPIUI_WEB_ACCESS_EXT: EXTENSIONS.web }, paths: [EXTENSIONS.web], tools: webTools },
       { name: "arxiv only", env: { ...allOff, PIPIUI_ARXIV_EXT: EXTENSIONS.arxiv }, paths: [EXTENSIONS.arxiv], tools: ["arxiv_fetch"] },
-      { name: "pdf helper off", env: { ...allOff, PIPIUI_PDF_EXT: EXTENSIONS.pdf }, paths: [], tools: [] },
       { name: "all disabled", env: allOff, paths: [], tools: [] },
     ];
 
@@ -418,14 +379,14 @@ test("actual worker spawns keep specialist routes across read-only, worktree, di
     const fixture = await prepareRuntimeHarness(directory);
     const { summary, captures } = await runRuntimeHarness(directory, fixture);
     const byLabel = captureMap(captures);
-    const routeSet = new Set([EXTENSIONS.web, EXTENSIONS.pdf, EXTENSIONS.github, EXTENSIONS.arxiv]);
+    const routeSet = new Set([EXTENSIONS.web, EXTENSIONS.arxiv]);
     const expectedByLabel = new Map([
-      ["capture:explore-readonly-explicit", new Set(["web_search", "web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"])],
-      ["capture:general-worktree", new Set(["web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"])],
-      ["capture:general-direct", new Set(["web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"])],
-      ["capture:general-resume-explicit", new Set(["web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"])],
-      ["capture:plan", new Set(["web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"])],
-      ["capture:reviewer", new Set(["web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"])],
+      ["capture:explore-readonly-explicit", new Set(["web_search", "fetch_content", "source_check", "get_search_content", "arxiv_fetch"])],
+      ["capture:general-worktree", new Set(["fetch_content", "source_check", "get_search_content", "arxiv_fetch"])],
+      ["capture:general-direct", new Set(["fetch_content", "source_check", "get_search_content", "arxiv_fetch"])],
+      ["capture:general-resume-explicit", new Set(["fetch_content", "source_check", "get_search_content", "arxiv_fetch"])],
+      ["capture:plan", new Set(["fetch_content", "source_check", "get_search_content", "arxiv_fetch"])],
+      ["capture:reviewer", new Set(["fetch_content", "source_check", "get_search_content", "arxiv_fetch"])],
       ["capture:operator", new Set()],
       ["capture:secretary", new Set()],
       ["capture:long-test", new Set()],
@@ -439,10 +400,7 @@ test("actual worker spawns keep specialist routes across read-only, worktree, di
       assert.deepEqual(specialistTools([...tools]), expected, `${label}: --tools matrix`);
       const paths = extensionPaths(record);
       assert.deepEqual(new Set(paths), expected.size === 0 ? new Set() : routeSet, `${label}: -e matches allowlist`);
-      assert.equal(record.env.PIPIUI_WEBSEARCH_EXT, EXTENSIONS.web, `${label}: inherit web env`);
-      assert.equal(record.env.PIPIUI_PDF_EXT, EXTENSIONS.pdf, `${label}: inherit pdf extension env`);
-      assert.equal(record.env.PIPIUI_PDF_HELPER, EXTENSIONS.helper, `${label}: inherit pdf helper env`);
-      assert.equal(record.env.PIPIUI_GITHUB_EXT, EXTENSIONS.github, `${label}: inherit github env`);
+      assert.equal(record.env.PIPIUI_WEB_ACCESS_EXT, EXTENSIONS.web, `${label}: inherit web env`);
       assert.equal(record.env.PIPIUI_ARXIV_EXT, EXTENSIONS.arxiv, `${label}: inherit arxiv env`);
     }
 

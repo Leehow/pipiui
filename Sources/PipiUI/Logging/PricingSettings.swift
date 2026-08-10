@@ -14,7 +14,7 @@ enum PriceUnit: String, CaseIterable {
     }
 }
 
-/// UserDefaults-backed display-price settings (mirrors `WebSearchSettings`).
+/// UserDefaults-backed display-price settings.
 enum PricingSettings {
     static let unitKey = "pipiui.pricing.unit"
     static let usdToCnyKey = "pipiui.pricing.usdToCny"

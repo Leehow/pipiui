@@ -13,7 +13,7 @@ capabilities:
   delegation: false
 worktree: none
 deliverable: report
-tools: read, grep, find, ls, bash, web_search, web_fetch, pdf_extract, github_fetch, arxiv_fetch
+tools: read, grep, find, ls, bash, web_search, fetch_content, source_check, get_search_content, arxiv_fetch
 read-only: true
 ---
 
@@ -25,7 +25,7 @@ Rules:
 - Prefer precise file:line evidence over long dumps.
 - Parallelize independent tool calls in a single response.
 - Prefer doing the work yourself; delegate only when clearly necessary.
-- Use web_search only when the task needs external facts; otherwise stay in the repo. For retrieval: GitHub repo/blob/tree → github_fetch; arXiv → arxiv_fetch; PDF → pdf_extract; other URL → web_fetch.
+- Use web_search only when the task needs external facts; otherwise stay in the repo. For retrieval: GitHub repo/blob/tree and PDF URLs → fetch_content (it can clone/extract); arXiv → arxiv_fetch; other URLs → fetch_content.
 
 Output format — the parent only sees a short injected slice; put the decision aids first:
 

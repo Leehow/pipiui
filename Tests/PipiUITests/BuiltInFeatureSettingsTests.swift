@@ -15,19 +15,22 @@ final class BuiltInFeatureSettingsTests: XCTestCase {
         XCTAssertFalse(set.allDisabled)
     }
 
-    func testPDFExtractDefaultsOnAndIsIndependentFromExistingArxivPreference() throws {
+    func testRetiredPDFExtractIDRemainsCompatibleWithExistingArxivPreference() throws {
         let upgraded = BuiltInFeatureSettings.EnabledSet(
             disabledIDs: [BuiltInFeatureSettings.FeatureID.arxivFetch.rawValue]
         )
         XCTAssertFalse(upgraded.isEnabled(.arxivFetch))
         XCTAssertTrue(upgraded.isEnabled(.pdfExtract),
-                      "a pre-existing arXiv-off preference must not disable core local PDF reading")
+                      "a pre-existing arXiv-off preference must not alter the retained PDF preference")
 
         let entry = try XCTUnwrap(
             BuiltInFeatureSettings.catalog.first { $0.id == .pdfExtract }
         )
-        XCTAssertEqual(entry.title, "本地 PDF 读取")
-        XCTAssertEqual(entry.summary, "本地PDF读取：文本层优先，必要时Vision OCR，无云上传。")
+        XCTAssertEqual(entry.title, "PDF agent 读取（已迁移）")
+        XCTAssertEqual(
+            entry.summary,
+            "PipiUI 已移除自研 PDF agent 工具；联网 PDF 由 pi-web-access 的 fetch_content 提供。拖入 composer 的本地 PDF 入库不受影响。"
+        )
     }
 
     func testEnableDisablePersists() {

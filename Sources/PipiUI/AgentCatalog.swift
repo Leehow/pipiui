@@ -27,28 +27,28 @@ enum AgentCatalog {
         .init(
             name: "explore",
             description: "Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files.",
-            tools: ["read", "grep", "find", "ls", "bash", "web_search", "web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"],
+            tools: ["read", "grep", "find", "ls", "bash", "web_search", "fetch_content", "source_check", "get_search_content", "arxiv_fetch"],
             frontmatterModel: "xai/grok-4.5:high",
             filePath: ""
         ),
         .init(
             name: "plan",
             description: "Grok-style planning agent. Explores and produces an implementation plan; does not edit files.",
-            tools: ["read", "grep", "find", "ls", "bash", "web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"],
+            tools: ["read", "grep", "find", "ls", "bash", "fetch_content", "source_check", "get_search_content", "arxiv_fetch"],
             frontmatterModel: "xai/grok-4.5:high",
             filePath: ""
         ),
         .init(
             name: "general-purpose",
             description: "Grok-style full-capability worker. Implements tasks in an isolated context.",
-            tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"],
+            tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "fetch_content", "source_check", "get_search_content", "arxiv_fetch"],
             frontmatterModel: "xai/grok-4.5:high",
             filePath: ""
         ),
         .init(
             name: "reviewer",
             description: "Read-only code review specialist for quality and security.",
-            tools: ["read", "grep", "find", "ls", "bash", "web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"],
+            tools: ["read", "grep", "find", "ls", "bash", "fetch_content", "source_check", "get_search_content", "arxiv_fetch"],
             frontmatterModel: "xai/grok-4.5:high",
             filePath: ""
         ),

@@ -246,7 +246,6 @@ async function runHarness(directory, fixture) {
       PIPIUI_SESSION_KEY: "",
       PIPIUI_SUBAGENT_EXT: "",
       PIPIUI_SEARCH_SCOPE_EXT: "",
-      PIPIUI_MCP_EXT: "",
       PIPIUI_COMPUTER_EXT: "",
       PIPIUI_COMPUTER_CAPABILITY: "",
     },

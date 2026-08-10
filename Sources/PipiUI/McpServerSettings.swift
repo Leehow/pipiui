@@ -7,18 +7,11 @@ enum McpTransport: String, Codable, CaseIterable, Sendable {
 }
 
 /// A single user-defined MCP server. Persisted in UserDefaults (canonical store) and
-/// mirrored to `mcp-servers.json` for hot-read by the embedded TS bridge extension.
+/// mirrored to pi-mcp-extension's standard `~/.pi/agent/mcp.json` config.
 ///
-/// JSON schema (written to the mirror file, keyed by name):
-/// ```json
-/// { "servers": { "<name>": { "enabled": true, "transport": "stdio",
-///   "command": "npx", "args": ["-y", "firecrawl-mcp"],
-///   "env": { "FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}" },
-///   "url": "https://...", "headers": { "Authorization": "Bearer ${X}" } } } }
-/// ```
-///
-/// Secrets are never stored in plaintext by the app: env/header values carry `${VAR}`
-/// references that the extension expands from `~/.pi/agent/.env` at runtime.
+/// The package accepts static env/header values only. PipiUI keeps `${VAR}` references
+/// in UserDefaults, expands them from the process environment and `~/.pi/agent/.env`
+/// when it writes the mirror, and restricts that mirror to mode 0600.
 struct McpServer: Codable, Equatable, Identifiable, Sendable {
     var name: String
     var enabled: Bool = true
@@ -34,14 +27,15 @@ struct McpServer: Codable, Equatable, Identifiable, Sendable {
 
 enum McpServerSettings {
     static let defaultsKey = "pipiui.mcpServers"
-    static let configFileName = "mcp-servers.json"
+    static let configFileName = "mcp.json"
 
     // MARK: - Paths
 
     static func configFileURL(fileManager: FileManager = .default) -> URL {
-        let dir = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("PipiUI", isDirectory: true)
-        return dir.appendingPathComponent(configFileName)
+        fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".pi", isDirectory: true)
+            .appendingPathComponent("agent", isDirectory: true)
+            .appendingPathComponent(configFileName, isDirectory: false)
     }
 
     // MARK: - Persistence (UserDefaults canonical + JSON mirror)
@@ -51,19 +45,26 @@ enum McpServerSettings {
         return (try? JSONDecoder().decode([McpServer].self, from: data)) ?? []
     }
 
-    /// Persist the server list and re-write the hot-read JSON mirror. A test suite
-    /// mirrors only to an explicit URL (never the user's shared file).
+    /// Persist the server list and re-write the pi-mcp-extension JSON mirror. A test
+    /// suite mirrors only to an explicit URL (never the user's shared file).
+    @discardableResult
     static func save(
         _ servers: [McpServer],
         defaults: UserDefaults = .standard,
         fileManager: FileManager = .default,
-        to explicitURL: URL? = nil
-    ) {
+        to explicitURL: URL? = nil,
+        variables: [String: String]? = nil
+    ) -> String? {
         let cleaned = servers.map { clean($0) }
         if let data = try? JSONEncoder().encode(cleaned) {
             defaults.set(data, forKey: defaultsKey)
         }
-        syncJSONFile(servers: cleaned, fileManager: fileManager, to: explicitURL)
+        return syncJSONFile(
+            servers: cleaned,
+            fileManager: fileManager,
+            to: explicitURL,
+            variables: variables
+        )
     }
 
     /// Trim leading/trailing whitespace on name/command/url so validation and the
@@ -76,49 +77,101 @@ enum McpServerSettings {
         return s
     }
 
-    /// JSON payload matching the documented schema (`servers` keyed by name).
-    static func jsonPayload(servers: [McpServer]) -> [String: Any] {
+    /// Map PipiUI's canonical model into pi-mcp-extension's `mcp.json` schema.
+    /// Enabled servers stay eager to preserve the old bridge's auto-connect behavior;
+    /// disabled servers are omitted so they cannot be started accidentally.
+    static func jsonPayload(
+        servers: [McpServer],
+        variables: [String: String]
+    ) throws -> [String: Any] {
         var entries: [String: Any] = [:]
-        for s in servers {
-            var d: [String: Any] = [
-                "enabled": s.enabled,
-                "transport": s.transport.rawValue,
-                "command": s.command,
-                "args": s.args,
-                "env": s.env,
-                "url": s.url,
-                "headers": s.headers,
-            ]
-            // Drop irrelevant transport fields to keep the file minimal.
-            switch s.transport {
+        for original in servers {
+            let server = clean(original)
+            guard server.enabled, !server.name.isEmpty else { continue }
+
+            var entry: [String: Any] = ["lifecycle": "eager"]
+            switch server.transport {
             case .stdio:
-                d["url"] = NSNull()
-                d["headers"] = NSNull()
+                entry["transport"] = McpTransport.stdio.rawValue
+                entry["command"] = server.command
+                if !server.args.isEmpty { entry["args"] = server.args }
+                if !server.env.isEmpty {
+                    entry["env"] = try interpolateRecord(server.env, variables: variables)
+                }
             case .http:
-                d["command"] = NSNull()
-                d["args"] = NSNull()
-                d["env"] = NSNull()
+                entry["transport"] = "streamable-http"
+                entry["url"] = server.url
+                if !server.headers.isEmpty {
+                    entry["headers"] = try interpolateRecord(server.headers, variables: variables)
+                }
             }
-            entries[s.name] = d
+            entries[server.name] = entry
         }
-        return ["servers": entries]
+        return [
+            "settings": ["toolPrefix": "mcp"],
+            "mcpServers": entries,
+        ]
     }
 
+    @discardableResult
     static func syncJSONFile(
         servers: [McpServer],
         fileManager: FileManager = .default,
-        to explicitURL: URL? = nil
-    ) {
-        guard SharedConfigWriteGuard.mayWriteSharedFile(explicitURL: explicitURL) else { return }
+        to explicitURL: URL? = nil,
+        variables: [String: String]? = nil
+    ) -> String? {
+        guard SharedConfigWriteGuard.mayWriteSharedFile(explicitURL: explicitURL) else { return nil }
         let url = explicitURL ?? configFileURL(fileManager: fileManager)
-        let dir = url.deletingLastPathComponent()
-        try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
-        guard let data = try? JSONSerialization.data(
-            withJSONObject: jsonPayload(servers: servers),
-            options: [.prettyPrinted, .sortedKeys]
-        ) else { return }
-        try? data.write(to: url, options: .atomic)
-        try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        do {
+            let payload = try jsonPayload(
+                servers: servers,
+                variables: variables ?? runtimeVariables()
+            )
+            let data = try JSONSerialization.data(
+                withJSONObject: payload,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+            try writeJSONSecurely(data, to: url, fileManager: fileManager)
+            return nil
+        } catch {
+            let message = error.localizedDescription
+            Log.warn("MCP config was not synced: \(message)", category: .storage)
+            return message
+        }
+    }
+
+    private static func runtimeVariables() -> [String: String] {
+        var variables = ProcessInfo.processInfo.environment
+        variables.merge(EnvFileStore().all()) { _, dotEnv in dotEnv }
+        return variables
+    }
+
+    private static func writeJSONSecurely(
+        _ data: Data,
+        to url: URL,
+        fileManager: FileManager
+    ) throws {
+        let directory = url.deletingLastPathComponent()
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let temporary = directory.appendingPathComponent(
+            ".\(url.lastPathComponent).tmp-\(UUID().uuidString)"
+        )
+        guard fileManager.createFile(
+            atPath: temporary.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        defer { try? fileManager.removeItem(at: temporary) }
+
+        if fileManager.fileExists(atPath: url.path) {
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            _ = try fileManager.replaceItemAt(url, withItemAt: temporary)
+        } else {
+            try fileManager.moveItem(at: temporary, to: url)
+        }
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
     // MARK: - Validation

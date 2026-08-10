@@ -7,15 +7,13 @@ let package = Package(
     products: [
         // Product name stays `PipiUI` so `swift run` / make-app keep familiar paths.
         .executable(name: "PipiUI", targets: ["PipiUIApp"]),
-        // Local macOS PDFKit/Vision worker embedded in Contents/Helpers by make-app.sh.
-        .executable(name: "pipiui-pdf-helper", targets: ["PipiUIPDFHelper"]),
     ],
     dependencies: [
         .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", from: "1.16.0"),
         .package(url: "https://github.com/swiftlang/swift-markdown.git", from: "0.8.0"),
     ],
     targets: [
-        // Reusable local PDF extraction/routing core shared by the app and helper.
+        // Reusable local PDF extraction/routing core used by composer ingestion.
         .target(
             name: "PipiPDFCore",
             path: "Sources/PipiPDFCore"
@@ -42,11 +40,6 @@ let package = Package(
             name: "PipiUIApp",
             dependencies: ["PipiUI"],
             path: "Sources/PipiUIApp"
-        ),
-        .executableTarget(
-            name: "PipiUIPDFHelper",
-            dependencies: ["PipiPDFCore"],
-            path: "Sources/PipiUIPDFHelper"
         ),
         .testTarget(
             name: "PipiUITests",

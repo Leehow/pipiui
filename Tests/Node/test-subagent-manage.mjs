@@ -53,7 +53,7 @@ deliverable: implementation
 tools:
   - read
   - write
-  - web_fetch
+  - fetch_content
   - mcp_safe_query
   - subagent`;
 
@@ -135,7 +135,7 @@ output.narrowedScaffold = await call({
   action: "scaffold", scope: "user", name: "narrowed", description: "Narrowed worker",
   mode: "worker", worktree: "isolated",
   capabilities: { filesystem: "workspace-write", shell: true, web: true, mcpTools: ["mcp_safe_query"], delegation: true },
-  tools: ["read", "web_fetch", "mcp_safe_query"],
+  tools: ["read", "fetch_content", "mcp_safe_query"],
 });
 const generatedDraft = output.scaffold.details.data.content;
 output.install = await call({ action: "install", scope: "user", name: "generated", draft: generatedDraft });
@@ -175,7 +175,6 @@ process.stdout.write(JSON.stringify(output));
       PIPIUI_SESSION_KEY: "",
       PIPIUI_SUBAGENT_EXT: "",
       PIPIUI_SEARCH_SCOPE_EXT: "",
-      PIPIUI_MCP_EXT: "",
       PIPIUI_COMPUTER_EXT: "",
       PIPIUI_COMPUTER_CAPABILITY: "",
     },
@@ -215,7 +214,7 @@ test("subagent_manage uses the real extension/parser for list, inspect, validate
     assert.equal(writer.mode, "worker");
     assert.equal(writer.worktree, "isolated");
     assert.equal(writer.deliverable, "implementation");
-    assert.deepEqual(writer.explicitTools, ["read", "write", "web_fetch", "mcp_safe_query", "subagent"]);
+    assert.deepEqual(writer.explicitTools, ["read", "write", "fetch_content", "mcp_safe_query", "subagent"]);
     assert.deepEqual(writer.permissionSummary.effectiveTools, writer.explicitTools);
     assert.ok(writer.permissionSummary.capabilityTools.includes("edit"));
     assert.ok(writer.permissionSummary.runtimeConstraints.some((line) => /disabled-tools/.test(line)));
@@ -247,9 +246,9 @@ test("subagent_manage uses the real extension/parser for list, inspect, validate
     assert.match(narrowed.data.content, /filesystem: workspace-write/);
     assert.match(narrowed.data.content, /shell: true/);
     assert.match(narrowed.data.content, /web: true/);
-    assert.match(narrowed.data.content, /- "read"\n  - "web_fetch"\n  - "mcp_safe_query"/);
-    assert.deepEqual(narrowed.data.agent.explicitTools, ["read", "web_fetch", "mcp_safe_query"]);
-    assert.deepEqual(narrowed.data.agent.permissionSummary.effectiveTools, ["read", "web_fetch", "mcp_safe_query"]);
+    assert.match(narrowed.data.content, /- "read"\n  - "fetch_content"\n  - "mcp_safe_query"/);
+    assert.deepEqual(narrowed.data.agent.explicitTools, ["read", "fetch_content", "mcp_safe_query"]);
+    assert.deepEqual(narrowed.data.agent.permissionSummary.effectiveTools, ["read", "fetch_content", "mcp_safe_query"]);
     assert.deepEqual(
       narrowed.data.agent.permissionSummary.effectiveTools,
       narrowed.data.agent.permissionSummary.capabilityTools.filter((tool) =>

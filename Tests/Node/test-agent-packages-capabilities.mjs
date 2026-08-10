@@ -7,7 +7,6 @@ import { pathToFileURL, fileURLToPath } from "node:url";
 
 import {
   resolveSubagentToolSelection,
-  shouldMountMcpExtension,
 } from "../../Sources/PipiUI/PiExt/subagent/desktop-tool-policy.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -64,7 +63,7 @@ deliverable: implementation
 tools:
   - read
   - write
-  - web_fetch
+  - fetch_content
   - mcp_safe_query
   - subagent`;
 
@@ -85,7 +84,7 @@ test("standard package parser compiles v1 capabilities and preserves legacy flat
     await writeLegacy(
       r.userDir,
       "legacy-reader",
-      "name: legacy-reader\ndescription: Existing flat agent\ntools: read, bash, web_fetch\nread-only: true\ndeliverable: report",
+      "name: legacy-reader\ndescription: Existing flat agent\ntools: read, bash, fetch_content\nread-only: true\ndeliverable: report",
     );
 
     const result = runtime.discoverAgentsFromRoots(r, "user");
@@ -98,7 +97,7 @@ test("standard package parser compiles v1 capabilities and preserves legacy flat
     assert.equal(writer.mode, "worker");
     assert.equal(writer.worktree, "isolated");
     assert.equal(writer.deliverable, "implementation");
-    assert.deepEqual(writer.tools, ["read", "write", "web_fetch", "mcp_safe_query", "subagent"]);
+    assert.deepEqual(writer.tools, ["read", "write", "fetch_content", "mcp_safe_query", "subagent"]);
     assert.deepEqual(writer.capabilities, {
       filesystem: "workspace-write",
       shell: true,
@@ -118,7 +117,7 @@ test("standard package parser compiles v1 capabilities and preserves legacy flat
     const legacy = result.agents.find((agent) => agent.name === "legacy-reader");
     assert.ok(legacy);
     assert.equal(legacy.schema, "legacy");
-    assert.deepEqual(legacy.tools, ["read", "bash", "web_fetch"]);
+    assert.deepEqual(legacy.tools, ["read", "bash", "fetch_content"]);
     assert.equal(legacy.capabilities.legacy, true);
     assert.equal(legacy.capabilities.desktop, "requestable", "flat legacy definitions retain desktop request compatibility");
     assert.equal(legacy.capabilities.delegation, true);
@@ -174,7 +173,7 @@ test("invalid schema/fields/duplicates fail closed with readable diagnostics", a
     await writePackage(r.userDir, "bad-schema", standardWriter.replace("schema: 1", "schema: 2").replaceAll("writer", "bad-schema"));
     await writePackage(r.userDir, "unknown-cap", standardWriter.replaceAll("writer", "unknown-cap").replace("  web: true", "  web: true\n  browser: true"));
     await writePackage(r.userDir, "bad-mcp", standardWriter.replaceAll("writer", "bad-mcp").replace("  mcp:\n    tools:\n      - mcp_safe_query", "  mcp: true"));
-    await writePackage(r.userDir, "browser-role", standardWriter.replaceAll("writer", "browser-role").replace("  - web_fetch", "  - browser"));
+    await writePackage(r.userDir, "browser-role", standardWriter.replaceAll("writer", "browser-role").replace("  - fetch_content", "  - browser"));
     await writeLegacy(r.userDir, "dupe", "name: dupe\ndescription: legacy duplicate\ntools: read");
     await writePackage(r.userDir, "dupe", standardWriter.replaceAll("writer", "dupe"));
 
@@ -202,30 +201,28 @@ test("explicit tools only intersect capabilities, global denylist still wins, an
     const agent = runtime.discoverAgentsFromRoots(r, "user").agents[0];
     const selection = resolveSubagentToolSelection({
       declaredTools: agent.tools,
-      disabledTools: ["write", "web_fetch", "mcp_safe_query"],
+      disabledTools: ["write", "fetch_content", "mcp_safe_query"],
       hasDesktopCapability: false,
       allowRecursiveDelegation: agent.capabilities.delegation,
-      availableExtensionTools: ["web_fetch"],
+      availableExtensionTools: ["fetch_content"],
     });
     assert.deepEqual(new Set(selection.names), new Set(["read", "subagent"]));
-    assert.equal(shouldMountMcpExtension(selection), false, "disabled exact MCP name cannot mount a broad MCP route");
 
     const allowed = resolveSubagentToolSelection({
       declaredTools: agent.tools,
       disabledTools: [],
       hasDesktopCapability: false,
       allowRecursiveDelegation: true,
-      availableExtensionTools: ["web_fetch"],
+      availableExtensionTools: ["fetch_content"],
     });
     assert.ok(allowed.names.includes("mcp_safe_query"));
-    assert.equal(shouldMountMcpExtension(allowed), true);
 
     const noDelegation = resolveSubagentToolSelection({
       declaredTools: agent.tools,
       disabledTools: [],
       hasDesktopCapability: false,
       allowRecursiveDelegation: false,
-      availableExtensionTools: ["web_fetch"],
+      availableExtensionTools: ["fetch_content"],
     });
     assert.equal(noDelegation.names.includes("subagent"), false, "runtime depth/trust denial outranks frontmatter");
   } finally {

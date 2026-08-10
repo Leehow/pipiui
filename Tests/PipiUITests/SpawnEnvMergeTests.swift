@@ -45,11 +45,8 @@ final class SpawnEnvMergeTests: XCTestCase {
             "PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE": "/old/subagent-model-capabilities.json",
             "PIPIUI_MEMORY_BROKER_ENABLED": "1",
             "PIPIUI_MEMORY_BROKER_CAPABILITY": "old-memory-token",
-            "PIPIUI_WEBSEARCH_CONFIG_FILE": "/old/websearch.json",
-            "PIPIUI_GITHUB_EXT": "/old/packages/github-fetch",
+            "PIPIUI_WEB_ACCESS_EXT": "/old/web-access.ts",
             "PIPIUI_ARXIV_EXT": "/old/packages/arxiv-fetch",
-            "PIPIUI_PDF_EXT": "/old/pdf-extract.ts",
-            "PIPIUI_PDF_HELPER": "/old/pipiui-pdf-helper",
             "PIPIUI_WORKTREE": "1",
         ]
         let disabled = BuiltInFeatureSettings.EnabledSet(
@@ -69,9 +66,7 @@ final class SpawnEnvMergeTests: XCTestCase {
                     git: "/p/git.ts",
                     reload: "/p/reload.ts",
                     webSearch: "/p/websearch.ts",
-                    githubFetchPackage: "/p/packages/github-fetch",
                     arxivFetchPackage: "/p/packages/arxiv-fetch",
-                    pdfExtract: "/p/pdf-extract.ts",
                     mcp: "/p/mcp.ts",
                     skillLoader: "/p/skills.ts",
                     searchScope: "/p/search.ts",
@@ -85,9 +80,7 @@ final class SpawnEnvMergeTests: XCTestCase {
                 features: disabled,
                 computerDescriptor: nil,
                 mainModelId: nil,
-                excludeToolsArgs: [],
-                webSearchConfigFile: "/p/websearch.json",
-                mcpConfigFile: "/p/mcp.json"
+                excludeToolsArgs: []
             )
         )
         var dotEnv = stale
@@ -129,10 +122,8 @@ final class SpawnEnvMergeTests: XCTestCase {
                     media: nil,
                     git: nil,
                     reload: nil,
-                    webSearch: nil,
-                    githubFetchPackage: "/current/packages/github-fetch",
+                    webSearch: "/current/web-access.ts",
                     arxivFetchPackage: "/current/packages/arxiv-fetch",
-                    pdfExtract: "/current/pdf-extract.ts",
                     mcp: nil,
                     skillLoader: nil,
                     searchScope: "/current/search.ts",
@@ -146,9 +137,7 @@ final class SpawnEnvMergeTests: XCTestCase {
                 features: .init(),
                 computerDescriptor: descriptor,
                 mainModelId: "current/model",
-                excludeToolsArgs: [],
-                webSearchConfigFile: "/current/websearch.json",
-                mcpConfigFile: "/current/mcp.json"
+                excludeToolsArgs: []
             )
         )
         let stale: [String: String] = [
@@ -157,10 +146,8 @@ final class SpawnEnvMergeTests: XCTestCase {
             "PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE": "/old/subagent-model-capabilities.json",
             "PIPIUI_MEMORY_BROKER_ENABLED": "0",
             "PIPIUI_MEMORY_BROKER_CAPABILITY": "old-memory-token",
-            "PIPIUI_GITHUB_EXT": "/old/packages/github-fetch",
+            "PIPIUI_WEB_ACCESS_EXT": "/old/web-access.ts",
             "PIPIUI_ARXIV_EXT": "/old/packages/arxiv-fetch",
-            "PIPIUI_PDF_EXT": "/old/pdf-extract.ts",
-            "PIPIUI_PDF_HELPER": "/old/pipiui-pdf-helper",
             "PIPIUI_COMPUTER_EXT": "/old/computer.ts",
             "PIPIUI_COMPUTER_CAPABILITY": "old-token",
         ]
@@ -177,10 +164,8 @@ final class SpawnEnvMergeTests: XCTestCase {
             final["PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE"],
             SubagentModelSettings.capabilityCatalogFileURL().path
         )
-        XCTAssertEqual(final["PIPIUI_GITHUB_EXT"], "/current/packages/github-fetch")
+        XCTAssertEqual(final["PIPIUI_WEB_ACCESS_EXT"], "/current/web-access.ts")
         XCTAssertEqual(final["PIPIUI_ARXIV_EXT"], "/current/packages/arxiv-fetch")
-        XCTAssertEqual(final["PIPIUI_PDF_EXT"], "/current/pdf-extract.ts")
-        XCTAssertNotEqual(final["PIPIUI_PDF_HELPER"], "/old/pipiui-pdf-helper")
         XCTAssertEqual(final["PIPIUI_COMPUTER_EXT"], "/current/computer.ts")
         XCTAssertEqual(final["PIPIUI_COMPUTER_CAPABILITY"], "current-computer-token")
     }

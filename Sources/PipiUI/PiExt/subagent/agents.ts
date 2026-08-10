@@ -458,7 +458,13 @@ function capabilityToolNames(capabilities: AgentCapabilities, trustedSecretary: 
 	if (capabilities.filesystem === "workspace-write") names.push("edit", "write");
 	if (capabilities.shell) names.push("bash");
 	if (capabilities.web) {
-		names.push("web_search", "web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch");
+		names.push(
+			"web_search",
+			"fetch_content",
+			"source_check",
+			"get_search_content",
+			"arxiv_fetch",
+		);
 	}
 	names.push(...capabilities.mcpTools);
 	if (capabilities.delegation) names.push("subagent");

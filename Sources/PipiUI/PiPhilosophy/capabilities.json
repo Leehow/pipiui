@@ -30,7 +30,7 @@
       "absent": "your model's own hosted search"
     },
     "fetch": {
-      "tool": "web_fetch",
+      "tool": "fetch_content",
       "required": false,
       "absent": "a fetch of the page"
     },

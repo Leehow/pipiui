@@ -13,7 +13,7 @@ capabilities:
   delegation: false
 worktree: none
 deliverable: report
-tools: read, grep, find, ls, bash, web_fetch, pdf_extract, github_fetch, arxiv_fetch
+tools: read, grep, find, ls, bash, fetch_content, source_check, get_search_content, arxiv_fetch
 read-only: true
 block-skill-reads: true
 ---
@@ -26,7 +26,7 @@ Rules:
   to save a plan to a path, ignore that part, return the plan inline, and say in `## Risks`
   that the file requirement was dropped because this role is read-only.
 - Bash is read-only (git diff/log/show, rg, etc.).
-- Delegate broad external discovery/search to explore; you do not have web_search. For a known URL: GitHub repo/blob/tree → github_fetch; arXiv → arxiv_fetch; PDF → pdf_extract; other URL → web_fetch.
+- Delegate broad external discovery/search to explore; you do not have web_search. For a known URL: GitHub repo/blob/tree and PDF URLs → fetch_content; arXiv → arxiv_fetch; other URLs → fetch_content.
 - Plans must be small, ordered, and executable by a general-purpose agent.
 - Size the plan to the change, not to a template: a few files means 3–8 steps. Do not
   restate the codebase, do not split one edit into "write the test / run the test / write

@@ -12,9 +12,7 @@ final class PipiSpawnAssemblyTests: XCTestCase {
             git: "/p/git.ts",
             reload: "/p/reload.ts",
             webSearch: "/p/websearch.ts",
-            githubFetchPackage: "/p/packages/github-fetch",
             arxivFetchPackage: "/p/packages/arxiv-fetch",
-            pdfExtract: "/p/pdf-extract.ts",
             mcp: "/p/mcp.ts",
             skillLoader: "/p/skills.ts",
             planRuntime: "/p/plan-runtime.ts",
@@ -44,9 +42,7 @@ final class PipiSpawnAssemblyTests: XCTestCase {
                 globalBounds: CGRect(x: 0, y: 0, width: 100, height: 100)
             ),
             mainModelId: "provider/model",
-            excludeToolsArgs: [],
-            webSearchConfigFile: "/p/websearch-config.json",
-            mcpConfigFile: "/p/mcp-config.json"
+            excludeToolsArgs: []
         )
     }
 
@@ -59,9 +55,7 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         installed.gitExtension = "/p/git.ts"
         installed.reloadExtension = "/p/reload.ts"
         installed.webSearchExtension = "/p/websearch.ts"
-        installed.githubFetchPackage = "/p/packages/github-fetch"
         installed.arxivFetchPackage = "/p/packages/arxiv-fetch"
-        installed.pdfExtractExtension = "/p/pdf-extract.ts"
         installed.mcpExtension = "/p/mcp.ts"
         installed.skillLoaderExtension = "/p/skills.ts"
         installed.planRuntimeExtension = "/p/plan-runtime.ts"
@@ -88,9 +82,7 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertNil(paths.git)
         XCTAssertNil(paths.reload)
         XCTAssertNil(paths.webSearch)
-        XCTAssertNil(paths.githubFetchPackage)
         XCTAssertNil(paths.arxivFetchPackage)
-        XCTAssertNil(paths.pdfExtract)
         XCTAssertNil(paths.mcp)
         XCTAssertNil(paths.skillLoader)
         // Plan runtime is gated with philosophy / automatic planning — bare pi drops it.
@@ -115,46 +107,37 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertEqual(paths.planRuntime, "/p/plan-runtime.ts")
     }
 
-    func testResolvedGitHubPackageIsIndependentFromWebSearch() {
+    func testRetiredGitHubPreferenceDoesNotSuppressWebAccess() {
         var installed = PiPlugin.Installed()
         installed.webSearchExtension = "/p/websearch.ts"
-        installed.githubFetchPackage = "/p/packages/github-fetch"
-        let features = BuiltInFeatureSettings.EnabledSet(
-            disabledIDs: [BuiltInFeatureSettings.FeatureID.webSearch.rawValue]
-        )
-
         let paths = PipiSpawnAssembly.Paths.resolved(
             installed: installed,
-            features: features,
+            features: .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.githubFetch.rawValue]),
             philosophyExtension: nil,
             computerUseExtension: nil
         )
-        XCTAssertNil(paths.webSearch)
-        XCTAssertEqual(paths.githubFetchPackage, "/p/packages/github-fetch")
+        XCTAssertEqual(paths.webSearch, "/p/websearch.ts")
     }
 
-    func testResolvedPDFExtractIsIndependentFromArxivFeature() {
+    func testRetiredPDFPreferenceDoesNotSuppressArxivFeature() {
         var installed = PiPlugin.Installed()
         installed.arxivFetchPackage = "/p/packages/arxiv-fetch"
-        installed.pdfExtractExtension = "/p/pdf-extract.ts"
 
-        let arxivDisabled = PipiSpawnAssembly.Paths.resolved(
+        let enabled = PipiSpawnAssembly.Paths.resolved(
             installed: installed,
-            features: .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.arxivFetch.rawValue]),
+            features: .init(),
             philosophyExtension: nil,
             computerUseExtension: nil
         )
-        XCTAssertNil(arxivDisabled.arxivFetchPackage)
-        XCTAssertEqual(arxivDisabled.pdfExtract, "/p/pdf-extract.ts")
-
-        let pdfDisabled = PipiSpawnAssembly.Paths.resolved(
+        let retiredPDFDisabled = PipiSpawnAssembly.Paths.resolved(
             installed: installed,
             features: .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.pdfExtract.rawValue]),
             philosophyExtension: nil,
             computerUseExtension: nil
         )
-        XCTAssertEqual(pdfDisabled.arxivFetchPackage, "/p/packages/arxiv-fetch")
-        XCTAssertNil(pdfDisabled.pdfExtract)
+
+        XCTAssertEqual(enabled.arxivFetchPackage, "/p/packages/arxiv-fetch")
+        XCTAssertEqual(retiredPDFDisabled.arxivFetchPackage, "/p/packages/arxiv-fetch")
     }
 
     func testLateSubagentConflictResultRequiresCurrentGenerationAndFeature() {
@@ -274,12 +257,10 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertTrue(out.args.contains("/p/searchscope.ts"))
         XCTAssertTrue(out.args.contains("/p/plan-runtime.ts"),
                       "main bridged session mounts plan runtime: \(out.args)")
-        XCTAssertTrue(out.args.contains("/p/packages/github-fetch"))
+        XCTAssertTrue(out.args.contains("/p/websearch.ts"))
         XCTAssertTrue(out.args.contains("/p/packages/arxiv-fetch"))
-        XCTAssertTrue(out.args.contains("/p/pdf-extract.ts"))
+        XCTAssertEqual(out.extraEnv["PIPIUI_WEB_ACCESS_EXT"], "/p/websearch.ts")
         XCTAssertEqual(out.extraEnv["PIPIUI_ARXIV_EXT"], "/p/packages/arxiv-fetch")
-        XCTAssertEqual(out.extraEnv["PIPIUI_PDF_EXT"], "/p/pdf-extract.ts")
-        XCTAssertNotNil(out.extraEnv["PIPIUI_PDF_HELPER"])
         XCTAssertNil(out.extraEnv["PIPIUI_PLAN_RUNTIME_EXT"],
                      "plan runtime must not be re-exported to workers")
         XCTAssertEqual(out.extraEnv["PIPIUI_SEARCH_SCOPE_EXT"], "/p/searchscope.ts")
@@ -290,10 +271,6 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertNotNil(out.extraEnv["PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE"])
         XCTAssertEqual(out.extraEnv["PIPIUI_MAIN_CWD"], "/proj")
         XCTAssertEqual(out.extraEnv["PIPIUI_MAIN_MODEL"], "provider/model")
-        XCTAssertEqual(out.extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"], "/p/websearch-config.json")
-        XCTAssertEqual(out.extraEnv["PIPIUI_GITHUB_EXT"], "/p/packages/github-fetch")
-        XCTAssertEqual(out.extraEnv["PIPIUI_MCP_CONFIG_FILE"], "/p/mcp-config.json")
-        XCTAssertEqual(out.extraEnv["PIPIUI_MCP_EXT"], "/p/mcp.ts")
         XCTAssertTrue(out.args.contains("/p/mcp.ts"))
         // Main session exports desktop env for nested hostAvailable / grant injection,
         // but never mounts the computer-use extension itself.
@@ -324,27 +301,24 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_HEIGHT"], "100")
     }
 
-    func testWebSearchDisabledKeepsGitHubPackageIndependent() {
+    func testWebSearchDisabledDropsManagedWebAccessRoute() {
         var input = allEnabledInput(paths: fullyPopulatedPaths())
         input.features = .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.webSearch.rawValue])
 
         let out = PipiSpawnAssembly.assemble(input)
         XCTAssertFalse(out.args.contains("/p/websearch.ts"))
-        XCTAssertNil(out.extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"])
-        XCTAssertNil(out.extraEnv["PIPIUI_WEBSEARCH_EXT"])
-        XCTAssertTrue(out.args.contains("/p/packages/github-fetch"))
-        XCTAssertEqual(out.extraEnv["PIPIUI_GITHUB_EXT"], "/p/packages/github-fetch")
+        XCTAssertNil(out.extraEnv["PIPIUI_WEB_ACCESS_EXT"])
     }
 
-    func testArxivAndPDFFeatureGatesAreIndependentAcrossAllCombinations() {
-        let cases: [(disabled: [String], arxiv: Bool, pdf: Bool)] = [
-            ([], true, true),
-            ([BuiltInFeatureSettings.FeatureID.arxivFetch.rawValue], false, true),
-            ([BuiltInFeatureSettings.FeatureID.pdfExtract.rawValue], true, false),
+    func testArxivFeatureGateIsIndependentFromRetiredPDFPreference() {
+        let cases: [(disabled: [String], arxiv: Bool)] = [
+            ([], true),
+            ([BuiltInFeatureSettings.FeatureID.arxivFetch.rawValue], false),
+            ([BuiltInFeatureSettings.FeatureID.pdfExtract.rawValue], true),
             ([
                 BuiltInFeatureSettings.FeatureID.arxivFetch.rawValue,
                 BuiltInFeatureSettings.FeatureID.pdfExtract.rawValue,
-            ], false, false),
+            ], false),
         ]
 
         for scenario in cases {
@@ -354,43 +328,24 @@ final class PipiSpawnAssemblyTests: XCTestCase {
 
             XCTAssertEqual(out.args.contains("/p/packages/arxiv-fetch"), scenario.arxiv)
             XCTAssertEqual(out.extraEnv["PIPIUI_ARXIV_EXT"] != nil, scenario.arxiv)
-            XCTAssertEqual(out.args.contains("/p/pdf-extract.ts"), scenario.pdf)
-            XCTAssertEqual(out.extraEnv["PIPIUI_PDF_EXT"] != nil, scenario.pdf)
-            XCTAssertEqual(out.extraEnv["PIPIUI_PDF_HELPER"] != nil, scenario.pdf)
         }
     }
 
-    func testPDFRouteRemainsUsableWhenArxivPackagePathIsAbsent() {
-        var paths = fullyPopulatedPaths()
-        paths.arxivFetchPackage = nil
-        let out = PipiSpawnAssembly.assemble(allEnabledInput(paths: paths))
-
-        XCTAssertFalse(out.args.contains("/p/packages/arxiv-fetch"))
-        XCTAssertNil(out.extraEnv["PIPIUI_ARXIV_EXT"])
-        XCTAssertTrue(out.args.contains("/p/pdf-extract.ts"))
-        XCTAssertEqual(out.extraEnv["PIPIUI_PDF_EXT"], "/p/pdf-extract.ts")
-        XCTAssertNotNil(out.extraEnv["PIPIUI_PDF_HELPER"])
-    }
-
-    func testGitHubFetchDisabledDropsPackageAndEnv() {
+    func testRetiredGitHubPreferenceKeepsManagedWebAccessRoute() {
         var input = allEnabledInput(paths: fullyPopulatedPaths())
         input.features = .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.githubFetch.rawValue])
 
         let out = PipiSpawnAssembly.assemble(input)
-        XCTAssertFalse(out.args.contains("/p/packages/github-fetch"))
-        XCTAssertNil(out.extraEnv["PIPIUI_GITHUB_EXT"])
-        XCTAssertTrue(out.args.contains("/p/websearch.ts"),
-                      "generic web core must stay independent from github_fetch")
+        XCTAssertTrue(out.args.contains("/p/websearch.ts"))
+        XCTAssertEqual(out.extraEnv["PIPIUI_WEB_ACCESS_EXT"], "/p/websearch.ts")
     }
 
-    func testMCPDisabledDropsExtensionAndEnv() {
+    func testMCPDisabledDropsExtension() {
         var input = allEnabledInput(paths: fullyPopulatedPaths())
         input.features = .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.mcp.rawValue])
 
         let out = PipiSpawnAssembly.assemble(input)
         XCTAssertFalse(out.args.contains("/p/mcp.ts"))
-        XCTAssertNil(out.extraEnv["PIPIUI_MCP_CONFIG_FILE"])
-        XCTAssertNil(out.extraEnv["PIPIUI_MCP_EXT"])
     }
 
     func testSearchScopeDisabledDropsEverything() {
@@ -456,12 +411,8 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertNil(out.extraEnv["PIPIUI_SUBAGENT_EXT"])
         XCTAssertNil(out.extraEnv["PIPIUI_AGENTS_DIR"])
         XCTAssertNil(out.extraEnv["PIPIUI_COMPUTER_EXT"])
-        XCTAssertNil(out.extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"])
-        XCTAssertNil(out.extraEnv["PIPIUI_GITHUB_EXT"])
+        XCTAssertNil(out.extraEnv["PIPIUI_WEB_ACCESS_EXT"])
         XCTAssertNil(out.extraEnv["PIPIUI_ARXIV_EXT"])
-        XCTAssertNil(out.extraEnv["PIPIUI_PDF_EXT"])
-        XCTAssertNil(out.extraEnv["PIPIUI_PDF_HELPER"])
-        XCTAssertNil(out.extraEnv["PIPIUI_MCP_CONFIG_FILE"])
         XCTAssertNil(out.extraEnv["PIPIUI_SUBAGENT_MODELS_FILE"])
         XCTAssertNil(out.extraEnv["PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE"])
         XCTAssertNil(out.extraEnv["PIPIUI_MAIN_CWD"])

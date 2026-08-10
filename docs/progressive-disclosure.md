@@ -20,7 +20,7 @@ media/git 的 prompt 块      757
 subagent + subagent_status  579
 browser_* ×5                517
 generate_image              433
-web_search + web_fetch      477
+web_search + fetch_content  477
 git_status + git_diff       368
 ```
 

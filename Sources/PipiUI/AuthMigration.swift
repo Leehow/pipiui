@@ -39,10 +39,16 @@ enum AuthMigration {
     /// Legacy UserDefaults key for per-backend search keys (pre-T19).
     static let legacyWebSearchKeysKey = "pipiui.webSearch.keys"
 
+    /// Retired generated-extension config, kept only for one-time key cleanup.
+    static var legacyWebSearchConfigURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("PipiUI/websearch-config.json")
+    }
+
     /// Injectable dependencies (tests point everything at temp locations).
     struct Options {
         var authURL: URL = PiAuthStore.defaultAuthURL()
-        var webSearchConfigURL: URL = WebSearchSettings.configFileURL()
+        var webSearchConfigURL: URL = AuthMigration.legacyWebSearchConfigURL
         var defaults: UserDefaults = .standard
         var envStore: EnvFileStore = EnvFileStore()
         var fileManager: FileManager = .default

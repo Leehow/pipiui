@@ -18,10 +18,6 @@
     "agentsDir": "/tmp/pipiui/PiExt/agents",
     "searchScope": "/tmp/pipiui/search-scope.ts",
     "webSearch": "/tmp/pipiui/web-search.ts",
-    "mcp": "/tmp/pipiui/mcp.ts",
-    "pdf": "/tmp/pipiui/pdf.ts",
-    "pdfHelper": "/tmp/pipiui/pipiui-pdf-helper",
-    "github": "/tmp/pipiui/github-fetch",
     "arxiv": "/tmp/pipiui/arxiv-fetch",
     "computer": "/tmp/pipiui/computer-use-strategy.ts"
   },
