@@ -20,9 +20,11 @@ const piPackageRoot = join(
 const piNodeModules = join(piPackageRoot, "node_modules");
 
 // Implementation A (subagent/index.ts): hardcoded AUTO_RESUME_MAX=2,
-// AUTO_RESUME_BACKOFF_MS=[5000, 15000]. No env knobs / [subagent-autoresume] notify.
+// AUTO_RESUME_BACKOFF_MS=[5000, 15000], jittered by up to -25%/+25%.
 const BACKOFF_FIRST_MS = 5_000;
 const BACKOFF_SECOND_MS = 15_000;
+const BACKOFF_JITTER_RATIO = 0.25;
+const MIN_BACKOFF_FACTOR = 1 - BACKOFF_JITTER_RATIO;
 
 async function linkRuntimePackages(directory) {
   const scoped = join(directory, "node_modules/@earendil-works");
@@ -205,9 +207,10 @@ test("retryable worker death auto-resumes once then succeeds", async () => {
     assert.ok(single, "details.results[0] present");
     assert.equal(single.exitCode, 0);
     assert.match(String(single.stderr ?? ""), /fetch failed/i);
+    const minFirstBackoff = BACKOFF_FIRST_MS * MIN_BACKOFF_FACTOR - 500;
     assert.ok(
-      out.elapsedMs >= BACKOFF_FIRST_MS - 500,
-      `expected ~${BACKOFF_FIRST_MS}ms first backoff, elapsed=${out.elapsedMs}`,
+      out.elapsedMs >= minFirstBackoff,
+      `expected >=${minFirstBackoff}ms jittered first backoff, elapsed=${out.elapsedMs}`,
     );
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -242,10 +245,10 @@ test("auto-resume caps at AUTO_RESUME_MAX=2 then fails with last retryable error
     const hits = stderr.match(/Service temporarily unavailable/gi) ?? [];
     assert.equal(hits.length, 3, "stderr should accumulate all three failed attempts");
 
-    const minBackoff = BACKOFF_FIRST_MS + BACKOFF_SECOND_MS - 1_000;
+    const minBackoff = (BACKOFF_FIRST_MS + BACKOFF_SECOND_MS) * MIN_BACKOFF_FACTOR - 500;
     assert.ok(
       out.elapsedMs >= minBackoff,
-      `expected ~${BACKOFF_FIRST_MS}+${BACKOFF_SECOND_MS}ms backoff, elapsed=${out.elapsedMs}`,
+      `expected >=${minBackoff}ms jittered backoff, elapsed=${out.elapsedMs}`,
     );
   } finally {
     await rm(directory, { recursive: true, force: true });

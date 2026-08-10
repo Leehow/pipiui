@@ -1,7 +1,6 @@
-import AppKit
 import CryptoKit
-import PDFKit
-import Vision
+import Foundation
+import PipiPDFCore
 
 /// Builds a local, page-addressable text bundle for a user-selected PDF.
 ///
@@ -24,17 +23,7 @@ enum NativePDFIngestion {
     /// critical section is serialized.
     private static let cacheWriteLock = NSLock()
 
-    enum ExtractionOrigin: String, Codable, Equatable {
-        case embeddedText = "embedded-text"
-        case visionOCR = "vision-ocr"
-
-        var displayName: String {
-            switch self {
-            case .embeddedText: return "PDF 内嵌文字"
-            case .visionOCR: return "本机 Vision OCR"
-            }
-        }
-    }
+    typealias ExtractionOrigin = PDFExtractionOrigin
 
     struct Page: Equatable {
         let number: Int
@@ -73,18 +62,10 @@ enum NativePDFIngestion {
         }
     }
 
-    struct OCRResult {
-        let text: String
-        let confidence: Float?
-
-        init(text: String, confidence: Float? = nil) {
-            self.text = text
-            self.confidence = confidence
-        }
-    }
+    typealias OCRResult = PDFOCRResult
 
     /// Injectable for deterministic tests and for future local recognizer tuning.
-    typealias OCRRecognizer = (CGImage) throws -> OCRResult
+    typealias OCRRecognizer = PDFOCRRecognizer
 
     struct Progress: Equatable {
         enum Phase: Equatable {
@@ -207,63 +188,47 @@ enum NativePDFIngestion {
             return cached
         }
 
-        guard let document = PDFDocument(url: snapshotURL) else {
-            throw IngestionError.invalidPDF
+        let extraction: PDFExtractionResult
+        do {
+            extraction = try PDFExtractionCore.extract(
+                sourceURL: snapshotURL,
+                options: PDFExtractionOptions(mode: .auto),
+                recognize: recognize,
+                progress: { completedPages, totalPages in
+                    progress?(Progress(
+                        phase: .extracting,
+                        completedPages: completedPages,
+                        totalPages: totalPages
+                    ))
+                }
+            )
+        } catch let error as PDFExtractionError {
+            // Preserve the attachment-ingestion errors that existing UI callers
+            // understand while allowing new core-only cancellation/timeout errors
+            // to propagate if this caller ever opts into those controls.
+            switch error {
+            case .invalidPDF:
+                throw IngestionError.invalidPDF
+            case .noPages:
+                throw IngestionError.noPages
+            case let .missingPage(number):
+                throw IngestionError.missingPage(number)
+            case let .cannotRenderPage(number):
+                throw IngestionError.cannotRenderPage(number)
+            case let .recognitionFailed(page, reason):
+                throw IngestionError.recognitionFailed(page: page, reason: reason)
+            default:
+                throw error
+            }
         }
-        let pageCount = document.pageCount
-        guard pageCount > 0 else { throw IngestionError.noPages }
-
-        let recognizer = recognize ?? recognizeWithVision
-        var extractedPages: [ExtractedPage] = []
-        extractedPages.reserveCapacity(pageCount)
-
-        for index in 0..<pageCount {
-            let pageNumber = index + 1
-            guard let page = document.page(at: index) else {
-                throw IngestionError.missingPage(pageNumber)
-            }
-
-            let embeddedText = normalizedText(page.string ?? "")
-            if isMeaningfulEmbeddedText(embeddedText) {
-                extractedPages.append(
-                    ExtractedPage(
-                        number: pageNumber,
-                        origin: .embeddedText,
-                        confidence: nil,
-                        text: embeddedText
-                    )
-                )
-            } else {
-                let image: CGImage
-                do {
-                    image = try render(page: page)
-                } catch {
-                    throw IngestionError.cannotRenderPage(pageNumber)
-                }
-
-                let recognized: OCRResult
-                do {
-                    recognized = try recognizer(image)
-                } catch {
-                    throw IngestionError.recognitionFailed(
-                        page: pageNumber,
-                        reason: error.localizedDescription
-                    )
-                }
-                extractedPages.append(
-                    ExtractedPage(
-                        number: pageNumber,
-                        origin: .visionOCR,
-                        confidence: recognized.confidence,
-                        text: normalizedText(recognized.text)
-                    )
-                )
-            }
-            progress?(Progress(
-                phase: .extracting,
-                completedPages: pageNumber,
-                totalPages: pageCount
-            ))
+        let pageCount = extraction.pageCount
+        let extractedPages = extraction.pages.map { page in
+            ExtractedPage(
+                number: page.number,
+                origin: page.origin,
+                confidence: page.confidence,
+                text: page.text
+            )
         }
 
         progress?(Progress(phase: .writing, completedPages: pageCount, totalPages: pageCount))
@@ -278,16 +243,10 @@ enum NativePDFIngestion {
         )
     }
 
-    /// A text layer consisting of only whitespace/punctuation or a single page
-    /// number should not suppress OCR. Short real headings such as `AI` or `第1`
-    /// remain usable PDF text and therefore do not need a lossy second pass.
+    /// Compatibility seam for existing attachment tests and callers. The reusable
+    /// core adds printable/garbled/header/short-page diagnostics to this decision.
     static func isMeaningfulEmbeddedText(_ text: String) -> Bool {
-        let scalars = text.unicodeScalars.filter { !$0.properties.isWhitespace }
-        guard !scalars.isEmpty else { return false }
-
-        let letterCount = scalars.filter { $0.properties.isAlphabetic }.count
-        let numberCount = scalars.filter { $0.properties.numericType != nil }.count
-        return letterCount >= 2 || (letterCount >= 1 && numberCount >= 1) || numberCount >= 6
+        PDFExtractionCore.isMeaningfulEmbeddedText(text)
     }
 
     // MARK: - Cache validation and writing
@@ -612,92 +571,4 @@ enum NativePDFIngestion {
         return snapshotURL
     }
 
-    private static func normalizedText(_ text: String) -> String {
-        text
-            .replacingOccurrences(of: "\u{00a0}", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// Render at roughly 288 DPI (or the largest safe dimension) before Vision
-    /// sees the page. This is intentionally a local intermediate, not an LLM
-    /// attachment.
-    private static func render(page: PDFPage) throws -> CGImage {
-        let bounds = page.bounds(for: .mediaBox)
-        guard bounds.width > 0, bounds.height > 0 else {
-            throw IngestionError.cannotRenderPage(0)
-        }
-
-        let targetScale: CGFloat = 4 // 72 pt × 4 ≈ 288 DPI
-        let maxDimension: CGFloat = 4_096
-        let scale = min(targetScale, maxDimension / max(bounds.width, bounds.height))
-        let width = max(1, Int((bounds.width * scale).rounded(.up)))
-        let height = max(1, Int((bounds.height * scale).rounded(.up)))
-        guard let context = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            throw IngestionError.cannotRenderPage(0)
-        }
-
-        context.setFillColor(NSColor.white.cgColor)
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        context.saveGState()
-        // PDFPage and a bitmap CGContext both use Quartz's lower-left drawing
-        // basis here. Do not apply an AppKit-style vertical flip: Vision would
-        // receive upside-down glyphs and transcribe reverse/garbled text.
-        context.scaleBy(x: scale, y: scale)
-        context.translateBy(x: -bounds.minX, y: -bounds.minY)
-        page.draw(with: .mediaBox, to: context)
-        context.restoreGState()
-
-        guard let image = context.makeImage() else {
-            throw IngestionError.cannotRenderPage(0)
-        }
-        return image
-    }
-
-    private static func recognizeWithVision(_ image: CGImage) throws -> OCRResult {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = true
-        request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US", "ja-JP"]
-
-        let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
-        try handler.perform([request])
-
-        let lines = (request.results ?? []).compactMap { observation -> (text: String, top: CGFloat, left: CGFloat, confidence: Float)? in
-            guard let candidate = observation.topCandidates(1).first,
-                  !candidate.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            else {
-                return nil
-            }
-            return (
-                text: candidate.string,
-                top: observation.boundingBox.maxY,
-                left: observation.boundingBox.minX,
-                confidence: candidate.confidence
-            )
-        }.sorted { lhs, rhs in
-            // Group observations in the same approximate line, then order left
-            // to right. Vision bounding boxes use a lower-left origin.
-            if abs(lhs.top - rhs.top) < 0.02 {
-                return lhs.left < rhs.left
-            }
-            return lhs.top > rhs.top
-        }
-
-        let text = lines.map(\.text).joined(separator: "\n")
-        let confidence: Float?
-        if lines.isEmpty {
-            confidence = nil
-        } else {
-            confidence = lines.map(\.confidence).reduce(0, +) / Float(lines.count)
-        }
-        return OCRResult(text: text, confidence: confidence)
-    }
 }

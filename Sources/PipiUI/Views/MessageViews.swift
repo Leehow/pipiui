@@ -315,6 +315,7 @@ struct MessageRow: View, Equatable {
             onOpenRunningTool: onOpenRunningTool,
             entryId: item.entryId,
             isWorking: isWorking,
+            activeThinkingBlockIndex: item.activeThinkingBlockIndex,
             onCopy: onCopy,
             onBranch: onBranch
         )
@@ -386,6 +387,8 @@ struct AssistantSegmentsView: View, Equatable {
     var onOpenRunningTool: ((RunningToolDetailPresentation) -> Void)?
     var entryId: String? = nil
     var isWorking: Bool = false
+    /// The sole still-open thinking block in a live `ChatItem`, if any.
+    var activeThinkingBlockIndex: Int? = nil
     var completionText: String? = nil
     var onCopy: (() -> Void)? = nil
     var onBranch: (() -> Void)? = nil
@@ -408,6 +411,7 @@ struct AssistantSegmentsView: View, Equatable {
             && lhs.presentationScopeID == rhs.presentationScopeID
             && lhs.entryId == rhs.entryId
             && lhs.isWorking == rhs.isWorking
+            && lhs.activeThinkingBlockIndex == rhs.activeThinkingBlockIndex
             && lhs.completionText == rhs.completionText
             && lhs.collapsedOverride == rhs.collapsedOverride
         // Callbacks intentionally excluded.
@@ -444,8 +448,25 @@ struct AssistantSegmentsView: View, Equatable {
         .onHover { hovered = $0 }
     }
 
+    /// Live stream blocks remain separately modeled, but the UI deliberately presents
+    /// all thinking fragments of this one assistant item as one compact card.
+    static func mergedStreamingThinking(
+        in segments: [AssistantBlockLayout.Segment]
+    ) -> (firstSegmentIndex: Int, text: String)? {
+        var firstSegmentIndex: Int?
+        var parts: [String] = []
+        for (index, segment) in segments.enumerated() {
+            guard case .singleton(.thinking(let text)) = segment else { continue }
+            if firstSegmentIndex == nil { firstSegmentIndex = index }
+            parts.append(text)
+        }
+        guard let firstSegmentIndex, !parts.isEmpty else { return nil }
+        return (firstSegmentIndex, parts.joined(separator: "\n\n"))
+    }
+
     @ViewBuilder
     private var segmentsBody: some View {
+        let mergedThinking = isStreaming ? Self.mergedStreamingThinking(in: segments) : nil
         VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
                 switch segment {
@@ -464,7 +485,19 @@ struct AssistantSegmentsView: View, Equatable {
                 case .video(let vid):
                     VideoBlockView(path: vid.path, onFlash: onFlash)
                 case .singleton(let block):
-                    assistantBlockView(block)
+                    if case .thinking(_) = block {
+                        if !isStreaming {
+                            assistantBlockView(block)
+                        } else if index == mergedThinking?.firstSegmentIndex,
+                                  let mergedThinking {
+                            ThinkingBlockView(
+                                text: mergedThinking.text,
+                                isStreaming: activeThinkingBlockIndex != nil
+                            )
+                        }
+                    } else {
+                        assistantBlockView(block)
+                    }
                 case .finishedGroup(let blocks):
                     FinishedNonTextGroupView(
                         presentation: AssistantBlockLayout.finishedGroupPresentation(
@@ -807,7 +840,7 @@ struct SubagentToolCardView: View {
                                 .foregroundStyle(.tertiary)
                                 .padding(.leading, CGFloat(agent.depth - 1) * 14)
                         }
-                        statusIcon(agent.state)
+                        statusIcon(agent)
                         Text(agent.name)
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.primary)
@@ -866,13 +899,16 @@ struct SubagentToolCardView: View {
     }
 
     @ViewBuilder
-    private func statusIcon(_ state: SubagentInfo.State) -> some View {
-        switch state {
-        case .running: ProgressView().controlSize(.mini).tint(.secondary)
-        case .ok: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
-        case .failed: Image(systemName: "xmark.circle.fill").foregroundStyle(.red).font(.caption)
-        case .aborted: Image(systemName: "stop.circle.fill").foregroundStyle(.orange).font(.caption)
-        case .interrupted: Image(systemName: "bolt.slash.circle.fill").foregroundStyle(.orange).font(.caption)
+    private func statusIcon(_ agent: SubagentInfo) -> some View {
+        let presentation = SubagentPresentationScale.rowPresentation(for: agent)
+        if agent.state == .running {
+            ProgressView().controlSize(.mini).tint(.secondary)
+        } else if let iconName = presentation.iconName {
+            Image(systemName: iconName)
+                .foregroundStyle(presentation.tone.displayColor)
+                .font(.caption)
+        } else {
+            EmptyView()
         }
     }
 }
@@ -884,12 +920,46 @@ enum SubagentPresentationScale {
     static let panelRowCap = 100
     private static let panelPriorityReserve = 40
 
+    /// Pure display tone; SwiftUI color mapping lives below so this policy stays testable.
+    enum LifecycleTone: Equatable {
+        case neutral
+        case success
+        case warning
+        case danger
+    }
+
+    /// Status copy placed above free-text final output when the lifecycle did not succeed.
+    struct LifecycleWarning: Equatable {
+        let title: String
+        let message: String
+        let reason: String?
+    }
+
+    /// Row/detail status is derived only from the lifecycle and durable closeout.
+    /// It deliberately never consults free-text `output` to infer success.
+    struct RowPresentation: Equatable {
+        let iconName: String?
+        let tone: LifecycleTone
+        /// The authoritative terminal lifecycle badge; closeout never rewrites it as success.
+        let terminalBadgeText: String?
+        /// Separate low-emphasis closeout marker shown after the terminal badge.
+        let handledBadgeText: String?
+        let needsAttention: Bool
+        let canMarkHandled: Bool
+        let lifecycleWarning: LifecycleWarning?
+
+        var statusText: String? {
+            let parts = [terminalBadgeText, handledBadgeText].compactMap { $0 }
+            return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        }
+    }
+
     struct Summary: Equatable {
         let totalCount: Int
         let runningCount: Int
         let failedCount: Int
         let totalCost: Double
-        /// 失败中 closeout 为 `.cleaned`（失败项/worktree 清理已完成）的数量。
+        /// 失败中 closeout 为 `.cleaned`（已明确处理、不再需关注）的数量。
         let failedCleanedCount: Int
         /// 失败中仍需关注（closeout 为 retained/unclassified/needsFixer/needsUser）的数量。
         let failedAttentionCount: Int
@@ -1019,24 +1089,125 @@ enum SubagentPresentationScale {
         )
     }
 
-    /// closeout 分类判定：只有 `.cleaned` 计入「已清理」（失败项/worktree 清理已完成）。
+    /// closeout 分类判定：只有 `.cleaned` 视为「已处理」，不再计入需关注。
     /// `.retained` 可能是验证失败或自动合并/清理被禁止而保留待复核，因此与未分类/需 fixer/
-    /// 需用户一样一律计入「需关注」。不代表底层失败已修复或用户已确认。
+    /// 需用户一样一律计入「需关注」。这不会把本次 lifecycle 改写为成功。
     static func isCleaned(_ agent: SubagentInfo) -> Bool {
-        switch agent.closeoutDisposition {
-        case .cleaned:
-            return true
-        case .retained, .unclassified, .needsFixer, .needsUser:
+        agent.closeoutDisposition == .cleaned
+    }
+
+    /// True only for failed/aborted/interrupted rows whose closeout remains unresolved.
+    static func isUnresolvedNonOKLifecycle(_ agent: SubagentInfo) -> Bool {
+        switch agent.state {
+        case .failed, .aborted, .interrupted:
+            return !isCleaned(agent)
+        case .running, .ok:
             return false
         }
     }
 
-    /// 失败徽标单行文案：全部已清理 => 「N 失败·已清理」；
+    static func rowPresentation(for agent: SubagentInfo) -> RowPresentation {
+        let handled = isCleaned(agent)
+        switch agent.state {
+        case .running:
+            return RowPresentation(
+                iconName: nil,
+                tone: .neutral,
+                terminalBadgeText: nil,
+                handledBadgeText: nil,
+                needsAttention: false,
+                canMarkHandled: false,
+                lifecycleWarning: nil
+            )
+        case .ok:
+            return RowPresentation(
+                iconName: "checkmark.circle.fill",
+                tone: .success,
+                terminalBadgeText: nil,
+                handledBadgeText: nil,
+                needsAttention: false,
+                canMarkHandled: false,
+                lifecycleWarning: nil
+            )
+        case .failed:
+            return nonOKRowPresentation(
+                agent: agent,
+                handled: handled,
+                terminalIconName: "xmark.circle.fill",
+                terminalTone: .danger,
+                terminalText: "失败·需处理",
+                warningTitle: "本次执行未成功"
+            )
+        case .aborted:
+            return nonOKRowPresentation(
+                agent: agent,
+                handled: handled,
+                terminalIconName: "stop.circle.fill",
+                terminalTone: .warning,
+                terminalText: "已中止·需处理",
+                warningTitle: "本次执行已中止"
+            )
+        case .interrupted:
+            return nonOKRowPresentation(
+                agent: agent,
+                handled: handled,
+                terminalIconName: "bolt.slash.circle.fill",
+                terminalTone: .warning,
+                terminalText: "已中断·需处理",
+                warningTitle: "本次执行被中断"
+            )
+        }
+    }
+
+    private static func nonOKRowPresentation(
+        agent: SubagentInfo,
+        handled: Bool,
+        terminalIconName: String,
+        terminalTone: LifecycleTone,
+        terminalText: String,
+        warningTitle: String
+    ) -> RowPresentation {
+        RowPresentation(
+            iconName: terminalIconName,
+            tone: terminalTone,
+            terminalBadgeText: terminalText,
+            handledBadgeText: handled ? "已处理" : nil,
+            needsAttention: !handled,
+            canMarkHandled: !handled,
+            lifecycleWarning: handled ? nil : LifecycleWarning(
+                title: warningTitle,
+                message: "下方仅是 agent 的最后输出，不代表任务已成功。",
+                reason: existingLifecycleReason(for: agent)
+            )
+        )
+    }
+
+    private static func existingLifecycleReason(for agent: SubagentInfo) -> String? {
+        if let verifyExit = agent.verifyExit, verifyExit != 0 {
+            return "验证命令退出码 \(verifyExit)"
+        }
+        if let reason = agent.closeoutReason?.trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty {
+            return reason
+        }
+        if let error = agent.worktreeError?.trimmingCharacters(in: .whitespacesAndNewlines), !error.isEmpty {
+            return error
+        }
+        switch agent.state {
+        case .aborted:
+            return "执行已中止"
+        case .interrupted:
+            return "执行已中断"
+        case .running, .ok, .failed:
+            return nil
+        }
+    }
+
+    /// 失败徽标单行文案：全部已处理 => 「N 失败·已处理」；
     /// 有需关注 => 「N 失败·需关注」（全部需关注）或「N 失败·M 需关注」。
     static func failureText(_ summary: Summary) -> String {
         guard summary.failedCount > 0 else { return "" }
         if summary.failedAttentionCount == 0 {
-            return "\(summary.failedCount) 失败·已清理"
+            return "\(summary.failedCount) 失败·已处理"
         }
         if summary.failedAttentionCount == summary.failedCount {
             return "\(summary.failedCount) 失败·需关注"
@@ -1044,9 +1215,9 @@ enum SubagentPresentationScale {
         return "\(summary.failedCount) 失败·\(summary.failedAttentionCount) 需关注"
     }
 
-    /// 失败徽标 help：明确 已清理/需关注 语义；不暗示底层失败已修复或用户已确认。
+    /// 失败徽标 help：明确 已处理/需关注 语义；不暗示本次 lifecycle 已成功。
     static func failureHelp(_ summary: Summary) -> String {
-        "失败 \(summary.failedCount) 个：已清理 \(summary.failedCleanedCount)（关联失败项/worktree 清理已完成）；需关注 \(summary.failedAttentionCount)（未分类、保留待复核、需 fixer 或需用户介入）。不代表底层失败已修复或用户已确认。"
+        "失败 \(summary.failedCount) 个：已处理 \(summary.failedCleanedCount)（已明确处置，不再计入需关注）；需关注 \(summary.failedAttentionCount)（未分类、保留待复核、需 fixer 或需用户介入）。已处理不代表本次执行已成功；也不代表底层失败已修复或用户已确认。"
     }
 
     /// Keeps every page under a fixed hard cap and in original tree order. Selected and recent
@@ -1145,7 +1316,10 @@ enum SubagentPresentationScale {
     }
 
     private static func isProblematic(_ agent: SubagentInfo) -> Bool {
-        if agent.state == .failed || agent.state == .aborted || agent.state == .interrupted {
+        if isCleaned(agent), agent.state != .running {
+            return false
+        }
+        if isUnresolvedNonOKLifecycle(agent) {
             return true
         }
         if agent.stalled || !(agent.worktreeError ?? "").isEmpty || (agent.verifyExit ?? 0) != 0 {
@@ -1164,9 +1338,21 @@ enum SubagentPresentationScale {
     }
 }
 
+extension SubagentPresentationScale.LifecycleTone {
+    var displayColor: Color {
+        switch self {
+        case .neutral: return .secondary
+        case .success: return .green
+        case .warning: return .orange
+        case .danger: return .red
+        }
+    }
+}
+
 /// Status subtitle for the main-chat subagent tool card (testable; never shows activity JSON).
 enum SubagentToolCardStatus {
     static func line(for agent: SubagentInfo) -> String {
+        let lifecycle = SubagentPresentationScale.rowPresentation(for: agent)
         switch agent.state {
         case .running:
             let title = agent.listSubtitle.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1178,11 +1364,11 @@ enum SubagentToolCardStatus {
                 rate: ModelPricing.Catalog.shared.exchangeRate
             )
         case .failed:
-            return "失败 · " + String(agent.listSubtitle.prefix(60))
+            return "\(lifecycle.statusText ?? "失败") · \(String(agent.listSubtitle.prefix(60)))"
         case .aborted:
-            return "已中止"
+            return lifecycle.statusText ?? "已中止"
         case .interrupted:
-            return "已中断（可续跑）"
+            return lifecycle.statusText ?? "已中断（可续跑）"
         }
     }
 }
@@ -1454,11 +1640,23 @@ struct SubagentHeartbeatMessage: Equatable {
 
         let agentId = String(line[..<titleStart.lowerBound])
         let title = String(line[titleStart.upperBound..<detailStart.lowerBound])
-        let detail = String(line[detailStart.upperBound...])
+        let detailWithState = String(line[detailStart.upperBound...])
         guard !agentId.isEmpty,
               !agentId.contains(where: { $0.isWhitespace }),
               !title.isEmpty else {
             return nil
+        }
+
+        let detail: String
+        if let stateStart = detailWithState.range(of: ", state=", options: .backwards) {
+            let state = String(detailWithState[stateStart.upperBound...])
+            guard !state.isEmpty,
+                  !state.contains(where: { $0.isWhitespace || $0 == "," }) else {
+                return nil
+            }
+            detail = String(detailWithState[..<stateStart.lowerBound])
+        } else {
+            detail = detailWithState
         }
 
         if detail.hasPrefix("running "),
@@ -1483,9 +1681,26 @@ struct SubagentHeartbeatMessage: Equatable {
 
         let vanishedPrefix = "process gone after "
         let vanishedSuffix = ", no result reported"
-        guard detail.hasPrefix(vanishedPrefix), detail.hasSuffix(vanishedSuffix) else { return nil }
-        let elapsedStart = detail.index(detail.startIndex, offsetBy: vanishedPrefix.count)
-        let elapsedEnd = detail.index(detail.endIndex, offsetBy: -vanishedSuffix.count)
+        if detail.hasPrefix(vanishedPrefix), detail.hasSuffix(vanishedSuffix) {
+            let elapsedStart = detail.index(detail.startIndex, offsetBy: vanishedPrefix.count)
+            let elapsedEnd = detail.index(detail.endIndex, offsetBy: -vanishedSuffix.count)
+            let elapsed = String(detail[elapsedStart..<elapsedEnd])
+            guard !elapsed.isEmpty else { return nil }
+            return WorkerSummary(
+                agentId: agentId,
+                title: title,
+                status: .vanished,
+                elapsed: elapsed,
+                idleSeconds: nil,
+                rawLine: rawLine
+            )
+        }
+
+        let noPidPrefix = "process never attached a pid after "
+        let noPidSuffix = "; treated as interrupted (vanished)"
+        guard detail.hasPrefix(noPidPrefix), detail.hasSuffix(noPidSuffix) else { return nil }
+        let elapsedStart = detail.index(detail.startIndex, offsetBy: noPidPrefix.count)
+        let elapsedEnd = detail.index(detail.endIndex, offsetBy: -noPidSuffix.count)
         let elapsed = String(detail[elapsedStart..<elapsedEnd])
         guard !elapsed.isEmpty else { return nil }
         return WorkerSummary(
@@ -2046,9 +2261,8 @@ struct ThinkingBlockView: View {
             // B: tail window keeps the streaming re-layout O(window).
             ScrollView {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(ThinkingChunkCache.tailWindow(of: text))
+                    Text(MarkdownTextView.thinkingInline(ThinkingChunkCache.tailWindow(of: text)))
                         .font(.callout)
-                        .italic()
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .transcriptCopyMenu(text)
@@ -2064,9 +2278,8 @@ struct ThinkingBlockView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(ThinkingChunkCache.chunks(for: text).enumerated()), id: \.offset) { _, chunk in
-                        Text(chunk)
+                        Text(MarkdownTextView.thinkingInline(chunk))
                             .font(.callout)
-                            .italic()
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .transcriptCopyMenu(chunk)

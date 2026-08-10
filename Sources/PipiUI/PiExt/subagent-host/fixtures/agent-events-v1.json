@@ -1,0 +1,133 @@
+{
+  "source": {
+    "extension": "Sources/PipiUI/PiExt/subagent/index.ts",
+    "consumer": "Sources/PipiUI/SubagentStore.swift#applyAgentEvent",
+    "note": "Every live v1 agent event carries the extension-captured runId. closeout is an exact terminal failed/aborted/interrupted-run display acknowledgment."
+  },
+  "events": [
+    {
+      "schemaVersion": 1,
+      "kind": "start",
+      "agentId": "host-contract",
+      "runId": "run-001",
+      "parentId": null,
+      "toolCallId": "tool-call-001",
+      "name": "general-purpose",
+      "task": "Freeze a portable host contract.",
+      "title": "Host protocol",
+      "depth": 1,
+      "model": "openai-codex/gpt-5.6",
+      "background": true,
+      "worktreePath": "/tmp/project/.pi/worktrees/host-contract",
+      "worktreeBranch": "pipiui/host-contract",
+      "memoryBrokerCapability": "memory-capability-0123456789abcdef",
+      "memoryRole": "worker"
+    },
+    {
+      "schemaVersion": 1,
+      "kind": "update",
+      "agentId": "host-contract",
+      "runId": "run-001",
+      "output": "Implementing validators.",
+      "activity": "write contract.ts",
+      "cost": 0.0123,
+      "turns": 2
+    },
+    {
+      "schemaVersion": 1,
+      "kind": "log_delta",
+      "agentId": "host-contract",
+      "runId": "run-001",
+      "contentIndex": 0,
+      "itemType": "thinking",
+      "text": "Map bridge fields before changing ownership.",
+      "name": ""
+    },
+    {
+      "schemaVersion": 1,
+      "kind": "log",
+      "agentId": "host-contract",
+      "runId": "run-001",
+      "items": [
+        { "itemType": "text", "text": "Contract surface is frozen." },
+        { "itemType": "tool", "name": "edit", "text": "{\"path\":\"contract.ts\"}" },
+        { "itemType": "toolResult", "name": "edit", "text": "updated", "isError": false }
+      ]
+    },
+    {
+      "schemaVersion": 1,
+      "kind": "usage",
+      "agentId": "host-contract",
+      "runId": "run-001",
+      "turn": 2,
+      "model": "openai-codex/gpt-5.6",
+      "tools": ["read", "edit"],
+      "usage": {
+        "input": 1200,
+        "output": 340,
+        "cacheRead": 700,
+        "cacheWrite": 0,
+        "cost": 0.0123,
+        "contextTokens": 4500
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "kind": "stalled",
+      "agentId": "host-contract",
+      "runId": "run-001",
+      "idle": 120,
+      "stalled": true,
+      "activity": "waiting for child output"
+    },
+    {
+      "schemaVersion": 1,
+      "kind": "end",
+      "agentId": "host-contract",
+      "runId": "run-001",
+      "ok": true,
+      "aborted": false,
+      "output": "Implemented and verified.",
+      "cost": 0.0234,
+      "turns": 3,
+      "contextTokens": 5100,
+      "stopReason": null,
+      "worktreePath": "/tmp/project/.pi/worktrees/host-contract",
+      "worktreeBranch": "pipiui/host-contract",
+      "verifyCommand": "node --experimental-strip-types --test Tests/Node/test-subagent-host-protocol.mjs",
+      "verifyExit": 0
+    },
+    {
+      "schemaVersion": 1,
+      "kind": "start",
+      "agentId": "closeout-contract",
+      "runId": "run-closeout",
+      "name": "general-purpose",
+      "task": "Keep the terminal worktree for review, then mark the failed episode handled.",
+      "depth": 1,
+      "worktreePath": "/tmp/project/.pi/worktrees/closeout-contract",
+      "worktreeBranch": "pipiui/closeout-contract"
+    },
+    {
+      "schemaVersion": 1,
+      "kind": "end",
+      "agentId": "closeout-contract",
+      "runId": "run-closeout",
+      "ok": false,
+      "output": "Verification failed; worktree retained.",
+      "worktreePath": "/tmp/project/.pi/worktrees/closeout-contract",
+      "worktreeBranch": "pipiui/closeout-contract",
+      "verifyCommand": "swift test",
+      "verifyExit": 1
+    },
+    {
+      "schemaVersion": 1,
+      "kind": "closeout",
+      "agentId": "closeout-contract",
+      "runId": "run-closeout",
+      "disposition": "cleaned",
+      "reason": "Boss marked this failed episode handled after review.",
+      "closeoutAt": 1786320005000
+    }
+  ]
+}

@@ -58,6 +58,24 @@ enum ComputerAppPolicy {
         "authentication", "authorization", "securityagent",
     ]
 
+    /// Shared memory boundary: automatic operator recipes must never be
+    /// collected for sensitive desktop targets. This deliberately reuses the
+    /// same maintained identity/name policy as Computer Use itself, while
+    /// ignoring any allow decisions because memory cannot alter authorization.
+    static func isSensitiveForMemory(
+        bundleID: String?,
+        appName: String?
+    ) -> Bool {
+        let bundle = bundleID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        let name = appName?.lowercased() ?? ""
+        guard !bundle.isEmpty || !name.isEmpty else { return true }
+        return bundle == ComputerHostSelfProtection.bundleID.lowercased()
+            || sensitiveBundleIDs.contains(bundle)
+            || sensitiveNameFragments.contains { name.contains($0) }
+    }
+
     static func decision(
         for app: ComputerApplicationIdentity,
         sessionAllowed: Set<String>,

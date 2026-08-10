@@ -21,6 +21,9 @@ if [[ "$CURRENT_ROOT" != "$CANONICAL_ROOT" ]]; then
 fi
 
 swift build -c release
+# Build the local PDF helper explicitly as well: it is a second executable product
+# embedded below, not a runtime download.
+swift build -c release --product pipiui-pdf-helper
 APP=build/PipiUI.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
@@ -28,6 +31,11 @@ mkdir -p "$APP/Contents/Resources"
 mkdir -p "$APP/Contents/Helpers"
 # Library+thin-entry layout: product binary is still named PipiUI (see Package.swift products).
 cp .build/release/PipiUI "$APP/Contents/MacOS/PipiUI"
+# Native PDFKit/Vision helper. Pi receives this path through PIPIUI_PDF_HELPER;
+# the routing layer injects that env value, while this packaging layer owns bytes/signing.
+PDF_HELPER="$APP/Contents/Helpers/pipiui-pdf-helper"
+cp .build/release/pipiui-pdf-helper "$PDF_HELPER"
+chmod 755 "$PDF_HELPER"
 # Embed the SwiftPM resource bundle in the standard signed-app location.
 # PipiResourceBundle resolves it here in packaged builds and falls back to
 # Bundle.module for `swift run` / tests.
@@ -121,12 +129,14 @@ codesign --force --sign "$CODE_SIGN_ID" \
   --preserve-metadata=identifier,entitlements,flags,runtime \
   "$CUA_HELPER"
 codesign --verify --strict --verbose=2 "$CUA_HELPER"
+codesign --force --sign "$CODE_SIGN_ID" "$PDF_HELPER"
+codesign --verify --strict --verbose=2 "$PDF_HELPER"
 codesign --force --sign "$CODE_SIGN_ID" "$RESOURCE_BUNDLE"
 codesign --force --sign "$CODE_SIGN_ID" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 BIN="$APP/Contents/MacOS/PipiUI"
 echo "Built $APP"
-echo "Open:  open $APP"
+echo "To use this build, quit PipiUI yourself, then reopen it manually from $APP."
 if [[ -x "$BIN" ]]; then
   stat -f 'Binary mtime: %Sm  %N' -t '%Y-%m-%d %H:%M:%S' "$BIN"
 fi

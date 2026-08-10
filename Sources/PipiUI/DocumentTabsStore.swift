@@ -13,6 +13,9 @@ package final class DocumentTabsStore: ObservableObject {
     @Published package private(set) var selectedTabID: String?
 
     private var stores: [String: DocumentStore] = [:]
+    /// Markdown-only reader state is owned per tab, alongside its independent loader.
+    /// Keeping it here makes tab switches/reloads preserve reader context without touching chat.
+    private var readerStates: [String: DocumentReaderState] = [:]
 
     package init() {}
 
@@ -26,6 +29,16 @@ package final class DocumentTabsStore: ObservableObject {
         tabs.first { $0.id == selectedTabID }
     }
 
+    /// Current tab's Markdown reader state. PDF/plain tabs leave this intentionally inert.
+    package var activeReaderState: DocumentReaderState? {
+        guard let id = selectedTabID else { return nil }
+        return readerStates[id]
+    }
+
+    package func readerState(for id: String) -> DocumentReaderState? {
+        readerStates[id]
+    }
+
     /// 打开（或切换到）一个文档；同路径不重复开 tab。
     package func open(_ url: URL) {
         if let existing = tabs.first(where: { $0.url.path == url.path }) {
@@ -37,6 +50,7 @@ package final class DocumentTabsStore: ObservableObject {
         selectedTabID = tab.id
         let store = DocumentStore()
         stores[tab.id] = store
+        readerStates[tab.id] = DocumentReaderState()
         store.open(url)
     }
 
@@ -47,6 +61,7 @@ package final class DocumentTabsStore: ObservableObject {
 
     package func closeTab(id: String) {
         stores[id] = nil
+        readerStates[id] = nil
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         tabs.remove(at: index)
         if selectedTabID == id {
@@ -71,6 +86,7 @@ package final class DocumentTabsStore: ObservableObject {
             tabs.append(tab)
             let store = DocumentStore()
             stores[tab.id] = store
+            readerStates[tab.id] = DocumentReaderState()
             store.open(url)
         }
         if let selectedPath, let hit = tabs.first(where: { $0.url.path == selectedPath }) {

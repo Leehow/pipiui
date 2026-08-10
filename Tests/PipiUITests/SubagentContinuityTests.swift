@@ -62,9 +62,13 @@ final class SubagentContinuityTests: XCTestCase {
     /// The boss cannot see the worker: absence of resumed=true on a name it meant to continue
     /// is the only signal that the name was typed wrong.
     func testResumedIsReportedInTheDoneHeader() throws {
-        let s = try source()
-        XCTAssertTrue(s.contains(#"${result.resumed ? " resumed=true" : ""}"#))
-        XCTAssertTrue(s.contains("resumed?: boolean;"))
+        let root = repositoryRoot()
+        let done = try String(
+            contentsOf: root.appendingPathComponent("Sources/PipiUI/PiExt/subagent/done-message.ts"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(done.contains(#"${result.resumed ? " resumed=true" : ""}"#))
+        XCTAssertTrue(done.contains("resumed?: boolean;"))
     }
 
     func testAgentIdAndFreshAreDispatchParameters() throws {
@@ -122,6 +126,12 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertTrue(s.contains("if (runningAgents.size === 0) return;"),
                       "an idle session must stay silent; a heartbeat costs the boss a turn")
         XCTAssertTrue(s.contains("[subagent-heartbeat] outstanding="))
+        XCTAssertTrue(s.contains("stalled=${stalled}"),
+                      "heartbeat headers must expose the number of stalled workers")
+        XCTAssertTrue(s.contains("state=${state}"),
+                      "each heartbeat worker summary must expose an explicit state tag")
+        XCTAssertTrue(s.contains("finalizing: boolean;"),
+                      "completion bookkeeping must be distinct from a live or vanished worker")
         XCTAssertTrue(s.contains("Do not re-dispatch a worker that is still running"))
     }
 
@@ -158,7 +168,7 @@ final class SubagentContinuityTests: XCTestCase {
         let s = try source()
         XCTAssertFalse(s.contains("const deliveredDone = new Set<string>();"),
                        "an agentId-only latch suppresses a later distinct completion")
-        XCTAssertTrue(s.contains("runId: keepLive ?"),
+        XCTAssertTrue(s.contains("const episodeRunId = runId ?? DeliveryObligationStore.runId();"),
                       "each distinct dispatch gets an explicit run identity")
         XCTAssertTrue(s.contains("obligation.state === \"delivered\" || entry.inFlight || obligation.attempts >= DONE_MAX_ATTEMPTS"),
                       "an unresolved send must block duplicate concurrent sends")
@@ -180,8 +190,15 @@ final class SubagentContinuityTests: XCTestCase {
                       "switching Pi sessions must leave old durable rows for their own later resume")
         XCTAssertFalse(s.contains("DeliveryObligationStore.routingDirectory(PIPIUI_SESSION)"))
         XCTAssertFalse(s.contains("{ routingKey: PIPIUI_SESSION }"))
-        XCTAssertTrue(s.contains("body: JSON.stringify({ sessionKey: PIPIUI_SESSION, action: \"agent_event\", ...payload })"),
-                      "ephemeral capability remains exclusively on bridge authorization/reporting")
+        XCTAssertTrue(s.contains("PIPIUI_SESSION_CAPABILITY,"),
+                      "the ephemeral capability is passed only to bridge request encoding")
+        let bridge = try String(
+            contentsOf: repositoryRoot().appendingPathComponent("Sources/PipiUI/PiExt/subagent/host-bridge.ts"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(bridge.contains("sessionCapability,"))
+        XCTAssertTrue(bridge.contains("return { sessionKey, action: \"agent_event\", ...event };"),
+                      "legacy bridge authorization remains separate from durable Pi session identity")
     }
 
     /// Drive the real persistence module in separate store instances (fresh extension processes),
@@ -378,17 +395,20 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertEqual(node.terminationStatus, 0, errorText)
     }
 
-    /// A boolean stallNotified pushed once and then went silent until the 15-minute heartbeat.
-    /// A boss that chose to keep waiting must hear again: the handle now stamps the last push
-    /// and re-pushes once five more minutes of idleness have passed.
-    func testStallRenotifiesOnATimestampNotABoolean() throws {
+    /// A continuing stall must re-notify at most twice after its first push, then stay quiet
+    /// until real activity starts a fresh idle episode.
+    func testStallRenotifiesAreBoundedAndRearmedByActivity() throws {
         let s = try source()
-        XCTAssertTrue(s.contains("lastStallNotifyAt: number;"),
-                      "a timestamp, not a boolean, so a continuing stall can be re-pushed")
-        XCTAssertTrue(s.contains("handle.lastStallNotifyAt = 0;"),
-                      "new activity re-arms the stall push for the next idle episode")
-        XCTAssertTrue(s.contains("if (handle.lastStallNotifyAt > 0 && now - handle.lastStallNotifyAt < STALL_RENOTIFY_INTERVAL_MS) continue;"),
-                      "re-push is gated at five minutes, not swallowed until the heartbeat")
+        XCTAssertTrue(s.contains("const STALL_RENOTIFY_MAX = 3;"),
+                      "one initial push plus two re-notifies bounds one idle episode")
+        XCTAssertTrue(s.contains("stallNotifyCount: number;"),
+                      "the running handle tracks how many pushes this idle episode used")
+        XCTAssertTrue(s.contains("handle.stallNotifyCount = 0;"),
+                      "new activity re-arms the stall cap for the next idle episode")
+        XCTAssertTrue(s.contains("function claimStallNotification(handle: RunningAgentHandle, now: number): boolean"),
+                      "the interval and cap must be claimed atomically in one helper")
+        XCTAssertTrue(s.contains("if (handle.stallNotifyCount >= STALL_RENOTIFY_MAX) return false;"),
+                      "a fourth spaced stall push must be rejected")
     }
 
     /// A worker whose pid is gone but whose close handler never ran used to wait for the
@@ -400,8 +420,10 @@ final class SubagentContinuityTests: XCTestCase {
                       "a dead (or aged no-pid) handle must surface in the 30s poll")
         XCTAssertTrue(s.contains("function markWorkerInterrupted(agentId: string, reason: string)"),
                       "vanished path must share one full-settle helper")
-        XCTAssertTrue(s.contains("markWorkerInterrupted(agentId, reason);"),
+        XCTAssertTrue(s.contains("if (!markWorkerInterrupted(agentId, reason)) continue;"),
                       "30s poll must settle jobRegistry + pipiuiReport end, not only delete")
+        XCTAssertTrue(s.contains("if (handle.finalizing) continue;"),
+                      "an observed child close must bypass watchdog vanish/stall handling during closeout")
         XCTAssertTrue(s.contains("interrupted, not failed"),
                       "a vanished worker still has its context and should be continued by name")
     }
@@ -433,8 +455,9 @@ final class SubagentContinuityTests: XCTestCase {
         let s = try source()
         XCTAssertFalse(s.contains("never reopen a terminal job"),
                        "terminal rows must reopen on same-agentId resume")
-        XCTAssertTrue(s.contains("Resume of the same agentId must reopen a terminal row as running"))
-        XCTAssertTrue(s.contains("const keepLive = existing?.state === \"running\";"))
+        XCTAssertTrue(s.contains("Every dispatch is a fresh episode"))
+        XCTAssertTrue(s.contains("cancelInterruptedReminders(agentId);"),
+                      "a same-agentId resume must clear old reminder state")
     }
 
     /// Handling that only matters when an event fires does not belong in a prefix paid for on
@@ -460,10 +483,15 @@ final class SubagentContinuityTests: XCTestCase {
     /// the few turns that write it. The file carries its own shape instead.
     func testLedgerLayoutLivesInTheFileNotThePrefix() throws {
         let s = try source()
-        XCTAssertTrue(s.contains("function seedBossLedger()"))
-        XCTAssertTrue(s.contains("if (fs.existsSync(file)) return;"), "an existing ledger is session state")
-        XCTAssertTrue(s.contains("## Closeout dispositions"), "the seeded file carries the layout")
-        XCTAssertTrue(s.contains("seedBossLedger();"), "seeded at first real dispatch, matching lazy discovery")
+        let root = repositoryRoot()
+        let ledger = try String(
+            contentsOf: root.appendingPathComponent("Sources/PipiUI/PiExt/subagent/boss-ledger.ts"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(ledger.contains("function seedBossLedger(mainCwd: string | undefined, sessionKey: string | undefined)"))
+        XCTAssertTrue(ledger.contains("if (fs.existsSync(file)) return;"), "an existing ledger is session state")
+        XCTAssertTrue(ledger.contains("## Closeout dispositions"), "the seeded file carries the layout")
+        XCTAssertTrue(s.contains("seedBossLedger(PIPIUI_MAIN_CWD, PIPIUI_SESSION);"), "seeded at first real dispatch, matching lazy discovery")
 
         let t = try PhilosophyLayerFixture.normalizedBody("orchestration")
         XCTAssertTrue(t.contains("the runtime has already created your ledger"))
@@ -471,28 +499,55 @@ final class SubagentContinuityTests: XCTestCase {
     }
 
     /// Research is the largest raw injection there is, so the boss must be able to hand it to a
-    /// worker. Provider-hosted search already reaches workers through pi's own discovery, but
-    /// only for models whose provider ships it — the generic tools are the fallback that makes
-    /// delegating research work whatever model the worker runs.
-    func testWorkersCanSearchTheWebSoResearchIsDelegable() throws {
+    /// worker. Provider-native web_search remains distinct, while PipiUI-owned URL/document
+    /// routes are only mounted and named when the main session exported their usable path.
+    func testWorkersInheritOnlyEnabledSpecialistRoutes() throws {
         let s = try source()
-        XCTAssertTrue(s.contains("const PIPIUI_WEBSEARCH_EXT = process.env.PIPIUI_WEBSEARCH_EXT;"))
-        XCTAssertTrue(s.contains(#"if (PIPIUI_WEBSEARCH_EXT) args.push("-e", PIPIUI_WEBSEARCH_EXT);"#))
+        for env in ["PIPIUI_WEBSEARCH_EXT", "PIPIUI_PDF_EXT", "PIPIUI_PDF_HELPER", "PIPIUI_GITHUB_EXT", "PIPIUI_ARXIV_EXT"] {
+            XCTAssertTrue(s.contains("const \(env) = process.env.\(env);"), "worker must read \(env)")
+        }
+        XCTAssertTrue(s.contains("resolvePipiUIExtensionRouting({"))
+        XCTAssertTrue(s.contains("availableExtensionTools: pipiuiExtensionRouting.extensionOnlyTools,"))
+        XCTAssertTrue(s.contains("selectPipiUIExtensionRoutes(pipiuiExtensionRouting, toolSelection)"))
 
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let root = repositoryRoot()
         let assembly = try String(
             contentsOf: root.appendingPathComponent("Sources/PipiUI/PipiSpawnAssembly.swift"),
             encoding: .utf8)
         XCTAssertTrue(assembly.contains(#"env["PIPIUI_WEBSEARCH_EXT"] = p"#),
                       "re-exported only inside the webSearch feature gate")
+        XCTAssertTrue(assembly.contains(#"env["PIPIUI_GITHUB_EXT"] = p"#),
+                      "GitHub package path is re-exported inside its independent feature gate")
+        XCTAssertTrue(assembly.contains(#"env["PIPIUI_ARXIV_EXT"] = p"#),
+                      "arXiv package path must reach workers")
+        XCTAssertTrue(assembly.contains("pdfExtract: features.isEnabled(.pdfExtract)"),
+                      "PDF path must have its own built-in feature gate")
+        XCTAssertTrue(assembly.contains("if f.isEnabled(.pdfExtract), let pdf = input.paths.pdfExtract"),
+                      "PDF helper env must not ride the arXiv gate")
+        XCTAssertTrue(assembly.contains(#"env["PIPIUI_PDF_EXT"] = pdf"#),
+                      "PDF extension path must reach workers alongside its helper")
+    }
 
-        // The allowlist filters registered tools, so explore needs them named explicitly.
-        let explore = try String(
-            contentsOf: root.appendingPathComponent("Sources/PipiUI/PiExt/agents/explore.md"),
-            encoding: .utf8)
-        XCTAssertTrue(explore.contains("web_search"))
-        XCTAssertTrue(explore.contains("web_fetch"))
+    func testBuiltInAgentSpecialistToolMatrixIsExplicit() throws {
+        let specialist = Set(["web_search", "web_fetch", "pdf_extract", "github_fetch", "arxiv_fetch"])
+        let expected: [String: Set<String>] = [
+            "explore": specialist,
+            "general-purpose": specialist.subtracting(Set(["web_search"])),
+            "plan": specialist.subtracting(Set(["web_search"])),
+            "reviewer": specialist.subtracting(Set(["web_search"])),
+            "operator": [],
+            "secretary": [],
+            "long-test": [],
+        ]
+        let agentsRoot = repositoryRoot().appendingPathComponent("Sources/PipiUI/PiExt/agents")
+        for (name, tools) in expected {
+            let source = try String(contentsOf: agentsRoot.appendingPathComponent("\(name)/AGENT.md"), encoding: .utf8)
+            let line = try XCTUnwrap(source.split(separator: "\n").first(where: { $0.hasPrefix("tools:") }))
+            let actual = Set(line.dropFirst("tools:".count).split(separator: ",").map {
+                $0.trimmingCharacters(in: .whitespaces)
+            })
+            XCTAssertEqual(actual.intersection(specialist), tools, "\(name) specialist tools")
+        }
     }
 
     /// The rule used to tell the boss to run every search itself, which contradicts the axiom
@@ -519,7 +574,7 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertTrue(s.contains("function flag(raw: unknown): boolean"))
         XCTAssertTrue(s.contains(#"if (typeof raw === "boolean") return raw;"#))
         XCTAssertTrue(s.contains("function str(raw: unknown): string | undefined"))
-        XCTAssertTrue(s.contains("parseFrontmatter<Record<string, unknown>>(content)"),
+        XCTAssertTrue(s.contains("parseFrontmatter<Record<string, unknown>>(input.content)"),
                       "the annotation must not claim every value is a string")
         XCTAssertFalse(s.contains("function flag(raw: string | undefined)"))
     }

@@ -10,6 +10,7 @@ final class CompactionLifecycleTests: XCTestCase {
         TimeInterval, TimeInterval, TimeInterval,
         TimeInterval, TimeInterval, TimeInterval
     )?
+    private var originalProactiveConfiguration: ProactiveCompactionPolicy.Configuration?
 
     override func setUp() {
         super.setUp()
@@ -27,6 +28,14 @@ final class CompactionLifecycleTests: XCTestCase {
         ChatSession.compactionStopShutdownDelay = 0.3
         // get_state 过期窗口：默认关（stale 采纳测试自行设置）。
         ChatSession.compactionStateStaleWindow = -1
+        originalProactiveConfiguration = ChatSession.proactiveCompactionConfiguration
+        let defaults = ProactiveCompactionPolicy.Configuration.standard
+        ChatSession.proactiveCompactionConfiguration = .init(
+            highWatermark: defaults.highWatermark,
+            lowWatermark: defaults.lowWatermark,
+            quietDelay: 0.03,
+            failureBackoff: 0.08
+        )
     }
 
     override func tearDown() {
@@ -37,6 +46,9 @@ final class CompactionLifecycleTests: XCTestCase {
             ChatSession.compactionStopSigtermDelay = originalDelays.3
             ChatSession.compactionStopSigkillDelay = originalDelays.4
             ChatSession.compactionStopShutdownDelay = originalDelays.5
+        }
+        if let originalProactiveConfiguration {
+            ChatSession.proactiveCompactionConfiguration = originalProactiveConfiguration
         }
         super.tearDown()
     }
@@ -56,6 +68,33 @@ final class CompactionLifecycleTests: XCTestCase {
             if case .text(let t) = item.blocks.first { return t }
             return nil
         }
+    }
+
+    private func makeReadySession(backend: FakeBackend) -> ChatSession {
+        let session = makeSession()
+        session.attachTestingBackend(backend)
+        return session
+    }
+
+    private func compactRequests(_ backend: FakeBackend) -> [[String: Any]] {
+        backend.requested.filter { ($0["type"] as? String) == "compact" }
+    }
+
+    private func promptRequests(_ backend: FakeBackend) -> [[String: Any]] {
+        backend.requested.filter { ($0["type"] as? String) == "prompt" }
+    }
+
+    private func applyFreshUsage(_ session: ChatSession, tokens: Int, window: Int) {
+        session.applySessionStats(J([
+            "contextUsage": [
+                "tokens": tokens,
+                "contextWindow": window,
+            ] as [String: Any],
+        ]))
+    }
+
+    private func waitForProactiveTimer() async {
+        try? await Task.sleep(nanoseconds: 150_000_000)
     }
 
     // MARK: - start / end 状态
@@ -415,5 +454,265 @@ final class CompactionLifecycleTests: XCTestCase {
         if let restart = events.first(where: { $0.kind == "restart" }) {
             XCTAssertGreaterThanOrEqual(restart.elapsed, 0.65, "restart must follow the long timeline offset")
         }
+    }
+
+    // MARK: - idle proactive compaction
+
+    func testProactivePolicyDefaultsAndFailureBackoff() {
+        let config = ProactiveCompactionPolicy.Configuration.standard
+        XCTAssertEqual(config.highWatermark, 0.80, accuracy: 0.000_1)
+        XCTAssertEqual(config.lowWatermark, 0.60, accuracy: 0.000_1)
+        XCTAssertEqual(config.quietDelay, 2, accuracy: 0.000_1)
+        XCTAssertGreaterThanOrEqual(config.failureBackoff, 60)
+
+        var policy = ProactiveCompactionPolicy(configuration: config)
+        let now = Date(timeIntervalSinceReferenceDate: 10_000)
+        policy.observeFreshUsage(
+            .init(tokens: 160, contextWindow: 200, percent: nil),
+            requestGeneration: 1
+        )
+        XCTAssertEqual(policy.nextSchedulingDelay(now: now) ?? -1, 2, accuracy: 0.000_1)
+
+        policy.recordCompactionFailure(at: now)
+        XCTAssertEqual(
+            policy.nextSchedulingDelay(now: now) ?? -1,
+            60,
+            accuracy: 0.000_1,
+            "failure must not tight-loop while high usage remains"
+        )
+        XCTAssertEqual(
+            policy.nextSchedulingDelay(now: now.addingTimeInterval(60)) ?? -1,
+            2,
+            accuracy: 0.000_1
+        )
+    }
+
+    func testProactivePolicyLowUsageDoesNotSchedule() {
+        var policy = ProactiveCompactionPolicy()
+        policy.observeFreshUsage(
+            .init(tokens: 120, contextWindow: 200, percent: nil),
+            requestGeneration: 1
+        )
+        XCTAssertNil(policy.nextSchedulingDelay(now: Date()))
+    }
+
+    func testProactivePolicySuccessNeedsFreshLowUsageToRearm() {
+        var policy = ProactiveCompactionPolicy()
+        let now = Date(timeIntervalSinceReferenceDate: 20_000)
+        policy.observeFreshUsage(
+            .init(tokens: 170, contextWindow: 200, percent: nil),
+            requestGeneration: 4
+        )
+        XCTAssertTrue(policy.isArmed)
+        policy.recordCompactionSuccess(requiringUsageRequestAfter: 4)
+        XCTAssertFalse(policy.isArmed)
+
+        // Nil and old-generation reports cannot turn a just-compacted high session back on.
+        policy.observeFreshUsage(nil, requestGeneration: 5)
+        policy.observeFreshUsage(
+            .init(tokens: 20, contextWindow: 200, percent: nil),
+            requestGeneration: 4
+        )
+        policy.observeFreshUsage(
+            .init(tokens: 170, contextWindow: 200, percent: nil),
+            requestGeneration: 6
+        )
+        XCTAssertFalse(policy.isArmed)
+        XCTAssertNil(policy.nextSchedulingDelay(now: now))
+
+        // Low must be strictly below the 60% low watermark.
+        policy.observeFreshUsage(
+            .init(tokens: 120, contextWindow: 200, percent: nil),
+            requestGeneration: 7
+        )
+        XCTAssertFalse(policy.isArmed)
+        policy.observeFreshUsage(
+            .init(tokens: 119, contextWindow: 200, percent: nil),
+            requestGeneration: 8
+        )
+        XCTAssertTrue(policy.isArmed)
+        XCTAssertNil(policy.nextSchedulingDelay(now: now), "rearming at low usage must not compact again")
+
+        policy.observeFreshUsage(
+            .init(tokens: 170, contextWindow: 200, percent: nil),
+            requestGeneration: 9
+        )
+        XCTAssertNotNil(policy.nextSchedulingDelay(now: now))
+    }
+
+    func testHighWatermarkIdleSchedulesProactiveCompact() async {
+        let backend = FakeBackend()
+        let session = makeReadySession(backend: backend)
+        defer { session.shutdown() }
+
+        applyFreshUsage(session, tokens: 170, window: 200)
+        await waitForProactiveTimer()
+
+        XCTAssertEqual(compactRequests(backend).count, 1)
+    }
+
+    func testProactiveGateBlocksWorkingQueueCompactingAndToolButAllowsWorkers() async {
+        let workingBackend = FakeBackend()
+        let working = makeReadySession(backend: workingBackend)
+        defer { working.shutdown() }
+        working.isStreaming = true
+        applyFreshUsage(working, tokens: 170, window: 200)
+        await waitForProactiveTimer()
+        XCTAssertTrue(compactRequests(workingBackend).isEmpty)
+
+        let queuedBackend = FakeBackend()
+        let queued = makeReadySession(backend: queuedBackend)
+        defer { queued.shutdown() }
+        queued.markUserRenamedTitle()
+        queued.isStreaming = true
+        queued.sendPrompt("queued follow-up")
+        queued.isStreaming = false
+        XCTAssertEqual(queued.messageQueue.count, 1)
+        applyFreshUsage(queued, tokens: 170, window: 200)
+        await waitForProactiveTimer()
+        XCTAssertTrue(compactRequests(queuedBackend).isEmpty)
+
+        let compactingBackend = FakeBackend()
+        let compacting = makeReadySession(backend: compactingBackend)
+        defer { compacting.shutdown() }
+        compacting.handleEvent(J(["type": "compaction_start", "reason": "manual"]))
+        applyFreshUsage(compacting, tokens: 170, window: 200)
+        await waitForProactiveTimer()
+        XCTAssertTrue(compactRequests(compactingBackend).isEmpty)
+
+        let toolBackend = FakeBackend()
+        let tool = makeReadySession(backend: toolBackend)
+        defer { tool.shutdown() }
+        tool.handleEvent(J(["type": "tool_execution_start", "toolCallId": "tool-1"]))
+        applyFreshUsage(tool, tokens: 170, window: 200)
+        await waitForProactiveTimer()
+        XCTAssertTrue(compactRequests(toolBackend).isEmpty)
+
+        let workerBackend = FakeBackend()
+        let worker = makeReadySession(backend: workerBackend)
+        defer { worker.shutdown() }
+        worker.subagents.handle(J([
+            "agentId": "worker-1",
+            "kind": "start",
+            "name": "worker",
+            "task": "continue background work",
+            "depth": 1,
+        ]))
+        XCTAssertEqual(worker.subagents.runningCount, 1)
+        applyFreshUsage(worker, tokens: 170, window: 200)
+        await waitForProactiveTimer()
+        XCTAssertEqual(
+            compactRequests(workerBackend).count,
+            1,
+            "background workers must not block an otherwise-idle main session"
+        )
+    }
+
+    func testProactiveQuietTimerCancelsWhenNewPromptArrives() async {
+        let backend = FakeBackend()
+        let session = makeReadySession(backend: backend)
+        defer { session.shutdown() }
+
+        applyFreshUsage(session, tokens: 170, window: 200)
+        session.markUserRenamedTitle()
+        session.sendPrompt("new user work")
+        await waitForProactiveTimer()
+
+        XCTAssertTrue(compactRequests(backend).isEmpty, "activity before the timer fires must cancel it")
+        XCTAssertEqual(promptRequests(backend).count, 1)
+        XCTAssertFalse(
+            backend.sent.contains { ($0["type"] as? String) == "abort" },
+            "a new prompt must not abort proactive compaction"
+        )
+    }
+
+    func testProactiveSuccessStaysDisarmedUntilFreshLowUsageThenHighUsage() async {
+        let backend = FakeBackend()
+        let session = makeReadySession(backend: backend)
+        defer { session.shutdown() }
+
+        applyFreshUsage(session, tokens: 170, window: 200)
+        await waitForProactiveTimer()
+        XCTAssertEqual(compactRequests(backend).count, 1)
+
+        session.handleEvent(J(["type": "compaction_start", "reason": "manual"]))
+        session.handleEvent(J(["type": "compaction_end", "reason": "manual", "aborted": false]))
+
+        // A null report and a fresh-but-high report cannot re-arm the successful compact.
+        session.applySessionStats(J([
+            "contextUsage": [
+                "tokens": NSNull(),
+                "percent": NSNull(),
+            ] as [String: Any],
+        ]))
+        applyFreshUsage(session, tokens: 170, window: 200)
+        await waitForProactiveTimer()
+        XCTAssertEqual(compactRequests(backend).count, 1)
+
+        applyFreshUsage(session, tokens: 119, window: 200)
+        await waitForProactiveTimer()
+        XCTAssertEqual(compactRequests(backend).count, 1, "low usage only rearms; it does not compact")
+
+        applyFreshUsage(session, tokens: 170, window: 200)
+        await waitForProactiveTimer()
+        XCTAssertEqual(compactRequests(backend).count, 2)
+    }
+
+    func testPromptQueuesDuringCompactionAndDrainsExactlyOnceAfterEnd() {
+        let backend = FakeBackend()
+        let session = makeReadySession(backend: backend)
+        defer { session.shutdown() }
+
+        session.handleEvent(J(["type": "compaction_start", "reason": "manual"]))
+        session.markUserRenamedTitle()
+        session.sendPrompt("continue after compact")
+
+        XCTAssertEqual(session.messageQueue.count, 1)
+        XCTAssertTrue(promptRequests(backend).isEmpty)
+        XCTAssertFalse(
+            backend.sent.contains { ($0["type"] as? String) == "abort" },
+            "queued input must not try to interrupt a compaction"
+        )
+
+        session.handleEvent(J(["type": "compaction_end", "reason": "manual", "aborted": false]))
+        XCTAssertTrue(session.messageQueue.isEmpty)
+        XCTAssertEqual(promptRequests(backend).count, 1)
+
+        // A late settle from the compaction must not pop/send the next queue item twice.
+        session.handleEvent(J(["type": "agent_settled"]))
+        XCTAssertEqual(promptRequests(backend).count, 1)
+    }
+
+    func testShutdownSwitchAndNewTaskCancelScheduledProactiveWork() async {
+        let shutdownBackend = FakeBackend()
+        let shutdownSession = makeReadySession(backend: shutdownBackend)
+        applyFreshUsage(shutdownSession, tokens: 170, window: 200)
+        shutdownSession.shutdown()
+        await waitForProactiveTimer()
+        XCTAssertTrue(compactRequests(shutdownBackend).isEmpty)
+
+        let switchBackend = FakeBackend()
+        let switchSession = makeReadySession(backend: switchBackend)
+        defer { switchSession.shutdown() }
+        switchSession.applyState(J([
+            "sessionFile": "/tmp/proactive-switch-old-\(UUID().uuidString).jsonl",
+        ]))
+        applyFreshUsage(switchSession, tokens: 170, window: 200)
+        switchSession.applyState(J([
+            "sessionFile": "/tmp/proactive-switch-new-\(UUID().uuidString).jsonl",
+        ]))
+        await waitForProactiveTimer()
+        XCTAssertTrue(compactRequests(switchBackend).isEmpty)
+
+        let newTaskBackend = FakeBackend()
+        let newTaskSession = makeReadySession(backend: newTaskBackend)
+        defer { newTaskSession.shutdown() }
+        var openedNewTask = false
+        newTaskSession.onRequestNewSession = { openedNewTask = true }
+        applyFreshUsage(newTaskSession, tokens: 170, window: 200)
+        newTaskSession.onRequestNewSession?()
+        await waitForProactiveTimer()
+        XCTAssertTrue(openedNewTask)
+        XCTAssertTrue(compactRequests(newTaskBackend).isEmpty)
     }
 }

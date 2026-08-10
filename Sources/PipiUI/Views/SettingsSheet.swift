@@ -7,6 +7,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case models = "模型"
     case usage = "用量"
     case toolsSkills = "工具/mcp"
+    case memory = "记忆"
     case subagentModels = "Subagent"
     case experimental = "实验"
     var id: String { rawValue }
@@ -16,6 +17,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var accessibilityName: String {
         switch self {
         case .toolsSkills: return "工具与 Skills"
+        case .memory: return "记忆"
         case .subagentModels: return "Subagent 模型"
         default: return rawValue
         }
@@ -28,6 +30,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .models: return "cpu"
         case .usage: return "chart.bar.fill"
         case .toolsSkills: return "wrench.and.screwdriver"
+        case .memory: return "brain.head.profile"
         case .subagentModels: return "person.2"
         case .experimental: return "flask"
         }
@@ -227,12 +230,61 @@ struct SettingsSheet: View {
             usageSection
         case .toolsSkills:
             toolsSkillsSection
+        case .memory:
+            memorySection
         case .subagentModels:
             subagentModelsSection
         case .experimental:
             experimentalSection
         case .models:
             EmptyView()
+        }
+    }
+
+    // MARK: - Memory Broker
+
+    private var memorySection: some View {
+        let status = store.memoryBrokerStatus
+        let migration = ControlledMemoryMigration.loadState()
+        return GroupBox("PipiUI Memory Broker") {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle("启用记忆", isOn: Binding(
+                    get: { MemoryBrokerSettings.isEnabled() },
+                    set: { store.setMemoryBrokerEnabled($0) }
+                ))
+                Text("启用后，主 Pi 会话只挂载 PipiUI 管理的 Memory Broker package；子 agent 与 Computer operator 的权限由 package 自行发放。安装失败时主 agent 仍可正常工作，记忆显示为降级。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
+                    GridRow { Text("Package").foregroundStyle(.secondary); Text("pipiui-memory-broker \(status.packageVersion)") }
+                    GridRow { Text("Hermes").foregroundStyle(.secondary); Text("pi-hermes-memory \(status.hermesVersion)") }
+                    GridRow { Text("安装/解析").foregroundStyle(.secondary); Text(status.state == .installing ? "正在安装…" : status.installed && status.resolved ? "已安装并解析" : "未就绪") }
+                    GridRow { Text("Native FTS").foregroundStyle(.secondary); Text(status.nativeFTS == true ? "可用" : status.nativeFTS == false ? "不可用" : "尚未检测") }
+                    GridRow { Text("状态").foregroundStyle(.secondary); Text(status.state.rawValue) }
+                }
+                .font(.caption)
+
+                if let detail = status.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
+                if let error = status.lastError { Text(error).font(.caption).foregroundStyle(.red) }
+                if let migration {
+                    Text("旧可控记忆迁移：\(migration.phase.rawValue)（\(migration.count) 条，\(migration.contentHash.prefix(12))…）")
+                        .font(.caption)
+                        .foregroundStyle(migration.phase == .failed ? .red : .secondary)
+                    if let error = migration.lastError { Text(error).font(.caption).foregroundStyle(.red) }
+                }
+
+                HStack {
+                    Button("刷新状态") { store.refreshMemoryBrokerStatus() }
+                    Button("迁移旧的可控记忆") { store.retryControlledMemoryMigration() }
+                    Spacer()
+                }
+                Text("旧数据路径：Application Support/PipiUI/Memory/approved.json。迁移先备份并校验数量和哈希；package durable import/readback 成功后才标记完成并停止旧后端。旧文件不会自动删除。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -1268,7 +1320,7 @@ struct SettingsSheet: View {
         case "edit": return "pencil"
         case "grep", "find": return "magnifyingglass"
         case "ls": return "folder"
-        case "web_search", "web_fetch": return "globe"
+        case "web_search", "web_fetch", "github_fetch": return "globe"
         case "subagent", "subagent_status": return "person.2"
         case "generate_image": return "photo"
         case "browser", "browser_navigate", "browser_click": return "safari"
@@ -2016,6 +2068,9 @@ struct SettingsSheet: View {
         if restartSessions {
             statusMessage = "已更新，相关会话已刷新"
         }
+        // Swift owns allowed-thinking policy; mirror the compact result so the live Node
+        // extension can display it and safely handle task-thinking across fallbacks.
+        SubagentModelSettings.syncCapabilityCatalog(models: models)
         // models / hiddenIds / subagentSettings 已就位，重算 picker 候选与 provider 分组缓存。
         recomputeGroupedModels()
         recomputePickerModels()

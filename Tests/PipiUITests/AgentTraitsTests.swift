@@ -21,7 +21,7 @@ final class AgentTraitsTests: XCTestCase {
     }
 
     private func frontmatter(_ agent: String) throws -> [String: String] {
-        let text = try source("Sources/PipiUI/PiExt/agents/\(agent).md")
+        let text = try source("Sources/PipiUI/PiExt/agents/\(agent)/AGENT.md")
         let parts = text.components(separatedBy: "---")
         guard parts.count >= 3 else { return [:] }
         var fields: [String: String] = [:]
@@ -44,10 +44,11 @@ final class AgentTraitsTests: XCTestCase {
         // Read through the same string coercion as every other field: pi parses frontmatter as
         // real YAML, so a value that is not a string must not reach .trim().
         XCTAssertTrue(s.contains(#"reportsInFull: str(frontmatter.deliverable)?.trim().toLowerCase() === "report""#))
-        XCTAssertTrue(s.contains("traits: parseAgentTraits(frontmatter)"))
+        XCTAssertTrue(s.contains("const traits: AgentTraits"))
+        XCTAssertTrue(s.contains("parseAgentTraits(frontmatter).blockSkillReads"))
         // An absent or misspelled key must land on the plain-worker answer, which is what an
         // unlisted name already got before the traits existed.
-        XCTAssertTrue(s.contains(#"return v === "true" || v === "yes" || v === "1";"#))
+        XCTAssertTrue(s.contains(#"return value === "true" || value === "yes" || value === "1";"#))
     }
 
     /// The shipped definitions have to reproduce exactly what the name checks used to decide,
@@ -61,8 +62,8 @@ final class AgentTraitsTests: XCTestCase {
             XCTAssertEqual(try frontmatter(report)["deliverable"], "report",
                            "\(report) had REPORT_DONE_CAP")
         }
-        // reviewer was read-only but never got the report cap; it returns a verdict.
-        XCTAssertNil(try frontmatter("reviewer")["deliverable"])
+        // reviewer was read-only but never got the report cap; `verdict` preserves that behavior.
+        XCTAssertEqual(try frontmatter("reviewer")["deliverable"], "verdict")
         XCTAssertEqual(try frontmatter("plan")["block-skill-reads"], "true")
         XCTAssertNil(try frontmatter("explore")["block-skill-reads"])
         XCTAssertNil(try frontmatter("operator")["delegates"], "operator must not get orchestration layers")
@@ -76,19 +77,25 @@ final class AgentTraitsTests: XCTestCase {
     }
 
     /// Traits only ever narrow an agent, so a definition that lies costs itself capability.
-    /// The secretary's worktree and delegation ban are the two that *grant*, so they stay
-    /// runtime-owned — a project-scoped `secretary.md` must not vote on them.
+    /// The secretary's closeout role and bundled operator's host-memory role are runtime-owned;
+    /// project/user definitions with either name must not manufacture those grants.
     func testGrantingPolicyStaysRuntimeOwnedAndNoOtherNameCheckSurvives() throws {
-        let s = try source("Sources/PipiUI/PiExt/subagent/index.ts")
-        XCTAssertTrue(s.contains(#"if (agentName === "secretary")"#))
-        XCTAssertTrue(s.contains("must not be able to hand itself either by editing its own frontmatter"))
+        let index = try source("Sources/PipiUI/PiExt/subagent/index.ts")
+        let policy = try source("Sources/PipiUI/PiExt/subagent/runtime-policy.ts")
+        XCTAssertTrue(policy.contains("agent.origin === \"bundled\" && agent.name === \"secretary\""))
+        XCTAssertTrue(policy.contains("A project/user agent with the same name, prompt"))
+        XCTAssertTrue(policy.contains("worktree: \"main-session\""))
+        XCTAssertTrue(policy.contains("allowRecursiveDelegation: false"))
+        XCTAssertTrue(policy.contains("agent.origin === \"bundled\" && agent.name === \"operator\""))
+        XCTAssertTrue(policy.contains("role: \"operator\""))
 
-        for name in ["explore", "plan", "reviewer", "operator", "general-purpose"] {
-            XCTAssertFalse(s.contains("agentName === \"\(name)\""),
-                           "\(name) must be decided by its traits, not by its name")
+        for name in ["explore", "plan", "reviewer", "general-purpose"] {
+            XCTAssertFalse(policy.contains("agent.name === \"\(name)\""),
+                           "\(name) must be decided by declarative capabilities, not by its name")
         }
-        XCTAssertFalse(s.contains("READ_ONLY_AGENTS"))
-        XCTAssertFalse(s.contains("doneCapForAgent"))
+        XCTAssertTrue(index.contains("runtimeRolePolicyForAgent(agent)"))
+        XCTAssertFalse(index.contains("READ_ONLY_AGENTS"))
+        XCTAssertFalse(index.contains("doneCapForAgent"))
     }
 
     /// The done formatter runs far from the definition, so the trait rides on the result.

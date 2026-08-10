@@ -85,6 +85,60 @@ final class WebSearchSettingsTests: XCTestCase {
         XCTAssertTrue(source.contains("hasNativeSearch(model) && !params.force"), "native-skip gate preserved")
     }
 
+    // MARK: - web_fetch generated TS contract
+
+    func testWebFetchHTMLExtractionContract() throws {
+        let source = try generatedSource()
+
+        // The small converter must preserve readable article structure while removing chrome.
+        for needle in ["function htmlToMarkdown", "function findContainer", "name === \"article\"",
+                       "name === \"main\"", "role\\s*=\\s*[\"']main", "NOISE_TAGS",
+                       "\"script\", \"style\", \"noscript\", \"svg\", \"nav\", \"header\", \"footer\", \"aside\"",
+                       "\"#\".repeat(Number(name[1]))", "name === \"li\"", "name === \"blockquote\"",
+                       "name === \"pre\"", "name === \"code\"", "name === \"a\"", "href"] {
+            XCTAssertTrue(source.contains(needle), "web_fetch extraction contract missing: \(needle)")
+        }
+        XCTAssertTrue(source.contains("decodeEntities"), "Chinese and entity text must not be ASCII-stripped")
+        XCTAssertTrue(source.contains("const tokens = /<!--[\\s\\S]*?-->|<[^>]*>/g"), "comments must be tokenized away")
+    }
+
+    func testWebFetchRSCAndHTTPBoundaryContract() throws {
+        let source = try generatedSource()
+
+        for needle in ["function extractRSCText", "self\\.__next_f\\.push", "body.replace(/\\s/g, \"\").length < 80",
+                       "MAX_RESPONSE_BYTES = 5 * 1024 * 1024", "function readTextWithLimit",
+                       "size > MAX_RESPONSE_BYTES", "new URL(url)",
+                       "parsed.protocol !== \"http:\" && parsed.protocol !== \"https:\"",
+                       "request timed out (30s)", "HTTP ${res.status}",
+                       "text/plain, JSON, and XML are intentionally returned directly", "[truncated]"] {
+            XCTAssertTrue(source.contains(needle), "web_fetch boundary/fallback contract missing: \(needle)")
+        }
+    }
+
+    func testWebFetchParameterCompatibilityIsPreserved() throws {
+        let source = try generatedSource()
+        XCTAssertTrue(source.contains("name: \"web_fetch\""))
+        XCTAssertTrue(source.contains("url: Type.String("))
+        XCTAssertTrue(source.contains("max_length: Type.Optional("))
+        XCTAssertTrue(source.contains("Math.min(Math.max(Math.round(params.max_length || 20000), 1000), 100000)"))
+    }
+
+    /// Generic web_fetch must not carry the specialized GitHub parser, APIs, clone
+    /// machinery, or fallback route. It may only teach the caller which tool to use.
+    func testWebFetchCoreHasNoGitHubSpecializedRouter() throws {
+        let source = try generatedSource()
+        for forbidden in ["type GitHubTarget", "parseGitHubCodeURL", "fetchGitHubCode",
+                          "fetchGitHubBlob", "fetchGitHubRepoOrTree", "GITHUB_TOTAL_BUDGET_MS",
+                          "api.github.com/repos/", "node:child_process", "githubHeaders", "Git LFS pointer"] {
+            XCTAssertFalse(source.contains(forbidden), "GitHub implementation leaked into web core: \(forbidden)")
+        }
+        XCTAssertEqual(source.components(separatedBy: "name: \"web_fetch\"").count - 1, 1)
+        XCTAssertTrue(source.contains("async function fetchGenericWebURL"),
+                      "generic HTTP/HTML/RSC/text/json/xml fetch remains owned by web_fetch")
+        XCTAssertTrue(source.contains("Use github_fetch instead for GitHub repository roots"),
+                      "web_fetch must route repo/blob/tree intent to the independent package")
+    }
+
     // MARK: - Native search detection
 
     func testNativeSearchGrok() {

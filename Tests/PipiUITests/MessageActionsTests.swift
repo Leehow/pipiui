@@ -86,16 +86,68 @@ final class MessageActionsTests: XCTestCase {
         XCTAssertEqual(MessageActions.copyableText(from: item), "visible")
     }
 
-    func testUserAuthoredMessageExcludesRuntimeWorkerSignals() {
+    func testNavigationEligibleHumanPromptExcludesRuntimeAndSystemInjections() {
         func userItem(_ text: String) -> ChatItem {
             ChatItem(id: text, role: "user", blocks: [.text(text)])
         }
 
+        // Real human prompts (text and image/attachment-only).
+        XCTAssertTrue(MessageActions.isNavigationEligibleHumanPrompt(userItem("修复跳转")))
         XCTAssertTrue(MessageActions.isUserAuthoredMessage(userItem("修复跳转")))
-        XCTAssertFalse(MessageActions.isUserAuthoredMessage(userItem("[subagent-done] agentId=a")))
-        XCTAssertFalse(MessageActions.isUserAuthoredMessage(userItem("[worktree-merge-failed] merge failed")))
-        XCTAssertFalse(MessageActions.isUserAuthoredMessage(
+        XCTAssertTrue(MessageActions.isNavigationEligibleHumanPromptText("普通用户问题"))
+        XCTAssertTrue(MessageActions.isNavigationEligibleHumanPromptText(""),
+                      "image-only human prompts yield empty copyable text")
+
+        let annotated = ImageAttachment.messageWithAttachmentPaths(
+            text: "看这张图",
+            paths: [URL(fileURLWithPath: "/tmp/shot.png")]
+        )
+        XCTAssertTrue(MessageActions.isNavigationEligibleHumanPrompt(userItem(annotated)))
+
+        let imageOnly = ChatItem(
+            id: "img",
+            role: "user",
+            blocks: [.image(ImageBlock(id: "i", data: Data([1, 2, 3]), mimeType: "image/png"))]
+        )
+        XCTAssertTrue(MessageActions.isNavigationEligibleHumanPrompt(imageOnly))
+
+        // Runtime / system injections into the user role — not navigation-eligible.
+        let injected: [String] = [
+            "[subagent-done] agentId=a",
+            "[subagent-heartbeat] outstanding=2 idle=30s",
+            "[subagent-stalled] agentId=abc idle=120s",
+            "[subagent-interrupted-reminder] agentId=x state=interrupted title=t idle=90s nudge=1/2",
+            "[worktree-merge-failed] merge failed",
+            "[post-merge-verify-failed] agentId=x name=worker branch=b",
+            "## Git (Pipi UI)\nbranch: main\ndirty: no",
+            "[PipiUI session skill policy: superpowers:using-superpowers bootstrap for pi\nSkills remain available.]",
+            "[PipiUI internal — session title] generate title",
+            "[PipiUI subagent isolation sentinel: superpowers:using-superpowers bootstrap for pi]",
+            "(re-delivery #2: the previous [subagent-done] below was not confirmed)",
+            "(recovered delivery: this [subagent-done] may already have been delivered)",
+        ]
+        for text in injected {
+            XCTAssertFalse(
+                MessageActions.isNavigationEligibleHumanPrompt(userItem(text)),
+                "expected injected text to be excluded: \(text.prefix(48))"
+            )
+            XCTAssertFalse(
+                MessageActions.isUserAuthoredMessage(userItem(text)),
+                "alias must match: \(text.prefix(48))"
+            )
+            XCTAssertTrue(
+                MessageActions.isRuntimeOrSystemInjectedUserText(
+                    MessageActions.copyableText(from: userItem(text))
+                ),
+                "text seam: \(text.prefix(48))"
+            )
+        }
+
+        XCTAssertFalse(MessageActions.isNavigationEligibleHumanPrompt(
             ChatItem(id: "a", role: "assistant", blocks: [.text("answer")])
+        ))
+        XCTAssertFalse(MessageActions.isNavigationEligibleHumanPrompt(
+            ChatItem(id: "s", role: "system", blocks: [.text("note")])
         ))
     }
 
@@ -121,6 +173,18 @@ final class MessageActionsTests: XCTestCase {
             role: "user", entryId: "e", displayText: "[subagent-done] x", isWorking: false))
         XCTAssertFalse(MessageActions.showsMutatingActions(
             role: "user", entryId: "e", displayText: "[worktree-merge-failed] x", isWorking: false))
+        XCTAssertFalse(MessageActions.showsMutatingActions(
+            role: "user", entryId: "e",
+            displayText: "[subagent-heartbeat] outstanding=1 vanished=0", isWorking: false))
+        XCTAssertFalse(MessageActions.showsMutatingActions(
+            role: "user", entryId: "e",
+            displayText: "[post-merge-verify-failed] agentId=x", isWorking: false))
+        XCTAssertFalse(MessageActions.showsMutatingActions(
+            role: "user", entryId: "e",
+            displayText: "## Git (Pipi UI)\nbranch: main", isWorking: false))
+        XCTAssertFalse(MessageActions.showsMutatingActions(
+            role: "user", entryId: "e",
+            displayText: "[PipiUI session skill policy: x]", isWorking: false))
         XCTAssertTrue(MessageActions.showsMutatingActions(
             role: "user", entryId: "e", displayText: "hi", isWorking: false))
     }

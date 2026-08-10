@@ -6,6 +6,11 @@ import SwiftUI
 /// Absolute file paths in prose become clickable (not inside fenced code).
 struct MarkdownTextView: View {
     let text: String
+    /// Chat is the compatibility default. DocumentPanel supplies a source URL so links, local
+    /// images, and reader typography can use the same AST/TextKit pipeline safely.
+    var renderContext: MarkdownRenderContext = .chat
+    /// Explicit document-tab routing takes precedence over the transcript environment hook.
+    var documentOpenAction: ((URL) -> Void)? = nil
     var lineLimit: Int? = nil
     /// Streaming rows may defer expensive inline markdown on the unstable tail.
     /// Settled messages leave this `false` so rendering stays bit-identical.
@@ -22,9 +27,10 @@ struct MarkdownTextView: View {
         SelectableMarkdownTextView(
             markdownText: text,
             typography: chatTypography,
+            renderContext: renderContext,
             maximumNumberOfLines: lineLimit,
             isStreaming: isStreaming,
-            onOpenDocument: openDocument,
+            onOpenDocument: documentOpenAction ?? openDocument,
             onFlash: onFlash
         )
     }
@@ -49,103 +55,126 @@ struct MarkdownTextView: View {
         return blocks
     }
 
-    enum Block: Equatable {
-        case paragraph(String)
-        case heading(Int, String)
-        case code(String)
+    /// AST-adapted block contract. The AppKit host still owns one NSTextStorage for the
+    /// whole message; only parsing/render decisions moved from line heuristics to Markdown AST.
+    indirect enum Block: Equatable {
+        case paragraph(InlineContent)
+        case heading(Int, InlineContent)
+        case code(String, language: String?)
         case mono(String) // ASCII art / diagrams outside fences
-        case table(header: [String], rows: [[String]])
+        case table(
+            header: [InlineContent],
+            rows: [[InlineContent]],
+            alignments: [TableAlignment?]
+        )
         case list([ListItem])
-        case quote(String)
+        case quote([Block])
         case rule
+    }
+
+    struct InlineContent: Equatable {
+        let runs: [InlineRun]
+
+        init(runs: [InlineRun]) {
+            self.runs = runs
+        }
+
+        static func plain(_ text: String) -> Self {
+            Self(runs: [.text(text)])
+        }
+
+        var plainText: String {
+            runs.map(\.plainText).joined()
+        }
+    }
+
+    indirect enum InlineRun: Equatable {
+        case text(String)
+        case softBreak
+        case hardBreak
+        case emphasis([InlineRun])
+        case strong([InlineRun])
+        case strikethrough([InlineRun])
+        case code(String)
+        case link(destination: String?, children: [InlineRun])
+        /// Inline image attachments intentionally degrade to linked alt text in the selection host.
+        /// Loading arbitrary remote/local binaries into NSTextStorage would undermine stable text
+        /// selection and streaming measurement; native message image blocks remain unchanged.
+        case image(source: String?, alt: [InlineRun])
+
+        var plainText: String {
+            switch self {
+            case .text(let text), .code(let text):
+                return text
+            case .softBreak, .hardBreak:
+                return "\n"
+            case .emphasis(let children), .strong(let children), .strikethrough(let children):
+                return children.map(\.plainText).joined()
+            case .link(_, let children):
+                return children.map(\.plainText).joined()
+            case .image(_, let alt):
+                let label = alt.map(\.plainText).joined()
+                return "[Image: \(label.isEmpty ? "image" : label)]"
+            }
+        }
+    }
+
+    enum TaskState: Equatable {
+        case checked
+        case unchecked
+    }
+
+    enum TableAlignment: Equatable {
+        case left
+        case center
+        case right
     }
 
     struct ListItem: Equatable {
         let marker: String
-        let text: String
+        let content: InlineContent
         let indent: Int
+        let taskState: TaskState?
+
+        init(
+            marker: String,
+            content: InlineContent,
+            indent: Int,
+            taskState: TaskState? = nil
+        ) {
+            self.marker = marker
+            self.content = content
+            self.indent = indent
+            self.taskState = taskState
+        }
+
+        /// Compatibility initializer for focused list tests and legacy callers. The unfinished
+        /// stream tail uses the explicit `content: .plain(...)` initializer to stay cheap.
+        init(marker: String, text: String, indent: Int) {
+            self.init(
+                marker: marker,
+                content: MarkdownASTAdapter.inlineContent(from: text),
+                indent: indent
+            )
+        }
+
+        var text: String { content.plainText }
     }
 
     // MARK: - Parsing
 
+    /// Settled assistant-message markdown is parsed by swift-markdown's GFM AST. The narrow
+    /// incremental line recognizers below are retained exclusively for the unfinished stream tail.
     static func parse(_ text: String) -> [Block] {
-        var blocks: [Block] = []
-        var paragraph: [String] = []
-        var listItems: [ListItem] = []
-        var quoteLines: [String] = []
-        var codeLines: [String]?
-
-        func flushParagraph() {
-            guard !paragraph.isEmpty else { return }
-            let joined = paragraph.joined(separator: "\n")
-            blocks.append(looksLikeAsciiArt(joined) ? .mono(joined) : .paragraph(joined))
-            paragraph = []
-        }
-        func flushList() {
-            if !listItems.isEmpty { blocks.append(.list(listItems)); listItems = [] }
-        }
-        func flushQuote() {
-            if !quoteLines.isEmpty { blocks.append(.quote(quoteLines.joined(separator: "\n"))); quoteLines = [] }
-        }
-        func flushAll() { flushParagraph(); flushList(); flushQuote() }
-
-        let lines = text.components(separatedBy: "\n")
-        var i = 0
-        while i < lines.count {
-            let line = lines[i]
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-            if codeLines != nil {
-                if trimmed.hasPrefix("```") {
-                    blocks.append(.code(codeLines!.joined(separator: "\n")))
-                    codeLines = nil
-                } else {
-                    codeLines!.append(line)
-                }
-                i += 1; continue
-            }
-            if trimmed.hasPrefix("```") {
-                flushAll(); codeLines = []; i += 1; continue
-            }
-            if trimmed.hasPrefix("|"), i + 1 < lines.count, isTableSeparator(lines[i + 1]) {
-                flushAll()
-                let header = tableCells(trimmed)
-                var rows: [[String]] = []
-                i += 2
-                while i < lines.count {
-                    let rowTrimmed = lines[i].trimmingCharacters(in: .whitespaces)
-                    guard rowTrimmed.hasPrefix("|") else { break }
-                    rows.append(tableCells(rowTrimmed))
-                    i += 1
-                }
-                blocks.append(.table(header: header, rows: rows))
-                continue
-            }
-            if trimmed.isEmpty { flushAll(); i += 1; continue }
-            if let (level, title) = headingLevel(trimmed) {
-                flushAll(); blocks.append(.heading(level, title)); i += 1; continue
-            }
-            if trimmed == "---" || trimmed == "***" || trimmed == "___" {
-                flushAll(); blocks.append(.rule); i += 1; continue
-            }
-            if trimmed.hasPrefix(">") {
-                flushParagraph(); flushList()
-                quoteLines.append(String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces))
-                i += 1; continue
-            }
-            if let item = listItem(line) {
-                flushParagraph(); flushQuote()
-                listItems.append(item)
-                i += 1; continue
-            }
-            flushList(); flushQuote()
-            paragraph.append(line)
-            i += 1
-        }
-        if let codeLines { blocks.append(.code(codeLines.joined(separator: "\n"))) }
-        flushAll()
-        return blocks
+        MarkdownASTAdapter.blocks(from: text)
     }
+
+    /// Test / memory-pressure helper: drop complete-document AST parse entries.
+    static func clearParseCache() {
+        parseCache.removeAllObjects()
+    }
+
+    // MARK: - Cheap unfinished-tail syntax
 
     fileprivate static func headingLevel(_ line: String) -> (Int, String)? {
         guard line.hasPrefix("#") else { return nil }
@@ -175,23 +204,50 @@ struct MarkdownTextView: View {
         let leading = line.prefix(while: { $0 == " " }).count
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         for bullet in ["- ", "* ", "+ "] where trimmed.hasPrefix(bullet) {
-            return ListItem(marker: "•", text: String(trimmed.dropFirst(2)), indent: leading / 2)
+            let (taskState, text) = taskStateAndText(String(trimmed.dropFirst(2)))
+            return ListItem(
+                marker: "•",
+                content: .plain(text),
+                indent: leading / 2,
+                taskState: taskState
+            )
         }
         if let dot = trimmed.firstIndex(where: { $0 == "." || $0 == ")" }),
            trimmed.index(after: dot) < trimmed.endIndex,
            trimmed[trimmed.index(after: dot)] == " ",
            !trimmed[..<dot].isEmpty, trimmed[..<dot].allSatisfy(\.isNumber) {
+            let (taskState, text) = taskStateAndText(
+                String(trimmed[trimmed.index(dot, offsetBy: 2)...])
+            )
             return ListItem(
                 marker: String(trimmed[..<dot]) + ".",
-                text: String(trimmed[trimmed.index(dot, offsetBy: 2)...]),
-                indent: leading / 2
+                content: .plain(text),
+                indent: leading / 2,
+                taskState: taskState
             )
         }
         return nil
     }
 
+    fileprivate static func taskStateAndText(_ text: String) -> (TaskState?, String) {
+        let lower = text.lowercased()
+        if lower.hasPrefix("[x] ") {
+            return (.checked, String(text.dropFirst(4)))
+        }
+        if lower.hasPrefix("[ ] ") {
+            return (.unchecked, String(text.dropFirst(4)))
+        }
+        return (nil, text)
+    }
+
+    fileprivate static func fenceLanguage(_ trimmed: String) -> String? {
+        guard trimmed.hasPrefix("```") else { return nil }
+        let info = trimmed.dropFirst(3).trimmingCharacters(in: .whitespaces)
+        return info.split(whereSeparator: { $0.isWhitespace }).first.map(String.init)
+    }
+
     /// 含框线字符或多行大量空格对齐的段落按等宽渲染，避免简图错位。
-    fileprivate static func looksLikeAsciiArt(_ text: String) -> Bool {
+    static func looksLikeAsciiArt(_ text: String) -> Bool {
         let artChars = CharacterSet(charactersIn: "│┌┐└┘├┤┬┴┼─═║╔╗╚╝▼▲◄►")
         if text.unicodeScalars.contains(where: { artChars.contains($0) }) { return true }
         let lines = text.components(separatedBy: "\n")
@@ -207,10 +263,43 @@ struct MarkdownTextView: View {
         )) ?? AttributedString(string)
     }
 
-    /// Inline markdown parse cache. Session history text is immutable, so a warm switch that
-    /// rebuilds ~150 `MessageRow`s (each with several markdown blocks) re-parses nothing — the
-    /// `AttributedString(markdown:)` Foundation call is the single biggest main-thread cost there.
-    /// Keyed by the raw string, matching `parseCache`.
+    /// Inline markdown for "thinking"/reasoning blocks. Renders `**bold**` (and other
+    /// inline spans) without leaking raw `*` delimiters, and unions `.emphasized`
+    /// (italic) into every run so the block keeps its reasoning look while preserving
+    /// `.stronglyEmphasized` (bold) where the model wrote `**...**`. Unlike
+    /// `inlineWithPaths`, it injects no path-link styling, so the caller's uniform
+    /// `.foregroundStyle` is preserved. Cached by raw string (immutable thinking text
+    /// → always hits after first view), mirroring `inlineWithPaths`.
+    static func thinkingInline(_ string: String) -> AttributedString {
+        let key = string as NSString
+        if let cached = thinkingInlineCache.object(forKey: key) { return cached.attributed }
+        var result = inline(string)
+        // Bake italic into every run without clobbering bold: union `.emphasized` into
+        // each run's `inlinePresentationIntent` (SwiftUI `Text` honors both intents, so
+        // bold ranges render bold-italic and plain ranges render italic).
+        let updates = result.runs.map { run -> (Range<AttributedString.Index>, InlinePresentationIntent) in
+            var intent = run.inlinePresentationIntent ?? []
+            intent.insert(.emphasized)
+            return (run.range, intent)
+        }
+        for (range, intent) in updates {
+            result[range].inlinePresentationIntent = intent
+        }
+        thinkingInlineCache.setObject(InlineBox(result), forKey: key)
+        return result
+    }
+
+    /// Cache for `thinkingInline`, separate from `inlineCache` (whose entries are
+    /// path-styled prose; thinking text needs baked-italic and never path links).
+    private static let thinkingInlineCache: NSCache<NSString, InlineBox> = {
+        let cache = NSCache<NSString, InlineBox>()
+        cache.countLimit = 1000
+        return cache
+    }()
+
+    /// Legacy inline-call cache. Active assistant blocks arrive as `InlineContent` from the
+    /// swift-markdown AST; this raw-string path remains for the inactive legacy block view and
+    /// callers that need a standalone inline fragment. Keyed by raw text, matching `parseCache`.
     private static let inlineCache: NSCache<NSString, InlineBox> = {
         let cache = NSCache<NSString, InlineBox>()
         cache.countLimit = 1000
@@ -222,14 +311,20 @@ struct MarkdownTextView: View {
         init(_ attributed: AttributedString) { self.attributed = attributed }
     }
 
-    /// Inline markdown for prose blocks. Path style + ⌘+click targets are applied once in
-    /// `PathLinkedText` via `FileReveal.pathLinkedContent` (avoids a second full-text scan).
-    /// Result is cached by the raw string (immutable history text → always hits after first view).
+    /// AST-backed inline fragment for prose blocks. `FileReveal` injects only bare-path styling
+    /// and deliberately leaves explicit markdown links intact.
+    static func inlineWithPaths(_ content: InlineContent) -> AttributedString {
+        MarkdownASTInlineRenderer.attributed(content)
+    }
+
+    /// Standalone AST-backed inline parse for compatibility call sites. The active message path
+    /// avoids this second parse because its `Block` already carries the adapted inline nodes.
     static func inlineWithPaths(_ string: String) -> AttributedString {
         let key = string as NSString
         if let cached = inlineCache.object(forKey: key) { return cached.attributed }
-        // Plain prose without markdown markers: hand plain attributed text to PathLinkedText.
-        let result = hasInlineMarkdownMarkers(string) ? inline(string) : AttributedString(string)
+        let result = MarkdownASTInlineRenderer.attributed(
+            MarkdownASTAdapter.inlineContent(from: string)
+        )
         inlineCache.setObject(InlineBox(result), forKey: key)
         return result
     }
@@ -237,6 +332,50 @@ struct MarkdownTextView: View {
     /// Test / memory-pressure helper: drop the inline markdown cache.
     static func clearInlineCache() {
         inlineCache.removeAllObjects()
+    }
+
+    /// Test / memory-pressure helper: drop the thinking-inline markdown cache.
+    static func clearThinkingInlineCache() {
+        thinkingInlineCache.removeAllObjects()
+    }
+
+    /// True when a subagent log text item has markdown structure that benefits
+    /// from the rich NSTextView renderer; plain prose/log lines return `false` so
+    /// the row can use a lightweight selectable `Text` (no NSTextView, no markdown
+    /// parse, no measurement host). Used by `AgentLogRow` to keep the common
+    /// plain-log row off the expensive path. Pure and deterministic for tests.
+    ///
+    /// Block-level markers (headings, fences, tables, quotes, lists, rules) or any
+    /// inline marker (bold/italic/code/link/strikethrough) triggers the rich path;
+    /// only genuinely plain text goes lightweight. Combined with the lazy detail
+    /// container this bounds mounted NSTextViews to visible structured rows.
+    static func logTextNeedsRichRendering(_ text: String) -> Bool {
+        guard !text.isEmpty else { return false }
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false).prefix(64) {
+            let trimmed = raw.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
+            if trimmed.hasPrefix("#")          // heading
+                || trimmed.hasPrefix("```")    // fenced code
+                || trimmed.hasPrefix("|")      // table row
+                || trimmed.hasPrefix(">")      // blockquote
+                || trimmed.hasPrefix("- ")
+                || trimmed.hasPrefix("* ")
+                || trimmed.hasPrefix("+ ")     // unordered list
+                || trimmed == "---"
+                || trimmed == "***"
+                || trimmed == "___" {          // thematic rule
+                return true
+            }
+            // Ordered list: digits then "."/")" then a space.
+            if let delim = trimmed.firstIndex(where: { $0 == "." || $0 == ")" }),
+               trimmed.index(after: delim) < trimmed.endIndex,
+               trimmed[trimmed.index(after: delim)] == " ",
+               !trimmed[..<delim].isEmpty,
+               trimmed[..<delim].allSatisfy(\.isNumber) {
+                return true
+            }
+        }
+        return hasInlineMarkdownMarkers(text)
     }
 
     private static func hasInlineMarkdownMarkers(_ string: String) -> Bool {
@@ -248,8 +387,8 @@ struct MarkdownTextView: View {
             || string.contains("~~")
     }
 
-    /// One AttributedString for a whole list block so bullets and text preserve
-    /// one visual run. (Separate `PathLinkedText` per item cannot share styling.)
+    /// One AttributedString for legacy callers; the active NSTextView additionally applies
+    /// hanging indents per item in `MarkdownSelectionContent`.
     static func listAttributed(_ items: [ListItem]) -> AttributedString {
         var result = AttributedString()
         for (index, item) in items.enumerated() {
@@ -260,7 +399,12 @@ struct MarkdownTextView: View {
             var marker = AttributedString(item.marker + " ")
             marker.foregroundColor = Color.secondary
             result.append(marker)
-            result.append(inlineWithPaths(item.text))
+            if let taskState = item.taskState {
+                var checkbox = AttributedString(taskState == .checked ? "☑ " : "☐ ")
+                checkbox.foregroundColor = taskState == .checked ? Color.accentColor : Color.secondary
+                result.append(checkbox)
+            }
+            result.append(inlineWithPaths(item.content))
         }
         return result
     }
@@ -268,6 +412,11 @@ struct MarkdownTextView: View {
 
 /// Flattens rendered markdown blocks into one attributed storage while preserving the text a
 /// user sees and copies. The AppKit bridge below then provides a single native selection range.
+private extension NSAttributedString.Key {
+    /// Semantic anchor written only for document-reader headings. Chat storage remains untouched.
+    static let pipiDocumentHeadingID = NSAttributedString.Key("PipiUI.DocumentHeadingID")
+}
+
 enum MarkdownSelectionContent {
     enum ParagraphRole {
         case body
@@ -278,18 +427,34 @@ enum MarkdownSelectionContent {
 
     static func attributedString(
         for text: String,
-        typography: ChatTypography = .make(fontSize: ChatTypography.defaultFontSize)
+        typography: ChatTypography = .make(fontSize: ChatTypography.defaultFontSize),
+        context: MarkdownRenderContext = .chat,
+        headingIDs: [String]? = nil
     ) -> NSAttributedString {
-        attributedString(for: MarkdownTextView.cachedParse(text), typography: typography)
+        attributedString(
+            for: MarkdownTextView.cachedParse(text),
+            typography: typography,
+            context: context,
+            headingIDs: headingIDs
+        )
     }
 
     static func attributedString(
         for blocks: [MarkdownTextView.Block],
         typography: ChatTypography = .make(fontSize: ChatTypography.defaultFontSize),
-        inlineHighlight: Bool = true
+        inlineHighlight: Bool = true,
+        context: MarkdownRenderContext = .chat,
+        headingIDs: [String]? = nil
     ) -> NSAttributedString {
         let result = NSMutableAttributedString()
-        append(blocks, to: result, typography: typography, inlineHighlight: inlineHighlight)
+        append(
+            blocks,
+            to: result,
+            typography: typography,
+            inlineHighlight: inlineHighlight,
+            context: context,
+            headingIDs: headingIDs
+        )
         return result
     }
 
@@ -297,76 +462,134 @@ enum MarkdownSelectionContent {
         _ blocks: ArraySlice<MarkdownTextView.Block>,
         to result: NSMutableAttributedString,
         typography: ChatTypography,
-        inlineHighlight: Bool = true
+        inlineHighlight: Bool = true,
+        context: MarkdownRenderContext = .chat,
+        headingIDs: [String]? = nil
     ) {
-        append(Array(blocks), to: result, typography: typography, inlineHighlight: inlineHighlight)
+        append(
+            Array(blocks),
+            to: result,
+            typography: typography,
+            inlineHighlight: inlineHighlight,
+            context: context,
+            headingIDs: headingIDs
+        )
     }
 
     static func append(
         _ blocks: [MarkdownTextView.Block],
         to result: NSMutableAttributedString,
         typography: ChatTypography,
-        inlineHighlight: Bool = true
+        inlineHighlight: Bool = true,
+        context: MarkdownRenderContext = .chat,
+        headingIDs: [String]? = nil
     ) {
-        let bodyStyle = paragraphStyle(for: typography, role: .body)
-        let listStyle = paragraphStyle(for: typography, role: .list)
-        let headingStyle = paragraphStyle(for: typography, role: .heading)
-        let codeStyle = paragraphStyle(for: typography, role: .code)
+        append(
+            blocks,
+            to: result,
+            renderStyle: MarkdownRenderStyle(typography: typography, context: context),
+            inlineHighlight: inlineHighlight,
+            headingIDs: headingIDs
+        )
+    }
+
+    private static func append(
+        _ blocks: [MarkdownTextView.Block],
+        to result: NSMutableAttributedString,
+        renderStyle: MarkdownRenderStyle,
+        inlineHighlight: Bool,
+        headingIDs: [String]?
+    ) {
+        let bodyStyle = paragraphStyle(for: renderStyle, role: .body)
+        let codeStyle = paragraphStyle(for: renderStyle, role: .code)
+        var headingIndex = 0
 
         for block in blocks {
             if result.length > 0 {
-                result.append(blockSeparator(typography: typography))
+                result.append(blockSeparator(style: renderStyle))
             }
             switch block {
             case .paragraph(let paragraph):
                 result.append(rendered(
-                    proseAttributed(paragraph, inlineHighlight: inlineHighlight),
-                    font: typography.bodyNSFont,
-                    codeFont: typography.codeNSFont,
+                    proseAttributed(
+                        paragraph,
+                        inlineHighlight: inlineHighlight,
+                        context: renderStyle.context
+                    ),
+                    font: renderStyle.bodyNSFont,
+                    codeFont: renderStyle.codeNSFont,
                     style: bodyStyle
                 ))
             case .heading(let level, let title):
-                result.append(rendered(
-                    proseAttributed(title, inlineHighlight: inlineHighlight),
-                    font: typography.headingNSFont(level: level),
-                    codeFont: typography.codeNSFont,
-                    style: headingStyle
+                let heading = NSMutableAttributedString(attributedString: rendered(
+                    proseAttributed(
+                        title,
+                        inlineHighlight: inlineHighlight,
+                        context: renderStyle.context
+                    ),
+                    font: renderStyle.headingNSFont(level: level),
+                    codeFont: renderStyle.codeNSFont,
+                    style: paragraphStyle(
+                        for: renderStyle,
+                        role: .heading,
+                        headingLevel: level
+                    )
                 ))
-            case .code(let code), .mono(let code):
+                if let headingIDs,
+                   headingIndex < headingIDs.count,
+                   heading.length > 0 {
+                    heading.addAttribute(
+                        .pipiDocumentHeadingID,
+                        value: headingIDs[headingIndex],
+                        range: NSRange(location: 0, length: heading.length)
+                    )
+                }
+                headingIndex += 1
+                result.append(heading)
+            case .code(let code, let language):
+                result.append(codeAttributed(
+                    code: code,
+                    language: language,
+                    renderStyle: renderStyle,
+                    style: codeStyle
+                ))
+            case .mono(let code):
                 result.append(rendered(
                     AttributedString(code),
-                    font: typography.codeNSFont,
-                    codeFont: typography.codeNSFont,
+                    font: renderStyle.codeNSFont,
+                    codeFont: renderStyle.codeNSFont,
                     style: codeStyle,
-                    background: NSColor.labelColor.withAlphaComponent(0.05)
+                    background: renderStyle.monoBackground
                 ))
             case .list(let items):
-                result.append(rendered(
-                    listAttributed(items, inlineHighlight: inlineHighlight),
-                    font: typography.bodyNSFont,
-                    codeFont: typography.codeNSFont,
-                    style: listStyle
+                result.append(listAttributed(
+                    items,
+                    renderStyle: renderStyle,
+                    inlineHighlight: inlineHighlight
                 ))
-            case .quote(let quote):
-                result.append(rendered(
-                    proseAttributed(quote, inlineHighlight: inlineHighlight),
-                    font: typography.bodyNSFont,
-                    codeFont: typography.codeNSFont,
-                    style: bodyStyle,
-                    color: .secondaryLabelColor
+            case .quote(let quoteBlocks):
+                result.append(quoteAttributed(
+                    quoteBlocks,
+                    renderStyle: renderStyle,
+                    inlineHighlight: inlineHighlight
                 ))
-            case .table(let header, let rows):
-                result.append(rendered(
-                    tableAttributed(header: header, rows: rows, inlineHighlight: inlineHighlight),
-                    font: typography.bodyNSFont,
-                    codeFont: typography.codeNSFont,
-                    style: bodyStyle
+            case .table(let header, let rows, let alignments):
+                result.append(tableAttributed(
+                    header: header,
+                    rows: rows,
+                    alignments: alignments,
+                    renderStyle: renderStyle,
+                    inlineHighlight: inlineHighlight
                 ))
             case .rule:
                 result.append(rendered(
-                    AttributedString("────────"),
-                    font: typography.bodyNSFont,
-                    codeFont: typography.codeNSFont,
+                    AttributedString(
+                        renderStyle.isDocument
+                            ? "────────────────────────────────"
+                            : "────────────────────────"
+                    ),
+                    font: renderStyle.bodyNSFont,
+                    codeFont: renderStyle.codeNSFont,
                     style: bodyStyle,
                     color: .separatorColor
                 ))
@@ -374,86 +597,474 @@ enum MarkdownSelectionContent {
         }
     }
 
-    /// Streaming tail path: skip `AttributedString(markdown:)` until the block settles.
-    private static func proseAttributed(_ string: String, inlineHighlight: Bool) -> AttributedString {
-        inlineHighlight ? MarkdownTextView.inlineWithPaths(string) : AttributedString(string)
+    /// Streaming-tail blocks carry cheap plain inline content; settled blocks carry AST runs.
+    private static func proseAttributed(
+        _ content: MarkdownTextView.InlineContent,
+        inlineHighlight: Bool,
+        context: MarkdownRenderContext
+    ) -> AttributedString {
+        MarkdownASTInlineRenderer.attributed(
+            content,
+            includeFormatting: inlineHighlight,
+            context: context
+        )
     }
 
+    /// Render each list item as a paragraph so TextKit can use a real hanging indent instead of
+    /// literal leading spaces. It remains one NSTextStorage and therefore one drag-selection span.
     private static func listAttributed(
         _ items: [MarkdownTextView.ListItem],
+        renderStyle: MarkdownRenderStyle,
         inlineHighlight: Bool
-    ) -> AttributedString {
-        guard inlineHighlight else {
-            var result = AttributedString()
-            for (index, item) in items.enumerated() {
-                if index > 0 { result.append(AttributedString("\n")) }
-                if item.indent > 0 {
-                    result.append(AttributedString(String(repeating: "  ", count: item.indent)))
-                }
-                var marker = AttributedString(item.marker + " ")
-                marker.foregroundColor = Color.secondary
-                result.append(marker)
-                result.append(AttributedString(item.text))
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        for (index, item) in items.enumerated() {
+            if index > 0 { result.append(NSAttributedString(string: "\n")) }
+
+            let line = NSMutableAttributedString()
+            let marker = NSMutableAttributedString(string: item.marker + " ")
+            marker.addAttribute(
+                .foregroundColor,
+                value: NSColor.secondaryLabelColor,
+                range: NSRange(location: 0, length: marker.length)
+            )
+            marker.addAttribute(
+                .font,
+                value: renderStyle.bodyNSFont,
+                range: NSRange(location: 0, length: marker.length)
+            )
+            line.append(marker)
+
+            if let taskState = item.taskState {
+                let checkbox = NSMutableAttributedString(
+                    string: taskState == .checked ? "☑ " : "☐ "
+                )
+                checkbox.addAttribute(
+                    .foregroundColor,
+                    value: taskState == .checked ? NSColor.controlAccentColor : NSColor.secondaryLabelColor,
+                    range: NSRange(location: 0, length: checkbox.length)
+                )
+                checkbox.addAttribute(
+                    .font,
+                    value: renderStyle.bodyNSFont,
+                    range: NSRange(location: 0, length: checkbox.length)
+                )
+                line.append(checkbox)
             }
-            return result
+
+            line.append(rendered(
+                proseAttributed(
+                    item.content,
+                    inlineHighlight: inlineHighlight,
+                    context: renderStyle.context
+                ),
+                font: renderStyle.bodyNSFont,
+                codeFont: renderStyle.codeNSFont,
+                style: paragraphStyle(for: renderStyle, role: .list)
+            ))
+
+            let baseIndent = CGFloat(item.indent) * (
+                renderStyle.isDocument
+                    ? max(22, renderStyle.fontSize * 1.55)
+                    : max(20, renderStyle.fontSize * 1.45)
+            )
+            let style = NSMutableParagraphStyle()
+            style.lineSpacing = renderStyle.lineSpacing
+            style.paragraphSpacing = renderStyle.listItemSpacing
+            style.firstLineHeadIndent = baseIndent
+            style.headIndent = baseIndent + (
+                renderStyle.isDocument
+                    ? max(34, renderStyle.fontSize * 2.45)
+                    : max(30, renderStyle.fontSize * 2.3)
+            )
+            let lineRange = NSRange(location: 0, length: line.length)
+            line.addAttribute(.paragraphStyle, value: style, range: lineRange)
+            result.append(line)
         }
-        return MarkdownTextView.listAttributed(items)
+        return result
+    }
+
+    private static func codeAttributed(
+        code: String,
+        language: String?,
+        renderStyle: MarkdownRenderStyle,
+        style: NSParagraphStyle
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let background = renderStyle.codeBackground
+        if let language, !language.isEmpty {
+            let labelStyle = NSMutableParagraphStyle()
+            labelStyle.lineSpacing = 0
+            labelStyle.paragraphSpacing = max(3, renderStyle.fontSize * 0.2)
+            let labelFont = NSFont.monospacedSystemFont(
+                ofSize: max(10, renderStyle.codeNSFont.pointSize - 2),
+                weight: .semibold
+            )
+            result.append(rendered(
+                AttributedString(language),
+                font: labelFont,
+                codeFont: labelFont,
+                style: labelStyle,
+                color: .secondaryLabelColor,
+                background: background
+            ))
+            result.append(NSAttributedString(string: "\n"))
+        }
+        result.append(rendered(
+            AttributedString(code),
+            font: renderStyle.codeNSFont,
+            codeFont: renderStyle.codeNSFont,
+            style: style,
+            background: background
+        ))
+        if result.length > 0 {
+            result.addAttribute(
+                .backgroundColor,
+                value: background,
+                range: NSRange(location: 0, length: result.length)
+            )
+        }
+        return result
+    }
+
+    private static func quoteAttributed(
+        _ blocks: [MarkdownTextView.Block],
+        renderStyle: MarkdownRenderStyle,
+        inlineHighlight: Bool
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString(
+            attributedString: attributedString(
+                for: blocks,
+                typography: renderStyle.typography,
+                inlineHighlight: inlineHighlight,
+                context: renderStyle.context
+            )
+        )
+        guard result.length > 0 else { return result }
+        let source = result.string as NSString
+        var lineStarts = [0]
+        for index in 0..<source.length where source.character(at: index) == 10 {
+            if index + 1 < source.length { lineStarts.append(index + 1) }
+        }
+
+        let quoteBackground = renderStyle.quoteBackground
+        result.addAttribute(
+            .backgroundColor,
+            value: quoteBackground,
+            range: NSRange(location: 0, length: result.length)
+        )
+        for location in lineStarts.reversed() where source.character(at: location) != 10 {
+            let bar = NSMutableAttributedString(string: "▎ ")
+            bar.addAttribute(
+                .foregroundColor,
+                value: NSColor.controlAccentColor.withAlphaComponent(0.8),
+                range: NSRange(location: 0, length: bar.length)
+            )
+            bar.addAttribute(
+                .backgroundColor,
+                value: quoteBackground,
+                range: NSRange(location: 0, length: bar.length)
+            )
+            bar.addAttribute(
+                .font,
+                value: renderStyle.bodyNSFont,
+                range: NSRange(location: 0, length: bar.length)
+            )
+            result.insert(bar, at: location)
+        }
+        return result
     }
 
     /// NSTextView ignores SwiftUI `.lineSpacing`; spacing must live on `NSParagraphStyle`.
     static func paragraphStyle(
         for typography: ChatTypography,
-        role: ParagraphRole = .body
+        role: ParagraphRole = .body,
+        headingLevel: Int? = nil
+    ) -> NSParagraphStyle {
+        paragraphStyle(
+            for: MarkdownRenderStyle(typography: typography, context: .chat),
+            role: role,
+            headingLevel: headingLevel
+        )
+    }
+
+    private static func paragraphStyle(
+        for renderStyle: MarkdownRenderStyle,
+        role: ParagraphRole = .body,
+        headingLevel: Int? = nil
     ) -> NSParagraphStyle {
         let style = NSMutableParagraphStyle()
         switch role {
         case .body:
-            style.lineSpacing = typography.lineSpacing
-            style.paragraphSpacing = typography.paragraphSpacing
+            style.lineSpacing = renderStyle.lineSpacing
+            style.paragraphSpacing = renderStyle.paragraphSpacing
         case .list:
-            style.lineSpacing = typography.lineSpacing
-            style.paragraphSpacing = typography.listItemSpacing
+            style.lineSpacing = renderStyle.lineSpacing
+            style.paragraphSpacing = renderStyle.listItemSpacing
         case .heading:
-            style.lineSpacing = typography.headingLineSpacing
-            style.paragraphSpacing = typography.paragraphSpacing
+            style.lineSpacing = renderStyle.headingLineSpacing
+            if renderStyle.isDocument {
+                let level = headingLevel ?? 6
+                style.paragraphSpacingBefore = max(
+                    level == 1 ? 22 : 15,
+                    renderStyle.fontSize * (level == 1 ? 1.15 : 0.78)
+                )
+                style.paragraphSpacing = max(
+                    level == 1 ? 16 : 11,
+                    renderStyle.fontSize * (level == 1 ? 0.82 : 0.58)
+                )
+            } else {
+                style.paragraphSpacingBefore = max(
+                    6,
+                    renderStyle.fontSize * (headingLevel == 1 ? 0.7 : 0.45)
+                )
+                style.paragraphSpacing = max(6, renderStyle.paragraphSpacing)
+            }
         case .code:
             // ~1.5× total line-height for monospace blocks.
-            style.lineSpacing = typography.fontSize * 0.3
-            style.paragraphSpacing = typography.paragraphSpacing
+            style.lineSpacing = renderStyle.isDocument
+                ? renderStyle.fontSize * 0.26
+                : renderStyle.fontSize * 0.3
+            style.paragraphSpacing = renderStyle.isDocument
+                ? max(12, renderStyle.paragraphSpacing)
+                : renderStyle.paragraphSpacing
         }
         return style
     }
 
     /// Empty paragraph between markdown blocks; height is exactly `blockSpacing`.
     static func blockSeparator(typography: ChatTypography) -> NSAttributedString {
+        blockSeparator(style: MarkdownRenderStyle(typography: typography, context: .chat))
+    }
+
+    private static func blockSeparator(style renderStyle: MarkdownRenderStyle) -> NSAttributedString {
         let style = NSMutableParagraphStyle()
-        style.minimumLineHeight = typography.blockSpacing
-        style.maximumLineHeight = typography.blockSpacing
+        style.minimumLineHeight = renderStyle.blockSpacing
+        style.maximumLineHeight = renderStyle.blockSpacing
         style.lineSpacing = 0
         style.paragraphSpacing = 0
         let result = NSMutableAttributedString(string: "\n\n")
         let range = NSRange(location: 0, length: result.length)
-        result.addAttribute(.font, value: typography.bodyNSFont, range: range)
+        result.addAttribute(.font, value: renderStyle.bodyNSFont, range: range)
         result.addAttribute(.paragraphStyle, value: style, range: range)
         return result
     }
 
-    /// Tab/newline join of table cells, preserving per-cell inline markdown (bold/code/…).
+    /// A text-table treatment avoids individual SwiftUI subviews (which would fragment selection):
+    /// borders are glyph runs, headers are weighted/backed, and rows retain their inline AST styles.
     private static func tableAttributed(
-        header: [String],
-        rows: [[String]],
-        inlineHighlight: Bool = true
-    ) -> AttributedString {
-        var result = AttributedString()
+        header: [MarkdownTextView.InlineContent],
+        rows: [[MarkdownTextView.InlineContent]],
+        alignments: [MarkdownTextView.TableAlignment?],
+        renderStyle: MarkdownRenderStyle,
+        inlineHighlight: Bool
+    ) -> NSAttributedString {
+        if renderStyle.isDocument {
+            return documentTableAttributed(
+                header: header,
+                rows: rows,
+                alignments: alignments,
+                renderStyle: renderStyle,
+                inlineHighlight: inlineHighlight
+            )
+        }
+
+        // Keep the transcript's existing compact table pixels and streaming measurements intact.
+        let typography = renderStyle.typography
+        _ = alignments
+        let result = NSMutableAttributedString()
         let allRows = [header] + rows
         for (rowIndex, row) in allRows.enumerated() {
-            if rowIndex > 0 { result.append(AttributedString("\n")) }
-            for (cellIndex, cell) in row.enumerated() {
-                if cellIndex > 0 { result.append(AttributedString("\t")) }
-                result.append(proseAttributed(cell, inlineHighlight: inlineHighlight))
+            if rowIndex > 0 { result.append(NSAttributedString(string: "\n")) }
+            let line = NSMutableAttributedString()
+            func appendBorder(_ text: String) {
+                let border = NSMutableAttributedString(string: text)
+                border.addAttribute(
+                    .foregroundColor,
+                    value: NSColor.separatorColor,
+                    range: NSRange(location: 0, length: border.length)
+                )
+                border.addAttribute(
+                    .font,
+                    value: typography.bodyNSFont,
+                    range: NSRange(location: 0, length: border.length)
+                )
+                line.append(border)
             }
+
+            appendBorder("│ ")
+            for (column, cell) in row.enumerated() {
+                if column > 0 { appendBorder(" │ ") }
+                line.append(rendered(
+                    proseAttributed(
+                        cell,
+                        inlineHighlight: inlineHighlight,
+                        context: renderStyle.context
+                    ),
+                    font: rowIndex == 0
+                        ? NSFont.systemFont(ofSize: typography.fontSize, weight: .semibold)
+                        : typography.bodyNSFont,
+                    codeFont: typography.codeNSFont,
+                    style: paragraphStyle(for: typography, role: .body)
+                ))
+            }
+            appendBorder(" │")
+
+            let style = NSMutableParagraphStyle()
+            style.lineSpacing = max(2, typography.fontSize * 0.16)
+            style.paragraphSpacing = max(2, typography.fontSize * 0.16)
+            let lineRange = NSRange(location: 0, length: line.length)
+            line.addAttribute(.paragraphStyle, value: style, range: lineRange)
+            let rowBackground: NSColor? = rowIndex == 0
+                ? NSColor.labelColor.withAlphaComponent(0.075)
+                : (!rowIndex.isMultiple(of: 2)
+                    ? NSColor.labelColor.withAlphaComponent(0.025)
+                    : nil)
+            if let rowBackground {
+                applyBackground(rowBackground, toUnbackgroundedRunsIn: line, range: lineRange)
+            }
+            if rowIndex == 0 {
+                line.addAttribute(
+                    .underlineStyle,
+                    value: NSUnderlineStyle.single.rawValue,
+                    range: lineRange
+                )
+            }
+            result.append(line)
         }
         return result
+    }
+
+    /// Document tables use a monospaced grid so AST column alignment is visible while every
+    /// cell remains in the same selectable NSTextStorage. Chat keeps its historical compact rows.
+    private static func documentTableAttributed(
+        header: [MarkdownTextView.InlineContent],
+        rows: [[MarkdownTextView.InlineContent]],
+        alignments: [MarkdownTextView.TableAlignment?],
+        renderStyle: MarkdownRenderStyle,
+        inlineHighlight: Bool
+    ) -> NSAttributedString {
+        let columnCount = max(header.count, rows.map(\.count).max() ?? 0)
+        guard columnCount > 0 else { return NSAttributedString() }
+
+        let allRows = [header] + rows
+        let widths = (0..<columnCount).map { column in
+            max(
+                3,
+                allRows.map { row in
+                    documentTableDisplayWidth(
+                        column < row.count ? row[column].plainText : ""
+                    )
+                }.max() ?? 0
+            )
+        }
+        let rowStyle = NSMutableParagraphStyle()
+        rowStyle.lineSpacing = max(3, renderStyle.fontSize * 0.18)
+        rowStyle.paragraphSpacing = max(4, renderStyle.fontSize * 0.22)
+        let headerFont = NSFont.monospacedSystemFont(
+            ofSize: renderStyle.tableFont.pointSize,
+            weight: .semibold
+        )
+
+        func chrome(_ text: String) -> NSAttributedString {
+            let value = NSMutableAttributedString(string: text)
+            let range = NSRange(location: 0, length: value.length)
+            value.addAttribute(.foregroundColor, value: NSColor.separatorColor, range: range)
+            value.addAttribute(.font, value: renderStyle.tableFont, range: range)
+            value.addAttribute(.paragraphStyle, value: rowStyle, range: range)
+            return value
+        }
+
+        func horizontalBorder(left: String, separator: String, right: String) -> NSAttributedString {
+            let pieces = widths.map { String(repeating: "─", count: $0 + 2) }
+            return chrome(left + pieces.joined(separator: separator) + right)
+        }
+
+        func rowLine(_ row: [MarkdownTextView.InlineContent], rowIndex: Int) -> NSAttributedString {
+            let line = NSMutableAttributedString()
+            line.append(chrome("│"))
+            for column in 0..<columnCount {
+                let cell = column < row.count ? row[column] : .plain("")
+                let missingWidth = max(0, widths[column] - documentTableDisplayWidth(cell.plainText))
+                let alignment = column < alignments.count ? alignments[column] : nil
+                let leftPadding: Int
+                let rightPadding: Int
+                switch alignment {
+                case .right:
+                    leftPadding = missingWidth
+                    rightPadding = 0
+                case .center:
+                    leftPadding = missingWidth / 2
+                    rightPadding = missingWidth - leftPadding
+                case .left, nil:
+                    leftPadding = 0
+                    rightPadding = missingWidth
+                }
+                line.append(chrome(" " + String(repeating: " ", count: leftPadding)))
+                line.append(rendered(
+                    proseAttributed(
+                        cell,
+                        inlineHighlight: inlineHighlight,
+                        context: renderStyle.context
+                    ),
+                    font: rowIndex == 0 ? headerFont : renderStyle.tableFont,
+                    codeFont: renderStyle.codeNSFont,
+                    style: rowStyle
+                ))
+                line.append(chrome(String(repeating: " ", count: rightPadding) + " "))
+                line.append(chrome("│"))
+            }
+
+            let range = NSRange(location: 0, length: line.length)
+            let background: NSColor? = rowIndex == 0
+                ? NSColor.labelColor.withAlphaComponent(0.12)
+                : (!rowIndex.isMultiple(of: 2)
+                    ? NSColor.labelColor.withAlphaComponent(0.035)
+                    : nil)
+            if let background {
+                applyBackground(background, toUnbackgroundedRunsIn: line, range: range)
+            }
+            line.addAttribute(.paragraphStyle, value: rowStyle, range: range)
+            return line
+        }
+
+        let lines: [NSAttributedString] = [
+            horizontalBorder(left: "┌", separator: "┬", right: "┐"),
+            rowLine(header, rowIndex: 0),
+            horizontalBorder(left: "├", separator: "┼", right: "┤"),
+        ] + rows.enumerated().map { offset, row in
+            rowLine(row, rowIndex: offset + 1)
+        } + [
+            horizontalBorder(left: "└", separator: "┴", right: "┘"),
+        ]
+
+        let result = NSMutableAttributedString()
+        for (index, line) in lines.enumerated() {
+            if index > 0 { result.append(NSAttributedString(string: "\n")) }
+            result.append(line)
+        }
+        return result
+    }
+
+    private static func documentTableDisplayWidth(_ text: String) -> Int {
+        text.reduce(into: 0) { width, character in
+            let isASCII = character.unicodeScalars.allSatisfy { $0.value < 0x80 }
+            width += isASCII ? 1 : 2
+        }
+    }
+
+    private static func applyBackground(
+        _ background: NSColor,
+        toUnbackgroundedRunsIn line: NSMutableAttributedString,
+        range: NSRange
+    ) {
+        var unbackgrounded = [NSRange]()
+        line.enumerateAttribute(.backgroundColor, in: range) { value, range, _ in
+            if value == nil { unbackgrounded.append(range) }
+        }
+        for range in unbackgrounded {
+            line.addAttribute(.backgroundColor, value: background, range: range)
+        }
     }
 
     private static func rendered(
@@ -467,8 +1078,8 @@ enum MarkdownSelectionContent {
         let result = NSMutableAttributedString(attributedString: NSAttributedString(text))
         let range = NSRange(location: 0, length: result.length)
         guard range.length > 0 else { return result }
-        // Per-run fonts: a single body font over the whole range wipes bold/italic/code that
-        // Foundation only carries as `inlinePresentationIntent` after markdown parse.
+        // Per-run fonts: a single body font over the whole range wipes AST-adapted
+        // bold/italic/code traits carried in `inlinePresentationIntent`.
         result.enumerateAttributes(in: range) { attrs, r, _ in
             let resolved = fontByMergingMarkdownTraits(
                 base: font,
@@ -481,6 +1092,39 @@ enum MarkdownSelectionContent {
                attrs[.strikethroughStyle] == nil {
                 result.addAttribute(
                     .strikethroughStyle,
+                    value: NSUnderlineStyle.single.rawValue,
+                    range: r
+                )
+            }
+            if intent.contains(.code), attrs[.backgroundColor] == nil {
+                result.addAttribute(
+                    .backgroundColor,
+                    value: NSColor.labelColor.withAlphaComponent(0.08),
+                    range: r
+                )
+            }
+            if attrs[.link] != nil {
+                if attrs[.foregroundColor] == nil {
+                    result.addAttribute(
+                        .foregroundColor,
+                        value: NSColor.controlAccentColor,
+                        range: r
+                    )
+                }
+                if attrs[.underlineStyle] == nil {
+                    result.addAttribute(
+                        .underlineStyle,
+                        value: NSUnderlineStyle.single.rawValue,
+                        range: r
+                    )
+                }
+            }
+            // `FileReveal` writes SwiftUI's underline scope for the legacy SwiftUI path.
+            // Mirror it into the AppKit key while flattening into this NSTextStorage.
+            if attrs[.underlineStyle] == nil,
+               attrs[NSAttributedString.Key("SwiftUI.UnderlineStyle")] != nil {
+                result.addAttribute(
+                    .underlineStyle,
                     value: NSUnderlineStyle.single.rawValue,
                     range: r
                 )
@@ -551,276 +1195,13 @@ enum MarkdownSelectionContent {
     }
 }
 
-/// Forward-only block parser for the streaming tail.
-///
-/// Complete lines (ending in `\n`) commit into parser state. The trailing partial line is
-/// held and only applied during `snapshotBlocks()` (EOF flush), matching `MarkdownTextView.parse`
-/// which always processes the final component. Append cost is O(new complete lines).
-private final class IncrementalMarkdownBlockParser {
-    private var blocks: [MarkdownTextView.Block] = []
-    private var paragraph: [String] = []
-    private var listItems: [MarkdownTextView.ListItem] = []
-    private var quoteLines: [String] = []
-    private var codeLines: [String]?
-    /// Incomplete trailing line (no terminating newline yet).
-    private var partialLine = ""
-    /// `components(separatedBy: "\n")` yields a final `""` when the source ends with `\n`.
-    /// Track that without committing it until `snapshotBlocks()`, so a later append can still
-    /// continue the line after the trailing newline of an intermediate chunk.
-    private var committedEndsWithNewline = false
-    /// One-line lookahead: a `|` line waits for the separator before becoming a table.
-    private var pendingTableHeader: String?
-    private var tableHeader: [String]?
-    private var tableRows: [[String]] = []
-
-    func reset() {
-        blocks = []
-        paragraph = []
-        listItems = []
-        quoteLines = []
-        codeLines = nil
-        partialLine = ""
-        committedEndsWithNewline = false
-        pendingTableHeader = nil
-        tableHeader = nil
-        tableRows = []
-    }
-
-    func replaceAll(with text: String) {
-        reset()
-        append(text)
-    }
-
-    func append(_ text: String) {
-        guard !text.isEmpty else { return }
-        var start = text.startIndex
-        if !partialLine.isEmpty {
-            // Resume the unfinished line.
-            if let nl = text.firstIndex(of: "\n") {
-                let line = partialLine + text[start..<nl]
-                partialLine = ""
-                processLine(line)
-                start = text.index(after: nl)
-                committedEndsWithNewline = start == text.endIndex
-            } else {
-                partialLine += text
-                committedEndsWithNewline = false
-                return
-            }
-        }
-        while start < text.endIndex {
-            if let nl = text[start...].firstIndex(of: "\n") {
-                processLine(String(text[start..<nl]))
-                start = text.index(after: nl)
-                committedEndsWithNewline = start == text.endIndex
-            } else {
-                partialLine = String(text[start...])
-                committedEndsWithNewline = false
-                return
-            }
-        }
-    }
-
-    /// Apply pending partial line + open-block flushes without mutating committed state.
-    func snapshotBlocks() -> [MarkdownTextView.Block] {
-        let savedBlocks = blocks
-        let savedParagraph = paragraph
-        let savedList = listItems
-        let savedQuote = quoteLines
-        let savedCode = codeLines
-        let savedPartial = partialLine
-        let savedEndsWithNewline = committedEndsWithNewline
-        let savedPendingHeader = pendingTableHeader
-        let savedTableHeader = tableHeader
-        let savedTableRows = tableRows
-
-        if !partialLine.isEmpty {
-            processLine(partialLine)
-            partialLine = ""
-        } else if committedEndsWithNewline {
-            // Match `"a\n".components(separatedBy:)` → `["a", ""]`.
-            processLine("")
-        }
-        flushAll()
-
-        let result = blocks
-
-        blocks = savedBlocks
-        paragraph = savedParagraph
-        listItems = savedList
-        quoteLines = savedQuote
-        codeLines = savedCode
-        partialLine = savedPartial
-        committedEndsWithNewline = savedEndsWithNewline
-        pendingTableHeader = savedPendingHeader
-        tableHeader = savedTableHeader
-        tableRows = savedTableRows
-        return result
-    }
-
-    private func flushParagraph() {
-        guard !paragraph.isEmpty else { return }
-        let joined = paragraph.joined(separator: "\n")
-        blocks.append(
-            MarkdownTextView.looksLikeAsciiArt(joined) ? .mono(joined) : .paragraph(joined)
-        )
-        paragraph = []
-    }
-
-    private func flushList() {
-        if !listItems.isEmpty {
-            blocks.append(.list(listItems))
-            listItems = []
-        }
-    }
-
-    private func flushQuote() {
-        if !quoteLines.isEmpty {
-            blocks.append(.quote(quoteLines.joined(separator: "\n")))
-            quoteLines = []
-        }
-    }
-
-    private func flushTable() {
-        if let header = tableHeader {
-            blocks.append(.table(header: header, rows: tableRows))
-        }
-        tableHeader = nil
-        tableRows = []
-    }
-
-    private func flushPendingTableHeaderAsProse() {
-        guard let header = pendingTableHeader else { return }
-        pendingTableHeader = nil
-        // Re-process as a normal content line (not a table).
-        processContentLine(header)
-    }
-
-    private func flushAll() {
-        flushPendingTableHeaderAsProse()
-        flushTable()
-        flushParagraph()
-        flushList()
-        flushQuote()
-        if let codeLines {
-            blocks.append(.code(codeLines.joined(separator: "\n")))
-            self.codeLines = nil
-        }
-    }
-
-    private func processLine(_ line: String) {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-        if codeLines != nil {
-            if trimmed.hasPrefix("```") {
-                blocks.append(.code(codeLines!.joined(separator: "\n")))
-                codeLines = nil
-            } else {
-                codeLines!.append(line)
-            }
-            return
-        }
-
-        // Resolve one-line table lookahead.
-        if let header = pendingTableHeader {
-            pendingTableHeader = nil
-            if MarkdownTextView.isTableSeparator(line) {
-                flushParagraph()
-                flushList()
-                flushQuote()
-                tableHeader = MarkdownTextView.tableCells(
-                    header.trimmingCharacters(in: .whitespaces)
-                )
-                tableRows = []
-                return
-            }
-            processContentLine(header)
-            // Fall through to process `line`.
-        }
-
-        if tableHeader != nil {
-            if trimmed.hasPrefix("|") {
-                tableRows.append(MarkdownTextView.tableCells(trimmed))
-                return
-            }
-            flushTable()
-            // Fall through.
-        }
-
-        if trimmed.hasPrefix("```") {
-            flushParagraph()
-            flushList()
-            flushQuote()
-            flushTable()
-            codeLines = []
-            return
-        }
-
-        if trimmed.hasPrefix("|") {
-            // Need the next line to know if this opens a table.
-            pendingTableHeader = line
-            return
-        }
-
-        processContentLine(line)
-    }
-
-    private func processContentLine(_ line: String) {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-        if trimmed.isEmpty {
-            flushParagraph()
-            flushList()
-            flushQuote()
-            flushTable()
-            return
-        }
-        if let (level, title) = MarkdownTextView.headingLevel(trimmed) {
-            flushParagraph()
-            flushList()
-            flushQuote()
-            flushTable()
-            blocks.append(.heading(level, title))
-            return
-        }
-        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
-            flushParagraph()
-            flushList()
-            flushQuote()
-            flushTable()
-            blocks.append(.rule)
-            return
-        }
-        if trimmed.hasPrefix(">") {
-            flushParagraph()
-            flushList()
-            flushTable()
-            quoteLines.append(
-                String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces)
-            )
-            return
-        }
-        if let item = MarkdownTextView.listItem(line) {
-            flushParagraph()
-            flushQuote()
-            flushTable()
-            listItems.append(item)
-            return
-        }
-        flushList()
-        flushQuote()
-        flushTable()
-        paragraph.append(line)
-    }
-}
-
 /// Per-native-host append lineage. Immutable/remounted messages still use the exact-string
 /// caches above; only a strict append with unchanged typography is allowed to reuse blocks.
 ///
 /// Streaming hot path:
 /// - stable prefix blocks are fully highlighted once and never reparsed on append
-/// - tail is scanned with a forward line cursor (O(new lines), not O(tail))
-/// - optional lightweight tail skips inline markdown until the row settles
+/// - only the unstable tail is reparsed and replaced on append
+/// - the tail uses the same swift-markdown AST and inline rendering as settled content
 final class MarkdownStreamingRenderer {
     enum Update {
         case unchanged
@@ -828,8 +1209,8 @@ final class MarkdownStreamingRenderer {
         case replace(range: NSRange, tail: NSAttributedString)
     }
 
-    /// When true, only stable blocks pay for `AttributedString(markdown:)`. Tail prose is plain
-    /// until promoted into the stable prefix or the host leaves streaming mode.
+    /// Enables tail-only replacement while a message is streaming. The tail still uses the
+    /// same swift-markdown AST and inline rendering as settled content.
     var prefersLightweightTail = false
 
     /// True when the latest `.replace` only mutated the unstable tail (layout may throttle).
@@ -842,7 +1223,6 @@ final class MarkdownStreamingRenderer {
     private var renderedLength = 0
     /// UTF-16 offset where the current unstable tail begins in `previousText`.
     private var tailStartUTF16 = 0
-    private let tailParser = IncrementalMarkdownBlockParser()
 
     func update(text: String, typography newTypography: ChatTypography) -> Update {
         lastReplaceThrottleable = false
@@ -883,14 +1263,13 @@ final class MarkdownStreamingRenderer {
             }
             stableBlocks = newStableBlocks
             tailStartUTF16 = newTailStartUTF16
-            tailParser.replaceAll(with: String(text[boundary...]))
-        } else {
-            // Pure tail growth: feed only the newly appended characters.
-            let suffixStart = text.index(text.startIndex, offsetBy: previousText.count)
-            tailParser.append(String(text[suffixStart...]))
         }
 
-        let tailBlocks = tailParser.snapshotBlocks()
+        // Parse only the unstable tail, but always use the same swift-markdown AST as settled
+        // content so GFM tables and inline formatting do not change during streaming.
+        let tailBlocks = MarkdownTextView.cachedParse(
+            boundary.map { String(text[$0...]) } ?? text
+        )
         let replacement = NSMutableAttributedString()
         if stableAttributed.length > replacementStart {
             replacement.append(stableAttributed.attributedSubstring(
@@ -906,13 +1285,13 @@ final class MarkdownStreamingRenderer {
         replacement.append(MarkdownSelectionContent.attributedString(
             for: tailBlocks,
             typography: newTypography,
-            inlineHighlight: !prefersLightweightTail
+            inlineHighlight: true
         ))
 
         let oldLength = renderedLength
         renderedLength = replacementStart + replacement.length
         previousText = text
-        lastReplaceThrottleable = prefersLightweightTail && !stableGrew
+        lastReplaceThrottleable = !stableGrew
         return .replace(
             range: NSRange(location: replacementStart, length: oldLength - replacementStart),
             tail: replacement
@@ -925,11 +1304,9 @@ final class MarkdownStreamingRenderer {
         if let boundary {
             stableBlocks = MarkdownTextView.cachedParse(String(text[..<boundary]))
             tailStartUTF16 = Self.utf16Offset(of: boundary, in: text)
-            tailParser.replaceAll(with: String(text[boundary...]))
         } else {
             stableBlocks = []
             tailStartUTF16 = 0
-            tailParser.replaceAll(with: text)
         }
         stableAttributed.setAttributedString(MarkdownSelectionContent.attributedString(
             for: stableBlocks,
@@ -937,23 +1314,19 @@ final class MarkdownStreamingRenderer {
             inlineHighlight: true
         ))
 
-        let full: NSAttributedString
-        if prefersLightweightTail {
-            let combined = NSMutableAttributedString(attributedString: stableAttributed)
-            let tailBlocks = tailParser.snapshotBlocks()
-            if !stableBlocks.isEmpty, !tailBlocks.isEmpty {
-                combined.append(MarkdownSelectionContent.blockSeparator(typography: newTypography))
-            }
-            combined.append(MarkdownSelectionContent.attributedString(
-                for: tailBlocks,
-                typography: newTypography,
-                inlineHighlight: false
-            ))
-            full = combined
-        } else {
-            // Settled / exact path: one monolithic parse so storage matches non-streaming hosts.
-            full = MarkdownSelectionContent.attributedString(for: text, typography: newTypography)
+        let combined = NSMutableAttributedString(attributedString: stableAttributed)
+        let tailBlocks = MarkdownTextView.cachedParse(
+            boundary.map { String(text[$0...]) } ?? text
+        )
+        if !stableBlocks.isEmpty, !tailBlocks.isEmpty {
+            combined.append(MarkdownSelectionContent.blockSeparator(typography: newTypography))
         }
+        combined.append(MarkdownSelectionContent.attributedString(
+            for: tailBlocks,
+            typography: newTypography,
+            inlineHighlight: true
+        ))
+        let full: NSAttributedString = combined
 
         previousText = text
         typography = newTypography
@@ -1007,6 +1380,7 @@ final class MarkdownStreamingRenderer {
 private struct SelectableMarkdownTextView: NSViewRepresentable {
     let markdownText: String
     let typography: ChatTypography
+    let renderContext: MarkdownRenderContext
     var maximumNumberOfLines: Int? = nil
     var isStreaming: Bool = false
     var onOpenDocument: ((URL) -> Void)? = nil
@@ -1046,6 +1420,7 @@ private struct SelectableMarkdownTextView: NSViewRepresentable {
         host.update(
             markdownText: markdownText,
             typography: typography,
+            renderContext: renderContext,
             maximumNumberOfLines: maximumNumberOfLines,
             isStreaming: isStreaming,
             onOpenDocument: onOpenDocument,
@@ -1092,6 +1467,8 @@ final class MarkdownNativeLayoutView: NSView {
     private let streamingRenderer = MarkdownStreamingRenderer()
     private(set) var tailReplacementCount = 0
     private var isStreamingContent = false
+    private var activeRenderContext: MarkdownRenderContext = .chat
+    private var hasResizableDocumentImages = false
     /// ~30 Hz ceiling for tail-only measure/invalidate while streaming (coalesce is ~50ms).
     private static let tailLayoutCooldown: TimeInterval = 1.0 / 30.0
     private var lastTailLayoutAt: TimeInterval = 0
@@ -1143,6 +1520,7 @@ final class MarkdownNativeLayoutView: NSView {
         if let container = textView.textContainer,
            bounds.width.isFinite,
            bounds.width > 0 {
+            _ = resizeDocumentImages(toMaximumWidth: bounds.width)
             MarkdownLayoutSizing.updateContainerIfNeeded(
                 container,
                 proposedWidth: bounds.width,
@@ -1184,21 +1562,49 @@ final class MarkdownNativeLayoutView: NSView {
     func update(
         markdownText: String,
         typography: ChatTypography,
+        renderContext: MarkdownRenderContext = .chat,
         maximumNumberOfLines: Int?,
         isStreaming: Bool = false,
         onOpenDocument: ((URL) -> Void)?,
         onFlash: ((String) -> Void)?,
         backingScale: CGFloat
     ) -> Bool {
+        let contextChanged = activeRenderContext != renderContext
+        activeRenderContext = renderContext
+        let renderStyle = MarkdownRenderStyle(typography: typography, context: renderContext)
         let streamingChanged = isStreamingContent != isStreaming
         isStreamingContent = isStreaming
+
+        // Documents intentionally bypass the chat streaming renderer, but still flatten the
+        // same AST into this one NSTextView. That makes URL/image context deterministic.
+        if renderContext.isDocument {
+            return update(
+                renderUpdate: .full(
+                    MarkdownSelectionContent.attributedString(
+                        for: markdownText,
+                        typography: typography,
+                        context: renderContext
+                    )
+                ),
+                bodyFont: renderStyle.bodyNSFont,
+                renderContext: renderContext,
+                maximumNumberOfLines: maximumNumberOfLines,
+                onOpenDocument: onOpenDocument,
+                onFlash: onFlash,
+                backingScale: backingScale,
+                throttleLayout: false
+            )
+        }
+
         streamingRenderer.prefersLightweightTail = isStreaming
-        // Leaving stream mode must rebuild with full inline highlight so settled pixels match.
-        if streamingChanged, !isStreaming, !markdownText.isEmpty {
+        // A host that previously rendered a document has no valid chat append lineage.
+        // Leaving stream mode likewise rebuilds full inline highlighting.
+        if contextChanged || (streamingChanged && !isStreaming) {
             let renderUpdate = streamingRenderer.reset(text: markdownText, typography: typography)
             return update(
                 renderUpdate: renderUpdate,
                 bodyFont: typography.bodyNSFont,
+                renderContext: renderContext,
                 maximumNumberOfLines: maximumNumberOfLines,
                 onOpenDocument: onOpenDocument,
                 onFlash: onFlash,
@@ -1217,6 +1623,7 @@ final class MarkdownNativeLayoutView: NSView {
         return update(
             renderUpdate: renderUpdate,
             bodyFont: typography.bodyNSFont,
+            renderContext: renderContext,
             maximumNumberOfLines: maximumNumberOfLines,
             onOpenDocument: onOpenDocument,
             onFlash: onFlash,
@@ -1229,14 +1636,17 @@ final class MarkdownNativeLayoutView: NSView {
     func update(
         attributedText: NSAttributedString,
         bodyFont: NSFont,
+        renderContext: MarkdownRenderContext = .chat,
         maximumNumberOfLines: Int?,
         onOpenDocument: ((URL) -> Void)?,
         onFlash: ((String) -> Void)?,
         backingScale: CGFloat
     ) -> Bool {
-        update(
+        activeRenderContext = renderContext
+        return update(
             renderUpdate: .full(attributedText),
             bodyFont: bodyFont,
+            renderContext: renderContext,
             maximumNumberOfLines: maximumNumberOfLines,
             onOpenDocument: onOpenDocument,
             onFlash: onFlash,
@@ -1248,6 +1658,7 @@ final class MarkdownNativeLayoutView: NSView {
     private func update(
         renderUpdate: MarkdownStreamingRenderer.Update,
         bodyFont: NSFont,
+        renderContext: MarkdownRenderContext,
         maximumNumberOfLines: Int?,
         onOpenDocument: ((URL) -> Void)?,
         onFlash: ((String) -> Void)?,
@@ -1256,6 +1667,7 @@ final class MarkdownNativeLayoutView: NSView {
     ) -> Bool {
         var heightChanged = false
         var invalidatedRange: NSRange?
+        var contentChanged = false
 
         if preferredBodyFont?.isEqual(bodyFont) != true {
             preferredBodyFont = bodyFont
@@ -1271,6 +1683,7 @@ final class MarkdownNativeLayoutView: NSView {
             textView.textColor = .labelColor
             textView.textStorage?.setAttributedString(attributedText)
             measurementStorage.setAttributedString(attributedText)
+            contentChanged = true
             heightChanged = true
         case .replace(let range, let tail)
             where NSMaxRange(range) <= (textView.textStorage?.length ?? 0)
@@ -1279,9 +1692,16 @@ final class MarkdownNativeLayoutView: NSView {
             measurementStorage.replaceCharacters(in: range, with: tail)
             invalidatedRange = NSRange(location: range.location, length: tail.length)
             tailReplacementCount += 1
+            contentChanged = true
             heightChanged = true
         default:
             break
+        }
+
+        if contentChanged {
+            hasResizableDocumentImages = MarkdownDocumentImageAttachments.contains(
+                in: textView.textStorage
+            )
         }
 
         let limit = max(0, maximumNumberOfLines ?? 0)
@@ -1300,6 +1720,7 @@ final class MarkdownNativeLayoutView: NSView {
             heightChanged = true
         }
 
+        textView.renderContext = renderContext
         textView.onOpenDocument = onOpenDocument
         textView.onFlash = onFlash
 
@@ -1362,6 +1783,39 @@ final class MarkdownNativeLayoutView: NSView {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
+    @discardableResult
+    private func resizeDocumentImages(toMaximumWidth width: CGFloat) -> Bool {
+        guard hasResizableDocumentImages,
+              width.isFinite,
+              width > 0 else {
+            return false
+        }
+        let displayChanged = MarkdownDocumentImageAttachments.resize(
+            in: textView.textStorage,
+            maximumWidth: width
+        )
+        let measurementChanged = MarkdownDocumentImageAttachments.resize(
+            in: measurementStorage,
+            maximumWidth: width
+        )
+        guard displayChanged || measurementChanged else { return false }
+
+        if let displayStorage = textView.textStorage, displayStorage.length > 0 {
+            textView.layoutManager?.invalidateLayout(
+                forCharacterRange: NSRange(location: 0, length: displayStorage.length),
+                actualCharacterRange: nil
+            )
+        }
+        if measurementStorage.length > 0 {
+            measurementLayoutManager.invalidateLayout(
+                forCharacterRange: NSRange(location: 0, length: measurementStorage.length),
+                actualCharacterRange: nil
+            )
+        }
+        measurement = nil
+        return true
+    }
+
     func measuredHeight(for proposedWidth: CGFloat, backingScale: CGFloat) -> CGFloat {
         guard proposedWidth.isFinite, proposedWidth > 0 else {
             return 0
@@ -1371,6 +1825,7 @@ final class MarkdownNativeLayoutView: NSView {
             proposedWidth,
             backingScale: scale
         )
+        _ = resizeDocumentImages(toMaximumWidth: width)
         if let measurement,
            measurement.width == width,
            measurement.backingScale == scale {
@@ -1448,6 +1903,534 @@ final class MarkdownNativeLayoutView: NSView {
     private func invalidateHostIntrinsicContentSize() {
         intrinsicInvalidationCount += 1
         invalidateIntrinsicContentSize()
+    }
+}
+
+/// Markdown documents use a dedicated native scroll host. It still renders the shared AST into
+/// one read-only NSTextView, preserving drag selection/copy while adding per-tab viewport,
+/// outline-anchor, and find behavior without changing the chat transcript's scroll machinery.
+struct DocumentMarkdownReaderView: NSViewRepresentable {
+    let markdownText: String
+    let headings: [MarkdownDocumentHeading]
+    let readerState: DocumentReaderState
+    let typography: ChatTypography
+    let renderContext: MarkdownRenderContext
+    let onOpenDocument: ((URL) -> Void)?
+    let onFlash: ((String) -> Void)?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView(frame: .zero)
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.drawsBackground = false
+        scrollView.automaticallyAdjustsContentInsets = false
+        OverlayScrollers.apply(to: scrollView)
+
+        let textView = PathClickTextView(frame: .zero)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = true
+        textView.importsGraphics = false
+        textView.allowsUndo = false
+        textView.drawsBackground = false
+        textView.backgroundColor = .clear
+        textView.textColor = .labelColor
+        textView.textContainerInset = NSSize(
+            width: MarkdownRenderContext.documentReaderHorizontalInset,
+            height: MarkdownRenderContext.documentReaderVerticalInset
+        )
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.heightTracksTextView = false
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.minSize = .zero
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.enabledTextCheckingTypes = 0
+        textView.setAccessibilityLabel("Markdown 文档阅读器")
+
+        scrollView.documentView = textView
+        context.coordinator.attach(scrollView: scrollView, textView: textView)
+        context.coordinator.update(
+            markdownText: markdownText,
+            headings: headings,
+            readerState: readerState,
+            typography: typography,
+            renderContext: renderContext,
+            onOpenDocument: onOpenDocument,
+            onFlash: onFlash
+        )
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        context.coordinator.update(
+            markdownText: markdownText,
+            headings: headings,
+            readerState: readerState,
+            typography: typography,
+            renderContext: renderContext,
+            onOpenDocument: onOpenDocument,
+            onFlash: onFlash
+        )
+        OverlayScrollers.applyIfNeeded(to: scrollView)
+    }
+
+    static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
+        coordinator.detach()
+    }
+
+    final class Coordinator {
+        private weak var scrollView: NSScrollView?
+        private weak var textView: PathClickTextView?
+        private weak var readerState: DocumentReaderState?
+        private var clipBoundsObserver: NSObjectProtocol?
+        private var renderedText = ""
+        private var renderedHeadings: [MarkdownDocumentHeading] = []
+        private var renderedTypography: ChatTypography?
+        private var renderedContext: MarkdownRenderContext?
+        private var headingRanges: [String: NSRange] = [:]
+        private var lastViewportWidth: CGFloat = 0
+        private var restorationGeneration: UInt64 = 0
+        /// Ignore clip notifications until a semantic restore has landed; otherwise the empty/new
+        /// native viewport can overwrite a tab's saved position before it is reapplied.
+        private var restorationPending = false
+        private var lastFindRequestGeneration: UInt64 = 0
+        private var lastHeadingJumpGeneration: UInt64 = 0
+
+        deinit {
+            detach()
+        }
+
+        fileprivate func attach(scrollView: NSScrollView, textView: PathClickTextView) {
+            detach()
+            self.scrollView = scrollView
+            self.textView = textView
+            textView.onReaderFind = { [weak self] in
+                self?.readerState?.showFind()
+            }
+            textView.onReaderFindNavigation = { [weak self] backwards in
+                guard let state = self?.readerState else { return }
+                state.showFind()
+                if backwards {
+                    state.findPrevious()
+                } else {
+                    state.findNext()
+                }
+            }
+
+            let clip = scrollView.contentView
+            clip.postsBoundsChangedNotifications = true
+            clipBoundsObserver = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification,
+                object: clip,
+                queue: .main
+            ) { [weak self] _ in
+                self?.handleClipBoundsChange()
+            }
+        }
+
+        func detach() {
+            captureScrollPosition()
+            if let clipBoundsObserver {
+                NotificationCenter.default.removeObserver(clipBoundsObserver)
+            }
+            clipBoundsObserver = nil
+            textView?.onReaderFind = nil
+            textView?.onReaderFindNavigation = nil
+            scrollView = nil
+            textView = nil
+            readerState = nil
+            restorationGeneration &+= 1
+            restorationPending = false
+        }
+
+        func update(
+            markdownText: String,
+            headings: [MarkdownDocumentHeading],
+            readerState: DocumentReaderState,
+            typography: ChatTypography,
+            renderContext: MarkdownRenderContext,
+            onOpenDocument: ((URL) -> Void)?,
+            onFlash: ((String) -> Void)?
+        ) {
+            guard let textView else { return }
+            let stateChanged = self.readerState !== readerState
+            let contentChanged = renderedText != markdownText
+                || renderedHeadings != headings
+                || renderedTypography != typography
+                || renderedContext != renderContext
+
+            if stateChanged || contentChanged {
+                captureScrollPosition()
+            }
+            self.readerState = readerState
+            textView.renderContext = renderContext
+            textView.onOpenDocument = onOpenDocument
+            textView.onFlash = onFlash
+
+            if stateChanged {
+                // Stored generations are requests issued while this tab was active. A tab switch
+                // restores its semantic position, rather than replaying a historical key/button.
+                lastFindRequestGeneration = readerState.findRequestGeneration
+                lastHeadingJumpGeneration = readerState.headingJumpGeneration
+            }
+
+            if contentChanged {
+                let attributed = MarkdownSelectionContent.attributedString(
+                    for: markdownText,
+                    typography: typography,
+                    context: renderContext,
+                    headingIDs: headings.map(\.id)
+                )
+                textView.font = MarkdownRenderStyle(
+                    typography: typography,
+                    context: renderContext
+                ).bodyNSFont
+                textView.textStorage?.setAttributedString(attributed)
+                renderedText = markdownText
+                renderedHeadings = headings
+                renderedTypography = typography
+                renderedContext = renderContext
+                headingRanges = Self.headingRanges(in: attributed)
+            }
+
+            if stateChanged || contentChanged {
+                layoutDocument()
+                restoreScrollPosition()
+            }
+            applyPendingHeadingJump()
+            applyPendingFindRequest()
+        }
+
+        private func handleClipBoundsChange() {
+            guard let scrollView else { return }
+            if restorationPending {
+                // Initial/mounted geometry can arrive after `update`. Keep the saved tab state
+                // authoritative until we have a usable native viewport to restore into.
+                if scrollView.contentView.bounds.width > 1,
+                   scrollView.contentView.bounds.height > 0 {
+                    restoreScrollPosition()
+                }
+                return
+            }
+
+            let width = scrollView.contentView.bounds.width
+            if abs(width - lastViewportWidth) > 0.5 {
+                captureScrollPosition()
+                layoutDocument()
+                restoreScrollPosition()
+                return
+            }
+            captureScrollPosition()
+        }
+
+        /// Keeps the NSTextView document-width equal to the reader measure, while the document
+        /// view itself spans the clip view so native scrolling and find indicators stay correct.
+        private func layoutDocument() {
+            guard let scrollView,
+                  let textView,
+                  let container = textView.textContainer,
+                  let layoutManager = textView.layoutManager
+            else { return }
+
+            let clipBounds = scrollView.contentView.bounds
+            let viewportWidth = max(1, clipBounds.width)
+            let bodyWidth = min(
+                MarkdownRenderContext.documentReaderMaximumMeasure,
+                max(1, viewportWidth - MarkdownRenderContext.documentReaderHorizontalInset * 2)
+            )
+            let horizontalInset = max(
+                MarkdownRenderContext.documentReaderHorizontalInset,
+                (viewportWidth - bodyWidth) / 2
+            )
+            let verticalInset = MarkdownRenderContext.documentReaderVerticalInset
+            lastViewportWidth = viewportWidth
+
+            if textView.textContainerInset != NSSize(width: horizontalInset, height: verticalInset) {
+                textView.textContainerInset = NSSize(width: horizontalInset, height: verticalInset)
+            }
+            let targetContainerSize = NSSize(
+                width: bodyWidth,
+                height: CGFloat.greatestFiniteMagnitude
+            )
+            if container.containerSize != targetContainerSize {
+                container.containerSize = targetContainerSize
+            }
+            if MarkdownDocumentImageAttachments.resize(
+                in: textView.textStorage,
+                maximumWidth: bodyWidth
+            ), let storage = textView.textStorage, storage.length > 0 {
+                layoutManager.invalidateLayout(
+                    forCharacterRange: NSRange(location: 0, length: storage.length),
+                    actualCharacterRange: nil
+                )
+            }
+
+            layoutManager.ensureLayout(for: container)
+            let contentHeight = ceil(
+                layoutManager.usedRect(for: container).height + verticalInset * 2
+            )
+            let targetFrame = NSSize(
+                width: viewportWidth,
+                height: max(clipBounds.height, contentHeight)
+            )
+            if textView.frame.size != targetFrame {
+                textView.setFrameSize(targetFrame)
+            }
+        }
+
+        private func restoreScrollPosition() {
+            restorationPending = true
+            restorationGeneration &+= 1
+            let generation = restorationGeneration
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.restorationGeneration == generation else { return }
+                self.layoutDocument()
+                guard let scrollView = self.scrollView,
+                      scrollView.contentView.bounds.width > 1,
+                      scrollView.contentView.bounds.height > 0
+                else { return }
+                self.restoreScrollPositionNow()
+            }
+        }
+
+        private func restoreScrollPositionNow() {
+            guard let state = readerState else {
+                restorationPending = false
+                return
+            }
+            switch DocumentReaderScrollRestoration.target(
+                for: state.scrollPosition,
+                availableHeadings: renderedHeadings
+            ) {
+            case .heading(let id, let progress):
+                if let start = headingTop(for: id) {
+                    let target: CGFloat
+                    if let progress,
+                       let end = sectionEnd(afterHeadingID: id), end > start {
+                        target = start + (end - start) * CGFloat(progress)
+                    } else {
+                        target = start
+                    }
+                    scroll(toDocumentY: target)
+                    state.recordActiveHeading(id)
+                } else {
+                    state.recordActiveHeading(nil)
+                    scrollToNormalized(state.scrollPosition.normalizedOffset)
+                }
+            case .normalized(let offset):
+                scrollToNormalized(offset)
+            }
+            restorationPending = false
+            captureScrollPosition()
+        }
+
+        private func applyPendingHeadingJump() {
+            guard let state = readerState,
+                  state.headingJumpGeneration != lastHeadingJumpGeneration
+            else { return }
+            lastHeadingJumpGeneration = state.headingJumpGeneration
+            guard let id = state.activeHeadingID,
+                  headingTop(for: id) != nil
+            else { return }
+            scroll(toDocumentY: headingTop(for: id) ?? 0)
+            captureScrollPosition()
+        }
+
+        private func applyPendingFindRequest() {
+            guard let state = readerState,
+                  state.findRequestGeneration != lastFindRequestGeneration
+            else { return }
+            lastFindRequestGeneration = state.findRequestGeneration
+            performFind(query: state.findQuery, direction: state.findDirection)
+        }
+
+        /// Reader find keeps its query per `DocumentReaderState`; NSTextView supplies the native
+        /// selection, visibility scroll, and transient find indicator without sharing global find
+        /// panel state between tabs.
+        private func performFind(
+            query: String,
+            direction: DocumentReaderFindDirection
+        ) {
+            guard let textView,
+                  !query.isEmpty,
+                  !textView.string.isEmpty
+            else { return }
+            let source = textView.string as NSString
+            let selected = textView.selectedRange()
+            let options: NSString.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+            let result: NSRange
+
+            switch direction {
+            case .next:
+                let start = min(NSMaxRange(selected), source.length)
+                let forwardRange = NSRange(location: start, length: source.length - start)
+                let forward = source.range(of: query, options: options, range: forwardRange)
+                result = forward.location != NSNotFound
+                    ? forward
+                    : source.range(
+                        of: query,
+                        options: options,
+                        range: NSRange(location: 0, length: source.length)
+                    )
+            case .previous:
+                let end = min(max(0, selected.location), source.length)
+                let backward = source.range(
+                    of: query,
+                    options: options.union(.backwards),
+                    range: NSRange(location: 0, length: end)
+                )
+                result = backward.location != NSNotFound
+                    ? backward
+                    : source.range(
+                        of: query,
+                        options: options.union(.backwards),
+                        range: NSRange(location: 0, length: source.length)
+                    )
+            }
+
+            guard result.location != NSNotFound else {
+                NSSound.beep()
+                return
+            }
+            textView.setSelectedRange(result)
+            textView.scrollRangeToVisible(result)
+            textView.showFindIndicator(for: result)
+            captureScrollPosition()
+        }
+
+        private func captureScrollPosition() {
+            guard !restorationPending,
+                  let scrollView,
+                  let textView,
+                  let state = readerState
+            else { return }
+            let clip = scrollView.contentView
+            let maxY = maximumScrollY()
+            let normalized = maxY > 0
+                ? Double(clip.bounds.origin.y / maxY)
+                : 0
+            let activeID = activeHeading(atDocumentY: clip.bounds.origin.y)
+            let progress = activeID.flatMap {
+                sectionProgress(forHeadingID: $0, atDocumentY: clip.bounds.origin.y)
+            }
+            state.captureScrollPosition(DocumentReaderScrollPosition(
+                normalizedOffset: normalized,
+                anchorHeadingID: activeID,
+                anchorProgress: progress
+            ))
+            _ = textView // Keeps both native inputs explicit at this seam.
+        }
+
+        private func activeHeading(atDocumentY y: CGFloat) -> String? {
+            var activeID: String?
+            for heading in renderedHeadings {
+                guard let top = headingTop(for: heading.id) else { continue }
+                if top <= y + 1 {
+                    activeID = heading.id
+                } else {
+                    break
+                }
+            }
+            return activeID
+        }
+
+        private func sectionProgress(
+            forHeadingID id: String,
+            atDocumentY y: CGFloat
+        ) -> Double? {
+            guard let start = headingTop(for: id),
+                  let end = sectionEnd(afterHeadingID: id),
+                  end > start
+            else { return nil }
+            return Double(min(1, max(0, (y - start) / (end - start))))
+        }
+
+        private func sectionEnd(afterHeadingID id: String) -> CGFloat? {
+            guard let index = renderedHeadings.firstIndex(where: { $0.id == id }) else {
+                return nil
+            }
+            for heading in renderedHeadings.dropFirst(index + 1) {
+                if let next = headingTop(for: heading.id) {
+                    return next
+                }
+            }
+            return maximumScrollY()
+        }
+
+        private func headingTop(for id: String) -> CGFloat? {
+            guard let textView,
+                  let range = headingRanges[id],
+                  range.length > 0,
+                  let container = textView.textContainer,
+                  let layoutManager = textView.layoutManager
+            else { return nil }
+            layoutManager.ensureLayout(for: container)
+            let glyphRange = layoutManager.glyphRange(
+                forCharacterRange: range,
+                actualCharacterRange: nil
+            )
+            guard glyphRange.length > 0 else { return nil }
+            let glyphRect = layoutManager.boundingRect(
+                forGlyphRange: glyphRange,
+                in: container
+            )
+            return max(
+                0,
+                glyphRect.minY + textView.textContainerOrigin.y - textView.textContainerInset.height
+            )
+        }
+
+        private func maximumScrollY() -> CGFloat {
+            guard let scrollView, let textView else { return 0 }
+            return max(0, textView.frame.height - scrollView.contentView.bounds.height)
+        }
+
+        private func scrollToNormalized(_ offset: Double) {
+            scroll(toDocumentY: maximumScrollY() * CGFloat(offset))
+        }
+
+        private func scroll(toDocumentY y: CGFloat) {
+            guard let scrollView else { return }
+            let clip = scrollView.contentView
+            let targetY = min(maximumScrollY(), max(0, y))
+            guard abs(clip.bounds.origin.y - targetY) > 0.5 else { return }
+            clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: targetY))
+            scrollView.reflectScrolledClipView(clip)
+        }
+
+        private static func headingRanges(in attributed: NSAttributedString) -> [String: NSRange] {
+            guard attributed.length > 0 else { return [:] }
+            var ranges: [String: NSRange] = [:]
+            attributed.enumerateAttribute(
+                .pipiDocumentHeadingID,
+                in: NSRange(location: 0, length: attributed.length)
+            ) { value, range, _ in
+                guard let id = value as? String else { return }
+                if let existing = ranges[id] {
+                    ranges[id] = NSUnionRange(existing, range)
+                } else {
+                    ranges[id] = range
+                }
+            }
+            return ranges
+        }
     }
 }
 
@@ -1540,9 +2523,51 @@ enum MarkdownHoverCursorKind: Equatable {
 /// 其它文件 → 访达显示；⌘+悬停路径显示手型光标。路径命中范围基于当前显示文本
 /// 现算（PathLinkCache 缓存，mousemove 走命中缓存）。
 private final class PathClickTextView: NSTextView {
+    var renderContext: MarkdownRenderContext = .chat
     var onOpenDocument: ((URL) -> Void)?
     var onFlash: ((String) -> Void)?
+    /// Set only by the document reader. Chat keeps its existing responder behavior.
+    var onReaderFind: (() -> Void)?
+    var onReaderFindNavigation: ((Bool) -> Void)?
     private var trackingAreaRef: NSTrackingArea?
+
+    override func performFindPanelAction(_ sender: Any?) {
+        // Route the standard Edit ▸ Find command into the tab-local reader field instead of
+        // NSTextView's process-shared find panel. Chat leaves this nil and keeps native behavior.
+        if let onReaderFind {
+            onReaderFind()
+            return
+        }
+        super.performFindPanelAction(sender)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if handleReaderFindShortcut(event) { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if handleReaderFindShortcut(event) { return }
+        super.keyDown(with: event)
+    }
+
+    private func handleReaderFindShortcut(_ event: NSEvent) -> Bool {
+        guard event.modifierFlags.contains(.command),
+              let characters = event.charactersIgnoringModifiers?.lowercased()
+        else { return false }
+        switch characters {
+        case "f":
+            guard let onReaderFind else { return false }
+            onReaderFind()
+            return true
+        case "g":
+            guard let onReaderFindNavigation else { return false }
+            onReaderFindNavigation(event.modifierFlags.contains(.shift))
+            return true
+        default:
+            return false
+        }
+    }
 
     override func mouseDown(with event: NSEvent) {
         if event.modifierFlags.contains(.command),
@@ -1552,6 +2577,36 @@ private final class PathClickTextView: NSTextView {
                 onOpenDocument(url)
             } else if !FileReveal.revealInFinder(url: url) {
                 onFlash?(FileReveal.missingPathMessage(url.path))
+            }
+            return
+        }
+        if let characterIndex = characterIndex(at: event),
+           let url = attributedURL(atCharacterIndex: characterIndex) {
+            if renderContext.isDocument {
+                switch MarkdownDocumentResourceResolver.linkAction(for: url.absoluteURL) {
+                case .openDocument(let localURL):
+                    if let onOpenDocument {
+                        onOpenDocument(localURL)
+                    } else if !FileReveal.revealInFinder(url: localURL) {
+                        onFlash?(FileReveal.missingPathMessage(localURL.path))
+                    }
+                case .revealInFinder(let localURL):
+                    if !FileReveal.revealInFinder(url: localURL) {
+                        onFlash?(FileReveal.missingPathMessage(localURL.path))
+                    }
+                case .openExternal(let externalURL):
+                    NSWorkspace.shared.open(externalURL)
+                case .blocked:
+                    break
+                }
+            } else if url.isFileURL {
+                if let onOpenDocument, DocumentDetector.isDocument(url) {
+                    onOpenDocument(url)
+                } else if !FileReveal.revealInFinder(url: url) {
+                    onFlash?(FileReveal.missingPathMessage(url.path))
+                }
+            } else {
+                NSWorkspace.shared.open(url)
             }
             return
         }
@@ -1586,11 +2641,21 @@ private final class PathClickTextView: NSTextView {
         return PathLinkHitTest.pathTarget(atCharacterIndex: charIndex, targets: targets)?.url
     }
 
-    private func hasAttributedLink(atCharacterIndex charIndex: Int) -> Bool {
+    private func attributedURL(atCharacterIndex charIndex: Int) -> URL? {
         guard let textStorage,
               charIndex >= 0,
-              charIndex < textStorage.length else { return false }
-        return textStorage.attribute(.link, at: charIndex, effectiveRange: nil) != nil
+              charIndex < textStorage.length else { return nil }
+        if let url = textStorage.attribute(.link, at: charIndex, effectiveRange: nil) as? URL {
+            return url
+        }
+        if let string = textStorage.attribute(.link, at: charIndex, effectiveRange: nil) as? String {
+            return URL(string: string)
+        }
+        return nil
+    }
+
+    private func hasAttributedLink(atCharacterIndex charIndex: Int) -> Bool {
+        attributedURL(atCharacterIndex: charIndex) != nil
     }
 
     override func updateTrackingAreas() {
@@ -1628,108 +2693,16 @@ private struct MarkdownBlockView: View {
     var onFlash: ((String) -> Void)? = nil
     @Environment(\.chatTypography) private var chatTypography
 
+    /// Kept as a non-active compatibility fallback. All transcript messages use
+    /// `MarkdownNativeLayoutView` above so selection never fragments across blocks.
     var body: some View {
-        switch block {
-        case .paragraph(let text):
-            PathLinkedText(
-                attributed: MarkdownTextView.inlineWithPaths(text),
-                onFlash: onFlash
-            )
-        case .heading(let level, let title):
-            PathLinkedText(
-                attributed: MarkdownTextView.inlineWithPaths(title),
-                nsFont: chatTypography.headingNSFont(level: level),
-                onFlash: onFlash
-            )
-            .padding(.top, level <= 2 ? 6 : 2)
-        case .code(let code), .mono(let code):
-            // Do NOT path-link inside fenced / mono code bodies.
-            // This legacy block renderer avoids SwiftUI textSelection. The active
-            // MarkdownTextView path uses one selectable AppKit NSTextView instead.
-            ScrollView(.horizontal) {
-                // 含框线字符的图走终端式网格渲染（CJK 占两格，框线严格对齐）
-                if MonoArtView.hasBoxDrawing(code) {
-                    MonoArtView(text: code)
-                        .padding(10)
-                } else {
-                    Text(code)
-                        .font(Font(chatTypography.codeNSFont))
-                        .contextMenu {
-                            Button("复制") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(
-                                    code,
-                                    forType: .string
-                                )
-                            }
-                        }
-                        .padding(10)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
-        case .table(let header, let rows):
-            tableView(header: header, rows: rows)
-        case .list(let items):
-            // Single selectable Text: per-item PathLinkedText cannot share drag selection.
-            PathLinkedText(
-                attributed: MarkdownTextView.listAttributed(items),
-                onFlash: onFlash
-            )
-        case .quote(let text):
-            HStack(alignment: .top, spacing: 8) {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(Color.accentColor.opacity(0.5))
-                    .frame(width: 3)
-                PathLinkedText(
-                    attributed: {
-                        var a = MarkdownTextView.inlineWithPaths(text)
-                        a.foregroundColor = Color.secondary
-                        return a
-                    }(),
-                    onFlash: onFlash
-                )
-            }
-        case .rule:
-            Divider()
-        }
-    }
-
-    private func tableView(header: [String], rows: [[String]]) -> some View {
-        let columns = max(header.count, rows.map(\.count).max() ?? 0)
-        let headerFont = NSFont.systemFont(ofSize: chatTypography.fontSize, weight: .semibold)
-        return ScrollView(.horizontal) {
-            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 0) {
-                GridRow {
-                    ForEach(0..<columns, id: \.self) { c in
-                        PathLinkedText(
-                            attributed: MarkdownTextView.inlineWithPaths(c < header.count ? header[c] : ""),
-                            lineLimit: 3,
-                            nsFont: headerFont,
-                            onFlash: onFlash
-                        )
-                    }
-                }
-                .padding(.vertical, 6)
-                Divider()
-                ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
-                    GridRow {
-                        ForEach(0..<columns, id: \.self) { c in
-                            PathLinkedText(
-                                attributed: MarkdownTextView.inlineWithPaths(c < row.count ? row[c] : ""),
-                                lineLimit: 3,
-                                onFlash: onFlash
-                            )
-                        }
-                    }
-                    .padding(.vertical, 5)
-                    .background(index.isMultiple(of: 2) ? Color.clear : Color.primary.opacity(0.025))
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 4)
-        }
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.primary.opacity(0.08)))
+        Text(
+            MarkdownSelectionContent.attributedString(
+                for: [block],
+                typography: chatTypography
+            ).string
+        )
+        .font(Font(chatTypography.bodyNSFont))
+        .foregroundStyle(.primary)
     }
 }

@@ -44,7 +44,11 @@ struct SidebarView: View {
     private static let sidebarGutter: CGFloat = 10
 
     var body: some View {
-        VStack(spacing: 0) {
+        // Built once per body: rows resolve their open key via a dictionary
+        // lookup (SidebarOpenKeyIndex) instead of re-scanning
+        // `store.openSessions` up to three times per row.
+        let openKeyIndex = SidebarOpenKeyIndex(openSessions: store.openSessions)
+        return VStack(spacing: 0) {
             BrandMark(size: .sidebar)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, Self.sidebarGutter + 2)
@@ -56,13 +60,21 @@ struct SidebarView: View {
             // when idle. Selection chrome is drawn by
             // SessionRowContainer.background.
             ScrollView {
-                // The sidebar has bounded, paged content. A plain stack avoids
+                // Bounded, paged content — `SidebarListLimits` caps the
+                // projects/pinned sections and per-project `sessionsShownByProject`
+                // caps active sessions, so at most a small fixed number of rows
+                // are materialized. A plain stack over this bounded set avoids
                 // LazyVStack's repeated size-estimation cycle when scrolling an
-                // expanded project tree containing dynamic hoverable rows.
+                // expanded project tree of dynamic hoverable rows (recycling those
+                // rows also re-fights the documented size-estimation cycle), so
+                // the tree is windowed via pagination rather than laziness.
+                // Per-row derivation (open-key lookup, relative time) is hoisted
+                // to a single per-body snapshot — see SidebarOpenKeyIndex and
+                // SidebarView.relativeFormatter.
                 VStack(alignment: .leading, spacing: 0) {
                     if sessionSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        pinnedSection
-                        projectsSection
+                        pinnedSection(openKeyIndex)
+                        projectsSection(openKeyIndex)
                         archivedSessionsSection
                     } else {
                         sessionSearchResults
@@ -325,8 +337,11 @@ struct SidebarView: View {
         }
     }
 
-    private var projectsSection: some View {
-        sidebarSection("项目") {
+    private func projectsSection(_ openKeyIndex: SidebarOpenKeyIndex) -> some View {
+        // `store.orderedProjects` re-filters/re-sorts pinned-vs-unpinned on each
+        // call; read it once for both the visible prefix and the toggle's total.
+        let orderedProjects = store.orderedProjects
+        return sidebarSection("项目") {
             Button {
                 store.addProjectViaPanel()
             } label: {
@@ -337,20 +352,20 @@ struct SidebarView: View {
             .accessibilityLabel("添加项目")
         } rows: {
             let capped = SidebarListLimits.visiblePrefix(
-                of: store.orderedProjects,
+                of: orderedProjects,
                 limit: SidebarListLimits.projects,
                 shown: projectsShown
             )
             ForEach(capped.items, id: \.path) { project in
                 projectFolderRow(project)
                 if expandedProjectPaths.contains(project.path) {
-                    projectSessionChildren(project)
+                    projectSessionChildren(project, openKeyIndex: openKeyIndex)
                 }
             }
             if capped.showsToggle {
                 moreToggle(
                     shown: $projectsShown,
-                    total: store.orderedProjects.count,
+                    total: orderedProjects.count,
                     limit: SidebarListLimits.projects,
                     sectionName: "项目"
                 )
@@ -475,7 +490,7 @@ struct SidebarView: View {
     }
 
     @ViewBuilder
-    private var pinnedSection: some View {
+    private func pinnedSection(_ openKeyIndex: SidebarOpenKeyIndex) -> some View {
         let pinned: [(SessionMeta, URL)] = store.pinnedSessionMetas.compactMap { meta in
             guard let project = store.project(forSessionPath: meta.path) else { return nil }
             return (meta, project)
@@ -490,8 +505,11 @@ struct SidebarView: View {
                     shown: pinnedShown
                 )
                 ForEach(capped.items, id: \.0.path) { meta, project in
-                    let openKey = openKeyFor(meta: meta) ?? "resume:\(meta.path)"
-                    let live = openKeyFor(meta: meta).flatMap { store.openSessions[$0] }
+                    // One dictionary lookup replaces up to three linear scans
+                    // over `store.openSessions` per pinned row.
+                    let resolvedOpenKey = openKeyIndex.openKey(for: meta)
+                    let openKey = resolvedOpenKey ?? "resume:\(meta.path)"
+                    let live = resolvedOpenKey.flatMap { store.openSessions[$0] }
                     sessionRow(
                         tag: openKey,
                         onSelect: {
@@ -502,7 +520,7 @@ struct SidebarView: View {
                         fallbackTitle: meta.name,
                         idleSubtitle: store.projectDisplayName(for: project),
                         meta: meta,
-                        openKey: openKeyFor(meta: meta),
+                        openKey: resolvedOpenKey,
                         project: project,
                         archivePath: meta.path,
                         isPinned: true
@@ -522,7 +540,7 @@ struct SidebarView: View {
 
     /// Active session rows live directly under their project folder. There is
     /// deliberately no standalone active-session section.
-    private func projectSessionChildren(_ project: URL) -> some View {
+    private func projectSessionChildren(_ project: URL, openKeyIndex: SidebarOpenKeyIndex) -> some View {
         let metas = SessionPinLogic.activeMetas(
             from: store.sessionsByProject[project.path] ?? [],
             excludingPinned: store.userPinnedSessionPaths
@@ -558,8 +576,11 @@ struct SidebarView: View {
             }
 
             ForEach(visibleMetas) { meta in
-                let openKey = openKeyFor(meta: meta) ?? "resume:\(meta.path)"
-                let live = openKeyFor(meta: meta).flatMap { store.openSessions[$0] }
+                // One dictionary lookup replaces up to three linear scans
+                // over `store.openSessions` per session row.
+                let resolvedOpenKey = openKeyIndex.openKey(for: meta)
+                let openKey = resolvedOpenKey ?? "resume:\(meta.path)"
+                let live = resolvedOpenKey.flatMap { store.openSessions[$0] }
                 sessionRow(
                     tag: openKey,
                     onSelect: { store.openSession(meta, project: project) },
@@ -567,7 +588,7 @@ struct SidebarView: View {
                     fallbackTitle: meta.name,
                     idleSubtitle: Self.relative(meta.modified),
                     meta: meta,
-                    openKey: openKeyFor(meta: meta),
+                    openKey: resolvedOpenKey,
                     project: project,
                     archivePath: meta.path,
                     isPinned: false
@@ -1039,15 +1060,60 @@ struct SidebarView: View {
         }
     }
 
-    private func openKeyFor(meta: SessionMeta) -> String? {
-        store.openSessions.first { $0.value.sessionFile == meta.path }?.key
-            ?? (store.openSessions["resume:\(meta.path)"] != nil ? "resume:\(meta.path)" : nil)
-    }
-
-    static func relative(_ date: Date) -> String {
+    /// Shared formatter so rows never allocate a `RelativeDateTimeFormatter`
+    /// on every render. Relative strings are still recomputed against `Date()`
+    /// on each body pass (live-badge/selection updates drive re-render), so
+    /// freshness is unchanged — only the per-row allocation is removed.
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: Date())
+        return formatter
+    }()
+
+    static func relative(_ date: Date) -> String {
+        Self.relativeFormatter.localizedString(for: date, relativeTo: Date())
+    }
+}
+
+/// Per-snapshot index of live-session open keys, built ONCE per sidebar body
+/// from `store.openSessions`. Each row then resolves its open key via a single
+/// dictionary lookup instead of a linear scan over all open sessions — the old
+/// `openKeyFor(meta:)` walked `store.openSessions` up to three times per row.
+///
+/// Lookup order mirrors the legacy method:
+///  1. a live session whose `sessionFile` equals the meta path wins;
+///  2. otherwise a `resume:<path>` open key backs that path;
+///  3. otherwise `nil`.
+///
+/// This is a pure value type so the dedup/seam is unit-testable without an
+/// AppStore or SwiftUI context.
+struct SidebarOpenKeyIndex {
+    private let pathToKey: [String: String]
+
+    init(openSessions: [String: ChatSession]) {
+        var map: [String: String] = [:]
+        // First pass: sessionFile matches take priority over resume keys.
+        for (key, session) in openSessions {
+            if let file = session.sessionFile, !file.isEmpty {
+                map[file] = key
+            }
+        }
+        // Second pass: resume:<path> fills only paths not already covered.
+        for key in openSessions.keys where key.hasPrefix("resume:") {
+            let path = String(key.dropFirst("resume:".count))
+            if map[path] == nil { map[path] = key }
+        }
+        pathToKey = map
+    }
+
+    /// Open key (e.g. `new:…`/`resume:…`) backing `meta.path`, or nil.
+    func openKey(for meta: SessionMeta) -> String? {
+        pathToKey[meta.path]
+    }
+
+    /// Path-keyed lookup exposed for snapshot tests / diagnostics.
+    func openKey(forPath path: String) -> String? {
+        pathToKey[path]
     }
 }
 
@@ -1177,9 +1243,9 @@ private enum SessionRowStatus: Equatable {
     case ok
     case none
 
-    static func from(_ session: ChatSession) -> SessionRowStatus {
+    static func from(_ session: ChatSession, subagentRunningCount: Int) -> SessionRowStatus {
         if session.isWorking { return .running }
-        let n = session.subagents.runningCount
+        let n = subagentRunningCount
         if n > 0 { return .subagentsRunning(n) }
         if session.lastError != nil || !session.processAlive { return .error }
         if session.hasUnseenInterruption { return .interrupted }
@@ -1201,8 +1267,11 @@ private enum SessionRowStatus: Equatable {
 /// Observes a live ChatSession so status dots update without reselection.
 private struct LiveSessionRow: View {
     @ObservedObject var session: ChatSession
-    /// Must observe subagents separately — agent_event updates won't refresh via session alone.
-    @ObservedObject private var agents: SubagentStore
+    /// Narrow subagent projection: re-publishes only when the running count changes
+    /// (lifecycle), so this row does not re-render on every ~16ms `log_delta` from its
+    /// own session's `SubagentStore`. Subagent logs are still ingested losslessly by
+    /// the store; only the row's reaction is throttled to lifecycle.
+    @StateObject private var subagentProjection = SubagentChatProjectionHost()
     /// Fallback when session.sessionName is nil/empty (e.g. disk meta name).
     let fallbackTitle: String
     /// Shown when not running (e.g. relative modified time). Empty for unsaved new sessions.
@@ -1220,7 +1289,6 @@ private struct LiveSessionRow: View {
         reservedTrailingWidth: CGFloat = 0
     ) {
         self.session = session
-        self.agents = session.subagents
         self.fallbackTitle = fallbackTitle
         self.idleSubtitle = idleSubtitle
         self.hideSubtitle = hideSubtitle
@@ -1228,9 +1296,10 @@ private struct LiveSessionRow: View {
     }
 
     var body: some View {
-        // Touch agents.runningCount so SwiftUI tracks SubagentStore publishes.
-        let _ = agents.runningCount
-        let status = SessionRowStatus.from(session)
+        let status = SessionRowStatus.from(
+            session,
+            subagentRunningCount: subagentProjection.presentation.runningCount
+        )
         // Prefer non-empty live name so disk meta still shows when sessionName unset.
         let title = session.sessionName.flatMap { $0.isEmpty ? nil : $0 } ?? fallbackTitle
         let subtitle = status.subtitleOverride ?? idleSubtitle
@@ -1261,6 +1330,10 @@ private struct LiveSessionRow: View {
         .padding(.trailing, reservedTrailingWidth)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
+        .onAppear { subagentProjection.bind(session.subagents) }
+        .onChange(of: session.bridgeRoutingKey) { _, _ in
+            subagentProjection.bind(session.subagents)
+        }
     }
 
     @ViewBuilder

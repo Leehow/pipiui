@@ -113,9 +113,11 @@ results.noModel = await compactHandler(event2, { model: undefined, modelRegistry
 
 // 3) bounded serialization: huge single user message must be truncated with marker.
 const bigText = "x".repeat(300_000);
-const { boundedSerializeConversation, buildDeterministicSummary } = await import(
-  "./subagent/main-compaction.ts"
-);
+const {
+  boundedSerializeConversation,
+  buildDeterministicSummary,
+  COMPACTION_DETERMINISTIC_MAX_SUMMARY_CHARS,
+} = await import("./subagent/main-compaction.ts");
 const serialized = boundedSerializeConversation([mkMsg("user", bigText)]);
 results.bounded = {
   truncated: serialized.length < 210_000,
@@ -148,6 +150,30 @@ results.garbage = await compactHandler(
   },
   { model: undefined, modelRegistry: undefined },
 );
+
+// 5) deterministic summary preserves high-value transcript facts under a fixed budget,
+// while dropping repetitive tool-result noise before it crowds out the required sections.
+const noisyToolOutput = "TOOL-NOISE ".repeat(30_000);
+const richSummary = buildDeterministicSummary({
+  serialized: [
+    "[User]: Build the reporting flow.",
+    "[Assistant]: Started an implementation draft.",
+    "[Tool result]: " + noisyToolOutput,
+    "[User]: Correction: do not add another compaction hook; use agentId=worker-7 and retain the worktree.",
+    "[Assistant]: Decision: preserve the current owner. Plan is in-flight; verification node --test passed; closeout retained the worktree.",
+    "[Tool result]: Error: verification failed once before the verified pass.",
+  ].join("\\n"),
+  previousSummary: "## Goal\\nSticky previous goal.\\n## Key Decisions\\n- Keep prior facts.",
+  fileOps: { read: new Set(["Sources/a.ts"]), written: new Set(["Sources/c.ts"]), edited: new Set(["Sources/a.ts"]) },
+  tokensBefore: 9000,
+  messageCount: 6,
+  reason: "threshold",
+});
+results.rich = {
+  summary: richSummary,
+  withinBudget: richSummary.length <= COMPACTION_DETERMINISTIC_MAX_SUMMARY_CHARS,
+  noiseFiltered: !richSummary.includes("TOOL-NOISE"),
+};
 
 writeFileSync(outputPath, JSON.stringify(results));
 process.exit(0);
@@ -313,6 +339,28 @@ test("main-session compaction hook: deterministic path, no-model fallback, bound
     // (4) garbage input never throws out of the hook: falls back safely.
     assert.ok(out.garbage?.compaction, "garbage messages must still produce a compaction result");
     assert.match(out.garbage.compaction.summary, /## Goal/);
+
+    // (5) fixed-budget deterministic fallback keeps structured, high-value transcript facts.
+    for (const heading of [
+      "Goal",
+      "User Corrections",
+      "Constraints & Decisions",
+      "In-Flight / Verification / Closeout",
+      "Errors & Open Loops",
+      "Previous Summary",
+      "Files",
+      "Recent Timeline",
+      "Next Steps",
+    ]) {
+      assert.ok(out.rich.summary.includes(`## ${heading}\n`), `missing required heading: ${heading}`);
+    }
+    assert.equal(out.rich.withinBudget, true, "deterministic summary must obey its fixed budget");
+    assert.equal(out.rich.noiseFiltered, true, "repetitive tool output must not crowd out facts");
+    assert.match(out.rich.summary, /agentId=worker-7/);
+    assert.match(out.rich.summary, /verification node --test passed/i);
+    assert.match(out.rich.summary, /verification failed once/i);
+    assert.match(out.rich.summary, /retain(?:ed)? the worktree/i);
+    assert.match(out.rich.summary, /Sticky previous goal/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -15,6 +15,21 @@ final class BuiltInFeatureSettingsTests: XCTestCase {
         XCTAssertFalse(set.allDisabled)
     }
 
+    func testPDFExtractDefaultsOnAndIsIndependentFromExistingArxivPreference() throws {
+        let upgraded = BuiltInFeatureSettings.EnabledSet(
+            disabledIDs: [BuiltInFeatureSettings.FeatureID.arxivFetch.rawValue]
+        )
+        XCTAssertFalse(upgraded.isEnabled(.arxivFetch))
+        XCTAssertTrue(upgraded.isEnabled(.pdfExtract),
+                      "a pre-existing arXiv-off preference must not disable core local PDF reading")
+
+        let entry = try XCTUnwrap(
+            BuiltInFeatureSettings.catalog.first { $0.id == .pdfExtract }
+        )
+        XCTAssertEqual(entry.title, "本地 PDF 读取")
+        XCTAssertEqual(entry.summary, "本地PDF读取：文本层优先，必要时Vision OCR，无云上传。")
+    }
+
     func testEnableDisablePersists() {
         let defaults = UserDefaults(suiteName: "pipiui.test.builtin.persist")!
         defaults.removePersistentDomain(forName: "pipiui.test.builtin.persist")

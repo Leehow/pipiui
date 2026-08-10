@@ -157,9 +157,13 @@ final class CutInBatchTests: XCTestCase {
         let idx = try XCTUnwrap(s.range(of: "async function trySendUserMessage"))
         let body = s[idx.lowerBound...]
         let awaitIdx = try XCTUnwrap(body.range(of: "await awaitCutInHoldRelease();"))
-        let sendIdx = try XCTUnwrap(body.range(of: "pi.sendUserMessage(text"))
-        XCTAssertTrue(awaitIdx.lowerBound < sendIdx.lowerBound,
-                      "hold must be awaited before any sendUserMessage")
+        let helperCall = try XCTUnwrap(body.range(of: "return sendUserMessageAfterCutIn(pi, text);"))
+        let helper = try XCTUnwrap(s.range(of: "async function sendUserMessageAfterCutIn"))
+        let helperBody = s[helper.lowerBound...]
+        let sendIdx = try XCTUnwrap(helperBody.range(of: "pi.sendUserMessage(text"))
+        XCTAssertTrue(awaitIdx.lowerBound < helperCall.lowerBound,
+                      "hold must be awaited before the helper can send")
+        XCTAssertNotNil(sendIdx, "the helper owns the actual followUp send")
     }
 
     /// Early release: a real user message (interactive/rpc, not an extension followUp)

@@ -63,6 +63,21 @@ final class PhilosophyLayerTests: XCTestCase {
         }
     }
 
+    /// Foundation is a runtime prompt layer (including worker scope), so the host lifecycle
+    /// rule must stay in the injected prompt rather than only in repository documentation.
+    func testFoundationInjectedPromptGuardsPipiUIHostLifecycle() throws {
+        let prompt = try text("foundation")
+        assertContains(prompt, "## PipiUI host lifecycle is user-authorized")
+        assertContains(prompt, "Never execute `kill`, `pkill`, `killall`, Force Quit")
+        assertContains(prompt, "`NSRunningApplication.terminate()`")
+        assertContains(prompt, "`NSRunningApplication.forceTerminate()`")
+        assertContains(prompt, "or an equivalent mechanism against it")
+        assertContains(prompt, "Never automatically open, launch, or relaunch PipiUI after a build, package, or update")
+        assertContains(prompt, "Package only, then tell the user to quit and reopen PipiUI manually")
+        assertContains(prompt, "The sole exception is when the current user explicitly requests that PipiUI be terminated or restarted")
+        assertContains(prompt, "Never infer that request, and never use termination or restart as a verification step")
+    }
+
     // MARK: - Ported content guards
 
     /// Difficulty tiers were a classification ritual paid for on every goal, and a heavy tier
@@ -129,6 +144,68 @@ final class PhilosophyLayerTests: XCTestCase {
         assertContains(orchestration, "MUST omit `verify`")
         assertContains(orchestration, "Never re-dispatch a read-only worker to make a shell command pass")
         assertContains(orchestration, "never dispatch a reviewer to review a plan document")
+    }
+
+    /// Formal planning is the main LLM's automatic judgement: explicit plan/spec asks or
+    /// genuinely substantial work load `to-spec` when present, show and publish the plan, then
+    /// wait for a natural-language approval decision mapped to internal lifecycle actions.
+    func testAutomaticFormalPlanningSkillTranscriptAndStructuredPublish() throws {
+        let method = try text("method")
+        assertContains(method, "## Automatic formal-planning judgement")
+        assertContains(method, "You automatically judge whether this goal needs a detailed executable plan")
+        assertContains(method, "explicit approval boundary")
+        assertContains(method, "explicitly** asked for a plan, a spec")
+        assertContains(method, "genuinely substantial or decomposition-heavy")
+        assertContains(method, "Small, local, single-file, one-line, question-only")
+        assertContains(method, "MUST stay direct")
+        assertContains(method, "skill_search(\"spec plan\")")
+        assertContains(method, "skill_load(\"to-spec\")")
+        assertContains(method, "fall back without blocking")
+        assertContains(method, "main assistant transcript")
+        assertContains(method, "not only as a Markdown file artifact")
+        assertContains(method, "approval invitation in the user's language")
+        assertContains(method, "Do not ask the user to choose, type, or repeat the internal **Execute**, **Adjust**, or **Ignore** lifecycle labels")
+        assertContains(method, "Classify their natural-language reply semantically")
+        assertContains(method, "approval is Execute")
+        assertContains(method, "a request to revise with feedback is Adjust")
+        assertContains(method, "a refusal or cancellation is Ignore")
+        assertContains(method, "Do not dispatch business-code work")
+
+        let orchestration = try text("orchestration")
+        assertContains(orchestration, "automatic formal-planning judgement has fired")
+        assertContains(orchestration, "skill_search(\"spec plan\")")
+        assertContains(orchestration, "skill_load(\"to-spec\")")
+        assertContains(orchestration, "fall back without blocking")
+        assertContains(orchestration, "main assistant transcript")
+        assertContains(orchestration, "not only as a Markdown artifact")
+        assertContains(orchestration, "plan_publish")
+        assertContains(orchestration, "plan_task_update")
+        assertContains(orchestration, "plan_approve")
+        assertContains(orchestration, "plan_cancel")
+        assertContains(orchestration, "stable unique `plan.id`")
+        assertContains(orchestration, "same `planId`")
+        assertContains(orchestration, "ordered tasks")
+        assertContains(orchestration, "During authorized execution")
+        assertContains(orchestration, "Tool absence is not BLOCKED")
+        assertContains(orchestration, "After formal publish, stop and await exactly one natural-language user response")
+        assertContains(orchestration, "never ask the user to choose or type **Execute**, **Adjust**, or **Ignore**")
+        assertContains(orchestration, "a request to adjust or revise with feedback as Adjust")
+        assertContains(orchestration, "a refusal or cancellation as Ignore")
+        assertContains(orchestration, "Before an approval classified as Execute, MUST NOT dispatch business-code work")
+        assertContains(orchestration, "On an approval classified as Execute, call `plan_approve`")
+        assertContains(orchestration, "MUST NOT present an execution-mode menu")
+        // Existing automatic-routing ban stays the product rule; formal planning must not
+        // reintroduce a user-facing mode choice after the plan is written.
+        assertContains(orchestration, "MUST NOT present, relay, or ask the user to choose an execution-mode menu")
+
+        let all = try PhilosophyLayerFixture.allNormalizedBodies()
+        for banned in ["please approve this plan", "reply approve to continue",
+                       "ask the user to choose exactly one next action: **execute**, **adjust**, or **ignore**",
+                       "after formal publish, stop and await exactly one user response: **execute**, **adjust**, or **ignore**",
+                       "until the user says execute", "choose execution mode", "delegated execution versus"] {
+            XCTAssertFalse(all.lowercased().contains(banned),
+                           "formal planning must not add an approval/mode gate (found \(banned))")
+        }
     }
 
     /// Persistent coordination state is required once delegation begins, but merely loading
@@ -234,12 +311,21 @@ final class PhilosophyLayerTests: XCTestCase {
         let bundled = try XCTUnwrap(PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil))
         let source = try String(
             contentsOf: bundled.appendingPathComponent("subagent/index.ts"), encoding: .utf8)
-        XCTAssertTrue(source.contains("PIPI_PHILOSOPHY_ROLE: agent.traits.delegates ? \"lead\" : \"worker\""))
+        XCTAssertTrue(source.contains("agent.traits.delegates && runtimePolicy.allowRecursiveDelegation"))
+        XCTAssertTrue(source.contains("? \"lead\" : \"worker\""))
 
         let agentsDir = bundled.appendingPathComponent("agents")
-        let agentFiles = try FileManager.default.contentsOfDirectory(
-            at: agentsDir, includingPropertiesForKeys: nil
-        ).filter { $0.pathExtension == "md" }
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: agentsDir, includingPropertiesForKeys: [.isDirectoryKey]
+        )
+        let agentFiles = entries.compactMap { url -> URL? in
+            let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            if isDirectory {
+                let package = url.appendingPathComponent("AGENT.md")
+                return FileManager.default.fileExists(atPath: package.path) ? package : nil
+            }
+            return url.pathExtension == "md" ? url : nil
+        }
         XCTAssertFalse(agentFiles.isEmpty, "expected bundled agent definitions")
         for url in agentFiles {
             // `lead.md` is deleted by the parallel agent-catalog worker; ignore it if still present.
@@ -323,9 +409,9 @@ final class PhilosophyLayerTests: XCTestCase {
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         for entry in agents {
             let name = try XCTUnwrap(entry["name"])
-            let definition = root.appendingPathComponent("Sources/PipiUI/PiExt/agents/\(name).md")
+            let definition = root.appendingPathComponent("Sources/PipiUI/PiExt/agents/\(name)/AGENT.md")
             XCTAssertTrue(FileManager.default.fileExists(atPath: definition.path),
-                          "roster names \(name) but no agents/\(name).md ships")
+                          "roster names \(name) but no agents/\(name)/AGENT.md ships")
         }
     }
 

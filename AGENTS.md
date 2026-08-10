@@ -21,6 +21,16 @@
 - Any security design that adds a user step must identify a concrete,
   non-deferrable threat first. Otherwise it must not block the usable MVP.
 
+### User-authorized PipiUI host lifecycle (binding)
+
+- The running PipiUI host process belongs to the current user. Agents/workers must never
+  execute `kill`, `pkill`, `killall`, Force Quit, `NSRunningApplication.terminate()`,
+  `NSRunningApplication.forceTerminate()`, or an equivalent mechanism against it.
+- After a build, package, or update, package only and tell the user to quit and reopen PipiUI
+  manually; never automatically open, launch, or relaunch it.
+- The sole exception is an explicit current-user request to terminate or restart PipiUI. Never
+  infer that request or invent termination/restart as a verification step.
+
 Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may create a runnable App.** All other linked/temporary worktrees must verify with `swift build` / `swift test` only and must never create `build/PipiUI.app`.
 
 ### Worktree ownership adapter (binding)

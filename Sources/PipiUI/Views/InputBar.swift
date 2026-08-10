@@ -1121,10 +1121,19 @@ struct ComposerTextView: NSViewRepresentable {
             guard textView.string != newText else { return }
             let oldSelection = textView.selectedRange()
             let oldLength = (textView.string as NSString).length
+            guard let storage = textView.textStorage else { return }
             let wasApplyingProgrammaticText = applyingProgrammaticText
             applyingProgrammaticText = true
             composerUndoManager.disableUndoRegistration()
-            textView.string = newText
+            storage.beginEditing()
+            storage.replaceCharacters(
+                in: NSRange(location: 0, length: storage.length),
+                with: NSAttributedString(
+                    string: newText,
+                    attributes: textView.typingAttributes
+                )
+            )
+            storage.endEditing()
             composerUndoManager.enableUndoRegistration()
             composerUndoManager.removeAllActions()
             applyingProgrammaticText = wasApplyingProgrammaticText
@@ -1343,6 +1352,9 @@ struct InputBar: View {
             session.pruneOrphanDraftPastes()
             refreshSlashPalette()
             composerRouter.clearAttachError()
+        }
+        .onChange(of: draftState.focusRequestToken) { _, _ in
+            focused = true
         }
         .onChange(of: session.availableCommands) { _, _ in
             refreshSlashPalette()

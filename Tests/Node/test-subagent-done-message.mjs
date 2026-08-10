@@ -2,7 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { formatSubagentDoneMessage } from "../../Sources/PipiUI/PiExt/subagent/done-message.ts";
 
-const HANDLING_SUBSTRING = "do not end the turn silently";
+const STATUS_CHECK = "FIRST call subagent_status() without agentId";
+const PENDING_WORKERS_SILENCE = "do NOT give the user a status update, progress report, partial conclusion, or summary";
+const FINAL_CLOSEOUT = "exactly one complete final closeout";
+const CLOSE_LOOP_SUBSTRING = 'Never reply "already completed" without first calling subagent_status';
 
 function result(overrides = {}) {
 	return {
@@ -22,7 +25,7 @@ function assistantText(text) {
 	return [{ role: "assistant", content: [{ type: "text", text }] }];
 }
 
-test("successful done message preserves its structure, TLDR slice, and handling instruction", () => {
+test("successful done message preserves its structure, TLDR slice, and completion handling contract", () => {
 	const message = formatSubagentDoneMessage(result({
 		messages: assistantText([
 			"Preamble that must not be delivered.",
@@ -35,19 +38,32 @@ test("successful done message preserves its structure, TLDR slice, and handling 
 			"## Follow-up",
 			"This section must not be delivered either.",
 		].join("\n")),
-	}));
+	}), { runId: "run-done-message" });
 
-	assert.match(message, /^\[subagent-done\] agentId=done-message-test /);
+	assert.match(message, /^\[subagent-done\] agentId=done-message-test runId=run-done-message /);
 	assert.match(message, /\nTitle: Done-message research\n/);
 	assert.match(message, /\nResult:\n/);
 	assert.match(message, /\nFull report: subagent_status\(\{agentId:"done-message-test", full:true\}\)\n/);
-	assert.match(message, new RegExp(HANDLING_SUBSTRING));
+	assert.ok(message.includes(STATUS_CHECK));
+	assert.ok(message.includes(PENDING_WORKERS_SILENCE));
+	assert.ok(message.includes(FINAL_CLOSEOUT));
+	assert.match(message, new RegExp(CLOSE_LOOP_SUBSTRING));
+	assert.match(message, /action:"abort"/);
+	assert.match(message, /action:"resolve"/);
+	assert.ok(
+		message.indexOf(STATUS_CHECK) < message.indexOf(PENDING_WORKERS_SILENCE),
+		"completion handling must require the status check before deciding whether user output is allowed",
+	);
+	assert.ok(
+		message.indexOf(PENDING_WORKERS_SILENCE) < message.indexOf(FINAL_CLOSEOUT),
+		"a same-goal worker still running/stalled must suppress a user summary until all related work is terminal",
+	);
 	assert.match(message, /## TLDR\nThe requested research is complete\./);
 	assert.match(message, /## What I did not check\nLive production behavior\./);
 	assert.doesNotMatch(message, /Preamble that must not be delivered|## Evidence|## Follow-up/);
 });
 
-test("error and aborted done messages both instruct the boss to report the outcome", () => {
+test("error and aborted done messages retain the status-first, no-partial-summary rule", () => {
 	const failed = formatSubagentDoneMessage(result({
 		exitCode: 1,
 		errorMessage: "Research worker failed after collecting partial evidence.",
@@ -57,6 +73,10 @@ test("error and aborted done messages both instruct the boss to report the outco
 		stderr: "Research worker was aborted.",
 	}));
 
-	assert.match(failed, new RegExp(HANDLING_SUBSTRING));
-	assert.match(aborted, new RegExp(HANDLING_SUBSTRING));
+	for (const message of [failed, aborted]) {
+		assert.ok(message.includes(STATUS_CHECK));
+		assert.ok(message.includes(PENDING_WORKERS_SILENCE));
+		assert.ok(message.includes(FINAL_CLOSEOUT));
+		assert.match(message, new RegExp(CLOSE_LOOP_SUBSTRING));
+	}
 });

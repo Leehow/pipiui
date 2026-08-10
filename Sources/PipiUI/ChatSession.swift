@@ -150,7 +150,7 @@ enum ToolCallSummary {
             return (promptSummary(args), 0)
         case "web_search":
             return (args["query"].string ?? "…", 0)
-        case "web_fetch":
+        case "web_fetch", "github_fetch":
             return (args["url"].string ?? "…", 0)
         case "browser":
             return (browserSummary(args), 0)
@@ -210,7 +210,7 @@ enum ToolCallSummary {
             return cmd.count > 120 ? String(cmd.prefix(120)) + "…" : cmd
         case "web_search":
             return scrapeJSONString(key: "query", from: text)
-        case "web_fetch":
+        case "web_fetch", "github_fetch":
             return scrapeJSONString(key: "url", from: text)
         case "generate_image":
             guard let prompt = scrapeJSONString(key: "prompt", from: text) else { return nil }
@@ -464,6 +464,9 @@ struct ChatItem: Identifiable, Equatable {
     var timestamp: String? = nil
     /// App-only bubble with no corresponding pi session entry (for example media generation).
     var isLocalOnly = false
+    /// Index in `blocks` of the sole open thinking segment during a live turn.
+    /// Settled transcript items always leave this nil.
+    var activeThinkingBlockIndex: Int? = nil
 }
 
 struct ToolRun: Equatable {
@@ -646,9 +649,16 @@ final class StreamingState: ObservableObject {
 /// that restore, send, or otherwise mutate the current draft.
 final class ComposerDraftState: ObservableObject {
     @Published var text: String
+    /// Monotonic request consumed by the currently mounted session's input bar.
+    /// Kept with the draft so focus requests cannot leak across warm session switches.
+    @Published private(set) var focusRequestToken: UInt64 = 0
 
     init(text: String = "") {
         self.text = text
+    }
+
+    func requestFocus() {
+        focusRequestToken &+= 1
     }
 }
 
@@ -666,17 +676,48 @@ final class ChatSession: ObservableObject, Identifiable {
     let projectURL: URL
     /// Which agent engine backs this session. Pinned at init; Plan A always `.pi`.
     let engineKind: EngineKind
-
     /// didSet 版本计数：任何 transcript 写入（append / 整体替换 / 元素修改）都会 bump，
     /// TranscriptPlanner 以此判断是否重算布局。宁滥勿缺——不确定的修改路径走属性写入即自动覆盖。
     @Published var transcript: [ChatItem] = [] {
-        didSet { transcriptVersion &+= 1 }
+        didSet {
+            transcriptVersion &+= 1
+            // Classify mutation: pure tail growth → suffix-only index update; else reconcile.
+            if let start = Self.userPromptTailAppendStart(from: oldValue, to: transcript) {
+                userPromptIndex.applyTailAppend(transcript, from: start)
+            } else {
+                userPromptIndex.apply(transcript)
+            }
+        }
     }
     /// 随 transcript 每次写入单调递增（T6 布局记忆化 key 的一部分）。非 @Published：
     /// transcript 本身的 @Published 已负责触发刷新。
     private(set) var transcriptVersion: UInt64 = 0
     /// T6 transcript 布局记忆化（planTranscript 结果缓存，body 里只读缓存）。
     let transcriptPlanner = TranscriptPlanner()
+    /// Full-session user-authored prompt index (stable IDs + plain summaries).
+    /// Updated on every transcript write; navigation/seek consume this, not the viewport.
+    let userPromptIndex = UserPromptIndex()
+
+    /// O(1) mutation classification for `userPromptIndex`.
+    ///
+    /// Returns the start index of the new suffix when `newValue` is a pure tail
+    /// append of `oldValue` (count grew; previous first/last stable IDs still sit
+    /// at the same indices). Structural edits — shrink, in-place element replace,
+    /// full rebuild, mid insert — return `nil` so the index reconciles.
+    ///
+    /// Endpoint identity only — do not walk the prior prefix (append path must
+    /// stay O(suffix) and never re-scan full history).
+    static func userPromptTailAppendStart(from oldValue: [ChatItem], to newValue: [ChatItem]) -> Int? {
+        let oldCount = oldValue.count
+        let newCount = newValue.count
+        guard newCount > oldCount else { return nil }
+        if oldCount == 0 { return 0 }
+        guard newValue[0].id == oldValue[0].id,
+              newValue[oldCount - 1].id == oldValue[oldCount - 1].id
+        else { return nil }
+        return oldCount
+    }
+
     /// Isolated publisher for high-frequency stream and tool-output updates.
     let streaming = StreamingState()
     /// Read-only compatibility forwarding; deliberately does not publish `ChatSession.objectWillChange`.
@@ -807,6 +848,8 @@ final class ChatSession: ObservableObject, Identifiable {
     /// get_state 的 isCompacting=true 快照若在最后一次 compaction_end 后不久到达
     /// （请求早于压缩、响应晚于结束），视为过期，避免把已结束的压缩重新点亮。
     static var compactionStateStaleWindow: TimeInterval = 3
+    /// Centralized defaults; tests may inject shorter timings before creating a session.
+    static var proactiveCompactionConfiguration = ProactiveCompactionPolicy.Configuration.standard
     /// Notifies AppStore to persist / clear interrupted-path badges.
     var onInFlightChange: ((String, Bool) -> Void)?
     /// False after resuming a disk session that already has a real name.
@@ -860,8 +903,19 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Server-side slash commands from `get_commands` (extension / prompt / skill).
     @Published var availableCommands: [SlashCommand] = []
 
-    /// Injected by AppStore for `/new`.
-    var onRequestNewSession: (() -> Void)?
+    /// Injected by AppStore for `/new`. Reading the action wraps it so a pending
+    /// idle-only compact cannot race the user's switch to a new task.
+    private var requestNewSessionAction: (() -> Void)?
+    var onRequestNewSession: (() -> Void)? {
+        get {
+            guard let action = requestNewSessionAction else { return nil }
+            return { [weak self] in
+                self?.cancelProactiveCompactionSchedule()
+                action()
+            }
+        }
+        set { requestNewSessionAction = newValue }
+    }
     /// Injected by AppStore for `/quit`.
     var onRequestClose: (() -> Void)?
     /// Injected by AppStore for `/schedule`; always opens a confirmation draft.
@@ -900,14 +954,16 @@ final class ChatSession: ObservableObject, Identifiable {
     /// 文档预览多 tab 容器（⌘+点击聊天中的 md/txt 文档路径在此打开）
     lazy var documentTabs = DocumentTabsStore()
 
-    /// 内嵌终端（SwiftTerm）：会话级缓存，收起/展开右栏复用同一 shell
-    lazy var terminalStore = TerminalSessionStore(projectURL: projectURL)
+    /// 内嵌终端多 tab 容器（每个 tab 独立 PTY；收起/展开右栏复用各 tab 的 shell）
+    lazy var terminalTabs = TerminalTabsStore(projectURL: projectURL)
 
     /// 浏览器 / 文档 tab 持久化（默认保留 72 小时，见 PanelTabSettings）
     private lazy var panelTabsPersistence = PanelTabPersistence(webTabs: webTabs, documentTabs: documentTabs)
 
     /// pi 派出的 subagent 树（扩展通过桥接上报）
     let subagents = SubagentStore()
+    /// Main-session structured plan (plan_publish / plan_task_update → plan_event).
+    let planStore = PlanStore()
 
     var onSessionMetaChanged: (() -> Void)?
     /// Fired only when the user actually submits a prompt (not resume / name / settle).
@@ -984,6 +1040,17 @@ final class ChatSession: ObservableObject, Identifiable {
     /// authoritative get_messages completes.
     private var initialPreviewItemCount = 0
     private var initialPreviewToolRunIDs: Set<String> = []
+    /// Request issue order lets post-compaction policy reject callbacks from older stats RPCs.
+    private var contextStatsRequestGeneration: UInt64 = 0
+    private var latestProactiveUsageRequestGeneration: UInt64 = 0
+    private var proactiveCompactionPolicy = ProactiveCompactionPolicy(
+        configuration: ChatSession.proactiveCompactionConfiguration
+    )
+    private var proactiveCompactionWorkItem: DispatchWorkItem?
+    private var proactiveCompactionScheduleToken: UInt64 = 0
+    /// True from the proactive `compact` RPC dispatch until its lifecycle settles.
+    /// It closes the small RPC/event gap so a user prompt cannot slip through unqueued.
+    private var proactiveCompactionRPCInFlight = false
     private var processStartCancelled = false
 
     init(id: String, projectURL: URL, sessionPath: String?,
@@ -993,8 +1060,13 @@ final class ChatSession: ObservableObject, Identifiable {
          gitExtension: String? = nil,
          reloadExtension: String? = nil,
          webSearchExtension: String? = nil,
+         githubFetchPackage: String? = nil,
+         arxivFetchPackage: String? = nil,
+         pdfExtractExtension: String? = nil,
          mcpExtension: String? = nil,
          skillLoaderExtension: String? = nil,
+         /// Main bridged session plan runtime (`plan_publish` / `plan_task_update`).
+         planRuntimeExtension: String? = nil,
          codexServerToolsExtension: String? = nil,
          claudeServerToolsExtension: String? = nil,
          computerUseExtension: String? = nil,
@@ -1002,7 +1074,12 @@ final class ChatSession: ObservableObject, Identifiable {
          agentsDir: String? = nil,
          philosophyExtension: String? = nil,
          searchScopeExtension: String? = nil,
-         memoryExtension: String? = nil,
+         /// Formal managed package entrypoint. Memory business remains inside
+         /// the TypeScript package; these are launch/status file locations only.
+         memoryBrokerExtension: String? = nil,
+         memoryBrokerStateDirectory: String? = nil,
+         memoryBrokerImportFile: String? = nil,
+         memoryBrokerImportReceiptFile: String? = nil,
          builtInFeatures: BuiltInFeatureSettings.EnabledSet = .init(),
          taskNotificationMode: SessionTaskNotificationMode = .standard,
          blockedReason: String? = nil,
@@ -1013,6 +1090,12 @@ final class ChatSession: ObservableObject, Identifiable {
         self.engineKind = engineKind
         self.taskNotificationMode = taskNotificationMode
         self.resumedFromDisk = sessionPath != nil
+        // Eager plan restore for resumed sessions (before backend get_state).
+        // Rebind later only when backend reports a different sessionFile.
+        if let sessionPath, !sessionPath.isEmpty {
+            self.sessionFile = sessionPath
+            planStore.attachPersistence(sessionFile: sessionPath)
+        }
         // A restarted/resumed session never inherits a stale external-search
         // grant — but only when the SearchScope capability is actually mounted.
         // Bare-pi mode must not create/reset PipiUI grant files at all.
@@ -1047,6 +1130,23 @@ final class ChatSession: ObservableObject, Identifiable {
             }
             return nil
         }
+        subagents.onWorktreeRecoveryNeeded = { [weak self] agent in
+            // This is a runtime command, not orchestration prose for the boss model. The
+            // extension validates the id and lease, then resumes the same branch/worktree.
+            let verify = Data((agent.verifyCommand ?? "").utf8).base64EncodedString()
+            let fresh = agent.recoveryFreshContext ? "1" : "0"
+            DispatchQueue.main.async {
+                self?.sendAppGeneratedPrompt("/subagent_recover \(agent.id) \(agent.name) \(fresh) \(verify)")
+            }
+        }
+        subagents.onWorktreeRecoveryEscalated = { [weak self] agent in
+            DispatchQueue.main.async {
+                self?.sendAppGeneratedPrompt(
+                    "[worktree-recovery-escalated] agentId=\(agent.id) name=\(agent.name) 自动恢复已切换策略后仍在处理。请派不同恢复策略的 worker；不要要求用户执行版本控制操作。"
+                )
+            }
+        }
+        subagents.dispatchPersistedRecoveryIfNeeded()
         subagents.onWorktreeMergeFailed = { [weak self] agent, error in
             guard let self else { return }
             let text = WorktreeMergeFailedMessage.format(agent: agent, error: error)
@@ -1085,6 +1185,12 @@ final class ChatSession: ObservableObject, Identifiable {
             var stampedItems = initialTranscript.items
             Self.stampToolDurations(&stampedItems, from: initialTranscript.toolRuns)
             transcript = stampedItems
+            // Seed nav index before first UI publish. Assigning `transcript` in
+            // init does not reliably run didSet (classic Swift); `@Published` may
+            // still fire it on some runtimes. `applyIfStale` builds the index when
+            // observers skipped and is a no-op when didSet already advanced the
+            // watermark — never a second full scan. Missed seed ⇒ rail EmptyView.
+            userPromptIndex.applyIfStale(transcript)
             streaming.replaceToolRuns(initialTranscript.toolRuns)
             itemCounter = initialTranscript.itemCounter
             skipNextAssistantIngest = initialTranscript.skipNextAssistantIngest
@@ -1123,20 +1229,24 @@ final class ChatSession: ObservableObject, Identifiable {
                 computerRoutingKey: computerRoutingKey,
                 grantSessionKey: id,
                 mainCWD: projectURL.path,
-                paths: PipiSpawnAssembly.Paths(
-                    philosophy: philosophyExtension,
-                    media: mediaExtension,
-                    git: gitExtension,
-                    reload: reloadExtension,
-                    webSearch: webSearchExtension,
-                    mcp: mcpExtension,
-                    skillLoader: skillLoaderExtension,
-                    searchScope: searchScopeExtension,
-                    memory: memoryExtension,
-                    codexServerTools: codexServerToolsExtension,
-                    claudeServerTools: claudeServerToolsExtension,
-                    computerUse: computerUseExtension,
-                    webview: webviewExtension,
+                paths: Self.spawnPaths(
+                    philosophyExtension: philosophyExtension,
+                    mediaExtension: mediaExtension,
+                    gitExtension: gitExtension,
+                    reloadExtension: reloadExtension,
+                    webSearchExtension: webSearchExtension,
+                    githubFetchPackage: githubFetchPackage,
+                    arxivFetchPackage: arxivFetchPackage,
+                    pdfExtractExtension: pdfExtractExtension,
+                    mcpExtension: mcpExtension,
+                    skillLoaderExtension: skillLoaderExtension,
+                    planRuntimeExtension: planRuntimeExtension,
+                    searchScopeExtension: searchScopeExtension,
+                    memoryBrokerExtension: memoryBrokerExtension,
+                    codexServerToolsExtension: codexServerToolsExtension,
+                    claudeServerToolsExtension: claudeServerToolsExtension,
+                    computerUseExtension: computerUseExtension,
+                    webviewExtension: webviewExtension,
                     subagentDir: subagentDir,
                     agentsDir: agentsDir
                 ),
@@ -1145,7 +1255,10 @@ final class ChatSession: ObservableObject, Identifiable {
                 mainModelId: model?.id ?? SubagentModelSettings.readMainModel(),
                 excludeToolsArgs: ToolSkillSettings.excludeToolsCLIArgs(),
                 webSearchConfigFile: WebSearchSettings.configFileURL().path,
-                mcpConfigFile: McpServerSettings.configFileURL().path
+                mcpConfigFile: McpServerSettings.configFileURL().path,
+                memoryBrokerStateDirectory: memoryBrokerStateDirectory,
+                memoryBrokerImportFile: memoryBrokerImportFile,
+                memoryBrokerImportReceiptFile: memoryBrokerImportReceiptFile
             )
         )
         let args = assembly.args
@@ -1161,6 +1274,53 @@ final class ChatSession: ObservableObject, Identifiable {
         } else {
             startProcess(arguments: args, environment: spawnEnv)
         }
+    }
+
+    /// Production handoff shape: AppStore resolves `PipiSpawnAssembly.Paths`, then ChatSession
+    /// rebuilds the same struct for `assemble`. `planRuntime` must be threaded here or the
+    /// main bridged session never mounts plan tools.
+    package static func spawnPaths(
+        philosophyExtension: String? = nil,
+        mediaExtension: String? = nil,
+        gitExtension: String? = nil,
+        reloadExtension: String? = nil,
+        webSearchExtension: String? = nil,
+        githubFetchPackage: String? = nil,
+        arxivFetchPackage: String? = nil,
+        pdfExtractExtension: String? = nil,
+        mcpExtension: String? = nil,
+        skillLoaderExtension: String? = nil,
+        planRuntimeExtension: String? = nil,
+        searchScopeExtension: String? = nil,
+        memoryBrokerExtension: String? = nil,
+        codexServerToolsExtension: String? = nil,
+        claudeServerToolsExtension: String? = nil,
+        computerUseExtension: String? = nil,
+        webviewExtension: String? = nil,
+        subagentDir: String? = nil,
+        agentsDir: String? = nil
+    ) -> PipiSpawnAssembly.Paths {
+        PipiSpawnAssembly.Paths(
+            philosophy: philosophyExtension,
+            media: mediaExtension,
+            git: gitExtension,
+            reload: reloadExtension,
+            webSearch: webSearchExtension,
+            githubFetchPackage: githubFetchPackage,
+            arxivFetchPackage: arxivFetchPackage,
+            pdfExtract: pdfExtractExtension,
+            mcp: mcpExtension,
+            skillLoader: skillLoaderExtension,
+            planRuntime: planRuntimeExtension,
+            searchScope: searchScopeExtension,
+            memoryBroker: memoryBrokerExtension,
+            codexServerTools: codexServerToolsExtension,
+            claudeServerTools: claudeServerToolsExtension,
+            computerUse: computerUseExtension,
+            webview: webviewExtension,
+            subagentDir: subagentDir,
+            agentsDir: agentsDir
+        )
     }
 
     private func startProcess(arguments: [String], environment: [String: String]) {
@@ -1234,6 +1394,8 @@ final class ChatSession: ObservableObject, Identifiable {
         subagents.reconcileOrphanedNow()
         isStopping = false
         cancelStopEscalation()
+        cancelProactiveCompactionSchedule()
+        proactiveCompactionRPCInFlight = false
         clearCompactionState()
         isSendingFromQueue = false
         // Exit before the first transcript arrives must not leave the spinner up.
@@ -1395,10 +1557,15 @@ final class ChatSession: ObservableObject, Identifiable {
             self?.applyState(resp["data"])
         }
         backend?.request(["type": "get_available_models"]) { [weak self] resp in
-            self?.availableModels = resp["data"]["models"].array.compactMap { m in
+            guard let self else { return }
+            let models: [ModelInfo] = resp["data"]["models"].array.compactMap { m in
                 guard let row = m.dict else { return nil }
                 return ModelInfo.parseModelListRow(row)
             }
+            self.availableModels = models
+            // Swift owns capability interpretation. Node hot-reads only this compact result
+            // when deciding whether Boss-selected thinking may survive a fallback.
+            SubagentModelSettings.syncCapabilityCatalog(models: models)
         }
         refreshThinkingLevels()
         beginInitialMessagesLoad()
@@ -1472,6 +1639,7 @@ final class ChatSession: ObservableObject, Identifiable {
             handleEvent(event)
         }
         syncEntryIds()
+        reconsiderProactiveCompaction()
     }
 
     /// Apply a background-built history once; drop if generation is stale (session recycled / re-load).
@@ -1508,6 +1676,7 @@ final class ChatSession: ObservableObject, Identifiable {
             handleEvent(event)
         }
         syncEntryIds()
+        reconsiderProactiveCompaction()
     }
 
     /// After transcript assign (initial or post-fork), fetch entries and stamp entryIds.
@@ -1616,15 +1785,23 @@ final class ChatSession: ObservableObject, Identifiable {
             }
         }
         if let file = data["sessionFile"].string, file != sessionFile {
+            // First state application names a fresh session file; it is not a replacement
+            // and must not discard the concurrently requested initial usage snapshot.
+            if sessionFile != nil {
+                resetProactiveCompactionForSessionReplacement()
+            }
             sessionFile = file
             onSessionMetaChanged?()
             syncInFlightMark()
         }
-        // 会话文件确定后挂载 subagent 树持久化（恢复历史 + 后续落盘）
+        // 会话文件确定后挂载 subagent 树 / plan 持久化（恢复历史 + 后续落盘）。
+        // planStore may already be attached from init(sessionPath); rebind only on change.
         if let file = sessionFile {
             subagents.attachPersistence(sessionFile: file)
+            planStore.attachPersistence(sessionFile: file)
             panelTabsPersistence.attach(sessionFile: file)
         }
+        reconsiderProactiveCompaction()
     }
 
     private func refreshThinkingLevels() {
@@ -1635,9 +1812,11 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     private func refreshStats() {
+        contextStatsRequestGeneration &+= 1
+        let requestGeneration = contextStatsRequestGeneration
         backend?.request(["type": "get_session_stats"]) { [weak self] resp in
             guard let self, resp["success"].bool == true else { return }
-            self.applySessionStats(resp["data"])
+            self.applySessionStats(resp["data"], requestGeneration: requestGeneration)
         }
     }
 
@@ -1668,8 +1847,14 @@ final class ChatSession: ObservableObject, Identifiable {
         }
     }
 
+    /// Test seam plus synchronous callers that already own a stats payload.
+    package func applySessionStats(_ data: J) {
+        contextStatsRequestGeneration &+= 1
+        applySessionStats(data, requestGeneration: contextStatsRequestGeneration)
+    }
+
     /// Parse `get_session_stats` payload into published context/cost fields.
-    private func applySessionStats(_ data: J) {
+    private func applySessionStats(_ data: J, requestGeneration: UInt64) {
         if let liveCost = data["cost"].double {
             hasLiveSessionCost = true
             cost = liveCost
@@ -1685,6 +1870,31 @@ final class ChatSession: ObservableObject, Identifiable {
             contextWindow = merged.window
             contextPercent = merged.percent
         }
+
+        // Only the newest issued stats request can affect the proactive policy. A delayed
+        // pre-compaction callback must not re-arm the session after a successful compact.
+        if requestGeneration > latestProactiveUsageRequestGeneration {
+            latestProactiveUsageRequestGeneration = requestGeneration
+            proactiveCompactionPolicy.observeFreshUsage(
+                proactiveContextUsage(from: contextUsage),
+                requestGeneration: requestGeneration
+            )
+        }
+        reconsiderProactiveCompaction()
+    }
+
+    /// Keep the policy input explicitly fresh: missing/null token and percent values are
+    /// unknown, not permission to reuse a stale high-watermark snapshot.
+    private func proactiveContextUsage(from contextUsage: J) -> ProactiveCompactionPolicy.ContextUsage? {
+        guard let dict = contextUsage.dict else { return nil }
+        let tokens = dict.keys.contains("tokens") ? contextUsage["tokens"].int : nil
+        let percent = dict.keys.contains("percent") ? contextUsage["percent"].double : nil
+        guard tokens != nil || percent != nil else { return nil }
+        return ProactiveCompactionPolicy.ContextUsage(
+            tokens: tokens,
+            contextWindow: contextUsage["contextWindow"].int ?? contextWindow ?? model?.contextWindow,
+            percent: percent
+        )
     }
 
     /// Compact context line for footer /session flash.
@@ -1829,6 +2039,8 @@ final class ChatSession: ObservableObject, Identifiable {
         switch type {
         case "agent_start":
             isStreaming = true
+            // Any resumed main activity invalidates an idle-only timer before it can fire.
+            cancelProactiveCompactionSchedule()
             // Defensive: a stale stop flag must never bleed into the next turn.
             isStopping = false
             cancelStopEscalation()
@@ -1840,12 +2052,19 @@ final class ChatSession: ObservableObject, Identifiable {
             agentTurnActive = true
             syncInFlightMark()
         case "agent_settled":
+            // If a compact lifecycle omitted its end event, settle is the final authority.
+            // Treat it as completed (not re-armable) so a stale high usage sample cannot loop.
+            let hadActiveMainTurn = agentTurnActive || isStreaming
+            let compactionWasPendingAtSettle = isCompacting || proactiveCompactionRPCInFlight
             isStreaming = false
             isStopping = false
             cancelStopEscalation()
             // 防御性清理：正常流中 compaction_end 先于 settle 到达；若缺失（例如
             // 压缩被进程级兜底中断后的残流），settle 必须收掉压缩态。
             clearCompactionState()
+            if compactionWasPendingAtSettle {
+                recordCompactionCompletion(success: true)
+            }
             pendingStreamMessage = nil
             streamAssembler.reset()
             pendingStreamCharCount = 0
@@ -1863,7 +2082,8 @@ final class ChatSession: ObservableObject, Identifiable {
             hasUnseenInterruption = false
             refreshStats()
             syncEntryIds()
-            drainQueueIfIdle()
+            drainQueueIfIdle(allowStaleDispatchReset: hadActiveMainTurn)
+            reconsiderProactiveCompaction()
             syncInFlightMark()
             // Green badge when still idle after drain (no queued follow-up).
             if !isWorking && messageQueue.isEmpty {
@@ -1933,6 +2153,7 @@ final class ChatSession: ObservableObject, Identifiable {
                 recordTurnUsage(for: e["message"])
             }
         case "tool_execution_start":
+            cancelProactiveCompactionSchedule()
             if let tid = e["toolCallId"].string {
                 pendingToolRuns.removeValue(forKey: tid)
                 streaming.updateToolRun(ToolRun(isRunning: true, startedAt: Date()), for: tid)
@@ -1981,6 +2202,7 @@ final class ChatSession: ObservableObject, Identifiable {
         case "extension_error":
             appendSystem("扩展错误：\(e["error"].string ?? "?")")
         case "compaction_start":
+            cancelProactiveCompactionSchedule()
             isCompacting = true
             compactionStartedAt = Date()
             compactionReason = e["reason"].string
@@ -1992,7 +2214,9 @@ final class ChatSession: ObservableObject, Identifiable {
             let willRetry = e["willRetry"].bool ?? false
             let reason = e["reason"].string ?? compactionReason ?? "?"
             let duration = compactionStartedAt.map { Int(Date().timeIntervalSince($0)) } ?? 0
+            let succeeded = !aborted && (errorMessage?.isEmpty ?? true)
             clearCompactionState()
+            recordCompactionCompletion(success: succeeded)
             // 竞态修复：压缩中 Stop 武装的是压缩专用短时间线（1.5s/2.5s/4s）。
             // 若 compaction_end 先到而 turn 尚未 settle（isStopping 仍为 true），旧
             // 短时间线会继续生效，把已离开压缩阶段的正常 post-compaction 工作过早
@@ -2024,6 +2248,11 @@ final class ChatSession: ObservableObject, Identifiable {
             }
             // Compaction often reports null tokens/percent; refresh so footer drops stale %.
             refreshStats()
+            // User input during compaction stayed in the normal queue; never abort the compact.
+            if !isStopping {
+                drainQueueIfIdle()
+            }
+            reconsiderProactiveCompaction()
         default:
             break
         }
@@ -2228,6 +2457,99 @@ final class ChatSession: ObservableObject, Identifiable {
         isCompacting = false
         compactionStartedAt = nil
         compactionReason = nil
+    }
+
+    private var hasActiveMainTool: Bool {
+        pendingToolRuns.values.contains { $0.isRunning }
+            || streaming.toolRuns.values.contains { $0.isRunning }
+    }
+
+    /// The main session may compact while workers continue in the background. Their
+    /// `runningCount` is intentionally not a gate: only main-turn activity matters here.
+    private var canScheduleProactiveCompaction: Bool {
+        guard processAlive,
+              backend?.isRunning == true,
+              !processStartCancelled,
+              !isInitializing,
+              !isWorking,
+              !agentTurnActive,
+              !isStopping,
+              !isCompacting,
+              !proactiveCompactionRPCInFlight,
+              !visionCaptionInProgress,
+              queue.isEmpty,
+              messageQueue.isEmpty,
+              !hasActiveMainTool
+        else { return false }
+        return true
+    }
+
+    private var isPromptDeliveryBlockedByCompaction: Bool {
+        isCompacting || proactiveCompactionRPCInFlight
+    }
+
+    /// Recheck all live state both when arming and when the timer fires. The timer is
+    /// deliberately cancellable rather than aborting an already-started compaction.
+    private func reconsiderProactiveCompaction() {
+        guard canScheduleProactiveCompaction,
+              let delay = proactiveCompactionPolicy.nextSchedulingDelay(now: Date())
+        else {
+            cancelProactiveCompactionSchedule()
+            return
+        }
+        guard proactiveCompactionWorkItem == nil else { return }
+
+        proactiveCompactionScheduleToken &+= 1
+        let token = proactiveCompactionScheduleToken
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  token == self.proactiveCompactionScheduleToken else { return }
+            self.proactiveCompactionWorkItem = nil
+            guard self.canScheduleProactiveCompaction,
+                  self.proactiveCompactionPolicy.nextSchedulingDelay(now: Date()) != nil
+            else { return }
+            self.runCompact(proactive: true)
+        }
+        proactiveCompactionWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func cancelProactiveCompactionSchedule() {
+        proactiveCompactionScheduleToken &+= 1
+        proactiveCompactionWorkItem?.cancel()
+        proactiveCompactionWorkItem = nil
+    }
+
+    /// A rebind changes the transcript/context that the old high-watermark sample described.
+    private func resetProactiveCompactionForSessionReplacement() {
+        cancelProactiveCompactionSchedule()
+        proactiveCompactionRPCInFlight = false
+        proactiveCompactionPolicy = ProactiveCompactionPolicy(
+            configuration: Self.proactiveCompactionConfiguration
+        )
+        // Ignore callbacks from stats requests issued for the prior session file.
+        latestProactiveUsageRequestGeneration = contextStatsRequestGeneration
+    }
+
+    /// Any completed compaction (manual, overflow, or proactive) invalidates the old high
+    /// sample. Only a newer explicitly low report can re-arm proactive compaction.
+    private func recordCompactionCompletion(success: Bool) {
+        proactiveCompactionRPCInFlight = false
+        if success {
+            proactiveCompactionPolicy.recordCompactionSuccess(
+                requiringUsageRequestAfter: contextStatsRequestGeneration
+            )
+        } else {
+            proactiveCompactionPolicy.recordCompactionFailure(at: Date())
+        }
+    }
+
+    private func finishProactiveCompactionRequestFailure() {
+        guard proactiveCompactionRPCInFlight else { return }
+        proactiveCompactionRPCInFlight = false
+        proactiveCompactionPolicy.recordCompactionFailure(at: Date())
+        drainQueueIfIdle()
+        reconsiderProactiveCompaction()
     }
 
     private static func compactionReasonLabel(_ reason: String?) -> String {
@@ -3093,6 +3415,7 @@ final class ChatSession: ObservableObject, Identifiable {
             return
         }
 
+        cancelProactiveCompactionSchedule()
         isSendingFromQueue = true
         backend.request(["type": "get_entries"]) { [weak self] response in
             guard let self else { return }
@@ -3382,6 +3705,7 @@ final class ChatSession: ObservableObject, Identifiable {
             flash("pi 未运行，无法\(actionNoun)消息")
             return
         }
+        cancelProactiveCompactionSchedule()
         isSendingFromQueue = true
         backend.request(["type": "fork", "entryId": entryId]) { [weak self] response in
             guard let self else { return }
@@ -3447,8 +3771,10 @@ final class ChatSession: ObservableObject, Identifiable {
     private func bindSessionFileAfterConfirmedSwitch(_ path: String) {
         guard !path.isEmpty, sessionFile != path else { return }
         let previousPath = sessionFile
+        resetProactiveCompactionForSessionReplacement()
         sessionFile = path
         subagents.attachPersistence(sessionFile: path)
+        planStore.attachPersistence(sessionFile: path)
         panelTabsPersistence.attach(sessionFile: path)
         onSessionMetaChanged?()
         if let previousPath, !previousPath.isEmpty {
@@ -3524,6 +3850,7 @@ final class ChatSession: ObservableObject, Identifiable {
     private func reloadTranscriptAfterSessionReplace(
         completion: @escaping (String?) -> Void
     ) {
+        resetProactiveCompactionForSessionReplacement()
         streaming.streamingItem = nil
         isStreaming = false
         isStopping = false
@@ -3570,20 +3897,25 @@ final class ChatSession: ObservableObject, Identifiable {
         sendPrompt(
             text,
             images: images,
-            searchGrantPolicy: .localHumanRecordPromptPaths
+            searchGrantPolicy: .localHumanRecordPromptPaths,
+            injectPendingInterruptionRecovery: true
         )
     }
 
     private func sendPrompt(
         _ text: String,
         images: [DraftImage],
-        searchGrantPolicy: PromptSearchGrantPolicy
+        searchGrantPolicy: PromptSearchGrantPolicy,
+        injectPendingInterruptionRecovery: Bool
     ) {
         let expanded = expandedDraftText(from: text)
         // Bodies are now in `expanded`; drop map so markers cannot be re-expanded later.
         clearDraftPastes()
         let trimmed = expanded.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !images.isEmpty else { return }
+        // A real task (including /new and app-authored follow-ups) cancels only the
+        // pending idle timer. It never aborts an already-started compaction.
+        cancelProactiveCompactionSchedule()
 
         // Defensive: a stale stop flag must never bleed into the next turn.
         isStopping = false
@@ -3609,6 +3941,15 @@ final class ChatSession: ObservableObject, Identifiable {
             return
         }
 
+        // A real human prompt is the only automatic recovery trigger. Do not
+        // inject while merely opening/re-attaching a session, or for app-owned
+        // orchestration prompts. Deliver/queue the resync first so the normal
+        // prompt naturally follows it through the existing queue.
+        if injectPendingInterruptionRecovery,
+           !deliverPendingInterruptionRecoveryIfNeeded() {
+            return
+        }
+
         let prepared = prepareMessage(text: trimmed, images: images)
         beginTurnWallClock()
         deliverAfterOptionalVisionFallback(
@@ -3623,6 +3964,168 @@ final class ChatSession: ObservableObject, Identifiable {
         case empty
         case rejectedBuiltin(String)
         case unavailable
+    }
+
+    /// Result of an app-owned plan approval action. UI can present `message`
+    /// without guessing whether the lifecycle transition occurred.
+    enum PlanActionOutcome: Equatable {
+        case sent
+        case queued
+        case rejected(String)
+
+        var errorMessage: String? {
+            if case .rejected(let message) = self { return message }
+            return nil
+        }
+    }
+
+    /// Approve an awaiting plan only after its explicit execution instruction has
+    /// entered the normal prompt delivery path. This intentionally bypasses
+    /// composer media, builtin-command, and draft-clearing behavior.
+    @discardableResult
+    func executePublishedPlan(planId: String) -> PlanActionOutcome {
+        guard let plan = planStore.plan else {
+            return .rejected("没有可执行的计划")
+        }
+        guard plan.id == planId else {
+            return .rejected("计划已更新，请重试")
+        }
+        guard plan.lifecycle == .awaitingApproval else {
+            return .rejected(plan.lifecycle == .cancelled ? "计划已忽略" : "计划已在执行")
+        }
+        guard processAlive, backend?.isRunning == true, !isInitializing else {
+            return .rejected("会话尚未就绪，无法执行计划")
+        }
+
+        let instruction = """
+        [PipiUI 计划执行指令]
+        已批准执行计划。
+        planId: \(plan.id)
+        planTitle: \(plan.title)
+        请立即执行该计划；执行过程中必须使用 plan_task_update 更新每个任务的状态、进度和阻塞原因。
+        """
+        let prepared = prepareMessage(text: instruction, images: [])
+        let wasBusy = isStreaming || isSendingFromQueue
+        guard deliverPreparedPrompt(
+            message: prepared.message,
+            images: [],
+            searchGrantPolicy: .appAuthoredPreserveLatestHumanGrant
+        ) else {
+            return .rejected("执行指令未发送")
+        }
+        guard planStore.approve(planId: plan.id).isApplied else {
+            return .rejected("计划批准失败")
+        }
+        return wasBusy ? .queued : .sent
+    }
+
+    /// Continue a plan that was interrupted by an abnormal app exit. The
+    /// resync prompt enters normal delivery before the durable marker is consumed,
+    /// so unavailable sessions cannot silently lose the recovery action.
+    @discardableResult
+    func continueInterruptedPlan(planId: String) -> PlanActionOutcome {
+        guard let plan = planStore.plan else {
+            return .rejected("没有可继续的计划")
+        }
+        guard plan.id == planId else {
+            return .rejected("计划已更新，请重试")
+        }
+        guard planStore.hasPendingInterruptionRecovery(planId: plan.id) else {
+            return .rejected("没有待恢复的中断计划")
+        }
+        guard processAlive, backend?.isRunning == true, !isInitializing else {
+            return .rejected("会话尚未就绪，无法继续计划")
+        }
+
+        let interruptedTaskIDs = planStore.interruptedTaskIDsForPendingRecovery(planId: plan.id)
+        guard !interruptedTaskIDs.isEmpty else {
+            return .rejected("没有待恢复的中断计划")
+        }
+        let instruction = Self.interruptedPlanRecoveryInstruction(
+            plan: plan,
+            interruptedTaskIDs: Set(interruptedTaskIDs)
+        )
+        let prepared = prepareMessage(text: instruction, images: [])
+        let wasBusy = isStreaming || isSendingFromQueue
+        guard deliverPreparedPrompt(
+            message: prepared.message,
+            images: [],
+            searchGrantPolicy: .appAuthoredPreserveLatestHumanGrant
+        ) else {
+            return .rejected("恢复同步指令未发送")
+        }
+        let recoveryOutcome = planStore.recoverInterruptedPlan(planId: plan.id)
+        guard recoveryOutcome.isApplied else {
+            if case .rejected(let reason, _) = recoveryOutcome {
+                return .rejected(reason)
+            }
+            return .rejected("恢复计划状态失败")
+        }
+        return wasBusy ? .queued : .sent
+    }
+
+    /// Format one app-authored recovery instruction from the still-blocked
+    /// snapshot. The resync explicitly requires tool updates before UI state is
+    /// transitioned back to `.running` by `continueInterruptedPlan`.
+    private static func interruptedPlanRecoveryInstruction(
+        plan: PlanSnapshot,
+        interruptedTaskIDs: Set<String>
+    ) -> String {
+        func summary(_ tasks: [PlanTaskSnapshot]) -> String {
+            guard !tasks.isEmpty else { return "none" }
+            return tasks.map { "\($0.id) — \($0.title)" }.joined(separator: "; ")
+        }
+        let completed = plan.tasks.filter {
+            $0.state == .completed || $0.state == .skipped
+        }
+        let interrupted = plan.tasks.filter { interruptedTaskIDs.contains($0.id) }
+        let nextPending = plan.tasks.first(where: { $0.state == .pending })
+        let nextPendingSummary = nextPending.map { "\($0.id) — \($0.title)" } ?? "none"
+        return """
+        [PipiUI 计划恢复同步]
+        应用异常退出后正在恢复计划状态。请先根据以下摘要与 UI 重新同步，再继续执行。
+        planId: \(plan.id)
+        planTitle: \(plan.title)
+        completed: \(summary(completed))
+        interrupted: \(summary(interrupted))
+        nextPending: \(nextPendingSummary)
+        必须使用 plan_task_update 更新每个恢复任务及后续任务的状态、进度和阻塞原因；不要假设 UI 已自动同步。
+        """
+    }
+
+    /// First real human/remote prompt path: queue or send one recovery context
+    /// before that prompt. Once Continue/auto delivery succeeds, PlanStore clears
+    /// its persisted latch, so reattach and later prompts cannot inject again.
+    private func deliverPendingInterruptionRecoveryIfNeeded() -> Bool {
+        guard let plan = planStore.plan,
+              planStore.hasPendingInterruptionRecovery(planId: plan.id)
+        else { return true }
+        let outcome = continueInterruptedPlan(planId: plan.id)
+        if let error = outcome.errorMessage {
+            lastError = error
+            return false
+        }
+        return true
+    }
+
+    /// Prefill a revision request in this session's composer without changing
+    /// plan lifecycle. Existing user text is retained after a clear separator.
+    @discardableResult
+    func preparePlanAdjustment(planId: String) -> PlanActionOutcome {
+        guard let plan = planStore.plan else {
+            return .rejected("没有可调整的计划")
+        }
+        guard plan.id == planId else {
+            return .rejected("计划已更新，请重试")
+        }
+        guard plan.lifecycle == .awaitingApproval else {
+            return .rejected(plan.lifecycle == .cancelled ? "计划已忽略" : "计划已在执行")
+        }
+        let revisionPrompt = "请调整计划（计划 ID：\(plan.id)，标题：\(plan.title)）。请根据我的补充重新发布计划，等待我批准后再执行。"
+        let existing = draftText.trimmingCharacters(in: .whitespacesAndNewlines)
+        draftText = existing.isEmpty ? revisionPrompt : existing + "\n\n---\n\n" + revisionPrompt
+        composerDraft.requestFocus()
+        return .sent
     }
 
     /// Result of remote `message.edit` / `message.resend`.
@@ -3766,7 +4269,10 @@ final class ChatSession: ObservableObject, Identifiable {
             return .rejectedBuiltin(builtinName)
         }
         guard processAlive, backend != nil, !isInitializing,
-              !isStreaming, !isSendingFromQueue else { return .unavailable }
+              !isStreaming, !isSendingFromQueue, !isPromptDeliveryBlockedByCompaction else {
+            return .unavailable
+        }
+        cancelProactiveCompactionSchedule()
 
         do {
             try SearchScopeExtension.applyPromptPolicy(
@@ -3811,26 +4317,14 @@ final class ChatSession: ObservableObject, Identifiable {
             return .rejectedBuiltin(builtinName)
         }
         guard processAlive, backend != nil else { return .unavailable }
+        guard deliverPendingInterruptionRecoveryIfNeeded() else { return .unavailable }
 
         let prepared = prepareMessage(text: trimmed, images: [])
-        if isStreaming || isSendingFromQueue {
-            guard queue.enqueue(
-                text: prepared.message,
-                images: [],
-                searchGrantPolicy: .remoteClearGrant
-            ) else {
-                return .empty
-            }
-            publishQueue()
-        } else {
-            guard sendPromptNow(
-                message: prepared.message,
-                images: [],
-                searchGrantPolicy: .remoteClearGrant
-            ) else {
-                return .unavailable
-            }
-        }
+        guard deliverPreparedPrompt(
+            message: prepared.message,
+            images: [],
+            searchGrantPolicy: .remoteClearGrant
+        ) else { return .unavailable }
         return .accepted
     }
 
@@ -3840,7 +4334,8 @@ final class ChatSession: ObservableObject, Identifiable {
         sendPrompt(
             text,
             images: [],
-            searchGrantPolicy: .appAuthoredPreserveLatestHumanGrant
+            searchGrantPolicy: .appAuthoredPreserveLatestHumanGrant,
+            injectPendingInterruptionRecovery: false
         )
     }
 
@@ -4108,15 +4603,19 @@ final class ChatSession: ObservableObject, Identifiable {
         }
     }
 
+    @discardableResult
     private func deliverPreparedPrompt(
         message: String,
         images: [DraftImage],
         searchGrantPolicy: PromptSearchGrantPolicy,
-        stripImagesForRPC: Bool,
+        stripImagesForRPC: Bool = false,
         appendOptimisticBubble: Bool = true
-    ) {
-        // Busy while streaming OR in the gap after drain popped until agent_start.
-        if isStreaming || isSendingFromQueue {
+    ) -> Bool {
+        // A prompt cancels only a not-yet-fired proactive timer. Once compacting, preserve
+        // the RPC and queue this message instead of relying on abort (which cannot stop it).
+        cancelProactiveCompactionSchedule()
+        // Busy while streaming, compaction, or in the gap after drain popped until agent_start.
+        if isStreaming || isSendingFromQueue || isPromptDeliveryBlockedByCompaction {
             let ok = queue.enqueue(
                 text: message,
                 images: images,
@@ -4125,9 +4624,9 @@ final class ChatSession: ObservableObject, Identifiable {
                 appendOptimisticBubble: appendOptimisticBubble
             )
             if ok { publishQueue() }
-            return
+            return ok
         }
-        sendPromptNow(
+        return sendPromptNow(
             message: message,
             images: images,
             searchGrantPolicy: searchGrantPolicy,
@@ -4165,9 +4664,15 @@ final class ChatSession: ObservableObject, Identifiable {
             // is unavailable; the Pi extension itself still fails closed outside cwd.
         }
 
+        // App-authored runtime prompts must never steal the first-user title or
+        // session-list pin from the human prompt they precede (notably restart
+        // recovery, which may be sent before the user's queued continuation).
+        let isAppAuthoredRuntimePrompt = MessageActions.isRuntimeOrSystemInjectedUserText(message)
+
         // Provisional title + at most one side-channel LLM refine (first user message only).
         // Never ghost-prompt the main pi process.
-        if autoTitleEnabled,
+        if !isAppAuthoredRuntimePrompt,
+           autoTitleEnabled,
            !userRenamedTitle,
            !message.contains(Self.sessionTitleJobMarker) {
             if SessionTitleLogic.isPlaceholderName(sessionName) {
@@ -4196,8 +4701,12 @@ final class ChatSession: ObservableObject, Identifiable {
         if !images.isEmpty, !stripImagesForRPC {
             cmd["images"] = ImageAttachment.rpcPayload(from: images)
         }
-        // Pin sidebar session to top on user submit (don't wait for agent_settled / disk mtime).
-        onUserSubmitted?()
+        // Pin sidebar session to top only for an actual user submit (don't wait
+        // for agent_settled / disk mtime). App-authored recovery stays invisible
+        // to this user-intent hook.
+        if !isAppAuthoredRuntimePrompt {
+            onUserSubmitted?()
+        }
         // Speed stats t0: the actual prompt RPC send. Set here (not at user submit)
         // so queued prompts and vision pre-captioning don't inflate TTFT.
         streamRequestStartedAt = Date()
@@ -4294,6 +4803,9 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     func abort(cutIn: Bool = false) {
+        // Stop cancels a timer that has not yet fired, but preserves the existing handling
+        // for a compaction that already started.
+        cancelProactiveCompactionSchedule()
         // Optimistic: acknowledge the click immediately. Cleared on settle / exit / new turn.
         isStopping = true
         pendingStreamMessage = nil
@@ -4459,11 +4971,16 @@ final class ChatSession: ObservableObject, Identifiable {
         try? FileManager.default.removeItem(at: cutInHoldFileURL)
     }
 
-    /// Drain queue when agent is idle. Call from agent_settled or cut-in when already idle.
+    /// Drain queue when agent is idle. Call from compaction_end / agent_settled or cut-in.
     /// Armed cut-in joins ALL queued messages into one prompt; otherwise pops the head only.
-    private func drainQueueIfIdle() {
-        // Stale flag if prior drain never saw agent_start (e.g. odd settle path).
+    private func drainQueueIfIdle(allowStaleDispatchReset: Bool = false) {
+        // A compaction's RPC can be accepted just before its start event. Keep queued input
+        // behind either state; do not send or abort it until the lifecycle is truly over.
+        guard !isPromptDeliveryBlockedByCompaction else { return }
+        // Only the settling turn may recover an old dispatch flag. A compaction_end can
+        // dispatch the next prompt before an old settle arrives, which must not pop twice.
         if isSendingFromQueue && !isStreaming {
+            guard allowStaleDispatchReset else { return }
             isSendingFromQueue = false
         }
         let cutInArmed = queue.cutInJoinArmed
@@ -4562,6 +5079,8 @@ final class ChatSession: ObservableObject, Identifiable {
     func shutdown(onExited: (() -> Void)? = nil) {
         // Any pending stop escalation must not outlive the kill path it triggers.
         cancelStopEscalation()
+        cancelProactiveCompactionSchedule()
+        proactiveCompactionRPCInFlight = false
         isStopping = false
         clearCompactionState()
         processStartCancelled = true
@@ -4569,6 +5088,7 @@ final class ChatSession: ObservableObject, Identifiable {
         unbindQuotaMonitor()
         unbindBalanceMonitor()
         subagents.saveNow()
+        planStore.saveNow()
         ComputerCoordinator.shared.release(
             sessionKey: bridgeRoutingKey,
             revokeConsent: true
@@ -4849,16 +5369,77 @@ extension ChatSession {
             }
         }
     }
+
+    /// Route the panel's "handled" action through Node's run-scoped resolve control plane.
+    /// Current rows never get a Swift-only `.cleaned`: Node cancels the matching reminder and
+    /// sends a closeout bridge event that performs the persisted/ledger update after runId match.
+    func resolveSubagent(_ agent: SubagentInfo) {
+        let runId = agent.runId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !runId.isEmpty else {
+            if subagents.markLegacyCleanedWithoutRuntimeCancel(id: agent.id) {
+                flash("旧记录没有 runId：已仅在本地标记为已处理，无法取消运行时提醒")
+            } else {
+                flash("旧记录缺少 runId，无法安全标记")
+            }
+            return
+        }
+        guard let backend else {
+            flash("pi 未运行，无法通过运行时标记已处理")
+            return
+        }
+        // Values originate from Node bridge state, but do not let any corrupted persisted row
+        // turn a private prompt command into multiple arguments/lines.
+        guard !agent.id.isEmpty,
+              agent.id.range(of: #"\s"#, options: .regularExpression) == nil,
+              runId.range(of: #"\s"#, options: .regularExpression) == nil else {
+            flash("agent 记录无效，无法安全标记")
+            return
+        }
+        let reason = "用户在界面标记为已处理"
+        backend.request([
+            "type": "prompt",
+            "message": "/subagent_resolve \(agent.id) \(runId) \(reason)",
+        ]) { [weak self] response in
+            guard let self else { return }
+            if response["success"].bool != true {
+                self.flash(response["error"].string ?? "标记已处理请求失败")
+            }
+        }
+    }
 }
 
 // MARK: - BuiltinCommandHost
 
 extension ChatSession: BuiltinCommandHost {
     func runCompact() {
-        backend?.request(["type": "compact"]) { [weak self] resp in
+        // Manual /compact remains the same RPC path; it merely supersedes a timer that
+        // has not fired yet. Existing compaction_start/end events remain authoritative.
+        cancelProactiveCompactionSchedule()
+        runCompact(proactive: false)
+    }
+
+    private func runCompact(proactive: Bool) {
+        guard let backend else {
+            if proactive {
+                finishProactiveCompactionRequestFailure()
+            }
+            return
+        }
+        if proactive {
+            // The timer is only a hint. Recheck every live gate immediately before RPC.
+            guard canScheduleProactiveCompaction,
+                  proactiveCompactionPolicy.nextSchedulingDelay(now: Date()) != nil
+            else { return }
+            proactiveCompactionRPCInFlight = true
+        }
+        backend.request(["type": "compact"]) { [weak self] resp in
             guard let self else { return }
             if resp["success"].bool != true {
-                self.flash(resp["error"].string ?? "压缩失败")
+                if proactive {
+                    self.finishProactiveCompactionRequestFailure()
+                } else {
+                    self.flash(resp["error"].string ?? "压缩失败")
+                }
             }
             // Success: existing compaction_start/end events append system lines.
         }

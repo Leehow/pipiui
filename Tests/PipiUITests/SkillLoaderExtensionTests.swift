@@ -15,6 +15,127 @@ final class SkillLoaderExtensionTests: XCTestCase {
         return try String(contentsOfFile: path, encoding: .utf8)
     }
 
+    func testGeneratedModuleExecutesBundledFirstReadOnlyDiscoveryAndPathRejection() throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("pipiui-skillloader-runtime-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: root) }
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let moduleDirectory = root.appendingPathComponent("module", isDirectory: true)
+        let modulePath = try XCTUnwrap(SkillLoaderExtension.install(into: moduleDirectory))
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let builtInRoot = home.appendingPathComponent(
+            "Library/Application Support/PipiUI/built-in-skills", isDirectory: true
+        )
+        let userRoot = home.appendingPathComponent(".pi/agent/skills", isDirectory: true)
+        let settingsRoot = root.appendingPathComponent("settings-skills", isDirectory: true)
+        let overrideRoot = root.appendingPathComponent("override-skills", isDirectory: true)
+        let denylistURL = home.appendingPathComponent(
+            "Library/Application Support/PipiUI/tool-skill-settings.json"
+        )
+        func writeSkill(_ root: URL, _ name: String, _ description: String, _ body: String) throws {
+            let directory = root.appendingPathComponent(name, isDirectory: true)
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try "---\nname: \(name)\ndescription: \(description)\n---\n\(body)\n".write(
+                to: directory.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8
+            )
+        }
+        try writeSkill(builtInRoot, "create-subagent", "bundled description", "bundled body")
+        try writeSkill(userRoot, "create-subagent", "user shadow description", "user shadow body")
+        try writeSkill(userRoot, "user-only", "user description", "user body")
+        try writeSkill(settingsRoot, "settings-only", "settings description", "settings body")
+        try writeSkill(overrideRoot, "override-only", "override description", "override body")
+        try writeSkill(userRoot, "disabled-one", "disabled description", "disabled body")
+        try fileManager.createDirectory(at: denylistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "{\"disabledSkills\":[\"disabled-one\"]}".write(to: denylistURL, atomically: true, encoding: .utf8)
+        let settingsURL = home.appendingPathComponent(".pi/agent/settings.json")
+        try fileManager.createDirectory(at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "{\"skills\":[\"\(settingsRoot.path)\"]}".write(to: settingsURL, atomically: true, encoding: .utf8)
+
+        // Discovery must work without write permission to normal user/settings roots.
+        for directory in [userRoot, settingsRoot] {
+            try fileManager.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        }
+        defer {
+            for directory in [userRoot, settingsRoot] {
+                try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            }
+        }
+
+        let typebox = moduleDirectory.appendingPathComponent("node_modules/typebox", isDirectory: true)
+        try fileManager.createDirectory(at: typebox, withIntermediateDirectories: true)
+        try "{\"type\":\"module\",\"exports\":\"./index.js\"}".write(
+            to: typebox.appendingPathComponent("package.json"), atomically: true, encoding: .utf8
+        )
+        try "export const Type = new Proxy({}, { get: () => (...args) => args[0] ?? {} });\n".write(
+            to: typebox.appendingPathComponent("index.js"), atomically: true, encoding: .utf8
+        )
+        let harness = moduleDirectory.appendingPathComponent("harness.mjs")
+        let harnessSource = #"""
+        import { pathToFileURL } from "node:url";
+        const tools = new Map();
+        const handlers = new Map();
+        const module = await import(pathToFileURL(process.env.PIPIUI_SKILL_LOADER).href);
+        module.default({
+          on(event, handler) { handlers.set(event, handler); },
+          registerTool(tool) { tools.set(tool.name, tool); },
+        });
+        const search = await tools.get("skill_search").execute("search", {});
+        const load = await tools.get("skill_load").execute("load", { name: "create-subagent" });
+        const rejected = await tools.get("skill_load").execute("bad", { name: "../outside/SKILL.md" });
+        const prompt = handlers.get("before_agent_start")({
+          systemPrompt: "before\n<available_skills>legacy</available_skills>\nafter",
+        });
+        process.stdout.write(JSON.stringify({
+          tools: [...tools.keys()].sort(),
+          search: search.content[0].text,
+          load: load.content[0].text,
+          rejected: { isError: rejected.isError, text: rejected.content[0].text },
+          prompt: prompt.systemPrompt,
+        }));
+        """#
+        try harnessSource.write(to: harness, atomically: true, encoding: .utf8)
+
+        var environment = ProcessInfo.processInfo.environment
+        environment["HOME"] = home.path
+        environment["PIPIUI_SKILL_ROOTS"] = overrideRoot.path
+        environment["PIPIUI_SKILL_LOADER"] = modulePath
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", "--experimental-strip-types", harness.path]
+        process.currentDirectoryURL = moduleDirectory
+        process.environment = environment
+        let output = Pipe()
+        let errors = Pipe()
+        process.standardOutput = output
+        process.standardError = errors
+        try process.run()
+        process.waitUntilExit()
+        let stdout = output.fileHandleForReading.readDataToEndOfFile()
+        let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        XCTAssertEqual(process.terminationStatus, 0, "skill loader runtime harness failed: \(stderr)")
+        let report = try XCTUnwrap(JSONSerialization.jsonObject(with: stdout) as? [String: Any])
+        XCTAssertEqual(report["tools"] as? [String], ["skill_load", "skill_search"])
+        let search = try XCTUnwrap(report["search"] as? String)
+        XCTAssertTrue(search.contains("bundled description"))
+        XCTAssertFalse(search.contains("user shadow description"), "bundled root must win same-name deduplication")
+        XCTAssertTrue(search.contains("user description"))
+        XCTAssertTrue(search.contains("settings description"))
+        XCTAssertTrue(search.contains("override description"))
+        XCTAssertFalse(search.contains("disabled description"), "denylisted skills must not be discovered")
+        XCTAssertTrue((report["load"] as? String)?.contains("bundled body") == true)
+        let rejected = try XCTUnwrap(report["rejected"] as? [String: Any])
+        XCTAssertEqual(rejected["isError"] as? Bool, true)
+        XCTAssertTrue((rejected["text"] as? String)?.contains("Unknown skill") == true)
+        XCTAssertTrue((report["prompt"] as? String)?.contains("create-subagent") == true)
+        XCTAssertFalse((report["prompt"] as? String)?.contains("legacy") == true)
+        XCTAssertEqual(
+            try String(contentsOf: userRoot.appendingPathComponent("user-only/SKILL.md"), encoding: .utf8),
+            "---\nname: user-only\ndescription: user description\n---\nuser body\n"
+        )
+    }
+
     func testReplacesPiCatalogWithNamesOnlyIndex() throws {
         let source = try installedSource()
 
@@ -75,6 +196,14 @@ final class SkillLoaderExtensionTests: XCTestCase {
         XCTAssertTrue(source.contains("process.env.PIPIUI_SKILL_ROOTS"))
         XCTAssertTrue(source.contains(".pi/agent/settings.json"))
         XCTAssertTrue(source.contains("Library/Application Support/PipiUI/tool-skill-settings.json"))
+        // PipiUI's signed, app-owned root is first (so a same-named user skill cannot
+        // replace it), while explicit roots and Pi's normal settings remain available.
+        XCTAssertTrue(source.contains("const PIPIUI_BUILT_IN_SKILL_ROOT = path.join("))
+        XCTAssertTrue(source.contains("\"Library\", \"Application Support\", \"PipiUI\", \"built-in-skills\""))
+        XCTAssertTrue(source.contains("const roots: string[] = [PIPIUI_BUILT_IN_SKILL_ROOT];"))
+        XCTAssertTrue(source.contains("roots.push(...override.split(\":\").filter(Boolean).map(homePath));"))
+        XCTAssertTrue(source.contains("roots.push(path.join(os.homedir(), \".pi/agent/skills\"));"))
+        XCTAssertTrue(source.contains("First root wins in loadCatalog"))
         XCTAssertTrue(source.contains("disabledSkills"))
         XCTAssertTrue(source.contains("if (!description || disabled.has(name)) continue;"))
         // Pi's rule: a directory holding SKILL.md is a leaf, so a skills root that also

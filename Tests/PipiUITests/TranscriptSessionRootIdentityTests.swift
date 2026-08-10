@@ -95,24 +95,28 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
 
         XCTAssertEqual(TranscriptRenderWindow.latestStartPage(itemCount: 0), 0)
         XCTAssertEqual(TranscriptRenderWindow.latestStartPage(itemCount: 32), 0)
-        XCTAssertEqual(TranscriptRenderWindow.latestStartPage(itemCount: 64), 1)
-        XCTAssertEqual(TranscriptRenderWindow.latestStartPage(itemCount: 65), 2)
-        XCTAssertEqual(TranscriptRenderWindow.latestStartPage(itemCount: 200), 6)
-        XCTAssertEqual(TranscriptRenderWindow.latestStartPage(itemCount: 1_085), 33)
+        XCTAssertEqual(TranscriptRenderWindow.latestStartPage(itemCount: 64), 0)
+        XCTAssertEqual(TranscriptRenderWindow.latestStartPage(itemCount: 65), 0)
+        XCTAssertEqual(TranscriptRenderWindow.latestStartPage(itemCount: 200), 3)
+        XCTAssertEqual(TranscriptRenderWindow.latestStartPage(itemCount: 1_085), 30)
     }
 
-    func testInitialAndRepinnedWindowIsLatestPage() {
-        // 200 items → latest page 6: the initial window is exactly that page —
-        // no second-page preload.
+    func testInitialAndRepinnedWindowWarmsLatestFourPages() {
+        // 200 items → pages 3...6: live/latest keeps the newest bounded window.
         let initial = TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: nil)
-        XCTAssertEqual(initial.range, 192..<200)
-        XCTAssertEqual(initial.renderedCount, 8)
+        XCTAssertEqual(initial.range, 96..<200)
+        XCTAssertEqual(initial.renderedCount, 104)
         XCTAssertTrue(initial.isLatest)
 
-        // Transcript shorter than one page renders everything.
+        let full = TranscriptRenderWindow.resolve(itemCount: 256, oldestLoadedPage: nil)
+        XCTAssertEqual(full.range, 128..<256)
+        XCTAssertEqual(full.renderedCount, 128)
+        XCTAssertTrue(full.isLatest)
+
+        // Transcripts below the 128-row cap render everything.
         XCTAssertEqual(
             TranscriptRenderWindow.resolve(itemCount: 40, oldestLoadedPage: nil).range,
-            32..<40
+            0..<40
         )
         XCTAssertEqual(
             TranscriptRenderWindow.resolve(itemCount: 10, oldestLoadedPage: nil).range,
@@ -125,8 +129,8 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         let before = TranscriptRenderWindow.resolve(itemCount: 100, oldestLoadedPage: nil)
         let after = TranscriptRenderWindow.resolve(itemCount: 140, oldestLoadedPage: nil)
 
-        XCTAssertEqual(before.range, 96..<100)
-        XCTAssertEqual(after.range, 128..<140)
+        XCTAssertEqual(before.range, 0..<100)
+        XCTAssertEqual(after.range, 32..<140)
         XCTAssertTrue(before.isLatest)
         XCTAssertTrue(after.isLatest)
     }
@@ -192,9 +196,9 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertNil(TranscriptHistoryExpander.expand(currentStartPage: -1))
     }
 
-    func testInitialWindowGrowsOnePagePerTopArrival() {
-        // 200 items: initial window is page 6 alone; each top arrival adds one
-        // page (1 → 2 → 3 pages), always ending at the newest item.
+    func testLatestWarmWindowSlidesOnePagePerTopArrival() {
+        // 200 items: latest starts at page 3; each top arrival admits exactly one
+        // older page while the four-page ceiling slides the window.
         var head: Int? = nil
         var ranges: [Range<Int>] = []
         for _ in 0..<3 {
@@ -204,20 +208,20 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
             let current = head ?? TranscriptRenderWindow.latestStartPage(itemCount: 200)
             head = TranscriptHistoryExpander.expand(currentStartPage: current)
         }
-        XCTAssertEqual(ranges[0], 192..<200)
-        XCTAssertEqual(ranges[1], 160..<200)
-        XCTAssertEqual(ranges[2], 128..<200)
+        XCTAssertEqual(ranges[0], 96..<200)
+        XCTAssertEqual(ranges[1], 64..<192)
+        XCTAssertEqual(ranges[2], 32..<160)
     }
 
     func testWindowClampsOutOfRangeOldestLoadedPage() {
         // Stale head after a transcript reload: page 9 no longer exists (last is 6).
         XCTAssertEqual(
             TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: 9).range,
-            192..<200
+            96..<200
         )
         XCTAssertEqual(
             TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: -2).range,
-            192..<200
+            96..<200
         )
         let empty = TranscriptRenderWindow.resolve(itemCount: 0, oldestLoadedPage: 3)
         XCTAssertEqual(empty.range, 0..<0)
@@ -312,11 +316,11 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertFalse(transcript.contains("topVisiblePage"))
         XCTAssertFalse(transcript.contains("lastPlannedRange"))
         XCTAssertFalse(transcript.contains("trackPlannedWindow"))
-        XCTAssertTrue(transcript.contains("transcriptOldestLoadedPage"))
-        // One explicit pager owns both non-scrollable safety backfill and
-        // user-driven near-top prefetch.
-        XCTAssertTrue(transcript.contains("TranscriptHistoryPager.begin"))
-        XCTAssertTrue(transcript.contains("historyPageLoadState"))
+        XCTAssertTrue(transcript.contains("historyPreparation"))
+        // One prepared-history reducer owns both non-scrollable safety backfill
+        // and user-driven near-top prefetch.
+        XCTAssertTrue(transcript.contains("TranscriptHistoryPreparation.request"))
+        XCTAssertTrue(transcript.contains("preparedHistoryPresentation"))
         XCTAssertTrue(transcript.contains("historyLoadingEnabled"))
         XCTAssertTrue(transcript.contains("onReachedTop:"))
         XCTAssertFalse(transcript.contains("onNearTop"))
@@ -368,11 +372,11 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertTrue(transcript.contains("StickToBottomTracker("))
         XCTAssertTrue(transcript.contains("pinEdge: .documentStart"))
         XCTAssertTrue(source.contains("distanceFromDocumentEnd("))
-        // The callback goes through the one-page pager. Pinned non-scrollable
-        // windows are intentionally allowed to safety-backfill.
-        XCTAssertTrue(transcript.contains("TranscriptHistoryPager.begin"))
+        // The callback goes through the prepared-history reducer. Pinned
+        // non-scrollable windows are intentionally allowed to safety-backfill.
+        XCTAssertTrue(transcript.contains("TranscriptHistoryPreparation.request"))
         XCTAssertFalse(transcript.contains("guard !session.pinTranscriptToBottom"))
-        XCTAssertTrue(transcript.contains("transcriptOldestLoadedPage"))
+        XCTAssertTrue(transcript.contains("historyPreparation.committedPage"))
         XCTAssertTrue(transcript.contains("latestStartPage(itemCount: items.count)"))
         XCTAssertTrue(transcript.contains("正在加载更早消息…"))
         XCTAssertTrue(transcript.contains("还没有消息"))
@@ -440,15 +444,14 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertTrue(source.contains("session.bridgeRoutingKey == key"))
     }
 
-    func testLatestStartPageIsLatestPageNoPreload() throws {
+    func testLatestStartPageKeepsLatestWarmWindow() throws {
         let source = try chatDetailSource()
-        // The default window is the newest single page: no second-page preload.
         XCTAssertTrue(source.contains("static func latestStartPage(itemCount: Int) -> Int {"))
-        XCTAssertTrue(source.contains("max(0, latestPage(itemCount: itemCount))"))
-        XCTAssertEqual(TranscriptRenderWindow.latestStartPage(itemCount: 200), 6)
+        XCTAssertTrue(source.contains("latestPage(itemCount: itemCount) - (maxPages - 1)"))
+        XCTAssertEqual(TranscriptRenderWindow.latestStartPage(itemCount: 200), 3)
         XCTAssertEqual(
             TranscriptRenderWindow.resolve(itemCount: 200, oldestLoadedPage: nil).range,
-            192..<200
+            96..<200
         )
     }
 
@@ -464,7 +467,18 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertTrue(tracker.contains("TranscriptHistoryPrefetchTrigger"))
         XCTAssertFalse(tracker.contains("onNearTop"))
         XCTAssertFalse(tracker.contains("TranscriptNearTopTrigger"))
-        XCTAssertTrue(source.contains("approachThreshold"))
+        // The host derives the approach band from its current viewport, then
+        // passes that dynamic value through the AppKit tracker to the trigger.
+        // Clamp behavior itself belongs to TranscriptExactTopTriggerTests.
+        XCTAssertTrue(
+            source.contains(
+                "historyPrefetchThreshold: TranscriptHistoryPrefetchTrigger.threshold(\n"
+                    + "                            viewportHeight: viewportHeight\n"
+                    + "                        )"
+            )
+        )
+        XCTAssertTrue(tracker.contains("var historyPrefetchThreshold: CGFloat"))
+        XCTAssertTrue(tracker.contains("threshold: historyPrefetchThreshold"))
         XCTAssertTrue(source.contains("distanceFromDocumentEnd("))
         XCTAssertTrue(tracker.contains("case .documentStart:"))
         XCTAssertFalse(tracker.contains("PendingPrependSnapshot"))
@@ -492,6 +506,37 @@ final class TranscriptSessionRootIdentityTests: XCTestCase {
         XCTAssertTrue(tracker.contains("coordinator.detach()"))
         XCTAssertFalse(tracker.contains("schedulePendingCleanup"))
         XCTAssertFalse(tracker.contains("pendingCleanupToken"))
+    }
+
+    func testAutomaticFollowUsesViewportOwnershipAndIntentGate() throws {
+        let source = try chatDetailSource()
+        let bodyStart = try XCTUnwrap(
+            source.range(of: "private struct ChatDetailViewBody: View")?.lowerBound
+        )
+        let rowsStart = try XCTUnwrap(
+            source.range(of: "private struct StreamingTranscriptRows: View")?.lowerBound
+        )
+        let body = String(source[bodyStart..<rowsStart])
+        let tracker = String(source[rowsStart..<source.endIndex])
+
+        // Proxy jump/retry/resize paths must read the same live-owner gate that
+        // becomes false on the first attributed user scroll.
+        XCTAssertTrue(body.contains("private var allowsAutomaticFollow: Bool"))
+        XCTAssertTrue(body.contains("userPromptNavigation.streamingMayWriteScroll"))
+        XCTAssertTrue(body.contains("guard allowsAutomaticFollow else { return }"))
+
+        // The AppKit document-frame path receives the ownership gate and also
+        // carries an immediate intent generation through its async follow hop.
+        XCTAssertTrue(tracker.contains("automaticFollowAllowed: automaticFollowAllowed"))
+        XCTAssertTrue(tracker.contains("private func allowsAutomaticFollow() -> Bool"))
+        XCTAssertTrue(tracker.contains("guard automaticFollowAllowed else { return false }"))
+        XCTAssertTrue(tracker.contains("followIntent.isCurrent(followGeneration)"))
+        XCTAssertTrue(tracker.contains("followIntent: followIntent"))
+        XCTAssertTrue(tracker.contains("unpinForPreparedHistoryCommit"))
+        XCTAssertTrue(tracker.contains("completePreparedHistoryCommitAfterWindowMutation"))
+        XCTAssertTrue(tracker.contains("resumeForExplicitLatest()"))
+        XCTAssertTrue(tracker.contains("mayWritePersistentUserUnpin"))
+        XCTAssertTrue(tracker.contains("onUserRepinnedLatest"))
     }
 
     func testInvertedLayoutPlacesBottomExtrasBeforeNewestFirstSettledRows() throws {

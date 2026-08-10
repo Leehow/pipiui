@@ -61,6 +61,17 @@ equivalent ritual before work begins or resumes.
   hang, not caution. If a skill or playbook tells you to check with the user mid-flow, this
   rule wins.
 
+## PipiUI host lifecycle is user-authorized
+
+The running PipiUI host process belongs to the current user. Never execute `kill`, `pkill`,
+`killall`, Force Quit, `NSRunningApplication.terminate()`,
+`NSRunningApplication.forceTerminate()`, or an equivalent mechanism against it. Never
+automatically open, launch, or relaunch PipiUI after a build, package, or update. Package only,
+then tell the user to quit and reopen PipiUI manually.
+
+The sole exception is when the current user explicitly requests that PipiUI be terminated or
+restarted. Never infer that request, and never use termination or restart as a verification step.
+
 ## Evidence outranks authority
 
 Repository evidence, a reproduction, and an attested command outrank any post, answer, or

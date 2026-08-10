@@ -23,7 +23,7 @@ const spawnAssemblyURL = new URL(
   import.meta.url,
 );
 const generalPurposeURL = new URL(
-  "../../Sources/PipiUI/PiExt/agents/general-purpose.md",
+  "../../Sources/PipiUI/PiExt/agents/general-purpose/AGENT.md",
   import.meta.url,
 );
 
@@ -93,13 +93,23 @@ test("tool allowlist: desktop tools injected only when the host gate passed", ()
   assert.deepEqual(noGrant, { flag: "--tools", names: ["read", "bash"] });
 
   const unrestricted = resolveSubagentToolSelection({
-    declaredTools: [],
+    declaredTools: undefined,
     disabledTools: staleJSON.disabledTools,
     hasDesktopCapability: true,
     allowRecursiveDelegation: false,
   });
   assert.equal(unrestricted.flag, "--exclude-tools");
   assert.deepEqual(unrestricted.names, ["bash", "subagent"]);
+
+  const legacyNoGrant = resolveSubagentToolSelection({
+    declaredTools: undefined,
+    disabledTools: [],
+    hasDesktopCapability: false,
+    allowRecursiveDelegation: true,
+  });
+  assert.equal(legacyNoGrant.flag, "--exclude-tools");
+  assert.ok(legacyNoGrant.names.includes("computer"));
+  assert.ok(legacyNoGrant.names.includes("open_application"));
 });
 
 test("child policy text: read/bash instead of computer, no wait/poll/log/build/test, browser split, named external browsers", () => {
@@ -151,8 +161,8 @@ test("index.ts runtime gate: grant gated extension mount, env, and early failure
   );
   const helperCalls = [...subagent.matchAll(/pipiuiChildProcessEnv\(/g)];
   assert.ok(
-    helperCalls.length >= 4,
-    "expected helper definition, verifier/git calls, and dispatched Pi call",
+    helperCalls.length >= 3,
+    "expected helper definition, a non-desktop helper call, and the dispatched Pi call",
   );
 });
 

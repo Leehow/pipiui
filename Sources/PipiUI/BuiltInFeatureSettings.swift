@@ -61,6 +61,12 @@ enum BuiltInFeatureSettings {
         case reload
         /// PipiUI's own web_search / web_fetch extension (not a native model tool).
         case webSearch
+        /// Core local PDF text/OCR extraction bridge (no cloud upload).
+        case pdfExtract
+        /// Local Pi package for GitHub repository/blob/tree retrieval.
+        case githubFetch
+        /// Local Pi package for arXiv metadata and HTML retrieval; optional PDF fallback is separate.
+        case arxivFetch
         /// User-added MCP servers (stdio / HTTP) exposed as local tools.
         case mcp
         /// On-demand skill loader (name index + skill_search / skill_load).
@@ -115,6 +121,18 @@ enum BuiltInFeatureSettings {
               section: .extensionTool,
               title: "web_search / web_fetch",
               summary: "为不带联网搜索的模型补充搜索/抓取工具（Firecrawl 免 key 搜索，无需配置）。"),
+        .init(id: .pdfExtract,
+              section: .extensionTool,
+              title: "本地 PDF 读取",
+              summary: "本地PDF读取：文本层优先，必要时Vision OCR，无云上传。"),
+        .init(id: .githubFetch,
+              section: .extensionTool,
+              title: "GitHub repo / code fetch",
+              summary: "独立本地 Pi package 的 github_fetch：GitHub 仓库、blob、tree 走 Contents API / 安全浅克隆；issue、PR、discussion、wiki、release 仍用 web_fetch。关闭 web_search 不会关闭它。"),
+        .init(id: .arxivFetch,
+              section: .extensionTool,
+              title: "arXiv paper fetch",
+              summary: "独立本地 Pi package 的 arxiv_fetch：arXiv Atom 元数据、官方 HTML 与 ar5iv 单次降级；PDF 降级取决于「本地 PDF 读取」开关，且不上传 PDF。关闭后 arXiv URL 回退 web_fetch。"),
         .init(id: .mcp,
               section: .extensionTool,
               title: "MCP 服务器",

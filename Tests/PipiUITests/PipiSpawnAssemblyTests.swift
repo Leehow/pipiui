@@ -12,8 +12,12 @@ final class PipiSpawnAssemblyTests: XCTestCase {
             git: "/p/git.ts",
             reload: "/p/reload.ts",
             webSearch: "/p/websearch.ts",
+            githubFetchPackage: "/p/packages/github-fetch",
+            arxivFetchPackage: "/p/packages/arxiv-fetch",
+            pdfExtract: "/p/pdf-extract.ts",
             mcp: "/p/mcp.ts",
             skillLoader: "/p/skills.ts",
+            planRuntime: "/p/plan-runtime.ts",
             searchScope: "/p/searchscope.ts",
             codexServerTools: "/p/codex.ts",
             claudeServerTools: "/p/claude.ts",
@@ -55,8 +59,12 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         installed.gitExtension = "/p/git.ts"
         installed.reloadExtension = "/p/reload.ts"
         installed.webSearchExtension = "/p/websearch.ts"
+        installed.githubFetchPackage = "/p/packages/github-fetch"
+        installed.arxivFetchPackage = "/p/packages/arxiv-fetch"
+        installed.pdfExtractExtension = "/p/pdf-extract.ts"
         installed.mcpExtension = "/p/mcp.ts"
         installed.skillLoaderExtension = "/p/skills.ts"
+        installed.planRuntimeExtension = "/p/plan-runtime.ts"
         installed.searchScopeExtension = "/p/searchscope.ts"
         installed.codexServerToolsExtension = "/p/codex.ts"
         installed.claudeServerToolsExtension = "/p/claude.ts"
@@ -80,12 +88,73 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertNil(paths.git)
         XCTAssertNil(paths.reload)
         XCTAssertNil(paths.webSearch)
+        XCTAssertNil(paths.githubFetchPackage)
+        XCTAssertNil(paths.arxivFetchPackage)
+        XCTAssertNil(paths.pdfExtract)
         XCTAssertNil(paths.mcp)
         XCTAssertNil(paths.skillLoader)
+        // Plan runtime is gated with philosophy / automatic planning — bare pi drops it.
+        XCTAssertNil(paths.planRuntime)
         XCTAssertNil(paths.searchScope)
         XCTAssertNil(paths.codexServerTools)
         XCTAssertNil(paths.claudeServerTools)
         XCTAssertNil(paths.computerUse)
+    }
+
+    func testResolvedPlanRuntimeMountsWhenPhilosophyEnabled() {
+        var installed = PiPlugin.Installed()
+        installed.planRuntimeExtension = "/p/plan-runtime.ts"
+        let enabled = BuiltInFeatureSettings.EnabledSet()
+        let paths = PipiSpawnAssembly.Paths.resolved(
+            installed: installed,
+            features: enabled,
+            philosophyExtension: "/p/philosophy.ts",
+            computerUseExtension: nil
+        )
+        XCTAssertEqual(paths.philosophy, "/p/philosophy.ts")
+        XCTAssertEqual(paths.planRuntime, "/p/plan-runtime.ts")
+    }
+
+    func testResolvedGitHubPackageIsIndependentFromWebSearch() {
+        var installed = PiPlugin.Installed()
+        installed.webSearchExtension = "/p/websearch.ts"
+        installed.githubFetchPackage = "/p/packages/github-fetch"
+        let features = BuiltInFeatureSettings.EnabledSet(
+            disabledIDs: [BuiltInFeatureSettings.FeatureID.webSearch.rawValue]
+        )
+
+        let paths = PipiSpawnAssembly.Paths.resolved(
+            installed: installed,
+            features: features,
+            philosophyExtension: nil,
+            computerUseExtension: nil
+        )
+        XCTAssertNil(paths.webSearch)
+        XCTAssertEqual(paths.githubFetchPackage, "/p/packages/github-fetch")
+    }
+
+    func testResolvedPDFExtractIsIndependentFromArxivFeature() {
+        var installed = PiPlugin.Installed()
+        installed.arxivFetchPackage = "/p/packages/arxiv-fetch"
+        installed.pdfExtractExtension = "/p/pdf-extract.ts"
+
+        let arxivDisabled = PipiSpawnAssembly.Paths.resolved(
+            installed: installed,
+            features: .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.arxivFetch.rawValue]),
+            philosophyExtension: nil,
+            computerUseExtension: nil
+        )
+        XCTAssertNil(arxivDisabled.arxivFetchPackage)
+        XCTAssertEqual(arxivDisabled.pdfExtract, "/p/pdf-extract.ts")
+
+        let pdfDisabled = PipiSpawnAssembly.Paths.resolved(
+            installed: installed,
+            features: .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.pdfExtract.rawValue]),
+            philosophyExtension: nil,
+            computerUseExtension: nil
+        )
+        XCTAssertEqual(pdfDisabled.arxivFetchPackage, "/p/packages/arxiv-fetch")
+        XCTAssertNil(pdfDisabled.pdfExtract)
     }
 
     func testLateSubagentConflictResultRequiresCurrentGenerationAndFeature() {
@@ -203,14 +272,26 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertTrue(out.args.contains("/p/webview.ts"))
         XCTAssertTrue(out.args.contains("/p/subagent"))
         XCTAssertTrue(out.args.contains("/p/searchscope.ts"))
+        XCTAssertTrue(out.args.contains("/p/plan-runtime.ts"),
+                      "main bridged session mounts plan runtime: \(out.args)")
+        XCTAssertTrue(out.args.contains("/p/packages/github-fetch"))
+        XCTAssertTrue(out.args.contains("/p/packages/arxiv-fetch"))
+        XCTAssertTrue(out.args.contains("/p/pdf-extract.ts"))
+        XCTAssertEqual(out.extraEnv["PIPIUI_ARXIV_EXT"], "/p/packages/arxiv-fetch")
+        XCTAssertEqual(out.extraEnv["PIPIUI_PDF_EXT"], "/p/pdf-extract.ts")
+        XCTAssertNotNil(out.extraEnv["PIPIUI_PDF_HELPER"])
+        XCTAssertNil(out.extraEnv["PIPIUI_PLAN_RUNTIME_EXT"],
+                     "plan runtime must not be re-exported to workers")
         XCTAssertEqual(out.extraEnv["PIPIUI_SEARCH_SCOPE_EXT"], "/p/searchscope.ts")
         XCTAssertNotNil(out.extraEnv["PIPIUI_SEARCH_GRANT_FILE"])
         XCTAssertEqual(out.extraEnv["PIPIUI_SUBAGENT_EXT"], "/p/subagent")
         XCTAssertEqual(out.extraEnv["PIPIUI_AGENTS_DIR"], "/p/agents")
         XCTAssertNotNil(out.extraEnv["PIPIUI_SUBAGENT_MODELS_FILE"])
+        XCTAssertNotNil(out.extraEnv["PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE"])
         XCTAssertEqual(out.extraEnv["PIPIUI_MAIN_CWD"], "/proj")
         XCTAssertEqual(out.extraEnv["PIPIUI_MAIN_MODEL"], "provider/model")
         XCTAssertEqual(out.extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"], "/p/websearch-config.json")
+        XCTAssertEqual(out.extraEnv["PIPIUI_GITHUB_EXT"], "/p/packages/github-fetch")
         XCTAssertEqual(out.extraEnv["PIPIUI_MCP_CONFIG_FILE"], "/p/mcp-config.json")
         XCTAssertEqual(out.extraEnv["PIPIUI_MCP_EXT"], "/p/mcp.ts")
         XCTAssertTrue(out.args.contains("/p/mcp.ts"))
@@ -243,6 +324,65 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_HEIGHT"], "100")
     }
 
+    func testWebSearchDisabledKeepsGitHubPackageIndependent() {
+        var input = allEnabledInput(paths: fullyPopulatedPaths())
+        input.features = .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.webSearch.rawValue])
+
+        let out = PipiSpawnAssembly.assemble(input)
+        XCTAssertFalse(out.args.contains("/p/websearch.ts"))
+        XCTAssertNil(out.extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"])
+        XCTAssertNil(out.extraEnv["PIPIUI_WEBSEARCH_EXT"])
+        XCTAssertTrue(out.args.contains("/p/packages/github-fetch"))
+        XCTAssertEqual(out.extraEnv["PIPIUI_GITHUB_EXT"], "/p/packages/github-fetch")
+    }
+
+    func testArxivAndPDFFeatureGatesAreIndependentAcrossAllCombinations() {
+        let cases: [(disabled: [String], arxiv: Bool, pdf: Bool)] = [
+            ([], true, true),
+            ([BuiltInFeatureSettings.FeatureID.arxivFetch.rawValue], false, true),
+            ([BuiltInFeatureSettings.FeatureID.pdfExtract.rawValue], true, false),
+            ([
+                BuiltInFeatureSettings.FeatureID.arxivFetch.rawValue,
+                BuiltInFeatureSettings.FeatureID.pdfExtract.rawValue,
+            ], false, false),
+        ]
+
+        for scenario in cases {
+            var input = allEnabledInput(paths: fullyPopulatedPaths())
+            input.features = .init(disabledIDs: scenario.disabled)
+            let out = PipiSpawnAssembly.assemble(input)
+
+            XCTAssertEqual(out.args.contains("/p/packages/arxiv-fetch"), scenario.arxiv)
+            XCTAssertEqual(out.extraEnv["PIPIUI_ARXIV_EXT"] != nil, scenario.arxiv)
+            XCTAssertEqual(out.args.contains("/p/pdf-extract.ts"), scenario.pdf)
+            XCTAssertEqual(out.extraEnv["PIPIUI_PDF_EXT"] != nil, scenario.pdf)
+            XCTAssertEqual(out.extraEnv["PIPIUI_PDF_HELPER"] != nil, scenario.pdf)
+        }
+    }
+
+    func testPDFRouteRemainsUsableWhenArxivPackagePathIsAbsent() {
+        var paths = fullyPopulatedPaths()
+        paths.arxivFetchPackage = nil
+        let out = PipiSpawnAssembly.assemble(allEnabledInput(paths: paths))
+
+        XCTAssertFalse(out.args.contains("/p/packages/arxiv-fetch"))
+        XCTAssertNil(out.extraEnv["PIPIUI_ARXIV_EXT"])
+        XCTAssertTrue(out.args.contains("/p/pdf-extract.ts"))
+        XCTAssertEqual(out.extraEnv["PIPIUI_PDF_EXT"], "/p/pdf-extract.ts")
+        XCTAssertNotNil(out.extraEnv["PIPIUI_PDF_HELPER"])
+    }
+
+    func testGitHubFetchDisabledDropsPackageAndEnv() {
+        var input = allEnabledInput(paths: fullyPopulatedPaths())
+        input.features = .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.githubFetch.rawValue])
+
+        let out = PipiSpawnAssembly.assemble(input)
+        XCTAssertFalse(out.args.contains("/p/packages/github-fetch"))
+        XCTAssertNil(out.extraEnv["PIPIUI_GITHUB_EXT"])
+        XCTAssertTrue(out.args.contains("/p/websearch.ts"),
+                      "generic web core must stay independent from github_fetch")
+    }
+
     func testMCPDisabledDropsExtensionAndEnv() {
         var input = allEnabledInput(paths: fullyPopulatedPaths())
         input.features = .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.mcp.rawValue])
@@ -272,18 +412,21 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertNil(out.extraEnv["PIPIUI_SUBAGENT_EXT"])
         XCTAssertNil(out.extraEnv["PIPIUI_AGENTS_DIR"])
         XCTAssertNil(out.extraEnv["PIPIUI_SUBAGENT_MODELS_FILE"])
+        XCTAssertNil(out.extraEnv["PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE"])
         XCTAssertNil(out.extraEnv["PIPIUI_MAIN_CWD"])
         XCTAssertNil(out.extraEnv["PIPIUI_MAIN_MODEL"])
         // Bridge plumbing is independent of the subagent feature and stays.
         XCTAssertNotNil(out.extraEnv["PIPIUI_BRIDGE_PORT"])
     }
 
-    func testPhilosophyDisabledDropsFallbackE() {
+    func testPhilosophyDisabledDropsFallbackEAndPlanRuntime() {
         var input = allEnabledInput(paths: fullyPopulatedPaths())
         input.features = .init(disabledIDs: [BuiltInFeatureSettings.FeatureID.philosophy.rawValue])
 
         let out = PipiSpawnAssembly.assemble(input)
         XCTAssertFalse(out.args.contains("/p/philosophy.ts"))
+        XCTAssertFalse(out.args.contains("/p/plan-runtime.ts"),
+                       "plan runtime rides with philosophy: \(out.args)")
     }
 
     func testComputerUseDisabledDropsExtensionAndEnv() {
@@ -297,30 +440,37 @@ final class PipiSpawnAssemblyTests: XCTestCase {
     }
 
     /// Turning every master switch off must produce a command line with NO
-    /// PipiUI-owned `-e` extension at all (bare pi), while RPC/UI routing
-    /// (bridge port / session key) is retained.
+    /// PipiUI `-e` extension, including plan runtime (philosophy-gated).
     func testAllDisabledIsBarePi() {
         let allIDs = BuiltInFeatureSettings.FeatureID.allCases.map(\.rawValue)
+        // Paths still carry planRuntime from the populated fixture; assemble must
+        // still drop it because philosophy is off — do not manually nil the path.
         var input = allEnabledInput(paths: fullyPopulatedPaths())
         input.features = .init(disabledIDs: allIDs)
 
         let out = PipiSpawnAssembly.assemble(input)
         XCTAssertFalse(out.args.contains("-e"), "no PipiUI-owned -e when all features off: \(out.args)")
+        XCTAssertFalse(out.args.contains("/p/plan-runtime.ts"))
         XCTAssertNil(out.extraEnv["PIPIUI_SEARCH_SCOPE_EXT"])
         XCTAssertNil(out.extraEnv["PIPIUI_SEARCH_GRANT_FILE"])
         XCTAssertNil(out.extraEnv["PIPIUI_SUBAGENT_EXT"])
         XCTAssertNil(out.extraEnv["PIPIUI_AGENTS_DIR"])
         XCTAssertNil(out.extraEnv["PIPIUI_COMPUTER_EXT"])
         XCTAssertNil(out.extraEnv["PIPIUI_WEBSEARCH_CONFIG_FILE"])
+        XCTAssertNil(out.extraEnv["PIPIUI_GITHUB_EXT"])
+        XCTAssertNil(out.extraEnv["PIPIUI_ARXIV_EXT"])
+        XCTAssertNil(out.extraEnv["PIPIUI_PDF_EXT"])
+        XCTAssertNil(out.extraEnv["PIPIUI_PDF_HELPER"])
         XCTAssertNil(out.extraEnv["PIPIUI_MCP_CONFIG_FILE"])
         XCTAssertNil(out.extraEnv["PIPIUI_SUBAGENT_MODELS_FILE"])
+        XCTAssertNil(out.extraEnv["PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE"])
         XCTAssertNil(out.extraEnv["PIPIUI_MAIN_CWD"])
         // Session path still threaded.
         XCTAssertTrue(out.args.contains("--session"))
     }
 
     /// When the bridge is inactive (dispatched worker), only the standalone
-    /// extensions are mounted; bridge-only ones (browser/subagent) are not.
+    /// extensions are mounted; bridge-only ones (browser/subagent/plan) are not.
     func testNoBridgeSkipsBridgeOnlyExtensions() {
         var input = allEnabledInput(paths: fullyPopulatedPaths())
         input.bridgePort = 0
@@ -328,9 +478,29 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         let out = PipiSpawnAssembly.assemble(input)
         XCTAssertFalse(out.args.contains("/p/webview.ts"))
         XCTAssertFalse(out.args.contains("/p/subagent"))
+        XCTAssertFalse(out.args.contains("/p/plan-runtime.ts"),
+                       "plan runtime is main-bridged only: \(out.args)")
         XCTAssertNil(out.extraEnv["PIPIUI_BRIDGE_PORT"])
+        XCTAssertNil(out.extraEnv["PIPIUI_PLAN_RUNTIME_EXT"])
         // Standalone extensions remain.
         XCTAssertTrue(out.args.contains("/p/media.ts"))
+    }
+
+    func testPlanRuntimeMountsOnlyWhenPathPresentOnBridge() {
+        var withPath = allEnabledInput(paths: fullyPopulatedPaths())
+        let mounted = PipiSpawnAssembly.assemble(withPath)
+        XCTAssertTrue(mounted.args.contains("/p/plan-runtime.ts"))
+
+        var paths = fullyPopulatedPaths()
+        paths.planRuntime = nil
+        let withoutPath = allEnabledInput(paths: paths)
+        let skipped = PipiSpawnAssembly.assemble(withoutPath)
+        XCTAssertFalse(skipped.args.contains("/p/plan-runtime.ts"))
+
+        // Path present but no bridge ⇒ still skipped.
+        withPath.bridgePort = 0
+        let noBridge = PipiSpawnAssembly.assemble(withPath)
+        XCTAssertFalse(noBridge.args.contains("/p/plan-runtime.ts"))
     }
 
     /// Computer Use requires both the feature flag AND a capture descriptor:

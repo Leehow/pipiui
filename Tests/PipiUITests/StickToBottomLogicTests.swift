@@ -182,6 +182,129 @@ final class StickToBottomLogicTests: XCTestCase {
         XCTAssertNil(endOfSameGesture)
     }
 
+    /// Regression: a user release is immediate, while the persistent pin binding
+    /// is intentionally coalesced. Any stale automatic re-pin that arrives in
+    /// that gap must not overwrite the pending user-unpin or reopen follow.
+    func testPendingUserUnpinRejectsStaleRepinAndBlocksAllAutomaticFollow() {
+        var follow = TranscriptFollowSuppression.State()
+
+        // An older re-pin was already queued when the user starts scrolling up.
+        XCTAssertTrue(follow.enqueuePersistentPin(true))
+        let scheduledFollowGeneration = follow.generation
+        follow.suppressImmediately()
+        XCTAssertFalse(follow.isCurrent(scheduledFollowGeneration))
+        XCTAssertFalse(follow.allowsFollow(isPinned: true))
+
+        // The real user-unpin supersedes it. Simulate a late stream/document/
+        // resize callback attempting the stale re-pin before the coalesced write.
+        XCTAssertFalse(follow.enqueuePersistentPin(false))
+        XCTAssertFalse(follow.enqueuePersistentPin(true))
+
+        // Exactly one persistent write remains, and it preserves user intent.
+        XCTAssertEqual(follow.takePersistentPin(), false)
+        XCTAssertNil(follow.takePersistentPin())
+        follow.didWritePersistentPin(false)
+        // Defense against a stale write that escaped a prior queue turn.
+        follow.didWritePersistentPin(true)
+
+        // Every automatic entry point shares this gate while detached.
+        for _ in 0..<3 { // stream append, document-frame, pinned-content follow
+            XCTAssertFalse(follow.allowsFollow(isPinned: true))
+        }
+    }
+
+    func testExplicitLatestResumeCancelsDeferredUnpinAndRestoresFollow() {
+        var follow = TranscriptFollowSuppression.State()
+        follow.suppressImmediately()
+        XCTAssertTrue(follow.enqueuePersistentPin(false))
+        XCTAssertFalse(follow.allowsFollow(isPinned: true))
+
+        // Jump-to-latest is an explicit user intent, not a geometry callback.
+        follow.resumeForExplicitLatest()
+        XCTAssertNil(follow.takePersistentPin(), "obsolete unpin must not land after jump")
+        XCTAssertTrue(follow.allowsFollow(isPinned: true))
+    }
+
+    /// Hot-path regression: AppKit may deliver hundreds of bounds/live-scroll
+    /// notifications before SwiftUI commits the coalesced pin binding. A single
+    /// user takeover must have O(1) semantic work rather than O(callbacks).
+    func testFiveHundredUserTakeoverCallbacksAreEdgeTriggered() {
+        var follow = TranscriptFollowSuppression.State()
+        var viewport = TranscriptViewport.State(
+            sessionKey: "s",
+            itemCount: 320,
+            mode: .liveLatest,
+            generation: 0,
+            scrollOwner: .live,
+            pinToBottom: true,
+            correctionsRemaining: 0
+        )
+        var userOwnerTransitions = 0
+        var observableStateMutations = 0
+        var suppressionInvalidations = 0
+        var persistentFalseEnqueues = 0
+        var persistentFalseWrites = 0
+        var automaticFollowEffectsWhileDetached = 0
+
+        for _ in 0..<500 {
+            let viewportBefore = viewport
+            _ = TranscriptViewport.reduce(&viewport, .userScrolled)
+            if viewport.scrollOwner != viewportBefore.scrollOwner {
+                userOwnerTransitions += 1
+            }
+            if viewport != viewportBefore {
+                observableStateMutations += 1
+            }
+
+            let generationBefore = follow.generation
+            follow.suppressImmediately()
+            if follow.generation != generationBefore {
+                suppressionInvalidations += 1
+            }
+            if follow.enqueuePersistentPin(false) {
+                persistentFalseEnqueues += 1
+            }
+            if follow.allowsFollow(isPinned: true) || viewport.streamingMayWriteScroll {
+                automaticFollowEffectsWhileDetached += 1
+            }
+        }
+
+        if follow.takePersistentPin() == false {
+            persistentFalseWrites += 1
+        }
+
+        XCTAssertEqual(userOwnerTransitions, 1)
+        XCTAssertEqual(observableStateMutations, 1)
+        XCTAssertEqual(suppressionInvalidations, 1)
+        XCTAssertEqual(persistentFalseEnqueues, 1)
+        XCTAssertEqual(persistentFalseWrites, 1)
+        XCTAssertEqual(automaticFollowEffectsWhileDetached, 0)
+
+        // Re-entering the latest edge is another single semantic transition;
+        // repeated near-bottom callbacks cannot keep invalidating or requeueing.
+        var recoveryTransitions = 0
+        var persistentTrueEnqueues = 0
+        var persistentTrueWrites = 0
+        for _ in 0..<500 {
+            let generationBefore = follow.generation
+            follow.resumeAfterUserRepin()
+            if follow.generation != generationBefore {
+                recoveryTransitions += 1
+            }
+            if follow.enqueuePersistentPin(true) {
+                persistentTrueEnqueues += 1
+            }
+        }
+        if follow.takePersistentPin() == true {
+            persistentTrueWrites += 1
+        }
+
+        XCTAssertEqual(recoveryTransitions, 1)
+        XCTAssertEqual(persistentTrueEnqueues, 1)
+        XCTAssertEqual(persistentTrueWrites, 1)
+        XCTAssertTrue(follow.allowsFollow(isPinned: true))
+    }
+
     func testDistanceDocumentEndFlipped() {
         let visible = CGRect(x: 0, y: 100, width: 300, height: 400)
         let d = StickToBottomLogic.distanceFromPinEdge(

@@ -62,12 +62,22 @@ You cannot see any worker panel. Worker state reaches you only through completio
 hunch. Aborting or interrupting your own turn does not kill background workers; they still
 report when they finish.
 
+A text-only “already completed” reply does not stop subagent signals. When a worker's work is
+already complete, call {{delegate_status}} first, then close the loop: abort a still-running
+worker (action:"abort"/{{delegate_abort}}) or resolve a terminal episode (action:"resolve" +
+runId) so no further messages arrive.
+
 Every signal — completion, merge failure, post-merge verify failure, stall, heartbeat — is a
 worker event, never a new user request, and each one carries its own handling instructions.
 Follow the instructions in the message you actually received rather than a recipe remembered
-from here; they are written against what really happened. Two rules hold across all of them:
-never pull raw artifacts (conflict diffs, full reports) into your context to decide, and
-re-dispatching an agent id reuses its worktree, branch and stored conversation — say
+from here; they are written against what really happened. On every completion signal, FIRST
+call {{delegate_status}} without an agent id and identify every worker still relevant to that
+user goal. If any is running or stalled, or related work is otherwise still expected, do only
+internal orchestration (ledger updates, dispatch, recovery) and give the user no progress,
+partial conclusion, or summary. Once every related worker is terminal, give exactly one
+complete final closeout for the whole goal, not one closeout per worker. Two rules hold across
+all signals: never pull raw artifacts (conflict diffs, full reports) into your context to decide,
+and re-dispatching an agent id reuses its worktree, branch and stored conversation — say
 `continuing/redoing <agent id>, because …` when you do.
 
 ## Keep the wave's output out of your context

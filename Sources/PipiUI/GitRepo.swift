@@ -161,6 +161,15 @@ package enum AgentBranchCleanupResult: Equatable, Sendable {
     }
 }
 
+/// Read-only gate before touching the main checkout.  It deliberately compares the
+/// worker's committed change set with every form of user WIP (index, worktree and
+/// untracked files); an inconclusive probe is never treated as safe.
+package enum WorktreeMergeReadiness: Equatable, Sendable {
+    case ready
+    case waitingForMain(paths: [String])
+    case blocked(String)
+}
+
 /// Git CLI helpers. Pure Foundation — no libgit2.
 package enum GitRepo {
 
@@ -560,6 +569,50 @@ package enum GitRepo {
             throw GitRepoError.commandFailed("非法\(label)")
         }
         return dest
+    }
+
+    /// Parse newline-delimited Git paths into a stable set. Kept public to make the
+    /// overlap rule testable without a repository.
+    package static func parseChangedPaths(_ output: String) -> Set<String> {
+        Set(output.split(whereSeparator: \.isNewline).map(String.init).filter { !$0.isEmpty })
+    }
+
+    package static func overlappingPaths(worker: Set<String>, main: Set<String>) -> [String] {
+        worker.intersection(main).sorted()
+    }
+
+    /// Read-only main-WIP preflight. No merge, index mutation, stash, reset or clean is
+    /// performed here. A dirty but disjoint main checkout is safe to integrate; overlapping
+    /// or unobservable paths must wait so user WIP is never overwritten.
+    package static func mergeReadiness(
+        branch: String,
+        workerWorkTree: URL? = nil,
+        in mainWorkTree: URL
+    ) -> WorktreeMergeReadiness {
+        do {
+            let name = try validatedRefName(branch, label: "分支名")
+            var worker = parseChangedPaths(try run(
+                gitArgs: ["diff", "--no-renames", "--name-only", "HEAD...\(name)"], in: mainWorkTree))
+            // The automatic commit happens only after this gate. Include every uncommitted
+            // worker path now so that commit cannot make an unexamined overlap mergeable.
+            if let workerWorkTree {
+                worker.formUnion(parseChangedPaths(try run(
+                    gitArgs: ["diff", "--no-renames", "--cached", "--name-only"], in: workerWorkTree)))
+                worker.formUnion(parseChangedPaths(try run(
+                    gitArgs: ["diff", "--no-renames", "--name-only"], in: workerWorkTree)))
+                worker.formUnion(parseChangedPaths(try run(
+                    gitArgs: ["ls-files", "--others", "--exclude-standard"], in: workerWorkTree)))
+            }
+            let staged = parseChangedPaths(try run(gitArgs: ["diff", "--no-renames", "--cached", "--name-only"], in: mainWorkTree))
+            let unstaged = parseChangedPaths(try run(gitArgs: ["diff", "--no-renames", "--name-only"], in: mainWorkTree))
+            let untracked = parseChangedPaths(try run(
+                gitArgs: ["ls-files", "--others", "--exclude-standard"], in: mainWorkTree))
+            let overlaps = overlappingPaths(worker: worker, main: staged.union(unstaged).union(untracked))
+            return overlaps.isEmpty ? .ready : .waitingForMain(paths: overlaps)
+        } catch {
+            let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return .blocked(detail)
+        }
     }
 
     /// Merge `branch` into the current HEAD of `workTree` (typically the main worktree).

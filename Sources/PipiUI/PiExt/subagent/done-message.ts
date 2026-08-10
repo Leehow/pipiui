@@ -141,7 +141,7 @@ export function extractDoneTldr(text: string, cap = TLDR_DONE_CAP): string {
 
 export function formatSubagentDoneMessage(
 	result: DoneMessageResult,
-	extra?: { aborted?: boolean; error?: string },
+	extra?: { aborted?: boolean; error?: string; runId?: string },
 ): string {
 	const aborted = extra?.aborted ?? result.stopReason === "aborted";
 	const ok = !isFailedResult(result) && !aborted && !extra?.error;
@@ -157,7 +157,7 @@ export function formatSubagentDoneMessage(
 	const title =
 		result.title?.trim() || (result.task.split("\n")[0] ?? "").trim().slice(0, 80) || "(untitled)";
 	const lines = [
-		`[subagent-done] agentId=${result.agentId ?? "?"} name=${result.agent} ok=${ok} verified=${verified} cost=${cost} turns=${result.usage.turns ?? 0}${result.resumed ? " resumed=true" : ""}`,
+		`[subagent-done] agentId=${result.agentId ?? "?"} runId=${extra?.runId ?? "?"} name=${result.agent} ok=${ok} verified=${verified} cost=${cost} turns=${result.usage.turns ?? 0}${result.resumed ? " resumed=true" : ""}`,
 		`Title: ${title}`,
 	];
 	if (verified === "none") {
@@ -183,7 +183,7 @@ export function formatSubagentDoneMessage(
 		"Result:",
 		output,
 		`Full report: subagent_status({agentId:"${result.agentId ?? "?"}", full:true})`,
-		"Handling: this is a worker event, not a new user request. If this result completes what the user asked for, report the outcome to the user in their language now — verdict, key evidence, what changed — do not end the turn silently. If other workers for the same goal are still in flight, continue orchestration and deliver the closeout when the goal completes.",
+		"Handling: this is a worker event, not a new user request. FIRST call subagent_status() without agentId and inspect every worker relevant to this user's goal, including this one. If any related worker is running (including stalled) or expected related work is still unfinished, do NOT give the user a status update, progress report, partial conclusion, or summary: only continue orchestration/internal ledger work or dispatch follow-up work, then wait for the next event. ONLY after status confirms every related worker is terminal may you give the user exactly one complete final closeout in their language — verdict, key evidence, and what changed. Do not end silently once that final-closeout condition is met. Never reply \"already completed\" without first calling subagent_status; if a related worker is still running but its work is done, close it with action:\"abort\" (or /subagent_abort) so its messages stop, or resolve terminal failed/aborted/interrupted episodes with action:\"resolve\" + runId (or /subagent_resolve).",
 	);
 	return lines.join("\n");
 }

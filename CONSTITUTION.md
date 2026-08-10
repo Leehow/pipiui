@@ -30,6 +30,12 @@ cd /Users/haoli/leehow/code/pipiui
 ./scripts/build-app.sh        # 可选：先测再打包（见脚本 --help）
 ```
 
+## 1A. PipiUI 宿主进程生命周期由用户授权（强制）
+
+运行中的 PipiUI 宿主进程属于当前用户。Agents/workers **不得**针对它执行 `kill`、`pkill`、`killall`、Force Quit、`NSRunningApplication.terminate()`、`NSRunningApplication.forceTerminate()` 或等价的终止操作。
+
+构建、打包或更新后只负责产出包，并告知用户自行退出再手动重新打开 PipiUI；不得自动打开、启动或重启它。唯一例外是当前用户明确要求终止或重启 PipiUI；不得自行推断该请求，也不得把终止/重启当作验证步骤。
+
 ## 2. 时间戳验收（强制）
 
 仅在主工作区打包后，验证唯一 `build/PipiUI.app` 二进制新于改动源码：

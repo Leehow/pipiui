@@ -9,6 +9,15 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
     static let hostBundleID = "com.leehow.pipiui"
     static let requestedProtocolVersion = "2025-06-18"
     static let supportedProtocolVersions: Set<String> = ["2025-06-18"]
+    /// Per-stream stderr tail capacity (bytes). Newest bytes are kept; the
+    /// oldest overflow is discarded so a chatty generation can never block its
+    /// stderr pipe.
+    static let stderrTailCapacity = 16_384
+    /// Maximum time to wait for a terminated child's stderr drain to reach EOF
+    /// when capturing failure diagnostics. EOF is delivered within
+    /// milliseconds of the child closing its stderr, so this budget only bounds
+    /// the pathological case; it never gates the emergency-cancel path.
+    static let stderrFlushBudget: TimeInterval = 0.3
     static let environmentOverlay = [
         "CUA_DRIVER_EMBEDDED": "1",
         "CUA_DRIVER_HOST_BUNDLE_ID": hostBundleID,
@@ -34,6 +43,10 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
     private var generation: UInt64 = 0
     private var socketURL: URL?
     private var initialized = false
+    private var daemonStderrPipe: Pipe?
+    private var daemonStderrTail: BoundedPipeTail?
+    private var proxyStderrPipe: Pipe?
+    private var proxyStderrTail: BoundedPipeTail?
     private var cancellationEpoch: UInt64 = 0
     private struct RegisteredProcess {
         let process: Process
@@ -77,6 +90,16 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
                     continuation.resume(returning: result)
                 } catch {
                     if Self.requiresGenerationTeardown(error) {
+                        // A user-driven cancel bumps the epoch before tearing
+                        // the generation down; that path is already logged at
+                        // the stop entry point, so do not double-log it as a
+                        // fatal failure here.
+                        let cancelledHere = cancellationLock.withLock {
+                            cancellationEpoch != expectedEpoch
+                        }
+                        if !cancelledHere {
+                            logFatalGenerationFailure(error)
+                        }
                         stopLocked()
                     }
                     continuation.resume(throwing: error)
@@ -90,6 +113,7 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
     /// SIGTERM immediately interrupts both children; the owning queue performs
     /// normal cleanup, with a delayed exact-generation kill/socket fallback.
     func cancelAndStop() {
+        Log.info("cua-driver stop/cancel requested", category: .process)
         let cancellation = signalCancellation()
         queue.async { [self] in
             stopLocked()
@@ -224,8 +248,20 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
         daemonProcess.environment = trustedEnvironment()
         daemonProcess.standardInput = liveness
         daemonProcess.standardOutput = FileHandle.nullDevice
-        daemonProcess.standardError = FileHandle.nullDevice
+        let daemonStderr = Pipe()
+        daemonProcess.standardError = daemonStderr
         try daemonProcess.run()
+        let daemonTail = BoundedPipeTail(
+            capacity: Self.stderrTailCapacity
+        )
+        attachStderrDrain(pipe: daemonStderr, tail: daemonTail)
+        // Close the parent's copy of the write end. The child holds its own
+        // dup'd stderr and is unaffected; closing our copy means that when the
+        // child exits the read end observes EOF, which the drain handler turns
+        // into a completeness signal for deterministic failure capture.
+        try? daemonStderr.fileHandleForWriting.close()
+        daemonStderrPipe = daemonStderr
+        daemonStderrTail = daemonTail
         daemon = daemonProcess
         daemonLivenessInput = liveness.fileHandleForWriting
         try register(
@@ -237,8 +273,13 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
         let deadline = Date().addingTimeInterval(startupTimeout)
         while !isPrivateOwnedSocket(at: socket) {
             guard daemonProcess.isRunning else {
+                let message = exitDiagnostics(
+                    role: "serve daemon",
+                    process: daemonProcess,
+                    tail: daemonStderrTail
+                )
                 stopLocked()
-                throw CuaDriverError.processExited("serve daemon")
+                throw CuaDriverError.processExited(message)
             }
             guard Date() < deadline else {
                 stopLocked()
@@ -261,8 +302,18 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
         proxyProcess.environment = trustedEnvironment()
         proxyProcess.standardInput = toProxy
         proxyProcess.standardOutput = fromProxy
-        proxyProcess.standardError = FileHandle.nullDevice
+        let proxyStderr = Pipe()
+        proxyProcess.standardError = proxyStderr
         try proxyProcess.run()
+        let proxyTail = BoundedPipeTail(
+            capacity: Self.stderrTailCapacity
+        )
+        attachStderrDrain(pipe: proxyStderr, tail: proxyTail)
+        // See daemon setup: closing the parent's write-end copy lets the read
+        // end observe EOF when the proxy exits.
+        try? proxyStderr.fileHandleForWriting.close()
+        proxyStderrPipe = proxyStderr
+        proxyStderrTail = proxyTail
         proxy = proxyProcess
         try register(
             process: proxyProcess,
@@ -280,6 +331,13 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
         proxyOutput = fromProxy.fileHandleForReading
         readBuffer.removeAll(keepingCapacity: true)
         nextID = 0
+
+        Log.info(
+            "cua-driver generation \(generation) started "
+                + "(daemon pid=\(daemonProcess.processIdentifier), "
+                + "proxy pid=\(proxyProcess.processIdentifier))",
+            category: .process
+        )
 
         do {
             nextID += 1
@@ -387,7 +445,13 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
     ) throws -> CuaToolResult {
         guard initialized,
               proxy?.isRunning == true else {
-            throw CuaDriverError.processExited("MCP proxy")
+            throw CuaDriverError.processExited(
+                exitDiagnostics(
+                    role: "MCP proxy",
+                    process: proxy,
+                    tail: proxyStderrTail
+                )
+            )
         }
         nextID += 1
         let message = try requestLocked(
@@ -461,7 +525,13 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
         do {
             try proxyInput.write(contentsOf: data)
         } catch {
-            throw CuaDriverError.processExited("MCP proxy stdin")
+            throw CuaDriverError.processExited(
+                exitDiagnostics(
+                    role: "MCP proxy stdin",
+                    process: proxy,
+                    tail: proxyStderrTail
+                )
+            )
         }
     }
 
@@ -484,7 +554,13 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
 
             guard let proxyOutput,
                   proxy?.isRunning == true else {
-                throw CuaDriverError.processExited("MCP proxy stdout")
+                throw CuaDriverError.processExited(
+                    exitDiagnostics(
+                        role: "MCP proxy stdout",
+                        process: proxy,
+                        tail: proxyStderrTail
+                    )
+                )
             }
             let remaining = deadline.timeIntervalSinceNow
             guard remaining > 0 else {
@@ -521,7 +597,13 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
                 )
             }
             guard count > 0 else {
-                throw CuaDriverError.processExited("MCP proxy stdout")
+                throw CuaDriverError.processExited(
+                    exitDiagnostics(
+                        role: "MCP proxy stdout",
+                        process: proxy,
+                        tail: proxyStderrTail
+                    )
+                )
             }
             readBuffer.append(bytes, count: count)
         }
@@ -529,6 +611,14 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
 
     private func stopLocked() {
         initialized = false
+        detachStderrDrain(pipe: daemonStderrPipe)
+        detachStderrDrain(pipe: proxyStderrPipe)
+        try? daemonStderrPipe?.fileHandleForReading.close()
+        try? daemonStderrPipe?.fileHandleForWriting.close()
+        daemonStderrPipe = nil
+        try? proxyStderrPipe?.fileHandleForReading.close()
+        try? proxyStderrPipe?.fileHandleForWriting.close()
+        proxyStderrPipe = nil
         try? daemonLivenessInput?.close()
         daemonLivenessInput = nil
         try? proxyInput?.close()
@@ -540,10 +630,154 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
         terminate(daemon)
         proxy = nil
         daemon = nil
+        daemonStderrTail = nil
+        proxyStderrTail = nil
         if let socketURL {
             try? FileManager.default.removeItem(at: socketURL)
         }
         socketURL = nil
+    }
+
+    private func attachStderrDrain(pipe: Pipe, tail: BoundedPipeTail) {
+        let handle = pipe.fileHandleForReading
+        handle.readabilityHandler = { [weak tail] handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                // EOF: the child closed its stderr. Drop the handler and mark
+                // the tail complete. EOF is delivered only after every data
+                // chunk, so this proves the tail holds everything the child
+                // wrote, letting failure capture serialize behind the flush.
+                handle.readabilityHandler = nil
+                tail?.markEOF()
+                return
+            }
+            tail?.append(chunk)
+        }
+    }
+
+    private func detachStderrDrain(pipe: Pipe?) {
+        // Clearing the handler stops further dispatch callbacks; closing the
+        // pipe handles (in stopLocked) prevents an fd leak and lets any
+        // in-flight reader observe EOF.
+        pipe?.fileHandleForReading.readabilityHandler = nil
+    }
+
+    /// Waits (bounded) for the drain handler to report EOF on a child's
+    /// stderr, but only when that child has already terminated — at which
+    /// point EOF is imminent. This closes the race where a fast-exit child
+    /// writes its final stderr and exits before the async readability handler
+    /// has flushed it into the tail. Never blocks for a still-running child,
+    /// so hung-process and timeout paths are unaffected.
+    private func waitForStderrEOF(
+        process: Process?,
+        tail: BoundedPipeTail?
+    ) {
+        guard let process, let tail, process.isRunning == false else { return }
+        _ = tail.waitForEOF(timeout: Self.stderrFlushBudget)
+    }
+
+    /// Enriches a role label with the process exit status/reason (when the
+    /// process has already terminated) and a sanitized stderr tail, so a
+    /// transport error carries actionable evidence instead of a bare name.
+    private func exitDiagnostics(
+        role: String,
+        process: Process?,
+        tail: BoundedPipeTail?
+    ) -> String {
+        // Serialize behind the async drain so a just-exited child's final
+        // stderr is guaranteed to be in the tail before we snapshot it.
+        waitForStderrEOF(process: process, tail: tail)
+        var segments: [String] = []
+        if let process, process.isRunning == false {
+            segments.append("status=\(process.terminationStatus)")
+            segments.append(
+                "reason=\(Self.reasonString(process.terminationReason))"
+            )
+        }
+        if let tail {
+            let text = tail.sanitizedTail()
+            if !text.isEmpty {
+                segments.append("stderr=\(text)")
+            }
+        }
+        guard !segments.isEmpty else { return role }
+        return "\(role) (\(segments.joined(separator: ", ")))"
+    }
+
+    /// Redacted stderr snapshot of both children, for fatal logs whose error
+    /// did not already embed stderr (e.g. protocol timeouts).
+    private func snapshotStderr() -> String {
+        var parts: [String] = []
+        let daemonText = daemonStderrTail?.sanitizedTail() ?? ""
+        if !daemonText.isEmpty {
+            parts.append("daemon stderr=\(daemonText)")
+        }
+        let proxyText = proxyStderrTail?.sanitizedTail() ?? ""
+        if !proxyText.isEmpty {
+            parts.append("proxy stderr=\(proxyText)")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private func logFatalGenerationFailure(_ error: Error) {
+        // A non-exit failure (e.g. a protocol timeout) still benefits from any
+        // stderr the children emitted. Only children that have already exited
+        // can reach EOF, so this never blocks for a live, hung process; for a
+        // crash, the exiting path's `exitDiagnostics` already observed EOF and
+        // the wait returns immediately.
+        waitForStderrEOF(process: daemon, tail: daemonStderrTail)
+        waitForStderrEOF(process: proxy, tail: proxyStderrTail)
+        var detail = Self.logLabel(for: error)
+        if !detail.contains("stderr=") {
+            let snapshot = snapshotStderr()
+            if !snapshot.isEmpty {
+                detail += " " + snapshot
+            }
+        }
+        Log.error(
+            "cua-driver generation \(generation) fatal: \(detail)",
+            category: .process
+        )
+    }
+
+    /// Compact, secret-free label for a driver error, suitable for the
+    /// unified log. Omits embedded socket paths and tool messages; for
+    /// `.processExited` the role already carries exit status and redacted
+    /// stderr, which is safe to repeat.
+    private static func logLabel(for error: Error) -> String {
+        guard let driverError = error as? CuaDriverError else {
+            return "unknown"
+        }
+        switch driverError {
+        case .cancelled:
+            return "cancelled"
+        case .helperMissing:
+            return "helperMissing"
+        case .helperNotExecutable:
+            return "helperNotExecutable"
+        case .startupTimedOut:
+            return "startupTimedOut"
+        case .permissionAttribution:
+            return "permissionAttribution"
+        case .startupContract:
+            return "startupContract"
+        case .protocolFailure:
+            return "protocolFailure"
+        case .toolFailure(let tool, _):
+            return "toolFailure(\(tool))"
+        case .processExited(let role):
+            return "processExited(\(role))"
+        }
+    }
+
+    private static func reasonString(
+        _ reason: Process.TerminationReason
+    ) -> String {
+        switch reason {
+        case .exit: return "exit"
+        case .uncaughtSignal: return "uncaughtSignal"
+        @unknown default: return "unknown"
+        }
     }
 
     private func terminate(_ process: Process?) {

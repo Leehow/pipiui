@@ -1113,6 +1113,165 @@ final class CuaDriverIntegrationTests: XCTestCase {
         }
     }
 
+    func testStderrSanitizerRedactsLongTokensTruncatesLinesAndTotal() {
+        // Long base64/hex token runs are replaced with a placeholder.
+        let secret = String(repeating: "B", count: 80)
+        let redacted = StderrSanitizer.sanitize("token=\(secret) done")
+        XCTAssertTrue(redacted.contains(StderrSanitizer.placeholder), redacted)
+        XCTAssertFalse(redacted.contains(secret), redacted)
+
+        // Short readable markers survive unchanged.
+        XCTAssertEqual(
+            StderrSanitizer.sanitize("panic: widget not found"),
+            "panic: widget not found"
+        )
+
+        // An overlong line (no long token run inside) is truncated per line.
+        let longLine = String(repeating: "word ", count: 250)
+        let capped = StderrSanitizer.sanitize(longLine)
+        XCTAssertTrue(capped.contains("<line truncated>"), capped)
+        XCTAssertLessThan(capped.count, longLine.count)
+
+        // Total length is bounded.
+        let huge = (0..<1_000).map { "line \($0)" }.joined(separator: "\n")
+        let bounded = StderrSanitizer.sanitize(huge)
+        XCTAssertLessThanOrEqual(
+            bounded.count,
+            StderrSanitizer.maxTotalCharacters + 64,
+            "sanitizer must bound total output length"
+        )
+    }
+
+    func testBoundedPipeTailKeepsNewestBytesOnly() {
+        let tail = BoundedPipeTail(capacity: 16)
+        tail.append(Data("HEAD".utf8))
+        tail.append(Data((0..<2_000).map { _ in UInt8(ascii: "X") }))
+        tail.append(Data("TAIL".utf8))
+        let snapshot = tail.sanitizedTail()
+        XCTAssertTrue(snapshot.contains("TAIL"), snapshot)
+        XCTAssertFalse(snapshot.contains("HEAD"), snapshot)
+    }
+
+    func testRuntimeExposesNonZeroExitCodeAndSanitizedStderrMarker() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("fake-cua-driver")
+        let secret = String(repeating: "A", count: 64)
+        let source = """
+        #!/usr/bin/python3
+        import sys
+        mode = sys.argv[1]
+        if mode == "serve":
+            sys.stderr.write("BOOT_FAILURE reason=demo secret=\(secret)\\n")
+            sys.stderr.flush()
+            sys.exit(7)
+        sys.exit(1)
+        """
+        try Data(source.utf8).write(to: helper, options: .atomic)
+        XCTAssertEqual(chmod(helper.path, 0o755), 0)
+
+        let runtime = CuaDriverProcessRuntime(
+            driverPathOverride: helper.path,
+            startupTimeout: 3,
+            responseTimeout: 3
+        )
+        do {
+            _ = try await runtime.call(tool: "ping", arguments: [:])
+            XCTFail("serve unexpectedly came up")
+        } catch let error as CuaDriverError {
+            guard case .processExited(let role) = error else {
+                return XCTFail("expected processExited, got \(error)")
+            }
+            XCTAssertTrue(role.contains("status=7"), role)
+            XCTAssertTrue(role.contains("reason="), role)
+            XCTAssertTrue(role.contains("BOOT_FAILURE"), role)
+            XCTAssertFalse(
+                role.contains(String(repeating: "A", count: 40)),
+                "long secret token must be redacted: \(role)"
+            )
+            XCTAssertTrue(role.contains("<redacted>"), role)
+        }
+        runtime.cancelAndStop()
+    }
+
+    func testBoundedPipeTailWaitForEOFBlocksUntilMarked() {
+        let tail = BoundedPipeTail(capacity: 64)
+        tail.append(Data("buffered-bytes".utf8))
+        // Without EOF, a bounded wait times out and reports false.
+        XCTAssertFalse(tail.waitForEOF(timeout: 0.05))
+        // Once EOF is marked, the wait returns immediately and true, and the
+        // buffered content survives.
+        tail.markEOF()
+        XCTAssertTrue(tail.waitForEOF(timeout: 1.0))
+        XCTAssertTrue(tail.sanitizedTail().contains("buffered-bytes"))
+    }
+
+    func testRuntimeFastExitStderrCapturedDeterministicallyAcrossRuns() async throws {
+        // Regression guard for the fast-exit drain race: a helper that writes
+        // a marker + long secret to stderr and exits non-zero must surface that
+        // marker (secret redacted) every single time, not just usually.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("fake-cua-driver")
+        let marker = "BOOT_FAILURE reason=fastexit"
+        let secret = String(repeating: "Z", count: 64)
+        let source = """
+        #!/usr/bin/python3
+        import sys
+        mode = sys.argv[1]
+        if mode == "serve":
+            sys.stderr.write("\(marker) secret=\(secret)\\n")
+            sys.stderr.flush()
+            sys.exit(9)
+        sys.exit(1)
+        """
+        try Data(source.utf8).write(to: helper, options: .atomic)
+        XCTAssertEqual(chmod(helper.path, 0o755), 0)
+
+        let iterations = 12
+        for index in 0..<iterations {
+            let runtime = CuaDriverProcessRuntime(
+                driverPathOverride: helper.path,
+                startupTimeout: 3,
+                responseTimeout: 3
+            )
+            do {
+                _ = try await runtime.call(tool: "ping", arguments: [:])
+                XCTFail("iteration \(index): serve unexpectedly came up")
+            } catch let error as CuaDriverError {
+                guard case .processExited(let role) = error else {
+                    return XCTFail(
+                        "iteration \(index): expected processExited, got \(error)"
+                    )
+                }
+                XCTAssertTrue(
+                    role.contains("status=9"),
+                    "iteration \(index): \(role)"
+                )
+                XCTAssertTrue(
+                    role.contains(marker),
+                    "iteration \(index): stderr marker lost: \(role)"
+                )
+                XCTAssertTrue(role.contains("<redacted>"), "iteration \(index): \(role)")
+                XCTAssertFalse(
+                    role.contains(String(repeating: "Z", count: 40)),
+                    "iteration \(index): secret not redacted: \(role)"
+                )
+            }
+            runtime.cancelAndStop()
+        }
+    }
+
     private func chromeLikeWindows(
         processID: Int32
     ) -> [[String: Any]] {

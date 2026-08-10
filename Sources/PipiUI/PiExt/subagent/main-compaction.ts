@@ -16,9 +16,9 @@
  *      thinking off (pi-ai `thinkingLevelMap.off === null`, e.g. pure
  *      reasoning models) — no 30s wasted on a doomed call. Reuses the
  *      session's own model + credentials — no new login required.
- *   2. Deterministic path (instant, zero provider dependency): structured
- *      markdown preserving previous summary, the recent tail of the
- *      conversation verbatim, and file operations.
+ *   2. Deterministic path (instant, zero provider dependency): fixed-budget
+ *      structured markdown preserving the sticky prior summary, high-value raw
+ *      transcript excerpts, and file operations while filtering tool noise.
  *   3. Any throw → return `undefined` → pi's built-in compaction (safe
  *      fallback; the hook never breaks the session).
  *
@@ -47,6 +47,8 @@ export const COMPACTION_DETERMINISTIC_HEAD_CHARS = 2_000;
 export const COMPACTION_DETERMINISTIC_TAIL_CHARS = 12_000;
 /** Deterministic path: previous summary kept verbatim (bounded). */
 export const COMPACTION_DETERMINISTIC_PREVIOUS_CHARS = 6_000;
+/** Deterministic path: total summary budget (all required headings always remain). */
+export const COMPACTION_DETERMINISTIC_MAX_SUMMARY_CHARS = 16_000;
 
 export interface FileOpsLike {
 	read?: Set<string> | string[];
@@ -188,7 +190,7 @@ export function extractSerializedGoal(
 		const m = /^\[User\]:\s*(.*)$/.exec(line);
 		if (m?.[1]?.trim()) {
 			const text = m[1].trim();
-			return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+			return clipDeterministicText(text, maxChars);
 		}
 	}
 	return "（未能从历史中提取目标，见 Recent Messages）";
@@ -233,6 +235,176 @@ function formatFileOps(fileOps: FileOpsLike | undefined): string {
 	return lines.length > 0 ? lines.join("\n") : "（无）";
 }
 
+type SerializedTranscriptTag =
+	| "User"
+	| "Assistant"
+	| "Assistant thinking"
+	| "Assistant tool calls"
+	| "Tool result";
+
+interface SerializedTranscriptRecord {
+	tag: SerializedTranscriptTag;
+	text: string;
+	order: number;
+}
+
+interface DeterministicSection {
+	heading: string;
+	content: string;
+	empty: string;
+	priority: number;
+	maxChars: number;
+}
+
+const SERIALIZED_TRANSCRIPT_RECORD =
+	/^\[(User|Assistant(?: thinking| tool calls)?|Tool result)\]:\s?(.*)$/;
+const USER_CORRECTION_PATTERN =
+	/\b(?:actually|instead|rather|correction|correct(?:ion)?|change(?:d)?|revise|don't|do not|must not|only|no longer|avoid|replace)\b|改口|修正|更正|改为|不要|必须|仅|改成|别再/i;
+const CONSTRAINT_OR_DECISION_PATTERN =
+	/\b(?:must|must not|should|should not|only|never|always|constraint|decision|decided|choose|chosen|plan|planned|prefer|avoid|keep|preserve|require|don't|do not)\b|约束|决定|方案|计划|保留|禁止|仅|必须|不要/i;
+const LIFECYCLE_PATTERN =
+	/\b(?:in[- ]?flight|in progress|running|pending|verify|verification|verified|test(?:ed|ing)?|pass(?:ed)?|fail(?:ed|ure)?|closeout|close[- ]?out|agentId|agent id|worktree|plan|merge|commit|build|exit(?: code)?|done)\b|进行中|验证|已验证|测试|通过|失败|收尾|代理|工作树|计划|合并|提交/i;
+const ERROR_OR_OPEN_LOOP_PATTERN =
+	/\b(?:error|failed|failure|exception|enoent|not found|blocked|blocker|unresolved|open loop|todo|fixme|cannot|can't|unable|timeout|timed out|retry|pending)\b|错误|失败|异常|阻塞|未解决|待处理|待验证|超时|重试/i;
+
+function clipDeterministicText(value: unknown, maxChars: number): string {
+	const text = typeof value === "string" ? value.trim() : "";
+	if (!text || maxChars <= 0) return "";
+	if (text.length <= maxChars) return text;
+	if (maxChars === 1) return "…";
+	const head = text.slice(0, maxChars - 1).trimEnd();
+	return `${head || text.slice(0, maxChars - 1)}…`;
+}
+
+function normalizeTranscriptText(value: string): string {
+	return value
+		.replace(/\u0000/g, "")
+		.replace(/[ \t]+\n/g, "\n")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+}
+
+function parseSerializedTranscript(serialized: string): SerializedTranscriptRecord[] {
+	if (typeof serialized !== "string" || !serialized.trim()) return [];
+	const records: SerializedTranscriptRecord[] = [];
+	let current: SerializedTranscriptRecord | undefined;
+	for (const line of serialized.split(/\r?\n/)) {
+		const match = SERIALIZED_TRANSCRIPT_RECORD.exec(line);
+		if (match) {
+			current = {
+				tag: match[1] as SerializedTranscriptTag,
+				text: match[2] ?? "",
+				order: records.length,
+			};
+			records.push(current);
+		} else if (current) {
+			current.text += `\n${line}`;
+		}
+	}
+	if (records.length === 0) {
+		return [{ tag: "Assistant", text: normalizeTranscriptText(serialized), order: 0 }];
+	}
+	return records.map((record) => ({ ...record, text: normalizeTranscriptText(record.text) }));
+}
+
+function transcriptOneLine(record: SerializedTranscriptRecord, maxChars: number): string {
+	return clipDeterministicText(record.text.replace(/\s+/g, " "), maxChars);
+}
+
+function transcriptLabel(tag: SerializedTranscriptTag): string {
+	if (tag === "Assistant thinking") return "Assistant thinking";
+	if (tag === "Assistant tool calls") return "Assistant tool calls";
+	if (tag === "Tool result") return "Tool result";
+	return tag;
+}
+
+function selectLatestTranscriptRecords(
+	records: SerializedTranscriptRecord[],
+	predicate: (record: SerializedTranscriptRecord) => boolean,
+	limit: number,
+): SerializedTranscriptRecord[] {
+	const picked: SerializedTranscriptRecord[] = [];
+	const seen = new Set<string>();
+	for (let i = records.length - 1; i >= 0 && picked.length < limit; i--) {
+		const record = records[i];
+		if (!record.text || !predicate(record)) continue;
+		const key = `${record.tag}:${record.text.replace(/\s+/g, " ").trim().toLowerCase()}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		picked.push(record);
+	}
+	return picked.reverse();
+}
+
+function formatTranscriptFacts(records: SerializedTranscriptRecord[], perLineChars: number): string {
+	const lines = records
+		.map((record) => {
+			const text = transcriptOneLine(record, perLineChars);
+			return text ? `- ${transcriptLabel(record.tag)}: ${text}` : "";
+		})
+		.filter(Boolean);
+	return lines.join("\n");
+}
+
+function isHighSignalToolRecord(record: SerializedTranscriptRecord): boolean {
+	return (
+		record.tag !== "Tool result" && record.tag !== "Assistant thinking"
+			? true
+			: LIFECYCLE_PATTERN.test(record.text) || ERROR_OR_OPEN_LOOP_PATTERN.test(record.text)
+	);
+}
+
+function nextStepsFromTranscript(records: SerializedTranscriptRecord[]): string {
+	const lines: string[] = [];
+	const correction = selectLatestTranscriptRecords(
+		records,
+		(record) => record.tag === "User" && USER_CORRECTION_PATTERN.test(record.text),
+		1,
+	)[0];
+	if (correction) lines.push(`- Honor the latest user correction: ${transcriptOneLine(correction, 500)}`);
+	const error = selectLatestTranscriptRecords(
+		records,
+		(record) => ERROR_OR_OPEN_LOOP_PATTERN.test(record.text),
+		1,
+	)[0];
+	if (error) lines.push(`- Resolve or re-check: ${transcriptOneLine(error, 500)}`);
+	const lifecycle = selectLatestTranscriptRecords(
+		records,
+		(record) => LIFECYCLE_PATTERN.test(record.text),
+		1,
+	)[0];
+	if (lifecycle) lines.push(`- Continue from this status: ${transcriptOneLine(lifecycle, 500)}`);
+	if (lines.length === 0) {
+		lines.push("- Continue from Recent Timeline and run the relevant verification before closeout.");
+	}
+	return [...new Set(lines)].slice(0, 3).join("\n");
+}
+
+function renderDeterministicSections(
+	sections: DeterministicSection[],
+	footer: string,
+	budget: number = COMPACTION_DETERMINISTIC_MAX_SUMMARY_CHARS,
+): string {
+	const safeFooter = clipDeterministicText(footer, 300);
+	const base = [
+		...sections.map((section) => `## ${section.heading}\n${section.empty}`),
+		safeFooter,
+	].join("\n\n");
+	let remaining = Math.max(0, budget - base.length);
+	const rendered = new Map<DeterministicSection, string>();
+	for (const section of [...sections].sort((a, b) => a.priority - b.priority)) {
+		const desired = clipDeterministicText(section.content, section.maxChars) || section.empty;
+		const allowance = Math.min(desired.length, section.empty.length + remaining);
+		const value = allowance >= desired.length ? desired : clipDeterministicText(desired, allowance);
+		rendered.set(section, value || section.empty);
+		remaining -= Math.max(0, (rendered.get(section)?.length ?? 0) - section.empty.length);
+	}
+	return [
+		...sections.map((section) => `## ${section.heading}\n${rendered.get(section) ?? section.empty}`),
+		safeFooter,
+	].join("\n\n");
+}
+
 export interface DeterministicSummaryInput {
 	serialized: string;
 	previousSummary?: string;
@@ -243,47 +415,134 @@ export interface DeterministicSummaryInput {
 }
 
 /**
- * Deterministic bounded summary in pi's structured markdown shape. No LLM,
- * no provider, no credentials: instant and always available. Preserves the
- * previous summary (if any), the recent tail of the conversation verbatim,
- * and the extracted file-operation/state info.
+ * Deterministic, transcript-derived compaction summary. It keeps stable
+ * headings under a fixed budget and promotes user corrections, lifecycle
+ * facts, errors, plans/worktrees, and verification over repetitive tool output.
  */
 export function buildDeterministicSummary(input: DeterministicSummaryInput): string {
 	const { serialized, previousSummary, fileOps, tokensBefore, messageCount, reason } = input;
-
+	const records = parseSerializedTranscript(serialized);
 	const prev =
 		typeof previousSummary === "string" && previousSummary.trim()
-			? previousSummary.trim().slice(0, COMPACTION_DETERMINISTIC_PREVIOUS_CHARS)
-			: undefined;
-	const goal =
-		extractSectionLine(prev ?? "", "Goal") ??
-		extractSerializedGoal(serialized);
-	const tail =
-		typeof serialized === "string" && serialized
-			? serialized.slice(-COMPACTION_DETERMINISTIC_TAIL_CHARS)
+			? clipDeterministicText(previousSummary, COMPACTION_DETERMINISTIC_PREVIOUS_CHARS)
 			: "";
-	const files = formatFileOps(fileOps);
-
-	const parts: string[] = [];
-	parts.push(`## Goal\n${goal}`);
-	parts.push(
-		`## Previous Summary\n${
-			prev ?? "（无）"
-		}`,
+	const firstUser = records.find((record) => record.tag === "User" && record.text);
+	const goal =
+		extractSectionLine(prev, "Goal") ??
+		(firstUser ? transcriptOneLine(firstUser, COMPACTION_DETERMINISTIC_HEAD_CHARS) : undefined) ??
+		extractSerializedGoal(serialized);
+	const corrections = formatTranscriptFacts(
+		selectLatestTranscriptRecords(
+			records,
+			(record) => record.tag === "User" && USER_CORRECTION_PATTERN.test(record.text),
+			6,
+		),
+		700,
 	);
-	parts.push(
-		`## Recent Messages\n${
-			tail || "（无可序列化内容）"
-		}`,
+	const constraintsAndDecisions = formatTranscriptFacts(
+		selectLatestTranscriptRecords(records, (record) => CONSTRAINT_OR_DECISION_PATTERN.test(record.text), 8),
+		700,
 	);
-	parts.push(`## Files\n${files}`);
-	parts.push(
-		"## Next Steps\n继续推进 Recent Messages 中尚未完成的工作；必要时用 read 复查 Files 中的文件，并保持验证状态。",
+	const lifecycle = formatTranscriptFacts(
+		selectLatestTranscriptRecords(records, (record) => LIFECYCLE_PATTERN.test(record.text), 10),
+		700,
 	);
-	parts.push(
-		`<!-- pipiui-compaction deterministic reason=${reason} messages=${messageCount} tokensBefore=${tokensBefore} -->`,
+	const errorsAndOpenLoops = formatTranscriptFacts(
+		selectLatestTranscriptRecords(records, (record) => ERROR_OR_OPEN_LOOP_PATTERN.test(record.text), 8),
+		700,
 	);
-	return parts.join("\n\n");
+	const timeline = formatTranscriptFacts(
+		selectLatestTranscriptRecords(records, isHighSignalToolRecord, 12),
+		600,
+	);
+	const recentMessages = formatTranscriptFacts(
+		selectLatestTranscriptRecords(
+			records,
+			(record) =>
+				record.tag === "User" ||
+				record.tag === "Assistant" ||
+				(record.tag === "Assistant tool calls" && isHighSignalToolRecord(record)),
+			8,
+		),
+		550,
+	);
+	const safeReason = clipDeterministicText(String(reason ?? "auto").replace(/-->/g, ""), 120) || "auto";
+	const safeTokensBefore = Number.isFinite(tokensBefore) ? tokensBefore : 0;
+	return renderDeterministicSections(
+		[
+			{
+				heading: "Goal",
+				content: goal,
+				empty: "（未能从历史中提取目标，见 Recent Messages）",
+				priority: 1,
+				maxChars: COMPACTION_DETERMINISTIC_HEAD_CHARS,
+			},
+			{
+				heading: "User Corrections",
+				content: corrections,
+				empty: "（无明确改口；以 Goal 和 Recent Timeline 为准。）",
+				priority: 2,
+				maxChars: 2_400,
+			},
+			{
+				heading: "Constraints & Decisions",
+				content: constraintsAndDecisions,
+				empty: "（未识别到额外约束或决策。）",
+				priority: 4,
+				maxChars: 2_800,
+			},
+			{
+				heading: "In-Flight / Verification / Closeout",
+				content: lifecycle,
+				empty: "（无明确 in-flight、验证或收尾记录。）",
+				priority: 5,
+				maxChars: 3_400,
+			},
+			{
+				heading: "Errors & Open Loops",
+				content: errorsAndOpenLoops,
+				empty: "（无明确错误或未闭环事项。）",
+				priority: 6,
+				maxChars: 2_800,
+			},
+			{
+				heading: "Previous Summary",
+				content: prev,
+				empty: "（无）",
+				priority: 3,
+				maxChars: COMPACTION_DETERMINISTIC_PREVIOUS_CHARS,
+			},
+			{
+				heading: "Files",
+				content: formatFileOps(fileOps),
+				empty: "（无）",
+				priority: 7,
+				maxChars: 2_000,
+			},
+			{
+				heading: "Recent Timeline",
+				content: timeline,
+				empty: "（无可用近期记录。）",
+				priority: 8,
+				maxChars: 3_600,
+			},
+			{
+				heading: "Recent Messages",
+				content: recentMessages,
+				empty: "（无可序列化内容）",
+				priority: 9,
+				maxChars: Math.min(COMPACTION_DETERMINISTIC_TAIL_CHARS, 2_800),
+			},
+			{
+				heading: "Next Steps",
+				content: nextStepsFromTranscript(records),
+				empty: "- Continue from Recent Timeline and preserve verification state.",
+				priority: 10,
+				maxChars: 1_800,
+			},
+		],
+		`<!-- pipiui-compaction deterministic reason=${safeReason} messages=${messageCount} tokensBefore=${safeTokensBefore} -->`,
+	);
 }
 
 interface CombinedSignal {

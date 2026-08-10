@@ -9,6 +9,8 @@ import Foundation
 /// - `transcriptVersion` — ChatSession 在 `transcript` 每次真实修改时递增（didSet，宁滥勿缺）
 /// - `toolStructureVersion` — changes when running state or result imagery alters grouping
 /// - `visibleCount` — 可见窗口（suffix(N)）大小
+/// - `windowFirstID` / `windowLastID` — actual mounted window identity so live
+///   suffix(N) and ancient seek windows of the same count never share a plan
 ///
 /// Content-only tool output does not invalidate the settled layout. Tool rows still
 /// receive the latest `ToolRun`; only a change between image-free and image-bearing
@@ -18,6 +20,10 @@ final class TranscriptPlanner {
         var transcriptVersion: UInt64
         var toolStructureVersion: UInt64
         var visibleCount: Int
+        /// Stable id of the first item in the planned window (`nil` if empty).
+        var windowFirstID: String?
+        /// Stable id of the last item in the planned window (`nil` if empty).
+        var windowLastID: String?
     }
 
     private var lastKey: InputKey?
@@ -32,14 +38,17 @@ final class TranscriptPlanner {
         transcriptVersion: UInt64,
         toolStructureVersion: UInt64
     ) -> AssistantBlockLayout.TranscriptPresentation {
+        let windowItems = Array(items.suffix(visibleCount))
         let key = InputKey(
             transcriptVersion: transcriptVersion,
             toolStructureVersion: toolStructureVersion,
-            visibleCount: visibleCount
+            visibleCount: visibleCount,
+            windowFirstID: windowItems.first?.id,
+            windowLastID: windowItems.last?.id
         )
         if key == lastKey { return cachedPresentation }
         let planned = AssistantBlockLayout.planTranscript(
-            items: Array(items.suffix(visibleCount)),
+            items: windowItems,
             toolRuns: toolRuns
         )
         lastKey = key

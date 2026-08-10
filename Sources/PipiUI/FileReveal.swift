@@ -119,9 +119,10 @@ package enum FileReveal {
     /// Does **not** set `.link` on paths. Skips ranges that already have a markdown/http link.
     package static func injectPathLinks(
         into attributed: AttributedString,
-        linkColor: Color? = Color.accentColor
+        linkColor: Color? = Color.accentColor,
+        cache: Bool = true
     ) -> AttributedString {
-        pathLinkedContent(attributed: attributed, linkColor: linkColor).visual
+        pathLinkedContent(attributed: attributed, linkColor: linkColor, cache: cache).visual
     }
 
     /// Single scan: styled plain text + path targets (shared cache for default styling).
@@ -136,17 +137,18 @@ package enum FileReveal {
     /// Single scan: inject path style into markdown attributed text + path targets.
     package static func pathLinkedContent(
         attributed: AttributedString,
-        linkColor: Color? = Color.accentColor
+        linkColor: Color? = Color.accentColor,
+        cache: Bool = true
     ) -> PathLinkedContent {
         // Cache only the common markdown-block shape: accent link color + an attributed
         // string carrying no caller-applied foreground color (i.e. exactly what
         // `MarkdownTextView.inlineWithPaths` produces). Callers that restyle (e.g. quote
         // sets `.secondary`) fall through to the scan path — they cannot pollute the cache
-        // because the foreground-color guard fails.
-        if PathLinkCache.shared.canCacheAttributed(attributed, linkColor: linkColor) {
-            if let hit = PathLinkCache.shared.attributedContent(attributed) {
-                return hit
-            }
+        // because the foreground-color guard fails. Document links carry a per-file base URL,
+        // so they intentionally bypass this plain-text-keyed cache.
+        let cacheable = cache && PathLinkCache.shared.canCacheAttributed(attributed, linkColor: linkColor)
+        if cacheable, let hit = PathLinkCache.shared.attributedContent(attributed) {
+            return hit
         }
 
         let plain = String(attributed.characters)
@@ -160,7 +162,7 @@ package enum FileReveal {
         )
         let content = PathLinkedContent(visual: visual, targets: targets)
 
-        if PathLinkCache.shared.canCacheAttributed(attributed, linkColor: linkColor) {
+        if cacheable {
             PathLinkCache.shared.storeAttributed(content, for: attributed)
         }
         return content

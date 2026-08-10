@@ -21,10 +21,16 @@ final class BossSecretaryCloseoutTests: XCTestCase {
             ),
             encoding: .utf8
         )
-        XCTAssertTrue(runtime.contains("function runtimeRolePolicyForAgent"))
-        XCTAssertTrue(runtime.contains("agentName === \"secretary\""))
-        XCTAssertTrue(runtime.contains("worktree: \"main-session\""))
-        XCTAssertTrue(runtime.contains("allowRecursiveDelegation: false"))
+        let policy = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/PipiUI/PiExt/subagent/runtime-policy.ts"
+            ),
+            encoding: .utf8
+        )
+        XCTAssertTrue(runtime.contains("runtimeRolePolicyForAgent(agent)"))
+        XCTAssertTrue(policy.contains("agent.origin === \"bundled\" && agent.name === \"secretary\""))
+        XCTAssertTrue(policy.contains("worktree: \"main-session\""))
+        XCTAssertTrue(policy.contains("allowRecursiveDelegation: false"))
         XCTAssertTrue(runtime.contains("PIPIUI_MAIN_CWD || defaultCwd"))
         XCTAssertTrue(runtime.contains("t !== \"subagent\""))
         XCTAssertTrue(runtime.contains("PIPIUI_AGENT_NO_DELEGATION: \"1\""))
@@ -35,7 +41,7 @@ final class BossSecretaryCloseoutTests: XCTestCase {
 
         let definition = try String(
             contentsOf: root.appendingPathComponent(
-                "Sources/PipiUI/PiExt/agents/secretary.md"
+                "Sources/PipiUI/PiExt/agents/secretary/AGENT.md"
             ),
             encoding: .utf8
         )

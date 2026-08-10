@@ -35,16 +35,13 @@ struct TranscriptSessionRootIdentity: Hashable {
 
 /// Settled-history window rendered by the eager transcript stack.
 ///
-/// A small eager window (one fixed page of 32 rows at the newest end) gives
-/// native NSTextView-backed markdown enough room to settle its exact height
-/// without reintroducing lazy-stack height estimation. History browsing expands
-/// one older page at a time from the latest end, but the eager stack is hard-capped
-/// at `maxPages` so continuous top-prefetch can never mount the entire session.
-/// While the head stays within `maxPages` of the newest item the window still ends
-/// at `itemCount` (live/latest); deeper history slides the capped window so the
-/// newest end drops. Newest-first presentation reverses this storage slice, so
-/// each older page appends at the inverted layout end. Pinned/live mode renders
-/// the latest page (`nil` head).
+/// A small eager latest window (up to four 32-row pages) gives native
+/// NSTextView-backed markdown enough room to settle its exact height without
+/// reintroducing lazy-stack height estimation. History browsing moves one older
+/// page at a time, while the eager stack remains hard-capped at `maxPages` so
+/// continuous top-prefetch can never mount the entire session. `nil` is the
+/// pinned/live latest warm window; a concrete head selects a bounded history
+/// window. Newest-first presentation reverses this storage slice.
 struct TranscriptRenderWindow: Equatable {
     static let pageSize = 32
     /// Hard ceiling on eagerly mounted pages (32 × 4 = 128 rows). Mirrors the
@@ -65,17 +62,16 @@ struct TranscriptRenderWindow: Equatable {
         return max(0, (count + pageSize - 1) / pageSize - 1)
     }
 
-    /// Default (pinned / freshly reset) window start: the newest page itself.
-    /// History grows one older page per admitted near-top request.
+    /// Default (pinned / freshly reset) window start: enough pages to warm the
+    /// latest bounded window. History moves one older page per admitted request.
     static func latestStartPage(itemCount: Int) -> Int {
-        max(0, latestPage(itemCount: itemCount))
+        max(0, latestPage(itemCount: itemCount) - (maxPages - 1))
     }
 
     /// Window from `oldestLoadedPage` (history head), spanning at most `maxPages`.
-    /// `nil` and out-of-range values clamp to the latest page, so a stale head
-    /// (transcript reload / session switch) can never render invalid items.
-    /// When the head is near the newest end the range still ends at `itemCount`;
-    /// once history walks past the cap the window slides and drops the newest end.
+    /// `nil` and out-of-range values resolve to the latest warm window, so a stale
+    /// head (transcript reload / session switch) can never render invalid items.
+    /// A history head slides the bounded window toward older pages.
     static func resolve(itemCount: Int, oldestLoadedPage: Int?) -> Self {
         let count = max(0, itemCount)
         let lastPage = latestPage(itemCount: count)
@@ -125,6 +121,15 @@ enum TranscriptHistoryPager {
 
     static func complete(loadedPage: Int) -> State {
         loadedPage == 0 ? .exhausted : .idle
+    }
+
+    /// Drop in-flight loading so a late ~60ms reveal cannot apply after seek,
+    /// return-to-latest, user takeover, or session switch. Exhausted stays put
+    /// until a hard window/session reset.
+    static func invalidateInFlight(_ state: inout State) {
+        if case .loading = state {
+            state = .idle
+        }
     }
 }
 
@@ -187,6 +192,22 @@ enum ShortTranscriptGravity {
 /// is covered until the current root's pinned bottom jump has been applied.
 /// macOS 15+ uses `.defaultScrollAnchor(.bottom, for: .initialOffset)` instead
 /// and never needs the cover (`fallbackNeeded == false`).
+/// Lifecycle state for the rail's proxy-backed selection host. A temporary
+/// ScrollView disappearance must not turn the still-visible rail permanently inert;
+/// the next root bind replaces the captured proxy.
+struct UserPromptRailSelectHostState: Equatable {
+    private(set) var isBound = false
+
+    mutating func bind() {
+        isBound = true
+    }
+
+    mutating func scrollRootDidDisappear() {
+        // Keep the last action until the replacement root binds. The rail and its
+        // host can overlap during SwiftUI teardown/rebuild.
+    }
+}
+
 enum BottomSettledCover {
     /// - Parameters:
     ///   - pinned: session currently pinned to the bottom.
@@ -228,8 +249,18 @@ private struct ChatDetailViewBody: View {
     @ObservedObject var session: ChatSession
     /// Passed through without observation; `TranscriptScrollView` owns the high-frequency subscription.
     let streaming: StreamingState
-    /// 单独观察 subagent 树：它更新时主界面的 subagent 卡片要实时跟着动
-    @ObservedObject var agentStore: SubagentStore
+    /// Current session's subagent tree, passed through WITHOUT observation so the
+    /// ~16ms `log_delta` `objectWillChange` from `SubagentStore` does not invalidate
+    /// this whole detail chrome (root + transcript subtree + nav rail + sheets) on
+    /// every log batch. Leaves that actually display subagent state/logs
+    /// (`StreamingTranscriptRows`, `SubagentPanel`, the finished-group sheet) observe
+    /// the store themselves; only the running-count badge reads `subagentProjection`.
+    let agentStore: SubagentStore
+    /// Narrow subagent projection: re-publishes only when running count / running
+    /// tool-call ids change (lifecycle), so the root chrome + rail stay stable across
+    /// ordinary `log_delta` batches while terminal/failed/needs-user states refresh
+    /// immediately.
+    @StateObject private var subagentProjection = SubagentChatProjectionHost()
     @Environment(\.chatTypography) private var chatTypography
 
     /// Coalesce explicit/recovery jump-to-latest `scrollTo` operations. Streaming
@@ -277,6 +308,27 @@ private struct ChatDetailViewBody: View {
     /// (parent-driven frame, not a content proposal) and passed explicitly into the
     /// rows so pinned short transcripts get layout-level bottom gravity.
     @State private var transcriptViewportHeight: CGFloat = 0
+    /// User-prompt seek navigation host (live/history/seek + jump generation).
+    @State private var userPromptNavigation = UserPromptNavigationCoordinator()
+    /// Synchronous parent-side half of a user-owned prepared-history commit.
+    /// It blocks proxy/retry/resize writers before the child changes its window.
+    @State private var historyCommitBlocksAutomaticFollow = false
+    /// Mounted user-row geometry cache. Preferences refresh this in stable
+    /// pre-flip document coordinates; AppKit user-scroll callbacks consume it
+    /// with the live clip, so current does not depend on preference re-emission.
+    @State private var mountedUserPromptCurrentTrackerStore = MountedUserPromptCurrentTrackerStore()
+    /// ScrollViewProxy-bound select action for the left nav rail (legacy path only).
+    /// TableTranscript keeps this nil so the rail stays hidden / inert.
+    @State private var userPromptRailSelect: ((String) -> Void)?
+    @State private var userPromptRailSelectHost = UserPromptRailSelectHostState()
+    /// Serial jump / correction work. Cancelled on new navigate, user scroll,
+    /// return-to-latest, and session switch (generation bump).
+    @State private var userPromptJumpWork: Task<Void, Never>?
+    /// Cancelable mount ack for the in-flight first seek scroll (session+generation).
+    @State private var seekMountAckBox: SeekMountAcknowledgementBox?
+    /// Settled row scoped ids currently in the tree (onAppear/onDisappear).
+    /// Lets first-scroll complete immediately when the target is already mounted.
+    @State private var appearedSeekRowIDs: Set<String> = []
     private let minimumChatWidth: CGFloat = 360
     private let minimumRightPanelWidth: CGFloat = 300
     private let preferredRightPanelWidth: CGFloat = 460
@@ -370,6 +422,7 @@ private struct ChatDetailViewBody: View {
         }
         .onAppear {
             gitBranches.bind(projectURL: session.projectURL)
+            subagentProjection.bind(agentStore)
         }
         .onChange(of: session.bridgeRoutingKey) { _, _ in
             // A distinct ChatSession receives a fresh bridge key. Persisted-id
@@ -379,6 +432,9 @@ private struct ChatDetailViewBody: View {
             // The fresh root must re-settle before the macOS 14 cover lifts;
             // re-entering an earlier key also needs a fresh settle.
             bottomSettledSessionKey = nil
+            // Warm session switch reuses this chrome: re-bind the projection to the
+            // new session's store so the running-count badge tracks the right tree.
+            subagentProjection.bind(agentStore)
         }
         .onChange(of: session.id) { _, _ in
             // The detail chrome is reused across sessions. Reset only transient view state;
@@ -434,16 +490,47 @@ private struct ChatDetailViewBody: View {
         )
         .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .clipped()
-        .overlay(alignment: .topTrailing) {
-            // 8pt keeps the rail in rhythm with compact panel headers / top chrome.
-            panelQuickRail.padding(.top, 8).padding(.trailing, 8)
-        }
+        // panelQuickRail overlays adaptiveLayout (full chat+divider+panel width)
+        // so it can sit on the panel boundary instead of chat-trailing + divider gap.
         .background(
             GeometryReader { geo in
                 Color.clear.preference(key: ChatColumnWidthKey.self, value: geo.size.width)
             }
         )
         .layoutPriority(1)
+    }
+
+    /// Left-edge Claude-style ticks from the full-session user-prompt index.
+    /// Lives in the transcript gutter only (never covers message content, title, or input).
+    /// Hidden when empty, on experimental TableTranscript, or before proxy bind.
+    @ViewBuilder
+    private var userPromptNavigationRailHost: some View {
+        let entries = session.userPromptIndex.entries
+        if TableTranscriptFeature.isEnabled || entries.isEmpty {
+            EmptyView()
+        } else {
+            let currentID = UserPromptNavigationRailModel.resolvedCurrentMessageID(
+                currentUserPromptID: userPromptNavigation.currentUserPromptID,
+                pendingUserPromptID: userPromptNavigation.pendingUserPromptID,
+                isSeeking: userPromptNavigation.isSeeking,
+                entryMessageIDs: entries.map(\.messageID)
+            )
+            UserPromptNavigationRail(
+                entries: entries,
+                currentMessageID: currentID,
+                onSelect: { messageID in
+                    userPromptRailSelect?(messageID)
+                }
+            )
+            .allowsHitTesting(userPromptRailSelectHost.isBound && userPromptRailSelect != nil)
+            .padding(.top, UserPromptNavigationRailModel.hostTopInset)
+            .padding(.leading, UserPromptNavigationRailModel.hostLeadingInset)
+            // Keep hit-testing inside the reserved gutter width.
+            .frame(
+                width: UserPromptNavigationRailModel.transcriptLeadingGutter,
+                alignment: .topLeading
+            )
+        }
     }
 
     /// Top-trailing branch + panel collapse/expand. Flat, borderless, ~28pt hits —
@@ -488,6 +575,26 @@ private struct ChatDetailViewBody: View {
         .padding(.horizontal, 2)
     }
 
+    /// Top-trailing rail chrome. `trailingInset` is distance from the overlay’s
+    /// trailing edge (panel width + 2 when open → hugs panel; 2 when closed).
+    private func panelQuickRailOverlay(trailingInset: CGFloat) -> some View {
+        HStack(alignment: .top, spacing: 4) {
+            // The compact plan popover is overlay-only, so it never changes the
+            // transcript scroll root or competes with its viewport ownership.
+            PlanStatusView(
+                store: session.planStore,
+                session: session,
+                onExecute: { session.executePublishedPlan(planId: $0) },
+                onAdjust: { session.preparePlanAdjustment(planId: $0) },
+                onContinue: { session.continueInterruptedPlan(planId: $0) },
+                onIgnore: { session.planStore.cancel(planId: $0) }
+            )
+            panelQuickRail
+        }
+        .padding(.top, 8)
+        .padding(.trailing, trailingInset)
+    }
+
     /// 聊天栏右上角的竖向快捷栏：右面板开关（Subagents / 浏览器 / 文档 / 终端）。
     /// Flat narrow strip — matches the compact top chrome (no floating capsule/shadow).
     private var panelQuickRail: some View {
@@ -505,7 +612,7 @@ private struct ChatDetailViewBody: View {
                 }
             }
             .overlay(alignment: .topTrailing) {
-                if session.subagents.runningCount > 0 {
+                if subagentProjection.presentation.runningCount > 0 {
                     Circle().fill(Color.green).frame(width: 7, height: 7)
                         .offset(x: 1, y: -1)
                 }
@@ -532,7 +639,12 @@ private struct ChatDetailViewBody: View {
                 isActive: session.rightPanel == .terminal,
                 help: "内嵌终端（项目目录）"
             ) {
-                session.rightPanel = session.rightPanel == .terminal ? nil : .terminal
+                if session.rightPanel == .terminal {
+                    session.rightPanel = nil
+                } else {
+                    session.terminalTabs.selectLatest()
+                    session.rightPanel = .terminal
+                }
             }
         }
         .padding(.vertical, 4)
@@ -580,6 +692,7 @@ private struct ChatDetailViewBody: View {
             // chatColumn 视图身份保持不变 → 不再因 HStack↔ZStack 翻转而拆除重建。
             HStack(spacing: 0) {
                 chatColumn
+                    .padding(.trailing, session.rightPanel != nil ? 24 : 0)
                     .frame(minWidth: minimumChatWidth)
                 if let panel = session.rightPanel {
                     RightPanelDivider(
@@ -601,9 +714,19 @@ private struct ChatDetailViewBody: View {
                         .frame(width: wideRightPanelWidth(for: width))
                 }
             }
+            // Rail on full HStack: when panel is open, hug its leading edge
+            // (was chat-trailing 8pt + 16pt divider ≈ 24pt visual gap).
+            .overlay(alignment: .topTrailing) {
+                panelQuickRailOverlay(
+                    trailingInset: session.rightPanel != nil
+                        ? wideRightPanelWidth(for: width) + 2
+                        : 2
+                )
+            }
         } else {
             ZStack(alignment: .trailing) {
                 chatColumn
+                    .padding(.trailing, session.rightPanel != nil ? 24 : 0)
 
                 if let panel = session.rightPanel {
                     panelView(panel)
@@ -618,6 +741,13 @@ private struct ChatDetailViewBody: View {
                 }
             }
             .clipped()
+            .overlay(alignment: .topTrailing) {
+                panelQuickRailOverlay(
+                    trailingInset: session.rightPanel != nil
+                        ? overlayPanelWidth(for: width) + 2
+                        : 2
+                )
+            }
             .animation(.easeInOut(duration: 0.18), value: session.rightPanel)
         }
     }
@@ -633,6 +763,7 @@ private struct ChatDetailViewBody: View {
                     store: session.subagents,
                     projectURL: session.projectURL,
                     onAbort: { agentId in session.abortSubagent(agentId) },
+                    onResolve: { agent in session.resolveSubagent(agent) },
                     onManualStatusCheck: { agentIDs in
                         requestManualSubagentStatusCheck(agentIDs)
                     }
@@ -646,7 +777,7 @@ private struct ChatDetailViewBody: View {
             case .document:
                 DocumentPanel(store: session.documentTabs)
             case .terminal:
-                TerminalPanel(store: session.terminalStore)
+                TerminalPanel(store: session.terminalTabs)
                     // Same session-identity convention as SubagentPanel: warm session
                     // switch reuses ChatDetailView chrome, so pin the terminal host to
                     // this session's routing key.
@@ -754,22 +885,67 @@ private struct ChatDetailViewBody: View {
                     agentStore: agentStore,
                     collapsedUserTurnIDs: $collapsedUserTurnIDs,
                     viewportHeight: transcriptViewportHeight,
+                    seekMountedRange: userPromptNavigation.seekMountedRange,
+                    isSeeking: userPromptNavigation.isSeeking,
+                    /// Bumps on navigate / return / user takeover / session reset so
+                    /// the production history pager drops in-flight 60ms reveals.
+                    viewportGeneration: userPromptNavigation.generation,
+                    automaticFollowAllowed: allowsAutomaticFollow,
+                    automaticFollowGeneration: userPromptNavigation.generation,
+                    mayWritePersistentUserUnpin: {
+                        userPromptNavigation.viewport.scrollOwner == .user
+                    },
+                    onUserOwnedHistoryCommitWillBegin: {
+                        beginUserOwnedHistoryCommitDetachment()
+                    },
+                    onHistoryCommitDidFinish: {
+                        historyCommitBlocksAutomaticFollow = false
+                    },
+                    onUserRepinnedLatest: {
+                        handleTranscriptUserRepinnedLatest(proxy: proxy)
+                    },
                     onOpenFinishedGroup: presentFinishedGroup,
                     onOpenRunningTool: presentRunningTool,
                     onReturnLatest: {
-                        session.transcriptPlanner.invalidate()
-                        session.pinTranscriptToBottom = true
-                        jumpToLatest(proxy, retry: true)
+                        returnToLatestTranscript(proxy: proxy)
+                    },
+                    onUserScroll: { viewport, mountedRange in
+                        // StickToBottomTracker only reports attributed user scroll
+                        // (wheel/trackpad/knob) — not programmatic scrollTo. It
+                        // supplies the current AppKit clip so cached layout anchors
+                        // for this exact mounted window can update without a new preference.
+                        handleTranscriptUserScroll(
+                            proxy: proxy,
+                            viewport: viewport,
+                            mountedRange: mountedRange
+                        )
+                    },
+                    onMountedUserPromptWindowChanged: { mountedRange in
+                        invalidateMountedUserPromptAnchorCache(for: mountedRange)
                     },
                     onJump: { target in
+                        // In-message jump targets only while the coordinator is idle.
+                        guard !userPromptNavigation.jumpCoordinatorMayWriteScroll else { return }
                         var transaction = Transaction()
                         transaction.disablesAnimations = true
                         withTransaction(transaction) {
                             proxy.scrollTo(target, anchor: jumpAnchor)
                         }
+                    },
+                    onSeekRowAppeared: { scopedID in
+                        appearedSeekRowIDs.insert(scopedID)
+                        seekMountAckBox?.acknowledge(rowID: scopedID)
+                    },
+                    onSeekRowDisappeared: { scopedID in
+                        appearedSeekRowIDs.remove(scopedID)
                     }
                 )
-                .padding(16)
+                // Leading gutter reserves independent rail hit-test space so ticks
+                // never overlay message content. Other edges keep the 16pt inset.
+                .padding(.top, 16)
+                .padding(.bottom, 16)
+                .padding(.trailing, 16)
+                .padding(.leading, 16 + UserPromptNavigationRailModel.transcriptLeadingGutter)
                 // Pinned short transcripts must hug the bottom composer at the layout
                 // level: a viewport min-height with bottom-leading alignment (plus the
                 // top flexible space inside the rows) leaves no clip travel for the
@@ -783,6 +959,10 @@ private struct ChatDetailViewBody: View {
                     ) ?? 0,
                     alignment: .bottomLeading
                 )
+                // This coordinate space is inside the ScrollView document and
+                // before the outer `.transcriptFlip()`. Row anchors therefore
+                // stay in stable layout/document coordinates while the clip moves.
+                .coordinateSpace(name: MountedUserPromptAnchorKey.layoutCoordinateSpaceName)
             }
             // Same-session identity rebinds may still update session.id without
             // replacing this ScrollView. Never animate that bookkeeping change.
@@ -807,6 +987,9 @@ private struct ChatDetailViewBody: View {
                     transcriptViewportHeight = height
                 }
             }
+            .onPreferenceChange(MountedUserPromptAnchorKey.self) { anchors in
+                applyMountedUserPromptAnchors(anchors)
+            }
             // Bottom pinning stays with explicit `scrollTo("bottom")` + the
             // tracker. The inverted AppKit document-end edge loads history;
             // newest-first layout makes every older page a structural append.
@@ -826,9 +1009,7 @@ private struct ChatDetailViewBody: View {
             .overlay(alignment: .bottomTrailing) {
                 if !session.pinTranscriptToBottom {
                     Button {
-                        session.transcriptPlanner.invalidate()
-                        session.pinTranscriptToBottom = true
-                        jumpToLatest(proxy, retry: true)
+                        returnToLatestTranscript(proxy: proxy)
                     } label: {
                         Image(systemName: "arrow.down")
                             .font(.system(size: 13, weight: .semibold))
@@ -846,10 +1027,34 @@ private struct ChatDetailViewBody: View {
             .overlay {
                 TranscriptLoadingOverlay(session: session, streaming: streaming)
             }
+            // Rail sits in the reserved leading gutter only — not over bubbles,
+            // not over InputBar/title (host is transcript-local, top-leading).
+            .overlay(alignment: .topLeading) {
+                userPromptNavigationRailHost
+            }
             .onAppear {
+                bindUserPromptNavigation(proxy: proxy)
+                bindUserPromptRailSelect(proxy: proxy)
                 jumpToLatest(proxy, retry: true)
             }
+            .onDisappear {
+                historyCommitBlocksAutomaticFollow = false
+                // Retain the host action during teardown; a rebuilt legacy root
+                // immediately replaces its proxy binding onAppear.
+                userPromptRailSelectHost.scrollRootDidDisappear()
+                appearedSeekRowIDs = []
+                resetMountedUserPromptCurrentTracker()
+                cancelUserPromptJumpWork()
+            }
+            .onChange(of: session.bridgeRoutingKey) { _, _ in
+                appearedSeekRowIDs = []
+                bindUserPromptNavigation(proxy: proxy)
+                bindUserPromptRailSelect(proxy: proxy)
+            }
             .onChange(of: session.transcriptVersion) { _, _ in
+                _ = mutateUserPromptNavigation {
+                    $0.streamAppended(itemCount: session.transcript.count)
+                }
                 // Background subagent signals (heartbeat / stalled / done re-delivery)
                 // must not yank the viewport: the user may still be reading a summary.
                 if SubagentSignalClassifier.isBackgroundSignal(item: session.transcript.last) { return }
@@ -899,6 +1104,16 @@ private struct ChatDetailViewBody: View {
             || NSApp.keyWindow?.inLiveResize == true
     }
 
+    /// Every automatic writer (stream append, document growth, retry, and width
+    /// recovery) must respect the viewport's current owner. `StickToBottomTracker`
+    /// supplies an additional immediate local suppression during the coalesced
+    /// persistent-unpin gap; this host gate prevents proxy jumps from bypassing it.
+    private var allowsAutomaticFollow: Bool {
+        !historyCommitBlocksAutomaticFollow
+            && session.pinTranscriptToBottom
+            && userPromptNavigation.streamingMayWriteScroll
+    }
+
     /// Debounce chat-column width changes, then re-pin — but **never** while layout
     /// is frozen for a live drag (window chrome or right-panel divider). Mid-drag
     /// `scrollTo("bottom")` races transcript reflow and makes the transcript tremble;
@@ -937,14 +1152,14 @@ private struct ChatDetailViewBody: View {
     /// After chat-column width jumps (right panel / resize end), one pin-edge settle
     /// so transcript rows settle at the new width. Only when still pinned.
     private func recoverPinAfterColumnWidthChange(_ proxy: ScrollViewProxy) {
-        guard session.pinTranscriptToBottom else { return }
+        guard allowsAutomaticFollow else { return }
         widthRecoverGeneration += 1
         let generation = widthRecoverGeneration
         let key = session.bridgeRoutingKey
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 32_000_000)
             guard generation == widthRecoverGeneration,
-                  session.pinTranscriptToBottom,
+                  allowsAutomaticFollow,
                   session.bridgeRoutingKey == key else { return }
             applyJumpToLatest(proxy)
         }
@@ -953,7 +1168,7 @@ private struct ChatDetailViewBody: View {
     /// Explicit jump to the pin edge. Normal top-down layout uses this for streaming
     /// follow, the jump button, initial session binding, and width recovery.
     private func jumpToLatest(_ proxy: ScrollViewProxy, retry: Bool = false) {
-        guard session.pinTranscriptToBottom else { return }
+        guard allowsAutomaticFollow else { return }
         if retry { scrollNeedsRetry = true }
         guard !scrollCoalesceScheduled else { return }
         scrollCoalesceScheduled = true
@@ -965,12 +1180,14 @@ private struct ChatDetailViewBody: View {
             scrollCoalesceScheduled = false
             let needsRetry = scrollNeedsRetry
             scrollNeedsRetry = false
-            guard session.pinTranscriptToBottom, session.bridgeRoutingKey == key else { return }
+            guard allowsAutomaticFollow,
+                  session.bridgeRoutingKey == key else { return }
             applyJumpToLatest(proxy)
             if needsRetry {
                 for delay in [0.05, 0.2] as [TimeInterval] {
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                        guard session.pinTranscriptToBottom, session.bridgeRoutingKey == key else { return }
+                        guard allowsAutomaticFollow,
+                              session.bridgeRoutingKey == key else { return }
                         applyJumpToLatest(proxy)
                     }
                 }
@@ -978,7 +1195,365 @@ private struct ChatDetailViewBody: View {
         }
     }
 
+    // MARK: - User-prompt navigation (seek)
+
+    /// Bind left-rail clicks to the live ScrollViewProxy (legacy inverted path only).
+    private func bindUserPromptRailSelect(proxy: ScrollViewProxy) {
+        userPromptRailSelect = { messageID in
+            navigateToUserPrompt(messageID: messageID, proxy: proxy)
+        }
+        userPromptRailSelectHost.bind()
+    }
+
+    /// Internal entry for the navigation rail: seek by stable user message id.
+    private func navigateToUserPrompt(messageID: String, proxy: ScrollViewProxy) {
+        // Resolve against the full-session index before mutating viewport state.
+        let index = session.userPromptIndex.transcriptIndex(for: messageID)
+        let effects = mutateUserPromptNavigation {
+            $0.navigateToUserPrompt(
+                messageID: messageID,
+                transcriptIndex: index,
+                itemCount: session.transcript.count,
+                sessionKey: session.bridgeRoutingKey
+            )
+        }
+        applyUserPromptNavigationEffects(effects, proxy: proxy)
+    }
+
+    private func returnToLatestTranscript(proxy: ScrollViewProxy) {
+        historyCommitBlocksAutomaticFollow = false
+        session.transcriptPlanner.invalidate()
+        let effects = mutateUserPromptNavigation { $0.returnToLatest() }
+        applyUserPromptNavigationEffects(effects, proxy: proxy)
+        jumpToLatest(proxy, retry: true)
+    }
+
+    /// A real user gesture reached the latest edge again. Restore live ownership
+    /// without issuing another proxy jump — the user is already at that location.
+    private func handleTranscriptUserRepinnedLatest(proxy: ScrollViewProxy) {
+        guard !userPromptNavigation.isSeeking else { return }
+        historyCommitBlocksAutomaticFollow = false
+        session.transcriptPlanner.invalidate()
+        let effects = mutateUserPromptNavigation { $0.returnToLatest() }
+        applyUserPromptNavigationEffects(effects, proxy: proxy)
+    }
+
+    /// A history prefetch admitted by a real user scroll can arrive before the
+    /// old geometric 4pt release threshold. Make the user detach durable before
+    /// the prepared window mutates; normal pinned safety-backfill returns false.
+    private func beginUserOwnedHistoryCommitDetachment() -> Bool {
+        guard !userPromptNavigation.isSeeking,
+              userPromptNavigation.viewport.scrollOwner == .user
+        else { return false }
+        historyCommitBlocksAutomaticFollow = true
+        _ = mutateUserPromptNavigation { $0.historyCommitBegan() }
+        return true
+    }
+
+    private func handleTranscriptUserScroll(
+        proxy: ScrollViewProxy,
+        viewport: UserPromptCurrentAssociation.Viewport,
+        mountedRange: Range<Int>
+    ) {
+        let effects = mutateUserPromptNavigation { nav in
+            // StickToBottom owns live pin geometry. Mirror session pin into nav
+            // before reduce so the one-way nav→session sync cannot re-pin after
+            // a geometry unpin (or clear a re-pin) during ordinary browsing.
+            if !nav.isSeeking {
+                nav.viewport.pinToBottom = session.pinTranscriptToBottom
+            }
+            // This call records the AppKit clip, transfers ownership, then uses
+            // the already-cached mounted layout anchors immediately. It never
+            // waits for a scroll-time Preference re-emission.
+            return mountedUserPromptCurrentTrackerStore.tracker.userScrolled(
+                navigation: &nav,
+                viewport: viewport,
+                mountedRange: mountedRange
+            )
+        }
+        applyUserPromptNavigationEffects(effects, proxy: proxy)
+    }
+
+    /// Cache all mounted user-row geometry regardless of current scroll owner.
+    /// During programmatic seek/live movement this deliberately does not rewrite
+    /// current; after a real user takeover `refreshCurrent` uses this exact cache.
+    private func applyMountedUserPromptAnchors(
+        _ reports: [MountedUserPromptAnchorReport]
+    ) {
+        guard !reports.isEmpty else { return }
+        // A teardown/rebuild can briefly deliver reports from adjacent windows.
+        // Keep them range-scoped; user-scroll association reads only the exact
+        // range carried by the AppKit callback, so stale rows cannot win.
+        var ranges: [Range<Int>] = []
+        for report in reports where !ranges.contains(report.mountedRange) {
+            ranges.append(report.mountedRange)
+        }
+        for range in ranges {
+            mountedUserPromptCurrentTrackerStore.tracker.replaceMountedAnchors(
+                reports
+                    .filter { $0.mountedRange == range }
+                    .map(\.anchor),
+                mountedRange: range
+            )
+        }
+        _ = mutateUserPromptNavigation { nav in
+            _ = mountedUserPromptCurrentTrackerStore.tracker.refreshCurrent(navigation: &nav)
+            return []
+        }
+    }
+
+    /// A bounded history/seek/live window replacement invalidates only geometry
+    /// that cannot belong to the incoming range. The selected rail node stays
+    /// intact until fresh visible anchors arrive, never falling back to latest.
+    private func invalidateMountedUserPromptAnchorCache(for mountedRange: Range<Int>) {
+        mountedUserPromptCurrentTrackerStore.tracker.mountedWindowDidChange(mountedRange)
+    }
+
+    private func resetMountedUserPromptCurrentTracker() {
+        mountedUserPromptCurrentTrackerStore.tracker.reset()
+    }
+
+    private func bindUserPromptNavigation(proxy: ScrollViewProxy) {
+        historyCommitBlocksAutomaticFollow = false
+        resetMountedUserPromptCurrentTracker()
+        let effects = mutateUserPromptNavigation {
+            $0.reset(
+                sessionKey: session.bridgeRoutingKey,
+                itemCount: session.transcript.count
+            )
+        }
+        applyUserPromptNavigationEffects(effects, proxy: proxy)
+    }
+
+    @discardableResult
+    private func mutateUserPromptNavigation(
+        _ body: (inout UserPromptNavigationCoordinator) -> [TranscriptViewport.Effect]
+    ) -> [TranscriptViewport.Effect] {
+        var nav = userPromptNavigation
+        let effects = body(&nav)
+        // Only write the @State when the coordinator actually changed. AppKit may
+        // deliver many true-scroll clip snapshots per gesture, but the reference
+        // geometry cache is non-observable and this state changes only when the
+        // discrete current id / ownership changes. `UserPromptNavigationCoordinator`
+        // is `Equatable`, so the comparison is cheap and effects still propagate
+        // to the host unchanged.
+        if nav != userPromptNavigation {
+            userPromptNavigation = nav
+        }
+        // Keep session pin aligned with viewport ownership (seek forces pin off).
+        if session.pinTranscriptToBottom != nav.pinToBottom {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                session.pinTranscriptToBottom = nav.pinToBottom
+            }
+        }
+        return effects
+    }
+
+    private func applyUserPromptNavigationEffects(
+        _ effects: [TranscriptViewport.Effect],
+        proxy: ScrollViewProxy
+    ) {
+        for effect in effects {
+            switch effect {
+            case .cancelPendingJumpWork:
+                cancelUserPromptJumpWork()
+            case .invalidateHistoryPager:
+                // Ownership lives on StreamingTranscriptRows via viewportGeneration
+                // observation (bumps historyLoadGeneration + invalidateInFlight).
+                // No direct child state access from the parent host.
+                break
+            case let .scrollToIndex(index, sessionKey, generation):
+                scheduleUserPromptSeekScroll(
+                    index: index,
+                    sessionKey: sessionKey,
+                    generation: generation,
+                    proxy: proxy
+                )
+            case let .runCorrection(sessionKey, generation):
+                scheduleUserPromptSeekCorrection(
+                    sessionKey: sessionKey,
+                    generation: generation,
+                    proxy: proxy
+                )
+            }
+        }
+    }
+
+    private func cancelUserPromptJumpWork() {
+        userPromptJumpWork?.cancel()
+        userPromptJumpWork = nil
+        seekMountAckBox?.cancel()
+        seekMountAckBox = nil
+    }
+
+    /// First seek scroll: prepare is already in viewport state; wait for a cancelable
+    /// target-row mount ack (session+generation), then animation-free scrollTo and
+    /// finite corrections. Does not rely on a fixed delay alone.
+    private func scheduleUserPromptSeekScroll(
+        index: Int,
+        sessionKey: String,
+        generation: UInt64,
+        proxy: ScrollViewProxy
+    ) {
+        cancelUserPromptJumpWork()
+        let key = sessionKey
+        let gen = generation
+        let targetIndex = index
+        guard targetIndex >= 0, targetIndex < session.transcript.count else { return }
+        let localID = session.transcript[targetIndex].id
+        let target = TranscriptRenderIdentity.scoped(sessionKey: key, localID: localID)
+        let request = SeekFirstScrollPipeline.Request(
+            targetIndex: targetIndex,
+            targetRowID: target,
+            sessionKey: key,
+            generation: gen
+        )
+        let box = SeekMountAcknowledgementBox(request: request)
+        seekMountAckBox = box
+        // Already in the tree (e.g. overlapping seek windows): ack without waiting.
+        if appearedSeekRowIDs.contains(target) {
+            box.acknowledge(rowID: target)
+        }
+
+        userPromptJumpWork = Task { @MainActor in
+            // One yield so SwiftUI can commit a newly prepared seek window.
+            await Task.yield()
+            guard !Task.isCancelled else {
+                box.cancel()
+                return
+            }
+            // Re-check after the commit pass — new rows may have appeared.
+            if appearedSeekRowIDs.contains(target) {
+                box.acknowledge(rowID: target)
+            }
+
+            let scrolled = await SeekFirstScrollPipeline.run(
+                request: request,
+                isCurrent: {
+                    userPromptNavigation.isCurrent(sessionKey: key, generation: gen)
+                        && userPromptNavigation.jumpCoordinatorMayWriteScroll
+                        && session.bridgeRoutingKey == key
+                },
+                host: .init(
+                    waitForMount: { req in
+                        // If a newer schedule replaced the box, this wait is stale.
+                        guard seekMountAckBox === box,
+                              box.request == req
+                        else { return .cancelled }
+                        return await box.wait(timeoutNanoseconds: 150_000_000)
+                    },
+                    performScroll: { req in
+                        guard userPromptNavigation.isCurrent(
+                            sessionKey: req.sessionKey,
+                            generation: req.generation
+                        ),
+                        userPromptNavigation.jumpCoordinatorMayWriteScroll,
+                        session.bridgeRoutingKey == req.sessionKey
+                        else { return }
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            proxy.scrollTo(req.targetRowID, anchor: jumpAnchor)
+                        }
+                    }
+                )
+            )
+
+            if seekMountAckBox === box {
+                seekMountAckBox = nil
+            }
+            guard !Task.isCancelled, scrolled else { return }
+            guard userPromptNavigation.isCurrent(sessionKey: key, generation: gen),
+                  userPromptNavigation.jumpCoordinatorMayWriteScroll,
+                  session.bridgeRoutingKey == key
+            else { return }
+
+            let followUp = mutateUserPromptNavigation {
+                $0.jumpScrollApplied(generation: gen)
+            }
+            await runUserPromptFollowUpEffects(
+                followUp,
+                sessionKey: key,
+                generation: gen,
+                targetScopedID: target,
+                proxy: proxy
+            )
+        }
+    }
+
+    private func scheduleUserPromptSeekCorrection(
+        sessionKey: String,
+        generation: UInt64,
+        proxy: ScrollViewProxy
+    ) {
+        // Corrections are normally chained from jumpScrollApplied. A standalone
+        // effect still runs under the same serial task + token guards.
+        let key = sessionKey
+        let gen = generation
+        let prior = userPromptJumpWork
+        userPromptJumpWork = Task { @MainActor in
+            _ = await prior?.result
+            guard !Task.isCancelled else { return }
+            guard userPromptNavigation.isCurrent(sessionKey: key, generation: gen),
+                  userPromptNavigation.jumpCoordinatorMayWriteScroll,
+                  session.bridgeRoutingKey == key,
+                  let targetIndex = userPromptNavigation.seekTargetIndex,
+                  targetIndex >= 0,
+                  targetIndex < session.transcript.count
+            else { return }
+            let localID = session.transcript[targetIndex].id
+            let target = TranscriptRenderIdentity.scoped(sessionKey: key, localID: localID)
+            await runUserPromptFollowUpEffects(
+                [.runCorrection(sessionKey: key, generation: gen)],
+                sessionKey: key,
+                generation: gen,
+                targetScopedID: target,
+                proxy: proxy
+            )
+        }
+    }
+
+    private func runUserPromptFollowUpEffects(
+        _ effects: [TranscriptViewport.Effect],
+        sessionKey: String,
+        generation: UInt64,
+        targetScopedID: String,
+        proxy: ScrollViewProxy
+    ) async {
+        var queue = effects
+        while !queue.isEmpty {
+            guard !Task.isCancelled else { return }
+            let effect = queue.removeFirst()
+            switch effect {
+            case .cancelPendingJumpWork, .invalidateHistoryPager:
+                continue
+            case .scrollToIndex:
+                continue
+            case let .runCorrection(effectKey, effectGen):
+                guard effectKey == sessionKey, effectGen == generation else { return }
+                try? await Task.sleep(nanoseconds: 16_000_000)
+                guard !Task.isCancelled else { return }
+                guard userPromptNavigation.isCurrent(sessionKey: sessionKey, generation: generation),
+                      userPromptNavigation.jumpCoordinatorMayWriteScroll,
+                      session.bridgeRoutingKey == sessionKey
+                else { return }
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    proxy.scrollTo(targetScopedID, anchor: jumpAnchor)
+                }
+                let next = mutateUserPromptNavigation {
+                    $0.correctionApplied(generation: generation)
+                }
+                queue.append(contentsOf: next)
+            }
+        }
+    }
+
     private func applyJumpToLatest(_ proxy: ScrollViewProxy) {
+        guard allowsAutomaticFollow else { return }
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -1134,58 +1709,119 @@ private struct RunningToolDetailSheetContent: View {
 private struct StreamingTranscriptRows: View {
     @ObservedObject var session: ChatSession
     @ObservedObject var streaming: StreamingState
-    @ObservedObject var agentStore: SubagentStore
+    /// Passed through WITHOUT observation. The full `SubagentStore` publishes
+    /// `objectWillChange` on every ~16ms `log_delta`/`update` batch, which used
+    /// to invalidate this entire settled-row group (planner window, fold guards,
+    /// and every `MessageRow` equality check) on each batch. Instead,
+    /// `transcriptSubagents` re-publishes a narrow per-agent slice that changes
+    /// only on lifecycle / display-relevant transitions; this `let` is read
+    /// fresh for actual card data whenever the body re-runs.
+    let agentStore: SubagentStore
     @Binding var collapsedUserTurnIDs: Set<String>
     /// Transcript viewport height measured at the scroll-container level by the
     /// parent. Drives the pinned short-content bottom gravity.
     let viewportHeight: CGFloat
+    /// When non-`nil`, mount this bounded seek slice instead of the live/history
+    /// `TranscriptRenderWindow` (never target→latest full span).
+    let seekMountedRange: Range<Int>?
+    /// Seek mode: history pager off, streaming extras off, pin re-entry blocked.
+    let isSeeking: Bool
+    /// `UserPromptNavigationCoordinator.generation` — bumps on seek start, return
+    /// to latest, user takeover, and session reset so pending history-pager work
+    /// is dropped (same ownership as the viewport reducer).
+    let viewportGeneration: UInt64
+    /// Live-stream / document growth may write only while the viewport remains
+    /// live-owned. This flips false immediately on an attributed user scroll,
+    /// before the coalesced persistent pin write lands.
+    let automaticFollowAllowed: Bool
+    /// Explicit return-to-latest / session navigation invalidates any local
+    /// immediate suppression held by the AppKit tracker.
+    let automaticFollowGeneration: UInt64
+    /// A queued false pin write remains valid only while the user still owns the
+    /// viewport. This rejects an old unpin after an explicit jump-to-latest.
+    let mayWritePersistentUserUnpin: () -> Bool
+    /// Called synchronously before a user-owned prepared history commit changes
+    /// its mounted window. Returns false for pinned safety-backfill.
+    let onUserOwnedHistoryCommitWillBegin: () -> Bool
+    /// Called after the committed window has appeared and stale callbacks have
+    /// been invalidated; it never itself resumes detached follow.
+    let onHistoryCommitDidFinish: () -> Void
+    /// The tracker calls this only after a real user re-enters the latest edge.
+    let onUserRepinnedLatest: () -> Void
     let onOpenFinishedGroup: (AssistantBlockLayout.FinishedGroupPresentation) -> Void
     let onOpenRunningTool: (RunningToolDetailPresentation) -> Void
     let onReturnLatest: () -> Void
+    /// User-driven scroll (wheel / trackpad / knob), with the current AppKit
+    /// clip converted into pre-flip document layout coordinates. Programmatic
+    /// `scrollTo` never invokes this callback. The mounted raw-item range tags
+    /// cached anchors so an old history-window preference cannot win after paging.
+    let onUserScroll: (UserPromptCurrentAssociation.Viewport, Range<Int>) -> Void
+    /// Fired whenever the bounded mounted raw-item window changes. The parent
+    /// drops stale row geometry before fresh preferences replace it.
+    let onMountedUserPromptWindowChanged: (Range<Int>) -> Void
     let onJump: (String) -> Void
+    /// Settled row appeared (scoped render id). Feeds cancelable seek mount ack.
+    let onSeekRowAppeared: (String) -> Void
+    /// Settled row left the tree — drop from the host's appeared set.
+    let onSeekRowDisappeared: (String) -> Void
     @Environment(\.chatTypography) private var chatTypography
-    /// History head while unpinned: the oldest rendered page, or `nil` for the
-    /// default latest page (pinned/live or not yet browsed). Only ever decreases
-    /// via one-page expansions. `TranscriptRenderWindow.resolve` hard-caps the
-    /// mounted span at `maxPages` (sliding off the newest end when needed).
-    @State private var transcriptOldestLoadedPage: Int?
-    /// Explicit one-page admission state for near-top asynchronous prefetch.
-    @State private var historyPageLoadState = TranscriptHistoryPager.State.idle
-    /// Invalidates a queued page reveal when pin/session identity changes.
-    @State private var historyLoadGeneration = 0
+
+    /// The only production history-pager state. Snapshot planning advances it
+    /// preparing → ready → committing; the committed page is its sole window truth.
+    @State private var historyPreparation = TranscriptHistoryPreparation.State()
+    /// A prepared presentation is immutable and used only when its request still
+    /// matches the current session, viewport generation, and render-window identity.
+    @State private var preparedHistoryPresentation: PreparedHistoryPresentation?
+    /// Reference-only scroll lifecycle gate: no body invalidation for live pulses.
+    @State private var historyLiveScrollGate = TranscriptHistoryLiveScrollGate()
+    /// Shared with the AppKit tracker. It invalidates queued document follow
+    /// synchronously before a prepared history commit mutates rows/window.
+    @State private var followIntent = TranscriptFollowIntent()
+    /// Narrow per-agent slice that drives re-render only on lifecycle /
+    /// display-relevant changes. Ordinary `log_delta`/telemetry batches leave
+    /// it equal, so the settled-row group stays stable across streaming.
+    @StateObject private var transcriptSubagents = TranscriptSubagentProjectionHost()
 
     var body: some View {
         let items = session.transcript
-        // Pinned/live mode always renders the latest page. Unpinned history
-        // browsing expands one page at a time at the old end; resolve hard-caps
-        // the eager span at maxPages so deep prefetch cannot mount the session.
-        let window = TranscriptRenderWindow.resolve(
-            itemCount: items.count,
-            // A pinned raw page can collapse to one tiny presentation row. Keep
-            // safety backfill pages mounted so the document can become scrollable.
-            oldestLoadedPage: transcriptOldestLoadedPage
-        )
+        // Read the projection so the body depends on it (establishes
+        // observation). Running tool-call ids come from the narrow slice; the
+        // actual card data is still read fresh from `agentStore` below.
+        let subagentPresentation = transcriptSubagents.presentation
+        // Seek: independent bounded range from the jump coordinator.
+        // Live/history: existing TranscriptRenderWindow behavior unchanged.
+        let window = resolvedRenderWindow(itemCount: items.count)
         let windowItems = Array(items[window.range])
-        // History expanded backward (head moved); return-to-latest uses pin reset.
-        let browsingHistory = !session.pinTranscriptToBottom && transcriptOldestLoadedPage != nil
+        // History expanded backward (head moved), or directed seek away from live.
+        // Return-to-latest uses pin reset / coordinator return.
+        let browsingHistory = isSeeking
+            || (!session.pinTranscriptToBottom && historyPreparation.committedPage != nil)
         // History loading gate for AppKit near-top prefetch and non-scrollable
         // safety backfill. The explicit pager closes it while one page is loading.
-        let effectiveStartPage = transcriptOldestLoadedPage
+        // Seek must never expand via the unidirectional history pager.
+        let effectiveStartPage = historyPreparation.committedPage
             ?? TranscriptRenderWindow.latestStartPage(itemCount: items.count)
-        let historyLoadingEnabled = effectiveStartPage > 0 && historyPageLoadState == .idle
-        let presentation = session.transcriptPlanner.presentation(
-            items: windowItems,
-            toolRuns: streaming.toolRuns,
-            visibleCount: windowItems.count,
+        let historyLoadingEnabled = !isSeeking
+            && effectiveStartPage > 0
+            && !historyPreparation.isLoading
+        let preparedMatches = preparedHistoryPresentation?.matches(
+            window: window,
+            sessionKey: session.bridgeRoutingKey,
+            viewportGeneration: viewportGeneration,
             transcriptVersion: session.transcriptVersion,
             toolStructureVersion: streaming.toolStructureVersion
-        )
+        ) == true
+        let presentation = preparedMatches
+            ? preparedHistoryPresentation!.presentation
+            : session.transcriptPlanner.presentation(
+                items: windowItems,
+                toolRuns: streaming.toolRuns,
+                visibleCount: windowItems.count,
+                transcriptVersion: session.transcriptVersion,
+                toolStructureVersion: streaming.toolStructureVersion
+            )
         let userTurnGroups = presentation.userTurnGroups
-        let runningSubagentToolCallIds = Set(
-            agentStore.agents.lazy
-                .filter { $0.state == .running }
-                .compactMap { $0.toolCallId }
-        )
+        let runningSubagentToolCallIds = subagentPresentation.runningToolCallIDs
         // Ordinary in-flight tool calls also keep their user turn expanded.
         let runningOrdinaryToolCallIds = Set(
             streaming.toolRuns.lazy
@@ -1204,10 +1840,7 @@ private struct StreamingTranscriptRows: View {
             orderedRowIDs: presentation.rows.map(\.id),
             naturallyVisibleRowIDs: naturallyVisibleSettledRowIDs
         )
-        let historyPageIsLoading: Bool = {
-            if case .loading = historyPageLoadState { return true }
-            return false
-        }()
+        let historyPageIsLoading = historyPreparation.isLoading
 
         // Intentionally eager but bounded to the one-way window (never lazy).
         // The inverted layout is newest-first: when history expands, older rows
@@ -1332,6 +1965,18 @@ private struct StreamingTranscriptRows: View {
                                 )
                                 .equatable()
                                 .id(transcriptID(item.id))
+                                .background {
+                                    // Mounted user prompts only: cache the full pre-flip
+                                    // layout rect for current-node association.
+                                    if presentation.userAuthoredLeafIDs.contains(item.id) {
+                                        MountedUserPromptAnchorReporter(
+                                            messageID: item.id,
+                                            mountedRange: window.range
+                                        )
+                                    }
+                                }
+                                .onAppear { onSeekRowAppeared(transcriptID(item.id)) }
+                                .onDisappear { onSeekRowDisappeared(transcriptID(item.id)) }
                                 .transcriptFlip()
                             }
                         case .assistantRun(let id, let entryId, let segments):
@@ -1379,6 +2024,8 @@ private struct StreamingTranscriptRows: View {
                                 )
                                 .equatable()
                                 .id(transcriptID(id))
+                                .onAppear { onSeekRowAppeared(transcriptID(id)) }
+                                .onDisappear { onSeekRowDisappeared(transcriptID(id)) }
                                 .transcriptFlip()
                             }
                         }
@@ -1389,26 +2036,23 @@ private struct StreamingTranscriptRows: View {
                 // measure or move the clip origin.
                 .overlay(alignment: .bottom) {
                     StickToBottomTracker(
-                        isPinned: $session.pinTranscriptToBottom,
+                        isPinned: seekAwarePinBinding,
                         pinEdge: .documentStart,
+                        automaticFollowAllowed: automaticFollowAllowed,
+                        automaticFollowGeneration: automaticFollowGeneration,
+                        followIntent: followIntent,
                         topLoadingEnabled: historyLoadingEnabled,
-                        onReachedTop: requestOlderHistoryPage
+                        historyPrefetchThreshold: TranscriptHistoryPrefetchTrigger.threshold(
+                            viewportHeight: viewportHeight
+                        ),
+                        onReachedTop: requestOlderHistoryPage,
+                        onLiveScrollChanged: handleHistoryLiveScroll,
+                        onUserRepinnedLatest: onUserRepinnedLatest,
+                        onUserScroll: { viewport in
+                            onUserScroll(viewport, window.range)
+                        }
                     )
                 }
-            }
-
-            if historyPageIsLoading {
-                HStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("正在加载更早消息…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 0)
-                }
-                .padding(.vertical, 4)
-                .transition(.opacity)
-                .transcriptFlip()
             }
 
             if presentation.rows.isEmpty,
@@ -1452,64 +2096,228 @@ private struct StreamingTranscriptRows: View {
                     .transcriptFlip()
             }
         }
+        // Overlay rather than a conditional transcript row: loading must not
+        // alter the inverted document's row tree or append geometry.
+        .overlay(alignment: .top) {
+            if historyPageIsLoading {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("正在加载更早消息…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(8)
+                .background(.regularMaterial, in: Capsule())
+                .transcriptFlip()
+            }
+        }
         // No window-replacement identity: the container must stay alive across
         // history expansion. Loading never reads row ids: the AppKit visual-top
         // edge loads one older page, whose rows append at layout end.
         .onChange(of: session.pinTranscriptToBottom) { _, newValue in
-            if newValue {
-                // Explicit transition: history browsing ends (jump-to-latest button
-                // or scrolled back near the bottom). Drop back to the latest
-                // page; the viewport is already bottom-pinned by the explicit
-                // scroll / StickToBottomTracker, so deleting above is safe.
-                transcriptOldestLoadedPage = nil
-                historyLoadGeneration += 1
-                historyPageLoadState = .idle
-                session.transcriptPlanner.invalidate()
-            }
+            if newValue { invalidateHistoryPreparation(clearCommittedPage: true) }
         }
         .onChange(of: session.id) { _, _ in
-            transcriptOldestLoadedPage = nil
-            historyLoadGeneration += 1
-            historyPageLoadState = .idle
-            session.transcriptPlanner.invalidate()
+            invalidateHistoryPreparation(clearCommittedPage: true)
         }
         .onChange(of: session.bridgeRoutingKey) { _, _ in
-            transcriptOldestLoadedPage = nil
-            historyLoadGeneration += 1
-            historyPageLoadState = .idle
+            invalidateHistoryPreparation(clearCommittedPage: true)
+        }
+        // Seek/navigation changes invalidate ready or pending pages before they
+        // can commit into another mounted window.
+        .onChange(of: viewportGeneration) { _, _ in
+            invalidateHistoryPreparation(clearCommittedPage: isSeeking)
+        }
+        .onChange(of: window.range) { _, _ in
+            // A history page / seek slice / live window shift can unmount rows.
+            // Clear only their geometry; current remains selected until fresh
+            // mounted anchors prove a new visible reading position.
+            onMountedUserPromptWindowChanged(window.range)
+            completePreparedHistoryCommitAfterWindowMutation(window)
+        }
+        .onAppear {
+            onMountedUserPromptWindowChanged(window.range)
+            // The scroll root is recreated per bridge key (`.id(...)` on the
+            // outer ScrollViewReader), so this host is freshly initialized on
+            // every session switch and rebinds to the current store here.
+            // Persisted-id rebind keeps both the key and `session.subagents`
+            // stable, so no separate rebind path is needed.
+            transcriptSubagents.bind(agentStore)
+        }
+        .onDisappear {
+            if followIntent.cancelHistoryCommit() {
+                onHistoryCommitDidFinish()
+            }
         }
     }
 
-    /// Expands exactly one older page when the user reaches visual history top.
-    /// Presentation rows are newest-first, so this state change appends older
-    /// rows at layout end and does not relocate the existing viewport.
+    /// Mounted raw-item window for the current viewport mode.
+    private func resolvedRenderWindow(itemCount: Int) -> TranscriptRenderWindow {
+        if let seekRange = seekMountedRange {
+            let lower = max(0, min(seekRange.lowerBound, itemCount))
+            let upper = max(lower, min(seekRange.upperBound, itemCount))
+            return TranscriptRenderWindow(range: lower..<upper, totalCount: itemCount)
+        }
+        // Pinned/live mode renders the latest warm window. Unpinned history
+        // moves one page at a time toward older pages; resolve hard-caps the eager
+        // span at maxPages so deep prefetch cannot mount the session.
+        return TranscriptRenderWindow.resolve(
+            itemCount: itemCount,
+            oldestLoadedPage: historyPreparation.committedPage
+        )
+    }
+
+    /// Pin binding that blocks accidental re-pin while seeking (local seek-window
+    /// bottom is not global latest). User scroll still reports via `onUserScroll`.
+    private var seekAwarePinBinding: Binding<Bool> {
+        Binding(
+            get: { session.pinTranscriptToBottom },
+            set: { newValue in
+                if isSeeking {
+                    // Never re-enter live pin from geometry while a seek window is up.
+                    if newValue { return }
+                    if session.pinTranscriptToBottom {
+                        session.pinTranscriptToBottom = false
+                    }
+                    return
+                }
+                // A user-unpin is intentionally deferred. If the user clicked
+                // jump-to-latest before that write ran, the parent has already
+                // returned ownership to `.live`, so this stale false must no-op.
+                if !newValue, !mayWritePersistentUserUnpin() { return }
+                session.pinTranscriptToBottom = newValue
+            }
+        )
+    }
+
+    /// Prepare the next immutable window/plan before touching the mounted page.
+    /// The async main-turn commit deliberately has no fixed delay: it is only a
+    /// safe turn boundary and is rejected if scrolling/session ownership changed.
     private func requestOlderHistoryPage() -> Bool {
-        let items = session.transcript
-        let startPage = transcriptOldestLoadedPage
-            ?? TranscriptRenderWindow.latestStartPage(itemCount: items.count)
-        var nextState = historyPageLoadState
-        guard let newStart = TranscriptHistoryPager.begin(
-            currentStartPage: startPage,
-            state: &nextState
+        guard !isSeeking, seekMountedRange == nil else { return false }
+        var state = historyPreparation
+        guard let request = TranscriptHistoryPreparation.request(
+            state: &state,
+            sessionKey: session.bridgeRoutingKey,
+            viewportGeneration: viewportGeneration,
+            itemCount: session.transcript.count
         ) else { return false }
-        historyPageLoadState = nextState
-        historyLoadGeneration += 1
-        let generation = historyLoadGeneration
-        let sessionKey = session.bridgeRoutingKey
-        // Publish `loading` before revealing the cached raw page. A short minimum
-        // display interval guarantees that the progress indicator reaches a
-        // rendered frame; prefetch begins 320pt before the hard edge, so this is
-        // normally hidden inside the user's approach gesture.
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 60_000_000)
-            guard generation == historyLoadGeneration,
-                  session.bridgeRoutingKey == sessionKey,
-                  historyPageLoadState == .loading(targetPage: newStart) else { return }
-            transcriptOldestLoadedPage = newStart
-            session.transcriptPlanner.invalidate()
-            historyPageLoadState = TranscriptHistoryPager.complete(loadedPage: newStart)
+        historyPreparation = state
+        Log.debug("history prepare begin", category: .session)
+
+        // Snapshot before plan construction; commit never recomputes this window.
+        let snapshot = session.transcript
+        let windowItems = Array(snapshot[request.window.range])
+        let presentation = session.transcriptPlanner.presentation(
+            items: windowItems,
+            toolRuns: streaming.toolRuns,
+            visibleCount: windowItems.count,
+            transcriptVersion: session.transcriptVersion,
+            toolStructureVersion: streaming.toolStructureVersion
+        )
+        guard request.window.totalCount == snapshot.count else { return false }
+        guard TranscriptHistoryPreparation.prepared(request, state: &state) else { return false }
+        historyPreparation = state
+        preparedHistoryPresentation = PreparedHistoryPresentation(
+            request: request,
+            presentation: presentation,
+            transcriptVersion: session.transcriptVersion,
+            toolStructureVersion: streaming.toolStructureVersion
+        )
+        Log.debug("history prepare end", category: .session)
+        DispatchQueue.main.async {
+            commitPreparedHistoryIfPossible(request)
         }
         return true
+    }
+
+    private func handleHistoryLiveScroll(_ isLive: Bool) {
+        // `didLiveScroll` can arrive once per display frame. This reference-only
+        // gate is a lifecycle edge, not a per-pixel state sink or log source.
+        guard historyLiveScrollGate.isLiveScrolling != isLive else { return }
+        historyLiveScrollGate.isLiveScrolling = isLive
+        if !isLive, let request = historyPreparation.request {
+            commitPreparedHistoryIfPossible(request)
+        }
+    }
+
+    private func commitPreparedHistoryIfPossible(_ request: TranscriptHistoryPreparation.Request) {
+        guard !historyLiveScrollGate.isLiveScrolling,
+              !isSeeking,
+              request.sessionKey == session.bridgeRoutingKey,
+              request.viewportGeneration == viewportGeneration,
+              preparedHistoryPresentation?.request == request
+        else { return }
+        var state = historyPreparation
+        // This only changes a local reducer value. The synchronous detach below
+        // must happen before assigning the committed window to SwiftUI.
+        guard TranscriptHistoryPreparation.beginCommit(request, state: &state) else { return }
+        let historyCommitToken = unpinForPreparedHistoryCommit(request)
+        historyPreparation = state
+        Log.debug("history commit begin", category: .session)
+        guard TranscriptHistoryPreparation.finishCommit(request, state: &state) else {
+            if historyCommitToken != nil, followIntent.cancelHistoryCommit() {
+                onHistoryCommitDidFinish()
+            }
+            return
+        }
+        historyPreparation = state
+        Log.debug("history commit end", category: .session)
+    }
+
+    /// Begins the shared intent transaction before `finishCommit` changes the
+    /// mounted range. Pinned non-scrollable safety backfill deliberately stays
+    /// on the normal live path; a real user owner detaches even inside 4pt.
+    private func unpinForPreparedHistoryCommit(
+        _ request: TranscriptHistoryPreparation.Request
+    ) -> TranscriptFollowIntent.HistoryCommitToken? {
+        guard onUserOwnedHistoryCommitWillBegin() else { return nil }
+        return followIntent.beginHistoryCommit(request: request)
+    }
+
+    /// Inverted history appends structurally preserve the visible anchor. Wait
+    /// until SwiftUI has observed the target window, then one main turn so any
+    /// document-frame callbacks from that layout see the active intent first.
+    private func completePreparedHistoryCommitAfterWindowMutation(_ window: TranscriptRenderWindow) {
+        guard let token = followIntent.activeHistoryCommit,
+              token.request.window == window
+        else { return }
+        let finish = onHistoryCommitDidFinish
+        DispatchQueue.main.async { [followIntent] in
+            guard followIntent.completeHistoryCommit(token) else { return }
+            finish()
+        }
+    }
+
+    private func invalidateHistoryPreparation(clearCommittedPage: Bool) {
+        if followIntent.cancelHistoryCommit() {
+            onHistoryCommitDidFinish()
+        }
+        var state = historyPreparation
+        TranscriptHistoryPreparation.invalidate(&state, clearCommittedPage: clearCommittedPage)
+        historyPreparation = state
+        preparedHistoryPresentation = nil
+    }
+
+    private struct PreparedHistoryPresentation {
+        let request: TranscriptHistoryPreparation.Request
+        let presentation: AssistantBlockLayout.TranscriptPresentation
+        let transcriptVersion: UInt64
+        let toolStructureVersion: UInt64
+
+        func matches(
+            window: TranscriptRenderWindow,
+            sessionKey: String,
+            viewportGeneration: UInt64,
+            transcriptVersion: UInt64,
+            toolStructureVersion: UInt64
+        ) -> Bool {
+            request.window == window
+                && request.sessionKey == sessionKey
+                && request.viewportGeneration == viewportGeneration
+                && self.transcriptVersion == transcriptVersion
+                && self.toolStructureVersion == toolStructureVersion
+        }
     }
 
     private func naturallyVisibleRowIDs(
@@ -1677,6 +2485,52 @@ private struct TranscriptViewportHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
+    }
+}
+
+/// Mounted user-row rectangles in pre-flip ScrollView document layout space.
+/// Every report carries its bounded raw-item window so a late preference from a
+/// previous history page can never be associated with the current AppKit clip.
+private struct MountedUserPromptAnchorReport: Equatable {
+    let mountedRange: Range<Int>
+    let anchor: UserPromptCurrentAssociation.Anchor
+}
+
+private struct MountedUserPromptAnchorKey: PreferenceKey {
+    static let layoutCoordinateSpaceName = "pipiui.transcriptLayoutDocument"
+    static var defaultValue: [MountedUserPromptAnchorReport] = []
+    static func reduce(
+        value: inout [MountedUserPromptAnchorReport],
+        nextValue: () -> [MountedUserPromptAnchorReport]
+    ) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
+/// Preference reporter for one mounted user prompt row.
+private struct MountedUserPromptAnchorReporter: View {
+    let messageID: String
+    let mountedRange: Range<Int>
+
+    var body: some View {
+        GeometryReader { geo in
+            // The named coordinate space sits inside the ScrollView content and
+            // before the outer `.transcriptFlip()`, so this frame is stable in
+            // document layout coordinates rather than transient viewport space.
+            let frame = geo.frame(in: .named(MountedUserPromptAnchorKey.layoutCoordinateSpaceName))
+            Color.clear.preference(
+                key: MountedUserPromptAnchorKey.self,
+                value: [
+                    MountedUserPromptAnchorReport(
+                        mountedRange: mountedRange,
+                        anchor: UserPromptCurrentAssociation.Anchor(
+                            messageID: messageID,
+                            layoutFrame: frame
+                        )
+                    ),
+                ]
+            )
+        }
     }
 }
 
@@ -1871,7 +2725,17 @@ enum StickToBottomLogic {
 /// loading gate is disabled. This moves one-page layout work ahead of the hard
 /// edge instead of making the user's gesture pay for it at the top.
 enum TranscriptHistoryPrefetchTrigger {
-    static let approachThreshold: CGFloat = 320
+    static let minimumThreshold: CGFloat = 640
+    /// Compatibility name for the former fixed threshold; the runtime now uses
+    /// `threshold(viewportHeight:)` but source-level integrations still refer to it.
+    static let approachThreshold: CGFloat = minimumThreshold
+    static let maximumThreshold: CGFloat = 2_400
+
+    /// Two visible screens, bounded for tiny and ultrawide viewports.
+    static func threshold(viewportHeight: CGFloat) -> CGFloat {
+        let height = viewportHeight.isFinite ? max(0, viewportHeight) : 0
+        return min(max(height * 2, minimumThreshold), maximumThreshold)
+    }
 
     struct State: Equatable {
         var isInsideApproachBand = false
@@ -1884,22 +2748,205 @@ enum TranscriptHistoryPrefetchTrigger {
     ///   - enabled: false while pinned, when the effective start page is 0, or
     ///     before the user has actually scrolled in this attachment (attach seed
     ///     and programmatic bottom scrolls must never auto-load).
-    ///   - threshold: near-top preload distance; defaults to `approachThreshold`.
+    ///   - threshold: viewport-derived near-top preload distance.
     /// - Returns: `true` exactly once per approach-band entry while enabled.
     static func step(
         state: inout State,
         distanceFromDocumentStart: CGFloat,
         enabled: Bool,
-        threshold: CGFloat = approachThreshold
+        threshold: CGFloat = minimumThreshold
     ) -> Bool {
         guard enabled else {
+            guard state.isInsideApproachBand else { return false }
             state.isInsideApproachBand = false
             return false
         }
         let isInside = distanceFromDocumentStart <= threshold
-        defer { state.isInsideApproachBand = isInside }
-        return isInside && !state.isInsideApproachBand
+        guard isInside != state.isInsideApproachBand else { return false }
+        state.isInsideApproachBand = isInside
+        return isInside
     }
+}
+
+/// Pure immediate-follow decision: persistent pin can be coalesced later, but
+/// the first upward gesture must stop stream-follow in the same event.
+enum TranscriptFollowSuppression {
+    /// Reference-owned by the AppKit coordinator. It is deliberately not
+    /// Observable: live scroll pulses must not invalidate the transcript body.
+    ///
+    /// The state separates an immediate user-intent barrier from the coalesced
+    /// persistent binding write. A stale automatic re-pin is never allowed to
+    /// cross that barrier; only a fresh user re-pin or an explicit latest jump
+    /// may resume automatic follow.
+    struct State {
+        private(set) var isSuppressed = false
+        private var pendingPersistentPin: Bool?
+        private var writeScheduled = false
+        /// Invalidates queued automatic follow work as soon as user intent changes.
+        private(set) var generation: UInt64 = 0
+
+        /// Returns true only when the immediate intent barrier actually changes.
+        /// Repeated bounds/live-scroll callbacks during one user-owned gesture
+        /// must not keep invalidating queued work or mutating coordinator state.
+        @discardableResult
+        mutating func suppressImmediately() -> Bool {
+            // A queued true still needs one invalidation/removal even if another
+            // path already marked the user detached. Otherwise this is a no-op.
+            guard !isSuppressed || pendingPersistentPin == true else { return false }
+            generation &+= 1
+            isSuppressed = true
+            // An older queued re-pin is not user intent and must not survive the
+            // first upward gesture. The caller immediately replaces it with false.
+            if pendingPersistentPin == true {
+                pendingPersistentPin = nil
+            }
+            return true
+        }
+
+        /// Only a confirmed user return to the latest edge may reopen follow.
+        @discardableResult
+        mutating func resumeAfterUserRepin() -> Bool {
+            guard isSuppressed else { return false }
+            generation &+= 1
+            isSuppressed = false
+            return true
+        }
+
+        /// Explicit jump-to-latest / session reset cancels an obsolete deferred
+        /// unpin because the host has already made latest the new user intent.
+        @discardableResult
+        mutating func resumeForExplicitLatest() -> Bool {
+            guard isSuppressed || pendingPersistentPin != nil else { return false }
+            generation &+= 1
+            isSuppressed = false
+            pendingPersistentPin = nil
+            return true
+        }
+
+        mutating func enqueuePersistentPin(_ value: Bool) -> Bool {
+            // `true` without an explicit resume is necessarily stale/automatic
+            // while detached. False remains admissible so repeated live-scroll
+            // pulses coalesce to the one user-unpin write.
+            guard !value || !isSuppressed else { return false }
+            // Keep a queued value stable across every later bounds callback. A
+            // different value may replace an already-scheduled stale write, but
+            // reuses its existing main-turn task rather than cancel/requeue it.
+            guard pendingPersistentPin != value else { return false }
+            pendingPersistentPin = value
+            guard !writeScheduled else { return false }
+            writeScheduled = true
+            return true
+        }
+
+        mutating func takePersistentPin() -> Bool? {
+            writeScheduled = false
+            defer { pendingPersistentPin = nil }
+            return pendingPersistentPin
+        }
+
+        /// Persistent writes do not change intent. In particular, a delayed true
+        /// write must never clear a newer user-unpin suppression.
+        mutating func didWritePersistentPin(_: Bool) {}
+
+        func isCurrent(_ scheduledGeneration: UInt64) -> Bool {
+            generation == scheduledGeneration
+        }
+
+        func allowsFollow(isPinned: Bool) -> Bool {
+            isPinned && !isSuppressed
+        }
+    }
+}
+
+/// Shared non-observable follow intent for one transcript root. The tracker and
+/// prepared-history host use the same `TranscriptFollowSuppression.State`, so a
+/// history window cannot grow between a user detach and its persistent pin write.
+final class TranscriptFollowIntent {
+    struct HistoryCommitToken: Equatable {
+        let request: TranscriptHistoryPreparation.Request
+        let generation: UInt64
+    }
+
+    private var suppression = TranscriptFollowSuppression.State()
+    private var nextHistoryCommitGeneration: UInt64 = 0
+    private(set) var activeHistoryCommit: HistoryCommitToken?
+
+    var generation: UInt64 { suppression.generation }
+    var isHistoryCommitActive: Bool { activeHistoryCommit != nil }
+
+    func suppressImmediately() {
+        suppression.suppressImmediately()
+    }
+
+    func resumeAfterUserRepin() {
+        // A short in-flight history layout must finish/cancel before a geometry
+        // callback can resume latest follow under the user's pointer.
+        guard activeHistoryCommit == nil else { return }
+        suppression.resumeAfterUserRepin()
+    }
+
+    func resumeForExplicitLatest() {
+        activeHistoryCommit = nil
+        suppression.resumeForExplicitLatest()
+    }
+
+    func enqueuePersistentPin(_ value: Bool) -> Bool {
+        suppression.enqueuePersistentPin(value)
+    }
+
+    func takePersistentPin() -> Bool? {
+        suppression.takePersistentPin()
+    }
+
+    func didWritePersistentPin(_ value: Bool) {
+        suppression.didWritePersistentPin(value)
+    }
+
+    func isCurrent(_ scheduledGeneration: UInt64) -> Bool {
+        suppression.isCurrent(scheduledGeneration)
+    }
+
+    func beginHistoryCommit(
+        request: TranscriptHistoryPreparation.Request
+    ) -> HistoryCommitToken {
+        if let activeHistoryCommit { return activeHistoryCommit }
+        nextHistoryCommitGeneration &+= 1
+        // Invalidates an already-scheduled document follow immediately. The host
+        // writes persistent false synchronously through the viewport reducer.
+        suppression.suppressImmediately()
+        let token = HistoryCommitToken(
+            request: request,
+            generation: nextHistoryCommitGeneration
+        )
+        activeHistoryCommit = token
+        return token
+    }
+
+    @discardableResult
+    func completeHistoryCommit(_ token: HistoryCommitToken) -> Bool {
+        guard activeHistoryCommit == token else { return false }
+        activeHistoryCommit = nil
+        // Do not resume suppression here: completion means layout is stable, not
+        // that the user asked to return to the latest edge.
+        return true
+    }
+
+    @discardableResult
+    func cancelHistoryCommit() -> Bool {
+        guard activeHistoryCommit != nil else { return false }
+        activeHistoryCommit = nil
+        return true
+    }
+
+    func allowsAutomaticFollow(isPinned: Bool) -> Bool {
+        activeHistoryCommit == nil && suppression.allowsFollow(isPinned: isPinned)
+    }
+}
+
+/// Non-observable: live scroll pulses must not invalidate SwiftUI just to defer
+/// a prepared history commit.
+private final class TranscriptHistoryLiveScrollGate {
+    var isLiveScrolling = false
 }
 
 /// ScrollView 的 AppKit 观察器：用户手势更新 pin，pinned 内容增长时跟随
@@ -1910,23 +2957,49 @@ struct StickToBottomTracker: NSViewRepresentable {
     @Binding var isPinned: Bool
     var threshold: CGFloat = StickToBottomLogic.rePinThreshold
     var pinEdge: StickPinEdge = .documentEnd
+    /// Parent viewport ownership gate. False immediately after user takeover,
+    /// even while the persistent pin binding is still coalescing to false.
+    var automaticFollowAllowed: Bool = true
+    /// Explicit latest/session intent generation used to release local suppression.
+    var automaticFollowGeneration: UInt64 = 0
+    /// Shared user/history intent. It is reference-only, so a commit can close
+    /// follow before SwiftUI mutates the transcript document.
+    var followIntent: TranscriptFollowIntent = TranscriptFollowIntent()
     /// History-top loading gate: `true` while unpinned and the effective window
     /// start page is above 0. While false the exact-top edge state is reset and
     /// `onReachedTop` never fires.
     var topLoadingEnabled: Bool = false
+    var historyPrefetchThreshold: CGFloat = TranscriptHistoryPrefetchTrigger.minimumThreshold
     /// Fired exactly once per false→true exact-top edge while `topLoadingEnabled`
     /// and the user has scrolled in this attachment. Returns `true` when the
     /// SwiftUI side actually loaded one older page (start page decremented);
     /// `false` when pinned or no older page exists.
     var onReachedTop: (() -> Bool)? = nil
+    /// Reference-only lifecycle signal; does not invalidate SwiftUI during pulses.
+    var onLiveScrollChanged: ((Bool) -> Void)? = nil
+    /// Fired after an actual user re-enters the latest edge and the persistent
+    /// pin binding has been written. The parent restores `.live` scroll ownership.
+    var onUserRepinnedLatest: (() -> Void)? = nil
+    /// Fired on attributed user scroll (live wheel/trackpad or scroller-knob drag)
+    /// with the current pre-flip document clip. Seek jump coordination uses this
+    /// to cancel finite corrections and rail current uses it to recompute from
+    /// cached row geometry without waiting for a SwiftUI preference update.
+    var onUserScroll: ((UserPromptCurrentAssociation.Viewport) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             isPinned: $isPinned,
             threshold: threshold,
             pinEdge: pinEdge,
+            automaticFollowAllowed: automaticFollowAllowed,
+            automaticFollowGeneration: automaticFollowGeneration,
+            followIntent: followIntent,
             topLoadingEnabled: topLoadingEnabled,
-            onReachedTop: onReachedTop
+            historyPrefetchThreshold: historyPrefetchThreshold,
+            onReachedTop: onReachedTop,
+            onLiveScrollChanged: onLiveScrollChanged,
+            onUserRepinnedLatest: onUserRepinnedLatest,
+            onUserScroll: onUserScroll
         )
     }
 
@@ -1945,11 +3018,20 @@ struct StickToBottomTracker: NSViewRepresentable {
         context.coordinator.isPinned = $isPinned
         context.coordinator.threshold = threshold
         context.coordinator.pinEdge = pinEdge
+        context.coordinator.followIntent = followIntent
+        context.coordinator.updateAutomaticFollow(
+            allowed: automaticFollowAllowed,
+            generation: automaticFollowGeneration
+        )
         // Refresh the history-top gate and callback on every body pass so a
         // session rebind/switch can never leave a stale closure behind.
         let loadingGateChanged = context.coordinator.topLoadingEnabled != topLoadingEnabled
         context.coordinator.topLoadingEnabled = topLoadingEnabled
+        context.coordinator.historyPrefetchThreshold = historyPrefetchThreshold
         context.coordinator.onReachedTop = onReachedTop
+        context.coordinator.onLiveScrollChanged = onLiveScrollChanged
+        context.coordinator.onUserRepinnedLatest = onUserRepinnedLatest
+        context.coordinator.onUserScroll = onUserScroll
         // Do not re-attach on every SwiftUI body pass — only when not yet wired.
         context.coordinator.ensureAttached(from: nsView)
         // The gate just flipped (e.g. the user unpinned while already at the
@@ -1973,12 +3055,26 @@ struct StickToBottomTracker: NSViewRepresentable {
         var isPinned: Binding<Bool>
         var threshold: CGFloat
         var pinEdge: StickPinEdge
+        /// Viewport ownership denies stream/document/recovery writes immediately
+        /// after a user takes scroll ownership.
+        var automaticFollowAllowed: Bool
+        /// Last explicit latest/session intent observed by this tracker.
+        private var automaticFollowGeneration: UInt64
+        /// Shared with `StreamingTranscriptRows` so prepared history can
+        /// synchronously invalidate a queued document follow before row mutation.
+        var followIntent: TranscriptFollowIntent
         /// History-top loading gate, refreshed by `updateNSView` each body pass.
         var topLoadingEnabled: Bool
+        var historyPrefetchThreshold: CGFloat
         /// Exact-top edge callback, refreshed by `updateNSView` each body pass so
         /// a rebind can never fire a stale session's closure. Returns `true` only
         /// when the SwiftUI side actually loaded an older page.
         var onReachedTop: (() -> Bool)?
+        var onLiveScrollChanged: ((Bool) -> Void)?
+        var onUserRepinnedLatest: (() -> Void)?
+        /// User-scroll callback, refreshed each body pass with the current
+        /// pre-flip layout clip (seek cancel + rail-current path).
+        var onUserScroll: ((UserPromptCurrentAssociation.Viewport) -> Void)?
         private weak var scrollView: NSScrollView?
         /// Exposed so `updateNSView` can re-apply overlay style after SwiftUI resets it.
         var attachedScrollView: NSScrollView? { scrollView }
@@ -1988,8 +3084,6 @@ struct StickToBottomTracker: NSViewRepresentable {
         private var documentFrameObs: NSObjectProtocol?
         private var documentBoundsObs: NSObjectProtocol?
         private var attachAttempts = 0
-        private var pinWriteScheduled = false
-        private var pendingPinValue: Bool?
         /// Clip bounds changes arrive for every scroller-knob movement. Process at
         /// most one attributed drag update per main-loop turn so the pin state
         /// machine cannot feed SwiftUI layout back into the drag continuously.
@@ -2006,6 +3100,9 @@ struct StickToBottomTracker: NSViewRepresentable {
         /// edge may load anything. Attach seed, initial layout, and programmatic
         /// bottom scrolls must never auto-load history.
         private var hasObservedUserScroll = false
+        /// didLiveScroll is display-rate; the rows host consumes only lifecycle
+        /// edges so it never receives a state/log callback for every pixel.
+        private var isLiveScrollActive = false
         /// Invalidates a queued bounds update if this coordinator is detached and
         /// later attached to another scroll view before the next main-loop turn.
         private var boundsUpdateGeneration = 0
@@ -2014,17 +3111,48 @@ struct StickToBottomTracker: NSViewRepresentable {
             isPinned: Binding<Bool>,
             threshold: CGFloat,
             pinEdge: StickPinEdge,
+            automaticFollowAllowed: Bool,
+            automaticFollowGeneration: UInt64,
+            followIntent: TranscriptFollowIntent,
             topLoadingEnabled: Bool,
-            onReachedTop: (() -> Bool)?
+            historyPrefetchThreshold: CGFloat,
+            onReachedTop: (() -> Bool)?,
+            onLiveScrollChanged: ((Bool) -> Void)?,
+            onUserRepinnedLatest: (() -> Void)?,
+            onUserScroll: ((UserPromptCurrentAssociation.Viewport) -> Void)?
         ) {
             self.isPinned = isPinned
             self.threshold = threshold
             self.pinEdge = pinEdge
+            self.automaticFollowAllowed = automaticFollowAllowed
+            self.automaticFollowGeneration = automaticFollowGeneration
+            self.followIntent = followIntent
             self.topLoadingEnabled = topLoadingEnabled
+            self.historyPrefetchThreshold = historyPrefetchThreshold
             self.onReachedTop = onReachedTop
+            self.onLiveScrollChanged = onLiveScrollChanged
+            self.onUserRepinnedLatest = onUserRepinnedLatest
+            self.onUserScroll = onUserScroll
         }
 
         deinit { detach() }
+
+        /// A new generation is emitted only for an explicit return-to-latest or
+        /// session/navigation reset. It is the sole non-user way to clear the
+        /// immediate local suppression; ordinary live-scroll end never does.
+        func updateAutomaticFollow(allowed: Bool, generation: UInt64) {
+            let didReceiveExplicitLatestIntent = automaticFollowGeneration != generation
+            if automaticFollowAllowed != allowed {
+                automaticFollowAllowed = allowed
+            }
+            if automaticFollowGeneration != generation {
+                automaticFollowGeneration = generation
+            }
+            guard didReceiveExplicitLatestIntent,
+                  allowed,
+                  isPinned.wrappedValue else { return }
+            followIntent.resumeForExplicitLatest()
+        }
 
         /// Idempotent: skip if observers already live on a scroll view.
         func ensureAttached(from view: NSView) {
@@ -2048,6 +3176,8 @@ struct StickToBottomTracker: NSViewRepresentable {
                 ) { [weak self] _ in
                     guard let self, self.scrollView?.window?.inLiveResize != true else { return }
                     self.hasObservedUserScroll = true
+                    self.reportLiveScrollChange(true)
+                    self.reportUserScrollViewport()
                     self.updatePinFromUserScroll(userLiveScroll: true)
                     self.scheduleTopEdgeEvaluation()
                 }
@@ -2058,6 +3188,8 @@ struct StickToBottomTracker: NSViewRepresentable {
                 ) { [weak self] _ in
                     guard let self, self.scrollView?.window?.inLiveResize != true else { return }
                     self.hasObservedUserScroll = true
+                    self.reportLiveScrollChange(false)
+                    self.reportUserScrollViewport()
                     self.updatePinFromUserScroll(userLiveScroll: true)
                     self.scheduleTopEdgeEvaluation()
                 }
@@ -2087,6 +3219,7 @@ struct StickToBottomTracker: NSViewRepresentable {
                     // frequency, so coalesce them to one state-machine entry per
                     // runloop.
                     self.hasObservedUserScroll = true
+                    self.reportUserScrollViewport()
                     self.scheduleKnobDragPinUpdate()
                 }
                 if let document = sv.documentView {
@@ -2138,32 +3271,41 @@ struct StickToBottomTracker: NSViewRepresentable {
             documentFrameObs = nil
             documentBoundsObs = nil
             scrollView = nil
-            pinWriteScheduled = false
-            pendingPinValue = nil
             knobDragUpdateScheduled = false
             contentFollowScheduled = false
             topEdgeEvaluationScheduled = false
             hasObservedUserScroll = false
+            isLiveScrollActive = false
             boundsUpdateGeneration += 1
         }
 
         private func schedulePinnedContentFollow() {
-            guard isPinned.wrappedValue, !contentFollowScheduled else { return }
+            guard !contentFollowScheduled, allowsAutomaticFollow() else { return }
             // Freeze follow while the scroller knob is held so streaming reflow
-            // cannot steal the origin mid-drag. Re-check inside the async hop.
-            guard allowsContentFollowNow() else { return }
+            // cannot steal the origin mid-drag. Capture both attachment and
+            // user-intent generations; an unpin between frame notification and
+            // this main-turn follow invalidates the pending clip mutation.
             contentFollowScheduled = true
-            let generation = boundsUpdateGeneration
+            let boundsGeneration = boundsUpdateGeneration
+            let followGeneration = followIntent.generation
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.boundsUpdateGeneration == generation else { return }
+                guard let self, self.boundsUpdateGeneration == boundsGeneration else { return }
                 self.contentFollowScheduled = false
+                guard self.followIntent.isCurrent(followGeneration),
+                      self.allowsAutomaticFollow()
+                else { return }
                 self.followPinnedContentGrowth()
             }
         }
 
-        private func allowsContentFollowNow() -> Bool {
+        /// One gate for all automatic content-follow paths. The parent ownership
+        /// check blocks stream append / proxy recovery after user takeover; the
+        /// local intent barrier closes the persistent-pin coalescing gap.
+        private func allowsAutomaticFollow() -> Bool {
+            guard automaticFollowAllowed else { return false }
             let inLiveResize = scrollView?.window?.inLiveResize == true
-            return StickToBottomLogic.allowsPinnedContentFollow(
+            return followIntent.allowsAutomaticFollow(isPinned: isPinned.wrappedValue)
+                && StickToBottomLogic.allowsPinnedContentFollow(
                 isPinned: isPinned.wrappedValue,
                 mouseButtonsDown: Int(NSEvent.pressedMouseButtons),
                 windowInLiveResize: inLiveResize
@@ -2214,14 +3356,52 @@ struct StickToBottomTracker: NSViewRepresentable {
             if TranscriptHistoryPrefetchTrigger.step(
                 state: &topEdgeState,
                 distanceFromDocumentStart: distance,
-                enabled: topLoadingEnabled && (hasObservedUserScroll || documentNeedsBackfill)
+                enabled: topLoadingEnabled && (hasObservedUserScroll || documentNeedsBackfill),
+                threshold: historyPrefetchThreshold
             ) {
                 _ = onReachedTop?()
             }
         }
 
+        /// Report a real live-scroll lifecycle transition once. The callback is
+        /// reference-only, but avoiding display-rate invocation also keeps any
+        /// structured lifecycle diagnostics transition-scoped.
+        private func reportLiveScrollChange(_ isLive: Bool) {
+            guard isLiveScrollActive != isLive else { return }
+            isLiveScrollActive = isLive
+            onLiveScrollChanged?(isLive)
+        }
+
+        /// Snapshot the current AppKit clip on every scroll event positively
+        /// attributed to a user. The transcript is visually flipped but its
+        /// SwiftUI anchor cache is pre-flip layout space, so convert an
+        /// unflipped AppKit document explicitly before emitting the callback.
+        /// Programmatic clip changes never call this method.
+        private func reportUserScrollViewport() {
+            // The parent owns the durable `.user` state, but its next SwiftUI
+            // update has not necessarily reached this coordinator yet. Close the
+            // local writer gate synchronously so a document-frame callback in
+            // this same event cannot write the clip back under the user.
+            if automaticFollowAllowed {
+                automaticFollowAllowed = false
+            }
+            guard let scrollView,
+                  let document = scrollView.documentView
+            else { return }
+            let layoutVisibleRect = UserPromptCurrentAssociation.layoutVisibleRect(
+                documentVisibleRect: scrollView.documentVisibleRect,
+                documentBounds: document.bounds,
+                documentIsFlipped: document.isFlipped
+            )
+            let viewport = UserPromptCurrentAssociation.Viewport(
+                layoutVisibleRect: layoutVisibleRect
+            )
+            guard viewport.isUsable else { return }
+            onUserScroll?(viewport)
+        }
+
         private func followPinnedContentGrowth() {
-            guard allowsContentFollowNow(),
+            guard allowsAutomaticFollow(),
                   let scrollView,
                   let document = scrollView.documentView else { return }
             let clip = scrollView.contentView
@@ -2271,18 +3451,24 @@ struct StickToBottomTracker: NSViewRepresentable {
                 allowRepin: allowRepin
             )
             guard let desired else { return }
-            // Unpin from a live wheel/trackpad scroll synchronously so in-flight
-            // jump / width-recover see `pin == false` this runloop.
+            // First upward gesture suppresses follow immediately; persistent pin
+            // is coalesced onto a safe main turn, never written in didLiveScroll.
             if desired == false, userLiveScroll {
-                pendingPinValue = nil
-                writePin(false)
+                followIntent.suppressImmediately()
+                schedulePinWrite(false)
                 return
+            }
+            if desired {
+                // Only an actual user arrival at the latest edge may clear the
+                // barrier. didEndLiveScroll / geometry callbacks never do.
+                followIntent.resumeAfterUserRepin()
             }
             // Re-pin / other writes: bounce to next runloop (avoid layout feedback).
             schedulePinWrite(desired)
         }
 
         private func writePin(_ value: Bool) {
+            followIntent.didWritePersistentPin(value)
             guard isPinned.wrappedValue != value else { return }
             // Avoid implicit animation / transition thrash on the jump-to-bottom control.
             var transaction = Transaction()
@@ -2290,17 +3476,17 @@ struct StickToBottomTracker: NSViewRepresentable {
             withTransaction(transaction) {
                 isPinned.wrappedValue = value
             }
+            if value {
+                // A geometry true can only originate in an attributed user scroll
+                // (all programmatic geometry returns nil from desiredPin).
+                onUserRepinnedLatest?()
+            }
         }
 
         private func schedulePinWrite(_ value: Bool) {
-            pendingPinValue = value
-            guard !pinWriteScheduled else { return }
-            pinWriteScheduled = true
+            guard followIntent.enqueuePersistentPin(value) else { return }
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.pinWriteScheduled = false
-                guard let pending = self.pendingPinValue else { return }
-                self.pendingPinValue = nil
+                guard let self, let pending = self.followIntent.takePersistentPin() else { return }
                 self.writePin(pending)
             }
         }

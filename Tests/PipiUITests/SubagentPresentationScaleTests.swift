@@ -193,27 +193,80 @@ final class SubagentPresentationScaleTests: XCTestCase {
 
     // MARK: - 失败处置分类（已清理 / 需关注）
 
-    func testFailedCleanedCountsAsCleaned() {
+    func testFailedCleanedRetainsFailureBadgeAndAddsSeparateHandledBadge() {
         var cleaned = agent(0, state: .failed)
         cleaned.closeoutDisposition = .cleaned
 
         let summary = SubagentPresentationScale.summary(for: [cleaned])
+        let row = SubagentPresentationScale.rowPresentation(for: cleaned)
 
         XCTAssertEqual(summary.failedCount, 1)
         XCTAssertEqual(summary.failedCleanedCount, 1)
         XCTAssertEqual(summary.failedAttentionCount, 0)
+        XCTAssertEqual(row.iconName, "xmark.circle.fill")
+        XCTAssertEqual(row.tone, .danger)
+        XCTAssertEqual(row.terminalBadgeText, "失败·需处理")
+        XCTAssertEqual(row.handledBadgeText, "已处理")
+        XCTAssertEqual(row.statusText, "失败·需处理 · 已处理")
+        XCTAssertFalse(row.terminalBadgeText?.contains("已处理·本次") == true)
+        XCTAssertFalse(row.needsAttention)
+        XCTAssertFalse(row.canMarkHandled)
+        XCTAssertNil(row.lifecycleWarning)
     }
 
-    func testFailedRetainedNeedsAttention() {
+    func testFailedRetainedNeedsAttentionAndPresentsOpenFailure() {
         // retained 可能是验证失败或自动合并/清理被禁止而保留待复核，因此计入需关注。
         var retained = agent(0, state: .failed)
         retained.closeoutDisposition = .retained
 
         let summary = SubagentPresentationScale.summary(for: [retained])
+        let row = SubagentPresentationScale.rowPresentation(for: retained)
 
         XCTAssertEqual(summary.failedCount, 1)
         XCTAssertEqual(summary.failedCleanedCount, 0)
         XCTAssertEqual(summary.failedAttentionCount, 1)
+        XCTAssertEqual(row.iconName, "xmark.circle.fill")
+        XCTAssertEqual(row.tone, .danger)
+        XCTAssertEqual(row.terminalBadgeText, "失败·需处理")
+        XCTAssertNil(row.handledBadgeText)
+        XCTAssertTrue(row.needsAttention)
+        XCTAssertTrue(row.canMarkHandled)
+        XCTAssertEqual(row.lifecycleWarning?.title, "本次执行未成功")
+    }
+
+    func testCleanedAbortedAndInterruptedRetainTerminalBadgeAndAddHandledBadge() {
+        let cases: [(SubagentInfo.State, String, SubagentPresentationScale.LifecycleTone, String)] = [
+            (.aborted, "stop.circle.fill", .warning, "已中止·需处理"),
+            (.interrupted, "bolt.slash.circle.fill", .warning, "已中断·需处理"),
+        ]
+
+        for (state, expectedIcon, expectedTone, expectedTerminalText) in cases {
+            var handled = agent(0, state: state)
+            handled.closeoutDisposition = .cleaned
+            let row = SubagentPresentationScale.rowPresentation(for: handled)
+
+            XCTAssertEqual(row.iconName, expectedIcon)
+            XCTAssertEqual(row.tone, expectedTone)
+            XCTAssertEqual(row.terminalBadgeText, expectedTerminalText)
+            XCTAssertEqual(row.handledBadgeText, "已处理")
+            XCTAssertEqual(row.statusText, "\(expectedTerminalText) · 已处理")
+            XCTAssertFalse(row.needsAttention)
+            XCTAssertFalse(row.canMarkHandled)
+            XCTAssertNil(row.lifecycleWarning)
+        }
+    }
+
+    func testFailedCompletedOutputStillShowsLifecycleWarning() {
+        var failed = agent(0, state: .failed)
+        failed.closeoutDisposition = .retained
+        failed.output = "Completed: all requested work is done."
+
+        let row = SubagentPresentationScale.rowPresentation(for: failed)
+
+        XCTAssertEqual(failed.state, .failed)
+        XCTAssertTrue(row.needsAttention)
+        XCTAssertEqual(row.lifecycleWarning?.title, "本次执行未成功")
+        XCTAssertTrue(row.lifecycleWarning?.message.contains("不代表任务已成功") == true)
     }
 
     func testFailedUnclassifiedFixerUserNeedAttention() {
@@ -284,7 +337,7 @@ final class SubagentPresentationScaleTests: XCTestCase {
         pendingUser.closeoutDisposition = .needsUser
 
         let allCleaned = SubagentPresentationScale.summary(for: [cleaned])
-        XCTAssertEqual(SubagentPresentationScale.failureText(allCleaned), "1 失败·已清理")
+        XCTAssertEqual(SubagentPresentationScale.failureText(allCleaned), "1 失败·已处理")
 
         let mixed = SubagentPresentationScale.summary(for: [cleaned, retained, pending])
         XCTAssertEqual(SubagentPresentationScale.failureText(mixed), "3 失败·2 需关注")
@@ -292,11 +345,12 @@ final class SubagentPresentationScaleTests: XCTestCase {
         let allAttention = SubagentPresentationScale.summary(for: [pending, pendingUser])
         XCTAssertEqual(SubagentPresentationScale.failureText(allAttention), "2 失败·需关注")
 
+        XCTAssertTrue(SubagentPresentationScale.failureHelp(mixed).contains("本次执行已成功"))
         XCTAssertTrue(SubagentPresentationScale.failureHelp(mixed).contains("不代表底层失败已修复或用户已确认"))
-        XCTAssertTrue(SubagentPresentationScale.failureHelp(mixed).contains("已清理 1"))
+        XCTAssertTrue(SubagentPresentationScale.failureHelp(mixed).contains("已处理 1"))
         XCTAssertTrue(SubagentPresentationScale.failureHelp(mixed).contains("需关注 2"))
         XCTAssertTrue(SubagentPresentationScale.failureHelp(mixed).contains("保留待复核"))
-        XCTAssertTrue(SubagentPresentationScale.failureHelp(mixed).contains("清理已完成"))
+        XCTAssertTrue(SubagentPresentationScale.failureHelp(mixed).contains("已明确处置"))
     }
 
     private func agent(

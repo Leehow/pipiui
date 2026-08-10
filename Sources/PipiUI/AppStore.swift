@@ -236,6 +236,11 @@ final class AppStore: ObservableObject {
 
     private var bridge: BridgeServer?
     private var plugin = PiPlugin.Installed()
+    /// Observable thin-host state for the formal managed memory package.
+    @Published private(set) var memoryBrokerStatus: MemoryBrokerRuntimeStatus = .disabled
+    /// One background package stage/install at a time. The work itself is
+    /// detached from Settings/spawn's UI path; completion returns to MainActor.
+    private var memoryBrokerInstallationTask: Task<Void, Never>?
     /// Immutable JSONL snapshots only. This cache never constructs ChatSession/PiProcess.
     private let historyPreloader = SessionHistoryPreloader()
 
@@ -351,6 +356,83 @@ final class AppStore: ObservableObject {
             return
         }
         restartAllOpenSessions()
+    }
+
+    /// One-step optional Memory Broker enablement. A package install failure is
+    /// recorded as degraded and never blocks a normal Pi session. npm/staging
+    /// always runs in a detached task; a successful install automatically
+    /// restarts current Pi sessions so the user never needs a second enable step.
+    func setMemoryBrokerEnabled(_ enabled: Bool) {
+        MemoryBrokerSettings.setEnabled(enabled)
+        guard enabled else {
+            memoryBrokerStatus = .disabled
+            restartAllOpenSessions()
+            return
+        }
+
+        let resolution = MemoryBrokerRuntime.resolveForMainSession(enabled: true)
+        memoryBrokerStatus = resolution.status
+        if resolution.entrypoint != nil {
+            restartAllOpenSessions()
+        } else {
+            scheduleMemoryBrokerInstallationIfNeeded()
+        }
+    }
+
+    private func scheduleMemoryBrokerInstallationIfNeeded() {
+        guard MemoryBrokerSettings.isEnabled() else { return }
+        if memoryBrokerInstallationTask != nil {
+            if memoryBrokerStatus.state != .ready {
+                memoryBrokerStatus = .installing
+            }
+            return
+        }
+
+        memoryBrokerStatus = .installing
+        let bundledPackagesRoot = plugin.memoryBrokerBundledPackagesRoot
+        memoryBrokerInstallationTask = MemoryBrokerBackgroundInstall.start(
+            operation: {
+                // Legacy data preparation is ordinary app-owned file I/O, but
+                // it belongs beside npm staging so Settings never waits on it.
+                if FileManager.default.fileExists(
+                    atPath: ControlledMemoryMigration.legacyRoot().appendingPathComponent("approved.json").path
+                ) {
+                    _ = try? ControlledMemoryMigration.prepare()
+                }
+                return MemoryBrokerRuntime.installForMainSession(
+                    bundledPackagesRoot: bundledPackagesRoot
+                )
+            },
+            completion: { [weak self] resolution in
+                guard let self else { return }
+                self.memoryBrokerInstallationTask = nil
+                guard MemoryBrokerSettings.isEnabled() else { return }
+                self.memoryBrokerStatus = resolution.status
+                if resolution.entrypoint != nil {
+                    self.restartAllOpenSessions()
+                }
+            }
+        )
+    }
+
+    func retryControlledMemoryMigration() {
+        do {
+            _ = try ControlledMemoryMigration.prepare()
+            memoryBrokerStatus.state = .importing
+            memoryBrokerStatus.detail = "Legacy approved memory is staged for the next broker session."
+            memoryBrokerStatus.lastError = nil
+        } catch {
+            memoryBrokerStatus.lastError = error.localizedDescription
+        }
+    }
+
+    func refreshMemoryBrokerStatus() {
+        guard MemoryBrokerSettings.isEnabled() else {
+            memoryBrokerStatus = .disabled
+            return
+        }
+        guard memoryBrokerInstallationTask == nil else { return }
+        memoryBrokerStatus = MemoryBrokerRuntime.resolveForMainSession(enabled: true).status
     }
 
     /// Global Computer Use master switch. When on, main sessions export
@@ -900,6 +982,15 @@ final class AppStore: ObservableObject {
         SubagentModelSettings.syncJSONFile()
         ToolSkillSettings.syncJSONFile()
         WebSearchSettings.syncJSONFile()
+        // Seed the hot-read capability catalog before the first Boss turn when possible.
+        // A live session and Settings reload both refresh it again from their authoritative
+        // model-list responses. XCTest skips the subprocess entirely.
+        if !SharedConfigWriteGuard.isRunningTests {
+            Task.detached(priority: .utility) {
+                guard let models = try? await PiAuthHelper.listModels() else { return }
+                SubagentModelSettings.syncCapabilityCatalog(models: models)
+            }
+        }
 
         // T20: 一次性把 auth.json / UserDefaults / 旧 websearch-config.json 里的
         // API key 迁到 ~/.pi/agent/.env。幂等；全程后台队列，主线程零 I/O。
@@ -938,7 +1029,18 @@ final class AppStore: ObservableObject {
                 if shouldAutoOpen, session.rightPanel == nil {
                     session.rightPanel = .agents
                 }
+                // Memory capability issuance is extension-first: the formal
+                // main package observes dispatch and emits each child env itself.
+                // The native bridge only acknowledges lifecycle telemetry.
                 respond(["ok": true])
+                return
+            }
+            if action == "plan_event" {
+                // Authenticated session already matched above; reject is only for
+                // reducer validation (schema/revision/id/transition). Wrong/missing
+                // sessions never reach here (unknown session key response).
+                let outcome = session.planStore.applyBridgeEvent(request)
+                respond(outcome.responseBody)
                 return
             }
             if ComputerRuntimeContract.operations.contains(action) {
@@ -976,8 +1078,11 @@ final class AppStore: ObservableObject {
                     }
                     return
                 }
-                let computerRespond: ([String: Any]) -> Void = {
-                    respond(ComputerRuntimeContract.compatibilityEnvelope($0))
+                // Keep the raw Computer bridge host-owned. The package observes
+                // Pi's settled `computer` tool result directly; no memory draft,
+                // policy, or Swift broker call is coupled to this response.
+                let computerRespond: ([String: Any]) -> Void = { rawResponse in
+                    respond(ComputerRuntimeContract.compatibilityEnvelope(rawResponse))
                 }
                 let requestID = request["requestID"].string ?? ""
                 if action == "computer_cancel" {
@@ -1100,6 +1205,24 @@ final class AppStore: ObservableObject {
         // session spawn so the whole assembly sees a consistent view; the
         // "内置" settings tab is the only writer.
         let builtInFeatures = BuiltInFeatureSettings.enabledSet()
+        // A receipt from a prior package-run is reconciled before a new launch.
+        // Only a count/hash-verified success disables the legacy spawn setting.
+        _ = ControlledMemoryMigration.reconcileReceipt()
+        let migration = ControlledMemoryMigration.launchConfiguration()
+        let memoryResolution = engine == .pi
+            ? MemoryBrokerRuntime.resolveForMainSession(
+                enabled: MemoryBrokerSettings.isEnabled()
+            )
+            : .init(entrypoint: nil, status: MemoryBrokerRuntimeStatus.disabled)
+        memoryBrokerStatus = memoryResolution.status
+        if engine == .pi,
+           MemoryBrokerSettings.isEnabled(),
+           memoryResolution.entrypoint == nil {
+            // Spawn self-healing never runs npm/staging on this construction
+            // path; it only schedules the detached installer and this session
+            // remains normally usable without optional memory meanwhile.
+            scheduleMemoryBrokerInstallationIfNeeded()
+        }
 
         // Conflict detection matters only for the patched subagent (-e) that can
         // collide with a user-installed same-name extension. When the built-in
@@ -1182,7 +1305,7 @@ final class AppStore: ObservableObject {
             features: builtInFeatures,
             philosophyExtension: philosophyExtension,
             computerUseExtension: selectedComputerStrategy?.extensionPath,
-            memoryEnabled: ControlledMemoryStore.isEnabledOnDisk()
+            memoryBrokerEntrypoint: memoryResolution.entrypoint
         )
         let session = ChatSession(
             id: key, projectURL: project, sessionPath: sessionPath,
@@ -1192,8 +1315,13 @@ final class AppStore: ObservableObject {
             gitExtension: paths.git,
             reloadExtension: paths.reload,
             webSearchExtension: paths.webSearch,
+            githubFetchPackage: paths.githubFetchPackage,
+            arxivFetchPackage: paths.arxivFetchPackage,
+            pdfExtractExtension: paths.pdfExtract,
             mcpExtension: paths.mcp,
             skillLoaderExtension: paths.skillLoader,
+            // Main bridged plan tools — must not drop paths.planRuntime here.
+            planRuntimeExtension: paths.planRuntime,
             codexServerToolsExtension: paths.codexServerTools,
             claudeServerToolsExtension: paths.claudeServerTools,
             computerUseExtension: paths.computerUse,
@@ -1201,7 +1329,10 @@ final class AppStore: ObservableObject {
             agentsDir: paths.agentsDir,
             philosophyExtension: paths.philosophy,
             searchScopeExtension: paths.searchScope,
-            memoryExtension: paths.memory,
+            memoryBrokerExtension: paths.memoryBroker,
+            memoryBrokerStateDirectory: MemoryBrokerPackage.defaultStateDirectory.path,
+            memoryBrokerImportFile: migration?.importPath,
+            memoryBrokerImportReceiptFile: migration?.receiptPath,
             builtInFeatures: builtInFeatures,
             taskNotificationMode: taskNotificationMode,
             blockedReason: sessionBlockedReason.isEmpty

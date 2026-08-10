@@ -40,6 +40,10 @@ final class ComputerLivePostGate: @unchecked Sendable {
     private let authorizePointer: @Sendable (CGPoint) throws -> Void
     private let beforePostAttempt: @Sendable () -> Void
     private let isExecutionCurrent: @Sendable () -> Bool
+    private let authorizeHost: @Sendable (
+        ComputerApplicationIdentity,
+        ComputerApplicationIdentity
+    ) throws -> Void
 
     init(
         executionGate: ComputerExecutionGate,
@@ -49,7 +53,11 @@ final class ComputerLivePostGate: @unchecked Sendable {
         authorizePointer:
             @escaping @Sendable (CGPoint) throws -> Void = { _ in },
         isExecutionCurrent: @escaping @Sendable () -> Bool = { true },
-        beforePostAttempt: @escaping @Sendable () -> Void = {}
+        beforePostAttempt: @escaping @Sendable () -> Void = {},
+        authorizeHost: @escaping @Sendable (
+            ComputerApplicationIdentity,
+            ComputerApplicationIdentity
+        ) throws -> Void = { _, _ in }
     ) {
         self.executionGate = executionGate
         self.targetApplication = targetApplication
@@ -57,6 +65,7 @@ final class ComputerLivePostGate: @unchecked Sendable {
         self.authorizePointer = authorizePointer
         self.isExecutionCurrent = isExecutionCurrent
         self.beforePostAttempt = beforePostAttempt
+        self.authorizeHost = authorizeHost
     }
 
     var targetPID: Int32 {
@@ -89,8 +98,11 @@ final class ComputerLivePostGate: @unchecked Sendable {
         guard isExecutionCurrent() else {
             throw ComputerInputError.executionStopped
         }
-        guard let current = frontmostApplicationProvider(),
-              current.processID == targetApplication.processID,
+        guard let current = frontmostApplicationProvider() else {
+            throw ComputerInputError.targetProcessChanged
+        }
+        try authorizeHost(targetApplication, current)
+        guard current.processID == targetApplication.processID,
               current.normalizedBundleID
                 == targetApplication.normalizedBundleID else {
             throw ComputerInputError.targetProcessChanged

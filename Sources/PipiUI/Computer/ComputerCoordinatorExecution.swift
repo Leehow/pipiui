@@ -61,7 +61,24 @@ extension ComputerCoordinator {
                             targetPID: targetApplication.processID
                         )
                     },
-                    isExecutionCurrent: { execution.isCurrent }
+                    isExecutionCurrent: { execution.isCurrent },
+                    authorizeHost: { [weak self] target, foreground in
+                        guard let self else {
+                            throw ComputerHostSelfProtectionError.hostTarget
+                        }
+                        let targetMatch = self.hostSelfProtection.match(target)
+                        let foregroundMatch = self.hostSelfProtection.match(
+                            foreground
+                        )
+                        guard !targetMatch.isHost, !foregroundMatch.isHost else {
+                            throw self.rejectHostControl(
+                                actionKind: action.kind,
+                                match: targetMatch.isHost
+                                    ? targetMatch
+                                    : foregroundMatch
+                            )
+                        }
+                    }
                 )
                 try await Task.detached(priority: .userInitiated) {
                     try actionInputSynth.execute(

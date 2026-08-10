@@ -8,6 +8,8 @@ struct SubagentPanel: View {
     var projectURL: URL
     /// 中止运行中 agent（ChatSession.abortSubagent → /subagent_abort RPC）。
     var onAbort: (String) -> Void
+    /// Resolve a terminal failed episode through the Node control plane (never Swift-only for current rows).
+    var onResolve: (SubagentInfo) -> Void
     /// UI-only recovery action for agents whose normal status observations went silent.
     var onManualStatusCheck: ([String]) -> Void
     /// 列表贴底跟随：新 agent 到达时若仍贴底则自动滚到最新条目；用户上滚看旧条目即脱离。
@@ -89,7 +91,7 @@ struct SubagentPanel: View {
                     Button(action: focusOnFailedAgent) {
                         Text(SubagentPresentationScale.failureText(summary))
                             .font(.caption)
-                            .foregroundStyle(summary.failedAttentionCount > 0 ? Color.red : Color.orange)
+                            .foregroundStyle(summary.failedAttentionCount > 0 ? Color.red : Color.green)
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
                     }
@@ -194,7 +196,7 @@ struct SubagentPanel: View {
                             abortPending: store.abortPending.contains(agent.id),
                             onSelect: { store.selectedId = agent.id },
                             onAbort: { onAbort(agent.id) },
-                            onMarkCleaned: { store.markCleaned(id: agent.id) }
+                            onMarkHandled: { onResolve(agent) }
                         )
                     }
                     if window.pageCount > 1 {
@@ -265,13 +267,13 @@ struct SubagentPanel: View {
 
     private var listBottomAnchorID: String { "subagent-list-bottom" }
 
-    /// 失败徽章点击：选中并滚动到第一个需关注的失败 agent；全部已清理时回退到第一个失败项。
+    /// 失败徽章点击：选中并滚动到最新的需关注失败 agent；全部已清理时回退到最新失败项。
     /// 失败/需关注行是列表优先行，任何分页下都渲染，故 scrollTo 总能命中，无需翻页。
     private func focusOnFailedAgent() {
         let order = store.displayOrder
-        let target = order.first(where: {
+        let target = order.last(where: {
             $0.state == .failed && !SubagentPresentationScale.isCleaned($0)
-        }) ?? order.first(where: { $0.state == .failed })
+        }) ?? order.last(where: { $0.state == .failed })
         guard let target else { return }
         store.selectedId = target.id
         listScrollProxy?.scrollTo(target.id, anchor: .center)
@@ -547,18 +549,21 @@ private struct AgentRow: View {
     var abortPending: Bool = false
     let onSelect: () -> Void
     var onAbort: (() -> Void)? = nil
-    var onMarkCleaned: (() -> Void)? = nil
+    var onMarkHandled: (() -> Void)? = nil
+
+    private var lifecyclePresentation: SubagentPresentationScale.RowPresentation {
+        SubagentPresentationScale.rowPresentation(for: agent)
+    }
+
+    private var hasRunId: Bool {
+        guard let runId = agent.runId?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return false
+        }
+        return !runId.isEmpty
+    }
 
     var body: some View {
-        if agent.state == .failed, !SubagentPresentationScale.isCleaned(agent) {
-            rowContent.contextMenu {
-                Button("标记已处理") {
-                    onMarkCleaned?()
-                }
-            }
-        } else {
-            rowContent
-        }
+        rowContent
     }
 
     private var rowContent: some View {
@@ -574,6 +579,20 @@ private struct AgentRow: View {
             .frame(maxWidth: .infinity)
             .accessibilityLabel("选择 \(agent.name) 子代理")
             .accessibilityAddTraits(selected ? .isSelected : [])
+
+            if lifecyclePresentation.canMarkHandled, let onMarkHandled {
+                Button(hasRunId ? "标记为已处理" : "标记为已处理（旧记录，仅本地）", action: onMarkHandled)
+                    .buttonStyle(.borderless)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .help(
+                        hasRunId
+                            ? "通过运行时控制面标记该失败 episode 已处理，并取消其提醒"
+                            : "旧记录没有 runId：只能本地标记，无法取消运行时提醒"
+                    )
+                    .accessibilityLabel("将 \(agent.name) 标记为已处理")
+                    .padding(.trailing, 8)
+            }
 
             if agent.state == .running, let onAbort {
                 Button(action: onAbort) {
@@ -612,6 +631,8 @@ private struct AgentRow: View {
                     Text(agent.name)
                         .font(.callout.weight(.medium))
                         .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                     if agent.name == "secretary" {
                         Text("收尾")
                             .font(.caption2)
@@ -619,6 +640,18 @@ private struct AgentRow: View {
                             .padding(.horizontal, 4)
                             .padding(.vertical, 1)
                             .background(Capsule().fill(Color.purple.opacity(0.15)))
+                    }
+                    if let terminalBadgeText = lifecyclePresentation.terminalBadgeText {
+                        HStack(spacing: 3) {
+                            lifecycleBadge(text: terminalBadgeText, color: lifecyclePresentation.tone.displayColor)
+                                .help("状态由本次执行 lifecycle 决定，不会依据最后输出判断成功。")
+                            if let handledBadgeText = lifecyclePresentation.handledBadgeText {
+                                handledLifecycleBadge(text: handledBadgeText)
+                                    .help("已明确处置；保留原终态，不代表本次执行成功。")
+                            }
+                        }
+                        .fixedSize(horizontal: true, vertical: false)
+                        .layoutPriority(1)
                     }
                     if agent.state == .running, agent.stalled {
                         lifecycleBadge(
@@ -647,10 +680,16 @@ private struct AgentRow: View {
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 1) {
+                HStack(spacing: 4) {
+                    if agent.state != .running, let ended = agent.ended {
+                        Text(TurnDurationFormat.completedAt(ended))
+                        Text("·")
+                    }
+                    durationText
+                }
                 if agent.cost > 0 {
                     Text(formatSpend(usdCost: agent.cost, unit: unit, rate: rate))
                 }
-                durationText
             }
             .font(.caption2.monospacedDigit())
             .foregroundStyle(.tertiary)
@@ -671,25 +710,35 @@ private struct AgentRow: View {
     private func lifecycleBadge(text: String, color: Color) -> some View {
         Text(text)
             .font(.caption2)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 4)
             .padding(.vertical, 1)
             .background(Capsule().fill(color.opacity(0.15)))
             .foregroundStyle(color)
     }
 
+    private func handledLifecycleBadge(text: String) -> some View {
+        Text(text)
+            .font(.system(size: 9, weight: .medium))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, 3)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(Color.secondary.opacity(0.10)))
+            .foregroundStyle(.secondary)
+    }
+
     @ViewBuilder
     private var statusDot: some View {
-        switch agent.state {
-        case .running:
+        if agent.state == .running {
             ProgressView().controlSize(.mini).tint(.secondary)
-        case .ok:
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
-        case .failed:
-            Image(systemName: "xmark.circle.fill").foregroundStyle(.red).font(.caption)
-        case .aborted:
-            Image(systemName: "stop.circle.fill").foregroundStyle(.orange).font(.caption)
-        case .interrupted:
-            Image(systemName: "bolt.slash.circle.fill").foregroundStyle(.orange).font(.caption)
+        } else if let iconName = lifecyclePresentation.iconName {
+            Image(systemName: iconName)
+                .foregroundStyle(lifecyclePresentation.tone.displayColor)
+                .font(.caption)
+        } else {
+            EmptyView()
         }
     }
 }
@@ -714,24 +763,39 @@ private struct AgentDetailView: View {
     @State private var diffStatText: String?
     @State private var diffBusy = false
     @State private var expandedToolGroupIDs: Set<Int> = []
+    /// Per-row expand state, lifted out of `AgentLogRow`: a LazyVStack unmounts
+    /// off-screen rows, so row-local `@State` would lose expansion on scroll.
+    /// Keyed by the stable log item id; the whole set is `@State` here and resets
+    /// when the detail is remounted on agent switch (`.id(agent.id)`), so one
+    /// agent's expansion never leaks into another. Tool groups keep their own
+    /// `expandedToolGroupIDs` set (keyed by the group leader id, never colliding
+    /// with a standalone item id within one agent's log).
+    @State private var expandedLogItemIDs: Set<Int> = []
     /// Collapsed by default; resets when the detail view identity changes (`.id(agent.id)`).
     @State private var finalResultExpanded = false
+    /// Body font size passed down to `AgentLogRow` so its lightweight `Text`
+    /// matches `MarkdownTextView` (which reads this same environment value) and so
+    /// a chat-font-size change bumps `Equatable` for re-render.
+    @Environment(\.chatTypography) private var chatTypography
 
     var body: some View {
-        // Pinned live mode anchors the window at the newest page so appended rows
-        // are always rendered; unpinned scrolling anchors it at the top-visible
-        // item, re-resolved from the live log on every pass so cap evictions that
-        // shift or drop the anchored row move the window deterministically.
+        // Window anchor with hysteresis: pinned → newest page (follows appended
+        // rows); unpinned → keep the committed page while the live top-visible
+        // item stays inside its window, sliding only when the item leaves it.
+        // Pure `stableAnchorPage` de-duplicates equal windows (no state write for
+        // small scroll drift); the resolved range is the hard mount ceiling
+        // (`SubagentLogRenderWindow.maxRenderedItems`), independent of log length.
         // Normal document order (oldest top → newest bottom), no flip.
-        let anchorPage = SubagentLogRenderWindow.anchorPage(
-            pinned: pinToBottom,
-            topVisibleItemIndex: topItemIndex(from: scrollTopID, log: agent.log),
-            previousTopVisiblePage: topVisiblePage,
-            itemCount: agent.log.count
-        )
+        let effectivePage = pinToBottom
+            ? SubagentLogRenderWindow.latestPage(itemCount: agent.log.count)
+            : SubagentLogRenderWindow.stableAnchorPage(
+                itemCount: agent.log.count,
+                committedTopVisiblePage: topVisiblePage,
+                liveAnchorIndex: topItemIndex(from: scrollTopID, log: agent.log)
+            )
         let window = SubagentLogRenderWindow.resolve(
             itemCount: agent.log.count,
-            topVisiblePage: anchorPage
+            topVisiblePage: effectivePage
         )
         // Drop only a terminal text row that duplicates agent.output (card owns it).
         let suppressLogID = SubagentFinalResultPresentation.terminalTextLogItemIDToSuppress(
@@ -746,6 +810,9 @@ private struct AgentDetailView: View {
 
         VStack(alignment: .leading, spacing: 0) {
             metricsHeader
+            if let reason = agent.closeoutReason, !reason.isEmpty {
+                closeoutSummary(reason)
+            }
             if agent.canReviewWorktree
                 || agent.worktreeLifecycle == .mergedCleanupPending
                 || (agent.worktreeError?.isEmpty == false)
@@ -761,12 +828,13 @@ private struct AgentDetailView: View {
             }
             ScrollViewReader { proxy in
                 ScrollView {
-                    // Eager stack: the window slides by dropping/adding a whole page
-                    // while `.scrollPosition` keeps the top-visible row anchored;
-                    // NSTextView-backed markdown rows need exact heights before the
-                    // anchor can settle, so lazy height estimation is avoided (same
-                    // choice as the main transcript; ≤ 400 rows).
-                    VStack(alignment: .leading, spacing: 8) {
+                    // Lazy stack: only on-screen rows (plus SwiftUI's small
+                    // overscan) mount. The data window above is the hard ceiling
+                    // (`SubagentLogRenderWindow.maxRenderedItems` ≤ 400 items), so
+                    // mounted rows are bounded regardless of log length, and
+                    // `.scrollPosition(id:)` re-anchors to the stable per-segment id
+                    // as rows enter/leave the viewport (same pattern as agentList).
+                    LazyVStack(alignment: .leading, spacing: 8) {
                         if segments.isEmpty && !showFinalResult {
                             waitingForFirstLog
                         } else {
@@ -828,13 +896,13 @@ private struct AgentDetailView: View {
                     // Pinned: the anchor is the newest page by definition; the
                     // AppKit pinned clip push does not reliably feed
                     // scrollPosition, so its reports must not overwrite the
-                    // synced page.
+                    // synced page. Unpinned: adopt the hysteresis page only when
+                    // it actually changes (keeps small drift from re-windowing).
                     guard !pinToBottom else { return }
-                    let page = SubagentLogRenderWindow.anchorPage(
-                        pinned: false,
-                        topVisibleItemIndex: topItemIndex(from: newValue, log: agent.log),
-                        previousTopVisiblePage: topVisiblePage,
-                        itemCount: agent.log.count
+                    let page = SubagentLogRenderWindow.stableAnchorPage(
+                        itemCount: agent.log.count,
+                        committedTopVisiblePage: topVisiblePage,
+                        liveAnchorIndex: topItemIndex(from: newValue, log: agent.log)
                     )
                     if page != topVisiblePage {
                         topVisiblePage = page
@@ -848,17 +916,16 @@ private struct AgentDetailView: View {
                     topVisiblePage = SubagentLogRenderWindow.latestPage(itemCount: newCount)
                 }
                 .onChange(of: pinToBottom) { _, newValue in
-                    // Unpin: re-resolve the anchor from the live scroll id right
-                    // away instead of trusting the cached page; an unresolvable id
-                    // (bottom anchor / cap-evicted / nil) falls back to the newest
-                    // page — the user just left the bottom, so that window covers
-                    // the viewport.
+                    // Unpin: seed the committed page at the newest (we just left
+                    // the bottom) and let `stableAnchorPage` keep it while the
+                    // top-visible item is still inside the newest window; an
+                    // unresolvable id (bottom anchor / cap-evicted / nil) keeps
+                    // that newest page, so the viewport stays covered.
                     guard !newValue else { return }
-                    topVisiblePage = SubagentLogRenderWindow.anchorPage(
-                        pinned: false,
-                        topVisibleItemIndex: topItemIndex(from: scrollTopID, log: agent.log),
-                        previousTopVisiblePage: SubagentLogRenderWindow.latestPage(itemCount: agent.log.count),
-                        itemCount: agent.log.count
+                    topVisiblePage = SubagentLogRenderWindow.stableAnchorPage(
+                        itemCount: agent.log.count,
+                        committedTopVisiblePage: SubagentLogRenderWindow.latestPage(itemCount: agent.log.count),
+                        liveAnchorIndex: topItemIndex(from: scrollTopID, log: agent.log)
                     )
                 }
             }
@@ -878,6 +945,24 @@ private struct AgentDetailView: View {
         } message: {
             Text("将强制删除该 agent 的 worktree，不会合并进主分支；对应的 pipiui/ 内部分支也会删除，即使含独有提交。非内部分支会保留。此操作不可撤销。")
         }
+    }
+
+    @ViewBuilder
+    private func closeoutSummary(_ reason: String) -> some View {
+        let isHandledFailure = agent.closeoutDisposition == .cleaned
+            && (agent.state == .failed || agent.state == .aborted || agent.state == .interrupted)
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(isHandledFailure ? "已处理（保留原状态）" : "收尾")
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(isHandledFailure ? Color.secondary : Color.orange)
+            Text(reason)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .textSelection(.enabled)
+        }
+        .padding(.horizontal, 10)
+        .padding(.bottom, 7)
     }
 
     private var documentBase: URL? {
@@ -968,11 +1053,41 @@ private struct AgentDetailView: View {
     /// Dedicated final-result card: collapsed ~8-line Markdown preview; expand shows
     /// all stored `agent.output` (no further UI truncation). Own header + expand control.
     private var finalResultCard: some View {
+        let lifecycle = SubagentPresentationScale.rowPresentation(for: agent)
         let stripped = SubagentFinalResultPresentation.displayBody(from: agent.output)
         let markdown = stripped.isEmpty ? agent.output : stripped
         let expanded = finalResultExpanded
         let cards = DocumentReferenceScanner.references(in: markdown, base: documentBase)
         return VStack(alignment: .leading, spacing: 8) {
+            if let warning = lifecycle.lifecycleWarning {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(lifecycle.tone.displayColor)
+                        Text(warning.title)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(lifecycle.tone.displayColor)
+                    }
+                    Text(warning.message)
+                        .font(.caption)
+                        .foregroundStyle(.primary)
+                    if let reason = warning.reason {
+                        Text("状态依据：\(reason)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                    }
+                }
+                .padding(9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 7).fill(lifecycle.tone.displayColor.opacity(0.12)))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7)
+                        .strokeBorder(lifecycle.tone.displayColor.opacity(0.28))
+                )
+            }
+
             HStack(spacing: 7) {
                 Image(systemName: "flag.checkered")
                     .foregroundStyle(.secondary)
@@ -1062,7 +1177,13 @@ private struct AgentDetailView: View {
 
             if expanded {
                 ForEach(items) { item in
-                    AgentLogRow(item: item, base: documentBase)
+                    AgentLogRow(
+                        item: item,
+                        base: documentBase,
+                        isExpanded: expandedLogItemIDs.contains(item.id),
+                        onToggleExpand: { toggleLogItemExpanded(item.id) },
+                        fontSize: chatTypography.fontSize
+                    )
                 }
             }
         }
@@ -1083,11 +1204,27 @@ private struct AgentDetailView: View {
         }
     }
 
+    /// Toggle a log item's expand state in the lifted owner set (stable id key).
+    private func toggleLogItemExpanded(_ id: Int) {
+        if expandedLogItemIDs.contains(id) {
+            expandedLogItemIDs.remove(id)
+        } else {
+            expandedLogItemIDs.insert(id)
+        }
+    }
+
     @ViewBuilder
     private func segmentRow(_ segment: SubagentLogLayout.Segment) -> some View {
         switch segment {
         case .item(let item):
-            AgentLogRow(item: item, base: documentBase)
+            AgentLogRow(
+                item: item,
+                base: documentBase,
+                isExpanded: expandedLogItemIDs.contains(item.id),
+                onToggleExpand: { toggleLogItemExpanded(item.id) },
+                fontSize: chatTypography.fontSize
+            )
+            .equatable()
         case .toolGroup(let items):
             toolGroup(items)
         }
@@ -1101,10 +1238,10 @@ private struct AgentDetailView: View {
 
     /// Map the reported top-visible segment id back to its log item index. The
     /// bottom anchor, an unknown id, and an id evicted by the store's 800-item
-    /// cap all return nil; `SubagentLogRenderWindow.anchorPage` then decides the
-    /// fallback (newest page right after unpinning, clamped previous page while
-    /// browsing history). Re-run on every body pass, so the anchor follows the
-    /// item's current index without waiting for the next scroll event.
+    /// cap all return nil; `SubagentLogRenderWindow.stableAnchorPage` then keeps
+    /// the committed page (newest page right after unpinning, the page the user
+    /// is browsing otherwise). Re-run on every body pass, so the anchor follows
+    /// the item's current index without waiting for the next scroll event.
     private func topItemIndex(from scrollTopID: String?, log: [AgentLogItem]) -> Int? {
         guard let scrollTopID, scrollTopID != logAnchorID else { return nil }
         let prefix = "agent-log-\(agent.id)-"
@@ -1286,27 +1423,48 @@ private struct AgentDetailView: View {
 }
 
 /// 工作流水单行：文本走 Markdown，思考灰斜体，工具调用对齐主会话 ToolCard 折叠头。
-private struct AgentLogRow: View {
+private struct AgentLogRow: View, Equatable {
     let item: AgentLogItem
     var base: URL? = nil
-    @State private var expanded = false
+    /// Lifted out of `@State`: a LazyVStack unmounts off-screen rows, which would
+    /// discard row-local expand state on scroll. The owner (`AgentDetailView`)
+    /// keeps it keyed by the stable log item id, so it survives unmount/remount and
+    /// is partitioned per agent by the detail view's `.id(agent.id)` remount.
+    var isExpanded: Bool = false
+    var onToggleExpand: () -> Void = {}
+    /// Body font size sourced from `AgentDetailView`'s `chatTypography`. A
+    /// parameter (not `@Environment`) so it bumps `Equatable` and `.equatable()`
+    /// rows re-render when the user changes the chat font size — matching the
+    /// `MessageRow` pattern. Keeps the lightweight `Text` and `MarkdownTextView`
+    /// on one project constant (no font-size jump between adjacent rows).
+    var fontSize: CGFloat = ChatTypography.defaultFontSize
+
+    static func == (lhs: AgentLogRow, rhs: AgentLogRow) -> Bool {
+        // All render inputs are compared: `item`/`base` skip unchanged historical
+        // rows on a log_delta batch, while `isExpanded`/`fontSize` force a re-render
+        // when either flips. The toggle closure is behavior, not render input, so it
+        // is excluded (same rule as `MessageRow`'s callbacks).
+        lhs.item == rhs.item
+            && lhs.base == rhs.base
+            && lhs.isExpanded == rhs.isExpanded
+            && lhs.fontSize == rhs.fontSize
+    }
 
     var body: some View {
         switch item.kind {
         case "thinking":
-            Text(item.text)
+            Text(MarkdownTextView.thinkingInline(item.text))
                 .font(.caption)
-                .italic()
                 .foregroundStyle(.tertiary)
-                .lineLimit(expanded ? nil : 2)
-                .onTapGesture { expanded.toggle() }
+                .lineLimit(isExpanded ? nil : 2)
+                .onTapGesture { onToggleExpand() }
         case "tool":
             toolRow
         case "toolResult":
             Text(item.text.isEmpty ? "（无输出）" : item.text)
                 .font(.caption.monospaced())
                 .foregroundStyle(item.isError ? .red : .secondary)
-                .lineLimit(expanded ? nil : 3)
+                .lineLimit(isExpanded ? nil : 3)
                 .textSelection(.enabled)
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1314,15 +1472,34 @@ private struct AgentLogRow: View {
                     RoundedRectangle(cornerRadius: 6)
                         .fill(item.isError ? Color.red.opacity(0.06) : Color.primary.opacity(0.035))
                 )
-                .onTapGesture { expanded.toggle() }
+                .onTapGesture { onToggleExpand() }
         default:
             VStack(alignment: .leading, spacing: 6) {
-                MarkdownTextView(
-                    text: item.text,
-                    lineLimit: expanded ? nil : 3
-                )
-                .contentShape(Rectangle())
-                .onTapGesture { expanded.toggle() }
+                if MarkdownTextView.logTextNeedsRichRendering(item.text) {
+                    // Structured/formatted text (headings, lists, code fences,
+                    // inline code/bold, …): full NSTextView-backed renderer. The
+                    // streaming fast path (append-lineage detection) keeps re-renders
+                    // cheap, and `Equatable` skips unchanged historical rows.
+                    MarkdownTextView(
+                        text: item.text,
+                        lineLimit: isExpanded ? nil : 3
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture { onToggleExpand() }
+                } else {
+                    // Lightweight selectable `Text` for plain log lines: no
+                    // NSTextView, no markdown parse, no measurement host. This is
+                    // the common realtime-log row, kept off the expensive path.
+                    Text(item.text)
+                        .font(.system(size: fontSize))
+                        .foregroundStyle(.primary)
+                        .lineLimit(isExpanded ? nil : 3)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .contentShape(Rectangle())
+                        .onTapGesture { onToggleExpand() }
+                }
                 let cards = DocumentReferenceScanner.references(in: item.text, base: base)
                 if !cards.isEmpty {
                     DocumentFileCardStack(references: cards)
@@ -1383,7 +1560,7 @@ private struct AgentLogRow: View {
                     .truncationMode(.middle)
                 Spacer(minLength: 0)
                 if !item.text.isEmpty {
-                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -1392,11 +1569,11 @@ private struct AgentLogRow: View {
             .padding(.vertical, 6)
             .contentShape(Rectangle())
             .onTapGesture {
-                if !item.text.isEmpty { expanded.toggle() }
+                if !item.text.isEmpty { onToggleExpand() }
             }
             .pointingHandCursor(!item.text.isEmpty)
 
-            if expanded, !item.text.isEmpty {
+            if isExpanded, !item.text.isEmpty {
                 Divider()
                 Text(item.text)
                     .font(.caption2.monospaced())
@@ -1427,7 +1604,7 @@ private struct AgentLogRow: View {
                 Text("−\(file.deletions)")
                     .foregroundStyle(.red)
                 Spacer(minLength: 0)
-                Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -1435,10 +1612,10 @@ private struct AgentLogRow: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
             .contentShape(Rectangle())
-            .onTapGesture { expanded.toggle() }
+            .onTapGesture { onToggleExpand() }
             .pointingHandCursor(true)
 
-            if expanded {
+            if isExpanded {
                 Divider()
                 if let message = file.qualityMessage {
                     Label(message, systemImage: "info.circle")

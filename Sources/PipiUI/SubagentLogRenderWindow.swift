@@ -72,3 +72,44 @@ struct SubagentLogRenderWindow: Equatable {
         return Self(range: start..<end, totalCount: count)
     }
 }
+
+extension SubagentLogRenderWindow {
+    /// Hard ceiling on the number of log items that can ever be in the render
+    /// window at once. A lazy container mounts a subset of these, so this is also
+    /// the upper bound on mounted rows. Pure and testable; stable as the log
+    /// grows (independent of `itemCount` beyond clamping).
+    static var maxRenderedItems: Int { maxPages * pageSize }
+
+    /// Hysteresis window anchor: keep the committed page while the live
+    /// top-visible item stays inside the committed window, and slide only to the
+    /// item's own page once it has left it. This prevents small `scrollPosition`
+    /// drift (e.g. oscillation across a page boundary) from flipping the whole
+    /// window, while still following the viewport once the user scrolls far
+    /// enough that the anchored row would otherwise leave the rendered range.
+    ///
+    /// - An unresolvable anchor (`nil`, the bottom anchor, or an id evicted by
+    ///   the store cap) keeps the committed page, so the caller can seed it with
+    ///   the newest page right after an unpin and never sees an uninvited jump.
+    /// - Pure function: identical inputs always return the same page, so equal
+    ///   windows are de-duplicated at the call site (no state write → no re-render).
+    static func stableAnchorPage(
+        itemCount: Int,
+        committedTopVisiblePage: Int,
+        liveAnchorIndex: Int?
+    ) -> Int {
+        let count = max(0, itemCount)
+        let committed = resolve(itemCount: count, topVisiblePage: committedTopVisiblePage)
+        guard let anchor = liveAnchorIndex, anchor >= 0, anchor < count else {
+            return committedTopVisiblePage
+        }
+        // The anchor is still covered by the committed window → keep it. This is
+        // both the dedup (same page → same window) and the hysteresis (a page
+        // boundary crossed inside the window does not slide the whole window).
+        if committed.range.contains(anchor) {
+            return committedTopVisiblePage
+        }
+        // The anchor left the window: slide to its own page so the viewport is
+        // covered again. `resolve` clamps the resulting window into range.
+        return anchor / pageSize
+    }
+}

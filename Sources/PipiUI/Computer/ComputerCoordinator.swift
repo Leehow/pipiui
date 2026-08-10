@@ -202,6 +202,7 @@ final class ComputerCoordinator: ObservableObject {
     /// main window does not flash mini→full→mini on every batch boundary.
     let desktopPresentationGraceInterval: TimeInterval
     let cuaDriver: CuaDriverTransport?
+    let hostSelfProtection: ComputerHostSelfProtection
     let cuaTargetValidator: @Sendable (CuaComputerTarget) -> Bool
 
     init(
@@ -299,11 +300,14 @@ final class ComputerCoordinator: ObservableObject {
         /// short interval (or 0) instead of waiting out the production value.
         desktopPresentationGraceInterval: TimeInterval = 45,
         cuaDriver: CuaDriverTransport? = nil,
-        cuaTargetValidator:
-            @escaping @Sendable (CuaComputerTarget) -> Bool = { target in
-                guard let running = NSRunningApplication(
-                    processIdentifier: target.processID
-                ), !running.isTerminated else {
+        hostSelfProtection: ComputerHostSelfProtection = .init(),
+        cuaTargetValidator: @escaping @Sendable (CuaComputerTarget) -> Bool = {
+            target in
+                let hostProtection = ComputerHostSelfProtection()
+                guard !hostProtection.match(target).isHost,
+                      let running = NSRunningApplication(
+                        processIdentifier: target.processID
+                      ), !running.isTerminated else {
                     return false
                 }
                 return running.bundleIdentifier?.caseInsensitiveCompare(
@@ -353,7 +357,10 @@ final class ComputerCoordinator: ObservableObject {
             desktopPresentationGraceInterval
         )
         self.cuaDriver = cuaDriver
-        self.cuaTargetValidator = cuaTargetValidator
+        self.hostSelfProtection = hostSelfProtection
+        self.cuaTargetValidator = { target in
+            !hostSelfProtection.match(target).isHost && cuaTargetValidator(target)
+        }
     }
 
     func configure(onEmergencyStop: @escaping (String) -> Void) {
@@ -600,6 +607,14 @@ final class ComputerCoordinator: ObservableObject {
 
         guard let application = frontmostApplicationProvider() else {
             reply.respond(Self.failure("frontmost application identity is unavailable"))
+            return
+        }
+        let hostMatch = hostSelfProtection.match(application)
+        guard !hostMatch.isHost else {
+            _ = rejectHostControl(actionKind: .screenshot, match: hostMatch)
+            reply.respond(Self.failure(
+                ComputerHostSelfProtectionError.hostTarget.localizedDescription
+            ))
             return
         }
         guard inFlightExecution == nil,

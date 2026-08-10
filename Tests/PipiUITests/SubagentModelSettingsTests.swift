@@ -332,6 +332,68 @@ final class SubagentModelSettingsTests: XCTestCase {
         ])
     }
 
+    func testCapabilityCatalogUsesSwiftAllowedLevelsAndPreservesUnknownState() throws {
+        let models = [
+            ModelInfo(
+                provider: "known",
+                modelId: "reasoning",
+                name: "Reasoning",
+                contextWindow: nil,
+                reasoning: true,
+                thinkingLevelMap: ["off": nil, "xhigh": "provider_xhigh"]
+            ),
+            ModelInfo(
+                provider: "known",
+                modelId: "nonreasoning",
+                name: "Non-reasoning",
+                contextWindow: nil,
+                reasoning: false,
+                thinkingLevelMap: nil
+            ),
+            ModelInfo(
+                provider: "unknown",
+                modelId: "legacy",
+                name: "Legacy",
+                contextWindow: nil,
+                reasoning: nil,
+                thinkingLevelMap: nil
+            ),
+        ]
+
+        let catalog = SubagentModelSettings.capabilityCatalog(models: models)
+        XCTAssertEqual(catalog.version, 1)
+        XCTAssertEqual(
+            catalog.models["known/reasoning"]?.levels,
+            ["", "minimal", "low", "medium", "high", "xhigh"]
+        )
+        XCTAssertEqual(catalog.models["known/reasoning"]?.reasoning, true)
+        XCTAssertEqual(catalog.models["known/nonreasoning"]?.levels, [""])
+        XCTAssertEqual(catalog.models["known/nonreasoning"]?.reasoning, false)
+        XCTAssertEqual(
+            catalog.models["unknown/legacy"]?.levels,
+            ["", "off", "minimal", "low", "medium", "high"]
+        )
+        XCTAssertNil(catalog.models["unknown/legacy"]?.reasoning)
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("subagent-model-capabilities-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        SubagentModelSettings.syncCapabilityCatalog(models: models, to: url)
+
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        )
+        XCTAssertEqual(root["v"] as? Int, 1)
+        let compactModels = try XCTUnwrap(root["m"] as? [String: Any])
+        let known = try XCTUnwrap(compactModels["known/reasoning"] as? [String: Any])
+        XCTAssertEqual(known["r"] as? Bool, true)
+        XCTAssertEqual(known["l"] as? [String], ["", "minimal", "low", "medium", "high", "xhigh"])
+        XCTAssertNil(known["thinkingLevelMap"], "Node receives levels, not duplicated Swift policy metadata")
+        let unknown = try XCTUnwrap(compactModels["unknown/legacy"] as? [String: Any])
+        XCTAssertNil(unknown["r"], "missing r is the compact unknown-capability marker")
+        XCTAssertEqual(unknown["l"] as? [String], ["", "off", "minimal", "low", "medium", "high"])
+    }
+
     func testExplicitThinkingPersistsSeparatelyFromModel() throws {
         let (name, suite) = tempSuite()
         defer { suite.removePersistentDomain(forName: name) }
@@ -652,6 +714,36 @@ final class AgentCatalogTests: XCTestCase {
         XCTAssertEqual(agent?.frontmatterModel, "xai/grok-4.5:high")
     }
 
+    func testParseStandardPackageFrontmatter() {
+        let md = """
+        ---
+        schema: 1
+        name: packaged
+        description: Standard package
+        model: provider/packaged
+        mode: worker
+        capabilities:
+          filesystem: read-only
+        worktree: isolated
+        deliverable: implementation
+        tools:
+          - read
+          - grep
+        ---
+
+        Package body.
+        """
+        let agent = AgentCatalog.parseFrontmatter(
+            md,
+            filePath: "/tmp/packaged/AGENT.md",
+            packageDirectoryName: "packaged"
+        )
+        XCTAssertEqual(agent?.name, "packaged")
+        XCTAssertEqual(agent?.tools, ["read", "grep"])
+        XCTAssertEqual(agent?.frontmatterModel, "provider/packaged")
+        XCTAssertNil(AgentCatalog.parseFrontmatter(md, packageDirectoryName: "wrong-name"))
+    }
+
     func testParseRequiresName() {
         let md = """
         ---
@@ -694,6 +786,43 @@ final class AgentCatalogTests: XCTestCase {
         XCTAssertTrue(loaded.map(\.name).contains("explore"))
         XCTAssertTrue(loaded.map(\.name).contains("general-purpose"))
         XCTAssertEqual(loaded.first(where: { $0.name == "plan" })?.tools, ["read", "bash"])
+    }
+
+    func testLoadStandardPackageAndSkipsFlatPackageDuplicate() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("agents-package-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        let package = dir.appendingPathComponent("packaged", isDirectory: true)
+        try fm.createDirectory(at: package, withIntermediateDirectories: true)
+        try """
+        ---
+        schema: 1
+        name: packaged
+        description: Package agent
+        mode: worker
+        capabilities:
+          filesystem: read-only
+        worktree: isolated
+        deliverable: implementation
+        tools: read, grep
+        ---
+        body
+        """.write(to: package.appendingPathComponent("AGENT.md"), atomically: true, encoding: .utf8)
+        try """
+        ---
+        name: packaged
+        description: Legacy duplicate
+        tools: read
+        ---
+        body
+        """.write(to: dir.appendingPathComponent("packaged.md"), atomically: true, encoding: .utf8)
+
+        let loaded = AgentCatalog.load(from: dir)
+        XCTAssertFalse(loaded.contains(where: { $0.name == "packaged" && $0.filePath.contains("/AGENT.md") }),
+                       "a duplicate must not arbitrarily win in Settings discovery")
+        XCTAssertTrue(loaded.contains(where: { $0.name == "explore" }), "built-ins still fill the roster")
     }
 
     func testLoadNeverEmptyWithoutDirectory() {

@@ -9,6 +9,21 @@ final class HighFanoutExtensionTests: XCTestCase {
         return try String(contentsOf: bundled.appendingPathComponent("subagent/index.ts"), encoding: .utf8)
     }
 
+    private func worktreeSource() throws -> String {
+        let bundled = try XCTUnwrap(PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil))
+        return try String(contentsOf: bundled.appendingPathComponent("subagent/worktree.ts"), encoding: .utf8)
+    }
+
+    /// Pure helper modules carry their own imports. The Node probe already supplies
+    /// those bindings, so feed its executable body without duplicate import declarations.
+    private func moduleBody(_ relative: String) throws -> String {
+        let bundled = try XCTUnwrap(PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil))
+        let source = try String(contentsOf: bundled.appendingPathComponent("subagent/\(relative)"), encoding: .utf8)
+        return source.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("import ") }
+            .joined(separator: "\n")
+    }
+
     private func pureRegion(_ name: String, in source: String) throws -> String {
         let begin = "// PIPIUI_PURE_\(name)_BEGIN"
         let end = "// PIPIUI_PURE_\(name)_END"
@@ -68,8 +83,11 @@ final class HighFanoutExtensionTests: XCTestCase {
         XCTAssertTrue(s.contains("Writable subagent isolation failed before spawn:"))
         XCTAssertTrue(s.contains("worktreeError: placement.worktreeError"),
                       "the failed lifecycle must expose a clear isolation reason")
-        XCTAssertTrue(s.contains("if (opts.explicitCwd) {"), "explicit cwd remains an intentional opt-out")
-        XCTAssertTrue(s.contains(#"opts.readOnly || process.env.PIPIUI_WORKTREE === "0""#))
+        let worktree = try worktreeSource()
+        XCTAssertTrue(worktree.contains("if (opts.explicitCwd) {"), "explicit cwd remains an intentional opt-out")
+        XCTAssertTrue(worktree.contains(#"opts.readOnly || process.env.PIPIUI_WORKTREE === "0""#))
+        XCTAssertTrue(worktree.contains("if (opts.policy.worktree === \"direct\") return { cwd: fallbackCwd };"),
+                      "declarative worktree:none must stay direct without becoming secretary main-session trust")
     }
 
     func testDoneDeliverySeparatesInflightConfirmationAndBoundedRetry() throws {
@@ -91,7 +109,7 @@ final class HighFanoutExtensionTests: XCTestCase {
                           "confirmed delivery must be persisted before its in-memory retry row is removed")
 
         XCTAssertTrue(s.contains("const obligation = createDoneObligation(agentId, runId, text);"))
-        XCTAssertTrue(s.contains("runId: keepLive ?"),
+        XCTAssertTrue(s.contains("const episodeRunId = runId ?? DeliveryObligationStore.runId();"),
                       "reusing one semantic agent id must create a distinct run identity")
 
         let bundled = try XCTUnwrap(PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil))
@@ -132,7 +150,7 @@ final class HighFanoutExtensionTests: XCTestCase {
 
     func testGlobalAgentLeaseRejectsAnotherProcessAndRecoversAfterCrash() throws {
         let s = try source()
-        try runNode(try pureRegion("AGENT_LEASE", in: s), assertions: #"""
+        try runNode(try moduleBody("agent-lease.ts"), assertions: #"""
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         if (process.argv[2] === "lease-child") {
           const root = process.argv[3];
@@ -181,7 +199,8 @@ final class HighFanoutExtensionTests: XCTestCase {
         XCTAssertTrue(s.contains("releaseAgentLease(agentLease);"))
         XCTAssertEqual(s.components(separatedBy: #"kind: "end""#).count - 1, 3,
                        "every terminal UI event must use the guarded terminal-report path")
-        XCTAssertEqual(s.components(separatedBy: "postTerminalPipiuiReport({").count - 1, 3)
+        XCTAssertEqual(s.components(separatedBy: "postTerminalPipiuiReport({").count - 1, 4,
+                       "the three terminal end reports plus run-scoped closeout must share guarded delivery")
         XCTAssertFalse(s.contains("pipiuiReport({\n\t\tkind: \"end\""),
                        "no terminal report may remain fire-and-forget")
         let terminalDrain = try XCTUnwrap(s.range(of: "await awaitTerminalPipiuiReports(pipiuiAgentId);"))
@@ -323,7 +342,7 @@ final class HighFanoutExtensionTests: XCTestCase {
         XCTAssertTrue(s.contains("() => isAgentLocallyActiveForSessionPrune(entry.agentId)"))
         XCTAssertTrue(s.contains("() => acquireAgentLease(path.resolve(PIPIUI_MAIN_CWD), entry.agentId).lease"))
         let housekeepingStart = try XCTUnwrap(s.range(of: "async function readStoredSessions(dir: string)"))
-        let housekeepingEnd = try XCTUnwrap(s.range(of: "function seedBossLedger()", range: housekeepingStart.lowerBound..<s.endIndex))
+        let housekeepingEnd = try XCTUnwrap(s.range(of: "function agentSessionDir()", range: housekeepingStart.lowerBound..<s.endIndex))
         let housekeeping = String(s[housekeepingStart.lowerBound..<housekeepingEnd.lowerBound])
         XCTAssertFalse(housekeeping.contains("readdirSync"), "housekeeping must not synchronously scan sessions")
         XCTAssertFalse(housekeeping.contains("statSync"), "housekeeping must not synchronously stat sessions")

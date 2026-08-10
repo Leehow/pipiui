@@ -24,6 +24,21 @@ extension ComputerCoordinator {
             ))
             return
         }
+        if let bundleIdentifier {
+            let hostMatch = hostSelfProtection.match(
+                processID: 0,
+                bundleID: bundleIdentifier
+            )
+            guard !hostMatch.isHost else {
+                _ = rejectHostControl(actionKind: .screenshot, match: hostMatch)
+                reply.respond(Self.cuaFailure(
+                    code: ComputerHostSelfProtectionError.code,
+                    message: ComputerHostSelfProtectionError.hostTarget
+                        .localizedDescription
+                ))
+                return
+            }
+        }
         guard beginCuaOperation(
             requestID: requestID,
             sessionKey: sessionKey,
@@ -78,6 +93,17 @@ extension ComputerCoordinator {
                     ?? resolvedBundleID
                 guard !resolvedBundleID.isEmpty else {
                     throw CuaIntegrationError.invalidLaunchResult
+                }
+                let hostMatch = self.hostSelfProtection.match(
+                    processID: processID,
+                    bundleID: resolvedBundleID
+                )
+                guard !hostMatch.isHost else {
+                    _ = self.rejectHostControl(
+                        actionKind: .screenshot,
+                        match: hostMatch
+                    )
+                    throw ComputerHostSelfProtectionError.hostTarget
                 }
 
                 var windows = Self.cuaWindows(
@@ -228,6 +254,15 @@ extension ComputerCoordinator {
                 var batchError: String?
                 for step in steps {
                     try Task.checkCancellation()
+                    if step.sourceIndexes.contains(where: {
+                        request.actions[$0].emitsInput
+                    }) {
+                        try self.ensureCuaNativeInputAllowed(
+                            target: currentTarget,
+                            sessionKey: sessionKey,
+                            actionKind: step.kind
+                        )
+                    }
                     do {
                         var evidence: [String: Any]?
                         if let tool = step.tool {
@@ -444,11 +479,36 @@ extension ComputerCoordinator {
         )
     }
 
+    private func ensureCuaNativeInputAllowed(
+        target: CuaComputerTarget,
+        sessionKey: String,
+        actionKind: ComputerActionKind
+    ) throws {
+        let targetMatch = hostSelfProtection.match(target)
+        guard !targetMatch.isHost else {
+            cuaSessionTargets.removeValue(forKey: sessionKey)
+            throw rejectHostControl(actionKind: actionKind, match: targetMatch)
+        }
+        guard let foreground = frontmostApplicationProvider() else {
+            throw ComputerInputError.targetProcessChanged
+        }
+        let foregroundMatch = hostSelfProtection.match(foreground)
+        guard !foregroundMatch.isHost else {
+            cuaSessionTargets.removeValue(forKey: sessionKey)
+            throw rejectHostControl(actionKind: actionKind, match: foregroundMatch)
+        }
+    }
+
     private func reconcileCuaTarget(
         _ target: CuaComputerTarget,
         sessionKey: String,
         driver: CuaDriverTransport
     ) async throws -> CuaComputerTarget {
+        let hostMatch = hostSelfProtection.match(target)
+        guard !hostMatch.isHost else {
+            cuaSessionTargets.removeValue(forKey: sessionKey)
+            throw rejectHostControl(actionKind: .screenshot, match: hostMatch)
+        }
         guard cuaTargetValidator(target) else {
             cuaSessionTargets.removeValue(forKey: sessionKey)
             throw CuaIntegrationError.targetLost
@@ -608,7 +668,13 @@ extension ComputerCoordinator {
         }
         finishCuaOperation(operation)
         let message = error.localizedDescription
-        if Self.cuaNeedsUserHandoff(message) {
+        if error is ComputerHostSelfProtectionError {
+            cuaSessionTargets.removeValue(forKey: operation.sessionKey)
+            operation.reply.respond(Self.cuaFailure(
+                code: ComputerHostSelfProtectionError.code,
+                message: message
+            ))
+        } else if Self.cuaNeedsUserHandoff(message) {
             operation.reply.respond(Self.cuaFailure(
                 code: "user_handoff_required",
                 message: "macOS or the target application requires authentication that automation cannot complete. Please finish the prompt manually, then retry.",

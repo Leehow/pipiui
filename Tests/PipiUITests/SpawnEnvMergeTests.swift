@@ -42,7 +42,14 @@ final class SpawnEnvMergeTests: XCTestCase {
             "PIPIUI_AGENT_ROLE": "old-worker",
             "PIPIUI_MAIN_CWD": "/old/project",
             "PIPIUI_MAIN_MODEL": "old/model",
+            "PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE": "/old/subagent-model-capabilities.json",
+            "PIPIUI_MEMORY_BROKER_ENABLED": "1",
+            "PIPIUI_MEMORY_BROKER_CAPABILITY": "old-memory-token",
             "PIPIUI_WEBSEARCH_CONFIG_FILE": "/old/websearch.json",
+            "PIPIUI_GITHUB_EXT": "/old/packages/github-fetch",
+            "PIPIUI_ARXIV_EXT": "/old/packages/arxiv-fetch",
+            "PIPIUI_PDF_EXT": "/old/pdf-extract.ts",
+            "PIPIUI_PDF_HELPER": "/old/pipiui-pdf-helper",
             "PIPIUI_WORKTREE": "1",
         ]
         let disabled = BuiltInFeatureSettings.EnabledSet(
@@ -62,6 +69,9 @@ final class SpawnEnvMergeTests: XCTestCase {
                     git: "/p/git.ts",
                     reload: "/p/reload.ts",
                     webSearch: "/p/websearch.ts",
+                    githubFetchPackage: "/p/packages/github-fetch",
+                    arxivFetchPackage: "/p/packages/arxiv-fetch",
+                    pdfExtract: "/p/pdf-extract.ts",
                     mcp: "/p/mcp.ts",
                     skillLoader: "/p/skills.ts",
                     searchScope: "/p/search.ts",
@@ -120,6 +130,9 @@ final class SpawnEnvMergeTests: XCTestCase {
                     git: nil,
                     reload: nil,
                     webSearch: nil,
+                    githubFetchPackage: "/current/packages/github-fetch",
+                    arxivFetchPackage: "/current/packages/arxiv-fetch",
+                    pdfExtract: "/current/pdf-extract.ts",
                     mcp: nil,
                     skillLoader: nil,
                     searchScope: "/current/search.ts",
@@ -141,6 +154,13 @@ final class SpawnEnvMergeTests: XCTestCase {
         let stale: [String: String] = [
             "PIPIUI_SUBAGENT_EXT": "/old/subagent",
             "PIPIUI_SEARCH_SCOPE_EXT": "/old/search.ts",
+            "PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE": "/old/subagent-model-capabilities.json",
+            "PIPIUI_MEMORY_BROKER_ENABLED": "0",
+            "PIPIUI_MEMORY_BROKER_CAPABILITY": "old-memory-token",
+            "PIPIUI_GITHUB_EXT": "/old/packages/github-fetch",
+            "PIPIUI_ARXIV_EXT": "/old/packages/arxiv-fetch",
+            "PIPIUI_PDF_EXT": "/old/pdf-extract.ts",
+            "PIPIUI_PDF_HELPER": "/old/pipiui-pdf-helper",
             "PIPIUI_COMPUTER_EXT": "/old/computer.ts",
             "PIPIUI_COMPUTER_CAPABILITY": "old-token",
         ]
@@ -149,6 +169,18 @@ final class SpawnEnvMergeTests: XCTestCase {
 
         XCTAssertEqual(final["PIPIUI_SUBAGENT_EXT"], "/current/subagent")
         XCTAssertEqual(final["PIPIUI_SEARCH_SCOPE_EXT"], "/current/search.ts")
+        XCTAssertNil(final["PIPIUI_MEMORY_BROKER_ENABLED"],
+                     "non-Hermes assembly must not inherit a stale broker route")
+        XCTAssertNil(final["PIPIUI_MEMORY_BROKER_CAPABILITY"],
+                     "dispatcher-only capability must never come from parent/.env")
+        XCTAssertEqual(
+            final["PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE"],
+            SubagentModelSettings.capabilityCatalogFileURL().path
+        )
+        XCTAssertEqual(final["PIPIUI_GITHUB_EXT"], "/current/packages/github-fetch")
+        XCTAssertEqual(final["PIPIUI_ARXIV_EXT"], "/current/packages/arxiv-fetch")
+        XCTAssertEqual(final["PIPIUI_PDF_EXT"], "/current/pdf-extract.ts")
+        XCTAssertNotEqual(final["PIPIUI_PDF_HELPER"], "/old/pipiui-pdf-helper")
         XCTAssertEqual(final["PIPIUI_COMPUTER_EXT"], "/current/computer.ts")
         XCTAssertEqual(final["PIPIUI_COMPUTER_CAPABILITY"], "current-computer-token")
     }

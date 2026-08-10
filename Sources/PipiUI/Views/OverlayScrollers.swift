@@ -39,6 +39,15 @@ enum OverlayScrollers {
         _ = applyIfNeeded(to: scrollView)
     }
 
+    /// True when `scrollView` already carries the overlay configuration that
+    /// `applyIfNeeded` installs. Centralises the installer's idempotency guard
+    /// so it is unit-testable instead of buried inside the NSViewRepresentable.
+    static func isCorrectlyConfigured(_ scrollView: NSScrollView) -> Bool {
+        scrollView.hasVerticalScroller
+            && scrollView.scrollerStyle == .overlay
+            && scrollView.autohidesScrollers
+    }
+
     static func collect(from root: NSView) -> [NSScrollView] {
         var found: [NSScrollView] = []
         var seen = Set<ObjectIdentifier>()
@@ -68,6 +77,10 @@ private struct OverlayScrollerInstaller: NSViewRepresentable {
     /// no following body pass to re-apply from. Same budget the old
     /// `SidebarVerticalScrollerHider` used (16 × 50 ms).
     fileprivate static let postSuccessTicks = 16
+
+    /// Discovery retry budget while no scroll view is attached yet (50 ms each).
+    /// Bounded so a never-mounted host cannot spin forever.
+    fileprivate static let discoveryRetryLimit = 16
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -105,13 +118,19 @@ private struct OverlayScrollerInstaller: NSViewRepresentable {
 
     final class Coordinator {
         /// Discovery retries while the scroll view is not yet in the hierarchy.
-        private var attempts = 0
-        /// Strictly bounded post-layout re-apply window (ticks), re-armed only by
-        /// direct SwiftUI passes (attach hooks / updateNSView). Retry ticks
-        /// consume it without re-arming, so the chain stops while the sidebar is
-        /// idle — never a self-perpetuating timer.
-        private var reapplyTicksRemaining = 0
+        /// Bounded so a never-mounted host cannot spin forever.
+        private var discoveryAttempts = 0
+        /// Strictly bounded post-install re-confirm window (50 ms ticks). Armed
+        /// ONLY when a real scroller-flag change was applied this pass; the
+        /// timer chain then consumes it without re-arming. A steady-state body
+        /// pass (live badges, selection, hover, search) finds every scroll view
+        /// already correctly styled and schedules nothing — the previous logic
+        /// re-armed this 16×50ms chain on every single body re-render.
+        private var confirmTicksRemaining = 0
         private var workItem: DispatchWorkItem?
+        /// Per-scroll-view idempotency guard: once a scroll view is confirmed
+        /// overlay-styled, later passes skip it (and skip re-arming any timer)
+        /// unless SwiftUI reset its flags or rebuilt it as a new instance.
         private var styled = Set<ObjectIdentifier>()
         /// Weakly retained targets so every pass re-applies without depending on
         /// re-discovery (mirrors `StickToBottomTracker.attachedScrollView`). Weak
@@ -119,10 +138,6 @@ private struct OverlayScrollerInstaller: NSViewRepresentable {
         private var retained: [WeakScrollViewBox] = []
 
         func ensureInstalled(from view: NSView) {
-            ensureInstalled(from: view, rearmPostWindow: true)
-        }
-
-        private func ensureInstalled(from view: NSView, rearmPostWindow: Bool) {
             var scrollViews = OverlayScrollers.collect(from: view)
             // Merge retained targets back in: during a content rebuild the
             // installer can sit between hierarchies where collect() alone would
@@ -133,48 +148,60 @@ private struct OverlayScrollerInstaller: NSViewRepresentable {
                     scrollViews.append(sv)
                 }
             }
+
             guard !scrollViews.isEmpty else {
-                scheduleRetry(from: view)
+                scheduleDiscoveryRetry(from: view)
                 return
             }
-            if rearmPostWindow {
-                attempts = 0
-                // SwiftUI can reset the AppKit scroller flags shortly after
-                // attachment (scroll-indicator materialization) with no body pass
-                // after it. The transcript survives that via StickToBottomTracker's
-                // per-pass re-apply; here re-apply briefly through the same single
-                // bounded timer — idempotent, no extra timers.
-                reapplyTicksRemaining = OverlayScrollerInstaller.postSuccessTicks
-            }
+            // Scroll views found: reset the discovery budget and remember targets.
+            discoveryAttempts = 0
             retained = scrollViews.map(WeakScrollViewBox.init)
             let ids = Set(scrollViews.map(ObjectIdentifier.init))
+
+            var appliedChange = false
             for sv in scrollViews {
                 let id = ObjectIdentifier(sv)
-                if styled.contains(id),
-                   sv.scrollerStyle == .overlay,
-                   sv.autohidesScrollers {
+                // Idempotency guard: already styled AND still correctly configured
+                // ⇒ no work, no timer re-arm this pass.
+                if styled.contains(id), OverlayScrollers.isCorrectlyConfigured(sv) {
                     continue
                 }
-                if OverlayScrollers.applyIfNeeded(to: sv) || sv.scrollerStyle == .overlay {
+                let didChange = OverlayScrollers.applyIfNeeded(to: sv)
+                if didChange || sv.scrollerStyle == .overlay {
                     styled.insert(id)
                 }
+                if didChange { appliedChange = true }
             }
+            // Drop ids for scroll views that have left the hierarchy.
             styled.formIntersection(ids)
-            if reapplyTicksRemaining > 0 {
-                reapplyTicksRemaining -= 1
-                scheduleRetry(from: view)
+
+            if appliedChange {
+                // SwiftUI can reset scroller flags during the layout pass right
+                // after install with no following body pass to re-apply. Re-confirm
+                // briefly through one bounded timer (idempotent, no extra timers).
+                confirmTicksRemaining = OverlayScrollerInstaller.postSuccessTicks
+                scheduleTick(from: view)
+            } else if confirmTicksRemaining > 0 {
+                confirmTicksRemaining -= 1
+                scheduleTick(from: view)
             }
+            // else: steady state — every scroll view is correct and the confirm
+            // window has expired. Nothing is scheduled; the next body pass
+            // rechecks cheaply (collect + isCorrectlyConfigured) and reschedules
+            // only if a flag was reset (e.g. SwiftUI rebuilt the scroll view).
         }
 
-        private func scheduleRetry(from view: NSView) {
-            guard attempts < 16 else { return }
-            attempts += 1
+        private func scheduleDiscoveryRetry(from view: NSView) {
+            guard discoveryAttempts < OverlayScrollerInstaller.discoveryRetryLimit else { return }
+            discoveryAttempts += 1
+            scheduleTick(from: view)
+        }
+
+        private func scheduleTick(from view: NSView) {
             workItem?.cancel()
             let item = DispatchWorkItem { [weak self, weak view] in
                 guard let self, let view else { return }
-                // Retry ticks never re-arm the post-layout window: the chain
-                // always terminates on its own while nothing keeps updating.
-                self.ensureInstalled(from: view, rearmPostWindow: false)
+                self.ensureInstalled(from: view)
             }
             workItem = item
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: item)
@@ -185,6 +212,8 @@ private struct OverlayScrollerInstaller: NSViewRepresentable {
             workItem = nil
             styled.removeAll()
             retained.removeAll()
+            confirmTicksRemaining = 0
+            discoveryAttempts = 0
         }
 
         deinit { cancel() }

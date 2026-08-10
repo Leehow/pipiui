@@ -27,6 +27,12 @@ enum WorktreeLifecycle: String, Codable, Equatable, Sendable {
 }
 
 /// Persisted final disposition used by Boss closeout and restart reconciliation.
+/// Durable owner/state for a single merge-recovery incident. The record is attached to
+/// the original worker so restart/replayed end events cannot create a second fixer.
+enum WorktreeRecoveryState: String, Codable, Equatable, Sendable {
+    case queued, fixerRunning, waitingForMain, retryingMerge, verifying, closed, needsBoss, needsUser
+}
+
 enum AgentCloseoutDisposition: String, Codable, Equatable, Sendable {
     /// Still running, awaiting merge/verify, or not yet audited.
     case unclassified
@@ -49,6 +55,8 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
     }
 
     let id: String
+    /// Unique Node dispatch identity. Optional so persisted rows from before run-scoped closeout decode safely.
+    var runId: String? = nil
     let parentId: String?
     /// 派出它的主会话 subagent 工具调用 id（用于主界面卡片归属匹配）
     var toolCallId: String?
@@ -90,9 +98,21 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
     /// secretary mirrors/summarizes it into the Boss ledger rather than creating a second ledger.
     var closeoutDisposition: AgentCloseoutDisposition = .unclassified
     var closeoutReason: String? = nil
+    /// Producer closeout timestamp when supplied; display evidence only, never an ordering authority.
+    var closeoutAt: Date? = nil
     /// Mark-only dormancy hint: terminal/dormant longer than the reap TTL. Never auto-deletes
     /// worktrees/branches; UI may surface this later. Defaults false so old JSON still decodes.
     var cleanupSuggested: Bool = false
+    /// Persisted, single-owner recovery incident. Optional/default keeps old session JSON readable.
+    var recoveryState: WorktreeRecoveryState? = nil
+    var recoveryOwner: String? = nil
+    var recoveryAttempt: Int = 0
+    var recoveryReason: String? = nil
+    var recoveryUpdatedAt: Date? = nil
+    /// Third automatic route starts fresh context but keeps this agent's branch/worktree.
+    var recoveryFreshContext: Bool = false
+    /// Durable once latch for the one boss technical-escalation signal after fresh recovery fails.
+    var recoveryBossSignaled: Bool = false
     /// Latest turn context occupancy (from usage.totalTokens / contextTokens).
     var contextTokens: Int = 0
     /// Model context window when known.
@@ -143,18 +163,21 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, parentId, toolCallId, name, task, title, depth, model
+        case id, runId, parentId, toolCallId, name, task, title, depth, model
         case state, output, activity, log, cost, turns, started, lastObservedAt, ended
         case stalled, stalledIdleSec
         case worktreePath, worktreeBranch, worktreeError, worktreeLifecycle
         case verifyCommand, verifyExit
-        case closeoutDisposition, closeoutReason, cleanupSuggested
+        case closeoutDisposition, closeoutReason, closeoutAt, cleanupSuggested
+        case recoveryState, recoveryOwner, recoveryAttempt, recoveryReason, recoveryUpdatedAt
+        case recoveryFreshContext, recoveryBossSignaled
         case contextTokens, contextWindow
         case totalInput, totalOutput, totalCacheRead, totalCacheWrite
     }
 
     init(
         id: String,
+        runId: String? = nil,
         parentId: String?,
         toolCallId: String? = nil,
         name: String,
@@ -181,7 +204,15 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         verifyExit: Int? = nil,
         closeoutDisposition: AgentCloseoutDisposition = .unclassified,
         closeoutReason: String? = nil,
+        closeoutAt: Date? = nil,
         cleanupSuggested: Bool = false,
+        recoveryState: WorktreeRecoveryState? = nil,
+        recoveryOwner: String? = nil,
+        recoveryAttempt: Int = 0,
+        recoveryReason: String? = nil,
+        recoveryUpdatedAt: Date? = nil,
+        recoveryFreshContext: Bool = false,
+        recoveryBossSignaled: Bool = false,
         contextTokens: Int = 0,
         contextWindow: Int? = nil,
         totalInput: Int = 0,
@@ -190,6 +221,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         totalCacheWrite: Int = 0
     ) {
         self.id = id
+        self.runId = runId
         self.parentId = parentId
         self.toolCallId = toolCallId
         self.name = name
@@ -216,7 +248,15 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         self.verifyExit = verifyExit
         self.closeoutDisposition = closeoutDisposition
         self.closeoutReason = closeoutReason
+        self.closeoutAt = closeoutAt
         self.cleanupSuggested = cleanupSuggested
+        self.recoveryState = recoveryState
+        self.recoveryOwner = recoveryOwner
+        self.recoveryAttempt = recoveryAttempt
+        self.recoveryReason = recoveryReason
+        self.recoveryUpdatedAt = recoveryUpdatedAt
+        self.recoveryFreshContext = recoveryFreshContext
+        self.recoveryBossSignaled = recoveryBossSignaled
         self.contextTokens = contextTokens
         self.contextWindow = contextWindow
         self.totalInput = totalInput
@@ -228,6 +268,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
+        runId = try c.decodeIfPresent(String.self, forKey: .runId)
         parentId = try c.decodeIfPresent(String.self, forKey: .parentId)
         toolCallId = try c.decodeIfPresent(String.self, forKey: .toolCallId)
         name = try c.decode(String.self, forKey: .name)
@@ -263,7 +304,15 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
             forKey: .closeoutDisposition
         ) ?? .unclassified
         closeoutReason = try c.decodeIfPresent(String.self, forKey: .closeoutReason)
+        closeoutAt = try c.decodeIfPresent(Date.self, forKey: .closeoutAt)
         cleanupSuggested = try c.decodeIfPresent(Bool.self, forKey: .cleanupSuggested) ?? false
+        recoveryState = try c.decodeIfPresent(WorktreeRecoveryState.self, forKey: .recoveryState)
+        recoveryOwner = try c.decodeIfPresent(String.self, forKey: .recoveryOwner)
+        recoveryAttempt = try c.decodeIfPresent(Int.self, forKey: .recoveryAttempt) ?? 0
+        recoveryReason = try c.decodeIfPresent(String.self, forKey: .recoveryReason)
+        recoveryUpdatedAt = try c.decodeIfPresent(Date.self, forKey: .recoveryUpdatedAt)
+        recoveryFreshContext = try c.decodeIfPresent(Bool.self, forKey: .recoveryFreshContext) ?? false
+        recoveryBossSignaled = try c.decodeIfPresent(Bool.self, forKey: .recoveryBossSignaled) ?? false
         contextTokens = try c.decodeIfPresent(Int.self, forKey: .contextTokens) ?? 0
         contextWindow = try c.decodeIfPresent(Int.self, forKey: .contextWindow)
         totalInput = try c.decodeIfPresent(Int.self, forKey: .totalInput) ?? 0
@@ -275,6 +324,7 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(id, forKey: .id)
+        try c.encodeIfPresent(runId, forKey: .runId)
         try c.encodeIfPresent(parentId, forKey: .parentId)
         try c.encodeIfPresent(toolCallId, forKey: .toolCallId)
         try c.encode(name, forKey: .name)
@@ -301,7 +351,15 @@ struct SubagentInfo: Identifiable, Equatable, Codable, Sendable {
         try c.encodeIfPresent(verifyExit, forKey: .verifyExit)
         try c.encode(closeoutDisposition, forKey: .closeoutDisposition)
         try c.encodeIfPresent(closeoutReason, forKey: .closeoutReason)
+        try c.encodeIfPresent(closeoutAt, forKey: .closeoutAt)
         try c.encode(cleanupSuggested, forKey: .cleanupSuggested)
+        try c.encodeIfPresent(recoveryState, forKey: .recoveryState)
+        try c.encodeIfPresent(recoveryOwner, forKey: .recoveryOwner)
+        try c.encode(recoveryAttempt, forKey: .recoveryAttempt)
+        try c.encodeIfPresent(recoveryReason, forKey: .recoveryReason)
+        try c.encodeIfPresent(recoveryUpdatedAt, forKey: .recoveryUpdatedAt)
+        try c.encode(recoveryFreshContext, forKey: .recoveryFreshContext)
+        try c.encode(recoveryBossSignaled, forKey: .recoveryBossSignaled)
         try c.encode(contextTokens, forKey: .contextTokens)
         try c.encodeIfPresent(contextWindow, forKey: .contextWindow)
         try c.encode(totalInput, forKey: .totalInput)
@@ -417,6 +475,8 @@ enum SubagentStatusCheckPrompt {
 
 /// 后台 git 操作结果（detached 任务返回值，跨线程传递）。
 enum MergeGitOutcome: Sendable {
+    case waitingForMain(String)
+    case blocked(String)
     case ok
     case zeroChangeCleaned
     case mergeFailed(String)
@@ -947,7 +1007,12 @@ final class SubagentStore: ObservableObject {
     var bridgeRoutingKey: String?
     /// Resolve model id (`provider/id`) → context window; set by ChatSession from availableModels.
     var resolveContextWindow: ((String?) -> Int?)?
-    /// Fired when merge fails (auto or manual); ChatSession injects `[worktree-merge-failed]`.
+    /// Fired once when runtime must resume the original worker to recover a committed-tree conflict.
+    /// The owner is persisted before this callback, so duplicate callbacks and restart are no-ops.
+    var onWorktreeRecoveryNeeded: ((SubagentInfo) -> Void)?
+    /// One durable technical escalation after the fresh recovery route also fails.
+    var onWorktreeRecoveryEscalated: ((SubagentInfo) -> Void)?
+    /// Legacy UI notification hook. Recovery no longer depends on it.
     var onWorktreeMergeFailed: ((SubagentInfo, String) -> Void)?
     /// Fired when the merged tree fails the agent's attested verify command;
     /// ChatSession injects `[post-merge-verify-failed]`. Third arg: main tree was dirty
@@ -977,6 +1042,7 @@ final class SubagentStore: ObservableObject {
     /// Persisted rows load asynchronously after the main project may already be bound.
     private var hasLoadedPersistedAgents = false
     private var didRetryPersistedPendingReviewMerges = false
+    private var waitingForMainRetry: DispatchWorkItem?
     /// Post-merge verify coalescing: distinct command → 本次被聚留的 agent 列表（含快照）。
     /// 验证只跑一次，但成功/失败结果应用到本次批次内全部相关 agent；flush 时清空，
     /// 之后同命令的新 merge 重新建批，不被旧批次结果提前最终化。
@@ -998,9 +1064,15 @@ final class SubagentStore: ObservableObject {
         let observedAt: Date
     }
     private var pendingAgentEvents: [PendingAgentEvent] = []
-    /// Latest replaceable telemetry slot per agent/kind, cleared at every per-agent segment barrier.
+    /// Latest replaceable telemetry slot per agent/run/kind, cleared at every per-run segment barrier.
     private var replaceablePendingEventIndex: [String: Int] = [:]
-    private var pendingLastEventKindByAgent: [String: String] = [:]
+    private var pendingLastEventKindByRun: [String: String] = [:]
+    /// Most recent accepted run-scoped start waiting in the mailbox for each reusable agent ID.
+    private var pendingStartRunIDByAgent: [String: String] = [:]
+    /// Bounded, process-local stale-start fence. It remembers only producer-issued IDs
+    /// displaced by a later accepted run; it never mints, resolves, or schedules runs.
+    private var retiredRunIDsByAgentID: [String: [String]] = [:]
+    private static let retiredRunIDLimit = 16
     /// Lifecycle projection for events waiting in the mailbox. Auto-open decisions must
     /// observe enqueue order, not the last published tree, because an end and the next
     /// root start can arrive inside the same 16ms window.
@@ -1057,6 +1129,7 @@ final class SubagentStore: ObservableObject {
         pendingSaveWorkItem?.cancel()
         orphanReconcileTimer?.invalidate()
         dormantReapTimer?.invalidate()
+        waitingForMainRetry?.cancel()
     }
 
     /// Bind the session's main project URL so successful agents can auto-merge.
@@ -1349,10 +1422,16 @@ final class SubagentStore: ObservableObject {
     private func setCloseoutDisposition(
         at index: Int,
         _ disposition: AgentCloseoutDisposition,
-        reason: String?
+        reason: String?,
+        closeoutAt: Date? = nil
     ) {
         agents[index].closeoutDisposition = disposition
         agents[index].closeoutReason = reason
+        if disposition == .cleaned {
+            if let closeoutAt { agents[index].closeoutAt = closeoutAt }
+        } else {
+            agents[index].closeoutAt = nil
+        }
         mirrorCloseoutDispositionToBossLedger(
             agentId: agents[index].id,
             disposition: disposition,
@@ -1427,17 +1506,48 @@ final class SubagentStore: ObservableObject {
 
     /// After restart, resume one missed automatic merge for each eligible persisted row.
     /// The end-event path uses the same scheduler, so a concurrent replay cannot duplicate Git work.
+    /// Re-emit only persisted, already-owned fixer incidents after the UI has installed
+    /// its runtime command callback. Kept separate from merge scheduling so binding order
+    /// cannot lose a restart recovery.
+    func dispatchPersistedRecoveryIfNeeded() {
+        guard hasLoadedPersistedAgents else { return }
+        for agent in agents where agent.recoveryState == .fixerRunning && agent.recoveryOwner == agent.id {
+            onWorktreeRecoveryNeeded?(agent)
+        }
+    }
+
     private func retryPersistedPendingReviewMergesIfReady() {
         guard hasLoadedPersistedAgents,
               !didRetryPersistedPendingReviewMerges,
               let main = mainProjectURL else { return }
         didRetryPersistedPendingReviewMerges = true
-        for agent in agents where agent.state == .ok
-                && agent.worktreeLifecycle == .pendingReview
-                && (agent.verifyExit ?? 0) == 0
-                && agent.worktreePath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
-            scheduleAutomaticMerge(agentId: agent.id, mainProjectURL: main)
+        for agent in agents where agent.worktreePath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            if agent.recoveryState == .waitingForMain {
+                scheduleWaitingForMainRetry()
+            } else if agent.state == .ok,
+                      agent.worktreeLifecycle == .pendingReview,
+                      (agent.verifyExit ?? 0) == 0 {
+                scheduleAutomaticMerge(agentId: agent.id, mainProjectURL: main)
+            } else if agent.recoveryState == .fixerRunning {
+                // The durable claim survived the process, but no in-memory child did.
+                // Re-emit exactly once after reload; the command-side lease makes it a no-op
+                // if the original runtime is still alive.
+                onWorktreeRecoveryNeeded?(agent)
+            }
         }
+    }
+
+    private func scheduleWaitingForMainRetry() {
+        guard waitingForMainRetry == nil, let main = mainProjectURL else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.waitingForMainRetry = nil
+            for agent in self.agents where agent.recoveryState == .waitingForMain {
+                self.scheduleAutomaticMerge(agentId: agent.id, mainProjectURL: main)
+            }
+        }
+        waitingForMainRetry = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: item)
     }
 
     private func scheduleAutomaticMerge(agentId: String, mainProjectURL: URL) {
@@ -1673,23 +1783,34 @@ final class SubagentStore: ObservableObject {
     }
 
     /// O(1) bridge ingress. Replaceable telemetry is collapsed within one frame; log and
-    /// usage records remain lossless, and start/end events form ordering barriers per agent.
+    /// usage records remain lossless, and start/end events form ordering barriers per run.
     /// The return value is true exactly once when a root event begins a projected wave.
     @discardableResult
     func enqueue(_ event: J, observedAt: Date = Date()) -> Bool {
         dispatchPrecondition(condition: .onQueue(.main))
         guard let id = event["agentId"].string, !id.isEmpty else { return false }
-        let shouldAutoOpen = projectAutoOpenDecision(for: event, agentID: id)
         let kind = event["kind"].string ?? ""
-        // Coalesce only one consecutive same-kind segment. Any intervening event for
-        // this agent is an ordering barrier, including lossless log/usage records.
-        // log_delta is replaceable per contentIndex (cumulative snapshot upserts).
-        if pendingLastEventKindByAgent[id] != kind {
-            clearReplaceablePendingSlots(forAgentID: id)
+        if isStaleRunScopedStart(event, agentID: id) { return false }
+        if kind == "start",
+           let runId = event["runId"].string?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !runId.isEmpty,
+           !(index(forAgentID: id).map { agents[$0].state == .running && agents[$0].runId != runId } ?? false) {
+            pendingStartRunIDByAgent[id] = runId
         }
-        pendingLastEventKindByAgent[id] = kind
+        // Drop known stale telemetry before it can alter mailbox coalescing or the
+        // projected running count. A queued new start establishes the expected run.
+        if isStaleRunScopedNonStartEvent(event, agentID: id) { return false }
+        let shouldAutoOpen = projectAutoOpenDecision(for: event, agentID: id)
+        let runIdentity = pendingRunIdentity(for: event, agentID: id)
+        // Coalesce only one consecutive same-kind segment. Any intervening event for
+        // this run is an ordering barrier, including lossless log/usage records.
+        // log_delta is replaceable per contentIndex (cumulative snapshot upserts).
+        if pendingLastEventKindByRun[runIdentity] != kind {
+            clearReplaceablePendingSlots(forRunIdentity: runIdentity)
+        }
+        pendingLastEventKindByRun[runIdentity] = kind
         if kind == "update" || kind == "stalled" {
-            let replacementKey = "\(id)|\(kind)"
+            let replacementKey = "\(runIdentity)|\(kind)"
             if let index = replaceablePendingEventIndex[replacementKey] {
                 pendingAgentEvents[index] = PendingAgentEvent(
                     event: event,
@@ -1701,7 +1822,7 @@ final class SubagentStore: ObservableObject {
             }
         } else if kind == "log_delta" {
             let contentIndex = event["contentIndex"].int ?? 0
-            let replacementKey = "\(id)|log_delta|\(contentIndex)"
+            let replacementKey = "\(runIdentity)|log_delta|\(contentIndex)"
             if let index = replaceablePendingEventIndex[replacementKey] {
                 pendingAgentEvents[index] = PendingAgentEvent(
                     event: event,
@@ -1730,7 +1851,8 @@ final class SubagentStore: ObservableObject {
         let batch = pendingAgentEvents
         pendingAgentEvents.removeAll(keepingCapacity: true)
         replaceablePendingEventIndex.removeAll(keepingCapacity: true)
-        pendingLastEventKindByAgent.removeAll(keepingCapacity: true)
+        pendingLastEventKindByRun.removeAll(keepingCapacity: true)
+        pendingStartRunIDByAgent.removeAll(keepingCapacity: true)
         projectedRunningByAgentID.removeAll(keepingCapacity: true)
         projectedRunningCount = nil
         applyAgentEvents(batch)
@@ -1738,10 +1860,62 @@ final class SubagentStore: ObservableObject {
 
     var pendingAgentEventCount: Int { pendingAgentEvents.count }
 
-    /// Drop coalesce slots for one agent (prefix `id|`). Pending events already in the
-    /// mailbox stay; only future same-key merges are affected.
-    private func clearReplaceablePendingSlots(forAgentID id: String) {
-        let prefix = "\(id)|"
+    /// Namespace mailbox coalescing by the extension-captured run ID. Historical
+    /// run-less bodies share a legacy bucket because they cannot identify an episode.
+    private func pendingRunIdentity(for event: J, agentID id: String) -> String {
+        let runId = event["runId"].string?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let runId, !runId.isEmpty { return "\(id)\u{0}\(runId)" }
+        return "\(id)\u{0}<legacy>"
+    }
+
+    /// A current row or queued start can reject stale non-start telemetry before
+    /// it affects mailbox coalescing or projected lifecycle state.
+    private func isStaleRunScopedNonStartEvent(_ event: J, agentID id: String) -> Bool {
+        guard event["kind"].string != "start",
+              let eventRunId = event["runId"].string?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !eventRunId.isEmpty
+        else { return false }
+        if let queuedRunId = pendingStartRunIDByAgent[id] {
+            return queuedRunId != eventRunId
+        }
+        guard let index = index(forAgentID: id),
+              let currentRunId = agents[index].runId
+        else { return false }
+        return currentRunId != eventRunId
+    }
+
+    /// Reject only producer IDs already displaced by a newer accepted episode. Unknown
+    /// IDs after a terminal row remain a legitimate next episode; run-less legacy starts
+    /// remain untouched because Swift must not manufacture an identity for them.
+    private func isStaleRunScopedStart(_ event: J, agentID id: String) -> Bool {
+        guard event["kind"].string == "start",
+              let eventRunId = event["runId"].string?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !eventRunId.isEmpty,
+              let index = index(forAgentID: id),
+              let currentRunId = agents[index].runId
+        else { return false }
+        if agents[index].state == .running {
+            return currentRunId != eventRunId
+        }
+        if currentRunId == eventRunId { return true }
+        return retiredRunIDsByAgentID[id]?.contains(eventRunId) == true
+    }
+
+    private func rememberRetiredRun(_ runId: String, for agentID: String) {
+        guard !runId.isEmpty else { return }
+        var retired = retiredRunIDsByAgentID[agentID] ?? []
+        retired.removeAll { $0 == runId }
+        retired.append(runId)
+        if retired.count > Self.retiredRunIDLimit {
+            retired.removeFirst(retired.count - Self.retiredRunIDLimit)
+        }
+        retiredRunIDsByAgentID[agentID] = retired
+    }
+
+    /// Drop coalesce slots for one exact agent/run identity. Pending events already
+    /// in the mailbox stay; only future same-key merges are affected.
+    private func clearReplaceablePendingSlots(forRunIdentity runIdentity: String) {
+        let prefix = "\(runIdentity)|"
         replaceablePendingEventIndex = replaceablePendingEventIndex.filter {
             !$0.key.hasPrefix(prefix)
         }
@@ -1783,6 +1957,34 @@ final class SubagentStore: ObservableObject {
         let oldIndex = index(forAgentID: id)
         let oldState = oldIndex.map { agents[$0].state }
         let oldCost = oldIndex.map { agents[$0].cost } ?? 0
+        let eventRunId = e["runId"].string?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Closeout is strictly run-scoped: never let an old Node event mark a reused row handled.
+        if kind == "closeout" {
+            guard let i = oldIndex,
+                  let eventRunId, !eventRunId.isEmpty,
+                  agents[i].runId == eventRunId else {
+                return (false, false)
+            }
+        }
+        // Every non-start report is run-scoped when the producer supplied an ID.
+        // Never let late telemetry from an old run mutate a reused agentId row.
+        // Run-less historical Swift bodies remain compatible with the existing row.
+        if kind != "start", let i = oldIndex,
+           let eventRunId, !eventRunId.isEmpty,
+           let currentRunId = agents[i].runId,
+           currentRunId != eventRunId {
+            return (false, false)
+        }
+        // The start fence only rejects a currently-running mismatch, a duplicate terminal
+        // run, or a producer ID remembered as displaced by a newer episode. An unknown
+        // runId after a terminal row is still the valid reuse path.
+        if isStaleRunScopedStart(e, agentID: id) { return (false, false) }
+        // A duplicate accepted closeout carries no new evidence. Reject it before it can
+        // refresh observation/callback state or overwrite the first reason/timestamp.
+        if kind == "closeout", let i = oldIndex,
+           agents[i].closeoutDisposition == .cleaned {
+            return (false, false)
+        }
         // For every event tied to an existing agent, record that the UI-side
         // status channel itself is still delivering. `start` also covers a new row.
         if kind != "start", let i = oldIndex {
@@ -1796,6 +1998,12 @@ final class SubagentStore: ObservableObject {
             // Same agentId may resume (续作) after end — refresh running state + worktree meta.
             if let i = oldIndex {
                 markObserved(i, at: observedAt)
+                if let eventRunId, !eventRunId.isEmpty {
+                    if let currentRunId = agents[i].runId, currentRunId != eventRunId {
+                        rememberRetiredRun(currentRunId, for: id)
+                    }
+                    agents[i].runId = eventRunId
+                }
                 agents[i].state = .running
                 agents[i].activity = ""
                 clearStalled(i)
@@ -1803,6 +2011,12 @@ final class SubagentStore: ObservableObject {
                 streamingLogItemIDs[id] = [:]
                 if abortPending.contains(id) { abortPending.remove(id) }
                 agents[i].ended = nil
+                // A runtime recovery resumes this exact worker id/conversation. Its old claim
+                // is now consumed; later failure can create one new attempt, never a sibling.
+                if agents[i].recoveryState == .fixerRunning {
+                    agents[i].recoveryState = .retryingMerge
+                    agents[i].recoveryUpdatedAt = observedAt
+                }
                 setCloseoutDisposition(at: i, .unclassified, reason: nil)
                 if let tc = e["toolCallId"].string { updateToolCallID(tc, at: i) }
                 if let t = e["title"].string { agents[i].title = t }
@@ -1820,6 +2034,7 @@ final class SubagentStore: ObservableObject {
             }
             var info = SubagentInfo(
                 id: id,
+                runId: eventRunId?.isEmpty == false ? eventRunId : nil,
                 parentId: e["parentId"].string,
                 toolCallId: e["toolCallId"].string,
                 name: e["name"].string ?? "agent",
@@ -1907,6 +2122,24 @@ final class SubagentStore: ObservableObject {
                     agents[i].activity = last
                 }
             }
+        case "closeout":
+            guard let i = oldIndex,
+                  e["disposition"].string == AgentCloseoutDisposition.cleaned.rawValue,
+                  (agents[i].state == .failed || agents[i].state == .aborted || agents[i].state == .interrupted)
+            else { return (false, false) }
+            lifecycleChanged = true
+            let producerMillis = e["closeoutAt"].double
+            let closeoutAt = producerMillis.map { millis in
+                millis.isFinite && millis >= 0
+                    ? Date(timeIntervalSince1970: millis / 1_000)
+                    : observedAt
+            } ?? observedAt
+            setCloseoutDisposition(
+                at: i,
+                .cleaned,
+                reason: e["reason"].string ?? "Boss 标记为已处理",
+                closeoutAt: closeoutAt
+            )
         case "end":
             guard let i = oldIndex else { return (false, false) }
             lifecycleChanged = true
@@ -1927,6 +2160,7 @@ final class SubagentStore: ObservableObject {
             agents[i].activity = ""
             agents[i].cost = e["cost"].double ?? agents[i].cost
             agents[i].turns = e["turns"].int ?? agents[i].turns
+            if let eventRunId, !eventRunId.isEmpty { agents[i].runId = eventRunId }
             agents[i].ended = observedAt
             if let path = e["worktreePath"].string { agents[i].worktreePath = path }
             if let branch = e["worktreeBranch"].string { agents[i].worktreeBranch = branch }
@@ -1943,25 +2177,30 @@ final class SubagentStore: ObservableObject {
                 }
             }
             let verifyFailed = (agents[i].verifyExit ?? 0) != 0
-            if agents[i].state != .ok {
-                setCloseoutDisposition(
-                    at: i,
-                    .retained,
-                    reason: "agent \(agents[i].state.rawValue)；成果与 worktree 保留审核"
-                )
-            } else if verifyFailed {
-                setCloseoutDisposition(
-                    at: i,
-                    .retained,
-                    reason: "agent worktree 验证失败；禁止自动合并或清理"
-                )
-            } else if agents[i].worktreePath?.isEmpty != false {
-                // Explicit-main-cwd roles (notably secretary) have no branch/worktree to clean.
-                setCloseoutDisposition(
-                    at: i,
-                    .cleaned,
-                    reason: "无隔离 worktree；运行时无需机械清理"
-                )
+            // A matching Node closeout is a deliberate user/boss decision. Duplicate terminal
+            // reports may arrive later, but must refresh real state/output/verify without
+            // replacing that handled marker with automatic retained/cleaned classification.
+            if agents[i].closeoutDisposition != .cleaned {
+                if agents[i].state != .ok {
+                    setCloseoutDisposition(
+                        at: i,
+                        .retained,
+                        reason: "agent \(agents[i].state.rawValue)；成果与 worktree 保留审核"
+                    )
+                } else if verifyFailed {
+                    setCloseoutDisposition(
+                        at: i,
+                        .retained,
+                        reason: "agent worktree 验证失败；禁止自动合并或清理"
+                    )
+                } else if agents[i].worktreePath?.isEmpty != false {
+                    // Explicit-main-cwd roles (notably secretary) have no branch/worktree to clean.
+                    setCloseoutDisposition(
+                        at: i,
+                        .cleaned,
+                        reason: "无隔离 worktree；运行时无需机械清理"
+                    )
+                }
             }
             // Product default: successful agent + worktree → auto-merge into main + remove wt.
             // failed/aborted/interrupted (incl. vanished settle) keep pendingReview for续作.
@@ -1996,9 +2235,8 @@ final class SubagentStore: ObservableObject {
         return (didMutate, lifecycleChanged)
     }
 
-    /// 活动序（与主会话按 modified 排序一致）：已完成在前、谁最后动谁排前，
-    /// 运行中整体垫底（组内同样按最近活动排序）。依据 UI 观测到的最近一次
-    /// 桥接事件 lastObservedAt；agent 终态后不再有事件，已完成部分的相对顺序稳定。
+    /// 显示序：已完成按完成时间升序（最旧在上、最新在下）；运行中整体垫底，
+    /// 组内按开始时间升序，避免 update/heartbeat 事件令运行中的行频繁换位跳动。
     var displayOrder: [SubagentInfo] {
         agents.sorted { lhs, rhs in
             let lhsRunning = lhs.state == .running
@@ -2006,8 +2244,16 @@ final class SubagentStore: ObservableObject {
             if lhsRunning != rhsRunning {
                 return !lhsRunning // 运行中放最下面
             }
-            if lhs.lastObservedAt != rhs.lastObservedAt {
-                return lhs.lastObservedAt > rhs.lastObservedAt
+            if lhsRunning {
+                if lhs.started != rhs.started {
+                    return lhs.started < rhs.started
+                }
+            } else {
+                let lhsCompletedAt = lhs.ended ?? lhs.started
+                let rhsCompletedAt = rhs.ended ?? rhs.started
+                if lhsCompletedAt != rhsCompletedAt {
+                    return lhsCompletedAt < rhsCompletedAt
+                }
             }
             return lhs.id < rhs.id
         }
@@ -2025,13 +2271,30 @@ final class SubagentStore: ObservableObject {
         onAgentCloseoutMayHaveChanged?()
     }
 
-    /// 用户手动把失败项标记为已处理：closeout 置为 `.cleaned`，不再计入「需关注」。
+    /// 用户手动把未成功终态标记为已处理：closeout 置为 `.cleaned`，不再计入「需关注」。
     /// `agents` 的 in-place 修改访问器在批外自动发布 objectWillChange，无需手动发送。
     func markCleaned(id: String) {
         guard let i = index(forAgentID: id) else { return }
         setCloseoutDisposition(at: i, .cleaned, reason: "用户标记为已处理")
         scheduleSave()
         onAgentCloseoutMayHaveChanged?()
+    }
+
+    /// Compatibility-only fallback for snapshots persisted before Node supplied a runId.
+    /// It deliberately cannot cancel a runtime reminder because no exact episode can be identified.
+    @discardableResult
+    func markLegacyCleanedWithoutRuntimeCancel(id: String) -> Bool {
+        guard let i = index(forAgentID: id) else { return false }
+        let runId = agents[i].runId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard runId == nil || runId?.isEmpty == true else { return false }
+        setCloseoutDisposition(
+            at: i,
+            .cleaned,
+            reason: "用户标记为已处理（旧记录未包含 runId，无法取消运行时提醒）"
+        )
+        scheduleSave()
+        onAgentCloseoutMayHaveChanged?()
+        return true
     }
 
     /// Reconcile terminal agent rows with Git after the worktree was handled outside this panel.
@@ -2178,6 +2441,20 @@ final class SubagentStore: ObservableObject {
         } else {
             // Serialized against every other main-repo operation (other merges, verify runs).
             outcome = await MainRepoSerialQueue.run {
+                // A missing/unusable worker worktree is a genuine merge failure (nothing
+                // to integrate), not a waiting-for-main condition. probe fails closed on
+                // a missing path, so this cannot hang the auto-merge chain silently.
+                guard GitRepo.probe(workTree: wtURL).isRepo else {
+                    return .mergeFailed("worktree 不存在或不是 git 仓库；无法合并")
+                }
+                // Read-only WIP gate. Never merge into an overlapping or unobservable main tree.
+                switch GitRepo.mergeReadiness(branch: branch, workerWorkTree: wtURL, in: main) {
+                case .ready: break
+                case .waitingForMain(let paths):
+                    return .waitingForMain(paths.joined(separator: ", "))
+                case .blocked(let reason):
+                    return .blocked(reason)
+                }
                 // A clean branch that is already reachable from main has no agent work to merge.
                 // Remove it directly, but only after both conditions prove no changes can be lost.
                 if !GitRepo.probe(workTree: wtURL).isDirty,
@@ -2243,10 +2520,33 @@ final class SubagentStore: ObservableObject {
         closeoutPendingAgentIDs.remove(agentId)
         var result: String?
         switch outcome {
+        case .waitingForMain(let paths):
+            if let idx = index(forAgentID: agentId) {
+                agents[idx].recoveryState = .waitingForMain
+                agents[idx].recoveryOwner = agentId
+                agents[idx].recoveryReason = "正在等待主工作区完成重叠文件的编辑: \(paths)"
+                agents[idx].recoveryUpdatedAt = Date()
+                agents[idx].worktreeError = nil
+                scheduleSave()
+                scheduleWaitingForMainRetry()
+            }
+            result = nil
+        case .blocked(let reason):
+            if let idx = index(forAgentID: agentId) {
+                agents[idx].recoveryState = .waitingForMain
+                agents[idx].recoveryOwner = agentId
+                agents[idx].recoveryReason = "无法安全读取主工作区状态，稍后自动重试: \(reason)"
+                agents[idx].recoveryUpdatedAt = Date()
+                scheduleSave()
+                scheduleWaitingForMainRetry()
+            }
+            result = nil
         case .zeroChangeCleaned:
             if let idx = index(forAgentID: agentId) {
                 agents[idx].worktreeLifecycle = .merged
                 agents[idx].worktreeError = nil
+                agents[idx].recoveryState = .closed
+                agents[idx].recoveryUpdatedAt = Date()
                 setCloseoutDisposition(at: idx, .cleaned, reason: "零改动,已直接清理")
                 scheduleSave()
             }
@@ -2254,7 +2554,12 @@ final class SubagentStore: ObservableObject {
             if let idx = index(forAgentID: agentId) {
                 agents[idx].worktreeLifecycle = .merged
                 agents[idx].worktreeError = nil
+                agents[idx].recoveryState = .verifying
+                agents[idx].recoveryUpdatedAt = Date()
                 markIntegratedAwaitingVerifyOrCleaned(index: idx)
+                if agents[idx].verifyCommand?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+                    agents[idx].recoveryState = .closed
+                }
                 // Keep path/branch strings for history display; buttons hide via lifecycle.
                 scheduleSave()
                 schedulePostMergeVerify(agent: agents[idx], mainProjectURL: main)
@@ -2263,8 +2568,39 @@ final class SubagentStore: ObservableObject {
             let dirtyPrefix = GitRepo.probe(workTree: main).isDirty ? "主仓有未提交改动;" : ""
             let full = "\(dirtyPrefix)合并失败（worktree 未删除）: \(msg)"
             if let idx = index(forAgentID: agentId) {
-                setCloseoutDisposition(at: idx, .needsFixer, reason: full)
-                notifyMergeFailed(agent: agents[idx], error: full)
+                // A running claim suppresses duplicate callbacks. Routes 1–2 resume the
+                // stored conversation; route 3 intentionally starts fresh but keeps the same
+                // agent id, branch and worktree. A further failure escalates once to the boss.
+                guard agents[idx].recoveryState != .fixerRunning else {
+                    result = setWorktreeError(full)
+                    break
+                }
+                let nextAttempt = agents[idx].recoveryAttempt + 1
+                agents[idx].recoveryReason = full
+                agents[idx].recoveryUpdatedAt = Date()
+                if nextAttempt <= 3 {
+                    agents[idx].recoveryState = .fixerRunning
+                    agents[idx].recoveryOwner = agents[idx].id
+                    agents[idx].recoveryAttempt = nextAttempt
+                    agents[idx].recoveryFreshContext = nextAttempt == 3
+                    setCloseoutDisposition(at: idx, .needsFixer, reason: full)
+                    scheduleSave()
+                    onWorktreeRecoveryNeeded?(agents[idx])
+                } else {
+                    agents[idx].recoveryState = .needsBoss
+                    agents[idx].recoveryOwner = agents[idx].id
+                    agents[idx].recoveryFreshContext = true
+                    setCloseoutDisposition(
+                        at: idx,
+                        .needsFixer,
+                        reason: "自动恢复已切换策略后仍未完成；等待不同恢复策略"
+                    )
+                    let shouldEscalate = !agents[idx].recoveryBossSignaled
+                    agents[idx].recoveryBossSignaled = true
+                    scheduleSave()
+                    if shouldEscalate { onWorktreeRecoveryEscalated?(agents[idx]) }
+                }
+                // Routine recovery is runtime-owned; no boss prompt is injected here.
             }
             result = setWorktreeError(full)
         case .removeFailed(let msg):
@@ -2493,6 +2829,8 @@ final class SubagentStore: ObservableObject {
                                     .cleaned,
                                     reason: "已集成、主仓验证通过，worktree 与内部分支已清理"
                                 )
+                                self.agents[index].recoveryState = .closed
+                                self.agents[index].recoveryUpdatedAt = Date()
                                 self.scheduleSave()
                             }
                         }

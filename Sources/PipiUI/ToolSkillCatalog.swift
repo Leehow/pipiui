@@ -28,7 +28,8 @@ enum ToolSkillCatalog {
         .init(name: "computer", group: "扩展", summary: "安全闸门控制的 macOS 屏幕与输入（默认关闭）"),
         .init(name: "git", group: "扩展", summary: "结构化 git status / diff / log / show"),
         .init(name: "web_search", group: "扩展", summary: "联网搜索（Firecrawl 免 key）"),
-        .init(name: "web_fetch", group: "扩展", summary: "抓取网页正文文本"),
+        .init(name: "web_fetch", group: "扩展", summary: "抓取网页正文文本（GitHub issue / PR / discussion / wiki / release）"),
+        .init(name: "github_fetch", group: "扩展", summary: "GitHub 仓库 / blob / tree 专用安全抓取"),
     ]
 
     static var allTools: [ToolEntry] { builtinTools + extensionTools }

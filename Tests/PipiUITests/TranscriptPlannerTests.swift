@@ -15,21 +15,22 @@ final class TranscriptPlannerTests: XCTestCase {
         ])
     }
 
-    /// 同一版本 key：即使传入的 items 数组内容不同，也必须命中缓存不重算。
-    /// （这证明 body 高频求值——击键/流式刷新——退化为一次数值比较。）
+    /// 同一版本 + 同一窗口身份：body 高频求值（击键/流式刷新）必须命中缓存。
+    /// 窗口身份（首尾稳定 id）变化时即使 version 未 bump 也必须重算——见
+    /// `testLiveAndAncientSeekSameCountDoNotReusePresentation`。
     func testSameVersionKeyHitsCache() {
         let planner = TranscriptPlanner()
         let first = planner.rows(
-            items: [item("1")], toolRuns: [:], visibleCount: 150,
+            items: [item("1"), item("2")], toolRuns: [:], visibleCount: 150,
             transcriptVersion: 1, toolStructureVersion: 0
         )
-        // 内容变了但版本没 bump —— 调用方契约不允许，但这里用来证明确实走了缓存。
+        // New array allocation, identical window endpoints + versions → cache hit.
         let second = planner.rows(
             items: [item("1"), item("2")], toolRuns: [:], visibleCount: 150,
             transcriptVersion: 1, toolStructureVersion: 0
         )
         XCTAssertEqual(second, first)
-        XCTAssertEqual(second.count, 1)
+        XCTAssertEqual(second.count, 2)
         XCTAssertEqual(planner.computationCount, 1)
     }
 
@@ -163,6 +164,76 @@ final class TranscriptPlannerTests: XCTestCase {
             transcriptVersion: 1, toolStructureVersion: 0
         )
         XCTAssertEqual(full.count, 5)
+    }
+
+    /// Live suffix(N) and ancient seek windows of the same count must not share a plan.
+    /// Cache key includes first/last stable window ids, not only visibleCount.
+    func testLiveAndAncientSeekSameCountDoNotReusePresentation() {
+        let planner = TranscriptPlanner()
+        let items = (0..<200).map { item("msg-\($0)") }
+        let liveWindow = Array(items.suffix(128))
+        let ancientWindow = Array(items.prefix(128))
+
+        let live = planner.presentation(
+            items: liveWindow,
+            toolRuns: [:],
+            visibleCount: 128,
+            transcriptVersion: 7,
+            toolStructureVersion: 2
+        )
+        let seek = planner.presentation(
+            items: ancientWindow,
+            toolRuns: [:],
+            visibleCount: 128,
+            transcriptVersion: 7,
+            toolStructureVersion: 2
+        )
+
+        XCTAssertEqual(live.rows.count, 128)
+        XCTAssertEqual(seek.rows.count, 128)
+        XCTAssertEqual(live.rows.first?.id, "msg-72")
+        XCTAssertEqual(live.rows.last?.id, "msg-199")
+        XCTAssertEqual(seek.rows.first?.id, "msg-0")
+        XCTAssertEqual(seek.rows.last?.id, "msg-127")
+        XCTAssertNotEqual(
+            live.rows.map(\.id),
+            seek.rows.map(\.id),
+            "live and ancient seek windows must produce distinct presentations"
+        )
+        XCTAssertEqual(planner.computationCount, 2)
+
+        // Same window identity hits cache even when the caller reallocates the array.
+        let liveAgain = planner.presentation(
+            items: Array(items.suffix(128)),
+            toolRuns: [:],
+            visibleCount: 128,
+            transcriptVersion: 7,
+            toolStructureVersion: 2
+        )
+        XCTAssertEqual(liveAgain.rows.map(\.id), live.rows.map(\.id))
+        // Last call was seek (count 2); liveAgain is a different window again → 3.
+        XCTAssertEqual(planner.computationCount, 3)
+
+        let seekAgain = planner.presentation(
+            items: Array(items.prefix(128)),
+            toolRuns: [:],
+            visibleCount: 128,
+            transcriptVersion: 7,
+            toolStructureVersion: 2
+        )
+        XCTAssertEqual(seekAgain.rows.map(\.id), seek.rows.map(\.id))
+        XCTAssertEqual(planner.computationCount, 4)
+
+        // Immediate repeat of the same window must hit.
+        let seekHit = planner.presentation(
+            items: ancientWindow,
+            toolRuns: [:],
+            visibleCount: 128,
+            transcriptVersion: 7,
+            toolStructureVersion: 2
+        )
+        XCTAssertEqual(seekHit.rows.map(\.id), seek.rows.map(\.id))
+        XCTAssertEqual(planner.computationCount, 4)
     }
 
     /// ChatSession 侧契约：任何 transcript 写入都 bump transcriptVersion。

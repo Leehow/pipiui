@@ -1,13 +1,48 @@
 import Foundation
 
 enum MessageActions {
-    /// Runtime worker signals arrive with the user role, but must not be treated as
-    /// user-authored prompts by transcript navigation or message actions.
+    /// Runtime/system injections arrive with the user role, but must not be treated
+    /// as human-authored prompts by transcript navigation, edit/branch chrome,
+    /// retry, or user-turn grouping.
+    ///
+    /// Prefer `isNavigationEligibleHumanPrompt` at new call sites; this name is kept
+    /// as the historical alias used across the app.
     static func isUserAuthoredMessage(_ item: ChatItem) -> Bool {
+        isNavigationEligibleHumanPrompt(item)
+    }
+
+    /// Single reusable predicate: real human user input eligible for the prompt rail
+    /// and other “user-authored” surfaces. Keeps ordinary text and attachment/image
+    /// prompts; excludes runtime/system content injected into the user role.
+    static func isNavigationEligibleHumanPrompt(_ item: ChatItem) -> Bool {
         guard item.role == "user" else { return false }
-        let displayText = copyableText(from: item)
-        return !displayText.hasPrefix("[subagent-done]")
-            && !displayText.hasPrefix("[worktree-merge-failed]")
+        // Image-only human prompts yield empty copyable text and remain eligible.
+        return isNavigationEligibleHumanPromptText(copyableText(from: item))
+    }
+
+    /// Text-level seam for the same navigation-eligible check (after copyableText).
+    static func isNavigationEligibleHumanPromptText(_ text: String) -> Bool {
+        !isRuntimeOrSystemInjectedUserText(text)
+    }
+
+    /// Detects PipiUI runtime / extension content that is stored or streamed as a
+    /// user-role message but is not a human prompt. Uses stable family prefixes so
+    /// new sibling signals do not each need a one-off hardcode.
+    static func isRuntimeOrSystemInjectedUserText(_ text: String) -> Bool {
+        if text.isEmpty { return false }
+        // Subagent follow-ups: done / heartbeat / stalled / interrupted-reminder / …
+        if text.hasPrefix("[subagent-") { return true }
+        // Worktree merge + post-merge verify notifications.
+        if text.hasPrefix("[worktree-") { return true }
+        if text.hasPrefix("[post-merge-") { return true }
+        // Session sentinels: skill policy, isolation, internal title jobs, …
+        if text.hasPrefix("[PipiUI") { return true }
+        // Git extension status snapshot (context/system prompt body if it leaks into user role).
+        if text.hasPrefix("## Git (Pipi UI)") { return true }
+        // Done-message delivery wrappers prepended ahead of the payload.
+        if text.hasPrefix("(re-delivery") { return true }
+        if text.hasPrefix("(recovered delivery") { return true }
+        return false
     }
 
     static func copyableText(from item: ChatItem) -> String {
@@ -42,8 +77,7 @@ enum MessageActions {
         _ = entryId
         guard !isWorking else { return false }
         guard role == "user" || role == "assistant" else { return false }
-        if displayText.hasPrefix("[subagent-done]") { return false }
-        if displayText.hasPrefix("[worktree-merge-failed]") { return false }
+        if role == "user", isRuntimeOrSystemInjectedUserText(displayText) { return false }
         return true
     }
 

@@ -129,6 +129,19 @@ extension ComputerCoordinator {
             return
         }
 
+        let hostMatch = hostSelfProtection.match(target.authorizationIdentity)
+        guard !hostMatch.isHost else {
+            _ = rejectHostControl(actionKind: .screenshot, match: hostMatch)
+            rejectOpenApplication(
+                reply: reply,
+                sessionKey: sessionKey,
+                target: target,
+                reason: ComputerHostSelfProtectionError.hostTarget
+                    .localizedDescription
+            )
+            return
+        }
+
         if let reason = openApplicationBusyReason(
             sessionKey: sessionKey,
             target: target,

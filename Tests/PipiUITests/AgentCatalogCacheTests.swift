@@ -31,6 +31,26 @@ final class AgentCatalogCacheTests: XCTestCase {
         try text.write(to: tempDir.appendingPathComponent("\(name).md"), atomically: true, encoding: .utf8)
     }
 
+    private func writePackage(_ name: String, description: String) throws {
+        let package = tempDir.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        let text = """
+        ---
+        schema: 1
+        name: \(name)
+        description: \(description)
+        mode: worker
+        capabilities:
+          filesystem: read-only
+        worktree: isolated
+        deliverable: implementation
+        tools: read, grep
+        ---
+        body
+        """
+        try text.write(to: package.appendingPathComponent("AGENT.md"), atomically: true, encoding: .utf8)
+    }
+
     func testLoadCachesPerDirectory() throws {
         try writeAgent("custom-agent", description: "first")
         let first = AgentCatalog.load(from: tempDir)
@@ -59,6 +79,22 @@ final class AgentCatalogCacheTests: XCTestCase {
         )
         let second = AgentCatalog.load(from: tempDir)
         XCTAssertTrue(second.contains(where: { $0.name == "mtime-agent" && $0.description == "v2" }))
+    }
+
+    func testPackageCacheInvalidatesWhenAGENTFileChanges() throws {
+        try writePackage("cached-package", description: "v1")
+        let first = AgentCatalog.load(from: tempDir)
+        XCTAssertTrue(first.contains(where: { $0.name == "cached-package" && $0.description == "v1" }))
+
+        Thread.sleep(forTimeInterval: 0.02)
+        try writePackage("cached-package", description: "v2")
+        let fileURL = tempDir.appendingPathComponent("cached-package/AGENT.md")
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(60)],
+            ofItemAtPath: fileURL.path
+        )
+        let second = AgentCatalog.load(from: tempDir)
+        XCTAssertTrue(second.contains(where: { $0.name == "cached-package" && $0.description == "v2" }))
     }
 
     func testBuiltInsMergedWhenDirectoryHasCustomAgents() throws {

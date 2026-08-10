@@ -215,4 +215,238 @@ final class SubagentLogRenderWindowTests: XCTestCase {
             0
         )
     }
+
+    // MARK: - Hard mount ceiling + overscan (goal 1)
+
+    func testMaxRenderedItemsMatchesWindowCeiling() {
+        XCTAssertEqual(
+            SubagentLogRenderWindow.maxRenderedItems,
+            SubagentLogRenderWindow.maxPages * SubagentLogRenderWindow.pageSize
+        )
+        XCTAssertEqual(SubagentLogRenderWindow.maxRenderedItems, 400)
+    }
+
+    func testNoWindowEverExceedsMountCeiling() {
+        // The render window is the only set of items available to mount; a lazy
+        // container cannot exceed it. This must hold for every log length and
+        // every (even out-of-range) anchor page.
+        let ceiling = SubagentLogRenderWindow.maxRenderedItems
+        for count in [0, 1, 50, 199, 200, 350, 399, 400, 401, 800, 801, 5_000] {
+            for page in -3...60 {
+                let window = SubagentLogRenderWindow.resolve(itemCount: count, topVisiblePage: page)
+                XCTAssertLessThanOrEqual(
+                    window.renderedCount, ceiling,
+                    "count=\(count) page=\(page) rendered \(window.renderedCount)"
+                )
+            }
+        }
+    }
+
+    func testMountedCeilingStaysStableAsLogGrowsPinned() {
+        // Pinned live growth: each appended item extends the newest window until
+        // the next page slide, but the rendered count never exceeds the ceiling.
+        let ceiling = SubagentLogRenderWindow.maxRenderedItems
+        var rendered = 0
+        for count in 1...2_000 {
+            let window = SubagentLogRenderWindow.resolve(
+                itemCount: count,
+                topVisiblePage: SubagentLogRenderWindow.latestPage(itemCount: count)
+            )
+            XCTAssertTrue(window.isLatest, "count=\(count)")
+            XCTAssertLessThanOrEqual(window.renderedCount, ceiling)
+            rendered = window.renderedCount
+        }
+        // At 2000 items the pinned window is the bottom two pages (still ≤ ceiling).
+        XCTAssertEqual(rendered, 200)
+    }
+
+    // MARK: - Hysteresis / threshold / dedup window anchor (goal 2)
+
+    func testStableAnchorKeepsCommittedWhileAnchorInsideWindow() {
+        // committed page 4 → window 300..<700. Any anchor inside keeps page 4,
+        // even when it crosses an internal page boundary (no whole-page flap).
+        let anchorIndices = [300, 399, 400, 500, 600, 699]
+        for index in anchorIndices {
+            XCTAssertEqual(
+                SubagentLogRenderWindow.stableAnchorPage(
+                    itemCount: 1000, committedTopVisiblePage: 4, liveAnchorIndex: index
+                ),
+                4,
+                "index=\(index)"
+            )
+        }
+    }
+
+    func testStableAnchorDoesNotFlapAcrossPageBoundaryInsideWindow() {
+        // The classic flap: top row oscillates between the last item of page 3
+        // (index 399) and the first of page 4 (index 400). Both sit inside the
+        // committed window for page 4, so the window never moves.
+        let a = SubagentLogRenderWindow.stableAnchorPage(
+            itemCount: 1000, committedTopVisiblePage: 4, liveAnchorIndex: 399
+        )
+        let b = SubagentLogRenderWindow.stableAnchorPage(
+            itemCount: 1000, committedTopVisiblePage: 4, liveAnchorIndex: 400
+        )
+        XCTAssertEqual(a, 4)
+        XCTAssertEqual(b, 4)
+        XCTAssertEqual(a, b)
+    }
+
+    func testStableAnchorSlidesOnlyWhenAnchorLeavesWindow() {
+        // Anchor leaves the top edge → slide down to its page.
+        XCTAssertEqual(
+            SubagentLogRenderWindow.stableAnchorPage(
+                itemCount: 1000, committedTopVisiblePage: 4, liveAnchorIndex: 700
+            ),
+            7
+        )
+        // Anchor leaves the bottom edge → slide up to its page.
+        XCTAssertEqual(
+            SubagentLogRenderWindow.stableAnchorPage(
+                itemCount: 1000, committedTopVisiblePage: 4, liveAnchorIndex: 299
+            ),
+            2
+        )
+        // After sliding down to 7, scrolling back into the overlap (600..<700)
+        // keeps page 7 — no flap back to 4 (hysteresis).
+        XCTAssertEqual(
+            SubagentLogRenderWindow.stableAnchorPage(
+                itemCount: 1000, committedTopVisiblePage: 7, liveAnchorIndex: 650
+            ),
+            7
+        )
+    }
+
+    func testStableAnchorSlidesAtMostOncePerThresholdCrossing() {
+        // Walk the anchor from 300 to 800 one item at a time and assert the
+        // committed page is a non-decreasing step function that only advances
+        // when the anchor leaves the current window (no oscillation).
+        var committed = 4
+        var advances = 0
+        for index in 300...800 {
+            let next = SubagentLogRenderWindow.stableAnchorPage(
+                itemCount: 1000, committedTopVisiblePage: committed, liveAnchorIndex: index
+            )
+            XCTAssertGreaterThanOrEqual(next, committed, "regressed at index \(index)")
+            if next != committed { advances += 1 }
+            committed = next
+            // Every committed page's window must cover the anchor (viewport safety).
+            XCTAssertTrue(
+                SubagentLogRenderWindow.resolve(itemCount: 1000, topVisiblePage: committed)
+                    .range.contains(index),
+                "index \(index) uncovered after committing page \(committed)"
+            )
+        }
+        XCTAssertEqual(advances, 1, "expected a single threshold slide 4→7")
+        XCTAssertEqual(committed, 7)
+    }
+
+    func testStableAnchorDedupesIdenticalInputs() {
+        // Pure function: identical inputs → identical page (call site skips the
+        // state write, so equal windows re-render nothing).
+        for committed in 0...8 {
+            for index in 0..<1000 {
+                let lhs = SubagentLogRenderWindow.stableAnchorPage(
+                    itemCount: 1000, committedTopVisiblePage: committed, liveAnchorIndex: index
+                )
+                let rhs = SubagentLogRenderWindow.stableAnchorPage(
+                    itemCount: 1000, committedTopVisiblePage: committed, liveAnchorIndex: index
+                )
+                XCTAssertEqual(lhs, rhs)
+            }
+        }
+    }
+
+    func testStableAnchorUnresolvableKeepsCommittedPage() {
+        // nil (bottom anchor / unknown id), negative, and ≥ count all keep the
+        // committed page — the caller seeds it, so there is never an uninvited jump.
+        let committed = 5
+        XCTAssertEqual(
+            SubagentLogRenderWindow.stableAnchorPage(
+                itemCount: 1000, committedTopVisiblePage: committed, liveAnchorIndex: nil
+            ),
+            committed
+        )
+        XCTAssertEqual(
+            SubagentLogRenderWindow.stableAnchorPage(
+                itemCount: 1000, committedTopVisiblePage: committed, liveAnchorIndex: -1
+            ),
+            committed
+        )
+        XCTAssertEqual(
+            SubagentLogRenderWindow.stableAnchorPage(
+                itemCount: 1000, committedTopVisiblePage: committed, liveAnchorIndex: 1000
+            ),
+            committed
+        )
+        XCTAssertEqual(
+            SubagentLogRenderWindow.stableAnchorPage(
+                itemCount: 1000, committedTopVisiblePage: committed, liveAnchorIndex: 5_000
+            ),
+            committed
+        )
+        // Empty log: any anchor keeps committed (no crash).
+        XCTAssertEqual(
+            SubagentLogRenderWindow.stableAnchorPage(
+                itemCount: 0, committedTopVisiblePage: 3, liveAnchorIndex: 0
+            ),
+            3
+        )
+    }
+
+    // MARK: - Append follow-bottom / off-bottom semantics (goal 4)
+
+    func testPinnedAppendFollowsBottomWithoutExceedingCeiling() {
+        // While pinned, appending items keeps the window at the newest pages and
+        // never exceeds the mount ceiling — auto-follow stays cheap as the log grows.
+        let ceiling = SubagentLogRenderWindow.maxRenderedItems
+        var committed = SubagentLogRenderWindow.latestPage(itemCount: 350)
+        for appended in 351...1_500 {
+            let window = SubagentLogRenderWindow.resolve(
+                itemCount: appended, topVisiblePage: committed
+            )
+            XCTAssertTrue(window.isLatest, "appended=\(appended)")
+            XCTAssertLessThanOrEqual(window.renderedCount, ceiling)
+            committed = SubagentLogRenderWindow.latestPage(itemCount: appended)
+        }
+        XCTAssertEqual(committed, SubagentLogRenderWindow.latestPage(itemCount: 1_500))
+    }
+
+    func testUnpinnedHistoryStaysPutWhileLogAppendsBelow() {
+        // User browsed up to page 2 (window 100..<500) and the live agent keeps
+        // appending at the bottom: the history window does not get pulled to the
+        // newest — the viewport stays where the user left it.
+        let committed = 2
+        let anchor = 250  // inside 100..<500
+        for appended in 1_000...1_400 {
+            let page = SubagentLogRenderWindow.stableAnchorPage(
+                itemCount: appended, committedTopVisiblePage: committed, liveAnchorIndex: anchor
+            )
+            XCTAssertEqual(page, 2, "appended=\(appended)")
+            let window = SubagentLogRenderWindow.resolve(itemCount: appended, topVisiblePage: page)
+            XCTAssertTrue(window.range.contains(anchor), "appended=\(appended)")
+            XCTAssertFalse(window.isLatest, "appended=\(appended) — must not jump to newest")
+        }
+    }
+
+    func testUnpinnedWindowSurvivesCapEvictionKeepingAnchorCovered() {
+        // Store caps at 800; appending past it evicts the oldest item, shifting
+        // every index down by 1. The anchored row must stay inside its window.
+        var committed = 4  // window 300..<700 at count 1000 (capped → 800)
+        for evictedCount in 0...200 {
+            let count = 800
+            // Anchor drifts down as items are evicted from the front.
+            let anchor = max(0, 450 - evictedCount)
+            let page = SubagentLogRenderWindow.stableAnchorPage(
+                itemCount: count, committedTopVisiblePage: committed, liveAnchorIndex: anchor
+            )
+            let window = SubagentLogRenderWindow.resolve(itemCount: count, topVisiblePage: page)
+            XCTAssertTrue(
+                window.range.contains(anchor),
+                "evicted=\(evictedCount) anchor=\(anchor) page=\(page) window=\(window.range)"
+            )
+            XCTAssertLessThanOrEqual(window.renderedCount, SubagentLogRenderWindow.maxRenderedItems)
+            committed = page
+        }
+    }
 }

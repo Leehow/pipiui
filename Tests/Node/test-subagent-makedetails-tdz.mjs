@@ -60,6 +60,7 @@ install({
   on() {},
 });
 const subagent = tools.get("subagent");
+const managementTool = tools.get("subagent_manage");
 const options = [new AbortController().signal, undefined, { cwd: "/", hasUI: false }];
 const single = await subagent.execute(
   "tdz-single",
@@ -76,7 +77,7 @@ const parallel = await subagent.execute(
   },
   ...options,
 );
-process.stdout.write(JSON.stringify({ single, parallel }));
+process.stdout.write(JSON.stringify({ single, parallel, managementTool: managementTool?.name }));
 `,
       "utf8",
     );
@@ -97,7 +98,8 @@ process.stdout.write(JSON.stringify({ single, parallel }));
         },
       },
     );
-    const results = JSON.parse(stdout);
+    const { managementTool, ...results } = JSON.parse(stdout);
+    assert.equal(managementTool, "subagent_manage", "the management tool must register alongside, not replace, dispatch");
 
     for (const [mode, result] of Object.entries(results)) {
       assert.equal(result.isError, true, mode);

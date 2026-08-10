@@ -120,17 +120,21 @@ export function resolveSubagentWorktree(opts: {
 	defaultCwd: string;
 	explicitCwd?: string;
 	readOnly: boolean;
-	policy: { worktree: "isolated" | "main-session" };
+	policy: { worktree: "isolated" | "direct" | "main-session" };
 	/** App-owned session root; was module opts.mainCwd. */
 	mainCwd?: string;
 }): WorktreePlacement {
 	const fallbackCwd = opts.explicitCwd ?? opts.defaultCwd;
 
 	if (opts.policy.worktree === "main-session") {
-		// Ignore caller cwd and nested worker cwd: secretary is a session-management
-		// role and must not manufacture another branch/worktree while closing them out.
+		// Ignore caller cwd and nested worker cwd: the trusted bundled secretary is a
+		// session-management role and must not manufacture another branch/worktree.
 		return { cwd: path.resolve(opts.mainCwd || opts.defaultCwd) };
 	}
+	// Declarative `worktree: none` is intentionally less privileged than the
+	// main-session role: it merely respects the caller/default cwd and never
+	// receives the secretary role or its write/commit policy exemptions.
+	if (opts.policy.worktree === "direct") return { cwd: fallbackCwd };
 	if (opts.readOnly || process.env.PIPIUI_WORKTREE === "0") {
 		return { cwd: fallbackCwd };
 	}

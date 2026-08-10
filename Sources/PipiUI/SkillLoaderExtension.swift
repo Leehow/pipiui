@@ -57,24 +57,35 @@ function homePath(raw: string): string {
   return raw.startsWith("~") ? path.join(os.homedir(), raw.slice(1)) : raw;
 }
 
-/** Roots come from Pi's own settings so discovery cannot drift from what Pi loaded. */
+// This root belongs to PipiUI, not pi. Its resources are installed from the signed app bundle
+// into Application Support and are never copied to or removed from ~/.pi/agent/skills.
+const PIPIUI_BUILT_IN_SKILL_ROOT = path.join(
+  os.homedir(), "Library", "Application Support", "PipiUI", "built-in-skills",
+);
+
+/**
+ * PipiUI's own skills are first so a same-named user skill cannot replace a bundled workflow.
+ * The user's explicit PIPIUI_SKILL_ROOTS override, normal Pi root, and settings roots remain
+ * discoverable afterwards. First root wins in loadCatalog, just as before for user roots.
+ */
 function skillRoots(): string[] {
+  const roots: string[] = [PIPIUI_BUILT_IN_SKILL_ROOT];
   const override = process.env.PIPIUI_SKILL_ROOTS;
-  if (override) return override.split(":").filter(Boolean).map(homePath);
-  const roots = new Set<string>([path.join(os.homedir(), ".pi/agent/skills")]);
+  if (override) roots.push(...override.split(":").filter(Boolean).map(homePath));
+  roots.push(path.join(os.homedir(), ".pi/agent/skills"));
   try {
     const settings = JSON.parse(
       fs.readFileSync(path.join(os.homedir(), ".pi/agent/settings.json"), "utf-8"),
     ) as { skills?: unknown };
     if (Array.isArray(settings.skills)) {
       for (const entry of settings.skills) {
-        if (typeof entry === "string" && entry.trim()) roots.add(homePath(entry.trim()));
+        if (typeof entry === "string" && entry.trim()) roots.push(homePath(entry.trim()));
       }
     }
   } catch {
-    // No settings file / unreadable: the default root above still applies.
+    // No settings file / unreadable: the normal user root above still applies.
   }
-  return [...roots];
+  return roots.filter((root, index) => root && roots.indexOf(root) === index);
 }
 
 /** Pi's rule: a directory holding SKILL.md is a skill root and is not recursed into. */

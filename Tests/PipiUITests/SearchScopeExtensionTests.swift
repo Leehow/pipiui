@@ -95,9 +95,9 @@ final class SearchScopeExtensionTests: XCTestCase {
         )
         // Built-in grep/find/ls must be additively activated (default active set omits them).
         XCTAssertTrue(installedSource.contains("pi.on(\"session_start\""))
-        XCTAssertTrue(installedSource.contains("const wanted = [\"grep\", \"find\", \"ls\"]"))
-        XCTAssertTrue(installedSource.contains("pi.getActiveTools()"))
-        XCTAssertTrue(installedSource.contains("pi.setActiveTools([...active, ...missing])"))
+        XCTAssertTrue(installedSource.contains("const active = pi.getActiveTools();"))
+        XCTAssertTrue(installedSource.contains("head.push(\"grep\", \"find\", \"ls\");"))
+        XCTAssertTrue(installedSource.contains("if (!unchanged) pi.setActiveTools(next);"))
         let harness = dir.appendingPathComponent("harness.ts")
         let script = """
         import { evaluateSearchPath, bashBlockReason } from "./pipiui-search-scope.ts";

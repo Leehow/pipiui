@@ -12,10 +12,15 @@ enum PipiSpawnEnvironmentPolicy {
         "PIPIUI_MAIN_CWD",
         "PIPIUI_MAIN_MODEL",
         "PIPIUI_MAIN_MODEL_FILE",
+        "PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE",
         "PIPIUI_SESSION_KEY",
         "PIPIUI_SKILL_READ_BLOCK",
         "PIPIUI_WEBSEARCH_CONFIG_FILE",
         "PIPIUI_WEBSEARCH_EXT",
+        "PIPIUI_GITHUB_EXT",
+        "PIPIUI_ARXIV_EXT",
+        "PIPIUI_PDF_EXT",
+        "PIPIUI_PDF_HELPER",
         "PIPIUI_MCP_CONFIG_FILE",
         "PIPIUI_MCP_EXT",
         "PIPIUI_WORKTREE",
@@ -23,10 +28,14 @@ enum PipiSpawnEnvironmentPolicy {
 
     static let managedPrefixes = [
         "PIPIUI_AGENT_",
+        "PIPIUI_MEMORY_",
         "PIPIUI_COMPUTER_",
         "PIPIUI_SEARCH_",
         "PIPIUI_SUBAGENT_",
         "PIPIUI_WORKTREE_",
+        // Hermes is main-session-only. Strip any stale inherited values rather
+        // than letting an older parent process smuggle an extension to a worker.
+        "PIPIUI_HERMES_",
     ]
 
     static func isManagedKey(_ key: String) -> Bool {
@@ -58,10 +67,19 @@ enum PipiSpawnAssembly {
         var git: String?
         var reload: String?
         var webSearch: String?
+        /// Local Pi package root (`package.json` → github_fetch extension).
+        var githubFetchPackage: String? = nil
+        /// Local Pi package root (`package.json` → arxiv_fetch extension).
+        var arxivFetchPackage: String? = nil
+        var pdfExtract: String? = nil
         var mcp: String?
         var skillLoader: String?
+        /// Main bridged session only; never exported to dispatched workers.
+        var planRuntime: String? = nil
         var searchScope: String?
-        var memory: String? = nil
+        /// Formal PipiUI-managed local package. Only the main session mounts it;
+        /// worker/operator capability environments come from the package itself.
+        var memoryBroker: String? = nil
         var codexServerTools: String?
         var claudeServerTools: String?
         var computerUse: String?
@@ -79,18 +97,26 @@ enum PipiSpawnAssembly {
             features: BuiltInFeatureSettings.EnabledSet,
             philosophyExtension: String?,
             computerUseExtension: String?,
-            memoryEnabled: Bool = false
+            memoryBrokerEntrypoint: String? = nil
         ) -> Paths {
-            Paths(
+            return Paths(
                 philosophy: features.isEnabled(.philosophy) ? philosophyExtension : nil,
                 media: features.isEnabled(.generateImage) ? installed.mediaExtension : nil,
                 git: features.isEnabled(.git) ? installed.gitExtension : nil,
                 reload: features.isEnabled(.reload) ? installed.reloadExtension : nil,
                 webSearch: features.isEnabled(.webSearch) ? installed.webSearchExtension : nil,
+                githubFetchPackage: features.isEnabled(.githubFetch)
+                    ? installed.githubFetchPackage : nil,
+                arxivFetchPackage: features.isEnabled(.arxivFetch)
+                    ? installed.arxivFetchPackage : nil,
+                pdfExtract: features.isEnabled(.pdfExtract) ? installed.pdfExtractExtension : nil,
                 mcp: features.isEnabled(.mcp) ? installed.mcpExtension : nil,
                 skillLoader: features.isEnabled(.skillLoader) ? installed.skillLoaderExtension : nil,
+                // Structured plan feed rides with philosophy / automatic planning.
+                // All-features-off (bare pi) and philosophy-off must not mount it.
+                planRuntime: features.isEnabled(.philosophy) ? installed.planRuntimeExtension : nil,
                 searchScope: features.isEnabled(.searchScope) ? installed.searchScopeExtension : nil,
-                memory: memoryEnabled ? installed.memoryExtension : nil,
+                memoryBroker: memoryBrokerEntrypoint,
                 codexServerTools: features.isEnabled(.codexServerTools)
                     ? installed.codexServerToolsExtension : nil,
                 claudeServerTools: features.isEnabled(.claudeServerTools)
@@ -117,6 +143,10 @@ enum PipiSpawnAssembly {
         var excludeToolsArgs: [String]
         var webSearchConfigFile: String
         var mcpConfigFile: String
+        /// App-owned, session-scoped state directory for package status/import receipts.
+        var memoryBrokerStateDirectory: String? = nil
+        var memoryBrokerImportFile: String? = nil
+        var memoryBrokerImportReceiptFile: String? = nil
     }
 
     struct Output: Equatable, Sendable {
@@ -184,6 +214,28 @@ enum PipiSpawnAssembly {
             env["PIPIUI_WEBSEARCH_EXT"] = p
         }
 
+        // GitHub repo/blob/tree retrieval is its own local Pi package, deliberately independent
+        // from generic web search/fetch. Re-export its package root so nested workers can mount it.
+        if f.isEnabled(.githubFetch), let p = input.paths.githubFetchPackage {
+            args += ["-e", p]
+            env["PIPIUI_GITHUB_EXT"] = p
+        }
+
+        // arXiv owns specialized metadata/content routing. Its package path is re-exported
+        // independently so a missing/disabled PDF bridge never suppresses HTML/Atom retrieval.
+        if f.isEnabled(.arxivFetch), let p = input.paths.arxivFetchPackage {
+            args += ["-e", p]
+            env["PIPIUI_ARXIV_EXT"] = p
+        }
+
+        // Core local PDF reading has its own feature gate and signed helper. Export both so
+        // workers can mount the same usable route independently of arXiv availability.
+        if f.isEnabled(.pdfExtract), let pdf = input.paths.pdfExtract {
+            args += ["-e", pdf]
+            env["PIPIUI_PDF_EXT"] = pdf
+            env.merge(PDFExtractExtension.helperEnvironment()) { _, current in current }
+        }
+
         // MCP: user-added servers + hot-read config env travel together. The extension is
         // re-exported (`PIPIUI_MCP_EXT`) so dispatched workers can also use user MCP tools.
         if f.isEnabled(.mcp), let p = input.paths.mcp {
@@ -194,10 +246,6 @@ enum PipiSpawnAssembly {
 
         // Main session only: dispatched workers stay fully skill-free.
         if f.isEnabled(.skillLoader), let p = input.paths.skillLoader { args += ["-e", p] }
-
-        // Controlled Memory has its own explicit, default-off native setting.
-        // AppStore resolves this path to nil unless enabled for the new session.
-        if let p = input.paths.memory { args += ["-e", p] }
 
         // Project search boundary: -e + grant file + nested-process re-export env.
         if f.isEnabled(.searchScope), let p = input.paths.searchScope {
@@ -233,7 +281,27 @@ enum PipiSpawnAssembly {
         }
 
         // Bridge-dependent extensions + routing env.
+        // The formal package is mounted once in the main process. It owns Hermes,
+        // ACLs, loopback transport, and all worker/operator capability issuance;
+        // Swift exports only launch identity and an app-owned status directory.
+        if let p = input.paths.memoryBroker {
+            args += ["-e", p]
+            env["PIPIUI_MEMORY_BROKER_MODE"] = "main"
+            env["PIPIUI_MEMORY_PROJECT_ROOT"] = input.mainCWD
+            if let stateDirectory = input.memoryBrokerStateDirectory {
+                env["PIPIUI_MEMORY_BROKER_STATE_DIR"] = stateDirectory
+            }
+            if let importFile = input.memoryBrokerImportFile,
+               let receiptFile = input.memoryBrokerImportReceiptFile {
+                env["PIPIUI_MEMORY_BROKER_IMPORT_FILE"] = importFile
+                env["PIPIUI_MEMORY_BROKER_IMPORT_RECEIPT_FILE"] = receiptFile
+            }
+        }
         if f.isEnabled(.browser), let p = input.paths.webview { args += ["-e", p] }
+        // Main bridged session only: plan tools POST plan_event. Path is already
+        // philosophy-gated in Paths.resolved. Do not re-export via PIPIUI_*_EXT —
+        // dispatched workers must not receive this extension.
+        if f.isEnabled(.philosophy), let p = input.paths.planRuntime { args += ["-e", p] }
         if f.isEnabled(.subagent), let p = input.paths.subagentDir {
             args += ["-e", p]
             env["PIPIUI_SUBAGENT_EXT"] = p
@@ -259,6 +327,8 @@ enum PipiSpawnAssembly {
             }
             env["PIPIUI_SUBAGENT_MODELS_FILE"] =
                 SubagentModelSettings.overridesFileURL().path
+            env["PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE"] =
+                SubagentModelSettings.capabilityCatalogFileURL().path
             env["PIPIUI_MAIN_MODEL_FILE"] =
                 SubagentModelSettings.mainModelFileURL().path
             if let mid = input.mainModelId, !mid.isEmpty {

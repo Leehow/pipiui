@@ -34,6 +34,51 @@ final class SubagentEventScalingTests: XCTestCase {
         XCTAssertEqual(store.totalCost, 101)
     }
 
+    func testQueuedReuseKeepsNewRunStateWhenLateOldRunReportsArrive() throws {
+        let store = SubagentStore()
+        let t = Date(timeIntervalSince1970: 100)
+        store.handle(event(
+            kind: "start", id: "a", extra: ["runId": "run-one", "name": "worker", "task": "first"]
+        ), observedAt: t)
+        store.handle(event(
+            kind: "end", id: "a", extra: ["runId": "run-one", "ok": false]
+        ), observedAt: t + 1)
+
+        // The new start and late old telemetry share one mailbox window. The
+        // queued run-two start becomes the expected episode before stale packets
+        // can affect coalescing or projected lifecycle state.
+        store.enqueue(event(
+            kind: "start", id: "a", extra: ["runId": "run-two", "name": "worker", "task": "second"]
+        ), observedAt: t + 2)
+        store.enqueue(event(
+            kind: "update", id: "a", extra: ["runId": "run-two", "output": "current"]
+        ), observedAt: t + 3)
+        store.enqueue(event(
+            kind: "update", id: "a", extra: ["runId": "run-one", "output": "late old"]
+        ), observedAt: t + 4)
+        store.enqueue(event(kind: "log_delta", id: "a", extra: [
+            "runId": "run-two", "contentIndex": 0, "itemType": "text", "text": "current log",
+        ]), observedAt: t + 5)
+        store.enqueue(event(kind: "log_delta", id: "a", extra: [
+            "runId": "run-one", "contentIndex": 0, "itemType": "text", "text": "late old log",
+        ]), observedAt: t + 6)
+        store.enqueue(event(
+            kind: "end", id: "a", extra: ["runId": "run-one", "ok": false]
+        ), observedAt: t + 7)
+
+        XCTAssertEqual(store.pendingAgentEventCount, 3,
+                       "late run-one telemetry must be rejected before it can replace run-two slots")
+        store.flushPendingAgentEvents()
+
+        let agent = try XCTUnwrap(store.agent(forID: "a"))
+        XCTAssertEqual(agent.runId, "run-two")
+        XCTAssertEqual(agent.state, .running)
+        XCTAssertEqual(agent.output, "current")
+        XCTAssertEqual(agent.log.map(\.text), ["current log"])
+        XCTAssertEqual(agent.lastObservedAt, t + 5,
+                       "the late old run must not replace or refresh run-two telemetry")
+    }
+
     func testBurstPublishesAgentTreeOnce() {
         let store = SubagentStore()
         store.handle(event(
@@ -287,7 +332,7 @@ final class SubagentEventScalingTests: XCTestCase {
         XCTAssertEqual(store.agent(forID: "c")?.state, .running)
     }
 
-    func testDisplayOrderPutsFinishedFirstThenRunningByActivity() throws {
+    func testDisplayOrderPutsFinishedFirstThenRunningByStartTime() throws {
         let store = SubagentStore()
         let t = Date(timeIntervalSince1970: 100)
         store.handle(event(kind: "start", id: "a", extra: ["name": "alpha", "task": "t"]), observedAt: t)
@@ -295,29 +340,33 @@ final class SubagentEventScalingTests: XCTestCase {
         store.handle(event(kind: "start", id: "c", extra: ["name": "gamma", "task": "t"]), observedAt: t + 2)
         store.handle(event(kind: "update", id: "b", extra: ["output": "x"]), observedAt: t + 3)
         store.handle(event(kind: "update", id: "c", extra: ["output": "y"]), observedAt: t + 4)
-        // a 最后结束：end 是它的最后一次观测 → 已完成部分的最顶端
+        // a 完成后排在运行组上方；b/c 仍按开始时间升序。
         store.handle(event(kind: "end", id: "a", extra: ["ok": true]), observedAt: t + 5)
 
-        XCTAssertEqual(store.displayOrder.map(\.id), ["a", "c", "b"])
+        XCTAssertEqual(store.displayOrder.map(\.id), ["a", "b", "c"])
         XCTAssertTrue(store.displayOrder.dropFirst().allSatisfy { $0.state == .running })
     }
 
-    func testDisplayOrderRunningGroupReordersByActivityAndFinishingAgentLeavesRunningTail() throws {
+    func testDisplayOrderRunningGroupStaysByStartTimeAndFinishingAgentLeavesRunningTail() throws {
         let store = SubagentStore()
         let t = Date(timeIntervalSince1970: 200)
         store.handle(event(kind: "start", id: "a", extra: ["name": "alpha"]), observedAt: t)
         store.handle(event(kind: "start", id: "b", extra: ["name": "beta"]), observedAt: t + 1)
         store.handle(event(kind: "start", id: "c", extra: ["name": "gamma"]), observedAt: t + 2)
-        XCTAssertEqual(store.displayOrder.map(\.id), ["c", "b", "a"])
+        XCTAssertEqual(store.displayOrder.map(\.id), ["a", "b", "c"])
 
-        // a 最后动 → 排到运行组最前
+        // update 只改变 lastObservedAt，运行中组不得因此重排。
         store.handle(event(kind: "update", id: "a", extra: ["output": "z"]), observedAt: t + 3)
-        XCTAssertEqual(store.displayOrder.map(\.id), ["a", "c", "b"])
+        XCTAssertEqual(store.displayOrder.map(\.id), ["a", "b", "c"])
 
-        // c 结束：离开运行组，跳到已完成顶端（end 即其最近观测）
+        // c 结束：离开运行组，进入已完成组；运行中的 a/b 仍按开始时间升序。
         store.handle(event(kind: "end", id: "c", extra: ["ok": true]), observedAt: t + 4)
         XCTAssertEqual(store.displayOrder.map(\.id), ["c", "a", "b"])
         XCTAssertEqual(store.displayOrder.filter { $0.state == .running }.map(\.id), ["a", "b"])
+
+        // b 后完成，按完成时间升序排在 c 的下方；最新完成项在更靠下的位置。
+        store.handle(event(kind: "end", id: "b", extra: ["ok": true]), observedAt: t + 5)
+        XCTAssertEqual(store.displayOrder.map(\.id), ["c", "b", "a"])
     }
 
     // MARK: - log_delta live streaming

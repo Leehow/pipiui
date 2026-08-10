@@ -1,0 +1,33 @@
+{
+  "name": "pipiui-github-fetch",
+  "version": "0.1.0",
+  "description": "PipiUI's standalone Pi package for safe GitHub repository, blob, and tree retrieval.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "github"
+  ],
+  "exports": {
+    ".": {
+      "types": "./extensions/github-fetch.ts",
+      "default": "./extensions/github-fetch.ts"
+    }
+  },
+  "types": "./extensions/github-fetch.ts",
+  "pi": {
+    "extensions": [
+      "./extensions/github-fetch.ts"
+    ]
+  },
+  "files": [
+    "extensions/github-fetch.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

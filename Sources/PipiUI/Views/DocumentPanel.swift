@@ -27,8 +27,15 @@ struct DocumentPanel: View {
                 tabStrip
                 Divider()
             }
-            if let active = store.activeStore {
-                DocumentTabContent(store: active)
+            if let active = store.activeStore,
+               let readerState = store.activeReaderState {
+                DocumentTabContent(
+                    store: active,
+                    readerState: readerState,
+                    onOpenDocument: { url in
+                        store.open(url)
+                    }
+                )
             } else {
                 emptyState
             }
@@ -89,17 +96,31 @@ struct DocumentPanel: View {
     }
 }
 
-/// 单个文档 tab 的内容：Markdown 走聊天同款 MarkdownTextView（标题/表格/代码块/引用），
+/// 单个文档 tab 的内容：Markdown 复用聊天同一 AST/TextKit 渲染，装入原生阅读器；
 /// 纯文本走等宽可选中原文；头部提供访达 / 外部打开 / 刷新。
 struct DocumentTabContent: View {
     @ObservedObject var store: DocumentStore
+    @ObservedObject var readerState: DocumentReaderState
+    /// Relative Markdown links return through this tab container so document files open as tabs.
+    let onOpenDocument: (URL) -> Void
     @Environment(\.chatTypography) private var chatTypography
+    @FocusState private var findFieldFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
             toolbar
+            readerControls
             Divider()
             content
+        }
+        .onChange(of: readerState.findFocusGeneration) { _, _ in
+            guard markdownDocument != nil else { return }
+            findFieldFocused = true
+        }
+        .onExitCommand {
+            guard readerState.isFindVisible else { return }
+            readerState.dismissFind()
+            findFieldFocused = false
         }
     }
 
@@ -124,6 +145,20 @@ struct DocumentTabContent: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+
+            if markdownDocument != nil {
+                iconButton("magnifyingglass", tip: "在文档中查找（⌘F）") {
+                    readerState.showFind()
+                }
+                if !markdownHeadings.isEmpty {
+                    iconButton(
+                        readerState.isTableOfContentsVisible ? "list.bullet.indent" : "list.bullet",
+                        tip: readerState.isTableOfContentsVisible ? "隐藏目录" : "显示目录"
+                    ) {
+                        readerState.toggleTableOfContents()
+                    }
+                }
+            }
 
             if let url = store.currentURL {
                 iconButton("folder", tip: "在访达中显示") {
@@ -181,6 +216,98 @@ struct DocumentTabContent: View {
 
     private var headerSubtitle: String? {
         store.currentURL?.path
+    }
+
+    private var markdownDocument: DocumentStore.Document? {
+        guard case .loaded(let doc) = store.loadState, doc.kind == .markdown else {
+            return nil
+        }
+        return doc
+    }
+
+    /// Reuses MarkdownTextView's cached AST; no line-oriented outline parser is introduced.
+    private var markdownHeadings: [MarkdownDocumentHeading] {
+        guard let doc = markdownDocument else { return [] }
+        return MarkdownDocumentOutline.headings(from: doc.text)
+    }
+
+    private var findBinding: Binding<String> {
+        Binding(
+            get: { readerState.findQuery },
+            set: { readerState.updateFindQuery($0) }
+        )
+    }
+
+    @ViewBuilder
+    private var readerControls: some View {
+        if markdownDocument != nil {
+            if readerState.isFindVisible {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("查找", text: findBinding)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($findFieldFocused)
+                        .onSubmit { readerState.findNext() }
+                        .accessibilityLabel("在文档中查找")
+                    Button {
+                        readerState.findPrevious()
+                    } label: {
+                        Image(systemName: "chevron.up")
+                    }
+                    .buttonStyle(HoverButtonStyle())
+                    .help("上一个匹配（⇧⌘G）")
+                    Button {
+                        readerState.findNext()
+                    } label: {
+                        Image(systemName: "chevron.down")
+                    }
+                    .buttonStyle(HoverButtonStyle())
+                    .help("下一个匹配（⌘G）")
+                    Button {
+                        readerState.dismissFind()
+                        findFieldFocused = false
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(HoverButtonStyle())
+                    .help("关闭查找")
+                }
+                .padding(.horizontal, 10)
+                .padding(.bottom, 7)
+            }
+
+            if readerState.isTableOfContentsVisible, !markdownHeadings.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 1) {
+                        ForEach(markdownHeadings) { heading in
+                            Button {
+                                readerState.requestHeadingJump(to: heading.id)
+                            } label: {
+                                Text(heading.title)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                    .foregroundStyle(
+                                        readerState.activeHeadingID == heading.id
+                                            ? Color.accentColor
+                                            : Color.primary
+                                    )
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.leading, CGFloat(max(0, heading.level - 1)) * 10)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 3)
+                            }
+                            .buttonStyle(HoverButtonStyle())
+                            .accessibilityLabel("跳转到 \(heading.title)")
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 7)
+                }
+                .frame(maxHeight: 132)
+            }
+        }
     }
 
     // MARK: - Content
@@ -243,29 +370,37 @@ struct DocumentTabContent: View {
 
     @ViewBuilder
     private func documentView(_ doc: DocumentStore.Document) -> some View {
+        let renderContext = MarkdownRenderContext.document(documentURL: doc.url)
         switch doc.kind {
         case .pdf:
             PDFKitView(url: doc.url)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .markdown, .plain:
+        case .markdown:
+            DocumentMarkdownReaderView(
+                markdownText: doc.text,
+                headings: markdownHeadings,
+                readerState: readerState,
+                typography: chatTypography,
+                renderContext: renderContext,
+                onOpenDocument: onOpenDocument,
+                onFlash: nil
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .plain:
+            let renderStyle = MarkdownRenderStyle(
+                typography: chatTypography,
+                context: renderContext
+            )
             ScrollView {
-                Group {
-                    switch doc.kind {
-                    case .markdown:
-                        MarkdownTextView(text: doc.text)
-                    case .plain:
-                        Text(doc.text)
-                            .font(Font(chatTypography.codeNSFont))
-                            .lineSpacing(chatTypography.lineSpacing)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    case .pdf:
-                        EmptyView()
-                    }
-                }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .overlayScrollers()
+                Text(doc.text)
+                    .font(Font(renderStyle.codeNSFont))
+                    .lineSpacing(renderStyle.lineSpacing)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: MarkdownRenderContext.documentReaderMaximumMeasure, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.horizontal, MarkdownRenderContext.documentReaderHorizontalInset)
+                    .padding(.vertical, MarkdownRenderContext.documentReaderVerticalInset)
+                    .overlayScrollers()
             }
             .scrollIndicators(.automatic)
         }

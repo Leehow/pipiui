@@ -12,6 +12,7 @@ import Foundation
 /// - App 自有 agent 目录（operator + 反摆烂版 explore/plan/reviewer/general-purpose），
 ///   通过 `PIPIUI_AGENTS_DIR` 让补丁版 subagent 读取，不碰 `~/.pi/agent/agents`。
 /// - 内置浏览器扩展。
+/// - App 自有 built-in skills 安装在 Application Support；不写入 `~/.pi/agent/skills`。
 ///
 /// 唯一的例外是工作哲学（`PhilosophyPackage`）：它注册进 `~/.pi/agent/settings.json`，
 /// 因为它是这里唯一「离开本 App 仍然成立」的东西——裸 TUI 也该吃到。
@@ -24,10 +25,16 @@ enum PiPlugin {
         var gitExtension: String?     // -e git_status / git_diff + prompt snapshot
         var reloadExtension: String?  // -e 内部 pipiui_reload 命令
         var webSearchExtension: String? // -e web_search / web_fetch
+        var githubFetchPackage: String? // -e local Pi package: github_fetch
+        var arxivFetchPackage: String? // -e local Pi package: arxiv_fetch
+        var pdfExtractExtension: String? // -e local pdf_extract helper bridge
         var mcpExtension: String? // -e user-added MCP servers (stdio/http)
         var skillLoaderExtension: String? // -e 技能按需加载（名字索引 + skill_search / skill_load）
+        var planRuntimeExtension: String? // -e 主会话 plan_publish / plan_task_update
         var searchScopeExtension: String? // -e 项目内搜索边界 + 当轮外部路径授权
-        var memoryExtension: String? // -e 默认关闭、仅提案、会话冻结的可控记忆
+        /// Read-only bundled source used only to stage the private managed
+        /// memory package. Spawn always uses its Application Support copy.
+        var memoryBrokerBundledPackagesRoot: String?
         var codexServerToolsExtension: String? // -e openai-codex hosted web_search
         var claudeServerToolsExtension: String? // -e anthropic hosted web_search
         var computerUseExtension: String? // -e opt-in desktop computer harness
@@ -112,6 +119,9 @@ enum PiPlugin {
         if let philosophy = PipiResourceBundle.shared.url(forResource: "PiPhilosophy", withExtension: nil) {
             parts.append(directorySignature(philosophy))
         }
+        if let builtInSkills = BuiltInSkillResources.bundledURL() {
+            parts.append(directorySignature(builtInSkills))
+        }
         return parts.joined(separator: "|")
     }
 
@@ -141,6 +151,16 @@ enum PiPlugin {
             guard fm.fileExists(atPath: sub), fm.fileExists(atPath: agents) else { return nil }
             result.subagentDir = sub
             result.agentsDir = agents
+            guard let githubFetch = GitHubFetchPackage.installedPath(in: dest),
+                  let arxivFetch = ArxivFetchPackage.installedPath(in: dest) else { return nil }
+            result.githubFetchPackage = githubFetch
+            result.arxivFetchPackage = arxivFetch
+        }
+        // A shipped skill tree is part of the complete App-owned install. If it is
+        // absent or partial, retry installation instead of silently keeping a stale marker.
+        if BuiltInSkillResources.bundledURL() != nil,
+           !BuiltInSkillResources.isComplete(BuiltInSkillResources.installedURL) {
+            return nil
         }
         let files: [(String, WritableKeyPath<Installed, String?>)] = [
             ("pipiui-webview.ts", \.webviewExtension),
@@ -148,10 +168,11 @@ enum PiPlugin {
             ("pipiui-git.ts", \.gitExtension),
             ("pipiui-reload.ts", \.reloadExtension),
             ("pipiui-websearch.ts", \.webSearchExtension),
+            (PDFExtractExtension.fileName, \.pdfExtractExtension),
             ("pipiui-mcp.ts", \.mcpExtension),
             ("pipiui-skillloader.ts", \.skillLoaderExtension),
+            (PlanRuntimeExtension.fileName, \.planRuntimeExtension),
             ("pipiui-search-scope.ts", \.searchScopeExtension),
-            (MemoryExtension.fileName, \.memoryExtension),
             ("pipiui-codex-server-tools.ts", \.codexServerToolsExtension),
             ("pipiui-claude-server-tools.ts", \.claudeServerToolsExtension),
         ]
@@ -165,6 +186,11 @@ enum PiPlugin {
             .appendingPathComponent(ComputerUseStrategyResource.fileName)
         guard fm.fileExists(atPath: builtInComputerStrategy.path) else { return nil }
         result.computerUseExtension = builtInComputerStrategy.path
+        if let bundledPackages = PipiResourceBundle.shared.url(forResource: "PiExt", withExtension: nil)?
+            .appendingPathComponent("packages", isDirectory: true),
+           fm.fileExists(atPath: bundledPackages.path) {
+            result.memoryBrokerBundledPackagesRoot = bundledPackages.path
+        }
         guard PhilosophyPackage.extensionPath != nil else { return nil }
         return result
     }
@@ -207,6 +233,8 @@ enum PiPlugin {
                 if fm.fileExists(atPath: agents.path) {
                     result.agentsDir = agents.path
                 }
+                result.githubFetchPackage = GitHubFetchPackage.installedPath(in: dest)
+                result.arxivFetchPackage = ArxivFetchPackage.installedPath(in: dest)
                 let computerStrategy = dest.appendingPathComponent(
                     ComputerUseStrategyResource.fileName
                 )
@@ -237,6 +265,12 @@ enum PiPlugin {
            fm.fileExists(atPath: bundledSub.path) {
             result.subagentDir = bundledSub.path
         }
+        if result.githubFetchPackage == nil, let bundledPiExt {
+            result.githubFetchPackage = GitHubFetchPackage.installedPath(in: bundledPiExt)
+        }
+        if result.arxivFetchPackage == nil, let bundledPiExt {
+            result.arxivFetchPackage = ArxivFetchPackage.installedPath(in: bundledPiExt)
+        }
         if result.computerUseExtension == nil,
            let bundledComputerStrategy = bundledPiExt?.appendingPathComponent(
                 ComputerUseStrategyResource.fileName
@@ -244,6 +278,10 @@ enum PiPlugin {
            fm.fileExists(atPath: bundledComputerStrategy.path) {
             result.computerUseExtension = bundledComputerStrategy.path
         }
+
+        // 1.5 App-owned bundled skills: stage-and-replace only Application Support/PipiUI.
+        // The installer never writes into pi's ~/.pi/agent/skills user directory.
+        _ = BuiltInSkillResources.install()
 
         // 2. 内置浏览器扩展（字符串生成，无外部依赖）
         result.webviewExtension = WebviewExtension.install(into: root)
@@ -259,6 +297,7 @@ enum PiPlugin {
 
         // 5.5 通用网络搜索 + 网页抓取（web_search / web_fetch）
         result.webSearchExtension = WebSearchExtension.install(into: root)
+        result.pdfExtractExtension = PDFExtractExtension.install(into: root)
 
         // 5.55 用户自添 MCP 服务器（stdio / HTTP）→ 本地工具
         result.mcpExtension = McpBridgeExtension.install(into: root)
@@ -266,11 +305,18 @@ enum PiPlugin {
         // 5.6 技能按需加载：提示里只留名字，描述/正文走 skill_search / skill_load
         result.skillLoaderExtension = SkillLoaderExtension.install(into: root)
 
+        // 5.62 主会话结构化计划：plan_publish / plan_task_update → bridge plan_event
+        result.planRuntimeExtension = PlanRuntimeExtension.install(into: root)
+
         // 5.65 项目搜索边界：内建 find/grep/ls + 明确的递归 bash 搜索
         result.searchScopeExtension = SearchScopeExtension.install(into: root)
 
-        // 5.66 可控记忆：模型只写 pending，批准存储只由原生确认修改
-        result.memoryExtension = MemoryExtension.install(into: root)
+        // 5.66 记忆 broker 是随包的本地 Pi package。这里只记录只读 bundle
+        // 源目录；启用时再 stage/install 到 Application Support 私有目录。
+        if let packages = bundledPiExt?.appendingPathComponent("packages", isDirectory: true),
+           fm.fileExists(atPath: packages.path) {
+            result.memoryBrokerBundledPackagesRoot = packages.path
+        }
 
         // 5.7 官方 openai-codex Responses hosted web_search
         result.codexServerToolsExtension = CodexServerToolsExtension.install(into: root)

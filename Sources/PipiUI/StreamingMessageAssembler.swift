@@ -20,9 +20,15 @@ final class StreamingMessageAssembler {
         var cachedFileChange: FileChangePayload?
     }
 
+    private struct ThinkingState {
+        var text: String
+        /// Active only until `thinking_end` or the first body-text event.
+        var isOpen: Bool
+    }
+
     private enum Block {
         case text(String)
-        case thinking(String)
+        case thinking(ThinkingState)
         case toolCall(ToolCallState)
     }
 
@@ -35,6 +41,8 @@ final class StreamingMessageAssembler {
     private(set) var textCharacterCount: Int = 0
     /// True after any apply since the last `consumePending` / reset.
     private(set) var isDirty: Bool = false
+    /// Once assistant body text begins, thinking must never re-enter the active state.
+    private var hasStartedBodyText = false
 
     func reset() {
         blocks.removeAll(keepingCapacity: true)
@@ -42,6 +50,7 @@ final class StreamingMessageAssembler {
         characterCount = 0
         textCharacterCount = 0
         isDirty = false
+        hasStartedBodyText = false
     }
 
     var isEmpty: Bool { blocks.isEmpty }
@@ -57,8 +66,12 @@ final class StreamingMessageAssembler {
 
         switch type {
         case "text_start":
+            hasStartedBodyText = true
+            closeThinkingSegments()
             replaceText(index, "")
         case "text_delta":
+            hasStartedBodyText = true
+            closeThinkingSegments()
             let delta = event["delta"].string ?? ""
             if case .text(let existing) = blocks[index] {
                 blocks[index] = .text(existing + delta)
@@ -75,20 +88,28 @@ final class StreamingMessageAssembler {
             }
 
         case "thinking_start":
-            replaceThinking(index, "")
+            // A turn can contain many thinking content indices, but only its newest
+            // open segment may animate the merged live Thinking card.
+            closeThinkingSegments()
+            replaceThinking(index, "", isOpen: !hasStartedBodyText)
         case "thinking_delta":
             let delta = event["delta"].string ?? ""
-            if case .thinking(let existing) = blocks[index] {
-                blocks[index] = .thinking(existing + delta)
+            if case .thinking(var existing) = blocks[index] {
+                existing.text += delta
+                blocks[index] = .thinking(existing)
                 characterCount += delta.count
             } else {
-                replaceThinking(index, delta)
+                closeThinkingSegments()
+                replaceThinking(index, delta, isOpen: !hasStartedBodyText)
             }
         case "thinking_end":
             if let content = event["content"].string {
-                replaceThinking(index, content)
-            } else if blocks[index] == nil {
-                replaceThinking(index, "")
+                replaceThinking(index, content, isOpen: false)
+            } else if case .thinking(var existing) = blocks[index] {
+                existing.isOpen = false
+                blocks[index] = .thinking(existing)
+            } else {
+                replaceThinking(index, "", isOpen: false)
             }
 
         case "toolcall_start":
@@ -170,7 +191,7 @@ final class StreamingMessageAssembler {
             case .text(let text):
                 content.append(["type": "text", "text": text])
             case .thinking(let thinking):
-                content.append(["type": "thinking", "thinking": thinking])
+                content.append(["type": "thinking", "thinking": thinking.text])
             case .toolCall(let state):
                 let arguments: Any
                 if let object = state.argumentsObject {
@@ -200,6 +221,7 @@ final class StreamingMessageAssembler {
     /// so growing `argumentsJSON` is not re-parsed into `FileChangePayload` every tick.
     func makeStreamingItem(id: String = "streaming") -> ChatItem {
         var chatBlocks: [ChatBlock] = []
+        var activeThinkingBlockIndex: Int?
         chatBlocks.reserveCapacity(orderedIndices.count)
         for index in orderedIndices {
             guard var block = blocks[index] else { continue }
@@ -207,7 +229,10 @@ final class StreamingMessageAssembler {
             case .text(let text):
                 if !text.isEmpty { chatBlocks.append(.text(text)) }
             case .thinking(let thinking):
-                if !thinking.isEmpty { chatBlocks.append(.thinking(thinking)) }
+                if !thinking.text.isEmpty {
+                    chatBlocks.append(.thinking(thinking.text))
+                    if thinking.isOpen { activeThinkingBlockIndex = chatBlocks.count - 1 }
+                }
             case .toolCall(var state):
                 Self.refreshToolCache(&state)
                 block = .toolCall(state)
@@ -221,7 +246,12 @@ final class StreamingMessageAssembler {
                 )))
             }
         }
-        return ChatItem(id: id, role: "assistant", blocks: chatBlocks)
+        return ChatItem(
+            id: id,
+            role: "assistant",
+            blocks: chatBlocks,
+            activeThinkingBlockIndex: activeThinkingBlockIndex
+        )
     }
 
     // MARK: - Private
@@ -231,22 +261,30 @@ final class StreamingMessageAssembler {
             characterCount -= old.count
             textCharacterCount -= old.count
         } else if case .thinking(let old) = blocks[index] {
-            characterCount -= old.count
+            characterCount -= old.text.count
         }
         characterCount += text.count
         textCharacterCount += text.count
         setBlock(index, .text(text))
     }
 
-    private func replaceThinking(_ index: Int, _ text: String) {
+    private func replaceThinking(_ index: Int, _ text: String, isOpen: Bool) {
         if case .text(let old) = blocks[index] {
             characterCount -= old.count
             textCharacterCount -= old.count
         } else if case .thinking(let old) = blocks[index] {
-            characterCount -= old.count
+            characterCount -= old.text.count
         }
         characterCount += text.count
-        setBlock(index, .thinking(text))
+        setBlock(index, .thinking(ThinkingState(text: text, isOpen: isOpen)))
+    }
+
+    private func closeThinkingSegments() {
+        for index in orderedIndices {
+            guard case .thinking(var thinking) = blocks[index], thinking.isOpen else { continue }
+            thinking.isOpen = false
+            blocks[index] = .thinking(thinking)
+        }
     }
 
     private func setBlock(_ index: Int, _ block: Block) {

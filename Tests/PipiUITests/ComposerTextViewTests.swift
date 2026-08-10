@@ -5,6 +5,35 @@ import SwiftUI
 
 @MainActor
 final class ComposerTextViewTests: XCTestCase {
+    func testInitialNonEmptyDraftSynchronizesAndPlacesCaretAtEnd() {
+        var boundText = "恢复的草稿"
+        var isFocused = false
+        var boundHeight = ComposerTextViewLayout.minimumHeight(
+            for: .systemFont(ofSize: NSFont.systemFontSize)
+        )
+        let identity = NSObject()
+        let parent = ComposerTextView(
+            text: Binding(get: { boundText }, set: { boundText = $0 }),
+            isFocused: Binding(get: { isFocused }, set: { isFocused = $0 }),
+            height: Binding(get: { boundHeight }, set: { boundHeight = $0 }),
+            sessionIdentity: ObjectIdentifier(identity),
+            placeholder: "输入消息…",
+            onSubmit: {}
+        )
+        let coordinator = ComposerTextView.Coordinator(parent: parent)
+        let host = ComposerTextViewHost()
+        host.textView.delegate = coordinator
+        coordinator.host = host
+
+        coordinator.synchronize(host)
+
+        XCTAssertEqual(host.textView.string, boundText)
+        XCTAssertEqual(
+            host.textView.selectedRange(),
+            NSRange(location: (boundText as NSString).length, length: 0)
+        )
+    }
+
     func testNativeHostUsesFullWidthCapsAtTenLinesAndClearsStaleScroll() {
         let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
         let host = ComposerTextViewHost(font: font)

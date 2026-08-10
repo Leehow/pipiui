@@ -113,68 +113,176 @@ async function searchFirecrawl(query: string, maxResults: number): Promise<Searc
 }
 
 // ---------------------------------------------------------------------------
-// HTML utilities (for web_fetch)
+// HTML utilities (for web_fetch). This deliberately small DOM-lite converter is
+// a seam: a future bundled readability parser can replace extractMainContent.
 // ---------------------------------------------------------------------------
 
-function stripTags(html: string): string {
-  return html.replace(/<[^>]*>/g, "");
-}
+const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+const NOISE_TAGS = new Set(["script", "style", "noscript", "svg", "nav", "header", "footer", "aside"]);
 
 function decodeEntities(s: string): string {
-  return s
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&#x2F;/g, "/")
-    .replace(/&nbsp;/g, " ");
+  return s.replace(/&(amp|lt|gt|quot|nbsp);|&#(x[0-9a-f]+|[0-9]+);/gi, (_all, named, numeric) => {
+    if (named) return ({ amp: "&", lt: "<", gt: ">", quot: '"', nbsp: " " } as Record<string, string>)[named.toLowerCase()] || " ";
+    const n = String(numeric).toLowerCase();
+    const code = n.startsWith("x") ? parseInt(n.slice(1), 16) : parseInt(n, 10);
+    return Number.isFinite(code) ? String.fromCodePoint(code) : " ";
+  });
+}
+
+function tagName(token: string): string {
+  return (token.match(/^<\/?\s*([a-z0-9:-]+)/i)?.[1] || "").toLowerCase();
+}
+
+function findContainer(html: string, matches: (token: string, name: string) => boolean): string | null {
+  const tokens = /<!--[\s\S]*?-->|<[^>]*>/g;
+  let match: RegExpExecArray | null;
+  while ((match = tokens.exec(html))) {
+    const token = match[0];
+    const name = tagName(token);
+    if (!name || /^<\//.test(token) || VOID_TAGS.has(name) || !matches(token, name)) continue;
+    const start = tokens.lastIndex;
+    let depth = 1;
+    while ((match = tokens.exec(html))) {
+      const nested = match[0];
+      const nestedName = tagName(nested);
+      if (!nestedName || VOID_TAGS.has(nestedName) || /^<!--/.test(nested)) continue;
+      if (/^<\//.test(nested)) depth--;
+      else if (!/\/>$/.test(nested)) depth++;
+      if (depth === 0) return html.slice(start, match.index);
+    }
+    return null;
+  }
+  return null;
+}
+
+function htmlToMarkdown(fragment: string): string {
+  const tokens = /<!--[\s\S]*?-->|<[^>]*>/g;
+  let output = "";
+  let cursor = 0;
+  let suppressed = 0;
+  let preDepth = 0;
+  let codeDepth = 0;
+  const lists: string[] = [];
+  const links: string[] = [];
+  const add = (s: string) => { output += s; };
+  const block = () => { if (!output.endsWith("\n\n")) add("\n\n"); };
+  const appendText = (value: string) => {
+    if (suppressed) return;
+    const decoded = decodeEntities(value);
+    add(preDepth ? decoded : decoded.replace(/\s+/g, " "));
+  };
+  let match: RegExpExecArray | null;
+  while ((match = tokens.exec(fragment))) {
+    appendText(fragment.slice(cursor, match.index));
+    cursor = tokens.lastIndex;
+    const token = match[0];
+    if (/^<!--/.test(token)) continue;
+    const closing = /^<\//.test(token);
+    const name = tagName(token);
+    if (!name) continue;
+    if (NOISE_TAGS.has(name)) { suppressed += closing ? -1 : 1; continue; }
+    if (suppressed) continue;
+    if (closing) {
+      if (/^h[1-6]$/.test(name) || ["p", "div", "section", "article", "li", "blockquote"].includes(name)) block();
+      if (name === "pre") { preDepth--; block(); }
+      if (name === "code") codeDepth--;
+      if (name === "ul" || name === "ol") lists.pop();
+      if (name === "a") { const href = links.pop(); if (href) add(` (${href})`); }
+      continue;
+    }
+    if (/^h[1-6]$/.test(name)) { block(); add("#".repeat(Number(name[1])) + " "); }
+    else if (["p", "div", "section", "article"].includes(name)) block();
+    else if (name === "br") add("\n");
+    else if (name === "ul" || name === "ol") { block(); lists.push(name); }
+    else if (name === "li") { add(`\n${lists[lists.length - 1] === "ol" ? "1." : "-"} `); }
+    else if (name === "blockquote") { block(); add("> "); }
+    else if (name === "pre") { block(); add("```\n"); preDepth++; }
+    else if (name === "code" && !preDepth) { add("`"); codeDepth++; }
+    else if (name === "a") { const href = token.match(/\bhref\s*=\s*["']([^"']+)["']/i)?.[1]; links.push(href || ""); }
+  }
+  appendText(fragment.slice(cursor));
+  while (codeDepth-- > 0) add("`");
+  while (preDepth-- > 0) add("\n```");
+  return output.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function extractRSCText(html: string): string {
+  const chunks: string[] = [];
+  const pushes = /self\.__next_f\.push\(([\s\S]*?)\);/g;
+  let push: RegExpExecArray | null;
+  while ((push = pushes.exec(html))) {
+    const quoted = /"(?:\\.|[^"\\])*"/g;
+    let item: RegExpExecArray | null;
+    while ((item = quoted.exec(push[1]))) {
+      try {
+        const value = JSON.parse(item[0]) as string;
+        const plain = htmlToMarkdown(value.replace(/\\n/g, "\n")).trim();
+        if (plain.length > 2 && /[A-Za-z\u4e00-\u9fff]/.test(plain) &&
+            !/(^|\s)(?:_next|webpack|static|chunk|layout|page|[a-f0-9]{16,})(\s|$)/i.test(plain) &&
+            !/^[/\\$]/.test(plain)) chunks.push(plain);
+      } catch { /* Ignore malformed payload fragments. */ }
+    }
+  }
+  return [...new Set(chunks)].join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function extractMainContent(html: string): string {
-  // Remove non-content elements
-  let cleaned = html
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, "")
-    .replace(/<svg[\s\S]*?<\/svg>/gi, "")
-    .replace(/<nav[\s\S]*?<\/nav>/gi, "")
-    .replace(/<footer[\s\S]*?<\/footer>/gi, "")
-    .replace(/<header[\s\S]*?<\/header>/gi, "")
-    .replace(/<aside[\s\S]*?<\/aside>/gi, "")
-    .replace(/<!--[\s\S]*?-->/g, "");
-
-  // Try to find main content container
-  const articleMatch = cleaned.match(/<article[^>]*>([\s\S]*?)<\/article>/i);
-  const mainMatch = cleaned.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
-  const roleMainMatch = cleaned.match(/<[^>]+role="main"[^>]*>([\s\S]*?)<\/(?:div|section|article)>/i);
-
-  const content = articleMatch?.[1] || mainMatch?.[1] || roleMainMatch?.[1] || cleaned;
-
-  // Extract title
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  const title = titleMatch ? stripTags(titleMatch[1]).trim() : "";
+  const title = titleMatch ? htmlToMarkdown(titleMatch[1]) : "";
+  const content =
+    findContainer(html, (_token, name) => name === "article") ||
+    findContainer(html, (_token, name) => name === "main") ||
+    findContainer(html, (token) => /\brole\s*=\s*["']main["']/i.test(token)) ||
+    html;
+  let body = htmlToMarkdown(content);
+  if (body.replace(/\s/g, "").length < 80) body = extractRSCText(html) || body;
+  if (!body) return "";
+  return title && !body.startsWith(`# ${title}`) ? `# ${title}\n\n${body}` : body;
+}
 
-  // Convert to text: preserve block structure
-  let text = content
-    .replace(/<\/(?:p|div|h[1-6]|li|tr|blockquote|section|article|pre)>/gi, "\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<[^>]*>/g, "")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&nbsp;/g, " ")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n[ \t]+/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+async function readTextWithLimit(res: Response): Promise<string> {
+  const declared = Number(res.headers.get("content-length") || 0);
+  if (declared > MAX_RESPONSE_BYTES) throw new Error(`response exceeds ${MAX_RESPONSE_BYTES} byte limit`);
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      size += next.value.byteLength;
+      if (size > MAX_RESPONSE_BYTES) throw new Error(`response exceeds ${MAX_RESPONSE_BYTES} byte limit`);
+      chunks.push(next.value);
+    }
+  } finally { reader.releaseLock(); }
+  const joined = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(joined);
+}
 
-  if (title) text = `# ${title}\n\n${text}`;
-  return text;
+async function fetchGenericWebURL(parsed: URL, maxLength: number): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  try {
+    const res = await fetch(parsed.href, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/json,application/xml,text/plain;q=0.9,*/*;q=0.8",
+      }, signal: controller.signal, redirect: "follow",
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText || "response"}`);
+    const raw = await readTextWithLimit(res);
+    const extracted = /(?:text\/html|application\/xhtml\+xml)/i.test(res.headers.get("content-type") || "")
+      ? extractMainContent(raw)
+      : raw; // text/plain, JSON, and XML are intentionally returned directly in phase one.
+    if (!extracted.trim()) throw new Error("page returned no extractable text content (possibly JS-rendered)");
+    return truncate(extracted, maxLength);
+  } catch (err: any) {
+    throw new Error(err?.name === "AbortError" ? "request timed out (30s)" : err?.message || String(err));
+  } finally { clearTimeout(timeout); }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,11 +359,13 @@ export default function (pi: ExtensionAPI) {
     label: "Web Fetch",
     description:
       "Fetch a URL and return its main text content with navigation, ads, scripts, and other " +
-      "non-content elements stripped. Useful for reading articles, documentation pages, or any " +
-      "web page in full after finding it via web_search. Returns plain text (markdown-like).",
+      "non-content elements stripped. Useful for reading articles, documentation pages, GitHub " +
+      "issues/PRs/discussions/wikis/releases, or any web page in full after finding it via web_search. " +
+      "Use github_fetch instead for GitHub repository roots and /blob/ or /tree/ URLs.",
     promptSnippet: "Fetch a URL and extract its main text content",
     promptGuidelines: [
       "Use web_fetch to read a specific page found via web_search or provided by the user.",
+      "Use github_fetch for GitHub repository roots and /blob/ or /tree/ URLs; use web_fetch for GitHub issues, pull requests, discussions, wikis, releases, and other rendered GitHub pages.",
       "The output is plain text with scripts/ads/nav removed; images are not included.",
     ],
     parameters: Type.Object({
@@ -266,46 +376,14 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params) {
       const url = (params.url || "").trim();
-      if (!url || (!url.startsWith("http://") && !url.startsWith("https://"))) {
+      let parsed: URL;
+      try { parsed = new URL(url); } catch { return text("web_fetch: url must be an absolute HTTP(S) URL.", true); }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
         return text("web_fetch: url must be an absolute HTTP(S) URL.", true);
       }
       const maxLength = Math.min(Math.max(Math.round(params.max_length || 20000), 1000), 100000);
-
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 30000);
-        const res = await fetch(url, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          },
-          signal: controller.signal,
-          redirect: "follow",
-        });
-        clearTimeout(timeout);
-
-        if (!res.ok) {
-          return text(`web_fetch failed: HTTP ${res.status} ${res.statusText}`, true);
-        }
-
-        const contentType = res.headers.get("content-type") || "";
-        if (!contentType.includes("text/html") && !contentType.includes("text/plain") && !contentType.includes("application/xhtml")) {
-          // For non-HTML (JSON, XML, etc.) return raw text
-          const raw = await res.text();
-          return text(truncate(raw, maxLength));
-        }
-
-        const html = await res.text();
-        const extracted = extractMainContent(html);
-        if (!extracted.trim()) {
-          return text("web_fetch: page returned no extractable text content.", true);
-        }
-        return text(truncate(extracted, maxLength));
-      } catch (err: any) {
-        const msg = err?.name === "AbortError" ? "request timed out (30s)" : err?.message || String(err);
-        return text(`web_fetch failed: ${msg}`, true);
-      }
+      try { return text(await fetchGenericWebURL(parsed, maxLength)); }
+      catch (err: any) { return text(`web_fetch failed: ${err?.message || String(err)}`, true); }
     },
   });
 }

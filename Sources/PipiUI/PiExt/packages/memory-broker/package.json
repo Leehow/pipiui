@@ -1,0 +1,51 @@
+{
+  "name": "pipiui-memory-broker",
+  "version": "0.1.0",
+  "description": "Loopback-only, host-neutral Pi memory broker extension with bounded worker and operator clients.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pipiui",
+    "memory"
+  ],
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./extension": {
+      "types": "./extensions/memory-broker.ts",
+      "default": "./extensions/memory-broker.ts"
+    }
+  },
+  "types": "./src/index.ts",
+  "imports": {
+    "#memory-broker-contract": "./vendor/pipiui-memory-broker-contract/contract/index.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/memory-broker.ts"
+    ]
+  },
+  "files": [
+    "extensions/memory-broker.ts",
+    "src/*.ts",
+    "vendor/pipiui-memory-broker-contract/**",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "pipiui-memory-broker-contract": "file:vendor/pipiui-memory-broker-contract",
+    "pi-hermes-memory": "0.9.4"
+  },
+  "bundledDependencies": [
+    "pipiui-memory-broker-contract",
+    "pi-hermes-memory"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

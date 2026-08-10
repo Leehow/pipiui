@@ -1,0 +1,61 @@
+{
+  "source": {
+    "extension": "Sources/PipiUI/PlanRuntimeExtension.swift",
+    "consumer": "Sources/PipiUI/PlanStore.swift#applyBridgeEvent",
+    "note": "Lifecycle events in the current generated runtime omit schemaVersion; v1 requires it on every plan envelope. Revision remains store-owned."
+  },
+  "events": [
+    {
+      "schemaVersion": 1,
+      "event": "publish",
+      "at": "2026-08-10T00:00:00.000Z",
+      "plan": {
+        "id": "host-contract-plan",
+        "title": "Portable host contract",
+        "summary": "Freeze contracts before moving hosts.",
+        "tasks": [
+          { "id": "contract", "title": "Define v1 contracts", "state": "pending" },
+          { "id": "adapter", "title": "Build Node adapter", "state": "pending", "detail": "" }
+        ]
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "event": "approve",
+      "planId": "host-contract-plan",
+      "at": "2026-08-10T00:00:01.000Z"
+    },
+    {
+      "schemaVersion": 1,
+      "event": "task_update",
+      "planId": "host-contract-plan",
+      "at": "2026-08-10T00:00:02.000Z",
+      "task": {
+        "id": "contract",
+        "state": "completed",
+        "detail": "Contracts decode unknown fields with warnings."
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "event": "cancel",
+      "planId": "host-contract-plan",
+      "at": "2026-08-10T00:00:03.000Z"
+    }
+  ],
+  "responses": [
+    {
+      "schemaVersion": 1,
+      "ok": true,
+      "applied": true,
+      "revision": 7
+    },
+    {
+      "schemaVersion": 1,
+      "ok": false,
+      "applied": false,
+      "currentRevision": 7,
+      "error": "plan is awaiting approval"
+    }
+  ]
+}

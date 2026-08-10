@@ -17,6 +17,7 @@ import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -29,11 +30,20 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import {
+	type AgentConfig,
+	type AgentScope,
+	discoverAgents,
+	formatAgentDiagnostics,
+} from "./agents.ts";
 import { registerMainSessionCompactionHook } from "./main-compaction.ts";
+import { registerSessionRecallTool } from "./session-recall.ts";
 import { registerQoderContextWindowCompat } from "./qoder-context-window.ts";
 import {
 	resolveSubagentToolSelection,
+	resolvePipiUIExtensionRouting,
+	selectPipiUIExtensionRoutes,
+	shouldMountMcpExtension,
 	resolveDesktopGrant,
 	DESKTOP_GRANT_CHILD_POLICY,
 	sanitizeDisabledToolNames,
@@ -66,6 +76,12 @@ import {
 	releaseAgentLease,
 } from "./agent-lease.ts";
 import { resolveSubagentWorktree } from "./worktree.ts";
+import { runtimeRolePolicyForAgent } from "./runtime-policy.ts";
+import { registerSubagentManagementTool } from "./agent-management.ts";
+import {
+	encodeAgentEventBridgeRequestV1,
+	type AgentBridgeEventPayloadV1,
+} from "./host-bridge.ts";
 
 const MAX_PARALLEL_TASKS = 1000;
 const MAX_CONCURRENCY = 1000;
@@ -347,16 +363,51 @@ function recordSubagentDispatchStats(
 // ---- Pipi UI 集成：向 App 桥接服务上报 subagent 生命周期（无环境变量时完全静默） ----
 const PIPIUI_PORT = process.env.PIPIUI_BRIDGE_PORT;
 const PIPIUI_SESSION = process.env.PIPIUI_SESSION_KEY;
+const PIPIUI_SESSION_CAPABILITY = process.env.PIPIUI_SESSION_CAPABILITY;
+const PIPIUI_HOST_PROTOCOL = process.env.PIPIUI_HOST_PROTOCOL;
 
 function pipiuiChildProcessEnv(
 	extra: Record<string, string | undefined> = {},
 	preserveComputerCapability = false,
 ): Record<string, string | undefined> {
 	const env = { ...process.env, ...extra };
+	// A broker connection/capability is one dispatch generation only. Never let a
+	// verifier, helper, or nested child inherit the main token or another run's
+	// grant. The main extension re-adds this complete tuple only for this spawn.
+	const memoryBrokerValues = Object.fromEntries(
+		Object.entries(extra).filter(([key, value]) =>
+			key === "PIPIUI_MEMORY_BROKER_MODE"
+			|| key === "PIPIUI_MEMORY_BROKER_URL"
+			|| key === "PIPIUI_MEMORY_BROKER_TOKEN"
+			|| key === "PIPIUI_MEMORY_BROKER_CAPABILITY"
+			|| key === "PIPIUI_MEMORY_PROJECT_ROOT"
+			|| key === "PIPIUI_MEMORY_BROKER_PACKAGE_ROOT"
+			|| key === "PIPIUI_MEMORY_BROKER_EXTENSION"
+			|| key === "PIPIUI_MEMORY_BROKER_PACKAGE_VERSION"
+			|| key === "PIPIUI_MAIN_CWD"
+			? typeof value === "string" && value.length > 0
+			: false,
+		),
+	);
+	const computerMemoryEnabled = extra.PIPIUI_COMPUTER_MEMORY_ENABLED;
+	delete env.PIPIUI_MEMORY_BROKER_MODE;
+	delete env.PIPIUI_MEMORY_BROKER_URL;
+	delete env.PIPIUI_MEMORY_BROKER_TOKEN;
+	delete env.PIPIUI_MEMORY_BROKER_CAPABILITY;
+	delete env.PIPIUI_MEMORY_PROJECT_ROOT;
+	delete env.PIPIUI_MEMORY_BROKER_PACKAGE_ROOT;
+	delete env.PIPIUI_MEMORY_BROKER_EXTENSION;
+	delete env.PIPIUI_MEMORY_BROKER_PACKAGE_VERSION;
+	delete env.PIPIUI_COMPUTER_MEMORY_ENABLED;
+	Object.assign(env, memoryBrokerValues);
 	// Only the dispatched Pi process may inherit desktop control. Verifier
-	// shells and git helpers still use the default false path.
+	// shells and git helpers still use the default false path. The companion
+	// Computer-memory marker is equally one-dispatch-only and is never inherited
+	// merely because a parent once held a desktop grant.
 	if (!preserveComputerCapability) {
 		delete env.PIPIUI_COMPUTER_CAPABILITY;
+	} else if (computerMemoryEnabled === "1") {
+		env.PIPIUI_COMPUTER_MEMORY_ENABLED = "1";
 	}
 	return env;
 }
@@ -380,6 +431,14 @@ const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
 // own extension discovery, but only when the worker's model has a provider that ships it —
 // this is the fallback that makes research delegable no matter which model runs it.
 const PIPIUI_WEBSEARCH_EXT = process.env.PIPIUI_WEBSEARCH_EXT;
+// Local PDF bridge: both the generated extension path and signed helper are required before a
+// worker may expose pdf_extract. The helper env itself is inherited into the child process.
+const PIPIUI_PDF_EXT = process.env.PIPIUI_PDF_EXT;
+const PIPIUI_PDF_HELPER = process.env.PIPIUI_PDF_HELPER;
+// Local Pi package roots for specialized URL retrieval. Role allowlists still decide whether a
+// child may call each mounted package tool.
+const PIPIUI_GITHUB_EXT = process.env.PIPIUI_GITHUB_EXT;
+const PIPIUI_ARXIV_EXT = process.env.PIPIUI_ARXIV_EXT;
 // User-added MCP servers (stdio / HTTP). Re-exported so a dispatched worker also sees the
 // user's MCP tools; the hot-read config file is inherited through the child env too.
 const PIPIUI_MCP_EXT = process.env.PIPIUI_MCP_EXT;
@@ -388,6 +447,87 @@ const PIPIUI_MCP_EXT = process.env.PIPIUI_MCP_EXT;
 const PIPIUI_SUBAGENT_SKILL_ISOLATION = process.env.PIPIUI_SUBAGENT_SKILL_ISOLATION === "1";
 // Read-only planners additionally cannot pull SKILL.md through the read tool.
 const PIPIUI_SKILL_READ_BLOCK = process.env.PIPIUI_SKILL_READ_BLOCK === "1";
+
+type MemoryBrokerChildRole = "worker" | "operator";
+type IssuedMemoryBrokerEnvironment = Record<string, string>;
+type IssuedMemoryBrokerPackage = { root: string; extension: string; version: string };
+type MainMemoryBrokerIssuer = ((input: {
+	agentID: string;
+	runID: string;
+	role: MemoryBrokerChildRole;
+	hostIssuedDesktopGrant?: "user-requested" | "ui-verify";
+}) => IssuedMemoryBrokerEnvironment | undefined) & {
+	validateIssuedPackageIdentity?: (
+		environment: Record<string, string | undefined>,
+	) => { root: string; entrypoint: string; version: string } | undefined;
+};
+
+const MAIN_MEMORY_BROKER_ISSUER = Symbol.for("pipiui.memory-broker.issue-child-capability");
+const memoryBrokerIssuerHost = globalThis as typeof globalThis & { [key: symbol]: unknown };
+
+function mainMemoryBrokerIssuer(): MainMemoryBrokerIssuer | undefined {
+	const issuer = memoryBrokerIssuerHost[MAIN_MEMORY_BROKER_ISSUER];
+	return typeof issuer === "function" ? issuer as MainMemoryBrokerIssuer : undefined;
+}
+
+/** Main-only capability issue. Absence/degradation remains optional-memory fail-soft. */
+async function issueMemoryBrokerEnvironment(
+	input: {
+		agentID: string;
+		runID: string;
+		role: MemoryBrokerChildRole;
+		hostIssuedDesktopGrant?: "user-requested" | "ui-verify";
+	},
+): Promise<IssuedMemoryBrokerEnvironment | undefined> {
+	try {
+		return mainMemoryBrokerIssuer()?.(input);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The live main package owns identity validation. There is deliberately no
+ * local `../packages` or development-tree fallback: a stale, mismatched, or
+ * missing identity removes only optional child memory.
+ */
+function issuedMemoryBrokerPackageForChild(
+	environment: IssuedMemoryBrokerEnvironment,
+): IssuedMemoryBrokerPackage | undefined {
+	try {
+		const identity = mainMemoryBrokerIssuer()?.validateIssuedPackageIdentity?.(environment);
+		return identity
+			? { root: identity.root, extension: identity.entrypoint, version: identity.version }
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Terminal memory is optional and must never delay done delivery. */
+async function submitBrokerTerminalCandidate(
+	environment: IssuedMemoryBrokerEnvironment | undefined,
+	input: { runID: string; task: string; title?: string; terminalText: string; outcome: "success" | "failure" },
+): Promise<void> {
+	if (!environment) return;
+	try {
+		const identity = issuedMemoryBrokerPackageForChild(environment);
+		if (!identity) return;
+		const clientPath = fs.realpathSync(path.join(identity.root, "src/client.ts"));
+		const prefix = identity.root.endsWith(path.sep) ? identity.root : `${identity.root}${path.sep}`;
+		if (!clientPath.startsWith(prefix) || !fs.statSync(clientPath).isFile()) return;
+		const { createMemoryBrokerClient, submitTerminalExperienceCandidate } = await import(pathToFileURL(clientPath).href);
+		await submitTerminalExperienceCandidate(createMemoryBrokerClient(environment), input);
+	} catch {
+		// Optional memory must not interfere with terminal report/done delivery.
+	}
+}
+
+function memoryBrokerExtensionPathForChild(
+	environment: IssuedMemoryBrokerEnvironment,
+): string | undefined {
+	return issuedMemoryBrokerPackageForChild(environment)?.extension;
+}
 
 /**
  * Runtime state published by the pipi-philosophy extension for this exact pid, each turn.
@@ -454,9 +594,23 @@ process.on("exit", pipiuiKillAllChildren);
 let pipiuiCurrentToolCall: string | null = null;
 
 const PIPIUI_REPORT_TIMEOUT_MS = 5000;
+type PipiuiAgentReport = AgentBridgeEventPayloadV1;
 
-async function postPipiuiReport(payload: Record<string, unknown>): Promise<void> {
-	if (!PIPIUI_PORT || !PIPIUI_SESSION) return;
+/**
+ * The sole live agent-event emitter. It selects exactly one envelope for the
+ * same /rpc endpoint: legacy flat Swift bridge by default, canonical v1 only
+ * when the Electron host explicitly exported PIPIUI_HOST_PROTOCOL=1.
+ */
+async function postPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
+	if (!PIPIUI_PORT) return;
+	const body = encodeAgentEventBridgeRequestV1(payload, {
+		PIPIUI_HOST_PROTOCOL,
+		PIPIUI_SESSION_KEY: PIPIUI_SESSION,
+		PIPIUI_SESSION_CAPABILITY,
+	});
+	// Missing agentId/runId or a missing canonical capability fails closed. Never
+	// send a second legacy fallback and never ask a host to infer a reusable run.
+	if (!body) return;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), PIPIUI_REPORT_TIMEOUT_MS);
 	timeout.unref?.();
@@ -464,7 +618,7 @@ async function postPipiuiReport(payload: Record<string, unknown>): Promise<void>
 		await fetch(`http://127.0.0.1:${PIPIUI_PORT}/rpc`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ sessionKey: PIPIUI_SESSION, action: "agent_event", ...payload }),
+			body: JSON.stringify(body),
 			signal: controller.signal,
 		});
 	} catch {
@@ -474,14 +628,14 @@ async function postPipiuiReport(payload: Record<string, unknown>): Promise<void>
 	}
 }
 
-function pipiuiReport(payload: Record<string, unknown>): void {
+function pipiuiReport(payload: PipiuiAgentReport): void {
 	void postPipiuiReport(payload);
 }
 
 const terminalPipiuiReportFlights = new Map<string, Promise<void>>();
 
 /** Serialize terminal UI events per bare ID; the lease owner awaits the queue before release. */
-function postTerminalPipiuiReport(payload: Record<string, unknown> & { agentId: string }): Promise<void> {
+function postTerminalPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
 	const previous = terminalPipiuiReportFlights.get(payload.agentId) ?? Promise.resolve();
 	const flight = previous.catch(() => {}).then(() => postPipiuiReport(payload));
 	terminalPipiuiReportFlights.set(payload.agentId, flight);
@@ -767,6 +921,8 @@ interface SingleResult {
 	step?: number;
 	/** PipiUI bridge / completion-signal id */
 	agentId?: string;
+	/** Dispatch generation; prevents a late terminal callback from contaminating a reused agentId. */
+	runId?: string;
 	/** Runtime-attested verify result (set when the brief carried `verify`). */
 	verify?: VerifyAttestation;
 	/** Brief carried `verify` but it was not run because the agent was aborted. */
@@ -787,6 +943,8 @@ interface SubagentDetails {
 	/** True when tool returned immediately and completion arrives via [subagent-done] followUp */
 	background?: boolean;
 	agentIds?: string[];
+	/** Invalid/duplicate package diagnostics from discovery; valid agents still remain usable. */
+	agentDiagnostics?: string[];
 }
 
 interface RunSingleAgentOptions {
@@ -800,6 +958,8 @@ interface RunSingleAgentOptions {
 	blockedBy?: string[];
 	/** Current session model as `provider/id` (depth 0 `ctx.model`); used for「跟随主 Agent」. */
 	sessionModel?: string;
+	/** Optional Boss-selected thinking for this dispatch; never inherited from the Boss session. */
+	thinking?: string;
 	/** Shell command the runtime runs in the agent's cwd after the process ends (attested verify). */
 	verify?: string;
 	/** Discard this worker's stored conversation and start it cold. */
@@ -893,12 +1053,89 @@ function loadSubagentModelOverrides(): Record<string, SubagentModelChain> {
 }
 
 const PI_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const PI_THINKING_LEVELS_WITH_DEFAULT = new Set(["", ...PI_THINKING_LEVELS]);
+
+type SubagentModelCapability = {
+	/** True only when Swift received an explicit reasoning boolean from the model catalog. */
+	capabilityKnown: boolean;
+	/** Exact Swift `ThinkingCapability.allowedLevels` output; empty string means model default. */
+	allowedLevels: string[];
+};
+
+/** Schema validation normally enforces this; keep direct/runtime callers from injecting junk. */
+function normalizeTaskThinking(value: unknown): string | undefined {
+	return typeof value === "string" && PI_THINKING_LEVELS.has(value.trim())
+		? value.trim()
+		: undefined;
+}
 
 /** `model:high` is Pi shorthand, not a distinct model id. */
 function stripModelThinkingSuffix(modelRef: string): string {
 	const colon = modelRef.lastIndexOf(":");
 	if (colon <= 0) return modelRef;
 	return PI_THINKING_LEVELS.has(modelRef.slice(colon + 1)) ? modelRef.slice(0, colon) : modelRef;
+}
+
+/**
+ * Hot-read the compact Swift capability catalog. Swift has already applied the authoritative
+ * `ThinkingCapability` rules, so Node only consumes the serialized allowed levels; it does not
+ * reconstruct reasoning/thinkingLevelMap behavior here.
+ */
+function loadSubagentModelCapabilities(): Record<string, SubagentModelCapability> {
+	const file =
+		process.env.PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE ||
+		// Tolerate an early experimental name if a live extension was launched before an app update.
+		process.env.PIPIUI_SUBAGENT_CAPABILITIES_FILE ||
+		path.join(os.homedir(), "Library/Application Support/PipiUI/subagent-model-capabilities.json");
+	try {
+		const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+		const root = parsed as { m?: unknown; models?: unknown };
+		const rawModels = root.m ?? root.models;
+		if (!rawModels || typeof rawModels !== "object" || Array.isArray(rawModels)) return {};
+
+		const result: Record<string, SubagentModelCapability> = {};
+		for (const [rawModel, rawEntry] of Object.entries(rawModels)) {
+			const model = rawModel.trim();
+			if (!model || !rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) continue;
+			const entry = rawEntry as {
+				r?: unknown;
+				l?: unknown;
+				reasoning?: unknown;
+				levels?: unknown;
+			};
+			const reasoning = entry.r ?? entry.reasoning;
+			const rawLevels = entry.l ?? entry.levels;
+			const levels = Array.isArray(rawLevels)
+				? Array.from(new Set(rawLevels.filter(
+					(level): level is string =>
+						typeof level === "string" && PI_THINKING_LEVELS_WITH_DEFAULT.has(level),
+				)))
+				: [];
+			result[model] = {
+				capabilityKnown: typeof reasoning === "boolean",
+				allowedLevels: levels,
+			};
+		}
+		return result;
+	} catch {
+		// Missing/unreadable catalog means capability is unknown, never permission to carry
+		// Boss-selected thinking across a fallback.
+		return {};
+	}
+}
+
+function capabilityForSubagentModel(
+	model: string,
+	catalog: Record<string, SubagentModelCapability> = loadSubagentModelCapabilities(),
+): SubagentModelCapability | undefined {
+	return catalog[stripModelThinkingSuffix(model.trim())];
+}
+
+/** A fallback may inherit tool thinking only with explicit catalog proof. */
+function modelExplicitlyAllowsThinking(model: string, thinking: string): boolean {
+	const capability = capabilityForSubagentModel(model);
+	return capability?.capabilityKnown === true && capability.allowedLevels.includes(thinking);
 }
 
 /**
@@ -992,9 +1229,28 @@ function resolveAgentModel(
 	return fb || undefined;
 }
 
-/** Only explicit per-subagent settings receive a `--thinking` argument. */
-function resolveAgentThinking(agentName: string): string | undefined {
-	return loadSubagentModelOverrides()[agentName]?.models[0]?.thinking;
+/**
+ * Initial candidate precedence is deliberately narrow: per-task tool thinking wins, then the
+ * selected chain entry's persisted thinking, otherwise Pi/model default. There is no Boss
+ * session-thinking input anywhere in this path.
+ */
+function resolveAgentThinking(agentName: string, taskThinking?: unknown): string | undefined {
+	return normalizeTaskThinking(taskThinking) ?? loadSubagentModelOverrides()[agentName]?.models[0]?.thinking;
+}
+
+/**
+ * A fallback can be reached after the Boss is no longer deciding. Carry its requested thinking
+ * only when the Swift catalog explicitly proves that exact fallback supports it. Otherwise use
+ * that candidate's own setting (including legacy/default behavior) rather than hard-passing an
+ * incompatible `--thinking`. Existing entry settings remain untouched when catalog data is unknown.
+ */
+function resolveFallbackThinking(
+	entry: SubagentModelOverride,
+	taskThinking: unknown,
+): string | undefined {
+	const requested = normalizeTaskThinking(taskThinking);
+	if (requested && modelExplicitlyAllowsThinking(entry.model, requested)) return requested;
+	return entry.thinking;
 }
 
 /** Chain entry by index (0-based); undefined past the end or without an explicit override. */
@@ -1014,32 +1270,72 @@ function inheritMainModel(sessionModel: string | undefined): string | undefined 
 	return process.env.PIPIUI_MAIN_MODEL || fileMain || sessionModel || undefined;
 }
 
-interface AgentRuntimeRolePolicy {
-	role: "worker" | "closeout-secretary";
-	worktree: "isolated" | "main-session";
-	allowRecursiveDelegation: boolean;
+function legacyModelThinking(model: string): string | undefined {
+	const trimmed = model.trim();
+	const colon = trimmed.lastIndexOf(":");
+	if (colon <= 0) return undefined;
+	const suffix = trimmed.slice(colon + 1);
+	return PI_THINKING_LEVELS.has(suffix) ? suffix : undefined;
+}
+
+function formatAllowedThinking(capability: SubagentModelCapability | undefined): string {
+	if (!capability) return "?";
+	const levels = capability.allowedLevels.map((level) => level || "default").join("|") || "none";
+	return capability.capabilityKnown ? levels : `${levels}?`;
+}
+
+function formatRoutingCandidate(
+	entry: SubagentModelOverride,
+	catalog: Record<string, SubagentModelCapability>,
+): string {
+	const configured = entry.thinking ?? legacyModelThinking(entry.model) ?? "default";
+	return `${entry.model}{set=${configured};allow=${formatAllowedThinking(
+		capabilityForSubagentModel(entry.model, catalog),
+	)}}`;
 }
 
 /**
- * Runtime-owned policy: agent markdown/prompt text cannot opt the closeout secretary
- * back into a worktree or recursive delegation.
- *
- * This is deliberately the one policy that stayed keyed on the name while the rest moved to
- * AgentTraits. The traits an agent declares only ever narrow it — read-only drops its verify,
- * a skill block takes reads away — so a definition that lies costs it capability. These two
- * grant: a main-session worktree and the right to delegate. A project-scoped `secretary.md`
- * must not be able to hand itself either by editing its own frontmatter.
+ * Boss-only, hot-read dispatch reference. It is intentionally compact because it is appended to
+ * the dynamic system prompt every turn: each route shows current primary/fallback candidates,
+ * configured strength, and Swift-authoritative allowed levels. `?` means catalog capability is
+ * unknown (the displayed persisted setting remains backward-compatible, but fallback tool
+ * thinking will not be carried through it).
  */
-function runtimeRolePolicyForAgent(agentName: string): AgentRuntimeRolePolicy {
-	if (agentName === "secretary") {
-		return {
-			role: "closeout-secretary",
-			worktree: "main-session",
-			allowRecursiveDelegation: false,
-		};
+function formatSubagentModelRoutingBlock(): string | null {
+	if (PIPIUI_DEPTH !== 0) return null;
+	const overrides = loadSubagentModelOverrides();
+	const catalog = loadSubagentModelCapabilities();
+	let discovered: AgentConfig[] = [];
+	try {
+		discovered = discoverAgents(process.cwd(), "user").agents;
+	} catch {
+		// The routing reference is advisory; a transient directory read must never block a turn.
 	}
-	return { role: "worker", worktree: "isolated", allowRecursiveDelegation: true };
+	const byName = new Map(discovered.map((agent) => [agent.name, agent]));
+	const names = Array.from(new Set([...byName.keys(), ...Object.keys(overrides)])).sort();
+	if (names.length === 0) return null;
+
+	const followMain = loadMainModelFile() || process.env.PIPIUI_MAIN_MODEL;
+	const routes = names.map((name) => {
+		const configured = overrides[name]?.models;
+		const agent = byName.get(name);
+		const fallbackModel = followMain || agent?.model;
+		const entries = configured ?? (fallbackModel
+			? [{ model: fallbackModel, thinking: undefined }]
+			: []);
+		const chain = entries.length > 0
+			? entries.map((entry) => formatRoutingCandidate(entry, catalog)).join(" -> ")
+			: "unresolved";
+		return `- ${name}${configured ? "" : " (follow-main)"}: ${chain}`;
+	});
+	return [
+		"[Subagent model routing — hot-read]",
+		"Optional task `thinking` is available on single, tasks[], and chain; v1 has no per-task model. Never inherit Boss thinking.",
+		"Priority: task thinking > current candidate set thinking > omit --thinking. On fallback, carry task thinking only when catalog explicitly allows it; otherwise use that fallback set thinking/default. `allow=?` or a trailing `?` means capability unknown.",
+		...routes,
+	].join("\n");
 }
+
 
 // Store cap for the pull path (`subagent_status full:true`). Must comfortably hold a
 // whole explore/plan report: this is the only place the full text survives, and every
@@ -1189,11 +1485,38 @@ interface JobRecord {
 	nudgeCount?: number;
 	/** Timestamp of the last interrupted-reminder push; undefined/0 = never this episode. */
 	lastNudgeAt?: number;
+	/** A watchdog-only interrupted result may be corrected by this same run's real terminal callback. */
+	interruptedProvisional?: boolean;
+	/** Boss/user closeout for this failed/aborted/interrupted episode; state and verify stay intact. */
+	closeoutDisposition?: "cleaned";
+	closeoutReason?: string;
+	closeoutAt?: number;
+}
+
+interface InterruptedReminder {
+	agentId: string;
+	runId: string;
+	nudgeSeq: number;
+	text: string;
 }
 
 const jobRegistry = new Map<string, JobRecord>();
+/** Queued reminder tokens are memory-only: restart never resurrects an old interrupted nudge. */
+const pendingInterruptedReminders = new Map<string, InterruptedReminder>();
 /** Immediate in-process reservations close the selector-to-dispatch await/confirmation gap. */
 const localAgentReservations = new Set<string>();
+
+function interruptedReminderKey(agentId: string, runId: string, nudgeSeq: number): string {
+	return `${agentId}\u0000${runId}\u0000${nudgeSeq}`;
+}
+
+function cancelInterruptedReminders(agentId: string, runId?: string): void {
+	for (const [key, reminder] of pendingInterruptedReminders) {
+		if (reminder.agentId === agentId && (runId === undefined || reminder.runId === runId)) {
+			pendingInterruptedReminders.delete(key);
+		}
+	}
+}
 
 // ---- Stall watchdog + abort：运行中后台 job 的外部可触达句柄 ----
 const STALL_THRESHOLD_MS = 120_000;
@@ -1296,6 +1619,8 @@ function jitteredRetryBackoffMs(baseMs: number, random = Math.random): number {
 }
 /** stall 复推节奏：boss 决定继续等时，最多 5 分钟沉默一次，不必等心跳。 */
 const STALL_RENOTIFY_INTERVAL_MS = 5 * 60 * 1000;
+/** 同一无活动片段最多推送首次 + 两次复推；有新活动后重新武装。 */
+const STALL_RENOTIFY_MAX = 3;
 /**
  * Terminal interrupted/aborted/failed jobs that still hold stored context: first boss reminder
  * after this many seconds idle in that state, then one re-nudge at the renudge threshold.
@@ -1341,6 +1666,8 @@ function isProcessAlive(pid: number): boolean {
 }
 
 interface RunningAgentHandle {
+	/** This exact dispatch generation; a late prior callback must never touch a reused agentId. */
+	runId: string;
 	/** 外部中止入口（action=abort / subagent_abort 命令）；走 killProc SIGTERM→SIGKILL。 */
 	controller: AbortController;
 	name: string;
@@ -1350,8 +1677,17 @@ interface RunningAgentHandle {
 	lastActivityAt: number;
 	/** 上次推送 [subagent-stalled] 的时间戳；0 = 本卡死片段尚未推过（有新活动后复位为 0）。 */
 	lastStallNotifyAt: number;
+	/** 本无活动片段已推送 [subagent-stalled] 的次数；有新活动后复位为 0。 */
+	stallNotifyCount: number;
 	/** When this worker was dispatched; the heartbeat reports elapsed time. */
 	startedAt: number;
+	/**
+	 * The child has emitted close/error and this run is performing verify/end-report closeout.
+	 * This is set only after an actual child terminal event, so it cannot hide a child that
+	 * disappeared without reporting; it only prevents the watchdog from mistaking expected
+	 * post-exit cleanup for a vanished live worker.
+	 */
+	finalizing: boolean;
 	/**
 	 * Child pid, so liveness can be checked directly. Idleness is not death: a worker can be
 	 * quiet while thinking, and a dead one can leave a registry entry behind if its close
@@ -1363,24 +1699,79 @@ interface RunningAgentHandle {
 /** 仅后台 job 注册；前台 job 由工具调用自身的 abort signal 负责。 */
 const runningAgents = new Map<string, RunningAgentHandle>();
 
-function noteAgentActivity(agentId: string): void {
+function handleForRun(agentId: string, runId: string): RunningAgentHandle | undefined {
 	const handle = runningAgents.get(agentId);
-	if (!handle) return;
+	return handle?.runId === runId ? handle : undefined;
+}
+
+function noteAgentActivity(agentId: string, runId?: string): void {
+	const handle = runningAgents.get(agentId);
+	if (!handle || (runId !== undefined && handle.runId !== runId)) return;
 	handle.lastActivityAt = Date.now();
 	handle.lastStallNotifyAt = 0;
+	handle.stallNotifyCount = 0;
+}
+
+/** Claim one bounded, interval-spaced stall notification for this idle episode. */
+function claimStallNotification(handle: RunningAgentHandle, now: number): boolean {
+	if (handle.stallNotifyCount >= STALL_RENOTIFY_MAX) return false;
+	if (
+		handle.lastStallNotifyAt > 0 &&
+		now - handle.lastStallNotifyAt < STALL_RENOTIFY_INTERVAL_MS
+	)
+		return false;
+	handle.lastStallNotifyAt = now;
+	handle.stallNotifyCount++;
+	return true;
+}
+
+function markAgentFinalizing(agentId: string, runId: string): void {
+	const handle = handleForRun(agentId, runId);
+	if (!handle) return;
+	handle.pid = undefined;
+	handle.finalizing = true;
+	noteAgentActivity(agentId, runId);
+}
+
+function resumeAgentHandle(agentId: string, runId: string): void {
+	const handle = handleForRun(agentId, runId);
+	if (!handle) return;
+	handle.pid = undefined;
+	handle.finalizing = false;
+	noteAgentActivity(agentId, runId);
+}
+
+function deleteRunningAgentHandle(agentId: string, runId: string): void {
+	const handle = runningAgents.get(agentId);
+	// `runId` was added after early test hooks/legacy handles existed; normal runtime handles
+	// always carry it, while an old untagged handle is still safe to remove only here.
+	if (handle && (handle.runId === runId || handle.runId === undefined)) runningAgents.delete(agentId);
 }
 
 function stalledInfoFor(agentId: string, now: number): { stalled: boolean; idleSec: number } {
 	const handle = runningAgents.get(agentId);
-	if (!handle) return { stalled: false, idleSec: 0 };
+	if (!handle || handle.finalizing) return { stalled: false, idleSec: 0 };
 	const idleSec = Math.max(0, Math.floor((now - handle.lastActivityAt) / 1000));
 	return { stalled: idleSec * 1000 >= STALL_THRESHOLD_MS, idleSec };
 }
 
 function formatJobStateWithStall(job: JobRecord, now: number): string {
-	if (job.state !== "running") return job.state;
+	if (job.state !== "running") {
+		return isHandledJob(job) ? `${job.state} (resolved/handled)` : job.state;
+	}
+	if (handleForRun(job.agentId, job.runId)?.finalizing) return "finalizing";
 	const info = stalledInfoFor(job.agentId, now);
 	return info.stalled ? `running (stalled, idle ${info.idleSec}s)` : "running";
+}
+
+/** Compact state tag for a heartbeat worker line; the verbose status view keeps idle detail. */
+function formatHeartbeatWorkerState(agentId: string, handle: RunningAgentHandle, now: number): string {
+	if (handle.finalizing) return "finalizing";
+	const job = jobRegistry.get(agentId);
+	if (!job || job.runId !== handle.runId || job.state === "running") {
+		return stalledInfoFor(agentId, now).stalled ? "running(stalled)" : "running";
+	}
+	return job.state;
 }
 
 /**
@@ -1408,11 +1799,110 @@ function abortRunningAgent(agentId: string): { ok: boolean; message: string } {
 			message: `Cannot abort agentId=${agentId}: job is running but has no abort handle (already finishing?).`,
 		};
 	}
+	if (handle.finalizing) {
+		return {
+			ok: false,
+			message: `Cannot abort agentId=${agentId}: child process already exited and is already finalizing closeout.`,
+		};
+	}
 	handle.controller.abort();
 	return {
 		ok: true,
 		message: `Abort requested for agentId=${agentId} (${handle.name}). SIGTERM sent (SIGKILL after 5s if still alive); the job will report [subagent-done] with aborted status.`,
 	};
+}
+
+interface ResolveSubagentEpisodeResult {
+	ok: boolean;
+	message: string;
+	job?: JobRecord;
+	currentRunId?: string;
+	idempotent?: boolean;
+}
+
+function isHandledJob(job: JobRecord): boolean {
+	return job.closeoutDisposition === "cleaned";
+}
+
+/**
+ * Mark one terminal failure episode handled without changing its process state or verify attestation.
+ * agentId is reusable, so runId is mandatory and stale requests are rejected rather than crossing runs.
+ */
+function resolveSubagentEpisode(
+	agentId: string,
+	runId: string,
+	reason?: string,
+): ResolveSubagentEpisodeResult {
+	const job = jobRegistry.get(agentId);
+	if (!job) {
+		return {
+			ok: false,
+			message: `Cannot resolve agentId=${agentId}: unknown agentId (no such job in this session process).`,
+		};
+	}
+	if (job.runId !== runId) {
+		return {
+			ok: false,
+			currentRunId: job.runId,
+			message: `Resolve rejected for agentId=${agentId}: stale runId=${runId}; currentRunId=${job.runId}.`,
+		};
+	}
+	if (isHandledJob(job)) {
+		cancelInterruptedReminders(agentId, runId);
+		return {
+			ok: true,
+			job,
+			idempotent: true,
+			message: `agentId=${agentId} runId=${runId} is already resolved/handled; state remains "${job.state}".`,
+		};
+	}
+	if (job.state === "running") {
+		return {
+			ok: false,
+			message: `Cannot resolve agentId=${agentId} runId=${runId}: job is still running. Use action:"abort" or wait for it to finish.`,
+		};
+	}
+	if (job.state === "ok") {
+		return {
+			ok: false,
+			message: `Cannot resolve agentId=${agentId} runId=${runId}: job state is "ok"; resolve only handles failed, aborted, or interrupted episodes.`,
+		};
+	}
+	if (!isInterruptedReminderState(job.state)) {
+		return {
+			ok: false,
+			message: `Cannot resolve agentId=${agentId} runId=${runId}: unsupported job state "${job.state}".`,
+		};
+	}
+	job.closeoutDisposition = "cleaned";
+	job.closeoutReason = taskSummary(
+		reason?.replace(/\s+/g, " ").trim() || "Boss marked this episode handled",
+		500,
+	);
+	job.closeoutAt = Date.now();
+	cancelInterruptedReminders(agentId, runId);
+	return {
+		ok: true,
+		job,
+		message: `Resolved agentId=${agentId} runId=${runId}: state remains "${job.state}" and verification was not changed; interrupted reminders cancelled.`,
+	};
+}
+
+/**
+ * Independent closeout bridge event; deliberately never impersonates a terminal end event.
+ * Queue it after any outstanding end report for this agent so Swift cannot observe a resolved
+ * closeout while its row still appears running.
+ */
+function reportResolvedCloseout(job: JobRecord): Promise<void> {
+	if (!isHandledJob(job)) return Promise.resolve();
+	return postTerminalPipiuiReport({
+		kind: "closeout",
+		agentId: job.agentId,
+		runId: job.runId,
+		disposition: "cleaned",
+		reason: job.closeoutReason ?? "Boss marked this episode handled",
+		closeoutAt: job.closeoutAt ?? Date.now(),
+	});
 }
 
 
@@ -1437,73 +1927,87 @@ function jobUpsertRunning(
 	task: string,
 	title?: string,
 	blockedBy?: string[],
-): void {
-	const existing = jobRegistry.get(agentId);
-	// Resume of the same agentId must reopen a terminal row as running (matches Swift start).
-	const keepLive = existing?.state === "running";
-	const deps =
-		blockedBy && blockedBy.length > 0
-			? blockedBy
-			: keepLive
-				? existing?.blockedBy
-				: undefined;
+	runId?: string,
+): string {
+	// Every dispatch is a fresh episode, including a same-agentId continuation. A late old
+	// close/finalize callback is therefore unable to mutate the new row or its reminders.
+	const episodeRunId = runId ?? DeliveryObligationStore.runId();
+	cancelInterruptedReminders(agentId);
 	jobRegistry.set(agentId, {
 		agentId,
-		runId: keepLive ? (existing?.runId ?? DeliveryObligationStore.runId()) : DeliveryObligationStore.runId(),
+		runId: episodeRunId,
 		name,
 		task: taskSummary(task),
 		title,
-		...(deps && deps.length > 0 ? { blockedBy: deps } : {}),
+		...(blockedBy && blockedBy.length > 0 ? { blockedBy } : {}),
 		state: "running",
-		startedAt: keepLive ? (existing?.startedAt ?? Date.now()) : Date.now(),
-		// Drop endedAt/resultText/metrics from a prior terminal run; keep live metrics only.
-		activity: keepLive ? existing?.activity : undefined,
-		cost: keepLive ? existing?.cost : undefined,
-		turns: keepLive ? existing?.turns : undefined,
+		startedAt: Date.now(),
 	});
 	jobPrune();
+	return episodeRunId;
 }
 
 function jobPatchRunning(
 	agentId: string,
+	runId: string,
 	patch: { activity?: string; cost?: number; turns?: number },
 ): void {
 	const job = jobRegistry.get(agentId);
-	if (!job || job.state !== "running") return;
+	if (!job || job.runId !== runId || job.state !== "running") return;
 	if (patch.activity !== undefined) job.activity = patch.activity;
 	if (patch.cost !== undefined) job.cost = patch.cost;
 	if (patch.turns !== undefined) job.turns = patch.turns;
 }
 
-function jobFinalize(
-	agentId: string,
-	fields: {
-		name?: string;
-		task?: string;
-		state: JobState;
-		resultText?: string;
-		cost?: number;
-		turns?: number;
-		activity?: string;
-		verify?: VerifyAttestation;
-	},
-): void {
-	if (fields.state === "running") return;
+type JobFinalizeFields = {
+	name?: string;
+	task?: string;
+	state: JobState;
+	resultText?: string;
+	cost?: number;
+	turns?: number;
+	activity?: string;
+	verify?: VerifyAttestation;
+	/** Only watchdog disappearance settle uses this; the real terminal callback may replace it. */
+	provisional?: boolean;
+};
+
+function mergeTerminalJobFields(existing: JobRecord, fields: JobFinalizeFields): void {
+	if (!existing.resultText && fields.resultText)
+		existing.resultText = truncateTextHead(fields.resultText, JOB_RESULT_STORE_CAP);
+	if (existing.cost === undefined && fields.cost !== undefined) existing.cost = fields.cost;
+	if (existing.turns === undefined && fields.turns !== undefined) existing.turns = fields.turns;
+	if (!existing.activity && fields.activity) existing.activity = fields.activity;
+	if (!existing.verify && fields.verify) existing.verify = fields.verify;
+}
+
+/**
+ * Apply one terminal result to exactly one run. A watchdog interruption is provisional only:
+ * the same run's real ok/failed/aborted terminal callback replaces it. Other terminal races are
+ * idempotent and cannot overwrite a newer run sharing this agentId.
+ */
+function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields): boolean {
+	if (fields.state === "running") return false;
 	const existing = jobRegistry.get(agentId);
 	const now = Date.now();
-	if (existing && existing.state !== "running") {
-		// Already terminal: fill missing result/metrics only (vanished settle may race with close→end).
-		if (!existing.resultText && fields.resultText)
-			existing.resultText = truncateTextHead(fields.resultText, JOB_RESULT_STORE_CAP);
-		if (existing.cost === undefined && fields.cost !== undefined) existing.cost = fields.cost;
-		if (existing.turns === undefined && fields.turns !== undefined) existing.turns = fields.turns;
-		if (!existing.activity && fields.activity) existing.activity = fields.activity;
-		if (!existing.verify && fields.verify) existing.verify = fields.verify;
-		return;
+	if (existing && existing.runId !== runId) return false;
+
+	const correctsProvisionalInterrupted =
+		existing?.state === "interrupted" &&
+		existing.interruptedProvisional === true &&
+		fields.provisional !== true &&
+		(fields.state === "ok" || fields.state === "failed" || fields.state === "aborted");
+	if (existing && existing.state !== "running" && !correctsProvisionalInterrupted) {
+		if (existing.state === fields.state) mergeTerminalJobFields(existing, fields);
+		return false;
 	}
+
+	// A new terminal boundary (or correction of watchdog-only interruption) invalidates every
+	// queued reminder from its prior view of this episode. `ok` consequently has no reminder path.
+	cancelInterruptedReminders(agentId, runId);
 	jobRegistry.set(agentId, {
 		agentId,
-		runId: existing?.runId ?? DeliveryObligationStore.runId(),
+		runId,
 		name: fields.name ?? existing?.name ?? "?",
 		task: fields.task ? taskSummary(fields.task) : (existing?.task ?? ""),
 		...(existing?.blockedBy && existing.blockedBy.length > 0
@@ -1520,41 +2024,121 @@ function jobFinalize(
 				? truncateTextHead(fields.resultText, JOB_RESULT_STORE_CAP)
 				: existing?.resultText,
 		verify: fields.verify ?? existing?.verify,
+		...(existing?.closeoutDisposition === "cleaned"
+			? {
+					closeoutDisposition: existing.closeoutDisposition,
+					closeoutReason: existing.closeoutReason,
+					closeoutAt: existing.closeoutAt,
+				}
+			: {}),
+		...(fields.state === "interrupted" && fields.provisional ? { interruptedProvisional: true } : {}),
 	});
 	jobPrune();
+	return true;
 }
 
-/** Dead pid, or no pid attached after NO_PID_VANISH_MS. */
+function isInterruptedReminderState(state: JobState): boolean {
+	return state === "interrupted" || state === "aborted" || state === "failed";
+}
+
+function formatInterruptedReminder(job: JobRecord, idleSec: number, nudgeSeq: number): string {
+	const title =
+		job.title?.trim() || (job.task.split("\n")[0] ?? "").trim().slice(0, 80) || "(untitled)";
+	return [
+		`[subagent-interrupted-reminder] agentId=${job.agentId} runId=${job.runId} state=${job.state} title=${title} idle=${idleSec}s nudge=${nudgeSeq}/2`,
+		`This worker is ${job.state} but its stored context is intact. Re-dispatch the same agentId to continue where it left off, or pass fresh:true to abandon that context. Do not treat this message as a new user request.`,
+		`If this episode's work is already complete, mark it handled with subagent({action:"resolve", agentId:"${job.agentId}", runId:"${job.runId}"}) (or /subagent_resolve ${job.agentId} ${job.runId}) so no further reminders are sent; do not just reply "already completed".`,
+	].join("\n");
+}
+
+/** Reserve due terminal reminders before delivery; reservations remain process-memory only. */
+function scheduleInterruptedReminders(now: number, resumableIds: ReadonlySet<string>): InterruptedReminder[] {
+	const reminders: InterruptedReminder[] = [];
+	for (const job of jobRegistry.values()) {
+		if (!isInterruptedReminderState(job.state) || isHandledJob(job) || !resumableIds.has(job.agentId)) continue;
+		const priorCount = job.nudgeCount ?? 0;
+		if (priorCount >= 2) continue;
+		const endedAt = job.endedAt ?? job.startedAt;
+		const idleSec = Math.max(0, Math.floor((now - endedAt) / 1000));
+		const thresholdSec = priorCount === 0 ? INTERRUPTED_NUDGE_SECS : INTERRUPTED_RENUDGE_SECS;
+		if (idleSec < thresholdSec) continue;
+		const nudgeSeq = priorCount + 1;
+		job.nudgeCount = nudgeSeq;
+		job.lastNudgeAt = now;
+		const reminder: InterruptedReminder = {
+			agentId: job.agentId,
+			runId: job.runId,
+			nudgeSeq,
+			text: formatInterruptedReminder(job, idleSec, nudgeSeq),
+		};
+		pendingInterruptedReminders.set(
+			interruptedReminderKey(reminder.agentId, reminder.runId, reminder.nudgeSeq),
+			reminder,
+		);
+		reminders.push(reminder);
+	}
+	return reminders;
+}
+
+function isInterruptedReminderEligible(reminder: InterruptedReminder): boolean {
+	const key = interruptedReminderKey(reminder.agentId, reminder.runId, reminder.nudgeSeq);
+	const queued = pendingInterruptedReminders.get(key);
+	const job = jobRegistry.get(reminder.agentId);
+	return (
+		queued === reminder &&
+		job !== undefined &&
+		job.runId === reminder.runId &&
+		!isHandledJob(job) &&
+		isInterruptedReminderState(job.state) &&
+		(job.nudgeCount ?? 0) >= reminder.nudgeSeq
+	);
+}
+
+function discardInterruptedReminder(reminder: InterruptedReminder): void {
+	const key = interruptedReminderKey(reminder.agentId, reminder.runId, reminder.nudgeSeq);
+	if (pendingInterruptedReminders.get(key) === reminder) pendingInterruptedReminders.delete(key);
+}
+
+/** Dead pid, or no pid attached after NO_PID_VANISH_MS. Finalizing follows an observed close. */
 function isHandleVanished(handle: RunningAgentHandle, now: number): boolean {
+	if (handle.finalizing) return false;
 	if (handle.pid !== undefined) return !isProcessAlive(handle.pid);
 	// Prefer lastActivityAt so auto-resume backoff (pid cleared + activity noted) is not vanished.
 	return now - Math.max(handle.startedAt, handle.lastActivityAt) >= NO_PID_VANISH_MS;
 }
 
 /**
- * Settle a vanished worker on every ledger: jobRegistry terminal, Swift panel via
- * pipiuiReport end (interrupted), then drop the running handle. Idempotent when
- * already terminal and the handle is gone. A later close→end may still fill metrics
- * via jobFinalize's terminal-merge path.
+ * Settle a genuinely vanished worker on every ledger. A child that emitted close is marked
+ * finalizing instead and reaches its own real terminal path after verify/end-report closeout.
  */
-function markWorkerInterrupted(agentId: string, reason: string): void {
+function markWorkerInterrupted(agentId: string, reason: string): boolean {
 	const handle = runningAgents.get(agentId);
 	const job = jobRegistry.get(agentId);
-	if (!handle && !job) return;
-	if (!handle && job && job.state !== "running") return;
+	if (!handle && !job) return false;
+	if (!handle && job && job.state !== "running") return false;
+	const runId = handle?.runId ?? job?.runId;
+	if (!runId) return false;
+	if (handle && job && handle.runId && handle.runId !== job.runId) {
+		deleteRunningAgentHandle(agentId, handle.runId);
+		return false;
+	}
 
-	jobFinalize(agentId, {
+	const changed = jobFinalize(agentId, runId, {
 		name: handle?.name ?? job?.name,
 		task: handle?.task ?? job?.task,
 		state: "interrupted",
+		provisional: true,
 		resultText: reason,
 		activity: job?.activity,
 		cost: job?.cost,
 		turns: job?.turns,
 	});
+	deleteRunningAgentHandle(agentId, runId);
+	if (!changed) return false;
 	void postTerminalPipiuiReport({
 		kind: "end",
 		agentId,
+		runId,
 		ok: false,
 		aborted: true,
 		interrupted: true,
@@ -1562,7 +2146,7 @@ function markWorkerInterrupted(agentId: string, reason: string): void {
 		...(job?.cost !== undefined ? { cost: job.cost } : {}),
 		...(job?.turns !== undefined ? { turns: job.turns } : {}),
 	});
-	runningAgents.delete(agentId);
+	return true;
 }
 
 function jobStateFromResult(
@@ -1579,11 +2163,12 @@ function jobStateFromResult(
 function ensureJobTerminalFromResult(
 	result: SingleResult,
 	extra?: { aborted?: boolean; error?: string },
-): void {
+): string | undefined {
 	const agentId = result.agentId;
-	if (!agentId) return;
+	if (!agentId) return undefined;
+	const runId = result.runId ?? jobRegistry.get(agentId)?.runId ?? DeliveryObligationStore.runId();
 	const resultText = extra?.error || getResultOutput(result) || result.stderr || "(no output)";
-	jobFinalize(agentId, {
+	jobFinalize(agentId, runId, {
 		name: result.agent,
 		task: result.task,
 		state: jobStateFromResult(result, extra),
@@ -1592,6 +2177,7 @@ function ensureJobTerminalFromResult(
 		turns: result.usage.turns,
 		verify: result.verify,
 	});
+	return runId;
 }
 
 function formatElapsedMs(ms: number): string {
@@ -1616,7 +2202,9 @@ function formatInFlightWorkersBlock(now: number): string | null {
 		const elapsed = formatElapsedMs(now - handle.startedAt);
 		const title = (handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 60)) || "(untitled)";
 		let state: string;
-		if (isHandleVanished(handle, now)) {
+		if (handle.finalizing) {
+			state = `finalizing closeout ${elapsed}`;
+		} else if (isHandleVanished(handle, now)) {
 			anyStalledOrVanished = true;
 			state = "VANISHED — process gone with no report";
 		} else if (idleSec * 1000 >= STALL_THRESHOLD_MS) {
@@ -1697,6 +2285,7 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 		const turns = job.turns ?? "-";
 		const lines = [
 			`agentId: ${job.agentId}`,
+			`runId: ${job.runId}`,
 			`name: ${job.name}`,
 			...(job.title ? [`title: ${job.title}`] : []),
 			...(job.blockedBy && job.blockedBy.length > 0
@@ -1708,6 +2297,11 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 			`elapsed: ${elapsed}`,
 			`Task: ${job.task || "(none)"}`,
 		];
+		if (isHandledJob(job)) {
+			const handledAt = job.closeoutAt ? new Date(job.closeoutAt).toISOString() : "(time unavailable)";
+			lines.push(`closeout: cleaned (resolved/handled) at ${handledAt}`);
+			lines.push(`reason: ${job.closeoutReason ?? "Boss marked this episode handled"}`);
+		}
 		if (job.verify) {
 			lines.push(`Verify: $ ${job.verify.command} → exit ${formatVerifyExit(job.verify)} (attested)`);
 			if (job.verify.tail) {
@@ -1745,8 +2339,8 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 		return bt - at;
 	});
 
-	const header = `| agentId | name | state | turns | cost | elapsed | preview |`;
-	const sep = `| --- | --- | --- | --- | --- | --- | --- |`;
+	const header = `| agentId | runId | name | state | turns | cost | elapsed | preview |`;
+	const sep = `| --- | --- | --- | --- | --- | --- | --- | --- |`;
 	const rows = jobs.map((j) => {
 		const elapsed =
 			j.state === "running"
@@ -1760,14 +2354,18 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 				: j.resultText || j.task || "";
 		const blockedByNote =
 			j.blockedBy && j.blockedBy.length > 0 ? `blocked-by: ${j.blockedBy.join(", ")}` : "";
+		const handledNote = isHandledJob(j)
+			? `handled: ${j.closeoutReason ?? "Boss marked this episode handled"}`
+			: "";
 		const previewBase = previewRaw.replace(/\s+/g, " ").trim();
-		const preview = (blockedByNote
+		const notes = [blockedByNote, handledNote].filter(Boolean).join(" · ");
+		const preview = (notes
 			? previewBase
-				? `${blockedByNote} · ${previewBase}`
-				: blockedByNote
+				? `${notes} · ${previewBase}`
+				: notes
 			: previewBase
 		).slice(0, 80);
-		return `| ${j.agentId} | ${j.name} | ${formatJobStateWithStall(j, now)} | ${turns} | ${cost} | ${elapsed} | ${preview || "-"} |`;
+		return `| ${j.agentId} | ${j.runId} | ${j.name} | ${formatJobStateWithStall(j, now)} | ${turns} | ${cost} | ${elapsed} | ${preview || "-"} |`;
 	});
 	return [header, sep, ...rows, ...formatResumableSection(new Set(jobs.map((j) => j.agentId)))].join(
 		"\n",
@@ -2261,21 +2859,67 @@ function appendSessionCompaction(
 }
 
 
-async function trySendUserMessage(pi: ExtensionAPI, text: string): Promise<boolean> {
-	// 插队保护：用户批量消息未进 turn 前，自动信号不得抢跑（超时自动释放）。
-	await awaitCutInHoldRelease();
+async function sendUserMessageAfterCutIn(
+	pi: ExtensionAPI,
+	text: string,
+	shouldSend?: () => boolean,
+): Promise<boolean> {
+	// A resolved episode may have been queued behind the cut-in hold. Re-check immediately
+	// before each actual send so resolve can suppress that stale reminder.
+	if (shouldSend && !shouldSend()) return false;
 	try {
 		await pi.sendUserMessage(text, { deliverAs: "followUp" });
 		return true;
 	} catch {
 		// 降级到不带 options 的形式（旧版 pi 可能不认识 deliverAs）。
 	}
+	if (shouldSend && !shouldSend()) return false;
 	try {
 		await pi.sendUserMessage(text);
 		return true;
 	} catch (err) {
 		console.error("[pipiui-subagent] failed to deliver message:", err);
 		return false;
+	}
+}
+
+async function trySendUserMessage(pi: ExtensionAPI, text: string): Promise<boolean> {
+	// 插队保护：用户批量消息未进 turn 前，自动信号不得抢跑（超时自动释放）。
+	await awaitCutInHoldRelease();
+	return sendUserMessageAfterCutIn(pi, text);
+}
+
+/**
+ * A reminder can wait behind a cut-in while the boss resumes/completes the worker. Revalidate
+ * both before and after that wait, then immediately before the actual follow-up send, so an old
+ * nudge token cannot surface after its agentId has begun another run or reached ok.
+ */
+async function deliverInterruptedReminder(
+	pi: ExtensionAPI,
+	reminder: InterruptedReminder,
+	testHooks?: {
+		waitForCutIn?: () => Promise<void>;
+		send?: (text: string) => Promise<boolean>;
+	},
+): Promise<boolean> {
+	if (!isInterruptedReminderEligible(reminder)) {
+		discardInterruptedReminder(reminder);
+		return false;
+	}
+	await (testHooks?.waitForCutIn ?? awaitCutInHoldRelease)();
+	if (!isInterruptedReminderEligible(reminder)) {
+		discardInterruptedReminder(reminder);
+		return false;
+	}
+	try {
+		const send = testHooks?.send ?? ((text: string) =>
+			sendUserMessageAfterCutIn(pi, text, () => isInterruptedReminderEligible(reminder)));
+		return await send(reminder.text);
+	} catch (err) {
+		console.error("[pipiui-subagent] failed to deliver interrupted reminder:", err);
+		return false;
+	} finally {
+		discardInterruptedReminder(reminder);
 	}
 }
 
@@ -2292,7 +2936,29 @@ interface PendingDoneEntry {
 	recoveredAmbiguous: boolean;
 }
 const pendingDone = new Map<string, PendingDoneEntry>();
+let pendingDoneSettledRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let doneDeliveryStore: DeliveryObligationStore | undefined;
+
+/**
+ * A compaction can make follow-up delivery reject as busy even though the done
+ * obligation is otherwise ready. session_compact/agent_settled are the narrow
+ * post-busy seams: coalesce them, wait one event-loop turn for the failed
+ * attempt to settle, then retry only entries that are no longer in flight.
+ */
+function retryPendingDoneAfterSessionSettled(pi: ExtensionAPI): void {
+	if (pendingDoneSettledRetryTimer) return;
+	pendingDoneSettledRetryTimer = setTimeout(() => {
+		pendingDoneSettledRetryTimer = undefined;
+		for (const [obligationId, entry] of [...pendingDone]) {
+			if (entry.obligation.state === "delivered") {
+				pendingDone.delete(obligationId);
+				continue;
+			}
+			if (!entry.inFlight) sendDoneWithConfirmation(pi, entry, true);
+		}
+	}, 0);
+	pendingDoneSettledRetryTimer.unref?.();
+}
 let doneDeliveryPiSessionId: string | undefined;
 
 function logDonePersistenceFailure(action: string, obligationId: string, err: unknown): void {
@@ -2467,11 +3133,13 @@ function notifySubagentDone(
 	extra?: { aborted?: boolean; error?: string },
 ): void {
 	// Finalize job BEFORE deliver: status must work even if sendUserMessage fails.
-	ensureJobTerminalFromResult(result, extra);
-	const text = formatSubagentDoneMessage(result, extra);
+	const terminalRunId = ensureJobTerminalFromResult(result, extra);
+	const runId = result.agentId
+		? (result.runId ?? terminalRunId ?? jobRegistry.get(result.agentId)?.runId ?? DeliveryObligationStore.runId())
+		: undefined;
+	const text = formatSubagentDoneMessage(result, runId ? { ...extra, runId } : extra);
 	// 前台 job 可能没有 bridge agentId；那种情况下投递确认无从挂起，退化为一次性投递。
-	if (result.agentId) {
-		const runId = jobRegistry.get(result.agentId)?.runId ?? DeliveryObligationStore.runId();
+	if (result.agentId && runId) {
 		deliverConfirmedDone(pi, result.agentId, runId, text);
 	} else {
 		deliverSubagentDone(pi, text);
@@ -2646,6 +3314,8 @@ async function runSingleAgent(
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 	const pipiuiAgentId = options?.agentId ?? generatePipiuiAgentId();
+	// Capture this invocation's generation before any early failure path can return a result.
+	const runId = DeliveryObligationStore.runId();
 	const isBackground = options?.background === true;
 	localAgentReservations.add(pipiuiAgentId);
 
@@ -2661,10 +3331,11 @@ async function runSingleAgent(
 			usage: emptyUsage(),
 			step,
 			agentId: pipiuiAgentId,
+			runId,
 			stopReason: "error",
 			errorMessage: `Unknown agent: "${agentName}"`,
 		};
-		jobFinalize(pipiuiAgentId, {
+		jobFinalize(pipiuiAgentId, runId, {
 			name: agentName,
 			task,
 			state: "failed",
@@ -2689,13 +3360,34 @@ async function runSingleAgent(
 			usage: emptyUsage(),
 			step,
 			agentId: pipiuiAgentId,
+			runId,
 			stopReason: "error",
 		};
 	}
 	const agentLease = leaseResult.lease;
 	try {
 
-	const runtimePolicy = runtimeRolePolicyForAgent(agentName);
+	const runtimePolicy = runtimeRolePolicyForAgent(agent);
+	// A package may make desktop requestable, but it never receives desktop merely
+	// by declaring that field. The boss still needs one explicit per-task grant.
+	if (options?.desktop && agent.capabilities.desktop !== "requestable") {
+		const message = `Agent "${agent.name}" does not declare desktop: requestable. Omit desktop or choose an agent whose v1 capability policy permits a per-task desktop grant.`;
+		return {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			title: options?.title,
+			exitCode: 1,
+			messages: [],
+			stderr: message,
+			errorMessage: message,
+			usage: emptyUsage(),
+			step,
+			agentId: pipiuiAgentId,
+			runId,
+			stopReason: "error",
+		};
+	}
 	// Per-task desktop gate: a worker gets computer/open_application (plus the
 	// strategy extension and capability env) ONLY when the boss attached an
 	// explicit grant AND the host capability is live. A requested grant with no
@@ -2719,9 +3411,43 @@ async function runSingleAgent(
 			usage: emptyUsage(),
 			step,
 			agentId: pipiuiAgentId,
+			runId,
 			stopReason: "error",
 		};
 	}
+	// The bundled operator receives the existing broker capability only while
+	// this exact dispatch has an explicit desktop grant. It is not a second
+	// desktop capability: it merely authorizes bounded app-recipe recall and
+	// host-generated metadata candidates for the already granted run.
+	const computerMemoryEnabled =
+		runtimePolicy.role === "operator" && desktopGrant.granted;
+	// The formal main extension owns the live registry and returns the only
+	// capability tuple a child may receive. No Swift/AppStore RPC registration or
+	// child-selected root is involved. An unavailable broker simply removes the
+	// optional query/candidate surface for this dispatch.
+	const memoryBrokerRole: MemoryBrokerChildRole | undefined =
+		runtimePolicy.role === "worker"
+			? "worker"
+			: computerMemoryEnabled
+				? "operator"
+				: undefined;
+	const issuedMemoryBrokerEnvironment = memoryBrokerRole
+		? await issueMemoryBrokerEnvironment({
+			agentID: pipiuiAgentId,
+			runID: runId,
+			role: memoryBrokerRole,
+			...(computerMemoryEnabled && (desktopGrant.reason === "user-requested" || desktopGrant.reason === "ui-verify")
+				? { hostIssuedDesktopGrant: desktopGrant.reason }
+				: {}),
+		})
+		: undefined;
+	// A complete capability is not enough on its own: the child must also be
+	// able to prove the exact installed package identity before it receives a
+	// memory tool or mounts an extension.
+	const terminalMemoryBrokerEnvironment = issuedMemoryBrokerEnvironment
+		&& memoryBrokerExtensionPathForChild(issuedMemoryBrokerEnvironment)
+		? issuedMemoryBrokerEnvironment
+		: undefined;
 	const placement = resolveSubagentWorktree({
 		mainCwd: PIPIUI_MAIN_CWD,
 		agentId: pipiuiAgentId,
@@ -2731,7 +3457,10 @@ async function runSingleAgent(
 		policy: runtimePolicy,
 	});
 	const resolvedModel = resolveAgentModel(agentName, agent.model, options?.sessionModel);
-	const resolvedThinking = resolveAgentThinking(agentName);
+	// Tool-selected thinking belongs to this one dispatch only; it never reads the Boss's
+	// current thinking level. The initial candidate may use it directly by priority.
+	const taskThinking = normalizeTaskThinking(options?.thinking);
+	const resolvedThinking = resolveAgentThinking(agentName, taskThinking);
 	const mainModelForChild = inheritMainModel(options?.sessionModel);
 	if (placement.worktreeError) {
 		const message = `Writable subagent isolation failed before spawn: ${placement.worktreeError}`;
@@ -2748,11 +3477,13 @@ async function runSingleAgent(
 			model: resolvedModel,
 			step,
 			agentId: pipiuiAgentId,
+			runId,
 			stopReason: "error",
 		};
 		await postPipiuiReport({
 			kind: "start",
 			agentId: pipiuiAgentId,
+			runId,
 			parentId: PIPIUI_PARENT,
 			toolCallId: pipiuiCurrentToolCall,
 			name: agentName,
@@ -2763,8 +3494,8 @@ async function runSingleAgent(
 			...(options?.background ? { background: true } : {}),
 			worktreeError: placement.worktreeError,
 		});
-		jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy);
-		jobFinalize(pipiuiAgentId, {
+		jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId);
+		jobFinalize(pipiuiAgentId, runId, {
 			name: agentName,
 			task,
 			state: "failed",
@@ -2773,6 +3504,7 @@ async function runSingleAgent(
 		await postTerminalPipiuiReport({
 			kind: "end",
 			agentId: pipiuiAgentId,
+			runId,
 			ok: false,
 			output: message,
 			worktreeError: placement.worktreeError,
@@ -2813,18 +3545,16 @@ async function runSingleAgent(
 	// Skill libraries are off for every dispatched role, not just plan: a worker that
 	// discovers a process skill on its own turns a scoped brief into someone else's SOP.
 	args.push("--no-skills");
-	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
-	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
-	if (PIPIUI_SEARCH_SCOPE_EXT) args.push("-e", PIPIUI_SEARCH_SCOPE_EXT);
-	if (PIPIUI_WEBSEARCH_EXT) args.push("-e", PIPIUI_WEBSEARCH_EXT);
-	if (PIPIUI_MCP_EXT) args.push("-e", PIPIUI_MCP_EXT);
-	if (desktopGrant.granted && PIPIUI_COMPUTER_EXT) {
-		args.push("-e", PIPIUI_COMPUTER_EXT);
-	}
-	// A new explicit thinking override wins over Pi's older `model:thinking` shorthand.
-	// Strip only a recognized shorthand suffix, preserving other colon-containing model ids.
-	if (resolvedModel) args.push("--model", resolvedThinking ? stripModelThinkingSuffix(resolvedModel) : resolvedModel);
-	if (resolvedThinking) args.push("--thinking", resolvedThinking);
+	// PipiUI-only tool names must be filtered before `--tools`: Pi 0.84 applies that flag to
+	// extension/custom registrations too, so an absent feature path cannot leave a dead name in
+	// a role's allowlist. `web_search` stays independent because it may be provider-native.
+	const pipiuiExtensionRouting = resolvePipiUIExtensionRouting({
+		webSearchExtension: PIPIUI_WEBSEARCH_EXT,
+		pdfExtractExtension: PIPIUI_PDF_EXT,
+		pdfHelper: PIPIUI_PDF_HELPER,
+		githubExtension: PIPIUI_GITHUB_EXT,
+		arxivExtension: PIPIUI_ARXIV_EXT,
+	});
 	const toolSelection = resolveSubagentToolSelection({
 		// Keep the role-local guard explicit at the caller as well as in the
 		// shared resolver: a secretary may never regain recursive delegation.
@@ -2833,8 +3563,32 @@ async function runSingleAgent(
 		),
 		disabledTools: loadDisabledTools(),
 		hasDesktopCapability: desktopGrant.granted,
+		hasMemoryBrokerCapability: !!terminalMemoryBrokerEnvironment,
 		allowRecursiveDelegation: runtimePolicy.allowRecursiveDelegation,
+		availableExtensionTools: pipiuiExtensionRouting.extensionOnlyTools,
 	});
+	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
+	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
+	// The official package owns the child-side read-only query registration.
+	// Mount it only alongside a complete main-issued capability tuple.
+	if (terminalMemoryBrokerEnvironment) {
+		const memoryBrokerExtension = memoryBrokerExtensionPathForChild(terminalMemoryBrokerEnvironment);
+		if (memoryBrokerExtension) args.push("-e", memoryBrokerExtension);
+	}
+	if (PIPIUI_SEARCH_SCOPE_EXT) args.push("-e", PIPIUI_SEARCH_SCOPE_EXT);
+	for (const route of selectPipiUIExtensionRoutes(pipiuiExtensionRouting, toolSelection)) {
+		args.push("-e", route.path);
+	}
+	// MCP is mounted only when the resolved policy can name at least one exact
+	// MCP tool. Standard packages cannot request an all-server wildcard.
+	if (PIPIUI_MCP_EXT && shouldMountMcpExtension(toolSelection)) args.push("-e", PIPIUI_MCP_EXT);
+	if (desktopGrant.granted && PIPIUI_COMPUTER_EXT) {
+		args.push("-e", PIPIUI_COMPUTER_EXT);
+	}
+	// A new explicit thinking override wins over Pi's older `model:thinking` shorthand.
+	// Strip only a recognized shorthand suffix, preserving other colon-containing model ids.
+	if (resolvedModel) args.push("--model", resolvedThinking ? stripModelThinkingSuffix(resolvedModel) : resolvedModel);
+	if (resolvedThinking) args.push("--thinking", resolvedThinking);
 	if (toolSelection.flag === "--no-tools") {
 		args.push("--no-tools");
 	} else {
@@ -2858,6 +3612,7 @@ async function runSingleAgent(
 		model: resolvedModel,
 		step,
 		agentId: pipiuiAgentId,
+		runId,
 		...(resumingSession ? { resumed: true } : {}),
 	};
 
@@ -2866,6 +3621,7 @@ async function runSingleAgent(
 	await postPipiuiReport({
 		kind: "start",
 		agentId: pipiuiAgentId,
+		runId,
 		parentId: PIPIUI_PARENT,
 		toolCallId: pipiuiCurrentToolCall,
 		name: agentName,
@@ -2878,20 +3634,23 @@ async function runSingleAgent(
 		...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
 		...(placement.worktreeError ? { worktreeError: placement.worktreeError } : {}),
 	});
-	jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy);
+	jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId);
 	// 后台 job：注册外部可触达的 AbortController（subagent_abort / action=abort 入口），
 	// 同一句柄也是 stall watchdog 的活动时间戳载体。前台 job 不注册（父 abort 已可杀）。
 	let backgroundAbort: AbortController | undefined;
 	if (isBackground) {
 		backgroundAbort = new AbortController();
 		runningAgents.set(pipiuiAgentId, {
+			runId,
 			controller: backgroundAbort,
 			name: agentName,
 			task,
 			title: options?.title,
 			lastActivityAt: Date.now(),
 			lastStallNotifyAt: 0,
+			stallNotifyCount: 0,
 			startedAt: Date.now(),
+			finalizing: false,
 		});
 	}
 	const pipiuiUpdate = (force = false) => {
@@ -2901,12 +3660,13 @@ async function runSingleAgent(
 		pipiuiReport({
 			kind: "update",
 			agentId: pipiuiAgentId,
+			runId,
 			output: (getFinalOutput(currentResult.messages) || "").slice(-4000),
 			activity: pipiuiActivity,
 			cost: currentResult.usage.cost,
 			turns: currentResult.usage.turns,
 		});
-		jobPatchRunning(pipiuiAgentId, {
+		jobPatchRunning(pipiuiAgentId, runId, {
 			activity: pipiuiActivity,
 			cost: currentResult.usage.cost,
 			turns: currentResult.usage.turns,
@@ -2960,14 +3720,20 @@ async function runSingleAgent(
 				const invocation = getPiInvocation(args);
 				const childEnv = pipiuiChildProcessEnv({
 					PIPIUI_AGENT_ID: pipiuiAgentId,
+					PIPIUI_AGENT_RUN_ID: runId,
 					PIPIUI_AGENT_DEPTH: String(PIPIUI_DEPTH + 1),
 					PIPIUI_AGENT_ROLE: runtimePolicy.role,
+					...(terminalMemoryBrokerEnvironment ?? {}),
+					...(computerMemoryEnabled
+						? { PIPIUI_COMPUTER_MEMORY_ENABLED: "1" }
+						: {}),
 					// Scope marker read by the philosophy package. An agent that delegates needs the
 					// orchestration layers; every other dispatched agent must not get them — depth
 					// alone cannot tell the two apart, and a worker taught to fan out would fight
 					// PIPIUI_AGENT_MAX_DEPTH. Declared by the agent (`delegates: true`), which is
 					// consistent with `tools` already deciding whether it can dispatch at all.
-					PIPI_PHILOSOPHY_ROLE: agent.traits.delegates ? "lead" : "worker",
+					PIPI_PHILOSOPHY_ROLE:
+						agent.traits.delegates && runtimePolicy.allowRecursiveDelegation ? "lead" : "worker",
 					...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
 					// Every dispatched child runs isolated from external skill libraries; an agent
 					// that asks for it (`block-skill-reads: true`) also cannot read SKILL.md at all.
@@ -2990,9 +3756,14 @@ async function runSingleAgent(
 					env: childEnv,
 				});
 				pipiuiTrackChild(proc);
-				// Recorded so the heartbeat can tell "quiet" from "gone".
-				const liveHandle = runningAgents.get(pipiuiAgentId);
-				if (liveHandle) liveHandle.pid = proc.pid;
+				// Recorded so the heartbeat can tell "quiet" from "gone". Bind it to this
+				// generation so an old child cannot attach its pid to a reused agentId.
+				const liveHandle = handleForRun(pipiuiAgentId, runId);
+				if (liveHandle) {
+					liveHandle.pid = proc.pid;
+					liveHandle.finalizing = false;
+					noteAgentActivity(pipiuiAgentId, runId);
+				}
 				let buffer = "";
 				// pi 0.84+: message_update carries assistantMessageEvent deltas only.
 				// Assemble text/thinking by contentIndex and push throttled cumulative
@@ -3018,6 +3789,7 @@ async function runSingleAgent(
 						pipiuiReport({
 							kind: "log_delta",
 							agentId: pipiuiAgentId,
+							runId,
 							contentIndex: idx,
 							itemType: part.itemType,
 							text: part.text,
@@ -3175,6 +3947,7 @@ async function runSingleAgent(
 									pipiuiReport({
 										kind: "usage",
 										agentId: pipiuiAgentId,
+										runId,
 										turn: currentResult.usage.turns,
 										model: msg.model || currentResult.model || null,
 										tools,
@@ -3217,7 +3990,7 @@ async function runSingleAgent(
 							// contentIndex→row slots even if tools array is empty (otherwise the
 							// next turn would overwrite the previous message's live rows).
 							if (pipiuiItems.length > 0 || didStreamTextOrThinking) {
-								pipiuiReport({ kind: "log", agentId: pipiuiAgentId, items: pipiuiItems });
+								pipiuiReport({ kind: "log", agentId: pipiuiAgentId, runId, items: pipiuiItems });
 							}
 							// Next assistant turn starts fresh contentIndex mapping on the Swift side
 							// after kind:"log"; clear local assembly state here.
@@ -3242,6 +4015,7 @@ async function runSingleAgent(
 						pipiuiReport({
 							kind: "log",
 							agentId: pipiuiAgentId,
+							runId,
 							items: [
 								{
 									itemType: "toolResult",
@@ -3257,7 +4031,7 @@ async function runSingleAgent(
 				};
 
 				proc.stdout.on("data", (data) => {
-					if (isBackground) noteAgentActivity(pipiuiAgentId);
+					if (isBackground) noteAgentActivity(pipiuiAgentId, runId);
 					buffer += data.toString();
 					const lines = buffer.split("\n");
 					buffer = lines.pop() || "";
@@ -3265,16 +4039,20 @@ async function runSingleAgent(
 				});
 
 				proc.stderr.on("data", (data) => {
-					if (isBackground) noteAgentActivity(pipiuiAgentId);
+					if (isBackground) noteAgentActivity(pipiuiAgentId, runId);
 					currentResult.stderr += data.toString();
 				});
 
 				proc.on("close", (code) => {
 					if (buffer.trim()) processLine(buffer);
+					// The process is known closed. Keep the background handle alive as finalizing
+					// while verify/end reporting runs; only an unreported dead live child is vanished.
+					if (isBackground) markAgentFinalizing(pipiuiAgentId, runId);
 					resolve(code ?? 0);
 				});
 
 				proc.on("error", () => {
+					if (isBackground) markAgentFinalizing(pipiuiAgentId, runId);
 					resolve(1);
 				});
 
@@ -3349,8 +4127,9 @@ async function runSingleAgent(
 				// are naturally bounded by chain length - 1.
 				const oldModel = resolveAgentModelChainEntry(agentName, modelChainIndex)?.model ?? "?";
 				modelChainIndex++;
-				rewriteSpawnModelArgs(args, nextChainEntry.model, nextChainEntry.thinking);
-				currentResult.model = nextChainEntry.thinking
+				const fallbackThinking = resolveFallbackThinking(nextChainEntry, taskThinking);
+				rewriteSpawnModelArgs(args, nextChainEntry.model, fallbackThinking);
+				currentResult.model = fallbackThinking
 					? stripModelThinkingSuffix(nextChainEntry.model)
 					: nextChainEntry.model;
 				autoResumeCount = 0; // the new model gets its own same-model resume budget
@@ -3360,6 +4139,7 @@ async function runSingleAgent(
 				pipiuiReport({
 					kind: "log",
 					agentId: pipiuiAgentId,
+					runId,
 					items: [{ itemType: "text", text: `[pipiui] ${fallbackNote}` }],
 				});
 				pipiuiUpdate(true);
@@ -3367,10 +4147,9 @@ async function runSingleAgent(
 				autoResumeCount++;
 				pipiuiActivity = `auto-resume 第${autoResumeCount}次：前次死于 ${shortErr}`;
 			}
-			// Drop dead pid before backoff so zombie-settle does not treat the worker as vanished.
-			const h = runningAgents.get(pipiuiAgentId);
-			if (h) h.pid = undefined;
-			if (isBackground) noteAgentActivity(pipiuiAgentId);
+			// A retry returns this same episode to live-running state; the just-closed pid is
+			// intentionally cleared, but activity remains fresh throughout the short backoff.
+			if (isBackground) resumeAgentHandle(pipiuiAgentId, runId);
 			// 压缩会话后再 resume：worker 进程已退出（无并发写窗口），满上下文会反复 fetch
 			// failed，append 一条 pi 原生 compaction 条目让 buildContextEntries 丢弃旧上下文。
 			// 只读角色（sessionDir undefined）无会话可压缩，跳过并走原 resume 路径（冷重跑）。
@@ -3410,6 +4189,10 @@ async function runSingleAgent(
 				wasAborted = true;
 				break;
 			}		}
+
+		// Child close/error has ended the live process. Keep its handle explicitly finalizing
+		// through verify + end reporting so the 30s watchdog cannot manufacture interruption.
+		if (isBackground) markAgentFinalizing(pipiuiAgentId, runId);
 
 		// Attested verify: runs AFTER the agent process exits and BEFORE the "end" report,
 		// because Swift auto-merges and removes the worktree on "end". Skipped on abort
@@ -3455,9 +4238,37 @@ async function runSingleAgent(
 			// Append only — never replace an existing terminal errorMessage.
 			if (currentResult.errorMessage) currentResult.errorMessage += note;
 		}
+		// Terminal job state before bridge end/notify so a watchdog-only interruption is corrected
+		// even while the bridge report is awaiting its bounded network timeout.
+		const endState: JobState = wasAborted ? "aborted" : endOk ? "ok" : "failed";
+		const terminalFinalized = jobFinalize(pipiuiAgentId, runId, {
+			name: agentName,
+			task,
+			state: endState,
+			resultText: endResultText,
+			cost: currentResult.usage.cost,
+			turns: currentResult.usage.turns,
+			activity: pipiuiActivity,
+			verify: currentResult.verify,
+		});
+		// Candidate evidence comes only from the final assistant text. It never
+		// reads stream previews, tool results, stderr, or a non-terminal run.
+		// A desktop-granted operator receives only host-projected Computer
+		// candidates from settled open/batch paths. Do not turn its broad terminal
+		// report into a second memory source that could contain UI prose.
+		if (terminalFinalized && !wasAborted && !computerMemoryEnabled) {
+			await submitBrokerTerminalCandidate(terminalMemoryBrokerEnvironment, {
+				runID: runId,
+				task,
+				title: options?.title,
+				terminalText: getFinalOutput(currentResult.messages),
+				outcome: endOk ? "success" : "failure",
+			});
+		}
 		await postTerminalPipiuiReport({
 			kind: "end",
 			agentId: pipiuiAgentId,
+			runId,
 			ok: endOk,
 			aborted: wasAborted,
 			output: endOutput,
@@ -3475,22 +4286,10 @@ async function runSingleAgent(
 					}
 				: {}),
 		});
-		// Terminal job state before notify/return so status works even if follow-up delivery fails.
-		const endState: JobState = wasAborted ? "aborted" : endOk ? "ok" : "failed";
-		jobFinalize(pipiuiAgentId, {
-			name: agentName,
-			task,
-			state: endState,
-			resultText: endResultText,
-			cost: currentResult.usage.cost,
-			turns: currentResult.usage.turns,
-			activity: pipiuiActivity,
-			verify: currentResult.verify,
-		});
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
-		if (isBackground) runningAgents.delete(pipiuiAgentId);
+		if (isBackground) deleteRunningAgentHandle(pipiuiAgentId, runId);
 		if (sessionDir) pruneAgentSessions(sessionDir, "completed");
 		if (tmpPromptPath)
 			try {
@@ -3516,13 +4315,15 @@ const VERIFY_PARAM_DESCRIPTION =
 	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Boss must fill this for implementation tasks. Omit it for read-only agents — they deliver a report, not files, and the runtime drops any verify they are given.";
 
 const AGENT_ID_DESCRIPTION =
-	"Short semantic name for the worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\". Re-dispatching the same agentId continues a writable worker with its previous conversation, worktree and branch — use it for one vertical slice (implement, verify, debug, fix, re-verify). Read-only roles are one-shot and do not create a worktree. Omit for one-off work and a name is generated. Also the target id for action=\"abort\".";
+	"Short semantic name for the worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\". Re-dispatching the same agentId continues a writable worker with its previous conversation, worktree and branch — use it for one vertical slice (implement, verify, debug, fix, re-verify). Read-only roles are one-shot and do not create a worktree. Omit for one-off work and a name is generated. Also the target id for action=\"abort\" or action=\"resolve\".";
 const FRESH_DESCRIPTION =
 	"Discard this agentId's stored conversation and start it cold. Use when its context went wrong, not routinely.";
 const DESKTOP_PARAM_DESCRIPTION =
 	'Explicit per-task Computer Use authorization. Omitted by default — desktop tools are NEVER injected without it, even when the global toggle is on. Only two values exist: "user-requested" (the user explicitly asked to operate an external app, or named Chrome/Safari/another external browser / "my browser" — then you MUST use exactly that external browser via open_application + computer, never swap in the built-in browser) and "ui-verify" (this task built/changed an app and genuinely needs a visual UI acceptance check). Ordinary web research → built-in browser tool, not desktop. Waiting, polling logs, reading files, and build/test verification never use desktop. Do not grant for convenience; each task is authorized independently and never inherits another task\'s grant.';
 const BLOCKED_BY_DESCRIPTION =
 	'Optional dependency tags (task/agentId short names this task depends on), e.g. ["tldr-done-report"]; informational display only — does not delay or gate scheduling.';
+const THINKING_PARAM_DESCRIPTION =
+	"Optional per-task thinking for this dispatch only: off|minimal|low|medium|high|xhigh|max. It never inherits the Boss current thinking and does not select a model (v1 has no per-task model). It overrides the current candidate's configured thinking; if a fallback is needed, it carries only when the Swift capability catalog explicitly allows that fallback level, otherwise that fallback uses its configured thinking/default.";
 
 /** Runtime shape check for blockedBy: array of strings, max 10, each ≤ 40 chars. */
 function validateBlockedBy(value: unknown, label: string): string | null {
@@ -3551,6 +4352,11 @@ const BlockedByParam = Type.Optional(
 		maxItems: 10,
 	}),
 );
+const ThinkingParam = Type.Optional(
+	StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, {
+		description: THINKING_PARAM_DESCRIPTION,
+	}),
+);
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
@@ -3564,6 +4370,7 @@ const TaskItem = Type.Object({
 	blockedBy: BlockedByParam,
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
+	thinking: ThinkingParam,
 	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	desktop: Type.Optional(
@@ -3584,6 +4391,7 @@ const ChainItem = Type.Object({
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
+	thinking: ThinkingParam,
 	desktop: Type.Optional(
 		StringEnum(["user-requested", "ui-verify"] as const, {
 			description: DESKTOP_PARAM_DESCRIPTION,
@@ -3596,14 +4404,7 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	default: "user",
 });
 
-const SubagentParams = Type.Object({
-	action: Type.Optional(
-		StringEnum(["abort"] as const, {
-			description:
-				'Optional action instead of dispatching. "abort": terminate a running background job (requires agentId); the job still reports [subagent-done] with aborted status.',
-		}),
-	),
-	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
+const SubagentSharedParams = {
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
@@ -3614,13 +4415,14 @@ const SubagentParams = Type.Object({
 		}),
 	),
 	blockedBy: BlockedByParam,
+	thinking: ThinkingParam,
 	tasks: Type.Optional(
 		Type.Array(TaskItem, {
 			description:
-				'Array of {agent, task, title?, blockedBy?, cwd?, verify?} for parallel execution. Put each independent workflow in its own array element; NEVER merge independent goals into one brief.\nExample: [{"agent":"explore","task":"map auth"},{"agent":"explore","task":"map billing"}].\nAnti-pattern: one task brief listing A; B; C.',
+				'Array of {agent, task, title?, blockedBy?, cwd?, verify?, thinking?} for parallel execution. Put each independent workflow in its own array element; NEVER merge independent goals into one brief.\nExample: [{"agent":"explore","task":"map auth"},{"agent":"explore","task":"map billing"}].\nAnti-pattern: one task brief listing A; B; C.',
 		}),
 	),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task, title?, cwd?, verify?} for sequential execution" })),
+	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task, title?, cwd?, verify?, thinking?} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
@@ -3638,6 +4440,34 @@ const SubagentParams = Type.Object({
 				"If true, return immediately after starting agents; completion is delivered later as a follow-up message. Default: true at boss depth (0), false for nested agents or chain mode.",
 		}),
 	),
+};
+
+// Keep the root object shape for existing Pi/tool introspection, while JSON Schema's conditional
+// branch makes runId and agentId required exactly when action=resolve.
+const SubagentParams = Type.Object({
+	action: Type.Optional(
+		StringEnum(["abort", "resolve"] as const, {
+			description:
+				'Optional action instead of dispatching. "abort": terminate a running background job (requires agentId); "resolve": mark one terminal failed/aborted/interrupted episode handled (requires agentId and runId).',
+		}),
+	),
+	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
+	runId: Type.Optional(Type.String({
+		minLength: 1,
+		description: "Exact runId for action=resolve; stale runIds are rejected with currentRunId.",
+	})),
+	reason: Type.Optional(Type.String({ maxLength: 500, description: "Optional handled/superseded reason shown in closeout status." })),
+	...SubagentSharedParams,
+}, {
+	allOf: [
+		{
+			if: {
+				properties: { action: { const: "resolve" } },
+				required: ["action"],
+			},
+			then: { required: ["agentId", "runId"] },
+		},
+	],
 });
 
 const SecretaryCommitParams = Type.Object({
@@ -3678,6 +4508,19 @@ export default function (pi: ExtensionAPI) {
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
 		initializeDoneDeliveryStore(pi, piSessionId);
 	});
+	// Do not add another session_before_compact handler: Pi resolves that hook
+	// last-wins. The existing main-compaction hook remains its only owner; these
+	// post-compaction/settled notifications merely unblock pending done delivery.
+	pi.on("session_compact", () => {
+		retryPendingDoneAfterSessionSettled(pi);
+	});
+	pi.on("agent_settled", () => {
+		retryPendingDoneAfterSessionSettled(pi);
+	});
+	registerSessionRecallTool(pi);
+	// UI-independent definition management. It only reads/scaffolds/installs
+	// agent packages and never enters the dispatch, desktop, or grant paths.
+	registerSubagentManagementTool(pi);
 	// Cut-in hold 提前释放：真实用户消息（本地/远程，非扩展自己的 followUp）已进入
 	// turn，说明 cut-in prompt 抢到了先手，暂缓的自动信号可以按原逻辑继续投递。
 	pi.on("input", (event) => {
@@ -3770,16 +4613,15 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	// Live in-flight worker reminder, registered unconditionally (not under the isolation
-	// env-var flag, which children only set for their own process): the boss process must
-	// see it. runningAgents is only populated in a dispatching process, so this is naturally
-	// self-scoping — empty when nothing is in flight, and every boss turn while a background
-	// worker is outstanding gets a fresh snapshot of what is still owed, so the boss can
-	// never answer "fine" over a stalled or vanished worker.
+	// Boss-only, hot-read routing reference plus the live in-flight reminder. The same dynamic
+	// prompt tells Boss exactly which agent chain / settings / allowed levels it can select before
+	// a dispatch, while workers stay free of parent orchestration context.
 	pi.on("before_agent_start", (event) => {
+		const routing = formatSubagentModelRoutingBlock();
 		const inflight = formatInFlightWorkersBlock(Date.now());
-		if (!inflight) return;
-		return { systemPrompt: `${event.systemPrompt.trimEnd()}\n\n${inflight}` };
+		const blocks = [routing, inflight].filter((block): block is string => Boolean(block));
+		if (blocks.length === 0) return;
+		return { systemPrompt: `${event.systemPrompt.trimEnd()}\n\n${blocks.join("\n\n")}` };
 	});
 
 	// Prompt text is not a security boundary. The runtime-owned closeout secretary
@@ -3818,8 +4660,8 @@ export default function (pi: ExtensionAPI) {
 	// 1) done 重投：sendUserMessage 的 promise 未确认（reject 或未 settle）的 [subagent-done]，
 	//    同一 obligation 至少隔 60s 重投一次，直到确认。job 已 terminal，重投只依赖持久化 text。
 	// 2) vanished 即时检测：pid 已死但没人报告 → 立刻推（不等 5min 心跳），推一次后从 runningAgents 删除。
-	// 3) stall 复推：idle ≥ 120s 即推 [subagent-stalled]，boss 若继续等，每 5 分钟复推一次（idle 秒数更新）；
-	//    有新活动后 noteAgentActivity 复位 lastStallNotifyAt=0，重新武装。
+	// 3) stall 复推：idle ≥ 120s 即推 [subagent-stalled]，同一无活动片段最多首次 + 两次复推，
+	//    每次仍至少间隔 5 分钟；有新活动后 noteAgentActivity 复位计数和时间戳，重新武装。
 	// 4) interrupted/aborted/failed + stored context：idle ≥ NUDGE_SECS 推 [subagent-interrupted-reminder]，
 	//    再于 RENUDGE_SECS 复推一次后沉默；同 agentId 再 dispatch 为 running 时字段被清零。
 	// 复用 [subagent-done] 的 followUp 通道。无 PIPIUI_* 环境变量时桥接上报自动静默（pipiuiReport no-op）。
@@ -3849,12 +4691,12 @@ export default function (pi: ExtensionAPI) {
 				handle.pid === undefined
 					? `process never attached a pid after ${elapsed}; treated as interrupted (vanished)`
 					: `process gone after ${elapsed}, no result reported`;
-			markWorkerInterrupted(agentId, reason);
+			if (!markWorkerInterrupted(agentId, reason)) continue;
 			deliverSubagentDone(
 				pi,
 				[
-					`[subagent-heartbeat] outstanding=${runningAgents.size} vanished=1`,
-					`  ${agentId} (${title}) — ${reason}`,
+					`[subagent-heartbeat] outstanding=${runningAgents.size} vanished=1 stalled=0`,
+					`  ${agentId} (${title}) — ${reason}, state=interrupted`,
 					"A vanished worker was interrupted, not failed: its stored conversation is intact, so re-dispatch that same agentId to continue where it left off.",
 				].join("\n"),
 			);
@@ -3862,11 +4704,11 @@ export default function (pi: ExtensionAPI) {
 
 		// (3) stall 推送 / 复推
 		for (const [agentId, handle] of runningAgents) {
+			if (handle.finalizing) continue;
 			const idleMs = now - handle.lastActivityAt;
 			if (idleMs < STALL_THRESHOLD_MS) continue;
-			// 本片段推过且距上次不足 5 分钟：boss 可能正在处理，保持沉默。
-			if (handle.lastStallNotifyAt > 0 && now - handle.lastStallNotifyAt < STALL_RENOTIFY_INTERVAL_MS) continue;
-			handle.lastStallNotifyAt = now;
+			// 同一无活动片段最多推 STALL_RENOTIFY_MAX 次；每次仍至少间隔 5 分钟。
+			if (!claimStallNotification(handle, now)) continue;
 			const idleSec = Math.floor(idleMs / 1000);
 			const job = jobRegistry.get(agentId);
 			const title =
@@ -3881,39 +4723,24 @@ export default function (pi: ExtensionAPI) {
 				[
 					`[subagent-stalled] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine}`,
 					`Query it first with subagent_status({agentId:"${agentId}"}), then choose exactly one: keep waiting (say why) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent still reports [subagent-done], and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
+					`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${agentId}"}). If it is still running, close it with action:"abort" (or /subagent_abort) so this recurring message stops; if it is terminal (failed/aborted/interrupted), resolve it with action:"resolve" + runId (or /subagent_resolve). A text-only reply does not stop this message.`,
 				].join("\n"),
 			);
 			pipiuiReport({
 				kind: "stalled",
 				agentId,
+				runId: handle.runId,
 				stalled: true,
 				idle: idleSec,
 				activity: lastLine,
 			});
 		}
 
-		// (4) interrupted/aborted/failed + intact stored context → remind boss to re-dispatch
+		// (4) interrupted/aborted/failed + intact stored context → reserve a run-scoped reminder,
+		// then revalidate it around the cut-in wait before any follow-up can enter the boss turn.
 		const resumableIds = new Set(resumableAgentIds());
-		for (const job of jobRegistry.values()) {
-			if (job.state !== "interrupted" && job.state !== "aborted" && job.state !== "failed") continue;
-			if (!resumableIds.has(job.agentId)) continue; // no session on disk → nothing to resume
-			const nudgeCount = job.nudgeCount ?? 0;
-			if (nudgeCount >= 2) continue; // first + one re-nudge, then silence this terminal episode
-			const endedAt = job.endedAt ?? job.startedAt;
-			const idleSec = Math.max(0, Math.floor((now - endedAt) / 1000));
-			const thresholdSec = nudgeCount === 0 ? INTERRUPTED_NUDGE_SECS : INTERRUPTED_RENUDGE_SECS;
-			if (idleSec < thresholdSec) continue;
-			job.nudgeCount = nudgeCount + 1;
-			job.lastNudgeAt = now;
-			const title =
-				job.title?.trim() || (job.task.split("\n")[0] ?? "").trim().slice(0, 80) || "(untitled)";
-			deliverSubagentDone(
-				pi,
-				[
-					`[subagent-interrupted-reminder] agentId=${job.agentId} state=${job.state} title=${title} idle=${idleSec}s nudge=${job.nudgeCount}/2`,
-					`This worker is ${job.state} but its stored context is intact. Re-dispatch the same agentId to continue where it left off, or pass fresh:true to abandon that context. Do not treat this message as a new user request.`,
-				].join("\n"),
-			);
+		for (const reminder of scheduleInterruptedReminders(now, resumableIds)) {
+			void deliverInterruptedReminder(pi, reminder);
 		}
 	}, STALL_WATCHDOG_INTERVAL_MS);
 	stallWatchdog.unref?.();
@@ -3938,6 +4765,7 @@ export default function (pi: ExtensionAPI) {
 		const now = Date.now();
 		const alive: string[] = [];
 		const vanished: string[] = [];
+		let stalled = 0;
 		for (const [agentId, handle] of [...runningAgents]) {
 			const title =
 				handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 60) || "(untitled)";
@@ -3949,15 +4777,18 @@ export default function (pi: ExtensionAPI) {
 					handle.pid === undefined
 						? `process never attached a pid after ${elapsed}; treated as interrupted (vanished)`
 						: `process gone after ${elapsed}, no result reported`;
-				markWorkerInterrupted(agentId, reason);
-				vanished.push(`  ${agentId} (${title}) — ${reason}`);
+				if (markWorkerInterrupted(agentId, reason)) {
+					vanished.push(`  ${agentId} (${title}) — ${reason}, state=interrupted`);
+				}
 				continue;
 			}
-			alive.push(`  ${agentId} (${title}) — running ${elapsed}, idle ${idle}s`);
+			const state = formatHeartbeatWorkerState(agentId, handle, now);
+			if (state === "running(stalled)") stalled++;
+			alive.push(`  ${agentId} (${title}) — running ${elapsed}, idle ${idle}s, state=${state}`);
 		}
 		if (alive.length === 0 && vanished.length === 0) return;
 		const lines = [
-			`[subagent-heartbeat] outstanding=${alive.length} vanished=${vanished.length}`,
+			`[subagent-heartbeat] outstanding=${alive.length} vanished=${vanished.length} stalled=${stalled}`,
 			...alive,
 			...vanished,
 		];
@@ -3968,6 +4799,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		lines.push(
 			"Silence is not progress: it means one of still thinking, died without reporting, or its report was lost. Decide which and act — keep waiting (say why), pull one report with subagent_status, or recover a vanished worker. Do not re-dispatch a worker that is still running; that puts two agents in the same files.",
+			"If a related worker's work is already complete, close the loop instead of replying \"already completed\": abort a still-running job with action:\"abort\" (or /subagent_abort), or resolve a terminal failed/aborted/interrupted episode with action:\"resolve\" + runId (or /subagent_resolve). A text-only reply does not stop these messages.",
 		);
 		deliverSubagentDone(pi, lines.join("\n"));
 	}, HEARTBEAT_INTERVAL_MS);
@@ -3979,7 +4811,7 @@ export default function (pi: ExtensionAPI) {
 		if (g[STALL_WATCHDOG_KEY] === stallWatchdog) delete g[STALL_WATCHDOG_KEY];
 	});
 
-	// ---- RPC 命令：GUI 经 {"type":"prompt","message":"/subagent_abort <agentId>"} 调用 ----
+	// ---- RPC commands: GUI uses these same Node control paths instead of mutating Swift-only state. ----
 	pi.registerCommand("subagent_abort", {
 		description: "Abort a running background subagent: /subagent_abort <agentId> (PipiUI)",
 		handler: async (args, ctx) => {
@@ -3993,13 +4825,61 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("subagent_resolve", {
+		description: "Mark one failed/aborted/interrupted subagent episode handled: /subagent_resolve <agentId> <runId> [reason] (PipiUI)",
+		handler: async (args, ctx) => {
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const agentId = parts.shift();
+			const runId = parts.shift();
+			if (!agentId || !runId) {
+				ctx.ui.notify("Usage: /subagent_resolve <agentId> <runId> [reason]", "error");
+				return;
+			}
+			const result = resolveSubagentEpisode(agentId, runId, parts.join(" ") || undefined);
+			if (result.ok && result.job) void reportResolvedCloseout(result.job);
+			ctx.ui.notify(result.message, result.ok ? "info" : "error");
+		},
+	});
+
+	// Runtime-owned recovery path. It deliberately reuses the original id: that makes
+	// resolveSubagentWorktree reuse its branch/path and runSingleAgent reuse its session.
+	// The cross-process lease plus running registry make duplicate bridge/restart commands no-ops.
+	pi.registerCommand("subagent_recover", {
+		description: "Internal: resume one failed worktree integration (PipiUI)",
+		handler: async (args, ctx) => {
+			const [agentId = "", requestedName = "", freshFlag = "0", verifyBase64 = ""] = (args ?? "").trim().split(/\s+/, 4);
+			if (!agentId || validateAgentId(agentId)) return;
+			if (jobRegistry.get(agentId)?.state === "running") return;
+			const previous = jobRegistry.get(agentId);
+			const discovery = discoverAgents(ctx.cwd, "both");
+			const agentName = previous?.name ?? requestedName;
+			if (!agentName || !discovery.agents.some((agent) => agent.name === agentName)) return;
+			const fresh = freshFlag === "1";
+			let persistedVerify: string | undefined;
+			try {
+				const decoded = Buffer.from(verifyBase64, "base64").toString("utf8").trim();
+				persistedVerify = decoded || undefined;
+			} catch {
+				persistedVerify = undefined;
+			}
+			const task = [
+				"Runtime recovery for the worktree integration failure. Continue the existing task in the existing worktree.",
+				"Integrate the current main HEAD, resolve any committed-tree conflict, run the original verification, then finish normally.",
+				"Do not ask the user for Git operations and do not use stash, reset, or clean.",
+			].join(" ");
+			void runSingleAgent(ctx.cwd, discovery.agents, agentName, task, undefined, undefined, undefined, undefined,
+				(results) => ({ mode: "single", agentScope: "both", projectAgentsDir: discovery.projectAgentsDir, results }),
+				{ agentId, background: true, fresh, title: previous?.title, verify: persistedVerify ?? previous?.verify?.command });
+		},
+	});
+
 	pi.registerTool({
 		name: "subagent_status",
 		label: "Subagent Status",
 		description: [
-			"Query subagent job status (running / ok / failed / aborted / interrupted), plus workers that are stopped but still hold their stored context.",
+			"Query subagent job status (running / ok / failed / aborted / interrupted), including the exact runId required to resolve an old failed episode safely.",
 			"An interrupted worker is not a failed one: re-dispatch its agentId to continue where it left off instead of starting someone cold.",
-			"Use when deciding next action, when the user asks for progress, or before re-dispatching.",
+			"Use on every [subagent-done] event before any user-facing conclusion: inspect all jobs, keep user-facing progress and summaries silent while related work remains running or stalled, and close out only after the whole related goal is terminal.",
 			"Prefer reading finished results via this tool or [subagent-done] over spawning a new agent for the same work.",
 			"Do not busy-loop poll; one check per decision is correct.",
 		].join(" "),
@@ -4029,12 +4909,14 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Optional thinking is accepted per single/task/chain step; it applies only to that dispatch, never inherits Boss thinking, and v1 intentionally has no per-task model. The dynamic system prompt shows each agent's configured model/fallback chain and allowed levels.",
 			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
 			"While the fan-out philosophy layer is active, background=false is ignored at boss depth — asynchronous dispatch is that layer's premise, not a preference. Use chain for genuinely ordered synchronous steps.",
 			"By default writable workers run in an isolated git worktree under .pi/worktrees/ on a pipiui/<agentId> branch; read-only roles run directly in the caller cwd and never create a worktree. Pass explicit cwd or set PIPIUI_WORKTREE=0 to disable worktree isolation. The runtime-owned secretary role is also an exception: it always runs in PIPIUI_MAIN_CWD with recursive delegation disabled and never creates a worktree. On successful writable-worker end the app auto-merges into the main project, removes the worktree, and safely deletes only a merged internal branch with git branch -d. If merge or cleanup fails, the main session retains actionable state; failed/aborted keeps worktree for resume (GUI merge/discard fallback).",
 			"Track jobs with subagent_status(agentId?). Never re-spawn a finished task without reading its result via [subagent-done] or subagent_status.",
 			"Optional blockedBy on single/parallel tasks records dependency tags for status and ledger display only (no scheduler gating).",
 			'Abort a running background job with action:"abort" + agentId (equivalent to /subagent_abort); it ends as aborted and still reports [subagent-done].',
+			'Resolve a terminal failed/aborted/interrupted episode with action:"resolve" + agentId + runId (from [subagent-done] or subagent_status). Resolve keeps the real state/verified attestation unchanged, marks closeout cleaned, and suppresses that run\'s interrupted reminders; stale runIds are rejected.',
 			"Background jobs with no output for 120s are pushed as [subagent-stalled] and marked stalled (with idle seconds) in subagent_status.",
 			"Do not busy-loop poll; one status check per decision is correct.",
 			"chain and nested (depth>0) are always synchronous. Background dispatches automatically wake you with a [subagent-done] signal; continue other work rather than waiting or polling.",
@@ -4079,6 +4961,9 @@ export default function (pi: ExtensionAPI) {
 					results,
 					...(extra?.background ? { background: true } : {}),
 					...(extra?.agentIds ? { agentIds: extra.agentIds } : {}),
+					...(discovery.diagnostics.length > 0
+						? { agentDiagnostics: discovery.diagnostics.map((entry) => `[${entry.severity}] ${entry.message}`) }
+						: {}),
 				});
 
 			const requestAgentIds = new Set<string>();
@@ -4096,6 +4981,28 @@ export default function (pi: ExtensionAPI) {
 					: params.background === false && forcedBackground
 						? "Warning: background:false ignored — the fan-out philosophy layer is active, and it requires dispatch to stay asynchronous. Do not wait here: keep dispatching independent work, then read [subagent-done]. Use chain if you genuinely need ordered synchronous steps, or turn off the 瀑布流 layer in Settings.\n\n"
 						: "";
+
+			// action=resolve: close one exact old terminal episode without changing state/verify.
+			if (params.action === "resolve") {
+				const target = params.agentId?.trim();
+				const runId = params.runId?.trim();
+				if (!target || !runId) {
+					return {
+						content: [
+							{ type: "text", text: 'action="resolve" requires both agentId and runId.' },
+						],
+						details: makeDetails("single")([]),
+						isError: true,
+					};
+				}
+				const resolveResult = resolveSubagentEpisode(target, runId, params.reason);
+				if (resolveResult.ok && resolveResult.job) void reportResolvedCloseout(resolveResult.job);
+				return {
+					content: [{ type: "text", text: resolveResult.message }],
+					details: makeDetails("single")([]),
+					isError: !resolveResult.ok,
+				};
+			}
 
 			// action=abort：中止运行中的后台 job（不占 single/parallel/chain 的 mode 名额）
 			if (params.action === "abort") {
@@ -4125,6 +5032,7 @@ export default function (pi: ExtensionAPI) {
 				mode: "single" | "parallel",
 				title: string | undefined,
 				verify: string | undefined,
+				thinking: string | undefined,
 				fresh?: boolean,
 				desktop?: "user-requested" | "ui-verify",
 				blockedBy?: string[],
@@ -4139,7 +5047,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ background: true, agentId, title, sessionModel, verify, fresh, desktop, blockedBy },
+					{ background: true, agentId, title, sessionModel, verify, thinking, fresh, desktop, blockedBy },
 				)
 					.then((result) => {
 						notifySubagentDone(pi, result);
@@ -4307,8 +5215,11 @@ export default function (pi: ExtensionAPI) {
 			const unknownNames = [...new Set(requestedNames.filter((name) => !agents.some((agent) => agent.name === name)))];
 			if (unknownNames.length > 0) {
 				const available = agents.map((agent) => `"${agent.name}"`).join(", ") || "none";
+				const packageDiagnostics = discovery.diagnostics.length > 0
+					? `\n\nAgent package diagnostics:\n${formatAgentDiagnostics(discovery.diagnostics)}`
+					: "";
 				return {
-					content: [{ type: "text", text: `Unknown agent(s): ${unknownNames.map((name) => `"${name}"`).join(", ")}. Available agents: ${available}.` }],
+					content: [{ type: "text", text: `Unknown agent(s): ${unknownNames.map((name) => `"${name}"`).join(", ")}. Available agents: ${available}.${packageDiagnostics}` }],
 					details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
 					isError: true,
 				};
@@ -4389,6 +5300,7 @@ export default function (pi: ExtensionAPI) {
 							title: step.title,
 							sessionModel,
 							verify: step.verify,
+							thinking: step.thinking,
 							agentId: generatePipiuiAgentId(requestAgentIds),
 							desktop: step.desktop,
 						},
@@ -4497,7 +5409,7 @@ export default function (pi: ExtensionAPI) {
 								undefined, // no parent abort binding
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ background: true, agentId, title: t.title, sessionModel, verify: t.verify, fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy },
+								{ background: true, agentId, title: t.title, sessionModel, verify: t.verify, thinking: t.thinking, fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy },
 							);
 							notifySubagentDone(pi, result);
 						} catch (err) {
@@ -4583,6 +5495,7 @@ export default function (pi: ExtensionAPI) {
 							title: t.title,
 							sessionModel,
 							verify: t.verify,
+							thinking: t.thinking,
 							agentId: t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
 							fresh: t.fresh,
 							desktop: t.desktop,
@@ -4637,7 +5550,7 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 					const agentId = params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
-					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.fresh, params.desktop, params.blockedBy);
+					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy);
 					const placeholder: SingleResult = {
 						agent: params.agent,
 						agentId,
@@ -4682,6 +5595,7 @@ export default function (pi: ExtensionAPI) {
 						title: params.title,
 						sessionModel,
 						verify: params.verify,
+						thinking: params.thinking,
 						agentId: params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
 						fresh: params.fresh,
 						desktop: params.desktop,
@@ -4732,6 +5646,16 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("toolTitle", theme.bold("subagent ")) +
 						theme.fg("warning", "abort ") +
 						theme.fg("accent", args.agentId || "?"),
+					0,
+					0,
+				);
+			}
+			if (args.action === "resolve") {
+				return new Text(
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+						theme.fg("success", "resolve ") +
+						theme.fg("accent", args.agentId || "?") +
+						theme.fg("muted", ` ${args.runId || "?"}`),
 					0,
 					0,
 				);
