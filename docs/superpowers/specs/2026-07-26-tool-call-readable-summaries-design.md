@@ -17,7 +17,7 @@
 - 不改 `ToolRun` 的输出与执行状态。
 - 不改卡片展开/折叠、选中/置灰等任何卡片状态。
 - 不改任何视图结构（`ToolCardView` / `SubagentToolCardView` / `SubagentPanel` 仅照常读取摘要）。
-- 不为其它工具（write / edit / bash / read / ls / web_search / web_fetch / generate_image / browser，已有专用分支）改行为。
+- 不为其它工具（write / edit / bash / read / ls / web_search / fetch_content / generate_image / browser，已有专用分支）改行为。
 - 不改 `make-app.sh` / `scripts/` / 打包流程。
 
 ## 2. 数据流
@@ -141,7 +141,7 @@
    - `"find {\"pattern\":\"*.swift\",\"path\":\"Sources\"}"` → `*.swift in Sources`。
    - `"subagent {\"agent\":\"researcher\",\"task\":\"do X\"}"` → `researcher: do X`。
    - （工具名前缀由调用方 / 桥按现有边界拼接，摘要器内不加前缀。）
-6. **既有工具回归**：write / edit / bash / read / ls / web_search / web_fetch / generate_image / browser 的现有摘要用例保持不变。
+6. **既有工具回归**：write / edit / bash / read / ls / web_search / fetch_content / generate_image / browser 的现有摘要用例保持不变。
 
 ### 5.2 手工验收
 - 主转录中触发 find / grep / subagent 工具调用：卡片头显示可读文字，不再是 JSON。

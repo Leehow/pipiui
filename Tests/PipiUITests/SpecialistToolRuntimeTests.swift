@@ -24,11 +24,8 @@ final class SpecialistToolRuntimeTests: XCTestCase {
         )
 
         XCTAssertTrue(plugin.contains("WebAccessPackage.ensureInstalled()"))
-        XCTAssertFalse(plugin.contains("WebSearch" + "Extension.install"))
-        XCTAssertFalse(plugin.contains("GitHub" + "FetchPackage"))
         XCTAssertTrue(policy.contains("\"fetch_content\""))
         XCTAssertTrue(policy.contains("\"source_check\""))
         XCTAssertTrue(policy.contains("\"get_search_content\""))
-        XCTAssertFalse(policy.contains("github_" + "fetch"))
     }
 }

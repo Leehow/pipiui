@@ -1,8 +1,8 @@
 # API key 统一管理（`~/.pi/agent/.env`）
 
-Pipi UI 把所有 API key 集中存放在 `~/.pi/agent/.env` 一个文件里，由
-`EnvFileStore`（`Sources/PipiUI/EnvFileStore.swift`）统一读写。模型 key、
-搜索 key、添加模型、设置页、启动迁移全部走这一个文件。
+Pipi UI 把模型 provider 的 API key 集中存放在 `~/.pi/agent/.env` 一个文件里，由
+`EnvFileStore`（`Sources/PipiUI/EnvFileStore.swift`）统一读写。添加模型、设置页与
+启动迁移都走这一个文件。
 
 ## 位置与权限模型
 
@@ -43,17 +43,15 @@ Pipi UI 把所有 API key 集中存放在 `~/.pi/agent/.env` 一个文件里，�
 完整表见 `ProviderEnvMap.envVarsByProvider`；未知 provider 不在表内，
 其 key 不会被迁移/注入（迁移时保留在 auth.json 并记日志）。
 
-搜索后端（`ProviderEnvMap.searchEnvVars`）：
-
-web_search 已改 Firecrawl 免 key 搜索，无搜索后端 API key 需要管理（表为空）。
-
 ## 各链路如何消费 .env
 
 - **模型 key**：每次新建会话 spawn `pi` 子进程时，`ChatSession.mergedSpawnEnv`
   把 `.env` 全量键值注入子进程环境作为**底层**；`PIPIUI_*` 开头的内部键
   永远在顶层、不可被 `.env` 覆盖。因此**改模型 key 需要重启会话才生效**
   （环境变量只在 spawn 那一刻确定）。密钥键值不会进日志。
-- **搜索 key**：`WebSearchExtension.swift` 使用 Firecrawl 免 key 搜索，无需任何 key 或后端配置。过渡期内 `~/Library/Application Support/PipiUI/websearch-config.json` 里的 backend 值被忽略（固定 firecrawl）。
+- **联网工具**：`pi-web-access` 提供 `web_search`、`fetch_content`、
+  `get_search_content` 和 `source_check`；PipiUI 不再维护自定义联网扩展的
+  配置文件或 key 镜像。默认联网能力无需 PipiUI 额外配置。
 - **OAuth 凭据**：`type: "oauth"` 的条目**永远留在** `~/.pi/agent/auth.json`，
   迁移不碰、添加模型不碰、清理冲突也不碰——refresh token 会轮转，必须
   留在 pi 自己管理的 auth.json 里。`.env` 只装 `api_key` 类型的静态密钥。
@@ -81,13 +79,8 @@ web_search 已改 Firecrawl 免 key 搜索，无搜索后端 API key 需要管�
    权限 0600）；
 2. 把 auth.json 里所有 `type: "api_key"` 的条目按映射表写入 `.env`
    （**`.env` 已有非空值时保留用户手改，绝不覆盖**）；
-3. 同时合并旧位置的搜索 key（UserDefaults `pipiui.webSearch.keys` 和
-   `websearch-config.json` 的 `keys` 字段）写入 `.env`（先到先得，`.env`
-   已有值仍赢）；搜索已改 Firecrawl 免 key，此步骤仅清理旧数据，不再有
-   实际搜索后端消费这些 key；
-4. 从 auth.json 删除已迁移的 `api_key` 条目（oauth 永不动），清空上述
-   两个旧存储；
-5. 写 UserDefaults 标记 `pipiui.authMigration.v1.done`（幂等，之后启动
+3. 从 auth.json 删除已迁移的 `api_key` 条目（oauth 永不动）；
+4. 写 UserDefaults 标记 `pipiui.authMigration.v1.done`（幂等，之后启动
    直接跳过），并留一次性提示 `pipiui.authMigration.v1.notice` 给 UI
    显示后清除。
 
@@ -120,8 +113,7 @@ set -a; . ~/.pi/agent/.env; set +a
 
 **Q：在设置页改了模型 key，为什么没生效？**
 模型 key 只在 spawn `pi` 子进程时注入环境。改完后需要**重启会话**（关闭
-再新建/重开），旧会话仍用旧 key。搜索 key 例外：搜索扩展每次热读 `.env`，
-立即生效。
+再新建/重开），旧会话仍用旧 key。
 
 **Q：设置页里的橙色「冲突」警告是什么意思？**
 同一个 provider 的 key 同时存在于 `.env` 和 auth.json。pi 运行时

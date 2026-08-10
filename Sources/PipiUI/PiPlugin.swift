@@ -291,12 +291,6 @@ enum PiPlugin {
         // 5. 热重载扩展/skills/prompts/context（内部命令 pipiui_reload）
         result.reloadExtension = ReloadExtension.install(into: root)
 
-        // 5.5 pi-web-access is installed through ManagedNpmPackage in installAll.
-        // Remove the generated custom web extension left by older builds.
-        try? fm.removeItem(at: root.appendingPathComponent("pipiui-websearch.ts"))
-        // Remove the generated custom PDF agent extension left by older builds.
-        try? fm.removeItem(at: root.appendingPathComponent("pipiui-pdf-extract.ts"))
-
         // 5.6 技能按需加载：提示里只留名字，描述/正文走 skill_search / skill_load
         result.skillLoaderExtension = SkillLoaderExtension.install(into: root)
 

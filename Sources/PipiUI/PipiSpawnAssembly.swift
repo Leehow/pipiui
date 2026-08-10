@@ -25,10 +25,6 @@ enum PipiSpawnEnvironmentPolicy {
         "PIPIUI_MEMORY_",
         "PIPIUI_COMPUTER_",
         "PIPIUI_SEARCH_",
-        // Retire the generated web and GitHub extension env names without
-        // letting stale parent/.env values resurrect an old package.
-        "PIPIUI_WEBSEARCH_",
-        "PIPIUI_GITHUB_",
         "PIPIUI_SUBAGENT_",
         "PIPIUI_WORKTREE_",
         // Hermes is main-session-only. Strip any stale inherited values rather

@@ -66,12 +66,6 @@ public enum ProviderEnvMap {
         "xiaomi-token-plan-sgp": ["XIAOMI_TOKEN_PLAN_SGP_API_KEY"],
     ]
 
-    // MARK: - Search backends
-
-    /// Search/web backends used by extensions; keyed by backend name.
-    /// Empty: web_search is now Firecrawl keyless — no backend API keys to map.
-    public static let searchEnvVars: [String: String] = [:]
-
     // MARK: - Lookups
 
     /// Canonical (first) env var for a provider ID, or nil if unknown.
@@ -86,11 +80,10 @@ public enum ProviderEnvMap {
 
     /// Reverse lookup: provider IDs whose canonical env var matches.
     public static func providers(forEnvVar envVar: String) -> [String] {
-        var hits = envVarsByProvider
+        envVarsByProvider
             .filter { $0.value.contains(envVar) }
             .map(\.key)
-        hits += searchEnvVars.filter { $0.value == envVar }.map(\.key)
-        return hits.sorted()
+            .sorted()
     }
 
     /// Whether a provider ID is known to the map.

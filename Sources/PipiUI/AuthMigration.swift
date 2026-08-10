@@ -1,16 +1,13 @@
 import Foundation
 
-/// AuthMigration — T20: one-time migration of API keys into `~/.pi/agent/.env`.
+/// AuthMigration — T20: one-time migration of model-provider API keys into
+/// `~/.pi/agent/.env`.
 ///
-/// Sources (legacy, pre-T18/T19 storage):
-/// 1. `~/.pi/agent/auth.json` — every `type: "api_key"` entry, key name via
-///    `ProviderEnvMap.envVar(forProvider:)`; providers outside the map are
-///    skipped (left untouched) and logged. `type: "oauth"` entries are NEVER
-///    touched.
-/// 2. UserDefaults `pipiui.webSearch.keys` — legacy per-backend search keys,
-///    mapped via `ProviderEnvMap.searchEnvVars`.
-/// 3. `~/Library/Application Support/PipiUI/websearch-config.json` `keys`
-///    field (same mapping; non-sensitive fields like `backend` are kept).
+/// Source:
+/// `~/.pi/agent/auth.json` — every `type: "api_key"` entry, with its key name
+/// resolved by `ProviderEnvMap.envVar(forProvider:)`. Providers outside the map
+/// are skipped (left untouched) and logged. `type: "oauth"` entries are NEVER
+/// touched.
 ///
 /// Actions (in order):
 /// - Back up `auth.json` → `auth.json.pipiui-bak` (never overwrites an
@@ -18,13 +15,12 @@ import Foundation
 /// - Merge into `.env` via `EnvFileStore` (serial write API). Existing
 ///   non-empty `.env` keys win — user hand-edits are never overwritten.
 /// - Remove migrated `api_key` entries from `auth.json`.
-/// - Clear UserDefaults `pipiui.webSearch.keys` and the JSON `keys` field.
 /// - Log a one-line summary (PipiLogger) and record a one-shot notice flag
 ///   in UserDefaults for the UI to consume (UI clears it after display).
 ///
 /// Idempotency: after a successful run `doneKey` is set in UserDefaults and
 /// later launches return immediately. Even without the flag a second run is
-/// a no-op because all sources have been cleaned and `.env` keys win.
+/// a no-op because migrated sources are cleaned and `.env` keys win.
 ///
 /// Threading: `migrateIfNeeded` is synchronous and does file I/O — callers
 /// MUST invoke it on a background queue (AppStore does). Main thread performs
@@ -36,19 +32,10 @@ enum AuthMigration {
     /// UserDefaults string: one-shot human-readable summary for the UI prompt.
     /// The UI reads and then removes this key.
     static let noticeKey = "pipiui.authMigration.v1.notice"
-    /// Legacy UserDefaults key for per-backend search keys (pre-T19).
-    static let legacyWebSearchKeysKey = "pipiui.webSearch.keys"
-
-    /// Retired generated-extension config, kept only for one-time key cleanup.
-    static var legacyWebSearchConfigURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("PipiUI/websearch-config.json")
-    }
 
     /// Injectable dependencies (tests point everything at temp locations).
     struct Options {
         var authURL: URL = PiAuthStore.defaultAuthURL()
-        var webSearchConfigURL: URL = AuthMigration.legacyWebSearchConfigURL
         var defaults: UserDefaults = .standard
         var envStore: EnvFileStore = EnvFileStore()
         var fileManager: FileManager = .default
@@ -65,8 +52,6 @@ enum AuthMigration {
         var providersRemoved: [String] = []
         /// `api_key` providers left in `auth.json` (no env-var mapping).
         var providersSkippedUnknown: [String] = []
-        var clearedUserDefaultsKeys = false
-        var clearedJSONKeys = false
     }
 
     /// Run the migration once. Synchronous — call from a background queue.
@@ -82,7 +67,6 @@ enum AuthMigration {
         }
 
         let authURL = options.authURL
-        let configURL = options.webSearchConfigURL
 
         // MARK: 1. Backup auth.json (never overwrite an existing backup)
         if fm.fileExists(atPath: authURL.path) {
@@ -98,10 +82,8 @@ enum AuthMigration {
             }
         }
 
-        // MARK: 2. Collect key candidates (auth.json → UserDefaults → JSON; first non-empty wins)
+        // MARK: 2. Collect model-provider key candidates (auth.json)
         var envValues: [String: String] = [:] // envVar -> api key
-        var unmappedBackends: [String] = []
-
         var authRoot = readJSONRoot(authURL)
         if let root = authRoot {
             for provider in root.keys.sorted() {
@@ -115,32 +97,6 @@ enum AuthMigration {
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 if !key.isEmpty { envValues[envVar] = key }
                 result.providersRemoved.append(provider)
-            }
-        }
-
-        let legacyDict = defaults.dictionary(forKey: legacyWebSearchKeysKey)
-        if let legacyDict {
-            for (backend, raw) in legacyDict {
-                guard let key = (raw as? String)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else { continue }
-                guard let envVar = ProviderEnvMap.searchEnvVars[backend] else {
-                    unmappedBackends.append(backend)
-                    continue
-                }
-                if envValues[envVar] == nil { envValues[envVar] = key }
-            }
-        }
-
-        var configRoot = readJSONRoot(configURL)
-        if let keys = configRoot?["keys"] as? [String: Any] {
-            for (backend, raw) in keys {
-                guard let key = (raw as? String)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else { continue }
-                guard let envVar = ProviderEnvMap.searchEnvVars[backend] else {
-                    if !unmappedBackends.contains(backend) { unmappedBackends.append(backend) }
-                    continue
-                }
-                if envValues[envVar] == nil { envValues[envVar] = key }
             }
         }
 
@@ -169,22 +125,7 @@ enum AuthMigration {
             }
         }
 
-        // MARK: 5. Clear legacy search-key stores (keep backend & friends)
-        if defaults.object(forKey: legacyWebSearchKeysKey) != nil {
-            defaults.removeObject(forKey: legacyWebSearchKeysKey)
-            result.clearedUserDefaultsKeys = true
-        }
-        if configRoot?["keys"] != nil {
-            configRoot?.removeValue(forKey: "keys")
-            do {
-                try writeJSONRoot(configRoot ?? [:], to: configURL, fm: fm)
-                result.clearedJSONKeys = true
-            } catch {
-                log("T20 migration: websearch-config.json rewrite failed: \(error.localizedDescription)", level: .error)
-            }
-        }
-
-        // MARK: 6. Done marker + one-shot UI notice + log
+        // MARK: 5. Done marker + one-shot UI notice + log
         defaults.set(true, forKey: doneKey)
 
         var summary = "T20 API key 迁移：写入 .env \(result.envWritten.count) 项"
@@ -196,13 +137,8 @@ enum AuthMigration {
             summary += "；auth.json 移除 api_key 条目 \(result.providersRemoved.joined(separator: ", "))"
         }
         if result.backupCreated { summary += "；已备份 auth.json.pipiui-bak" }
-        if result.clearedUserDefaultsKeys { summary += "；已清 UserDefaults 搜索 key" }
-        if result.clearedJSONKeys { summary += "；已清 websearch-config.json keys" }
         if !result.providersSkippedUnknown.isEmpty {
             summary += "；跳过未知 provider（保留在 auth.json）：\(result.providersSkippedUnknown.joined(separator: ", "))"
-        }
-        if !unmappedBackends.isEmpty {
-            summary += "；跳过无 .env 映射的搜索后端：\(unmappedBackends.joined(separator: ", "))"
         }
         defaults.set(summary, forKey: noticeKey)
         log(summary, level: .info)

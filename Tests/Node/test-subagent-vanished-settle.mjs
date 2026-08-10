@@ -94,6 +94,7 @@ export const __vanishedSettleHooks = {
 	STALL_RENOTIFY_MAX,
 	STALL_RENOTIFY_INTERVAL_MS,
 	INTERRUPTED_NUDGE_SECS,
+	HEARTBEAT_INTERVAL_MS,
 	getReports(): Record<string, unknown>[] {
 		const g = globalThis as typeof globalThis & { __pipiuiReports?: Record<string, unknown>[] };
 		return g.__pipiuiReports ?? [];
@@ -526,6 +527,123 @@ process.stdout.write(JSON.stringify({ stalled, finalizing, abortFinalizing, ok, 
       aborted: "aborted",
       interrupted: "interrupted",
     });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("heartbeat interval is configurable and suppresses unchanged state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pipiui-heartbeat-dedupe-"));
+  try {
+    await prepareHooksModule(directory);
+
+    const out = await runProbe(
+      directory,
+      `delete process.env.PIPIUI_HEARTBEAT_SECS;
+const intervals = [];
+globalThis.setInterval = (callback, ms) => {
+  const handle = { unref() {} };
+  intervals.push({ callback, ms });
+  return handle;
+};
+globalThis.clearInterval = () => {};
+const { default: registerSubagent, __vanishedSettleHooks: h } = await import("./subagent/index.ts");
+let now = 1_000_000;
+Date.now = () => now;
+const messages = [];
+const pi = {
+  on() {},
+  registerTool() {},
+  registerCommand() {},
+  async sendUserMessage(text, options) {
+    messages.push({ text, deliverAs: options?.deliverAs ?? null });
+  },
+};
+registerSubagent(pi);
+h.reset();
+const agentId = "heartbeat-dedupe";
+const runId = h.jobUpsertRunning(agentId, "probe", "wait", "t");
+const handle = {
+  runId,
+  controller: new AbortController(),
+  name: "probe",
+  task: "wait",
+  title: "t",
+  lastActivityAt: now,
+  lastStallNotifyAt: 0,
+  stallNotifyCount: 0,
+  startedAt: now - 1_000,
+  finalizing: false,
+  pid: process.pid,
+};
+h.runningAgents.set(agentId, handle);
+const heartbeat = intervals.find((interval) => interval.ms === h.HEARTBEAT_INTERVAL_MS);
+if (!heartbeat) throw new Error("heartbeat interval was not registered");
+const flush = async () => {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+};
+heartbeat.callback();
+await flush();
+const first = messages.length;
+now += h.HEARTBEAT_INTERVAL_MS;
+handle.lastActivityAt = now; // worker activity keeps the semantic state at running
+heartbeat.callback();
+await flush();
+const unchanged = messages.length;
+h.runningAgents.clear();
+heartbeat.callback(); // empty path must reset the dedupe payload
+await flush();
+handle.lastActivityAt = now;
+h.runningAgents.set(agentId, handle);
+heartbeat.callback();
+await flush();
+const afterEmptyReset = messages.length;
+handle.finalizing = true;
+now += 1;
+heartbeat.callback();
+await flush();
+const finalizing = messages.length;
+process.stdout.write(JSON.stringify({
+  intervalMs: heartbeat.ms,
+  first,
+  unchanged,
+  afterEmptyReset,
+  finalizing,
+  allFollowUp: messages.every((message) => message.deliverAs === "followUp"),
+}));
+`,
+    );
+
+    assert.equal(out.intervalMs, 15 * 60 * 1000);
+    assert.equal(out.first, 1);
+    assert.equal(out.unchanged, 1, "elapsed/idle changes alone must not create a follow-up");
+    assert.equal(out.afterEmptyReset, 2, "the next worker heartbeat must deliver after an empty interval");
+    assert.equal(out.finalizing, 3, "a state transition must still deliver");
+    assert.equal(out.allFollowUp, true);
+
+    const override = await runProbe(
+      directory,
+      `process.env.PIPIUI_HEARTBEAT_SECS = "17";
+const intervals = [];
+globalThis.setInterval = (callback, ms) => {
+  const handle = { unref() {} };
+  intervals.push({ callback, ms });
+  return handle;
+};
+globalThis.clearInterval = () => {};
+const { default: registerSubagent, __vanishedSettleHooks: h } = await import("./subagent/index.ts");
+const pi = { on() {}, registerTool() {}, registerCommand() {}, async sendUserMessage() {} };
+registerSubagent(pi);
+const heartbeat = intervals.find((interval) => interval.ms === h.HEARTBEAT_INTERVAL_MS);
+process.stdout.write(JSON.stringify({
+  intervalMs: heartbeat?.ms ?? null,
+  configuredMs: h.HEARTBEAT_INTERVAL_MS,
+}));
+`,
+    );
+    assert.equal(override.configuredMs, 17 * 1000);
+    assert.equal(override.intervalMs, 17 * 1000);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

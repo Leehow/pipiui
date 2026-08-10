@@ -268,7 +268,6 @@ test("policy resolves the role matrix and only names mounted PipiUI specialist t
     "utf8",
   );
   assert.match(assembly, /if f\.isEnabled\(\.arxivFetch\), let p = input\.paths\.arxivFetchPackage/);
-  assert.doesNotMatch(assembly, /PIPIUI_PDF/);
 
   const sources = await Promise.all(
     ["explore", "general-purpose", "plan", "reviewer", "operator", "secretary", "long-test"].map(

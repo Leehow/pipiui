@@ -1639,9 +1639,13 @@ const DONE_MAX_ATTEMPTS = 5;
  * How long the boss may hear nothing at all while work is outstanding. Chosen to be far longer
  * than the stall threshold: this is the last line of defence against silence, not a progress
  * report, and every heartbeat costs the boss a turn. 即时性已由 30s 轮询（stall 复推 / done
- * 重投 / vanished 检测）承担，心跳只做兜底摘要，故从 15min 降到 5min。
+ * 重投 / vanished 检测）承担。Unchanged summaries are deduped and create no boss turn, so the
+ * default 15-minute heartbeat is a true last resort rather than a progress report. 可通过
+ * PIPIUI_HEARTBEAT_SECS 覆盖。
  */
-const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+const HEARTBEAT_INTERVAL_MS = envPositiveSecs("PIPIUI_HEARTBEAT_SECS", 15 * 60) * 1000;
+/** Last delivered heartbeat's stable state payload; reset after all workers leave. */
+let lastHeartbeatText: string | undefined;
 /** A handle with no pid after this age is treated as vanished (spawn never attached). */
 const NO_PID_VANISH_MS = 5 * 60 * 1000;
 
@@ -4739,17 +4743,21 @@ export default function (pi: ExtensionAPI) {
 	//
 	// Codex avoids this by making the wait itself bounded: `wait_agent` takes a timeout and
 	// returns an empty status when it expires, so control always comes back. We cannot bound a
-	// wait the boss never issued, so we bound the silence instead: while anything is
-	// outstanding, the boss hears from us at least this often, whatever else did or did not
-	// happen.
+	// wait the boss never issued, so we bound the silence instead. Unchanged summaries are
+	// suppressed before followUp (no model turn); only state changes — new worker, stall flip,
+	// finalizing, vanished, or done — wake the boss through this last-resort path.
 	const HEARTBEAT_KEY = "__pipiuiSubagentHeartbeat";
 	const prevHeartbeat = g[HEARTBEAT_KEY] as ReturnType<typeof setInterval> | undefined;
 	if (prevHeartbeat) clearInterval(prevHeartbeat);
 	const heartbeat = setInterval(() => {
-		if (runningAgents.size === 0) return; // nothing outstanding: stay quiet
+		if (runningAgents.size === 0) {
+			lastHeartbeatText = undefined;
+			return; // nothing outstanding: stay quiet
+		}
 		const now = Date.now();
 		const alive: string[] = [];
 		const vanished: string[] = [];
+		const heartbeatState: Array<{ agentId: string; runId: string; title: string; state: string }> = [];
 		let stalled = 0;
 		for (const [agentId, handle] of [...runningAgents]) {
 			const title =
@@ -4764,12 +4772,14 @@ export default function (pi: ExtensionAPI) {
 						: `process gone after ${elapsed}, no result reported`;
 				if (markWorkerInterrupted(agentId, reason)) {
 					vanished.push(`  ${agentId} (${title}) — ${reason}, state=interrupted`);
+					heartbeatState.push({ agentId, runId: handle.runId, title, state: "interrupted(vanished)" });
 				}
 				continue;
 			}
 			const state = formatHeartbeatWorkerState(agentId, handle, now);
 			if (state === "running(stalled)") stalled++;
 			alive.push(`  ${agentId} (${title}) — running ${elapsed}, idle ${idle}s, state=${state}`);
+			heartbeatState.push({ agentId, runId: handle.runId, title, state });
 		}
 		if (alive.length === 0 && vanished.length === 0) return;
 		const lines = [
@@ -4786,6 +4796,16 @@ export default function (pi: ExtensionAPI) {
 			"Silence is not progress: it means one of still thinking, died without reporting, or its report was lost. Decide which and act — keep waiting (say why), pull one report with subagent_status, or recover a vanished worker. Do not re-dispatch a worker that is still running; that puts two agents in the same files.",
 			"If a related worker's work is already complete, close the loop instead of replying \"already completed\": abort a still-running job with action:\"abort\" (or /subagent_abort), or resolve a terminal failed/aborted/interrupted episode with action:\"resolve\" + runId (or /subagent_resolve). A text-only reply does not stop these messages.",
 		);
+		// Elapsed/idle counters are display-only: without a stable state payload, they would
+		// make an unchanged worker look different on every interval.
+		const heartbeatText = JSON.stringify({
+			outstanding: alive.length,
+			vanished: vanished.length,
+			stalled,
+			workers: heartbeatState,
+		});
+		if (heartbeatText === lastHeartbeatText) return;
+		lastHeartbeatText = heartbeatText;
 		deliverSubagentDone(pi, lines.join("\n"));
 	}, HEARTBEAT_INTERVAL_MS);
 	heartbeat.unref?.();

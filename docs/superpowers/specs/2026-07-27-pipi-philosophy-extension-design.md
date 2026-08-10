@@ -196,7 +196,7 @@ scope: [main, lead]
 { "delegate":        { "tool": "subagent",        "required": true  },
   "delegate_status": { "tool": "subagent_status", "required": true  },
   "search":          { "tool": "web_search",      "required": false },
-  "fetch":           { "tool": "web_fetch",       "required": false },
+  "fetch":           { "tool": "fetch_content",   "required": false },
   "locate":          { "tool": "grep",            "required": false } }
 ```
 

@@ -5,7 +5,6 @@ final class AuthMigrationTests: XCTestCase {
 
     private var tmpDir: URL!
     private var authURL: URL!
-    private var configURL: URL!
     private var envURL: URL!
     private var suiteName: String!
     private var defaults: UserDefaults!
@@ -16,7 +15,6 @@ final class AuthMigrationTests: XCTestCase {
             .appendingPathComponent("AuthMigrationTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
         authURL = tmpDir.appendingPathComponent("auth.json")
-        configURL = tmpDir.appendingPathComponent("websearch-config.json")
         envURL = tmpDir.appendingPathComponent(".env")
         suiteName = "AuthMigrationTests.\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: suiteName)
@@ -34,7 +32,6 @@ final class AuthMigrationTests: XCTestCase {
     private var options: AuthMigration.Options {
         var o = AuthMigration.Options()
         o.authURL = authURL
-        o.webSearchConfigURL = configURL
         o.defaults = defaults
         o.envStore = envStore
         return o
@@ -43,11 +40,6 @@ final class AuthMigrationTests: XCTestCase {
     private func writeAuthJSON(_ dict: [String: Any]) throws {
         let data = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: authURL, options: .atomic)
-    }
-
-    private func writeConfigJSON(_ dict: [String: Any]) throws {
-        let data = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: configURL, options: .atomic)
     }
 
     private func readJSON(_ url: URL) -> [String: Any]? {
@@ -62,32 +54,20 @@ final class AuthMigrationTests: XCTestCase {
             "openai": ["type": "oauth", "access": "tok", "refresh": "ref"],
             "mystery": ["type": "api_key", "key": "unknown-provider-key"],
         ])
-        defaults.set(["tavily": "tvly-1", "brave": "brave-ud"], forKey: AuthMigration.legacyWebSearchKeysKey)
-        try writeConfigJSON([
-            // Legacy search keys are no longer mapped (Firecrawl keyless); migration
-            // clears these stores but does not write them to .env.
-            "backend": "tavily",
-            "keys": ["brave": "brave-json", "serpapi": "serp-9"],
-        ])
     }
 
     // MARK: - Tests
 
-    func testFullMigration() throws {
+    func testFullMigrationFromAuthJSON() throws {
         try seedFullFixture()
         let result = AuthMigration.migrateIfNeeded(options: options)
 
-        // .env content: only model provider keys (auth.json); legacy search keys are
-        // no longer mapped to any env var because web_search is Firecrawl keyless.
         let env = envStore.all()
         XCTAssertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-123")
         XCTAssertEqual(env["XAI_API_KEY"], "xai-abc")
-        XCTAssertNil(env["TAVILY_API_KEY"])
-        XCTAssertNil(env["BRAVE_API_KEY"])
-        XCTAssertNil(env["SERPAPI_API_KEY"])
         XCTAssertEqual(Set(result.envWritten), ["ANTHROPIC_API_KEY", "XAI_API_KEY"])
 
-        // auth.json: only oauth + unknown-provider api_key remain
+        // auth.json: only oauth + unknown-provider api_key remain.
         let auth = readJSON(authURL)
         XCTAssertNotNil(auth?["openai"])
         XCTAssertEqual((auth?["openai"] as? [String: Any])?["type"] as? String, "oauth")
@@ -97,7 +77,7 @@ final class AuthMigrationTests: XCTestCase {
         XCTAssertNil(auth?["xai"])
         XCTAssertEqual(result.providersSkippedUnknown, ["mystery"])
 
-        // backup exists with the ORIGINAL auth.json content
+        // Backup contains the original auth.json content.
         let bakURL = authURL.appendingPathExtension("pipiui-bak")
         XCTAssertTrue(FileManager.default.fileExists(atPath: bakURL.path))
         let bak = readJSON(bakURL)
@@ -105,13 +85,6 @@ final class AuthMigrationTests: XCTestCase {
         XCTAssertNotNil(bak?["openai"])
         XCTAssertTrue(result.backupCreated)
 
-        // legacy search stores cleared; backend preserved
-        XCTAssertNil(defaults.object(forKey: AuthMigration.legacyWebSearchKeysKey))
-        let config = readJSON(configURL)
-        XCTAssertEqual(config?["backend"] as? String, "tavily")
-        XCTAssertNil(config?["keys"])
-
-        // flags
         XCTAssertTrue(defaults.bool(forKey: AuthMigration.doneKey))
         let notice = defaults.string(forKey: AuthMigration.noticeKey) ?? ""
         XCTAssertTrue(notice.contains("ANTHROPIC_API_KEY"), "notice should summarize writes: \(notice)")
@@ -144,7 +117,7 @@ final class AuthMigrationTests: XCTestCase {
         XCTAssertEqual(envStore.value(forKey: "ANTHROPIC_API_KEY"), "user-custom")
         XCTAssertEqual(result.envPreserved, ["ANTHROPIC_API_KEY"])
         XCTAssertTrue(result.envWritten.isEmpty)
-        // entry still removed from auth.json: value already lives in .env
+        // Entry still removed from auth.json: value already lives in .env.
         XCTAssertNil(readJSON(authURL)?["anthropic"])
     }
 
@@ -163,7 +136,6 @@ final class AuthMigrationTests: XCTestCase {
     }
 
     func testNoSourcesStillSetsDoneFlagAndIsHarmless() throws {
-        // No auth.json, no UserDefaults keys, no config JSON.
         let result = AuthMigration.migrateIfNeeded(options: options)
         XCTAssertFalse(result.backupCreated)
         XCTAssertTrue(result.envWritten.isEmpty)

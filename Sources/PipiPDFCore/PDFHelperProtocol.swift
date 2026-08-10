@@ -217,7 +217,7 @@ public enum PDFHelperService {
             throw PDFHelperServiceError.invalidRequest("path is required.")
         }
         guard (trimmed as NSString).isAbsolutePath else {
-            throw PDFHelperServiceError.invalidInput("path must be an absolute local path; HTTP(S) downloads belong in pdf_extract.")
+            throw PDFHelperServiceError.invalidInput("path must be an absolute local path; download HTTP(S) PDFs with fetch_content before supplying a local path.")
         }
 
         let sourceURL = URL(fileURLWithPath: trimmed)
@@ -258,7 +258,7 @@ public enum PDFHelperService {
         var lines = [
             "# PDF extraction",
             "",
-            "<!-- pdf_extract_metadata",
+            "<!-- pdf_metadata",
             "pageCount: \(metadata.pageCount)",
             "selectedPages: \(metadata.selectedPages)",
             "textPages: \(metadata.textPages)",

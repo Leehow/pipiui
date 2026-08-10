@@ -992,8 +992,8 @@ final class AppStore: ObservableObject {
             }
         }
 
-        // T20: 一次性把 auth.json / UserDefaults / 旧 websearch-config.json 里的
-        // API key 迁到 ~/.pi/agent/.env。幂等；全程后台队列，主线程零 I/O。
+        // T20: 一次性把 auth.json 里的 API key 迁到 ~/.pi/agent/.env。
+        // 幂等；全程后台队列，主线程零 I/O。
         DispatchQueue.global(qos: .utility).async {
             AuthMigration.migrateIfNeeded()
         }

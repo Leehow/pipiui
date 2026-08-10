@@ -122,8 +122,8 @@ final class SubagentContinuityTests: XCTestCase {
     /// waits forever on work that is already over, so the silence itself has to be bounded.
     func testHeartbeatBoundsHowLongTheBossCanHearNothing() throws {
         let s = try source()
-        XCTAssertTrue(s.contains("const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;"))
-        XCTAssertTrue(s.contains("if (runningAgents.size === 0) return;"),
+        XCTAssertTrue(s.contains("const HEARTBEAT_INTERVAL_MS = envPositiveSecs(\"PIPIUI_HEARTBEAT_SECS\", 15 * 60) * 1000;"))
+        XCTAssertTrue(s.contains("if (runningAgents.size === 0) {"),
                       "an idle session must stay silent; a heartbeat costs the boss a turn")
         XCTAssertTrue(s.contains("[subagent-heartbeat] outstanding="))
         XCTAssertTrue(s.contains("stalled=${stalled}"),
@@ -518,8 +518,6 @@ final class SubagentContinuityTests: XCTestCase {
                       "managed web-access path is re-exported inside the webSearch feature gate")
         XCTAssertTrue(assembly.contains(#"env["PIPIUI_ARXIV_EXT"] = p"#),
                       "arXiv package path must reach workers")
-        XCTAssertFalse(assembly.contains("PIPIUI_PDF"),
-                       "the retired custom PDF route must not be exported")
     }
 
     func testBuiltInAgentSpecialistToolMatrixIsExplicit() throws {

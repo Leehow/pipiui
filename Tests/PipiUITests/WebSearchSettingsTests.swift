@@ -51,8 +51,7 @@ final class WebSearchSettingsTests: XCTestCase {
             encoding: .utf8
         )
         XCTAssertTrue(source.contains("WebAccessPackage.ensureInstalled()"))
-        XCTAssertFalse(source.contains("WebSearch" + "Extension.install"))
-        XCTAssertFalse(source.contains("pipiui-websearch.ts\", \\.webSearchExtension"))
+        XCTAssertTrue(source.contains("result.webSearchExtension = WebAccessPackage.ensureInstalled()"))
     }
 
     func testWebSearchGateMountsResolvedPackageEntrypoint() {
@@ -81,16 +80,12 @@ final class WebSearchSettingsTests: XCTestCase {
         XCTAssertNil(disabled.extraEnv["PIPIUI_WEB_ACCESS_EXT"])
     }
 
-    func testLegacyGeneratedWebEnvironmentIsNotExported() throws {
-        let source = try String(
-            contentsOf: repositoryRoot().appendingPathComponent("Sources/PipiUI/PipiSpawnAssembly.swift"),
-            encoding: .utf8
-        )
-        let legacyConfigEnv = "PIPIUI_WEBSEARCH_" + "CONFIG_FILE"
-        let legacyExtensionEnv = "PIPIUI_WEBSEARCH_" + "EXT"
-        let legacyGitHubEnv = "PIPIUI_GITHUB_" + "EXT"
-        XCTAssertFalse(source.contains(legacyConfigEnv))
-        XCTAssertFalse(source.contains(legacyExtensionEnv))
-        XCTAssertFalse(source.contains(legacyGitHubEnv))
+    func testWebAccessEnvironmentIsManaged() {
+        let sanitized = PipiSpawnEnvironmentPolicy.sanitized([
+            "PIPIUI_WEB_ACCESS_EXT": "/stale/web-access.ts",
+            "UNRELATED": "kept",
+        ])
+        XCTAssertNil(sanitized["PIPIUI_WEB_ACCESS_EXT"])
+        XCTAssertEqual(sanitized["UNRELATED"], "kept")
     }
 }
