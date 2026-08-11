@@ -146,24 +146,20 @@ body{overscroll-behavior:none}
 .system-message{margin:12px auto;max-width:900px;padding:10px 14px;border:1px solid var(--border);border-radius:9px;color:var(--muted);background:var(--surface-raised);font:13px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:.01em}
 
 /* ── Overlay scrollbars (Swift OverlayScrollers parity) ──────────────
-   Thin, transparent by default; visible on container hover or while the
-   element is actively scrolling (.pipiui-scrolling is toggled by a global
-   scroll listener in App.tsx).  !important overrides inline styles that
-   virtualised lists (react-virtuoso) may set on their scroll containers.
-   Modal / dialog bodies are excluded so their scrollbars stay visible. */
-*{scrollbar-width:thin;scrollbar-color:transparent transparent}
-*::-webkit-scrollbar{width:7px;height:7px}
+   Thin and subtle by default (always faintly visible so the scrollbar
+   area is hoverable); brighten on hover and while actively scrolling.
+   .pipiui-scrolling is toggled by a global scroll listener in App.tsx
+   so virtualised containers (react-virtuoso) also show the scrollbar
+   during scroll. */
+*::-webkit-scrollbar{width:6px;height:6px}
 *::-webkit-scrollbar-track,
-*::-webkit-scrollbar-corner{background:transparent!important}
-*::-webkit-scrollbar-thumb{background:transparent!important;border-radius:4px;border:none!important}
-/* Show on hover — works for plain overflow:auto containers (sidebar, agent list, etc.) */
-*:hover::-webkit-scrollbar-thumb{background:rgb(130 130 130/.40)!important}
-*:hover::-webkit-scrollbar-thumb:hover{background:rgb(130 130 130/.65)!important}
-*:hover::-webkit-scrollbar-thumb:active{background:rgb(130 130 130/.85)!important}
-/* Show while actively scrolling — covers virtualised containers (Virtuoso)
-   whose scroll events may not align with CSS :hover. */
-.pipiui-scrolling::-webkit-scrollbar-thumb{background:rgb(130 130 130/.50)!important}
-.pipiui-scrolling:hover::-webkit-scrollbar-thumb{background:rgb(130 130 130/.65)!important}
+*::-webkit-scrollbar-corner{background:transparent}
+*::-webkit-scrollbar-thumb{background:rgb(128 128 128/.15);border-radius:3px}
+*::-webkit-scrollbar-thumb:hover{background:rgb(128 128 128/.40)}
+*::-webkit-scrollbar-thumb:active{background:rgb(128 128 128/.60)}
+/* During active scroll: brighter so the scrollbar is clearly visible. */
+.pipiui-scrolling::-webkit-scrollbar-thumb{background:rgb(128 128 128/.45)}
+.pipiui-scrolling::-webkit-scrollbar-thumb:hover{background:rgb(128 128 128/.60)}
 
 /* macOS hiddenInset chrome (VS Code / Notion style): the app owns the
    titlebar band. Detected via UA in App.tsx (Electron only); plain-browser

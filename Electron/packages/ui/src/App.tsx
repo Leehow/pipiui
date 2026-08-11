@@ -1,12 +1,11 @@
 import { forwardRef, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Streamdown, type ControlsConfig } from 'streamdown'
-import { code } from '@streamdown/code'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { SubagentPanel } from './SubagentPanel'
 import { DocumentPanel, mockDocumentContents } from './DocumentPanel'
 import { TerminalPanel } from './TerminalPanel'
 import { BrowserPanel } from './BrowserPanel'
 import { ActivityCard as CollapsibleActivityCard } from './ActivityCard'
+import { AssistantTranscriptContent, type TranscriptTool } from './AssistantTranscriptContent'
 import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, DocumentContent, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, Project, PromptAttachment, Session, SessionLease, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
 import { ComputerUsePanel } from './ComputerUsePanel'
@@ -36,7 +35,6 @@ import { buildRailPrompts } from './prompt-rail'
 import { parseSubagentNotice } from './subagent-notice'
 export { parseSubagentNotice } from './subagent-notice'
 import { compactionNotice } from './compaction-notice'
-import { toolArgsSummary } from './tool-summary'
 import { filterSlashCommands, parseSlashInvocation, slashCommandByName, slashPaletteQuery, type SlashCommandDef } from './slash-commands'
 import { useModelVisibility, type ModelVisibilityController } from './useModelVisibility'
 import { fileToPromptAttachment, imageFilesFromClipboard, validateAttachment } from './attachments'
@@ -44,7 +42,7 @@ import './app.css'
 import './message-actions.css'
 import './subagent.css'
 
-type ToolCard = { id: string; name: string; input: string; result?: string; error?: boolean; startedAt: number; finished?: boolean }
+type ToolCard = TranscriptTool
 export type ChatMessage = { id: string; role: 'user' | 'assistant' | 'tool'; content: string; thinking?: string; tools?: ToolCard[]; streaming?: boolean }
 type PanelTab = 'Subagents' | 'Browser' | 'Document' | 'Terminal'
 type PaneWidths = { sidebar: number; tools: number; sidebarCollapsed: boolean; toolsCollapsed: boolean }
@@ -953,22 +951,26 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
 
   // Overlay-scrollbar scroll tracking (Swift OverlayScrollers parity).
   // Adds .pipiui-scrolling to any element that is actively scrolling so the
-  // CSS overlay scrollbar stays visible during scroll, even when the scroll
-  // container is a virtualised list (react-virtuoso) whose internal element
-  // may not receive CSS :hover reliably.  Uses capture phase because the
-  // native scroll event does not bubble.
+  // CSS overlay scrollbar brightens during scroll.  Uses capture phase on
+  // both document and window because the native scroll event does not bubble
+  // and some containers (e.g. react-virtuoso internals) may target either.
   useEffect(() => {
     const timers = new WeakMap<Element, ReturnType<typeof setTimeout>>()
     const onScroll = (event: Event) => {
       const target = event.target
-      if (!(target instanceof HTMLElement)) return
+      if (!target || target === document || target === window) return
+      if (!(target instanceof Element)) return
       target.classList.add('pipiui-scrolling')
       const prev = timers.get(target)
       if (prev !== undefined) clearTimeout(prev)
       timers.set(target, setTimeout(() => { target.classList.remove('pipiui-scrolling') }, 1200))
     }
     document.addEventListener('scroll', onScroll, { capture: true, passive: true })
-    return () => { document.removeEventListener('scroll', onScroll, true) }
+    window.addEventListener('scroll', onScroll, { capture: true, passive: true })
+    return () => {
+      document.removeEventListener('scroll', onScroll, true)
+      window.removeEventListener('scroll', onScroll, true)
+    }
   }, [])
 
   const sidebarCollapsed = narrowViewport ? !narrowPanes.sidebar : widths.sidebarCollapsed
@@ -1295,29 +1297,7 @@ function ChatHeader({ session, project, lease, host, gitAvailable, sidebarCollap
 type MessageActionHandlers = { onCopy: (message: ChatMessage) => Promise<void>; onResend: (message: ChatMessage) => void; resendDisabled: boolean; copiedId: string | null }
 function Transcript({ messages, transcriptRef, waiting, onCopy, onResend, resendDisabled, copiedId }: { messages: ChatMessage[]; transcriptRef: React.RefObject<VirtuosoHandle>; waiting?: { startedAt: number; phase: WaitingPhase; onStop: () => void } } & MessageActionHandlers) { const [atBottom, setAtBottom] = useState(true); const [seekingId, setSeekingId] = useState<string | null>(null); const prompts = useMemo(() => buildRailPrompts(messages), [messages]); const { activeId: viewportActiveId, containerRef } = useActivePromptId(prompts, atBottom); const activeId = seekingId ?? viewportActiveId; useEffect(() => { if (atBottom) setSeekingId(null) }, [atBottom]); const jump = (index: number, id: string) => { setSeekingId(id); transcriptRef.current?.scrollToIndex({ index, align: 'start', behavior: 'smooth' }) }; const returnLatest = () => { setSeekingId(null); transcriptRef.current?.scrollToIndex({ index: Math.max(0, messages.length - 1), align: 'end', behavior: 'smooth' }); setAtBottom(true) }; return <div className="transcript-area" ref={containerRef}><PromptRail prompts={prompts} activeId={activeId} onJump={jump} /><MessageList ref={transcriptRef} messages={messages} atBottom={atBottom} onAtBottom={setAtBottom} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} />{waiting && <WaitingPlaceholder phase={waiting.phase} startedAt={waiting.startedAt} onStop={waiting.onStop} />}{!atBottom && messages.length > 0 && <button className="return-latest" onClick={returnLatest}>回到最新</button>}</div> }
 const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessage[]; atBottom: boolean; onAtBottom: (value: boolean) => void } & MessageActionHandlers>(function MessageList({ messages, atBottom, onAtBottom, onCopy, onResend, resendDisabled, copiedId }, ref) { return <div className="message-list" data-testid="message-scroll"><Virtuoso ref={ref} data={messages} followOutput={() => atBottom ? 'auto' : false} atBottomStateChange={onAtBottom} alignToBottom itemContent={(_, message) => <MessageView message={message} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copied={copiedId === message.id} />} /></div> }))
-export const MessageView = memo(function MessageView({ message, onCopy, onResend, resendDisabled, copied }: { message: ChatMessage; copied?: boolean } & Omit<MessageActionHandlers, 'copiedId'>) { const copyDisabled = !message.content.trim(); const copy = () => { void onCopy(message).catch(() => undefined) }; if (message.role === 'user') return <article className="message user-message" data-user-prompt={message.id}><div className="user-message-stack"><UserMessageBubble text={message.content} /><MessageActionBar alignment="trailing" canCopy canResend={Boolean(message.content.trim())} copyDisabled={copyDisabled} resendDisabled={resendDisabled} onCopy={copy} onResend={() => onResend(message)} copied={copied} /></div></article>; if (message.role === 'tool') { const notice = parseSubagentNotice(message.content); return notice ? <article className="message assistant-message"><CollapsibleActivityCard kind="result" label="子任务" summary={notice.name} meta={`${notice.ok ? '成功' : '失败'} · ${notice.cost}`}><pre>{message.content}</pre></CollapsibleActivityCard><MessageActionBar alignment="leading" canCopy copyDisabled={copyDisabled} onCopy={copy} copied={copied} /></article> : <article className="system-message tool-message"><div>{message.content}</div><MessageActionBar alignment="leading" canCopy copyDisabled={copyDisabled} onCopy={copy} copied={copied} /></article> } return <article className="message assistant-message"><ActivityCard message={message} />{message.content && <Markdown content={message.content} streaming={message.streaming} />}<MessageActionBar alignment="leading" canCopy copyDisabled={copyDisabled} onCopy={copy} copied={copied} /></article> })
-function ActivityCard({ message }: { message: ChatMessage }) { const steps = (message.thinking ? 1 : 0) + (message.tools?.length ?? 0); if (!steps) return null; return <CollapsibleActivityCard key={message.streaming ? 'live' : 'done'} summary={toolRunSummary(steps, message.thinking ? 'Thinking' : null, message.tools ?? [])} running={Boolean(message.streaming)} defaultExpanded={Boolean(message.streaming)}>{message.thinking && <CollapsibleActivityCard key={message.streaming ? 'live' : 'done'} kind="thinking" label="Thinking" summary="Thinking" running={Boolean(message.streaming)} defaultExpanded={Boolean(message.streaming)}><p>{message.thinking}</p></CollapsibleActivityCard>}{message.tools?.map(tool => <ToolCallCard key={tool.id} tool={tool} />)}</CollapsibleActivityCard> }
-/** Folded card title for a tool/thinking turn. A multi-tool burst (consecutive
- * tool-only assistant turns coalesce into one card) collapses to the most
- * frequent tool label with its count — "7 个步骤 · bash ×6" (Swift "7 steps ·
- * bash" parity) — instead of repeating the label once per tool call. */
-function toolRunSummary(steps: number, thinking: string | null, tools: { name: string }[]): string {
-  const labels = [thinking, ...tools.map(tool => tool.name)].filter((label): label is string => Boolean(label))
-  if (labels.length <= 1) return `${steps} 个步骤${labels.length ? ` · ${labels[0]}` : ''}`
-  const counts = new Map<string, number>()
-  for (const tool of tools) counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1)
-  let primary = tools[0].name
-  let primaryCount = 1
-  for (const [name, count] of counts) if (count > primaryCount) { primary = name; primaryCount = count }
-  const label = primaryCount > 1 ? `${primary} ×${primaryCount}` : primary
-  return `${steps} 个步骤 · ${[thinking, label].filter((part): part is string => Boolean(part)).join(' · ')}`
-}
-
-const staticMarkdownPlugins = { code }
-// Trim Streamdown's scattered controls: keep only the code-block copy button (hover-revealed via CSS).
-const streamdownControls: ControlsConfig = { table: { copy: false, download: false, fullscreen: false }, code: { copy: true, download: false }, mermaid: false }
-const Markdown = memo(function Markdown({ content, streaming }: { content: string; streaming?: boolean }) { return <div className="markdown"><Streamdown mode={streaming ? 'streaming' : 'static'} isAnimating={streaming} plugins={streaming ? undefined : staticMarkdownPlugins} shikiTheme={['github-light', 'github-dark']} controls={streamdownControls}>{content}</Streamdown></div> })
-const ToolCallCard = memo(function ToolCallCard({ tool }: { tool: ToolCard }) { const argsSummary = toolArgsSummary(tool.name, tool.input); const subagentNotice = tool.name === 'subagent' && tool.finished && tool.result ? parseSubagentNotice(tool.result) : null; const summary = subagentNotice ? `子任务 · ${subagentNotice.name}` : tool.name === 'subagent' ? `子任务${argsSummary !== '…' ? ` · ${argsSummary}` : ''}` : `${tool.name}${argsSummary !== '…' ? ` · ${argsSummary}` : ''}`; const meta = subagentNotice ? `${subagentNotice.ok ? '成功' : '失败'} · ${subagentNotice.cost} · ${elapsed(tool.startedAt)}` : tool.finished ? `完成 · ${elapsed(tool.startedAt)}` : `运行中 · ${elapsed(tool.startedAt)}`; return <CollapsibleActivityCard key={tool.finished ? 'done' : 'live'} kind="tool" summary={summary} meta={meta} error={Boolean(tool.error)} defaultExpanded={!tool.finished}>{tool.input && <pre>{tool.input}</pre>}{tool.result && <div className="tool-result">{tool.result}</div>}</CollapsibleActivityCard> })
+export const MessageView = memo(function MessageView({ message, onCopy, onResend, resendDisabled, copied }: { message: ChatMessage; copied?: boolean } & Omit<MessageActionHandlers, 'copiedId'>) { const copyDisabled = !message.content.trim(); const copy = () => { void onCopy(message).catch(() => undefined) }; if (message.role === 'user') return <article className="message user-message" data-user-prompt={message.id}><div className="user-message-stack"><UserMessageBubble text={message.content} /><MessageActionBar alignment="trailing" canCopy canResend={Boolean(message.content.trim())} copyDisabled={copyDisabled} resendDisabled={resendDisabled} onCopy={copy} onResend={() => onResend(message)} copied={copied} /></div></article>; if (message.role === 'tool') { const notice = parseSubagentNotice(message.content); return notice ? <article className="message assistant-message"><CollapsibleActivityCard kind="result" label="子任务" summary={notice.name} meta={`${notice.ok ? '成功' : '失败'} · ${notice.cost}`}><pre>{message.content}</pre></CollapsibleActivityCard><MessageActionBar alignment="leading" canCopy copyDisabled={copyDisabled} onCopy={copy} copied={copied} /></article> : <article className="system-message tool-message"><div>{message.content}</div><MessageActionBar alignment="leading" canCopy copyDisabled={copyDisabled} onCopy={copy} copied={copied} /></article> } return <article className="message assistant-message"><AssistantTranscriptContent message={message} /><MessageActionBar alignment="leading" canCopy copyDisabled={copyDisabled} onCopy={copy} copied={copied} /></article> })
 const MIN_COMPOSER_HEIGHT = 29
 const MAX_COMPOSER_HEIGHT = 150
 /** jsdom has no layout engine (scrollHeight is 0), so fall back to a line-based estimate there. */
