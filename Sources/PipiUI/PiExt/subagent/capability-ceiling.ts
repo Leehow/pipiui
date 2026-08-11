@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { types as nodeTypes } from "node:util";
 
 export const SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES = 32_768;
 
@@ -7,6 +8,10 @@ const MAX_AUTHORITY_ENTRY_BYTES = 128;
 const MAX_PROVENANCE_ENTRIES = 8;
 const MAX_PROVENANCE_ENTRY_BYTES = 128;
 const TRANSPORT_PREFIX = "scv1.";
+const WORST_CASE_PROVENANCE = Object.freeze(Array.from(
+  { length: MAX_PROVENANCE_ENTRIES },
+  (_, index) => `${"\\".repeat(MAX_PROVENANCE_ENTRY_BYTES - 1)}${index}`,
+));
 const KEYS = new Set([
   "version",
   "allowedTools",
@@ -30,8 +35,13 @@ function fail(message: string): never {
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
+  if (nodeTypes.isProxy(value)) return false;
+  try {
+    const prototype = Reflect.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
+    return false;
+  }
 }
 
 function normalizeStringSet(
@@ -52,7 +62,7 @@ function normalizeStringSet(
     if (Buffer.byteLength(entry, "utf8") > maxEntryBytes) {
       fail(`${field}[${index}] exceeds ${maxEntryBytes} UTF-8 bytes`);
     }
-    if (rejectControlCharacters && /[\u0000-\u001f\u007f]/u.test(entry)) {
+    if (rejectControlCharacters && /\p{Cc}/u.test(entry)) {
       fail(`${field}[${index}] contains a control character`);
     }
     return entry;
@@ -79,28 +89,80 @@ function freezeCeiling(value: {
   return Object.freeze(result);
 }
 
+function canonicalJSON(value: SubagentCapabilityCeilingV1): string {
+  const transport: Record<string, unknown> = { version: 1 };
+  if (value.allowedTools !== undefined) transport.allowedTools = value.allowedTools;
+  if (value.allowedAgents !== undefined) transport.allowedAgents = value.allowedAgents;
+  transport.denyExtensions = value.denyExtensions;
+  if (value.provenance !== undefined) transport.provenance = value.provenance;
+  return JSON.stringify(transport);
+}
+
+function encodedTransport(value: SubagentCapabilityCeilingV1): string {
+  return `${TRANSPORT_PREFIX}${Buffer.from(canonicalJSON(value), "utf8").toString("base64url")}`;
+}
+
+function ensureTransportClosure(value: SubagentCapabilityCeilingV1): void {
+  const withReservedProvenance = freezeCeiling({
+    allowedTools: value.allowedTools,
+    allowedAgents: value.allowedAgents,
+    denyExtensions: value.denyExtensions,
+    provenance: WORST_CASE_PROVENANCE,
+  });
+  if (Buffer.byteLength(encodedTransport(withReservedProvenance), "utf8")
+    > SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES) {
+    fail(`authority cannot fit the ${SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES}-byte transport with bounded provenance`);
+  }
+  if (Buffer.byteLength(encodedTransport(value), "utf8")
+    > SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES) {
+    fail(`encoded payload exceeds ${SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES} bytes`);
+  }
+}
+
 export function parseSubagentCapabilityCeilingV1(
   value: unknown,
 ): SubagentCapabilityCeilingV1 {
   if (!isPlainRecord(value)) fail("expected an object");
-  for (const key of Object.keys(value)) {
-    if (!KEYS.has(key)) fail(`unknown key ${JSON.stringify(key)}`);
+  const data: Record<string, unknown> = Object.create(null);
+  let ownKeys: readonly PropertyKey[];
+  try {
+    ownKeys = Reflect.ownKeys(value);
+  } catch {
+    fail("cannot inspect object keys");
   }
-  if (value.version !== 1) fail("version must be 1");
-  if (typeof value.denyExtensions !== "boolean") fail("denyExtensions must be a boolean");
+  for (const key of ownKeys) {
+    if (typeof key !== "string") fail("symbol keys are not allowed");
+    if (!KEYS.has(key)) fail(`unknown key ${JSON.stringify(key)}`);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    } catch {
+      fail(`cannot inspect property ${JSON.stringify(key)}`);
+    }
+    if (descriptor === undefined
+      || descriptor.enumerable !== true
+      || !("value" in descriptor)) {
+      fail(`${JSON.stringify(key)} must be an enumerable data property`);
+    }
+    data[key] = descriptor.value;
+  }
+  if (data.version !== 1) fail("version must be 1");
+  if (typeof data.denyExtensions !== "boolean") fail("denyExtensions must be a boolean");
 
-  return freezeCeiling({
-    allowedTools: value.allowedTools === undefined
+  const normalized = freezeCeiling({
+    allowedTools: data.allowedTools === undefined
       ? undefined
-      : normalizeStringSet(value.allowedTools, "allowedTools", MAX_AUTHORITY_ENTRIES, MAX_AUTHORITY_ENTRY_BYTES, true),
-    allowedAgents: value.allowedAgents === undefined
+      : normalizeStringSet(data.allowedTools, "allowedTools", MAX_AUTHORITY_ENTRIES, MAX_AUTHORITY_ENTRY_BYTES, true),
+    allowedAgents: data.allowedAgents === undefined
       ? undefined
-      : normalizeStringSet(value.allowedAgents, "allowedAgents", MAX_AUTHORITY_ENTRIES, MAX_AUTHORITY_ENTRY_BYTES, true),
-    denyExtensions: value.denyExtensions,
-    provenance: value.provenance === undefined
+      : normalizeStringSet(data.allowedAgents, "allowedAgents", MAX_AUTHORITY_ENTRIES, MAX_AUTHORITY_ENTRY_BYTES, true),
+    denyExtensions: data.denyExtensions,
+    provenance: data.provenance === undefined
       ? undefined
-      : normalizeStringSet(value.provenance, "provenance", MAX_PROVENANCE_ENTRIES, MAX_PROVENANCE_ENTRY_BYTES, true),
+      : normalizeStringSet(data.provenance, "provenance", MAX_PROVENANCE_ENTRIES, MAX_PROVENANCE_ENTRY_BYTES, true),
   });
+  ensureTransportClosure(normalized);
+  return normalized;
 }
 
 function intersectOptionalSets(
@@ -166,22 +228,9 @@ export function equivalentSubagentCapabilityAuthorityV1(
     && isSubagentCapabilityAuthorityAtMostV1(right, left);
 }
 
-function canonicalJSON(value: SubagentCapabilityCeilingV1): string {
-  const transport: Record<string, unknown> = { version: 1 };
-  if (value.allowedTools !== undefined) transport.allowedTools = value.allowedTools;
-  if (value.allowedAgents !== undefined) transport.allowedAgents = value.allowedAgents;
-  transport.denyExtensions = value.denyExtensions;
-  if (value.provenance !== undefined) transport.provenance = value.provenance;
-  return JSON.stringify(transport);
-}
-
 export function encodeSubagentCapabilityCeilingV1(value: unknown): string {
   const normalized = parseSubagentCapabilityCeilingV1(value);
-  const encoded = `${TRANSPORT_PREFIX}${Buffer.from(canonicalJSON(normalized), "utf8").toString("base64url")}`;
-  if (Buffer.byteLength(encoded, "utf8") > SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES) {
-    fail(`encoded payload exceeds ${SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES} bytes`);
-  }
-  return encoded;
+  return encodedTransport(normalized);
 }
 
 export function decodeSubagentCapabilityCeilingV1(encoded: unknown): SubagentCapabilityCeilingV1 {

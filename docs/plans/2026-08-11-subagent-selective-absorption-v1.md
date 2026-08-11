@@ -100,11 +100,15 @@ runtime and a pinned adapter. Do not layer two schedulers together.
 
 ## Capability-ceiling rules
 
-Parsing fails closed. Objects must have exactly known keys, version 1, correct
-types, bounded arrays and entries, no blank values, surrounding whitespace, or
-control characters. Tool and agent sets are sorted and deduplicated. Authority
-entries are limited to 256 items and 128 UTF-8 bytes per item. Provenance is
-limited to 8 items and 128 UTF-8 bytes per item.
+Parsing fails closed. Inputs must be ordinary or null-prototype records made
+only of enumerable own data properties. Proxies, symbol keys, non-enumerable
+keys, accessors, unknown keys, exotic prototypes, and inspection failures are
+rejected before any property value is read; getters are never executed.
+Objects must then have version 1, correct types, bounded arrays and entries, no
+blank values, surrounding whitespace, or Unicode `Cc` control characters.
+Tool and agent sets are sorted and deduplicated. Authority entries are limited
+to 256 items and 128 UTF-8 bytes per item. Provenance is limited to 8 items and
+128 UTF-8 bytes per item.
 
 Intersection is the only composition operation:
 
@@ -121,6 +125,14 @@ prefixes, malformed or non-canonical base64url, invalid JSON, unknown fields,
 non-normalized data, incompatible versions, and oversized payloads. The module
 has no filesystem, process-environment, network, scheduler, or mutable global
 dependency.
+
+The successfully parsed V1 domain is closed under canonical encoding: every
+value returned by `parseSubagentCapabilityCeilingV1` can be encoded. Parsing
+reserves transport capacity for the maximum bounded provenance before accepting
+an authority payload, so intersecting two accepted ceilings also remains
+encodable even when their provenance labels combine. The encoder does not call
+itself from parsing; parsing checks the internal canonical representation
+directly.
 
 ## Security and trust rules
 
@@ -198,6 +210,9 @@ and machine-readable lifecycle artifacts as separate specs. Do not add
 | Bounded/unbounded semantics | Focused Node test | Legacy-to-enforced transition cases |
 | Provenance bounded and non-authoritative | Focused Node test | Safe diagnostics inspection |
 | Malformed/version/type/size input fails closed | Focused Node test | Launch refusal and UI recovery reason |
+| Symbols/hidden keys/accessors/proxies fail without getter/trap execution | Focused Node test | In-process descriptor rejection |
+| Every parsed/intersected value is encodable within the transport cap | Boundary and exhaustive tests | Nested/resume descriptor propagation |
+| All Unicode `Cc` controls and UTF-8 byte overflows are rejected | Focused Node test | Safe diagnostics inspection |
 | Deterministic transport round trip | Focused Node test | Parent/child descriptor acknowledgment |
 | PipiUI identity/projection unchanged | Not touched | Same `agentId`/`runId`, cards, logs, restart state |
 | Memory/TCC/worktree semantics preserved | Not touched | Real broker, desktop gate, merge/recovery acceptance |
