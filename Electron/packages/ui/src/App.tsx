@@ -17,6 +17,10 @@ import { GitBranchMenu } from './GitBranchMenu'
 import { ProviderLogo } from './ProviderLogo'
 import { Sidebar, type ProjectMenuAction, type ProjectMenuUnavailable, type SidebarProject, type SidebarSession, type SessionStatus } from './Sidebar'
 import { SlashMenu } from './SlashMenu'
+import personGroupIcon from './sf-icons/person-2.png'
+import globeIcon from './sf-icons/globe.png'
+import docTextIcon from './sf-icons/doc-text.png'
+import terminalIcon from './sf-icons/terminal.png'
 import { ThinkingChip } from './thinking-chip'
 import { WaitingPlaceholder, type WaitingPhase } from './WaitingPlaceholder'
 import { StreamEventCoalescer } from './StreamEventCoalescer'
@@ -64,7 +68,15 @@ export function leaseOwnerLabel(lease: SessionLease | null): string {
 }
 
 const tabs: PanelTab[] = ['Subagents', 'Browser', 'Document', 'Terminal']
-const toolGlyph = (tab: PanelTab) => ({ Subagents: '♙', Browser: '◉', Document: '▤', Terminal: '›_' }[tab])
+/** SF Symbols parity tool-rail glyphs (Swift panelQuickRail: person.2/globe/doc.text/terminal).
+ *  Rendered from system-exported SF Symbols bitmaps via CSS mask, so the icon shape matches
+ *  Swift's `systemName` glyphs exactly and the color follows `currentColor` (accent when active). */
+const toolRailIcons: Record<PanelTab, { src: string; ratio: number }> = {
+  Subagents: { src: personGroupIcon, ratio: 70 / 49 },
+  Browser: { src: globeIcon, ratio: 46 / 46 },
+  Document: { src: docTextIcon, ratio: 44 / 49 },
+  Terminal: { src: terminalIcon, ratio: 57 / 43 },
+}
 const defaultWidths: PaneWidths = { sidebar: 258, tools: 368, sidebarCollapsed: false, toolsCollapsed: false }
 const storageKey = 'pipiui:eui-pane-widths'
 const sidebarPreferencePrefix = 'pipiui:eui:sidebar:v1'
@@ -743,6 +755,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [computerUseOpen, setComputerUseOpen] = useState(false)
   const [remoteOpen, setRemoteOpen] = useState(false)
   const [subagentModelsOpen, setSubagentModelsOpen] = useState(false)
+  const browserOccluded = modalOpen || computerUseOpen || remoteOpen || subagentModelsOpen
   const modalVisibility = useModelVisibility(host, modelState?.model)
   const transcriptRef = useRef<VirtuosoHandle>(null)
   const copiedTimerRef = useRef<number | null>(null)
@@ -937,6 +950,27 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   useEffect(() => { localStorage.setItem(storageKey, JSON.stringify(widths)) }, [widths])
   // Auto-collapse is the narrow-width default on every entry (Swift sidebarCollapseWidth).
   useEffect(() => { if (narrowViewport) setNarrowPanes({ sidebar: false, tools: false }) }, [narrowViewport])
+
+  // Overlay-scrollbar scroll tracking (Swift OverlayScrollers parity).
+  // Adds .pipiui-scrolling to any element that is actively scrolling so the
+  // CSS overlay scrollbar stays visible during scroll, even when the scroll
+  // container is a virtualised list (react-virtuoso) whose internal element
+  // may not receive CSS :hover reliably.  Uses capture phase because the
+  // native scroll event does not bubble.
+  useEffect(() => {
+    const timers = new WeakMap<Element, ReturnType<typeof setTimeout>>()
+    const onScroll = (event: Event) => {
+      const target = event.target
+      if (!(target instanceof HTMLElement)) return
+      target.classList.add('pipiui-scrolling')
+      const prev = timers.get(target)
+      if (prev !== undefined) clearTimeout(prev)
+      timers.set(target, setTimeout(() => { target.classList.remove('pipiui-scrolling') }, 1200))
+    }
+    document.addEventListener('scroll', onScroll, { capture: true, passive: true })
+    return () => { document.removeEventListener('scroll', onScroll, true) }
+  }, [])
+
   const sidebarCollapsed = narrowViewport ? !narrowPanes.sidebar : widths.sidebarCollapsed
   const toolsCollapsed = narrowViewport ? !narrowPanes.tools : widths.toolsCollapsed
   useEffect(() => () => { if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current) }, [])
@@ -1186,7 +1220,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       </div>
     </section>
     <ResizeHandle label="调整工具栏宽度" onPointerDown={resize('tools', widths.tools)} />
-    <ToolPanel activeTab={activeTab} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningChange={setSubagentsRunning} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={projects.find(project => project.id === selectedProject)?.path} />
+    <ToolPanel activeTab={activeTab} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningChange={setSubagentsRunning} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={projects.find(project => project.id === selectedProject)?.path} />
     {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} current={modelState?.model ?? null} onModelState={setModelState} onClose={() => setModalOpen(false)} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} />}
@@ -1464,25 +1498,27 @@ function ToolQuickRail({ activeTab, toolsCollapsed, onSelect, host, browserAvail
       const unavailableTitle = browserUnavailable ? '当前连接不支持内置浏览器' : '当前连接不支持终端'
       const active = activeTab === tab && !toolsCollapsed
       return <button key={tab} className={`tool-rail-button${active ? ' active' : ''}`} aria-label={tab} aria-current={active ? 'page' : undefined} aria-disabled={unavailable || undefined} disabled={unavailable} title={unavailable ? unavailableTitle : tab} onClick={() => onSelect(tab)}>
-        <span className="tool-rail-icon" aria-hidden="true">{toolGlyph(tab)}</span>
+        <span className="tool-rail-icon" aria-hidden="true" style={{ width: 13 * toolRailIcons[tab].ratio, WebkitMaskImage: `url(${toolRailIcons[tab].src})`, maskImage: `url(${toolRailIcons[tab].src})` }} />
         {tab === 'Subagents' && subagentsRunning && <span className="tool-rail-running" aria-label="有运行中的 subagent" />}
       </button>
     })}
   </nav>
 }
-function ToolPanel({ activeTab, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningChange, browserAvailable, terminalAvailable, retainedWorktreeDispositionAvailable, projectId, projectPath }: { activeTab: PanelTab; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningChange: (running: boolean) => void; browserAvailable: boolean | undefined; terminalAvailable: boolean | undefined; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string }) {
+function ToolPanel({ activeTab, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningChange, browserAvailable, browserOccluded, terminalAvailable, retainedWorktreeDispositionAvailable, projectId, projectPath }: { activeTab: PanelTab; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningChange: (running: boolean) => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string }) {
   const [terminalMounted, setTerminalMounted] = useState(activeTab === 'Terminal')
   const [documentMounted, setDocumentMounted] = useState(activeTab === 'Document')
+  const [browserMounted, setBrowserMounted] = useState(activeTab === 'Browser')
   useEffect(() => {
     if (activeTab === 'Terminal') setTerminalMounted(true)
     if (activeTab === 'Document') setDocumentMounted(true)
+    if (activeTab === 'Browser') setBrowserMounted(true)
   }, [activeTab])
   return <aside className="tool-panel">
     <div className="tool-content">
       <div className="tool-page subagent-content" hidden={activeTab !== 'Subagents'}><SubagentPanel host={host} sessionId={sessionId} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onRunningChange={onSubagentsRunningChange} /></div>
       {activeTab === 'Terminal' && terminalAvailable === false ? <div className="tool-page"><div className="empty-panel" data-testid="terminal-unavailable"><b>Terminal 不可用</b><p>当前连接未提供终端能力。</p></div></div> : terminalMounted || activeTab === 'Terminal' ? <div className="tool-page terminal-content" hidden={activeTab !== 'Terminal'}><TerminalPanel host={host} theme={theme} sessionId={sessionId} announcedTerminal={announcedTerminal} revealedTerminalId={revealedTerminalId} projectId={projectId} projectPath={projectPath} visible={activeTab === 'Terminal'} /></div> : null}
       {documentMounted || activeTab === 'Document' ? <div className="tool-page document-content" hidden={activeTab !== 'Document'}><DocumentPanel host={host} projectId={projectId} /></div> : null}
-      {activeTab === 'Browser' && <div className="tool-page browser-content">{browserAvailable === true && host.browser ? <BrowserPanel host={host} sessionId={sessionId} /> : <div className="empty-panel browser-placeholder" data-testid="browser-unavailable"><b>Browser 不可用</b><p>{browserAvailable === undefined ? '正在检查当前连接的浏览器能力…' : '当前连接未提供桌面浏览器能力。'}</p></div>}</div>}
+      {browserMounted || activeTab === 'Browser' ? <div className="tool-page browser-content" hidden={activeTab !== 'Browser'}>{browserAvailable === true && host.browser ? <BrowserPanel host={host} sessionId={sessionId} occluded={browserOccluded || activeTab !== 'Browser'} /> : <div className="empty-panel browser-placeholder" data-testid="browser-unavailable"><b>Browser 不可用</b><p>{browserAvailable === undefined ? '正在检查当前连接的浏览器能力…' : '当前连接未提供桌面浏览器能力。'}</p></div>}</div> : null}
     </div>
   </aside>
 }
