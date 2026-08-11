@@ -8,10 +8,14 @@ const MAX_AUTHORITY_ENTRY_BYTES = 128;
 const MAX_PROVENANCE_ENTRIES = 8;
 const MAX_PROVENANCE_ENTRY_BYTES = 128;
 const TRANSPORT_PREFIX = "scv1.";
-const WORST_CASE_PROVENANCE = Object.freeze(Array.from(
-  { length: MAX_PROVENANCE_ENTRIES },
-  (_, index) => `${"\\".repeat(MAX_PROVENANCE_ENTRY_BYTES - 1)}${index}`,
-));
+const MAX_JSON_BYTES_PER_PROVENANCE_ENTRY = (2 * MAX_PROVENANCE_ENTRY_BYTES) + 2;
+const MAX_PROVENANCE_JSON_ADDITION_BYTES = 1 // comma before the property
+  + Buffer.byteLength(JSON.stringify("provenance"), "utf8")
+  + 1 // colon
+  + 1 // opening array bracket
+  + (MAX_PROVENANCE_ENTRIES * MAX_JSON_BYTES_PER_PROVENANCE_ENTRY)
+  + (MAX_PROVENANCE_ENTRIES - 1) // array commas
+  + 1; // closing array bracket
 const KEYS = new Set([
   "version",
   "allowedTools",
@@ -51,10 +55,58 @@ function normalizeStringSet(
   maxEntryBytes: number,
   rejectControlCharacters: boolean,
 ): readonly string[] {
-  if (!Array.isArray(value)) fail(`${field} must be an array`);
-  if (value.length > maxEntries) fail(`${field} exceeds ${maxEntries} entries`);
+  if (typeof value !== "object" || value === null || nodeTypes.isProxy(value)) {
+    fail(`${field} must be an ordinary array`);
+  }
+  if (!Array.isArray(value)) fail(`${field} must be an ordinary array`);
+  let prototype: object | null;
+  let keys: readonly PropertyKey[];
+  try {
+    prototype = Reflect.getPrototypeOf(value);
+    keys = Reflect.ownKeys(value);
+  } catch {
+    fail(`${field} cannot be inspected`);
+  }
+  if (prototype !== Array.prototype) fail(`${field} must use Array.prototype`);
 
-  const normalized = value.map((entry, index) => {
+  const descriptors = new Map<string, PropertyDescriptor>();
+  for (const key of keys) {
+    if (typeof key !== "string") fail(`${field} must not contain symbol keys`);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    } catch {
+      fail(`${field}.${key} cannot be inspected`);
+    }
+    if (descriptor === undefined || !("value" in descriptor)) {
+      fail(`${field}.${key} must be a data property`);
+    }
+    descriptors.set(key, descriptor);
+  }
+
+  const lengthDescriptor = descriptors.get("length");
+  const length = lengthDescriptor?.value;
+  if (lengthDescriptor === undefined
+    || lengthDescriptor.enumerable !== false
+    || lengthDescriptor.configurable !== false
+    || typeof length !== "number"
+    || !Number.isSafeInteger(length)
+    || length < 0) {
+    fail(`${field}.length must be the canonical array length property`);
+  }
+  if (length > maxEntries) fail(`${field} exceeds ${maxEntries} entries`);
+  if (descriptors.size !== length + 1) fail(`${field} must be dense and contain no extra keys`);
+
+  const entries: string[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors.get(String(index));
+    if (descriptor === undefined || descriptor.enumerable !== true) {
+      fail(`${field} must contain dense enumerable index data properties`);
+    }
+    entries.push(descriptor.value as string);
+  }
+
+  const normalized = entries.map((entry, index) => {
     if (typeof entry !== "string") fail(`${field}[${index}] must be a string`);
     if (entry.length === 0 || entry.trim().length === 0 || entry !== entry.trim()) {
       fail(`${field}[${index}] must be non-blank and have no surrounding whitespace`);
@@ -102,20 +154,24 @@ function encodedTransport(value: SubagentCapabilityCeilingV1): string {
   return `${TRANSPORT_PREFIX}${Buffer.from(canonicalJSON(value), "utf8").toString("base64url")}`;
 }
 
+function base64urlUnpaddedLength(byteLength: number): number {
+  const completeTriples = Math.floor(byteLength / 3);
+  const remainder = byteLength % 3;
+  return (completeTriples * 4) + (remainder === 0 ? 0 : remainder + 1);
+}
+
 function ensureTransportClosure(value: SubagentCapabilityCeilingV1): void {
-  const withReservedProvenance = freezeCeiling({
+  const authorityOnly = freezeCeiling({
     allowedTools: value.allowedTools,
     allowedAgents: value.allowedAgents,
     denyExtensions: value.denyExtensions,
-    provenance: WORST_CASE_PROVENANCE,
   });
-  if (Buffer.byteLength(encodedTransport(withReservedProvenance), "utf8")
-    > SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES) {
+  const authorityJSONBytes = Buffer.byteLength(canonicalJSON(authorityOnly), "utf8");
+  const maximumJSONBytes = authorityJSONBytes + MAX_PROVENANCE_JSON_ADDITION_BYTES;
+  const maximumEncodedBytes = Buffer.byteLength(TRANSPORT_PREFIX, "utf8")
+    + base64urlUnpaddedLength(maximumJSONBytes);
+  if (maximumEncodedBytes > SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES) {
     fail(`authority cannot fit the ${SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES}-byte transport with bounded provenance`);
-  }
-  if (Buffer.byteLength(encodedTransport(value), "utf8")
-    > SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES) {
-    fail(`encoded payload exceeds ${SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES} bytes`);
   }
 }
 

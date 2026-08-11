@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 
 import {
   decodeSubagentCapabilityCeilingV1,
@@ -160,6 +161,60 @@ test("strict parsing inspects descriptors without executing accessors", () => {
   });
 });
 
+test("nested authority arrays are descriptor-validated without traps or getters", () => {
+  for (const field of ["allowedTools", "allowedAgents", "provenance"]) {
+    let trapCalls = 0;
+    const proxied = new Proxy(["read"], {
+      get() {
+        trapCalls += 1;
+        return "unexpected";
+      },
+      getPrototypeOf() {
+        trapCalls += 1;
+        return Array.prototype;
+      },
+      ownKeys() {
+        trapCalls += 1;
+        return ["0", "length"];
+      },
+    });
+    assert.throws(() => parse({ version: 1, [field]: proxied, denyExtensions: false }), /ordinary array/i);
+    assert.equal(trapCalls, 0);
+
+    const revoked = Proxy.revocable(["read"], {});
+    revoked.revoke();
+    assert.throws(() => parse({ version: 1, [field]: revoked.proxy, denyExtensions: false }), /ordinary array/i);
+
+    let getterCalls = 0;
+    const accessor = ["placeholder"];
+    Object.defineProperty(accessor, "0", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        getterCalls += 1;
+        return "read";
+      },
+    });
+    assert.throws(() => parse({ version: 1, [field]: accessor, denyExtensions: false }), /data property/i);
+    assert.equal(getterCalls, 0);
+
+    const hole = Array(1);
+    assert.throws(() => parse({ version: 1, [field]: hole, denyExtensions: false }), /dense/i);
+
+    const symbolExtra = ["read"];
+    symbolExtra[Symbol("extra")] = true;
+    assert.throws(() => parse({ version: 1, [field]: symbolExtra, denyExtensions: false }), /symbol/i);
+
+    const namedExtra = ["read"];
+    Object.defineProperty(namedExtra, "extra", { enumerable: false, value: true });
+    assert.throws(() => parse({ version: 1, [field]: namedExtra, denyExtensions: false }), /extra keys/i);
+
+    class ExoticArray extends Array {}
+    assert.throws(() => parse({ version: 1, [field]: new ExoticArray("read"), denyExtensions: false }), /Array\.prototype/i);
+    assert.doesNotThrow(() => parse({ version: 1, [field]: Object.freeze(["read"]), denyExtensions: false }));
+  }
+});
+
 test("entry and collection bounds use UTF-8 bytes and reject all Unicode controls", () => {
   const entries = (count) => Array.from({ length: count }, (_, index) => `tool-${index}`);
   assert.equal(parse({ version: 1, allowedTools: entries(255), denyExtensions: false }).allowedTools.length, 255);
@@ -209,6 +264,59 @@ test("every accepted value is canonically encodable, including simultaneous maxi
     allowedAgents: transportOverflow,
     denyExtensions: false,
   }), /transport/i);
+});
+
+test("transport reserve is exact at cap boundaries and closes 4+4 provenance intersection", () => {
+  const prefixBytes = Buffer.byteLength("scv1.", "utf8");
+  const provenanceAdditionBytes = 1 + 12 + 1 + 1 + (8 * 258) + 7 + 1;
+  const base64urlLength = (bytes) => (4 * Math.floor(bytes / 3)) + (bytes % 3 === 0 ? 0 : (bytes % 3) + 1);
+  const authorityJSONBytesForTransport = (transportBytes) => {
+    const bodyLength = transportBytes - prefixBytes;
+    for (let bytes = 0; bytes <= SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES; bytes += 1) {
+      if (base64urlLength(bytes) === bodyLength) return bytes - provenanceAdditionBytes;
+    }
+    assert.fail(`no JSON length maps to transport size ${transportBytes}`);
+  };
+  const authorityWithJSONBytes = (targetBytes) => {
+    const empty = { version: 1, allowedTools: [], denyExtensions: false };
+    const emptyBytes = Buffer.byteLength(JSON.stringify(empty), "utf8");
+    for (let fullCount = 0; fullCount <= 256; fullCount += 1) {
+      const fullContribution = fullCount === 0 ? 0 : (fullCount * 255) + (fullCount - 1);
+      const remaining = targetBytes - emptyBytes - fullContribution;
+      if (remaining === 0) {
+        return { ...empty, allowedTools: Array.from({ length: fullCount }, (_, index) => `${index.toString().padStart(3, "0")}${"\\".repeat(125)}`) };
+      }
+      const separatorAndQuotes = (fullCount === 0 ? 0 : 1) + 2;
+      const payloadJSONBytes = remaining - separatorAndQuotes;
+      for (let escaped = 0; escaped <= 128; escaped += 1) {
+        const plain = payloadJSONBytes - (2 * escaped);
+        if (plain < 0 || escaped + plain > 128) continue;
+        const allowedTools = Array.from({ length: fullCount }, (_, index) => `${index.toString().padStart(3, "0")}${"\\".repeat(125)}`);
+        allowedTools.push(`${"\\".repeat(escaped)}${"x".repeat(plain)}`);
+        const candidate = { ...empty, allowedTools };
+        if (Buffer.byteLength(JSON.stringify(candidate), "utf8") === targetBytes) return candidate;
+      }
+    }
+    assert.fail(`could not construct authority JSON with ${targetBytes} bytes`);
+  };
+
+  const below = authorityWithJSONBytes(authorityJSONBytesForTransport(SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES - 1));
+  const at = authorityWithJSONBytes(authorityJSONBytesForTransport(SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES));
+  const above = authorityWithJSONBytes(authorityJSONBytesForTransport(SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES + 1));
+  assert.doesNotThrow(() => parse(below));
+  const atCeiling = parse(at);
+  assert.throws(() => parse(above), /transport/i);
+
+  const worstProvenance = Array.from({ length: 8 }, (_, index) => {
+    const suffix = index.toString(2).padStart(3, "0").replaceAll("0", "\\").replaceAll("1", "\"");
+    return `${"\\".repeat(125)}${suffix}`;
+  });
+  const left = parse({ ...atCeiling, provenance: worstProvenance.slice(0, 4) });
+  const right = parse({ ...atCeiling, provenance: worstProvenance.slice(4) });
+  const combined = intersect(left, right);
+  const encoded = encodeSubagentCapabilityCeilingV1(combined);
+  assert.equal(Buffer.byteLength(encoded, "utf8"), SUBAGENT_CAPABILITY_CEILING_V1_MAX_ENCODED_BYTES);
+  assert.deepEqual(decodeSubagentCapabilityCeilingV1(encoded), combined);
 });
 
 test("authority laws hold exhaustively over a deterministic small domain", () => {

@@ -110,6 +110,14 @@ Tool and agent sets are sorted and deduplicated. Authority entries are limited
 to 256 items and 128 UTF-8 bytes per item. Provenance is limited to 8 items and
 128 UTF-8 bytes per item.
 
+Nested sets are ordinary arrays with exactly `Array.prototype`. They are
+validated recursively through own keys and property descriptors before element
+values are collected. Only the normal non-enumerable `length` data property and
+dense enumerable canonical index data properties are accepted. Nested proxies
+(including revoked proxies), holes, symbols, named extras, accessors, and exotic
+array prototypes are rejected without executing traps or getters. Ordinary and
+frozen dense arrays are both valid.
+
 Intersection is the only composition operation:
 
 - when both sides bound a dimension, use set intersection;
@@ -127,12 +135,21 @@ has no filesystem, process-environment, network, scheduler, or mutable global
 dependency.
 
 The successfully parsed V1 domain is closed under canonical encoding: every
-value returned by `parseSubagentCapabilityCeilingV1` can be encoded. Parsing
-reserves transport capacity for the maximum bounded provenance before accepting
-an authority payload, so intersecting two accepted ceilings also remains
-encodable even when their provenance labels combine. The encoder does not call
-itself from parsing; parsing checks the internal canonical representation
-directly.
+value returned by `parseSubagentCapabilityCeilingV1` can be encoded. A valid
+128-byte string can add at most 258 canonical JSON bytes including its quotes:
+each input byte contributes at most two bytes when JSON-escaped, and Unicode
+`Cc` values that could require longer escapes are rejected. Maximum provenance
+therefore adds exactly the conservative bound
+`1 + 12 + 1 + 1 + (8 * 258) + 7 + 1 = 2087` bytes: property comma, quoted key,
+colon, opening bracket, eight strings, seven commas, and closing bracket.
+Parsing adds that bound to the authority-only canonical JSON byte count and
+computes unpadded base64url length as
+`4 * floor(bytes / 3) + (remainder == 0 ? 0 : remainder + 1)`, plus the five
+`scv1.` bytes. Authority is accepted only when that proven maximum is at most
+32,768 bytes. Intersections can only shrink authority sets (and logical OR can
+only shorten `false` to `true`), so two accepted ceilings remain encodable even
+when their provenance labels combine. The encoder does not call itself from
+parsing; parsing checks this byte budget directly.
 
 ## Security and trust rules
 
@@ -210,8 +227,8 @@ and machine-readable lifecycle artifacts as separate specs. Do not add
 | Bounded/unbounded semantics | Focused Node test | Legacy-to-enforced transition cases |
 | Provenance bounded and non-authoritative | Focused Node test | Safe diagnostics inspection |
 | Malformed/version/type/size input fails closed | Focused Node test | Launch refusal and UI recovery reason |
-| Symbols/hidden keys/accessors/proxies fail without getter/trap execution | Focused Node test | In-process descriptor rejection |
-| Every parsed/intersected value is encodable within the transport cap | Boundary and exhaustive tests | Nested/resume descriptor propagation |
+| Symbols/hidden keys/accessors/proxies fail without getter/trap execution | Top-level and nested adversarial tests | In-process descriptor rejection |
+| Every parsed/intersected value is encodable within the transport cap | Exact cap-1/cap/cap+1, 4+4 provenance and exhaustive tests | Nested/resume descriptor propagation |
 | All Unicode `Cc` controls and UTF-8 byte overflows are rejected | Focused Node test | Safe diagnostics inspection |
 | Deterministic transport round trip | Focused Node test | Parent/child descriptor acknowledgment |
 | PipiUI identity/projection unchanged | Not touched | Same `agentId`/`runId`, cards, logs, restart state |
