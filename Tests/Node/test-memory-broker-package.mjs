@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { test } from "node:test";
 import { promisify } from "node:util";
@@ -88,7 +88,7 @@ async function linkExtensionRuntime(directory) {
 async function extensionFixture(mode) {
   const directory = await mkdtemp(join(tmpdir(), "pipiui-memory-package-"));
   try {
-    await cp(join(packagesRoot, "memory-broker"), join(directory, "packages/memory-broker"), { recursive: true });
+    await cp(join(packagesRoot, "memory-broker"), join(directory, "packages/memory-broker"), { recursive: true, filter: (source) => basename(source) !== "node_modules" });
     await cp(join(packagesRoot, "memory-broker-contract"), join(directory, "packages/memory-broker-contract"), { recursive: true });
     await linkExtensionRuntime(directory);
     const output = join(directory, "result.json");
@@ -138,6 +138,7 @@ writeFileSync(${JSON.stringify(output)}, JSON.stringify({
       PIPIUI_MEMORY_BROKER_TOKEN: "t".repeat(43),
       PIPIUI_MEMORY_BROKER_CAPABILITY: "c".repeat(43),
       PIPIUI_MEMORY_PROJECT_ROOT: "/fixture/project",
+      PIPIUI_MEMORY_CATALOG_DIR: join(directory, "catalog"),
       PIPIUI_AGENT_ID: "agent-a",
       PIPIUI_AGENT_RUN_ID: "run-a",
     };
@@ -373,7 +374,7 @@ test("session_start catches broker bind failures and atomically publishes degrad
   const directory = await mkdtemp(join(tmpdir(), "pipiui-memory-bind-status-"));
   try {
     const runtimePackage = join(directory, "packages/memory-broker");
-    await cp(packageRoot, runtimePackage, { recursive: true });
+    await cp(packageRoot, runtimePackage, { recursive: true, filter: (source) => basename(source) !== "node_modules" });
     await linkExtensionRuntime(directory);
     const extension = await import(pathToFileURL(join(runtimePackage, "src/extension.ts")).href);
     const handlers = new Map();
@@ -382,6 +383,7 @@ test("session_start catches broker bind failures and atomically publishes degrad
       on(name, handler) { handlers.set(name, handler); },
     }, {
       backendFactory: () => new core.InMemoryMemoryBackend(),
+      catalogDirectory: join(directory, "catalog"),
       serverFactory: () => ({
         async start() { throw new Error("simulated loopback bind failure"); },
         async close() {},
@@ -406,7 +408,7 @@ test("copied standalone broker resolves its vendored contract without a sibling 
   const directory = await mkdtemp(join(tmpdir(), "pipiui-memory-standalone-"));
   try {
     const standalone = join(directory, "broker");
-    await cp(packageRoot, standalone, { recursive: true });
+    await cp(packageRoot, standalone, { recursive: true, filter: (source) => basename(source) !== "node_modules" });
     const standaloneCore = await import(pathToFileURL(join(standalone, "src/index.ts")).href);
     const server = new standaloneCore.MemoryBrokerServer({
       projectRoot: "/fixture/standalone",
@@ -454,7 +456,7 @@ test("canonical runtime package identity accepts only the exact main-installed e
   const directory = await mkdtemp(join(tmpdir(), "pipiui-memory-identity-"));
   try {
     const devBundle = join(directory, "memory-broker");
-    await cp(packageRoot, devBundle, { recursive: true });
+    await cp(packageRoot, devBundle, { recursive: true, filter: (source) => basename(source) !== "node_modules" });
     const [devRoot, devExtension] = await Promise.all([
       realpath(devBundle),
       realpath(join(devBundle, "extensions/memory-broker.ts")),
@@ -476,7 +478,7 @@ test("Pi package entry registers lifecycle/tools by mode without worker backend 
     extensionFixture("operator"),
   ]);
   sameSet(main.tools, ["memory_query", "memory_status"]);
-  sameSet(main.handlers, ["session_shutdown", "session_start"]);
+  sameSet(main.handlers, ["input", "tool_result", "session_shutdown", "session_start"]);
   assert.match(main.beforeShutdown.url, /^http:\/\/127\.0\.0\.1:/);
   assert.match(main.beforeShutdown.token, /^[A-Za-z0-9_-]{43}$/);
   assert.equal(main.afterShutdown.url, undefined);
@@ -521,5 +523,19 @@ test("Pi package entry registers lifecycle/tools by mode without worker backend 
   assert.match(manifest, /"bundledDependencies"\s*:\s*\[[\s\S]*"pi-hermes-memory"/);
   assert.match(entry, /installMemoryBrokerExtension/);
   assert.match(extensionSource, /await import\("\.\/server\.ts"\)/, "only main session_start may load server/backend code");
-  assert.doesNotMatch(`${entry}\n${source}\n${extensionSource}`, /^import(?:\s+type)? .*?(?:AppStore|BridgeServer|Hermes|PipiUI)/m);
+  assert.doesNotMatch(extensionSource, /^import[\s\S]*?from\s+["']pi-hermes-memory(?:["']|\/)/m, "extension has no static Hermes package import");
+  assert.match(extensionSource, /await import\("\.\/hermes-adapter\.ts"\)/, "Hermes stays behind the main session_start dynamic boundary");
+  assert.doesNotMatch(`${entry}\n${source}\n${extensionSource}`, /^import(?:\s+type)? .*?(?:AppStore|BridgeServer|PipiUI)/m);
+});
+
+test("installed-copy package carries runnable Memory Center UI and eval corpus", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pipiui-memory-installed-ui-"));
+  try {
+    const standalone = join(directory, "memory-broker");
+    await cp(packageRoot, standalone, { recursive: true, filter: (source) => basename(source) !== "node_modules" });
+    const page = await readFile(join(standalone, "ui/index.html"), "utf8");
+    assert.match(page, /Memory Center/);
+    const evalResult = await execFileAsync(process.execPath, ["scripts/run-eval.mjs"], { cwd: standalone });
+    assert.match(evalResult.stdout, /2 cases/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });

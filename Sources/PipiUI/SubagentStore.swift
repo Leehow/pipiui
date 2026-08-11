@@ -473,17 +473,6 @@ enum SubagentStatusCheckPrompt {
     }
 }
 
-/// 后台 git 操作结果（detached 任务返回值，跨线程传递）。
-enum MergeGitOutcome: Sendable {
-    case waitingForMain(String)
-    case blocked(String)
-    case ok
-    case zeroChangeCleaned
-    case mergeFailed(String)
-    case removeFailed(String)
-    case cleanupFailed(String)
-}
-
 /// Best-effort upsert into an existing Boss ledger `## Closeout dispositions` table.
 /// Never creates ledgers or missing sections — seeding is owned by the pi extension.
 enum BossLedgerCloseoutMirror {
@@ -856,7 +845,7 @@ private final class LockedBool {
 }
 
 /// 每个会话一棵 subagent 树；agent_event 先进入短时 mailbox，再在主线程批量应用。
-final class SubagentStore: ObservableObject {
+package final class SubagentStore: ObservableObject {
     /// Agent rows publish manually so a mailbox drain can apply many mutations with one
     /// `objectWillChange`. Mutations outside a batch retain the old one-write/one-publish
     /// behavior through the in-place modifying accessor.
@@ -2432,7 +2421,6 @@ final class SubagentStore: ObservableObject {
             return setWorktreeError("非法 branch/path")
         }
 
-        let wtURL = URL(fileURLWithPath: pathStr, isDirectory: true)
         let main = mainProjectURL
 
         let outcome: MergeGitOutcome
@@ -2441,77 +2429,12 @@ final class SubagentStore: ObservableObject {
         } else {
             // Serialized against every other main-repo operation (other merges, verify runs).
             outcome = await MainRepoSerialQueue.run {
-                // A missing/unusable worker worktree is a genuine merge failure (nothing
-                // to integrate), not a waiting-for-main condition. probe fails closed on
-                // a missing path, so this cannot hang the auto-merge chain silently.
-                guard GitRepo.probe(workTree: wtURL).isRepo else {
-                    return .mergeFailed("worktree 不存在或不是 git 仓库；无法合并")
-                }
-                // Read-only WIP gate. Never merge into an overlapping or unobservable main tree.
-                switch GitRepo.mergeReadiness(branch: branch, workerWorkTree: wtURL, in: main) {
-                case .ready: break
-                case .waitingForMain(let paths):
-                    return .waitingForMain(paths.joined(separator: ", "))
-                case .blocked(let reason):
-                    return .blocked(reason)
-                }
-                // A clean branch that is already reachable from main has no agent work to merge.
-                // Remove it directly, but only after both conditions prove no changes can be lost.
-                if !GitRepo.probe(workTree: wtURL).isDirty,
-                   GitRepo.isAncestor(branch, of: "HEAD", in: main) {
-                    do {
-                        try GitRepo.worktreeRemove(at: wtURL, in: main, force: false)
-                    } catch {
-                        let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                        return .removeFailed(msg)
-                    }
-                    let cleanup = GitRepo.safelyDeleteMergedAgentBranch(
-                        branch,
-                        persistedWorktreePath: pathStr,
-                        integrationRef: "HEAD",
-                        in: main
-                    )
-                    if let warning = cleanup.warning, !warning.isEmpty {
-                        return .cleanupFailed(warning)
-                    }
-                    return .zeroChangeCleaned
-                }
-
-                // Best-effort: commit dirty files in the agent worktree so they are not lost.
-                _ = GitRepo.commitAllIfDirty(
-                    in: wtURL,
-                    message: "pipiui: agent \(agentId) work"
+                WorktreeMerger.mergeWorktree(
+                    agentID: agentId,
+                    branch: branch,
+                    worktreePath: pathStr,
+                    mainProjectURL: main
                 )
-                // Never force-remove unexplained leftovers after a failed commit attempt.
-                // The existing add-all commit contract remains for compatibility, but a
-                // still-dirty tree is retained for secretary/fixer classification.
-                if GitRepo.probe(workTree: wtURL).isDirty {
-                    return .mergeFailed(
-                        "agent worktree 提交后仍有未提交/未分类文件；已保留，禁止自动清理"
-                    )
-                }
-                do {
-                    try GitRepo.mergeBranch(branch, into: main)
-                } catch {
-                    let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                    return .mergeFailed(msg)
-                }
-                do {
-                    try GitRepo.worktreeRemove(at: wtURL, in: main, force: false)
-                } catch {
-                    let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                    return .removeFailed(msg)
-                }
-                let cleanup = GitRepo.safelyDeleteMergedAgentBranch(
-                    branch,
-                    persistedWorktreePath: pathStr,
-                    integrationRef: "HEAD",
-                    in: main
-                )
-                if let warning = cleanup.warning, !warning.isEmpty {
-                    return .cleanupFailed(warning)
-                }
-                return .ok
             }
         }
 

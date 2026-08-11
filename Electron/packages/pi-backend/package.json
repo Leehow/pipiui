@@ -1,0 +1,27 @@
+{
+  "name": "@pipi/pi-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.0",
+    "@pipi/host-api": "file:../host-api",
+    "pi-mcp-extension": "1.5.0",
+    "pi-web-access": "0.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.10"
+  }
+}

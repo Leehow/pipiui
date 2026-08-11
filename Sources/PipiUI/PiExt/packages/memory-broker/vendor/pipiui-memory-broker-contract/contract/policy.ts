@@ -238,7 +238,7 @@ export function normalizeExperienceCandidate(raw: unknown): MemoryExperienceCand
   }
   const candidate: MemoryExperienceCandidate = {
     kind: raw.kind,
-    claimKind: raw.claimKind ?? "task",
+    claimKind: (raw.claimKind ?? "task") as MemoryClaimKind,
     claim: normalizeClaim(raw.claim),
     scope: raw.scope,
     provenance: raw.provenance,

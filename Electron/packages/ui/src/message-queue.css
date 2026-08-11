@@ -1,0 +1,374 @@
+/*
+ * MessageQueue — self-contained compact queue strip above the composer.
+ * Mirrors Swift `InputBar.queueStrip`: a slim bar (`排队 N 条` + first-item
+ * preview) with an expandable per-item list. No dependency on app.css; this
+ * file carries its own light/dark tokens and follows the host's `[data-theme]`
+ * attribute (with a standalone prefers-color-scheme fallback).
+ */
+
+.message-queue {
+  /* Light tokens (default) */
+  --mq-text: #3c3c46;
+  --mq-text-muted: #8a8a96;
+  --mq-text-strong: #17171a;
+  --mq-accent: #4968c9;
+  --mq-accent-soft: rgba(73, 104, 201, 0.14);
+  --mq-danger: #bd5962;
+  --mq-danger-soft: rgba(189, 89, 98, 0.12);
+  --mq-success: #28865a;
+  --mq-bg: #ffffff;
+  --mq-bg-hover: #f2f2f6;
+  --mq-border: rgba(0, 0, 0, 0.1);
+  --mq-border-strong: rgba(0, 0, 0, 0.16);
+  --mq-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+  --mq-thumb-bg: rgba(0, 0, 0, 0.06);
+  --mq-input-bg: #ffffff;
+
+  margin: 0 16px 8px;
+  border: 1px solid var(--mq-border-strong);
+  border-radius: 9px;
+  background: var(--mq-bg);
+  box-shadow: var(--mq-shadow);
+  color: var(--mq-text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow: hidden;
+}
+
+[data-theme='dark'] .message-queue {
+  --mq-text: #c7c9d4;
+  --mq-text-muted: #7d7f8c;
+  --mq-text-strong: #f0f1f5;
+  --mq-accent: #8a9df0;
+  --mq-accent-soft: rgba(138, 157, 240, 0.2);
+  --mq-danger: #e08a92;
+  --mq-danger-soft: rgba(224, 138, 146, 0.16);
+  --mq-success: #76c59b;
+  --mq-bg: #23242b;
+  --mq-bg-hover: #2a2b33;
+  --mq-border: rgba(255, 255, 255, 0.08);
+  --mq-border-strong: rgba(255, 255, 255, 0.14);
+  --mq-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+  --mq-thumb-bg: rgba(255, 255, 255, 0.08);
+  --mq-input-bg: #1b1c21;
+}
+
+/* Standalone dark fallback when no [data-theme] ancestor exists. */
+@media (prefers-color-scheme: dark) {
+  :root:not(:has([data-theme])) .message-queue {
+    --mq-text: #c7c9d4;
+    --mq-text-muted: #7d7f8c;
+    --mq-text-strong: #f0f1f5;
+    --mq-accent: #8a9df0;
+    --mq-accent-soft: rgba(138, 157, 240, 0.2);
+    --mq-danger: #e08a92;
+    --mq-danger-soft: rgba(224, 138, 146, 0.16);
+    --mq-success: #76c59b;
+    --mq-bg: #23242b;
+    --mq-bg-hover: #2a2b33;
+    --mq-border: rgba(255, 255, 255, 0.08);
+    --mq-border-strong: rgba(255, 255, 255, 0.14);
+    --mq-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+    --mq-thumb-bg: rgba(255, 255, 255, 0.08);
+    --mq-input-bg: #1b1c21;
+  }
+}
+
+/* ---- collapsed bar ---- */
+
+.message-queue__bar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.message-queue__bar:hover {
+  background: var(--mq-bg-hover);
+}
+
+.message-queue__bar:focus-visible {
+  outline: 2px solid var(--mq-accent);
+  outline-offset: -2px;
+}
+
+.message-queue__tray {
+  flex: none;
+  font-size: 11px;
+  color: var(--mq-text-muted);
+}
+
+.message-queue__count {
+  flex: none;
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--mq-text-strong);
+  white-space: nowrap;
+}
+
+.message-queue__preview {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--mq-text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-queue__chevron {
+  flex: none;
+  font-size: 9px;
+  color: var(--mq-text-muted);
+}
+
+/* ---- expanded list ---- */
+
+.message-queue__list {
+  margin: 0;
+  padding: 0 0 4px;
+  list-style: none;
+  border-top: 1px solid var(--mq-border);
+}
+
+.message-queue__item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 10px 7px 8px;
+  border-bottom: 1px solid var(--mq-border);
+}
+
+.message-queue__item:last-child {
+  border-bottom: none;
+}
+
+.message-queue__index {
+  flex: none;
+  min-width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+  border-radius: 4px;
+  background: var(--mq-thumb-bg);
+  color: var(--mq-text-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.message-queue__body {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.message-queue__text {
+  overflow: hidden;
+  color: var(--mq-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- image thumbnail identifier ---- */
+
+.message-queue__thumbs {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.message-queue__thumb {
+  width: 20px;
+  height: 20px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--mq-border);
+  background: var(--mq-thumb-bg);
+  display: block;
+}
+
+.message-queue__thumb--blank {
+  background:
+    linear-gradient(135deg, var(--mq-thumb-bg) 25%, transparent 25%) -4px 0/8px 8px,
+    linear-gradient(225deg, var(--mq-thumb-bg) 25%, transparent 25%) -4px 0/8px 8px,
+    linear-gradient(45deg, var(--mq-thumb-bg) 25%, transparent 25%) 0 0/8px 8px,
+    linear-gradient(315deg, var(--mq-thumb-bg) 25%, transparent 25%) 0 0/8px 8px;
+}
+
+.message-queue__thumb-count {
+  display: inline-flex;
+  align-items: center;
+  min-width: 18px;
+  height: 16px;
+  justify-content: center;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--mq-accent-soft);
+  color: var(--mq-accent);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- status ---- */
+
+.message-queue__status {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 10px;
+  white-space: nowrap;
+  color: var(--mq-text-muted);
+  background: var(--mq-thumb-bg);
+}
+
+.message-queue__status--queued {
+  color: var(--mq-text-muted);
+}
+
+.message-queue__status--sending {
+  color: var(--mq-accent);
+  background: var(--mq-accent-soft);
+}
+
+.message-queue__status--failed {
+  color: var(--mq-danger);
+  background: var(--mq-danger-soft);
+}
+
+.message-queue__error {
+  color: var(--mq-danger);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+/* ---- actions ---- */
+
+.message-queue__actions {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.message-queue__actions button {
+  padding: 2px 6px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--mq-text-muted);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.message-queue__actions button:hover:not(:disabled) {
+  background: var(--mq-bg-hover);
+  color: var(--mq-text-strong);
+}
+
+.message-queue__actions button:focus-visible {
+  outline: 2px solid var(--mq-accent);
+  outline-offset: -1px;
+}
+
+.message-queue__actions button:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.message-queue__remove:hover:not(:disabled) {
+  color: var(--mq-danger);
+}
+
+.message-queue__retry {
+  color: var(--mq-success) !important;
+}
+
+.message-queue__retry:hover:not(:disabled) {
+  color: var(--mq-success) !important;
+  background: var(--mq-thumb-bg) !important;
+}
+
+/* ---- inline editor ---- */
+
+.message-queue__editor {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 100%;
+}
+
+.message-queue__editor-input {
+  width: 100%;
+  min-height: 40px;
+  padding: 5px 7px;
+  border: 1px solid var(--mq-border-strong);
+  border-radius: 6px;
+  outline: none;
+  background: var(--mq-input-bg);
+  color: var(--mq-text);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.message-queue__editor-input:focus {
+  border-color: var(--mq-accent);
+}
+
+.message-queue__editor-input:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.message-queue__editor-actions {
+  display: inline-flex;
+  align-self: flex-end;
+  gap: 5px;
+}
+
+.message-queue__editor-actions button {
+  padding: 2px 9px;
+  border: 1px solid var(--mq-border-strong);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--mq-text);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.message-queue__editor-actions button:hover:not(:disabled) {
+  background: var(--mq-bg-hover);
+}
+
+.message-queue__editor-actions button:focus-visible {
+  outline: 2px solid var(--mq-accent);
+  outline-offset: -1px;
+}
+
+.message-queue__editor-actions button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.message-queue__save {
+  background: var(--mq-accent-soft) !important;
+  border-color: transparent !important;
+  color: var(--mq-accent) !important;
+  font-weight: 600;
+}

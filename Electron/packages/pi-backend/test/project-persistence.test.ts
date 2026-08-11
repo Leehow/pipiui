@@ -24,7 +24,7 @@ async function setup(paths = ["haoli"]): Promise<{ agent: string; sessions: stri
   return { agent, sessions, projects };
 }
 
-function backend(agent: string, sessions: string) { return createPiHostBackend({ agentDir: agent, sessionsRoot: sessions }); }
+function backend(agent: string, sessions: string, canonicalProjectPaths: () => Promise<string[] | undefined> = async () => undefined) { return createPiHostBackend({ agentDir: agent, sessionsRoot: sessions, canonicalProjectPaths }); }
 
 describe("explicit sidebar project persistence", () => {
   it("starts empty despite historical JSONL cwd values and records the presence sentinel", async () => {
@@ -64,6 +64,19 @@ describe("explicit sidebar project persistence", () => {
     expect(await fresh.handle("listSessions", [added.id])).toEqual([expect.objectContaining({ id: "haoli-session", projectId: added.id })]);
   });
 
+  it("replaces one legacy polluted list once from the canonical Swift plist source, then keeps explicit Host edits", async () => {
+    const fixture = await setup(["haoli", "other"]);
+    await writeFile(join(fixture.agent, "pipiui-settings.json"), JSON.stringify({ projectPathsVersion: 1, projectPaths: [fixture.projects.haoli, fixture.projects.other, "/old/discovered"] }));
+    const canonical = async () => [fixture.projects.haoli];
+    const migrated = backend(fixture.agent, fixture.sessions, canonical);
+    expect(await migrated.handle("getProjectPaths", [])).toEqual([fixture.projects.haoli]);
+    const settings = JSON.parse(await readFile(join(fixture.agent, "pipiui-settings.json"), "utf8"));
+    expect(settings).toMatchObject({ projectPathsVersion: 1, projectPaths: [fixture.projects.haoli], projectPathsCanonicalMigrationVersion: 1, projectPathsCanonicalMigrationSource: "com.leehow.pipiui:pipiui.projects" });
+    await migrated.handle("addProject", [fixture.projects.other]);
+    const fresh = backend(fixture.agent, fixture.sessions, async () => []);
+    expect(await fresh.handle("getProjectPaths", [])).toEqual([fixture.projects.haoli, fixture.projects.other]);
+  });
+
   it("atomically merges project paths with hidden IDs and unrelated queue settings fields", async () => {
     const fixture = await setup();
     await writeFile(join(fixture.agent, "pipiui-settings.json"), JSON.stringify({ hiddenModelIds: ["openai/gpt-5"], queue: { retained: true }, futureQueueField: ["keep"] }) + "\n");
@@ -77,6 +90,27 @@ describe("explicit sidebar project persistence", () => {
       projectPaths: [],
       queue: { retained: true },
       futureQueueField: ["keep"],
+    });
+  });
+
+  it("persists Computer Use and ordered subagent model chains without replacing other settings", async () => {
+    const fixture = await setup();
+    const first = backend(fixture.agent, fixture.sessions);
+    expect(await first.handle("getComputerUseState", [])).toEqual({ enabled: false });
+    expect(await first.handle("setComputerUseEnabled", [true])).toEqual({ enabled: true });
+    expect(await first.handle("setSubagentModel", ["operator", [{ model: "gpt-5", thinking: "high" }, { model: "claude-sonnet-4", thinking: "medium" }]])).toEqual({
+      operator: [{ model: "gpt-5", thinking: "high" }, { model: "claude-sonnet-4", thinking: "medium" }],
+    });
+    expect(await first.handle("listAgentDefinitions", [])).toEqual(expect.arrayContaining([
+	  expect.objectContaining({ name: "computer-use-leader" }),
+      expect.objectContaining({ name: "operator" }),
+	  expect.objectContaining({ name: "computer-verifier" }),
+      expect.objectContaining({ name: "long-test" }),
+    ]));
+    const fresh = backend(fixture.agent, fixture.sessions);
+    expect(await fresh.handle("getComputerUseState", [])).toEqual({ enabled: true });
+    expect(await fresh.handle("getSubagentModels", [])).toEqual({
+      operator: [{ model: "gpt-5", thinking: "high" }, { model: "claude-sonnet-4", thinking: "medium" }],
     });
   });
 });

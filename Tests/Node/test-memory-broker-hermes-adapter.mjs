@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { cp, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { test } from "node:test";
 
@@ -44,7 +44,9 @@ async function ensureSymlink(target, link) {
 
 async function copyBrokerPackage(root) {
   const destination = join(root, "packages/memory-broker");
-  await cp(brokerRoot, destination, { recursive: true });
+  // A developer checkout may contain npm's local cache/install tree. The
+  // fixture must instead resolve the pinned runtime installed at `root`.
+  await cp(brokerRoot, destination, { recursive: true, filter: (source) => basename(source) !== "node_modules" });
   await cp(join(packagesRoot, "memory-broker-contract"), join(root, "packages/memory-broker-contract"), { recursive: true });
   return destination;
 }
@@ -261,15 +263,16 @@ export default function (pi) {
   });
 }
 `, "utf8");
-    const { output, stderr } = await runPiProbe({
+    const { output, stdout: outputText, stderr } = await runPiProbe({
       root,
       extensions: [probe, join(packageDirectory, "extensions/memory-broker.ts")],
       mode: "main",
       probeCommand: "broker-main-probe",
       outputPath: resultPath,
     });
-    assert.equal(stderr, "");
-    assert.equal(output.before.status.ready, true);
+    const diagnostics = () => JSON.stringify({ output, stdout: outputText, stderr }, null, 2);
+    assert.equal(stderr, "", diagnostics());
+    assert.equal(output.before.status.ready, true, diagnostics());
     assert.match(output.before.status.detail, /Hermes 0\.9\.4 FTS backend is ready/);
     assert.equal(output.durable.ok, true);
     assert.equal(output.query.ok, true);

@@ -1,0 +1,10 @@
+Streamdown — Third-Party Notice (PENDING)
+==========================================
+
+Source:  https://github.com/vercel/streamdown
+License: Apache-2.0
+Status:  Planned direct dependency; not present in this repository or a distributed artifact.
+
+Before first inclusion, replace this placeholder with the selected package name and
+pinned version, upstream copyright notice, Apache-2.0 license text, and any
+upstream NOTICE required by that locked version. See docs/plans/2026-08-10-electron-reuse-audit.md.

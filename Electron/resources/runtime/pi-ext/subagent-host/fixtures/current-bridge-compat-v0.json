@@ -1,0 +1,35 @@
+{
+  "source": {
+    "agentProducer": "pi-ext/subagent/index.ts#postPipiuiReport",
+    "planProducer": "legacy-host/plan-runtime#postPlanEvent",
+    "bridgeConsumer": "legacy-host/bridge action == agent_event / plan_event"
+  },
+  "currentAgentUpdate": {
+    "sessionKey": "0123456789abcdef0123456789abcdef",
+    "action": "agent_event",
+    "kind": "update",
+    "agentId": "agent-a",
+    "runId": "run-a",
+    "output": "legacy flat bridge body now retains the producer run identity",
+    "activity": "write adapter",
+    "cost": 0.1,
+    "turns": 1
+  },
+  "historicalAgentUpdateWithoutRunId": {
+    "sessionKey": "0123456789abcdef0123456789abcdef",
+    "action": "agent_event",
+    "kind": "update",
+    "agentId": "agent-a",
+    "output": "historical pre-runId body; only an external authoritative adapter may bind it",
+    "activity": "write adapter",
+    "cost": 0.1,
+    "turns": 1
+  },
+  "currentPlanApprove": {
+    "sessionKey": "0123456789abcdef0123456789abcdef",
+    "action": "plan_event",
+    "event": "approve",
+    "planId": "plan-a",
+    "at": "2026-08-10T00:00:01.000Z"
+  }
+}

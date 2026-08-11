@@ -296,6 +296,7 @@ final class PipiSpawnAssemblyTests: XCTestCase {
         XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_EXT"], "/p/computer.ts")
         XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_CAPABILITY"], "computer")
         XCTAssertNotNil(out.extraEnv["PIPIUI_COMPUTER_RUNTIME_PROTOCOL"])
+        XCTAssertEqual(out.extraEnv["PIPIUI_CUA_DRIVER_VERSION"], "0.19.2")
         XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_DISPLAY_ID"], "1")
         XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_WIDTH"], "100")
         XCTAssertEqual(out.extraEnv["PIPIUI_COMPUTER_HEIGHT"], "100")

@@ -317,6 +317,117 @@ final class BrowserDOMControllerTests: XCTestCase {
         XCTAssertTrue(eventText.contains("editable:change"))
     }
 
+    func testTargetedScrollUsesNearestScrollableAncestorAndReportsActualTarget() throws {
+        let store = WebViewStore()
+        let html = #"""
+        <title>Ancestor scroll fixture</title>
+        <div id="scroller" style="width:320px;height:80px;overflow:auto">
+          <button id="target" style="display:block;margin-top:500px;width:200px;height:40px">Nested target</button>
+          <div style="height:500px"></div>
+        </div>
+        """#
+        try loadHTML(html, in: store, expectedTitle: "Ancestor scroll fixture")
+        let observed = try call(store, action: "observe", request: ["scope": "page"])
+        let target = try element(named: "Nested target", in: observed)
+        let result = try call(store, action: "scroll", request: [
+            "snapshot_id": try XCTUnwrap(observed["snapshotID"] as? String),
+            "element_token": try XCTUnwrap(target["token"] as? String),
+            "direction": "down",
+            "amount": 0.5,
+        ])
+
+        XCTAssertEqual(result["ok"] as? Bool, true)
+        XCTAssertEqual((result["action"] as? [String: Any])?["target"] as? String, "ancestor")
+        let position = try call(store, action: "eval", request: [
+            "js": "document.getElementById('scroller').scrollTop",
+        ])
+        XCTAssertGreaterThan(Int(position["result"] as? String ?? "0") ?? 0, 0)
+    }
+
+    func testContentEditableInputUsesBrowserLikeEventSequenceWithoutEchoingText() throws {
+        let store = WebViewStore()
+        let html = #"""
+        <title>Editable event fixture</title>
+        <div id="editor" contenteditable="true" aria-label="Rich editor" style="width:320px;height:80px">Old</div>
+        <script>
+          window.editorEvents = [];
+          for (const type of ['beforeinput', 'input', 'change']) {
+            editor.addEventListener(type, event => {
+              window.editorEvents.push(type + ':' + (event.data || '') + ':' + editor.textContent);
+            });
+          }
+        </script>
+        """#
+        try loadHTML(html, in: store, expectedTitle: "Editable event fixture")
+        let observed = try call(store, action: "observe", request: ["scope": "page"])
+        let editor = try element(named: "Rich editor", tag: "div", in: observed)
+        let typed = "PRIVATE_EDITOR_TEXT"
+        let result = try call(store, action: "input", request: [
+            "snapshot_id": try XCTUnwrap(observed["snapshotID"] as? String),
+            "element_token": try XCTUnwrap(editor["token"] as? String),
+            "text": typed,
+        ])
+
+        XCTAssertEqual(result["ok"] as? Bool, true)
+        XCTAssertFalse(try serialized(result).contains(typed))
+        let events = try call(store, action: "eval", request: ["js": "JSON.stringify(window.editorEvents)"])
+        XCTAssertEqual(
+            events["result"] as? String,
+            #"["beforeinput:PRIVATE_EDITOR_TEXT:Old","input:PRIVATE_EDITOR_TEXT:PRIVATE_EDITOR_TEXT","change::PRIVATE_EDITOR_TEXT"]"#
+        )
+    }
+
+    func testClickRejectsTargetWhoseCenterIsObscured() throws {
+        let store = WebViewStore()
+        let html = #"""
+        <title>Obscured click fixture</title>
+        <button id="covered" style="position:absolute;left:20px;top:20px;width:240px;height:60px">Covered action</button>
+        <div id="overlay" style="position:absolute;left:20px;top:20px;width:240px;height:60px;z-index:10"></div>
+        <script>
+          window.coveredClicks = 0;
+          covered.addEventListener('click', () => { window.coveredClicks += 1; });
+        </script>
+        """#
+        try loadHTML(html, in: store, expectedTitle: "Obscured click fixture")
+        let observed = try call(store, action: "observe", request: ["scope": "page"])
+        let button = try element(named: "Covered action", in: observed)
+        let result = try call(store, action: "click", request: [
+            "snapshot_id": try XCTUnwrap(observed["snapshotID"] as? String),
+            "element_token": try XCTUnwrap(button["token"] as? String),
+        ])
+
+        XCTAssertEqual(result["ok"] as? Bool, false)
+        XCTAssertEqual(result["code"] as? String, "browser_target_obscured")
+        XCTAssertEqual(result["requiresObservation"] as? Bool, true)
+        let clicks = try call(store, action: "eval", request: ["js": "window.coveredClicks"])
+        XCTAssertEqual(clicks["result"] as? String, "0")
+    }
+
+    func testBeforeInputCannotTurnOrdinaryControlSensitiveAndReceiveText() throws {
+        let store = WebViewStore()
+        let html = #"""
+        <title>Before input sensitivity fixture</title>
+        <label for="field">Initially ordinary</label><input id="field">
+        <script>
+          field.addEventListener('beforeinput', () => { field.type = 'password'; });
+        </script>
+        """#
+        try loadHTML(html, in: store, expectedTitle: "Before input sensitivity fixture")
+        let observed = try call(store, action: "observe", request: ["scope": "page"])
+        let field = try element(named: "Initially ordinary", tag: "input", in: observed)
+        let typed = "MUST_NOT_BE_WRITTEN"
+        let result = try call(store, action: "input", request: [
+            "snapshot_id": try XCTUnwrap(observed["snapshotID"] as? String),
+            "element_token": try XCTUnwrap(field["token"] as? String),
+            "text": typed,
+        ])
+
+        XCTAssertEqual(result["code"] as? String, "user_handoff_required")
+        XCTAssertFalse(try serialized(result).contains(typed))
+        let value = try call(store, action: "eval", request: ["js": "document.getElementById('field').value"])
+        XCTAssertEqual(value["result"] as? String, "")
+    }
+
     func testSensitiveInputRequiresUserHandoffAndDOMReplacementIsStale() throws {
         let store = WebViewStore()
         try loadFixture(in: store)

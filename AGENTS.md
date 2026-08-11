@@ -31,7 +31,7 @@
 - The sole exception is an explicit current-user request to terminate or restart PipiUI. Never
   infer that request or invent termination/restart as a verification step.
 
-Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may create a runnable App.** All other linked/temporary worktrees must verify with `swift build` / `swift test` only and must never create `build/PipiUI.app`.
+Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may create runnable Apps.** All other linked/temporary worktrees must verify with `swift build` / `swift test` or Electron workspace builds only and must never create `build/PipiUI.app` or `build/PipiUI Electron.app`.
 
 ### Worktree ownership adapter (binding)
 
@@ -42,12 +42,13 @@ Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may cre
   `.worktrees/*` paths on `codex/*` branches) must be created, audited, and
   closed through `/Users/haoli/.codex/scripts/codex-worktree-lifecycle`.
 - Linked worktrees remain build/test-only. The primary checkout below remains
-  the sole location allowed to package `build/PipiUI.app`.
+  the sole location allowed to package `build/PipiUI.app` or `build/PipiUI Electron.app`.
 
 ```bash
 cd /Users/haoli/leehow/code/pipiui
 ./make-app.sh              # the sole release .app location
-./scripts/build-app.sh     # test (optional skip) then make-app.sh
+./scripts/build-app.sh              # test (optional skip) then make-app.sh
+./scripts/build-electron-app.sh     # Electron → build/PipiUI Electron.app
 ```
 
 ### 快速打包（快速迭代）
@@ -78,7 +79,8 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 | Build / run docs | `README.md` → 构建运行 |
 | Package App (primary checkout only) | `./make-app.sh` → `build/PipiUI.app` |
 | Test + package (primary checkout only) | `./scripts/build-app.sh` |
+| Package Electron App (primary checkout only) | `./scripts/build-electron-app.sh` → `build/PipiUI Electron.app` |
 | 快速打包（跳过测试） | `./scripts/build-app.sh --skip-tests`（或 `./make-app.sh`） |
 | Worker/dev verification | `swift run` / `swift build` / `swift test` |
 
-macOS 14+ · SwiftPM · the only product bundle is `/Users/haoli/leehow/code/pipiui/build/PipiUI.app`.
+macOS 14+ · SwiftPM + Electron · the only product bundles are `/Users/haoli/leehow/code/pipiui/build/PipiUI.app` and `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app`.

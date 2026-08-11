@@ -1,0 +1,148 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createPiHostBackend } from "../src/index.js";
+import type { AuthEventLike, AuthInteractionLike, AuthPromptLike, AuthRuntimeLike } from "../src/provider-auth.js";
+
+/** In-memory pi auth runtime with scripted login flows. Credential values never logged. */
+function fakeAuthRuntime(initialCredentialed: string[] = []): AuthRuntimeLike & { capturedKeys: string[]; logouts: string[] } {
+  const capturedKeys: string[] = [];
+  const logouts: string[] = [];
+  const credentialed = new Set(initialCredentialed);
+  const providers = [
+    { id: "anthropic", name: "Anthropic", auth: { oauth: { loginLabel: "Login Anthropic" }, apiKey: { login: {} } } },
+    { id: "deepseek", name: "DeepSeek", auth: { apiKey: { login: {} } } },
+    { id: "plain", name: "NoAuth", auth: undefined }
+  ];
+  const catalog = [
+    { provider: "anthropic", id: "a1", name: "A1", reasoning: true, input: ["text", "image"] },
+    { provider: "anthropic", id: "a2", name: "A2", reasoning: false },
+    { provider: "deepseek", id: "d1", name: "D1", reasoning: true },
+    { provider: "openai", id: "o1", name: "O1", reasoning: true }
+  ];
+  return {
+    capturedKeys,
+    logouts,
+    getProviders: async () => providers,
+    getAvailable: async () => catalog.filter(m => credentialed.has(m.provider)),
+    login: async (providerId: string, authType: "api_key" | "oauth", interaction: AuthInteractionLike) => {
+      if (authType === "oauth") {
+        interaction.notify({ type: "auth_url", url: "https://auth.example.com/start", instructions: "open the link" });
+        await interaction.prompt({ type: "manual_code", message: "enter device code" });
+        credentialed.add(providerId);
+        return { type: "oauth" };
+      }
+      const key = await interaction.prompt({ type: "secret", message: "API key" });
+      capturedKeys.push(key);
+      credentialed.add(providerId);
+      return { type: "api_key", key };
+    },
+    logout: async (providerId: string) => { credentialed.delete(providerId); logouts.push(providerId) }
+  };
+}
+
+async function tempAgent(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "pipi-auth-"));
+  const agent = join(root, "agent");
+  await mkdir(agent, { recursive: true });
+  return agent;
+}
+
+describe("provider auth via pi ModelRuntime bridge", () => {
+  let root = "";
+  afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }) });
+
+  it("lists auth-capable providers with credential metadata from auth.json (never key values)", async () => {
+    root = await tempAgent();
+    await writeFile(join(root, "auth.json"), JSON.stringify({ anthropic: { type: "oauth", access: "tok" } }));
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime(["anthropic"]) });
+    const providers: any[] = await backend.handle("authProviders", []);
+    expect(providers.map(p => p.id)).toEqual(["anthropic", "deepseek"]); // plain provider filtered out
+    expect(providers.find(p => p.id === "anthropic")).toMatchObject({ authTypes: ["oauth", "api_key"], authenticated: true, authType: "oauth", loginLabel: "Login Anthropic" });
+    expect(providers.find(p => p.id === "deepseek")).toMatchObject({ authTypes: ["api_key"], authenticated: false });
+    expect(JSON.stringify(providers)).not.toContain("tok");
+  });
+
+  it("rejects a broken registry but keeps readable providers when one entry is malformed", async () => {
+    root = await tempAgent();
+    const runtime = fakeAuthRuntime();
+    runtime.getProviders = async () => [
+      { id: "broken", get name() { throw new Error("bad provider metadata") }, auth: { apiKey: { login: {} } } } as any,
+      { id: "deepseek", name: "DeepSeek", auth: { apiKey: { login: {} } } },
+    ];
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: runtime });
+    expect((await backend.handle("authProviders", []) as any[]).map(provider => provider.id)).toEqual(["deepseek"]);
+    runtime.getProviders = async () => { throw new Error("registry offline") };
+    await expect(backend.handle("authProviders", [])).rejects.toThrow("无法读取 pi provider 目录：registry offline");
+  });
+
+  it("merges authenticated runtime models with configured custom/api-key models", async () => {
+    root = await tempAgent();
+    await writeFile(join(root, "models.json"), JSON.stringify({ providers: { openai: { apiKey: "$OPENAI_KEY", models: [{ id: "o1", name: "Configured O1", reasoning: true }] } } }));
+    await writeFile(join(root, "settings.json"), JSON.stringify({ defaultProvider: "openai", defaultModel: "o1" }));
+    const quotaStore = { snapshot: vi.fn(async () => { throw new Error("listModels must not fetch quota") }) };
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime(["anthropic"]), env: { OPENAI_KEY: "ok" }, quotaStore: quotaStore as any });
+    const models = await backend.handle("listModels", []) as any[];
+    expect(models.map(model => `${model.provider}/${model.id}`)).toEqual(["openai/o1", "anthropic/a1", "anthropic/a2"]);
+    expect(quotaStore.snapshot).not.toHaveBeenCalled();
+    expect(await backend.handle("setModel", ["anthropic", "a1"])).toMatchObject({ model: { provider: "anthropic", id: "a1" } });
+  });
+
+  it("runs an api-key login through prompt events and never leaks the key into events", async () => {
+    root = await tempAgent();
+    const runtime = fakeAuthRuntime();
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: runtime });
+    const { loginId } = await backend.handle("beginProviderLogin", ["deepseek", "api_key"]) as any;
+    const prompt = await backend.handle("continueProviderLogin", [loginId]);
+    expect(prompt).toMatchObject({ kind: "prompt", promptType: "secret" });
+    const secret = "sk-super-secret";
+    const completed = await backend.handle("continueProviderLogin", [loginId, secret]);
+    expect(completed).toEqual({ kind: "completed", providerId: "deepseek" });
+    // The key reaches the storage boundary (the runtime) but never the wire events.
+    expect(runtime.capturedKeys).toEqual([secret]);
+    expect(JSON.stringify([prompt, completed])).not.toContain(secret);
+  });
+
+  it("streams an oauth device/browser flow (auth_url) and supports cancellation", async () => {
+    root = await tempAgent();
+    const runtime = fakeAuthRuntime();
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: runtime });
+    const { loginId } = await backend.handle("beginProviderLogin", ["anthropic", "oauth"]) as any;
+    const authUrl = await backend.handle("continueProviderLogin", [loginId]);
+    expect(authUrl).toMatchObject({ kind: "auth_url", url: "https://auth.example.com/start", code: "open the link" });
+    // cancel aborts the pending manual-code prompt
+    await backend.handle("cancelProviderLogin", [loginId]);
+    const after = await backend.handle("continueProviderLogin", [loginId]);
+    expect(after.kind).toBe("cancelled");
+    expect(runtime.logouts).toEqual([]);
+  });
+
+  it("removes provider credentials via pi logout, refreshes models, and keeps env-configured providers", async () => {
+    root = await tempAgent();
+    await writeFile(join(root, "models.json"), JSON.stringify({ providers: { openai: { apiKey: "$OPENAI_KEY", models: [{ id: "o1", name: "O1", reasoning: true }] } } }));
+    await writeFile(join(root, "settings.json"), JSON.stringify({ defaultProvider: "openai", defaultModel: "o1" }));
+    await writeFile(join(root, "auth.json"), JSON.stringify({ anthropic: { type: "api_key", key: "sk-x" } }));
+    const runtime = fakeAuthRuntime(["anthropic"]);
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: runtime, env: { OPENAI_KEY: "ok" } });
+    // anthropic was only credentialed via auth.json; openai via the resolved env key.
+    expect((await backend.handle("listModels", []) as any[]).map(model => `${model.provider}/${model.id}`)).toEqual(["openai/o1", "anthropic/a1", "anthropic/a2"]);
+    const state = await backend.handle("removeProviderCredentials", ["anthropic"]) as any;
+    expect(runtime.logouts).toEqual(["anthropic"]);
+    expect((await backend.handle("listModels", [])).map((m: any) => m.id)).not.toContain("a1");
+    expect(state).toMatchObject({ model: { provider: "openai", id: "o1" } });
+  });
+
+  it("keeps an env-configured model available when its provider credentials are removed", async () => {
+    root = await tempAgent();
+    await writeFile(join(root, "models.json"), JSON.stringify({ providers: { openai: { apiKey: "$OPENAI_KEY", models: [{ id: "o1", name: "O1", reasoning: true }] } } }));
+    await writeFile(join(root, "settings.json"), JSON.stringify({ defaultProvider: "openai", defaultModel: "o1" }));
+    const runtime = fakeAuthRuntime();
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: runtime, env: { OPENAI_KEY: "ok" } });
+    // Pi logout only removes auth.json credentials; an explicit env API key remains usable.
+    const state = await backend.handle("removeProviderCredentials", ["openai"]) as any;
+    expect(runtime.logouts).toEqual(["openai"]);
+    expect(state).toMatchObject({ model: { provider: "openai", id: "o1" } });
+    expect((await backend.handle("getModelState", []))).toMatchObject({ model: { provider: "openai", id: "o1" } });
+  });
+});

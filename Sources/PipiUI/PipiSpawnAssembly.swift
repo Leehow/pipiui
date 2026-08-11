@@ -24,6 +24,8 @@ enum PipiSpawnEnvironmentPolicy {
         "PIPIUI_AGENT_",
         "PIPIUI_MEMORY_",
         "PIPIUI_COMPUTER_",
+        "PIPIUI_CUA_",
+        "PIPIUI_TERMINAL_",
         "PIPIUI_SEARCH_",
         "PIPIUI_SUBAGENT_",
         "PIPIUI_WORKTREE_",
@@ -283,6 +285,7 @@ enum PipiSpawnAssembly {
             env["PIPIUI_COMPUTER_DISPLAY_ID"] = String(descriptor.displayID)
             env["PIPIUI_COMPUTER_WIDTH"] = String(descriptor.outputSize.width)
             env["PIPIUI_COMPUTER_HEIGHT"] = String(descriptor.outputSize.height)
+            env["PIPIUI_CUA_DRIVER_VERSION"] = "0.19.2"
         }
 
         // Main root, App-owned agents, and model-selection files are all read

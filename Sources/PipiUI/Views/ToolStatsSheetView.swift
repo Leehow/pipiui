@@ -10,6 +10,10 @@ struct ToolStatsSheetView: View {
         ToolCallStats.compute(items: session.transcript)
     }
 
+    private var health: ToolCallHealthReport {
+        ToolCallHealth.compute(items: session.transcript)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -19,6 +23,7 @@ struct ToolStatsSheetView: View {
             } else {
                 table
             }
+            healthFooter
         }
         .frame(width: 520, height: 420)
         .background(Color(nsColor: .windowBackgroundColor))
@@ -119,6 +124,46 @@ struct ToolStatsSheetView: View {
             .padding(20)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    /// 只在有异常时出现：干净的会话不该为一条永远为 0 的指标付出版面。
+    @ViewBuilder
+    private var healthFooter: some View {
+        let health = self.health
+        if !health.isClean {
+            Divider()
+            VStack(alignment: .leading, spacing: 6) {
+                if health.toolFreeRounds > 0 {
+                    Label(
+                        "\(health.toolFreeRounds)/\(health.rounds) 轮全程没有调用任何工具",
+                        systemImage: "wrench.and.screwdriver"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                if !health.leakedTokens.isEmpty {
+                    Label(
+                        "疑似未解析的工具调用 \(health.leakedTokenCount) 处：\(leakSummary(health))",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    Text("控制标记出现在正文里，说明工具调用是在模型/网关侧漏掉的，不是任务没做。")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+        }
+    }
+
+    private func leakSummary(_ health: ToolCallHealthReport) -> String {
+        health.leakedTokens
+            .prefix(3)
+            .map { $0.count > 1 ? "\($0.token) ×\($0.count)" : $0.token }
+            .joined(separator: "、")
     }
 
     private var overallAverage: TimeInterval? {

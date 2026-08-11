@@ -1,0 +1,112 @@
+/**
+ * Slash command interaction semantics, mirroring Swift PipiUI's
+ * SlashCommand / SlashPaletteQuery / SlashFuzzy / BuiltinCommands.parseInvocation
+ * across both desktop clients.
+ *
+ * Pure logic only — no React, no host protocol. UI consumes this from the
+ * Composer and the slash palette.
+ */
+
+/** Action dispatched when a slash command is executed from the composer. */
+export type SlashAction =
+  | { kind: 'open-model-manager' }
+  /** Compact the session context now, via the host's `compact` method. */
+  | { kind: 'compact' }
+  /** Reserved for future rounds: /thinking, /new … */
+  | { kind: 'not-implemented' }
+
+export interface SlashCommandDef {
+  /** Command name without the leading '/'. */
+  name: string
+  description: string
+  action: SlashAction
+}
+
+/**
+ * Builtin slash commands, mirroring Swift `BuiltinCommands.all`. Extensible:
+ * future rounds append e.g.
+ *   { name: 'thinking', description: '调整思考级别', action: { kind: 'not-implemented' } }
+ *   { name: 'new',      description: '新建会话',   action: { kind: 'not-implemented' } }
+ * with their own action kinds.
+ */
+export const slashCommands: readonly SlashCommandDef[] = [
+  { name: 'model', description: '管理模型可见性', action: { kind: 'open-model-manager' } },
+  { name: 'compact', description: '压缩上下文', action: { kind: 'compact' } }
+]
+
+export function slashCommandByName(name: string): SlashCommandDef | undefined {
+  return slashCommands.find(command => command.name === name)
+}
+
+/**
+ * Mirrors Swift `SlashPaletteQuery.paletteQuery`: the palette is eligible only
+ * while the draft is a bare `/query` (leading whitespace tolerated, no inner
+ * whitespace — an argument starts hiding the palette). Returns null when the
+ * palette must not show.
+ */
+export function slashPaletteQuery(draft: string): string | null {
+  const trimmed = draft.trimStart()
+  if (!trimmed.startsWith('/')) return null
+  const rest = trimmed.slice(1)
+  if (/\s/.test(rest)) return null
+  return rest
+}
+
+function isBoundary(name: string, index: number): boolean {
+  if (index <= 0) return true
+  const prev = name[index - 1]
+  if (prev === '-' || prev === '_' || prev === ':' || prev === '/') return true
+  const cur = name[index]
+  return prev >= 'a' && prev <= 'z' && cur >= 'A' && cur <= 'Z'
+}
+
+/** Mirrors Swift `SlashFuzzy.score`: subsequence match with boundary and
+ *  consecutive bonuses. Higher is better; null means no match. */
+export function slashFuzzyScore(query: string, name: string): number | null {
+  const q = query.toLowerCase()
+  const n = name.toLowerCase()
+  if (!q) return 0
+  let qi = 0
+  let score = 0
+  let prevMatched = -2
+  let firstMatchIndex: number | undefined
+  for (let ni = 0; ni < n.length && qi < q.length; ni++) {
+    if (n[ni] !== q[qi]) continue
+    score += 1
+    if (ni === prevMatched + 1) score += 3
+    if (firstMatchIndex === undefined) {
+      firstMatchIndex = ni
+      if (ni === 0) score += 5
+      else if (isBoundary(name, ni)) score += 2
+    }
+    prevMatched = ni
+    qi += 1
+  }
+  return qi === q.length ? score : null
+}
+
+/** Mirrors Swift `SlashFuzzy.filter`: fuzzy-ranked command list for the query. */
+export function filterSlashCommands(query: string): SlashCommandDef[] {
+  const q = query.trim()
+  if (!q) return [...slashCommands]
+  return slashCommands
+    .map(command => ({ command, score: slashFuzzyScore(q, command.name) }))
+    .filter((item): item is { command: SlashCommandDef; score: number } => item.score !== null)
+    .sort((a, b) => b.score - a.score || a.command.name.localeCompare(b.command.name))
+    .map(item => item.command)
+}
+
+/**
+ * Mirrors Swift `BuiltinCommands.parseInvocation`: split a trimmed draft into
+ * `/name args`. Returns null for non-slash text.
+ */
+export function parseSlashInvocation(text: string): { name: string; args: string } | null {
+  const trimmed = text.trim()
+  if (!trimmed.startsWith('/') || trimmed.length < 2) return null
+  const rest = trimmed.slice(1)
+  const tokenEnd = rest.search(/\s/)
+  const token = tokenEnd === -1 ? rest : rest.slice(0, tokenEnd)
+  if (!token) return null
+  const args = tokenEnd === -1 ? '' : rest.slice(tokenEnd).trim()
+  return { name: token, args }
+}

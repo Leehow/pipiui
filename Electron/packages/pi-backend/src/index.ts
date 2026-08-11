@@ -1,4 +1,4 @@
-import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
 import { createReadStream, existsSync, promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -6,6 +6,7 @@ import { createInterface } from "node:readline";
 
 import {
   PIPI_HOST_PROTOCOL_VERSION,
+  type AgentDefinition,
   type AgentEvent,
   type AgentSummary,
   type AuthLoginEvent,
@@ -24,17 +25,19 @@ import {
   type QuotaSnapshot,
   type Session,
   type SessionStats,
+  type SubagentModelSetting,
   type ThinkingLevel,
   type WorktreeStatus,
 } from "@pipi/host-api";
 import {
   assemblePiSpawn,
   defaultRuntimeRoot,
+  mergedSpawnEnvironment,
   resolvePiExecutable,
   resolveSpawnPaths,
-  sanitizeEnvironment,
   withToolPath,
   type ComputerDescriptor,
+  type PiCommand,
   type SpawnFeatures,
 } from "./spawn-assembly.js";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
@@ -51,7 +54,24 @@ import {
   type QueuedMessage,
 } from "./message-queue.js";
 import { FileQueueStore, type QueueStore } from "./queue-store.js";
-import { QuotaStore } from "./quota.js";
+import { QuotaStore, parseDotEnv } from "./quota.js";
+import {
+  appendLedgerRecord,
+  latestContextBySession,
+  readLedgerFile,
+} from "./token-ledger.js";
+import {
+  ProactiveCompactionScheduler,
+  type ProactiveCompactionConfiguration,
+} from "./proactive-compaction.js";
+export {
+  ProactiveCompactionPolicy,
+  ProactiveCompactionScheduler,
+  STANDARD_PROACTIVE_COMPACTION,
+  contextUsageFraction,
+  type ContextUsageLike,
+  type ProactiveCompactionConfiguration,
+} from "./proactive-compaction.js";
 export {
   ensureManagedPackage,
   ensureManagedPackages,
@@ -63,11 +83,13 @@ export {
   assemblePiSpawn,
   defaultRuntimeRoot,
   MANAGED_PACKAGES,
+  mergedSpawnEnvironment,
   type ManagedPackage,
   resolvePiExecutable,
   resolveSpawnPaths,
   sanitizeEnvironment,
   withToolPath,
+  type PiCommand,
 } from "./spawn-assembly.js";
 export {
   HostBridge,
@@ -113,30 +135,67 @@ export {
 } from "./message-queue.js";
 export { FileQueueStore, type QueueStore } from "./queue-store.js";
 export {
+  ledgerLine,
+  parseLedgerLine,
+  readLedgerFile,
+  appendLedgerRecord,
+  latestContextBySession,
+  type LedgerContextRecord,
+  type SessionLastContext,
+} from "./token-ledger.js";
+export {
+  BALANCE_ACCOUNT_LABEL,
+  balanceProviderFor,
   codexWindowLabel,
   CODEX_USAGE_URL,
+  DEEPSEEK_BALANCE_URL,
+  deepSeekApiKey,
   fetchCodexQuota,
+  fetchDeepSeekBalance,
   parseCodexAuth,
   parseCodexUsageWindows,
+  parseDeepSeekBalance,
+  parseDotEnv,
   QUOTA_ACCOUNT_LABELS,
   quotaProviderFor,
   QuotaStore,
   QUOTA_STALE_AFTER_MS,
+  type BalanceProviderKind,
   type CodexCredentials,
   type QuotaFetchDeps,
   type QuotaProviderKind,
 } from "./quota.js";
 
 type Rpc = Record<string, any>;
+
+/** Swift `AgentCatalog.builtInAgents` parity for the Electron settings surface. */
+const BUILT_IN_AGENT_DEFINITIONS: AgentDefinition[] = [
+  { name: "explore", description: "Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files." },
+  { name: "plan", description: "Grok-style planning agent. Explores and produces an implementation plan; does not edit files." },
+  { name: "general-purpose", description: "Grok-style full-capability worker. Implements tasks in an isolated context." },
+  { name: "reviewer", description: "Read-only code review specialist for quality and security." },
+  { name: "computer-use-leader", description: "Computer Use supervisor. Plans desktop work, receives every private worker result, owns recovery decisions, and returns the single final report." },
+  { name: "operator", description: "Computer-use desktop worker. Performs macOS desktop operations and returns a compressed text verdict; does not edit code files." },
+  { name: "computer-verifier", description: "Observe-only Computer Use verifier. Takes a fresh desktop observation and independently checks the Leader's requested postconditions." },
+  { name: "computer-terminal", description: "Bounded terminal worker using an attenuated one-run Host tool broker; receives no desktop capability." },
+  { name: "secretary", description: "Boss closeout secretary. Reconciles agent outcomes, worktrees, branches, verification, temporary artifacts, and the existing Boss ledger without creating another worktree." },
+  { name: "long-test", description: "Long-running test runner. Executes end-to-end suites, integration/regression sweeps, opt-in long tests, and cross-repo E2E harnesses; reports pass/fail without fixing code." },
+];
+
 type ProcFactory = (
   bin: string,
   args: string[],
   options: any,
 ) => ChildProcessWithoutNullStreams;
 export type PiBackendOptions = {
+  /** Explicit Pi process invocation. Packaged Electron supplies bundled Node + unpacked Pi CLI. */
+  piCommand?: PiCommand;
+  /** Legacy/development shorthand for a directly executable external `pi`. */
   piPath?: string;
   sessionsRoot?: string;
   /** App-specific installed extension tree. */ runtimeRoot?: string;
+  /** Real on-disk node_modules containing the two bundled, pinned managed extensions. */
+  managedNodeModulesRoot?: string;
   /**
    * Shipped extension sources. When set, the runtime tree is refreshed from them before every
    * spawn, so an edit under the Electron runtime source reaches the next session without
@@ -151,7 +210,13 @@ export type PiBackendOptions = {
   env?: NodeJS.ProcessEnv;
   browserAction?: (
     request: Record<string, unknown>,
+    sessionId: string,
   ) => Promise<Record<string, unknown>>;
+  terminalAction?: (
+    request: Record<string, unknown>,
+    sessionId: string,
+  ) => Promise<Record<string, unknown>>;
+  terminalSessionDeleted?: (sessionId: string) => void;
   computerAction?: (
     request: Record<string, unknown>,
   ) => Promise<Record<string, unknown>>;
@@ -162,7 +227,26 @@ export type PiBackendOptions = {
   authNodePath?: string;
   /** Injectable queue persistence; defaults to ~/.pi/agent/pipiui-queues. */ queueStore?: QueueStore;
   /** Injectable account-quota store for tests; defaults to the real Codex fetch. */ quotaStore?: QuotaStore;
+  /** Watermarks/delays for idle-time compaction; defaults to the Swift app's. */
+  compaction?: ProactiveCompactionConfiguration;
+  /** Testable canonical Swift project source; undefined preserves existing host state. */
+  canonicalProjectPaths?: () => Promise<string[] | undefined>;
 };
+
+async function swiftCanonicalProjectPaths(env: NodeJS.ProcessEnv): Promise<string[] | undefined> {
+  if (process.platform !== "darwin") return undefined;
+  const home = env.HOME || homedir();
+  const plist = join(home, "Library", "Preferences", "com.leehow.pipiui.plist");
+  return new Promise(resolveValue => {
+    execFile("/usr/bin/plutil", ["-extract", "pipiui\\.projects", "json", "-o", "-", plist], { env }, (error, stdout) => {
+      if (error) { resolveValue(undefined); return; }
+      try {
+        const value: unknown = JSON.parse(stdout);
+        resolveValue(Array.isArray(value) && value.every(path => typeof path === "string" && path.length > 0) ? [...new Set(value)] : undefined);
+      } catch { resolveValue(undefined); }
+    });
+  });
+}
 type Live = {
   session: Session;
   path: string;
@@ -177,6 +261,14 @@ type Live = {
   followUps: string[];
   /** contentIndex → streamed tool-args JSON, assembled from toolcall_delta until toolcall_end. */
   toolArgs: Map<number, string>;
+  /** Idle-time context compaction; also tracks pi's own compaction lifecycle. */
+  compaction: ProactiveCompactionScheduler;
+  /**
+   * This compaction started outside a turn, so it — not `agent_settled` — owns
+   * the queue's busy flag until `compaction_end`. Prompts typed meanwhile wait
+   * in the normal queue instead of racing pi mid-compaction.
+   */
+  compactionHoldsQueue?: boolean;
 };
 const text = (content: any) =>
   typeof content === "string"
@@ -209,6 +301,8 @@ type SessionMeta = {
   header: any;
   name?: string;
   updatedAt: number;
+  /** Latest `model_change` entry in the JSONL (provider/modelId), when present. */
+  model?: { provider: string; modelId: string } | null;
 };
 const METADATA_HEAD_BYTES = 64 * 1024,
   METADATA_TAIL_BYTES = 64 * 1024;
@@ -241,6 +335,21 @@ function sessionName(records: any[]): string | undefined {
     }
   }
 }
+/** Latest `model_change` row in file order (pi persists the session model as a model_change entry). */
+function sessionModelFromRows(rows: any[]): { provider: string; modelId: string } | null {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const r = rows[i];
+    if (
+      r?.type === "model_change" &&
+      typeof r.provider === "string" &&
+      r.provider &&
+      typeof r.modelId === "string" &&
+      r.modelId
+    )
+      return { provider: r.provider, modelId: r.modelId };
+  }
+  return null;
+}
 /** Bounded metadata probe: header plus a small head/tail window, never a full JSONL parse. */
 async function readSessionMeta(path: string): Promise<SessionMeta> {
   const stat = await fs.stat(path);
@@ -256,15 +365,17 @@ async function readSessionMeta(path: string): Promise<SessionMeta> {
     const tail = Buffer.alloc(tailLength);
     await handle.read(tail, 0, tailLength, Math.max(0, stat.size - tailLength));
     const tailRows = parseLines(tail.toString("utf8"));
-    const last = [...tailRows]
+    const rows = [...headRows, ...tailRows];
+    const last = [...rows]
       .reverse()
       .find((row) => typeof row?.timestamp === "string");
     const timestamp = Date.parse(last?.timestamp ?? "");
     return {
       path,
       header,
-      name: sessionName([...headRows, ...tailRows]),
+      name: sessionName(rows),
       updatedAt: Number.isFinite(timestamp) ? timestamp : stat.mtimeMs,
+      model: sessionModelFromRows(rows),
     };
   } finally {
     await handle.close();
@@ -465,6 +576,15 @@ export class PiHostBackend implements HostBackend {
   private listeners = new Set<(event: HostEvent) => void>();
   private live = new Map<string, Live>();
   private leases = new Map<string, LeaseManager>();
+  /**
+   * Per-session in-flight spawn (ensure) promises. Concurrent ensure() calls for
+   * the same cold session share one spawn, so only the winner races the
+   * single-winner lease acquire(); losers await its result instead of losing
+   * the lease and surfacing a spurious "session is read-only" error. Cleared on
+   * settle (success or failure) so a later call can re-attempt after a failure;
+   * different sessions stay fully parallel.
+   */
+  private ensureInFlight = new Map<string, Promise<Live>>();
   private models: Model[] = [];
   private modelState: ModelState = {
     model: {
@@ -478,11 +598,18 @@ export class PiHostBackend implements HostBackend {
   };
   private sessionModelStates = new Map<string, ModelState>();
   private sessionModelSnapshots = new Map<string, ModelState>();
+  /** Per-session last-known context occupancy, rehydrated from the token ledger on cold start. */
+  private sessionContextLastKnown = new Map<
+    string,
+    { tokens: number; contextWindow: number; percent: number | null }
+  >();
+  private sessionContextLedgerLoaded?: Promise<void>;
   private computerDescriptor?: ComputerDescriptor;
   private computerUsable: () => boolean = () => false;
   private root: string;
-  private pi: string;
+  private piCommand: PiCommand;
   private runtimeRoot: string;
+  private managedNodeModulesRoot?: string;
   private runtimeAssets?: RuntimeAssets;
   private agentDir: string;
   private features: SpawnFeatures;
@@ -504,23 +631,37 @@ export class PiHostBackend implements HostBackend {
   private queueWrites = new Map<string, Promise<void>>();
   private closed = false;
   private bridge: HostBridge;
+  private compactionConfiguration?: ProactiveCompactionConfiguration;
+  private canonicalProjectPaths: () => Promise<string[] | undefined>;
+  private terminalSessionDeleted?: (sessionId: string) => void;
   constructor(options: PiBackendOptions = {}) {
+    this.terminalSessionDeleted = options.terminalSessionDeleted;
+    this.compactionConfiguration = options.compaction;
     this.computerDescriptor = options.computerDescriptor;
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
     this.root = options.sessionsRoot ?? join(this.agentDir, "sessions");
-    this.pi = options.piPath ?? resolvePiExecutable(options.env ?? process.env);
+    this.piCommand = options.piCommand
+      ? {
+          executable: options.piCommand.executable,
+          prefixArgs: [...(options.piCommand.prefixArgs ?? [])],
+          env: { ...(options.piCommand.env ?? {}) },
+          piPath: options.piCommand.piPath,
+        }
+      : { executable: options.piPath ?? resolvePiExecutable(options.env ?? process.env) };
     this.runtimeRoot = options.runtimeRoot ?? defaultRuntimeRoot();
+    this.managedNodeModulesRoot = options.managedNodeModulesRoot;
     this.runtimeAssets = options.runtimeAssets;
     this.features = options.features ?? DEFAULT_FEATURES;
     this.proc = options.spawn ?? (spawn as ProcFactory);
     this.env = options.env ?? process.env;
+    this.canonicalProjectPaths = options.canonicalProjectPaths ?? (() => swiftCanonicalProjectPaths(this.env));
     const queueRoot =
       options.agentDir || !options.sessionsRoot
         ? join(this.agentDir, "pipiui-queues")
         : join(this.root, ".pipiui-queues");
     this.queueStore = options.queueStore ?? new FileQueueStore(queueRoot);
-    this.quotaStore = options.quotaStore ?? new QuotaStore(this.env);
+    this.quotaStore = options.quotaStore ?? new QuotaStore(this.env, { agentDir: this.agentDir });
     this.queue = new SessionMessageQueue({
       dispatch: (id, payload, behavior) =>
         this.dispatchQueuedMessage(id, payload, behavior),
@@ -529,10 +670,14 @@ export class PiHostBackend implements HostBackend {
     this.bridge = new HostBridge({
       onAgentEvent: (event, sessionId) => this.mapAgentEvent(event, sessionId),
       onPlanEvent: (event, sessionId) => this.planEvent(event, sessionId),
-      onBrowserAction: async (event) =>
+      onBrowserAction: async (event, sessionId) =>
         options.browserAction
-          ? options.browserAction(event)
+          ? options.browserAction(event, sessionId)
           : { ok: false, error: "browser host unavailable" },
+      onTerminalAction: async (event, sessionId) =>
+        options.terminalAction
+          ? options.terminalAction(event, sessionId)
+          : { ok: false, error: "terminal host unavailable" },
       onComputerAction: async (event) =>
         options.computerAction
           ? options.computerAction(event)
@@ -543,10 +688,10 @@ export class PiHostBackend implements HostBackend {
     } else if (options.authHelperPath) {
       this.authRuntimePromise = Promise.resolve(new ExternalAuthRuntime({
         helperPath: options.authHelperPath,
-        nodePath: options.authNodePath,
-        piPath: this.pi,
+        nodePath: options.authNodePath ?? (this.piCommand.prefixArgs?.length ? this.piCommand.executable : undefined),
+        piPath: this.piCommand.piPath ?? this.piCommand.executable,
         agentDir: this.agentDir,
-        env: this.env,
+        env: { ...this.env, ...(this.piCommand.env ?? {}) },
       }));
     }
     this.auth = new ProviderAuthBackend({
@@ -573,6 +718,7 @@ export class PiHostBackend implements HostBackend {
     const live = [...this.live.values()];
     this.live.clear();
     for (const item of live) {
+      item.compaction.dispose();
       for (const pending of item.pending.values())
         pending.reject(new Error("host backend closed"));
       item.pending.clear();
@@ -709,6 +855,7 @@ export class PiHostBackend implements HostBackend {
         header,
         name: manager.getSessionName() ?? meta.name,
         updatedAt: last?.timestamp ? asTime(last.timestamp) : meta.updatedAt,
+        model: sessionModelFromRows(entries) ?? meta.model,
       };
     } catch (error) {
       console.warn(
@@ -716,6 +863,48 @@ export class PiHostBackend implements HostBackend {
       );
       return meta;
     }
+  }
+  /** Resolve a session's model: in-memory snapshot (set this host run, may not be flushed yet) wins over the JSONL probe. */
+  private sessionModelOf(s: SessionMeta): { provider: string; modelId: string } | null {
+    const inMemory =
+      this.sessionModelStates.get(s.header.id) ??
+      this.sessionModelSnapshots.get(s.header.id);
+    if (inMemory) {
+      const m = inMemory.model;
+      if (m.provider !== "unknown" && m.id !== "unknown")
+        return { provider: m.provider, modelId: m.id };
+    }
+    return s.model ?? null;
+  }
+  /**
+   * Model to spawn a session with: an in-memory selection wins; a cold session
+   * restores its JSONL `model_change` (per-session binding); only sessions with
+   * no model record inherit the configured global default.
+   */
+  private desiredModelFor(s: SessionMeta): ModelState {
+    const inMemory =
+      this.sessionModelStates.get(s.header.id) ??
+      this.sessionModelSnapshots.get(s.header.id);
+    if (inMemory) return inMemory;
+    const base = this.modelState;
+    const ref = this.sessionModelOf(s);
+    if (!ref) return base;
+    const known = this.models.find(
+      (m) => m.provider === ref.provider && m.id === ref.modelId,
+    );
+    const model: Model = known ?? {
+      provider: ref.provider,
+      id: ref.modelId,
+      name: ref.modelId,
+      reasoning: false,
+    };
+    return {
+      ...base,
+      model,
+      availableThinkingLevels: model.reasoning
+        ? ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        : ["off"],
+    };
   }
   private project(path: string): Project {
     return { id: dirId(path), name: basename(path) || path, path };
@@ -807,6 +996,7 @@ export class PiHostBackend implements HostBackend {
             projectId: pid,
             name: s.name ?? "Session",
             updatedAt: s.updatedAt,
+            model: this.sessionModelOf(s),
           }))
           .sort((a, b) => b.updatedAt - a.updatedAt);
       }
@@ -823,6 +1013,10 @@ export class PiHostBackend implements HostBackend {
       }
       case "deleteSession": {
         const s = await this.locate(params[0] as string);
+        // Revoke tool authority before any asynchronous filesystem/process
+        // cleanup; otherwise a stale Pi process can recreate deleted resources.
+        this.bridge.unregister(s.header.id);
+        this.terminalSessionDeleted?.(s.header.id);
         await this.leases.get(s.header.id)?.release();
         this.leases.delete(s.header.id);
         await this.queueWrites.get(s.header.id)?.catch(() => undefined);
@@ -907,10 +1101,16 @@ export class PiHostBackend implements HostBackend {
         );
       case "queueFollowUp":
         return this.prompt(params[0] as string, params[1] as string, true);
+      case "compact":
+        return this.compactSession(params[0] as string);
       case "getHiddenModelIds":
         return this.loadHiddenModelIds();
       case "setHiddenModelIds":
         return this.saveHiddenModelIds(params[0]);
+      case "getSidebarSessionPreferences":
+        return this.loadSidebarSessionPreferences();
+      case "setSidebarSessionPreferences":
+        return this.saveSidebarSessionPreferences(params[0]);
       case "authProviders":
         return this.auth.listProviders();
       case "beginProviderLogin":
@@ -930,6 +1130,16 @@ export class PiHostBackend implements HostBackend {
         return;
       case "removeProviderCredentials":
         return this.removeProviderCredentials(params[0] as string);
+      case "getComputerUseState":
+        return { enabled: await this.loadComputerUseEnabled() };
+      case "setComputerUseEnabled":
+        return { enabled: await this.saveComputerUseEnabled(params[0]) };
+      case "getSubagentModels":
+        return this.loadSubagentModels();
+      case "setSubagentModel":
+        return this.saveSubagentModel(params[0], params[1]);
+      case "listAgentDefinitions":
+        return BUILT_IN_AGENT_DEFINITIONS.map((agent) => ({ ...agent }));
       case "listModels":
         await this.loadModelCatalog();
         return this.models;
@@ -951,7 +1161,7 @@ export class PiHostBackend implements HostBackend {
       case "getSessionStats":
         return this.getSessionStats(params[0] as string | undefined);
       case "getQuotaSnapshot":
-        return this.getQuotaSnapshot();
+        return this.getQuotaSnapshot(params[0] as string | undefined);
       case "listAgents": {
         const sessionId = params[0] as string | undefined;
         return [...this.agents.values()].filter(
@@ -989,6 +1199,7 @@ export class PiHostBackend implements HostBackend {
           git: true,
           plan: false,
           retainedWorktreeDisposition: false,
+          compact: true,
         };
     }
   }
@@ -1026,6 +1237,7 @@ export class PiHostBackend implements HostBackend {
       projectId: dirId(s.header.cwd),
       name: s.name ?? "Session",
       updatedAt: s.updatedAt,
+      model: this.sessionModelOf(s),
     };
   }
   private leaseFor(s: { path: string; header: any }): LeaseManager {
@@ -1083,14 +1295,34 @@ export class PiHostBackend implements HostBackend {
       updatedAt: Date.now(),
     };
   }
-  private async ensure(id: string): Promise<Live> {
-    let live = this.live.get(id);
-    if (live) return live;
+  /**
+   * T17 parity: parse `~/.pi/agent/.env` for injection into the spawned pi process env.
+   * A missing/unreadable file is not an error — a GUI launch from Finder may have none.
+   */
+  private async readDotEnv(): Promise<Record<string, string>> {
+    try {
+      return parseDotEnv(await fs.readFile(join(this.agentDir, ".env"), "utf8"));
+    } catch {
+      return {};
+    }
+  }
+  private ensure(id: string): Promise<Live> {
+    const live = this.live.get(id);
+    if (live) return Promise.resolve(live);
+    const inFlight = this.ensureInFlight.get(id);
+    if (inFlight) return inFlight;
+    const attempt = this.spawnLive(id).finally(() => {
+      this.ensureInFlight.delete(id);
+    });
+    this.ensureInFlight.set(id, attempt);
+    return attempt;
+  }
+  private async spawnLive(id: string): Promise<Live> {
     await this.requireLease(id);
     const found = await this.locate(id);
     const session = this.toSession(found);
     await this.loadConfiguredModels();
-    const desired = this.sessionModelSnapshots.get(id) ?? this.modelState;
+    const desired = this.desiredModelFor(found);
     this.sessionModelSnapshots.set(id, desired);
     const bridgePort = await this.bridge.listen();
     const sessionCapability = this.bridge.register(id);
@@ -1105,7 +1337,9 @@ export class PiHostBackend implements HostBackend {
       cwd: found.header.cwd,
       runtimeRoot: this.runtimeRoot,
       features: this.features,
-      paths: resolveSpawnPaths(this.refreshRuntimeTree()),
+      paths: resolveSpawnPaths(this.refreshRuntimeTree(), {
+        managedNodeModulesRoot: this.managedNodeModulesRoot,
+      }),
       mainModelId: this.mainModelId(),
       bridgePort,
       bridgeRoutingKey: id,
@@ -1115,11 +1349,22 @@ export class PiHostBackend implements HostBackend {
         ? this.computerDescriptor
         : undefined,
     });
-    const child = this.proc(this.pi, ["--mode", "rpc", ...output.args], {
+    const child = this.proc(this.piCommand.executable, [
+      ...(this.piCommand.prefixArgs ?? []),
+      "--mode",
+      "rpc",
+      ...output.args,
+    ], {
       cwd: found.header.cwd,
+      // T17 parity: ~/.pi/agent/.env is layered under the internal PIPIUI_* contract
+      // (and wins over the host process env), so env-key providers like DeepSeek/Kimi
+      // that `listModels` sees via the auth runtime resolve in the RPC session too.
       env: withToolPath(
-        { ...sanitizeEnvironment(this.env), ...output.env },
-        this.pi,
+        mergedSpawnEnvironment(this.env, await this.readDotEnv(), {
+          ...output.env,
+          ...(this.piCommand.env ?? {}),
+        }),
+        this.piCommand.executable,
       ),
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -1127,6 +1372,7 @@ export class PiHostBackend implements HostBackend {
     const exit = new Promise<void>((resolve) => {
       resolveExit = resolve;
     });
+    let live!: Live;
     live = {
       session,
       path: found.path,
@@ -1137,6 +1383,11 @@ export class PiHostBackend implements HostBackend {
       pending: new Map(),
       followUps: [],
       toolArgs: new Map(),
+      compaction: new ProactiveCompactionScheduler({
+        configuration: this.compactionConfiguration,
+        isIdle: () => this.isSessionQuiet(id),
+        compact: () => this.command(id, { type: "compact" }),
+      }),
     };
     this.live.set(id, live);
     child.stdout.on("data", (chunk) => this.lines(live!, chunk.toString()));
@@ -1147,6 +1398,7 @@ export class PiHostBackend implements HostBackend {
     child.on("error", (error) => failPending(error));
     child.on("exit", () => {
       failPending(new Error("pi exited"));
+      live!.compaction.dispose();
       this.live.delete(id);
       this.bridge.unregister(id);
       resolveExit();
@@ -1198,6 +1450,7 @@ export class PiHostBackend implements HostBackend {
     }
     const id = live.session.id;
     if (e.type === "agent_start") {
+      live.compaction.cancel();
       void this.loadQueue(id).then(() => this.queue.markBusy(id));
       this.stream({ type: "status", sessionId: id, status: "started" });
     } else if (e.type === "agent_settled") {
@@ -1208,6 +1461,10 @@ export class PiHostBackend implements HostBackend {
         pendingFollowUps: live.followUps,
       });
       void this.queueIdle(id);
+      // A compact lifecycle that omitted its end event must not wedge the
+      // scheduler; settle is the final authority. The stats push that follows
+      // is what re-arms the policy.
+      live.compaction.settleTurn();
       void this.pushSessionStats(id);
     } else if (e.type === "agent_stopped" || e.type === "agent_error") {
       this.stream({
@@ -1217,6 +1474,44 @@ export class PiHostBackend implements HostBackend {
         pendingFollowUps: live.followUps,
       });
       void this.queueIdle(id);
+      live.compaction.settleTurn();
+    } else if (e.type === "compaction_start") {
+      live.compaction.compactionStarted();
+      // A compaction that started outside a turn (idle-time or `/compact`) must
+      // hold the queue itself: a prompt sent meanwhile would otherwise reach pi
+      // mid-compaction. Inside a turn the turn already owns the flag.
+      if (!this.queue.isBusy(id)) {
+        live.compactionHoldsQueue = true;
+        void this.loadQueue(id).then(() => this.queue.markBusy(id));
+      }
+      this.stream({
+        type: "compaction",
+        sessionId: id,
+        phase: "start",
+        reason: typeof e.reason === "string" ? e.reason : undefined,
+      });
+    } else if (e.type === "compaction_end") {
+      const aborted = e.aborted === true;
+      const error =
+        typeof e.errorMessage === "string" && e.errorMessage
+          ? e.errorMessage
+          : undefined;
+      live.compaction.compactionFinished(!aborted && !error);
+      if (live.compactionHoldsQueue) {
+        live.compactionHoldsQueue = false;
+        void this.queueIdle(id);
+      }
+      this.stream({
+        type: "compaction",
+        sessionId: id,
+        phase: "end",
+        reason: typeof e.reason === "string" ? e.reason : undefined,
+        aborted: aborted || undefined,
+        error,
+      });
+      // Compaction reports null tokens/percent until the next assistant usage;
+      // refresh so the pill drops the stale number instead of showing 316k/200k.
+      void this.pushSessionStats(id);
     } else if (e.type === "queue_update") {
       live.followUps = e.followUp ?? [];
       this.stream({
@@ -1386,11 +1681,90 @@ export class PiHostBackend implements HostBackend {
       throw new Error("projectPaths 必须是 string[]（每项不能为空）");
     return [...new Set(value)];
   }
+  /** Missing is intentionally false so upgraded Electron hosts stay desktop-safe. */
+  private async loadComputerUseEnabled(): Promise<boolean> {
+    const value = (await this.readSettings()).computerUseEnabled;
+    if (value === undefined) return false;
+    if (typeof value !== "boolean") throw new Error("computerUseEnabled 必须是 boolean");
+    return value;
+  }
+  private async saveComputerUseEnabled(value: unknown): Promise<boolean> {
+    if (typeof value !== "boolean") throw new Error("computerUseEnabled 必须是 boolean");
+    return this.updateSettings((settings) => {
+      settings.computerUseEnabled = value;
+      return value;
+    });
+  }
+  private checkedSubagentModelChain(value: unknown): SubagentModelSetting[] {
+    if (!Array.isArray(value) || !value.every((entry) =>
+      isRecord(entry) && typeof entry.model === "string" && entry.model.trim().length > 0 &&
+      (entry.thinking === undefined || typeof entry.thinking === "string"),
+    )) throw new Error("subagentModels 必须是 { model, thinking? }[]");
+    return value.map((entry) => ({
+      model: (entry as { model: string }).model,
+      ...((entry as { thinking?: string }).thinking === undefined
+        ? {}
+        : { thinking: (entry as { thinking: string }).thinking }),
+    }));
+  }
+  private async loadSubagentModels(): Promise<Record<string, SubagentModelSetting[]>> {
+    const value = (await this.readSettings()).subagentModels;
+    if (value === undefined) return {};
+    if (!isRecord(value)) throw new Error("subagentModels 必须是 object");
+    return Object.fromEntries(Object.entries(value).map(([name, chain]) => {
+      if (!name.trim()) throw new Error("subagentModels agent name 不能为空");
+      return [name, this.checkedSubagentModelChain(chain)];
+    }));
+  }
+  private subagentModelsRuntimeFile(): string {
+    return join(this.env.HOME || homedir(), "Library", "Application Support", "PipiUI", "subagent-models.json");
+  }
+  private async materializeSubagentModels(value: Record<string, SubagentModelSetting[]>): Promise<void> {
+    const target = this.subagentModelsRuntimeFile();
+    await fs.mkdir(dirname(target), { recursive: true });
+    const tmp = `${target}.tmp-${process.pid}-${Date.now()}-${crypto.randomUUID()}`;
+    await fs.writeFile(tmp, JSON.stringify(value, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+    await fs.rename(tmp, target);
+  }
+  private async saveSubagentModel(agentName: unknown, chain: unknown): Promise<Record<string, SubagentModelSetting[]>> {
+    if (typeof agentName !== "string" || !agentName.trim())
+      throw new Error("subagent agentName 必须是非空 string");
+    const checkedChain = this.checkedSubagentModelChain(chain);
+    const all = await this.updateSettings((settings) => {
+      const current = settings.subagentModels;
+      if (current !== undefined && !isRecord(current))
+        throw new Error("subagentModels 必须是 object");
+      const all: Record<string, SubagentModelSetting[]> = current
+        ? Object.fromEntries(Object.entries(current).map(([name, value]) => [name, this.checkedSubagentModelChain(value)]))
+        : {};
+      if (checkedChain.length) all[agentName] = checkedChain;
+      else delete all[agentName];
+      settings.subagentModels = all;
+      return all;
+    });
+    await this.materializeSubagentModels(all);
+    return all;
+  }
   /** Initializes an explicit empty sidebar once. Version presence makes [] durable. */
   private async loadProjectPaths(): Promise<string[]> {
     if (!this.projectPathsLoaded) {
       this.projectPathsLoaded = (async () => {
         const settings = await this.readSettings();
+        if (settings.projectPathsCanonicalMigrationVersion !== 1) {
+          const canonical = await this.canonicalProjectPaths();
+          if (canonical !== undefined) {
+            this.projectPaths = await this.updateSettings(current => {
+              if (current.projectPathsCanonicalMigrationVersion === 1)
+                return this.checkedProjectPaths(current.projectPaths);
+              current.projectPathsVersion = 1;
+              current.projectPaths = this.checkedProjectPaths(canonical);
+              current.projectPathsCanonicalMigrationVersion = 1;
+              current.projectPathsCanonicalMigrationSource = "com.leehow.pipiui:pipiui.projects";
+              return [...canonical];
+            });
+            return;
+          }
+        }
         if (settings.projectPathsVersion === 1) {
           this.projectPaths = this.checkedProjectPaths(settings.projectPaths);
           return;
@@ -1475,6 +1849,32 @@ export class PiHostBackend implements HostBackend {
     this.hiddenIds = [...sorted];
     this.hiddenIdsLoaded = Promise.resolve();
     return [...sorted];
+  }
+  private checkedSidebarSessionPreferences(value: unknown): { pinnedSessionIds: string[]; archivedSessionIds: string[] } {
+    if (!isRecord(value)) throw new Error("sidebarSessionPreferences 必须是 object");
+    const checked = (key: "pinnedSessionIds" | "archivedSessionIds") => {
+      const ids = value[key];
+      if (!Array.isArray(ids) || !ids.every(id => typeof id === "string" && id.length > 0))
+        throw new Error(`${key} 必须是非空 string[]`);
+      return [...new Set(ids)];
+    };
+    const pinnedSessionIds = checked("pinnedSessionIds");
+    const archived = new Set(checked("archivedSessionIds"));
+    // A session cannot occupy both semantic sections; archive wins.
+    return { pinnedSessionIds: pinnedSessionIds.filter(id => !archived.has(id)), archivedSessionIds: [...archived] };
+  }
+  private async loadSidebarSessionPreferences(): Promise<{ pinnedSessionIds: string[]; archivedSessionIds: string[] }> {
+    const value = (await this.readSettings()).sidebarSessionPreferences;
+    return value === undefined
+      ? { pinnedSessionIds: [], archivedSessionIds: [] }
+      : this.checkedSidebarSessionPreferences(value);
+  }
+  private async saveSidebarSessionPreferences(value: unknown): Promise<{ pinnedSessionIds: string[]; archivedSessionIds: string[] }> {
+    const checked = this.checkedSidebarSessionPreferences(value);
+    return this.updateSettings(settings => {
+      settings.sidebarSessionPreferences = checked;
+      return { pinnedSessionIds: [...checked.pinnedSessionIds], archivedSessionIds: [...checked.archivedSessionIds] };
+    });
   }
   private async modelRuntime(): Promise<AuthRuntimeLike> {
     if (!this.authRuntimePromise) {
@@ -1700,34 +2100,132 @@ export class PiHostBackend implements HostBackend {
     return state;
   }
   /**
+   * Per-session last-known context persistence. Same file name and line format
+   * as Swift's TokenLedger (`pipiui-token-ledger.jsonl`), written beside the
+   * host's other state in `~/.pi/agent`; existing files are parsed with the
+   * same reader, so records from earlier runs (or a Swift host sharing the
+   * sessions) are reused instead of recreated with a new format.
+   */
+  private contextLedgerFile(): string {
+    return join(this.agentDir, "pipiui-token-ledger.jsonl");
+  }
+  private loadSessionContextLedger(): Promise<void> {
+    if (!this.sessionContextLedgerLoaded) {
+      this.sessionContextLedgerLoaded = this.readSessionContextLedger();
+    }
+    return this.sessionContextLedgerLoaded;
+  }
+  private async readSessionContextLedger(): Promise<void> {
+    try {
+      const records = await readLedgerFile(this.contextLedgerFile());
+      for (const [session, context] of latestContextBySession(records)) {
+        if (this.sessionContextLastKnown.has(session)) continue;
+        if (typeof context.contextWindow === "number" && context.contextWindow > 0)
+          this.sessionContextLastKnown.set(session, {
+            tokens: context.tokens,
+            contextWindow: context.contextWindow,
+            percent: context.percent,
+          });
+      }
+    } catch {
+      /* a missing/unreadable ledger is fine; live stats still work */
+    }
+  }
+  /** Best-effort ledger append of one observed context sample. */
+  private persistSessionContext(
+    id: string,
+    known: { tokens: number; contextWindow: number },
+    model: Model,
+  ): void {
+    const ref =
+      model.provider === "unknown" && model.id === "unknown"
+        ? "?"
+        : `${model.provider}/${model.id}`;
+    void appendLedgerRecord(this.contextLedgerFile(), {
+      ts: new Date().toISOString(),
+      session: id,
+      channel: "main",
+      depth: 0,
+      model: ref,
+      turn: 0,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: 0,
+      contextTokens: known.tokens,
+      contextWindow: known.contextWindow,
+    });
+  }
+  /**
    * Real pi `get_session_stats` RPC mapped onto the stable SessionStats shape.
    * `sessionId` is optional and defaults to the current active (most recently
    * started) live session; a cold session is spawned like any resume so stats
    * always come from pi, never from renderer-side JSONL scanning.
    */
   private async getSessionStats(sessionId?: string): Promise<SessionStats> {
+    await this.loadSessionContextLedger();
     const id = sessionId ?? [...this.live.keys()].at(-1);
     if (!id) throw new Error("no active session; pass an explicit sessionId");
     const live = await this.ensure(id);
     return this.sessionStatsData(live.session.id);
   }
   /**
-   * Account-quota snapshot for the provider backing the current model (Codex
-   * plan today). Mirrors the Swift app's quota capsule below the input bar;
-   * resolves null — never throws — when the provider has no quota source.
+   * Account-quota snapshot for the requested session's model. A session model
+   * can differ from the configured default, so using `this.modelState` here
+   * made a live Codex session ask the quota store for the wrong provider and
+   * silently hide its pills. The optional no-id form remains the legacy
+   * configured-default query.
    */
-  private async getQuotaSnapshot(): Promise<QuotaSnapshot | null> {
+  private async getQuotaSnapshot(sessionId?: string): Promise<QuotaSnapshot | null> {
     await this.loadConfiguredModels();
-    const provider = this.modelState.model.provider;
-    return this.quotaStore.snapshot(provider);
+    const state = sessionId
+      ? this.sessionModelStates.get(sessionId) ?? this.sessionModelSnapshots.get(sessionId) ?? await this.getModelState(sessionId)
+      : this.modelState;
+    return this.quotaStore.snapshot(state.model.provider);
   }
   private async sessionStatsData(id: string): Promise<SessionStats> {
+    await this.loadSessionContextLedger();
+    // Issue order is recorded before the RPC so a stale pre-compaction response
+    // can never re-arm the policy after a compaction already succeeded.
+    const generation = this.live.get(id)?.compaction.beginUsageRequest();
     const data = await this.command(id, { type: "get_session_stats" });
     const tokens = isRecord(data?.tokens) ? data.tokens : {};
-    const contextUsage: any = isRecord(data?.contextUsage)
+    const liveUsage: any = isRecord(data?.contextUsage)
       ? data.contextUsage
       : undefined;
     const model = (this.sessionModelStates.get(id) ?? this.modelState).model;
+    // Per-session last-known context: fresh live occupancy is remembered and
+    // persisted to the token ledger; when pi omits usage (e.g. right after
+    // compaction) the snapshot falls back to last-known instead of dropping
+    // the ring entirely.
+    let contextUsage = liveUsage;
+    if (liveUsage) {
+      const liveTokens =
+        typeof liveUsage.tokens === "number" ? liveUsage.tokens : null;
+      const liveWindow = num(liveUsage.contextWindow);
+      if (liveTokens !== null && liveWindow > 0) {
+        const known = {
+          tokens: liveTokens,
+          contextWindow: liveWindow,
+          percent:
+            typeof liveUsage.percent === "number"
+              ? liveUsage.percent
+              : Math.min(100, (liveTokens / liveWindow) * 100),
+        };
+        this.sessionContextLastKnown.set(id, known);
+        this.persistSessionContext(id, known, model);
+      }
+    } else {
+      const known = this.sessionContextLastKnown.get(id);
+      if (known) {
+        contextUsage = {
+          tokens: known.tokens,
+          contextWindow: known.contextWindow,
+          percent: known.percent,
+        };
+      }
+    }
     const stats: SessionStats = {
       sessionId: id,
       tokens: {
@@ -1756,7 +2254,35 @@ export class PiHostBackend implements HostBackend {
           ? undefined
           : { provider: model.provider, id: model.id, name: model.name },
     };
+    if (generation !== undefined)
+      this.live.get(id)?.compaction.observeUsage(stats.contextUsage, generation);
     return stats;
+  }
+  /**
+   * Every live gate the idle-time compaction respects. Deliberately narrower
+   * than "no work anywhere": dispatched workers may keep running in the
+   * background — only main-turn activity blocks a main-session compact.
+   */
+  private isSessionQuiet(id: string): boolean {
+    if (this.closed) return false;
+    const live = this.live.get(id);
+    const child = live?.process;
+    if (!live || !child) return false;
+    if (child.exitCode !== null || child.signalCode) return false;
+    if (live.followUps.length > 0) return false;
+    if (this.queue.isBusy(id)) return false;
+    return this.queue.listQueue(id).length === 0;
+  }
+  /**
+   * Manual `/compact` and the scheduler share this path. Resolves once pi
+   * finished the compaction; `compaction` stream events carry the progress.
+   */
+  private async compactSession(id: string): Promise<void> {
+    const live = await this.ensure(id);
+    // The pending quiet-period timer is only a hint; an explicit compact
+    // supersedes it rather than racing a second one behind it.
+    live.compaction.cancel();
+    await this.command(live.session.id, { type: "compact" });
   }
   /** Best-effort post-settle snapshot; the command query above stays authoritative. */
   private async pushSessionStats(id: string) {
@@ -1924,7 +2450,10 @@ export class PiHostBackend implements HostBackend {
       this.worktrees.set(agent.agentId, status);
       this.agent({ type: "worktree", status });
     }
-    if (raw.kind === "log_delta")
+    if (raw.kind === "log_delta") {
+      // Runtime log_delta pushes cumulative full text keyed by contentIndex; carry
+      // the key so the panel upserts one row instead of adding one per chunk.
+      const contentIndex = num2(raw.contentIndex);
       this.agent({
         type: "agent_log",
         agentId: agent.agentId,
@@ -1932,8 +2461,9 @@ export class PiHostBackend implements HostBackend {
         text: raw.text ?? "",
         name: raw.name,
         isError: raw.isError,
+        ...(contentIndex === undefined ? {} : { contentIndex }),
       });
-    else if (raw.kind === "log")
+    } else if (raw.kind === "log")
       for (const item of raw.items ?? [])
         this.agent({
           type: "agent_log",

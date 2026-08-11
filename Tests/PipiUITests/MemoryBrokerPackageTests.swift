@@ -27,6 +27,10 @@ final class MemoryBrokerPackageTests: XCTestCase {
         try write("export default function () {}", to: bundled.appendingPathComponent("memory-broker/extensions/memory-broker.ts"))
         try write(#"{"name":"pipiui-memory-broker-contract","version":"0.1.0"}"#, to: bundled.appendingPathComponent("memory-broker/vendor/pipiui-memory-broker-contract/package.json"))
         try write("export {}", to: bundled.appendingPathComponent("memory-broker/vendor/pipiui-memory-broker-contract/contract/index.ts"))
+        try write("<main>Memory Center</main>", to: bundled.appendingPathComponent("memory-broker/ui/index.html"))
+        try write("export {}", to: bundled.appendingPathComponent("memory-broker/ui/memory-center.js"))
+        try write("{\"version\":1,\"cases\":[]}", to: bundled.appendingPathComponent("memory-broker/eval/corpus.json"))
+        try write("export {}", to: bundled.appendingPathComponent("memory-broker/scripts/run-eval.mjs"))
     }
 
     private func installDependencies(at prefix: URL) throws {
@@ -56,6 +60,8 @@ final class MemoryBrokerPackageTests: XCTestCase {
         XCTAssertTrue(value.entrypoint.hasPrefix(install.path))
         XCTAssertFalse(value.entrypoint.hasPrefix(bundled.path), "spawn must never mount the bundled/development source")
         XCTAssertTrue(fileManager.fileExists(atPath: value.hermesEntrypoint))
+        XCTAssertTrue(fileManager.fileExists(atPath: URL(fileURLWithPath: value.root).appendingPathComponent("memory-broker/ui/index.html").path))
+        XCTAssertTrue(fileManager.fileExists(atPath: URL(fileURLWithPath: value.root).appendingPathComponent("memory-broker/eval/corpus.json").path))
         XCTAssertEqual(try MemoryBrokerPackage.resolveInstalled(in: install), value)
     }
 
@@ -115,9 +121,8 @@ final class MemoryBrokerPackageTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("Sources/PipiUI/Views/SettingsSheet.swift"))
-        XCTAssertTrue(settings.contains("PipiUI Memory Broker"))
-        XCTAssertTrue(settings.contains("Native FTS"))
-        XCTAssertTrue(settings.contains("pi-hermes-memory"))
+        XCTAssertTrue(settings.contains("打开 Memory Center"))
+        XCTAssertTrue(settings.contains("pipiui-memory-broker"))
     }
 
     func testSpawnResolutionOnlyReadsInstalledPackageAndDegradesWithoutBlocking() throws {

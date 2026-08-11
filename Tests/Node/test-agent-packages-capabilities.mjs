@@ -279,6 +279,43 @@ test("bundled create-subagent skill uses standard SKILL.md frontmatter and a par
   }
 });
 
+test("bundled desktop operator is read-only and cannot bypass Computer Use through bash", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pipiui-operator-package-"));
+  try {
+    const runtime = await loadAgentRuntime(directory);
+    const r = roots(directory);
+    await cp(
+      join(repositoryRoot, "Sources/PipiUI/PiExt/agents/operator"),
+      join(r.pipiuiAgentsDir, "operator"),
+      { recursive: true },
+    );
+
+    const result = runtime.discoverAgentsFromRoots(r, "user");
+    assert.equal(result.diagnostics.length, 0, runtime.formatAgentDiagnostics(result.diagnostics));
+    const operator = result.agents.find((agent) => agent.name === "operator");
+    assert.ok(operator);
+    assert.equal(operator.mode, "read-only");
+    assert.equal(operator.worktree, "none");
+    assert.equal(operator.deliverable, "verdict");
+    assert.equal(operator.traits.readOnly, true);
+    assert.equal(operator.capabilities.shell, false);
+    assert.deepEqual(operator.tools, ["read", "grep", "find", "ls"]);
+
+    const granted = resolveSubagentToolSelection({
+      declaredTools: operator.tools,
+      disabledTools: [],
+      hasDesktopCapability: true,
+      allowRecursiveDelegation: false,
+    });
+    assert.deepEqual(
+      new Set(granted.names),
+      new Set(["read", "grep", "find", "ls", "computer", "open_application"]),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("desktop remains requestable-only and custom secretary frontmatter cannot spoof bundled trust", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pipiui-agent-trust-"));
   try {

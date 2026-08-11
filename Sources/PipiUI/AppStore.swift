@@ -415,14 +415,24 @@ final class AppStore: ObservableObject {
         )
     }
 
-    func retryControlledMemoryMigration() {
-        do {
-            _ = try ControlledMemoryMigration.prepare()
-            memoryBrokerStatus.state = .importing
-            memoryBrokerStatus.detail = "Legacy approved memory is staged for the next broker session."
-            memoryBrokerStatus.lastError = nil
-        } catch {
-            memoryBrokerStatus.lastError = error.localizedDescription
+    /// Explicit user action only. The active extension returns an opaque, short-lived URL;
+    /// the host neither stores an admin token nor implements Memory Center business actions.
+    func openMemoryCenter() {
+        guard let session = currentSession else {
+            memoryBrokerStatus.lastError = "请先打开一个正在运行的 Pi 会话，再打开 Memory Center。"
+            memoryBrokerStatus.state = .degraded
+            return
+        }
+        session.requestMemoryCenterDescriptor { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let descriptor):
+                guard !descriptor.isExpired else { self.memoryBrokerStatus.state = .degraded; self.memoryBrokerStatus.lastError = "Memory Center 链接已过期，请重试。"; return }
+                NSWorkspace.shared.open(descriptor.url)
+            case .failure(let error):
+                self.memoryBrokerStatus.state = .degraded
+                self.memoryBrokerStatus.lastError = error.localizedDescription
+            }
         }
     }
 

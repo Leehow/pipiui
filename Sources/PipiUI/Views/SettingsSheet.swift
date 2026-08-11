@@ -244,46 +244,25 @@ struct SettingsSheet: View {
 
     private var memorySection: some View {
         let status = store.memoryBrokerStatus
-        let migration = ControlledMemoryMigration.loadState()
-        return GroupBox("PipiUI Memory Broker") {
+        return GroupBox("Memory") {
             VStack(alignment: .leading, spacing: 10) {
-                Toggle("启用记忆", isOn: Binding(
-                    get: { MemoryBrokerSettings.isEnabled() },
-                    set: { store.setMemoryBrokerEnabled($0) }
-                ))
-                Text("启用后，主 Pi 会话只挂载 PipiUI 管理的 Memory Broker package；子 agent 与 Computer operator 的权限由 package 自行发放。安装失败时主 agent 仍可正常工作，记忆显示为降级。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
+                Toggle("启用记忆", isOn: Binding(get: { MemoryBrokerSettings.isEnabled() }, set: { store.setMemoryBrokerEnabled($0) }))
+                Text("安装、Catalog、Retrieval、Curator、学习循环和 Memory Center 都由正式安装的 Pi extension 提供。PipiUI 只负责启用、安装、状态和显式打开入口。")
+                    .font(.caption).foregroundStyle(.secondary)
                 Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
-                    GridRow { Text("Package").foregroundStyle(.secondary); Text("pipiui-memory-broker \(status.packageVersion)") }
-                    GridRow { Text("Hermes").foregroundStyle(.secondary); Text("pi-hermes-memory \(status.hermesVersion)") }
-                    GridRow { Text("安装/解析").foregroundStyle(.secondary); Text(status.state == .installing ? "正在安装…" : status.installed && status.resolved ? "已安装并解析" : "未就绪") }
-                    GridRow { Text("Native FTS").foregroundStyle(.secondary); Text(status.nativeFTS == true ? "可用" : status.nativeFTS == false ? "不可用" : "尚未检测") }
+                    GridRow { Text("Extension").foregroundStyle(.secondary); Text("pipiui-memory-broker \(status.packageVersion)") }
+                    GridRow { Text("安装").foregroundStyle(.secondary); Text(status.installed && status.resolved ? "已安装并解析" : status.state == .installing ? "正在安装…" : "未就绪") }
+                    ForEach(MemoryBrokerRuntimeStatus.Component.allCases, id: \.self) { component in
+                        GridRow { Text(component.rawValue).foregroundStyle(.secondary); Text(status.components[component] ?? "未报告") }
+                    }
                     GridRow { Text("状态").foregroundStyle(.secondary); Text(status.state.rawValue) }
-                }
-                .font(.caption)
-
+                }.font(.caption)
                 if let detail = status.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
                 if let error = status.lastError { Text(error).font(.caption).foregroundStyle(.red) }
-                if let migration {
-                    Text("旧可控记忆迁移：\(migration.phase.rawValue)（\(migration.count) 条，\(migration.contentHash.prefix(12))…）")
-                        .font(.caption)
-                        .foregroundStyle(migration.phase == .failed ? .red : .secondary)
-                    if let error = migration.lastError { Text(error).font(.caption).foregroundStyle(.red) }
-                }
-
-                HStack {
-                    Button("刷新状态") { store.refreshMemoryBrokerStatus() }
-                    Button("迁移旧的可控记忆") { store.retryControlledMemoryMigration() }
-                    Spacer()
-                }
-                Text("旧数据路径：Application Support/PipiUI/Memory/approved.json。迁移先备份并校验数量和哈希；package durable import/readback 成功后才标记完成并停止旧后端。旧文件不会自动删除。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(8)
-            .frame(maxWidth: .infinity, alignment: .leading)
+                HStack { Button("刷新状态") { store.refreshMemoryBrokerStatus() }; Button("打开 Memory Center") { store.openMemoryCenter() }.disabled(!status.enabled); Spacer() }
+                Text("打开操作只会向当前 Pi 会话请求一次短期、opaque 的 extension 描述符；没有活动会话不会自动创建会话。裸 Pi 用户可在已启用 extension 的会话中输入 /memory。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }.padding(8).frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 

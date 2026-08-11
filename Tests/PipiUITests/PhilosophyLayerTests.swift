@@ -28,7 +28,8 @@ final class PhilosophyLayerTests: XCTestCase {
 
     func testFourLayersWithDeclaredDependency() throws {
         let layers = try PhilosophyLayerFixture.layers()
-        XCTAssertEqual(layers.map(\.id), ["foundation", "method", "orchestration", "fanout"])
+        XCTAssertEqual(layers.filter { $0.requiresModels.isEmpty }.map(\.id),
+                       ["foundation", "method", "orchestration", "fanout"])
         XCTAssertEqual(try layer("fanout").requires, ["orchestration"])
         for id in ["foundation", "method", "orchestration"] {
             XCTAssertTrue(try layer(id).requires.isEmpty, "\(id) must stand alone")
@@ -36,6 +37,19 @@ final class PhilosophyLayerTests: XCTestCase {
         for l in layers {
             XCTAssertFalse(l.name.isEmpty)
             XCTAssertFalse(l.summary.isEmpty, "\(l.id) needs a summary for the settings row")
+        }
+    }
+
+    /// A layer that corrects one model family must say so in frontmatter, or it silently
+    /// becomes advice every other model pays for and does not need.
+    func testModelScopedLayersDeclareTheirModels() throws {
+        let scoped = try PhilosophyLayerFixture.layers().filter { !$0.requiresModels.isEmpty }
+        XCTAssertEqual(scoped.map(\.id), ["toolcall"])
+        for l in scoped {
+            for pattern in l.requiresModels {
+                XCTAssertTrue(pattern.contains("/"),
+                              "\(l.id): \"\(pattern)\" is not a provider/id pattern")
+            }
         }
     }
 
@@ -231,10 +245,19 @@ final class PhilosophyLayerTests: XCTestCase {
             orchestration,
             "the runtime has already created your ledger under `.pi/boss/`"
         )
-        assertContains(orchestration, "Find it, fill it in, and keep it current")
+        // The runtime writes `## Tasks` from real dispatch/completion events, so a
+        // hand-maintained row is a second copy of state that only goes stale.
         assertContains(
             orchestration,
-            "From that point onward, update the ledger BEFORE acting"
+            "`## Tasks` is written by the runtime from real dispatch and completion events"
+        )
+        assertContains(orchestration, "Never hand-write a row there")
+        // Recording must never gate dispatch: a task nobody is working on is a queue,
+        // which is exactly what fan-out exists to prevent.
+        assertContains(orchestration, "Dispatch first, record after")
+        assertContains(
+            orchestration,
+            "the ledger note follows that dispatch and never gates it"
         )
         assertContains(
             orchestration,
@@ -369,6 +392,63 @@ final class PhilosophyLayerTests: XCTestCase {
         assertContains(fanout, "one worker told to cover several independent sub-items")
     }
 
+    /// The old wording only fired when a single request listed 2+ items, so a boss handed one
+    /// task at a time ran one worker at a time, parked later tasks, and waited to be told
+    /// "in parallel". Worktree isolation plus background dispatch make width the cheap default,
+    /// so the layer has to ask for it — proactively, and without the user prompting.
+    func testFanOutIsAggressiveRatherThanReactive() throws {
+        let fanout = try text("fanout")
+
+        // Width is the default; serializing is what needs an argument.
+        assertContains(fanout, "Width is the default; serialization is the exception you have to justify")
+        assertContains(fanout, "what else can go out in this same call?")
+        assertContains(fanout, "dispatching both is the cheaper mistake")
+
+        // The boss decomposes; the user should not have to ask for concurrency.
+        assertContains(fanout, "Split before you dispatch")
+        assertContains(fanout, "Decomposition is your job; the user should never have to ask for parallelism")
+
+        // A second task must join the running wave rather than queue behind it.
+        assertContains(fanout, "New work does not wait for running work")
+        assertContains(fanout, "dispatched in the turn it arrives, alongside them")
+
+        // After a wave goes out, look for the next one instead of idling.
+        assertContains(fanout, "Look ahead after every dispatch")
+        assertContains(
+            fanout,
+            "waiting for the user to say \"in parallel\" before doing what this layer already requires"
+        )
+
+        // Context bounds a wave through reports, never through the number of dispatches.
+        assertContains(fanout, "Never narrow a wave to protect context you have not spent")
+
+        // Orchestration must not read as a cap that outvotes the layer above.
+        assertContains(try text("orchestration"), "Go looking for that split instead of waiting for it to be obvious")
+    }
+
+    /// `blockedBy` became a real scheduler gate, so ordered work is handed over in one call
+    /// instead of being remembered by the boss — intent it holds rather than hands over is lost
+    /// at the next compaction, which is exactly how follow-up tasks used to disappear.
+    func testOrderedWorkIsHandedOverRatherThanRemembered() throws {
+        let fanout = try text("fanout")
+
+        assertContains(fanout, "Hand over the whole chain, not the first step")
+        assertContains(fanout, "starts by itself when they succeed")
+        assertContains(fanout, "you never return to dispatch step two")
+
+        // The reason it matters: context is cleared, the queue is not.
+        assertContains(fanout, "your context is cleared at the next compaction; work in the queue survives it")
+
+        // Width needs no rationing, because the runtime paces it.
+        assertContains(fanout, "oversubscribing is handled, under-dispatching is not")
+
+        // A failed dependency must neither run nor discard its dependents.
+        assertContains(fanout, "does not run its dependents and does not discard them")
+
+        // Queue state is asked for, never reconstructed from memory.
+        assertContains(fanout, "lists work that has not started and what each item is waiting on")
+    }
+
     /// `{{agents}}` used to render five bare names, so a rule saying "delegate this" left the
     /// boss without a way to answer "to whom" — and an unrecognized name resolves as "do it
     /// myself". Each entry now carries when to reach for it, written for the boss routing a
@@ -425,7 +505,7 @@ final class PhilosophyLayerTests: XCTestCase {
     /// tokens of the equivalent Chinese. Frontmatter (name/summary) is UI text and may be
     /// Chinese — only the body that reaches the model is pinned.
     func testLayerBodiesStayEnglish() throws {
-        for id in ["foundation", "method", "orchestration", "fanout"] {
+        for id in ["foundation", "method", "orchestration", "fanout", "toolcall"] {
             let han = try layer(id).body.unicodeScalars.filter { (0x4E00...0x9FFF).contains($0.value) }
             XCTAssertTrue(han.isEmpty, "\(id) body must stay English (found \(han.count) Han chars)")
         }

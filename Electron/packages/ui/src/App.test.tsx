@@ -1,0 +1,1859 @@
+// @vitest-environment jsdom
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { AgentSummary, Model, ModelState, PipiHostAPI, Project, PromptAttachment, QueuedMessage, Session, SidebarSessionPreferences, StreamEvent } from '@pipi/host-api'
+
+const xtermHarness = vi.hoisted(() => ({ instances: [] as any[] }))
+
+beforeEach(() => {
+  vi.useRealTimers()
+  vi.unstubAllGlobals()
+  localStorage.clear()
+  Reflect.deleteProperty(window, 'pipiHost')
+})
+afterEach(() => {
+  cleanup()
+  vi.clearAllTimers()
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+  localStorage.clear()
+  Reflect.deleteProperty(window, 'pipiHost')
+  document.title = ''
+  xtermHarness.instances.length = 0
+})
+
+const virtuosoHarness = { atBottom: undefined as undefined | ((value: boolean) => void), scrollToIndex: vi.fn() }
+vi.mock('react-virtuoso', async () => {
+  const React = await import('react')
+  return { Virtuoso: React.forwardRef(({ data, itemContent, atBottomStateChange }: { data: unknown[]; itemContent: (index: number, item: never) => JSX.Element; atBottomStateChange?: (value: boolean) => void }, ref) => { virtuosoHarness.atBottom = atBottomStateChange; React.useImperativeHandle(ref, () => ({ scrollToIndex: virtuosoHarness.scrollToIndex })); return <div>{data.map((item, index) => <React.Fragment key={index}>{itemContent(index, item as never)}</React.Fragment>)}</div> }) }
+})
+
+vi.mock('streamdown', () => ({ Streamdown: ({ children }: { children: unknown }) => <>{children}</> }))
+vi.mock('@streamdown/code', () => ({ code: {} }))
+
+vi.mock('@xterm/xterm', () => {
+  class MockTerminal {
+    options: any
+    buffer = { active: { viewportY: 0, baseY: 0 } }
+    open = vi.fn()
+    write = vi.fn()
+    clear = vi.fn()
+    focus = vi.fn()
+    scrollToBottom = vi.fn()
+    dispose = vi.fn()
+    loadAddon = vi.fn()
+    private dataListener?: (data: string) => void
+    private scrollListener?: () => void
+
+    constructor(options: any) {
+      this.options = options
+      xtermHarness.instances.push(this)
+    }
+
+    onData(listener: (data: string) => void) {
+      this.dataListener = listener
+      return { dispose: vi.fn() }
+    }
+
+    onScroll(listener: () => void) {
+      this.scrollListener = listener
+      return { dispose: vi.fn() }
+    }
+
+    emitData(data: string) { this.dataListener?.(data) }
+    emitScroll() { this.scrollListener?.() }
+  }
+  return { Terminal: MockTerminal }
+})
+
+vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit = vi.fn(); dispose = vi.fn() } }))
+
+import { App, createMockHost, sidebarPreferencesKey, sidebarModelForSession, sidebarStatusForSession, DEMO_MODEL_STORAGE_KEY, DEMO_SESSION_MODELS_STORAGE_KEY } from './App'
+
+describe('PipiUI Electron main layout', () => {
+  it('constrains the real sidebar grid item and the shell row to the viewport', () => {
+    const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
+    expect(css).toMatch(/\.pipiui-shell\s*\{[^}]*grid-template-rows:minmax\(0,1fr\)/s)
+    expect(css).toMatch(/\.sb-root[^\{]*\{[^}]*min-height:0[^}]*max-height:100%[^}]*overflow:hidden/s)
+    expect(css).toMatch(/\.chat-composer-stack\{[^}]*grid-row:3[^}]*flex:0 0 auto[^}]*flex-direction:column/s)
+    expect(css).toMatch(/\.chat-viewport\{[^}]*min-height:0[^}]*overflow:hidden[^}]*grid-row:2/s)
+  })
+
+  it('uses pane-local scroll containers inside a viewport-bound shell', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(container.querySelector('.pipiui-shell')).toBeTruthy()
+    expect(screen.getByTestId('sidebar').querySelector('.sb-scroll')).toBeTruthy()
+    expect(screen.getByTestId('message-scroll').className).toContain('message-list')
+    expect(container.querySelector('.tool-page.subagent-content')).toBeTruthy()
+    expect(container.querySelector('.tool-quick-rail')).toBeTruthy()
+  })
+
+  it('mirrors the Swift titlebar by showing the session name as the window title', async () => {
+    render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(document.title).toBe('Electron 三栏界面'))
+  })
+
+  it('wires the header right-pane toggle: collapse, restore, persist, remount', async () => {
+    const first = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const shell = first.container.querySelector('.pipiui-shell')!
+    expect(shell.className).not.toContain('tools-collapsed')
+    fireEvent.click(screen.getByLabelText('收起右栏'))
+    expect(shell.className).toContain('tools-collapsed')
+    expect(screen.getByLabelText('展开右栏')).toBeTruthy()
+    // persisted with a collapse marker inside the existing widths key
+    expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({ sidebar: 258, tools: 368, sidebarCollapsed: false, toolsCollapsed: true })
+    // the floating quick rail stays available while the pane is collapsed
+    expect(first.container.querySelector('.tool-quick-rail')).toBeTruthy()
+    fireEvent.click(screen.getByLabelText('展开右栏'))
+    expect(shell.className).not.toContain('tools-collapsed')
+    expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({ toolsCollapsed: false })
+    first.unmount()
+
+    localStorage.setItem('pipiui:eui-pane-widths', JSON.stringify({ sidebar: 258, tools: 368, sidebarCollapsed: false, toolsCollapsed: true }))
+    const second = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(second.container.querySelector('.pipiui-shell')!.className).toContain('tools-collapsed')
+    expect(screen.getByLabelText('展开右栏')).toBeTruthy()
+  })
+
+  it('wires the header left-pane toggle: collapse, restore, persist', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const shell = container.querySelector('.pipiui-shell')!
+    fireEvent.click(screen.getByLabelText('收起左栏'))
+    expect(shell.className).toContain('sidebar-collapsed')
+    expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({ sidebarCollapsed: true })
+    fireEvent.click(screen.getByLabelText('展开左栏'))
+    expect(shell.className).not.toContain('sidebar-collapsed')
+    expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({ sidebarCollapsed: false })
+    // the session tree is still reachable after re-expanding
+    expect(screen.getByTestId('sidebar')).toBeTruthy()
+  })
+
+  it('places the sidebar toggle at the header top-left, before the title and the right-pane toggle', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const header = container.querySelector('.chat-header')!
+    const toggleSidebar = header.querySelector('[data-testid="toggle-sidebar"]')!
+    const toggleTools = header.querySelector('[data-testid="toggle-tools"]')!
+    // the left-pane toggle is the very first element inside the header (top-left corner)
+    expect(header.firstElementChild).toBe(toggleSidebar)
+    // it comes before the header title and before the right-pane toggle
+    expect(header.compareDocumentPosition(toggleSidebar) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(header.compareDocumentPosition(header.querySelector('.chat-header-title')!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // the right-pane toggle stays in the trailing actions group
+    expect(toggleTools.closest('.chat-header-actions')).not.toBeNull()
+    // and the relocated toggle still works
+    fireEvent.click(screen.getByLabelText('收起左栏'))
+    expect(container.querySelector('.pipiui-shell')!.className).toContain('sidebar-collapsed')
+    fireEvent.click(screen.getByLabelText('展开左栏'))
+    expect(container.querySelector('.pipiui-shell')!.className).not.toContain('sidebar-collapsed')
+  })
+
+  it('renders the floating quick rail over the chat column and toggles/closes tools', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const rail = container.querySelector('.tool-quick-rail')!
+    expect(rail).toBeTruthy()
+    // floats inside the chat viewport (over the transcript), not inside the tool column
+    expect(container.querySelector('.chat-viewport')!.contains(rail)).toBe(true)
+    expect(container.querySelector('.tool-panel')!.contains(rail)).toBe(false)
+    expect(rail.querySelectorAll('button')).toHaveLength(4)
+    const browser = screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement
+    await waitFor(() => expect(browser.disabled).toBe(false))
+    // switching via the rail opens that tool and highlights it
+    fireEvent.click(browser)
+    expect(await screen.findByTestId('browser-panel')).toBeTruthy()
+    expect(browser.className).toContain('active')
+    // re-clicking the active tool closes the whole right pane; the rail stays
+    fireEvent.click(browser)
+    expect(container.querySelector('.pipiui-shell')!.className).toContain('tools-collapsed')
+    expect(browser.className).not.toContain('active')
+    expect(container.querySelector('.tool-quick-rail')).toBeTruthy()
+    // clicking again reopens the same tool
+    fireEvent.click(browser)
+    expect(container.querySelector('.pipiui-shell')!.className).not.toContain('tools-collapsed')
+    expect(await screen.findByTestId('browser-panel')).toBeTruthy()
+  })
+
+  it('auto-collapses both panes on a narrow viewport and still allows manual re-expand', async () => {
+    const media = { matches: true, media: '(max-width: 720px)', onchange: null, addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn() } as unknown as MediaQueryList
+    vi.stubGlobal('matchMedia', vi.fn(() => media))
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const shell = container.querySelector('.pipiui-shell')!
+    expect(shell.className).toContain('sidebar-collapsed')
+    expect(shell.className).toContain('tools-collapsed')
+    // the main column stays present and the composer is usable
+    expect(screen.getByTestId('chat-viewport')).toBeTruthy()
+    expect(screen.getByLabelText('消息输入框')).toBeTruthy()
+    // header toggles can still show the panes at narrow width
+    fireEvent.click(screen.getByLabelText('展开左栏'))
+    expect(shell.className).not.toContain('sidebar-collapsed')
+    fireEvent.click(screen.getByLabelText('展开右栏'))
+    expect(shell.className).not.toContain('tools-collapsed')
+    vi.unstubAllGlobals()
+  })
+
+  it('defines narrow breakpoints that collapse panes, overlay expanded panes, and cap overflow', () => {
+    const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
+    // collapse flags zero the effective grid columns
+    expect(css).toMatch(/\.pipiui-shell\.sidebar-collapsed\{[^}]*--sidebar-col:0px/)
+    expect(css).toMatch(/\.pipiui-shell\.tools-collapsed\{[^}]*--tools-col:0px/)
+    // existing 899px breakpoint stays viewport-proportional instead of fixed px
+    expect(css).toMatch(/@media \(max-width:899px\)\{[^}]*minmax\(150px,28vw\)/)
+    // 899px breakpoint keeps the stats/quota/balance row hugging the composer's
+    // right edge: even when the options row wraps, the auto margin pushes the
+    // wrapped row to the right edge of its flex line (never left-aligned).
+    const narrow899 = css.match(/@media \(max-width:899px\)\{[^\n]*\}/)?.[0] ?? ''
+    expect(narrow899).toMatch(/\.composer-stats\{[^}]*margin-left:auto/)
+    expect(narrow899).not.toMatch(/\.composer-stats\{[^}]*margin-left:0/)
+    // 720px breakpoint: auto-collapse hides panes, re-expanded panes become overlays
+    const narrow = css.match(/@media \(max-width:720px\)\{[^\n]*\}/)?.[0] ?? ''
+    expect(narrow).toContain('position:fixed')
+    expect(narrow).toContain('width:min(86vw,340px)')
+    expect(narrow).toMatch(/\.pipiui-shell\.sidebar-collapsed \.sb-root[^}]*display:none/)
+    expect(narrow).toMatch(/\.pipiui-shell\.tools-collapsed \.tool-panel[^}]*display:none/)
+    expect(narrow).toContain('.pipiui-shell .resize-handle{visibility:hidden}')
+  })
+
+  it('reserves a draggable title band for the macOS hiddenInset chrome in Electron only', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(navigator, 'userAgent')
+    Object.defineProperty(navigator, 'userAgent', { value: 'Mozilla/5.0 PipiUI Electron/32.3.3', configurable: true })
+    try {
+      const { container } = render(<App host={createMockHost()} />)
+      await screen.findAllByText('Electron 三栏界面')
+      expect(container.querySelector('.pipiui-shell')?.className).toContain('titlebar-pad')
+      // the drag band stays (draggable chrome) but carries no duplicated title — the chat header owns it
+      expect(container.querySelector('.titlebar-drag')).toBeTruthy()
+      expect(container.querySelector('.titlebar-drag')?.textContent?.trim()).toBe('')
+      expect(container.querySelector('.titlebar-drag-title')).toBeNull()
+      // header title stays left-aligned: actions pushed right via margin-left:auto, no space-between centering
+      const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
+      expect(css).toMatch(/\.chat-header\{[^}]*\}/)
+      expect(css.match(/\.chat-header\{[^}]*\}/)?.[0]).not.toContain('justify-content:space-between')
+      expect(css).toMatch(/\.chat-header-actions\{[^}]*margin-left:auto/)
+      expect(css).not.toContain('.titlebar-drag-title{')
+    } finally {
+      // userAgent normally lives on Navigator.prototype; unshadow it either way.
+      if (descriptor) Object.defineProperty(navigator, 'userAgent', descriptor)
+      else delete (navigator as { userAgent?: unknown }).userAgent
+    }
+
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(container.querySelector('.pipiui-shell')?.className).not.toContain('titlebar-pad')
+  })
+
+  it('switches the icon tool rail and mounts the Browser host panel', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(screen.getAllByText('PipiUI').length).toBeGreaterThan(0)
+    expect(screen.getByRole('button', { name: 'Subagents' }).className).toContain('active')
+    await waitFor(() => expect(container.querySelector('.tool-rail-running')).toBeTruthy())
+    const browser = screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement
+    await waitFor(() => expect(browser.disabled).toBe(false))
+    fireEvent.click(browser)
+    expect(await screen.findByTestId('browser-panel')).toBeTruthy()
+    expect(browser.className).toContain('active')
+    expect(screen.queryByRole('button', { name: 'Plan' })).toBeNull()
+  })
+
+  it('reveals Browser when the host reports an agent browser action', async () => {
+    const host = createMockHost()
+    const selectSession = vi.spyOn(host.browser!, 'selectSession')
+    const listeners = new Set<(event: any) => void>()
+    const subscribe = host.browser!.subscribe.bind(host.browser)
+    host.browser!.subscribe = listener => {
+      listeners.add(listener)
+      const unsubscribe = subscribe(listener)
+      return () => { listeners.delete(listener); unsubscribe() }
+    }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(screen.getByRole('button', { name: 'Subagents' }).className).toContain('active')
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement).disabled).toBe(false))
+    await waitFor(() => expect(selectSession).toHaveBeenCalledWith('welcome'))
+
+    listeners.forEach(listener => listener({ type: 'reveal', sessionId: 'layout' }))
+    expect(screen.getByRole('button', { name: 'Subagents' }).className).toContain('active')
+
+    listeners.forEach(listener => listener({ type: 'reveal', sessionId: 'welcome' }))
+
+    expect(await screen.findByTestId('browser-panel')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Browser' }).className).toContain('active')
+  })
+
+  it('reveals the exact Terminal only for the currently selected chat session', async () => {
+    const host = createMockHost()
+    const listeners = new Set<(event: import('@pipi/host-api').TerminalEvent) => void>()
+    host.terminal = {
+      open: vi.fn(async options => ({ id: 'term-welcome', title: '终端', cwd: '/tmp', sessionId: options?.sessionId })),
+      write: vi.fn(async () => undefined), resize: vi.fn(async () => undefined), clear: vi.fn(async () => undefined), close: vi.fn(async () => undefined),
+      subscribe: vi.fn(() => () => undefined), subscribeAll: listener => { listeners.add(listener); return () => listeners.delete(listener) }
+    }
+    host.capabilities = async () => ({ computerUse: false, revealInFinder: true, terminal: true, browser: true, git: true, plan: false, retainedWorktreeDisposition: false })
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Terminal' }) as HTMLButtonElement).disabled).toBe(false))
+    listeners.forEach(listener => listener({ type: 'reveal', sessionId: 'layout', terminalId: 'term-layout' }))
+    expect(screen.getByRole('button', { name: 'Subagents' }).className).toContain('active')
+    listeners.forEach(listener => listener({ type: 'opened', sessionId: 'welcome', terminal: { id: 'term-agent', title: 'ssh', sessionId: 'welcome' } }))
+    listeners.forEach(listener => listener({ type: 'reveal', sessionId: 'welcome', terminalId: 'term-agent' }))
+    expect(await screen.findByTestId('xterm-surface-term-agent')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Terminal' }).className).toContain('active')
+    expect(screen.getByRole('tab', { name: 'ssh' }).getAttribute('aria-selected')).toBe('true')
+
+    const layoutRow = document.querySelector('[data-session-id="layout"]') as HTMLElement
+    fireEvent.click(layoutRow)
+    await waitFor(() => expect(layoutRow.getAttribute('aria-current')).toBe('true'))
+    listeners.forEach(listener => listener({ type: 'opened', sessionId: 'layout', terminal: { id: 'term-layout', title: 'layout shell', sessionId: 'layout' } }))
+    listeners.forEach(listener => listener({ type: 'reveal', sessionId: 'layout', terminalId: 'term-layout' }))
+    expect(await screen.findByTestId('xterm-surface-term-layout')).toBeTruthy()
+    expect(screen.getByRole('tab', { name: 'layout shell' }).getAttribute('aria-selected')).toBe('true')
+    listeners.forEach(listener => listener({ type: 'reveal', sessionId: 'welcome', terminalId: 'term-agent' }))
+    expect(screen.getByRole('tab', { name: 'layout shell' }).getAttribute('aria-selected')).toBe('true')
+  })
+
+  it('keeps Subagent selection/disclosure/scroll and the terminal instance across rail switches', async () => {
+    const base = createMockHost()
+    const terminalHost = {
+      open: vi.fn(async () => ({ id: 'real-host-terminal', title: '终端', cwd: '/tmp/pipiui' })),
+      write: vi.fn(async () => undefined),
+      resize: vi.fn(async () => undefined),
+      clear: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      subscribe: vi.fn(() => () => undefined)
+    }
+    const host: PipiHostAPI = { ...base, terminal: terminalHost, capabilities: async () => ({ computerUse: false, revealInFinder: true, terminal: true, documents: true, browser: true, git: true, plan: false, retainedWorktreeDisposition: false }) }
+    const open = vi.spyOn(host.terminal!, 'open')
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+
+    const researchRow = await screen.findByTestId('agent-row-research')
+    fireEvent.click(researchRow.querySelector('.agent-select')!)
+    await waitFor(() => expect(researchRow.querySelector('.agent-select')?.getAttribute('aria-pressed')).toBe('true'))
+    const thinking = await screen.findByRole('button', { name: /Thinking/ })
+    fireEvent.click(thinking)
+    await screen.findByText(/正在梳理 packages\/ui 的组件边界/, { selector: '.agent-card-pre' })
+    const agentLog = screen.getByTestId('agent-log')
+    agentLog.scrollTop = 48
+
+    fireEvent.click(screen.getByRole('button', { name: 'Document' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Subagents' }))
+    await waitFor(() => expect(researchRow.querySelector('.agent-select')?.getAttribute('aria-pressed')).toBe('true'))
+    expect(screen.getByText(/正在梳理 packages\/ui 的组件边界/, { selector: '.agent-card-pre' })).toBeTruthy()
+    expect(screen.getByTestId('agent-log').scrollTop).toBe(48)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Terminal' }))
+    await waitFor(() => expect(xtermHarness.instances).toHaveLength(1))
+    const terminal = xtermHarness.instances[0]
+    const writesBeforeSwitch = [...terminal.write.mock.calls]
+    expect(open).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Document' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Terminal' }))
+    await waitFor(() => expect(xtermHarness.instances).toHaveLength(1))
+    expect(xtermHarness.instances[0]).toBe(terminal)
+    expect(terminal.dispose).not.toHaveBeenCalled()
+    expect(terminal.write.mock.calls).toEqual(writesBeforeSwitch)
+    expect(open).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps Document selection, disclosure, and scroll position across a rail switch', async () => {
+    render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(screen.getByRole('button', { name: 'Document' }))
+    const notes = await screen.findByRole('button', { name: '预览 document-panel-checklist.txt' })
+    fireEvent.click(notes)
+    const preview = await screen.findByLabelText('文档内容 document-panel-checklist.txt')
+    const listHeading = screen.getByRole('button', { name: /文件列表/ })
+    fireEvent.click(listHeading)
+    expect(listHeading.getAttribute('aria-expanded')).toBe('false')
+    preview.scrollTop = 47
+
+    fireEvent.click(screen.getByRole('button', { name: 'Subagents' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Document' }))
+    const restoredPreview = await screen.findByLabelText('文档内容 document-panel-checklist.txt')
+    const restoredListHeading = screen.getByRole('button', { name: /文件列表/ })
+    const listExpanded = restoredListHeading.getAttribute('aria-expanded')
+    fireEvent.click(restoredListHeading)
+    const restoredNotes = screen.getByRole('button', { name: '预览 document-panel-checklist.txt' })
+    expect({
+      notesSelected: restoredNotes.getAttribute('aria-pressed'),
+      listExpanded,
+      previewName: restoredPreview.getAttribute('aria-label'),
+      previewScrollTop: restoredPreview.scrollTop
+    }).toEqual({
+      notesSelected: 'true',
+      listExpanded: 'false',
+      previewName: '文档内容 document-panel-checklist.txt',
+      previewScrollTop: 47
+    })
+  })
+
+  it('disables Browser for a remote host without browser capability', async () => {
+    const base = createMockHost()
+    const host: PipiHostAPI = { ...base, capabilities: async () => ({ computerUse: false, revealInFinder: true, terminal: true, browser: false, plan: false, retainedWorktreeDisposition: false }) }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const browser = screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement
+    await waitFor(() => expect(browser.disabled).toBe(true))
+    expect(screen.queryByTestId('browser-panel')).toBeNull()
+  })
+
+  it('does not advertise or provide a local terminal when no real host terminal exists', async () => {
+    const host = createMockHost()
+    expect(host.terminal).toBeUndefined()
+    expect(await host.capabilities()).toMatchObject({ terminal: false })
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Terminal' }) as HTMLButtonElement).disabled).toBe(true))
+  })
+
+  it('disables server-only browser, terminal, and unavailable Finder controls', async () => {
+    const base = createMockHost()
+    const host: PipiHostAPI = { ...base, capabilities: async () => ({ computerUse: false, revealInFinder: false, terminal: false, browser: false, plan: false, retainedWorktreeDisposition: false }) }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => {
+      expect((screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement).disabled).toBe(true)
+      expect((screen.getByRole('button', { name: 'Terminal' }) as HTMLButtonElement).disabled).toBe(true)
+    })
+    fireEvent.click(screen.getByLabelText('PipiUI 项目菜单'))
+    expect((screen.getByRole('menuitem', { name: /在 Finder 中显示/ }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('shows the project git branch in the chat header and hides it without the capability', async () => {
+    render(<App host={createMockHost()} />)
+    const branch = await screen.findByTestId('git-branch-button')
+    expect(branch.textContent).toContain('pipiui/electron-git-bran')
+    expect(branch.closest('.chat-header')).not.toBeNull()
+    cleanup()
+    const base = createMockHost()
+    render(<App host={{ ...base, capabilities: async () => ({ computerUse: false, revealInFinder: true, terminal: true, browser: true, git: false, plan: false, retainedWorktreeDisposition: false }) }} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(screen.queryByTestId('git-branch-button')).toBeNull())
+  })
+
+  it('shows a read-only lease and allows explicit takeover', async () => {
+    const forceTakeoverSessionLease = vi.fn(async (sessionId: string) => ({ sessionId, writable: true }))
+    const host: PipiHostAPI = { ...createMockHost(), getSessionLease: async sessionId => ({ sessionId, writable: false, holder: { protocolVersion: 1, holder: 'pipiui-swift', pid: 1, hostname: 'mac', acquiredAt: '', heartbeatAt: '', expiresAt: '' } }), forceTakeoverSessionLease }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).disabled).toBe(true)
+    expect(screen.getByText(/由 pipiui-swift 运行中/)).toBeTruthy()
+    fireEvent.click(screen.getByTestId('lease-takeover-header'))
+    await waitFor(() => expect(forceTakeoverSessionLease).toHaveBeenCalled())
+    await waitFor(() => expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).disabled).toBe(false))
+  })
+
+  it('keeps the fixed Composer and explicit takeover available for a real canWrite/ownerLabel read-only lease', async () => {
+    const base = createMockHost()
+    const forceTakeoverSessionLease = vi.fn(async (sessionId: string) => ({ sessionId, canWrite: true, ownerLabel: 'this-client' } as unknown as import('@pipi/host-api').SessionLease))
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionLease: async sessionId => ({ sessionId, canWrite: false, ownerLabel: 'pipiui-electron' } as unknown as import('@pipi/host-api').SessionLease),
+      forceTakeoverSessionLease,
+      listQueue: async sessionId => [queuedMessage('lease-queued', sessionId, '只读时仍可浏览的队列项')]
+    }
+    const { container, unmount } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const stack = screen.getByTestId('chat-composer-stack')
+    const textarea = within(stack).getByLabelText('消息输入框') as HTMLTextAreaElement
+    expect(textarea.disabled).toBe(true)
+    expect(screen.getByText(/由 pipiui-electron 运行中/)).toBeTruthy()
+    expect(within(stack).getByTestId('composer-read-only').textContent).toContain('pipiui-electron')
+    expect(within(stack).getByTestId('composer-lease-takeover')).toBeTruthy()
+    expect(await within(stack).findByTestId('composer-session-stats')).toBeTruthy()
+    expect(within(stack).getByTestId('stats-pill')).toBeTruthy()
+    expect(container.querySelector('.chat-column')?.children).toHaveLength(3)
+
+    fireEvent.click(await screen.findByTestId('message-queue-toggle'))
+    expect((screen.getByTestId('queue-edit-0') as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByTestId('queue-remove-0') as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(within(stack).getByTestId('composer-lease-takeover'))
+    await waitFor(() => expect(forceTakeoverSessionLease).toHaveBeenCalledWith('welcome'))
+    await waitFor(() => expect(textarea.disabled).toBe(false))
+    unmount()
+
+    const writableHost: PipiHostAPI = {
+      ...base,
+      getSessionLease: async sessionId => ({ sessionId, canWrite: true, ownerLabel: 'this-client' } as unknown as import('@pipi/host-api').SessionLease)
+    }
+    render(<App host={writableHost} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).disabled).toBe(false))
+    expect(screen.queryByTestId('composer-read-only')).toBeNull()
+    expect(screen.getByTestId('composer-session-stats')).toBeTruthy()
+  })
+
+  it('uses an injected host and keeps host effects stable while composing', async () => {
+    const base = createMockHost()
+    const listProjects = vi.fn(async () => [{ id: 'injected', name: 'Injected Project', path: '/tmp/injected' }])
+    const listSessions = vi.fn(async () => [{ id: 'injected-session', projectId: 'injected', name: 'Injected Session', updatedAt: Date.now() }])
+    const host: PipiHostAPI = { ...base, listProjects, listSessions, getSessionHistory: async () => [] }
+    render(<App host={host} />)
+    await screen.findByText('Injected Project')
+    expect(screen.queryByText('Electron 三栏界面')).toBeNull()
+    expect(screen.queryByText('/Users/demo/code/pipiui')).toBeNull()
+    // the header shows only the session title — project paths are not rendered anymore
+    expect(screen.queryByText('/tmp/injected')).toBeNull()
+    const composer = screen.getByLabelText('消息输入框')
+    fireEvent.change(composer, { target: { value: 'a' } }); fireEvent.change(composer, { target: { value: 'ab' } }); fireEvent.change(composer, { target: { value: 'abc' } })
+    expect((composer as HTMLTextAreaElement).value).toBe('abc')
+    expect(listProjects).toHaveBeenCalledTimes(1)
+    expect(listSessions).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the context ring/used-window and adds the Swift-style quota pill, both from the selected session', async () => {
+    const base = createMockHost()
+    const streamListeners = new Map<string, (event: any) => void>()
+    const getSessionStats = vi.fn(async (sessionId?: string) => ({
+      sessionId: sessionId ?? 'welcome',
+      tokens: { input: 100, output: 20, cacheRead: 10, cacheWrite: 0, total: 130 },
+      cost: 0.01,
+      contextUsage: { tokens: sessionId === 'layout' ? 40_000 : 76_000, contextWindow: 272_000, percent: sessionId === 'layout' ? 15 : 28 }
+    }))
+    const getQuotaSnapshot = vi.fn(async (sessionId?: string) => sessionId === 'layout'
+      ? { provider: 'codex', accountLabel: 'Codex 账号额度', windows: [{ id: 'primary', usedPercent: 63, label: '5h', title: '5小时额度' }, { id: 'secondary', usedPercent: 12, label: '周', title: '周额度' }] }
+      : { provider: 'codex', accountLabel: 'Codex 账号额度', windows: [{ id: 'primary', usedPercent: 4, label: '5h', title: '5小时额度' }, { id: 'secondary', usedPercent: 12, label: '周', title: '周额度' }] })
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionStats,
+      getQuotaSnapshot,
+      subscribeStream: (sessionId, listener) => { streamListeners.set(sessionId, listener); return () => streamListeners.delete(sessionId) }
+    }
+    const { container } = render(<App host={host} />)
+    const composerStats = await screen.findByTestId('composer-session-stats')
+    expect(composerStats.closest('.composer-options')).toBeTruthy()
+    const optionsRow = composerStats.closest('.composer-options')!
+    // Swift parity: the status row is an independent sibling below the input
+    // card, never nested inside the capsule that wraps the textarea.
+    expect(optionsRow.parentElement?.classList.contains('composer')).toBe(true)
+    expect(optionsRow.previousElementSibling?.classList.contains('composer-card')).toBe(true)
+    expect(container.querySelector('.composer-card .composer-options')).toBeNull()
+    // Left group: model + thinking chips stay left inside the options row.
+    expect(screen.getByTestId('model-chip')).toBeTruthy()
+    expect(optionsRow.querySelector('.composer-options-left .model-chip')).toBeTruthy()
+    expect(optionsRow.querySelector('.composer-options-left .thinking-chip')).toBeTruthy()
+    // Right group: stats + quota stay inside the same right-aligned row.
+    expect(optionsRow.querySelector('.composer-stats .session-stats-pill')).toBeTruthy()
+    expect(optionsRow.querySelector('.composer-stats .quota-pill')).toBeTruthy()
+    await waitFor(() => expect(getSessionStats).toHaveBeenCalledWith('welcome'))
+    await waitFor(() => expect(getQuotaSnapshot).toHaveBeenCalledWith('welcome'))
+    // Context indicator unchanged: ring + used/window capsule.
+    expect(screen.getByTestId('stats-pill').textContent).toContain('76k/272k')
+    expect(screen.getByTestId('context-progress-ring')).toBeTruthy()
+    // Quota sits next to it in the same composer footer, Swift-selected single period.
+    expect(screen.getByTestId('quota-pill').textContent).toBe('周 12%')
+    expect(screen.getAllByTestId('quota-pill')).toHaveLength(1)
+    // Both stay inside the same right-aligned stats row.
+    expect(composerStats.querySelector('.session-stats-pill')).toBeTruthy()
+    expect(composerStats.querySelector('.quota-pill')).toBeTruthy()
+    // Quota styling is self-contained: other footer controls keep their own classes/shapes.
+    expect(container.querySelector('.model-chip')?.className).toBe('model-chip')
+    expect(container.querySelector('.thinking-chip')?.className).toBe('thinking-chip')
+    expect(composerStats.querySelector('.model-chip')).toBeNull()
+
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(getSessionStats).toHaveBeenLastCalledWith('layout'))
+    await waitFor(() => expect(getQuotaSnapshot).toHaveBeenLastCalledWith('layout'))
+    expect(screen.getByTestId('stats-pill').textContent).toContain('40k/272k')
+    expect(screen.getByTestId('quota-pill').textContent).toBe('5h 63%')
+
+    const callsBeforeSettle = getSessionStats.mock.calls.length
+    streamListeners.get('layout')?.({ type: 'status', sessionId: 'layout', status: 'settled' })
+    await waitFor(() => expect(getSessionStats.mock.calls.length).toBe(callsBeforeSettle + 1))
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('completed'))
+
+    cleanup()
+    // No quota source: the context pill remains and nothing quota-like renders.
+    render(<App host={{ ...base, getSessionStats, getQuotaSnapshot: async () => null }} />)
+    expect((await screen.findByTestId('stats-pill')).textContent).toContain('76k/272k')
+    expect(screen.getByTestId('context-progress-ring')).toBeTruthy()
+    await waitFor(() => expect(screen.queryByTestId('quota-pill')).toBeNull())
+    // No quota source: the right group still renders stats, and only stats.
+    const statsOnly = await screen.findByTestId('composer-session-stats')
+    expect(statsOnly.querySelector('.session-stats-pill')).toBeTruthy()
+    expect(statsOnly.querySelector('.quota-pill')).toBeNull()
+  })
+
+  it('shows the Codex quota fixture next to the context pill in the browser/dev fallback after selecting Codex', async () => {
+    render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(screen.queryByTestId('quota-pill')).toBeNull()
+    fireEvent.click(screen.getByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-openai-openai-codex'))
+    expect((await screen.findByTestId('quota-pill')).textContent).toBe('周 12%')
+    // Context indicator is untouched by the quota fixture.
+    expect(screen.getByTestId('stats-pill').textContent).toContain('200k')
+    expect(screen.getByTestId('context-progress-ring')).toBeTruthy()
+  })
+
+  it('shows the DeepSeek balance fixture instead of a quota pill, then swaps back to Codex quota', async () => {
+    render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(screen.queryByTestId('balance-pill')).toBeNull()
+    expect(screen.queryByTestId('quota-pill')).toBeNull()
+    fireEvent.click(screen.getByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-deepseek-deepseek-v3'))
+    expect((await screen.findByTestId('balance-pill')).textContent).toBe('¥88.00')
+    expect(screen.queryByTestId('quota-pill')).toBeNull()
+    // Codex quota wins over balance for the same capsule slot.
+    fireEvent.click(screen.getByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-openai-openai-codex'))
+    expect((await screen.findByTestId('quota-pill')).textContent).toBe('周 12%')
+    expect(screen.queryByTestId('balance-pill')).toBeNull()
+  })
+
+  it('follows system color-scheme changes', async () => {
+    let listener: ((event: MediaQueryListEvent) => void) | undefined
+    const media = { matches: false, media: '(prefers-color-scheme: dark)', onchange: null, addEventListener: (_: string, callback: (event: MediaQueryListEvent) => void) => { listener = callback }, removeEventListener: () => undefined, addListener: () => undefined, removeListener: () => undefined, dispatchEvent: () => true } as MediaQueryList
+    vi.stubGlobal('matchMedia', vi.fn(() => media))
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(container.querySelector('.pipiui-shell')?.getAttribute('data-theme')).toBe('light')
+    Object.defineProperty(media, 'matches', { value: true, configurable: true })
+    listener?.({ matches: true } as MediaQueryListEvent)
+    await waitFor(() => expect(container.querySelector('.pipiui-shell')?.getAttribute('data-theme')).toBe('dark'))
+    vi.unstubAllGlobals()
+  })
+
+  it('mounts the standalone Sidebar without old blue-dot rows and maps the selected model', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(screen.getByTestId('sidebar')).toBeTruthy()
+    expect(screen.getByText('项目')).toBeTruthy()
+    expect(container.querySelector('.status-dot')).toBeNull()
+    expect(container.querySelector('.side-scroll')).toBeNull()
+
+    const welcome = container.querySelector('[data-session-id="welcome"]')!
+    // welcome carries the running explore fixture, so its row reflects that status.
+    expect(welcome.getAttribute('data-status')).toBe('subagents-running')
+    expect(welcome.getAttribute('aria-current')).toBe('true')
+    expect(welcome.querySelector('[data-testid="provider-logo-anthropic"]')).toBeTruthy()
+    // Sessions carry their own model metadata: non-selected rows show their own provider logo.
+    expect(container.querySelector('[data-session-id="layout"] [data-testid="provider-logo-openai"]')).toBeTruthy()
+    expect(container.querySelector('[data-session-id="agent-run"] [data-testid="provider-logo-deepseek"]')).toBeTruthy()
+    // A session without model data still falls back to the neutral logo.
+    expect(container.querySelector('[data-session-id="tokens"] [data-testid="provider-logo-unknown"]')).toBeTruthy()
+
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('aria-current')).toBe('true'))
+  })
+
+  it('restores sidebar expansion/pins/page size and wires more/search/new/project menu behavior', async () => {
+    const workspace = [
+      { id: 'pipiui', name: 'PipiUI', path: '/Users/demo/code/pipiui' },
+      { id: 'website', name: 'Website', path: '/Users/demo/code/website' },
+      { id: 'design', name: 'Design System', path: '/Users/demo/code/design-system' }
+    ]
+    localStorage.setItem(sidebarPreferencesKey(workspace), JSON.stringify({ expandedIds: ['pipiui'], pinnedSessionIds: ['agent-run'], visibleLimit: 1 }))
+    const host = createMockHost()
+    const newSession = vi.spyOn(host, 'newSession')
+    const revealProject = vi.spyOn(host, 'revealProject')
+    const first = render(<App host={host} />)
+    await screen.findByText('PipiUI')
+    await waitFor(() => expect(screen.getByTestId('show-more')).toBeTruthy())
+    expect(screen.getByText('置顶')).toBeTruthy()
+    expect(screen.getByText('Subagent 面板验收')).toBeTruthy()
+    expect(screen.queryByText('Website')).toBeNull()
+    fireEvent.click(screen.getByTestId('show-more'))
+    expect(await screen.findByText('Website')).toBeTruthy()
+
+    fireEvent.change(screen.getByRole('searchbox', { name: '搜索所有会话' }), { target: { value: 'Landing' } })
+    expect(await screen.findByText('Landing page')).toBeTruthy()
+    fireEvent.change(screen.getByRole('searchbox', { name: '搜索所有会话' }), { target: { value: '' } })
+
+    fireEvent.click(screen.getByRole('button', { name: /在 PipiUI 新建会话/ }))
+    await waitFor(() => expect(newSession).toHaveBeenCalledWith('pipiui'))
+    fireEvent.click(screen.getByLabelText('PipiUI 项目菜单'))
+    fireEvent.click(screen.getByRole('menuitem', { name: '在 Finder 中显示' }))
+    await waitFor(() => expect(revealProject).toHaveBeenCalledWith('pipiui'))
+    fireEvent.click(screen.getByLabelText('PipiUI 项目菜单'))
+    expect((screen.getByRole('menuitem', { name: /编辑名称/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('menuitem', { name: /移除项目/ }) as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole('button', { name: /收起项目 PipiUI/ }))
+    await waitFor(() => expect(JSON.parse(localStorage.getItem(sidebarPreferencesKey(workspace))!).expandedIds).toEqual([]))
+    first.unmount()
+    render(<App host={createMockHost()} />)
+    await screen.findByText('PipiUI')
+    expect(screen.getByRole('button', { name: /展开项目 PipiUI/ })).toBeTruthy()
+  })
+
+  it('uses host semantic sidebar preferences after one-time local migration while keeping disclosure local', async () => {
+    const host = createMockHost()
+    const workspace = await host.listProjects()
+    localStorage.setItem(sidebarPreferencesKey(workspace), JSON.stringify({ expandedIds: ['pipiui'], pinnedSessionIds: ['agent-run'], archivedSessionIds: [], visibleLimit: 2 }))
+    localStorage.setItem('pipiui:eui:sidebar-semantic-host:v1', '1')
+    host.getSidebarSessionPreferences = vi.fn(async () => ({ pinnedSessionIds: ['welcome'], archivedSessionIds: ['layout'] }))
+    const save = vi.fn(async (preferences: SidebarSessionPreferences) => preferences)
+    host.setSidebarSessionPreferences = save
+
+    render(<App host={host} />)
+    await waitFor(() => expect(host.getSidebarSessionPreferences).toHaveBeenCalled())
+    expect(await screen.findByText('置顶')).toBeTruthy()
+    expect(screen.getAllByText('Electron 三栏界面').length).toBeGreaterThan(0)
+    expect(screen.getByText('已归档')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /收起项目 PipiUI/ })).toBeTruthy()
+    await waitFor(() => expect(save).toHaveBeenCalledWith({ pinnedSessionIds: ['welcome'], archivedSessionIds: ['layout'] }))
+  })
+
+  it('uses durable explicit project paths for host-backed add/remove, rollback, and remount', async () => {
+    const base = createMockHost()
+    let durable: Project[] = [
+      { id: 'haoli', name: 'haoli', path: '/Users/haoli' },
+      { id: 'other', name: 'other', path: '/Users/demo/other' }
+    ]
+    let removeFails = true
+    const getProjectPaths = vi.fn(async () => durable.map(project => project.path))
+    const listProjects = vi.fn(async () => durable.map(project => ({ ...project })))
+    const listSessions = vi.fn(async (projectId: string) => projectId === 'haoli'
+      ? [{ id: 'haoli-session', projectId, name: 'haoli 历史会话', updatedAt: Date.now() }]
+      : [{ id: 'other-session', projectId, name: 'other 会话', updatedAt: Date.now() }])
+    const addProject = vi.fn(async (path: string) => {
+      if (path === '/Users/demo/fail') throw new Error('路径不可用')
+      const project = { id: 'added', name: 'added', path }
+      durable = [...durable, project]
+      return project
+    })
+    const removeProject = vi.fn(async (projectId: string) => {
+      if (removeFails) throw new Error('删除被拒绝')
+      durable = durable.filter(project => project.id !== projectId)
+    })
+    const host: PipiHostAPI = { ...base, getProjectPaths, listProjects, listSessions, addProject, removeProject, getSessionHistory: async () => [] }
+    const first = render(<App host={host} />)
+    await screen.findByText('haoli')
+    await waitFor(() => expect(getProjectPaths).toHaveBeenCalled())
+
+    fireEvent.click(screen.getByLabelText('haoli 项目菜单'))
+    fireEvent.click(screen.getByRole('menuitem', { name: '移除项目' }))
+    expect(screen.queryByText('haoli')).toBeNull() // optimistic removal
+    expect((await screen.findByTestId('sidebar-project-error')).textContent).toContain('删除被拒绝')
+    expect(screen.getByText('haoli')).toBeTruthy() // failed removal restores the snapshot
+    fireEvent.click(screen.getByLabelText('关闭项目错误'))
+
+    removeFails = false
+    fireEvent.click(screen.getByLabelText('haoli 项目菜单'))
+    fireEvent.click(screen.getByRole('menuitem', { name: '移除项目' }))
+    await waitFor(() => expect(removeProject).toHaveBeenCalledWith('haoli'))
+    await waitFor(() => expect(screen.queryByText('haoli')).toBeNull())
+    first.unmount()
+
+    render(<App host={host} />)
+    await screen.findByText('other')
+    await waitFor(() => expect(screen.queryByText('haoli')).toBeNull())
+
+    fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
+    fireEvent.change(screen.getByLabelText('项目路径'), { target: { value: '/Users/demo/added' } })
+    fireEvent.click(screen.getByRole('button', { name: '添加' }))
+    await waitFor(() => expect(addProject).toHaveBeenCalledWith('/Users/demo/added'))
+    expect(await screen.findByText('added')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
+    fireEvent.change(screen.getByLabelText('项目路径'), { target: { value: '/Users/demo/fail' } })
+    fireEvent.click(screen.getByRole('button', { name: '添加' }))
+    expect((await screen.findByTestId('sidebar-project-error')).textContent).toContain('路径不可用')
+    expect(screen.queryByText('fail')).toBeNull()
+  })
+
+  it('keeps the composer and SessionStatsPill in the dedicated bottom row for empty, loading, failed history, and an open right rail', async () => {
+    const base = createMockHost()
+    const project = { id: 'layout-check', name: 'Layout Check', path: '/tmp/layout-check' }
+    const session = { id: 'layout-empty', projectId: project.id, name: '空历史会话', updatedAt: Date.now() }
+    const histories = [
+      async () => [],
+      () => new Promise<never>(() => undefined),
+      async () => { throw new Error('history unavailable') }
+    ]
+    for (const getSessionHistory of histories) {
+      const { container, unmount } = render(<App host={{ ...base, listProjects: async () => [project], listSessions: async () => [session], getSessionHistory }} />)
+      await screen.findAllByText('空历史会话')
+      const column = container.querySelector('.chat-column')!
+      const viewport = screen.getByTestId('chat-viewport')
+      const stack = screen.getByTestId('chat-composer-stack')
+      expect(column.children).toHaveLength(3)
+      expect(viewport.querySelector('.transcript-area')).toBeTruthy()
+      expect(stack.querySelector('.composer')).toBeTruthy()
+      expect(within(stack).getByLabelText('消息输入框')).toBeTruthy()
+      expect(await within(stack).findByTestId('composer-session-stats')).toBeTruthy()
+      unmount()
+    }
+
+    const { container } = render(<App host={{ ...base, listProjects: async () => [project], listSessions: async () => [session], getSessionHistory: async () => [] }} />)
+    await screen.findAllByText('空历史会话')
+    fireEvent.click(screen.getByRole('button', { name: 'Document' }))
+    expect(screen.getByRole('button', { name: 'Document' }).className).toContain('active')
+    expect(container.querySelector('[data-testid="chat-composer-stack"] .composer')).toBeTruthy()
+    expect(container.querySelector('[data-testid="chat-composer-stack"] [data-testid="composer-session-stats"]')).toBeTruthy()
+  })
+
+  it('maps stream and session-bound agent snapshots to sidebar statuses without marking unrelated history running', () => {
+    const agents: AgentSummary[] = [
+      { agentId: 'a-running', runId: '1', name: 'run', task: '', state: 'running', sessionId: 'subtask' },
+      { agentId: 'a-failed', runId: '2', name: 'fail', task: '', state: 'failed', sessionId: 'failed' },
+      { agentId: 'a-stalled', runId: '3', name: 'stall', task: '', state: 'stalled', sessionId: 'stalled' },
+      { agentId: 'a-interrupted', runId: '4', name: 'interrupt', task: '', state: 'interrupted', sessionId: 'interrupted' },
+      { agentId: 'a-ok', runId: '5', name: 'ok', task: '', state: 'ok', sessionId: 'completed' }
+    ]
+    expect(sidebarStatusForSession('selected', 'selected', true, undefined, agents).status).toBe('running')
+    expect(sidebarStatusForSession('subtask', 'selected', false, undefined, agents)).toEqual({ status: 'subagents-running', subagentCount: 1 })
+    expect(sidebarStatusForSession('failed', 'selected', false, undefined, agents).status).toBe('failed')
+    expect(sidebarStatusForSession('stalled', 'selected', false, undefined, agents).status).toBe('stalled')
+    expect(sidebarStatusForSession('interrupted', 'selected', false, undefined, agents).status).toBe('interrupted')
+    expect(sidebarStatusForSession('completed', 'selected', false, undefined, agents).status).toBe('completed')
+    expect(sidebarStatusForSession('unrelated-history', 'selected', false, undefined, agents).status).toBe('idle')
+  })
+
+  it('maps the session model onto the sidebar logo: own model wins, currentModel only fills the selected session, no model falls back to unknown', () => {
+    const current: Model = { provider: 'anthropic', id: 'claude-sonnet-4', name: 'Claude Sonnet 4', reasoning: true }
+    const base = { id: 's1', projectId: 'p1', name: 'x', updatedAt: 1 }
+    // Non-selected session carries its own model → shown as-is.
+    expect(sidebarModelForSession({ ...base, model: { provider: 'openai', modelId: 'gpt-5' } }, 'other', current))
+      .toEqual({ provider: 'openai', modelId: 'gpt-5' })
+    // Nested model object shape ({ provider, id }) is also accepted (older payload parity).
+    expect(sidebarModelForSession({ ...base, model: { provider: 'deepseek', id: 'deepseek-v3' } } as unknown as Session, 'other', current))
+      .toEqual({ provider: 'deepseek', modelId: 'deepseek-v3' })
+    // No model data → unknown fallback (empty provider renders the neutral logo).
+    expect(sidebarModelForSession({ ...base }, 'other', current)).toEqual({ provider: '', modelId: undefined })
+    // The selected session is the only one that falls back to the live current model.
+    expect(sidebarModelForSession({ ...base }, base.id, current)).toEqual({ provider: 'anthropic', modelId: 'claude-sonnet-4' })
+    // A session's own model still wins over the current model for the selected row.
+    expect(sidebarModelForSession({ ...base, model: { provider: 'xai', modelId: 'grok-4' } }, base.id, current))
+      .toEqual({ provider: 'xai', modelId: 'grok-4' })
+  })
+
+  it('shows return-to-latest after leaving the bottom and rail jumps with Virtuoso', async () => {
+    render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    virtuosoHarness.atBottom?.(false)
+    await screen.findByText('回到最新')
+    fireEvent.click(screen.getByText('回到最新'))
+    expect(virtuosoHarness.scrollToIndex).toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: '用户输入 1/1' }))
+    expect(virtuosoHarness.scrollToIndex).toHaveBeenCalled()
+  })
+
+  it('uses the shared collapsed ActivityCard for middle and subagent execution', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await screen.findByText('最终结果')
+    expect(container.querySelector('[data-activity-card="final"]')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '开始流式测试' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    const summary = await screen.findByRole('button', { name: /个步骤/ })
+    expect(summary.closest('[data-activity-card="default"]')).toBeTruthy()
+    // Preserve stream-perf behavior: live activity details are expanded while streaming.
+    expect(screen.getByText('Electron/packages/ui/package.json')).toBeTruthy()
+    fireEvent.click(summary)
+    expect(screen.queryByText('Electron/packages/ui/package.json')).toBeNull()
+  })
+
+  it('renders structured 子任务 cards for matching tool notices and falls back otherwise', async () => {
+    const base = createMockHost()
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async sessionId => sessionId === 'welcome' ? [
+        { id: 't1', role: 'tool', content: '子任务完成 · explore · ok · cost ¥0.12', timestamp: Date.now() },
+        { id: 't2', role: 'tool', content: '已读取 package.json', timestamp: Date.now() }
+      ] : []
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(container.querySelector('[data-activity-card="result"]')).toBeTruthy())
+    const noticeCard = container.querySelector('[data-activity-card="result"]')!
+    expect(noticeCard).toBeTruthy()
+    expect(noticeCard.textContent).toContain('子任务')
+    expect(noticeCard.textContent).toContain('成功 · ¥0.12')
+    expect(noticeCard.querySelector('pre')).toBeNull()
+    fireEvent.click(noticeCard.querySelector('.activity-summary')!)
+    expect(noticeCard.querySelector('pre')?.textContent).toContain('子任务完成 · explore · ok · cost ¥0.12')
+    const fallback = container.querySelector('.system-message')
+    expect(fallback?.textContent).toContain('已读取 package.json')
+    expect(container.querySelectorAll('[data-activity-card="result"]').length).toBe(1)
+  })
+
+  it('collapses Thinking after streaming settles and expands it on demand', async () => {
+    render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '思考一下' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await screen.findByText(/正在分析请求与当前项目结构/)
+    await waitFor(() => expect(screen.queryByText(/正在分析请求与当前项目结构/)).toBeNull())
+    const outer = await screen.findByRole('button', { name: /个步骤/ })
+    expect(outer.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(outer)
+    const thinkingButton = await screen.findByRole('button', { name: /^Thinking/ })
+    expect(thinkingButton.closest('[data-activity-card="thinking"]')).toBeTruthy()
+    expect(thinkingButton.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(thinkingButton)
+    await screen.findByText(/正在分析请求与当前项目结构/)
+  })
+
+  it('appends mock streaming events to the transcript', async () => {
+    render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '开始流式测试' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(screen.getByRole('button', { name: /个步骤/ })).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(/已开始处理/)).toBeTruthy())
+  })
+
+  it('keeps idle submits direct and routes busy composer submits through enqueueMessage', async () => {
+    const base = createMockHost()
+    const sendPrompt = vi.fn(async () => undefined)
+    const enqueueMessage = vi.fn(async (sessionId: string, text: string) => ({ outcome: 'queued' as const, message: queuedMessage('busy-item', sessionId, text) }))
+    const host: PipiHostAPI = { ...base, sendPrompt, enqueueMessage, listQueue: async () => [] }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+
+    const composer = screen.getByLabelText('消息输入框')
+    fireEvent.change(composer, { target: { value: 'idle direct' } })
+    await waitFor(() => expect((screen.getByLabelText('发送消息') as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle direct'))
+    expect(enqueueMessage).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'busy queue' } })
+    await waitFor(() => expect(screen.getByLabelText('加入消息队列')).toBeTruthy())
+    fireEvent.click(screen.getByLabelText('加入消息队列'))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'busy queue', undefined))
+    expect(sendPrompt).toHaveBeenCalledTimes(1)
+  })
+
+  it('consumes queue_update snapshots only for the selected session and retains attachment/status metadata', async () => {
+    const base = createMockHost()
+    const listeners = new Map<string, (event: StreamEvent) => void>()
+    const host: PipiHostAPI = {
+      ...base,
+      listQueue: async () => [],
+      subscribeStream: (sessionId, listener) => { listeners.set(sessionId, listener); return () => { if (listeners.get(sessionId) === listener) listeners.delete(sessionId) } }
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(listeners.has('welcome')).toBe(true))
+    const staleWelcomeListener = listeners.get('welcome')!
+    const welcomeQueue = [
+      queuedMessage('welcome-queued', 'welcome', '带附件的排队消息', 'queued', [{ dataBase64: 'aGVsbG8=', mimeType: 'image/png', name: 'queue.png' }]),
+      queuedMessage('welcome-sending', 'welcome', '正在发送', 'sending'),
+      queuedMessage('welcome-failed', 'welcome', '失败消息', 'failed', [], '上游超时')
+    ]
+    await act(async () => { staleWelcomeListener({ type: 'queue_update', sessionId: 'welcome', queue: welcomeQueue }) })
+    expect(await screen.findByTestId('message-queue')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('message-queue-toggle'))
+    expect(screen.getByTestId('queue-thumbs-0').textContent).toContain('1')
+    expect(screen.getByTestId('queue-status-1').textContent).toBe('发送中')
+    expect(screen.getByTestId('queue-error-2').textContent).toBe('上游超时')
+
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listeners.has('layout')).toBe(true))
+    await waitFor(() => expect(screen.queryByTestId('message-queue')).toBeNull())
+    // A callback captured before unsubscription must not bleed welcome's queue into layout.
+    await act(async () => { staleWelcomeListener({ type: 'queue_update', sessionId: 'welcome', queue: welcomeQueue }) })
+    expect(screen.queryByTestId('message-queue')).toBeNull()
+
+    await act(async () => { listeners.get('layout')!({ type: 'queue_update', sessionId: 'layout', queue: [queuedMessage('layout-queued', 'layout', '只属于布局会话')] }) })
+    expect((await screen.findByTestId('message-queue')).textContent).toContain('只属于布局会话')
+  })
+
+  it('wires edit/remove/retry and immediate dispatch to their supported queue host APIs', async () => {
+    const base = createMockHost()
+    const queue = [
+      queuedMessage('editable', 'welcome', '待编辑', 'queued', [{ dataBase64: 'aGVsbG8=', mimeType: 'image/png', name: 'keep.png' }]),
+      queuedMessage('failed', 'welcome', '待重试', 'failed', [], '网络错误')
+    ]
+    let listener: ((event: StreamEvent) => void) | undefined
+    const updateQueuedMessage = vi.fn(async (_sessionId: string, messageId: string, text: string, attachments?: PromptAttachment[]) => ({ ...queue.find(item => item.id === messageId)!, text, attachments: attachments ?? [] }))
+    const removeQueuedMessage = vi.fn(async (_sessionId: string, messageId: string) => queue.find(item => item.id === messageId)!)
+    const retryQueuedMessage = vi.fn(async (_sessionId: string, messageId: string) => ({ ...queue.find(item => item.id === messageId)!, state: 'queued' as const, error: undefined }))
+    const steerQueuedMessage = vi.fn(async (_sessionId: string, messageId: string) => ({ ...queue.find(item => item.id === messageId)!, state: 'sending' as const }))
+    const host: PipiHostAPI = {
+      ...base,
+      listQueue: async sessionId => sessionId === 'welcome' ? queue : [],
+      updateQueuedMessage,
+      removeQueuedMessage,
+      retryQueuedMessage,
+      steerQueuedMessage,
+      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } }
+    }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await screen.findByTestId('message-queue')
+    fireEvent.click(screen.getByTestId('message-queue-toggle'))
+
+    fireEvent.click(screen.getByTestId('queue-edit-0'))
+    fireEvent.change(screen.getByTestId('queue-editor-input-0'), { target: { value: '已编辑' } })
+    fireEvent.click(screen.getByTestId('queue-save'))
+    await waitFor(() => expect(updateQueuedMessage).toHaveBeenCalledWith('welcome', 'editable', '已编辑', [expect.objectContaining({ name: 'keep.png' })]))
+
+    fireEvent.click(screen.getByTestId('queue-remove-0'))
+    await waitFor(() => expect(removeQueuedMessage).toHaveBeenCalledWith('welcome', 'editable'))
+    fireEvent.click(screen.getByTestId('queue-retry-1'))
+    await waitFor(() => expect(retryQueuedMessage).toHaveBeenCalledWith('welcome', 'failed'))
+
+    await act(async () => { listener?.({ type: 'status', sessionId: 'welcome', status: 'streaming' }) })
+    expect(await screen.findByTestId('queue-steer-0')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('queue-steer-0'))
+    await waitFor(() => expect(steerQueuedMessage).toHaveBeenCalledWith('welcome', 'editable'))
+  })
+})
+
+function queuedMessage(id: string, sessionId: string, text: string, state: QueuedMessage['state'] = 'queued', attachments: PromptAttachment[] = [], error?: string): QueuedMessage {
+  return { id, sessionId, text, attachments, createdAt: 1, state, error }
+}
+
+async function renderChat(host: PipiHostAPI) {
+  render(<App host={host} />)
+  await screen.findAllByText('Electron 三栏界面')
+  return screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+}
+
+/** Works both when vitest runs from packages/ui and from the workspace root. */
+function readAppCss(): string {
+  const candidates = [join('src', 'app.css'), join('packages', 'ui', 'src', 'app.css')]
+  const found = candidates.map(candidate => join(process.cwd(), candidate)).find(existsSync)
+  if (!found) throw new Error('cannot locate app.css for the sizing assertion')
+  return readFileSync(found, 'utf8')
+}
+
+const objectUrlIds = { next: 0 }
+const revokedUrls: string[] = []
+
+beforeAll(() => {
+  URL.createObjectURL = vi.fn((obj: Blob | MediaSource) => `blob:mock-${objectUrlIds.next++}`) as unknown as typeof URL.createObjectURL
+  URL.revokeObjectURL = vi.fn((url: string) => { revokedUrls.push(String(url)) }) as unknown as typeof URL.revokeObjectURL
+})
+beforeEach(() => {
+  objectUrlIds.next = 0
+  revokedUrls.length = 0
+})
+
+function makeImageFile(name = 'shot.png', type = 'image/png', size = 1024): File {
+  return new File([new Uint8Array(size)], name, { type })
+}
+
+function pasteImage(textarea: HTMLTextAreaElement, file: File) {
+  fireEvent.paste(textarea, {
+    clipboardData: { items: [{ kind: 'file', type: file.type, getAsFile: () => file }] }
+  })
+}
+
+async function openModelModal(host: PipiHostAPI): Promise<HTMLTextAreaElement> {
+  const composer = await renderChat(host)
+  fireEvent.change(composer, { target: { value: '/model' } })
+  fireEvent.keyDown(composer, { key: 'Enter' })
+  await screen.findByTestId('model-modal')
+  return composer
+}
+
+async function reopenModelModal(composer: HTMLTextAreaElement) {
+  fireEvent.change(composer, { target: { value: '/model' } })
+  fireEvent.keyDown(composer, { key: 'Enter' })
+  await screen.findByTestId('model-modal')
+}
+
+describe('composer slash commands and model management', () => {
+  it('shows the slash menu on /, ranks /model, and has an empty state', async () => {
+    await renderChat(createMockHost())
+    const composer = screen.getByLabelText('消息输入框')
+    fireEvent.change(composer, { target: { value: '/m' } })
+    const row = await screen.findByTestId('slash-row-model')
+    expect(row.textContent).toContain('/model')
+    expect(row.textContent).toContain('管理模型可见性')
+    expect(row.getAttribute('aria-selected')).toBe('true')
+    fireEvent.change(composer, { target: { value: '/zzz' } })
+    expect(screen.getByTestId('slash-empty')).toBeTruthy()
+    expect(screen.queryByTestId('slash-row-model')).toBeNull()
+  })
+
+  it('opens the model management modal on Enter for /model without sending a prompt', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    await openModelModal(host)
+    expect(sendPrompt).not.toHaveBeenCalled()
+    // Swift executeSlash clears the draft before running the command
+    expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).value).toBe('')
+  })
+
+  it('opens the model management modal from the pinned sidebar settings footer', async () => {
+    await renderChat(createMockHost())
+    const gear = screen.getByRole('button', { name: '设置' })
+    fireEvent.click(gear)
+    await screen.findByTestId('model-modal')
+    // The sidebar footer stays pinned: closing keeps the gear reachable.
+    fireEvent.mouseDown(document.querySelector('.model-modal-backdrop')!)
+    expect(screen.queryByTestId('model-modal')).toBeNull()
+    expect(screen.getByRole('button', { name: '设置' })).toBeTruthy()
+  })
+
+  it('handles /model with trailing text via Enter without sending a prompt', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/model ' } })
+    expect(screen.queryByTestId('slash-menu')).toBeNull()
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    expect(await screen.findByTestId('model-modal')).toBeTruthy()
+    expect(sendPrompt).not.toHaveBeenCalled()
+  })
+
+  it('opens the model management modal when clicking the /model candidate without sending', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    await renderChat(host)
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '/' } })
+    fireEvent.mouseDown(await screen.findByTestId('slash-row-model'))
+    expect(await screen.findByTestId('model-modal')).toBeTruthy()
+    expect(sendPrompt).not.toHaveBeenCalled()
+  })
+
+  it('navigates the slash menu with arrows, completes with Tab, dismisses with Esc', async () => {
+    const composer = await renderChat(createMockHost())
+    fireEvent.change(composer, { target: { value: '/m' } })
+    expect((await screen.findByTestId('slash-row-model')).getAttribute('aria-selected')).toBe('true')
+    fireEvent.keyDown(composer, { key: 'ArrowDown' })
+    fireEvent.keyDown(composer, { key: 'ArrowUp' })
+    expect(screen.getByTestId('slash-row-model').getAttribute('aria-selected')).toBe('true')
+    fireEvent.keyDown(composer, { key: 'Tab' })
+    expect(composer.value).toBe('/model ')
+    expect(screen.queryByTestId('slash-menu')).toBeNull()
+    fireEvent.change(composer, { target: { value: '/mod' } })
+    expect(screen.getByTestId('slash-menu')).toBeTruthy()
+    fireEvent.keyDown(composer, { key: 'Escape' })
+    expect(screen.queryByTestId('slash-menu')).toBeNull()
+    expect(composer.value).toBe('/mod')
+    fireEvent.change(composer, { target: { value: '/model' } })
+    expect(screen.getByTestId('slash-menu')).toBeTruthy()
+  })
+
+  it('closes the slash menu when clicking outside', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    fireEvent.change(composer, { target: { value: '/' } })
+    await screen.findByTestId('slash-menu')
+    fireEvent.mouseDown(container.querySelector('.slash-backdrop')!)
+    expect(screen.queryByTestId('slash-menu')).toBeNull()
+    expect(composer.value).toBe('/')
+  })
+
+  it('groups models by provider and collapses/expands provider sections within the modal lifetime', async () => {
+    await openModelModal(createMockHost())
+    const provider = await screen.findByTestId('model-provider-anthropic')
+    expect(provider.querySelectorAll('.model-row').length).toBe(2)
+    expect(screen.getByTestId('model-provider-openai')).toBeTruthy()
+    expect(screen.getByTestId('model-provider-deepseek')).toBeTruthy()
+    // collapse keeps rows hidden until expanded again (modal-lifetime state)
+    fireEvent.click(screen.getByLabelText('折叠 anthropic'))
+    expect(screen.queryByTestId('model-row-anthropic-claude-sonnet-4')).toBeNull()
+    fireEvent.click(screen.getByLabelText('展开 anthropic'))
+    expect(await screen.findByTestId('model-row-anthropic-claude-sonnet-4')).toBeTruthy()
+  })
+
+  it('persists checkbox state through the host and re-reads it on reopen', async () => {
+    const host = createMockHost()
+    const setHidden = vi.spyOn(host, 'setHiddenModelIds')
+    const composer = await openModelModal(host)
+    await screen.findByTestId('model-row-openai-gpt-5')
+    fireEvent.click(screen.getByLabelText('在快捷菜单显示 GPT-5'))
+    await waitFor(() => expect(setHidden).toHaveBeenCalledWith(['openai/gpt-5']))
+    expect(await host.getHiddenModelIds()).toEqual(['openai/gpt-5'])
+    // close and reopen — the host is the source of truth
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(screen.queryByTestId('model-modal')).toBeNull()
+    await reopenModelModal(composer)
+    await screen.findByTestId('model-row-openai-gpt-5')
+    expect((screen.getByLabelText('在快捷菜单显示 GPT-5') as HTMLInputElement).checked).toBe(false)
+  })
+
+  it('clears every model of a provider through the tri-state checkbox (hide all)', async () => {
+    const host = createMockHost()
+    const setHidden = vi.spyOn(host, 'setHiddenModelIds')
+    await openModelModal(host)
+    await screen.findByTestId('model-provider-deepseek')
+    const check = screen.getByLabelText('deepseek 全部勾选') as HTMLInputElement
+    expect(check.checked).toBe(true)
+    fireEvent.click(check)
+    await waitFor(() => expect(setHidden).toHaveBeenCalledWith(['deepseek/deepseek-v3']))
+    expect((screen.getByLabelText('在快捷菜单显示 DeepSeek V3') as HTMLInputElement).checked).toBe(false)
+  })
+
+  it('keeps the current model visible in the quick menu even when unchecked (Swift fallback)', async () => {
+    const host = createMockHost()
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-modal')
+    await screen.findByTestId('model-row-anthropic-claude-sonnet-4')
+    expect((screen.getByLabelText('在快捷菜单显示 Claude Sonnet 4') as HTMLInputElement).checked).toBe(true)
+    expect(screen.getByText('当前模型')).toBeTruthy()
+    fireEvent.click(screen.getByLabelText('在快捷菜单显示 Claude Sonnet 4'))
+    await waitFor(async () => expect(await host.getHiddenModelIds()).toContain('anthropic/claude-sonnet-4'))
+    fireEvent.keyDown(window, { key: 'Escape' })
+    // unchecked current model is still listed (保底可见) and marked current
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    const row = await screen.findByTestId('quick-row-anthropic-claude-sonnet-4')
+    expect(row.className).toContain('current')
+    expect(row.textContent).toContain('✓')
+  })
+
+  it('renders provider logo tiles with brand mapping and a unified fallback for unknown providers', async () => {
+    await openModelModal(createMockHost())
+    await screen.findByTestId('model-provider-anthropic')
+    expect(screen.getAllByTestId('provider-logo-anthropic').length).toBeGreaterThan(0)
+    expect(screen.getAllByTestId('provider-logo-openai').length).toBeGreaterThan(0)
+    expect(screen.getAllByTestId('provider-logo-deepseek').length).toBeGreaterThan(0)
+    expect(screen.getAllByTestId('provider-logo-kimi').length).toBeGreaterThan(0)
+    expect(screen.getAllByTestId('provider-logo-xai').length).toBeGreaterThan(0)
+    expect(screen.getAllByTestId('provider-logo-zhipu').length).toBeGreaterThan(0)
+    expect(screen.getAllByTestId('provider-logo-volcengine').length).toBeGreaterThan(0)
+    expect(screen.getAllByTestId('provider-logo-qwen').length).toBeGreaterThan(0)
+    expect(screen.getAllByTestId('provider-logo-unknown').length).toBeGreaterThan(0)
+  })
+
+  it('closes the model management modal with Escape or the backdrop', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-modal')
+    fireEvent.mouseDown(container.querySelector('.model-modal-backdrop')!)
+    expect(screen.queryByTestId('model-modal')).toBeNull()
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-modal')
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(screen.queryByTestId('model-modal')).toBeNull()
+  })
+})
+
+describe('composer quick model menu', () => {
+  it('renders the selected session confirmed model instead of the configured default', async () => {
+    const configured: ModelState = { model: { provider: 'volcengine', id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', reasoning: true }, thinkingLevel: 'high', availableThinkingLevels: ['off', 'high'] }
+    const active: ModelState = { model: { provider: 'openai-codex', id: 'gpt-5.5', name: 'GPT-5.5', reasoning: true }, thinkingLevel: 'high', availableThinkingLevels: ['off', 'high'] }
+    const getModelState = vi.fn(async (sessionId?: string) => sessionId ? active : configured)
+    const host = { ...createMockHost(), getModelState } as PipiHostAPI
+    const { container } = render(<App host={host} />)
+    await waitFor(() => expect(getModelState).toHaveBeenCalledWith('welcome'))
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('GPT-5.5'))
+    // the header no longer shows the model name (only the title)
+    await waitFor(() => expect(container.querySelector('.model-detail')).toBeNull())
+  })
+
+  it('shows logo + display name only (no full provider/id) and lists only checked models', async () => {
+    const host = createMockHost()
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-row-openai-gpt-5')
+    fireEvent.click(screen.getByLabelText('在快捷菜单显示 GPT-5'))
+    fireEvent.keyDown(window, { key: 'Escape' })
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    await screen.findByTestId('quick-menu')
+    expect(screen.queryByTestId('quick-row-openai-gpt-5')).toBeNull()
+    expect(await screen.findByTestId('quick-row-anthropic-claude-sonnet-4')).toBeTruthy()
+    // no full provider/id refs rendered inside the quick menu
+    const menu = screen.getByTestId('quick-menu')
+    expect(menu.textContent).not.toContain('anthropic/claude-sonnet-4')
+    expect(menu.textContent).not.toContain('openai/gpt-5')
+    // provider titles present (low contrast), no search box
+    expect(screen.getAllByText('anthropic').length).toBeGreaterThan(0)
+    expect(screen.queryByLabelText('搜索模型')).toBeNull()
+    const current = screen.getByTestId('quick-row-anthropic-claude-sonnet-4')
+    expect(current.className).toContain('current')
+    expect(current.textContent).toContain('✓')
+    expect(current.textContent).toContain('Claude Sonnet 4')
+  })
+
+  it('switches the model from the quick menu, closes the menu, and updates the chip', async () => {
+    const host = createMockHost()
+    const setModel = vi.spyOn(host, 'setModel')
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-openai-gpt-5'))
+    await waitFor(() => expect(setModel).toHaveBeenCalledWith('welcome', 'openai', 'gpt-5'))
+    await waitFor(() => expect(screen.queryByTestId('quick-menu')).toBeNull())
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('GPT-5'))
+    await waitFor(() => expect(container.querySelector('.model-detail')).toBeNull())
+  })
+
+  it('shows a lightweight error and keeps the original model on failed switch', async () => {
+    const host = { ...createMockHost(), setModel: vi.fn(async () => { throw new Error('模型不可用') }) }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-openai-gpt-5'))
+    expect(await screen.findByText(/切换模型失败：模型不可用/)).toBeTruthy()
+    expect(screen.getByTestId('model-chip').textContent).toContain('Claude Sonnet 4')
+    expect(container.querySelector('.model-detail')).toBeNull()
+  })
+})
+
+describe('demo mock host model persistence (browser reload)', () => {
+  it('restores the persisted demo model from localStorage on host creation', async () => {
+    localStorage.setItem('pipiui.demoModel', JSON.stringify({ provider: 'openai', id: 'openai-codex' }))
+    const state = await createMockHost().getModelState()
+    expect(state.model.provider).toBe('openai')
+    expect(state.model.id).toBe('openai-codex')
+    expect(state.model.name).toBe('OpenAI Codex')
+  })
+
+  it('derives thinking levels from the restored model', async () => {
+    localStorage.setItem('pipiui.demoModel', JSON.stringify({ provider: 'deepseek', id: 'deepseek-v3' }))
+    const state = await createMockHost().getModelState()
+    expect(state.model.id).toBe('deepseek-v3')
+    expect(state.availableThinkingLevels).toEqual(['off'])
+  })
+
+  it('writes the selected model to localStorage on switch', async () => {
+    const host = createMockHost()
+    await host.setModel('welcome', 'openai', 'openai-codex')
+    expect(JSON.parse(localStorage.getItem('pipiui.demoModel')!)).toEqual({ provider: 'openai', id: 'openai-codex' })
+  })
+
+  it('restores the switched model on a fresh host instance (simulated reload)', async () => {
+    await createMockHost().setModel('welcome', 'openai', 'openai-codex')
+    const reloaded = await createMockHost().getModelState()
+    expect(reloaded.model.id).toBe('openai-codex')
+  })
+
+  it('falls back to the default model when nothing is stored', async () => {
+    expect(localStorage.getItem('pipiui.demoModel')).toBeNull()
+    const state = await createMockHost().getModelState()
+    expect(state.model.id).toBe('claude-sonnet-4')
+    expect(state.model.name).toBe('Claude Sonnet 4')
+  })
+
+  it('falls back to the default model when the stored value is invalid', async () => {
+    // malformed JSON
+    localStorage.setItem('pipiui.demoModel', 'not-json{')
+    expect((await createMockHost().getModelState()).model.id).toBe('claude-sonnet-4')
+    // incomplete shape (no id)
+    localStorage.setItem('pipiui.demoModel', JSON.stringify({ provider: 'openai' }))
+    expect((await createMockHost().getModelState()).model.id).toBe('claude-sonnet-4')
+    // non-object value
+    localStorage.setItem('pipiui.demoModel', JSON.stringify('openai/gpt-5'))
+    expect((await createMockHost().getModelState()).model.id).toBe('claude-sonnet-4')
+  })
+
+  it('falls back to the default model when the stored model is no longer in the catalog', async () => {
+    localStorage.setItem('pipiui.demoModel', JSON.stringify({ provider: 'openai', id: 'gpt-4-legacy' }))
+    const state = await createMockHost().getModelState()
+    expect(state.model.id).toBe('claude-sonnet-4')
+  })
+
+  it('binds model and context per session: switching sessions changes both, switching a model only changes that session, and per-session models survive a reload', async () => {
+    localStorage.removeItem(DEMO_MODEL_STORAGE_KEY)
+    localStorage.removeItem(DEMO_SESSION_MODELS_STORAGE_KEY)
+    try {
+      const host = createMockHost()
+      expect((await host.getModelState('welcome')).model.id).toBe('claude-sonnet-4')
+      expect((await host.getModelState('layout')).model.id).toBe('gpt-5')
+      expect((await host.getModelState('agent-run')).model.id).toBe('deepseek-v3')
+      // Context occupancy differs per session (fixture ring/window).
+      const welcome = await host.getSessionStats('welcome')
+      const layout = await host.getSessionStats('layout')
+      expect(welcome.contextUsage?.tokens).toBe(76_000)
+      expect(layout.contextUsage?.tokens).toBe(40_000)
+      expect(welcome.contextUsage?.contextWindow).not.toBe(layout.contextUsage?.contextWindow)
+      // Switching a model is session-scoped: the other session keeps its own.
+      await host.setModel('welcome', 'deepseek', 'deepseek-v3')
+      expect((await host.getModelState('welcome')).model.id).toBe('deepseek-v3')
+      expect((await host.getModelState('layout')).model.id).toBe('gpt-5')
+      // Per-session model survives a simulated reload.
+      const reloaded = createMockHost()
+      expect((await reloaded.getModelState('welcome')).model.id).toBe('deepseek-v3')
+      expect((await reloaded.getModelState('layout')).model.id).toBe('gpt-5')
+    } finally {
+      localStorage.removeItem(DEMO_MODEL_STORAGE_KEY)
+      localStorage.removeItem(DEMO_SESSION_MODELS_STORAGE_KEY)
+    }
+  })
+
+  it('switching sessions in the demo UI moves the model chip and the context ring', async () => {
+    localStorage.removeItem(DEMO_MODEL_STORAGE_KEY)
+    localStorage.removeItem(DEMO_SESSION_MODELS_STORAGE_KEY)
+    try {
+      const { container } = render(<App host={createMockHost()} />)
+      await screen.findAllByText('Electron 三栏界面')
+      // Welcome is the initially selected session → Claude Sonnet 4 + 76k/200k.
+      await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('Claude Sonnet 4'))
+      await waitFor(() => expect(screen.getByTestId('stats-pill').textContent).toContain('76k/200k'))
+      // Switching to the layout session binds its own model and context.
+      fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+      await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('GPT-5'))
+      await waitFor(() => expect(screen.getByTestId('stats-pill').textContent).toContain('40k/128k'))
+      // And back — the welcome session keeps its own values.
+      fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
+      await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('Claude Sonnet 4'))
+      await waitFor(() => expect(screen.getByTestId('stats-pill').textContent).toContain('76k/200k'))
+    } finally {
+      localStorage.removeItem(DEMO_MODEL_STORAGE_KEY)
+      localStorage.removeItem(DEMO_SESSION_MODELS_STORAGE_KEY)
+    }
+  })
+})
+
+describe('composer image attachments', () => {
+  it('has no attach button or file picker — images arrive only via clipboard paste', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(screen.queryByLabelText('添加图片')).toBeNull()
+    expect(container.querySelector('.composer')?.textContent).not.toContain('＋')
+    expect(container.querySelector('input[type="file"]')).toBeNull()
+    expect((createMockHost() as { pickImages?: unknown }).pickImages).toBeUndefined()
+  })
+
+  it('adds pasted clipboard images as attachments', async () => {
+    await renderChat(createMockHost())
+    pasteImage(screen.getByLabelText('消息输入框') as HTMLTextAreaElement, makeImageFile('pasted.png'))
+    const thumb = await screen.findByTestId('composer-thumb-0')
+    expect(thumb.querySelector('img')?.getAttribute('alt')).toBe('pasted.png')
+  })
+
+  it('supports multiple images, removal (with revoke), and unmount revoke', async () => {
+    const { unmount } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const textarea = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    pasteImage(textarea, makeImageFile('a.png'))
+    await screen.findByTestId('composer-thumb-0')
+    pasteImage(textarea, makeImageFile('b.png'))
+    await screen.findByTestId('composer-thumb-1')
+    expect(screen.getAllByTestId(/composer-thumb-/).length).toBe(2)
+    fireEvent.click(screen.getByLabelText('移除图片 a.png'))
+    await waitFor(() => expect(screen.getAllByTestId(/composer-thumb-/).length).toBe(1))
+    expect(revokedUrls).toContain('blob:mock-0')
+    unmount()
+    expect(revokedUrls).toContain('blob:mock-1')
+  })
+
+  it('opens a lightbox on thumbnail click and closes with Esc or the backdrop', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    pasteImage(screen.getByLabelText('消息输入框') as HTMLTextAreaElement, makeImageFile('lightbox.png'))
+    const thumb = await screen.findByTestId('composer-thumb-0')
+    fireEvent.click(thumb.querySelector('img')!)
+    expect(screen.getByTestId('lightbox')).toBeTruthy()
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(screen.queryByTestId('lightbox')).toBeNull()
+    fireEvent.click(thumb.querySelector('img')!)
+    expect(screen.getByTestId('lightbox')).toBeTruthy()
+    fireEvent.mouseDown(container.querySelector('.lightbox-backdrop')!)
+    expect(screen.queryByTestId('lightbox')).toBeNull()
+  })
+
+  it('sends text + images as a real payload and clears both on success', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '看图' } })
+    pasteImage(composer, makeImageFile('shot.png'))
+    await screen.findByTestId('composer-thumb-0')
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '看图', [
+      expect.objectContaining({ mimeType: 'image/png', name: 'shot.png', dataBase64: expect.any(String) })
+    ]))
+    await waitFor(() => expect(composer.value).toBe(''))
+    await waitFor(() => expect(screen.queryByTestId('composer-thumbs')).toBeNull())
+    expect(revokedUrls).toContain('blob:mock-0')
+  })
+
+  it('allows sending images without text', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    const composer = await renderChat(host)
+    pasteImage(composer, makeImageFile('only.png'))
+    await screen.findByTestId('composer-thumb-0')
+    expect((screen.getByLabelText('发送消息') as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '', [expect.objectContaining({ name: 'only.png' })]))
+  })
+
+  it('keeps text and attachments and shows an error when sending fails', async () => {
+    const host = { ...createMockHost(), sendPrompt: vi.fn(async () => { throw new Error('backend offline') }) }
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '别丢' } })
+    pasteImage(composer, makeImageFile('keep.png'))
+    await screen.findByTestId('composer-thumb-0')
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    expect(await screen.findByText(/发送失败：backend offline/)).toBeTruthy()
+    expect(composer.value).toBe('别丢')
+    expect(screen.getByTestId('composer-thumb-0')).toBeTruthy()
+  })
+
+  it('rejects unsupported MIME types and oversized images with clear errors', async () => {
+    await renderChat(createMockHost())
+    const textarea = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    pasteImage(textarea, makeImageFile('sketch.bmp', 'image/bmp'))
+    expect(await screen.findByText(/不支持的图片格式：sketch.bmp/)).toBeTruthy()
+    expect(screen.queryByTestId('composer-thumb-0')).toBeNull()
+    pasteImage(textarea, makeImageFile('huge.png', 'image/png', 20 * 1024 * 1024 + 1))
+    expect(await screen.findByText(/图片超过 20MB，无法添加：huge.png/)).toBeTruthy()
+    expect(screen.queryByTestId('composer-thumb-0')).toBeNull()
+  })
+
+  it('blocks sending when the current model does not support images and never drops attachments', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-deepseek-deepseek-v3'))
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('DeepSeek V3'))
+    const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    pasteImage(composer, makeImageFile('img.png'))
+    await screen.findByTestId('composer-thumb-0')
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    expect(await screen.findByText(/当前模型 DeepSeek V3 不支持图片附件/)).toBeTruthy()
+    expect(sendPrompt).not.toHaveBeenCalled()
+    expect(screen.getByTestId('composer-thumb-0')).toBeTruthy()
+  })
+})
+
+describe('composer textarea sizing and hints', () => {
+  it('disables the native resize handle and hides the keyboard hint', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const css = readAppCss()
+    expect(css).toContain('resize:none')
+    expect(css).toContain('max-height:150px')
+    expect(container.querySelector('.composer-options > span')).toBeNull()
+    expect(screen.queryByText(/⌘↵ 发送/)).toBeNull()
+    expect(screen.queryByText(/换行/)).toBeNull()
+  })
+
+  it('grows the textarea on multiline input and restores it after clearing', async () => {
+    await renderChat(createMockHost())
+    const textarea = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    fireEvent.change(textarea, { target: { value: 'a\nb\nc\nd\ne' } })
+    const grown = parseFloat(textarea.style.height)
+    expect(grown).toBeGreaterThan(29)
+    // deleting back to a single line shrinks it
+    fireEvent.change(textarea, { target: { value: 'x' } })
+    expect(parseFloat(textarea.style.height)).toBeLessThan(grown)
+    // programmatic clear restores the single-line height
+    fireEvent.change(textarea, { target: { value: '' } })
+    expect(parseFloat(textarea.style.height)).toBeLessThan(grown)
+    // very long content caps at the max height (internal scroll, no page growth)
+    fireEvent.change(textarea, { target: { value: 'a\n'.repeat(100) } })
+    expect(parseFloat(textarea.style.height)).toBeLessThanOrEqual(150)
+  })
+
+  it('keeps Enter-to-send and Shift+Enter newline behavior', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: 'hello' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'hello'))
+    await waitFor(() => expect(composer.value).toBe(''))
+    fireEvent.change(composer, { target: { value: 'line1' } })
+    fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true })
+    expect(sendPrompt).toHaveBeenCalledTimes(1)
+    expect(composer.value).toBe('line1')
+  })
+})
+
+describe('model visibility checkbox P0 regression', () => {
+  it('rapid sequential unchecks stay unchecked when saves resolve out of order', async () => {
+    const host = createMockHost()
+    const original = host.setHiddenModelIds
+    let delaySeq = 0
+    vi.spyOn(host, 'setHiddenModelIds').mockImplementation(async ids => {
+      const delay = delaySeq++ === 0 ? 50 : 5
+      await new Promise(resolve => setTimeout(resolve, delay))
+      return original(ids)
+    })
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-row-openai-gpt-5')
+    // Two unchecks back-to-back while the first save is still in flight.
+    fireEvent.click(screen.getByLabelText('在快捷菜单显示 GPT-5'))
+    fireEvent.click(screen.getByLabelText('在快捷菜单显示 OpenAI Codex'))
+    await new Promise(resolve => setTimeout(resolve, 120))
+    expect((screen.getByLabelText('在快捷菜单显示 GPT-5') as HTMLInputElement).checked).toBe(false)
+    expect((screen.getByLabelText('在快捷菜单显示 OpenAI Codex') as HTMLInputElement).checked).toBe(false)
+    expect(await host.getHiddenModelIds()).toEqual(['openai/gpt-5', 'openai/openai-codex'])
+  })
+
+  it('unchecking a non-current model persists across close/reopen', async () => {
+    const host = createMockHost()
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-row-openai-gpt-5')
+    fireEvent.click(screen.getByLabelText('在快捷菜单显示 GPT-5'))
+    await waitFor(async () => expect(await host.getHiddenModelIds()).toContain('openai/gpt-5'))
+    fireEvent.keyDown(window, { key: 'Escape' })
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-row-openai-gpt-5')
+    expect((screen.getByLabelText('在快捷菜单显示 GPT-5') as HTMLInputElement).checked).toBe(false)
+    // re-check persists too
+    fireEvent.click(screen.getByLabelText('在快捷菜单显示 GPT-5'))
+    await waitFor(async () => expect(await host.getHiddenModelIds()).not.toContain('openai/gpt-5'))
+    expect((screen.getByLabelText('在快捷菜单显示 GPT-5') as HTMLInputElement).checked).toBe(true)
+  })
+
+  it('provider tri-state unchecks every model of the provider and show-all restores them', async () => {
+    const host = createMockHost()
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-row-openai-gpt-5')
+    const tri = screen.getByLabelText('openai 全部勾选') as HTMLInputElement
+    expect(tri.checked).toBe(true)
+    expect(tri.indeterminate).toBe(false)
+    fireEvent.click(tri)
+    await waitFor(async () => expect(await host.getHiddenModelIds()).toEqual(expect.arrayContaining(['openai/gpt-5', 'openai/openai-codex'])))
+    expect((screen.getByLabelText('在快捷菜单显示 GPT-5') as HTMLInputElement).checked).toBe(false)
+    expect((screen.getByLabelText('在快捷菜单显示 OpenAI Codex') as HTMLInputElement).checked).toBe(false)
+    expect((screen.getByLabelText('openai 全部勾选') as HTMLInputElement).checked).toBe(false)
+    // clicking unchecked tri-state restores every model
+    fireEvent.click(screen.getByLabelText('openai 全部勾选'))
+    await waitFor(async () => expect(await host.getHiddenModelIds()).toEqual([]))
+    expect((screen.getByLabelText('在快捷菜单显示 GPT-5') as HTMLInputElement).checked).toBe(true)
+  })
+
+  it('shows a dismissible save error instead of silently reverting when persistence fails', async () => {
+    const host = { ...createMockHost(), setHiddenModelIds: vi.fn(async () => { throw new Error('disk full') }) }
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-row-openai-gpt-5')
+    fireEvent.click(screen.getByLabelText('在快捷菜单显示 GPT-5'))
+    expect(await screen.findByText(/保存模型可见性失败：disk full/)).toBeTruthy()
+    // rollback kept the checkbox consistent (checked again), and the error is closable
+    expect((screen.getByLabelText('在快捷菜单显示 GPT-5') as HTMLInputElement).checked).toBe(true)
+    fireEvent.click(screen.getByTestId('visibility-error-close'))
+    expect(screen.queryByText(/保存模型可见性失败/)).toBeNull()
+  })
+
+  it('unchecking the current model is allowed and the quick menu keeps it visible (Swift fallback)', async () => {
+    const host = createMockHost()
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-row-anthropic-claude-sonnet-4')
+    const box = screen.getByLabelText('在快捷菜单显示 Claude Sonnet 4') as HTMLInputElement
+    expect(box.disabled).toBe(false)
+    fireEvent.click(box)
+    await waitFor(async () => expect(await host.getHiddenModelIds()).toContain('anthropic/claude-sonnet-4'))
+    expect((screen.getByLabelText('在快捷菜单显示 Claude Sonnet 4') as HTMLInputElement).checked).toBe(false)
+    fireEvent.keyDown(window, { key: 'Escape' })
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    const row = await screen.findByTestId('quick-row-anthropic-claude-sonnet-4')
+    expect(row.className).toContain('current')
+  })
+})
+
+describe('composer thinking selector', () => {
+  it('renders the line-art brain SVG + level in one compact flat capsule (no chevron)', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const chip = await screen.findByTestId('thinking-chip')
+    const svg = screen.getByTestId('thinking-brain-icon')
+    expect(chip.contains(svg)).toBe(true)
+    expect(svg.getAttribute('fill')).toBe('none')
+    expect(svg.getAttribute('stroke')).toBe('currentColor')
+    expect(svg.getAttribute('stroke-linecap')).toBe('round')
+    expect(svg.getAttribute('stroke-linejoin')).toBe('round')
+    expect(svg.getAttribute('width')).toBe('13')
+    expect(chip.textContent).toContain('medium')
+    // Swift parity: no chevron glyph inside the chip.
+    expect(chip.textContent).not.toContain('▾')
+    const css = readAppCss()
+    expect(css).toContain('.thinking-chip{display:inline-flex')
+    expect(css).toContain('width:auto')
+    expect(chip.className).toContain('thinking-chip')
+    expect(chip.className).not.toContain('stretch')
+  })
+
+  it('styles both composer chips as Swift-aligned flat capsules (no accent bg, no chevron)', async () => {
+    render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const css = readAppCss()
+    const modelRule = css.match(/\.model-chip\{[^}]*\}/)?.[0] ?? ''
+    const thinkingRule = css.match(/\.thinking-chip\{[^}]*\}/)?.[0] ?? ''
+    // Very light capsule from text/primary ~6%, never the accent highlight.
+    expect(modelRule).toContain('color-mix(in srgb,var(--text) 6%,transparent)')
+    expect(modelRule).not.toContain('var(--accent)')
+    expect(modelRule).toContain('padding:5px 10px')
+    expect(modelRule).toContain('border-radius:999px')
+    expect(modelRule).toContain('gap:4px')
+    expect(thinkingRule).toContain('color-mix(in srgb,var(--text) 6%,transparent)')
+    expect(thinkingRule).not.toContain('var(--accent)')
+    expect(thinkingRule).toContain('padding:5px 10px')
+    expect(thinkingRule).toContain('border-radius:999px')
+    expect(thinkingRule).toContain('gap:4px')
+    expect(screen.getByTestId('model-chip').textContent).not.toContain('▾')
+    expect(screen.getByTestId('thinking-chip').textContent).not.toContain('▾')
+  })
+
+  it('opens the menu from the level text area and updates the level', async () => {
+    const host = createMockHost()
+    const setThinkingLevel = vi.spyOn(host, 'setThinkingLevel')
+    await renderChat(host)
+    const chip = await screen.findByTestId('thinking-chip')
+    fireEvent.click(chip.querySelector('.thinking-chip-level')!)
+    await screen.findByTestId('thinking-menu')
+    expect(chip.getAttribute('aria-expanded')).toBe('true')
+    expect((screen.getByTestId('thinking-row-medium') as HTMLButtonElement).getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(screen.getByTestId('thinking-row-high'))
+    await waitFor(() => expect(setThinkingLevel).toHaveBeenCalledWith('welcome', 'high'))
+    await waitFor(() => expect(screen.getByTestId('thinking-chip').textContent).toContain('high'))
+    expect(screen.queryByTestId('thinking-menu')).toBeNull()
+  })
+
+  it('closes the thinking menu with Escape or the backdrop', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByTestId('thinking-chip'))
+    await screen.findByTestId('thinking-menu')
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(screen.queryByTestId('thinking-menu')).toBeNull()
+    fireEvent.click(screen.getByTestId('thinking-chip'))
+    await screen.findByTestId('thinking-menu')
+    fireEvent.mouseDown(container.querySelector('.quick-menu-backdrop')!)
+    expect(screen.queryByTestId('thinking-menu')).toBeNull()
+  })
+})
+
+describe('composer error dismissal', () => {
+  it('closes the composer error with its × button', async () => {
+    const host = { ...createMockHost(), setModel: vi.fn(async () => { throw new Error('模型不可用') }) }
+    await renderChat(host)
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-openai-gpt-5'))
+    expect(await screen.findByText(/切换模型失败：模型不可用/)).toBeTruthy()
+    fireEvent.click(screen.getByTestId('composer-error-close'))
+    expect(screen.queryByTestId('composer-error')).toBeNull()
+  })
+})
+
+describe('model provider deletion', () => {
+  it('requires confirmation and cancels without changes', async () => {
+    const host = createMockHost()
+    const remove = vi.spyOn(host, 'removeProviderCredentials')
+    await openModelModal(host)
+    await screen.findByTestId('model-provider-deepseek')
+    fireEvent.click(screen.getByTestId('delete-provider-deepseek'))
+    await screen.findByTestId('delete-confirm-deepseek')
+    fireEvent.click(screen.getByTestId('delete-cancel-deepseek'))
+    expect(screen.queryByTestId('delete-confirm-deepseek')).toBeNull()
+    expect(remove).not.toHaveBeenCalled()
+  })
+
+  it('deletes the provider after confirmation and refreshes the catalog', async () => {
+    const host = createMockHost()
+    const remove = vi.spyOn(host, 'removeProviderCredentials')
+    await openModelModal(host)
+    await screen.findByTestId('model-provider-deepseek')
+    fireEvent.click(screen.getByTestId('delete-provider-deepseek'))
+    fireEvent.click(await screen.findByTestId('delete-confirm-btn-deepseek'))
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('deepseek'))
+    await waitFor(() => expect(screen.queryByTestId('model-provider-deepseek')).toBeNull())
+    expect((await host.listModels()).some(model => model.provider === 'deepseek')).toBe(false)
+  })
+
+  it('shows an error and keeps the provider when deletion fails', async () => {
+    const host = { ...createMockHost(), removeProviderCredentials: vi.fn(async () => { throw new Error('auth locked') }) }
+    await openModelModal(host)
+    await screen.findByTestId('model-provider-deepseek')
+    fireEvent.click(screen.getByTestId('delete-provider-deepseek'))
+    fireEvent.click(await screen.findByTestId('delete-confirm-btn-deepseek'))
+    expect(await screen.findByText(/删除失败：auth locked/)).toBeTruthy()
+    expect(screen.getByTestId('model-provider-deepseek')).toBeTruthy()
+  })
+
+  it('safely switches to another model when the current provider is deleted', async () => {
+    const host = createMockHost()
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-provider-anthropic')
+    fireEvent.click(screen.getByTestId('delete-provider-anthropic'))
+    fireEvent.click(await screen.findByTestId('delete-confirm-btn-anthropic'))
+    await waitFor(() => expect(container.querySelector('.model-detail')).toBeNull())
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('GPT-5'))
+  })
+})
+
+describe('model provider add (pi auth flow)', () => {
+  it('lists providers from the host with status and per-auth-type actions', async () => {
+    await openModelModal(createMockHost())
+    fireEvent.click(await screen.findByTestId('model-add-button'))
+    await screen.findByTestId('provider-row-anthropic')
+    expect(screen.getByTestId('provider-row-anthropic').textContent).toContain('已登录（oauth）')
+    expect(screen.getByTestId('provider-row-deepseek').textContent).toContain('未登录')
+    expect(screen.getByTestId('login-anthropic-oauth')).toBeTruthy()
+    expect(screen.getByTestId('login-deepseek-api-key')).toBeTruthy()
+  })
+
+  it('completes an api-key login, clears the input, and never retains the key in the renderer', async () => {
+    const host = createMockHost()
+    await openModelModal(host)
+    fireEvent.click(await screen.findByTestId('model-add-button'))
+    fireEvent.click(await screen.findByTestId('login-github-copilot-api-key'))
+    await screen.findByTestId('provider-login-prompt')
+    const secret = 'sk-abcdef0123456789'
+    fireEvent.change(screen.getByTestId('provider-login-input'), { target: { value: secret } })
+    fireEvent.click(screen.getByTestId('provider-login-submit'))
+    await waitFor(() => expect(screen.queryByTestId('provider-login')).toBeNull())
+    await screen.findByTestId('model-add-button') // back on manage view
+    expect(document.body.textContent).not.toContain(secret)
+    expect(screen.queryByDisplayValue(secret)).toBeNull()
+    expect((await host.authProviders()).find(p => p.id === 'github-copilot')?.authenticated).toBe(true)
+  })
+
+  it('opens the oauth URL in the default browser automatically and completes on continue', async () => {
+    const host = createMockHost()
+    const openExternal = vi.spyOn(host as { openExternal: (url: string) => Promise<void> }, 'openExternal')
+    await openModelModal(host)
+    fireEvent.click(await screen.findByTestId('model-add-button'))
+    fireEvent.click(await screen.findByTestId('login-github-copilot-oauth'))
+    await screen.findByTestId('provider-login-auth')
+    expect(screen.getByTestId('provider-login-url').textContent).toContain('auth.example.com')
+    expect(screen.getByTestId('provider-login-code').textContent).toContain('ABCD-1234')
+    await waitFor(() => expect(openExternal).toHaveBeenCalledWith('https://auth.example.com/github-copilot'))
+    fireEvent.click(screen.getByTestId('provider-login-continue'))
+    await waitFor(() => expect(screen.queryByTestId('provider-login')).toBeNull())
+    expect((await host.authProviders()).find(p => p.id === 'github-copilot')?.authenticated).toBe(true)
+  })
+
+  it('keeps the oauth URL visible and allows retry when opening the browser fails', async () => {
+    const host = createMockHost()
+    const openExternal = vi.spyOn(host as { openExternal: (url: string) => Promise<void> }, 'openExternal')
+      .mockRejectedValueOnce(new Error('browser unavailable'))
+      .mockResolvedValueOnce(undefined)
+    await openModelModal(host)
+    fireEvent.click(await screen.findByTestId('model-add-button'))
+    fireEvent.click(await screen.findByTestId('login-github-copilot-oauth'))
+    expect((await screen.findByTestId('provider-login-browser-error')).textContent).toContain('browser unavailable')
+    expect(screen.getByTestId('provider-login-url').textContent).toContain('auth.example.com')
+    fireEvent.click(screen.getByTestId('provider-login-open'))
+    await waitFor(() => expect(openExternal).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByTestId('provider-login-browser-error')).toBeNull())
+  })
+
+  it('cancels the oauth flow and returns to the provider list', async () => {
+    await openModelModal(createMockHost())
+    fireEvent.click(await screen.findByTestId('model-add-button'))
+    fireEvent.click(await screen.findByTestId('login-github-copilot-oauth'))
+    await screen.findByTestId('provider-login-auth')
+    fireEvent.click(screen.getByTestId('provider-login-cancel'))
+    await waitFor(() => expect(screen.queryByTestId('provider-login')).toBeNull())
+    expect(screen.getByTestId('provider-row-github-copilot')).toBeTruthy()
+  })
+})

@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@pipiui/ui": ["../../packages/ui/src/index.ts"],
+      "@pipiui/ui/style.css": ["../../packages/ui/src/app.css"]
+    }
+  },
+  "include": ["src", "electron.vite.config.ts"]
+}

@@ -112,6 +112,7 @@ enum MemoryBrokerPackage {
             version: contractVersion,
             fileManager: fileManager
         )
+        try validateRequiredResources(at: brokerSource, fileManager: fileManager)
         do {
             try fileManager.createDirectory(at: installRoot, withIntermediateDirectories: true)
         } catch {
@@ -144,7 +145,7 @@ enum MemoryBrokerPackage {
         defer { try? fileManager.removeItem(at: stage) }
         do {
             try fileManager.createDirectory(at: stage, withIntermediateDirectories: false)
-            try fileManager.copyItem(at: brokerSource, to: stage.appendingPathComponent("memory-broker", isDirectory: true))
+            try copyManagedPackageSource(from: brokerSource, to: stage.appendingPathComponent("memory-broker", isDirectory: true), fileManager: fileManager)
             try bundledFingerprint.write(
                 to: stage.appendingPathComponent(".pipiui-bundle-fingerprint"),
                 atomically: true,
@@ -221,6 +222,7 @@ enum MemoryBrokerPackage {
         try validateBundledSource(broker, name: packageName, version: packageVersion, fileManager: fileManager)
         try validateBundledSource(vendoredContract, name: contractName, version: contractVersion, fileManager: fileManager)
         try validateBundledSource(installedContract, name: contractName, version: contractVersion, fileManager: fileManager)
+        try validateRequiredResources(at: broker, fileManager: fileManager)
         let entrypoint = broker.appendingPathComponent(entrypointRelativePath)
         guard fileManager.fileExists(atPath: entrypoint.path) else {
             throw PackageError.installationInvalid("missing extension entrypoint")
@@ -236,21 +238,36 @@ enum MemoryBrokerPackage {
         return Installation(root: root.path, entrypoint: entrypoint.path, hermesEntrypoint: hermesEntrypoint.path)
     }
 
+    /// The managed install is intentionally independent of a developer checkout:
+    /// fingerprint and copy the complete publish surface, never node_modules.
+    private static let managedSourcePaths = ["extensions", "src", "vendor", "ui", "eval", "scripts", "types", "package.json", "README.md", "LICENSE", "tsconfig.json"]
+
     private static func sourceFingerprint(_ roots: [URL], fileManager: FileManager) -> String {
         var data = Data()
         for root in roots.sorted(by: { $0.path < $1.path }) {
-            guard let enumerator = fileManager.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey]) else { continue }
-            let urls = (enumerator.allObjects as? [URL] ?? []).sorted { $0.path < $1.path }
-            for url in urls {
-                guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
-                let relative = url.path.replacingOccurrences(of: root.path, with: "")
-                data.append(Data(relative.utf8))
-                data.append(0)
-                data.append((try? Data(contentsOf: url)) ?? Data())
-                data.append(0)
+            for relative in managedSourcePaths.sorted() {
+                let source = root.appendingPathComponent(relative)
+                guard let enumerator = fileManager.enumerator(at: source, includingPropertiesForKeys: [.isRegularFileKey]) else { continue }
+                let urls = (enumerator.allObjects as? [URL] ?? []).sorted { $0.path < $1.path }
+                for url in urls where (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                    let path = url.path.replacingOccurrences(of: root.path, with: "")
+                    data.append(Data(path.utf8)); data.append(0); data.append((try? Data(contentsOf: url)) ?? Data()); data.append(0)
+                }
+                if (try? source.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                    data.append(Data(relative.utf8)); data.append(0); data.append((try? Data(contentsOf: source)) ?? Data()); data.append(0)
+                }
             }
         }
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func copyManagedPackageSource(from source: URL, to destination: URL, fileManager: FileManager) throws {
+        try fileManager.createDirectory(at: destination, withIntermediateDirectories: false)
+        for relative in managedSourcePaths {
+            let item = source.appendingPathComponent(relative)
+            guard fileManager.fileExists(atPath: item.path) else { continue }
+            try fileManager.copyItem(at: item, to: destination.appendingPathComponent(relative))
+        }
     }
 
     private static func validateBundledSource(
@@ -268,6 +285,14 @@ enum MemoryBrokerPackage {
               manifest["name"] as? String == name,
               manifest["version"] as? String == version else {
             throw PackageError.invalidManifest(manifestURL.path)
+        }
+    }
+
+    private static func validateRequiredResources(at broker: URL, fileManager: FileManager) throws {
+        for relative in ["ui/index.html", "ui/memory-center.js", "eval/corpus.json", "scripts/run-eval.mjs"] {
+            guard fileManager.fileExists(atPath: broker.appendingPathComponent(relative).path) else {
+                throw PackageError.installationInvalid("missing required extension resource: \(relative)")
+            }
         }
     }
 
@@ -313,26 +338,29 @@ enum MemoryBrokerPackage {
 }
 
 struct MemoryBrokerRuntimeStatus: Equatable, Sendable {
-    enum State: String, Equatable, Sendable {
-        case disabled, installing, ready, degraded, importing, migrated
-    }
-
+    enum State: String, Equatable, Sendable { case disabled, installing, ready, degraded }
+    enum Component: String, CaseIterable, Equatable, Sendable { case hermes, catalog, retrieval, curator, admin, eval }
     var state: State
     var enabled: Bool
     var packageVersion: String = MemoryBrokerPackage.packageVersion
-    var hermesVersion: String = MemoryBrokerPackage.hermesVersion
     var installed: Bool = false
     var resolved: Bool = false
-    var nativeFTS: Bool? = nil
+    /// Opaque extension summaries only; Swift never parses records/lifecycle/admin payloads.
+    var components: [Component: String] = [:]
     var detail: String?
     var lastError: String?
-
+    /// Compatibility presentation only; derives from the opaque Hermes summary.
+    var nativeFTS: Bool? { components[.hermes].map { $0 == "ready" } }
     static let disabled = MemoryBrokerRuntimeStatus(state: .disabled, enabled: false)
-    static let installing = MemoryBrokerRuntimeStatus(
-        state: .installing,
-        enabled: true,
-        detail: "Installing the optional managed Memory Broker package."
-    )
+    static let installing = MemoryBrokerRuntimeStatus(state: .installing, enabled: true, detail: "Installing the optional managed Memory Broker extension.")
+}
+
+/// Opaque one-shot result of an explicit extension admin-open request. Never persist or log it.
+struct MemoryCenterOpenDescriptor: Equatable, Sendable {
+    let version: Int
+    let url: URL
+    let expiresAt: Date
+    var isExpired: Bool { expiresAt <= Date() }
 }
 
 enum MemoryBrokerRuntime {
@@ -399,13 +427,20 @@ enum MemoryBrokerRuntime {
               let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
+        guard value["version"] as? Int == 1 else { return nil }
         let ready = value["ready"] as? Bool
+        var components: [MemoryBrokerRuntimeStatus.Component: String] = ready == true ? [.hermes: "ready"] : [:]
+        if let raw = value["components"] as? [String: String] {
+            for component in MemoryBrokerRuntimeStatus.Component.allCases {
+                if let summary = raw[component.rawValue] { components[component] = String(summary.prefix(120)) }
+            }
+        }
         return MemoryBrokerRuntimeStatus(
             state: ready == true ? .ready : .degraded,
             enabled: true,
             installed: true,
             resolved: true,
-            nativeFTS: ready,
+            components: components,
             detail: value["detail"] as? String,
             lastError: value["lastError"] as? String
         )

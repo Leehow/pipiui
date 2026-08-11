@@ -1,0 +1,31 @@
+/*
+ * BalancePill — Swift-aligned prepaid-balance capsule (`¥110.00` / `$74.75`),
+ * scoped strictly to `.balance-pill` so no other composer control (model chip,
+ * thinking chip, quota/context pills) is affected. Same Capsule shape and gray
+ * text as `.quota-pill`; sits right of the quota capsule via its own 8px
+ * margin, matching Swift metricsStatus spacing. No popover in this port — the
+ * capsule is informational only (Swift's spend breakdown is not ported).
+ */
+
+.balance-pill {
+  --bp-text: #6b6b73;
+  --bp-bg: rgba(0, 0, 0, 0.06);
+
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  margin-left: 8px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: var(--bp-bg);
+  color: var(--bp-text);
+  font-size: 12px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+[data-theme='dark'] .balance-pill {
+  --bp-text: #9da2ad;
+  --bp-bg: rgba(255, 255, 255, 0.08);
+}

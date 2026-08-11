@@ -29,6 +29,9 @@ package final class DocumentTabsStore: ObservableObject {
         tabs.first { $0.id == selectedTabID }
     }
 
+    /// 文档 tab 没有默认占位项，全部都是用户打开的文档。
+    package var activityCount: Int { tabs.count }
+
     /// Current tab's Markdown reader state. PDF/plain tabs leave this intentionally inert.
     package var activeReaderState: DocumentReaderState? {
         guard let id = selectedTabID else { return nil }

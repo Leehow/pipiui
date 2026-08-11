@@ -170,6 +170,22 @@ package enum WorktreeMergeReadiness: Equatable, Sendable {
     case blocked(String)
 }
 
+/// Narrow policy selected by the code-reviewed maintenance manifest. It is deliberately
+/// not a user-provided CLI switch: `GitRepo` re-checks the matching Git predicate before
+/// the only destructive ref operation.
+package enum ReviewedWorktreeDiscardBasis: String, Equatable, Sendable {
+    case integratedAncestor
+    case cherryEquivalent
+    case explicitlySuperseded
+}
+
+package enum ReviewedAgentBranchDiscardResult: Equatable, Sendable {
+    case deleted
+    case alreadyAbsent
+    case retained(String)
+    case failed(String)
+}
+
 /// Git CLI helpers. Pure Foundation — no libgit2.
 package enum GitRepo {
 
@@ -639,6 +655,73 @@ package enum GitRepo {
         )) != nil
     }
 
+    /// Full commit ID of a local branch ref, or nil when the ref cannot be proved to exist.
+    /// Callers use this as a pin before destructive reviewed-maintenance actions.
+    package static func branchTip(_ branch: String, in workTree: URL) -> String? {
+        guard let name = try? validatedRefName(branch, label: "分支名"),
+              let output = try? run(
+                gitArgs: ["rev-parse", "--verify", "refs/heads/\(name)^{commit}"],
+                in: workTree
+              ) else {
+            return nil
+        }
+        let tip = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return looksLikeFullCommitSHA(tip) ? tip : nil
+    }
+
+    /// `git cherry <integration> <branch>` signs each non-ancestor commit with `-`
+    /// when an equivalent patch already exists in the integration history, or `+` when
+    /// it does not. Nil means Git output was unavailable or malformed.
+    package static func cherryMarks(
+        for branch: String,
+        against integrationRef: String = "HEAD",
+        in workTree: URL
+    ) -> [Character]? {
+        guard let name = try? validatedRefName(branch, label: "分支名"),
+              let integration = try? validatedRefName(integrationRef, label: "integration ref"),
+              let output = try? run(gitArgs: ["cherry", integration, name], in: workTree) else {
+            return nil
+        }
+        var marks: [Character] = []
+        for rawLine in output.split(whereSeparator: \.isNewline) {
+            let parts = rawLine.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+            guard parts.count == 2,
+                  parts[0].count == 1,
+                  let mark = parts[0].first,
+                  mark == "+" || mark == "-",
+                  !parts[1].isEmpty else {
+                return nil
+            }
+            marks.append(mark)
+        }
+        return marks
+    }
+
+    /// True only for a non-empty `git cherry` result whose every commit is marked `-`.
+    package static func allUniqueCommitsAreCherryEquivalent(
+        _ branch: String,
+        against integrationRef: String = "HEAD",
+        in workTree: URL
+    ) -> Bool {
+        guard let marks = cherryMarks(for: branch, against: integrationRef, in: workTree),
+              !marks.isEmpty else {
+            return false
+        }
+        return marks.allSatisfy { $0 == "-" }
+    }
+
+    /// Readable `git status --porcelain=v1` lines for a worktree. Nil is an
+    /// inconclusive probe; an empty array means clean. This is intentionally read-only.
+    package static func worktreeStatusSummary(in workTree: URL) -> [String]? {
+        guard let output = try? run(
+            gitArgs: ["status", "--porcelain=v1", "--untracked-files=all"],
+            in: workTree
+        ) else {
+            return nil
+        }
+        return output.split(whereSeparator: \.isNewline).map(String.init)
+    }
+
     /// Remove a linked worktree at `path`. Run from the main worktree.
     /// Default `force: true` discards uncommitted changes in that worktree.
     package static func worktreeRemove(at path: URL, in mainWorkTree: URL, force: Bool = true) throws {
@@ -902,6 +985,103 @@ package enum GitRepo {
         }
     }
 
+    /// Delete a reviewed, runtime-owned branch after its worktree has already been
+    /// detached. The caller cannot use this to bypass Git proof: this method checks the
+    /// current integration branch, exact expected tip, internal namespace, absence of a
+    /// registered worktree, and the basis-specific predicate immediately before deletion.
+    ///
+    /// `explicitlySuperseded` is intentionally only reachable from the code-reviewed
+    /// maintenance manifest in `SubagentStoreMaintenance`; no CLI accepts this basis.
+    package static func deleteReviewedInternalAgentBranch(
+        _ branch: String,
+        expectedTip: String,
+        basis: ReviewedWorktreeDiscardBasis,
+        persistedWorktreePath: String? = nil,
+        integrationRef: String = "HEAD",
+        in workTree: URL
+    ) -> ReviewedAgentBranchDiscardResult {
+        guard looksLikeFullCommitSHA(expectedTip) else {
+            return .retained("review manifest 的 expected tip SHA 非法")
+        }
+        guard let name = try? validatedRefName(branch, label: "分支名") else {
+            return .retained("非法 agent 分支名")
+        }
+        let status = probe(workTree: workTree)
+        guard status.isRepo else {
+            return .failed("无法确认主仓 Git 状态")
+        }
+        guard status.currentBranch != name else {
+            return .retained("拒绝删除当前 integration branch")
+        }
+        guard let actualTip = branchTip(name, in: workTree) else {
+            return .alreadyAbsent
+        }
+        guard actualTip == expectedTip else {
+            return .retained("branch tip 与 review manifest 不匹配")
+        }
+
+        let state = reconcileAgentBranch(
+            name,
+            persistedWorktreePath: persistedWorktreePath,
+            integrationRef: integrationRef,
+            in: workTree
+        )
+        guard state.isInternal else {
+            return .retained("分支不属于 pipiui/ runtime namespace")
+        }
+        guard state.branchExists else {
+            return .alreadyAbsent
+        }
+        guard state.registeredWorktreePath == nil else {
+            return .retained("分支仍注册在 worktree \(state.registeredWorktreePath!)")
+        }
+
+        switch basis {
+        case .integratedAncestor:
+            guard state.isAncestorOfIntegrationHead == true else {
+                return .retained("branch tip 不是 integration HEAD 的祖先")
+            }
+            do {
+                // Non-force closeout for already-integrated work.
+                try deleteLocalBranch(name, in: workTree)
+            } catch {
+                return .failed(errorMessage(error))
+            }
+
+        case .cherryEquivalent:
+            guard state.isAncestorOfIntegrationHead == false,
+                  allUniqueCommitsAreCherryEquivalent(name, against: integrationRef, in: workTree) else {
+                return .retained("独有提交并非全部与 integration HEAD patch-equivalent")
+            }
+            do {
+                guard branchTip(name, in: workTree) == expectedTip else {
+                    return .retained("branch tip 在删除前发生变化")
+                }
+                _ = try run(gitArgs: ["branch", "-D", name], in: workTree)
+            } catch {
+                return .failed(errorMessage(error))
+            }
+
+        case .explicitlySuperseded:
+            guard state.isAncestorOfIntegrationHead == false,
+                  state.disposition == .retainedUniqueCommits else {
+                return .retained("superseded closeout 仅允许非祖先、无注册 worktree 的内部 ref")
+            }
+            do {
+                guard branchTip(name, in: workTree) == expectedTip else {
+                    return .retained("branch tip 在删除前发生变化")
+                }
+                _ = try run(gitArgs: ["branch", "-D", name], in: workTree)
+            } catch {
+                return .failed(errorMessage(error))
+            }
+        }
+
+        return branchTip(name, in: workTree) == nil
+            ? .deleted
+            : .failed("branch 删除后验证失败")
+    }
+
     /// Force-delete a runtime-owned branch only after the user has explicitly confirmed
     /// discarding its worktree. This is intentionally separate from automatic closeout:
     /// unique commits may be destroyed here, but never for non-internal or still-registered refs.
@@ -985,6 +1165,18 @@ package enum GitRepo {
             return "(no diff)"
         }
         return truncateDiffOutput(out, maxFiles: maxFiles, maxBytes: maxBytes)
+    }
+
+    private static func looksLikeFullCommitSHA(_ value: String) -> Bool {
+        value.count == 40 && value.unicodeScalars.allSatisfy { scalar in
+            (scalar.value >= 48 && scalar.value <= 57) ||
+            (scalar.value >= 97 && scalar.value <= 102) ||
+            (scalar.value >= 65 && scalar.value <= 70)
+        }
+    }
+
+    private static func errorMessage(_ error: Error) -> String {
+        (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 
     /// Delete a local branch with non-force `git branch -d`. Does not touch remotes.

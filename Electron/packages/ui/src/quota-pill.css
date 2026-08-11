@@ -1,0 +1,56 @@
+/*
+ * QuotaPill — Swift-aligned capsule + popover, scoped strictly to `.quota-pill`
+ * (and its popover `.quota-menu`) so no other composer control (model chip,
+ * thinking chip, context pill) is affected. Swift-aligned Capsule shape with
+ * gray text; sits right of the context pill via its own margin (8px, matching
+ * Swift metricsStatus spacing). Clicking opens a quick-menu popover listing
+ * every window the provider reports; the selected row carries a checkmark.
+ */
+
+.quota-pill {
+  --qp-text: #6b6b73;
+  --qp-bg: rgba(0, 0, 0, 0.06);
+
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  margin-left: 8px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: var(--qp-bg);
+  color: var(--qp-text);
+  font-size: 12px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.quota-pill:hover {
+  --qp-bg: rgba(0, 0, 0, 0.1);
+}
+
+[data-theme='dark'] .quota-pill {
+  --qp-text: #9da2ad;
+  --qp-bg: rgba(255, 255, 255, 0.08);
+}
+
+[data-theme='dark'] .quota-pill:hover {
+  --qp-bg: rgba(255, 255, 255, 0.13);
+}
+
+/* Popover rows: window title left, usage right, checkmark last (Swift layout). */
+.quota-menu {
+  min-width: 200px;
+}
+
+.quota-menu-percent {
+  flex: none;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.quota-menu .quick-menu-check {
+  margin-left: 8px;
+}

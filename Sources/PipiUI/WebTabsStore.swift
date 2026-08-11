@@ -29,6 +29,9 @@ final class WebTabsStore: ObservableObject {
 
     var selectedTab: Tab? { tabs.first { $0.id == selectedTabID } }
 
+    /// 用户打开过网页时显示全部标签数；初始的空白默认 tab 不计入活动数。
+    var activityCount: Int { isFresh ? 0 : tabs.count }
+
     /// 选中 tab 的 engine。容器恒有 ≥1 个 tab，故总是可取值。
     var active: WebViewStore {
         engine(for: selectedTabID ?? tabs[0].id)

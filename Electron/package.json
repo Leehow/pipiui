@@ -1,0 +1,32 @@
+{
+  "name": "pipiui-electron-workspace",
+  "private": true,
+  "workspaces": ["packages/*", "apps/*"],
+  "scripts": {
+    "sync:computer-agent": "node scripts/sync-computer-agent-runtime.mjs",
+    "runtime:prepare": "node scripts/fetch-pi-runtime.mjs",
+    "runtime:check": "node scripts/fetch-pi-runtime.mjs --check",
+    "runtime:update": "node scripts/fetch-pi-runtime.mjs --force",
+    "runtime:prepare:mac": "node scripts/fetch-pi-runtime.mjs --platform darwin --arch x64 && node scripts/fetch-pi-runtime.mjs --platform darwin --arch arm64",
+    "runtime:check:mac": "node scripts/fetch-pi-runtime.mjs --platform darwin --arch x64 --check && node scripts/fetch-pi-runtime.mjs --platform darwin --arch arm64 --check",
+    "predev": "npm run sync:computer-agent",
+    "predev:watch": "npm run sync:computer-agent",
+    "prebuild": "npm run sync:computer-agent",
+    "pretest": "node scripts/sync-computer-agent-runtime.mjs --check",
+    "dev": "npm run dev -w @pipiui/electron",
+    "dev:watch": "npm run dev:watch -w @pipiui/electron",
+    "dev:browser": "npm run build -w @pipi/host-api && npm run build -w @pipiui/ui && npm run build -w @pipi/pi-backend && npm run build -w @pipiui/server && PIPIUI_SERVER_HOST=127.0.0.1 PIPIUI_SERVER_PORT=5173 PIPIUI_SERVER_PUBLIC_ORIGIN=http://localhost:5173 npm run start -w @pipiui/server",
+    "build": "npm run build -w @pipi/host-api && npm run build -w @pipiui/ui && npm run build -w @pipi/pi-backend && npm run build -w @pipiui/server && npm run build -w @pipiui/electron",
+    "test": "vitest run --exclude '**/dist/**' --exclude 'resources/runtime/**'",
+    "package": "npm run package:mac",
+    "package:mac": "npm run build && npm run package:mac -w @pipiui/electron",
+    "package:win": "npm run build && npm run package:win -w @pipiui/electron",
+    "package:linux": "npm run build && npm run package:linux -w @pipiui/electron"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.10"
+  }
+}

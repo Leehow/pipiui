@@ -1,0 +1,160 @@
+@import 'streamdown/styles.css';
+
+:root { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:13px; }
+.pipiui-shell { --bg:#17181c;--surface:#202126;--surface-raised:#25262c;--surface-hover:#2c2d34;--surface-input:#2a2b31;--border:#303137;--border-strong:#373941;--text:#e5e7eb;--text-strong:#f3f4f6;--muted:#9da2ad;--subtle:#747a86;--selection:#353750;--accent:#6578ea;--accent-soft:#33354c;--danger:#a75b63;--warning:#f5c76e;--success:#76c59b; color:var(--text); background:var(--bg); }
+.pipiui-shell[data-theme="light"] { --bg:#f5f5f7;--surface:#ececef;--surface-raised:#fff;--surface-hover:#e1e1e6;--surface-input:#fff;--border:#d6d6dc;--border-strong:#c8c8cf;--text:#27272a;--text-strong:#17171a;--muted:#6b6b73;--subtle:#898991;--selection:#dbe5ff;--accent:#4968c9;--accent-soft:#e4eaff;--danger:#bd5962;--warning:#9a6816;--success:#28865a; }
+*{box-sizing:border-box} body,#root{margin:0;min-width:900px;min-height:100vh;background:var(--bg)} button,input,textarea,select{font:inherit}button{color:inherit;border:0;background:transparent;cursor:pointer}.pipiui-shell{display:grid;min-height:100vh;overflow:hidden}.sidebar,.tool-panel{min-width:0;background:var(--surface);display:flex;flex-direction:column}.sidebar{border-right:1px solid var(--border)}.brand{padding:17px 14px 11px;font-size:17px;font-weight:700;letter-spacing:-.3px;color:var(--text-strong)}.search{margin:0 10px 8px;height:30px;display:flex;align-items:center;gap:6px;padding:0 8px;color:var(--muted);background:var(--surface-input);border:1px solid var(--border);border-radius:7px}.search input{min-width:0;width:100%;color:var(--text);outline:0;border:0;background:transparent}.search kbd{font:10px inherit;color:var(--subtle);white-space:nowrap}.side-scroll{flex:1;overflow:auto;padding:0 10px}.section-title{display:flex;align-items:center;justify-content:space-between;padding:14px 6px 7px;color:var(--muted);font-weight:650;letter-spacing:.07em;font-size:11px}.section-title button{font-size:18px;font-weight:300}.project-row,.project-main,.session-row{width:100%;display:flex;align-items:center;gap:7px;min-height:31px;border-radius:6px;text-align:left}.project-row{padding:0 7px}.project-row:hover,.session-row:hover{background:var(--surface-hover)}.project-main{min-width:0;padding:0;color:var(--text)}.folder-icon{color:var(--muted);white-space:pre}.project-new{display:none;margin-left:auto;color:var(--muted);font-size:17px}.project-row:hover .project-new{display:block}.session-row{padding:0 7px 0 25px;color:var(--text);font-size:12px}.session-row.selected{background:var(--selection);color:var(--text-strong)}.session-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.session-row small{margin-left:auto;color:var(--subtle);font-size:10px;white-space:nowrap}.status-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);flex:none}.pin-icon{color:var(--muted)}.agent-badge,.lease-badge{padding:1px 4px;border-radius:4px;font-size:9px;font-style:normal;white-space:nowrap}.agent-badge{color:var(--success);background:color-mix(in srgb,var(--success) 16%,transparent)}.lease-badge{color:var(--warning);background:color-mix(in srgb,var(--warning) 16%,transparent)}.more-toggle{padding:7px 6px;color:var(--muted);font-size:11px}.archived-row{width:100%;display:flex;gap:7px;align-items:center;padding:14px 6px 8px;color:var(--muted);text-align:left}.archived-row small{margin-left:auto;color:var(--subtle)}.sidebar-footer{display:flex;align-items:center;gap:5px;border-top:1px solid var(--border);padding:10px}.sidebar-footer>button{height:27px;min-width:27px;border-radius:5px;color:var(--muted)}.sidebar-footer>button:hover{background:var(--surface-hover);color:var(--text-strong)}.resize-handle{position:relative;z-index:2;margin-left:-3px;margin-right:-3px;cursor:col-resize}.resize-handle:hover,.resize-handle:active{background:var(--accent)}.chat-column{min-width:0;display:grid;grid-template-rows:50px minmax(0,1fr) auto;background:var(--bg)}.chat-header{display:flex;align-items:center;padding:0 17px;border-bottom:1px solid var(--border);background:var(--surface)}.chat-header strong{color:var(--text-strong)}.chat-header span{margin-left:8px;color:var(--muted);font-size:11px}.chat-header button{color:var(--muted);font-size:18px}.lease-detail{color:var(--warning)!important}.lease-detail button{margin-left:6px;color:var(--warning);text-decoration:underline;font-size:11px}.message-list{min-height:0}.message{max-width:900px;margin:0 auto;padding:10px 28px}.assistant-message{color:var(--text);line-height:1.56}.user-message{display:flex;justify-content:flex-end}.user-bubble{max-width:min(75%,650px);padding:10px 13px;border-radius:15px;color:#fff;background:var(--accent);line-height:1.48;white-space:pre-wrap}.system-message{margin:9px 28px;padding:8px 10px;border-radius:6px;color:var(--muted);background:var(--surface);font:11px ui-monospace,SFMono-Regular,Menlo,monospace}.thinking,.tool-card{margin:8px 0;border:1px solid var(--border-strong);border-radius:8px;background:var(--surface)}.thinking summary,.tool-card header{padding:8px 10px;color:var(--muted);cursor:pointer}.thinking p{margin:0;padding:0 10px 10px;color:var(--muted);white-space:pre-wrap;font-size:12px}.tool-card header{display:flex;gap:8px;align-items:center}.tool-card header span{color:var(--success)}.tool-card header small{margin-left:auto;color:var(--muted)}.tool-card pre,.tool-result{overflow:auto;margin:0;padding:8px 10px;border-top:1px solid var(--border);color:var(--text);background:var(--bg);font:11px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}.markdown{font-size:14px;overflow-wrap:anywhere}.markdown pre{overflow:auto;padding:12px!important;border:1px solid var(--border);border-radius:8px;background:var(--bg)!important;white-space:pre-wrap;overflow-wrap:anywhere}.markdown :not(pre)>code{padding:1px 4px;border-radius:4px;background:var(--surface-hover)}.composer{margin:0 16px 15px;position:relative}.composer-card{padding:9px 10px 8px;border:1px solid var(--border-strong);border-radius:12px;background:var(--surface-raised);box-shadow:0 -5px 18px rgb(0 0 0 / 8%)}.composer-shell{display:flex;align-items:flex-end;gap:8px}.composer textarea{width:100%;min-height:29px;max-height:150px;resize:none;overflow-y:auto;outline:0;border:0;color:var(--text-strong);background:transparent;line-height:1.5}.composer textarea::placeholder{color:var(--muted)}.send{width:27px;height:27px;border-radius:7px;color:#fff;background:var(--accent);font-size:16px}.send:disabled{cursor:default;opacity:.35}.send.stop{background:var(--danger);font-size:12px}.composer-options{display:flex;align-items:center;gap:6px;min-width:0;margin:8px 0 0}.composer-options-left{display:flex;min-width:0;align-items:center;gap:6px}.composer-stats{display:flex;min-width:0;margin-left:auto;justify-content:flex-end}.composer-options select{max-width:150px;padding:2px 4px;outline:0;border:0;color:var(--muted);background:transparent;font-size:11px}.model-chip{display:flex;align-items:center;gap:4px;max-width:220px;min-width:0;padding:5px 10px;border-radius:999px;background:color-mix(in srgb,var(--text) 6%,transparent);font-size:12px;font-weight:500;color:var(--text)}.model-chip:hover{background:color-mix(in srgb,var(--text) 12%,transparent)}.model-chip-name{overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap}.tool-panel{border-left:1px solid var(--border)}.tool-content{flex:1;display:grid;place-items:center;padding:18px}.subagent-mount,.empty-panel{width:100%;max-width:290px;padding:16px;border:1px dashed var(--border-strong);border-radius:8px;color:var(--muted);background:var(--surface-raised)}.subagent-content{display:flex;padding:0;min-height:0;place-items:stretch}
+
+/* Viewport-bound desktop layout: only the three designated panes may scroll. */
+html,body,#root{width:100%;height:100%;min-width:0;min-height:0;overflow:hidden}
+body{overscroll-behavior:none}
+.pipiui-shell{width:100vw;height:100dvh;min-width:0;min-height:0;max-height:100dvh;grid-template-rows:minmax(0,1fr);overflow:hidden;isolation:isolate}
+/* Pane grid: App persists the remembered widths inline (--sidebar-w/--tools-w);
+   the effective column (--sidebar-col/--tools-col) is zeroed while collapsed. */
+.pipiui-shell{--sidebar-col:var(--sidebar-w,258px);--tools-col:var(--tools-w,368px);grid-template-columns:var(--sidebar-col) 6px minmax(0,1fr) 6px var(--tools-col)}
+.pipiui-shell.sidebar-collapsed{--sidebar-col:0px}
+.pipiui-shell.tools-collapsed{--tools-col:0px}
+.pipiui-shell.tools-collapsed .tool-panel{border-left:0}
+.sidebar,.sb-root,.tool-panel,.chat-column{min-width:0;min-height:0;max-height:100%;overflow:hidden}
+.sidebar{height:100%;}
+.brand,.search,.sidebar-footer{flex:0 0 auto}
+.side-scroll{min-width:0;min-height:0;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain}
+.chat-column{height:100%;grid-template-rows:50px minmax(0,1fr) auto;overflow:hidden}
+/* Keep transcript scrolling in the sole flexible row. Queue/error/composer live
+   together in the final auto row so implicit grid rows can never push input off-screen. */
+.chat-viewport{position:relative;min-width:0;min-height:0;overflow:hidden;grid-row:2}
+.chat-viewport>.transcript-area{height:100%;min-height:0}
+.chat-composer-stack{grid-row:3;align-self:end;display:flex;min-width:0;min-height:0;flex:0 0 auto;flex-direction:column;overflow:visible}
+.chat-header,.composer{min-width:0;flex:none}
+/* Lease state is content in the fixed composer row, never a separate grid row. */
+.composer-read-only{display:flex;min-width:0;align-items:center;gap:8px;margin:0 0 7px;padding:5px 7px;border:1px solid color-mix(in srgb,var(--warning) 42%,var(--border));border-radius:7px;color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface-raised));font-size:11px}
+.composer-read-only span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.composer-read-only button{margin-left:auto;flex:none;padding:2px 5px;border-radius:4px;color:var(--warning);font-size:11px;text-decoration:underline}
+.composer-read-only button:hover{background:color-mix(in srgb,var(--warning) 16%,transparent)}
+.composer-thumb-remove:disabled{cursor:not-allowed;opacity:.45}
+.chat-header-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-header-actions{display:flex;flex:none;align-items:center;gap:6px;margin-left:auto}
+.message-list{min-width:0;min-height:0;height:100%;overflow:hidden}
+.message-list>div{min-width:0;min-height:0;height:100%}
+.tool-panel{height:100%}
+.tool-content{min-width:0;min-height:0;overflow:hidden}
+.subagent-content{width:100%;height:100%;min-width:0;min-height:0;overflow:hidden}
+.subagent-content>.subagents{width:100%;height:100%;min-width:0;min-height:0}
+@media (max-width:899px){.pipiui-shell{width:100%;--sidebar-col:minmax(150px,28vw);--tools-col:minmax(190px,32vw);grid-template-columns:var(--sidebar-col) 6px minmax(0,1fr) 6px var(--tools-col)}.brand{padding-top:12px}.message{padding-inline:14px}.composer{margin-inline:10px}.composer-options{flex-wrap:wrap}.composer-stats{margin-left:auto;justify-content:flex-end}}
+/* Narrow viewport (Swift sidebarCollapseWidth 720): App auto-collapses both panes;
+   manually re-expanded panes become fixed overlays so the chat column keeps the
+   full width and nothing overflows horizontally. */
+@media (max-width:720px){.pipiui-shell{grid-template-columns:0 minmax(0,1fr) 0}.pipiui-shell .sb-root,.pipiui-shell .tool-panel{position:fixed;top:calc(var(--titlebar-pad) + 50px);bottom:0;z-index:30;width:min(86vw,340px);height:auto;box-shadow:0 10px 40px rgb(0 0 0/30%)}.pipiui-shell .sb-root{left:0}.pipiui-shell .tool-panel{right:0;border-left:1px solid var(--border)}.pipiui-shell.sidebar-collapsed .sb-root,.pipiui-shell.tools-collapsed .tool-panel{display:none}.pipiui-shell .resize-handle{visibility:hidden}.tool-quick-rail{z-index:35}.pipiui-shell:not(.tools-collapsed) .tool-quick-rail{right:min(86vw,340px)}}
+.project-menu-wrap{position:relative;display:none}.project-row:hover .project-menu-wrap,.project-menu-wrap:focus-within{display:block}.project-menu-button{width:22px;height:24px;border-radius:5px;color:var(--muted);font-size:17px}.project-menu-button:hover{background:var(--surface-hover);color:var(--text)}.project-menu{position:absolute;z-index:10;top:26px;right:0;width:184px;padding:4px;border:1px solid var(--border);border-radius:8px;background:var(--surface-raised);box-shadow:0 10px 25px rgb(0 0 0 / 18%)}.project-menu button,.project-menu-count{display:block;width:100%;padding:6px 8px;text-align:left;border-radius:5px;font-size:11px}.project-menu button:hover{background:var(--surface-hover)}.project-menu button:disabled,.project-menu-count{color:var(--subtle);cursor:default}.project-menu .danger{color:var(--danger)}.sb-menu-item:disabled{cursor:not-allowed;opacity:.55;color:var(--subtle)}.sb-menu-item:disabled:hover{background:transparent}.transcript-area{position:relative;min-width:0;min-height:0;overflow:hidden}.return-latest{position:absolute;z-index:4;right:22px;bottom:18px;padding:6px 10px;border:1px solid var(--border);border-radius:16px;color:var(--text);background:var(--surface-raised);box-shadow:0 3px 10px rgb(0 0 0 / 16%);font-size:11px}
+
+/* Right tool workspace is content-only; the tool switcher floats over the chat
+   column as a Swift-style quick rail (panelQuickRail parity). */
+.tool-panel{display:flex;flex-direction:column;min-width:0;min-height:0}
+.tool-quick-rail{position:absolute;top:10px;right:10px;z-index:8;display:flex;min-width:0;flex-direction:column;align-items:center;gap:2px;padding:4px 3px;border:1px solid color-mix(in srgb,var(--border) 58%,transparent);border-radius:10px;background:color-mix(in srgb,var(--surface-raised) 92%,transparent);box-shadow:0 3px 12px rgb(0 0 0/14%)}
+.tool-rail-button{position:relative;display:grid;width:30px;height:30px;min-height:30px;flex:0 0 30px;place-items:center;padding:0;border-radius:7px;color:var(--muted);font-size:13px}.tool-rail-button:hover{background:var(--surface-hover);color:var(--text)}.tool-rail-button:disabled{cursor:not-allowed;opacity:.42}.tool-rail-button:disabled:hover{background:transparent;color:var(--muted)}.tool-rail-button.active{color:var(--text-strong);background:var(--accent-soft)}
+.tool-rail-icon{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;line-height:1}.tool-rail-running{position:absolute;top:5px;right:5px;width:6px;height:6px;border:1px solid var(--surface);border-radius:50%;background:var(--success);box-shadow:0 0 0 1px color-mix(in srgb,var(--success) 22%,transparent)}
+.tool-panel .tool-content{flex:1;display:block;min-width:0;min-height:0;overflow:hidden;padding:0}.tool-page{display:grid;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;place-items:stretch}.tool-page[hidden]{display:none!important}.tool-page.subagent-content,.tool-page.document-content{display:flex;padding:0}.tool-page>.empty-panel{align-self:center;justify-self:center}.browser-placeholder b{color:var(--text-strong)}
+
+
+/* Slash command palette (mirrors Swift SlashPalette above the composer). */
+.slash-backdrop{position:fixed;z-index:30;inset:0}
+.slash-menu{position:absolute;z-index:31;left:10px;right:10px;bottom:calc(100% - 10px);max-height:220px;overflow:auto;padding:6px;border:1px solid var(--border-strong);border-radius:10px;background:var(--surface-raised);box-shadow:0 10px 25px rgb(0 0 0 / 18%)}
+.slash-row{display:flex;width:100%;align-items:center;gap:8px;padding:7px 10px;border-radius:6px;text-align:left;font-size:12px;color:var(--text)}
+.slash-row:hover{background:var(--surface-hover)}
+.slash-row.selected{background:var(--accent-soft);color:var(--text-strong)}
+.slash-name{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600}
+.slash-desc{color:var(--muted);font-size:11px}
+.slash-empty{padding:10px;color:var(--subtle);font-size:11px;text-align:center}
+
+/* In-session /model quick picker modal. */
+.composer-thumbs{display:flex;flex-wrap:wrap;gap:6px;padding:0 0 8px}.composer-thumb{position:relative}.composer-thumb img{width:44px;height:44px;object-fit:cover;border:1px solid var(--border-strong);border-radius:6px;cursor:zoom-in;display:block}.composer-thumb-remove{position:absolute;top:-5px;right:-5px;width:16px;height:16px;border-radius:50%;color:#fff;background:var(--danger);font-size:11px;line-height:1}.composer-error{padding:2px 4px 6px;color:var(--danger);font-size:11px}.quick-menu-anchor{position:relative}.quick-menu-backdrop{position:fixed;z-index:30;inset:0}.quick-menu{position:absolute;z-index:31;bottom:calc(100% + 8px);left:0;min-width:200px;max-width:280px;max-height:300px;overflow:auto;padding:5px;border:1px solid var(--border-strong);border-radius:9px;background:var(--surface-raised);box-shadow:0 10px 25px rgb(0 0 0 / 18%)}.quick-menu-provider{padding:5px 8px 3px;color:var(--subtle);font-size:10px;font-weight:650;letter-spacing:.06em;text-transform:uppercase}.quick-menu-row{display:flex;width:100%;align-items:center;gap:7px;padding:6px 8px;border-radius:6px;text-align:left;font-size:12px;color:var(--text)}.quick-menu-row:hover{background:var(--surface-hover)}.quick-menu-row.current{background:var(--selection);color:var(--text-strong)}.quick-menu-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.quick-menu-check{margin-left:auto;color:var(--accent);font-weight:650}.quick-menu-empty{padding:12px;color:var(--subtle);font-size:11px;text-align:center}.provider-logo{display:inline-flex;flex:none;align-items:center;justify-content:center;border-radius:4px;color:#fff;font-weight:700;line-height:1;user-select:none}.model-modal-backdrop{position:fixed;z-index:40;inset:0;display:grid;place-items:center;background:rgb(0 0 0 / 45%)}.model-modal{display:flex;width:min(520px,calc(100vw - 48px));max-height:min(620px,calc(100dvh - 80px));flex-direction:column;border:1px solid var(--border-strong);border-radius:12px;background:var(--surface-raised);box-shadow:0 20px 50px rgb(0 0 0 / 35%)}.model-modal header{position:relative;padding:14px 16px 8px}.model-modal header h2{margin:0;font-size:14px;color:var(--text-strong)}.model-modal header p{margin:4px 0 0;color:var(--muted);font-size:11px}.model-modal-close{position:absolute;top:10px;right:10px;width:24px;height:24px;border-radius:5px;color:var(--muted);font-size:15px}.model-modal-close:hover{background:var(--surface-hover);color:var(--text-strong)}.model-modal-body{min-height:160px;max-height:520px;overflow:auto;padding:4px 12px 12px}.model-modal-state,.model-modal-error{padding:22px;text-align:center;color:var(--subtle);font-size:11px}.model-modal-error{color:var(--danger)}.model-provider{border-bottom:1px solid var(--border)}.model-provider-header{display:flex;align-items:center;gap:7px;padding:8px 4px}.model-provider-toggle{width:18px;height:18px;border-radius:4px;color:var(--muted);font-size:10px}.model-provider-toggle:hover{background:var(--surface-hover);color:var(--text)}.model-provider-name{font-weight:650;font-size:12px;color:var(--text-strong)}.model-provider-count{margin-left:auto;color:var(--subtle);font-size:10px}.model-provider-clear{padding:2px 7px;border-radius:5px;color:var(--muted);font-size:10px}.model-provider-clear:hover{background:var(--surface-hover);color:var(--danger)}.model-row{display:flex;align-items:center;gap:8px;padding:6px 4px 6px 25px;border-radius:6px;font-size:12px;color:var(--text);cursor:pointer}.model-row:hover{background:var(--surface-hover)}.model-row input{accent-color:var(--accent)}.model-row-name{overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap}.model-row-id{margin-left:auto;color:var(--muted);font-size:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}.model-row-current{flex:none;padding:1px 5px;border-radius:4px;color:var(--accent);background:var(--accent-soft);font-size:9px;font-weight:650}.lightbox-backdrop{position:fixed;z-index:50;inset:0;display:grid;place-items:center;background:rgb(0 0 0 / 70%);cursor:zoom-out}.lightbox-backdrop img{max-width:min(90vw,1200px);max-height:90dvh;border-radius:6px;box-shadow:0 20px 60px rgb(0 0 0 / 50%)}.lightbox-close{position:fixed;top:16px;right:20px;width:30px;height:30px;border-radius:50%;color:#fff;background:rgb(255 255 255 / 14%);font-size:16px}.lightbox-close:hover{background:rgb(255 255 255 / 26%)}
+
+/* Composer thinking selector — compact inline-flex chip (brain + level), Swift-aligned flat capsule without chevron. */
+.thinking-chip-anchor{position:relative}
+.thinking-chip{display:inline-flex;align-items:center;gap:4px;width:auto;padding:5px 10px;border-radius:999px;background:color-mix(in srgb,var(--text) 6%,transparent);font-size:12px;font-weight:500;color:var(--text)}
+.thinking-chip:hover{background:color-mix(in srgb,var(--text) 12%,transparent)}
+.thinking-chip:disabled{opacity:.45;cursor:default}
+.thinking-chip .thinking-brain{color:var(--muted)}
+.thinking-chip:hover .thinking-brain,.thinking-chip:active .thinking-brain{color:var(--text-strong)}
+.thinking-chip-level{color:var(--text-strong)}
+.thinking-chip:hover .thinking-chip-level{color:var(--text-strong)}
+.thinking-menu{min-width:120px}
+.thinking-menu .quick-menu-row{font-size:11px;text-transform:capitalize}
+
+/* Composer error is dismissible. */
+.queue-operation-error{display:flex;align-items:center;gap:8px;margin:0 16px 8px;padding:5px 8px;border:1px solid color-mix(in srgb,var(--danger) 36%,var(--border));border-radius:7px;color:var(--danger);background:color-mix(in srgb,var(--danger) 8%,var(--surface-raised));font-size:11px}.queue-operation-error button{margin-left:auto;width:18px;height:18px;border-radius:4px;color:var(--muted);font-size:13px;line-height:1}.queue-operation-error button:hover{background:var(--surface-hover);color:var(--danger)}
+.composer-error{display:flex;align-items:center;gap:8px;padding:2px 4px 6px;color:var(--danger);font-size:11px}
+.composer-error-close{margin-left:auto;flex:none;width:16px;height:16px;border-radius:4px;color:var(--muted);font-size:12px;line-height:1}
+.composer-error-close:hover{background:var(--surface-hover);color:var(--danger)}
+
+/* Provider header tri-state checkbox + delete + confirm. */
+.model-provider-header input[type="checkbox"]{accent-color:var(--accent);cursor:pointer}
+.model-provider-delete{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:5px;color:var(--muted)}
+.model-provider-delete:hover{background:var(--surface-hover);color:var(--danger)}
+.model-provider-confirm{padding:6px 8px 8px 25px;border-radius:6px;background:color-mix(in srgb,var(--danger) 8%,transparent);font-size:11px}
+.model-provider-confirm>span{color:var(--text)}
+.model-provider-confirm-actions{display:flex;gap:6px;margin-top:6px}
+.confirm-delete{padding:3px 10px;border-radius:6px;color:#fff;background:var(--danger);font-size:11px}
+.confirm-delete:disabled{opacity:.5;cursor:default}
+.provider-login-cancel{padding:3px 10px;border-radius:6px;color:var(--muted);font-size:11px}
+.provider-login-cancel:hover{background:var(--surface-hover)}
+
+/* Modal top action buttons. */
+.model-modal-add{position:absolute;top:10px;right:38px;padding:3px 9px;border-radius:10px;background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent);font-size:11px}
+.model-modal-add:hover{background:color-mix(in srgb,var(--accent) 22%,transparent)}
+
+/* Add-provider flow (pi native login). */
+.provider-row{display:flex;align-items:center;gap:8px;padding:8px 4px;border-bottom:1px solid var(--border)}
+.provider-row-main{display:flex;min-width:0;flex:1;align-items:center;gap:8px}
+.provider-row-name{color:var(--text-strong);font-size:12px;font-weight:600}
+.provider-row-status{color:var(--subtle);font-size:10px}
+.provider-row-actions{display:flex;flex:none;gap:6px}
+.provider-login-btn{padding:3px 10px;border-radius:10px;background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent);font-size:11px}
+.provider-login-btn:hover{background:color-mix(in srgb,var(--accent) 22%,transparent)}
+.provider-login{border:1px solid var(--border-strong);border-radius:8px;padding:10px;margin:4px 0}
+.provider-login-title{display:flex;align-items:center;gap:8px;font-size:12px}
+.provider-login-title b{color:var(--text-strong)}
+.provider-login-type{padding:1px 6px;border-radius:4px;background:var(--surface-hover);color:var(--muted);font-size:10px}
+.provider-login-waiting,.provider-login-error{padding:8px 0;font-size:11px;color:var(--muted)}
+.provider-login-error{color:var(--danger)}
+.provider-login-form{display:flex;flex-direction:column;gap:6px;padding:8px 0 0}
+.provider-login-form label{font-size:11px;color:var(--text)}
+.provider-login-form input{height:28px;padding:0 8px;border:1px solid var(--border-strong);border-radius:6px;outline:0;color:var(--text);background:var(--surface-input);font-size:12px}
+.provider-login-form input:focus{border-color:var(--accent)}
+.provider-login-form-actions{display:flex;gap:6px}
+.provider-login-submit{padding:3px 10px;border-radius:6px;color:#fff;background:var(--accent);font-size:11px}
+.provider-login-submit:disabled{opacity:.5;cursor:default}
+.provider-login-options{display:flex;flex-wrap:wrap;gap:6px}
+.provider-login-auth{display:flex;flex-direction:column;gap:6px;padding:8px 0 0;font-size:11px;color:var(--text)}
+.provider-login-code b{color:var(--text-strong);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.provider-login-url{overflow:hidden;padding:5px 7px;border-radius:5px;background:var(--surface-input);color:var(--muted);font-size:10px;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+
+/* Dismissible visibility-save error inside the model modal. */
+.visibility-error{display:flex;align-items:center;gap:8px;margin:4px 0;padding:6px 8px;border-radius:6px;background:color-mix(in srgb,var(--danger) 8%,transparent)}
+.visibility-error-close{margin-left:auto;flex:none;width:16px;height:16px;border-radius:4px;color:var(--muted);font-size:12px;line-height:1}
+.visibility-error-close:hover{background:var(--surface-hover);color:var(--danger)}
+
+/* Transcript tidy: the single canonical .activity-card ruleset lives here (subagent.css keeps only kind variants). */
+.activity-card{margin:4px 0 9px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}.activity-summary{display:flex;width:100%;min-width:0;align-items:center;gap:7px;padding:7px 9px;text-align:left}.activity-summary:hover{background:color-mix(in srgb,var(--surface-hover) 68%,transparent)}.activity-status{flex:0 0 auto;color:var(--success);font-size:11px}.activity-kind{flex:0 0 auto;padding:1px 4px;border-radius:7px;color:var(--muted);background:var(--surface-hover);font-size:9px;font-weight:600}.activity-summary b{min-width:0;overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap;font-size:11px}.activity-meta{margin-left:auto;overflow:hidden;color:var(--muted);text-overflow:ellipsis;white-space:nowrap;font-size:10px}.activity-chevron{flex:0 0 auto;color:var(--subtle);font-size:10px}.activity-details{padding:0 9px 8px}.activity-details .thinking,.activity-details .tool-card{margin:0 0 7px}
+/* Cap tall disclosure bodies inside collapsed cards (tool input/output, thinking prose). */
+.activity-details pre,.activity-details .tool-result,.activity-card-thinking .activity-details p{max-height:480px;overflow:auto}
+.activity-card-thinking .activity-details p{margin:0;color:var(--muted);font-size:12px;white-space:pre-wrap}
+/* Streamdown 2.5.0 code copy button: hover-reveal only. Identity lives in data-streamdown attributes, not classes — the button's className is tailwind-only (dist/chunk-BO2N2NFS.js: div[data-streamdown="code-block"] > … > button[data-streamdown="code-block-copy-button"][title="Copy Code"]). A button[title="Copy Code"] fallback (translations.copyCode) guards against the data attribute changing in future versions. Opacity only, so the button stays clickable once revealed. Verified in a real browser (dev server): idle opacity 0, container hover → 1, click works, unhover → 0. */
+.markdown [data-streamdown="code-block-copy-button"],.markdown [data-streamdown="code-block"] button[title="Copy Code"]{opacity:0;transition:opacity .15s ease}.markdown [data-streamdown="code-block"]:hover [data-streamdown="code-block-copy-button"],.markdown [data-streamdown="code-block"]:hover button[title="Copy Code"],.markdown [data-streamdown="code-block-copy-button"]:focus-visible,.markdown [data-streamdown="code-block"] button[title="Copy Code"]:focus-visible{opacity:1}
+/* System-message fallback: rounded card with a softened (non-mono) read. */
+.system-message{margin:10px auto;max-width:900px;padding:8px 12px;border:1px solid var(--border);border-radius:9px;color:var(--muted);background:var(--surface-raised);font:11.5px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:.01em}
+
+/* macOS hiddenInset chrome (VS Code / Notion style): the app owns the
+   titlebar band. Detected via UA in App.tsx (Electron only); plain-browser
+   server mode keeps zero padding. The band shows the session title like a
+   native macOS window and is the primary window-drag zone. */
+.pipiui-shell{position:relative;--titlebar-pad:0px;padding-top:var(--titlebar-pad)}
+.pipiui-shell.titlebar-pad{--titlebar-pad:38px}
+.titlebar-drag{position:absolute;top:0;left:0;right:0;z-index:6;height:var(--titlebar-pad);border-bottom:1px solid var(--border);background:var(--surface);-webkit-app-region:drag;user-select:none}
+/* The session header doubles as a drag zone; interactive controls stay clickable. */
+.titlebar-pad .chat-header{-webkit-app-region:drag}
+.titlebar-pad .chat-header button,.titlebar-pad .chat-header input,.titlebar-pad .chat-header select{-webkit-app-region:no-drag}
+/* Browser build boot state: never substitute demo data when the real Pi host is unavailable. */
+.browser-host-state { min-height: 100vh; display: grid; place-items: center; padding: 24px; color: var(--text-primary, #202124); background: var(--bg-primary, #fff); }
+.browser-host-error { position: relative; width: min(520px, 100%); padding: 24px; border: 1px solid var(--border, #d7d9df); border-radius: 14px; background: var(--panel-bg, #fff); }
+.browser-host-error > button[aria-label="关闭错误"] { position: absolute; top: 10px; right: 12px; border: 0; background: transparent; font-size: 24px; cursor: pointer; }

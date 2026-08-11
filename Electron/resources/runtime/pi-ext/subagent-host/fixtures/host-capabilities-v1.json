@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "bridge": {
+    "host": "127.0.0.1",
+    "port": 43123,
+    "rpcPath": "/rpc",
+    "sessionCapability": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  "session": {
+    "id": "pi-session-golden",
+    "agentDepth": 0,
+    "maxAgentDepth": 2,
+    "skillReadBlock": true
+  },
+  "mainCwd": "/tmp/pipiui-golden-project",
+  "extensions": {
+    "subagent": "/tmp/pipiui/PiExt/subagent",
+    "agentsDir": "/tmp/pipiui/PiExt/agents",
+    "searchScope": "/tmp/pipiui/search-scope.ts",
+    "webSearch": "/tmp/pipiui/web-search.ts",
+    "arxiv": "/tmp/pipiui/arxiv-fetch",
+    "computer": "/tmp/pipiui/computer-use-strategy.ts"
+  },
+  "modelFiles": {
+    "mainModelFile": "/tmp/pipiui/main-model.txt",
+    "subagentModelsFile": "/tmp/pipiui/subagent-models.json",
+    "subagentModelCapabilitiesFile": "/tmp/pipiui/subagent-model-capabilities.json"
+  },
+  "platform": {
+    "computer": {
+      "available": true,
+      "protocolVersion": 1,
+      "routingCapability": "computer-capability-0123456789abcdef",
+      "label": "host-provided computer route"
+    },
+    "search": {
+      "available": true,
+      "grantFile": "/tmp/pipiui/search-grant.json"
+    },
+    "memory": {
+      "available": true,
+      "label": "host-provided memory broker route"
+    }
+  }
+}

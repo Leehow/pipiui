@@ -289,6 +289,9 @@ private struct ChatDetailViewBody: View {
     @State private var finishedGroupPresentation: AssistantBlockLayout.FinishedGroupPresentation?
     @State private var runningToolDetail: RunningToolDetailPresentation?
     @StateObject private var gitBranches = GitBranchStore()
+    /// Narrow projections keep the detail chrome from observing full tab stores.
+    @State private var webTabActivityCount = 0
+    @State private var documentTabActivityCount = 0
 
     /// Last settled chat-column width. Width changes (window resize / right panel)
     /// reflow transcript row heights; we re-pin after the width stops moving.
@@ -423,6 +426,7 @@ private struct ChatDetailViewBody: View {
         .onAppear {
             gitBranches.bind(projectURL: session.projectURL)
             subagentProjection.bind(agentStore)
+            refreshPanelTabActivityCounts()
         }
         .onChange(of: session.bridgeRoutingKey) { _, _ in
             // A distinct ChatSession receives a fresh bridge key. Persisted-id
@@ -435,6 +439,7 @@ private struct ChatDetailViewBody: View {
             // Warm session switch reuses this chrome: re-bind the projection to the
             // new session's store so the running-count badge tracks the right tree.
             subagentProjection.bind(agentStore)
+            refreshPanelTabActivityCounts()
         }
         .onChange(of: session.id) { _, _ in
             // The detail chrome is reused across sessions. Reset only transient view state;
@@ -475,6 +480,9 @@ private struct ChatDetailViewBody: View {
                 }
             if let conflicts = store.extensionConflicts[session.id], !conflicts.isEmpty {
                 conflictBanner(conflicts)
+            }
+            if let conflict = session.leaseConflict {
+                leaseConflictBanner(conflict)
             }
             if let error = session.lastError {
                 errorBanner(error)
@@ -612,10 +620,7 @@ private struct ChatDetailViewBody: View {
                 }
             }
             .overlay(alignment: .topTrailing) {
-                if subagentProjection.presentation.runningCount > 0 {
-                    Circle().fill(Color.green).frame(width: 7, height: 7)
-                        .offset(x: 1, y: -1)
-                }
+                railBadge(count: subagentProjection.presentation.runningCount, color: .green)
             }
 
             railButton(
@@ -625,6 +630,9 @@ private struct ChatDetailViewBody: View {
             ) {
                 session.rightPanel = session.rightPanel == .web ? nil : .web
             }
+            .overlay(alignment: .topTrailing) {
+                railBadge(count: webTabActivityCount, color: .accentColor)
+            }
 
             railButton(
                 systemName: "doc.text",
@@ -632,6 +640,9 @@ private struct ChatDetailViewBody: View {
                 help: "文档面板（⌘+点击聊天中的 md/txt 文档路径在此预览）"
             ) {
                 session.rightPanel = session.rightPanel == .document ? nil : .document
+            }
+            .overlay(alignment: .topTrailing) {
+                railBadge(count: documentTabActivityCount, color: .accentColor)
             }
 
             railButton(
@@ -660,6 +671,41 @@ private struct ChatDetailViewBody: View {
         // Rail floats over selectable transcript text; without an explicit cursor
         // the underlying I-beam bleeds through on hover.
         .pointingHandCursor()
+        .onReceive(session.webTabs.$tabs) { _ in
+            refreshPanelTabActivityCountsAfterPublishedMutation()
+        }
+        .onReceive(session.documentTabs.$tabs) { _ in
+            refreshPanelTabActivityCountsAfterPublishedMutation()
+        }
+        // A navigation makes the initial browser tab non-fresh without changing
+        // the tab array. Defer past `objectWillChange`'s pre-mutation delivery.
+        .onReceive(session.webTabs.active.objectWillChange) { _ in
+            refreshPanelTabActivityCountsAfterPublishedMutation()
+        }
+    }
+
+    private func refreshPanelTabActivityCounts() {
+        webTabActivityCount = session.webTabs.activityCount
+        documentTabActivityCount = session.documentTabs.activityCount
+    }
+
+    private func refreshPanelTabActivityCountsAfterPublishedMutation() {
+        DispatchQueue.main.async {
+            refreshPanelTabActivityCounts()
+        }
+    }
+
+    @ViewBuilder
+    private func railBadge(count: Int, color: Color) -> some View {
+        if count > 0 {
+            Text("\(count)")
+                .font(.system(size: 9, weight: .bold, design: .rounded).monospacedDigit())
+                .foregroundStyle(.white)
+                .frame(minWidth: 14, minHeight: 14)
+                .background(Capsule().fill(color))
+                .offset(x: 3, y: -3)
+                .accessibilityHidden(true)
+        }
     }
 
     private func railButton(
@@ -1632,6 +1678,25 @@ private struct ChatDetailViewBody: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(Color.red.opacity(0.1))
+    }
+
+    /// 会话单写者租约冲突：只读徽标 + 显式「强制接管」（参照 Electron UI 语义）。
+    private func leaseConflictBanner(_ conflict: SessionLeaseConflict) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "lock.fill")
+                .foregroundStyle(.orange)
+            Text("由 \(conflict.holder) 运行中 · 只读")
+                .font(.callout)
+                .lineLimit(2)
+            Spacer()
+            Button("强制接管") {
+                session.forceTakeover()
+            }
+            .buttonStyle(HoverButtonStyle(base: .secondary, hovered: .primary))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.1))
     }
 
     private func errorBanner(_ error: String) -> some View {

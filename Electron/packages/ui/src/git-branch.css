@@ -1,0 +1,20 @@
+/* Chat-header git branch control (Electron counterpart of Swift GitBranchMenu).
+   Selectors stay two-class deep so the generic `.chat-header button/span` rules
+   in app.css cannot re-impose their 18px/margin-left on this control. */
+.git-branch{position:relative;display:flex;align-items:center}
+.git-branch .git-branch-button{display:flex;align-items:center;gap:5px;max-width:210px;min-width:0;height:26px;padding:0 7px;border-radius:6px;color:var(--muted);font-size:11px}
+.git-branch .git-branch-button:hover{background:var(--surface-hover);color:var(--text)}
+.git-branch .git-branch-button:disabled{cursor:default;opacity:.55}
+.git-branch .git-branch-icon{flex:none;margin:0;font-size:12px;line-height:1}
+.git-branch .git-branch-name{overflow:hidden;margin:0;font-size:11px;text-overflow:ellipsis;white-space:nowrap}
+.git-branch .git-branch-chevron{flex:none;margin:0;color:var(--subtle);font-size:9px}
+.git-menu-backdrop{position:fixed;z-index:30;inset:0}
+.git-branch .git-menu{position:absolute;z-index:31;top:30px;right:0;min-width:200px;max-width:300px;max-height:320px;overflow:auto;padding:5px;border:1px solid var(--border-strong);border-radius:9px;background:var(--surface-raised);box-shadow:0 10px 25px rgb(0 0 0 / 18%)}
+.git-branch .git-menu-row{display:flex;width:100%;align-items:center;gap:6px;padding:6px 8px;border-radius:6px;text-align:left;color:var(--text);font-size:12px}
+.git-branch .git-menu-row:hover{background:var(--surface-hover)}
+.git-branch .git-menu-row.current{background:var(--selection);color:var(--text-strong)}
+.git-branch .git-menu-row:disabled{cursor:default;opacity:.55}
+.git-branch .git-menu-check{flex:none;width:11px;margin:0;color:var(--accent);font-size:10px}
+.git-branch .git-menu-name{overflow:hidden;margin:0;font-size:12px;text-overflow:ellipsis;white-space:nowrap}
+.git-branch .git-menu-divider{margin:4px 6px;border-top:1px solid var(--border)}
+.git-branch .git-menu-error{padding:6px 8px;color:var(--danger);font-size:11px}

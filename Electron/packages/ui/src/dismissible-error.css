@@ -1,0 +1,6 @@
+.dismissible-error { display:flex; min-width:0; align-items:flex-start; gap:7px; padding:6px 7px; border:1px solid color-mix(in srgb,var(--danger) 50%,var(--border)); border-radius:6px; background:var(--surface-raised); color:var(--danger); font-size:11px; line-height:1.45; box-shadow:0 3px 10px rgb(0 0 0 / 15%); }
+.dismissible-error-message { flex:1; min-width:0; margin:0; overflow-wrap:anywhere; }
+.dismissible-error-retry { flex:none; margin:0; padding:1px 7px; border:1px solid color-mix(in srgb,var(--danger) 45%,var(--border)); border-radius:5px; color:var(--danger); background:transparent; font-size:11px; line-height:1.6; }
+.dismissible-error-retry:hover { background:color-mix(in srgb,var(--danger) 10%,transparent); }
+.dismissible-error-close { flex:none; display:grid; width:20px; height:20px; place-items:center; margin:0; padding:0; border-radius:5px; color:var(--muted); font-size:15px; line-height:1; }
+.dismissible-error-close:hover { color:var(--text-strong); background:var(--surface-hover); }

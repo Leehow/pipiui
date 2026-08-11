@@ -16,3 +16,9 @@ Sources.bak-20260723-104538/
 
 # Local git worktrees
 .worktrees/
+
+# Electron workspace outputs
+Electron/node_modules/
+Electron/**/node_modules/
+Electron/**/dist/
+Electron/**/out/

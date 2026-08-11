@@ -33,13 +33,17 @@ if [[ "$SKIP_TESTS" -eq 0 ]]; then
     echo "Re-run with --skip-tests to package without tests." >&2
     exit 1
   fi
-  # Node gate: qoder 200K context-window compat + main-session compaction
-  # (real extension loaded through the installed pi runtime). A failure here
-  # must block packaging just like a swift test failure.
-  echo "==> node --test Tests/Node/test-qoder-context-window.mjs Tests/Node/test-main-compaction.mjs"
+  # Node gate: qoder 200K context-window compat + main-session compaction +
+  # the runtime-owned boss ledger task table (real extension loaded through the
+  # installed pi runtime). A failure here must block packaging just like a swift
+  # test failure.
+  echo "==> node --test Tests/Node/test-qoder-context-window.mjs Tests/Node/test-main-compaction.mjs Tests/Node/test-boss-ledger-tasks.mjs Tests/Node/test-subagent-worktree-finalize.mjs"
   if ! node --test \
     Tests/Node/test-qoder-context-window.mjs \
-    Tests/Node/test-main-compaction.mjs; then
+    Tests/Node/test-main-compaction.mjs \
+    Tests/Node/test-boss-ledger-tasks.mjs \
+    Tests/Node/test-subagent-worktree-finalize.mjs \
+    Tests/Node/test-subagent-dispatch-queue.mjs; then
     echo "node tests failed; Re-run with --skip-tests to package without tests." >&2
     exit 1
   fi

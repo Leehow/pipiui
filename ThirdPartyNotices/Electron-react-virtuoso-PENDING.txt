@@ -1,0 +1,10 @@
+react-virtuoso — Third-Party Notice (PENDING)
+===============================================
+
+Source:  https://github.com/petyosi/react-virtuoso
+License: MIT (core package only)
+Status:  Planned direct dependency; not present in this repository or a distributed artifact.
+
+Do not include the commercial Message List package. Before first inclusion,
+replace this placeholder with the pinned version, upstream copyright notice, and
+the complete MIT license text (or an approved bundled-license reference). See docs/plans/2026-08-10-electron-reuse-audit.md.

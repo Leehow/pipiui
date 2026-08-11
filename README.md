@@ -27,6 +27,12 @@
 
 实现：App 内起一个仅监听 127.0.0.1 的 HTTP 桥接服务，扩展通过 `PIPIUI_BRIDGE_PORT` / `PIPIUI_SESSION_KEY` 环境变量找到它；后者是每个顶层会话独立的高熵 capability，桥在分发任何请求前都会校验。未知或已关闭的 capability 一律拒绝，不会回退到当前选中会话。调试钩子：`PIPIUI_AUTO_SESSION=<项目路径>` 启动可自动建会话。
 
+## Memory（extension-native Learning Loop）
+
+设置 → **记忆** 中勾选「启用记忆」即可安装并启用正式的 `pipiui-memory-broker` extension；安装、Catalog/Retrieval/Curator、学习循环、管理页与 eval 都属于该 extension。状态只显示 extension 的版本和 ready/degraded 摘要。点击 **打开 Memory Center** 时，PipiUI 仅通过当前活动 Pi 会话请求一次短期 opaque 描述符并打开 extension 页面；没有活动会话会提示先打开会话，不会自动创建或重启会话。短期 URL 过期后回到设置重试即可。
+
+在裸 Pi 中，安装/启用该 extension 后输入 `/memory` 可请求并打开同一 extension 提供的 Memory Center。业务 API、数据格式及运维说明都在 `Sources/PipiUI/PiExt/packages/memory-broker/README.md`，不属于 Swift 宿主契约。
+
 ## Computer Use（macOS 桌面控制，opt-in）
 
 设置 → 工具与 Skills 中可显式开启 Computer Use。默认关闭时不导出桌面能力，工具不存在、没有前缀成本。开启后主会话只导出 `PIPIUI_COMPUTER_*` 环境（供嵌套派发 host-check），**不**挂载 `computer` / `open_application`；桌面工具仅注入给带 desktop 授权的 subagent（`operator`）。

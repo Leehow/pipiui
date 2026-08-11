@@ -1,0 +1,19 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MemoryCatalog, MemoryCatalogError } from "../src/memory-catalog.ts";
+
+async function fixture() { return mkdtemp(join(tmpdir(), "pipiui-catalog-")); }
+async function record(c: MemoryCatalog, claim = "Use UTF-8 café") { return c.upsert({ kind: "semantic", claim, scope: { kind: "project", project: "/repo" }, evidence: [{ summary: "observed" }], sourceRuns: ["run-a"] }); }
+
+test("create/reload, UTF-8 hash, project/app isolation, and source-run merge", async () => { const dir = await fixture(); try { const c = await MemoryCatalog.open(dir); const first = await record(c); const duplicate = await c.upsert({ kind: "semantic", claim: "Use UTF-8 café", scope: { kind: "project", project: "/repo" }, sourceRuns: ["run-b"], evidence: [{ summary: "also observed" }] }); assert.equal(first.id, duplicate.id); assert.deepEqual(duplicate.sourceRuns, ["run-a", "run-b"]); const app = await c.upsert({ kind: "semantic", claim: "Use UTF-8 café", scope: { kind: "app", project: "/repo", app: "com.example.app" } }); assert.notEqual(app.id, first.id); assert.equal((await MemoryCatalog.open(dir)).list().length, 2); } finally { await rm(dir, { recursive: true }); } });
+
+test("legal lifecycle, tombstone, and illegal resurrection", async () => { const dir = await fixture(); try { const c = await MemoryCatalog.open(dir); const r = await record(c); await c.transition(r.id, "deleted"); assert.equal((await c.upsert({ kind: "semantic", claim: r.claim, scope: r.scope, sourceRuns: ["old-run"] })).status, "deleted"); await assert.rejects(() => c.transition(r.id, "active"), MemoryCatalogError); } finally { await rm(dir, { recursive: true }); } });
+
+test("replay tolerates only a corrupt tail and recovers when snapshot is absent", async () => { const dir = await fixture(); try { const c = await MemoryCatalog.open(dir); await record(c); const log = join(dir, "pipiui-memory-catalog-v2.jsonl"); await writeFile(log, `${await readFile(log, "utf8")}{bad`, "utf8"); await unlink(join(dir, "pipiui-memory-catalog-v2.json")); assert.equal((await MemoryCatalog.open(dir)).list().length, 1); await writeFile(log, `${await readFile(log, "utf8")}\n{bad}\n{}\n`, "utf8"); await assert.rejects(() => MemoryCatalog.open(dir), MemoryCatalogError); } finally { await rm(dir, { recursive: true }); } });
+
+test("promotion never reports active before Hermes verification and reconciliation is safe", async () => { const dir = await fixture(); try { const c = await MemoryCatalog.open(dir); const r = await record(c); const failed = await c.promote(r.id, { add: async () => ({ id: "h1" }), verify: async () => false }); assert.equal(failed.status, "candidate"); await c.reconcile({ add: async () => ({ id: "h1" }), verify: async () => true }); assert.equal(c.get(r.id)?.status, "active"); } finally { await rm(dir, { recursive: true }); } });
+
+test("V1 import is idempotent and preserves queue", async () => { const dir = await fixture(); try { const queue = join(dir, "pipiui-memory-broker-experience-v1.jsonl"); await writeFile(queue, `${JSON.stringify({ version: 1, kind: "pipiui-memory-experience", reason: "quarantined", projectRoot: "/repo", candidate: { claim: "legacy", sourceRuns: ["v1-run"], evidence: [{ summary: "legacy evidence" }] } })}\n`); const c = await MemoryCatalog.open(dir); assert.equal(await c.importV1(), 1); assert.equal(await c.importV1(), 0); assert.equal(c.list()[0]?.provenance[0]?.reason, "quarantined"); assert.ok(await readFile(queue, "utf8")); const permissions = await c.permissions(); assert.equal(permissions.log, 0o600); assert.equal(permissions.snapshot, 0o600); } finally { await rm(dir, { recursive: true }); } });

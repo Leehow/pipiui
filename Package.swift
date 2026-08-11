@@ -7,6 +7,8 @@ let package = Package(
     products: [
         // Product name stays `PipiUI` so `swift run` / make-app keep familiar paths.
         .executable(name: "PipiUI", targets: ["PipiUIApp"]),
+        // Non-UI maintenance entry point; never initializes NSApplication.
+        .executable(name: "pipiui-maintenance", targets: ["PipiUIMaintenance"]),
     ],
     dependencies: [
         .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", from: "1.16.0"),
@@ -40,6 +42,11 @@ let package = Package(
             name: "PipiUIApp",
             dependencies: ["PipiUI"],
             path: "Sources/PipiUIApp"
+        ),
+        .executableTarget(
+            name: "PipiUIMaintenance",
+            dependencies: ["PipiUI"],
+            path: "Sources/PipiUIMaintenance"
         ),
         .testTarget(
             name: "PipiUITests",

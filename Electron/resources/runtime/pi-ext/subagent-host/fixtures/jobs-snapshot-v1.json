@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-10T00:00:04.000Z",
+  "jobs": [
+    {
+      "agentId": "host-contract",
+      "runId": "run-001",
+      "name": "general-purpose",
+      "task": "Freeze a portable host contract.",
+      "title": "Host protocol",
+      "blockedBy": ["protocol-review"],
+      "state": "running",
+      "startedAt": 1786320000000,
+      "activity": "write contract.ts",
+      "cost": 0.0123,
+      "turns": 2,
+      "stalled": false
+    },
+    {
+      "agentId": "finished-worker",
+      "runId": "run-002",
+      "name": "reviewer",
+      "task": "Review the adapter.",
+      "state": "ok",
+      "startedAt": 1786319900000,
+      "endedAt": 1786319990000,
+      "resultText": "No blocking findings.",
+      "cost": 0.0042,
+      "turns": 1
+    },
+    {
+      "agentId": "closed-worker",
+      "runId": "run-003",
+      "name": "reviewer",
+      "task": "Review the retained failed worktree.",
+      "state": "failed",
+      "startedAt": 1786319800000,
+      "endedAt": 1786319890000,
+      "resultText": "Verification failed; retained for review.",
+      "closeoutDisposition": "cleaned",
+      "closeoutReason": "Boss confirmed this failure was handled.",
+      "closeoutAt": 1786320005000,
+      "cost": 0.001,
+      "turns": 1
+    }
+  ]
+}

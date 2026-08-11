@@ -1,0 +1,108 @@
+# Cross-platform Electron build & test (plan: cross-platform-builds).
+# Matrix: mac (dmg/zip, x64+arm64) · win (NSIS x64) · linux (AppImage+deb x64).
+# Each job: npm ci → npm test → npm run build → electron-builder package.
+# The bare macOS .app bundle is deliberately NOT uploaded (AGENTS.md keeps
+# .app packaging primary-checkout-scoped); only dmg/zip/exe/AppImage/deb are
+# published as artifacts.
+name: electron-cross-platform
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'Electron/**'
+      - 'scripts/build-electron-app.sh'
+      - 'scripts/make-icon.sh'
+      - '.github/workflows/electron.yml'
+  pull_request:
+    paths:
+      - 'Electron/**'
+      - 'scripts/build-electron-app.sh'
+      - 'scripts/make-icon.sh'
+      - '.github/workflows/electron.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: mac
+            os: macos-latest
+            args: --mac
+          - platform: win
+            os: windows-latest
+            args: --win
+          - platform: linux
+            os: ubuntu-latest
+            args: --linux
+    runs-on: ${{ matrix.os }}
+    env:
+      # No signing certificates on CI: keep electron-builder from probing
+      # keychains / auto-discovering identities.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: Electron/package-lock.json
+
+      - name: Install dependencies
+        working-directory: Electron
+        run: npm ci
+
+      # node-pty / native-deps placeholder (NOT wired in yet — round 2):
+      # when a native dependency lands, rebuild it against the pinned
+      # Electron ABI right after `npm ci`, on every platform:
+      #   - name: Rebuild native deps for Electron
+      #     working-directory: Electron
+      #     run: npx electron-builder install-app-deps
+      # (electron-rebuild equivalent; packaging also honors npmRebuild=true.)
+
+      # server tests serve packages/ui/dist/browser — build must run first.
+      - name: Build workspace
+        working-directory: Electron
+        run: npm run build
+
+      - name: Test
+        working-directory: Electron
+        run: npm test
+
+      # build/ is gitignored, so build/icon.icns only exists after a local
+      # make-icon.sh run; regenerate it on macOS runners (sips + iconutil are
+      # macOS-only — win/linux use the committed iconset at
+      # Electron/apps/electron/assets/icons/, converted by app-builder).
+      - name: Regenerate macOS icon (icns)
+        if: matrix.platform == 'mac'
+        run: bash scripts/make-icon.sh assets/brand/app-icon.png Electron/apps/electron/build/icon.icns
+
+      - name: Package (${{ matrix.platform }})
+        working-directory: Electron/apps/electron
+        run: npx electron-builder ${{ matrix.args }} --config.directories.output=../../../build
+
+      - name: Sanity-check deb artifact (stub guard)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          DEB=$(ls build/pipiui_e_*_amd64.deb 2>/dev/null | head -1)
+          if [ -z "$DEB" ]; then echo "deb artifact missing" >&2; exit 1; fi
+          SIZE=$(stat -c %s "$DEB" 2>/dev/null || stat -f %z "$DEB")
+          if [ "$SIZE" -lt 1024 ]; then echo "deb is a stub ($SIZE bytes); fpm failed" >&2; exit 1; fi
+          echo "deb OK: $DEB ($SIZE bytes)"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipiui_e-${{ matrix.platform }}
+          path: |
+            build/*.dmg
+            build/*.zip
+            build/*.exe
+            build/*.AppImage
+            build/*.deb
+          if-no-files-found: error

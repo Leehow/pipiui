@@ -16,9 +16,11 @@ final class DocumentTabsStoreTests: XCTestCase {
         let a = makeTempDocument()
         let b = makeTempDocument()
 
+        XCTAssertEqual(store.activityCount, 0)
         store.open(a)
         store.open(b)
         XCTAssertEqual(store.tabs.count, 2)
+        XCTAssertEqual(store.activityCount, 2)
         XCTAssertEqual(store.selectedTab?.url.path, b.path)
 
         store.open(a) // 同路径 → 只切换，不新增
@@ -48,6 +50,7 @@ final class DocumentTabsStoreTests: XCTestCase {
         let aID = store.tabs[0].id
         store.closeTab(id: aID) // 全关 → 空态
         XCTAssertTrue(store.tabs.isEmpty)
+        XCTAssertEqual(store.activityCount, 0)
         XCTAssertNil(store.selectedTabID)
         XCTAssertNil(store.activeStore)
     }

@@ -1,0 +1,156 @@
+/*
+ * WaitingPlaceholder — restrained inline waiting row for the transcript tail.
+ * Echoes pi's `Working... (esc to interrupt)` and Swift `WaitingPlaceholderView`
+ * (small progress indicator + copy + elapsed), upgraded to a deterministic
+ * 3-bar waveform with phase-aware copy. Self-contained styles: no app.css
+ * dependency; light/dark tokens follow the host `[data-theme]` ancestor with a
+ * standalone prefers-color-scheme fallback. Reduced motion (media query, or the
+ * `reduceMotion` prop → `.is-reduce-motion`) drops translation/scale animation
+ * and keeps only a static opacity pulse.
+ */
+
+.waiting-placeholder {
+  /* Light tokens (default) */
+  --wp-text: #4b4b55;
+  --wp-text-muted: #8a8a96;
+  --wp-accent: #4968c9;
+  --wp-accent-soft: rgba(73, 104, 201, 0.14);
+  --wp-stop-border: rgba(0, 0, 0, 0.18);
+  --wp-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 5px 0;
+  color: var(--wp-text);
+  font: 12px/1.4 var(--wp-font);
+  white-space: nowrap;
+  user-select: none;
+  animation: waiting-row-in 0.18s ease-out;
+}
+
+[data-theme='dark'] .waiting-placeholder {
+  --wp-text: #c7c9d4;
+  --wp-text-muted: #7d7f8c;
+  --wp-accent: #8a9df0;
+  --wp-accent-soft: rgba(138, 157, 240, 0.2);
+  --wp-stop-border: rgba(255, 255, 255, 0.2);
+}
+
+/* Standalone dark fallback when no [data-theme] ancestor exists. */
+@media (prefers-color-scheme: dark) {
+  :root:not(:has([data-theme])) .waiting-placeholder {
+    --wp-text: #c7c9d4;
+    --wp-text-muted: #7d7f8c;
+    --wp-accent: #8a9df0;
+    --wp-accent-soft: rgba(138, 157, 240, 0.2);
+    --wp-stop-border: rgba(255, 255, 255, 0.2);
+  }
+}
+
+/* ---- 3-bar waveform ---- */
+
+.waiting-placeholder__bars {
+  display: inline-flex;
+  align-items: center;
+  gap: 2.5px;
+  height: 12px;
+  flex: none;
+}
+
+.waiting-placeholder__bar {
+  width: 3px;
+  border-radius: 2px;
+  background: var(--wp-accent);
+  animation: waiting-bar-bounce 1.2s ease-in-out infinite;
+}
+
+.waiting-placeholder__bar--1 { height: 6px; animation-delay: 0s; }
+.waiting-placeholder__bar--2 { height: 11px; animation-delay: 0.18s; }
+.waiting-placeholder__bar--3 { height: 8px; animation-delay: 0.36s; }
+
+@keyframes waiting-bar-bounce {
+  0%, 100% { transform: scaleY(0.45); opacity: 0.55; }
+  50% { transform: scaleY(1); opacity: 1; }
+}
+
+/* ---- copy / detail / elapsed ---- */
+
+.waiting-placeholder__copy {
+  color: var(--wp-text);
+}
+
+.waiting-placeholder__detail {
+  min-width: 0;
+  max-width: 40ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--wp-text-muted);
+}
+
+.waiting-placeholder__elapsed {
+  color: var(--wp-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- stop control ---- */
+
+.waiting-placeholder__stop {
+  padding: 2px 10px;
+  border: 1px solid var(--wp-stop-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--wp-text-muted);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.waiting-placeholder__stop:hover {
+  background: var(--wp-accent-soft);
+  border-color: transparent;
+  color: var(--wp-accent);
+}
+
+.waiting-placeholder__stop:focus-visible {
+  outline: 2px solid var(--wp-accent);
+  outline-offset: 1px;
+}
+
+/* ---- reduced motion: no translation/scale, opacity only ---- */
+
+@media (prefers-reduced-motion: reduce) {
+  .waiting-placeholder {
+    animation: waiting-row-fade-in 0.2s ease-out;
+  }
+
+  .waiting-placeholder__bar {
+    animation: waiting-bar-fade 1.6s ease-in-out infinite;
+  }
+}
+
+.waiting-placeholder.is-reduce-motion {
+  animation: waiting-row-fade-in 0.2s ease-out;
+}
+
+.waiting-placeholder.is-reduce-motion .waiting-placeholder__bar {
+  animation: waiting-bar-fade 1.6s ease-in-out infinite;
+}
+
+@keyframes waiting-row-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes waiting-row-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes waiting-bar-fade {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}

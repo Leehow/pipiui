@@ -318,12 +318,15 @@ final class PhilosophySettingsTests: XCTestCase {
                   atomically: true, encoding: .utf8)
 
         let bundled = try XCTUnwrap(PhilosophyPackage.bundledURL)
-        let layers = PhilosophySettings.layers(
-            layersURL: bundled.appendingPathComponent("layers"), userURL: userDir)
+        let bundledLayersURL = bundled.appendingPathComponent("layers")
+        let bundledCount = PhilosophySettings.layers(layersURL: bundledLayersURL, userURL: nil).count
+        let layers = PhilosophySettings.layers(layersURL: bundledLayersURL, userURL: userDir)
         let foundation = try XCTUnwrap(layers.first { $0.id == "foundation" })
         XCTAssertTrue(foundation.isUserProvided)
         XCTAssertEqual(foundation.body, "Mine.")
         XCTAssertEqual(layers.filter { $0.id == "foundation" }.count, 1)
-        XCTAssertEqual(layers.count, 4, "shadowing must not add a fifth layer")
+        // Relative to what ships, not a literal: this pins the shadowing rule, and a new
+        // bundled layer is not supposed to be able to fail it.
+        XCTAssertEqual(layers.count, bundledCount, "shadowing must replace a layer, not add one")
     }
 }

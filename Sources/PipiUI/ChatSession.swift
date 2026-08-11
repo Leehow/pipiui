@@ -773,7 +773,23 @@ final class ChatSession: ObservableObject, Identifiable {
     /// Pre-formatted pay-per-token balance for the input-bar capsule (nil = hidden).
     @Published var accountBalance: String?
     @Published var sessionName: String?
-    @Published var sessionFile: String?
+    @Published var sessionFile: String? {
+        didSet {
+            // Session file replaced (fork / rebind): drop the old lease first.
+            if oldValue != nil, oldValue != sessionFile {
+                leaseManager?.release()
+                leaseManager = nil
+            }
+            if sessionFile != nil {
+                attachSessionLeaseIfPossible()
+            }
+        }
+    }
+    /// 会话单写者租约冲突：非 nil 表示另一实现（Electron / 另一 PipiUI 进程）
+    /// 正持有本会话的写租约。冲突时会话只读，可显式「强制接管」。
+    @Published private(set) var leaseConflict: SessionLeaseConflict?
+    /// 会话是否因租约冲突处于只读状态（发送被禁用）。
+    var isLeaseReadOnly: Bool { leaseConflict != nil }
     @Published var lastError: String? {
         didSet { lastErrorCanRetry = false }
     }
@@ -1052,6 +1068,13 @@ final class ChatSession: ObservableObject, Identifiable {
     /// It closes the small RPC/event gap so a user prompt cannot slip through unqueued.
     private var proactiveCompactionRPCInFlight = false
     private var processStartCancelled = false
+    /// 会话单写者租约管理器（pi 引擎且会话文件 id 已知时挂载）。
+    private var leaseManager: SessionLeaseManager?
+    /// 因租约冲突被推迟的 pi 启动参数；「强制接管」成功后补启动。
+    private var deferredSpawnArguments: [String]?
+    private var deferredSpawnEnvironment: [String: String]?
+    /// One explicit, non-persistent Memory Center open request at a time.
+    private var memoryCenterDescriptorCompletion: ((Result<MemoryCenterOpenDescriptor, Error>) -> Void)?
 
     init(id: String, projectURL: URL, sessionPath: String?,
          bridgePort: UInt16 = 0,
@@ -1208,6 +1231,9 @@ final class ChatSession: ObservableObject, Identifiable {
             return
         }
 
+        // 会话单写者租约：恢复历史会话先尝试持租约；冲突则只读打开（startProcess 不 spawn）。
+        attachSessionLeaseIfPossible()
+
         // Computer Use also depends on the built-in capability switch: even if the
         // standalone authorization (`ComputerUseSettings.isEnabled()`) is on, the
         // harness is never mounted when the master feature is off.
@@ -1315,6 +1341,15 @@ final class ChatSession: ObservableObject, Identifiable {
 
     private func startProcess(arguments: [String], environment: [String: String]) {
         guard !processStartCancelled, backend == nil else { return }
+        // 会话单写者租约：冲突时绝不 spawn 第二个写者。记录启动参数，
+        // 用户「强制接管」成功后由 forceTakeover() 补启动。
+        if engineKind == .pi, leaseConflict != nil {
+            deferredSpawnArguments = arguments
+            deferredSpawnEnvironment = environment
+            processAlive = false
+            isInitializing = false
+            return
+        }
         switch engineKind {
         case .pi:
             guard let proc = PiProcess(cwd: projectURL, arguments: arguments, extraEnv: environment) else {
@@ -1408,6 +1443,8 @@ final class ChatSession: ObservableObject, Identifiable {
     }
 
     deinit {
+        // 会话单写者租约：释放本会话的租约（进程退出另有 atexit 兜底）。
+        leaseManager?.release()
         if let quotaObserverID, let monitor = currentQuotaMonitor {
             let id = quotaObserverID
             let mon = monitor
@@ -1970,6 +2007,24 @@ final class ChatSession: ObservableObject, Identifiable {
         streamFirstTokenAt = Date()
     }
 
+    /// Requests an opaque short-lived descriptor through the already-active Pi session.
+    /// The extension delivers it in its UI notify event; it is never transcript/log/defaults data.
+    func requestMemoryCenterDescriptor(completion: @escaping (Result<MemoryCenterOpenDescriptor, Error>) -> Void) {
+        guard processAlive, backend != nil else { completion(.failure(MemoryCenterRequestError.noActiveSession)); return }
+        guard memoryCenterDescriptorCompletion == nil else { completion(.failure(MemoryCenterRequestError.inProgress)); return }
+        memoryCenterDescriptorCompletion = completion
+        backend?.request(["type": "prompt", "message": "/memory"]) { [weak self] response in
+            guard let self, response["success"].bool != true else { return }
+            let callback = self.memoryCenterDescriptorCompletion
+            self.memoryCenterDescriptorCompletion = nil
+            callback?(.failure(MemoryCenterRequestError.requestFailed))
+        }
+    }
+
+    enum MemoryCenterRequestError: LocalizedError { case noActiveSession, inProgress, requestFailed, invalidDescriptor, expired
+        var errorDescription: String? { switch self { case .noActiveSession: return "请先打开一个正在运行的 Pi 会话，再打开 Memory Center。"; case .inProgress: return "Memory Center 请求正在进行。"; case .requestFailed: return "Memory Center 请求失败，请重试。"; case .invalidDescriptor: return "Memory Center 返回了无效描述符。"; case .expired: return "Memory Center 链接已过期，请重试。" } }
+    }
+
     // MARK: - Event handling
 
     package func handleEvent(_ e: J) {
@@ -2336,7 +2391,21 @@ final class ChatSession: ObservableObject, Identifiable {
         let method = e["method"].string ?? ""
         switch method {
         case "notify":
-            appendSystem("[\(e["notifyType"].string ?? "info")] \(e["message"].string ?? "")")
+            let message = e["message"].string ?? ""
+            if let completion = memoryCenterDescriptorCompletion,
+               let data = message.data(using: .utf8),
+               let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let version = raw["version"] as? Int,
+               let urlText = raw["url"] as? String,
+               let url = URL(string: urlText),
+               let expiry = raw["expiresAt"] as? String,
+               let expiresAt = ISO8601DateFormatter().date(from: expiry) {
+                memoryCenterDescriptorCompletion = nil
+                let descriptor = MemoryCenterOpenDescriptor(version: version, url: url, expiresAt: expiresAt)
+                completion(descriptor.isExpired ? .failure(MemoryCenterRequestError.expired) : .success(descriptor))
+                return
+            }
+            appendSystem("[\(e["notifyType"].string ?? "info")] \(message)")
         case "confirm":
             // 无人值守时安全默认：拒绝
             if let rid = e["id"].string {
@@ -3949,6 +4018,57 @@ final class ChatSession: ObservableObject, Identifiable {
         )
     }
 
+    // MARK: - Session single-writer lease
+
+    /// 会话文件确定后挂载写租约（恢复路径在 init、新会话路径在 get_state 回填后）。
+    /// 解析失败（无 id / 文件未就绪）则暂不参与租约；发送前会再尝试。
+    private func attachSessionLeaseIfPossible() {
+        guard engineKind == .pi, leaseManager == nil, let file = sessionFile else { return }
+        guard let manager = SessionLeaseManager(sessionFile: file) else { return }
+        manager.onOwnershipLost = { [weak self] status in
+            DispatchQueue.main.async {
+                self?.applyLeaseStatus(status)
+            }
+        }
+        leaseManager = manager
+        applyLeaseStatus(manager.acquire())
+    }
+
+    private func applyLeaseStatus(_ status: SessionLeaseStatus) {
+        if status.writable {
+            leaseConflict = nil
+        } else if let record = status.holder {
+            leaseConflict = SessionLeaseConflict(record: record)
+        }
+    }
+
+    /// 发送前确认持有写租约；尚未挂载（新会话文件未回填）时先尝试挂载。
+    /// 返回 true 表示可写。
+    private func ensureLeaseBeforeSend() -> Bool {
+        if leaseConflict != nil { return false }
+        if let manager = leaseManager {
+            if manager.isOwned { return true }
+            applyLeaseStatus(manager.acquire())
+            return manager.isOwned
+        }
+        attachSessionLeaseIfPossible()
+        return leaseManager?.isOwned ?? true
+    }
+
+    /// 用户显式强制接管（破坏性）：作废旧租约并独占，然后补启动被推迟的 pi。
+    func forceTakeover() {
+        guard let manager = leaseManager else { return }
+        applyLeaseStatus(manager.forceTakeover())
+        guard leaseConflict == nil else { return }
+        if backend == nil,
+           let arguments = deferredSpawnArguments,
+           let environment = deferredSpawnEnvironment {
+            deferredSpawnArguments = nil
+            deferredSpawnEnvironment = nil
+            startProcess(arguments: arguments, environment: environment)
+        }
+    }
+
     enum RemotePromptSubmissionResult: Equatable {
         case accepted
         case empty
@@ -4634,6 +4754,24 @@ final class ChatSession: ObservableObject, Identifiable {
         stripImagesForRPC: Bool = false,
         appendOptimisticBubble: Bool = true
     ) -> Bool {
+        // 会话单写者租约：发送 prompt 前必须持有写租约；未持租约只读。
+        if let conflict = leaseConflict {
+            if let requeueOnFailure {
+                queue.requeueFront(requeueOnFailure)
+                publishQueue()
+            }
+            lastError = "会话正由 \(conflict.holder) 运行中，当前为只读。可点击「强制接管」获取写权限。"
+            return false
+        }
+        if !ensureLeaseBeforeSend() {
+            if let requeueOnFailure {
+                queue.requeueFront(requeueOnFailure)
+                publishQueue()
+            }
+            lastError = "会话正由另一版本运行中，当前为只读。可点击「强制接管」获取写权限。"
+            return false
+        }
+
         do {
             try SearchScopeExtension.applyPromptPolicy(
                 searchGrantPolicy,

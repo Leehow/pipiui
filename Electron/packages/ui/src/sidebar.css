@@ -1,0 +1,378 @@
+/* Standalone PipiUI sidebar — mirrors the Swift SidebarView layout.
+   Self-contained: consumes app.css design tokens (--surface/--text/--muted/
+   --accent/...) when present and falls back to neutral values otherwise, so
+   it themes with the shell's light/dark data-theme without touching app.css.
+   All classes are sb- prefixed to avoid colliding with existing app.css
+   sidebar styles. */
+
+.sb-root{
+  --sb-text:var(--text,#e5e7eb);
+  --sb-text-strong:var(--text-strong,#f3f4f6);
+  --sb-muted:var(--muted,#9da2ad);
+  --sb-subtle:var(--subtle,#747a86);
+  --sb-surface:var(--surface,#202126);
+  --sb-surface-raised:var(--surface-raised,#25262c);
+  --sb-surface-hover:var(--surface-hover,#2c2d34);
+  --sb-surface-input:var(--surface-input,#2a2b31);
+  --sb-border:var(--border,#303137);
+  --sb-border-strong:var(--border-strong,#373941);
+  --sb-accent:var(--accent,#6578ea);
+  --sb-accent-soft:var(--accent-soft,#33354c);
+  --sb-danger:var(--danger,#a75b63);
+  --sb-warning:var(--warning,#f5c76e);
+  --sb-success:var(--success,#76c59b);
+  --sb-orange:#e08a3c; /* Swift systemOrange for background subagents */
+  display:flex;
+  flex-direction:column;
+  height:100%;
+  min-width:0;
+  background:var(--sb-surface);
+  color:var(--sb-text);
+  font-size:12px;
+  line-height:1.35;
+  border-right:1px solid var(--sb-border);
+}
+
+/* ── Search ─────────────────────────────────────────────── */
+.sb-search{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  flex:0 0 auto;
+  margin:10px 12px 6px;
+  padding:0 8px;
+  height:28px;
+  border:1px solid var(--sb-border-strong);
+  border-radius:7px;
+  background:var(--sb-surface-input);
+}
+.sb-search-icon{color:var(--sb-subtle);font-size:13px;line-height:1}
+.sb-search input{
+  flex:1;
+  min-width:0;
+  border:0;
+  outline:0;
+  background:transparent;
+  color:var(--sb-text);
+  font-size:12px;
+}
+.sb-search input::placeholder{color:var(--sb-subtle)}
+
+/* ── Scrollable list area ───────────────────────────────── */
+.sb-scroll{
+  flex:1 1 auto;
+  min-height:0;
+  overflow-x:hidden;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  padding:2px 8px 10px;
+}
+
+/* ── Bottom settings footer (Swift SidebarView safeAreaInset parity) ──
+   Pinned below the scroll list: flex 0 0 auto keeps it visible no matter
+   how long the project/session list grows. */
+.sb-footer{
+  flex:0 0 auto;
+  display:flex;
+  align-items:center;
+  gap:4px;
+  padding:9px 12px;
+  border-top:1px solid var(--sb-border);
+}
+.sb-footer-btn{
+  display:grid;
+  place-items:center;
+  width:27px;
+  height:27px;
+  border-radius:5px;
+  color:var(--sb-muted);
+}
+.sb-footer-icon{
+  display:block;
+  height:14px;
+  background:currentColor;
+  -webkit-mask-repeat:no-repeat;
+  mask-repeat:no-repeat;
+  -webkit-mask-size:contain;
+  mask-size:contain;
+  -webkit-mask-position:center;
+  mask-position:center;
+}
+.sb-footer-btn:hover{background:var(--sb-surface-hover);color:var(--sb-text-strong)}
+.sb-section{margin-top:4px}
+.sb-section-title{
+  margin:8px 6px 3px;
+  font-size:10.5px;
+  font-weight:600;
+  letter-spacing:.4px;
+  text-transform:uppercase;
+  color:var(--sb-subtle);
+}
+.sb-project-heading{display:flex;align-items:center;gap:5px}
+.sb-add-project{display:grid;place-items:center;width:18px;height:18px;margin-left:auto;border-radius:5px;color:var(--sb-muted);font-size:15px;line-height:1}.sb-add-project:hover:not(:disabled){background:var(--sb-surface-hover);color:var(--sb-text-strong)}.sb-add-project:disabled{cursor:not-allowed;opacity:.5}
+.sb-add-project-form{display:flex;align-items:center;gap:4px;margin:4px 6px 6px;padding:5px;border:1px solid var(--sb-border);border-radius:7px;background:var(--sb-surface-raised)}.sb-add-project-form input{min-width:0;flex:1;height:24px;padding:0 6px;border:1px solid var(--sb-border-strong);border-radius:5px;outline:0;color:var(--sb-text);background:var(--sb-surface-input);font-size:11px}.sb-add-project-form input:focus{border-color:var(--sb-accent)}.sb-add-project-form button{padding:3px 6px;border-radius:5px;color:var(--sb-muted);font-size:11px}.sb-add-project-form button[type="submit"]{color:var(--sb-accent);background:var(--sb-accent-soft)}.sb-add-project-form button:disabled{opacity:.5;cursor:default}
+.sb-project-error{display:flex;align-items:center;gap:6px;margin:0 10px 4px;padding:5px 7px;border:1px solid color-mix(in srgb,var(--sb-danger) 34%,var(--sb-border));border-radius:6px;color:var(--sb-danger);background:color-mix(in srgb,var(--sb-danger) 8%,var(--sb-surface-raised));font-size:11px}.sb-project-error span{min-width:0;flex:1;overflow-wrap:anywhere}.sb-project-error button{width:17px;height:17px;border-radius:4px;color:var(--sb-muted);font-size:13px;line-height:1}.sb-project-error button:hover{background:var(--sb-surface-hover);color:var(--sb-danger)}
+
+/* ── Project row ────────────────────────────────────────── */
+.sb-project{
+  display:flex;
+  align-items:center;
+  gap:2px;
+  border-radius:6px;
+}
+.sb-project:hover{background:var(--sb-surface-hover)}
+.sb-project-main{
+  display:flex;
+  align-items:center;
+  gap:5px;
+  flex:1 1 auto;
+  min-width:0;
+  padding:4px 6px;
+  text-align:left;
+  border-radius:6px;
+  color:var(--sb-text);
+}
+.sb-project-main:focus-visible{outline:1px solid var(--sb-accent);outline-offset:-1px}
+.sb-sf-icon{display:block;flex:none}
+.sb-project-main .sb-sf-icon{width:14px;height:14px;color:var(--sb-muted)}
+.sb-ghost .sb-sf-icon{width:13px;height:13px}
+.sb-add-project .sb-sf-icon{width:14px;height:14px}
+.sb-project-name{
+  flex:1 1 auto;
+  min-width:0;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  font-weight:500;
+  color:var(--sb-text-strong);
+}
+
+/* Hover-only ghost actions (… / +), Swift parity. */
+.sb-project-actions{
+  display:flex;
+  align-items:center;
+  gap:1px;
+  flex:none;
+  padding-right:4px;
+  opacity:0;
+  pointer-events:none;
+  transition:opacity .12s ease;
+}
+.sb-project:hover .sb-project-actions,
+.sb-project-actions:focus-within{opacity:1;pointer-events:auto}
+.sb-ghost{
+  display:grid;
+  place-items:center;
+  width:20px;
+  height:20px;
+  border-radius:5px;
+  color:var(--sb-muted);
+  font-size:13px;
+  line-height:1;
+}
+.sb-ghost:hover{background:var(--sb-surface-hover);color:var(--sb-text-strong)}
+.sb-ghost:focus-visible{outline:1px solid var(--sb-accent);opacity:1}
+
+/* Project dropdown menu. */
+.sb-menu-wrap{position:relative}
+.sb-menu{
+  position:absolute;
+  z-index:12;
+  top:calc(100% + 3px);
+  right:0;
+  width:172px;
+  padding:4px;
+  border:1px solid var(--sb-border);
+  border-radius:8px;
+  background:var(--sb-surface-raised);
+  box-shadow:0 10px 25px rgb(0 0 0 / 18%);
+}
+.sb-menu-item{
+  display:block;
+  width:100%;
+  padding:6px 9px;
+  border-radius:5px;
+  text-align:left;
+  font-size:12px;
+  color:var(--sb-text);
+}
+.sb-menu-item:hover{background:var(--sb-surface-hover)}
+.sb-menu-item.sb-danger{color:var(--sb-danger)}
+.sb-menu-item:disabled{cursor:not-allowed;opacity:.55;color:var(--sb-subtle)}
+.sb-menu-item:disabled:hover{background:transparent}
+.sb-menu-item:focus-visible{outline:1px solid var(--sb-accent)}
+
+/* ── Session rows ───────────────────────────────────────── */
+.sb-project-sessions{margin:0 0 3px 16px;border-left:1px solid var(--sb-border);padding-left:6px}
+.sb-session{
+  position:relative;
+  display:flex;
+  align-items:center;
+  gap:7px;
+  width:100%;
+  min-width:0;
+  padding:4px 6px;
+  border-radius:6px;
+  text-align:left;
+  color:var(--sb-text);
+}
+.sb-session:hover{background:var(--sb-surface-hover)}
+.sb-session:focus-visible{outline:1px solid var(--sb-accent);outline-offset:-1px}
+.sb-session .provider-logo{flex:none}
+.sb-session-title{
+  flex:1 1 auto;
+  min-width:0;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  font-size:12px;
+}
+.sb-selected{background:var(--sb-accent-soft)}
+.sb-selected:hover{background:var(--sb-accent-soft)}
+.sb-selected .sb-session-title{color:var(--sb-text-strong);font-weight:600}
+
+/* Right-side status caption (Swift SessionRowStatus). min-width reserves the
+   hover action area so the title never shifts or runs under the buttons, and
+   the caption fades on hover while the actions overlay the same corner. */
+.sb-status{
+  flex:none;
+  display:inline-flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:4px;
+  min-width:66px;
+  max-width:96px;
+  font-size:10.5px;
+  color:var(--sb-muted);
+  transition:opacity .12s ease;
+}
+.sb-status-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Swift parity (SessionRowContainer): hover hides the time/caption while the
+   pin/pencil/archive buttons overlay the right corner. */
+.sb-session:hover .sb-status,
+.sb-session:focus-within .sb-status{opacity:0}
+
+/* Hover-only session actions (pin/pencil/archive), Swift SessionRowContainer parity:
+   absolutely positioned overlay at the row's right corner, fading in above the
+   reserved status slot. */
+.sb-session-actions{
+  position:absolute;
+  right:2px;
+  top:50%;
+  transform:translateY(-50%);
+  display:inline-flex;
+  align-items:center;
+  gap:1px;
+  opacity:0;
+  pointer-events:none;
+  transition:opacity .12s ease;
+}
+.sb-session:hover .sb-session-actions,
+.sb-session:focus-within .sb-session-actions,
+.sb-session-actions:focus-within{opacity:1;pointer-events:auto}
+.sb-session-action{
+  display:grid;
+  place-items:center;
+  width:20px;
+  height:20px;
+  border-radius:5px;
+  color:var(--sb-muted);
+}
+.sb-session-action .sb-sf-icon{width:12px;height:12px}
+.sb-session-action:hover{background:var(--sb-surface-hover);color:var(--sb-text-strong)}
+
+/* Archived section — global (not per-project), Swift archivedSessionsSection parity. */
+.sb-archived-toggle{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  width:100%;
+  padding:8px 6px 6px;
+  color:var(--sb-muted);
+  font-size:11px;
+  font-weight:650;
+  letter-spacing:.07em;
+  text-align:left;
+}
+.sb-archived-toggle:hover{color:var(--sb-text-strong)}
+.sb-archived-chevron{flex:none;font-size:9px;transition:transform .12s ease}
+.sb-archived-chevron.open{transform:rotate(90deg)}
+.sb-archived-count{
+  margin-left:auto;
+  padding:0 6px;
+  border-radius:8px;
+  background:var(--sb-surface-hover);
+  font-size:10px;
+}
+.sb-archived-list{padding-left:6px}
+.sb-archived-row{position:relative;display:flex;align-items:center}
+.sb-archived-row .sb-session{flex:1 1 auto;min-width:0}
+.sb-unarchive{position:absolute;right:4px;opacity:0;pointer-events:none}
+.sb-archived-row:hover .sb-unarchive{opacity:1;pointer-events:auto}
+
+/* Status glyphs — each status has a distinct icon + color + caption. */
+.sb-spinner{
+  width:9px;height:9px;flex:none;
+  border:1.5px solid color-mix(in srgb,var(--sb-accent) 35%,transparent);
+  border-top-color:var(--sb-accent);
+  border-radius:50%;
+  animation:sb-spin .7s linear infinite;
+}
+@keyframes sb-spin{to{transform:rotate(360deg)}}
+
+.sb-people{
+  position:relative;
+  flex:none;
+  display:inline-flex;
+  color:var(--sb-orange);
+  animation:sb-pulse 1s ease-in-out infinite alternate;
+}
+@keyframes sb-pulse{from{opacity:1}to{opacity:.55}}
+.sb-people-count{
+  position:absolute;
+  top:-3px;right:-5px;
+  min-width:9px;height:9px;
+  padding:0 1.5px;
+  border-radius:4.5px;
+  background:var(--sb-orange);
+  color:#fff;
+  font-size:7px;
+  font-weight:700;
+  line-height:9px;
+  text-align:center;
+}
+
+.sb-dot{width:7px;height:7px;flex:none;border-radius:50%}
+.sb-status-completed{color:var(--sb-success)}
+.sb-status-completed .sb-dot{background:var(--sb-success)}
+.sb-status-failed{color:var(--sb-danger)}
+.sb-status-failed .sb-dot{background:var(--sb-danger)}
+.sb-status-stalled{color:var(--sb-warning)}
+.sb-status-stalled .sb-dot{background:var(--sb-warning)}
+.sb-status-interrupted{color:var(--sb-danger)}
+.sb-ring{
+  width:7px;height:7px;flex:none;
+  border:1.5px solid var(--sb-danger);
+  border-radius:50%;
+}
+.sb-status-running{color:var(--sb-accent)}
+.sb-status-subagents-running{color:var(--sb-orange)}
+
+/* ── 更多 / empty state ─────────────────────────────────── */
+.sb-more{
+  display:block;
+  width:calc(100% - 12px);
+  margin:5px 6px 0;
+  padding:4px 0;
+  border-radius:6px;
+  color:var(--sb-muted);
+  font-size:11.5px;
+}
+.sb-more:hover{background:var(--sb-surface-hover);color:var(--sb-text)}
+.sb-empty{
+  padding:26px 12px;
+  text-align:center;
+  color:var(--sb-subtle);
+  font-size:11.5px;
+}

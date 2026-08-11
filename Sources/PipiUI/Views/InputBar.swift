@@ -329,7 +329,8 @@ final class ComposerSessionRouter: ObservableObject {
     var canSend: Bool {
         guard let session,
               !session.mediaBusy,
-              !isPDFIngestionPending(for: session)
+              !isPDFIngestionPending(for: session),
+              session.leaseConflict == nil
         else { return false }
         let hasText = !session.draftText
             .trimmingCharacters(in: .whitespacesAndNewlines)

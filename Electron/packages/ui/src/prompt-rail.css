@@ -1,0 +1,104 @@
+/* User-prompt navigation rail (left edge of the transcript).
+   Mirrors Swift UserPromptNavigationRail: a compact vertical index fixed to
+   the transcript's left edge. Ticks form a dense list with a fixed pitch
+   (--rail-pitch, 8px) constrained by the transcript viewport with hidden internal scroll — they are
+   never spread across the transcript's real message height. Each tick is a
+   short horizontal bar (not a dot); the active one is wider and accent-
+   colored. The tooltip is a wide horizontal summary card on the rail's right,
+   explicitly sized so CJK text wraps normally instead of collapsing into a
+   one-character column. */
+
+.prompt-rail{
+  position:absolute;
+  z-index:3;
+  top:10px;
+  left:3px;
+  width:14px;
+  min-width:14px;
+  pointer-events:none; /* hit-testing lives on the scroll list / ticks */
+}
+
+/* Compact list: dense fixed-pitch column, internal scroll when it overflows. */
+.prompt-rail-scroll{
+  display:flex;
+  flex-direction:column;
+  /* Tall desktop transcripts expose hundreds of compact ticks; short windows
+     remain bounded by their viewport rather than a fixed short rail block. */
+  max-height:min(70vh, calc(100dvh - 96px));
+  overflow-x:hidden;
+  overflow-y:auto;
+  padding:1px 0; /* RAIL_TICK_PADDING */
+  scrollbar-width:none;
+  pointer-events:auto;
+}
+.prompt-rail-scroll::-webkit-scrollbar{display:none}
+
+/* Each tick: the whole pitch slot is the hit target; the short bar is visual. */
+.prompt-rail-tick{
+  position:relative;
+  width:14px;
+  height:var(--rail-pitch, 8px);
+  padding:0;
+  border-radius:2px;
+  display:flex;
+  align-items:center;
+  justify-content:flex-start; /* leading-aligned bar, grows right on hover/active */
+}
+.prompt-rail-tick::before{
+  content:'';
+  width:9px;
+  height:3px;
+  border-radius:1.5px;
+  background:var(--muted);
+  opacity:.5;
+  transition:width .12s ease-in-out, opacity .12s ease-in-out, background-color .12s ease-in-out;
+}
+.prompt-rail-tick:hover,
+.prompt-rail-tick:focus-visible{
+  background:var(--surface-hover);
+}
+.prompt-rail-tick:hover::before,
+.prompt-rail-tick:focus-visible::before{
+  width:12px;
+  background:var(--accent);
+  opacity:.85;
+}
+.prompt-rail-tick:focus-visible{outline:none}
+.prompt-rail-tick[data-active]{
+  background:color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.prompt-rail-tick[data-active]::before{
+  width:14px;
+  background:var(--accent);
+  opacity:.95;
+}
+
+/* Wide horizontal summary card to the rail's right. Explicit width (not just
+   max-width) so CJK text wraps in normal horizontal lines; clamped vertically
+   so it never strays outside the rail's window; pointer-transparent so it
+   never blocks the transcript or the composer below. */
+.prompt-rail-tooltip{
+  position:absolute;
+  z-index:10;
+  left:calc(100% + 5px);
+  top:max(34px, min(calc(100% - 34px), var(--tip-top, 34px)));
+  transform:translateY(-50%);
+  width:clamp(220px, 30vw, 320px);
+  min-width:220px;
+  max-width:320px;
+  padding:6px 10px;
+  border:1px solid var(--border-strong);
+  border-radius:8px;
+  background:var(--surface-raised);
+  box-shadow:0 6px 18px rgb(0 0 0 / 20%);
+  color:var(--text);
+  font-size:12px;
+  line-height:1.5;
+  pointer-events:none;
+  white-space:normal;
+  overflow-wrap:break-word;
+  display:-webkit-box;
+  -webkit-line-clamp:3;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+}

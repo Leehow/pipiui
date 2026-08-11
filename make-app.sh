@@ -35,6 +35,13 @@ RESOURCE_BUNDLE="$APP/Contents/Resources/PipiUI_PipiUI.bundle"
 mkdir -p "$RESOURCE_BUNDLE/Contents/Resources"
 cp -R .build/release/PipiUI_PipiUI.bundle/. "$RESOURCE_BUNDLE/Contents/Resources/"
 
+# The memory-broker package ships its source, UI, evaluation corpus, scripts,
+# contract, and npm metadata. Its local node_modules is a development install
+# (and may contain checkout paths), so it must never be embedded in the app.
+MEMORY_BROKER_NODE_MODULES="$RESOURCE_BUNDLE/Contents/Resources/PiExt/packages/memory-broker/node_modules"
+rm -rf "$MEMORY_BROKER_NODE_MODULES"
+test ! -e "$MEMORY_BROKER_NODE_MODULES"
+
 # Cua Driver is fetched only while packaging, pinned by version and SHA-256.
 # The App never downloads executable code at runtime.
 CUA_HELPER="$APP/Contents/Helpers/cua-driver"

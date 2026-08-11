@@ -38,6 +38,12 @@ export interface Layer {
   order: number;
   requires: string[];
   requiresCapabilities: string[];
+  /**
+   * `provider/id` patterns this layer is written for. Empty means every model — the
+   * normal case. A non-empty list marks a layer that exists to correct one model
+   * family's behavior, which is advice that would be wrong to give any other model.
+   */
+  requiresModels: string[];
   scope: Role[];
   body: string;
   /** Where it came from; user layers shadow bundled ones with the same id. */
@@ -79,6 +85,15 @@ export interface ComposeInput {
    * session, e.g. in a test or a preview) and every capability is treated as present.
    */
   activeTools: string[] | null;
+  /**
+   * This session's model as `provider/id` (`ctx.model`). Absent means "unknown", and a
+   * model-scoped layer is then dropped rather than guessed in.
+   *
+   * The opposite default from `activeTools` on purpose: an optional capability that turns
+   * out to be missing costs a slightly over-optimistic sentence, while telling the wrong
+   * model it has a known failure mode is simply false.
+   */
+  model?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,12 +152,34 @@ export function parseLayer(
       order,
       requires: parseInlineList(fields.requires ?? ""),
       requiresCapabilities: parseInlineList(fields["requires-capabilities"] ?? ""),
+      requiresModels: parseInlineList(fields["requires-models"] ?? ""),
       scope,
       body,
       file,
       source,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Model scope
+// ---------------------------------------------------------------------------
+
+/**
+ * Does a `provider/id` model ref match one `requires-models` entry?
+ *
+ * Exact match, or one trailing `*` as a prefix (`deepseek/*`). Case-insensitive.
+ *
+ * Deliberately literal: model ids are a closed, enumerable set that the author is
+ * naming on purpose, so nothing here tries to infer a family from a name it was not
+ * told about. A pattern that stops matching after a provider renames a model shows up
+ * as the layer going inactive in `/philosophy`, which is the honest failure.
+ */
+export function modelMatches(model: string, pattern: string): boolean {
+  const m = model.trim().toLowerCase();
+  const p = pattern.trim().toLowerCase();
+  if (!m || !p) return false;
+  return p.endsWith("*") ? m.startsWith(p.slice(0, -1)) : m === p;
 }
 
 /** User layers shadow bundled layers with the same id; that is how a user edits a philosophy. */
@@ -218,6 +255,7 @@ export function resolvePlaceholders(
 
 export function composePhilosophy(input: ComposeInput): ComposeResult {
   const { layers, config, capabilities, role, activeTools } = input;
+  const model = input.model?.trim() ?? "";
   const skipped: SkippedLayer[] = [];
   const skip = (layer: Layer, reason: string) => {
     skipped.push({ id: layer.id, name: layer.name, reason });
@@ -226,12 +264,21 @@ export function composePhilosophy(input: ComposeInput): ComposeResult {
   if (!config.enabled) {
     return { text: "", included: [], skipped: layers.map((l) => ({ id: l.id, name: l.name, reason: "philosophy is off" })) };
   }
-  if (role === "worker" && !config.scopes.worker) {
-    return { text: "", included: [], skipped: layers.map((l) => ({ id: l.id, name: l.name, reason: "worker distribution is off" })) };
-  }
+  /**
+   * `scopes.worker` decides whether *judgement* philosophy propagates to dispatched
+   * workers — a taste-and-tokens call the user owns. A model-scoped layer is not
+   * judgement: it is a compatibility correction for a model that misbehaves, and the
+   * worker is where that misbehavior costs most, because a boss reads a worker's
+   * "I can't" as a finding rather than as a dropped turn. So the switch does not gate it.
+   */
+  const workerDistributionOff = role === "worker" && !config.scopes.worker;
 
   let candidates: Layer[] = [];
   for (const layer of layers) {
+    if (workerDistributionOff && layer.requiresModels.length === 0) {
+      skip(layer, "worker distribution is off");
+      continue;
+    }
     if (config.layers[layer.id] === false) {
       skip(layer, "turned off");
       continue;
@@ -239,6 +286,16 @@ export function composePhilosophy(input: ComposeInput): ComposeResult {
     if (!layer.scope.includes(role)) {
       skip(layer, `not in scope for role "${role}"`);
       continue;
+    }
+    if (layer.requiresModels.length > 0) {
+      if (!model) {
+        skip(layer, `written for ${layer.requiresModels.join(", ")}, and this session's model is unknown`);
+        continue;
+      }
+      if (!layer.requiresModels.some((pattern) => modelMatches(model, pattern))) {
+        skip(layer, `not in scope for model "${model}"`);
+        continue;
+      }
     }
     const missing = layer.requiresCapabilities.filter((key) => {
       const capability = capabilities.capabilities[key];

@@ -1,0 +1,10 @@
+react-diff-view — Third-Party Notice (PENDING)
+===============================================
+
+Source:  https://github.com/otakustay/react-diff-view
+License: MIT
+Status:  Planned direct dependency candidate B; not present in this repository or a distributed artifact.
+
+Only one diff candidate may be included. Before first inclusion, replace this
+placeholder with the pinned version, upstream copyright notice, and the complete
+MIT license text (or an approved bundled-license reference). See docs/plans/2026-08-10-electron-reuse-audit.md.

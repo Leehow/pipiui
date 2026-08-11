@@ -1,0 +1,11 @@
+{
+  "version": "0.19.2",
+  "tag": "cua-driver-rs-v0.19.2",
+  "assets": {
+    "darwin-universal": { "archive": "cua-driver-rs-0.19.2-darwin-universal-binary.tar.gz", "sha256": "d32d802f7f9803b55529107e23ba22b9c7e6b6e9664ba39669764046fa300da9" },
+    "linux-x64": { "archive": "cua-driver-rs-0.19.2-linux-x86_64-binary.tar.gz", "sha256": "13372e584fcfe4020fe0c5a70ac8d4f0e1c37125f104702d0156d0dddf98fc15" },
+    "linux-arm64": { "archive": "cua-driver-rs-0.19.2-linux-arm64-binary.tar.gz", "sha256": "6b50aa2539cc4870b80ed19861550639613b5763cfc636427fd80dbb84b56096" },
+    "win32-x64": { "archive": "cua-driver-rs-0.19.2-windows-x86_64-binary.zip", "sha256": "9868b60999e64ed1028a0f65082624dab7523b06f33b68d582fa0a187d1bf618" },
+    "win32-arm64": { "archive": "cua-driver-rs-0.19.2-windows-arm64-binary.zip", "sha256": "3976148f985912d03c1876766284898dfbe672db5cc2daa2fb03a0ccb755a1fd" }
+  }
+}

@@ -8,56 +8,66 @@ struct UpdateCenterSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("更新中心")
-                    .font(.title3.bold())
-                Spacer()
-                Button {
-                    store.isUpdateCenterPresented = false
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.body)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("关闭")
-                .accessibilityLabel("关闭")
-            }
+            headerRow
 
-            VStack(spacing: 12) {
-                ForEach(UpdateProductID.allCases, id: \.self) { id in
-                    productCard(for: id)
-                }
-            }
-
-            HStack {
-                Spacer()
-                Button {
-                    store.refreshAllUpdates()
-                } label: {
-                    if store.isAnyUpdateChecking {
-                        HStack(spacing: 6) {
-                            ProgressView().controlSize(.small)
-                            Text("刷新中…")
-                        }
-                    } else {
-                        Text("刷新")
+            ScrollView {
+                VStack(spacing: 12) {
+                    ForEach(UpdateProductID.allCases, id: \.self) { id in
+                        productCard(for: id)
                     }
                 }
-                .buttonStyle(.bordered)
-                .disabled(store.isAnyUpdateChecking)
-
-                Button("知道了") {
-                    store.isUpdateCenterPresented = false
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
             }
 
-            Spacer(minLength: 0)
+            footerRow
         }
         .padding(20)
-        .frame(width: 460, height: 360)
+        .frame(width: 460)
+        .frame(idealHeight: 380, maxHeight: 460)
+        .dismissOnOutsideClick { store.isUpdateCenterPresented = false }
+    }
+
+    private var headerRow: some View {
+        HStack {
+            Text("更新中心")
+                .font(.title3.bold())
+            Spacer()
+            Button {
+                store.isUpdateCenterPresented = false
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("关闭")
+            .accessibilityLabel("关闭")
+        }
+    }
+
+    private var footerRow: some View {
+        HStack {
+            Spacer()
+            Button {
+                store.refreshAllUpdates()
+            } label: {
+                if store.isAnyUpdateChecking {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("刷新中…")
+                    }
+                } else {
+                    Text("刷新")
+                }
+            }
+            .buttonStyle(.bordered)
+            .disabled(store.isAnyUpdateChecking)
+
+            Button("知道了") {
+                store.isUpdateCenterPresented = false
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
+        }
     }
 
     @ViewBuilder

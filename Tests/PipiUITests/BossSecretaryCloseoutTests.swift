@@ -113,8 +113,10 @@ final class BossSecretaryCloseoutTests: XCTestCase {
         // Spec-vs-direction conflicts are resolved by the boss, in the orchestration layer.
         let orchestration = try PhilosophyLayerFixture.normalizedBody("orchestration")
         XCTAssertTrue(orchestration.contains("adopt the most conservative interpretation"))
-        XCTAssertTrue(orchestration.contains("update the ledger"))
         XCTAssertTrue(orchestration.contains("immediately dispatch implementation"))
+        // Recording follows the dispatch rather than gating it, and lands in the half of
+        // the ledger the boss still owns.
+        XCTAssertTrue(orchestration.contains("record the call under Decisions"))
     }
 
     func testSafeEligibilityClassifiesMergedUniqueDirtyAndNonInternal() throws {

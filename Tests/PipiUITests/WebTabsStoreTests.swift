@@ -8,6 +8,20 @@ final class WebTabsStoreTests: XCTestCase {
         XCTAssertEqual(store.tabs.count, 1)
         XCTAssertEqual(store.selectedTabID, store.tabs[0].id)
         XCTAssertTrue(store.isFresh)
+        XCTAssertEqual(store.activityCount, 0)
+    }
+
+    func testActivityCountExcludesOnlyFreshDefaultTab() {
+        let store = WebTabsStore()
+        _ = store.addTab()
+        XCTAssertEqual(store.activityCount, 2)
+
+        let first = store.tabs[0].id
+        let second = store.tabs[1].id
+        store.closeTab(id: second)
+        XCTAssertEqual(store.activityCount, 0)
+        store.closeTab(id: first)
+        XCTAssertEqual(store.activityCount, 0)
     }
 
     func testAddTabSelectsNewTab() {
@@ -57,6 +71,7 @@ final class WebTabsStoreTests: XCTestCase {
             selectedIndex: 5 // 越界 → 收敛到最后一个
         )
         XCTAssertEqual(store.tabs.count, 2) // 空 URL 被过滤
+        XCTAssertEqual(store.activityCount, 2)
         XCTAssertEqual(store.selectedTab, store.tabs[1])
         XCTAssertFalse(store.isFresh)
 

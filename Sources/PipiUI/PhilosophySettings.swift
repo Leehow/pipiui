@@ -26,6 +26,10 @@ enum PhilosophySettings {
         let summary: String
         let order: Int
         let requires: [String]
+        /// `provider/id` patterns this layer is written for; empty means every model.
+        /// Parsed for display only — which layers actually compose is decided in the pi
+        /// extension, where the live model is known. Same as `requires-capabilities`.
+        let requiresModels: [String]
         let isUserProvided: Bool
         /// Same rough estimate as the rest of the app (`chars / 4`); only shown to a human.
         let estimatedTokens: Int
@@ -87,6 +91,7 @@ enum PhilosophySettings {
             summary: fields["summary"] ?? "",
             order: order,
             requires: parseInlineList(fields["requires"] ?? ""),
+            requiresModels: parseInlineList(fields["requires-models"] ?? ""),
             isUserProvided: isUserProvided,
             estimatedTokens: max(1, Int((Double(body.count) / 4.0).rounded())),
             body: body

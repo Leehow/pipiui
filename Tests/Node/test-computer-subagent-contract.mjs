@@ -112,11 +112,13 @@ test("tool allowlist: desktop tools injected only when the host gate passed", ()
   assert.ok(legacyNoGrant.names.includes("open_application"));
 });
 
-test("child policy text: read/bash instead of computer, no wait/poll/log/build/test, browser split, named external browsers", () => {
+test("child policy text: shell is for non-GUI work and cannot replace granted Computer Use", () => {
   const policy = DESKTOP_GRANT_CHILD_POLICY;
-  assert.match(policy, /NEVER use computer when read\/bash\/browser can do the job/);
+  assert.match(policy, /For files, logs, process or file waiting, polling, and build\/test verification, use read\/bash instead of computer/);
   assert.match(policy, /read\/bash for files, logs, process or file waiting, polling, and build\/test verification/);
   assert.match(policy, /Waiting, sleeping, polling logs, compiling, running tests, reading files, and ordinary web research are FORBIDDEN via computer/);
+  assert.match(policy, /Never use bash, shell, AppleScript, osascript, `open`, process signals, or synthetic input to operate or replace a requested GUI\/App interaction/);
+  assert.match(policy, /When the user requested a visible App\/GUI operation, you MUST use open_application and computer/);
   assert.match(policy, /built-in browser tool for ordinary web work/);
   assert.match(policy, /Chrome, Safari, another external browser, or "my browser"/);
   assert.match(policy, /MUST use exactly that browser/);
