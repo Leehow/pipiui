@@ -13,7 +13,12 @@ import { createPiHostBackend, type PiCommand } from "../src/index.js";
  */
 describe("pi spawn env injects ~/.pi/agent/.env (T17 parity)", () => {
   let root = "";
+  let currentBackend: ReturnType<typeof createPiHostBackend> | undefined;
   afterEach(async () => {
+    // Drain durable-index/queue writes and stop fake pi before removing the temp
+    // tree; fire-and-forget persists racing rm recreate agentDir (ENOTEMPTY).
+    await currentBackend?.close().catch(() => undefined);
+    currentBackend = undefined;
     if (root) await rm(root, { recursive: true, force: true });
     root = "";
   });
@@ -60,6 +65,7 @@ describe("pi spawn env injects ~/.pi/agent/.env (T17 parity)", () => {
         ) as any;
       },
     });
+    currentBackend = backend;
     return { backend, env: () => captured, command: () => ({ bin: capturedBin, args: capturedArgs }) };
   }
 

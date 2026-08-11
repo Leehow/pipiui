@@ -1,5 +1,5 @@
 import { ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
-import { createReadStream, existsSync, promises as fs } from "node:fs";
+import { createReadStream, existsSync, readFileSync, promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -253,7 +253,9 @@ type Live = {
   cwd: string;
   process?: ChildProcessWithoutNullStreams;
   exit?: Promise<void>;
+  exitError?: PiExitedError;
   buffer: string;
+  stderrTail: string;
   pending: Map<
     string,
     { resolve: (data: any) => void; reject: (e: Error) => void }
@@ -270,6 +272,23 @@ type Live = {
    */
   compactionHoldsQueue?: boolean;
 };
+const PI_STDERR_TAIL_LIMIT = 16 * 1024;
+class PiExitedError extends Error {
+  constructor(
+    readonly code: number | null,
+    readonly signal: NodeJS.Signals | null,
+    stderrTail: string,
+  ) {
+    const status = code !== null
+      ? `code ${code}`
+      : signal
+        ? `signal ${signal}`
+        : "unknown status";
+    const diagnostic = stderrTail.trim();
+    super(`pi exited (${status})${diagnostic ? `: ${diagnostic}` : ""}`);
+    this.name = "PiExitedError";
+  }
+}
 const text = (content: any) =>
   typeof content === "string"
     ? content
@@ -607,6 +626,10 @@ export class PiHostBackend implements HostBackend {
   private computerDescriptor?: ComputerDescriptor;
   private computerUsable: () => boolean = () => false;
   private root: string;
+  /** Stat-validated session metadata cache; re-reads only files whose size/mtime changed. */
+  private indexCache = new Map<string, { size: number; mtimeMs: number; meta: SessionMeta }>();
+  /** Shares one directory scan across the concurrent locate() calls a single UI click triggers. */
+  private indexScan?: Promise<SessionMeta[]>;
   private piCommand: PiCommand;
   private runtimeRoot: string;
   private managedNodeModulesRoot?: string;
@@ -631,6 +654,9 @@ export class PiHostBackend implements HostBackend {
   private queueWrites = new Map<string, Promise<void>>();
   private closed = false;
   private bridge: HostBridge;
+  /** Durable Electron-side projection of runtime lifecycle events. Pi owns the worker
+   * conversations; this small index only lets the UI rebuild its tree after host restart. */
+  private agentsWrite: Promise<void> = Promise.resolve();
   private compactionConfiguration?: ProactiveCompactionConfiguration;
   private canonicalProjectPaths: () => Promise<string[] | undefined>;
   private terminalSessionDeleted?: (sessionId: string) => void;
@@ -706,6 +732,13 @@ export class PiHostBackend implements HostBackend {
         void this.refreshModelsAfterAuthChange();
       },
     });
+    // The bridge callback is synchronous, so finish the small durable-index read before this
+    // backend can receive any live event. An async constructor load could otherwise overwrite a
+    // newer same-key run or persist an incomplete map when START arrived immediately.
+    this.loadPersistedAgents();
+    // Preload the pi SessionManager module at startup: otherwise the first session open after
+    // launch pays its ~1s dynamic-import cost and the chat appears to stall before painting.
+    void loadSessionManager();
   }
   subscribe(listener: (event: HostEvent) => void) {
     this.listeners.add(listener);
@@ -739,6 +772,10 @@ export class PiHostBackend implements HostBackend {
         write.catch(() => undefined),
       ),
     );
+    // Drain the durable agent index last: events from dying pi processes can
+    // still enqueue persists until their exit settles, and callers (tests,
+    // host shutdown) rely on close() completing every write to agentDir.
+    await this.agentsWrite;
     this.leases.clear();
     this.listeners.clear();
   }
@@ -813,7 +850,14 @@ export class PiHostBackend implements HostBackend {
       message: result.message,
     };
   }
-  private async index(): Promise<SessionMeta[]> {
+  private index(): Promise<SessionMeta[]> {
+    // A single session selection fires several locate() calls at once; share one
+    // scan and reuse stat-validated metadata instead of re-reading every JSONL.
+    return (this.indexScan ??= this.scanIndex().finally(() => {
+      this.indexScan = undefined;
+    }));
+  }
+  private async scanIndex(): Promise<SessionMeta[]> {
     const files: string[] = [];
     const walk = async (d: string) => {
       if (!existsSync(d)) return;
@@ -825,14 +869,26 @@ export class PiHostBackend implements HostBackend {
       }
     };
     await walk(this.root);
+    const seen = new Set<string>();
     const result: SessionMeta[] = [];
     for (const path of files) {
+      seen.add(path);
       try {
-        result.push(await readSessionMeta(path));
+        const stat = await fs.stat(path);
+        const cached = this.indexCache.get(path);
+        if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+          result.push(cached.meta);
+          continue;
+        }
+        const meta = await readSessionMeta(path);
+        this.indexCache.set(path, { size: stat.size, mtimeMs: stat.mtimeMs, meta });
+        result.push(meta);
       } catch {
         /* incomplete/corrupt JSONL is not a session */
       }
     }
+    for (const path of this.indexCache.keys())
+      if (!seen.has(path)) this.indexCache.delete(path);
     return result;
   }
   private async locate(id: string) {
@@ -1135,7 +1191,7 @@ export class PiHostBackend implements HostBackend {
       case "setComputerUseEnabled":
         return { enabled: await this.saveComputerUseEnabled(params[0]) };
       case "getSubagentModels":
-        return this.loadSubagentModels();
+        return this.loadAndMaterializeSubagentModels();
       case "setSubagentModel":
         return this.saveSubagentModel(params[0], params[1]);
       case "listAgentDefinitions":
@@ -1332,6 +1388,7 @@ export class PiHostBackend implements HostBackend {
       this.computerUsable()
         ? this.bridge.registerComputer(id)
         : undefined;
+    await this.loadAndMaterializeSubagentModels();
     const output = assemblePiSpawn({
       sessionPath: found.path,
       cwd: found.header.cwd,
@@ -1341,6 +1398,7 @@ export class PiHostBackend implements HostBackend {
         managedNodeModulesRoot: this.managedNodeModulesRoot,
       }),
       mainModelId: this.mainModelId(),
+      subagentModelsFile: this.subagentModelsRuntimeFile(),
       bridgePort,
       bridgeRoutingKey: id,
       sessionCapability,
@@ -1380,6 +1438,7 @@ export class PiHostBackend implements HostBackend {
       process: child,
       exit,
       buffer: "",
+      stderrTail: "",
       pending: new Map(),
       followUps: [],
       toolArgs: new Map(),
@@ -1391,19 +1450,28 @@ export class PiHostBackend implements HostBackend {
     };
     this.live.set(id, live);
     child.stdout.on("data", (chunk) => this.lines(live!, chunk.toString()));
+    child.stderr.on("data", (chunk) => {
+      live!.stderrTail = (live!.stderrTail + chunk.toString()).slice(-PI_STDERR_TAIL_LIMIT);
+    });
     const failPending = (reason: Error) => {
       for (const p of live!.pending.values()) p.reject(reason);
       live!.pending.clear();
     };
     child.on("error", (error) => failPending(error));
-    child.on("exit", () => {
-      failPending(new Error("pi exited"));
+    child.on("close", (code, signal) => {
+      const reason = new PiExitedError(code, signal, live!.stderrTail);
+      live!.exitError = reason;
+      failPending(reason);
       live!.compaction.dispose();
-      this.live.delete(id);
       this.bridge.unregister(id);
-      resolveExit();
-      void this.leases.get(id)?.release();
-      if (!this.closed) void this.queueIdle(id);
+      const finish = () => {
+        if (this.live.get(id) === live) this.live.delete(id);
+        resolveExit();
+        if (!this.closed) void this.queueIdle(id);
+      };
+      const lease = this.leases.get(id);
+      if (lease) void lease.release().catch(() => undefined).finally(finish);
+      else finish();
     });
     if (desired.model.provider !== "unknown" && desired.model.id !== "unknown") {
       await this.command(id, {
@@ -1578,22 +1646,20 @@ export class PiHostBackend implements HostBackend {
         isError: e.isError,
       });
   }
-  private command(id: string, body: Rpc) {
-    return this.ensure(id).then(
-      (live) =>
-        new Promise<any>((resolve, reject) => {
-          const child = live.process;
-          if (child && (child.exitCode !== null || child.signalCode)) {
-            reject(new Error("pi exited"));
-            return;
-          }
-          const req = crypto.randomUUID();
-          live.pending.set(req, { resolve, reject });
-          live.process!.stdin.write(
-            JSON.stringify({ id: req, ...body }) + "\n",
-          );
-        }),
-    );
+  private async command(id: string, body: Rpc) {
+    const live = await this.ensure(id);
+    const child = live.process;
+    if (child && (child.exitCode !== null || child.signalCode)) {
+      await live.exit;
+      throw live.exitError ?? new PiExitedError(child.exitCode, child.signalCode, live.stderrTail);
+    }
+    return new Promise<any>((resolve, reject) => {
+      const req = crypto.randomUUID();
+      live.pending.set(req, { resolve, reject });
+      live.process!.stdin.write(
+        JSON.stringify({ id: req, ...body }) + "\n",
+      );
+    });
   }
   private async refreshState(live: Live) {
     try {
@@ -1717,7 +1783,7 @@ export class PiHostBackend implements HostBackend {
     }));
   }
   private subagentModelsRuntimeFile(): string {
-    return join(this.env.HOME || homedir(), "Library", "Application Support", "PipiUI", "subagent-models.json");
+    return join(this.agentDir, "pipiui-subagent-models-runtime.json");
   }
   private async materializeSubagentModels(value: Record<string, SubagentModelSetting[]>): Promise<void> {
     const target = this.subagentModelsRuntimeFile();
@@ -1725,6 +1791,11 @@ export class PiHostBackend implements HostBackend {
     const tmp = `${target}.tmp-${process.pid}-${Date.now()}-${crypto.randomUUID()}`;
     await fs.writeFile(tmp, JSON.stringify(value, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
     await fs.rename(tmp, target);
+  }
+  private async loadAndMaterializeSubagentModels(): Promise<Record<string, SubagentModelSetting[]>> {
+    const value = await this.loadSubagentModels();
+    await this.materializeSubagentModels(value);
+    return value;
   }
   private async saveSubagentModel(agentName: unknown, chain: unknown): Promise<Record<string, SubagentModelSetting[]>> {
     if (typeof agentName !== "string" || !agentName.trim())
@@ -2081,8 +2152,15 @@ export class PiHostBackend implements HostBackend {
     return this.modelState;
   }
   private async setModel(sessionId: string, provider: string, modelId: string) {
-    const live = await this.ensure(sessionId);
-    await this.command(sessionId, { type: "set_model", provider, modelId });
+    let live = await this.ensure(sessionId);
+    try {
+      await this.command(sessionId, { type: "set_model", provider, modelId });
+    } catch (error) {
+      if (!(error instanceof PiExitedError)) throw error;
+      await live.exit;
+      live = await this.ensure(sessionId);
+      await this.command(sessionId, { type: "set_model", provider, modelId });
+    }
     await this.refreshState(live);
     const state = this.sessionModelStates.get(sessionId)!;
     this.sessionModelSnapshots.set(sessionId, state);
@@ -2299,8 +2377,52 @@ export class PiHostBackend implements HostBackend {
   }
   private agents = new Map<string, AgentSummary>();
   private worktrees = new Map<string, WorktreeStatus>();
+  private agentsFile(): string {
+    return join(this.agentDir, "pipiui-agent-index.json");
+  }
+  private agentKey(agentId: string, sessionId?: string): string {
+    return `${sessionId ?? ""}\u0000${agentId}`;
+  }
+  private loadPersistedAgents(): void {
+    try {
+      const value = JSON.parse(readFileSync(this.agentsFile(), "utf8"));
+      if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.agents)) return;
+      const restartedAt = Date.now();
+      for (const raw of value.agents) {
+        if (!isRecord(raw) || typeof raw.agentId !== "string" || typeof raw.sessionId !== "string") continue;
+        const agent = raw as unknown as AgentSummary;
+        // A process-local `running` bit is never evidence that a worker survived the host.
+        // Its Pi session remains resumable, but the UI must show an interruption, not a spinner.
+        if (agent.state === "running" || agent.state === "stalled") {
+          agent.state = "interrupted";
+          agent.endedAt = agent.endedAt ?? restartedAt;
+        }
+        this.agents.set(this.agentKey(agent.agentId, agent.sessionId), agent);
+      }
+      if (Array.isArray(value.worktrees)) for (const raw of value.worktrees) {
+        if (isRecord(raw) && typeof raw.agentId === "string") this.worktrees.set(raw.agentId, raw as unknown as WorktreeStatus);
+      }
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") console.warn(`[pipi-agents] unable to load durable index: ${error?.message ?? error}`);
+    }
+  }
+  private persistAgents(): void {
+    if (this.closed) return;
+    const target = this.agentsFile();
+    const snapshot = JSON.stringify({ version: 1, agents: [...this.agents.values()], worktrees: [...this.worktrees.values()] }, null, 2) + "\n";
+    this.agentsWrite = this.agentsWrite.then(async () => {
+      await fs.mkdir(dirname(target), { recursive: true });
+      const tmp = `${target}.tmp-${process.pid}`;
+      await fs.writeFile(tmp, snapshot, { encoding: "utf8", mode: 0o600 });
+      await fs.rename(tmp, target);
+    }).catch(error => console.warn(`[pipi-agents] unable to persist durable index: ${error?.message ?? error}`));
+  }
   private async getAgent(id: string) {
-    const a = this.agents.get(id);
+    // Commands predate session-qualified ids. Prefer an active matching row, then the newest;
+    // listAgents itself remains exactly session-scoped even when two projects reuse `builder`.
+    const a = [...this.agents.values()]
+      .filter(agent => agent.agentId === id)
+      .sort((left, right) => Number(right.state === "running") - Number(left.state === "running") || (right.createdAt ?? 0) - (left.createdAt ?? 0))[0];
     if (!a) throw new Error(`unknown agent ${id}`);
     return a;
   }
@@ -2323,6 +2445,7 @@ export class PiHostBackend implements HostBackend {
       a.closeout = a.closeout ?? "Boss marked this episode handled";
     }
     this.agent({ type: "agent", agent: { ...a } });
+    this.persistAgents();
   } /**
    * Manual merge/discard of a retained worker worktree.
    *
@@ -2352,7 +2475,8 @@ export class PiHostBackend implements HostBackend {
     void sessionId;
   }
   private mapAgentEvent(raw: any, sessionId?: string) {
-    const current = this.agents.get(raw.agentId);
+    const key = this.agentKey(raw.agentId, sessionId);
+    const current = this.agents.get(key);
     if (raw.kind === "closeout") {
       if (
         !current ||
@@ -2365,8 +2489,9 @@ export class PiHostBackend implements HostBackend {
         handled: true,
         closeout: raw.reason ?? current.closeout,
       };
-      this.agents.set(agent.agentId, agent);
+      this.agents.set(key, agent);
       this.agent({ type: "agent", agent });
+      this.persistAgents();
       return;
     }
     const state = raw.ok
@@ -2419,7 +2544,7 @@ export class PiHostBackend implements HostBackend {
       cacheTokens: num2(usage?.cacheRead) ?? current?.cacheTokens,
       contextTokens: num2(usage?.contextTokens) ?? current?.contextTokens,
     };
-    this.agents.set(agent.agentId, agent);
+    this.agents.set(key, agent);
     const lifecycle =
       raw.worktreeLifecycle ??
       (raw.worktreePath
@@ -2474,6 +2599,7 @@ export class PiHostBackend implements HostBackend {
           isError: item.isError,
         });
     this.agent({ type: "agent", agent });
+    this.persistAgents();
   }
   /** Lease surface deliberately remains absent: no lease is acquired/released in this backend. */
 }
