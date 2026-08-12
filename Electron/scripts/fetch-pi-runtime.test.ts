@@ -88,6 +88,17 @@ describe('persistent embedded Pi runtime CLI', () => {
     expect(await readdir(root)).toEqual(beforeEntries)
   })
 
+  it('caps npm concurrency on the staged install, which --prefix puts outside the repo .npmrc', async () => {
+    const source = await readFile(new URL('./fetch-pi-runtime.mjs', import.meta.url), 'utf8')
+    // npm's default of 15 sockets deadlocks behind a local HTTP proxy and strands
+    // the release build with no output at all; the repo .npmrc cannot reach an
+    // install that runs under --prefix.
+    expect(source).toContain("'--maxsockets', '3'")
+    expect(source).toContain("'--fetch-timeout', '60000'")
+    const npmrc = await readFile(new URL('../.npmrc', import.meta.url), 'utf8')
+    expect(npmrc).toMatch(/^maxsockets=3$/m)
+  })
+
   it('rejects a target prepared before pruning so the release cannot ship the fat tree', async () => {
     const arm = await seed('darwin', 'arm64')
     const piCli = join(arm, 'pi', 'lib', 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js')

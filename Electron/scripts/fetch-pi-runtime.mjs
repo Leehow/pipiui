@@ -144,6 +144,34 @@ async function pruneRuntimeTree(root, { platform, arch }) {
   return removed
 }
 
+// The official Node tarball ships an unstripped binary (~106MB on darwin-arm64);
+// dropping its debug symbols saves ~21MB. `strip` invalidates the Mach-O
+// signature and macOS SIGKILLs an arm64 binary carrying a broken one, so re-sign
+// ad-hoc right here: development runs this exact tree, and only packaging
+// re-signs with the release identity. Stripping is an optimization, never a
+// correctness requirement, so any failure restores the original binary.
+async function stripEmbeddedNode(nodePath, platform, arch) {
+  if (platform !== 'darwin' || process.platform !== 'darwin') return 0
+  const before = (await stat(nodePath)).size
+  const backup = `${nodePath}.unstripped`
+  await copyFile(nodePath, backup)
+  try {
+    run('strip', ['-S', '-x', nodePath], { stdio: 'ignore' })
+    run('codesign', ['--sign', '-', '--force', nodePath], { stdio: 'ignore' })
+    run('codesign', ['--verify', nodePath], { stdio: 'ignore' })
+    // A cross-architecture binary cannot be trusted to run here, so only the
+    // matching-arch build gets the definitive check.
+    if (arch === process.arch) run(nodePath, ['-e', 'process.exit(0)'], { stdio: 'ignore' })
+    const saved = before - (await stat(nodePath)).size
+    await rm(backup, { force: true })
+    return saved
+  } catch (error) {
+    await rename(backup, nodePath)
+    console.warn(`Embedded Node strip skipped, shipping the unstripped binary: ${error.message}`)
+    return 0
+  }
+}
+
 async function inspectRuntime(root, expected) {
   let manifest
   try { manifest = await json(join(root, 'manifest.json')) } catch { return { ok: false, reason: 'manifest.json is missing or unreadable' } }
@@ -260,6 +288,8 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
     await mkdir(dirname(stagedNode), { recursive: true })
     await copyFile(extractedNode, stagedNode)
     if (platform !== 'win32') await chmod(stagedNode, 0o755)
+    const strippedBytes = await stripEmbeddedNode(stagedNode, platform, arch)
+    if (strippedBytes > 0) console.log(`Stripped ${Math.round(strippedBytes / 1048576)}MB of debug symbols from the embedded Node`)
 
     const archiveRoot = asset.nodePath.split('/')[0]
     try { await copyFile(join(extraction, archiveRoot, 'LICENSE'), join(staging, 'node', 'LICENSE')) } catch { /* executable is required */ }
@@ -280,6 +310,12 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
       '--include=optional',
       '--no-audit',
       '--no-fund',
+      // This install runs with --prefix pointing at a staging directory, so the
+      // repository .npmrc that carries these limits may not be on npm's config
+      // path. Passing them explicitly keeps the proxy deadlock (see Electron/.npmrc)
+      // from stranding a release build.
+      '--maxsockets', '3',
+      '--fetch-timeout', '60000',
       `--os=${platform}`,
       `--cpu=${arch}`,
       '--prefix',
