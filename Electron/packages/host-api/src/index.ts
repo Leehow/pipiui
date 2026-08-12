@@ -54,7 +54,7 @@ export type AgentState = "running" | "stalled" | "ok" | "failed" | "aborted" | "
 /** `cost` remains USD for compatibility; these optional fields select its display unit and USD→CNY rate. */
 export type CostUnit = "USD" | "CNY";
 /** Metadata is optional for v1 producers; v2 producers populate it on snapshots and updates. */
-export type AgentSummary = { agentId: string; runId: string; name: string; task: string; state: AgentState; stalled?: boolean; stalledIdleSec?: number; handled?: boolean; cost?: number; costUnit?: CostUnit; exchangeRate?: number; turns?: number; outputCount?: number; sessionId?: string; parentId?: string | null; depth?: number; role?: string; createdAt?: number; endedAt?: number; title?: string; model?: string; provider?: string; listSubtitle?: string; closeout?: string; contextTokens?: number; contextWindowTokens?: number; inputTokens?: number; outputTokens?: number; cacheTokens?: number; finalResult?: string };
+export type AgentSummary = { agentId: string; runId: string; name: string; task: string; state: AgentState; stalled?: boolean; stalledIdleSec?: number; handled?: boolean; cost?: number; costUnit?: CostUnit; exchangeRate?: number; turns?: number; outputCount?: number; sessionId?: string; parentId?: string | null; depth?: number; role?: string; createdAt?: number; updatedAt?: number; deadlineAt?: number; endedAt?: number; title?: string; model?: string; provider?: string; listSubtitle?: string; closeout?: string; contextTokens?: number; contextWindowTokens?: number; inputTokens?: number; outputTokens?: number; cacheTokens?: number; finalResult?: string };
 export type WorktreeLifecycle = "none" | "active" | "pendingReview" | "merged" | "mergedCleanupPending" | "discarded";
 export type WorktreeStatus = { agentId: string; branch?: string; path?: string; error?: string; lifecycle: WorktreeLifecycle; merge: "ready" | "merged" | "conflict" | "unavailable"; discard: "ready" | "discarded" | "unavailable" };
 export type HostCapabilities = { computerUse: boolean; revealInFinder: boolean; terminal: boolean; plan: boolean; retainedWorktreeDisposition: boolean; [capability: string]: boolean };
@@ -345,7 +345,7 @@ export interface PipiHostAPI {
    */
   getQuotaSnapshot?(sessionId?: string): Promise<QuotaSnapshot | null>;
   /** Current snapshot; omit sessionId only for hosts that intentionally aggregate all sessions. */
-  listAgents(sessionId?: string): Promise<AgentSummary[]>; subscribeAgents(listener: (event: AgentEvent) => void): Unsubscribe; subscribeAgentLog(agentId: string, listener: (event: Extract<AgentEvent, { type: "agent_log" }>) => void): Unsubscribe; abortAgent(agentId: string): Promise<void>; resolveAgent(agentId: string): Promise<void>; checkAgent(agentId: string): Promise<AgentSummary>; getWorktreeStatus(agentId: string): Promise<WorktreeStatus>; mergeWorktree(agentId: string): Promise<WorktreeStatus>; discardWorktree(agentId: string): Promise<WorktreeStatus>;
+  listAgents(sessionId?: string): Promise<AgentSummary[]>; getAgentLogs(agentId: string): Promise<{ itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; contentIndex?: number }[]>; subscribeAgents(listener: (event: AgentEvent) => void): Unsubscribe; subscribeAgentLog(agentId: string, listener: (event: Extract<AgentEvent, { type: "agent_log" }>) => void): Unsubscribe; abortAgent(agentId: string): Promise<void>; resolveAgent(agentId: string): Promise<void>; checkAgent(agentId: string): Promise<AgentSummary>; getWorktreeStatus(agentId: string): Promise<WorktreeStatus>; mergeWorktree(agentId: string): Promise<WorktreeStatus>; discardWorktree(agentId: string): Promise<WorktreeStatus>;
   capabilities(): Promise<HostCapabilities>;
   /**
    * Optional git extension for the toolbar branch control. Hosts advertise it
@@ -430,6 +430,7 @@ function apiFrom(
     getQuotaSnapshot: sessionId => sessionId === undefined ? invoke("getQuotaSnapshot") : invoke("getQuotaSnapshot", sessionId),
     subscribeSessionStats: listener => subscribe("session_stats", event => event.channel === "session_stats", event => listener((event as Extract<HostEvent, { channel: "session_stats" }>).event)),
     listAgents: sessionId => invoke("listAgents", sessionId),
+    getAgentLogs: agentId => invoke("getAgentLogs", agentId),
     subscribeAgents: listener => subscribe("agents", event => event.channel === "agents", event => listener((event as Extract<HostEvent, { channel: "agents" }>).event)),
     subscribeAgentLog: (agentId, listener) => subscribe("agents", event => event.channel === "agents" && event.event.type === "agent_log" && event.event.agentId === agentId, event => listener((event as Extract<HostEvent, { channel: "agents" }>).event as Extract<AgentEvent, { type: "agent_log" }>)),
     abortAgent: agentId => invoke("abortAgent", agentId),

@@ -43,7 +43,7 @@ import './message-actions.css'
 import './subagent.css'
 
 type ToolCard = TranscriptTool
-export type ChatMessage = { id: string; role: 'user' | 'assistant' | 'tool'; content: string; thinking?: string; tools?: ToolCard[]; streaming?: boolean }
+export type ChatMessage = { id: string; role: 'user' | 'assistant' | 'tool'; content: string; thinking?: string; tools?: ToolCard[]; streaming?: boolean; timestamp?: number }
 type PanelTab = 'Subagents' | 'Browser' | 'Document' | 'Terminal'
 type PaneWidths = { sidebar: number; tools: number; sidebarCollapsed: boolean; toolsCollapsed: boolean }
 type SidebarPreferences = { expandedIds: string[]; pinnedSessionIds: string[]; archivedSessionIds: string[]; visibleLimit: number }
@@ -651,6 +651,9 @@ export function createMockHost(): PipiHostAPI {
         : null,
     subscribeSessionStats: () => () => undefined,
     listAgents: async sessionId => mockAgents.filter(agent => !sessionId || agent.sessionId === sessionId),
+    // The demo agents have no run behind them, so there is no cached log to replay;
+    // subscribeAgentLog below is what populates the panel.
+    getAgentLogs: async () => [],
     subscribeAgents: () => () => undefined,
     subscribeAgentLog: (agentId, listener) => {
       if (agentId !== 'research') return () => undefined
@@ -1021,7 +1024,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (!selectedSession || !canWriteLease) return false
     const targetSession = selectedSession
     const beginDirectTurn = () => {
-      setMessages(items => [...items, { id: crypto.randomUUID(), role: 'user', content: prompt + (attachments?.length ? ` [${attachments.length} 张图片]` : '') }])
+      setMessages(items => [...items, { id: crypto.randomUUID(), role: 'user', content: prompt + (attachments?.length ? ` [${attachments.length} 张图片]` : ''), timestamp: Date.now() }])
       activeUserTurnRef.current = true
       setStreaming(true)
       setWaitingStartedAt(Date.now())
@@ -1301,7 +1304,7 @@ export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
         previous.tools!.push(...tools!)
         continue
       }
-      messages.push({ id: entry.id, role: 'assistant', content: entry.content, thinking: entry.thinking, tools })
+      messages.push({ id: entry.id, role: 'assistant', content: entry.content, thinking: entry.thinking, tools, timestamp: entry.timestamp })
       continue
     }
     if (entry.role === 'tool' && entry.toolCallId && cards.has(entry.toolCallId)) {
@@ -1318,17 +1321,20 @@ export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
 
 export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamEvent, { type: 'status' }>): ChatMessage[] {
   const index = previous.findLastIndex(item => item.role === 'assistant')
-  const current = index >= 0 && previous[index].streaming ? previous[index] : { id: `stream-${Date.now()}`, role: 'assistant' as const, content: '', thinking: '', tools: [], streaming: true }
+  const current = index >= 0 && previous[index].streaming ? previous[index] : { id: `stream-${Date.now()}`, role: 'assistant' as const, content: '', thinking: '', tools: [], streaming: true, timestamp: Date.now() }
   const next = index >= 0 && previous[index].streaming ? [...previous] : [...previous, current]
   const updated: ChatMessage = { ...current, tools: [...(current.tools ?? [])] }
   if (event.type === 'text') updated.content += event.delta
   if (event.type === 'thinking') updated.thinking = (updated.thinking ?? '') + event.delta
   if (event.type === 'tool_call') {
-    const tool = updated.tools!.find(item => item.id === event.toolCallId)
-    if (tool) tool.input += event.delta ?? ''
+    const toolIndex = updated.tools!.findIndex(item => item.id === event.toolCallId)
+    if (toolIndex >= 0) updated.tools![toolIndex] = { ...updated.tools![toolIndex], input: updated.tools![toolIndex].input + (event.delta ?? '') }
     else updated.tools!.push({ id: event.toolCallId, name: event.name, input: event.delta ?? '', startedAt: Date.now() })
   }
-  if (event.type === 'tool_result') { const tool = updated.tools!.find(item => item.id === event.toolCallId); if (tool) Object.assign(tool, { result: event.content, error: event.isError, finished: true, images: event.images }) }
+  if (event.type === 'tool_result') {
+    const toolIndex = updated.tools!.findIndex(item => item.id === event.toolCallId)
+    if (toolIndex >= 0) updated.tools![toolIndex] = { ...updated.tools![toolIndex], result: event.content, error: event.isError, finished: true, images: event.images }
+  }
   next[next.length - 1] = updated
   return next
 }
@@ -1345,8 +1351,9 @@ function ResizeHandle({ label, onPointerDown }: { label: string; onPointerDown: 
 function ChatHeader({ session, project, lease, host, gitAvailable, sidebarCollapsed, toolsCollapsed, onToggleSidebar, onToggleTools, onTakeover }: { session?: Session; project?: Project; lease: SessionLease | null; host: PipiHostAPI; gitAvailable: boolean; sidebarCollapsed: boolean; toolsCollapsed: boolean; onToggleSidebar: () => void; onToggleTools: () => void; onTakeover: () => void }) { const readOnly = lease !== null && !leaseCanWrite(lease); return <header className="chat-header"><button data-testid="toggle-sidebar" title={sidebarCollapsed ? '展开左栏' : '收起左栏'} aria-label={sidebarCollapsed ? '展开左栏' : '收起左栏'} aria-expanded={!sidebarCollapsed} onClick={onToggleSidebar}>≡</button><div className="chat-header-title"><strong>{session?.name ?? '新会话'}</strong>{readOnly && <span className="lease-detail">由 {leaseOwnerLabel(lease)} 运行中 · 只读 <button data-testid="lease-takeover-header" onClick={onTakeover}>强制接管</button></span>}</div><div className="chat-header-actions"><GitBranchMenu host={host} projectId={project?.id} available={gitAvailable} /><button data-testid="toggle-tools" title={toolsCollapsed ? '展开右栏' : '收起右栏'} aria-label={toolsCollapsed ? '展开右栏' : '收起右栏'} aria-expanded={!toolsCollapsed} onClick={onToggleTools}>▤</button></div></header> }
 type MessageActionHandlers = { onCopy: (message: ChatMessage) => Promise<void>; onResend: (message: ChatMessage) => void; resendDisabled: boolean; copiedId: string | null }
 function Transcript({ messages, transcriptRef, waiting, onCopy, onResend, resendDisabled, copiedId }: { messages: ChatMessage[]; transcriptRef: React.RefObject<VirtuosoHandle>; waiting?: { startedAt: number; phase: WaitingPhase; detail?: string; onStop: () => void } } & MessageActionHandlers) { const [atBottom, setAtBottom] = useState(true); const [seekingId, setSeekingId] = useState<string | null>(null); const prompts = useMemo(() => buildRailPrompts(messages), [messages]); const { activeId: viewportActiveId, containerRef } = useActivePromptId(prompts, atBottom); const activeId = seekingId ?? viewportActiveId; useEffect(() => { if (atBottom) setSeekingId(null) }, [atBottom]); const jump = (index: number, id: string) => { setSeekingId(id); transcriptRef.current?.scrollToIndex({ index, align: 'start', behavior: 'smooth' }) }; const returnLatest = () => { setSeekingId(null); transcriptRef.current?.scrollToIndex({ index: Math.max(0, messages.length - 1), align: 'end', behavior: 'smooth' }); setAtBottom(true) }; return <div className="transcript-area" ref={containerRef}><PromptRail prompts={prompts} activeId={activeId} onJump={jump} /><MessageList ref={transcriptRef} messages={messages} atBottom={atBottom} onAtBottom={setAtBottom} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} />{waiting && <WaitingPlaceholder phase={waiting.phase} startedAt={waiting.startedAt} detail={waiting.detail} onStop={waiting.onStop} />}{!atBottom && messages.length > 0 && <button className="return-latest" onClick={returnLatest}>回到最新</button>}</div> }
-const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessage[]; atBottom: boolean; onAtBottom: (value: boolean) => void } & MessageActionHandlers>(function MessageList({ messages, atBottom, onAtBottom, onCopy, onResend, resendDisabled, copiedId }, ref) { return <div className="message-list" data-testid="message-scroll"><Virtuoso ref={ref} data={messages} followOutput={() => atBottom ? 'auto' : false} atBottomStateChange={onAtBottom} alignToBottom itemContent={(_, message) => <MessageView message={message} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copied={copiedId === message.id} />} /></div> }))
-export const MessageView = memo(function MessageView({ message, onCopy, onResend, resendDisabled, copied }: { message: ChatMessage; copied?: boolean } & Omit<MessageActionHandlers, 'copiedId'>) { const copyDisabled = !message.content.trim(); const copy = () => { void onCopy(message).catch(() => undefined) }; if (message.role === 'user') return <article className="message user-message" data-user-prompt={message.id}><div className="user-message-stack"><UserMessageBubble text={message.content} /><MessageActionBar alignment="trailing" canCopy canResend={Boolean(message.content.trim())} copyDisabled={copyDisabled} resendDisabled={resendDisabled} onCopy={copy} onResend={() => onResend(message)} copied={copied} /></div></article>; if (message.role === 'tool') { const notice = parseSubagentNotice(message.content); return notice ? <article className="message assistant-message"><CollapsibleActivityCard kind="result" label="子任务" summary={notice.name} meta={`${notice.ok ? '成功' : '失败'} · ${notice.cost}`}><pre>{message.content}</pre></CollapsibleActivityCard><MessageActionBar alignment="leading" canCopy copyDisabled={copyDisabled} onCopy={copy} copied={copied} /></article> : <article className="system-message tool-message"><div>{message.content}</div><MessageActionBar alignment="leading" canCopy copyDisabled={copyDisabled} onCopy={copy} copied={copied} /></article> } return <article className="message assistant-message"><AssistantTranscriptContent message={message} /><MessageActionBar alignment="leading" canCopy copyDisabled={copyDisabled} onCopy={copy} copied={copied} /></article> })
+const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessage[]; atBottom: boolean; onAtBottom: (value: boolean) => void } & MessageActionHandlers>(function MessageList({ messages, atBottom, onAtBottom, onCopy, onResend, resendDisabled, copiedId }, ref) { return <div className="message-list" data-testid="message-scroll"><Virtuoso ref={ref} data={messages} followOutput={() => atBottom ? 'auto' : false} atBottomStateChange={onAtBottom} alignToBottom itemContent={(index, message) => { const next = messages[index + 1]; const isTurnEnd = message.role === 'user' || (!message.streaming && (!next || next.role !== 'assistant')); return <MessageView message={message} showFooter={isTurnEnd} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copied={copiedId === message.id} /> } } /></div> }))
+function messageTime(timestamp?: number): string { if (!timestamp) return ''; return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
+export const MessageView = memo(function MessageView({ message, showFooter, onCopy, onResend, resendDisabled, copied }: { message: ChatMessage; showFooter?: boolean; copied?: boolean } & Omit<MessageActionHandlers, 'copiedId'>) { const copyDisabled = !message.content.trim(); const copy = () => { void onCopy(message).catch(() => undefined) }; const time = showFooter && message.timestamp ? <time className="message-time">{messageTime(message.timestamp)}</time> : null; const actions = showFooter ? <MessageActionBar alignment={message.role === 'user' ? 'trailing' : 'leading'} canCopy canResend={message.role === 'user' && Boolean(message.content.trim())} copyDisabled={copyDisabled} resendDisabled={resendDisabled} onCopy={copy} onResend={() => onResend(message)} copied={copied} /> : null;if (message.role === 'user') return <article className="message user-message" data-user-prompt={message.id}><div className="user-message-stack"><UserMessageBubble text={message.content} />{actions}</div>{time}</article>; if (message.role === 'tool') { const notice = parseSubagentNotice(message.content); return notice ? <article className="message assistant-message"><CollapsibleActivityCard kind="result" label="子任务" summary={notice.name} meta={`${notice.ok ? '成功' : '失败'} · ${notice.cost}`}><pre>{message.content}</pre></CollapsibleActivityCard>{actions}{time}</article> : <article className="system-message tool-message"><div>{message.content}</div>{actions}{time}</article> } return <article className="message assistant-message"><AssistantTranscriptContent message={message} />{actions || time ? <div className="assistant-message-footer">{actions}{time}</div> : null}</article> })
 const MIN_COMPOSER_HEIGHT = 29
 const MAX_COMPOSER_HEIGHT = 150
 /** jsdom has no layout engine (scrollHeight is 0), so fall back to a line-based estimate there. */

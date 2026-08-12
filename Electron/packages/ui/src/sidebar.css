@@ -231,22 +231,19 @@
 .sb-selected:hover{background:var(--sb-accent-soft)}
 .sb-selected .sb-session-title{color:var(--sb-text-strong);font-weight:600}
 
-/* Right-side status caption (Swift SessionRowStatus). No fixed min-width: the
-   hover action buttons are absolutely positioned overlays, so reserving flex
-   space only truncates the title prematurely. The caption fades on hover while
-   the actions overlay the same corner. */
+/* Right-side status caption (Swift SessionRowStatus). Sizes to content only —
+   no min-width or max-width — so the title gets all remaining flex space.
+   The caption fades on hover while the action buttons overlay the same corner. */
 .sb-status{
-  flex:none;
+  flex:0 0 auto;
   display:inline-flex;
   align-items:center;
-  justify-content:flex-end;
   gap:4px;
-  max-width:96px;
   font-size:10.5px;
   color:var(--sb-muted);
   transition:opacity .12s ease;
 }
-.sb-status-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sb-status-text{white-space:nowrap}
 
 /* Swift parity (SessionRowContainer): hover hides the time/caption while the
    pin/pencil/archive buttons overlay the right corner. */

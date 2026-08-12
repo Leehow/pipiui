@@ -27,18 +27,21 @@ describe('demo subagent log streaming', () => {
     // Wait for the full stream to finish (thinking×2 + tool×1 + toolResult×2 chunks).
     await screen.findByText(/确认流式更新逻辑位于 SubagentPanel/, {}, { timeout: 4_000 })
 
-    const log = screen.getByTestId('agent-log')
-    // 5 cumulative snapshots collapse into 3 rows: thinking, tool, toolResult.
-    expect(log.querySelectorAll('[data-activity-card]')).toHaveLength(3)
-    expect(log.querySelector('[data-activity-card="thinking"]')).toBeTruthy()
-    expect(log.querySelector('[data-activity-card="tool"]')).toBeTruthy()
-    expect(log.querySelector('[data-activity-card="result"]')).toBeTruthy()
+    const transcript = screen.getByTestId('subagent-transcript')
+    // The 5 cumulative snapshots collapse into one unified transcript message
+    // (thinking + read tool), not one card per chunk.
+    expect(transcript.querySelectorAll('[data-testid="assistant-transcript-content"]')).toHaveLength(1)
+    await screen.findByRole('button', { name: /2 个步骤/ })
 
     // The thinking row carries the final cumulative text — the intermediate
     // first-chunk-only snapshot must not linger as its own row.
-    expect(log.querySelector('[data-activity-card="thinking"]')?.textContent).toContain('，对照 App 与 SubagentPanel 的日志渲染路径')
+    const thinkingCard = screen.getByRole('button', { name: /^Thinking/ })
+    fireEvent.click(thinkingCard)
+    expect(screen.getByText(/，对照 App 与 SubagentPanel 的日志渲染路径/)).toBeTruthy()
     expect(screen.queryByText('正在梳理 packages/ui 的组件边界', { exact: true })).toBeNull()
-    // Same for toolResult: partial snapshot replaced by the full one.
-    expect(log.querySelector('[data-activity-card="result"]')?.textContent).toContain('确认流式更新逻辑位于 SubagentPanel。')
+
+    // The streaming tool card is expanded by default; the toolResult's final
+    // cumulative snapshot is visible (partial first chunk does not linger).
+    expect(screen.getByText(/确认流式更新逻辑位于 SubagentPanel。/)).toBeTruthy()
   })
 })

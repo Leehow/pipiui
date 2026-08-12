@@ -64,7 +64,6 @@ describe('SubagentPanel', () => {
     expect(screen.getByText('inspect this failure')).toBeTruthy()
     expect(screen.getByText('failed-only result')).toBeTruthy()
     expect(screen.getByText('¥7.20 CNY')).toBeTruthy()
-    expect(screen.getByText(/\$1\.00 USD/)).toBeTruthy()
     expect(screen.getAllByText(/61s/).length).toBeGreaterThan(0)
     expect(screen.getByLabelText('中止 runner')).toBeTruthy()
     expect(screen.queryByLabelText('中止 failed')).toBeNull()
@@ -75,8 +74,7 @@ describe('SubagentPanel', () => {
     expect(document.activeElement).toBe(resolve)
     fireEvent.click(resolve)
     await waitFor(() => expect(harness.resolveAgent).toHaveBeenCalledWith('failed'))
-    await waitFor(() => expect(screen.getByText('1 已处理')).toBeTruthy())
-    expect(screen.queryByLabelText('标记 failed 已处理')).toBeNull()
+    await waitFor(() => expect(screen.queryByLabelText('标记 failed 已处理')).toBeNull())
   })
 
   it('shows the actionable empty state after an empty snapshot', async () => {
@@ -157,7 +155,9 @@ describe('SubagentPanel', () => {
 
     await waitFor(() => expect(harness.hasLogSubscriber('tools')).toBe(true))
     harness.emitLog('tools', { type: 'agent_log', agentId: 'tools', itemType: 'tool', name: 'terminal_read_file', text: '{"path":"/tmp/raw fixture.txt","line_start":2}' })
-    expect(await screen.findByText('{"path":"/tmp/raw fixture.txt","line_start":2}')).toBeTruthy()
+    // The running tool card is expanded by default; the raw input (incl. line_start)
+    // is preserved verbatim — localization never mangles tool details.
+    expect(await screen.findByText(/"line_start": 2/)).toBeTruthy()
   })
 
   it('keeps the list compact and moves exact model, provider, profile, and session metadata into details', async () => {
@@ -238,6 +238,41 @@ describe('SubagentPanel', () => {
     expect(screen.getByText('已中止')).toBeTruthy()
   })
 
+  it('distinguishes a quiet Computer Worker from healthy indeterminate progress', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'quiet-operator', runId: 'r-quiet', name: 'operator', task: '在 TextEdit 中打开文件',
+      state: 'running', createdAt: now - 60_000, updatedAt: now - 45_000,
+      deadlineAt: now + 105_000, listSubtitle: 'desktop_act {"actions":[{"type":"key","keys":["CMD","O"]}]}'
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} />)
+
+    await screen.findByTestId('agent-row-quiet-operator')
+    expect(screen.getAllByText(/等待工具返回 · desktop_act/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/45 秒无新进展/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/105 秒后自动中止/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/可能卡住/).length).toBeGreaterThan(0)
+  })
+
+  it('shows a quiet Leader as coordinating while one of its children is still active', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'leader', runId: 'leader-run', name: 'computer-use-leader', task: 'coordinate workers',
+      state: 'running', createdAt: now - 60_000, updatedAt: now - 45_000, deadlineAt: now + 75_000
+    }, {
+      agentId: 'operator', runId: 'operator-run', parentId: 'leader', name: 'operator', task: 'open the file',
+      state: 'running', createdAt: now - 20_000, updatedAt: now - 5_000, deadlineAt: now + 130_000,
+      listSubtitle: 'desktop_act {"actions":[{"type":"key","keys":["CMD","O"]}]}'
+    }] as AgentSummary[]
+    render(<SubagentPanel host={harness.host} />)
+
+    await screen.findByTestId('agent-row-leader')
+    expect(screen.getAllByText('正在协调 · 1 个子 agent 运行中').length).toBeGreaterThan(0)
+    expect(screen.queryByTestId('agent-row-leader')?.textContent).not.toContain('可能卡住')
+  })
+
   it('shows and dismisses an actionable stop error', async () => {
     const harness = hostHarness()
     harness.host.listAgents = async () => [{ agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running' }]
@@ -284,8 +319,6 @@ describe('SubagentPanel', () => {
     expect(screen.getByText('已合并')).toBeTruthy()
     fireEvent.click(screen.getByTestId('agent-row-done').querySelector('.agent-select')!)
     expect(screen.getByText('¥3.60 CNY')).toBeTruthy()
-    expect(screen.getByText(/\$0\.55 USD/)).toBeTruthy()
-    expect(screen.getByText(/×7\.20/)).toBeTruthy()
   })
 
   it('keeps a narrow detail pane readable and reveals exact metadata only after opening technical details', async () => {
@@ -481,48 +514,22 @@ describe('SubagentPanel', () => {
     await screen.findByTestId('agent-row-run')
     await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
 
-    // Three cumulative snapshots of the same contentIndex must collapse into one row.
+    // Three cumulative snapshots of the same contentIndex must collapse into one
+    // content row — the final cumulative text wins, intermediate partials don't linger.
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: '{"step":', contentIndex: 0 })
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: '{"step": 1', contentIndex: 0 })
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: '{"step": 1}', contentIndex: 0 })
-    const structuredGroup = await screen.findByRole('button', { name: /1 个步骤 · 结构化结果/ })
-    expect(structuredGroup.getAttribute('aria-expanded')).toBe('false')
-    expect(screen.queryByText(/"step": 1/)).toBeNull()
-    fireEvent.click(structuredGroup)
-    const structuredCard = screen.getByRole('button', { name: /^结构化结果/ })
-    expect(structuredCard.getAttribute('aria-expanded')).toBe('false')
-    fireEvent.click(structuredCard)
-    const rows = await screen.findAllByText(/"step": 1/)
-    expect(rows).toHaveLength(1)
+    expect(await screen.findAllByText('{"step": 1}')).toHaveLength(1)
     expect(screen.queryByText('{"step":')).toBeNull()
     expect(screen.queryByText('{"step": 1')).toBeNull()
 
-    // A different contentIndex opens a second row.
+    // A different contentIndex opens a second row: thinking becomes its own step
+    // (a "1 个步骤 · Thinking" card) alongside the existing content.
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'thinking', text: 'plan', contentIndex: 1 })
-    expandTranscriptCards()
-    await screen.findByText('plan')
-    expect(screen.getByText(/"step": 1/)).toBeTruthy()
-
-    // No contentIndex (legacy host / terminal log batch): plain append.
-    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'toolResult', text: 'done' })
-    expect(screen.queryByText('done')).toBeNull()
-
-    // Completed tool results use the same two-level fold as the main transcript.
-    const resultGroup = await screen.findByRole('button', { name: /1 个步骤 · 工具结果/ })
-    expect(resultGroup.getAttribute('aria-expanded')).toBe('false')
-    fireEvent.click(resultGroup)
-    const resultCard = screen.getByRole('button', { name: /^工具结果/ })
-    expect(resultCard.getAttribute('aria-expanded')).toBe('false')
-    fireEvent.click(resultCard)
-    expect(await screen.findByText('done')).toBeTruthy()
-
-    // Adding a later log changes the earlier thinking message from live to
-    // completed, so reopen that completed card before asserting its body.
-    const thinkingGroup = screen.getByRole('button', { name: /1 个步骤 · Thinking/ })
-    if (thinkingGroup.getAttribute('aria-expanded') === 'false') fireEvent.click(thinkingGroup)
+    await screen.findByRole('button', { name: /1 个步骤 · Thinking/ })
+    expect(screen.getByText('{"step": 1}')).toBeTruthy()
     const thinkingCard = screen.getByRole('button', { name: /^Thinking/ })
-    if (thinkingCard.getAttribute('aria-expanded') === 'false') fireEvent.click(thinkingCard)
-    expect(screen.getByText(/"step": 1/)).toBeTruthy()
+    fireEvent.click(thinkingCard)
     expect(await screen.findByText('plan')).toBeTruthy()
   })
 

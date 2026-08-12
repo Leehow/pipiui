@@ -22,10 +22,26 @@ async function closeTracked(backend: ReturnType<typeof createPiHostBackend>) {
   await backend.close();
   backends = backends.filter(candidate => candidate !== backend);
 }
+async function removeRoot(path: string) {
+  // createPiHostBackend fire-and-forgets a model-catalog probe whose helper
+  // child briefly writes cache files into agentDir after close() returns; retry
+  // so teardown doesn't flap on that benign race.
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rm(path, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if ((code !== "ENOTEMPTY" && code !== "EPERM") || attempt >= 20) throw error;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
+}
+
 afterEach(async () => {
   await Promise.all(backends.map(backend => backend.close()));
   backends = [];
-  if (root) await rm(root, { recursive: true, force: true });
+  if (root) await removeRoot(root);
   root = "";
 });
 

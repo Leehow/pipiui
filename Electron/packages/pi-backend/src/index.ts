@@ -271,6 +271,12 @@ type Live = {
    * in the normal queue instead of racing pi mid-compaction.
    */
   compactionHoldsQueue?: boolean;
+  /**
+   * A successful host abort owns the turn's terminal semantics. Pi may emit a
+   * later generic `agent_settled` (or no terminal event at all), but neither
+   * case may turn an interrupted UI back into a completed one.
+   */
+  hostAbortedTurn?: boolean;
 };
 const PI_STDERR_TAIL_LIMIT = 16 * 1024;
 class PiExitedError extends Error {
@@ -657,6 +663,9 @@ export class PiHostBackend implements HostBackend {
    * different sessions stay fully parallel.
    */
   private ensureInFlight = new Map<string, Promise<Live>>();
+  /** In-memory agent log cache: agentId → accumulated log entries. Lets the UI
+   * reconstruct a completed subagent's transcript without a live subscription. */
+  private agentLogCache = new Map<string, { itemType: string; text: string; name?: string; isError?: boolean; contentIndex?: number }[]>();
   /** Cache-first stats refreshes that must settle during graceful close. */
   private backgroundStatsRefreshes = new Set<Promise<void>>();
   private models: Model[] = [];
@@ -870,6 +879,18 @@ export class PiHostBackend implements HostBackend {
       channel: "agents",
       event,
     });
+  }
+  /** Append a log entry to the in-memory cache for a completed-agent transcript. */
+  private cacheAgentLog(agentId: string, entry: { itemType: string; text: string; name?: string; isError?: boolean; contentIndex?: number }) {
+    const logs = this.agentLogCache.get(agentId) ?? []
+    // log_delta pushes cumulative snapshots keyed by contentIndex; upsert in place.
+    if (entry.contentIndex !== undefined) {
+      const idx = logs.findIndex(l => l.contentIndex === entry.contentIndex)
+      if (idx >= 0) { logs[idx] = entry; this.agentLogCache.set(agentId, logs); return }
+    }
+    logs.push(entry)
+    if (logs.length > 500) logs.splice(0, logs.length - 500)
+    this.agentLogCache.set(agentId, logs)
   }
   private queueChanged(id: string, items: QueuedMessage[]) {
     if (this.closed) return;
@@ -1230,9 +1251,26 @@ export class PiHostBackend implements HostBackend {
           params[1] as string,
         );
       case "stop":
-        return this.command(params[0] as string, { type: "abort" }).then(
-          () => undefined,
-        );
+        {
+          const sessionId = params[0] as string;
+          const live = this.live.get(sessionId);
+          if (live) live.hostAbortedTurn = true;
+          try {
+            await this.command(sessionId, { type: "abort" });
+          } catch (error) {
+            if (live) live.hostAbortedTurn = false;
+            throw error;
+          }
+          this.stream({
+            type: "status",
+            sessionId,
+            status: "stopped",
+            pendingFollowUps: live?.followUps ?? [],
+          });
+          live?.compaction.settleTurn();
+          await this.queueIdle(sessionId);
+          return undefined;
+        }
       case "queueFollowUp":
         return this.prompt(params[0] as string, params[1] as string, true);
       case "compact":
@@ -1302,6 +1340,8 @@ export class PiHostBackend implements HostBackend {
           (agent) => !sessionId || agent.sessionId === sessionId,
         );
       }
+      case "getAgentLogs":
+        return this.agentLogCache.get(params[0] as string) ?? [];
       case "abortAgent":
         return this.agentCommand(params[0] as string, "abort");
       case "resolveAgent":
@@ -1604,6 +1644,7 @@ export class PiHostBackend implements HostBackend {
     }
     const id = live.session.id;
     if (e.type === "agent_start") {
+      live.hostAbortedTurn = false;
       live.compaction.cancel();
       void this.loadQueue(id).then(() => this.queue.markBusy(id));
       this.stream({ type: "status", sessionId: id, status: "started" });
@@ -1611,7 +1652,7 @@ export class PiHostBackend implements HostBackend {
       this.stream({
         type: "status",
         sessionId: id,
-        status: "settled",
+        status: live.hostAbortedTurn ? "stopped" : "settled",
         pendingFollowUps: live.followUps,
       });
       void this.queueIdle(id);
@@ -2630,6 +2671,7 @@ export class PiHostBackend implements HostBackend {
     const a = await this.getAgent(id);
 		if (operation === "abort") {
 			if (!a.sessionId || !/^[A-Za-z0-9_-]{2,160}$/.test(id)) throw new Error("agent abort requires a live session and bounded agent id");
+			const abortsOwningTurn = a.name === "computer-use-leader" && !a.parentId;
 			// Pi executes extension commands immediately while streaming. Do not forge
 			// terminal UI state here; the real child end event remains authoritative.
 			await this.withAgentCommandTimeout(
@@ -2638,6 +2680,12 @@ export class PiHostBackend implements HostBackend {
 				"停止请求在 5 秒内未被主 Agent 接收；请重试",
 			);
 			await this.waitForAgentTerminal(a.agentId, a.sessionId, a.runId);
+			// A root Computer Task is the owning tool call of the current Pi turn. Once
+			// its real terminal event arrives, abort that turn as well so Pi emits its
+			// authoritative stopped lifecycle and the session queue/composer return to
+			// idle. Ordinary child aborts intentionally leave the Boss turn running so
+			// it can investigate or recover.
+			if (abortsOwningTurn) await this.command(a.sessionId, { type: "abort" });
 			return;
 		} else {
       a.handled = true;
@@ -2761,6 +2809,7 @@ export class PiHostBackend implements HostBackend {
     const usage = isRecord(raw.usage) ? raw.usage : undefined;
     const terminal = raw.kind === "end";
     const sameRun = current?.runId === raw.runId;
+		const eventAt = raw.at ? asTime(raw.at) : Date.now();
 		const currentIsTerminal = sameRun && current !== undefined && current.state !== "running" && current.state !== "stalled";
 		// HTTP lifecycle reports can arrive out of order. Once one run reaches a
 		// terminal state, a late preview/update/log/stall may enrich metrics but it
@@ -2785,7 +2834,9 @@ export class PiHostBackend implements HostBackend {
       title: raw.title ?? current?.title,
       createdAt:
         raw.createdAt ??
-        (raw.at ? asTime(raw.at) : (current?.createdAt ?? Date.now())),
+				(raw.at ? asTime(raw.at) : (sameRun ? current?.createdAt : undefined) ?? Date.now()),
+			updatedAt: eventAt,
+			deadlineAt: num2(raw.deadlineAt) ?? (sameRun ? current?.deadlineAt : undefined),
       // `start` sends `model: null` when the worker inherits the main model, so a null must never
       // clobber a model a later `usage` event resolved.
       model: modelRef(raw.model) ?? current?.model,
@@ -2839,25 +2890,15 @@ export class PiHostBackend implements HostBackend {
       // Runtime log_delta pushes cumulative full text keyed by contentIndex; carry
       // the key so the panel upserts one row instead of adding one per chunk.
       const contentIndex = num2(raw.contentIndex);
-      this.agent({
-        type: "agent_log",
-        agentId: agent.agentId,
-        itemType: raw.itemType,
-        text: raw.text ?? "",
-        name: raw.name,
-        isError: raw.isError,
-        ...(contentIndex === undefined ? {} : { contentIndex }),
-      });
+      const entry = { itemType: raw.itemType, text: raw.text ?? "", name: raw.name, isError: raw.isError, ...(contentIndex === undefined ? {} : { contentIndex }) };
+      this.cacheAgentLog(agent.agentId, entry);
+      this.agent({ type: "agent_log", agentId: agent.agentId, ...entry });
     } else if (raw.kind === "log")
-      for (const item of raw.items ?? [])
-        this.agent({
-          type: "agent_log",
-          agentId: agent.agentId,
-          itemType: item.itemType,
-          text: item.text,
-          name: item.name,
-          isError: item.isError,
-        });
+      for (const item of raw.items ?? []) {
+        const entry = { itemType: item.itemType, text: item.text, name: item.name, isError: item.isError };
+        this.cacheAgentLog(agent.agentId, entry);
+        this.agent({ type: "agent_log", agentId: agent.agentId, ...entry });
+      }
     this.agent({ type: "agent", agent });
     this.persistAgents();
   }

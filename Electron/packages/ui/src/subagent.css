@@ -22,14 +22,15 @@
 .agent-list{min-width:0;min-height:0;overflow-x:hidden;overflow-y:auto;padding:5px;overscroll-behavior:contain}
 .agent-row{display:flex;min-width:0;align-items:center;margin-bottom:1px;border-radius:7px;transition:background .12s ease}
 .agent-row.agent-root:has(+.agent-child){margin-top:3px;background:color-mix(in srgb,var(--accent) 5%,transparent)}
-.agent-row.agent-child{border-radius:7px}
+.agent-row.agent-child{margin-left:8px;border-left:1.5px solid color-mix(in srgb,var(--accent) 24%,var(--border));border-radius:0 7px 7px 0}
 .agent-row.selected{background:var(--selection)}
 .agent-row:hover{background:color-mix(in srgb,var(--selection) 58%,transparent)}
 .agent-select{display:flex;min-width:0;flex:1;align-items:center;gap:6px;padding:3px 6px;text-align:left}
 .agent-indent{display:block;flex:none}.agent-parent{display:none}.agent-metrics,.agent-pager{color:var(--subtle);font-size:10px}
 .agent-state{display:grid;width:15px;flex:0 0 15px;place-items:center;font-weight:700}.agent-state.running{color:var(--accent)}.agent-state.stalled{color:var(--warning)}.agent-state.ok{color:var(--success)}.agent-state.failed,.agent-state.aborted,.agent-state.interrupted{color:var(--danger)}
 .agent-spinner{display:inline-block;width:11px;height:11px;border:1.5px solid currentColor;border-right-color:transparent;border-radius:50%;animation:agent-spin .8s linear infinite}@keyframes agent-spin{to{transform:rotate(360deg)}}
-.agent-copy{display:grid;min-width:0;flex:1;gap:1px}.agent-copy small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;line-height:1.2}
+.agent-copy{display:grid;min-width:0;flex:1;gap:1px}.agent-copy small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;line-height:1.2}.agent-row-time{color:var(--subtle);font-size:10px;font-variant-numeric:tabular-nums}
+.agent-copy .agent-live-state{font-weight:600;color:var(--accent)}.agent-copy .agent-live-state.quiet{color:var(--warning,#a15c00)}.agent-copy .agent-live-state.deadline{color:var(--danger)}
 .agent-name-line{display:flex;min-width:0;align-items:center;gap:4px;overflow:hidden}.agent-name-line strong{overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap;font-size:13px;line-height:1.2}
 .agent-model-icon{display:inline-grid;width:20px;height:20px;flex:0 0 20px;place-items:center;object-fit:contain}.agent-model-icon.generic{opacity:.72}
 .agent-name-line em{flex:0 0 auto;padding:1px 4px;border-radius:8px;background:var(--surface-hover);color:var(--muted);font-size:9px;font-style:normal;font-weight:500}
@@ -48,6 +49,7 @@
 .worktree-meta{display:flex;flex:0 0 auto;flex-wrap:wrap;align-items:center;gap:6px;padding:0 10px 8px}.worktree-meta code{max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.worktree-meta>small{width:100%;color:var(--warning)}.worktree-actions button{padding:3px 6px;border:1px solid var(--border-strong);border-radius:4px;color:var(--accent);font-size:10px}.worktree-actions button:last-child{color:var(--danger)}
 .agent-log{min-width:0;min-height:0;flex:1 1 auto;overflow-x:hidden;overflow-y:auto;padding:8px 10px;overscroll-behavior:contain}.agent-log>p{color:var(--muted);font-size:11px}.agent-running-activity{display:flex;align-items:center;gap:7px;margin:0 0 8px;padding:7px 8px;border-radius:6px;color:var(--muted);background:color-mix(in srgb,var(--accent) 8%,transparent);font-size:11px}.agent-running-activity .agent-spinner{color:var(--accent)}
 .agent-running-activity{min-width:0;flex-wrap:wrap;margin:8px 10px}.agent-running-activity button{margin-left:auto;color:var(--danger)}
+.agent-running-activity.quiet{color:var(--warning,#8a5200);background:color-mix(in srgb,var(--warning,#d88a00) 12%,transparent)}.agent-running-activity.deadline{color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,transparent)}
 .agent-conclusion{min-width:0;padding:0 20px 18px;border-top:1px solid var(--border)}.agent-conclusion h3{margin:15px 0 20px;color:var(--text-strong);font-size:22px;line-height:1.1}.agent-tldr,.agent-failure-summary{min-width:0;margin:0;color:var(--text);font-size:13px;line-height:1.6;overflow-wrap:anywhere}.agent-failure-summary{color:var(--danger)}
 .agent-detail>.activity-card,.agent-detail>.agent-technical-details{margin:0 20px 8px}.detail-agent-title small{padding-left:25px}.agent-detail>.agent-closeout{padding:10px 20px 12px;color:var(--muted)}
 .agent-technical-details{min-width:0;min-height:0;overflow:auto;padding:0 10px 10px}.agent-technical-details>summary{cursor:pointer;padding:7px 0;color:var(--muted);font-size:11px}.technical-metadata{display:grid;min-width:0;gap:6px;padding:6px 0;color:var(--muted);font-size:10px;overflow-wrap:anywhere}.technical-metadata .detail-metrics{flex-wrap:wrap;overflow:visible;white-space:normal}

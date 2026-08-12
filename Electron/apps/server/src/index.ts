@@ -567,12 +567,16 @@ export function createWsHostServer(
     async close(): Promise<void> {
       for (const [socket, connection] of [...connections]) {
         closeConnection(socket, connection);
-        // A shutdown must not wait forever for a browser's WebSocket close
-        // handshake. This only terminates this server's own client socket.
         socket.terminate();
       }
       await new Promise<void>(resolve => wss.close(() => resolve()));
       if (!server.listening) return;
+      // Destroy every open HTTP connection (not just idle ones). Node's fetch
+      // (undici) holds keep-alive sockets in its pool after a response, and
+      // server.close() otherwise waits several seconds for them to drain — long
+      // enough to trip teardown timeouts. On shutdown we are tearing the server
+      // down, so terminating in-flight connections is the intended behavior.
+      server.closeAllConnections();
       await new Promise<void>(resolve => server.close(() => resolve()));
     },
   };

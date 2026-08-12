@@ -156,6 +156,40 @@ function agentListSubtitle(agent: Agent): string {
   return localizedTaskSummary(source)
 }
 
+type LiveAgentStatus = { text: string; severity: 'active' | 'quiet' | 'deadline' }
+
+function liveAgentStatus(agent: Agent, now: number, activeChildCount = 0): LiveAgentStatus {
+	if (activeChildCount > 0) {
+		return { severity: 'active', text: `正在协调 · ${activeChildCount} 个子 agent 运行中` }
+	}
+  const quietSeconds = agent.updatedAt === undefined ? undefined : Math.max(0, Math.floor((now - agent.updatedAt) / 1000))
+  const rawActivity = visibleAgentText(agent.listSubtitle ?? '').trim()
+  const tool = rawActivity.match(/^([a-z][a-z0-9_-]*)\b/i)?.[1]
+  const replanning = /^(?:Revise this Computer Task plan|Repair this Computer Task plan)/i.test(agent.task)
+  const phase = replanning
+    ? '正在调查失败并重新规划'
+    : tool
+      ? `等待工具返回 · ${tool}`
+      : '等待模型响应'
+  const deadlineSeconds = agent.deadlineAt ? Math.max(0, Math.ceil((agent.deadlineAt - now) / 1000)) : undefined
+  if (quietSeconds === undefined) {
+    return { text: `${phase} · 等待新的状态事件`, severity: 'active' }
+  }
+  if (deadlineSeconds === 0) {
+    return { text: `正在自动中止 · ${phase} · ${quietSeconds} 秒无新进展`, severity: 'deadline' }
+  }
+  if (quietSeconds >= 30) {
+    return {
+      text: `可能卡住 · ${phase} · ${quietSeconds} 秒无新进展${deadlineSeconds === undefined ? '' : ` · ${deadlineSeconds} 秒后自动中止`}`,
+      severity: 'quiet'
+    }
+  }
+  return {
+    text: `${phase} · ${quietSeconds} 秒前有新进展${deadlineSeconds === undefined ? '' : ` · 最迟 ${deadlineSeconds} 秒后自动中止`}`,
+    severity: 'active'
+  }
+}
+
 function providerLabel(agent: Agent) {
   return agent.provider || agent.model?.split('/')[0] || 'pi'
 }
@@ -350,7 +384,11 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
 
   useEffect(() => {
     if (!agents.some(isActive)) return
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
+    // Agent events update the activity text immediately. The clock only ages
+    // relative labels and must not churn the whole accessibility tree once per
+    // second: Computer Use deliberately rejects actions when the target UI
+    // changes between observation and click.
+    const timer = window.setInterval(() => setNow(Date.now()), 15_000)
     return () => window.clearInterval(timer)
   }, [agents])
 
@@ -361,17 +399,33 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
       : agent)))
   }, [host, selected?.agentId])
 
+  // Fetch cached logs for the selected agent so completed subagents show their
+  // full transcript (live subscription only delivers events while running).
+  useEffect(() => {
+    if (!selected?.agentId || !host.getAgentLogs) return
+    let cancelled = false
+    const agentId = selected.agentId
+    void host.getAgentLogs(agentId).then(entries => {
+      if (cancelled || !entries.length) return
+      setAgents(current => current.map(agent => {
+        if (agent.agentId !== agentId || agent.logs.length > 0) return agent
+        let logs: Log[] = []
+        for (const entry of entries) logs = applyLogDelta(logs, { type: 'agent_log', agentId, ...entry })
+        return { ...agent, logs }
+      }))
+    })
+    return () => { cancelled = true }
+  }, [host, selected?.agentId])
+
   useEffect(() => {
     if (follow && agents.length) setPage(0)
   }, [agents.length, follow])
 
   const summary = useMemo(() => ({
     running: agents.filter(isActive).length,
-    failed: agents.filter(agent => agent.state === 'failed' && !agent.handled).length,
-    handled: agents.filter(agent => agent.handled).length,
-    cost: agents.reduce((sum, agent) => sum + (agent.cost ?? 0), 0)
+    succeeded: agents.filter(agent => agent.state === 'ok').length,
+    failed: agents.filter(agent => agent.state === 'failed').length,
   }), [agents])
-  const pricing = useMemo(() => pricingFor(agents), [agents])
 
   useEffect(() => {
     onRunningChange?.(summary.running > 0)
@@ -431,7 +485,7 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
   }
 
   return <section className="subagents" data-testid="subagent-panel">
-    <SubagentHeader total={agents.length} {...summary} pricing={pricing} onClear={clearFinished} />
+    <SubagentHeader total={agents.length} {...summary} onClear={clearFinished} />
 		{abortError && <div className="subagent-abort-error"><DismissibleError message={abortError} onDismiss={() => setAbortError('')} /></div>}
     {loading
       ? <div className="subagent-loading" role="status"><span className="agent-spinner" aria-hidden="true" />正在加载 subagents…</div>
@@ -445,8 +499,10 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
                 key={agent.agentId}
                 agent={agent}
 				childCount={agents.filter(candidate => candidate.parentId === agent.agentId).length}
+				activeChildCount={agents.filter(candidate => candidate.parentId === agent.agentId && isActive(candidate)).length}
                 selected={agent.agentId === selectedId}
 				aborting={abortingIds.has(agent.agentId)}
+				now={now}
                 onSelect={() => setSelectedId(agent.agentId)}
 				onAbort={() => void abort(agent)}
                 onResolve={() => void host.resolveAgent(agent.agentId).then(() => setAgents(current => current.map(item => item.agentId === agent.agentId ? { ...item, handled: true } : item)))}
@@ -458,7 +514,7 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
               </div>}
             </div>
             <div className="subagent-divider" aria-label="调整 agent 列表高度" role="separator" onPointerDown={startDrag} />
-			<AgentDetail agent={selected} aborting={Boolean(selected && abortingIds.has(selected.agentId))} now={now} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onCheck={check} onWorktree={worktree} onAbort={agent => void abort(agent)} />
+			<AgentDetail agent={selected} activeChildCount={selected ? agents.filter(candidate => candidate.parentId === selected.agentId && isActive(candidate)).length : 0} aborting={Boolean(selected && abortingIds.has(selected.agentId))} now={now} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onCheck={check} onWorktree={worktree} onAbort={agent => void abort(agent)} />
           </div>}
   </section>
 }
@@ -537,13 +593,11 @@ function applyLogDelta(logs: Log[], event: Extract<AgentEvent, { type: 'agent_lo
   return [...logs, { id: logs.length + 1, itemType, text, name, isError }]
 }
 
-function SubagentHeader({ total, running, failed, handled, cost, pricing, onClear }: {
+function SubagentHeader({ total, running, succeeded, failed, onClear }: {
   total: number
   running: number
+  succeeded: number
   failed: number
-  handled: number
-  cost: number
-  pricing: Pricing
   onClear: () => void
 }) {
   const finished = Math.max(0, total - running)
@@ -552,23 +606,22 @@ function SubagentHeader({ total, running, failed, handled, cost, pricing, onClea
       <b>♙ Subagents</b>
       <span>{total} 个</span>
       <i className={`running-badge${running ? '' : ' is-zero'}`}>{running} 运行中</i>
+      <i className={`handled-badge${succeeded ? '' : ' is-zero'}`}>{succeeded} 成功</i>
       <i className={`failed-badge${failed ? '' : ' is-zero'}`}>{failed} 失败</i>
-      <i className={`handled-badge${handled ? '' : ' is-zero'}`}>{handled} 已处理</i>
     </div>
     <div className="subagent-header-right">
-      {cost > 0 && <span className="subagent-total-spend" title={`1 USD = ¥${pricing.exchangeRate.toFixed(2)}`}>
-        {spend(cost, pricing, true)} · ×{pricing.exchangeRate.toFixed(2)}
-      </span>}
       <button onClick={onClear} disabled={finished === 0}>清空</button>
     </div>
   </header>
 }
 
-function AgentRow({ agent, childCount, selected, aborting, onSelect, onAbort, onResolve }: {
+function AgentRow({ agent, childCount, activeChildCount, selected, aborting, now, onSelect, onAbort, onResolve }: {
   agent: Agent
 	childCount: number
+	activeChildCount: number
   selected: boolean
 	aborting: boolean
+  now: number
   onSelect: () => void
   onAbort: () => void
   onResolve: () => void
@@ -578,6 +631,7 @@ function AgentRow({ agent, childCount, selected, aborting, onSelect, onAbort, on
   const subtitle = agentListSubtitle(agent)
   const handled = !active && !agent.handled && ['failed', 'aborted', 'interrupted'].includes(agent.state)
   const stalled = agent.stalled || agent.state === 'stalled'
+	const live = active ? liveAgentStatus(agent, now, activeChildCount) : undefined
 
   return <article className={`agent-row ${agent.parentId ? 'agent-child' : 'agent-root'} ${selected ? 'selected' : ''}`} data-testid={`agent-row-${agent.agentId}`}>
     <button className="agent-select" onClick={onSelect} aria-pressed={selected}>
@@ -595,6 +649,9 @@ function AgentRow({ agent, childCount, selected, aborting, onSelect, onAbort, on
           {worktree && <em className={`worktree-badge ${worktree.lifecycle}`}>{worktree.text}</em>}
         </span>
         <small>{subtitle}</small>
+        {active && <small className="agent-row-time">· {duration(agent, now)}</small>}
+        {!active && agent.endedAt && <small className="agent-row-time">{completedAt(agent.endedAt)} · {duration(agent, now)}</small>}
+		{live && <small className={`agent-live-state ${live.severity}`}>{live.text}</small>}
       </span>
     </button>
     {active && <button aria-label={`${aborting ? '正在中止' : '中止'} ${agent.name}`} title={aborting ? '正在中止 agent' : '中止 agent'} className="agent-control abort" disabled={aborting} onClick={onAbort}>{aborting ? <span className="agent-spinner" aria-hidden="true" /> : '■'}</button>}
@@ -602,8 +659,9 @@ function AgentRow({ agent, childCount, selected, aborting, onSelect, onAbort, on
   </article>
 }
 
-function AgentDetail({ agent, aborting, now, retainedWorktreeDispositionAvailable, onCheck, onWorktree, onAbort }: {
+function AgentDetail({ agent, activeChildCount, aborting, now, retainedWorktreeDispositionAvailable, onCheck, onWorktree, onAbort }: {
   agent?: Agent
+	activeChildCount: number
 	aborting: boolean
   now: number
   retainedWorktreeDispositionAvailable: boolean
@@ -616,6 +674,7 @@ function AgentDetail({ agent, aborting, now, retainedWorktreeDispositionAvailabl
   const model = agent.model || `${providerLabel(agent)}/${agent.name}`
   const output = latestReadableResult(agent)
   const activity = localizedTaskSummary(agent.listSubtitle || agent.title || agent.task)
+	const live = isActive(agent) ? liveAgentStatus(agent, now, activeChildCount) : undefined
   const detailTitle = detailTaskTitle(agent, output)
   const transcript = agentTranscript(agent, output)
 
@@ -628,7 +687,7 @@ function AgentDetail({ agent, aborting, now, retainedWorktreeDispositionAvailabl
     </header>
     <p className="agent-closeout">{agent.closeout ? `收尾　${agent.closeout}` : `${stateText(agent)}${agent.worktree ? `　${worktreeText(agent.worktree)}` : ''}`}</p>
     <div className="agent-transcript-scroll" data-testid="subagent-transcript-scroll">
-      {isActive(agent) && <div className="agent-running-activity"><span className="agent-spinner" aria-hidden="true" />正在执行 · {activity}<button disabled={aborting} onClick={() => onAbort(agent)}>{aborting ? '正在停止' : '停止'}</button></div>}
+      {isActive(agent) && <div className={`agent-running-activity ${live?.severity ?? 'active'}`} role="status" aria-live="polite"><span className="agent-spinner" aria-hidden="true" /><span>{live?.text ?? `正在执行 · ${activity}`}</span><button disabled={aborting} onClick={() => onAbort(agent)}>{aborting ? '正在停止' : '停止'}</button></div>}
       <div className="agent-transcript" data-testid="subagent-transcript">
         {transcript.map((message, index) => <article className="message assistant-message" key={`${agent.runId}-transcript-${index}`}><AssistantTranscriptContent message={message} expandSteps /></article>)}
       </div>
