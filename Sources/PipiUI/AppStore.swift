@@ -2355,6 +2355,7 @@ final class AppStore: ObservableObject {
         remotePeerProductionState = .disabled
         remoteHostController.resetRuntimeState()
         ComputerCoordinator.shared.releaseAll(revokeConsent: true)
+        ComputerCoordinator.shared.shutdownCuaRuntimeAndWait()
         ComputerCoordinator.shared.shutdownInputMonitoring()
         for session in openSessions.values {
             session.subagents.saveNow()

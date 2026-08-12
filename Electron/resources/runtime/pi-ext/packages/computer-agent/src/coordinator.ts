@@ -54,10 +54,40 @@ export type ComputerWorkerResult = {
   outcome: "completed" | "verified" | "failed" | "blocked" | "outcome_unknown";
   summary: string;
   claims?: string[];
+  /** Host-filtered, exact requested conditions attested by a fresh multimodal Verifier. */
+  attestedPostconditions?: ComputerPostcondition[];
   observation?: ComputerObservation;
   artifactReferences?: Array<{ id: string; kind: "screenshot" | "accessibility" | "terminal" | "trajectory" | "file"; summary: string; digest: string; byteLength: number }>;
   trajectory?: string;
+  failureCode?: ComputerWorkerFailureCode;
 };
+export const COMPUTER_WORKER_FAILURE_CODES = [
+  "gui_broker_start_failed", "gui_grant_issue_failed", "gui_private_resource_failed",
+  "gui_child_prestart_failed", "gui_child_failed", "gui_child_stalled", "computer_worker_dispatch_failed",
+	"computer_worker_runtime_timeout", "computer_worker_request_cancelled",
+	"computer_worker_no_progress",
+] as const;
+export type ComputerWorkerFailureCode = typeof COMPUTER_WORKER_FAILURE_CODES[number];
+
+export async function runComputerWorkerWithStallDeadline<T>(
+  run: () => Promise<T>,
+  onStalled: () => void,
+  timeoutMs = 150_000,
+): Promise<T> {
+  const operation = Promise.resolve().then(run);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<T>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      try { onStalled(); } catch { /* The closed failure still wins if best-effort abort reporting fails. */ }
+      reject(Object.assign(new Error("gui_child_stalled"), { failureCode: "gui_child_stalled" as const }));
+    }, Math.max(10, timeoutMs));
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 export type HostExecutionRecord =
   | { role: "gui-operator"; kind: "open_application" | "click" | "type_parameter"; bundleId?: string; appName?: string; locator?: { role: string; nameLiteral: string }; observationId: string; observedAt: string }
   | { role: "terminal-worker"; kind: "write_parameterized_file"; path: string; byteLength: number; contentDigest: string; observationId: string; observedAt: string };
@@ -71,6 +101,19 @@ export type ComputerTaskResult = {
     conditionResults: Array<{ conditionId: string; outcome: "verified" | "not_verified" | "unknown" }>;
   };
   planRevisions: number;
+  investigation?: {
+    stage: "task_verification" | "recovery_exhausted" | "recovery_plan" | "plan_dependencies" | "cancelled";
+    code: "task_conditions_not_verified" | "worker_postconditions_not_verified" | "worker_failed" | "worker_blocked" | "worker_outcome_unknown" | "recovery_plan_invalid" | "unresolved_dependencies" | "task_cancelled" | ComputerWorkerFailureCode;
+    recoveryAttempts: number;
+    failedConditions: Array<{ conditionId: string; kind: ComputerPostcondition["kind"]; outcome: "not_verified" | "unknown" }>;
+    workerAttempts: Array<{
+      stepId: string;
+      role: ComputerWorkerRole;
+      outcome: ComputerWorkerResult["outcome"];
+      verification: "verified" | "not_verified" | "unknown";
+      failureCode?: ComputerWorkerFailureCode;
+    }>;
+  };
 };
 
 type Planner = {
@@ -101,6 +144,16 @@ type ProcedureLearning = {
 const WORKER_SUMMARY: Record<ComputerWorkerResult["outcome"], string> = { completed: "Worker completed", verified: "Verifier completed", failed: "Worker failed", blocked: "Worker blocked", outcome_unknown: "Worker outcome unknown" };
 const ARTIFACT_SUMMARY: Record<NonNullable<ComputerWorkerResult["artifactReferences"]>[number]["kind"], string> = { screenshot: "Screenshot artifact", accessibility: "Accessibility artifact", terminal: "Terminal artifact", trajectory: "Trajectory artifact", file: "File artifact" };
 
+function closedPostcondition(value: unknown): ComputerPostcondition | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const item = value as Record<string, unknown>;
+  if (item.kind === "visible_text" && Object.keys(item).every((key) => ["kind", "contains"].includes(key)) && typeof item.contains === "string" && item.contains.length > 0 && item.contains.length <= 4_096) return { kind: "visible_text", contains: item.contains };
+  if (item.kind === "element_exists" && Object.keys(item).every((key) => ["kind", "name"].includes(key)) && typeof item.name === "string" && item.name.length > 0 && item.name.length <= 4_096) return { kind: "element_exists", name: item.name };
+  if (item.kind === "file_exists" && Object.keys(item).every((key) => ["kind", "path"].includes(key)) && typeof item.path === "string" && item.path.startsWith("/") && item.path.length <= 4_096) return { kind: "file_exists", path: item.path };
+  if (item.kind === "visual_judgement" && Object.keys(item).every((key) => ["kind", "description"].includes(key)) && typeof item.description === "string" && item.description.length > 0 && item.description.length <= 4_096) return { kind: "visual_judgement", description: item.description };
+  return undefined;
+}
+
 export function projectComputerWorkerResult(value: ComputerWorkerResult): ComputerWorkerResult {
   const observation = value.observation && typeof value.observation.id === "string" ? {
     id: /^[A-Za-z0-9:_-]{1,160}$/.test(value.observation.id) ? value.observation.id : "observation:redacted",
@@ -119,9 +172,16 @@ export function projectComputerWorkerResult(value: ComputerWorkerResult): Comput
     && Number.isInteger(item.byteLength) && item.byteLength >= 0
   ).slice(0, 12).map((item: any) => ({ id: item.id, kind: item.kind, summary: ARTIFACT_SUMMARY[item.kind as keyof typeof ARTIFACT_SUMMARY], digest: item.digest.toLowerCase(), byteLength: item.byteLength }));
   const outcome = ["completed", "verified", "failed", "blocked", "outcome_unknown"].includes(value.outcome) ? value.outcome : "failed";
+  const failureCode = COMPUTER_WORKER_FAILURE_CODES.includes(value.failureCode as ComputerWorkerFailureCode) ? value.failureCode as ComputerWorkerFailureCode : undefined;
+  const attestedPostconditions = (value.attestedPostconditions ?? []).flatMap((item) => {
+    const condition = closedPostcondition(item);
+    return condition ? [condition] : [];
+  }).slice(0, 32);
   return {
     outcome,
     summary: WORKER_SUMMARY[outcome],
+    ...(failureCode ? { failureCode } : {}),
+    ...(attestedPostconditions.length ? { attestedPostconditions } : {}),
     ...(observation ? { observation } : {}),
     ...(artifactReferences.length ? { artifactReferences } : {}),
   };
@@ -196,10 +256,64 @@ export class ComputerAgentCoordinator {
     const completed = new Set<string>();
     const executed: Array<{ stepId: string; role: ComputerWorkerRole; outcome: string; artifactReferences: ComputerWorkerResult["artifactReferences"]; hostExecutionRecords: HostExecutionRecord[] }> = [];
     const verificationObservationIds = new Set<string>();
+    const verifiedTaskConditions = new Set<string>();
+    const workerAttempts: NonNullable<ComputerTaskResult["investigation"]>["workerAttempts"] = [];
+
+    const taskVerification = () => {
+      const conditionResults = plan.successConditions.map((condition, index) => ({
+        conditionId: `task:condition:${index}`,
+        outcome: verifiedTaskConditions.has(JSON.stringify(condition)) ? "verified" as const : "not_verified" as const,
+      }));
+      return {
+        status: conditionResults.every((condition) => condition.outcome === "verified") ? "verified" as const : "not_verified" as const,
+        conditionResults,
+      };
+    };
+    const recordTaskEvidence = (step: ComputerPlanStep, observation: ComputerObservation | undefined, verifiedByFreshVerifier: boolean, attestedPostconditions: ComputerPostcondition[] = []) => {
+      const boundStepConditions = new Set(step.postconditions.map((condition) => JSON.stringify(condition)));
+      const attested = new Set(attestedPostconditions.map((condition) => JSON.stringify(condition)));
+      for (const condition of plan.successConditions) {
+        const key = JSON.stringify(condition);
+        if (!boundStepConditions.has(key)) continue;
+        if (isSubjective(condition)) {
+          if (verifiedByFreshVerifier) verifiedTaskConditions.add(key);
+        } else if (verifiedByFreshVerifier && attested.has(key)) {
+          verifiedTaskConditions.add(key);
+        } else if (evaluatePostconditions([condition], observation, "task:evidence").status === "verified") {
+          verifiedTaskConditions.add(key);
+        }
+      }
+    };
+    const investigation = (
+      stage: NonNullable<ComputerTaskResult["investigation"]>["stage"],
+      code: NonNullable<ComputerTaskResult["investigation"]>["code"],
+      verification = taskVerification(),
+    ): NonNullable<ComputerTaskResult["investigation"]> => ({
+      stage,
+      code,
+      recoveryAttempts: revisions,
+      failedConditions: verification.conditionResults.flatMap((condition, index) => condition.outcome === "verified" ? [] : [{
+        conditionId: condition.conditionId,
+        kind: plan.successConditions[index]?.kind ?? "visual_judgement",
+        outcome: condition.outcome,
+      }]),
+      workerAttempts: workerAttempts.slice(-16).map((attempt) => ({ ...attempt })),
+    });
+    const finishBlocked = (
+      stage: NonNullable<ComputerTaskResult["investigation"]>["stage"],
+      code: NonNullable<ComputerTaskResult["investigation"]>["code"],
+      verification = taskVerification(),
+      summary = "Computer Task blocked",
+    ) => {
+      const blocked = this.#result("blocked", summary, revisions, verification, investigation(stage, code, verification));
+      this.#emit({ type: "task_finished", taskId, outcome: blocked.outcome });
+      return blocked;
+    };
 
     while (true) {
       if (signal?.aborted) {
-        const cancelled = this.#result("cancelled", "Computer Task cancelled", revisions);
+        const verification = taskVerification();
+        const cancelled = this.#result("cancelled", "Computer Task cancelled", revisions, verification, investigation("cancelled", "task_cancelled", verification));
         this.#emit({ type: "task_finished", taskId, outcome: cancelled.outcome });
         return cancelled;
       }
@@ -208,18 +322,19 @@ export class ComputerAgentCoordinator {
         && candidate.dependsOn.every((dependency) => completed.has(dependency))
       );
       if (!step) {
-        const finalObservation = undefined;
         if (plan.steps.every((candidate) => completed.has(candidate.id))) {
+          const verification = taskVerification();
+          if (verification.status !== "verified") {
+            return finishBlocked("task_verification", "task_conditions_not_verified", verification, "Task-level success conditions are not freshly verified");
+          }
           return await this.#succeeded(taskId, runId, goal, plan, executed, verificationObservationIds, {
             outcome: "succeeded",
             summary: "Computer Task completed",
-            verification: verifiedConditionResults(plan.successConditions, "task:condition"),
+            verification,
             planRevisions: revisions,
           });
         }
-        const blocked = this.#result("blocked", "Computer Task plan has unresolved dependencies", revisions, finalObservation);
-        this.#emit({ type: "task_finished", taskId, outcome: blocked.outcome });
-        return blocked;
+        return finishBlocked("plan_dependencies", "unresolved_dependencies", taskVerification(), "Computer Task plan has unresolved dependencies");
       }
 
       this.#emit({ type: "worker_started", taskId, stepId: step.id, role: step.role, parentRole: "computer-use-leader", depth: 1 });
@@ -234,9 +349,21 @@ export class ComputerAgentCoordinator {
       }, signal);
       const result = dispatched.workerResult;
       executed.push({ stepId: step.id, role: step.role, outcome: result.outcome, artifactReferences: result.artifactReferences, hostExecutionRecords: dispatched.hostExecutionRecords });
+      const attempt: NonNullable<ComputerTaskResult["investigation"]>["workerAttempts"][number] = {
+        stepId: step.id,
+        role: step.role,
+        outcome: result.outcome,
+        verification: "unknown",
+        ...(result.failureCode ? { failureCode: result.failureCode } : {}),
+      };
+      workerAttempts.push(attempt);
       this.#emit({ type: "worker_finished", taskId, stepId: step.id, role: step.role, outcome: result.outcome, parentRole: "computer-use-leader", depth: 1 });
       if (result.outcome === "completed" || result.outcome === "verified") {
-        let verification = step.role === "verifier" && result.outcome === "verified" && result.observation?.id
+        const resultObservationIsFresh = Boolean(result.observation?.id && !verificationObservationIds.has(result.observation.id));
+        let taskObservation = result.observation;
+        let taskAttestations = result.attestedPostconditions ?? [];
+        let verifiedByFreshVerifier = step.role === "verifier" && result.outcome === "verified" && resultObservationIsFresh;
+        let verification = step.role === "verifier" && result.outcome === "verified" && resultObservationIsFresh
           ? verifiedConditionResults(step.postconditions, `${step.id}:condition`)
           : evaluatePostconditions(step.postconditions, result.observation, `${step.id}:condition`);
         if (verification.status === "verified" && result.observation?.id) verificationObservationIds.add(result.observation.id);
@@ -250,17 +377,36 @@ export class ComputerAgentCoordinator {
             grants: grantsForComputerRole("verifier"),
             observation: result.observation,
           }, signal);
+          const verifierAttempt: NonNullable<ComputerTaskResult["investigation"]>["workerAttempts"][number] = {
+            stepId: `${step.id}-verify`,
+            role: "verifier",
+            outcome: verified.workerResult.outcome,
+            verification: "unknown",
+            ...(verified.workerResult.failureCode ? { failureCode: verified.workerResult.failureCode } : {}),
+          };
+          workerAttempts.push(verifierAttempt);
           verification = verified.workerResult.outcome === "verified" && verified.workerResult.observation?.id && verified.workerResult.observation.id !== result.observation?.id
             ? verifiedConditionResults(step.postconditions, `${step.id}:condition`)
             : evaluatePostconditions(step.postconditions, verified.workerResult.observation, `${step.id}:condition`);
+          verifierAttempt.verification = verification.status;
+          taskObservation = verified.workerResult.observation;
+          taskAttestations = verified.workerResult.attestedPostconditions ?? [];
+          verifiedByFreshVerifier = Boolean(
+            verified.workerResult.outcome === "verified" &&
+            verified.workerResult.observation?.id &&
+            verified.workerResult.observation.id !== result.observation?.id &&
+            !verificationObservationIds.has(verified.workerResult.observation.id)
+          );
           if (verification.status === "verified" && verified.workerResult.observation?.id) verificationObservationIds.add(verified.workerResult.observation.id);
         }
+        attempt.verification = verification.status;
         if (verification.status === "verified") {
+          recordTaskEvidence(step, taskObservation, verifiedByFreshVerifier, taskAttestations);
           completed.add(step.id);
           if (plan.steps.every((candidate) => completed.has(candidate.id))) {
-            const taskVerification = evaluatePostconditions(plan.successConditions, result.observation, "task:condition");
-            if (taskVerification.status !== "verified" && JSON.stringify(plan.successConditions) !== JSON.stringify(step.postconditions)) {
-              return this.#result("blocked", "Task-level success conditions are not freshly verified", revisions);
+            const verification = taskVerification();
+            if (verification.status !== "verified") {
+              return finishBlocked("task_verification", "task_conditions_not_verified", verification, "Task-level success conditions are not freshly verified");
             }
             return await this.#succeeded(taskId, runId, goal, plan, executed, verificationObservationIds, {
               outcome: "succeeded",
@@ -283,15 +429,31 @@ export class ComputerAgentCoordinator {
           postconditions: step.postconditions,
           grants: grantsForComputerRole("verifier"),
         }, signal);
+        const verifierAttempt: NonNullable<ComputerTaskResult["investigation"]>["workerAttempts"][number] = {
+          stepId: `${step.id}-observe-after-unknown`,
+          role: "verifier",
+          outcome: observed.workerResult.outcome,
+          verification: "unknown",
+          ...(observed.workerResult.failureCode ? { failureCode: observed.workerResult.failureCode } : {}),
+        };
+        workerAttempts.push(verifierAttempt);
         recoveryObservation = observed.workerResult.observation;
         const recovered = evaluatePostconditions(step.postconditions, recoveryObservation, `${step.id}:condition`);
+        verifierAttempt.verification = recovered.status;
+        attempt.verification = recovered.status;
         if (recovered.status === "verified") {
+          if (recoveryObservation?.id) verificationObservationIds.add(recoveryObservation.id);
+          recordTaskEvidence(step, recoveryObservation, false);
           completed.add(step.id);
           if (plan.steps.every((candidate) => completed.has(candidate.id))) {
+            const verification = taskVerification();
+            if (verification.status !== "verified") {
+              return finishBlocked("task_verification", "task_conditions_not_verified", verification, "Task-level success conditions are not freshly verified");
+            }
             return await this.#succeeded(taskId, runId, goal, plan, executed, verificationObservationIds, {
               outcome: "succeeded",
               summary: "Computer Task completed",
-              verification: recovered,
+              verification,
               planRevisions: revisions,
             });
           }
@@ -299,18 +461,37 @@ export class ComputerAgentCoordinator {
         }
       }
 
+      if (attempt.verification === "unknown" && result.observation) {
+        attempt.verification = evaluatePostconditions(step.postconditions, result.observation, `${step.id}:condition`).status;
+      }
+
       if (revisions >= this.#maxReplans) {
-        const blocked = this.#result("blocked", "Computer Task replan budget exhausted", revisions, recoveryObservation);
+        const code = result.failureCode
+          ?? (result.outcome === "outcome_unknown" ? "worker_outcome_unknown"
+            : attempt.verification === "not_verified" ? "worker_postconditions_not_verified"
+              : result.outcome === "blocked" ? "worker_blocked" : "worker_failed");
+        return finishBlocked("recovery_exhausted", code, taskVerification(), "Computer Task replan budget exhausted");
+      }
+      try {
+        plan = await this.#planner.replan({
+          plan,
+          failedStep: step,
+          result,
+          observation: recoveryObservation,
+        });
+        this.#validatePlan(plan);
+      } catch {
+        const verification = taskVerification();
+        const blocked: ComputerTaskResult = {
+          outcome: "blocked",
+          summary: "Computer Task recovery plan was invalid after worker failure",
+          verification,
+          planRevisions: revisions,
+          investigation: investigation("recovery_plan", "recovery_plan_invalid", verification),
+        };
         this.#emit({ type: "task_finished", taskId, outcome: blocked.outcome });
         return blocked;
       }
-      plan = await this.#planner.replan({
-        plan,
-        failedStep: step,
-        result,
-        observation: recoveryObservation,
-      });
-      this.#validatePlan(plan);
       revisions += 1;
       this.#emit({ type: "plan_revised", taskId, revision: revisions, stepSummaries: plan.steps.map(({ id, role }) => `${role}:${id}`.slice(0, 240)) });
     }
@@ -318,6 +499,11 @@ export class ComputerAgentCoordinator {
 
   #validatePlan(plan: ComputerPlan): void {
     if (!Array.isArray(plan.steps) || plan.steps.length === 0) throw new Error("Computer Plan requires at least one step");
+    if (!Array.isArray(plan.successConditions) || plan.successConditions.length === 0) throw new Error("Computer Plan requires at least one task success condition");
+    const stepPostconditions = plan.steps.flatMap((step) => step.postconditions.map((condition) => JSON.stringify(condition)));
+    if (plan.successConditions.some((condition) => !stepPostconditions.includes(JSON.stringify(condition)))) {
+      throw new Error("Every Computer Plan success condition must exactly match a step Postcondition");
+    }
     const ids = new Set(plan.steps.map(({ id }) => id));
     if (ids.size !== plan.steps.length) throw new Error("Computer Plan step IDs must be unique");
     for (const step of plan.steps) {
@@ -344,7 +530,10 @@ export class ComputerAgentCoordinator {
       if ("workerResult" in dispatched && Array.isArray(dispatched.hostExecutionRecords)) return { workerResult: projectComputerWorkerResult(dispatched.workerResult), hostExecutionRecords: structuredClone(dispatched.hostExecutionRecords) };
       return { workerResult: projectComputerWorkerResult(dispatched), hostExecutionRecords: [] };
     } catch (error) {
-      return { workerResult: projectComputerWorkerResult({ outcome: "failed", summary: error instanceof Error ? error.message : "Computer Worker failed" }), hostExecutionRecords: [] };
+      const failureCode = error && typeof error === "object" && COMPUTER_WORKER_FAILURE_CODES.includes((error as any).failureCode)
+        ? (error as any).failureCode as ComputerWorkerFailureCode
+        : "computer_worker_dispatch_failed";
+      return { workerResult: projectComputerWorkerResult({ outcome: "failed", summary: error instanceof Error ? error.message : "Computer Worker failed", failureCode }), hostExecutionRecords: [] };
     }
   }
 
@@ -371,13 +560,15 @@ export class ComputerAgentCoordinator {
     outcome: "blocked" | "failed" | "cancelled",
     summary: string,
     planRevisions: number,
-    _observation?: ComputerObservation,
+    verification: ComputerTaskResult["verification"] = { status: "not_verified", conditionResults: [] },
+    investigation?: ComputerTaskResult["investigation"],
   ): ComputerTaskResult {
     return {
       outcome,
       summary: outcome === "cancelled" ? "Computer Task cancelled" : outcome === "blocked" ? "Computer Task blocked" : "Computer Task failed",
-      verification: { status: "not_verified", conditionResults: [] },
+      verification,
       planRevisions,
+      ...(investigation ? { investigation } : {}),
     };
   }
 }

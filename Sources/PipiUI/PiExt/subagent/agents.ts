@@ -842,6 +842,12 @@ export function discoverAgentsFromRoots(roots: AgentDiscoveryRoots, scope: Agent
 	};
 }
 
+/** Load App-shipped definitions from one exact runtime resource directory. */
+export function discoverBundledAgentsFromDirectory(directory: string): AgentDiscoveryResult {
+	const loaded = loadAgentsFromDir(directory, "user", "bundled");
+	return { agents: loaded.agents, projectAgentsDir: null, diagnostics: loaded.diagnostics };
+}
+
 export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
 	return discoverAgentsFromRoots(
 		{

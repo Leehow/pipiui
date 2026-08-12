@@ -32,8 +32,17 @@ function hostHarness() {
     resolveAgent,
     mergeWorktree,
     discardWorktree,
+    hasLogSubscriber: (id: string) => logs.has(id),
     emitAgent: (event: AgentEvent) => agents?.(event),
     emitLog: (id: string, event: Extract<AgentEvent, { type: 'agent_log' }>) => logs.get(id)?.(event)
+  }
+}
+
+function expandTranscriptCards() {
+  for (let pass = 0; pass < 4; pass += 1) {
+    const collapsed = screen.queryAllByRole('button').filter(button => button.getAttribute('aria-expanded') === 'false' && button.closest('[data-activity-card]'))
+    if (!collapsed.length) break
+    collapsed.forEach(button => fireEvent.click(button))
   }
 }
 
@@ -53,7 +62,7 @@ describe('SubagentPanel', () => {
     await waitFor(() => expect(failedRow.querySelector('.agent-select')?.getAttribute('aria-pressed')).toBe('true'))
     expect(document.querySelector('.detail-agent-title b')?.textContent).toBe('Failed detail')
     expect(screen.getByText('inspect this failure')).toBeTruthy()
-    expect(screen.getByRole('button', { name: /failed-only result/ })).toBeTruthy()
+    expect(screen.getByText('failed-only result')).toBeTruthy()
     expect(screen.getByText('¥7.20 CNY')).toBeTruthy()
     expect(screen.getByText(/\$1\.00 USD/)).toBeTruthy()
     expect(screen.getAllByText(/61s/).length).toBeGreaterThan(0)
@@ -77,6 +86,128 @@ describe('SubagentPanel', () => {
     expect(await screen.findByText('还没有 subagent')).toBeTruthy()
     expect(screen.getByText('0 个')).toBeTruthy()
     expect(screen.queryByTestId('agent-row-any')).toBeNull()
+  })
+
+  it('shows only the selected session while restoring that session from the durable index', async () => {
+    const harness = hostHarness()
+    const ownerAgent = { agentId: 'electron-ui-acceptance', runId: 'r1', name: 'general-purpose', task: '验证 Electron UI', listSubtitle: 'bash {"command":"npm test"}', state: 'ok' as const, sessionId: 'owner-session', createdAt: 1 }
+    const listAgents = vi.fn(async (sessionId?: string) => sessionId === 'owner-session' ? [ownerAgent] : [])
+    harness.host.listAgents = listAgents
+    const view = render(<SubagentPanel host={harness.host} sessionId="selected-other" />)
+    expect(await screen.findByText('还没有 subagent')).toBeTruthy()
+    expect(screen.queryByTestId('agent-row-electron-ui-acceptance')).toBeNull()
+    expect(listAgents).toHaveBeenLastCalledWith('selected-other')
+
+    view.rerender(<SubagentPanel host={harness.host} sessionId="owner-session" />)
+    const row = await screen.findByTestId('agent-row-electron-ui-acceptance')
+    expect(row.querySelector('strong')?.textContent).toBe('general-purpose')
+    expect(row.textContent).not.toContain('electron-ui-acceptance')
+    expect(row.textContent).toContain('验证 Electron UI')
+    expect(row.textContent).not.toContain('通用')
+    expect(row.textContent).not.toContain('owner-session')
+    fireEvent.click(row.querySelector('.agent-select')!)
+    expect(document.querySelector('.agent-technical-details')?.textContent).toContain('通用')
+    expect(document.querySelector('.agent-technical-details')?.textContent).toContain('owner-session')
+    expect(listAgents).toHaveBeenLastCalledWith('owner-session')
+
+    view.rerender(<SubagentPanel host={harness.host} sessionId="another-current-session" />)
+    await waitFor(() => expect(screen.queryByTestId('agent-row-electron-ui-acceptance')).toBeNull())
+    expect(await screen.findByText('还没有 subagent')).toBeTruthy()
+    expect(screen.getByText('0 个')).toBeTruthy()
+    expect(listAgents).toHaveBeenLastCalledWith('another-current-session')
+  })
+
+  it('ignores a stale snapshot and streamed events from the previous session', async () => {
+    const harness = hostHarness()
+    let resolveOld!: (agents: AgentSummary[]) => void
+    const oldSnapshot = new Promise<AgentSummary[]>(resolve => { resolveOld = resolve })
+    harness.host.listAgents = vi.fn(async (sessionId?: string) => sessionId === 'old-session' ? oldSnapshot : [])
+    const view = render(<SubagentPanel host={harness.host} sessionId="old-session" />)
+
+    view.rerender(<SubagentPanel host={harness.host} sessionId="new-session" />)
+    expect(await screen.findByText('还没有 subagent')).toBeTruthy()
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'old-live', runId: 'old-run', name: 'explore', task: '旧会话任务', state: 'running', sessionId: 'old-session' } })
+    expect(screen.queryByTestId('agent-row-old-live')).toBeNull()
+
+    resolveOld([{ agentId: 'old-durable', runId: 'old-durable-run', name: 'reviewer', task: '旧快照', state: 'ok', sessionId: 'old-session' }])
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(screen.queryByTestId('agent-row-old-durable')).toBeNull()
+    expect(screen.getByText('0 个')).toBeTruthy()
+  })
+
+  it('localizes known task, activity, and profile labels while preserving raw tool details', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [
+      { agentId: 'fixture', runId: 'r1', name: 'builder', task: 'Build fixture', state: 'ok', createdAt: 1 },
+      { agentId: 'round-two', runId: 'r2', name: 'explore', task: 'same-task round 2', state: 'ok', createdAt: 2 },
+      { agentId: 'profile', runId: 'r3', name: 'general-purpose', task: 'profile-first-ok', state: 'ok', createdAt: 3 },
+      { agentId: 'leader', runId: 'r4', name: 'computer-use-leader', task: 'Computer Use Leader', state: 'ok', createdAt: 4 },
+      { agentId: 'tools', runId: 'r5', name: 'computer-terminal', task: 'terminal_file_status {"path":"/tmp/raw fixture.txt"}', state: 'running', createdAt: 5 }
+    ]
+    render(<SubagentPanel host={harness.host} />)
+
+    expect(await screen.findByText('构建测试夹具')).toBeTruthy()
+    expect(screen.getByText('同一任务第 2 轮')).toBeTruthy()
+    expect(screen.getByText('优先恢复配置验证成功')).toBeTruthy()
+    expect(screen.getByText('协调并核验桌面操作任务')).toBeTruthy()
+    expect(screen.getAllByText('执行受限终端步骤').length).toBeGreaterThan(0)
+    expect(screen.queryByText('构建')).toBeNull()
+    expect(screen.queryByText('探索')).toBeNull()
+
+    await waitFor(() => expect(harness.hasLogSubscriber('tools')).toBe(true))
+    harness.emitLog('tools', { type: 'agent_log', agentId: 'tools', itemType: 'tool', name: 'terminal_read_file', text: '{"path":"/tmp/raw fixture.txt","line_start":2}' })
+    expect(await screen.findByText('{"path":"/tmp/raw fixture.txt","line_start":2}')).toBeTruthy()
+  })
+
+  it('keeps the list compact and moves exact model, provider, profile, and session metadata into details', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [{
+      agentId: 'electron-ui-acceptance', runId: 'r1', name: 'reviewer', task: '验证中文列表', state: 'ok', createdAt: 1,
+      provider: 'jellytoken', model: 'volcengine/deepseek-v4-flash', sessionId: 'session-exact-123'
+    }]
+    render(<SubagentPanel host={harness.host} />)
+
+    const row = await screen.findByTestId('agent-row-electron-ui-acceptance')
+    expect(row.textContent).not.toContain('jellytoken')
+    expect(row.textContent).not.toContain('volcengine')
+    expect(row.textContent).not.toContain('deepseek-v4-flash')
+    expect(row.textContent).not.toContain('session-exact-123')
+    expect(row.textContent).not.toContain('审查')
+    expect(row.querySelector('[role="img"]')?.getAttribute('aria-label')).toBe('DeepSeek 模型')
+
+    fireEvent.click(row.querySelector('.agent-select')!)
+    const detail = document.querySelector('.agent-detail')!
+    expect(detail.textContent).toContain('jellytoken')
+    expect(detail.textContent).toContain('volcengine/deepseek-v4-flash')
+    expect(detail.textContent).toContain('session-exact-123')
+    expect(detail.textContent).toContain('审查')
+  })
+
+  it('keeps unknown free text unchanged and gives Chinese labels to common tools', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [
+      { agentId: 'memory', runId: 'r1', name: 'reviewer', task: 'memory_query {"query":"subagent reuse"}', state: 'ok', createdAt: 1 },
+      { agentId: 'shell', runId: 'r2', name: 'operator', task: 'bash {"command":"pwd"}', state: 'ok', createdAt: 2 },
+      { agentId: 'unknown', runId: 'r3', name: 'custom-profile', task: 'Investigate the unusual frobnicator', state: 'ok', createdAt: 3 }
+    ]
+    render(<SubagentPanel host={harness.host} />)
+
+    expect(await screen.findByText(/查询记忆/)).toBeTruthy()
+    expect(screen.getByText('运行命令 · pwd')).toBeTruthy()
+    expect(screen.getAllByText('Investigate the unusual frobnicator').length).toBeGreaterThan(0)
+    expect(screen.getByTestId('agent-row-shell').textContent).not.toContain('操作')
+    expect(screen.getByTestId('agent-row-unknown').querySelector('strong')?.textContent).toBe('custom-profile')
+  })
+
+  it('removes the internal isolation sentinel from details and logs', async () => {
+    const harness = hostHarness()
+    const leaked = '[PipiUI subagent isolation sentinel: skip\nThis sentinel is not a skill instruction; internal only.]'
+    harness.host.listAgents = async () => [{ agentId: 'safe', runId: 'r1', name: 'builder', task: `${leaked}\n用户任务`, state: 'ok', finalResult: `${leaked}\n完成`, createdAt: 1 }]
+    render(<SubagentPanel host={harness.host} />)
+    await screen.findByText('用户任务')
+    expect(document.body.textContent).not.toContain('isolation sentinel')
+    expect(document.querySelector('[data-testid="subagent-transcript"]')?.textContent).toContain('完成')
   })
 
   it('renders lifecycle counts and routes abort to the host', async () => {
@@ -111,16 +242,145 @@ describe('SubagentPanel', () => {
     })
     harness.emitAgent({ type: 'worktree', status: { agentId: 'done', lifecycle: 'merged', merge: 'merged', discard: 'unavailable' } })
 
-    await screen.findByText('secretary')
-    expect(screen.getByText('anthropic')).toBeTruthy()
-    expect(screen.getByText('claude-sonnet-4')).toBeTruthy()
-    expect(screen.getByText('收尾')).toBeTruthy()
+    const liveRow = await screen.findByTestId('agent-row-live')
+    expect(liveRow.textContent).not.toContain('anthropic')
+    expect(liveRow.textContent).not.toContain('claude-sonnet-4')
+    fireEvent.click(liveRow.querySelector('.agent-select')!)
+    expect(document.querySelector('.agent-detail')?.textContent).toContain('anthropic/claude-sonnet-4')
+    expect(document.querySelector('.agent-detail')?.textContent).toContain('收尾秘书')
     expect(screen.getByText('卡住 42s')).toBeTruthy()
     expect(screen.getByText('wt')).toBeTruthy()
     expect(screen.getByText('已合并')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('agent-row-done').querySelector('.agent-select')!)
     expect(screen.getByText('¥3.60 CNY')).toBeTruthy()
     expect(screen.getByText(/\$0\.55 USD/)).toBeTruthy()
     expect(screen.getByText(/×7\.20/)).toBeTruthy()
+  })
+
+  it('keeps a narrow detail pane readable and reveals exact metadata only after opening technical details', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [{
+      agentId: 'narrow', runId: 'r1', name: 'reviewer', title: '中文任务简介', task: 'RAW_PROMPT /tmp/exact path',
+      state: 'ok', createdAt: 1, endedAt: 2, provider: 'jellytoken', model: 'volcengine/deepseek-v4-flash',
+      sessionId: 'session-raw-exact', contextTokens: 120, inputTokens: 80, outputTokens: 40, cacheTokens: 20,
+      finalResult: '中文 TLDR：验证完成', worktree: { agentId: 'narrow', lifecycle: 'mergedCleanupPending', merge: 'unavailable', discard: 'unavailable', error: 'FULL_RAW_ERROR exact' }
+    }]
+    render(<SubagentPanel host={harness.host} />)
+
+    await screen.findByTestId('agent-row-narrow')
+    const detail = document.querySelector('.agent-detail') as HTMLElement
+    detail.style.width = '280px'
+    expect(detail.querySelector('[data-testid="subagent-transcript"]')?.textContent).toContain('中文 TLDR：验证完成')
+    const technical = detail.querySelector('.agent-technical-details') as HTMLDetailsElement
+    expect(technical.open).toBe(false)
+    expect(detail.querySelector('.agent-detail-header')?.textContent).not.toMatch(/jellytoken|deepseek|session-raw|ctx|cache|RAW_PROMPT|FULL_RAW_ERROR/)
+
+    fireEvent.click(screen.getByText('技术详情'))
+    expect(technical.open).toBe(true)
+    expect(technical.textContent).toContain('jellytoken')
+    expect(technical.textContent).toContain('volcengine/deepseek-v4-flash')
+    expect(technical.textContent).toContain('session-raw-exact')
+    expect(technical.textContent).toContain('RAW_PROMPT /tmp/exact path')
+    expect(technical.textContent).toContain('FULL_RAW_ERROR exact')
+    expect(technical.textContent).toMatch(/ctx 120|in 80|out 40|cache 20/)
+  })
+
+  it('matches the Swift hierarchy while rendering detail through the shared assistant transcript', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [{
+      agentId: 'fa0238aa', runId: 'r1', name: 'computer-use-leader', task: 'Computer Use Leader {"goal":"raw english goal"}',
+      title: '整理桌面交付结果', state: 'ok', createdAt: 1, endedAt: 2, finalResult: '中文最终结论',
+      provider: 'openai', model: 'openai/gpt-5', sessionId: 'session-exact'
+    }]
+    render(<SubagentPanel host={harness.host} />)
+    const row = await screen.findByTestId('agent-row-fa0238aa')
+    expect(row.querySelector('strong')?.textContent).toBe('computer-use-leader')
+    expect(row.textContent).toContain('整理桌面交付结果')
+    expect(row.textContent).not.toContain('fa0238aa')
+    expect(row.textContent).not.toContain('raw english goal')
+    const icon = row.querySelector('[role="img"], img') as HTMLElement
+    expect(icon.getAttribute('aria-label') || icon.getAttribute('alt')).toBeTruthy()
+    expect(icon.textContent).not.toBe('◇')
+
+    const detail = document.querySelector('.agent-detail')!
+    const transcript = detail.querySelector('[data-testid="subagent-transcript"]')!
+    const technical = detail.querySelector('.agent-technical-details')!
+    expect(transcript.querySelector('[data-testid="assistant-transcript-content"]')).toBeTruthy()
+    expect(technical.parentElement).toBe(detail.querySelector('[data-testid="subagent-transcript-scroll"]'))
+    expect(transcript.textContent).toContain('中文最终结论')
+    expect(technical.textContent).not.toContain('中文最终结论')
+    expect(row.textContent).not.toContain('session-exact')
+    fireEvent.click(screen.getByText('技术详情'))
+    expect(technical.textContent).toContain('fa0238aa')
+    expect(technical.textContent).toContain('session-exact')
+  })
+
+  it('hides generated agent ids, uses real provider marks, localizes the desktop leader, and fills TLDR from the latest result', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [
+      {
+        agentId: 'agent-695e75d00abc', runId: 'r1', name: 'computer-terminal',
+        task: 'Run a restricted terminal step', state: 'ok', createdAt: 1,
+        provider: 'jellytoken', model: 'volcengine/deepseek-v4-flash'
+      },
+      {
+        agentId: 'agent-13cbc1234def', runId: 'r2', parentId: 'agent-695e75d00abc', name: 'computer-use-leader',
+        task: 'Give the main agent a detailed summary of the computer use work', state: 'ok', createdAt: 2,
+        provider: 'openai', model: 'openai/gpt-5'
+      },
+      {
+        agentId: 'agent-images', runId: 'r3', name: 'subagent', task: 'subagent', state: 'interrupted', createdAt: 3,
+        provider: 'google', model: 'google/gemini-2.5-pro', finalResult: '已整理图片并返回可用结果'
+      }
+    ]
+    render(<SubagentPanel host={harness.host} />)
+
+    const terminal = await screen.findByTestId('agent-row-agent-695e75d00abc')
+    const leader = screen.getByTestId('agent-row-agent-13cbc1234def')
+    expect(terminal.querySelector('strong')?.textContent).toBe('computer-terminal')
+    expect(leader.querySelector('strong')?.textContent).toBe('computer-use-leader')
+    expect(terminal.textContent).not.toContain('agent-695e75d')
+    expect(leader.textContent).not.toContain('agent-13cbc')
+    expect(leader.textContent).toContain('协调并核验桌面操作任务')
+    expect(leader.textContent).not.toContain('Give the main agent')
+
+    const icon = terminal.querySelector('[role="img"]')!
+    expect(icon.getAttribute('aria-label')).toBe('DeepSeek 模型')
+    expect(icon.querySelector('[data-testid="provider-logo-deepseek"]')).toBeTruthy()
+    expect(icon.textContent).not.toMatch(/^[DGA]$/)
+
+    fireEvent.click(screen.getByTestId('agent-row-agent-images').querySelector('.agent-select')!)
+    expect(document.querySelector('.detail-agent-title b')?.textContent).toContain('已整理图片并返回可用结果')
+    expect(document.querySelector('[data-testid="subagent-transcript"]')?.textContent).toContain('已整理图片并返回可用结果')
+    expect(document.querySelector('.agent-detail-header')?.textContent).not.toContain('subagent')
+  })
+
+  it('uses a compact independently scrolling list/detail split and represents the full long history with standard folding', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'long-log', runId: 'r1', name: 'explore', task: '检查日志', state: 'running' } })
+    await screen.findByTestId('agent-row-long-log')
+    await waitFor(() => expect(harness.hasLogSubscriber('long-log')).toBe(true))
+    const raw = `LONG_RAW_JSON ${JSON.stringify({ tool: 'memory_query', path: '/tmp/exact raw path', payload: 'x'.repeat(500) })}`
+    harness.emitLog('long-log', { type: 'agent_log', agentId: 'long-log', itemType: 'thinking', text: 'FULL_THINKING_PROCESS' })
+    harness.emitLog('long-log', { type: 'agent_log', agentId: 'long-log', itemType: 'tool', name: 'memory_query', text: '{"query":"exact"}' })
+    harness.emitLog('long-log', { type: 'agent_log', agentId: 'long-log', itemType: 'toolResult', text: 'TOOL_RESULT_EXACT' })
+    harness.emitLog('long-log', { type: 'agent_log', agentId: 'long-log', itemType: 'text', text: raw })
+    const list = document.querySelector('.agent-list') as HTMLElement
+    const scroll = screen.getByTestId('subagent-transcript-scroll')
+    expect(list.dataset.density).toBe('compact')
+    expect(list).not.toBe(scroll)
+    expect(scroll.classList.contains('agent-transcript-scroll')).toBe(true)
+    await waitFor(() => expect(screen.getAllByTestId('assistant-transcript-content')).toHaveLength(1))
+    expect(screen.getByText(/LONG_RAW_JSON/)).toBeTruthy()
+    expect(screen.queryByText('FULL_THINKING_PROCESS')).toBeNull()
+    // Tool cards are expanded by default (expandSteps); tool results are visible.
+    expect(screen.getByText('TOOL_RESULT_EXACT')).toBeTruthy()
+    expandTranscriptCards()
+    expect(await screen.findByText('FULL_THINKING_PROCESS')).toBeTruthy()
+    scroll.scrollTop = 120
+    fireEvent.scroll(scroll)
+    expect(scroll.scrollTop).toBe(120)
   })
 
   it('loads the snapshot tree and routes review worktree actions', async () => {
@@ -147,7 +407,7 @@ describe('SubagentPanel', () => {
       { agentId: 'root', runId: 'r1', name: 'builder', task: 'build', state: 'failed', createdAt: 1 }
     ]
     render(<SubagentPanel host={harness.host} />)
-    await screen.findByText('builder')
+    await screen.findByTestId('agent-row-root')
     harness.emitAgent({ type: 'worktree', status: { agentId: 'root', lifecycle: 'pendingReview', merge: 'ready', discard: 'ready' } })
     expect(screen.queryByText('合并到主分支')).toBeNull()
     expect(screen.queryByText('丢弃 worktree')).toBeNull()
@@ -161,53 +421,86 @@ describe('SubagentPanel', () => {
       type: 'agent',
       agent: { agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running', finalResult: '最终输出内容' }
     })
-    await screen.findByText('explore')
+    await screen.findByTestId('agent-row-run')
+    await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'thinking', text: hiddenThought })
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'edit', text: '{"path":"Electron/packages/ui/src/SubagentPanel.tsx"}' })
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'toolResult', text: 'diff --git a/demo.ts b/demo.ts\n--- a/demo.ts\n+++ b/demo.ts\n@@ -1 +1 @@\n-old\n+new' })
 
-    const thinking = await screen.findByRole('button', { name: /Thinking/ })
-    expect(thinking.closest('[data-activity-card="thinking"]')).toBeTruthy()
+    // Unified step card (thinking + edit combined), expanded by default (expandSteps).
+    await screen.findByRole('button', { name: /个步骤/ })
     expect(screen.queryByText(/EXPANDED_THINKING_BODY/)).toBeNull()
+    // Thinking card is collapsed inside the expanded step card.
+    const thinking = await screen.findByRole('button', { name: /^Thinking/ })
+    expect(thinking.closest('[data-activity-card="thinking"]')).toBeTruthy()
     fireEvent.click(thinking)
     await screen.findByText(/EXPANDED_THINKING_BODY/)
-    expect(document.querySelector('[data-activity-card="tool"]')).toBeTruthy()
-    expect(document.querySelector('[data-activity-card="diff"]')).toBeTruthy()
-    expect(document.querySelector('[data-activity-card="final"]')).toBeTruthy()
+    // Tool card is collapsed; expand to see the diff.
+    const tool = await screen.findByRole('button', { name: /^edit/ })
+    expect(tool.closest('[data-activity-card="tool"]')).toBeTruthy()
+    if (tool.getAttribute('aria-expanded') === 'false') fireEvent.click(tool)
+    expect(screen.getByText(/diff --git a\/demo.ts/)).toBeTruthy()
+    expect(document.querySelector('[data-activity-card="final"]')).toBeNull()
   })
 
   it('upserts streamed log_delta snapshots into one row per contentIndex', async () => {
     const harness = hostHarness()
     render(<SubagentPanel host={harness.host} />)
     harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running' } })
-    await screen.findByText('explore')
+    await screen.findByTestId('agent-row-run')
+    await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
 
     // Three cumulative snapshots of the same contentIndex must collapse into one row.
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: '{"step":', contentIndex: 0 })
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: '{"step": 1', contentIndex: 0 })
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: '{"step": 1}', contentIndex: 0 })
-    const rows = await screen.findAllByText('{"step": 1}')
+    const structuredGroup = await screen.findByRole('button', { name: /1 个步骤 · 结构化结果/ })
+    expect(structuredGroup.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByText(/"step": 1/)).toBeNull()
+    fireEvent.click(structuredGroup)
+    const structuredCard = screen.getByRole('button', { name: /^结构化结果/ })
+    expect(structuredCard.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(structuredCard)
+    const rows = await screen.findAllByText(/"step": 1/)
     expect(rows).toHaveLength(1)
     expect(screen.queryByText('{"step":')).toBeNull()
     expect(screen.queryByText('{"step": 1')).toBeNull()
 
     // A different contentIndex opens a second row.
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'thinking', text: 'plan', contentIndex: 1 })
+    expandTranscriptCards()
     await screen.findByText('plan')
-    expect(screen.getByText('{"step": 1}')).toBeTruthy()
+    expect(screen.getByText(/"step": 1/)).toBeTruthy()
 
     // No contentIndex (legacy host / terminal log batch): plain append.
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'toolResult', text: 'done' })
-    await screen.findByText('done')
-    expect(screen.getByText('{"step": 1}')).toBeTruthy()
-    expect(screen.getByText('plan')).toBeTruthy()
+    expect(screen.queryByText('done')).toBeNull()
+
+    // Completed tool results use the same two-level fold as the main transcript.
+    const resultGroup = await screen.findByRole('button', { name: /1 个步骤 · 工具结果/ })
+    expect(resultGroup.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(resultGroup)
+    const resultCard = screen.getByRole('button', { name: /^工具结果/ })
+    expect(resultCard.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(resultCard)
+    expect(await screen.findByText('done')).toBeTruthy()
+
+    // Adding a later log changes the earlier thinking message from live to
+    // completed, so reopen that completed card before asserting its body.
+    const thinkingGroup = screen.getByRole('button', { name: /1 个步骤 · Thinking/ })
+    if (thinkingGroup.getAttribute('aria-expanded') === 'false') fireEvent.click(thinkingGroup)
+    const thinkingCard = screen.getByRole('button', { name: /^Thinking/ })
+    if (thinkingCard.getAttribute('aria-expanded') === 'false') fireEvent.click(thinkingCard)
+    expect(screen.getByText(/"step": 1/)).toBeTruthy()
+    expect(await screen.findByText('plan')).toBeTruthy()
   })
 
   it('applies the prefix-replace fallback for hosts without contentIndex', async () => {
     const harness = hostHarness()
     render(<SubagentPanel host={harness.host} />)
     harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running' } })
-    await screen.findByText('explore')
+    await screen.findByTestId('agent-row-run')
+    await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
 
     // Cumulative no-index snapshot extending the previous row replaces it…
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: 'first' })
@@ -225,7 +518,8 @@ describe('SubagentPanel', () => {
     const harness = hostHarness()
     render(<SubagentPanel host={harness.host} />)
     harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running' } })
-    await screen.findByText('explore')
+    await screen.findByTestId('agent-row-run')
+    await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: 'run one', contentIndex: 0 })
     await screen.findByText('run one')
 
@@ -244,7 +538,7 @@ describe('SubagentPanel', () => {
     }))
     harness.host.listAgents = async () => snapshot
     const first = render(<SubagentPanel host={harness.host} />)
-    await screen.findByText('agent-30')
+    await screen.findByTestId('agent-row-agent-30')
     expect(screen.queryByTestId('agent-row-agent-0')).toBeNull()
     expect(screen.getByText('最新第 1/2 页')).toBeTruthy()
 
@@ -265,7 +559,7 @@ describe('SubagentPanel', () => {
 
     first.unmount()
     render(<SubagentPanel host={harness.host} />)
-    await screen.findByText('agent-30')
+    await screen.findByTestId('agent-row-agent-30')
     expect((document.querySelector('.subagent-split') as HTMLElement).style.gridTemplateRows).toContain(`${savedRatio}fr`)
   })
 

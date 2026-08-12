@@ -175,6 +175,30 @@ describe('SessionStatsPill', () => {
     expect((await screen.findByTestId('stats-pill')).textContent).toBe('5k/272k')
   })
 
+  it('reuses a session-scoped cached snapshot immediately while refreshing it in the background', async () => {
+    const snapshots: Record<string, SessionStats> = {
+      a: { ...sampleStats, sessionId: 'a', contextUsage: { tokens: 11_000, contextWindow: 272_000, percent: 4 } },
+      b: { ...sampleStats, sessionId: 'b', contextUsage: { tokens: 22_000, contextWindow: 272_000, percent: 8 } }
+    }
+    let holdA = false
+    const getSessionStats = vi.fn((sessionId?: string) => {
+      if (sessionId === 'a' && holdA) return new Promise<SessionStats>(() => undefined)
+      return Promise.resolve(snapshots[sessionId ?? 'a'])
+    })
+    const host = { protocolVersion: 2, getSessionStats, subscribeSessionStats: () => () => undefined } as unknown as PipiHostAPI
+    const { rerender } = render(<SessionStatsPill host={host} sessionId="a" />)
+    expect((await screen.findByTestId('stats-pill')).textContent).toBe('11k/272k')
+    rerender(<SessionStatsPill host={host} sessionId="b" />)
+    expect((await screen.findByTestId('stats-pill')).textContent).toBe('22k/272k')
+
+    holdA = true
+    rerender(<SessionStatsPill host={host} sessionId="a" />)
+
+    // No loading ellipsis and no b-session leakage while the new fetch hangs.
+    expect(screen.queryByTestId('stats-loading')).toBeNull()
+    expect(screen.getByTestId('stats-pill').textContent).toBe('11k/272k')
+  })
+
   it('does not substitute cumulative session tokens for absent context usage', async () => {
     const noContext: SessionStats = { sessionId: 's1', tokens: { input: 12_000, output: 3_400, cacheRead: 8_900, cacheWrite: 2_100, total: 26_400 }, cost: 0.0312 }
     const { host } = statsHost({ snapshots: { s1: noContext } })

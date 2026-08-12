@@ -35,7 +35,7 @@ describe('demo tool-burst session: consecutive tool rounds coalesce into one car
     expect(outer.getAttribute('aria-expanded')).toBe('true')
     // Expanded detail: all 7 tool calls render as collapsed sub-cards.
     expect(container.querySelectorAll('.activity-card-tool .activity-summary')).toHaveLength(7)
-    const bashCards = [...container.querySelectorAll('.activity-card-tool .activity-summary')].filter(button => button.textContent?.includes('bash ·'))
+    const bashCards = [...container.querySelectorAll('.activity-card-tool .activity-summary')].filter(button => button.textContent?.includes('bash') && !button.textContent?.includes('browser'))
     expect(bashCards).toHaveLength(6)
     expect(screen.getByRole('button', { name: /browser · navigate http:\/\/localhost:5176/ })).toBeTruthy()
   })

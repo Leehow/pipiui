@@ -41,6 +41,8 @@ type BrowserSpaceEvent = { type: 'tabs'; snapshot: BrowserTabsSnapshot } | { typ
 export interface BrowserViewNativeHostLike {
   contentView: { addChildView(view: BrowserViewLike): void; removeChildView(view: BrowserViewLike): void }
   hide?(): void
+  setOpacity?(opacity: number): void
+  setIgnoreMouseEvents?(ignore: boolean): void
   showInactive?(): void
 }
 
@@ -56,6 +58,14 @@ export function routeBrowserView(
     mainHost.contentView.addChildView(view)
   } else {
     hiddenHost.contentView.addChildView(view)
+    // macOS may constrain an off-screen native window back onto a visible
+    // display. Keep this rendering host transparent before it is shown so the
+    // real Chromium viewport cannot leak out as a white utility window.
+    hiddenHost.setOpacity?.(0)
+    // A fully transparent native window still participates in macOS hit
+    // testing. If the OS constrains this off-screen host onto a display, it
+    // must never intercept the renderer's tool-rail pointer events.
+    hiddenHost.setIgnoreMouseEvents?.(true)
     hiddenHost.showInactive?.()
   }
 }

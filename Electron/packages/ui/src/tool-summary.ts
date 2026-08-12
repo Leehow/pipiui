@@ -99,7 +99,7 @@ function legacySummary(args: Record<string, unknown>): string {
   if (command) return truncate(command)
   return stringField(args, 'path')
     ?? stringField(args, 'file_path')
-    ?? truncate(JSON.stringify(args))
+    ?? '…'
 }
 
 function truncate(text: string): string {
@@ -214,7 +214,72 @@ export function toolArgsSummary(name: string, raw: string): string {
   if (name === 'grep') return grepScrapedSummary(trimmed)
   const scraped = scrapeFields(name, trimmed)
   if (scraped) return scraped
-  // Already a plain summary, or truncated non-JSON — never echo huge brace dumps.
-  if (trimmed.includes('{') && trimmed.length > MAX_LONG) return `${trimmed.slice(0, MAX_LONG)}…`
+  // A JSON-looking payload belongs in expanded details, never in the visible header.
+  if (trimmed.includes('{') || trimmed.includes('[')) return '…'
   return trimmed
+}
+
+/** Runtime activity is commonly `toolName {args}`. Match Swift by showing the
+ * meaningful argument, while leaving the raw payload to the expanded card. */
+export function toolActivitySummary(activity: string): string {
+  const trimmed = activity.trim()
+  if (!trimmed) return ''
+  const split = trimmed.indexOf(' ')
+  if (split < 0) return truncate(trimmed)
+  const name = trimmed.slice(0, split)
+  const raw = trimmed.slice(split + 1).trim()
+  if (!raw.startsWith('{')) return truncate(trimmed)
+  const summary = toolArgsSummary(name, raw)
+  return summary === '…' ? name : `${name} · ${summary}`
+}
+
+/** Extract the `command` field from a bash/shell tool-args payload (JSON or
+ *  truncated scrape). Returns undefined when no command is present. */
+function bashCommand(raw: string): string | undefined {
+  const trimmed = raw.trim()
+  if (!trimmed) return undefined
+  try {
+    const parsed = JSON.parse(trimmed)
+    if (isRecord(parsed) && typeof parsed.command === 'string') return parsed.command
+  } catch { /* fall through to scrape */ }
+  return scrapeJSONString('command', trimmed)
+}
+
+/**
+ * Collapsed-header display name for a tool call. For bash/shell, leads with
+ * `bash <first-command-word>` (e.g. `bash grep`, `bash ls`) so the user can
+ * tell at a glance what the command does. Other tools keep the existing
+ * `name · summary` pattern.
+ */
+export function toolDisplaySummary(name: string, raw: string): string {
+  if (name === 'bash' || name === 'shell') {
+    const command = bashCommand(raw)
+    if (command) {
+      const firstWord = command.trim().split(/\s+/)[0]
+      if (firstWord) return `${name} ${firstWord}`
+    }
+    return name
+  }
+  const argsSummary = toolArgsSummary(name, raw)
+  return argsSummary !== '…' ? `${name} · ${argsSummary}` : name
+}
+
+/**
+ * Human-readable tool input for the expanded card. For bash/shell, renders the
+ * command directly as `$ <command>` instead of raw JSON. Other tools are
+ * pretty-printed as 2-space-indented JSON; partial/streaming input falls back
+ * to the raw string.
+ */
+export function formatToolInput(name: string, raw: string): string {
+  const trimmed = raw.trim()
+  if (!trimmed) return ''
+  if (name === 'bash' || name === 'shell') {
+    const command = bashCommand(raw)
+    if (command) return `$ ${command}`
+  }
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2)
+  } catch {
+    return trimmed
+  }
 }

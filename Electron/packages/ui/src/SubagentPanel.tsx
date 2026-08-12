@@ -1,8 +1,12 @@
-import { useCallback, useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { Diff, Hunk, parseDiff } from 'react-diff-view'
 import { ActivityCard } from './ActivityCard'
-import { toolArgsSummary } from './tool-summary'
+import { toolActivitySummary, toolArgsSummary } from './tool-summary'
 import { DismissibleError } from './DismissibleError'
+import { ProviderLogo } from './ProviderLogo'
+import { providerBrand, type ProviderBrand } from './provider-logo'
+import { AssistantTranscriptContent, type AssistantTranscriptMessage } from './AssistantTranscriptContent'
+import genericAgentIcon from './sf-icons/person-2.png'
 import type { AgentEvent, AgentState, AgentSummary, CostUnit, PipiHostAPI, WorktreeStatus } from '@pipi/host-api'
 
 type Log = {
@@ -85,6 +89,73 @@ function preview(value: string, fallback = '无内容') {
   return compact ? `${compact.slice(0, 72)}${compact.length > 72 ? '…' : ''}` : fallback
 }
 
+const profileNames: Record<string, string> = {
+  builder: '构建',
+  explore: '探索',
+  'general-purpose': '通用',
+  reviewer: '审查',
+  review: '审查',
+  plan: '规划',
+  secretary: '收尾秘书',
+  'long-test': '长时测试',
+  'computer-use-leader': '电脑操作主管',
+  'computer-terminal': '终端操作',
+  'computer-verifier': '操作验证',
+  operator: '操作'
+}
+
+const toolNames: Record<string, string> = {
+  terminal_file_status: '查看文件状态',
+  terminal_read_file: '读取文件',
+  memory_query: '查询记忆',
+  bash: '运行命令',
+  pwd: '查看工作目录'
+}
+
+export function localizedProfileName(name: string): string {
+  return profileNames[name.trim().toLowerCase()] ?? name
+}
+
+function knownTaskSummary(text: string): string | undefined {
+  const compact = text.replace(/\s+/g, ' ').trim()
+  if (!compact) return undefined
+  if (/^build fixture[.!]?$/i.test(compact)) return '构建测试夹具'
+  const sameTask = compact.match(/^same-task round (\d+)[.!]?$/i)
+  if (sameTask) return `同一任务第 ${sameTask[1]} 轮`
+  if (/^profile-first-ok[.!]?$/i.test(compact)) return '优先恢复配置验证成功'
+  if (/^profile-second-ok[.!]?$/i.test(compact)) return '第二轮配置恢复成功'
+  if (/^computer use leader[.!]?$/i.test(compact)) return '电脑操作主管'
+  return undefined
+}
+
+function containsChinese(text: string): boolean {
+  return /[\u3400-\u9fff]/.test(text)
+}
+
+/** Deterministic display-only localization. Unknown prose stays untouched. */
+export function localizedTaskSummary(text: string): string {
+  const clean = visibleAgentText(text)
+  const direct = knownTaskSummary(clean)
+  if (direct) return direct
+  const activity = clean.match(/^([A-Za-z0-9_-]+)(?:\s+([\s\S]*))?$/)
+  if (activity && toolNames[activity[1]]) {
+    const args = activity[2]?.trim()
+    const detail = args ? toolActivitySummary(`${activity[1]} ${args}`).replace(new RegExp(`^${activity[1]}(?:\\s*·?\\s*)?`), '') : ''
+    return detail && detail !== '…' ? `${toolNames[activity[1]]} · ${detail}` : toolNames[activity[1]]
+  }
+  return clean
+}
+
+function agentListSubtitle(agent: Agent): string {
+  // A Boss-authored Chinese title/task is more useful than a later structured activity.
+  const bossText = [agent.title, agent.task].find(value => value && containsChinese(value))
+  if (!bossText && (agent.name === 'computer-use-leader' || agent.role === 'computer-use-leader')) return '协调并核验桌面操作任务'
+  if (!bossText && agent.name === 'computer-terminal') return '执行受限终端步骤'
+  if (!bossText && agent.name === 'computer-verifier') return '核验桌面操作结果'
+  const source = bossText || agent.title || agent.task || agent.listSubtitle || 'subagent'
+  return localizedTaskSummary(source)
+}
+
 function providerLabel(agent: Agent) {
   return agent.provider || agent.model?.split('/')[0] || 'pi'
 }
@@ -93,6 +164,76 @@ function modelLabel(agent: Agent) {
   const model = agent.model?.trim()
   if (!model) return ''
   return model.includes('/') ? model.slice(model.lastIndexOf('/') + 1) : model
+}
+
+const modelFamilyNames: Partial<Record<ProviderBrand, string>> = {
+  anthropic: 'Claude', deepseek: 'DeepSeek', google: 'Gemini', openai: 'GPT', codex: 'Codex',
+  xai: 'Grok', kimi: 'Kimi', qwen: 'Qwen', zhipu: 'GLM', mistral: 'Mistral', meta: 'Llama'
+}
+
+function modelFamily(agent: Agent) {
+  const brand = providerBrand(agent.provider ?? '', agent.model)
+  return { brand, family: modelFamilyNames[brand] ?? (brand === 'unknown' ? '通用' : brand) }
+}
+
+function ModelFamilyIcon({ agent }: { agent: Agent }) {
+  const icon = modelFamily(agent)
+  return icon.brand === 'unknown'
+    ? <img className="agent-model-icon generic" src={genericAgentIcon} alt="通用 agent" />
+    : <span className="agent-model-icon" role="img" aria-label={`${icon.family} 模型`}><ProviderLogo provider={agent.provider ?? ''} modelId={agent.model} size={18} /></span>
+}
+
+export function agentDisplayName(agent: Pick<Agent, 'agentId' | 'name' | 'role'>): string {
+  return agent.name || agent.role || 'subagent'
+}
+
+function latestReadableResult(agent: Agent): string {
+  const finalResult = visibleAgentText(agent.finalResult ?? '').trim()
+  if (finalResult) return finalResult
+  // A tool result is execution detail, not an assistant conclusion. Promoting it
+  // into prose is what exposed raw JSON twice: once as a tool and again as TLDR.
+  const latest = [...agent.logs].reverse().find(log => log.itemType === 'text')
+  return visibleAgentText(latest?.text ?? '').trim()
+}
+
+function detailTaskTitle(agent: Agent, result: string): string {
+  const task = agentListSubtitle(agent).trim()
+  if (task && !/^(?:subagent|agent|task)$/i.test(task)) return task
+  if (result) return preview(localizedTaskSummary(result), '任务结果')
+  const identity = agentDisplayName(agent)
+  return identity === 'subagent' ? '子任务' : identity
+}
+
+function agentTranscript(agent: Agent, finalResult: string): AssistantTranscriptMessage[] {
+  // Build ONE unified message — exactly like the main agent transcript — so the
+  // subagent detail reuses AssistantTranscriptContent verbatim: one "N 个步骤"
+  // card containing all thinking + tools, followed by the text content.
+  const thinkingParts: string[] = []
+  const tools: TranscriptTool[] = []
+  const contentParts: string[] = []
+  for (let index = 0; index < agent.logs.length; index += 1) {
+    const log = agent.logs[index]
+    const text = visibleAgentText(log.text)
+    if (log.itemType === 'thinking') {
+      if (text) thinkingParts.push(text)
+    } else if (log.itemType === 'tool') {
+      const result = agent.logs[index + 1]?.itemType === 'toolResult' ? agent.logs[++index] : undefined
+      tools.push({ id: `subagent-tool-${log.id}`, name: log.name ?? 'tool', input: log.text, result: result ? visibleAgentText(result.text) : undefined, error: result?.isError, startedAt: agent.startedAt, finished: Boolean(result) || !isActive(agent) })
+    } else if (text) {
+      contentParts.push(text)
+    }
+  }
+  const content = contentParts.join('\n\n')
+  const messages: AssistantTranscriptMessage[] = []
+  const hasSteps = thinkingParts.length > 0 || tools.length > 0
+  if (hasSteps || content) {
+    messages.push({ content, thinking: thinkingParts.length > 0 ? thinkingParts.join('\n') : undefined, tools: tools.length > 0 ? tools : undefined, streaming: isActive(agent) })
+  }
+  if (finalResult && finalResult.trim() && !content.includes(finalResult.trim())) {
+    messages.push({ content: finalResult })
+  }
+  if (!messages.length && !isActive(agent)) messages.push({ content: agent.state === 'ok' ? '任务已完成' : agent.state === 'failed' ? '任务失败。请查看技术详情中的完整错误。' : `任务${stateText(agent)}，尚无返回内容。` })
+  return messages
 }
 
 function worktreeBadge(status: WorktreeStatus | undefined, active: boolean) {
@@ -146,30 +287,48 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [now, setNow] = useState(() => Date.now())
+  const loadGeneration = useRef(0)
   const selected = agents.find(agent => agent.agentId === selectedId)
 
   // Extracted so the full-page load-error state can retry the same loader.
   const load = useCallback(async () => {
+    const generation = ++loadGeneration.current
     setLoading(true)
     setLoadError('')
     try {
+      // The durable host index survives restarts, but the visible tree belongs to the
+      // selected chat. Replacing (rather than accumulating) the snapshot keeps agents
+      // from another session out of the panel.
       const snapshot = await host.listAgents(sessionId)
+      if (generation !== loadGeneration.current) return
+      // The session-change effect already cleared the previous chat. Merge the
+      // snapshot into any events that arrived while this request was in flight,
+      // otherwise a fast START can be erased by a slower empty snapshot.
       setAgents(current => snapshot.reduce((next, agent) => applyAgentEvent(next, { type: 'agent', agent }), current))
     } catch (error) {
+      if (generation !== loadGeneration.current) return
       setLoadError(error instanceof Error ? error.message : '无法加载 subagents')
     } finally {
-      setLoading(false)
+      if (generation === loadGeneration.current) setLoading(false)
     }
   }, [host, sessionId])
 
   useEffect(() => {
-    // A session switch is a different agent tree, not more of the same one.
+    // Clear the old chat synchronously before its replacement snapshot arrives. The
+    // generation guard also prevents a slow response for the previous chat from
+    // repopulating the panel after a rapid switch.
+    loadGeneration.current += 1
     setAgents([])
     setSelectedId(undefined)
     setPage(0)
     void load()
-    const off = host.subscribeAgents(event => setAgents(current => sessionScopedEvent(current, event, sessionId) ? applyAgentEvent(current, event) : current))
-    return off
+    const off = host.subscribeAgents(event => setAgents(current => sessionScopedEvent(current, event, sessionId)
+      ? applyAgentEvent(current, event)
+      : current))
+    return () => {
+      loadGeneration.current += 1
+      off()
+    }
   }, [host, load, sessionId])
 
   useEffect(() => {
@@ -260,14 +419,12 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
         : !agents.length
           ? <div className="subagent-empty"><b>♙</b><strong>还没有 subagent</strong><p>让 pi 用 subagent 工具委派任务后，这里会实时显示 agent 树。</p></div>
           : <div className="subagent-split" style={{ gridTemplateRows: `${ratio}fr 6px ${1 - ratio}fr` }}>
-            <div className="agent-list" onScroll={event => setFollow(event.currentTarget.scrollHeight - event.currentTarget.scrollTop - event.currentTarget.clientHeight < 24)}>
+            <div className="agent-list compact" data-density="compact" onScroll={event => setFollow(event.currentTarget.scrollHeight - event.currentTarget.scrollTop - event.currentTarget.clientHeight < 24)}>
               {visible.map(agent => <AgentRow
                 key={agent.agentId}
                 agent={agent}
 				childCount={agents.filter(candidate => candidate.parentId === agent.agentId).length}
                 selected={agent.agentId === selectedId}
-                now={now}
-                pricing={pricing}
                 onSelect={() => setSelectedId(agent.agentId)}
                 onAbort={() => void host.abortAgent(agent.agentId)}
                 onResolve={() => void host.resolveAgent(agent.agentId).then(() => setAgents(current => current.map(item => item.agentId === agent.agentId ? { ...item, handled: true } : item)))}
@@ -279,7 +436,7 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
               </div>}
             </div>
             <div className="subagent-divider" aria-label="调整 agent 列表高度" role="separator" onPointerDown={startDrag} />
-            <AgentDetail agent={selected} now={now} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onCheck={check} onWorktree={worktree} />
+            <AgentDetail agent={selected} now={now} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onCheck={check} onWorktree={worktree} onAbort={agentId => void host.abortAgent(agentId)} />
           </div>}
   </section>
 }
@@ -293,7 +450,10 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
  */
 function sessionScopedEvent(current: Agent[], event: AgentEvent, sessionId?: string): boolean {
   if (!sessionId) return true
-  if (event.type === 'agent') return !event.agent.sessionId || event.agent.sessionId === sessionId
+  if (event.type === 'agent') {
+    if (event.agent.sessionId) return event.agent.sessionId === sessionId
+    return current.some(agent => agent.agentId === event.agent.agentId)
+  }
   const agentId = event.type === 'worktree' ? event.status.agentId : event.agentId
   return current.some(agent => agent.agentId === agentId)
 }
@@ -382,45 +542,36 @@ function SubagentHeader({ total, running, failed, handled, cost, pricing, onClea
   </header>
 }
 
-function AgentRow({ agent, childCount, selected, now, pricing, onSelect, onAbort, onResolve }: {
+function AgentRow({ agent, childCount, selected, onSelect, onAbort, onResolve }: {
   agent: Agent
 	childCount: number
   selected: boolean
-  now: number
-  pricing: Pricing
   onSelect: () => void
   onAbort: () => void
   onResolve: () => void
 }) {
   const active = isActive(agent)
   const worktree = worktreeBadge(agent.worktree, active)
-  const subtitle = agent.listSubtitle || agent.title || agent.task || 'subagent'
+  const subtitle = agentListSubtitle(agent)
   const handled = !active && !agent.handled && ['failed', 'aborted', 'interrupted'].includes(agent.state)
   const stalled = agent.stalled || agent.state === 'stalled'
-  const model = modelLabel(agent)
 
   return <article className={`agent-row ${agent.parentId ? 'agent-child' : 'agent-root'} ${selected ? 'selected' : ''}`} data-testid={`agent-row-${agent.agentId}`}>
     <button className="agent-select" onClick={onSelect} aria-pressed={selected}>
-      <span className="agent-indent" style={{ width: Math.max(0, (agent.depth ?? 1) - 1) * 16 }} />
+      <span className="agent-indent" style={{ width: Math.max(0, (agent.depth ?? 1) - 1) * 10 }} />
 	  {agent.parentId && <span className="agent-parent" aria-label="Leader 的子 agent">└</span>}
       <span className={`agent-state ${agent.state}`} title={stateText(agent)}>
         {active && agent.state === 'running' ? <span className="agent-spinner" aria-label="运行中" /> : terminalIcon[agent.state]}
       </span>
       <span className="agent-copy">
         <span className="agent-name-line">
-          <em className="provider-badge">{providerLabel(agent)}</em>
-          {model && <em className="model-badge" title={agent.model}>{model}</em>}
-          <strong>{agent.name}</strong>
+          <ModelFamilyIcon agent={agent} />
+          <strong>{agentDisplayName(agent)}</strong>
 		  {childCount > 0 && <em className="agent-leader-badge">主管 · {childCount} 个子 agent</em>}
-          {agent.name === 'secretary' && <em className="closeout-badge">收尾</em>}
           {stalled && <em className="stalled-badge">{agent.stalledIdleSec ? `卡住 ${agent.stalledIdleSec}s` : '卡住'}</em>}
           {worktree && <em className={`worktree-badge ${worktree.lifecycle}`}>{worktree.text}</em>}
         </span>
         <small>{subtitle}</small>
-      </span>
-      <span className="agent-metrics">
-        <small>{active ? `运行中 · ${duration(agent, now)}` : `${completedAt(agent.endedAt)} · ${duration(agent, now)}`}</small>
-        {agent.cost && agent.cost > 0 && <small>{spend(agent.cost, pricing)}</small>}
       </span>
     </button>
     {active && <button aria-label={`中止 ${agent.name}`} title="中止 agent" className="agent-control abort" onClick={onAbort}>■</button>}
@@ -428,51 +579,68 @@ function AgentRow({ agent, childCount, selected, now, pricing, onSelect, onAbort
   </article>
 }
 
-function AgentDetail({ agent, now, retainedWorktreeDispositionAvailable, onCheck, onWorktree }: {
+function AgentDetail({ agent, now, retainedWorktreeDispositionAvailable, onCheck, onWorktree, onAbort }: {
   agent?: Agent
   now: number
   retainedWorktreeDispositionAvailable: boolean
   onCheck: (agent: Agent) => void
   onWorktree: (agentId: string, action: 'merge' | 'discard') => void
+  onAbort: (agentId: string) => void
 }) {
   if (!agent) return <div className="agent-detail empty">选择一个 agent 查看详情</div>
   const reviewable = agent.worktree?.lifecycle === 'pendingReview'
   const model = agent.model || `${providerLabel(agent)}/${agent.name}`
-  const output = agent.finalResult?.trim()
+  const output = latestReadableResult(agent)
+  const activity = localizedTaskSummary(agent.listSubtitle || agent.title || agent.task)
+  const detailTitle = detailTaskTitle(agent, output)
+  const transcript = agentTranscript(agent, output)
 
   return <div className="agent-detail">
     <header className="agent-detail-header">
       <div className="detail-agent-title">
-        <div><b>{agent.title || agent.name}</b><span className={`detail-state ${agent.state}`}>{stateText(agent)}</span></div>
-        <small title={model}>{model}</small>
+        <div><ModelFamilyIcon agent={agent} /><b>{detailTitle}</b></div>
+        <small>{modelFamily(agent).family}</small>
       </div>
-      <DetailMetrics agent={agent} />
-      <button onClick={() => void onCheck(agent)}>手动检查</button>
     </header>
-    <p className="agent-task">{agent.task}</p>
-    {agent.closeout && <p className="agent-closeout">收尾 · {agent.closeout}</p>}
-    {agent.worktree && <div className="worktree-meta">
-      <span className={`worktree-status ${agent.worktree.lifecycle}`}>{worktreeText(agent.worktree)}</span>
-      {agent.worktree.branch && <code>{agent.worktree.branch}</code>}
-      {agent.worktree.error && <small>{agent.worktree.error}</small>}
-      {reviewable && retainedWorktreeDispositionAvailable && <span className="worktree-actions"><button onClick={() => void onWorktree(agent.agentId, 'merge')}>合并到主分支</button><button onClick={() => void onWorktree(agent.agentId, 'discard')}>丢弃 worktree</button></span>}
-    </div>}
-    <div className="agent-log" data-testid="agent-log">
-      {isActive(agent) && <div className="agent-running-activity"><span className="agent-spinner" aria-hidden="true" />正在执行 · {agent.listSubtitle || agent.task}</div>}
-      {agent.logs.length ? agent.logs.map(log => <LogRow key={log.id} log={log} />) : !output && <p>{isActive(agent) ? '等待 agent 返回第一条工作记录…' : '没有可显示的工作记录'}</p>}
-      {output && <ActivityCard kind="final" label="最终结果" summary={preview(output)} meta="完成结果"><div className="agent-final-result">{output}</div></ActivityCard>}
+    <p className="agent-closeout">{agent.closeout ? `收尾　${agent.closeout}` : `${stateText(agent)}${agent.worktree ? `　${worktreeText(agent.worktree)}` : ''}`}</p>
+    <div className="agent-transcript-scroll" data-testid="subagent-transcript-scroll">
+      {isActive(agent) && <div className="agent-running-activity"><span className="agent-spinner" aria-hidden="true" />正在执行 · {activity}<button onClick={() => onAbort(agent.agentId)}>停止</button></div>}
+      <div className="agent-transcript" data-testid="subagent-transcript">
+        {transcript.map((message, index) => <article className="message assistant-message" key={`${agent.runId}-transcript-${index}`}><AssistantTranscriptContent message={message} expandSteps /></article>)}
+      </div>
+      <details className="agent-technical-details">
+      <summary>技术详情</summary>
+      <div className="technical-metadata">
+        <span>Agent ID：{agent.agentId}</span>
+        <span>Profile：{localizedProfileName(agent.name)}（{agent.name}）</span>
+        <span>Provider / Model：{providerLabel(agent)} · {model}</span>
+        {agent.sessionId && <span>Session：{agent.sessionId}</span>}
+        <DetailMetrics agent={agent} now={now} pricing={pricingFor([agent])} />
+        <button onClick={() => void onCheck(agent)}>手动检查</button>
+      </div>
+      <p className="agent-task">{visibleAgentText(agent.task)}</p>
+      {agent.closeout && <p className="agent-closeout">收尾 · {agent.closeout}</p>}
+      {agent.worktree && <div className="worktree-meta">
+        <span className={`worktree-status ${agent.worktree.lifecycle}`}>{worktreeText(agent.worktree)}</span>
+        {agent.worktree.branch && <code>{agent.worktree.branch}</code>}
+        {agent.worktree.error && <small>{agent.worktree.error}</small>}
+        {reviewable && retainedWorktreeDispositionAvailable && <span className="worktree-actions"><button onClick={() => void onWorktree(agent.agentId, 'merge')}>合并到主分支</button><button onClick={() => void onWorktree(agent.agentId, 'discard')}>丢弃 worktree</button></span>}
+      </div>}
       {!isActive(agent) && <span className="agent-finished-at">结束于 {completedAt(agent.endedAt)} · {duration(agent, now)}</span>}
+      </details>
     </div>
   </div>
 }
 
-function DetailMetrics({ agent }: { agent: Agent }) {
+function DetailMetrics({ agent, now, pricing }: { agent: Agent; now: number; pricing: Pricing }) {
   const context = formatTokens(agent.contextTokens)
   const contextLimit = formatTokens(agent.contextWindowTokens)
   const input = formatTokens(agent.inputTokens)
   const output = formatTokens(agent.outputTokens)
   const cache = formatTokens(agent.cacheTokens)
   return <div className="detail-metrics" aria-label="模型上下文统计">
+    <span title="运行耗时">{duration(agent, now)}</span>
+    {agent.cost && agent.cost > 0 ? <span title="累计费用">{spend(agent.cost, pricing)}</span> : null}
     {context && <span title="上下文占用">ctx {context}{contextLimit ? `/${contextLimit}` : ''}</span>}
     {input && <span title="累计输入 tokens">in {input}</span>}
     {output && <span title="累计输出 tokens">out {output}</span>}
@@ -481,24 +649,31 @@ function DetailMetrics({ agent }: { agent: Agent }) {
 }
 
 function LogRow({ log }: { log: Log }) {
+  const visibleText = visibleAgentText(log.text)
   if (log.itemType === 'thinking') {
-    return <ActivityCard kind="thinking" label="Thinking" summary={preview(log.text, '思考过程')} meta="思考"><pre className="agent-card-pre thinking-copy">{log.text}</pre></ActivityCard>
+    return <ActivityCard kind="thinking" label="Thinking" summary={preview(visibleText, '思考过程')} meta="思考"><pre className="agent-card-pre thinking-copy">{visibleText}</pre></ActivityCard>
   }
   if (log.itemType === 'tool') {
     const argsSummary = toolArgsSummary(log.name ?? 'tool', log.text)
-    return <ActivityCard kind="tool" label="工具" summary={`${log.name ?? 'tool'}${argsSummary !== '…' ? ` · ${argsSummary}` : ''}`} meta="调用参数"><pre className="agent-card-pre">{log.text || '（无参数）'}</pre></ActivityCard>
+    const displayName = toolNames[log.name ?? ''] ?? log.name ?? '工具'
+    return <ActivityCard kind="tool" label="工具" summary={`${displayName}${argsSummary !== '…' ? ` · ${argsSummary}` : ''}`} meta="调用参数"><pre className="agent-card-pre">{log.text || '（无参数）'}</pre></ActivityCard>
   }
   if (log.itemType === 'toolResult') {
-    const diff = diffSummary(log.text)
+    const diff = diffSummary(visibleText)
     if (diff) {
-      return <ActivityCard kind="diff" label="Diff" summary={`${diff.files} 个文件 · +${diff.additions} −${diff.deletions}`} meta="工具结果"><div className="agent-diff">{renderDiff(log.text)}</div></ActivityCard>
+      return <ActivityCard kind="diff" label="Diff" summary={`${diff.files} 个文件 · +${diff.additions} −${diff.deletions}`} meta="工具结果"><div className="agent-diff">{renderDiff(visibleText)}</div></ActivityCard>
     }
-    return <ActivityCard kind="result" label="结果" error={Boolean(log.isError)} summary={preview(log.text, log.isError ? '工具调用失败' : '工具结果')} meta={log.isError ? '错误' : '工具结果'}><pre className="agent-card-pre">{log.text || '（无输出）'}</pre></ActivityCard>
+    return <ActivityCard kind="result" label="结果" error={Boolean(log.isError)} summary={preview(visibleText, log.isError ? '工具调用失败' : '工具结果')} meta={log.isError ? '错误' : '工具结果'}><pre className="agent-card-pre">{visibleText || '（无输出）'}</pre></ActivityCard>
   }
   return <article className="agent-log-row text">
     <span className="agent-log-kind">日志</span>
-    <p className="agent-log-text">{log.text}</p>
+    <p className="agent-log-text">{visibleText}</p>
   </article>
+}
+
+/** Internal isolation policy can be echoed by a model, but is never user-facing work output. */
+export function visibleAgentText(text: string): string {
+  return text.replace(/\[PipiUI subagent isolation sentinel:[\s\S]*?This sentinel is not a skill instruction[^\]]*\]/gi, '').trim()
 }
 
 function diffSummary(text: string) {

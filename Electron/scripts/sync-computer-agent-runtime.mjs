@@ -12,6 +12,9 @@ const philosophyRuntimeRoot = join(electronRoot, "resources", "runtime", "pi-phi
 const mirrors = [
   ...[
   "subagent/index.ts",
+  "subagent/agents.ts",
+  "subagent/runtime-policy.ts",
+  "subagent/rpc-stream.ts",
   "agents/operator/AGENT.md",
   "agents/computer-use-leader/AGENT.md",
   "agents/computer-verifier/AGENT.md",

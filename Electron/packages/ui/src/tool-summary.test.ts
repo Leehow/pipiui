@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { toolArgsSummary } from './tool-summary'
+import { formatToolInput, toolActivitySummary, toolArgsSummary, toolDisplaySummary } from './tool-summary'
 
 describe('toolArgsSummary', () => {
   it('renders write/edit as their path', () => {
@@ -53,5 +53,56 @@ describe('toolArgsSummary', () => {
   it('falls back to plain text and empty input', () => {
     expect(toolArgsSummary('read', 'Sources/Foo.swift')).toBe('Sources/Foo.swift')
     expect(toolArgsSummary('bash', '')).toBe('…')
+  })
+
+  it('keeps raw JSON in details and renders a human activity summary', () => {
+    expect(toolActivitySummary('bash {"command":"npm run build"}')).toBe('bash · npm run build')
+    expect(toolActivitySummary('mystery {"opaque":true}')).toBe('mystery')
+    expect(toolArgsSummary('mystery', '{"opaque":true}')).toBe('…')
+    expect(toolArgsSummary('mystery', '{"opaque":')).toBe('…')
+  })
+})
+
+describe('toolDisplaySummary', () => {
+  it('renders bash as "bash <first-command-word>"', () => {
+    expect(toolDisplaySummary('bash', '{"command":"grep -r foo ."}')).toBe('bash grep')
+    expect(toolDisplaySummary('bash', '{"command":"ls -la"}')).toBe('bash ls')
+    expect(toolDisplaySummary('bash', '{"command":"git status"}')).toBe('bash git')
+  })
+
+  it('falls back to bare name when command is missing or empty', () => {
+    expect(toolDisplaySummary('bash', '{"command":""}')).toBe('bash')
+    expect(toolDisplaySummary('bash', '')).toBe('bash')
+  })
+
+  it('keeps "name · summary" for non-bash tools', () => {
+    expect(toolDisplaySummary('edit', '{"file_path":"App.tsx"}')).toBe('edit · App.tsx')
+    expect(toolDisplaySummary('grep', '{"pattern":"foo","path":"src"}')).toBe('grep · /foo/ in src')
+  })
+
+  it('scrapes truncated bash JSON while streaming', () => {
+    expect(toolDisplaySummary('bash', '{"command":"grep -')).toBe('bash grep')
+  })
+})
+
+describe('formatToolInput', () => {
+  it('renders bash command directly with $ prefix', () => {
+    expect(formatToolInput('bash', '{"command":"grep -r foo .","cwd":"/tmp"}')).toBe('$ grep -r foo .')
+  })
+
+  it('pretty-prints JSON for non-bash tools', () => {
+    expect(formatToolInput('edit', '{"file_path":"App.tsx","newText":"x"}')).toBe(
+      '{\n  "file_path": "App.tsx",\n  "newText": "x"\n}'
+    )
+  })
+
+  it('falls back to raw text for partial/streaming JSON', () => {
+    expect(formatToolInput('bash', '{"command":"grep -')).toBe('$ grep -')
+    expect(formatToolInput('edit', '{"file_path":"App')).toBe('{"file_path":"App')
+  })
+
+  it('returns empty for empty input', () => {
+    expect(formatToolInput('bash', '')).toBe('')
+    expect(formatToolInput('edit', '  ')).toBe('')
   })
 })

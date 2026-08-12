@@ -12,6 +12,27 @@ export type SessionStatsStatus = 'loading' | 'ready' | 'error'
 const AUTO_RETRIES = 2
 const AUTO_RETRY_DELAYS = [300, 1000]
 
+/**
+ * Session-scoped stale-while-revalidate cache. Composer is intentionally keyed
+ * by session id, so hook-local state is destroyed on every switch; keeping the
+ * last verified snapshot per host here lets a warm session paint immediately
+ * without ever borrowing the previously selected session's numbers.
+ */
+const statsByHost = new WeakMap<PipiHostAPI, Map<string, SessionStats>>()
+
+function statsCache(host: PipiHostAPI): Map<string, SessionStats> {
+  let cache = statsByHost.get(host)
+  if (!cache) {
+    cache = new Map()
+    statsByHost.set(host, cache)
+  }
+  return cache
+}
+
+function statsCacheKey(sessionId?: string): string {
+  return sessionId ?? '__active__'
+}
+
 export interface UseSessionStatsResult {
   /** Latest snapshot; null until the first get/push resolves. */
   stats: SessionStats | null
@@ -58,8 +79,9 @@ export function mergeSessionStats(previous: SessionStats | null, incoming: Sessi
  * publishes the active session).
  */
 export function useSessionStats(host: PipiHostAPI, sessionId?: string, refreshKey?: unknown): UseSessionStatsResult {
-  const [stats, setStats] = useState<SessionStats | null>(null)
-  const [status, setStatus] = useState<SessionStatsStatus>('loading')
+  const initial = statsCache(host).get(statsCacheKey(sessionId)) ?? null
+  const [stats, setStats] = useState<SessionStats | null>(initial)
+  const [status, setStatus] = useState<SessionStatsStatus>(initial ? 'ready' : 'loading')
   const [error, setError] = useState<string>()
   const [attempt, setAttempt] = useState(0)
 
@@ -67,9 +89,13 @@ export function useSessionStats(host: PipiHostAPI, sessionId?: string, refreshKe
     let cancelled = false
     let unsubscribe: (() => void) | undefined
 
-    setStats(null)
+    const cache = statsCache(host)
+    const cacheKey = statsCacheKey(sessionId)
+    const cached = cache.get(cacheKey) ?? null
+
+    setStats(cached)
     setError(undefined)
-    setStatus('loading')
+    setStatus(cached ? 'ready' : 'loading')
 
     const fetchStats = async (retriesLeft = AUTO_RETRIES) => {
       try {
@@ -78,7 +104,11 @@ export function useSessionStats(host: PipiHostAPI, sessionId?: string, refreshKe
         }
         const snapshot = await host.getSessionStats(sessionId)
         if (cancelled) return
-        setStats(previous => mergeSessionStats(previous, snapshot))
+        setStats(previous => {
+          const merged = mergeSessionStats(previous, snapshot)
+          cache.set(cacheKey, merged)
+          return merged
+        })
         setStatus('ready')
       } catch (err) {
         if (cancelled) return
@@ -87,6 +117,12 @@ export function useSessionStats(host: PipiHostAPI, sessionId?: string, refreshKe
           await new Promise(resolve => setTimeout(resolve, delayMs))
           if (cancelled) return
           await fetchStats(retriesLeft - 1)
+          return
+        }
+        // A failed background revalidation must not replace a verified cached
+        // snapshot with an error/loading surface.
+        if (cache.has(cacheKey)) {
+          setStatus('ready')
           return
         }
         setError(err instanceof Error ? err.message : String(err))
@@ -99,7 +135,11 @@ export function useSessionStats(host: PipiHostAPI, sessionId?: string, refreshKe
       unsubscribe = host.subscribeSessionStats((event: SessionStatsEvent) => {
         if (cancelled) return
         if (sessionId !== undefined && event.sessionId !== sessionId) return
-        setStats(previous => mergeSessionStats(previous, event.stats))
+        setStats(previous => {
+          const merged = mergeSessionStats(previous, event.stats)
+          cache.set(cacheKey, merged)
+          return merged
+        })
         setError(undefined)
         setStatus('ready')
       })

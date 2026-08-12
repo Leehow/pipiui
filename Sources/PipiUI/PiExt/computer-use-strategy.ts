@@ -546,9 +546,19 @@ export function compactAccessibility(value: unknown): Record<string, unknown> | 
   const elements = Array.isArray(value.elements) ? value.elements : [];
   const elementCount = elements.length;
   const interactive = elements.filter(elementIsInteractive);
+  const structural = elements.filter((element) => {
+    if (!isRecord(element)) return false;
+    return ["window", "sheet", "dialog", "drawer"].includes(
+      normalizeAxRole(element.role),
+    );
+  });
   // Prefer interactive controls; if none matched, fall back to the raw list so
-  // the model is not left without any AX handles.
-  const preferred = interactive.length > 0 ? interactive : elements;
+  // the model is not left without any AX handles. Always retain the small
+  // window/sheet/dialog spine: flattening it makes controls behind a modal look
+  // equally actionable to the dedicated GUI Operator.
+  const preferred = interactive.length > 0
+    ? [...structural, ...interactive.filter((element) => !structural.includes(element))]
+    : elements;
   const limited = preferred.slice(0, MAX_ACCESSIBILITY_ELEMENTS_IN_CONTEXT);
   const wasTrimmed = limited.length < elementCount;
   const compact: Record<string, unknown> = {
@@ -569,6 +579,11 @@ export function compactAccessibility(value: unknown): Record<string, unknown> | 
     || typeof focused === "number"
     || typeof focused === "string"
   ) compact.focused_element_index = focused;
+  for (const key of [
+    "snapshot_id", "focused_window_id", "modal_window_id", "windows", "hierarchy",
+  ]) {
+    if (value[key] !== undefined) compact[key] = value[key];
+  }
   return compact;
 }
 
@@ -770,7 +785,7 @@ export default function (pi: ExtensionAPI) {
       "Prefer element_index/element_token AX actions over screenshot coordinates. " +
       "Use screenshot coordinates only as a fallback when lifecycle commands and AX cannot complete the task. " +
       "Batch discipline (hard rule): one accepted batch = one round-trip (one screenshot plus one full model inference); batches are the unit of cost. Put every coherent sequence into ONE actions:[...] batch — e.g. click field + type + Enter; CMD+L + CMD+V + RETURN + wait; navigate + observe. Split only when the next step genuinely depends on seeing the previous result. Single-action batches are the expensive anti-pattern; avoid them for anything non-exploratory. Every accepted batch returns a fresh screenshot. " +
-      "Failure discipline: when a coordinate is reported out-of-bounds or an element_token is stale, that input is permanent-fail until you re-observe. Do not retry the same coordinate or token. Re-capture a fresh screenshot / AX snapshot first, recompute, then act. " +
+      "Failure discipline: when a coordinate is reported out-of-bounds or an element_token is stale, that input is permanent-fail until you re-observe. Do not retry the same coordinate or token. Re-capture a fresh screenshot / AX snapshot first, recompute, then act. If the result reports actionable_context_changed, snapshot_changed, batchInterrupted, noProgress, or outcomeUnknown, stop the old sequence: re-observe and replan inside the dedicated Computer Use agent. Never click a parent-window control while a sheet/dialog/modal layer is present. " +
       "Use element_index/element_token from the latest AX snapshot when available. " +
       "mouse_move points with the Cua overlay and does not trigger native hover; " +
       "hold_key is unsupported. Mouse down/up are accepted only as one complete " +

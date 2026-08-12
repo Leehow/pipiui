@@ -23,7 +23,7 @@ describe('stream message reducer', () => {
     expect(finishStreamingMessage(messages)[0].streaming).toBe(false)
   })
 
-  it('renders the readable tool summary (bash · command) on the folded tool card', () => {
+  it('renders the readable tool summary (bash <command>) on the folded tool card', () => {
     let messages: ChatMessage[] = []
     messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'bash-1', name: 'bash', delta: '{"command":"ls -la","cwd":"/tmp"}' })
     messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'bash-1', content: 'total 0', isError: false })
@@ -31,7 +31,7 @@ describe('stream message reducer', () => {
     render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
     // Outer "N 个步骤" card collapses when the turn settles; expand it to reveal the tool card.
     fireEvent.click(screen.getByRole('button', { name: /1 个步骤/ }))
-    const tool = screen.getByRole('button', { name: /bash · ls -la/ })
+    const tool = screen.getByRole('button', { name: /bash ls/ })
     expect(tool.getAttribute('aria-expanded')).toBe('false')
   })
 
@@ -59,8 +59,8 @@ describe('stream message reducer', () => {
     const outer = screen.getByRole('button', { name: /2 个步骤/ })
     expect(outer.getAttribute('aria-expanded')).toBe('false')
     fireEvent.click(outer)
-    // The tool card inside is also collapsed, with a readable bash · command summary.
-    const tool = screen.getByRole('button', { name: /bash · ls -la/ })
+    // The tool card inside is also collapsed, with a readable bash <command> summary.
+    const tool = screen.getByRole('button', { name: /bash ls/ })
     expect(tool.getAttribute('aria-expanded')).toBe('false')
   })
 
@@ -96,7 +96,7 @@ describe('tool-only assistant turn coalescing (Swift finishedGroup parity)', () 
     const outer = screen.getByRole('button', { name: /7 个步骤 · bash ×6/ })
     expect(outer.getAttribute('aria-expanded')).toBe('false')
     fireEvent.click(outer)
-    expect(screen.getAllByRole('button', { name: /bash · ls -la/ })).toHaveLength(6)
+    expect(screen.getAllByRole('button', { name: /bash ls/ })).toHaveLength(6)
     expect(screen.getByRole('button', { name: /browser · navigate http:\/\/localhost:5176/ })).toBeTruthy()
   })
 

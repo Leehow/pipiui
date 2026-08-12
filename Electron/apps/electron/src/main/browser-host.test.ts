@@ -56,12 +56,14 @@ describe('BrowserTabsHost', () => {
     const main = { contentView: { addChildView: () => calls.push('main:add'), removeChildView: () => calls.push('main:remove') } }
     const hidden = {
       contentView: { addChildView: () => calls.push('hidden:add'), removeChildView: () => calls.push('hidden:remove') },
+      setOpacity: (opacity: number) => calls.push(`hidden:opacity:${opacity}`),
+      setIgnoreMouseEvents: (ignore: boolean) => calls.push(`hidden:ignoreMouse:${ignore}`),
       showInactive: () => calls.push('hidden:showInactive'),
       hide: () => calls.push('hidden:hide')
     }
 
     routeBrowserView(view, false, main, hidden)
-    expect(calls).toEqual(['main:remove', 'hidden:remove', 'hidden:add', 'hidden:showInactive'])
+    expect(calls).toEqual(['main:remove', 'hidden:remove', 'hidden:add', 'hidden:opacity:0', 'hidden:ignoreMouse:true', 'hidden:showInactive'])
     calls.length = 0
     routeBrowserView(view, true, main, hidden)
     // The off-screen host may contain other sessions that are still browsing;

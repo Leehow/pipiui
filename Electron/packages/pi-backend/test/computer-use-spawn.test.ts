@@ -5,25 +5,27 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createPiHostBackend } from "../src/index.js";
 
-describe("fresh Pi session Computer Use injection", () => {
+describe("fresh Pi session Computer Use orchestration", () => {
   let root = "";
   afterEach(async () => {
     if (root) await rm(root, { recursive: true, force: true });
     root = "";
   });
 
-  it("mounts the reviewed strategy in the actual RPC child spawn", async () => {
+  it("mounts only the coordinator in main and reserves the reviewed strategy for workers", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-computer-spawn-"));
     const cwd = join(root, "project");
     const sessionsRoot = join(root, "sessions");
     const sessionDir = join(sessionsRoot, "project");
     const runtimeRoot = join(root, "runtime");
     const extensionsDir = join(runtimeRoot, "extensions");
+    const subagentDir = join(runtimeRoot, "pi-ext", "subagent");
     const extension = join(extensionsDir, "pipiui-computer-use.ts");
     await Promise.all([
       mkdir(cwd, { recursive: true }),
       mkdir(sessionDir, { recursive: true }),
       mkdir(extensionsDir, { recursive: true }),
+      mkdir(subagentDir, { recursive: true }),
     ]);
     await writeFile(extension, "// reviewed computer strategy\n");
     await writeFile(
@@ -59,8 +61,9 @@ describe("fresh Pi session Computer Use injection", () => {
 
     await backend.handle("sendPrompt", ["session-1", "show the desktop"]);
     expect(actualArgs).toEqual(
-      expect.arrayContaining(["--mode", "rpc", "-e", extension]),
+      expect.arrayContaining(["--mode", "rpc", "-e", subagentDir]),
     );
+    expect(actualArgs).not.toContain(extension);
     expect(actualEnv).toMatchObject({
       PIPIUI_COMPUTER_EXT: extension,
       PIPIUI_COMPUTER_RUNTIME_PROTOCOL: "1",

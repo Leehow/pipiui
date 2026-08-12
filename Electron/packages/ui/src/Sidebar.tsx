@@ -171,6 +171,24 @@ export function relativeTime(epochMs: number): string {
   return `${Math.floor(hours / 24)}天前`
 }
 
+/** Swift parity (SidebarListLimits.sessions / pageSize): each project folder
+ *  starts at 10 visible session rows; one 「更多」 click reveals another 10 until
+ *  the whole list is shown, then the toggle reads 「收起」. The shown count is
+ *  local component state — never persisted — mirroring Swift's
+ *  `sessionsShownByProject`. Project-row pagination (`visibleLimit`) is a
+ *  separate, parent-owned concern and stays untouched. */
+const SESSION_LIMIT = 10
+const SESSION_PAGE_SIZE = 10
+
+/** Mirrors Swift `SidebarListLimits.visiblePrefix`: show a clamped prefix of
+ *  `items` (clamped to `[limit, total]`) and report whether the total exceeds
+ *  `limit` (governs toggle visibility). */
+function visiblePrefix<T>(items: T[], limit: number, shown: number): { items: T[]; showsToggle: boolean } {
+  const showsToggle = items.length > limit
+  const shownCount = Math.min(Math.max(shown, limit), items.length)
+  return { items: items.slice(0, shownCount), showsToggle }
+}
+
 /** Decorative per-status glyph (Swift 风格图标). */
 function StatusGlyph({ status, count }: { status: SessionStatus; count: number }) {
   if (status === 'running') return <span className="sb-spinner" aria-hidden="true" />
@@ -227,6 +245,39 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
       </span>
       {actions}
     </button>
+  )
+}
+
+/** Active session rows under a project folder, with Swift-parity pagination.
+ *  Browse view truncates to `SESSION_LIMIT` (10) with a 「更多/收起」 toggle that
+ *  pages 10 at a time; a search bypasses pagination so every match shows. */
+function ProjectSessions({ project, query, selectedSessionId, onSelectSession, onPinSession, onRenameSession, onArchiveSession, shown, onToggle }: {
+  project: SidebarProject
+  query: string
+  selectedSessionId: string | null
+  onSelectSession: (id: string) => void
+  onPinSession?: (id: string) => void
+  onRenameSession?: (id: string) => void
+  onArchiveSession?: (id: string) => void
+  shown: number
+  onToggle: () => void
+}) {
+  const sessions = project.sessions
+  const isSearch = query !== ''
+  const visible = isSearch ? sessions : visiblePrefix(sessions, SESSION_LIMIT, shown).items
+  const showsToggle = !isSearch && sessions.length > SESSION_LIMIT
+  const collapsed = showsToggle && shown >= sessions.length
+  return (
+    <div className="sb-project-sessions" role="group" aria-label={`${project.name} 的会话`}>
+      {visible.map(session => (
+        <SessionRow key={session.id} session={session} selected={selectedSessionId === session.id} onSelect={onSelectSession} onPin={onPinSession} onRename={onRenameSession} onArchive={onArchiveSession} />
+      ))}
+      {showsToggle && (
+        <button type="button" className="sb-more sb-more-sessions" data-testid="show-more-sessions" aria-label={collapsed ? `收起${project.name} 会话` : `展开更多${project.name} 会话`} onClick={onToggle}>
+          {collapsed ? '收起' : '更多'}
+        </button>
+      )}
+    </div>
   )
 }
 
@@ -400,6 +451,22 @@ export function Sidebar(props: SidebarProps) {
   const query = searchQuery.trim().toLowerCase()
   const expanded = useMemo(() => new Set(expandedIds), [expandedIds])
 
+  // Per-project session shown counts — local state only, never persisted
+  // (Swift parity: `sessionsShownByProject`). Defaults to SESSION_LIMIT (10).
+  const [sessionsShownByProject, setSessionsShownByProject] = useState<Record<string, number>>({})
+
+  // Swift parity (moreToggle): if already fully shown, collapse back to the
+  // cap; otherwise reveal another page of 10 (clamped to the total).
+  const toggleProjectSessions = (projectId: string, total: number) => {
+    setSessionsShownByProject(prev => {
+      const current = prev[projectId] ?? SESSION_LIMIT
+      if (total > SESSION_LIMIT && current >= total) {
+        return { ...prev, [projectId]: SESSION_LIMIT }
+      }
+      return { ...prev, [projectId]: Math.min(total, current + SESSION_PAGE_SIZE) }
+    })
+  }
+
   const sessionMatches = (s: SidebarSession) => {
     if (!query) return true
     return (
@@ -465,11 +532,17 @@ export function Sidebar(props: SidebarProps) {
                 projectMenuUnavailable={projectMenuUnavailable}
               />
               {isProjectOpen(project.id) && project.sessions.length > 0 && (
-                <div className="sb-project-sessions" role="group" aria-label={`${project.name} 的会话`}>
-                  {project.sessions.map(session => (
-                    <SessionRow key={session.id} session={session} selected={selectedSessionId === session.id} onSelect={onSelectSession} onPin={onPinSession} onRename={onRenameSession} onArchive={onArchiveSession} />
-                  ))}
-                </div>
+                <ProjectSessions
+                  project={project}
+                  query={query}
+                  selectedSessionId={selectedSessionId}
+                  onSelectSession={onSelectSession}
+                  onPinSession={onPinSession}
+                  onRenameSession={onRenameSession}
+                  onArchiveSession={onArchiveSession}
+                  shown={sessionsShownByProject[project.id] ?? SESSION_LIMIT}
+                  onToggle={() => toggleProjectSessions(project.id, project.sessions.length)}
+                />
               )}
             </div>
           ))}

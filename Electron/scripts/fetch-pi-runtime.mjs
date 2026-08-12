@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { constants } from 'node:fs'
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { access, chmod, copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const electronRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -98,6 +98,52 @@ async function declaredEntrypoint(nodeModules, name) {
   } catch { return undefined }
 }
 
+// `npm install` leaves development-only payload in the tree we ship inside the
+// app bundle. None of it is reachable at runtime: pi loads `.ts` extensions
+// through jiti (transpile-only, so no `.d.ts` is consulted), sourcemaps only
+// serve debuggers, and koffi ships prebuilt binaries for eighteen platforms
+// while a build targets exactly one. pi-coding-agent's own `docs/` IS read at
+// runtime via getDocsPath(), so Markdown under any `docs/` directory stays.
+// Anchored on a code extension so a package shipping a genuine `.map` data file
+// keeps it; `.d.ts.map` is covered by the `.ts.map` alternative.
+const PRUNABLE_FILE = /(?:\.(?:js|mjs|cjs|css|ts|mts|cts)\.map|\.d\.(?:ts|mts|cts)|\.md)$/
+
+// `koffi/build/koffi` holds nothing but one directory per prebuilt target, so
+// every sibling of the slice we ship goes. glibc and musl are separate builds
+// and a Linux package has to run on both.
+function koffiPrebuildsToKeep(platform, arch) {
+  return platform === 'linux' ? [`linux_${arch}`, `musl_${arch}`] : [`${platform}_${arch}`]
+}
+
+async function pruneRuntimeTree(root, { platform, arch }) {
+  const keptPrebuilds = new Set(koffiPrebuildsToKeep(platform, arch))
+  let removed = 0
+  // koffi lays its prebuilt binaries out as `koffi/build/koffi/<platform>_<arch>`.
+  const walk = async (dir, insideDocs, holdsPrebuilds) => {
+    let entries
+    try { entries = await readdir(dir, { withFileTypes: true }) } catch { return }
+    for (const entry of entries) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (holdsPrebuilds && !keptPrebuilds.has(entry.name)) {
+          await rm(path, { recursive: true, force: true })
+          removed += 1
+          continue
+        }
+        await walk(path, insideDocs || entry.name === 'docs', entry.name === 'koffi' && basename(dir) === 'build')
+        continue
+      }
+      if (!entry.isFile()) continue
+      if (insideDocs && entry.name.endsWith('.md')) continue
+      if (!PRUNABLE_FILE.test(entry.name)) continue
+      await rm(path, { force: true })
+      removed += 1
+    }
+  }
+  await walk(root, false, false)
+  return removed
+}
+
 async function inspectRuntime(root, expected) {
   let manifest
   try { manifest = await json(join(root, 'manifest.json')) } catch { return { ok: false, reason: 'manifest.json is missing or unreadable' } }
@@ -135,6 +181,9 @@ async function inspectRuntime(root, expected) {
   for (const name of ['pi-web-access', 'pi-mcp-extension']) {
     if (!(await declaredEntrypoint(nodeModules, name))) return { ok: false, reason: `${name} declared Pi extension entrypoint is missing` }
   }
+  // A runtime prepared before pruning existed would silently add ~245MB to the
+  // app bundle; the CLI sourcemap is the cheapest witness that it was skipped.
+  if (await isFile(`${piCli}.map`)) return { ok: false, reason: 'runtime still carries development-only sourcemaps (prepared before pruning)' }
   return { ok: true, manifest, node, piCli, piLauncher, nodeModules }
 }
 
@@ -240,6 +289,11 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
     const nodeModules = join(piLib, 'node_modules')
     const piCli = join(nodeModules, '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js')
     if (!(await isFile(piCli))) throw new Error('Installed Pi package has no dist/cli.js')
+
+    // Prune before the manifest is written so the staged validation below runs
+    // against exactly the tree that ships.
+    const pruned = await pruneRuntimeTree(piLib, { platform, arch })
+    console.log(`Pruned ${pruned} development-only path(s) from the embedded Pi runtime`)
 
     const piBin = join(staging, 'pi', 'bin')
     await mkdir(piBin, { recursive: true })

@@ -135,12 +135,15 @@ export class HostBridge {
             Promise.resolve({ ok: false, error: "computer host unavailable" })),
         );
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+				const code = error && typeof error === "object" && (error as { code?: unknown }).code === "cua_driver_rpc_timeout"
+					? "cua_driver_rpc_timeout"
+					: "computer_host_error";
+				const message = code === "cua_driver_rpc_timeout" ? "Cua Driver request timed out" : error instanceof Error ? error.message : String(error);
         return this.reply(response, 200, {
           ok: false,
           error: message,
           runtimeError: {
-            code: "computer_host_error",
+            code,
             message,
             retryable: true,
             requiresObservation: true,

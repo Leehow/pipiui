@@ -1,8 +1,11 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { validateDesktopActions } from "./desktop-actions.ts";
 
 export type ComputerWorkerRole = "gui-operator" | "terminal-worker" | "verifier";
 export type ComputerWorkerGrant = "observe" | "mutate" | "openApplication";
 export type ComputerWorkerOperation = ComputerWorkerGrant | "locate";
+type ComputerWorkerFatalCode = "computer_worker_runtime_timeout" | "computer_worker_request_cancelled" | "computer_worker_no_progress";
+const MAX_CONSECUTIVE_OBSERVATIONS = 3;
 
 export type HostGuiExecutionRecord = {
   kind: "open_application" | "click" | "type_parameter";
@@ -32,7 +35,38 @@ type GrantRecord = {
   bindings: Map<string, { role: string; nameLiteral: string }>;
   executions: HostGuiExecutionRecord[];
   controllers: Set<AbortController>;
+	busy: boolean;
+	fatalCode?: ComputerWorkerFatalCode;
+	consecutiveObservations: number;
+  noProgress?: {
+    signature: string;
+    fingerprint: string;
+    requiresObserve: boolean;
+    exhausted: boolean;
+  };
 };
+
+function stable(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+  if (value && typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		const hasStableElementIndex = Number.isInteger(record.element_index);
+		return `{${Object.entries(record)
+		.filter(([key]) => !["screenshotId", "observationId", "snapshot_id"].includes(key) && !(key === "element_token" && hasStableElementIndex))
+    .sort(([left], [right]) => left.localeCompare(right))
+		.map(([key, item]) => `${JSON.stringify(key)}:${stable(item)}`).join(",")}}`;
+	}
+  return JSON.stringify(value);
+}
+
+export function observationFingerprint(value: Record<string, unknown> | undefined): string {
+  if (!value) return "";
+  return createHash("sha256").update(stable(value)).digest("hex");
+}
+
+export function mutationSignature(actions: unknown): string {
+  return createHash("sha256").update(stable(actions)).digest("hex");
+}
 
 export function grantsForComputerRole(role: ComputerWorkerRole): ComputerWorkerGrant[] {
   if (role === "gui-operator") return ["observe", "mutate", "openApplication"];
@@ -50,13 +84,19 @@ export class ComputerWorkerBroker {
   readonly #runtime: ComputerRuntimeAdapter;
   readonly #tokenFactory: () => string;
   readonly #grants = new Map<string, GrantRecord>();
+		readonly #requestTimeoutMs: number;
+	readonly #onFatal?: (event: { taskId: string; stepId: string; runId: string; code: ComputerWorkerFatalCode }) => void;
 
   constructor(input: {
     request: ComputerRuntimeAdapter["request"];
     tokenFactory?: () => string;
+			requestTimeoutMs?: number;
+		onFatal?: (event: { taskId: string; stepId: string; runId: string; code: ComputerWorkerFatalCode }) => void;
   }) {
     this.#runtime = { request: input.request };
     this.#tokenFactory = input.tokenFactory ?? (() => randomBytes(32).toString("base64url"));
+			this.#requestTimeoutMs = Math.min(120_000, Math.max(10, input.requestTimeoutMs ?? 35_000));
+		this.#onFatal = input.onFatal;
   }
 
   issue(input: {
@@ -86,6 +126,8 @@ export class ComputerWorkerBroker {
       bindings: new Map(),
       executions: [],
       controllers: new Set(),
+				busy: false,
+		consecutiveObservations: 0,
     });
     return {
       token,
@@ -104,8 +146,9 @@ export class ComputerWorkerBroker {
     request: ComputerWorkerBrokerRequest,
     signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
-    const grant = this.#grants.get(token);
-    if (!grant) throw new Error("computer worker capability is unknown or revoked");
+	    const grant = this.#grants.get(token);
+	    if (!grant) throw new Error("computer worker capability is unknown or revoked");
+		if (grant.fatalCode) throw new Error(grant.fatalCode);
     if (request.operation === "locate" ? !grant.grants.has("observe") : !grant.grants.has(request.operation)) {
       throw new Error(`computer worker role ${grant.role} does not grant ${request.operation}`);
     }
@@ -137,8 +180,25 @@ export class ComputerWorkerBroker {
       grant.bindings.set(bindingId, { role: matches[0].role, nameLiteral: matches[0].name });
       return { status: "resolved", bindingId, match: matches[0] };
     }
-    if (request.operation === "mutate" && (!Array.isArray(request.payload.actions) || request.payload.actions.length < 1 || request.payload.actions.length > 64)) throw new Error("mutate requires 1...64 actions");
-    if (request.operation === "openApplication" && ![request.payload.bundle_identifier, request.payload.application_name].some((value) => typeof value === "string" && value.trim().length > 0)) throw new Error("openApplication requires an exact application identity");
+	    if (request.operation === "mutate") validateDesktopActions(request.payload.actions);
+    const signature = request.operation === "mutate" ? mutationSignature(request.payload.actions) : undefined;
+    if (request.operation === "mutate" && grant.noProgress?.requiresObserve) {
+      throw new Error("no_progress_requires_fresh_observation: observe and replan before another UI mutation");
+    }
+    if (request.operation === "mutate" && signature && grant.noProgress?.exhausted) {
+      if (grant.noProgress.signature === signature) {
+        throw new Error("no_progress_budget_exhausted: equivalent UI mutation is blocked until the UI or strategy changes");
+      }
+      grant.noProgress = undefined;
+    }
+	    if (request.operation === "openApplication" && ![request.payload.bundle_identifier, request.payload.application_name].some((value) => typeof value === "string" && value.trim().length > 0)) throw new Error("openApplication requires an exact application identity");
+		if (request.operation === "observe") {
+			grant.consecutiveObservations += 1;
+			if (grant.consecutiveObservations > MAX_CONSECUTIVE_OBSERVATIONS) {
+				this.#markFatal(grant, "computer_worker_no_progress");
+				throw new Error("computer_worker_no_progress");
+			}
+		}
     const action = request.operation === "openApplication"
       ? "computer_open_application"
       : "computer_batch";
@@ -146,19 +206,75 @@ export class ComputerWorkerBroker {
       ? { ...request.payload, actions: [{ type: "screenshot" }] }
       : request.operation === "mutate" ? { actions: request.payload.actions } : request.payload;
     const controller = new AbortController();
+		if (grant.busy) throw new Error("computer_worker_request_in_progress");
+		grant.busy = true;
     grant.controllers.add(controller);
-    const abort = () => controller.abort();
+    let timedOut = false;
+    let callerAborted = false;
+    const abort = () => { callerAborted = true; controller.abort(); };
     signal?.addEventListener("abort", abort, { once: true });
-    const result = await this.#runtime.request({
-      ...payload,
-      action,
-      taskId: grant.taskId,
-      stepId: grant.stepId,
-      runId: grant.runId,
-    }, controller.signal).finally(() => { grant.controllers.delete(controller); signal?.removeEventListener("abort", abort); });
+    const beforeFingerprint = observationFingerprint(grant.lastObservation);
+			let timeout: ReturnType<typeof setTimeout>;
+			const deadline = new Promise<never>((_resolve, reject) => {
+				timeout = setTimeout(() => {
+					timedOut = true;
+					controller.abort();
+					reject(new Error("computer_worker_runtime_timeout"));
+				}, this.#requestTimeoutMs);
+				controller.signal.addEventListener("abort", () => {
+					if (!timedOut) reject(new Error("computer_worker_request_cancelled"));
+				}, { once: true });
+			});
+			let result: Record<string, unknown>;
+			const runtimeRequest = Promise.resolve().then(() => this.#runtime.request({
+	      ...payload,
+	      action,
+	      taskId: grant.taskId,
+	      stepId: grant.stepId,
+	      runId: grant.runId,
+	    }, controller.signal));
+			try { result = await Promise.race([runtimeRequest, deadline]); }
+			catch (error) {
+				const driverTimedOut = error && typeof error === "object" && (error as { code?: unknown }).code === "cua_driver_rpc_timeout";
+				const fatalCode = timedOut || driverTimedOut ? "computer_worker_runtime_timeout" : callerAborted || controller.signal.aborted ? "computer_worker_request_cancelled" : undefined;
+				if (fatalCode) {
+					this.#markFatal(grant, fatalCode);
+					throw new Error(fatalCode);
+				}
+				throw error;
+			} finally { clearTimeout(timeout); grant.busy = false; grant.controllers.delete(controller); signal?.removeEventListener("abort", abort); }
     const observationId = String((result as any).observationId ?? (result as any).screenshotId ?? "");
     const observedAt = new Date().toISOString();
-    if (["observe", "mutate", "openApplication"].includes(request.operation)) grant.lastObservation = result;
+    if (request.operation === "observe" && grant.noProgress) {
+      if (observationFingerprint(result) !== grant.noProgress.fingerprint) {
+        grant.noProgress = undefined;
+      } else {
+        grant.noProgress.requiresObserve = false;
+        grant.noProgress.exhausted = true;
+      }
+    }
+	    if (["observe", "mutate", "openApplication"].includes(request.operation)) grant.lastObservation = result;
+		if (request.operation === "mutate" || request.operation === "openApplication") grant.consecutiveObservations = 0;
+    if (request.operation === "mutate" && signature) {
+      const unchanged = beforeFingerprint.length > 0 && beforeFingerprint === observationFingerprint(result);
+      if (unchanged) {
+        grant.noProgress = {
+          signature,
+          fingerprint: beforeFingerprint,
+          requiresObserve: true,
+          exhausted: false,
+        };
+        return {
+          ...result,
+          noProgress: {
+            status: "reobserve_required",
+            unchangedAttempts: 1,
+            mutationBlockedUntilObserve: true,
+          },
+        };
+      }
+      grant.noProgress = undefined;
+    }
     if (request.operation === "openApplication" && observationId) grant.executions.push({ kind: "open_application", bundleId: typeof request.payload.bundle_identifier === "string" ? request.payload.bundle_identifier : undefined, appName: typeof request.payload.application_name === "string" ? request.payload.application_name : undefined, observationId, observedAt });
     if (request.operation === "mutate" && observationId && Array.isArray(request.payload.semanticBindings)) {
       for (const item of request.payload.semanticBindings as any[]) {
@@ -175,6 +291,11 @@ export class ComputerWorkerBroker {
     for (const grant of this.#grants.values()) if (grant.taskId === taskId && grant.stepId === stepId) { records.push(...grant.executions); grant.executions.length = 0; }
     return structuredClone(records);
   }
+	#markFatal(grant: GrantRecord, code: ComputerWorkerFatalCode): void {
+		if (grant.fatalCode) return;
+		grant.fatalCode = code;
+		this.#onFatal?.({ taskId: grant.taskId, stepId: grant.stepId, runId: grant.runId, code });
+	}
   observation(taskId: string, stepId: string): Record<string, unknown> | undefined {
     for (const grant of this.#grants.values()) if (grant.taskId === taskId && grant.stepId === stepId && grant.lastObservation) return structuredClone(grant.lastObservation);
     return undefined;

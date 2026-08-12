@@ -601,6 +601,15 @@ extension ComputerCoordinator {
         cuaDriver?.cancelAndStop()
     }
 
+    /// App quit owns a stronger boundary than an interactive cancel: the
+    /// process must not return until its embedded Cua children are gone.
+    func shutdownCuaRuntimeAndWait() {
+        cuaSessionTargets.removeAll()
+        cuaInFlightOperation?.task?.cancel()
+        cuaInFlightOperation = nil
+        cuaDriver?.shutdownAndWait()
+    }
+
     private func finishCuaOperation(_ operation: CuaInFlightOperation) {
         guard cuaInFlightOperation === operation else { return }
         operation.task = nil

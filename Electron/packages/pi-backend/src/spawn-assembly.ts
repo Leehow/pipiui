@@ -6,7 +6,7 @@ export type Feature = "philosophy"|"plan"|"generateImage"|"git"|"reload"|"webSea
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
 export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"computerUse"|"webview"|"terminal"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
-export type SpawnInput = { sessionPath?: string; cwd: string; runtimeRoot?: string; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; excludeToolsArgs?: string[] };
+export type SpawnInput = { sessionPath?: string; cwd: string; runtimeRoot?: string; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; subagentModelsFile?: string; excludeToolsArgs?: string[] };
 export type SpawnOutput = { args: string[]; env: Record<string,string> };
 /**
  * An explicit process invocation for Pi.
@@ -64,7 +64,7 @@ if(enabled(f,"subagent")&&p.subagentDir){ext(args,p.subagentDir);env.PIPIUI_SUBA
 // to the audited service in pi so
 // exactly one finalizer ever runs against a repository.
 env.PIPIUI_WORKTREE_FINALIZER="pi";
-if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI_MAIN_MODEL=input.mainModelId;env.PIPIUI_COMPUTER_PROCEDURE_STORE=join(homedir(),"Library","Application Support","PipiUI","computer-agent","procedures.json")}
+if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI_MAIN_MODEL=input.mainModelId;if(input.subagentModelsFile)env.PIPIUI_SUBAGENT_MODELS_FILE=input.subagentModelsFile;env.PIPIUI_COMPUTER_PROCEDURE_STORE=join(homedir(),"Library","Application Support","PipiUI","computer-agent","procedures.json")}
 if(!input.bridgePort)return{args,env};
 // Genuinely bridge-dependent: the memory broker issues host-scoped capabilities, the webview
 // extension drives the host's browser surface, and an explicitly enabled plan runtime posts events.
@@ -72,11 +72,12 @@ if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PI
 // Canonical v1: the extension encodes `sessionCapability` envelopes and fails closed when the
 // capability is missing, so the protocol marker is only ever set together with a real credential.
 if(input.sessionCapability){env.PIPIUI_HOST_PROTOCOL="1";env.PIPIUI_SESSION_CAPABILITY=input.sessionCapability}
-if(enabled(f,"computerUse")&&p.computerUse&&input.computerCapability&&input.computerDescriptor){
-// Electron exposes Computer Use in the fresh main Pi session. PIPIUI_COMPUTER_EXT
-// remains exported so desktop-authorized nested operators can mount the same
-// reviewed strategy; the capability still gates both processes.
-ext(args,p.computerUse);env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.19.2";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
+if(enabled(f,"computerUse")&&enabled(f,"subagent")&&p.subagentDir&&p.computerUse&&input.computerCapability&&input.computerDescriptor){
+// The main Pi session owns only computer_task orchestration through the subagent
+// extension mounted above. Export the reviewed strategy for explicitly granted
+// GUI Operator children; never register mutating computer/open_application tools
+// directly in the main session.
+env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.19.2";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
 return{args,env}; }
 function declaredEntrypoint(root:string):string|undefined {
   try {

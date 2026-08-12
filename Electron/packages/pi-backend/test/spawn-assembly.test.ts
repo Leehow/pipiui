@@ -141,6 +141,11 @@ describe("bridge-free subagent orchestration", () => {
     expect(env.PIPIUI_BRIDGE_PORT).toBeUndefined();
   });
 
+  it("binds nested model resolution to the Electron-owned materialized settings file", () => {
+    const { env } = assemblePiSpawn({ cwd: "/tmp/project", features: { subagent: true }, paths, subagentModelsFile: "/electron/agent/subagent-models.json" });
+    expect(env.PIPIUI_SUBAGENT_MODELS_FILE).toBe("/electron/agent/subagent-models.json");
+  });
+
   it("keeps genuinely bridge-dependent extensions gated", () => {
     const { args } = assemblePiSpawn({ cwd: "/tmp/project", features: { subagent: true, memoryBroker: true, browser: true, philosophy: true }, paths });
     expect(args).not.toContain("/ext/memory");
@@ -227,10 +232,11 @@ describe("default feature set", () => {
   });
 
   it("exports computer runtime routing only with a resolved extension, descriptor and capability", () => {
-    const ready = assemblePiSpawn({ cwd: "/tmp/project", features: { computerUse: true }, paths: { computerUse: "/runtime/pipiui-computer-use.ts" }, bridgePort: 1234, bridgeRoutingKey: "session-id", computerCapability: "computer-secret", computerDescriptor: { displayID: 7, width: 1440, height: 900 } });
-    expect(ready.args).toEqual(expect.arrayContaining(["-e", "/runtime/pipiui-computer-use.ts"]));
+    const ready = assemblePiSpawn({ cwd: "/tmp/project", features: { computerUse: true, subagent: true }, paths: { computerUse: "/runtime/pipiui-computer-use.ts", subagentDir: "/runtime/pi-ext/subagent" }, bridgePort: 1234, bridgeRoutingKey: "session-id", computerCapability: "computer-secret", computerDescriptor: { displayID: 7, width: 1440, height: 900 } });
+    expect(ready.args).toEqual(expect.arrayContaining(["-e", "/runtime/pi-ext/subagent"]));
+    expect(ready.args).not.toContain("/runtime/pipiui-computer-use.ts");
     expect(ready.env).toMatchObject({ PIPIUI_COMPUTER_EXT: "/runtime/pipiui-computer-use.ts", PIPIUI_COMPUTER_CAPABILITY: "computer-secret", PIPIUI_COMPUTER_RUNTIME_PROTOCOL: "1", PIPIUI_COMPUTER_DISPLAY_ID: "7", PIPIUI_COMPUTER_WIDTH: "1440", PIPIUI_COMPUTER_HEIGHT: "900" });
-    const unavailable = assemblePiSpawn({ cwd: "/tmp/project", features: { computerUse: true }, paths: { computerUse: "/runtime/pipiui-computer-use.ts" }, bridgePort: 1234 });
+    const unavailable = assemblePiSpawn({ cwd: "/tmp/project", features: { computerUse: true }, paths: { computerUse: "/runtime/pipiui-computer-use.ts" }, bridgePort: 1234, computerCapability: "computer-secret", computerDescriptor: { displayID: 7, width: 1440, height: 900 } });
     expect(unavailable.args).not.toContain("/runtime/pipiui-computer-use.ts");
     expect(unavailable.env.PIPIUI_COMPUTER_EXT).toBeUndefined();
   });

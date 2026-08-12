@@ -115,4 +115,17 @@ describe('BrowserPanel', () => {
     rerender(<BrowserPanel host={host} sessionId="welcome" />)
     await waitFor(() => expect(address.value).toBe('https://welcome.example'))
   })
+
+  it('hides the native browser view while occluded and restores its current bounds', async () => {
+    const host = createMockHost()
+    const setViewBounds = vi.spyOn(host.browser!, 'setViewBounds')
+    const { rerender } = render(<BrowserPanel host={host} sessionId="welcome" />)
+    await waitFor(() => expect(setViewBounds).toHaveBeenCalledWith('welcome', expect.objectContaining({ visible: true })))
+
+    rerender(<BrowserPanel host={host} sessionId="welcome" occluded />)
+    await waitFor(() => expect(setViewBounds).toHaveBeenCalledWith('welcome', { x: 0, y: 0, width: 0, height: 0, visible: false }))
+
+    rerender(<BrowserPanel host={host} sessionId="welcome" occluded={false} />)
+    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1]).toMatchObject({ visible: true }))
+  })
 })

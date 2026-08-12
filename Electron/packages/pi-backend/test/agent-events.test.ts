@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent, AgentSummary, HostEvent } from "@pipi/host-api";
@@ -17,11 +17,22 @@ const UPDATE = { kind: "update", agentId: "a1", runId: "r1", output: "部分结�
 const END = { kind: "end", agentId: "a1", runId: "r1", ok: true, output: "最终结果全文", cost: 0.55, turns: 4 };
 
 let root = "";
-afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = ""; });
+let backends: ReturnType<typeof createPiHostBackend>[] = [];
+async function closeTracked(backend: ReturnType<typeof createPiHostBackend>) {
+  await backend.close();
+  backends = backends.filter(candidate => candidate !== backend);
+}
+afterEach(async () => {
+  await Promise.all(backends.map(backend => backend.close()));
+  backends = [];
+  if (root) await rm(root, { recursive: true, force: true });
+  root = "";
+});
 
 async function harness() {
   root = await mkdtemp(join(tmpdir(), "pipi-agent-events-"));
   const backend = createPiHostBackend({ agentDir: join(root, "agent"), sessionsRoot: join(root, "sessions") });
+  backends.push(backend);
   const events: AgentEvent[] = [];
   backend.subscribe((frame: HostEvent) => { if (frame.channel === "agents") events.push(frame.event) });
   // The bridge hands each envelope's inner `event` to the mapper together with its session.
@@ -34,6 +45,17 @@ async function harness() {
 }
 
 describe("subagent lifecycle → AgentSummary", () => {
+	it("routes targeted abort through the owning live Pi command and waits for the real end event", async () => {
+		const { backend, deliver, latest } = await harness();
+		deliver({ ...START, agentId: "agent-safe_1" });
+		const command = vi.fn(async () => ({}));
+		(backend as any).command = command;
+		await backend.handle("abortAgent", ["agent-safe_1"]);
+		expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1" });
+		expect(latest().state).toBe("running");
+		deliver({ ...END, agentId: "agent-safe_1", ok: false, output: "aborted" });
+		expect(latest().state).toBe("failed");
+	});
   it("carries identity, model, live activity and tokens through to the panel", async () => {
     const { deliver, latest } = await harness();
 
@@ -65,6 +87,22 @@ describe("subagent lifecycle → AgentSummary", () => {
     deliver(START);
     const worktree = events.filter((event): event is Extract<AgentEvent, { type: "worktree" }> => event.type === "worktree");
     expect(worktree.at(-1)?.status).toMatchObject({ agentId: "a1", path: "/tmp/wt", branch: "pipiui/worker-a1", lifecycle: "active" });
+  });
+
+  it("does not display a private Operator blocked verdict as successful just because Pi exited zero", async () => {
+    const { deliver, latest } = await harness();
+    deliver({ ...START, name: "operator" });
+    deliver({
+      ...END,
+      name: "operator",
+      ok: true,
+      output: JSON.stringify({ outcome: "blocked", summary: "The document remained inaccessible." }),
+    });
+    expect(latest()).toMatchObject({
+      name: "operator",
+      state: "failed",
+      finalResult: JSON.stringify({ outcome: "blocked", summary: "The document remained inaccessible." }),
+    });
   });
 
   it("relays streamed log deltas and batched log items", async () => {
@@ -104,6 +142,94 @@ describe("subagent lifecycle → AgentSummary", () => {
     deliver(START);
     deliver({ kind: "end", agentId: "a1", runId: "r1", ok: false, output: "boom" });
     expect(latest()).toMatchObject({ state: "failed", finalResult: "boom" });
+  });
+
+  it("clears terminal fields when a Computer Leader reuses its agentId for a new planning run", async () => {
+    const { deliver, latest } = await harness();
+    deliver({ ...START, agentId: "leader", runId: "plan-1", name: "computer-use-leader" });
+    deliver({ ...END, agentId: "leader", runId: "plan-1", output: "old plan" });
+    expect(latest()).toMatchObject({ state: "ok", finalResult: "old plan" });
+    expect(latest().endedAt).toBeGreaterThan(0);
+    deliver({
+      ...START,
+      agentId: "leader",
+      runId: "replan-2",
+      name: "computer-use-leader",
+      task: "Revise this Computer Task plan after real failure",
+      title: "Revise Computer Task",
+    });
+    expect(latest()).toMatchObject({ state: "running", runId: "replan-2" });
+    expect(latest().endedAt).toBeUndefined();
+    expect(latest().finalResult).toBeUndefined();
+  });
+
+  it("rehydrates the session-scoped tree after restart without faking a running process", async () => {
+    const { backend, deliver } = await harness();
+    deliver(START);
+    deliver(UPDATE);
+    (backend as unknown as { mapAgentEvent(raw: unknown, sessionId?: string): void }).mapAgentEvent(
+      { ...START, runId: "r-other", task: "另一个项目里的同名切片", title: "另一个项目" },
+      "session-2"
+    );
+    await closeTracked(backend);
+
+    const restarted = createPiHostBackend({ agentDir: join(root, "agent"), sessionsRoot: join(root, "sessions") });
+    backends.push(restarted);
+    await expect(restarted.handle("listAgents", ["another-session"])).resolves.toEqual([]);
+    await expect(restarted.handle("listAgents", ["session-1"])).resolves.toMatchObject([{
+      agentId: "a1",
+      runId: "r1",
+      state: "interrupted",
+      task: "接入真实左侧栏",
+      title: "接入真实左侧栏",
+      listSubtitle: "bash cd Electron && npm run build",
+      sessionId: "session-1"
+    }]);
+    await expect(restarted.handle("listAgents", ["session-2"])).resolves.toMatchObject([{
+      agentId: "a1",
+      runId: "r-other",
+      state: "interrupted",
+      task: "另一个项目里的同名切片",
+      sessionId: "session-2"
+    }]);
+    await closeTracked(restarted);
+  });
+
+  it("loads the durable index before an immediate live START can replace or drop rows", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-agent-events-race-"));
+    const agentDir = join(root, "agent");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(join(agentDir, "pipiui-agent-index.json"), JSON.stringify({
+      version: 1,
+      agents: [
+        { agentId: "same", runId: "stale-run", name: "general-purpose", task: "旧任务", state: "ok", sessionId: "session-live", createdAt: 1 },
+        { agentId: "old", runId: "old-run", name: "explore", task: "历史无关任务", state: "ok", sessionId: "session-old", createdAt: 2 }
+      ],
+      worktrees: []
+    }));
+
+    const backend = createPiHostBackend({ agentDir, sessionsRoot: join(root, "sessions") });
+    backends.push(backend);
+    // Deliberately no await/yield between construction and event delivery.
+    (backend as unknown as { mapAgentEvent(raw: unknown, sessionId?: string): void }).mapAgentEvent(
+      { ...START, agentId: "same", runId: "new-run", task: "当前新任务", title: "当前新任务" },
+      "session-live"
+    );
+
+    await expect(backend.handle("listAgents", ["session-live"])).resolves.toMatchObject([{
+      agentId: "same", runId: "new-run", state: "running", task: "当前新任务"
+    }]);
+    await expect(backend.handle("listAgents", ["session-old"])).resolves.toMatchObject([{
+      agentId: "old", runId: "old-run", task: "历史无关任务"
+    }]);
+    await closeTracked(backend);
+
+    const restarted = createPiHostBackend({ agentDir, sessionsRoot: join(root, "sessions") });
+    backends.push(restarted);
+    await expect(restarted.handle("listAgents", [])).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: "same", runId: "new-run", state: "interrupted", task: "当前新任务" }),
+      expect.objectContaining({ agentId: "old", runId: "old-run", task: "历史无关任务" })
+    ]));
   });
 
   it("keeps a resolved failure terminal instead of synthesizing a generic running agent", async () => {

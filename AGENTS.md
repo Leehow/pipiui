@@ -48,8 +48,30 @@ Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may cre
 cd /Users/haoli/leehow/code/pipiui
 ./make-app.sh              # the sole release .app location
 ./scripts/build-app.sh              # test (optional skip) then make-app.sh
-./scripts/build-electron-app.sh     # Electron → build/PipiUI Electron.app
 ```
+
+### Electron packaging adapter (binding)
+
+All Electron packaging goes through the `pipiui-electron-build` skill. Do not
+invoke `electron-builder` by hand, and do not call
+`./scripts/build-electron-app.sh` directly — reach it through the skill's
+`release` mode.
+
+```bash
+~/.codex/skills/pipiui-electron-build/scripts/pipiui-electron-build fast-app  # host arch, signed, no DMG/ZIP
+~/.codex/skills/pipiui-electron-build/scripts/pipiui-electron-build release   # dual arch + DMG/ZIP
+```
+
+The skill is the only path that carries the packaging invariants: it refuses to
+overwrite a running canonical App, cleans its own staging tree (leaked
+`.electron-fast-*` directories previously grew `build/` past 9GB), exports the
+`PIPIUI_EMBEDDED_RUNTIME_TARGET` that selects the per-architecture Cua driver
+slice, and checks the result against a size budget. A single-architecture App is
+~610MB; it was 1.2GB before the packaging was slimmed, so a bundle near that size
+is a regression to report, not a heavier build to ship. Read the skill's
+`SKILL.md` before changing anything under `Electron/apps/electron/package.json`
+`build`, `scripts/fetch-pi-runtime.mjs`, or `scripts/fetch-cua-driver.mjs` —
+each holds a slimming invariant that an innocuous-looking edit silently undoes.
 
 ### 快速打包（快速迭代）
 
@@ -79,7 +101,7 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 | Build / run docs | `README.md` → 构建运行 |
 | Package App (primary checkout only) | `./make-app.sh` → `build/PipiUI.app` |
 | Test + package (primary checkout only) | `./scripts/build-app.sh` |
-| Package Electron App (primary checkout only) | `./scripts/build-electron-app.sh` → `build/PipiUI Electron.app` |
+| Package Electron App (primary checkout only) | `pipiui-electron-build` skill → `fast-app` (host arch) or `release` (dual arch + DMG/ZIP); never `electron-builder` by hand |
 | 快速打包（跳过测试） | `./scripts/build-app.sh --skip-tests`（或 `./make-app.sh`） |
 | Worker/dev verification | `swift run` / `swift build` / `swift test` |
 

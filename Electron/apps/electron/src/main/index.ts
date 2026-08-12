@@ -11,6 +11,7 @@ import {
   type HostWireFrame
 } from '@pipi/host-api'
 import { BrowserSessionHost, routeBrowserView, withBrowserTabsHost } from './browser-host.js'
+import { installOwnedRuntimeShutdown } from './app-lifecycle.js'
 import { CuaDriverHost } from './cua-driver-host.js'
 import { resolveRuntimeAssets } from './runtime-assets.js'
 import { withOpenExternal } from './external-url.js'
@@ -76,6 +77,8 @@ function createWindow(browser: BrowserSessionHost, onClosed: () => void): void {
     height: 800,
     frame: false,
     focusable: false,
+    hasShadow: false,
+    opacity: 0,
     skipTaskbar: true
   })
   browser.attachToWindow((rawView, visible) => {
@@ -135,7 +138,7 @@ if (app) {
     const terminalBackend = terminalHost.wrapBackend(piBackend)
     registerPipiHostIpc(ipcMain, withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)))
     createWindow(browser, () => terminalHost.closeAll())
-    app.on('before-quit', () => terminalHost.closeAll())
+    installOwnedRuntimeShutdown(app, terminalHost, computer, piBackend)
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow(browser, () => terminalHost.closeAll())
     })

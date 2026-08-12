@@ -88,6 +88,17 @@ describe('persistent embedded Pi runtime CLI', () => {
     expect(await readdir(root)).toEqual(beforeEntries)
   })
 
+  it('rejects a target prepared before pruning so the release cannot ship the fat tree', async () => {
+    const arm = await seed('darwin', 'arm64')
+    const piCli = join(arm, 'pi', 'lib', 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js')
+    expect(run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '').status).toBe(0)
+
+    await writeFile(`${piCli}.map`, '{"version":3}')
+    const stale = run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '')
+    expect(stale.status).toBe(1)
+    expect(stale.stderr).toContain('development-only sourcemaps')
+  })
+
   it('detects a version-stale target while leaving an independent target usable', async () => {
     const arm = await seed('darwin', 'arm64')
     await seed('darwin', 'x64')

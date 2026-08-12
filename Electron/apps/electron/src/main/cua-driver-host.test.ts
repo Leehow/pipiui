@@ -3,12 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  actionableContextChanged,
   buildActionCall,
   CUA_DRIVER_VERSION,
   cuaSocketPath,
+  cuaToolFailureCode,
   CuaDriverHost,
   selectLaunchWindow,
 } from "./cua-driver-host.js";
+import { ComputerWorkerBroker } from "../../../../../Sources/PipiUI/PiExt/packages/computer-agent/src/worker-broker.ts";
 
 describe("CuaDriverHost", () => {
   const roots: string[] = [];
@@ -29,6 +32,266 @@ describe("CuaDriverHost", () => {
         42,
       ),
     ).toMatchObject({ window_id: 8 });
+  });
+
+  it("pins an on-screen current-space TextEdit window ahead of a larger off-screen sibling", () => {
+    expect(selectLaunchWindow([
+      { pid: 42, window_id: 100620, bounds: { x: 0, y: -1003, width: 1200, height: 900 }, is_on_screen: false, on_current_space: false, z_index: null },
+      { pid: 42, window_id: 100621, bounds: { x: 80, y: 60, width: 800, height: 600 }, is_on_screen: true, on_current_space: true, z_index: 9 },
+    ], 42)).toMatchObject({ window_id: 100621 });
+  });
+
+  it("pins a real content window ahead of a thin high-z sharing surface", () => {
+    expect(selectLaunchWindow([
+      { pid: 91023, window_id: 101025, bounds: { x: 219, y: -997, width: 66, height: 20 }, is_on_screen: true, on_current_space: true, z_index: 391 },
+      { pid: 91023, window_id: 100646, bounds: { x: -1259, y: -762, width: 673, height: 439 }, is_on_screen: true, on_current_space: true, z_index: 385 },
+      { pid: 91023, window_id: 100620, bounds: { x: -1282, y: -1003, width: 603, height: 505 }, is_on_screen: true, on_current_space: true, z_index: 382 },
+    ], 91023)).toMatchObject({ window_id: 100646 });
+    expect(selectLaunchWindow([
+      { pid: 7, window_id: 70, bounds: { x: 0, y: 0, width: 90, height: 60 }, is_on_screen: true, on_current_space: true, z_index: 1 },
+    ], 7)).toMatchObject({ window_id: 70 });
+  });
+
+  it("detects a Save sheet appearing over the pinned parent window", () => {
+    const target = { session: "save", pid: 42, window_id: 77 };
+    const parent = { accessibility: { elements: [
+      { element_index: 0, role: "AXWindow", name: "Untitled", frame: { x: 0, y: 0, width: 800, height: 600 } },
+      { element_index: 1, role: "AXButton", name: "Format" },
+    ] } };
+    const sheet = { accessibility: { elements: [
+      ...parent.accessibility.elements,
+      { element_index: 2, parent_index: 0, role: "AXSheet", name: "Save", frame: { x: 120, y: 90, width: 560, height: 400 } },
+      { element_index: 3, parent_index: 2, role: "AXButton", name: "Save" },
+    ] } };
+    expect(actionableContextChanged(parent, sheet, target)).toBe(true);
+  });
+
+  it("ignores volatile window title, frame, and AX enumeration order", () => {
+    const target = { session: "save", pid: 42, window_id: 77 };
+    const before = { accessibility: { elements: [
+      { element_index: 0, role: "AXWindow", name: "Untitled", frame: { x: 0, y: 0, width: 800, height: 600 }, window_id: 77 },
+      { element_index: 1, role: "AXDialog", name: "Old title", parent_index: 0, element_id: "dialog-1", frame: { x: 10, y: 10, width: 300, height: 200 } },
+    ] } };
+    const after = { accessibility: { elements: [
+      { element_index: 8, role: "AXDialog", name: "New title", parent_index: 9, element_id: "dialog-1", frame: { x: 50, y: 80, width: 420, height: 260 } },
+      { element_index: 9, role: "AXWindow", name: "Edited", frame: { x: 1, y: 2, width: 900, height: 700 }, window_id: 77 },
+    ] } };
+    expect(actionableContextChanged(before, after, target)).toBe(false);
+  });
+
+  it("stops a batch after an action opens a sheet instead of clicking through it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-modal-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    let observations = 0;
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.targets.set("save", { session: "save", pid: 42, window_id: 77 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "get_window_state") {
+        observations += 1;
+        return { structuredContent: {
+          screenshot_png_b64: `PNG-${observations}`,
+          elements: observations === 1
+            ? [{ element_index: 0, role: "AXWindow", name: "Untitled" }]
+            : [
+                { element_index: 0, role: "AXWindow", name: "Untitled" },
+                { element_index: 1, parent_index: 0, role: "AXSheet", name: "Save" },
+              ],
+        } };
+      }
+      return { structuredContent: {} };
+    };
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "save",
+      action: "computer_batch",
+      actions: [
+        { type: "key", key: "CMD+S" },
+        { type: "click", coordinate: [700, 500] },
+      ],
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      batchInterrupted: true,
+      interruptionReason: "actionable_context_changed",
+      requiresReplan: true,
+      completedActions: 1,
+    });
+    expect(calls.filter((call) => call.name === "press_key")).toHaveLength(1);
+    expect(calls.filter((call) => call.name === "click")).toHaveLength(0);
+  });
+
+  it("requires re-observation and then blocks a repeated no-progress click", async () => {
+    let capture = 0;
+    let runtimeCalls = 0;
+    const unchanged = () => ({
+      screenshotId: `observation-${++capture}`,
+      base64: "SAME_PNG",
+      accessibility: {
+        snapshot_id: `snapshot-${capture}`,
+        elements: [{ role: "button", name: "Behind sheet", snapshot_id: `element-snapshot-${capture}` }],
+      },
+    });
+    const broker = new ComputerWorkerBroker({ request: async () => {
+      runtimeCalls += 1;
+      return unchanged();
+    } });
+    const grant = broker.issue({ taskId: "task", stepId: "step", runId: "run", role: "gui-operator" });
+    await broker.execute(grant.token, { operation: "observe", payload: { fresh: true } });
+    const action = { operation: "mutate" as const, payload: {
+      actions: [{ type: "click", coordinate: [700, 500] }],
+    } };
+    await expect(broker.execute(grant.token, action)).resolves.toMatchObject({
+      noProgress: { status: "reobserve_required", unchangedAttempts: 1 },
+    });
+    await expect(broker.execute(grant.token, action)).rejects.toThrow(
+      "no_progress_requires_fresh_observation",
+    );
+    await broker.execute(grant.token, { operation: "observe", payload: { fresh: true } });
+    const callsBeforeBlockedRetry = runtimeCalls;
+    await expect(broker.execute(grant.token, action)).rejects.toThrow(
+      "no_progress_budget_exhausted",
+    );
+    expect(runtimeCalls).toBe(callsBeforeBlockedRetry);
+    await expect(broker.execute(grant.token, {
+      operation: "mutate",
+      payload: { actions: [{ type: "key", key: "ESCAPE" }] },
+    })).resolves.toMatchObject({ noProgress: { status: "reobserve_required" } });
+    expect(runtimeCalls).toBe(callsBeforeBlockedRetry + 1);
+  });
+
+  it("unblocks a mutation signature after a fresh observation proves UI progress", async () => {
+    let state = "A";
+    let runtimeCalls = 0;
+    const broker = new ComputerWorkerBroker({ request: async (request) => {
+      runtimeCalls += 1;
+      if ((request as any).actions?.[0]?.coordinate?.[0] === 10 && state === "B") state = "C";
+      return {
+        screenshotId: `observation-${runtimeCalls}`,
+        base64: `PNG-${state}`,
+        accessibility: { snapshot_id: `snapshot-${runtimeCalls}`, elements: [{ role: "button", name: state }] },
+      };
+    } });
+    const grant = broker.issue({ taskId: "task-change", stepId: "step", runId: "run", role: "gui-operator" });
+    await broker.execute(grant.token, { operation: "observe", payload: { fresh: true } });
+    const action = { operation: "mutate" as const, payload: {
+      actions: [{ type: "click", coordinate: [10, 10] }],
+    } };
+    await expect(broker.execute(grant.token, action)).resolves.toMatchObject({
+      noProgress: { status: "reobserve_required" },
+    });
+    state = "B";
+    await broker.execute(grant.token, { operation: "observe", payload: { fresh: true } });
+    await expect(broker.execute(grant.token, action)).resolves.not.toHaveProperty("noProgress");
+  });
+
+  it("preserves a structured mutation outcome unknown through the worker broker", async () => {
+    const unknown = {
+      ok: false,
+      outcomeUnknown: true,
+      runtimeError: {
+        code: "mutation_outcome_unknown",
+        message: "post-action observation failed",
+        requiresObservation: true,
+      },
+      screenshotId: "best-effort-observation",
+      base64: "PNG",
+      accessibility: { elements: [] },
+    };
+    const broker = new ComputerWorkerBroker({ request: async () => unknown });
+    const grant = broker.issue({ taskId: "unknown", stepId: "step", runId: "run", role: "gui-operator" });
+    await expect(broker.execute(grant.token, {
+      operation: "mutate",
+      payload: { actions: [{ type: "click", coordinate: [10, 10] }] },
+    })).resolves.toMatchObject({
+      outcomeUnknown: true,
+      runtimeError: { code: "mutation_outcome_unknown", requiresObservation: true },
+    });
+    expect(broker.observation("unknown", "step")).toMatchObject({ outcomeUnknown: true });
+  });
+
+  it("does not rebind a tail element action after the snapshot changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-snapshot-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    let observations = 0;
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.targets.set("snapshot", { session: "snapshot", pid: 42, window_id: 77 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "get_window_state") {
+        observations += 1;
+        return { structuredContent: {
+          screenshot_png_b64: `PNG-${observations}`,
+          snapshot_id: `snapshot-${observations}`,
+          elements: [{ element_index: 0, role: "AXWindow", window_id: 77 }],
+        } };
+      }
+      return { structuredContent: {} };
+    };
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "snapshot",
+      action: "computer_batch",
+      actions: [
+        { type: "click", coordinate: [10, 10] },
+        { type: "click", element_index: 4 },
+      ],
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      batchInterrupted: true,
+      interruptionReason: "snapshot_changed",
+      requiresReplan: true,
+      completedActions: 1,
+    });
+    expect(calls.filter((call) => call.name === "click")).toHaveLength(1);
+  });
+
+  it("returns outcome unknown when mandatory post-mutation observation fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-unknown-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: string[] = [];
+    let observations = 0;
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.targets.set("unknown", { session: "unknown", pid: 42, window_id: 77 });
+    host.call = async (name: string) => {
+      calls.push(name);
+      if (name === "get_window_state" && observations++ === 0) {
+        return { structuredContent: {
+          screenshot_png_b64: "BEFORE",
+          elements: [{ role: "AXWindow", window_id: 77 }],
+        } };
+      }
+      if (name === "get_window_state") throw new Error("post-observe failed");
+      return { structuredContent: {} };
+    };
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "unknown",
+      action: "computer_batch",
+      actions: [
+        { type: "click", coordinate: [10, 10] },
+        { type: "click", coordinate: [20, 20] },
+      ],
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      outcomeUnknown: true,
+      runtimeError: { code: "mutation_outcome_unknown" },
+      completedActions: 0,
+    });
+    expect(calls.filter((name) => name === "click")).toHaveLength(1);
   });
 
   it("keeps the daemon socket below the macOS sockaddr_un byte limit", () => {
@@ -107,11 +370,154 @@ describe("CuaDriverHost", () => {
         rejected = error.message;
       },
     });
+    host.targets.set("session", { session: "session", pid: 42, window_id: 100 });
+    host.rootTargets.set("session", { session: "session", pid: 42, window_id: 100 });
     host.cancel();
     expect({ daemonKilled, proxyKilled, rejected }).toEqual({
       daemonKilled: true,
       proxyKilled: true,
       rejected: "computer request cancelled",
+    });
+    expect(host.targets.size).toBe(0);
+    expect(host.rootTargets.size).toBe(0);
+  });
+
+  it("does not finish shutdown until owned helpers that ignore SIGTERM are reaped", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-host-shutdown-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    const trace = join(root, "pids.jsonl");
+    await writeFile(helper, `#!/usr/bin/env node
+const fs = require("node:fs");
+const net = require("node:net");
+const readline = require("node:readline");
+const mode = process.argv[2];
+const socket = process.argv[process.argv.indexOf("--socket") + 1];
+fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify({ mode, pid: process.pid }) + "\\n");
+process.on("SIGTERM", () => {});
+if (mode === "serve") {
+  net.createServer(() => {}).listen(socket);
+  setInterval(() => {}, 1000);
+} else {
+  const lines = readline.createInterface({ input: process.stdin });
+  lines.on("line", (line) => {
+    const message = JSON.parse(line);
+    if (!message.id) return;
+    const result = message.method === "initialize"
+      ? { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "fake", version: "1" } }
+      : { content: [], structuredContent: {}, isError: false };
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n");
+  });
+  setInterval(() => {}, 1000);
+}
+`);
+    await chmod(helper, 0o755);
+    const host = new CuaDriverHost(helper, { displayID: 1, width: 1, height: 1 });
+    await expect(host.handle({
+      protocolVersion: 1,
+      action: "computer_runtime_capabilities",
+    })).resolves.toMatchObject({ ok: true });
+    const pids = (await readFile(trace, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line).pid as number);
+    expect(pids).toHaveLength(2);
+
+    await host.shutdown();
+
+    for (const pid of pids) {
+      expect(() => process.kill(pid, 0), `pid ${pid} survived shutdown`).toThrow();
+    }
+  });
+
+  it("fences an in-flight startup before it can spawn a helper after shutdown", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-host-startup-shutdown-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    const trace = join(root, "pids.jsonl");
+    await writeFile(helper, `#!/usr/bin/env node
+const fs = require("node:fs");
+const net = require("node:net");
+const readline = require("node:readline");
+const mode = process.argv[2];
+const socket = process.argv[process.argv.indexOf("--socket") + 1];
+fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify({ mode, pid: process.pid }) + "\\n");
+if (mode === "serve") {
+  let server;
+  process.on("SIGTERM", () => {
+    if (!server) server = net.createServer(() => {}).listen(socket);
+  });
+  setInterval(() => {}, 1000);
+} else {
+  process.on("SIGTERM", () => {});
+  const lines = readline.createInterface({ input: process.stdin });
+  lines.on("line", (line) => {
+    const message = JSON.parse(line);
+    if (!message.id) return;
+    const result = message.method === "initialize"
+      ? { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "fake", version: "1" } }
+      : { content: [], structuredContent: {}, isError: false };
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n");
+  });
+  setInterval(() => {}, 1000);
+}
+`);
+    await chmod(helper, 0o755);
+    const host = new CuaDriverHost(helper, { displayID: 1, width: 1, height: 1 });
+    const request = host.handle({
+      protocolVersion: 1,
+      action: "computer_runtime_capabilities",
+    });
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const current = await readFile(trace, "utf8").catch(() => "");
+      if (current.includes('"mode":"serve"')) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const shutdown = host.shutdown();
+    await Promise.allSettled([request, shutdown]);
+    const records = (await readFile(trace, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { mode: string; pid: number });
+    const survivors = records.filter(({ pid }) => {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    });
+    for (const { pid } of survivors) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already exited */ }
+    }
+
+    expect(records.map(({ mode }) => mode)).toEqual(["serve"]);
+    expect(survivors).toEqual([]);
+  });
+
+  it("extracts only closed target-window codes from Cua tool failures", () => {
+    expect(cuaToolFailureCode({
+      isError: true,
+      structuredContent: { error_code: "window_id_not_found" },
+    })).toBe("window_id_not_found");
+    expect(cuaToolFailureCode({
+      isError: true,
+      content: [{ type: "text", text: "window_owner_pid_mismatch owner_pid=84" }],
+    })).toBe("window_owner_pid_mismatch");
+    expect(cuaToolFailureCode({
+      isError: true,
+      structuredContent: { error_code: "arbitrary_failure" },
+      content: [{ type: "text", text: "owner_pid=84" }],
+    })).toBeUndefined();
+  });
+
+  it("classifies only its own RPC deadline with a closed typed timeout code", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-host-test-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1, height: 1 }, undefined, 10);
+    host.proxy = { stdin: { writable: true, write: () => true }, killed: false };
+    await expect(host.rpc("tools/call", { name: "screenshot", arguments: {} })).rejects.toMatchObject({
+      name: "CuaDriverRPCTimeoutError",
+      code: "cua_driver_rpc_timeout",
     });
   });
 
@@ -160,8 +566,14 @@ describe("CuaDriverHost", () => {
       },
     });
     expect(
-      buildActionCall({ type: "key", keys: ["CMD", "L"] }, target),
-    ).toMatchObject({
+      buildActionCall({
+        type: "key",
+        keys: ["CMD", "L"],
+        element_token: "s00000001:0",
+        element_index: 9,
+        snapshot_id: "snapshot-old",
+      }, target),
+    ).toEqual({
       tool: "hotkey",
       arguments: {
         session: "session-a",
@@ -185,6 +597,319 @@ describe("CuaDriverHost", () => {
         amount: 4,
       },
     });
+  });
+
+  it("escalates ambiguous same-pid keyboard actions to the exact foreground window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-keyboard-ambiguity-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    host.targets.set("open-panel", { session: "open-panel", pid: 91023, window_id: 101369 });
+    host.rootTargets.set("open-panel", { session: "open-panel", pid: 91023, window_id: 101240 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "get_window_state") return { structuredContent: {
+        screenshot_png_b64: "PNG",
+        snapshot_id: "snapshot-panel",
+        pid: 91023,
+        window_id: 101369,
+        elements: [{ role: "AXWindow" }, { role: "AXList" }],
+        background_input: { routes: [
+          { route: "accessibility", status: "available" },
+          { route: "pid_keyboard", status: "refused", reason: "same_pid_keyboard_ambiguity" },
+        ] },
+      } };
+      return { structuredContent: {} };
+    };
+    for (const action of [
+      { type: "key", keys: ["CMD", "SHIFT", "G"] },
+      { type: "type", text: "pipiui-computer-agent-final-acceptance-19.txt" },
+      { type: "key", key: "RETURN" },
+    ]) {
+      expect(await host.handle({
+        protocolVersion: 1,
+        sessionKey: "open-panel",
+        action: "computer_batch",
+        actions: [action],
+      })).toMatchObject({ ok: true });
+    }
+    expect(calls.filter((call) => ["hotkey", "type_text", "press_key"].includes(call.name))
+      .map((call) => ({ name: call.name, pid: call.args.pid, window: call.args.window_id, delivery: call.args.delivery_mode })))
+      .toEqual([
+        { name: "hotkey", pid: 91023, window: 101369, delivery: "foreground" },
+        { name: "type_text", pid: 91023, window: 101369, delivery: "foreground" },
+        { name: "press_key", pid: 91023, window: 101369, delivery: "foreground" },
+      ]);
+  });
+
+  it("opens one exact Open Panel file child and proves return to the immutable document surface", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-typeahead-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+	let panelRoot = '- [0] AXWindow "打开" [id=open-panel actions=[raise]]\n  - [55] AXList [actions=[showmenu]]\n    - [57] AXImage "pipiui-computer-agent-final-acceptance-24.txt" [actions=[open,showmenu]]';
+	let fileLists: Array<Record<string, unknown>> = [
+	  { element_index: 55, element_token: "s00000024:55", role: "AXList", label: "图标视图" },
+	];
+	let fileChildren: Array<Record<string, unknown>> = [];
+	let opened = false;
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.targets.set("open-panel", { session: "open-panel", pid: 91023, window_id: 101369 });
+	host.rootTargets.set("open-panel", { session: "open-panel", pid: 91023, window_id: 101240 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+	  if (name === "get_window_state" && opened && args.window_id === 101369) throw Object.assign(new Error("closed"), { code: "window_id_not_found" });
+      if (name === "get_window_state") return { structuredContent: {
+        screenshot_png_b64: "PNG",
+        snapshot_id: "s00000024",
+        tree_markdown: args.window_id === 101240 ? '- [0] AXWindow "Document" [id=_NS:34]\n  - [1] AXTextArea' : panelRoot,
+        elements: [
+		  { element_index: 0, element_token: "s00000024:0", role: "AXWindow" },
+		  ...fileLists,
+		  ...(args.window_id === 101240 ? [{ element_index: 1, role: "AXTextArea", enabled: true }] : fileChildren),
+        ],
+      } };
+	  if (name === "click") opened = true;
+      return { structuredContent: {} };
+    };
+
+    const longBasename = "pipiui-computer-agent-final-acceptance-24.txt";
+	fileChildren = [{ element_index: 57, element_token: "s00000024:57", parent_index: 55, role: "AXImage", label: longBasename, selected: false }];
+	expect(await host.handle({
+      protocolVersion: 1,
+      sessionKey: "open-panel",
+      action: "computer_batch",
+      actions: [{
+        type: "typeahead",
+        text: longBasename,
+      }],
+	})).toMatchObject({ ok: true });
+
+	expect(calls.filter((call) => call.name === "press_key")).toHaveLength(0);
+	expect(calls.filter((call) => call.name === "type_text")).toHaveLength(0);
+	expect(calls.filter((call) => call.name === "click").map((call) => ({
+	  action: call.args.action,
+	  pid: call.args.pid,
+	  window: call.args.window_id,
+	  token: call.args.element_token,
+	}))).toEqual([
+	  { action: "open", pid: 91023, window: 101369, token: "s00000024:57" },
+	]);
+
+	const beforeRejected = calls.filter((call) => call.name === "click").length;
+	for (const state of [
+	  { root: panelRoot, lists: [], children: fileChildren },
+	  { root: panelRoot, lists: [
+		{ element_index: 55, element_token: "s00000024:55", role: "AXList" },
+		{ element_index: 56, element_token: "s00000024:56", role: "AXList" },
+	  ], children: fileChildren },
+	  { root: panelRoot, lists: fileLists, children: [] },
+	  { root: panelRoot, lists: fileLists, children: [
+		{ element_index: 57, element_token: "s00000024:57", parent_index: 55, role: "AXImage", label: "mismatch.txt" },
+	  ] },
+	  { root: panelRoot, lists: fileLists, children: [
+		{ element_index: 57, element_token: "s00000024:57", parent_index: 0, role: "AXImage", label: "other.txt" },
+	  ] },
+	  { root: panelRoot, lists: fileLists, children: [
+		{ element_index: 57, element_token: "s00000024:57", parent_index: 55, role: "AXImage", label: "other.txt" },
+		{ element_index: 58, element_token: "s00000024:58", parent_index: 55, role: "AXImage", label: "other.txt" },
+	  ] },
+	  { root: '- [0] AXWindow "打开" [id=open-panel]\n  - [55] AXList\n    - [57] AXImage "other.txt" [actions=[showmenu]]', lists: [{ element_index: 55, element_token: "s00000024:55", role: "AXList" }], children: [{ element_index: 57, element_token: "s00000024:57", parent_index: 55, role: "AXImage", label: "other.txt" }] },
+	  { root: "- [0] AXWindow \"Document\"", lists: [{ element_index: 55, element_token: "s00000024:55", role: "AXList" }], children: fileChildren },
+	]) {
+	  panelRoot = state.root;
+	  fileLists = state.lists;
+	  fileChildren = state.children;
+	  opened = false;
+	  host.targets.set("open-panel", { session: "open-panel", pid: 91023, window_id: 101369 });
+	  await expect(host.handle({
+		protocolVersion: 1,
+		sessionKey: "open-panel",
+		action: "computer_batch",
+		actions: [{ type: "typeahead", text: "other.txt" }],
+	  })).resolves.toMatchObject({
+		ok: false,
+		runtimeError: { code: "typeahead_target_untrusted", requiresObservation: true },
+	  });
+	}
+	expect(calls.filter((call) => call.name === "click")).toHaveLength(beforeRejected);
+
+	panelRoot = '- [0] AXWindow "打开" [id=open-panel actions=[raise]]\n  - [55] AXList\n    - [57] AXImage "unproven.txt" [actions=[open,showmenu]]';
+	fileLists = [{ element_index: 55, element_token: "s00000024:55", role: "AXList" }];
+	fileChildren = [{ element_index: 57, element_token: "s00000024:57", parent_index: 55, role: "AXImage", label: "unproven.txt" }];
+	opened = false;
+	host.call = async (name: string, args: any) => {
+	  calls.push({ name, args });
+	  if (name === "get_window_state") return { structuredContent: {
+		screenshot_png_b64: "PNG", snapshot_id: "s00000024", tree_markdown: panelRoot,
+		elements: [{ element_index: 0, role: "AXWindow" }, ...fileLists, ...fileChildren],
+	  } };
+	  return { structuredContent: {} };
+	};
+	await expect(host.handle({ protocolVersion: 1, sessionKey: "open-panel", action: "computer_batch", actions: [{ type: "typeahead", text: "unproven.txt" }] }))
+	  .resolves.toMatchObject({ ok: false, runtimeError: { code: "typeahead_open_unverified" } });
+
+	for (const driftTarget of [
+	  { session: "open-panel", pid: 91024, window_id: 101369 },
+	  { session: "open-panel", pid: 91023, window_id: 101370 },
+	]) {
+	  opened = false;
+	  host.targets.set("open-panel", { session: "open-panel", pid: 91023, window_id: 101369 });
+	  host.call = async (name: string, args: any) => {
+		calls.push({ name, args });
+		if (name === "click") {
+		  opened = true;
+		  host.targets.set("open-panel", driftTarget);
+		}
+		if (name === "get_window_state") return { structuredContent: {
+		  screenshot_png_b64: "PNG", snapshot_id: "s00000024", tree_markdown: panelRoot,
+		  elements: [
+			{ element_index: 0, role: "AXWindow" }, ...fileLists,
+			...fileChildren,
+		  ],
+		} };
+		return { structuredContent: {} };
+	  };
+	  await expect(host.handle({ protocolVersion: 1, sessionKey: "open-panel", action: "computer_batch", actions: [{ type: "typeahead", text: "unproven.txt" }] }))
+		.resolves.toMatchObject({ ok: false, runtimeError: { code: "typeahead_open_unverified" } });
+	}
+  });
+
+  it("resumes an authoritative pre-existing Open Panel at application launch without adopting sibling documents", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-launch-panel-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    const calls: Array<{ name: string; args: any }> = [];
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "launch_app") return { structuredContent: {
+        pid: 91023,
+        windows: [
+          { pid: 91023, window_id: 101240, bounds: { width: 673, height: 439 }, is_on_screen: true, on_current_space: true, z_index: 385 },
+          { pid: 91023, window_id: 100620, bounds: { width: 603, height: 505 }, is_on_screen: true, on_current_space: true, z_index: 382 },
+        ],
+      } };
+      if (name === "get_window_state") return { structuredContent: {
+        screenshot_png_b64: `PNG-${args.window_id}`,
+        snapshot_id: `snapshot-${args.window_id}`,
+        pid: 91023,
+        window_id: args.window_id,
+        elements: [],
+        tree_markdown: args.window_id === 101271
+          ? '- [0] AXWindow [id=open-panel actions=[raise]]'
+          : '- [0] AXWindow [id=_NS:34 actions=[raise]]',
+      } };
+      if (name === "get_accessibility_tree") return { structuredContent: { windows: [
+        { pid: 91023, window_id: 101271, bounds: { width: 881, height: 448 }, z_index: 410 },
+        { pid: 91023, window_id: 101240, bounds: { width: 673, height: 439 }, z_index: 385 },
+        { pid: 91023, window_id: 100620, bounds: { width: 603, height: 505 }, z_index: 382 },
+      ] } };
+      if (name === "list_windows") return { structuredContent: { windows: [
+        { pid: 91023, window_id: 101271, bounds: { width: 881, height: 448 }, is_on_screen: true, on_current_space: true, z_index: 410 },
+        { pid: 91023, window_id: 101240, bounds: { width: 673, height: 439 }, is_on_screen: true, on_current_space: true, z_index: 385 },
+        { pid: 91023, window_id: 100620, bounds: { width: 603, height: 505 }, is_on_screen: true, on_current_space: true, z_index: 382 },
+      ] } };
+      return { structuredContent: {} };
+    };
+
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "textedit-existing-panel",
+      action: "computer_open_application",
+      bundle_identifier: "com.apple.TextEdit",
+    });
+    expect(result).toMatchObject({ ok: true, target: { pid: 91023, window_id: 101271 }, window_id: 101271 });
+    expect(host.rootTargets.get("textedit-existing-panel")).toMatchObject({ pid: 91023, window_id: 101240 });
+    expect(host.targets.get("textedit-existing-panel")).toMatchObject({ pid: 91023, window_id: 101271 });
+
+    // When the authoritative z-order has the selected root first, a second
+    // ordinary document below it is not a modal handoff candidate.
+    host.call = async (name: string, args: any) => {
+      if (name === "launch_app") return { structuredContent: {
+        pid: 91023,
+        windows: [{ pid: 91023, window_id: 101240, bounds: { width: 673, height: 439 }, is_on_screen: true, on_current_space: true, z_index: 385 }],
+      } };
+      if (name === "get_window_state") return { structuredContent: {
+        screenshot_png_b64: `PNG-${args.window_id}`,
+        pid: 91023,
+        window_id: args.window_id,
+        elements: [],
+      } };
+      if (name === "get_accessibility_tree") return { structuredContent: { windows: [
+        { pid: 91023, window_id: 101240, bounds: { width: 673, height: 439 }, z_index: 385 },
+        { pid: 91023, window_id: 100620, bounds: { width: 603, height: 505 }, z_index: 382 },
+      ] } };
+      return { structuredContent: { windows: [] } };
+    };
+    const noPanel = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "textedit-no-panel",
+      action: "computer_open_application",
+      bundle_identifier: "com.apple.TextEdit",
+    });
+    expect(noPanel).toMatchObject({ ok: true, target: { pid: 91023, window_id: 101240 }, window_id: 101240 });
+    expect(host.targets.get("textedit-no-panel")).toMatchObject({ pid: 91023, window_id: 101240 });
+  });
+
+  it("resumes a standard file panel below the activated root using exact AX identity and list proof", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-launch-reused-panel-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    host.call = async (name: string, args: any) => {
+      if (name === "launch_app") return { structuredContent: {
+        pid: 91023,
+        windows: [
+          { pid: 91023, window_id: 101240, bounds: { width: 673, height: 439 }, is_on_screen: true, on_current_space: true, z_index: 397 },
+          { pid: 91023, window_id: 100646, bounds: { width: 673, height: 439 }, is_on_screen: true, on_current_space: true, z_index: 379 },
+        ],
+      } };
+      if (name === "get_accessibility_tree") return { structuredContent: { windows: [
+        // Real 0.19.2 shape has no bounds here. The thin surface is rejected by
+        // the independent list_windows proof, not trusted from AX ordering.
+        { pid: 91023, window_id: 101244 },
+        { pid: 91023, window_id: 101240 },
+        { pid: 91023, window_id: 101271 },
+        { pid: 91023, window_id: 100646 },
+      ] } };
+      if (name === "list_windows") return { structuredContent: { windows: [
+        { pid: 91023, window_id: 101244, bounds: { width: 66, height: 20 }, is_on_screen: true, on_current_space: true, z_index: 399 },
+        { pid: 91023, window_id: 101240, bounds: { width: 673, height: 439 }, is_on_screen: true, on_current_space: true, z_index: 397 },
+        { pid: 91023, window_id: 101271, bounds: { width: 881, height: 448 }, is_on_screen: true, on_current_space: true, z_index: 373 },
+        { pid: 91023, window_id: 100646, bounds: { width: 673, height: 439 }, is_on_screen: true, on_current_space: true, z_index: 379 },
+      ] } };
+      if (name === "get_window_state") {
+        const filePanel = args.window_id === 101271;
+        return { structuredContent: {
+          screenshot_png_b64: `PNG-${args.window_id}`,
+          pid: 91023,
+          window_id: args.window_id,
+          elements: filePanel ? [{ role: "AXWindow" }, { role: "AXOutline" }] : [{ role: "AXWindow" }, { role: "AXTextArea" }],
+          tree_markdown: filePanel
+            ? '- [0] AXWindow [id=open-panel actions=[raise]]\n  - AXOutline'
+            : '- [0] AXWindow [id=_NS:34 actions=[raise]]\n  - [1] AXTextArea',
+        } };
+      }
+      return { structuredContent: {} };
+    };
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "textedit-reused-panel",
+      action: "computer_open_application",
+      bundle_identifier: "com.apple.TextEdit",
+    });
+    expect(result).toMatchObject({ ok: true, target: { pid: 91023, window_id: 101271 }, window_id: 101271 });
+    expect(host.rootTargets.get("textedit-reused-panel")).toMatchObject({ pid: 91023, window_id: 101240 });
   });
 
   it("uses get_window_state after launch and never shares a target across sessions", async () => {
@@ -236,12 +961,13 @@ describe("CuaDriverHost", () => {
       "launch_app",
       "bring_to_front",
       "get_window_state",
+      "get_accessibility_tree",
     ]);
     expect(calls.find((call) => call.name === "bring_to_front")?.args).toEqual({
       pid: 42,
       window_id: 77,
     });
-    expect(calls.at(-1)?.args).toMatchObject({
+    expect(calls.find((call) => call.name === "get_window_state")?.args).toMatchObject({
       session: "a",
       pid: 42,
       window_id: 77,
@@ -258,6 +984,219 @@ describe("CuaDriverHost", () => {
       runtimeError: { code: "target_unavailable" },
     });
     expect(calls.some((call) => call.name === "screenshot")).toBe(false);
+  });
+
+  it("hands one session from its root app to exact out-of-process nested panels and back", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-panel-handoff-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    let surface: "root" | "panel" | "folder" = "root";
+    const png = (windowId: number, extra: Record<string, unknown> = {}) => ({
+      structuredContent: {
+        screenshot_png_b64: `PNG-${windowId}`,
+        snapshot_id: `snapshot-${windowId}`,
+        elements: [],
+        ...extra,
+      },
+    });
+    const missing = () => Object.assign(new Error("closed driver error"), {
+      code: "window_id_not_found",
+    });
+    const host: any = new CuaDriverHost(helper, {
+      displayID: 1,
+      width: 1440,
+      height: 900,
+    });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "launch_app") return {
+        structuredContent: { pid: 42, windows: [{ pid: 42, window_id: 100 }] },
+      };
+      if (name === "list_windows") return { structuredContent: { windows: [
+        { pid: 42, window_id: 100 },
+        { pid: 84, window_id: 200 },
+        { pid: 85, window_id: 300 },
+      ] } };
+      if (name === "get_window_state") {
+        if (args.window_id === 100) return surface === "root"
+          ? png(100)
+          : png(100, { modal_window_id: 200, focused_window_id: 200 });
+        if (args.window_id === 200) {
+          if (surface === "root") throw missing();
+          return surface === "folder"
+            ? png(200, { modal_window_id: 300, focused_window_id: 300 })
+            : png(200);
+        }
+        if (args.window_id === 300) {
+          if (surface !== "folder") throw missing();
+          return png(300);
+        }
+      }
+      if (name === "hotkey" && args.keys.join("+") === "CMD+O") surface = "panel";
+      if (name === "hotkey" && args.keys.join("+") === "CMD+SHIFT+G") surface = "folder";
+      if (name === "press_key" && args.key === "RETURN") {
+        surface = surface === "folder" ? "panel" : "root";
+      }
+      return { structuredContent: {} };
+    };
+
+    await host.handle({
+      protocolVersion: 1,
+      sessionKey: "textedit-a",
+      action: "computer_open_application",
+      bundle_identifier: "com.apple.TextEdit",
+    });
+    for (const action of [
+      { type: "key", keys: ["CMD", "O"] },
+      { type: "key", keys: ["CMD", "SHIFT", "G"] },
+      { type: "type", text: "/Users/haoli/Desktop/exact.txt" },
+      { type: "key", key: "RETURN" },
+      { type: "key", key: "RETURN" },
+    ]) {
+      expect(await host.handle({
+        protocolVersion: 1,
+        sessionKey: "textedit-a",
+        action: "computer_batch",
+        actions: [action],
+      })).toMatchObject({ ok: true });
+    }
+
+    expect(calls.filter((call) => ["hotkey", "type_text", "press_key"].includes(call.name))
+      .map((call) => [call.name, call.args.pid, call.args.window_id]))
+      .toEqual([
+        ["hotkey", 42, 100],
+        ["hotkey", 84, 200],
+        ["type_text", 85, 300],
+        ["press_key", 85, 300],
+        ["press_key", 84, 200],
+      ]);
+    expect(host.targets.get("textedit-a")).toMatchObject({ pid: 42, window_id: 100 });
+  });
+
+  it("discovers a same-owner Open Panel after CMD+O when 0.19.2 omits modal window ids", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-panel-discovery-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    let surface: "root" | "panel" | "folder" = "root";
+    const state = (windowId: number) => ({ structuredContent: {
+      screenshot_png_b64: `PNG-${windowId}`,
+      snapshot_id: `snapshot-${windowId}`,
+      pid: 91023,
+      window_id: windowId,
+      elements: [{ role: "AXWindow" }],
+    } });
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    host.targets.set("textedit", { session: "textedit", pid: 91023, window_id: 100646 });
+    host.rootTargets.set("textedit", { session: "textedit", pid: 91023, window_id: 100646 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "get_window_state") return state(args.window_id);
+      if (name === "hotkey") {
+        surface = args.keys.join("+") === "CMD+SHIFT+G" ? "folder" : "panel";
+        return { structuredContent: {} };
+      }
+      if (name === "get_accessibility_tree") return { structuredContent: { windows: surface === "root" ? [] : [
+        ...(surface === "folder" ? [{ pid: 91023, window_id: 101102, bounds: { x: 300, y: 180, width: 640, height: 180 }, z_index: 405 }] : []),
+        { pid: 91023, window_id: 101101, bounds: { x: 200, y: 100, width: 881, height: 448 }, z_index: 401 },
+        { pid: 91023, window_id: 100646, bounds: { x: 100, y: 100, width: 673, height: 439 }, z_index: 385 },
+        { pid: 96262, window_id: 999999, bounds: { x: 0, y: 0, width: 900, height: 500 }, z_index: 410 },
+      ] } };
+      if (name === "list_windows") return { structuredContent: { windows: [
+        { pid: 91023, window_id: 101101, bounds: { x: 200, y: 100, width: 881, height: 448 }, is_on_screen: true, on_current_space: true, z_index: 401 },
+        { pid: 91023, window_id: 101102, bounds: { x: 300, y: 180, width: 640, height: 180 }, is_on_screen: true, on_current_space: true, z_index: 405 },
+      ] } };
+      return { structuredContent: {} };
+    };
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "textedit",
+      action: "computer_batch",
+      actions: [{ type: "key", keys: ["CMD", "O"], delivery_mode: "foreground" }],
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      batchInterrupted: true,
+      interruptionReason: "actionable_context_changed",
+      window_id: 101101,
+    });
+    expect(host.targets.get("textedit")).toMatchObject({ pid: 91023, window_id: 101101 });
+    expect(calls.filter((call) => call.name === "get_accessibility_tree")).toHaveLength(1);
+    expect(calls.find((call) => call.name === "list_windows")?.args).toEqual({});
+    expect(calls.filter((call) => call.name === "get_window_state").at(-1)?.args)
+      .toMatchObject({ pid: 91023, window_id: 101101 });
+    expect(await host.handle({
+      protocolVersion: 1,
+      sessionKey: "textedit",
+      action: "computer_batch",
+      actions: [{ type: "key", keys: ["CMD", "SHIFT", "G"], delivery_mode: "foreground" }],
+    })).toMatchObject({ ok: true, window_id: 101102 });
+    expect(calls.filter((call) => call.name === "hotkey").map((call) => call.args.window_id))
+      .toEqual([100646, 101101]);
+  });
+
+  it("fails closed for unlisted observation window ids without changing another session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-panel-untrusted-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.targets.set("a", { session: "a", pid: 42, window_id: 100 });
+    host.targets.set("b", { session: "b", pid: 52, window_id: 500 });
+    host.rootTargets.set("a", { session: "a", pid: 42, window_id: 100 });
+    host.rootTargets.set("b", { session: "b", pid: 52, window_id: 500 });
+    host.call = async (name: string, args: any) => {
+      if (name === "get_window_state") return {
+        structuredContent: {
+          screenshot_png_b64: "PNG",
+          elements: [],
+          modal_window_id: args.window_id === 100 ? 999 : undefined,
+        },
+      };
+      if (name === "list_windows") return { structuredContent: { windows: [
+        { pid: 52, window_id: 500 },
+      ] } };
+      return { structuredContent: {} };
+    };
+    expect(await host.handle({
+      protocolVersion: 1,
+      sessionKey: "a",
+      action: "computer_batch",
+      actions: [{ type: "screenshot" }],
+    })).toMatchObject({ ok: false, runtimeError: { code: "target_handoff_untrusted" } });
+    expect(host.targets.get("a")).toMatchObject({ pid: 42, window_id: 100 });
+    expect(host.targets.get("b")).toMatchObject({ pid: 52, window_id: 500 });
+  });
+
+  it("fails closed on a driver owner mismatch instead of trusting the reported pid", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-panel-owner-mismatch-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.targets.set("a", { session: "a", pid: 42, window_id: 100 });
+    host.rootTargets.set("a", { session: "a", pid: 42, window_id: 100 });
+    host.call = async (name: string) => {
+      if (name === "get_window_state") throw Object.assign(
+        new Error("closed driver error"),
+        { code: "window_owner_pid_mismatch", owner_pid: 999 },
+      );
+      return { structuredContent: {} };
+    };
+    expect(await host.handle({
+      protocolVersion: 1,
+      sessionKey: "a",
+      action: "computer_batch",
+      actions: [{ type: "screenshot" }],
+    })).toMatchObject({ ok: false, runtimeError: { code: "target_handoff_untrusted" } });
+    expect(host.targets.get("a")).toMatchObject({ pid: 42, window_id: 100 });
   });
 
   it("uses a separate desktop-scoped session for untargeted observation", async () => {

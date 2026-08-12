@@ -20,6 +20,39 @@ const APPROVED_EXECUTABLE_PATHS = new Set([
   "/usr/bin/printf", "/bin/ls", "/usr/bin/head", "/usr/bin/tail",
 ]);
 
+export function normalizeTerminalPolicyProposal(value: unknown, options: { typedFileWriteOnly?: boolean; typedFileWritePaths?: string[] } = {}): Omit<TerminalStepPolicy, "commands"> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Terminal Worker step requires a bounded terminalPolicy object");
+  const policy = value as Record<string, unknown>;
+  if (typeof policy.cwd !== "string" || !isAbsolute(policy.cwd)) throw new Error("Terminal Worker cwd must be an absolute path");
+  if (!Array.isArray(policy.writeRoots) || policy.writeRoots.length < 1 || policy.writeRoots.length > 16
+      || policy.writeRoots.some((root) => typeof root !== "string" || !isAbsolute(root))) {
+    throw new Error("Terminal Worker writeRoots must be a bounded list of absolute paths");
+  }
+  const typedFileWriteOnly = options.typedFileWriteOnly === true;
+  const typedFileWritePaths = new Set(options.typedFileWritePaths ?? []);
+  if (!Array.isArray(policy.allowedExecutables) || policy.allowedExecutables.length > 16
+      || policy.allowedExecutables.some((item) => typeof item !== "string")) {
+    throw new Error("Terminal Worker allowedExecutables must be a bounded string list");
+  }
+  let allowedExecutables = [...new Set(policy.allowedExecutables.filter((item): item is string =>
+    isAbsolute(item) && APPROVED_EXECUTABLE_PATHS.has(item),
+  ))];
+  if (typedFileWriteOnly && policy.allowedExecutables.length === 0) allowedExecutables = ["/usr/bin/stat"];
+  if (allowedExecutables.length === 0) throw new Error("Terminal Worker proposal contains no approved canonical executable path");
+  const maxCommands = typedFileWriteOnly && policy.maxCommands === 0 ? 1 : policy.maxCommands;
+  if (!Number.isInteger(maxCommands) || (maxCommands as number) < 1 || (maxCommands as number) > 32) {
+    throw new Error("Terminal Worker maxCommands must be an integer from 1 through 32");
+  }
+  return {
+    cwd: policy.cwd,
+    writeRoots: [...new Set((policy.writeRoots as string[]).map((root) =>
+      typedFileWriteOnly && typedFileWritePaths.has(root) ? dirname(root) : root,
+    ))],
+    allowedExecutables,
+    maxCommands: maxCommands as number,
+  };
+}
+
 export function validateTerminalBoundaryShape(value: Omit<TerminalStepPolicy, "commands">): void {
   if (!value || !isAbsolute(value.cwd)) throw new Error("terminal cwd must be absolute");
   if (!Array.isArray(value.writeRoots) || value.writeRoots.some((root) => typeof root !== "string" || !isAbsolute(root))) throw new Error("terminal write roots must be absolute");

@@ -48,6 +48,7 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
     private var proxyStderrPipe: Pipe?
     private var proxyStderrTail: BoundedPipeTail?
     private var cancellationEpoch: UInt64 = 0
+    private var shutdownRequested = false
     private struct RegisteredProcess {
         let process: Process
         let epoch: UInt64
@@ -80,7 +81,7 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
         tool: String,
         arguments: [String: Any]
     ) async throws -> CuaToolResult {
-        let expectedEpoch = currentCancellationEpoch()
+        let expectedEpoch = try epochForNewCall()
         return try await withCheckedThrowingContinuation { continuation in
             queue.async { [self] in
                 do {
@@ -129,8 +130,43 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
         }
     }
 
-    private func currentCancellationEpoch() -> UInt64 {
-        cancellationLock.withLock { cancellationEpoch }
+    /// App-termination boundary. Unlike interactive cancellation, this waits
+    /// for the SIGTERM-to-SIGKILL escalation and serialized teardown so the
+    /// host cannot exit and orphan an embedded driver generation. Escalation
+    /// must happen before queue synchronization: the queue may currently be
+    /// blocked reading from the very proxy that shutdown needs to reap.
+    func shutdownAndWait() {
+        Log.info("cua-driver synchronous shutdown requested", category: .process)
+        let cancellation = signalCancellation(final: true)
+
+        let gracefulDeadline = Date().addingTimeInterval(0.4)
+        while cancellation.processes.contains(where: \.isRunning),
+              Date() < gracefulDeadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        forceKill(
+            processes: cancellation.processes,
+            socketURLs: cancellation.socketURLs,
+            olderThanEpoch: cancellation.epoch
+        )
+
+        if DispatchQueue.getSpecific(key: queueKey) == 1 {
+            stopLocked()
+        } else {
+            // A forced proxy exit wakes any in-flight poll/read immediately.
+            // Its queued error cleanup runs first; this barrier then proves
+            // every owned Process has reached terminate(...).waitUntilExit().
+            queue.sync { stopLocked() }
+        }
+    }
+
+    private func epochForNewCall() throws -> UInt64 {
+        try cancellationLock.withLock {
+            guard !shutdownRequested else {
+                throw CuaDriverError.cancelled
+            }
+            return cancellationEpoch
+        }
     }
 
     private func checkCancellation(_ expectedEpoch: UInt64) throws {
@@ -141,12 +177,13 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
         }
     }
 
-    private func signalCancellation() -> (
+    private func signalCancellation(final: Bool = false) -> (
         epoch: UInt64,
         processes: [Process],
         socketURLs: [URL]
     ) {
         cancellationLock.withLock {
+            if final { shutdownRequested = true }
             cancellationEpoch &+= 1
             let registrations = Array(registeredProcesses.values)
             let processes = registrations.map(\.process)
@@ -385,7 +422,10 @@ final class CuaDriverProcessRuntime: CuaDriverTransport, @unchecked Sendable {
             return true
         }
         guard accepted else {
-            Darwin.kill(process.processIdentifier, SIGTERM)
+            // Registration can lose a race with final App shutdown after the
+            // child has already spawned. Reap that unregistered child here;
+            // it is absent from shutdown's registered-generation snapshot.
+            terminate(process)
             throw CuaDriverError.cancelled
         }
     }

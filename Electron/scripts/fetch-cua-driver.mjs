@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 
 const manifest = JSON.parse(await readFile(new URL('../cua-driver-assets.json', import.meta.url), 'utf8'))
@@ -35,7 +36,27 @@ try {
   if (!source) throw new Error(`${basename(asset.archive)} did not contain ${executable}`)
   const destination = new URL('../.cua-driver/', import.meta.url)
   await mkdir(destination, { recursive: true })
+  // Dev resolves this fixed path (runtime-assets.ts, dev-electron-app.sh), so the
+  // as-downloaded binary stays put.
   await copyFile(source, new URL(executable, destination))
   if (targetPlatform !== 'win32') await chmod(new URL(executable, destination), 0o755)
   console.log(new URL(executable, destination).pathname)
+
+  // Packaging pulls from a per-target directory instead: the macOS asset is a
+  // universal binary, but each electron-builder run ships exactly one slice.
+  const packagedArches = targetPlatform === 'darwin' ? ['x64', 'arm64'] : [targetArch]
+  for (const arch of packagedArches) {
+    const targetDir = new URL(`${targetPlatform}-${arch}/`, destination)
+    await mkdir(targetDir, { recursive: true })
+    const packaged = new URL(executable, targetDir)
+    // lipo names slices the Mach-O way, not the Node way.
+    const slice = arch === 'x64' ? 'x86_64' : arch
+    const thinned = targetPlatform === 'darwin'
+      ? spawnSync('lipo', [source, '-thin', slice, '-output', fileURLToPath(packaged)], { encoding: 'utf8' })
+      : undefined
+    // lipo fails on a binary that is already single-slice, and is absent off macOS.
+    if (!thinned || thinned.status !== 0) await copyFile(source, packaged)
+    if (targetPlatform !== 'win32') await chmod(packaged, 0o755)
+    console.log(packaged.pathname)
+  }
 } finally { await rm(staging, { recursive: true, force: true }) }

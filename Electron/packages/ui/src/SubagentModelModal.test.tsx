@@ -34,6 +34,43 @@ function visibility(overrides: Partial<ModelVisibilityController> = {}): ModelVi
 }
 
 describe('SubagentModelModal', () => {
+  it('persists the provider-qualified model selected for a nested Computer Worker', async () => {
+    const xaiGrok: Model = { provider: 'xai', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
+    const copilotGrok: Model = { provider: 'github-copilot', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
+    const host = createMockHost()
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility({
+      models: [xaiGrok, copilotGrok],
+      visibleModels: [xaiGrok, copilotGrok],
+      quickModels: [xaiGrok, copilotGrok],
+      quickProviders: ['xai', 'github-copilot'],
+      hiddenIds: new Set(),
+    })} onClose={() => undefined} />)
+    await screen.findByTestId('subagent-agent-operator')
+    fireEvent.click(screen.getByRole('button', { name: 'operator 0 模型' }))
+    fireEvent.click(screen.getByTestId('subagent-model-option-operator-0-xai-grok-4.5'))
+    await waitFor(async () => expect(await host.getSubagentModels?.()).toMatchObject({
+      operator: [{ model: 'xai/grok-4.5', thinking: 'off' }],
+    }))
+  })
+
+  it('shows a non-binding visual-model hint only for screenshot-reading roles without changing defaults', async () => {
+    const host = createMockHost()
+    const save = vi.spyOn(host, 'setSubagentModel')
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    const operator = await screen.findByTestId('subagent-agent-operator')
+    const verifier = screen.getByTestId('subagent-agent-computer-verifier')
+    const leader = screen.getByTestId('subagent-agent-computer-use-leader')
+    const terminal = screen.getByTestId('subagent-agent-computer-terminal')
+    expect(within(operator).getByText(/需要查看截图，建议选择支持图像输入的模型/)).toBeTruthy()
+    expect(within(verifier).getByText(/需要查看截图，建议选择支持图像输入的模型/)).toBeTruthy()
+    expect(within(leader).queryByText(/需要查看截图/)).toBeNull()
+    expect(within(terminal).queryByText(/需要查看截图/)).toBeNull()
+    for (const role of ['operator', 'computer-verifier', 'computer-use-leader', 'computer-terminal']) {
+      expect(screen.getByRole('button', { name: `${role} 0 模型` }).textContent).toContain('跟随主 Agent')
+    }
+    expect(save).not.toHaveBeenCalled()
+  })
+
   it('leaves loading, filters to model-management enabled models, and persists independent role chains', async () => {
     const host = createMockHost()
     render(<SubagentModelModal host={host} current={null} visibility={visibility()} onClose={() => undefined} />)
@@ -47,43 +84,43 @@ describe('SubagentModelModal', () => {
 	expect(screen.getByTestId('subagent-agent-computer-terminal')).toBeTruthy()
 
 	fireEvent.click(screen.getByRole('button', { name: 'computer-use-leader 0 模型' }))
-	fireEvent.click(screen.getByTestId('subagent-model-option-computer-use-leader-0-gpt-5'))
+	fireEvent.click(screen.getByTestId('subagent-model-option-computer-use-leader-0-openai-gpt-5'))
 	await waitFor(() => expect(screen.getByRole('button', { name: 'computer-use-leader 0 模型' }).textContent).toContain('GPT-5'))
 	fireEvent.click(screen.getByRole('button', { name: 'computer-verifier 0 模型' }))
-	fireEvent.click(screen.getByTestId('subagent-model-option-computer-verifier-0-claude-sonnet-4'))
+	fireEvent.click(screen.getByTestId('subagent-model-option-computer-verifier-0-anthropic-claude-sonnet-4'))
 	await waitFor(() => expect(screen.getByRole('button', { name: 'computer-verifier 0 模型' }).textContent).toContain('Claude'))
 	fireEvent.click(screen.getByRole('button', { name: 'computer-terminal 0 模型' }))
-	fireEvent.click(screen.getByTestId('subagent-model-option-computer-terminal-0-gpt-5'))
+	fireEvent.click(screen.getByTestId('subagent-model-option-computer-terminal-0-openai-gpt-5'))
 	await waitFor(() => expect(screen.getByRole('button', { name: 'computer-terminal 0 模型' }).textContent).toContain('GPT-5'))
 
     fireEvent.click(screen.getByRole('button', { name: 'explore 0 模型' }))
-    expect(screen.getByTestId('subagent-model-option-explore-0-gpt-5')).toBeTruthy()
-    expect(screen.queryByTestId('subagent-model-option-explore-0-deepseek-v3')).toBeNull()
-    fireEvent.click(screen.getByTestId('subagent-model-option-explore-0-gpt-5'))
+    expect(screen.getByTestId('subagent-model-option-explore-0-openai-gpt-5')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-model-option-explore-0-deepseek-deepseek-v3')).toBeNull()
+    fireEvent.click(screen.getByTestId('subagent-model-option-explore-0-openai-gpt-5'))
     await waitFor(() => expect(screen.getByRole('button', { name: 'explore 0 模型' }).textContent).toContain('GPT-5'))
     fireEvent.change(screen.getByLabelText('explore 0 思考强度'), { target: { value: 'high' } })
 
     fireEvent.click(screen.getByRole('button', { name: 'plan 0 模型' }))
-    fireEvent.click(screen.getByTestId('subagent-model-option-plan-0-claude-sonnet-4'))
+    fireEvent.click(screen.getByTestId('subagent-model-option-plan-0-anthropic-claude-sonnet-4'))
     await waitFor(() => expect(screen.getByRole('button', { name: 'plan 0 模型' }).textContent).toContain('Claude'))
     fireEvent.click(within(screen.getByTestId('subagent-agent-plan')).getByRole('button', { name: /添加备用模型/ }))
     await waitFor(() => expect(screen.getAllByTestId(/^subagent-chain-plan-/)).toHaveLength(2))
     fireEvent.click(screen.getByRole('button', { name: 'plan 1 模型' }))
-    expect(screen.queryByTestId('subagent-model-option-plan-1-deepseek-v3')).toBeNull()
-    expect(screen.getByTestId('subagent-model-option-plan-1-gpt-5')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-model-option-plan-1-deepseek-deepseek-v3')).toBeNull()
+    expect(screen.getByTestId('subagent-model-option-plan-1-openai-gpt-5')).toBeTruthy()
 
     await waitFor(async () => {
       expect(await host.getSubagentModels?.()).toMatchObject({
-		'computer-use-leader': [{ model: 'gpt-5', thinking: 'off' }],
-		'computer-verifier': [{ model: 'claude-sonnet-4', thinking: 'off' }],
-		'computer-terminal': [{ model: 'gpt-5', thinking: 'off' }],
-        explore: [{ model: 'gpt-5', thinking: 'high' }],
-        plan: [{ model: 'claude-sonnet-4', thinking: 'off' }, { model: 'gpt-5', thinking: 'off' }]
+		'computer-use-leader': [{ model: 'openai/gpt-5', thinking: 'off' }],
+		'computer-verifier': [{ model: 'anthropic/claude-sonnet-4', thinking: 'off' }],
+		'computer-terminal': [{ model: 'openai/gpt-5', thinking: 'off' }],
+        explore: [{ model: 'openai/gpt-5', thinking: 'high' }],
+        plan: [{ model: 'anthropic/claude-sonnet-4', thinking: 'off' }, { model: 'openai/gpt-5', thinking: 'off' }]
       })
     })
 
     fireEvent.click(screen.getByRole('button', { name: 'explore 0 模型' }))
-    const selected = screen.getByTestId('subagent-model-option-explore-0-gpt-5')
+    const selected = screen.getByTestId('subagent-model-option-explore-0-openai-gpt-5')
     expect(selected.getAttribute('aria-selected')).toBe('true')
     expect(within(selected).getByLabelText('已选中')).toBeTruthy()
   })

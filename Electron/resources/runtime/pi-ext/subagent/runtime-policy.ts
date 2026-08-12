@@ -1,5 +1,18 @@
 import type { AgentConfig } from "./agents.ts";
 
+export const PRIVATE_COMPUTER_AGENT_NAMES = ["computer-use-leader", "operator", "computer-verifier", "computer-terminal"] as const;
+
+/** Bind Computer Task protocol principals to exact App-shipped definitions. */
+export function bindCanonicalComputerAgents(discovered: AgentConfig[], canonical: AgentConfig[]): AgentConfig[] {
+	const result = new Map(discovered.map((agent) => [agent.name, agent]));
+	for (const name of PRIVATE_COMPUTER_AGENT_NAMES) {
+		const agent = canonical.find((candidate) => candidate.name === name && candidate.origin === "bundled");
+		if (!agent) throw new Error(`Canonical Computer Agent role is unavailable: ${name}`);
+		result.set(name, agent);
+	}
+	return [...result.values()];
+}
+
 /** Runtime-only grants that frontmatter is never allowed to manufacture. */
 export interface AgentRuntimeRolePolicy {
 	role: "worker" | "operator" | "closeout-secretary";
@@ -28,7 +41,10 @@ export function runtimeRolePolicyForAgent(agent: AgentConfig): AgentRuntimeRoleP
 	if (agent.origin === "bundled" && agent.name === "operator") {
 		return {
 			role: "operator",
-			worktree: "isolated",
+			// The bundled Operator is declaratively read-only and never edits code.
+			// Giving it an isolated worktree incorrectly classifies an unnamed desktop
+			// dispatch as a writable branch-producing worker before model/spawn setup.
+			worktree: "direct",
 			allowRecursiveDelegation: false,
 		};
 	}

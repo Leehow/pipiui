@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { builtinModules } from 'node:module'
 import { resolve } from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import nodeRuntimeAssets from '../../node-runtime-assets.json'
 import workspacePackage from '../../package.json'
 import packageJSON from './package.json'
@@ -28,6 +29,59 @@ describe('macOS packaging contract', () => {
       from: '../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}',
       to: 'pipiui-embedded'
     }))
+  })
+
+  // electron-builder's `files` allow-list governs only the app source file set:
+  // production node_modules are collected separately by computeNodeModuleFileSets
+  // and can be dropped only with negation patterns. electron-vite bundles every
+  // import except the ones externalizeDepsPlugin leaves as bare requires, so the
+  // packaged asar needs exactly those and nothing else.
+  const bundledExternals = () => {
+    const mainOut = resolve(import.meta.dirname, 'out/main')
+    if (!existsSync(mainOut)) return undefined
+    const builtins = new Set(builtinModules)
+    const found = new Set<string>()
+    for (const file of readdirSync(mainOut)) {
+      if (!file.endsWith('.js')) continue
+      const source = readFileSync(resolve(mainOut, file), 'utf8')
+      for (const [, specifier] of source.matchAll(/\brequire\("([^"]+)"\)/g)) {
+        if (specifier.startsWith('.') || specifier.startsWith('node:')) continue
+        if (builtins.has(specifier) || specifier === 'electron') continue
+        found.add(specifier)
+      }
+    }
+    return found
+  }
+
+  it('ships only the node_modules the main bundle still requires at runtime', () => {
+    const files = packageJSON.build.files
+    expect(files).toContain('!node_modules/**/*')
+    const reincluded = files
+      .filter(pattern => pattern.startsWith('node_modules/'))
+      .map(pattern => pattern.replace(/^node_modules\//, '').replace(/\/\*\*\/\*$/, ''))
+    // Negations and re-inclusions are applied in order, so every kept package
+    // must be listed after the blanket exclusion.
+    for (const pattern of reincluded) {
+      expect(files.indexOf('!node_modules/**/*')).toBeLessThan(files.indexOf(`node_modules/${pattern}/**/*`))
+    }
+    const externals = bundledExternals()
+    if (!externals) return // out/ is a build artifact; nothing to check before `npm run build`
+    expect([...externals].sort()).toEqual(reincluded.sort())
+  })
+
+  it('ships one Cua driver slice per target and fetches the slice each package script packages', () => {
+    // The macOS download is a universal binary; shipping both slices doubled the
+    // driver in every single-arch build.
+    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+      from: '../../.cua-driver/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}',
+      to: 'cua-driver'
+    }))
+    // PIPIUI_EMBEDDED_RUNTIME_TARGET is `<platform>-<arch>`, so whatever the fetch
+    // step lays down has to be keyed the same way the packaging step reads it.
+    for (const [script, platform] of [['package:mac', 'darwin'], ['package:win', 'win32'], ['package:linux', 'linux']] as const) {
+      expect(packageJSON.scripts[script]).toContain(`CUA_TARGET_PLATFORM=${platform}`)
+      expect(packageJSON.scripts[script]).toContain('fetch-cua-driver.mjs')
+    }
   })
 
   it('checks and selects exactly one persistent target without preparing during release', () => {
@@ -68,6 +122,89 @@ describe('macOS packaging contract', () => {
     expect(wrapper).toMatch(/mv "\$APP_SRC" "\$APP_DST"[\s\S]*codesign --verify --deep --strict --verbose=2 "\$APP_DST"/)
   })
 
+  it('grants JIT entitlements only to the embedded Node loose Mach-O', () => {
+    if (process.platform !== 'darwin') return
+    const scriptPath = resolve(import.meta.dirname, '../../../scripts/build-electron-app.sh')
+    const entitlementsPath = resolve(import.meta.dirname, '../../node_modules/app-builder-lib/templates/entitlements.mac.plist')
+    const output = execFileSync('/bin/bash', ['-c', [
+      'set -euo pipefail',
+      'fixture="$(mktemp -d)"',
+      'trap \'rm -rf "$fixture"\' EXIT',
+      'app="$fixture/Test.app"',
+      'embedded_node="$app/Contents/Resources/pipiui-embedded/node/bin/node"',
+      'generic_helper="$app/Contents/Resources/native-helper"',
+      'codesign_log="$fixture/codesign.log"',
+      'mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks/Electron Framework.framework"',
+      'mkdir -p "$app/Contents/Resources/cua-driver" "$(dirname "$embedded_node")"',
+      'mkdir -p "$app/Contents/Resources/pipiui-runtime"',
+      `cp ${JSON.stringify(process.execPath)} "$app/Contents/MacOS/PipiUI Electron"`,
+      `cp ${JSON.stringify(process.execPath)} "$app/Contents/Resources/cua-driver/cua-driver"`,
+      `cp ${JSON.stringify(process.execPath)} "$embedded_node"`,
+      `cp ${JSON.stringify(process.execPath)} "$generic_helper"`,
+      'chmod +x "$app/Contents/MacOS/PipiUI Electron" "$app/Contents/Resources/cua-driver/cua-driver" "$embedded_node" "$generic_helper"',
+      `eval "$(sed '/^PLATFORM=/,$d' ${JSON.stringify(scriptPath)})"`,
+      `MAC_ENTITLEMENTS=${JSON.stringify(entitlementsPath)}`,
+      'MAC_INHERIT_ENTITLEMENTS="$MAC_ENTITLEMENTS"',
+      'CSC_NAME=TEST-IDENTITY',
+      'codesign() {',
+      '  case "$1" in',
+      '    --sign)',
+      '      printf \'SIGN\' >> "$codesign_log"',
+      '      printf \' <%s>\' "$@" >> "$codesign_log"',
+      '      printf \'\\n\' >> "$codesign_log"',
+      '      ;;',
+      '    --verify) ;;',
+      '    -d) cat "$MAC_ENTITLEMENTS" ;;',
+      '    *) return 2 ;;',
+      '  esac',
+      '}',
+      'finalize_mac_bundle "$app"',
+      'cat "$codesign_log"'
+    ].join('\n')], { encoding: 'utf8' })
+    const records = output.trim().split('\n')
+    const embeddedSign = records.find(line => line.endsWith('/pipiui-embedded/node/bin/node>'))
+    const genericSign = records.find(line => line.endsWith('/Contents/Resources/native-helper>'))
+    expect(embeddedSign).toContain(` <--entitlements> <${entitlementsPath}>`)
+    expect(genericSign).toBeDefined()
+    expect(genericSign).not.toContain('<--entitlements>')
+  }, 15_000)
+
+  it('fails finalization when the signed embedded Node lacks allow-jit', () => {
+    if (process.platform !== 'darwin') return
+    const scriptPath = resolve(import.meta.dirname, '../../../scripts/build-electron-app.sh')
+    const entitlementsPath = resolve(import.meta.dirname, '../../node_modules/app-builder-lib/templates/entitlements.mac.plist')
+    const result = spawnSync('/bin/bash', ['-c', [
+      'set -euo pipefail',
+      'fixture="$(mktemp -d)"',
+      'trap \'rm -rf "$fixture"\' EXIT',
+      'app="$fixture/Test.app"',
+      'embedded_node="$app/Contents/Resources/pipiui-embedded/node/bin/node"',
+      'mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks/Electron Framework.framework"',
+      'mkdir -p "$app/Contents/Resources/cua-driver" "$(dirname "$embedded_node")"',
+      'mkdir -p "$app/Contents/Resources/pipiui-runtime"',
+      `cp ${JSON.stringify(process.execPath)} "$app/Contents/MacOS/PipiUI Electron"`,
+      `cp ${JSON.stringify(process.execPath)} "$app/Contents/Resources/cua-driver/cua-driver"`,
+      `cp ${JSON.stringify(process.execPath)} "$embedded_node"`,
+      'chmod +x "$app/Contents/MacOS/PipiUI Electron" "$app/Contents/Resources/cua-driver/cua-driver" "$embedded_node"',
+      `eval "$(sed '/^PLATFORM=/,$d' ${JSON.stringify(scriptPath)})"`,
+      `MAC_ENTITLEMENTS=${JSON.stringify(entitlementsPath)}`,
+      'MAC_INHERIT_ENTITLEMENTS="$MAC_ENTITLEMENTS"',
+      'CSC_NAME=TEST-IDENTITY',
+      'codesign() {',
+      '  case "$1" in',
+      '    --sign|--verify) return 0 ;;',
+      '    -d)',
+      '      printf \'%s\\n\' \'<?xml version="1.0" encoding="UTF-8"?>\' \'<plist version="1.0"><dict></dict></plist>\'',
+      '      ;;',
+      '    *) return 2 ;;',
+      '  esac',
+      '}',
+      'finalize_mac_bundle "$app"'
+    ].join('\n')], { encoding: 'utf8' })
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('embedded Node is missing required com.apple.security.cs.allow-jit entitlement')
+  })
+
   it('recovers only an exact root sealed-resource failure with a complete expected bundle', () => {
     expect(wrapper).toContain('builder_failure_is_outer_seal_only "$log" "$app"')
     expect(wrapper).toMatch(/grep -Fq "\$app" "\$log"/)
@@ -90,6 +227,21 @@ describe('macOS packaging contract', () => {
       'PIPIUI_ELECTRON_PACKAGING_FUNCTION_TEST=1 package_mac_arch arm64 "/tmp/mac-arm64"'
     ].join('\n')], { encoding: 'utf8' })
     expect(output.trim()).toBe('/tmp/mac-arm64/PipiUI Electron.app')
+  })
+
+  it('matches only the exact canonical Electron executable and guards before mac build work', () => {
+    const scriptPath = resolve(import.meta.dirname, '../../../scripts/build-electron-app.sh')
+    const result = spawnSync('/bin/bash', ['-c', [
+      'set -euo pipefail',
+      `eval "$(sed '/^PLATFORM=/,$d' ${JSON.stringify(scriptPath)})"`,
+      'target="/workspace/build/PipiUI Electron.app/Contents/MacOS/PipiUI Electron"',
+      'printf \' 42 %s\\n\' "$target" | process_list_contains_exact_executable "$target"',
+      'if printf \' 43 %s Helper\\n\' "$target" | process_list_contains_exact_executable "$target"; then exit 41; fi',
+      'if printf \' 44 /other/PipiUI Electron.app/Contents/MacOS/PipiUI Electron\\n\' | process_list_contains_exact_executable "$target"; then exit 42; fi',
+    ].join('\n')], { encoding: 'utf8' })
+    expect(result.status, result.stderr).toBe(0)
+    expect(wrapper).toContain('CANONICAL_ELECTRON_EXECUTABLE="$ROOT/build/PipiUI Electron.app/Contents/MacOS/PipiUI Electron"')
+    expect(wrapper).toMatch(/canonical_electron_app_is_running "\$CANONICAL_ELECTRON_EXECUTABLE"[\s\S]*exit 1[\s\S]*prepare_mac_signing_identity/)
   })
 
   it('discovers a non-executable Mach-O native module by suffix without scanning unrelated resources', () => {

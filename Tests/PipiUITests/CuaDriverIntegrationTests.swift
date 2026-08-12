@@ -963,6 +963,245 @@ final class CuaDriverIntegrationTests: XCTestCase {
         }
     }
 
+    func testRuntimeShutdownWaitsUntilSIGTERMIgnoringChildrenAreReaped() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("fake-cua-driver")
+        let trace = directory.appendingPathComponent("pids.jsonl")
+        let source = """
+        #!/usr/bin/python3
+        import json, os, signal, socket, sys, time
+        mode = sys.argv[1]
+        socket_path = sys.argv[sys.argv.index("--socket") + 1]
+        with open("\(trace.path)", "a") as output:
+            output.write(json.dumps({"mode": mode, "pid": os.getpid()}) + "\\n")
+            output.flush()
+        signal.signal(signal.SIGTERM, lambda signum, frame: None)
+        if mode == "serve":
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(socket_path)
+            os.chmod(socket_path, 0o600)
+            server.listen(1)
+            while True:
+                time.sleep(1)
+        if mode == "mcp":
+            for line in sys.stdin:
+                message = json.loads(line)
+                if "id" not in message:
+                    continue
+                if message["method"] == "initialize":
+                    result = {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fake", "version": "1"},
+                    }
+                else:
+                    name = message["params"]["name"]
+                    structured = {"ok": True}
+                    if name == "check_permissions":
+                        structured = {"source": {
+                            "attribution": "host",
+                            "embedded": True,
+                            "host_bundle_id": "com.leehow.pipiui",
+                        }}
+                    result = {
+                        "content": [],
+                        "structuredContent": structured,
+                        "isError": False,
+                    }
+                print(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "result": result,
+                }), flush=True)
+        """
+        try Data(source.utf8).write(to: helper, options: .atomic)
+        XCTAssertEqual(chmod(helper.path, 0o755), 0)
+
+        let runtime = CuaDriverProcessRuntime(
+            driverPathOverride: helper.path,
+            startupTimeout: 2,
+            responseTimeout: 2
+        )
+        _ = try await runtime.call(tool: "ping", arguments: [:])
+        let records = try String(contentsOf: trace, encoding: .utf8)
+            .split(separator: "\n")
+            .compactMap { line -> [String: Any]? in
+                try? JSONSerialization.jsonObject(
+                    with: Data(line.utf8)
+                ) as? [String: Any]
+            }
+        XCTAssertEqual(records.count, 2)
+
+        runtime.shutdownAndWait()
+
+        for record in records {
+            guard let pid = (record["pid"] as? NSNumber)?.int32Value else {
+                return XCTFail("missing child pid: \(record)")
+            }
+            XCTAssertEqual(Darwin.kill(pid, 0), -1, "pid \(pid) survived shutdown")
+            XCTAssertEqual(errno, ESRCH)
+        }
+
+        do {
+            _ = try await runtime.call(tool: "must_not_restart", arguments: [:])
+            XCTFail("a final App shutdown must fence future driver generations")
+        } catch {
+            XCTAssertEqual(error as? CuaDriverError, .cancelled)
+        }
+        let recordsAfterRejectedCall = try String(
+            contentsOf: trace,
+            encoding: .utf8
+        ).split(separator: "\n")
+        XCTAssertEqual(recordsAfterRejectedCall.count, 2)
+    }
+
+    func testRuntimeShutdownInterruptsBlockedRequestBeforeProtocolTimeout() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("fake-cua-driver")
+        let blockedMarker = directory.appendingPathComponent("blocked")
+        let trace = directory.appendingPathComponent("pids.jsonl")
+        let source = """
+        #!/usr/bin/python3
+        import json, os, signal, socket, sys, time
+        mode = sys.argv[1]
+        socket_path = sys.argv[sys.argv.index("--socket") + 1]
+        with open("\(trace.path)", "a") as output:
+            output.write(json.dumps({"mode": mode, "pid": os.getpid()}) + "\\n")
+            output.flush()
+        signal.signal(signal.SIGTERM, lambda signum, frame: None)
+        if mode == "serve":
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(socket_path)
+            os.chmod(socket_path, 0o600)
+            server.listen(1)
+            while True:
+                time.sleep(1)
+        if mode == "mcp":
+            open("\(blockedMarker.path)", "w").close()
+            while True:
+                time.sleep(1)
+        """
+        try Data(source.utf8).write(to: helper, options: .atomic)
+        XCTAssertEqual(chmod(helper.path, 0o755), 0)
+
+        let runtime = CuaDriverProcessRuntime(
+            driverPathOverride: helper.path,
+            startupTimeout: 2,
+            responseTimeout: 5
+        )
+        let call = Task {
+            try await runtime.call(tool: "block_forever", arguments: [:])
+        }
+        for _ in 0..<200 where
+            !FileManager.default.fileExists(atPath: blockedMarker.path) {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: blockedMarker.path),
+            "fake MCP process never entered its blocked request"
+        )
+
+        let started = Date()
+        runtime.shutdownAndWait()
+        XCTAssertLessThan(
+            Date().timeIntervalSince(started),
+            1.5,
+            "App shutdown must reap a blocked generation before its protocol timeout"
+        )
+        do {
+            _ = try await call.value
+            XCTFail("blocked MCP call unexpectedly succeeded")
+        } catch {
+            XCTAssertTrue(error is CuaDriverError, "unexpected error: \(error)")
+        }
+
+        let records = try String(contentsOf: trace, encoding: .utf8)
+            .split(separator: "\n")
+            .compactMap { line -> [String: Any]? in
+                try? JSONSerialization.jsonObject(
+                    with: Data(line.utf8)
+                ) as? [String: Any]
+            }
+        XCTAssertEqual(records.count, 2)
+        for record in records {
+            guard let pid = (record["pid"] as? NSNumber)?.int32Value else {
+                return XCTFail("missing child pid: \(record)")
+            }
+            XCTAssertEqual(Darwin.kill(pid, 0), -1, "pid \(pid) survived shutdown")
+            XCTAssertEqual(errno, ESRCH)
+        }
+    }
+
+    func testRuntimeShutdownReapsChildThatLosesRegistrationRace() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("fake-cua-driver")
+        let spawnedMarker = directory.appendingPathComponent("spawned")
+        let releaseMarker = directory.appendingPathComponent("release")
+        let trace = directory.appendingPathComponent("pid")
+        let source = """
+        #!/usr/bin/python3
+        import os, signal, sys, time
+        with open("\(trace.path)", "w") as output:
+            output.write(str(os.getpid()))
+            output.flush()
+        signal.signal(signal.SIGTERM, lambda signum, frame: None)
+        open("\(spawnedMarker.path)", "w").close()
+        while not os.path.exists("\(releaseMarker.path)"):
+            time.sleep(0.01)
+        while True:
+            time.sleep(1)
+        """
+        try Data(source.utf8).write(to: helper, options: .atomic)
+        XCTAssertEqual(chmod(helper.path, 0o755), 0)
+
+        let runtime = CuaDriverProcessRuntime(
+            driverPathOverride: helper.path,
+            startupTimeout: 2,
+            responseTimeout: 2
+        )
+        let call = Task {
+            try await runtime.call(tool: "race", arguments: [:])
+        }
+        for _ in 0..<200 where
+            !FileManager.default.fileExists(atPath: spawnedMarker.path) {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: spawnedMarker.path))
+
+        let shutdown = Task.detached { runtime.shutdownAndWait() }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        try Data().write(to: releaseMarker, options: .atomic)
+        _ = await shutdown.value
+        do {
+            _ = try await call.value
+            XCTFail("startup unexpectedly survived final shutdown")
+        } catch {
+            XCTAssertEqual(error as? CuaDriverError, .cancelled)
+        }
+
+        let pid = Int32(try String(contentsOf: trace, encoding: .utf8))!
+        XCTAssertEqual(Darwin.kill(pid, 0), -1, "race-losing child survived")
+        XCTAssertEqual(errno, ESRCH)
+    }
+
     func testRuntimeFatalTimeoutReapsGenerationAndRestartsCleanly() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

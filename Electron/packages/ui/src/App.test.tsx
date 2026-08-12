@@ -264,6 +264,44 @@ describe('PipiUI Electron main layout', () => {
     expect(screen.queryByRole('button', { name: 'Plan' })).toBeNull()
   })
 
+  it.each([
+    ['Subagents', ['Subagents', 'Browser', 'Document', 'Terminal']],
+    ['Browser', ['Browser', 'Document', 'Terminal', 'Subagents']],
+    ['Document', ['Document', 'Terminal', 'Subagents', 'Browser']],
+    ['Terminal', ['Terminal', 'Subagents', 'Browser', 'Document']],
+  ] as const)('keeps native Browser input away from the rail across three cycles starting at %s', async (_start, cycle) => {
+    const host = createMockHost()
+    host.terminal = { open: vi.fn(async () => ({ id: 'rail-terminal', title: 'Terminal', cwd: '/tmp' })), write: vi.fn(async () => undefined), resize: vi.fn(async () => undefined), clear: vi.fn(async () => undefined), close: vi.fn(async () => undefined), subscribe: vi.fn(() => () => undefined) }
+    host.capabilities = async () => ({ computerUse: false, revealInFinder: true, terminal: true, documents: true, browser: true, git: true, plan: false, retainedWorktreeDisposition: false })
+    const setViewBounds = vi.spyOn(host.browser!, 'setViewBounds')
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const click = (name: 'Subagents' | 'Browser' | 'Document' | 'Terminal') => fireEvent.click(screen.getByRole('button', { name }))
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement).disabled).toBe(false))
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Terminal' }) as HTMLButtonElement).disabled).toBe(false))
+    let browserOpened = false
+    for (const name of [...cycle, ...cycle, ...cycle]) {
+      click(name)
+      if (name === 'Browser') {
+        browserOpened = true
+        await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1].visible).toBe(true))
+      } else if (browserOpened) {
+        await waitFor(() => expect(setViewBounds.mock.calls.at(-1)).toEqual(['welcome', { x: 0, y: 0, width: 0, height: 0, visible: false }]))
+      }
+    }
+    expect(screen.getByTestId('browser-panel')).toBeTruthy()
+    expect(Boolean(screen.getByTestId('browser-panel').closest('[hidden]'))).toBe(cycle.at(-1) !== 'Browser')
+  })
+
+  it('keeps the tool rail in a viewport-level pointer hit layer independent of panel contents', () => {
+    const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
+    const railRule = [...css.matchAll(/\.tool-quick-rail\{[^}]*\}/g)].map(match => match[0]).find(rule => rule.includes('flex-direction:column')) ?? ''
+    expect(railRule).toContain('position:fixed')
+    expect(railRule).toContain('pointer-events:auto')
+    expect(railRule).toMatch(/z-index:(?:3[5-9]|[4-9]\d|\d{3,})/)
+    expect(railRule).toContain('right:calc(var(--tools-col) + 16px)')
+  })
+
   it('reveals Browser when the host reports an agent browser action', async () => {
     const host = createMockHost()
     const selectSession = vi.spyOn(host.browser!, 'selectSession')
@@ -338,17 +376,26 @@ describe('PipiUI Electron main layout', () => {
     const researchRow = await screen.findByTestId('agent-row-research')
     fireEvent.click(researchRow.querySelector('.agent-select')!)
     await waitFor(() => expect(researchRow.querySelector('.agent-select')?.getAttribute('aria-pressed')).toBe('true'))
-    const thinking = await screen.findByRole('button', { name: /Thinking/ })
-    fireEvent.click(thinking)
-    await screen.findByText(/正在梳理 packages\/ui 的组件边界/, { selector: '.agent-card-pre' })
-    const agentLog = screen.getByTestId('agent-log')
+    const subagentTranscript = screen.getByTestId('subagent-transcript')
+    expect(within(subagentTranscript).queryByText(/已读取主界面实现/)).toBeNull()
+    // Logs stream in via subscribeAgentLog; wait for the unified step card
+    // (thinking + read combined, like the main agent transcript).
+    await within(subagentTranscript).findByRole('button', { name: /个步骤/ })
+    // expandSteps keeps the outer card open; tool cards are also expanded by default.
+    const readDetail = await within(subagentTranscript).findByRole('button', { name: /^read/ })
+    await within(subagentTranscript).findByText(/已读取主界面实现/)
+    // Thinking card is collapsed by default; expand to verify content persists.
+    const thinkingDetail = await within(subagentTranscript).findByRole('button', { name: /^Thinking/ })
+    fireEvent.click(thinkingDetail)
+    await screen.findByText(/正在梳理 packages\/ui 的组件边界/)
+    const agentLog = screen.getByTestId('subagent-transcript-scroll')
     agentLog.scrollTop = 48
 
     fireEvent.click(screen.getByRole('button', { name: 'Document' }))
     fireEvent.click(screen.getByRole('button', { name: 'Subagents' }))
     await waitFor(() => expect(researchRow.querySelector('.agent-select')?.getAttribute('aria-pressed')).toBe('true'))
-    expect(screen.getByText(/正在梳理 packages\/ui 的组件边界/, { selector: '.agent-card-pre' })).toBeTruthy()
-    expect(screen.getByTestId('agent-log').scrollTop).toBe(48)
+    expect(screen.getByText(/正在梳理 packages\/ui 的组件边界/)).toBeTruthy()
+    expect(screen.getByTestId('subagent-transcript-scroll').scrollTop).toBe(48)
 
     fireEvent.click(screen.getByRole('button', { name: 'Terminal' }))
     await waitFor(() => expect(xtermHarness.instances).toHaveLength(1))
@@ -843,8 +890,7 @@ describe('PipiUI Electron main layout', () => {
   it('uses the shared collapsed ActivityCard for middle and subagent execution', async () => {
     const { container } = render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
-    await screen.findByText('最终结果')
-    expect(container.querySelector('[data-activity-card="final"]')).toBeTruthy()
+    await waitFor(() => expect(container.querySelector('[data-testid="subagent-transcript"] [data-testid="assistant-transcript-content"]')).toBeTruthy())
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '开始流式测试' } })
     fireEvent.click(screen.getByLabelText('发送消息'))
     const summary = await screen.findByRole('button', { name: /个步骤/ })
@@ -879,16 +925,16 @@ describe('PipiUI Electron main layout', () => {
     expect(container.querySelectorAll('[data-activity-card="result"]').length).toBe(1)
   })
 
-  it('collapses Thinking after streaming settles and expands it on demand', async () => {
+  it('keeps Thinking collapsed by default and expands it on demand', async () => {
     render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '思考一下' } })
     fireEvent.click(screen.getByLabelText('发送消息'))
-    await screen.findByText(/正在分析请求与当前项目结构/)
-    await waitFor(() => expect(screen.queryByText(/正在分析请求与当前项目结构/)).toBeNull())
-    const outer = await screen.findByRole('button', { name: /个步骤/ })
-    expect(outer.getAttribute('aria-expanded')).toBe('false')
+    // Wait for the turn to settle — the outer step card remounts collapsed.
+    await waitFor(() => expect(screen.getByRole('button', { name: /个步骤/ }).getAttribute('aria-expanded')).toBe('false'))
+    const outer = screen.getByRole('button', { name: /个步骤/ })
     fireEvent.click(outer)
+    // Thinking is collapsed by default inside the expanded step card.
     const thinkingButton = await screen.findByRole('button', { name: /^Thinking/ })
     expect(thinkingButton.closest('[data-activity-card="thinking"]')).toBeTruthy()
     expect(thinkingButton.getAttribute('aria-expanded')).toBe('false')
@@ -1399,6 +1445,28 @@ describe('demo mock host model persistence (browser reload)', () => {
       localStorage.removeItem(DEMO_MODEL_STORAGE_KEY)
       localStorage.removeItem(DEMO_SESSION_MODELS_STORAGE_KEY)
     }
+  })
+
+  it('shows the target session model immediately while its authoritative refresh is still pending', async () => {
+    const base = createMockHost()
+    let resolveLayout: ((state: ModelState) => void) | undefined
+    const getModelState = vi.fn(async (sessionId?: string) => {
+      if (sessionId !== 'layout') return base.getModelState(sessionId)
+      return new Promise<ModelState>(resolve => { resolveLayout = resolve })
+    })
+    const host: PipiHostAPI = { ...base, getModelState }
+    const { container } = render(<App host={host} />)
+
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('Claude Sonnet 4'))
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+
+    // listSessions already carries layout's openai/gpt-5 binding. A slow Pi
+    // refresh must never leave the previous session's Claude model visible.
+    expect(screen.getByTestId('model-chip').textContent).toContain('GPT-5')
+    expect(screen.getByTestId('model-chip').textContent).not.toContain('Claude')
+
+    resolveLayout?.(await base.getModelState('layout'))
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('GPT-5'))
   })
 })
 

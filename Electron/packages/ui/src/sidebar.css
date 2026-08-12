@@ -203,7 +203,7 @@
 .sb-menu-item:focus-visible{outline:1px solid var(--sb-accent)}
 
 /* ── Session rows ───────────────────────────────────────── */
-.sb-project-sessions{margin:0 0 3px 16px;border-left:1px solid var(--sb-border);padding-left:6px}
+.sb-project-sessions{margin:0 0 3px 10px}
 .sb-session{
   position:relative;
   display:flex;
@@ -231,16 +231,16 @@
 .sb-selected:hover{background:var(--sb-accent-soft)}
 .sb-selected .sb-session-title{color:var(--sb-text-strong);font-weight:600}
 
-/* Right-side status caption (Swift SessionRowStatus). min-width reserves the
-   hover action area so the title never shifts or runs under the buttons, and
-   the caption fades on hover while the actions overlay the same corner. */
+/* Right-side status caption (Swift SessionRowStatus). No fixed min-width: the
+   hover action buttons are absolutely positioned overlays, so reserving flex
+   space only truncates the title prematurely. The caption fades on hover while
+   the actions overlay the same corner. */
 .sb-status{
   flex:none;
   display:inline-flex;
   align-items:center;
   justify-content:flex-end;
   gap:4px;
-  min-width:66px;
   max-width:96px;
   font-size:10.5px;
   color:var(--sb-muted);
@@ -370,6 +370,10 @@
   font-size:11.5px;
 }
 .sb-more:hover{background:var(--sb-surface-hover);color:var(--sb-text)}
+/* Per-project session 「更多/收起」 toggle — sits inside the already-indented
+   `.sb-project-sessions` group, so it drops the outer side margins and hugs
+   the session rows. */
+.sb-more-sessions{width:100%;margin:5px 0 0;padding:4px 6px}
 .sb-empty{
   padding:26px 12px;
   text-align:center;

@@ -142,17 +142,16 @@ test("index.ts runtime gate: grant gated extension mount, env, and early failure
   assert.match(subagent, /hasDesktopCapability: desktopGrant\.granted,/);
   // Capability env is preserved for the dispatched Pi child only under a grant.
   const childEnvStart = subagent.indexOf(
-    "const childEnv = pipiuiChildProcessEnv({",
+    "const childEnv = options?.computerWorker",
   );
   const childSpawnStart = subagent.indexOf(
     "const proc = spawn(invocation.command",
     childEnvStart,
   );
   assert.ok(childEnvStart >= 0 && childSpawnStart > childEnvStart);
-  assert.match(
-    subagent.slice(childEnvStart, childSpawnStart),
-    /\}, desktopGrant\.granted\);\s*$/,
-  );
+  const childEnvBlock = subagent.slice(childEnvStart, childSpawnStart);
+  assert.match(childEnvBlock, /isolatedComputerWorkerChildProcessEnv\(childEnvironmentInput\)/);
+  assert.match(childEnvBlock, /pipiuiChildProcessEnv\(childEnvironmentInput, desktopGrant\.granted\)/);
   // The child-policy prompt is appended only for granted dispatches.
   assert.match(subagent, /if \(desktopGrant\.granted\) promptParts\.push\(DESKTOP_GRANT_CHILD_POLICY\);/);
 

@@ -15,7 +15,7 @@ function activeTab(snapshot: BrowserTabsSnapshot): BrowserTab | undefined {
   return snapshot.tabs.find(tab => tab.id === snapshot.activeTabId) ?? snapshot.tabs[0]
 }
 
-export function BrowserPanel({ host, sessionId }: { host: PipiHostAPI; sessionId?: string }) {
+export function BrowserPanel({ host, sessionId, occluded = false }: { host: PipiHostAPI; sessionId?: string; occluded?: boolean }) {
   const browser = host.browser
   const [tabs, setTabs] = useState<BrowserTabsSnapshot>(emptyTabs)
   const [address, setAddress] = useState('')
@@ -59,7 +59,7 @@ export function BrowserPanel({ host, sessionId }: { host: PipiHostAPI; sessionId
 
   useLayoutEffect(() => {
     if (!browser || !sessionKey) return
-    const update = () => setBounds(true)
+    const update = () => setBounds(!occluded)
     update()
     const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(update)
     if (surfaceRef.current) observer?.observe(surfaceRef.current)
@@ -72,7 +72,7 @@ export function BrowserPanel({ host, sessionId }: { host: PipiHostAPI; sessionId
       // Hides (rather than destroys) the sole main-process WebContentsView.
       void browser.setViewBounds(sessionKey, { x: 0, y: 0, width: 0, height: 0, visible: false }).catch(() => undefined)
     }
-  }, [browser, setBounds, sessionKey])
+  }, [browser, occluded, setBounds, sessionKey])
 
   const run = (operation: () => Promise<unknown>) => {
     setError(undefined)

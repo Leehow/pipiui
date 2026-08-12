@@ -1,6 +1,22 @@
 {
-  "devDependencies": {
-    "@types/node": "22.10.2",
-    "typescript": "5.7.3"
+  "name": "@pipiui/electron",
+  "version": "0.0.0",
+  "private": true,
+  "main": "./out/main/index.js",
+  "description": "pipiui_e — cross-platform PipiUI Electron client",
+  "author": {
+    "name": "PipiUI",
+    "email": "pipiui@leehow.com"
+  },
+  "homepage": "https://github.com/Leehow/pipiui",
+  "dependencies": {
+    "@pipi/host-api": "file:../../packages/host-api",
+    "@pipi/pi-backend": "file:../../packages/pi-backend",
+    "@pipiui/ui": "file:../../packages/ui",
+    "@xterm/addon-serialize": "^0.13.0",
+    "@xterm/headless": "^5.5.0",
+    "node-pty": "^1.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   }
 }

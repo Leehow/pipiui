@@ -604,6 +604,8 @@ export class PiHostBackend implements HostBackend {
    * different sessions stay fully parallel.
    */
   private ensureInFlight = new Map<string, Promise<Live>>();
+  /** Cache-first stats refreshes that must settle during graceful close. */
+  private backgroundStatsRefreshes = new Set<Promise<void>>();
   private models: Model[] = [];
   private modelState: ModelState = {
     model: {
@@ -640,6 +642,11 @@ export class PiHostBackend implements HostBackend {
   private env: NodeJS.ProcessEnv;
   private modelsLoaded?: Promise<void>;
   private configuredModels: Model[] = [];
+  /** Cached, deduped pi runtime model catalog for the current auth epoch.
+   * Set to undefined by refreshModelsAfterAuthChange so login/logout re-fetches. */
+  private runtimeModelsPromise?: Promise<Model[]>;
+  private manualModelSelection?: { provider: string; modelId: string };
+  private manualModelSelectionLoaded?: Promise<void>;
   private hiddenIds: string[] = [];
   private hiddenIdsLoaded?: Promise<void>;
   private projectPaths: string[] = [];
@@ -739,6 +746,13 @@ export class PiHostBackend implements HostBackend {
     // Preload the pi SessionManager module at startup: otherwise the first session open after
     // launch pays its ~1s dynamic-import cost and the chat appears to stall before painting.
     void loadSessionManager();
+    // Preload the model catalog at startup so opening Settings or the Subagent
+    // modal never stalls on "正在加载模型": the costly `list-models` child-process
+    // spawn overlaps with window load, and the resolved catalog is cached
+    // (runtimeModelsPromise) so the renderer's mount-time listModels reuses it
+    // instead of re-spawning. Errors are swallowed here — they resurface on the
+    // next on-demand listModels, and the cache self-clears on failure.
+    void this.loadModelCatalog().catch(() => undefined);
   }
   subscribe(listener: (event: HostEvent) => void) {
     this.listeners.add(listener);
@@ -762,6 +776,7 @@ export class PiHostBackend implements HostBackend {
       }
     }
     await Promise.all(live.map((item) => item.exit ?? Promise.resolve()));
+    await Promise.allSettled([...this.backgroundStatsRefreshes]);
     await Promise.all(
       [...this.leases.values()].map((lease) =>
         lease.release().catch(() => undefined),
@@ -1313,7 +1328,7 @@ export class PiHostBackend implements HostBackend {
       );
   }
   private async newSession(projectId: string, name?: string): Promise<Session> {
-    await this.loadConfiguredModels();
+    await this.loadModelCatalog();
     const projects = (await this.handle("listProjects", [])) as Project[];
     const p = projects.find((x) => x.id === projectId);
     if (!p) throw new Error(`unknown project ${projectId}`);
@@ -1407,6 +1422,14 @@ export class PiHostBackend implements HostBackend {
         ? this.computerDescriptor
         : undefined,
     });
+    // close() may race a cache-first background resume before the child is
+    // inserted into `live`. Fail closed here so shutdown cannot miss a late Pi
+    // process or leave its session lease behind.
+    if (this.closed) {
+      this.bridge.unregister(id);
+      await this.leases.get(id)?.release().catch(() => undefined);
+      throw new Error("host backend closed");
+    }
     const child = this.proc(this.piCommand.executable, [
       ...(this.piCommand.prefixArgs ?? []),
       "--mode",
@@ -1739,6 +1762,52 @@ export class PiHostBackend implements HostBackend {
     await write;
     return result;
   }
+  private async loadManualModelSelection(): Promise<{ provider: string; modelId: string } | undefined> {
+    if (!this.manualModelSelectionLoaded) {
+      this.manualModelSelectionLoaded = (async () => {
+        const value = (await this.readSettings()).manualModelSelection;
+        this.manualModelSelection =
+          isRecord(value) &&
+          typeof value.provider === "string" && value.provider.trim().length > 0 &&
+          typeof value.modelId === "string" && value.modelId.trim().length > 0
+            ? { provider: value.provider, modelId: value.modelId }
+            : undefined;
+      })();
+    }
+    await this.manualModelSelectionLoaded;
+    return this.manualModelSelection;
+  }
+  /** A remembered selection affects only future sessions; existing sessions retain their own model state. */
+  private applyManualModelSelection(selection: { provider: string; modelId: string } | undefined): void {
+    if (!selection) return;
+    const model = this.models.find(
+      (item) => item.provider === selection.provider && item.id === selection.modelId,
+    );
+    if (!model) return;
+    this.modelState = {
+      ...this.modelState,
+      model,
+      availableThinkingLevels: model.reasoning
+        ? ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        : ["off"],
+    };
+  }
+  private async rememberManualModelSelection(model: Model): Promise<void> {
+    const selection = { provider: model.provider, modelId: model.id };
+    await this.updateSettings((settings) => {
+      settings.manualModelSelection = selection;
+    });
+    this.manualModelSelection = selection;
+    this.manualModelSelectionLoaded = Promise.resolve();
+    // Do not inherit the selected session's thinking level into future sessions.
+    this.modelState = {
+      ...this.modelState,
+      model,
+      availableThinkingLevels: model.reasoning
+        ? ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        : ["off"],
+    };
+  }
   private checkedProjectPaths(value: unknown): string[] {
     if (
       !Array.isArray(value) ||
@@ -1975,6 +2044,35 @@ export class PiHostBackend implements HostBackend {
       supportsImages: supportsImagesFor(m.id, m.provider, m.input),
     };
   }
+  /**
+   * Pi's auth-aware runtime catalog with in-flight dedup + caching. The first
+   * call pays the `list-models` child-process spawn; concurrent callers (the
+   * constructor preload + the renderer's mount-time listModels) and subsequent
+   * callers within the same auth epoch reuse the resolved promise instead of
+   * re-spawning. Invalidated by refreshModelsAfterAuthChange on login/logout.
+   * On failure the cache self-clears so the next call retries.
+   */
+  private runtimeModels(): Promise<Model[]> {
+    if (!this.runtimeModelsPromise) {
+      this.runtimeModelsPromise = (async () => {
+        try {
+          const runtime = await this.modelRuntime();
+          const available = await runtime.getAvailable();
+          return [...available]
+            .map((model) => this.toRuntimeModel(model))
+            .sort(
+              (a, b) =>
+                a.provider.localeCompare(b.provider) ||
+                a.id.localeCompare(b.id),
+            );
+        } catch (error) {
+          this.runtimeModelsPromise = undefined;
+          throw error;
+        }
+      })();
+    }
+    return this.runtimeModelsPromise;
+  }
   /** Merge configured/custom models with pi's auth-aware runtime catalog in stable order. */
   private async mergeRuntimeModels(includeCurrent = true): Promise<void> {
     const merged = new Map<string, Model>(
@@ -1984,14 +2082,7 @@ export class PiHostBackend implements HostBackend {
       ]),
     );
     try {
-      const runtime = await this.modelRuntime();
-      const available = await runtime.getAvailable();
-      const additions = [...available]
-        .map((model) => this.toRuntimeModel(model))
-        .sort(
-          (a, b) =>
-            a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id),
-        );
+      const additions = await this.runtimeModels();
       for (const model of additions) {
         const key = `${model.provider}/${model.id}`;
         if (!merged.has(key)) merged.set(key, model);
@@ -2012,12 +2103,14 @@ export class PiHostBackend implements HostBackend {
   private async loadModelCatalog(includeCurrent = true): Promise<void> {
     await this.loadConfiguredModels();
     await this.mergeRuntimeModels(includeCurrent);
+    this.applyManualModelSelection(await this.loadManualModelSelection());
   }
   /** Rebuild after pi login/logout while preserving still-configured literal/env-key models. */
   private async refreshModelsAfterAuthChange(
     includeCurrent = true,
   ): Promise<Model[]> {
     this.modelsLoaded = undefined;
+    this.runtimeModelsPromise = undefined;
     await this.loadModelCatalog(includeCurrent);
     return this.models;
   }
@@ -2164,6 +2257,8 @@ export class PiHostBackend implements HostBackend {
     await this.refreshState(live);
     const state = this.sessionModelStates.get(sessionId)!;
     this.sessionModelSnapshots.set(sessionId, state);
+    if (state.model.provider === provider && state.model.id === modelId)
+      await this.rememberManualModelSelection(state.model);
     return state;
   }
   private async setThinking(sessionId: string, level: ThinkingLevel) {
@@ -2236,15 +2331,43 @@ export class PiHostBackend implements HostBackend {
     });
   }
   /**
-   * Real pi `get_session_stats` RPC mapped onto the stable SessionStats shape.
-   * `sessionId` is optional and defaults to the current active (most recently
-   * started) live session; a cold session is spawned like any resume so stats
-   * always come from pi, never from renderer-side JSONL scanning.
+   * Session stats use a cache-first cold path for the compact context indicator,
+   * then publish the authoritative real-pi `get_session_stats` snapshot after
+   * background resume. A live/no-ledger session still waits for the real RPC.
    */
   private async getSessionStats(sessionId?: string): Promise<SessionStats> {
     await this.loadSessionContextLedger();
     const id = sessionId ?? [...this.live.keys()].at(-1);
     if (!id) throw new Error("no active session; pass an explicit sessionId");
+    const known = this.sessionContextLastKnown.get(id);
+    if (!this.live.has(id) && known) {
+      await this.loadConfiguredModels();
+      const cachedState = this.sessionModelStates.get(id) ?? this.sessionModelSnapshots.get(id);
+      const session = cachedState ? undefined : await this.locate(id);
+      const state = cachedState ?? this.desiredModelFor(session!);
+      this.sessionModelSnapshots.set(id, state);
+      // Revalidate without blocking selection. pushSessionStats publishes the
+      // authoritative live accounting once the cold Pi session is ready.
+      const refresh = this.ensure(id)
+        .then(() => this.pushSessionStats(id))
+        .catch(() => undefined)
+        .finally(() => this.backgroundStatsRefreshes.delete(refresh));
+      this.backgroundStatsRefreshes.add(refresh);
+      return {
+        sessionId: id,
+        tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        cost: 0,
+        contextUsage: {
+          tokens: known.tokens,
+          contextWindow: known.contextWindow,
+          percent: known.percent,
+        },
+        model:
+          state.model.provider === "unknown" && state.model.id === "unknown"
+            ? undefined
+            : { provider: state.model.provider, id: state.model.id, name: state.model.name },
+      };
+    }
     const live = await this.ensure(id);
     return this.sessionStatsData(live.session.id);
   }
@@ -2439,8 +2562,13 @@ export class PiHostBackend implements HostBackend {
   }
   private async agentCommand(id: string, operation: "abort" | "resolve") {
     const a = await this.getAgent(id);
-    if (operation === "abort") a.state = "aborted";
-    else {
+		if (operation === "abort") {
+			if (!a.sessionId || !/^[A-Za-z0-9_-]{2,160}$/.test(id)) throw new Error("agent abort requires a live session and bounded agent id");
+			// Pi executes extension commands immediately while streaming. Do not forge
+			// terminal UI state here; the real child end event remains authoritative.
+			await this.command(a.sessionId, { type: "prompt", message: `/subagent_abort ${id}` });
+			return;
+		} else {
       a.handled = true;
       a.closeout = a.closeout ?? "Boss marked this episode handled";
     }
@@ -2494,7 +2622,21 @@ export class PiHostBackend implements HostBackend {
       this.persistAgents();
       return;
     }
-    const state = raw.ok
+    const reportedName = raw.name ?? current?.name;
+    const privateComputerWorker = reportedName === "operator" || reportedName === "computer-verifier" || reportedName === "computer-terminal";
+    let closedWorkerOutcome: string | undefined;
+    if (privateComputerWorker && raw.kind === "end" && typeof raw.output === "string") {
+      try {
+        const parsed = JSON.parse(raw.output.trim());
+        if (isRecord(parsed) && typeof parsed.outcome === "string") closedWorkerOutcome = parsed.outcome;
+      } catch {
+        // These private roles promise closed JSON. A malformed terminal verdict
+        // is not task success even when the child process itself exited zero.
+      }
+    }
+    const semanticWorkerFailure = privateComputerWorker && raw.kind === "end"
+      && !["completed", "verified"].includes(closedWorkerOutcome ?? "");
+    const state = raw.ok && !semanticWorkerFailure
       ? "ok"
       : raw.aborted
         ? "aborted"
@@ -2507,6 +2649,7 @@ export class PiHostBackend implements HostBackend {
               : "running";
     const usage = isRecord(raw.usage) ? raw.usage : undefined;
     const terminal = raw.kind === "end";
+    const sameRun = current?.runId === raw.runId;
     const agent: AgentSummary = {
       agentId: raw.agentId,
       runId: raw.runId,
@@ -2537,8 +2680,8 @@ export class PiHostBackend implements HostBackend {
       // so a running worker never renders a 最终结果 card built from a half-written answer.
       finalResult: terminal
         ? (nonEmpty(raw.output) ?? current?.finalResult)
-        : current?.finalResult,
-      endedAt: terminal ? (current?.endedAt ?? Date.now()) : current?.endedAt,
+        : sameRun ? current?.finalResult : undefined,
+      endedAt: terminal ? (sameRun ? current?.endedAt : undefined) ?? Date.now() : sameRun ? current?.endedAt : undefined,
       inputTokens: num2(usage?.input) ?? current?.inputTokens,
       outputTokens: num2(usage?.output) ?? current?.outputTokens,
       cacheTokens: num2(usage?.cacheRead) ?? current?.cacheTokens,

@@ -203,6 +203,67 @@ describe('Sidebar', () => {
     expect(screen.queryByTestId('show-more')).toBeNull()
   })
 
+  it('paginates per-project sessions: 10 default, 更多 reveals a page, then 收起 collapses', () => {
+    const sessions = Array.from({ length: 15 }, (_, i) => session({ id: `s${i}`, projectId: 'p1' }))
+    const props = defaultProps({
+      projects: [{ id: 'p1', name: 'demo-project', path: '/Users/me/demo', sessions }],
+      pinnedSessions: []
+    })
+    render(<Sidebar {...props} />)
+    // Default: 10 visible + 更多 toggle (not 收起 yet).
+    expect(screen.getAllByTestId('session-row')).toHaveLength(10)
+    const more = screen.getByTestId('show-more-sessions')
+    expect(more.textContent).toBe('更多')
+    // Click 更多 → reveals another page (capped at the 15-session total).
+    fireEvent.click(more)
+    expect(screen.getAllByTestId('session-row')).toHaveLength(15)
+    const collapse = screen.getByTestId('show-more-sessions')
+    expect(collapse.textContent).toBe('收起')
+    // Click 收起 → back to the 10-row cap.
+    fireEvent.click(collapse)
+    expect(screen.getAllByTestId('session-row')).toHaveLength(10)
+    expect(screen.getByTestId('show-more-sessions').textContent).toBe('更多')
+  })
+
+  it('hides the per-project session toggle when sessions ≤ 10', () => {
+    render(<Sidebar {...defaultProps()} />)
+    // p1 has 2 sessions, p2 (collapsed) has 1 → no session toggle anywhere.
+    expect(screen.queryByTestId('show-more-sessions')).toBeNull()
+  })
+
+  it('keeps per-project session pagination independent across projects', () => {
+    const sessionsP1 = Array.from({ length: 12 }, (_, i) => session({ id: `a${i}`, projectId: 'p1' }))
+    const sessionsP2 = Array.from({ length: 13 }, (_, i) => session({ id: `b${i}`, projectId: 'p2' }))
+    const props = defaultProps({
+      projects: [
+        { id: 'p1', name: 'demo-project', path: '/x', sessions: sessionsP1 },
+        { id: 'p2', name: 'other-project', path: '/y', sessions: sessionsP2 }
+      ],
+      pinnedSessions: [],
+      expandedIds: ['p1', 'p2']
+    })
+    render(<Sidebar {...props} />)
+    // Both expanded: 10 + 10 = 20 rows, plus two independent toggles.
+    expect(screen.getAllByTestId('session-row')).toHaveLength(20)
+    const toggles = screen.getAllByTestId('show-more-sessions')
+    expect(toggles).toHaveLength(2)
+    // Expand only p1's sessions; p2 stays capped.
+    fireEvent.click(toggles[0])
+    expect(screen.getAllByTestId('session-row')).toHaveLength(22)
+  })
+
+  it('search bypasses per-project session pagination and shows every match', () => {
+    const sessions = Array.from({ length: 15 }, (_, i) => session({ id: `find${i}`, projectId: 'p1' }))
+    const props = defaultProps({
+      projects: [{ id: 'p1', name: 'demo-project', path: '/x', sessions }],
+      pinnedSessions: [],
+      searchQuery: 'find'
+    })
+    render(<Sidebar {...props} />)
+    expect(screen.getAllByTestId('session-row')).toHaveLength(15)
+    expect(screen.queryByTestId('show-more-sessions')).toBeNull()
+  })
+
   it('search results bypass pagination so every match is visible', () => {
     const props = defaultProps({ visibleLimit: 1, searchQuery: 's' })
     render(<Sidebar {...props} />)
@@ -350,9 +411,10 @@ describe('Sidebar', () => {
     expect(css).toMatch(/\.sb-session-actions\{[^}]*position:absolute[^}]*\}/)
     expect(css).toMatch(/\.sb-session:hover \.sb-session-actions,?/)
     expect(css).toMatch(/\.sb-session-actions\{[^}]*opacity:0;[^}]*pointer-events:none[^}]*\}/)
-    // Trailing width is reserved so the title never shifts or runs under the buttons.
+    // The row is positioned so the hover actions can overlay the right corner.
     expect(css).toMatch(/\.sb-session\{[^}]*position:relative[^}]*\}/)
-    expect(css).toMatch(/\.sb-status\{[^}]*min-width:66px[^}]*\}/)
+    // No fixed min-width on status — the title fills available space and hover actions overlay.
+    expect(css).not.toMatch(/\.sb-status\{[^}]*min-width:[^}]*\}/)
   })
 
   it('keeps the caption and the three hover actions mounted on the row across mouseenter/mouseleave', () => {

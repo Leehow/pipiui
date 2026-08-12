@@ -87,8 +87,77 @@ discover_macho_candidates() {
       done
 }
 
+process_list_contains_exact_executable() {
+  local target="$1"
+  local pid executable
+  local found=1
+  while read -r pid executable; do
+    if [[ "$executable" == "$target" ]]; then
+      found=0
+    fi
+  done
+  return "$found"
+}
+
+canonical_electron_app_is_running() {
+  local executable="$1"
+  process_list_contains_exact_executable "$executable" < <(/bin/ps -axo pid=,comm=)
+}
+
+verify_embedded_node_signing() {
+  local embedded_node="$1"
+  local embedded_entitlements jit_entitlement host_arch node_arches
+  local -a node_command=()
+
+  if ! codesign --verify --strict --verbose=2 "$embedded_node"; then
+    echo "ERROR: embedded Node signature verification failed: $embedded_node" >&2
+    return 1
+  fi
+  if ! embedded_entitlements="$(codesign -d --entitlements :- "$embedded_node" 2>/dev/null)"; then
+    echo "ERROR: could not read embedded Node entitlements: $embedded_node" >&2
+    return 1
+  fi
+  jit_entitlement="$(
+    printf '%s' "$embedded_entitlements" \
+      | /usr/bin/plutil -extract 'com\.apple\.security\.cs\.allow-jit' raw -o - - 2>/dev/null \
+      || true
+  )"
+  if [[ "$jit_entitlement" != "true" ]]; then
+    echo "ERROR: embedded Node is missing required com.apple.security.cs.allow-jit entitlement: $embedded_node" >&2
+    return 1
+  fi
+
+  host_arch="$(/usr/bin/uname -m)"
+  if ! node_arches="$(/usr/bin/lipo -archs "$embedded_node" 2>/dev/null)" || [[ -z "$node_arches" ]]; then
+    echo "ERROR: could not determine embedded Node architecture: $embedded_node" >&2
+    return 1
+  fi
+  case " $node_arches " in
+    *" $host_arch "*)
+      node_command=("$embedded_node")
+      ;;
+    *" x86_64 "*)
+      if [[ "$host_arch" == "arm64" ]] && /usr/bin/arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+        node_command=(/usr/bin/arch -x86_64 "$embedded_node")
+      fi
+      ;;
+  esac
+
+  if [[ "${#node_command[@]}" -eq 0 ]]; then
+    echo "Embedded Node signature/JIT verified; startup probe skipped for $node_arches on $host_arch."
+    return 0
+  fi
+  if ! /usr/bin/env -i HOME="${TMPDIR:-/tmp}" PATH=/usr/bin:/bin \
+      "${node_command[@]}" -e 'if (!process.versions || !process.versions.node) process.exit(1)'; then
+    echo "ERROR: embedded Node failed the minimal JavaScript startup probe: $embedded_node" >&2
+    return 1
+  fi
+  echo "Embedded Node signature/JIT/startup verified: $embedded_node"
+}
+
 finalize_mac_bundle() {
   local app="$1"
+  local embedded_node="$app/Contents/Resources/pipiui-embedded/node/bin/node"
   expected_mac_bundle_is_complete "$app" || {
     echo "ERROR: refusing to sign incomplete Electron bundle: $app" >&2
     return 1
@@ -109,13 +178,19 @@ finalize_mac_bundle() {
   # executables), then containing frameworks/XPCs/helper Apps deepest-first,
   # and only then seal the root App.
   while IFS= read -r nested; do
-    codesign --sign "$CSC_NAME" --force --timestamp --options runtime "$nested"
+    if [[ "$nested" == "$embedded_node" ]]; then
+      codesign --sign "$CSC_NAME" --force --timestamp --options runtime \
+        --entitlements "$MAC_ENTITLEMENTS" "$nested"
+    else
+      codesign --sign "$CSC_NAME" --force --timestamp --options runtime "$nested"
+    fi
   done < <(
     discover_macho_candidates "$app" \
       | awk '{ path=$0; depth=gsub("/", "/", path); print depth, $0 }' \
       | sort -rn \
       | cut -d' ' -f2-
   )
+  verify_embedded_node_signing "$embedded_node"
 
   while IFS= read -r nested; do
     case "$nested" in
@@ -208,6 +283,15 @@ if [[ "$CURRENT_ROOT" != "$PRIMARY_ROOT" ]]; then
     echo "Current checkout: $CURRENT_ROOT" >&2
     echo "Running the Electron workspace build only." >&2
     exec npm --prefix Electron run build
+  fi
+fi
+
+if [[ "$PLATFORM" == "mac" ]]; then
+  CANONICAL_ELECTRON_EXECUTABLE="$ROOT/build/PipiUI Electron.app/Contents/MacOS/PipiUI Electron"
+  if canonical_electron_app_is_running "$CANONICAL_ELECTRON_EXECUTABLE"; then
+    echo "ERROR: refusing to build or replace the canonical Electron App while it is running." >&2
+    echo "Quit PipiUI Electron manually, then rerun this command. The running process was not terminated." >&2
+    exit 1
   fi
 fi
 

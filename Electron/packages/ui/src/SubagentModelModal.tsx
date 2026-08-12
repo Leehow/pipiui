@@ -7,6 +7,7 @@ import './subagent-models.css'
 
 const THINKING_LEVELS = ['off', 'low', 'medium', 'high'] as const
 const COMPUTER_USE_AGENT_NAMES = new Set(['computer-use-leader', 'operator', 'computer-verifier', 'computer-terminal'])
+const VISUAL_COMPUTER_USE_AGENT_NAMES = new Set(['operator', 'computer-verifier'])
 
 /** Per-role ordered model fallback editor, mirroring Swift Settings > Subagent. */
 export function SubagentModelModal({ host, current, visibility, onClose }: { host: PipiHostAPI; current: Model | null; visibility: ModelVisibilityController; onClose: () => void }) {
@@ -99,15 +100,17 @@ function AgentRow({ agent, chain, models, saving, onSave }: {
   saving: boolean
   onSave: (agentName: string, chain: SubagentModelSetting[]) => Promise<void>
 }) {
+  const findModel = (ref: string) => models.find(candidate => modelRef(candidate) === ref)
+    ?? models.find(candidate => candidate.id === ref)
   const rows = chain.length ? chain : [{ model: '', thinking: undefined }]
-  const changeModel = (index: number, modelId: string) => {
-    if (index === 0 && modelId === '') {
+  const changeModel = (index: number, selectedRef: string) => {
+    if (index === 0 && selectedRef === '') {
       void onSave(agent.name, [])
       return
     }
-    const model = models.find(candidate => candidate.id === modelId)
+    const model = findModel(selectedRef)
     const next = chain.length ? [...chain] : [{ model: '', thinking: undefined }]
-    next[index] = { model: modelId, ...(model?.reasoning ? { thinking: next[index]?.thinking ?? 'off' } : {}) }
+    next[index] = { model: selectedRef, ...(model?.reasoning ? { thinking: next[index]?.thinking ?? 'off' } : {}) }
     void onSave(agent.name, next)
   }
   const changeThinking = (index: number, thinking: string) => {
@@ -119,8 +122,9 @@ function AgentRow({ agent, chain, models, saving, onSave }: {
   const addFallback = () => {
     const first = models[0]
     if (!first) return
-    const primary = chain.length ? chain : [{ model: first.id, ...(first.reasoning ? { thinking: 'off' } : {}) }]
-    void onSave(agent.name, [...primary, { model: first.id, ...(first.reasoning ? { thinking: 'off' } : {}) }])
+    const firstRef = modelRef(first)
+    const primary = chain.length ? chain : [{ model: firstRef, ...(first.reasoning ? { thinking: 'off' } : {}) }]
+    void onSave(agent.name, [...primary, { model: firstRef, ...(first.reasoning ? { thinking: 'off' } : {}) }])
   }
   const remove = (index: number) => void onSave(agent.name, chain.filter((_, itemIndex) => itemIndex !== index))
 
@@ -128,8 +132,9 @@ function AgentRow({ agent, chain, models, saving, onSave }: {
     <article className="subagent-agent-row" data-testid={`subagent-agent-${agent.name}`}>
       <div className="subagent-agent-heading"><strong>{agent.name}</strong>{chain.length > 1 && <span>fallback ×{chain.length}</span>}</div>
       <p>{agent.description}</p>
+      {VISUAL_COMPUTER_USE_AGENT_NAMES.has(agent.name) && <p className="subagent-visual-model-hint">需要查看截图，建议选择支持图像输入的模型（如 Grok）。这只是建议，不会自动选择或覆盖你的设置。</p>}
       {rows.map((entry, index) => {
-        const selected = models.find(model => model.id === entry.model)
+        const selected = findModel(entry.model)
         const reasoning = selected?.reasoning
         return (
           <div className="subagent-chain-row" key={`${index}:${entry.model}`} data-testid={`subagent-chain-${agent.name}-${index}`}>
@@ -172,8 +177,9 @@ function ModelPicker({ models, selected, follow, allowFollow, disabled, onSelect
       {open && <div className="subagent-model-picker-menu" role="listbox" aria-label={`${agentName} 模型候选`}>
         {allowFollow && <button type="button" role="option" aria-selected={follow} className={follow ? 'selected' : ''} onClick={() => pick('')}><span>跟随主 Agent</span>{follow && <b aria-label="已选中">✓</b>}</button>}
         {models.map(model => {
-          const active = selected?.id === model.id && !follow
-          return <button type="button" role="option" aria-selected={active} className={active ? 'selected' : ''} key={`${model.provider}/${model.id}`} data-testid={`subagent-model-option-${agentName}-${index}-${model.id}`} onClick={() => pick(model.id)}><ProviderLogo provider={model.provider} modelId={model.id} size={14} /><span>{model.name}（{model.id}）</span>{active && <b aria-label="已选中">✓</b>}</button>
+          const ref = modelRef(model)
+          const active = selected ? modelRef(selected) === ref && !follow : false
+          return <button type="button" role="option" aria-selected={active} className={active ? 'selected' : ''} key={ref} data-testid={`subagent-model-option-${agentName}-${index}-${model.provider}-${model.id}`} onClick={() => pick(ref)}><ProviderLogo provider={model.provider} modelId={model.id} size={14} /><span>{model.name}（{model.id}）</span>{active && <b aria-label="已选中">✓</b>}</button>
         })}
       </div>}
     </div>

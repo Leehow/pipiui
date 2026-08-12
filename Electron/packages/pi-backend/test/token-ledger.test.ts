@@ -175,4 +175,38 @@ describe("per-session last-known context persistence", () => {
     // Percent is re-derived from tokens/window after rehydration (Swift does the same).
     expect(restored.contextUsage.percent).toBeCloseTo(15000 / 262144 * 100, 3);
   });
+
+  it("returns a cold session's ledger snapshot before Pi finishes starting, then refreshes in the background", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-ledger-cache-first-"));
+    const agent = join(root, "agent");
+    const sessions = join(root, "sessions");
+    const cwd = join(root, "project");
+    await mkdir(agent, { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await writeSession("session-1", cwd, sessions);
+    await appendLedgerRecord(join(agent, "pipiui-token-ledger.jsonl"), record);
+
+    // A Pi child that never answers any RPC makes the old implementation hang.
+    // The cached context must still resolve without waiting for that child.
+    const backend = createPiHostBackend({
+      agentDir: agent,
+      sessionsRoot: sessions,
+      runtimeRoot: join(root, "runtime"),
+      env: { PATH: process.env.PATH ?? "" },
+      piPath: "node",
+      spawn: (_bin: any, _args: any, options: any) =>
+        spawn("/usr/local/bin/node", ["-e", "process.stdin.resume();process.stdin.on('end',()=>process.exit(0));setInterval(()=>{},1000)"], { ...options, env: { ...options.env, PATH: "/usr/local/bin:/usr/bin:/bin" } }) as any,
+      authRuntime: { getProviders: async () => [], getAvailable: async () => [], login: async () => undefined, logout: async () => undefined },
+    });
+
+    const outcome = await Promise.race([
+      backend.handle("getSessionStats", ["session-1"]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("waited for Pi")), 250)),
+    ]) as any;
+    expect(outcome).toMatchObject({
+      sessionId: "session-1",
+      contextUsage: { tokens: 15000, contextWindow: 262144 },
+    });
+    await backend.close();
+  });
 });

@@ -89,6 +89,20 @@ describe("HostBridge", () => {
     expect((await post(port, { sessionKey: "session-1", computerCapability: "forged", protocolVersion: 1, action: "computer_batch", actions: [] })).status).toBe(403);
   });
 
+  it("preserves only the closed typed CUA RPC timeout code across the computer bridge", async () => {
+    bridge = new HostBridge({
+      onAgentEvent: () => {},
+      onPlanEvent: () => {},
+      onComputerAction: async () => { throw Object.assign(new Error("private driver detail"), { code: "cua_driver_rpc_timeout" }); },
+    });
+    const port = await bridge.listen();
+    const computerCapability = bridge.registerComputer("session-1");
+    const response = await post(port, { sessionKey: "session-1", computerCapability, protocolVersion: 1, action: "computer_batch", actions: [{ type: "screenshot" }] });
+    const result = await response.json();
+    expect(result).toMatchObject({ ok: false, error: "Cua Driver request timed out", runtimeError: { code: "cua_driver_rpc_timeout", message: "Cua Driver request timed out" } });
+    expect(JSON.stringify(result)).not.toContain("private driver detail");
+  });
+
   it("serves only POST /rpc", async () => {
     const { port } = await started();
     expect((await post(port, {}, "/anything")).status).toBe(404);

@@ -84,4 +84,13 @@ enum CuaDriverError: LocalizedError, Equatable {
 protocol CuaDriverTransport: AnyObject {
     func call(tool: String, arguments: [String: Any]) async throws -> CuaToolResult
     func cancelAndStop()
+    /// App-termination boundary. Implementations that own child processes
+    /// override this to return only after those children are reaped.
+    func shutdownAndWait()
+}
+
+extension CuaDriverTransport {
+    func shutdownAndWait() {
+        cancelAndStop()
+    }
 }

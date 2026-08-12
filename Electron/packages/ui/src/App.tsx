@@ -147,6 +147,20 @@ export function sidebarModelForSession(session: Session, selectedSessionId: stri
   return { provider: provider ?? '', modelId }
 }
 
+/** Build an immediate display snapshot from listSessions metadata. */
+function modelStateFromSession(session: Session | undefined, catalog: readonly Model[]): ModelState | null {
+  if (!session) return null
+  const ref = sidebarModelForSession(session, '', null)
+  if (!ref.provider || !ref.modelId) return null
+  const known = catalog.find(model => model.provider === ref.provider && model.id === ref.modelId)
+  const model: Model = known ?? { provider: ref.provider, id: ref.modelId, name: ref.modelId, reasoning: false }
+  return {
+    model,
+    thinkingLevel: 'off',
+    availableThinkingLevels: model.reasoning ? ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] : ['off']
+  }
+}
+
 /** Swift-style priority: main stream > session-bound subagents > terminal agent states > observed stream state > idle. */
 export function sidebarStatusForSession(sessionId: string, selectedSessionId: string, streaming: boolean, observedStatus: SessionStatus | undefined, agents: readonly AgentSummary[]): { status: SessionStatus; subagentCount?: number } {
   if ((sessionId === selectedSessionId && streaming) || observedStatus === 'running') return { status: 'running' }
@@ -718,6 +732,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [selectedSession, setSelectedSession] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [modelState, setModelState] = useState<ModelState | null>(null)
+  const modelStatesBySessionRef = useRef(new Map<string, ModelState>())
   const [streaming, setStreaming] = useState(false)
   const [compacting, setCompacting] = useState(false)
   const [copiedId, setCopiedId] = useState<string | null>(null)
@@ -725,6 +740,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [waitingStartedAt, setWaitingStartedAt] = useState<number | null>(null)
   const [waitingVisible, setWaitingVisible] = useState(false)
   const [waitingPhase, setWaitingPhase] = useState<WaitingPhase>('awaiting')
+  const [waitingDetail, setWaitingDetail] = useState<string | undefined>(undefined)
   const [lease, setLease] = useState<SessionLease | null>(null)
   const [activeTab, setActiveTab] = useState<PanelTab>('Subagents')
   const [announcedTerminals, setAnnouncedTerminals] = useState<Record<string, TerminalSession>>({})
@@ -868,8 +884,16 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   useEffect(() => { document.title = sessions.find(session => session.id === selectedSession)?.name ?? 'PipiUI' }, [selectedSession, sessions])
   useEffect(() => {
     let current = true
+    const sessionId = selectedSession
+    const immediate = modelStatesBySessionRef.current.get(sessionId)
+      ?? modelStateFromSession(sessions.find(session => session.id === sessionId), modalVisibility.models)
+    if (immediate) setModelState(immediate)
     void host.getModelState(selectedSession || undefined)
-      .then(state => { if (current) setModelState(state) })
+      .then(state => {
+        if (!current) return
+        if (sessionId) modelStatesBySessionRef.current.set(sessionId, state)
+        setModelState(state)
+      })
       // Failure fallback: the session's own model (from listSessions) keeps the
       // chip/row per-session even when the host model query itself failed.
       .catch(() => {
@@ -878,7 +902,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         if (ref) setModelState({ model: { provider: ref.provider, id: ref.modelId, name: ref.modelId, reasoning: false }, thinkingLevel: 'off', availableThinkingLevels: ['off'] })
       })
     return () => { current = false }
-  }, [host, selectedSession, sessions])
+  }, [host, modalVisibility.models, selectedSession, sessions])
   useEffect(() => {
     const request = ++historyLoadRef.current
     if (!selectedSession) {
@@ -935,11 +959,25 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           activeUserTurnRef.current = false
           setWaitingVisible(false)
           setWaitingStartedAt(null)
+          setWaitingDetail(undefined)
         }
         return
       }
-      // Only real visible assistant output ends the user-initiated first-token wait.
-      setWaitingVisible(false)
+      // Thinking and tool runs live inside folded cards — keep the placeholder
+      // visible with an appropriate phase so the user never sees a silent gap
+      // between sending their message and the first readable text. Only real
+      // text output ends the first-token wait.
+      if (activeUserTurnRef.current) {
+        if (event.type === 'text') {
+          setWaitingVisible(false)
+        } else if (event.type === 'thinking') {
+          setWaitingPhase('thinking')
+        } else if (event.type === 'tool_call' || event.type === 'tool_result') {
+          setWaitingPhase('tool')
+          if (event.type === 'tool_call' && event.name === 'subagent') setWaitingDetail('子任务执行中')
+          else if (event.type === 'tool_call') setWaitingDetail(undefined)
+        }
+      }
       setMessages(previous => applyStreamEvent(previous, event))
     } })
     const unsubscribe = host.subscribeStream(selectedSession, event => coalescer.push(event))
@@ -989,12 +1027,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setWaitingStartedAt(Date.now())
       setWaitingVisible(true)
       setWaitingPhase('awaiting')
+      setWaitingDetail(undefined)
     }
     const resetFailedDirectTurn = () => {
       activeUserTurnRef.current = false
       setStreaming(false)
       setWaitingVisible(false)
       setWaitingStartedAt(null)
+      setWaitingDetail(undefined)
     }
 
     if (sessionQueue.busy) {
@@ -1165,7 +1205,15 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setSelectedProject(session.projectId)
       setSidebarExpandedIds(current => current.includes(session.projectId) ? current : [...current, session.projectId])
     }
+    const immediate = modelStatesBySessionRef.current.get(sessionId)
+      ?? modelStateFromSession(session, modalVisibility.models)
+    if (immediate) setModelState(immediate)
     setSelectedSession(sessionId)
+  }
+
+  const applySelectedModelState = (state: ModelState) => {
+    if (selectedSession) modelStatesBySessionRef.current.set(selectedSession, state)
+    setModelState(state)
   }
   const onSidebarProjectMenu = (projectId: string, action: ProjectMenuAction) => {
     if (action === 'newSession') { void newSession(projectId); return }
@@ -1213,17 +1261,17 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       <ChatHeader session={sessions.find(item => item.id === selectedSession)} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={sidebarCollapsed} toolsCollapsed={toolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} />
       <div className="chat-viewport" data-testid="chat-viewport">
         <ToolQuickRail activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunning={subagentsRunning} />
-        <Transcript messages={messages} transcriptRef={transcriptRef} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={waitingVisible && waitingStartedAt !== null ? { startedAt: waitingStartedAt, phase: waitingPhase, onStop: () => { setWaitingPhase('stopping'); if (selectedSession) void host.stop(selectedSession) } } : undefined} />
+        <Transcript messages={messages} transcriptRef={transcriptRef} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={waitingVisible && waitingStartedAt !== null ? { startedAt: waitingStartedAt, phase: waitingPhase, detail: waitingDetail, onStop: () => { setWaitingPhase('stopping'); if (selectedSession) void host.stop(selectedSession) } } : undefined} />
       </div>
       <div className="chat-composer-stack" data-testid="chat-composer-stack">
         {sessionQueue.error && <div className="queue-operation-error" role="alert" data-testid="queue-operation-error"><span>{sessionQueue.error}</span><button aria-label="关闭队列错误" onClick={sessionQueue.dismissError}>×</button></div>}
         <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.steer(id).catch(() => undefined) }} />
-        <Composer key={selectedSession} streaming={streaming} compacting={compacting} queueBusy={sessionQueue.busy} readOnly={leaseReadOnly} leaseOwner={leaseReadOnly ? leaseOwnerLabel(lease) : undefined} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} modelState={modelState} host={host} sessionId={selectedSession} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} onOpenModelManager={() => setModalOpen(true)} onCompact={compact} onSend={send} onStop={() => { setWaitingPhase('stopping'); if (selectedSession) void host.stop(selectedSession) }} onModel={setModelState} />
+        <Composer key={selectedSession} streaming={streaming} compacting={compacting} queueBusy={sessionQueue.busy} readOnly={leaseReadOnly} leaseOwner={leaseReadOnly ? leaseOwnerLabel(lease) : undefined} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} modelState={modelState} host={host} sessionId={selectedSession} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} onOpenModelManager={() => setModalOpen(true)} onCompact={compact} onSend={send} onStop={() => { setWaitingPhase('stopping'); if (selectedSession) void host.stop(selectedSession) }} onModel={applySelectedModelState} />
       </div>
     </section>
     <ResizeHandle label="调整工具栏宽度" onPointerDown={resize('tools', widths.tools)} />
     <ToolPanel activeTab={activeTab} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningChange={setSubagentsRunning} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={projects.find(project => project.id === selectedProject)?.path} />
-    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} current={modelState?.model ?? null} onModelState={setModelState} onClose={() => setModalOpen(false)} />}
+    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} current={modelState?.model ?? null} onModelState={applySelectedModelState} onClose={() => setModalOpen(false)} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} />}
     {subagentModelsOpen && <SubagentModelModal host={host} current={modelState?.model ?? null} visibility={modalVisibility} onClose={() => setSubagentModelsOpen(false)} />}
@@ -1295,7 +1343,7 @@ export function finishStreamingMessage(messages: ChatMessage[]): ChatMessage[] {
 function ResizeHandle({ label, onPointerDown }: { label: string; onPointerDown: (event: React.PointerEvent) => void }) { return <div className="resize-handle" role="separator" aria-label={label} onPointerDown={onPointerDown} /> }
 function ChatHeader({ session, project, lease, host, gitAvailable, sidebarCollapsed, toolsCollapsed, onToggleSidebar, onToggleTools, onTakeover }: { session?: Session; project?: Project; lease: SessionLease | null; host: PipiHostAPI; gitAvailable: boolean; sidebarCollapsed: boolean; toolsCollapsed: boolean; onToggleSidebar: () => void; onToggleTools: () => void; onTakeover: () => void }) { const readOnly = lease !== null && !leaseCanWrite(lease); return <header className="chat-header"><button data-testid="toggle-sidebar" title={sidebarCollapsed ? '展开左栏' : '收起左栏'} aria-label={sidebarCollapsed ? '展开左栏' : '收起左栏'} aria-expanded={!sidebarCollapsed} onClick={onToggleSidebar}>≡</button><div className="chat-header-title"><strong>{session?.name ?? '新会话'}</strong>{readOnly && <span className="lease-detail">由 {leaseOwnerLabel(lease)} 运行中 · 只读 <button data-testid="lease-takeover-header" onClick={onTakeover}>强制接管</button></span>}</div><div className="chat-header-actions"><GitBranchMenu host={host} projectId={project?.id} available={gitAvailable} /><button data-testid="toggle-tools" title={toolsCollapsed ? '展开右栏' : '收起右栏'} aria-label={toolsCollapsed ? '展开右栏' : '收起右栏'} aria-expanded={!toolsCollapsed} onClick={onToggleTools}>▤</button></div></header> }
 type MessageActionHandlers = { onCopy: (message: ChatMessage) => Promise<void>; onResend: (message: ChatMessage) => void; resendDisabled: boolean; copiedId: string | null }
-function Transcript({ messages, transcriptRef, waiting, onCopy, onResend, resendDisabled, copiedId }: { messages: ChatMessage[]; transcriptRef: React.RefObject<VirtuosoHandle>; waiting?: { startedAt: number; phase: WaitingPhase; onStop: () => void } } & MessageActionHandlers) { const [atBottom, setAtBottom] = useState(true); const [seekingId, setSeekingId] = useState<string | null>(null); const prompts = useMemo(() => buildRailPrompts(messages), [messages]); const { activeId: viewportActiveId, containerRef } = useActivePromptId(prompts, atBottom); const activeId = seekingId ?? viewportActiveId; useEffect(() => { if (atBottom) setSeekingId(null) }, [atBottom]); const jump = (index: number, id: string) => { setSeekingId(id); transcriptRef.current?.scrollToIndex({ index, align: 'start', behavior: 'smooth' }) }; const returnLatest = () => { setSeekingId(null); transcriptRef.current?.scrollToIndex({ index: Math.max(0, messages.length - 1), align: 'end', behavior: 'smooth' }); setAtBottom(true) }; return <div className="transcript-area" ref={containerRef}><PromptRail prompts={prompts} activeId={activeId} onJump={jump} /><MessageList ref={transcriptRef} messages={messages} atBottom={atBottom} onAtBottom={setAtBottom} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} />{waiting && <WaitingPlaceholder phase={waiting.phase} startedAt={waiting.startedAt} onStop={waiting.onStop} />}{!atBottom && messages.length > 0 && <button className="return-latest" onClick={returnLatest}>回到最新</button>}</div> }
+function Transcript({ messages, transcriptRef, waiting, onCopy, onResend, resendDisabled, copiedId }: { messages: ChatMessage[]; transcriptRef: React.RefObject<VirtuosoHandle>; waiting?: { startedAt: number; phase: WaitingPhase; detail?: string; onStop: () => void } } & MessageActionHandlers) { const [atBottom, setAtBottom] = useState(true); const [seekingId, setSeekingId] = useState<string | null>(null); const prompts = useMemo(() => buildRailPrompts(messages), [messages]); const { activeId: viewportActiveId, containerRef } = useActivePromptId(prompts, atBottom); const activeId = seekingId ?? viewportActiveId; useEffect(() => { if (atBottom) setSeekingId(null) }, [atBottom]); const jump = (index: number, id: string) => { setSeekingId(id); transcriptRef.current?.scrollToIndex({ index, align: 'start', behavior: 'smooth' }) }; const returnLatest = () => { setSeekingId(null); transcriptRef.current?.scrollToIndex({ index: Math.max(0, messages.length - 1), align: 'end', behavior: 'smooth' }); setAtBottom(true) }; return <div className="transcript-area" ref={containerRef}><PromptRail prompts={prompts} activeId={activeId} onJump={jump} /><MessageList ref={transcriptRef} messages={messages} atBottom={atBottom} onAtBottom={setAtBottom} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} />{waiting && <WaitingPlaceholder phase={waiting.phase} startedAt={waiting.startedAt} detail={waiting.detail} onStop={waiting.onStop} />}{!atBottom && messages.length > 0 && <button className="return-latest" onClick={returnLatest}>回到最新</button>}</div> }
 const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessage[]; atBottom: boolean; onAtBottom: (value: boolean) => void } & MessageActionHandlers>(function MessageList({ messages, atBottom, onAtBottom, onCopy, onResend, resendDisabled, copiedId }, ref) { return <div className="message-list" data-testid="message-scroll"><Virtuoso ref={ref} data={messages} followOutput={() => atBottom ? 'auto' : false} atBottomStateChange={onAtBottom} alignToBottom itemContent={(_, message) => <MessageView message={message} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copied={copiedId === message.id} />} /></div> }))
 export const MessageView = memo(function MessageView({ message, onCopy, onResend, resendDisabled, copied }: { message: ChatMessage; copied?: boolean } & Omit<MessageActionHandlers, 'copiedId'>) { const copyDisabled = !message.content.trim(); const copy = () => { void onCopy(message).catch(() => undefined) }; if (message.role === 'user') return <article className="message user-message" data-user-prompt={message.id}><div className="user-message-stack"><UserMessageBubble text={message.content} /><MessageActionBar alignment="trailing" canCopy canResend={Boolean(message.content.trim())} copyDisabled={copyDisabled} resendDisabled={resendDisabled} onCopy={copy} onResend={() => onResend(message)} copied={copied} /></div></article>; if (message.role === 'tool') { const notice = parseSubagentNotice(message.content); return notice ? <article className="message assistant-message"><CollapsibleActivityCard kind="result" label="子任务" summary={notice.name} meta={`${notice.ok ? '成功' : '失败'} · ${notice.cost}`}><pre>{message.content}</pre></CollapsibleActivityCard><MessageActionBar alignment="leading" canCopy copyDisabled={copyDisabled} onCopy={copy} copied={copied} /></article> : <article className="system-message tool-message"><div>{message.content}</div><MessageActionBar alignment="leading" canCopy copyDisabled={copyDisabled} onCopy={copy} copied={copied} /></article> } return <article className="message assistant-message"><AssistantTranscriptContent message={message} /><MessageActionBar alignment="leading" canCopy copyDisabled={copyDisabled} onCopy={copy} copied={copied} /></article> })
 const MIN_COMPOSER_HEIGHT = 29

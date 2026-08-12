@@ -32,6 +32,8 @@ cd /Users/haoli/leehow/code/pipiui
 ./scripts/build-electron-app.sh  # Electron release → build/PipiUI Electron.app
 ```
 
+Agents 不直接调用 `build-electron-app.sh`，一律经 `pipiui-electron-build` skill 打包（见 `AGENTS.md` → Electron packaging adapter）；该 skill 的 `release` 模式内部才调用本脚本。本条约束的是打包**地点**，skill 约束的是打包**方式**，两者并行生效。
+
 ## 1A. PipiUI 宿主进程生命周期由用户授权（强制）
 
 运行中的 PipiUI 宿主进程属于当前用户。Agents/workers **不得**针对它执行 `kill`、`pkill`、`killall`、Force Quit、`NSRunningApplication.terminate()`、`NSRunningApplication.forceTerminate()` 或等价的终止操作。
@@ -61,7 +63,7 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 |------|------|
 | 任意 worktree 的快速调试/验证 | `swift run` / `swift build -c debug` / `swift test` |
 | 主工作区的可双击 Swift App | `./make-app.sh`（仅主工作区，release 打包到 `build/PipiUI.app`） |
-| 主工作区的可双击 Electron App | `./scripts/build-electron-app.sh`（仅主工作区，打包到 `build/PipiUI Electron.app`） |
+| 主工作区的可双击 Electron App | `pipiui-electron-build` skill 的 `fast-app` / `release`（仅主工作区，打包到 `build/PipiUI Electron.app`；勿手调 electron-builder） |
 
 Prefer release package via `make-app.sh` for the double-clickable app, but only from the primary checkout. `swift run` is for quick debug only.
 
@@ -74,5 +76,5 @@ Prefer release package via `make-app.sh` for the double-clickable app, but only 
 ---
 
 **权威产物路径：** `/Users/haoli/leehow/code/pipiui/build/PipiUI.app` · `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app`（仅有的可运行包）
-**入口脚本：** `./make-app.sh` · `./scripts/build-app.sh` · `./scripts/build-electron-app.sh`
+**入口脚本：** `./make-app.sh` · `./scripts/build-app.sh` · Electron 走 `pipiui-electron-build` skill（其 `release` 内部调 `./scripts/build-electron-app.sh`）
 **Agent 入口：** 见根目录 `AGENTS.md`

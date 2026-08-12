@@ -50,7 +50,7 @@ describe('active-turn waiting placeholder', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /1 个步骤/ }).getAttribute('aria-expanded')).toBe('false'))
   })
 
-  it('only starts for a user send, hides on first assistant event, and stop uses host.stop', async () => {
+  it('only starts for a user send, stays visible through thinking/tools, hides on first text, and stop uses host.stop', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     const base = createMockHost()
     const stop = vi.fn(async () => listener?.({ type: 'status', sessionId: 'welcome', status: 'stopped' }))
@@ -76,7 +76,11 @@ describe('active-turn waiting placeholder', () => {
     fireEvent.click(directSend)
     expect(await screen.findByTestId('waiting-placeholder')).toBeTruthy()
 
+    // Thinking lives inside a folded card — the placeholder must stay visible.
     act(() => { listener?.({ type: 'thinking', sessionId: 'welcome', contentIndex: 0, delta: 'thinking' }) })
+    expect(screen.getByTestId('waiting-placeholder')).toBeTruthy()
+    // Only real text output ends the first-token wait.
+    act(() => { listener?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: 'Hello' }) })
     await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
 
     // End the first turn, start another, and verify the inline stop delegates to the existing API.

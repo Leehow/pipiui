@@ -6,17 +6,22 @@ import { join } from "node:path";
 
 import {
   ComputerAgentCoordinator,
+  evaluatePostconditions,
   projectComputerWorkerResult,
+  runComputerWorkerWithStallDeadline,
 } from "../../Sources/PipiUI/PiExt/packages/computer-agent/src/coordinator.ts";
 import {
   ComputerWorkerBroker,
   grantsForComputerRole,
+	mutationSignature,
 } from "../../Sources/PipiUI/PiExt/packages/computer-agent/src/worker-broker.ts";
 import { ComputerWorkerBrokerServer } from "../../Sources/PipiUI/PiExt/packages/computer-agent/src/worker-broker-server.ts";
+import { TerminalWorkerBrokerServer } from "../../Sources/PipiUI/PiExt/packages/computer-agent/src/terminal-broker-server.ts";
 import { validateTerminalStep } from "../../Sources/PipiUI/PiExt/packages/computer-agent/src/terminal-policy.ts";
 import { skillNamesForComputerRole } from "../../Sources/PipiUI/PiExt/packages/computer-agent/src/workers.ts";
 import { registerComputerTerminalTools, toolNamesForTerminalWorkerRole } from "../../Sources/PipiUI/PiExt/packages/computer-agent/extensions/computer-terminal.ts";
 import {
+	registerComputerWorkerTools,
   toolNamesForComputerWorkerRole,
 } from "../../Sources/PipiUI/PiExt/packages/computer-agent/extensions/computer-worker.ts";
 import {
@@ -31,6 +36,190 @@ import { TaskArtifactStore, compressWorkerTrajectory } from "../../Sources/PipiU
 const app = { bundleId: "com.apple.TextEdit", appName: "TextEdit" };
 const postcondition = { kind: "file_exists", pathParameter: "outputFile" };
 const terminalPolicy = { cwd: "/tmp", writeRoots: ["/tmp"], allowedExecutables: ["/usr/bin/stat", "/usr/bin/file", "/usr/bin/printf"], maxCommands: 3 };
+
+test("Computer Worker desktop tools are sequential and broker runtime calls are bounded/fail-fast", async () => {
+  const tools = [];
+  registerComputerWorkerTools({ registerTool: (tool) => tools.push(tool) }, {
+    PIPIUI_COMPUTER_WORKER_BROKER_URL: "http://127.0.0.1:1/v1/computer-worker",
+    PIPIUI_COMPUTER_WORKER_BROKER_TOKEN: "x".repeat(32),
+    PIPIUI_COMPUTER_WORKER_ROLE: "gui-operator",
+  }, async () => { throw new Error("not called"); });
+  assert.equal(tools.length, 6);
+  assert.ok(tools.every((tool) => tool.executionMode === "sequential"));
+	const typeaheadTool = tools.find((tool) => tool.name === "desktop_typeahead");
+	assert.ok(typeaheadTool, "GUI Operator receives a discoverable dedicated file-list type-ahead tool");
+	assert.deepEqual(typeaheadTool.parameters.required, ["basename"]);
+	assert.match(typeaheadTool.description, /exact basename.*Open.*Save.*AXList/i);
+	assert.deepEqual(Object.keys(typeaheadTool.parameters.properties), ["basename"]);
+
+  const canonicalShapeTools = [];
+  registerComputerWorkerTools({ registerTool: (tool) => canonicalShapeTools.push(tool) }, {
+    PIPIUI_COMPUTER_WORKER_BROKER_URL: "http://127.0.0.1:1/v1/computer-worker",
+    PIPIUI_COMPUTER_WORKER_BROKER_TOKEN: "x".repeat(32),
+    PIPIUI_COMPUTER_WORKER_ROLE: "gui-operator",
+  }, async () => new Response(JSON.stringify({ observationId: "observation:canonical", base64: "REAL_CANONICAL_SCREENSHOT", mimeType: "image/webp", accessibility: { elements: [] } }), { status: 200, headers: { "content-type": "application/json" } }));
+  const canonicalResult = await canonicalShapeTools.find((tool) => tool.name === "desktop_observe").execute("canonical", {}, undefined);
+  assert.deepEqual(canonicalResult.content.find((part) => part.type === "image"), { type: "image", data: "REAL_CANONICAL_SCREENSHOT", mimeType: "image/webp" });
+  assert.doesNotMatch(canonicalResult.content.find((part) => part.type === "text").text, /REAL_CANONICAL_SCREENSHOT|base64/);
+	const actSchema = canonicalShapeTools.find((tool) => tool.name === "desktop_act").parameters.properties.actions;
+	assert.equal(JSON.stringify(actSchema.items).includes('"typeahead"'), false, "nested desktop_act no longer exposes the internal type-ahead action");
+  assert.match(actSchema.description, /CMD','O'.*fresh observe.*CMD','SHIFT','G'.*parent-directory.*RETURN.*fresh observe.*desktop_typeahead.*exact basename.*immutable document surface.*do not press an extra Return/i);
+  assert.match(actSchema.description, /hotkeys.*never attach element_token, element_index, or snapshot_id/i);
+  assert.match(actSchema.description, /same_pid_keyboard_ambiguity.*foreground delivery.*never fall back to menus or sidebar/i);
+	assert.match(actSchema.description, /desktop_typeahead.*only the exact basename.*ordinary type inserts into a text field.*must not substitute/i);
+  assert.doesNotMatch(actSchema.description, /exact\/absolute\/path/);
+  assert.ok(actSchema.items.oneOf.length >= 6);
+
+	let dedicatedRequest;
+	const dedicatedTools = [];
+	registerComputerWorkerTools({ registerTool: (tool) => dedicatedTools.push(tool) }, {
+	  PIPIUI_COMPUTER_WORKER_BROKER_URL: "http://127.0.0.1:1/v1/computer-worker",
+	  PIPIUI_COMPUTER_WORKER_BROKER_TOKEN: "x".repeat(32),
+	  PIPIUI_COMPUTER_WORKER_ROLE: "gui-operator",
+	}, async (_url, init) => {
+	  dedicatedRequest = JSON.parse(String(init.body));
+	  return new Response(JSON.stringify({ observationId: "observation:typeahead", accessibility: { elements: [] } }), { status: 200, headers: { "content-type": "application/json" } });
+	});
+	await dedicatedTools.find((tool) => tool.name === "desktop_typeahead").execute("typeahead", {
+	  basename: "pipiui-computer-agent-final-acceptance-21.txt",
+	}, undefined);
+	assert.deepEqual(dedicatedRequest.payload.actions, [{
+	  type: "typeahead",
+	  text: "pipiui-computer-agent-final-acceptance-21.txt",
+	}]);
+
+  const locallySerialized = [];
+  let activeFetches = 0;
+  let maxActiveFetches = 0;
+  let localFetchCalls = 0;
+  let releaseFirstFetch;
+  registerComputerWorkerTools({ registerTool: (tool) => locallySerialized.push(tool) }, {
+    PIPIUI_COMPUTER_WORKER_BROKER_URL: "http://127.0.0.1:1/v1/computer-worker",
+    PIPIUI_COMPUTER_WORKER_BROKER_TOKEN: "x".repeat(32),
+    PIPIUI_COMPUTER_WORKER_ROLE: "gui-operator",
+  }, async () => {
+    localFetchCalls += 1;
+    activeFetches += 1;
+    maxActiveFetches = Math.max(maxActiveFetches, activeFetches);
+    if (localFetchCalls === 1) await new Promise((resolve) => { releaseFirstFetch = resolve; });
+    activeFetches -= 1;
+    return new Response(JSON.stringify({ observationId: `observation:${Date.now()}` }), { status: 200, headers: { "content-type": "application/json" } });
+  });
+  const localObserve = locallySerialized.find((tool) => tool.name === "desktop_observe");
+  const localFirst = localObserve.execute("one", {}, undefined);
+  const localSecond = localObserve.execute("two", {}, undefined);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(maxActiveFetches, 1);
+  releaseFirstFetch();
+  await Promise.all([localFirst, localSecond]);
+  assert.equal(maxActiveFetches, 1);
+
+  let release;
+  const broker = new ComputerWorkerBroker({ requestTimeoutMs: 25, request: () => new Promise((resolve) => { release = resolve; }) });
+  const issued = broker.issue({ taskId: "task", stepId: "step", runId: "run", role: "gui-operator" });
+  const first = broker.execute(issued.token, { operation: "observe", payload: { fresh: true } });
+  await assert.rejects(broker.execute(issued.token, { operation: "observe", payload: { fresh: true } }), /computer_worker_request_in_progress/);
+  release({ observationId: "observation:one" });
+  await first;
+
+  const timeoutBroker = new ComputerWorkerBroker({ requestTimeoutMs: 20, request: (_request, signal) => new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new Error("raw private runtime error")), { once: true })) });
+  const timed = timeoutBroker.issue({ taskId: "task", stepId: "timeout", runId: "run", role: "gui-operator" });
+  await assert.rejects(timeoutBroker.execute(timed.token, { operation: "observe", payload: {} }), /^Error: computer_worker_runtime_timeout$/);
+
+  let rejectLate;
+  let calls = 0;
+  const fatalEvents = [];
+  const ignoringBroker = new ComputerWorkerBroker({ requestTimeoutMs: 20, onFatal: (event) => fatalEvents.push(event), request: () => {
+    calls += 1;
+    if (calls === 1) return new Promise((_resolve, reject) => { rejectLate = reject; });
+    return Promise.resolve({ observationId: "observation:after-timeout" });
+  } });
+  const ignoring = ignoringBroker.issue({ taskId: "task", stepId: "ignores-abort", runId: "run", role: "gui-operator" });
+  await assert.rejects(ignoringBroker.execute(ignoring.token, { operation: "mutate", payload: { actions: [{ type: "click", x: 1, y: 2 }], semanticBindings: [] } }), /^Error: computer_worker_runtime_timeout$/);
+  assert.deepEqual(ignoringBroker.consumeExecutions("task", "ignores-abort"), []);
+  await assert.rejects(ignoringBroker.execute(ignoring.token, { operation: "observe", payload: {} }), /^Error: computer_worker_runtime_timeout$/);
+  assert.equal(fatalEvents.length, 1);
+  const recovered = ignoringBroker.issue({ taskId: "task", stepId: "fresh-grant", runId: "run-2", role: "gui-operator" });
+  await ignoringBroker.execute(recovered.token, { operation: "observe", payload: {} });
+  rejectLate(new Error("late raw private runtime rejection"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(ignoringBroker.consumeExecutions("task", "ignores-abort"), []);
+
+  let typedCalls = 0;
+  const typedFatalEvents = [];
+  const typedTimeoutBroker = new ComputerWorkerBroker({ requestTimeoutMs: 1_000, onFatal: (event) => typedFatalEvents.push(event), request: async () => {
+    typedCalls += 1;
+    if (typedCalls === 1) throw Object.assign(new Error("private driver timeout detail"), { code: "cua_driver_rpc_timeout" });
+    return { observationId: "observation:fresh-transport" };
+  } });
+  const typed = typedTimeoutBroker.issue({ taskId: "task", stepId: "typed-driver-timeout", runId: "run-3", role: "gui-operator" });
+  await assert.rejects(typedTimeoutBroker.execute(typed.token, { operation: "mutate", payload: { actions: [{ type: "click", x: 3, y: 4 }], semanticBindings: [] } }), /^Error: computer_worker_runtime_timeout$/);
+  await assert.rejects(typedTimeoutBroker.execute(typed.token, { operation: "observe", payload: {} }), /^Error: computer_worker_runtime_timeout$/);
+  assert.equal(typedCalls, 1, "typed timeout poisons the grant before model retry reaches Runtime");
+  assert.equal(typedFatalEvents.length, 1);
+  assert.deepEqual(typedTimeoutBroker.consumeExecutions("task", "typed-driver-timeout"), []);
+  const typedFresh = typedTimeoutBroker.issue({ taskId: "task", stepId: "typed-fresh", runId: "run-4", role: "gui-operator" });
+  await typedTimeoutBroker.execute(typedFresh.token, { operation: "observe", payload: {} });
+
+  let observationCalls = 0;
+  const progressFatalEvents = [];
+  const progressBroker = new ComputerWorkerBroker({ onFatal: (event) => progressFatalEvents.push(event), request: async (request) => ({ observationId: `observation:${++observationCalls}`, accessibility: { elements: [] }, action: request.action }) });
+  const observeOnly = progressBroker.issue({ taskId: "task", stepId: "observe-only", runId: "run-5", role: "gui-operator" });
+  for (let index = 0; index < 3; index += 1) await progressBroker.execute(observeOnly.token, { operation: "observe", payload: { fresh: true } });
+  await assert.rejects(progressBroker.execute(observeOnly.token, { operation: "observe", payload: { fresh: true } }), /^Error: computer_worker_no_progress$/);
+  await assert.rejects(progressBroker.execute(observeOnly.token, { operation: "observe", payload: { fresh: true } }), /^Error: computer_worker_no_progress$/);
+  assert.equal(observationCalls, 3, "observe-only exhaustion terminates before another Runtime screenshot");
+  assert.equal(progressFatalEvents.length, 1);
+  assert.equal(progressFatalEvents[0].code, "computer_worker_no_progress");
+  assert.deepEqual(progressBroker.consumeExecutions("task", "observe-only"), []);
+
+  const progressing = progressBroker.issue({ taskId: "task", stepId: "observe-act-observe", runId: "run-6", role: "gui-operator" });
+  await progressBroker.execute(progressing.token, { operation: "observe", payload: { fresh: true } });
+  await progressBroker.execute(progressing.token, { operation: "mutate", payload: { actions: [{ type: "key", key: "ENTER" }], semanticBindings: [] } });
+  await progressBroker.execute(progressing.token, { operation: "observe", payload: { fresh: true } });
+  assert.equal(progressFatalEvents.length, 1, "a consequential action resets the consecutive-observation budget");
+
+  let contractRuntimeCalls = 0;
+  const contractFatalEvents = [];
+  const contractBroker = new ComputerWorkerBroker({ onFatal: (event) => contractFatalEvents.push(event), request: async (request) => {
+    contractRuntimeCalls += 1;
+    if (request.actions?.[0]?.type === "key" && request.actions[0].key === "FAIL") throw new Error("ordinary runtime failure");
+    return { observationId: `observation:contract:${contractRuntimeCalls}`, accessibility: { elements: [] } };
+  } });
+  const contract = contractBroker.issue({ taskId: "task", stepId: "closed-actions", runId: "run-7", role: "gui-operator" });
+  for (const invalid of [
+    { type: "raise" },
+    { type: "keychord", keys: ["CMD", "O"] },
+    { type: "menu_click", path: ["文件", "打开…"] },
+  ]) await assert.rejects(contractBroker.execute(contract.token, { operation: "mutate", payload: { actions: [invalid], semanticBindings: [] } }), /unsupported desktop action type/);
+	for (const invalid of [
+	  { type: "typeahead", text: "/Users/haoli/Desktop/file.txt", element_token: "s00000001:1" },
+	]) await assert.rejects(contractBroker.execute(contract.token, { operation: "mutate", payload: { actions: [invalid], semanticBindings: [] } }), /typeahead requires/);
+  assert.equal(contractRuntimeCalls, 0, "captured invented actions are rejected before Runtime");
+  await contractBroker.execute(contract.token, { operation: "observe", payload: { fresh: true } });
+  await contractBroker.execute(contract.token, { operation: "observe", payload: { fresh: true } });
+  await assert.rejects(contractBroker.execute(contract.token, { operation: "mutate", payload: { actions: [{ type: "key", key: "FAIL" }], semanticBindings: [] } }), /ordinary runtime failure/);
+  await contractBroker.execute(contract.token, { operation: "observe", payload: { fresh: true } });
+  await assert.rejects(contractBroker.execute(contract.token, { operation: "observe", payload: { fresh: true } }), /^Error: computer_worker_no_progress$/);
+  assert.equal(contractFatalEvents.at(-1).code, "computer_worker_no_progress", "failed mutation does not reset pure-observe progress");
+
+  const validContract = contractBroker.issue({ taskId: "task", stepId: "valid-actions", runId: "run-8", role: "gui-operator" });
+  await contractBroker.execute(validContract.token, { operation: "observe", payload: { fresh: true } });
+  await contractBroker.execute(validContract.token, { operation: "mutate", payload: { actions: [
+    { type: "key", keys: ["CMD", "O"] },
+    { type: "type", text: "/Users/haoli/Desktop/exact.txt" },
+    { type: "key", key: "RETURN" },
+  ], semanticBindings: [] } });
+  await contractBroker.execute(validContract.token, { operation: "observe", payload: { fresh: true } });
+
+  const refreshedSameElement = [
+    { type: "click", element_index: 28, element_token: "snapshot-one:28", snapshot_id: "snapshot-one" },
+    { type: "click", element_index: 28, element_token: "snapshot-two:28", snapshot_id: "snapshot-two" },
+  ];
+  assert.equal(mutationSignature([refreshedSameElement[0]]), mutationSignature([refreshedSameElement[1]]), "ephemeral snapshot/token refresh must not disguise the same indexed click");
+  assert.notEqual(mutationSignature([refreshedSameElement[0]]), mutationSignature([{ ...refreshedSameElement[1], element_index: 29 }]), "different stable element indices remain different actions");
+  assert.notEqual(mutationSignature([{ type: "click", element_token: "token-only-a" }]), mutationSignature([{ type: "click", element_token: "token-only-b" }]), "token-only targets are not collapsed without stable identity evidence");
+});
 const procedurePolicy = {
   isSensitiveApplication(application) {
     return new Set(["com.apple.keychainaccess", "com.1password.1password", "com.apple.systempreferences"]).has(application.bundleId.toLowerCase());
@@ -106,6 +295,21 @@ test("Terminal Worker has no desktop grants, environment, tools, or GUI substitu
   assert.match(leader, /nested `terminalPolicy`/);
   assert.match(leader, /`cwd`, `writeRoots`, `allowedExecutables`, and `maxCommands`/);
   assert.match(leader, /Never flatten/);
+  assert.match(leader, /`\/usr\/bin\/printf`/);
+  assert.match(leader, /Never propose a\s+shell, interpreter, basename/);
+});
+
+test("a silent GUI child is aborted and returned to Leader recovery as a closed stalled failure", async () => {
+  let aborted = 0;
+  let resolveLate;
+  const late = new Promise((resolve) => { resolveLate = resolve; });
+  await assert.rejects(
+    runComputerWorkerWithStallDeadline(() => late, () => { aborted += 1; }, 10),
+    (error) => error?.message === "gui_child_stalled" && error?.failureCode === "gui_child_stalled",
+  );
+  assert.equal(aborted, 1);
+  resolveLate("late private result");
+  await new Promise((resolve) => setImmediate(resolve));
 });
 
 test("Verifier cannot override the authoritative broker envelope to execute mutation", async () => {
@@ -176,6 +380,39 @@ test("Terminal extension proxies every operation to its authenticated host broke
   assert.ok(calls.every(({ token }) => token === "0123456789abcdef0123456789abcdef"));
 });
 
+test("Terminal host broker turns read/status evidence into coordinator-consumable file observations", async () => {
+  const root = await mkdtemp(join(tmpdir(), "computer-terminal-observation-"));
+  const file = join(root, "result.txt");
+  await writeFile(file, "hello");
+  const server = new TerminalWorkerBrokerServer();
+  await server.start();
+  try {
+    const issued = server.issue({ taskId: "task", stepId: "terminal", runId: "run", policy: { cwd: root, writeRoots: [root], allowedExecutables: [], maxCommands: 1 } });
+    for (const request of [{ operation: "read", path: file, maxBytes: 32 }, { operation: "status", path: file }]) {
+      const response = await fetch(issued.environment.PIPIUI_TERMINAL_WORKER_BROKER_URL, { method: "POST", headers: { authorization: `Bearer ${issued.token}`, "content-type": "application/json" }, body: JSON.stringify(request) });
+      assert.equal(response.ok, true);
+    }
+    assert.deepEqual(server.consumeFileObservations("task", "terminal").map(({ path, exists }) => ({ path, exists })), [{ path: file, exists: true }]);
+  } finally { await server.stop(); }
+});
+
+test("live-shaped terminal_write_file receipt remains observable after execution records are consumed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "computer-terminal-live-write-"));
+  const file = join(root, "pipiui-computer-agent-final-acceptance-3.txt");
+  const server = new TerminalWorkerBrokerServer();
+  await server.start();
+  try {
+    const issued = server.issue({ taskId: "live-task", stepId: "terminal-write", runId: "live-run", policy: { cwd: root, writeRoots: [root], allowedExecutables: [], maxCommands: 1 } });
+    const response = await fetch(issued.environment.PIPIUI_TERMINAL_WORKER_BROKER_URL, { method: "POST", headers: { authorization: `Bearer ${issued.token}`, "content-type": "application/json" }, body: JSON.stringify({ operation: "write", path: file, content: "PipiUI Computer Agent final acceptance 3" }) });
+    assert.equal(response.ok, true);
+    const records = server.consumeExecutions("live-task", "terminal-write");
+    const files = server.consumeFileObservations("live-task", "terminal-write");
+    assert.equal(records.length, 1);
+    assert.deepEqual(files.map(({ path, exists, digest }) => ({ path, exists, digest })), [{ path: file, exists: true, digest: records[0].contentDigest }]);
+    assert.equal(evaluatePostconditions([{ kind: "file_exists", path: file }], { id: records[0].observationId, files }).status, "verified");
+  } finally { await server.stop(); }
+});
+
 test("planned task dispatches Terminal Worker before dependent GUI and keeps worker reports compressed", async () => {
   const dispatches = [];
   const coordinator = new ComputerAgentCoordinator({
@@ -210,6 +447,239 @@ test("planned task dispatches Terminal Worker before dependent GUI and keeps wor
   assert.doesNotMatch(JSON.stringify(result), /x{100}|screenshot|accessibility|base64/i);
 });
 
+test("invalid recovery Leader output preserves the real worker failure as a bounded terminal result", async () => {
+  const events = [];
+  const coordinator = new ComputerAgentCoordinator({
+    planner: {
+      plan: async (goal) => ({
+        goal,
+        mode: "direct",
+        successConditions: [{ kind: "visible_text", contains: "target" }],
+        steps: [{ id: "gui", role: "gui-operator", objective: "Open the target", dependsOn: [], postconditions: [{ kind: "visible_text", contains: "target" }] }],
+      }),
+      replan: async () => { throw new Error("Computer Agent child returned no JSON object: raw private output"); },
+    },
+    dispatcher: { dispatch: async () => ({ outcome: "blocked", summary: "real GUI step failed" }) },
+    onEvent: (event) => events.push(event),
+  });
+  const result = await coordinator.run({ goal: "Open the target" });
+  assert.equal(result.outcome, "blocked");
+  assert.equal(result.summary, "Computer Task recovery plan was invalid after worker failure");
+  assert.equal(JSON.stringify(result).includes("raw private output"), false);
+  assert.deepEqual(events.at(-1), { type: "task_finished", taskId: events[0].taskId, outcome: "blocked" });
+});
+
+test("task success conditions are nonempty, step-bound, and verified from fresh observation rather than verifier prose", async () => {
+  for (const plan of [
+    { goal: "empty", mode: "direct", successConditions: [], steps: [{ id: "gui", role: "gui-operator", objective: "show target", dependsOn: [], postconditions: [{ kind: "visible_text", contains: "target" }] }] },
+    { goal: "unbound", mode: "direct", successConditions: [{ kind: "visible_text", contains: "invented" }], steps: [{ id: "gui", role: "gui-operator", objective: "show target", dependsOn: [], postconditions: [{ kind: "visible_text", contains: "target" }] }] },
+  ]) {
+    let dispatches = 0;
+    const coordinator = new ComputerAgentCoordinator({
+      planner: { plan: async () => plan, replan: async () => { throw new Error("not reached"); } },
+      dispatcher: { dispatch: async () => { dispatches += 1; throw new Error("invalid plan must not dispatch"); } },
+    });
+    await assert.rejects(coordinator.run({ goal: plan.goal }), /success condition/i);
+    assert.equal(dispatches, 0);
+  }
+
+  const boundPlan = {
+    goal: "show target", mode: "direct",
+    successConditions: [{ kind: "visible_text", contains: "target" }],
+    steps: [{ id: "verify", role: "verifier", objective: "freshly verify target", dependsOn: [], postconditions: [{ kind: "visible_text", contains: "target" }] }],
+  };
+  const passed = new ComputerAgentCoordinator({
+    planner: { plan: async () => boundPlan, replan: async () => { throw new Error("not reached"); } },
+    dispatcher: { dispatch: async () => ({ outcome: "verified", summary: "untrusted prose", observation: { id: "fresh-visible", visibleText: ["target"] } }) },
+  });
+  const passedResult = await passed.run({ goal: "show target" });
+  assert.equal(passedResult.outcome, "succeeded");
+  assert.deepEqual(passedResult.verification, { status: "verified", conditionResults: [{ conditionId: "task:condition:0", outcome: "verified" }] });
+
+  const proseOnly = new ComputerAgentCoordinator({
+    maxReplans: 0,
+    planner: { plan: async () => boundPlan, replan: async () => { throw new Error("not reached"); } },
+    dispatcher: { dispatch: async () => ({ outcome: "verified", summary: "target is visible", observation: { id: "fresh-empty", visibleText: [] } }) },
+  });
+  const proseResult = await proseOnly.run({ goal: "show target" });
+  assert.equal(proseResult.outcome, "blocked");
+  assert.equal(proseResult.verification.status, "not_verified");
+
+  const screenshotOnly = new ComputerAgentCoordinator({
+    maxReplans: 0,
+    planner: { plan: async () => boundPlan, replan: async () => { throw new Error("not reached"); } },
+    dispatcher: { dispatch: async () => ({
+      outcome: "verified",
+      summary: "untrusted prose",
+      observation: { id: "fresh-screenshot-only", visibleText: [] },
+      attestedPostconditions: [{ kind: "visible_text", contains: "target" }],
+    }) },
+  });
+  const screenshotResult = await screenshotOnly.run({ goal: "show target" });
+  assert.equal(screenshotResult.outcome, "succeeded", "a fresh multimodal Verifier may attest only exact requested closed postconditions");
+  assert.deepEqual(screenshotResult.verification, { status: "verified", conditionResults: [{ conditionId: "task:condition:0", outcome: "verified" }] });
+
+  for (const unsafeResult of [
+    { outcome: "verified", summary: "target is visible", observation: { id: "fresh-string-claim", visibleText: [] }, claims: ["target is visible"] },
+    { outcome: "verified", summary: "unbound", observation: { id: "fresh-unbound", visibleText: [] }, attestedPostconditions: [{ kind: "visible_text", contains: "invented" }] },
+    { outcome: "verified", summary: "no fresh observation", attestedPostconditions: [{ kind: "visible_text", contains: "target" }] },
+  ]) {
+    const unsafe = new ComputerAgentCoordinator({
+      maxReplans: 0,
+      planner: { plan: async () => boundPlan, replan: async () => { throw new Error("not reached"); } },
+      dispatcher: { dispatch: async () => unsafeResult },
+    });
+    assert.equal((await unsafe.run({ goal: "show target" })).outcome, "blocked");
+  }
+});
+
+test("task verification aggregates authoritative heterogeneous evidence across dependent workers", async () => {
+  const fileCondition = { kind: "file_exists", path: "/tmp/acceptance-28.txt" };
+  const textCondition = { kind: "visible_text", contains: "acceptance 28" };
+  const plan = {
+    goal: "write and open", mode: "planned", successConditions: [fileCondition, textCondition],
+    steps: [
+      { id: "terminal", role: "terminal-worker", objective: "write", dependsOn: [], postconditions: [fileCondition], terminalPolicy },
+      { id: "operator", role: "gui-operator", objective: "open", dependsOn: ["terminal"], postconditions: [textCondition] },
+      { id: "verifier", role: "verifier", objective: "fresh verify", dependsOn: ["operator"], postconditions: [textCondition] },
+    ],
+  };
+  const coordinator = new ComputerAgentCoordinator({
+    planner: { plan: async () => plan, replan: async () => { throw new Error("not reached"); } },
+    dispatcher: { dispatch: async ({ role }) => role === "terminal-worker"
+      ? { outcome: "completed", summary: "written", observation: { id: "file-fresh", files: [{ path: fileCondition.path, exists: true }] } }
+      : role === "gui-operator"
+        ? { outcome: "completed", summary: "opened", observation: { id: "gui-fresh", visibleText: [textCondition.contains] } }
+        : { outcome: "verified", summary: "untrusted verifier prose", observation: { id: "verifier-fresh", visibleText: [textCondition.contains] } } },
+  });
+  const result = await coordinator.run({ goal: "write and open" });
+  assert.equal(result.outcome, "succeeded");
+  assert.deepEqual(result.verification.conditionResults, [
+    { conditionId: "task:condition:0", outcome: "verified" },
+    { conditionId: "task:condition:1", outcome: "verified" },
+  ]);
+
+  const missingFile = new ComputerAgentCoordinator({
+    maxReplans: 0,
+    planner: { plan: async () => plan, replan: async () => { throw new Error("not reached"); } },
+    dispatcher: { dispatch: async ({ role }) => role === "terminal-worker"
+      ? { outcome: "completed", summary: "claimed only", observation: { id: "file-empty", files: [] } }
+      : { outcome: role === "verifier" ? "verified" : "completed", summary: "acceptance 28", observation: { id: `${role}-fresh`, visibleText: [textCondition.contains] } } },
+  });
+  const missingResult = await missingFile.run({ goal: "write and open" });
+  assert.equal(missingResult.outcome, "blocked");
+});
+
+test("blocked Computer Task preserves a closed investigation ledger instead of erasing subordinate evidence", async () => {
+  const textCondition = { kind: "visible_text", contains: "acceptance evidence" };
+  const coordinator = new ComputerAgentCoordinator({
+    maxReplans: 0,
+    planner: {
+      plan: async () => ({
+        goal: "show acceptance evidence",
+        mode: "direct",
+        successConditions: [textCondition],
+        steps: [{ id: "operator", role: "gui-operator", objective: "show the target", dependsOn: [], postconditions: [textCondition] }],
+      }),
+      replan: async () => { throw new Error("not reached"); },
+    },
+    dispatcher: {
+      dispatch: async () => ({ outcome: "completed", summary: "untrusted worker prose", observation: { id: "fresh-but-missing", visibleText: [] } }),
+    },
+  });
+
+  const result = await coordinator.run({ goal: "show acceptance evidence" });
+  assert.equal(result.outcome, "blocked");
+  assert.deepEqual(result.verification.conditionResults, [
+    { conditionId: "task:condition:0", outcome: "not_verified" },
+  ]);
+  assert.deepEqual(result.investigation, {
+    stage: "recovery_exhausted",
+    code: "worker_postconditions_not_verified",
+    recoveryAttempts: 0,
+    failedConditions: [{ conditionId: "task:condition:0", kind: "visible_text", outcome: "not_verified" }],
+    workerAttempts: [{ stepId: "operator", role: "gui-operator", outcome: "completed", verification: "not_verified" }],
+  });
+  assert.equal(JSON.stringify(result).includes("untrusted worker prose"), false);
+});
+
+test("a failed Operator can be investigated and replaced without losing successful subordinate evidence", async () => {
+  const path = "/Users/haoli/Desktop/pipiui-cua-complex-acceptance-32.txt";
+  const fileCondition = { kind: "file_exists", path };
+  const valueCondition = { kind: "visible_text", contains: "value=23" };
+  const doubleCondition = { kind: "visible_text", contains: "double=46" };
+  const statusCondition = { kind: "visible_text", contains: "status=VERIFIED" };
+  const titleCondition = { kind: "visible_text", contains: "pipiui-cua-complex-acceptance-32" };
+  const initialPlan = {
+    goal: "create, open, and independently verify the file",
+    mode: "planned",
+    successConditions: [fileCondition, valueCondition, doubleCondition, statusCondition, titleCondition],
+    steps: [
+      { id: "create-file", role: "terminal-worker", objective: "write the exact file", dependsOn: [], postconditions: [fileCondition], terminalPolicy: { ...terminalPolicy, cwd: "/Users/haoli/Desktop", writeRoots: ["/Users/haoli/Desktop"] } },
+      { id: "open-file", role: "gui-operator", objective: "open the file in TextEdit", dependsOn: ["create-file"], postconditions: [valueCondition, doubleCondition, statusCondition] },
+      { id: "verify-file", role: "verifier", objective: "freshly verify title and content", dependsOn: ["open-file"], postconditions: [titleCondition, valueCondition, doubleCondition, statusCondition] },
+    ],
+  };
+  const recoveryPlan = {
+    ...initialPlan,
+    revision: 1,
+    steps: [
+      { id: "recheck-file", role: "terminal-worker", objective: "read-only file recheck", dependsOn: [], postconditions: [fileCondition], terminalPolicy: { ...terminalPolicy, cwd: "/Users/haoli/Desktop", writeRoots: ["/Users/haoli/Desktop"] } },
+      { id: "open-file-recovery", role: "gui-operator", objective: "open with a corrected GUI strategy", dependsOn: ["recheck-file"], postconditions: [valueCondition, doubleCondition, statusCondition] },
+      { id: "verify-file-recovery", role: "verifier", objective: "freshly verify title and content", dependsOn: ["open-file-recovery"], postconditions: [titleCondition, valueCondition, doubleCondition, statusCondition] },
+    ],
+  };
+  const dispatches = [];
+  let firstOperator = true;
+  const coordinator = new ComputerAgentCoordinator({
+    planner: { plan: async () => initialPlan, replan: async () => recoveryPlan },
+    dispatcher: {
+      dispatch: async (request) => {
+        dispatches.push(`${request.role}:${request.stepId}`);
+        if (request.role === "terminal-worker") return { outcome: "completed", summary: "file observed", observation: { id: `file:${request.stepId}`, files: [{ path, exists: true }] } };
+        if (request.role === "gui-operator" && firstOperator) {
+          firstOperator = false;
+          return { outcome: "failed", summary: "worker failed", failureCode: "computer_worker_request_cancelled" };
+        }
+        const observation = { id: `desktop:${request.stepId}`, visibleText: ["pipiui-cua-complex-acceptance-32.txt", "value=23", "double=46", "status=VERIFIED"] };
+        return { outcome: request.role === "verifier" ? "verified" : "completed", summary: "closed result", observation };
+      },
+    },
+  });
+
+  const result = await coordinator.run({ goal: initialPlan.goal });
+  assert.equal(result.outcome, "succeeded");
+  assert.deepEqual(result.verification.conditionResults, initialPlan.successConditions.map((_condition, index) => ({ conditionId: `task:condition:${index}`, outcome: "verified" })));
+  assert.deepEqual(dispatches, [
+    "terminal-worker:create-file",
+    "gui-operator:open-file",
+    "terminal-worker:recheck-file",
+    "gui-operator:open-file-recovery",
+    "verifier:verify-file-recovery",
+  ]);
+});
+
+test("subjective task evidence rejects a verifier observation reused from an earlier worker", async () => {
+  const visualCondition = { kind: "visual_judgement", description: "document layout is correct" };
+  const plan = {
+    goal: "inspect layout", mode: "planned", successConditions: [visualCondition],
+    steps: [
+      { id: "operator", role: "gui-operator", objective: "show document", dependsOn: [], postconditions: [{ kind: "visible_text", contains: "document" }] },
+      { id: "verifier", role: "verifier", objective: "freshly judge layout", dependsOn: ["operator"], postconditions: [visualCondition] },
+    ],
+  };
+  const coordinator = new ComputerAgentCoordinator({
+    maxReplans: 0,
+    planner: { plan: async () => plan, replan: async () => { throw new Error("not reached"); } },
+    dispatcher: { dispatch: async ({ role }) => role === "gui-operator"
+      ? { outcome: "completed", summary: "shown", observation: { id: "reused-observation", visibleText: ["document"] } }
+      : { outcome: "verified", summary: "untrusted verifier prose", observation: { id: "reused-observation", visibleText: ["document"] } } },
+  });
+  const result = await coordinator.run({ goal: "inspect layout" });
+  assert.equal(result.outcome, "blocked");
+  assert.equal(result.verification.status, "not_verified");
+});
+
 test("artifact references and recipe retrieval keep raw evidence and broker internals out of cross-context slices", async () => {
   const artifacts = new TaskArtifactStore(await mkdtemp(join(tmpdir(), "computer-artifacts-")));
   const reference = await artifacts.put("terminal", "raw terminal output with many details", "file metadata checked");
@@ -233,7 +703,7 @@ test("Leader dispatch accepts fixed roles only and emits leader-owned hierarchy 
   const events = [];
   const coordinator = new ComputerAgentCoordinator({
     planner: {
-      plan: async (goal) => ({ goal, mode: "planned", successConditions: [], steps: [{ id: "bad", role: "peer-agent", objective: "talk laterally", dependsOn: [], postconditions: [] }] }),
+      plan: async (goal) => ({ goal, mode: "planned", successConditions: [{ kind: "visible_text", contains: "done" }], steps: [{ id: "bad", role: "peer-agent", objective: "talk laterally", dependsOn: [], postconditions: [{ kind: "visible_text", contains: "done" }] }] }),
       replan: async () => { throw new Error("not reached"); },
     },
     dispatcher: { dispatch: async () => { throw new Error("invalid role must not dispatch"); } },
@@ -256,7 +726,7 @@ test("Leader dispatch accepts fixed roles only and emits leader-owned hierarchy 
   const validEvents = [];
   const valid = new ComputerAgentCoordinator({
     planner: {
-      plan: async (goal) => ({ goal, mode: "planned", successConditions: [], steps: [{ id: "terminal", role: "terminal-worker", objective: "inspect", dependsOn: [], postconditions: [{ kind: "file_exists", path: "/tmp/a" }], terminalPolicy }] }),
+      plan: async (goal) => ({ goal, mode: "planned", successConditions: [{ kind: "file_exists", path: "/tmp/a" }], steps: [{ id: "terminal", role: "terminal-worker", objective: "inspect", dependsOn: [], postconditions: [{ kind: "file_exists", path: "/tmp/a" }], terminalPolicy }] }),
       replan: async () => { throw new Error("not reached"); },
     },
     dispatcher: { dispatch: async () => ({ outcome: "completed", summary: "ok", observation: { id: "file", files: [{ path: "/tmp/a", exists: true }] } }) },
@@ -542,11 +1012,19 @@ test("closed coordinator projection drops standalone base64, coordinates, passwo
   const result = await coordinator.run({ goal: "Run bounded inspection" });
   const serialized = JSON.stringify({ result, events });
   for (const raw of rawValues) assert.equal(serialized.includes(raw), false, raw);
-  assert.deepEqual(result.verification, { status: "verified", conditionResults: [{ conditionId: "gui:condition:0", outcome: "verified" }] });
-  assert.deepEqual(events.find(({ type }) => type === "verification")?.conditionResults, [{ conditionId: "gui:condition:0", outcome: "verified" }]);
+  assert.deepEqual(result.verification, { status: "verified", conditionResults: [{ conditionId: "task:condition:0", outcome: "verified" }] });
+  assert.deepEqual(events.find(({ type }) => type === "verification")?.conditionResults, [{ conditionId: "task:condition:0", outcome: "verified" }]);
   const projected = projectComputerWorkerResult({ outcome: "completed", summary: rawValues[0], claims: rawValues, artifactReferences: [{ id: "artifact:test", kind: "trajectory", summary: rawValues[3], digest: "a".repeat(64), byteLength: 12, rawPayload: rawValues, nested: { secret: "hunter2" } }] });
   assert.deepEqual(Object.keys(projected.artifactReferences[0]).sort(), ["byteLength", "digest", "id", "kind", "summary"]);
   assert.equal(projected.summary, "Worker completed");
   assert.equal("claims" in projected, false);
 });
 
+test("closed worker failure projection retains only an allowlisted GUI stage code", () => {
+  const raw = "secret=/Users/example/Desktop/private.txt token=abc123 coordinates=400,500";
+  const projected = projectComputerWorkerResult({ outcome: "failed", summary: raw, failureCode: "gui_private_resource_failed" });
+  assert.deepEqual(projected, { outcome: "failed", summary: "Worker failed", failureCode: "gui_private_resource_failed" });
+  assert.equal(projectComputerWorkerResult({ outcome: "failed", summary: raw, failureCode: "computer_worker_runtime_timeout" }).failureCode, "computer_worker_runtime_timeout");
+  assert.equal(JSON.stringify(projected).includes("private.txt"), false);
+  assert.equal(projectComputerWorkerResult({ outcome: "failed", summary: raw, failureCode: raw }).failureCode, undefined);
+});
