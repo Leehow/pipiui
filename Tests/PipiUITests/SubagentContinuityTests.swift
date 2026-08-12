@@ -44,11 +44,34 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertTrue(s.contains("const sessionId = `pipiui-${pipiuiAgentId}`"))
     }
 
-    /// A report is a one-shot deliverable; yesterday's context would only bias the next one.
-    func testReadOnlyRolesStayEphemeral() throws {
+    /// Read-only is an authority boundary, not a memory policy. Ordinary reports remain
+    /// ephemeral, while an orchestrator may explicitly retain its own conversation.
+    func testReadOnlyRolesStayEphemeralUnlessTheHostRetainsContext() throws {
         let s = try source()
-        XCTAssertTrue(s.contains("const sessionDir = agent.traits.readOnly ? undefined : agentSessionDir();"))
+        XCTAssertTrue(s.contains("retainContext?: boolean;"))
+        XCTAssertTrue(s.contains("const sessionDir = agent.traits.readOnly && !options?.retainContext ? undefined : agentSessionDir();"))
         XCTAssertTrue(s.contains(#"args.push("--no-session")"#), "no session dir must still mean no session")
+    }
+
+    /// Restarting the Boss must not erase its ability to inspect what a previous subordinate
+    /// did. History is semantic evidence for the Agent to judge, never an automatic task key.
+    func testStatusSurfacesPersistedTaskAndResultHistory() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains("resultSummary?: string;"))
+        XCTAssertTrue(s.contains("function rememberAgentSliceTerminal("))
+        XCTAssertTrue(s.contains("Historical workers (persisted task and result summaries"))
+        XCTAssertTrue(s.contains("The Boss chooses whether this exact agentId belongs to the same semantic work"))
+        XCTAssertFalse(s.contains("taskKey"), "continuity must be an Agent decision, not a program-owned task mapping")
+    }
+
+    /// Computer Use is still a subagent hierarchy: Boss selects a known Leader id, while the
+    /// Host gives that Leader and its execution workers continuity without granting write power.
+    func testComputerTaskCanResumeABossSelectedLeaderAndStableWorkers() throws {
+        let s = try source()
+        XCTAssertTrue(s.contains("selectComputerTaskLeaderAgentId(params.agentId"))
+        XCTAssertTrue(s.contains("computerWorkerAgentId(taskId, \"operator\")"))
+        XCTAssertTrue(s.contains("computerWorkerAgentId(taskId, \"computer-terminal\")"))
+        XCTAssertTrue(s.contains("retainContext: true"))
     }
 
     /// Continuity must be escapable: a context that went wrong is worth throwing away.
@@ -580,7 +603,9 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertTrue(t.contains("Name the worker, not just the task"))
         XCTAssertTrue(t.contains("implement → verify → diagnose the failure → fix → re-verify"))
         XCTAssertTrue(t.contains("two-attempts rule outranks continuity"))
-        XCTAssertTrue(t.contains("Read-only roles (plan / explore / reviewer) are always cold"))
+        XCTAssertTrue(t.contains("Ordinary read-only roles (plan / explore / reviewer) are cold"))
+        XCTAssertTrue(t.contains("Computer Use Leader may explicitly retain context"),
+                      "read-only authority must not force a supervising Agent to forget its subordinates")
         XCTAssertTrue(t.contains("An interruption is not a failure"))
         XCTAssertTrue(t.contains("a *failed* worker produced a wrong answer; an *interrupted* one produced no answer yet"))
         XCTAssertTrue(t.contains("establish state rather than guessing"))

@@ -295,6 +295,43 @@ const text = (content: any) =>
     : Array.isArray(content)
       ? content.map((p) => p.text ?? p.thinking ?? "").join("")
       : "";
+const SCREENSHOT_MARKER = /\[PIPIUI_COMPUTER_SCREENSHOT:([^\]]+)\]/g;
+/** Extract display text and inline images from a tool-result content payload.
+ *  Handles structured `{type:"image"}` parts and resolves computer-use markers
+ *  from the in-process screenshot cache. Markers without a cache hit are stripped
+ *  from the display text so the user never sees raw marker syntax. */
+function extractResult(content: any, screenshots?: Map<string, { data: string; mimeType: string }>): { text: string; images: { data: string; mimeType: string }[] } {
+  if (typeof content === "string") {
+    const { text: clean, images } = resolveMarkers(content, screenshots)
+    return { text: clean, images }
+  }
+  if (!Array.isArray(content)) return { text: "", images: [] }
+  const textParts: string[] = []
+  const images: { data: string; mimeType: string }[] = []
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue
+    if (part.type === "image") {
+      const data = part.data ?? part.source?.data ?? part.source?.url
+      const mimeType = part.mimeType ?? part.source?.mediaType ?? part.source?.mime_type
+      if (typeof data === "string" && data.length > 0) images.push({ data, mimeType: mimeType ?? "image/png" })
+    } else {
+      textParts.push(part.text ?? part.thinking ?? "")
+    }
+  }
+  const { text: clean, images: markerImages } = resolveMarkers(textParts.join(""), screenshots)
+  return { text: clean, images: [...images, ...markerImages] }
+}
+function resolveMarkers(textContent: string, screenshots?: Map<string, { data: string; mimeType: string }>): { text: string; images: { data: string; mimeType: string }[] } {
+  if (!screenshots || !textContent.includes("PIPIUI_COMPUTER_SCREENSHOT")) return { text: textContent, images: [] }
+  const images: { data: string; mimeType: string }[] = []
+  let match
+  SCREENSHOT_MARKER.lastIndex = 0
+  while ((match = SCREENSHOT_MARKER.exec(textContent)) !== null) {
+    const shot = screenshots.get(match[1])
+    if (shot) images.push(shot)
+  }
+  return { text: textContent.replace(SCREENSHOT_MARKER, "").trim(), images }
+}
 const emitFrame = (listeners: Set<(e: HostEvent) => void>, event: HostEvent) =>
   listeners.forEach((l) => l(event));
 function asTime(value: any): number {
@@ -413,6 +450,7 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
   let textPart = "";
   let thinking: string | undefined;
   let tools: HistoryTool[] | undefined;
+  let images: { data: string; mimeType: string }[] | undefined;
   if (typeof content === "string") {
     textPart = content;
   } else if (Array.isArray(content)) {
@@ -420,6 +458,14 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
       if (!part || typeof part !== "object") continue;
       if (part.type === "text") textPart += part.text ?? "";
       else if (part.type === "thinking") thinking = (thinking ?? "") + (part.thinking ?? "");
+      else if (part.type === "image") {
+        const imgData = part.data ?? part.source?.data;
+        const imgMime = part.mimeType ?? part.source?.mediaType;
+        if (typeof imgData === "string" && imgData.length > 0) {
+          images = images ?? [];
+          images.push({ data: imgData, mimeType: imgMime ?? "image/png" });
+        }
+      }
       else if (part.type === "toolCall") {
         const args = part.arguments;
         tools = tools ?? [];
@@ -434,6 +480,12 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
       }
     }
   }
+  // Strip computer-use screenshot markers from display text (past-session
+  // screenshots are not in the in-memory cache, so they can't be resolved).
+  if (textPart.includes("PIPIUI_COMPUTER_SCREENSHOT")) {
+    textPart = textPart.replace(SCREENSHOT_MARKER, "").trim();
+    SCREENSHOT_MARKER.lastIndex = 0;
+  }
   const result: HistoryEntry = {
     id: entry.id,
     role,
@@ -442,6 +494,7 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
   };
   if (thinking) result.thinking = thinking;
   if (tools && tools.length) result.tools = tools;
+  if (images && images.length) result.images = images;
   if (message.role === "toolResult") {
     result.toolCallId = message.toolCallId;
     result.toolName = message.toolName;
@@ -660,6 +713,9 @@ export class PiHostBackend implements HostBackend {
   private queueLoads = new Map<string, Promise<void>>();
   private queueWrites = new Map<string, Promise<void>>();
   private closed = false;
+  /** Computer-use screenshot cache: screenshotId → base64+mimeType. Populated by
+   * the computerAction handler so tool-result markers resolve to inline images. */
+  private computerScreenshots = new Map<string, { data: string; mimeType: string }>();
   private bridge: HostBridge;
   /** Durable Electron-side projection of runtime lifecycle events. Pi owns the worker
    * conversations; this small index only lets the UI rebuild its tree after host restart. */
@@ -711,10 +767,17 @@ export class PiHostBackend implements HostBackend {
         options.terminalAction
           ? options.terminalAction(event, sessionId)
           : { ok: false, error: "terminal host unavailable" },
-      onComputerAction: async (event) =>
-        options.computerAction
-          ? options.computerAction(event)
-          : { ok: false, error: "computer host unavailable" },
+      onComputerAction: async (event) => {
+        if (!options.computerAction) return { ok: false, error: "computer host unavailable" }
+        const result = await options.computerAction(event)
+        // Cache computer-use screenshots so tool-result markers resolve into
+        // inline images for the transcript.
+        if (result && typeof result === "object" && typeof (result as any).screenshotId === "string" && typeof (result as any).base64 === "string") {
+          this.computerScreenshots.set((result as any).screenshotId, { data: (result as any).base64, mimeType: (result as any).mimeType ?? "image/png" })
+          if (this.computerScreenshots.size > 24) this.computerScreenshots.delete(this.computerScreenshots.keys().next().value!)
+        }
+        return result
+      },
     });
     if (options.authRuntime) {
       this.authRuntimePromise = Promise.resolve(options.authRuntime);
@@ -1660,14 +1723,17 @@ export class PiHostBackend implements HostBackend {
     } else if (e.type === "message_end") {
       // A new message restarts content indexing; drop unclaimed tool buffers.
       live.toolArgs.clear();
-    } else if (e.type === "tool_execution_end")
+    } else if (e.type === "tool_execution_end") {
+      const { text: resultText, images } = extractResult(e.result?.content, this.computerScreenshots)
       this.stream({
         type: "tool_result",
         sessionId: id,
         toolCallId: e.toolCallId,
-        content: text(e.result?.content),
+        content: resultText,
+        images: images.length > 0 ? images : undefined,
         isError: e.isError,
       });
+    }
   }
   private async command(id: string, body: Rpc) {
     const live = await this.ensure(id);
@@ -2566,7 +2632,12 @@ export class PiHostBackend implements HostBackend {
 			if (!a.sessionId || !/^[A-Za-z0-9_-]{2,160}$/.test(id)) throw new Error("agent abort requires a live session and bounded agent id");
 			// Pi executes extension commands immediately while streaming. Do not forge
 			// terminal UI state here; the real child end event remains authoritative.
-			await this.command(a.sessionId, { type: "prompt", message: `/subagent_abort ${id}` });
+			await this.withAgentCommandTimeout(
+				this.command(a.sessionId, { type: "prompt", message: `/subagent_abort ${id}` }),
+				5_000,
+				"停止请求在 5 秒内未被主 Agent 接收；请重试",
+			);
+			await this.waitForAgentTerminal(a.agentId, a.sessionId, a.runId);
 			return;
 		} else {
       a.handled = true;
@@ -2602,6 +2673,46 @@ export class PiHostBackend implements HostBackend {
     void event;
     void sessionId;
   }
+	private waitForAgentTerminal(agentId: string, sessionId: string, runId: string, timeoutMs = 15_000): Promise<void> {
+		const key = this.agentKey(agentId, sessionId);
+		const deadline = Date.now() + timeoutMs;
+		return new Promise((resolve, reject) => {
+			const poll = () => {
+				if (this.closed) return reject(new Error("PipiUI 已关闭，无法确认 subagent 的停止状态"));
+				const current = this.agents.get(key);
+				if (!current || current.runId !== runId) return reject(new Error("subagent 在停止期间切换了运行实例，请刷新后重试"));
+				if (current.state !== "running" && current.state !== "stalled") return resolve();
+				if (Date.now() >= deadline) return reject(new Error("停止请求已发送，但 15 秒内没有收到 subagent 的终态；请重试或使用“手动检查”查看状态"));
+				const timer = setTimeout(poll, 50);
+				timer.unref?.();
+			};
+			poll();
+		});
+	}
+	private withAgentCommandTimeout<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			const timer = setTimeout(() => {
+				settled = true;
+				reject(new Error(message));
+			}, timeoutMs);
+			timer.unref?.();
+			operation.then(
+				(value) => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					resolve(value);
+				},
+				(error) => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					reject(error);
+				},
+			);
+		});
+	}
   private mapAgentEvent(raw: any, sessionId?: string) {
     const key = this.agentKey(raw.agentId, sessionId);
     const current = this.agents.get(key);
@@ -2636,7 +2747,7 @@ export class PiHostBackend implements HostBackend {
     }
     const semanticWorkerFailure = privateComputerWorker && raw.kind === "end"
       && !["completed", "verified"].includes(closedWorkerOutcome ?? "");
-    const state = raw.ok && !semanticWorkerFailure
+    const reportedState = raw.ok && !semanticWorkerFailure
       ? "ok"
       : raw.aborted
         ? "aborted"
@@ -2650,13 +2761,19 @@ export class PiHostBackend implements HostBackend {
     const usage = isRecord(raw.usage) ? raw.usage : undefined;
     const terminal = raw.kind === "end";
     const sameRun = current?.runId === raw.runId;
+		const currentIsTerminal = sameRun && current !== undefined && current.state !== "running" && current.state !== "stalled";
+		// HTTP lifecycle reports can arrive out of order. Once one run reaches a
+		// terminal state, a late preview/update/log/stall may enrich metrics but it
+		// must never reopen that same run. A new runId remains free to start.
+		const staleAfterTerminal = currentIsTerminal && !terminal;
+		const state = staleAfterTerminal ? current.state : reportedState;
     const agent: AgentSummary = {
       agentId: raw.agentId,
       runId: raw.runId,
       name: raw.name ?? current?.name ?? "subagent",
       task: raw.task ?? current?.task ?? "",
       state,
-      stalled: raw.stalled,
+      stalled: staleAfterTerminal ? false : raw.stalled,
       handled: current?.handled,
       cost: raw.cost ?? usage?.cost ?? current?.cost,
       turns: raw.turns ?? raw.turn ?? current?.turns,

@@ -222,6 +222,37 @@ describe('SubagentPanel', () => {
     await waitFor(() => expect(harness.abortAgent).toHaveBeenCalledWith('run'))
   })
 
+  it('shows a pending stop state until the real terminal event arrives', async () => {
+    const harness = hostHarness()
+    let finishAbort!: () => void
+    harness.host.abortAgent = vi.fn(() => new Promise<void>(resolve => { finishAbort = resolve }))
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running' } })
+
+    fireEvent.click(await screen.findByLabelText('中止 explore'))
+    expect((await screen.findByLabelText('正在中止 explore') as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: '正在停止' }) as HTMLButtonElement).disabled).toBe(true)
+    finishAbort()
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'aborted', endedAt: Date.now() } })
+    await waitFor(() => expect(screen.queryByLabelText('正在中止 explore')).toBeNull())
+    expect(screen.getByText('已中止')).toBeTruthy()
+  })
+
+  it('shows and dismisses an actionable stop error', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [{ agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running' }]
+    harness.host.abortAgent = vi.fn(async () => { throw new Error('Pi 没有确认停止请求') })
+    render(<SubagentPanel host={harness.host} />)
+
+    fireEvent.click(await screen.findByLabelText('中止 explore'))
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('无法停止 explore')
+    expect(alert.textContent).toContain('Pi 没有确认停止请求')
+    expect((screen.getByLabelText('中止 explore') as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: '关闭错误提示' }))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+  })
+
   it('renders AgentRow model, worktree, stalled, and currency metadata', async () => {
     const harness = hostHarness()
     render(<SubagentPanel host={harness.host} />)

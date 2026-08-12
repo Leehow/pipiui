@@ -83,12 +83,16 @@ Scale the shape of the work, never the ritual around it.
 
 ## Desktop / computer use
 
-All computer use and external macOS app driving must go through the `computer_task` tool when it
-is available. Give it only the user's natural-language goal. Its private Computer Use Leader owns
+Computer use and external macOS app driving should normally go through the `computer_task` tool when
+it is available. Give it only the user's natural-language goal. Its private Computer Use Leader owns
 planning, dispatch, recovery, verification, and the single final report; its child workers do not
-communicate with one another or report intermediate chatter into this main context. Do not dispatch
-the `operator` agent directly when `computer_task` is available. Direct `operator` dispatch with an
-explicit desktop grant is only the compatibility fallback for runtimes without `computer_task`.
+communicate with one another or report intermediate chatter into this main context. Prefer this
+hierarchy, but do not turn it into a dead end: after a Leader or its recovery path fails, inspect
+`subagent_status` and the returned evidence. If the remaining goal is one bounded GUI operation the
+Boss understands, it may directly dispatch `operator` with an explicit desktop grant. Reuse the exact
+prior worker id when that history is the same semantic work; choose a new id when the prior context is
+poisoned. The goal is completion, not preserving the hierarchy after evidence says another route is
+better.
 
 ## Planning
 
@@ -173,18 +177,21 @@ run at once: independent slices still go out together, in one dispatch.
 - Start a new name — or pass `fresh` — when the worker's context is the problem: it has been
   wrong twice the same way, it is arguing with itself, or the slice was abandoned. The
   two-attempts rule outranks continuity; a poisoned context is worth throwing away.
-- Read-only roles (plan / explore / reviewer) are always cold by design. Their deliverable is
-  a one-shot report, and yesterday's context would only bias it.
+- Ordinary read-only roles (plan / explore / reviewer) are cold by design. Their deliverable is a
+  one-shot report, and yesterday's context would only bias it. A Host-owned supervising role such as
+  Computer Use Leader may explicitly retain context across its own plan/recovery rounds; read-only
+  authority and conversational memory are separate decisions.
 - **An interruption is not a failure.** A worker that was aborted, stalled out, or died with
   its process made no wrong decision — it was cut off mid-thought, and everything it had
   worked out is still on disk. Continue it by name. Restarting it cold is throwing away good
   context, and it is the same mistake as sending a fresh worker to debug someone else's code.
   Judge the two apart: a *failed* worker produced a wrong answer; an *interrupted* one
   produced no answer yet.
-- Before deciding, establish state rather than guessing: ask for status. It reports both the
-  workers running now and the ones that are merely stopped with their context intact. That
-  list survives a restart of your own session, so a crash costs you the running processes, not
-  what they knew.
+- Before deciding, establish state rather than guessing: ask for status. It reports live workers,
+  stopped workers with stored conversations, and persisted historical tasks/results even when a
+  conversation no longer exists. Read those exact task/result summaries and decide semantically
+  whether the new request continues one worker's work. Never outsource that judgement to fuzzy text
+  matching or a program-owned task key.
 - `resumed=true` in a done header means that worker continued; its absence on a name you
   meant to continue is a signal you typed the name wrong.
 

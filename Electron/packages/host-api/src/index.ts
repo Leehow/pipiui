@@ -35,6 +35,8 @@ export type HistoryEntry = {
   toolCallId?: string;
   toolName?: string;
   isError?: boolean;
+  /** tool only: images extracted from the result (screenshots, generated images). */
+  images?: TranscriptImage[];
 };
 /** Text files that a host makes available to the right-side document reader. */
 export type DocumentKind = "markdown" | "plain";
@@ -245,11 +247,14 @@ export interface BrowserHostAPI {
   subscribe(listener: (event: BrowserEvent) => void): Unsubscribe;
 }
 
+/** Base64-encoded image attached to a tool result (screenshots, generated images, etc.). */
+export type TranscriptImage = { data: string; mimeType: string };
+
 export type StreamEvent =
   | { type: "text"; sessionId: string; contentIndex: number; delta: string }
   | { type: "thinking"; sessionId: string; contentIndex: number; delta: string }
   | { type: "tool_call"; sessionId: string; toolCallId: string; name: string; delta?: string }
-  | { type: "tool_result"; sessionId: string; toolCallId: string; content: string; isError?: boolean }
+  | { type: "tool_result"; sessionId: string; toolCallId: string; content: string; isError?: boolean; images?: TranscriptImage[] }
   | { type: "status"; sessionId: string; status: "started" | "streaming" | "settled" | "stopped"; pendingFollowUps?: string[] }
   /** Snapshot after every queue mutation; old clients may safely ignore this new event type. */
   | { type: "queue_update"; sessionId: string; queue: QueuedMessage[]; pendingFollowUps?: string[] }

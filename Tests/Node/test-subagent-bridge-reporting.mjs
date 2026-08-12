@@ -15,6 +15,7 @@ import {
 const execFileAsync = promisify(execFile);
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const sourceSubagentDirectory = join(repositoryRoot, "Sources/PipiUI/PiExt/subagent");
+const sourceComputerAgentDirectory = join(repositoryRoot, "Sources/PipiUI/PiExt/packages/computer-agent");
 const piPackageRoot = join(homedir(), ".npm-global/lib/node_modules/@earendil-works/pi-coding-agent");
 const piNodeModules = join(piPackageRoot, "node_modules");
 const capability = "canonical-live-capability-0123456789abcdef";
@@ -43,6 +44,7 @@ async function waitFor(predicate, timeoutMs = 2_000) {
 async function prepareHarness(directory) {
   const subagentDirectory = join(directory, "subagent");
   await cp(sourceSubagentDirectory, subagentDirectory, { recursive: true });
+	await cp(sourceComputerAgentDirectory, join(directory, "packages/computer-agent"), { recursive: true });
   await linkRuntimePackages(directory);
   const indexPath = join(subagentDirectory, "index.ts");
   let source = await (await import("node:fs/promises")).readFile(indexPath, "utf8");
@@ -105,6 +107,11 @@ if (process.argv.includes("--mode")) {
   globalThis.fetch = async (input, init) => {
     const attempt = { url: String(input), body: String(init?.body ?? "") };
     try {
+      const body = JSON.parse(attempt.body);
+      // Force a normal live update to be slower than the terminal report. The
+      // reporter must serialize the same agent's lifecycle rather than letting
+      // HTTP completion timing reorder end/update at the host.
+      if (body.event?.kind === "update") await new Promise((resolve) => setTimeout(resolve, 180));
       const response = await realFetch(input, init);
       fetchAttempts.push({ ...attempt, status: response.status, response: await response.clone().text() });
       return response;
@@ -149,7 +156,10 @@ if (process.argv.includes("--mode")) {
     undefined,
     context,
   );
-  await new Promise((resolve) => setTimeout(resolve, 120));
+  // The test deliberately adds latency to update requests. Wait for the
+  // ordered lifecycle queue (including closeout) to drain before serializing
+  // the harness evidence.
+  await new Promise((resolve) => setTimeout(resolve, 2_500));
   process.stdout.write(JSON.stringify({ runId, statusText, resolved, fetchAttempts }));
 }
 `, "utf8");
@@ -202,6 +212,10 @@ test("live extension reporting captures one explicit runId for every agent event
       `missing live canonical kinds: ${JSON.stringify(observed)}`);
     assert.ok(observed.every((event) => event.runId === result.runId),
       "every asynchronously emitted live report must retain the dispatch-captured runId");
+    const terminalIndex = observed.findIndex((event) => event.kind === "end");
+    assert.ok(terminalIndex >= 0, "the live run must report a terminal event");
+    assert.equal(observed.slice(terminalIndex + 1).some((event) => ["start", "update", "usage", "stalled"].includes(event.kind)), false,
+      `no non-terminal lifecycle event may overtake end: ${JSON.stringify(observed.map((event) => event.kind))}`);
     assert.equal(result.fetchAttempts.length, observed.length, "the single emitter must issue one /rpc request per observed report");
     const encoded = result.fetchAttempts.map((attempt) => JSON.parse(attempt.body));
     assert.ok(result.fetchAttempts.every((attempt) => attempt.status === 200), "all captured canonical reports should reach the live host");

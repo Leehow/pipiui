@@ -50,11 +50,41 @@ describe("subagent lifecycle → AgentSummary", () => {
 		deliver({ ...START, agentId: "agent-safe_1" });
 		const command = vi.fn(async () => ({}));
 		(backend as any).command = command;
-		await backend.handle("abortAgent", ["agent-safe_1"]);
+		const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
+		await vi.waitFor(() => expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1" }));
 		expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1" });
 		expect(latest().state).toBe("running");
-		deliver({ ...END, agentId: "agent-safe_1", ok: false, output: "aborted" });
-		expect(latest().state).toBe("failed");
+		deliver({ ...END, agentId: "agent-safe_1", ok: false, aborted: true, output: "aborted" });
+		await expect(aborting).resolves.toBeUndefined();
+		expect(latest().state).toBe("aborted");
+	});
+
+	it("rejects a stop request when the owning Pi never acknowledges the command", async () => {
+		vi.useFakeTimers();
+		try {
+			const { backend, deliver, latest } = await harness();
+			deliver({ ...START, agentId: "agent-safe_1" });
+			const command = vi.fn(() => new Promise<never>(() => undefined));
+			(backend as any).command = command;
+			const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1" });
+			const rejected = expect(aborting).rejects.toThrow("停止请求在 5 秒内未被主 Agent 接收；请重试");
+			await vi.advanceTimersByTimeAsync(5_000);
+			await rejected;
+			expect(latest().state).toBe("running");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps a same-run terminal state when an older update arrives late", async () => {
+		const { deliver, latest } = await harness();
+		deliver(START);
+		deliver({ ...END, ok: false, aborted: true, output: "aborted" });
+		const endedAt = latest().endedAt;
+		deliver({ ...UPDATE, output: "late preview", activity: "stale activity" });
+		expect(latest()).toMatchObject({ state: "aborted", finalResult: "aborted", endedAt });
 	});
   it("carries identity, model, live activity and tokens through to the panel", async () => {
     const { deliver, latest } = await harness();

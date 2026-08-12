@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import ts from "../../Electron/node_modules/typescript/lib/typescript.js";
 import { normalizeTerminalPolicyProposal } from "../../Sources/PipiUI/PiExt/packages/computer-agent/src/terminal-policy.ts";
@@ -73,6 +74,28 @@ async function loadActualComputerPlanParser() {
     normalizeTerminalWorkerObjective,
     validateTerminalPolicyBoundary,
     validateComputerPlanGoalBindings,
+  );
+}
+
+async function loadComputerTaskContinuityHelpers(history = []) {
+  const source = await readFile(subagentURL, "utf8");
+  const start = source.indexOf("const PLAN_ADMISSION_MAX_DISTINCT_CANDIDATES");
+  const end = source.indexOf("class ComputerPlanInvestigationError", start);
+  assert.ok(start >= 0 && end > start, "Computer Task continuity seam must remain discoverable");
+  const javascript = ts.transpileModule(source.slice(start, end), {
+    compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  return new Function(
+    "createHash",
+    "generatePipiuiAgentId",
+    "validateAgentId",
+    "readAgentSliceMetadata",
+    `${javascript}\nreturn { candidateFingerprint, selectComputerTaskLeaderAgentId, computerWorkerAgentId };`,
+  )(
+    createHash,
+    () => "agent-generatedleader",
+    (id) => /^[a-z0-9][a-z0-9_-]{1,23}$/.test(id) ? null : "invalid agent id",
+    () => history,
   );
 }
 
@@ -561,7 +584,12 @@ test("Computer Use Leader remains coordinating between private planning calls un
   assert.match(source, /markComputerLeaderCoordinating/);
   assert.match(source, /plan:\s*async[\s\S]*await markComputerLeaderCoordinating\(\)/);
   assert.match(source, /replan:\s*async[\s\S]*await markComputerLeaderCoordinating\(\)/);
-  assert.match(source, /PLAN_ADMISSION_REPAIR_LIMIT = 2/);
+  assert.match(source, /PLAN_ADMISSION_MAX_DISTINCT_CANDIDATES = 6/);
+  assert.match(source, /seenCandidateFingerprints/);
+  assert.match(source, /candidateFingerprint/);
+  assert.match(source, /plan_repair_stalled/);
+  assert.match(source, /主 Agent 应先查看该 Leader 与相关 Worker 的历史任务和结果/);
+  assert.doesNotMatch(source, /PLAN_ADMISSION_REPAIR_LIMIT = 2/);
   assert.match(source, /repairRejectedPlan/);
   assert.match(source, /Admission diagnosis:/);
   assert.match(source, /ComputerPlanInvestigationError/);
@@ -570,6 +598,52 @@ test("Computer Use Leader remains coordinating between private planning calls un
   const coordinatorRun = source.indexOf('await coordinator.run');
   assert.ok(finalSummary > coordinatorRun, "final Leader completion must happen only after coordinator awaited all children");
 	assert.match(source, /if \(leaderCoordinating\) await postTerminalPipiuiReport\(\{ kind: "end"[\s\S]*?Computer Task failed/);
+});
+
+test("Computer Task continuity is Boss-selected and role-aware instead of taskKey routing or fresh workers", async () => {
+  const source = await readFile(subagentURL, "utf8");
+  const computerTaskStart = source.indexOf('name: "computer_task"');
+  const computerTaskEnd = source.indexOf("export default function", computerTaskStart);
+  assert.ok(computerTaskStart >= 0 && computerTaskEnd > computerTaskStart);
+  const computerTask = source.slice(computerTaskStart, computerTaskEnd);
+
+  assert.match(computerTask, /agentId:\s*Type\.Optional/);
+  assert.match(computerTask, /selectComputerTaskLeaderAgentId\(params\.agentId/);
+  assert.match(computerTask, /retainContext:\s*true/);
+  assert.match(computerTask, /computerWorkerAgentId\(taskId,\s*"operator"\)/);
+  assert.match(computerTask, /computerWorkerAgentId\(taskId,\s*"computer-terminal"\)/);
+  assert.match(computerTask, /role === "verifier"[\s\S]*fresh:\s*true/);
+  assert.doesNotMatch(computerTask, /fresh:\s*true\s*\}\);?[\s\n]*if \(result\.exitCode/, "runChild must not force every private role cold");
+  assert.doesNotMatch(source, /taskKey|TASK_KEY_DESCRIPTION|selectTaskKeyAgentIdentity/);
+});
+
+test("Computer Task exact identities resume only a Leader and derive stable subordinate ids", async () => {
+  const helpers = await loadComputerTaskContinuityHelpers([
+    { agentId: "old-leader", name: "computer-use-leader" },
+    { agentId: "old-reviewer", name: "reviewer" },
+  ]);
+  assert.equal(helpers.selectComputerTaskLeaderAgentId(" old-leader "), "old-leader");
+  assert.equal(helpers.selectComputerTaskLeaderAgentId(undefined), "agent-generatedleader");
+  assert.throws(() => helpers.selectComputerTaskLeaderAgentId("old-reviewer"), /not computer-use-leader/);
+  assert.throws(() => helpers.selectComputerTaskLeaderAgentId("Bad ID"), /invalid agent id/);
+
+  const operator = helpers.computerWorkerAgentId("old-leader", "operator");
+  const terminal = helpers.computerWorkerAgentId("old-leader", "computer-terminal");
+  assert.equal(operator, helpers.computerWorkerAgentId("old-leader", "operator"));
+  assert.notEqual(operator, terminal);
+  assert.match(operator, /^[a-z0-9][a-z0-9_-]{1,23}$/);
+  assert.match(terminal, /^[a-z0-9][a-z0-9_-]{1,23}$/);
+  assert.equal(helpers.candidateFingerprint(" plan "), helpers.candidateFingerprint("plan"));
+});
+
+test("subagent status exposes persisted semantic worker history for Boss investigation", async () => {
+  const source = await readFile(subagentURL, "utf8");
+  assert.match(source, /interface AgentSliceMetadata[\s\S]*runId\?: string;[\s\S]*state\?: JobState;[\s\S]*resultSummary\?: string;/);
+  assert.match(source, /rememberAgentSliceTerminal/);
+  assert.match(source, /const finalized = jobRegistry\.get\(agentId\);[\s\S]{0,180}rememberAgentSliceTerminal\(agentId, runId, finalized\.state/);
+  assert.match(source, /Historical workers \(persisted task and result summaries/);
+  assert.match(source, /stored conversation: /);
+  assert.match(source, /The Boss chooses whether this exact agentId belongs to the same semantic work/);
 });
 
 test("Computer Use Leader repairs the rejected candidate instead of reconstructing a fresh plan from only an error code", async () => {

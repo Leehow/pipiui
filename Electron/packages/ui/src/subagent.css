@@ -14,6 +14,7 @@
 .subagent-header-right button:hover,.agent-detail-header>button:hover,.agent-pager button:hover{background:var(--surface-hover);color:var(--text)}
 .subagent-header-right button:disabled{cursor:default;opacity:.42}
 .subagent-loading,.subagent-empty,.agent-detail.empty{display:grid;min-width:0;min-height:0;flex:1;place-content:center;gap:9px;padding:25px;color:var(--muted);text-align:center}
+.subagent-abort-error{flex:0 0 auto;padding:6px 10px;border-bottom:1px solid var(--border)}
 .subagent-loading{display:flex;align-items:center;justify-content:center;font-size:12px}
 .subagent-empty b{font-size:30px;color:var(--subtle)}
 .subagent-empty p{max-width:250px;margin:0;font-size:11px;line-height:1.5}
@@ -36,7 +37,7 @@
 .agent-name-line .agent-leader-badge{color:var(--accent);background:color-mix(in srgb,var(--accent) 13%,transparent)}
 .agent-name-line .worktree-badge.pendingReview,.worktree-status.pendingReview{color:var(--warning);background:color-mix(in srgb,var(--warning) 15%,transparent)}.agent-name-line .worktree-badge.merged,.worktree-status.merged{color:var(--success);background:color-mix(in srgb,var(--success) 15%,transparent)}.agent-name-line .worktree-badge.mergedCleanupPending,.worktree-status.mergedCleanupPending{color:var(--warning);background:color-mix(in srgb,var(--warning) 15%,transparent)}.agent-name-line .worktree-badge.discarded,.worktree-status.discarded{color:var(--muted)}.agent-name-line .worktree-badge.active,.worktree-status.active{color:var(--accent);background:color-mix(in srgb,var(--accent) 15%,transparent)}
 .agent-metrics{display:grid;min-width:64px;gap:2px;margin-left:6px;text-align:right;font-variant-numeric:tabular-nums}.agent-metrics small{white-space:nowrap}
-.agent-control{display:grid;flex:0 0 auto;place-items:center;height:24px;margin-right:4px;border-radius:5px;font-size:10px}.agent-control:hover{background:var(--surface-hover)}.agent-control.abort{width:24px;color:var(--danger)}
+.agent-control{display:grid;flex:0 0 auto;place-items:center;height:24px;margin-right:4px;border-radius:5px;font-size:10px}.agent-control:hover{background:var(--surface-hover)}.agent-control:disabled{cursor:wait;opacity:.65}.agent-control.abort{width:24px;color:var(--danger)}
 .agent-control.resolve{padding:0 6px;opacity:0;pointer-events:none;white-space:nowrap;color:var(--success);transition:opacity .13s ease}.agent-row:hover .agent-control.resolve,.agent-row:focus-within .agent-control.resolve{opacity:1;pointer-events:auto}
 .agent-pager{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 4px;font-variant-numeric:tabular-nums}.agent-pager button:disabled{cursor:default;opacity:.4}
 .subagent-divider{cursor:row-resize;background:var(--border)}.subagent-divider:hover,.subagent-divider:active{background:var(--accent)}

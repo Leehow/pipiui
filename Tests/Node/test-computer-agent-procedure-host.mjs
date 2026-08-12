@@ -38,9 +38,9 @@ test("trusted coordinator compilation rejects forged application and ambiguous b
   assert.equal((await runtime.recordCoordinatorExecution(base)).state, "candidate");
 });
 
-test("registered computer_task keeps goal-only public UX while wiring Procedure runtime behind closed Leader context", async () => {
+test("registered computer_task keeps natural-language goal UX plus optional exact Leader continuity", async () => {
   const source = await readFile(new URL("../../Sources/PipiUI/PiExt/subagent/index.ts", import.meta.url), "utf8");
-  assert.match(source, /parameters: Type\.Object\(\{ goal: Type\.String/);
+  assert.match(source, /parameters: Type\.Object\(\{[\s\S]{0,200}goal: Type\.String[\s\S]{0,300}agentId: Type\.Optional/);
   assert.doesNotMatch(source, /parameters: Type\.Object\(\{ goal:[\s\S]{0,300}(?:bundleId|parameterBindings)/);
   assert.match(source, /ProcedureHostRuntime\.open/);
   assert.match(source, /recordCoordinatorExecution/);

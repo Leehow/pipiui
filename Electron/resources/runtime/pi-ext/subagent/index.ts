@@ -12,7 +12,7 @@
  * Uses JSON mode to capture structured output from subagents.
  */
 
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -706,14 +706,15 @@ async function postPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
 	}
 }
 
-function pipiuiReport(payload: PipiuiAgentReport): void {
-	void postPipiuiReport(payload);
-}
-
 const terminalPipiuiReportFlights = new Map<string, Promise<void>>();
 
-/** Serialize terminal UI events per bare ID; the lease owner awaits the queue before release. */
-function postTerminalPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
+/**
+ * Serialize every lifecycle report per bare agent ID. A fire-and-forget update
+ * may otherwise complete after `end` and reopen a terminal row in hosts that
+ * receive HTTP requests in completion order. The host still enforces terminal
+ * monotonicity because network/process failures can drop or replay messages.
+ */
+function enqueuePipiuiReport(payload: PipiuiAgentReport): Promise<void> {
 	const previous = terminalPipiuiReportFlights.get(payload.agentId) ?? Promise.resolve();
 	const flight = previous.catch(() => {}).then(() => postPipiuiReport(payload));
 	terminalPipiuiReportFlights.set(payload.agentId, flight);
@@ -723,6 +724,15 @@ function postTerminalPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
 		}
 	});
 	return flight;
+}
+
+function pipiuiReport(payload: PipiuiAgentReport): void {
+	void enqueuePipiuiReport(payload);
+}
+
+/** The lease owner awaits the same ordered queue before it releases this agent ID. */
+function postTerminalPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
+	return enqueuePipiuiReport(payload);
 }
 
 async function awaitTerminalPipiuiReports(agentId: string): Promise<void> {
@@ -1046,6 +1056,8 @@ interface RunSingleAgentOptions {
 	verify?: string;
 	/** Discard this worker's stored conversation and start it cold. */
 	fresh?: boolean;
+	/** Keep this role's conversation even when it is read-only. Authority and memory are separate. */
+	retainContext?: boolean;
 	/** Explicit per-task Computer Use grant; omission = no desktop tools. */
 	desktop?: "user-requested" | "ui-verify";
 	/** Runtime-owned scoped Computer Agent worker route; never model/frontmatter supplied. */
@@ -2178,6 +2190,7 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 	jobPrune();
 	const ledgerStatus = ledgerStatusFor(fields.state);
 	const finalized = jobRegistry.get(agentId);
+	if (finalized) rememberAgentSliceTerminal(agentId, runId, finalized.state, finalized.resultText ?? "");
 	if (PIPIUI_DEPTH === 0 && ledgerStatus && finalized) {
 		const attestation = finalized.verify;
 		recordTaskTerminal({
@@ -2445,7 +2458,9 @@ interface AgentSliceMetadata {
 	name: string;
 	task: string;
 	title?: string;
-	taskKey?: string;
+	runId?: string;
+	state?: JobState;
+	resultSummary?: string;
 	updatedAt: number;
 }
 
@@ -2468,64 +2483,38 @@ function readAgentSliceMetadata(): AgentSliceMetadata[] {
 	}
 }
 
-/** Explicit semantic identity index: no fuzzy matching. The Boss sees the exact previous
- * title/task and decides whether the new request belongs to that same vertical slice. */
-function rememberAgentSlice(agentId: string, name: string, task: string, title?: string): void {
+function writeAgentSliceMetadata(slices: AgentSliceMetadata[]): void {
 	const file = agentSliceMetadataFile();
 	if (!file) return;
 	try {
 		fs.mkdirSync(path.dirname(file), { recursive: true });
-		const all = readAgentSliceMetadata();
-		const current = all.find((item) => item.agentId === agentId);
-		const previous = all.filter((item) => item.agentId !== agentId);
-		const slices = [{ agentId, name, task, ...(title ? { title } : {}), ...(current?.taskKey ? { taskKey: current.taskKey } : {}), updatedAt: Date.now() }, ...previous].slice(0, 1000);
 		const temp = `${file}.tmp-${process.pid}`;
-		fs.writeFileSync(temp, JSON.stringify({ version: 1, slices }, null, 2) + "\n", { mode: 0o600 });
+		fs.writeFileSync(temp, JSON.stringify({ version: 1, slices: slices.slice(0, 1000) }, null, 2) + "\n", { mode: 0o600 });
 		fs.renameSync(temp, file);
 	} catch {
 		// Discovery metadata is advisory; it must never block a real dispatch.
 	}
 }
 
-const TASK_KEY_PATTERN = /^[a-z0-9][a-z0-9._:-]{1,63}$/;
-
-// PIPIUI_PURE_TASK_KEY_ROUTING_BEGIN
-export function selectTaskKeyAgentIdentity(taskKey: string, requestedAgentId: string | undefined, requestedName: string | undefined, entries: readonly { taskKey?: string; agentId: string; name: string }[]): { agentId?: string; name?: string; problem?: string } {
-	const key = taskKey.trim();
-	if (!TASK_KEY_PATTERN.test(key)) return { problem: `Invalid taskKey ${JSON.stringify(taskKey)}. Use 2-64 lowercase letters, digits, ., _, :, or -.` };
-	const existing = entries.find((item) => item.taskKey === key);
-	if (existing && requestedAgentId && existing.agentId !== requestedAgentId.trim()) return { problem: `taskKey ${JSON.stringify(key)} already belongs to agentId ${JSON.stringify(existing.agentId)}; omit agentId or use that exact id to resume it.` };
-	if (existing && requestedName && existing.name !== requestedName.trim()) return { problem: `taskKey ${JSON.stringify(key)} already belongs to agent profile ${JSON.stringify(existing.name)}; omit agent or use that exact profile to resume the same worker.` };
-	const agentId = existing?.agentId ?? requestedAgentId?.trim();
-	const name = existing?.name ?? requestedName?.trim();
-	if (!agentId) return { problem: `New taskKey ${JSON.stringify(key)} needs agentId on its first dispatch. Later dispatches may omit agentId and will resume it automatically.` };
-	if (!name) return { problem: `New taskKey ${JSON.stringify(key)} needs agent/profile on its first dispatch. Later dispatches may omit it and will restore the original profile automatically.` };
-	return { agentId, name };
-}
-// PIPIUI_PURE_TASK_KEY_ROUTING_END
-
-/** Deterministic semantic routing. A taskKey is explicit product metadata, never a fuzzy
- * comparison of prose: the same key resumes the same worker, a different key cannot match. */
-function agentIdentityForTaskKey(taskKey: string, requestedAgentId: string | undefined, requestedName: string | undefined, task: string, title?: string): { agentId?: string; name?: string; problem?: string } {
+/** Persist the exact task identity at dispatch. This is evidence for the Boss, not routing:
+ * no program guesses whether two prose tasks are the same semantic work. */
+function rememberAgentSlice(agentId: string, name: string, task: string, title: string | undefined, runId: string): void {
 	const all = readAgentSliceMetadata();
-	const key = taskKey.trim();
-	const selected = selectTaskKeyAgentIdentity(taskKey, requestedAgentId, requestedName, all);
-	if (selected.problem || !selected.agentId || !selected.name) return selected;
-	const agentId = selected.agentId;
-	const name = selected.name;
-	const invalid = validateAgentId(agentId);
-	if (invalid) return { problem: invalid };
-	try {
-		const file = agentSliceMetadataFile();
-		if (file) {
-			fs.mkdirSync(path.dirname(file), { recursive: true });
-			const slices = [{ agentId, name, task, ...(title ? { title } : {}), taskKey: key, updatedAt: Date.now() }, ...all.filter((item) => item.agentId !== agentId && item.taskKey !== key)].slice(0, 1000);
-			const temp = `${file}.tmp-${process.pid}`;
-			fs.writeFileSync(temp, JSON.stringify({ version: 1, slices }, null, 2) + "\n", { mode: 0o600 });
-			fs.renameSync(temp, file);
-		}
-	} catch { /* advisory persistence failure falls back to this dispatch only */ }
-	return { agentId, name };
+	writeAgentSliceMetadata([
+		{ agentId, name, task: task.slice(0, 12_000), ...(title ? { title: title.slice(0, 500) } : {}), runId, state: "running", updatedAt: Date.now() },
+		...all.filter((item) => item.agentId !== agentId),
+	]);
+}
+
+function rememberAgentSliceTerminal(agentId: string, runId: string, state: JobState, resultText: string): void {
+	const all = readAgentSliceMetadata();
+	const current = all.find((item) => item.agentId === agentId);
+	if (!current || (current.runId && current.runId !== runId)) return;
+	const resultSummary = resultText.replace(/\s+/g, " ").trim().slice(0, 4_000);
+	writeAgentSliceMetadata([
+		{ ...current, runId, state, ...(resultSummary ? { resultSummary } : {}), updatedAt: Date.now() },
+		...all.filter((item) => item.agentId !== agentId),
+	]);
 }
 
 function formatResumableSection(exclude: Set<string>): string[] {
@@ -2536,14 +2525,35 @@ function formatResumableSection(exclude: Set<string>): string[] {
 		const item = metadata.get(id);
 		if (!item) return `- \`${id}\``;
 		const summary = (item.title?.trim() || item.task.replace(/\s+/g, " ").trim()).slice(0, 120);
-		return `- \`${id}\` (${item.name}) — ${summary || "(task unavailable)"}`;
+		const result = item.resultSummary?.replace(/\s+/g, " ").trim().slice(0, 120);
+		return `- \`${id}\` (${item.name}) — state=${item.state ?? "unknown"}; task=${summary || "(task unavailable)"}${result ? `; result=${result}` : ""}`;
 	});
 	return [
 		"",
 		"Resumable workers (stored context, not running):",
 		...rows,
+		"An interruption is not a failure: inspect the prior task/result before deciding whether to continue or replace the worker.",
 		"Re-dispatch one by its agentId to continue with everything it already knows; pass fresh only to throw that context away.",
 		"Reuse an id only when the explicit title/task is the same vertical slice; do not infer from fuzzy text similarity.",
+	];
+}
+
+function formatHistoricalSection(exclude: Set<string>): string[] {
+	const stored = new Set(resumableAgentIds());
+	const history = readAgentSliceMetadata()
+		.filter((item) => !exclude.has(item.agentId) && !stored.has(item.agentId))
+		.slice(0, 100);
+	if (history.length === 0) return [];
+	const rows = history.map((item) => {
+		const task = item.task.replace(/\s+/g, " ").trim().slice(0, 120) || "(task unavailable)";
+		const result = item.resultSummary?.replace(/\s+/g, " ").trim().slice(0, 120);
+		return `- \`${item.agentId}\` (${item.name}) — state=${item.state ?? "unknown"}; stored conversation=${stored.has(item.agentId) ? "yes" : "no"}; task=${task}${result ? `; result=${result}` : ""}`;
+	});
+	return [
+		"",
+		"Historical workers (persisted task and result summaries; newest first):",
+		...rows,
+		"The Boss chooses whether this exact agentId belongs to the same semantic work. Inspect it with subagent_status(agentId), then resume that id or deliberately create a new worker; the runtime never fuzzy-matches prose.",
 	];
 }
 
@@ -2553,6 +2563,22 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 		const job = jobRegistry.get(opts.agentId);
 		if (!job) {
 			const resumable = resumableAgentIds().includes(opts.agentId);
+			const historical = readAgentSliceMetadata().find((item) => item.agentId === opts.agentId);
+			if (historical) {
+				return [
+					`agentId: ${opts.agentId}`,
+					...(historical.runId ? [`runId: ${historical.runId}`] : []),
+					`name: ${historical.name}`,
+					...(historical.title ? [`title: ${historical.title}`] : []),
+					`state: ${historical.state ?? "not running in this process"}`,
+					`stored conversation: ${resumable ? "yes" : "no"}`,
+					`Task: ${historical.task}`,
+					...(historical.resultSummary ? ["Result:", opts.full ? historical.resultSummary : truncateTextHead(historical.resultSummary, JOB_RESULT_DISPLAY_CAP)] : []),
+					resumable
+						? "This worker's stored conversation is intact. Re-dispatch this same agentId to continue it, or choose a new id when the prior approach is poisoned."
+						: "This historical result is inspectable, but no stored conversation remains; use it as evidence when deciding the next dispatch.",
+				].join("\n");
+			}
 			if (resumable) {
 				return [
 					`agentId: ${opts.agentId}`,
@@ -2611,7 +2637,7 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 			? "No running subagent jobs."
 			: "No subagent jobs recorded in this process.";
 		// A restarted main session has an empty registry while stored conversations remain.
-		return opts.onlyRunning ? head : [head, ...formatResumableSection(new Set())].join("\n");
+		return opts.onlyRunning ? head : [head, ...formatResumableSection(new Set()), ...formatHistoricalSection(new Set())].join("\n");
 	}
 
 	// running first, then newest endedAt/startedAt
@@ -2658,6 +2684,7 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 		...rows,
 		...formatQueuedSection(now),
 		...formatResumableSection(new Set(jobs.map((j) => j.agentId))),
+		...formatHistoricalSection(new Set(jobs.map((j) => j.agentId))),
 	].join("\n");
 }
 
@@ -3864,13 +3891,13 @@ async function runSingleAgent(
 	// A worker keeps its conversation across re-dispatches so a vertical slice — implement,
 	// verify, debug, fix, re-verify — is done by someone who remembers writing the code, rather
 	// than by a stranger who re-reads the files and re-derives the same wrong assumption every
-	// round. Read-only roles stay ephemeral: their deliverable is a one-shot report, and stale
-	// context would bias the next one.
+	// round. Ordinary read-only reports stay ephemeral, but a Host-owned orchestrator can opt
+	// into continuity without gaining any write authority: memory and authority are separate.
 	// First real dispatch is exactly when the ledger becomes relevant (see the lazy-discovery
 	// rule the orchestration layer states), so seed it here rather than on every session start.
 	seedBossLedger(PIPIUI_MAIN_CWD, PIPIUI_SESSION);
-	rememberAgentSlice(pipiuiAgentId, agentName, task, options?.title);
-	const sessionDir = agent.traits.readOnly ? undefined : agentSessionDir();
+	rememberAgentSlice(pipiuiAgentId, agentName, task, options?.title, runId);
+	const sessionDir = agent.traits.readOnly && !options?.retainContext ? undefined : agentSessionDir();
 	const sessionId = `pipiui-${pipiuiAgentId}`;
 	const resumingSession = Boolean(
 		sessionDir && !options?.fresh && agentSessionExists(sessionDir, sessionId),
@@ -4713,8 +4740,6 @@ const AGENT_ID_DESCRIPTION =
 	"Short semantic name for the worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\". Re-dispatching the same agentId continues a writable worker with its previous conversation, worktree and branch — use it for one vertical slice (implement, verify, debug, fix, re-verify). Read-only roles are one-shot and do not create a worktree. Required for any role that writes code: it becomes the git branch pipiui/<agentId>. Read-only one-shot roles may omit it and a name is generated. Also the target id for action=\"abort\" or action=\"resolve\".";
 const FRESH_DESCRIPTION =
 	"Discard this agentId's stored conversation and start it cold. Use when its context went wrong, not routinely.";
-const TASK_KEY_DESCRIPTION =
-	"Stable explicit identity for one semantic task slice. First dispatch supplies taskKey + agentId; after restart or in another Boss session, the same taskKey may omit agentId and deterministically resumes the mapped worker. Different keys never fuzzy-match.";
 const DESKTOP_PARAM_DESCRIPTION =
 	'Explicit per-task Computer Use authorization. Omitted by default — desktop tools are NEVER injected without it, even when the global toggle is on. Only two values exist: "user-requested" (the user explicitly asked to operate an external app, or named Chrome/Safari/another external browser / "my browser" — then you MUST use exactly that external browser via open_application + computer, never swap in the built-in browser) and "ui-verify" (this task built/changed an app and genuinely needs a visual UI acceptance check). Ordinary web research → built-in browser tool, not desktop. Waiting, polling logs, reading files, and build/test verification never use desktop. Do not grant for convenience; each task is authorized independently and never inherits another task\'s grant.';
 const BLOCKED_BY_DESCRIPTION =
@@ -4769,7 +4794,6 @@ const TaskItem = Type.Object({
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	thinking: ThinkingParam,
 	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
-	taskKey: Type.Optional(Type.String({ description: TASK_KEY_DESCRIPTION })),
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	desktop: Type.Optional(
 		StringEnum(["user-requested", "ui-verify"] as const, {
@@ -4805,7 +4829,7 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 
 const SubagentSharedParams = {
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
-	agent: Type.Optional(Type.String({ description: "Name/profile of the agent to invoke (single mode). May be omitted only when taskKey already has a persisted identity; that original profile is restored." })),
+	agent: Type.Optional(Type.String({ description: "Name/profile of the agent to invoke (single mode)." })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	title: Type.Optional(
 		Type.String({
@@ -4851,7 +4875,6 @@ const SubagentParams = Type.Object({
 		}),
 	),
 	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
-	taskKey: Type.Optional(Type.String({ description: TASK_KEY_DESCRIPTION })),
 	runId: Type.Optional(Type.String({
 		minLength: 1,
 		description: "Exact runId for action=resolve; stale runIds are rejected with currentRunId.",
@@ -5120,7 +5143,28 @@ function computerPlanFromOutput(output: string, goal: string): ComputerPlan {
 	return plan;
 }
 
-const PLAN_ADMISSION_REPAIR_LIMIT = 2;
+const PLAN_ADMISSION_MAX_DISTINCT_CANDIDATES = 6;
+
+function candidateFingerprint(candidate: string): string {
+	return createHash("sha256").update(candidate.trim()).digest("hex");
+}
+
+function selectComputerTaskLeaderAgentId(requestedAgentId: string | undefined): string {
+	const agentId = requestedAgentId?.trim() || generatePipiuiAgentId();
+	const invalid = validateAgentId(agentId);
+	if (invalid) throw new Error(invalid);
+	const historical = readAgentSliceMetadata().find((item) => item.agentId === agentId);
+	if (historical && historical.name !== "computer-use-leader") {
+		throw new Error(`agentId ${JSON.stringify(agentId)} belongs to ${JSON.stringify(historical.name)}, not computer-use-leader`);
+	}
+	return agentId;
+}
+
+function computerWorkerAgentId(taskId: string, role: "operator" | "computer-terminal"): string {
+	const prefix = role === "operator" ? "cua-op" : "cua-term";
+	const digest = createHash("sha256").update(`${taskId}\0${role}`).digest("hex").slice(0, 12);
+	return `${prefix}-${digest}`;
+}
 
 class ComputerPlanInvestigationError extends Error {
 	readonly diagnostic: ComputerPlanAdmissionDiagnostic;
@@ -5136,7 +5180,7 @@ class ComputerPlanInvestigationError extends Error {
 
 function computerPlanInvestigationReport(error: ComputerPlanInvestigationError) {
 	const { diagnostic, attempts } = error;
-	const summary = `Computer Task 未开始执行：Computer Use Leader 已复查并修订计划 ${attempts} 次，但仍无法生成安全可执行的计划。原因：${diagnostic.summary} 下一步：${diagnostic.leaderInstruction}`;
+	const summary = `Computer Task 未开始执行：Computer Use Leader 已检查 ${attempts} 个计划候选，但仍无法生成安全可执行的计划。原因：${diagnostic.summary} 下一步：${diagnostic.leaderInstruction}`;
 	return {
 		content: [{ type: "text" as const, text: summary }],
 		details: {
@@ -5155,10 +5199,13 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "computer_task",
 		label: "Computer Task",
-		description: "Complete one natural-language desktop goal through an isolated planning, GUI operation, recovery, and verification workflow. Supply the goal only; do not prescribe clicks or coordinates.",
-		parameters: Type.Object({ goal: Type.String({ minLength: 1, maxLength: 12_000 }) }, { additionalProperties: false }),
+		description: "Complete one natural-language desktop goal through an isolated planning, GUI operation, recovery, and verification workflow. Before repeating related work, inspect subagent_status and pass the exact prior Computer Use Leader agentId when its task/result show that it should continue; omit agentId to start a deliberate new hierarchy.",
+		parameters: Type.Object({
+			goal: Type.String({ minLength: 1, maxLength: 12_000 }),
+			agentId: Type.Optional(Type.String({ description: "Exact historical computer-use-leader id selected by the Boss after inspecting subagent_status. Omit for a new hierarchy." })),
+		}, { additionalProperties: false }),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const taskId = randomUUID();
+			const taskId = selectComputerTaskLeaderAgentId(params.agentId);
 			const coordinatorRunId = randomUUID();
 			const { ComputerAgentCoordinator, ProcedureHostRuntime, runComputerWorkerWithStallDeadline } = await loadComputerAgentModule();
 			const discovery = discoverAgents(ctx.cwd, "user");
@@ -5171,7 +5218,7 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 				const effectiveSignal = signal && childSignal ? AbortSignal.any([signal, childSignal]) : signal ?? childSignal;
 				const result = await runSingleAgent(ctx.cwd, computerAgents, agentName, task, undefined, undefined, effectiveSignal, undefined,
 					(results) => ({ mode: "single", agentScope: "user", projectAgentsDir: discovery.projectAgentsDir, results }),
-					{ ...options, ...(leader ? { agentId: taskId, parentAgentId: PIPIUI_PARENT, depth: PIPIUI_DEPTH + 1 } : { parentAgentId: taskId, depth: PIPIUI_DEPTH + 2 }), sessionModel, background: false, fresh: true });
+					{ ...options, ...(leader ? { agentId: taskId, parentAgentId: PIPIUI_PARENT, depth: PIPIUI_DEPTH + 1, retainContext: true, fresh: false } : { parentAgentId: taskId, depth: PIPIUI_DEPTH + 2 }), sessionModel, background: false });
 				if (result.exitCode !== 0 || result.errorMessage) throw Object.assign(new Error(result.errorMessage || result.stderr || `${agentName} failed`), {
 					agentId: result.agentId, runId: result.runId, resolvedModel: result.model, hadMessages: result.messages.length > 0,
 				});
@@ -5199,12 +5246,23 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 			let leaderCoordinating = false;
 			const repairRejectedPlan = async (goal: string, output: string, phase: "initial" | "recovery"): Promise<ComputerPlan> => {
 				let candidate = output;
+				const seenCandidateFingerprints = new Set<string>();
 				for (let attempt = 0; ; attempt += 1) {
+					const fingerprint = candidateFingerprint(candidate);
+					if (seenCandidateFingerprints.has(fingerprint)) {
+						const repeated: ComputerPlanAdmissionDiagnostic = {
+							code: "plan_repair_stalled",
+							summary: "Leader 再次返回了已经被拒绝的同一份计划，本轮没有产生新的修复方案。",
+							leaderInstruction: "主 Agent 应先查看该 Leader 与相关 Worker 的历史任务和结果，再判断是继续这个 Leader、换一条执行路线，还是在上下文已经固化错误时启动新的 Leader。",
+						};
+						throw new ComputerPlanInvestigationError(repeated, attempt + 1);
+					}
+					seenCandidateFingerprints.add(fingerprint);
 					try {
 						return computerPlanFromOutput(candidate, goal);
 					} catch (error) {
 						const diagnostic = diagnoseComputerPlanAdmissionFailure(error);
-						if (attempt >= PLAN_ADMISSION_REPAIR_LIMIT) throw new ComputerPlanInvestigationError(diagnostic, attempt + 1);
+						if (seenCandidateFingerprints.size >= PLAN_ADMISSION_MAX_DISTINCT_CANDIDATES) throw new ComputerPlanInvestigationError(diagnostic, attempt + 1);
 						candidate = await runChild("computer-use-leader", [
 							`The Host rejected your ${phase === "initial" ? "initial" : "recovery"} plan before any new worker was dispatched. Investigate the rejected plan yourself, then return a corrected complete JSON plan only.`,
 							`Admission diagnosis: ${JSON.stringify({ code: diagnostic.code, explanation: diagnostic.summary, correction: diagnostic.leaderInstruction })}`,
@@ -5270,6 +5328,8 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 							"For file content mutation, call terminal_write_file directly with the exact requested path and content. Do not use terminal_execute with printf, echo, a shell, >, or >>; argv is literal. Do not add or remove a trailing newline unless the goal explicitly requests it.",
 							"Return the role's required final JSON only. Do not include raw file contents or terminal output in the summary.",
 						].join("\n"), {
+							agentId: computerWorkerAgentId(taskId, "computer-terminal"),
+							retainContext: true,
 							title: "Terminal Computer Task",
 							computerWorker: { role, environment: terminalEnvironment, extensionPath: COMPUTER_TERMINAL_EXTENSION, toolNames: ["terminal_read_file", "terminal_write_file", "terminal_file_status", "terminal_execute"] },
 							privateSkillPaths: privateComputerSkills(["terminal-investigation", "procedure-learning"]),
@@ -5301,6 +5361,9 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 						catch (error) { throw stageError("gui_private_resource_failed", error); }
 						let text: string;
 						try { text = await runComputerWorkerWithStallDeadline(() => runChild(agentName, objective, {
+							...(role === "verifier"
+								? { fresh: true }
+								: { agentId: computerWorkerAgentId(taskId, "operator"), retainContext: true }),
 							title: role === "verifier" ? "Verify Computer Task" : "Operate Computer Task",
 							computerWorker: { role, environment: issued.environment, extensionPath: COMPUTER_WORKER_EXTENSION, toolNames: toolNamesForComputerWorkerRole(role) },
 								privateSkillPaths,
@@ -5811,6 +5874,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent Status",
 		description: [
 			"Query subagent job status (running / ok / failed / aborted / interrupted), including the exact runId required to resolve an old failed episode safely.",
+			"The unfiltered view also includes persisted historical worker task/result summaries after process or Boss restart, so the Boss can inspect exact prior work and choose an agentId semantically instead of creating duplicates.",
 			"An interrupted worker is not a failed one: re-dispatch its agentId to continue where it left off instead of starting someone cold.",
 			"Use on every [subagent-done] event before any user-facing conclusion: inspect all jobs, keep user-facing progress and summaries silent while related work remains running or stalled, and close out only after the whole related goal is terminal.",
 			"Prefer reading finished results via this tool or [subagent-done] over spawning a new agent for the same work.",
@@ -5841,7 +5905,8 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
-			"Modes: single (task + agent, or task + previously bound taskKey), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Modes: single (task + agent), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Before dispatching related work, inspect subagent_status: it includes persisted task/result history. Decide semantically whether to continue an exact prior agentId or create a new worker; the runtime never maps prose to a task key.",
 			"Optional thinking is accepted per single/task/chain step; it applies only to that dispatch, never inherits Boss thinking, and v1 intentionally has no per-task model. The dynamic system prompt shows each agent's configured model/fallback chain and allowed levels.",
 			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
 			"While the fan-out philosophy layer is active, background=false is ignored at boss depth — asynchronous dispatch is that layer's premise, not a preference. Use chain for genuinely ordered synchronous steps.",
@@ -5865,15 +5930,6 @@ export default function (pi: ExtensionAPI) {
 			// One invocation is one wave, however many tasks it carries — that is the unit the
 			// fan-out layer plans in, so it is the unit the ledger's rows are grouped by.
 			beginWave();
-			const keyed = params.tasks ?? (params.task ? [{ agent: params.agent, task: params.task, title: params.title, agentId: params.agentId, taskKey: params.taskKey }] : []);
-			for (const item of keyed) {
-				if (!item.taskKey) continue;
-				const route = agentIdentityForTaskKey(item.taskKey, item.agentId, item.agent, item.task, item.title);
-				if (route.problem) return { content: [{ type: "text", text: route.problem }], details: null, isError: true };
-				item.agentId = route.agentId;
-				item.agent = route.name;
-				if (!params.tasks) { params.agentId = route.agentId; params.agent = route.name; }
-			}
 			const sessionModel = formatCtxModel(
 				(ctx as { model?: { provider?: string; id?: string } } | undefined)?.model,
 			);

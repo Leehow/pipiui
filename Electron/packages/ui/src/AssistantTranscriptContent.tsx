@@ -6,7 +6,7 @@ import { parseSubagentNotice } from './subagent-notice'
 import { toolArgsSummary, toolDisplaySummary, formatToolInput } from './tool-summary'
 import { formatCompactTokens } from './session-stats-format'
 
-export type TranscriptTool = { id: string; name: string; input: string; result?: string; error?: boolean; startedAt: number; finished?: boolean }
+export type TranscriptTool = { id: string; name: string; input: string; result?: string; error?: boolean; startedAt: number; finished?: boolean; images?: { data: string; mimeType: string }[] }
 export type AssistantTranscriptMessage = { content: string; thinking?: string; tools?: TranscriptTool[]; streaming?: boolean }
 
 function elapsed(startedAt: number) { return `${Math.max(0, Math.round((Date.now() - startedAt) / 1000))}s` }
@@ -33,6 +33,7 @@ const TranscriptToolCard = memo(function TranscriptToolCard({ tool, streaming, e
   // what the agent is doing. No remount-on-finish key: the card preserves its
   // expand state until the outer step card remounts at turn settle.
   return <ActivityCard kind="tool" summary={summary} meta={meta} error={Boolean(tool.error)} defaultExpanded={expandSteps || streaming || !tool.finished}>
+    {tool.images && tool.images.length > 0 && <div className="tool-images">{tool.images.map((img, i) => <img key={i} className="tool-screenshot" src={`data:${img.mimeType};base64,${img.data}`} alt="工具截图" loading="lazy" />)}</div>}
     {tool.input && <div className="tool-io"><div className="tool-io-label">输入</div><pre>{formatToolInput(tool.name, tool.input)}</pre></div>}
     {tool.result && <div className="tool-io"><div className="tool-io-label">输出</div><div className="tool-result">{tool.result}</div></div>}
   </ActivityCard>

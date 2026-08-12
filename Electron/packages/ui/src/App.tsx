@@ -1308,6 +1308,7 @@ export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
       const tool = cards.get(entry.toolCallId)!
       tool.result = entry.content
       tool.error = entry.isError
+      if (entry.images) tool.images = entry.images
       continue
     }
     messages.push({ id: entry.id, role: entry.role, content: entry.content })
@@ -1327,7 +1328,7 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
     if (tool) tool.input += event.delta ?? ''
     else updated.tools!.push({ id: event.toolCallId, name: event.name, input: event.delta ?? '', startedAt: Date.now() })
   }
-  if (event.type === 'tool_result') { const tool = updated.tools!.find(item => item.id === event.toolCallId); if (tool) Object.assign(tool, { result: event.content, error: event.isError, finished: true }) }
+  if (event.type === 'tool_result') { const tool = updated.tools!.find(item => item.id === event.toolCallId); if (tool) Object.assign(tool, { result: event.content, error: event.isError, finished: true, images: event.images }) }
   next[next.length - 1] = updated
   return next
 }

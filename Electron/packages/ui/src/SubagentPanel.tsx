@@ -5,7 +5,7 @@ import { toolActivitySummary, toolArgsSummary } from './tool-summary'
 import { DismissibleError } from './DismissibleError'
 import { ProviderLogo } from './ProviderLogo'
 import { providerBrand, type ProviderBrand } from './provider-logo'
-import { AssistantTranscriptContent, type AssistantTranscriptMessage } from './AssistantTranscriptContent'
+import { AssistantTranscriptContent, type AssistantTranscriptMessage, type TranscriptTool } from './AssistantTranscriptContent'
 import genericAgentIcon from './sf-icons/person-2.png'
 import type { AgentEvent, AgentState, AgentSummary, CostUnit, PipiHostAPI, WorktreeStatus } from '@pipi/host-api'
 
@@ -286,6 +286,8 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
   const [follow, setFollow] = useState(true)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
+	const [abortError, setAbortError] = useState('')
+	const [abortingIds, setAbortingIds] = useState<Set<string>>(() => new Set())
   const [now, setNow] = useState(() => Date.now())
   const loadGeneration = useRef(0)
   const selected = agents.find(agent => agent.agentId === selectedId)
@@ -321,6 +323,8 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
     setAgents([])
     setSelectedId(undefined)
     setPage(0)
+		setAbortError('')
+		setAbortingIds(new Set())
     void load()
     const off = host.subscribeAgents(event => setAgents(current => sessionScopedEvent(current, event, sessionId)
       ? applyAgentEvent(current, event)
@@ -392,6 +396,22 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
     const status = action === 'merge' ? await host.mergeWorktree(agentId) : await host.discardWorktree(agentId)
     setAgents(current => applyAgentEvent(current, { type: 'worktree', status }))
   }
+	const abort = async (agent: Agent) => {
+		if (abortingIds.has(agent.agentId)) return
+		setAbortError('')
+		setAbortingIds(current => new Set(current).add(agent.agentId))
+		try {
+			await host.abortAgent(agent.agentId)
+		} catch (error) {
+			setAbortError(`无法停止 ${agentDisplayName(agent)}：${error instanceof Error ? error.message : '停止请求失败'}`)
+		} finally {
+			setAbortingIds(current => {
+				const next = new Set(current)
+				next.delete(agent.agentId)
+				return next
+			})
+		}
+	}
   const clearFinished = () => {
     setAgents(current => current.filter(isActive))
     setPage(0)
@@ -412,6 +432,7 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
 
   return <section className="subagents" data-testid="subagent-panel">
     <SubagentHeader total={agents.length} {...summary} pricing={pricing} onClear={clearFinished} />
+		{abortError && <div className="subagent-abort-error"><DismissibleError message={abortError} onDismiss={() => setAbortError('')} /></div>}
     {loading
       ? <div className="subagent-loading" role="status"><span className="agent-spinner" aria-hidden="true" />正在加载 subagents…</div>
       : loadError
@@ -425,8 +446,9 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
                 agent={agent}
 				childCount={agents.filter(candidate => candidate.parentId === agent.agentId).length}
                 selected={agent.agentId === selectedId}
+				aborting={abortingIds.has(agent.agentId)}
                 onSelect={() => setSelectedId(agent.agentId)}
-                onAbort={() => void host.abortAgent(agent.agentId)}
+				onAbort={() => void abort(agent)}
                 onResolve={() => void host.resolveAgent(agent.agentId).then(() => setAgents(current => current.map(item => item.agentId === agent.agentId ? { ...item, handled: true } : item)))}
               />)}
               {ordered.length > pageSize && <div className="agent-pager">
@@ -436,7 +458,7 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
               </div>}
             </div>
             <div className="subagent-divider" aria-label="调整 agent 列表高度" role="separator" onPointerDown={startDrag} />
-            <AgentDetail agent={selected} now={now} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onCheck={check} onWorktree={worktree} onAbort={agentId => void host.abortAgent(agentId)} />
+			<AgentDetail agent={selected} aborting={Boolean(selected && abortingIds.has(selected.agentId))} now={now} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onCheck={check} onWorktree={worktree} onAbort={agent => void abort(agent)} />
           </div>}
   </section>
 }
@@ -542,10 +564,11 @@ function SubagentHeader({ total, running, failed, handled, cost, pricing, onClea
   </header>
 }
 
-function AgentRow({ agent, childCount, selected, onSelect, onAbort, onResolve }: {
+function AgentRow({ agent, childCount, selected, aborting, onSelect, onAbort, onResolve }: {
   agent: Agent
 	childCount: number
   selected: boolean
+	aborting: boolean
   onSelect: () => void
   onAbort: () => void
   onResolve: () => void
@@ -574,18 +597,19 @@ function AgentRow({ agent, childCount, selected, onSelect, onAbort, onResolve }:
         <small>{subtitle}</small>
       </span>
     </button>
-    {active && <button aria-label={`中止 ${agent.name}`} title="中止 agent" className="agent-control abort" onClick={onAbort}>■</button>}
+    {active && <button aria-label={`${aborting ? '正在中止' : '中止'} ${agent.name}`} title={aborting ? '正在中止 agent' : '中止 agent'} className="agent-control abort" disabled={aborting} onClick={onAbort}>{aborting ? <span className="agent-spinner" aria-hidden="true" /> : '■'}</button>}
     {handled && <button aria-label={`标记 ${agent.name} 已处理`} title="标记已处理" className="agent-control resolve" onClick={onResolve}>标记已处理</button>}
   </article>
 }
 
-function AgentDetail({ agent, now, retainedWorktreeDispositionAvailable, onCheck, onWorktree, onAbort }: {
+function AgentDetail({ agent, aborting, now, retainedWorktreeDispositionAvailable, onCheck, onWorktree, onAbort }: {
   agent?: Agent
+	aborting: boolean
   now: number
   retainedWorktreeDispositionAvailable: boolean
   onCheck: (agent: Agent) => void
   onWorktree: (agentId: string, action: 'merge' | 'discard') => void
-  onAbort: (agentId: string) => void
+  onAbort: (agent: Agent) => void
 }) {
   if (!agent) return <div className="agent-detail empty">选择一个 agent 查看详情</div>
   const reviewable = agent.worktree?.lifecycle === 'pendingReview'
@@ -604,7 +628,7 @@ function AgentDetail({ agent, now, retainedWorktreeDispositionAvailable, onCheck
     </header>
     <p className="agent-closeout">{agent.closeout ? `收尾　${agent.closeout}` : `${stateText(agent)}${agent.worktree ? `　${worktreeText(agent.worktree)}` : ''}`}</p>
     <div className="agent-transcript-scroll" data-testid="subagent-transcript-scroll">
-      {isActive(agent) && <div className="agent-running-activity"><span className="agent-spinner" aria-hidden="true" />正在执行 · {activity}<button onClick={() => onAbort(agent.agentId)}>停止</button></div>}
+      {isActive(agent) && <div className="agent-running-activity"><span className="agent-spinner" aria-hidden="true" />正在执行 · {activity}<button disabled={aborting} onClick={() => onAbort(agent)}>{aborting ? '正在停止' : '停止'}</button></div>}
       <div className="agent-transcript" data-testid="subagent-transcript">
         {transcript.map((message, index) => <article className="message assistant-message" key={`${agent.runId}-transcript-${index}`}><AssistantTranscriptContent message={message} expandSteps /></article>)}
       </div>

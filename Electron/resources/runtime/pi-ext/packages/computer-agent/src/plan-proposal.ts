@@ -13,7 +13,7 @@ export type NormalizedComputerPostcondition =
  * actionable explanation for a user nor a safe retry instruction.
  */
 export type ComputerPlanAdmissionDiagnostic = {
-  code: "path_not_preserved" | "terminal_policy_invalid" | "terminal_objective_invalid" | "postconditions_invalid" | "success_conditions_invalid" | "required_role_missing" | "plan_schema_invalid";
+  code: "path_not_preserved" | "terminal_policy_invalid" | "terminal_objective_invalid" | "postconditions_invalid" | "success_conditions_invalid" | "required_role_missing" | "plan_schema_invalid" | "plan_repair_stalled";
   summary: string;
   leaderInstruction: string;
 };
