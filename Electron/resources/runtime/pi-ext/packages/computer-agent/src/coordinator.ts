@@ -66,13 +66,19 @@ export const COMPUTER_WORKER_FAILURE_CODES = [
   "gui_child_prestart_failed", "gui_child_failed", "gui_child_stalled", "computer_worker_dispatch_failed",
 	"computer_worker_runtime_timeout", "computer_worker_request_cancelled",
 	"computer_worker_no_progress",
+	"terminal_path_policy_rejected", "terminal_command_policy_rejected",
+	"terminal_request_invalid", "terminal_operation_failed",
+	"computer_leader_stalled",
 ] as const;
 export type ComputerWorkerFailureCode = typeof COMPUTER_WORKER_FAILURE_CODES[number];
+
+export const COMPUTER_WORKER_STALL_TIMEOUT_MS = 150_000;
+export const COMPUTER_LEADER_STALL_TIMEOUT_MS = 120_000;
 
 export async function runComputerWorkerWithStallDeadline<T>(
   run: () => Promise<T>,
   onStalled: () => void,
-  timeoutMs = 150_000,
+  timeoutMs = COMPUTER_WORKER_STALL_TIMEOUT_MS,
 ): Promise<T> {
   const operation = Promise.resolve().then(run);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -80,6 +86,26 @@ export async function runComputerWorkerWithStallDeadline<T>(
     timer = setTimeout(() => {
       try { onStalled(); } catch { /* The closed failure still wins if best-effort abort reporting fails. */ }
       reject(Object.assign(new Error("gui_child_stalled"), { failureCode: "gui_child_stalled" as const }));
+    }, Math.max(10, timeoutMs));
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export async function runComputerLeaderWithStallDeadline<T>(
+  run: () => Promise<T>,
+  onStalled: () => void,
+  timeoutMs = COMPUTER_LEADER_STALL_TIMEOUT_MS,
+): Promise<T> {
+  const operation = Promise.resolve().then(run);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<T>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      try { onStalled(); } catch { /* The closed failure still wins if best-effort abort reporting fails. */ }
+      reject(Object.assign(new Error("computer_leader_stalled"), { failureCode: "computer_leader_stalled" as const }));
     }, Math.max(10, timeoutMs));
   });
   try {
@@ -309,14 +335,15 @@ export class ComputerAgentCoordinator {
       this.#emit({ type: "task_finished", taskId, outcome: blocked.outcome });
       return blocked;
     };
+    const finishCancelled = () => {
+      const verification = taskVerification();
+      const cancelled = this.#result("cancelled", "Computer Task cancelled", revisions, verification, investigation("cancelled", "task_cancelled", verification));
+      this.#emit({ type: "task_finished", taskId, outcome: cancelled.outcome });
+      return cancelled;
+    };
 
     while (true) {
-      if (signal?.aborted) {
-        const verification = taskVerification();
-        const cancelled = this.#result("cancelled", "Computer Task cancelled", revisions, verification, investigation("cancelled", "task_cancelled", verification));
-        this.#emit({ type: "task_finished", taskId, outcome: cancelled.outcome });
-        return cancelled;
-      }
+      if (signal?.aborted) return finishCancelled();
       const step = plan.steps.find((candidate) =>
         !completed.has(candidate.id)
         && candidate.dependsOn.every((dependency) => completed.has(dependency))
@@ -347,6 +374,7 @@ export class ComputerAgentCoordinator {
         ...(step.terminalPolicy ? { terminalPolicy: step.terminalPolicy } : {}),
         grants: grantsForComputerRole(step.role),
       }, signal);
+      if (signal?.aborted) return finishCancelled();
       const result = dispatched.workerResult;
       executed.push({ stepId: step.id, role: step.role, outcome: result.outcome, artifactReferences: result.artifactReferences, hostExecutionRecords: dispatched.hostExecutionRecords });
       const attempt: NonNullable<ComputerTaskResult["investigation"]>["workerAttempts"][number] = {
@@ -367,7 +395,8 @@ export class ComputerAgentCoordinator {
           ? verifiedConditionResults(step.postconditions, `${step.id}:condition`)
           : evaluatePostconditions(step.postconditions, result.observation, `${step.id}:condition`);
         if (verification.status === "verified" && result.observation?.id) verificationObservationIds.add(result.observation.id);
-        if (verification.status === "unknown") {
+        if (verification.status === "unknown" && step.postconditions.every((condition) => condition.kind !== "file_exists")) {
+          if (signal?.aborted) return finishCancelled();
           const verified = await this.#dispatch({
             taskId,
             stepId: `${step.id}-verify`,
@@ -377,6 +406,7 @@ export class ComputerAgentCoordinator {
             grants: grantsForComputerRole("verifier"),
             observation: result.observation,
           }, signal);
+          if (signal?.aborted) return finishCancelled();
           const verifierAttempt: NonNullable<ComputerTaskResult["investigation"]>["workerAttempts"][number] = {
             stepId: `${step.id}-verify`,
             role: "verifier",
@@ -421,6 +451,7 @@ export class ComputerAgentCoordinator {
 
       let recoveryObservation = result.observation;
       if (result.outcome === "outcome_unknown") {
+        if (signal?.aborted) return finishCancelled();
         const observed = await this.#dispatch({
           taskId,
           stepId: `${step.id}-observe-after-unknown`,
@@ -429,6 +460,7 @@ export class ComputerAgentCoordinator {
           postconditions: step.postconditions,
           grants: grantsForComputerRole("verifier"),
         }, signal);
+        if (signal?.aborted) return finishCancelled();
         const verifierAttempt: NonNullable<ComputerTaskResult["investigation"]>["workerAttempts"][number] = {
           stepId: `${step.id}-observe-after-unknown`,
           role: "verifier",
@@ -472,6 +504,7 @@ export class ComputerAgentCoordinator {
               : result.outcome === "blocked" ? "worker_blocked" : "worker_failed");
         return finishBlocked("recovery_exhausted", code, taskVerification(), "Computer Task replan budget exhausted");
       }
+      if (signal?.aborted) return finishCancelled();
       try {
         plan = await this.#planner.replan({
           plan,
@@ -479,8 +512,10 @@ export class ComputerAgentCoordinator {
           result,
           observation: recoveryObservation,
         });
+        if (signal?.aborted) return finishCancelled();
         this.#validatePlan(plan);
       } catch {
+        if (signal?.aborted) return finishCancelled();
         const verification = taskVerification();
         const blocked: ComputerTaskResult = {
           outcome: "blocked",

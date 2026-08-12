@@ -35,6 +35,25 @@ async function loadComputerWorkerOutcomeParser() {
   return new Function(`${javascript}\nreturn computerWorkerOutcomeFromOutput;`)();
 }
 
+async function loadComputerWorkerFailureCodeParser() {
+  const source = await readFile(subagentURL, "utf8");
+  const start = source.indexOf("function parseComputerJSON(");
+  const end = source.indexOf("function validateTerminalPolicyBoundary", start);
+  assert.ok(start >= 0 && end > start, "Computer Worker failure parser seam must remain discoverable");
+  const javascript = ts.transpileModule(source.slice(start, end), {
+    compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  return new Function(
+    "COMPUTER_WORKER_FAILURE_CODES",
+    `${javascript}\nreturn computerWorkerFailureCodeFromOutput;`,
+  )([
+    "terminal_path_policy_rejected",
+    "terminal_command_policy_rejected",
+    "terminal_request_invalid",
+    "terminal_operation_failed",
+  ]);
+}
+
 async function loadComputerVerifierAttestationParser() {
   const source = await readFile(subagentURL, "utf8");
   const start = source.indexOf("function parseComputerJSON(");
@@ -124,8 +143,16 @@ test("captured Operator prose FAIL cannot be promoted to completed", async () =>
   assert.equal(parse(captured), "failed");
   assert.equal(parse('{"outcome":"completed"}'), "completed");
   assert.equal(parse('{"outcome":"blocked"}'), "blocked");
+  assert.equal(parse('{"status":"blocked","failureCode":"terminal_path_policy_rejected"}'), "blocked");
   assert.equal(parse('{"summary":"missing outcome"}'), "failed");
   assert.equal(parse('{"outcome":"completed"}', true), "outcome_unknown");
+});
+
+test("actual worker verdict parser preserves only closed Terminal diagnostics", async () => {
+  const parseFailureCode = await loadComputerWorkerFailureCodeParser();
+  assert.equal(parseFailureCode('{"outcome":"blocked","failureCode":"terminal_path_policy_rejected"}'), "terminal_path_policy_rejected");
+  assert.equal(parseFailureCode('{"outcome":"blocked","failureCode":"private raw path /Users/example"}'), undefined);
+  assert.equal(parseFailureCode("not json"), undefined);
 });
 
 test("Verifier output admits only exact requested closed postcondition attestations", async () => {
@@ -547,6 +574,8 @@ test("GUI dispatch exposes only closed lifecycle failure stages to Leader recove
 	assert.match(source, /computerRuntimeRequest\(\{ action: "computer_cancel" \}\)/);
 	assert.match(source, /computerWorkerFatalCodes\.get\(workerKey\).*gui_child_failed/s);
 	assert.match(source, /runComputerWorkerWithStallDeadline/);
+	assert.match(source, /deadlineAt = Date\.now\(\) \+ COMPUTER_WORKER_STALL_TIMEOUT_MS/);
+	assert.match(source, /privateSkillPaths,[\s\S]*deadlineAt/);
 });
 
 test("bundled read-only Operator uses direct placement and cannot hit writable agentId admission", async () => {
@@ -581,6 +610,10 @@ test("Computer Task binds hostile same-name shadows to exact canonical private r
 
 test("Computer Use Leader remains coordinating between private planning calls until all foreground children reconcile", async () => {
   const source = await readFile(subagentURL, "utf8");
+  assert.match(source, /runComputerLeaderWithStallDeadline/);
+  assert.match(source, /deadlineAt = Date\.now\(\) \+ COMPUTER_LEADER_STALL_TIMEOUT_MS/);
+  assert.match(source, /runChild\("computer-use-leader", task, \{ \.\.\.options, deadlineAt \}/);
+  assert.match(source, /const runLeader = async[\s\S]*leaderController\.abort\(\)/);
   assert.match(source, /markComputerLeaderCoordinating/);
   assert.match(source, /plan:\s*async[\s\S]*await markComputerLeaderCoordinating\(\)/);
   assert.match(source, /replan:\s*async[\s\S]*await markComputerLeaderCoordinating\(\)/);
@@ -598,6 +631,23 @@ test("Computer Use Leader remains coordinating between private planning calls un
   const coordinatorRun = source.indexOf('await coordinator.run');
   assert.ok(finalSummary > coordinatorRun, "final Leader completion must happen only after coordinator awaited all children");
 	assert.match(source, /if \(leaderCoordinating\) await postTerminalPipiuiReport\(\{ kind: "end"[\s\S]*?Computer Task failed/);
+	assert.match(source, /computer_leader_stalled[\s\S]*subagent_status[\s\S]*leaderAgentId/);
+});
+
+test("Terminal Worker final contract preserves closed failures without reporting blocked work as completed", async () => {
+	const [source, definition] = await Promise.all([
+		readFile(subagentURL, "utf8"),
+		readFile(new URL("../../Sources/PipiUI/PiExt/agents/computer-terminal/AGENT.md", import.meta.url), "utf8"),
+	]);
+	assert.match(definition, /"outcome":"completed\|blocked\|failed"/);
+	assert.match(definition, /Use `outcome`, never `status`/);
+	assert.match(definition, /preserve that exact code in `failureCode`/);
+	const terminalBranchStart = source.indexOf('if (role === "terminal-worker")');
+	const terminalBranchEnd = source.indexOf("const stageError", terminalBranchStart);
+	assert.ok(terminalBranchStart >= 0 && terminalBranchEnd > terminalBranchStart);
+	const terminalBranch = source.slice(terminalBranchStart, terminalBranchEnd);
+	assert.match(terminalBranch, /computerWorkerOutcomeFromOutput\(text\)/);
+	assert.match(terminalBranch, /computerWorkerFailureCodeFromOutput\(text\)/);
 });
 
 test("Computer Task continuity is Boss-selected and role-aware instead of taskKey routing or fresh workers", async () => {

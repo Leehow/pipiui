@@ -2,11 +2,20 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { registerComputerTerminalHostTools } from "./terminal-host-tools.ts";
+import type { TerminalBrokerFailureCode } from "./terminal-broker.ts";
 import type { TerminalStepPolicy } from "./terminal-policy.ts";
 
 type ObservedFile = { path: string; exists: boolean; type?: string; digest?: string };
 type Entry = { taskId: string; stepId: string; runId: string; tools: Map<string, any>; records: HostTerminalExecutionRecord[]; observedFiles: Map<string, ObservedFile>; controllers: Set<AbortController> };
 export type HostTerminalExecutionRecord = { kind: "write_parameterized_file"; path: string; byteLength: number; contentDigest: string; observationId: string; observedAt: string };
+
+function closedFailureCode(error: unknown): TerminalBrokerFailureCode {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/path|root|symlink|hard link|file identity/i.test(message)) return "terminal_path_policy_rejected";
+  if (/command|executable|argv|budget|GUI substitution/i.test(message)) return "terminal_command_policy_rejected";
+  if (/request|JSON|too large|invalid terminal_/i.test(message)) return "terminal_request_invalid";
+  return "terminal_operation_failed";
+}
 
 export class TerminalWorkerBrokerServer {
   #server?: Server; #url?: string; readonly #entries = new Map<string, Entry>();
@@ -34,7 +43,7 @@ export class TerminalWorkerBrokerServer {
         else if (body.operation === "status") { projected = { operation: "status", artifactId, exists: details.exists === true, ...(details.type ? { kind: details.type } : {}), ...(Number.isInteger(details.size) ? { byteLength: details.size } : {}) }; entry.observedFiles.set(String(body.path), { path: String(body.path), exists: details.exists === true, ...(typeof details.type === "string" ? { type: details.type } : {}) }); }
         else projected = { operation: "execute", artifactId, exitCode: Number(details.exitCode ?? 0), stdoutDigest: createHash("sha256").update(String(details.stdout ?? "")).digest("hex"), stderrDigest: createHash("sha256").update(String(details.stderr ?? "")).digest("hex"), truncated: details.truncated === true };
         response.end(JSON.stringify(projected));
-      } catch (error) { response.statusCode = 400; response.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) })); }
+      } catch (error) { response.statusCode = 400; response.end(JSON.stringify({ ok: false, code: closedFailureCode(error) })); }
     });
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); }); });
     this.#server = server; const address = server.address() as AddressInfo; this.#url = `http://127.0.0.1:${address.port}/v1/terminal-worker`; return this.#url;

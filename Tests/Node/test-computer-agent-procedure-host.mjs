@@ -46,6 +46,11 @@ test("registered computer_task keeps natural-language goal UX plus optional exac
   assert.match(source, /recordCoordinatorExecution/);
   assert.match(source, /procedureContext\.application/);
   assert.match(source, /procedureContext\.parameters/);
+  assert.match(source, /runningComputerTasks\.set\(taskId, \{ runId: coordinatorRunId, controller: taskController \}\)/);
+  assert.match(source, /const computerTask = runningComputerTasks\.get\(agentId\)[\s\S]{0,160}computerTask\.controller\.abort\(\)/);
+  assert.match(source, /coordinator\.run\(\{ goal: params\.goal, taskId \}, taskSignal\)/);
+  assert.match(source, /result\.outcome === "cancelled"[\s\S]{0,300}aborted: true[\s\S]{0,160}Computer Task cancelled/);
+  assert.match(source, /runningComputerTasks\.get\(taskId\)\?\.runId === coordinatorRunId[\s\S]{0,120}runningComputerTasks\.delete\(taskId\)/);
 });
 
 test("real Terminal child tools proxy to one-run Host execution and authoritative audit", async () => {
@@ -58,6 +63,9 @@ test("real Terminal child tools proxy to one-run Host execution and authoritativ
     assert.equal(await readFile(output, "utf8"), "after");
     const records = server.consumeExecutions("task", "step"); assert.equal(records.length, 1); assert.equal(records[0].path, output); assert.doesNotMatch(JSON.stringify(records), /after/);
     server.revokeStep("task", "step");
-    await assert.rejects(tools.find(({ name }) => name === "terminal_file_status").execute("status", { path: output }), /rejected request|401/i);
+    await assert.rejects(
+      tools.find(({ name }) => name === "terminal_file_status").execute("status", { path: output }),
+      (error) => error?.message === "terminal_operation_failed" && error?.code === "terminal_operation_failed",
+    );
   } finally { await server.stop(); }
 });

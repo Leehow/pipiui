@@ -10,6 +10,18 @@ export type TerminalBrokerResult =
   | { operation: "status"; artifactId: string; exists: boolean; kind?: "file" | "directory" | "other"; byteLength?: number; digest?: string }
   | { operation: "execute"; artifactId: string; exitCode: number; stdoutDigest?: string; stderrDigest?: string; truncated: boolean };
 
+export const TERMINAL_BROKER_FAILURE_CODES = [
+  "terminal_path_policy_rejected",
+  "terminal_command_policy_rejected",
+  "terminal_request_invalid",
+  "terminal_operation_failed",
+] as const;
+export type TerminalBrokerFailureCode = typeof TERMINAL_BROKER_FAILURE_CODES[number];
+
+export function isTerminalBrokerFailureCode(value: unknown): value is TerminalBrokerFailureCode {
+  return typeof value === "string" && (TERMINAL_BROKER_FAILURE_CODES as readonly string[]).includes(value);
+}
+
 export type TerminalBrokerTransport = (input: {
   endpoint: string;
   token: string;

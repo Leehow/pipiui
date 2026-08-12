@@ -78,8 +78,9 @@ async function canonicalRoots(roots: string[]): Promise<string[]> {
   for (const root of roots) {
     if (!isAbsolute(root)) throw new Error("terminal bounded roots must be absolute");
     const configured = await lstat(root);
-    if (configured.isSymbolicLink()) throw new Error(`terminal bounded root symlink is forbidden: ${root}`);
     const canonical = await realpath(root);
+    const trustedMacOSTmpAlias = process.platform === "darwin" && resolve(root) === "/tmp" && canonical === "/private/tmp";
+    if (configured.isSymbolicLink() && !trustedMacOSTmpAlias) throw new Error(`terminal bounded root symlink is forbidden: ${root}`);
     const metadata = await lstat(canonical);
     if (!metadata.isDirectory()) throw new Error(`terminal bounded root is not a directory: ${root}`);
     values.push(canonical);

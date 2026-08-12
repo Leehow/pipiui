@@ -1,4 +1,4 @@
-import type { TerminalBrokerRequest, TerminalBrokerResult, TerminalBrokerTransport } from "../src/terminal-broker.ts";
+import { isTerminalBrokerFailureCode, type TerminalBrokerRequest, type TerminalBrokerResult, type TerminalBrokerTransport } from "../src/terminal-broker.ts";
 
 type RegisteredTool = { name: string; label: string; description: string; parameters: Record<string, unknown>; execute(id: string, params: any, signal?: AbortSignal): Promise<any> };
 type PiLike = { registerTool(tool: RegisteredTool): void };
@@ -32,8 +32,12 @@ function decodeResult(value: unknown, operation: TerminalBrokerRequest["operatio
 
 const fetchTransport: TerminalBrokerTransport = async ({ endpoint, token, request, signal }) => {
   const response = await fetch(endpoint, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(request), signal });
-  if (!response.ok) throw new Error(`Terminal broker rejected request (${response.status})`);
-  return decodeResult(await response.json(), request.operation);
+  const body = await response.json().catch(() => undefined);
+  if (!response.ok) {
+    const code = isTerminalBrokerFailureCode((body as any)?.code) ? (body as any).code : "terminal_operation_failed";
+    throw Object.assign(new Error(code), { code });
+  }
+  return decodeResult(body, request.operation);
 };
 
 export function toolNamesForTerminalWorkerRole(): string[] { return ["terminal_read_file", "terminal_write_file", "terminal_file_status", "terminal_execute"]; }

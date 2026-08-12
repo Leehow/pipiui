@@ -31,10 +31,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import type {
-	ComputerPlan,
-	ComputerWorkerDispatch,
-	ComputerWorkerResult,
+
+import {
+	COMPUTER_WORKER_FAILURE_CODES,
+	type ComputerPlan,
+	type ComputerWorkerFailureCode,
+	type ComputerWorkerDispatch,
+	type ComputerWorkerResult,
 } from "../packages/computer-agent/src/index.ts";
 import { normalizeTerminalPolicyProposal } from "../packages/computer-agent/src/terminal-policy.ts";
 import { diagnoseComputerPlanAdmissionFailure, normalizeComputerPostconditionProposals, normalizeTerminalWorkerObjective, validateComputerPlanGoalBindings, type ComputerPlanAdmissionDiagnostic } from "../packages/computer-agent/src/plan-proposal.ts";
@@ -1058,6 +1061,8 @@ interface RunSingleAgentOptions {
 	fresh?: boolean;
 	/** Keep this role's conversation even when it is read-only. Authority and memory are separate. */
 	retainContext?: boolean;
+	/** Host-owned absolute deadline surfaced to UIs; it never grants the child more runtime. */
+	deadlineAt?: number;
 	/** Explicit per-task Computer Use grant; omission = no desktop tools. */
 	desktop?: "user-requested" | "ui-verify";
 	/** Runtime-owned scoped Computer Agent worker route; never model/frontmatter supplied. */
@@ -1901,6 +1906,14 @@ function abortRunningAgent(agentId: string): { ok: boolean; message: string } {
 		return {
 			ok: true,
 			message: `Dropped queued agentId=${agentId} before it started; no process ran and no [subagent-done] will arrive for it.`,
+		};
+	}
+	const computerTask = runningComputerTasks.get(agentId);
+	if (computerTask) {
+		computerTask.controller.abort();
+		return {
+			ok: true,
+			message: `Abort requested for the whole Computer Task agentId=${agentId}; planning, active workers, recovery, and verification will stop together.`,
 		};
 	}
 	const job = jobRegistry.get(agentId);
@@ -4004,6 +4017,7 @@ async function runSingleAgent(
 		depth: options?.depth ?? PIPIUI_DEPTH + 1,
 		model: resolvedModel ?? null,
 		...(options?.title ? { title: options.title } : {}),
+		...(options?.deadlineAt ? { deadlineAt: options.deadlineAt } : {}),
 		...(isBackground ? { background: true } : {}),
 		...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
 		...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
@@ -4937,6 +4951,7 @@ let computerAgentModule: Promise<ComputerAgentModule> | undefined;
 let computerWorkerBrokerServer: InstanceType<ComputerAgentModule["ComputerWorkerBrokerServer"]> | undefined;
 const computerWorkerFatalControllers = new Map<string, AbortController>();
 const computerWorkerFatalCodes = new Map<string, "computer_worker_runtime_timeout" | "computer_worker_request_cancelled" | "computer_worker_no_progress" | "gui_child_stalled">();
+const runningComputerTasks = new Map<string, { runId: string; controller: AbortController }>();
 const computerWorkerKey = (taskId: string, stepId: string) => `${taskId}\u0000${stepId}`;
 
 function loadComputerAgentModule(): Promise<ComputerAgentModule> {
@@ -4989,12 +5004,22 @@ function computerWorkerOutcomeFromOutput(
 ): "verified" | "outcome_unknown" | "blocked" | "failed" | "completed" {
 	if (hostOutcomeUnknown) return "outcome_unknown";
 	try {
-		const outcome = parseComputerJSON(text)?.outcome;
+		const output = parseComputerJSON(text);
+		const outcome = output?.outcome ?? output?.status;
 		return ["verified", "outcome_unknown", "blocked", "failed", "completed"].includes(outcome)
 			? outcome
 			: "failed";
 	} catch {
 		return "failed";
+	}
+}
+
+function computerWorkerFailureCodeFromOutput(text: string): ComputerWorkerFailureCode | undefined {
+	try {
+		const failureCode = parseComputerJSON(text)?.failureCode;
+		return COMPUTER_WORKER_FAILURE_CODES.includes(failureCode) ? failureCode : undefined;
+	} catch {
+		return undefined;
 	}
 }
 
@@ -5207,7 +5232,12 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const taskId = selectComputerTaskLeaderAgentId(params.agentId);
 			const coordinatorRunId = randomUUID();
-			const { ComputerAgentCoordinator, ProcedureHostRuntime, runComputerWorkerWithStallDeadline } = await loadComputerAgentModule();
+			const taskController = new AbortController();
+			const taskSignal = signal ? AbortSignal.any([signal, taskController.signal]) : taskController.signal;
+			if (runningComputerTasks.has(taskId)) throw new Error(`Computer Task agentId=${taskId} is already running`);
+			runningComputerTasks.set(taskId, { runId: coordinatorRunId, controller: taskController });
+			try {
+			const { ComputerAgentCoordinator, ProcedureHostRuntime, COMPUTER_LEADER_STALL_TIMEOUT_MS, COMPUTER_WORKER_STALL_TIMEOUT_MS, runComputerLeaderWithStallDeadline, runComputerWorkerWithStallDeadline } = await loadComputerAgentModule();
 			const discovery = discoverAgents(ctx.cwd, "user");
 			const canonicalDiscovery = discoverBundledAgentsFromDirectory(fileURLToPath(new URL("../agents", import.meta.url)));
 			if (canonicalDiscovery.diagnostics.some((entry) => entry.severity === "error")) throw new Error("Canonical Computer Agent roles failed validation");
@@ -5215,7 +5245,7 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 			const sessionModel = formatCtxModel(ctx.model);
 			const runChild = async (agentName: string, task: string, options: RunSingleAgentOptions = {}, childSignal?: AbortSignal) => {
 				const leader = agentName === "computer-use-leader";
-				const effectiveSignal = signal && childSignal ? AbortSignal.any([signal, childSignal]) : signal ?? childSignal;
+				const effectiveSignal = childSignal ? AbortSignal.any([taskSignal, childSignal]) : taskSignal;
 				const result = await runSingleAgent(ctx.cwd, computerAgents, agentName, task, undefined, undefined, effectiveSignal, undefined,
 					(results) => ({ mode: "single", agentScope: "user", projectAgentsDir: discovery.projectAgentsDir, results }),
 					{ ...options, ...(leader ? { agentId: taskId, parentAgentId: PIPIUI_PARENT, depth: PIPIUI_DEPTH + 1, retainContext: true, fresh: false } : { parentAgentId: taskId, depth: PIPIUI_DEPTH + 2 }), sessionModel, background: false });
@@ -5223,6 +5253,15 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 					agentId: result.agentId, runId: result.runId, resolvedModel: result.model, hadMessages: result.messages.length > 0,
 				});
 				return getFinalOutput(result.messages) || result.stderr;
+			};
+			const runLeader = async (task: string, options: RunSingleAgentOptions = {}) => {
+				const leaderController = new AbortController();
+				const deadlineAt = Date.now() + COMPUTER_LEADER_STALL_TIMEOUT_MS;
+				return runComputerLeaderWithStallDeadline(
+					() => runChild("computer-use-leader", task, { ...options, deadlineAt }, leaderController.signal),
+					() => leaderController.abort(),
+					COMPUTER_LEADER_STALL_TIMEOUT_MS,
+				);
 			};
 			const markComputerLeaderCoordinating = async () => {
 				await postPipiuiReport({
@@ -5263,7 +5302,7 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 					} catch (error) {
 						const diagnostic = diagnoseComputerPlanAdmissionFailure(error);
 						if (seenCandidateFingerprints.size >= PLAN_ADMISSION_MAX_DISTINCT_CANDIDATES) throw new ComputerPlanInvestigationError(diagnostic, attempt + 1);
-						candidate = await runChild("computer-use-leader", [
+						candidate = await runLeader([
 							`The Host rejected your ${phase === "initial" ? "initial" : "recovery"} plan before any new worker was dispatched. Investigate the rejected plan yourself, then return a corrected complete JSON plan only.`,
 							`Admission diagnosis: ${JSON.stringify({ code: diagnostic.code, explanation: diagnostic.summary, correction: diagnostic.leaderInstruction })}`,
 							`Rejected plan candidate: ${truncateTextHead(candidate, 24 * 1024)}`,
@@ -5279,14 +5318,14 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 			};
 			const planner = {
 				plan: async (goal: string) => {
-					const output = await runChild("computer-use-leader", `Plan this Computer Task: ${goal}`, {
+					const output = await runLeader(`Plan this Computer Task: ${goal}`, {
 						privateSkillPaths: privateComputerSkills(["computer-task-planning"]), title: "Plan Computer Task",
 					});
 					await markComputerLeaderCoordinating();
 					return repairRejectedPlan(goal, output, "initial");
 				},
 				replan: async ({ plan, failedStep, result, observation }: any) => {
-					const output = await runChild("computer-use-leader", [
+					const output = await runLeader([
 						`Revise this Computer Task plan after real failure. Goal: ${plan.goal}`,
 						`Previous plan: ${JSON.stringify(plan)}`,
 						`Failed step: ${JSON.stringify(failedStep)}`,
@@ -5336,12 +5375,14 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 						});
 								const records = terminalBroker.consumeExecutions(request.taskId, request.stepId);
 								const observedFiles = terminalBroker.consumeFileObservations(request.taskId, request.stepId);
-								let outcome: "verified" | "blocked" | "failed" | "completed" = "completed";
-								try {
-									const parsed = parseComputerJSON(text);
-									outcome = parsed.outcome === "verified" ? "verified" : parsed.outcome === "blocked" ? "blocked" : parsed.outcome === "failed" ? "failed" : "completed";
-								} catch { /* Host-owned typed effects remain authoritative when worker prose is malformed. */ }
-								return { workerResult: { outcome, summary: "Terminal Worker completed", observation: observedFiles.length ? { id: records.at(-1)?.observationId ?? `file:${randomUUID()}`, files: observedFiles } : undefined }, hostExecutionRecords: records.map((record) => ({ ...record, role: "terminal-worker" })) };
+								const hostEffectsSatisfyPostconditions = request.postconditions.length > 0 && request.postconditions.every((condition) =>
+									condition.kind === "file_exists" && observedFiles.some((file) => file.path === condition.path && file.exists),
+								);
+								// Host-owned typed effects remain authoritative: a malformed or pessimistic
+								// worker verdict cannot cause an already-proven write to run twice.
+								const outcome = hostEffectsSatisfyPostconditions ? "completed" : computerWorkerOutcomeFromOutput(text);
+								const failureCode = hostEffectsSatisfyPostconditions ? undefined : computerWorkerFailureCodeFromOutput(text);
+								return { workerResult: { outcome, summary: `Terminal Worker ${outcome}`, ...(failureCode ? { failureCode } : {}), observation: observedFiles.length ? { id: records.at(-1)?.observationId ?? `file:${randomUUID()}`, files: observedFiles } : undefined }, hostExecutionRecords: records.map((record) => ({ ...record, role: "terminal-worker" })) };
 							} finally { terminalBroker.revokeStep(request.taskId, request.stepId); }
 					}
 					const stageError = (failureCode: string, error: unknown) => Object.assign(new Error(error instanceof Error ? error.message : String(error)), { failureCode });
@@ -5360,6 +5401,7 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 						try { privateSkillPaths = role === "verifier" ? privateComputerSkills(["desktop-verification"]) : privateComputerSkills(["cua-driver-operation", "desktop-investigation"]); }
 						catch (error) { throw stageError("gui_private_resource_failed", error); }
 						let text: string;
+						const deadlineAt = Date.now() + COMPUTER_WORKER_STALL_TIMEOUT_MS;
 						try { text = await runComputerWorkerWithStallDeadline(() => runChild(agentName, objective, {
 							...(role === "verifier"
 								? { fresh: true }
@@ -5367,10 +5409,11 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 							title: role === "verifier" ? "Verify Computer Task" : "Operate Computer Task",
 							computerWorker: { role, environment: issued.environment, extensionPath: COMPUTER_WORKER_EXTENSION, toolNames: toolNamesForComputerWorkerRole(role) },
 								privateSkillPaths,
+								deadlineAt,
 							}, workerController.signal), () => {
 								computerWorkerFatalCodes.set(workerKey, "gui_child_stalled");
 								workerController.abort();
-							}, 150_000); } catch (error) {
+							}, COMPUTER_WORKER_STALL_TIMEOUT_MS); } catch (error) {
 								const diagnostic = error as { agentId?: string; runId?: string; resolvedModel?: string; hadMessages?: boolean };
 								const failureCode = computerWorkerFatalCodes.get(workerKey) ?? (diagnostic.hadMessages ? "gui_child_failed" : "gui_child_prestart_failed");
 							if (diagnostic.agentId && diagnostic.runId) {
@@ -5406,10 +5449,10 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 				const policy = { isSensitiveApplication: (application: { bundleId: string; appName: string }) => /(?:keychain|1password|password|systempreferences|systemsettings)/i.test(`${application.bundleId} ${application.appName}`) };
 				procedureRuntime = await ProcedureHostRuntime.open({ storePath: procedureStorePath, policy, adapters: {
 					evaluate: async (condition: any, _phase: any, parameters: Record<string, unknown>, observation?: { id: string }) => {
-						if (signal?.aborted) return { met: false, observationId: `cancelled:${randomUUID()}`, observedAt: new Date().toISOString() };
+						if (taskSignal.aborted) return { met: false, observationId: `cancelled:${randomUUID()}`, observedAt: new Date().toISOString() };
 						if (condition.kind === "file_exists") { const file = String(parameters[condition.pathParameter] ?? ""); return { met: !!file && fs.existsSync(file), observationId: `file:${randomUUID()}`, observedAt: new Date().toISOString() }; }
 						let raw = observation ? observations.get(observation.id) : undefined;
-						if (!raw) raw = await computerRuntimeRequest({ action: "computer_batch", actions: [{ type: "screenshot" }] }, signal);
+						if (!raw) raw = await computerRuntimeRequest({ action: "computer_batch", actions: [{ type: "screenshot" }] }, taskSignal);
 						const ref = observationFrom(raw); const elements = Array.isArray(raw?.accessibility?.elements) ? raw.accessibility.elements : [];
 						const met = condition.kind === "application_available" ? [raw?.target?.bundle_identifier, raw?.target?.bundleId].includes(condition.bundleId)
 							: condition.kind === "element_exists" ? elements.some((item: any) => item.role === condition.locator.role && item.name === (condition.locator.nameLiteral ?? parameters[condition.locator.nameParameter]))
@@ -5433,14 +5476,18 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 						return { ok: true, observation: observationFrom(await computerRuntimeRequest({ action: "computer_batch", actions: [action] }, replaySignal)) };
 					},
 				} });
-				const replay = await procedureRuntime.run({ intent: params.goal.trim(), bundleId: procedureContext.application.bundleId, parameters: procedureContext.parameters, taskId, runId: randomUUID(), qualifyCandidate: procedureContext.qualification === true }, signal).catch(() => ({ outcome: "fallback_to_agent" as const }));
+				const replay = await procedureRuntime.run({ intent: params.goal.trim(), bundleId: procedureContext.application.bundleId, parameters: procedureContext.parameters, taskId, runId: randomUUID(), qualifyCandidate: procedureContext.qualification === true }, taskSignal).catch(() => ({ outcome: "fallback_to_agent" as const }));
 				if (replay.outcome === "succeeded") { leaderCoordinating = false; await postTerminalPipiuiReport({ kind: "end", agentId: taskId, runId: coordinatorRunId, ok: true, output: "Computer Task completed" }); return { content: [{ type: "text", text: JSON.stringify({ outcome: "succeeded", summary: "Computer Task completed", verification: { status: "verified", conditionResults: [] }, planRevisions: 0 }) }], details: { outcome: "succeeded", summary: "Computer Task completed", verification: { status: "verified", conditionResults: [] }, planRevisions: 0 } }; }
 				if (replay.outcome === "drift" && "procedureId" in replay) repairsProcedureId = replay.procedureId;
 			}
 			const coordinator = new ComputerAgentCoordinator({ planner, dispatcher, ...(procedureRuntime ? { procedureLearning: { recordVerifiedExecution: (input: any) => procedureRuntime!.recordCoordinatorExecution({ ...input, ...(repairsProcedureId ? { repairsProcedureId } : {}) }).then(() => undefined) } } : {}) });
-				const result = await coordinator.run({ goal: params.goal, taskId }, signal);
+				const result = await coordinator.run({ goal: params.goal, taskId }, taskSignal);
 				leaderCoordinating = false;
-				const leaderSummary = await runChild("computer-use-leader", [
+				if (result.outcome === "cancelled") {
+					await postTerminalPipiuiReport({ kind: "end", agentId: taskId, runId: coordinatorRunId, ok: false, aborted: true, output: "Computer Task cancelled" });
+					return { content: [{ type: "text", text: "Computer Task cancelled" }], details: result };
+				}
+				const leaderSummary = await runLeader([
 					`Give the main agent the final result of this Computer Task. Goal: ${params.goal}`,
 					`Coordinator result: ${JSON.stringify(result)}`,
 					"Before concluding, reconcile investigation.workerAttempts with investigation.failedConditions. Preserve completed subordinate work, name the first missing evidence category, and never claim that nothing ran when the ledger shows completed attempts.",
@@ -5456,15 +5503,38 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 					await postTerminalPipiuiReport({ kind: "end", agentId: taskId, runId: coordinatorRunId, ok: false, output: `Computer Task plan admission blocked: ${error.diagnostic.code}` });
 					return computerPlanInvestigationReport(error);
 				}
-				if (leaderCoordinating) await postTerminalPipiuiReport({ kind: "end", agentId: taskId, runId: coordinatorRunId, ok: false, output: signal?.aborted ? "Computer Task cancelled" : "Computer Task failed" });
+				if ((error as { failureCode?: unknown })?.failureCode === "computer_leader_stalled") {
+					leaderCoordinating = false;
+					await postTerminalPipiuiReport({ kind: "end", agentId: taskId, runId: coordinatorRunId, ok: false, output: "Computer Task paused: computer_leader_stalled" });
+					const summary = "Computer Use Leader 长时间没有响应，当前规划调用已安全停止。主 Agent 应先调用 subagent_status 查看这个 Leader 及其下属的任务和结果，再根据证据使用同一个 Leader agentId 继续，或改走其他可行路线。";
+					return {
+						content: [{ type: "text", text: summary }],
+						details: {
+							outcome: "blocked" as const,
+							summary,
+							leaderAgentId: taskId,
+							investigation: {
+								stage: "leader_runtime",
+								code: "computer_leader_stalled",
+								nextAction: "Call subagent_status, inspect this Leader and its children, then retry with the same leaderAgentId when the evidence supports continuing.",
+							},
+							verification: { status: "unknown" as const, conditionResults: [] },
+							planRevisions: 0,
+						},
+					};
+				}
+				if (leaderCoordinating) await postTerminalPipiuiReport({ kind: "end", agentId: taskId, runId: coordinatorRunId, ok: false, ...(taskSignal.aborted ? { aborted: true } : {}), output: taskSignal.aborted ? "Computer Task cancelled" : "Computer Task failed" });
 				throw error;
 			} finally {
 				broker?.revokeTask(taskId);
 				terminalBroker?.revokeTask(taskId);
 				await terminalBroker?.stop().catch(() => {});
-				if (signal?.aborted) {
+				if (taskSignal.aborted) {
 					await computerRuntimeRequest({ action: "computer_cancel" }).catch(() => {});
 				}
+			}
+			} finally {
+				if (runningComputerTasks.get(taskId)?.runId === coordinatorRunId) runningComputerTasks.delete(taskId);
 			}
 		},
 	});

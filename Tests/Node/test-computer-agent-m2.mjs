@@ -1,13 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  COMPUTER_LEADER_STALL_TIMEOUT_MS,
+  COMPUTER_WORKER_STALL_TIMEOUT_MS,
   ComputerAgentCoordinator,
   evaluatePostconditions,
   projectComputerWorkerResult,
+  runComputerLeaderWithStallDeadline,
   runComputerWorkerWithStallDeadline,
 } from "../../Sources/PipiUI/PiExt/packages/computer-agent/src/coordinator.ts";
 import {
@@ -300,12 +303,27 @@ test("Terminal Worker has no desktop grants, environment, tools, or GUI substitu
 });
 
 test("a silent GUI child is aborted and returned to Leader recovery as a closed stalled failure", async () => {
+  assert.equal(COMPUTER_WORKER_STALL_TIMEOUT_MS, 150_000);
   let aborted = 0;
   let resolveLate;
   const late = new Promise((resolve) => { resolveLate = resolve; });
   await assert.rejects(
     runComputerWorkerWithStallDeadline(() => late, () => { aborted += 1; }, 10),
     (error) => error?.message === "gui_child_stalled" && error?.failureCode === "gui_child_stalled",
+  );
+  assert.equal(aborted, 1);
+  resolveLate("late private result");
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
+test("a silent Computer Use Leader is aborted and returned to the Boss as a closed stalled failure", async () => {
+  assert.equal(COMPUTER_LEADER_STALL_TIMEOUT_MS, 120_000);
+  let aborted = 0;
+  let resolveLate;
+  const late = new Promise((resolve) => { resolveLate = resolve; });
+  await assert.rejects(
+    runComputerLeaderWithStallDeadline(() => late, () => { aborted += 1; }, 10),
+    (error) => error?.message === "computer_leader_stalled" && error?.failureCode === "computer_leader_stalled",
   );
   assert.equal(aborted, 1);
   resolveLate("late private result");
@@ -413,6 +431,66 @@ test("live-shaped terminal_write_file receipt remains observable after execution
   } finally { await server.stop(); }
 });
 
+test("Terminal Worker accepts the standard macOS /tmp alias through its authenticated broker", async (t) => {
+  if (process.platform !== "darwin") return t.skip("macOS /tmp alias contract");
+  const root = await mkdtemp("/tmp/pipiui-terminal-alias-");
+  const file = join(root, "result.txt");
+  const server = new TerminalWorkerBrokerServer();
+  await server.start();
+  try {
+    const issued = server.issue({ taskId: "tmp-alias", stepId: "write", runId: "run", policy: { cwd: "/tmp", writeRoots: ["/tmp"], allowedExecutables: ["/usr/bin/stat"], maxCommands: 1 } });
+    const tools = [];
+    registerComputerTerminalTools({ registerTool: (tool) => tools.push(tool) }, issued.environment);
+    const result = await tools.find(({ name }) => name === "terminal_write_file").execute("write", { path: file, content: "exact-no-newline" });
+    assert.deepEqual(result.details, { operation: "write", artifactId: result.details.artifactId, digest: result.details.digest, byteLength: 16, written: true });
+    assert.equal(await readFile(file, "utf8"), "exact-no-newline");
+  } finally {
+    await server.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Terminal Worker receives a closed path-policy failure code instead of an opaque HTTP 400", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pipiui-terminal-boundary-"));
+  const outside = join(tmpdir(), `pipiui-terminal-outside-${Date.now()}.txt`);
+  const server = new TerminalWorkerBrokerServer();
+  await server.start();
+  try {
+    const issued = server.issue({ taskId: "closed-error", stepId: "write", runId: "run", policy: { cwd: root, writeRoots: [root], allowedExecutables: ["/usr/bin/stat"], maxCommands: 1 } });
+    const tools = [];
+    registerComputerTerminalTools({ registerTool: (tool) => tools.push(tool) }, issued.environment);
+    await assert.rejects(
+      tools.find(({ name }) => name === "terminal_write_file").execute("write", { path: outside, content: "must-not-write" }),
+      (error) => error?.message === "terminal_path_policy_rejected" && error?.code === "terminal_path_policy_rejected",
+    );
+  } finally {
+    await server.stop();
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { force: true });
+  }
+});
+
+test("Terminal Worker rejects arbitrary symlink roots while retaining only the standard macOS /tmp alias", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pipiui-terminal-symlink-root-"));
+  const target = await mkdtemp(join(parent, "target-"));
+  const linkedRoot = join(parent, "linked-root");
+  await symlink(target, linkedRoot);
+  const server = new TerminalWorkerBrokerServer();
+  await server.start();
+  try {
+    const issued = server.issue({ taskId: "symlink-root", stepId: "write", runId: "run", policy: { cwd: linkedRoot, writeRoots: [linkedRoot], allowedExecutables: ["/usr/bin/stat"], maxCommands: 1 } });
+    const tools = [];
+    registerComputerTerminalTools({ registerTool: (tool) => tools.push(tool) }, issued.environment);
+    await assert.rejects(
+      tools.find(({ name }) => name === "terminal_write_file").execute("write", { path: join(linkedRoot, "forbidden.txt"), content: "must-not-write" }),
+      (error) => error?.code === "terminal_path_policy_rejected",
+    );
+  } finally {
+    await server.stop();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("planned task dispatches Terminal Worker before dependent GUI and keeps worker reports compressed", async () => {
   const dispatches = [];
   const coordinator = new ComputerAgentCoordinator({
@@ -445,6 +523,26 @@ test("planned task dispatches Terminal Worker before dependent GUI and keeps wor
   assert.equal(result.outcome, "succeeded");
   assert.deepEqual(dispatches.map(({ role }) => role), ["terminal-worker", "gui-operator"]);
   assert.doesNotMatch(JSON.stringify(result), /x{100}|screenshot|accessibility|base64/i);
+});
+
+test("unknown file evidence returns to Leader recovery without dispatching a desktop Verifier", async () => {
+  const roles = [];
+  const coordinator = new ComputerAgentCoordinator({
+    maxReplans: 0,
+    planner: {
+      plan: async (goal) => ({
+        goal,
+        mode: "planned",
+        successConditions: [{ kind: "file_exists", path: "/tmp/missing.txt" }],
+        steps: [{ id: "terminal", role: "terminal-worker", objective: "write file", dependsOn: [], postconditions: [{ kind: "file_exists", path: "/tmp/missing.txt" }], terminalPolicy }],
+      }),
+      replan: async () => { throw new Error("replan budget is zero"); },
+    },
+    dispatcher: { dispatch: async (request) => { roles.push(request.role); return { outcome: "completed", summary: "no host file evidence" }; } },
+  });
+  const result = await coordinator.run({ goal: "write missing file" });
+  assert.equal(result.outcome, "blocked");
+  assert.deepEqual(roles, ["terminal-worker"]);
 });
 
 test("invalid recovery Leader output preserves the real worker failure as a bounded terminal result", async () => {
@@ -657,6 +755,39 @@ test("a failed Operator can be investigated and replaced without losing successf
     "gui-operator:open-file-recovery",
     "verifier:verify-file-recovery",
   ]);
+});
+
+test("cancelling the root Computer Task after a worker returns stops recovery and replanning", async () => {
+  const controller = new AbortController();
+  let replans = 0;
+  const events = [];
+  const coordinator = new ComputerAgentCoordinator({
+    planner: {
+      plan: async (goal) => ({
+        goal,
+        mode: "direct",
+        successConditions: [{ kind: "visible_text", contains: "done" }],
+        steps: [{ id: "operator", role: "gui-operator", objective: "finish the task", dependsOn: [], postconditions: [{ kind: "visible_text", contains: "done" }] }],
+      }),
+      replan: async () => {
+        replans += 1;
+        throw new Error("cancelled task must not replan");
+      },
+    },
+    dispatcher: {
+      dispatch: async () => {
+        controller.abort();
+        return { outcome: "failed", summary: "active worker stopped" };
+      },
+    },
+    onEvent: (event) => events.push(event),
+  });
+
+  const result = await coordinator.run({ goal: "finish the task", taskId: "cancel-whole-task" }, controller.signal);
+  assert.equal(result.outcome, "cancelled");
+  assert.equal(result.investigation?.code, "task_cancelled");
+  assert.equal(replans, 0);
+  assert.deepEqual(events.at(-1), { type: "task_finished", taskId: "cancel-whole-task", outcome: "cancelled" });
 });
 
 test("subjective task evidence rejects a verifier observation reused from an earlier worker", async () => {
@@ -1025,6 +1156,7 @@ test("closed worker failure projection retains only an allowlisted GUI stage cod
   const projected = projectComputerWorkerResult({ outcome: "failed", summary: raw, failureCode: "gui_private_resource_failed" });
   assert.deepEqual(projected, { outcome: "failed", summary: "Worker failed", failureCode: "gui_private_resource_failed" });
   assert.equal(projectComputerWorkerResult({ outcome: "failed", summary: raw, failureCode: "computer_worker_runtime_timeout" }).failureCode, "computer_worker_runtime_timeout");
+  assert.equal(projectComputerWorkerResult({ outcome: "blocked", summary: raw, failureCode: "terminal_path_policy_rejected" }).failureCode, "terminal_path_policy_rejected");
   assert.equal(JSON.stringify(projected).includes("private.txt"), false);
   assert.equal(projectComputerWorkerResult({ outcome: "failed", summary: raw, failureCode: raw }).failureCode, undefined);
 });
