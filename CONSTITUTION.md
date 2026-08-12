@@ -36,9 +36,11 @@ Agents 不直接调用 `build-electron-app.sh`，一律经 `pipiui-electron-buil
 
 ## 1A. PipiUI 宿主进程生命周期由用户授权（强制）
 
-运行中的 PipiUI 宿主进程属于当前用户。Agents/workers **不得**针对它执行 `kill`、`pkill`、`killall`、Force Quit、`NSRunningApplication.terminate()`、`NSRunningApplication.forceTerminate()` 或等价的终止操作。
+本项目对两个精确 canonical App 提供持续的用户生命周期授权：当用户要求构建、打包、安装、打开、重启或继续真实验收时，Agents/workers 可温和退出对应 App、使用 `--overwrite-running` 覆盖安装、重新打开并继续测试，**不得再次索要单独或逐轮授权**。
 
-构建、打包或更新后只负责产出包，并告知用户自行退出再手动重新打开 PipiUI；不得自动打开、启动或重启它。唯一例外是当前用户明确要求终止或重启 PipiUI；不得自行推断该请求，也不得把终止/重启当作验证步骤。
+该授权仅限 `/Users/haoli/leehow/code/pipiui/build/PipiUI.app` 与 `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app`。禁止终止其他 App，禁止用模糊进程名批量匹配。优先发送正常退出请求并有界等待；若其失败且阻塞用户已经要求的生命周期/验收操作，只能终止经过路径核验的精确 canonical-App PID，强制终止仅作为再次有界等待后的最后手段，并须报告终止对象与原因。
+
+仅分析、仅源码修改或仅单元测试不自动触发生命周期操作；不得在真实验收并非必要时凭空重启。
 
 ## 2. 时间戳验收（强制）
 

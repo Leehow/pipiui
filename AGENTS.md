@@ -23,13 +23,19 @@
 
 ### User-authorized PipiUI host lifecycle (binding)
 
-- The running PipiUI host process belongs to the current user. Agents/workers must never
-  execute `kill`, `pkill`, `killall`, Force Quit, `NSRunningApplication.terminate()`,
-  `NSRunningApplication.forceTerminate()`, or an equivalent mechanism against it.
-- After a build, package, or update, package only and tell the user to quit and reopen PipiUI
-  manually; never automatically open, launch, or relaunch it.
-- The sole exception is an explicit current-user request to terminate or restart PipiUI. Never
-  infer that request or invent termination/restart as a verification step.
+- This repository has standing user authorization for the exact canonical PipiUI Apps. A request
+  to build, package, install, open, restart, or continue live acceptance testing authorizes the
+  agent to gracefully quit the relevant canonical App, pass `--overwrite-running`, install the
+  replacement, relaunch it, and continue the requested test. Do not ask for a separate or repeated
+  overwrite/restart confirmation.
+- Scope this authority to `/Users/haoli/leehow/code/pipiui/build/PipiUI.app` and
+  `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app` only. Never terminate unrelated Apps
+  or broad process-name matches.
+- Prefer the App's normal quit request and a bounded wait. If that fails and blocks an already
+  requested lifecycle/test operation, terminate only the exact verified canonical-App PID; force
+  termination is a last resort after another bounded wait. Record what was terminated and why.
+- Analysis-only, source-only, or test-only requests do not imply a lifecycle operation. Do not
+  invent restarts when they are unnecessary for the requested result.
 
 Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may create runnable Apps.** All other linked/temporary worktrees must verify with `swift build` / `swift test` or Electron workspace builds only and must never create `build/PipiUI.app` or `build/PipiUI Electron.app`.
 
@@ -62,8 +68,9 @@ invoke `electron-builder` by hand, and do not call
 ~/.codex/skills/pipiui-electron-build/scripts/pipiui-electron-build release   # dual arch + DMG/ZIP
 ```
 
-The skill is the only path that carries the packaging invariants: it refuses to
-overwrite a running canonical App, cleans its own staging tree (leaked
+The skill is the only path that carries the packaging invariants: it requires
+`--overwrite-running` for a running canonical App (the standing lifecycle authorization above
+allows the agent to supply it whenever packaging or live acceptance was requested), cleans its own staging tree (leaked
 `.electron-fast-*` directories previously grew `build/` past 9GB), exports the
 `PIPIUI_EMBEDDED_RUNTIME_TARGET` that selects the per-architecture Cua driver
 slice, and checks the result against a size budget. A single-architecture App is
@@ -72,6 +79,19 @@ is a regression to report, not a heavier build to ship. Read the skill's
 `SKILL.md` before changing anything under `Electron/apps/electron/package.json`
 `build`, `scripts/fetch-pi-runtime.mjs`, or `scripts/fetch-cua-driver.mjs` —
 each holds a slimming invariant that an innocuous-looking edit silently undoes.
+
+### npm 在本机会经代理死锁（binding）
+
+本机 `HTTP_PROXY`/`HTTPS_PROXY` 指向 `127.0.0.1:6152`。npm 默认 `maxsockets=15`
+经它会死锁：连接建立后被静默丢弃且收不到 FIN，npm 逐个等满 `fetch-timeout`。
+
+`Electron/.npmrc` 已钉死 `maxsockets=3`，`scripts/fetch-pi-runtime.mjs` 里那次
+`--prefix` 安装另行显式传参（它跑在 .npmrc 作用域之外）。**不要移除这些限制，
+也不要改用户的全局 npm 或代理配置。** 从别处调 npm 时自己带上 `--maxsockets 3`。
+
+识别方法：卡死时 `node_modules` 与 `~/.npm/_cacache` 零写入、累计 CPU 时间冻结、
+数百条 ESTABLISHED socket。**registry 全程可达（3-4 秒），所以连通性测试查不出来**
+—— 要看 CPU 时间和写入量，别看能不能 ping 通。
 
 ### 快速打包（快速迭代）
 
