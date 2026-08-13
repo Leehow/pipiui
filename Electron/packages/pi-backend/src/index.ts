@@ -1,7 +1,7 @@
 import { ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
 import { createReadStream, existsSync, readFileSync, promises as fs } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 import {
@@ -12,6 +12,7 @@ import {
   type AuthLoginEvent,
   type AuthProviderInfo,
   type AuthType,
+  type DocumentContent,
   type HostBackend,
   type HostEvent,
   type HostMethod,
@@ -97,6 +98,55 @@ export {
   type BridgeHandlers,
 } from "./bridge.js";
 export { DEFAULT_FEATURES } from "./features.js";
+
+const MAX_MARKDOWN_DOCUMENT_BYTES = 2 * 1024 * 1024;
+
+async function readMarkdownDocument(input: unknown): Promise<DocumentContent> {
+  if (typeof input !== "string" || !input.trim())
+    throw new Error("document path is required");
+  const path = input.trim();
+  if (!isAbsolute(path)) throw new Error("document path must be absolute");
+  const extension = extname(path).toLowerCase();
+  if (extension !== ".md" && extension !== ".markdown")
+    throw new Error("only .md and .markdown documents can be opened");
+
+  let handle;
+  try {
+    handle = await fs.open(path, "r");
+  } catch (error: any) {
+    if (error?.code === "ENOENT") throw new Error(`Markdown document does not exist: ${path}`);
+    throw new Error(`cannot open Markdown document: ${path}`);
+  }
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`Markdown document is not a regular file: ${path}`);
+    if (stat.size > MAX_MARKDOWN_DOCUMENT_BYTES)
+      throw new Error(`Markdown document is too large (maximum ${MAX_MARKDOWN_DOCUMENT_BYTES} bytes)`);
+
+    // Read through the already validated handle and stop at cap+1 so a file that
+    // grows between stat and read cannot turn this IPC into an unbounded allocation.
+    const buffer = Buffer.allocUnsafe(MAX_MARKDOWN_DOCUMENT_BYTES + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, total, buffer.length - total, total);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+    }
+    if (total > MAX_MARKDOWN_DOCUMENT_BYTES)
+      throw new Error(`Markdown document is too large (maximum ${MAX_MARKDOWN_DOCUMENT_BYTES} bytes)`);
+    return {
+      id: path,
+      name: basename(path),
+      path,
+      kind: "markdown",
+      size: total,
+      updatedAt: stat.mtimeMs,
+      content: buffer.subarray(0, total).toString("utf8"),
+    };
+  } finally {
+    await handle.close();
+  }
+}
 export {
   installRuntimeTree,
   syncTree,
@@ -1138,6 +1188,11 @@ export class PiHostBackend implements HostBackend {
         return this.addProject(params[0]);
       case "removeProject":
         return this.removeProject(params[0] as string);
+      case "listDocuments":
+        // Documents are opened explicitly from transcript references; never scan a project.
+        return [];
+      case "readDocument":
+        return readMarkdownDocument(params[0]);
       case "listSessions": {
         const pid = params[0] as string;
         const paths = await this.loadProjectPaths();

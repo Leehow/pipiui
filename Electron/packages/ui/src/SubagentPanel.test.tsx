@@ -47,6 +47,22 @@ function expandTranscriptCards() {
 }
 
 describe('SubagentPanel', () => {
+
+  it('opens a Markdown reference against the selected agent worktree before the project path', async () => {
+    const harness = hostHarness()
+    const onOpenDocument = vi.fn()
+    render(<SubagentPanel host={harness.host} projectPath="/projects/main" onOpenDocument={onOpenDocument} />)
+    await screen.findByText('还没有 subagent')
+
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'docs', runId: 'docs-run', name: 'reviewer', task: 'write docs', state: 'ok', createdAt: 1, finalResult: 'Result: [report](docs/report.md)' } })
+    harness.emitAgent({ type: 'worktree', status: { agentId: 'docs', path: '/worktrees/docs', lifecycle: 'pendingReview', merge: 'ready', discard: 'ready' } })
+
+    const card = await screen.findByRole('button', { name: '打开文档 report.md' })
+    expect(card.textContent).toContain('/worktrees/docs/docs/report.md')
+    fireEvent.click(card)
+    expect(onOpenDocument).toHaveBeenCalledWith('/worktrees/docs/docs/report.md')
+  })
+
   it('links a selected agent to details, renders duration/cost, and marks a failed agent handled', async () => {
     const harness = hostHarness()
     harness.host.listAgents = async () => [

@@ -1,0 +1,4 @@
+.document-reference-cards{display:grid;gap:6px;margin-top:8px}
+.document-reference-card{display:flex;width:100%;min-width:0;align-items:center;gap:8px;padding:8px 9px;border:1px solid var(--border);border-radius:8px;background:var(--surface-raised);text-align:left}.document-reference-card:hover{border-color:color-mix(in srgb,var(--accent) 35%,var(--border));background:var(--surface-hover)}
+.document-reference-icon{flex:none;padding:3px 5px;border-radius:4px;color:var(--accent);background:var(--accent-soft);font:700 9px ui-monospace,SFMono-Regular,Menlo,monospace}
+.document-reference-copy{display:grid;min-width:0;gap:2px}.document-reference-copy b,.document-reference-copy small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.document-reference-copy b{color:var(--text-strong);font-size:11px}.document-reference-copy small{color:var(--muted);font:9px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}

@@ -1,12 +1,12 @@
 import { forwardRef, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { SubagentPanel } from './SubagentPanel'
-import { DocumentPanel, mockDocumentContents } from './DocumentPanel'
+import { DocumentPanel } from './DocumentPanel'
 import { TerminalPanel } from './TerminalPanel'
 import { BrowserPanel } from './BrowserPanel'
 import { ActivityCard as CollapsibleActivityCard } from './ActivityCard'
 import { AssistantTranscriptContent, type TranscriptTool } from './AssistantTranscriptContent'
-import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, DocumentContent, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, Project, PromptAttachment, Session, SessionLease, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
+import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, Project, PromptAttachment, Session, SessionLease, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
 import { ComputerUsePanel } from './ComputerUsePanel'
 import { RemoteConnectionPanel } from './RemoteConnectionPanel'
@@ -404,7 +404,7 @@ export function createMockHost(): PipiHostAPI {
   const history: Record<string, HistoryEntry[]> = {
     welcome: [
       { id: 'u1', role: 'user', content: '请实现 Electron 三栏主界面。', timestamp: Date.now() - 60_000 },
-      { id: 'a1', role: 'assistant', content: '我会先检查现有结构，然后完成 UI。\n\n```tsx\nexport function App() {\n  return <MainLayout />\n}\n```', timestamp: Date.now() - 50_000 }
+      { id: 'a1', role: 'assistant', content: '我会先检查现有结构，然后完成 UI。说明见 [README](README.md)。\n\n```tsx\nexport function App() {\n  return <MainLayout />\n}\n```', timestamp: Date.now() - 50_000 }
     ],
     layout: [{ id: 'u2', role: 'user', content: '左栏宽度要能持久化。', timestamp: Date.now() - 86_400_000 }],
     // pi emits one assistant message per tool round; 6 bash + 1 browser turns
@@ -439,21 +439,6 @@ export function createMockHost(): PipiHostAPI {
     { agentId: 'ui-check', runId: 'mock-3', sessionId: 'agent-run', name: 'operator', role: 'operator', title: 'UI 验收', task: '验收三栏布局与流式渲染', state: 'ok', depth: 1, createdAt: Date.now() - 30_000, endedAt: Date.now() - 5_000, cost: 0.05, costUnit: 'CNY', exchangeRate: 7.2, turns: 3, provider: 'anthropic', model: 'anthropic/claude-sonnet-4', contextTokens: 24_100, contextWindowTokens: 200_000, inputTokens: 8_300, outputTokens: 1_400, cacheTokens: 3_200, listSubtitle: '截图核对三栏对齐', finalResult: '布局验收通过：三栏对齐、消息流式渲染正常。' },
     { agentId: 'closeout', runId: 'mock-4', sessionId: 'agent-run', name: 'secretary', role: 'secretary', title: '收尾审计', task: '核对 worktree 与残留产物', state: 'ok', depth: 1, createdAt: Date.now() - 15_000, endedAt: Date.now() - 3_000, cost: 0.01, costUnit: 'CNY', exchangeRate: 7.2, turns: 1, provider: 'anthropic', model: 'anthropic/claude-sonnet-4', closeout: '已确认无残留', listSubtitle: '无未合并分支' }
   ]
-  // Mock documents are project-scoped. The `pipiui` set reuses the shared
-  // `mockDocumentContents` fixtures so the DocumentPanel fallback and the
-  // mock host agree; other projects carry their own files so switching
-  // projects visibly changes the document list.
-  const mockDocumentsByProject: Record<string, DocumentContent[]> = {
-    pipiui: mockDocumentContents,
-    website: [
-      { id: 'landing-page', name: 'landing-page.md', path: '/Users/demo/code/website/docs/landing-page.md', kind: 'markdown', size: 1420, updatedAt: Date.now() - 12 * 3_600_000, content: '# Landing page\n\n官网落地页的标题、副标题与 CTA 区块说明。' },
-      { id: 'metrics-dashboard', name: 'metrics.md', path: '/Users/demo/code/website/docs/metrics.md', kind: 'markdown', size: 980, updatedAt: Date.now() - 3 * 86_400_000, content: '# 指标仪表盘\n\n流量、转化率与留存的关键指标定义。' }
-    ],
-    design: [
-      { id: 'light-tokens', name: 'light-theme-tokens.md', path: '/Users/demo/code/design-system/docs/light-theme-tokens.md', kind: 'markdown', size: 760, updatedAt: Date.now() - 4 * 3_600_000, content: '# 浅色主题 Token\n\n--surface、--border、--text 等浅色主题变量说明。' },
-      { id: 'dark-tokens', name: 'dark-theme-tokens.md', path: '/Users/demo/code/design-system/docs/dark-theme-tokens.md', kind: 'markdown', size: 820, updatedAt: Date.now() - 4 * 3_600_000, content: '# 深色主题 Token\n\n深色主题下的表面与文本色变量说明。' }
-    ]
-  }
   // Realistic multi-provider catalog so the picker exercises provider grouping.
   // supportsImages mirrors Swift ModelInfo.supportsImages (deepseek → false).
   let mockModels: Model[] = [
@@ -522,18 +507,7 @@ export function createMockHost(): PipiHostAPI {
     resumeSession: async sessionId => sessions.find(session => session.id === sessionId)!,
     deleteSession: async () => undefined,
     getSessionHistory: async sessionId => history[sessionId] ?? [],
-    // Mock documents are project-scoped, mirroring the real backend's
-    // `listDocuments(projectId)` — switching projects lists that project's files.
-    listDocuments: async projectId => {
-      const docs = (projectId && mockDocumentsByProject[projectId]) || mockDocumentsByProject['pipiui']
-      return docs.map(({ content: _content, ...document }) => ({ ...document }))
-    },
-    readDocument: async documentId => {
-      const all = Object.values(mockDocumentsByProject).flat()
-      const document = all.find(item => item.id === documentId)
-      if (!document) throw new Error(`unknown document: ${documentId}`)
-      return { ...document }
-    },
+    readDocument: async path => ({ id: path, name: path.split('/').at(-1) ?? path, path, kind: 'markdown', content: `# ${path.split('/').at(-1) ?? 'Document'}\n\nMock host preview for ${path}.` }),
     getSessionLease: async sessionId => ({ sessionId, writable: true }),
     forceTakeoverSessionLease: async sessionId => ({ sessionId, writable: true }),
     sendPrompt: async (sessionId, prompt, attachments) => {
@@ -772,6 +746,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [computerUseOpen, setComputerUseOpen] = useState(false)
   const [remoteOpen, setRemoteOpen] = useState(false)
   const [subagentModelsOpen, setSubagentModelsOpen] = useState(false)
+  const [openedDocumentPath, setOpenedDocumentPath] = useState<string | null>(null)
   const browserOccluded = modalOpen || computerUseOpen || remoteOpen || subagentModelsOpen
   const modalVisibility = useModelVisibility(host, modelState?.model)
   const transcriptRef = useRef<VirtuosoHandle>(null)
@@ -1016,6 +991,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
 
   const sidebarCollapsed = narrowViewport ? !narrowPanes.sidebar : widths.sidebarCollapsed
   const toolsCollapsed = narrowViewport ? !narrowPanes.tools : widths.toolsCollapsed
+  const selectedProjectPath = projects.find(project => project.id === selectedProject)?.path
   useEffect(() => () => { if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current) }, [])
 
   const send = async (draft: string, attachments?: PromptAttachment[]) => {
@@ -1254,6 +1230,13 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
   }
 
+  const openDocument = useCallback((path: string) => {
+    setOpenedDocumentPath(path)
+    setActiveTab('Document')
+    if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: true }))
+    else setWidths(current => ({ ...current, toolsCollapsed: false }))
+  }, [narrowViewport])
+
   const shellClass = `pipiui-shell${isElectronChrome() ? ' titlebar-pad' : ''}${sidebarCollapsed ? ' sidebar-collapsed' : ''}${toolsCollapsed ? ' tools-collapsed' : ''}`
   return <main className={shellClass} data-theme={theme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${widths.tools}px` } as React.CSSProperties}>
     {/* hiddenInset titlebar band: draggable chrome strip (title lives in the chat header only), keeps traffic lights clear of content. */}
@@ -1264,7 +1247,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       <ChatHeader session={sessions.find(item => item.id === selectedSession)} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={sidebarCollapsed} toolsCollapsed={toolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} />
       <div className="chat-viewport" data-testid="chat-viewport">
         <ToolQuickRail activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunning={subagentsRunning} />
-        <Transcript messages={messages} transcriptRef={transcriptRef} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={waitingVisible && waitingStartedAt !== null ? { startedAt: waitingStartedAt, phase: waitingPhase, detail: waitingDetail, onStop: () => { setWaitingPhase('stopping'); if (selectedSession) void host.stop(selectedSession) } } : undefined} />
+        <Transcript messages={messages} transcriptRef={transcriptRef} documentBasePath={selectedProjectPath} onOpenDocument={openDocument} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={waitingVisible && waitingStartedAt !== null ? { startedAt: waitingStartedAt, phase: waitingPhase, detail: waitingDetail, onStop: () => { setWaitingPhase('stopping'); if (selectedSession) void host.stop(selectedSession) } } : undefined} />
       </div>
       <div className="chat-composer-stack" data-testid="chat-composer-stack">
         {sessionQueue.error && <div className="queue-operation-error" role="alert" data-testid="queue-operation-error"><span>{sessionQueue.error}</span><button aria-label="关闭队列错误" onClick={sessionQueue.dismissError}>×</button></div>}
@@ -1273,7 +1256,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       </div>
     </section>
     <ResizeHandle label="调整工具栏宽度" onPointerDown={resize('tools', widths.tools)} />
-    <ToolPanel activeTab={activeTab} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningChange={setSubagentsRunning} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={projects.find(project => project.id === selectedProject)?.path} />
+    <ToolPanel activeTab={activeTab} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningChange={setSubagentsRunning} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={openedDocumentPath} onOpenDocument={openDocument} />
     {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} current={modelState?.model ?? null} onModelState={applySelectedModelState} onClose={() => setModalOpen(false)} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} />}
@@ -1350,10 +1333,11 @@ export function finishStreamingMessage(messages: ChatMessage[]): ChatMessage[] {
 function ResizeHandle({ label, onPointerDown }: { label: string; onPointerDown: (event: React.PointerEvent) => void }) { return <div className="resize-handle" role="separator" aria-label={label} onPointerDown={onPointerDown} /> }
 function ChatHeader({ session, project, lease, host, gitAvailable, sidebarCollapsed, toolsCollapsed, onToggleSidebar, onToggleTools, onTakeover }: { session?: Session; project?: Project; lease: SessionLease | null; host: PipiHostAPI; gitAvailable: boolean; sidebarCollapsed: boolean; toolsCollapsed: boolean; onToggleSidebar: () => void; onToggleTools: () => void; onTakeover: () => void }) { const readOnly = lease !== null && !leaseCanWrite(lease); return <header className="chat-header"><button data-testid="toggle-sidebar" title={sidebarCollapsed ? '展开左栏' : '收起左栏'} aria-label={sidebarCollapsed ? '展开左栏' : '收起左栏'} aria-expanded={!sidebarCollapsed} onClick={onToggleSidebar}>≡</button><div className="chat-header-title"><strong>{session?.name ?? '新会话'}</strong>{readOnly && <span className="lease-detail">由 {leaseOwnerLabel(lease)} 运行中 · 只读 <button data-testid="lease-takeover-header" onClick={onTakeover}>强制接管</button></span>}</div><div className="chat-header-actions"><GitBranchMenu host={host} projectId={project?.id} available={gitAvailable} /><button data-testid="toggle-tools" title={toolsCollapsed ? '展开右栏' : '收起右栏'} aria-label={toolsCollapsed ? '展开右栏' : '收起右栏'} aria-expanded={!toolsCollapsed} onClick={onToggleTools}>▤</button></div></header> }
 type MessageActionHandlers = { onCopy: (message: ChatMessage) => Promise<void>; onResend: (message: ChatMessage) => void; resendDisabled: boolean; copiedId: string | null }
-function Transcript({ messages, transcriptRef, waiting, onCopy, onResend, resendDisabled, copiedId }: { messages: ChatMessage[]; transcriptRef: React.RefObject<VirtuosoHandle>; waiting?: { startedAt: number; phase: WaitingPhase; detail?: string; onStop: () => void } } & MessageActionHandlers) { const [atBottom, setAtBottom] = useState(true); const [seekingId, setSeekingId] = useState<string | null>(null); const prompts = useMemo(() => buildRailPrompts(messages), [messages]); const { activeId: viewportActiveId, containerRef } = useActivePromptId(prompts, atBottom); const activeId = seekingId ?? viewportActiveId; useEffect(() => { if (atBottom) setSeekingId(null) }, [atBottom]); const jump = (index: number, id: string) => { setSeekingId(id); transcriptRef.current?.scrollToIndex({ index, align: 'start', behavior: 'smooth' }) }; const returnLatest = () => { setSeekingId(null); transcriptRef.current?.scrollToIndex({ index: Math.max(0, messages.length - 1), align: 'end', behavior: 'smooth' }); setAtBottom(true) }; return <div className="transcript-area" ref={containerRef}><PromptRail prompts={prompts} activeId={activeId} onJump={jump} /><MessageList ref={transcriptRef} messages={messages} atBottom={atBottom} onAtBottom={setAtBottom} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} />{waiting && <WaitingPlaceholder phase={waiting.phase} startedAt={waiting.startedAt} detail={waiting.detail} onStop={waiting.onStop} />}{!atBottom && messages.length > 0 && <button className="return-latest" onClick={returnLatest}>回到最新</button>}</div> }
-const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessage[]; atBottom: boolean; onAtBottom: (value: boolean) => void } & MessageActionHandlers>(function MessageList({ messages, atBottom, onAtBottom, onCopy, onResend, resendDisabled, copiedId }, ref) { return <div className="message-list" data-testid="message-scroll"><Virtuoso ref={ref} data={messages} followOutput={() => atBottom ? 'auto' : false} atBottomStateChange={onAtBottom} alignToBottom itemContent={(index, message) => { const next = messages[index + 1]; const isTurnEnd = message.role === 'user' || (!message.streaming && (!next || next.role !== 'assistant')); return <MessageView message={message} showFooter={isTurnEnd} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copied={copiedId === message.id} /> } } /></div> }))
+type DocumentOpenProps = { documentBasePath?: string; onOpenDocument?: (path: string) => void }
+function Transcript({ messages, transcriptRef, waiting, documentBasePath, onOpenDocument, onCopy, onResend, resendDisabled, copiedId }: { messages: ChatMessage[]; transcriptRef: React.RefObject<VirtuosoHandle>; waiting?: { startedAt: number; phase: WaitingPhase; detail?: string; onStop: () => void } } & DocumentOpenProps & MessageActionHandlers) { const [atBottom, setAtBottom] = useState(true); const [seekingId, setSeekingId] = useState<string | null>(null); const prompts = useMemo(() => buildRailPrompts(messages), [messages]); const { activeId: viewportActiveId, containerRef } = useActivePromptId(prompts, atBottom); const activeId = seekingId ?? viewportActiveId; useEffect(() => { if (atBottom) setSeekingId(null) }, [atBottom]); const jump = (index: number, id: string) => { setSeekingId(id); transcriptRef.current?.scrollToIndex({ index, align: 'start', behavior: 'smooth' }) }; const returnLatest = () => { setSeekingId(null); transcriptRef.current?.scrollToIndex({ index: Math.max(0, messages.length - 1), align: 'end', behavior: 'smooth' }); setAtBottom(true) }; return <div className="transcript-area" ref={containerRef}><PromptRail prompts={prompts} activeId={activeId} onJump={jump} /><MessageList ref={transcriptRef} messages={messages} atBottom={atBottom} onAtBottom={setAtBottom} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} />{waiting && <WaitingPlaceholder phase={waiting.phase} startedAt={waiting.startedAt} detail={waiting.detail} onStop={waiting.onStop} />}{!atBottom && messages.length > 0 && <button className="return-latest" onClick={returnLatest}>回到最新</button>}</div> }
+const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessage[]; atBottom: boolean; onAtBottom: (value: boolean) => void } & DocumentOpenProps & MessageActionHandlers>(function MessageList({ messages, atBottom, onAtBottom, documentBasePath, onOpenDocument, onCopy, onResend, resendDisabled, copiedId }, ref) { return <div className="message-list" data-testid="message-scroll"><Virtuoso ref={ref} data={messages} followOutput={() => atBottom ? 'auto' : false} atBottomStateChange={onAtBottom} alignToBottom itemContent={(index, message) => { const next = messages[index + 1]; const isTurnEnd = message.role === 'user' || (!message.streaming && (!next || next.role !== 'assistant')); return <MessageView message={message} showFooter={isTurnEnd} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copied={copiedId === message.id} /> } } /></div> }))
 function messageTime(timestamp?: number): string { if (!timestamp) return ''; return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
-export const MessageView = memo(function MessageView({ message, showFooter, onCopy, onResend, resendDisabled, copied }: { message: ChatMessage; showFooter?: boolean; copied?: boolean } & Omit<MessageActionHandlers, 'copiedId'>) { const copyDisabled = !message.content.trim(); const copy = () => { void onCopy(message).catch(() => undefined) }; const time = showFooter && message.timestamp ? <time className="message-time">{messageTime(message.timestamp)}</time> : null; const actions = showFooter ? <MessageActionBar alignment={message.role === 'user' ? 'trailing' : 'leading'} canCopy canResend={message.role === 'user' && Boolean(message.content.trim())} copyDisabled={copyDisabled} resendDisabled={resendDisabled} onCopy={copy} onResend={() => onResend(message)} copied={copied} /> : null;if (message.role === 'user') return <article className="message user-message" data-user-prompt={message.id}><div className="user-message-stack"><UserMessageBubble text={message.content} />{actions}</div>{time}</article>; if (message.role === 'tool') { const notice = parseSubagentNotice(message.content); return notice ? <article className="message assistant-message"><CollapsibleActivityCard kind="result" label="子任务" summary={notice.name} meta={`${notice.ok ? '成功' : '失败'} · ${notice.cost}`}><pre>{message.content}</pre></CollapsibleActivityCard>{actions}{time}</article> : <article className="system-message tool-message"><div>{message.content}</div>{actions}{time}</article> } return <article className="message assistant-message"><AssistantTranscriptContent message={message} />{actions || time ? <div className="assistant-message-footer">{actions}{time}</div> : null}</article> })
+export const MessageView = memo(function MessageView({ message, showFooter, documentBasePath, onOpenDocument, onCopy, onResend, resendDisabled, copied }: { message: ChatMessage; showFooter?: boolean; copied?: boolean } & DocumentOpenProps & Omit<MessageActionHandlers, 'copiedId'>) { const copyDisabled = !message.content.trim(); const copy = () => { void onCopy(message).catch(() => undefined) }; const time = showFooter && message.timestamp ? <time className="message-time">{messageTime(message.timestamp)}</time> : null; const actions = showFooter ? <MessageActionBar alignment={message.role === 'user' ? 'trailing' : 'leading'} canCopy canResend={message.role === 'user' && Boolean(message.content.trim())} copyDisabled={copyDisabled} resendDisabled={resendDisabled} onCopy={copy} onResend={() => onResend(message)} copied={copied} /> : null;if (message.role === 'user') return <article className="message user-message" data-user-prompt={message.id}><div className="user-message-stack"><UserMessageBubble text={message.content} />{actions}</div>{time}</article>; if (message.role === 'tool') { const notice = parseSubagentNotice(message.content); return notice ? <article className="message assistant-message"><CollapsibleActivityCard kind="result" label="子任务" summary={notice.name} meta={`${notice.ok ? '成功' : '失败'} · ${notice.cost}`}><pre>{message.content}</pre></CollapsibleActivityCard>{actions}{time}</article> : <article className="system-message tool-message"><div>{message.content}</div>{actions}{time}</article> } return <article className="message assistant-message"><AssistantTranscriptContent message={message} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} />{actions || time ? <div className="assistant-message-footer">{actions}{time}</div> : null}</article> })
 const MIN_COMPOSER_HEIGHT = 29
 const MAX_COMPOSER_HEIGHT = 150
 /** jsdom has no layout engine (scrollHeight is 0), so fall back to a line-based estimate there. */
@@ -1540,7 +1524,7 @@ function ToolQuickRail({ activeTab, toolsCollapsed, onSelect, host, browserAvail
     })}
   </nav>
 }
-function ToolPanel({ activeTab, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningChange, browserAvailable, browserOccluded, terminalAvailable, retainedWorktreeDispositionAvailable, projectId, projectPath }: { activeTab: PanelTab; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningChange: (running: boolean) => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string }) {
+function ToolPanel({ activeTab, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningChange, browserAvailable, browserOccluded, terminalAvailable, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument }: { activeTab: PanelTab; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningChange: (running: boolean) => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void }) {
   const [terminalMounted, setTerminalMounted] = useState(activeTab === 'Terminal')
   const [documentMounted, setDocumentMounted] = useState(activeTab === 'Document')
   const [browserMounted, setBrowserMounted] = useState(activeTab === 'Browser')
@@ -1551,9 +1535,9 @@ function ToolPanel({ activeTab, host, theme, sessionId, announcedTerminal, revea
   }, [activeTab])
   return <aside className="tool-panel">
     <div className="tool-content">
-      <div className="tool-page subagent-content" hidden={activeTab !== 'Subagents'}><SubagentPanel host={host} sessionId={sessionId} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onRunningChange={onSubagentsRunningChange} /></div>
+      <div className="tool-page subagent-content" hidden={activeTab !== 'Subagents'}><SubagentPanel host={host} sessionId={sessionId} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onRunningChange={onSubagentsRunningChange} /></div>
       {activeTab === 'Terminal' && terminalAvailable === false ? <div className="tool-page"><div className="empty-panel" data-testid="terminal-unavailable"><b>Terminal 不可用</b><p>当前连接未提供终端能力。</p></div></div> : terminalMounted || activeTab === 'Terminal' ? <div className="tool-page terminal-content" hidden={activeTab !== 'Terminal'}><TerminalPanel host={host} theme={theme} sessionId={sessionId} announcedTerminal={announcedTerminal} revealedTerminalId={revealedTerminalId} projectId={projectId} projectPath={projectPath} visible={activeTab === 'Terminal'} /></div> : null}
-      {documentMounted || activeTab === 'Document' ? <div className="tool-page document-content" hidden={activeTab !== 'Document'}><DocumentPanel host={host} projectId={projectId} /></div> : null}
+      {documentMounted || activeTab === 'Document' ? <div className="tool-page document-content" hidden={activeTab !== 'Document'}><DocumentPanel host={host} documentPath={openedDocumentPath} /></div> : null}
       {browserMounted || activeTab === 'Browser' ? <div className="tool-page browser-content" hidden={activeTab !== 'Browser'}>{browserAvailable === true && host.browser ? <BrowserPanel host={host} sessionId={sessionId} occluded={browserOccluded || activeTab !== 'Browser'} /> : <div className="empty-panel browser-placeholder" data-testid="browser-unavailable"><b>Browser 不可用</b><p>{browserAvailable === undefined ? '正在检查当前连接的浏览器能力…' : '当前连接未提供桌面浏览器能力。'}</p></div>}</div> : null}
     </div>
   </aside>

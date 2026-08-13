@@ -312,7 +312,7 @@ function treeOrder(agents: Agent[]) {
   return order
 }
 
-export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvailable = false, onRunningChange }: { host: PipiHostAPI; sessionId?: string; retainedWorktreeDispositionAvailable?: boolean; onRunningChange?: (running: boolean) => void }) {
+export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable = false, onRunningChange }: { host: PipiHostAPI; sessionId?: string; projectPath?: string; onOpenDocument?: (path: string) => void; retainedWorktreeDispositionAvailable?: boolean; onRunningChange?: (running: boolean) => void }) {
   const [agents, setAgents] = useState<Agent[]>([])
   const [selectedId, setSelectedId] = useState<string>()
   const [page, setPage] = useState(0)
@@ -514,7 +514,7 @@ export function SubagentPanel({ host, sessionId, retainedWorktreeDispositionAvai
               </div>}
             </div>
             <div className="subagent-divider" aria-label="调整 agent 列表高度" role="separator" onPointerDown={startDrag} />
-			<AgentDetail agent={selected} activeChildCount={selected ? agents.filter(candidate => candidate.parentId === selected.agentId && isActive(candidate)).length : 0} aborting={Boolean(selected && abortingIds.has(selected.agentId))} now={now} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onCheck={check} onWorktree={worktree} onAbort={agent => void abort(agent)} />
+			<AgentDetail agent={selected} activeChildCount={selected ? agents.filter(candidate => candidate.parentId === selected.agentId && isActive(candidate)).length : 0} aborting={Boolean(selected && abortingIds.has(selected.agentId))} now={now} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onCheck={check} onWorktree={worktree} onAbort={agent => void abort(agent)} />
           </div>}
   </section>
 }
@@ -659,11 +659,13 @@ function AgentRow({ agent, childCount, activeChildCount, selected, aborting, now
   </article>
 }
 
-function AgentDetail({ agent, activeChildCount, aborting, now, retainedWorktreeDispositionAvailable, onCheck, onWorktree, onAbort }: {
+function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable, onCheck, onWorktree, onAbort }: {
   agent?: Agent
 	activeChildCount: number
 	aborting: boolean
   now: number
+  projectPath?: string
+  onOpenDocument?: (path: string) => void
   retainedWorktreeDispositionAvailable: boolean
   onCheck: (agent: Agent) => void
   onWorktree: (agentId: string, action: 'merge' | 'discard') => void
@@ -689,7 +691,7 @@ function AgentDetail({ agent, activeChildCount, aborting, now, retainedWorktreeD
     <div className="agent-transcript-scroll" data-testid="subagent-transcript-scroll">
       {isActive(agent) && <div className={`agent-running-activity ${live?.severity ?? 'active'}`} role="status" aria-live="polite"><span className="agent-spinner" aria-hidden="true" /><span>{live?.text ?? `正在执行 · ${activity}`}</span><button disabled={aborting} onClick={() => onAbort(agent)}>{aborting ? '正在停止' : '停止'}</button></div>}
       <div className="agent-transcript" data-testid="subagent-transcript">
-        {transcript.map((message, index) => <article className="message assistant-message" key={`${agent.runId}-transcript-${index}`}><AssistantTranscriptContent message={message} expandSteps /></article>)}
+        {transcript.map((message, index) => <article className="message assistant-message" key={`${agent.runId}-transcript-${index}`}><AssistantTranscriptContent message={message} expandSteps documentBasePath={agent.worktree?.path || projectPath} onOpenDocument={onOpenDocument} /></article>)}
       </div>
       <details className="agent-technical-details">
       <summary>技术详情</summary>

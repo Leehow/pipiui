@@ -5,6 +5,7 @@ import { ActivityCard } from './ActivityCard'
 import { parseSubagentNotice } from './subagent-notice'
 import { toolArgsSummary, toolDisplaySummary, formatToolInput } from './tool-summary'
 import { formatCompactTokens } from './session-stats-format'
+import { DocumentReferenceCards } from './DocumentReferenceCards'
 
 export type TranscriptTool = { id: string; name: string; input: string; result?: string; error?: boolean; startedAt: number; finished?: boolean; images?: { data: string; mimeType: string }[] }
 export type AssistantTranscriptMessage = { content: string; thinking?: string; tools?: TranscriptTool[]; streaming?: boolean }
@@ -38,11 +39,11 @@ const TranscriptToolCard = memo(function TranscriptToolCard({ tool, streaming }:
     {tool.result && <div className="tool-io"><div className="tool-io-label">输出</div><div className="tool-result">{tool.result}</div></div>}
   </ActivityCard>
 })
-export const AssistantTranscriptContent = memo(function AssistantTranscriptContent({ message, expandSteps }: { message: AssistantTranscriptMessage; expandSteps?: boolean }) {
+export const AssistantTranscriptContent = memo(function AssistantTranscriptContent({ message, expandSteps, documentBasePath, onOpenDocument }: { message: AssistantTranscriptMessage; expandSteps?: boolean; documentBasePath?: string; onOpenDocument?: (path: string) => void }) {
   const steps = (message.thinking ? 1 : 0) + (message.tools?.length ?? 0)
   const stepsExpanded = expandSteps ?? Boolean(message.streaming)
   return <div className="assistant-transcript-content" data-testid="assistant-transcript-content">
     {steps > 0 && <ActivityCard key={expandSteps ? 'steps' : message.streaming ? 'live' : 'done'} summary={toolRunSummary(steps, message.thinking ? 'Thinking' : null, message.tools ?? [])} running={Boolean(message.streaming)} defaultExpanded={stepsExpanded}>{message.thinking && <ActivityCard key={expandSteps ? 'thinking' : message.streaming ? 'live' : 'done'} kind="thinking" label="Thinking" summary="Thinking" meta={`${formatCompactTokens(Math.round(message.thinking.length / 4))} tokens`} running={Boolean(message.streaming)} defaultExpanded={false}><p>{message.thinking}</p></ActivityCard>}{message.tools?.map(tool => <TranscriptToolCard key={tool.id} tool={tool} streaming={message.streaming} />)}</ActivityCard>}
-    {message.content && <TranscriptMarkdown content={message.content} streaming={message.streaming} />}
+    {message.content && <><TranscriptMarkdown content={message.content} streaming={message.streaming} />{!message.streaming && <DocumentReferenceCards content={message.content} basePath={documentBasePath} onOpenDocument={onOpenDocument} />}</>}
   </div>
 })

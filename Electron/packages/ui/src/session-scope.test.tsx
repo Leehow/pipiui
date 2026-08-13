@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { AgentEvent, AgentSummary, DocumentSummary, PipiHostAPI, TerminalSession } from '@pipi/host-api'
+import type { AgentEvent, AgentSummary, PipiHostAPI, TerminalSession } from '@pipi/host-api'
 // xterm needs a real layout engine; jsdom has none, so the panel logic is tested without it.
 vi.mock('@xterm/xterm', () => ({ Terminal: class { buffer = { active: { viewportY: 0, baseY: 0 } }; options = {}; open = vi.fn(); write = vi.fn(); clear = vi.fn(); focus = vi.fn(); scrollToBottom = vi.fn(); dispose = vi.fn(); loadAddon = vi.fn(); onData() { return { dispose: vi.fn() } } onScroll() { return { dispose: vi.fn() } } } }))
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit = vi.fn(); dispose = vi.fn() } }))
@@ -54,15 +54,16 @@ describe('right panel session scoping', () => {
     expect(screen.queryByTestId('agent-row-agent-session-a')).toBeNull()
   })
 
-  it('scopes documents to the selected project and reloads on change', async () => {
-    const listDocuments = vi.fn(async (projectId?: string): Promise<DocumentSummary[]> => [{ id: `doc-${projectId}`, name: `${projectId}.md`, path: `/${projectId}.md`, kind: 'markdown' }])
-    const host = { listDocuments, readDocument: async (id: string) => ({ id, name: 'x.md', path: '/x.md', kind: 'markdown' as const, content: '# x' }) } as unknown as PipiHostAPI
-    const { rerender } = render(<DocumentPanel host={host} projectId="project-a" />)
-    await waitFor(() => expect(screen.getAllByText('project-a.md').length).toBeGreaterThan(0))
-    expect(listDocuments).toHaveBeenCalledWith('project-a')
-    rerender(<DocumentPanel host={host} projectId="project-b" />)
-    await waitFor(() => expect(screen.getAllByText('project-b.md').length).toBeGreaterThan(0))
-    expect(screen.queryByText('project-a.md')).toBeNull()
+  it('reads only the explicitly opened document path and reloads when that path changes', async () => {
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: path.split('/').at(-1)!, path, kind: 'markdown' as const, content: `# ${path}` }))
+    const host = { readDocument } as unknown as PipiHostAPI
+    const { rerender } = render(<DocumentPanel host={host} />)
+    expect(readDocument).not.toHaveBeenCalled()
+    rerender(<DocumentPanel host={host} documentPath="/project-a/a.md" />)
+    await waitFor(() => expect(readDocument).toHaveBeenCalledWith('/project-a/a.md'))
+    rerender(<DocumentPanel host={host} documentPath="/project-b/b.md" />)
+    await waitFor(() => expect(readDocument).toHaveBeenCalledWith('/project-b/b.md'))
+    expect(readDocument).toHaveBeenCalledTimes(2)
   })
 
   it('gives each session its own terminal and keeps the other one alive', async () => {

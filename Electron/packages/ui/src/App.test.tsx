@@ -264,6 +264,23 @@ describe('PipiUI Electron main layout', () => {
     expect(screen.queryByRole('button', { name: 'Plan' })).toBeNull()
   })
 
+  it('opens a main assistant Markdown card in the expanded Document panel using the selected project path', async () => {
+    const host = createMockHost()
+    const readDocument = vi.spyOn(host, 'readDocument')
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const collapse = screen.getByRole('button', { name: '收起右栏' })
+    fireEvent.click(collapse)
+    expect(container.querySelector('.pipiui-shell')?.className).toContain('tools-collapsed')
+
+    fireEvent.click(await screen.findByRole('button', { name: '打开文档 README.md' }))
+
+    await waitFor(() => expect(container.querySelector('.pipiui-shell')?.className).not.toContain('tools-collapsed'))
+    expect(screen.getByRole('button', { name: 'Document' }).className).toContain('active')
+    await waitFor(() => expect(readDocument).toHaveBeenCalledWith('/Users/demo/code/pipiui/README.md'))
+    expect((await screen.findByLabelText('文档内容 README.md')).textContent).toContain('Mock host preview')
+  })
+
   it.each([
     ['Subagents', ['Subagents', 'Browser', 'Document', 'Terminal']],
     ['Browser', ['Browser', 'Document', 'Terminal', 'Subagents']],
@@ -411,36 +428,20 @@ describe('PipiUI Electron main layout', () => {
     expect(open).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps Document selection, disclosure, and scroll position across a rail switch', async () => {
+  it('keeps the explicitly opened Document and reader scroll position across a rail switch', async () => {
     render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
-    fireEvent.click(screen.getByRole('button', { name: 'Document' }))
-    const notes = await screen.findByRole('button', { name: '预览 document-panel-checklist.txt' })
-    fireEvent.click(notes)
-    const preview = await screen.findByLabelText('文档内容 document-panel-checklist.txt')
-    const listHeading = screen.getByRole('button', { name: /文件列表/ })
-    fireEvent.click(listHeading)
-    expect(listHeading.getAttribute('aria-expanded')).toBe('false')
-    preview.scrollTop = 47
+    fireEvent.click(await screen.findByRole('button', { name: '打开文档 README.md' }))
+    const preview = await screen.findByLabelText('文档内容 README.md')
+    const reader = preview.closest('.document-reader') as HTMLElement
+    reader.scrollTop = 47
 
     fireEvent.click(screen.getByRole('button', { name: 'Subagents' }))
     fireEvent.click(screen.getByRole('button', { name: 'Document' }))
-    const restoredPreview = await screen.findByLabelText('文档内容 document-panel-checklist.txt')
-    const restoredListHeading = screen.getByRole('button', { name: /文件列表/ })
-    const listExpanded = restoredListHeading.getAttribute('aria-expanded')
-    fireEvent.click(restoredListHeading)
-    const restoredNotes = screen.getByRole('button', { name: '预览 document-panel-checklist.txt' })
-    expect({
-      notesSelected: restoredNotes.getAttribute('aria-pressed'),
-      listExpanded,
-      previewName: restoredPreview.getAttribute('aria-label'),
-      previewScrollTop: restoredPreview.scrollTop
-    }).toEqual({
-      notesSelected: 'true',
-      listExpanded: 'false',
-      previewName: '文档内容 document-panel-checklist.txt',
-      previewScrollTop: 47
-    })
+    const restoredPreview = await screen.findByLabelText('文档内容 README.md')
+    expect(restoredPreview).toBe(preview)
+    expect((restoredPreview.closest('.document-reader') as HTMLElement).scrollTop).toBe(47)
+    expect(screen.queryByText(/文件列表|个文件|正在同步/)).toBeNull()
   })
 
   it('disables Browser for a remote host without browser capability', async () => {
