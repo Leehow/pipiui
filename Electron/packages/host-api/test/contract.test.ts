@@ -356,6 +356,31 @@ async function wsFactory(): Promise<{ host: PipiHostAPI; close(): Promise<void> 
 contract('IPC transport', ipcFactory)
 contract('WebSocket transport', wsFactory, { computerUse: false, revealInFinder: false, terminal: true, browser: false })
 
+describe('desktop document host extension', () => {
+  it('exposes only the opted-in local opener and preserves structured error codes', async () => {
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        if (request.params[0] === '/missing/report.pdf') {
+          return { protocolVersion: 2, id: request.id, type: 'response', ok: false, error: 'Document does not exist', errorCode: 'document_not_found' }
+        }
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: undefined }
+      },
+      on: () => undefined,
+      removeListener: () => undefined
+    }
+    const defaultHost = createIpcHost(ipc)
+    expect(defaultHost.openDocumentExternally).toBeUndefined()
+
+    const desktopHost = createIpcHost(ipc, undefined, { openDocumentExternally: true })
+    await desktopHost.openDocumentExternally?.('/work/report.pdf')
+    expect(calls.at(-1)).toEqual({ method: 'openDocumentExternally', params: ['/work/report.pdf'] })
+    await expect(desktopHost.openDocumentExternally?.('/missing/report.pdf'))
+      .rejects.toMatchObject({ message: 'Document does not exist', code: 'document_not_found' })
+  })
+})
+
 describe('browser transport extension', () => {
   it('maps tab commands, active-tab state, snapshots, bounds, and subscriptions', async () => {
     const calls: Array<{ method: string; params: unknown[] }> = []

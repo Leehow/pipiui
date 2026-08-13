@@ -11,7 +11,8 @@ import { existsSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import electronViteConfig, { generatedWatchExcludes } from './electron.vite.config'
+import { resolveFileViewerCopyAssetsTarget } from '@file-viewer/vite-plugin'
+import electronViteConfig, { fileViewerAssetOptions, generatedWatchExcludes } from './electron.vite.config'
 
 type AliasEntry = { find: string | RegExp; replacement: string }
 
@@ -42,6 +43,15 @@ describe('renderer resolves @pipiui/ui from packages/ui source', () => {
 
   it('never references packages/ui/dist in renderer resolution', () => {
     expect(toPosix(JSON.stringify(aliases))).not.toContain('/dist/')
+  })
+
+  it('selects only the office preset and publishes its offline assets below the renderer output', () => {
+    expect(fileViewerAssetOptions).toEqual({ preset: 'office', copyAssets: { baseDir: 'file-viewer' } })
+    const target = resolveFileViewerCopyAssetsTarget('build', fileViewerAssetOptions.copyAssets, {
+      projectRoot: dirname(fileURLToPath(import.meta.url)),
+      outDir: 'out/renderer'
+    })
+    expect(toPosix(target.targetRoot)).toMatch(/apps\/electron\/out\/renderer\/file-viewer$/)
   })
 })
 

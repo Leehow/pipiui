@@ -2,6 +2,7 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react'
+import { fileViewerRenderers, type FileViewerRenderersPluginOptions } from '@file-viewer/vite-plugin'
 
 // Workspace packages must be bundled into the main/preload output so the
 // packaged app.asar never resolves @pipi/* through node_modules at runtime.
@@ -20,6 +21,10 @@ const hostApiSourceEntry = resolve(workspaceRoot, 'packages/host-api/src/index.t
 // build` alike, so the production bundle is built from the same source.
 const uiSourceEntry = resolve(uiPackageRoot, 'src/index.ts')
 const uiSourceAppCss = resolve(uiPackageRoot, 'src/app.css')
+export const fileViewerAssetOptions = {
+  preset: 'office',
+  copyAssets: { baseDir: 'file-viewer' }
+} satisfies FileViewerRenderersPluginOptions
 
 // A parallel workspace build/package rewrites these generated paths. Rollup's
 // main-process watcher otherwise treats those writes as source edits and
@@ -53,7 +58,7 @@ export default defineConfig({
     build: { watch: devWatch }
   },
   renderer: {
-    plugins: [react()],
+    plugins: [fileViewerRenderers(fileViewerAssetOptions), react()],
     resolve: {
       // String aliases are prefix-matched, so the more specific style.css
       // subpath must be listed before the bare package alias. Importing

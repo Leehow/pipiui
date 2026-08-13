@@ -14,6 +14,7 @@ import { BrowserSessionHost, routeBrowserView, withBrowserTabsHost } from './bro
 import { installOwnedRuntimeShutdown } from './app-lifecycle.js'
 import { CuaDriverHost } from './cua-driver-host.js'
 import { resolveRuntimeAssets } from './runtime-assets.js'
+import { withOpenDocumentExternally } from './external-document.js'
 import { withOpenExternal } from './external-url.js'
 import { createPtyTerminalBackend, TerminalSessionHost } from './terminal-host.js'
 export { createPtyTerminalBackend, resolveTerminalCwd, resolveTerminalShell } from './terminal-host.js'
@@ -46,7 +47,10 @@ export function registerPipiHostIpc(
     try {
       return { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: request.id, type: 'response', ok: true, result: await backend.handle(request.method, request.params) }
     } catch (error) {
-      return { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: request.id, type: 'response', ok: false, error: error instanceof Error ? error.message : String(error) }
+      const errorCode = error && typeof error === 'object' && typeof (error as { code?: unknown }).code === 'string'
+        ? (error as { code: string }).code
+        : undefined
+      return { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: request.id, type: 'response', ok: false, error: error instanceof Error ? error.message : String(error), ...(errorCode ? { errorCode } : {}) }
     }
   })
 }
@@ -136,7 +140,7 @@ if (app) {
       runtimeAssets: assets
     })
     const terminalBackend = terminalHost.wrapBackend(piBackend)
-    registerPipiHostIpc(ipcMain, withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)))
+    registerPipiHostIpc(ipcMain, withOpenDocumentExternally(withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)), path => shell.openPath(path)))
     createWindow(browser, () => terminalHost.closeAll())
     installOwnedRuntimeShutdown(app, terminalHost, computer, piBackend)
     app.on('activate', () => {

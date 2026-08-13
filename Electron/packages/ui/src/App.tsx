@@ -6,6 +6,7 @@ import { TerminalPanel } from './TerminalPanel'
 import { BrowserPanel } from './BrowserPanel'
 import { ActivityCard as CollapsibleActivityCard } from './ActivityCard'
 import { AssistantTranscriptContent, type TranscriptTool } from './AssistantTranscriptContent'
+import { documentKindForName } from '@pipi/host-api'
 import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, Project, PromptAttachment, Session, SessionLease, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
 import { ComputerUsePanel } from './ComputerUsePanel'
@@ -507,7 +508,14 @@ export function createMockHost(): PipiHostAPI {
     resumeSession: async sessionId => sessions.find(session => session.id === sessionId)!,
     deleteSession: async () => undefined,
     getSessionHistory: async sessionId => history[sessionId] ?? [],
-    readDocument: async path => ({ id: path, name: path.split('/').at(-1) ?? path, path, kind: 'markdown', content: `# ${path.split('/').at(-1) ?? 'Document'}\n\nMock host preview for ${path}.` }),
+    readDocument: async path => {
+      const name = path.split('/').at(-1) ?? path
+      const kind = documentKindForName(path)
+      if (!kind) throw new Error('unsupported document type')
+      if (kind === 'markdown') return { id: path, name, path, kind, content: `# ${name}\n\nMock host preview for ${path}.` }
+      if (kind === 'plain') return { id: path, name, path, kind, content: `Mock text preview for ${path}.` }
+      return { id: path, name, path, kind, bytes: new Uint8Array([1, 2, 3]) }
+    },
     getSessionLease: async sessionId => ({ sessionId, writable: true }),
     forceTakeoverSessionLease: async sessionId => ({ sessionId, writable: true }),
     sendPrompt: async (sessionId, prompt, attachments) => {

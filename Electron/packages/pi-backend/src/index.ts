@@ -6,6 +6,7 @@ import { createInterface } from "node:readline";
 
 import {
   PIPI_HOST_PROTOCOL_VERSION,
+  documentKindForName,
   type AgentDefinition,
   type AgentEvent,
   type AgentSummary,
@@ -13,6 +14,7 @@ import {
   type AuthProviderInfo,
   type AuthType,
   type DocumentContent,
+  type DocumentErrorCode,
   type HostBackend,
   type HostEvent,
   type HostMethod,
@@ -99,50 +101,77 @@ export {
 } from "./bridge.js";
 export { DEFAULT_FEATURES } from "./features.js";
 
-const MAX_MARKDOWN_DOCUMENT_BYTES = 2 * 1024 * 1024;
+const MAX_TEXT_DOCUMENT_BYTES = 2 * 1024 * 1024;
+const MAX_BINARY_DOCUMENT_BYTES = 50 * 1024 * 1024;
+export class DocumentReadError extends Error {
+  constructor(readonly code: DocumentErrorCode, message: string) {
+    super(message);
+    this.name = "DocumentReadError";
+  }
+}
 
-async function readMarkdownDocument(input: unknown): Promise<DocumentContent> {
+function documentError(code: DocumentErrorCode, message: string): DocumentReadError {
+  return new DocumentReadError(code, message);
+}
+
+async function readBoundedFile(handle: Awaited<ReturnType<typeof fs.open>>, limit: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (total <= limit) {
+    const chunk = Buffer.allocUnsafe(Math.min(1024 * 1024, limit + 1 - total));
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, total);
+    if (bytesRead === 0) break;
+    chunks.push(chunk.subarray(0, bytesRead));
+    total += bytesRead;
+  }
+  if (total > limit) throw documentError("document_too_large", `Document is too large (maximum ${limit} bytes)`);
+  return Buffer.concat(chunks, total);
+}
+
+export async function readLocalDocument(input: unknown): Promise<DocumentContent> {
   if (typeof input !== "string" || !input.trim())
-    throw new Error("document path is required");
+    throw documentError("document_invalid_path", "document path is required");
   const path = input.trim();
-  if (!isAbsolute(path)) throw new Error("document path must be absolute");
-  const extension = extname(path).toLowerCase();
-  if (extension !== ".md" && extension !== ".markdown")
-    throw new Error("only .md and .markdown documents can be opened");
+  if (!isAbsolute(path)) throw documentError("document_invalid_path", "document path must be absolute");
+  const kind = documentKindForName(extname(path));
+  if (!kind)
+    throw documentError("document_unsupported_type", "unsupported document type; allowed: .md, .markdown, .txt, .pdf, .doc, .docx, .xls, .xlsx, .ppt, .pptx");
+  const limit = kind === "markdown" || kind === "plain" ? MAX_TEXT_DOCUMENT_BYTES : MAX_BINARY_DOCUMENT_BYTES;
 
-  let handle;
+  let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
     handle = await fs.open(path, "r");
   } catch (error: any) {
-    if (error?.code === "ENOENT") throw new Error(`Markdown document does not exist: ${path}`);
-    throw new Error(`cannot open Markdown document: ${path}`);
+    if (error?.code === "ENOENT") throw documentError("document_not_found", `Document does not exist: ${path}`);
+    throw documentError("document_read_failed", `Cannot open document: ${path}`);
   }
   try {
     const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error(`Markdown document is not a regular file: ${path}`);
-    if (stat.size > MAX_MARKDOWN_DOCUMENT_BYTES)
-      throw new Error(`Markdown document is too large (maximum ${MAX_MARKDOWN_DOCUMENT_BYTES} bytes)`);
+    if (!stat.isFile()) throw documentError("document_not_file", `Document is not a regular file: ${path}`);
+    if (stat.size > limit)
+      throw documentError("document_too_large", `Document is too large (maximum ${limit} bytes)`);
 
-    // Read through the already validated handle and stop at cap+1 so a file that
-    // grows between stat and read cannot turn this IPC into an unbounded allocation.
-    const buffer = Buffer.allocUnsafe(MAX_MARKDOWN_DOCUMENT_BYTES + 1);
-    let total = 0;
-    while (total < buffer.length) {
-      const { bytesRead } = await handle.read(buffer, total, buffer.length - total, total);
-      if (bytesRead === 0) break;
-      total += bytesRead;
-    }
-    if (total > MAX_MARKDOWN_DOCUMENT_BYTES)
-      throw new Error(`Markdown document is too large (maximum ${MAX_MARKDOWN_DOCUMENT_BYTES} bytes)`);
-    return {
+    // Read through the validated handle in bounded chunks. The cap+1 probe also
+    // catches a file that grows between stat and read without a large up-front allocation.
+    const buffer = await readBoundedFile(handle, limit);
+    const summary = {
       id: path,
       name: basename(path),
       path,
-      kind: "markdown",
-      size: total,
+      kind,
+      size: buffer.byteLength,
       updatedAt: stat.mtimeMs,
-      content: buffer.subarray(0, total).toString("utf8"),
     };
+    if (kind === "markdown" || kind === "plain")
+      return { ...summary, kind, content: buffer.toString("utf8") };
+    return {
+      ...summary,
+      kind,
+      bytes: new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength),
+    };
+  } catch (error) {
+    if (error instanceof DocumentReadError) throw error;
+    throw documentError("document_read_failed", `Cannot read document: ${path}`);
   } finally {
     await handle.close();
   }
@@ -1192,7 +1221,7 @@ export class PiHostBackend implements HostBackend {
         // Documents are opened explicitly from transcript references; never scan a project.
         return [];
       case "readDocument":
-        return readMarkdownDocument(params[0]);
+        return readLocalDocument(params[0]);
       case "listSessions": {
         const pid = params[0] as string;
         const paths = await this.loadProjectPaths();

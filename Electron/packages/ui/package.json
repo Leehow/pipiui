@@ -21,6 +21,7 @@
     "react-dom": "^18.0.0"
   },
   "devDependencies": {
+    "@file-viewer/vite-plugin": "^2.2.8",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.2",
     "@types/react": "^18.3.12",
@@ -34,6 +35,8 @@
     "vitest": "^4.1.10"
   },
   "dependencies": {
+    "@file-viewer/preset-office": "^2.2.8",
+    "@file-viewer/react": "^2.2.8",
     "@lobehub/icons-static-svg": "^1.94.0",
     "@pipi/host-api": "file:../host-api",
     "@streamdown/code": "^1.1.1",

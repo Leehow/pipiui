@@ -38,10 +38,31 @@ export type HistoryEntry = {
   /** tool only: images extracted from the result (screenshots, generated images). */
   images?: TranscriptImage[];
 };
-/** Text files that a host makes available to the right-side document reader. */
-export type DocumentKind = "markdown" | "plain";
+/** Local files that a host makes available to the right-side document reader. */
+export type DocumentKind = "markdown" | "plain" | "pdf" | "word" | "spreadsheet" | "presentation";
+export const DOCUMENT_KIND_BY_EXTENSION = {
+  ".md": "markdown",
+  ".markdown": "markdown",
+  ".txt": "plain",
+  ".pdf": "pdf",
+  ".doc": "word",
+  ".docx": "word",
+  ".xls": "spreadsheet",
+  ".xlsx": "spreadsheet",
+  ".ppt": "presentation",
+  ".pptx": "presentation",
+} as const satisfies Record<string, DocumentKind>;
+export type SupportedDocumentExtension = keyof typeof DOCUMENT_KIND_BY_EXTENSION;
+export function documentKindForName(name: string): DocumentKind | null {
+  const normalized = name.toLowerCase();
+  const extension = Object.keys(DOCUMENT_KIND_BY_EXTENSION).find(candidate => normalized.endsWith(candidate));
+  return extension ? DOCUMENT_KIND_BY_EXTENSION[extension as SupportedDocumentExtension] : null;
+}
 export type DocumentSummary = { id: string; name: string; path: string; kind: DocumentKind; size?: number; updatedAt?: number };
-export type DocumentContent = DocumentSummary & { content: string };
+export type TextDocumentContent = DocumentSummary & { kind: "markdown" | "plain"; content: string; bytes?: never };
+export type BinaryDocumentContent = DocumentSummary & { kind: "pdf" | "word" | "spreadsheet" | "presentation"; bytes: Uint8Array; content?: never };
+export type DocumentContent = TextDocumentContent | BinaryDocumentContent;
+export type DocumentErrorCode = "document_invalid_path" | "document_unsupported_type" | "document_not_found" | "document_not_file" | "document_too_large" | "document_read_failed" | "document_external_open_failed";
 export type Model = { provider: string; id: string; name: string; reasoning: boolean; /** Mirrors Swift ModelInfo.supportsImages (pi input array or heuristic). Absent = unknown (defaults to supported). */ supportsImages?: boolean };
 export type ModelState = { model: Model; thinkingLevel: ThinkingLevel; availableThinkingLevels: ThinkingLevel[] };
 /** Ordered subagent model fallback entry. An empty chain means “follow main Agent”. */
@@ -329,6 +350,8 @@ export interface PipiHostAPI {
   removeProviderCredentials(providerId: string): Promise<ModelState>;
   /** Electron-only: open an auth URL in the user's browser (safe http/https only). */
   openExternal?(url: string): Promise<void>;
+  /** Electron-only: open one validated local supported document in the OS default app. */
+  openDocumentExternally?(absolutePath: string): Promise<void>;
   /**
    * Cumulative usage snapshot for a session. `sessionId` is optional: omit it
    * to target the host's current active session. Backed by pi's real
@@ -367,7 +390,7 @@ export type TerminalHostMethod = "terminalOpen" | "terminalWrite" | "terminalRes
 export type BrowserHostMethod = "browserSelectSession" | "browserListTabs" | "browserGetActiveTab" | "browserNewTab" | "browserSwitchTab" | "browserCloseTab" | "browserLoadURL" | "browserGoBack" | "browserGoForward" | "browserReload" | "browserSnapshot" | "browserSetViewBounds";
 export type HostMethod = BaseHostMethod | TerminalHostMethod | BrowserHostMethod;
 export type HostRequest = { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "request"; method: HostMethod; params: unknown[] };
-export type HostResponse = { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "response"; ok: true; result: unknown } | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "response"; ok: false; error: string };
+export type HostResponse = { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "response"; ok: true; result: unknown } | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "response"; ok: false; error: string; errorCode?: string };
 export type HostWireFrame = HostRequest | HostResponse | ({ type: "event" } & HostEvent);
 export interface HostBackend { handle(method: HostMethod, params: unknown[]): Promise<unknown>; subscribe(listener: (event: HostEvent) => void): Unsubscribe; }
 export interface IpcRendererLike { invoke(channel: string, request: HostRequest): Promise<HostResponse>; on(channel: string, listener: (_event: unknown, frame: HostWireFrame) => void): void; removeListener(channel: string, listener: (_event: unknown, frame: HostWireFrame) => void): void; }
@@ -377,7 +400,7 @@ function requestId(): string { return `${Date.now()}-${Math.random().toString(36
 function apiFrom(
   call: (method: HostMethod, params: unknown[]) => Promise<unknown>,
   subscribe: (channel: HostEvent["channel"], predicate: (event: HostEvent) => boolean, listener: (event: HostEvent) => void) => Unsubscribe,
-  options: { openExternal?: boolean } = {}
+  options: { openExternal?: boolean; openDocumentExternally?: boolean } = {}
 ): PipiHostAPI {
   const invoke = <T>(method: HostMethod, ...params: unknown[]) => call(method, params) as Promise<T>;
   const api: PipiHostAPI = {
@@ -470,14 +493,21 @@ function apiFrom(
     }
   };
   if (options.openExternal) api.openExternal = url => invoke("openExternal", url);
+  if (options.openDocumentExternally) api.openDocumentExternally = path => invoke("openDocumentExternally", path);
   return api;
 }
 
-export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHANNEL, options?: { openExternal?: boolean }): PipiHostAPI {
+function responseError(response: Extract<HostResponse, { ok: false }>): Error & { code?: string } {
+  const error = new Error(response.error) as Error & { code?: string };
+  if (response.errorCode) error.code = response.errorCode;
+  return error;
+}
+
+export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHANNEL, options?: { openExternal?: boolean; openDocumentExternally?: boolean }): PipiHostAPI {
   return apiFrom(
     async (method, params) => {
       const response = await ipc.invoke(channel, { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: requestId(), type: "request", method, params });
-      if (!response.ok) throw new Error(response.error);
+      if (!response.ok) throw responseError(response);
       return response.result;
     },
     (wanted, predicate, listener) => {
@@ -503,7 +533,7 @@ export function createWsHost(socket: WebSocketLike): PipiHostAPI {
       const item = pending.get(frame.id);
       if (!item) return;
       pending.delete(frame.id);
-      frame.ok ? item.resolve(frame.result) : item.reject(new Error(frame.error));
+      frame.ok ? item.resolve(frame.result) : item.reject(responseError(frame));
     } else if (frame.type === "event") {
       events.forEach(listener => listener(frame));
     }

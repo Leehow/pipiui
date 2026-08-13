@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPiHostBackend } from "../src/index.js";
@@ -17,7 +17,7 @@ async function fixture() {
   return createPiHostBackend({ agentDir });
 }
 
-describe("explicit Markdown document reads", () => {
+describe("explicit local document reads", () => {
   it("returns the real requested Markdown file without scanning a project", async () => {
     const backend = await fixture();
     const path = join(root, "notes.markdown");
@@ -34,21 +34,53 @@ describe("explicit Markdown document reads", () => {
     await backend.close();
   });
 
-  it("rejects missing, relative, non-Markdown, non-file, and oversized inputs", async () => {
+  it("returns TXT as text and PDF/Office as Uint8Array without base64", async () => {
+    const backend = await fixture();
+    const text = join(root, "notes.txt");
+    await writeFile(text, "plain text");
+    expect(await backend.handle("readDocument", [text])).toMatchObject({ kind: "plain", content: "plain text" });
+
+    const fixtures = [
+      ["report.pdf", "pdf"],
+      ["contract.doc", "word"],
+      ["contract.docx", "word"],
+      ["budget.xls", "spreadsheet"],
+      ["budget.xlsx", "spreadsheet"],
+      ["deck.ppt", "presentation"],
+      ["deck.pptx", "presentation"],
+    ] as const;
+    for (const [name, kind] of fixtures) {
+      const path = join(root, name);
+      await writeFile(path, new Uint8Array([0, 1, 2, 255]));
+      const result = await backend.handle("readDocument", [path]) as any;
+      expect(result).toMatchObject({ id: path, name, path, kind, size: 4 });
+      expect(result.bytes).toBeInstanceOf(Uint8Array);
+      expect(Array.from(result.bytes)).toEqual([0, 1, 2, 255]);
+      expect(result).not.toHaveProperty("content");
+      expect(result).not.toHaveProperty("base64");
+    }
+    await backend.close();
+  });
+
+  it("rejects missing, relative, unsupported, non-file, and proportionally oversized inputs", async () => {
     const backend = await fixture();
     const directory = join(root, "folder.md");
-    const text = join(root, "notes.txt");
+    const unsupported = join(root, "notes.js");
     const oversized = join(root, "large.md");
+    const oversizedPdf = join(root, "large.pdf");
     await mkdir(directory);
-    await writeFile(text, "plain");
+    await writeFile(unsupported, "plain");
     await writeFile(oversized, Buffer.alloc(2 * 1024 * 1024 + 1));
+    await writeFile(oversizedPdf, "");
+    await truncate(oversizedPdf, 50 * 1024 * 1024 + 1);
 
-    await expect(backend.handle("readDocument", [""])).rejects.toThrow("document path is required");
-    await expect(backend.handle("readDocument", ["relative.md"])).rejects.toThrow("must be absolute");
-    await expect(backend.handle("readDocument", [text])).rejects.toThrow("only .md and .markdown");
-    await expect(backend.handle("readDocument", [directory])).rejects.toThrow("not a regular file");
-    await expect(backend.handle("readDocument", [join(root, "missing.md")])).rejects.toThrow("does not exist");
-    await expect(backend.handle("readDocument", [oversized])).rejects.toThrow("too large");
+    await expect(backend.handle("readDocument", [""])).rejects.toMatchObject({ code: "document_invalid_path" });
+    await expect(backend.handle("readDocument", ["relative.md"])).rejects.toMatchObject({ code: "document_invalid_path" });
+    await expect(backend.handle("readDocument", [unsupported])).rejects.toMatchObject({ code: "document_unsupported_type" });
+    await expect(backend.handle("readDocument", [directory])).rejects.toMatchObject({ code: "document_not_file" });
+    await expect(backend.handle("readDocument", [join(root, "missing.md")])).rejects.toMatchObject({ code: "document_not_found" });
+    await expect(backend.handle("readDocument", [oversized])).rejects.toMatchObject({ code: "document_too_large" });
+    await expect(backend.handle("readDocument", [oversizedPdf])).rejects.toMatchObject({ code: "document_too_large" });
     await backend.close();
   });
 });

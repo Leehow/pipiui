@@ -1,7 +1,17 @@
 import { memo, useMemo } from 'react'
+import { documentKindForName, type DocumentKind } from '@pipi/host-api'
 import './document-reference-cards.css'
 
-export type DocumentReference = { name: string; path: string }
+export type DocumentReference = { name: string; path: string; kind: DocumentKind }
+
+const DOCUMENT_ICON: Record<DocumentKind, string> = {
+  markdown: 'MD',
+  plain: 'TXT',
+  pdf: 'PDF',
+  word: 'DOC',
+  spreadsheet: 'XLS',
+  presentation: 'PPT'
+}
 
 function normalizeAbsolutePath(value: string): string {
   const parts: string[] = []
@@ -39,8 +49,7 @@ function stripReferenceDecorations(value: string): string {
 export function normalizeDocumentPath(raw: string, basePath?: string, homePath?: string): string | null {
   const value = stripReferenceDecorations(raw)
   if (!value || /^https?:\/\//i.test(value)) return null
-  const lower = value.toLowerCase()
-  if (!lower.endsWith('.md') && !lower.endsWith('.markdown')) return null
+  if (!documentKindForName(value)) return null
 
   let absolute: string
   if (value.startsWith('/')) absolute = value
@@ -64,14 +73,14 @@ function markdownDestinations(content: string): string[] {
   const result: string[] = []
   const link = /!?\[[^\]]*\]\(\s*(?:<([^>]+)>|((?:\\.|[^\s)])+))(?:\s+["'][^"']*["'])?\s*\)/g
   for (const match of content.matchAll(link)) result.push(match[1] ?? match[2] ?? '')
-  for (const match of content.matchAll(/`([^`\n]+\.(?:md|markdown))`/gi)) result.push(match[1])
+  for (const match of content.matchAll(/`([^`\n]+\.(?:markdown|docx|xlsx|pptx|pdf|doc|xls|ppt|txt|md))`/gi)) result.push(match[1])
   return result
 }
 
 /** Finds Markdown links and clear path-shaped references without probing the filesystem. */
 export function findDocumentReferences(content: string, basePath?: string, homePath?: string): DocumentReference[] {
   const candidates = markdownDestinations(content)
-  const barePath = /(?:file:\/\/\/|~\/|\/|\.\.?\/)?(?:[^\s<>"'`()\[\]{}|,;，。！？：；]+\/)*[^\s<>"'`()\[\]{}|,;，。！？：；]+\.(?:md|markdown)(?:#[^\s<>"']+)?/gi
+  const barePath = /(?:file:\/\/\/|~\/|\/|\.\.?\/)?(?:[^\s<>"'`()\[\]{}|,;，。！？：；]+\/)*[^\s<>"'`()\[\]{}|,;，。！？：；]+\.(?:markdown|docx|xlsx|pptx|pdf|doc|xls|ppt|txt|md)(?:#[^\s<>"']+)?/gi
   for (const match of content.matchAll(barePath)) candidates.push(match[0])
 
   const seen = new Set<string>()
@@ -79,8 +88,10 @@ export function findDocumentReferences(content: string, basePath?: string, homeP
   for (const candidate of candidates) {
     const path = normalizeDocumentPath(candidate, basePath, homePath)
     if (!path || seen.has(path)) continue
+    const kind = documentKindForName(path)
+    if (!kind) continue
     seen.add(path)
-    references.push({ name: path.split('/').at(-1) ?? path, path })
+    references.push({ name: path.split('/').at(-1) ?? path, path, kind })
   }
   return references
 }
@@ -90,7 +101,7 @@ export const DocumentReferenceCards = memo(function DocumentReferenceCards({ con
   if (!onOpenDocument || references.length === 0) return null
   return <div className="document-reference-cards" data-testid="document-reference-cards">
     {references.map(reference => <button key={reference.path} className="document-reference-card" title={reference.path} aria-label={`打开文档 ${reference.name}`} onClick={() => onOpenDocument(reference.path)}>
-      <span className="document-reference-icon" aria-hidden="true">MD</span>
+      <span className={`document-reference-icon document-reference-icon-${reference.kind}`} aria-hidden="true">{DOCUMENT_ICON[reference.kind]}</span>
       <span className="document-reference-copy"><b>{reference.name}</b><small>{reference.path}</small></span>
     </button>)}
   </div>

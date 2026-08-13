@@ -7,7 +7,7 @@ export interface ContextBridgeLike {
 
 /** Electron preload entry: call with Electron's contextBridge and ipcRenderer. */
 export function exposePipiHost(contextBridge: ContextBridgeLike, ipc: IpcRendererLike): PipiHostAPI {
-  const host = createIpcHost(ipc, PIPI_HOST_IPC_CHANNEL, { openExternal: true })
+  const host = createIpcHost(ipc, PIPI_HOST_IPC_CHANNEL, { openExternal: true, openDocumentExternally: true })
   contextBridge.exposeInMainWorld('pipiHost', host)
   return host
 }

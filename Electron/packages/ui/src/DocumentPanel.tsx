@@ -1,10 +1,35 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { DocumentContent, PipiHostAPI } from '@pipi/host-api'
+import FileViewer, { type ViewerState } from '@file-viewer/react'
+import officePreset from '@file-viewer/preset-office'
+import { documentKindForName, type BinaryDocumentContent, type DocumentContent, type DocumentKind, type PipiHostAPI } from '@pipi/host-api'
 import { TranscriptMarkdown } from './AssistantTranscriptContent'
 import './document-panel.css'
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error && error.message.trim() ? error.message : '无法读取这个 Markdown 文档'
+  return error instanceof Error && error.message.trim() ? error.message : '无法读取这个文档'
+}
+
+const DOCUMENT_ICON: Record<DocumentKind, string> = { markdown: 'MD', plain: 'TXT', pdf: 'PDF', word: 'DOC', spreadsheet: 'XLS', presentation: 'PPT' }
+const OFFICE_VIEWER_OPTIONS = {
+  preset: officePreset,
+  rendererMode: 'replace' as const,
+  locale: 'zh-CN' as const,
+  toolbar: { download: false, print: false, exportHtml: false, theme: false, position: 'top' as const }
+}
+
+function validDocument(value: DocumentContent | null | undefined): value is DocumentContent {
+  if (!value || !documentKindForName(value.path) || !value.name) return false
+  return value.kind === 'markdown' || value.kind === 'plain'
+    ? typeof value.content === 'string'
+    : value.bytes instanceof Uint8Array
+}
+
+function isBinaryDocument(document: DocumentContent): document is BinaryDocumentContent {
+  return document.kind !== 'markdown' && document.kind !== 'plain'
+}
+
+function binaryBuffer(document: BinaryDocumentContent): ArrayBuffer {
+  return Uint8Array.from(document.bytes).buffer
 }
 
 export function DocumentPanel({ host, documentPath }: { host: PipiHostAPI; documentPath?: string | null }) {
@@ -14,6 +39,14 @@ export function DocumentPanel({ host, documentPath }: { host: PipiHostAPI; docum
   const [reloadGeneration, setReloadGeneration] = useState(0)
 
   const load = useCallback(() => setReloadGeneration(value => value + 1), [])
+  const openExternally = useCallback(() => {
+    if (!documentPath || !host.openDocumentExternally) return
+    setError(null)
+    void host.openDocumentExternally(documentPath).catch(nextError => setError(errorMessage(nextError)))
+  }, [host, documentPath])
+  const onViewerStateChange = useCallback((state: ViewerState) => {
+    if (state.error) setError(errorMessage(state.error))
+  }, [])
 
   useEffect(() => {
     setDocument(null)
@@ -24,7 +57,7 @@ export function DocumentPanel({ host, documentPath }: { host: PipiHostAPI; docum
     }
     if (!host.readDocument) {
       setLoading(false)
-      setError('当前连接不支持读取 Markdown 文档')
+      setError('当前连接不支持读取文档')
       return
     }
     let cancelled = false
@@ -32,7 +65,7 @@ export function DocumentPanel({ host, documentPath }: { host: PipiHostAPI; docum
     void host.readDocument(documentPath)
       .then(value => {
         if (cancelled) return
-        if (!value || typeof value.content !== 'string' || value.kind !== 'markdown') throw new Error('宿主返回了无效的 Markdown 文档')
+        if (!validDocument(value)) throw new Error('宿主返回了无效的文档内容')
         setDocument(value)
         setError(null)
       })
@@ -45,18 +78,30 @@ export function DocumentPanel({ host, documentPath }: { host: PipiHostAPI; docum
     {!documentPath ? <div className="document-empty" data-testid="document-empty">
       <span className="document-empty-icon" aria-hidden="true">▤</span>
       <b>没有打开的文档</b>
-      <p>点击主聊天或 subagent 消息下方的 Markdown 文档卡片，即可在这里阅读。</p>
+      <p>点击主聊天或 subagent 消息下方的文档卡片，即可在这里预览 Markdown、TXT、PDF 或 Office 文档。</p>
     </div> : <>
       <header className="document-panel-header">
-        <span className="document-header-icon" aria-hidden="true">MD</span>
+        <span className="document-header-icon" aria-hidden="true">{DOCUMENT_ICON[document?.kind ?? documentKindForName(documentPath) ?? 'plain']}</span>
         <span className="document-header-copy"><b>{document?.name ?? documentPath.split('/').at(-1)}</b><small>{documentPath}</small></span>
+        {host.openDocumentExternally ? <button className="document-external-open" aria-label="用默认应用打开文档" title="用默认应用打开" onClick={openExternally}>↗</button> : null}
         <button className="document-reload" aria-label="重新加载文档" title="重新加载文档" onClick={load}>↻</button>
       </header>
       <div className="document-reader">
         {loading ? <div className="document-loading" role="status">正在读取文档…</div>
           : error ? <div className="document-error" role="alert"><span>{error}</span><span className="document-error-actions"><button onClick={load}>重试</button><button aria-label="关闭文档错误" onClick={() => setError(null)}>×</button></span></div>
-            : document ? <article className="document-markdown" aria-label={`文档内容 ${document.name}`}><TranscriptMarkdown content={document.content} /></article>
-              : null}
+            : document?.kind === 'markdown' ? <article className="document-markdown" aria-label={`文档内容 ${document.name}`}><TranscriptMarkdown content={document.content} /></article>
+              : document?.kind === 'plain' ? <pre className="document-plain-text" aria-label={`文档内容 ${document.name}`}>{document.content}</pre>
+                : document && isBinaryDocument(document) ? <div className="document-office-preview" aria-label={`文档内容 ${document.name}`}>
+                  <FileViewer
+                    key={`${document.path}:${document.updatedAt ?? document.size ?? 0}`}
+                    buffer={binaryBuffer(document)}
+                    name={document.name}
+                    type={document.name.split('.').at(-1)}
+                    size={document.size}
+                    options={OFFICE_VIEWER_OPTIONS}
+                    onStateChange={onViewerStateChange}
+                  />
+                </div> : null}
       </div>
     </>}
   </section>

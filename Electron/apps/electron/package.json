@@ -30,6 +30,7 @@
   },
   "devDependencies": {
     "@electron-toolkit/utils": "^3.0.0",
+    "@file-viewer/vite-plugin": "^2.2.8",
     "@pipi/host-api": "file:../../packages/host-api",
     "@pipi/pi-backend": "file:../../packages/pi-backend",
     "@pipiui/ui": "file:../../packages/ui",
