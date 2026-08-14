@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent, AgentSummary, Model, ModelState, PipiHostAPI, Project, PromptAttachment, QueuedMessage, Session, SidebarSessionPreferences, StreamEvent } from '@pipi/host-api'
+import { visionHostMethods } from './useVisionRouting'
 
 const xtermHarness = vi.hoisted(() => ({ instances: [] as any[] }))
 
@@ -1589,6 +1590,23 @@ describe('composer draft persistence', () => {
     fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
     expect(box().value).toBe('')
   })
+
+  it('clears the composer as soon as send starts, not after sendPrompt resolves', async () => {
+    const base = createMockHost()
+    let release!: () => void
+    const sendPrompt = vi.fn(() => new Promise<void>(resolve => { release = resolve }))
+    const host: PipiHostAPI = { ...base, sendPrompt }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const box = () => screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    fireEvent.change(box(), { target: { value: '发送后应立刻消失' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(box().value).toBe(''))
+    expect(screen.getByText('发送后应立刻消失')).toBeTruthy()
+    expect(sendPrompt).toHaveBeenCalled()
+    await act(async () => { release() })
+    expect(box().value).toBe('')
+  })
 })
 
 describe('composer slash commands and model management', () => {
@@ -1849,6 +1867,40 @@ describe('composer quick model menu', () => {
     expect(current.className).toContain('current')
     expect(current.textContent).toContain('✓')
     expect(current.textContent).toContain('Claude Sonnet 4')
+  })
+
+  it('updates the model chip before setModel resolves', async () => {
+    const base = createMockHost()
+    let release: ((state: ModelState) => void) | undefined
+    const host: PipiHostAPI = {
+      ...base,
+      setModel: () => new Promise(resolve => { release = resolve })
+    }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-openai-gpt-5'))
+    expect(screen.queryByTestId('quick-menu')).toBeNull()
+    expect(screen.getByTestId('model-chip').textContent).toContain('GPT-5')
+    release?.(await base.setModel('welcome', 'openai', 'gpt-5'))
+  })
+
+  it('does not revert the chip when a late getModelState arrives after a switch', async () => {
+    const base = createMockHost()
+    const stale = await base.getModelState('welcome')
+    expect(stale.model.id).toBe('claude-sonnet-4')
+    const pending: Array<(state: ModelState) => void> = []
+    const host: PipiHostAPI = {
+      ...base,
+      getModelState: () => new Promise(resolve => { pending.push(resolve) })
+    }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-openai-gpt-5'))
+    expect(screen.getByTestId('model-chip').textContent).toContain('GPT-5')
+    await act(async () => { for (const resolve of pending) resolve(stale) })
+    expect(screen.getByTestId('model-chip').textContent).toContain('GPT-5')
   })
 
   it('switches the model from the quick menu, closes the menu, and updates the chip', async () => {
@@ -2139,6 +2191,13 @@ describe('composer image attachments', () => {
     await screen.findByText('开个头')
   })
 
+  it('does not use Node process.stdout in the renderer App', () => {
+    const candidates = [join('src', 'App.tsx'), join('packages', 'ui', 'src', 'App.tsx')]
+    const found = candidates.map(candidate => join(process.cwd(), candidate)).find(existsSync)
+    if (!found) throw new Error('cannot locate App.tsx')
+    expect(readFileSync(found, 'utf8')).not.toMatch(/process\.stdout/)
+  })
+
   it('keeps text and attachments and shows an error when sending fails', async () => {
     const host = { ...createMockHost(), sendPrompt: vi.fn(async () => { throw new Error('backend offline') }) }
     const composer = await renderChat(host)
@@ -2166,6 +2225,162 @@ describe('composer image attachments', () => {
     const host = createMockHost()
     const sendPrompt = vi.spyOn(host, 'sendPrompt')
     const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-deepseek-deepseek-v3'))
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('DeepSeek V3'))
+    const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    pasteImage(composer, makeImageFile('img.png'))
+    await screen.findByTestId('composer-thumb-0')
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    expect(await screen.findByText(/当前模型 DeepSeek V3 不支持图片附件/)).toBeTruthy()
+    expect(sendPrompt).not.toHaveBeenCalled()
+    expect(screen.getByTestId('composer-thumb-0')).toBeTruthy()
+  })
+
+  it('keeps pasted image attachments across session switches and restores them', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    pasteImage(screen.getByLabelText('消息输入框') as HTMLTextAreaElement, makeImageFile('keep.png'))
+    await screen.findByTestId('composer-thumb-0')
+    // Switch to another session: welcome's thumbnails must not leak over, and
+    // their object URLs must stay alive for when we come back.
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    expect(screen.queryByTestId('composer-thumb-0')).toBeNull()
+    expect(revokedUrls).not.toContain('blob:mock-0')
+    // Switch back: the very same attachment (same object URL) is restored.
+    fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
+    expect(await screen.findByTestId('composer-thumb-0')).toBeTruthy()
+    expect(screen.getByTestId('composer-thumb-0').querySelector('img')?.getAttribute('src')).toBe('blob:mock-0')
+    // The restored attachment is still sendable with its original file.
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '', [expect.objectContaining({ name: 'keep.png' })]))
+  })
+
+  it('does not resurrect image attachments after a successful send', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    pasteImage(screen.getByLabelText('消息输入框') as HTMLTextAreaElement, makeImageFile('sent.png'))
+    await screen.findByTestId('composer-thumb-0')
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(screen.queryByTestId('composer-thumbs')).toBeNull())
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
+    expect(screen.queryByTestId('composer-thumbs')).toBeNull()
+    expect(screen.queryByTestId('composer-thumb-0')).toBeNull()
+  })
+})
+
+describe('vision routing (通用 tab)', () => {
+  it('renders the 通用 tab with the switch and a disabled selector while the switch is off', async () => {
+    const composer = await renderChat(createMockHost())
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-modal')
+    // 模型管理 stays the default tab
+    expect(screen.getByTestId('model-tab-models').getAttribute('aria-selected')).toBe('true')
+    fireEvent.click(screen.getByTestId('model-tab-general'))
+    await screen.findByTestId('vision-picker')
+    const toggle = screen.getByTestId('vision-enabled-switch')
+    expect(toggle.getAttribute('role')).toBe('switch')
+    expect(toggle.getAttribute('aria-checked')).toBe('false')
+    // 开关关闭时选择器渲染但禁用
+    const select = screen.getByTestId('vision-model-select') as HTMLSelectElement
+    expect(select.disabled).toBe(true)
+  })
+
+  it('reveals the selector listing only checked and vision-capable models once enabled', async () => {
+    const host = createMockHost()
+    const visionHost = visionHostMethods(host)
+    await host.setHiddenModelIds(['xai/grok-4'])
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-modal')
+    fireEvent.click(screen.getByTestId('model-tab-general'))
+    await screen.findByTestId('vision-picker')
+    const select = screen.getByTestId('vision-model-select') as HTMLSelectElement
+    expect(select.disabled).toBe(true)
+    fireEvent.click(screen.getByTestId('vision-enabled-switch'))
+    await waitFor(() => expect(select.disabled).toBe(false))
+    const values = Array.from(select.options).map(option => option.value)
+    expect(values).toContain('anthropic/claude-sonnet-4')
+    expect(values).toContain('openai/gpt-5')
+    expect(values).not.toContain('openai/openai-codex') // supportsImages === false
+    expect(values).not.toContain('deepseek/deepseek-v3') // supportsImages === false
+    expect(values).not.toContain('xai/grok-4') // unchecked in 模型管理
+    // 选择后持久化到主机，并显示「已选」提示
+    fireEvent.change(select, { target: { value: 'anthropic/claude-sonnet-4' } })
+    await waitFor(async () => expect(await visionHost.getVisionModel?.()).toBe('anthropic/claude-sonnet-4'))
+    expect((await screen.findByTestId('vision-model-selected')).textContent).toContain('已选：anthropic/claude-sonnet-4')
+  })
+
+  it('keeps the selected vision model in the selector even when unchecked in 模型管理', async () => {
+    const host = createMockHost()
+    const visionHost = visionHostMethods(host)
+    await host.setHiddenModelIds(['xai/grok-4'])
+    await visionHost.setVisionEnabled?.(true)
+    await visionHost.setVisionModel?.('xai/grok-4')
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-modal')
+    fireEvent.click(screen.getByTestId('model-tab-general'))
+    await screen.findByTestId('vision-picker')
+    const select = (await screen.findByTestId('vision-model-select')) as HTMLSelectElement
+    await waitFor(() => expect(select.disabled).toBe(false))
+    expect(select.value).toBe('xai/grok-4')
+    expect(Array.from(select.options).map(option => option.value)).toContain('xai/grok-4')
+  })
+
+  it('clears the vision model when the switch is turned off', async () => {
+    const host = createMockHost()
+    const visionHost = visionHostMethods(host)
+    const setModel = vi.spyOn(host, 'setVisionModel')
+    await visionHost.setVisionEnabled?.(true)
+    await visionHost.setVisionModel?.('anthropic/claude-sonnet-4')
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-modal')
+    fireEvent.click(screen.getByTestId('model-tab-general'))
+    await screen.findByTestId('vision-picker')
+    const select = screen.getByTestId('vision-model-select') as HTMLSelectElement
+    await waitFor(() => expect(select.disabled).toBe(false))
+    fireEvent.click(screen.getByTestId('vision-enabled-switch'))
+    await waitFor(() => expect(setModel).toHaveBeenCalledWith(null))
+    expect(await visionHost.getVisionEnabled?.()).toBe(false)
+    expect(select.disabled).toBe(true)
+  })
+
+  it('allows image sends with a non-multimodal main model when vision routing is enabled and a vision model is selected', async () => {
+    const host = createMockHost()
+    const visionHost = visionHostMethods(host)
+    await visionHost.setVisionEnabled?.(true)
+    await visionHost.setVisionModel?.('anthropic/claude-sonnet-4')
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-deepseek-deepseek-v3'))
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('DeepSeek V3'))
+    const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    pasteImage(composer, makeImageFile('img.png'))
+    await screen.findByTestId('composer-thumb-0')
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalled())
+    expect(screen.queryByText(/当前模型 DeepSeek V3 不支持图片附件/)).toBeNull()
+  })
+
+  it('still blocks image sends with a non-multimodal main model when vision routing is disabled', async () => {
+    const host = createMockHost()
+    const visionHost = visionHostMethods(host)
+    await visionHost.setVisionEnabled?.(false)
+    await visionHost.setVisionModel?.(null)
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
     fireEvent.click(await screen.findByTestId('model-chip'))
     fireEvent.click(await screen.findByTestId('quick-row-deepseek-deepseek-v3'))

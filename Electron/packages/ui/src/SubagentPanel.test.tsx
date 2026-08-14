@@ -544,6 +544,49 @@ describe('SubagentPanel', () => {
     expect(scroll.scrollTop).toBe(400)
   })
 
+  it('keeps the agent list pinned to the newest row while the viewer is at the bottom', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'old', runId: 'r-old', name: 'explore', task: '旧任务', state: 'ok', createdAt: 1 } })
+    await screen.findByTestId('agent-row-old')
+    const list = document.querySelector('.agent-list') as HTMLElement
+    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 200 })
+    let height = 400
+    Object.defineProperty(list, 'scrollHeight', { configurable: true, get: () => height })
+
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'mid', runId: 'r-mid', name: 'explore', task: '中任务', state: 'ok', createdAt: 2 } })
+    await screen.findByTestId('agent-row-mid')
+    await waitFor(() => expect(list.scrollTop).toBe(200))
+
+    list.scrollTop = 40
+    fireEvent.scroll(list)
+    height = 480
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'later', runId: 'r-later', name: 'explore', task: '后任务', state: 'ok', createdAt: 3 } })
+    await screen.findByTestId('agent-row-later')
+    expect(list.scrollTop).toBe(40)
+
+    list.scrollTop = 264
+    fireEvent.scroll(list)
+    height = 600
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'newest', runId: 'r-newest', name: 'explore', task: '最新任务', state: 'ok', createdAt: 4 } })
+    await screen.findByTestId('agent-row-newest')
+    await waitFor(() => expect(list.scrollTop).toBe(400))
+  })
+
+  it('pins the agent list to the newest row when the pane becomes visible', async () => {
+    const harness = hostHarness()
+    const view = render(<SubagentPanel host={harness.host} visible={false} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'hidden', runId: 'r-hidden', name: 'explore', task: '后台任务', state: 'ok', createdAt: 1 } })
+    await screen.findByTestId('agent-row-hidden')
+    const list = document.querySelector('.agent-list') as HTMLElement
+    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 200 })
+    Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 500 })
+    expect(list.scrollTop).toBe(0)
+
+    view.rerender(<SubagentPanel host={harness.host} visible />)
+    await waitFor(() => expect(list.scrollTop).toBe(300))
+  })
+
   it('loads the snapshot tree and routes review worktree actions', async () => {
     const harness = hostHarness()
     harness.host.listAgents = async () => [

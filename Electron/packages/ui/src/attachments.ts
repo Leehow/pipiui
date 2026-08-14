@@ -112,15 +112,18 @@ export function chatImagesFromAttachments(attachments?: PromptAttachment[]): Cha
 
 /** Read a File into the wire shape (base64 + mimeType + name) at the transport edge only. */
 export function fileToPromptAttachment(file: File): Promise<PromptAttachment> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onerror = () => reject(new Error('无法读取图片'))
-    reader.onload = () => {
-      const dataUrl = String(reader.result ?? '')
-      const comma = dataUrl.indexOf(',')
-      resolve({ dataBase64: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl, mimeType: file.type, name: file.name })
+  // Blob.arrayBuffer() resolves on microtasks (jsdom: Promise.resolve), so the
+  // optimistic send path settles before the next macrotask instead of waiting on
+  // the FileReader's three setImmediate hops — the composer clears, the bubble
+  // gets its base64 images, and sendPrompt dispatches before any later echo.
+  return file.arrayBuffer().then(buffer => {
+    const bytes = new Uint8Array(buffer)
+    // Chunked so a max-size (20MB) file never blows the call stack.
+    let binary = ''
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
     }
-    reader.readAsDataURL(file)
+    return { dataBase64: btoa(binary), mimeType: file.type, name: file.name }
   })
 }
 

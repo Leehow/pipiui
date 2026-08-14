@@ -77,6 +77,7 @@ import {
   isPlaceholderSessionTitle,
   provisionalSessionTitle,
 } from "./session-title.js";
+import { describeImages } from "./vision-describe.js";
 export {
   ProactiveCompactionPolicy,
   ProactiveCompactionScheduler,
@@ -943,6 +944,9 @@ export class PiHostBackend implements HostBackend {
   /** Selected vision model (full "provider/id" ref) mirrored into vision.json for @getpipher/vision. */
   private visionModel: string | null = null;
   private visionModelLoaded?: Promise<void>;
+  /** Master switch for describing attachments through the selected vision model. */
+  private visionEnabled = false;
+  private visionEnabledLoaded?: Promise<void>;
   private projectPaths: string[] = [];
   private projectPathsLoaded?: Promise<void>;
   private settingsWrite: Promise<void> = Promise.resolve();
@@ -1653,6 +1657,10 @@ export class PiHostBackend implements HostBackend {
         return this.loadVisionModel();
       case "setVisionModel":
         return this.saveVisionModel(params[0]);
+      case "getVisionEnabled":
+        return this.loadVisionEnabled();
+      case "setVisionEnabled":
+        return this.saveVisionEnabled(params[0]);
       case "listAgentDefinitions":
         return BUILT_IN_AGENT_DEFINITIONS.map((agent) => ({ ...agent }));
       case "listModels":
@@ -2694,6 +2702,31 @@ export class PiHostBackend implements HostBackend {
     await this.writeVisionBridgeFile(ref);
     return ref;
   }
+  /** Master switch for routing attachments to the selected vision model. Missing is intentionally false. */
+  private async loadVisionEnabled(): Promise<boolean> {
+    if (!this.visionEnabledLoaded) {
+      this.visionEnabledLoaded = (async () => {
+        const value = (await this.readSettings()).visionEnabled;
+        if (value === undefined) {
+          this.visionEnabled = false;
+          return;
+        }
+        if (typeof value !== "boolean") throw new Error("visionEnabled 必须是 boolean");
+        this.visionEnabled = value;
+      })();
+    }
+    await this.visionEnabledLoaded;
+    return this.visionEnabled;
+  }
+  private async saveVisionEnabled(value: unknown): Promise<boolean> {
+    if (typeof value !== "boolean") throw new Error("visionEnabled 必须是 boolean");
+    await this.updateSettings((settings) => {
+      settings.visionEnabled = value;
+    });
+    this.visionEnabled = value;
+    this.visionEnabledLoaded = Promise.resolve();
+    return value;
+  }
   private checkedSidebarSessionPreferences(value: unknown): { pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 } {
     if (!isRecord(value)) throw new Error("sidebarSessionPreferences 必须是 object");
     const checked = (key: "pinnedSessionIds" | "archivedSessionIds" | "orderedSessionIds", optional = false) => {
@@ -2892,6 +2925,7 @@ export class PiHostBackend implements HostBackend {
     live: Live,
     text: string,
     attachments: PromptAttachment[],
+    described = false,
   ): Promise<string> {
     const dir = join(live.cwd, ".pi", "attachments");
     await fs.mkdir(dir, { recursive: true });
@@ -2914,10 +2948,78 @@ export class PiHostBackend implements HostBackend {
       lines.push("Attached image files:");
       for (const p of paths) lines.push(`- ${p}`);
     }
-    lines.push(
-      "(Images are also embedded multimodally; prefer viewing them directly. If you use the read tool, use the paths above — do not invent paths like /home/workdir/attachments/.)",
-    );
+    if (!described) {
+      lines.push(
+        "(Images are also embedded multimodally; prefer viewing them directly. If you use the read tool, use the paths above — do not invent paths like /home/workdir/attachments/.)",
+      );
+    }
     return lines.join("\n");
+  }
+  /**
+   * Whether this send should describe attachments through the selected vision
+   * model instead of embedding them: only when vision routing is enabled, a
+   * vision model is selected, and the session's current main model cannot
+   * accept images.
+   */
+  private async visionDescribePlan(live: Live): Promise<{ active: boolean; visionRef: string | null }> {
+    if (!(await this.loadVisionEnabled())) return { active: false, visionRef: null };
+    const visionRef = await this.loadVisionModel();
+    if (!visionRef) return { active: false, visionRef: null };
+    const model = this.sessionModelStates.get(live.session.id)?.model
+      ?? this.sessionModelSnapshots.get(live.session.id)?.model
+      ?? this.modelState.model;
+    if (supportsImagesFor(model.id, model.provider)) return { active: false, visionRef };
+    return { active: true, visionRef };
+  }
+  /**
+   * Describe the given attachments via the selected vision model in an isolated
+   * no-session/no-tools Pi process. Best-effort: failures resolve `undefined`
+   * and never block the user's send.
+   */
+  private async describeAttachedImages(
+    live: Live,
+    visionRef: string,
+    attachments: PromptAttachment[],
+    userText?: string,
+  ): Promise<string | undefined> {
+    const isolated = assemblePiSpawn({
+      cwd: live.cwd,
+      agentDir: this.profileMode === "isolated" ? this.agentDir : undefined,
+      sessionsRoot: this.profileMode === "isolated" ? this.root : undefined,
+      resourceMode: "explicit",
+      features: {},
+      paths: {},
+    });
+    const slash = visionRef.indexOf("/");
+    return describeImages({
+      spawn: this.proc,
+      executable: this.piCommand.executable,
+      args: [
+        ...(this.piCommand.prefixArgs ?? []),
+        "--mode", "rpc",
+        "--no-session", "--no-tools",
+        ...isolated.args,
+        "--thinking", "off",
+      ],
+      cwd: live.cwd,
+      env: withToolPath(
+        mergedSpawnEnvironment(this.env, await this.readDotEnv(), {
+          ...isolated.env,
+          ...(this.piCommand.env ?? {}),
+        }),
+        this.piCommand.executable,
+      ),
+      model: {
+        provider: visionRef.slice(0, slash),
+        id: visionRef.slice(slash + 1),
+      },
+      images: attachments.map((a) => ({
+        dataBase64: a.dataBase64,
+        mimeType: a.mimeType,
+      })),
+      userText,
+      signal: this.titleGenerationAbort.signal,
+    });
   }
   private async dispatchQueuedMessage(
     id: string,
@@ -2930,8 +3032,11 @@ export class PiHostBackend implements HostBackend {
       await this.startAutomaticSessionTitle(live, payload.text);
     }
     const attachments = payload.attachments as PromptAttachment[];
+    const plan = attachments.length && behavior !== "follow_up"
+      ? await this.visionDescribePlan(live)
+      : { active: false, visionRef: null };
     const message = attachments.length
-      ? await this.prepareImageMessage(live, payload.text, attachments)
+      ? await this.prepareImageMessage(live, payload.text, attachments, plan.active)
       : payload.text;
     const body: Rpc = {
       type:
@@ -2942,7 +3047,16 @@ export class PiHostBackend implements HostBackend {
             : "prompt",
       message,
     };
-    if (attachments.length && behavior !== "follow_up")
+    let described = false;
+    if (plan.active && plan.visionRef) {
+      const description = await this.describeAttachedImages(live, plan.visionRef, attachments, payload.text)
+        .catch(() => undefined);
+      if (description) {
+        described = true;
+        body.message = `${body.message}\n\n${description}`;
+      }
+    }
+    if (attachments.length && behavior !== "follow_up" && !described)
       body.images = attachments.map((a) => ({
         type: "image",
         data: a.dataBase64,
@@ -3086,33 +3200,101 @@ export class PiHostBackend implements HostBackend {
     };
     return this.modelState;
   }
+  private composeSessionModelState(sessionId: string, provider: string, modelId: string): ModelState {
+    const known = this.models.find((item) => item.provider === provider && item.id === modelId);
+    const model: Model = known ?? { provider, id: modelId, name: modelId, reasoning: true };
+    const current =
+      this.sessionModelStates.get(sessionId) ??
+      this.sessionModelSnapshots.get(sessionId) ??
+      this.modelState;
+    const availableThinkingLevels = thinkingLevelsForModel(model);
+    return {
+      model,
+      thinkingLevel: resolveThinkingLevel(current.thinkingLevel, availableThinkingLevels) ?? "off",
+      availableThinkingLevels,
+    };
+  }
+  /** Append a Pi-shaped JSONL row without opening SessionManager or spawning Pi. */
+  private async persistColdSessionRow(
+    sessionId: string,
+    row:
+      | { type: "model_change"; provider: string; modelId: string }
+      | { type: "thinking_level_change"; thinkingLevel: ThinkingLevel },
+  ): Promise<void> {
+    const meta = await this.findSession(sessionId);
+    const status = await this.leaseFor(meta).acquire();
+    if (!status.writable)
+      throw new Error(`session is read-only: held by ${status.holder?.holder ?? "another writer"}`);
+    await fs.appendFile(
+      meta.path,
+      `${JSON.stringify({
+        ...row,
+        id: crypto.randomUUID(),
+        parentId: null,
+        timestamp: new Date().toISOString(),
+      })}\n`,
+    );
+    const stat = await fs.stat(meta.path);
+    this.rememberSessionMeta(
+      {
+        ...meta,
+        updatedAt: Date.now(),
+        model: row.type === "model_change" ? { provider: row.provider, modelId: row.modelId } : meta.model,
+        thinkingLevel: row.type === "thinking_level_change" ? row.thinkingLevel : meta.thinkingLevel,
+      },
+      stat.size,
+      stat.mtimeMs,
+    );
+  }
   private async setModel(sessionId: string, provider: string, modelId: string) {
-    let live = await this.ensure(sessionId);
-    try {
-      await this.selectExactModel(live, provider, modelId);
-    } catch (error) {
-      if (!(error instanceof PiExitedError)) throw error;
-      await live.exit;
-      live = await this.ensure(sessionId);
-      await this.selectExactModel(live, provider, modelId);
+    await this.loadModelCatalog();
+    if (this.live.has(sessionId) || this.ensureInFlight.has(sessionId)) {
+      let live = await this.ensure(sessionId);
+      try {
+        await this.selectExactModel(live, provider, modelId);
+      } catch (error) {
+        if (!(error instanceof PiExitedError)) throw error;
+        await live.exit;
+        live = await this.ensure(sessionId);
+        await this.selectExactModel(live, provider, modelId);
+      }
+      await this.refreshState(live);
+      const state = this.sessionModelStates.get(sessionId)!;
+      this.sessionModelSnapshots.set(sessionId, state);
+      if (state.model.provider === provider && state.model.id === modelId)
+        await this.rememberManualModelSelection(state.model);
+      return state;
     }
-    await this.refreshState(live);
-    const state = this.sessionModelStates.get(sessionId)!;
-    this.sessionModelSnapshots.set(sessionId, state);
-    if (state.model.provider === provider && state.model.id === modelId)
-      await this.rememberManualModelSelection(state.model);
-    return state;
+    const next = this.composeSessionModelState(sessionId, provider, modelId);
+    await this.persistColdSessionRow(sessionId, { type: "model_change", provider, modelId });
+    this.sessionModelStates.set(sessionId, next);
+    this.sessionModelSnapshots.set(sessionId, next);
+    await this.rememberManualModelSelection(next.model);
+    return next;
   }
   private async setThinking(sessionId: string, level: ThinkingLevel) {
-    const live = await this.ensure(sessionId);
-    const current = this.sessionModelStates.get(sessionId) ?? this.sessionModelSnapshots.get(sessionId) ?? this.modelState;
+    if (this.live.has(sessionId) || this.ensureInFlight.has(sessionId)) {
+      const live = await this.ensure(sessionId);
+      const current = this.sessionModelStates.get(sessionId) ?? this.sessionModelSnapshots.get(sessionId) ?? this.modelState;
+      if (!current.availableThinkingLevels.includes(level))
+        throw new Error(`thinking level ${level} is unavailable`);
+      await this.command(sessionId, { type: "set_thinking_level", level });
+      await this.refreshState(live);
+      const state = this.sessionModelStates.get(sessionId)!;
+      this.sessionModelSnapshots.set(sessionId, state);
+      return state;
+    }
+    const current =
+      this.sessionModelStates.get(sessionId) ??
+      this.sessionModelSnapshots.get(sessionId) ??
+      await this.getModelState(sessionId);
     if (!current.availableThinkingLevels.includes(level))
       throw new Error(`thinking level ${level} is unavailable`);
-    await this.command(sessionId, { type: "set_thinking_level", level });
-    await this.refreshState(live);
-    const state = this.sessionModelStates.get(sessionId)!;
-    this.sessionModelSnapshots.set(sessionId, state);
-    return state;
+    const next = { ...current, thinkingLevel: level };
+    await this.persistColdSessionRow(sessionId, { type: "thinking_level_change", thinkingLevel: level });
+    this.sessionModelStates.set(sessionId, next);
+    this.sessionModelSnapshots.set(sessionId, next);
+    return next;
   }
   /**
    * Per-session last-known context persistence. Same file name and line format

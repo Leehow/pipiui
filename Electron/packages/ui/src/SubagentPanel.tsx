@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { Diff, Hunk, parseDiff } from 'react-diff-view'
 import { ActivityCard } from './ActivityCard'
 import { toolActivitySummary, toolArgsSummary } from './tool-summary'
@@ -384,7 +384,7 @@ function treeOrder(agents: Agent[]) {
   return order
 }
 
-export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable = false, onRunningChange, onRunningCountChange, onAgentStarted }: { host: PipiHostAPI; sessionId?: string; projectPath?: string; onOpenDocument?: (path: string) => void; retainedWorktreeDispositionAvailable?: boolean; onRunningChange?: (running: boolean) => void; onRunningCountChange?: (count: number) => void; onAgentStarted?: () => void }) {
+export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable = false, visible: paneVisible = true, onRunningChange, onRunningCountChange, onAgentStarted }: { host: PipiHostAPI; sessionId?: string; projectPath?: string; onOpenDocument?: (path: string) => void; retainedWorktreeDispositionAvailable?: boolean; visible?: boolean; onRunningChange?: (running: boolean) => void; onRunningCountChange?: (count: number) => void; onAgentStarted?: () => void }) {
   const [agents, setAgents] = useState<Agent[]>([])
   const [selectedId, setSelectedId] = useState<string>()
   const [page, setPage] = useState(0)
@@ -395,6 +395,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
 	const [abortError, setAbortError] = useState('')
 	const [abortingIds, setAbortingIds] = useState<Set<string>>(() => new Set())
   const [now, setNow] = useState(() => Date.now())
+  const listRef = useRef<HTMLDivElement>(null)
   const loadGeneration = useRef(0)
   // Agents already running when the panel mounts (initial snapshot or a session
   // switch) are not "new runs": seed the baseline from the snapshot so they
@@ -517,8 +518,13 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     onRunningCountChange?.(summary.running)
     onRunningChange?.(summary.running > 0)
     if (hydratedRef.current && summary.running > previousRunningRef.current) onAgentStarted?.()
-    previousRunningRef.current = summary.running
-  }, [onAgentStarted, onRunningChange, onRunningCountChange, summary.running])
+    // A session switch clears the list (running temporarily 0) and the reload's
+    // snapshot re-merges the pre-existing running agents afterwards. If the
+    // baseline decays to 0 during that cleared window, those agents look like a
+    // fresh run and onAgentStarted force-opens a pane the user collapsed. Hold
+    // the baseline while a snapshot reload is in flight.
+    if (!loading) previousRunningRef.current = summary.running
+  }, [onAgentStarted, onRunningChange, onRunningCountChange, summary.running, loading])
 
   useEffect(() => () => {
     onRunningCountChange?.(0)
@@ -528,11 +534,18 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
   const ordered = treeOrder(agents)
   const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
   const activePage = Math.min(page, pageCount - 1)
-  const visible = ordered.slice(Math.max(0, ordered.length - (activePage + 1) * pageSize), ordered.length - activePage * pageSize)
+  const visibleAgents = ordered.slice(Math.max(0, ordered.length - (activePage + 1) * pageSize), ordered.length - activePage * pageSize)
+  const newestId = ordered.at(-1)?.agentId
 
   useEffect(() => {
     if (page !== activePage) setPage(activePage)
   }, [activePage, page])
+
+  useLayoutEffect(() => {
+    const el = listRef.current
+    if (!el || !follow || !paneVisible) return
+    el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight)
+  }, [follow, newestId, paneVisible, visibleAgents.length])
 
   const check = async (agent: Agent) => {
     const update = await host.checkAgent(agent.agentId)
@@ -586,8 +599,8 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
         : !agents.length
           ? <div className="subagent-empty"><b>♙</b><strong>还没有 subagent</strong><p>让 pi 用 subagent 工具委派任务后，这里会实时显示 agent 树。</p></div>
           : <div className="subagent-split" style={{ gridTemplateRows: `${ratio}fr 6px ${1 - ratio}fr` }}>
-            <div className="agent-list compact" data-density="compact" onScroll={event => setFollow(event.currentTarget.scrollHeight - event.currentTarget.scrollTop - event.currentTarget.clientHeight < 24)}>
-              {visible.map(agent => <AgentRow
+            <div ref={listRef} className="agent-list compact" data-density="compact" onScroll={event => setFollow(event.currentTarget.scrollHeight - event.currentTarget.scrollTop - event.currentTarget.clientHeight < 24)}>
+              {visibleAgents.map(agent => <AgentRow
                 key={agent.agentId}
                 agent={agent}
 				childCount={agents.filter(candidate => candidate.parentId === agent.agentId).length}

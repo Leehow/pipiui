@@ -4,6 +4,8 @@ import type { ModelVisibilityController } from './useModelVisibility'
 import { groupByProvider, modelRef } from './model-visibility'
 import { ProviderLogo } from './ProviderLogo'
 import { ProviderLoginPanel } from './ProviderLoginPanel'
+import type { VisionRoutingController } from './useVisionRouting'
+import './computer-use.css'
 
 function TrashIcon() {
   return (
@@ -41,19 +43,111 @@ function ProviderTriState({ visibleCount, total, provider, onChange }: {
 }
 
 /**
- * `/model` — provider-collapsible model visibility management modal mirroring
- * Swift Settings > 模型. Provider headers carry a tri-state checkbox
- * (all/none/partial visible), a per-provider delete action (pi logout with
- * confirmation) and an "添加模型" flow driving pi's native OAuth/api-key login.
- * Visibility state is persisted through the host (hiddenModelIds, atomic).
+ * 通用 tab — 识图路由开关 + 识图模型选择。开关仿 ComputerUsePanel
+ * (role="switch" + computer-use-switch CSS)；选择器为原生 <select>
+ * (仿 SubagentModelModal 的原生 select 风格)。候选 = 模型管理中已勾选
+ * (visible) 且 supportsImages !== false 的模型；已选识图模型即便未勾选
+ * 也保底出现在列表中（与 quickGroups 对当前模型的保底逻辑一致）。
+ * 持久化走 useVisionRouting (getVisionEnabled/setVisionEnabled +
+ * getVisionModel/setVisionModel)。
  */
-export function ModelVisibilityModal({ host, visibility, current, onModelState, onClose }: {
+function VisionRoutingPane({ visibility, vision }: {
+  visibility: ModelVisibilityController
+  vision: VisionRoutingController
+}) {
+  const candidates = useMemo(() => {
+    const list = visibility.quickModels.filter(model => model.supportsImages !== false)
+    const selected = vision.model
+    if (selected && !list.some(model => modelRef(model) === selected)) {
+      const current = visibility.models.find(model => modelRef(model) === selected)
+      if (current) list.push(current)
+    }
+    return list
+  }, [visibility.quickModels, visibility.models, vision.model])
+  const groups = useMemo(() => groupByProvider(candidates), [candidates])
+
+  if (!vision.available) {
+    return <div className="model-modal-state" data-testid="vision-unsupported">当前连接不支持识图设置。</div>
+  }
+  if (vision.loading) {
+    return <div className="model-modal-state" data-testid="vision-loading">正在加载识图设置…</div>
+  }
+  return (
+    <div className="vision-picker" data-testid="vision-picker">
+      <div className="computer-use-toggle-row">
+        <div>
+          <strong>识图模型</strong>
+          <p>图片识别</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={vision.enabled}
+          aria-label="启用识图模型"
+          className={`computer-use-switch${vision.enabled ? ' enabled' : ''}`}
+          disabled={vision.saving}
+          data-testid="vision-enabled-switch"
+          onClick={() => void vision.setEnabled(!vision.enabled)}
+        >
+          <span />
+        </button>
+      </div>
+      <p className="vision-picker-hint">主线模型不支持图片时，用指定识图模型识别图片后交给文字模型。</p>
+      {vision.error && (
+        <div className="model-modal-error" role="alert" data-testid="vision-error">
+          <span>{vision.error}</span>
+          <button className="visibility-error-close" aria-label="关闭错误提示" data-testid="vision-error-close" onClick={() => vision.dismissError()}>×</button>
+        </div>
+      )}
+      <label className="vision-model-select-row" style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 10, color: 'var(--muted)', fontSize: 11 }}>
+        <span>识图模型</span>
+        <select
+          className="vision-model-select"
+          aria-label="识图模型"
+          data-testid="vision-model-select"
+          value={vision.model ?? ''}
+          disabled={!vision.enabled || vision.saving}
+          onChange={event => void vision.setModel(event.target.value || null)}
+          style={{ width: '100%', maxWidth: 'none', padding: '5px', border: '1px solid var(--border-strong)', borderRadius: 6, color: 'var(--text)', background: 'var(--surface-input)', fontSize: 11 }}
+        >
+          <option value="">未选择识图模型</option>
+          {groups.map(group => (
+            <optgroup key={group.provider} label={group.provider}>
+              {group.models.map(model => (
+                <option key={modelRef(model)} value={modelRef(model)}>
+                  {model.name}（{modelRef(model)}）
+                </option>
+              ))}
+            </optgroup>
+          ))}
+        </select>
+      </label>
+      {vision.enabled && vision.model && (
+        <p className="vision-picker-hint" data-testid="vision-model-selected">已选：{vision.model}</p>
+      )}
+    </div>
+  )
+}
+
+/**
+ * `/model` — settings modal with two tabs: 通用 (vision-routing switch +
+ * selector, default off) and 模型管理 (provider-collapsible model visibility
+ * management mirroring Swift Settings > 模型, the default tab). Provider
+ * headers carry a tri-state checkbox (all/none/partial visible), a
+ * per-provider delete action (pi logout with confirmation) and an "添加模型"
+ * flow driving pi's native OAuth/api-key login. Visibility state is persisted
+ * through the host (hiddenModelIds, atomic); vision routing through
+ * getVisionEnabled/setVisionEnabled + getVisionModel/setVisionModel.
+ */
+export function ModelVisibilityModal({ host, visibility, vision, current, onModelState, onClose }: {
   host: PipiHostAPI
   visibility: ModelVisibilityController
+  vision: VisionRoutingController
   current: Model | null
   onModelState?: (state: ModelState) => void
   onClose: () => void
 }) {
+  const [tab, setTab] = useState<'general' | 'models'>('models')
   // Default: every provider collapsed. `expanded` is in-memory only (no cross-session
   // persistence); a refresh keeps it, so already-expanded providers stay open while
   // newly discovered providers (e.g. after refresh) appear collapsed.
@@ -100,11 +194,11 @@ export function ModelVisibilityModal({ host, visibility, current, onModelState, 
     <div className="model-modal-backdrop" data-testid="model-modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
       <section className="model-modal" role="dialog" aria-modal="true" aria-label="模型管理" data-testid="model-modal">
         <header>
-          <h2>{view === 'manage' ? '模型管理' : '添加模型'}</h2>
-          <p>{view === 'manage' ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。' : '登录 pi 支持的 provider 后，其模型目录会自动出现。'}</p>
+          <h2>{tab === 'general' ? '通用' : view === 'manage' ? '模型管理' : '添加模型'}</h2>
+          <p>{tab === 'general' ? '主线模型不支持图片时，用指定识图模型识别图片后交给文字模型。' : view === 'manage' ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。' : '登录 pi 支持的 provider 后，其模型目录会自动出现。'}</p>
           <button className="model-modal-close" aria-label="关闭模型管理" onClick={onClose}>×</button>
           <div className="model-modal-header-actions">
-            {view === 'manage'
+            {tab === 'models' && (view === 'manage'
               ? <>
                   <button
                     className="model-modal-refresh"
@@ -116,13 +210,33 @@ export function ModelVisibilityModal({ host, visibility, current, onModelState, 
                   </button>
                   <button className="model-modal-add" data-testid="model-add-button" onClick={() => setView('add')}>＋ 添加模型</button>
                 </>
-              : <button className="model-modal-add" data-testid="model-add-back" onClick={() => setView('manage')}>← 返回</button>}
+              : <button className="model-modal-add" data-testid="model-add-back" onClick={() => setView('manage')}>← 返回</button>)}
+          </div>
+          <div className="model-modal-tabs" role="tablist" aria-label="设置分类">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === 'general'}
+              className={`model-modal-tab${tab === 'general' ? ' active' : ''}`}
+              data-testid="model-tab-general"
+              onClick={() => setTab('general')}
+            >通用</button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === 'models'}
+              className={`model-modal-tab${tab === 'models' ? ' active' : ''}`}
+              data-testid="model-tab-models"
+              onClick={() => { setView('manage'); setTab('models') }}
+            >模型管理</button>
           </div>
         </header>
         <div className="model-modal-body" data-testid="model-modal-body">
-          {view === 'add'
-            ? <ProviderLoginPanel host={host} onAdded={() => { setView('manage'); void visibility.refresh() }} />
-            : <>
+          {tab === 'general'
+            ? <VisionRoutingPane visibility={visibility} vision={vision} />
+            : view === 'add'
+              ? <ProviderLoginPanel host={host} onAdded={() => { setView('manage'); void visibility.refresh() }} />
+              : <>
               {visibility.error && (
                 <div className="model-modal-error visibility-error" data-testid="visibility-error">
                   <span>{visibility.error}</span>

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -94,6 +94,40 @@ describe("listSessions session model metadata", () => {
     await backend.handle("setModel", ["bound", "relay", "fast"]);
     expect((await backend.handle("getModelState", ["bound"]))).toMatchObject({ model: { provider: "relay", id: "fast" } });
     expect((await backend.handle("getModelState", ["plain"]))).toMatchObject({ model: { provider: "relay", id: "fast" } });
+  });
+
+  it("does not spawn Pi when switching the model of a cold session", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-session-cold-setmodel-"));
+    const agent = join(root, "agent");
+    const cwd = join(root, "project");
+    const dir = join(root, "sessions", "--project--");
+    await mkdir(agent, { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(agent, "settings.json"), JSON.stringify({ defaultProvider: "relay", defaultModel: "cheap" }));
+    await writeFile(join(agent, "models.json"), JSON.stringify({ providers: { relay: { apiKey: "$RELAY_KEY", models: [{ id: "fast", name: "Fast", reasoning: true }, { id: "cheap", name: "Cheap", reasoning: true }] } } }));
+    await writeFile(join(dir, "bound.jsonl"), JSON.stringify({ type: "session", version: 3, id: "bound", timestamp: "2026-08-10T00:00:00.000Z", cwd }) + "\n");
+    const spawnSpy = vi.fn((_bin: any, _args: any, options: any) =>
+      spawn("/usr/local/bin/node", [new URL("./fake-pi.mjs", import.meta.url).pathname], { ...options, env: { ...options.env, PATH: "/usr/local/bin:/usr/bin:/bin" } }) as any,
+    );
+    const backend = createPiHostBackend({
+      agentDir: agent,
+      sessionsRoot: join(root, "sessions"),
+      runtimeRoot: join(root, "runtime"),
+      env: { RELAY_KEY: "present" },
+      piPath: "node",
+      spawn: spawnSpy,
+      authRuntime: { getProviders: async () => [], getAvailable: async () => [], login: async () => undefined, logout: async () => undefined },
+    });
+    await backend.handle("setProjectPaths", [[cwd]]);
+    const state = await backend.handle("setModel", ["bound", "relay", "fast"]) as any;
+    expect(spawnSpy).toHaveBeenCalledTimes(0);
+    expect(state.model).toMatchObject({ provider: "relay", id: "fast", name: "Fast" });
+    expect(await backend.handle("getModelState", ["bound"])).toMatchObject({ model: { provider: "relay", id: "fast" } });
+    const jsonl = await readFile(join(dir, "bound.jsonl"), "utf8");
+    expect(jsonl).toContain('"type":"model_change"');
+    expect(jsonl).toContain('"modelId":"fast"');
+    await backend.close();
   });
 });
 
@@ -277,7 +311,7 @@ describe("session model recovery after Pi exits", () => {
         }) as any;
       },
     });
-    await backend.handle("getModelState", ["session-1"]);
+    await (backend as any).ensure("session-1");
     return { backend, spawnCount: () => spawnCount };
   }
 

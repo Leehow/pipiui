@@ -154,4 +154,23 @@ describe('selected-session working stop control', () => {
     expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
     expect(screen.queryByTestId('stats-streaming')).toBeNull()
   })
+
+  it('does not keep the stop button when a late delta arrives after settle', async () => {
+    const { host, listeners } = controlledHost()
+    render(<App host={host} />)
+    await ready(listeners)
+
+    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
+    act(() => { listeners.get('welcome')?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: '结论已经写完了' }) })
+    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'settled' }) })
+    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+
+    // A leftover text/tool event after agent_settled must not reopen a streaming
+    // assistant bubble. That leaves the composer idle except for a stranded stop.
+    act(() => { listeners.get('welcome')?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: '迟到的尾巴' }) })
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
+    expect(screen.getByLabelText('发送消息')).toBeTruthy()
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
+    expect(screen.queryByTestId('stats-streaming')).toBeNull()
+  })
 })

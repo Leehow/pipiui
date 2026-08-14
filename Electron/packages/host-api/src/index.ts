@@ -418,6 +418,15 @@ export interface PipiHostAPI {
    */
   getVisionModel?(): Promise<string | null>;
   setVisionModel?(ref: string | null): Promise<string | null>;
+  /**
+   * Optional global master switch for the image-attachment fallback: when on
+   * and a vision model is selected, attached images are described by the
+   * vision model and the description text is injected into the message sent to
+   * a non-multimodal main model. Persisted by the host (Electron:
+   * `pipiui-settings.json`); missing = disabled.
+   */
+  getVisionEnabled?(): Promise<boolean>;
+  setVisionEnabled?(enabled: boolean): Promise<boolean>;
   listAgentDefinitions?(): Promise<AgentDefinition[]>;
   /**
    * Provider credentials and login — backed by pi's ModelRuntime
@@ -536,6 +545,8 @@ function apiFrom(
     setSubagentModel: (agentName, chain) => invoke("setSubagentModel", agentName, chain),
     getVisionModel: () => invoke("getVisionModel"),
     setVisionModel: ref => invoke("setVisionModel", ref),
+    getVisionEnabled: () => invoke("getVisionEnabled"),
+    setVisionEnabled: enabled => invoke("setVisionEnabled", enabled),
     listAgentDefinitions: () => invoke("listAgentDefinitions"),
     getSessionStats: sessionId => invoke("getSessionStats", sessionId),
     getQuotaSnapshot: sessionId => sessionId === undefined ? invoke("getQuotaSnapshot") : invoke("getQuotaSnapshot", sessionId),
