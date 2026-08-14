@@ -60,10 +60,20 @@ async function harness() {
   return { backend, events, deliver, latest };
 }
 
+function fakeLive() {
+  return {
+    process: { pid: 1, exitCode: null, signalCode: null, stdin: { end() {} } },
+    pending: new Map(),
+    compaction: { dispose() {} },
+    exit: Promise.resolve(),
+  };
+}
+
 describe("subagent lifecycle → AgentSummary", () => {
 	it("routes targeted abort through the owning live Pi command and waits for the real end event", async () => {
 		const { backend, deliver, latest } = await harness();
 		deliver({ ...START, agentId: "agent-safe_1" });
+		(backend as any).live.set("session-1", fakeLive());
 		const command = vi.fn(async () => ({}));
 		(backend as any).command = command;
 		const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
@@ -75,20 +85,70 @@ describe("subagent lifecycle → AgentSummary", () => {
 		expect(latest().state).toBe("aborted");
 	});
 
-	it("rejects a stop request when the owning Pi never acknowledges the command", async () => {
+	it("force-settles a stop when the owning Pi never acknowledges the command", async () => {
 		vi.useFakeTimers();
 		try {
 			const { backend, deliver, latest } = await harness();
 			deliver({ ...START, agentId: "agent-safe_1" });
+			(backend as any).live.set("session-1", fakeLive());
 			const command = vi.fn(() => new Promise<never>(() => undefined));
 			(backend as any).command = command;
 			const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
 			await vi.advanceTimersByTimeAsync(0);
 			expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1" });
-			const rejected = expect(aborting).rejects.toThrow("停止请求在 5 秒内未被主 Agent 接收；请重试");
 			await vi.advanceTimersByTimeAsync(5_000);
-			await rejected;
+			await expect(aborting).resolves.toBeUndefined();
+			expect(latest()).toMatchObject({ agentId: "agent-safe_1", state: "aborted" });
+			await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+				expect.objectContaining({ agentId: "agent-safe_1", state: "aborted" }),
+			]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("force-settles a stop when the host closes before the end event arrives", async () => {
+		const { backend, deliver, latest } = await harness();
+		deliver({ ...START, agentId: "agent-safe_1" });
+		(backend as any).live.set("session-1", fakeLive());
+		const command = vi.fn(async () => ({}));
+		(backend as any).command = command;
+		const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
+		await vi.waitFor(() => expect(command).toHaveBeenCalled());
+		expect(latest().state).toBe("running");
+		await backend.close();
+		await expect(aborting).resolves.toBeUndefined();
+		expect(latest()).toMatchObject({ agentId: "agent-safe_1", state: "aborted" });
+		await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+			expect.objectContaining({ agentId: "agent-safe_1", state: "aborted" }),
+		]);
+	});
+
+	it("force-settles a stop when no live Pi process exists to receive /subagent_abort", async () => {
+		const { backend, deliver, latest } = await harness();
+		deliver({ ...START, agentId: "agent-safe_1" });
+		const command = vi.fn(async () => ({}));
+		(backend as any).command = command;
+		await expect(backend.handle("abortAgent", ["agent-safe_1"])).resolves.toBeUndefined();
+		expect(command).not.toHaveBeenCalled();
+		expect(latest()).toMatchObject({ agentId: "agent-safe_1", state: "aborted" });
+	});
+
+	it("force-settles a stop when the worker never emits an end event", async () => {
+		vi.useFakeTimers();
+		try {
+			const { backend, deliver, latest } = await harness();
+			deliver({ ...START, agentId: "agent-safe_1" });
+			(backend as any).live.set("session-1", fakeLive());
+			const command = vi.fn(async () => ({}));
+			(backend as any).command = command;
+			const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1" });
 			expect(latest().state).toBe("running");
+			await vi.advanceTimersByTimeAsync(15_000);
+			await expect(aborting).resolves.toBeUndefined();
+			expect(latest()).toMatchObject({ agentId: "agent-safe_1", state: "aborted" });
 		} finally {
 			vi.useRealTimers();
 		}
@@ -178,7 +238,7 @@ describe("subagent lifecycle → AgentSummary", () => {
     deliver(START);
     deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 0, itemType: "thinking", text: "Planning project rebuild" });
     deliver({ kind: "log", agentId: "a1", runId: "r1", items: [{ itemType: "tool", name: "bash", text: "npm run build" }, { itemType: "toolResult", text: "done", isError: false }] });
-    const logs = events.filter((event): event is Extract<AgentEvent, { type: "agent_log" }> => event.type === "agent_log");
+    const logs = events.filter((event): event is Extract<AgentEvent, { type: "agent_log" }> => event.type === "agent_log" && !event.resetStreamSlots);
     expect(logs.map(log => [log.itemType, log.name ?? "", log.text])).toEqual([
       ["thinking", "", "Planning project rebuild"],
       ["tool", "bash", "npm run build"],
@@ -195,7 +255,7 @@ describe("subagent lifecycle → AgentSummary", () => {
     // A runtime without the key stays backward compatible: the field is simply absent.
     deliver({ kind: "log_delta", agentId: "a1", runId: "r1", itemType: "text", text: "legacy" });
     deliver({ kind: "log", agentId: "a1", runId: "r1", items: [{ itemType: "tool", name: "bash", text: "run" }] });
-    const logs = events.filter((event): event is Extract<AgentEvent, { type: "agent_log" }> => event.type === "agent_log");
+    const logs = events.filter((event): event is Extract<AgentEvent, { type: "agent_log" }> => event.type === "agent_log" && !event.resetStreamSlots);
     expect(logs.map(log => [log.contentIndex, log.text])).toEqual([
       [0, "{\"step\":"],
       [0, "{\"step\": 1}"],
@@ -227,6 +287,42 @@ describe("subagent lifecycle → AgentSummary", () => {
     await expect(backend.handle("getAgentLogs", ["shared", "session-2", "run-2"])).resolves.toMatchObject([{ contentIndex: 0, text: "session two" }]);
     await expect(backend.handle("getAgentLogs", ["shared", "session-1", "run-3"])).resolves.toMatchObject([{ contentIndex: 0, text: "new run" }]);
     await expect(backend.handle("getAgentLogs", ["shared", "session-2", "run-1"])).resolves.toEqual([]);
+  });
+
+  it("persists agent logs across host restart so a completed transcript can be reloaded", async () => {
+    const { backend, deliver } = await harness();
+    deliver(START);
+    deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 0, itemType: "thinking", text: "first" });
+    deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 1, itemType: "text", text: "先读 A" });
+    deliver({ kind: "log", agentId: "a1", runId: "r1", items: [{ itemType: "tool", name: "read", text: "A.tsx" }] });
+    deliver(END);
+    await closeTracked(backend);
+
+    const restarted = createPiHostBackend({ agentDir: join(root, "agent"), sessionsRoot: join(root, "sessions") });
+    backends.push(restarted);
+    await expect(restarted.handle("getAgentLogs", ["a1", "session-1", "r1"])).resolves.toMatchObject([
+      { itemType: "thinking", text: "first" },
+      { itemType: "text", text: "先读 A" },
+      { itemType: "tool", name: "read", text: "A.tsx" },
+    ]);
+    await closeTracked(restarted);
+  });
+
+  it("resets cached contentIndex slots on batched log so the next turn does not overwrite", async () => {
+    const { backend, deliver } = await harness();
+    deliver(START);
+    deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 0, itemType: "thinking", text: "first" });
+    deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 1, itemType: "text", text: "先读 A" });
+    deliver({ kind: "log", agentId: "a1", runId: "r1", items: [{ itemType: "tool", name: "read", text: "A.tsx" }] });
+    deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 0, itemType: "thinking", text: "second" });
+    deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 1, itemType: "text", text: "再读 B" });
+    await expect(backend.handle("getAgentLogs", ["a1", "session-1", "r1"])).resolves.toMatchObject([
+      { itemType: "thinking", text: "first" },
+      { itemType: "text", text: "先读 A" },
+      { itemType: "tool", text: "A.tsx" },
+      { itemType: "thinking", text: "second" },
+      { itemType: "text", text: "再读 B" },
+    ]);
   });
 
   it("marks a failed run failed rather than leaving it running forever", async () => {

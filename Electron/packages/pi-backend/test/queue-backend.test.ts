@@ -141,4 +141,25 @@ describe("PiHostBackend message queue integration", () => {
     expect(events.slice(lastSettled + 1).some(event => event.status === "streaming")).toBe(false);
     await backend.close();
   });
+
+  it("streams an injected follow-up user message so the UI can show [subagent-done]", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const events: any[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream") events.push(event.event);
+    });
+    await backend.handle("sendPrompt", ["s1", "__user_followup__"]);
+    await eventually(() => events.some(event => event.type === "user_message"));
+    off();
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "user_message",
+        sessionId: "s1",
+        content: "[subagent-done] agentId=a1 name=explore ok=true",
+      }),
+      expect.objectContaining({ type: "status", sessionId: "s1", status: "started" }),
+    ]));
+    await backend.close();
+  });
 });

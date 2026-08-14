@@ -5,6 +5,7 @@ import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import type { AuthType } from "@pipi/host-api";
 import type { AuthInteractionLike, AuthRuntimeLike } from "./provider-auth.js";
+import { withElectronRunAsNode } from "./spawn-assembly.js";
 
 const execFileAsync = promisify(execFile);
 export interface ExternalAuthRuntimeOptions { helperPath: string; piPath: string; agentDir: string; sessionsRoot?: string; enforceProfile?: boolean; env?: NodeJS.ProcessEnv; nodePath?: string }
@@ -24,7 +25,7 @@ function parseDotEnv(source: string): NodeJS.ProcessEnv {
 export async function modelRuntimeEnvironment(agentDir: string, piPath: string, base: NodeJS.ProcessEnv, sessionsRoot = join(agentDir, "sessions"), enforceProfile = false): Promise<NodeJS.ProcessEnv> {
   let overlay: NodeJS.ProcessEnv = {};
   try { overlay = parseDotEnv(await readFile(join(agentDir, ".env"), "utf8")); } catch { /* optional */ }
-  return { ...base, ...overlay, PATH: [dirname(piPath), "/opt/homebrew/bin", "/usr/local/bin", base.PATH].filter(Boolean).join(delimiter), PIPIUI_PI_PATH: piPath, ...(enforceProfile ? { PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: sessionsRoot } : {}) };
+  return withElectronRunAsNode({ ...base, ...overlay, PATH: [dirname(piPath), "/opt/homebrew/bin", "/usr/local/bin", base.PATH].filter(Boolean).join(delimiter), PIPIUI_PI_PATH: piPath, ...(enforceProfile ? { PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: sessionsRoot } : {}) });
 }
 
 async function resolveNode(explicit: string | undefined, env: NodeJS.ProcessEnv): Promise<string> {

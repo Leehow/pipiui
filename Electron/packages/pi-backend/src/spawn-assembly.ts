@@ -40,16 +40,27 @@ export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,strin
  * from both base layers, so a stale `.env`/parent value can never resurrect a disabled
  * feature or clobber the host's bridge/computer contract.
  */
+/**
+ * Packaged Pi/auth children run as Electron Helper. A reconstructed spawn env
+ * that drops this flag makes Helper start as Chromium and busy-loop.
+ * Harmless on a real Node binary.
+ */
+export function withElectronRunAsNode<T extends Record<string, string | undefined>>(
+  env: T,
+): T & { ELECTRON_RUN_AS_NODE: string } {
+  return { ...env, ELECTRON_RUN_AS_NODE: "1" };
+}
+
 export function mergedSpawnEnvironment(
   parent: NodeJS.ProcessEnv,
   dotEnv: Record<string, string>,
   internal: Record<string, string>,
 ): Record<string, string> {
-  return {
+  return withElectronRunAsNode({
     ...sanitizeEnvironment(parent),
     ...sanitizeEnvironment(dotEnv),
     ...internal,
-  };
+  });
 }
 /** Assemble the Electron host's Pi process contract. */
 export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.resourceMode==="explicit")args.push("--no-extensions","--no-skills","--no-prompt-templates","--no-themes");if(input.agentDir)env.PI_CODING_AGENT_DIR=input.agentDir;if(input.sessionsRoot)env.PI_CODING_AGENT_SESSION_DIR=input.sessionsRoot;if(input.sessionPath)args.push("--session",input.sessionPath);if(enabled(f,"philosophy"))ext(args,p.philosophy);if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git"))ext(args,p.git);if(enabled(f,"reload"))ext(args,p.reload);if(enabled(f,"webSearch")){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){ext(args,p.skillLoader);if(p.skillLoader&&p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);args.push(...mainSessionExcludeToolArgs({bossReadOnly:enabled(f,"bossReadOnly"),disabledToolNames:input.disabledToolNames}));
@@ -121,15 +132,55 @@ export function resolvePiExecutable(env:NodeJS.ProcessEnv=process.env):string{
   const candidates=[...fromPath,join(homedir(),".npm-global","bin","pi"),"/opt/homebrew/bin/pi","/usr/local/bin/pi",join(homedir(),".bun","bin","pi"),join(homedir(),".local","bin","pi")];
   return candidates.find(candidate=>{try{accessSync(candidate,constants.X_OK);return true}catch{return false}})??"pi";
 }
+const NODE_BIN = process.platform === "win32" ? "node.exe" : "node";
+
+/**
+ * Packaged Electron ships `node` as a shim that execs Helper under
+ * ELECTRON_RUN_AS_NODE. Detect that script so user commands can prefer a real
+ * Node binary instead of turning every `npm test` into a Helper swarm.
+ */
+export function isElectronNodeShim(executable: string): boolean {
+  try {
+    const head = readFileSync(executable, "utf8").slice(0, 400);
+    return head.startsWith("#!") && head.includes("ELECTRON_RUN_AS_NODE");
+  } catch {
+    return false;
+  }
+}
+
+function nodeBinaryIn(dir: string): string {
+  return join(dir, NODE_BIN);
+}
+
+function isRealNodeDir(dir: string): boolean {
+  const binary = nodeBinaryIn(dir);
+  try {
+    accessSync(binary, constants.X_OK);
+    return !isElectronNodeShim(binary);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Finder/Dock-launched apps inherit a minimal PATH, so pi's `#!/usr/bin/env node` shebang and any
  * `node`/`npm` child exit 127 unless the
  * well-known tool dirs (pi's own bin, Homebrew, /usr/local) are prepended.
+ *
+ * When the packaged Electron node shim is on PATH and a real Node exists, drop
+ * the shim directory: Pi itself is launched by absolute path / PIPIUI_NODE_PATH,
+ * but bash/`npx`/`#!/usr/bin/env node` must not inherit Helper as `node`.
  */
 export function withToolPath(env:Record<string,string>, piExecutable:string):Record<string,string>{
-  const fallbackDirs=["/opt/homebrew/bin","/usr/local/bin","/usr/bin","/bin"];
-  const existing=env.PATH??"";
-  return {...env,PATH:[...new Set([dirname(piExecutable),...existing.split(delimiter).filter(Boolean),...fallbackDirs])].join(delimiter)};
+  const fallbackDirs=["/opt/homebrew/bin","/usr/local/bin",join(homedir(),".local","bin"),join(homedir(),".npm-global","bin"),"/usr/bin","/bin"];
+  const existing=(env.PATH??"").split(delimiter).filter(Boolean);
+  const candidates=[...new Set([dirname(piExecutable),...existing,...fallbackDirs].filter(Boolean))];
+  const hasShim=candidates.some(dir=>isElectronNodeShim(nodeBinaryIn(dir)));
+  if(!hasShim)return {...env,PATH:candidates.join(delimiter)};
+  const realNodeDirs=candidates.filter(isRealNodeDir);
+  if(realNodeDirs.length===0)return {...env,PATH:candidates.join(delimiter)};
+  const withoutShim=candidates.filter(dir=>!isElectronNodeShim(nodeBinaryIn(dir)));
+  return {...env,PATH:[...new Set([...realNodeDirs,...withoutShim])].join(delimiter)};
 }
 /** Host-independent fallback for tests/embedders. The Electron app injects app.getPath('userData'). */
 export function defaultRuntimeRoot():string { return join(homedir(),".pipiui-electron","runtime") }

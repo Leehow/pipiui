@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPiHostBackend } from "../src/index.js";
-import { ExternalAuthRuntime } from "../src/external-auth-runtime.js";
+import { ExternalAuthRuntime, modelRuntimeEnvironment } from "../src/external-auth-runtime.js";
 
 const fixture = `
 const command = process.argv[2];
@@ -84,5 +84,14 @@ describe("external Pi model runtime", () => {
     const result = await runtime.login("xai", "api_key", { prompt: async () => secret, notify: () => undefined });
     expect(result).toEqual({ accepted: secret.length });
     expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it("keeps ELECTRON_RUN_AS_NODE on a sparse Finder-like auth helper env", async () => {
+    const env = await modelRuntimeEnvironment(
+      "/missing-agent",
+      "/opt/homebrew/bin/pi",
+      { HOME: "/tmp", PATH: "/usr/bin:/bin" },
+    );
+    expect(env.ELECTRON_RUN_AS_NODE).toBe("1");
   });
 });

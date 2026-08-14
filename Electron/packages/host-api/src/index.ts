@@ -21,6 +21,7 @@ export type SessionLease = { sessionId: string; writable: boolean; holder?: { pr
 export type HistoryTool = { id: string; name: string; input: string };
 export type HistoryActivity =
   | { type: "thinking"; contentIndex: number; content: string }
+  | { type: "text"; contentIndex: number; content: string }
   | { type: "tool"; contentIndex: number; tool: HistoryTool };
 /**
  * Transcript entry. `content` is the plain text of the message; assistant
@@ -39,6 +40,8 @@ export type HistoryEntry = {
   tools?: HistoryTool[];
   /** assistant only: ordered non-text content blocks for exact resume parity. */
   activities?: HistoryActivity[];
+  /** assistant only: terminal failure (`stopReason: "error"`) with no text content. */
+  errorMessage?: string;
   /** tool (toolResult) only: the tool call this result belongs to. */
   toolCallId?: string;
   toolName?: string;
@@ -332,12 +335,20 @@ export interface BrowserHostAPI {
 export type TranscriptImage = { data: string; mimeType: string };
 
 export type StreamEvent =
-  | { type: "text"; sessionId: string; contentIndex: number; delta: string }
+  | { type: "user_message"; sessionId: string; content: string; id?: string }
+  | { type: "text"; sessionId: string; contentIndex: number; delta: string; segment?: number }
   | { type: "thinking"; sessionId: string; contentIndex: number; delta: string; segment?: number }
-  | { type: "tool_call"; sessionId: string; contentIndex?: number; toolCallId: string; name: string; delta?: string }
+  | { type: "tool_call"; sessionId: string; contentIndex?: number; toolCallId: string; name: string; delta?: string; segment?: number }
   | { type: "tool_result"; sessionId: string; toolCallId: string; content: string; isError?: boolean; images?: TranscriptImage[] }
   | { type: "session_title"; sessionId: string; title: string; source: "provisional" | "model" | "manual" }
   | { type: "status"; sessionId: string; status: "started" | "streaming" | "settled" | "stopped"; pendingFollowUps?: string[] }
+  /**
+   * Turn-terminal model/provider failure: pi closed the assistant message with
+   * `stopReason: "error"` and an `errorMessage` instead of text. Forwarded so a
+   * failed turn never settles as a blank bubble. `content` is the raw provider
+   * error text. Old clients may safely ignore it.
+   */
+  | { type: "error"; sessionId: string; content: string }
   /** Snapshot after every queue mutation; old clients may safely ignore this new event type. */
   | { type: "queue_update"; sessionId: string; queue: QueuedMessage[]; pendingFollowUps?: string[] }
   /**
@@ -348,7 +359,7 @@ export type StreamEvent =
    * mutually exclusive with a clean finish. Old clients may safely ignore it.
    */
   | { type: "compaction"; sessionId: string; phase: "start" | "end"; reason?: string; aborted?: boolean; error?: string };
-export type AgentEvent = { type: "agent"; agent: AgentSummary } | { type: "agent_log"; /** Optional only so an older host event can be ignored safely; current hosts always emit both identity fields. */ sessionId?: string; agentId: string; runId?: string; itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; /** Runtime log_delta key: cumulative full text per streamed entry, so the panel can upsert one row per contentIndex instead of one per chunk. */ contentIndex?: number } | { type: "worktree"; status: WorktreeStatus };
+export type AgentEvent = { type: "agent"; agent: AgentSummary } | { type: "agent_log"; /** Optional only so an older host event can be ignored safely; current hosts always emit both identity fields. */ sessionId?: string; agentId: string; runId?: string; itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; /** Runtime log_delta key: cumulative full text per streamed entry, so the panel can upsert one row per contentIndex instead of one per chunk. */ contentIndex?: number; /** Turn boundary from runtime `kind:"log"`: forget contentIndex slots so the next message's index 0 opens a new row instead of rewriting the previous thinking/text. */ resetStreamSlots?: boolean } | { type: "worktree"; status: WorktreeStatus };
 export type HostEvent =
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "stream"; event: StreamEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "agents"; event: AgentEvent }

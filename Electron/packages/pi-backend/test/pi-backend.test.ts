@@ -17,12 +17,12 @@ expect(await backend.handle("getWorktreeStatus",["agent-1"])).toMatchObject({lif
 await expect(backend.handle("discardWorktree",["agent-1"])).rejects.toThrow(/not implemented in this host yet/);expect(await backend.handle("capabilities",[])).toMatchObject({computerUse:false,revealInFinder:process.platform==="darwin"});});
 
 it("serves real get_session_stats snapshots: empty session, missing usage, and RPC errors stay distinguishable",async()=>{root=await mkdtemp(join(tmpdir(),"pipi-pi-stats-"));const cwd=join(root,"project");const dir=join(root,"sessions","project");await mkdir(dir,{recursive:true});await mkdir(cwd,{recursive:true});const path=join(dir,"session.jsonl");await writeFile(path,[JSON.stringify({type:"session",version:3,id:"session-1",timestamp:"2026-08-10T00:00:00.000Z",cwd})].join("\n")+"\n");const spawnPi=()=>({piPath:"node",spawn:(_bin,_args,options)=>spawn("/usr/local/bin/node",[new URL("./fake-pi.mjs",import.meta.url).pathname],{...options,env:{...options.env,PATH:"/usr/local/bin:/usr/bin:/bin"}}) as any});const backend=createPiHostBackend({agentDir:join(root,"agent"),sessionsRoot:join(root,"sessions"),runtimeRoot:join(root,"runtime"),canonicalProjectPaths:async()=>undefined,...spawnPi()});
-// A session that never ran has a zero snapshot with real tokens/cost fields and the active model.
-const empty=await backend.handle("getSessionStats",["session-1"]) as any;expect(empty).toMatchObject({sessionId:"session-1",tokens:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0},cost:0,contextUsage:{tokens:0,contextWindow:262144,percent:0},model:{provider:"fake",id:"fake-1",name:"Fake"}});
-// Missing usage: pi omits contextUsage; the snapshot falls back to the
-// per-session last-known context (0/262144 measured earlier in this test)
-// instead of guessing — the task-required rehydration path.
-const events:any[]=[];const off=backend.subscribe(e=>events.push(e));await backend.handle("sendPrompt",["session-1","no-usage"]);await new Promise(r=>setTimeout(r,20));off();const missing=await backend.handle("getSessionStats",["session-1"]) as any;expect(missing.tokens).toMatchObject({input:1200,output:340,cacheRead:800,cacheWrite:100,total:2440});expect(missing.cost).toBe(0.00123);expect(missing.contextUsage).toEqual({tokens:0,contextWindow:262144,percent:0});expect(events.some(e=>e.channel==="session_stats"&&e.event.type==="snapshot"&&e.event.stats.contextUsage&&e.event.stats.contextUsage.tokens===0)).toBe(true);
+// Browsing a session that never ran must not spawn Pi: zeros, no fabricated window/model.
+const empty=await backend.handle("getSessionStats",["session-1"]) as any;expect(empty).toMatchObject({sessionId:"session-1",tokens:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0},cost:0});expect(empty.contextUsage).toBeUndefined();expect(empty.model).toBeUndefined();
+// A real turn establishes last-known occupancy. A later turn that omits
+// contextUsage must fall back to that last-known window instead of guessing.
+await backend.handle("sendPrompt",["session-1","go"]);await new Promise(r=>setTimeout(r,20));
+const events:any[]=[];const off=backend.subscribe(e=>events.push(e));await backend.handle("sendPrompt",["session-1","no-usage"]);await new Promise(r=>setTimeout(r,20));off();const missing=await backend.handle("getSessionStats",["session-1"]) as any;expect(missing.tokens).toMatchObject({input:1200,output:340,cacheRead:800,cacheWrite:100,total:2440});expect(missing.cost).toBe(0.00123);expect(missing.contextUsage).toMatchObject({tokens:15000,contextWindow:262144,percent:5.7});expect(events.some(e=>e.channel==="session_stats"&&e.event.type==="snapshot"&&e.event.stats.contextUsage&&e.event.stats.contextUsage.tokens===15000)).toBe(true);
 // A failing pi RPC surfaces as a rejected command, not a fabricated snapshot.
 await backend.handle("sendPrompt",["session-1","fail-stats"]);await new Promise(r=>setTimeout(r,20));await expect(backend.handle("getSessionStats",["session-1"])).rejects.toThrow(/stats unavailable/);
 // No id and no active session: explicit error rather than a guessed session.
@@ -31,7 +31,12 @@ const fresh=createPiHostBackend({agentDir:join(root,"agent"),sessionsRoot:join(r
 it("tags streamed thinking with a per-message segment epoch",async()=>{root=await mkdtemp(join(tmpdir(),"pipi-pi-seg-"));const cwd=join(root,"project");const dir=join(root,"sessions","project");await mkdir(dir,{recursive:true});await mkdir(cwd,{recursive:true});await writeFile(join(dir,"session.jsonl"),[JSON.stringify({type:"session",version:3,id:"session-1",timestamp:"2026-08-10T00:00:00.000Z",cwd})].join("\n")+"\n");const backend=createPiHostBackend({agentDir:join(root,"agent"),sessionsRoot:join(root,"sessions"),runtimeRoot:join(root,"runtime"),canonicalProjectPaths:async()=>undefined,piPath:"node",spawn:(_bin,_args,options)=>spawn("/usr/local/bin/node",[new URL("./fake-pi.mjs",import.meta.url).pathname],{...options,env:{...options.env,PATH:"/usr/local/bin:/usr/bin:/bin"}}) as any});await backend.handle("addProject",[cwd]);const events:any[]=[];const off=backend.subscribe(e=>events.push(e));await backend.handle("sendPrompt",["session-1","__segments__"]);await new Promise(r=>setTimeout(r,20));off();
 // Pi restarts contentIndex at every assistant message; the second thinking block
 // at contentIndex 0 must carry a fresh segment so the UI keeps the blocks apart.
-const thinking=events.filter(e=>e.channel==="stream"&&e.event.type==="thinking").map(e=>[e.event.segment,e.event.contentIndex,e.event.delta]);expect(thinking).toEqual([[0,0,"think"],[1,0,"reflect"]]);});});
+const thinking=events.filter(e=>e.channel==="stream"&&e.event.type==="thinking").map(e=>[e.event.segment,e.event.contentIndex,e.event.delta]);expect(thinking).toEqual([[0,0,"think"],[1,0,"reflect"]]);});
+
+it("forwards a terminal stopReason error as a stream error so a failed turn is never blank",async()=>{root=await mkdtemp(join(tmpdir(),"pipi-pi-fail-"));const cwd=join(root,"project");const dir=join(root,"sessions","project");await mkdir(dir,{recursive:true});await mkdir(cwd,{recursive:true});await writeFile(join(dir,"session.jsonl"),[JSON.stringify({type:"session",version:3,id:"session-1",timestamp:"2026-08-10T00:00:00.000Z",cwd})].join("\n")+"\n");const backend=createPiHostBackend({agentDir:join(root,"agent"),sessionsRoot:join(root,"sessions"),runtimeRoot:join(root,"runtime"),canonicalProjectPaths:async()=>undefined,piPath:"node",spawn:(_bin,_args,options)=>spawn("/usr/local/bin/node",[new URL("./fake-pi.mjs",import.meta.url).pathname],{...options,env:{...options.env,PATH:"/usr/local/bin:/usr/bin:/bin"}}) as any});await backend.handle("addProject",[cwd]);const events:any[]=[];const off=backend.subscribe(e=>events.push(e));await backend.handle("sendPrompt",["session-1","__fail_turn__"]);await new Promise(r=>setTimeout(r,20));off();
+// Pi reports message_end with stopReason "error" + errorMessage and no content;
+// the host must surface it as a stream error so the UI can render the failure.
+const errors=events.filter(e=>e.channel==="stream"&&e.event.type==="error").map(e=>e.event);expect(errors).toEqual([{type:"error",sessionId:"session-1",content:"Codex error: Invalid schema for function 'subagent': ..."}]);});});
 
 describe("PiHostBackend history structure",()=>{let root="";afterEach(async()=>{if(root)await (await import("node:fs/promises")).rm(root,{recursive:true,force:true});root="";});it("preserves thinking/tool structure in history entries (SessionManager path)", async () => {
   root = await mkdtemp(join(tmpdir(), "pipi-pi-hist-"));
@@ -60,6 +65,7 @@ describe("PiHostBackend history structure",()=>{let root="";afterEach(async()=>{
       { type: "tool", contentIndex: 1, tool: { id: "call-1", name: "bash", input: '{"command":"ls -la"}' } },
       { type: "thinking", contentIndex: 2, content: "verify next" },
       { type: "tool", contentIndex: 3, tool: { id: "call-2", name: "read", input: '{"path":"src/App.tsx"}' } },
+      { type: "text", contentIndex: 4, content: "done" },
     ] }),
     expect.objectContaining({ role: "tool", content: "total 0", toolCallId: "call-1", toolName: "bash", isError: false }),
   ]);
@@ -87,6 +93,26 @@ it("preserves tool structure via the streaming fallback for oversized sessions",
   expect(history).toEqual([
     expect.objectContaining({ role: "assistant", content: "ok", tools: [{ id: "call-9", name: "web_search", input: '{"query":"hello"}' }] }),
     expect.objectContaining({ role: "tool", content: "result!", toolCallId: "call-9", toolName: "web_search" }),
+  ]);
+});
+
+it("carries terminal assistant errors into history so resumed sessions still show them", async () => {
+  root = await mkdtemp(join(tmpdir(), "pipi-pi-hist-fail-"));
+  const cwd = join(root, "project");
+  const dir = join(root, "sessions", "project");
+  await mkdir(dir, { recursive: true });
+  await mkdir(cwd, { recursive: true });
+  const path = join(dir, "session.jsonl");
+  const msg = (id, parentId, message) => JSON.stringify({ type: "message", id, parentId, timestamp: "2026-08-10T00:00:00.000Z", message });
+  // The on-disk shape of a failed openai-codex turn: content [], stopReason "error", errorMessage.
+  await writeFile(path, [
+    JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: "2026-08-10T00:00:00.000Z", cwd }),
+    msg("fail-1", null, { role: "assistant", content: [], stopReason: "error", errorMessage: "Codex error: Invalid schema for function 'subagent': ..." }),
+  ].join("\n") + "\n");
+  const backend = createPiHostBackend({ agentDir: join(root, "agent"), sessionsRoot: join(root, "sessions"), runtimeRoot: join(root, "runtime"), piPath: "node" });
+  const history = await backend.handle("getSessionHistory", ["session-1"]) as any[];
+  expect(history).toEqual([
+    expect.objectContaining({ role: "assistant", content: "", errorMessage: "Codex error: Invalid schema for function 'subagent': ..." }),
   ]);
 });
 });

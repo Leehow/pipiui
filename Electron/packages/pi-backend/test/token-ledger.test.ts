@@ -176,7 +176,7 @@ describe("per-session last-known context persistence", () => {
     expect(restored.contextUsage.percent).toBeCloseTo(15000 / 262144 * 100, 3);
   });
 
-  it("returns a cold session's ledger snapshot before Pi finishes starting, then refreshes in the background", async () => {
+  it("returns a cold session's ledger snapshot without waiting for Pi", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-ledger-cache-first-"));
     const agent = join(root, "agent");
     const sessions = join(root, "sessions");

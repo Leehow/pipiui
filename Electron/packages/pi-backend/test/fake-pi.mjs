@@ -82,6 +82,34 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     if (command.message === "fill-context-no-compact") { contextTokens = 240000; failCompact = true }
     if (command.message === "fill-context-slow") { contextTokens = 240000; slowCompact = true }
     ok();
+    if (command.message === "__user_followup__") {
+      send({
+        type: "message_end",
+        message: {
+          id: "u-done",
+          role: "user",
+          content: [{ type: "text", text: "[subagent-done] agentId=a1 name=explore ok=true" }],
+        },
+      });
+      send({ type: "agent_start" });
+      return;
+    }
+    if (command.message === "__fail_turn__") {
+      // Provider failure: the assistant message ends with stopReason "error",
+      // an errorMessage, and no content — the host must forward it to the UI.
+      send({
+        type: "message_end",
+        message: {
+          id: "fail-1",
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "Codex error: Invalid schema for function 'subagent': ...",
+        },
+      });
+      send({ type: "agent_settled" });
+      return;
+    }
     emitTurn(command.message, command.images);
     if (command.message === "__late_queue_update__") send({ type: "queue_update", followUp: [] });
     return;

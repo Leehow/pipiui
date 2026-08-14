@@ -101,6 +101,7 @@ export {
   resolvePiExecutable,
   resolveSpawnPaths,
   sanitizeEnvironment,
+  withElectronRunAsNode,
   withToolPath,
   type PiCommand,
 } from "./spawn-assembly.js";
@@ -608,7 +609,14 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
   } else if (Array.isArray(content)) {
     for (const [contentIndex, part] of content.entries()) {
       if (!part || typeof part !== "object") continue;
-      if (part.type === "text") textPart += part.text ?? "";
+      if (part.type === "text") {
+        const fragment = part.text ?? "";
+        textPart += fragment;
+        if (fragment) {
+          activities = activities ?? [];
+          activities.push({ type: "text", contentIndex, content: fragment });
+        }
+      }
       else if (part.type === "thinking") {
         const fragment = part.thinking ?? "";
         thinking = (thinking ?? "") + fragment;
@@ -660,6 +668,13 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
     result.toolCallId = message.toolCallId;
     result.toolName = message.toolName;
     result.isError = Boolean(message.isError);
+  }
+  if (role === "assistant" && message.stopReason === "error") {
+    const errorMessage =
+      typeof message.errorMessage === "string" && message.errorMessage
+        ? message.errorMessage
+        : undefined;
+    if (errorMessage) result.errorMessage = errorMessage;
   }
   return result;
 }
@@ -839,6 +854,14 @@ function sanitizeAttachmentName(
   const safe = base.replace(/[^\w.\-() ]/g, "").trim();
   return safe || fallback;
 }
+type CachedAgentLog = { itemType: string; text: string; name?: string; isError?: boolean; contentIndex?: number };
+function isCachedAgentLog(value: unknown): value is CachedAgentLog {
+  if (!isRecord(value) || typeof value.itemType !== "string" || typeof value.text !== "string") return false;
+  if (value.name !== undefined && typeof value.name !== "string") return false;
+  if (value.isError !== undefined && typeof value.isError !== "boolean") return false;
+  if (value.contentIndex !== undefined && typeof value.contentIndex !== "number") return false;
+  return true;
+}
 export class PiHostBackend implements HostBackend {
   readonly protocolVersion = 2 as const;
   private listeners = new Set<(event: HostEvent) => void>();
@@ -853,6 +876,8 @@ export class PiHostBackend implements HostBackend {
    * different sessions stay fully parallel.
    */
   private ensureInFlight = new Map<string, Promise<Live>>();
+  /** Parsed history for an unchanged JSONL. Switching back must not re-parse on the UI thread. */
+  private historyCache = new Map<string, { mtimeMs: number; size: number; offset: number; limit: number; entries: HistoryEntry[] }>();
   /** At most one Swift-parity title side channel may be launched per placeholder session. */
   private titleGenerationStarted = new Set<string>();
   /** A user rename always wins over an already-running automatic title refinement. */
@@ -861,7 +886,8 @@ export class PiHostBackend implements HostBackend {
   private titleGenerationAbort = new AbortController();
   /** In-memory agent log cache: exact session + agent + run → accumulated log entries. Lets the UI
    * reconstruct a completed subagent's transcript without a live subscription. */
-  private agentLogCache = new Map<string, { itemType: string; text: string; name?: string; isError?: boolean; contentIndex?: number }[]>();
+  private agentLogCache = new Map<string, CachedAgentLog[]>();
+  private agentLogsPersistTimer: ReturnType<typeof setTimeout> | undefined;
   /** Cache-first stats refreshes that must settle during graceful close. */
   private backgroundStatsRefreshes = new Set<Promise<void>>();
   private models: Model[] = [];
@@ -888,6 +914,9 @@ export class PiHostBackend implements HostBackend {
   private root: string;
   /** Stat-validated session metadata cache; re-reads only files whose size/mtime changed. */
   private indexCache = new Map<string, { size: number; mtimeMs: number; meta: SessionMeta }>();
+  /** Last index, keyed by session id. findSession must not walk the tree again. */
+  private sessionById = new Map<string, SessionMeta>();
+  private indexGenerations = 0;
   /** Shares one directory scan across the concurrent locate() calls a single UI click triggers. */
   private indexScan?: Promise<SessionMeta[]>;
   private piCommand: PiCommand;
@@ -925,6 +954,7 @@ export class PiHostBackend implements HostBackend {
   private queueLoads = new Map<string, Promise<void>>();
   private queueWrites = new Map<string, Promise<void>>();
   private closed = false;
+  private agentTerminalWaiters = new Set<() => void>();
   /** Computer-use screenshot cache: screenshotId → base64+mimeType. Populated by
    * the computerAction handler so tool-result markers resolve to inline images. */
   private computerScreenshots = new Map<string, { data: string; mimeType: string }>();
@@ -1022,6 +1052,7 @@ export class PiHostBackend implements HostBackend {
     // backend can receive any live event. An async constructor load could otherwise overwrite a
     // newer same-key run or persist an incomplete map when START arrived immediately.
     this.loadPersistedAgents();
+    this.loadPersistedAgentLogs();
     // Preload the pi SessionManager module at startup: otherwise the first session open after
     // launch pays its ~1s dynamic-import cost and the chat appears to stall before painting.
     void loadSessionManager();
@@ -1032,14 +1063,58 @@ export class PiHostBackend implements HostBackend {
     // instead of re-spawning. Errors are swallowed here — they resurface on the
     // next on-demand listModels, and the cache self-clears on failure.
     void this.loadModelCatalog().catch(() => undefined);
+    void this.index().catch(() => undefined);
   }
   subscribe(listener: (event: HostEvent) => void) {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
+  private childStillRunning(child?: ChildProcessWithoutNullStreams): boolean {
+    return Boolean(child && child.exitCode === null && !child.signalCode);
+  }
+
+  /** EOF first; if the child ignores it (or is not Node), SIGTERM then SIGKILL. */
+  private async stopLiveProcess(item: Live, graceMs = 250): Promise<void> {
+    try {
+      item.process?.stdin.end();
+    } catch {
+      /* process is already gone */
+    }
+    const child = item.process;
+    const finished = item.exit ?? Promise.resolve();
+    if (!this.childStillRunning(child)) {
+      await finished;
+      return;
+    }
+    const wait = (ms: number) =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        timer.unref?.();
+      });
+    await Promise.race([finished, wait(graceMs)]);
+    if (this.childStillRunning(child)) {
+      try {
+        child!.kill("SIGTERM");
+      } catch {
+        /* already gone */
+      }
+      await Promise.race([finished, wait(graceMs)]);
+    }
+    if (this.childStillRunning(child)) {
+      try {
+        child!.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      await Promise.race([finished, wait(graceMs)]);
+    }
+  }
+
   /** Graceful connection teardown for hosts that allocate one backend per client. */
   async close(): Promise<void> {
+    this.persistAgentLogs();
     this.closed = true;
+    for (const wake of [...this.agentTerminalWaiters]) wake();
     this.titleGenerationAbort.abort();
     await Promise.allSettled([...this.backgroundTitleGenerations]);
     await this.bridge.close();
@@ -1050,13 +1125,8 @@ export class PiHostBackend implements HostBackend {
       for (const pending of item.pending.values())
         pending.reject(new Error("host backend closed"));
       item.pending.clear();
-      try {
-        item.process?.stdin.end();
-      } catch {
-        /* process is already gone */
-      }
     }
-    await Promise.all(live.map((item) => item.exit ?? Promise.resolve()));
+    await Promise.all(live.map((item) => this.stopLiveProcess(item)));
     await Promise.allSettled([...this.backgroundStatsRefreshes]);
     await Promise.all(
       [...this.leases.values()].map((lease) =>
@@ -1090,17 +1160,25 @@ export class PiHostBackend implements HostBackend {
     });
   }
   /** Append a log entry to the in-memory cache for a completed-agent transcript. */
-  private cacheAgentLog(sessionId: string, agentId: string, runId: string, entry: { itemType: string; text: string; name?: string; isError?: boolean; contentIndex?: number }) {
+  private resetAgentLogStreamSlots(sessionId: string, agentId: string, runId: string) {
+    const key = this.agentLogKey(sessionId, agentId, runId)
+    const logs = this.agentLogCache.get(key)
+    if (!logs?.length) return
+    this.agentLogCache.set(key, logs.map(log => log.contentIndex === undefined ? log : { ...log, contentIndex: undefined }))
+    this.persistAgentLogs()
+  }
+  private cacheAgentLog(sessionId: string, agentId: string, runId: string, entry: CachedAgentLog) {
     const key = this.agentLogKey(sessionId, agentId, runId)
     const logs = this.agentLogCache.get(key) ?? []
     // log_delta pushes cumulative snapshots keyed by contentIndex; upsert in place.
     if (entry.contentIndex !== undefined) {
       const idx = logs.findIndex(l => l.contentIndex === entry.contentIndex)
-      if (idx >= 0) { logs[idx] = entry; this.agentLogCache.set(key, logs); return }
+      if (idx >= 0) { logs[idx] = entry; this.agentLogCache.set(key, logs); this.schedulePersistAgentLogs(); return }
     }
     logs.push(entry)
     if (logs.length > 500) logs.splice(0, logs.length - 500)
     this.agentLogCache.set(key, logs)
+    this.schedulePersistAgentLogs()
   }
   private queueChanged(id: string, items: QueuedMessage[]) {
     if (this.closed) return;
@@ -1167,6 +1245,7 @@ export class PiHostBackend implements HostBackend {
     }));
   }
   private async scanIndex(): Promise<SessionMeta[]> {
+    this.indexGenerations += 1;
     const files: string[] = [];
     const walk = async (d: string) => {
       if (!existsSync(d)) return;
@@ -1196,14 +1275,54 @@ export class PiHostBackend implements HostBackend {
         /* incomplete/corrupt JSONL is not a session */
       }
     }
-    for (const path of this.indexCache.keys())
-      if (!seen.has(path)) this.indexCache.delete(path);
+    for (const path of [...this.indexCache.keys()]) {
+      if (seen.has(path)) continue;
+      try {
+        await fs.stat(path);
+      } catch {
+        const stale = this.indexCache.get(path)?.meta;
+        this.indexCache.delete(path);
+        if (stale) this.sessionById.delete(stale.header.id);
+      }
+    }
+    this.rebuildSessionById();
     return result;
   }
-  private async locate(id: string) {
-    for (const item of await this.index())
-      if (item.header.id === id) return this.confirmSessionMeta(item);
+  private rebuildSessionById() {
+    this.sessionById.clear();
+    for (const { meta } of this.indexCache.values())
+      this.sessionById.set(meta.header.id, meta);
+  }
+  private rememberSessionMeta(meta: SessionMeta, size: number, mtimeMs: number) {
+    this.indexCache.set(meta.path, { size, mtimeMs, meta });
+    this.sessionById.set(meta.header.id, meta);
+  }
+  /** Index metadata only. A known id must not walk the session tree again. */
+  private async findSession(id: string) {
+    const cached = this.sessionById.get(id);
+    if (cached) return cached;
+    await this.index();
+    const found = this.sessionById.get(id);
+    if (found) return found;
     throw new Error(`unknown session ${id}`);
+  }
+  private async locate(id: string) {
+    return this.confirmSessionMeta(await this.findSession(id));
+  }
+  private async readHistoryCached(path: string, offset: number, limit: number): Promise<HistoryEntry[]> {
+    const stat = await fs.stat(path);
+    const hit = this.historyCache.get(path);
+    if (
+      hit &&
+      hit.mtimeMs === stat.mtimeMs &&
+      hit.size === stat.size &&
+      hit.offset === offset &&
+      hit.limit === limit
+    )
+      return hit.entries;
+    const entries = await readHistory(path, offset, limit);
+    this.historyCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, offset, limit, entries });
+    return entries;
   }
   private async confirmSessionMeta(meta: SessionMeta): Promise<SessionMeta> {
     try {
@@ -1392,6 +1511,9 @@ export class PiHostBackend implements HostBackend {
         await this.queueStore.remove(s.header.id);
         this.queueLoads.delete(s.header.id);
         await fs.rm(s.path);
+        this.historyCache.delete(s.path);
+        this.indexCache.delete(s.path);
+        this.sessionById.delete(s.header.id);
         this.live.get(s.header.id)?.process?.stdin.end();
         this.live.delete(s.header.id);
         this.sessionModelStates.delete(s.header.id);
@@ -1402,15 +1524,15 @@ export class PiHostBackend implements HostBackend {
       case "moveSession":
         return this.moveSession(params[0] as string, params[1] as string);
       case "getSessionHistory": {
-        const session = await this.locate(params[0] as string);
-        return readHistory(
+        const session = await this.findSession(params[0] as string);
+        return this.readHistoryCached(
           session.path,
           Number(params[1] ?? 0),
           Number(params[2] ?? 500),
         );
       }
       case "getSessionLease": {
-        const s = await this.locate(params[0] as string);
+        const s = await this.findSession(params[0] as string);
         return this.leaseFor(s).query();
       }
       case "forceTakeoverSessionLease": {
@@ -1685,6 +1807,17 @@ export class PiHostBackend implements HostBackend {
         }),
       );
     await fs.writeFile(path, lines.join("\n") + "\n");
+    const created = await fs.stat(path);
+    this.rememberSessionMeta(
+      {
+        path,
+        header,
+        name: name ?? "New session",
+        updatedAt: Date.now(),
+      },
+      created.size,
+      created.mtimeMs,
+    );
     this.sessionModelSnapshots.set(id, this.modelState);
     return {
       id,
@@ -1904,6 +2037,10 @@ export class PiHostBackend implements HostBackend {
       if (lease) void lease.release().catch(() => undefined).finally(finish);
       else finish();
     });
+    if (this.closed) {
+      await this.stopLiveProcess(live);
+      throw new Error("host backend closed");
+    }
     if (desired.model.provider !== "unknown" && desired.model.id !== "unknown")
       await this.selectExactModel(live, desired.model.provider, desired.model.id);
     const spawnThinkingLevel = resolveThinkingLevel(
@@ -2026,6 +2163,7 @@ export class PiHostBackend implements HostBackend {
           type: "text",
           sessionId: id,
           contentIndex: d.contentIndex ?? 0,
+          segment: live.messageEpoch,
           delta: d.delta ?? "",
         });
       if (d.type === "thinking_delta")
@@ -2064,6 +2202,7 @@ export class PiHostBackend implements HostBackend {
           type: "tool_call",
           sessionId: id,
           contentIndex: index,
+          segment: live.messageEpoch,
           toolCallId: call.id ?? `content-${index}`,
           name: call.name ?? "tool",
           delta: args,
@@ -2074,6 +2213,32 @@ export class PiHostBackend implements HostBackend {
       // bump the epoch so later thinking segments key apart from earlier ones.
       live.toolArgs.clear();
       live.messageEpoch++;
+      // Swift ingests user rows on message_end. Follow-ups such as [subagent-done]
+      // never go through sendPrompt, so without this the live transcript stays on
+      // the previous assistant turn and the composer looks falsely stuck.
+      const message = e.message ?? {};
+      if (message.role === "user") {
+        const content = text(message.content);
+        if (content) {
+          this.stream({
+            type: "user_message",
+            sessionId: id,
+            id: typeof message.id === "string" ? message.id : typeof e.id === "string" ? e.id : undefined,
+            content,
+          });
+        }
+      }
+      // A failed turn still ends with a message_end whose assistant message has
+      // stopReason "error", an errorMessage, and no content — dropping it leaves
+      // the user a blank bubble. Forward it as a stream error so the UI can
+      // render the real provider failure (e.g. a Codex schema validation error).
+      if (message.stopReason === "error") {
+        const content =
+          typeof message.errorMessage === "string" && message.errorMessage
+            ? message.errorMessage
+            : undefined;
+        if (content) this.stream({ type: "error", sessionId: id, content });
+      }
     } else if (e.type === "tool_execution_end") {
       const { text: resultText, images } = extractResult(e.result?.content, this.computerScreenshots)
       this.stream({
@@ -2883,8 +3048,27 @@ export class PiHostBackend implements HostBackend {
   private async getModelState(sessionId?: string): Promise<ModelState> {
     await this.loadModelCatalog();
     if (!sessionId) return this.modelState;
-    await this.ensure(sessionId);
-    return this.sessionModelStates.get(sessionId) ?? this.sessionModelSnapshots.get(sessionId) ?? this.modelState;
+    if (this.live.has(sessionId) || this.ensureInFlight.has(sessionId)) {
+      await this.ensure(sessionId);
+      const liveState = this.sessionModelStates.get(sessionId) ?? this.sessionModelSnapshots.get(sessionId) ?? this.modelState;
+      const persisted = (await this.findSession(sessionId)).thinkingLevel;
+      if (
+        persisted &&
+        liveState.availableThinkingLevels.includes(persisted) &&
+        liveState.thinkingLevel !== persisted &&
+        liveState.thinkingLevel === liveState.availableThinkingLevels[0]
+      ) {
+        const restored = { ...liveState, thinkingLevel: persisted };
+        this.sessionModelStates.set(sessionId, restored);
+        return restored;
+      }
+      return liveState;
+    }
+    const cached = this.sessionModelStates.get(sessionId) ?? this.sessionModelSnapshots.get(sessionId);
+    if (cached) return cached;
+    const desired = this.desiredModelFor(await this.findSession(sessionId));
+    this.sessionModelSnapshots.set(sessionId, desired);
+    return desired;
   }
   /** Legacy/default selection path used before any session exists; live UI changes are session-scoped. */
   private async setConfiguredModel(provider: string, modelId: string) {
@@ -2989,45 +3173,38 @@ export class PiHostBackend implements HostBackend {
     });
   }
   /**
-   * Session stats use a cache-first cold path for the compact context indicator,
-   * then publish the authoritative real-pi `get_session_stats` snapshot after
-   * background resume. A live/no-ledger session still waits for the real RPC.
+   * Browsing a session must not spawn Pi. Live RPC is used only when a process
+   * is already running; otherwise the pill reads the token ledger / zeros.
    */
   private async getSessionStats(sessionId?: string): Promise<SessionStats> {
     await this.loadSessionContextLedger();
     const id = sessionId ?? [...this.live.keys()].at(-1);
     if (!id) throw new Error("no active session; pass an explicit sessionId");
+    if (this.live.has(id)) return this.sessionStatsData(id);
+    return this.coldSessionStats(id);
+  }
+  private async coldSessionStats(id: string): Promise<SessionStats> {
+    await this.loadConfiguredModels();
+    const cachedState = this.sessionModelStates.get(id) ?? this.sessionModelSnapshots.get(id);
+    const state = cachedState ?? this.desiredModelFor(await this.findSession(id));
+    this.sessionModelSnapshots.set(id, state);
     const known = this.sessionContextLastKnown.get(id);
-    if (!this.live.has(id) && known) {
-      await this.loadConfiguredModels();
-      const cachedState = this.sessionModelStates.get(id) ?? this.sessionModelSnapshots.get(id);
-      const session = cachedState ? undefined : await this.locate(id);
-      const state = cachedState ?? this.desiredModelFor(session!);
-      this.sessionModelSnapshots.set(id, state);
-      // Revalidate without blocking selection. pushSessionStats publishes the
-      // authoritative live accounting once the cold Pi session is ready.
-      const refresh = this.ensure(id)
-        .then(() => this.pushSessionStats(id))
-        .catch(() => undefined)
-        .finally(() => this.backgroundStatsRefreshes.delete(refresh));
-      this.backgroundStatsRefreshes.add(refresh);
-      return {
-        sessionId: id,
-        tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        cost: 0,
-        contextUsage: {
-          tokens: known.tokens,
-          contextWindow: known.contextWindow,
-          percent: known.percent,
-        },
-        model:
-          state.model.provider === "unknown" && state.model.id === "unknown"
-            ? undefined
-            : { provider: state.model.provider, id: state.model.id, name: state.model.name },
-      };
-    }
-    const live = await this.ensure(id);
-    return this.sessionStatsData(live.session.id);
+    return {
+      sessionId: id,
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      cost: 0,
+      contextUsage: known
+        ? {
+            tokens: known.tokens,
+            contextWindow: known.contextWindow,
+            percent: known.percent,
+          }
+        : undefined,
+      model:
+        state.model.provider === "unknown" && state.model.id === "unknown"
+          ? undefined
+          : { provider: state.model.provider, id: state.model.id, name: state.model.name },
+    };
   }
   /**
    * Account-quota snapshot for the requested session's model. A session model
@@ -3161,6 +3338,9 @@ export class PiHostBackend implements HostBackend {
   private agentsFile(): string {
     return join(this.agentDir, "pipiui-agent-index.json");
   }
+  private agentLogsFile(): string {
+    return join(this.agentDir, "pipiui-agent-logs.json");
+  }
   private agentKey(agentId: string, sessionId?: string): string {
     return `${sessionId ?? ""}\u0000${agentId}`;
   }
@@ -3193,6 +3373,50 @@ export class PiHostBackend implements HostBackend {
       if (error?.code !== "ENOENT") console.warn(`[pipi-agents] unable to load durable index: ${error?.message ?? error}`);
     }
   }
+  private loadPersistedAgentLogs(): void {
+    try {
+      const value = JSON.parse(readFileSync(this.agentLogsFile(), "utf8"));
+      if (!isRecord(value) || value.version !== 1 || !isRecord(value.logs)) return;
+      for (const [key, entries] of Object.entries(value.logs)) {
+        if (typeof key !== "string" || !Array.isArray(entries)) continue;
+        this.agentLogCache.set(key, entries.filter(isCachedAgentLog));
+      }
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") console.warn(`[pipi-agents] unable to load durable logs: ${error?.message ?? error}`);
+    }
+  }
+  private schedulePersistAgentLogs(): void {
+    if (this.closed || this.agentLogsPersistTimer) return;
+    this.agentLogsPersistTimer = setTimeout(() => {
+      this.agentLogsPersistTimer = undefined;
+      this.persistAgentLogs();
+    }, 250);
+    this.agentLogsPersistTimer.unref?.();
+  }
+  private persistAgentLogs(): void {
+    if (this.agentLogsPersistTimer) {
+      clearTimeout(this.agentLogsPersistTimer);
+      this.agentLogsPersistTimer = undefined;
+    }
+    if (this.closed) return;
+    const known = new Set(
+      [...this.agents.values()].map(agent => this.agentLogKey(agent.sessionId ?? "", agent.agentId, agent.runId)),
+    );
+    const logs: Record<string, CachedAgentLog[]> = {};
+    for (const [key, entries] of this.agentLogCache) {
+      if (!entries.length) continue;
+      if (known.size > 0 && !known.has(key)) continue;
+      logs[key] = entries;
+    }
+    const target = this.agentLogsFile();
+    const snapshot = JSON.stringify({ version: 1, logs }) + "\n";
+    this.agentsWrite = this.agentsWrite.then(async () => {
+      await fs.mkdir(dirname(target), { recursive: true });
+      const tmp = `${target}.tmp-${process.pid}`;
+      await fs.writeFile(tmp, snapshot, { encoding: "utf8", mode: 0o600 });
+      await fs.rename(tmp, target);
+    }).catch(error => console.warn(`[pipi-agents] unable to persist durable logs: ${error?.message ?? error}`));
+  }
   private persistAgents(): void {
     if (this.closed) return;
     const target = this.agentsFile();
@@ -3224,25 +3448,64 @@ export class PiHostBackend implements HostBackend {
       } satisfies WorktreeStatus)
     );
   }
+  private liveSessionProcess(sessionId: string): Live | undefined {
+    const live = this.live.get(sessionId);
+    if (!live?.process) return undefined;
+    if (live.process.exitCode !== null || live.process.signalCode) return undefined;
+    return live;
+  }
+  private forceAbortAgent(agent: AgentSummary, reason: string): void {
+    const key = this.agentKey(agent.agentId, agent.sessionId);
+    const current = this.agents.get(key);
+    if (!current || current.runId !== agent.runId) return;
+    if (current.state !== "running" && current.state !== "stalled") return;
+    const next: AgentSummary = {
+      ...current,
+      state: "aborted",
+      endedAt: current.endedAt ?? Date.now(),
+      closeout: current.closeout ?? reason,
+    };
+    this.agents.set(key, next);
+    this.agent({ type: "agent", agent: next });
+    this.persistAgents();
+  }
   private async agentCommand(id: string, operation: "abort" | "resolve") {
     const a = await this.getAgent(id);
 		if (operation === "abort") {
 			if (!a.sessionId || !/^[A-Za-z0-9_-]{2,160}$/.test(id)) throw new Error("agent abort requires a live session and bounded agent id");
 			const abortsOwningTurn = a.name === "computer-use-leader" && !a.parentId;
-			// Pi executes extension commands immediately while streaming. Do not forge
-			// terminal UI state here; the real child end event remains authoritative.
-			await this.withAgentCommandTimeout(
-				this.command(a.sessionId, { type: "prompt", message: `/subagent_abort ${id}` }),
-				5_000,
-				"停止请求在 5 秒内未被主 Agent 接收；请重试",
-			);
-			await this.waitForAgentTerminal(a.agentId, a.sessionId, a.runId);
+			const live = this.closed ? undefined : this.liveSessionProcess(a.sessionId);
+			if (live) {
+				// Pi executes extension commands immediately while streaming. Prefer the
+				// real child end event, but never leave the panel stuck on 运行中 if the
+				// owning process is wedged, already gone, or the host is closing.
+				try {
+					await this.withAgentCommandTimeout(
+						this.command(a.sessionId, { type: "prompt", message: `/subagent_abort ${id}` }),
+						5_000,
+						"停止请求在 5 秒内未被主 Agent 接收",
+					);
+					try {
+						await this.waitForAgentTerminal(a.agentId, a.sessionId, a.runId);
+					} catch (error) {
+						if (error instanceof Error && error.message.includes("切换了运行实例")) throw error;
+						this.forceAbortAgent(a, error instanceof Error ? error.message : "停止请求已发送，但没有收到终态");
+					}
+				} catch (error) {
+					if (error instanceof Error && error.message.includes("切换了运行实例")) throw error;
+					this.forceAbortAgent(a, error instanceof Error ? error.message : "停止请求未能送达");
+				}
+			} else {
+				this.forceAbortAgent(a, "没有可接收停止请求的主 Agent 进程，已在界面结束该子任务");
+			}
 			// A root Computer Task is the owning tool call of the current Pi turn. Once
 			// its real terminal event arrives, abort that turn as well so Pi emits its
 			// authoritative stopped lifecycle and the session queue/composer return to
 			// idle. Ordinary child aborts intentionally leave the Boss turn running so
 			// it can investigate or recover.
-			if (abortsOwningTurn) await this.command(a.sessionId, { type: "abort" });
+			if (abortsOwningTurn && this.liveSessionProcess(a.sessionId) && !this.closed) {
+				await this.command(a.sessionId, { type: "abort" }).catch(() => undefined);
+			}
 			return;
 		} else {
       a.handled = true;
@@ -3282,15 +3545,25 @@ export class PiHostBackend implements HostBackend {
 		const key = this.agentKey(agentId, sessionId);
 		const deadline = Date.now() + timeoutMs;
 		return new Promise((resolve, reject) => {
+			let settled = false;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const finish = (fn: () => void) => {
+				if (settled) return;
+				settled = true;
+				if (timer !== undefined) clearTimeout(timer);
+				this.agentTerminalWaiters.delete(poll);
+				fn();
+			};
 			const poll = () => {
-				if (this.closed) return reject(new Error("PipiUI 已关闭，无法确认 subagent 的停止状态"));
+				if (this.closed) return finish(() => reject(new Error("PipiUI 已关闭，无法确认 subagent 的停止状态")));
 				const current = this.agents.get(key);
-				if (!current || current.runId !== runId) return reject(new Error("subagent 在停止期间切换了运行实例，请刷新后重试"));
-				if (current.state !== "running" && current.state !== "stalled") return resolve();
-				if (Date.now() >= deadline) return reject(new Error("停止请求已发送，但 15 秒内没有收到 subagent 的终态；请重试或使用“手动检查”查看状态"));
-				const timer = setTimeout(poll, 50);
+				if (!current || current.runId !== runId) return finish(() => reject(new Error("subagent 在停止期间切换了运行实例，请刷新后重试")));
+				if (current.state !== "running" && current.state !== "stalled") return finish(() => resolve());
+				if (Date.now() >= deadline) return finish(() => reject(new Error("停止请求已发送，但 15 秒内没有收到 subagent 的终态；请重试或使用“手动检查”查看状态")));
+				timer = setTimeout(poll, 50);
 				timer.unref?.();
 			};
+			this.agentTerminalWaiters.add(poll);
 			poll();
 		});
 	}
@@ -3452,12 +3725,15 @@ export class PiHostBackend implements HostBackend {
       const entry = { itemType: raw.itemType, text: raw.text ?? "", name: raw.name, isError: raw.isError, ...(contentIndex === undefined ? {} : { contentIndex }) };
       this.cacheAgentLog(logSessionId, agent.agentId, agent.runId, entry);
       this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
-    } else if (raw.kind === "log" && logSessionId)
+    } else if (raw.kind === "log" && logSessionId) {
+      this.resetAgentLogStreamSlots(logSessionId, agent.agentId, agent.runId);
+      this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, itemType: "text", text: "", resetStreamSlots: true });
       for (const item of raw.items ?? []) {
         const entry = { itemType: item.itemType, text: item.text, name: item.name, isError: item.isError };
         this.cacheAgentLog(logSessionId, agent.agentId, agent.runId, entry);
         this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
       }
+    }
     this.agent({ type: "agent", agent });
     this.persistAgents();
   }

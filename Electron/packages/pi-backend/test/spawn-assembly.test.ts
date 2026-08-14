@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { assemblePiSpawn, mergedSpawnEnvironment, resolveSpawnPaths, sanitizeEnvironment } from "../src/spawn-assembly.js";
+import { delimiter, join } from "node:path";
+import { assemblePiSpawn, mergedSpawnEnvironment, resolveSpawnPaths, sanitizeEnvironment, withToolPath } from "../src/spawn-assembly.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
 
 describe("runtime info extension mount", () => {
@@ -208,6 +209,18 @@ describe(".env injection into the pi spawn env (T17 parity)", () => {
     );
     expect(merged).toMatchObject({ PATH: "/usr/bin", PIPIUI_SESSION_KEY: "abc" });
   });
+
+  it("always marks the child as Electron-as-Node even under a Finder-like sparse env", () => {
+    // Packaged Pi is the Electron Helper. A reconstructed spawn env that drops
+    // ELECTRON_RUN_AS_NODE turns that Helper into a Chromium process that
+    // busy-loops at ~80% CPU instead of running the script.
+    const merged = mergedSpawnEnvironment(
+      { HOME: "/tmp", PATH: "/usr/bin:/bin" },
+      {},
+      {},
+    );
+    expect(merged.ELECTRON_RUN_AS_NODE).toBe("1");
+  });
 });
 
 /**
@@ -334,5 +347,44 @@ describe("default feature set", () => {
   it("does not register the browser extension when the feature is explicitly disabled", () => {
     const { args } = assemblePiSpawn({ cwd: "/tmp/project", features: { browser: false }, paths: { webview: "/ext/browser.ts" }, bridgePort: 1234, sessionCapability: "secret" });
     expect(args).not.toContain("/ext/browser.ts");
+  });
+});
+
+describe("withToolPath and the Electron node shim", () => {
+  const trees: string[] = [];
+  afterEach(async () => {
+    await Promise.all(trees.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  async function seedNodeTree(kind: "shim" | "real"): Promise<string> {
+    const root = await mkdtemp(join(tmpdir(), `pipiui-${kind}-node-`));
+    trees.push(root);
+    const bin = join(root, "bin");
+    await mkdir(bin, { recursive: true });
+    const body = kind === "shim"
+      ? "#!/bin/sh\nexec env ELECTRON_RUN_AS_NODE=1 /Helper \"$@\"\n"
+      : "#!/bin/sh\nexit 0\n";
+    await writeFile(join(bin, "node"), body, { mode: 0o755 });
+    return bin;
+  }
+
+  function firstNodeDir(path: string): string | undefined {
+    return path.split(delimiter).find((dir) => existsSync(join(dir, "node")));
+  }
+
+  it("does not let the Electron node shim win PATH when a real node exists", async () => {
+    const shimDir = await seedNodeTree("shim");
+    const realDir = await seedNodeTree("real");
+    const env = withToolPath(
+      { PATH: [shimDir, "/usr/bin", "/bin", realDir].join(delimiter) },
+      join(shimDir, "node"),
+    );
+    expect(firstNodeDir(env.PATH ?? "")).toBe(realDir);
+    expect(env.PATH?.split(delimiter)).not.toContain(shimDir);
+  });
+
+  it("still prepends a normal pi executable directory when no shim is involved", () => {
+    const env = withToolPath({ PATH: "/usr/bin:/bin" }, "/opt/homebrew/bin/pi");
+    expect(env.PATH?.split(delimiter)[0]).toBe("/opt/homebrew/bin");
   });
 });

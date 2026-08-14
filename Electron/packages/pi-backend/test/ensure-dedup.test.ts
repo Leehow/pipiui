@@ -6,12 +6,9 @@ import { spawn } from "node:child_process";
 import { createPiHostBackend } from "../src/index.js";
 
 /**
- * Cold-start concurrency regression: SessionStatsPill's getSessionStats, App's
- * getModelState and QuotaPill's getQuotaSnapshot all ensure() the same cold
- * session in parallel. Before per-session in-flight dedup, every caller raced
- * the single-winner lease acquire(); the losers threw "session is read-only:
- * held by pipiui-electron" and the stats pill surfaced 统计不可用. Dedup makes
- * all concurrent callers share one spawn.
+ * Opening a session to read chrome must not spawn Pi. Work that still needs a
+ * live RPC shares one in-flight ensure() so concurrent callers cannot race the
+ * single-winner lease.
  */
 describe("PiHostBackend ensure() concurrency dedup", () => {
   let root = "";
@@ -55,6 +52,32 @@ describe("PiHostBackend ensure() concurrency dedup", () => {
     return { backend };
   }
 
+  it("does not spawn Pi for concurrent chrome reads of a cold session", async () => {
+    const spawnSpy = vi.fn((_bin: string, _args: string[], options: any) =>
+      spawn("/usr/local/bin/node", [new URL("./fake-pi.mjs", import.meta.url).pathname], {
+        ...options,
+        env: { ...options.env, PATH: "/usr/local/bin:/usr/bin:/bin" },
+      }) as any,
+    );
+    const { backend } = await fixture(spawnSpy);
+
+    const [stats, modelState, quota] = await Promise.all([
+      backend.handle("getSessionStats", ["session-1"]),
+      backend.handle("getModelState", ["session-1"]),
+      backend.handle("getQuotaSnapshot", ["session-1"]),
+    ]);
+
+    expect(spawnSpy).toHaveBeenCalledTimes(0);
+    expect(stats).toMatchObject({
+      sessionId: "session-1",
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      cost: 0,
+    });
+    expect((modelState as any).model.provider).toBe("unknown");
+    expect(quota).toBeNull();
+    await backend.close();
+  });
+
   it("shares one in-flight spawn across concurrent ensure() calls for the same session", async () => {
     const spawnSpy = vi.fn((_bin: string, _args: string[], options: any) =>
       spawn("/usr/local/bin/node", [new URL("./fake-pi.mjs", import.meta.url).pathname], {
@@ -64,26 +87,16 @@ describe("PiHostBackend ensure() concurrency dedup", () => {
     );
     const { backend } = await fixture(spawnSpy);
 
-    // The cold-start race: three host calls ensure() the same session at once.
-    const [stats, modelState, quota] = await Promise.all([
-      backend.handle("getSessionStats", ["session-1"]),
-      backend.handle("getModelState", ["session-1"]),
-      backend.handle("getQuotaSnapshot", ["session-1"]),
+    await Promise.all([
+      (backend as any).ensure("session-1"),
+      (backend as any).ensure("session-1"),
+      (backend as any).ensure("session-1"),
     ]);
 
     expect(spawnSpy).toHaveBeenCalledTimes(1);
-    expect(stats).toMatchObject({
-      sessionId: "session-1",
-      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      cost: 0,
-      contextUsage: { tokens: 0, contextWindow: 262144, percent: 0 },
-    });
-    expect((modelState as any).model.id).toBe("fake-1");
-    expect(quota).toBeNull(); // fake provider maps to no quota/balance kind
-
-    // A later call reuses the cached live session; no second spawn.
-    await backend.handle("getSessionStats", ["session-1"]);
+    await (backend as any).ensure("session-1");
     expect(spawnSpy).toHaveBeenCalledTimes(1);
+    await backend.close();
   });
 
   it("does not serialize different sessions: each cold session spawns once, in parallel", async () => {
@@ -109,14 +122,13 @@ describe("PiHostBackend ensure() concurrency dedup", () => {
       ].join("\n") + "\n",
     );
 
-    const [a, b] = await Promise.all([
-      backend.handle("getSessionStats", ["session-1"]),
-      backend.handle("getSessionStats", ["session-2"]),
+    await Promise.all([
+      (backend as any).ensure("session-1"),
+      (backend as any).ensure("session-2"),
     ]);
 
     expect(spawnSpy).toHaveBeenCalledTimes(2);
-    expect((a as any).sessionId).toBe("session-1");
-    expect((b as any).sessionId).toBe("session-2");
+    await backend.close();
   });
 
   it("clears the in-flight promise on failure so a later call can retry the spawn", async () => {
@@ -133,19 +145,17 @@ describe("PiHostBackend ensure() concurrency dedup", () => {
       );
     const { backend } = await fixture(spawnSpy);
 
-    // Concurrent callers share the same rejection and none races the lease.
     const settled = await Promise.allSettled([
-      backend.handle("getSessionStats", ["session-1"]),
-      backend.handle("getModelState", ["session-1"]),
+      (backend as any).ensure("session-1"),
+      (backend as any).ensure("session-1"),
     ]);
     expect(settled.every((r) => r.status === "rejected")).toBe(true);
     for (const r of settled)
       expect(String((r as PromiseRejectedResult).reason)).toMatch(/spawn failed/);
     expect(spawnSpy).toHaveBeenCalledTimes(1);
 
-    // The failed spawn is not cached: a retry spawns anew and succeeds.
-    const stats = await backend.handle("getSessionStats", ["session-1"]);
+    await (backend as any).ensure("session-1");
     expect(spawnSpy).toHaveBeenCalledTimes(2);
-    expect(stats).toMatchObject({ sessionId: "session-1" });
+    await backend.close();
   });
 });

@@ -59,7 +59,7 @@ describe("listSessions session model metadata", () => {
     expect(session.model).toBeNull();
   });
 
-  it("cold-start ensure() restores the session JSONL model; only sessions without a model record inherit the global default", async () => {
+  it("cold-start getModelState restores the session JSONL model; only sessions without a model record inherit the global default", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-session-coldrestore-"));
     const agent = join(root, "agent");
     const cwd = join(root, "project");
@@ -83,11 +83,10 @@ describe("listSessions session model metadata", () => {
       spawn: (_bin: any, _args: any, options: any) => spawn("/usr/local/bin/node", [new URL("./fake-pi.mjs", import.meta.url).pathname], { ...options, env: { ...options.env, PATH: "/usr/local/bin:/usr/bin:/bin" } }) as any,
       authRuntime: { getProviders: async () => [], getAvailable: async () => [], login: async () => undefined, logout: async () => undefined },
     });
-    // A cold spawn restores the session's own JSONL model, never the default.
+    // A cold read restores the session's own JSONL model from metadata, never the default, and does not spawn Pi.
     const bound = await backend.handle("getModelState", ["bound"]) as any;
     expect(bound.model).toMatchObject({ provider: "relay", id: "cheap" });
-    // fake-pi echoes the modelId as its name after set_model (real pi returns the catalog name).
-    expect(bound.model.name).toBe("cheap");
+    expect(bound.model.name).toBe("Cheap");
     // A session with no model record inherits the configured default.
     const plain = await backend.handle("getModelState", ["plain"]) as any;
     expect(plain.model).toMatchObject({ provider: "relay", id: "fast" });
