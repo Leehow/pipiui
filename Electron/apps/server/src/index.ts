@@ -45,7 +45,7 @@ const HOST_METHODS = new Set<HostMethod>([
   "steerQueuedMessage", "retryQueuedMessage", "stop", "queueFollowUp", "compact", "listModels", "getModelState", "setModel",
   "setThinkingLevel", "getHiddenModelIds", "setHiddenModelIds", "getSidebarSessionPreferences", "setSidebarSessionPreferences", "authProviders", "beginProviderLogin", "continueProviderLogin", "cancelProviderLogin", "removeProviderCredentials", "getSessionStats", "getQuotaSnapshot", "listAgents", "abortAgent", "resolveAgent",
   "checkAgent", "getWorktreeStatus", "mergeWorktree", "discardWorktree",
-  "getVisionModel", "setVisionModel",
+  "getVisionModel", "setVisionModel", "getMemoryReviewModel", "setMemoryReviewModel",
   "capabilities", "gitStatus", "gitCheckout", "probeDirectoryGit", "gitInitDirectory", "revealProject", "terminalOpen", "terminalWrite",
   "terminalClear", "terminalClose", "browserListTabs", "browserGetActiveTab",
   "browserNewTab", "browserSwitchTab", "browserCloseTab", "browserLoadURL",

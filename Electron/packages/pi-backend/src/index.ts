@@ -308,8 +308,6 @@ export type PiBackendOptions = {
   /** Disable Pi's ambient resource discovery while retaining explicit mounts assembled here. */
   resourceMode?: "default" | "explicit";
   features?: SpawnFeatures;
-  /** Optional full provider/model used by Hermes review instead of the active chat model. */
-  memoryReviewModelId?: string;
   spawn?: ProcFactory;
   env?: NodeJS.ProcessEnv;
   browserAction?: (
@@ -956,7 +954,6 @@ export class PiHostBackend implements HostBackend {
   private runtimeAssets?: RuntimeAssets;
   private agentDir: string;
   private features: SpawnFeatures;
-  private memoryReviewModelId?: string;
   private profileMode: "default" | "isolated";
   private resourceMode: "default" | "explicit";
   private proc: ProcFactory;
@@ -1008,7 +1005,6 @@ export class PiHostBackend implements HostBackend {
   constructor(options: PiBackendOptions = {}) {
     this.terminalSessionDeleted = options.terminalSessionDeleted;
     this.compactionConfiguration = options.compaction;
-    this.memoryReviewModelId = options.memoryReviewModelId;
     this.computerDescriptor = options.computerDescriptor;
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
@@ -1697,6 +1693,10 @@ export class PiHostBackend implements HostBackend {
         return this.loadAndMaterializeSubagentModels(true);
       case "setSubagentModel":
         return this.saveSubagentModel(params[0], params[1]);
+      case "getMemoryReviewModel":
+        return this.loadMemoryReviewModel();
+      case "setMemoryReviewModel":
+        return this.saveMemoryReviewModel(params[0]);
       case "getVisionModel":
         return this.loadVisionModel();
       case "setVisionModel":
@@ -2022,7 +2022,7 @@ export class PiHostBackend implements HostBackend {
         managedNodeModulesRoot: this.managedNodeModulesRoot,
       }),
       mainModelId: this.mainModelId(),
-      memoryReviewModelId: this.memoryReviewModelId,
+      memoryReviewModelId: (await this.loadMemoryReviewModel()) ?? undefined,
       subagentModelsFile: this.subagentModelsRuntimeFile(),
       bridgePort,
       bridgeRoutingKey: id,
@@ -2608,6 +2608,27 @@ export class PiHostBackend implements HostBackend {
     });
     await this.materializeSubagentModels(all);
     return all;
+  }
+  private checkedMemoryReviewModel(value: unknown): string | null {
+    if (value === undefined || value === null || value === "") return null;
+    if (typeof value !== "string")
+      throw new Error("memoryReviewModel 必须是 provider/model 完整标识或 null");
+    const model = value.trim();
+    const slash = model.indexOf("/");
+    if (model.length > 300 || slash <= 0 || slash === model.length - 1 || /[\u0000-\u001f\u007f\s]/u.test(model))
+      throw new Error(`Hermes 复核模型必须使用 provider/model 完整标识：${model}`);
+    return model;
+  }
+  private async loadMemoryReviewModel(): Promise<string | null> {
+    return this.checkedMemoryReviewModel((await this.readSettings()).memoryReviewModel);
+  }
+  private async saveMemoryReviewModel(value: unknown): Promise<string | null> {
+    const checked = this.checkedMemoryReviewModel(value);
+    return this.updateSettings((settings) => {
+      if (checked) settings.memoryReviewModel = checked;
+      else delete settings.memoryReviewModel;
+      return checked;
+    });
   }
   /** Initializes an explicit empty sidebar once. Version presence makes [] durable. */
   private async loadProjectPaths(): Promise<string[]> {

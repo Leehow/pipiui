@@ -12,10 +12,11 @@ const COMPUTER_USE_WORKER_ORDER = ['operator', 'computer-verifier', 'computer-te
 
 /** Per-role ordered model fallback editor, mirroring Swift Settings > Subagent. */
 export function SubagentModelModal({ host, current, visibility, onClose }: { host: PipiHostAPI; current: Model | null; visibility: ModelVisibilityController; onClose: () => void }) {
-  const hostMethodsPresent = typeof host.getSubagentModels === 'function' && typeof host.setSubagentModel === 'function' && typeof host.listAgentDefinitions === 'function'
+  const hostMethodsPresent = typeof host.getSubagentModels === 'function' && typeof host.setSubagentModel === 'function' && typeof host.getMemoryReviewModel === 'function' && typeof host.setMemoryReviewModel === 'function' && typeof host.listAgentDefinitions === 'function'
   const [available, setAvailable] = useState(hostMethodsPresent)
   const [agents, setAgents] = useState<AgentDefinition[]>([])
   const [settings, setSettings] = useState<Record<string, SubagentModelSetting[]>>({})
+  const [memoryReviewModel, setMemoryReviewModel] = useState<string | null>(null)
   const [loading, setLoading] = useState(hostMethodsPresent)
   const [saving, setSaving] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -30,11 +31,12 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
   const generalAgents = agents.filter(agent => !COMPUTER_USE_AGENT_NAMES.has(agent.name))
 
   useEffect(() => {
-    if (!host.getSubagentModels || !host.listAgentDefinitions) return
+    if (!host.getSubagentModels || !host.getMemoryReviewModel || !host.listAgentDefinitions) return
     let active = true
-    void Promise.all([host.getSubagentModels(), host.listAgentDefinitions()]).then(([nextSettings, nextAgents]) => {
+    void Promise.all([host.getSubagentModels(), host.getMemoryReviewModel(), host.listAgentDefinitions()]).then(([nextSettings, nextMemoryReviewModel, nextAgents]) => {
       if (!active) return
       setSettings(nextSettings)
+      setMemoryReviewModel(nextMemoryReviewModel)
       setAgents(nextAgents)
     }).catch((err) => {
       // `apiFrom` cannot know whether an older IPC backend implements these
@@ -53,6 +55,19 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
     try {
       const next = await host.setSubagentModel(agentName, chain)
       setSettings(next)
+    } catch (err) {
+      setError(`保存失败：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  const saveMemoryReview = async (model: string) => {
+    if (!host.setMemoryReviewModel) return
+    setSaving('memory-review')
+    setError(null)
+    try {
+      setMemoryReviewModel(await host.setMemoryReviewModel(model || null))
     } catch (err) {
       setError(`保存失败：${err instanceof Error ? err.message : String(err)}`)
     } finally {
@@ -81,6 +96,15 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
             <div className="subagent-main-model">
               {current ? <><ProviderLogo provider={current.provider} modelId={current.id} size={14} /> 当前主 Agent（底栏）：{current.name}（{current.provider}/{current.id}）</> : '当前无打开会话；「跟随」将在派出时使用当时底栏选中的模型。'}
             </div>
+            <section className="subagent-agent-group" aria-labelledby="system-memory-models-heading">
+              <div className="subagent-agent-group-heading"><h3 id="system-memory-models-heading">系统 / 记忆</h3><span>独立后台角色，不参与 Subagent fallback</span></div>
+              <article className="subagent-agent-row" data-testid="memory-review-model-row">
+                <div className="subagent-agent-heading"><strong>Hermes 记忆复核</strong></div>
+                <p>整理会话记忆时使用。默认在复核发生时跟随当时的主 Agent；显式选择只覆盖复核模型。</p>
+                <ModelPicker models={candidateModels} selected={candidateModels.find(model => modelRef(model) === memoryReviewModel)} configuredRef={memoryReviewModel ?? ''} follow={!memoryReviewModel} allowFollow disabled={saving === 'memory-review'} onSelect={saveMemoryReview} agentName="memory-review" index={0} />
+                {memoryReviewModel && !candidateModels.some(model => modelRef(model) === memoryReviewModel) && <div className="subagent-model-warning" role="alert">历史设置「{memoryReviewModel}」当前不可见，请重新选择已启用的 provider/model。</div>}
+              </article>
+            </section>
             <section className="subagent-agent-group" aria-labelledby="general-subagent-models-heading">
               <div className="subagent-agent-group-heading"><h3 id="general-subagent-models-heading">通用 Subagents</h3></div>
               {generalAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} onSave={save} />)}

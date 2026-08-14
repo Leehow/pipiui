@@ -73,6 +73,7 @@ function createContractMockBackend(): HostBackend {
   let state: any = { model: { provider: 'mock', id: 'model-1', name: 'Mock Model', reasoning: true }, thinkingLevel: 'medium', availableThinkingLevels: ['off', 'low', 'medium', 'high'] }
   let hiddenModelIds: string[] = []
   let visionModel: string | null = null
+  let memoryReviewModel: string | null = null
   let sidebarSessionPreferences: SidebarSessionPreferences = { pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: [] }
   const loginOwners = new Map<string, string>()
   // session-1 carries full usage; sessions created by newSession have no usage data yet.
@@ -180,6 +181,13 @@ function createContractMockBackend(): HostBackend {
           visionModel = ref
           return visionModel
         }
+        case 'getMemoryReviewModel': return memoryReviewModel
+        case 'setMemoryReviewModel': {
+          const ref = params[0] ?? null
+          if (ref !== null && (typeof ref !== 'string' || !ref.includes('/'))) throw new Error('memoryReviewModel must be "provider/id" string or null')
+          memoryReviewModel = ref
+          return memoryReviewModel
+        }
         case 'getSidebarSessionPreferences': return structuredClone(sidebarSessionPreferences)
         case 'setSidebarSessionPreferences': {
           const value = params[0] as typeof sidebarSessionPreferences
@@ -280,6 +288,11 @@ function contract(name: string, factory: Factory, expectedCapabilities: Record<s
       expect(await host.getVisionModel?.()).toBe('anthropic/claude-sonnet-4')
       expect(await host.setVisionModel?.(null)).toBeNull()
       expect(await host.getVisionModel?.()).toBeNull()
+      expect(await host.getMemoryReviewModel?.()).toBeNull()
+      expect(await host.setMemoryReviewModel?.('anthropic/claude-sonnet-4')).toBe('anthropic/claude-sonnet-4')
+      expect(await host.getMemoryReviewModel?.()).toBe('anthropic/claude-sonnet-4')
+      expect(await host.setMemoryReviewModel?.(null)).toBeNull()
+      expect(await host.getMemoryReviewModel?.()).toBeNull()
       expect(await host.getSidebarSessionPreferences?.()).toEqual({ pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: [] })
       expect(await host.setSidebarSessionPreferences?.({ pinnedSessionIds: ['session-a', 'session-b'], archivedSessionIds: ['session-b'], orderedSessionIds: ['session-b', 'session-a'], sessionOrderVersion: 2 })).toEqual({ pinnedSessionIds: ['session-a'], archivedSessionIds: ['session-b'], orderedSessionIds: ['session-b', 'session-a'], sessionOrderVersion: 2 })
       expect(await host.getSidebarSessionPreferences?.()).toEqual({ pinnedSessionIds: ['session-a'], archivedSessionIds: ['session-b'], orderedSessionIds: ['session-b', 'session-a'], sessionOrderVersion: 2 })
