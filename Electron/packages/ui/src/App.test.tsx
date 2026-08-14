@@ -115,8 +115,12 @@ describe('PipiUI Electron main layout', () => {
     host.setSidebarSessionPreferences = save
     const view = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
-    const layoutRow = view.container.querySelector('[data-session-id="layout"]')!
-    fireEvent.click(within(layoutRow as HTMLElement).getByRole('button', { name: '归档会话' }))
+    const layoutRow = await waitFor(() => {
+      const row = view.container.querySelector('[data-session-id="layout"]')
+      if (!row) throw new Error('layout session row not rendered yet')
+      return row as HTMLElement
+    })
+    fireEvent.click(within(layoutRow).getByRole('button', { name: '归档会话' }))
     await waitFor(() => expect(save.mock.calls.some(([value]) =>
       value.archivedSessionIds.includes('layout') && typeof value.archivedSessionTimestamps?.layout === 'number'
     )).toBe(true))

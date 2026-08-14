@@ -903,6 +903,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   // True only between an authoritative `started` and `settled`/`stopped`.
   // A late `streaming` (pi queue_update after settle) must not reopen the turn.
   const mainTurnOpenRef = useRef(false)
+  /** The optimistic user bubble of the in-flight direct send. The server's
+   *  `user_message` echo merges back into this bubble by id, so an assistant
+   *  placeholder that already streamed past it cannot wedge a duplicate below. */
+  const pendingLocalUserRef = useRef<{ id: string; content: string } | null>(null)
   const stoppingSessionRef = useRef<string | null>(null)
   const historyLoadRef = useRef(0)
   /** Send from the empty "新会话" state creates the session first; the pending
@@ -1224,7 +1228,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         return
       }
       if (event.type === 'user_message') {
-        const next = appendLiveUserMessage(messagesRef.current, event)
+        const pendingEcho = pendingLocalUserRef.current
+        pendingLocalUserRef.current = null
+        const next = appendLiveUserMessage(messagesRef.current, event, pendingEcho ?? undefined)
         messagesRef.current = next
         setMessages(next)
         // follow_up RPC can emit `started` before this card lands. If the wait
@@ -1258,6 +1264,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         }
         if (terminal) {
           mainTurnOpenRef.current = false
+          pendingLocalUserRef.current = null
           setStreaming(false)
           setCompacting(false)
           setStatsRefreshKey(key => key + 1)
@@ -1297,7 +1304,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setMessages(previous => applyStreamEvent(previous, event))
     } })
     const unsubscribe = host.subscribeStream(selectedSession, event => {
-      if (import.meta.env.DEV && (event.type === 'text' || event.type === 'thinking') && (event as { delta?: string }).delta) console.log(`[stream-debug] renderer-recv ${event.type} sid=${selectedSession} t=${Date.now()} len=${((event as { delta?: string }).delta ?? '').length}`)
       coalescer.push(event)
     })
     return () => { unsubscribe(); coalescer.dispose() }
@@ -1371,7 +1377,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     if (!canWriteLease) return false
     const beginDirectTurn = () => {
-      setMessages(items => [...items, { id: crypto.randomUUID(), role: 'user', content: prompt, images: chatImagesFromAttachments(attachments), timestamp: Date.now() }])
+      const localUserId = crypto.randomUUID()
+      pendingLocalUserRef.current = { id: localUserId, content: prompt }
+      setMessages(items => [...items, { id: localUserId, role: 'user', content: prompt, images: chatImagesFromAttachments(attachments), timestamp: Date.now() }])
       activeUserTurnRef.current = true
       mainTurnOpenRef.current = true
       setStreaming(true)

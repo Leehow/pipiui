@@ -124,6 +124,17 @@ describe('transcript model', () => {
     })
   })
 
+  it('merges the echo by id in place even after an assistant placeholder streamed past the optimistic bubble', () => {
+    const messages: ChatMessage[] = [
+      { id: 'local', role: 'user', content: '看图', timestamp: 1 },
+      { id: 'a', role: 'assistant', content: '', thinking: '', tools: [], streaming: true, timestamp: 2 },
+    ]
+    const next = appendLiveUserMessage(messages, { id: 'srv', content: '看图' }, { id: 'local', content: '看图' })
+    expect(next).toHaveLength(2)
+    expect(next[0]).toMatchObject({ id: 'srv', role: 'user', content: '看图' })
+    expect(next[1].role).toBe('assistant')
+  })
+
   it('replaces an image-only optimistic bubble when the echo is only the attachment footnote', () => {
     const note = '(Images are also embedded multimodally; prefer viewing them directly. If you use the read tool, use the paths above — do not invent paths like /home/workdir/attachments/.)'
     const optimistic: ChatMessage[] = [{ id: 'local', role: 'user', content: '', images: [{ data: 'abc', mimeType: 'image/png' }], timestamp: 1 }]

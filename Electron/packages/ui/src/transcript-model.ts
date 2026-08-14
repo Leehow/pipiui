@@ -147,10 +147,21 @@ export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
   return messages
 }
 
-export function appendLiveUserMessage(messages: ChatMessage[], incoming: { content: string; id?: string; images?: ChatMessage['images'] }): ChatMessage[] {
+export function appendLiveUserMessage(messages: ChatMessage[], incoming: { content: string; id?: string; images?: ChatMessage['images'] }, match?: { id: string; content: string }): ChatMessage[] {
   const raw = incoming.content
   if (!raw) return messages
   const content = stripAttachmentPathsForDisplay(raw)
+  // Server echo of our own just-sent bubble: merge back into the optimistic
+  // bubble by id — in place, so an assistant placeholder that already streamed
+  // after it cannot wedge a duplicate below it.
+  if (match && stripAttachmentPathsForDisplay(match.content).trim() === content.trim()) {
+    const index = messages.findIndex(item => item.id === match.id)
+    if (index >= 0) {
+      const next = [...messages]
+      next[index] = { ...next[index], id: incoming.id ?? next[index].id, content, images: next[index].images?.length ? next[index].images : incoming.images }
+      return next
+    }
+  }
   const last = messages[messages.length - 1]
   if (last?.role === 'user' && last.content === raw) return messages
   if (last?.role === 'user' && stripAttachmentPathsForDisplay(last.content).trim() === content.trim()) {

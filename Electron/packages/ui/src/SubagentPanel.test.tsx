@@ -863,4 +863,20 @@ describe('SubagentPanel', () => {
     expect(screen.getByRole('alert').textContent).toContain('mock list failure')
     expect(await screen.findByText('未能加载 subagents')).toBeTruthy()
   })
+
+  it('treats snapshot agents as pre-existing runs and only reveals starts after hydration', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [
+      { agentId: 'pre-running', runId: 'run-1', name: 'explore', task: 'already running before mount', state: 'running', createdAt: 1 }
+    ]
+    const onAgentStarted = vi.fn()
+    render(<SubagentPanel host={harness.host} onAgentStarted={onAgentStarted} />)
+
+    expect(await screen.findByText('explore')).toBeTruthy()
+    await waitFor(() => expect(onAgentStarted).not.toHaveBeenCalled())
+
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'fresh-run', runId: 'run-2', name: 'builder', task: 'started live', state: 'running', createdAt: 2 } })
+    expect(await screen.findByText('builder')).toBeTruthy()
+    await waitFor(() => expect(onAgentStarted).toHaveBeenCalledTimes(1))
+  })
 })

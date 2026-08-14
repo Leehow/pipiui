@@ -396,6 +396,12 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
 	const [abortingIds, setAbortingIds] = useState<Set<string>>(() => new Set())
   const [now, setNow] = useState(() => Date.now())
   const loadGeneration = useRef(0)
+  // Agents already running when the panel mounts (initial snapshot or a session
+  // switch) are not "new runs": seed the baseline from the snapshot so they
+  // never fire onAgentStarted and force-open a pane the user (or the narrow
+  // viewport) collapsed. Only running-count increases after hydration reveal.
+  const hydratedRef = useRef(false)
+  const previousRunningRef = useRef(0)
   const selected = agents.find(agent => agent.agentId === selectedId)
 
   // Extracted so the full-page load-error state can retry the same loader.
@@ -409,6 +415,10 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
       // from another session out of the panel.
       const snapshot = await host.listAgents(sessionId)
       if (generation !== loadGeneration.current) return
+      if (!hydratedRef.current) {
+        previousRunningRef.current = snapshot.filter(isActive).length
+        hydratedRef.current = true
+      }
       // The session-change effect already cleared the previous chat. Merge the
       // snapshot into any events that arrived while this request was in flight,
       // otherwise a fast START can be erased by a slower empty snapshot.
@@ -426,6 +436,8 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     // generation guard also prevents a slow response for the previous chat from
     // repopulating the panel after a rapid switch.
     loadGeneration.current += 1
+    hydratedRef.current = false
+    previousRunningRef.current = 0
     setAgents([])
     setSelectedId(undefined)
     setPage(0)
@@ -501,11 +513,10 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     failed: agents.filter(agent => agent.state === 'failed').length,
   }), [agents])
 
-  const previousRunningRef = useRef(0)
   useEffect(() => {
     onRunningCountChange?.(summary.running)
     onRunningChange?.(summary.running > 0)
-    if (summary.running > previousRunningRef.current) onAgentStarted?.()
+    if (hydratedRef.current && summary.running > previousRunningRef.current) onAgentStarted?.()
     previousRunningRef.current = summary.running
   }, [onAgentStarted, onRunningChange, onRunningCountChange, summary.running])
 
