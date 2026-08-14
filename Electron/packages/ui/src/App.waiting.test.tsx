@@ -76,6 +76,7 @@ describe('active-turn waiting placeholder', () => {
     expect(screen.getByTestId('waiting-placeholder').getAttribute('data-phase')).toBe('thinking')
     act(() => { listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'bash-1', name: 'bash', delta: '{"command":"ls -la"}' }) })
     expect(screen.getByTestId('waiting-placeholder').getAttribute('data-phase')).toBe('tool')
+    expect(screen.getByTestId('waiting-placeholder').textContent).toContain('bash · ls -la')
 
     // First real text ends the first-response wait, but the turn is still
     // streaming: the Composer keeps its stop control until settled/stopped.

@@ -32,10 +32,12 @@ export { parseSubagentNotice } from './subagent-notice'
 import { compactionNotice } from './compaction-notice'
 import { filterSlashCommands, parseSlashInvocation, slashCommandByName, slashPaletteQuery, type SlashCommandDef } from './slash-commands'
 import { useModelVisibility, type ModelVisibilityController } from './useModelVisibility'
-import { chatImagesFromAttachments, fileToPromptAttachment, imageFilesFromClipboard, validateAttachment } from './attachments'
+import { chatImagesFromAttachments, fileToPromptAttachment, imageFilesFromClipboard, stripAttachmentPathsForDisplay, validateAttachment } from './attachments'
 import { LiveSubagentBindingProvider } from './LiveSubagentBinding'
 import { Transcript } from './Transcript'
-import { applyStreamEvent, finishStreamingMessage, historyMessages, type ChatMessage } from './transcript-model'
+import { parseSubagentSignal } from './subagent-signal'
+import { appendLiveUserMessage, applyStreamEvent, finishStreamingMessage, historyMessages, type ChatMessage } from './transcript-model'
+import { toolDisplaySummary } from './tool-summary'
 import './app.css'
 import './message-actions.css'
 import './subagent.css'
@@ -860,6 +862,21 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   // effect does not re-run per message).
   const messagesRef = useRef<ChatMessage[]>(messages)
   messagesRef.current = messages
+  const messagesBySessionRef = useRef(new Map<string, ChatMessage[]>())
+  const idleTranscriptRef = useRef<VirtuosoHandle>(null)
+  const [mountedSessionIds, setMountedSessionIds] = useState<string[]>([])
+  useEffect(() => {
+    if (selectedSession && messagesBySessionRef.current.has(selectedSession)) {
+      messagesBySessionRef.current.set(selectedSession, messages)
+    }
+  }, [selectedSession, messages])
+  useEffect(() => {
+    if (!selectedSession) return
+    setMountedSessionIds(current => {
+      if (current[0] === selectedSession) return current
+      return [selectedSession, ...current.filter(id => id !== selectedSession)].slice(0, 6)
+    })
+  }, [selectedSession])
   const [observedSessionStatuses, setObservedSessionStatuses] = useState<Record<string, SessionStatus>>({})
   const [loadedSidebarPreferencesKey, setLoadedSidebarPreferencesKey] = useState('')
   const [canRevealInFinder, setCanRevealInFinder] = useState(false)
@@ -1104,10 +1121,11 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     activeUserTurnRef.current = false
     mainTurnOpenRef.current = false
-    // The transcript is wiped this tick; mirror that synchronously so the stream
-    // effect (subscribed moments later) never reads the previous session's
-    // messages when deciding whether a first-response wait is warranted.
-    messagesRef.current = []
+    const cached = messagesBySessionRef.current.get(selectedSession)
+    // Restore a visited transcript this tick so switching back does not flash
+    // empty and wait for another JSONL parse on the host.
+    messagesRef.current = cached ?? []
+    setMessages(cached ?? [])
     setCompacting(false)
     setWaitingVisible(false)
     setWaitingStartedAt(null)
@@ -1125,21 +1143,29 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setWaitingVisible(true)
       setWaitingPhase('awaiting')
     }
-    setMessages([])
     setLease(null)
-    void host.getSessionHistory(selectedSession).then(entries => {
+    const applyHistory = (entries: HistoryEntry[]) => {
       if (historyLoadRef.current !== request) return
-      const messages = historyMessages(entries)
-      setMessages(messages)
-      messagesRef.current = messages
+      const next = historyMessages(entries)
+      messagesBySessionRef.current.set(selectedSession, next)
+      setMessages(next)
+      messagesRef.current = next
       // A resumed running session whose history already shows assistant output
       // still has an open turn: keep the wait, but do not claim "first response".
-      if (resumedRunning && hasVisibleAssistantOutput(messages)) {
+      if (resumedRunning && hasVisibleAssistantOutput(next)) {
         setWaitingPhase('continuing')
         setWaitingVisible(true)
       }
-      requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, messages.length - 1), align: 'end', behavior: 'auto' }))
-    }).catch(() => { if (historyLoadRef.current === request) setMessages([]) })
+      requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, next.length - 1), align: 'end', behavior: 'auto' }))
+    }
+    if (cached !== undefined && !resumedRunning) {
+      requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, cached.length - 1), align: 'end', behavior: 'auto' }))
+    } else {
+      void host.getSessionHistory(selectedSession).then(applyHistory).catch(() => {
+        if (historyLoadRef.current !== request) return
+        if (cached === undefined) setMessages([])
+      })
+    }
     void host.getSessionLease(selectedSession).then(lease => { if (historyLoadRef.current === request) setLease(lease) }).catch(() => { if (historyLoadRef.current === request) setLease(null) })
   }, [host, selectedSession])
   useEffect(() => {
@@ -1197,6 +1223,15 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         if (event.phase === 'end') setStatsRefreshKey(key => key + 1)
         return
       }
+      if (event.type === 'user_message') {
+        const next = appendLiveUserMessage(messagesRef.current, event)
+        messagesRef.current = next
+        setMessages(next)
+        // follow_up RPC can emit `started` before this card lands. If the wait
+        // already opened as `continuing`, rename it once the signal is visible.
+        if (activeUserTurnRef.current && parseSubagentSignal(event.content)) setWaitingPhase('followup')
+        return
+      }
       if (event.type === 'status') {
         const terminal = event.status === 'settled' || event.status === 'stopped'
         // A late `streaming` after settle is a follow-up-list update, not a new
@@ -1217,7 +1252,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
             activeUserTurnRef.current = true
             setWaitingStartedAt(Date.now())
             setWaitingVisible(true)
-            setWaitingPhase(hasVisibleAssistantOutput(messagesRef.current) ? 'continuing' : 'awaiting')
+            setWaitingPhase(waitingPhaseForTurn(messagesRef.current, event.pendingFollowUps))
             setWaitingDetail(undefined)
           }
         }
@@ -1257,7 +1292,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       } else if (event.type === 'tool_call' || event.type === 'tool_result') {
         setWaitingPhase('tool')
         if (event.type === 'tool_call' && event.name === 'subagent') setWaitingDetail('子任务执行中')
-        else if (event.type === 'tool_call') setWaitingDetail(undefined)
+        else if (event.type === 'tool_call') setWaitingDetail(toolDisplaySummary(event.name, event.delta ?? ''))
       }
       setMessages(previous => applyStreamEvent(previous, event))
     } })
@@ -1326,6 +1361,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       // No lease exists yet in this state, so the write gate below must not apply.
       if (!selectedProject) return false
       const session = await host.newSession(selectedProject)
+      messagesBySessionRef.current.set(session.id, [])
       pendingAutoSendRef.current = { sessionId: session.id, prompt, attachments }
       setSessions(items => [session, ...items])
       setSelectedProject(selectedProject)
@@ -1389,8 +1425,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
   }
   const handleCopy = async (message: ChatMessage) => {
-    if (!message.content.trim()) return
-    await navigator.clipboard.writeText(message.content)
+    const text = message.role === 'user' ? stripAttachmentPathsForDisplay(message.content) : message.content
+    if (!text.trim()) return
+    await navigator.clipboard.writeText(text)
     if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current)
     setCopiedId(message.id)
     copiedTimerRef.current = window.setTimeout(() => {
@@ -1400,18 +1437,22 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   }
   const handleResend = (message: ChatMessage) => {
     // Electron has no fork/resend RPC yet: this deliberately sends a new prompt.
-    void send(message.content).catch(() => undefined)
+    const text = message.role === 'user' ? stripAttachmentPathsForDisplay(message.content) : message.content
+    void send(text).catch(() => undefined)
   }
   const resendDisabled = Boolean(!canWriteLease || streaming || sessionQueue.busy)
 
   const newSession = async (projectId = selectedProject) => {
     if (!projectId) return
+    if (selectedSession) messagesBySessionRef.current.set(selectedSession, messagesRef.current)
     const session = await host.newSession(projectId)
+    messagesBySessionRef.current.set(session.id, [])
     setSessions(items => [session, ...items])
     setSelectedProject(projectId)
     setSelectedSession(session.id)
     setSidebarExpandedIds(current => current.includes(projectId) ? current : [...current, projectId])
     setMessages([])
+    messagesRef.current = []
   }
   const addProject = async (): Promise<boolean> => {
     if (!host.pickProjectDirectory || !host.addProject) {
@@ -1525,6 +1566,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     setSidebarExpandedIds(current => current.includes(projectId) ? current.filter(id => id !== projectId) : [...current, projectId])
   }
   const selectSidebarSession = (sessionId: string) => {
+    if (selectedSession && selectedSession !== sessionId) {
+      messagesBySessionRef.current.set(selectedSession, messagesRef.current)
+    }
+    const cached = messagesBySessionRef.current.get(sessionId)
+    if (cached !== undefined) {
+      messagesRef.current = cached
+      setMessages(cached)
+    }
     const session = sessions.find(item => item.id === sessionId)
     if (session) {
       setSelectedProject(session.projectId)
@@ -1725,7 +1774,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   // transcript tail; while it is hidden, a running background subagent keeps the
   // tail alive with a stable-timed phase=tool indicator and no stop button.
   const firstResponseWaiting = waitingVisible && waitingStartedAt !== null
-    ? { startedAt: waitingStartedAt, phase: waitingPhase, detail: waitingDetail, onStop: waitingPhase === 'continuing' ? undefined : stopSelectedSession }
+    ? { startedAt: waitingStartedAt, phase: waitingPhase, detail: waitingDetail, onStop: waitingPhase === 'continuing' || waitingPhase === 'followup' ? undefined : stopSelectedSession }
     : undefined
   const subagentWaiting = !firstResponseWaiting && subagentsRunningCount > 0 && subagentWaitingStartedAt !== null
     ? { startedAt: subagentWaitingStartedAt, phase: 'tool' as const, detail: `${subagentsRunningCount} 个子任务执行中` }
@@ -1738,13 +1787,36 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       <div className="chat-viewport" data-testid="chat-viewport">
         <ToolQuickRail activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunningCount={subagentsRunningCount} />
         <LiveSubagentBindingProvider host={host} sessionId={selectedSession}>
-          <Transcript messages={messages} transcriptRef={transcriptRef} documentBasePath={selectedProjectPath} onOpenDocument={openDocument} onOpenSubagents={openSubagents} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={firstResponseWaiting ?? subagentWaiting} />
+          {(() => {
+            const ids = (selectedSession && !mountedSessionIds.includes(selectedSession)
+              ? [selectedSession, ...mountedSessionIds]
+              : mountedSessionIds).slice(0, 6)
+            if (ids.length === 0) {
+              return <Transcript messages={messages} transcriptRef={transcriptRef} documentBasePath={selectedProjectPath} onOpenDocument={openDocument} onOpenSubagents={openSubagents} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={firstResponseWaiting ?? subagentWaiting} />
+            }
+            return ids.map(id => (
+              <div key={id} className="session-transcript-slot" data-session-transcript={id} hidden={id !== selectedSession}>
+                <Transcript
+                  messages={id === selectedSession ? messages : (messagesBySessionRef.current.get(id) ?? [])}
+                  transcriptRef={id === selectedSession ? transcriptRef : idleTranscriptRef}
+                  documentBasePath={selectedProjectPath}
+                  onOpenDocument={openDocument}
+                  onOpenSubagents={openSubagents}
+                  onCopy={handleCopy}
+                  onResend={handleResend}
+                  resendDisabled={resendDisabled}
+                  copiedId={id === selectedSession ? copiedId : null}
+                  waiting={id === selectedSession ? firstResponseWaiting ?? subagentWaiting : undefined}
+                />
+              </div>
+            ))
+          })()}
         </LiveSubagentBindingProvider>
       </div>
       <div className="chat-composer-stack" data-testid="chat-composer-stack">
         {sessionQueue.error && <div className="queue-operation-error" role="alert" data-testid="queue-operation-error"><span>{sessionQueue.error}</span><button aria-label="关闭队列错误" onClick={sessionQueue.dismissError}>×</button></div>}
         <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.steer(id).catch(() => undefined) }} />
-        <Composer key={selectedSession} streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} queueBusy={sessionQueue.busy} readOnly={leaseReadOnly} leaseOwner={leaseReadOnly ? leaseOwnerLabel(lease) : undefined} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} onDraftChange={persistComposerDraft} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} onOpenModelManager={() => setModalOpen(true)} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} />
+        <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} queueBusy={sessionQueue.busy} readOnly={leaseReadOnly} leaseOwner={leaseReadOnly ? leaseOwnerLabel(lease) : undefined} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} onDraftChange={persistComposerDraft} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} onOpenModelManager={() => setModalOpen(true)} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} />
       </div>
     </section>
     <ResizeHandle label="调整工具栏宽度" onPointerDown={resize('tools', widths.tools)} />
@@ -1762,10 +1834,21 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
 function hasVisibleAssistantOutput(messages: ChatMessage[]): boolean {
   return messages.some(message => message.role === 'assistant' && (
     Boolean(message.content) ||
+    Boolean(message.error) ||
     (message.tools?.length ?? 0) > 0 ||
     Boolean(message.thinking) ||
     (message.activities?.length ?? 0) > 0
   ))
+}
+
+/** A `[subagent-*]` injection — already in the transcript or still pending on
+ *  the just-emitted `started` — is a follow-up wait, not a leftover first-token
+ *  or generic "等待模型响应" after the worker card already says 已完成. */
+function waitingPhaseForTurn(messages: ChatMessage[], pendingFollowUps?: string[]): WaitingPhase {
+  const lastUser = [...messages].reverse().find(message => message.role === 'user')
+  if (lastUser && parseSubagentSignal(lastUser.content)) return 'followup'
+  if (pendingFollowUps?.some(text => parseSubagentSignal(text))) return 'followup'
+  return hasVisibleAssistantOutput(messages) ? 'continuing' : 'awaiting'
 }
 
 function ResizeHandle({ label, onPointerDown }: { label: string; onPointerDown: (event: React.PointerEvent) => void }) { return <div className="resize-handle" role="separator" aria-label={label} onPointerDown={onPointerDown} /> }
@@ -1805,6 +1888,11 @@ function toPromptAttachment(a: ComposerAttachment): Promise<PromptAttachment> {
 
 function Composer({ streaming, working, stopping, stopError, compacting, queueBusy, readOnly, leaseOwner, onTakeover, modelState, host, sessionId, initialDraft = '', onDraftChange, statsRefreshKey, visibility, onOpenModelManager, onCompact, onSend, onStop, onDismissStopError, onModel, onOpenBrowserLogin }: { streaming: boolean; working: boolean; stopping: boolean; stopError: string | null; compacting: boolean; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover: () => void; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; initialDraft?: string; onDraftChange?: (draft: string) => void; statsRefreshKey: number; visibility: ModelVisibilityController; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: PromptAttachment[]) => Promise<boolean>; onStop: () => void; onDismissStopError: () => void; onModel: (state: ModelState) => void; onOpenBrowserLogin?: () => void }) {
   const [draft, setDraft] = useState(initialDraft)
+  const [draftSessionId, setDraftSessionId] = useState(sessionId)
+  if (sessionId !== draftSessionId) {
+    setDraftSessionId(sessionId)
+    setDraft(initialDraft)
+  }
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
   const [attachError, setAttachError] = useState<string | null>(null)
@@ -1818,6 +1906,14 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
 
   // Revoke all object URLs when the composer unmounts (no leaks).
   useEffect(() => () => { for (const a of attachmentsRef.current) URL.revokeObjectURL(a.url) }, [])
+  useEffect(() => {
+    for (const a of attachmentsRef.current) URL.revokeObjectURL(a.url)
+    setAttachments([])
+    setLightboxIndex(null)
+    setAttachError(null)
+    setSendError(null)
+    setQuickOpen(false)
+  }, [sessionId])
   // Esc closes the lightbox and the quick menu.
   useEffect(() => {
     if (lightboxIndex === null && !quickOpen) return

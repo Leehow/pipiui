@@ -38,6 +38,8 @@ describe('waitingCopy', () => {
     expect(waitingCopy('stopping', 45)).toBe('正在停止…')
     expect(waitingCopy('continuing', 0)).toBe('等待模型响应')
     expect(waitingCopy('continuing', 600)).toBe('等待模型响应')
+    expect(waitingCopy('followup', 0)).toBe('正在处理子任务结果')
+    expect(waitingCopy('followup', 94)).toBe('正在处理子任务结果')
   })
 })
 

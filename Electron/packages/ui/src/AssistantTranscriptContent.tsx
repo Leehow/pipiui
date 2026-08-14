@@ -9,9 +9,10 @@ import { DocumentReferenceCards } from './DocumentReferenceCards'
 import { LiveSubagentCard } from './LiveSubagentCard'
 import { useLiveSubagentBindings } from './LiveSubagentBinding'
 import type { ChatMessage, TranscriptActivity, TranscriptTool } from './transcript-model'
+import { activitiesFromMessage, planAssistantTranscript } from './transcript-model'
 
 export type { TranscriptActivity, TranscriptTool } from './transcript-model'
-export type AssistantTranscriptMessage = Pick<ChatMessage, 'content' | 'thinking' | 'tools' | 'activities' | 'streaming'>
+export type AssistantTranscriptMessage = Pick<ChatMessage, 'content' | 'thinking' | 'tools' | 'activities' | 'streaming' | 'error'>
 
 function elapsed(startedAt: number, endedAt = Date.now()) { return `${Math.max(0, Math.round((endedAt - startedAt) / 1000))}s` }
 function toolRunSummary(steps: number, thinking: string | null, tools: { name: string }[]): string {
@@ -37,7 +38,7 @@ const TranscriptToolCard = memo(function TranscriptToolCard({ tool, streaming }:
     : toolDisplaySummary(tool.name, tool.input)
   const completedElapsed = elapsed(tool.startedAt, tool.finishedAt ?? tool.startedAt)
   const meta = tool.error ? `失败 · ${completedElapsed}` : subagentNotice ? `${subagentNotice.ok ? '成功' : '失败'} · ${subagentNotice.cost} · ${completedElapsed}` : tool.dispatched ? `已派发 · ${completedElapsed}` : tool.finished ? `完成 · ${completedElapsed}` : `运行中 · ${elapsed(tool.startedAt)}`
-  return <ActivityCard kind="tool" summary={summary} meta={meta} error={Boolean(tool.error || (subagentNotice && !subagentNotice.ok))} defaultExpanded={tool.name === 'subagent' ? (Boolean(streaming) || !tool.finished || Boolean(tool.dispatched)) : Boolean(streaming || !tool.finished)}>
+  return <ActivityCard kind="tool" summary={summary} meta={meta} error={Boolean(tool.error || (subagentNotice && !subagentNotice.ok))} defaultExpanded={tool.name === 'subagent' ? (Boolean(streaming) || !tool.finished || Boolean(tool.dispatched)) : false}>
     {tool.images && tool.images.length > 0 && <div className="tool-images">{tool.images.map((img, i) => <img key={i} className="tool-screenshot" src={`data:${img.mimeType};base64,${img.data}`} alt="工具截图" loading="lazy" />)}</div>}
     {tool.input && <div className="tool-io"><div className="tool-io-label">输入</div><pre>{formatToolInput(tool.name, tool.input)}</pre></div>}
     {tool.result && <div className="tool-io"><div className="tool-io-label">输出</div><div className="tool-result">{tool.result}</div></div>}
@@ -45,37 +46,51 @@ const TranscriptToolCard = memo(function TranscriptToolCard({ tool, streaming }:
 })
 
 const ActiveToolCard = memo(function ActiveToolCard({ tool }: { tool: TranscriptTool }) {
-  const argsSummary = toolArgsSummary(tool.name, tool.input)
-  const summary = `${tool.name}${argsSummary !== '…' ? ` · ${argsSummary}` : ''}`
-  return <section className="activity-card activity-card-tool activity-card-active-tool" data-activity-card="tool" data-testid="active-tool"><div className="activity-summary"><span className="activity-status" aria-hidden="true">◌</span><b>{summary}</b><small className="activity-meta">运行中 · {elapsed(tool.startedAt)}</small></div></section>
+  return <section className="activity-card activity-card-tool activity-card-active-tool" data-activity-card="tool" data-testid="active-tool"><div className="activity-summary"><span className="activity-status" aria-hidden="true">◌</span><b>{toolDisplaySummary(tool.name, tool.input)}</b><small className="activity-meta">运行中 · {elapsed(tool.startedAt)}</small></div></section>
 })
 
 export const AssistantTranscriptContent = memo(function AssistantTranscriptContent({ message, expandSteps, documentBasePath, onOpenDocument, onOpenSubagents }: { message: AssistantTranscriptMessage; expandSteps?: boolean; documentBasePath?: string; onOpenDocument?: (path: string) => void; onOpenSubagents?: (agentId?: string) => void }) {
-  const activities: TranscriptActivity[] = message.activities ?? [
-    ...(message.thinking ? [{ type: 'thinking' as const, id: 'thinking', contentIndex: 0, content: message.thinking }] : []),
-    ...(message.tools ?? []).map((tool, index) => ({ type: 'tool' as const, contentIndex: index + (message.thinking ? 1 : 0), tool })),
-  ]
-  const activeTool = message.streaming && !expandSteps ? [...activities].reverse().find((activity): activity is Extract<TranscriptActivity, { type: 'tool' }> => activity.type === 'tool' && !activity.tool.finished && activity.tool.name !== 'subagent') : undefined
-  const groupedActivities = activeTool ? activities.filter(activity => activity !== activeTool) : activities
-  const tools = groupedActivities.flatMap(activity => activity.type === 'tool' ? [activity.tool] : [])
+  const activities = activitiesFromMessage(message)
+  const stepActivities = activities.filter((activity): activity is Extract<TranscriptActivity, { type: 'thinking' | 'tool' }> => activity.type !== 'text')
+  const activeTool = message.streaming ? [...stepActivities].reverse().find((activity): activity is Extract<TranscriptActivity, { type: 'tool' }> => activity.type === 'tool' && !activity.tool.finished && activity.tool.name !== 'subagent') : undefined
+  const segments: ReturnType<typeof planAssistantTranscript> = []
+  for (const segment of planAssistantTranscript(message)) {
+    if (segment.type === 'text') {
+      segments.push(segment)
+      continue
+    }
+    const grouped = activeTool ? segment.activities.filter(activity => !(activity.type === 'tool' && activity.tool.id === activeTool.tool.id)) : segment.activities
+    if (grouped.length) segments.push({ type: 'steps', activities: grouped })
+  }
+  const tools = segments.flatMap(segment => segment.type === 'steps' ? segment.activities.flatMap(activity => activity.type === 'tool' ? [activity.tool] : []) : [])
   const liveByTool = useLiveSubagentBindings(tools)
   const subagentProjections = tools.filter(tool => tool.name === 'subagent').map(tool => liveByTool.get(tool.id)).filter((projection): projection is NonNullable<typeof projection> => Boolean(projection))
   const linkedRunning = subagentProjections.some(projection => projection.runningCount > 0)
   const pendingDispatch = tools.some(tool => tool.name === 'subagent' && Boolean(tool.dispatched) && (liveByTool.get(tool.id)?.roots.length ?? 0) === 0)
   const linkedFailed = subagentProjections.some(projection => projection.failedCount > 0)
-  const hasThinking = groupedActivities.some(activity => activity.type === 'thinking')
-  const steps = groupedActivities.length
   const failed = tools.some(tool => Boolean(tool.error) || (tool.name === 'subagent' && tool.finished && tool.result ? parseSubagentNotice(tool.result)?.ok === false : false)) || linkedFailed
   const running = Boolean(message.streaming && !activeTool) || linkedRunning || pendingDispatch
   const stepsExpanded = expandSteps ?? (Boolean(message.streaming) || pendingDispatch || linkedRunning)
+  const lastStepsIndex = segments.reduce((last, segment, index) => segment.type === 'steps' ? index : last, -1)
+  const stepGroupCount = segments.filter(segment => segment.type === 'steps').length
+  const stepsKey = (index: number) => {
+    const base = expandSteps ? 'steps' : message.streaming ? 'live' : linkedRunning || pendingDispatch ? 'live-agent' : 'done'
+    return stepGroupCount > 1 ? `${base}:${index}` : base
+  }
   return <div className="assistant-transcript-content" data-testid="assistant-transcript-content">
-    {steps > 0 && <ActivityCard key={expandSteps ? 'steps' : message.streaming ? 'live' : linkedRunning || pendingDispatch ? 'live-agent' : 'done'} summary={toolRunSummary(steps, hasThinking ? 'Thinking' : null, tools)} running={running} error={failed && !running} meta={failed && !running ? '失败' : undefined} defaultExpanded={stepsExpanded}>{groupedActivities.map((activity, index) => {
-      const live = Boolean(message.streaming && index === groupedActivities.length - 1 && !activeTool)
-      if (activity.type === 'thinking') return <ActivityCard key={`thinking:${activity.id}`} kind="thinking" label="Thinking" summary="Thinking" meta={`${formatCompactTokens(Math.round(activity.content.length / 4))} tokens`} running={live} defaultExpanded={false}><p>{activity.content}</p></ActivityCard>
-      const projection = liveByTool.get(activity.tool.id)
-      return activity.tool.name === 'subagent' && projection && projection.totalCount > 0 ? <LiveSubagentCard key={`tool:${activity.tool.id}`} projection={projection} onOpenSubagents={onOpenSubagents} /> : <TranscriptToolCard key={`tool:${activity.tool.id}`} tool={activity.tool} streaming={live || !activity.tool.finished} />
-    })}</ActivityCard>}
+    {segments.map((segment, index) => {
+      if (segment.type === 'text') return <div key={`text:${segment.id}`} data-transcript-segment="text"><TranscriptMarkdown content={segment.content} streaming={message.streaming && index === segments.length - 1} />{!message.streaming && <DocumentReferenceCards content={segment.content} basePath={documentBasePath} onOpenDocument={onOpenDocument} />}</div>
+      const groupTools = segment.activities.flatMap(activity => activity.type === 'tool' ? [activity.tool] : [])
+      const hasThinking = segment.activities.some(activity => activity.type === 'thinking')
+      const groupRunning = running && index === lastStepsIndex
+      return <ActivityCard key={stepsKey(index)} summary={toolRunSummary(segment.activities.length, hasThinking ? 'Thinking' : null, groupTools)} running={groupRunning} error={failed && !running && index === lastStepsIndex} meta={failed && !running && index === lastStepsIndex ? '失败' : undefined} defaultExpanded={stepsExpanded}>{segment.activities.map((activity, activityIndex) => {
+        const live = Boolean(message.streaming && index === lastStepsIndex && activityIndex === segment.activities.length - 1 && !activeTool && (activity.type === 'thinking' || !activity.tool.finished))
+        if (activity.type === 'thinking') return <ActivityCard key={`thinking:${activity.id}`} kind="thinking" label="Thinking" summary="Thinking" meta={`${formatCompactTokens(Math.round(activity.content.length / 4))} tokens`} running={live} defaultExpanded={false}><p>{activity.content}</p></ActivityCard>
+        const projection = liveByTool.get(activity.tool.id)
+        return activity.tool.name === 'subagent' && projection && projection.totalCount > 0 ? <LiveSubagentCard key={`tool:${activity.tool.id}`} projection={projection} onOpenSubagents={onOpenSubagents} /> : <TranscriptToolCard key={`tool:${activity.tool.id}`} tool={activity.tool} streaming={live} />
+      })}</ActivityCard>
+    })}
     {activeTool && <ActiveToolCard key={`active-tool:${activeTool.tool.id}`} tool={activeTool.tool} />}
-    {message.content && <><TranscriptMarkdown content={message.content} streaming={message.streaming} />{!message.streaming && <DocumentReferenceCards content={message.content} basePath={documentBasePath} onOpenDocument={onOpenDocument} />}</>}
+    {message.error && <div className="assistant-turn-error" data-testid="assistant-turn-error" role="alert">{message.error}</div>}
   </div>
 })

@@ -1,4 +1,5 @@
 import type { HistoryEntry, StreamEvent } from '@pipi/host-api'
+import { stripAttachmentPathsForDisplay } from './attachments'
 
 export type TranscriptTool = {
   id: string
@@ -14,8 +15,13 @@ export type TranscriptTool = {
 }
 
 export type TranscriptActivity =
-  | { type: 'thinking'; id: string; contentIndex: number; content: string }
-  | { type: 'tool'; contentIndex: number; tool: TranscriptTool }
+  | { type: 'thinking'; id: string; contentIndex: number; segment?: number; content: string }
+  | { type: 'text'; id: string; contentIndex: number; segment?: number; content: string }
+  | { type: 'tool'; contentIndex: number; segment?: number; tool: TranscriptTool }
+
+export type TranscriptSegment =
+  | { type: 'steps'; activities: Array<Extract<TranscriptActivity, { type: 'thinking' | 'tool' }>> }
+  | { type: 'text'; id: string; content: string }
 
 export type ChatMessage = {
   id: string
@@ -27,10 +33,66 @@ export type ChatMessage = {
   streaming?: boolean
   timestamp?: number
   images?: { data: string; mimeType: string }[]
+  /** assistant only: terminal provider error (stopReason "error") rendered as an error bubble. */
+  error?: string
 }
 
 function isBackgroundSubagentAck(content: string): boolean {
   return /\bStarted background agent(?:\(s\)|s)?\b/i.test(content)
+}
+
+function cloneActivity(activity: TranscriptActivity, toolsById: Map<string, TranscriptTool>): TranscriptActivity {
+  return activity.type === 'tool'
+    ? { ...activity, tool: toolsById.get(activity.tool.id) ?? { ...activity.tool } }
+    : { ...activity }
+}
+
+function mapHistoryActivity(entry: HistoryEntry, activity: NonNullable<HistoryEntry['activities']>[number], toolsById: Map<string, TranscriptTool>): TranscriptActivity {
+  if (activity.type === 'thinking') return { type: 'thinking', id: `${entry.id}:${activity.contentIndex}`, contentIndex: activity.contentIndex, content: activity.content }
+  if (activity.type === 'text') return { type: 'text', id: `${entry.id}:text:${activity.contentIndex}`, contentIndex: activity.contentIndex, content: activity.content }
+  return { type: 'tool', contentIndex: activity.contentIndex, tool: toolsById.get(activity.tool.id) ?? { ...activity.tool, startedAt: entry.timestamp, finished: true } }
+}
+
+function lastSegment(activities: TranscriptActivity[]): number {
+  return activities.reduce((highest, activity) => Math.max(highest, activity.segment ?? 0), 0)
+}
+
+export function activitiesFromMessage(message: Pick<ChatMessage, 'thinking' | 'tools' | 'activities'>): TranscriptActivity[] {
+  return message.activities ?? [
+    ...(message.thinking ? [{ type: 'thinking' as const, id: 'thinking', contentIndex: 0, content: message.thinking }] : []),
+    ...(message.tools ?? []).map((tool, index) => ({ type: 'tool' as const, contentIndex: index + (message.thinking ? 1 : 0), tool })),
+  ]
+}
+
+export function planTranscriptSegments(activities: TranscriptActivity[]): TranscriptSegment[] {
+  const segments: TranscriptSegment[] = []
+  let pending: Array<Extract<TranscriptActivity, { type: 'thinking' | 'tool' }>> = []
+  const flush = () => {
+    if (pending.length) {
+      segments.push({ type: 'steps', activities: pending })
+      pending = []
+    }
+  }
+  for (const activity of activities) {
+    if (activity.type === 'text') {
+      if (!activity.content) continue
+      flush()
+      segments.push({ type: 'text', id: activity.id, content: activity.content })
+    } else {
+      pending.push(activity)
+    }
+  }
+  flush()
+  return segments
+}
+
+export function planAssistantTranscript(message: Pick<ChatMessage, 'content' | 'thinking' | 'tools' | 'activities'>): TranscriptSegment[] {
+  const activities = activitiesFromMessage(message)
+  const segments = planTranscriptSegments(activities)
+  if (message.content && !activities.some(activity => activity.type === 'text')) {
+    segments.push({ type: 'text', id: 'content', content: message.content })
+  }
+  return segments
 }
 
 /**
@@ -42,13 +104,11 @@ export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
   const cards = new Map<string, TranscriptTool>()
   const messages: ChatMessage[] = []
   for (const entry of entries) {
-    if (entry.role === 'assistant' && (entry.thinking || entry.tools?.length)) {
+    if (entry.role === 'assistant' && (entry.thinking || entry.tools?.length || entry.activities?.some(activity => activity.type !== 'text'))) {
       const tools = entry.tools?.map(tool => ({ id: tool.id, name: tool.name, input: tool.input, startedAt: entry.timestamp, finished: true }))
       for (const tool of tools ?? []) cards.set(tool.id, tool)
       const toolsById = new Map((tools ?? []).map(tool => [tool.id, tool]))
-      const activities: TranscriptActivity[] = entry.activities?.map(activity => activity.type === 'thinking'
-        ? { type: 'thinking', id: `${entry.id}:${activity.contentIndex}`, contentIndex: activity.contentIndex, content: activity.content }
-        : { type: 'tool', contentIndex: activity.contentIndex, tool: toolsById.get(activity.tool.id) ?? { ...activity.tool, startedAt: entry.timestamp, finished: true } }) ?? [
+      const activities: TranscriptActivity[] = entry.activities?.map(activity => mapHistoryActivity(entry, activity, toolsById)) ?? [
         ...(entry.thinking ? [{ type: 'thinking' as const, id: entry.id, contentIndex: 0, content: entry.thinking }] : []),
         ...(tools ?? []).map((tool, index) => ({ type: 'tool' as const, contentIndex: index + (entry.thinking ? 1 : 0), tool })),
       ]
@@ -62,7 +122,7 @@ export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
         previous.timestamp = entry.timestamp
         continue
       }
-      messages.push({ id: entry.id, role: 'assistant', content: entry.content, thinking: entry.thinking, tools, activities, timestamp: entry.timestamp })
+      messages.push({ id: entry.id, role: 'assistant', content: entry.content, thinking: entry.thinking, tools, activities, timestamp: entry.timestamp, ...(entry.errorMessage ? { error: entry.errorMessage } : {}) })
       continue
     }
     if (entry.role === 'tool' && entry.toolCallId && cards.has(entry.toolCallId)) {
@@ -82,22 +142,52 @@ export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
       previous.timestamp = entry.timestamp
       continue
     }
-    messages.push({ id: entry.id, role: entry.role, content: entry.content, ...(entry.role === 'user' && entry.images?.length ? { images: entry.images } : {}) })
+    messages.push({ id: entry.id, role: entry.role, content: entry.role === 'user' ? stripAttachmentPathsForDisplay(entry.content) : entry.content, ...(entry.role === 'assistant' && entry.errorMessage ? { error: entry.errorMessage } : {}), ...(entry.role === 'user' && entry.images?.length ? { images: entry.images } : {}) })
   }
   return messages
 }
 
+export function appendLiveUserMessage(messages: ChatMessage[], incoming: { content: string; id?: string; images?: ChatMessage['images'] }): ChatMessage[] {
+  const raw = incoming.content
+  if (!raw) return messages
+  const content = stripAttachmentPathsForDisplay(raw)
+  const last = messages[messages.length - 1]
+  if (last?.role === 'user' && last.content === raw) return messages
+  if (last?.role === 'user' && stripAttachmentPathsForDisplay(last.content).trim() === content.trim()) {
+    const next = [...messages]
+    next[next.length - 1] = {
+      ...last,
+      id: incoming.id ?? last.id,
+      content,
+      images: last.images?.length ? last.images : incoming.images,
+    }
+    return next
+  }
+  return [...messages, { id: incoming.id ?? `user-${Date.now()}`, role: 'user', content, timestamp: Date.now(), ...(incoming.images?.length ? { images: incoming.images } : {}) }]
+}
+
 export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamEvent, { type: 'status' }>): ChatMessage[] {
+  if (event.type === 'error') return applyTurnError(previous, event.content)
+  if (event.type !== 'text' && event.type !== 'thinking' && event.type !== 'tool_call' && event.type !== 'tool_result') return previous
   const index = previous.findLastIndex(item => item.role === 'assistant')
   const current = index >= 0 && previous[index].streaming ? previous[index] : { id: `stream-${Date.now()}`, role: 'assistant' as const, content: '', thinking: '', tools: [], streaming: true, timestamp: Date.now() }
   const next = index >= 0 && previous[index].streaming ? [...previous] : [...previous, current]
   const tools = (current.tools ?? []).map(tool => ({ ...tool }))
   const toolsById = new Map(tools.map(tool => [tool.id, tool]))
-  const activities = (current.activities ?? []).map(activity => activity.type === 'thinking'
-    ? { ...activity }
-    : { ...activity, tool: toolsById.get(activity.tool.id) ?? { ...activity.tool } })
+  const activities = (current.activities ?? []).map(activity => cloneActivity(activity, toolsById))
   const updated: ChatMessage = { ...current, tools, activities }
-  if (event.type === 'text') updated.content += event.delta
+  if (event.type === 'text') {
+    updated.content += event.delta
+    const segment = event.segment ?? 0
+    const id = `text:${segment}:${event.contentIndex}`
+    const activityIndex = activities.findIndex(activity => activity.type === 'text' && activity.id === id)
+    if (activityIndex >= 0) {
+      const activity = activities[activityIndex]
+      if (activity.type === 'text') activities[activityIndex] = { ...activity, content: activity.content + event.delta }
+    } else {
+      activities.push({ type: 'text', id, contentIndex: event.contentIndex, segment, content: event.delta })
+    }
+  }
   if (event.type === 'thinking') {
     updated.thinking = (updated.thinking ?? '') + event.delta
     // Pi restarts contentIndex at every assistant message, so the segment epoch
@@ -109,7 +199,7 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
       const activity = activities[activityIndex]
       if (activity.type === 'thinking') activities[activityIndex] = { ...activity, content: activity.content + event.delta }
     } else {
-      activities.push({ type: 'thinking', id: `thinking:${segment}:${event.contentIndex}`, contentIndex: event.contentIndex, content: event.delta })
+      activities.push({ type: 'thinking', id: `thinking:${segment}:${event.contentIndex}`, contentIndex: event.contentIndex, segment, content: event.delta })
     }
   }
   if (event.type === 'tool_call') {
@@ -121,7 +211,8 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
     if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool } as TranscriptActivity
     else {
       const contentIndex = event.contentIndex ?? (activities.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
-      activities.push({ type: 'tool', contentIndex, tool })
+      const segment = event.segment ?? lastSegment(activities)
+      activities.push({ type: 'tool', contentIndex, segment, tool })
     }
   }
   if (event.type === 'tool_result') {
@@ -134,8 +225,24 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
       if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool: completed } as TranscriptActivity
     }
   }
-  activities.sort((left, right) => left.contentIndex - right.contentIndex)
+  // Keep insertion order. Sorting by contentIndex is wrong: Pi restarts the
+  // index every assistant message, and text/thinking often share index 0.
   next[next.length - 1] = updated
+  return next
+}
+
+/** A turn that ended in `stopReason: "error"` streams no text — surface the
+ *  provider errorMessage on the assistant turn so the failure is visible
+ *  instead of an empty bubble. */
+function applyTurnError(messages: ChatMessage[], content: string): ChatMessage[] {
+  if (!content) return messages
+  const index = messages.findLastIndex(message => message.role === 'assistant' && message.streaming)
+  const next = [...messages]
+  if (index >= 0) {
+    next[index] = { ...next[index], error: content, streaming: false }
+  } else {
+    next.push({ id: `error-${Date.now()}`, role: 'assistant', content: '', error: content, streaming: false, timestamp: Date.now() })
+  }
   return next
 }
 

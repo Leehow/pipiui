@@ -23,7 +23,9 @@ body{overscroll-behavior:none}
 /* Keep transcript scrolling in the sole flexible row. Queue/error/composer live
    together in the final auto row so implicit grid rows can never push input off-screen. */
 .chat-viewport{position:relative;min-width:0;min-height:0;overflow:hidden;grid-row:2}
-.chat-viewport>.transcript-area{height:100%;min-height:0}
+.chat-viewport>.transcript-area,.chat-viewport>.session-transcript-slot{height:100%;min-height:0}
+.chat-viewport>.session-transcript-slot>.transcript-area{height:100%;min-height:0}
+.chat-viewport>.session-transcript-slot[hidden]{display:none!important}
 .chat-composer-stack{grid-row:3;align-self:end;display:flex;min-width:0;min-height:0;flex:0 0 auto;flex-direction:column;overflow:visible;padding-right:var(--chat-scrollbar-gutter)}
 .chat-header,.composer{min-width:0;flex:none}
 /* Lease state is content in the fixed composer row, never a separate grid row. */
@@ -53,7 +55,7 @@ body{overscroll-behavior:none}
    manually re-expanded panes become fixed overlays so the chat column keeps the
    full width and nothing overflows horizontally. */
 @media (max-width:720px){.pipiui-shell{grid-template-columns:0 minmax(0,1fr) 0}.pipiui-shell .sb-root,.pipiui-shell .tool-panel{position:fixed;top:0;bottom:0;z-index:30;width:min(86vw,340px);height:auto;box-shadow:0 10px 40px rgb(0 0 0/30%)}.pipiui-shell .sb-root{left:0}.pipiui-shell .tool-panel{right:0;border-left:1px solid var(--border)}.pipiui-shell.sidebar-collapsed .sb-root,.pipiui-shell.tools-collapsed .tool-panel{display:none}.pipiui-shell .resize-handle{visibility:hidden}.tool-quick-rail{z-index:35}.pipiui-shell:not(.tools-collapsed) .tool-quick-rail{right:min(86vw,340px)}}
-.project-menu-wrap{position:relative;display:none}.project-row:hover .project-menu-wrap,.project-menu-wrap:focus-within{display:block}.project-menu-button{width:22px;height:24px;border-radius:5px;color:var(--muted);font-size:17px}.project-menu-button:hover{background:var(--surface-hover);color:var(--text)}.project-menu{position:absolute;z-index:10;top:26px;right:0;width:184px;padding:4px;border:1px solid var(--border);border-radius:8px;background:var(--surface-raised);box-shadow:0 10px 25px rgb(0 0 0 / 18%)}.project-menu button,.project-menu-count{display:block;width:100%;padding:6px 8px;text-align:left;border-radius:5px;font-size:11px}.project-menu button:hover{background:var(--surface-hover)}.project-menu button:disabled,.project-menu-count{color:var(--subtle);cursor:default}.project-menu .danger{color:var(--danger)}.sb-menu-item:disabled{cursor:not-allowed;opacity:.55;color:var(--subtle)}.sb-menu-item:disabled:hover{background:transparent}.transcript-area{position:relative;min-width:0;min-height:0;overflow:hidden}.return-latest{position:absolute;z-index:4;right:22px;bottom:18px;padding:6px 10px;border:1px solid var(--border);border-radius:16px;color:var(--text);background:var(--surface-raised);box-shadow:0 3px 10px rgb(0 0 0 / 16%);font-size:11px}
+.project-menu-wrap{position:relative;display:none}.project-row:hover .project-menu-wrap,.project-menu-wrap:focus-within{display:block}.project-menu-button{width:22px;height:24px;border-radius:5px;color:var(--muted);font-size:17px}.project-menu-button:hover{background:var(--surface-hover);color:var(--text)}.project-menu{position:absolute;z-index:10;top:26px;right:0;width:184px;padding:4px;border:1px solid var(--border);border-radius:8px;background:var(--surface-raised);box-shadow:0 10px 25px rgb(0 0 0 / 18%)}.project-menu button,.project-menu-count{display:block;width:100%;padding:6px 8px;text-align:left;border-radius:5px;font-size:11px}.project-menu button:hover{background:var(--surface-hover)}.project-menu button:disabled,.project-menu-count{color:var(--subtle);cursor:default}.project-menu .danger{color:var(--danger)}.sb-menu-item:disabled{cursor:not-allowed;opacity:.55;color:var(--subtle)}.sb-menu-item:disabled:hover{background:transparent}.transcript-area{position:relative;min-width:0;min-height:0;overflow:hidden}.return-latest{position:absolute;z-index:4;right:22px;bottom:18px;width:32px;height:32px;display:flex;align-items:center;justify-content:center;padding:0;border:1px solid var(--border);border-radius:50%;color:var(--text);background:var(--surface-raised);box-shadow:0 3px 10px rgb(0 0 0 / 16%);cursor:pointer}
 
 /* Right tool workspace is content-only; the tool switcher floats over the chat
    column as a Swift-style quick rail (panelQuickRail parity). */
@@ -109,8 +111,7 @@ body{overscroll-behavior:none}
 .provider-login-cancel:hover{background:var(--surface-hover)}
 
 /* Modal top action buttons. */
-.model-modal-add{position:absolute;top:10px;right:38px;padding:3px 9px;border-radius:10px;background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent);font-size:11px}
-.model-modal-add:hover{background:color-mix(in srgb,var(--accent) 22%,transparent)}
+.model-modal-header-actions{position:absolute;top:10px;right:38px;display:flex;align-items:center;gap:6px}.model-modal-add{padding:3px 9px;border-radius:10px;background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent);font-size:11px}.model-modal-add:hover{background:color-mix(in srgb,var(--accent) 22%,transparent)}.model-modal-refresh{padding:3px 9px;border-radius:10px;background:color-mix(in srgb,var(--text) 8%,transparent);color:var(--muted);font-size:11px}.model-modal-refresh:hover:not(:disabled){background:color-mix(in srgb,var(--text) 16%,transparent);color:var(--text-strong)}.model-modal-refresh:disabled{opacity:.55;cursor:default}
 
 /* Settings segment control (通用 | 模型管理). */
 .model-modal-tabs{display:flex;gap:2px;margin-top:10px;padding:3px;border-radius:10px;background:color-mix(in srgb,var(--text) 6%,transparent)}
@@ -175,6 +176,9 @@ body{overscroll-behavior:none}
 .markdown [data-streamdown="code-block-copy-button"],.markdown [data-streamdown="code-block"] button[title="Copy Code"]{opacity:0;transition:opacity .15s ease}.markdown [data-streamdown="code-block"]:hover [data-streamdown="code-block-copy-button"],.markdown [data-streamdown="code-block"]:hover button[title="Copy Code"],.markdown [data-streamdown="code-block-copy-button"]:focus-visible,.markdown [data-streamdown="code-block"] button[title="Copy Code"]:focus-visible{opacity:1}
 /* System-message fallback: rounded card with a softened (non-mono) read. */
 .system-message{margin:12px auto;max-width:var(--chat-content-max);padding:10px 14px;border:1px solid var(--border);border-radius:9px;color:var(--muted);background:var(--surface-raised);font:13px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:.01em}
+/* Turn-terminal provider failure (stopReason "error"): the assistant message
+   carries no text, so the error bubble is the only visible artifact. */
+.assistant-turn-error{margin:6px 0 0;padding:9px 12px;border:1px solid color-mix(in srgb,var(--danger) 38%,var(--border));border-radius:8px;color:var(--danger);background:color-mix(in srgb,var(--danger) 7%,var(--surface-raised));font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 
 /* ── Overlay scrollbars (Swift OverlayScrollers parity) ──────────────
    Thin and subtle by default (always faintly visible so the scrollbar

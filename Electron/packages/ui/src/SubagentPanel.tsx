@@ -173,18 +173,31 @@ function agentListSubtitle(agent: Agent): string {
 
 type LiveAgentStatus = { text: string; severity: 'active' | 'quiet' | 'deadline' }
 
+function liveToolActivityLabel(rawActivity: string): string | undefined {
+  const match = rawActivity.match(/^([a-z][a-z0-9_-]*)\b/i)
+  if (!match) return undefined
+  const name = match[1]
+  const rest = rawActivity.slice(match[0].length).trim()
+  if (!rest || rest === '…') return name
+  if (rest.startsWith('{')) {
+    const summary = toolArgsSummary(name, rest)
+    return summary !== '…' ? `${name} · ${summary}` : name
+  }
+  return `${name} · ${rest}`
+}
+
 function liveAgentStatus(agent: Agent, now: number, activeChildCount = 0): LiveAgentStatus {
 	if (activeChildCount > 0) {
 		return { severity: 'active', text: `正在协调 · ${activeChildCount} 个子 agent 运行中` }
 	}
   const quietSeconds = agent.updatedAt === undefined ? undefined : Math.max(0, Math.floor((now - agent.updatedAt) / 1000))
   const rawActivity = visibleAgentText(agent.listSubtitle ?? '').trim()
-  const tool = rawActivity.match(/^([a-z][a-z0-9_-]*)\b/i)?.[1]
+  const toolLabel = liveToolActivityLabel(rawActivity)
   const replanning = /^(?:Revise this Computer Task plan|Repair this Computer Task plan)/i.test(agent.task)
   const phase = replanning
     ? '正在调查失败并重新规划'
-    : tool
-      ? `等待工具返回 · ${tool}`
+    : toolLabel
+      ? `等待工具返回 · ${toolLabel}`
       : '等待模型响应'
   const deadlineSeconds = agent.deadlineAt ? Math.max(0, Math.ceil((agent.deadlineAt - now) / 1000)) : undefined
   if (quietSeconds === undefined) {
@@ -292,11 +305,12 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
     if (log.itemType === 'thinking') {
       if (!text) continue
       const contentIndex = activityIndex(log)
-      activities.push({ type: 'thinking', id: `thinking:${log.contentIndex ?? log.id}`, contentIndex, content: text })
+      activities.push({ type: 'thinking', id: `thinking:${log.id}`, contentIndex, content: text })
       nextIndex = Math.max(nextIndex, contentIndex + 1)
     } else if (log.itemType === 'tool') {
       const result = takeResult(log, index)
-      const tool: TranscriptTool = { id: `subagent-tool-${log.id}`, name: log.name ?? 'tool', input: log.text, result: result ? visibleAgentText(result.text) : undefined, error: result?.isError, startedAt: agent.startedAt, finished: Boolean(result) || !isActive(agent) }
+      const laterTool = agent.logs.slice(index + 1).some(candidate => candidate.itemType === 'tool')
+      const tool: TranscriptTool = { id: `subagent-tool-${log.id}`, name: log.name ?? 'tool', input: log.text, result: result ? visibleAgentText(result.text) : undefined, error: result?.isError, startedAt: agent.startedAt, finished: Boolean(result) || !isActive(agent) || laterTool }
       const contentIndex = activityIndex(log)
       tools.push(tool)
       activities.push({ type: 'tool', contentIndex, tool })
@@ -304,7 +318,9 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
     } else if (log.itemType === 'toolResult') {
       if (!consumed.has(index) && text) contentParts.push(text)
     } else if (text) {
-      contentParts.push(text)
+      const contentIndex = activityIndex(log)
+      activities.push({ type: 'text', id: `text:${log.id}`, contentIndex, content: text })
+      nextIndex = Math.max(nextIndex, contentIndex + 1)
     }
   }
   const content = contentParts.join('\n\n')
@@ -319,7 +335,7 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
       streaming: isActive(agent)
     })
   }
-  if (finalResult && finalResult.trim() && !content.includes(finalResult.trim())) {
+  if (finalResult && finalResult.trim() && !content.includes(finalResult.trim()) && !activities.some(activity => activity.type === 'text' && activity.content.includes(finalResult.trim()))) {
     messages.push({ content: finalResult })
   }
   if (!messages.length && !isActive(agent)) messages.push({ content: agent.state === 'ok' ? '任务已完成' : agent.state === 'failed' ? '任务失败。请查看技术详情中的完整错误。' : `任务${stateText(agent)}，尚无返回内容。` })
@@ -636,8 +652,13 @@ function applyAgentEvent(current: Agent[], event: AgentEvent): Agent[] {
  * that don't pass the key) are appended; as a fallback for those hosts, a cumulative
  * snapshot that simply extends the previous row replaces it instead of duplicating.
  */
+function sealStreamSlots(logs: Log[]): Log[] {
+  return logs.map(log => log.contentIndex === undefined ? log : { ...log, contentIndex: undefined })
+}
+
 function applyLogDelta(logs: Log[], event: Extract<AgentEvent, { type: 'agent_log' }>): Log[] {
   const { itemType, text, name, isError } = event
+  if (event.resetStreamSlots) logs = sealStreamSlots(logs)
   if (event.contentIndex !== undefined) {
     const index = logs.findIndex(log => log.contentIndex === event.contentIndex)
     if (index >= 0) {
@@ -651,6 +672,10 @@ function applyLogDelta(logs: Log[], event: Extract<AgentEvent, { type: 'agent_lo
     if (!text && itemType !== 'tool') return logs
     return [...logs, { id: logs.length + 1, itemType, text, name, isError, contentIndex: event.contentIndex }]
   }
+  if (event.resetStreamSlots && !text && itemType !== 'tool') return logs
+  // A no-index `kind:"log"` item is a turn boundary: forget live slots so the
+  // next message's contentIndex 0 cannot rewrite the previous thinking/text.
+  logs = event.resetStreamSlots ? logs : sealStreamSlots(logs)
   const last = logs[logs.length - 1]
   if (last && last.itemType === itemType && text.length > last.text.length && text.startsWith(last.text)) {
     return logs.map(log => log.id === last.id ? { ...log, text } : log)
@@ -736,10 +761,24 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
   onWorktree: (agentId: string, action: 'merge' | 'discard') => void
   onAbort: (agent: Agent) => void
 }) {
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const followRef = useRef(true)
+  const output = agent ? latestReadableResult(agent) : ''
+  const latestLog = agent?.logs.at(-1)
+
+  useEffect(() => {
+    followRef.current = true
+  }, [agent?.agentId])
+
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el || !followRef.current) return
+    el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight)
+  }, [agent?.agentId, agent?.logs.length, agent?.state, latestLog?.text, latestLog?.itemType, output])
+
   if (!agent) return <div className="agent-detail empty">选择一个 agent 查看详情</div>
   const reviewable = agent.worktree?.lifecycle === 'pendingReview'
   const model = agent.model || `${providerLabel(agent)}/${agent.name}`
-  const output = latestReadableResult(agent)
   const activity = localizedTaskSummary(agent.listSubtitle || agent.title || agent.task)
 	const live = isActive(agent) ? liveAgentStatus(agent, now, activeChildCount) : undefined
   const detailTitle = detailTaskTitle(agent, output)
@@ -753,7 +792,10 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
       </div>
     </header>
     <p className="agent-closeout">{agent.closeout ? `收尾　${agent.closeout}` : `${stateText(agent)}${agent.worktree ? `　${worktreeText(agent.worktree)}` : ''}`}</p>
-    <div className="agent-transcript-scroll" data-testid="subagent-transcript-scroll">
+    <div className="agent-transcript-scroll" data-testid="subagent-transcript-scroll" ref={scrollRef} onScroll={event => {
+      const el = event.currentTarget
+      followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+    }}>
       {isActive(agent) && <div className={`agent-running-activity ${live?.severity ?? 'active'}`} role="status" aria-live="polite"><span className="agent-spinner" aria-hidden="true" /><span>{live?.text ?? `正在执行 · ${activity}`}</span><button disabled={aborting} onClick={() => onAbort(agent)}>{aborting ? '正在停止' : '停止'}</button></div>}
       <div className="agent-transcript" data-testid="subagent-transcript">
         {transcript.map((message, index) => <article className="message assistant-message" key={`${agent.runId}-transcript-${index}`}><AssistantTranscriptContent message={message} expandSteps documentBasePath={agent.worktree?.path || projectPath} onOpenDocument={onOpenDocument} /></article>)}

@@ -10,10 +10,16 @@ afterEach(() => cleanup())
 
 import { mergeAgentSummary, selectedSessionAgentSummaries } from './App'
 import { MessageView } from './Transcript'
-import { applyStreamEvent, finishStreamingMessage, historyMessages, type ChatMessage } from './transcript-model'
+import { applyStreamEvent, finishStreamingMessage, historyMessages, type ChatMessage, type TranscriptActivity } from './transcript-model'
 import { LiveSubagentBindingProvider } from './LiveSubagentBinding'
 import { projectLiveSubagents } from './live-subagent-projection'
 import type { AgentSummary, HistoryEntry } from '@pipi/host-api'
+
+function activityLabel(activity: TranscriptActivity): string {
+  if (activity.type === 'thinking') return `thinking:${activity.content}`
+  if (activity.type === 'text') return `text:${activity.content}`
+  return `tool:${activity.tool.name}`
+}
 
 function renderWithAgents(view: JSX.Element, agents: AgentSummary[], sessionId = 's') {
   const host = { listAgents: vi.fn(() => ({ then: (resolve: (value: AgentSummary[]) => void) => { resolve(agents); return { catch: () => undefined } } })), subscribeAgents: vi.fn(() => () => undefined) } as unknown as import('@pipi/host-api').PipiHostAPI
@@ -29,7 +35,7 @@ describe('stream message reducer', () => {
     messages = applyStreamEvent(messages, { type: 'thinking', sessionId: 's', contentIndex: 2, delta: 'verify' })
     messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', contentIndex: 3, toolCallId: 'bash-1', name: 'bash', delta: '{"command":"npm test"}' })
 
-    expect(messages[0].activities?.map(activity => activity.type === 'thinking' ? `thinking:${activity.content}` : `tool:${activity.tool.name}`)).toEqual([
+    expect(messages[0].activities?.map(activityLabel)).toEqual([
       'thinking:inspect', 'tool:read', 'thinking:verify', 'tool:bash',
     ])
 
@@ -54,7 +60,7 @@ describe('stream message reducer', () => {
     const streamingCompleted = screen.getByRole('button', { name: /4 个步骤/ })
     expect(streamingCompleted.getAttribute('aria-expanded')).toBe('false')
     fireEvent.click(streamingCompleted)
-    const finishedTool = screen.getByRole('button', { name: /bash npm/ })
+    const finishedTool = screen.getByRole('button', { name: /bash · npm test/ })
     expect(finishedTool.getAttribute('aria-expanded')).toBe('false')
     expect(screen.queryByText('passed')).toBeNull()
 
@@ -66,6 +72,31 @@ describe('stream message reducer', () => {
     expect([...document.querySelectorAll('.assistant-transcript-content > .activity-card > .activity-details > .activity-card')].map(card => card.getAttribute('data-activity-card'))).toEqual([
       'thinking', 'tool', 'thinking', 'tool',
     ])
+  })
+
+  it('renders restarted-index rounds in chronological order and keeps mid-turn text between groups', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'thinking', sessionId: 's', contentIndex: 0, segment: 0, delta: 'inspect A' })
+    messages = applyStreamEvent(messages, { type: 'text', sessionId: 's', contentIndex: 1, segment: 0, delta: '先读 A' })
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', contentIndex: 2, segment: 0, toolCallId: 'read-a', name: 'read', delta: '{"path":"A.tsx"}' })
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'read-a', content: 'a' })
+    messages = applyStreamEvent(messages, { type: 'thinking', sessionId: 's', contentIndex: 0, segment: 1, delta: 'inspect B' })
+    messages = applyStreamEvent(messages, { type: 'text', sessionId: 's', contentIndex: 1, segment: 1, delta: '再读 B' })
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', contentIndex: 2, segment: 1, toolCallId: 'read-b', name: 'read', delta: '{"path":"B.tsx"}' })
+    messages = finishStreamingMessage(messages)
+
+    render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    for (const button of screen.getAllByRole('button', { name: /个步骤/ })) fireEvent.click(button)
+    const firstText = screen.getByText('先读 A')
+    const secondText = screen.getByText('再读 B')
+    const thinkings = screen.getAllByRole('button', { name: /^Thinking/ })
+    const tools = screen.getAllByRole('button', { name: /read / })
+    expect(thinkings).toHaveLength(2)
+    expect(tools).toHaveLength(2)
+    expect(firstText.compareDocumentPosition(thinkings[1]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(firstText.compareDocumentPosition(secondText) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(thinkings[0].compareDocumentPosition(tools[0]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(tools[0].compareDocumentPosition(thinkings[1]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 
   it('appends coalesced tool deltas to one tool and clears streaming on terminal status', () => {
@@ -87,7 +118,7 @@ describe('stream message reducer', () => {
     render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
     // Outer "N 个步骤" card collapses when the turn settles; expand it to reveal the tool card.
     fireEvent.click(screen.getByRole('button', { name: /1 个步骤/ }))
-    const tool = screen.getByRole('button', { name: /bash ls/ })
+    const tool = screen.getByRole('button', { name: /bash · ls -la/ })
     expect(tool.getAttribute('aria-expanded')).toBe('false')
   })
 
@@ -116,7 +147,7 @@ describe('stream message reducer', () => {
     expect(outer.getAttribute('aria-expanded')).toBe('false')
     fireEvent.click(outer)
     // The tool card inside is also collapsed, with a readable bash <command> summary.
-    const tool = screen.getByRole('button', { name: /bash ls/ })
+    const tool = screen.getByRole('button', { name: /bash · ls -la/ })
     expect(tool.getAttribute('aria-expanded')).toBe('false')
   })
 
@@ -155,6 +186,19 @@ describe('stream message reducer', () => {
       vi.useRealTimers()
     }
   })
+
+  it('renders a terminal provider error as a visible bubble instead of an empty assistant turn', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'error', sessionId: 's', content: "Codex error: Invalid schema for function 'subagent': ..." })
+    expect(messages[0]).toMatchObject({ role: 'assistant', content: '', error: "Codex error: Invalid schema for function 'subagent': ..." })
+    const view = render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    const bubble = screen.getByTestId('assistant-turn-error')
+    expect(bubble.getAttribute('role')).toBe('alert')
+    expect(bubble.textContent).toBe("Codex error: Invalid schema for function 'subagent': ...")
+    expect(screen.getByText("Codex error: Invalid schema for function 'subagent': ...", { selector: '.assistant-turn-error' })).toBeTruthy()
+    expect(screen.getByTestId('assistant-transcript-content').textContent ?? '').not.toBe('')
+    view.unmount()
+  })
 })
 
 describe('assistant activity turn coalescing (Swift finishedGroup parity)', () => {
@@ -181,7 +225,7 @@ describe('assistant activity turn coalescing (Swift finishedGroup parity)', () =
     const outer = screen.getByRole('button', { name: /7 个步骤 · bash ×6/ })
     expect(outer.getAttribute('aria-expanded')).toBe('false')
     fireEvent.click(outer)
-    expect(screen.getAllByRole('button', { name: /bash ls/ })).toHaveLength(6)
+    expect(screen.getAllByRole('button', { name: /bash · ls -la/ })).toHaveLength(6)
     expect(screen.getByRole('button', { name: /browser · navigate http:\/\/localhost:5176/ })).toBeTruthy()
   })
 
@@ -206,7 +250,7 @@ describe('assistant activity turn coalescing (Swift finishedGroup parity)', () =
     ])
     expect(messages).toHaveLength(2)
     expect(messages[1]).toMatchObject({ id: 'a-final', content: '验证通过。', timestamp: 7 })
-    expect(messages[1].activities?.map(activity => activity.type === 'thinking' ? `thinking:${activity.content}` : `tool:${activity.tool.name}`)).toEqual([
+    expect(messages[1].activities?.map(activityLabel)).toEqual([
       'thinking:先读取文件', 'tool:read',
       'thinking:再确认改动范围', 'tool:git',
       'thinking:最后运行验证', 'tool:terminal',
@@ -238,7 +282,7 @@ describe('assistant activity turn coalescing (Swift finishedGroup parity)', () =
       ],
     } as HistoryEntry])
 
-    expect(messages[0].activities?.map(activity => activity.type === 'thinking' ? `thinking:${activity.content}` : `tool:${activity.tool.name}`)).toEqual([
+    expect(messages[0].activities?.map(activityLabel)).toEqual([
       'thinking:inspect', 'tool:read', 'thinking:verify', 'tool:bash',
     ])
   })
@@ -410,13 +454,13 @@ describe('active tool-card semantics', () => {
     view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
     expect(screen.queryByTestId('active-tool')).toBeNull()
     expect(screen.getByRole('button', { name: /1 个步骤/ }).getAttribute('aria-expanded')).toBe('true')
-    expect(screen.getByRole('button', { name: /bash ls/ }).getAttribute('aria-expanded')).toBe('false')
+    expect(screen.getByRole('button', { name: /bash · ls -la/ }).getAttribute('aria-expanded')).toBe('false')
     // Settled: both the outer card and the finished tool fold back to collapsed.
     messages = finishStreamingMessage(messages)
     view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
     expect(screen.getByRole('button', { name: /1 个步骤/ }).getAttribute('aria-expanded')).toBe('false')
     fireEvent.click(screen.getByRole('button', { name: /1 个步骤/ }))
-    expect(screen.getByRole('button', { name: /bash ls/ }).getAttribute('aria-expanded')).toBe('false')
+    expect(screen.getByRole('button', { name: /bash · ls -la/ }).getAttribute('aria-expanded')).toBe('false')
   })
 
   it('does not light an unrelated historical subagent card from a session-global running count', () => {

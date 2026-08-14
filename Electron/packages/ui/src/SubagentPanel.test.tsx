@@ -218,8 +218,10 @@ describe('SubagentPanel', () => {
 
     await waitFor(() => expect(harness.hasLogSubscriber('tools')).toBe(true))
     harness.emitLog('tools', { type: 'agent_log', agentId: 'tools', itemType: 'tool', name: 'terminal_read_file', text: '{"path":"/tmp/raw fixture.txt","line_start":2}' })
-    // The running tool card is expanded by default; the raw input (incl. line_start)
-    // is preserved verbatim — localization never mangles tool details.
+    harness.emitLog('tools', { type: 'agent_log', agentId: 'tools', itemType: 'toolResult', name: 'terminal_read_file', text: '{"path":"/tmp/raw fixture.txt","line_start":2}' })
+    const tool = await screen.findByRole('button', { name: /^terminal_read_file/ })
+    expect(tool.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(tool)
     expect(await screen.findByText(/"line_start": 2/)).toBeTruthy()
   })
 
@@ -501,13 +503,45 @@ describe('SubagentPanel', () => {
     await waitFor(() => expect(screen.getAllByTestId('assistant-transcript-content')).toHaveLength(1))
     expect(screen.getByText(/LONG_RAW_JSON/)).toBeTruthy()
     expect(screen.queryByText('FULL_THINKING_PROCESS')).toBeNull()
-    // Tool cards are expanded by default (expandSteps); tool results are visible.
-    expect(screen.getByText('TOOL_RESULT_EXACT')).toBeTruthy()
+    expect(screen.queryByText('TOOL_RESULT_EXACT')).toBeNull()
+    const tool = await screen.findByRole('button', { name: /^memory_query/ })
+    expect(tool.getAttribute('aria-expanded')).toBe('false')
     expandTranscriptCards()
     expect(await screen.findByText('FULL_THINKING_PROCESS')).toBeTruthy()
+    expect(screen.getByText('TOOL_RESULT_EXACT')).toBeTruthy()
     scroll.scrollTop = 120
     fireEvent.scroll(scroll)
     expect(scroll.scrollTop).toBe(120)
+  })
+
+  it('keeps the detail transcript pinned to the latest log while the viewer is at the bottom', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'live', runId: 'r-live', name: 'explore', task: '定位按钮', state: 'running' } })
+    await screen.findByTestId('agent-row-live')
+    await waitFor(() => expect(harness.hasLogSubscriber('live')).toBe(true))
+    const scroll = screen.getByTestId('subagent-transcript-scroll')
+    Object.defineProperty(scroll, 'clientHeight', { configurable: true, value: 200 })
+    let height = 400
+    Object.defineProperty(scroll, 'scrollHeight', { configurable: true, get: () => height })
+
+    harness.emitLog('live', { type: 'agent_log', agentId: 'live', itemType: 'text', text: 'FIRST_RESULT' })
+    await waitFor(() => expect(screen.getByText('FIRST_RESULT')).toBeTruthy())
+    expect(scroll.scrollTop).toBe(200)
+
+    scroll.scrollTop = 40
+    fireEvent.scroll(scroll)
+    height = 480
+    harness.emitLog('live', { type: 'agent_log', agentId: 'live', itemType: 'text', text: 'MIDDLE_RESULT' })
+    await waitFor(() => expect(screen.getByText('MIDDLE_RESULT')).toBeTruthy())
+    expect(scroll.scrollTop).toBe(40)
+
+    scroll.scrollTop = 264
+    fireEvent.scroll(scroll)
+    height = 600
+    harness.emitLog('live', { type: 'agent_log', agentId: 'live', itemType: 'text', text: 'LATEST_RESULT' })
+    await waitFor(() => expect(screen.getByText('LATEST_RESULT')).toBeTruthy())
+    expect(scroll.scrollTop).toBe(400)
   })
 
   it('loads the snapshot tree and routes review worktree actions', async () => {
@@ -540,6 +574,62 @@ describe('SubagentPanel', () => {
     expect(screen.queryByText('丢弃 worktree')).toBeNull()
   })
 
+  it('hydrates a completed agent transcript from getAgentLogs after a restart', async () => {
+    const harness = hostHarness()
+    harness.host.getAgentLogs = async () => [
+      { itemType: 'thinking', text: 'first-plan' },
+      { itemType: 'text', text: '先读 A' },
+      { itemType: 'tool', name: 'read', text: '{"path":"A.md"}' },
+      { itemType: 'toolResult', text: 'README contents' },
+    ]
+    harness.host.listAgents = async () => [
+      { agentId: 'done', runId: 'r1', sessionId: 's1', name: 'explore', task: 'research', state: 'ok', finalResult: '## TLDR only' },
+    ]
+    render(<SubagentPanel host={harness.host} />)
+    await screen.findByTestId('agent-row-done')
+    expect(await screen.findByText('先读 A')).toBeTruthy()
+    expect(screen.getAllByRole('button', { name: /个步骤/ }).length).toBeGreaterThan(0)
+    expect(screen.queryByText('README contents')).toBeNull()
+    expect(screen.getByText(/TLDR only/)).toBeTruthy()
+  })
+
+  it('shows the running bash command on the live tool row and status line', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({
+      type: 'agent',
+      agent: {
+        agentId: 'run', runId: 'r1', name: 'general-purpose', title: '视觉模型设置收尾验证',
+        task: 'verify', state: 'running', createdAt: now - 10_000, updatedAt: now,
+        listSubtitle: 'bash npm test --workspaces',
+      },
+    })
+    await screen.findByTestId('agent-row-run')
+    await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'thinking', text: 'run the suite' })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'bash', text: 'npm test --workspaces' })
+
+    const active = await screen.findByTestId('active-tool')
+    expect(active.querySelector('b')?.textContent).toBe('bash · npm test --workspaces')
+    expect(active.textContent).toContain('运行中')
+    expect(screen.getAllByText(/等待工具返回 · bash · npm test --workspaces/).length).toBeGreaterThan(0)
+    expect(screen.queryByText('输入')).toBeNull()
+  })
+
+  it('keeps a running tool card collapsed so execution details stay folded', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running' } })
+    await screen.findByTestId('agent-row-run')
+    await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'read', text: '{"path":"SECRET.md"}' })
+    const active = await screen.findByTestId('active-tool')
+    expect(active.querySelector('b')?.textContent).toBe('read · SECRET.md')
+    expect(active.querySelector('[aria-expanded]')).toBeNull()
+    expect(screen.queryByText('输入')).toBeNull()
+  })
+
   it('renders thinking, tools, results, diffs, and final output through shared collapsed cards', async () => {
     const harness = hostHarness()
     render(<SubagentPanel host={harness.host} />)
@@ -554,7 +644,6 @@ describe('SubagentPanel', () => {
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'edit', text: '{"path":"Electron/packages/ui/src/SubagentPanel.tsx"}' })
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'toolResult', text: 'diff --git a/demo.ts b/demo.ts\n--- a/demo.ts\n+++ b/demo.ts\n@@ -1 +1 @@\n-old\n+new' })
 
-    // Unified step card (thinking + edit combined), expanded by default (expandSteps).
     await screen.findByRole('button', { name: /个步骤/ })
     expect(screen.queryByText(/EXPANDED_THINKING_BODY/)).toBeNull()
     // Thinking card is collapsed inside the expanded step card.
@@ -623,6 +712,35 @@ describe('SubagentPanel', () => {
     if (thinkingCards[1].getAttribute('aria-expanded') === 'false') fireEvent.click(thinkingCards[1])
     expect(await screen.findByText('second-plan')).toBeTruthy()
     expect(screen.queryByText(/first-plan\s*second-plan/)).toBeNull()
+  })
+
+  it('does not let the next assistant turn overwrite earlier thinking or swallow mid-turn text', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running' } })
+    await screen.findByTestId('agent-row-run')
+    await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
+
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'thinking', text: 'first-plan', contentIndex: 0 })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: '先读 A', contentIndex: 1 })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: '', resetStreamSlots: true })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'read', text: '{"path":"A.tsx"}' })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'thinking', text: 'second-plan', contentIndex: 0 })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: '再读 B', contentIndex: 1 })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: '', resetStreamSlots: true })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'read', text: '{"path":"B.tsx"}' })
+
+    await screen.findByText('先读 A')
+    expect(screen.getByText('再读 B')).toBeTruthy()
+    const thinkingCards = screen.getAllByRole('button', { name: /^Thinking/ })
+    expect(thinkingCards).toHaveLength(2)
+    const timeline = [...document.querySelectorAll('[data-testid="subagent-transcript"] [data-activity-card="thinking"], [data-testid="subagent-transcript"] [data-activity-card="tool"], [data-testid="subagent-transcript"] [data-transcript-segment="text"]')]
+    expect(timeline.map(node => node.getAttribute('data-activity-card') ?? node.getAttribute('data-transcript-segment'))).toEqual([
+      'thinking', 'text', 'tool', 'thinking', 'text', 'tool',
+    ])
+    expect(screen.queryByText('first-plan')).toBeNull()
+    fireEvent.click(thinkingCards[0])
+    expect(await screen.findByText('first-plan')).toBeTruthy()
   })
 
   it('applies the prefix-replace fallback for hosts without contentIndex', async () => {

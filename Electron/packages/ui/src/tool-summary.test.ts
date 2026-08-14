@@ -68,10 +68,11 @@ describe('toolArgsSummary', () => {
 })
 
 describe('toolDisplaySummary', () => {
-  it('renders bash as "bash <first-command-word>"', () => {
-    expect(toolDisplaySummary('bash', '{"command":"grep -r foo ."}')).toBe('bash grep')
-    expect(toolDisplaySummary('bash', '{"command":"ls -la"}')).toBe('bash ls')
-    expect(toolDisplaySummary('bash', '{"command":"git status"}')).toBe('bash git')
+  it('renders bash as name · full command, including subagent plain-text summaries', () => {
+    expect(toolDisplaySummary('bash', '{"command":"grep -r foo ."}')).toBe('bash · grep -r foo .')
+    expect(toolDisplaySummary('bash', '{"command":"ls -la"}')).toBe('bash · ls -la')
+    expect(toolDisplaySummary('bash', '{"command":"git status"}')).toBe('bash · git status')
+    expect(toolDisplaySummary('bash', 'npm test --workspaces')).toBe('bash · npm test --workspaces')
   })
 
   it('falls back to bare name when command is missing or empty', () => {
@@ -85,7 +86,7 @@ describe('toolDisplaySummary', () => {
   })
 
   it('scrapes truncated bash JSON while streaming', () => {
-    expect(toolDisplaySummary('bash', '{"command":"grep -')).toBe('bash grep')
+    expect(toolDisplaySummary('bash', '{"command":"grep -')).toBe('bash · grep -')
   })
 })
 

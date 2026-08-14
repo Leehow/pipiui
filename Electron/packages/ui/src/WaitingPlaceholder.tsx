@@ -8,12 +8,13 @@ import './waiting-placeholder.css'
  * captioning / media) mapped to web equivalents:
  * - `awaiting` — user prompt sent, no visible assistant content yet (first-token wait)
  * - `continuing` — a later turn is open after prior assistant output (not "first response")
+ * - `followup` — a `[subagent-*]` follow-up is being digested (not a silent leftover busy)
  * - `thinking` — model reasoning in progress (Swift "AI 正在思考…")
  * - `tool`     — a tool run is in flight (Swift media / compacting equivalents)
  * - `retrying` — a failed call is being retried
  * - `stopping` — user requested stop (Swift "正在停止…", which takes precedence)
  */
-export type WaitingPhase = 'awaiting' | 'continuing' | 'thinking' | 'tool' | 'retrying' | 'stopping'
+export type WaitingPhase = 'awaiting' | 'continuing' | 'followup' | 'thinking' | 'tool' | 'retrying' | 'stopping'
 
 export const WAITING_COPY = {
   connecting: '正在连接模型',
@@ -21,6 +22,7 @@ export const WAITING_COPY = {
   awaitingFirstResponse: '等待第一个响应',
   stillWorking: '模型仍在处理',
   continuing: '等待模型响应',
+  followup: '正在处理子任务结果',
   thinking: '模型正在思考…',
   tool: '正在执行工具操作…',
   retrying: '连接中断，正在重试…',
@@ -93,8 +95,8 @@ function toEpochMs(startedAt: Date | number): number {
  * elapsed · optional stop. Never full-screen, never a skeleton, no big spinner.
  *
  * Integration rule: render it for the active turn until that turn has visible
- * output. A follow-up after prior assistant text uses phase=`continuing` so the
- * copy does not claim to wait for the first response. This component makes no
+ * output. A later user turn after prior assistant text uses phase=`continuing`;
+ * a `[subagent-*]` injection uses `followup`. This component makes no
  * global-streaming decisions itself.
  */
 export function WaitingPlaceholder({ phase, startedAt, detail, onStop, reduceMotion = false }: WaitingPlaceholderProps) {

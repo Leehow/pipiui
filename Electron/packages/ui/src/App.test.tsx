@@ -1284,8 +1284,8 @@ describe('PipiUI Electron main layout', () => {
     render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
     virtuosoHarness.atBottom?.(false)
-    await screen.findByText('回到最新')
-    fireEvent.click(screen.getByText('回到最新'))
+    await screen.findByRole('button', { name: '回到最新' })
+    fireEvent.click(screen.getByRole('button', { name: '回到最新' }))
     expect(virtuosoHarness.scrollToIndex).toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: '用户输入 1/1' }))
     expect(virtuosoHarness.scrollToIndex).toHaveBeenCalled()
@@ -1503,7 +1503,6 @@ async function openModelModal(host: PipiHostAPI): Promise<HTMLTextAreaElement> {
   fireEvent.change(composer, { target: { value: '/model' } })
   fireEvent.keyDown(composer, { key: 'Enter' })
   await screen.findByTestId('model-modal')
-  fireEvent.click(screen.getByTestId('model-tab-models'))
   return composer
 }
 
@@ -1511,8 +1510,54 @@ async function reopenModelModal(composer: HTMLTextAreaElement) {
   fireEvent.change(composer, { target: { value: '/model' } })
   fireEvent.keyDown(composer, { key: 'Enter' })
   await screen.findByTestId('model-modal')
-  fireEvent.click(screen.getByTestId('model-tab-models'))
 }
+
+describe('session switch transcript cache', () => {
+  it('keeps a visited session transcript on screen when switching away and back', async () => {
+    const base = createMockHost()
+    let welcomeLoads = 0
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async sessionId => {
+        if (sessionId === 'welcome') {
+          welcomeLoads += 1
+          if (welcomeLoads > 1) return new Promise(() => undefined)
+        }
+        return base.getSessionHistory(sessionId)
+      }
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findByText('请实现 Electron 三栏主界面。')
+    expect(welcomeLoads).toBe(1)
+
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await screen.findByText('左栏宽度要能持久化。')
+    const welcomeTranscript = screen.getByText('请实现 Electron 三栏主界面。').closest('[data-session-transcript]') as HTMLElement | null
+    const layoutTranscript = screen.getByText('左栏宽度要能持久化。').closest('[data-session-transcript]') as HTMLElement | null
+    expect(welcomeTranscript?.getAttribute('data-session-transcript')).toBe('welcome')
+    expect(welcomeTranscript?.hidden).toBe(true)
+    expect(layoutTranscript?.hidden).toBe(false)
+
+    fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
+    expect(welcomeTranscript?.hidden).toBe(false)
+    expect(layoutTranscript?.hidden).toBe(true)
+    expect(welcomeLoads).toBe(1)
+  })
+
+  it('does not refetch history when opening a new empty session', async () => {
+    const base = createMockHost()
+    const getSessionHistory = vi.fn(base.getSessionHistory)
+    const host: PipiHostAPI = { ...base, getSessionHistory }
+    render(<App host={host} />)
+    await screen.findByText('请实现 Electron 三栏主界面。')
+    const loadsBeforeNew = getSessionHistory.mock.calls.length
+
+    fireEvent.click(screen.getByRole('button', { name: /在 PipiUI 新建会话/ }))
+    await waitFor(() => expect(screen.getByLabelText('消息输入框')).toBeTruthy())
+    expect((screen.getByText('请实现 Electron 三栏主界面。').closest('[data-session-transcript]') as HTMLElement | null)?.hidden).toBe(true)
+    expect(getSessionHistory.mock.calls.length).toBe(loadsBeforeNew)
+  })
+})
 
 describe('composer draft persistence', () => {
   it('restores unsent composer text when returning to a session', async () => {
@@ -1627,21 +1672,57 @@ describe('composer slash commands and model management', () => {
     expect(composer.value).toBe('/')
   })
 
-  it('groups models by provider, collapses every provider by default, and expands on header click within the modal lifetime', async () => {
+  it('groups models by provider and collapses/expands provider sections within the modal lifetime', async () => {
     await openModelModal(createMockHost())
     const provider = await screen.findByTestId('model-provider-anthropic')
+    // every provider starts collapsed by default
+    expect(provider.querySelectorAll('.model-row').length).toBe(0)
     expect(screen.getByTestId('model-provider-openai')).toBeTruthy()
     expect(screen.getByTestId('model-provider-deepseek')).toBeTruthy()
-    // default: every provider collapsed, no model rows rendered
-    expect(provider.querySelectorAll('.model-row').length).toBe(0)
-    expect(screen.queryByTestId('model-row-anthropic-claude-sonnet-4')).toBeNull()
-    // expand reveals rows; collapse hides them again (modal-lifetime state)
-    fireEvent.click(screen.getByLabelText('展开 anthropic'))
-    expect(await screen.findByTestId('model-row-anthropic-claude-sonnet-4')).toBeTruthy()
+    const anthropicToggle = screen.getByLabelText('展开 anthropic')
+    expect(anthropicToggle.getAttribute('aria-expanded')).toBe('false')
+    // expanding reveals the provider's rows
+    fireEvent.click(anthropicToggle)
     expect(provider.querySelectorAll('.model-row').length).toBe(2)
+    expect(anthropicToggle.getAttribute('aria-expanded')).toBe('true')
+    // collapse keeps rows hidden until expanded again (modal-lifetime state)
     fireEvent.click(screen.getByLabelText('折叠 anthropic'))
     expect(screen.queryByTestId('model-row-anthropic-claude-sonnet-4')).toBeNull()
     fireEvent.click(screen.getByLabelText('展开 anthropic'))
+    expect(await screen.findByTestId('model-row-anthropic-claude-sonnet-4')).toBeTruthy()
+  })
+
+  it('refreshes the catalog from the header refresh button', async () => {
+    const host = createMockHost()
+    const listModels = vi.spyOn(host, 'listModels')
+    await openModelModal(host)
+    const button = await screen.findByTestId('model-refresh-button') as HTMLButtonElement
+    await waitFor(() => expect(button.disabled).toBe(false))
+    expect(button.textContent).toContain('刷新')
+    const callsBefore = listModels.mock.calls.length
+    expect(callsBefore).toBeGreaterThan(0)
+    fireEvent.click(button)
+    await waitFor(() => expect(listModels.mock.calls.length).toBeGreaterThan(callsBefore))
+  })
+
+  it('refresh keeps expanded providers expanded and new providers collapsed by default', async () => {
+    const host = createMockHost()
+    const base = host.listModels
+    let withExtra = false
+    host.listModels = vi.fn(async () => {
+      const models = await base()
+      return withExtra ? [...models, { provider: 'mistral', id: 'mistral-large', name: 'Mistral Large', reasoning: true }] : models
+    })
+    await openModelModal(host)
+    fireEvent.click(screen.getByLabelText('展开 anthropic'))
+    await screen.findByTestId('model-row-anthropic-claude-sonnet-4')
+    withExtra = true
+    fireEvent.click(screen.getByTestId('model-refresh-button'))
+    await waitFor(() => expect(screen.getByTestId('model-provider-mistral')).toBeTruthy())
+    // the new provider appears collapsed by default
+    expect(screen.getByLabelText('展开 mistral').getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByTestId('model-row-mistral-mistral-large')).toBeNull()
+    // the previously expanded provider stays expanded after refresh
     expect(await screen.findByTestId('model-row-anthropic-claude-sonnet-4')).toBeTruthy()
   })
 
@@ -1649,7 +1730,7 @@ describe('composer slash commands and model management', () => {
     const host = createMockHost()
     const setHidden = vi.spyOn(host, 'setHiddenModelIds')
     const composer = await openModelModal(host)
-    fireEvent.click(await screen.findByLabelText('展开 openai'))
+    fireEvent.click(screen.getByLabelText('展开 openai'))
     await screen.findByTestId('model-row-openai-gpt-5')
     fireEvent.click(screen.getByLabelText('在快捷菜单显示 GPT-5'))
     await waitFor(() => expect(setHidden).toHaveBeenCalledWith(['openai/gpt-5']))
@@ -1658,53 +1739,17 @@ describe('composer slash commands and model management', () => {
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(screen.queryByTestId('model-modal')).toBeNull()
     await reopenModelModal(composer)
-    fireEvent.click(await screen.findByLabelText('展开 openai'))
+    fireEvent.click(screen.getByLabelText('展开 openai'))
     await screen.findByTestId('model-row-openai-gpt-5')
     expect((screen.getByLabelText('在快捷菜单显示 GPT-5') as HTMLInputElement).checked).toBe(false)
-  })
-
-  it('picks a vision-capable model in the 通用 tab and clears it to 无 through the host', async () => {
-    const host = createMockHost()
-    const setVision = vi.spyOn(host, 'setVisionModel')
-    const composer = await renderChat(host)
-    fireEvent.change(composer, { target: { value: '/model' } })
-    fireEvent.keyDown(composer, { key: 'Enter' })
-    await screen.findByTestId('model-modal')
-    // 通用 tab is default: only visible + vision-capable models are listed
-    expect(await screen.findByTestId('vision-picker')).toBeTruthy()
-    expect(screen.getByTestId('vision-row-none')).toBeTruthy()
-    expect(screen.queryByTestId('vision-row-openai-openai-codex')).toBeNull() // supportsImages: false
-    expect(screen.queryByTestId('vision-row-deepseek-deepseek-v3')).toBeNull() // supportsImages: false
-    // selecting a model persists through the host
-    fireEvent.click(screen.getByTestId('vision-row-anthropic-claude-sonnet-4'))
-    await waitFor(() => expect(setVision).toHaveBeenCalledWith('anthropic/claude-sonnet-4'))
-    expect(await host.getVisionModel?.()).toBe('anthropic/claude-sonnet-4')
-    // clearing to 无（不加强） persists a null ref
-    fireEvent.click(screen.getByTestId('vision-row-none'))
-    await waitFor(() => expect(setVision).toHaveBeenCalledWith(null))
-    expect(await host.getVisionModel?.()).toBeNull()
-  })
-
-  it('shows the model management tab content only after switching tabs', async () => {
-    const composer = await renderChat(createMockHost())
-    fireEvent.change(composer, { target: { value: '/model' } })
-    fireEvent.keyDown(composer, { key: 'Enter' })
-    await screen.findByTestId('model-modal')
-    // manage view is not rendered on the default 通用 tab
-    expect(screen.queryByTestId('model-provider-anthropic')).toBeNull()
-    expect(await screen.findByTestId('vision-picker')).toBeTruthy()
-    fireEvent.click(screen.getByTestId('model-tab-models'))
-    expect(await screen.findByTestId('model-provider-anthropic')).toBeTruthy()
-    fireEvent.click(screen.getByTestId('model-tab-general'))
-    expect(await screen.findByTestId('vision-picker')).toBeTruthy()
   })
 
   it('clears every model of a provider through the tri-state checkbox (hide all)', async () => {
     const host = createMockHost()
     const setHidden = vi.spyOn(host, 'setHiddenModelIds')
     await openModelModal(host)
+    fireEvent.click(screen.getByLabelText('展开 deepseek'))
     await screen.findByTestId('model-provider-deepseek')
-    fireEvent.click(await screen.findByLabelText('展开 deepseek'))
     const check = screen.getByLabelText('deepseek 全部勾选') as HTMLInputElement
     expect(check.checked).toBe(true)
     fireEvent.click(check)
@@ -1718,8 +1763,7 @@ describe('composer slash commands and model management', () => {
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
     await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-models'))
-    fireEvent.click(await screen.findByLabelText('展开 anthropic'))
+    fireEvent.click(screen.getByLabelText('展开 anthropic'))
     await screen.findByTestId('model-row-anthropic-claude-sonnet-4')
     expect((screen.getByLabelText('在快捷菜单显示 Claude Sonnet 4') as HTMLInputElement).checked).toBe(true)
     expect(screen.getByText('当前模型')).toBeTruthy()
@@ -1782,9 +1826,7 @@ describe('composer quick model menu', () => {
     const composer = await renderChat(host)
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
-    await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-models'))
-    fireEvent.click(await screen.findByLabelText('展开 openai'))
+    fireEvent.click(screen.getByLabelText('展开 openai'))
     await screen.findByTestId('model-row-openai-gpt-5')
     fireEvent.click(screen.getByLabelText('在快捷菜单显示 GPT-5'))
     fireEvent.keyDown(window, { key: 'Escape' })
@@ -2029,6 +2071,39 @@ describe('composer image attachments', () => {
     expect(revokedUrls).toContain('blob:mock-0')
   })
 
+  it('does not add a second user bubble when the backend echoes the annotated image prompt', async () => {
+    const base = createMockHost()
+    let listener: ((event: StreamEvent) => void) | undefined
+    const host: PipiHostAPI = {
+      ...base,
+      subscribeStream: (_sessionId, callback) => {
+        listener = callback
+        return () => { listener = undefined }
+      },
+    }
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '看图' } })
+    pasteImage(composer, makeImageFile('shot.png'))
+    await screen.findByTestId('composer-thumb-0')
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(document.querySelectorAll('.user-message').length).toBeGreaterThan(0))
+    const before = document.querySelectorAll('[data-user-prompt]').length
+    const note = '(Images are also embedded multimodally; prefer viewing them directly. If you use the read tool, use the paths above — do not invent paths like /home/workdir/attachments/.)'
+    await act(async () => {
+      listener?.({
+        type: 'user_message',
+        sessionId: 'welcome',
+        id: 'srv-img',
+        content: `看图\n\nAttached image file: /Users/demo/code/pipiui/.pi/attachments/shot.png\n${note}`,
+      })
+    })
+    expect(document.querySelectorAll('[data-user-prompt]').length).toBe(before)
+    expect(screen.getAllByText('看图').length).toBe(1)
+    expect(screen.queryByText(/Attached image file/)).toBeNull()
+    expect(screen.queryByText(/embedded multimodally/)).toBeNull()
+    expect(document.querySelector('img.user-bubble-image')).toBeTruthy()
+  })
+
   it('allows sending images without text', async () => {
     const host = createMockHost()
     const sendPrompt = vi.spyOn(host, 'sendPrompt')
@@ -2158,9 +2233,7 @@ describe('model visibility checkbox P0 regression', () => {
     const composer = await renderChat(host)
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
-    await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-models'))
-    fireEvent.click(await screen.findByLabelText('展开 openai'))
+    fireEvent.click(screen.getByLabelText('展开 openai'))
     await screen.findByTestId('model-row-openai-gpt-5')
     // Two unchecks back-to-back while the first save is still in flight.
     fireEvent.click(screen.getByLabelText('在快捷菜单显示 GPT-5'))
@@ -2176,18 +2249,14 @@ describe('model visibility checkbox P0 regression', () => {
     const composer = await renderChat(host)
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
-    await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-models'))
-    fireEvent.click(await screen.findByLabelText('展开 openai'))
+    fireEvent.click(screen.getByLabelText('展开 openai'))
     await screen.findByTestId('model-row-openai-gpt-5')
     fireEvent.click(screen.getByLabelText('在快捷菜单显示 GPT-5'))
     await waitFor(async () => expect(await host.getHiddenModelIds()).toContain('openai/gpt-5'))
     fireEvent.keyDown(window, { key: 'Escape' })
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
-    await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-models'))
-    fireEvent.click(await screen.findByLabelText('展开 openai'))
+    fireEvent.click(screen.getByLabelText('展开 openai'))
     await screen.findByTestId('model-row-openai-gpt-5')
     expect((screen.getByLabelText('在快捷菜单显示 GPT-5') as HTMLInputElement).checked).toBe(false)
     // re-check persists too
@@ -2201,9 +2270,7 @@ describe('model visibility checkbox P0 regression', () => {
     const composer = await renderChat(host)
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
-    await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-models'))
-    fireEvent.click(await screen.findByLabelText('展开 openai'))
+    fireEvent.click(screen.getByLabelText('展开 openai'))
     await screen.findByTestId('model-row-openai-gpt-5')
     const tri = screen.getByLabelText('openai 全部勾选') as HTMLInputElement
     expect(tri.checked).toBe(true)
@@ -2224,9 +2291,7 @@ describe('model visibility checkbox P0 regression', () => {
     const composer = await renderChat(host)
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
-    await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-models'))
-    fireEvent.click(await screen.findByLabelText('展开 openai'))
+    fireEvent.click(screen.getByLabelText('展开 openai'))
     await screen.findByTestId('model-row-openai-gpt-5')
     fireEvent.click(screen.getByLabelText('在快捷菜单显示 GPT-5'))
     expect(await screen.findByText(/保存模型可见性失败：disk full/)).toBeTruthy()
@@ -2241,9 +2306,7 @@ describe('model visibility checkbox P0 regression', () => {
     const composer = await renderChat(host)
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
-    await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-models'))
-    fireEvent.click(await screen.findByLabelText('展开 anthropic'))
+    fireEvent.click(screen.getByLabelText('展开 anthropic'))
     await screen.findByTestId('model-row-anthropic-claude-sonnet-4')
     const box = screen.getByLabelText('在快捷菜单显示 Claude Sonnet 4') as HTMLInputElement
     expect(box.disabled).toBe(false)
@@ -2455,8 +2518,6 @@ describe('model provider deletion', () => {
     const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
-    await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-models'))
     await screen.findByTestId('model-provider-anthropic')
     fireEvent.click(screen.getByTestId('delete-provider-anthropic'))
     fireEvent.click(await screen.findByTestId('delete-confirm-btn-anthropic'))

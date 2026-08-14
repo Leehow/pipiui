@@ -11,11 +11,9 @@ function isNonEmptyDelta(event: StreamEvent): event is DeltaEvent {
 function keyFor(event: DeltaEvent): string {
   return event.type === 'tool_call'
     ? `${event.sessionId}:tool_call:${event.toolCallId}`
-    : event.type === 'thinking'
-      // Segment epoch is part of the key: thinking blocks from different
-      // assistant messages reuse contentIndex and must never merge together.
-      ? `${event.sessionId}:${event.type}:${event.segment ?? 0}:${event.contentIndex}`
-      : `${event.sessionId}:${event.type}:${event.contentIndex}`
+    // Segment epoch is part of the key: text/thinking from different assistant
+    // messages reuse contentIndex and must never merge together.
+    : `${event.sessionId}:${event.type}:${event.segment ?? 0}:${event.contentIndex}`
 }
 
 /**

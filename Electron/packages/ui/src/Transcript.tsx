@@ -33,7 +33,7 @@ export function Transcript({ messages, transcriptRef, waiting, documentBasePath,
     <PromptRail prompts={prompts} activeId={activeId} onJump={jump} />
     <MessageList ref={transcriptRef} messages={messages} atBottom={atBottom} onAtBottom={setAtBottom} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} />
     {waiting && <WaitingPlaceholder phase={waiting.phase} startedAt={waiting.startedAt} detail={waiting.detail} onStop={waiting.onStop} />}
-    {!atBottom && messages.length > 0 && <button className="return-latest" onClick={returnLatest}>回到最新</button>}
+    {!atBottom && messages.length > 0 && <button className="return-latest" aria-label="回到最新" title="回到最新" onClick={returnLatest}><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg></button>}
   </div>
 }
 

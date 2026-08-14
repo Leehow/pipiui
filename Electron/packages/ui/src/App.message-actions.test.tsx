@@ -85,4 +85,23 @@ describe('App message actions', () => {
     const user = document.querySelector('[data-user-prompt="user-full"]') as HTMLElement
     expect((within(user).getByRole('button', { name: '重发消息' }) as HTMLButtonElement).disabled).toBe(true)
   })
+
+  it('copies and resends the user prose without the attachment footnote', async () => {
+    const note = '(Images are also embedded multimodally; prefer viewing them directly. If you use the read tool, use the paths above — do not invent paths like /home/workdir/attachments/.)'
+    const sendPrompt = vi.fn(async () => undefined)
+    const host = hostWithHistory({
+      sendPrompt,
+      getSessionHistory: async sessionId => sessionId === 'welcome'
+        ? [{ id: 'user-img', role: 'user', content: `看图\n\nAttached image file: /tmp/a.png\n${note}`, timestamp: 1, images: [{ data: 'abc', mimeType: 'image/png' }] }]
+        : [],
+    })
+    render(<App host={host} />)
+    await screen.findByText('看图')
+    const user = document.querySelector('[data-user-prompt="user-img"]') as HTMLElement
+    expect(user.textContent).not.toContain('Attached image file')
+    fireEvent.click(within(user).getByRole('button', { name: '复制消息' }))
+    await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledWith('看图'))
+    fireEvent.click(within(user).getByRole('button', { name: '重发消息' }))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '看图'))
+  })
 })

@@ -58,6 +58,14 @@ describe('UserMessageBubble', () => {
     expect(screen.queryByRole('button', { name: /展开|收起/ })).toBeNull()
   })
 
+  it('hides the model-facing attachment footnote from the bubble', () => {
+    const note = '(Images are also embedded multimodally; prefer viewing them directly. If you use the read tool, use the paths above — do not invent paths like /home/workdir/attachments/.)'
+    const { container } = render(<UserMessageBubble text={`看图\n\nAttached image file: /tmp/a.png\n${note}`} images={[{ data: 'abc', mimeType: 'image/png' }]} />)
+    expect(container.querySelector('.user-message-content')?.textContent).toBe('看图')
+    expect(container.textContent).not.toContain('Attached image file')
+    expect(container.textContent).not.toContain('embedded multimodally')
+  })
+
   it('keeps collapse behavior for long text even when one image is attached', () => {
     const text = `one\ntwo\nthree\nfour\nfive\nsix UNIQUE_FULL_TEXT_MARKER`
     const { container } = render(<UserMessageBubble text={text} images={[{ data: 'abc', mimeType: 'image/jpeg' }]} />)

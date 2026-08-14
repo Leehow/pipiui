@@ -48,6 +48,21 @@ describe('StreamEventCoalescer', () => {
     } finally { vi.useRealTimers() }
   })
 
+  it('never merges text deltas from different message segments sharing a contentIndex', () => {
+    vi.useFakeTimers()
+    try {
+      const applied: StreamEvent[] = []
+      const coalescer = new StreamEventCoalescer({ onEvent: event => applied.push(event) })
+      coalescer.push({ type: 'text', sessionId: 's', contentIndex: 0, segment: 0, delta: '先读 A' })
+      coalescer.push({ type: 'text', sessionId: 's', contentIndex: 0, segment: 0, delta: ' 续' })
+      coalescer.push({ type: 'text', sessionId: 's', contentIndex: 0, segment: 1, delta: '再读 B' })
+      coalescer.dispose()
+      const texts = applied.filter((event): event is Extract<StreamEvent, { type: 'text' }> => event.type === 'text')
+      expect(texts).toHaveLength(3)
+      expect(texts[2]).toMatchObject({ segment: 1, delta: '再读 B' })
+    } finally { vi.useRealTimers() }
+  })
+
   it('never merges thinking deltas from different message segments sharing a contentIndex', () => {
     vi.useFakeTimers()
     try {

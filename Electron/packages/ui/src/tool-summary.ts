@@ -255,20 +255,12 @@ function bashCommand(raw: string): string | undefined {
 }
 
 /**
- * Collapsed-header display name for a tool call. For bash/shell, leads with
- * `bash <first-command-word>` (e.g. `bash grep`, `bash ls`) so the user can
- * tell at a glance what the command does. Other tools keep the existing
- * `name · summary` pattern.
+ * Collapsed-header display name for a tool call. Matches Swift's
+ * `name` + `argsSummary` header: `bash · ls -la`, `read · App.tsx`.
+ * Subagent logs store a plain command/path summary rather than JSON;
+ * `toolArgsSummary` already treats that as the argument text.
  */
 export function toolDisplaySummary(name: string, raw: string): string {
-  if (name === 'bash' || name === 'shell') {
-    const command = bashCommand(raw)
-    if (command) {
-      const firstWord = command.trim().split(/\s+/)[0]
-      if (firstWord) return `${name} ${firstWord}`
-    }
-    return name
-  }
   const argsSummary = toolArgsSummary(name, raw)
   return argsSummary !== '…' ? `${name} · ${argsSummary}` : name
 }
