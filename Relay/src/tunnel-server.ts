@@ -1,11 +1,14 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
 
 const PAIR_PATH = /^\/pair\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const ROOM_ID = PAIR_PATH;
+const DOWNLOAD_PATH = /^\/downloads\/([A-Za-z0-9][A-Za-z0-9._-]{0,180})$/;
 const SECRET = /^[0-9a-f]{64}$/;
 const REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TUNNEL_PATH = "/tunnel/ws";
@@ -43,6 +46,8 @@ export interface TunnelServerOptions {
   port: number;
   publicOrigin: string;
   tunnelURL: string;
+  /** Directory behind GET /downloads/<name>; defaults to <relay>/downloads. */
+  downloadsDir?: string;
 }
 
 export function tunnelOptionsFromEnvironment(
@@ -96,6 +101,67 @@ function browserCSSAsset(): string {
   const selected = candidates.find((candidate) => existsSync(candidate));
   if (!selected) throw new Error("Tunnel browser CSS missing; run npm run bundle");
   return readFileSync(selected, "utf8");
+}
+
+function downloadContentType(name: string): string {
+  if (name.endsWith(".zip")) return "application/zip";
+  if (name.endsWith(".dmg")) return "application/x-apple-diskimage";
+  if (name.endsWith(".tar.gz")) return "application/gzip";
+  return "application/octet-stream";
+}
+
+/**
+ * Streams one file from the relay's downloads directory (App builds etc.).
+ * The name regex already excludes "/" and leading dots, so join() cannot
+ * escape the directory. Single-range responses keep large downloads resumable.
+ */
+async function serveDownload(
+  name: string,
+  downloadsRoot: string,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const filePath = join(downloadsRoot, name);
+  let size = 0;
+  try {
+    const info = await stat(filePath);
+    if (!info.isFile()) throw new Error("not a regular file");
+    size = info.size;
+  } catch {
+    return json(res, 404, { error: "not found" });
+  }
+  let start = 0;
+  let end = size - 1;
+  let partial = false;
+  const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range ?? ""));
+  if (range) {
+    if (range[1]) {
+      start = Number(range[1]);
+      if (range[2]) end = Number(range[2]);
+    } else {
+      start = Math.max(0, size - Number(range[2] || 0));
+    }
+    if (start >= size || start > end) {
+      res.statusCode = 416;
+      res.setHeader("Content-Range", `bytes */${size}`);
+      res.end();
+      return;
+    }
+    end = Math.min(end, size - 1);
+    partial = true;
+  }
+  res.statusCode = partial ? 206 : 200;
+  res.setHeader("Content-Type", downloadContentType(name));
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Content-Length", String(end - start + 1));
+  if (partial) res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
+  if (req.method === "HEAD" || size === 0) {
+    res.end();
+    return;
+  }
+  createReadStream(filePath, { start, end })
+    .on("error", () => res.destroy())
+    .pipe(res);
 }
 
 function json(res: ServerResponse, status: number, value: unknown): void {
@@ -165,6 +231,8 @@ export function createTunnelServer(options: TunnelServerOptions) {
   const invalidatedRooms = new Map<string, NodeJS.Timeout>();
   const pendingBrowsers = new Map<string, Client[]>();
   const clients = new Set<Client>();
+  const downloadsRoot = options.downloadsDir
+    ?? fileURLToPath(new URL("../downloads/", import.meta.url));
   const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Referrer-Policy", "no-referrer");
@@ -187,6 +255,10 @@ export function createTunnelServer(options: TunnelServerOptions) {
       res.statusCode = 200;
       res.setHeader("Content-Type", "text/css; charset=utf-8");
       return res.end(browserCSSAsset());
+    }
+    const download = DOWNLOAD_PATH.exec(url.pathname);
+    if (download && (req.method === "GET" || req.method === "HEAD")) {
+      return void serveDownload(download[1], downloadsRoot, req, res);
     }
     const pair = req.method === "GET" ? PAIR_PATH.exec(url.pathname) : null;
     if (pair) {

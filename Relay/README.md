@@ -25,6 +25,17 @@ npm run build
 
 产物入口：`dist/tunnel-server.js`。
 
+### App 分发下载
+
+`GET /downloads/<文件名>` 从 `<relay>/downloads/`（默认 `/opt/pipiui-relay/downloads/`）流式分发
+App 构建包（`.zip`/`.dmg` 等），支持 `Range` 断点续传；文件名仅限 `[A-Za-z0-9._-]`
+且不可以点开头，无目录遍历。上传新构建：
+
+```bash
+rsync -a --partial PipiUI-Electron-<date>.zip root@<server>:/opt/pipiui-relay/downloads/
+# 公网链接即 https://<public-origin>/downloads/PipiUI-Electron-<date>.zip
+```
+
 ### 2. 环境变量
 
 参考 `deploy/pipiui-relay.env.example`，写入 `/etc/pipiui-relay.env`：

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import WebSocket from "ws";
 import {
@@ -29,12 +32,13 @@ function installFrameQueue(socket: WebSocket) {
   });
 }
 
-async function fixture() {
+async function fixture(downloadsDir?: string) {
   const instance = createTunnelServer({
     host: "127.0.0.1",
     port: 0,
     publicOrigin: "http://127.0.0.1",
     tunnelURL: "ws://127.0.0.1/tunnel/ws",
+    downloadsDir,
   });
   instance.server.listen(0, "127.0.0.1");
   await once(instance.server, "listening");
@@ -134,6 +138,45 @@ test("tunnel product defaults expose only exact static and WSS routes", async ()
     const [error] = await once(rejected, "error");
     assert.ok(error instanceof Error);
     accepted.close();
+  } finally {
+    await relay.close();
+  }
+});
+
+test("downloads route streams App builds with resumable ranges and no traversal", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pipiui-downloads-"));
+  await writeFile(join(dir, "PipiUI-Electron-2026-08-14.zip"), "0123456789");
+  const relay = await fixture(dir);
+  try {
+    const name = "PipiUI-Electron-2026-08-14.zip";
+    const full = await fetch(`${relay.origin}/downloads/${name}`);
+    assert.equal(full.status, 200);
+    assert.equal(full.headers.get("content-type"), "application/zip");
+    assert.equal(full.headers.get("accept-ranges"), "bytes");
+    assert.equal(full.headers.get("content-length"), "10");
+    assert.equal(await full.text(), "0123456789");
+
+    const part = await fetch(`${relay.origin}/downloads/${name}`, { headers: { range: "bytes=2-5" } });
+    assert.equal(part.status, 206);
+    assert.equal(part.headers.get("content-range"), "bytes 2-5/10");
+    assert.equal(await part.text(), "2345");
+
+    const tail = await fetch(`${relay.origin}/downloads/${name}`, { headers: { range: "bytes=-4" } });
+    assert.equal(tail.status, 206);
+    assert.equal(await tail.text(), "6789");
+
+    const head = await fetch(`${relay.origin}/downloads/${name}`, { method: "HEAD" });
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get("content-length"), "10");
+
+    const unsatisfiable = await fetch(`${relay.origin}/downloads/${name}`, { headers: { range: "bytes=99-" } });
+    assert.equal(unsatisfiable.status, 416);
+
+    assert.equal((await fetch(`${relay.origin}/downloads/missing.zip`)).status, 404);
+    // encoded traversal, bare directory, and dotfiles never leave the downloads dir
+    assert.equal((await fetch(`${relay.origin}/downloads/%2e%2e%2fsecret`)).status, 404);
+    assert.equal((await fetch(`${relay.origin}/downloads/`)).status, 404);
+    assert.equal((await fetch(`${relay.origin}/downloads/.hidden`)).status, 404);
   } finally {
     await relay.close();
   }
