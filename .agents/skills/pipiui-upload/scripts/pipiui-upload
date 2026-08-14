@@ -1,0 +1,104 @@
+#!/bin/zsh
+# Publishes the canonical PipiUI Electron.app (or any build artifact) to the
+# DMIT download host and verifies the public link end to end.
+set -euo pipefail
+
+key_path="${DMIT_SSH_KEY:-$HOME/.ssh/id_rsa}"
+host="${DMIT_HOST:-179.253.244.124}"
+remote_dir="/opt/pipiui-relay/downloads"
+base_url="https://pipi.aichattrpg.com/downloads"
+ssh_opts=(-i "$key_path" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=12)
+
+usage() {
+  cat <<'EOF'
+usage: pipiui-upload [options] [file]
+
+  no file        zip build/PipiUI Electron.app and publish as PipiUI-Electron-YYYY-MM-DD.zip
+  file           publish this existing artifact (.zip/.dmg) under its own name
+
+options:
+  --app <path>   app bundle to zip (default: <repo>/build/PipiUI Electron.app)
+  --force        skip the stale-build freshness check
+  -h, --help     this help
+EOF
+}
+
+repo_root="${0:A:h:h:h:h:h}"
+app_path="$repo_root/build/PipiUI Electron.app"
+force=0
+target=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --app) app_path="$2"; shift 2 ;;
+    --force) force=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) print -u2 "unknown option: $1"; usage >&2; exit 2 ;;
+    *) target="$1"; shift ;;
+  esac
+done
+
+remote_md5() {
+  local name="$1"
+  /usr/bin/ssh "${ssh_opts[@]}" "root@$host" "md5sum '$remote_dir/$name' 2>/dev/null" | awk '{print $1}'
+}
+
+publish() {
+  local file="$1" name="$2"
+  local sum="$(md5 -q "$file")"
+  local size=$(stat -f %z "$file")
+  local remote="$(remote_md5 "$name")"
+  if [[ "$remote" == "$sum" ]]; then
+    print "remote already matches: $name"
+  else
+    if [[ -n "$remote" && "$target" == "" ]]; then
+      # same-day rebuild would overwrite a shared link; take the next suffix
+      local n=2 suffix
+      while [[ -n "$(remote_md5 "${name:r}-$n.${name:e}")" ]]; do n=$((n+1)); done
+      suffix="${name:r}-$n.${name:e}"
+      print "remote $name differs; publishing as $suffix instead"
+      name="$suffix"
+    fi
+    print "uploading $file -> $remote_dir/$name ($(printf '%.1f' $((size/1048576.0)))MB)"
+    /usr/bin/scp -q "${ssh_opts[@]}" "$file" "root@$host:$remote_dir/$name"
+    local verify="$(remote_md5 "$name")"
+    [[ "$verify" == "$sum" ]] || { print -u2 "md5 mismatch after upload: $verify != $sum"; exit 1 }
+  fi
+
+  local url="$base_url/$name"
+  local code length i
+  for i in {1..10}; do
+    code=$(curl -sS -o /dev/null -w '%{http_code}' -I "$url" || true)
+    [[ "$code" == "200" ]] && break
+    sleep 2
+  done
+  [[ "$code" == "200" ]] || { print -u2 "public link returned $code: $url"; exit 1 }
+  length=$(curl -sSI "$url" | awk 'tolower($1)=="content-length:"{gsub("\r","");print $2}')
+  [[ "$length" == "$size" ]] || { print -u2 "public Content-Length $length != $size"; exit 1 }
+  local range_status=$(curl -sS -o /dev/null -w '%{http_code}' -r 0-0 "$url")
+  [[ "$range_status" == "206" ]] || { print -u2 "range request returned $range_status (expected 206)"; exit 1 }
+  print "verified: HEAD 200, Content-Length $size, Range 206"
+  print "$url"
+}
+
+if [[ -n "$target" ]]; then
+  [[ -f "$target" ]] || { print -u2 "no such file: $target"; exit 2 }
+  publish "${target:A}" "${target:t}"
+  exit 0
+fi
+
+binary="$app_path/Contents/MacOS/PipiUI Electron"
+[[ -x "$binary" ]] || { print -u2 "app bundle missing: $app_path"; exit 2 }
+if (( ! force )); then
+  stale=$(find "$repo_root/Electron" -type f -newer "$binary" -not -path "*/node_modules/*" -not -path "*/out/*" -not -path "*/dist/*" -print -quit 2>/dev/null || true)
+  if [[ -n "$stale" ]]; then
+    print -u2 "stale build: $stale is newer than the packaged binary."
+    print -u2 "repackage via the pipiui-electron-build skill, or pass --force to ship as-is."
+    exit 3
+  fi
+fi
+
+name="PipiUI-Electron-$(date +%F).zip"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+ditto -c -k --sequesterRsrc --keepParent "$app_path" "$work/$name"
+publish "$work/$name" "$name"
