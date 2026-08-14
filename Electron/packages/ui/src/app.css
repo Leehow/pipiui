@@ -36,7 +36,7 @@ body{overscroll-behavior:none}
 .composer-read-only button{margin-left:auto;flex:none;padding:2px 5px;border-radius:4px;color:var(--warning);font-size:11px;text-decoration:underline}
 .composer-read-only button:hover{background:color-mix(in srgb,var(--warning) 16%,transparent)}
 .composer-thumb-remove:disabled{cursor:not-allowed;opacity:.45}
-.chat-header-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-header-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 10px}
 .chat-header-title-label{display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;cursor:text}
 .chat-header-title-label:focus-visible{outline:2px solid color-mix(in srgb,var(--accent) 60%,transparent);outline-offset:3px;border-radius:3px}
 .chat-header-title-input{width:min(420px,55vw);height:30px;padding:3px 8px;border:1px solid var(--accent);border-radius:6px;outline:0;color:var(--text-strong);background:var(--surface-input);font-weight:650;box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 16%,transparent)}
@@ -63,7 +63,7 @@ body{overscroll-behavior:none}
    floats over the chat column so the pane can be reopened. */
 .tool-panel{display:flex;flex-direction:column;min-width:0;min-height:0}
 .tool-quick-rail{display:flex;min-width:0;align-items:center;gap:2px;pointer-events:auto;-webkit-app-region:no-drag}
-.tool-quick-rail-header{flex:1;flex-direction:row}
+.tool-quick-rail-header{flex:0 0 auto;flex-direction:row}
 .tool-quick-rail-float{position:fixed;top:60px;right:calc(var(--tools-col) + 16px);z-index:35;flex-direction:column;padding:4px 3px;border:1px solid color-mix(in srgb,var(--border) 58%,transparent);border-radius:10px;background:color-mix(in srgb,var(--surface-raised) 92%,transparent);box-shadow:0 3px 12px rgb(0 0 0/14%);pointer-events:auto}
 .tool-rail-button{position:relative;display:grid;width:30px;height:30px;min-height:30px;flex:0 0 30px;place-items:center;padding:0;border-radius:7px;color:var(--muted);font-size:13px}.tool-rail-button:hover{background:var(--surface-hover);color:var(--text)}.tool-rail-button:disabled{cursor:not-allowed;opacity:.42}.tool-rail-button:disabled:hover{background:transparent;color:var(--muted)}.tool-rail-button.active{color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
 /* Swift panelQuickRail parity: 13pt SF Symbol rendered via CSS mask (currentColor). */
