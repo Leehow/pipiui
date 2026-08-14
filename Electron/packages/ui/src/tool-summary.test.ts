@@ -18,6 +18,15 @@ describe('toolArgsSummary', () => {
     expect(toolArgsSummary('web_search', '{"query":""}')).toBe('…')
   })
 
+  it('renders built-in browser search/fetch like their HTTP twins', () => {
+    expect(toolArgsSummary('browser_search', '{"query":"Electron 打包"}')).toBe('Electron 打包')
+    expect(toolArgsSummary('browser_search', '{}')).toBe('…')
+    expect(toolArgsSummary('browser_fetch', '{"url":"https://example.com","mode":"text"}')).toBe('https://example.com')
+    // Truncated streaming payloads still scrape the meaningful field.
+    expect(toolArgsSummary('browser_search', '{"query":"Electron 打包')).toBe('Electron 打包')
+    expect(toolArgsSummary('browser_fetch', '{"url":"https://example.com')).toBe('https://example.com')
+  })
+
   it('renders fetch_content url (single and array)', () => {
     expect(toolArgsSummary('fetch_content', '{"url":"https://example.com"}')).toBe('https://example.com')
     expect(toolArgsSummary('fetch_content', '{"urls":["https://a.com","https://b.com"]}')).toBe('https://a.com')
