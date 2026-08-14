@@ -59,6 +59,15 @@ describe('SubagentModelModal', () => {
     expect(await host.getMemoryReviewModel?.()).toBeNull()
   })
 
+  it('keeps existing subagent settings available when an older host lacks Hermes review methods', async () => {
+    const host = createMockHost()
+    host.getMemoryReviewModel = undefined
+    host.setMemoryReviewModel = undefined
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    expect(await screen.findByTestId('subagent-agent-explore')).toBeTruthy()
+    expect(screen.queryByTestId('memory-review-model-row')).toBeNull()
+  })
+
   it('persists the provider-qualified model selected for a nested Computer Worker', async () => {
     const xaiGrok: Model = { provider: 'xai', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
     const copilotGrok: Model = { provider: 'github-copilot', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
