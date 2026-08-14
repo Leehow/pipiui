@@ -10,12 +10,26 @@ const electronRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const defaultRuntimesRoot = join(electronRoot, '.embedded-runtimes')
 const metadata = JSON.parse(await readFile(join(electronRoot, 'node-runtime-assets.json'), 'utf8'))
 const backendPackage = JSON.parse(await readFile(join(electronRoot, 'packages', 'pi-backend', 'package.json'), 'utf8'))
+const brokerPackage = JSON.parse(await readFile(join(electronRoot, 'resources', 'runtime', 'pi-ext', 'packages', 'memory-broker', 'package.json'), 'utf8'))
+const brokerLock = JSON.parse(await readFile(join(electronRoot, 'resources', 'runtime', 'pi-ext', 'packages', 'memory-broker', 'package-lock.json'), 'utf8'))
+const electronPackage = JSON.parse(await readFile(join(electronRoot, 'apps', 'electron', 'package.json'), 'utf8'))
+const hermesPackageName = 'pi-hermes-memory'
+const hermesPackageVersion = brokerPackage.dependencies?.[hermesPackageName]
+const betterSqliteVersion = brokerLock.packages?.['node_modules/better-sqlite3']?.version
+const electronVersion = electronPackage.devDependencies?.electron
 const runtimePackageNames = [
   '@earendil-works/pi-coding-agent',
   'pi-web-access',
   'pi-mcp-extension'
 ]
-const requiredPackages = Object.fromEntries(runtimePackageNames.map(name => [name, backendPackage.dependencies?.[name]]))
+const requiredPackages = {
+  ...Object.fromEntries(runtimePackageNames.map(name => [name, backendPackage.dependencies?.[name]])),
+  [hermesPackageName]: hermesPackageVersion,
+  // Hermes declares a range, but the Electron runtime needs a reviewed native
+  // artifact and npm 12 requires install-script approval. Reuse the broker's
+  // committed lock resolution so both the ABI approval and package are exact.
+  'better-sqlite3': betterSqliteVersion
+}
 
 function usage() {
   console.log(`Prepare or validate PipiUI's persistent embedded Pi runtime.
@@ -98,6 +112,53 @@ async function declaredEntrypoint(nodeModules, name) {
   } catch { return undefined }
 }
 
+function nativeArchitectures(bytes, platform) {
+  if (platform === 'darwin' && bytes.length >= 8) {
+    const cpuName = value => value === 0x01000007 ? 'x64' : value === 0x0100000c ? 'arm64' : undefined
+    if (bytes.readUInt32LE(0) === 0xfeedfacf) return [cpuName(bytes.readUInt32LE(4))].filter(Boolean)
+    const magic = bytes.readUInt32BE(0)
+    if ((magic === 0xcafebabe || magic === 0xcafebabf) && bytes.length >= 8) {
+      const count = bytes.readUInt32BE(4)
+      const stride = magic === 0xcafebabf ? 32 : 20
+      const values = []
+      for (let index = 0; index < count; index += 1) {
+        const offset = 8 + index * stride
+        if (offset + 4 > bytes.length) break
+        const name = cpuName(bytes.readUInt32BE(offset))
+        if (name) values.push(name)
+      }
+      return values
+    }
+  }
+  if (platform === 'linux' && bytes.length >= 20 && bytes.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
+    const little = bytes[5] === 1
+    const machine = little ? bytes.readUInt16LE(18) : bytes.readUInt16BE(18)
+    return machine === 62 ? ['x64'] : machine === 183 ? ['arm64'] : []
+  }
+  if (platform === 'win32' && bytes.length >= 64 && bytes.subarray(0, 2).toString('ascii') === 'MZ') {
+    const peOffset = bytes.readUInt32LE(0x3c)
+    if (peOffset + 6 <= bytes.length && bytes.subarray(peOffset, peOffset + 4).toString('binary') === 'PE\0\0') {
+      const machine = bytes.readUInt16LE(peOffset + 4)
+      return machine === 0x8664 ? ['x64'] : machine === 0xaa64 ? ['arm64'] : []
+    }
+  }
+  return []
+}
+
+async function inspectHermesNative(nodeModules, { platform, arch }) {
+  const addon = join(nodeModules, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')
+  let bytes
+  try { bytes = await readFile(addon) } catch { return { ok: false, reason: `better-sqlite3 native addon is missing: ${addon}` } }
+  const architectures = nativeArchitectures(bytes, platform)
+  if (!architectures.includes(arch)) {
+    return {
+      ok: false,
+      reason: `better-sqlite3 native addon is ${architectures.join('+') || 'an unrecognized binary'}, expected ${arch}`
+    }
+  }
+  return { ok: true, addon, architectures }
+}
+
 // `npm install` leaves development-only payload in the tree we ship inside the
 // app bundle. None of it is reachable at runtime: pi loads `.ts` extensions
 // through jiti (transpile-only, so no `.d.ts` is consulted), sourcemaps only
@@ -142,6 +203,54 @@ async function pruneRuntimeTree(root, { platform, arch }) {
   }
   await walk(root, false, false)
   return removed
+}
+
+// Electron already contains a Node runtime, so shipping a second standalone Node
+// cost ~85MB for nothing once Electron 43 (Node 24) cleared pi's `>=22.19.0`
+// floor. This shim keeps the path everyone already resolves — PATH via
+// runtime-assets, `pi/bin/pi`'s hardcoded `../../node/bin/node`, and npm's
+// `#!/usr/bin/env node` shebang — while execing Electron in Node mode.
+//
+// The app exports PIPIUI_ELECTRON_BINARY because it alone knows the correct Node
+// host. On macOS that is Electron's background Helper rather than the foreground
+// app executable, which would create one Dock tile per long-lived Pi process.
+// The relative fallbacks only cover invocations the app did not launch.
+const NODE_SHIM_POSIX = `#!/bin/sh
+# Generated by scripts/fetch-pi-runtime.mjs — PipiUI ships no standalone Node.
+if [ -n "\${PIPIUI_ELECTRON_BINARY:-}" ] && [ -x "\${PIPIUI_ELECTRON_BINARY}" ]; then
+  exec env ELECTRON_RUN_AS_NODE=1 "\${PIPIUI_ELECTRON_BINARY}" "$@"
+fi
+self_dir=$(cd "$(dirname "$0")" && pwd -P)
+# Packaged: <app>/Contents/Resources/pipiui-embedded/node/bin -> <app>/Contents/MacOS
+# Development: <root>/.embedded-runtimes/<target>/node/bin -> <root>/node_modules
+for candidate in \\
+  "$self_dir"/../../../../Frameworks/*" Helper.app"/Contents/MacOS/*" Helper" \\
+  "$self_dir"/../../../../MacOS/* \\
+  "$self_dir"/../../../../node_modules/electron/dist/Electron.app/Contents/Frameworks/"Electron Helper.app"/Contents/MacOS/"Electron Helper" \\
+  "$self_dir"/../../../../node_modules/electron/dist/Electron.app/Contents/MacOS/Electron
+do
+  if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+    exec env ELECTRON_RUN_AS_NODE=1 "$candidate" "$@"
+  fi
+done
+echo "pipiui: no Electron binary provides Node; set PIPIUI_ELECTRON_BINARY" >&2
+exit 127
+`
+
+const NODE_SHIM_WINDOWS = `@echo off
+rem Generated by scripts/fetch-pi-runtime.mjs — PipiUI ships no standalone Node.
+if defined PIPIUI_ELECTRON_BINARY (
+  set ELECTRON_RUN_AS_NODE=1
+  "%PIPIUI_ELECTRON_BINARY%" %*
+  exit /b %errorlevel%
+)
+echo pipiui: no Electron binary provides Node; set PIPIUI_ELECTRON_BINARY 1>&2
+exit /b 127
+`
+
+async function writeNodeShim(nodePath, platform) {
+  await writeFile(nodePath, platform === 'win32' ? NODE_SHIM_WINDOWS : NODE_SHIM_POSIX)
+  if (platform !== 'win32') await chmod(nodePath, 0o755)
 }
 
 // The official Node tarball ships an unstripped binary (~106MB on darwin-arm64);
@@ -209,9 +318,20 @@ async function inspectRuntime(root, expected) {
   for (const name of ['pi-web-access', 'pi-mcp-extension']) {
     if (!(await declaredEntrypoint(nodeModules, name))) return { ok: false, reason: `${name} declared Pi extension entrypoint is missing` }
   }
+  const hermesNative = await inspectHermesNative(nodeModules, expected)
+  if (!hermesNative.ok) return hermesNative
   // A runtime prepared before pruning existed would silently add ~245MB to the
   // app bundle; the CLI sourcemap is the cheapest witness that it was skipped.
   if (await isFile(`${piCli}.map`)) return { ok: false, reason: 'runtime still carries development-only sourcemaps (prepared before pruning)' }
+  // A runtime prepared before the shim existed still carries an 85MB standalone
+  // Node. Sourcemaps are not a witness for it — that tree is pruned but fat — so
+  // check the executable is the shim rather than a Mach-O.
+  try {
+    const head = (await readFile(node)).subarray(0, 16).toString('utf8')
+    if (!head.startsWith('#!') && !head.startsWith('@echo')) {
+      return { ok: false, reason: 'embedded Node is a standalone binary, not the Electron shim (prepared before the shim existed)' }
+    }
+  } catch (error) { return { ok: false, reason: `Node executable is unreadable: ${error.message}` } }
   return { ok: true, manifest, node, piCli, piLauncher, nodeModules }
 }
 
@@ -286,10 +406,8 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
     const nodeRelative = platform === 'win32' ? join('node', 'node.exe') : join('node', 'bin', 'node')
     const stagedNode = join(staging, nodeRelative)
     await mkdir(dirname(stagedNode), { recursive: true })
-    await copyFile(extractedNode, stagedNode)
-    if (platform !== 'win32') await chmod(stagedNode, 0o755)
-    const strippedBytes = await stripEmbeddedNode(stagedNode, platform, arch)
-    if (strippedBytes > 0) console.log(`Stripped ${Math.round(strippedBytes / 1048576)}MB of debug symbols from the embedded Node`)
+    await writeNodeShim(stagedNode, platform)
+    console.log(`Wrote the Electron-backed Node shim (saves ~85MB over a standalone Node ${metadata.version})`)
 
     const archiveRoot = asset.nodePath.split('/')[0]
     try { await copyFile(join(extraction, archiveRoot, 'LICENSE'), join(staging, 'node', 'LICENSE')) } catch { /* executable is required */ }
@@ -300,7 +418,10 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
       name: 'pipiui-embedded-pi-runtime',
       private: true,
       version: '1.0.0',
-      dependencies: requiredPackages
+      dependencies: requiredPackages,
+      allowScripts: {
+        [`better-sqlite3@${betterSqliteVersion}`]: true
+      }
     }, null, 2)}\n`)
     const npm = npmInvocation()
     run(npm.command, [
@@ -320,7 +441,21 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
       `--cpu=${arch}`,
       '--prefix',
       piLib
-    ], { shell: npm.shell })
+    ], {
+      shell: npm.shell,
+      env: {
+        ...process.env,
+        // pi-hermes-memory's better-sqlite3 addon is loaded by Electron in
+        // ELECTRON_RUN_AS_NODE mode. Select the Electron ABI as well as the
+        // destination architecture; npm's --cpu/--os alone do not reach every
+        // native install script during a cross-architecture release build.
+        npm_config_runtime: 'electron',
+        npm_config_target: electronVersion,
+        npm_config_disturl: 'https://electronjs.org/headers',
+        npm_config_arch: arch,
+        npm_config_platform: platform
+      }
+    })
 
     const nodeModules = join(piLib, 'node_modules')
     const piCli = join(nodeModules, '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js')
@@ -375,6 +510,7 @@ async function main() {
   for (const [name, version] of Object.entries(requiredPackages)) {
     if (!exactVersion(version)) throw new Error(`${name} must be an exact production dependency, got ${version ?? 'missing'}`)
   }
+  if (!exactVersion(electronVersion)) throw new Error(`Electron must be an exact development dependency, got ${electronVersion ?? 'missing'}`)
 
   const runtimesRoot = resolve(process.env.PIPIUI_EMBEDDED_RUNTIMES_ROOT || defaultRuntimesRoot)
   const destination = join(runtimesRoot, key)

@@ -5,11 +5,89 @@ import { join } from "node:path";
 import { assemblePiSpawn, mergedSpawnEnvironment, resolveSpawnPaths, sanitizeEnvironment } from "../src/spawn-assembly.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
 
+describe("runtime info extension mount", () => {
+  const runtimeInfo = "/runtime/extensions/pipiui-runtime-info.ts";
+
+  it("always mounts for a main session, with or without a host bridge", () => {
+    const input = { cwd: "/tmp/project", paths: { runtimeInfo } };
+    expect(assemblePiSpawn(input).args).toEqual(["-e", runtimeInfo]);
+    expect(assemblePiSpawn({ ...input, bridgePort: 1234 }).args).toEqual(["-e", runtimeInfo]);
+  });
+
+  it("mounts last so request evidence observes the final rewritten payload", () => {
+    const codex = "/runtime/extensions/pipiui-codex-server-tools.ts";
+    const browser = "/runtime/extensions/pipiui-electron-webview.ts";
+    const output = assemblePiSpawn({
+      cwd: "/tmp/project",
+      features: { codexServerTools: true, browser: true },
+      paths: { codexServerTools: codex, webview: browser, runtimeInfo },
+      bridgePort: 1234,
+    });
+    expect(output.args).toEqual(["-e", codex, "-e", browser, "-e", runtimeInfo]);
+  });
+});
+
 describe("shared terminal extension mount", () => {
   it("mounts only behind the bridge feature gate", () => {
     const input = { cwd: "/tmp/project", paths: { terminal: "/runtime/extensions/pipiui-electron-terminal.ts" }, features: { terminal: true } };
     expect(assemblePiSpawn(input).args).not.toContain("/runtime/extensions/pipiui-electron-terminal.ts");
     expect(assemblePiSpawn({ ...input, bridgePort: 1234, sessionCapability: "cap" }).args).toEqual(["-e", "/runtime/extensions/pipiui-electron-terminal.ts"]);
+  });
+});
+
+describe("main-only Hermes runtime ownership", () => {
+  it("passes the exact managed package root only to the main memory broker", () => {
+    const paths = { memoryBroker: "/runtime/memory-broker", hermesMemory: "/embedded/node_modules/pi-hermes-memory" };
+    const main = assemblePiSpawn({ cwd: "/repo", features: { memoryBroker: true }, paths, bridgePort: 1234 });
+    expect(main.env.PIPIUI_HERMES_PACKAGE_ROOT).toBe(paths.hermesMemory);
+    expect(main.env.PIPIUI_HERMES_NODE_MODULES_ROOT).toBe("/embedded/node_modules");
+
+    const worker = assemblePiSpawn({ cwd: "/repo", features: {}, paths, bridgePort: 1234 });
+    expect(worker.env.PIPIUI_HERMES_PACKAGE_ROOT).toBeUndefined();
+    expect(worker.env.PIPIUI_HERMES_NODE_MODULES_ROOT).toBeUndefined();
+  });
+
+  it("resolves Hermes only from the exact-version managed runtime", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-hermes-spawn-"));
+    try {
+      const nodeModules = join(root, "node_modules");
+      const hermes = join(nodeModules, "pi-hermes-memory");
+      await mkdir(hermes, { recursive: true });
+      await writeFile(join(hermes, "package.json"), JSON.stringify({ name: "pi-hermes-memory", version: "0.9.4" }));
+      expect(resolveSpawnPaths("/runtime", { managedNodeModulesRoot: nodeModules }).hermesMemory).toBe(hermes);
+      await writeFile(join(hermes, "package.json"), JSON.stringify({ name: "pi-hermes-memory", version: "0.9.3" }));
+      expect(resolveSpawnPaths("/runtime", { managedNodeModulesRoot: nodeModules }).hermesMemory).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("explicit Pi resource mode", () => {
+  it("disables ambient discovery while retaining explicit PipiUI mounts", () => {
+    const { args, env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      agentDir: "/electron/pi-agent",
+      sessionsRoot: "/electron/pi-agent/sessions",
+      resourceMode: "explicit",
+      features: { philosophy: true, git: true },
+      paths: { philosophy: "/runtime/philosophy.ts", git: "/runtime/git.ts" },
+    });
+    expect(args).toEqual(expect.arrayContaining([
+      "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
+      "-e", "/runtime/philosophy.ts", "/runtime/git.ts",
+    ]));
+    expect(env).toMatchObject({
+      PI_CODING_AGENT_DIR: "/electron/pi-agent",
+      PI_CODING_AGENT_SESSION_DIR: "/electron/pi-agent/sessions",
+    });
+  });
+
+  it("keeps generic callers on Pi's default discovery behavior", () => {
+    const { args, env } = assemblePiSpawn({ cwd: "/tmp/project", features: { git: true }, paths: { git: "/runtime/git.ts" } });
+    expect(args).toEqual(["-e", "/runtime/git.ts"]);
+    expect(env.PI_CODING_AGENT_DIR).toBeUndefined();
+    expect(env.PI_CODING_AGENT_SESSION_DIR).toBeUndefined();
   });
 });
 
@@ -75,7 +153,7 @@ describe("Computer Agent host contract", () => {
 });
 
 /**
- * T17 parity: `~/.pi/agent/.env` keys reach the spawned pi process env. Mirrors Swift
+ * T17 parity: configured `<agentDir>/.env` keys reach the spawned pi process env. Mirrors Swift
  * `ChatSession.mergedSpawnEnv` + `PiProcess.mergedProcessEnvironment`: internal
  * PIPIUI_* contract wins > `.env` > host process env, with managed keys stripped from
  * both base layers.
@@ -99,6 +177,16 @@ describe(".env injection into the pi spawn env (T17 parity)", () => {
     );
     expect(merged.PIPIUI_BRIDGE_PORT).toBe("1234");
     expect(merged.TEST_KEY).toBe("xxx");
+  });
+
+  it("internal Pi profile paths win over stale .env and parent values", () => {
+    const merged = mergedSpawnEnvironment(
+      { PI_CODING_AGENT_DIR: "/global-parent", PI_CODING_AGENT_SESSION_DIR: "/global-parent/sessions" },
+      { PI_CODING_AGENT_DIR: "/global-dotenv", PI_CODING_AGENT_SESSION_DIR: "/global-dotenv/sessions" },
+      { PI_CODING_AGENT_DIR: "/electron/pi-agent", PI_CODING_AGENT_SESSION_DIR: "/electron/pi-agent/sessions" },
+    );
+    expect(merged.PI_CODING_AGENT_DIR).toBe("/electron/pi-agent");
+    expect(merged.PI_CODING_AGENT_SESSION_DIR).toBe("/electron/pi-agent/sessions");
   });
 
   it("strips managed PIPIUI_* keys from .env and parent layers", () => {
@@ -179,11 +267,13 @@ describe("installed runtime tree", () => {
     await mkdir(join(root, "pi-philosophy"), { recursive: true });
     await writeFile(join(root, "extensions", "pipiui-git.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-skillloader.ts"), "//\n");
+    await writeFile(join(root, "extensions", "pipiui-runtime-info.ts"), "//\n");
     await writeFile(join(root, "pi-philosophy", "package.json"), JSON.stringify({ pi: { extensions: ["./philosophy.ts"] } }));
     await writeFile(join(root, "pi-philosophy", "philosophy.ts"), "//\n");
 
     const paths = resolveSpawnPaths(root);
     expect(paths.git).toBe(join(root, "extensions", "pipiui-git.ts"));
+    expect(paths.runtimeInfo).toBe(join(root, "extensions", "pipiui-runtime-info.ts"));
     expect(paths.subagentDir).toBe(join(root, "pi-ext", "subagent"));
     expect(paths.philosophy).toBe(join(root, "pi-philosophy", "philosophy.ts"));
     expect(paths.builtInSkills).toBe(join(root, "built-in-skills"));

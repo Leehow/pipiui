@@ -11,6 +11,10 @@ import type { SpawnFeatures } from "./spawn-assembly.js";
  * - `searchScope`: it is a *gate* — searches outside the project need a host-granted path. Electron
  *   has no grant UI, so mounting it could only ever block the agent, never approve it.
  *
+ * - `bossReadOnly` enforces the orchestration layer's "you do not work the floor" rule in the
+ *   runtime rather than in prose: the main session loses `bash`/`edit`/`write` and keeps every
+ *   read. See `main-tool-policy.ts` for why the shell is in that set and what replaces it.
+ *
  * Everything else is verified to load: pi boots with all 13 mounts and a clean stderr.
  */
-export const DEFAULT_FEATURES:SpawnFeatures=Object.freeze({philosophy:true,plan:false,subagent:true,memoryBroker:true,git:true,generateImage:true,reload:true,webSearch:true,arxivFetch:true,mcp:true,skillLoader:true,searchScope:false,codexServerTools:true,claudeServerTools:true,browser:true,terminal:true,computerUse:true});
+export const DEFAULT_FEATURES:SpawnFeatures=Object.freeze({philosophy:true,plan:false,subagent:true,memoryBroker:true,git:true,generateImage:true,reload:true,webSearch:true,arxivFetch:true,mcp:true,skillLoader:true,searchScope:false,codexServerTools:true,claudeServerTools:true,browser:true,terminal:true,computerUse:true,bossReadOnly:true});

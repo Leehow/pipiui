@@ -85,9 +85,6 @@
     },
     "mac": {
       "icon": "build/icon.icns",
-      "binaries": [
-        "Contents/Resources/pipiui-embedded/node/bin/node"
-      ],
       "target": [
         "dmg",
         "zip"

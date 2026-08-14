@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "source": "https://models.dev/api.json",
+  "retrievedAt": "2026-08-13T03:11:00Z",
+  "providers": {
+    "xai": {
+      "models": {
+        "grok-4.6": {
+          "reasoning": true,
+          "reasoningOptions": [
+            {
+              "type": "effort",
+              "values": ["low", "medium", "high", "xhigh"]
+            }
+          ],
+          "verifiedAdditiveEffortValues": ["minimal"],
+          "verification": {
+            "method": "Authenticated POST https://api.x.ai/v1/chat/completions with model=grok-4.6 and max_tokens=1",
+            "verifiedAt": "2026-08-13T03:20:00Z",
+            "acceptedValues": ["minimal", "low", "medium", "high", "xhigh"],
+            "rejectedValues": ["off", "max", "garbage"],
+            "result": "Accepted values returned HTTP 200; rejected values returned HTTP 400 Invalid reasoning effort"
+          }
+        }
+      }
+    }
+  }
+}

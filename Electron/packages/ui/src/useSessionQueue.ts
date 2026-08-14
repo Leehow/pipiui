@@ -27,6 +27,9 @@ export type UseSessionQueueResult = {
   setExpanded: (expanded: boolean) => void
   dismissError: () => void
   acceptStreamEvent: (event: StreamEvent) => void
+  /** Re-pulls the authoritative queue snapshot (e.g. after settled) so a missed
+   *  queue_update can never strand the composer in a busy state. */
+  resync: () => Promise<void>
   enqueue: (text: string, attachments?: PromptAttachment[]) => Promise<QueueEnqueueResult>
   edit: (messageId: string, text: string) => Promise<void>
   remove: (messageId: string) => Promise<void>
@@ -80,6 +83,19 @@ export function useSessionQueue(host: PipiHostAPI, sessionId: string, streaming:
     setQueue(event.queue)
   }, [])
 
+  const resync = useCallback(async () => {
+    const activeSessionId = sessionRef.current
+    if (!activeSessionId) return
+    try {
+      const items = await host.listQueue(activeSessionId)
+      // A queue_update that arrived after this pull started is newer; keep it.
+      if (sessionRef.current === activeSessionId) {
+        snapshotGenerationRef.current += 1
+        setQueue(items)
+      }
+    } catch { /* best-effort: snapshots keep flowing via queue_update */ }
+  }, [host])
+
   const mutate = useCallback(async <T,>(operation: (activeSessionId: string) => Promise<T>): Promise<T> => {
     const activeSessionId = sessionRef.current
     if (!activeSessionId) throw new Error('未选择会话')
@@ -119,6 +135,7 @@ export function useSessionQueue(host: PipiHostAPI, sessionId: string, streaming:
     setExpanded,
     dismissError: () => setError(null),
     acceptStreamEvent,
+    resync,
     enqueue,
     edit,
     remove,

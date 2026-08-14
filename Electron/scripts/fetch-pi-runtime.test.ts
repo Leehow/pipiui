@@ -19,15 +19,29 @@ describe('persistent embedded Pi runtime CLI', () => {
     const node = join(target, 'node', 'bin', 'node')
     const nodeModules = join(target, 'pi', 'lib', 'node_modules')
     const piCli = join(nodeModules, '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js')
+    const hermes = join(nodeModules, 'pi-hermes-memory', 'package.json')
+    const sqliteNative = join(nodeModules, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')
     const launcher = join(target, 'pi', 'bin', 'pi')
     await Promise.all([
       mkdir(join(node, '..'), { recursive: true }),
       mkdir(join(piCli, '..'), { recursive: true }),
+      mkdir(join(hermes, '..'), { recursive: true }),
+      mkdir(join(sqliteNative, '..'), { recursive: true }),
       mkdir(join(launcher, '..'), { recursive: true })
     ])
     await Promise.all([
       writeFile(node, '#!/bin/sh\n'),
       writeFile(piCli, '// cli\n'),
+      writeFile(hermes, JSON.stringify({ name: 'pi-hermes-memory', version: '0.9.4' })),
+      writeFile(join(nodeModules, 'better-sqlite3', 'package.json'), JSON.stringify({ name: 'better-sqlite3', version: '12.11.1' })),
+      // Thin Mach-O header with the requested CPU type. inspectRuntime only
+      // needs the header to reject a closure prepared for the other target.
+      writeFile(sqliteNative, (() => {
+        const header = Buffer.alloc(32)
+        header.writeUInt32LE(0xfeedfacf, 0)
+        header.writeUInt32LE(arch === 'arm64' ? 0x0100000c : 0x01000007, 4)
+        return header
+      })()),
       writeFile(launcher, '#!/bin/sh\n'),
       writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '0.84.0' }))
     ])
@@ -50,7 +64,9 @@ describe('persistent embedded Pi runtime CLI', () => {
       packages: {
         '@earendil-works/pi-coding-agent': '0.84.0',
         'pi-web-access': '0.20.0',
-        'pi-mcp-extension': '1.5.0'
+        'pi-mcp-extension': '1.5.0',
+        'pi-hermes-memory': '0.9.4',
+        'better-sqlite3': '12.11.1'
       }
     }))
     return target
@@ -95,8 +111,23 @@ describe('persistent embedded Pi runtime CLI', () => {
     // install that runs under --prefix.
     expect(source).toContain("'--maxsockets', '3'")
     expect(source).toContain("'--fetch-timeout', '60000'")
+    expect(source).toContain('[`better-sqlite3@${betterSqliteVersion}`]: true')
     const npmrc = await readFile(new URL('../.npmrc', import.meta.url), 'utf8')
     expect(npmrc).toMatch(/^maxsockets=3$/m)
+  })
+
+  it('rejects a target whose Node is a standalone binary rather than the Electron shim', async () => {
+    const arm = await seed('darwin', 'arm64')
+    const node = join(arm, 'node', 'bin', 'node')
+    // seed() writes `#!/bin/sh`, which is what the shim looks like.
+    expect(run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '').status).toBe(0)
+
+    // A real Node starts with a Mach-O magic number, never a shebang.
+    await writeFile(node, Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0]))
+    await chmod(node, 0o755)
+    const fat = run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '')
+    expect(fat.status).toBe(1)
+    expect(fat.stderr).toContain('not the Electron shim')
   })
 
   it('rejects a target prepared before pruning so the release cannot ship the fat tree', async () => {
@@ -108,6 +139,28 @@ describe('persistent embedded Pi runtime CLI', () => {
     const stale = run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '')
     expect(stale.status).toBe(1)
     expect(stale.stderr).toContain('development-only sourcemaps')
+  })
+
+  it('rejects a runtime without the pinned Hermes closure or with the wrong native SQLite slice', async () => {
+    const arm = await seed('darwin', 'arm64')
+    const nodeModules = join(arm, 'pi', 'lib', 'node_modules')
+    expect(run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '').status).toBe(0)
+
+    await rm(join(nodeModules, 'pi-hermes-memory'), { recursive: true, force: true })
+    const missing = run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '')
+    expect(missing.status).toBe(1)
+    expect(missing.stderr).toContain('pi-hermes-memory installed version is missing, expected 0.9.4')
+
+    await mkdir(join(nodeModules, 'pi-hermes-memory'), { recursive: true })
+    await writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ name: 'pi-hermes-memory', version: '0.9.4' }))
+    const sqliteNative = join(nodeModules, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')
+    const wrongHeader = Buffer.alloc(32)
+    wrongHeader.writeUInt32LE(0xfeedfacf, 0)
+    wrongHeader.writeUInt32LE(0x01000007, 4)
+    await writeFile(sqliteNative, wrongHeader)
+    const wrongArch = run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '')
+    expect(wrongArch.status).toBe(1)
+    expect(wrongArch.stderr).toContain('better-sqlite3 native addon is x64, expected arm64')
   })
 
   it('detects a version-stale target while leaving an independent target usable', async () => {

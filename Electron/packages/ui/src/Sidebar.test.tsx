@@ -57,6 +57,8 @@ function defaultProps(overrides: Partial<SidebarProps> = {}): SidebarProps {
     selectedSessionId: null,
     searchQuery: '',
     visibleLimit: 10,
+    collapsed: false,
+    onToggleCollapsed: vi.fn(),
     onToggleProject: vi.fn(),
     onSelectSession: vi.fn(),
     onNewSession: vi.fn(),
@@ -68,9 +70,14 @@ function defaultProps(overrides: Partial<SidebarProps> = {}): SidebarProps {
 }
 
 describe('Sidebar', () => {
-  it('renders search, pinned section, project rows and session rows', () => {
+  it('renders its pane toggle above search, pinned section, project rows and session rows', () => {
     render(<Sidebar {...defaultProps()} />)
     expect(screen.getByRole('navigation', { name: '会话侧边栏' })).toBeTruthy()
+    const brand = screen.getByLabelText('PipiUI')
+    expect(brand.closest('.sb-topbar')).toBeTruthy()
+    expect(brand.textContent).toBe('Pipi UI')
+    expect(brand.querySelector('span')?.textContent).toBe('i')
+    expect(screen.getByRole('button', { name: '收起左栏' }).closest('.sb-topbar')).toBeTruthy()
     expect(screen.getByRole('searchbox', { name: '搜索所有会话' })).toBeTruthy()
     expect(screen.getByText('置顶')).toBeTruthy()
     expect(screen.getByText('项目')).toBeTruthy()
@@ -135,14 +142,12 @@ describe('Sidebar', () => {
     expect(props.onProjectMenu).toHaveBeenLastCalledWith('p1', 'newSession' satisfies ProjectMenuAction)
   })
 
-  it('adds an explicit project path through the parent host callback', async () => {
+  it('opens the native project-folder picker without showing a path text field', async () => {
     const onAddProject = vi.fn(async () => true)
     render(<Sidebar {...defaultProps({ onAddProject })} />)
     fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
-    fireEvent.change(screen.getByLabelText('项目路径'), { target: { value: '/Users/me/new-project' } })
-    fireEvent.click(screen.getByRole('button', { name: '添加' }))
-    await waitFor(() => expect(onAddProject).toHaveBeenCalledWith('/Users/me/new-project'))
-    await waitFor(() => expect(screen.queryByTestId('add-project-form')).toBeNull())
+    await waitFor(() => expect(onAddProject).toHaveBeenCalledWith())
+    expect(screen.queryByRole('textbox', { name: '项目路径' })).toBeNull()
   })
 
   it('typing in the search box reports the query upward (controlled)', () => {
@@ -151,6 +156,69 @@ describe('Sidebar', () => {
     const input = screen.getByRole('searchbox', { name: '搜索所有会话' })
     fireEvent.change(input, { target: { value: 'claude' } })
     expect(props.onSearch).toHaveBeenCalledWith('claude')
+  })
+
+  it('drags projects to a new manual position', () => {
+    const onMoveProject = vi.fn()
+    render(<Sidebar {...defaultProps({ onMoveProject })} />)
+    const [first, second] = screen.getAllByTestId('project-row')
+    const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
+    fireEvent.dragStart(first, { dataTransfer: transfer })
+    fireEvent.dragOver(second, { dataTransfer: transfer, clientY: 10 })
+    fireEvent.drop(second, { dataTransfer: transfer, clientY: 10 })
+    expect(onMoveProject).toHaveBeenCalledWith('p1', 'p2', 'after')
+  })
+
+  it('reorders sessions and moves one onto another project', () => {
+    const onMoveSession = vi.fn()
+    render(<Sidebar {...defaultProps({ onMoveSession })} />)
+    const rows = screen.getAllByTestId('session-row')
+    const s1 = rows.find(row => row.getAttribute('data-session-id') === 's1')!
+    const s2 = rows.find(row => row.getAttribute('data-session-id') === 's2')!
+    const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
+    fireEvent.dragStart(s1, { dataTransfer: transfer })
+    fireEvent.dragOver(s2, { dataTransfer: transfer, clientY: 10 })
+    fireEvent.drop(s2, { dataTransfer: transfer, clientY: 10 })
+    expect(onMoveSession).toHaveBeenLastCalledWith('s1', 'p1', 's2', 'after')
+
+    fireEvent.dragStart(s1, { dataTransfer: transfer })
+    const p2 = screen.getAllByTestId('project-row')[1]
+    fireEvent.dragOver(p2, { dataTransfer: transfer })
+    fireEvent.drop(p2, { dataTransfer: transfer })
+    expect(onMoveSession).toHaveBeenLastCalledWith('s1', 'p2')
+  })
+
+  it('pins by dropping into the pinned section and unpins by dropping onto a project', () => {
+    const onMoveSession = vi.fn()
+    const onMoveSessionToPinned = vi.fn()
+    render(<Sidebar {...defaultProps({ onMoveSession, onMoveSessionToPinned })} />)
+    const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
+    const row = (screen.getAllByTestId('session-row')).find(item => item.getAttribute('data-session-id') === 's1')!
+    const pinned = screen.getByLabelText('置顶会话')
+    fireEvent.dragStart(row, { dataTransfer: transfer })
+    fireEvent.dragOver(pinned, { dataTransfer: transfer })
+    fireEvent.drop(pinned, { dataTransfer: transfer })
+    expect(onMoveSessionToPinned).toHaveBeenCalledWith('s1', undefined, 'after')
+
+    const pinnedRow = (screen.getAllByTestId('session-row')).find(item => item.getAttribute('data-session-id') === 'pin1')!
+    const project = screen.getAllByTestId('project-row')[1]
+    fireEvent.dragStart(pinnedRow, { dataTransfer: transfer })
+    fireEvent.dragOver(project, { dataTransfer: transfer })
+    fireEvent.drop(project, { dataTransfer: transfer })
+    expect(onMoveSession).toHaveBeenCalledWith('pin1', 'p2')
+  })
+
+  it('reorders pinned sessions by dragging one over another', () => {
+    const onMoveSessionToPinned = vi.fn()
+    render(<Sidebar {...defaultProps({ pinnedSessions: [session({ id: 'pin1' }), session({ id: 'pin2' })], onMoveSessionToPinned })} />)
+    const rows = screen.getAllByTestId('session-row')
+    const pin1 = rows.find(item => item.getAttribute('data-session-id') === 'pin1')!
+    const pin2 = rows.find(item => item.getAttribute('data-session-id') === 'pin2')!
+    const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
+    fireEvent.dragStart(pin1, { dataTransfer: transfer })
+    fireEvent.dragOver(pin2, { dataTransfer: transfer, clientY: 10 })
+    fireEvent.drop(pin2, { dataTransfer: transfer, clientY: 10 })
+    expect(onMoveSessionToPinned).toHaveBeenCalledWith('pin1', 'pin2', 'after')
   })
 
   it('filters projects and sessions by title', () => {
@@ -274,7 +342,7 @@ describe('Sidebar', () => {
   it('marks the selected session row and reports clicks', () => {
     const props = defaultProps({ selectedSessionId: 's2' })
     render(<Sidebar {...props} />)
-    const row = screen.getByText('s2').closest('button')!
+    const row = screen.getByText('s2').closest('.sb-session')!
     expect(row.getAttribute('aria-current')).toBe('true')
     expect(row.classList.contains('sb-selected')).toBe(true)
     fireEvent.click(row)
@@ -283,10 +351,7 @@ describe('Sidebar', () => {
 
   it.each([
     ['running', '进行中'],
-    ['completed', '已完成'],
-    ['failed', '失败'],
-    ['stalled', '停滞'],
-    ['interrupted', '已中断']
+    ['stalled', '停滞']
   ] as const)('renders a distinct status caption and glyph for %s', (status, caption) => {
     const props = defaultProps({
       projects: [{ id: 'p1', name: 'demo', sessions: [session({ id: 'x', status })] }],
@@ -297,6 +362,20 @@ describe('Sidebar', () => {
     expect(row.getAttribute('data-status')).toBe(status)
     expect(within(row).getByText(caption)).toBeTruthy()
     // status badge also carries data-status for styling
+    expect(screen.getByText(caption).closest('.sb-status')!.getAttribute('data-status')).toBe(status)
+  })
+
+  it.each(['completed', 'interrupted', 'failed'] as const)('renders relativeTime as the caption for %s', (status) => {
+    const updatedAt = now - 12 * 60_000
+    const caption = relativeTime(updatedAt)
+    const props = defaultProps({
+      projects: [{ id: 'p1', name: 'demo', sessions: [session({ id: 'x', status, updatedAt })] }],
+      pinnedSessions: []
+    })
+    render(<Sidebar {...props} />)
+    const row = screen.getByTestId('session-row')
+    expect(row.getAttribute('data-status')).toBe(status)
+    expect(within(row).getByText(caption)).toBeTruthy()
     expect(screen.getByText(caption).closest('.sb-status')!.getAttribute('data-status')).toBe(status)
   })
 
@@ -379,7 +458,7 @@ describe('Sidebar', () => {
     expect(screen.queryByTestId('sidebar-footer')).toBeNull()
   })
 
-  it('reports pin/rename/archive from session hover actions and archive is global', () => {
+  it('reports pin/archive and commits rename from the inline session-title editor', async () => {
     const onPin = vi.fn()
     const onRename = vi.fn()
     const onArchive = vi.fn()
@@ -398,8 +477,12 @@ describe('Sidebar', () => {
     pinBtn.click()
     expect(onPin).toHaveBeenCalledWith('s1')
     const renameBtn = s1.querySelector('.sb-session-action[aria-label="修改标题"]') as HTMLElement
-    renameBtn.click()
-    expect(onRename).toHaveBeenCalledWith('s1')
+    fireEvent.click(renameBtn)
+    const input = within(s1 as HTMLElement).getByRole('textbox', { name: '会话名称' })
+    fireEvent.change(input, { target: { value: '新的会话名称' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(onRename).toHaveBeenCalledWith('s1', '新的会话名称'))
+    await waitFor(() => expect(within(s1 as HTMLElement).queryByRole('textbox', { name: '会话名称' })).toBeNull())
   })
 
   it('hides the status caption and overlays the hover actions on the right corner (Swift parity CSS)', () => {
@@ -461,5 +544,26 @@ describe('statusCaption / relativeTime', () => {
     expect(relativeTime(now - 30 * 60_000)).toBe('30分钟前')
     expect(relativeTime(now - 5 * 3600_000)).toBe('5小时前')
     expect(relativeTime(now - 3 * 86_400_000)).toBe('3天前')
+  })
+
+  it('uses relativeTime for completed, interrupted, failed, and idle', () => {
+    const updatedAt = now - 12 * 60_000
+    const expected = relativeTime(updatedAt)
+    for (const status of ['completed', 'interrupted', 'failed', 'idle'] as const) {
+      expect(statusCaption({
+        id: 'a',
+        projectId: 'p',
+        title: 't',
+        provider: 'x',
+        status,
+        updatedAt
+      })).toBe(expected)
+    }
+  })
+
+  it('keeps live captions for running and stalled', () => {
+    const base = { id: 'a', projectId: 'p', title: 't', provider: 'x', updatedAt: now }
+    expect(statusCaption({ ...base, status: 'running' })).toBe('进行中')
+    expect(statusCaption({ ...base, status: 'stalled' })).toBe('停滞')
   })
 })

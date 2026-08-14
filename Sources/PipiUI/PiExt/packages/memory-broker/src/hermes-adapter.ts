@@ -1,7 +1,9 @@
 import { createRequire } from "node:module";
+import { readFileSync, realpathSync } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { randomBytes } from "node:crypto";
 import { MemoryBackendUnavailableError, UnavailableMemoryBackend, type MemoryBrokerBackend } from "./backend.ts";
 import type { HermesCatalogPort } from "./memory-catalog.ts";
@@ -157,17 +159,36 @@ function requireString(value: unknown, name: string): string {
   return value;
 }
 
-function packageRoot(): string {
+function packageRoot(env: Record<string, string | undefined>): { root: string; entrypoint: string } {
   const require = createRequire(import.meta.url);
   let manifestPath: string;
-  try {
-    manifestPath = require.resolve(`${HERMES_MEMORY_PACKAGE_NAME}/package.json`);
-  } catch {
-    throw new HermesMemoryAdapterError("load-failed", `Unable to resolve ${HERMES_MEMORY_PACKAGE_NAME}@${HERMES_MEMORY_PACKAGE_VERSION}.`);
+  const configuredRoot = env.PIPIUI_HERMES_PACKAGE_ROOT?.trim();
+  const configuredModules = env.PIPIUI_HERMES_NODE_MODULES_ROOT?.trim();
+  if (configuredRoot || configuredModules) {
+    if (!configuredRoot || !configuredModules) {
+      throw new HermesMemoryAdapterError("load-failed", "Hermes managed package root contract is incomplete.");
+    }
+    try {
+      const modules = realpathSync(resolve(configuredModules));
+      const root = realpathSync(resolve(configuredRoot));
+      if (relative(modules, root) !== HERMES_MEMORY_PACKAGE_NAME
+        || root !== realpathSync(join(modules, HERMES_MEMORY_PACKAGE_NAME))) {
+        throw new Error("package root is outside the managed node_modules root");
+      }
+      manifestPath = join(root, "package.json");
+    } catch {
+      throw new HermesMemoryAdapterError("load-failed", "Hermes managed package root is missing or outside its Electron-owned node_modules root.");
+    }
+  } else {
+    try {
+      manifestPath = require.resolve(`${HERMES_MEMORY_PACKAGE_NAME}/package.json`);
+    } catch {
+      throw new HermesMemoryAdapterError("load-failed", `Unable to resolve ${HERMES_MEMORY_PACKAGE_NAME}@${HERMES_MEMORY_PACKAGE_VERSION}.`);
+    }
   }
   let manifest: unknown;
   try {
-    manifest = JSON.parse(require("node:fs").readFileSync(manifestPath, "utf8"));
+    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   } catch {
     throw new HermesMemoryAdapterError("load-failed", "Unable to read pi-hermes-memory package metadata.");
   }
@@ -179,15 +200,30 @@ function packageRoot(): string {
       `Expected ${HERMES_MEMORY_PACKAGE_NAME}@${HERMES_MEMORY_PACKAGE_VERSION}.`,
     );
   }
-  return dirname(manifestPath);
+  const root = realpathSync(dirname(manifestPath));
+  const main = typeof manifest.main === "string" ? manifest.main : "";
+  let entrypoint: string;
+  try {
+    entrypoint = realpathSync(resolve(root, main));
+  } catch {
+    throw new HermesMemoryAdapterError("shape-incompatible", `${HERMES_MEMORY_PACKAGE_NAME}@${HERMES_MEMORY_PACKAGE_VERSION} has no loadable main entrypoint.`);
+  }
+  const relativeEntrypoint = relative(root, entrypoint);
+  if (!main || !relativeEntrypoint || relativeEntrypoint.startsWith("..") || isAbsolute(relativeEntrypoint)) {
+    throw new HermesMemoryAdapterError("shape-incompatible", `${HERMES_MEMORY_PACKAGE_NAME}@${HERMES_MEMORY_PACKAGE_VERSION} has an invalid main entrypoint.`);
+  }
+  return { root, entrypoint };
 }
 
 /**
  * The upstream package exposes only its extension factory. These imports are
  * deliberately isolated here until upstream publishes a stable broker API.
  */
-async function loadHermesBridge(): Promise<{ extension: (pi: unknown) => unknown; bridge: HermesBridge }> {
-  packageRoot();
+async function loadHermesBridge(
+  env: Record<string, string | undefined> = process.env,
+): Promise<{ extension: (pi: unknown) => unknown; bridge: HermesBridge }> {
+  const hermes = packageRoot(env);
+  const moduleURL = (relativePath: string) => pathToFileURL(join(hermes.root, relativePath)).href;
   let extensionModule: UnknownRecord;
   let databaseModule: UnknownRecord;
   let memoryStoreModule: UnknownRecord;
@@ -197,13 +233,13 @@ async function loadHermesBridge(): Promise<{ extension: (pi: unknown) => unknown
   let projectModule: UnknownRecord;
   try {
     [extensionModule, databaseModule, memoryStoreModule, sessionSearchModule, configModule, pathsModule, projectModule] = await Promise.all([
-      import(HERMES_MEMORY_PACKAGE_NAME) as Promise<UnknownRecord>,
-      import(`${HERMES_MEMORY_PACKAGE_NAME}/src/store/db.js`) as Promise<UnknownRecord>,
-      import(`${HERMES_MEMORY_PACKAGE_NAME}/src/store/sqlite-memory-store.js`) as Promise<UnknownRecord>,
-      import(`${HERMES_MEMORY_PACKAGE_NAME}/src/store/session-search.js`) as Promise<UnknownRecord>,
-      import(`${HERMES_MEMORY_PACKAGE_NAME}/src/config.js`) as Promise<UnknownRecord>,
-      import(`${HERMES_MEMORY_PACKAGE_NAME}/src/paths.js`) as Promise<UnknownRecord>,
-      import(`${HERMES_MEMORY_PACKAGE_NAME}/src/project.js`) as Promise<UnknownRecord>,
+      import(pathToFileURL(hermes.entrypoint).href) as Promise<UnknownRecord>,
+      import(moduleURL("src/store/db.ts")) as Promise<UnknownRecord>,
+      import(moduleURL("src/store/sqlite-memory-store.ts")) as Promise<UnknownRecord>,
+      import(moduleURL("src/store/session-search.ts")) as Promise<UnknownRecord>,
+      import(moduleURL("src/config.ts")) as Promise<UnknownRecord>,
+      import(moduleURL("src/paths.ts")) as Promise<UnknownRecord>,
+      import(moduleURL("src/project.ts")) as Promise<UnknownRecord>,
     ]);
   } catch (error) {
     throw new HermesMemoryAdapterError("load-failed", `Unable to load ${HERMES_MEMORY_PACKAGE_NAME}@${HERMES_MEMORY_PACKAGE_VERSION}: ${boundedDetail(error)}`);
@@ -483,8 +519,10 @@ export class HermesMemoryBrokerBackend implements MemoryBrokerBackend {
  * upstream extension factory, so tests/hosts can exercise the verified storage
  * adapter without registering a second set of Hermes lifecycle hooks.
  */
-export async function createHermesMemoryBrokerBackend(): Promise<MemoryBrokerBackend> {
-  const { bridge } = await loadHermesBridge();
+export async function createHermesMemoryBrokerBackend(
+  env: Record<string, string | undefined> = process.env,
+): Promise<MemoryBrokerBackend> {
+  const { bridge } = await loadHermesBridge(env);
   return new HermesMemoryBrokerBackend(bridge);
 }
 
@@ -495,7 +533,7 @@ export async function installHermesMainIntegration(
 ): Promise<HermesMainIntegration> {
   try {
     const { configPath } = await mergeHermesConfiguration(env);
-    const { extension, bridge } = await loadHermesBridge();
+    const { extension, bridge } = await loadHermesBridge(env);
     await extension(pi);
     return {
       configPath,

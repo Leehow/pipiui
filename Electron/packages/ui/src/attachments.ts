@@ -20,6 +20,24 @@ export function validateAttachment(file: File): string | null {
   return null
 }
 
+/** Transcript / bubble image payload (same shape as tool screenshots and HistoryEntry.images). */
+export type ChatImage = { data: string; mimeType: string }
+
+/** Map send-time attachments onto the transcript image shape. Drops empty payloads. */
+export function chatImagesFromAttachments(attachments?: PromptAttachment[]): ChatImage[] | undefined {
+  if (!attachments?.length) return undefined
+  const images: ChatImage[] = []
+  for (const attachment of attachments) {
+    const data = typeof attachment.dataBase64 === 'string' ? attachment.dataBase64 : ''
+    if (!data) continue
+    images.push({
+      data,
+      mimeType: typeof attachment.mimeType === 'string' && attachment.mimeType ? attachment.mimeType : 'image/png',
+    })
+  }
+  return images.length ? images : undefined
+}
+
 /** Read a File into the wire shape (base64 + mimeType + name) at the transport edge only. */
 export function fileToPromptAttachment(file: File): Promise<PromptAttachment> {
   return new Promise((resolve, reject) => {

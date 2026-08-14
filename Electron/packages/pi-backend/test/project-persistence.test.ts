@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createPiHostBackend } from "../src/index.js";
 
 let root = "";
@@ -64,6 +64,55 @@ describe("explicit sidebar project persistence", () => {
     expect(await fresh.handle("listSessions", [added.id])).toEqual([expect.objectContaining({ id: "haoli-session", projectId: added.id })]);
   });
 
+  it("moves a session to another project's real cwd without changing its transcript", async () => {
+    const fixture = await setup(["haoli", "other"]);
+    const first = backend(fixture.agent, fixture.sessions);
+    await first.handle("setProjectPaths", [[fixture.projects.haoli, fixture.projects.other]]);
+    const projects = await first.handle("listProjects", []) as any[];
+    const source = projects.find(project => project.path === fixture.projects.haoli);
+    const target = projects.find(project => project.path === fixture.projects.other);
+    const sourceFile = join(fixture.sessions, encodeURIComponent(fixture.projects.haoli), "haoli.jsonl");
+    await writeFile(sourceFile, (await readFile(sourceFile, "utf8")) + JSON.stringify({ type: "message", id: "u1", timestamp: "2026-08-10T00:00:01.000Z", message: { role: "user", content: "keep this" } }) + "\n");
+
+    const moved = await first.handle("moveSession", ["haoli-session", target.id]) as any;
+
+    expect(moved).toMatchObject({ id: "haoli-session", projectId: target.id });
+    expect(await first.handle("listSessions", [source.id])).toEqual([]);
+    expect(await first.handle("listSessions", [target.id])).toEqual(expect.arrayContaining([expect.objectContaining({ id: "haoli-session" })]));
+    const rows = (await readFile(sourceFile, "utf8")).trim().split("\n").map(JSON.parse);
+    expect(rows[0]).toMatchObject({ id: "haoli-session", cwd: fixture.projects.other });
+    expect(rows[1]).toMatchObject({ id: "u1", message: { content: "keep this" } });
+    expect((await readdir(dirname(sourceFile))).filter(name => name.includes(".tmp-"))).toEqual([]);
+    await expect(first.handle("moveSession", ["haoli-session", "missing-project"])).rejects.toThrow("unknown project");
+  });
+
+  it("creates a session without waiting for the optional network model catalog", async () => {
+    const fixture = await setup();
+    const stalledCatalog = new Promise<never>(() => undefined);
+    const first = createPiHostBackend({
+      agentDir: fixture.agent,
+      sessionsRoot: fixture.sessions,
+      canonicalProjectPaths: async () => undefined,
+      authRuntime: {
+        getProviders: async () => [],
+        getAvailable: () => stalledCatalog,
+        login: async () => undefined,
+        logout: async () => undefined,
+      },
+    });
+    const project = await first.handle("addProject", [fixture.projects.haoli]) as any;
+
+    const created = await Promise.race([
+      first.handle("newSession", [project.id]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("newSession waited for model catalog")), 100)),
+    ]) as any;
+
+    expect(created).toMatchObject({ projectId: project.id, name: "New session" });
+    expect(await first.handle("listSessions", [project.id])).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: created.id }),
+    ]));
+  });
+
   it("replaces one legacy polluted list once from the canonical Swift plist source, then keeps explicit Host edits", async () => {
     const fixture = await setup(["haoli", "other"]);
     await writeFile(join(fixture.agent, "pipiui-settings.json"), JSON.stringify({ projectPathsVersion: 1, projectPaths: [fixture.projects.haoli, fixture.projects.other, "/old/discovered"] }));
@@ -74,7 +123,7 @@ describe("explicit sidebar project persistence", () => {
     expect(settings).toMatchObject({ projectPathsVersion: 1, projectPaths: [fixture.projects.haoli], projectPathsCanonicalMigrationVersion: 1, projectPathsCanonicalMigrationSource: "com.leehow.pipiui:pipiui.projects" });
     await migrated.handle("addProject", [fixture.projects.other]);
     const fresh = backend(fixture.agent, fixture.sessions, async () => []);
-    expect(await fresh.handle("getProjectPaths", [])).toEqual([fixture.projects.haoli, fixture.projects.other]);
+    expect(await fresh.handle("getProjectPaths", [])).toEqual([fixture.projects.other, fixture.projects.haoli]);
   });
 
   it("atomically merges project paths with hidden IDs and unrelated queue settings fields", async () => {
@@ -98,8 +147,8 @@ describe("explicit sidebar project persistence", () => {
     const first = backend(fixture.agent, fixture.sessions);
     expect(await first.handle("getComputerUseState", [])).toEqual({ enabled: false });
     expect(await first.handle("setComputerUseEnabled", [true])).toEqual({ enabled: true });
-    expect(await first.handle("setSubagentModel", ["operator", [{ model: "gpt-5", thinking: "high" }, { model: "claude-sonnet-4", thinking: "medium" }]])).toEqual({
-      operator: [{ model: "gpt-5", thinking: "high" }, { model: "claude-sonnet-4", thinking: "medium" }],
+    expect(await first.handle("setSubagentModel", ["operator", [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }]])).toEqual({
+      operator: [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
     });
     expect(await first.handle("listAgentDefinitions", [])).toEqual(expect.arrayContaining([
 	  expect.objectContaining({ name: "computer-use-leader" }),
@@ -110,7 +159,7 @@ describe("explicit sidebar project persistence", () => {
     const fresh = backend(fixture.agent, fixture.sessions);
     expect(await fresh.handle("getComputerUseState", [])).toEqual({ enabled: true });
     expect(await fresh.handle("getSubagentModels", [])).toEqual({
-      operator: [{ model: "gpt-5", thinking: "high" }, { model: "claude-sonnet-4", thinking: "medium" }],
+      operator: [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
     });
   });
 });

@@ -43,6 +43,7 @@ if [[ "$SKIP_TESTS" -eq 0 ]]; then
     Tests/Node/test-main-compaction.mjs \
     Tests/Node/test-boss-ledger-tasks.mjs \
     Tests/Node/test-subagent-worktree-finalize.mjs \
+    Tests/Node/test-subagent-worktree-recovery.mjs \
     Tests/Node/test-subagent-dispatch-queue.mjs; then
     echo "node tests failed; Re-run with --skip-tests to package without tests." >&2
     exit 1

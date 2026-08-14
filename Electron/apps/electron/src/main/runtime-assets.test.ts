@@ -1,6 +1,6 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { resolveRuntimeAssets } from './runtime-assets.js'
@@ -29,7 +29,11 @@ describe('resolveRuntimeAssets', () => {
       writeFile(node, ''),
       writeFile(piCli, '// pi cli\n'),
       writeFile(launcher, ''),
-      writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '0.84.0' }))
+      writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '0.84.0' })),
+      mkdir(join(nodeModules, 'pi-hermes-memory'), { recursive: true }).then(() =>
+        writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ version: '0.9.4' }))),
+      mkdir(join(nodeModules, 'better-sqlite3'), { recursive: true }).then(() =>
+        writeFile(join(nodeModules, 'better-sqlite3', 'package.json'), JSON.stringify({ version: '12.11.1' })))
     ])
     for (const [name, version] of [['pi-web-access', '0.20.0'], ['pi-mcp-extension', '1.5.0']]) {
       const packageRoot = join(nodeModules, name)
@@ -50,7 +54,9 @@ describe('resolveRuntimeAssets', () => {
       packages: {
         '@earendil-works/pi-coding-agent': '0.84.0',
         'pi-web-access': '0.20.0',
-        'pi-mcp-extension': '1.5.0'
+        'pi-mcp-extension': '1.5.0',
+        'pi-hermes-memory': '0.9.4',
+        'better-sqlite3': '12.11.1'
       }
     }))
   }
@@ -116,6 +122,8 @@ describe('resolveRuntimeAssets', () => {
   it('uses bundled Node and the real unpacked Pi CLI for a packaged launch', async () => {
     const { resourcesPath } = await seedPackagedRuntime()
     const assets = resolveRuntimeAssets({ packaged: true, resourcesPath, dirname: builtMainDir, env: { PATH: '/usr/bin:/bin' }, platform: 'darwin', arch: 'arm64' })
+    const electronName = basename(process.execPath)
+    const backgroundNodeHost = join(dirname(process.execPath), '..', 'Frameworks', `${electronName} Helper.app`, 'Contents', 'MacOS', `${electronName} Helper`)
     expect(assets.sourceRoot).toBe(join(resourcesPath, 'pipiui-runtime'))
     expect(assets.piCommand).toEqual({
       executable: join(resourcesPath, 'pipiui-embedded/node/bin/node'),
@@ -124,10 +132,14 @@ describe('resolveRuntimeAssets', () => {
       env: {
         PATH: `${join(resourcesPath, 'pipiui-embedded/node/bin')}:${join(resourcesPath, 'pipiui-embedded/pi/bin')}:/usr/bin:/bin`,
         PIPIUI_NODE_PATH: join(resourcesPath, 'pipiui-embedded/node/bin/node'),
-        PIPIUI_PI_PATH: join(resourcesPath, 'pipiui-embedded/pi/bin/pi')
+        PIPIUI_PI_PATH: join(resourcesPath, 'pipiui-embedded/pi/bin/pi'),
+        // macOS must use Electron's LSUIElement helper so each long-lived Pi
+        // process stays out of the Dock while still sharing Electron's Node.
+        PIPIUI_ELECTRON_BINARY: backgroundNodeHost
       }
     })
     expect(assets.managedNodeModulesRoot).toBe(join(resourcesPath, 'pipiui-embedded/pi/lib/node_modules'))
+    expect(JSON.parse(await readFile(join(assets.managedNodeModulesRoot!, 'pi-hermes-memory/package.json'), 'utf8')).version).toBe('0.9.4')
   })
 
   it('fails closed when a packaged runtime is absent or for another architecture', async () => {
@@ -140,7 +152,7 @@ describe('resolveRuntimeAssets', () => {
 
   it('lets the environment override the one runtime source root without an existence check', () => {
     const env = { PIPIUI_RUNTIME_SOURCE_ROOT: '/tmp/runtime-source', PIPIUI_CUA_DRIVER_PATH: '/tmp/drv' }
-    const assets = resolveRuntimeAssets({ packaged: false, resourcesPath: '/nope', dirname: builtMainDir, env })
+    const assets = resolveRuntimeAssets({ packaged: false, resourcesPath: '/nope', dirname: builtMainDir, env, platform: 'darwin', arch: 'not-prepared' })
     expect(assets.sourceRoot).toBe('/tmp/runtime-source')
     expect(assets.cuaDriver).toBe('/tmp/drv')
   })

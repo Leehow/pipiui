@@ -1,5 +1,5 @@
 import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs'
-import { delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import type { PiCommand, RuntimeAssets } from '@pipi/pi-backend'
 
 export interface AssetLookup {
@@ -27,7 +27,9 @@ const EXPECTED_NODE_VERSION = '22.19.0'
 const EXPECTED_PACKAGES = {
   '@earendil-works/pi-coding-agent': '0.84.0',
   'pi-web-access': '0.20.0',
-  'pi-mcp-extension': '1.5.0'
+  'pi-mcp-extension': '1.5.0',
+  'pi-hermes-memory': '0.9.4',
+  'better-sqlite3': '12.11.1'
 } as const
 
 type EmbeddedRuntimeManifest = {
@@ -73,6 +75,12 @@ function packageVersion(nodeModulesRoot: string, name: string): string | undefin
   try { return JSON.parse(readFileSync(join(nodeModulesRoot, name, 'package.json'), 'utf8')).version } catch { return undefined }
 }
 
+function electronNodeHost(platform: NodeJS.Platform, execPath = process.execPath): string {
+  if (platform !== 'darwin') return execPath
+  const name = basename(execPath)
+  return join(dirname(execPath), '..', 'Frameworks', `${name} Helper.app`, 'Contents', 'MacOS', `${name} Helper`)
+}
+
 function resolveEmbeddedPi(
   root: string,
   env: NodeJS.ProcessEnv,
@@ -106,7 +114,12 @@ function resolveEmbeddedPi(
   const commandEnv = {
     PATH: [dirname(node), dirname(piLauncher), env.PATH].filter(Boolean).join(delimiter),
     PIPIUI_NODE_PATH: node,
-    PIPIUI_PI_PATH: piLauncher
+    PIPIUI_PI_PATH: piLauncher,
+    // On macOS the main Electron executable is a foreground application even
+    // under ELECTRON_RUN_AS_NODE, so every long-lived Pi process gets another
+    // Dock tile. Electron's LSUIElement helper carries the same Node runtime
+    // without registering as a foreground app.
+    PIPIUI_ELECTRON_BINARY: electronNodeHost(platform)
   }
   return {
     piCommand: { executable: node, prefixArgs: [piCli], piPath: piLauncher, env: commandEnv },

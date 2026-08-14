@@ -420,6 +420,10 @@ export function registerSessionRecallTool(pi: ExtensionAPI): void {
 			"Searches only the current active lineage, including history compacted out of live context; it never searches other branches.",
 			"Use a focused query such as an agentId, verification result, plan, worktree, file, or user correction. Results are bounded entry snippets, not a full transcript.",
 		].join(" "),
+		// Without a snippet this tool is absent from Pi's rendered tool list, and the one
+		// caller who most needs it — a Boss whose context was just compacted — is the least
+		// likely to go looking for a tool nobody mentioned.
+		promptSnippet: "Recall this session's own earlier history, including what compaction dropped",
 		parameters: SessionRecallParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const result = recallActiveSession({

@@ -49,10 +49,12 @@ describe('context compaction', () => {
     emit({ type: 'compaction', sessionId: 'welcome', phase: 'start', reason: 'threshold' })
     expect(await screen.findByText('正在压缩上下文…（上下文超限）')).toBeTruthy()
     expect((await screen.findByTestId('stats-compacting')).textContent).toContain('压缩中')
+    expect(screen.getByLabelText('停止生成')).toBeTruthy()
 
     emit({ type: 'compaction', sessionId: 'welcome', phase: 'end', reason: 'threshold' })
     expect(await screen.findByText('上下文压缩完成')).toBeTruthy()
     await waitFor(() => expect(screen.queryByTestId('stats-compacting')).toBeNull())
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
   })
 
   it('reports a failed compaction instead of silently doing nothing', async () => {

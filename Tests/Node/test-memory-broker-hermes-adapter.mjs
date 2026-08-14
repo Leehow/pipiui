@@ -87,11 +87,18 @@ async function stopTestChild(child, milliseconds, stage, output) {
 
 async function installHermesRuntime(root, packageDirectory) {
   const env = isolatedEnvironment(root, { npm_config_cache: join(root, "npm-cache") });
+  const runtimePrefix = join(root, "embedded", "pi", "lib");
   // bundledDependencies are present for distributable Pi packages. Put the
-  // explicit test install at the temporary parent module root so Node/Jiti can
-  // resolve it from the copied package without mutating package metadata.
-  await writeFile(join(root, "package.json"), JSON.stringify({ name: "pipiui-hermes-fixture", private: true, type: "module" }), "utf8");
-  const child = spawn("npm", ["install", "--prefix", root, "--omit=dev", "--no-audit", "--no-fund", "pi-hermes-memory@0.9.4"], {
+  // explicit test install in the same embedded node_modules layout Electron
+  // ships. It is intentionally not an ancestor of the copied broker package.
+  await mkdir(runtimePrefix, { recursive: true });
+  await writeFile(join(runtimePrefix, "package.json"), JSON.stringify({
+    name: "pipiui-hermes-fixture",
+    private: true,
+    type: "module",
+    allowScripts: { "better-sqlite3@12.11.1": true },
+  }), "utf8");
+  const child = spawn("npm", ["install", "--prefix", runtimePrefix, "--omit=dev", "--no-audit", "--no-fund", "pi-hermes-memory@0.9.4"], {
     env,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -104,8 +111,10 @@ async function installHermesRuntime(root, packageDirectory) {
     ensureSymlink(piPackageRoot, join(packageDirectory, "node_modules/@earendil-works/pi-coding-agent")),
     ensureSymlink(join(piNodeModules, "typebox"), join(packageDirectory, "node_modules/typebox")),
   ]);
-  assert.equal(await exists(join(root, "node_modules/pi-hermes-memory/package.json")), true,
+  const nodeModules = join(runtimePrefix, "node_modules");
+  assert.equal(await exists(join(nodeModules, "pi-hermes-memory/package.json")), true,
     "temporary npm fixture must contain the pinned Hermes package");
+  return nodeModules;
 }
 
 async function linkPiPeers(root, packageDirectory) {
@@ -203,11 +212,32 @@ test("Hermes configuration merge preserves unknown keys and forces broker invari
   }
 });
 
+test("explicit Hermes root rejects a symlink escaping the Electron-owned node_modules tree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pipiui-hermes-containment-"));
+  try {
+    const modules = join(root, "embedded/node_modules");
+    const outside = join(root, "outside/pi-hermes-memory");
+    await mkdir(join(outside, "src"), { recursive: true });
+    await mkdir(modules, { recursive: true });
+    await writeFile(join(outside, "package.json"), JSON.stringify({ name: "pi-hermes-memory", version: "0.9.4", type: "module", main: "src/index.ts" }));
+    await writeFile(join(outside, "src/index.ts"), "export default function () {}\n");
+    await symlink(outside, join(modules, "pi-hermes-memory"), "dir");
+    const integration = await adapter.installHermesMainIntegration({}, {
+      PI_CODING_AGENT_DIR: join(root, "agent"),
+      PIPIUI_HERMES_PACKAGE_ROOT: join(modules, "pi-hermes-memory"),
+      PIPIUI_HERMES_NODE_MODULES_ROOT: modules,
+    });
+    assert.match(integration.detail, /outside its Electron-owned node_modules root/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("real Hermes main RPC load provides native FTS status/query/submit while quarantined experience is durably queued", { timeout: 300_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "pipiui-hermes-main-"));
   try {
     const packageDirectory = await copyBrokerPackage(root);
-    await installHermesRuntime(root, packageDirectory);
+    const managedNodeModules = await installHermesRuntime(root, packageDirectory);
     await linkPiPeers(root, packageDirectory);
     const probe = join(root, "a-main-probe.ts");
     const resultPath = join(root, "main-result.json");
@@ -269,6 +299,10 @@ export default function (pi) {
       mode: "main",
       probeCommand: "broker-main-probe",
       outputPath: resultPath,
+      extraEnv: {
+        PIPIUI_HERMES_PACKAGE_ROOT: join(managedNodeModules, "pi-hermes-memory"),
+        PIPIUI_HERMES_NODE_MODULES_ROOT: managedNodeModules,
+      },
     });
     const diagnostics = () => JSON.stringify({ output, stdout: outputText, stderr }, null, 2);
     assert.equal(stderr, "", diagnostics());

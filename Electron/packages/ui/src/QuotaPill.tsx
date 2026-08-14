@@ -10,7 +10,16 @@ export interface QuotaPillProps {
   provider?: string
   /** Extra dependency to force a refetch (e.g. after model/auth changes). */
   refreshKey?: unknown
+  /**
+   * Called when the user clicks the Qwen Token Plan login capsule. Mirrors the
+   * Swift InputBar entry: with no quota data for a Token Plan provider, show a
+   * login capsule that opens the embedded browser at the bailian plan page.
+   */
+  onOpenBrowserLogin?: () => void
 }
+
+/** Bailian Token Plan page (Swift `bailianTokenPlanURL` parity). */
+export const QWEN_TOKEN_PLAN_LOGIN_URL = 'https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/token-plan/personal'
 
 /** Windows safe to present as real account usage; incomplete host data stays hidden. */
 export function visibleQuotaWindows(snapshot: QuotaSnapshot): QuotaWindow[] {
@@ -64,29 +73,60 @@ function capsuleWindow(windows: QuotaWindow[], selectedId: string | null): Quota
  * The popover stays open after a pick and closes on outside click or re-click
  * (Swift popover parity).
  */
-export function QuotaPill({ host, sessionId, provider, refreshKey }: QuotaPillProps) {
+export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowserLogin }: QuotaPillProps) {
   const [snapshot, setSnapshot] = useState<QuotaSnapshot | null>(null)
+  const [loaded, setLoaded] = useState(false)
+  const [refreshTick, setRefreshTick] = useState(0)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [open, setOpen] = useState(false)
 
   useEffect(() => {
     if (typeof host.getQuotaSnapshot !== 'function') return
     let cancelled = false
+    setLoaded(false)
     const load = async () => {
       try {
         const snap = await host.getQuotaSnapshot!(sessionId)
-        if (!cancelled) setSnapshot(snap)
+        if (cancelled) return
+        setSnapshot(snap)
       } catch {
         // Quota is best-effort: keep the last good snapshot, never error UI.
       }
+      if (!cancelled) setLoaded(true)
     }
     void load()
     return () => { cancelled = true }
-  }, [host, sessionId, provider, refreshKey])
+  }, [host, sessionId, provider, refreshKey, refreshTick])
 
-  if (!snapshot) return null
+  const showLogin = loaded && !snapshot && Boolean(onOpenBrowserLogin) && Boolean(provider?.includes('qwen-token-plan'))
+
+  useEffect(() => {
+    // While the login capsule is up, the user may complete the bailian login in
+    // the built-in browser at any moment; poll so the quota capsule appears
+    // shortly after login without needing a model switch round-trip.
+    if (!showLogin) return
+    const timer = window.setInterval(() => setRefreshTick(tick => tick + 1), 5000)
+    return () => window.clearInterval(timer)
+  }, [showLogin])
+
+  if (!snapshot || visibleQuotaWindows(snapshot).length === 0) {
+    // Swift parity (InputBar): a Token Plan session without quota data is not
+    // logged in — offer a capsule that opens the embedded browser login page.
+    // Wait for the fetch so a slow load never flashes the login entry.
+    if (!showLogin) return null
+    return (
+      <button
+        type="button"
+        className="quota-pill"
+        data-testid="quota-login-pill"
+        title="登录阿里云百炼以查看 Token Plan 额度"
+        onClick={onOpenBrowserLogin}
+      >
+        Token Plan 登录
+      </button>
+    )
+  }
   const windows = visibleQuotaWindows(snapshot)
-  if (windows.length === 0) return null
   const providerName = snapshot.provider
 
   // In-session pick wins over the persisted one (which wins over highest-usage).

@@ -1,10 +1,55 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
-import { createIpcHost, createWsHost, type HostBackend, type HostWireFrame, type IpcRendererLike, type PipiHostAPI } from '../src/index.js'
+import { createIpcHost, createWsHost, resolveThinkingLevel, thinkingLevelsForModel, type HostBackend, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences } from '../src/index.js'
 import { registerPipiHostIpc } from '../../../apps/electron/src/main/index.js'
 import { createWsHostServer } from '../../../apps/server/src/index.js'
 
 type Factory = () => Promise<{ host: PipiHostAPI; close(): Promise<void> }>
+
+describe('thinking capability tri-state helper', () => {
+  const unknown = { provider: 'unknown', id: 'unknown', name: 'Unknown' }
+
+  it('uses the standard fallback only for unknown capability metadata', () => {
+    expect(thinkingLevelsForModel(unknown)).toEqual(['off', 'minimal', 'low', 'medium', 'high'])
+    expect(thinkingLevelsForModel({ ...unknown, reasoning: false })).toEqual([])
+    expect(thinkingLevelsForModel({ ...unknown, thinkingConfigurable: false })).toEqual([])
+    expect(thinkingLevelsForModel(unknown, ['off', 'high', 'xhigh'])).toEqual(['off', 'high', 'xhigh'])
+  })
+
+  it('exposes only string-mapped levels from a sparse openai-codex thinkingLevelMap', () => {
+    const sparse = {
+      ...unknown,
+      provider: 'openai-codex',
+      id: 'gpt-5.6-luna',
+      name: 'GPT-5.6 Luna',
+      reasoning: true,
+      thinkingLevelMap: { minimal: 'low', xhigh: 'xhigh', max: 'max' },
+    }
+    expect(thinkingLevelsForModel(sparse)).toEqual(['off', 'minimal', 'xhigh', 'max'])
+    expect(thinkingLevelsForModel(sparse)).not.toContain('high')
+    expect(thinkingLevelsForModel(sparse)).not.toContain('medium')
+  })
+
+  it('hides an explicit null map value, including off', () => {
+    expect(thinkingLevelsForModel({
+      ...unknown,
+      reasoning: true,
+      thinkingLevelMap: { off: null, minimal: 'low', high: null, xhigh: 'xhigh' },
+    })).toEqual(['minimal', 'xhigh'])
+  })
+
+  it('clamps a stale high onto an allowed sparse-map level', () => {
+    const available = thinkingLevelsForModel({
+      ...unknown,
+      reasoning: true,
+      thinkingLevelMap: { minimal: 'low', xhigh: 'xhigh', max: 'max' },
+    })
+    expect(resolveThinkingLevel('high', available, 'high')).toBe('off')
+    expect(resolveThinkingLevel('high', available, 'xhigh')).toBe('xhigh')
+    expect(resolveThinkingLevel('minimal', available, 'off')).toBe('minimal')
+    expect(resolveThinkingLevel('high', [])).toBeUndefined()
+  })
+})
 
 /** Transport fixture only; production server defaults to PiHostBackend. */
 function createContractMockBackend(): HostBackend {
@@ -23,11 +68,12 @@ function createContractMockBackend(): HostBackend {
   const queueItem = (sessionId: string, text: string, attachments: any[] = [], state: 'queued' | 'failed' = 'queued', error?: string) => ({ id: `queue-${++sequence}`, sessionId, text, attachments: structuredClone(attachments), createdAt: Date.now(), state, error })
   let state: any = { model: { provider: 'mock', id: 'model-1', name: 'Mock Model', reasoning: true }, thinkingLevel: 'medium', availableThinkingLevels: ['off', 'low', 'medium', 'high'] }
   let hiddenModelIds: string[] = []
-  let sidebarSessionPreferences = { pinnedSessionIds: [] as string[], archivedSessionIds: [] as string[] }
+  let sidebarSessionPreferences: SidebarSessionPreferences = { pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: [] }
   const loginOwners = new Map<string, string>()
   // session-1 carries full usage; sessions created by newSession have no usage data yet.
   const fullStats = (sessionId: string) => ({ sessionId, tokens: { input: 100, output: 50, cacheRead: 200, cacheWrite: 10, total: 360 }, cost: 0.0123, contextUsage: { tokens: 9000, contextWindow: 262144, percent: 3.4 }, model: { provider: 'mock', id: 'model-1', name: 'Mock Model' } })
   const agent: any = { agentId: 'agent-1', runId: 'run-1', name: 'builder', role: 'general-purpose', title: 'Mock build', task: 'Mock task', state: 'running', depth: 1, createdAt: 1, cost: 0, turns: 1, outputCount: 0 }
+  const agentLogs: any[] = []
   let worktree: any = { agentId: agent.agentId, branch: 'pipiui/mock', path: '/tmp/pipiui-mock', lifecycle: 'pendingReview', merge: 'ready', discard: 'ready' }
   const terminals = new Map<string, { cwd: string; input: string }>()
   const requireSession = (id: string) => { if (!history.has(id)) throw new Error(`unknown session ${id}`) }
@@ -63,17 +109,21 @@ function createContractMockBackend(): HostBackend {
           sessions.push(session); history.set(session.id, []); queues.set(session.id, []); return session
         }
         case 'resumeSession': { const session = sessions.find(item => item.id === params[0]); if (!session) throw new Error('unknown session'); return session }
+        case 'renameSession': { const session = sessions.find(item => item.id === params[0]); if (!session) throw new Error('unknown session'); session.name = params[1] as string; session.updatedAt = Date.now(); return { ...session } }
         case 'deleteSession': sessions = sessions.filter(item => item.id !== params[0]); history.delete(params[0] as string); queues.delete(params[0] as string); activeSessions.delete(params[0] as string); return
+        case 'moveSession': { const session = sessions.find(item => item.id === params[0]); if (!session) throw new Error('unknown session'); session.projectId = params[1] as string; return { ...session } }
         case 'getSessionHistory': requireSession(params[0] as string); return history.get(params[0] as string)
         case 'getSessionLease': return { sessionId: params[0], writable: true }
         case 'forceTakeoverSessionLease': return { sessionId: params[0], writable: true }
         case 'sendPrompt': {
           const [sessionId, prompt] = params as [string, string]; requireSession(sessionId)
           emit('stream', { type: 'status', sessionId, status: 'started' })
-          emit('agents', { type: 'agent_log', agentId: agent.agentId, itemType: 'text', text: `Prompt received: ${prompt}` })
+          const log = { type: 'agent_log', sessionId, agentId: agent.agentId, runId: agent.runId, itemType: 'text', text: `Prompt received: ${prompt}` }
+          agentLogs.push(log)
+          emit('agents', log)
           emit('stream', { type: 'thinking', sessionId, contentIndex: 0, delta: 'thinking' })
           emit('stream', { type: 'text', sessionId, contentIndex: 0, delta: `Echo: ${prompt}` })
-          emit('stream', { type: 'tool_call', sessionId, toolCallId: 'tool-1', name: 'mock' })
+          emit('stream', { type: 'tool_call', sessionId, contentIndex: 1, toolCallId: 'tool-1', name: 'mock' })
           emit('stream', { type: 'tool_result', sessionId, toolCallId: 'tool-1', content: 'ok' })
           emit('stream', { type: 'status', sessionId, status: 'settled' }); emit('session_stats', { type: 'snapshot', sessionId, stats: fullStats(sessionId) }); return
         }
@@ -109,7 +159,7 @@ function createContractMockBackend(): HostBackend {
         case 'setSidebarSessionPreferences': {
           const value = params[0] as typeof sidebarSessionPreferences
           const archived = new Set(value.archivedSessionIds)
-          sidebarSessionPreferences = { pinnedSessionIds: [...new Set(value.pinnedSessionIds)].filter(id => !archived.has(id)), archivedSessionIds: [...archived] }
+          sidebarSessionPreferences = { pinnedSessionIds: [...new Set(value.pinnedSessionIds)].filter(id => !archived.has(id)), archivedSessionIds: [...archived], orderedSessionIds: [...new Set(value.orderedSessionIds)], ...(value.sessionOrderVersion === 2 ? { sessionOrderVersion: 2 as const } : {}) }
           return structuredClone(sidebarSessionPreferences)
         }
         case 'authProviders': return [{ id: 'mock-provider', name: 'Mock Provider', authTypes: ['api_key'], authenticated: true, authType: 'api_key' }]
@@ -132,6 +182,12 @@ function createContractMockBackend(): HostBackend {
             ? { provider: 'deepseek', accountLabel: '账户余额', balance: { amount: 88, currency: 'CNY' }, windows: [] }
             : null
         case 'listAgents': return [agent]
+        case 'getAgentLogs': {
+          const [agentId, sessionId, runId] = params as [string, string, string]
+          return agentLogs
+            .filter(log => log.agentId === agentId && log.sessionId === sessionId && log.runId === runId)
+            .map(({ type: _type, sessionId: _sessionId, agentId: _agentId, runId: _runId, ...entry }) => entry)
+        }
         case 'abortAgent': agent.state = 'aborted'; emit('agents', { type: 'agent', agent: { ...agent } }); return
         case 'resolveAgent': agent.state = 'ok'; emit('agents', { type: 'agent', agent: { ...agent } }); return
         case 'checkAgent': return agent
@@ -174,11 +230,15 @@ function contract(name: string, factory: Factory, expectedCapabilities: Record<s
       expect(await host.setProjectPaths(['/tmp/pipiui'])).toEqual(['/tmp/pipiui'])
       const addedProject = await host.addProject('/tmp/contract-added')
       expect((await host.listProjects()).map(item => item.path)).toContain('/tmp/contract-added')
-      await host.removeProject(addedProject.id)
-      expect((await host.listProjects()).map(item => item.path)).not.toContain('/tmp/contract-added')
       const [project] = await host.listProjects()
       const session = await host.newSession(project.id, 'Contract')
       expect((await host.listSessions(project.id)).map(item => item.id)).toContain(session.id)
+      expect(await host.renameSession(session.id, 'Renamed contract')).toMatchObject({ id: session.id, name: 'Renamed contract' })
+      expect((await host.listSessions(project.id)).find(item => item.id === session.id)?.name).toBe('Renamed contract')
+      expect(await host.moveSession(session.id, addedProject.id)).toMatchObject({ id: session.id, projectId: addedProject.id })
+      expect((await host.listSessions(addedProject.id)).map(item => item.id)).toContain(session.id)
+      await host.removeProject(addedProject.id)
+      expect((await host.listProjects()).map(item => item.path)).not.toContain('/tmp/contract-added')
       expect(await host.resumeSession(session.id)).toMatchObject({ id: session.id })
       expect(await host.getSessionHistory(session.id)).toEqual([])
       expect(await host.capabilities()).toMatchObject(expectedCapabilities)
@@ -188,9 +248,9 @@ function contract(name: string, factory: Factory, expectedCapabilities: Record<s
       expect(await host.getHiddenModelIds()).toEqual([])
       expect(await host.setHiddenModelIds(['openai/model-1', 'anthropic/model-2', 'openai/model-1'])).toEqual(['anthropic/model-2', 'openai/model-1'])
       expect(await host.getHiddenModelIds()).toEqual(['anthropic/model-2', 'openai/model-1'])
-      expect(await host.getSidebarSessionPreferences?.()).toEqual({ pinnedSessionIds: [], archivedSessionIds: [] })
-      expect(await host.setSidebarSessionPreferences?.({ pinnedSessionIds: ['session-a', 'session-b'], archivedSessionIds: ['session-b'] })).toEqual({ pinnedSessionIds: ['session-a'], archivedSessionIds: ['session-b'] })
-      expect(await host.getSidebarSessionPreferences?.()).toEqual({ pinnedSessionIds: ['session-a'], archivedSessionIds: ['session-b'] })
+      expect(await host.getSidebarSessionPreferences?.()).toEqual({ pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: [] })
+      expect(await host.setSidebarSessionPreferences?.({ pinnedSessionIds: ['session-a', 'session-b'], archivedSessionIds: ['session-b'], orderedSessionIds: ['session-b', 'session-a'], sessionOrderVersion: 2 })).toEqual({ pinnedSessionIds: ['session-a'], archivedSessionIds: ['session-b'], orderedSessionIds: ['session-b', 'session-a'], sessionOrderVersion: 2 })
+      expect(await host.getSidebarSessionPreferences?.()).toEqual({ pinnedSessionIds: ['session-a'], archivedSessionIds: ['session-b'], orderedSessionIds: ['session-b', 'session-a'], sessionOrderVersion: 2 })
       expect(await host.listAgents()).toEqual([expect.objectContaining({ agentId: 'agent-1', depth: 1, title: 'Mock build', role: 'general-purpose', createdAt: 1 })])
       expect((await host.checkAgent('agent-1')).state).toBe('running')
       expect(await host.getWorktreeStatus('agent-1')).toMatchObject({ lifecycle: 'pendingReview', merge: 'ready', discard: 'ready' })
@@ -262,10 +322,12 @@ function contract(name: string, factory: Factory, expectedCapabilities: Record<s
       const stream: any[] = []
       const agents: any[] = []
       const logs: any[] = []
+      const wrongRunLogs: any[] = []
       const off = [
         host.subscribeStream(session.id, event => stream.push(event)),
         host.subscribeAgents(event => agents.push(event)),
-        host.subscribeAgentLog('agent-1', event => logs.push(event))
+        host.subscribeAgentLog('agent-1', event => logs.push(event), session.id, 'run-1'),
+        host.subscribeAgentLog('agent-1', event => wrongRunLogs.push(event), session.id, 'wrong-run')
       ]
       await host.queueFollowUp(session.id, 'later')
       await host.sendPrompt(session.id, 'hello')
@@ -273,9 +335,11 @@ function contract(name: string, factory: Factory, expectedCapabilities: Record<s
       await new Promise(resolve => setTimeout(resolve, 10))
       off.forEach(stop => stop())
       expect(stream.map(event => event.type)).toEqual(expect.arrayContaining(['status', 'thinking', 'text', 'tool_call', 'tool_result']))
+      expect(stream.find(event => event.type === 'tool_call')).toMatchObject({ contentIndex: 1, toolCallId: 'tool-1', name: 'mock' })
       expect(stream.some(event => event.type === 'status' && event.pendingFollowUps?.includes('later'))).toBe(true)
       expect(agents.some(event => event.type === 'agent' && event.agent.state === 'aborted')).toBe(true)
-      expect(logs[0]).toMatchObject({ itemType: 'text', text: 'Prompt received: hello' })
+      expect(logs[0]).toMatchObject({ sessionId: session.id, agentId: 'agent-1', runId: 'run-1', itemType: 'text', text: 'Prompt received: hello' })
+      expect(wrongRunLogs).toEqual([])
     })
 
     it('round-trips queue commands and queue_update snapshots while preserving legacy sendPrompt', async () => {
@@ -356,6 +420,23 @@ async function wsFactory(): Promise<{ host: PipiHostAPI; close(): Promise<void> 
 contract('IPC transport', ipcFactory)
 contract('WebSocket transport', wsFactory, { computerUse: false, revealInFinder: false, terminal: true, browser: false })
 
+describe('agent log cache identity contract', () => {
+  it('serializes the exact session, agent, and run over IPC', async () => {
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: [] }
+      },
+      on: () => undefined,
+      removeListener: () => undefined
+    }
+    const host = createIpcHost(ipc)
+    await expect(host.getAgentLogs('shared', 'session-exact', 'run-exact')).resolves.toEqual([])
+    expect(calls).toEqual([{ method: 'getAgentLogs', params: ['shared', 'session-exact', 'run-exact'] }])
+  })
+})
+
 describe('desktop document host extension', () => {
   it('exposes only the opted-in local opener and preserves structured error codes', async () => {
     const calls: Array<{ method: string; params: unknown[] }> = []
@@ -418,5 +499,25 @@ describe('browser transport extension', () => {
       { method: 'browserSetViewBounds', params: ['session-a', { x: 1, y: 2, width: 3, height: 4, visible: true }] }
     ]))
     unsubscribe()
+  })
+})
+
+describe('Electron-native project directory picker extension', () => {
+  it('is exposed only when the preload opts into the native picker', async () => {
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: '/Users/demo/project' }
+      },
+      on: () => undefined,
+      removeListener: () => undefined
+    }
+
+    expect(createIpcHost(ipc).pickProjectDirectory).toBeUndefined()
+    const picker = createIpcHost(ipc, undefined, { projectDirectoryPicker: true }).pickProjectDirectory
+    if (!picker) throw new Error('project directory picker unavailable')
+    await expect(picker()).resolves.toBe('/Users/demo/project')
+    expect(calls).toEqual([{ method: 'pickProjectDirectory', params: [] }])
   })
 })

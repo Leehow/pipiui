@@ -49,6 +49,11 @@ async function linkRuntimePackages(directory) {
  */
 async function prepareHooksModule(directory) {
   await cp(sourceSubagentDirectory, join(directory, "subagent"), { recursive: true });
+  await cp(
+    join(sourceSubagentDirectory, "../packages/computer-agent"),
+    join(directory, "packages/computer-agent"),
+    { recursive: true },
+  );
   await linkRuntimePackages(directory);
 
   const indexPath = join(directory, "subagent/index.ts");
@@ -93,8 +98,12 @@ export const __vanishedSettleHooks = {
 	NO_PID_VANISH_MS,
 	STALL_RENOTIFY_MAX,
 	STALL_RENOTIFY_INTERVAL_MS,
+	STALL_WATCHDOG_INTERVAL_MS,
 	INTERRUPTED_NUDGE_SECS,
-	HEARTBEAT_INTERVAL_MS,
+	CHECKIN_FIRST_MS,
+	CHECKIN_SECOND_MS,
+	CHECKIN_REST_MS,
+	nextCheckinAt,
 	getReports(): Record<string, unknown>[] {
 		const g = globalThis as typeof globalThis & { __pipiuiReports?: Record<string, unknown>[] };
 		return g.__pipiuiReports ?? [];
@@ -532,8 +541,8 @@ process.stdout.write(JSON.stringify({ stalled, finalizing, abortFinalizing, ok, 
   }
 });
 
-test("heartbeat interval is configurable and suppresses unchanged state", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pipiui-heartbeat-dedupe-"));
+test("long-running check-in wakes the boss at 10m then 30m with an activity snapshot", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pipiui-checkin-"));
   try {
     await prepareHooksModule(directory);
 
@@ -561,70 +570,83 @@ const pi = {
 };
 registerSubagent(pi);
 h.reset();
-const agentId = "heartbeat-dedupe";
-const runId = h.jobUpsertRunning(agentId, "probe", "wait", "t");
+const agentId = "checkin-active";
+const runId = h.jobUpsertRunning(agentId, "probe", "package the electron app", "打包 Electron App");
+const job = h.jobRegistry.get(agentId);
+job.activity = "editing electron.vite.config.ts";
+job.turns = 12;
+job.cost = 0.41;
 const handle = {
   runId,
   controller: new AbortController(),
   name: "probe",
-  task: "wait",
-  title: "t",
+  task: "package the electron app",
+  title: "打包 Electron App",
   lastActivityAt: now,
   lastStallNotifyAt: 0,
   stallNotifyCount: 0,
-  startedAt: now - 1_000,
+  startedAt: now,
   finalizing: false,
   pid: process.pid,
 };
 h.runningAgents.set(agentId, handle);
-const heartbeat = intervals.find((interval) => interval.ms === h.HEARTBEAT_INTERVAL_MS);
-if (!heartbeat) throw new Error("heartbeat interval was not registered");
+const watchdog = intervals.find((interval) => interval.ms === h.STALL_WATCHDOG_INTERVAL_MS);
+if (!watchdog) throw new Error("stall watchdog was not registered");
 const flush = async () => {
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
 };
-heartbeat.callback();
+watchdog.callback();
 await flush();
-const first = messages.length;
-now += h.HEARTBEAT_INTERVAL_MS;
-handle.lastActivityAt = now; // worker activity keeps the semantic state at running
-heartbeat.callback();
-await flush();
-const unchanged = messages.length;
-h.runningAgents.clear();
-heartbeat.callback(); // empty path must reset the dedupe payload
-await flush();
+const beforeDue = messages.length;
+now = handle.startedAt + h.CHECKIN_FIRST_MS;
 handle.lastActivityAt = now;
-h.runningAgents.set(agentId, handle);
-heartbeat.callback();
+watchdog.callback();
 await flush();
-const afterEmptyReset = messages.length;
-handle.finalizing = true;
-now += 1;
-heartbeat.callback();
+const first = messages[0]?.text ?? "";
+const afterFirst = messages.length;
+watchdog.callback();
 await flush();
-const finalizing = messages.length;
+const afterRepeat = messages.length;
+now = handle.startedAt + h.nextCheckinAt(handle.startedAt, 1) - handle.startedAt;
+handle.lastActivityAt = now;
+watchdog.callback();
+await flush();
+const second = messages[1]?.text ?? "";
 process.stdout.write(JSON.stringify({
-  intervalMs: heartbeat.ms,
+  firstMs: h.CHECKIN_FIRST_MS,
+  secondAt: h.nextCheckinAt(0, 1),
+  restAt: h.nextCheckinAt(0, 2),
+  beforeDue,
+  afterFirst,
+  afterRepeat,
+  afterSecond: messages.length,
   first,
-  unchanged,
-  afterEmptyReset,
-  finalizing,
+  second,
   allFollowUp: messages.every((message) => message.deliverAs === "followUp"),
 }));
 `,
     );
 
-    assert.equal(out.intervalMs, 15 * 60 * 1000);
-    assert.equal(out.first, 1);
-    assert.equal(out.unchanged, 1, "elapsed/idle changes alone must not create a follow-up");
-    assert.equal(out.afterEmptyReset, 2, "the next worker heartbeat must deliver after an empty interval");
-    assert.equal(out.finalizing, 3, "a state transition must still deliver");
+    assert.equal(out.firstMs, 10 * 60 * 1000);
+    assert.equal(out.secondAt, 30 * 60 * 1000);
+    assert.equal(out.restAt, 60 * 60 * 1000);
+    assert.equal(out.beforeDue, 0, "must not wake the boss before the first check-in");
+    assert.equal(out.afterFirst, 1);
+    assert.equal(out.afterRepeat, 1, "the same check-in must not fire twice");
+    assert.equal(out.afterSecond, 2, "the stretched second check-in must still fire while running");
+    assert.match(out.first, /\[subagent-heartbeat\] outstanding=1 vanished=0 stalled=0/);
+    assert.match(out.first, /打包 Electron App/);
+    assert.match(out.first, /turns=12/);
+    assert.match(out.first, /cost=\$0\.4100|cost=\$0\.41/);
+    assert.match(out.first, /last=editing electron\.vite\.config\.ts/);
+    assert.match(out.first, /wall-clock check-in|still producing output/);
+    assert.match(out.second, /\[subagent-heartbeat\]/);
     assert.equal(out.allFollowUp, true);
 
-    const override = await runProbe(
+    const stalled = await runProbe(
       directory,
-      `process.env.PIPIUI_HEARTBEAT_SECS = "17";
+      `delete process.env.PIPIUI_HEARTBEAT_SECS;
 const intervals = [];
 globalThis.setInterval = (callback, ms) => {
   const handle = { unref() {} };
@@ -633,17 +655,60 @@ globalThis.setInterval = (callback, ms) => {
 };
 globalThis.clearInterval = () => {};
 const { default: registerSubagent, __vanishedSettleHooks: h } = await import("./subagent/index.ts");
-const pi = { on() {}, registerTool() {}, registerCommand() {}, async sendUserMessage() {} };
+let now = 2_000_000;
+Date.now = () => now;
+const messages = [];
+const pi = {
+  on() {},
+  registerTool() {},
+  registerCommand() {},
+  async sendUserMessage(text) { messages.push(text); },
+};
 registerSubagent(pi);
-const heartbeat = intervals.find((interval) => interval.ms === h.HEARTBEAT_INTERVAL_MS);
+h.reset();
+const agentId = "checkin-stalled";
+const runId = h.jobUpsertRunning(agentId, "probe", "wait", "卡住");
+const handle = {
+  runId,
+  controller: new AbortController(),
+  name: "probe",
+  task: "wait",
+  title: "卡住",
+  lastActivityAt: now - 130_000,
+  lastStallNotifyAt: 0,
+  stallNotifyCount: 0,
+  startedAt: now - h.CHECKIN_FIRST_MS,
+  finalizing: false,
+  pid: process.pid,
+};
+h.runningAgents.set(agentId, handle);
+const watchdog = intervals.find((interval) => interval.ms === h.STALL_WATCHDOG_INTERVAL_MS);
+watchdog.callback();
+await new Promise((resolve) => setImmediate(resolve));
+await new Promise((resolve) => setImmediate(resolve));
 process.stdout.write(JSON.stringify({
-  intervalMs: heartbeat?.ms ?? null,
-  configuredMs: h.HEARTBEAT_INTERVAL_MS,
+  texts: messages,
 }));
 `,
     );
-    assert.equal(override.configuredMs, 17 * 1000);
-    assert.equal(override.intervalMs, 17 * 1000);
+    assert.equal(stalled.texts.length, 1);
+    assert.match(stalled.texts[0], /\[subagent-stalled\]/);
+    assert.doesNotMatch(stalled.texts[0], /wall-clock check-in|still producing output/);
+
+    const override = await runProbe(
+      directory,
+      `process.env.PIPIUI_HEARTBEAT_SECS = "17";
+const { __vanishedSettleHooks: h } = await import("./subagent/index.ts");
+process.stdout.write(JSON.stringify({
+  firstMs: h.CHECKIN_FIRST_MS,
+  secondAt: h.nextCheckinAt(0, 1),
+  restAt: h.nextCheckinAt(0, 2),
+}));
+`,
+    );
+    assert.equal(override.firstMs, 17 * 1000);
+    assert.equal(override.secondAt, 17 * 1000 + 34 * 1000);
+    assert.equal(override.restAt, 17 * 1000 + 34 * 1000 + 51 * 1000);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -39,7 +39,7 @@ export {
 const MAX_WIRE_PAYLOAD_BYTES = 8 * 1024 * 1024;
 const HOST_METHODS = new Set<HostMethod>([
   "listProjects", "getProjectPaths", "setProjectPaths", "addProject", "removeProject", "listSessions", "listDocuments", "readDocument",
-  "newSession", "resumeSession", "deleteSession", "getSessionHistory",
+  "newSession", "resumeSession", "renameSession", "deleteSession", "moveSession", "getSessionHistory",
   "getSessionLease", "forceTakeoverSessionLease", "sendPrompt", "listQueue",
   "enqueueMessage", "updateQueuedMessage", "removeQueuedMessage", "promoteQueuedMessage",
   "steerQueuedMessage", "retryQueuedMessage", "stop", "queueFollowUp", "compact", "listModels", "getModelState", "setModel",

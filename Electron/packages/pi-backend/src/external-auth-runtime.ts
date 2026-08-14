@@ -7,7 +7,7 @@ import type { AuthType } from "@pipi/host-api";
 import type { AuthInteractionLike, AuthRuntimeLike } from "./provider-auth.js";
 
 const execFileAsync = promisify(execFile);
-export interface ExternalAuthRuntimeOptions { helperPath: string; piPath: string; agentDir: string; env?: NodeJS.ProcessEnv; nodePath?: string }
+export interface ExternalAuthRuntimeOptions { helperPath: string; piPath: string; agentDir: string; sessionsRoot?: string; enforceProfile?: boolean; env?: NodeJS.ProcessEnv; nodePath?: string }
 
 function parseDotEnv(source: string): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
@@ -21,10 +21,10 @@ function parseDotEnv(source: string): NodeJS.ProcessEnv {
   return result;
 }
 
-export async function modelRuntimeEnvironment(agentDir: string, piPath: string, base: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv> {
+export async function modelRuntimeEnvironment(agentDir: string, piPath: string, base: NodeJS.ProcessEnv, sessionsRoot = join(agentDir, "sessions"), enforceProfile = false): Promise<NodeJS.ProcessEnv> {
   let overlay: NodeJS.ProcessEnv = {};
   try { overlay = parseDotEnv(await readFile(join(agentDir, ".env"), "utf8")); } catch { /* optional */ }
-  return { ...base, ...overlay, PATH: [dirname(piPath), "/opt/homebrew/bin", "/usr/local/bin", base.PATH].filter(Boolean).join(delimiter), PIPIUI_PI_PATH: piPath };
+  return { ...base, ...overlay, PATH: [dirname(piPath), "/opt/homebrew/bin", "/usr/local/bin", base.PATH].filter(Boolean).join(delimiter), PIPIUI_PI_PATH: piPath, ...(enforceProfile ? { PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: sessionsRoot } : {}) };
 }
 
 async function resolveNode(explicit: string | undefined, env: NodeJS.ProcessEnv): Promise<string> {
@@ -42,7 +42,7 @@ async function resolveNode(explicit: string | undefined, env: NodeJS.ProcessEnv)
 export class ExternalAuthRuntime implements AuthRuntimeLike {
   constructor(private readonly options: ExternalAuthRuntimeOptions) {}
   private async command(command: string, ...args: string[]): Promise<any> {
-    const env = await modelRuntimeEnvironment(this.options.agentDir, this.options.piPath, this.options.env ?? process.env);
+    const env = await modelRuntimeEnvironment(this.options.agentDir, this.options.piPath, this.options.env ?? process.env, this.options.sessionsRoot, this.options.enforceProfile);
     const node = await resolveNode(this.options.nodePath, env);
     try {
       const { stdout } = await execFileAsync(node, [this.options.helperPath, command, ...args], { env, maxBuffer: 4 * 1024 * 1024 });
@@ -55,7 +55,7 @@ export class ExternalAuthRuntime implements AuthRuntimeLike {
   async getAvailable() { return (await this.command("list-models")).models; }
   async logout(providerId: string) { await this.command("logout", providerId); }
   async login(providerId: string, authType: AuthType, interaction: AuthInteractionLike): Promise<unknown> {
-    const env = await modelRuntimeEnvironment(this.options.agentDir, this.options.piPath, this.options.env ?? process.env);
+    const env = await modelRuntimeEnvironment(this.options.agentDir, this.options.piPath, this.options.env ?? process.env, this.options.sessionsRoot, this.options.enforceProfile);
     const node = await resolveNode(this.options.nodePath, env);
     const child = spawn(node, [this.options.helperPath, "login-json", providerId, authType], { env, stdio: ["pipe", "pipe", "pipe"] });
     const abort = () => child.kill();

@@ -1,13 +1,11 @@
-import { forwardRef, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { VirtuosoHandle } from 'react-virtuoso'
 import { SubagentPanel } from './SubagentPanel'
 import { DocumentPanel } from './DocumentPanel'
 import { TerminalPanel } from './TerminalPanel'
 import { BrowserPanel } from './BrowserPanel'
-import { ActivityCard as CollapsibleActivityCard } from './ActivityCard'
-import { AssistantTranscriptContent, type TranscriptTool } from './AssistantTranscriptContent'
-import { documentKindForName } from '@pipi/host-api'
-import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, Project, PromptAttachment, Session, SessionLease, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
+import { documentKindForName, thinkingLevelsForModel } from '@pipi/host-api'
+import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, Project, PromptAttachment, Session, SessionLease, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
 import { ComputerUsePanel } from './ComputerUsePanel'
 import { RemoteConnectionPanel } from './RemoteConnectionPanel'
@@ -22,32 +20,29 @@ import globeIcon from './sf-icons/globe.png'
 import docTextIcon from './sf-icons/doc-text.png'
 import terminalIcon from './sf-icons/terminal.png'
 import { ThinkingChip } from './thinking-chip'
-import { WaitingPlaceholder, type WaitingPhase } from './WaitingPlaceholder'
+import type { WaitingPhase } from './WaitingPlaceholder'
 import { StreamEventCoalescer } from './StreamEventCoalescer'
-import { QuotaPill } from './QuotaPill'
+import { QuotaPill, QWEN_TOKEN_PLAN_LOGIN_URL } from './QuotaPill'
 import { BalancePill } from './BalancePill'
 import { SessionStatsPill } from './SessionStatsPill'
-import { PromptRail, useActivePromptId } from './PromptRail'
 import { MessageQueue } from './MessageQueue'
 import { useSessionQueue } from './useSessionQueue'
-import { UserMessageBubble } from './UserMessageBubble'
-import { MessageActionBar } from './MessageActionBar'
-import { buildRailPrompts } from './prompt-rail'
-import { parseSubagentNotice } from './subagent-notice'
+import { InlineSessionTitleEditor } from './InlineSessionTitleEditor'
 export { parseSubagentNotice } from './subagent-notice'
 import { compactionNotice } from './compaction-notice'
 import { filterSlashCommands, parseSlashInvocation, slashCommandByName, slashPaletteQuery, type SlashCommandDef } from './slash-commands'
 import { useModelVisibility, type ModelVisibilityController } from './useModelVisibility'
-import { fileToPromptAttachment, imageFilesFromClipboard, validateAttachment } from './attachments'
+import { chatImagesFromAttachments, fileToPromptAttachment, imageFilesFromClipboard, validateAttachment } from './attachments'
+import { LiveSubagentBindingProvider } from './LiveSubagentBinding'
+import { Transcript } from './Transcript'
+import { applyStreamEvent, finishStreamingMessage, historyMessages, type ChatMessage } from './transcript-model'
 import './app.css'
 import './message-actions.css'
 import './subagent.css'
 
-type ToolCard = TranscriptTool
-export type ChatMessage = { id: string; role: 'user' | 'assistant' | 'tool'; content: string; thinking?: string; tools?: ToolCard[]; streaming?: boolean; timestamp?: number }
 type PanelTab = 'Subagents' | 'Browser' | 'Document' | 'Terminal'
 type PaneWidths = { sidebar: number; tools: number; sidebarCollapsed: boolean; toolsCollapsed: boolean }
-type SidebarPreferences = { expandedIds: string[]; pinnedSessionIds: string[]; archivedSessionIds: string[]; visibleLimit: number }
+type SidebarPreferences = { expandedIds: string[]; pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; visibleLimit: number }
 type SessionWithSidebarMetadata = Session & { provider?: unknown; modelId?: unknown; modelRef?: unknown; model?: unknown }
 type RuntimeSessionLease = SessionLease & { canWrite?: unknown; ownerLabel?: unknown }
 
@@ -81,6 +76,8 @@ const storageKey = 'pipiui:eui-pane-widths'
 const sidebarPreferencePrefix = 'pipiui:eui:sidebar:v1'
 const sidebarSemanticMigrationKey = 'pipiui:eui:sidebar-semantic-host:v1'
 export const SIDEBAR_PROJECT_PAGE_SIZE = 6
+export const ARCHIVE_RETENTION_MS = 24 * 60 * 60 * 1000
+const ARCHIVE_CLEANUP_RETRY_MS = 60 * 1000
 /** Mock/demo host only: survives browser-demo reloads because the demo has no pi session to own model state. The real host never reads/writes this key. */
 export const DEMO_MODEL_STORAGE_KEY = 'pipiui.demoModel'
 /** Demo-only per-session model map (sessionId → {provider, id}); the real host binds models per session via JSONL `model_change`, this key only survives browser-demo reloads. */
@@ -101,15 +98,32 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
 
+function timestampRecord(value: unknown): Record<string, number> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, number] =>
+    Boolean(entry[0]) && typeof entry[1] === 'number' && Number.isFinite(entry[1]) && entry[1] >= 0
+  ))
+}
+
+/** Keep only live archive keys; legacy archives start a fresh retention window. */
+export function normalizeArchiveTimestamps(archivedSessionIds: readonly string[], timestamps: Record<string, number> | undefined, now = Date.now()): Record<string, number> {
+  const source = timestampRecord(timestamps)
+  return Object.fromEntries(archivedSessionIds.map(id => [id, source[id] ?? now]))
+}
+
+export function expiredArchivedSessionIds(archivedSessionIds: readonly string[], timestamps: Record<string, number>, now = Date.now()): string[] {
+  return archivedSessionIds.filter(id => now - timestamps[id] >= ARCHIVE_RETENTION_MS)
+}
+
 function readSidebarPreferences(key: string): SidebarPreferences | null {
   try {
     const value: unknown = JSON.parse(localStorage.getItem(key) ?? 'null')
     if (!value || typeof value !== 'object') return null
-    const candidate = value as { expandedIds?: unknown; pinnedSessionIds?: unknown; archivedSessionIds?: unknown; visibleLimit?: unknown }
+    const candidate = value as { expandedIds?: unknown; pinnedSessionIds?: unknown; archivedSessionIds?: unknown; archivedSessionTimestamps?: unknown; visibleLimit?: unknown }
     const visibleLimit = typeof candidate.visibleLimit === 'number' && Number.isFinite(candidate.visibleLimit)
       ? Math.max(1, Math.floor(candidate.visibleLimit))
       : SIDEBAR_PROJECT_PAGE_SIZE
-    return { expandedIds: stringArray(candidate.expandedIds), pinnedSessionIds: stringArray(candidate.pinnedSessionIds), archivedSessionIds: stringArray(candidate.archivedSessionIds), visibleLimit }
+    return { expandedIds: stringArray(candidate.expandedIds), pinnedSessionIds: stringArray(candidate.pinnedSessionIds), archivedSessionIds: stringArray(candidate.archivedSessionIds), archivedSessionTimestamps: timestampRecord(candidate.archivedSessionTimestamps), visibleLimit }
   } catch { return null }
 }
 
@@ -122,7 +136,16 @@ function metadataString(value: unknown): string | undefined {
 }
 
 /** Read optional future session metadata without widening the host-api v2 contract. */
-export function sidebarModelForSession(session: Session, selectedSessionId: string, currentModel: Model | null): { provider: string; modelId?: string } {
+export function sidebarModelForSession(session: Session, selectedSessionId: string, currentModel: Model | null, knownModels?: Readonly<Record<string, { provider: string; modelId?: string }>>): { provider: string; modelId?: string } {
+  // The selected row mirrors the live composer model state: a mid-session model
+  // switch updates modelState instantly while the sessions metadata (listSessions
+  // snapshot / JSONL model_change) lags, so the live state must win here or the
+  // sidebar keeps advertising the pre-switch model.
+  if (session.id === selectedSessionId && currentModel) {
+    return { provider: currentModel.provider, modelId: currentModel.id }
+  }
+  const known = knownModels?.[session.id]
+  if (known?.provider) return { provider: known.provider, modelId: known.modelId }
   const metadata = session as SessionWithSidebarMetadata
   let provider = metadataString(metadata.provider)
   let modelId = metadataString(metadata.modelId)
@@ -140,11 +163,6 @@ export function sidebarModelForSession(session: Session, selectedSessionId: stri
       modelId ??= modelRef.slice(slash + 1) || undefined
     } else modelId ??= modelRef
   }
-  // The selected live session is the only one for which App has a verified current model.
-  if (session.id === selectedSessionId && currentModel) {
-    provider ??= currentModel.provider
-    modelId ??= currentModel.id
-  }
   return { provider: provider ?? '', modelId }
 }
 
@@ -154,17 +172,32 @@ function modelStateFromSession(session: Session | undefined, catalog: readonly M
   const ref = sidebarModelForSession(session, '', null)
   if (!ref.provider || !ref.modelId) return null
   const known = catalog.find(model => model.provider === ref.provider && model.id === ref.modelId)
-  const model: Model = known ?? { provider: ref.provider, id: ref.modelId, name: ref.modelId, reasoning: false }
+  const model: Model = known ?? { provider: ref.provider, id: ref.modelId, name: ref.modelId }
   return {
     model,
     thinkingLevel: 'off',
-    availableThinkingLevels: model.reasoning ? ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] : ['off']
+    availableThinkingLevels: thinkingLevelsForModel(model)
   }
 }
 
-/** Swift-style priority: main stream > session-bound subagents > terminal agent states > observed stream state > idle. */
+/** Replace provisional/cached session capability data once the authenticated catalog is ready. */
+function reconcileModelStateWithCatalog(state: ModelState, catalog: readonly Model[]): ModelState {
+  const known = catalog.find(model => model.provider === state.model.provider && model.id === state.model.id)
+  if (!known) return state
+  return {
+    ...state,
+    model: known,
+    availableThinkingLevels: thinkingLevelsForModel(known, state.availableThinkingLevels)
+  }
+}
+
+/** Swift-style priority: live main turn > session-bound subagents > terminal agent states > observed stream state > idle.
+ *  `observedStatus` is only live while that session's stream is subscribed (the
+ *  selected row). A leftover `running` from the last visit must not hide a
+ *  background subagent badge. */
 export function sidebarStatusForSession(sessionId: string, selectedSessionId: string, streaming: boolean, observedStatus: SessionStatus | undefined, agents: readonly AgentSummary[]): { status: SessionStatus; subagentCount?: number } {
-  if ((sessionId === selectedSessionId && streaming) || observedStatus === 'running') return { status: 'running' }
+  const selected = sessionId === selectedSessionId
+  if (selected && (streaming || observedStatus === 'running')) return { status: 'running' }
   const linked = agents.filter(agent => agent.sessionId === sessionId)
   const runningCount = linked.filter(agent => agent.state === 'running').length
   if (runningCount > 0) return { status: 'subagents-running', subagentCount: runningCount }
@@ -174,6 +207,51 @@ export function sidebarStatusForSession(sessionId: string, selectedSessionId: st
   if (observedStatus && observedStatus !== 'idle') return { status: observedStatus }
   if (linked.some(agent => agent.state === 'ok')) return { status: 'completed' }
   return { status: 'idle' }
+}
+
+/** Global sidebar snapshot keeps session identity; transcripts receive only the selected slice. */
+export function mergeAgentSummary(current: AgentSummary[], incoming: AgentSummary): AgentSummary[] {
+  const index = current.findIndex(agent => agent.agentId === incoming.agentId && (
+    incoming.sessionId ? agent.sessionId === incoming.sessionId : true
+  ))
+  const next = index < 0 ? incoming : { ...incoming, sessionId: incoming.sessionId ?? current[index]?.sessionId }
+  return index < 0
+    ? [...current, next]
+    : current.map((agent, candidate) => candidate === index ? next : agent)
+}
+
+/** Overlay live agent events on a listAgents snapshot so a stale/empty snapshot cannot drop a running row. */
+export function mergeAgentSnapshot(current: AgentSummary[], snapshot: readonly AgentSummary[]): AgentSummary[] {
+  return current.reduce((items, agent) => mergeAgentSummary(items, agent), snapshot.slice())
+}
+
+export function selectedSessionAgentSummaries(agents: readonly AgentSummary[], sessionId: string): AgentSummary[] {
+  return agents.filter(agent => agent.sessionId === sessionId)
+}
+
+type SidebarDropPlacement = 'before' | 'after'
+
+function movedIds(ids: string[], sourceId: string, targetId: string, placement: SidebarDropPlacement): string[] {
+  if (sourceId === targetId) return ids
+  const without = ids.filter(id => id !== sourceId)
+  const target = without.indexOf(targetId)
+  if (target < 0) return ids
+  without.splice(target + (placement === 'after' ? 1 : 0), 0, sourceId)
+  return without
+}
+
+/** Apply a small explicit-drag constraint without lifting its members above newer untouched sessions. */
+export function sessionsByActivityAndManualOrder<T extends Pick<Session, 'id' | 'updatedAt'>>(items: T[], orderedIds: readonly string[]): T[] {
+  const byActivity = [...items].sort((a, b) => b.updatedAt - a.updatedAt)
+  const itemIds = new Set(byActivity.map(item => item.id))
+  const manual = [...new Set(orderedIds)].filter(id => itemIds.has(id))
+  if (manual.length < 2) return byActivity
+  const participants = new Set(manual)
+  const insertAt = Math.min(...byActivity.flatMap((item, index) => participants.has(item.id) ? [index] : []))
+  const manualItems = manual.flatMap(id => byActivity.find(item => item.id === id) ?? [])
+  const rest = byActivity.filter(item => !participants.has(item.id))
+  rest.splice(insertAt, 0, ...manualItems)
+  return rest
 }
 
 function readWidths(): PaneWidths {
@@ -456,13 +534,13 @@ export function createMockHost(): PipiHostAPI {
     { provider: 'acme', id: 'mystery-1', name: 'Mystery One', reasoning: false, supportsImages: true }
   ]
   let hiddenModelIds: string[] = []
-  let sidebarSessionPreferences = { pinnedSessionIds: [] as string[], archivedSessionIds: [] as string[] }
+  let sidebarSessionPreferences: SidebarSessionPreferences = { pinnedSessionIds: [], archivedSessionIds: [], archivedSessionTimestamps: {}, orderedSessionIds: [], sessionOrderVersion: 2 }
   // Demo-only: restore the reload-persisted model when it is still in the catalog;
   // fall back to mockModels[0] otherwise (real host model state is owned by pi sessions).
   const savedDemoModel = readDemoModel()
   const restoredModel = savedDemoModel ? mockModels.find(model => model.provider === savedDemoModel.provider && model.id === savedDemoModel.id) : undefined
   const initialModel = restoredModel ?? mockModels[0]
-  let modelState: ModelState = { model: initialModel, thinkingLevel: 'medium', availableThinkingLevels: initialModel.reasoning ? ['off', 'low', 'medium', 'high'] : ['off'] }
+  let modelState: ModelState = { model: initialModel, thinkingLevel: 'medium', availableThinkingLevels: thinkingLevelsForModel(initialModel) }
   // Demo-only per-session context occupancy: switching sessions visibly moves
   // the context ring/window in the browser demo (the real host returns live
   // get_session_stats and rehydrates last-known from the token ledger).
@@ -506,7 +584,20 @@ export function createMockHost(): PipiHostAPI {
     listSessions: async projectId => sessions.filter(session => session.projectId === projectId),
     newSession: async (projectId, name = '新会话') => { const session = { id: crypto.randomUUID(), projectId, name, updatedAt: Date.now() }; sessions.unshift(session); history[session.id] = []; return session },
     resumeSession: async sessionId => sessions.find(session => session.id === sessionId)!,
+    renameSession: async (sessionId, name) => {
+      const index = sessions.findIndex(session => session.id === sessionId)
+      if (index < 0) throw new Error(`unknown session ${sessionId}`)
+      sessions[index] = { ...sessions[index], name, updatedAt: Date.now() }
+      emit(sessionId, { type: 'session_title', sessionId, title: name, source: 'manual' })
+      return sessions[index]
+    },
     deleteSession: async () => undefined,
+    moveSession: async (sessionId, targetProjectId) => {
+      const index = sessions.findIndex(session => session.id === sessionId)
+      if (index < 0) throw new Error(`unknown session ${sessionId}`)
+      sessions[index] = { ...sessions[index], projectId: targetProjectId }
+      return sessions[index]
+    },
     getSessionHistory: async sessionId => history[sessionId] ?? [],
     readDocument: async path => {
       const name = path.split('/').at(-1) ?? path
@@ -519,7 +610,7 @@ export function createMockHost(): PipiHostAPI {
     getSessionLease: async sessionId => ({ sessionId, writable: true }),
     forceTakeoverSessionLease: async sessionId => ({ sessionId, writable: true }),
     sendPrompt: async (sessionId, prompt, attachments) => {
-      const item = { id: crypto.randomUUID(), role: 'user' as const, content: prompt + (attachments?.length ? ` [${attachments.length} 张图片]` : ''), timestamp: Date.now() }
+      const item = { id: crypto.randomUUID(), role: 'user' as const, content: prompt, images: chatImagesFromAttachments(attachments), timestamp: Date.now() }
       ;(history[sessionId] ??= []).push(item)
       emit(sessionId, { type: 'status', sessionId, status: 'started' })
       emit(sessionId, { type: 'thinking', sessionId, contentIndex: 0, delta: '正在分析请求与当前项目结构…' })
@@ -553,7 +644,7 @@ export function createMockHost(): PipiHostAPI {
         const ref = session?.model
         if (ref) {
           const found = mockModels.find(model => model.provider === ref.provider && model.id === ref.modelId)
-          if (found) return { model: found, thinkingLevel: 'medium', availableThinkingLevels: found.reasoning ? ['off', 'low', 'medium', 'high'] : ['off'] }
+          if (found) return { model: found, thinkingLevel: 'medium', availableThinkingLevels: thinkingLevelsForModel(found) }
         }
       }
       return modelState
@@ -561,7 +652,7 @@ export function createMockHost(): PipiHostAPI {
     setModel: async (sessionId, provider, id) => {
       const found = mockModels.find(model => model.provider === provider && model.id === id)
       if (!found) throw new Error(`unknown model ${provider}/${id}`)
-      modelState = { ...modelState, model: found, availableThinkingLevels: found.reasoning ? ['off', 'low', 'medium', 'high'] : ['off'] }
+      modelState = { ...modelState, model: found, availableThinkingLevels: thinkingLevelsForModel(found) }
       // Session-scoped: keep the session's own model in sync so the sidebar row (and
       // future listSessions consumers) shows the same provider the chat uses.
       const target = sessions.find(session => session.id === sessionId)
@@ -596,18 +687,19 @@ export function createMockHost(): PipiHostAPI {
       hiddenModelIds = hiddenModelIds.filter(id => !id.startsWith(`${providerId}/`))
       if (modelState.model.provider === providerId) {
         const next = mockModels[0] ?? { provider: 'unknown', id: 'unknown', name: '无可用模型', reasoning: false }
-        modelState = { ...modelState, model: next, availableThinkingLevels: next.reasoning ? ['off', 'low', 'medium', 'high'] : ['off'] }
+        modelState = { ...modelState, model: next, availableThinkingLevels: thinkingLevelsForModel(next) }
       }
       return modelState
     },
     openExternal: async () => undefined,
     getHiddenModelIds: async () => [...hiddenModelIds],
     setHiddenModelIds: async ids => { hiddenModelIds = [...new Set(ids)].sort(); return [...hiddenModelIds] },
-    getSidebarSessionPreferences: async () => ({ pinnedSessionIds: [...sidebarSessionPreferences.pinnedSessionIds], archivedSessionIds: [...sidebarSessionPreferences.archivedSessionIds] }),
+    getSidebarSessionPreferences: async () => ({ pinnedSessionIds: [...sidebarSessionPreferences.pinnedSessionIds], archivedSessionIds: [...sidebarSessionPreferences.archivedSessionIds], archivedSessionTimestamps: { ...(sidebarSessionPreferences.archivedSessionTimestamps ?? {}) }, orderedSessionIds: [...sidebarSessionPreferences.orderedSessionIds], sessionOrderVersion: 2 }),
     setSidebarSessionPreferences: async preferences => {
       const archived = new Set(preferences.archivedSessionIds)
-      sidebarSessionPreferences = { pinnedSessionIds: [...new Set(preferences.pinnedSessionIds)].filter(id => !archived.has(id)), archivedSessionIds: [...archived] }
-      return { pinnedSessionIds: [...sidebarSessionPreferences.pinnedSessionIds], archivedSessionIds: [...sidebarSessionPreferences.archivedSessionIds] }
+      const archivedSessionTimestamps = Object.fromEntries(Object.entries(preferences.archivedSessionTimestamps ?? {}).filter(([id]) => archived.has(id)))
+      sidebarSessionPreferences = { pinnedSessionIds: [...new Set(preferences.pinnedSessionIds)].filter(id => !archived.has(id)), archivedSessionIds: [...archived], archivedSessionTimestamps, orderedSessionIds: [...new Set(preferences.orderedSessionIds)], sessionOrderVersion: 2 }
+      return { pinnedSessionIds: [...sidebarSessionPreferences.pinnedSessionIds], archivedSessionIds: [...sidebarSessionPreferences.archivedSessionIds], archivedSessionTimestamps: { ...archivedSessionTimestamps }, orderedSessionIds: [...sidebarSessionPreferences.orderedSessionIds], sessionOrderVersion: 2 }
     },
     getComputerUseState: async () => ({ enabled: computerUseEnabled }),
     setComputerUseEnabled: async enabled => { computerUseEnabled = enabled; return { enabled: computerUseEnabled } },
@@ -637,8 +729,9 @@ export function createMockHost(): PipiHostAPI {
     // subscribeAgentLog below is what populates the panel.
     getAgentLogs: async () => [],
     subscribeAgents: () => () => undefined,
-    subscribeAgentLog: (agentId, listener) => {
-      if (agentId !== 'research') return () => undefined
+    subscribeAgentLog: (agentId, listener, sessionId, runId) => {
+      const selected = mockAgents.find(agent => agent.agentId === agentId && agent.sessionId === sessionId && agent.runId === runId)
+      if (!selected || selected.agentId !== 'research') return () => undefined
       const timers: number[] = []
       // Stream cumulative log_delta snapshots (same contentIndex) so the demo shows one
       // progressively-updated row per entry — not a new line per chunk.
@@ -647,7 +740,7 @@ export function createMockHost(): PipiHostAPI {
         chunks.forEach((chunk, i) => {
           timers.push(window.setTimeout(() => {
             acc += chunk
-            listener({ type: 'agent_log', agentId, itemType, text: acc, name, contentIndex })
+            listener({ type: 'agent_log', sessionId, agentId, runId, itemType, text: acc, name, contentIndex })
           }, 300 * (i + 1)))
         })
       }
@@ -669,7 +762,7 @@ export function createMockHost(): PipiHostAPI {
   }
 }
 
-/** Hidden-inset macOS chrome only applies inside the Electron shell; the plain-browser server mode keeps zero titlebar padding. */
+/** Hidden-inset macOS chrome only applies inside the Electron shell. */
 export function isElectronChrome(): boolean {
   return typeof navigator !== 'undefined' && /Electron/.test(navigator.userAgent)
 }
@@ -718,6 +811,16 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [modelState, setModelState] = useState<ModelState | null>(null)
   const modelStatesBySessionRef = useRef(new Map<string, ModelState>())
+  const [sessionModels, setSessionModels] = useState<Record<string, { provider: string; modelId?: string }>>({})
+  const rememberSessionModel = (sessionId: string, model: Model) => {
+    if (!sessionId || !model.provider || !model.id) return
+    setSessionModels(current => {
+      const previous = current[sessionId]
+      if (previous?.provider === model.provider && previous.modelId === model.id) return current
+      return { ...current, [sessionId]: { provider: model.provider, modelId: model.id } }
+    })
+  }
+  const draftsBySessionRef = useRef(new Map<string, string>())
   const [streaming, setStreaming] = useState(false)
   const [compacting, setCompacting] = useState(false)
   const [copiedId, setCopiedId] = useState<string | null>(null)
@@ -726,8 +829,11 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [waitingVisible, setWaitingVisible] = useState(false)
   const [waitingPhase, setWaitingPhase] = useState<WaitingPhase>('awaiting')
   const [waitingDetail, setWaitingDetail] = useState<string | undefined>(undefined)
+  const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null)
+  const [stopError, setStopError] = useState<{ sessionId: string; message: string } | null>(null)
   const [lease, setLease] = useState<SessionLease | null>(null)
   const [activeTab, setActiveTab] = useState<PanelTab>('Subagents')
+  const [openedDocumentPath, setOpenedDocumentPath] = useState<string | null>(null)
   const [announcedTerminals, setAnnouncedTerminals] = useState<Record<string, TerminalSession>>({})
   const [revealedTerminalIds, setRevealedTerminalIds] = useState<Record<string, string>>({})
   const [widths, setWidths] = useState<PaneWidths>(readWidths)
@@ -735,13 +841,22 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   // Narrow-viewport override (not persisted): both panes start collapsed and the
   // header toggles / quick rail flip these to show the panes as overlays.
   const [narrowPanes, setNarrowPanes] = useState<{ sidebar: boolean; tools: boolean }>({ sidebar: false, tools: false })
-  const [subagentsRunning, setSubagentsRunning] = useState(false)
+  const [subagentsRunningCount, setSubagentsRunningCount] = useState(0)
+  /** Turn-start anchor for the background-subagent tail indicator (phase=tool, no stop). */
+  const [subagentWaitingStartedAt, setSubagentWaitingStartedAt] = useState<number | null>(null)
   const [sidebarExpandedIds, setSidebarExpandedIds] = useState<string[]>([])
   const [pinnedSessionIds, setPinnedSessionIds] = useState<string[]>([])
   const [archivedSessionIds, setArchivedSessionIds] = useState<string[]>([])
+  const [archivedSessionTimestamps, setArchivedSessionTimestamps] = useState<Record<string, number>>({})
+  const [orderedSessionIds, setOrderedSessionIds] = useState<string[]>([])
   const [sidebarVisibleLimit, setSidebarVisibleLimit] = useState(SIDEBAR_PROJECT_PAGE_SIZE)
   const [sidebarSearch, setSidebarSearch] = useState('')
   const [sidebarAgents, setSidebarAgents] = useState<AgentSummary[]>([])
+  // Latest committed transcript for the stream effect's first-response-wait
+  // decisions. Read via ref so the subscription closure never goes stale (that
+  // effect does not re-run per message).
+  const messagesRef = useRef<ChatMessage[]>(messages)
+  messagesRef.current = messages
   const [observedSessionStatuses, setObservedSessionStatuses] = useState<Record<string, SessionStatus>>({})
   const [loadedSidebarPreferencesKey, setLoadedSidebarPreferencesKey] = useState('')
   const [canRevealInFinder, setCanRevealInFinder] = useState(false)
@@ -754,21 +869,43 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [computerUseOpen, setComputerUseOpen] = useState(false)
   const [remoteOpen, setRemoteOpen] = useState(false)
   const [subagentModelsOpen, setSubagentModelsOpen] = useState(false)
-  const [openedDocumentPath, setOpenedDocumentPath] = useState<string | null>(null)
   const browserOccluded = modalOpen || computerUseOpen || remoteOpen || subagentModelsOpen
   const modalVisibility = useModelVisibility(host, modelState?.model)
   const transcriptRef = useRef<VirtuosoHandle>(null)
   const copiedTimerRef = useRef<number | null>(null)
+  const archiveCleanupInFlightRef = useRef(new Set<string>())
   const sidebarStorageKey = useMemo(() => sidebarPreferencesKey(projects), [projects])
-  // A host status can describe queued follow-ups. Only a local user send owns this waiting turn.
+  // Any active main turn — a local send, a host-driven/resumed/read-only turn, or a
+  // queue dispatch — owns the waiting placeholder from `started` until
+  // `settled`/`stopped`. The ref is a same-tick guard so repeated started
+  // status events keep the first waitingStartedAt stable.
   const activeUserTurnRef = useRef(false)
   // True only between an authoritative `started` and `settled`/`stopped`.
   // A late `streaming` (pi queue_update after settle) must not reopen the turn.
   const mainTurnOpenRef = useRef(false)
-  const messagesRef = useRef<ChatMessage[]>([])
-  messagesRef.current = messages
+  const stoppingSessionRef = useRef<string | null>(null)
   const historyLoadRef = useRef(0)
+  /** Send from the empty "新会话" state creates the session first; the pending
+   *  prompt is dispatched by the auto-send effect once the new session's history
+   *  load and stream subscription are live (a direct sendPrompt would race them). */
+  const pendingAutoSendRef = useRef<{ sessionId: string; prompt: string; attachments?: PromptAttachment[] } | null>(null)
+  // Mirror of observedSessionStatuses for the history-load effect. Adding the map
+  // itself to that effect's deps would re-load history on every status event.
+  const observedSessionStatusesRef = useRef(observedSessionStatuses)
+  useEffect(() => { observedSessionStatusesRef.current = observedSessionStatuses }, [observedSessionStatuses])
+  // Anchor the subagent tail indicator on the first 0→>0 transition of the selected
+  // session's running count. SubagentPanel clears its agents on session switch (the
+  // count dips to 0), which resets the anchor so the elapsed clock never carries over
+  // from the previous session; later count changes inside a run keep the anchor.
+  useEffect(() => {
+    if (subagentsRunningCount > 0) setSubagentWaitingStartedAt(current => current ?? Date.now())
+    else setSubagentWaitingStartedAt(null)
+  }, [subagentsRunningCount])
   const sessionQueue = useSessionQueue(host, selectedSession, streaming)
+  const selectedObservedRunning = observedSessionStatuses[selectedSession] === 'running'
+  const messageStreaming = messages.some(message => message.role === 'assistant' && message.streaming)
+  const selectedStopping = stoppingSessionId === selectedSession
+  const sessionWorking = streaming || selectedObservedRunning || messageStreaming || sessionQueue.busy || compacting || selectedStopping
   const canWriteLease = leaseCanWrite(lease)
   const leaseReadOnly = lease !== null && !canWriteLease
   /** The explicit path read performs the one-time backend migration; listProjects supplies matching UI metadata. */
@@ -808,14 +945,13 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   }, [host, selectedSession])
   useEffect(() => {
     let mounted = true
-    void host.listAgents().then(snapshot => { if (mounted) setSidebarAgents(snapshot) }).catch(() => { if (mounted) setSidebarAgents([]) })
     const unsubscribe = host.subscribeAgents(event => {
       if (event.type !== 'agent') return
-      setSidebarAgents(current => {
-        const index = current.findIndex(agent => agent.agentId === event.agent.agentId)
-        return index < 0 ? [...current, event.agent] : current.map(agent => agent.agentId === event.agent.agentId ? event.agent : agent)
-      })
+      setSidebarAgents(current => mergeAgentSummary(current, event.agent))
     })
+    void host.listAgents().then(snapshot => {
+      if (mounted) setSidebarAgents(current => mergeAgentSnapshot(current, snapshot))
+    }).catch(() => undefined)
     return () => { mounted = false; unsubscribe() }
   }, [host])
   useEffect(() => {
@@ -837,63 +973,125 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     void (async () => {
       let pinned = saved?.pinnedSessionIds ?? []
       let archived = saved?.archivedSessionIds ?? []
+      let archivedTimestamps = saved?.archivedSessionTimestamps ?? {}
+      let ordered: string[] = []
       if (host.getSidebarSessionPreferences && host.setSidebarSessionPreferences) {
         const remote = await host.getSidebarSessionPreferences()
         const migrated = localStorage.getItem(sidebarSemanticMigrationKey) === '1'
         if (migrated) {
           pinned = remote.pinnedSessionIds
           archived = remote.archivedSessionIds
+          archivedTimestamps = remote.archivedSessionTimestamps ?? {}
+          ordered = remote.sessionOrderVersion === 2 ? remote.orderedSessionIds ?? [] : []
         } else {
           archived = [...new Set([...remote.archivedSessionIds, ...archived])]
+          archivedTimestamps = { ...archivedTimestamps, ...(remote.archivedSessionTimestamps ?? {}) }
           const archivedSet = new Set(archived)
           pinned = [...new Set([...remote.pinnedSessionIds, ...pinned])].filter(id => !archivedSet.has(id))
-          await host.setSidebarSessionPreferences({ pinnedSessionIds: pinned, archivedSessionIds: archived })
+          ordered = remote.sessionOrderVersion === 2 ? remote.orderedSessionIds ?? [] : []
+          archivedTimestamps = normalizeArchiveTimestamps(archived, archivedTimestamps)
+          await host.setSidebarSessionPreferences({ pinnedSessionIds: pinned, archivedSessionIds: archived, archivedSessionTimestamps: archivedTimestamps, orderedSessionIds: ordered, sessionOrderVersion: 2 })
           localStorage.setItem(sidebarSemanticMigrationKey, '1')
         }
       }
       if (!active) return
+      archivedTimestamps = normalizeArchiveTimestamps(archived, archivedTimestamps)
       setPinnedSessionIds(pinned)
       setArchivedSessionIds(archived)
+      setArchivedSessionTimestamps(archivedTimestamps)
+      setOrderedSessionIds(ordered)
       setLoadedSidebarPreferencesKey(sidebarStorageKey)
     })().catch(error => {
       if (!active) return
       setProjectError(`加载侧栏偏好失败：${error instanceof Error ? error.message : String(error)}`)
       setPinnedSessionIds(saved?.pinnedSessionIds ?? [])
       setArchivedSessionIds(saved?.archivedSessionIds ?? [])
+      setArchivedSessionTimestamps(normalizeArchiveTimestamps(saved?.archivedSessionIds ?? [], saved?.archivedSessionTimestamps))
+      setOrderedSessionIds([])
       setLoadedSidebarPreferencesKey(sidebarStorageKey)
     })
     return () => { active = false }
   }, [host, loadedSidebarPreferencesKey, projects, sidebarStorageKey])
   useEffect(() => {
     if (!projects.length || loadedSidebarPreferencesKey !== sidebarStorageKey) return
-    writeSidebarPreferences(sidebarStorageKey, { expandedIds: sidebarExpandedIds, pinnedSessionIds, archivedSessionIds, visibleLimit: sidebarVisibleLimit })
+    writeSidebarPreferences(sidebarStorageKey, { expandedIds: sidebarExpandedIds, pinnedSessionIds, archivedSessionIds, archivedSessionTimestamps, visibleLimit: sidebarVisibleLimit })
     if (host.setSidebarSessionPreferences) {
-      void host.setSidebarSessionPreferences({ pinnedSessionIds, archivedSessionIds }).catch(error => setProjectError(`保存侧栏偏好失败：${error instanceof Error ? error.message : String(error)}`))
+      void host.setSidebarSessionPreferences({ pinnedSessionIds, archivedSessionIds, archivedSessionTimestamps, orderedSessionIds, sessionOrderVersion: 2 }).catch(error => setProjectError(`保存侧栏偏好失败：${error instanceof Error ? error.message : String(error)}`))
     }
-  }, [host, loadedSidebarPreferencesKey, pinnedSessionIds, archivedSessionIds, projects.length, sidebarExpandedIds, sidebarStorageKey, sidebarVisibleLimit])
+  }, [host, loadedSidebarPreferencesKey, pinnedSessionIds, archivedSessionIds, archivedSessionTimestamps, orderedSessionIds, projects.length, sidebarExpandedIds, sidebarStorageKey, sidebarVisibleLimit])
+  useEffect(() => {
+    if (!projects.length || loadedSidebarPreferencesKey !== sidebarStorageKey || archivedSessionIds.length === 0) return
+    const cleanup = async () => {
+      const expired = expiredArchivedSessionIds(archivedSessionIds, archivedSessionTimestamps)
+      for (const sessionId of expired) {
+        if (archiveCleanupInFlightRef.current.has(sessionId)) continue
+        archiveCleanupInFlightRef.current.add(sessionId)
+        try {
+          await host.deleteSession(sessionId)
+          const archivedSet = new Set(archivedSessionIds)
+          const fallback = sessions.find(session => session.id !== sessionId && !archivedSet.has(session.id))
+          setSessions(current => current.filter(session => session.id !== sessionId))
+          setArchivedSessionIds(current => current.filter(id => id !== sessionId))
+          setArchivedSessionTimestamps(current => Object.fromEntries(Object.entries(current).filter(([id]) => id !== sessionId)))
+          setPinnedSessionIds(current => current.filter(id => id !== sessionId))
+          setOrderedSessionIds(current => current.filter(id => id !== sessionId))
+          if (selectedSession === sessionId) {
+            setSelectedSession(fallback?.id ?? '')
+            if (fallback) setSelectedProject(fallback.projectId)
+          }
+        } catch (error) {
+          // Keep the archive entry and timestamp so a transient host/filesystem
+          // failure retries instead of pretending the destructive cleanup worked.
+          setProjectError(`自动删除过期归档失败：${error instanceof Error ? error.message : String(error)}`)
+        } finally {
+          archiveCleanupInFlightRef.current.delete(sessionId)
+        }
+      }
+    }
+    void cleanup()
+    const timer = window.setInterval(() => { void cleanup() }, ARCHIVE_CLEANUP_RETRY_MS)
+    return () => window.clearInterval(timer)
+  }, [archivedSessionIds, archivedSessionTimestamps, host, loadedSidebarPreferencesKey, projects.length, selectedSession, sessions, sidebarStorageKey])
   useEffect(() => { if (!selectedProject) return; void host.listSessions(selectedProject).then(items => { setSessions(current => [...current.filter(session => session.projectId !== selectedProject), ...items]); setSelectedSession(previous => items.some(item => item.id === previous) ? previous : items[0]?.id ?? '') }) }, [host, selectedProject])
   useEffect(() => { document.title = sessions.find(session => session.id === selectedSession)?.name ?? 'PipiUI' }, [selectedSession, sessions])
+  const sessionsRef = useRef(sessions)
+  sessionsRef.current = sessions
   useEffect(() => {
     let current = true
     const sessionId = selectedSession
-    const immediate = modelStatesBySessionRef.current.get(sessionId)
-      ?? modelStateFromSession(sessions.find(session => session.id === sessionId), modalVisibility.models)
-    if (immediate) setModelState(immediate)
+    const provisional = modelStatesBySessionRef.current.get(sessionId)
+      ?? modelStateFromSession(sessionsRef.current.find(session => session.id === sessionId), modalVisibility.models)
+    const immediate = provisional && reconcileModelStateWithCatalog(provisional, modalVisibility.models)
+    if (immediate) {
+      if (sessionId) {
+        modelStatesBySessionRef.current.set(sessionId, immediate)
+        rememberSessionModel(sessionId, immediate.model)
+      }
+      setModelState(immediate)
+    }
     void host.getModelState(selectedSession || undefined)
       .then(state => {
         if (!current) return
-        if (sessionId) modelStatesBySessionRef.current.set(sessionId, state)
-        setModelState(state)
+        const reconciled = reconcileModelStateWithCatalog(state, modalVisibility.models)
+        if (sessionId) {
+          modelStatesBySessionRef.current.set(sessionId, reconciled)
+          rememberSessionModel(sessionId, reconciled.model)
+        }
+        setModelState(reconciled)
       })
       // Failure fallback: the session's own model (from listSessions) keeps the
       // chip/row per-session even when the host model query itself failed.
       .catch(() => {
         if (!current || !selectedSession) return
-        const ref = sessions.find(session => session.id === selectedSession)?.model
-        if (ref) setModelState({ model: { provider: ref.provider, id: ref.modelId, name: ref.modelId, reasoning: false }, thinkingLevel: 'off', availableThinkingLevels: ['off'] })
+        const ref = sessionsRef.current.find(session => session.id === selectedSession)?.model
+        if (ref) {
+          const model: Model = { provider: ref.provider, id: ref.modelId, name: ref.modelId }
+          rememberSessionModel(selectedSession, model)
+          setModelState({ model, thinkingLevel: 'off', availableThinkingLevels: thinkingLevelsForModel(model) })
+        }
       })
     return () => { current = false }
-  }, [host, modalVisibility.models, selectedSession, sessions])
+  }, [host, modalVisibility.models, selectedSession])
   useEffect(() => {
     const request = ++historyLoadRef.current
     if (!selectedSession) {
@@ -903,26 +1101,89 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     activeUserTurnRef.current = false
     mainTurnOpenRef.current = false
+    // The transcript is wiped this tick; mirror that synchronously so the stream
+    // effect (subscribed moments later) never reads the previous session's
+    // messages when deciding whether a first-response wait is warranted.
     messagesRef.current = []
-    setStreaming(false)
     setCompacting(false)
     setWaitingVisible(false)
     setWaitingStartedAt(null)
+    setWaitingDetail(undefined)
+    setSubagentWaitingStartedAt(null)
+    // A session still observed as running resumes live: restore streaming and the
+    // waiting row immediately instead of looking idle while history loads.
+    // The ref keeps the observed map out of this effect's deps (no reload loop).
+    const resumedRunning = observedSessionStatusesRef.current[selectedSession] === 'running'
+    setStreaming(resumedRunning)
+    if (resumedRunning) {
+      mainTurnOpenRef.current = true
+      activeUserTurnRef.current = true
+      setWaitingStartedAt(Date.now())
+      setWaitingVisible(true)
+      setWaitingPhase('awaiting')
+    }
     setMessages([])
     setLease(null)
     void host.getSessionHistory(selectedSession).then(entries => {
       if (historyLoadRef.current !== request) return
       const messages = historyMessages(entries)
       setMessages(messages)
+      messagesRef.current = messages
+      // A resumed running session whose history already shows assistant output
+      // still has an open turn: keep the wait, but do not claim "first response".
+      if (resumedRunning && hasVisibleAssistantOutput(messages)) {
+        setWaitingPhase('continuing')
+        setWaitingVisible(true)
+      }
       requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, messages.length - 1), align: 'end', behavior: 'auto' }))
     }).catch(() => { if (historyLoadRef.current === request) setMessages([]) })
     void host.getSessionLease(selectedSession).then(lease => { if (historyLoadRef.current === request) setLease(lease) }).catch(() => { if (historyLoadRef.current === request) setLease(null) })
+  }, [host, selectedSession])
+  useEffect(() => {
+    // Runs after the history-load effect above and the stream-subscription effect
+    // below: by the next macrotask the new session's transcript and live events
+    // are wired, so the pending auto-send prompt can be dispatched safely.
+    const pending = pendingAutoSendRef.current
+    if (!pending || pending.sessionId !== selectedSession) return
+    pendingAutoSendRef.current = null
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          setMessages(items => [...items, { id: crypto.randomUUID(), role: 'user', content: pending.prompt, images: chatImagesFromAttachments(pending.attachments), timestamp: Date.now() }])
+          activeUserTurnRef.current = true
+          mainTurnOpenRef.current = true
+          setStreaming(true)
+          setWaitingStartedAt(Date.now())
+          setWaitingVisible(true)
+          setWaitingPhase('awaiting')
+          setWaitingDetail(undefined)
+          setSessions(current => current.map(session => session.id === pending.sessionId ? { ...session, updatedAt: Date.now() } : session))
+          if (pending.attachments?.length) await host.sendPrompt(pending.sessionId, pending.prompt, pending.attachments)
+          else await host.sendPrompt(pending.sessionId, pending.prompt)
+        } catch (error) {
+          activeUserTurnRef.current = false
+          mainTurnOpenRef.current = false
+          setStreaming(false)
+          setWaitingVisible(false)
+          setWaitingStartedAt(null)
+          setWaitingDetail(undefined)
+          setProjectError(`发送失败：${error instanceof Error ? error.message : String(error)}`)
+        }
+      })()
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [host, selectedSession])
   useEffect(() => {
     if (!selectedSession) return
     const coalescer = new StreamEventCoalescer({ onEvent: event => {
       if (event.type === 'queue_update') {
         sessionQueue.acceptStreamEvent(event)
+        return
+      }
+      if (event.type === 'session_title') {
+        setSessions(current => current.map(session => session.id === event.sessionId
+          ? { ...session, name: event.title, updatedAt: Date.now() }
+          : session))
         return
       }
       if (event.type === 'compaction') {
@@ -945,6 +1206,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         if (event.status === 'started' || event.status === 'streaming') {
           if (event.status === 'started') mainTurnOpenRef.current = true
           setStreaming(true)
+          setSessions(current => current.map(session => session.id === event.sessionId ? { ...session, updatedAt: Date.now() } : session))
+          // Any active main turn owns the wait, not just a local send. Follow-ups
+          // after visible assistant output use `continuing` so the copy does not
+          // claim to wait for the first response.
           if (!activeUserTurnRef.current) {
             activeUserTurnRef.current = true
             setWaitingStartedAt(Date.now())
@@ -956,13 +1221,20 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         if (terminal) {
           mainTurnOpenRef.current = false
           setStreaming(false)
+          setCompacting(false)
           setStatsRefreshKey(key => key + 1)
+          // Belt and suspenders: a missed/late queue_update must never strand the
+          // composer in a busy state once the turn has settled — re-pull the
+          // authoritative snapshot.
+          void sessionQueue.resync()
+          if (stoppingSessionRef.current === event.sessionId) stoppingSessionRef.current = null
+          setStoppingSessionId(current => current === event.sessionId ? null : current)
+          setStopError(current => current?.sessionId === event.sessionId ? null : current)
           // Settle the streaming assistant message no matter who started the turn
           // (direct send, resumed/read-only session, queue dispatch, background
           // turn): otherwise the "N 个步骤" card stays expanded forever.
           setMessages(previous => finishStreamingMessage(previous))
-        }
-        if (terminal && activeUserTurnRef.current) {
+          // Settled/stopped ends the waiting turn no matter who started it.
           activeUserTurnRef.current = false
           setWaitingVisible(false)
           setWaitingStartedAt(null)
@@ -972,22 +1244,24 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       }
       // Thinking and tool runs live inside folded cards — keep the placeholder
       // visible with an appropriate phase so the user never sees a silent gap
-      // between sending their message and the first readable text. Only real
-      // text output ends the first-token wait.
-      if (activeUserTurnRef.current) {
-        if (event.type === 'text') {
-          setWaitingVisible(false)
-        } else if (event.type === 'thinking') {
-          setWaitingPhase('thinking')
-        } else if (event.type === 'tool_call' || event.type === 'tool_result') {
-          setWaitingPhase('tool')
-          if (event.type === 'tool_call' && event.name === 'subagent') setWaitingDetail('子任务执行中')
-          else if (event.type === 'tool_call') setWaitingDetail(undefined)
-        }
+      // between the turn start and the first readable text. Only real text
+      // output ends the first-token wait (streaming itself keeps going until
+      // settled/stopped, which the Composer reflects).
+      if (event.type === 'text') {
+        setWaitingVisible(false)
+      } else if (event.type === 'thinking') {
+        setWaitingPhase('thinking')
+      } else if (event.type === 'tool_call' || event.type === 'tool_result') {
+        setWaitingPhase('tool')
+        if (event.type === 'tool_call' && event.name === 'subagent') setWaitingDetail('子任务执行中')
+        else if (event.type === 'tool_call') setWaitingDetail(undefined)
       }
       setMessages(previous => applyStreamEvent(previous, event))
     } })
-    const unsubscribe = host.subscribeStream(selectedSession, event => coalescer.push(event))
+    const unsubscribe = host.subscribeStream(selectedSession, event => {
+      if (import.meta.env.DEV && (event.type === 'text' || event.type === 'thinking') && (event as { delta?: string }).delta) console.log(`[stream-debug] renderer-recv ${event.type} sid=${selectedSession} t=${Date.now()} len=${((event as { delta?: string }).delta ?? '').length}`)
+      coalescer.push(event)
+    })
     return () => { unsubscribe(); coalescer.dispose() }
   }, [host, selectedSession, sessionQueue.acceptStreamEvent])
   useEffect(() => { localStorage.setItem(storageKey, JSON.stringify(widths)) }, [widths])
@@ -1023,13 +1297,42 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const selectedProjectPath = projects.find(project => project.id === selectedProject)?.path
   useEffect(() => () => { if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current) }, [])
 
+  const stopSelectedSession = useCallback(() => {
+    const targetSession = selectedSession
+    if (!targetSession || stoppingSessionRef.current === targetSession) return
+    stoppingSessionRef.current = targetSession
+    setStoppingSessionId(targetSession)
+    setStopError(current => current?.sessionId === targetSession ? null : current)
+    setWaitingPhase('stopping')
+    void Promise.resolve().then(() => host.stop(targetSession)).catch(error => {
+      if (stoppingSessionRef.current !== targetSession) return
+      stoppingSessionRef.current = null
+      setStoppingSessionId(current => current === targetSession ? null : current)
+      setWaitingPhase(current => current === 'stopping' ? 'awaiting' : current)
+      setStopError({ sessionId: targetSession, message: `停止失败：${error instanceof Error ? error.message : String(error)}` })
+    })
+  }, [host, selectedSession])
+
   const send = async (draft: string, attachments?: PromptAttachment[]) => {
     const prompt = draft.trim()
     if (!prompt && !attachments?.length) return false
-    if (!selectedSession || !canWriteLease) return false
-    const targetSession = selectedSession
+    let targetSession = selectedSession
+    if (!targetSession) {
+      // Empty "新会话" state used to make Send a silent no-op; create the session
+      // in the selected project and dispatch the prompt as soon as it is selected.
+      // No lease exists yet in this state, so the write gate below must not apply.
+      if (!selectedProject) return false
+      const session = await host.newSession(selectedProject)
+      pendingAutoSendRef.current = { sessionId: session.id, prompt, attachments }
+      setSessions(items => [session, ...items])
+      setSelectedProject(selectedProject)
+      setSelectedSession(session.id)
+      setSidebarExpandedIds(current => current.includes(selectedProject) ? current : [...current, selectedProject])
+      return true
+    }
+    if (!canWriteLease) return false
     const beginDirectTurn = () => {
-      setMessages(items => [...items, { id: crypto.randomUUID(), role: 'user', content: prompt + (attachments?.length ? ` [${attachments.length} 张图片]` : ''), timestamp: Date.now() }])
+      setMessages(items => [...items, { id: crypto.randomUUID(), role: 'user', content: prompt, images: chatImagesFromAttachments(attachments), timestamp: Date.now() }])
       activeUserTurnRef.current = true
       mainTurnOpenRef.current = true
       setStreaming(true)
@@ -1037,6 +1340,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setWaitingVisible(true)
       setWaitingPhase('awaiting')
       setWaitingDetail(undefined)
+      setSessions(current => current.map(session => session.id === targetSession ? { ...session, updatedAt: Date.now() } : session))
     }
     const resetFailedDirectTurn = () => {
       activeUserTurnRef.current = false
@@ -1073,6 +1377,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
    */
   const compact = async () => {
     if (!selectedSession || !canWriteLease || !host.compact) return
+    setCompacting(true)
     try {
       await host.compact(selectedSession)
     } catch (error) {
@@ -1105,17 +1410,25 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     setSidebarExpandedIds(current => current.includes(projectId) ? current : [...current, projectId])
     setMessages([])
   }
-  const addProject = async (path: string): Promise<boolean> => {
-    if (!host.addProject) {
+  const addProject = async (): Promise<boolean> => {
+    if (!host.pickProjectDirectory || !host.addProject) {
       setProjectError('当前连接不支持添加项目')
       return false
     }
+    let path: string | null
+    try {
+      path = await host.pickProjectDirectory()
+    } catch (error) {
+      setProjectError(`选择项目文件夹失败：${error instanceof Error ? error.message : String(error)}`)
+      return false
+    }
+    if (!path) return false
     const normalizedPath = path.trim()
     if (!normalizedPath) return false
     const snapshot = { projects, sessions, selectedProject, selectedSession }
     const name = normalizedPath.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || normalizedPath
     const optimistic: Project = { id: `pending-project:${normalizedPath}`, name, path: normalizedPath }
-    setProjects(current => current.some(project => project.path === normalizedPath) ? current : [...current, optimistic])
+    setProjects(current => current.some(project => project.path === normalizedPath) ? current : [optimistic, ...current])
     setSidebarExpandedIds(current => current.includes(optimistic.id) ? current : [...current, optimistic.id])
     setProjectError(null)
     try {
@@ -1173,12 +1486,12 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const sidebarSessionById = useMemo(() => {
     const mapped = new Map<string, SidebarSession>()
     for (const session of sessions) {
-      const model = sidebarModelForSession(session, selectedSession, modelState?.model ?? null)
+      const model = sidebarModelForSession(session, selectedSession, modelState?.model ?? null, sessionModels)
       const status = sidebarStatusForSession(session.id, selectedSession, streaming, observedSessionStatuses[session.id], sidebarAgents)
       mapped.set(session.id, { id: session.id, projectId: session.projectId, title: session.name, provider: model.provider, modelId: model.modelId, status: status.status, subagentCount: status.subagentCount, updatedAt: session.updatedAt })
     }
     return mapped
-  }, [modelState, observedSessionStatuses, selectedSession, sessions, sidebarAgents, streaming])
+  }, [modelState, observedSessionStatuses, selectedSession, sessionModels, sessions, sidebarAgents, streaming])
   const pinnedSessionIdSet = useMemo(() => new Set(pinnedSessionIds), [pinnedSessionIds])
   const archivedSessionIdSet = useMemo(() => new Set(archivedSessionIds), [archivedSessionIds])
   const pinnedSidebarSessions = useMemo(() => pinnedSessionIds.flatMap(id => {
@@ -1195,18 +1508,17 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     name: project.name,
     path: project.path,
     // Pinned sessions live in the dedicated section; archived ones in the global archive.
-    sessions: sessions.filter(session => session.projectId === project.id && !pinnedSessionIdSet.has(session.id) && !archivedSessionIdSet.has(session.id)).flatMap(session => {
+    sessions: sessionsByActivityAndManualOrder(sessions.filter(session => session.projectId === project.id && !pinnedSessionIdSet.has(session.id) && !archivedSessionIdSet.has(session.id)), orderedSessionIds).flatMap(session => {
       const mapped = sidebarSessionById.get(session.id)
       return mapped ? [mapped] : []
     })
-  })), [archivedSessionIdSet, pinnedSessionIdSet, projects, sessions, sidebarSessionById])
+  })), [archivedSessionIdSet, orderedSessionIds, pinnedSessionIdSet, projects, sessions, sidebarSessionById])
   const sidebarProjectMenuUnavailable = useMemo<ProjectMenuUnavailable>(() => ({
     rename: '待宿主支持',
     ...(!host.removeProject ? { remove: '当前连接不支持移除项目' } : {}),
     ...(!canRevealInFinder ? { reveal: '当前连接不支持在 Finder 中显示' } : {})
   }), [canRevealInFinder, host.removeProject])
   const toggleSidebarProject = (projectId: string) => {
-    setSelectedProject(projectId)
     setSidebarExpandedIds(current => current.includes(projectId) ? current.filter(id => id !== projectId) : [...current, projectId])
   }
   const selectSidebarSession = (sessionId: string) => {
@@ -1215,15 +1527,34 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setSelectedProject(session.projectId)
       setSidebarExpandedIds(current => current.includes(session.projectId) ? current : [...current, session.projectId])
     }
-    const immediate = modelStatesBySessionRef.current.get(sessionId)
+    const provisional = modelStatesBySessionRef.current.get(sessionId)
       ?? modelStateFromSession(session, modalVisibility.models)
-    if (immediate) setModelState(immediate)
+    const immediate = provisional && reconcileModelStateWithCatalog(provisional, modalVisibility.models)
+    if (immediate) {
+      modelStatesBySessionRef.current.set(sessionId, immediate)
+      rememberSessionModel(sessionId, immediate.model)
+      setModelState(immediate)
+    } else {
+      setModelState(null)
+    }
     setSelectedSession(sessionId)
   }
 
   const applySelectedModelState = (state: ModelState) => {
-    if (selectedSession) modelStatesBySessionRef.current.set(selectedSession, state)
+    if (selectedSession) {
+      modelStatesBySessionRef.current.set(selectedSession, state)
+      rememberSessionModel(selectedSession, state.model)
+    }
     setModelState(state)
+    // A model/thinking-level switch changes the context window and per-model
+    // accounting; pull a fresh stats snapshot so the pill stops showing the
+    // previous model's numbers.
+    setStatsRefreshKey(key => key + 1)
+  }
+  const persistComposerDraft = (draft: string) => {
+    if (!selectedSession) return
+    if (draft === '') draftsBySessionRef.current.delete(selectedSession)
+    else draftsBySessionRef.current.set(selectedSession, draft)
   }
   const onSidebarProjectMenu = (projectId: string, action: ProjectMenuAction) => {
     if (action === 'newSession') { void newSession(projectId); return }
@@ -1232,12 +1563,101 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     // Rename remains disabled until the host exposes an explicit rename contract.
   }
   const pinSidebarSession = (sessionId: string) => setPinnedSessionIds(current => current.includes(sessionId) ? current.filter(id => id !== sessionId) : [...current, sessionId])
-  const renameSidebarSession = (sessionId: string) => { /* Host rename contract pending; select the session for now. */ selectSidebarSession(sessionId) }
+  const renameSidebarSession = async (sessionId: string, title: string) => {
+    const previous = sessions.find(session => session.id === sessionId)
+    if (!previous || previous.name === title) return
+    setSessions(current => current.map(session => session.id === sessionId ? { ...session, name: title, updatedAt: Date.now() } : session))
+    try {
+      const renamed = await host.renameSession(sessionId, title)
+      setSessions(current => current.map(session => session.id === sessionId ? renamed : session))
+    } catch (error) {
+      setSessions(current => current.map(session => session.id === sessionId ? previous : session))
+      setProjectError(`修改会话名称失败：${error instanceof Error ? error.message : String(error)}`)
+      throw error
+    }
+  }
   const archiveSidebarSession = (sessionId: string) => {
     setArchivedSessionIds(current => current.includes(sessionId) ? current : [...current, sessionId])
+    setArchivedSessionTimestamps(current => current[sessionId] === undefined ? { ...current, [sessionId]: Date.now() } : current)
     setPinnedSessionIds(current => current.filter(id => id !== sessionId))
+    if (selectedSession === sessionId) {
+      const archived = new Set([...archivedSessionIds, sessionId])
+      const fallback = sessions.find(session => !archived.has(session.id))
+      setSelectedSession(fallback?.id ?? '')
+      if (fallback) setSelectedProject(fallback.projectId)
+    }
   }
-  const unarchiveSidebarSession = (sessionId: string) => setArchivedSessionIds(current => current.filter(id => id !== sessionId))
+  const unarchiveSidebarSession = (sessionId: string) => {
+    setArchivedSessionIds(current => current.filter(id => id !== sessionId))
+    setArchivedSessionTimestamps(current => Object.fromEntries(Object.entries(current).filter(([id]) => id !== sessionId)))
+  }
+  const moveSidebarProject = async (sourceId: string, targetId: string, placement: SidebarDropPlacement) => {
+    if (!host.setProjectPaths || sourceId === targetId) return
+    const snapshot = projects
+    const ids = movedIds(projects.map(project => project.id), sourceId, targetId, placement)
+    const byId = new Map(projects.map(project => [project.id, project]))
+    const next = ids.flatMap(id => byId.get(id) ?? [])
+    setProjects(next)
+    try {
+      await host.setProjectPaths(next.map(project => project.path))
+    } catch (error) {
+      setProjects(snapshot)
+      setProjectError(`调整项目顺序失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  const moveSidebarSession = async (sessionId: string, targetProjectId: string, targetSessionId?: string, placement: SidebarDropPlacement = 'after') => {
+    const source = sessions.find(session => session.id === sessionId)
+    if (!source) return
+    const snapshot = sessions
+    const snapshotOrder = orderedSessionIds
+    const snapshotPinned = pinnedSessionIds
+    const projectOrder = projects.flatMap(project => sidebarProjects.find(item => item.id === project.id)?.sessions.map(session => session.id) ?? [])
+    const allIds = [...projectOrder, ...sessions.map(session => session.id).filter(id => !projectOrder.includes(id))]
+    let nextIds = allIds.filter(id => id !== sessionId)
+    if (targetSessionId && nextIds.includes(targetSessionId)) {
+      const target = nextIds.indexOf(targetSessionId)
+      nextIds.splice(target + (placement === 'after' ? 1 : 0), 0, sessionId)
+    } else {
+      const targetProjectIds = nextIds.filter(id => sessions.find(session => session.id === id)?.projectId === targetProjectId)
+      const last = targetProjectIds.at(-1)
+      const insertAt = last ? nextIds.indexOf(last) + 1 : nextIds.length
+      nextIds.splice(insertAt, 0, sessionId)
+    }
+    const participants = new Set(orderedSessionIds)
+    if (targetSessionId) {
+      participants.add(sessionId)
+      participants.add(targetSessionId)
+    }
+    const nextManualOrder = nextIds.filter(id => participants.has(id))
+    setSessions(current => current.map(session => session.id === sessionId ? { ...session, projectId: targetProjectId } : session))
+    setOrderedSessionIds(nextManualOrder)
+    setPinnedSessionIds(current => current.filter(id => id !== sessionId))
+    setSidebarExpandedIds(current => current.includes(targetProjectId) ? current : [...current, targetProjectId])
+    try {
+      if (source.projectId !== targetProjectId) {
+        const moved = await host.moveSession(sessionId, targetProjectId)
+        setSessions(current => current.map(session => session.id === sessionId ? moved : session))
+        if (selectedSession === sessionId) setSelectedProject(targetProjectId)
+      }
+    } catch (error) {
+      setSessions(snapshot)
+      setOrderedSessionIds(snapshotOrder)
+      setPinnedSessionIds(snapshotPinned)
+      setProjectError(`移动会话失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  const moveSidebarSessionToPinned = (sessionId: string, targetSessionId?: string, placement: SidebarDropPlacement = 'after') => {
+    setPinnedSessionIds(current => {
+      const next = current.filter(id => id !== sessionId)
+      if (targetSessionId && next.includes(targetSessionId)) {
+        const target = next.indexOf(targetSessionId)
+        next.splice(target + (placement === 'after' ? 1 : 0), 0, sessionId)
+      } else {
+        next.push(sessionId)
+      }
+      return next
+    })
+  }
   const resize = (pane: keyof PaneWidths, start: number) => (event: React.PointerEvent) => { const origin = event.clientX; const onMove = (move: PointerEvent) => setWidths(current => ({ ...current, [pane]: clamp(start + (pane === 'sidebar' ? move.clientX - origin : origin - move.clientX), pane === 'sidebar' ? 190 : 270, pane === 'sidebar' ? 440 : 620) })); const done = () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', done) }; window.addEventListener('pointermove', onMove); window.addEventListener('pointerup', done) }
   const toggleSidebar = () => {
     if (narrowViewport) setNarrowPanes(current => ({ ...current, sidebar: !current.sidebar }))
@@ -1260,7 +1680,36 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       else setWidths(current => ({ ...current, toolsCollapsed: false }))
     }
   }
-
+  const openQwenTokenPlanLogin = async () => {
+    // Swift InputBar parity: the Token Plan login capsule opens the embedded
+    // browser at the bailian plan page; the quota pill appears once logged in.
+    if (!selectedSession || !host.browser) return
+    try {
+      await host.browser.newTab(selectedSession, { url: QWEN_TOKEN_PLAN_LOGIN_URL })
+    } catch (error) {
+      setProjectError(`打开 Token Plan 登录页失败：${error instanceof Error ? error.message : String(error)}`)
+      return
+    }
+    setActiveTab('Browser')
+    if (toolsCollapsed) {
+      if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: true }))
+      else setWidths(current => ({ ...current, toolsCollapsed: false }))
+    }
+  }
+  const revealSubagentsForNewRun = useCallback(() => {
+    // Match Swift: reveal a new run only when the right pane is closed. An
+    // already-open Browser/Document/Terminal tab remains under user control.
+    if (!toolsCollapsed) return
+    setActiveTab('Subagents')
+    if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: true }))
+    else setWidths(current => ({ ...current, toolsCollapsed: false }))
+  }, [narrowViewport, toolsCollapsed])
+  /** Subagent tool-card click: always open the Subagents pane (Swift card tap parity). */
+  const openSubagents = useCallback(() => {
+    setActiveTab('Subagents')
+    if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: true }))
+    else setWidths(current => ({ ...current, toolsCollapsed: false }))
+  }, [narrowViewport])
   const openDocument = useCallback((path: string) => {
     setOpenedDocumentPath(path)
     setActiveTab('Document')
@@ -1268,26 +1717,35 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     else setWidths(current => ({ ...current, toolsCollapsed: false }))
   }, [narrowViewport])
 
-  const shellClass = `pipiui-shell${isElectronChrome() ? ' titlebar-pad' : ''}${sidebarCollapsed ? ' sidebar-collapsed' : ''}${toolsCollapsed ? ' tools-collapsed' : ''}`
+  const shellClass = `pipiui-shell${isElectronChrome() ? ' electron-chrome' : ''}${sidebarCollapsed ? ' sidebar-collapsed' : ''}${toolsCollapsed ? ' tools-collapsed' : ''}`
+  // The first-response wait (any active main turn) takes precedence at the
+  // transcript tail; while it is hidden, a running background subagent keeps the
+  // tail alive with a stable-timed phase=tool indicator and no stop button.
+  const firstResponseWaiting = waitingVisible && waitingStartedAt !== null
+    ? { startedAt: waitingStartedAt, phase: waitingPhase, detail: waitingDetail, onStop: waitingPhase === 'continuing' ? undefined : stopSelectedSession }
+    : undefined
+  const subagentWaiting = !firstResponseWaiting && subagentsRunningCount > 0 && subagentWaitingStartedAt !== null
+    ? { startedAt: subagentWaitingStartedAt, phase: 'tool' as const, detail: `${subagentsRunningCount} 个子任务执行中` }
+    : undefined
   return <main className={shellClass} data-theme={theme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${widths.tools}px` } as React.CSSProperties}>
-    {/* hiddenInset titlebar band: draggable chrome strip (title lives in the chat header only), keeps traffic lights clear of content. */}
-    <div className="titlebar-drag" />
-    <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} projectMenuUnavailable={sidebarProjectMenuUnavailable} onAddProject={addProject} projectAddUnavailable={host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onOpenSettings={() => setModalOpen(true)} onOpenComputerUse={() => setComputerUseOpen(true)} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} />
+    <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} projectMenuUnavailable={sidebarProjectMenuUnavailable} onMoveProject={host.setProjectPaths ? moveSidebarProject : undefined} onMoveSession={moveSidebarSession} onMoveSessionToPinned={moveSidebarSessionToPinned} onAddProject={addProject} projectAddUnavailable={host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onOpenSettings={() => setModalOpen(true)} onOpenComputerUse={() => setComputerUseOpen(true)} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} />
     <ResizeHandle label="调整左栏宽度" onPointerDown={resize('sidebar', widths.sidebar)} />
     <section className="chat-column">
-      <ChatHeader session={sessions.find(item => item.id === selectedSession)} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={sidebarCollapsed} toolsCollapsed={toolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} />
+      <ChatHeader session={sessions.find(item => item.id === selectedSession)} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={sidebarCollapsed} toolsCollapsed={toolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onRename={renameSidebarSession} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} />
       <div className="chat-viewport" data-testid="chat-viewport">
-        <ToolQuickRail activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunning={subagentsRunning} />
-        <Transcript messages={messages} transcriptRef={transcriptRef} documentBasePath={selectedProjectPath} onOpenDocument={openDocument} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={waitingVisible && waitingStartedAt !== null ? { startedAt: waitingStartedAt, phase: waitingPhase, detail: waitingDetail, onStop: () => { setWaitingPhase('stopping'); if (selectedSession) void host.stop(selectedSession) } } : undefined} />
+        <ToolQuickRail activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunningCount={subagentsRunningCount} />
+        <LiveSubagentBindingProvider host={host} sessionId={selectedSession}>
+          <Transcript messages={messages} transcriptRef={transcriptRef} documentBasePath={selectedProjectPath} onOpenDocument={openDocument} onOpenSubagents={openSubagents} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={firstResponseWaiting ?? subagentWaiting} />
+        </LiveSubagentBindingProvider>
       </div>
       <div className="chat-composer-stack" data-testid="chat-composer-stack">
         {sessionQueue.error && <div className="queue-operation-error" role="alert" data-testid="queue-operation-error"><span>{sessionQueue.error}</span><button aria-label="关闭队列错误" onClick={sessionQueue.dismissError}>×</button></div>}
         <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.steer(id).catch(() => undefined) }} />
-        <Composer key={selectedSession} streaming={streaming} compacting={compacting} queueBusy={sessionQueue.busy} readOnly={leaseReadOnly} leaseOwner={leaseReadOnly ? leaseOwnerLabel(lease) : undefined} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} modelState={modelState} host={host} sessionId={selectedSession} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} onOpenModelManager={() => setModalOpen(true)} onCompact={compact} onSend={send} onStop={() => { setWaitingPhase('stopping'); if (selectedSession) void host.stop(selectedSession) }} onModel={applySelectedModelState} />
+        <Composer key={selectedSession} streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} queueBusy={sessionQueue.busy} readOnly={leaseReadOnly} leaseOwner={leaseReadOnly ? leaseOwnerLabel(lease) : undefined} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} onDraftChange={persistComposerDraft} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} onOpenModelManager={() => setModalOpen(true)} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} />
       </div>
     </section>
     <ResizeHandle label="调整工具栏宽度" onPointerDown={resize('tools', widths.tools)} />
-    <ToolPanel activeTab={activeTab} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningChange={setSubagentsRunning} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={openedDocumentPath} onOpenDocument={openDocument} />
+    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={openedDocumentPath} onOpenDocument={openDocument} />
     {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} current={modelState?.model ?? null} onModelState={applySelectedModelState} onClose={() => setModalOpen(false)} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} />}
@@ -1295,88 +1753,30 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   </main>
 }
 
-/**
- * Build transcript messages from history entries, preserving the folded
- * tool/turn structure: assistant entries with thinking/tools render as the
- * same collapsed "N 个步骤" cards as the live stream (Swift parity), and
- * toolResult entries attach to their tool card instead of a bare row.
- */
-export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
-  const cards = new Map<string, ToolCard>()
-  const messages: ChatMessage[] = []
-  for (const entry of entries) {
-    if (entry.role === 'assistant' && (entry.thinking || entry.tools?.length)) {
-      const tools = entry.tools?.map(tool => ({ id: tool.id, name: tool.name, input: tool.input, startedAt: entry.timestamp, finished: true }))
-      for (const tool of tools ?? []) cards.set(tool.id, tool)
-      // pi emits one assistant message per tool round, so a burst of consecutive
-      // tool-only turns (no text/thinking) coalesces into one folded card (Swift
-      // finishedGroup parity) instead of a stack of "1 个步骤" cards. Tool results
-      // still attach by id: the shared ToolCard objects are already in `cards`.
-      const toolOnly = (entry.tools?.length ?? 0) > 0 && !entry.content && !entry.thinking
-      const previous = messages[messages.length - 1]
-      if (toolOnly && previous?.role === 'assistant' && (previous.tools?.length ?? 0) > 0 && !previous.content && !previous.thinking) {
-        previous.tools!.push(...tools!)
-        continue
-      }
-      messages.push({ id: entry.id, role: 'assistant', content: entry.content, thinking: entry.thinking, tools, timestamp: entry.timestamp })
-      continue
-    }
-    if (entry.role === 'tool' && entry.toolCallId && cards.has(entry.toolCallId)) {
-      const tool = cards.get(entry.toolCallId)!
-      tool.result = entry.content
-      tool.error = entry.isError
-      if (entry.images) tool.images = entry.images
-      continue
-    }
-    messages.push({ id: entry.id, role: entry.role, content: entry.content })
-  }
-  return messages
-}
-
-export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamEvent, { type: 'status' }>): ChatMessage[] {
-  const index = previous.findLastIndex(item => item.role === 'assistant')
-  const current = index >= 0 && previous[index].streaming ? previous[index] : { id: `stream-${Date.now()}`, role: 'assistant' as const, content: '', thinking: '', tools: [], streaming: true, timestamp: Date.now() }
-  const next = index >= 0 && previous[index].streaming ? [...previous] : [...previous, current]
-  const updated: ChatMessage = { ...current, tools: [...(current.tools ?? [])] }
-  if (event.type === 'text') updated.content += event.delta
-  if (event.type === 'thinking') updated.thinking = (updated.thinking ?? '') + event.delta
-  if (event.type === 'tool_call') {
-    const toolIndex = updated.tools!.findIndex(item => item.id === event.toolCallId)
-    if (toolIndex >= 0) updated.tools![toolIndex] = { ...updated.tools![toolIndex], input: updated.tools![toolIndex].input + (event.delta ?? '') }
-    else updated.tools!.push({ id: event.toolCallId, name: event.name, input: event.delta ?? '', startedAt: Date.now() })
-  }
-  if (event.type === 'tool_result') {
-    const toolIndex = updated.tools!.findIndex(item => item.id === event.toolCallId)
-    if (toolIndex >= 0) updated.tools![toolIndex] = { ...updated.tools![toolIndex], result: event.content, error: event.isError, finished: true, images: event.images }
-  }
-  next[next.length - 1] = updated
-  return next
-}
-
-export function finishStreamingMessage(messages: ChatMessage[]): ChatMessage[] {
-  const index = messages.findLastIndex(message => message.role === 'assistant' && message.streaming)
-  if (index < 0) return messages
-  const next = [...messages]
-  next[index] = { ...next[index], streaming: false }
-  return next
-}
-
+/** A transcript already showing assistant output (text or a thinking/tool card)
+ *  has no first-token wait left. A new `started` after that uses phase
+ *  `continuing` so the placeholder still names the wait. */
 function hasVisibleAssistantOutput(messages: ChatMessage[]): boolean {
   return messages.some(message => message.role === 'assistant' && (
     Boolean(message.content) ||
     (message.tools?.length ?? 0) > 0 ||
-    Boolean(message.thinking)
+    Boolean(message.thinking) ||
+    (message.activities?.length ?? 0) > 0
   ))
 }
 
 function ResizeHandle({ label, onPointerDown }: { label: string; onPointerDown: (event: React.PointerEvent) => void }) { return <div className="resize-handle" role="separator" aria-label={label} onPointerDown={onPointerDown} /> }
-function ChatHeader({ session, project, lease, host, gitAvailable, sidebarCollapsed, toolsCollapsed, onToggleSidebar, onToggleTools, onTakeover }: { session?: Session; project?: Project; lease: SessionLease | null; host: PipiHostAPI; gitAvailable: boolean; sidebarCollapsed: boolean; toolsCollapsed: boolean; onToggleSidebar: () => void; onToggleTools: () => void; onTakeover: () => void }) { const readOnly = lease !== null && !leaseCanWrite(lease); return <header className="chat-header"><button data-testid="toggle-sidebar" title={sidebarCollapsed ? '展开左栏' : '收起左栏'} aria-label={sidebarCollapsed ? '展开左栏' : '收起左栏'} aria-expanded={!sidebarCollapsed} onClick={onToggleSidebar}>≡</button><div className="chat-header-title"><strong>{session?.name ?? '新会话'}</strong>{readOnly && <span className="lease-detail">由 {leaseOwnerLabel(lease)} 运行中 · 只读 <button data-testid="lease-takeover-header" onClick={onTakeover}>强制接管</button></span>}</div><div className="chat-header-actions"><GitBranchMenu host={host} projectId={project?.id} available={gitAvailable} /><button data-testid="toggle-tools" title={toolsCollapsed ? '展开右栏' : '收起右栏'} aria-label={toolsCollapsed ? '展开右栏' : '收起右栏'} aria-expanded={!toolsCollapsed} onClick={onToggleTools}>▤</button></div></header> }
-type MessageActionHandlers = { onCopy: (message: ChatMessage) => Promise<void>; onResend: (message: ChatMessage) => void; resendDisabled: boolean; copiedId: string | null }
-type DocumentOpenProps = { documentBasePath?: string; onOpenDocument?: (path: string) => void }
-function Transcript({ messages, transcriptRef, waiting, documentBasePath, onOpenDocument, onCopy, onResend, resendDisabled, copiedId }: { messages: ChatMessage[]; transcriptRef: React.RefObject<VirtuosoHandle>; waiting?: { startedAt: number; phase: WaitingPhase; detail?: string; onStop: () => void } } & DocumentOpenProps & MessageActionHandlers) { const [atBottom, setAtBottom] = useState(true); const [seekingId, setSeekingId] = useState<string | null>(null); const prompts = useMemo(() => buildRailPrompts(messages), [messages]); const { activeId: viewportActiveId, containerRef } = useActivePromptId(prompts, atBottom); const activeId = seekingId ?? viewportActiveId; useEffect(() => { if (atBottom) setSeekingId(null) }, [atBottom]); const jump = (index: number, id: string) => { setSeekingId(id); transcriptRef.current?.scrollToIndex({ index, align: 'start', behavior: 'smooth' }) }; const returnLatest = () => { setSeekingId(null); transcriptRef.current?.scrollToIndex({ index: Math.max(0, messages.length - 1), align: 'end', behavior: 'smooth' }); setAtBottom(true) }; return <div className="transcript-area" ref={containerRef}><PromptRail prompts={prompts} activeId={activeId} onJump={jump} /><MessageList ref={transcriptRef} messages={messages} atBottom={atBottom} onAtBottom={setAtBottom} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} />{waiting && <WaitingPlaceholder phase={waiting.phase} startedAt={waiting.startedAt} detail={waiting.detail} onStop={waiting.onStop} />}{!atBottom && messages.length > 0 && <button className="return-latest" onClick={returnLatest}>回到最新</button>}</div> }
-const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessage[]; atBottom: boolean; onAtBottom: (value: boolean) => void } & DocumentOpenProps & MessageActionHandlers>(function MessageList({ messages, atBottom, onAtBottom, documentBasePath, onOpenDocument, onCopy, onResend, resendDisabled, copiedId }, ref) { return <div className="message-list" data-testid="message-scroll"><Virtuoso ref={ref} data={messages} followOutput={() => atBottom ? 'auto' : false} atBottomStateChange={onAtBottom} alignToBottom itemContent={(index, message) => { const next = messages[index + 1]; const isTurnEnd = message.role === 'user' || (!message.streaming && (!next || next.role !== 'assistant')); return <MessageView message={message} showFooter={isTurnEnd} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copied={copiedId === message.id} /> } } /></div> }))
-function messageTime(timestamp?: number): string { if (!timestamp) return ''; return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
-export const MessageView = memo(function MessageView({ message, showFooter, documentBasePath, onOpenDocument, onCopy, onResend, resendDisabled, copied }: { message: ChatMessage; showFooter?: boolean; copied?: boolean } & DocumentOpenProps & Omit<MessageActionHandlers, 'copiedId'>) { const copyDisabled = !message.content.trim(); const copy = () => { void onCopy(message).catch(() => undefined) }; const time = showFooter && message.timestamp ? <time className="message-time">{messageTime(message.timestamp)}</time> : null; const actions = showFooter ? <MessageActionBar alignment={message.role === 'user' ? 'trailing' : 'leading'} canCopy canResend={message.role === 'user' && Boolean(message.content.trim())} copyDisabled={copyDisabled} resendDisabled={resendDisabled} onCopy={copy} onResend={() => onResend(message)} copied={copied} /> : null;if (message.role === 'user') return <article className="message user-message" data-user-prompt={message.id}><div className="user-message-stack"><UserMessageBubble text={message.content} />{actions}</div>{time}</article>; if (message.role === 'tool') { const notice = parseSubagentNotice(message.content); return notice ? <article className="message assistant-message"><CollapsibleActivityCard kind="result" label="子任务" summary={notice.name} meta={`${notice.ok ? '成功' : '失败'} · ${notice.cost}`}><pre>{message.content}</pre></CollapsibleActivityCard>{actions}{time}</article> : <article className="system-message tool-message"><div>{message.content}</div>{actions}{time}</article> } return <article className="message assistant-message"><AssistantTranscriptContent message={message} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} />{actions || time ? <div className="assistant-message-footer">{actions}{time}</div> : null}</article> })
+function RightPaneToggleIcon({ expanded }: { expanded: boolean }) {
+  return expanded
+    ? <svg className="right-pane-toggle-icon" data-pane-icon="collapse" aria-hidden="true" viewBox="0 0 20 20"><rect x="2.5" y="3" width="15" height="14" rx="2" /><path className="right-pane-toggle-fill" d="M11 3h4.5a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H11z" /><path d="M9.5 10h5m-2-2 2 2-2 2" /></svg>
+    : <svg className="right-pane-toggle-icon" data-pane-icon="expand" aria-hidden="true" viewBox="0 0 20 20"><rect x="2.5" y="3" width="15" height="14" rx="2" /><path d="M11.5 3v14" /><path d="M14.5 7.5v5" /></svg>
+}
+function ChatHeader({ session, project, lease, host, gitAvailable, sidebarCollapsed, toolsCollapsed, onToggleSidebar, onToggleTools, onRename, onTakeover }: { session?: Session; project?: Project; lease: SessionLease | null; host: PipiHostAPI; gitAvailable: boolean; sidebarCollapsed: boolean; toolsCollapsed: boolean; onToggleSidebar: () => void; onToggleTools: () => void; onRename: (sessionId: string, title: string) => Promise<void> | void; onTakeover: () => void }) {
+  const [renaming, setRenaming] = useState(false)
+  useEffect(() => setRenaming(false), [session?.id])
+  const readOnly = lease !== null && !leaseCanWrite(lease)
+  return <header className="chat-header">{sidebarCollapsed && <button className="pane-toggle pane-restore pane-restore-sidebar" data-testid="toggle-sidebar" title="展开左栏" aria-label="展开左栏" aria-expanded="false" onClick={onToggleSidebar}>≡</button>}<div className="chat-header-title">{renaming && session ? <InlineSessionTitleEditor value={session.name} ariaLabel="会话名称" className="chat-header-title-input" onCommit={async title => { await onRename(session.id, title); setRenaming(false) }} onCancel={() => setRenaming(false)} /> : <strong className="chat-header-title-label" role={session ? 'button' : undefined} tabIndex={session ? 0 : undefined} title={session ? '双击修改会话名称' : undefined} onDoubleClick={() => { if (session) setRenaming(true) }} onKeyDown={event => { if (session && (event.key === 'Enter' || event.key === 'F2')) { event.preventDefault(); setRenaming(true) } }}>{session?.name ?? '新会话'}</strong>}{readOnly && <span className="lease-detail">由 {leaseOwnerLabel(lease)} 运行中 · 只读 <button data-testid="lease-takeover-header" onClick={onTakeover}>强制接管</button></span>}</div><div className="chat-header-actions"><GitBranchMenu host={host} projectId={project?.id} available={gitAvailable} />{toolsCollapsed && <button className="pane-toggle" data-testid="toggle-tools" title="展开右栏" aria-label="展开右栏" aria-expanded="false" onClick={onToggleTools}><RightPaneToggleIcon expanded={false} /></button>}</div></header>
+}
 const MIN_COMPOSER_HEIGHT = 29
 const MAX_COMPOSER_HEIGHT = 150
 /** jsdom has no layout engine (scrollHeight is 0), so fall back to a line-based estimate there. */
@@ -1400,8 +1800,8 @@ function toPromptAttachment(a: ComposerAttachment): Promise<PromptAttachment> {
   return fileToPromptAttachment(a.file).catch(() => { throw new Error('无法读取图片') })
 }
 
-function Composer({ streaming, compacting, queueBusy, readOnly, leaseOwner, onTakeover, modelState, host, sessionId, statsRefreshKey, visibility, onOpenModelManager, onCompact, onSend, onStop, onModel }: { streaming: boolean; compacting: boolean; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover: () => void; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; statsRefreshKey: number; visibility: ModelVisibilityController; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: PromptAttachment[]) => Promise<boolean>; onStop: () => void; onModel: (state: ModelState) => void }) {
-  const [draft, setDraft] = useState('')
+function Composer({ streaming, working, stopping, stopError, compacting, queueBusy, readOnly, leaseOwner, onTakeover, modelState, host, sessionId, initialDraft = '', onDraftChange, statsRefreshKey, visibility, onOpenModelManager, onCompact, onSend, onStop, onDismissStopError, onModel, onOpenBrowserLogin }: { streaming: boolean; working: boolean; stopping: boolean; stopError: string | null; compacting: boolean; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover: () => void; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; initialDraft?: string; onDraftChange?: (draft: string) => void; statsRefreshKey: number; visibility: ModelVisibilityController; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: PromptAttachment[]) => Promise<boolean>; onStop: () => void; onDismissStopError: () => void; onModel: (state: ModelState) => void; onOpenBrowserLogin?: () => void }) {
+  const [draft, setDraft] = useState(initialDraft)
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
   const [attachError, setAttachError] = useState<string | null>(null)
@@ -1438,16 +1838,17 @@ function Composer({ streaming, compacting, queueBusy, readOnly, leaseOwner, onTa
     el.style.height = `${Math.min(measured, MAX_COMPOSER_HEIGHT)}px`
   }, [draft])
 
-  const changeDraft = (value: string) => { setDraft(value); setSlashHidden(false) }
+  const persistDraft = (value: string) => { setDraft(value); onDraftChange?.(value) }
+  const changeDraft = (value: string) => { persistDraft(value); setSlashHidden(false) }
   const dismissSlash = () => setSlashHidden(true)
   const executeSlash = (command: SlashCommandDef) => {
     setSlashHidden(true)
     if (command.action.kind === 'open-model-manager') {
       onOpenModelManager()
-      setDraft('') // Swift executeSlash clears the draft before running the command
+      persistDraft('') // Swift executeSlash clears the draft before running the command
     } else if (command.action.kind === 'compact') {
       onCompact()
-      setDraft('')
+      persistDraft('')
     }
   }
 
@@ -1499,7 +1900,7 @@ function Composer({ streaming, compacting, queueBusy, readOnly, leaseOwner, onTa
       const ok = await onSend(hasText ? draft : '', payload.length ? payload : undefined)
       if (!ok) return
       clearAttachments()
-      setDraft('')
+      persistDraft('')
       setAttachError(null)
     } catch (err) {
       setSendError(`发送失败：${err instanceof Error ? err.message : String(err)}`)
@@ -1512,7 +1913,7 @@ function Composer({ streaming, compacting, queueBusy, readOnly, leaseOwner, onTa
     }
     if (event.key === 'ArrowDown' && slashVisible && slashMatches.length) { event.preventDefault(); setSlashIndex(i => Math.min(i + 1, slashMatches.length - 1)); return }
     if (event.key === 'ArrowUp' && slashVisible && slashMatches.length) { event.preventDefault(); setSlashIndex(i => Math.max(i - 1, 0)); return }
-    if (event.key === 'Tab' && slashVisible && slashMatches.length) { event.preventDefault(); setDraft(`/${slashMatches[Math.min(slashIndex, slashMatches.length - 1)].name} `); setSlashHidden(true); return }
+    if (event.key === 'Tab' && slashVisible && slashMatches.length) { event.preventDefault(); persistDraft(`/${slashMatches[Math.min(slashIndex, slashMatches.length - 1)].name} `); setSlashHidden(true); return }
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
       if (slashVisible && slashMatches.length > 0) { executeSlash(slashMatches[Math.min(slashIndex, slashMatches.length - 1)]); return }
@@ -1542,13 +1943,13 @@ function Composer({ streaming, compacting, queueBusy, readOnly, leaseOwner, onTa
         </div>
       ))}
     </div>}
-    {(attachError || sendError) && <div className="composer-error" data-testid="composer-error"><span>{sendError ?? attachError}</span><button className="composer-error-close" aria-label="关闭错误提示" data-testid="composer-error-close" onClick={() => { setSendError(null); setAttachError(null) }}>×</button></div>}
-    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将加入队列…' : '给 PipiUI 发送消息…'} rows={1} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{streaming && !showQueueSubmit ? <button aria-label="停止生成" className="send stop" onClick={onStop}>■</button> : <button aria-label={queueBusy ? '加入消息队列' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button>}</div></div>
-    <div className="composer-options"><div className="composer-options-left"><div className="quick-menu-anchor"><button className="model-chip" aria-label="当前模型" title="切换模型" data-testid="model-chip" onClick={() => setQuickOpen(value => !value)}>{modelState?.model && <ProviderLogo provider={modelState.model.provider} modelId={modelState.model.id} size={13} />}<span className="model-chip-name">{modelState?.model.name ?? '加载模型…'}</span></button>{quickOpen && <ModelQuickMenu groups={visibility.quickGroups} current={modelState?.model ?? null} onSelect={model => void handleQuickSelect(model)} onClose={() => setQuickOpen(false)} />}</div><ThinkingChip level={modelState?.thinkingLevel ?? 'medium'} levels={modelState?.availableThinkingLevels ?? ['medium']} onChange={level => void setThinking(level)} /></div><div className="composer-stats" data-testid="composer-session-stats"><SessionStatsPill host={host} sessionId={sessionId} isStreaming={streaming} isCompacting={compacting} refreshKey={statsRefreshKey} /><QuotaPill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} /><BalancePill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} /></div></div>
+    {(attachError || sendError || stopError) && <div className="composer-error" data-testid="composer-error"><span>{stopError ?? sendError ?? attachError}</span><button className="composer-error-close" aria-label="关闭错误提示" data-testid="composer-error-close" onClick={() => { setSendError(null); setAttachError(null); onDismissStopError() }}>×</button></div>}
+    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将加入队列…' : '给 PipiUI 发送消息…'} rows={1} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '加入消息队列' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
+    <div className="composer-options"><div className="composer-options-left"><div className="quick-menu-anchor"><button className="model-chip" aria-label="当前模型" title="切换模型" data-testid="model-chip" onClick={() => setQuickOpen(value => !value)}>{modelState?.model && <ProviderLogo provider={modelState.model.provider} modelId={modelState.model.id} size={13} />}<span className="model-chip-name">{modelState?.model.name ?? '加载模型…'}</span></button>{quickOpen && <ModelQuickMenu groups={visibility.quickGroups} current={modelState?.model ?? null} onSelect={model => void handleQuickSelect(model)} onClose={() => setQuickOpen(false)} />}</div><ThinkingChip level={modelState?.thinkingLevel ?? 'off'} levels={modelState?.availableThinkingLevels ?? []} onChange={level => void setThinking(level)} /></div><div className="composer-stats" data-testid="composer-session-stats"><SessionStatsPill host={host} sessionId={sessionId} isStreaming={streaming} isCompacting={compacting} refreshKey={statsRefreshKey} /><QuotaPill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} onOpenBrowserLogin={onOpenBrowserLogin} /><BalancePill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} /></div></div>
     {lightboxIndex !== null && attachments[lightboxIndex] && <div className="lightbox-backdrop" data-testid="lightbox" onMouseDown={event => { if (event.target === event.currentTarget) setLightboxIndex(null) }}><img src={attachments[lightboxIndex].url} alt="图片预览" /><button className="lightbox-close" aria-label="关闭预览" onClick={() => setLightboxIndex(null)}>×</button></div>}
   </footer>
 }
-function ToolQuickRail({ activeTab, toolsCollapsed, onSelect, host, browserAvailable, terminalAvailable, subagentsRunning }: { activeTab: PanelTab; toolsCollapsed: boolean; onSelect: (tab: PanelTab) => void; host: PipiHostAPI; browserAvailable: boolean | undefined; terminalAvailable: boolean | undefined; subagentsRunning: boolean }) {
+function ToolQuickRail({ activeTab, toolsCollapsed, onSelect, host, browserAvailable, terminalAvailable, subagentsRunningCount }: { activeTab: PanelTab; toolsCollapsed: boolean; onSelect: (tab: PanelTab) => void; host: PipiHostAPI; browserAvailable: boolean | undefined; terminalAvailable: boolean | undefined; subagentsRunningCount: number }) {
   return <nav className="tool-quick-rail" aria-label="工具面板" data-testid="tool-quick-rail">
     {tabs.map(tab => {
       const browserUnavailable = tab === 'Browser' && (browserAvailable === false || !host.browser)
@@ -1558,12 +1959,12 @@ function ToolQuickRail({ activeTab, toolsCollapsed, onSelect, host, browserAvail
       const active = activeTab === tab && !toolsCollapsed
       return <button key={tab} className={`tool-rail-button${active ? ' active' : ''}`} aria-label={tab} aria-current={active ? 'page' : undefined} aria-disabled={unavailable || undefined} disabled={unavailable} title={unavailable ? unavailableTitle : tab} onClick={() => onSelect(tab)}>
         <span className="tool-rail-icon" aria-hidden="true" style={{ width: 13 * toolRailIcons[tab].ratio, WebkitMaskImage: `url(${toolRailIcons[tab].src})`, maskImage: `url(${toolRailIcons[tab].src})` }} />
-        {tab === 'Subagents' && subagentsRunning && <span className="tool-rail-running" aria-label="有运行中的 subagent" />}
+        {tab === 'Subagents' && subagentsRunningCount > 0 && <span className="tool-rail-running" aria-label={`${subagentsRunningCount} 个运行中的 subagent`}>{subagentsRunningCount}</span>}
       </button>
     })}
   </nav>
 }
-function ToolPanel({ activeTab, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningChange, browserAvailable, browserOccluded, terminalAvailable, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument }: { activeTab: PanelTab; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningChange: (running: boolean) => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void }) {
+function ToolPanel({ activeTab, collapsed, onToggleCollapsed, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted, browserAvailable, browserOccluded, terminalAvailable, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument }: { activeTab: PanelTab; collapsed: boolean; onToggleCollapsed: () => void; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningCountChange: (count: number) => void; onSubagentStarted: () => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void }) {
   const [terminalMounted, setTerminalMounted] = useState(activeTab === 'Terminal')
   const [documentMounted, setDocumentMounted] = useState(activeTab === 'Document')
   const [browserMounted, setBrowserMounted] = useState(activeTab === 'Browser')
@@ -1573,8 +1974,9 @@ function ToolPanel({ activeTab, host, theme, sessionId, announcedTerminal, revea
     if (activeTab === 'Browser') setBrowserMounted(true)
   }, [activeTab])
   return <aside className="tool-panel">
+    {!collapsed && <header className="tool-panel-header"><strong>{activeTab}</strong><button className="pane-toggle" data-testid="toggle-tools" title="收起右栏" aria-label="收起右栏" aria-expanded="true" onClick={onToggleCollapsed}><RightPaneToggleIcon expanded /></button></header>}
     <div className="tool-content">
-      <div className="tool-page subagent-content" hidden={activeTab !== 'Subagents'}><SubagentPanel host={host} sessionId={sessionId} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onRunningChange={onSubagentsRunningChange} /></div>
+      <div className="tool-page subagent-content" hidden={activeTab !== 'Subagents'}><SubagentPanel host={host} sessionId={sessionId} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onRunningCountChange={onSubagentsRunningCountChange} onAgentStarted={onSubagentStarted} /></div>
       {activeTab === 'Terminal' && terminalAvailable === false ? <div className="tool-page"><div className="empty-panel" data-testid="terminal-unavailable"><b>Terminal 不可用</b><p>当前连接未提供终端能力。</p></div></div> : terminalMounted || activeTab === 'Terminal' ? <div className="tool-page terminal-content" hidden={activeTab !== 'Terminal'}><TerminalPanel host={host} theme={theme} sessionId={sessionId} announcedTerminal={announcedTerminal} revealedTerminalId={revealedTerminalId} projectId={projectId} projectPath={projectPath} visible={activeTab === 'Terminal'} /></div> : null}
       {documentMounted || activeTab === 'Document' ? <div className="tool-page document-content" hidden={activeTab !== 'Document'}><DocumentPanel host={host} documentPath={openedDocumentPath} /></div> : null}
       {browserMounted || activeTab === 'Browser' ? <div className="tool-page browser-content" hidden={activeTab !== 'Browser'}>{browserAvailable === true && host.browser ? <BrowserPanel host={host} sessionId={sessionId} occluded={browserOccluded || activeTab !== 'Browser'} /> : <div className="empty-panel browser-placeholder" data-testid="browser-unavailable"><b>Browser 不可用</b><p>{browserAvailable === undefined ? '正在检查当前连接的浏览器能力…' : '当前连接未提供桌面浏览器能力。'}</p></div>}</div> : null}

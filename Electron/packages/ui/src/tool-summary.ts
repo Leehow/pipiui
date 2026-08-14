@@ -54,7 +54,16 @@ function grepSummary(args: Record<string, unknown>): string {
 
 /** `subagent` → the dispatched task/title so the folded card says what the agent is doing. */
 function subagentSummary(args: Record<string, unknown>): string {
-  const raw = stringField(args, 'title') ?? stringField(args, 'task') ?? stringField(args, 'name')
+  const tasks = Array.isArray(args['tasks'])
+    ? args['tasks'].flatMap(item => {
+      if (!item || typeof item !== 'object') return []
+      const task = item as Record<string, unknown>
+      return [stringField(task, 'title') ?? stringField(task, 'task') ?? stringField(task, 'name')].filter((value): value is string => Boolean(value))
+    })
+    : []
+  const raw = tasks.length > 0
+    ? tasks.join('、')
+    : stringField(args, 'title') ?? stringField(args, 'task') ?? stringField(args, 'name')
   if (!raw) return '…'
   const compact = raw.replace(/\s+/g, ' ').trim()
   return compact.length <= MAX_PROMPT ? compact : `${compact.slice(0, MAX_PROMPT)}…`

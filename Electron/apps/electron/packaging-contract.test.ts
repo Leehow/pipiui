@@ -10,6 +10,8 @@ import packageJSON from './package.json'
 describe('macOS packaging contract', () => {
   const wrapper = readFileSync(resolve(import.meta.dirname, '../../../scripts/build-electron-app.sh'), 'utf8')
   const targetPackager = readFileSync(resolve(import.meta.dirname, '../../scripts/package-electron-target.mjs'), 'utf8')
+  const runtimePreparer = readFileSync(resolve(import.meta.dirname, '../../scripts/fetch-pi-runtime.mjs'), 'utf8')
+  const brokerPackage = JSON.parse(readFileSync(resolve(import.meta.dirname, '../../resources/runtime/pi-ext/packages/memory-broker/package.json'), 'utf8'))
   it('packages x64 and arm64 sequentially so their app staging directories cannot race', () => {
     const script = packageJSON.scripts['package:mac']
     expect(script).toMatch(/package-electron-target\.mjs --platform darwin --arch x64 -- --mac --x64 && node .*package-electron-target\.mjs --platform darwin --arch arm64 -- --mac --arm64/)
@@ -29,6 +31,19 @@ describe('macOS packaging contract', () => {
       from: '../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}',
       to: 'pipiui-embedded'
     }))
+  })
+
+  it('ships Hermes through the target-specific embedded runtime, never the source-tree node_modules exclusion', () => {
+    const runtimeSource = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime')
+    const embedded = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-embedded')
+    expect(runtimeSource?.filter).toContain('!**/node_modules/**')
+    expect(embedded?.from).toBe('../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}')
+    expect(embedded?.filter).toBeUndefined()
+    expect(brokerPackage.dependencies['pi-hermes-memory']).toBe('0.9.4')
+    expect(runtimePreparer).toContain("const hermesPackageName = 'pi-hermes-memory'")
+    expect(runtimePreparer).toContain("npm_config_runtime: 'electron'")
+    expect(runtimePreparer).toContain("npm_config_disturl: 'https://electronjs.org/headers'")
+    expect(runtimePreparer).toContain('npm_config_arch: arch')
   })
 
   // electron-builder's `files` allow-list governs only the app source file set:
@@ -94,7 +109,11 @@ describe('macOS packaging contract', () => {
     expect(runtimeCalls.length).toBeGreaterThan(0)
     expect(runtimeCalls.every(line => line.includes('--check'))).toBe(true)
     expect(wrapper).not.toContain('npm install')
-    expect(packageJSON.build.mac.binaries).toContain('Contents/Resources/pipiui-embedded/node/bin/node')
+    // The embedded Node is a shell shim that execs Electron in Node mode, not a
+    // Mach-O. Listing it here would make electron-builder try to codesign a
+    // script; finalize_mac_bundle skips it on its own because
+    // discover_macho_candidates settles format with `file`.
+    expect(packageJSON.build.mac.binaries).toBeUndefined()
     expect(packageJSON.build.forceCodeSigning).toBe(true)
   })
 
@@ -118,6 +137,7 @@ describe('macOS packaging contract', () => {
     expect(wrapper).toContain("-name '*.framework' -o -name '*.xpc' -o -name '*.app'")
     expect(wrapper).toMatch(/codesign --sign "\$CSC_NAME" --force --timestamp --options runtime[\s\S]*--entitlements "\$MAC_INHERIT_ENTITLEMENTS" "\$nested"/)
     expect(wrapper).toMatch(/codesign --sign "\$CSC_NAME" --force --timestamp --options runtime[\s\S]*--entitlements "\$MAC_ENTITLEMENTS" "\$app"/)
+    expect(wrapper).toMatch(/--entitlements "\$MAC_ENTITLEMENTS" "\$app"\s+#[\s\S]*verify_embedded_node_signing "\$embedded_node" "\$app"\s+codesign --verify --deep --strict --verbose=2 "\$app"/)
     expect(wrapper).toMatch(/codesign --verify --deep --strict --verbose=2 "\$app"/)
     expect(wrapper).toMatch(/mv "\$APP_SRC" "\$APP_DST"[\s\S]*codesign --verify --deep --strict --verbose=2 "\$APP_DST"/)
   })

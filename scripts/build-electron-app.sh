@@ -104,10 +104,68 @@ canonical_electron_app_is_running() {
   process_list_contains_exact_executable "$executable" < <(/bin/ps -axo pid=,comm=)
 }
 
+verify_embedded_node_shim() {
+  local shim="$1"
+  local app="$2"
+  local app_name electron_binary helper_plist background_agent entitlements jit_entitlement probe
+
+  [[ -x "$shim" ]] || { echo "ERROR: embedded Node shim is not executable: $shim" >&2; return 1; }
+  head -c 2 "$shim" | grep -q '#!' || {
+    echo "ERROR: embedded Node is neither a Mach-O nor a shim script: $shim" >&2
+    return 1
+  }
+
+  app_name="$(basename "$app" .app)"
+  electron_binary="$app/Contents/Frameworks/$app_name Helper.app/Contents/MacOS/$app_name Helper"
+  helper_plist="$app/Contents/Frameworks/$app_name Helper.app/Contents/Info.plist"
+  [[ -x "$electron_binary" ]] || { echo "ERROR: no background Electron Helper to back the Node shim: $electron_binary" >&2; return 1; }
+  background_agent="$(/usr/bin/plutil -extract LSUIElement raw -o - "$helper_plist" 2>/dev/null || true)"
+  [[ "$background_agent" == "true" ]] || {
+    echo "ERROR: Electron Node host is not an LSUIElement background helper: $helper_plist" >&2
+    return 1
+  }
+
+  # V8 needs JIT wherever it runs. That requirement moved from the standalone
+  # Node onto the Electron binary the shim delegates to, so assert it there.
+  if ! entitlements="$(codesign -d --entitlements :- "$electron_binary" 2>/dev/null)"; then
+    echo "ERROR: could not read entitlements for $electron_binary" >&2
+    return 1
+  fi
+  jit_entitlement="$(
+    printf '%s' "$entitlements" \
+      | /usr/bin/plutil -extract 'com\.apple\.security\.cs\.allow-jit' raw -o - - 2>/dev/null \
+      || true
+  )"
+  if [[ "$jit_entitlement" != "true" ]]; then
+    echo "ERROR: Electron binary backing the Node shim lacks com.apple.security.cs.allow-jit: $electron_binary" >&2
+    return 1
+  fi
+
+  # The startup probe is the whole point: prove the shim really yields a Node.
+  probe="$(/usr/bin/env -i HOME="${TMPDIR:-/tmp}" PATH=/usr/bin:/bin \
+    PIPIUI_ELECTRON_BINARY="$electron_binary" \
+    "$shim" -e 'process.stdout.write(process.versions.node)' 2>/dev/null)" || {
+    echo "ERROR: embedded Node shim failed its startup probe: $shim" >&2
+    return 1
+  }
+  [[ -n "$probe" ]] || { echo "ERROR: embedded Node shim reported no Node version: $shim" >&2; return 1; }
+  echo "Embedded Node shim verified; background Electron Helper provides Node $probe with allow-jit."
+}
+
 verify_embedded_node_signing() {
   local embedded_node="$1"
+  local app="${2:-}"
   local embedded_entitlements jit_entitlement host_arch node_arches
   local -a node_command=()
+
+  # The embedded Node is a shell shim that execs Electron's background Helper in
+  # Node mode; shipping a standalone Node cost ~85MB once Electron 43 cleared pi's
+  # Node floor. Nothing about a script can be codesigned, arch-probed, or carry
+  # entitlements, so verify what actually has to hold on the Helper instead.
+  if [[ "$(/usr/bin/file -b "$embedded_node")" != Mach-O* ]]; then
+    verify_embedded_node_shim "$embedded_node" "$app"
+    return $?
+  fi
 
   if ! codesign --verify --strict --verbose=2 "$embedded_node"; then
     echo "ERROR: embedded Node signature verification failed: $embedded_node" >&2
@@ -190,8 +248,6 @@ finalize_mac_bundle() {
       | sort -rn \
       | cut -d' ' -f2-
   )
-  verify_embedded_node_signing "$embedded_node"
-
   while IFS= read -r nested; do
     case "$nested" in
       *.app|*.xpc)
@@ -212,6 +268,10 @@ finalize_mac_bundle() {
 
   codesign --sign "$CSC_NAME" --force --timestamp --options runtime \
     --entitlements "$MAC_ENTITLEMENTS" "$app"
+  # A script shim delegates Node execution to the root Electron binary, so its
+  # JIT check is only meaningful after that binary carries the final entitlement.
+  # Standalone embedded Node binaries remain fully verified here as well.
+  verify_embedded_node_signing "$embedded_node" "$app"
   codesign --verify --deep --strict --verbose=2 "$app"
 }
 

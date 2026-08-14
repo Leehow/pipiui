@@ -19,6 +19,10 @@
       "tool": "subagent",
       "required": true
     },
+    "delegate_parallel": {
+      "tool": "subagent_parallel",
+      "required": true
+    },
     "delegate_status": {
       "tool": "subagent_status",
       "required": false,

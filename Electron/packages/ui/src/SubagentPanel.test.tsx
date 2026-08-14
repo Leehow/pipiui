@@ -93,6 +93,53 @@ describe('SubagentPanel', () => {
     await waitFor(() => expect(screen.queryByLabelText('标记 failed 已处理')).toBeNull())
   })
 
+  it('shows a Chinese title in the list instead of a long English task', async () => {
+    const harness = hostHarness()
+    const longTask = 'Investigate why Electron PipiUI cannot use openai-codex Grok models for the right-rail subagent list title'
+    harness.host.listAgents = async () => [{
+      agentId: 'titled', runId: 'r-titled', name: 'explore', title: '核对思考档与隐藏模型', task: longTask, state: 'ok', createdAt: 1
+    }]
+    render(<SubagentPanel host={harness.host} />)
+
+    const row = await screen.findByTestId('agent-row-titled')
+    expect(row.querySelector('small')?.textContent).toBe('核对思考档与隐藏模型')
+    expect(row.textContent).not.toContain(longTask)
+    expect(row.textContent).not.toContain('Investigate why Electron PipiUI')
+    expect(document.querySelector('.detail-agent-title b')?.textContent).toBe('核对思考档与隐藏模型')
+  })
+
+  it('derives a short list label from a long untitled task instead of dumping the brief', async () => {
+    const harness = hostHarness()
+    const longTask = 'Read-only. Repo: /Users/haoli/leehow/code/pipiui. Investigate why Electron PipiUI cannot use openai-codex Grok models and report the root cause with files and commands.'
+    harness.host.listAgents = async () => [{
+      agentId: 'untitled', runId: 'r-untitled', name: 'explore', title: '', task: longTask, state: 'ok', createdAt: 1
+    }]
+    render(<SubagentPanel host={harness.host} />)
+
+    const row = await screen.findByTestId('agent-row-untitled')
+    const label = row.querySelector('small')?.textContent ?? ''
+    expect(label.startsWith('Read-only.')).toBe(true)
+    expect(label.length).toBeLessThanOrEqual(41)
+    expect(label).toContain('…')
+    expect(row.textContent).not.toContain('/Users/haoli/leehow/code/pipiui')
+    expect(row.textContent).not.toContain(longTask)
+    expect(document.querySelector('.detail-agent-title b')?.textContent).toBe(label)
+  })
+
+  it('prefers an English title over a Chinese task in the list', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [{
+      agentId: 'en-title', runId: 'r-en', name: 'reviewer', title: 'Check hidden models', task: '核对思考档与隐藏模型的完整任务说明',
+      state: 'ok', createdAt: 1
+    }]
+    render(<SubagentPanel host={harness.host} />)
+
+    const row = await screen.findByTestId('agent-row-en-title')
+    expect(row.querySelector('small')?.textContent).toBe('Check hidden models')
+    expect(row.textContent).not.toContain('核对思考档与隐藏模型的完整任务说明')
+    expect(document.querySelector('.detail-agent-title b')?.textContent).toBe('Check hidden models')
+  })
+
   it('shows the actionable empty state after an empty snapshot', async () => {
     const harness = hostHarness()
     render(<SubagentPanel host={harness.host} />)
@@ -547,6 +594,35 @@ describe('SubagentPanel', () => {
     const thinkingCard = screen.getByRole('button', { name: /^Thinking/ })
     fireEvent.click(thinkingCard)
     expect(await screen.findByText('plan')).toBeTruthy()
+  })
+
+  it('streams thinking and tools as chronological detail steps instead of one overwritten Thinking header', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running' } })
+    await screen.findByTestId('agent-row-run')
+    await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
+
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'thinking', text: 'first-plan', contentIndex: 0 })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'grep', text: '{"pattern":"agentTranscript"}', contentIndex: 1 })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'toolResult', text: 'match', contentIndex: 2 })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'thinking', text: 'second-plan', contentIndex: 3 })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'find', text: '{"pattern":"*.tsx"}', contentIndex: 4 })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'toolResult', text: 'file', contentIndex: 5 })
+
+    await screen.findByRole('button', { name: /4 个步骤/ })
+    const thinkingCards = screen.getAllByRole('button', { name: /^Thinking/ })
+    expect(thinkingCards).toHaveLength(2)
+    const stepCards = [...document.querySelectorAll('[data-testid="subagent-transcript"] [data-activity-card="thinking"], [data-testid="subagent-transcript"] [data-activity-card="tool"]')]
+    expect(stepCards.map(card => card.getAttribute('data-activity-card'))).toEqual(['thinking', 'tool', 'thinking', 'tool'])
+    expect(stepCards[1].textContent).toMatch(/grep/)
+    expect(stepCards[3].textContent).toMatch(/find/)
+    expect(screen.queryByText('first-plan')).toBeNull()
+    fireEvent.click(thinkingCards[0])
+    expect(await screen.findByText('first-plan')).toBeTruthy()
+    if (thinkingCards[1].getAttribute('aria-expanded') === 'false') fireEvent.click(thinkingCards[1])
+    expect(await screen.findByText('second-plan')).toBeTruthy()
+    expect(screen.queryByText(/first-plan\s*second-plan/)).toBeNull()
   })
 
   it('applies the prefix-replace fallback for hosts without contentIndex', async () => {

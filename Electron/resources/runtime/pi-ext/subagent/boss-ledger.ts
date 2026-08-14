@@ -37,10 +37,40 @@ export function beginWave(): void {
 	waveCounter += 1;
 }
 
-function ledgerPath(mainCwd: string, sessionKey: string | undefined): string {
+/** Exported so the Boss's own note tool writes to exactly the file the runtime maintains. */
+export function ledgerPath(mainCwd: string, sessionKey: string | undefined): string {
 	const key = sessionKey?.trim() || "terminal";
 	return path.join(mainCwd, ".pi", "boss", `ledger-${key}.md`);
 }
+
+/**
+ * The seeded layout. Exported because `ledger_note` may be the first thing that touches a
+ * session's ledger — a Boss that records a decision before it dispatches must not end up
+ * with a file whose headings the runtime's own upserts cannot find.
+ */
+export const LEDGER_TEMPLATE = [
+	"# Ledger",
+	"<one-line session goal>",
+	"",
+	"## Decisions",
+	"<!-- user mid-course changes / additions / cancellations: time + content + affected task IDs -->",
+	"",
+	TASKS_HEADING,
+	"<!-- Runtime-owned: written from real dispatch and completion events. Do not hand-edit. -->",
+	TASKS_HEADER_ROW,
+	TASKS_DIVIDER_ROW,
+	"",
+	"## Done",
+	"<!-- one line per finished task: conclusion + key evidence (file paths / command results) -->",
+	"",
+	"## Risks & open questions",
+	"",
+	"## Closeout dispositions",
+	"| item | disposition | evidence/reason |",
+	"| ---- | ----------- | --------------- |",
+	"<!-- disposition: cleaned | retained | needs-fixer | needs-user -->",
+	"",
+].join("\n");
 
 /**
  * Seed the boss ledger the first time this session actually dispatches.
@@ -57,33 +87,7 @@ export function seedBossLedger(mainCwd: string | undefined, sessionKey: string |
 	try {
 		if (fs.existsSync(file)) return;
 		fs.mkdirSync(path.dirname(file), { recursive: true });
-		fs.writeFileSync(
-			file,
-			[
-				"# Ledger",
-				"<one-line session goal>",
-				"",
-				"## Decisions",
-				"<!-- user mid-course changes / additions / cancellations: time + content + affected task IDs -->",
-				"",
-				TASKS_HEADING,
-				"<!-- Runtime-owned: written from real dispatch and completion events. Do not hand-edit. -->",
-				TASKS_HEADER_ROW,
-				TASKS_DIVIDER_ROW,
-				"",
-				"## Done",
-				"<!-- one line per finished task: conclusion + key evidence (file paths / command results) -->",
-				"",
-				"## Risks & open questions",
-				"",
-				"## Closeout dispositions",
-				"| item | disposition | evidence/reason |",
-				"| ---- | ----------- | --------------- |",
-				"<!-- disposition: cleaned | retained | needs-fixer | needs-user -->",
-				"",
-			].join("\n"),
-			"utf-8",
-		);
+		fs.writeFileSync(file, LEDGER_TEMPLATE, "utf-8");
 	} catch {
 		// The boss can still create it itself; never fail a dispatch over bookkeeping.
 	}

@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react'
-import type { AgentDefinition, Model, PipiHostAPI, SubagentModelSetting } from '@pipi/host-api'
+import { thinkingLevelsForModel } from '@pipi/host-api'
+import type { AgentDefinition, Model, PipiHostAPI, SubagentModelSetting, ThinkingLevel } from '@pipi/host-api'
 import { modelRef } from './model-visibility'
 import { ProviderLogo } from './ProviderLogo'
 import type { ModelVisibilityController } from './useModelVisibility'
 import './subagent-models.css'
 
-const THINKING_LEVELS = ['off', 'low', 'medium', 'high'] as const
 const COMPUTER_USE_AGENT_NAMES = new Set(['computer-use-leader', 'operator', 'computer-verifier', 'computer-terminal'])
 const VISUAL_COMPUTER_USE_AGENT_NAMES = new Set(['operator', 'computer-verifier'])
+const COMPUTER_USE_WORKER_ORDER = ['operator', 'computer-verifier', 'computer-terminal']
 
 /** Per-role ordered model fallback editor, mirroring Swift Settings > Subagent. */
 export function SubagentModelModal({ host, current, visibility, onClose }: { host: PipiHostAPI; current: Model | null; visibility: ModelVisibilityController; onClose: () => void }) {
@@ -22,8 +23,11 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
   // its one intentional exception: a currently selected but unchecked model.
   // Subagent primary and fallback rows must only offer checked models.
   const candidateModels = visibility.quickModels.filter(model => !visibility.hiddenIds.has(modelRef(model)))
-	const computerUseAgents = agents.filter(agent => COMPUTER_USE_AGENT_NAMES.has(agent.name))
-	const generalAgents = agents.filter(agent => !COMPUTER_USE_AGENT_NAMES.has(agent.name))
+  const computerUseLeader = agents.find(agent => agent.name === 'computer-use-leader')
+  const computerUseWorkers = COMPUTER_USE_WORKER_ORDER
+    .map(name => agents.find(agent => agent.name === name))
+    .filter((agent): agent is AgentDefinition => Boolean(agent))
+  const generalAgents = agents.filter(agent => !COMPUTER_USE_AGENT_NAMES.has(agent.name))
 
   useEffect(() => {
     if (!host.getSubagentModels || !host.listAgentDefinitions) return
@@ -75,16 +79,22 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
         ) : (
           <div className="subagent-modal-body">
             <div className="subagent-main-model">
-              {current ? <><ProviderLogo provider={current.provider} modelId={current.id} size={14} /> 当前主 Agent（底栏）：{current.name}（{current.id}）</> : '当前无打开会话；「跟随」将在派出时使用当时底栏选中的模型。'}
+              {current ? <><ProviderLogo provider={current.provider} modelId={current.id} size={14} /> 当前主 Agent（底栏）：{current.name}（{current.provider}/{current.id}）</> : '当前无打开会话；「跟随」将在派出时使用当时底栏选中的模型。'}
             </div>
-			{computerUseAgents.length > 0 && <section className="subagent-agent-group" aria-labelledby="computer-use-models-heading">
-			  <div className="subagent-agent-group-heading"><h3 id="computer-use-models-heading">Computer Use Agent</h3><span>Leader 与专属执行/验证子 agent 可分别设置</span></div>
-			  {computerUseAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} onSave={save} />)}
-			</section>}
-			<section className="subagent-agent-group" aria-labelledby="general-subagent-models-heading">
-			  <div className="subagent-agent-group-heading"><h3 id="general-subagent-models-heading">通用 Subagents</h3></div>
-			  {generalAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} onSave={save} />)}
-			</section>
+            <section className="subagent-agent-group" aria-labelledby="general-subagent-models-heading">
+              <div className="subagent-agent-group-heading"><h3 id="general-subagent-models-heading">通用 Subagents</h3></div>
+              {generalAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} onSave={save} />)}
+            </section>
+            {(computerUseLeader || computerUseWorkers.length > 0) && <section className="subagent-agent-group subagent-computer-use-group" aria-labelledby="computer-use-models-heading" data-testid="computer-use-model-hierarchy">
+              <div className="subagent-agent-group-heading"><h3 id="computer-use-models-heading">Computer Use Agents</h3><span>Leader 主管下属专用执行与验证 Agent</span></div>
+              <div className="subagent-computer-use-tree">
+                {computerUseLeader && <AgentRow hierarchy="leader" agent={computerUseLeader} chain={settings[computerUseLeader.name] ?? []} models={candidateModels} saving={saving === computerUseLeader.name} onSave={save} />}
+                {computerUseWorkers.length > 0 && <div className="subagent-computer-use-children" role="group" aria-label="Computer Use Leader 的子 Agent">
+                  <div className="subagent-computer-use-branch-label"><span aria-hidden="true">↳</span> Leader 调度</div>
+                  {computerUseWorkers.map(agent => <AgentRow hierarchy="worker" key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} onSave={save} />)}
+                </div>}
+              </div>
+            </section>}
             {error && <div className="subagent-modal-error" role="alert"><span>{error}</span><button type="button" aria-label="关闭 Subagent 模型错误" onClick={() => setError(null)}>×</button></div>}
           </div>
         )}
@@ -93,60 +103,73 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
   )
 }
 
-function AgentRow({ agent, chain, models, saving, onSave }: {
+function AgentRow({ agent, chain, models, saving, onSave, hierarchy }: {
   agent: AgentDefinition
   chain: SubagentModelSetting[]
   models: Model[]
   saving: boolean
   onSave: (agentName: string, chain: SubagentModelSetting[]) => Promise<void>
+  hierarchy?: 'leader' | 'worker'
 }) {
+  // Persisted selections are provider-qualified. A historical bare id must not
+  // masquerade as the first matching provider in the current catalog.
   const findModel = (ref: string) => models.find(candidate => modelRef(candidate) === ref)
-    ?? models.find(candidate => candidate.id === ref)
   const rows = chain.length ? chain : [{ model: '', thinking: undefined }]
   const changeModel = (index: number, selectedRef: string) => {
     if (index === 0 && selectedRef === '') {
       void onSave(agent.name, [])
       return
     }
-    const model = findModel(selectedRef)
     const next = chain.length ? [...chain] : [{ model: '', thinking: undefined }]
-    next[index] = { model: selectedRef, ...(model?.reasoning ? { thinking: next[index]?.thinking ?? 'off' } : {}) }
+    const previousThinking = next[index]?.thinking
+    const selected = findModel(selectedRef)
+    const allowed = selected ? thinkingLevelsForModel(selected) : []
+    next[index] = {
+      model: selectedRef,
+      ...(previousThinking && allowed.includes(previousThinking as ThinkingLevel)
+        ? { thinking: previousThinking }
+        : {}),
+    }
     void onSave(agent.name, next)
   }
   const changeThinking = (index: number, thinking: string) => {
     const next = [...chain]
     if (!next[index]) return
-    next[index] = { ...next[index], thinking }
+    const { thinking: _previous, ...entry } = next[index]
+    next[index] = thinking ? { ...entry, thinking } : entry
     void onSave(agent.name, next)
   }
   const addFallback = () => {
     const first = models[0]
     if (!first) return
     const firstRef = modelRef(first)
-    const primary = chain.length ? chain : [{ model: firstRef, ...(first.reasoning ? { thinking: 'off' } : {}) }]
-    void onSave(agent.name, [...primary, { model: firstRef, ...(first.reasoning ? { thinking: 'off' } : {}) }])
+    const primary = chain.length ? chain : [{ model: firstRef }]
+    void onSave(agent.name, [...primary, { model: firstRef }])
   }
   const remove = (index: number) => void onSave(agent.name, chain.filter((_, itemIndex) => itemIndex !== index))
 
   return (
-    <article className="subagent-agent-row" data-testid={`subagent-agent-${agent.name}`}>
-      <div className="subagent-agent-heading"><strong>{agent.name}</strong>{chain.length > 1 && <span>fallback ×{chain.length}</span>}</div>
+    <article className={`subagent-agent-row${hierarchy ? ` subagent-agent-${hierarchy}` : ''}`} data-testid={`subagent-agent-${agent.name}`}>
+      <div className="subagent-agent-heading"><strong>{agent.name}</strong>{hierarchy && <span className="subagent-agent-hierarchy-badge">{hierarchy === 'leader' ? '主管' : '子 Agent'}</span>}{chain.length > 1 && <span>fallback ×{chain.length}</span>}</div>
       <p>{agent.description}</p>
       {VISUAL_COMPUTER_USE_AGENT_NAMES.has(agent.name) && <p className="subagent-visual-model-hint">需要查看截图，建议选择支持图像输入的模型（如 Grok）。这只是建议，不会自动选择或覆盖你的设置。</p>}
       {rows.map((entry, index) => {
         const selected = findModel(entry.model)
-        const reasoning = selected?.reasoning
+        const thinkingLevels = selected ? thinkingLevelsForModel(selected) : []
+        const selectedThinking = thinkingLevels.includes(entry.thinking as ThinkingLevel) ? entry.thinking : ''
         return (
           <div className="subagent-chain-row" key={`${index}:${entry.model}`} data-testid={`subagent-chain-${agent.name}-${index}`}>
             {(index > 0 || chain.length > 1) && <div className="subagent-chain-label"><span>{index === 0 ? '主选' : `备用 ${index}`}</span>{chain.length > 1 && <button type="button" aria-label={`移除 ${agent.name} 备用模型 ${index}`} disabled={saving} onClick={() => remove(index)}>删除</button>}</div>}
-            <ModelPicker models={models} selected={selected} follow={index === 0 && !entry.model} allowFollow={index === 0} disabled={saving} onSelect={modelId => changeModel(index, modelId)} agentName={agent.name} index={index} />
-            {reasoning === false ? <div className="subagent-thinking-note">思考强度由模型决定</div> : (
+            <ModelPicker models={models} selected={selected} configuredRef={entry.model} follow={index === 0 && !entry.model} allowFollow={index === 0} disabled={saving} onSelect={modelId => changeModel(index, modelId)} agentName={agent.name} index={index} />
+            {entry.model && !selected && <div className="subagent-model-warning" role="alert">历史设置「{entry.model}」无法在当前模型中确认，请重新选择完整 provider/model。</div>}
+            {selected && thinkingLevels.length === 0 ? <div className="subagent-thinking-note">{selected.reasoning === false || selected.thinkingConfigurable === false ? '思考强度由模型决定' : '模型未报告可配置思考强度'}</div> : selected ? (
               <label className="subagent-thinking-select">思考强度
-                <select aria-label={`${agent.name} ${index} 思考强度`} value={entry.thinking ?? 'off'} disabled={saving || !entry.model} onChange={event => changeThinking(index, event.target.value)}>
-                  {THINKING_LEVELS.map(level => <option key={level} value={level}>{level}</option>)}
+                <select aria-label={`${agent.name} ${index} 思考强度`} value={selectedThinking} disabled={saving || !entry.model} onChange={event => changeThinking(index, event.target.value)}>
+                  <option value="">模型默认（不覆盖）</option>
+                  {thinkingLevels.map(level => <option key={level} value={level}>{level}</option>)}
                 </select>
               </label>
-            )}
+            ) : null}
           </div>
         )
       })}
@@ -155,9 +178,10 @@ function AgentRow({ agent, chain, models, saving, onSave }: {
   )
 }
 
-function ModelPicker({ models, selected, follow, allowFollow, disabled, onSelect, agentName, index }: {
+function ModelPicker({ models, selected, configuredRef, follow, allowFollow, disabled, onSelect, agentName, index }: {
   models: Model[]
   selected?: Model
+  configuredRef: string
   follow: boolean
   allowFollow: boolean
   disabled: boolean
@@ -167,7 +191,7 @@ function ModelPicker({ models, selected, follow, allowFollow, disabled, onSelect
 }) {
   const [open, setOpen] = useState(false)
   const pick = (modelId: string) => { setOpen(false); onSelect(modelId) }
-  const label = follow ? '跟随主 Agent' : selected ? `${selected.name}（${selected.id}）` : '选择模型'
+  const label = follow ? '跟随主 Agent' : selected ? `${selected.name}（${selected.provider}/${selected.id}）` : configuredRef ? `需重新选择 provider（${configuredRef}）` : '选择模型'
   return (
     <div className="subagent-model-picker">
       <button type="button" className="subagent-model-picker-trigger" aria-label={`${agentName} ${index} 模型`} aria-haspopup="listbox" aria-expanded={open} disabled={disabled} onClick={() => setOpen(value => !value)}>
@@ -179,7 +203,7 @@ function ModelPicker({ models, selected, follow, allowFollow, disabled, onSelect
         {models.map(model => {
           const ref = modelRef(model)
           const active = selected ? modelRef(selected) === ref && !follow : false
-          return <button type="button" role="option" aria-selected={active} className={active ? 'selected' : ''} key={ref} data-testid={`subagent-model-option-${agentName}-${index}-${model.provider}-${model.id}`} onClick={() => pick(ref)}><ProviderLogo provider={model.provider} modelId={model.id} size={14} /><span>{model.name}（{model.id}）</span>{active && <b aria-label="已选中">✓</b>}</button>
+          return <button type="button" role="option" aria-selected={active} className={active ? 'selected' : ''} key={ref} data-testid={`subagent-model-option-${agentName}-${index}-${model.provider}-${model.id}`} onClick={() => pick(ref)}><ProviderLogo provider={model.provider} modelId={model.id} size={14} /><span>{model.name}（{ref}）</span>{active && <b aria-label="已选中">✓</b>}</button>
         })}
       </div>}
     </div>

@@ -22,12 +22,23 @@
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  max-width: 100%;
-  padding: 5px 0;
+  max-width: var(--chat-content-max, 780px);
+  padding: 5px 14px;
   color: var(--wp-text);
   font: 12px/1.4 var(--wp-font);
   white-space: nowrap;
   user-select: none;
+  /* The transcript area is position:relative with overflow:hidden, and the
+     virtualized .message-list fills 100% height — an in-flow placeholder would
+     render below the fold and be clipped, so the waiting row would never be
+     visible after a send. Anchor it to the transcript tail so it always shows. */
+  position: absolute;
+  left: var(--chat-content-gutter, 16px);
+  right: calc(var(--chat-content-gutter, 16px) + var(--chat-scrollbar-gutter, 6px));
+  margin-inline: auto;
+  bottom: 8px;
+  z-index: 4;
+  background: linear-gradient(to top, var(--surface, #fff) 62%, transparent);
   animation: waiting-row-in 0.18s ease-out;
 }
 

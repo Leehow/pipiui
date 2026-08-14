@@ -23,7 +23,8 @@ const uiSourceEntry = resolve(uiPackageRoot, 'src/index.ts')
 const uiSourceAppCss = resolve(uiPackageRoot, 'src/app.css')
 export const fileViewerAssetOptions = {
   preset: 'office',
-  copyAssets: { baseDir: 'file-viewer' }
+  copyAssets: { baseDir: 'file-viewer' },
+  chunkStrategy: 'none'
 } satisfies FileViewerRenderersPluginOptions
 
 // A parallel workspace build/package rewrites these generated paths. Rollup's

@@ -24,7 +24,9 @@
   --mq-thumb-bg: rgba(0, 0, 0, 0.06);
   --mq-input-bg: #ffffff;
 
-  margin: 0 16px 8px;
+  width: var(--chat-content-width, calc(100% - 32px));
+  max-width: var(--chat-content-max, 780px);
+  margin: 0 auto 8px;
   border: 1px solid var(--mq-border-strong);
   border-radius: 9px;
   background: var(--mq-bg);

@@ -1,12 +1,16 @@
 import { ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
-import { createReadStream, existsSync, readFileSync, promises as fs } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, readFileSync, promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { pipeline } from "node:stream/promises";
 
 import {
   PIPI_HOST_PROTOCOL_VERSION,
+  THINKING_LEVELS,
   documentKindForName,
+  resolveThinkingLevel,
+  thinkingLevelsForModel,
   type AgentDefinition,
   type AgentEvent,
   type AgentSummary,
@@ -30,6 +34,7 @@ import {
   type SessionStats,
   type SubagentModelSetting,
   type ThinkingLevel,
+  type ThinkingLevelMap,
   type WorktreeStatus,
 } from "@pipi/host-api";
 import {
@@ -67,6 +72,11 @@ import {
   ProactiveCompactionScheduler,
   type ProactiveCompactionConfiguration,
 } from "./proactive-compaction.js";
+import {
+  generateModelSessionTitle,
+  isPlaceholderSessionTitle,
+  provisionalSessionTitle,
+} from "./session-title.js";
 export {
   ProactiveCompactionPolicy,
   ProactiveCompactionScheduler,
@@ -177,6 +187,12 @@ export async function readLocalDocument(input: unknown): Promise<DocumentContent
   }
 }
 export {
+  BOSS_MUTATION_TOOL_NAMES,
+  mainSessionExcludeToolArgs,
+  resolveMainSessionExcludedTools,
+  type MainToolPolicyInput,
+} from "./main-tool-policy.js";
+export {
   installRuntimeTree,
   syncTree,
   treeSignature,
@@ -284,6 +300,10 @@ export type PiBackendOptions = {
    */
   runtimeAssets?: RuntimeAssets;
   agentDir?: string;
+  /** Bind Pi children to agentDir/sessionsRoot instead of inheriting their ambient profile. */
+  profileMode?: "default" | "isolated";
+  /** Disable Pi's ambient resource discovery while retaining explicit mounts assembled here. */
+  resourceMode?: "default" | "explicit";
   features?: SpawnFeatures;
   spawn?: ProcFactory;
   env?: NodeJS.ProcessEnv;
@@ -342,6 +362,9 @@ type Live = {
   followUps: string[];
   /** contentIndex → streamed tool-args JSON, assembled from toolcall_delta until toolcall_end. */
   toolArgs: Map<number, string>;
+  /** Pi restarts contentIndex at every assistant message; this epoch lets the UI
+   *  tell same-index content from different messages apart within one turn. */
+  messageEpoch: number;
   /** Idle-time context compaction; also tracks pi's own compaction lifecycle. */
   compaction: ProactiveCompactionScheduler;
   /**
@@ -444,6 +467,8 @@ type SessionMeta = {
   updatedAt: number;
   /** Latest `model_change` entry in the JSONL (provider/modelId), when present. */
   model?: { provider: string; modelId: string } | null;
+  /** Latest persisted Pi thinking level, when the session recorded one. */
+  thinkingLevel?: ThinkingLevel;
 };
 const METADATA_HEAD_BYTES = 64 * 1024,
   METADATA_TAIL_BYTES = 64 * 1024;
@@ -491,6 +516,17 @@ function sessionModelFromRows(rows: any[]): { provider: string; modelId: string 
   }
   return null;
 }
+/** Latest valid `thinking_level_change` row in file order. */
+function sessionThinkingLevelFromRows(rows: any[]): ThinkingLevel | undefined {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    if (
+      row?.type === "thinking_level_change" &&
+      THINKING_LEVELS.includes(row.thinkingLevel)
+    )
+      return row.thinkingLevel;
+  }
+}
 /** Bounded metadata probe: header plus a small head/tail window, never a full JSONL parse. */
 async function readSessionMeta(path: string): Promise<SessionMeta> {
   const stat = await fs.stat(path);
@@ -517,9 +553,39 @@ async function readSessionMeta(path: string): Promise<SessionMeta> {
       name: sessionName(rows),
       updatedAt: Number.isFinite(timestamp) ? timestamp : stat.mtimeMs,
       model: sessionModelFromRows(rows),
+      thinkingLevel: sessionThinkingLevelFromRows(rows),
     };
   } finally {
     await handle.close();
+  }
+}
+
+/** Atomically replace only the JSONL session header without loading a large transcript into memory. */
+async function rewriteSessionCwd(path: string, cwd: string): Promise<void> {
+  const stat = await fs.stat(path);
+  const handle = await fs.open(path, "r");
+  let firstNewline = -1;
+  let header: any;
+  try {
+    const head = Buffer.alloc(Math.min(METADATA_HEAD_BYTES, stat.size));
+    await handle.read(head, 0, head.length, 0);
+    firstNewline = head.indexOf(0x0a);
+    const firstLine = head.subarray(0, firstNewline < 0 ? head.length : firstNewline).toString("utf8").trim();
+    header = JSON.parse(firstLine);
+    if (header?.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string")
+      throw new Error("invalid session header");
+  } finally {
+    await handle.close();
+  }
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}-${crypto.randomUUID()}`;
+  try {
+    await fs.writeFile(tmp, JSON.stringify({ ...header, cwd }) + "\n", { mode: stat.mode });
+    if (firstNewline >= 0 && firstNewline + 1 < stat.size)
+      await pipeline(createReadStream(path, { start: firstNewline + 1 }), createWriteStream(tmp, { flags: "a" }));
+    await fs.rename(tmp, path);
+  } catch (error) {
+    await fs.rm(tmp, { force: true }).catch(() => undefined);
+    throw error;
   }
 }
 /**
@@ -535,14 +601,20 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
   let textPart = "";
   let thinking: string | undefined;
   let tools: HistoryTool[] | undefined;
+  let activities: NonNullable<HistoryEntry["activities"]> | undefined;
   let images: { data: string; mimeType: string }[] | undefined;
   if (typeof content === "string") {
     textPart = content;
   } else if (Array.isArray(content)) {
-    for (const part of content) {
+    for (const [contentIndex, part] of content.entries()) {
       if (!part || typeof part !== "object") continue;
       if (part.type === "text") textPart += part.text ?? "";
-      else if (part.type === "thinking") thinking = (thinking ?? "") + (part.thinking ?? "");
+      else if (part.type === "thinking") {
+        const fragment = part.thinking ?? "";
+        thinking = (thinking ?? "") + fragment;
+        activities = activities ?? [];
+        activities.push({ type: "thinking", contentIndex, content: fragment });
+      }
       else if (part.type === "image") {
         const imgData = part.data ?? part.source?.data;
         const imgMime = part.mimeType ?? part.source?.mediaType;
@@ -554,14 +626,17 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
       else if (part.type === "toolCall") {
         const args = part.arguments;
         tools = tools ?? [];
-        tools.push({
+        const tool = {
           id: String(part.id ?? ""),
           name: String(part.name ?? "tool"),
           input:
             args != null && typeof args === "object"
               ? JSON.stringify(args)
               : String(args ?? ""),
-        });
+        };
+        tools.push(tool);
+        activities = activities ?? [];
+        activities.push({ type: "tool", contentIndex, tool });
       }
     }
   }
@@ -579,6 +654,7 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
   };
   if (thinking) result.thinking = thinking;
   if (tools && tools.length) result.tools = tools;
+  if (activities && activities.length) result.activities = activities;
   if (images && images.length) result.images = images;
   if (message.role === "toolResult") {
     result.toolCallId = message.toolCallId;
@@ -714,6 +790,41 @@ function supportsImagesFor(
   if (m.includes("vl") || p.includes("vl")) return true;
   return true;
 }
+function thinkingLevelMapFrom(value: unknown): ThinkingLevelMap | undefined {
+  if (!isRecord(value)) return undefined;
+  const result: ThinkingLevelMap = {};
+  for (const level of ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+    const mapped = value[level];
+    if (typeof mapped === "string" || mapped === null) result[level] = mapped;
+  }
+  return result;
+}
+/** Reduce Pi's provider-shaped model into the small capability contract renderers need. */
+function hostModelFromPi(raw: any, fallbackProvider?: string, inherited: any = {}): Model {
+  const provider = raw?.provider ?? fallbackProvider ?? inherited?.provider ?? "unknown";
+  const id = raw?.id ?? "unknown";
+  const reasoning = typeof raw?.reasoning === "boolean"
+    ? raw.reasoning
+    : (typeof inherited?.reasoning === "boolean" ? inherited.reasoning : undefined);
+  const thinkingLevelMap = thinkingLevelMapFrom(raw?.thinkingLevelMap ?? inherited?.thinkingLevelMap);
+  let thinkingConfigurable: boolean | undefined;
+  if (reasoning === false) {
+    thinkingConfigurable = false;
+  } else if (reasoning === true && thinkingLevelMap) {
+    thinkingConfigurable = thinkingLevelsForModel({ provider, id, name: raw?.name ?? id, reasoning, thinkingLevelMap }).length > 0;
+  } else if (reasoning === true) {
+    thinkingConfigurable = true;
+  }
+  return {
+    provider,
+    id,
+    name: raw?.name ?? id,
+    ...(reasoning === undefined ? {} : { reasoning }),
+    ...(thinkingLevelMap === undefined ? {} : { thinkingLevelMap }),
+    ...(thinkingConfigurable === undefined ? {} : { thinkingConfigurable }),
+    supportsImages: supportsImagesFor(id, provider, raw?.input ?? inherited?.input),
+  };
+}
 const ATTACHMENT_EXT: Record<string, string> = {
   "image/png": "png",
   "image/jpeg": "jpg",
@@ -742,7 +853,13 @@ export class PiHostBackend implements HostBackend {
    * different sessions stay fully parallel.
    */
   private ensureInFlight = new Map<string, Promise<Live>>();
-  /** In-memory agent log cache: agentId → accumulated log entries. Lets the UI
+  /** At most one Swift-parity title side channel may be launched per placeholder session. */
+  private titleGenerationStarted = new Set<string>();
+  /** A user rename always wins over an already-running automatic title refinement. */
+  private manualTitleOverrides = new Set<string>();
+  private backgroundTitleGenerations = new Set<Promise<void>>();
+  private titleGenerationAbort = new AbortController();
+  /** In-memory agent log cache: exact session + agent + run → accumulated log entries. Lets the UI
    * reconstruct a completed subagent's transcript without a live subscription. */
   private agentLogCache = new Map<string, { itemType: string; text: string; name?: string; isError?: boolean; contentIndex?: number }[]>();
   /** Cache-first stats refreshes that must settle during graceful close. */
@@ -756,7 +873,7 @@ export class PiHostBackend implements HostBackend {
       reasoning: false,
     },
     thinkingLevel: "off",
-    availableThinkingLevels: ["off"],
+    availableThinkingLevels: [],
   };
   private sessionModelStates = new Map<string, ModelState>();
   private sessionModelSnapshots = new Map<string, ModelState>();
@@ -779,9 +896,13 @@ export class PiHostBackend implements HostBackend {
   private runtimeAssets?: RuntimeAssets;
   private agentDir: string;
   private features: SpawnFeatures;
+  private profileMode: "default" | "isolated";
+  private resourceMode: "default" | "explicit";
   private proc: ProcFactory;
   private env: NodeJS.ProcessEnv;
   private modelsLoaded?: Promise<void>;
+  /** True only after configured and auth-aware runtime catalogs have been merged successfully. */
+  private modelCatalogReady = false;
   private configuredModels: Model[] = [];
   /** Cached, deduped pi runtime model catalog for the current auth epoch.
    * Set to undefined by refreshModelsAfterAuthChange so login/logout re-fetches. */
@@ -830,6 +951,8 @@ export class PiHostBackend implements HostBackend {
     this.managedNodeModulesRoot = options.managedNodeModulesRoot;
     this.runtimeAssets = options.runtimeAssets;
     this.features = options.features ?? DEFAULT_FEATURES;
+    this.profileMode = options.profileMode ?? "default";
+    this.resourceMode = options.resourceMode ?? "default";
     this.proc = options.spawn ?? (spawn as ProcFactory);
     this.env = options.env ?? process.env;
     this.canonicalProjectPaths = options.canonicalProjectPaths ?? (() => swiftCanonicalProjectPaths(this.env));
@@ -875,6 +998,8 @@ export class PiHostBackend implements HostBackend {
         nodePath: options.authNodePath ?? (this.piCommand.prefixArgs?.length ? this.piCommand.executable : undefined),
         piPath: this.piCommand.piPath ?? this.piCommand.executable,
         agentDir: this.agentDir,
+        sessionsRoot: this.root,
+        enforceProfile: this.profileMode === "isolated",
         env: { ...this.env, ...(this.piCommand.env ?? {}) },
       }));
     }
@@ -912,6 +1037,8 @@ export class PiHostBackend implements HostBackend {
   /** Graceful connection teardown for hosts that allocate one backend per client. */
   async close(): Promise<void> {
     this.closed = true;
+    this.titleGenerationAbort.abort();
+    await Promise.allSettled([...this.backgroundTitleGenerations]);
     await this.bridge.close();
     const live = [...this.live.values()];
     this.live.clear();
@@ -960,16 +1087,17 @@ export class PiHostBackend implements HostBackend {
     });
   }
   /** Append a log entry to the in-memory cache for a completed-agent transcript. */
-  private cacheAgentLog(agentId: string, entry: { itemType: string; text: string; name?: string; isError?: boolean; contentIndex?: number }) {
-    const logs = this.agentLogCache.get(agentId) ?? []
+  private cacheAgentLog(sessionId: string, agentId: string, runId: string, entry: { itemType: string; text: string; name?: string; isError?: boolean; contentIndex?: number }) {
+    const key = this.agentLogKey(sessionId, agentId, runId)
+    const logs = this.agentLogCache.get(key) ?? []
     // log_delta pushes cumulative snapshots keyed by contentIndex; upsert in place.
     if (entry.contentIndex !== undefined) {
       const idx = logs.findIndex(l => l.contentIndex === entry.contentIndex)
-      if (idx >= 0) { logs[idx] = entry; this.agentLogCache.set(agentId, logs); return }
+      if (idx >= 0) { logs[idx] = entry; this.agentLogCache.set(key, logs); return }
     }
     logs.push(entry)
     if (logs.length > 500) logs.splice(0, logs.length - 500)
-    this.agentLogCache.set(agentId, logs)
+    this.agentLogCache.set(key, logs)
   }
   private queueChanged(id: string, items: QueuedMessage[]) {
     if (this.closed) return;
@@ -1090,6 +1218,7 @@ export class PiHostBackend implements HostBackend {
         name: manager.getSessionName() ?? meta.name,
         updatedAt: last?.timestamp ? asTime(last.timestamp) : meta.updatedAt,
         model: sessionModelFromRows(entries) ?? meta.model,
+        thinkingLevel: sessionThinkingLevelFromRows(entries) ?? meta.thinkingLevel,
       };
     } catch (error) {
       console.warn(
@@ -1122,7 +1251,13 @@ export class PiHostBackend implements HostBackend {
     if (inMemory) return inMemory;
     const base = this.modelState;
     const ref = this.sessionModelOf(s);
-    if (!ref) return base;
+    if (!ref) {
+      if (s.thinkingLevel === undefined) return base;
+      return {
+        ...base,
+        thinkingLevel: resolveThinkingLevel(s.thinkingLevel, base.availableThinkingLevels, base.thinkingLevel) ?? "off",
+      };
+    }
     const known = this.models.find(
       (m) => m.provider === ref.provider && m.id === ref.modelId,
     );
@@ -1132,12 +1267,12 @@ export class PiHostBackend implements HostBackend {
       name: ref.modelId,
       reasoning: false,
     };
+    const availableThinkingLevels = thinkingLevelsForModel(model);
     return {
       ...base,
       model,
-      availableThinkingLevels: model.reasoning
-        ? ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-        : ["off"],
+      thinkingLevel: resolveThinkingLevel(s.thinkingLevel ?? base.thinkingLevel, availableThinkingLevels, base.thinkingLevel) ?? "off",
+      availableThinkingLevels,
     };
   }
   private project(path: string): Project {
@@ -1170,17 +1305,7 @@ export class PiHostBackend implements HostBackend {
         if (!available) continue;
         for (const model of config.models ?? [])
           if (typeof model?.id === "string")
-            configured.push({
-              provider: model.provider ?? provider,
-              id: model.id,
-              name: model.name ?? model.id,
-              reasoning: Boolean(model.reasoning),
-              supportsImages: supportsImagesFor(
-                model.id,
-                model.provider ?? provider,
-                model.input,
-              ),
-            });
+            configured.push(hostModelFromPi(model, provider, config));
       }
       this.configuredModels = configured;
       this.models = [...configured];
@@ -1192,14 +1317,14 @@ export class PiHostBackend implements HostBackend {
         ) ??
         configured.find((model) => model.id === settings.defaultModel) ??
         configured[0];
-      if (preferred)
+      if (preferred) {
+        const availableThinkingLevels = thinkingLevelsForModel(preferred);
         this.modelState = {
           model: preferred,
-          thinkingLevel: settings.defaultThinkingLevel ?? "off",
-          availableThinkingLevels: preferred.reasoning
-            ? ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-            : ["off"],
+          thinkingLevel: resolveThinkingLevel(settings.defaultThinkingLevel ?? "off", availableThinkingLevels) ?? "off",
+          availableThinkingLevels,
         };
+      }
     })();
     return this.modelsLoaded;
   }
@@ -1250,6 +1375,8 @@ export class PiHostBackend implements HostBackend {
         await this.loadQueue(s.header.id);
         return this.toSession(s);
       }
+      case "renameSession":
+        return this.renameSession(params[0] as string, params[1] as string);
       case "deleteSession": {
         const s = await this.locate(params[0] as string);
         // Revoke tool authority before any asynchronous filesystem/process
@@ -1266,8 +1393,11 @@ export class PiHostBackend implements HostBackend {
         this.live.delete(s.header.id);
         this.sessionModelStates.delete(s.header.id);
         this.sessionModelSnapshots.delete(s.header.id);
+        this.manualTitleOverrides.delete(s.header.id);
         return;
       }
+      case "moveSession":
+        return this.moveSession(params[0] as string, params[1] as string);
       case "getSessionHistory": {
         const session = await this.locate(params[0] as string);
         return readHistory(
@@ -1391,7 +1521,7 @@ export class PiHostBackend implements HostBackend {
       case "setComputerUseEnabled":
         return { enabled: await this.saveComputerUseEnabled(params[0]) };
       case "getSubagentModels":
-        return this.loadAndMaterializeSubagentModels();
+        return this.loadAndMaterializeSubagentModels(true);
       case "setSubagentModel":
         return this.saveSubagentModel(params[0], params[1]);
       case "listAgentDefinitions":
@@ -1425,7 +1555,7 @@ export class PiHostBackend implements HostBackend {
         );
       }
       case "getAgentLogs":
-        return this.agentLogCache.get(params[0] as string) ?? [];
+        return this.agentLogCache.get(this.agentLogKey(params[1] as string, params[0] as string, params[2] as string)) ?? [];
       case "abortAgent":
         return this.agentCommand(params[0] as string, "abort");
       case "resolveAgent":
@@ -1515,7 +1645,10 @@ export class PiHostBackend implements HostBackend {
       );
   }
   private async newSession(projectId: string, name?: string): Promise<Session> {
-    await this.loadModelCatalog();
+    // Session creation needs only local configuration. The optional authenticated runtime
+    // catalog may involve network-backed provider discovery and must never gate a sidebar click.
+    await this.loadConfiguredModels();
+    this.applyManualModelSelection(await this.loadManualModelSelection());
     const projects = (await this.handle("listProjects", [])) as Project[];
     const p = projects.find((x) => x.id === projectId);
     if (!p) throw new Error(`unknown project ${projectId}`);
@@ -1553,8 +1686,85 @@ export class PiHostBackend implements HostBackend {
       updatedAt: Date.now(),
     };
   }
+  private async renameSession(sessionId: string, name: string): Promise<Session> {
+    const title = typeof name === "string" ? name.trim() : "";
+    if (!title || title.length > 120) throw new Error("session name must be 1-120 characters");
+    const session = await this.locate(sessionId);
+    const lease = this.leaseFor(session);
+    const status = await lease.acquire();
+    if (!status.writable)
+      throw new Error(`session is read-only: held by ${status.holder?.holder ?? "another writer"}`);
+
+    this.manualTitleOverrides.add(sessionId);
+    const timestamp = new Date().toISOString();
+    const live = this.live.get(sessionId);
+    try {
+      if (live) {
+        await this.command(sessionId, { type: "set_session_name", name: title });
+        live.session = { ...live.session, name: title, updatedAt: Date.now() };
+      } else {
+        await fs.appendFile(session.path, `${JSON.stringify({
+          type: "session_info",
+          id: crypto.randomUUID(),
+          parentId: null,
+          timestamp,
+          name: title,
+        })}\n`);
+      }
+    } catch (error) {
+      this.manualTitleOverrides.delete(sessionId);
+      throw error;
+    }
+
+    this.indexCache.delete(session.path);
+    const refreshed = await readSessionMeta(session.path);
+    const stat = await fs.stat(session.path);
+    this.indexCache.set(session.path, { size: stat.size, mtimeMs: stat.mtimeMs, meta: refreshed });
+    const renamed = live ? { ...live.session, name: title } : this.toSession(refreshed);
+    this.stream({ type: "session_title", sessionId, title, source: "manual" });
+    return renamed;
+  }
   /**
-   * T17 parity: parse `~/.pi/agent/.env` for injection into the spawned pi process env.
+   * Move a session's real working directory. An idle live Pi is closed first so
+   * its in-memory cwd cannot disagree with the durable JSONL header; active or
+   * queued work is never moved underneath a running turn.
+   */
+  private async moveSession(sessionId: string, targetProjectId: string): Promise<Session> {
+    const paths = await this.loadProjectPaths();
+    const targetPath = paths.find(path => dirId(path) === targetProjectId);
+    if (!targetPath) throw new Error(`unknown project ${targetProjectId}`);
+    const session = await this.locate(sessionId);
+    if (dirId(session.header.cwd) === targetProjectId) return this.toSession(session);
+    await this.loadQueue(sessionId);
+    if (this.ensureInFlight.has(sessionId) || this.queue.isBusy(sessionId) || this.queue.listQueue(sessionId).length > 0)
+      throw new Error("会话正在执行或仍有排队消息，暂时不能移动");
+    const live = this.live.get(sessionId);
+    if (live) {
+      if (!this.isSessionQuiet(sessionId)) throw new Error("会话正在执行，暂时不能移动");
+      live.compaction.dispose();
+      live.process?.stdin.end();
+      await Promise.race([
+        live.exit ?? Promise.resolve(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("等待会话停止超时，未移动")), 5_000)),
+      ]);
+    }
+    const lease = this.leaseFor(session);
+    const status = await lease.acquire();
+    if (!status.writable)
+      throw new Error(`session is read-only: held by ${status.holder?.holder ?? "another writer"}`);
+    try {
+      await rewriteSessionCwd(session.path, targetPath);
+      this.indexCache.delete(session.path);
+      const moved = await readSessionMeta(session.path);
+      const stat = await fs.stat(session.path);
+      this.indexCache.set(session.path, { size: stat.size, mtimeMs: stat.mtimeMs, meta: moved });
+      return this.toSession(moved);
+    } finally {
+      await lease.release().catch(() => undefined);
+    }
+  }
+  /**
+   * T17 parity: parse the configured agent profile's `.env` for Pi process injection.
    * A missing/unreadable file is not an error — a GUI launch from Finder may have none.
    */
   private async readDotEnv(): Promise<Record<string, string>> {
@@ -1595,6 +1805,9 @@ export class PiHostBackend implements HostBackend {
       sessionPath: found.path,
       cwd: found.header.cwd,
       runtimeRoot: this.runtimeRoot,
+      agentDir: this.profileMode === "isolated" ? this.agentDir : undefined,
+      sessionsRoot: this.profileMode === "isolated" ? this.root : undefined,
+      resourceMode: this.resourceMode,
       features: this.features,
       paths: resolveSpawnPaths(this.refreshRuntimeTree(), {
         managedNodeModulesRoot: this.managedNodeModulesRoot,
@@ -1624,7 +1837,7 @@ export class PiHostBackend implements HostBackend {
       ...output.args,
     ], {
       cwd: found.header.cwd,
-      // T17 parity: ~/.pi/agent/.env is layered under the internal PIPIUI_* contract
+      // T17 parity: the configured agent profile's .env is layered under the internal host contract
       // (and wins over the host process env), so env-key providers like DeepSeek/Kimi
       // that `listModels` sees via the auth runtime resolve in the RPC session too.
       env: withToolPath(
@@ -1652,6 +1865,7 @@ export class PiHostBackend implements HostBackend {
       pending: new Map(),
       followUps: [],
       toolArgs: new Map(),
+      messageEpoch: 0,
       compaction: new ProactiveCompactionScheduler({
         configuration: this.compactionConfiguration,
         isIdle: () => this.isSessionQuiet(id),
@@ -1683,21 +1897,24 @@ export class PiHostBackend implements HostBackend {
       if (lease) void lease.release().catch(() => undefined).finally(finish);
       else finish();
     });
-    if (desired.model.provider !== "unknown" && desired.model.id !== "unknown") {
+    if (desired.model.provider !== "unknown" && desired.model.id !== "unknown")
+      await this.selectExactModel(live, desired.model.provider, desired.model.id);
+    const spawnThinkingLevel = resolveThinkingLevel(
+      desired.thinkingLevel,
+      desired.availableThinkingLevels,
+      this.modelState.thinkingLevel,
+    );
+    if (spawnThinkingLevel !== undefined) {
       await this.command(id, {
-        type: "set_model",
-        provider: desired.model.provider,
-        modelId: desired.model.id,
+        type: "set_thinking_level",
+        level: spawnThinkingLevel,
       });
     }
-    await this.command(id, {
-      type: "set_thinking_level",
-      level: desired.thinkingLevel,
-    });
     await this.refreshState(live);
     return live;
   }
   private lines(live: Live, chunk: string) {
+    if (process.env.PIPIUI_STREAM_DEBUG) console.log(`[stream-debug] stdout chunk sid=${live.session.id} t=${Date.now()} bytes=${chunk.length}`);
     live.buffer += chunk;
     let at;
     while ((at = live.buffer.indexOf("\n")) >= 0) {
@@ -1809,8 +2026,11 @@ export class PiHostBackend implements HostBackend {
           type: "thinking",
           sessionId: id,
           contentIndex: d.contentIndex ?? 0,
+          segment: live.messageEpoch,
           delta: d.delta ?? "",
         });
+      if (process.env.PIPIUI_STREAM_DEBUG && (d.type === "text_delta" || d.type === "thinking_delta"))
+        console.log(`[stream-debug] emit ${d.type} sid=${id} t=${Date.now()} len=${(d.delta ?? "").length}`);
       if (d.type === "toolcall_delta") {
         // Tool args stream as partial JSON chunks keyed by contentIndex; the real
         // toolCallId/name only become known at toolcall_end. Buffer the chunks so
@@ -1836,14 +2056,17 @@ export class PiHostBackend implements HostBackend {
         this.stream({
           type: "tool_call",
           sessionId: id,
+          contentIndex: index,
           toolCallId: call.id ?? `content-${index}`,
           name: call.name ?? "tool",
           delta: args,
         });
       }
     } else if (e.type === "message_end") {
-      // A new message restarts content indexing; drop unclaimed tool buffers.
+      // A new message restarts content indexing; drop unclaimed tool buffers and
+      // bump the epoch so later thinking segments key apart from earlier ones.
       live.toolArgs.clear();
+      live.messageEpoch++;
     } else if (e.type === "tool_execution_end") {
       const { text: resultText, images } = extractResult(e.result?.content, this.computerScreenshots)
       this.stream({
@@ -1871,39 +2094,60 @@ export class PiHostBackend implements HostBackend {
       );
     });
   }
+  /** Pi model ids are not provider-unique. Never silently accept a same-id sibling. */
+  private async selectExactModel(live: Live, provider: string, modelId: string) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await this.command(live.session.id, { type: "set_model", provider, modelId });
+      const state = await this.command(live.session.id, { type: "get_state" });
+      if (state.model?.provider === provider && state.model?.id === modelId) return;
+    }
+    const state = await this.command(live.session.id, { type: "get_state" });
+    throw new Error(
+      `Pi 模型选择未生效：期望 ${provider}/${modelId}，实际 ${state.model?.provider ?? "unknown"}/${state.model?.id ?? "unknown"}`,
+    );
+  }
   private async refreshState(live: Live) {
     try {
       const models = await this.command(live.session.id, {
         type: "get_available_models",
       });
-      this.models = (models.models ?? []).map((m: any) => ({
-        provider: m.provider,
-        id: m.id,
-        name: m.name ?? m.id,
-        reasoning: Boolean(m.reasoning),
-        supportsImages: supportsImagesFor(m.id, m.provider, m.input),
-      }));
+      const catalogModels = this.models;
+      this.models = (models.models ?? []).map((raw: any) => {
+        const reported = hostModelFromPi(raw);
+        const catalog = catalogModels.find(item => item.provider === reported.provider && item.id === reported.id);
+        if (!catalog) return reported;
+        const thinkingLevelMap = reported.thinkingLevelMap ?? catalog.thinkingLevelMap;
+        return {
+          ...catalog,
+          ...reported,
+          ...(thinkingLevelMap === undefined ? {} : { thinkingLevelMap }),
+          thinkingConfigurable: thinkingLevelMap
+            ? thinkingLevelsForModel({ ...reported, thinkingLevelMap }).length > 0
+            : (reported.thinkingConfigurable ?? catalog.thinkingConfigurable),
+        };
+      });
       const state = await this.command(live.session.id, { type: "get_state" });
       const levels = await this.command(live.session.id, {
         type: "get_available_thinking_levels",
       });
-      const model = state.model
-        ? {
-            provider: state.model.provider,
-            id: state.model.id,
-            name: state.model.name ?? state.model.id,
-            reasoning: Boolean(state.model.reasoning),
-            supportsImages: supportsImagesFor(
-              state.model.id,
-              state.model.provider,
-              state.model.input,
-            ),
-          }
+      const reportedModel = state.model ? hostModelFromPi(state.model) : undefined;
+      const model = reportedModel
+        ? (this.models.find(item => item.provider === reportedModel.provider && item.id === reportedModel.id) ?? reportedModel)
         : (this.models[0] ?? this.modelState.model);
+      const availableThinkingLevels = thinkingLevelsForModel(model, levels.levels);
+      const previous = this.sessionModelSnapshots.get(live.session.id);
+      const reportedThinkingLevel = state.thinkingLevel as ThinkingLevel | undefined;
+      const thinkingLevel = resolveThinkingLevel(
+        reportedThinkingLevel,
+        availableThinkingLevels,
+        previous?.thinkingLevel,
+      ) ?? reportedThinkingLevel ?? "off";
+      if (thinkingLevel !== reportedThinkingLevel && availableThinkingLevels.includes(thinkingLevel))
+        await this.command(live.session.id, { type: "set_thinking_level", level: thinkingLevel });
       this.sessionModelStates.set(live.session.id, {
         model,
-        thinkingLevel: state.thinkingLevel ?? "off",
-        availableThinkingLevels: levels.levels ?? ["off"],
+        thinkingLevel,
+        availableThinkingLevels,
       });
     } catch {
       /* sessions can be viewed without configured models */
@@ -1971,12 +2215,12 @@ export class PiHostBackend implements HostBackend {
       (item) => item.provider === selection.provider && item.id === selection.modelId,
     );
     if (!model) return;
+    const availableThinkingLevels = thinkingLevelsForModel(model);
     this.modelState = {
       ...this.modelState,
       model,
-      availableThinkingLevels: model.reasoning
-        ? ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-        : ["off"],
+      thinkingLevel: resolveThinkingLevel(this.modelState.thinkingLevel, availableThinkingLevels) ?? "off",
+      availableThinkingLevels,
     };
   }
   private async rememberManualModelSelection(model: Model): Promise<void> {
@@ -1987,12 +2231,12 @@ export class PiHostBackend implements HostBackend {
     this.manualModelSelection = selection;
     this.manualModelSelectionLoaded = Promise.resolve();
     // Do not inherit the selected session's thinking level into future sessions.
+    const availableThinkingLevels = thinkingLevelsForModel(model);
     this.modelState = {
       ...this.modelState,
       model,
-      availableThinkingLevels: model.reasoning
-        ? ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-        : ["off"],
+      thinkingLevel: resolveThinkingLevel(this.modelState.thinkingLevel, availableThinkingLevels) ?? "off",
+      availableThinkingLevels,
     };
   }
   private checkedProjectPaths(value: unknown): string[] {
@@ -2017,26 +2261,76 @@ export class PiHostBackend implements HostBackend {
       return value;
     });
   }
-  private checkedSubagentModelChain(value: unknown): SubagentModelSetting[] {
+  private checkedSubagentModelChain(value: unknown, allowLegacyBare = true): SubagentModelSetting[] {
     if (!Array.isArray(value) || !value.every((entry) =>
       isRecord(entry) && typeof entry.model === "string" && entry.model.trim().length > 0 &&
       (entry.thinking === undefined || typeof entry.thinking === "string"),
     )) throw new Error("subagentModels 必须是 { model, thinking? }[]");
-    return value.map((entry) => ({
-      model: (entry as { model: string }).model,
-      ...((entry as { thinking?: string }).thinking === undefined
-        ? {}
-        : { thinking: (entry as { thinking: string }).thinking }),
-    }));
+    return value.map((entry) => {
+      const model = (entry as { model: string }).model.trim();
+      const slash = model.indexOf("/");
+      if (!allowLegacyBare && (slash <= 0 || slash === model.length - 1))
+        throw new Error(`Subagent 模型必须使用 provider/model 完整标识：${model}`);
+      return {
+        model,
+        ...((entry as { thinking?: string }).thinking === undefined
+          ? {}
+          : { thinking: (entry as { thinking: string }).thinking }),
+      };
+    });
   }
-  private async loadSubagentModels(): Promise<Record<string, SubagentModelSetting[]>> {
-    const value = (await this.readSettings()).subagentModels;
+  private checkedSubagentModels(value: unknown): Record<string, SubagentModelSetting[]> {
     if (value === undefined) return {};
     if (!isRecord(value)) throw new Error("subagentModels 必须是 object");
     return Object.fromEntries(Object.entries(value).map(([name, chain]) => {
       if (!name.trim()) throw new Error("subagentModels agent name 不能为空");
       return [name, this.checkedSubagentModelChain(chain)];
     }));
+  }
+  /** Qualify a historical bare id only when the authenticated catalog has one unambiguous owner. */
+  private qualifyLegacySubagentModels(value: Record<string, SubagentModelSetting[]>): { value: Record<string, SubagentModelSetting[]>; changed: boolean } {
+    const refsById = new Map<string, Set<string>>();
+    const exactRefs = new Set<string>();
+    for (const model of this.models) {
+      const ref = `${model.provider}/${model.id}`;
+      exactRefs.add(ref);
+      const refs = refsById.get(model.id) ?? new Set<string>();
+      refs.add(ref);
+      refsById.set(model.id, refs);
+    }
+    let changed = false;
+    const qualified = Object.fromEntries(Object.entries(value).map(([name, chain]) => [name, chain.map(entry => {
+      if (exactRefs.has(entry.model)) return entry;
+      const matches = [...(refsById.get(entry.model) ?? [])];
+      if (matches.length !== 1) return entry;
+      changed = true;
+      return { ...entry, model: matches[0] };
+    })]));
+    return { value: qualified, changed };
+  }
+  private async loadSubagentModels(waitForCatalog = false): Promise<Record<string, SubagentModelSetting[]>> {
+    const loaded = this.checkedSubagentModels((await this.readSettings()).subagentModels);
+    if (waitForCatalog) {
+      try {
+        await this.loadModelCatalog();
+      } catch {
+        // Preserve legacy settings when the auth-aware catalog is unavailable. Runtime will
+        // reject a still-bare override explicitly instead of letting Pi guess a provider.
+        return loaded;
+      }
+    } else if (!this.modelCatalogReady) {
+      // Session spawn must never wait for the optional auth catalog preload. If it has not
+      // completed yet, materialize the stored value and let the runtime's explicit guard handle it.
+      return loaded;
+    }
+    const normalized = this.qualifyLegacySubagentModels(loaded);
+    if (!normalized.changed) return loaded;
+    return this.updateSettings(settings => {
+      const current = this.checkedSubagentModels(settings.subagentModels);
+      const latest = this.qualifyLegacySubagentModels(current).value;
+      settings.subagentModels = latest;
+      return latest;
+    });
   }
   private subagentModelsRuntimeFile(): string {
     return join(this.agentDir, "pipiui-subagent-models-runtime.json");
@@ -2048,15 +2342,15 @@ export class PiHostBackend implements HostBackend {
     await fs.writeFile(tmp, JSON.stringify(value, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
     await fs.rename(tmp, target);
   }
-  private async loadAndMaterializeSubagentModels(): Promise<Record<string, SubagentModelSetting[]>> {
-    const value = await this.loadSubagentModels();
+  private async loadAndMaterializeSubagentModels(waitForCatalog = false): Promise<Record<string, SubagentModelSetting[]>> {
+    const value = await this.loadSubagentModels(waitForCatalog);
     await this.materializeSubagentModels(value);
     return value;
   }
   private async saveSubagentModel(agentName: unknown, chain: unknown): Promise<Record<string, SubagentModelSetting[]>> {
     if (typeof agentName !== "string" || !agentName.trim())
       throw new Error("subagent agentName 必须是非空 string");
-    const checkedChain = this.checkedSubagentModelChain(chain);
+    const checkedChain = this.checkedSubagentModelChain(chain, false);
     const all = await this.updateSettings((settings) => {
       const current = settings.subagentModels;
       if (current !== undefined && !isRecord(current))
@@ -2133,7 +2427,7 @@ export class PiHostBackend implements HostBackend {
     if (typeof value !== "string" || !value.length)
       throw new Error("project path 必须是非空 string");
     const paths = await this.loadProjectPaths();
-    if (!paths.includes(value)) await this.saveProjectPaths([...paths, value]);
+    if (!paths.includes(value)) await this.saveProjectPaths([value, ...paths]);
     return this.project(value);
   }
   /** Removes only the explicit sidebar entry; session JSONL files remain untouched. */
@@ -2177,30 +2471,46 @@ export class PiHostBackend implements HostBackend {
     this.hiddenIdsLoaded = Promise.resolve();
     return [...sorted];
   }
-  private checkedSidebarSessionPreferences(value: unknown): { pinnedSessionIds: string[]; archivedSessionIds: string[] } {
+  private checkedSidebarSessionPreferences(value: unknown): { pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 } {
     if (!isRecord(value)) throw new Error("sidebarSessionPreferences 必须是 object");
-    const checked = (key: "pinnedSessionIds" | "archivedSessionIds") => {
+    const checked = (key: "pinnedSessionIds" | "archivedSessionIds" | "orderedSessionIds", optional = false) => {
       const ids = value[key];
+      if (optional && ids === undefined) return [];
       if (!Array.isArray(ids) || !ids.every(id => typeof id === "string" && id.length > 0))
         throw new Error(`${key} 必须是非空 string[]`);
       return [...new Set(ids)];
     };
     const pinnedSessionIds = checked("pinnedSessionIds");
     const archived = new Set(checked("archivedSessionIds"));
+    const rawTimestamps = value.archivedSessionTimestamps;
+    let archivedSessionTimestamps: Record<string, number> | undefined;
+    if (rawTimestamps !== undefined) {
+      if (!isRecord(rawTimestamps)) throw new Error("archivedSessionTimestamps 必须是 object");
+      archivedSessionTimestamps = {};
+      for (const [id, timestamp] of Object.entries(rawTimestamps)) {
+        if (typeof timestamp !== "number" || !Number.isFinite(timestamp) || timestamp < 0)
+          throw new Error("archivedSessionTimestamps 必须只包含非负时间戳");
+        if (archived.has(id)) archivedSessionTimestamps[id] = timestamp;
+      }
+    }
+    const orderedSessionIds = checked("orderedSessionIds", true);
+    const sessionOrderVersion = value.sessionOrderVersion;
+    if (sessionOrderVersion !== undefined && sessionOrderVersion !== 2)
+      throw new Error("sessionOrderVersion 必须是 2");
     // A session cannot occupy both semantic sections; archive wins.
-    return { pinnedSessionIds: pinnedSessionIds.filter(id => !archived.has(id)), archivedSessionIds: [...archived] };
+    return { pinnedSessionIds: pinnedSessionIds.filter(id => !archived.has(id)), archivedSessionIds: [...archived], ...(archivedSessionTimestamps === undefined ? {} : { archivedSessionTimestamps }), orderedSessionIds, ...(sessionOrderVersion === 2 ? { sessionOrderVersion: 2 as const } : {}) };
   }
-  private async loadSidebarSessionPreferences(): Promise<{ pinnedSessionIds: string[]; archivedSessionIds: string[] }> {
+  private async loadSidebarSessionPreferences(): Promise<{ pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 }> {
     const value = (await this.readSettings()).sidebarSessionPreferences;
     return value === undefined
-      ? { pinnedSessionIds: [], archivedSessionIds: [] }
+      ? { pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: [] }
       : this.checkedSidebarSessionPreferences(value);
   }
-  private async saveSidebarSessionPreferences(value: unknown): Promise<{ pinnedSessionIds: string[]; archivedSessionIds: string[] }> {
+  private async saveSidebarSessionPreferences(value: unknown): Promise<{ pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 }> {
     const checked = this.checkedSidebarSessionPreferences(value);
     return this.updateSettings(settings => {
       settings.sidebarSessionPreferences = checked;
-      return { pinnedSessionIds: [...checked.pinnedSessionIds], archivedSessionIds: [...checked.archivedSessionIds] };
+      return { pinnedSessionIds: [...checked.pinnedSessionIds], archivedSessionIds: [...checked.archivedSessionIds], ...(checked.archivedSessionTimestamps === undefined ? {} : { archivedSessionTimestamps: { ...checked.archivedSessionTimestamps } }), orderedSessionIds: [...checked.orderedSessionIds], ...(checked.sessionOrderVersion === 2 ? { sessionOrderVersion: 2 as const } : {}) };
     });
   }
   private async modelRuntime(): Promise<AuthRuntimeLike> {
@@ -2223,13 +2533,7 @@ export class PiHostBackend implements HostBackend {
     return this.authRuntimePromise;
   }
   private toRuntimeModel(m: any): Model {
-    return {
-      provider: m.provider,
-      id: m.id,
-      name: m.name ?? m.id,
-      reasoning: Boolean(m.reasoning),
-      supportsImages: supportsImagesFor(m.id, m.provider, m.input),
-    };
+    return hostModelFromPi(m);
   }
   /**
    * Pi's auth-aware runtime catalog with in-flight dedup + caching. The first
@@ -2291,6 +2595,41 @@ export class PiHostBackend implements HostBackend {
     await this.loadConfiguredModels();
     await this.mergeRuntimeModels(includeCurrent);
     this.applyManualModelSelection(await this.loadManualModelSelection());
+    for (const [sessionId, state] of this.sessionModelStates) {
+      const catalog = this.models.find(model =>
+        model.provider === state.model.provider && model.id === state.model.id,
+      );
+      if (!catalog) continue;
+      const availableThinkingLevels = thinkingLevelsForModel(catalog, state.availableThinkingLevels);
+      const snapshot = this.sessionModelSnapshots.get(sessionId);
+      const thinkingLevel = resolveThinkingLevel(
+        state.thinkingLevel,
+        availableThinkingLevels,
+        snapshot?.thinkingLevel,
+      ) ?? state.thinkingLevel;
+      this.sessionModelStates.set(sessionId, {
+        model: catalog,
+        thinkingLevel,
+        availableThinkingLevels,
+      });
+      // A late catalog map (sparse openai-codex) can invalidate a stale "high".
+      // Persist through the existing set-thinking RPC so the next prompt does not send it.
+      if (thinkingLevel !== state.thinkingLevel && availableThinkingLevels.includes(thinkingLevel)) {
+        this.sessionModelSnapshots.set(sessionId, {
+          model: catalog,
+          thinkingLevel,
+          availableThinkingLevels,
+        });
+        if (this.live.has(sessionId)) {
+          try {
+            await this.command(sessionId, { type: "set_thinking_level", level: thinkingLevel });
+          } catch {
+            /* session may have exited between catalog merge and persist */
+          }
+        }
+      }
+    }
+    this.modelCatalogReady = true;
   }
   /** Rebuild after pi login/logout while preserving still-configured literal/env-key models. */
   private async refreshModelsAfterAuthChange(
@@ -2298,6 +2637,7 @@ export class PiHostBackend implements HostBackend {
   ): Promise<Model[]> {
     this.modelsLoaded = undefined;
     this.runtimeModelsPromise = undefined;
+    this.modelCatalogReady = false;
     await this.loadModelCatalog(includeCurrent);
     return this.models;
   }
@@ -2314,12 +2654,12 @@ export class PiHostBackend implements HostBackend {
         name: "无可用模型",
         reasoning: false,
       };
+      const availableThinkingLevels = thinkingLevelsForModel(next);
       this.modelState = {
         ...this.modelState,
         model: next,
-        availableThinkingLevels: next.reasoning
-          ? ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-          : ["off"],
+        thinkingLevel: resolveThinkingLevel(this.modelState.thinkingLevel, availableThinkingLevels) ?? "off",
+        availableThinkingLevels,
       };
     }
     return this.modelState;
@@ -2363,6 +2703,9 @@ export class PiHostBackend implements HostBackend {
   ) {
     await this.requireLease(id);
     const live = await this.ensure(id);
+    if (behavior === "prompt" && payload.text.trim()) {
+      await this.startAutomaticSessionTitle(live, payload.text);
+    }
     const attachments = payload.attachments as PromptAttachment[];
     const message = attachments.length
       ? await this.prepareImageMessage(live, payload.text, attachments)
@@ -2383,6 +2726,76 @@ export class PiHostBackend implements HostBackend {
         mimeType: a.mimeType,
       }));
     await this.command(id, body);
+  }
+
+  /**
+   * Swift parity: immediately expose a deterministic first-message title, then refine it through
+   * an isolated no-session/no-tools Pi process. Title generation never enters the conversation or
+   * writes an orphan JSONL, and a failed/slow side channel never blocks the user's main prompt.
+   */
+  private async startAutomaticSessionTitle(live: Live, userMessage: string): Promise<void> {
+    const id = live.session.id;
+    if (this.titleGenerationStarted.has(id) || !isPlaceholderSessionTitle(live.session.name)) return;
+    const provisional = provisionalSessionTitle(userMessage);
+    if (!provisional) return;
+    this.titleGenerationStarted.add(id);
+    try {
+      await this.applyAutomaticSessionTitle(live, provisional, "provisional");
+    } catch {
+      // Naming is enhancement-only: never turn a valid user prompt into a send failure.
+    }
+    const refinement = this.refineAutomaticSessionTitle(live, userMessage)
+      .catch(() => undefined)
+      .finally(() => this.backgroundTitleGenerations.delete(refinement));
+    this.backgroundTitleGenerations.add(refinement);
+  }
+
+  private async applyAutomaticSessionTitle(
+    live: Live,
+    title: string,
+    source: "provisional" | "model",
+  ): Promise<void> {
+    await this.command(live.session.id, { type: "set_session_name", name: title });
+    live.session = { ...live.session, name: title, updatedAt: Date.now() };
+    this.stream({ type: "session_title", sessionId: live.session.id, title, source });
+  }
+
+  private async refineAutomaticSessionTitle(live: Live, userMessage: string): Promise<void> {
+    const isolated = assemblePiSpawn({
+      cwd: live.cwd,
+      agentDir: this.profileMode === "isolated" ? this.agentDir : undefined,
+      sessionsRoot: this.profileMode === "isolated" ? this.root : undefined,
+      resourceMode: "explicit",
+      features: {},
+      paths: {},
+    });
+    const model = this.sessionModelStates.get(live.session.id)?.model
+      ?? this.sessionModelSnapshots.get(live.session.id)?.model
+      ?? this.modelState.model;
+    const title = await generateModelSessionTitle({
+      spawn: this.proc,
+      executable: this.piCommand.executable,
+      args: [
+        ...(this.piCommand.prefixArgs ?? []),
+        "--mode", "rpc",
+        "--no-session", "--no-tools",
+        ...isolated.args,
+        "--thinking", "off",
+      ],
+      cwd: live.cwd,
+      env: withToolPath(
+        mergedSpawnEnvironment(this.env, await this.readDotEnv(), {
+          ...isolated.env,
+          ...(this.piCommand.env ?? {}),
+        }),
+        this.piCommand.executable,
+      ),
+      userMessage,
+      model: { provider: model.provider, id: model.id },
+      signal: this.titleGenerationAbort.signal,
+    });
+    if (!title || title === live.session.name || this.closed || this.manualTitleOverrides.has(live.session.id)) return;
+    await this.applyAutomaticSessionTitle(live, title, "model");
   }
   private async prompt(
     id: string,
@@ -2422,24 +2835,24 @@ export class PiHostBackend implements HostBackend {
       (item) => item.provider === provider && item.id === modelId,
     );
     if (!model) throw new Error(`unknown model ${provider}/${modelId}`);
+    const availableThinkingLevels = thinkingLevelsForModel(model);
     this.modelState = {
       ...this.modelState,
       model,
-      availableThinkingLevels: model.reasoning
-        ? ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-        : ["off"],
+      thinkingLevel: resolveThinkingLevel(this.modelState.thinkingLevel, availableThinkingLevels) ?? "off",
+      availableThinkingLevels,
     };
     return this.modelState;
   }
   private async setModel(sessionId: string, provider: string, modelId: string) {
     let live = await this.ensure(sessionId);
     try {
-      await this.command(sessionId, { type: "set_model", provider, modelId });
+      await this.selectExactModel(live, provider, modelId);
     } catch (error) {
       if (!(error instanceof PiExitedError)) throw error;
       await live.exit;
       live = await this.ensure(sessionId);
-      await this.command(sessionId, { type: "set_model", provider, modelId });
+      await this.selectExactModel(live, provider, modelId);
     }
     await this.refreshState(live);
     const state = this.sessionModelStates.get(sessionId)!;
@@ -2693,11 +3106,15 @@ export class PiHostBackend implements HostBackend {
   private agentKey(agentId: string, sessionId?: string): string {
     return `${sessionId ?? ""}\u0000${agentId}`;
   }
+  private agentLogKey(sessionId: string, agentId: string, runId: string): string {
+    return `${sessionId}\u0000${agentId}\u0000${runId}`;
+  }
   private loadPersistedAgents(): void {
     try {
       const value = JSON.parse(readFileSync(this.agentsFile(), "utf8"));
       if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.agents)) return;
       const restartedAt = Date.now();
+      let normalized = false;
       for (const raw of value.agents) {
         if (!isRecord(raw) || typeof raw.agentId !== "string" || typeof raw.sessionId !== "string") continue;
         const agent = raw as unknown as AgentSummary;
@@ -2706,12 +3123,14 @@ export class PiHostBackend implements HostBackend {
         if (agent.state === "running" || agent.state === "stalled") {
           agent.state = "interrupted";
           agent.endedAt = agent.endedAt ?? restartedAt;
+          normalized = true;
         }
         this.agents.set(this.agentKey(agent.agentId, agent.sessionId), agent);
       }
       if (Array.isArray(value.worktrees)) for (const raw of value.worktrees) {
         if (isRecord(raw) && typeof raw.agentId === "string") this.worktrees.set(raw.agentId, raw as unknown as WorktreeStatus);
       }
+      if (normalized) this.persistAgents();
     } catch (error: any) {
       if (error?.code !== "ENOENT") console.warn(`[pipi-agents] unable to load durable index: ${error?.message ?? error}`);
     }
@@ -2903,12 +3322,13 @@ export class PiHostBackend implements HostBackend {
       task: raw.task ?? current?.task ?? "",
       state,
       stalled: staleAfterTerminal ? false : raw.stalled,
-      handled: current?.handled,
-      cost: raw.cost ?? usage?.cost ?? current?.cost,
-      turns: raw.turns ?? raw.turn ?? current?.turns,
-      outputCount: raw.output ? 1 : current?.outputCount,
+      handled: sameRun ? current?.handled : undefined,
+      cost: raw.cost ?? usage?.cost ?? (sameRun ? current?.cost : undefined),
+      turns: raw.turns ?? raw.turn ?? (sameRun ? current?.turns : undefined),
+      outputCount: raw.output ? 1 : sameRun ? current?.outputCount : undefined,
       sessionId: sessionId ?? current?.sessionId,
       parentId: raw.parentId !== undefined ? raw.parentId : current?.parentId,
+      toolCallId: nonEmpty(raw.toolCallId) ?? (sameRun ? current?.toolCallId : undefined),
       depth: raw.depth ?? current?.depth,
       role: raw.role ?? raw.agentType ?? current?.role ?? raw.name,
       title: raw.title ?? current?.title,
@@ -2919,21 +3339,21 @@ export class PiHostBackend implements HostBackend {
 			deadlineAt: num2(raw.deadlineAt) ?? (sameRun ? current?.deadlineAt : undefined),
       // `start` sends `model: null` when the worker inherits the main model, so a null must never
       // clobber a model a later `usage` event resolved.
-      model: modelRef(raw.model) ?? current?.model,
-      provider: providerOf(modelRef(raw.model)) ?? current?.provider,
+      model: modelRef(raw.model) ?? (sameRun ? current?.model : undefined),
+      provider: providerOf(modelRef(raw.model)) ?? (sameRun ? current?.provider : undefined),
       // The extension's `activity` is the one-line "what this worker is doing right now"; it is what
       // Swift shows as the row subtitle and in the 正在执行 block.
-      listSubtitle: nonEmpty(raw.activity) ?? current?.listSubtitle,
+      listSubtitle: nonEmpty(raw.activity) ?? (sameRun ? current?.listSubtitle : undefined),
       // `update` carries a rolling snapshot of the output; only the terminal event is the real result,
       // so a running worker never renders a 最终结果 card built from a half-written answer.
       finalResult: terminal
         ? (nonEmpty(raw.output) ?? current?.finalResult)
         : sameRun ? current?.finalResult : undefined,
       endedAt: terminal ? (sameRun ? current?.endedAt : undefined) ?? Date.now() : sameRun ? current?.endedAt : undefined,
-      inputTokens: num2(usage?.input) ?? current?.inputTokens,
-      outputTokens: num2(usage?.output) ?? current?.outputTokens,
-      cacheTokens: num2(usage?.cacheRead) ?? current?.cacheTokens,
-      contextTokens: num2(usage?.contextTokens) ?? current?.contextTokens,
+      inputTokens: num2(usage?.input) ?? (sameRun ? current?.inputTokens : undefined),
+      outputTokens: num2(usage?.output) ?? (sameRun ? current?.outputTokens : undefined),
+      cacheTokens: num2(usage?.cacheRead) ?? (sameRun ? current?.cacheTokens : undefined),
+      contextTokens: num2(usage?.contextTokens) ?? (sameRun ? current?.contextTokens : undefined),
     };
     this.agents.set(key, agent);
     const lifecycle =
@@ -2966,18 +3386,19 @@ export class PiHostBackend implements HostBackend {
       this.worktrees.set(agent.agentId, status);
       this.agent({ type: "worktree", status });
     }
-    if (raw.kind === "log_delta") {
+    const logSessionId = agent.sessionId;
+    if (raw.kind === "log_delta" && logSessionId) {
       // Runtime log_delta pushes cumulative full text keyed by contentIndex; carry
       // the key so the panel upserts one row instead of adding one per chunk.
       const contentIndex = num2(raw.contentIndex);
       const entry = { itemType: raw.itemType, text: raw.text ?? "", name: raw.name, isError: raw.isError, ...(contentIndex === undefined ? {} : { contentIndex }) };
-      this.cacheAgentLog(agent.agentId, entry);
-      this.agent({ type: "agent_log", agentId: agent.agentId, ...entry });
-    } else if (raw.kind === "log")
+      this.cacheAgentLog(logSessionId, agent.agentId, agent.runId, entry);
+      this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
+    } else if (raw.kind === "log" && logSessionId)
       for (const item of raw.items ?? []) {
         const entry = { itemType: item.itemType, text: item.text, name: item.name, isError: item.isError };
-        this.cacheAgentLog(agent.agentId, entry);
-        this.agent({ type: "agent_log", agentId: agent.agentId, ...entry });
+        this.cacheAgentLog(logSessionId, agent.agentId, agent.runId, entry);
+        this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
       }
     this.agent({ type: "agent", agent });
     this.persistAgents();

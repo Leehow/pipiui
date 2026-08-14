@@ -33,7 +33,27 @@
   border-right:1px solid var(--sb-border);
 }
 
-/* ── Search ─────────────────────────────────────────────── */
+/* ── Pane title row / Search ───────────────────────────── */
+.sb-topbar{
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  flex:0 0 50px;
+  min-width:0;
+  padding:0 10px;
+  border-bottom:1px solid var(--sb-border);
+}
+.sb-brand-wordmark{
+  margin-right:auto;
+  color:var(--sb-text-strong);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  font-size:17px;
+  font-weight:750;
+  line-height:1;
+  letter-spacing:-.55px;
+  white-space:nowrap;
+}
+.sb-brand-wordmark span{color:#13b8d3}
 .sb-search{
   display:flex;
   align-items:center;
@@ -215,8 +235,16 @@
   border-radius:6px;
   text-align:left;
   color:var(--sb-text);
+  cursor:default;
 }
 .sb-session:hover{background:var(--sb-surface-hover)}
+.sb-project[draggable="true"]{cursor:grab}
+.sb-session[draggable="true"]{cursor:default}
+.sb-project[data-dragging="true"]{opacity:.42;cursor:grabbing}
+.sb-session[data-dragging="true"]{opacity:.42;cursor:default}
+.sb-pinned-section[data-drop-active="true"]{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--sb-accent) 45%,transparent);border-radius:7px}
+.sb-project[data-drop-placement="before"],.sb-session[data-drop-placement="before"]{box-shadow:inset 0 2px 0 var(--sb-accent)}
+.sb-project[data-drop-placement="after"],.sb-session[data-drop-placement="after"]{box-shadow:inset 0 -2px 0 var(--sb-accent)}
 .sb-session:focus-visible{outline:1px solid var(--sb-accent);outline-offset:-1px}
 .sb-session .provider-logo{flex:none}
 .sb-session-title{
@@ -226,6 +254,19 @@
   text-overflow:ellipsis;
   white-space:nowrap;
   font-size:12px;
+}
+.sb-session-title-input{
+  min-width:0;
+  width:100%;
+  height:24px;
+  padding:2px 6px;
+  border:1px solid var(--sb-accent);
+  border-radius:5px;
+  outline:0;
+  color:var(--sb-text-strong);
+  background:var(--sb-surface-input);
+  font:inherit;
+  box-shadow:0 0 0 2px color-mix(in srgb,var(--sb-accent) 18%,transparent);
 }
 .sb-selected{background:var(--sb-accent-soft)}
 .sb-selected:hover{background:var(--sb-accent-soft)}

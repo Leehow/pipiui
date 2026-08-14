@@ -5,6 +5,9 @@ export const PIPI_HOST_IPC_CHANNEL = "pipi-host:v1";
 
 export type Unsubscribe = () => void;
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const STANDARD_THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
+export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
 export type Project = { id: string; name: string; path: string };
 export type Session = {
   id: string;
@@ -16,6 +19,9 @@ export type Session = {
 };
 export type SessionLease = { sessionId: string; writable: boolean; holder?: { protocolVersion: number; holder: string; pid: number; hostname: string; acquiredAt: string; heartbeatAt: string; expiresAt: string } };
 export type HistoryTool = { id: string; name: string; input: string };
+export type HistoryActivity =
+  | { type: "thinking"; contentIndex: number; content: string }
+  | { type: "tool"; contentIndex: number; tool: HistoryTool };
 /**
  * Transcript entry. `content` is the plain text of the message; assistant
  * entries additionally carry `thinking` and `tools` so resumed sessions render
@@ -31,6 +37,8 @@ export type HistoryEntry = {
   thinking?: string;
   /** assistant only: tool calls with their raw args JSON. */
   tools?: HistoryTool[];
+  /** assistant only: ordered non-text content blocks for exact resume parity. */
+  activities?: HistoryActivity[];
   /** tool (toolResult) only: the tool call this result belongs to. */
   toolCallId?: string;
   toolName?: string;
@@ -63,19 +71,71 @@ export type TextDocumentContent = DocumentSummary & { kind: "markdown" | "plain"
 export type BinaryDocumentContent = DocumentSummary & { kind: "pdf" | "word" | "spreadsheet" | "presentation"; bytes: Uint8Array; content?: never };
 export type DocumentContent = TextDocumentContent | BinaryDocumentContent;
 export type DocumentErrorCode = "document_invalid_path" | "document_unsupported_type" | "document_not_found" | "document_not_file" | "document_too_large" | "document_read_failed" | "document_external_open_failed";
-export type Model = { provider: string; id: string; name: string; reasoning: boolean; /** Mirrors Swift ModelInfo.supportsImages (pi input array or heuristic). Absent = unknown (defaults to supported). */ supportsImages?: boolean };
+export type Model = {
+  provider: string;
+  id: string;
+  name: string;
+  /** Pi model metadata. Absent means the runtime did not report whether this is a reasoning model. */
+  reasoning?: boolean;
+  /** Pi's tri-state map: string = supported provider value, null = explicitly unsupported, absent key = provider default. */
+  thinkingLevelMap?: ThinkingLevelMap;
+  /** Semantic result of Pi API/compat metadata. Absent means configurability is unknown. */
+  thinkingConfigurable?: boolean;
+  /** Mirrors Swift ModelInfo.supportsImages (pi input array or heuristic). Absent = unknown (defaults to supported). */
+  supportsImages?: boolean;
+};
 export type ModelState = { model: Model; thinkingLevel: ThinkingLevel; availableThinkingLevels: ThinkingLevel[] };
-/** Ordered subagent model fallback entry. An empty chain means “follow main Agent”. */
+
+/** One capability source for backend fallbacks, the composer, and subagent overrides. */
+export function thinkingLevelsForModel(model: Model, reported?: readonly ThinkingLevel[]): ThinkingLevel[] {
+  if (model.reasoning === false || model.thinkingConfigurable === false) return [];
+  const thinkingLevelMap = model.thinkingLevelMap;
+  if (thinkingLevelMap) {
+    // Sparse maps (openai-codex GPT) define only the effort strings chatgpt.com accepts.
+    // Absent keys are not valid provider values — do not invent STANDARD levels for them.
+    return THINKING_LEVELS.filter(level => {
+      if (Object.prototype.hasOwnProperty.call(thinkingLevelMap, level))
+        return typeof thinkingLevelMap[level] === "string";
+      return level === "off";
+    });
+  }
+  if (reported) {
+    const supported = new Set(reported);
+    return THINKING_LEVELS.filter(level => supported.has(level));
+  }
+  return [...STANDARD_THINKING_LEVELS];
+}
+
+/** Prefer current if allowed, else fallback if allowed, else the first allowed level. */
+export function resolveThinkingLevel(
+  current: ThinkingLevel | undefined,
+  available: readonly ThinkingLevel[],
+  fallback?: ThinkingLevel,
+): ThinkingLevel | undefined {
+  if (current && available.includes(current)) return current;
+  if (fallback && available.includes(fallback)) return fallback;
+  return available[0];
+}
+/** Ordered subagent fallback entry. New selections persist `model` as full `provider/modelId`; an empty chain means “follow main Agent”. */
 export type SubagentModelSetting = { model: string; thinking?: string };
 /** Cross-renderer semantic sidebar state. Device-only disclosure/layout stays local. */
-export type SidebarSessionPreferences = { pinnedSessionIds: string[]; archivedSessionIds: string[] };
+export type SidebarSessionPreferences = {
+  pinnedSessionIds: string[];
+  archivedSessionIds: string[];
+  /** Unix milliseconds when each session entered the archive. Missing legacy entries receive a fresh grace window in the UI. */
+  archivedSessionTimestamps?: Record<string, number>;
+  /** Only sessions that participated in an explicit drag, in their local relative order. */
+  orderedSessionIds: string[];
+  /** Absent identifies the legacy full-list order that must be migrated away. */
+  sessionOrderVersion?: 2;
+};
 /** Built-in subagent role metadata used by the settings UI. */
 export type AgentDefinition = { name: string; description: string };
 export type AgentState = "running" | "stalled" | "ok" | "failed" | "aborted" | "interrupted";
 /** `cost` remains USD for compatibility; these optional fields select its display unit and USD→CNY rate. */
 export type CostUnit = "USD" | "CNY";
 /** Metadata is optional for v1 producers; v2 producers populate it on snapshots and updates. */
-export type AgentSummary = { agentId: string; runId: string; name: string; task: string; state: AgentState; stalled?: boolean; stalledIdleSec?: number; handled?: boolean; cost?: number; costUnit?: CostUnit; exchangeRate?: number; turns?: number; outputCount?: number; sessionId?: string; parentId?: string | null; depth?: number; role?: string; createdAt?: number; updatedAt?: number; deadlineAt?: number; endedAt?: number; title?: string; model?: string; provider?: string; listSubtitle?: string; closeout?: string; contextTokens?: number; contextWindowTokens?: number; inputTokens?: number; outputTokens?: number; cacheTokens?: number; finalResult?: string };
+export type AgentSummary = { agentId: string; runId: string; name: string; task: string; state: AgentState; stalled?: boolean; stalledIdleSec?: number; handled?: boolean; cost?: number; costUnit?: CostUnit; exchangeRate?: number; turns?: number; outputCount?: number; sessionId?: string; parentId?: string | null; /** The main-chat tool_call this agent was dispatched from (subagent tool), if any. Lets the transcript card link a tool_call to its live worker. */ toolCallId?: string; depth?: number; role?: string; createdAt?: number; updatedAt?: number; deadlineAt?: number; endedAt?: number; title?: string; model?: string; provider?: string; listSubtitle?: string; closeout?: string; contextTokens?: number; contextWindowTokens?: number; inputTokens?: number; outputTokens?: number; cacheTokens?: number; finalResult?: string };
 export type WorktreeLifecycle = "none" | "active" | "pendingReview" | "merged" | "mergedCleanupPending" | "discarded";
 export type WorktreeStatus = { agentId: string; branch?: string; path?: string; error?: string; lifecycle: WorktreeLifecycle; merge: "ready" | "merged" | "conflict" | "unavailable"; discard: "ready" | "discarded" | "unavailable" };
 export type HostCapabilities = { computerUse: boolean; revealInFinder: boolean; terminal: boolean; plan: boolean; retainedWorktreeDisposition: boolean; [capability: string]: boolean };
@@ -273,9 +333,10 @@ export type TranscriptImage = { data: string; mimeType: string };
 
 export type StreamEvent =
   | { type: "text"; sessionId: string; contentIndex: number; delta: string }
-  | { type: "thinking"; sessionId: string; contentIndex: number; delta: string }
-  | { type: "tool_call"; sessionId: string; toolCallId: string; name: string; delta?: string }
+  | { type: "thinking"; sessionId: string; contentIndex: number; delta: string; segment?: number }
+  | { type: "tool_call"; sessionId: string; contentIndex?: number; toolCallId: string; name: string; delta?: string }
   | { type: "tool_result"; sessionId: string; toolCallId: string; content: string; isError?: boolean; images?: TranscriptImage[] }
+  | { type: "session_title"; sessionId: string; title: string; source: "provisional" | "model" | "manual" }
   | { type: "status"; sessionId: string; status: "started" | "streaming" | "settled" | "stopped"; pendingFollowUps?: string[] }
   /** Snapshot after every queue mutation; old clients may safely ignore this new event type. */
   | { type: "queue_update"; sessionId: string; queue: QueuedMessage[]; pendingFollowUps?: string[] }
@@ -287,7 +348,7 @@ export type StreamEvent =
    * mutually exclusive with a clean finish. Old clients may safely ignore it.
    */
   | { type: "compaction"; sessionId: string; phase: "start" | "end"; reason?: string; aborted?: boolean; error?: string };
-export type AgentEvent = { type: "agent"; agent: AgentSummary } | { type: "agent_log"; agentId: string; itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; /** Runtime log_delta key: cumulative full text per streamed entry, so the panel can upsert one row per contentIndex instead of one per chunk. */ contentIndex?: number } | { type: "worktree"; status: WorktreeStatus };
+export type AgentEvent = { type: "agent"; agent: AgentSummary } | { type: "agent_log"; /** Optional only so an older host event can be ignored safely; current hosts always emit both identity fields. */ sessionId?: string; agentId: string; runId?: string; itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; /** Runtime log_delta key: cumulative full text per streamed entry, so the panel can upsert one row per contentIndex instead of one per chunk. */ contentIndex?: number } | { type: "worktree"; status: WorktreeStatus };
 export type HostEvent =
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "stream"; event: StreamEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "agents"; event: AgentEvent }
@@ -304,10 +365,12 @@ export interface PipiHostAPI {
    * empty across restarts until callers add a path again.
    */
   getProjectPaths?(): Promise<string[]>; setProjectPaths?(paths: string[]): Promise<string[]>;
+  /** Electron-only native folder chooser. `null` means the user cancelled. */
+  pickProjectDirectory?(): Promise<string | null>;
   addProject?(path: string): Promise<Project>; removeProject?(projectId: string): Promise<void>;
   /** Optional: absent or unsupported v2 hosts let the UI use its local preview fallback. */
   listDocuments?(projectId?: string): Promise<DocumentSummary[]>; readDocument?(documentId: string): Promise<DocumentContent>;
-  newSession(projectId: string, name?: string): Promise<Session>; resumeSession(sessionId: string): Promise<Session>; deleteSession(sessionId: string): Promise<void>; getSessionHistory(sessionId: string): Promise<HistoryEntry[]>; getSessionLease(sessionId: string): Promise<SessionLease>; forceTakeoverSessionLease(sessionId: string): Promise<SessionLease>;
+  newSession(projectId: string, name?: string): Promise<Session>; resumeSession(sessionId: string): Promise<Session>; renameSession(sessionId: string, name: string): Promise<Session>; deleteSession(sessionId: string): Promise<void>; moveSession(sessionId: string, targetProjectId: string): Promise<Session>; getSessionHistory(sessionId: string): Promise<HistoryEntry[]>; getSessionLease(sessionId: string): Promise<SessionLease>; forceTakeoverSessionLease(sessionId: string): Promise<SessionLease>;
   /** Legacy-compatible send: direct sends and busy queueing are observed through `queue_update` stream events. */
   sendPrompt(sessionId: string, prompt: string, attachments?: PromptAttachment[]): Promise<void>;
   listQueue(sessionId: string): Promise<QueuedMessage[]>; enqueueMessage(sessionId: string, text: string, attachments?: PromptAttachment[]): Promise<QueueEnqueueResult>; updateQueuedMessage(sessionId: string, messageId: string, text: string, attachments?: PromptAttachment[]): Promise<QueuedMessage>; removeQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; promoteQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; steerQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; retryQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>;
@@ -368,7 +431,7 @@ export interface PipiHostAPI {
    */
   getQuotaSnapshot?(sessionId?: string): Promise<QuotaSnapshot | null>;
   /** Current snapshot; omit sessionId only for hosts that intentionally aggregate all sessions. */
-  listAgents(sessionId?: string): Promise<AgentSummary[]>; getAgentLogs(agentId: string): Promise<{ itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; contentIndex?: number }[]>; subscribeAgents(listener: (event: AgentEvent) => void): Unsubscribe; subscribeAgentLog(agentId: string, listener: (event: Extract<AgentEvent, { type: "agent_log" }>) => void): Unsubscribe; abortAgent(agentId: string): Promise<void>; resolveAgent(agentId: string): Promise<void>; checkAgent(agentId: string): Promise<AgentSummary>; getWorktreeStatus(agentId: string): Promise<WorktreeStatus>; mergeWorktree(agentId: string): Promise<WorktreeStatus>; discardWorktree(agentId: string): Promise<WorktreeStatus>;
+  listAgents(sessionId?: string): Promise<AgentSummary[]>; getAgentLogs(agentId: string, sessionId: string, runId: string): Promise<{ itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; contentIndex?: number }[]>; subscribeAgents(listener: (event: AgentEvent) => void): Unsubscribe; subscribeAgentLog(agentId: string, listener: (event: Extract<AgentEvent, { type: "agent_log" }>) => void, sessionId: string, runId: string): Unsubscribe; abortAgent(agentId: string): Promise<void>; resolveAgent(agentId: string): Promise<void>; checkAgent(agentId: string): Promise<AgentSummary>; getWorktreeStatus(agentId: string): Promise<WorktreeStatus>; mergeWorktree(agentId: string): Promise<WorktreeStatus>; discardWorktree(agentId: string): Promise<WorktreeStatus>;
   capabilities(): Promise<HostCapabilities>;
   /**
    * Optional git extension for the toolbar branch control. Hosts advertise it
@@ -400,7 +463,7 @@ function requestId(): string { return `${Date.now()}-${Math.random().toString(36
 function apiFrom(
   call: (method: HostMethod, params: unknown[]) => Promise<unknown>,
   subscribe: (channel: HostEvent["channel"], predicate: (event: HostEvent) => boolean, listener: (event: HostEvent) => void) => Unsubscribe,
-  options: { openExternal?: boolean; openDocumentExternally?: boolean } = {}
+  options: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean } = {}
 ): PipiHostAPI {
   const invoke = <T>(method: HostMethod, ...params: unknown[]) => call(method, params) as Promise<T>;
   const api: PipiHostAPI = {
@@ -409,13 +472,16 @@ function apiFrom(
     listSessions: projectId => invoke("listSessions", projectId),
     getProjectPaths: () => invoke("getProjectPaths"),
     setProjectPaths: paths => invoke("setProjectPaths", paths),
+    pickProjectDirectory: () => invoke("pickProjectDirectory"),
     addProject: path => invoke("addProject", path),
     removeProject: projectId => invoke("removeProject", projectId),
     listDocuments: projectId => invoke("listDocuments", projectId),
     readDocument: documentId => invoke("readDocument", documentId),
     newSession: (projectId, name) => invoke("newSession", projectId, name),
     resumeSession: sessionId => invoke("resumeSession", sessionId),
+    renameSession: (sessionId, name) => invoke("renameSession", sessionId, name),
     deleteSession: sessionId => invoke("deleteSession", sessionId),
+    moveSession: (sessionId, targetProjectId) => invoke("moveSession", sessionId, targetProjectId),
     getSessionHistory: sessionId => invoke("getSessionHistory", sessionId),
     getSessionLease: sessionId => invoke("getSessionLease", sessionId),
     forceTakeoverSessionLease: sessionId => invoke("forceTakeoverSessionLease", sessionId),
@@ -453,9 +519,9 @@ function apiFrom(
     getQuotaSnapshot: sessionId => sessionId === undefined ? invoke("getQuotaSnapshot") : invoke("getQuotaSnapshot", sessionId),
     subscribeSessionStats: listener => subscribe("session_stats", event => event.channel === "session_stats", event => listener((event as Extract<HostEvent, { channel: "session_stats" }>).event)),
     listAgents: sessionId => invoke("listAgents", sessionId),
-    getAgentLogs: agentId => invoke("getAgentLogs", agentId),
+    getAgentLogs: (agentId, sessionId, runId) => invoke("getAgentLogs", agentId, sessionId, runId),
     subscribeAgents: listener => subscribe("agents", event => event.channel === "agents", event => listener((event as Extract<HostEvent, { channel: "agents" }>).event)),
-    subscribeAgentLog: (agentId, listener) => subscribe("agents", event => event.channel === "agents" && event.event.type === "agent_log" && event.event.agentId === agentId, event => listener((event as Extract<HostEvent, { channel: "agents" }>).event as Extract<AgentEvent, { type: "agent_log" }>)),
+    subscribeAgentLog: (agentId, listener, sessionId, runId) => subscribe("agents", event => event.channel === "agents" && event.event.type === "agent_log" && event.event.agentId === agentId && event.event.sessionId === sessionId && event.event.runId === runId, event => listener((event as Extract<HostEvent, { channel: "agents" }>).event as Extract<AgentEvent, { type: "agent_log" }>)),
     abortAgent: agentId => invoke("abortAgent", agentId),
     resolveAgent: agentId => invoke("resolveAgent", agentId),
     checkAgent: agentId => invoke("checkAgent", agentId),
@@ -492,6 +558,7 @@ function apiFrom(
       ,subscribeAll: listener => subscribe("terminal", event => event.channel === "terminal", event => listener((event as Extract<HostEvent, { channel: "terminal" }>).event))
     }
   };
+  if (!options.projectDirectoryPicker) delete api.pickProjectDirectory;
   if (options.openExternal) api.openExternal = url => invoke("openExternal", url);
   if (options.openDocumentExternally) api.openDocumentExternally = path => invoke("openDocumentExternally", path);
   return api;
@@ -503,7 +570,7 @@ function responseError(response: Extract<HostResponse, { ok: false }>): Error & 
   return error;
 }
 
-export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHANNEL, options?: { openExternal?: boolean; openDocumentExternally?: boolean }): PipiHostAPI {
+export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHANNEL, options?: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean }): PipiHostAPI {
   return apiFrom(
     async (method, params) => {
       const response = await ipc.invoke(channel, { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: requestId(), type: "request", method, params });

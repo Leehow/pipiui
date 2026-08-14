@@ -48,21 +48,24 @@ export function ThinkingChip({ level, levels, onChange }: {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [open])
-  const onlyOff = levels.length === 1 && levels[0] === 'off'
+  const modelDecides = levels.length === 0
+  const noChoice = levels.length <= 1
+  const displayLevel = modelDecides ? 'auto' : level
   return (
     <div className="quick-menu-anchor thinking-chip-anchor" data-testid="thinking-chip-anchor">
       <button
         type="button"
         className="thinking-chip"
-        aria-label={`思考级别（当前：${level}）`}
+        aria-label={modelDecides ? '思考强度由模型决定' : `思考级别（当前：${level}）`}
         aria-haspopup="menu"
         aria-expanded={open}
-        disabled={onlyOff}
+        disabled={noChoice}
+        title={modelDecides ? '思考强度由模型决定' : undefined}
         data-testid="thinking-chip"
         onClick={() => setOpen(value => !value)}
       >
         <BrainIcon size={13} />
-        <span className="thinking-chip-level">{level}</span>
+        <span className="thinking-chip-level">{displayLevel}</span>
       </button>
       {open && (
         <>

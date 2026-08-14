@@ -2,11 +2,13 @@ import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
-export type Feature = "philosophy"|"plan"|"generateImage"|"git"|"reload"|"webSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"computerUse"|"browser"|"terminal"|"subagent";
+import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
+
+export type Feature = "philosophy"|"plan"|"generateImage"|"git"|"reload"|"webSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
-export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"computerUse"|"webview"|"terminal"|"subagentDir"|"agentsDir", string>>;
+export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"computerUse"|"webview"|"terminal"|"runtimeInfo"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
-export type SpawnInput = { sessionPath?: string; cwd: string; runtimeRoot?: string; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; subagentModelsFile?: string; excludeToolsArgs?: string[] };
+export type SpawnInput = { sessionPath?: string; cwd: string; runtimeRoot?: string; agentDir?: string; sessionsRoot?: string; resourceMode?: "default"|"explicit"; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; subagentModelsFile?: string; /** The user's Settings → 工具开关 denylist. Merged with the Boss read-only policy; never passed to workers. */ disabledToolNames?: readonly string[] };
 export type SpawnOutput = { args: string[]; env: Record<string,string> };
 /**
  * An explicit process invocation for Pi.
@@ -28,10 +30,10 @@ const ext=(args:string[], path?:string)=>{if(path)args.push("-e",path)};
  * finalizer: a bridge credential inherited from an outer shell would let another process address
  * this session's agent tree. Only the value this host mints for this spawn survives.
  */
-export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,string> { const exact=new Set(["PIPIUI_AGENTS_DIR","PIPIUI_BRIDGE_PORT","PIPIUI_BUILT_IN_SKILL_ROOT","PIPIUI_MAIN_CWD","PIPIUI_MAIN_MODEL","PIPIUI_MAIN_MODEL_FILE","PIPIUI_NODE_PATH","PIPIUI_PI_PATH","PIPIUI_RUNTIME_SOURCE_ROOT","PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE","PIPIUI_SESSION_KEY","PIPIUI_SESSION_CAPABILITY","PIPIUI_HOST_PROTOCOL","PIPIUI_SKILL_READ_BLOCK","PIPIUI_TOOL_SKILL_SETTINGS_FILE","PIPIUI_WEB_ACCESS_EXT","PIPIUI_ARXIV_EXT","PIPIUI_WORKTREE"]); return Object.fromEntries(Object.entries(env).filter(([key,value])=>value!==undefined&&!exact.has(key)&&!["PIPIUI_AGENT_","PIPIUI_MEMORY_","PIPIUI_COMPUTER_","PIPIUI_CUA_","PIPIUI_TERMINAL_","PIPIUI_SEARCH_","PIPIUI_SUBAGENT_","PIPIUI_WORKTREE_","PIPIUI_HERMES_"].some(prefix=>key.startsWith(prefix))) as [string,string][]); }
+export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,string> { const exact=new Set(["PIPIUI_AGENTS_DIR","PIPIUI_BOSS_READ_ONLY","PIPIUI_BRIDGE_PORT","PIPIUI_BUILT_IN_SKILL_ROOT","PIPIUI_MAIN_CWD","PIPIUI_MAIN_MODEL","PIPIUI_MAIN_MODEL_FILE","PIPIUI_NODE_PATH","PIPIUI_PI_PATH","PIPIUI_RUNTIME_SOURCE_ROOT","PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE","PIPIUI_SESSION_KEY","PIPIUI_SESSION_CAPABILITY","PIPIUI_HOST_PROTOCOL","PIPIUI_SKILL_READ_BLOCK","PIPIUI_TOOL_SKILL_SETTINGS_FILE","PIPIUI_WEB_ACCESS_EXT","PIPIUI_ARXIV_EXT","PIPIUI_WORKTREE"]); return Object.fromEntries(Object.entries(env).filter(([key,value])=>value!==undefined&&!exact.has(key)&&!["PIPIUI_AGENT_","PIPIUI_MEMORY_","PIPIUI_COMPUTER_","PIPIUI_CUA_","PIPIUI_TERMINAL_","PIPIUI_SEARCH_","PIPIUI_SUBAGENT_","PIPIUI_WORKTREE_","PIPIUI_HERMES_"].some(prefix=>key.startsWith(prefix))) as [string,string][]); }
 /**
  * Layered spawn environment, mirroring Swift `ChatSession.mergedSpawnEnv` + `PiProcess`
- * (T17): every `~/.pi/agent/.env` key is injected into the spawned pi process so
+ * (T17): every configured `<agentDir>/.env` key is injected into the spawned pi process so
  * env-key providers (DeepSeek, Kimi, …) resolve in the RPC session exactly as they do
  * for `listModels`. Precedence, highest first: internal assembly env (the host's own
  * PIPIUI_* contract) → `.env` → host process env. Managed PIPIUI_* keys are stripped
@@ -50,7 +52,10 @@ export function mergedSpawnEnvironment(
   };
 }
 /** Assemble the Electron host's Pi process contract. */
-export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.sessionPath)args.push("--session",input.sessionPath);if(enabled(f,"philosophy"))ext(args,p.philosophy);if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git"))ext(args,p.git);if(enabled(f,"reload"))ext(args,p.reload);if(enabled(f,"webSearch")){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){ext(args,p.skillLoader);if(p.skillLoader&&p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);args.push(...(input.excludeToolsArgs??[]));
+export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.resourceMode==="explicit")args.push("--no-extensions","--no-skills","--no-prompt-templates","--no-themes");if(input.agentDir)env.PI_CODING_AGENT_DIR=input.agentDir;if(input.sessionsRoot)env.PI_CODING_AGENT_SESSION_DIR=input.sessionsRoot;if(input.sessionPath)args.push("--session",input.sessionPath);if(enabled(f,"philosophy"))ext(args,p.philosophy);if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git"))ext(args,p.git);if(enabled(f,"reload"))ext(args,p.reload);if(enabled(f,"webSearch")){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){ext(args,p.skillLoader);if(p.skillLoader&&p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);args.push(...mainSessionExcludeToolArgs({bossReadOnly:enabled(f,"bossReadOnly"),disabledToolNames:input.disabledToolNames}));
+// `--exclude-tools` removes bash, but the shared `terminal` tool can also run a command. It is
+// gated by action instead of removed, so the Boss keeps observe/list/wait — see the extension.
+if(enabled(f,"bossReadOnly"))env.PIPIUI_BOSS_READ_ONLY="1";
 /*
  * Subagent orchestration, deliberately mounted before the bridge gate.
  *
@@ -65,10 +70,10 @@ if(enabled(f,"subagent")&&p.subagentDir){ext(args,p.subagentDir);env.PIPIUI_SUBA
 // exactly one finalizer ever runs against a repository.
 env.PIPIUI_WORKTREE_FINALIZER="pi";
 if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI_MAIN_MODEL=input.mainModelId;if(input.subagentModelsFile)env.PIPIUI_SUBAGENT_MODELS_FILE=input.subagentModelsFile;env.PIPIUI_COMPUTER_PROCEDURE_STORE=join(homedir(),"Library","Application Support","PipiUI","computer-agent","procedures.json")}
-if(!input.bridgePort)return{args,env};
+if(!input.bridgePort){ext(args,p.runtimeInfo);return{args,env};}
 // Genuinely bridge-dependent: the memory broker issues host-scoped capabilities, the webview
 // extension drives the host's browser surface, and an explicitly enabled plan runtime posts events.
-if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PIPIUI_MEMORY_BROKER_MODE="main";env.PIPIUI_MEMORY_PROJECT_ROOT=input.cwd}}if(enabled(f,"browser"))ext(args,p.webview);if(enabled(f,"terminal"))ext(args,p.terminal);if(enabled(f,"plan"))ext(args,p.planRuntime);env.PIPIUI_BRIDGE_PORT=String(input.bridgePort);env.PIPIUI_SESSION_KEY=input.bridgeRoutingKey??"";
+if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PIPIUI_MEMORY_BROKER_MODE="main";env.PIPIUI_MEMORY_PROJECT_ROOT=input.cwd;if(p.hermesMemory){env.PIPIUI_HERMES_PACKAGE_ROOT=p.hermesMemory;env.PIPIUI_HERMES_NODE_MODULES_ROOT=dirname(p.hermesMemory)}}}if(enabled(f,"browser"))ext(args,p.webview);if(enabled(f,"terminal"))ext(args,p.terminal);if(enabled(f,"plan"))ext(args,p.planRuntime);env.PIPIUI_BRIDGE_PORT=String(input.bridgePort);env.PIPIUI_SESSION_KEY=input.bridgeRoutingKey??"";
 // Canonical v1: the extension encodes `sessionCapability` envelopes and fails closed when the
 // capability is missing, so the protocol marker is only ever set together with a real credential.
 if(input.sessionCapability){env.PIPIUI_HOST_PROTOCOL="1";env.PIPIUI_SESSION_CAPABILITY=input.sessionCapability}
@@ -78,7 +83,9 @@ if(enabled(f,"computerUse")&&enabled(f,"subagent")&&p.subagentDir&&p.computerUse
 // GUI Operator children; never register mutating computer/open_application tools
 // directly in the main session.
 env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.19.2";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
-return{args,env}; }
+// Mounted last so its read-only request observer sees the final provider payload after all
+// PipiUI rewriters. The isolated title helper passes no runtimeInfo path and remains tool-free.
+ext(args,p.runtimeInfo);return{args,env}; }
 function declaredEntrypoint(root:string):string|undefined {
   try {
     const manifest=JSON.parse(readFileSync(join(root,"package.json"),"utf8"));
@@ -90,6 +97,17 @@ function declaredEntrypoint(root:string):string|undefined {
   } catch{return undefined}
 }
 /**
+ * A `pi` that a transitive dependency dragged in is never the one this host wants.
+ *
+ * `pi-mcp-extension` depends on the pre-rename `@mariozechner/pi-coding-agent` at `*`, which
+ * installs an old Pi into this repo's node_modules and claims the `pi` name in
+ * `node_modules/.bin`. npm puts that directory first on PATH for every `npm run` script, so
+ * the external-Pi fallback used in development would resolve a build several minor versions
+ * behind the one this host is written against — and that build rejects flags the host now
+ * passes, turning a stale-but-working session into one that will not start at all.
+ */
+const isPackageLocalBin=(dir:string):boolean=>dir.split(/[\\/]/).includes("node_modules");
+/**
  * Resolve the `pi` executable without a shell.
  *
  * An Electron app launched from Finder inherits a minimal PATH (`/usr/bin:/bin:…`), so a bare
@@ -99,7 +117,7 @@ function declaredEntrypoint(root:string):string|undefined {
  */
 export function resolvePiExecutable(env:NodeJS.ProcessEnv=process.env):string{
   const executable=process.platform==="win32"?"pi.cmd":"pi";
-  const fromPath=(env.PATH??"").split(delimiter).filter(Boolean).map(dir=>join(dir,executable));
+  const fromPath=(env.PATH??"").split(delimiter).filter(Boolean).filter(dir=>!isPackageLocalBin(dir)).map(dir=>join(dir,executable));
   const candidates=[...fromPath,join(homedir(),".npm-global","bin","pi"),"/opt/homebrew/bin/pi","/usr/local/bin/pi",join(homedir(),".bun","bin","pi"),join(homedir(),".local","bin","pi")];
   return candidates.find(candidate=>{try{accessSync(candidate,constants.X_OK);return true}catch{return false}})??"pi";
 }
@@ -122,6 +140,7 @@ export type ManagedPackage={name:string;version:string};
  * mount lookup can never drift onto different versions.
  */
 export const MANAGED_PACKAGES:readonly ManagedPackage[]=[{name:"pi-web-access",version:"0.20.0"},{name:"pi-mcp-extension",version:"1.5.0"}];
+export const HERMES_MEMORY_PACKAGE:ManagedPackage={name:"pi-hermes-memory",version:"0.9.4"};
 const fileIfPresent=(...segments:string[]):string|undefined=>{const path=join(...segments);return existsSync(path)?path:undefined};
 const packageIfPresent=(...segments:string[]):string|undefined=>{const dir=join(...segments);return existsSync(join(dir,"package.json"))?dir:undefined};
 export type SpawnPathOptions={managedNodeModulesRoot?:string};
@@ -143,6 +162,12 @@ export function resolveSpawnPaths(runtimeRoot:string=defaultRuntimeRoot(),option
     } catch{return undefined}
     return declaredEntrypoint(root);
   };
+  const managedRoot=({name,version}:ManagedPackage)=>{
+    const root=options.managedNodeModulesRoot
+      ? join(options.managedNodeModulesRoot,name)
+      : join(runtimeRoot,"managed-npm",`${name}-${version}`,"node_modules",name);
+    try{return JSON.parse(readFileSync(join(root,"package.json"),"utf8"))?.version===version?root:undefined}catch{return undefined}
+  };
   return {
     philosophy:declaredEntrypoint(join(runtimeRoot,"pi-philosophy")),
     media:fileIfPresent(extensions,"pipiui-media.ts"),
@@ -157,9 +182,11 @@ export function resolveSpawnPaths(runtimeRoot:string=defaultRuntimeRoot(),option
     computerUse:fileIfPresent(extensions,"pipiui-computer-use.ts"),
     webview:fileIfPresent(extensions,"pipiui-electron-webview.ts"),
     terminal:fileIfPresent(extensions,"pipiui-electron-terminal.ts"),
+    runtimeInfo:fileIfPresent(extensions,"pipiui-runtime-info.ts"),
     subagentDir:fileIfPresent(ext,"subagent"),
     agentsDir:fileIfPresent(ext,"agents"),
     memoryBroker:packageIfPresent(ext,"packages","memory-broker"),
+    hermesMemory:managedRoot(HERMES_MEMORY_PACKAGE),
     arxivFetchPackage:packageIfPresent(ext,"packages","arxiv-fetch"),
     webSearch:managed(MANAGED_PACKAGES[0]),
     mcp:managed(MANAGED_PACKAGES[1]),

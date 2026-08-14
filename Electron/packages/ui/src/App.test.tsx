@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AgentSummary, Model, ModelState, PipiHostAPI, Project, PromptAttachment, QueuedMessage, Session, SidebarSessionPreferences, StreamEvent } from '@pipi/host-api'
+import type { AgentEvent, AgentSummary, Model, ModelState, PipiHostAPI, Project, PromptAttachment, QueuedMessage, Session, SidebarSessionPreferences, StreamEvent } from '@pipi/host-api'
 
 const xtermHarness = vi.hoisted(() => ({ instances: [] as any[] }))
 
@@ -70,9 +70,68 @@ vi.mock('@xterm/xterm', () => {
 
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit = vi.fn(); dispose = vi.fn() } }))
 
-import { App, createMockHost, sidebarPreferencesKey, sidebarModelForSession, sidebarStatusForSession, DEMO_MODEL_STORAGE_KEY, DEMO_SESSION_MODELS_STORAGE_KEY } from './App'
+import { App, createMockHost, mergeAgentSnapshot, mergeAgentSummary, sidebarPreferencesKey, sidebarModelForSession, sidebarStatusForSession, normalizeArchiveTimestamps, expiredArchivedSessionIds, ARCHIVE_RETENTION_MS, DEMO_MODEL_STORAGE_KEY, DEMO_SESSION_MODELS_STORAGE_KEY } from './App'
 
 describe('PipiUI Electron main layout', () => {
+  it('keeps archive timestamps stable, grants legacy archives a fresh window, and expires at 24 hours', () => {
+    const now = 2_000_000_000_000
+    const existing = now - 10_000
+    const normalized = normalizeArchiveTimestamps(['existing', 'legacy'], { existing, stale: 1 }, now)
+    expect(normalized).toEqual({ existing, legacy: now })
+    expect(expiredArchivedSessionIds(['existing', 'legacy'], normalized, now + ARCHIVE_RETENTION_MS - 1)).toEqual(['existing'])
+    expect(expiredArchivedSessionIds(['existing', 'legacy'], normalized, now + ARCHIVE_RETENTION_MS)).toEqual(['existing', 'legacy'])
+  })
+
+  it('automatically deletes expired archives while preserving legacy archives for a fresh 24-hour window', async () => {
+    const host = createMockHost()
+    const now = Date.now()
+    const remove = vi.fn(async () => undefined)
+    const save = vi.fn(async (preferences: SidebarSessionPreferences) => preferences)
+    host.deleteSession = remove
+    host.getSidebarSessionPreferences = vi.fn(async (): Promise<SidebarSessionPreferences> => ({
+      pinnedSessionIds: [],
+      archivedSessionIds: ['layout', 'agent-run'],
+      archivedSessionTimestamps: { layout: now - ARCHIVE_RETENTION_MS },
+      orderedSessionIds: [],
+      sessionOrderVersion: 2
+    }))
+    host.setSidebarSessionPreferences = save
+
+    render(<App host={host} />)
+
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('layout'))
+    expect(remove).not.toHaveBeenCalledWith('agent-run')
+    await waitFor(() => expect(save.mock.calls.some(([value]) =>
+      value.archivedSessionIds.length === 1
+      && value.archivedSessionIds[0] === 'agent-run'
+      && typeof value.archivedSessionTimestamps?.['agent-run'] === 'number'
+      && !('layout' in (value.archivedSessionTimestamps ?? {}))
+    )).toBe(true))
+  })
+
+  it('timestamps a newly archived session and keeps an expired archive when deletion fails', async () => {
+    const host = createMockHost()
+    const save = vi.fn(async (preferences: SidebarSessionPreferences) => preferences)
+    host.setSidebarSessionPreferences = save
+    const view = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const layoutRow = view.container.querySelector('[data-session-id="layout"]')!
+    fireEvent.click(within(layoutRow as HTMLElement).getByRole('button', { name: '归档会话' }))
+    await waitFor(() => expect(save.mock.calls.some(([value]) =>
+      value.archivedSessionIds.includes('layout') && typeof value.archivedSessionTimestamps?.layout === 'number'
+    )).toBe(true))
+    view.unmount()
+
+    const failing = createMockHost()
+    failing.deleteSession = vi.fn(async () => { throw new Error('disk busy') })
+    failing.getSidebarSessionPreferences = vi.fn(async (): Promise<SidebarSessionPreferences> => ({
+      pinnedSessionIds: [], archivedSessionIds: ['layout'], archivedSessionTimestamps: { layout: Date.now() - ARCHIVE_RETENTION_MS }, orderedSessionIds: [], sessionOrderVersion: 2
+    }))
+    render(<App host={failing} />)
+    expect(await screen.findByText(/自动删除过期归档失败：disk busy/)).toBeTruthy()
+    expect(screen.getByText('已归档')).toBeTruthy()
+  })
+
   it('constrains the real sidebar grid item and the shell row to the viewport', () => {
     const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
     expect(css).toMatch(/\.pipiui-shell\s*\{[^}]*grid-template-rows:minmax\(0,1fr\)/s)
@@ -97,20 +156,71 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(document.title).toBe('Electron 三栏界面'))
   })
 
-  it('wires the header right-pane toggle: collapse, restore, persist, remount', async () => {
+  it('applies provisional and model-refined session titles from the host stream', async () => {
+    const host = createMockHost()
+    let listener: ((event: StreamEvent) => void) | undefined
+    host.subscribeStream = (_sessionId, callback) => { listener = callback; return () => { listener = undefined } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+
+    act(() => listener?.({ type: 'session_title', sessionId: 'welcome', title: '修复侧栏会话', source: 'provisional' }))
+    expect(container.querySelector('[data-session-id="welcome"]')?.textContent).toContain('修复侧栏会话')
+    await waitFor(() => expect(document.title).toBe('修复侧栏会话'))
+
+    act(() => listener?.({ type: 'session_title', sessionId: 'welcome', title: 'Electron 会话创建修复', source: 'model' }))
+    expect(container.querySelector('[data-session-id="welcome"]')?.textContent).toContain('Electron 会话创建修复')
+  })
+
+  it('renames the selected session from both the sidebar editor and a header double-click', async () => {
+    const base = createMockHost()
+    const renameSession = vi.fn(base.renameSession)
+    const host: PipiHostAPI = { ...base, renameSession }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+
+    const selectedRow = container.querySelector('[data-session-id="welcome"]') as HTMLElement
+    fireEvent.click(within(selectedRow).getByRole('button', { name: '修改标题' }))
+    const sidebarInput = within(selectedRow).getByRole('textbox', { name: '会话名称' })
+    fireEvent.change(sidebarInput, { target: { value: '侧栏重命名' } })
+    fireEvent.keyDown(sidebarInput, { key: 'Enter' })
+    await waitFor(() => expect(renameSession).toHaveBeenCalledWith('welcome', '侧栏重命名'))
+    await waitFor(() => expect(container.querySelector('.chat-header-title')?.textContent).toContain('侧栏重命名'))
+
+    const headerTitle = container.querySelector('.chat-header-title-label') as HTMLElement
+    fireEvent.doubleClick(headerTitle)
+    const headerInput = within(container.querySelector('.chat-header-title') as HTMLElement).getByRole('textbox', { name: '会话名称' })
+    fireEvent.change(headerInput, { target: { value: '顶栏重命名' } })
+    fireEvent.keyDown(headerInput, { key: 'Enter' })
+    await waitFor(() => expect(renameSession).toHaveBeenLastCalledWith('welcome', '顶栏重命名'))
+    await waitFor(() => expect(container.querySelector('[data-session-id="welcome"]')?.textContent).toContain('顶栏重命名'))
+    expect(document.title).toBe('顶栏重命名')
+  })
+
+  it('moves the right-pane toggle to the visible pane edge and persists collapse state', async () => {
     const first = render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
     const shell = first.container.querySelector('.pipiui-shell')!
     expect(shell.className).not.toContain('tools-collapsed')
-    fireEvent.click(screen.getByLabelText('收起右栏'))
+    const collapse = screen.getByLabelText('收起右栏')
+    expect(collapse.closest('.tool-panel-header')).not.toBeNull()
+    expect(collapse.querySelector('[data-pane-icon="collapse"]')).not.toBeNull()
+    expect(first.container.querySelector('.chat-header [data-testid="toggle-tools"]')).toBeNull()
+    fireEvent.click(collapse)
     expect(shell.className).toContain('tools-collapsed')
-    expect(screen.getByLabelText('展开右栏')).toBeTruthy()
+    const restore = screen.getByLabelText('展开右栏')
+    expect(restore.closest('.chat-header-actions')).not.toBeNull()
+    expect(restore.querySelector('[data-pane-icon="expand"]')).not.toBeNull()
+    expect(restore.querySelector('[data-pane-icon="collapse"]')).toBeNull()
+    expect(screen.queryByLabelText('收起右栏')).toBeNull()
     // persisted with a collapse marker inside the existing widths key
     expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({ sidebar: 258, tools: 368, sidebarCollapsed: false, toolsCollapsed: true })
     // the floating quick rail stays available while the pane is collapsed
     expect(first.container.querySelector('.tool-quick-rail')).toBeTruthy()
-    fireEvent.click(screen.getByLabelText('展开右栏'))
+    fireEvent.click(restore)
     expect(shell.className).not.toContain('tools-collapsed')
+    const reopened = screen.getByLabelText('收起右栏')
+    expect(reopened.closest('.tool-panel-header')).not.toBeNull()
+    expect(reopened.querySelector('[data-pane-icon="collapse"]')).not.toBeNull()
     expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({ toolsCollapsed: false })
     first.unmount()
 
@@ -135,23 +245,21 @@ describe('PipiUI Electron main layout', () => {
     expect(screen.getByTestId('sidebar')).toBeTruthy()
   })
 
-  it('places the sidebar toggle at the header top-left, before the title and the right-pane toggle', async () => {
+  it('keeps one sidebar toggle in the visible pane header and restores it from the chat header', async () => {
     const { container } = render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
     const header = container.querySelector('.chat-header')!
-    const toggleSidebar = header.querySelector('[data-testid="toggle-sidebar"]')!
-    const toggleTools = header.querySelector('[data-testid="toggle-tools"]')!
-    // the left-pane toggle is the very first element inside the header (top-left corner)
-    expect(header.firstElementChild).toBe(toggleSidebar)
-    // it comes before the header title and before the right-pane toggle
-    expect(header.compareDocumentPosition(toggleSidebar) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(header.compareDocumentPosition(header.querySelector('.chat-header-title')!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    // the right-pane toggle stays in the trailing actions group
-    expect(toggleTools.closest('.chat-header-actions')).not.toBeNull()
-    // and the relocated toggle still works
-    fireEvent.click(screen.getByLabelText('收起左栏'))
+    const toggleSidebar = screen.getByLabelText('收起左栏')
+    expect(toggleSidebar.closest('.sb-topbar')).not.toBeNull()
+    expect(header.querySelector('[data-testid="toggle-sidebar"]')).toBeNull()
+    expect(screen.getAllByTestId('toggle-sidebar')).toHaveLength(1)
+    fireEvent.click(toggleSidebar)
     expect(container.querySelector('.pipiui-shell')!.className).toContain('sidebar-collapsed')
-    fireEvent.click(screen.getByLabelText('展开左栏'))
+    const restoreSidebar = screen.getByLabelText('展开左栏')
+    expect(restoreSidebar.closest('.chat-header')).not.toBeNull()
+    expect(restoreSidebar.className).toContain('pane-restore-sidebar')
+    expect(screen.getAllByTestId('toggle-sidebar')).toHaveLength(1)
+    fireEvent.click(restoreSidebar)
     expect(container.querySelector('.pipiui-shell')!.className).not.toContain('sidebar-collapsed')
   })
 
@@ -222,22 +330,58 @@ describe('PipiUI Electron main layout', () => {
     expect(narrow).toContain('.pipiui-shell .resize-handle{visibility:hidden}')
   })
 
-  it('reserves a draggable title band for the macOS hiddenInset chrome in Electron only', async () => {
+  it('shares one outer content track across every main chat row', () => {
+    const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
+    const waitingCss = readFileSync(join(import.meta.dirname, 'waiting-placeholder.css'), 'utf8')
+    const queueCss = readFileSync(join(import.meta.dirname, 'message-queue.css'), 'utf8')
+    expect(css).toContain('--chat-content-max:780px')
+    expect(css).toContain('--chat-content-gutter:16px')
+    expect(css).toContain('--chat-scrollbar-gutter:6px')
+    expect(css).toContain('--chat-content-width:calc(100% - var(--chat-content-gutter) - var(--chat-content-gutter))')
+    expect(css).toMatch(/\.chat-composer-stack\{[^}]*padding-right:var\(--chat-scrollbar-gutter\)/)
+    expect(css).toContain('.message-list [data-testid="virtuoso-scroller"]{scrollbar-gutter:stable}')
+    expect(css).toMatch(/\.message,\s*\.system-message,\s*\.queue-operation-error,\s*\.composer\s*\{[^}]*width: var\(--chat-content-width\)[^}]*max-width: var\(--chat-content-max\)[^}]*margin-left: auto[^}]*margin-right: auto/)
+    expect(css).toMatch(/\.message \{ padding-inline: 0; \}/)
+    expect(waitingCss).toMatch(/\.waiting-placeholder\s*\{[^}]*max-width: var\(--chat-content-max, 780px\)[^}]*left: var\(--chat-content-gutter, 16px\)[^}]*right: calc\(var\(--chat-content-gutter, 16px\) \+ var\(--chat-scrollbar-gutter, 6px\)\)[^}]*margin-inline: auto/)
+    expect(queueCss).toMatch(/\.message-queue\s*\{[^}]*width: var\(--chat-content-width, calc\(100% - 32px\)\)[^}]*max-width: var\(--chat-content-max, 780px\)[^}]*margin: 0 auto 8px/)
+    expect(css).not.toContain('.tools-collapsed .chat-header{padding-right:54px}')
+  })
+
+  it('styles assistant markdown instead of falling back to UA defaults', () => {
+    const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
+    // No Tailwind in this app, so streamdown's utility classes are inert: every
+    // block element needs an explicit rule or it renders at UA defaults.
+    for (const selector of ['.markdown h2', '.markdown ul, .markdown ol', '.markdown li', '.markdown blockquote', '.markdown table', '.markdown hr']) {
+      expect(css).toContain(selector)
+    }
+    // One shared block rhythm, driven by a single knob.
+    expect(css).toMatch(/\.pipiui-shell \{ --md-fs:[^;]+; --md-lh:[^;]+; --md-block:[^;]+; \}/)
+    expect(css).toMatch(/\.markdown > \* \{ margin: 0 0 var\(--md-block\); \}/)
+    // `anywhere` belongs on inline code only — on the whole body it shreds mixed CJK/Latin wrapping.
+    expect(css).toMatch(/\.markdown \{[^}]*overflow-wrap: break-word;[^}]*line-break: strict;/)
+    expect(css).toMatch(/\.markdown :not\(pre\) > code \{[^}]*overflow-wrap: anywhere;/)
+    // Markdown code blocks scroll horizontally; tool output keeps wrapping.
+    expect(css).toMatch(/\.markdown pre \{[^}]*white-space: pre;/)
+    expect(css).toMatch(/\.tool-card pre,\.tool-result\{[^}]*white-space:pre-wrap/)
+  })
+
+  it('uses the pane headers as macOS hiddenInset chrome in Electron only', async () => {
     const descriptor = Object.getOwnPropertyDescriptor(navigator, 'userAgent')
     Object.defineProperty(navigator, 'userAgent', { value: 'Mozilla/5.0 PipiUI Electron/32.3.3', configurable: true })
     try {
       const { container } = render(<App host={createMockHost()} />)
       await screen.findAllByText('Electron 三栏界面')
-      expect(container.querySelector('.pipiui-shell')?.className).toContain('titlebar-pad')
-      // the drag band stays (draggable chrome) but carries no duplicated title — the chat header owns it
-      expect(container.querySelector('.titlebar-drag')).toBeTruthy()
-      expect(container.querySelector('.titlebar-drag')?.textContent?.trim()).toBe('')
+      expect(container.querySelector('.pipiui-shell')?.className).toContain('electron-chrome')
+      // Pane headers own the drag regions; an extra grid child would shift every pane one column.
+      expect(container.querySelector('.titlebar-drag')).toBeNull()
       expect(container.querySelector('.titlebar-drag-title')).toBeNull()
       // header title stays left-aligned: actions pushed right via margin-left:auto, no space-between centering
       const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
       expect(css).toMatch(/\.chat-header\{[^}]*\}/)
       expect(css.match(/\.chat-header\{[^}]*\}/)?.[0]).not.toContain('justify-content:space-between')
       expect(css).toMatch(/\.chat-header-actions\{[^}]*margin-left:auto/)
+      expect(css).toMatch(/\.electron-chrome \.sb-topbar[^}]*padding-left:88px/)
+      expect(css).toMatch(/\.electron-chrome \.chat-header-title-label\{[^}]*-webkit-app-region:no-drag/)
       expect(css).not.toContain('.titlebar-drag-title{')
     } finally {
       // userAgent normally lives on Navigator.prototype; unshadow it either way.
@@ -247,7 +391,7 @@ describe('PipiUI Electron main layout', () => {
 
     const { container } = render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
-    expect(container.querySelector('.pipiui-shell')?.className).not.toContain('titlebar-pad')
+    expect(container.querySelector('.pipiui-shell')?.className).not.toContain('electron-chrome')
   })
 
   it('switches the icon tool rail and mounts the Browser host panel', async () => {
@@ -255,7 +399,7 @@ describe('PipiUI Electron main layout', () => {
     await screen.findAllByText('Electron 三栏界面')
     expect(screen.getAllByText('PipiUI').length).toBeGreaterThan(0)
     expect(screen.getByRole('button', { name: 'Subagents' }).className).toContain('active')
-    await waitFor(() => expect(container.querySelector('.tool-rail-running')).toBeTruthy())
+    await waitFor(() => expect(container.querySelector('.tool-rail-running')?.textContent).toBe('1'))
     const browser = screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement
     await waitFor(() => expect(browser.disabled).toBe(false))
     fireEvent.click(browser)
@@ -279,6 +423,30 @@ describe('PipiUI Electron main layout', () => {
     expect(screen.getByRole('button', { name: 'Document' }).className).toContain('active')
     await waitFor(() => expect(readDocument).toHaveBeenCalledWith('/Users/demo/code/pipiui/README.md'))
     expect((await screen.findByLabelText('文档内容 README.md')).textContent).toContain('Mock host preview')
+  })
+
+  it('opens collapsed tools on a newly started subagent without stealing an already open tab', async () => {
+    const host = createMockHost()
+    let pushAgent: ((event: AgentEvent) => void) | undefined
+    host.listAgents = async () => []
+    host.subscribeAgents = listener => { pushAgent = listener; return () => { pushAgent = undefined } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Subagents' }))
+    expect(container.querySelector('.pipiui-shell')?.className).toContain('tools-collapsed')
+    act(() => pushAgent?.({ type: 'agent', agent: { agentId: 'fresh', runId: 'run-1', sessionId: 'welcome', name: 'explore', task: 'new work', state: 'running' } }))
+    await waitFor(() => expect(container.querySelector('.pipiui-shell')?.className).not.toContain('tools-collapsed'))
+    expect(screen.getByRole('button', { name: 'Subagents' }).className).toContain('active')
+    expect(container.querySelector('.tool-rail-running')?.textContent).toBe('1')
+
+    const browser = screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement
+    await waitFor(() => expect(browser.disabled).toBe(false))
+    fireEvent.click(browser)
+    expect(browser.className).toContain('active')
+    act(() => pushAgent?.({ type: 'agent', agent: { agentId: 'second', runId: 'run-2', sessionId: 'welcome', name: 'reviewer', task: 'more work', state: 'running' } }))
+    await waitFor(() => expect(container.querySelector('.tool-rail-running')?.textContent).toBe('2'))
+    expect(browser.className).toContain('active')
   })
 
   it.each([
@@ -398,9 +566,10 @@ describe('PipiUI Electron main layout', () => {
     // Logs stream in via subscribeAgentLog; wait for the unified step card
     // (thinking + read combined, like the main agent transcript).
     await within(subagentTranscript).findByRole('button', { name: /个步骤/ })
-    // expandSteps keeps the outer card open; tool cards are also expanded by default.
+    // expandSteps keeps only the outer card open; nested ordinary tools stay folded.
     const readDetail = await within(subagentTranscript).findByRole('button', { name: /^read/ })
-    await within(subagentTranscript).findByText(/已读取主界面实现/)
+    expect(readDetail.getAttribute('aria-expanded')).toBe('false')
+    expect(within(subagentTranscript).queryByText(/已读取主界面实现/)).toBeNull()
     // Thinking card is collapsed by default; expand to verify content persists.
     const thinkingDetail = await within(subagentTranscript).findByRole('button', { name: /^Thinking/ })
     fireEvent.click(thinkingDetail)
@@ -735,12 +904,32 @@ describe('PipiUI Electron main layout', () => {
     expect(screen.getByRole('button', { name: /展开项目 PipiUI/ })).toBeTruthy()
   })
 
+  it('only toggles a project folder and does not switch the selected session', async () => {
+    const base = createMockHost()
+    const listSessions = vi.fn(base.listSessions)
+    const host: PipiHostAPI = { ...base, listSessions }
+    const { container } = render(<App host={host} />)
+
+    await waitFor(() => expect(container.querySelector('.chat-header-title-label')?.textContent).toBe('Electron 三栏界面'))
+    const websiteToggle = await screen.findByRole('button', { name: '收起项目 Website' })
+    await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(4))
+    const initialListCalls = listSessions.mock.calls.length
+
+    fireEvent.click(websiteToggle)
+    await waitFor(() => expect(screen.getByRole('button', { name: '展开项目 Website' })).toBeTruthy())
+    await act(async () => { await Promise.resolve() })
+
+    expect(listSessions).toHaveBeenCalledTimes(initialListCalls)
+    expect(container.querySelector('[data-session-id="welcome"]')?.getAttribute('aria-current')).toBe('true')
+    expect(container.querySelector('.chat-header-title-label')?.textContent).toBe('Electron 三栏界面')
+  })
+
   it('uses host semantic sidebar preferences after one-time local migration while keeping disclosure local', async () => {
     const host = createMockHost()
     const workspace = await host.listProjects()
     localStorage.setItem(sidebarPreferencesKey(workspace), JSON.stringify({ expandedIds: ['pipiui'], pinnedSessionIds: ['agent-run'], archivedSessionIds: [], visibleLimit: 2 }))
     localStorage.setItem('pipiui:eui:sidebar-semantic-host:v1', '1')
-    host.getSidebarSessionPreferences = vi.fn(async () => ({ pinnedSessionIds: ['welcome'], archivedSessionIds: ['layout'] }))
+    host.getSidebarSessionPreferences = vi.fn(async () => ({ pinnedSessionIds: ['welcome'], archivedSessionIds: ['layout'], orderedSessionIds: [] }))
     const save = vi.fn(async (preferences: SidebarSessionPreferences) => preferences)
     host.setSidebarSessionPreferences = save
 
@@ -750,7 +939,139 @@ describe('PipiUI Electron main layout', () => {
     expect(screen.getAllByText('Electron 三栏界面').length).toBeGreaterThan(0)
     expect(screen.getByText('已归档')).toBeTruthy()
     expect(screen.getByRole('button', { name: /收起项目 PipiUI/ })).toBeTruthy()
-    await waitFor(() => expect(save).toHaveBeenCalledWith({ pinnedSessionIds: ['welcome'], archivedSessionIds: ['layout'] }))
+    await waitFor(() => expect(save).toHaveBeenCalledWith({ pinnedSessionIds: ['welcome'], archivedSessionIds: ['layout'], archivedSessionTimestamps: { layout: expect.any(Number) }, orderedSessionIds: [], sessionOrderVersion: 2 }))
+  })
+
+  it('migrates legacy full session order and keeps a new unranked session in the updatedAt top ten', async () => {
+    const base = createMockHost()
+    const project: Project = { id: 'order', name: 'Order', path: '/tmp/order' }
+    const old = Array.from({ length: 11 }, (_, index): Session => ({
+      id: `old-${index}`,
+      projectId: project.id,
+      name: `旧会话 ${index}`,
+      updatedAt: 1_000 - index
+    }))
+    const newest: Session = { id: 'newest', projectId: project.id, name: '最新未手动会话', updatedAt: 2_000 }
+    const save = vi.fn(async (preferences: SidebarSessionPreferences) => preferences)
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: async () => [project],
+      listSessions: async () => [newest, ...old],
+      getSessionHistory: async () => [],
+      getSidebarSessionPreferences: async () => ({
+        pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: old.map(session => session.id)
+      }),
+      setSidebarSessionPreferences: save
+    }
+
+    render(<App host={host} />)
+
+    const group = await screen.findByRole('group', { name: 'Order 的会话' })
+    expect(within(group).getAllByTestId('session-row')[0].getAttribute('data-session-id')).toBe('newest')
+    expect(within(group).getByText('最新未手动会话')).toBeTruthy()
+    await waitFor(() => expect(save.mock.calls.some(([value]) =>
+      value.orderedSessionIds.length === 0 && (value as SidebarSessionPreferences & { sessionOrderVersion?: number }).sessionOrderVersion === 2
+    )).toBe(true))
+  })
+
+  it('moves a session to the updatedAt front when its run starts', async () => {
+    const base = createMockHost()
+    const project: Project = { id: 'activity', name: 'Activity', path: '/tmp/activity' }
+    const older: Session = { id: 'older', projectId: project.id, name: '刚开始运行', updatedAt: 1_000 }
+    const newer: Session = { id: 'newer', projectId: project.id, name: '先前较新', updatedAt: 2_000 }
+    let listener: ((event: StreamEvent) => void) | undefined
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: async () => [project],
+      listSessions: async () => [older, newer],
+      getSessionHistory: async () => [],
+      getSidebarSessionPreferences: async () => ({ pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: [], sessionOrderVersion: 2 } as SidebarSessionPreferences),
+      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } }
+    }
+
+    render(<App host={host} />)
+    const group = await screen.findByRole('group', { name: 'Activity 的会话' })
+    expect(within(group).getAllByTestId('session-row').map(row => row.getAttribute('data-session-id'))).toEqual(['newer', 'older'])
+
+    act(() => listener?.({ type: 'status', sessionId: 'older', status: 'started' }))
+
+    await waitFor(() => expect(within(group).getAllByTestId('session-row').map(row => row.getAttribute('data-session-id'))).toEqual(['older', 'newer']))
+  })
+
+  it('persists only sessions involved in an explicit drag and restores that local order', async () => {
+    const base = createMockHost()
+    const project: Project = { id: 'manual', name: 'Manual', path: '/tmp/manual' }
+    const sessions: Session[] = [
+      { id: 'a', projectId: project.id, name: 'A', updatedAt: 3_000 },
+      { id: 'b', projectId: project.id, name: 'B', updatedAt: 2_000 },
+      { id: 'c', projectId: project.id, name: 'C', updatedAt: 1_000 }
+    ]
+    let durable: SidebarSessionPreferences & { sessionOrderVersion?: 2 } = {
+      pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: [], sessionOrderVersion: 2
+    }
+    const save = vi.fn(async (preferences: SidebarSessionPreferences) => {
+      durable = { ...preferences }
+      return preferences
+    })
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: async () => [project],
+      listSessions: async () => sessions,
+      getSessionHistory: async () => [],
+      getSidebarSessionPreferences: async () => durable,
+      setSidebarSessionPreferences: save
+    }
+    const first = render(<App host={host} />)
+    const group = await screen.findByRole('group', { name: 'Manual 的会话' })
+    const rows = within(group).getAllByTestId('session-row')
+    const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
+    fireEvent.dragStart(rows.find(row => row.getAttribute('data-session-id') === 'c')!, { dataTransfer: transfer })
+    const target = rows.find(row => row.getAttribute('data-session-id') === 'a')!
+    fireEvent.dragOver(target, { dataTransfer: transfer, clientY: -1 })
+    fireEvent.drop(target, { dataTransfer: transfer, clientY: -1 })
+
+    await waitFor(() => expect(within(group).getAllByTestId('session-row').map(row => row.getAttribute('data-session-id'))).toEqual(['a', 'c', 'b']))
+    await waitFor(() => expect(save.mock.calls.some(([value]) =>
+      value.orderedSessionIds.join(',') === 'a,c' && (value as SidebarSessionPreferences & { sessionOrderVersion?: number }).sessionOrderVersion === 2
+    )).toBe(true))
+    expect(durable.orderedSessionIds).toEqual(['a', 'c'])
+    first.unmount()
+
+    render(<App host={host} />)
+    const restored = await screen.findByRole('group', { name: 'Manual 的会话' })
+    await waitFor(() => expect(within(restored).getAllByTestId('session-row').map(row => row.getAttribute('data-session-id'))).toEqual(['a', 'c', 'b']))
+  })
+
+  it('persists project drag order and routes cross-project session drops through the host', async () => {
+    const host = createMockHost()
+    const workspace = await host.listProjects()
+    host.getProjectPaths = vi.fn(async () => workspace.map(project => project.path))
+    const setProjectPaths = vi.fn(async (paths: string[]) => paths)
+    host.setProjectPaths = setProjectPaths
+    const originalMove = host.moveSession.bind(host)
+    const moveSession = vi.fn(originalMove)
+    host.moveSession = moveSession
+    render(<App host={host} />)
+    const projectRows = await screen.findAllByTestId('project-row')
+    const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
+    fireEvent.dragStart(projectRows[0], { dataTransfer: transfer })
+    fireEvent.dragOver(projectRows[1], { dataTransfer: transfer, clientY: 10 })
+    fireEvent.drop(projectRows[1], { dataTransfer: transfer, clientY: 10 })
+    await waitFor(() => expect(setProjectPaths).toHaveBeenCalledWith(['/Users/demo/code/website', '/Users/demo/code/pipiui', '/Users/demo/code/design-system']))
+
+    let sessionRow = (await screen.findAllByTestId('session-row')).find(row => row.getAttribute('data-session-id') === 'layout')!
+    const pinnedSection = screen.getByLabelText('置顶会话')
+    fireEvent.dragStart(sessionRow, { dataTransfer: transfer })
+    fireEvent.dragOver(pinnedSection, { dataTransfer: transfer })
+    fireEvent.drop(pinnedSection, { dataTransfer: transfer })
+    await waitFor(() => expect(screen.getByLabelText('置顶会话').textContent).toContain('布局与流式消息'))
+
+    sessionRow = (await screen.findAllByTestId('session-row')).find(row => row.getAttribute('data-session-id') === 'layout')!
+    const websiteRow = (await screen.findAllByTestId('project-row')).find(row => row.getAttribute('data-project-id') === 'website')!
+    fireEvent.dragStart(sessionRow, { dataTransfer: transfer })
+    fireEvent.dragOver(websiteRow, { dataTransfer: transfer })
+    fireEvent.drop(websiteRow, { dataTransfer: transfer })
+    await waitFor(() => expect(moveSession).toHaveBeenCalledWith('layout', 'website'))
   })
 
   it('uses durable explicit project paths for host-backed add/remove, rollback, and remount', async () => {
@@ -771,11 +1092,14 @@ describe('PipiUI Electron main layout', () => {
       durable = [...durable, project]
       return project
     })
+    const pickProjectDirectory = vi.fn()
+      .mockResolvedValueOnce('/Users/demo/added')
+      .mockResolvedValueOnce('/Users/demo/fail')
     const removeProject = vi.fn(async (projectId: string) => {
       if (removeFails) throw new Error('删除被拒绝')
       durable = durable.filter(project => project.id !== projectId)
     })
-    const host: PipiHostAPI = { ...base, getProjectPaths, listProjects, listSessions, addProject, removeProject, getSessionHistory: async () => [] }
+    const host: PipiHostAPI = { ...base, getProjectPaths, listProjects, listSessions, pickProjectDirectory, addProject, removeProject, getSessionHistory: async () => [] }
     const first = render(<App host={host} />)
     await screen.findByText('haoli')
     await waitFor(() => expect(getProjectPaths).toHaveBeenCalled())
@@ -799,16 +1123,18 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(screen.queryByText('haoli')).toBeNull())
 
     fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
-    fireEvent.change(screen.getByLabelText('项目路径'), { target: { value: '/Users/demo/added' } })
-    fireEvent.click(screen.getByRole('button', { name: '添加' }))
+    await waitFor(() => expect(pickProjectDirectory).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(addProject).toHaveBeenCalledWith('/Users/demo/added'))
     expect(await screen.findByText('added')).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
-    fireEvent.change(screen.getByLabelText('项目路径'), { target: { value: '/Users/demo/fail' } })
-    fireEvent.click(screen.getByRole('button', { name: '添加' }))
+    await waitFor(() => expect(pickProjectDirectory).toHaveBeenCalledTimes(2))
     expect((await screen.findByTestId('sidebar-project-error')).textContent).toContain('路径不可用')
     expect(screen.queryByText('fail')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
+    await waitFor(() => expect(pickProjectDirectory).toHaveBeenCalledTimes(3))
+    expect(addProject).toHaveBeenCalledTimes(2) // cancelling the native picker is a no-op
   })
 
   it('keeps the composer and SessionStatsPill in the dedicated bottom row for empty, loading, failed history, and an open right rail', async () => {
@@ -852,6 +1178,11 @@ describe('PipiUI Electron main layout', () => {
     ]
     expect(sidebarStatusForSession('selected', 'selected', true, undefined, agents).status).toBe('running')
     expect(sidebarStatusForSession('subtask', 'selected', false, undefined, agents)).toEqual({ status: 'subagents-running', subagentCount: 1 })
+    // Stream status is only live for the selected session. A leftover
+    // `running` from the last visit must not hide a background subagent badge.
+    expect(sidebarStatusForSession('subtask', 'selected', false, 'running', agents)).toEqual({ status: 'subagents-running', subagentCount: 1 })
+    expect(sidebarStatusForSession('subtask', 'subtask', false, 'running', agents).status).toBe('running')
+    expect(sidebarStatusForSession('idle-running', 'selected', false, 'running', []).status).toBe('running')
     expect(sidebarStatusForSession('failed', 'selected', false, undefined, agents).status).toBe('failed')
     expect(sidebarStatusForSession('stalled', 'selected', false, undefined, agents).status).toBe('stalled')
     expect(sidebarStatusForSession('interrupted', 'selected', false, undefined, agents).status).toBe('interrupted')
@@ -859,7 +1190,7 @@ describe('PipiUI Electron main layout', () => {
     expect(sidebarStatusForSession('unrelated-history', 'selected', false, undefined, agents).status).toBe('idle')
   })
 
-  it('maps the session model onto the sidebar logo: own model wins, currentModel only fills the selected session, no model falls back to unknown', () => {
+  it('maps the session model onto the sidebar logo: own model wins for other sessions, the selected row mirrors the live current model, no model falls back to unknown', () => {
     const current: Model = { provider: 'anthropic', id: 'claude-sonnet-4', name: 'Claude Sonnet 4', reasoning: true }
     const base = { id: 's1', projectId: 'p1', name: 'x', updatedAt: 1 }
     // Non-selected session carries its own model → shown as-is.
@@ -870,11 +1201,83 @@ describe('PipiUI Electron main layout', () => {
       .toEqual({ provider: 'deepseek', modelId: 'deepseek-v3' })
     // No model data → unknown fallback (empty provider renders the neutral logo).
     expect(sidebarModelForSession({ ...base }, 'other', current)).toEqual({ provider: '', modelId: undefined })
-    // The selected session is the only one that falls back to the live current model.
+    // The selected session mirrors the live composer model state.
     expect(sidebarModelForSession({ ...base }, base.id, current)).toEqual({ provider: 'anthropic', modelId: 'claude-sonnet-4' })
-    // A session's own model still wins over the current model for the selected row.
+    // A mid-session model switch updates modelState before the session metadata
+    // does; the selected row must follow the live state, not the stale metadata.
     expect(sidebarModelForSession({ ...base, model: { provider: 'xai', modelId: 'grok-4' } }, base.id, current))
+      .toEqual({ provider: 'anthropic', modelId: 'claude-sonnet-4' })
+    // Without a live model the selected row still falls back to its metadata.
+    expect(sidebarModelForSession({ ...base, model: { provider: 'xai', modelId: 'grok-4' } }, base.id, null))
       .toEqual({ provider: 'xai', modelId: 'grok-4' })
+    // After a live switch, leaving the session must keep the last-known model —
+    // listSessions / JSONL metadata often still has the pre-switch provider.
+    expect(sidebarModelForSession(
+      { ...base, model: { provider: 'xai', modelId: 'grok-4' } },
+      'other',
+      current,
+      { s1: { provider: 'anthropic', modelId: 'claude-sonnet-4' } }
+    )).toEqual({ provider: 'anthropic', modelId: 'claude-sonnet-4' })
+  })
+
+  it('keeps a switched sidebar logo after leaving that session when listSessions metadata lags', async () => {
+    const base = createMockHost()
+    const host: PipiHostAPI = {
+      ...base,
+      setModel: async (sessionId, provider, id) => {
+        const state = await base.setModel(sessionId, provider, id)
+        // Real host: setModel updates Pi / in-memory snapshots, but the React
+        // sessions[] copy from the last listSessions still has the old model.
+        const listed = await base.listSessions('pipiui')
+        const welcome = listed.find(session => session.id === 'welcome')
+        if (welcome) welcome.model = { provider: 'anthropic', modelId: 'claude-sonnet-4' }
+        return state
+      }
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const welcome = () => container.querySelector('[data-session-id="welcome"]')!
+    expect(welcome().querySelector('[data-testid="provider-logo-anthropic"]')).toBeTruthy()
+
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-openai-gpt-5'))
+    await waitFor(() => expect(welcome().querySelector('[data-testid="provider-logo-openai"]')).toBeTruthy())
+
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('aria-current')).toBe('true'))
+    expect(welcome().querySelector('[data-testid="provider-logo-openai"]')).toBeTruthy()
+    expect(welcome().querySelector('[data-testid="provider-logo-anthropic"]')).toBeNull()
+    expect(container.querySelector('[data-session-id="layout"] [data-testid="provider-logo-openai"]')).toBeTruthy()
+  })
+
+  it('does not replace a live running agent with a later empty listAgents snapshot', () => {
+    const running: AgentSummary = { agentId: 'bg', runId: '1', name: 'explore', task: '', state: 'running', sessionId: 'layout' }
+    expect(mergeAgentSnapshot([running], [])).toEqual([running])
+    expect(mergeAgentSummary([], { ...running, sessionId: undefined }).map(agent => agent.sessionId)).toEqual([undefined])
+    expect(mergeAgentSummary([running], { ...running, sessionId: undefined, state: 'running' })[0]?.sessionId).toBe('layout')
+  })
+
+  it('keeps a background subagent-running badge when a later listAgents snapshot is empty', async () => {
+    const base = createMockHost()
+    let resolveList: ((agents: AgentSummary[]) => void) | undefined
+    const agentListeners = new Set<(event: AgentEvent) => void>()
+    const host: PipiHostAPI = {
+      ...base,
+      listAgents: () => new Promise(resolve => { resolveList = resolve }),
+      subscribeAgents: listener => {
+        agentListeners.add(listener)
+        return () => { agentListeners.delete(listener) }
+      }
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    act(() => {
+      const event: AgentEvent = { type: 'agent', agent: { agentId: 'bg', runId: '1', sessionId: 'layout', name: 'explore', task: '', state: 'running' } }
+      for (const listener of agentListeners) listener(event)
+    })
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('subagents-running'))
+    act(() => resolveList?.([]))
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('subagents-running'))
   })
 
   it('shows return-to-latest after leaving the bottom and rail jumps with Virtuoso', async () => {
@@ -888,7 +1291,7 @@ describe('PipiUI Electron main layout', () => {
     expect(virtuosoHarness.scrollToIndex).toHaveBeenCalled()
   })
 
-  it('uses the shared collapsed ActivityCard for middle and subagent execution', async () => {
+  it('uses a disclosure for completed steps but not for the active ordinary tool', async () => {
     const { container } = render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
     await waitFor(() => expect(container.querySelector('[data-testid="subagent-transcript"] [data-testid="assistant-transcript-content"]')).toBeTruthy())
@@ -896,10 +1299,14 @@ describe('PipiUI Electron main layout', () => {
     fireEvent.click(screen.getByLabelText('发送消息'))
     const summary = await screen.findByRole('button', { name: /个步骤/ })
     expect(summary.closest('[data-activity-card="default"]')).toBeTruthy()
-    // Preserve stream-perf behavior: live activity details are expanded while streaming.
-    expect(screen.getByText('Electron/packages/ui/package.json')).toBeTruthy()
+    const activeTool = screen.getByTestId('active-tool')
+    expect(activeTool.textContent).toContain('read · Electron/packages/ui/package.json')
+    expect(activeTool.querySelector('[aria-expanded]')).toBeNull()
+    expect(activeTool.querySelector('.activity-details')).toBeNull()
+    expect(activeTool.querySelector('.tool-io')).toBeNull()
     fireEvent.click(summary)
-    expect(screen.queryByText('Electron/packages/ui/package.json')).toBeNull()
+    // Collapsing prior steps does not hide or mutate the independent active tool row.
+    expect(screen.getByTestId('active-tool')).toBeTruthy()
   })
 
   it('renders structured 子任务 cards for matching tool notices and falls back otherwise', async () => {
@@ -1044,7 +1451,7 @@ describe('PipiUI Electron main layout', () => {
     fireEvent.click(screen.getByTestId('queue-retry-1'))
     await waitFor(() => expect(retryQueuedMessage).toHaveBeenCalledWith('welcome', 'failed'))
 
-    await act(async () => { listener?.({ type: 'status', sessionId: 'welcome', status: 'streaming' }) })
+    await act(async () => { listener?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
     expect(await screen.findByTestId('queue-steer-0')).toBeTruthy()
     fireEvent.click(screen.getByTestId('queue-steer-0'))
     await waitFor(() => expect(steerQueuedMessage).toHaveBeenCalledWith('welcome', 'editable'))
@@ -1104,6 +1511,34 @@ async function reopenModelModal(composer: HTMLTextAreaElement) {
   fireEvent.keyDown(composer, { key: 'Enter' })
   await screen.findByTestId('model-modal')
 }
+
+describe('composer draft persistence', () => {
+  it('restores unsent composer text when returning to a session', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const box = () => screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    fireEvent.change(box(), { target: { value: 'welcome-draft-keep' } })
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    expect(box().value).not.toBe('welcome-draft-keep')
+    fireEvent.change(box(), { target: { value: 'layout-draft-keep' } })
+    fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
+    expect(box().value).toBe('welcome-draft-keep')
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    expect(box().value).toBe('layout-draft-keep')
+  })
+
+  it('does not restore composer text after a successful send', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const box = () => screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    fireEvent.change(box(), { target: { value: 'sent-then-gone' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(box().value).toBe(''))
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
+    expect(box().value).toBe('')
+  })
+})
 
 describe('composer slash commands and model management', () => {
   it('shows the slash menu on /, ranks /model, and has an empty state', async () => {
@@ -1357,7 +1792,7 @@ describe('demo mock host model persistence (browser reload)', () => {
     localStorage.setItem('pipiui.demoModel', JSON.stringify({ provider: 'deepseek', id: 'deepseek-v3' }))
     const state = await createMockHost().getModelState()
     expect(state.model.id).toBe('deepseek-v3')
-    expect(state.availableThinkingLevels).toEqual(['off'])
+    expect(state.availableThinkingLevels).toEqual([])
   })
 
   it('writes the selected model to localStorage on switch', async () => {
@@ -1532,6 +1967,14 @@ describe('composer image attachments', () => {
     ]))
     await waitFor(() => expect(composer.value).toBe(''))
     await waitFor(() => expect(screen.queryByTestId('composer-thumbs')).toBeNull())
+    const bubbleImage = await waitFor(() => {
+      const img = document.querySelector('img.user-bubble-image')
+      expect(img).toBeTruthy()
+      return img
+    })
+    expect(bubbleImage?.getAttribute('alt')).toBe('用户图片')
+    expect(bubbleImage?.getAttribute('src')).toMatch(/^data:image\/png;base64,/)
+    expect(screen.queryByText(/\[1\s*张图片\]/)).toBeNull()
     expect(revokedUrls).toContain('blob:mock-0')
   })
 
@@ -1544,6 +1987,26 @@ describe('composer image attachments', () => {
     expect((screen.getByLabelText('发送消息') as HTMLButtonElement).disabled).toBe(false)
     fireEvent.click(screen.getByLabelText('发送消息'))
     await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '', [expect.objectContaining({ name: 'only.png' })]))
+  })
+
+  it('creates a session on the fly when sending from the empty 新会话 state', async () => {
+    const base = createMockHost()
+    const newSession = vi.spyOn(base, 'newSession')
+    const sendPrompt = vi.spyOn(base, 'sendPrompt')
+    // No sessions anywhere → the app boots in the empty 新会话 state.
+    const host = { ...base, listSessions: async () => [] as Session[] }
+    render(<App host={host} />)
+    const composer = await screen.findByLabelText('消息输入框') as HTMLTextAreaElement
+    fireEvent.change(composer, { target: { value: '开个头' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(newSession).toHaveBeenCalledWith('pipiui'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledTimes(1))
+    const createdSession = await newSession.mock.results[0].value
+    const [sessionId, prompt] = sendPrompt.mock.calls[0] as [string, string]
+    expect(sessionId).toBe(createdSession.id)
+    expect(prompt).toBe('开个头')
+    // The optimistic user message lands in the transcript of the fresh session.
+    await screen.findByText('开个头')
   })
 
   it('keeps text and attachments and shows an error when sending fails', async () => {
@@ -1781,6 +2244,78 @@ describe('composer thinking selector', () => {
     await waitFor(() => expect(setThinkingLevel).toHaveBeenCalledWith('welcome', 'high'))
     await waitFor(() => expect(screen.getByTestId('thinking-chip').textContent).toContain('high'))
     expect(screen.queryByTestId('thinking-menu')).toBeNull()
+  })
+
+  it('renders a proven non-configurable reasoning model as model-default without dispatching a no-op level', async () => {
+    const host = createMockHost()
+    const fixedReasoner = {
+      provider: 'fixed', id: 'fixed-reasoner', name: 'Fixed Reasoner', reasoning: true,
+      thinkingConfigurable: false
+    } as Model
+    host.listModels = vi.fn(async () => [fixedReasoner])
+    host.getModelState = vi.fn(async (): Promise<ModelState> => ({
+      model: fixedReasoner,
+      thinkingLevel: 'high',
+      availableThinkingLevels: []
+    }))
+    const setThinkingLevel = vi.spyOn(host, 'setThinkingLevel')
+
+    await renderChat(host)
+    const chip = await screen.findByTestId('thinking-chip') as HTMLButtonElement
+    expect(chip.disabled).toBe(true)
+    expect(chip.textContent).toContain('auto')
+    fireEvent.click(chip)
+    expect(screen.queryByTestId('thinking-menu')).toBeNull()
+    expect(setThinkingLevel).not.toHaveBeenCalled()
+  })
+
+  it('keeps real xai/grok-4.6 reported levels selectable across cold restore and catalog reconciliation', async () => {
+    const base = createMockHost()
+    const restoredSession: Session = {
+      id: 'cold-grok',
+      projectId: 'pipiui',
+      name: '排查Grok思考强度',
+      updatedAt: Date.now(),
+      model: { provider: 'xai', modelId: 'grok-4.6' }
+    }
+    const coldSnapshot: ModelState = {
+      model: { provider: 'xai', id: 'grok-4.6', name: 'Grok 4.6', reasoning: true },
+      thinkingLevel: 'low',
+      availableThinkingLevels: ['minimal', 'low', 'medium', 'high', 'xhigh']
+    }
+    const catalogModel: Model = {
+      provider: 'xai', id: 'grok-4.6', name: 'Grok 4.6', reasoning: true,
+      thinkingConfigurable: true
+    }
+    const setThinkingLevel = vi.fn(base.setThinkingLevel)
+    let resolveCatalog!: (models: Model[]) => void
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: async () => [{ id: 'pipiui', name: 'PipiUI', path: '/Users/demo/code/pipiui' }],
+      listSessions: async () => [restoredSession],
+      getSessionHistory: async () => [],
+      getModelState: vi.fn(async () => coldSnapshot),
+      listModels: vi.fn(() => new Promise<Model[]>(resolve => { resolveCatalog = resolve })),
+      setThinkingLevel
+    }
+
+    render(<App host={host} />)
+    expect(await screen.findByLabelText('思考级别（当前：low）')).toBeTruthy()
+
+    await act(async () => { resolveCatalog([catalogModel]) })
+
+    const chip = await screen.findByLabelText('思考级别（当前：low）') as HTMLButtonElement
+    expect(chip.disabled).toBe(false)
+    fireEvent.click(chip)
+    expect(screen.queryByTestId('thinking-row-off')).toBeNull()
+    expect(screen.getByTestId('thinking-row-minimal')).toBeTruthy()
+    expect(screen.getByTestId('thinking-row-low')).toBeTruthy()
+    expect(screen.getByTestId('thinking-row-medium')).toBeTruthy()
+    expect(screen.getByTestId('thinking-row-high')).toBeTruthy()
+    expect(screen.getByTestId('thinking-row-xhigh')).toBeTruthy()
+    expect(screen.queryByTestId('thinking-row-max')).toBeNull()
+    fireEvent.click(screen.getByTestId('thinking-row-medium'))
+    await waitFor(() => expect(setThinkingLevel).toHaveBeenCalledWith('cold-grok', 'medium'))
   })
 
   it('closes the thinking menu with Escape or the backdrop', async () => {

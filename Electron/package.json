@@ -1,7 +1,10 @@
 {
   "name": "pipiui-electron-workspace",
   "private": true,
-  "workspaces": ["packages/*", "apps/*"],
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
     "sync:computer-agent": "node scripts/sync-computer-agent-runtime.mjs",
     "runtime:prepare": "node scripts/fetch-pi-runtime.mjs",
@@ -21,7 +24,8 @@
     "package": "npm run package:mac",
     "package:mac": "npm run build && npm run package:mac -w @pipiui/electron",
     "package:win": "npm run build && npm run package:win -w @pipiui/electron",
-    "package:linux": "npm run build && npm run package:linux -w @pipiui/electron"
+    "package:linux": "npm run build && npm run package:linux -w @pipiui/electron",
+    "check:boss-tools": "npx --no-install tsx scripts/check-boss-tool-policy.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

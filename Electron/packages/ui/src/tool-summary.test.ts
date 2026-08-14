@@ -43,6 +43,10 @@ describe('toolArgsSummary', () => {
   it('renders subagent task as what the agent is doing', () => {
     expect(toolArgsSummary('subagent', '{"task":"修复折叠 bug","agent":"general-purpose"}')).toBe('修复折叠 bug')
     expect(toolArgsSummary('subagent', '{"title":"调研 electron UI"}')).toBe('调研 electron UI')
+    expect(toolArgsSummary('subagent', JSON.stringify({ tasks: [
+      { agent: 'explore', title: '核对 Electron 生命周期', task: '读取状态桥接' },
+      { agent: 'reviewer', task: '验证跨会话隔离' },
+    ] }))).toBe('核对 Electron 生命周期、验证跨会话隔离')
   })
 
   it('scrapes truncated JSON while streaming', () => {

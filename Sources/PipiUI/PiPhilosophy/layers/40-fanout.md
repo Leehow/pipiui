@@ -4,7 +4,7 @@ name: 瀑布流哲学
 summary: 无依赖的活一次全派出去；宽 wave 用清晰 brief 与分组管；异步信号自己收，不回头看原始产物。
 order: 40
 requires: [orchestration]
-requires-capabilities: [delegate]
+requires-capabilities: [delegate, delegate_parallel]
 scope: [main, lead]
 ---
 # Fan-out: many workers, running in the background
@@ -48,7 +48,7 @@ of a single goal yourself.
 Dispatch every independent piece in **one** call in the **same** turn:
 
 ```
-{{delegate}}({ tasks: [ {agent, task, title}, {agent, task, title}, ... ] })
+{{delegate_parallel}}({ tasks: [ {task, agent}, {task, agent}, ... ] })
 ```
 
 Concurrency here is cheap for structural reasons, not optimism: writable workers run in isolated
@@ -109,6 +109,9 @@ runId) so no further messages arrive.
 
 Every signal — completion, merge failure, post-merge verify failure, stall, heartbeat — is a
 worker event, never a new user request, and each one carries its own handling instructions.
+A heartbeat check-in means the worker is still producing output after a long wall-clock run
+(10 minutes, then 30, then every 30). Judge drift from the activity snapshot in that message;
+do not treat silence-of-the-boss as approval to keep going unexamined.
 Follow the instructions in the message you actually received rather than a recipe remembered
 from here; they are written against what really happened. On every completion signal, FIRST
 call {{delegate_status}} without an agent id and identify every worker still relevant to that

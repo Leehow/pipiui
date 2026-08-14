@@ -130,6 +130,34 @@ describe('QuotaPill', () => {
     expect(container.firstChild).toBeNull()
   })
 
+  it('shows the Token Plan login capsule when the qwen provider has no quota data', async () => {
+    const { host } = quotaHost(null)
+    const onOpenBrowserLogin = vi.fn()
+    render(<QuotaPill host={host} sessionId="s1" provider="qwen-token-plan-cn" onOpenBrowserLogin={onOpenBrowserLogin} />)
+    const pill = await screen.findByTestId('quota-login-pill')
+    expect(pill.textContent).toBe('Token Plan 登录')
+    fireEvent.click(pill)
+    expect(onOpenBrowserLogin).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the quota capsule (not the login entry) once Token Plan has data', async () => {
+    const { host } = quotaHost({
+      provider: 'qwen-token-plan',
+      accountLabel: 'Token Plan',
+      windows: [{ id: 'weekly', title: '周', label: '周', usedPercent: 12 }],
+    })
+    render(<QuotaPill host={host} provider="qwen-token-plan-cn" onOpenBrowserLogin={vi.fn()} />)
+    expect(await screen.findByTestId('quota-pill')).toBeTruthy()
+    expect(screen.queryByTestId('quota-login-pill')).toBeNull()
+  })
+
+  it('does not offer the login capsule for non-Token-Plan providers without data', async () => {
+    const { host, getQuotaSnapshot } = quotaHost(null)
+    const { container } = render(<QuotaPill host={host} provider="deepseek" onOpenBrowserLogin={vi.fn()} />)
+    await waitFor(() => expect(getQuotaSnapshot).toHaveBeenCalled())
+    expect(container.firstChild).toBeNull()
+  })
+
   it('hides a partial quota snapshot with no reported used percentage', async () => {
     const { host } = quotaHost({
       provider: 'codex',

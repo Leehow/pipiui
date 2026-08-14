@@ -5,7 +5,7 @@ import { toolActivitySummary, toolArgsSummary } from './tool-summary'
 import { DismissibleError } from './DismissibleError'
 import { ProviderLogo } from './ProviderLogo'
 import { providerBrand, type ProviderBrand } from './provider-logo'
-import { AssistantTranscriptContent, type AssistantTranscriptMessage, type TranscriptTool } from './AssistantTranscriptContent'
+import { AssistantTranscriptContent, type AssistantTranscriptMessage, type TranscriptActivity, type TranscriptTool } from './AssistantTranscriptContent'
 import genericAgentIcon from './sf-icons/person-2.png'
 import type { AgentEvent, AgentState, AgentSummary, CostUnit, PipiHostAPI, WorktreeStatus } from '@pipi/host-api'
 
@@ -128,10 +128,6 @@ function knownTaskSummary(text: string): string | undefined {
   return undefined
 }
 
-function containsChinese(text: string): boolean {
-  return /[\u3400-\u9fff]/.test(text)
-}
-
 /** Deterministic display-only localization. Unknown prose stays untouched. */
 export function localizedTaskSummary(text: string): string {
   const clean = visibleAgentText(text)
@@ -146,14 +142,33 @@ export function localizedTaskSummary(text: string): string {
   return clean
 }
 
+function firstNonEmptyLine(text: string): string {
+  for (const line of visibleAgentText(text).split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (trimmed) return trimmed
+  }
+  return ''
+}
+
+function shortTaskLabel(task: string): string {
+  const line = firstNonEmptyLine(task)
+  if (!line) return ''
+  const compact = localizedTaskSummary(line).replace(/\s+/g, ' ').trim()
+  return compact.length > 40 ? `${compact.slice(0, 40)}…` : compact
+}
+
 function agentListSubtitle(agent: Agent): string {
-  // A Boss-authored Chinese title/task is more useful than a later structured activity.
-  const bossText = [agent.title, agent.task].find(value => value && containsChinese(value))
-  if (!bossText && (agent.name === 'computer-use-leader' || agent.role === 'computer-use-leader')) return '协调并核验桌面操作任务'
-  if (!bossText && agent.name === 'computer-terminal') return '执行受限终端步骤'
-  if (!bossText && agent.name === 'computer-verifier') return '核验桌面操作结果'
-  const source = bossText || agent.title || agent.task || agent.listSubtitle || 'subagent'
-  return localizedTaskSummary(source)
+  const title = agent.title?.trim()
+  if (title) return localizedTaskSummary(title)
+  if (agent.name === 'computer-use-leader' || agent.role === 'computer-use-leader') return '协调并核验桌面操作任务'
+  if (agent.name === 'computer-terminal') return '执行受限终端步骤'
+  if (agent.name === 'computer-verifier') return '核验桌面操作结果'
+  const taskLabel = agent.task?.trim() ? shortTaskLabel(agent.task) : ''
+  if (taskLabel) return taskLabel
+  const activity = agent.listSubtitle?.trim()
+  if (activity) return localizedTaskSummary(activity)
+  const profile = agent.name?.trim()
+  return profile ? localizedProfileName(profile) : 'subagent'
 }
 
 type LiveAgentStatus = { text: string; severity: 'active' | 'quiet' | 'deadline' }
@@ -242,26 +257,67 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
   // Build ONE unified message — exactly like the main agent transcript — so the
   // subagent detail reuses AssistantTranscriptContent verbatim: one "N 个步骤"
   // card containing all thinking + tools, followed by the text content.
-  const thinkingParts: string[] = []
+  const activities: TranscriptActivity[] = []
   const tools: TranscriptTool[] = []
   const contentParts: string[] = []
+  let nextIndex = 0
+  const activityIndex = (log: Log) => log.contentIndex ?? nextIndex
+  const consumed = new Set<number>()
+  const nameOf = (log: Log) => (log.name ?? '').trim()
+  const takeResult = (tool: Log, toolIndex: number): Log | undefined => {
+    if (tool.contentIndex !== undefined) {
+      const same = agent.logs.findIndex(log => log.itemType === 'toolResult' && log.contentIndex === tool.contentIndex)
+      if (same >= 0) { consumed.add(same); return agent.logs[same] }
+    }
+    const adjacent = agent.logs[toolIndex + 1]
+    if (adjacent?.itemType === 'toolResult' && !consumed.has(toolIndex + 1)) {
+      consumed.add(toolIndex + 1)
+      return adjacent
+    }
+    for (let i = 0; i < agent.logs.length; i += 1) {
+      const candidate = agent.logs[i]
+      if (candidate.itemType !== 'toolResult' || consumed.has(i)) continue
+      const resultName = nameOf(candidate)
+      const toolName = nameOf(tool)
+      if (!resultName || !toolName || resultName === toolName) {
+        consumed.add(i)
+        return candidate
+      }
+    }
+    return undefined
+  }
   for (let index = 0; index < agent.logs.length; index += 1) {
     const log = agent.logs[index]
     const text = visibleAgentText(log.text)
     if (log.itemType === 'thinking') {
-      if (text) thinkingParts.push(text)
+      if (!text) continue
+      const contentIndex = activityIndex(log)
+      activities.push({ type: 'thinking', id: `thinking:${log.contentIndex ?? log.id}`, contentIndex, content: text })
+      nextIndex = Math.max(nextIndex, contentIndex + 1)
     } else if (log.itemType === 'tool') {
-      const result = agent.logs[index + 1]?.itemType === 'toolResult' ? agent.logs[++index] : undefined
-      tools.push({ id: `subagent-tool-${log.id}`, name: log.name ?? 'tool', input: log.text, result: result ? visibleAgentText(result.text) : undefined, error: result?.isError, startedAt: agent.startedAt, finished: Boolean(result) || !isActive(agent) })
+      const result = takeResult(log, index)
+      const tool: TranscriptTool = { id: `subagent-tool-${log.id}`, name: log.name ?? 'tool', input: log.text, result: result ? visibleAgentText(result.text) : undefined, error: result?.isError, startedAt: agent.startedAt, finished: Boolean(result) || !isActive(agent) }
+      const contentIndex = activityIndex(log)
+      tools.push(tool)
+      activities.push({ type: 'tool', contentIndex, tool })
+      nextIndex = Math.max(nextIndex, contentIndex + 1)
+    } else if (log.itemType === 'toolResult') {
+      if (!consumed.has(index) && text) contentParts.push(text)
     } else if (text) {
       contentParts.push(text)
     }
   }
   const content = contentParts.join('\n\n')
   const messages: AssistantTranscriptMessage[] = []
-  const hasSteps = thinkingParts.length > 0 || tools.length > 0
+  const hasSteps = activities.length > 0
   if (hasSteps || content) {
-    messages.push({ content, thinking: thinkingParts.length > 0 ? thinkingParts.join('\n') : undefined, tools: tools.length > 0 ? tools : undefined, streaming: isActive(agent) })
+    messages.push({
+      content,
+      thinking: activities.find((activity): activity is Extract<TranscriptActivity, { type: 'thinking' }> => activity.type === 'thinking')?.content,
+      tools: tools.length > 0 ? tools : undefined,
+      activities: hasSteps ? activities : undefined,
+      streaming: isActive(agent)
+    })
   }
   if (finalResult && finalResult.trim() && !content.includes(finalResult.trim())) {
     messages.push({ content: finalResult })
@@ -312,7 +368,7 @@ function treeOrder(agents: Agent[]) {
   return order
 }
 
-export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable = false, onRunningChange }: { host: PipiHostAPI; sessionId?: string; projectPath?: string; onOpenDocument?: (path: string) => void; retainedWorktreeDispositionAvailable?: boolean; onRunningChange?: (running: boolean) => void }) {
+export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable = false, onRunningChange, onRunningCountChange, onAgentStarted }: { host: PipiHostAPI; sessionId?: string; projectPath?: string; onOpenDocument?: (path: string) => void; retainedWorktreeDispositionAvailable?: boolean; onRunningChange?: (running: boolean) => void; onRunningCountChange?: (count: number) => void; onAgentStarted?: () => void }) {
   const [agents, setAgents] = useState<Agent[]>([])
   const [selectedId, setSelectedId] = useState<string>()
   const [page, setPage] = useState(0)
@@ -396,8 +452,8 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     if (!selected) return
     return host.subscribeAgentLog(selected.agentId, event => setAgents(current => current.map(agent => agent.agentId === selected.agentId
       ? { ...agent, logs: applyLogDelta(agent.logs, event) }
-      : agent)))
-  }, [host, selected?.agentId])
+      : agent)), selected.sessionId ?? '', selected.runId ?? '')
+  }, [host, selected?.agentId, selected?.sessionId, selected?.runId])
 
   // Fetch cached logs for the selected agent so completed subagents show their
   // full transcript (live subscription only delivers events while running).
@@ -405,7 +461,9 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     if (!selected?.agentId || !host.getAgentLogs) return
     let cancelled = false
     const agentId = selected.agentId
-    void host.getAgentLogs(agentId).then(entries => {
+    const session = selected.sessionId ?? ''
+    const runId = selected.runId ?? ''
+    void host.getAgentLogs(agentId, session, runId).then(entries => {
       if (cancelled || !entries.length) return
       setAgents(current => current.map(agent => {
         if (agent.agentId !== agentId || agent.logs.length > 0) return agent
@@ -415,7 +473,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
       }))
     })
     return () => { cancelled = true }
-  }, [host, selected?.agentId])
+  }, [host, selected?.agentId, selected?.sessionId, selected?.runId])
 
   useEffect(() => {
     if (follow && agents.length) setPage(0)
@@ -427,11 +485,18 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     failed: agents.filter(agent => agent.state === 'failed').length,
   }), [agents])
 
+  const previousRunningRef = useRef(0)
   useEffect(() => {
+    onRunningCountChange?.(summary.running)
     onRunningChange?.(summary.running > 0)
-  }, [onRunningChange, summary.running])
+    if (summary.running > previousRunningRef.current) onAgentStarted?.()
+    previousRunningRef.current = summary.running
+  }, [onAgentStarted, onRunningChange, onRunningCountChange, summary.running])
 
-  useEffect(() => () => onRunningChange?.(false), [onRunningChange])
+  useEffect(() => () => {
+    onRunningCountChange?.(0)
+    onRunningChange?.(false)
+  }, [onRunningChange, onRunningCountChange])
 
   const ordered = treeOrder(agents)
   const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))

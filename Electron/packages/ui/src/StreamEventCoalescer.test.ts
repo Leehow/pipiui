@@ -48,6 +48,22 @@ describe('StreamEventCoalescer', () => {
     } finally { vi.useRealTimers() }
   })
 
+  it('never merges thinking deltas from different message segments sharing a contentIndex', () => {
+    vi.useFakeTimers()
+    try {
+      const applied: StreamEvent[] = []
+      const coalescer = new StreamEventCoalescer({ onEvent: event => applied.push(event) })
+      coalescer.push({ type: 'thinking', sessionId: 's', contentIndex: 0, segment: 0, delta: 'first' })
+      coalescer.push({ type: 'thinking', sessionId: 's', contentIndex: 0, segment: 0, delta: ' more' })
+      coalescer.push({ type: 'thinking', sessionId: 's', contentIndex: 0, segment: 1, delta: 'second' })
+      coalescer.dispose()
+      const thinking = applied.filter((event): event is Extract<StreamEvent, { type: 'thinking' }> => event.type === 'thinking')
+      expect(thinking).toHaveLength(3)
+      // The segment-1 delta must keep its own segment attribution.
+      expect(thinking[2]).toMatchObject({ segment: 1, delta: 'second' })
+    } finally { vi.useRealTimers() }
+  })
+
   it('flushes pending final content on dispose', () => {
     const applied: StreamEvent[] = []
     const coalescer = new StreamEventCoalescer({ onEvent: event => applied.push(event) })

@@ -6,12 +6,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createPiHostBackend, type PiCommand } from "../src/index.js";
 
 /**
- * T17 parity: `~/.pi/agent/.env` keys must reach the spawned pi RPC process env, or
+ * T17 parity: configured `<agentDir>/.env` keys must reach the spawned pi RPC process env, or
  * env-key providers (DeepSeek/Kimi) that `listModels` sees via the auth runtime fail
  * `set_model` with "Model not found". Mirrors Swift `ChatSession.mergedSpawnEnv` +
  * `PiProcess.mergedProcessEnvironment` end to end.
  */
-describe("pi spawn env injects ~/.pi/agent/.env (T17 parity)", () => {
+describe("pi spawn env injects the configured profile .env (T17 parity)", () => {
   let root = "";
   let currentBackend: ReturnType<typeof createPiHostBackend> | undefined;
   afterEach(async () => {
@@ -24,7 +24,7 @@ describe("pi spawn env injects ~/.pi/agent/.env (T17 parity)", () => {
   });
 
   /** agentDir with an optional .env; returns the env actually handed to the spawned pi. */
-  async function fixture(dotEnv: string | undefined, parentEnv: NodeJS.ProcessEnv = {}, piCommand?: PiCommand) {
+  async function fixture(dotEnv: string | undefined, parentEnv: NodeJS.ProcessEnv = {}, piCommand?: PiCommand, resourceMode?: "default" | "explicit") {
     root = await mkdtemp(join(tmpdir(), "pipi-dotenv-"));
     const agent = join(root, "agent");
     const cwd = join(root, "project");
@@ -45,19 +45,17 @@ describe("pi spawn env injects ~/.pi/agent/.env (T17 parity)", () => {
         cwd,
       })}\n`,
     );
-    let captured: NodeJS.ProcessEnv = {};
-    let capturedBin = "";
-    let capturedArgs: string[] = [];
+    const captured: Array<{ bin: string; args: string[]; env: NodeJS.ProcessEnv }> = [];
     const backend = createPiHostBackend({
       agentDir: agent,
       sessionsRoot: join(root, "sessions"),
       runtimeRoot: join(root, "runtime"),
       ...(piCommand ? { piCommand } : { piPath: "node" }),
+      profileMode: resourceMode === "explicit" ? "isolated" : "default",
+      resourceMode,
       env: { PATH: "/usr/local/bin:/usr/bin:/bin", ...parentEnv },
       spawn: (bin, args, options) => {
-        capturedBin = bin;
-        capturedArgs = args;
-        captured = options.env;
+        captured.push({ bin, args, env: options.env });
         return spawn(
           process.execPath,
           [new URL("./fake-pi.mjs", import.meta.url).pathname],
@@ -66,7 +64,8 @@ describe("pi spawn env injects ~/.pi/agent/.env (T17 parity)", () => {
       },
     });
     currentBackend = backend;
-    return { backend, env: () => captured, command: () => ({ bin: capturedBin, args: capturedArgs }) };
+    const mainSpawn = () => captured.find(item => item.env.PIPIUI_SESSION_KEY === "session-1") ?? captured[0];
+    return { backend, env: () => mainSpawn().env, command: () => ({ bin: mainSpawn().bin, args: mainSpawn().args }) };
   }
 
   it("injects .env provider keys (DEEPSEEK_API_KEY / KIMI_API_KEY) into the spawned pi env", async () => {
@@ -99,7 +98,7 @@ describe("pi spawn env injects ~/.pi/agent/.env (T17 parity)", () => {
     expect(actual.PIPIUI_COMPUTER_EXT).toBeUndefined();
   });
 
-  it("spawns normally when ~/.pi/agent/.env is absent", async () => {
+  it("spawns normally when the configured profile .env is absent", async () => {
     const { backend, env } = await fixture(undefined, {
       PIPIUI_SESSION_KEY: "stale-parent",
     });
@@ -133,5 +132,20 @@ describe("pi spawn env injects ~/.pi/agent/.env (T17 parity)", () => {
       PIPIUI_SESSION_KEY: "session-1",
     });
     expect(env().PATH?.split(":" ).slice(0, 2)).toEqual(["/bundle/node/bin", "/bundle/pi/bin"]);
+  });
+
+  it("pins isolated Pi paths and explicit resource flags above conflicting inherited values", async () => {
+    const { backend, env, command } = await fixture(
+      "PI_CODING_AGENT_DIR=/global-dotenv\nPI_CODING_AGENT_SESSION_DIR=/global-dotenv/sessions\n",
+      { PI_CODING_AGENT_DIR: "/global-parent", PI_CODING_AGENT_SESSION_DIR: "/global-parent/sessions" },
+      undefined,
+      "explicit",
+    );
+    await backend.handle("sendPrompt", ["session-1", "go"]);
+    expect(env().PI_CODING_AGENT_DIR).toBe(join(root, "agent"));
+    expect(env().PI_CODING_AGENT_SESSION_DIR).toBe(join(root, "sessions"));
+    expect(command().args).toEqual(expect.arrayContaining([
+      "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
+    ]));
   });
 });

@@ -1,0 +1,27 @@
+{
+  "$comment": [
+    "Tools that are registered in the main session but introduced to the model nowhere:",
+    "no promptSnippet, and no mention in the philosophy layers. They are still callable —",
+    "their schemas reach the model — but Pi gives the model no steering about when to use",
+    "them, which is how `ledger_note` shipped as a capability the Boss never reached for.",
+    "",
+    "This file is a baseline, not an allowlist. check-boss-tool-policy.mjs reports every",
+    "entry and fails only on names that are NOT here, so a new one cannot land unnoticed.",
+    "Fix an entry by giving the tool a promptSnippet or naming it in a philosophy layer,",
+    "then delete it from this list.",
+    "",
+    "secretary_commit is deliberate and expected to stay. It is registered process-wide but",
+    "runSecretaryCommit rejects any caller whose PIPIUI_AGENT_ROLE is not closeout-secretary,",
+    "which the main session's never is. Introducing it to the Boss would advertise a commit",
+    "path the Boss cannot use and must not look for.",
+    "",
+    "subagent_manage reads, scaffolds and installs agent definitions and never enters the",
+    "dispatch, desktop or grant paths. Low value to a Boss mid-orchestration, so it is left",
+    "unintroduced for now rather than spending prompt on it — revisit if agent authoring",
+    "becomes something the Boss is expected to do."
+  ],
+  "notIntroduced": [
+    "secretary_commit",
+    "subagent_manage"
+  ]
+}

@@ -28,6 +28,11 @@ async function linkRuntimePackages(directory) {
 /** Copy the extension and expose only the run-scoped resolve control-plane seams. */
 async function prepareHooksModule(directory) {
   await cp(sourceSubagentDirectory, join(directory, "subagent"), { recursive: true });
+  await cp(
+    join(sourceSubagentDirectory, "../packages/computer-agent"),
+    join(directory, "packages/computer-agent"),
+    { recursive: true },
+  );
   await linkRuntimePackages(directory);
 
   const indexPath = join(directory, "subagent/index.ts");
@@ -282,14 +287,21 @@ process.stdout.write(JSON.stringify({
   }
 });
 
-test("resolve schema requires runId without replacing the root tool object", async () => {
+test("resolve keeps runtime identity validation without xAI best-effort schema conditionals", async () => {
   const source = await readFile(join(sourceSubagentDirectory, "index.ts"), "utf8");
   assert.match(source, /name: "subagent"/);
-  assert.match(source, /const SubagentParams = Type\.Object\(/);
-  assert.match(source, /StringEnum\(\["abort", "resolve"\] as const/);
-  assert.match(source, /runId: Type\.Optional\(Type\.String\(\{\s*minLength: 1/s);
-  assert.match(source, /properties: \{ action: \{ const: "resolve" \} \}/);
-  assert.match(source, /then: \{ required: \["agentId", "runId"\] \}/);
+	assert.match(source, /const SubagentParams = Type\.Object\(\{/);
+	assert.match(source, /StringEnum\(\["abort", "resolve"\] as const/);
+	assert.match(source, /runId: Type\.Optional\(Type\.String\(\{ minLength: 1/);
+  const schemaSource = source.slice(
+		source.indexOf("const SubagentParams = Type.Object("),
+		source.indexOf("const ParallelSubagentParams = Type.Object("),
+  );
+  assert.doesNotMatch(schemaSource, /\btasks:/);
+  assert.doesNotMatch(schemaSource, /\b(?:if|then|else):/);
+  assert.match(source, /if \(params\.action === "resolve"\)/);
+  assert.match(source, /if \(!target \|\| !runId\)/);
+  assert.match(source, /action="resolve" requires both agentId and runId/);
   assert.match(source, /function cancelInterruptedReminders\(agentId: string, runId\?: string\)/);
   assert.match(source, /pi\.registerCommand\("subagent_resolve"/);
 });

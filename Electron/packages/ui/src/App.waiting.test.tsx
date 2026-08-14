@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { PipiHostAPI, StreamEvent } from '@pipi/host-api'
+import type { AgentEvent, PipiHostAPI, StreamEvent } from '@pipi/host-api'
 
 vi.mock('react-virtuoso', async () => {
   const React = await import('react')
@@ -50,46 +50,177 @@ describe('active-turn waiting placeholder', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /1 个步骤/ }).getAttribute('aria-expanded')).toBe('false'))
   })
 
-  it('only starts for a user send, stays visible through thinking/tools, hides on first text, and stop uses host.stop', async () => {
+  it('shows the first-response wait for host-driven turns, keeps it through thinking/tool, hides on first text, and cleans up on settle', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     const base = createMockHost()
-    const stop = vi.fn(async () => listener?.({ type: 'status', sessionId: 'welcome', status: 'stopped' }))
-    const host: PipiHostAPI = { ...base, sendPrompt: vi.fn(async () => undefined), stop, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
-    render(<App host={host} />)
+    const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
+    const { container } = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
     await waitFor(() => expect(listener).toBeDefined())
+
+    // Layout has no running subagent fixtures, so the tail indicator is unambiguous.
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('aria-current')).toBe('true'))
+    await waitFor(() => expect(listener).toBeDefined())
+
+    // A host-driven turn (resumed/read-only session, queue dispatch, background
+    // dispatch) shows the first-response wait even though the UI never sent a prompt.
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', pendingFollowUps: ['queued'] }) })
+    const placeholder = await screen.findByTestId('waiting-placeholder')
+    expect(placeholder.getAttribute('data-phase')).toBe('awaiting')
+    // The turn owns the Composer too: the stop control replaces the send button.
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
+
+    // Thinking/tool keep the wait visible and move its phase.
+    act(() => { listener?.({ type: 'thinking', sessionId: 'layout', contentIndex: 0, delta: 'plan' }) })
+    expect(screen.getByTestId('waiting-placeholder').getAttribute('data-phase')).toBe('thinking')
+    act(() => { listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'bash-1', name: 'bash', delta: '{"command":"ls -la"}' }) })
+    expect(screen.getByTestId('waiting-placeholder').getAttribute('data-phase')).toBe('tool')
+
+    // First real text ends the first-response wait, but the turn is still
+    // streaming: the Composer keeps its stop control until settled/stopped.
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: 'Hello' }) })
+    await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
+
+    // settled cleans up streaming + waiting and folds the streaming message.
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled' }) })
+    await waitFor(() => expect(screen.queryAllByLabelText('停止生成')).toHaveLength(0))
+    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
+    expect(screen.getByLabelText('发送消息')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /个步骤/ }).getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('starts the wait for a local send and routes the inline stop to host.stop', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const stop = vi.fn(async () => listener?.({ type: 'status', sessionId: 'layout', status: 'stopped' }))
+    const host: PipiHostAPI = { ...base, sendPrompt: vi.fn(async () => undefined), stop, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(listener).toBeDefined())
+
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listener).toBeDefined())
     const input = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
-    const send = screen.getByLabelText('发送消息') as HTMLButtonElement
     await waitFor(() => expect(input.disabled).toBe(false), { timeout: 5000 })
 
-    // A queue/status update is not a user turn and must not create a placeholder.
-    act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'started', pendingFollowUps: ['queued'] }) })
-    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
-    // The observed host turn is busy but not ours; once it settles, the next
-    // user turn remains a direct send and gets its own waiting indicator.
-    act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }) })
-    await waitFor(() => expect(screen.getByLabelText('发送消息')).toBeTruthy(), { timeout: 5000 })
-
     fireEvent.change(input, { target: { value: 'hello' } })
-    const directSend = screen.getByLabelText('发送消息') as HTMLButtonElement
-    await waitFor(() => expect(directSend.disabled).toBe(false), { timeout: 5000 })
-    fireEvent.click(directSend)
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    // The user's own send establishes the first-response wait (phase awaiting)
+    // immediately, before any host status event.
+    const waiting = await screen.findByTestId('waiting-placeholder')
+    expect(waiting.getAttribute('data-phase')).toBe('awaiting')
+    // The inline stop delegates to host.stop; the stopped status cleans up.
+    fireEvent.click(screen.getByTestId('waiting-stop'))
+    await waitFor(() => expect(stop).toHaveBeenCalledWith('layout'))
+    await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
+  })
+
+  it('restores streaming + waiting when switching back to an observed-running session', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(listener).toBeDefined())
+
+    // A host-driven turn starts on layout while it is selected.
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listener).toBeDefined())
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started' }) })
     expect(await screen.findByTestId('waiting-placeholder')).toBeTruthy()
 
-    // Thinking lives inside a folded card — the placeholder must stay visible.
-    act(() => { listener?.({ type: 'thinking', sessionId: 'welcome', contentIndex: 0, delta: 'thinking' }) })
-    expect(screen.getByTestId('waiting-placeholder')).toBeTruthy()
-    // Only real text output ends the first-token wait.
-    act(() => { listener?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: 'Hello' }) })
+    // Switching away clears the live state.
+    fireEvent.click(container.querySelector('[data-session-id="tool-burst"]')!)
+    await waitFor(() => expect(container.querySelector('[data-session-id="tool-burst"]')?.getAttribute('aria-current')).toBe('true'))
     await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
+    expect(screen.queryAllByLabelText('停止生成')).toHaveLength(0)
 
-    // End the first turn, start another, and verify the inline stop delegates to the existing API.
+    // Switching back to the still-running session restores streaming + waiting
+    // from the observed status map — no replay protocol, no new status event.
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(screen.getByTestId('waiting-placeholder')).toBeTruthy())
+    expect(screen.getByTestId('waiting-placeholder').getAttribute('data-phase')).toBe('awaiting')
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
+    // The loaded history is present alongside the restored live state.
+    expect(screen.getByText('左栏宽度要能持久化。')).toBeTruthy()
+  })
+
+  it('shows a continuing wait for queued follow-ups instead of a second first-response placeholder', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(listener).toBeDefined())
+
+    // Layout has a user-only history, so a fresh host-driven turn owns the wait.
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listener).toBeDefined())
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started' }) })
+    expect(await screen.findByTestId('waiting-placeholder')).toBeTruthy()
+
+    // A live tool card is visible output; a follow-up 'started' while the turn is
+    // still active must not add a second placeholder (the ref guard anchors it).
+    act(() => { listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'bash-1', name: 'bash', delta: '{"command":"ls -la"}' }) })
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', pendingFollowUps: ['queued'] }) })
+    expect(screen.queryAllByTestId('waiting-placeholder')).toHaveLength(1)
+
+    // First text ends the first-token wait; settle ends the turn.
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '第一轮答复' }) })
+    await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled' }) })
+    await waitFor(() => expect(screen.queryAllByLabelText('停止生成')).toHaveLength(0))
+
+    // A queued follow-up now dispatches: the transcript already shows assistant
+    // output, so the first-response "等待第一个响应" copy must not return. The
+    // new turn still needs a reason — otherwise the composer only says 生成中.
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', pendingFollowUps: ['queued'] }) })
+    const followUpWait = await screen.findByTestId('waiting-placeholder')
+    expect(followUpWait.getAttribute('data-phase')).toBe('continuing')
+    expect(followUpWait.textContent).toContain('等待模型响应')
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
+
+    // The follow-up streams its own text and settles cleanly.
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '第二轮答复' }) })
+    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled' }) })
+    await waitFor(() => expect(screen.queryAllByLabelText('停止生成')).toHaveLength(0))
+  })
+
+  it('keeps a stable subagent tail indicator while workers run, even after the main turn settles', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const agentListeners = new Set<(event: AgentEvent) => void>()
+    const host: PipiHostAPI = {
+      ...base,
+      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
+      subscribeAgents: agentListener => { agentListeners.add(agentListener); return () => { agentListeners.delete(agentListener) } }
+    }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(agentListeners.size).toBeGreaterThan(0))
+
+    // welcome's fixture 'research' worker is running: the tail indicator appears.
+    const placeholder = await screen.findByTestId('waiting-placeholder')
+    expect(placeholder.getAttribute('data-phase')).toBe('tool')
+    expect(placeholder.textContent).toContain('1 个子任务执行中')
+    // It is not a main turn: no stop control.
+    expect(placeholder.querySelector('[data-testid="waiting-stop"]')).toBeNull()
+
+    // A settled main turn with visible text does not remove it.
+    act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
+    act(() => { listener?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: '主回复' }) })
     act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }) })
-    await waitFor(() => expect(screen.getByLabelText('发送消息')).toBeTruthy())
-    fireEvent.change(input, { target: { value: 'again' } })
-    fireEvent.click(screen.getByLabelText('发送消息'))
-    fireEvent.click(await screen.findByTestId('waiting-stop'))
-    await waitFor(() => expect(stop).toHaveBeenCalledWith('welcome'))
+    await waitFor(() => expect(screen.getByText(/主回复/)).toBeTruthy())
+    expect(screen.getByTestId('waiting-placeholder').textContent).toContain('1 个子任务执行中')
+
+    // The elapsed readout ticks live (anchored at the run start).
+    await waitFor(() => expect(screen.getByTestId('waiting-elapsed').textContent).toContain('已用时'), { timeout: 4000 })
+
+    // Agent terminal removes the indicator.
+    act(() => { for (const push of agentListeners) push({ type: 'agent', agent: { agentId: 'research', runId: 'mock-1', sessionId: 'welcome', name: 'explore', role: 'explore', title: '调研 UI', task: '调研 Electron UI 结构', state: 'ok', createdAt: Date.now() - 20_000 } }) })
     await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
   })
 })

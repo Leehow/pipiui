@@ -1,9 +1,9 @@
 @import 'streamdown/styles.css';
 
 :root { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:14px; }
-.pipiui-shell { --bg:#17181c;--surface:#202126;--surface-raised:#25262c;--surface-hover:#2c2d34;--surface-input:#2a2b31;--border:#303137;--border-strong:#373941;--text:#e5e7eb;--text-strong:#f3f4f6;--muted:#9da2ad;--subtle:#747a86;--selection:#353750;--accent:#6578ea;--accent-soft:#33354c;--danger:#a75b63;--warning:#f5c76e;--success:#76c59b; color:var(--text); background:var(--bg); }
+.pipiui-shell { --bg:#17181c;--surface:#202126;--surface-raised:#25262c;--surface-hover:#2c2d34;--surface-input:#2a2b31;--border:#303137;--border-strong:#373941;--text:#e5e7eb;--text-strong:#f3f4f6;--muted:#9da2ad;--subtle:#747a86;--selection:#353750;--accent:#6578ea;--accent-soft:#33354c;--danger:#a75b63;--warning:#f5c76e;--success:#76c59b;--chat-content-max:780px;--chat-content-gutter:16px;--chat-scrollbar-gutter:6px;--chat-content-width:calc(100% - var(--chat-content-gutter) - var(--chat-content-gutter)); color:var(--text); background:var(--bg); }
 .pipiui-shell[data-theme="light"] { --bg:#f5f5f7;--surface:#ececef;--surface-raised:#fff;--surface-hover:#e1e1e6;--surface-input:#fff;--border:#d6d6dc;--border-strong:#c8c8cf;--text:#27272a;--text-strong:#17171a;--muted:#6b6b73;--subtle:#898991;--selection:#dbe5ff;--accent:#4968c9;--accent-soft:#e4eaff;--danger:#bd5962;--warning:#9a6816;--success:#28865a; }
-*{box-sizing:border-box} body,#root{margin:0;min-width:900px;min-height:100vh;background:var(--bg)} button,input,textarea,select{font:inherit}button{color:inherit;border:0;background:transparent;cursor:pointer}.pipiui-shell{display:grid;min-height:100vh;overflow:hidden}.sidebar,.tool-panel{min-width:0;background:var(--surface);display:flex;flex-direction:column}.sidebar{border-right:1px solid var(--border)}.brand{padding:17px 14px 11px;font-size:17px;font-weight:700;letter-spacing:-.3px;color:var(--text-strong)}.search{margin:0 10px 8px;height:30px;display:flex;align-items:center;gap:6px;padding:0 8px;color:var(--muted);background:var(--surface-input);border:1px solid var(--border);border-radius:7px}.search input{min-width:0;width:100%;color:var(--text);outline:0;border:0;background:transparent}.search kbd{font:10px inherit;color:var(--subtle);white-space:nowrap}.side-scroll{flex:1;overflow:auto;padding:0 10px}.section-title{display:flex;align-items:center;justify-content:space-between;padding:14px 6px 7px;color:var(--muted);font-weight:650;letter-spacing:.07em;font-size:11px}.section-title button{font-size:18px;font-weight:300}.project-row,.project-main,.session-row{width:100%;display:flex;align-items:center;gap:7px;min-height:31px;border-radius:6px;text-align:left}.project-row{padding:0 7px}.project-row:hover,.session-row:hover{background:var(--surface-hover)}.project-main{min-width:0;padding:0;color:var(--text)}.folder-icon{color:var(--muted);white-space:pre}.project-new{display:none;margin-left:auto;color:var(--muted);font-size:17px}.project-row:hover .project-new{display:block}.session-row{padding:0 7px 0 25px;color:var(--text);font-size:12px}.session-row.selected{background:var(--selection);color:var(--text-strong)}.session-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.session-row small{margin-left:auto;color:var(--subtle);font-size:10px;white-space:nowrap}.status-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);flex:none}.pin-icon{color:var(--muted)}.agent-badge,.lease-badge{padding:1px 4px;border-radius:4px;font-size:9px;font-style:normal;white-space:nowrap}.agent-badge{color:var(--success);background:color-mix(in srgb,var(--success) 16%,transparent)}.lease-badge{color:var(--warning);background:color-mix(in srgb,var(--warning) 16%,transparent)}.more-toggle{padding:7px 6px;color:var(--muted);font-size:11px}.archived-row{width:100%;display:flex;gap:7px;align-items:center;padding:14px 6px 8px;color:var(--muted);text-align:left}.archived-row small{margin-left:auto;color:var(--subtle)}.sidebar-footer{display:flex;align-items:center;gap:5px;border-top:1px solid var(--border);padding:10px}.sidebar-footer>button{height:27px;min-width:27px;border-radius:5px;color:var(--muted)}.sidebar-footer>button:hover{background:var(--surface-hover);color:var(--text-strong)}.resize-handle{position:relative;z-index:2;margin-left:-3px;margin-right:-3px;cursor:col-resize}.resize-handle:hover,.resize-handle:active{background:var(--accent)}.chat-column{min-width:0;display:grid;grid-template-rows:50px minmax(0,1fr) auto;background:var(--bg)}.chat-header{display:flex;align-items:center;padding:0 17px;border-bottom:1px solid var(--border);background:var(--surface)}.chat-header strong{color:var(--text-strong)}.chat-header span{margin-left:8px;color:var(--muted);font-size:11px}.chat-header button{color:var(--muted);font-size:18px}.lease-detail{color:var(--warning)!important}.lease-detail button{margin-left:6px;color:var(--warning);text-decoration:underline;font-size:11px}.message-list{min-height:0}.message{max-width:900px;margin:0 auto;padding:14px 28px}.assistant-message{color:var(--text);line-height:1.72}.assistant-message-footer{display:flex;align-items:center;gap:8px;margin-top:2px}.message-time{color:var(--subtle);font-size:10px;font-variant-numeric:tabular-nums;flex:none}.user-message .message-time{margin-left:auto;padding-right:2px}.user-message{display:flex;justify-content:flex-end}.user-bubble{max-width:min(75%,650px);padding:12px 15px;border-radius:15px;color:#fff;background:var(--accent);line-height:1.65;white-space:pre-wrap;font-size:15px}.system-message{margin:12px 28px;padding:10px 12px;border-radius:6px;color:var(--muted);background:var(--surface);font:12px ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.6}.thinking,.tool-card{margin:10px 0;border:1px solid var(--border-strong);border-radius:8px;background:var(--surface)}.thinking summary,.tool-card header{padding:10px 12px;color:var(--muted);cursor:pointer;font-size:13px}.thinking p{margin:0;padding:0 12px 12px;color:var(--muted);white-space:pre-wrap;font-size:13px;line-height:1.6}.tool-card header{display:flex;gap:8px;align-items:center}.tool-card header span{color:var(--success)}.tool-card header small{margin-left:auto;color:var(--muted)}.tool-card pre,.tool-result{overflow:auto;margin:0;padding:10px 12px;border-top:1px solid var(--border);color:var(--text);background:var(--bg);font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}.markdown{font-size:15px;line-height:1.72;overflow-wrap:anywhere}.markdown p{margin:0 0 8px}.markdown pre{overflow:auto;padding:14px!important;border:1px solid var(--border);border-radius:8px;background:var(--bg)!important;white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.55}.markdown :not(pre)>code{padding:2px 5px;border-radius:4px;background:var(--surface-hover);font-size:13.5px}.composer{margin:0 16px 15px;position:relative}.composer-card{padding:9px 10px 8px;border:1px solid var(--border-strong);border-radius:12px;background:var(--surface-raised);box-shadow:0 -5px 18px rgb(0 0 0 / 8%)}.composer-shell{display:flex;align-items:flex-end;gap:8px}.composer textarea{width:100%;min-height:29px;max-height:150px;resize:none;overflow-y:auto;outline:0;border:0;color:var(--text-strong);background:transparent;line-height:1.6;font-size:14px}.composer textarea::placeholder{color:var(--muted)}.send{width:27px;height:27px;border-radius:7px;color:#fff;background:var(--accent);font-size:16px}.send:disabled{cursor:default;opacity:.35}.send.stop{background:var(--danger);font-size:12px}.composer-options{display:flex;align-items:center;gap:6px;min-width:0;margin:8px 0 0}.composer-options-left{display:flex;min-width:0;align-items:center;gap:6px}.composer-stats{display:flex;min-width:0;margin-left:auto;justify-content:flex-end}.composer-options select{max-width:150px;padding:2px 4px;outline:0;border:0;color:var(--muted);background:transparent;font-size:11px}.model-chip{display:flex;align-items:center;gap:4px;max-width:220px;min-width:0;padding:5px 10px;border-radius:999px;background:color-mix(in srgb,var(--text) 6%,transparent);font-size:12px;font-weight:500;color:var(--text)}.model-chip:hover{background:color-mix(in srgb,var(--text) 12%,transparent)}.model-chip-name{overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap}.tool-panel{border-left:1px solid var(--border)}.tool-content{flex:1;display:grid;place-items:center;padding:18px}.subagent-mount,.empty-panel{width:100%;max-width:290px;padding:16px;border:1px dashed var(--border-strong);border-radius:8px;color:var(--muted);background:var(--surface-raised)}.subagent-content{display:flex;padding:0;min-height:0;place-items:stretch}
+*{box-sizing:border-box} body,#root{margin:0;min-width:900px;min-height:100vh;background:var(--bg)} button,input,textarea,select{font:inherit}button{color:inherit;border:0;background:transparent;cursor:pointer}.pipiui-shell{display:grid;min-height:100vh;overflow:hidden}.sidebar,.tool-panel{min-width:0;background:var(--surface);display:flex;flex-direction:column}.sidebar{border-right:1px solid var(--border)}.brand{padding:17px 14px 11px;font-size:17px;font-weight:700;letter-spacing:-.3px;color:var(--text-strong)}.search{margin:0 10px 8px;height:30px;display:flex;align-items:center;gap:6px;padding:0 8px;color:var(--muted);background:var(--surface-input);border:1px solid var(--border);border-radius:7px}.search input{min-width:0;width:100%;color:var(--text);outline:0;border:0;background:transparent}.search kbd{font:10px inherit;color:var(--subtle);white-space:nowrap}.side-scroll{flex:1;overflow:auto;padding:0 10px}.section-title{display:flex;align-items:center;justify-content:space-between;padding:14px 6px 7px;color:var(--muted);font-weight:650;letter-spacing:.07em;font-size:11px}.section-title button{font-size:18px;font-weight:300}.project-row,.project-main,.session-row{width:100%;display:flex;align-items:center;gap:7px;min-height:31px;border-radius:6px;text-align:left}.project-row{padding:0 7px}.project-row:hover,.session-row:hover{background:var(--surface-hover)}.project-main{min-width:0;padding:0;color:var(--text)}.folder-icon{color:var(--muted);white-space:pre}.project-new{display:none;margin-left:auto;color:var(--muted);font-size:17px}.project-row:hover .project-new{display:block}.session-row{padding:0 7px 0 25px;color:var(--text);font-size:12px}.session-row.selected{background:var(--selection);color:var(--text-strong)}.session-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.session-row small{margin-left:auto;color:var(--subtle);font-size:10px;white-space:nowrap}.status-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);flex:none}.pin-icon{color:var(--muted)}.agent-badge,.lease-badge{padding:1px 4px;border-radius:4px;font-size:9px;font-style:normal;white-space:nowrap}.agent-badge{color:var(--success);background:color-mix(in srgb,var(--success) 16%,transparent)}.lease-badge{color:var(--warning);background:color-mix(in srgb,var(--warning) 16%,transparent)}.more-toggle{padding:7px 6px;color:var(--muted);font-size:11px}.archived-row{width:100%;display:flex;gap:7px;align-items:center;padding:14px 6px 8px;color:var(--muted);text-align:left}.archived-row small{margin-left:auto;color:var(--subtle)}.sidebar-footer{display:flex;align-items:center;gap:5px;border-top:1px solid var(--border);padding:10px}.sidebar-footer>button{height:27px;min-width:27px;border-radius:5px;color:var(--muted)}.sidebar-footer>button:hover{background:var(--surface-hover);color:var(--text-strong)}.resize-handle{position:relative;z-index:2;margin-left:-3px;margin-right:-3px;cursor:col-resize}.resize-handle:hover,.resize-handle:active{background:var(--accent)}.chat-column{min-width:0;display:grid;grid-template-rows:50px minmax(0,1fr) auto;background:var(--bg)}.chat-header{display:flex;align-items:center;padding:0 17px;border-bottom:1px solid var(--border);background:var(--surface)}.chat-header strong{color:var(--text-strong)}.chat-header span{margin-left:8px;color:var(--muted);font-size:11px}.chat-header button{color:var(--muted);font-size:18px}.lease-detail{color:var(--warning)!important}.lease-detail button{margin-left:6px;color:var(--warning);text-decoration:underline;font-size:11px}.message-list{min-height:0}.message{max-width:var(--chat-content-max);margin:0 auto;padding:14px 28px}.assistant-message{color:var(--text);line-height:1.72}.message-footer{display:flex;width:100%;min-height:32px;align-items:center;gap:8px;margin-top:2px}.message-time{color:var(--subtle);font-size:10px;font-variant-numeric:tabular-nums;flex:none}.user-message{display:flex;flex-direction:column;align-items:flex-end}.user-bubble{max-width:min(75%,650px);padding:12px 15px;border-radius:15px;color:#fff;background:var(--accent);line-height:1.65;white-space:pre-wrap;font-size:15px}.system-message{margin:12px 28px;padding:10px 12px;border-radius:6px;color:var(--muted);background:var(--surface);font:12px ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.6}.thinking,.tool-card{margin:10px 0;border:1px solid var(--border-strong);border-radius:8px;background:var(--surface)}.thinking summary,.tool-card header{padding:10px 12px;color:var(--muted);cursor:pointer;font-size:13px}.thinking p{margin:0;padding:0 12px 12px;color:var(--muted);white-space:pre-wrap;font-size:13px;line-height:1.6}.tool-card header{display:flex;gap:8px;align-items:center}.tool-card header span{color:var(--success)}.tool-card header small{margin-left:auto;color:var(--muted)}.tool-card pre,.tool-result{overflow:auto;margin:0;padding:10px 12px;border-top:1px solid var(--border);color:var(--text);background:var(--bg);font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}.composer{width:calc(100% - 32px);max-width:var(--chat-content-max);margin:0 auto 15px;position:relative}.composer-card{padding:9px 10px 8px;border:1px solid var(--border-strong);border-radius:12px;background:var(--surface-raised);box-shadow:0 -5px 18px rgb(0 0 0 / 8%)}.composer-shell{display:flex;align-items:flex-end;gap:8px}.composer textarea{width:100%;min-height:29px;max-height:150px;resize:none;overflow-y:auto;outline:0;border:0;color:var(--text-strong);background:transparent;line-height:1.6;font-size:14px}.composer textarea::placeholder{color:var(--muted)}.send{width:27px;height:27px;border-radius:7px;color:#fff;background:var(--accent);font-size:16px}.send:disabled{cursor:default;opacity:.35}.send.stop{background:var(--danger);font-size:12px}.composer-options{display:flex;align-items:center;gap:6px;min-width:0;margin:8px 0 0}.composer-options-left{display:flex;min-width:0;align-items:center;gap:6px}.composer-stats{display:flex;min-width:0;margin-left:auto;justify-content:flex-end}.composer-options select{max-width:150px;padding:2px 4px;outline:0;border:0;color:var(--muted);background:transparent;font-size:11px}.model-chip{display:flex;align-items:center;gap:4px;max-width:220px;min-width:0;padding:5px 10px;border-radius:999px;background:color-mix(in srgb,var(--text) 6%,transparent);font-size:12px;font-weight:500;color:var(--text)}.model-chip:hover{background:color-mix(in srgb,var(--text) 12%,transparent)}.model-chip-name{overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap}.tool-panel{border-left:1px solid var(--border)}.tool-content{flex:1;display:grid;place-items:center;padding:18px}.subagent-mount,.empty-panel{width:100%;max-width:290px;padding:16px;border:1px dashed var(--border-strong);border-radius:8px;color:var(--muted);background:var(--surface-raised)}.subagent-content{display:flex;padding:0;min-height:0;place-items:stretch}
 
 /* Viewport-bound desktop layout: only the three designated panes may scroll. */
 html,body,#root{width:100%;height:100%;min-width:0;min-height:0;overflow:hidden}
@@ -24,7 +24,7 @@ body{overscroll-behavior:none}
    together in the final auto row so implicit grid rows can never push input off-screen. */
 .chat-viewport{position:relative;min-width:0;min-height:0;overflow:hidden;grid-row:2}
 .chat-viewport>.transcript-area{height:100%;min-height:0}
-.chat-composer-stack{grid-row:3;align-self:end;display:flex;min-width:0;min-height:0;flex:0 0 auto;flex-direction:column;overflow:visible}
+.chat-composer-stack{grid-row:3;align-self:end;display:flex;min-width:0;min-height:0;flex:0 0 auto;flex-direction:column;overflow:visible;padding-right:var(--chat-scrollbar-gutter)}
 .chat-header,.composer{min-width:0;flex:none}
 /* Lease state is content in the fixed composer row, never a separate grid row. */
 .composer-read-only{display:flex;min-width:0;align-items:center;gap:8px;margin:0 0 7px;padding:5px 7px;border:1px solid color-mix(in srgb,var(--warning) 42%,var(--border));border-radius:7px;color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface-raised));font-size:11px}
@@ -33,27 +33,35 @@ body{overscroll-behavior:none}
 .composer-read-only button:hover{background:color-mix(in srgb,var(--warning) 16%,transparent)}
 .composer-thumb-remove:disabled{cursor:not-allowed;opacity:.45}
 .chat-header-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-header-title-label{display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;cursor:text}
+.chat-header-title-label:focus-visible{outline:2px solid color-mix(in srgb,var(--accent) 60%,transparent);outline-offset:3px;border-radius:3px}
+.chat-header-title-input{width:min(420px,55vw);height:30px;padding:3px 8px;border:1px solid var(--accent);border-radius:6px;outline:0;color:var(--text-strong);background:var(--surface-input);font-weight:650;box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 16%,transparent)}
 .chat-header-actions{display:flex;flex:none;align-items:center;gap:6px;margin-left:auto}
+.pane-toggle{display:grid;width:28px;height:28px;flex:0 0 28px;place-items:center;border-radius:6px;color:var(--muted);font-size:17px;line-height:1;-webkit-app-region:no-drag}.pane-toggle:hover{background:var(--surface-hover);color:var(--text-strong)}
+.right-pane-toggle-icon{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.45;stroke-linecap:round;stroke-linejoin:round}.right-pane-toggle-fill{fill:currentColor;fill-opacity:.16;stroke:none}
+.tool-panel-header{display:flex;min-width:0;flex:0 0 50px;align-items:center;gap:8px;padding:0 10px 0 14px;border-bottom:1px solid var(--border);background:var(--surface)}.tool-panel-header strong{min-width:0;overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap;font-size:12px}.tool-panel-header .pane-toggle{margin-left:auto}
+.pane-restore{position:absolute;top:11px;z-index:40;background:var(--surface-raised);box-shadow:0 2px 8px rgb(0 0 0/16%)}.pane-restore-sidebar{left:10px}.sidebar-collapsed .chat-header{padding-left:54px}.electron-chrome.sidebar-collapsed .chat-header{padding-left:122px}
 .message-list{min-width:0;min-height:0;height:100%;overflow:hidden}
 .message-list>div{min-width:0;min-height:0;height:100%}
+.message-list [data-testid="virtuoso-scroller"]{scrollbar-gutter:stable}
 .tool-panel{height:100%}
 .tool-content{min-width:0;min-height:0;overflow:hidden}
 .subagent-content{width:100%;height:100%;min-width:0;min-height:0;overflow:hidden}
 .subagent-content>.subagents{width:100%;height:100%;min-width:0;min-height:0}
-@media (max-width:899px){.pipiui-shell{width:100%;--sidebar-col:minmax(150px,28vw);--tools-col:minmax(190px,32vw);grid-template-columns:var(--sidebar-col) 6px minmax(0,1fr) 6px var(--tools-col)}.brand{padding-top:12px}.message{padding-inline:14px}.composer{margin-inline:10px}.composer-options{flex-wrap:wrap}.composer-stats{margin-left:auto;justify-content:flex-end}}
+@media (max-width:899px){.pipiui-shell{width:100%;--sidebar-col:minmax(150px,28vw);--tools-col:minmax(190px,32vw);grid-template-columns:var(--sidebar-col) 6px minmax(0,1fr) 6px var(--tools-col)}.brand{padding-top:12px}.message{padding-inline:14px}.composer{width:calc(100% - 20px)}.composer-options{flex-wrap:wrap}.composer-stats{margin-left:auto;justify-content:flex-end}}
 /* Narrow viewport (Swift sidebarCollapseWidth 720): App auto-collapses both panes;
    manually re-expanded panes become fixed overlays so the chat column keeps the
    full width and nothing overflows horizontally. */
-@media (max-width:720px){.pipiui-shell{grid-template-columns:0 minmax(0,1fr) 0}.pipiui-shell .sb-root,.pipiui-shell .tool-panel{position:fixed;top:calc(var(--titlebar-pad) + 50px);bottom:0;z-index:30;width:min(86vw,340px);height:auto;box-shadow:0 10px 40px rgb(0 0 0/30%)}.pipiui-shell .sb-root{left:0}.pipiui-shell .tool-panel{right:0;border-left:1px solid var(--border)}.pipiui-shell.sidebar-collapsed .sb-root,.pipiui-shell.tools-collapsed .tool-panel{display:none}.pipiui-shell .resize-handle{visibility:hidden}.tool-quick-rail{z-index:35}.pipiui-shell:not(.tools-collapsed) .tool-quick-rail{right:min(86vw,340px)}}
+@media (max-width:720px){.pipiui-shell{grid-template-columns:0 minmax(0,1fr) 0}.pipiui-shell .sb-root,.pipiui-shell .tool-panel{position:fixed;top:0;bottom:0;z-index:30;width:min(86vw,340px);height:auto;box-shadow:0 10px 40px rgb(0 0 0/30%)}.pipiui-shell .sb-root{left:0}.pipiui-shell .tool-panel{right:0;border-left:1px solid var(--border)}.pipiui-shell.sidebar-collapsed .sb-root,.pipiui-shell.tools-collapsed .tool-panel{display:none}.pipiui-shell .resize-handle{visibility:hidden}.tool-quick-rail{z-index:35}.pipiui-shell:not(.tools-collapsed) .tool-quick-rail{right:min(86vw,340px)}}
 .project-menu-wrap{position:relative;display:none}.project-row:hover .project-menu-wrap,.project-menu-wrap:focus-within{display:block}.project-menu-button{width:22px;height:24px;border-radius:5px;color:var(--muted);font-size:17px}.project-menu-button:hover{background:var(--surface-hover);color:var(--text)}.project-menu{position:absolute;z-index:10;top:26px;right:0;width:184px;padding:4px;border:1px solid var(--border);border-radius:8px;background:var(--surface-raised);box-shadow:0 10px 25px rgb(0 0 0 / 18%)}.project-menu button,.project-menu-count{display:block;width:100%;padding:6px 8px;text-align:left;border-radius:5px;font-size:11px}.project-menu button:hover{background:var(--surface-hover)}.project-menu button:disabled,.project-menu-count{color:var(--subtle);cursor:default}.project-menu .danger{color:var(--danger)}.sb-menu-item:disabled{cursor:not-allowed;opacity:.55;color:var(--subtle)}.sb-menu-item:disabled:hover{background:transparent}.transcript-area{position:relative;min-width:0;min-height:0;overflow:hidden}.return-latest{position:absolute;z-index:4;right:22px;bottom:18px;padding:6px 10px;border:1px solid var(--border);border-radius:16px;color:var(--text);background:var(--surface-raised);box-shadow:0 3px 10px rgb(0 0 0 / 16%);font-size:11px}
 
 /* Right tool workspace is content-only; the tool switcher floats over the chat
    column as a Swift-style quick rail (panelQuickRail parity). */
 .tool-panel{display:flex;flex-direction:column;min-width:0;min-height:0}
-.tool-quick-rail{position:fixed;top:calc(var(--titlebar-pad) + 60px);right:calc(var(--tools-col) + 16px);z-index:35;display:flex;min-width:0;flex-direction:column;align-items:center;gap:2px;padding:4px 3px;border:1px solid color-mix(in srgb,var(--border) 58%,transparent);border-radius:10px;background:color-mix(in srgb,var(--surface-raised) 92%,transparent);box-shadow:0 3px 12px rgb(0 0 0/14%);pointer-events:auto;-webkit-app-region:no-drag}
+.tool-quick-rail{position:fixed;top:60px;right:calc(var(--tools-col) + 16px);z-index:35;display:flex;min-width:0;flex-direction:column;align-items:center;gap:2px;padding:4px 3px;border:1px solid color-mix(in srgb,var(--border) 58%,transparent);border-radius:10px;background:color-mix(in srgb,var(--surface-raised) 92%,transparent);box-shadow:0 3px 12px rgb(0 0 0/14%);pointer-events:auto;-webkit-app-region:no-drag}
 .tool-rail-button{position:relative;display:grid;width:30px;height:30px;min-height:30px;flex:0 0 30px;place-items:center;padding:0;border-radius:7px;color:var(--muted);font-size:13px}.tool-rail-button:hover{background:var(--surface-hover);color:var(--text)}.tool-rail-button:disabled{cursor:not-allowed;opacity:.42}.tool-rail-button:disabled:hover{background:transparent;color:var(--muted)}.tool-rail-button.active{color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
 /* Swift panelQuickRail parity: 13pt SF Symbol rendered via CSS mask (currentColor). */
-.tool-rail-icon{display:block;height:13px;background:currentColor;-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-size:contain;mask-size:contain;-webkit-mask-position:center;mask-position:center}.tool-rail-running{position:absolute;top:5px;right:5px;width:6px;height:6px;border:1px solid var(--surface);border-radius:50%;background:var(--success);box-shadow:0 0 0 1px color-mix(in srgb,var(--success) 22%,transparent)}
+.tool-rail-icon{display:block;height:13px;background:currentColor;-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-size:contain;mask-size:contain;-webkit-mask-position:center;mask-position:center}.tool-rail-running{position:absolute;top:1px;right:1px;display:grid;min-width:15px;height:15px;padding:0 3px;place-items:center;border:1px solid var(--surface);border-radius:999px;background:var(--success);box-shadow:0 0 0 1px color-mix(in srgb,var(--success) 22%,transparent);color:#fff;font-size:9px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
 .tool-panel .tool-content{flex:1;display:block;min-width:0;min-height:0;overflow:hidden;padding:0}.tool-page{display:grid;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;place-items:stretch}.tool-page[hidden]{display:none!important}.tool-page.subagent-content,.tool-page.document-content{display:flex;padding:0}.tool-page>.empty-panel{align-self:center;justify-self:center}.browser-placeholder b{color:var(--text-strong)}
 
 
@@ -147,7 +155,7 @@ body{overscroll-behavior:none}
 /* Streamdown 2.5.0 code copy button: hover-reveal only. Identity lives in data-streamdown attributes, not classes — the button's className is tailwind-only (dist/chunk-BO2N2NFS.js: div[data-streamdown="code-block"] > … > button[data-streamdown="code-block-copy-button"][title="Copy Code"]). A button[title="Copy Code"] fallback (translations.copyCode) guards against the data attribute changing in future versions. Opacity only, so the button stays clickable once revealed. Verified in a real browser (dev server): idle opacity 0, container hover → 1, click works, unhover → 0. */
 .markdown [data-streamdown="code-block-copy-button"],.markdown [data-streamdown="code-block"] button[title="Copy Code"]{opacity:0;transition:opacity .15s ease}.markdown [data-streamdown="code-block"]:hover [data-streamdown="code-block-copy-button"],.markdown [data-streamdown="code-block"]:hover button[title="Copy Code"],.markdown [data-streamdown="code-block-copy-button"]:focus-visible,.markdown [data-streamdown="code-block"] button[title="Copy Code"]:focus-visible{opacity:1}
 /* System-message fallback: rounded card with a softened (non-mono) read. */
-.system-message{margin:12px auto;max-width:900px;padding:10px 14px;border:1px solid var(--border);border-radius:9px;color:var(--muted);background:var(--surface-raised);font:13px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:.01em}
+.system-message{margin:12px auto;max-width:var(--chat-content-max);padding:10px 14px;border:1px solid var(--border);border-radius:9px;color:var(--muted);background:var(--surface-raised);font:13px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:.01em}
 
 /* ── Overlay scrollbars (Swift OverlayScrollers parity) ──────────────
    Thin and subtle by default (always faintly visible so the scrollbar
@@ -165,17 +173,137 @@ body{overscroll-behavior:none}
 .pipiui-scrolling::-webkit-scrollbar-thumb{background:rgb(128 128 128/.45)}
 .pipiui-scrolling::-webkit-scrollbar-thumb:hover{background:rgb(128 128 128/.60)}
 
-/* macOS hiddenInset chrome (VS Code / Notion style): the app owns the
-   titlebar band. Detected via UA in App.tsx (Electron only); plain-browser
-   server mode keeps zero padding. The band shows the session title like a
-   native macOS window and is the primary window-drag zone. */
-.pipiui-shell{position:relative;--titlebar-pad:0px;padding-top:var(--titlebar-pad)}
-.pipiui-shell.titlebar-pad{--titlebar-pad:38px}
-.titlebar-drag{position:absolute;top:0;left:0;right:0;z-index:6;height:var(--titlebar-pad);border-bottom:1px solid var(--border);background:var(--surface);-webkit-app-region:drag;user-select:none}
-/* The session header doubles as a drag zone; interactive controls stay clickable. */
-.titlebar-pad .chat-header{-webkit-app-region:drag}
-.titlebar-pad .chat-header button,.titlebar-pad .chat-header input,.titlebar-pad .chat-header select{-webkit-app-region:no-drag}
+/* macOS hiddenInset chrome: traffic lights share the left pane's top row
+   instead of consuming a full-width blank strip. All three pane headers are
+   draggable; controls opt back out so they remain clickable. */
+.pipiui-shell{position:relative}
+.electron-chrome .sb-topbar,.electron-chrome .chat-header,.electron-chrome .tool-panel-header{-webkit-app-region:drag;user-select:none}
+.electron-chrome .sb-topbar{padding-left:88px}
+.electron-chrome .sb-topbar button,.electron-chrome .chat-header button,.electron-chrome .chat-header input,.electron-chrome .chat-header select,.electron-chrome .tool-panel-header button{-webkit-app-region:no-drag}
+.electron-chrome .chat-header-title-label{-webkit-app-region:no-drag;user-select:text}
+.electron-chrome .pane-restore-sidebar{left:78px}
 /* Browser build boot state: never substitute demo data when the real Pi host is unavailable. */
 .browser-host-state { min-height: 100vh; display: grid; place-items: center; padding: 24px; color: var(--text-primary, #202124); background: var(--bg-primary, #fff); }
 .browser-host-error { position: relative; width: min(520px, 100%); padding: 24px; border: 1px solid var(--border, #d7d9df); border-radius: 14px; background: var(--panel-bg, #fff); }
 .browser-host-error > button[aria-label="关闭错误"] { position: absolute; top: 10px; right: 12px; border: 0; background: transparent; font-size: 24px; cursor: pointer; }
+
+/* One outer content track for every chat-surface row. Keep inner component
+   padding local, so cards and the composer share the exact same visual edges. */
+.message,
+.system-message,
+.queue-operation-error,
+.composer {
+  width: var(--chat-content-width);
+  max-width: var(--chat-content-max);
+  margin-left: auto;
+  margin-right: auto;
+}
+.message { padding-inline: 0; }
+.queue-operation-error { margin-bottom: 8px; }
+
+@media (max-width:899px) {
+  .pipiui-shell { --chat-content-gutter:10px; }
+  .message { padding-inline:0; }
+  .composer { width:var(--chat-content-width); }
+}
+
+/* ── 助手正文排版 ─────────────────────────────────────────────────
+   项目没有 Tailwind，streamdown 组件自带的 utility class 全是空转，标题/
+   列表/表格/引用此前一律落到浏览器 UA 默认样式（h2 1.5em + .83em 边距、
+   ol padding-left:40px）。这里给出 .markdown 的完整块级节奏，所有块间距
+   统一走 --md-block，改一处即可整体调松紧。 */
+.pipiui-shell { --md-fs:15.5px; --md-lh:1.78; --md-block:1.05em; }
+
+.markdown {
+  font-size: var(--md-fs);
+  line-height: var(--md-lh);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", sans-serif;
+  /* 旧值是 anywhere，对整段正文放开任意断点，中英混排右缘会碎成锯齿。
+     break-word 只在单词真的塞不下时才断；anywhere 收缩到行内 code 上。 */
+  overflow-wrap: break-word;
+  word-break: normal;
+  line-break: strict;            /* 避头尾：。」）不落行首 */
+  text-wrap: pretty;             /* 消除段尾孤字 */
+  /* Electron 43 = Chromium 14x，两条 CJK 排版特性都可直接用 */
+  text-autospace: normal;        /* 中英/中数之间自动 1/8 空隙（Chromium 137+） */
+  text-spacing-trim: trim-start; /* 行首全角标点收边（Chromium 123+） */
+}
+.markdown > * { margin: 0 0 var(--md-block); }
+.markdown > :first-child { margin-top: 0; }
+.markdown > :last-child { margin-bottom: 0; }
+
+.markdown h1, .markdown h2, .markdown h3, .markdown h4 {
+  margin: 1.85em 0 .65em;
+  line-height: 1.35;
+  font-weight: 650;
+  color: var(--text-strong);
+  letter-spacing: -.01em;
+  text-wrap: balance;
+}
+.markdown h1 { font-size: 1.38em; }
+.markdown h2 { font-size: 1.2em; padding-bottom: .4em; border-bottom: 1px solid var(--border); }
+.markdown h3 { font-size: 1.07em; }
+.markdown h4 { font-size: 1em; color: var(--text); }
+
+.markdown ul, .markdown ol { margin: 0 0 var(--md-block); padding-left: 1.45em; }
+.markdown li { margin: .32em 0; }
+.markdown li > p { margin: 0 0 .4em; }
+.markdown li > ul, .markdown li > ol { margin: .32em 0 0; }
+.markdown li::marker { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* 行内 code 减重：技术长文里几乎每隔几个字一个芯片，旧的 surface-hover 底
+   + 13.5px 死字号会让整段看着像马赛克。跟随正文字号、底色压到 6%。 */
+.markdown :not(pre) > code {
+  padding: .1em .34em;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text-strong);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .86em;
+  font-variant-ligatures: none;
+  overflow-wrap: anywhere;
+}
+/* 代码块横向滚动而非折行，保住缩进层级；工具输入/输出的 .tool-card pre
+   仍然是 pre-wrap，那里是日志不是代码。 */
+.markdown pre {
+  overflow-x: auto;
+  padding: 14px !important;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg) !important;
+  white-space: pre;
+  font-size: .86em;   /* 跟随 --md-fs，文档面板变窄时一起缩 */
+  line-height: 1.55;
+}
+
+.markdown strong { font-weight: 650; color: var(--text-strong); }
+.markdown a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.markdown a:hover { text-decoration-color: var(--accent); }
+.markdown blockquote {
+  margin: 0 0 var(--md-block);
+  padding: .1em 0 .1em 1em;
+  border-left: 2px solid var(--border-strong);
+  color: var(--muted);
+}
+.markdown blockquote > :last-child { margin-bottom: 0; }
+.markdown table {
+  display: block;
+  overflow-x: auto;
+  width: 100%;
+  margin: 0 0 var(--md-block);
+  border-collapse: collapse;
+  font-size: .92em;
+}
+.markdown th, .markdown td {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.markdown th { background: var(--surface); color: var(--text-strong); font-weight: 600; white-space: nowrap; }
+.markdown hr { margin: 1.9em 0; border: 0; border-top: 1px solid var(--border); }

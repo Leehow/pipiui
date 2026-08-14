@@ -10,9 +10,10 @@ const command = process.argv[2];
 const secret = process.env.XAI_API_KEY;
 if (command === "list-models") console.log(JSON.stringify({ok:true,models:[
   {provider:"openai-codex",id:"gpt-5.4",reasoning:true},
-  ...(secret ? [{provider:"xai",id:"grok-4.5",reasoning:true}] : [])
+  ...(secret ? [{provider:"xai",id:"grok-4.5",reasoning:true,thinkingLevelMap:{off:null,minimal:"minimal",low:"low",medium:"medium",high:"high",xhigh:"xhigh",max:null},compat:{supportsReasoningEffort:true}}] : [])
 ]}));
 else if (command === "list-providers") console.log(JSON.stringify({ok:true,providers:[{id:"xai",name:"xAI",auth:{apiKey:{}}}]}));
+else if (command === "profile-env") console.log(JSON.stringify({ok:true,agentDir:process.env.PI_CODING_AGENT_DIR,sessionsRoot:process.env.PI_CODING_AGENT_SESSION_DIR}));
 else if (command === "logout") console.log(JSON.stringify({ok:true}));
 else if (command === "login-json") { console.log(JSON.stringify({event:"prompt",prompt:{type:"secret",message:"API key"}})); process.stdin.once("data", data => { const answer=JSON.parse(String(data)).answer; console.log(JSON.stringify({ok:true,result:{accepted:answer.length}})); }); }
 else process.exit(2);
@@ -32,6 +33,10 @@ describe("external Pi model runtime", () => {
     const runtime = new ExternalAuthRuntime({ helperPath, agentDir, piPath: "/opt/homebrew/bin/pi", nodePath: process.execPath, env: { HOME: root, PATH: "/usr/bin:/bin" } });
     const models = await runtime.getAvailable();
     expect(models.map(model => `${model.provider}/${model.id}`)).toEqual(["openai-codex/gpt-5.4", "xai/grok-4.5"]);
+    expect(models[1]).toMatchObject({
+      thinkingLevelMap: { off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: null },
+      compat: { supportsReasoningEffort: true },
+    });
     expect(JSON.stringify(models)).not.toContain("do-not-expose");
   });
 
@@ -47,6 +52,27 @@ describe("external Pi model runtime", () => {
     await writeFile(helperPath, "throw new Error('node:sqlite unavailable')\n");
     const failed = createPiHostBackend({ agentDir, authHelperPath: helperPath, piCommand, env: { HOME: root } });
     await expect(failed.handle("listModels", [])).rejects.toThrow("Pi 模型目录不可用");
+  });
+
+  it("forces auth helpers onto the isolated profile despite conflicting parent and .env values", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-external-profile-env-"));
+    const agentDir = join(root, "agent");
+    const sessionsRoot = join(root, "sessions");
+    const helperPath = join(root, "helper.mjs");
+    await mkdir(agentDir);
+    await writeFile(join(agentDir, ".env"), "PI_CODING_AGENT_DIR=/global-dotenv\nPI_CODING_AGENT_SESSION_DIR=/global-dotenv/sessions\n");
+    await writeFile(helperPath, fixture);
+    const runtime = new ExternalAuthRuntime({
+      helperPath,
+      agentDir,
+      sessionsRoot,
+      enforceProfile: true,
+      piPath: "/opt/homebrew/bin/pi",
+      nodePath: process.execPath,
+      env: { HOME: root, PI_CODING_AGENT_DIR: "/global-parent", PI_CODING_AGENT_SESSION_DIR: "/global-parent/sessions" },
+    });
+    const actual = await (runtime as any).command("profile-env");
+    expect(actual).toMatchObject({ agentDir, sessionsRoot });
   });
 
   it("preserves interactive login while keeping the API key off argv and result events", async () => {

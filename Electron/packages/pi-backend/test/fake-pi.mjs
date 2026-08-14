@@ -28,6 +28,12 @@ function emitTurn(message, images) {
   send({ type: "message_update", assistantMessageEvent: { type: "toolcall_delta", contentIndex: 1, delta: "{\"command\":\"ls -la\"}" } });
   send({ type: "message_update", assistantMessageEvent: { type: "toolcall_end", contentIndex: 1, toolCall: { id: "tool-1", name: "fake_tool" } } });
   send({ type: "tool_execution_end", toolCallId: "tool-1", result: { content: [{ type: "text", text: "ok" }] }, isError: false });
+  if (message === "__segments__") {
+    // A second assistant message restarts contentIndex at 0 — the host must tag
+    // its thinking with a fresh segment so the UI keeps the blocks apart.
+    send({ type: "message_end" });
+    send({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "reflect" } });
+  }
   if (message !== "__hold__") send({ type: "agent_settled" });
   else heldTurn = true;
 }

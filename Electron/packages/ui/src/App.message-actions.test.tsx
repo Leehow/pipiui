@@ -13,6 +13,7 @@ vi.mock('@xterm/xterm', () => ({ Terminal: class { open = vi.fn(); write = vi.fn
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit = vi.fn(); dispose = vi.fn() } }))
 
 import { App, createMockHost } from './App'
+import { MessageView } from './Transcript'
 
 let originalClipboard: PropertyDescriptor | undefined
 beforeEach(() => {
@@ -41,13 +42,27 @@ function hostWithHistory(overrides: Partial<PipiHostAPI> = {}) {
 }
 
 describe('App message actions', () => {
+  it('shows a full date and time before right-aligned message actions', () => {
+    const timestamp = new Date(2026, 7, 13, 0, 16).getTime()
+    const onCopy = vi.fn(async () => undefined)
+    const onResend = vi.fn()
+    const { container } = render(<MessageView message={{ id: 'dated', role: 'assistant', content: 'dated message', timestamp }} showFooter onCopy={onCopy} onResend={onResend} resendDisabled={false} />)
+    const footer = container.querySelector('.message-footer') as HTMLElement
+    const time = within(footer).getByText(/2026.*08.*13.*00:16/)
+    const toolbar = within(footer).getByRole('toolbar', { name: '消息操作' })
+    expect(time.compareDocumentPosition(toolbar) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(toolbar.className).toContain('trailing')
+  })
+
   it('copies the complete user source text and reports success', async () => {
     render(<App host={hostWithHistory()} />)
     await screen.findByText('完整原文 😀', { exact: false })
     const user = document.querySelector('[data-user-prompt="user-full"]') as HTMLElement
     fireEvent.click(within(user).getByRole('button', { name: '复制消息' }))
     await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledWith('完整原文 😀\n第二行'))
-    expect(screen.getByRole('status').textContent).toBe('已复制')
+    // The copied notice lives inside the user message; the transcript tail can
+    // host other role=status rows (e.g. a running-subagent indicator).
+    expect(within(user).getByRole('status').textContent).toBe('已复制')
   })
 
   it('resends only user messages via the existing send path', async () => {

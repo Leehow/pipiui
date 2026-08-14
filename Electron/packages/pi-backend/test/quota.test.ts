@@ -1,3 +1,8 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -258,6 +263,65 @@ describe("QuotaStore", () => {
     const snapshot = await store.snapshot("deepseek");
     expect(snapshot).toEqual({ provider: "deepseek", accountLabel: "账户余额", balance: { amount: 88, currency: "CNY" }, windows: [] });
     expect(snapshot?.windows).toEqual([]);
+  });
+
+  it("reads OpenCode Go costs from a temporary SQLite database only when auth.json has a key", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pipi-opencode-go-"));
+    const databasePath = join(directory, "opencode.db");
+    const now = Date.UTC(2026, 7, 13, 12);
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec("CREATE TABLE message (id TEXT PRIMARY KEY, data TEXT, time_created INTEGER); CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, data TEXT, time_created INTEGER)");
+      const message = database.prepare("INSERT INTO message (id, data, time_created) VALUES (?, ?, ?)");
+      message.run("m1", JSON.stringify({ providerID: "opencode-go", role: "assistant", cost: 8, time: { created: now - 60_000 } }), now - 60_000);
+      message.run("m2", JSON.stringify({ providerID: "opencode-go", role: "assistant", cost: 2, time: { created: now - 120_000 } }), now - 120_000);
+      message.run("m3", JSON.stringify({ providerID: "other", role: "assistant", cost: 100, time: { created: now - 60_000 } }), now - 60_000);
+      database.prepare("INSERT INTO part (id, message_id, data, time_created) VALUES (?, ?, ?, ?)")
+        .run("p1", "m1", JSON.stringify({ type: "step-finish", cost: 3, time: { created: now - 30_000 } }), now - 30_000);
+    } finally {
+      database.close();
+    }
+    try {
+      // agentDir points at the temp dir so a real ~/.pi/agent/.env (which may
+      // carry OPENCODE_API_KEY) never satisfies the credential gate.
+      const withoutKey = new QuotaStore({}, { now: () => now, agentDir: directory, openCodeDatabasePath: databasePath, readOpenCodeAuth: async () => JSON.stringify({ "opencode-go": { key: "  " } }) });
+      expect(await withoutKey.snapshot("opencode-go", true)).toBeNull();
+
+      const withKey = new QuotaStore({}, { now: () => now, agentDir: directory, openCodeDatabasePath: databasePath, readOpenCodeAuth: async () => JSON.stringify({ "opencode-go": { key: "go-key" } }) });
+      const snapshot = await withKey.snapshot("opencode-go", true);
+      expect(snapshot?.provider).toBe("opencodeGo");
+      expect(snapshot?.windows.map(window => window.usedPercent)).toEqual([expect.closeTo(5 / 12 * 100), expect.closeTo(5 / 30 * 100), expect.closeTo(5 / 60 * 100)]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("lets an injected OpenCode local reader override the default auth/database capability", async () => {
+    const now = Date.UTC(2026, 7, 13, 12);
+    const readLocalUsage = vi.fn(async () => [{ createdMs: now - 1_000, cost: 6 }]);
+    const store = new QuotaStore({ OPENCODE_API_KEY: "go-key" }, { now: () => now, readOpenCodeAuth: async () => "{}", openCodeDatabasePath: "/must/not/be/opened", readLocalUsage });
+    const snapshot = await store.snapshot("opencode-go", true);
+    expect(snapshot?.windows[0].usedPercent).toBe(50);
+    expect(readLocalUsage).toHaveBeenCalledOnce();
+  });
+
+  it("falls back to assistant message costs when the OpenCode database has no part table", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pipi-opencode-go-message-"));
+    const databasePath = join(directory, "opencode.db"), now = Date.UTC(2026, 7, 13, 12);
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec("CREATE TABLE message (id TEXT PRIMARY KEY, data TEXT, time_created INTEGER)");
+      database.prepare("INSERT INTO message (id, data, time_created) VALUES (?, ?, ?)")
+        .run("m1", JSON.stringify({ providerID: "opencode-go", role: "assistant", cost: 6, time: { created: now - 1_000 } }), now - 1_000);
+    } finally {
+      database.close();
+    }
+    try {
+      const store = new QuotaStore({}, { now: () => now, openCodeDatabasePath: databasePath, readOpenCodeAuth: async () => JSON.stringify({ "opencode-go": { key: "go-key" } }) });
+      expect((await store.snapshot("opencode-go", true))?.windows[0].usedPercent).toBe(50);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("throttles refetches until the snapshot is stale, then refreshes", async () => {

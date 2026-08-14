@@ -140,17 +140,17 @@ final class SubagentContinuityTests: XCTestCase {
         XCTAssertTrue(s.contains("// A file we cannot remove only costs disk; never fail a dispatch over housekeeping."))
     }
 
-    /// Background dispatch ends the boss's turn, so the session only moves again when something
-    /// pushes it — and every other push fires at most once per worker. If one is missed the boss
-    /// waits forever on work that is already over, so the silence itself has to be bounded.
+    /// A still-active worker can drift for a long time without going idle. Wall-clock check-ins
+    /// wake the boss at 10 / 30 / 60 minutes with last activity so it can judge that, while
+    /// stall remains the path for silence.
     func testHeartbeatBoundsHowLongTheBossCanHearNothing() throws {
         let s = try source()
-        XCTAssertTrue(s.contains("const HEARTBEAT_INTERVAL_MS = envPositiveSecs(\"PIPIUI_HEARTBEAT_SECS\", 15 * 60) * 1000;"))
-        XCTAssertTrue(s.contains("if (runningAgents.size === 0) {"),
-                      "an idle session must stay silent; a heartbeat costs the boss a turn")
+        XCTAssertTrue(s.contains("const CHECKIN_FIRST_MS = envPositiveSecs(\"PIPIUI_HEARTBEAT_SECS\", 10 * 60) * 1000;"))
+        XCTAssertTrue(s.contains("function nextCheckinAt(startedAt: number, delivered: number): number"))
         XCTAssertTrue(s.contains("[subagent-heartbeat] outstanding="))
-        XCTAssertTrue(s.contains("stalled=${stalled}"),
-                      "heartbeat headers must expose the number of stalled workers")
+        XCTAssertTrue(s.contains("wall-clock check-in while the worker is still producing output"))
+        XCTAssertTrue(s.contains("last=${lastLine}"),
+                      "a check-in must carry the latest activity so the boss can judge drift")
         XCTAssertTrue(s.contains("state=${state}"),
                       "each heartbeat worker summary must expose an explicit state tag")
         XCTAssertTrue(s.contains("finalizing: boolean;"),
@@ -612,8 +612,8 @@ final class SubagentContinuityTests: XCTestCase {
 
         // How to read a heartbeat travels with the heartbeat, not in every turn's prefix.
         let s = try source()
-        XCTAssertTrue(s.contains("Silence is not progress"))
-        XCTAssertTrue(s.contains("still thinking, died without reporting, or its report was lost"))
+        XCTAssertTrue(s.contains("wall-clock check-in while the worker is still producing output"))
+        XCTAssertTrue(s.contains("Compare each worker's last activity to its assigned task"))
         XCTAssertTrue(s.contains("Do not re-dispatch a worker that is still running"))
     }
 }

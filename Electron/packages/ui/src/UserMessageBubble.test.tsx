@@ -46,4 +46,24 @@ describe('UserMessageBubble', () => {
     expect(container.querySelector('.user-message-content')?.textContent).toBe('短消息\n第二行')
     expect(screen.queryByRole('button', { name: /展开|收起/ })).toBeNull()
   })
+
+  it('renders an image and strips the count placeholder when images are shown', () => {
+    const { container } = render(<UserMessageBubble text="看图 [1张图片]" images={[{ data: 'abc', mimeType: 'image/png' }]} />)
+    const img = container.querySelector('img.user-bubble-image')
+    expect(img).toBeTruthy()
+    expect(img?.getAttribute('src')).toBe('data:image/png;base64,abc')
+    expect(container.querySelector('.user-message-content')?.textContent).toBe('看图')
+    expect(container.textContent).not.toContain('[1张图片]')
+    expect(container.textContent).not.toContain('[1 张图片]')
+    expect(screen.queryByRole('button', { name: /展开|收起/ })).toBeNull()
+  })
+
+  it('keeps collapse behavior for long text even when one image is attached', () => {
+    const text = `one\ntwo\nthree\nfour\nfive\nsix UNIQUE_FULL_TEXT_MARKER`
+    const { container } = render(<UserMessageBubble text={text} images={[{ data: 'abc', mimeType: 'image/jpeg' }]} />)
+    expect(container.querySelector('img.user-bubble-image')?.getAttribute('src')).toBe('data:image/jpeg;base64,abc')
+    expect(screen.getByRole('button', { name: '展开' })).toBeTruthy()
+    expect(container.querySelector('.user-message-content')?.textContent).toBe('one\ntwo\nthree\nfour\nfive')
+    expect(screen.queryByText(/UNIQUE_FULL_TEXT_MARKER/)).toBeNull()
+  })
 })

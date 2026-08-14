@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent, AgentSummary, HostEvent } from "@pipi/host-api";
@@ -120,6 +120,7 @@ describe("subagent lifecycle → AgentSummary", () => {
     expect(latest().finalResult).toBeUndefined();
     // A payload without `model` must not erase the resolved one.
     expect(latest().model).toBe("deepseek/deepseek-v4-flash");
+    expect(latest()).toMatchObject({ provider: "deepseek", inputTokens: 12_400, outputTokens: 2_130, cacheTokens: 8_900, contextTokens: 153_000, turns: 3, cost: 0.44 });
 
     deliver(END);
     expect(latest()).toMatchObject({ state: "ok", finalResult: "最终结果全文", cost: 0.55, turns: 4 });
@@ -133,6 +134,27 @@ describe("subagent lifecycle → AgentSummary", () => {
     deliver(START);
     const worktree = events.filter((event): event is Extract<AgentEvent, { type: "worktree" }> => event.type === "worktree");
     expect(worktree.at(-1)?.status).toMatchObject({ agentId: "a1", path: "/tmp/wt", branch: "pipiui/worker-a1", lifecycle: "active" });
+  });
+
+  it("preserves the dispatching toolCallId so the transcript card can join agents", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    expect(latest().toolCallId).toBe("tc1");
+    // A later preview must not erase the link, and the terminal event keeps it
+    // so a finished boss turn can still group workers under its tool_call.
+    deliver(UPDATE);
+    deliver(END);
+    expect(latest().toolCallId).toBe("tc1");
+    // Newer events without a toolCallId (e.g. child agents) fall back to the
+    // known one rather than dropping it.
+    deliver({ ...UPDATE, parentId: "a1", toolCallId: undefined });
+    expect(latest().toolCallId).toBe("tc1");
+
+    // Agent ids may be reused for a later planning run. A fresh run has no
+    // relationship to the old tool_call unless its own START reports one.
+    deliver({ ...START, runId: "r2", toolCallId: undefined });
+    expect(latest()).toMatchObject({ runId: "r2", state: "running" });
+    expect(latest().toolCallId).toBeUndefined();
   });
 
   it("does not display a private Operator blocked verdict as successful just because Pi exited zero", async () => {
@@ -183,6 +205,30 @@ describe("subagent lifecycle → AgentSummary", () => {
     ]);
   });
 
+  it("qualifies cached and live logs by the exact session, agent, and run", async () => {
+    const { backend, events } = await harness();
+    const deliverFor = (sessionId: string, payload: Record<string, unknown>) =>
+      (backend as unknown as { mapAgentEvent(raw: unknown, sessionId?: string): void }).mapAgentEvent(payload, sessionId);
+
+    deliverFor("session-1", { ...START, agentId: "shared", runId: "run-1" });
+    deliverFor("session-1", { kind: "log_delta", agentId: "shared", runId: "run-1", contentIndex: 0, itemType: "text", text: "session one" });
+    deliverFor("session-2", { ...START, agentId: "shared", runId: "run-2" });
+    deliverFor("session-2", { kind: "log_delta", agentId: "shared", runId: "run-2", contentIndex: 0, itemType: "text", text: "session two" });
+    deliverFor("session-1", { ...START, agentId: "shared", runId: "run-3" });
+    deliverFor("session-1", { kind: "log_delta", agentId: "shared", runId: "run-3", contentIndex: 0, itemType: "text", text: "new run" });
+
+    const logs = events.filter((event): event is Extract<AgentEvent, { type: "agent_log" }> => event.type === "agent_log");
+    expect(logs.map(log => [log.sessionId, log.agentId, log.runId, log.contentIndex, log.text])).toEqual([
+      ["session-1", "shared", "run-1", 0, "session one"],
+      ["session-2", "shared", "run-2", 0, "session two"],
+      ["session-1", "shared", "run-3", 0, "new run"],
+    ]);
+    await expect(backend.handle("getAgentLogs", ["shared", "session-1", "run-1"])).resolves.toMatchObject([{ contentIndex: 0, text: "session one" }]);
+    await expect(backend.handle("getAgentLogs", ["shared", "session-2", "run-2"])).resolves.toMatchObject([{ contentIndex: 0, text: "session two" }]);
+    await expect(backend.handle("getAgentLogs", ["shared", "session-1", "run-3"])).resolves.toMatchObject([{ contentIndex: 0, text: "new run" }]);
+    await expect(backend.handle("getAgentLogs", ["shared", "session-2", "run-1"])).resolves.toEqual([]);
+  });
+
   it("marks a failed run failed rather than leaving it running forever", async () => {
     const { deliver, latest } = await harness();
     deliver(START);
@@ -191,10 +237,13 @@ describe("subagent lifecycle → AgentSummary", () => {
   });
 
   it("clears terminal fields when a Computer Leader reuses its agentId for a new planning run", async () => {
-    const { deliver, latest } = await harness();
+    const { backend, deliver, latest } = await harness();
     deliver({ ...START, agentId: "leader", runId: "plan-1", name: "computer-use-leader" });
+    deliver({ ...USAGE, agentId: "leader", runId: "plan-1" });
+    deliver({ ...UPDATE, agentId: "leader", runId: "plan-1" });
     deliver({ ...END, agentId: "leader", runId: "plan-1", output: "old plan" });
-    expect(latest()).toMatchObject({ state: "ok", finalResult: "old plan" });
+    await backend.handle("resolveAgent", ["leader"]);
+    expect(latest()).toMatchObject({ state: "ok", finalResult: "old plan", handled: true, model: "deepseek/deepseek-v4-flash", provider: "deepseek", cost: 0.55, turns: 4, outputCount: 1, inputTokens: 12_400, outputTokens: 2_130, cacheTokens: 8_900, contextTokens: 153_000, listSubtitle: "bash cd Electron && npm run build" });
     expect(latest().endedAt).toBeGreaterThan(0);
     deliver({
       ...START,
@@ -207,6 +256,53 @@ describe("subagent lifecycle → AgentSummary", () => {
     expect(latest()).toMatchObject({ state: "running", runId: "replan-2" });
     expect(latest().endedAt).toBeUndefined();
     expect(latest().finalResult).toBeUndefined();
+    expect(latest().handled).toBeUndefined();
+    expect(latest().model).toBeUndefined();
+    expect(latest().provider).toBeUndefined();
+    expect(latest().cost).toBeUndefined();
+    expect(latest().turns).toBeUndefined();
+    expect(latest().outputCount).toBeUndefined();
+    expect(latest().inputTokens).toBeUndefined();
+    expect(latest().outputTokens).toBeUndefined();
+    expect(latest().cacheTokens).toBeUndefined();
+    expect(latest().contextTokens).toBeUndefined();
+    expect(latest().listSubtitle).toBeUndefined();
+  });
+
+  it("persists restart normalization once and preserves an existing endedAt", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-agent-events-restart-"));
+    const agentDir = join(root, "agent");
+    const indexPath = join(agentDir, "pipiui-agent-index.json");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(indexPath, JSON.stringify({
+      version: 1,
+      agents: [
+        { agentId: "running", runId: "run-1", name: "explore", task: "running before restart", state: "running", sessionId: "session-1", createdAt: 1, endedAt: 777 },
+        { agentId: "stalled", runId: "run-2", name: "reviewer", task: "stalled before restart", state: "stalled", sessionId: "session-1", createdAt: 2 },
+      ],
+      worktrees: [],
+    }, null, 2) + "\n");
+
+    const first = createPiHostBackend({ agentDir, sessionsRoot: join(root, "sessions") });
+    backends.push(first);
+    const firstRows = await first.handle("listAgents", ["session-1"]) as AgentSummary[];
+    expect(firstRows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: "running", state: "interrupted", endedAt: 777 }),
+      expect.objectContaining({ agentId: "stalled", state: "interrupted", endedAt: expect.any(Number) }),
+    ]));
+    await closeTracked(first);
+
+    const persistedOnce = await readFile(indexPath, "utf8");
+    expect(JSON.parse(persistedOnce).agents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: "running", state: "interrupted", endedAt: 777 }),
+      expect.objectContaining({ agentId: "stalled", state: "interrupted", endedAt: expect.any(Number) }),
+    ]));
+
+    const second = createPiHostBackend({ agentDir, sessionsRoot: join(root, "sessions") });
+    backends.push(second);
+    await expect(second.handle("listAgents", ["session-1"])).resolves.toEqual(firstRows);
+    await closeTracked(second);
+    expect(await readFile(indexPath, "utf8")).toBe(persistedOnce);
   });
 
   it("rehydrates the session-scoped tree after restart without faking a running process", async () => {
@@ -225,6 +321,7 @@ describe("subagent lifecycle → AgentSummary", () => {
     await expect(restarted.handle("listAgents", ["session-1"])).resolves.toMatchObject([{
       agentId: "a1",
       runId: "r1",
+      toolCallId: "tc1",
       state: "interrupted",
       task: "接入真实左侧栏",
       title: "接入真实左侧栏",

@@ -47,10 +47,31 @@ describe('SubagentModelModal', () => {
     })} onClose={() => undefined} />)
     await screen.findByTestId('subagent-agent-operator')
     fireEvent.click(screen.getByRole('button', { name: 'operator 0 模型' }))
+    expect(screen.getByTestId('subagent-model-option-operator-0-xai-grok-4.5').textContent).toContain('xai/grok-4.5')
+    expect(screen.getByTestId('subagent-model-option-operator-0-github-copilot-grok-4.5').textContent).toContain('github-copilot/grok-4.5')
     fireEvent.click(screen.getByTestId('subagent-model-option-operator-0-xai-grok-4.5'))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'operator 0 模型' }).textContent).toContain('xai/grok-4.5'))
     await waitFor(async () => expect(await host.getSubagentModels?.()).toMatchObject({
-      operator: [{ model: 'xai/grok-4.5', thinking: 'off' }],
+      operator: [{ model: 'xai/grok-4.5' }],
     }))
+  })
+
+  it('does not present an ambiguous historical bare id as either provider', async () => {
+    const xaiGrok: Model = { provider: 'xai', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
+    const copilotGrok: Model = { provider: 'github-copilot', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
+    const host = createMockHost()
+    await host.setSubagentModel?.('explore', [{ model: 'grok-4.5', thinking: 'high' }])
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility({
+      models: [xaiGrok, copilotGrok], visibleModels: [xaiGrok, copilotGrok], quickModels: [xaiGrok, copilotGrok],
+      quickProviders: ['xai', 'github-copilot'], hiddenIds: new Set(),
+    })} onClose={() => undefined} />)
+
+    const explore = await screen.findByTestId('subagent-agent-explore')
+    expect(within(explore).getByRole('button', { name: 'explore 0 模型' }).textContent).toContain('需重新选择 provider（grok-4.5）')
+    expect(within(explore).getByRole('alert').textContent).toContain('重新选择完整 provider/model')
+    fireEvent.click(within(explore).getByRole('button', { name: 'explore 0 模型' }))
+    expect(screen.getByTestId('subagent-model-option-explore-0-xai-grok-4.5').getAttribute('aria-selected')).toBe('false')
+    expect(screen.getByTestId('subagent-model-option-explore-0-github-copilot-grok-4.5').getAttribute('aria-selected')).toBe('false')
   })
 
   it('shows a non-binding visual-model hint only for screenshot-reading roles without changing defaults', async () => {
@@ -77,11 +98,24 @@ describe('SubagentModelModal', () => {
     await screen.findByTestId('subagent-agent-explore')
     expect(screen.queryByText('正在加载 Subagent 模型设置…')).toBeNull()
 	expect(screen.getAllByTestId(/^subagent-agent-/)).toHaveLength(10)
-	expect(screen.getByRole('heading', { name: 'Computer Use Agent' })).toBeTruthy()
+	expect(screen.getByRole('heading', { name: 'Computer Use Agents' })).toBeTruthy()
 	expect(screen.getByTestId('subagent-agent-computer-use-leader')).toBeTruthy()
 	expect(screen.getByTestId('subagent-agent-operator')).toBeTruthy()
 	expect(screen.getByTestId('subagent-agent-computer-verifier')).toBeTruthy()
 	expect(screen.getByTestId('subagent-agent-computer-terminal')).toBeTruthy()
+	const generalHeading = screen.getByRole('heading', { name: '通用 Subagents' })
+	const computerHeading = screen.getByRole('heading', { name: 'Computer Use Agents' })
+	expect(generalHeading.compareDocumentPosition(computerHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+	const computerHierarchy = screen.getByTestId('computer-use-model-hierarchy')
+	const leader = within(computerHierarchy).getByTestId('subagent-agent-computer-use-leader')
+	const workers = within(computerHierarchy).getByRole('group', { name: 'Computer Use Leader 的子 Agent' })
+	expect(leader.className).toContain('subagent-agent-leader')
+	expect(within(leader).getByText('主管')).toBeTruthy()
+	for (const role of ['operator', 'computer-verifier', 'computer-terminal']) {
+	  const worker = within(workers).getByTestId(`subagent-agent-${role}`)
+	  expect(worker.className).toContain('subagent-agent-worker')
+	  expect(within(worker).getByText('子 Agent')).toBeTruthy()
+	}
 
 	fireEvent.click(screen.getByRole('button', { name: 'computer-use-leader 0 模型' }))
 	fireEvent.click(screen.getByTestId('subagent-model-option-computer-use-leader-0-openai-gpt-5'))
@@ -111,11 +145,11 @@ describe('SubagentModelModal', () => {
 
     await waitFor(async () => {
       expect(await host.getSubagentModels?.()).toMatchObject({
-		'computer-use-leader': [{ model: 'openai/gpt-5', thinking: 'off' }],
-		'computer-verifier': [{ model: 'anthropic/claude-sonnet-4', thinking: 'off' }],
-		'computer-terminal': [{ model: 'openai/gpt-5', thinking: 'off' }],
+		'computer-use-leader': [{ model: 'openai/gpt-5' }],
+		'computer-verifier': [{ model: 'anthropic/claude-sonnet-4' }],
+		'computer-terminal': [{ model: 'openai/gpt-5' }],
         explore: [{ model: 'openai/gpt-5', thinking: 'high' }],
-        plan: [{ model: 'anthropic/claude-sonnet-4', thinking: 'off' }, { model: 'openai/gpt-5', thinking: 'off' }]
+        plan: [{ model: 'anthropic/claude-sonnet-4' }, { model: 'openai/gpt-5' }]
       })
     })
 
@@ -151,5 +185,65 @@ describe('SubagentModelModal', () => {
     render(<SubagentModelModal host={host} current={null} visibility={visibility({ error: 'disk read failed' })} onClose={() => undefined} />)
     expect((await screen.findByRole('alert')).textContent).toContain('disk read failed')
     expect(screen.queryByTestId('subagent-agent-explore')).toBeNull()
+  })
+
+  it('derives mapped choices and preserves only compatible overrides across explicit model changes', async () => {
+    const mapped = {
+      provider: 'mapped', id: 'mapped-reasoner', name: 'Mapped Reasoner', reasoning: true,
+      thinkingConfigurable: true,
+      thinkingLevelMap: { off: null, minimal: null, low: 'low', medium: 'medium', high: 'high', xhigh: null, max: null }
+    } as Model
+    const compatible = {
+      provider: 'mapped', id: 'compatible-reasoner', name: 'Compatible Reasoner', reasoning: true,
+      thinkingConfigurable: true,
+      thinkingLevelMap: { off: null, minimal: null, low: 'low', medium: 'medium', high: 'high', xhigh: null, max: null }
+    } as Model
+    const lowOnly = {
+      provider: 'mapped', id: 'low-only-reasoner', name: 'Low Only Reasoner', reasoning: true,
+      thinkingConfigurable: true,
+      thinkingLevelMap: { off: null, minimal: null, low: 'low', medium: null, high: null, xhigh: null, max: null }
+    } as Model
+    const fixed = {
+      provider: 'fixed', id: 'fixed-reasoner', name: 'Fixed Reasoner', reasoning: true,
+      thinkingConfigurable: false
+    } as Model
+    const host = createMockHost()
+    await host.setSubagentModel?.('explore', [{ model: 'mapped/mapped-reasoner', thinking: 'high' }])
+    render(<SubagentModelModal host={host} current={mapped} visibility={visibility({
+      models: [mapped, compatible, lowOnly, fixed], visibleModels: [mapped, compatible, lowOnly, fixed], quickModels: [mapped, compatible, lowOnly, fixed],
+      quickProviders: ['mapped', 'fixed'], hiddenIds: new Set(),
+    })} onClose={() => undefined} />)
+
+    const select = await screen.findByLabelText('explore 0 思考强度') as HTMLSelectElement
+    expect([...select.options].map(option => option.value)).toEqual(['', 'low', 'medium', 'high'])
+    expect(select.options[0].textContent).toContain('模型默认')
+
+    fireEvent.click(screen.getByRole('button', { name: 'explore 0 模型' }))
+    fireEvent.click(screen.getByTestId('subagent-model-option-explore-0-mapped-compatible-reasoner'))
+    await waitFor(async () => expect(await host.getSubagentModels?.()).toMatchObject({
+      explore: [{ model: 'mapped/compatible-reasoner', thinking: 'high' }]
+    }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'explore 0 模型' }))
+    fireEvent.click(screen.getByTestId('subagent-model-option-explore-0-mapped-low-only-reasoner'))
+    await waitFor(async () => expect(await host.getSubagentModels?.()).toMatchObject({
+      explore: [{ model: 'mapped/low-only-reasoner' }]
+    }))
+    fireEvent.change(screen.getByLabelText('explore 0 思考强度'), { target: { value: 'low' } })
+    await waitFor(async () => expect(await host.getSubagentModels?.()).toMatchObject({
+      explore: [{ model: 'mapped/low-only-reasoner', thinking: 'low' }]
+    }))
+    fireEvent.change(screen.getByLabelText('explore 0 思考强度'), { target: { value: '' } })
+    await waitFor(async () => expect(await host.getSubagentModels?.()).toMatchObject({
+      explore: [{ model: 'mapped/low-only-reasoner' }]
+    }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'explore 0 模型' }))
+    fireEvent.click(screen.getByTestId('subagent-model-option-explore-0-fixed-fixed-reasoner'))
+    await waitFor(async () => expect(await host.getSubagentModels?.()).toMatchObject({
+      explore: [{ model: 'fixed/fixed-reasoner' }]
+    }))
+    expect(screen.queryByLabelText('explore 0 思考强度')).toBeNull()
+    expect(within(screen.getByTestId('subagent-agent-explore')).getByText('思考强度由模型决定')).toBeTruthy()
   })
 })

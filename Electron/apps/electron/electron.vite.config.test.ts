@@ -46,7 +46,7 @@ describe('renderer resolves @pipiui/ui from packages/ui source', () => {
   })
 
   it('selects only the office preset and publishes its offline assets below the renderer output', () => {
-    expect(fileViewerAssetOptions).toEqual({ preset: 'office', copyAssets: { baseDir: 'file-viewer' } })
+    expect(fileViewerAssetOptions).toEqual({ preset: 'office', copyAssets: { baseDir: 'file-viewer' }, chunkStrategy: 'none' })
     const target = resolveFileViewerCopyAssetsTarget('build', fileViewerAssetOptions.copyAssets, {
       projectRoot: dirname(fileURLToPath(import.meta.url)),
       outDir: 'out/renderer'

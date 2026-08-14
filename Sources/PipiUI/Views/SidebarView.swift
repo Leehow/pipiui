@@ -773,7 +773,7 @@ struct SidebarView: View {
                 SessionRow(
                     title: displayTitle(meta: meta, openKey: openKey),
                     modelRef: meta.modelRef,
-                    subtitle: interrupted ? "已中断" : idleSubtitle,
+                    subtitle: idleSubtitle,
                     status: interrupted ? .interrupted : .none,
                     engineKind: meta.engineKind,
                     hideSubtitle: isHovered,
@@ -1258,7 +1258,6 @@ private enum SessionRowStatus: Equatable {
         case .running: return "进行中"
         case .subagentsRunning(let n):
             return n > 1 ? "\(n) 个子任务" : "子任务中"
-        case .interrupted: return "已中断"
         default: return nil
         }
     }
