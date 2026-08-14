@@ -4,10 +4,12 @@
  * Spawns a separate `pi` process for each subagent invocation,
  * giving it an isolated context window.
  *
- * Supports three modes:
- *   - Single: { agent: "name", task: "..." }
- *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
- *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
+ * Public tools:
+ *   - subagent: { agent, task }
+ *   - subagent_parallel: { tasks: [{ agent, task }, ...] }
+ *   - subagent_chain: { chain: [{ agent, task }, ...] }
+ *   - subagent_abort: { agentId }
+ *   - subagent_resolve: { agentId, runId }
  *
  * Uses JSON mode to capture structured output from subagents.
  */
@@ -33,7 +35,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { bindPrepareStrictToolArguments, makeStrictJsonSchema, omitNulls } from "./strict-json-schema.ts";
+import { makeStrictJsonSchema, omitNulls, bindSanitizeStrictToolArguments } from "./strict-json-schema.ts";
 import {
 	COMPUTER_WORKER_FAILURE_CODES,
 	type ComputerPlan,
@@ -61,6 +63,7 @@ import {
 	resolveDesktopGrant,
 	DESKTOP_GRANT_CHILD_POLICY,
 	sanitizeDisabledToolNames,
+	isDelegationTool,
 } from "./desktop-tool-policy.mjs";
 import {
 	DeliveryObligationStore,
@@ -2096,7 +2099,7 @@ function resolveSubagentEpisode(
 	if (job.state === "running") {
 		return {
 			ok: false,
-			message: `Cannot resolve agentId=${agentId} runId=${runId}: job is still running. Use action:"abort" or wait for it to finish.`,
+			message: `Cannot resolve agentId=${agentId} runId=${runId}: job is still running. Use subagent_abort({agentId}) or wait for it to finish.`,
 		};
 	}
 	if (job.state === "ok") {
@@ -2355,7 +2358,7 @@ function formatInterruptedReminder(job: JobRecord, idleSec: number, nudgeSeq: nu
 	return [
 		`[subagent-interrupted-reminder] agentId=${job.agentId} runId=${job.runId} state=${job.state} title=${title} idle=${idleSec}s nudge=${nudgeSeq}/2`,
 		`This worker is ${job.state} but its stored context is intact. Re-dispatch the same agentId to continue where it left off, or pass fresh:true to abandon that context. Do not treat this message as a new user request.`,
-		`If this episode's work is already complete, mark it handled with subagent({action:"resolve", agentId:"${job.agentId}", runId:"${job.runId}"}) (or /subagent_resolve ${job.agentId} ${job.runId}) so no further reminders are sent; do not just reply "already completed".`,
+		`If this episode's work is already complete, mark it handled with subagent_resolve({agentId:"${job.agentId}", runId:"${job.runId}"}) (or /subagent_resolve ${job.agentId} ${job.runId}) so no further reminders are sent; do not just reply "already completed".`,
 	].join("\n");
 }
 
@@ -4253,7 +4256,7 @@ async function runSingleAgent(
 		// Keep the role-local guard explicit at the caller as well as in the
 		// shared resolver: a secretary may never regain recursive delegation.
 		declaredTools: agent.tools?.filter(
-			(t) => runtimePolicy.allowRecursiveDelegation || t !== "subagent",
+			(t) => runtimePolicy.allowRecursiveDelegation || !isDelegationTool(t),
 		),
 		disabledTools: loadDisabledTools(),
 		hasDesktopCapability: desktopGrant.granted,
@@ -5243,36 +5246,76 @@ const SharedDispatchParams = {
 	),
 };
 
-// DeepSeek requires every function schema to have an object root. Keep all legacy
-// modes in one flat object and enforce their mutually-exclusive requirements in
-// execute below; root-level unions serialize without a type and are rejected before
-// the model can call the tool.
+// Each public tool is one intent. The shared execute still accepts the internal
+// union (single / chain / tasks / abort / resolve) so wrappers can delegate.
 const SubagentParams = Type.Object({
-	action: Type.Optional(
-		StringEnum(["abort", "resolve"] as const, {
-			description: 'Control mode. Omit for single or chain; use "abort" or "resolve" only with the required identity fields.',
-		}),
-	),
-	agent: Type.Optional(Type.String({ description: "Name/profile of the agent to invoke in single mode." })),
-	task: Type.Optional(Type.String({ description: "Task to delegate in single mode." })),
+	agent: Type.String({ description: "Name of the agent to invoke." }),
+	task: Type.String({ description: "Task to delegate." }),
 	title: Type.Optional(Type.String({ description: "Short one-line title; omit to fall back to task text." })),
 	blockedBy: BlockedByParam,
 	thinking: ThinkingParam,
 	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
-	runId: Type.Optional(Type.String({ minLength: 1, description: "Exact runId for resolve; stale runIds are rejected with currentRunId." })),
-	reason: Type.Optional(Type.String({ maxLength: 500, description: "Optional handled/superseded reason shown in closeout status." })),
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process." })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	desktop: Type.Optional(StringEnum(["user-requested", "ui-verify"] as const, { description: DESKTOP_PARAM_DESCRIPTION })),
-	chain: Type.Optional(
-		Type.Array(ChainItem, {
-			description: "Array of {agent, task, agentId?, title?, cwd?, verify?, thinking?} for sequential execution",
-			minItems: 1,
-		}),
-	),
 	...SharedDispatchParams,
 }, { additionalProperties: false });
+const SubagentChainParams = Type.Object({
+	chain: Type.Array(ChainItem, {
+		description: "Ordered steps. Each item needs agent and task. Use {previous} to pass the prior step's output.",
+		minItems: 1,
+	}),
+	...SharedDispatchParams,
+}, { additionalProperties: false });
+const SubagentAbortParams = Type.Object({
+	agentId: Type.String({ description: "Running job to abort." }),
+}, { additionalProperties: false });
+const SubagentResolveParams = Type.Object({
+	agentId: Type.String({ description: AGENT_ID_DESCRIPTION }),
+	runId: Type.String({ minLength: 1, description: "Exact runId from [subagent-done] or subagent_status. Stale runIds are rejected." }),
+	reason: Type.Optional(Type.String({ maxLength: 500, description: "Optional handled/superseded reason shown in closeout status." })),
+}, { additionalProperties: false });
+type SubagentExecuteParams = {
+	action?: "abort" | "resolve";
+	agent?: string;
+	task?: string;
+	title?: string;
+	blockedBy?: string[];
+	thinking?: string;
+	agentId?: string;
+	runId?: string;
+	reason?: string;
+	fresh?: boolean;
+	cwd?: string;
+	verify?: string;
+	desktop?: "user-requested" | "ui-verify";
+	chain?: Array<{
+		agent: string;
+		task: string;
+		agentId?: string;
+		title?: string;
+		cwd?: string;
+		verify?: string;
+		thinking?: string;
+		desktop?: "user-requested" | "ui-verify";
+	}>;
+	tasks?: Array<{
+		agent: string;
+		task: string;
+		title?: string;
+		blockedBy?: string[];
+		cwd?: string;
+		verify?: string;
+		thinking?: string;
+		agentId?: string;
+		fresh?: boolean;
+		desktop?: "user-requested" | "ui-verify";
+	}>;
+	agentScope?: AgentScope;
+	confirmProjectAgents?: boolean;
+	background?: boolean;
+};
 const ParallelSubagentParams = Type.Object({
 	tasks: Type.Array(
 		Type.Object({
@@ -5604,14 +5647,17 @@ function computerPlanInvestigationReport(error: ComputerPlanInvestigationError) 
 function registerComputerTaskTool(pi: ExtensionAPI): void {
 	if (PIPIUI_DEPTH !== 0 || !PIPIUI_PORT || !PIPIUI_SESSION || !process.env.PIPIUI_COMPUTER_CAPABILITY) return;
 	assertComputerAgentRuntimeContract();
+	const computerTaskParameters = makeStrictJsonSchema(Type.Object({
+		goal: Type.String({ minLength: 1, maxLength: 12_000 }),
+		agentId: Type.Optional(Type.String({ description: "Exact historical computer-use-leader id selected by the Boss after inspecting subagent_status. Omit for a new hierarchy." })),
+	}, { additionalProperties: false }));
 	pi.registerTool({
 		name: "computer_task",
 		label: "Computer Task",
 		description: "Complete one natural-language desktop goal through an isolated planning, GUI operation, recovery, and verification workflow. Before repeating related work, inspect subagent_status and pass the exact prior Computer Use Leader agentId when its task/result show that it should continue; omit agentId to start a deliberate new hierarchy.",
-		parameters: makeStrictJsonSchema(Type.Object({
-			goal: Type.String({ minLength: 1, maxLength: 12_000 }),
-			agentId: Type.Optional(Type.String({ description: "Exact historical computer-use-leader id selected by the Boss after inspecting subagent_status. Omit for a new hierarchy." })),
-		}, { additionalProperties: false })),
+		parameters: computerTaskParameters,
+		// pi validates before execute(); strip null fillers / unknown keys first.
+		prepareArguments: bindSanitizeStrictToolArguments(computerTaskParameters),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			params = omitNulls(params);
 			const toolCallId = _toolCallId;
@@ -6097,6 +6143,7 @@ export default function (pi: ExtensionAPI) {
 			"Returns commit=created:<sha>, already-clean:<sha>, or blocked:<reason>, plus committed and remaining dirty paths.",
 		].join(" "),
 		parameters: makeStrictJsonSchema(SecretaryCommitParams),
+		prepareArguments: bindSanitizeStrictToolArguments(makeStrictJsonSchema(SecretaryCommitParams)),
 		async execute(_toolCallId, params) {
 			params = omitNulls(params);
 			const result = runSecretaryCommit(params, {
@@ -6178,7 +6225,7 @@ export default function (pi: ExtensionAPI) {
 				[
 					`[subagent-stalled] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine}`,
 					`Query it first with subagent_status({agentId:"${agentId}"}), then choose exactly one: keep waiting (say why) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent still reports [subagent-done], and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
-					`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${agentId}"}). If it is still running, close it with action:"abort" (or /subagent_abort) so this recurring message stops; if it is terminal (failed/aborted/interrupted), resolve it with action:"resolve" + runId (or /subagent_resolve). A text-only reply does not stop this message.`,
+					`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${agentId}"}). If it is still running, close it with subagent_abort({agentId}) (or /subagent_abort) so this recurring message stops; if it is terminal (failed/aborted/interrupted), resolve it with subagent_resolve({agentId, runId}) (or /subagent_resolve). A text-only reply does not stop this message.`,
 				].join("\n"),
 			);
 			pipiuiReport({
@@ -6314,11 +6361,11 @@ export default function (pi: ExtensionAPI) {
 			"Query subagent job status (running / ok / failed / aborted / interrupted), including the exact runId required to resolve an old failed episode safely.",
 			"The unfiltered view also includes persisted historical worker task/result summaries after process or Boss restart, so the Boss can inspect exact prior work and choose an agentId semantically instead of creating duplicates.",
 			"An interrupted worker is not a failed one: re-dispatch its agentId to continue where it left off instead of starting someone cold.",
-			"Use on every [subagent-done] event before any user-facing conclusion: inspect all jobs, keep user-facing progress and summaries silent while related work remains running or stalled, and close out only after the whole related goal is terminal.",
+			"Before a user-facing conclusion, one unfiltered status call per turn is enough: it lists every job. Do not call again for each [subagent-done]. Keep user-facing progress and summaries silent while related work remains running or stalled, and close out only after the whole related goal is terminal.",
 			"Prefer reading finished results via this tool or [subagent-done] over spawning a new agent for the same work.",
-			"Do not busy-loop poll; one check per decision is correct.",
+			"Do not busy-loop poll; one unfiltered check per turn is enough.",
 		].join(" "),
-		parameters: makeStrictJsonSchema(Type.Object({
+		parameters: Type.Object({
 			agentId: Type.Optional(Type.String({ description: "If set, return this job only with fuller Result text." })),
 			onlyRunning: Type.Optional(Type.Boolean({ description: "If true, only running jobs. Default false." })),
 			full: Type.Optional(
@@ -6327,7 +6374,7 @@ export default function (pi: ExtensionAPI) {
 						"If true (with agentId), return the job's full stored result text without display truncation. Default false.",
 				}),
 			),
-		}, { additionalProperties: false })),
+		}, { additionalProperties: false }),
 		async execute(_toolCallId, params) {
 			params = omitNulls(params);
 			const text = formatJobsStatus({
@@ -6339,37 +6386,25 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	const subagentParameters = makeStrictJsonSchema(SubagentParams);
-	const parallelSubagentParameters = makeStrictJsonSchema(ParallelSubagentParams);
+	const subagentParameters = SubagentParams;
+	const parallelSubagentParameters = ParallelSubagentParams;
 	const subagentTool = {
 		name: "subagent",
 		label: "Subagent",
 		description: [
-			"Delegate tasks to specialized subagents with isolated context.",
-			"Dispatch one worker with task + agent. For sequential steps use chain. Never set action when dispatching — action is only \"abort\" or \"resolve\" for an existing job. For two or more independent tasks, ALWAYS use subagent_parallel; NEVER pass tasks[] to this tool.",
-			"Before dispatching related work, inspect subagent_status: it includes persisted task/result history. Decide semantically whether to continue an exact prior agentId or create a new worker; the runtime never maps prose to a task key.",
-			"Optional thinking is accepted per single/task/chain step; it applies only to that dispatch, never inherits Boss thinking, and v1 intentionally has no per-task model. The dynamic system prompt shows each agent's configured model/fallback chain and allowed levels.",
-			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
-			"While the fan-out philosophy layer is active, background=false is ignored at boss depth — asynchronous dispatch is that layer's premise, not a preference. Use chain for genuinely ordered synchronous steps.",
-			"By default writable workers run in an isolated git worktree under .pi/worktrees/ on a pipiui/<agentId> branch; read-only roles run directly in the caller cwd and never create a worktree. Pass explicit cwd or set PIPIUI_WORKTREE=0 to disable worktree isolation. The runtime-owned secretary role is also an exception: it always runs in PIPIUI_MAIN_CWD with recursive delegation disabled and never creates a worktree. On successful writable-worker end the app auto-merges into the main project, removes the worktree, and safely deletes only a merged internal branch with git branch -d. If merge or cleanup fails, the main session retains actionable state; failed/aborted keeps worktree for resume (GUI merge/discard fallback).",
-			"Track jobs with subagent_status(agentId?). Never re-spawn a finished task without reading its result via [subagent-done] or subagent_status.",
-			`Optional blockedBy on single/parallel tasks is a real scheduler gate: a task waits until every agentId it names finishes successfully, then starts automatically without another call from you. Hand over whole chains at once (implement → review → fix) instead of remembering to dispatch the next step yourself.`,
-			`Up to ${MAX_CONCURRENCY} workers run at a time; anything beyond that is queued and starts as slots free, so dispatching widely is safe and never needs pacing by you.`,
-			'If a dependency fails, its dependents are NOT run and NOT discarded: they are held and reported as [subagent-blocked]. Re-dispatch the dependency to release them automatically, or drop one with action:"abort" + agentId. Queued and held tasks are listed by subagent_status.',
-			'Abort a running background job with action:"abort" + agentId (equivalent to /subagent_abort); it ends as aborted and still reports [subagent-done].',
-			'Resolve a terminal failed/aborted/interrupted episode with action:"resolve" + agentId + runId (from [subagent-done] or subagent_status). Resolve keeps the real state/verified attestation unchanged, marks closeout cleaned, and suppresses that run\'s interrupted reminders; stale runIds are rejected.',
-			"Background jobs with no output for 120s are pushed as [subagent-stalled] and marked stalled (with idle seconds) in subagent_status.",
-			"Workers that are still producing output are pushed as [subagent-heartbeat] check-ins at 10 minutes, then 30, then every 30 minutes, with last activity / turns / cost so you can judge drift without polling.",
-			"Do not busy-loop poll; one status check per decision is correct.",
-			"chain and nested (depth>0) are always synchronous. Background dispatches automatically wake you with a [subagent-done] signal; continue other work rather than waiting or polling.",
-			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
-			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
+			"Dispatch one worker. Required: agent, task. Optional: title, agentId, thinking, blockedBy.",
+			"For two or more independent tasks use subagent_parallel. For ordered steps use subagent_chain.",
+			"To stop a running job use subagent_abort. To close a failed episode use subagent_resolve.",
+			"Inspect jobs with subagent_status before re-dispatching the same work.",
 		].join(" "),
 		parameters: subagentParameters,
-		prepareArguments: bindPrepareStrictToolArguments(subagentParameters),
-		constrainedSampling: { type: "json_schema", strict: "prefer" },
+		// pi validates arguments before execute() runs; models that emit
+		// `action: null`-style fillers or unknown keys would otherwise loop on
+		// "root: must not have additional properties" forever (the error never
+		// names the offending key), wedging the whole turn.
+		prepareArguments: bindSanitizeStrictToolArguments(subagentParameters),
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params: SubagentExecuteParams, signal, onUpdate, ctx) {
 			params = omitNulls(params);
 			const toolCallId = _toolCallId;
 			// One invocation is one wave, however many tasks it carries — that is the unit the
@@ -7501,18 +7536,99 @@ export default function (pi: ExtensionAPI) {
 	};
 	pi.registerTool(subagentTool);
 	pi.registerTool({
+		name: "subagent_chain",
+		label: "Subagent Chain",
+		description: "Run ordered worker steps. Required: chain[{agent, task}]. Each step may use {previous} for the prior output.",
+		promptSnippet: "Run ordered subagent steps in sequence; a step references the prior step's output as {previous}.",
+		promptGuidelines: [
+			"Use subagent_chain only for genuinely ordered steps; independent tasks belong in subagent_parallel.",
+			"Chain steps run synchronously in order; do not use a chain to serialize work that is actually independent.",
+		],
+		parameters: SubagentChainParams,
+		prepareArguments: bindSanitizeStrictToolArguments(SubagentChainParams),
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			return subagentTool.execute(toolCallId, omitNulls(params) as SubagentExecuteParams, signal, onUpdate, ctx);
+		},
+		renderCall(args, theme) {
+			const steps = args.chain ?? [];
+			let text =
+				theme.fg("toolTitle", theme.bold("subagent_chain ")) +
+				theme.fg("accent", `${steps.length} steps`);
+			for (let i = 0; i < Math.min(steps.length, 3); i++) {
+				const step = steps[i];
+				const cleanTask = String(step.task ?? "").replace(/\{previous\}/g, "").trim();
+				const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
+				text +=
+					"\n  " +
+					theme.fg("muted", `${i + 1}.`) +
+					" " +
+					theme.fg("accent", step.agent) +
+					theme.fg("dim", ` ${preview}`);
+			}
+			if (steps.length > 3) text += `\n  ${theme.fg("muted", `... +${steps.length - 3} more`)}`;
+			return new Text(text, 0, 0);
+		},
+	});
+	pi.registerTool({
+		name: "subagent_abort",
+		label: "Subagent Abort",
+		description: "Abort one running background worker. Required: agentId.",
+		parameters: SubagentAbortParams,
+		prepareArguments: bindSanitizeStrictToolArguments(SubagentAbortParams),
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			return subagentTool.execute(
+				toolCallId,
+				{ action: "abort", agentId: params.agentId } as SubagentExecuteParams,
+				signal,
+				onUpdate,
+				ctx,
+			);
+		},
+		renderCall(args, theme) {
+			return new Text(
+				theme.fg("toolTitle", theme.bold("subagent_abort ")) + theme.fg("accent", args.agentId || "?"),
+				0,
+				0,
+			);
+		},
+	});
+	pi.registerTool({
+		name: "subagent_resolve",
+		label: "Subagent Resolve",
+		description: "Close one terminal failed/aborted/interrupted episode. Required: agentId, runId.",
+		parameters: SubagentResolveParams,
+		prepareArguments: bindSanitizeStrictToolArguments(SubagentResolveParams),
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			return subagentTool.execute(
+				toolCallId,
+				{ action: "resolve", agentId: params.agentId, runId: params.runId, reason: params.reason } as SubagentExecuteParams,
+				signal,
+				onUpdate,
+				ctx,
+			);
+		},
+		renderCall(args, theme) {
+			return new Text(
+				theme.fg("toolTitle", theme.bold("subagent_resolve ")) +
+					theme.fg("accent", args.agentId || "?") +
+					theme.fg("muted", ` ${args.runId || "?"}`),
+				0,
+				0,
+			);
+		},
+	});
+	pi.registerTool({
 		name: "subagent_parallel",
 		label: "Subagent Parallel",
 		promptSnippet: "Dispatch two or more independent subagent tasks together; each item requires task and agent.",
 		promptGuidelines: [
-			"Use subagent_parallel for every tasks[] fan-out; never send tasks[] to subagent.",
+			"Use subagent_parallel for every independent fan-out; never send tasks[] to subagent.",
 			"Every item must include a complete non-empty task before its agent name.",
 		],
 		description:
-			"Dispatch two or more independent subagent tasks together in one background wave. This is the only tool for tasks[] fan-out. Each item contains exactly a complete non-empty task and an agent name; the runtime assigns safe unique worker ids. Use subagent for single, chain, abort, or resolve.",
+			"Dispatch two or more independent workers in one wave. Required: tasks[{task, agent}]. Use subagent for one worker, subagent_chain for ordered steps.",
 		parameters: parallelSubagentParameters,
-		prepareArguments: bindPrepareStrictToolArguments(parallelSubagentParameters),
-		constrainedSampling: { type: "json_schema", strict: "prefer" },
+		prepareArguments: bindSanitizeStrictToolArguments(parallelSubagentParameters),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			params = omitNulls(params);
 			const reserved = new Set<string>();

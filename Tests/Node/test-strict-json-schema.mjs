@@ -7,7 +7,7 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..")
 const schemaModule = await import(
   pathToFileURL(join(repositoryRoot, "Electron/resources/runtime/pi-ext/subagent/strict-json-schema.ts")).href
 );
-const { makeStrictJsonSchema, omitNulls, makeStrictFunctionTools } = schemaModule;
+const { makeStrictJsonSchema, omitNulls, makeStrictFunctionTools, prepareStrictToolArguments, sanitizeStrictToolArguments } = schemaModule;
 
 function collectObjectsMissingRequiredKeys(value, path = "$") {
   const missing = [];
@@ -83,6 +83,162 @@ test("omitNulls drops null keys so execute can treat them as omitted", () => {
       chain: [{ agent: "probe", task: "next" }],
     },
   );
+});
+
+const dispatchSchema = () =>
+  makeStrictJsonSchema({
+    type: "object",
+    properties: {
+      action: { type: "string", enum: ["abort", "resolve"] },
+      agent: { type: "string" },
+      task: { type: "string" },
+      title: { type: "string" },
+      thinking: { type: "string", enum: ["off", "medium", "high"] },
+      blockedBy: {
+        type: "array",
+        items: { type: "string" },
+        maxItems: 10,
+      },
+      chain: {
+        type: "array",
+        minItems: 1,
+        items: {
+          type: "object",
+          properties: {
+            agent: { type: "string" },
+            task: { type: "string" },
+            thinking: { type: "string", enum: ["off", "medium"] },
+          },
+          required: ["agent", "task"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["agent", "task"],
+    additionalProperties: false,
+  });
+
+test("prepareStrictToolArguments fills omitted nullable keys and coerces action=single", () => {
+  const schema = dispatchSchema();
+  const prepared = prepareStrictToolArguments(schema, {
+    action: "single",
+    agent: "general-purpose",
+    task: "hide the head promote button",
+    thinking: "medium",
+  });
+  assert.equal(prepared.action, null);
+  assert.equal(prepared.chain, null);
+  assert.equal(prepared.title, null);
+  assert.equal(prepared.agent, "general-purpose");
+  assert.equal(prepared.task, "hide the head promote button");
+  assert.equal(prepared.thinking, "medium");
+  assert.deepEqual(collectObjectsMissingRequiredKeys(schema), []);
+});
+
+test("prepareStrictToolArguments coerces string nulls and quoted enum values", () => {
+  const schema = dispatchSchema();
+  const sentinels = prepareStrictToolArguments(schema, {
+    agent: "probe",
+    task: "inspect",
+    thinking: "null",
+    title: "unused",
+  });
+  assert.equal(sentinels.thinking, null);
+  assert.equal(sentinels.title, null);
+
+  const quoted = prepareStrictToolArguments(schema, {
+    agent: "probe",
+    task: "inspect",
+    thinking: '"off"',
+  });
+  assert.equal(quoted.thinking, "off");
+});
+
+test("prepareStrictToolArguments coerces empty minItems arrays to null and keeps empty optional arrays", () => {
+  const schema = dispatchSchema();
+  const prepared = prepareStrictToolArguments(schema, {
+    agent: "explore",
+    task: "Locate quota menu",
+    title: "Locate quota menu",
+    blockedBy: [],
+    thinking: "low",
+    agentId: "quota-locate",
+    chain: [],
+  });
+  assert.equal(prepared.chain, null);
+  assert.deepEqual(prepared.blockedBy, []);
+  assert.equal(prepared.agent, "explore");
+  assert.equal(prepared.task, "Locate quota menu");
+});
+
+test("prepareStrictToolArguments drops sentinel single-mode fields when chain is present", () => {
+  const schema = dispatchSchema();
+  const prepared = prepareStrictToolArguments(schema, {
+    action: null,
+    agent: "null",
+    task: "not used",
+    title: "unused",
+    thinking: "null",
+    extra: "drop-me",
+    chain: [{ agent: "general-purpose", task: "real work", thinking: "medium" }],
+  });
+  assert.equal(prepared.action, null);
+  assert.equal(prepared.agent, null);
+  assert.equal(prepared.task, null);
+  assert.equal(prepared.title, null);
+  assert.equal(prepared.thinking, null);
+  assert.equal(prepared.extra, undefined);
+  assert.deepEqual(prepared.chain, [{ agent: "general-purpose", task: "real work", thinking: "medium" }]);
+});
+
+test("sanitizeStrictToolArguments survives the additionalProperties validation loop payload", () => {
+  // Registered (non-strict) subagent schema shape: additionalProperties:false,
+  // optionals NOT nullable. Models retrying a dispatch have emitted null-valued
+  // unknown keys (action/chain) plus unknown keys outright; pi rejects the call
+  // before execute() with "root: must not have additional properties" and never
+  // names the key, so nothing may survive that is not a declared property.
+  const registeredSchema = {
+    type: "object",
+    properties: {
+      agent: { type: "string" },
+      task: { type: "string" },
+      title: { type: "string" },
+      thinking: { type: "string", enum: ["off", "medium", "high"] },
+      desktop: { type: "string", enum: ["user-requested", "ui-verify"] },
+      background: { type: "boolean" },
+    },
+    required: ["agent", "task"],
+    additionalProperties: false,
+  };
+  const sanitized = sanitizeStrictToolArguments(registeredSchema, {
+    action: null,
+    agent: "general-purpose",
+    task: "Implement the Swift-style cut-in",
+    title: null,
+    desktop: null,
+    reason: "resolve-only field",
+    chain: null,
+    background: true,
+  });
+  assert.deepEqual(sanitized, {
+    agent: "general-purpose",
+    task: "Implement the Swift-style cut-in",
+    background: true,
+  });
+});
+
+test("sanitizeStrictToolArguments keeps declared values and passes through non-objects", () => {
+  const registeredSchema = {
+    type: "object",
+    properties: { agentId: { type: "string" } },
+    required: ["agentId"],
+    additionalProperties: false,
+  };
+  assert.deepEqual(
+    sanitizeStrictToolArguments(registeredSchema, { agentId: "agent-1", action: null }),
+    { agentId: "agent-1" },
+  );
+  assert.equal(sanitizeStrictToolArguments(registeredSchema, undefined), undefined);
 });
 
 test("makeStrictFunctionTools rewrites Responses and Completions function tools", () => {

@@ -94,10 +94,22 @@ install({
 
 const matching = registrations.filter((tool) => tool.name === "subagent");
 const parallelMatching = registrations.filter((tool) => tool.name === "subagent_parallel");
+const chainMatching = registrations.filter((tool) => tool.name === "subagent_chain");
+const abortMatching = registrations.filter((tool) => tool.name === "subagent_abort");
+const resolveMatching = registrations.filter((tool) => tool.name === "subagent_resolve");
+const statusMatching = registrations.filter((tool) => tool.name === "subagent_status");
 const subagent = matching[0];
 const parallel = parallelMatching[0];
+const chain = chainMatching[0];
+const abort = abortMatching[0];
+const resolve = resolveMatching[0];
+const status = statusMatching[0];
 if (!subagent) throw new Error("subagent tool was not registered");
 if (!parallel) throw new Error("subagent_parallel tool was not registered");
+if (!chain) throw new Error("subagent_chain tool was not registered");
+if (!abort) throw new Error("subagent_abort tool was not registered");
+if (!resolve) throw new Error("subagent_resolve tool was not registered");
+if (!status) throw new Error("subagent_status tool was not registered");
 
 let payload;
 const { stream } = await import("@earendil-works/pi-ai/api/openai-completions");
@@ -229,7 +241,10 @@ const codexParameters = codexSerialized?.parameters;
 const codexParallelParameters = codexSerializedParallel?.parameters;
 const branches = parameters?.anyOf;
 const taskSchema = parallelParameters?.properties?.tasks?.items;
-const chainItemSchema = parameters?.properties?.chain?.items;
+const chainParameters = chain.parameters;
+const abortParameters = abort.parameters;
+const resolveParameters = resolve.parameters;
+const statusParameters = status.parameters;
 function collectObjectsMissingAdditionalProperties(value, path = "$") {
   const missing = [];
   function walk(node, current) {
@@ -281,19 +296,8 @@ function collectUnsupportedGrammarKeywords(value, path = "$") {
   }
 }
 collectUnsupportedGrammarKeywords(parameters);
-async function rejectsResolve(params) {
-  const result = await subagent.execute(
-    "resolve-validation-probe",
-    params,
-    new AbortController().signal,
-    undefined,
-    { cwd: process.cwd() },
-  );
-  return result?.isError === true &&
-    result?.content?.[0]?.text === 'action="resolve" requires both agentId and runId.';
-}
-async function executeLegacy(params, toolCallId) {
-  return subagent.execute(
+async function executeTool(tool, params, toolCallId) {
+  return tool.execute(
     toolCallId,
     params,
     new AbortController().signal,
@@ -301,11 +305,12 @@ async function executeLegacy(params, toolCallId) {
     { cwd: process.cwd(), hasUI: false },
   );
 }
-const resolveMissingAgentIdRejected = await rejectsResolve({ action: "resolve", runId: "run-probe" });
-const resolveMissingRunIdRejected = await rejectsResolve({ action: "resolve", agentId: "agent-probe" });
-const abortMissingAgentIdResult = await executeLegacy({ action: "abort" }, "abort-validation-probe");
-const invalidSingleResult = await executeLegacy({ agent: "probe" }, "single-validation-probe");
-const mixedModeResult = await executeLegacy(
+const resolveMissingAgentIdRejected = await executeTool(resolve, { runId: "run-probe" }, "resolve-missing-agent");
+const resolveMissingRunIdRejected = await executeTool(resolve, { agentId: "agent-probe" }, "resolve-missing-run");
+const abortMissingAgentIdResult = await executeTool(abort, {}, "abort-validation-probe");
+const invalidSingleResult = await executeTool(subagent, { agent: "probe" }, "single-validation-probe");
+const mixedModeResult = await executeTool(
+  subagent,
   {
     agent: "probe",
     task: "single mode",
@@ -313,11 +318,13 @@ const mixedModeResult = await executeLegacy(
   },
   "mixed-mode-validation-probe",
 );
-const singleResult = await executeLegacy(
+const singleResult = await executeTool(
+  subagent,
   { agent: "probe", task: "inspect the single path", agentId: "deepseek-single-probe" },
   "single-dispatch-probe",
 );
-const chainResult = await executeLegacy(
+const chainResult = await executeTool(
+  chain,
   { chain: [{ agent: "probe", task: "inspect the chain path", agentId: "deepseek-chain-probe" }] },
   "chain-dispatch-probe",
 );
@@ -333,47 +340,46 @@ const parallelWrapperResult = await parallel.execute(
 );
 const dispatchedResults = parallelWrapperResult?.details?.results ?? [];
 const generatedIds = dispatchedResults.map((result) => result.agentId);
+const subagentRequired = parameters?.required ?? subagent.parameters?.required ?? [];
 process.stdout.write(JSON.stringify({
   registrationCount: matching.length,
   parallelRegistrationCount: parallelMatching.length,
+  chainRegistrationCount: chainMatching.length,
+  abortRegistrationCount: abortMatching.length,
+  resolveRegistrationCount: resolveMatching.length,
   constrainedSampling: subagent.constrainedSampling ?? null,
   parallelConstrainedSampling: parallel.constrainedSampling ?? null,
-  serializedStrict: serialized?.function?.strict ?? null,
-  serializedParallelStrict: serializedParallel?.function?.strict ?? null,
-  deepseekSerializedStrict: deepseekSerialized?.function?.strict ?? null,
-  deepseekSerializedRootType: deepseekParameters?.type ?? null,
-  deepseekSerializedParametersMatchRegistration:
-    JSON.stringify(deepseekParameters) === JSON.stringify(subagent.parameters),
-  serializedParametersMatchRegistration:
-    JSON.stringify(parameters) === JSON.stringify(subagent.parameters),
+  prepareArgumentsPresent: typeof subagent.prepareArguments === "function",
   serializedRootType: parameters?.type ?? null,
   serializedRootUnionBranches: Array.isArray(branches) ? branches.length : 0,
   serializedRootAdditionalProperties: parameters?.additionalProperties,
   serializedRootPropertyNames: Object.keys(parameters?.properties ?? {}),
-  objectsMissingAdditionalProperties: collectObjectsMissingAdditionalProperties(parameters),
-  objectsMissingRequiredKeys: collectObjectsMissingRequiredKeys(parameters),
-  serializedChainItemAdditionalProperties: chainItemSchema?.additionalProperties,
-  oldSubagentAdvertisesTasks:
-    Boolean(parameters?.properties?.tasks) ||
-    (Array.isArray(branches) && branches.some((branch) => branch?.properties?.tasks)),
+  serializedRequired: subagentRequired,
+  advertisesAction: Boolean(parameters?.properties?.action),
+  advertisesChain: Boolean(parameters?.properties?.chain),
+  advertisesTasks: Boolean(parameters?.properties?.tasks),
+  advertisesRunId: Boolean(parameters?.properties?.runId),
+  oldSubagentAdvertisesTasks: Boolean(parameters?.properties?.tasks),
   serializedParallelRootType: parallelParameters?.type ?? null,
   serializedParallelRequired: parallelParameters?.required ?? null,
-  serializedParallelRootAdditionalProperties: parallelParameters?.additionalProperties,
-  serializedTaskType: taskSchema?.type ?? null,
-  serializedTaskPropertyNames: Object.keys(taskSchema?.properties ?? {}),
   serializedTaskRequired: taskSchema?.required ?? null,
-  serializedTaskPropertyType: taskSchema?.properties?.task?.type ?? null,
-  serializedTaskAdditionalProperties: taskSchema?.additionalProperties,
-  parallelObjectsMissingAdditionalProperties: collectObjectsMissingAdditionalProperties(parallelParameters),
-  parallelObjectsMissingRequiredKeys: collectObjectsMissingRequiredKeys(parallelParameters),
-  codexSerializedStrict: codexSerialized?.strict ?? null,
-  codexSerializedParallelStrict: codexSerializedParallel?.strict ?? null,
-  codexObjectsMissingAdditionalProperties: collectObjectsMissingAdditionalProperties(codexParameters),
-  codexObjectsMissingRequiredKeys: collectObjectsMissingRequiredKeys(codexParameters),
-  codexParallelObjectsMissingRequiredKeys: collectObjectsMissingRequiredKeys(codexParallelParameters),
+  chainRequired: chainParameters?.required ?? null,
+  abortRequired: abortParameters?.required ?? null,
+  resolveRequired: resolveParameters?.required ?? null,
+  statusRequired: statusParameters?.required ?? [],
+  objectsMissingAdditionalProperties: collectObjectsMissingAdditionalProperties(parameters),
+  serializedRequiredMatchesRegistration:
+    JSON.stringify(parameters?.required ?? []) === JSON.stringify(subagent.parameters?.required ?? []),
+  serializedNamesMatchRegistration:
+    JSON.stringify(Object.keys(parameters?.properties ?? {})) ===
+    JSON.stringify(Object.keys(subagent.parameters?.properties ?? {})),
   unsupportedGrammarKeywords,
-  resolveMissingAgentIdRejected,
-  resolveMissingRunIdRejected,
+  resolveMissingAgentIdRejected:
+    resolveMissingAgentIdRejected?.isError === true &&
+    resolveMissingAgentIdRejected?.content?.[0]?.text === 'action="resolve" requires both agentId and runId.',
+  resolveMissingRunIdRejected:
+    resolveMissingRunIdRejected?.isError === true &&
+    resolveMissingRunIdRejected?.content?.[0]?.text === 'action="resolve" requires both agentId and runId.',
   abortMissingAgentIdRejected:
     abortMissingAgentIdResult?.isError === true &&
     abortMissingAgentIdResult?.content?.[0]?.text ===
@@ -425,8 +431,8 @@ process.stdout.write(JSON.stringify({
   return JSON.parse(stdout);
 }
 
-test("both runtime copies strictly constrain the exact subagent registration", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "pipiui-subagent-strict-"));
+test("both runtime copies register split subagent tools with slim required fields", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pipiui-subagent-split-"));
   t.after(() => rm(root, { recursive: true, force: true }));
 
   const probes = [];
@@ -437,55 +443,49 @@ test("both runtime copies strictly constrain the exact subagent registration", a
   const expected = {
     registrationCount: 1,
     parallelRegistrationCount: 1,
-    constrainedSampling: { type: "json_schema", strict: "prefer" },
-    parallelConstrainedSampling: { type: "json_schema", strict: "prefer" },
-    serializedStrict: true,
-    serializedParallelStrict: true,
-    deepseekSerializedStrict: true,
-    deepseekSerializedRootType: "object",
-    deepseekSerializedParametersMatchRegistration: true,
-    serializedParametersMatchRegistration: true,
+    chainRegistrationCount: 1,
+    abortRegistrationCount: 1,
+    resolveRegistrationCount: 1,
+    constrainedSampling: null,
+    parallelConstrainedSampling: null,
+    // The pre-validation sanitizer must be attached: pi validates arguments
+    // before execute(), and null fillers (`action: null`) would otherwise loop
+    // the turn on "root: must not have additional properties".
+    prepareArgumentsPresent: true,
     serializedRootType: "object",
     serializedRootUnionBranches: 0,
     serializedRootAdditionalProperties: false,
-    objectsMissingAdditionalProperties: [],
-    objectsMissingRequiredKeys: [],
-    serializedChainItemAdditionalProperties: false,
     serializedRootPropertyNames: [
-      "action",
       "agent",
       "task",
       "title",
       "blockedBy",
       "thinking",
       "agentId",
-      "runId",
-      "reason",
       "fresh",
       "cwd",
       "verify",
       "desktop",
-      "chain",
       "agentScope",
       "confirmProjectAgents",
       "background",
     ],
+    serializedRequired: ["agent", "task"],
+    advertisesAction: false,
+    advertisesChain: false,
+    advertisesTasks: false,
+    advertisesRunId: false,
     oldSubagentAdvertisesTasks: false,
     serializedParallelRootType: "object",
     serializedParallelRequired: ["tasks"],
-    serializedParallelRootAdditionalProperties: false,
-    serializedTaskType: "object",
-    serializedTaskPropertyNames: ["task", "agent"],
     serializedTaskRequired: ["task", "agent"],
-    serializedTaskPropertyType: "string",
-    serializedTaskAdditionalProperties: false,
-    parallelObjectsMissingAdditionalProperties: [],
-    parallelObjectsMissingRequiredKeys: [],
-    codexSerializedStrict: true,
-    codexSerializedParallelStrict: true,
-    codexObjectsMissingAdditionalProperties: [],
-    codexObjectsMissingRequiredKeys: [],
-    codexParallelObjectsMissingRequiredKeys: [],
+    chainRequired: ["chain"],
+    abortRequired: ["agentId"],
+    resolveRequired: ["agentId", "runId"],
+    statusRequired: [],
+    objectsMissingAdditionalProperties: [],
+    serializedRequiredMatchesRegistration: true,
+    serializedNamesMatchRegistration: true,
     unsupportedGrammarKeywords: [],
     resolveMissingAgentIdRejected: true,
     resolveMissingRunIdRejected: true,
