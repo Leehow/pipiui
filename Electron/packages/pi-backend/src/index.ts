@@ -2897,6 +2897,23 @@ export class PiHostBackend implements HostBackend {
     await this.loadModelCatalog(includeCurrent);
     return this.models;
   }
+  /**
+   * Invalidate the cached configured/runtime model catalog and reload it from disk.
+   *
+   * The host runs profile migration and bundled model-capability override installs in
+   * the background so the window can paint before they finish. The backend's
+   * constructor preload may therefore read models.json before those overrides land;
+   * this method clears the affected caches and re-reads them so the renderer's next
+   * listModels returns the complete, capability-aware catalog. Safe to call before or
+   * while the constructor's preload is still in flight (it only replaces the result).
+   */
+  async refreshModelCatalog(): Promise<Model[]> {
+    this.modelsLoaded = undefined;
+    this.runtimeModelsPromise = undefined;
+    this.modelCatalogReady = false;
+    await this.loadModelCatalog(true);
+    return this.models;
+  }
   private async removeProviderCredentials(
     providerId: string,
   ): Promise<ModelState> {

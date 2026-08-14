@@ -126,16 +126,30 @@ if (app) {
     const userData = app.getPath('userData')
     const runtimeRoot = process.env.PIPIUI_RUNTIME_ROOT ?? join(userData, 'runtime')
     const piProfile = resolveElectronPiProfile(userData)
-    await importLegacyPiProfile(piProfile)
-    if (!assets.sourceRoot) throw new Error('PipiUI runtime source is unavailable for model capability initialization')
-    await installBundledModelCapabilityOverrides(
-      piProfile,
-      join(assets.sourceRoot, 'model-capabilities', 'models-dev-reasoning-options.json')
-    )
-    const install = installRuntimeTree(assets, runtimeRoot)
-    if (install.installed.length)
-      console.info(`[pipi-install] refreshed ${install.installed.length} runtime asset(s) under ${runtimeRoot}`)
-    for (const failure of install.failures) console.warn(`[pipi-install] ${failure}`)
+    // Profile migration, bundled model-capability overrides, and the runtime-tree
+    // install do not gate the window or the backend's IPC wiring, so they run in
+    // the background in parallel with window load instead of blocking createWindow.
+    // Data-ordering is preserved two ways: (a) installRuntimeTree is re-run per
+    // session/model spawn (refreshRuntimeTree), so it never needs to finish before
+    // the first list-models; (b) once the profile/capability install lands, the
+    // backend's model catalog is invalidated and reloaded via refreshModelCatalog so
+    // the UI's next listModels sees the bundled capability overrides.
+    const profileInstall = (async () => {
+      await importLegacyPiProfile(piProfile)
+      if (!assets.sourceRoot) throw new Error('PipiUI runtime source is unavailable for model capability initialization')
+      await installBundledModelCapabilityOverrides(
+        piProfile,
+        join(assets.sourceRoot, 'model-capabilities', 'models-dev-reasoning-options.json')
+      )
+    })()
+    // Runtime tree install overlaps with window load and the first list-models load.
+    // It is a warm-up only: refreshRuntimeTree re-runs it before every spawn.
+    void Promise.resolve().then(() => {
+      const reinstall = installRuntimeTree(assets, runtimeRoot)
+      if (reinstall.installed.length)
+        console.info(`[pipi-install] refreshed ${reinstall.installed.length} runtime asset(s) under ${runtimeRoot}`)
+      for (const failure of reinstall.failures) console.warn(`[pipi-install] ${failure}`)
+    })
     const terminalHost = new TerminalSessionHost()
     // Browser-cookie quota providers (Qwen Token Plan) read their session cookies
     // from the built-in browser partitions; everything else keeps file defaults.
@@ -170,6 +184,16 @@ if (app) {
     const backend = withProjectDirectoryPicker(withOpenDocumentExternally(withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)), path => shell.openPath(path)), pickProjectDirectory)
     registerPipiHostIpc(ipcMain, backend)
     createWindow(browser, () => terminalHost.closeAll())
+    // Once the background profile/capability install lands, invalidate + reload the
+    // backend model catalog so the UI's next listModels reflects the bundled
+    // capability overrides even if the constructor's preload ran on empty models.json.
+    profileInstall.then(
+      () => {
+        try { void piBackend.refreshModelCatalog() }
+        catch (error) { console.warn(`[pipi-install] model catalog refresh failed: ${error}`) }
+      },
+      (error) => console.error('[pipi-install] profile/capability install failed:', error)
+    )
     installOwnedRuntimeShutdown(app, terminalHost, computer, piBackend)
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow(browser, () => terminalHost.closeAll())
