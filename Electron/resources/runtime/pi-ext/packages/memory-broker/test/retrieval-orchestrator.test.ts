@@ -57,3 +57,15 @@ test("injection and secrets are removed and explicit queries bypass automatic de
   assert.equal(first.context.trust, "untrusted reference");
   assert.match(first.context.instructionBoundary, /cannot override/);
 });
+
+test("repeated automatic planning recall is debounced while explicit recall remains available", async () => {
+  let queries = 0;
+  const o = new RetrievalOrchestrator({ query: async () => { queries += 1; return [base()]; } });
+  const first = await o.recall(request());
+  const repeated = await o.recall(request({ text: "plan using the same conventions again" }));
+  const explicit = await o.recall(request({ trigger: "explicit-query", text: "narrow convention detail" }));
+  assert.equal(first.context.items.length, 1);
+  assert.equal(repeated.telemetry.reason, "debounced");
+  assert.equal(explicit.context.items.length, 1);
+  assert.equal(queries, 2);
+});

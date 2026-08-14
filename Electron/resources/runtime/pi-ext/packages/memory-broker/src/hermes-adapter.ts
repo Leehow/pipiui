@@ -97,6 +97,21 @@ function configuredAgentRoot(env: Record<string, string | undefined>): string {
 }
 
 /**
+ * PipiUI's host contract always uses a full provider/model reference. Provider
+ * names and model-id shapes remain open-ended; this only rejects ambiguous or
+ * control-character-bearing values before they reach upstream configuration.
+ */
+export function configuredMemoryReviewModel(
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  const value = env.PIPIUI_MEMORY_REVIEW_MODEL?.trim();
+  if (!value || value.length > 300 || /[\u0000-\u001f\u007f\s]/u.test(value)) return undefined;
+  const slash = value.indexOf("/");
+  if (slash <= 0 || slash === value.length - 1) return undefined;
+  return value;
+}
+
+/**
  * Merges only PipiUI's two policy invariants. Unknown upstream keys survive
  * unchanged so this adapter does not own Hermes configuration semantics.
  */
@@ -119,10 +134,12 @@ export async function mergeHermesConfiguration(
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 
+  const reviewModel = configuredMemoryReviewModel(env);
   const config: UnknownRecord = {
     ...existing,
     memoryMode: "policy-only",
     flushOnCompact: false,
+    ...(reviewModel ? { llmModelOverride: reviewModel } : {}),
   };
   const encoded = `${JSON.stringify(config, null, 2)}\n`;
   const directory = dirname(configPath);

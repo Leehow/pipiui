@@ -308,6 +308,8 @@ export type PiBackendOptions = {
   /** Disable Pi's ambient resource discovery while retaining explicit mounts assembled here. */
   resourceMode?: "default" | "explicit";
   features?: SpawnFeatures;
+  /** Optional full provider/model used by Hermes review instead of the active chat model. */
+  memoryReviewModelId?: string;
   spawn?: ProcFactory;
   env?: NodeJS.ProcessEnv;
   browserAction?: (
@@ -954,6 +956,7 @@ export class PiHostBackend implements HostBackend {
   private runtimeAssets?: RuntimeAssets;
   private agentDir: string;
   private features: SpawnFeatures;
+  private memoryReviewModelId?: string;
   private profileMode: "default" | "isolated";
   private resourceMode: "default" | "explicit";
   private proc: ProcFactory;
@@ -1005,6 +1008,7 @@ export class PiHostBackend implements HostBackend {
   constructor(options: PiBackendOptions = {}) {
     this.terminalSessionDeleted = options.terminalSessionDeleted;
     this.compactionConfiguration = options.compaction;
+    this.memoryReviewModelId = options.memoryReviewModelId;
     this.computerDescriptor = options.computerDescriptor;
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
@@ -2018,6 +2022,7 @@ export class PiHostBackend implements HostBackend {
         managedNodeModulesRoot: this.managedNodeModulesRoot,
       }),
       mainModelId: this.mainModelId(),
+      memoryReviewModelId: this.memoryReviewModelId,
       subagentModelsFile: this.subagentModelsRuntimeFile(),
       bridgePort,
       bridgeRoutingKey: id,

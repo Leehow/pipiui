@@ -70,6 +70,20 @@ describe("main-only Hermes runtime ownership", () => {
     expect(worker.env.PIPIUI_HERMES_NODE_MODULES_ROOT).toBeUndefined();
   });
 
+  it("passes an optional provider-neutral review model only through the host-owned memory contract", () => {
+    const paths = { memoryBroker: "/runtime/memory-broker", hermesMemory: "/embedded/node_modules/pi-hermes-memory" };
+    const main = assemblePiSpawn({
+      cwd: "/repo",
+      features: { memoryBroker: true },
+      paths,
+      bridgePort: 1234,
+      memoryReviewModelId: "provider/model-family/reviewer",
+    });
+    expect(main.env.PIPIUI_MEMORY_REVIEW_MODEL).toBe("provider/model-family/reviewer");
+    const absent = assemblePiSpawn({ cwd: "/repo", features: { memoryBroker: true }, paths, bridgePort: 1234 });
+    expect(absent.env.PIPIUI_MEMORY_REVIEW_MODEL).toBeUndefined();
+  });
+
   it("resolves Hermes only from the exact-version managed runtime", async () => {
     const root = await mkdtemp(join(tmpdir(), "pipi-hermes-spawn-"));
     try {
