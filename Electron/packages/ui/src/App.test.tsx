@@ -353,6 +353,24 @@ describe('PipiUI Electron main layout', () => {
     expect(narrow).toContain('.pipiui-shell .resize-handle{visibility:hidden}')
   })
 
+  it('keeps collapsed drag handles in the grid flow instead of removing them', () => {
+    const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
+    const desktop = css.slice(0, css.indexOf('@media'))
+    // jsdom cannot lay out CSS grid, so pin the stylesheet contract instead:
+    // a collapsed pane hides its handle with visibility so the handle keeps
+    // owning its 6px track. display:none dropped the handle from auto-placement
+    // and shifted the chat column into the 6px track — the whole chat vanished
+    // behind a handle-width strip while the freed handle track showed the
+    // hover-highlighted (accent blue) resize handle at chat width.
+    expect(desktop).toMatch(/\.pipiui-shell\.sidebar-collapsed \.resize-handle-left[,{][^}]*visibility:hidden/)
+    expect(desktop).toMatch(/\.pipiui-shell\.tools-collapsed \.resize-handle-right\{visibility:hidden\}/)
+    expect(desktop).not.toMatch(/resize-handle-(left|right)[^{}]*\{[^}]*display:none/)
+    // the dead 6px handle track collapses together with its pane
+    expect(desktop).toMatch(/\.pipiui-shell\.sidebar-collapsed\{[^}]*grid-template-columns:0 0 minmax\(0,1fr\)/)
+    expect(desktop).toMatch(/\.pipiui-shell\.tools-collapsed\{[^}]*grid-template-columns:var\(--sidebar-col\) 6px minmax\(0,1fr\) 0 0/)
+    expect(desktop).toMatch(/\.pipiui-shell\.sidebar-collapsed\.tools-collapsed\{grid-template-columns:0 0 minmax\(0,1fr\) 0 0\}/)
+  })
+
   it('shares one outer content track across every main chat row', () => {
     const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
     const waitingCss = readFileSync(join(import.meta.dirname, 'waiting-placeholder.css'), 'utf8')
