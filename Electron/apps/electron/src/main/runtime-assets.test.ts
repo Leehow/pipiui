@@ -177,4 +177,15 @@ describe('resolveRuntimeAssets', () => {
     expect(source).toContain('summary: outcome === "outcome_unknown" ? "Computer Worker outcome unknown"')
     expect(source).not.toContain('summary: runtimeError?.message')
   })
+
+  it('launches nested Pi through the packaged node shim, not raw Helper execPath', async () => {
+    const source = await readFile(new URL('../../../../resources/runtime/pi-ext/subagent/index.ts', import.meta.url), 'utf8')
+    const start = source.indexOf('function getPiInvocation')
+    const end = source.indexOf('\nfunction ', start + 1)
+    const block = source.slice(start, end === -1 ? undefined : end)
+    expect(start).toBeGreaterThanOrEqual(0)
+    expect(block).toContain('process.env.PIPIUI_NODE_PATH')
+    expect(block).toMatch(/command:\s*nodeShim/)
+    expect(source).toMatch(/for \(const key of \["PIPIUI_NODE_PATH", "PIPIUI_PI_PATH", "PIPIUI_ELECTRON_BINARY", "ELECTRON_RUN_AS_NODE"\]\)/)
+  })
 })

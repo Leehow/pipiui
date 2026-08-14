@@ -152,6 +152,7 @@ test("index.ts runtime gate: grant gated extension mount, env, and early failure
   const childEnvBlock = subagent.slice(childEnvStart, childSpawnStart);
   assert.match(childEnvBlock, /isolatedComputerWorkerChildProcessEnv\(childEnvironmentInput\)/);
   assert.match(childEnvBlock, /pipiuiChildProcessEnv\(childEnvironmentInput, desktopGrant\.granted\)/);
+  assert.match(subagent, /env\.ELECTRON_RUN_AS_NODE = "1"/);
   // The child-policy prompt is appended only for granted dispatches.
   assert.match(subagent, /if \(desktopGrant\.granted\) promptParts\.push\(DESKTOP_GRANT_CHILD_POLICY\);/);
 

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { makeStrictJsonSchema, omitNulls } from "./strict-json-schema.ts";
 
 /** Default number of active-lineage matches returned to the model. */
 export const SESSION_RECALL_DEFAULT_LIMIT = 6;
@@ -84,7 +85,7 @@ const SessionRecallParams = Type.Object({
 			maximum: SESSION_RECALL_MAX_LIMIT,
 		}),
 	),
-});
+}, { additionalProperties: false });
 
 function asRecord(value: unknown): SessionEntryLike | undefined {
 	return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -424,8 +425,9 @@ export function registerSessionRecallTool(pi: ExtensionAPI): void {
 		// caller who most needs it — a Boss whose context was just compacted — is the least
 		// likely to go looking for a tool nobody mentioned.
 		promptSnippet: "Recall this session's own earlier history, including what compaction dropped",
-		parameters: SessionRecallParams,
+		parameters: makeStrictJsonSchema(SessionRecallParams),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			params = omitNulls(params);
 			const result = recallActiveSession({
 				query: params.query,
 				limit: params.limit,

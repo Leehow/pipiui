@@ -171,6 +171,42 @@ for await (const _event of deepseekProbe) {
   // onPayload intentionally stops before fetch; drain the resulting local error event.
 }
 
+let codexPayload;
+const { stream: streamCodex } = await import("@earendil-works/pi-ai/api/openai-codex-responses");
+const fakeCodexJwt = [
+  btoa(JSON.stringify({ alg: "none", typ: "JWT" })),
+  btoa(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "probe-account" } })),
+  "sig",
+].join(".");
+const codexProbe = streamCodex(
+  {
+    id: "gpt-5.6-terra",
+    name: "GPT-5.6 Terra schema probe",
+    api: "openai-codex-responses",
+    provider: "openai-codex",
+    baseUrl: "https://chatgpt.com/backend-api",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 4096,
+    maxTokens: 512,
+  },
+  {
+    messages: [{ role: "user", content: "probe", timestamp: Date.now() }],
+    tools: [subagent, parallel],
+  },
+  {
+    apiKey: fakeCodexJwt,
+    onPayload(nextPayload) {
+      codexPayload = nextPayload;
+      throw new Error("PIPIUI_CODEX_PAYLOAD_CAPTURED");
+    },
+  },
+);
+for await (const _event of codexProbe) {
+  // onPayload intentionally stops before fetch; drain the resulting local error event.
+}
+
 const serialized = payload?.tools?.find(
   (entry) => entry.type === "function" && entry.function?.name === "subagent",
 );
@@ -183,8 +219,51 @@ const deepseekSerialized = deepseekPayload?.tools?.find(
 const parameters = serialized?.function?.parameters;
 const parallelParameters = serializedParallel?.function?.parameters;
 const deepseekParameters = deepseekSerialized?.function?.parameters;
+const codexSerialized = codexPayload?.tools?.find(
+  (entry) => entry.type === "function" && entry.name === "subagent",
+);
+const codexSerializedParallel = codexPayload?.tools?.find(
+  (entry) => entry.type === "function" && entry.name === "subagent_parallel",
+);
+const codexParameters = codexSerialized?.parameters;
+const codexParallelParameters = codexSerializedParallel?.parameters;
 const branches = parameters?.anyOf;
 const taskSchema = parallelParameters?.properties?.tasks?.items;
+const chainItemSchema = parameters?.properties?.chain?.items;
+function collectObjectsMissingAdditionalProperties(value, path = "$") {
+  const missing = [];
+  function walk(node, current) {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      node.forEach((entry, index) => walk(entry, current + "[" + index + "]"));
+      return;
+    }
+    if (node.type === "object" && node.additionalProperties !== false) missing.push(current);
+    for (const [key, entry] of Object.entries(node)) walk(entry, current + "." + key);
+  }
+  walk(value, path);
+  return missing;
+}
+function collectObjectsMissingRequiredKeys(value, path = "$") {
+  const missing = [];
+  function walk(node, current) {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      node.forEach((entry, index) => walk(entry, current + "[" + index + "]"));
+      return;
+    }
+    const types = Array.isArray(node.type) ? node.type : node.type ? [node.type] : [];
+    if ((types.includes("object") || node.properties) && node.properties && typeof node.properties === "object") {
+      const keys = Object.keys(node.properties);
+      const required = Array.isArray(node.required) ? node.required : [];
+      const absent = keys.filter((key) => !required.includes(key));
+      if (absent.length > 0) missing.push({ path: current, missing: absent });
+    }
+    for (const [key, entry] of Object.entries(node)) walk(entry, current + "." + key);
+  }
+  walk(value, path);
+  return missing;
+}
 const unsupportedGrammarKeywords = [];
 function collectUnsupportedGrammarKeywords(value, path = "$") {
   if (!value || typeof value !== "object") return;
@@ -269,19 +348,29 @@ process.stdout.write(JSON.stringify({
     JSON.stringify(parameters) === JSON.stringify(subagent.parameters),
   serializedRootType: parameters?.type ?? null,
   serializedRootUnionBranches: Array.isArray(branches) ? branches.length : 0,
-  serializedRootAdditionalProperties: parameters?.additionalProperties ?? false,
+  serializedRootAdditionalProperties: parameters?.additionalProperties,
   serializedRootPropertyNames: Object.keys(parameters?.properties ?? {}),
+  objectsMissingAdditionalProperties: collectObjectsMissingAdditionalProperties(parameters),
+  objectsMissingRequiredKeys: collectObjectsMissingRequiredKeys(parameters),
+  serializedChainItemAdditionalProperties: chainItemSchema?.additionalProperties,
   oldSubagentAdvertisesTasks:
     Boolean(parameters?.properties?.tasks) ||
     (Array.isArray(branches) && branches.some((branch) => branch?.properties?.tasks)),
   serializedParallelRootType: parallelParameters?.type ?? null,
   serializedParallelRequired: parallelParameters?.required ?? null,
-  serializedParallelRootAdditionalProperties: parallelParameters?.additionalProperties ?? false,
+  serializedParallelRootAdditionalProperties: parallelParameters?.additionalProperties,
   serializedTaskType: taskSchema?.type ?? null,
   serializedTaskPropertyNames: Object.keys(taskSchema?.properties ?? {}),
   serializedTaskRequired: taskSchema?.required ?? null,
   serializedTaskPropertyType: taskSchema?.properties?.task?.type ?? null,
-  serializedTaskAdditionalProperties: taskSchema?.additionalProperties ?? false,
+  serializedTaskAdditionalProperties: taskSchema?.additionalProperties,
+  parallelObjectsMissingAdditionalProperties: collectObjectsMissingAdditionalProperties(parallelParameters),
+  parallelObjectsMissingRequiredKeys: collectObjectsMissingRequiredKeys(parallelParameters),
+  codexSerializedStrict: codexSerialized?.strict ?? null,
+  codexSerializedParallelStrict: codexSerializedParallel?.strict ?? null,
+  codexObjectsMissingAdditionalProperties: collectObjectsMissingAdditionalProperties(codexParameters),
+  codexObjectsMissingRequiredKeys: collectObjectsMissingRequiredKeys(codexParameters),
+  codexParallelObjectsMissingRequiredKeys: collectObjectsMissingRequiredKeys(codexParallelParameters),
   unsupportedGrammarKeywords,
   resolveMissingAgentIdRejected,
   resolveMissingRunIdRejected,
@@ -359,6 +448,9 @@ test("both runtime copies strictly constrain the exact subagent registration", a
     serializedRootType: "object",
     serializedRootUnionBranches: 0,
     serializedRootAdditionalProperties: false,
+    objectsMissingAdditionalProperties: [],
+    objectsMissingRequiredKeys: [],
+    serializedChainItemAdditionalProperties: false,
     serializedRootPropertyNames: [
       "action",
       "agent",
@@ -387,6 +479,13 @@ test("both runtime copies strictly constrain the exact subagent registration", a
     serializedTaskRequired: ["task", "agent"],
     serializedTaskPropertyType: "string",
     serializedTaskAdditionalProperties: false,
+    parallelObjectsMissingAdditionalProperties: [],
+    parallelObjectsMissingRequiredKeys: [],
+    codexSerializedStrict: true,
+    codexSerializedParallelStrict: true,
+    codexObjectsMissingAdditionalProperties: [],
+    codexObjectsMissingRequiredKeys: [],
+    codexParallelObjectsMissingRequiredKeys: [],
     unsupportedGrammarKeywords: [],
     resolveMissingAgentIdRejected: true,
     resolveMissingRunIdRejected: true,

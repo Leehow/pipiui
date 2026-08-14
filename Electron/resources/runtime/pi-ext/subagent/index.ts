@@ -33,6 +33,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
+import { makeStrictJsonSchema, omitNulls } from "./strict-json-schema.ts";
 import {
 	COMPUTER_WORKER_FAILURE_CODES,
 	type ComputerPlan,
@@ -488,6 +489,10 @@ function isolatedComputerWorkerChildProcessEnv(
 	const safeHostKeys = ["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "SHELL", "USER", "LOGNAME"];
 	const env: Record<string, string | undefined> = {};
 	for (const key of safeHostKeys) if (process.env[key]) env[key] = process.env[key];
+	for (const key of ["PIPIUI_NODE_PATH", "PIPIUI_PI_PATH", "PIPIUI_ELECTRON_BINARY", "ELECTRON_RUN_AS_NODE"]) {
+		if (process.env[key]) env[key] = process.env[key];
+	}
+	env.ELECTRON_RUN_AS_NODE = "1";
 	for (const [key, value] of Object.entries(extra)) {
 		if (terminalWorkerEnvKeys.has(key) || desktopWorkerEnvKeys.has(key)
 			|| ["PIPIUI_AGENT_ID", "PIPIUI_AGENT_RUN_ID", "PIPIUI_AGENT_DEPTH", "PIPIUI_AGENT_ROLE", "PIPIUI_MAIN_MODEL", "PIPIUI_SUBAGENT_SKILL_ISOLATION", "PIPIUI_SKILL_READ_BLOCK", "PIPI_PHILOSOPHY_ROLE"].includes(key)) env[key] = value;
@@ -3873,8 +3878,12 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
+	const nodeShim = process.env.PIPIUI_NODE_PATH;
 	const currentScript = process.argv[1];
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
+	if (nodeShim && fs.existsSync(nodeShim) && currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
+		return { command: nodeShim, args: [currentScript, ...args] };
+	}
 	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
 		return { command: process.execPath, args: [currentScript, ...args] };
 	}
@@ -5190,7 +5199,7 @@ const TaskItem = Type.Object({
 			description: DESKTOP_PARAM_DESCRIPTION,
 		}),
 	),
-});
+}, { additionalProperties: false });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
@@ -5210,7 +5219,7 @@ const ChainItem = Type.Object({
 			description: DESKTOP_PARAM_DESCRIPTION,
 		}),
 	),
-});
+}, { additionalProperties: false });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	description: 'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
@@ -5259,7 +5268,7 @@ const SubagentParams = Type.Object({
 		}),
 	),
 	...SharedDispatchParams,
-});
+}, { additionalProperties: false });
 const ParallelSubagentParams = Type.Object({
 	tasks: Type.Array(
 		Type.Object({
@@ -5268,7 +5277,7 @@ const ParallelSubagentParams = Type.Object({
 			// parallel shape lived inside subagent's large anyOf schema.
 			task: Type.String({ minLength: 1, description: "Complete non-empty task body for this worker" }),
 			agent: Type.String({ minLength: 1, description: "Name of the agent to invoke" }),
-		}),
+		}, { additionalProperties: false }),
 		{
 			description:
 				'Independent tasks to dispatch together. Every item must contain exactly task and agent. Example: [{"task":"map auth","agent":"explore"},{"task":"map billing","agent":"explore"}].',
@@ -5276,7 +5285,7 @@ const ParallelSubagentParams = Type.Object({
 			maxItems: MAX_PARALLEL_TASKS,
 		},
 	),
-});
+}, { additionalProperties: false });
 const SecretaryCommitParams = Type.Object({
 	closeout: StringEnum(["pass", "needs-action", "blocked"] as const),
 	integrationVerify: StringEnum(["pass", "fail", "none"] as const),
@@ -5299,9 +5308,9 @@ const SecretaryCommitParams = Type.Object({
 				["cleaned", "retained", "unclassified", "needs-fixer", "needs-user"] as const,
 			),
 			reason: Type.Optional(Type.String()),
-		}),
+		}, { additionalProperties: false }),
 	),
-});
+}, { additionalProperties: false });
 
 const COMPUTER_AGENT_ROOT = fileURLToPath(new URL("../packages/computer-agent", import.meta.url));
 const COMPUTER_WORKER_EXTENSION = path.join(COMPUTER_AGENT_ROOT, "extensions/computer-worker.ts");
@@ -5595,11 +5604,12 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 		name: "computer_task",
 		label: "Computer Task",
 		description: "Complete one natural-language desktop goal through an isolated planning, GUI operation, recovery, and verification workflow. Before repeating related work, inspect subagent_status and pass the exact prior Computer Use Leader agentId when its task/result show that it should continue; omit agentId to start a deliberate new hierarchy.",
-		parameters: Type.Object({
+		parameters: makeStrictJsonSchema(Type.Object({
 			goal: Type.String({ minLength: 1, maxLength: 12_000 }),
 			agentId: Type.Optional(Type.String({ description: "Exact historical computer-use-leader id selected by the Boss after inspecting subagent_status. Omit for a new hierarchy." })),
-		}, { additionalProperties: false }),
+		}, { additionalProperties: false })),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			params = omitNulls(params);
 			const toolCallId = _toolCallId;
 			const taskId = selectComputerTaskLeaderAgentId(params.agentId);
 			const coordinatorRunId = randomUUID();
@@ -6082,8 +6092,9 @@ export default function (pi: ExtensionAPI) {
 			"Stages and commits only that manifest; raw git add/commit remains forbidden in bash.",
 			"Returns commit=created:<sha>, already-clean:<sha>, or blocked:<reason>, plus committed and remaining dirty paths.",
 		].join(" "),
-		parameters: SecretaryCommitParams,
+		parameters: makeStrictJsonSchema(SecretaryCommitParams),
 		async execute(_toolCallId, params) {
+			params = omitNulls(params);
 			const result = runSecretaryCommit(params, {
 				processRole: PIPIUI_AGENT_ROLE,
 				mainCwd: PIPIUI_MAIN_CWD,
@@ -6303,7 +6314,7 @@ export default function (pi: ExtensionAPI) {
 			"Prefer reading finished results via this tool or [subagent-done] over spawning a new agent for the same work.",
 			"Do not busy-loop poll; one check per decision is correct.",
 		].join(" "),
-		parameters: Type.Object({
+		parameters: makeStrictJsonSchema(Type.Object({
 			agentId: Type.Optional(Type.String({ description: "If set, return this job only with fuller Result text." })),
 			onlyRunning: Type.Optional(Type.Boolean({ description: "If true, only running jobs. Default false." })),
 			full: Type.Optional(
@@ -6312,8 +6323,9 @@ export default function (pi: ExtensionAPI) {
 						"If true (with agentId), return the job's full stored result text without display truncation. Default false.",
 				}),
 			),
-		}),
+		}, { additionalProperties: false })),
 		async execute(_toolCallId, params) {
+			params = omitNulls(params);
 			const text = formatJobsStatus({
 				agentId: params.agentId,
 				onlyRunning: params.onlyRunning === true,
@@ -6347,10 +6359,11 @@ export default function (pi: ExtensionAPI) {
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
-		parameters: SubagentParams,
+		parameters: makeStrictJsonSchema(SubagentParams),
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			params = omitNulls(params);
 			const toolCallId = _toolCallId;
 			// One invocation is one wave, however many tasks it carries — that is the unit the
 			// fan-out layer plans in, so it is the unit the ledger's rows are grouped by.
@@ -7490,9 +7503,10 @@ export default function (pi: ExtensionAPI) {
 		],
 		description:
 			"Dispatch two or more independent subagent tasks together in one background wave. This is the only tool for tasks[] fan-out. Each item contains exactly a complete non-empty task and an agent name; the runtime assigns safe unique worker ids. Use subagent for single, chain, abort, or resolve.",
-		parameters: ParallelSubagentParams,
+		parameters: makeStrictJsonSchema(ParallelSubagentParams),
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			params = omitNulls(params);
 			const reserved = new Set<string>();
 			const delegated = {
 				tasks: params.tasks.map((task) => ({

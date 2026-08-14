@@ -2,6 +2,7 @@
 // Inject OpenAI/ChatGPT Codex hosted web_search into openai-codex-responses requests.
 // Upstream: https://chatgpt.com/backend-api/codex/responses
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { makeStrictFunctionTools } from "../pi-ext/subagent/strict-json-schema.ts";
 
 const CODEX_SERVER_TOOLS = [{ type: "web_search" }] as const;
 
@@ -64,7 +65,7 @@ export default function (pi: ExtensionAPI) {
     const payload = event.payload as ResponsesPayload;
     return {
       ...payload,
-      tools: mergeServerTools(payload.tools),
+      tools: makeStrictFunctionTools(mergeServerTools(payload.tools)),
     };
   });
 

@@ -22,6 +22,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { makeStrictJsonSchema } from "./strict-json-schema.ts";
 
 import { LEDGER_TEMPLATE, ledgerPath } from "./boss-ledger.ts";
 
@@ -134,10 +135,10 @@ export function bossLedgerNoteTool(session: { mainCwd: string | undefined; sessi
 			"Never blocks a dispatch: record after dispatching, never before.",
 		].join(" "),
 		promptSnippet: "Record a decision / outcome / risk in the boss ledger",
-		parameters: Type.Object({
+		parameters: makeStrictJsonSchema(Type.Object({
 			section: Type.String({ description: `One of: ${sections}` }),
 			note: Type.String({ minLength: 1, maxLength: 2_000, description: "One line. Newlines are collapsed to spaces." }),
-		}, { additionalProperties: false }),
+		}, { additionalProperties: false })),
 		async execute(_toolCallId: string, params: { section: string; note: string }) {
 			if (!isBossLedgerSection(params.section)) {
 				return text(`Unknown section "${params.section}". Valid sections: ${Object.keys(BOSS_LEDGER_SECTIONS).join(", ")}.`, true);

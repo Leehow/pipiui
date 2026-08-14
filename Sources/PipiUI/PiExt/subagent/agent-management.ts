@@ -16,6 +16,7 @@ import { randomBytes } from "node:crypto";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { makeStrictJsonSchema, omitNulls } from "./strict-json-schema.ts";
 import {
 	discoverAgents,
 	summarizeAgentPermissions,
@@ -83,7 +84,7 @@ const CapabilitiesParams = Type.Optional(
 		mcpTools: Type.Optional(Type.Array(Type.String({ maxLength: 160 }))),
 		desktop: Type.Optional(StringEnum(["none", "requestable"] as const)),
 		delegation: Type.Optional(Type.Boolean()),
-	}),
+	}, { additionalProperties: false }),
 );
 
 const SubagentManageParams = Type.Object({
@@ -104,7 +105,7 @@ const SubagentManageParams = Type.Object({
 	path: Type.Optional(Type.String({ maxLength: 1_000, description: "For validate only: root-relative existing candidate file (`name.md` or `name/AGENT.md`). Absolute and traversal paths are rejected." })),
 	format: Type.Optional(StringEnum(["legacy", "package"] as const, { description: "Draft format for validate; package is the default." })),
 	overwrite: Type.Optional(Type.Boolean({ description: "install only: false by default. True atomically replaces an existing regular AGENT.md file." })),
-});
+}, { additionalProperties: false });
 
 function parserIdentity(scope: MutableScope): { source: AgentSource; origin: AgentOrigin } {
 	return scope === "project"
@@ -515,8 +516,9 @@ export function registerSubagentManagementTool(pi: ExtensionAPI): void {
 			"inspect returns one definition; validate uses the runtime agents.ts parser; scaffold produces a least-privilege schema:1 package; install safely writes only a validated user/project package.",
 			"Every result is structured JSON `{version:1, success, action, diagnostics, data}`. Runtime dispatch still applies disabled-tools, extension availability, desktop per-task grants, role/depth limits, and project confirmation separately.",
 		].join(" "),
-		parameters: SubagentManageParams,
+		parameters: makeStrictJsonSchema(SubagentManageParams),
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			rawParams = omitNulls(rawParams);
 			try {
 				return toolResponse(executeManage(rawParams as ManageParams, safeContextCwd(ctx.cwd)));
 			} catch (error) {
