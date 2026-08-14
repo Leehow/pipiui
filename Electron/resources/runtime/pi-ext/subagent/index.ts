@@ -33,7 +33,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { makeStrictJsonSchema, omitNulls } from "./strict-json-schema.ts";
+import { bindPrepareStrictToolArguments, makeStrictJsonSchema, omitNulls } from "./strict-json-schema.ts";
 import {
 	COMPUTER_WORKER_FAILURE_CODES,
 	type ComputerPlan,
@@ -495,7 +495,7 @@ function isolatedComputerWorkerChildProcessEnv(
 	env.ELECTRON_RUN_AS_NODE = "1";
 	for (const [key, value] of Object.entries(extra)) {
 		if (terminalWorkerEnvKeys.has(key) || desktopWorkerEnvKeys.has(key)
-			|| ["PIPIUI_AGENT_ID", "PIPIUI_AGENT_RUN_ID", "PIPIUI_AGENT_DEPTH", "PIPIUI_AGENT_ROLE", "PIPIUI_MAIN_MODEL", "PIPIUI_SUBAGENT_SKILL_ISOLATION", "PIPIUI_SKILL_READ_BLOCK", "PIPI_PHILOSOPHY_ROLE"].includes(key)) env[key] = value;
+			|| ["PIPIUI_AGENT_ID", "PIPIUI_AGENT_RUN_ID", "PIPIUI_AGENT_DEPTH", "PIPIUI_AGENT_ROLE", "PIPIUI_MAIN_MODEL", "PIPIUI_SUBAGENT_SKILL_ISOLATION", "PIPIUI_SKILL_READ_BLOCK", "PIPI_PHILOSOPHY_ROLE", "PIPI_PHILOSOPHY_AGENT"].includes(key)) env[key] = value;
 	}
 	return env;
 }
@@ -4441,6 +4441,10 @@ async function runSingleAgent(
 					// consistent with `tools` already deciding whether it can dispatch at all.
 					PIPI_PHILOSOPHY_ROLE:
 						agent.traits.delegates && runtimePolicy.allowRecursiveDelegation ? "lead" : "worker",
+					// The agent's own name, so a philosophy layer can address one kind of worker:
+					// craft rules to whoever writes code, research rules to whoever investigates.
+					// Without it every dispatched agent looks alike and only role-wide layers land.
+					PIPI_PHILOSOPHY_AGENT: agentName,
 					...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
 					// Every dispatched child runs isolated from external skill libraries; an agent
 					// that asks for it (`block-skill-reads: true`) also cannot read SKILL.md at all.
@@ -6143,14 +6147,16 @@ export default function (pi: ExtensionAPI) {
 					? `process never attached a pid after ${elapsed}; treated as interrupted (vanished)`
 					: `process gone after ${elapsed}, no result reported`;
 			if (!markWorkerInterrupted(agentId, reason)) continue;
-			deliverSubagentDone(
-				pi,
-				[
-					`[subagent-heartbeat] outstanding=${runningAgents.size} vanished=1 stalled=0`,
-					`  ${agentId} (${title}) — ${reason}, state=interrupted`,
-					"A vanished worker was interrupted, not failed: its stored conversation is intact, so re-dispatch that same agentId to continue where it left off.",
-				].join("\n"),
-			);
+			const vanishedText = [
+				`[subagent-heartbeat] outstanding=${runningAgents.size} vanished=1 stalled=0`,
+				`  ${agentId} (${title}) — ${reason}, state=interrupted`,
+				"A vanished worker was interrupted, not failed: its stored conversation is intact.",
+				`FIRST call subagent_status({agentId:"${agentId}"}), then call subagent_status() without agentId and inspect every worker relevant to this user's goal.`,
+				"Then choose exactly one: resume that same agentId / abort and re-dispatch by a materially different route / abort and ask the user. Do not treat this message as a new user request.",
+			].join("\n");
+			const vanishedRunId = jobRegistry.get(agentId)?.runId;
+			if (vanishedRunId) deliverConfirmedDone(pi, agentId, vanishedRunId, vanishedText);
+			else deliverSubagentDone(pi, vanishedText);
 		}
 
 		// (3) stall 推送 / 复推
@@ -6335,12 +6341,14 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	const subagentParameters = makeStrictJsonSchema(SubagentParams);
+	const parallelSubagentParameters = makeStrictJsonSchema(ParallelSubagentParams);
 	const subagentTool = {
 		name: "subagent",
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
-			"Modes: single (task + agent), chain (sequential with {previous} placeholder), abort, and resolve. For two or more independent tasks, ALWAYS use subagent_parallel; NEVER pass tasks[] to this tool.",
+			"Dispatch one worker with task + agent. For sequential steps use chain. Never set action when dispatching — action is only \"abort\" or \"resolve\" for an existing job. For two or more independent tasks, ALWAYS use subagent_parallel; NEVER pass tasks[] to this tool.",
 			"Before dispatching related work, inspect subagent_status: it includes persisted task/result history. Decide semantically whether to continue an exact prior agentId or create a new worker; the runtime never maps prose to a task key.",
 			"Optional thinking is accepted per single/task/chain step; it applies only to that dispatch, never inherits Boss thinking, and v1 intentionally has no per-task model. The dynamic system prompt shows each agent's configured model/fallback chain and allowed levels.",
 			"At boss depth 0, single/parallel default to background=true: tool returns immediately with agentIds; each agent completion arrives later as a user message prefixed [subagent-done].",
@@ -6359,7 +6367,8 @@ export default function (pi: ExtensionAPI) {
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
-		parameters: makeStrictJsonSchema(SubagentParams),
+		parameters: subagentParameters,
+		prepareArguments: bindPrepareStrictToolArguments(subagentParameters),
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -7503,7 +7512,8 @@ export default function (pi: ExtensionAPI) {
 		],
 		description:
 			"Dispatch two or more independent subagent tasks together in one background wave. This is the only tool for tasks[] fan-out. Each item contains exactly a complete non-empty task and an agent name; the runtime assigns safe unique worker ids. Use subagent for single, chain, abort, or resolve.",
-		parameters: makeStrictJsonSchema(ParallelSubagentParams),
+		parameters: parallelSubagentParameters,
+		prepareArguments: bindPrepareStrictToolArguments(parallelSubagentParameters),
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			params = omitNulls(params);
