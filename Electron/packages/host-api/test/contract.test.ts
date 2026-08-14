@@ -534,3 +534,23 @@ describe('Electron-native project directory picker extension', () => {
     expect(calls).toEqual([{ method: 'pickProjectDirectory', params: [] }])
   })
 })
+
+describe('Electron-native Computer Use permission opener', () => {
+  it('is exposed only when the preload opts into system permission settings', async () => {
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: { enabled: true, screenRecording: false, accessibility: true } }
+      },
+      on: () => undefined,
+      removeListener: () => undefined
+    }
+
+    expect(createIpcHost(ipc).openComputerUsePermission).toBeUndefined()
+    const open = createIpcHost(ipc, undefined, { computerUsePermissions: true }).openComputerUsePermission
+    if (!open) throw new Error('computer-use permission opener unavailable')
+    await expect(open('screenRecording')).resolves.toEqual({ enabled: true, screenRecording: false, accessibility: true })
+    expect(calls).toEqual([{ method: 'openComputerUsePermission', params: ['screenRecording'] }])
+  })
+})

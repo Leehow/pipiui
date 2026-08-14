@@ -1,29 +1,32 @@
 import { useEffect, useState } from 'react'
-import type { PipiHostAPI } from '@pipi/host-api'
+import type { ComputerUsePermissionKind, ComputerUseState, PipiHostAPI } from '@pipi/host-api'
 import './computer-use.css'
-
-type ComputerState = { enabled: boolean; screenRecording?: boolean; accessibility?: boolean }
 
 /** Electron parity for Swift's compact ComputerUseSettingsPanel. */
 export function ComputerUsePanel({ host, onClose }: { host: PipiHostAPI; onClose: () => void }) {
   const hostMethodsPresent = typeof host.getComputerUseState === 'function' && typeof host.setComputerUseEnabled === 'function'
   const [available, setAvailable] = useState(hostMethodsPresent)
-  const [state, setState] = useState<ComputerState>({ enabled: false })
+  const [state, setState] = useState<ComputerUseState>({ enabled: false })
   const [loading, setLoading] = useState(hostMethodsPresent)
   const [saving, setSaving] = useState(false)
+  const [opening, setOpening] = useState<ComputerUsePermissionKind | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!host.getComputerUseState) return
     let active = true
-    void host.getComputerUseState().then(next => {
-      if (active) setState(next)
-    }).catch(() => {
-      // IPC factories expose optional methods optimistically; an older backend
-      // replies “unknown method”, which is an unavailable settings surface.
-      if (active) setAvailable(false)
-    }).finally(() => { if (active) setLoading(false) })
-    return () => { active = false }
+    const load = (markUnavailableOnError = false) => {
+      void host.getComputerUseState!().then(next => {
+        if (active) setState(next)
+      }).catch(() => {
+        // IPC factories expose optional methods optimistically; an older backend
+        // replies “unknown method”, which is an unavailable settings surface.
+        if (active && markUnavailableOnError) setAvailable(false)
+      }).finally(() => { if (active) setLoading(false) })
+    }
+    load(true)
+    const timer = window.setInterval(() => load(false), 2000)
+    return () => { active = false; window.clearInterval(timer) }
   }, [host])
 
   const toggle = async () => {
@@ -40,6 +43,19 @@ export function ComputerUsePanel({ host, onClose }: { host: PipiHostAPI; onClose
       setError(`保存失败：${err instanceof Error ? err.message : String(err)}`)
     } finally {
       setSaving(false)
+    }
+  }
+
+  const openPermission = async (kind: ComputerUsePermissionKind) => {
+    if (!host.openComputerUsePermission || opening) return
+    setOpening(kind)
+    setError(null)
+    try {
+      setState(await host.openComputerUsePermission(kind))
+    } catch (err) {
+      setError(`打开系统设置失败：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setOpening(null)
     }
   }
 
@@ -70,8 +86,8 @@ export function ComputerUsePanel({ host, onClose }: { host: PipiHostAPI; onClose
             </div>
             <p className="computer-use-description">打开后桌面工具只注入给带 desktop 授权的 subagent（operator）；主会话不持有 computer 工具。</p>
             <div className="computer-use-permissions" aria-label="桌面权限">
-              <PermissionRow title="屏幕录制" granted={state.screenRecording} />
-              <PermissionRow title="辅助功能" granted={state.accessibility} />
+              <PermissionRow title="屏幕录制" kind="screenRecording" granted={state.screenRecording} opening={opening === 'screenRecording'} onOpen={host.openComputerUsePermission ? openPermission : undefined} />
+              <PermissionRow title="辅助功能" kind="accessibility" granted={state.accessibility} opening={opening === 'accessibility'} onOpen={host.openComputerUsePermission ? openPermission : undefined} />
             </div>
             {error && <div className="settings-modal-error" role="alert">{error}</div>}
           </div>
@@ -81,9 +97,11 @@ export function ComputerUsePanel({ host, onClose }: { host: PipiHostAPI; onClose
   )
 }
 
-function PermissionRow({ title, granted }: { title: string; granted?: boolean }) {
+function PermissionRow({ title, kind, granted, opening, onOpen }: { title: string; kind: ComputerUsePermissionKind; granted?: boolean; opening: boolean; onOpen?: (kind: ComputerUsePermissionKind) => void }) {
   const known = granted !== undefined
   const allowed = granted === true
+  const canOpen = typeof onOpen === 'function'
+  const actionLabel = allowed ? `打开${title}设置` : `去授权${title}`
   return (
     <div className="computer-use-permission-row">
       <span className={`computer-use-permission-status ${allowed ? 'granted' : known ? 'denied' : 'unknown'}`} aria-label={`${title}${allowed ? '已授权' : known ? '未授权' : '状态未提供'}`}>
@@ -91,7 +109,15 @@ function PermissionRow({ title, granted }: { title: string; granted?: boolean })
       </span>
       <span>{title}</span>
       <span className="computer-use-permission-label">{allowed ? '已授权' : known ? '未授权' : '未提供'}</span>
-      <button type="button" disabled={!known} title={known ? 'Electron 后端暂不能打开系统权限设置' : '当前连接未提供权限状态'}>{allowed ? '设置' : '去授权'}</button>
+      <button
+        type="button"
+        aria-label={actionLabel}
+        disabled={!canOpen || opening}
+        title={canOpen ? (allowed ? '打开系统设置' : '打开系统设置并请求授权') : (known ? '当前连接不能打开系统权限设置' : '当前连接未提供权限状态')}
+        onClick={() => onOpen?.(kind)}
+      >
+        {allowed ? '设置' : '去授权'}
+      </button>
     </div>
   )
 }

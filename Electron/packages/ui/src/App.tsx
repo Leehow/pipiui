@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { VirtuosoHandle } from 'react-virtuoso'
 import { SubagentPanel } from './SubagentPanel'
 import { DocumentPanel } from './DocumentPanel'
@@ -846,6 +846,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [stopError, setStopError] = useState<{ sessionId: string; message: string } | null>(null)
   const [lease, setLease] = useState<SessionLease | null>(null)
   const [activeTab, setActiveTab] = useState<PanelTab>('Subagents')
+  const [toolReturnTab, setToolReturnTab] = useState<PanelTab | null>(null)
+  const activeTabRef = useRef(activeTab)
+  activeTabRef.current = activeTab
+  const rememberToolReturn = useCallback((tab: PanelTab) => {
+    const current = activeTabRef.current
+    if (tab !== current) setToolReturnTab(tab === 'Subagents' ? null : current)
+    setActiveTab(tab)
+  }, [])
   const [openedDocumentPath, setOpenedDocumentPath] = useState<string | null>(null)
   const [announcedTerminals, setAnnouncedTerminals] = useState<Record<string, TerminalSession>>({})
   const [revealedTerminalIds, setRevealedTerminalIds] = useState<Record<string, string>>({})
@@ -973,16 +981,16 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   useEffect(() => {
     if (!host.browser) return
     return host.browser.subscribe(event => {
-      if (event.type === 'reveal' && event.sessionId === selectedSession) setActiveTab('Browser')
+      if (event.type === 'reveal' && event.sessionId === selectedSession) rememberToolReturn('Browser')
     })
-  }, [host, selectedSession])
+  }, [host, rememberToolReturn, selectedSession])
   useEffect(() => {
     if (!host.terminal?.subscribeAll) return
     return host.terminal.subscribeAll((event: TerminalEvent) => {
       if (event.type === 'opened') setAnnouncedTerminals(current => ({ ...current, [event.sessionId]: event.terminal }))
-      if (event.type === 'reveal' && event.sessionId === selectedSession) { setRevealedTerminalIds(current => ({ ...current, [event.sessionId]: event.terminalId })); setActiveTab('Terminal') }
+      if (event.type === 'reveal' && event.sessionId === selectedSession) { setRevealedTerminalIds(current => ({ ...current, [event.sessionId]: event.terminalId })); rememberToolReturn('Terminal') }
     })
-  }, [host, selectedSession])
+  }, [host, rememberToolReturn, selectedSession])
   useEffect(() => {
     let mounted = true
     const unsubscribe = host.subscribeAgents(event => {
@@ -1778,6 +1786,19 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: !current.tools }))
     else setWidths(current => ({ ...current, toolsCollapsed: !current.toolsCollapsed }))
   }
+  const expandTools = useCallback(() => {
+    if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: true }))
+    else setWidths(current => current.toolsCollapsed ? { ...current, toolsCollapsed: false } : current)
+  }, [narrowViewport])
+  const navigateTool = useCallback((tab: PanelTab) => {
+    rememberToolReturn(tab)
+    expandTools()
+  }, [expandTools, rememberToolReturn])
+  const goBackTool = useCallback(() => {
+    const target = toolReturnTab ?? 'Subagents'
+    setToolReturnTab(null)
+    setActiveTab(target)
+  }, [toolReturnTab])
   /** Swift panelQuickRail behavior: switching opens the panel, re-clicking the active tool closes it. */
   const selectTool = (tab: PanelTab) => {
     if (!toolsCollapsed && activeTab === tab) {
@@ -1785,11 +1806,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       else setWidths(current => ({ ...current, toolsCollapsed: true }))
       return
     }
-    setActiveTab(tab)
-    if (toolsCollapsed) {
-      if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: true }))
-      else setWidths(current => ({ ...current, toolsCollapsed: false }))
-    }
+    navigateTool(tab)
   }
   const openQwenTokenPlanLogin = async () => {
     // Swift InputBar parity: the Token Plan login capsule opens the embedded
@@ -1801,32 +1818,22 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setProjectError(`打开 Token Plan 登录页失败：${error instanceof Error ? error.message : String(error)}`)
       return
     }
-    setActiveTab('Browser')
-    if (toolsCollapsed) {
-      if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: true }))
-      else setWidths(current => ({ ...current, toolsCollapsed: false }))
-    }
+    navigateTool('Browser')
   }
   const revealSubagentsForNewRun = useCallback(() => {
     // Match Swift: reveal a new run only when the right pane is closed. An
     // already-open Browser/Document/Terminal tab remains under user control.
     if (!toolsCollapsed) return
-    setActiveTab('Subagents')
-    if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: true }))
-    else setWidths(current => ({ ...current, toolsCollapsed: false }))
-  }, [narrowViewport, toolsCollapsed])
+    navigateTool('Subagents')
+  }, [navigateTool, toolsCollapsed])
   /** Subagent tool-card click: always open the Subagents pane (Swift card tap parity). */
   const openSubagents = useCallback(() => {
-    setActiveTab('Subagents')
-    if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: true }))
-    else setWidths(current => ({ ...current, toolsCollapsed: false }))
-  }, [narrowViewport])
+    navigateTool('Subagents')
+  }, [navigateTool])
   const openDocument = useCallback((path: string) => {
     setOpenedDocumentPath(path)
-    setActiveTab('Document')
-    if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: true }))
-    else setWidths(current => ({ ...current, toolsCollapsed: false }))
-  }, [narrowViewport])
+    navigateTool('Document')
+  }, [navigateTool])
 
   const shellClass = `pipiui-shell${isElectronChrome() ? ' electron-chrome' : ''}${sidebarCollapsed ? ' sidebar-collapsed' : ''}${toolsCollapsed ? ' tools-collapsed' : ''}`
   // The first-response wait (any active main turn) takes precedence at the
@@ -1844,7 +1851,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     <section className="chat-column">
       <ChatHeader session={sessions.find(item => item.id === selectedSession)} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={sidebarCollapsed} toolsCollapsed={toolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onRename={renameSidebarSession} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} />
       <div className="chat-viewport" data-testid="chat-viewport">
-        <ToolQuickRail activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunningCount={subagentsRunningCount} />
+        {toolsCollapsed && <ToolQuickRail variant="float" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunningCount={subagentsRunningCount} />}
         <LiveSubagentBindingProvider host={host} sessionId={selectedSession}>
           {(() => {
             const ids = (selectedSession && !mountedSessionIds.includes(selectedSession)
@@ -1879,7 +1886,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       </div>
     </section>
     <ResizeHandle label="调整工具栏宽度" onPointerDown={resize('tools', widths.tools)} />
-    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={openedDocumentPath} onOpenDocument={openDocument} />
+    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== 'Subagents'} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={openedDocumentPath} onOpenDocument={openDocument} />
     {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} current={modelState?.model ?? null} onModelState={applySelectedModelState} onClose={() => setModalOpen(false)} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} />}
@@ -2135,8 +2142,8 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     {lightboxIndex !== null && attachments[lightboxIndex] && <div className="lightbox-backdrop" data-testid="lightbox" onMouseDown={event => { if (event.target === event.currentTarget) setLightboxIndex(null) }}><img src={attachments[lightboxIndex].url} alt="图片预览" /><button className="lightbox-close" aria-label="关闭预览" onClick={() => setLightboxIndex(null)}>×</button></div>}
   </footer>
 }
-function ToolQuickRail({ activeTab, toolsCollapsed, onSelect, host, browserAvailable, terminalAvailable, subagentsRunningCount }: { activeTab: PanelTab; toolsCollapsed: boolean; onSelect: (tab: PanelTab) => void; host: PipiHostAPI; browserAvailable: boolean | undefined; terminalAvailable: boolean | undefined; subagentsRunningCount: number }) {
-  return <nav className="tool-quick-rail" aria-label="工具面板" data-testid="tool-quick-rail">
+function ToolQuickRail({ variant, activeTab, toolsCollapsed, onSelect, host, browserAvailable, terminalAvailable, subagentsRunningCount }: { variant: 'header' | 'float'; activeTab: PanelTab; toolsCollapsed: boolean; onSelect: (tab: PanelTab) => void; host: PipiHostAPI; browserAvailable: boolean | undefined; terminalAvailable: boolean | undefined; subagentsRunningCount: number }) {
+  return <nav className={`tool-quick-rail tool-quick-rail-${variant}`} aria-label="工具面板" data-testid="tool-quick-rail">
     {tabs.map(tab => {
       const browserUnavailable = tab === 'Browser' && (browserAvailable === false || !host.browser)
       const terminalUnavailable = tab === 'Terminal' && (terminalAvailable === false || !host.terminal)
@@ -2150,7 +2157,7 @@ function ToolQuickRail({ activeTab, toolsCollapsed, onSelect, host, browserAvail
     })}
   </nav>
 }
-function ToolPanel({ activeTab, collapsed, onToggleCollapsed, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted, browserAvailable, browserOccluded, terminalAvailable, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument }: { activeTab: PanelTab; collapsed: boolean; onToggleCollapsed: () => void; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningCountChange: (count: number) => void; onSubagentStarted: () => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void }) {
+function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, onBack, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted, browserAvailable, browserOccluded, terminalAvailable, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument }: { activeTab: PanelTab; collapsed: boolean; onToggleCollapsed: () => void; rail?: ReactNode; canGoBack: boolean; onBack: () => void; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningCountChange: (count: number) => void; onSubagentStarted: () => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void }) {
   const [terminalMounted, setTerminalMounted] = useState(activeTab === 'Terminal')
   const [documentMounted, setDocumentMounted] = useState(activeTab === 'Document')
   const [browserMounted, setBrowserMounted] = useState(activeTab === 'Browser')
@@ -2160,7 +2167,8 @@ function ToolPanel({ activeTab, collapsed, onToggleCollapsed, host, theme, sessi
     if (activeTab === 'Browser') setBrowserMounted(true)
   }, [activeTab])
   return <aside className="tool-panel">
-    {!collapsed && <header className="tool-panel-header"><strong>{activeTab}</strong><button className="pane-toggle" data-testid="toggle-tools" title="收起右栏" aria-label="收起右栏" aria-expanded="true" onClick={onToggleCollapsed}><RightPaneToggleIcon expanded /></button></header>}
+    {!collapsed && <header className="tool-panel-header">{rail}<button className="pane-toggle" data-testid="toggle-tools" title="收起右栏" aria-label="收起右栏" aria-expanded="true" onClick={onToggleCollapsed}><RightPaneToggleIcon expanded /></button></header>}
+    {!collapsed && canGoBack && <div className="tool-panel-nav"><button type="button" className="tool-panel-back" data-testid="tool-panel-back" aria-label="返回上一栏" onClick={onBack}>‹ 返回</button></div>}
     <div className="tool-content">
       <div className="tool-page subagent-content" hidden={activeTab !== 'Subagents'}><SubagentPanel host={host} sessionId={sessionId} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} visible={activeTab === 'Subagents' && !collapsed} onRunningCountChange={onSubagentsRunningCountChange} onAgentStarted={onSubagentStarted} /></div>
       {activeTab === 'Terminal' && terminalAvailable === false ? <div className="tool-page"><div className="empty-panel" data-testid="terminal-unavailable"><b>Terminal 不可用</b><p>当前连接未提供终端能力。</p></div></div> : terminalMounted || activeTab === 'Terminal' ? <div className="tool-page terminal-content" hidden={activeTab !== 'Terminal'}><TerminalPanel host={host} theme={theme} sessionId={sessionId} announcedTerminal={announcedTerminal} revealedTerminalId={revealedTerminalId} projectId={projectId} projectPath={projectPath} visible={activeTab === 'Terminal'} /></div> : null}

@@ -142,6 +142,8 @@ export type AgentSummary = { agentId: string; runId: string; name: string; task:
 export type WorktreeLifecycle = "none" | "active" | "pendingReview" | "merged" | "mergedCleanupPending" | "discarded";
 export type WorktreeStatus = { agentId: string; branch?: string; path?: string; error?: string; lifecycle: WorktreeLifecycle; merge: "ready" | "merged" | "conflict" | "unavailable"; discard: "ready" | "discarded" | "unavailable" };
 export type HostCapabilities = { computerUse: boolean; revealInFinder: boolean; terminal: boolean; plan: boolean; retainedWorktreeDisposition: boolean; [capability: string]: boolean };
+export type ComputerUsePermissionKind = "screenRecording" | "accessibility";
+export type ComputerUseState = { enabled: boolean; screenRecording?: boolean; accessibility?: boolean };
 
 /**
  * Work-tree git state for the chat toolbar; mirrors Swift `GitRepoStatus`.
@@ -379,6 +381,8 @@ export interface PipiHostAPI {
   /** Electron-only native folder chooser. `null` means the user cancelled. */
   pickProjectDirectory?(): Promise<string | null>;
   addProject?(path: string): Promise<Project>; removeProject?(projectId: string): Promise<void>;
+  /** Display name only; the on-disk folder is never renamed. */
+  renameProject?(projectId: string, name: string): Promise<Project>;
   /** Optional: absent or unsupported v2 hosts let the UI use its local preview fallback. */
   listDocuments?(projectId?: string): Promise<DocumentSummary[]>; readDocument?(documentId: string): Promise<DocumentContent>;
   newSession(projectId: string, name?: string): Promise<Session>; resumeSession(sessionId: string): Promise<Session>; renameSession(sessionId: string, name: string): Promise<Session>; deleteSession(sessionId: string): Promise<void>; moveSession(sessionId: string, targetProjectId: string): Promise<Session>; getSessionHistory(sessionId: string): Promise<HistoryEntry[]>; getSessionLease(sessionId: string): Promise<SessionLease>; forceTakeoverSessionLease(sessionId: string): Promise<SessionLease>;
@@ -404,8 +408,10 @@ export interface PipiHostAPI {
   getSidebarSessionPreferences?(): Promise<SidebarSessionPreferences>;
   setSidebarSessionPreferences?(preferences: SidebarSessionPreferences): Promise<SidebarSessionPreferences>;
   /** Optional desktop-control preference; permission probes are unavailable on some hosts. */
-  getComputerUseState?(): Promise<{ enabled: boolean; screenRecording?: boolean; accessibility?: boolean }>;
+  getComputerUseState?(): Promise<ComputerUseState>;
   setComputerUseEnabled?(enabled: boolean): Promise<{ enabled: boolean }>;
+  /** Electron/macOS-only: request the TCC permission and open the matching System Settings pane. */
+  openComputerUsePermission?(kind: ComputerUsePermissionKind): Promise<ComputerUseState>;
   /** Optional per-role model fallback chains. Empty chain follows the main Agent model. */
   getSubagentModels?(): Promise<Record<string, SubagentModelSetting[]>>;
   setSubagentModel?(agentName: string, chain: SubagentModelSetting[]): Promise<Record<string, SubagentModelSetting[]>>;
@@ -469,7 +475,7 @@ export interface PipiHostAPI {
    */
   gitStatus?(projectId: string): Promise<GitStatus>;
   gitCheckout?(projectId: string, branch: string): Promise<GitStatus>;
-  /** Optional v2 UI convenience; older hosts simply render Finder reveal disabled. */
+  /** Open the project folder in the OS file manager. Older hosts omit it and the UI disables the action. */
   revealProject?(projectId: string): Promise<void>;
   /** Optional extension; remote/non-Electron hosts advertise `capabilities().browser === false`. */
   browser?: BrowserHostAPI;
@@ -492,7 +498,7 @@ function requestId(): string { return `${Date.now()}-${Math.random().toString(36
 function apiFrom(
   call: (method: HostMethod, params: unknown[]) => Promise<unknown>,
   subscribe: (channel: HostEvent["channel"], predicate: (event: HostEvent) => boolean, listener: (event: HostEvent) => void) => Unsubscribe,
-  options: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean } = {}
+  options: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean; computerUsePermissions?: boolean } = {}
 ): PipiHostAPI {
   const invoke = <T>(method: HostMethod, ...params: unknown[]) => call(method, params) as Promise<T>;
   const api: PipiHostAPI = {
@@ -504,6 +510,7 @@ function apiFrom(
     pickProjectDirectory: () => invoke("pickProjectDirectory"),
     addProject: path => invoke("addProject", path),
     removeProject: projectId => invoke("removeProject", projectId),
+    renameProject: (projectId, name) => invoke("renameProject", projectId, name),
     listDocuments: projectId => invoke("listDocuments", projectId),
     readDocument: documentId => invoke("readDocument", documentId),
     newSession: (projectId, name) => invoke("newSession", projectId, name),
@@ -564,6 +571,7 @@ function apiFrom(
     capabilities: () => invoke("capabilities"),
     gitStatus: projectId => invoke("gitStatus", projectId),
     gitCheckout: (projectId, branch) => invoke("gitCheckout", projectId, branch),
+    revealProject: projectId => invoke("revealProject", projectId),
     browser: {
       selectSession: sessionId => invoke("browserSelectSession", sessionId),
       listTabs: sessionId => invoke("browserListTabs", sessionId),
@@ -594,6 +602,7 @@ function apiFrom(
   if (!options.projectDirectoryPicker) delete api.pickProjectDirectory;
   if (options.openExternal) api.openExternal = url => invoke("openExternal", url);
   if (options.openDocumentExternally) api.openDocumentExternally = path => invoke("openDocumentExternally", path);
+  if (options.computerUsePermissions) api.openComputerUsePermission = kind => invoke("openComputerUsePermission", kind);
   return api;
 }
 
@@ -603,7 +612,7 @@ function responseError(response: Extract<HostResponse, { ok: false }>): Error & 
   return error;
 }
 
-export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHANNEL, options?: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean }): PipiHostAPI {
+export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHANNEL, options?: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean; computerUsePermissions?: boolean }): PipiHostAPI {
   return apiFrom(
     async (method, params) => {
       const response = await ipc.invoke(channel, { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: requestId(), type: "request", method, params });

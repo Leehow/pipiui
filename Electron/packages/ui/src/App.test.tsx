@@ -273,9 +273,8 @@ describe('PipiUI Electron main layout', () => {
     await screen.findAllByText('Electron 三栏界面')
     const rail = container.querySelector('.tool-quick-rail')!
     expect(rail).toBeTruthy()
-    // floats inside the chat viewport (over the transcript), not inside the tool column
-    expect(container.querySelector('.chat-viewport')!.contains(rail)).toBe(true)
-    expect(container.querySelector('.tool-panel')!.contains(rail)).toBe(false)
+    expect(container.querySelector('.tool-panel-header')!.contains(rail)).toBe(true)
+    expect(container.querySelector('.chat-viewport')!.contains(rail)).toBe(false)
     expect(rail.querySelectorAll('button')).toHaveLength(4)
     const browser = screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement
     await waitFor(() => expect(browser.disabled).toBe(false))
@@ -284,14 +283,33 @@ describe('PipiUI Electron main layout', () => {
     expect(await screen.findByTestId('browser-panel')).toBeTruthy()
     expect(browser.className).toContain('active')
     // re-clicking the active tool closes the whole right pane; the rail stays
-    fireEvent.click(browser)
+    fireEvent.click(screen.getByRole('button', { name: 'Browser' }))
     expect(container.querySelector('.pipiui-shell')!.className).toContain('tools-collapsed')
-    expect(browser.className).not.toContain('active')
-    expect(container.querySelector('.tool-quick-rail')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Browser' }).className).not.toContain('active')
+    const floating = container.querySelector('.tool-quick-rail')!
+    expect(container.querySelector('.chat-viewport')!.contains(floating)).toBe(true)
+    expect(container.querySelector('.tool-panel')!.contains(floating)).toBe(false)
     // clicking again reopens the same tool
-    fireEvent.click(browser)
+    fireEvent.click(screen.getByRole('button', { name: 'Browser' }))
     expect(container.querySelector('.pipiui-shell')!.className).not.toContain('tools-collapsed')
     expect(await screen.findByTestId('browser-panel')).toBeTruthy()
+    expect(container.querySelector('.tool-panel-header')!.contains(container.querySelector('.tool-quick-rail'))).toBe(true)
+  })
+
+  it('puts a back control on non-Subagents tool pages and returns to the previous tab', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(screen.queryByTestId('tool-panel-back')).toBeNull()
+    const browser = screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement
+    await waitFor(() => expect(browser.disabled).toBe(false))
+    fireEvent.click(browser)
+    expect(await screen.findByTestId('browser-panel')).toBeTruthy()
+    const back = screen.getByTestId('tool-panel-back')
+    expect(back.closest('.tool-panel-nav')).not.toBeNull()
+    expect(container.querySelector('.subagent-header')?.contains(back)).toBe(false)
+    fireEvent.click(back)
+    expect(screen.queryByTestId('tool-panel-back')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Subagents' }).className).toContain('active')
   })
 
   it('auto-collapses both panes on a narrow viewport and still allows manual re-expand', async () => {
@@ -485,11 +503,14 @@ describe('PipiUI Electron main layout', () => {
 
   it('keeps the tool rail in a viewport-level pointer hit layer independent of panel contents', () => {
     const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
-    const railRule = [...css.matchAll(/\.tool-quick-rail\{[^}]*\}/g)].map(match => match[0]).find(rule => rule.includes('flex-direction:column')) ?? ''
-    expect(railRule).toContain('position:fixed')
-    expect(railRule).toContain('pointer-events:auto')
-    expect(railRule).toMatch(/z-index:(?:3[5-9]|[4-9]\d|\d{3,})/)
-    expect(railRule).toContain('right:calc(var(--tools-col) + 16px)')
+    const floatRule = [...css.matchAll(/\.tool-quick-rail-float\{[^}]*\}/g)].map(match => match[0]).find(rule => rule.includes('position:fixed')) ?? ''
+    expect(floatRule).toContain('position:fixed')
+    expect(floatRule).toContain('flex-direction:column')
+    expect(floatRule).toContain('pointer-events:auto')
+    expect(floatRule).toMatch(/z-index:(?:3[5-9]|[4-9]\d|\d{3,})/)
+    expect(floatRule).toContain('right:calc(var(--tools-col) + 16px)')
+    const headerRule = [...css.matchAll(/\.tool-quick-rail-header\{[^}]*\}/g)].map(match => match[0])[0] ?? ''
+    expect(headerRule).toContain('flex-direction:row')
   })
 
   it('reveals Browser when the host reports an agent browser action', async () => {

@@ -1,4 +1,4 @@
-import { app, BaseWindow, BrowserWindow, dialog, ipcMain, screen, shell, WebContentsView, type OpenDialogOptions } from 'electron'
+import { app, BaseWindow, BrowserWindow, desktopCapturer, dialog, ipcMain, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions } from 'electron'
 import { join } from 'node:path'
 import { createPiHostBackend, installRuntimeTree, QuotaStore } from '@pipi/pi-backend'
 import {
@@ -19,6 +19,7 @@ import { createQuotaCookieReader, createQuotaCookiePersister } from './quota-cap
 import { resolveRuntimeAssets } from './runtime-assets.js'
 import { withOpenDocumentExternally } from './external-document.js'
 import { withOpenExternal } from './external-url.js'
+import { createElectronComputerUsePermissionHost, withComputerUsePermissions } from './computer-use-permissions.js'
 import { createPtyTerminalBackend, TerminalSessionHost } from './terminal-host.js'
 export { createPtyTerminalBackend, resolveTerminalCwd, resolveTerminalShell } from './terminal-host.js'
 
@@ -181,7 +182,14 @@ if (app) {
       const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options)
       return result.canceled ? null : result.filePaths[0] ?? null
     }
-    const backend = withProjectDirectoryPicker(withOpenDocumentExternally(withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)), path => shell.openPath(path)), pickProjectDirectory)
+    const backend = withComputerUsePermissions(withProjectDirectoryPicker(withOpenDocumentExternally(withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)), path => shell.openPath(path)), pickProjectDirectory), createElectronComputerUsePermissionHost({
+      getMediaAccessStatus: media => systemPreferences.getMediaAccessStatus(media),
+      isTrustedAccessibilityClient: prompt => systemPreferences.isTrustedAccessibilityClient(prompt),
+      requestScreenRecording: async () => {
+        await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } })
+      },
+      openURL: url => shell.openExternal(url),
+    }))
     registerPipiHostIpc(ipcMain, backend)
     createWindow(browser, () => terminalHost.closeAll())
     // Once the background profile/capability install lands, invalidate + reload the
