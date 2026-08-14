@@ -63,14 +63,18 @@ function clampChars(value: string, max: number): { body: string; truncated: bool
  * Page-world extractor for the DuckDuckGo HTML endpoint. Kept as a plain function body (no
  * template interpolation) so the injected string can never carry user input; the count is
  * appended as a literal number after validation.
+ *
+ * Result links are DuckDuckGo redirects — observed shapes: `/l/?uddg=<encoded>` on the
+ * current HTML endpoint, `/y.js?u3=<encoded>` on older variants. Both decode to the real
+ * destination; anything else passes through as-is.
  */
 const DDG_EXTRACT_JS = `(() => {
   const decode = (href) => {
     try {
       const link = new URL(href, location.href);
-      if (link.hostname.endsWith("duckduckgo.com") && link.pathname.startsWith("/y.js")) {
-        const target = link.searchParams.get("uddg");
-        if (target) return decodeURIComponent(target);
+      if (link.hostname.endsWith("duckduckgo.com") && (link.pathname === "/l/" || link.pathname.startsWith("/y.js"))) {
+        const target = link.searchParams.get("uddg") ?? link.searchParams.get("u3");
+        if (target) return target;
       }
       return link.href;
     } catch { return href; }
@@ -137,6 +141,16 @@ export default function (pi: ExtensionAPI) {
       if (!r.ok) return bridgeFailure(r);
       const results = parseSearchResults(r.result);
       if (results.length === 0) {
+        // DuckDuckGo answers suspected automation with a challenge page (#challenge-form)
+        // instead of results. Detect it so the model waits/retries rather than
+        // concluding the query has no matches.
+        const challenge = await bridge("eval", { js: `!!document.querySelector("#challenge-form")` }, signal);
+        if (challenge.ok && challenge.result === true) {
+          return text(
+            `Search: ${query}\nSource: ${target}\nDuckDuckGo served a bot-check page instead of results (rate limit or fingerprint suspicion). Wait about a minute and retry, or fall back to web_search.`,
+            { url: target },
+          );
+        }
         return text(
           `Search: ${query}\nSource: ${target}\nResults: 0\n\nNo results parsed. Use browser {action:"observe"} on the current page to inspect it, or retry with different keywords.`,
           { url: target },

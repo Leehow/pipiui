@@ -111,7 +111,16 @@ if (app) {
   app.whenReady().then(async () => {
     // One BrowserTabsHost owns exactly one WebContentsView at a time. Its
     // `partition` constructor slot is reserved for future BrowserContext Spaces.
-    const browser = new BrowserSessionHost(options => new WebContentsView(options))
+    const browser = new BrowserSessionHost(options => {
+      const view = new WebContentsView(options)
+      // The default UA advertises "PipiUI Electron/… Electron/…" tokens; some sites
+      // (e.g. DuckDuckGo's HTML search endpoint) answer such framework UAs with
+      // bot-challenge pages instead of content. Keep the standard Chrome tokens only.
+      view.webContents.session.setUserAgent(
+        view.webContents.getUserAgent().replace(/\s*[\w ]*Electron\/[\d.]+/g, '')
+      )
+      return view
+    })
     const primary = screen.getPrimaryDisplay()
     const display = { displayID: primary.id, width: primary.size.width, height: primary.size.height }
     const assets = resolveRuntimeAssets({

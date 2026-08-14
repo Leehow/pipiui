@@ -17,6 +17,7 @@ class FakeWebContents {
   reload = vi.fn(() => { void this.loadURL(this.url) })
   executeJavaScript = vi.fn(async (code: string) => code.includes('__pipiBrowserDOM.dispatch')
     ? { ok: true, url: this.url, text: this.pageText, viewport: { ...this.viewport }, elements: this.viewport.width > 0 ? [{ index: 0, role: 'link', name: '热门视频' }] : [] }
+    : code.includes('document.documentElement.outerHTML') ? { title: `Title for ${this.url}`, url: this.url, content: this.pageText }
     : code.includes('querySelector') ? { ok: true } : this.pageText)
   capturePage = vi.fn(async () => ({ toPNG: () => Buffer.from('png-bytes') }))
   close = vi.fn()
@@ -157,6 +158,10 @@ describe('BrowserTabsHost', () => {
     await host.toolAction({ action: 'reload' })
     await expect(host.toolAction({ action: 'screenshot' })).resolves.toMatchObject({ ok: true, mimeType: 'image/png', base64: Buffer.from('png-bytes').toString('base64') })
     expect(contents.executeJavaScript.mock.calls.some(([code]) => String(code).includes('querySelector'))).toBe(true)
+    // eval/content bypass the structured DOM controller and run against the live page.
+    await expect(host.toolAction({ action: 'eval', js: 'document.title' })).resolves.toMatchObject({ ok: true, result: 'Bilibili 热门科技视频' })
+    await expect(host.toolAction({ action: 'content', mode: 'text' })).resolves.toMatchObject({ ok: true, content: 'Bilibili 热门科技视频', truncated: false })
+    await expect(host.toolAction({ action: 'eval' })).resolves.toMatchObject({ ok: false })
   })
 
   it('reveals and embeds the physical browser for a Pi action from another tool tab', async () => {

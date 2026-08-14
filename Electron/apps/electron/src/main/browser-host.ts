@@ -272,8 +272,44 @@ export class BrowserTabsHost {
       if (request.selector && (request.action === 'click' || request.action === 'input')) {
         return this.selectorAction(request)
       }
-      if (['observe', 'click', 'input', 'select', 'scroll', 'content', 'eval'].includes(request.action)) return this.domAction(request)
+      // eval/content run against the live page directly; the structured DOM
+      // controller only models observe/click/input/select/scroll, so routing
+      // these through domAction would surface "unsupported browser action".
+      if (request.action === 'eval') return this.evalAction(request)
+      if (request.action === 'content') return this.contentAction(request)
+      if (['observe', 'click', 'input', 'select', 'scroll'].includes(request.action)) return this.domAction(request)
       return { ok: false, error: `unknown browser action: ${request.action}` }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  private async evalAction(request: BrowserToolRequest): Promise<BrowserToolResult> {
+    await this.ensureToolPage()
+    const execute = this.view?.webContents.executeJavaScript
+    if (!execute || !this.active || this.shownTabId !== this.active.id) return { ok: false, error: 'browser page is unavailable' }
+    if (typeof request.js !== 'string' || request.js.length === 0) return { ok: false, error: 'browser eval requires js' }
+    try {
+      const result = await execute.call(this.view.webContents, request.js)
+      return { ok: true, result }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  private async contentAction(request: BrowserToolRequest): Promise<BrowserToolResult> {
+    await this.ensureToolPage()
+    const execute = this.view?.webContents.executeJavaScript
+    if (!execute || !this.active || this.shownTabId !== this.active.id) return { ok: false, error: 'browser page is unavailable' }
+    const htmlMode = request.mode === 'html'
+    // Read-only page dump composed as a static script; the mode flag is the
+    // only interpolated value and it is a validated boolean.
+    const source = `(() => { const html = ${JSON.stringify(htmlMode)}; return { title: document.title, url: location.href, content: html ? document.documentElement.outerHTML : (document.body ? document.body.innerText : "") }; })()`
+    try {
+      const raw = await execute.call(this.view.webContents, source) as { content?: unknown } | undefined
+      const full = typeof raw?.content === 'string' ? raw.content : ''
+      const truncated = full.length > 100_000
+      return { ok: true, content: truncated ? full.slice(0, 100_000) : full, truncated }
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) }
     }
