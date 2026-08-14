@@ -4,6 +4,19 @@
 
 **Read and follow [`CONSTITUTION.md`](./CONSTITUTION.md).**
 
+### Default product UI: Electron only (binding)
+
+- Default UI, product, and acceptance work is the Electron edition
+  (`Electron/packages/ui` → `build/PipiUI Electron.app`).
+- The Swift/SwiftUI app is frozen. Do not add features, fix UI, keep
+  Electron/Swift UI in parity, or package `build/PipiUI.app` unless the user
+  explicitly asks for the Swift edition in the current turn.
+- `Sources/PipiUI/PiExt` and `Sources/PipiUI/PiPhilosophy` are Swift-app
+  mirrors of `Electron/resources/runtime/`. Do not sync them from Electron
+  unless the user explicitly asks to update Swift.
+- “打包 / 打开 App / 验收” without naming Swift means the Electron App and
+  the `pipiui-electron-build` skill.
+
 ### Product priority: usability first (binding)
 
 - The first milestone must be a real, end-to-end usable product flow. Get the
@@ -95,21 +108,22 @@ each holds a slimming invariant that an innocuous-looking edit silently undoes.
 
 ### 快速打包（快速迭代）
 
-- `make-app.sh` 本身**不跑测试**，直接 release 打包 → 就是快速打包。
-- 需要跳过测试时用 `./scripts/build-app.sh --skip-tests`（等价快速打包）。
-- 依赖 SwiftPM **增量缓存**：不要每次 `swift clean`/删 `.build`。首次全量编译慢（约 90s+），之后只重编改动文件，秒级。
-- **增量只对公共接口未变的小改动有效**：重构/大范围改动会触发全量重编，耗时不可避免（无捷径，除非分布式构建/更强硬件）。
-- **并行 agent 构建已隔离**：可写 worker 各在独立 worktree，`.build` 各自独立，互不干扰；主仓打包用主仓自己的 `.build`。不要假设共享增量会产生冲突。
-- 耗时来源：release 编译（首次或重构）为主；`cua-driver` 下载与 `make-icon` 均有缓存，非瓶颈。
-- 只验证代码能否编译、不打包时，用 `swift build`（增量，最快），不要跑 `make-app.sh`。
+默认打 Electron，不要走 Swift 的 `make-app.sh`。
 
-Do **not** report "done / open the app" if only `.build/*` is fresh and `build/PipiUI.app` is older than sources.
+```bash
+~/.codex/skills/pipiui-electron-build/scripts/pipiui-electron-build fast-app --overwrite-running
+```
+
+- 只验证 Electron 工作区能否编译、不打包时，在 `Electron/` 跑对应 workspace build / 测试。
+- Swift 的 `make-app.sh` / `./scripts/build-app.sh` 仅在用户明确要求更新 Swift App 时使用。
+
+Do **not** report "done / open the app" if only `Electron/**/dist` or `.build/*` is fresh and `build/PipiUI Electron.app` is older than sources.
 
 Verify after package:
 
 ```bash
 stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
-  build/PipiUI.app/Contents/MacOS/PipiUI \
+  build/PipiUI\ Electron.app/Contents/MacOS/PipiUI\ Electron \
   <changed-source-files>
 ```
 
@@ -119,10 +133,9 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 |------|--------|
 | Project rules | `CONSTITUTION.md` |
 | Build / run docs | `README.md` → 构建运行 |
-| Package App (primary checkout only) | `./make-app.sh` → `build/PipiUI.app` |
-| Test + package (primary checkout only) | `./scripts/build-app.sh` |
-| Package Electron App (primary checkout only) | `pipiui-electron-build` skill → `fast-app` (host arch) or `release` (dual arch + DMG/ZIP); never `electron-builder` by hand |
-| 快速打包（跳过测试） | `./scripts/build-app.sh --skip-tests`（或 `./make-app.sh`） |
-| Worker/dev verification | `swift run` / `swift build` / `swift test` |
+| Default UI / package App | `pipiui-electron-build` skill → `fast-app` → `build/PipiUI Electron.app` |
+| Electron release (dual arch + DMG/ZIP) | `pipiui-electron-build` skill → `release`；never `electron-builder` by hand |
+| Swift App（frozen，仅用户点名时） | `./make-app.sh` → `build/PipiUI.app` |
+| Worker/dev verification | Electron workspace build / test；Swift 仅在点名时 `swift build` / `swift test` |
 
-macOS 14+ · SwiftPM + Electron · the only product bundles are `/Users/haoli/leehow/code/pipiui/build/PipiUI.app` and `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app`.
+macOS 14+ · default product is Electron (`build/PipiUI Electron.app`). The Swift App is frozen.
