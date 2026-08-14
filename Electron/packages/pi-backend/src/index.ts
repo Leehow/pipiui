@@ -952,6 +952,8 @@ export class PiHostBackend implements HostBackend {
   private settingsWrite: Promise<void> = Promise.resolve();
   private auth: ProviderAuthBackend;
   private authRuntimePromise?: Promise<AuthRuntimeLike>;
+  /** Resident external-pi worker (when authHelperPath is used); stopped on backend close. */
+  private externalAuthRuntime?: ExternalAuthRuntime;
   private queue: SessionMessageQueue;
   private queueStore: QueueStore;
   private quotaStore: QuotaStore;
@@ -1030,7 +1032,7 @@ export class PiHostBackend implements HostBackend {
     if (options.authRuntime) {
       this.authRuntimePromise = Promise.resolve(options.authRuntime);
     } else if (options.authHelperPath) {
-      this.authRuntimePromise = Promise.resolve(new ExternalAuthRuntime({
+      this.externalAuthRuntime = new ExternalAuthRuntime({
         helperPath: options.authHelperPath,
         nodePath: options.authNodePath ?? (this.piCommand.prefixArgs?.length ? this.piCommand.executable : undefined),
         piPath: this.piCommand.piPath ?? this.piCommand.executable,
@@ -1038,7 +1040,8 @@ export class PiHostBackend implements HostBackend {
         sessionsRoot: this.root,
         enforceProfile: this.profileMode === "isolated",
         env: { ...this.env, ...(this.piCommand.env ?? {}) },
-      }));
+      });
+      this.authRuntimePromise = Promise.resolve(this.externalAuthRuntime);
     }
     this.auth = new ProviderAuthBackend({
       runtime: {
@@ -1118,6 +1121,8 @@ export class PiHostBackend implements HostBackend {
   async close(): Promise<void> {
     this.persistAgentLogs();
     this.closed = true;
+    // Stop the resident external-pi worker if one was spawned during this run.
+    this.externalAuthRuntime?.stop();
     for (const wake of [...this.agentTerminalWaiters]) wake();
     this.titleGenerationAbort.abort();
     await Promise.allSettled([...this.backgroundTitleGenerations]);

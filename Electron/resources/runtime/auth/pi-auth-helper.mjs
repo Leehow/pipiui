@@ -40,11 +40,38 @@ function interaction() {
   input.on("line", line => { const waiter = pending.shift(); if (waiter) waiter(JSON.parse(line).answer); });
   return { value: { prompt: prompt => { emit({ event: "prompt", prompt }); return new Promise(resolve => pending.push(resolve)); }, notify: notification => emit({ event: "notify", notification }) }, close: () => input.close() };
 }
+/** Execute a single non-interactive command against the given ModelRuntime. */
+async function runCommand(rt, command, args) {
+  if (command === "list-models") return { models: (await rt.getAvailable()).map(serializeAvailableModel) };
+  if (command === "list-providers") { await rt.getAvailable(); return { providers: rt.getProviders().map(p => ({ id: p.id, name: p.name, auth: { oauth: p.auth?.oauth ? { loginLabel: p.auth.oauth.loginLabel } : undefined, apiKey: p.auth?.apiKey ? {} : undefined } })) }; }
+  if (command === "logout") { await rt.logout(args[0]); return {}; }
+  throw new Error(`unknown command ${command}`);
+}
+/** Reset the reused runtime's cached catalog/availability so the next command re-fetches (auth change). */
+async function reload(rt) {
+  if (typeof rt.refresh === "function") await rt.refresh({ force: true, allowNetwork: true, signal: AbortSignal.timeout(MODEL_REFRESH_TIMEOUT_MS) });
+}
+/** Resident worker: reuse one ModelRuntime across many commands via newline-delimited JSON-RPC on stdin/stdout. */
+async function serve() {
+  const rt = await runtime();
+  emit({ ready: true }); // startup handshake so the client knows the runtime is up
+  const input = createInterface({ input: process.stdin });
+  for await (const line of input) {
+    let req;
+    try { req = JSON.parse(line); } catch { emit({ id: "unknown", ok: false, error: "invalid request" }); continue; }
+    const id = req && typeof req.id === "string" ? req.id : "unknown";
+    try {
+      if (req.cmd === "reload") { await reload(rt); emit({ id, ok: true, data: {} }); continue; }
+      const data = await runCommand(rt, req.cmd, Array.isArray(req.args) ? req.args : []);
+      emit({ id, ok: true, data });
+    } catch (error) { emit({ id, ok: false, error: error instanceof Error ? error.message : String(error) }); }
+  }
+}
 async function main() {
-  const [command, providerId, authType] = process.argv.slice(2); const rt = await runtime();
-  if (command === "list-models") return emit({ ok: true, models: (await rt.getAvailable()).map(serializeAvailableModel) });
-  if (command === "list-providers") { await rt.getAvailable(); return emit({ ok: true, providers: rt.getProviders().map(p => ({ id: p.id, name: p.name, auth: { oauth: p.auth?.oauth ? { loginLabel: p.auth.oauth.loginLabel } : undefined, apiKey: p.auth?.apiKey ? {} : undefined } })) }); }
-  if (command === "logout") { await rt.logout(providerId); return emit({ ok: true }); }
+  const [command, providerId, authType] = process.argv.slice(2);
+  if (command === "serve") return serve();
+  const rt = await runtime();
+  if (command === "list-models" || command === "list-providers" || command === "logout") return emit({ ok: true, ...(await runCommand(rt, command, [providerId])) });
   if (command === "login-json") { const bridge = interaction(); try { emit({ ok: true, result: await rt.login(providerId, authType, bridge.value) }); } finally { bridge.close(); } return; }
   throw new Error(`unknown command ${command}`);
 }
