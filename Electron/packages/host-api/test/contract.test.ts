@@ -573,3 +573,23 @@ describe('Electron-native Computer Use permission opener', () => {
     expect(calls).toEqual([{ method: 'openComputerUsePermission', params: ['screenRecording'] }])
   })
 })
+
+describe('Electron-native update center extension', () => {
+  it('is exposed only when preload opts in and sends no renderer-controlled parameters', async () => {
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const result = { checkedAt: 123, items: [{ id: 'pi', name: 'Pi', currentVersion: '1.0.0', latestVersion: '1.0.1', status: 'updateAvailable' }] }
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result }
+      },
+      on: () => undefined,
+      removeListener: () => undefined
+    }
+    expect(createIpcHost(ipc).checkForUpdates).toBeUndefined()
+    const check = createIpcHost(ipc, undefined, { updateCenter: true }).checkForUpdates
+    if (!check) throw new Error('update center unavailable')
+    await expect(check()).resolves.toEqual(result)
+    expect(calls).toEqual([{ method: 'checkForUpdates', params: [] }])
+  })
+})
