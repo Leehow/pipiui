@@ -122,7 +122,7 @@ describe('SubagentPanel', () => {
     const row = await screen.findByTestId('agent-row-iso')
     fireEvent.click(row.querySelector('.agent-select')!)
 
-    expect(await screen.findByText('无法创建隔离工作区：该项目不在 Git 仓库中（或 Git 不可用），可写工人不能并行改文件。可在项目根目录执行 git init 后重试，或让主管改用只读工人 / 串行完成。')).toBeTruthy()
+    expect(await screen.findByText('工人没有启动，这次任务也没有自动交回主管。若文件夹缺少版本管理，重新添加文件夹可能有帮助；否则请查看技术详情后重试。')).toBeTruthy()
     expect(screen.getByText(`Writable subagent isolation failed before spawn: ${reason}`)).toBeTruthy()
   })
 

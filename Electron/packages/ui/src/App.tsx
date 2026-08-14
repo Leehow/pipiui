@@ -8,7 +8,6 @@ import { BrowserPanel } from './BrowserPanel'
 import { documentKindForName, resolveThinkingLevel, thinkingLevelsForModel } from '@pipi/host-api'
 import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, Project, PromptAttachment, Session, SessionLease, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
-import { GitInitConfirmDialog } from './GitInitConfirmDialog'
 import { ComputerUsePanel } from './ComputerUsePanel'
 import { RemoteConnectionPanel } from './RemoteConnectionPanel'
 import { SubagentModelModal } from './SubagentModelModal'
@@ -912,9 +911,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [terminalAvailable, setTerminalAvailable] = useState<boolean | undefined>(host.terminal ? undefined : false)
   const [retainedWorktreeDispositionAvailable, setRetainedWorktreeDispositionAvailable] = useState(false)
   const [projectError, setProjectError] = useState<string | null>(null)
-  // Non-git folder picked in the chooser: wait for the user's git-init decision
-  // before it joins the sidebar (writable workers need a git work tree).
-  const [gitConfirmPath, setGitConfirmPath] = useState<string | null>(null)
   const [modalOpen, setModalOpen] = useState(false)
   const [modalInitialView, setModalInitialView] = useState<'manage' | 'add'>('manage')
   // First-run onboarding: with zero credentialed models nothing can run, so the
@@ -1591,12 +1587,16 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (!path) return false
     const normalizedPath = path.trim()
     if (!normalizedPath) return false
-    if (host.probeDirectoryGit) {
+    // Writable workers are isolated in git worktrees, but "init or not" is not a
+    // question a non-technical user can answer — PipiUI answers it for them:
+    // a plain folder silently gains version management before joining the
+    // sidebar. Every failure falls through to a normal add: the main session
+    // still works, only parallel writable workers would be unavailable.
+    if (host.probeDirectoryGit && host.gitInitDirectory) {
       try {
         const status = await host.probeDirectoryGit(normalizedPath)
         if (!status.isRepo) {
-          setGitConfirmPath(normalizedPath)
-          return false
+          try { await host.gitInitDirectory(normalizedPath) } catch { /* git missing/permission: add anyway */ }
         }
       } catch {
         // A failed probe must not block adding — behave exactly like a host without one.
@@ -1962,18 +1962,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resize('tools', widths.tools)} />
     <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== 'Subagents'} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={openedDocumentPath} onOpenDocument={openDocument} />
     {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} current={modelState?.model ?? null} onModelState={applySelectedModelState} onClose={closeModelManager} initialView={modalInitialView} />}
-    {gitConfirmPath && <GitInitConfirmDialog
-      path={gitConfirmPath}
-      canInit={Boolean(host.gitInitDirectory)}
-      onInit={async () => {
-        if (!host.gitInitDirectory) throw new Error('当前连接不支持初始化 Git')
-        await host.gitInitDirectory(gitConfirmPath)
-        setGitConfirmPath(null)
-        await completeAddProject(gitConfirmPath)
-      }}
-      onAddAnyway={() => { const path = gitConfirmPath; setGitConfirmPath(null); void completeAddProject(path) }}
-      onCancel={() => setGitConfirmPath(null)}
-    />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} />}
     {subagentModelsOpen && <SubagentModelModal host={host} current={modelState?.model ?? null} visibility={modalVisibility} onClose={() => setSubagentModelsOpen(false)} />}

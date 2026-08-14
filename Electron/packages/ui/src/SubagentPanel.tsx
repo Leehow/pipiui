@@ -343,8 +343,8 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
   if (!messages.length && !isActive(agent)) messages.push({ content: agent.state === 'ok' ? '任务已完成' : agent.state === 'failed' ? '任务失败。请查看技术详情中的完整错误。' : `任务${stateText(agent)}，尚无返回内容。` })
   // Writable isolation failed before the worker even spawned (usually: the project
   // is not a git work tree). The raw stderr below stays as technical detail; this
-  // leading hint is the actionable version for the user.
-  if (agent.worktreeError) messages.unshift({ content: '无法创建隔离工作区：该项目不在 Git 仓库中（或 Git 不可用），可写工人不能并行改文件。可在项目根目录执行 git init 后重试，或让主管改用只读工人 / 串行完成。' })
+  // leading hint is the plain-language version — no commands, no jargon.
+  if (agent.worktreeError) messages.unshift({ content: '工人没有启动，这次任务也没有自动交回主管。若文件夹缺少版本管理，重新添加文件夹可能有帮助；否则请查看技术详情后重试。' })
   return messages
 }
 

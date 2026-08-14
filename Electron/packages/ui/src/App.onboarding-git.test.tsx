@@ -29,28 +29,8 @@ function projectHost(overrides: Partial<PipiHostAPI>): PipiHostAPI {
   return { ...createMockHost(), listProjects, getProjectPaths, addProject, ...overrides }
 }
 
-describe('add-project git guard', () => {
-  it('asks before adding a non-git folder, then init-and-adds in one click', async () => {
-    const gitInitDirectory = vi.fn(async () => A_REPO)
-    const probeDirectoryGit = vi.fn(async () => NOT_A_REPO)
-    const addProjectHost = projectHost({ probeDirectoryGit, gitInitDirectory })
-    const host: PipiHostAPI = { ...addProjectHost, pickProjectDirectory: vi.fn(async () => '/Users/demo/plain') }
-    render(<App host={host} />)
-    await screen.findByText('existing')
-
-    fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
-    expect(await screen.findByTestId('git-init-modal')).toBeTruthy()
-    expect(screen.getByText('/Users/demo/plain')).toBeTruthy()
-    expect(host.addProject).not.toHaveBeenCalled()
-
-    fireEvent.click(screen.getByTestId('git-init-confirm'))
-    await waitFor(() => expect(gitInitDirectory).toHaveBeenCalledWith('/Users/demo/plain'))
-    await waitFor(() => expect(host.addProject).toHaveBeenCalledWith('/Users/demo/plain'))
-    expect(screen.queryByTestId('git-init-modal')).toBeNull()
-    expect(await screen.findByText('plain')).toBeTruthy()
-  })
-
-  it('adds anyway without init when the user chooses serial-only work', async () => {
+describe('add-project silent git setup', () => {
+  it('silently inits a non-git folder and adds it without asking the user anything', async () => {
     const gitInitDirectory = vi.fn(async () => A_REPO)
     const probeDirectoryGit = vi.fn(async () => NOT_A_REPO)
     const host: PipiHostAPI = { ...projectHost({ probeDirectoryGit, gitInitDirectory }), pickProjectDirectory: vi.fn(async () => '/Users/demo/plain') }
@@ -58,38 +38,50 @@ describe('add-project git guard', () => {
     await screen.findByText('existing')
 
     fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
-    fireEvent.click(await screen.findByText('直接添加（不用并行工人）'))
+    await waitFor(() => expect(gitInitDirectory).toHaveBeenCalledWith('/Users/demo/plain'))
     await waitFor(() => expect(host.addProject).toHaveBeenCalledWith('/Users/demo/plain'))
-    expect(gitInitDirectory).not.toHaveBeenCalled()
-    expect(screen.queryByTestId('git-init-modal')).toBeNull()
+    expect(await screen.findByText('plain')).toBeTruthy()
+    // No decision dialog ever appears — the user picked a folder, PipiUI did the rest.
+    expect(document.querySelector('[data-testid="git-init-modal"]')).toBeNull()
   })
 
-  it('cancelling the guard adds nothing', async () => {
-    const host: PipiHostAPI = { ...projectHost({ probeDirectoryGit: vi.fn(async () => NOT_A_REPO) }), pickProjectDirectory: vi.fn(async () => '/Users/demo/plain') }
+  it('still adds the folder when git init itself fails', async () => {
+    const gitInitDirectory = vi.fn(async () => { throw new Error('git not installed') })
+    const probeDirectoryGit = vi.fn(async () => NOT_A_REPO)
+    const host: PipiHostAPI = { ...projectHost({ probeDirectoryGit, gitInitDirectory }), pickProjectDirectory: vi.fn(async () => '/Users/demo/plain') }
     render(<App host={host} />)
     await screen.findByText('existing')
 
     fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
-    fireEvent.click(await screen.findByTestId('git-init-cancel'))
-    expect(screen.queryByTestId('git-init-modal')).toBeNull()
-    expect(host.addProject).not.toHaveBeenCalled()
+    await waitFor(() => expect(host.addProject).toHaveBeenCalledWith('/Users/demo/plain'))
+    expect(await screen.findByText('plain')).toBeTruthy()
   })
 
-  it('skips the dialog for a git work tree and when the probe itself fails', async () => {
-    const gitHost: PipiHostAPI = { ...projectHost({ probeDirectoryGit: vi.fn(async () => A_REPO) }), pickProjectDirectory: vi.fn(async () => '/Users/demo/repo') }
+  it('never touches an already-managed folder and ignores a failing probe', async () => {
+    const gitHost: PipiHostAPI = { ...projectHost({ probeDirectoryGit: vi.fn(async () => A_REPO), gitInitDirectory: vi.fn(async () => A_REPO) }), pickProjectDirectory: vi.fn(async () => '/Users/demo/repo') }
     const { unmount } = render(<App host={gitHost} />)
     await screen.findByText('existing')
     fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
     await waitFor(() => expect(gitHost.addProject).toHaveBeenCalledWith('/Users/demo/repo'))
-    expect(screen.queryByTestId('git-init-modal')).toBeNull()
+    expect(gitHost.gitInitDirectory).not.toHaveBeenCalled()
     unmount()
 
-    const brokenHost: PipiHostAPI = { ...projectHost({ probeDirectoryGit: vi.fn(async () => { throw new Error('git missing') }) }), pickProjectDirectory: vi.fn(async () => '/Users/demo/plain') }
+    const brokenHost: PipiHostAPI = { ...projectHost({ probeDirectoryGit: vi.fn(async () => { throw new Error('git missing') }), gitInitDirectory: vi.fn(async () => A_REPO) }), pickProjectDirectory: vi.fn(async () => '/Users/demo/plain') }
     render(<App host={brokenHost} />)
     await screen.findByText('existing')
     fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
     await waitFor(() => expect(brokenHost.addProject).toHaveBeenCalledWith('/Users/demo/plain'))
-    expect(screen.queryByTestId('git-init-modal')).toBeNull()
+    expect(brokenHost.gitInitDirectory).not.toHaveBeenCalled()
+  })
+
+  it('keeps the plain legacy flow for hosts without the probe', async () => {
+    const host: PipiHostAPI = { ...projectHost({}), pickProjectDirectory: vi.fn(async () => '/Users/demo/plain') }
+    render(<App host={host} />)
+    await screen.findByText('existing')
+
+    fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
+    await waitFor(() => expect(host.addProject).toHaveBeenCalledWith('/Users/demo/plain'))
+    expect(await screen.findByText('plain')).toBeTruthy()
   })
 })
 
@@ -107,7 +99,7 @@ describe('first-run model onboarding', () => {
     await waitFor(() => expect(screen.queryByTestId('model-modal')).toBeNull())
   })
 
-  it('respect an explicit close while still model-less across remounts', async () => {
+  it('respects an explicit close while still model-less across remounts', async () => {
     const host: PipiHostAPI = { ...createMockHost(), listModels: vi.fn(async () => []) }
     const first = render(<App host={host} />)
     fireEvent.click(await screen.findByLabelText('关闭模型管理'))

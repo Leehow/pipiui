@@ -126,20 +126,6 @@ body{overscroll-behavior:none}
 .model-modal-tab:hover{color:var(--text-strong)}
 .model-modal-tab.active{color:var(--text-strong);background:var(--surface-raised);box-shadow:0 1px 4px rgb(0 0 0 / 14%);font-weight:600}
 
-/* Add-project guard for non-git folders — reuses the model-modal chrome. */
-.git-init-modal{width:min(440px,calc(100vw - 48px))}
-.git-init-path{margin:6px 0;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:color-mix(in srgb,var(--text) 4%,transparent);color:var(--text);font:10px ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.git-init-facts{margin:8px 0 4px;padding-left:18px;color:var(--muted);font-size:11px;line-height:1.7}
-.git-init-error{margin:8px 0 0;color:var(--danger);font-size:11px}
-.git-init-actions{display:flex;justify-content:flex-end;gap:8px;padding:10px 16px 14px;border-top:1px solid var(--border)}
-.git-init-cancel{padding:5px 10px;border-radius:7px;color:var(--muted);font-size:12px}
-.git-init-cancel:hover:not(:disabled){background:var(--surface-hover);color:var(--text-strong)}
-.git-init-anyway{padding:5px 10px;border-radius:7px;background:color-mix(in srgb,var(--text) 8%,transparent);color:var(--text);font-size:12px}
-.git-init-anyway:hover:not(:disabled){background:color-mix(in srgb,var(--text) 16%,transparent)}
-.git-init-primary{padding:5px 12px;border-radius:7px;background:var(--accent);color:var(--accent-contrast,#fff);font-size:12px;font-weight:600}
-.git-init-primary:hover:not(:disabled){filter:brightness(1.08)}
-.git-init-actions button:disabled{opacity:.55;cursor:default}
-
 /* 通用 tab — vision model picker. */
 .vision-picker-hint{padding:6px 4px 4px;color:var(--muted);font-size:11px}
 .vision-row{display:flex;width:100%;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;font-size:12px;color:var(--text);text-align:left;cursor:pointer}
