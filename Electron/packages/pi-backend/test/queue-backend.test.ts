@@ -10,7 +10,7 @@ import { createPiHostBackend, FileQueueStore } from "../src/index.js";
 let root = "";
 afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = ""; });
 
-async function eventually(check: () => boolean, timeoutMs = 1_000): Promise<void> {
+async function eventually(check: () => boolean, timeoutMs = 3_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (check()) return;

@@ -113,6 +113,9 @@ type Connection = {
   cookieHeader?: string;
   expiryTimer?: NodeJS.Timeout;
   closed: boolean;
+  /** Resolves when the backend drain finished; close() awaits these so no
+   * backend write outlives the server and races a caller's temp-dir cleanup. */
+  closing?: Promise<void>;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -376,6 +379,9 @@ export function createWsHostServer(
   });
 
   const connections = new Map<WebSocket, Connection>();
+  /** Backend drains still in flight; close() awaits them so no backend write
+   * (agent logs, session JSONL) outlives the server teardown. */
+  const backendClosings = new Set<Promise<void>>();
   let boundPort: number | undefined;
   let boundHost = configuredHost;
   let defaultPairing: PairingLink | undefined;
@@ -473,7 +479,9 @@ export function createWsHostServer(
     connections.delete(socket);
     if (connection.expiryTimer) clearTimeout(connection.expiryTimer);
     connection.unsubscribe();
-    void Promise.resolve(connection.backend.close?.()).catch(() => undefined);
+    connection.closing = Promise.resolve(connection.backend.close?.()).catch(() => undefined);
+    backendClosings.add(connection.closing);
+    void connection.closing.finally(() => backendClosings.delete(connection.closing!));
   };
 
   const openConnection = (socket: WebSocket, identity?: PairingIdentity, cookieHeader?: string): void => {
@@ -579,6 +587,7 @@ export function createWsHostServer(
       // down, so terminating in-flight connections is the intended behavior.
       server.closeAllConnections();
       await new Promise<void>(resolve => server.close(() => resolve()));
+      await Promise.allSettled([...backendClosings]);
     },
   };
 }

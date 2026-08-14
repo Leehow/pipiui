@@ -104,7 +104,7 @@ describe("context compaction", () => {
     // 240000/262144 ≈ 92%: pi's own threshold check only runs on the next turn,
     // which is exactly the gap this scheduler closes.
     await backend.handle("sendPrompt", ["session-1", "fill-context"]);
-    await settle(200);
+    await waitFor(() => compactionEvents(events).length >= 2);
     off();
 
     expect(compactionEvents(events).map((e) => e.phase)).toEqual(["start", "end"]);
