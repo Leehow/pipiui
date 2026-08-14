@@ -68,6 +68,7 @@ function createContractMockBackend(): HostBackend {
   const queueItem = (sessionId: string, text: string, attachments: any[] = [], state: 'queued' | 'failed' = 'queued', error?: string) => ({ id: `queue-${++sequence}`, sessionId, text, attachments: structuredClone(attachments), createdAt: Date.now(), state, error })
   let state: any = { model: { provider: 'mock', id: 'model-1', name: 'Mock Model', reasoning: true }, thinkingLevel: 'medium', availableThinkingLevels: ['off', 'low', 'medium', 'high'] }
   let hiddenModelIds: string[] = []
+  let visionModel: string | null = null
   let sidebarSessionPreferences: SidebarSessionPreferences = { pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: [] }
   const loginOwners = new Map<string, string>()
   // session-1 carries full usage; sessions created by newSession have no usage data yet.
@@ -154,6 +155,13 @@ function createContractMockBackend(): HostBackend {
           if (!Array.isArray(ids) || !ids.every(id => typeof id === 'string')) throw new Error('hiddenModelIds must be string[]')
           hiddenModelIds = [...new Set(ids)].sort()
           return [...hiddenModelIds]
+        }
+        case 'getVisionModel': return visionModel
+        case 'setVisionModel': {
+          const ref = params[0] ?? null
+          if (ref !== null && (typeof ref !== 'string' || !ref.includes('/'))) throw new Error('visionModel must be "provider/id" string or null')
+          visionModel = ref
+          return visionModel
         }
         case 'getSidebarSessionPreferences': return structuredClone(sidebarSessionPreferences)
         case 'setSidebarSessionPreferences': {
@@ -248,6 +256,11 @@ function contract(name: string, factory: Factory, expectedCapabilities: Record<s
       expect(await host.getHiddenModelIds()).toEqual([])
       expect(await host.setHiddenModelIds(['openai/model-1', 'anthropic/model-2', 'openai/model-1'])).toEqual(['anthropic/model-2', 'openai/model-1'])
       expect(await host.getHiddenModelIds()).toEqual(['anthropic/model-2', 'openai/model-1'])
+      expect(await host.getVisionModel?.()).toBeNull()
+      expect(await host.setVisionModel?.('anthropic/claude-sonnet-4')).toBe('anthropic/claude-sonnet-4')
+      expect(await host.getVisionModel?.()).toBe('anthropic/claude-sonnet-4')
+      expect(await host.setVisionModel?.(null)).toBeNull()
+      expect(await host.getVisionModel?.()).toBeNull()
       expect(await host.getSidebarSessionPreferences?.()).toEqual({ pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: [] })
       expect(await host.setSidebarSessionPreferences?.({ pinnedSessionIds: ['session-a', 'session-b'], archivedSessionIds: ['session-b'], orderedSessionIds: ['session-b', 'session-a'], sessionOrderVersion: 2 })).toEqual({ pinnedSessionIds: ['session-a'], archivedSessionIds: ['session-b'], orderedSessionIds: ['session-b', 'session-a'], sessionOrderVersion: 2 })
       expect(await host.getSidebarSessionPreferences?.()).toEqual({ pinnedSessionIds: ['session-a'], archivedSessionIds: ['session-b'], orderedSessionIds: ['session-b', 'session-a'], sessionOrderVersion: 2 })

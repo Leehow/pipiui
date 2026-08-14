@@ -562,6 +562,7 @@ export function createMockHost(): PipiHostAPI {
   let loginSeq = 0
   const loginSessions = new Map<string, { providerId: string; authType: 'oauth' | 'api_key'; phase: number }>()
   let computerUseEnabled = false
+  let visionModel: string | null = null
   let subagentModels: Record<string, SubagentModelSetting[]> = {}
   const agentDefinitions: AgentDefinition[] = [
     { name: 'explore', description: 'Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files.' },
@@ -703,6 +704,8 @@ export function createMockHost(): PipiHostAPI {
     },
     getComputerUseState: async () => ({ enabled: computerUseEnabled }),
     setComputerUseEnabled: async enabled => { computerUseEnabled = enabled; return { enabled: computerUseEnabled } },
+    getVisionModel: async () => visionModel,
+    setVisionModel: async ref => { visionModel = ref; return visionModel },
     getSubagentModels: async () => Object.fromEntries(Object.entries(subagentModels).map(([name, chain]) => [name, chain.map(entry => ({ ...entry }))])),
     setSubagentModel: async (agentName, chain) => { if (chain.length) subagentModels[agentName] = chain.map(entry => ({ ...entry })); else delete subagentModels[agentName]; return Object.fromEntries(Object.entries(subagentModels).map(([name, saved]) => [name, saved.map(entry => ({ ...entry }))])) },
     listAgentDefinitions: async () => agentDefinitions.map(agent => ({ ...agent })),

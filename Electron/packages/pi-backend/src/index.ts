@@ -911,6 +911,9 @@ export class PiHostBackend implements HostBackend {
   private manualModelSelectionLoaded?: Promise<void>;
   private hiddenIds: string[] = [];
   private hiddenIdsLoaded?: Promise<void>;
+  /** Selected vision model (full "provider/id" ref) mirrored into vision.json for @getpipher/vision. */
+  private visionModel: string | null = null;
+  private visionModelLoaded?: Promise<void>;
   private projectPaths: string[] = [];
   private projectPathsLoaded?: Promise<void>;
   private settingsWrite: Promise<void> = Promise.resolve();
@@ -1524,6 +1527,10 @@ export class PiHostBackend implements HostBackend {
         return this.loadAndMaterializeSubagentModels(true);
       case "setSubagentModel":
         return this.saveSubagentModel(params[0], params[1]);
+      case "getVisionModel":
+        return this.loadVisionModel();
+      case "setVisionModel":
+        return this.saveVisionModel(params[0]);
       case "listAgentDefinitions":
         return BUILT_IN_AGENT_DEFINITIONS.map((agent) => ({ ...agent }));
       case "listModels":
@@ -2470,6 +2477,57 @@ export class PiHostBackend implements HostBackend {
     this.hiddenIds = [...sorted];
     this.hiddenIdsLoaded = Promise.resolve();
     return [...sorted];
+  }
+  /**
+   * Selected vision model (full `provider/id` ref). Stored in
+   * pipiui-settings.json and mirrored atomically into vision.json as the
+   * `{ provider, model }` bridge consumed by @getpipher/vision.
+   */
+  private async loadVisionModel(): Promise<string | null> {
+    if (!this.visionModelLoaded) {
+      this.visionModelLoaded = (async () => {
+        const value = (await this.readSettings()).visionModel;
+        if (value === undefined || value === null) {
+          this.visionModel = null;
+          return;
+        }
+        this.visionModel = this.checkedVisionModelRef(value);
+      })();
+    }
+    await this.visionModelLoaded;
+    return this.visionModel;
+  }
+  private checkedVisionModelRef(value: unknown): string | null {
+    if (value === null || value === undefined) return null;
+    if (typeof value !== "string" || !value.includes("/"))
+      throw new Error('visionModel 必须是 "provider/id" 字符串或 null');
+    const [provider, ...modelParts] = value.split("/");
+    if (!provider || !modelParts.length || !modelParts.every((part) => part.length > 0))
+      throw new Error('visionModel 必须是 "provider/id" 字符串或 null');
+    return value;
+  }
+  private visionBridgeFile(): string {
+    return join(this.agentDir, "vision.json");
+  }
+  /** Atomic { provider, model } bridge write for @getpipher/vision; null writes {} (no vision model). */
+  private async writeVisionBridgeFile(ref: string | null): Promise<void> {
+    const target = this.visionBridgeFile();
+    const payload = ref ? { provider: ref.split("/")[0], model: ref.slice(ref.indexOf("/") + 1) } : {};
+    await fs.mkdir(dirname(target), { recursive: true });
+    const tmp = `${target}.tmp-${process.pid}-${Date.now()}-${crypto.randomUUID()}`;
+    await fs.writeFile(tmp, JSON.stringify(payload, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+    await fs.rename(tmp, target);
+  }
+  private async saveVisionModel(value: unknown): Promise<string | null> {
+    const ref = this.checkedVisionModelRef(value);
+    await this.updateSettings((settings) => {
+      if (ref === null) delete settings.visionModel;
+      else settings.visionModel = ref;
+    });
+    this.visionModel = ref;
+    this.visionModelLoaded = Promise.resolve();
+    await this.writeVisionBridgeFile(ref);
+    return ref;
   }
   private checkedSidebarSessionPreferences(value: unknown): { pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 } {
     if (!isRecord(value)) throw new Error("sidebarSessionPreferences 必须是 object");

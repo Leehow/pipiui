@@ -398,6 +398,15 @@ export interface PipiHostAPI {
   /** Optional per-role model fallback chains. Empty chain follows the main Agent model. */
   getSubagentModels?(): Promise<Record<string, SubagentModelSetting[]>>;
   setSubagentModel?(agentName: string, chain: SubagentModelSetting[]): Promise<Record<string, SubagentModelSetting[]>>;
+  /**
+   * Optional persistent vision-model selection (full `provider/modelId` ref).
+   * `null` means none selected. Backed by the host (Electron:
+   * `pipiui-settings.json` + a `vision.json` bridge for @getpipher/vision),
+   * atomic. Absent on hosts without vision support — the UI shows an
+   * unavailable state instead of calling these.
+   */
+  getVisionModel?(): Promise<string | null>;
+  setVisionModel?(ref: string | null): Promise<string | null>;
   listAgentDefinitions?(): Promise<AgentDefinition[]>;
   /**
    * Provider credentials and login — backed by pi's ModelRuntime
@@ -514,6 +523,8 @@ function apiFrom(
     setComputerUseEnabled: enabled => invoke("setComputerUseEnabled", enabled),
     getSubagentModels: () => invoke("getSubagentModels"),
     setSubagentModel: (agentName, chain) => invoke("setSubagentModel", agentName, chain),
+    getVisionModel: () => invoke("getVisionModel"),
+    setVisionModel: ref => invoke("setVisionModel", ref),
     listAgentDefinitions: () => invoke("listAgentDefinitions"),
     getSessionStats: sessionId => invoke("getSessionStats", sessionId),
     getQuotaSnapshot: sessionId => sessionId === undefined ? invoke("getQuotaSnapshot") : invoke("getQuotaSnapshot", sessionId),
