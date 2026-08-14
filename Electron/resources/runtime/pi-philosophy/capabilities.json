@@ -21,7 +21,8 @@
     },
     "delegate_parallel": {
       "tool": "subagent_parallel",
-      "required": true
+      "required": false,
+      "absent": "the dispatch tool, once per task"
     },
     "delegate_status": {
       "tool": "subagent_status",
@@ -63,7 +64,7 @@
     },
     {
       "name": "operator",
-	  "use": "compatibility-only desktop worker. When computer_task is available, never dispatch operator directly: give computer_task the natural-language goal and let its private Leader supervise isolated workers and return one final report."
+      "use": "compatibility-only desktop worker. When computer_task is available, never dispatch operator directly: give computer_task the natural-language goal and let its private Leader supervise isolated workers and return one final report."
     },
     {
       "name": "secretary",

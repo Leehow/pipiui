@@ -4,7 +4,7 @@ name: 瀑布流哲学
 summary: 无依赖的活一次全派出去；宽 wave 用清晰 brief 与分组管；异步信号自己收，不回头看原始产物。
 order: 40
 requires: [orchestration]
-requires-capabilities: [delegate, delegate_parallel]
+requires-capabilities: [delegate]
 scope: [main, lead]
 ---
 # Fan-out: many workers, running in the background

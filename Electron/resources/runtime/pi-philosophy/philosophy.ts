@@ -20,6 +20,7 @@ import {
   mergeLayers,
   normalizeConfig,
   parseLayer,
+  resolveAgent,
   resolveRole,
 } from "./compose.ts";
 
@@ -143,6 +144,17 @@ function loadLayers(): { layers: Layer[]; capabilities: CapabilityTable } {
   return { layers: cachedLayers, capabilities: cachedCapabilities };
 }
 
+/**
+ * `ctx.model` → the `provider/id` ref a layer's `requires-models` is written against.
+ *
+ * Typed structurally rather than against pi's `Model`: this is the only shape the
+ * philosophy needs, and a pi version that widens that type should not break the build.
+ */
+function formatModel(model: { provider?: string; id?: string } | undefined | null): string | undefined {
+  if (!model?.provider || !model?.id) return undefined;
+  return `${model.provider}/${model.id}`;
+}
+
 /** Hot-read on every turn: a toggle applies without restarting the session. */
 function readConfig(): PhilosophyConfig {
   try {
@@ -161,14 +173,14 @@ function writeConfig(config: PhilosophyConfig): void {
 // Report
 // ---------------------------------------------------------------------------
 
-function buildReport(activeTools: string[] | null): string {
+function buildReport(activeTools: string[] | null, model: string | undefined): string {
   const { layers, capabilities } = loadLayers();
   const config = readConfig();
   const role = resolveRole(process.env);
-  const result = composePhilosophy({ layers, config, capabilities, role, activeTools });
+  const result = composePhilosophy({ layers, config, capabilities, role, activeTools, model });
 
   const lines: string[] = [
-    `# Philosophy — ${config.enabled ? "on" : "off"} (role: ${role})`,
+    `# Philosophy — ${config.enabled ? "on" : "off"} (role: ${role}, model: ${model ?? "unknown"})`,
     `Package: ${PACKAGE_DIR}`,
     `Config:  ${fs.existsSync(CONFIG_FILE) ? CONFIG_FILE : `${CONFIG_FILE} (not written yet, using defaults)`}`,
     "",
@@ -199,7 +211,7 @@ function buildReport(activeTools: string[] | null): string {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, ctx) => {
     if (event.systemPrompt.includes(MARKER)) return; // already injected by another copy
     const { layers, capabilities } = loadLayers();
     const result = composePhilosophy({
@@ -207,7 +219,11 @@ export default function (pi: ExtensionAPI) {
       config: readConfig(),
       capabilities,
       role: resolveRole(process.env),
+      agent: resolveAgent(process.env),
       activeTools: pi.getActiveTools(),
+      // Read per turn, not per session: `/model` mid-session must re-decide which
+      // model-scoped layers apply, exactly as an edited layer file does.
+      model: formatModel(ctx.model),
     });
     // Published before the turn runs, so any tool called during it sees this turn's truth.
     publishState(result.included.map((l) => l.id));
@@ -229,6 +245,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const [verb, target] = args.trim().split(/\s+/).filter(Boolean);
       const activeTools = pi.getActiveTools();
+      const model = formatModel(ctx.model);
 
       if (verb === "on" || verb === "off") {
         const config = readConfig();
@@ -260,7 +277,9 @@ export default function (pi: ExtensionAPI) {
           config: readConfig(),
           capabilities,
           role: resolveRole(process.env),
+      agent: resolveAgent(process.env),
           activeTools,
+          model,
         });
         pi.sendMessage({
           customType: "philosophy_text",
@@ -272,7 +291,7 @@ export default function (pi: ExtensionAPI) {
 
       pi.sendMessage({
         customType: "philosophy_status",
-        content: buildReport(activeTools),
+        content: buildReport(activeTools, model),
         display: true,
       });
     },

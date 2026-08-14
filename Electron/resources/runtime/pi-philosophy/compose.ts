@@ -38,7 +38,14 @@ export interface Layer {
   order: number;
   requires: string[];
   requiresCapabilities: string[];
-  scope: Role[];
+  /**
+   * `provider/id` patterns this layer is written for. Empty means every model — the
+   * normal case. A non-empty list marks a layer that exists to correct one model
+   * family's behavior, which is advice that would be wrong to give any other model.
+   */
+  requiresModels: string[];
+  /** Roles (`main`/`lead`/`worker`) and/or agent names (`explore`, `plan`, …). */
+  scope: string[];
   body: string;
   /** Where it came from; user layers shadow bundled ones with the same id. */
   file: string;
@@ -74,11 +81,22 @@ export interface ComposeInput {
   config: PhilosophyConfig;
   capabilities: CapabilityTable;
   role: Role;
+  /** Dispatched agent name (`explore`, `plan`, …); empty in the main session. */
+  agent?: string;
   /**
    * Live tool names from `pi.getActiveTools()`. `null` means "unknown" (composing outside a
    * session, e.g. in a test or a preview) and every capability is treated as present.
    */
   activeTools: string[] | null;
+  /**
+   * This session's model as `provider/id` (`ctx.model`). Absent means "unknown", and a
+   * model-scoped layer is then dropped rather than guessed in.
+   *
+   * The opposite default from `activeTools` on purpose: an optional capability that turns
+   * out to be missing costs a slightly over-optimistic sentence, while telling the wrong
+   * model it has a known failure mode is simply false.
+   */
+  model?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,9 +138,9 @@ export function parseLayer(
   const order = Number.parseInt(fields.order ?? "", 10);
   if (!Number.isFinite(order)) return { ok: false, error: `${file}: layer ${id} has no numeric order` };
 
-  const scope = parseInlineList(fields.scope ?? "").filter((s): s is Role =>
-    (ROLES as readonly string[]).includes(s),
-  );
+  // Roles and agent names share one list: a rule aimed at whoever writes code says
+  // `general-purpose`, one aimed at any dispatched worker says `worker`.
+  const scope = parseInlineList(fields.scope ?? "");
   if (scope.length === 0) return { ok: false, error: `${file}: layer ${id} has an empty or invalid scope` };
 
   const body = match[2].trim();
@@ -137,12 +155,34 @@ export function parseLayer(
       order,
       requires: parseInlineList(fields.requires ?? ""),
       requiresCapabilities: parseInlineList(fields["requires-capabilities"] ?? ""),
+      requiresModels: parseInlineList(fields["requires-models"] ?? ""),
       scope,
       body,
       file,
       source,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Model scope
+// ---------------------------------------------------------------------------
+
+/**
+ * Does a `provider/id` model ref match one `requires-models` entry?
+ *
+ * Exact match, or one trailing `*` as a prefix (`deepseek/*`). Case-insensitive.
+ *
+ * Deliberately literal: model ids are a closed, enumerable set that the author is
+ * naming on purpose, so nothing here tries to infer a family from a name it was not
+ * told about. A pattern that stops matching after a provider renames a model shows up
+ * as the layer going inactive in `/philosophy`, which is the honest failure.
+ */
+export function modelMatches(model: string, pattern: string): boolean {
+  const m = model.trim().toLowerCase();
+  const p = pattern.trim().toLowerCase();
+  if (!m || !p) return false;
+  return p.endsWith("*") ? m.startsWith(p.slice(0, -1)) : m === p;
 }
 
 /** User layers shadow bundled layers with the same id; that is how a user edits a philosophy. */
@@ -218,6 +258,7 @@ export function resolvePlaceholders(
 
 export function composePhilosophy(input: ComposeInput): ComposeResult {
   const { layers, config, capabilities, role, activeTools } = input;
+  const model = input.model?.trim() ?? "";
   const skipped: SkippedLayer[] = [];
   const skip = (layer: Layer, reason: string) => {
     skipped.push({ id: layer.id, name: layer.name, reason });
@@ -226,9 +267,21 @@ export function composePhilosophy(input: ComposeInput): ComposeResult {
   if (!config.enabled) {
     return { text: "", included: [], skipped: layers.map((l) => ({ id: l.id, name: l.name, reason: "philosophy is off" })) };
   }
-  if (role === "worker" && !config.scopes.worker) {
-    return { text: "", included: [], skipped: layers.map((l) => ({ id: l.id, name: l.name, reason: "worker distribution is off" })) };
-  }
+  /**
+   * `scopes.worker` governs *untargeted bulk*: shipping the whole judgement stack to every
+   * dispatched worker, which is the taste-and-tokens call the user owns.
+   *
+   * It does not govern a layer that names its audience. A layer scoped to `explore` was
+   * addressed to that worker on purpose, exactly like a model-scoped layer is addressed to
+   * one model's defect — withholding either would mean the author aimed at someone the
+   * switch then silently hid them from. So the gate applies only to layers whose scope is
+   * roles alone.
+   */
+  const agent = input.agent?.trim().toLowerCase() ?? "";
+  const rosterNames = new Set(
+    capabilities.agents.map((a) => (typeof a === "string" ? a : a.name).toLowerCase()),
+  );
+  const workerBulkOff = role === "worker" && !config.scopes.worker;
 
   let candidates: Layer[] = [];
   for (const layer of layers) {
@@ -236,9 +289,35 @@ export function composePhilosophy(input: ComposeInput): ComposeResult {
       skip(layer, "turned off");
       continue;
     }
-    if (!layer.scope.includes(role)) {
-      skip(layer, `not in scope for role "${role}"`);
+    // A scope naming neither a role nor any agent on the roster can never be delivered.
+    // Agent names are an open set, so this cannot be caught when the file is parsed — and a
+    // typo would otherwise make the layer silently invisible forever.
+    const addressable = new Set<string>([
+      ...ROLES,
+      ...capabilities.agents.map((a) => (typeof a === "string" ? a : a.name).toLowerCase()),
+    ]);
+    if (!layer.scope.some((s) => addressable.has(s.toLowerCase()))) {
+      skip(layer, `scope names nobody that exists: ${layer.scope.join(", ")}`);
       continue;
+    }
+    const targetsAnAgent = layer.scope.some((s) => rosterNames.has(s.toLowerCase()));
+    if (workerBulkOff && !targetsAnAgent && layer.requiresModels.length === 0) {
+      skip(layer, "worker distribution is off");
+      continue;
+    }
+    if (!layer.scope.includes(role) && !(agent && layer.scope.includes(agent))) {
+      skip(layer, `not in scope for ${agent ? `${role} "${agent}"` : `role "${role}"`}`);
+      continue;
+    }
+    if (layer.requiresModels.length > 0) {
+      if (!model) {
+        skip(layer, `written for ${layer.requiresModels.join(", ")}, and this session's model is unknown`);
+        continue;
+      }
+      if (!layer.requiresModels.some((pattern) => modelMatches(model, pattern))) {
+        skip(layer, `not in scope for model "${model}"`);
+        continue;
+      }
     }
     const missing = layer.requiresCapabilities.filter((key) => {
       const capability = capabilities.capabilities[key];
@@ -312,6 +391,11 @@ export function normalizeConfig(raw: unknown): PhilosophyConfig {
  * Role resolution. An explicit marker wins; otherwise a nested dispatch depth means this
  * process is a worker. Frontends that set neither are treated as the main session.
  */
+/** The dispatched agent's name, so a layer can address one role of worker specifically. */
+export function resolveAgent(env: Record<string, string | undefined>): string {
+  return (env.PIPI_PHILOSOPHY_AGENT ?? "").trim().toLowerCase();
+}
+
 export function resolveRole(env: Record<string, string | undefined>): Role {
   const explicit = (env.PIPI_PHILOSOPHY_ROLE ?? "").trim().toLowerCase();
   if ((ROLES as readonly string[]).includes(explicit)) return explicit as Role;
