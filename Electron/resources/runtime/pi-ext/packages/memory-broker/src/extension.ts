@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import { Type } from "typebox";
 import { MEMORY_LIMITS, normalizeAppName, normalizeBundleID, normalizeQuery } from "#memory-broker-contract";
 import {
@@ -11,7 +12,7 @@ import { operatorComputerObservationFromToolResult, type OperatorComputerApplica
 import { importControlledMemoryIfRequested } from "./controlled-memory-migration.ts";
 import { openMainMemoryCatalog, type HermesCatalogPort, type MemoryCatalog } from "./memory-catalog.ts";
 import { MemoryCurator, MemoryCuratorScheduler, type CuratorReviewer } from "./memory-curator.ts";
-import { RetrievalOrchestrator, RetrievalRuntimeAdapter, createCatalogHermesRetrievalPort, type RetrievalPort, type RetrievalResult } from "./retrieval-orchestrator.ts";
+import { RetrievalOrchestrator, RetrievalRuntimeAdapter, type RetrievalPort, type RetrievalResult } from "./retrieval-orchestrator.ts";
 import { MEMORY_BROKER_HTTP_VERSION, type MemoryBrokerMode } from "./protocol.ts";
 import { publishMemoryBrokerStatus } from "./status-file.ts";
 import {
@@ -125,7 +126,6 @@ function clearMainChildIssuer(): void {
 
 type CatalogHermesBackend = MemoryBrokerBackend & {
   catalogPort?: HermesCatalogPort;
-  scoreCatalogRecord?: (text: string, record: import("#memory-broker-contract").MemoryRecordV2) => Promise<number>;
 };
 
 function eventText(event: unknown): string | undefined {
@@ -238,6 +238,56 @@ function clearMainEnvironment(values: Record<string, string> | undefined): void 
 function queryFromMainResponse(response: MemoryBrokerWireResponse) {
   if (!response.ok || response.operation !== "memory.query") return undefined;
   return Array.isArray(response.results) ? response.results : [];
+}
+
+/**
+ * Default production retrieval reads through the live main broker, which owns
+ * project/session scope and the same verified Hermes backend as memory_query.
+ * Catalog promotion remains lifecycle metadata; it is not a prerequisite for
+ * recalling durable Hermes MEMORY/USER/project entries.
+ */
+export function createMainBrokerRetrievalPort(
+  broker: Pick<MemoryBrokerServer, "handleMainRequest">,
+  projectRoot: string,
+): RetrievalPort {
+  return {
+    async query(request) {
+      // The broker's main context is fixed at construction. Do not relabel its
+      // results as belonging to a caller-supplied project.
+      if (request.project !== projectRoot) return [];
+      const query = normalizeQuery({
+        text: request.text,
+        budget: MEMORY_LIMITS.maximumQueryBudget,
+        scope: "project",
+      });
+      const response = await broker.handleMainRequest({
+        version: MEMORY_BROKER_HTTP_VERSION,
+        operation: "memory.query",
+        query,
+      });
+      const results = queryFromMainResponse(response);
+      if (!results) throw new Error(response.error || "memory broker unavailable");
+      const seen = new Set<string>();
+      return results
+        .filter((result) => {
+          const key = result.claim.normalize("NFKC").trim().toLocaleLowerCase("en-US");
+          if (!key || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .slice(0, request.limit)
+        .map((result) => ({
+          id: `broker-${createHash("sha256").update(`${request.project}\0${result.claim}`).digest("hex").slice(0, 24)}`,
+          kind: "semantic" as const,
+          summary: result.claim,
+          scope: { kind: "project" as const, project: projectRoot },
+          confidence: Math.max(0, Math.min(1, result.score)),
+          evidence: [],
+          status: "active" as const,
+          hermesScore: result.score,
+        }));
+    },
+  };
 }
 
 /**
@@ -356,9 +406,6 @@ export async function installMemoryBrokerExtension(
           const reviewer = options.curatorReviewer ?? { review: async () => ({ decision: "keep_candidate" }) };
           const curator = MemoryCurator.create({ mode: "main", catalog, hermes: catalogBackend.catalogPort, reviewer, metrics: runtimeMetrics });
           if (curator) curatorScheduler = new MemoryCuratorScheduler(curator, catalog);
-          if (!options.retrievalPort && catalogBackend.scoreCatalogRecord) {
-            installRetrieval(createCatalogHermesRetrievalPort(catalog, { score: catalogBackend.scoreCatalogRecord }));
-          }
         }
         if (catalog) admin = new MemoryAdminService(catalog, catalogBackend?.catalogPort, `${identity.root}/ui`, async () => {
           const value = await backend!.status((await import("#memory-broker-contract")).createActorContext({ projectRoot, chatSessionID: "memory-main-session", bridgeRoutingKey: "memory-main-route", agentID: "main", runID: "main-session", role: "main" }));
@@ -387,6 +434,12 @@ export async function installMemoryBrokerExtension(
           version: MEMORY_BROKER_HTTP_VERSION,
           operation: "memory.status",
         });
+        // session_start is awaited by Pi. Install production retrieval only
+        // after the loopback broker and its backend both report ready, so the
+        // first before_agent_start turn cannot race initialization.
+        if (!options.retrievalPort && status.ok && status.status?.ready) {
+          installRetrieval(createMainBrokerRetrievalPort(candidate, projectRoot));
+        }
         await publishMemoryBrokerStatus(env, status).catch(() => {});
       } catch (error) {
         const failed = candidate ?? server;
