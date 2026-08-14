@@ -31,6 +31,13 @@ export const MANAGED_RUNTIME_PACKAGE_VERSIONS = {
   'pi-hermes-memory': '0.9.4',
   'better-sqlite3': '12.11.1'
 } as const
+/** User-facing Pi packages with meaningful independent upstream release channels. */
+export const UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS = {
+  '@earendil-works/pi-coding-agent': MANAGED_RUNTIME_PACKAGE_VERSIONS['@earendil-works/pi-coding-agent'],
+  'pi-web-access': MANAGED_RUNTIME_PACKAGE_VERSIONS['pi-web-access'],
+  'pi-mcp-extension': MANAGED_RUNTIME_PACKAGE_VERSIONS['pi-mcp-extension'],
+  'pi-hermes-memory': MANAGED_RUNTIME_PACKAGE_VERSIONS['pi-hermes-memory']
+} as const
 const EXPECTED_PACKAGES = MANAGED_RUNTIME_PACKAGE_VERSIONS
 
 type EmbeddedRuntimeManifest = {

@@ -2358,6 +2358,8 @@ describe('update center settings flow', () => {
     const composer = await openModelModal(host)
     fireEvent.click(screen.getByTestId('model-tab-updates'))
     expect(await screen.findByTestId('update-center')).toBeTruthy()
+    expect(screen.getByRole('dialog', { name: '设置' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '关闭设置' })).toBeTruthy()
     fireEvent.click(await screen.findByRole('button', { name: '更新' }))
     await waitFor(() => expect(screen.queryByTestId('model-modal')).toBeNull())
     await waitFor(() => expect(sendPrompt).toHaveBeenCalledTimes(1))

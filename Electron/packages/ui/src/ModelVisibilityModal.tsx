@@ -196,11 +196,11 @@ export function ModelVisibilityModal({ host, visibility, vision, current, onMode
 
   return (
     <div className="model-modal-backdrop" data-testid="model-modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
-      <section className="model-modal" role="dialog" aria-modal="true" aria-label="模型管理" data-testid="model-modal">
+      <section className="model-modal" role="dialog" aria-modal="true" aria-label="设置" data-testid="model-modal">
         <header>
           <h2>{tab === 'general' ? '通用' : tab === 'updates' ? '更新中心' : view === 'manage' ? '模型管理' : '添加模型'}</h2>
           <p>{tab === 'general' ? '主线模型不支持图片时，用指定识图模型识别图片后交给文字模型。' : tab === 'updates' ? '比较内置 Pi、Cua Driver 和托管运行时组件的本机与最新版本。' : view === 'manage' ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。' : '登录 pi 支持的 provider 后，其模型目录会自动出现。'}</p>
-          <button className="model-modal-close" aria-label="关闭模型管理" onClick={onClose}>×</button>
+          <button className="model-modal-close" aria-label="关闭设置" onClick={onClose}>×</button>
           <div className="model-modal-header-actions">
             {tab === 'models' && (view === 'manage'
               ? <>

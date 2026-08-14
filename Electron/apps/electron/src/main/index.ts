@@ -16,7 +16,7 @@ import { CUA_DRIVER_VERSION, CuaDriverHost } from './cua-driver-host.js'
 import { importLegacyPiProfile, installBundledModelCapabilityOverrides, resolveElectronPiProfile } from './pi-profile.js'
 import { withProjectDirectoryPicker } from './project-directory-picker.js'
 import { createQuotaCookieReader, createQuotaCookiePersister } from './quota-capabilities.js'
-import { MANAGED_RUNTIME_PACKAGE_VERSIONS, resolveRuntimeAssets } from './runtime-assets.js'
+import { resolveRuntimeAssets, UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS } from './runtime-assets.js'
 import { createUpdateCenterService, withUpdateCenter, type UpdateCatalogItem } from './update-center.js'
 import { withOpenDocumentExternally } from './external-document.js'
 import { withOpenExternal } from './external-url.js'
@@ -188,7 +188,7 @@ if (app) {
       return result.canceled ? null : result.filePaths[0] ?? null
     }
     const updateCatalog: UpdateCatalogItem[] = [
-      ...Object.entries(MANAGED_RUNTIME_PACKAGE_VERSIONS).map(([packageName, currentVersion]) => ({
+      ...Object.entries(UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS).map(([packageName, currentVersion]) => ({
         id: packageName,
         name: packageName === '@earendil-works/pi-coding-agent' ? 'Pi' : packageName,
         currentVersion,
