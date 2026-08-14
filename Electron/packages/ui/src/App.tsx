@@ -79,6 +79,8 @@ const defaultWidths: PaneWidths = { sidebar: 258, tools: 368, sidebarCollapsed: 
 const storageKey = 'pipiui:eui-pane-widths'
 const sidebarPreferencePrefix = 'pipiui:eui:sidebar:v1'
 const sidebarSemanticMigrationKey = 'pipiui:eui:sidebar-semantic-host:v1'
+export const LAST_SESSION_STORAGE_KEY = 'pipiui:eui:last-session:v1'
+const HISTORY_PAGE_SIZE = 500
 export const SIDEBAR_PROJECT_PAGE_SIZE = 6
 export const ARCHIVE_RETENTION_MS = 24 * 60 * 60 * 1000
 const ARCHIVE_CLEANUP_RETRY_MS = 60 * 1000
@@ -133,6 +135,20 @@ function readSidebarPreferences(key: string): SidebarPreferences | null {
 
 function writeSidebarPreferences(key: string, preferences: SidebarPreferences) {
   try { localStorage.setItem(key, JSON.stringify(preferences)) } catch { /* storage can be disabled by the host */ }
+}
+
+function readLastSessionSelection(): { projectId: string; sessionId: string } | null {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(LAST_SESSION_STORAGE_KEY) ?? 'null')
+    if (!value || typeof value !== 'object') return null
+    const candidate = value as { projectId?: unknown; sessionId?: unknown }
+    return typeof candidate.projectId === 'string' && candidate.projectId && typeof candidate.sessionId === 'string' && candidate.sessionId
+      ? { projectId: candidate.projectId, sessionId: candidate.sessionId }
+      : null
+  } catch {
+    try { localStorage.removeItem(LAST_SESSION_STORAGE_KEY) } catch { /* storage can be disabled by the host */ }
+    return null
+  }
 }
 
 function metadataString(value: unknown): string | undefined {
@@ -828,6 +844,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [sessions, setSessions] = useState<Session[]>([])
   const [selectedProject, setSelectedProject] = useState('')
   const [selectedSession, setSelectedSession] = useState('')
+  const sessionsRef = useRef(sessions)
+  sessionsRef.current = sessions
+  const selectedProjectRef = useRef(selectedProject)
+  selectedProjectRef.current = selectedProject
+  const selectedSessionRef = useRef(selectedSession)
+  selectedSessionRef.current = selectedSession
+  const restoredLastSessionRef = useRef(false)
+  const [projectsLoaded, setProjectsLoaded] = useState(false)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [modelState, setModelState] = useState<ModelState | null>(null)
   const modelStatesBySessionRef = useRef(new Map<string, ModelState>())
@@ -889,6 +913,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const messagesRef = useRef<ChatMessage[]>(messages)
   messagesRef.current = messages
   const messagesBySessionRef = useRef(new Map<string, ChatMessage[]>())
+  const historyCompleteBySessionRef = useRef(new Map<string, boolean>())
   const idleTranscriptRef = useRef<VirtuosoHandle>(null)
   const [mountedSessionIds, setMountedSessionIds] = useState<string[]>([])
   useEffect(() => {
@@ -1000,14 +1025,40 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     const listed = await host.listProjects()
     const explicitPaths = paths ? new Set(paths) : undefined
     const items = explicitPaths ? listed.filter(project => explicitPaths.has(project.path)) : listed
-    const groupedSessions = await Promise.all(items.map(project => host.listSessions(project.id).catch(() => [])))
-    const nextSessions = groupedSessions.flat()
+    const groupedSessions = await Promise.all(items.map(async project => {
+      try {
+        return { projectId: project.id, sessions: await host.listSessions(project.id) }
+      } catch (error) {
+        return { projectId: project.id, error }
+      }
+    }))
+    const failedProjectIds = new Set(groupedSessions.filter(result => 'error' in result).map(result => result.projectId))
+    const successfulSessions: Session[] = groupedSessions.flatMap(result => result.sessions ?? [])
+    const nextSessions: Session[] = [
+      ...successfulSessions,
+      ...sessionsRef.current.filter(session => failedProjectIds.has(session.projectId)),
+    ]
+    const failures = groupedSessions.filter((result): result is { projectId: string; error: unknown } => 'error' in result)
+    if (failures.length) {
+      const details = failures.map(({ projectId, error }) => `${items.find(project => project.id === projectId)?.name ?? projectId}：${error instanceof Error ? error.message : String(error)}`).join('；')
+      setProjectError(`加载会话列表失败：${details}`)
+    }
     const validProjectIds = new Set(items.map(project => project.id))
     const validSessionIds = new Set(nextSessions.map(session => session.id))
+    const remembered = restoredLastSessionRef.current ? null : readLastSessionSelection()
+    restoredLastSessionRef.current = true
+    const rememberedSession = remembered && validProjectIds.has(remembered.projectId)
+      ? nextSessions.find(session => session.id === remembered.sessionId && session.projectId === remembered.projectId)
+      : undefined
+    const currentSession = nextSessions.find(session => session.id === selectedSessionRef.current)
+    const nextSession = currentSession ?? rememberedSession ?? nextSessions[0]
+    const nextProject = nextSession?.projectId
+      ?? (validProjectIds.has(selectedProjectRef.current) ? selectedProjectRef.current : items[0]?.id ?? '')
     setProjects(items)
     setSessions(nextSessions)
-    setSelectedProject(current => validProjectIds.has(current) ? current : items[0]?.id ?? '')
-    setSelectedSession(current => validSessionIds.has(current) ? current : nextSessions[0]?.id ?? '')
+    setSelectedProject(nextProject)
+    setSelectedSession(validSessionIds.has(nextSession?.id ?? '') ? nextSession!.id : '')
+    setProjectsLoaded(true)
     return items
   }, [host])
 
@@ -1138,10 +1189,19 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     const timer = window.setInterval(() => { void cleanup() }, ARCHIVE_CLEANUP_RETRY_MS)
     return () => window.clearInterval(timer)
   }, [archivedSessionIds, archivedSessionTimestamps, host, loadedSidebarPreferencesKey, projects.length, selectedSession, sessions, sidebarStorageKey])
-  useEffect(() => { if (!selectedProject) return; void host.listSessions(selectedProject).then(items => { setSessions(current => [...current.filter(session => session.projectId !== selectedProject), ...items]); setSelectedSession(previous => items.some(item => item.id === previous) ? previous : items[0]?.id ?? '') }) }, [host, selectedProject])
+  useEffect(() => {
+    if (!projectsLoaded || !selectedProject) return
+    void host.listSessions(selectedProject).then(items => {
+      setSessions(current => [...current.filter(session => session.projectId !== selectedProject), ...items])
+      setSelectedSession(previous => items.some(item => item.id === previous) ? previous : items[0]?.id ?? '')
+    }).catch(error => setProjectError(`加载会话列表失败：${error instanceof Error ? error.message : String(error)}`))
+  }, [host, projectsLoaded, selectedProject])
+  useEffect(() => {
+    if (!projectsLoaded || !selectedProject || !selectedSession) return
+    if (!sessions.some(session => session.id === selectedSession && session.projectId === selectedProject)) return
+    try { localStorage.setItem(LAST_SESSION_STORAGE_KEY, JSON.stringify({ projectId: selectedProject, sessionId: selectedSession })) } catch { /* storage can be disabled by the host */ }
+  }, [projectsLoaded, selectedProject, selectedSession, sessions])
   useEffect(() => { document.title = sessions.find(session => session.id === selectedSession)?.name ?? 'PipiUI' }, [selectedSession, sessions])
-  const sessionsRef = useRef(sessions)
-  sessionsRef.current = sessions
   useEffect(() => {
     let current = true
     const sessionId = selectedSession
@@ -1211,7 +1271,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setWaitingPhase('awaiting')
     }
     setLease(null)
-    const applyHistory = (entries: HistoryEntry[]) => {
+    const applyHistory = (entries: HistoryEntry[], scrollToNewest: boolean) => {
       if (historyLoadRef.current !== request) return
       const next = historyMessages(entries)
       messagesBySessionRef.current.set(selectedSession, next)
@@ -1223,15 +1283,45 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         setWaitingPhase('continuing')
         setWaitingVisible(true)
       }
-      requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, next.length - 1), align: 'end', behavior: 'auto' }))
+      if (scrollToNewest) requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, next.length - 1), align: 'end', behavior: 'auto' }))
     }
-    if (cached !== undefined && !resumedRunning) {
+    if (cached !== undefined && !resumedRunning && historyCompleteBySessionRef.current.get(selectedSession) === true) {
       requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, cached.length - 1), align: 'end', behavior: 'auto' }))
     } else {
-      void host.getSessionHistory(selectedSession).then(applyHistory).catch(() => {
-        if (historyLoadRef.current !== request) return
-        if (cached === undefined) setMessages([])
-      })
+      if (cached !== undefined) requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, cached.length - 1), align: 'end', behavior: 'auto' }))
+      historyCompleteBySessionRef.current.set(selectedSession, false)
+      void (async () => {
+        let before: string | undefined
+        let accumulated: HistoryEntry[] = []
+        let loadedPage = false
+        try {
+          while (historyLoadRef.current === request) {
+            const page = before === undefined
+              ? await host.getSessionHistory(selectedSession)
+              : await host.getSessionHistory(selectedSession, before, HISTORY_PAGE_SIZE)
+            if (historyLoadRef.current !== request) return
+            if (page.length === 0) {
+              historyCompleteBySessionRef.current.set(selectedSession, true)
+              return
+            }
+            accumulated = [...page, ...accumulated]
+            applyHistory(accumulated, !loadedPage)
+            loadedPage = true
+            if (page.length < HISTORY_PAGE_SIZE) {
+              historyCompleteBySessionRef.current.set(selectedSession, true)
+              return
+            }
+            const nextBefore = page[0]?.id
+            if (!nextBefore || nextBefore === before) throw new Error('主机返回了无效的会话历史游标')
+            before = nextBefore
+          }
+        } catch (error) {
+          if (historyLoadRef.current !== request) return
+          historyCompleteBySessionRef.current.set(selectedSession, false)
+          setProjectError(`读取会话记录失败：${error instanceof Error ? error.message : String(error)}`)
+          // Keep a cached transcript or any successfully loaded newer pages.
+        }
+      })()
     }
     void host.getSessionLease(selectedSession).then(lease => { if (historyLoadRef.current === request) setLease(lease) }).catch(() => { if (historyLoadRef.current === request) setLease(null) })
   }, [host, selectedSession])
@@ -1439,6 +1529,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       if (!selectedProject) return false
       const session = await host.newSession(selectedProject)
       messagesBySessionRef.current.set(session.id, [])
+      historyCompleteBySessionRef.current.set(session.id, true)
       pendingAutoSendRef.current = { sessionId: session.id, prompt, attachments }
       setSessions(items => [session, ...items])
       setSelectedProject(selectedProject)
@@ -1539,6 +1630,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (selectedSession) messagesBySessionRef.current.set(selectedSession, messagesRef.current)
     const session = await host.newSession(projectId)
     messagesBySessionRef.current.set(session.id, [])
+    historyCompleteBySessionRef.current.set(session.id, true)
     setSessions(items => [session, ...items])
     setSelectedProject(projectId)
     setSelectedSession(session.id)

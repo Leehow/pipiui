@@ -537,7 +537,75 @@ function sessionThinkingLevelFromRows(rows: any[]): ThinkingLevel | undefined {
       return row.thinkingLevel;
   }
 }
-/** Bounded metadata probe: header plus a small head/tail window, never a full JSONL parse. */
+type LatestSessionMetadata = {
+  name?: string;
+  model: { provider: string; modelId: string } | null;
+  thinkingLevel?: ThinkingLevel;
+  updatedAt?: number;
+};
+
+/**
+ * Scan JSONL records newest-first in fixed-size byte chunks. Memory stays
+ * bounded by one chunk plus the largest individual JSONL record, while fields
+ * that happen to sit outside the old fixed tail window are still discovered.
+ */
+async function readLatestSessionMetadata(
+  handle: Awaited<ReturnType<typeof fs.open>>,
+  size: number,
+): Promise<LatestSessionMetadata> {
+  let position = size;
+  let carry = Buffer.alloc(0);
+  let name: string | undefined;
+  let model: { provider: string; modelId: string } | null | undefined;
+  let thinkingLevel: ThinkingLevel | undefined;
+  let foundThinkingLevel = false;
+  let updatedAt: number | undefined;
+  while (position > 0) {
+    const start = Math.max(0, position - METADATA_TAIL_BYTES);
+    const chunk = Buffer.alloc(position - start);
+    await handle.read(chunk, 0, chunk.length, start);
+    const combined = carry.length ? Buffer.concat([chunk, carry]) : chunk;
+    let complete = combined;
+    if (start > 0) {
+      const firstNewline = combined.indexOf(0x0a);
+      if (firstNewline < 0) {
+        carry = combined;
+        position = start;
+        continue;
+      }
+      carry = combined.subarray(0, firstNewline);
+      complete = combined.subarray(firstNewline + 1);
+    }
+    const lines = complete.toString("utf8").split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let row: any;
+      try {
+        row = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (updatedAt === undefined && typeof row?.timestamp === "string") {
+        const timestamp = Date.parse(row.timestamp);
+        if (Number.isFinite(timestamp)) updatedAt = timestamp;
+      }
+      if (name === undefined && row?.type === "session_info" && typeof row.name === "string" && row.name.trim())
+        name = row.name.trim();
+      if (model === undefined && row?.type === "model_change" && typeof row.provider === "string" && row.provider && typeof row.modelId === "string" && row.modelId)
+        model = { provider: row.provider, modelId: row.modelId };
+      if (!foundThinkingLevel && row?.type === "thinking_level_change" && THINKING_LEVELS.includes(row.thinkingLevel)) {
+        thinkingLevel = row.thinkingLevel;
+        foundThinkingLevel = true;
+      }
+    }
+    if (name !== undefined && model !== undefined && foundThinkingLevel && updatedAt !== undefined) break;
+    position = start;
+  }
+  return { name, model: model ?? null, thinkingLevel, updatedAt };
+}
+
+/** Bounded-memory metadata scan: a small header read plus newest-first chunks. */
 async function readSessionMeta(path: string): Promise<SessionMeta> {
   const stat = await fs.stat(path);
   const handle = await fs.open(path, "r");
@@ -548,22 +616,14 @@ async function readSessionMeta(path: string): Promise<SessionMeta> {
     const header = headRows.find((row) => row?.type === "session");
     if (!header?.id || typeof header.cwd !== "string")
       throw new Error("invalid session header");
-    const tailLength = Math.min(METADATA_TAIL_BYTES, stat.size);
-    const tail = Buffer.alloc(tailLength);
-    await handle.read(tail, 0, tailLength, Math.max(0, stat.size - tailLength));
-    const tailRows = parseLines(tail.toString("utf8"));
-    const rows = [...headRows, ...tailRows];
-    const last = [...rows]
-      .reverse()
-      .find((row) => typeof row?.timestamp === "string");
-    const timestamp = Date.parse(last?.timestamp ?? "");
+    const latest = await readLatestSessionMetadata(handle, stat.size);
     return {
       path,
       header,
-      name: sessionName(rows),
-      updatedAt: Number.isFinite(timestamp) ? timestamp : stat.mtimeMs,
-      model: sessionModelFromRows(rows),
-      thinkingLevel: sessionThinkingLevelFromRows(rows),
+      name: latest.name ?? sessionName(headRows),
+      updatedAt: latest.updatedAt ?? stat.mtimeMs,
+      model: latest.model,
+      thinkingLevel: latest.thinkingLevel,
     };
   } finally {
     await handle.close();
@@ -687,14 +747,87 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
   }
   return result;
 }
+function visibleHistoryEntry(entry: any): HistoryEntry | undefined {
+  if (entry?.type === "message") return historyEntryFromMessage(entry);
+  if (entry?.type === "custom_message" && entry.display) {
+    return { id: entry.id, role: "user", content: text(entry.content), timestamp: asTime(entry.timestamp) };
+  }
+  if (entry?.type === "compaction" && entry.summary) {
+    return { id: entry.id, role: "assistant", content: entry.summary, timestamp: asTime(entry.timestamp) };
+  }
+}
+
+/**
+ * Build the active, compaction-aware id set without retaining message bodies.
+ * This is the large-file equivalent of SessionManager.buildContextEntries().
+ */
+type ContextEntrySummary = { id: string; parentId: string | null; type: string; firstKeptEntryId?: string; visible: boolean };
+
+async function activeVisibleIds(path: string): Promise<string[]> {
+  const byId = new Map<string, ContextEntrySummary>();
+  let leafId: string | undefined;
+  const lines = createInterface({ input: createReadStream(path, { encoding: "utf8" }), crlfDelay: Infinity });
+  for await (const line of lines) {
+    let entry: any;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry?.type === "session" || typeof entry?.id !== "string") continue;
+    const summary = {
+      id: entry.id,
+      parentId: typeof entry.parentId === "string" ? entry.parentId : null,
+      type: String(entry.type ?? ""),
+      visible: entry.type === "message"
+        || (entry.type === "custom_message" && Boolean(entry.display))
+        || (entry.type === "compaction" && Boolean(entry.summary)),
+      ...(typeof entry.firstKeptEntryId === "string" ? { firstKeptEntryId: entry.firstKeptEntryId } : {}),
+    };
+    byId.set(summary.id, summary);
+    leafId = summary.id;
+  }
+  const branch: ContextEntrySummary[] = [];
+  let current = leafId ? byId.get(leafId) : undefined;
+  const visited = new Set<string>();
+  while (current && !visited.has(current.id)) {
+    visited.add(current.id);
+    branch.push(current);
+    current = current.parentId ? byId.get(current.parentId) : undefined;
+  }
+  branch.reverse();
+  let compactionIndex = -1;
+  for (let index = 0; index < branch.length; index++) if (branch[index].type === "compaction") compactionIndex = index;
+  if (compactionIndex < 0) return branch.filter(entry => entry.visible).map(entry => entry.id);
+  const compaction = branch[compactionIndex];
+  const context: ContextEntrySummary[] = [compaction];
+  let include = false;
+  for (let index = 0; index < compactionIndex; index++) {
+    if (branch[index].id === compaction.firstKeptEntryId) include = true;
+    if (include) context.push(branch[index]);
+  }
+  context.push(...branch.slice(compactionIndex + 1));
+  return context.filter(entry => entry.visible).map(entry => entry.id);
+}
+
+function historyPage(entries: HistoryEntry[], before: number | string, limit: number): HistoryEntry[] {
+  const end = typeof before === "string"
+    ? entries.findIndex(entry => entry.id === before)
+    : Math.max(0, entries.length - before);
+  if (typeof before === "string" && end < 0) throw new Error(`history cursor no longer exists: ${before}`);
+  return entries.slice(Math.max(0, end - limit), end);
+}
+
 /** History is opened on demand and parsed incrementally; listing never reaches this path. */
 async function readHistoryFallback(
   path: string,
-  offset = 0,
+  before: number | string = 0,
   limit = 500,
 ): Promise<HistoryEntry[]> {
-  const result: HistoryEntry[] = [];
-  let seen = 0;
+  const visibleIds = await activeVisibleIds(path);
+  const end = typeof before === "string"
+    ? visibleIds.indexOf(before)
+    : Math.max(0, visibleIds.length - before);
+  if (typeof before === "string" && end < 0) throw new Error(`history cursor no longer exists: ${before}`);
+  const pageIds = visibleIds.slice(Math.max(0, end - limit), end);
+  const wanted = new Set(pageIds);
+  const mappedById = new Map<string, HistoryEntry>();
   const lines = createInterface({
     input: createReadStream(path, { encoding: "utf8" }),
     crlfDelay: Infinity,
@@ -706,14 +839,15 @@ async function readHistoryFallback(
     } catch {
       continue;
     }
-    if (entry?.type !== "message") continue;
-    if (seen++ < offset) continue;
-    const mapped = historyEntryFromMessage(entry);
+    if (!wanted.has(entry?.id)) continue;
+    const mapped = visibleHistoryEntry(entry);
     if (!mapped) continue;
-    result.push(mapped);
-    if (result.length >= limit) break;
+    mappedById.set(mapped.id, mapped);
   }
-  return result;
+  return pageIds.flatMap(id => {
+    const entry = mappedById.get(id);
+    return entry ? [entry] : [];
+  });
 }
 const SESSION_MANAGER_MAX_BYTES = 4 * 1024 * 1024;
 let sessionManagerModule: Promise<{ SessionManager: any }> | undefined;
@@ -726,7 +860,7 @@ async function loadSessionManager() {
 /** Uses pi's active-branch/compaction semantics for bounded-size files. Large files stay on the streaming fallback. */
 async function readHistory(
   path: string,
-  offset = 0,
+  before: number | string = 0,
   limit = 500,
 ): Promise<HistoryEntry[]> {
   const stat = await fs.stat(path);
@@ -734,7 +868,7 @@ async function readHistory(
     console.warn(
       `[pipi-backend] SessionManager skipped for ${path}: ${stat.size} bytes exceeds bounded history limit`,
     );
-    return readHistoryFallback(path, offset, limit);
+    return readHistoryFallback(path, before, limit);
   }
   try {
     const { SessionManager } = await loadSessionManager();
@@ -742,31 +876,15 @@ async function readHistory(
     const entries = manager.buildContextEntries();
     const visible: HistoryEntry[] = [];
     for (const entry of entries as any[]) {
-      if (entry.type === "message") {
-        const mapped = historyEntryFromMessage(entry);
-        if (mapped) visible.push(mapped);
-      } else if (entry.type === "custom_message" && entry.display) {
-        visible.push({
-          id: entry.id,
-          role: "user",
-          content: text(entry.content),
-          timestamp: asTime(entry.timestamp),
-        });
-      } else if (entry.type === "compaction" && entry.summary) {
-        visible.push({
-          id: entry.id,
-          role: "assistant",
-          content: entry.summary,
-          timestamp: asTime(entry.timestamp),
-        });
-      }
+      const mapped = visibleHistoryEntry(entry);
+      if (mapped) visible.push(mapped);
     }
-    return visible.slice(offset, offset + limit);
+    return historyPage(visible, before, limit);
   } catch (error) {
     console.warn(
       `[pipi-backend] SessionManager fallback for ${path}: ${error instanceof Error ? error.message : String(error)}`,
     );
-    return readHistoryFallback(path, offset, limit);
+    return readHistoryFallback(path, before, limit);
   }
 }
 function dirId(path: string) {
@@ -906,7 +1024,7 @@ export class PiHostBackend implements HostBackend {
    */
   private ensureInFlight = new Map<string, Promise<Live>>();
   /** Parsed history for an unchanged JSONL. Switching back must not re-parse on the UI thread. */
-  private historyCache = new Map<string, { mtimeMs: number; size: number; offset: number; limit: number; entries: HistoryEntry[] }>();
+  private historyCache = new Map<string, { mtimeMs: number; size: number; before: number | string; limit: number; entries: HistoryEntry[] }>();
   /** At most one Swift-parity title side channel may be launched per placeholder session. */
   private titleGenerationStarted = new Set<string>();
   /** A user rename always wins over an already-running automatic title refinement. */
@@ -1351,19 +1469,19 @@ export class PiHostBackend implements HostBackend {
   private async locate(id: string) {
     return this.confirmSessionMeta(await this.findSession(id));
   }
-  private async readHistoryCached(path: string, offset: number, limit: number): Promise<HistoryEntry[]> {
+  private async readHistoryCached(path: string, before: number | string, limit: number): Promise<HistoryEntry[]> {
     const stat = await fs.stat(path);
     const hit = this.historyCache.get(path);
     if (
       hit &&
       hit.mtimeMs === stat.mtimeMs &&
       hit.size === stat.size &&
-      hit.offset === offset &&
+      hit.before === before &&
       hit.limit === limit
     )
       return hit.entries;
-    const entries = await readHistory(path, offset, limit);
-    this.historyCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, offset, limit, entries });
+    const entries = await readHistory(path, before, limit);
+    this.historyCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, before, limit, entries });
     return entries;
   }
   private async confirmSessionMeta(meta: SessionMeta): Promise<SessionMeta> {
@@ -1569,10 +1687,17 @@ export class PiHostBackend implements HostBackend {
         return this.moveSession(params[0] as string, params[1] as string);
       case "getSessionHistory": {
         const session = await this.findSession(params[0] as string);
+        const requestedBefore = params[1];
+        const requestedLimit = Number(params[2] ?? 500);
+        const numericBefore = Number(requestedBefore ?? 0);
+        const before = typeof requestedBefore === "string" && requestedBefore
+          ? requestedBefore
+          : Number.isFinite(numericBefore) ? Math.max(0, Math.floor(numericBefore)) : 0;
+        const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(500, Math.floor(requestedLimit))) : 500;
         return this.readHistoryCached(
           session.path,
-          Number(params[1] ?? 0),
-          Number(params[2] ?? 500),
+          before,
+          limit,
         );
       }
       case "getSessionLease": {

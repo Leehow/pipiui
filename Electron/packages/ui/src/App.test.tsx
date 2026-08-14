@@ -161,6 +161,116 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(document.title).toBe('Electron 三栏界面'))
   })
 
+  it('restores the last valid project and session after an App remount', async () => {
+    const base = createMockHost()
+    const projects: Project[] = [
+      { id: 'p1', name: 'One', path: '/tmp/one' },
+      { id: 'p2', name: 'Two', path: '/tmp/two' }
+    ]
+    const sessions: Session[] = [
+      { id: 's1', projectId: 'p1', name: 'First', updatedAt: 2 },
+      { id: 's2', projectId: 'p2', name: 'Remember me', updatedAt: 1 }
+    ]
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: async () => projects,
+      listSessions: async projectId => sessions.filter(session => session.projectId === projectId),
+      getSessionHistory: async () => []
+    }
+    const first = render(<App host={host} />)
+    const secondRow = await waitFor(() => {
+      const row = first.container.querySelector('[data-session-id="s2"]')
+      if (!row) throw new Error('second session not loaded')
+      return row as HTMLElement
+    })
+    fireEvent.click(secondRow)
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('pipiui:eui:last-session:v1') ?? '{}')).toEqual({ projectId: 'p2', sessionId: 's2' }))
+    first.unmount()
+
+    const second = render(<App host={host} />)
+    await waitFor(() => expect(second.container.querySelector('[data-session-id="s2"]')?.getAttribute('aria-current')).toBe('true'))
+    expect(document.title).toBe('Remember me')
+  })
+
+  it('falls back safely when the remembered session is malformed or deleted', async () => {
+    localStorage.setItem('pipiui:eui:last-session:v1', '{not-json')
+    const view = render(<App host={createMockHost()} />)
+    await waitFor(() => expect(view.container.querySelector('[data-session-id="welcome"]')?.getAttribute('aria-current')).toBe('true'))
+    expect(document.title).toBe('Electron 三栏界面')
+  })
+
+  it('keeps successful session lists when another project read fails and surfaces a dismissible error', async () => {
+    const base = createMockHost()
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: async () => [
+        { id: 'ok', name: 'OK', path: '/tmp/ok' },
+        { id: 'broken', name: 'Broken', path: '/tmp/broken' }
+      ],
+      listSessions: async projectId => {
+        if (projectId === 'broken') throw new Error('disk busy')
+        return [{ id: 'kept', projectId: 'ok', name: 'Kept session', updatedAt: 1 }]
+      },
+      getSessionHistory: async () => []
+    }
+    const view = render(<App host={host} />)
+    await waitFor(() => expect(view.container.querySelector('[data-session-id="kept"]')).toBeTruthy())
+    expect((await screen.findByTestId('sidebar-project-error')).textContent).toContain('disk busy')
+    fireEvent.click(screen.getByRole('button', { name: '关闭项目错误' }))
+    expect(screen.queryByTestId('sidebar-project-error')).toBeNull()
+    expect(view.container.querySelector('[data-session-id="kept"]')).toBeTruthy()
+  })
+
+  it('loads older history pages without gaps and preserves the newest successful page when an older read fails', async () => {
+    const base = createMockHost()
+    const newest = Array.from({ length: 500 }, (_, index) => ({
+      id: `new-${index}`,
+      role: 'user' as const,
+      content: index === 499 ? 'newest marker' : `new ${index}`,
+      timestamp: 1_000 + index
+    }))
+    const history = vi.fn(async (_sessionId: string, before?: number | string) => {
+      if (before === undefined) return newest
+      throw new Error('older page unavailable')
+    })
+    const host: PipiHostAPI = { ...base, getSessionHistory: history }
+    render(<App host={host} />)
+    expect(await screen.findByText('newest marker')).toBeTruthy()
+    await waitFor(() => expect(history).toHaveBeenCalledWith('welcome', 'new-0', 500))
+    expect((await screen.findByTestId('sidebar-project-error')).textContent).toContain('older page unavailable')
+    expect(screen.getByText('newest marker')).toBeTruthy()
+  })
+
+  it('retries an incomplete cached history on reselection without hiding its newest page', async () => {
+    const base = createMockHost()
+    const newest = Array.from({ length: 500 }, (_, index) => ({
+      id: `retry-new-${index}`,
+      role: 'user' as const,
+      content: index === 499 ? 'retry newest marker' : `retry new ${index}`,
+      timestamp: 2_000 + index
+    }))
+    let olderAttempts = 0
+    const history = vi.fn(async (sessionId: string, before?: number | string) => {
+      if (sessionId === 'layout') return []
+      if (before === undefined || before === 0) return newest
+      olderAttempts += 1
+      if (olderAttempts === 1) throw new Error('temporary older failure')
+      return [{ id: 'retry-old', role: 'user' as const, content: 'recovered older marker', timestamp: 1 }]
+    })
+    const host: PipiHostAPI = { ...base, getSessionHistory: history }
+    const view = render(<App host={host} />)
+    expect(await screen.findByText('retry newest marker')).toBeTruthy()
+    await screen.findByText(/temporary older failure/)
+
+    fireEvent.click(view.container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(view.container.querySelector('[data-session-id="layout"]')?.getAttribute('aria-current')).toBe('true'))
+    fireEvent.click(view.container.querySelector('[data-session-id="welcome"]')!)
+    expect(screen.getByText('retry newest marker')).toBeTruthy()
+    expect(await screen.findByText('recovered older marker')).toBeTruthy()
+    expect(screen.getByText('retry newest marker')).toBeTruthy()
+    expect(olderAttempts).toBe(2)
+  })
+
   it('applies provisional and model-refined session titles from the host stream', async () => {
     const host = createMockHost()
     let listener: ((event: StreamEvent) => void) | undefined
@@ -859,6 +969,7 @@ describe('PipiUI Electron main layout', () => {
 
     cleanup()
     // No quota source: the context pill remains and nothing quota-like renders.
+    localStorage.removeItem('pipiui:eui:last-session:v1')
     render(<App host={{ ...base, getSessionStats, getQuotaSnapshot: async () => null }} />)
     expect((await screen.findByTestId('stats-pill')).textContent).toContain('76k/272k')
     expect(screen.getByTestId('context-progress-ring')).toBeTruthy()

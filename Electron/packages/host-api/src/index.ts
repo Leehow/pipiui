@@ -391,7 +391,10 @@ export interface PipiHostAPI {
   renameProject?(projectId: string, name: string): Promise<Project>;
   /** Optional: absent or unsupported v2 hosts let the UI use its local preview fallback. */
   listDocuments?(projectId?: string): Promise<DocumentSummary[]>; readDocument?(documentId: string): Promise<DocumentContent>;
-  newSession(projectId: string, name?: string): Promise<Session>; resumeSession(sessionId: string): Promise<Session>; renameSession(sessionId: string, name: string): Promise<Session>; deleteSession(sessionId: string): Promise<void>; moveSession(sessionId: string, targetProjectId: string): Promise<Session>; getSessionHistory(sessionId: string): Promise<HistoryEntry[]>; getSessionLease(sessionId: string): Promise<SessionLease>; forceTakeoverSessionLease(sessionId: string): Promise<SessionLease>;
+  newSession(projectId: string, name?: string): Promise<Session>; resumeSession(sessionId: string): Promise<Session>; renameSession(sessionId: string, name: string): Promise<Session>; deleteSession(sessionId: string): Promise<void>; moveSession(sessionId: string, targetProjectId: string): Promise<Session>;
+  /** Newest-first paging cursor: an entry id is stable/exclusive; numeric newest-relative offsets remain supported for compatibility. */
+  getSessionHistory(sessionId: string, before?: number | string, limit?: number): Promise<HistoryEntry[]>;
+  getSessionLease(sessionId: string): Promise<SessionLease>; forceTakeoverSessionLease(sessionId: string): Promise<SessionLease>;
   /** Legacy-compatible send: direct sends and busy queueing are observed through `queue_update` stream events. */
   sendPrompt(sessionId: string, prompt: string, attachments?: PromptAttachment[]): Promise<void>;
   listQueue(sessionId: string): Promise<QueuedMessage[]>; enqueueMessage(sessionId: string, text: string, attachments?: PromptAttachment[]): Promise<QueueEnqueueResult>; updateQueuedMessage(sessionId: string, messageId: string, text: string, attachments?: PromptAttachment[]): Promise<QueuedMessage>; removeQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; promoteQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; steerQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; retryQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>;
@@ -532,7 +535,9 @@ function apiFrom(
     renameSession: (sessionId, name) => invoke("renameSession", sessionId, name),
     deleteSession: sessionId => invoke("deleteSession", sessionId),
     moveSession: (sessionId, targetProjectId) => invoke("moveSession", sessionId, targetProjectId),
-    getSessionHistory: sessionId => invoke("getSessionHistory", sessionId),
+    getSessionHistory: (sessionId, before, limit) => before === undefined
+      ? invoke("getSessionHistory", sessionId)
+      : invoke("getSessionHistory", sessionId, before, limit),
     getSessionLease: sessionId => invoke("getSessionLease", sessionId),
     forceTakeoverSessionLease: sessionId => invoke("forceTakeoverSessionLease", sessionId),
     sendPrompt: (sessionId, prompt, attachments) => attachments?.length ? invoke("sendPrompt", sessionId, prompt, attachments) : invoke("sendPrompt", sessionId, prompt),
