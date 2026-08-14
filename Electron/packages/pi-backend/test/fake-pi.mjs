@@ -77,6 +77,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     if (command.message === "fill-context-slow") { contextTokens = 240000; slowCompact = true }
     ok();
     emitTurn(command.message, command.images);
+    if (command.message === "__late_queue_update__") send({ type: "queue_update", followUp: [] });
     return;
   }
   if (command.type === "steer") {

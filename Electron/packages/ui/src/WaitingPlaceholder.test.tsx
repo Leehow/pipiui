@@ -36,6 +36,8 @@ describe('waitingCopy', () => {
     expect(waitingCopy('tool', 0)).toBe('正在执行工具操作…')
     expect(waitingCopy('retrying', 20)).toBe('连接中断，正在重试…')
     expect(waitingCopy('stopping', 45)).toBe('正在停止…')
+    expect(waitingCopy('continuing', 0)).toBe('等待模型响应')
+    expect(waitingCopy('continuing', 600)).toBe('等待模型响应')
   })
 })
 

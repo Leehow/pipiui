@@ -1792,13 +1792,9 @@ export class PiHostBackend implements HostBackend {
       // refresh so the pill drops the stale number instead of showing 316k/200k.
       void this.pushSessionStats(id);
     } else if (e.type === "queue_update") {
+      // Follow-up list only. Emitting status:streaming here reopened a settled
+      // composer as 生成中 with no turn — the UI treats streaming as "busy now".
       live.followUps = e.followUp ?? [];
-      this.stream({
-        type: "status",
-        sessionId: id,
-        status: "streaming",
-        pendingFollowUps: live.followUps,
-      });
     } else if (e.type === "message_update") {
       const d = e.assistantMessageEvent ?? {};
       if (d.type === "text_delta")
@@ -2409,7 +2405,7 @@ export class PiHostBackend implements HostBackend {
     this.stream({
       type: "status",
       sessionId: id,
-      status: "streaming",
+      status: "started",
       pendingFollowUps: live.followUps,
     });
   }

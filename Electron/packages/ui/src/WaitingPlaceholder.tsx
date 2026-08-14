@@ -7,18 +7,20 @@ import './waiting-placeholder.css'
  * Mirrors Swift `WaitingPlaceholderChoice` (thinking / stopping / compacting /
  * captioning / media) mapped to web equivalents:
  * - `awaiting` — user prompt sent, no visible assistant content yet (first-token wait)
+ * - `continuing` — a later turn is open after prior assistant output (not "first response")
  * - `thinking` — model reasoning in progress (Swift "AI 正在思考…")
  * - `tool`     — a tool run is in flight (Swift media / compacting equivalents)
  * - `retrying` — a failed call is being retried
  * - `stopping` — user requested stop (Swift "正在停止…", which takes precedence)
  */
-export type WaitingPhase = 'awaiting' | 'thinking' | 'tool' | 'retrying' | 'stopping'
+export type WaitingPhase = 'awaiting' | 'continuing' | 'thinking' | 'tool' | 'retrying' | 'stopping'
 
 export const WAITING_COPY = {
   connecting: '正在连接模型',
   readingContext: '模型正在阅读上下文',
   awaitingFirstResponse: '等待第一个响应',
   stillWorking: '模型仍在处理',
+  continuing: '等待模型响应',
   thinking: '模型正在思考…',
   tool: '正在执行工具操作…',
   retrying: '连接中断，正在重试…',
@@ -90,9 +92,10 @@ function toEpochMs(startedAt: Date | number): number {
  * elapsed), rendered as one restrained line: 3-bar waveform · copy · detail ·
  * elapsed · optional stop. Never full-screen, never a skeleton, no big spinner.
  *
- * Integration rule (next round): render it only for the active turn when
- * `streaming && no visible assistant content`; queued follow-ups must not show
- * it. This component makes no global-streaming decisions itself.
+ * Integration rule: render it for the active turn until that turn has visible
+ * output. A follow-up after prior assistant text uses phase=`continuing` so the
+ * copy does not claim to wait for the first response. This component makes no
+ * global-streaming decisions itself.
  */
 export function WaitingPlaceholder({ phase, startedAt, detail, onStop, reduceMotion = false }: WaitingPlaceholderProps) {
   const startMs = useMemo(() => toEpochMs(startedAt), [startedAt])

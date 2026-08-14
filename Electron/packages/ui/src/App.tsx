@@ -762,6 +762,11 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const sidebarStorageKey = useMemo(() => sidebarPreferencesKey(projects), [projects])
   // A host status can describe queued follow-ups. Only a local user send owns this waiting turn.
   const activeUserTurnRef = useRef(false)
+  // True only between an authoritative `started` and `settled`/`stopped`.
+  // A late `streaming` (pi queue_update after settle) must not reopen the turn.
+  const mainTurnOpenRef = useRef(false)
+  const messagesRef = useRef<ChatMessage[]>([])
+  messagesRef.current = messages
   const historyLoadRef = useRef(0)
   const sessionQueue = useSessionQueue(host, selectedSession, streaming)
   const canWriteLease = leaseCanWrite(lease)
@@ -897,6 +902,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       return
     }
     activeUserTurnRef.current = false
+    mainTurnOpenRef.current = false
+    messagesRef.current = []
     setStreaming(false)
     setCompacting(false)
     setWaitingVisible(false)
@@ -928,12 +935,26 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       }
       if (event.type === 'status') {
         const terminal = event.status === 'settled' || event.status === 'stopped'
+        // A late `streaming` after settle is a follow-up-list update, not a new
+        // turn. Ignoring it keeps the composer idle instead of 生成中 with no work.
+        if (event.status === 'streaming' && !mainTurnOpenRef.current) return
         const sidebarStatus: SessionStatus = event.status === 'started' || event.status === 'streaming'
           ? 'running'
           : event.status === 'settled' ? 'completed' : 'interrupted'
         setObservedSessionStatuses(current => current[event.sessionId] === sidebarStatus ? current : { ...current, [event.sessionId]: sidebarStatus })
-        if (event.status === 'started' || event.status === 'streaming') setStreaming(true)
+        if (event.status === 'started' || event.status === 'streaming') {
+          if (event.status === 'started') mainTurnOpenRef.current = true
+          setStreaming(true)
+          if (!activeUserTurnRef.current) {
+            activeUserTurnRef.current = true
+            setWaitingStartedAt(Date.now())
+            setWaitingVisible(true)
+            setWaitingPhase(hasVisibleAssistantOutput(messagesRef.current) ? 'continuing' : 'awaiting')
+            setWaitingDetail(undefined)
+          }
+        }
         if (terminal) {
+          mainTurnOpenRef.current = false
           setStreaming(false)
           setStatsRefreshKey(key => key + 1)
           // Settle the streaming assistant message no matter who started the turn
@@ -1010,6 +1031,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     const beginDirectTurn = () => {
       setMessages(items => [...items, { id: crypto.randomUUID(), role: 'user', content: prompt + (attachments?.length ? ` [${attachments.length} 张图片]` : ''), timestamp: Date.now() }])
       activeUserTurnRef.current = true
+      mainTurnOpenRef.current = true
       setStreaming(true)
       setWaitingStartedAt(Date.now())
       setWaitingVisible(true)
@@ -1018,6 +1040,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     const resetFailedDirectTurn = () => {
       activeUserTurnRef.current = false
+      mainTurnOpenRef.current = false
       setStreaming(false)
       setWaitingVisible(false)
       setWaitingStartedAt(null)
@@ -1336,6 +1359,14 @@ export function finishStreamingMessage(messages: ChatMessage[]): ChatMessage[] {
   const next = [...messages]
   next[index] = { ...next[index], streaming: false }
   return next
+}
+
+function hasVisibleAssistantOutput(messages: ChatMessage[]): boolean {
+  return messages.some(message => message.role === 'assistant' && (
+    Boolean(message.content) ||
+    (message.tools?.length ?? 0) > 0 ||
+    Boolean(message.thinking)
+  ))
 }
 
 function ResizeHandle({ label, onPointerDown }: { label: string; onPointerDown: (event: React.PointerEvent) => void }) { return <div className="resize-handle" role="separator" aria-label={label} onPointerDown={onPointerDown} /> }

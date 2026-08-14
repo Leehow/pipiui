@@ -125,4 +125,20 @@ describe("PiHostBackend message queue integration", () => {
     expect(await backend.handle("listQueue", ["s1"])).toMatchObject([expect.objectContaining({ text: "blocked in s1" })]);
     await backend.close();
   });
+
+  it("does not emit status:streaming for a late pi queue_update after settle", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const events: any[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream" && event.event.type === "status") events.push(event.event);
+    });
+    await backend.handle("sendPrompt", ["s1", "__late_queue_update__"]);
+    await eventually(() => events.some(event => event.status === "settled"));
+    off();
+    const lastSettled = events.findLastIndex(event => event.status === "settled");
+    expect(lastSettled).toBeGreaterThanOrEqual(0);
+    expect(events.slice(lastSettled + 1).some(event => event.status === "streaming")).toBe(false);
+    await backend.close();
+  });
 });
