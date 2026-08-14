@@ -40,6 +40,8 @@
 
 /* Popover rows: window title left, usage right, checkmark last (Swift layout). */
 .quota-menu {
+  right: 0;
+  left: auto;
   min-width: 200px;
 }
 

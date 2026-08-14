@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import type { PipiHostAPI, TerminalEvent, TerminalSession } from '@pipi/host-api'
@@ -49,7 +50,7 @@ function displayTitle(tab: TerminalSession, index: number, total: number) {
   return title === '终端' && total > 1 ? `终端 ${index + 1}` : title
 }
 
-export function TerminalPanel({ host, theme, sessionId, announcedTerminal, revealedTerminalId, projectId, projectPath, visible = true }: { host: PipiHostAPI; theme: ThemeName; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; projectId?: string; projectPath?: string; visible?: boolean }) {
+export function TerminalPanel({ host, theme, sessionId, announcedTerminal, revealedTerminalId, projectId, projectPath, visible = true, headerSlot }: { host: PipiHostAPI; theme: ThemeName; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; projectId?: string; projectPath?: string; visible?: boolean; headerSlot?: HTMLElement | null }) {
   /**
    * Terminals are session-scoped: each chat session owns its own set, so switching sessions shows
    * that session's shells rather than someone else's. Every tab stays mounted regardless of which
@@ -124,7 +125,7 @@ export function TerminalPanel({ host, theme, sessionId, announcedTerminal, revea
   }
 
   return <section className="terminal-panel" data-testid="terminal-panel">
-    <nav className="terminal-tabs" aria-label="终端标签页" role="tablist">
+    {headerSlot && visible && createPortal(<nav className="terminal-tabs" aria-label="终端标签页" role="tablist">
       {sessionTabs.map((tab, index) => {
         const title = displayTitle(tab, index, sessionTabs.length)
         const selected = tab.id === activeId
@@ -134,7 +135,7 @@ export function TerminalPanel({ host, theme, sessionId, announcedTerminal, revea
         </div>
       })}
       <button className="terminal-new-tab" aria-label="新建终端" title="新建终端" onClick={() => void openTab()}>＋</button>
-    </nav>
+    </nav>, headerSlot)}
     <div className="terminal-sessions">
       {activeSession && <TerminalSurface key={activeSession.id} host={host} session={activeSession} theme={theme} fallbackCwd={projectPath} active={visible} onMetadata={updateMetadata} onError={setError} />}
     </div>
@@ -260,10 +261,6 @@ function TerminalSurface({ host, session, theme, fallbackCwd, active, onMetadata
 
   return <section id={`terminal-${session.id}`} className="terminal-session" role="tabpanel">
     <header className="terminal-session-header">
-      <div className="terminal-session-meta">
-        <span className="terminal-icon" aria-hidden="true">⌘</span>
-        <div><strong>{session.title}</strong><small title={session.cwd ?? fallbackCwd ?? '终端会话'}>{session.cwd ?? fallbackCwd ?? '终端会话'}</small></div>
-      </div>
       <div className="terminal-actions">
         {session.privateState === 'pending' && <><button onClick={() => privateAction('begin_private_input')}>开始私密输入</button><button onClick={() => privateAction('cancel_private_input')}>取消</button></>}
         {session.privateState === 'active' && <button onClick={() => privateAction('finish_private_input')}>完成私密输入并交还 Agent</button>}

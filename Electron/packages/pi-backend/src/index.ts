@@ -50,7 +50,7 @@ import {
 } from "./spawn-assembly.js";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
 import { LeaseManager } from "./lease.js";
-import { checkoutBranch, probeGit } from "./git.js";
+import { checkoutBranch, initGit, probeGit } from "./git.js";
 import { HostBridge } from "./bridge.js";
 import { DEFAULT_FEATURES } from "./features.js";
 import { ProviderAuthBackend, type AuthRuntimeLike } from "./provider-auth.js";
@@ -204,6 +204,7 @@ export {
 export {
   checkoutBranch,
   githubBrowserURL,
+  initGit,
   parsePorcelain,
   parseUpstreamCounts,
   probeGit,
@@ -332,6 +333,8 @@ export type PiBackendOptions = {
   compaction?: ProactiveCompactionConfiguration;
   /** Testable canonical Swift project source; undefined preserves existing host state. */
   canonicalProjectPaths?: () => Promise<string[] | undefined>;
+  /** Open a project folder in the OS file manager. Defaults to open/explorer/xdg-open. */
+  revealPath?: (path: string) => Promise<void>;
 };
 
 async function swiftCanonicalProjectPaths(env: NodeJS.ProcessEnv): Promise<string[] | undefined> {
@@ -383,6 +386,11 @@ type Live = {
   hostAbortedTurn?: boolean;
 };
 const PI_STDERR_TAIL_LIMIT = 16 * 1024;
+/** Matches Swift `SubagentWatchdog.staleThreshold`. */
+const ORPHAN_STALE_MS = 10 * 60 * 1000;
+const ORPHAN_RECONCILE_INTERVAL_MS = 60 * 1000;
+const ORPHAN_CLOSEOUT =
+  "会话进程已退出且超过 10 分钟无观察事件；按中断成果保留";
 class PiExitedError extends Error {
   constructor(
     readonly code: number | null,
@@ -764,6 +772,26 @@ async function readHistory(
 function dirId(path: string) {
   return Buffer.from(path).toString("base64url");
 }
+function displayNameFor(path: string, names: Record<string, string>): string {
+  const custom = names[path]?.trim();
+  return custom || basename(path) || path;
+}
+/** Open a folder in Finder / Explorer / the desktop file manager. */
+function defaultRevealPath(target: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const spec =
+      process.platform === "darwin"
+        ? { cmd: "open", args: [target] }
+        : process.platform === "win32"
+          ? { cmd: "explorer", args: [target] }
+          : { cmd: "xdg-open", args: [target] };
+    execFile(spec.cmd, spec.args, (error) => {
+      // Windows Explorer often exits 1 after a successful reveal.
+      if (error && process.platform !== "win32") reject(error);
+      else resolve();
+    });
+  });
+}
 const num = (value: any) =>
   typeof value === "number" && Number.isFinite(value) ? value : 0;
 const nonEmpty = (value: any): string | undefined =>
@@ -949,6 +977,9 @@ export class PiHostBackend implements HostBackend {
   private visionEnabledLoaded?: Promise<void>;
   private projectPaths: string[] = [];
   private projectPathsLoaded?: Promise<void>;
+  private projectNames: Record<string, string> = {};
+  private projectNamesLoaded?: Promise<void>;
+  private revealPath: (path: string) => Promise<void>;
   private settingsWrite: Promise<void> = Promise.resolve();
   private auth: ProviderAuthBackend;
   private authRuntimePromise?: Promise<AuthRuntimeLike>;
@@ -995,6 +1026,7 @@ export class PiHostBackend implements HostBackend {
     this.proc = options.spawn ?? (spawn as ProcFactory);
     this.env = options.env ?? process.env;
     this.canonicalProjectPaths = options.canonicalProjectPaths ?? (() => swiftCanonicalProjectPaths(this.env));
+    this.revealPath = options.revealPath ?? defaultRevealPath;
     const queueRoot =
       options.agentDir || !options.sessionsRoot
         ? join(this.agentDir, "pipiui-queues")
@@ -1121,6 +1153,7 @@ export class PiHostBackend implements HostBackend {
   async close(): Promise<void> {
     this.persistAgentLogs();
     this.closed = true;
+    this.stopOrphanReconcileTimer();
     // Stop the resident external-pi worker if one was spawned during this run.
     this.externalAuthRuntime?.stop();
     for (const wake of [...this.agentTerminalWaiters]) wake();
@@ -1406,8 +1439,8 @@ export class PiHostBackend implements HostBackend {
       availableThinkingLevels,
     };
   }
-  private project(path: string): Project {
-    return { id: dirId(path), name: basename(path) || path, path };
+  private project(path: string, names = this.projectNames): Project {
+    return { id: dirId(path), name: displayNameFor(path, names), path };
   }
   private async loadConfiguredModels(): Promise<void> {
     if (this.modelsLoaded) return this.modelsLoaded;
@@ -1462,9 +1495,7 @@ export class PiHostBackend implements HostBackend {
   async handle(method: HostMethod, params: unknown[]): Promise<unknown> {
     switch (method) {
       case "listProjects":
-        return (await this.loadProjectPaths()).map((path) =>
-          this.project(path),
-        );
+        return this.listConfiguredProjects();
       case "getProjectPaths":
         return [...(await this.loadProjectPaths())];
       case "setProjectPaths":
@@ -1473,6 +1504,10 @@ export class PiHostBackend implements HostBackend {
         return this.addProject(params[0]);
       case "removeProject":
         return this.removeProject(params[0] as string);
+      case "renameProject":
+        return this.renameProject(params[0] as string, params[1]);
+      case "revealProject":
+        return this.revealProject(params[0] as string);
       case "listDocuments":
         // Documents are opened explicitly from transcript references; never scan a project.
         return [];
@@ -1717,6 +1752,10 @@ export class PiHostBackend implements HostBackend {
           await this.projectPath(params[0] as string),
           params[1] as string,
         );
+      case "probeDirectoryGit":
+        return probeGit(await this.pickedDirectory(params[0]));
+      case "gitInitDirectory":
+        return initGit(await this.pickedDirectory(params[0]));
       case "capabilities":
         return {
           computerUse: Boolean(
@@ -1724,7 +1763,7 @@ export class PiHostBackend implements HostBackend {
               this.computerDescriptor &&
               this.computerUsable(),
           ),
-          revealInFinder: process.platform === "darwin",
+          revealInFinder: true,
           terminal: true,
           git: true,
           plan: false,
@@ -1739,6 +1778,19 @@ export class PiHostBackend implements HostBackend {
     const project = projects.find((item) => item.id === projectId);
     if (!project) throw new Error(`unknown project ${projectId}`);
     return project.path;
+  }
+  /**
+   * Add-project-time git probe/init run in a directory the user just picked in
+   * the native chooser — the same trust level as `addProject`. Still refuse
+   * anything that is not an existing absolute directory so a malformed value
+   * can never point git at an arbitrary file.
+   */
+  private async pickedDirectory(value: unknown): Promise<string> {
+    const path = typeof value === "string" ? value.trim() : "";
+    if (!path || !isAbsolute(path)) throw new Error("目录必须是绝对路径");
+    const stat = await fs.stat(path).catch(() => undefined);
+    if (!stat?.isDirectory()) throw new Error(`目录不存在或不是文件夹：${path}`);
+    return path;
   }
   /**
    * Bring the runtime tree up to the shipped sources, then hand back its root for path
@@ -2044,6 +2096,7 @@ export class PiHostBackend implements HostBackend {
       const finish = () => {
         if (this.live.get(id) === live) this.live.delete(id);
         resolveExit();
+        this.reconcileOrphanedNow(id);
         if (!this.closed) void this.queueIdle(id);
       };
       const lease = this.leases.get(id);
@@ -2613,7 +2666,67 @@ export class PiHostBackend implements HostBackend {
       throw new Error("project path 必须是非空 string");
     const paths = await this.loadProjectPaths();
     if (!paths.includes(value)) await this.saveProjectPaths([value, ...paths]);
+    await this.loadProjectNames();
     return this.project(value);
+  }
+  private async listConfiguredProjects(): Promise<Project[]> {
+    const paths = await this.loadProjectPaths();
+    const names = await this.loadProjectNames();
+    return paths.map((path) => this.project(path, names));
+  }
+  /** Display name only — never renames the on-disk folder. */
+  private async renameProject(projectId: string, name: unknown): Promise<Project> {
+    if (typeof name !== "string") throw new Error("project name 必须是 string");
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error("项目名称不能为空");
+    if (trimmed.length > 120) throw new Error("项目名称过长");
+    const path = await this.projectPath(projectId);
+    const names = await this.loadProjectNames();
+    const next = { ...names };
+    if (trimmed === (basename(path) || path)) delete next[path];
+    else next[path] = trimmed;
+    await this.saveProjectNames(next);
+    return this.project(path, next);
+  }
+  private async revealProject(projectId: string): Promise<void> {
+    const path = await this.projectPath(projectId);
+    let stat;
+    try {
+      stat = await fs.stat(path);
+    } catch (error: any) {
+      if (error?.code === "ENOENT") throw new Error(`项目文件夹不存在：${path}`);
+      throw new Error(`无法打开项目文件夹：${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!stat.isDirectory()) throw new Error(`项目路径不是文件夹：${path}`);
+    await this.revealPath(path);
+  }
+  private checkedProjectNames(value: unknown): Record<string, string> {
+    if (value === undefined) return {};
+    if (
+      !isRecord(value) ||
+      !Object.entries(value).every(([key, name]) => typeof key === "string" && key.length > 0 && typeof name === "string" && name.trim().length > 0)
+    )
+      throw new Error("projectNames 必须是 Record<string, string>");
+    return Object.fromEntries(Object.entries(value).map(([key, name]) => [key, (name as string).trim()]));
+  }
+  private async loadProjectNames(): Promise<Record<string, string>> {
+    if (!this.projectNamesLoaded) {
+      this.projectNamesLoaded = (async () => {
+        this.projectNames = this.checkedProjectNames((await this.readSettings()).projectNames);
+      })();
+    }
+    await this.projectNamesLoaded;
+    return { ...this.projectNames };
+  }
+  private async saveProjectNames(names: Record<string, string>): Promise<Record<string, string>> {
+    const saved = await this.updateSettings((settings) => {
+      if (Object.keys(names).length === 0) delete settings.projectNames;
+      else settings.projectNames = { ...names };
+      return { ...names };
+    });
+    this.projectNames = saved;
+    this.projectNamesLoaded = Promise.resolve();
+    return { ...saved };
   }
   /** Removes only the explicit sidebar entry; session JSONL files remain untouched. */
   private async removeProject(projectId: string): Promise<void> {
@@ -3539,6 +3652,7 @@ export class PiHostBackend implements HostBackend {
   }
   private agents = new Map<string, AgentSummary>();
   private worktrees = new Map<string, WorktreeStatus>();
+  private orphanReconcileTimer?: ReturnType<typeof setInterval>;
   private agentsFile(): string {
     return join(this.agentDir, "pipiui-agent-index.json");
   }
@@ -3657,6 +3771,88 @@ export class PiHostBackend implements HostBackend {
     if (!live?.process) return undefined;
     if (live.process.exitCode !== null || live.process.signalCode) return undefined;
     return live;
+  }
+  private lastObservedAt(agent: AgentSummary): number | undefined {
+    return agent.updatedAt ?? agent.createdAt;
+  }
+  private isLiveAgentState(state: AgentSummary["state"]): boolean {
+    return state === "running" || state === "stalled";
+  }
+  private stopOrphanReconcileTimer(): void {
+    if (!this.orphanReconcileTimer) return;
+    clearInterval(this.orphanReconcileTimer);
+    this.orphanReconcileTimer = undefined;
+  }
+  private syncOrphanReconcileTimer(): void {
+    const needsTick = [...this.agents.values()].some(
+      (agent) =>
+        this.isLiveAgentState(agent.state) &&
+        Boolean(agent.sessionId) &&
+        !this.liveSessionProcess(agent.sessionId!),
+    );
+    if (!needsTick || this.closed) {
+      this.stopOrphanReconcileTimer();
+      return;
+    }
+    if (this.orphanReconcileTimer) return;
+    this.orphanReconcileTimer = setInterval(
+      () => this.reconcileAllOrphaned(),
+      ORPHAN_RECONCILE_INTERVAL_MS,
+    );
+    this.orphanReconcileTimer.unref?.();
+  }
+  private retainOrphanWorktree(agentId: string): void {
+    const current = this.worktrees.get(agentId);
+    if (!current?.path || current.lifecycle !== "active") return;
+    const status: WorktreeStatus = {
+      ...current,
+      lifecycle: "pendingReview",
+      merge: "ready",
+      discard: "ready",
+    };
+    this.worktrees.set(agentId, status);
+    this.agent({ type: "worktree", status });
+  }
+  /**
+   * App-runtime orphan sweep (Swift `SubagentStore.reconcileOrphanedNow`):
+   * only when the session process is dead, and only for running/stalled rows
+   * whose last observation is older than the 10-minute watchdog window.
+   */
+  private reconcileOrphanedNow(sessionId: string, now = Date.now()): boolean {
+    if (this.liveSessionProcess(sessionId)) {
+      this.syncOrphanReconcileTimer();
+      return false;
+    }
+    let changed = false;
+    for (const agent of [...this.agents.values()]) {
+      if (agent.sessionId !== sessionId || !this.isLiveAgentState(agent.state)) continue;
+      const observed = this.lastObservedAt(agent);
+      if (observed === undefined || now - observed < ORPHAN_STALE_MS) continue;
+      const next: AgentSummary = {
+        ...agent,
+        state: "interrupted",
+        stalled: false,
+        stalledIdleSec: undefined,
+        listSubtitle: "",
+        endedAt: agent.endedAt ?? now,
+        closeout: agent.closeout ?? ORPHAN_CLOSEOUT,
+      };
+      this.agents.set(this.agentKey(agent.agentId, agent.sessionId), next);
+      this.agent({ type: "agent", agent: next });
+      this.retainOrphanWorktree(agent.agentId);
+      changed = true;
+    }
+    if (changed) this.persistAgents();
+    this.syncOrphanReconcileTimer();
+    return changed;
+  }
+  private reconcileAllOrphaned(now = Date.now()): void {
+    const sessionIds = new Set(
+      [...this.agents.values()]
+        .map((agent) => agent.sessionId)
+        .filter((id): id is string => Boolean(id)),
+    );
+    for (const sessionId of sessionIds) this.reconcileOrphanedNow(sessionId, now);
   }
   private forceAbortAgent(agent: AgentSummary, reason: string): void {
     const key = this.agentKey(agent.agentId, agent.sessionId);
@@ -3884,6 +4080,7 @@ export class PiHostBackend implements HostBackend {
       finalResult: terminal
         ? (nonEmpty(raw.output) ?? current?.finalResult)
         : sameRun ? current?.finalResult : undefined,
+      worktreeError: nonEmpty(raw.worktreeError) ?? (sameRun ? current?.worktreeError : undefined),
       endedAt: terminal ? (sameRun ? current?.endedAt : undefined) ?? Date.now() : sameRun ? current?.endedAt : undefined,
       inputTokens: num2(usage?.input) ?? (sameRun ? current?.inputTokens : undefined),
       outputTokens: num2(usage?.output) ?? (sameRun ? current?.outputTokens : undefined),

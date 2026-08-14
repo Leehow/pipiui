@@ -305,8 +305,8 @@ describe('PipiUI Electron main layout', () => {
     fireEvent.click(browser)
     expect(await screen.findByTestId('browser-panel')).toBeTruthy()
     const back = screen.getByTestId('tool-panel-back')
-    expect(back.closest('.tool-panel-nav')).not.toBeNull()
-    expect(container.querySelector('.subagent-header')?.contains(back)).toBe(false)
+    expect(back.closest('.tool-panel-header')).not.toBeNull()
+    expect(back.closest('.subagent-header')).toBeNull()
     fireEvent.click(back)
     expect(screen.queryByTestId('tool-panel-back')).toBeNull()
     expect(screen.getByRole('button', { name: 'Subagents' }).className).toContain('active')
@@ -405,6 +405,9 @@ describe('PipiUI Electron main layout', () => {
       expect(css).toMatch(/\.chat-header-actions\{[^}]*margin-left:auto/)
       expect(css).toMatch(/\.electron-chrome \.sb-topbar[^}]*padding-left:88px/)
       expect(css).toMatch(/\.electron-chrome \.chat-header-title-label\{[^}]*-webkit-app-region:no-drag/)
+      expect(css).toMatch(/\.electron-chrome \.chat-header-title-label\{[^}]*user-select:none/)
+      expect(css).toMatch(/\.pipiui-shell\{[^}]*height:100%;[^}]*max-height:100%/)
+      expect(css).not.toMatch(/\.pipiui-shell\{[^}]*100dvh/)
       expect(css).not.toContain('.titlebar-drag-title{')
     } finally {
       // userAgent normally lives on Navigator.prototype; unshadow it either way.
@@ -470,6 +473,23 @@ describe('PipiUI Electron main layout', () => {
     act(() => pushAgent?.({ type: 'agent', agent: { agentId: 'second', runId: 'run-2', sessionId: 'welcome', name: 'reviewer', task: 'more work', state: 'running' } }))
     await waitFor(() => expect(container.querySelector('.tool-rail-running')?.textContent).toBe('2'))
     expect(browser.className).toContain('active')
+  })
+
+  it('sends a narrowly scoped status-check prompt when the user clicks the stale-channel warning', async () => {
+    const host = createMockHost()
+    const now = Date.now()
+    host.listAgents = async () => [
+      { agentId: 'ghost', runId: 'r-ghost', sessionId: 'welcome', name: 'explore', task: 'vanished', state: 'running', createdAt: now - 11 * 60_000, updatedAt: now - 11 * 60_000 },
+    ]
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByTestId('subagent-manual-status-check'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalled())
+    const prompt = sendPrompt.mock.calls[0]?.[1] as string
+    expect(prompt).toContain('`ghost`')
+    expect(prompt).toContain('subagent_status')
+    expect(prompt).toContain('不要自动重新派发')
   })
 
   it.each([
@@ -812,7 +832,9 @@ describe('PipiUI Electron main layout', () => {
     const callsBeforeSettle = getSessionStats.mock.calls.length
     streamListeners.get('layout')?.({ type: 'status', sessionId: 'layout', status: 'settled' })
     await waitFor(() => expect(getSessionStats.mock.calls.length).toBe(callsBeforeSettle + 1))
-    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('completed'))
+    // Selected session: terminal-status notification is consumed, so the sidebar
+    // row falls back to idle (no red dot) — only live activity stays visible.
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('idle'))
 
     cleanup()
     // No quota source: the context pill remains and nothing quota-like renders.
@@ -916,13 +938,19 @@ describe('PipiUI Electron main layout', () => {
     fireEvent.click(screen.getByRole('button', { name: /在 PipiUI 新建会话/ }))
     await waitFor(() => expect(newSession).toHaveBeenCalledWith('pipiui'))
     fireEvent.click(screen.getByLabelText('PipiUI 项目菜单'))
+    expect(screen.queryByRole('menuitem', { name: '新建会话' })).toBeNull()
     fireEvent.click(screen.getByRole('menuitem', { name: '在 Finder 中显示' }))
     await waitFor(() => expect(revealProject).toHaveBeenCalledWith('pipiui'))
     fireEvent.click(screen.getByLabelText('PipiUI 项目菜单'))
-    expect((screen.getByRole('menuitem', { name: /编辑名称/ }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('menuitem', { name: '重命名' }))
+    const renameInput = screen.getByRole('textbox', { name: '项目名称' })
+    fireEvent.change(renameInput, { target: { value: '我的仓库' } })
+    fireEvent.keyDown(renameInput, { key: 'Enter' })
+    expect(await screen.findByText('我的仓库')).toBeTruthy()
+    fireEvent.click(screen.getByLabelText('我的仓库 项目菜单'))
     expect((screen.getByRole('menuitem', { name: /移除项目/ }) as HTMLButtonElement).disabled).toBe(true)
 
-    fireEvent.click(screen.getByRole('button', { name: /收起项目 PipiUI/ }))
+    fireEvent.click(screen.getByRole('button', { name: /收起项目 我的仓库/ }))
     await waitFor(() => expect(JSON.parse(localStorage.getItem(sidebarPreferencesKey(workspace))!).expandedIds).toEqual([]))
     first.unmount()
     render(<App host={createMockHost()} />)
@@ -1214,6 +1242,14 @@ describe('PipiUI Electron main layout', () => {
     expect(sidebarStatusForSession('interrupted', 'selected', false, undefined, agents).status).toBe('interrupted')
     expect(sidebarStatusForSession('completed', 'selected', false, undefined, agents).status).toBe('completed')
     expect(sidebarStatusForSession('unrelated-history', 'selected', false, undefined, agents).status).toBe('idle')
+    // Selected session: terminal-status notifications (red dot) are consumed —
+    // only running / subagents activity stays visible, everything else goes idle.
+    expect(sidebarStatusForSession('failed', 'failed', false, undefined, agents).status).toBe('idle')
+    expect(sidebarStatusForSession('stalled', 'stalled', false, undefined, agents).status).toBe('idle')
+    expect(sidebarStatusForSession('interrupted', 'interrupted', false, undefined, agents).status).toBe('idle')
+    expect(sidebarStatusForSession('completed', 'completed', false, undefined, agents).status).toBe('idle')
+    expect(sidebarStatusForSession('subtask', 'subtask', false, undefined, agents)).toEqual({ status: 'subagents-running', subagentCount: 1 })
+    expect(sidebarStatusForSession('subtask', 'subtask', true, undefined, agents).status).toBe('running')
   })
 
   it('maps the session model onto the sidebar logo: own model wins for other sessions, the selected row mirrors the live current model, no model falls back to unknown', () => {

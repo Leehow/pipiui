@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { relativeTime, Sidebar, statusCaption } from './Sidebar'
-import type { ProjectMenuAction, SidebarProps, SidebarSession } from './Sidebar'
+import type { SidebarProps, SidebarSession } from './Sidebar'
 
 beforeEach(() => {
   vi.useRealTimers()
@@ -110,16 +110,21 @@ describe('Sidebar', () => {
     expect(screen.getByText('s2')).toBeTruthy()
   })
 
-  it('project menu reports rename/reveal/remove actions via callback', () => {
-    const props = defaultProps()
+  it('project menu reports reveal/remove and renames inline without touching the folder path', async () => {
+    const onRenameProject = vi.fn()
+    const props = defaultProps({ onRenameProject })
     render(<Sidebar {...props} />)
     fireEvent.click(screen.getAllByRole('button', { name: 'demo-project 项目菜单' })[0])
     const menu = screen.getByTestId('project-menu')
     expect(menu.getAttribute('role')).toBe('menu')
+    expect(within(menu).queryByRole('menuitem', { name: '新建会话' })).toBeNull()
 
-    fireEvent.click(within(menu).getByRole('menuitem', { name: '编辑名称' }))
-    expect(props.onProjectMenu).toHaveBeenLastCalledWith('p1', 'rename')
-    expect(screen.queryByTestId('project-menu')).toBeNull()
+    fireEvent.click(within(menu).getByRole('menuitem', { name: '重命名' }))
+    expect(props.onProjectMenu).not.toHaveBeenCalled()
+    const input = screen.getByRole('textbox', { name: '项目名称' })
+    fireEvent.change(input, { target: { value: '我的仓库' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(onRenameProject).toHaveBeenCalledWith('p1', '我的仓库'))
 
     fireEvent.click(screen.getAllByRole('button', { name: 'demo-project 项目菜单' })[0])
     fireEvent.click(within(screen.getByTestId('project-menu')).getByRole('menuitem', { name: '在 Finder 中显示' }))
@@ -130,7 +135,7 @@ describe('Sidebar', () => {
     expect(props.onProjectMenu).toHaveBeenLastCalledWith('p1', 'remove')
   })
 
-  it('menu 新建会话 and the + ghost both report new-session intents', () => {
+  it('the + ghost reports a new-session intent and the menu does not offer it', () => {
     const props = defaultProps()
     render(<Sidebar {...props} />)
 
@@ -138,8 +143,7 @@ describe('Sidebar', () => {
     expect(props.onNewSession).toHaveBeenCalledWith('p1')
 
     fireEvent.click(screen.getAllByRole('button', { name: 'demo-project 项目菜单' })[0])
-    fireEvent.click(within(screen.getByTestId('project-menu')).getByRole('menuitem', { name: '新建会话' }))
-    expect(props.onProjectMenu).toHaveBeenLastCalledWith('p1', 'newSession' satisfies ProjectMenuAction)
+    expect(within(screen.getByTestId('project-menu')).queryByRole('menuitem', { name: '新建会话' })).toBeNull()
   })
 
   it('opens the native project-folder picker without showing a path text field', async () => {

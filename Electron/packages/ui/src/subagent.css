@@ -1,5 +1,5 @@
 .subagents{display:flex;flex:1;min-width:0;min-height:0;overflow:hidden;flex-direction:column;background:var(--surface)}
-.subagent-header{display:flex;flex:0 0 auto;min-width:0;align-items:center;gap:8px;min-height:40px;padding:0 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+.subagent-header{display:flex;flex:1 1 auto;min-width:0;align-items:center;gap:8px;min-height:0;padding:0 8px;white-space:nowrap}
 .subagent-header-left{display:flex;min-width:0;flex:1;align-items:center;gap:7px;overflow:hidden}
 .subagent-header-left>b{overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;font-size:12px}
 .subagent-header span,.agent-copy small,.agent-task,.worktree-meta,.agent-closeout{color:var(--muted);font-size:11px}
@@ -14,6 +14,10 @@
 .subagent-header-right button:hover,.agent-detail-header>button:hover,.agent-pager button:hover{background:var(--surface-hover);color:var(--text)}
 .subagent-header-right button:disabled{cursor:default;opacity:.42}
 .subagent-loading,.subagent-empty,.agent-detail.empty{display:grid;min-width:0;min-height:0;flex:1;place-content:center;gap:9px;padding:25px;color:var(--muted);text-align:center}
+.subagent-status-channel-warning{display:flex;flex:0 0 auto;align-items:center;gap:8px;padding:7px 12px;border-bottom:1px solid color-mix(in srgb,var(--warning,#d88a00) 28%,var(--border));background:color-mix(in srgb,var(--warning,#d88a00) 12%,transparent)}
+.subagent-status-channel-warning p{min-width:0;flex:1;margin:0;color:var(--text);font-size:11px;line-height:1.45}
+.subagent-status-channel-warning button{flex:0 0 auto;padding:3px 8px;border:1px solid color-mix(in srgb,var(--warning,#d88a00) 40%,var(--border));border-radius:4px;color:var(--text);background:color-mix(in srgb,var(--warning,#d88a00) 10%,var(--surface));font-size:11px}
+.subagent-status-channel-warning button:hover{background:color-mix(in srgb,var(--warning,#d88a00) 18%,var(--surface))}
 .subagent-abort-error{flex:0 0 auto;padding:6px 10px;border-bottom:1px solid var(--border)}
 .subagent-loading{display:flex;align-items:center;justify-content:center;font-size:12px}
 .subagent-empty b{font-size:30px;color:var(--subtle)}
@@ -42,7 +46,7 @@
 .agent-control.resolve{padding:0 6px;opacity:0;pointer-events:none;white-space:nowrap;color:var(--success);transition:opacity .13s ease}.agent-row:hover .agent-control.resolve,.agent-row:focus-within .agent-control.resolve{opacity:1;pointer-events:auto}
 .agent-pager{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 4px;font-variant-numeric:tabular-nums}.agent-pager button:disabled{cursor:default;opacity:.4}
 .subagent-divider{cursor:row-resize;background:var(--border)}.subagent-divider:hover,.subagent-divider:active{background:var(--accent)}
-.agent-detail{display:flex;min-width:0;min-height:0;overflow:hidden;flex-direction:column}.agent-detail-header{display:flex;min-width:0;flex:0 0 auto;align-items:center;gap:8px;min-height:47px;padding:7px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+.agent-detail{display:flex;min-width:0;min-height:0;overflow:hidden;flex-direction:column}.agent-detail .return-latest{right:10px;bottom:10px}.agent-detail-header{display:flex;min-width:0;flex:0 0 auto;align-items:center;gap:8px;min-height:47px;padding:7px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
 .agent-transcript-scroll{min-width:0;min-height:0;flex:1 1 auto;overflow-x:hidden;overflow-y:auto;padding:0 12px 12px;overscroll-behavior:contain}.agent-transcript{min-width:0}.agent-transcript .message{padding:6px 0}.agent-transcript .assistant-transcript-content{min-width:0}
 .detail-agent-title{display:grid;min-width:0;flex:1;gap:2px}.detail-agent-title>div{display:flex;min-width:0;align-items:center;gap:7px}.detail-agent-title b{overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;font-size:12px}.detail-agent-title small{overflow:hidden;color:var(--subtle);text-overflow:ellipsis;white-space:nowrap;font-size:10px}.detail-metrics{display:flex;min-width:0;align-items:center;gap:5px;overflow:hidden;color:var(--muted);font:10px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}.detail-metrics span{padding:2px 3px;border-radius:3px;background:var(--surface-hover)}
 .agent-task,.agent-closeout{flex:0 0 auto;margin:0;padding:6px 10px;line-height:1.4}.agent-task{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}.agent-closeout{padding-top:0;color:var(--warning)}

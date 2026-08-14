@@ -2,9 +2,12 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GitStatus, PipiHostAPI } from '@pipi/host-api'
-import { GitBranchMenu, branchHelpText, orderedBranches, toolbarTitle } from './GitBranchMenu'
+import { GitBranchMenu, GIT_FOCUS_REFRESH_MS, branchHelpText, orderedBranches, toolbarTitle } from './GitBranchMenu'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.useRealTimers()
+})
 
 const repo: GitStatus = { isRepo: true, currentBranch: 'pipiui/tunnel-reconnect', isDetached: false, shortSHA: '408cf26', localBranches: ['main', 'pipiui/tunnel-reconnect', 'Feature'], upstream: 'origin/main', ahead: 2, behind: 1, isDirty: true, staged: 1, unstaged: 3, untracked: 2, githubURL: 'https://github.com/demo/pipiui' }
 const clean: GitStatus = { isRepo: false, isDetached: false, localBranches: [], ahead: 0, behind: 0, isDirty: false, staged: 0, unstaged: 0, untracked: 0 }
@@ -68,7 +71,15 @@ describe('GitBranchMenu', () => {
     const api = host()
     render(<GitBranchMenu host={api} projectId="p1" available />)
     await screen.findByTestId('git-branch-button')
+    vi.useFakeTimers()
     fireEvent.focus(window)
-    await waitFor(() => expect(api.gitStatus).toHaveBeenCalledTimes(2))
+    // The same click that focuses a background window often starts a title-bar
+    // drag. Do not spawn git(1) on that frame.
+    expect(api.gitStatus).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(GIT_FOCUS_REFRESH_MS - 1)
+    expect(api.gitStatus).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(api.gitStatus).toHaveBeenCalledTimes(2)
+    vi.useRealTimers()
   })
 })

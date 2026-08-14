@@ -29,6 +29,21 @@
       "required": false,
       "absent": "your runtime's status channel"
     },
+    "delegate_chain": {
+      "tool": "subagent_chain",
+      "required": false,
+      "absent": "ordered sequential dispatch"
+    },
+    "delegate_abort": {
+      "tool": "subagent_abort",
+      "required": false,
+      "absent": "your runtime's abort command"
+    },
+    "delegate_resolve": {
+      "tool": "subagent_resolve",
+      "required": false,
+      "absent": "your runtime's resolve command"
+    },
     "search": {
       "tool": "web_search",
       "required": false,

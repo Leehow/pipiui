@@ -137,7 +137,7 @@ export class DispatchQueueV1 {
 					this.options.notify(
 						`[subagent-blocked] agentId=${item.agentId} title=${item.title ?? item.role} is held: ${admission.reason}. ` +
 							"It has NOT run and will NOT run on its own. Re-dispatch that dependency — this task starts automatically when the dependency succeeds — " +
-							`or drop it with action:"abort" + agentId="${item.agentId}" if it is no longer wanted.`,
+							`or drop it with subagent_abort({agentId:"${item.agentId}"}) if it is no longer wanted.`,
 					);
 				}
 				continue;
@@ -209,7 +209,7 @@ export function formatQueuedPromptSections(
 				const title = item.title?.trim() || item.agentId;
 				return `- \`${item.agentId}\` (${title}) — ${item.heldReason}`;
 			}),
-			'Each is waiting on a dependency that did not succeed. Re-dispatch that dependency and the held task resumes automatically, or drop it with `action:"abort"` + its agentId. Do not declare the goal finished while anything above is held.',
+			"Each is waiting on a dependency that did not succeed. Re-dispatch that dependency and the held task resumes automatically, or drop it with subagent_abort({agentId}) . Do not declare the goal finished while anything above is held.",
 		);
 	}
 	return lines;

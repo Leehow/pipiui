@@ -44,6 +44,14 @@ interface ModelCapabilitySnapshot {
       reasoning?: boolean
       reasoningOptions?: Array<{ type: string, values?: string[] }>
       verifiedAdditiveEffortValues?: string[]
+      /**
+       * Hand-curated passthrough for providers whose effort vocabulary is not named after
+       * pi levels (deepseek accepts low/high/max). The derived same-name map would forward
+       * an unsupported "medium" — the one failure mode this file exists to prevent.
+       */
+      thinkingLevelMap?: Record<string, string | null>
+      /** Hand-curated compat fields (e.g. thinkingFormat) merged over the derived override. */
+      compat?: Record<string, unknown>
     }>
   }>
 }
@@ -65,19 +73,24 @@ function capabilityOverride(model: ModelCapabilitySnapshot['providers'][string][
     ?.filter(option => option.type === 'effort')
     .flatMap(option => option.values ?? []) ?? []
   const supported = new Set([...catalogValues, ...(model.verifiedAdditiveEffortValues ?? [])])
-  if (!model.reasoning || supported.size === 0) return undefined
+  const handCurated = model.thinkingLevelMap !== undefined || model.compat !== undefined
+  if (!handCurated && (!model.reasoning || supported.size === 0)) return undefined
   // "off" disables reasoning and must stay available even when the provider's effort
   // catalog omits it. Leave the key absent rather than mapped: an absent entry keeps
   // "off" selectable in the UI while sending no reasoning param, whereas a string value
   // would be forwarded as the provider effort and null would hide the level entirely
-  // (stranding the UI default thinking level as invalid).
-  const thinkingLevelMap = Object.fromEntries(
-    THINKING_LEVELS.filter(level => level !== 'off').map(level => [level, supported.has(level) ? level : null])
-  ) as Record<ThinkingLevel, string | null>
+  // (stranding the UI default thinking level as invalid). A hand-curated entry may set
+  // "off": null deliberately — for a model that cannot be trusted to think on command,
+  // keeping an unset level at the provider default beats silently disabling thinking.
+  const derived = handCurated && model.thinkingLevelMap !== undefined
+    ? model.thinkingLevelMap
+    : Object.fromEntries(
+        THINKING_LEVELS.filter(level => level !== 'off').map(level => [level, supported.has(level) ? level : null])
+      ) as Record<ThinkingLevel, string | null>
   return {
-    reasoning: true,
-    thinkingLevelMap,
-    compat: { supportsReasoningEffort: true }
+    reasoning: model.reasoning ?? true,
+    thinkingLevelMap: derived,
+    compat: { supportsReasoningEffort: true, ...(model.compat ?? {}) }
   }
 }
 

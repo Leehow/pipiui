@@ -36,6 +36,28 @@ describe("shared terminal extension mount", () => {
   });
 });
 
+describe("built-in browser search mount", () => {
+  const browserSearch = "/runtime/extensions/pipiui-browser-search.ts";
+  const input = { cwd: "/tmp/project", paths: { browserSearch }, features: { browserSearch: true } };
+
+  it("mounts only behind its own feature gate and only with a host bridge", () => {
+    expect(assemblePiSpawn({ ...input, bridgePort: 1234 }).args).toEqual(["-e", browserSearch]);
+    expect(assemblePiSpawn({ ...input, bridgePort: 1234, features: {} }).args).not.toContain(browserSearch);
+    expect(assemblePiSpawn(input).args).not.toContain(browserSearch);
+  });
+
+  it("mounts independently of the interactive browser tool so each stays a separate switch", () => {
+    const { args } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      features: { browserSearch: true },
+      paths: { browserSearch, webview: "/ext/webview.ts" },
+      bridgePort: 1234,
+    });
+    expect(args).toEqual(["-e", browserSearch]);
+    expect(args).not.toContain("/ext/webview.ts");
+  });
+});
+
 describe("main-only Hermes runtime ownership", () => {
   it("passes the exact managed package root only to the main memory broker", () => {
     const paths = { memoryBroker: "/runtime/memory-broker", hermesMemory: "/embedded/node_modules/pi-hermes-memory" };
@@ -230,7 +252,7 @@ describe(".env injection into the pi spawn env (T17 parity)", () => {
  * all until an HTTP bridge exists.
  */
 describe("bridge-free subagent orchestration", () => {
-  const paths = { subagentDir: "/ext/subagent", agentsDir: "/ext/agents", memoryBroker: "/ext/memory", webview: "/ext/webview.ts", planRuntime: "/ext/plan.ts" };
+  const paths = { subagentDir: "/ext/subagent", agentsDir: "/ext/agents", memoryBroker: "/ext/memory", webview: "/ext/webview.ts", browserSearch: "/ext/browser-search.ts", planRuntime: "/ext/plan.ts" };
 
   it("mounts subagent and claims finalization without a bridge", () => {
     const { args, env } = assemblePiSpawn({ cwd: "/tmp/project", features: { subagent: true }, paths });
@@ -248,9 +270,10 @@ describe("bridge-free subagent orchestration", () => {
   });
 
   it("keeps genuinely bridge-dependent extensions gated", () => {
-    const { args } = assemblePiSpawn({ cwd: "/tmp/project", features: { subagent: true, memoryBroker: true, browser: true, philosophy: true }, paths });
+    const { args } = assemblePiSpawn({ cwd: "/tmp/project", features: { subagent: true, memoryBroker: true, browser: true, browserSearch: true, philosophy: true }, paths });
     expect(args).not.toContain("/ext/memory");
     expect(args).not.toContain("/ext/webview.ts");
+    expect(args).not.toContain("/ext/browser-search.ts");
     expect(args).not.toContain("/ext/plan.ts");
   });
 
@@ -281,12 +304,14 @@ describe("installed runtime tree", () => {
     await writeFile(join(root, "extensions", "pipiui-git.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-skillloader.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-runtime-info.ts"), "//\n");
+    await writeFile(join(root, "extensions", "pipiui-browser-search.ts"), "//\n");
     await writeFile(join(root, "pi-philosophy", "package.json"), JSON.stringify({ pi: { extensions: ["./philosophy.ts"] } }));
     await writeFile(join(root, "pi-philosophy", "philosophy.ts"), "//\n");
 
     const paths = resolveSpawnPaths(root);
     expect(paths.git).toBe(join(root, "extensions", "pipiui-git.ts"));
     expect(paths.runtimeInfo).toBe(join(root, "extensions", "pipiui-runtime-info.ts"));
+    expect(paths.browserSearch).toBe(join(root, "extensions", "pipiui-browser-search.ts"));
     expect(paths.subagentDir).toBe(join(root, "pi-ext", "subagent"));
     expect(paths.philosophy).toBe(join(root, "pi-philosophy", "philosophy.ts"));
     expect(paths.builtInSkills).toBe(join(root, "built-in-skills"));
@@ -323,7 +348,7 @@ describe("installed runtime tree", () => {
 
 describe("default feature set", () => {
   it("mounts the orchestration stack and the built-in browser while withholding unavailable desktop surfaces", () => {
-    expect(DEFAULT_FEATURES).toMatchObject({ philosophy: true, plan: false, subagent: true, git: true, skillLoader: true, searchScope: false, webSearch: true, mcp: true, browser: true });
+    expect(DEFAULT_FEATURES).toMatchObject({ philosophy: true, plan: false, subagent: true, git: true, skillLoader: true, searchScope: false, webSearch: true, browserSearch: true, mcp: true, browser: true });
     expect(DEFAULT_FEATURES.computerUse).toBe(true);
   });
 

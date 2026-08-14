@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { VirtuosoHandle } from 'react-virtuoso'
 import { SubagentPanel } from './SubagentPanel'
+import { makeSubagentStatusCheckPrompt } from './subagent-status-check'
 import { DocumentPanel } from './DocumentPanel'
 import { TerminalPanel } from './TerminalPanel'
 import { BrowserPanel } from './BrowserPanel'
 import { documentKindForName, resolveThinkingLevel, thinkingLevelsForModel } from '@pipi/host-api'
 import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, Project, PromptAttachment, Session, SessionLease, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
+import { GitInitConfirmDialog } from './GitInitConfirmDialog'
 import { ComputerUsePanel } from './ComputerUsePanel'
 import { RemoteConnectionPanel } from './RemoteConnectionPanel'
 import { SubagentModelModal } from './SubagentModelModal'
@@ -204,6 +206,9 @@ export function sidebarStatusForSession(sessionId: string, selectedSessionId: st
   const linked = agents.filter(agent => agent.sessionId === sessionId)
   const runningCount = linked.filter(agent => agent.state === 'running').length
   if (runningCount > 0) return { status: 'subagents-running', subagentCount: runningCount }
+  // Selected session: the user is viewing it, so terminal-status notifications
+  // (red dot) are consumed — only live activity (running / subagents) stays visible.
+  if (selected) return { status: 'idle' }
   if (linked.some(agent => agent.state === 'failed')) return { status: 'failed' }
   if (linked.some(agent => agent.stalled || agent.state === 'stalled')) return { status: 'stalled' }
   if (linked.some(agent => agent.state === 'interrupted' || agent.state === 'aborted')) return { status: 'interrupted' }
@@ -767,6 +772,12 @@ export function createMockHost(): PipiHostAPI {
     gitStatus: async projectId => projectId === 'pipiui' ? { ...mockGit } : { isRepo: false, isDetached: false, localBranches: [], ahead: 0, behind: 0, isDirty: false, staged: 0, unstaged: 0, untracked: 0 },
     gitCheckout: async (_projectId, branch) => { mockGit = { ...mockGit, currentBranch: branch, isDetached: false }; return { ...mockGit } },
     revealProject: async () => undefined,
+    renameProject: async (projectId, name) => {
+      const project = projects.find(item => item.id === projectId)
+      if (!project) throw new Error(`unknown project ${projectId}`)
+      project.name = name
+      return { ...project }
+    },
     browser
   }
   return mock
@@ -901,16 +912,47 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [terminalAvailable, setTerminalAvailable] = useState<boolean | undefined>(host.terminal ? undefined : false)
   const [retainedWorktreeDispositionAvailable, setRetainedWorktreeDispositionAvailable] = useState(false)
   const [projectError, setProjectError] = useState<string | null>(null)
+  // Non-git folder picked in the chooser: wait for the user's git-init decision
+  // before it joins the sidebar (writable workers need a git work tree).
+  const [gitConfirmPath, setGitConfirmPath] = useState<string | null>(null)
   const [modalOpen, setModalOpen] = useState(false)
+  const [modalInitialView, setModalInitialView] = useState<'manage' | 'add'>('manage')
+  // First-run onboarding: with zero credentialed models nothing can run, so the
+  // model manager opens straight into 添加模型 once. An explicit close while
+  // still empty is respected across launches (localStorage).
+  const [modelOnboardingDismissed, setModelOnboardingDismissed] = useState(() => localStorage.getItem('pipiui:model-onboarding-dismissed') === '1')
   const vision = useVisionRouting(host)
   // Opening the settings modal refreshes the vision-routing snapshot so the 通用
   // tab always shows the host's current state (reads happen on open, per spec).
-  const openModelManager = () => { setModalOpen(true); void vision.refresh() }
+  const openModelManager = () => { setModalInitialView('manage'); setModalOpen(true); void vision.refresh() }
   const [computerUseOpen, setComputerUseOpen] = useState(false)
   const [remoteOpen, setRemoteOpen] = useState(false)
   const [subagentModelsOpen, setSubagentModelsOpen] = useState(false)
   const browserOccluded = modalOpen || computerUseOpen || remoteOpen || subagentModelsOpen
   const modalVisibility = useModelVisibility(host, modelState?.model)
+  // Closing the manager while still model-less is an explicit "stop asking" —
+  // persisted so the onboarding never re-nags on the next launch.
+  const closeModelManager = () => {
+    if (!modalVisibility.loading && !modalVisibility.error && modalVisibility.models.length === 0 && !modelOnboardingDismissed) {
+      localStorage.setItem('pipiui:model-onboarding-dismissed', '1')
+      setModelOnboardingDismissed(true)
+    }
+    setModalOpen(false)
+  }
+  // First-run onboarding: once per session, when the catalog has settled empty
+  // (no error), open the manager straight into the provider login pane. A manual
+  // open of the manager also consumes the onboarding for this session.
+  const modelOnboardingShownRef = useRef(false)
+  useEffect(() => {
+    if (modelOnboardingShownRef.current) return
+    if (modalVisibility.loading || modalVisibility.error) return
+    if (modalVisibility.models.length > 0) { modelOnboardingShownRef.current = true; return }
+    if (modelOnboardingDismissed || modalOpen) return
+    modelOnboardingShownRef.current = true
+    setModalInitialView('add')
+    setModalOpen(true)
+    void vision.refresh()
+  }, [modalVisibility.loading, modalVisibility.error, modalVisibility.models.length, modelOnboardingDismissed, modalOpen, vision])
   const transcriptRef = useRef<VirtuosoHandle>(null)
   const copiedTimerRef = useRef<number | null>(null)
   const archiveCleanupInFlightRef = useRef(new Set<string>())
@@ -1508,21 +1550,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     setMessages([])
     messagesRef.current = []
   }
-  const addProject = async (): Promise<boolean> => {
-    if (!host.pickProjectDirectory || !host.addProject) {
-      setProjectError('当前连接不支持添加项目')
-      return false
-    }
-    let path: string | null
-    try {
-      path = await host.pickProjectDirectory()
-    } catch (error) {
-      setProjectError(`选择项目文件夹失败：${error instanceof Error ? error.message : String(error)}`)
-      return false
-    }
-    if (!path) return false
-    const normalizedPath = path.trim()
-    if (!normalizedPath) return false
+  const completeAddProject = async (normalizedPath: string): Promise<boolean> => {
     const snapshot = { projects, sessions, selectedProject, selectedSession }
     const name = normalizedPath.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || normalizedPath
     const optimistic: Project = { id: `pending-project:${normalizedPath}`, name, path: normalizedPath }
@@ -1530,7 +1558,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     setSidebarExpandedIds(current => current.includes(optimistic.id) ? current : [...current, optimistic.id])
     setProjectError(null)
     try {
-      await host.addProject(normalizedPath)
+      await host.addProject!(normalizedPath)
     } catch (error) {
       setProjects(snapshot.projects)
       setSessions(snapshot.sessions)
@@ -1547,6 +1575,34 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setProjectError(`添加项目后刷新失败：${error instanceof Error ? error.message : String(error)}`)
       return false
     }
+  }
+  const addProject = async (): Promise<boolean> => {
+    if (!host.pickProjectDirectory || !host.addProject) {
+      setProjectError('当前连接不支持添加项目')
+      return false
+    }
+    let path: string | null
+    try {
+      path = await host.pickProjectDirectory()
+    } catch (error) {
+      setProjectError(`选择项目文件夹失败：${error instanceof Error ? error.message : String(error)}`)
+      return false
+    }
+    if (!path) return false
+    const normalizedPath = path.trim()
+    if (!normalizedPath) return false
+    if (host.probeDirectoryGit) {
+      try {
+        const status = await host.probeDirectoryGit(normalizedPath)
+        if (!status.isRepo) {
+          setGitConfirmPath(normalizedPath)
+          return false
+        }
+      } catch {
+        // A failed probe must not block adding — behave exactly like a host without one.
+      }
+    }
+    return completeAddProject(normalizedPath)
   }
   const removeProject = async (projectId: string) => {
     if (!host.removeProject) {
@@ -1612,10 +1668,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     })
   })), [archivedSessionIdSet, orderedSessionIds, pinnedSessionIdSet, projects, sessions, sidebarSessionById])
   const sidebarProjectMenuUnavailable = useMemo<ProjectMenuUnavailable>(() => ({
-    rename: '待宿主支持',
+    ...(!host.renameProject ? { rename: '待宿主支持' } : {}),
     ...(!host.removeProject ? { remove: '当前连接不支持移除项目' } : {}),
     ...(!canRevealInFinder ? { reveal: '当前连接不支持在 Finder 中显示' } : {})
-  }), [canRevealInFinder, host.removeProject])
+  }), [canRevealInFinder, host.removeProject, host.renameProject])
   const toggleSidebarProject = (projectId: string) => {
     setSidebarExpandedIds(current => current.includes(projectId) ? current.filter(id => id !== projectId) : [...current, projectId])
   }
@@ -1677,9 +1733,27 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   }, [])
   const onSidebarProjectMenu = (projectId: string, action: ProjectMenuAction) => {
     if (action === 'newSession') { void newSession(projectId); return }
-    if (action === 'reveal' && canRevealInFinder) void host.revealProject?.(projectId)
+    if (action === 'reveal' && canRevealInFinder) {
+      void host.revealProject?.(projectId).catch(error => setProjectError(`在文件管理器中显示失败：${error instanceof Error ? error.message : String(error)}`))
+    }
     if (action === 'remove') void removeProject(projectId)
-    // Rename remains disabled until the host exposes an explicit rename contract.
+  }
+  const renameSidebarProject = async (projectId: string, name: string) => {
+    if (!host.renameProject) {
+      setProjectError('当前连接不支持重命名项目')
+      return
+    }
+    const previous = projects.find(project => project.id === projectId)
+    if (!previous || previous.name === name) return
+    setProjects(current => current.map(project => project.id === projectId ? { ...project, name } : project))
+    try {
+      const renamed = await host.renameProject(projectId, name)
+      setProjects(current => current.map(project => project.id === projectId ? renamed : project))
+    } catch (error) {
+      setProjects(current => current.map(project => project.id === projectId ? previous : project))
+      setProjectError(`修改项目名称失败：${error instanceof Error ? error.message : String(error)}`)
+      throw error
+    }
   }
   const pinSidebarSession = (sessionId: string) => setPinnedSessionIds(current => current.includes(sessionId) ? current.filter(id => id !== sessionId) : [...current, sessionId])
   const renameSidebarSession = async (sessionId: string, title: string) => {
@@ -1846,8 +1920,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     ? { startedAt: subagentWaitingStartedAt, phase: 'tool' as const, detail: `${subagentsRunningCount} 个子任务执行中` }
     : undefined
   return <main className={shellClass} data-theme={theme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${widths.tools}px` } as React.CSSProperties}>
-    <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} projectMenuUnavailable={sidebarProjectMenuUnavailable} onMoveProject={host.setProjectPaths ? moveSidebarProject : undefined} onMoveSession={moveSidebarSession} onMoveSessionToPinned={moveSidebarSessionToPinned} onAddProject={addProject} projectAddUnavailable={host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onOpenSettings={() => { setModalOpen(true); void vision.refresh() }} onOpenComputerUse={() => setComputerUseOpen(true)} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} />
-    <ResizeHandle label="调整左栏宽度" onPointerDown={resize('sidebar', widths.sidebar)} />
+    <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} onRenameProject={host.renameProject ? renameSidebarProject : undefined} projectMenuUnavailable={sidebarProjectMenuUnavailable} onMoveProject={host.setProjectPaths ? moveSidebarProject : undefined} onMoveSession={moveSidebarSession} onMoveSessionToPinned={moveSidebarSessionToPinned} onAddProject={addProject} projectAddUnavailable={host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onOpenSettings={openModelManager} onOpenComputerUse={() => setComputerUseOpen(true)} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} />
+    <ResizeHandle label="调整左栏宽度" side="left" onPointerDown={resize('sidebar', widths.sidebar)} />
     <section className="chat-column">
       <ChatHeader session={sessions.find(item => item.id === selectedSession)} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={sidebarCollapsed} toolsCollapsed={toolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onRename={renameSidebarSession} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} />
       <div className="chat-viewport" data-testid="chat-viewport">
@@ -1885,9 +1959,21 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} queueBusy={sessionQueue.busy} readOnly={leaseReadOnly} leaseOwner={leaseReadOnly ? leaseOwnerLabel(lease) : undefined} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} initialAttachments={selectedSession ? (attachmentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_ATTACHMENTS) : EMPTY_COMPOSER_ATTACHMENTS} onDraftChange={persistComposerDraft} onAttachmentsChange={persistComposerAttachments} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} onOpenModelManager={openModelManager} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} visionEnabled={vision.enabled} visionModelRef={vision.model} />
       </div>
     </section>
-    <ResizeHandle label="调整工具栏宽度" onPointerDown={resize('tools', widths.tools)} />
-    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== 'Subagents'} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={openedDocumentPath} onOpenDocument={openDocument} />
-    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} current={modelState?.model ?? null} onModelState={applySelectedModelState} onClose={() => setModalOpen(false)} />}
+    <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resize('tools', widths.tools)} />
+    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== 'Subagents'} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={openedDocumentPath} onOpenDocument={openDocument} />
+    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} current={modelState?.model ?? null} onModelState={applySelectedModelState} onClose={closeModelManager} initialView={modalInitialView} />}
+    {gitConfirmPath && <GitInitConfirmDialog
+      path={gitConfirmPath}
+      canInit={Boolean(host.gitInitDirectory)}
+      onInit={async () => {
+        if (!host.gitInitDirectory) throw new Error('当前连接不支持初始化 Git')
+        await host.gitInitDirectory(gitConfirmPath)
+        setGitConfirmPath(null)
+        await completeAddProject(gitConfirmPath)
+      }}
+      onAddAnyway={() => { const path = gitConfirmPath; setGitConfirmPath(null); void completeAddProject(path) }}
+      onCancel={() => setGitConfirmPath(null)}
+    />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} />}
     {subagentModelsOpen && <SubagentModelModal host={host} current={modelState?.model ?? null} visibility={modalVisibility} onClose={() => setSubagentModelsOpen(false)} />}
@@ -1917,7 +2003,7 @@ function waitingPhaseForTurn(messages: ChatMessage[], pendingFollowUps?: string[
   return hasVisibleAssistantOutput(messages) ? 'continuing' : 'awaiting'
 }
 
-function ResizeHandle({ label, onPointerDown }: { label: string; onPointerDown: (event: React.PointerEvent) => void }) { return <div className="resize-handle" role="separator" aria-label={label} onPointerDown={onPointerDown} /> }
+function ResizeHandle({ label, side, onPointerDown }: { label: string; side?: 'left' | 'right'; onPointerDown: (event: React.PointerEvent) => void }) { return <div className={`resize-handle${side ? ` resize-handle-${side}` : ''}`} role="separator" aria-label={label} onPointerDown={onPointerDown} /> }
 function RightPaneToggleIcon({ expanded }: { expanded: boolean }) {
   return expanded
     ? <svg className="right-pane-toggle-icon" data-pane-icon="collapse" aria-hidden="true" viewBox="0 0 20 20"><rect x="2.5" y="3" width="15" height="14" rx="2" /><path className="right-pane-toggle-fill" d="M11 3h4.5a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H11z" /><path d="M9.5 10h5m-2-2 2 2-2 2" /></svg>
@@ -2157,7 +2243,8 @@ function ToolQuickRail({ variant, activeTab, toolsCollapsed, onSelect, host, bro
     })}
   </nav>
 }
-function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, onBack, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted, browserAvailable, browserOccluded, terminalAvailable, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument }: { activeTab: PanelTab; collapsed: boolean; onToggleCollapsed: () => void; rail?: ReactNode; canGoBack: boolean; onBack: () => void; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningCountChange: (count: number) => void; onSubagentStarted: () => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void }) {
+function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, onBack, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted, onManualSubagentStatusCheck, browserAvailable, browserOccluded, terminalAvailable, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument }: { activeTab: PanelTab; collapsed: boolean; onToggleCollapsed: () => void; rail?: ReactNode; canGoBack: boolean; onBack: () => void; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningCountChange: (count: number) => void; onSubagentStarted: () => void; onManualSubagentStatusCheck: (agentIDs: string[]) => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void }) {
+  const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null)
   const [terminalMounted, setTerminalMounted] = useState(activeTab === 'Terminal')
   const [documentMounted, setDocumentMounted] = useState(activeTab === 'Document')
   const [browserMounted, setBrowserMounted] = useState(activeTab === 'Browser')
@@ -2167,13 +2254,12 @@ function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, o
     if (activeTab === 'Browser') setBrowserMounted(true)
   }, [activeTab])
   return <aside className="tool-panel">
-    {!collapsed && <header className="tool-panel-header">{rail}<button className="pane-toggle" data-testid="toggle-tools" title="收起右栏" aria-label="收起右栏" aria-expanded="true" onClick={onToggleCollapsed}><RightPaneToggleIcon expanded /></button></header>}
-    {!collapsed && canGoBack && <div className="tool-panel-nav"><button type="button" className="tool-panel-back" data-testid="tool-panel-back" aria-label="返回上一栏" onClick={onBack}>‹ 返回</button></div>}
+    {!collapsed && <header className="tool-panel-header">{rail}{canGoBack && <button type="button" className="tool-panel-back" data-testid="tool-panel-back" aria-label="返回上一栏" onClick={onBack}>‹ 返回</button>}<div className="tool-panel-header-slot" ref={el => setHeaderSlot(el)} /><button className="pane-toggle" data-testid="toggle-tools" title="收起右栏" aria-label="收起右栏" aria-expanded="true" onClick={onToggleCollapsed}><RightPaneToggleIcon expanded /></button></header>}
     <div className="tool-content">
-      <div className="tool-page subagent-content" hidden={activeTab !== 'Subagents'}><SubagentPanel host={host} sessionId={sessionId} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} visible={activeTab === 'Subagents' && !collapsed} onRunningCountChange={onSubagentsRunningCountChange} onAgentStarted={onSubagentStarted} /></div>
-      {activeTab === 'Terminal' && terminalAvailable === false ? <div className="tool-page"><div className="empty-panel" data-testid="terminal-unavailable"><b>Terminal 不可用</b><p>当前连接未提供终端能力。</p></div></div> : terminalMounted || activeTab === 'Terminal' ? <div className="tool-page terminal-content" hidden={activeTab !== 'Terminal'}><TerminalPanel host={host} theme={theme} sessionId={sessionId} announcedTerminal={announcedTerminal} revealedTerminalId={revealedTerminalId} projectId={projectId} projectPath={projectPath} visible={activeTab === 'Terminal'} /></div> : null}
+      <div className="tool-page subagent-content" hidden={activeTab !== 'Subagents'}><SubagentPanel host={host} sessionId={sessionId} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} visible={activeTab === 'Subagents' && !collapsed} headerSlot={headerSlot} onRunningCountChange={onSubagentsRunningCountChange} onAgentStarted={onSubagentStarted} onManualStatusCheck={onManualSubagentStatusCheck} /></div>
+      {activeTab === 'Terminal' && terminalAvailable === false ? <div className="tool-page"><div className="empty-panel" data-testid="terminal-unavailable"><b>Terminal 不可用</b><p>当前连接未提供终端能力。</p></div></div> : terminalMounted || activeTab === 'Terminal' ? <div className="tool-page terminal-content" hidden={activeTab !== 'Terminal'}><TerminalPanel host={host} theme={theme} sessionId={sessionId} announcedTerminal={announcedTerminal} revealedTerminalId={revealedTerminalId} projectId={projectId} projectPath={projectPath} visible={activeTab === 'Terminal'} headerSlot={headerSlot} /></div> : null}
       {documentMounted || activeTab === 'Document' ? <div className="tool-page document-content" hidden={activeTab !== 'Document'}><DocumentPanel host={host} documentPath={openedDocumentPath} /></div> : null}
-      {browserMounted || activeTab === 'Browser' ? <div className="tool-page browser-content" hidden={activeTab !== 'Browser'}>{browserAvailable === true && host.browser ? <BrowserPanel host={host} sessionId={sessionId} occluded={browserOccluded || activeTab !== 'Browser'} /> : <div className="empty-panel browser-placeholder" data-testid="browser-unavailable"><b>Browser 不可用</b><p>{browserAvailable === undefined ? '正在检查当前连接的浏览器能力…' : '当前连接未提供桌面浏览器能力。'}</p></div>}</div> : null}
+      {browserMounted || activeTab === 'Browser' ? <div className="tool-page browser-content" hidden={activeTab !== 'Browser'}>{browserAvailable === true && host.browser ? <BrowserPanel host={host} sessionId={sessionId} occluded={browserOccluded || activeTab !== 'Browser'} headerSlot={headerSlot} /> : <div className="empty-panel browser-placeholder" data-testid="browser-unavailable"><b>Browser 不可用</b><p>{browserAvailable === undefined ? '正在检查当前连接的浏览器能力…' : '当前连接未提供桌面浏览器能力。'}</p></div>}</div> : null}
     </div>
   </aside>
 }

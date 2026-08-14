@@ -268,4 +268,81 @@ describe('Electron Pi profile', () => {
     expect(offPayload).toBeDefined()
     expect(offPayload).not.toHaveProperty('reasoning_effort')
   })
+
+  it('wires a hand-curated deepseek map so thinking levels reach a non-pi-named effort vocabulary', async () => {
+    root = await mkdtemp(join(tmpdir(), 'pipi-profile-deepseek-effort-'))
+    const profile = resolveElectronPiProfile(join(root, 'user-data'))
+    await mkdir(profile.agentDir, { recursive: true })
+    // The broken state this guards against: a relay serving deepseek models with
+    // reasoning:false and no thinking wiring, so every dispatch-level thinking knob
+    // silently did nothing while the model thought itself into thousands of tokens.
+    await writeFile(join(profile.agentDir, 'models.json'), JSON.stringify({
+      providers: {
+        jellytoken: {
+          api: 'openai-completions',
+          apiKey: 'not-sent',
+          baseUrl: 'https://aiservice.example.test/v1',
+          models: [{
+            id: 'deepseek-v4-flash',
+            name: 'DeepSeek V4 Flash',
+            reasoning: false,
+            input: ['text'],
+            contextWindow: 200000,
+            maxTokens: 16384
+          }]
+        }
+      }
+    }))
+    await writeFile(join(profile.agentDir, 'models-store.json'), JSON.stringify({}))
+    const snapshotPath = join(process.cwd(), 'resources', 'runtime', 'model-capabilities', 'models-dev-reasoning-options.json')
+    expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('updated')
+    expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('unchanged')
+
+    const { ModelRuntime } = await import('@earendil-works/pi-coding-agent')
+    const runtime = await ModelRuntime.create({
+      modelsPath: join(profile.agentDir, 'models.json'),
+      modelsStorePath: join(profile.agentDir, 'models-store.json'),
+      allowModelNetwork: false
+    })
+    const model = runtime.getModel('jellytoken', 'deepseek-v4-flash')
+    expect(model).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: {
+        off: null,
+        minimal: 'low',
+        low: 'low',
+        medium: 'high',
+        high: 'high',
+        xhigh: 'max',
+        max: 'max'
+      },
+      compat: { supportsReasoningEffort: true, thinkingFormat: 'deepseek' }
+    })
+
+    const { streamSimple } = await import('@earendil-works/pi-ai/api/openai-completions')
+    const capture = async (reasoning?: string) => {
+      let payload: Record<string, unknown> | undefined
+      const stream = streamSimple(model as any, {
+        messages: [{ role: 'user', content: 'probe', timestamp: Date.now() }]
+      }, {
+        apiKey: 'not-sent',
+        ...(reasoning ? { reasoning } : {}),
+        maxTokens: 1,
+        onPayload: value => {
+          payload = value as unknown as Record<string, unknown>
+          throw new Error('payload captured before network')
+        }
+      })
+      await stream.result().catch(() => undefined)
+      expect(payload).toBeDefined()
+      return payload!
+    }
+
+    // An explicit low level arrives as deepseek's native pair: thinking on + effort low.
+    expect(await capture('low')).toMatchObject({ reasoning_effort: 'low', thinking: { type: 'enabled' } })
+    // medium is not a deepseek effort: the map routes it to high instead of forwarding garbage.
+    expect(await capture('medium')).toMatchObject({ reasoning_effort: 'high' })
+    // With no level requested, off:null must not silently disable thinking wholesale.
+    expect(await capture()).not.toHaveProperty('thinking')
+  })
 })

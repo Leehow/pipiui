@@ -173,7 +173,11 @@ if (app) {
       quotaStore,
       // Refreshed again before every spawn, so editing a philosophy layer or a subagent file
       // reaches the next session without relaunching the app.
-      runtimeAssets: assets
+      runtimeAssets: assets,
+      revealPath: async (path) => {
+        const error = await shell.openPath(path)
+        if (error.trim()) throw new Error(error)
+      }
     })
     const terminalBackend = terminalHost.wrapBackend(piBackend)
     const pickProjectDirectory = async (): Promise<string | null> => {

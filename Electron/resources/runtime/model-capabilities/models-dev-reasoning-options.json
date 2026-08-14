@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "source": "https://models.dev/api.json",
+  "source": "https://models.dev/api.json + hand-curated entries",
   "retrievedAt": "2026-08-13T03:11:00Z",
   "providers": {
     "xai": {
@@ -20,6 +20,50 @@
             "acceptedValues": ["minimal", "low", "medium", "high", "xhigh"],
             "rejectedValues": ["off", "max", "garbage"],
             "result": "Accepted values returned HTTP 200; rejected values returned HTTP 400 Invalid reasoning effort"
+          }
+        }
+      }
+    },
+    "jellytoken": {
+      "models": {
+        "deepseek-v4-flash": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "low",
+            "low": "low",
+            "medium": "high",
+            "high": "high",
+            "xhigh": "max",
+            "max": "max"
+          },
+          "compat": { "thinkingFormat": "deepseek" },
+          "verification": {
+            "method": "Hand-curated against the official DeepSeek thinking-mode contract (api-docs.deepseek.com/guides/thinking_mode): chat completions accept thinking {type: enabled|disabled} plus reasoning_effort {low, high, max}. The relay forwards the request body to DeepSeek. Levels map to the nearest supported effort — a same-name map would forward an invalid \"medium\" — and off: null keeps an unset level at the provider default instead of silently disabling thinking.",
+            "verifiedAt": "2026-08-14T11:00:00Z",
+            "acceptedValues": ["low", "high", "max"],
+            "rejectedValues": ["minimal", "medium", "xhigh"],
+            "result": "Effort vocabulary is documented, not probed: the relay is user-configured, so values are taken from the official API contract."
+          }
+        },
+        "deepseek-v4-pro": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "low",
+            "low": "low",
+            "medium": "high",
+            "high": "high",
+            "xhigh": "max",
+            "max": "max"
+          },
+          "compat": { "thinkingFormat": "deepseek" },
+          "verification": {
+            "method": "Same hand-curated DeepSeek thinking-mode contract as deepseek-v4-flash on this relay.",
+            "verifiedAt": "2026-08-14T11:00:00Z",
+            "acceptedValues": ["low", "high", "max"],
+            "rejectedValues": ["minimal", "medium", "xhigh"],
+            "result": "Effort vocabulary is documented, not probed: the relay is user-configured, so values are taken from the official API contract."
           }
         }
       }

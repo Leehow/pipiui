@@ -6,8 +6,8 @@
 .terminal-empty { place-items:center; align-content:center; padding:20px; text-align:center; }
 .terminal-empty b { color:var(--text-strong); }
 .terminal-empty p { margin:7px 0 0; color:var(--danger); font-size:11px; }
-.terminal-tabs { display:flex; min-width:0; min-height:38px; align-items:center; gap:4px; overflow-x:auto; padding:4px 7px; border-bottom:1px solid var(--border); background:var(--surface); }
-.terminal-tab { display:flex; min-width:0; align-items:center; border:1px solid transparent; border-radius:6px; color:var(--muted); }
+.terminal-tabs { display:flex; min-width:0; flex:1 1 auto; min-height:0; align-items:center; gap:4px; overflow-x:auto; padding:3px 4px; background:transparent; }
+.terminal-tab { display:flex; min-width:0; align-items:center; border:1px solid transparent; border-radius:5px; color:var(--muted); }
 .terminal-tab.selected { border-color:var(--border); color:var(--text-strong); background:var(--surface-raised); }
 .terminal-tab>button:first-child { max-width:138px; overflow:hidden; padding:4px 4px 4px 7px; text-overflow:ellipsis; white-space:nowrap; }
 .terminal-tab-close,.terminal-new-tab { display:grid; width:22px; height:22px; flex:none; place-items:center; border-radius:4px; color:var(--muted); font-size:16px; line-height:1; }
@@ -15,13 +15,8 @@
 .terminal-new-tab { margin-left:2px; font-size:18px; }
 .terminal-sessions { position:relative; min-width:0; min-height:0; overflow:hidden; }
 .terminal-session { display:grid; width:100%; height:100%; min-width:0; min-height:0; grid-template-rows:auto minmax(0,1fr); }
-.terminal-session-header { display:flex; min-width:0; align-items:center; justify-content:space-between; gap:8px; padding:6px 9px; border-bottom:1px solid var(--border); background:var(--surface); }
-.terminal-session-meta { display:flex; min-width:0; align-items:center; gap:7px; }
-.terminal-icon { color:var(--muted); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
-.terminal-session-meta>div { display:grid; min-width:0; gap:1px; }
-.terminal-session-meta strong,.terminal-session-meta small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.terminal-session-meta strong { color:var(--text-strong); font-size:12px; }
-.terminal-session-meta small { color:var(--muted); font:10px ui-monospace,SFMono-Regular,Menlo,monospace; }
+.terminal-session-header { display:flex; min-width:0; flex:0 0 auto; align-items:center; justify-content:flex-end; gap:4px; padding:3px 8px; border-bottom:1px solid var(--border); background:var(--surface); }
+
 .terminal-actions { display:flex; flex:none; gap:2px; }
 .terminal-actions button { display:grid; width:24px; height:24px; place-items:center; border-radius:5px; color:var(--muted); font:14px ui-monospace,SFMono-Regular,Menlo,monospace; }
 .terminal-xterm { min-width:0; min-height:0; padding:7px 0 7px 7px; background:var(--bg); }

@@ -8,13 +8,15 @@
 /* Viewport-bound desktop layout: only the three designated panes may scroll. */
 html,body,#root{width:100%;height:100%;min-width:0;min-height:0;overflow:hidden}
 body{overscroll-behavior:none}
-.pipiui-shell{width:100vw;height:100dvh;min-width:0;min-height:0;max-height:100dvh;grid-template-rows:minmax(0,1fr);overflow:hidden;isolation:isolate}
+.pipiui-shell{width:100%;height:100%;min-width:0;min-height:0;max-height:100%;grid-template-rows:minmax(0,1fr);overflow:hidden;isolation:isolate}
 /* Pane grid: App persists the remembered widths inline (--sidebar-w/--tools-w);
    the effective column (--sidebar-col/--tools-col) is zeroed while collapsed. */
 .pipiui-shell{--sidebar-col:var(--sidebar-w,258px);--tools-col:var(--tools-w,368px);grid-template-columns:var(--sidebar-col) 6px minmax(0,1fr) 6px var(--tools-col)}
 .pipiui-shell.sidebar-collapsed{--sidebar-col:0px}
 .pipiui-shell.tools-collapsed{--tools-col:0px}
 .pipiui-shell.tools-collapsed .tool-panel{border-left:0}
+.pipiui-shell.tools-collapsed .resize-handle-right{display:none}
+.pipiui-shell.sidebar-collapsed .resize-handle-left{display:none}
 .sidebar,.sb-root,.tool-panel,.chat-column{min-width:0;min-height:0;max-height:100%;overflow:hidden}
 .sidebar{height:100%;}
 .brand,.search,.sidebar-footer{flex:0 0 auto}
@@ -41,7 +43,7 @@ body{overscroll-behavior:none}
 .chat-header-actions{display:flex;flex:none;align-items:center;gap:6px;margin-left:auto}
 .pane-toggle{display:grid;width:28px;height:28px;flex:0 0 28px;place-items:center;border-radius:6px;color:var(--muted);font-size:17px;line-height:1;-webkit-app-region:no-drag}.pane-toggle:hover{background:var(--surface-hover);color:var(--text-strong)}
 .right-pane-toggle-icon{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.45;stroke-linecap:round;stroke-linejoin:round}.right-pane-toggle-fill{fill:currentColor;fill-opacity:.16;stroke:none}
-.tool-panel-header{display:flex;min-width:0;flex:0 0 50px;align-items:center;gap:8px;padding:0 8px 0 10px;border-bottom:1px solid var(--border);background:var(--surface)}.tool-panel-header .pane-toggle{margin-left:auto}.tool-panel-nav{display:flex;min-width:0;flex:0 0 36px;align-items:center;gap:8px;padding:0 10px;border-bottom:1px solid var(--border);background:var(--surface)}.tool-panel-back{display:flex;min-width:0;align-items:center;gap:4px;height:26px;padding:0 8px;border-radius:6px;color:var(--text);font-size:12px;font-weight:600}.tool-panel-back:hover{background:var(--surface-hover);color:var(--text-strong)}
+.tool-panel-header{display:flex;min-width:0;flex:0 0 50px;align-items:center;gap:8px;padding:0 8px 0 10px;border-bottom:1px solid var(--border);background:var(--surface)}.tool-panel-header .pane-toggle{margin-left:0;flex:0 0 auto}.tool-panel-header-slot{flex:1 1 auto;min-width:0;display:flex;align-items:center;overflow:hidden}.tool-panel-back{display:flex;min-width:0;flex:0 0 auto;align-items:center;gap:4px;height:26px;padding:0 8px;border-radius:6px;color:var(--text);font-size:12px;font-weight:600}.tool-panel-back:hover{background:var(--surface-hover);color:var(--text-strong)}
 .pane-restore{position:absolute;top:11px;z-index:40;background:var(--surface-raised);box-shadow:0 2px 8px rgb(0 0 0/16%)}.pane-restore-sidebar{left:10px}.sidebar-collapsed .chat-header{padding-left:54px}.electron-chrome.sidebar-collapsed .chat-header{padding-left:122px}
 .message-list{min-width:0;min-height:0;height:100%;overflow:hidden}
 .message-list>div{min-width:0;min-height:0;height:100%}
@@ -57,9 +59,6 @@ body{overscroll-behavior:none}
 @media (max-width:720px){.pipiui-shell{grid-template-columns:0 minmax(0,1fr) 0}.pipiui-shell .sb-root,.pipiui-shell .tool-panel{position:fixed;top:0;bottom:0;z-index:30;width:min(86vw,340px);height:auto;box-shadow:0 10px 40px rgb(0 0 0/30%)}.pipiui-shell .sb-root{left:0}.pipiui-shell .tool-panel{right:0;border-left:1px solid var(--border)}.pipiui-shell.sidebar-collapsed .sb-root,.pipiui-shell.tools-collapsed .tool-panel{display:none}.pipiui-shell .resize-handle{visibility:hidden}.tool-quick-rail-float{z-index:35}}
 .project-menu-wrap{position:relative;display:none}.project-row:hover .project-menu-wrap,.project-menu-wrap:focus-within{display:block}.project-menu-button{width:22px;height:24px;border-radius:5px;color:var(--muted);font-size:17px}.project-menu-button:hover{background:var(--surface-hover);color:var(--text)}.project-menu{position:absolute;z-index:10;top:26px;right:0;width:184px;padding:4px;border:1px solid var(--border);border-radius:8px;background:var(--surface-raised);box-shadow:0 10px 25px rgb(0 0 0 / 18%)}.project-menu button,.project-menu-count{display:block;width:100%;padding:6px 8px;text-align:left;border-radius:5px;font-size:11px}.project-menu button:hover{background:var(--surface-hover)}.project-menu button:disabled,.project-menu-count{color:var(--subtle);cursor:default}.project-menu .danger{color:var(--danger)}.sb-menu-item:disabled{cursor:not-allowed;opacity:.55;color:var(--subtle)}.sb-menu-item:disabled:hover{background:transparent}.transcript-area{position:relative;min-width:0;min-height:0;overflow:hidden}.return-latest{position:absolute;z-index:4;right:22px;bottom:18px;width:32px;height:32px;display:flex;align-items:center;justify-content:center;padding:0;border:1px solid var(--border);border-radius:50%;color:var(--text);background:var(--surface-raised);box-shadow:0 3px 10px rgb(0 0 0 / 16%);cursor:pointer}
 
-/* Right tool workspace is content-only; the tool switcher floats over the chat
-   column as a Swift-style quick rail (panelQuickRail parity). */
-.tool-panel{display:flex;flex-direction:column;min-width:0;min-height:0}
 /* Right tool workspace: expanded header hosts the switcher; collapsed it
    floats over the chat column so the pane can be reopened. */
 .tool-panel{display:flex;flex-direction:column;min-width:0;min-height:0}
@@ -123,6 +122,20 @@ body{overscroll-behavior:none}
 .model-modal-tab{flex:1;padding:4px 12px;border-radius:8px;color:var(--muted);font-size:11px;text-align:center}
 .model-modal-tab:hover{color:var(--text-strong)}
 .model-modal-tab.active{color:var(--text-strong);background:var(--surface-raised);box-shadow:0 1px 4px rgb(0 0 0 / 14%);font-weight:600}
+
+/* Add-project guard for non-git folders — reuses the model-modal chrome. */
+.git-init-modal{width:min(440px,calc(100vw - 48px))}
+.git-init-path{margin:6px 0;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:color-mix(in srgb,var(--text) 4%,transparent);color:var(--text);font:10px ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.git-init-facts{margin:8px 0 4px;padding-left:18px;color:var(--muted);font-size:11px;line-height:1.7}
+.git-init-error{margin:8px 0 0;color:var(--danger);font-size:11px}
+.git-init-actions{display:flex;justify-content:flex-end;gap:8px;padding:10px 16px 14px;border-top:1px solid var(--border)}
+.git-init-cancel{padding:5px 10px;border-radius:7px;color:var(--muted);font-size:12px}
+.git-init-cancel:hover:not(:disabled){background:var(--surface-hover);color:var(--text-strong)}
+.git-init-anyway{padding:5px 10px;border-radius:7px;background:color-mix(in srgb,var(--text) 8%,transparent);color:var(--text);font-size:12px}
+.git-init-anyway:hover:not(:disabled){background:color-mix(in srgb,var(--text) 16%,transparent)}
+.git-init-primary{padding:5px 12px;border-radius:7px;background:var(--accent);color:var(--accent-contrast,#fff);font-size:12px;font-weight:600}
+.git-init-primary:hover:not(:disabled){filter:brightness(1.08)}
+.git-init-actions button:disabled{opacity:.55;cursor:default}
 
 /* 通用 tab — vision model picker. */
 .vision-picker-hint{padding:6px 4px 4px;color:var(--muted);font-size:11px}
@@ -208,7 +221,8 @@ body{overscroll-behavior:none}
 .electron-chrome .sb-topbar,.electron-chrome .chat-header,.electron-chrome .tool-panel-header{-webkit-app-region:drag;user-select:none}
 .electron-chrome .sb-topbar{padding-left:88px}
 .electron-chrome .sb-topbar button,.electron-chrome .chat-header button,.electron-chrome .chat-header input,.electron-chrome .chat-header select,.electron-chrome .tool-panel-header button{-webkit-app-region:no-drag}
-.electron-chrome .chat-header-title-label{-webkit-app-region:no-drag;user-select:text}
+.electron-chrome .chat-header-title{-webkit-app-region:drag}
+.electron-chrome .chat-header-title-label{-webkit-app-region:no-drag;user-select:none;cursor:default}
 .electron-chrome .pane-restore-sidebar{left:78px}
 /* Browser build boot state: never substitute demo data when the real Pi host is unavailable. */
 .browser-host-state { min-height: 100vh; display: grid; place-items: center; padding: 24px; color: var(--text-primary, #202124); background: var(--bg-primary, #fff); }

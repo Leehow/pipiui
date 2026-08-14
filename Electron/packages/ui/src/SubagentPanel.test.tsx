@@ -1,19 +1,30 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { useState, type ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent, AgentSummary, PipiHostAPI } from '@pipi/host-api'
 import { SubagentPanel } from './SubagentPanel'
 
 afterEach(() => {
   cleanup()
+  document.querySelectorAll('.jsdom-header-slot').forEach(el => el.remove())
   localStorage.removeItem('pipiui:subagent-list-ratio')
 })
+
+function Fixture(props: ComponentProps<typeof SubagentPanel>) {
+  const [slot, setSlot] = useState<HTMLDivElement | null>(null)
+  return <div className="jsdom-header-slot" ref={el => setSlot(el)}>{slot && <SubagentPanel {...props} headerSlot={slot} />}</div>
+}
+function renderSubagentPanel(props: ComponentProps<typeof SubagentPanel>) {
+  return render(<Fixture {...props} />)
+}
 
 function hostHarness() {
   let agents: ((event: AgentEvent) => void) | undefined
   const logs = new Map<string, (event: Extract<AgentEvent, { type: 'agent_log' }>) => void>()
   const abortAgent = vi.fn(async () => undefined)
   const resolveAgent = vi.fn(async () => undefined)
+  const checkAgent = vi.fn(async (agentId: string) => ({ agentId, runId: 'checked', name: 'explore', task: '', state: 'running' as const }))
   const mergeWorktree = vi.fn(async agentId => ({ agentId, lifecycle: 'merged' as const, merge: 'merged' as const, discard: 'unavailable' as const }))
   const discardWorktree = vi.fn(async agentId => ({ agentId, lifecycle: 'discarded' as const, merge: 'unavailable' as const, discard: 'discarded' as const }))
   const host = {
@@ -23,6 +34,7 @@ function hostHarness() {
     subscribeAgentLog: (id: string, listener: (event: Extract<AgentEvent, { type: 'agent_log' }>) => void) => { logs.set(id, listener); return () => logs.delete(id) },
     abortAgent,
     resolveAgent,
+    checkAgent,
     mergeWorktree,
     discardWorktree
   } as unknown as PipiHostAPI
@@ -30,6 +42,7 @@ function hostHarness() {
     host,
     abortAgent,
     resolveAgent,
+    checkAgent,
     mergeWorktree,
     discardWorktree,
     hasLogSubscriber: (id: string) => logs.has(id),
@@ -93,6 +106,26 @@ describe('SubagentPanel', () => {
     await waitFor(() => expect(screen.queryByLabelText('标记 failed 已处理')).toBeNull())
   })
 
+  it('explains a pre-spawn worktree failure in Chinese above the raw stderr', async () => {
+    const harness = hostHarness()
+    const reason = 'writable isolation requires a git work tree; refusing shared-cwd fallback'
+    render(<SubagentPanel host={harness.host} projectPath="/projects/main" />)
+    await screen.findByText('还没有 subagent')
+
+    harness.emitAgent({
+      type: 'agent',
+      agent: {
+        agentId: 'iso', runId: 'r-iso', name: 'builder', task: '改布局', state: 'failed', createdAt: 0, endedAt: 1_000,
+        finalResult: `Writable subagent isolation failed before spawn: ${reason}`, worktreeError: reason
+      }
+    })
+    const row = await screen.findByTestId('agent-row-iso')
+    fireEvent.click(row.querySelector('.agent-select')!)
+
+    expect(await screen.findByText('无法创建隔离工作区：该项目不在 Git 仓库中（或 Git 不可用），可写工人不能并行改文件。可在项目根目录执行 git init 后重试，或让主管改用只读工人 / 串行完成。')).toBeTruthy()
+    expect(screen.getByText(`Writable subagent isolation failed before spawn: ${reason}`)).toBeTruthy()
+  })
+
   it('shows a Chinese title in the list instead of a long English task', async () => {
     const harness = hostHarness()
     const longTask = 'Investigate why Electron PipiUI cannot use openai-codex Grok models for the right-rail subagent list title'
@@ -142,7 +175,7 @@ describe('SubagentPanel', () => {
 
   it('shows the actionable empty state after an empty snapshot', async () => {
     const harness = hostHarness()
-    render(<SubagentPanel host={harness.host} />)
+    renderSubagentPanel({ host: harness.host })
 
     expect(await screen.findByText('还没有 subagent')).toBeTruthy()
     expect(screen.getByText('0 个')).toBeTruthy()
@@ -154,12 +187,12 @@ describe('SubagentPanel', () => {
     const ownerAgent = { agentId: 'electron-ui-acceptance', runId: 'r1', name: 'general-purpose', task: '验证 Electron UI', listSubtitle: 'bash {"command":"npm test"}', state: 'ok' as const, sessionId: 'owner-session', createdAt: 1 }
     const listAgents = vi.fn(async (sessionId?: string) => sessionId === 'owner-session' ? [ownerAgent] : [])
     harness.host.listAgents = listAgents
-    const view = render(<SubagentPanel host={harness.host} sessionId="selected-other" />)
+    const view = render(<Fixture host={harness.host} sessionId="selected-other" />)
     expect(await screen.findByText('还没有 subagent')).toBeTruthy()
     expect(screen.queryByTestId('agent-row-electron-ui-acceptance')).toBeNull()
     expect(listAgents).toHaveBeenLastCalledWith('selected-other')
 
-    view.rerender(<SubagentPanel host={harness.host} sessionId="owner-session" />)
+    view.rerender(<Fixture host={harness.host} sessionId="owner-session" />)
     const row = await screen.findByTestId('agent-row-electron-ui-acceptance')
     expect(row.querySelector('strong')?.textContent).toBe('general-purpose')
     expect(row.textContent).not.toContain('electron-ui-acceptance')
@@ -171,7 +204,7 @@ describe('SubagentPanel', () => {
     expect(document.querySelector('.agent-technical-details')?.textContent).toContain('owner-session')
     expect(listAgents).toHaveBeenLastCalledWith('owner-session')
 
-    view.rerender(<SubagentPanel host={harness.host} sessionId="another-current-session" />)
+    view.rerender(<Fixture host={harness.host} sessionId="another-current-session" />)
     await waitFor(() => expect(screen.queryByTestId('agent-row-electron-ui-acceptance')).toBeNull())
     expect(await screen.findByText('还没有 subagent')).toBeTruthy()
     expect(screen.getByText('0 个')).toBeTruthy()
@@ -183,9 +216,9 @@ describe('SubagentPanel', () => {
     let resolveOld!: (agents: AgentSummary[]) => void
     const oldSnapshot = new Promise<AgentSummary[]>(resolve => { resolveOld = resolve })
     harness.host.listAgents = vi.fn(async (sessionId?: string) => sessionId === 'old-session' ? oldSnapshot : [])
-    const view = render(<SubagentPanel host={harness.host} sessionId="old-session" />)
+    const view = render(<Fixture host={harness.host} sessionId="old-session" />)
 
-    view.rerender(<SubagentPanel host={harness.host} sessionId="new-session" />)
+    view.rerender(<Fixture host={harness.host} sessionId="new-session" />)
     expect(await screen.findByText('还没有 subagent')).toBeTruthy()
     harness.emitAgent({ type: 'agent', agent: { agentId: 'old-live', runId: 'old-run', name: 'explore', task: '旧会话任务', state: 'running', sessionId: 'old-session' } })
     expect(screen.queryByTestId('agent-row-old-live')).toBeNull()
@@ -277,7 +310,7 @@ describe('SubagentPanel', () => {
 
   it('renders lifecycle counts and routes abort to the host', async () => {
     const harness = hostHarness()
-    render(<SubagentPanel host={harness.host} />)
+    renderSubagentPanel({ host: harness.host })
     harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running', cost: .2 } })
     harness.emitAgent({ type: 'agent', agent: { agentId: 'bad', runId: 'r2', name: 'review', task: 'verify', state: 'failed', cost: .1 } })
     await screen.findByText('2 个')
@@ -542,6 +575,35 @@ describe('SubagentPanel', () => {
     harness.emitLog('live', { type: 'agent_log', agentId: 'live', itemType: 'text', text: 'LATEST_RESULT' })
     await waitFor(() => expect(screen.getByText('LATEST_RESULT')).toBeTruthy())
     expect(scroll.scrollTop).toBe(400)
+  })
+
+  it('shows a 回到最新 button when the detail transcript is scrolled away from the bottom and resumes following on click', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'live', runId: 'r-live', name: 'explore', task: '定位按钮', state: 'running' } })
+    await screen.findByTestId('agent-row-live')
+    await waitFor(() => expect(harness.hasLogSubscriber('live')).toBe(true))
+    const scroll = screen.getByTestId('subagent-transcript-scroll')
+    Object.defineProperty(scroll, 'clientHeight', { configurable: true, value: 200 })
+    let height = 400
+    Object.defineProperty(scroll, 'scrollHeight', { configurable: true, get: () => height })
+
+    harness.emitLog('live', { type: 'agent_log', agentId: 'live', itemType: 'text', text: 'FIRST_RESULT' })
+    await waitFor(() => expect(screen.getByText('FIRST_RESULT')).toBeTruthy())
+
+    // no button while at the bottom and following
+    expect(screen.queryByRole('button', { name: '回到最新' })).toBeNull()
+
+    // scroll away from the bottom -> button appears
+    scroll.scrollTop = 40
+    fireEvent.scroll(scroll)
+    expect(screen.getByRole('button', { name: '回到最新' })).toBeTruthy()
+
+    // clicking resumes follow and scrolls back to the bottom, button disappears
+    height = 480
+    fireEvent.click(screen.getByRole('button', { name: '回到最新' }))
+    expect(scroll.scrollTop).toBe(280)
+    expect(screen.queryByRole('button', { name: '回到最新' })).toBeNull()
   })
 
   it('keeps the agent list pinned to the newest row while the viewer is at the bottom', async () => {
@@ -921,5 +983,54 @@ describe('SubagentPanel', () => {
     harness.emitAgent({ type: 'agent', agent: { agentId: 'fresh-run', runId: 'run-2', name: 'builder', task: 'started live', state: 'running', createdAt: 2 } })
     expect(await screen.findByText('builder')).toBeTruthy()
     await waitFor(() => expect(onAgentStarted).toHaveBeenCalledTimes(1))
+  })
+
+  it('warns when a running worker has been silent for 10 minutes and lets the user ask the main agent to check status', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [
+      { agentId: 'ghost', runId: 'r-ghost', name: 'explore', task: 'vanished worker', state: 'running', createdAt: now - 11 * 60_000, updatedAt: now - 11 * 60_000 },
+      { agentId: 'fresh', runId: 'r-fresh', name: 'builder', task: 'still reporting', state: 'running', createdAt: now, updatedAt: now },
+      { agentId: 'done', runId: 'r-done', name: 'reviewer', task: 'already finished', state: 'ok', createdAt: now - 11 * 60_000, updatedAt: now - 11 * 60_000 },
+    ]
+    const onManualStatusCheck = vi.fn()
+    render(<SubagentPanel host={harness.host} onManualStatusCheck={onManualStatusCheck} />)
+
+    const warning = await screen.findByTestId('subagent-status-channel-warning')
+    expect(warning.textContent).toContain('1 个子代理（ghost）')
+    expect(warning.textContent).toContain('自动状态通道可能不可用')
+    expect(warning.textContent).not.toContain('fresh')
+    expect(warning.textContent).not.toContain('done')
+
+    fireEvent.click(screen.getByTestId('subagent-manual-status-check'))
+    expect(onManualStatusCheck).toHaveBeenCalledWith(['ghost'])
+  })
+
+  it('does not show the status-channel warning while every running worker is still being observed', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [
+      { agentId: 'fresh', runId: 'r-fresh', name: 'builder', task: 'still reporting', state: 'running', createdAt: now, updatedAt: now },
+    ]
+    render(<SubagentPanel host={harness.host} onManualStatusCheck={vi.fn()} />)
+
+    expect(await screen.findByTestId('agent-row-fresh')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-status-channel-warning')).toBeNull()
+  })
+
+  it('asks the main agent to inspect the selected worker when technical-details 手动检查 is clicked', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [
+      { agentId: 'worker-1', runId: 'r1', name: 'explore', task: 'look around', state: 'running', createdAt: now, updatedAt: now },
+    ]
+    const onManualStatusCheck = vi.fn()
+    render(<SubagentPanel host={harness.host} onManualStatusCheck={onManualStatusCheck} />)
+
+    await screen.findByTestId('agent-row-worker-1')
+    fireEvent.click(screen.getByText('技术详情'))
+    fireEvent.click(screen.getByTestId('subagent-detail-status-check'))
+    expect(onManualStatusCheck).toHaveBeenCalledWith(['worker-1'])
+    expect(harness.checkAgent).toHaveBeenCalledWith('worker-1')
   })
 })

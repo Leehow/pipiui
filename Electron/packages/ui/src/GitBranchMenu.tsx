@@ -4,6 +4,8 @@ import './git-branch.css'
 
 /** Swift GitRepo.toolbarTitle uses the same cap, so both toolbars truncate alike. */
 const MAX_TITLE_CHARS = 24
+/** Wait out a title-bar drag that started on the same click that focused the window. */
+export const GIT_FOCUS_REFRESH_MS = 800
 
 export function displayBranchName(status: GitStatus): string {
   if (status.isDetached) return status.shortSHA ? `detached @ ${status.shortSHA}` : 'detached'
@@ -53,9 +55,22 @@ export function GitBranchMenu({ host, projectId, available }: { host: PipiHostAP
 
   useEffect(() => { refresh() }, [refresh])
   // Mirrors the Swift store: re-probe when the window regains focus, never poll.
+  // Defer past the click that focused a background window — that click is also
+  // how a title-bar drag starts, and git(1) on this repo contends with the move.
   useEffect(() => {
-    window.addEventListener('focus', refresh)
-    return () => window.removeEventListener('focus', refresh)
+    let timer = 0
+    const onFocus = () => {
+      window.clearTimeout(timer)
+      timer = window.setTimeout(refresh, GIT_FOCUS_REFRESH_MS)
+    }
+    const onBlur = () => window.clearTimeout(timer)
+    window.addEventListener('focus', onFocus)
+    window.addEventListener('blur', onBlur)
+    return () => {
+      window.clearTimeout(timer)
+      window.removeEventListener('focus', onFocus)
+      window.removeEventListener('blur', onBlur)
+    }
   }, [refresh])
   useEffect(() => {
     if (!open) return

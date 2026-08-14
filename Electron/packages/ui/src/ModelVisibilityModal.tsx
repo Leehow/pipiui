@@ -139,20 +139,22 @@ function VisionRoutingPane({ visibility, vision }: {
  * through the host (hiddenModelIds, atomic); vision routing through
  * getVisionEnabled/setVisionEnabled + getVisionModel/setVisionModel.
  */
-export function ModelVisibilityModal({ host, visibility, vision, current, onModelState, onClose }: {
+export function ModelVisibilityModal({ host, visibility, vision, current, onModelState, onClose, initialView = 'manage' }: {
   host: PipiHostAPI
   visibility: ModelVisibilityController
   vision: VisionRoutingController
   current: Model | null
   onModelState?: (state: ModelState) => void
   onClose: () => void
+  /** First-run onboarding opens straight into the provider login pane. */
+  initialView?: 'manage' | 'add'
 }) {
   const [tab, setTab] = useState<'general' | 'models'>('models')
   // Default: every provider collapsed. `expanded` is in-memory only (no cross-session
   // persistence); a refresh keeps it, so already-expanded providers stay open while
   // newly discovered providers (e.g. after refresh) appear collapsed.
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
-  const [view, setView] = useState<'manage' | 'add'>('manage')
+  const [view, setView] = useState<'manage' | 'add'>(initialView)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)

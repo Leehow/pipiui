@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { createPortal } from 'react-dom'
 import { Diff, Hunk, parseDiff } from 'react-diff-view'
 import { ActivityCard } from './ActivityCard'
 import { toolActivitySummary, toolArgsSummary } from './tool-summary'
@@ -8,6 +9,7 @@ import { providerBrand, type ProviderBrand } from './provider-logo'
 import { AssistantTranscriptContent, type AssistantTranscriptMessage, type TranscriptActivity, type TranscriptTool } from './AssistantTranscriptContent'
 import genericAgentIcon from './sf-icons/person-2.png'
 import type { AgentEvent, AgentState, AgentSummary, CostUnit, PipiHostAPI, WorktreeStatus } from '@pipi/host-api'
+import { staleRunningAgentIDs, statusChannelWarningText } from './subagent-status-check'
 
 type Log = {
   id: number
@@ -339,6 +341,10 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
     messages.push({ content: finalResult })
   }
   if (!messages.length && !isActive(agent)) messages.push({ content: agent.state === 'ok' ? '任务已完成' : agent.state === 'failed' ? '任务失败。请查看技术详情中的完整错误。' : `任务${stateText(agent)}，尚无返回内容。` })
+  // Writable isolation failed before the worker even spawned (usually: the project
+  // is not a git work tree). The raw stderr below stays as technical detail; this
+  // leading hint is the actionable version for the user.
+  if (agent.worktreeError) messages.unshift({ content: '无法创建隔离工作区：该项目不在 Git 仓库中（或 Git 不可用），可写工人不能并行改文件。可在项目根目录执行 git init 后重试，或让主管改用只读工人 / 串行完成。' })
   return messages
 }
 
@@ -384,7 +390,7 @@ function treeOrder(agents: Agent[]) {
   return order
 }
 
-export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable = false, visible: paneVisible = true, onRunningChange, onRunningCountChange, onAgentStarted }: { host: PipiHostAPI; sessionId?: string; projectPath?: string; onOpenDocument?: (path: string) => void; retainedWorktreeDispositionAvailable?: boolean; visible?: boolean; onRunningChange?: (running: boolean) => void; onRunningCountChange?: (count: number) => void; onAgentStarted?: () => void }) {
+export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable = false, visible: paneVisible = true, headerSlot, onRunningChange, onRunningCountChange, onAgentStarted, onManualStatusCheck }: { host: PipiHostAPI; sessionId?: string; projectPath?: string; onOpenDocument?: (path: string) => void; retainedWorktreeDispositionAvailable?: boolean; visible?: boolean; headerSlot?: HTMLElement | null; onRunningChange?: (running: boolean) => void; onRunningCountChange?: (count: number) => void; onAgentStarted?: () => void; onManualStatusCheck?: (agentIDs: string[]) => void }) {
   const [agents, setAgents] = useState<Agent[]>([])
   const [selectedId, setSelectedId] = useState<string>()
   const [page, setPage] = useState(0)
@@ -547,7 +553,13 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight)
   }, [follow, newestId, paneVisible, visibleAgents.length])
 
+  const staleAgentIDs = staleRunningAgentIDs(agents, now)
+  const requestManualStatusCheck = (agentIDs: string[]) => {
+    if (!agentIDs.length) return
+    onManualStatusCheck?.(agentIDs)
+  }
   const check = async (agent: Agent) => {
+    requestManualStatusCheck([agent.agentId])
     const update = await host.checkAgent(agent.agentId)
     setAgents(current => applyAgentEvent(current, { type: 'agent', agent: update }))
   }
@@ -590,7 +602,11 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
   }
 
   return <section className="subagents" data-testid="subagent-panel">
-    <SubagentHeader total={agents.length} {...summary} onClear={clearFinished} />
+    {headerSlot && paneVisible && createPortal(<SubagentHeader total={agents.length} {...summary} onClear={clearFinished} />, headerSlot)}
+    {staleAgentIDs.length > 0 && <div className="subagent-status-channel-warning" data-testid="subagent-status-channel-warning" role="status">
+      <p>{statusChannelWarningText(staleAgentIDs)}</p>
+      <button type="button" data-testid="subagent-manual-status-check" title="向主会话发出用户主动的状态查询；不会自动重新派发 agent" onClick={() => requestManualStatusCheck(staleAgentIDs)}>手动检查</button>
+    </div>}
 		{abortError && <div className="subagent-abort-error"><DismissibleError message={abortError} onDismiss={() => setAbortError('')} /></div>}
     {loading
       ? <div className="subagent-loading" role="status"><span className="agent-spinner" aria-hidden="true" />正在加载 subagents…</div>
@@ -787,11 +803,13 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
 }) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const followRef = useRef(true)
+  const [atBottom, setAtBottom] = useState(true)
   const output = agent ? latestReadableResult(agent) : ''
   const latestLog = agent?.logs.at(-1)
 
   useEffect(() => {
     followRef.current = true
+    setAtBottom(true)
   }, [agent?.agentId])
 
   useEffect(() => {
@@ -799,6 +817,13 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
     if (!el || !followRef.current) return
     el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight)
   }, [agent?.agentId, agent?.logs.length, agent?.state, latestLog?.text, latestLog?.itemType, output])
+
+  const returnLatest = useCallback(() => {
+    followRef.current = true
+    setAtBottom(true)
+    const el = scrollRef.current
+    if (el) el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight)
+  }, [])
 
   if (!agent) return <div className="agent-detail empty">选择一个 agent 查看详情</div>
   const reviewable = agent.worktree?.lifecycle === 'pendingReview'
@@ -808,7 +833,7 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
   const detailTitle = detailTaskTitle(agent, output)
   const transcript = agentTranscript(agent, output)
 
-  return <div className="agent-detail">
+  return <div className="agent-detail" style={{ position: 'relative' }}>
     <header className="agent-detail-header">
       <div className="detail-agent-title">
         <div><ModelFamilyIcon agent={agent} /><b>{detailTitle}</b></div>
@@ -818,7 +843,9 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
     <p className="agent-closeout">{agent.closeout ? `收尾　${agent.closeout}` : `${stateText(agent)}${agent.worktree ? `　${worktreeText(agent.worktree)}` : ''}`}</p>
     <div className="agent-transcript-scroll" data-testid="subagent-transcript-scroll" ref={scrollRef} onScroll={event => {
       const el = event.currentTarget
-      followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+      followRef.current = atBottom
+      setAtBottom(atBottom)
     }}>
       {isActive(agent) && <div className={`agent-running-activity ${live?.severity ?? 'active'}`} role="status" aria-live="polite"><span className="agent-spinner" aria-hidden="true" /><span>{live?.text ?? `正在执行 · ${activity}`}</span><button disabled={aborting} onClick={() => onAbort(agent)}>{aborting ? '正在停止' : '停止'}</button></div>}
       <div className="agent-transcript" data-testid="subagent-transcript">
@@ -832,7 +859,7 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
         <span>Provider / Model：{providerLabel(agent)} · {model}</span>
         {agent.sessionId && <span>Session：{agent.sessionId}</span>}
         <DetailMetrics agent={agent} now={now} pricing={pricingFor([agent])} />
-        <button onClick={() => void onCheck(agent)}>手动检查</button>
+        <button type="button" data-testid="subagent-detail-status-check" title="向主会话发出用户主动的状态查询；不会自动重新派发 agent" onClick={() => void onCheck(agent)}>手动检查</button>
       </div>
       <p className="agent-task">{visibleAgentText(agent.task)}</p>
       {agent.closeout && <p className="agent-closeout">收尾 · {agent.closeout}</p>}
@@ -845,6 +872,7 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
       {!isActive(agent) && <span className="agent-finished-at">结束于 {completedAt(agent.endedAt)} · {duration(agent, now)}</span>}
       </details>
     </div>
+    {agent && !atBottom && <button className="return-latest" aria-label="回到最新" title="回到最新" onClick={returnLatest}><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg></button>}
   </div>
 }
 

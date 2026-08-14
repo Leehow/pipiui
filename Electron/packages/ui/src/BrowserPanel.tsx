@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type { BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, PipiHostAPI } from '@pipi/host-api'
 import { DismissibleError } from './DismissibleError'
 import './browser-panel.css'
@@ -15,7 +16,7 @@ function activeTab(snapshot: BrowserTabsSnapshot): BrowserTab | undefined {
   return snapshot.tabs.find(tab => tab.id === snapshot.activeTabId) ?? snapshot.tabs[0]
 }
 
-export function BrowserPanel({ host, sessionId, occluded = false }: { host: PipiHostAPI; sessionId?: string; occluded?: boolean }) {
+export function BrowserPanel({ host, sessionId, occluded = false, headerSlot }: { host: PipiHostAPI; sessionId?: string; occluded?: boolean; headerSlot?: HTMLElement | null }) {
   const browser = host.browser
   const [tabs, setTabs] = useState<BrowserTabsSnapshot>(emptyTabs)
   const [address, setAddress] = useState('')
@@ -82,7 +83,7 @@ export function BrowserPanel({ host, sessionId, occluded = false }: { host: Pipi
   if (!browser) return <section className="browser-panel browser-unavailable" data-testid="browser-unavailable"><b>Browser 不可用</b><p>当前连接未提供桌面浏览器能力。</p></section>
 
   return <section className="browser-panel" data-testid="browser-panel">
-    <nav className="browser-tabs" aria-label="浏览器标签页" role="tablist">
+    {headerSlot && !occluded && createPortal(<nav className="browser-tabs" aria-label="浏览器标签页" role="tablist">
       {tabs.tabs.map(tab => {
         const title = displayTitle(tab)
         const selected = tab.id === active?.id
@@ -94,7 +95,7 @@ export function BrowserPanel({ host, sessionId, occluded = false }: { host: Pipi
         </div>
       })}
       <button className="browser-new-tab" aria-label="新建标签页" title="新建标签页" onClick={() => run(() => browser.newTab(sessionKey))}>＋</button>
-    </nav>
+    </nav>, headerSlot)}
 
     <form className="browser-toolbar" onSubmit={event => { event.preventDefault(); if (address.trim()) run(() => browser.loadURL(sessionKey, address, active?.id)) }}>
       <button type="button" aria-label="后退" title="后退" disabled={!active?.canGoBack} onClick={() => active && run(() => browser.goBack(sessionKey, active.id))}>‹</button>

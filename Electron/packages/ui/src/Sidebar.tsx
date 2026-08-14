@@ -121,8 +121,9 @@ export interface SidebarProps {
   onToggleProject: (projectId: string) => void
   onSelectSession: (sessionId: string) => void
   onNewSession: (projectId: string) => void
-  /** Menu actions are reported, never applied here (rename/reveal/remove/newSession). */
+  /** Menu actions are reported, never applied here (reveal/remove). Rename is inline. */
   onProjectMenu: (projectId: string, action: ProjectMenuAction) => void
+  onRenameProject?: (projectId: string, name: string) => Promise<void> | void
   onMoveProject?: (sourceProjectId: string, targetProjectId: string, placement: 'before' | 'after') => void
   onMoveSession?: (sessionId: string, targetProjectId: string, targetSessionId?: string, placement?: 'before' | 'after') => void
   onMoveSessionToPinned?: (sessionId: string, targetSessionId?: string, placement?: 'before' | 'after') => void
@@ -309,8 +310,7 @@ function ProjectSessions({ project, query, selectedSessionId, onSelectSession, o
 }
 
 const MENU_ITEMS: { action: ProjectMenuAction; label: string; danger?: boolean }[] = [
-  { action: 'newSession', label: '新建会话' },
-  { action: 'rename', label: '编辑名称' },
+  { action: 'rename', label: '重命名' },
   { action: 'reveal', label: '在 Finder 中显示' },
   { action: 'remove', label: '移除项目', danger: true }
 ]
@@ -329,12 +329,13 @@ function ProjectAddControl({ onAddProject, unavailable }: { onAddProject?: () =>
   return <button type="button" className="sb-add-project" aria-label="添加项目" title={unavailable ?? '选择项目文件夹'} disabled={Boolean(unavailable) || pending} onClick={() => void pick()}><SfIconFolderBadgePlus /></button>
 }
 
-function ProjectRow({ project, isExpanded, onToggle, onNewSession, onProjectMenu, projectMenuUnavailable, draggable, dragging, dropPlacement, onDragStart, onDragEnd, onDragOver, onDrop }: {
+function ProjectRow({ project, isExpanded, onToggle, onNewSession, onProjectMenu, onRenameProject, projectMenuUnavailable, draggable, dragging, dropPlacement, onDragStart, onDragEnd, onDragOver, onDrop }: {
   project: SidebarProject
   isExpanded: boolean
   onToggle: (id: string) => void
   onNewSession: (id: string) => void
   onProjectMenu: (id: string, action: ProjectMenuAction) => void
+  onRenameProject?: (id: string, name: string) => Promise<void> | void
   projectMenuUnavailable?: ProjectMenuUnavailable
   draggable?: boolean
   dragging?: boolean
@@ -345,8 +346,13 @@ function ProjectRow({ project, isExpanded, onToggle, onNewSession, onProjectMenu
   onDrop?: (event: DragEvent, project: SidebarProject) => void
 }) {
   const [menuOpen, setMenuOpen] = useState(false)
+  const [renaming, setRenaming] = useState(false)
   const runMenuAction = (action: ProjectMenuAction) => {
     setMenuOpen(false)
+    if (action === 'rename' && onRenameProject) {
+      setRenaming(true)
+      return
+    }
     onProjectMenu(project.id, action)
   }
   return (
@@ -356,7 +362,7 @@ function ProjectRow({ project, isExpanded, onToggle, onNewSession, onProjectMenu
       aria-expanded={isExpanded}
       data-testid="project-row"
       data-project-id={project.id}
-      draggable={draggable}
+      draggable={renaming ? false : draggable}
       data-dragging={dragging || undefined}
       data-drop-placement={dropPlacement}
       onDragStart={event => onDragStart?.(event, project)}
@@ -364,17 +370,28 @@ function ProjectRow({ project, isExpanded, onToggle, onNewSession, onProjectMenu
       onDragOver={event => onDragOver?.(event, project)}
       onDrop={event => onDrop?.(event, project)}
     >
-      <button
-        type="button"
-        className="sb-project-main"
-        aria-expanded={isExpanded}
-        aria-label={`${isExpanded ? '收起' : '展开'}项目 ${project.name}`}
-        onClick={() => onToggle(project.id)}
-      >
-        <SfIconFolder filled={isExpanded} />
-        <span className="sb-project-name">{project.name}</span>
-      </button>
-      <div className="sb-project-actions">
+      {renaming && onRenameProject
+        ? <div className="sb-project-main">
+            <SfIconFolder filled={isExpanded} />
+            <InlineSessionTitleEditor
+              value={project.name}
+              ariaLabel="项目名称"
+              className="sb-session-title-input"
+              onCommit={async name => { await onRenameProject(project.id, name); setRenaming(false) }}
+              onCancel={() => setRenaming(false)}
+            />
+          </div>
+        : <button
+            type="button"
+            className="sb-project-main"
+            aria-expanded={isExpanded}
+            aria-label={`${isExpanded ? '收起' : '展开'}项目 ${project.name}`}
+            onClick={() => onToggle(project.id)}
+          >
+            <SfIconFolder filled={isExpanded} />
+            <span className="sb-project-name">{project.name}</span>
+          </button>}
+      {!renaming && <div className="sb-project-actions">
         <div className="sb-menu-wrap">
           <button
             type="button"
@@ -418,7 +435,7 @@ function ProjectRow({ project, isExpanded, onToggle, onNewSession, onProjectMenu
         >
           <SfIconPlus />
         </button>
-      </div>
+      </div>}
     </div>
   )
 }
@@ -467,6 +484,7 @@ export function Sidebar(props: SidebarProps) {
     onSelectSession,
     onNewSession,
     onProjectMenu,
+    onRenameProject,
     onMoveProject,
     onMoveSession,
     onMoveSessionToPinned,
@@ -636,6 +654,7 @@ export function Sidebar(props: SidebarProps) {
                 onToggle={onToggleProject}
                 onNewSession={onNewSession}
                 onProjectMenu={onProjectMenu}
+                onRenameProject={onRenameProject}
                 projectMenuUnavailable={projectMenuUnavailable}
                 draggable={!query && Boolean(onMoveProject)}
                 dragging={dragged?.type === 'project' && dragged.id === project.id}

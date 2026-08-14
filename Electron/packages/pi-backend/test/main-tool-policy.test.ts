@@ -16,7 +16,7 @@ describe("boss read-only tool policy", () => {
 
   it("keeps the Boss's read and verification tools", () => {
     const excluded = new Set(resolveMainSessionExcludedTools({ bossReadOnly: true }));
-    for (const kept of ["read", "grep", "find", "ls", "git", "web_search", "browser", "subagent", "subagent_status", "ledger_note"]) {
+    for (const kept of ["read", "grep", "find", "ls", "git", "web_search", "browser", "browser_search", "browser_fetch", "subagent", "subagent_status", "ledger_note"]) {
       expect(excluded.has(kept)).toBe(false);
     }
   });
@@ -27,8 +27,10 @@ describe("boss read-only tool policy", () => {
   });
 
   it("merges the user's own denylist and expands the browser group id", () => {
+    // The browser group covers every tool driven by the built-in browser surface,
+    // including the bridge-backed search/fetch route.
     expect(resolveMainSessionExcludedTools({ bossReadOnly: true, disabledToolNames: ["browser_*", "generate_image"] }))
-      .toEqual(["bash", "browser", "edit", "generate_image", "write"]);
+      .toEqual(["bash", "browser", "browser_fetch", "browser_search", "edit", "generate_image", "write"]);
   });
 
   it("never denies the desktop tools, which only the global Computer Use toggle controls", () => {

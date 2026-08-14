@@ -4,12 +4,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createMockHost } from './App'
 import { BrowserPanel } from './BrowserPanel'
 
+function renderPanel(host = createMockHost(), sessionId = 'welcome') {
+  const slot = document.createElement('div')
+  document.body.appendChild(slot)
+  const view = render(<BrowserPanel host={host} sessionId={sessionId} headerSlot={slot} />)
+  return { view, slot }
+}
+
 afterEach(cleanup)
 
 describe('BrowserPanel', () => {
   it('adds, switches, and closes virtual tabs through the host API', async () => {
     const host = createMockHost()
-    render(<BrowserPanel host={host} sessionId="welcome" />)
+    renderPanel(host)
 
     await screen.findByRole('tab', { name: '新标签页' })
     const address = screen.getByLabelText('浏览器地址') as HTMLInputElement
@@ -32,7 +39,7 @@ describe('BrowserPanel', () => {
 
   it('exposes back, forward, and refresh against mock navigation state', async () => {
     const host = createMockHost()
-    render(<BrowserPanel host={host} sessionId="welcome" />)
+    renderPanel(host)
     await screen.findByRole('tab', { name: '新标签页' })
     const address = screen.getByLabelText('浏览器地址') as HTMLInputElement
 
@@ -80,7 +87,7 @@ describe('BrowserPanel', () => {
     if (!browser) throw new Error('mock browser unavailable')
     const reload = vi.fn(async () => { throw new Error('mock reload failure') })
     browser.reload = reload
-    render(<BrowserPanel host={host} sessionId="welcome" />)
+    renderPanel(host)
     await screen.findByRole('tab', { name: '新标签页' })
 
     fireEvent.click(screen.getByRole('button', { name: '刷新' }))

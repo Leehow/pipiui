@@ -149,9 +149,11 @@ if (process.argv.includes("--mode")) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   if (!runId) throw new Error("probe did not expose a terminal runId: " + statusText);
-  const resolved = await subagent.execute(
+  const resolver = tools.get("subagent_resolve");
+  if (!resolver) throw new Error("subagent_resolve was not registered");
+  const resolved = await resolver.execute(
     "bridge-live-resolve",
-    { action: "resolve", agentId: "bridge-live", runId, reason: "canonical probe handled" },
+    { agentId: "bridge-live", runId, reason: "canonical probe handled" },
     new AbortController().signal,
     undefined,
     context,

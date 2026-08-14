@@ -38,7 +38,7 @@ export {
 
 const MAX_WIRE_PAYLOAD_BYTES = 8 * 1024 * 1024;
 const HOST_METHODS = new Set<HostMethod>([
-  "listProjects", "getProjectPaths", "setProjectPaths", "addProject", "removeProject", "listSessions", "listDocuments", "readDocument",
+  "listProjects", "getProjectPaths", "setProjectPaths", "addProject", "removeProject", "renameProject", "listSessions", "listDocuments", "readDocument",
   "newSession", "resumeSession", "renameSession", "deleteSession", "moveSession", "getSessionHistory",
   "getSessionLease", "forceTakeoverSessionLease", "sendPrompt", "listQueue",
   "enqueueMessage", "updateQueuedMessage", "removeQueuedMessage", "promoteQueuedMessage",
@@ -46,7 +46,7 @@ const HOST_METHODS = new Set<HostMethod>([
   "setThinkingLevel", "getHiddenModelIds", "setHiddenModelIds", "getSidebarSessionPreferences", "setSidebarSessionPreferences", "authProviders", "beginProviderLogin", "continueProviderLogin", "cancelProviderLogin", "removeProviderCredentials", "getSessionStats", "getQuotaSnapshot", "listAgents", "abortAgent", "resolveAgent",
   "checkAgent", "getWorktreeStatus", "mergeWorktree", "discardWorktree",
   "getVisionModel", "setVisionModel",
-  "capabilities", "gitStatus", "gitCheckout", "revealProject", "terminalOpen", "terminalWrite",
+  "capabilities", "gitStatus", "gitCheckout", "probeDirectoryGit", "gitInitDirectory", "revealProject", "terminalOpen", "terminalWrite",
   "terminalClear", "terminalClose", "browserListTabs", "browserGetActiveTab",
   "browserNewTab", "browserSwitchTab", "browserCloseTab", "browserLoadURL",
   "browserGoBack", "browserGoForward", "browserReload", "browserSnapshot",

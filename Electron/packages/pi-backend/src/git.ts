@@ -111,3 +111,9 @@ export async function checkoutBranch(cwd: string, branch: string): Promise<GitSt
   await gitStrict(cwd, ["checkout", validateBranchName(branch)]);
   return probeGit(cwd);
 }
+
+/** `git init` a freshly picked non-repo folder, then re-probe. Errors carry git's stderr. */
+export async function initGit(cwd: string): Promise<GitStatus> {
+  await gitStrict(cwd, ["init"]);
+  return probeGit(cwd);
+}

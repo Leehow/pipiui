@@ -77,6 +77,7 @@ function summarizeArgs(name: string, args: Record<string, unknown>): string {
     case 'generate_image':
       return promptSummary(args)
     case 'web_search':
+    case 'browser_search':
       return stringField(args, 'query') ?? '…'
     case 'fetch_content': {
       const url = stringField(args, 'url')
@@ -85,6 +86,8 @@ function summarizeArgs(name: string, args: Record<string, unknown>): string {
       if (Array.isArray(urls) && typeof urls[0] === 'string') return urls[0]
       return '…'
     }
+    case 'browser_fetch':
+      return stringField(args, 'url') ?? '…'
     case 'browser':
       return browserSummary(args)
     case 'computer': {
@@ -193,8 +196,10 @@ function scrapeFields(name: string, text: string): string | undefined {
       return cmd == null ? undefined : truncate(cmd)
     }
     case 'web_search':
+    case 'browser_search':
       return scrapeJSONString('query', text)
     case 'fetch_content':
+    case 'browser_fetch':
       return scrapeJSONString('url', text)
     case 'generate_image': {
       const prompt = scrapeJSONString('prompt', text)

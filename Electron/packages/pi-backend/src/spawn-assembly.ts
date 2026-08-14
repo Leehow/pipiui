@@ -4,9 +4,9 @@ import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:pa
 
 import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
 
-export type Feature = "philosophy"|"plan"|"generateImage"|"git"|"reload"|"webSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
+export type Feature = "philosophy"|"plan"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
-export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"computerUse"|"webview"|"terminal"|"runtimeInfo"|"subagentDir"|"agentsDir", string>>;
+export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"computerUse"|"webview"|"terminal"|"runtimeInfo"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
 export type SpawnInput = { sessionPath?: string; cwd: string; runtimeRoot?: string; agentDir?: string; sessionsRoot?: string; resourceMode?: "default"|"explicit"; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; subagentModelsFile?: string; /** The user's Settings → 工具开关 denylist. Merged with the Boss read-only policy; never passed to workers. */ disabledToolNames?: readonly string[] };
 export type SpawnOutput = { args: string[]; env: Record<string,string> };
@@ -84,7 +84,11 @@ if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI
 if(!input.bridgePort){ext(args,p.runtimeInfo);return{args,env};}
 // Genuinely bridge-dependent: the memory broker issues host-scoped capabilities, the webview
 // extension drives the host's browser surface, and an explicitly enabled plan runtime posts events.
-if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PIPIUI_MEMORY_BROKER_MODE="main";env.PIPIUI_MEMORY_PROJECT_ROOT=input.cwd;if(p.hermesMemory){env.PIPIUI_HERMES_PACKAGE_ROOT=p.hermesMemory;env.PIPIUI_HERMES_NODE_MODULES_ROOT=dirname(p.hermesMemory)}}}if(enabled(f,"browser"))ext(args,p.webview);if(enabled(f,"terminal"))ext(args,p.terminal);if(enabled(f,"plan"))ext(args,p.planRuntime);env.PIPIUI_BRIDGE_PORT=String(input.bridgePort);env.PIPIUI_SESSION_KEY=input.bridgeRoutingKey??"";
+if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PIPIUI_MEMORY_BROKER_MODE="main";env.PIPIUI_MEMORY_PROJECT_ROOT=input.cwd;if(p.hermesMemory){env.PIPIUI_HERMES_PACKAGE_ROOT=p.hermesMemory;env.PIPIUI_HERMES_NODE_MODULES_ROOT=dirname(p.hermesMemory)}}}if(enabled(f,"browser"))ext(args,p.webview);
+// Built-in-browser search/fetch share the webview's bridge; mounted beside it, independently
+// gated so the Settings browser toggle and this search route stay separate switches.
+if(enabled(f,"browserSearch"))ext(args,p.browserSearch);
+if(enabled(f,"terminal"))ext(args,p.terminal);if(enabled(f,"plan"))ext(args,p.planRuntime);env.PIPIUI_BRIDGE_PORT=String(input.bridgePort);env.PIPIUI_SESSION_KEY=input.bridgeRoutingKey??"";
 // Canonical v1: the extension encodes `sessionCapability` envelopes and fails closed when the
 // capability is missing, so the protocol marker is only ever set together with a real credential.
 if(input.sessionCapability){env.PIPIUI_HOST_PROTOCOL="1";env.PIPIUI_SESSION_CAPABILITY=input.sessionCapability}
@@ -232,6 +236,7 @@ export function resolveSpawnPaths(runtimeRoot:string=defaultRuntimeRoot(),option
     claudeServerTools:fileIfPresent(extensions,"pipiui-claude-server-tools.ts"),
     computerUse:fileIfPresent(extensions,"pipiui-computer-use.ts"),
     webview:fileIfPresent(extensions,"pipiui-electron-webview.ts"),
+    browserSearch:fileIfPresent(extensions,"pipiui-browser-search.ts"),
     terminal:fileIfPresent(extensions,"pipiui-electron-terminal.ts"),
     runtimeInfo:fileIfPresent(extensions,"pipiui-runtime-info.ts"),
     subagentDir:fileIfPresent(ext,"subagent"),

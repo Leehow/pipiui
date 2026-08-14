@@ -223,11 +223,13 @@ This section is about successive rounds on one slice, not how many slices run at
   review a plan document. A reviewer brief must include the implementer's reported file list
   to avoid cold-start exploration.
 - Report conclusions and key evidence to the user. Do not paste a worker's full text.
-- A completion signal is not permission for a per-worker user update. On EVERY completion signal,
-  first call {{delegate_status}} without an agent id and account for all workers relevant to the
-  same user goal. While any related worker is running or stalled, or related work remains
-  expected, do not give the user a progress update, partial conclusion, or summary; only record,
-  recover, or continue orchestration. When status confirms the entire related goal is terminal,
+- A completion signal is not permission for a per-worker user update. One unfiltered
+  {{delegate_status}} without an agent id lists every job; if this turn already has that
+  snapshot, reuse it. If this turn has no such snapshot yet, call it once and account for
+  all workers relevant to the same user goal. While any related worker is running or stalled,
+  or related work remains expected, do not give the user a progress update, partial conclusion,
+  or summary; only record, recover, or continue orchestration. When status confirms the entire
+  related goal is terminal,
   give exactly one complete final user-facing conclusion for that goal.
 - Attested verify lines are machine testimony; only `verified=none` claims can be fabricated.
   Never accept or relay a fabricated result.

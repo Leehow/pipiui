@@ -162,4 +162,38 @@ describe("explicit sidebar project persistence", () => {
       operator: [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
     });
   });
+
+  it("renames the stored display name without changing the folder path", async () => {
+    const fixture = await setup();
+    const first = backend(fixture.agent, fixture.sessions);
+    const added = await first.handle("addProject", [fixture.projects.haoli]) as any;
+    expect(added).toMatchObject({ path: fixture.projects.haoli, name: "haoli" });
+
+    const renamed = await first.handle("renameProject", [added.id, "  我的仓库  "]) as any;
+    expect(renamed).toMatchObject({ id: added.id, path: fixture.projects.haoli, name: "我的仓库" });
+    expect(await first.handle("listProjects", [])).toEqual([expect.objectContaining({ id: added.id, path: fixture.projects.haoli, name: "我的仓库" })]);
+
+    const settings = JSON.parse(await readFile(join(fixture.agent, "pipiui-settings.json"), "utf8"));
+    expect(settings.projectNames[fixture.projects.haoli]).toBe("我的仓库");
+    expect(settings.projectPaths).toEqual([fixture.projects.haoli]);
+
+    const fresh = backend(fixture.agent, fixture.sessions);
+    expect(await fresh.handle("listProjects", [])).toEqual([expect.objectContaining({ id: added.id, path: fixture.projects.haoli, name: "我的仓库" })]);
+    await expect(first.handle("renameProject", [added.id, "   "])).rejects.toThrow("项目名称不能为空");
+  });
+
+  it("reveals the project folder through the injectable file-manager opener", async () => {
+    const fixture = await setup();
+    const revealed: string[] = [];
+    const first = createPiHostBackend({
+      agentDir: fixture.agent,
+      sessionsRoot: fixture.sessions,
+      canonicalProjectPaths: async () => undefined,
+      revealPath: async (path) => { revealed.push(path); },
+    });
+    const added = await first.handle("addProject", [fixture.projects.haoli]) as any;
+    await first.handle("revealProject", [added.id]);
+    expect(revealed).toEqual([fixture.projects.haoli]);
+    await expect(first.handle("revealProject", ["missing"])).rejects.toThrow("unknown project");
+  });
 });

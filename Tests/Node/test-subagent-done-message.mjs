@@ -2,10 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { formatSubagentDoneMessage } from "../../Sources/PipiUI/PiExt/subagent/done-message.ts";
 
-const STATUS_CHECK = "FIRST call subagent_status() without agentId";
+const STATUS_CHECK = "if this turn has no unfiltered subagent_status() yet, call it once without agentId";
 const PENDING_WORKERS_SILENCE = "do NOT give the user a status update, progress report, partial conclusion, or summary";
 const FINAL_CLOSEOUT = "exactly one complete final closeout";
-const CLOSE_LOOP_SUBSTRING = 'Never reply "already completed" without first calling subagent_status';
+const CLOSE_LOOP_SUBSTRING = 'Never reply "already completed" without a status snapshot this turn';
 
 function result(overrides = {}) {
 	return {
@@ -48,11 +48,11 @@ test("successful done message preserves its structure, TLDR slice, and completio
 	assert.ok(message.includes(PENDING_WORKERS_SILENCE));
 	assert.ok(message.includes(FINAL_CLOSEOUT));
 	assert.match(message, new RegExp(CLOSE_LOOP_SUBSTRING));
-	assert.match(message, /action:"abort"/);
-	assert.match(message, /action:"resolve"/);
+	assert.match(message, /subagent_abort\(\{agentId\}\)/);
+	assert.match(message, /subagent_resolve\(\{agentId, runId\}\)/);
 	assert.ok(
 		message.indexOf(STATUS_CHECK) < message.indexOf(PENDING_WORKERS_SILENCE),
-		"completion handling must require the status check before deciding whether user output is allowed",
+		"completion handling must require a once-per-turn status snapshot before deciding whether user output is allowed",
 	);
 	assert.ok(
 		message.indexOf(PENDING_WORKERS_SILENCE) < message.indexOf(FINAL_CLOSEOUT),

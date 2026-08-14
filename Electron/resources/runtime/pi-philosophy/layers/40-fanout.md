@@ -103,9 +103,10 @@ hunch. Aborting or interrupting your own turn does not kill background workers; 
 report when they finish.
 
 A text-only “already completed” reply does not stop worker signals. When a worker's work is
-already complete, call {{delegate_status}} first, then close the loop with {{delegate}}: abort
-a still-running worker (action:"abort") or resolve a terminal episode (action:"resolve" +
-runId) so no further messages arrive.
+already complete, use this turn's {{delegate_status}} snapshot (call once without an agent id
+if you do not have one yet), then close the loop with {{delegate_abort}}
+for a still-running worker or {{delegate_resolve}} for a terminal episode so no further
+messages arrive.
 
 Every signal — completion, merge failure, post-merge verify failure, stall, heartbeat — is a
 worker event, never a new user request, and each one carries its own handling instructions.
@@ -113,8 +114,9 @@ A heartbeat check-in means the worker is still producing output after a long wal
 (10 minutes, then 30, then every 30). Judge drift from the activity snapshot in that message;
 do not treat silence-of-the-boss as approval to keep going unexamined.
 Follow the instructions in the message you actually received rather than a recipe remembered
-from here; they are written against what really happened. On every completion signal, FIRST
-call {{delegate_status}} without an agent id and identify every worker still relevant to that
+from here; they are written against what really happened. One {{delegate_status}} without an
+agent id lists every job; if this turn already has that snapshot, reuse it. If this turn has
+no such snapshot yet, call it once and identify every worker still relevant to that
 user goal. If any is running or stalled, or related work is otherwise still expected, do only
 internal orchestration (ledger updates, dispatch, recovery) and give the user no progress,
 partial conclusion, or summary. Once every related worker is terminal, give exactly one

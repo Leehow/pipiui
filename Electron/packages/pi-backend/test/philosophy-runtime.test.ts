@@ -58,6 +58,7 @@ describe("vendored philosophy: structure", () => {
       "orchestration",
       "fanout",
       "toolcall",
+      "thinking",
     ]);
   });
 
@@ -92,7 +93,7 @@ describe("vendored philosophy: delivery", () => {
 
   it("delivers a model-scoped layer to a worker regardless of the bulk switch", () => {
     const result = compose({ role: "worker", agent: "general-purpose", model: SCOPED_MODEL });
-    expect(result.included.map((l) => l.id)).toEqual(["craft", "toolcall"]);
+    expect(result.included.map((l) => l.id)).toEqual(["craft", "toolcall", "thinking"]);
   });
 
   it("survives a runtime that has only the single dispatch tool", () => {
@@ -132,8 +133,9 @@ describe("vendored philosophy: delivery", () => {
   it("keeps the boss's whole prefix inside budget", () => {
     // The standalone package capped this at 11500; the vendored tree also carries the
     // host-policy sections (tool withholding, computer_task routing, status persistence,
-    // session recall), which are load-bearing here and cost the difference.
+    // session recall) and the deepseek-scoped thinking-discipline layer, which are
+    // load-bearing here and cost the difference.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(12000);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(12500);
   });
 });

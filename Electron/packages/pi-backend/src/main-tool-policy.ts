@@ -40,9 +40,10 @@ export const BOSS_MUTATION_TOOL_NAMES: readonly string[] = Object.freeze(["bash"
  */
 const RESERVED_DESKTOP_TOOL_NAMES = new Set(["computer", "open_application"]);
 
-/** Settings still store the browser group id; it expands to the single `browser` tool. */
+/** Settings still store the browser group id; it expands to the tools driven by the built-in
+ * browser surface, including the bridge-backed browser_search/browser_fetch route. */
 const BROWSER_GROUP_ID = "browser_*";
-const BROWSER_TOOL_NAMES = ["browser"];
+const BROWSER_TOOL_NAMES = ["browser", "browser_search", "browser_fetch"];
 
 export interface MainToolPolicyInput {
   /** False restores the legacy fully-capable main session. */

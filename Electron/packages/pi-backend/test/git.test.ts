@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkoutBranch, createPiHostBackend, githubBrowserURL, parsePorcelain, parseUpstreamCounts, probeGit, validateBranchName } from "../src/index.js";
+import { checkoutBranch, createPiHostBackend, githubBrowserURL, initGit, parsePorcelain, parseUpstreamCounts, probeGit, validateBranchName } from "../src/index.js";
 
 let root = "";
 afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = ""; });
@@ -64,6 +64,11 @@ describe("probeGit", () => {
     const cwd = await repository();
     await expect(checkoutBranch(cwd, "missing-branch")).rejects.toThrow(/missing-branch/);
   });
+  it("inits a plain folder into a probe-able repository", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-initgit-"));
+    expect(await probeGit(root)).toMatchObject({ isRepo: false });
+    expect(await initGit(root)).toMatchObject({ isRepo: true, isDetached: false });
+  });
 });
 
 describe("PiHostBackend git methods", () => {
@@ -81,5 +86,19 @@ describe("PiHostBackend git methods", () => {
     expect(await backend.handle("gitStatus", [project.id])).toMatchObject({ isRepo: true, currentBranch: "main" });
     expect(await backend.handle("gitCheckout", [project.id, "feature"])).toMatchObject({ currentBranch: "feature" });
     await expect(backend.handle("gitStatus", ["not-a-project"])).rejects.toThrow(/unknown project/);
+  });
+  it("probes a freshly picked non-repo directory and inits it in place", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-pick-"));
+    const backend = createPiHostBackend({ agentDir: join(root, ".agent"), sessionsRoot: join(root, ".sessions"), canonicalProjectPaths: async () => undefined });
+    expect(await backend.handle("probeDirectoryGit", [root])).toMatchObject({ isRepo: false });
+    expect(await backend.handle("gitInitDirectory", [root])).toMatchObject({ isRepo: true });
+    expect(await backend.handle("probeDirectoryGit", [root])).toMatchObject({ isRepo: true });
+  });
+  it("refuses probe/init outside an existing absolute directory", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-pick-"));
+    const backend = createPiHostBackend({ agentDir: join(root, ".agent"), sessionsRoot: join(root, ".sessions"), canonicalProjectPaths: async () => undefined });
+    await expect(backend.handle("probeDirectoryGit", ["relative/path"])).rejects.toThrow(/绝对路径/);
+    await expect(backend.handle("probeDirectoryGit", [join(root, "missing")])).rejects.toThrow(/目录不存在或不是文件夹/);
+    await expect(backend.handle("gitInitDirectory", [42])).rejects.toThrow(/绝对路径/);
   });
 });

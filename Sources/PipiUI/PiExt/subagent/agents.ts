@@ -467,7 +467,16 @@ function capabilityToolNames(capabilities: AgentCapabilities, trustedSecretary: 
 		);
 	}
 	names.push(...capabilities.mcpTools);
-	if (capabilities.delegation) names.push("subagent");
+	if (capabilities.delegation) {
+		names.push(
+			"subagent",
+			"subagent_parallel",
+			"subagent_chain",
+			"subagent_abort",
+			"subagent_resolve",
+			"subagent_status",
+		);
+	}
 	if (trustedSecretary) names.push(SECRETARY_COMMIT_TOOL);
 	return [...new Set(names)];
 }

@@ -259,17 +259,19 @@ export function MessageQueue({
                           立即发送
                         </button>
                       )}
-                      <button
-                        type="button"
-                        className="message-queue__promote"
-                        data-testid={`queue-promote-${index}`}
-                        aria-label={`插队第 ${index + 1} 条`}
-                        title={index === 0 ? '已是队首' : '插队到最前'}
-                        disabled={mutationBlocked || item.status === 'sending' || index === 0}
-                        onClick={() => onPromote(item.id)}
-                      >
-                        插队
-                      </button>
+                      {index > 0 && (
+                        <button
+                          type="button"
+                          className="message-queue__promote"
+                          data-testid={`queue-promote-${index}`}
+                          aria-label={`插队第 ${index + 1} 条`}
+                          title="插队到最前"
+                          disabled={mutationBlocked || item.status === 'sending'}
+                          onClick={() => onPromote(item.id)}
+                        >
+                          插队
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="message-queue__edit"

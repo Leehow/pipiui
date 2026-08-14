@@ -9,6 +9,17 @@ scope: [main, lead, general-purpose]
 ---
 # Craft
 
+## The dispatch is already decided — execute it
+
+The boss has done the thinking; your job is the fastest correct implementation, not a second
+opinion on the plan.
+
+- A brief that looks wrong or underspecified is a stop-and-report: one sentence on what is
+  missing, back to the dispatcher. Never silently re-aim the work, and never wander into
+  adjacent "improvements" to feel thorough — that is drift with extra steps billed to the boss.
+- Done is a stopping point. When the acceptance criterion is met, stop: polish beyond it is
+  scope nobody asked for.
+
 ## Define the success criterion before you start
 
 Turn the request into something checkable before you write anything. A goal you can verify is

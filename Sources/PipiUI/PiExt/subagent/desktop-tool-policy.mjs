@@ -3,6 +3,20 @@ export const RESERVED_DESKTOP_TOOL_NAMES = Object.freeze([
 	"open_application",
 ]);
 
+/** Tools that exist only to dispatch or control workers. Nested roles lose the whole set. */
+export const DELEGATION_TOOL_NAMES = Object.freeze([
+	"subagent",
+	"subagent_parallel",
+	"subagent_chain",
+	"subagent_abort",
+	"subagent_resolve",
+	"subagent_status",
+]);
+
+export function isDelegationTool(name) {
+	return DELEGATION_TOOL_NAMES.includes(name);
+}
+
 /** App-issued one-run capability may add only this read-only broker tool. */
 export const MEMORY_BROKER_TOOL_NAME = "memory_query";
 
@@ -169,7 +183,7 @@ export function resolveSubagentToolSelection({
 				(name) =>
 					!disabled.has(name) &&
 					!RESERVED_DESKTOP_TOOLS.has(name) &&
-					(allowRecursiveDelegation || name !== "subagent") &&
+					(allowRecursiveDelegation || !isDelegationTool(name)) &&
 					(!PIPIUI_EXTENSION_ONLY_TOOL_SET.has(name) || available.has(name)),
 			),
 		);
@@ -186,7 +200,9 @@ export function resolveSubagentToolSelection({
 			: { flag: "--no-tools", names: [] };
 	}
 
-	if (!allowRecursiveDelegation) disabled.add("subagent");
+	if (!allowRecursiveDelegation) {
+		for (const name of DELEGATION_TOOL_NAMES) disabled.add(name);
+	}
 	// Even a legacy unconstrained worker cannot surface a provider/custom
 	// desktop tool unless the host AND this dispatch granted it.
 	if (!hasDesktopCapability) {

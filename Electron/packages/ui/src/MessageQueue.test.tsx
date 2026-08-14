@@ -103,9 +103,8 @@ describe('MessageQueue', () => {
   it('promotes (插队) a mutable later item, keeps the head non-promotable, and protects sending rows', () => {
     const cb = callbacks()
     render(<MessageQueue items={items} expanded {...cb} />)
-    const head = screen.getByTestId('queue-promote-0')
-    expect(head.hasAttribute('disabled')).toBe(true)
-    expect(head.getAttribute('title')).toBe('已是队首')
+    // Head item (index 0) has nothing to jump over — the promote button is hidden entirely.
+    expect(screen.queryByTestId('queue-promote-0')).toBeNull()
     // queue-host rejects mutations for an in-flight sending item.
     expect((screen.getByTestId('queue-promote-1') as HTMLButtonElement).disabled).toBe(true)
     expect((screen.getByTestId('queue-edit-1') as HTMLButtonElement).disabled).toBe(true)

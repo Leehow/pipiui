@@ -187,7 +187,7 @@ process.stdout.write(JSON.stringify({
     assert.equal(out.staleCurrentRunId, out.failedRunId);
     assert.match(out.staleMessage, /stale runId=.*currentRunId=/);
     assert.equal(out.runningOk, false);
-    assert.match(out.runningMessage, /action:"abort"|wait/);
+    assert.match(out.runningMessage, /subagent_abort|wait/);
     assert.equal(out.okOk, false);
     assert.match(out.okMessage, /state is "ok"/);
 
@@ -290,14 +290,17 @@ process.stdout.write(JSON.stringify({
 test("resolve keeps runtime identity validation without xAI best-effort schema conditionals", async () => {
   const source = await readFile(join(sourceSubagentDirectory, "index.ts"), "utf8");
   assert.match(source, /name: "subagent"/);
-	assert.match(source, /const SubagentParams = Type\.Object\(\{/);
-	assert.match(source, /StringEnum\(\["abort", "resolve"\] as const/);
-	assert.match(source, /runId: Type\.Optional\(Type\.String\(\{ minLength: 1/);
+  assert.match(source, /name: "subagent_resolve"/);
+  assert.match(source, /name: "subagent_abort"/);
+  assert.match(source, /const SubagentParams = Type\.Object\(\{/);
+  assert.match(source, /const SubagentResolveParams = Type\.Object\(\{/);
+  assert.match(source, /runId: Type\.String\(\{ minLength: 1/);
   const schemaSource = source.slice(
-		source.indexOf("const SubagentParams = Type.Object("),
-		source.indexOf("const ParallelSubagentParams = Type.Object("),
+    source.indexOf("const SubagentParams = Type.Object("),
+    source.indexOf("const ParallelSubagentParams = Type.Object("),
   );
   assert.doesNotMatch(schemaSource, /\btasks:/);
+  assert.doesNotMatch(schemaSource, /\baction:/);
   assert.doesNotMatch(schemaSource, /\b(?:if|then|else):/);
   assert.match(source, /if \(params\.action === "resolve"\)/);
   assert.match(source, /if \(!target \|\| !runId\)/);

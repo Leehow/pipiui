@@ -196,6 +196,16 @@ describe("subagent lifecycle → AgentSummary", () => {
     expect(worktree.at(-1)?.status).toMatchObject({ agentId: "a1", path: "/tmp/wt", branch: "pipiui/worker-a1", lifecycle: "active" });
   });
 
+  it("carries worktreeError to the panel when writable isolation failed before spawn", async () => {
+    const { deliver, latest } = await harness();
+    // Mirrors the runtime's refuse-shared-cwd fallback: start + end both carry the
+    // reason; the panel turns it into an actionable Chinese hint.
+    const reason = "writable isolation requires a git work tree; refusing shared-cwd fallback";
+    deliver({ ...START, worktreePath: undefined, worktreeBranch: undefined, worktreeError: reason });
+    deliver({ ...END, ok: false, output: `Writable subagent isolation failed before spawn: ${reason}`, worktreeError: reason });
+    expect(latest()).toMatchObject({ state: "failed", worktreeError: reason });
+  });
+
   it("preserves the dispatching toolCallId so the transcript card can join agents", async () => {
     const { deliver, latest } = await harness();
     deliver(START);
@@ -505,5 +515,74 @@ describe("subagent lifecycle → AgentSummary", () => {
 
     await backend.handle("resolveAgent", ["a1"]);
     await expect(backend.handle("checkAgent", ["a1"])).resolves.toMatchObject({ state: "failed", handled: true });
+  });
+});
+
+describe("dead-session orphan reconcile", () => {
+  const base = Date.parse("2026-01-01T00:00:00.000Z");
+  const staleAt = new Date(base).toISOString();
+  const staleNow = base + 10 * 60 * 1000;
+
+  it("leaves a stale running worker alone while the session process is alive", async () => {
+    const { backend, deliver } = await harness();
+    deliver({ ...START, at: staleAt });
+    (backend as any).live.set("session-1", fakeLive());
+    expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(false);
+    await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+      { agentId: "a1", state: "running" },
+    ]);
+  });
+
+  it("sweeps a stale running worker to interrupted after the session process dies", async () => {
+    const { backend, deliver, events } = await harness();
+    deliver({ ...START, at: staleAt, activity: "bash sleep 999" });
+    expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(true);
+    await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+      {
+        agentId: "a1",
+        state: "interrupted",
+        endedAt: staleNow,
+        listSubtitle: "",
+        closeout: "会话进程已退出且超过 10 分钟无观察事件；按中断成果保留",
+      },
+    ]);
+    const worktree = events.filter((event): event is Extract<AgentEvent, { type: "worktree" }> => event.type === "worktree").at(-1);
+    expect(worktree?.status).toMatchObject({ agentId: "a1", lifecycle: "pendingReview", merge: "ready", discard: "ready" });
+    await expect(backend.handle("getWorktreeStatus", ["a1"])).resolves.toMatchObject({
+      lifecycle: "pendingReview",
+    });
+  });
+
+  it("does not sweep a fresh observation or a terminal row", async () => {
+    const { backend, deliver } = await harness();
+    deliver({ ...START, at: staleAt });
+    deliver({ ...START, agentId: "fresh", runId: "r-fresh", at: new Date(staleNow).toISOString(), worktreePath: undefined });
+    deliver({ ...START, agentId: "done", runId: "r-done", at: staleAt, worktreePath: undefined });
+    deliver({ kind: "end", agentId: "done", runId: "r-done", ok: true, output: "ok", at: staleAt });
+    expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(true);
+    const rows = await backend.handle("listAgents", ["session-1"]) as AgentSummary[];
+    expect(rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: "a1", state: "interrupted" }),
+      expect.objectContaining({ agentId: "fresh", state: "running" }),
+      expect.objectContaining({ agentId: "done", state: "ok" }),
+    ]));
+    expect((backend as any).reconcileOrphanedNow("session-1", staleNow + 10 * 60 * 1000)).toBe(true);
+    await expect(backend.handle("listAgents", ["session-1"])).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: "fresh", state: "interrupted" }),
+      expect.objectContaining({ agentId: "done", state: "ok" }),
+    ]));
+  });
+
+  it("is idempotent and persists so a restart does not see a running ghost", async () => {
+    const { backend, deliver } = await harness();
+    deliver({ ...START, at: staleAt });
+    expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(true);
+    expect((backend as any).reconcileOrphanedNow("session-1", staleNow + 120_000)).toBe(false);
+    await (backend as any).agentsWrite;
+    const persisted = JSON.parse(await readFile(join(root, "agent", "pipiui-agent-index.json"), "utf8"));
+    expect(persisted.agents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: "a1", state: "interrupted", endedAt: staleNow }),
+    ]));
+    expect(persisted.agents.some((agent: { state: string }) => agent.state === "running")).toBe(false);
   });
 });

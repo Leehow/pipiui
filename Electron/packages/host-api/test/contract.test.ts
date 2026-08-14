@@ -57,7 +57,11 @@ function createContractMockBackend(): HostBackend {
   const emit = (channel: string, event: any) => listeners.forEach(listener => listener({ protocolVersion: 2, channel, event }))
   const project = { id: 'project-1', name: 'PipiUI', path: '/tmp/pipiui' }
   let projectPaths = [project.path]
-  const projectFor = (path: string) => path === project.path ? project : { id: `project-${Buffer.from(path).toString('base64url')}`, name: path.split('/').filter(Boolean).at(-1) ?? path, path }
+  const projectNames = new Map<string, string>([[project.path, project.name]])
+  const projectFor = (path: string) => {
+    const id = path === project.path ? project.id : `project-${Buffer.from(path).toString('base64url')}`
+    return { id, name: projectNames.get(path) ?? path.split('/').filter(Boolean).at(-1) ?? path, path }
+  }
   let sequence = 1
   let sessions: any[] = [{ id: 'session-1', projectId: project.id, name: 'Welcome', updatedAt: 1 }]
   const history = new Map<string, any[]>([['session-1', []]])
@@ -102,6 +106,19 @@ function createContractMockBackend(): HostBackend {
           const path = projectPaths.find(item => projectFor(item).id === id)
           if (!path) throw new Error(`unknown project ${id}`)
           projectPaths = projectPaths.filter(item => item !== path)
+          return
+        }
+        case 'renameProject': {
+          const [id, name] = params as [string, string]
+          const path = projectPaths.find(item => projectFor(item).id === id)
+          if (!path) throw new Error(`unknown project ${id}`)
+          if (typeof name !== 'string' || !name.trim()) throw new Error('project name must be a non-empty string')
+          projectNames.set(path, name.trim())
+          return projectFor(path)
+        }
+        case 'revealProject': {
+          const id = params[0] as string
+          if (!projectPaths.some(item => projectFor(item).id === id)) throw new Error(`unknown project ${id}`)
           return
         }
         case 'listSessions': return sessions.filter(session => session.projectId === params[0])
@@ -245,6 +262,8 @@ function contract(name: string, factory: Factory, expectedCapabilities: Record<s
       expect((await host.listSessions(project.id)).find(item => item.id === session.id)?.name).toBe('Renamed contract')
       expect(await host.moveSession(session.id, addedProject.id)).toMatchObject({ id: session.id, projectId: addedProject.id })
       expect((await host.listSessions(addedProject.id)).map(item => item.id)).toContain(session.id)
+      expect(await host.renameProject?.(project.id, 'Renamed project')).toMatchObject({ id: project.id, name: 'Renamed project', path: project.path })
+      expect((await host.listProjects()).find(item => item.id === project.id)?.name).toBe('Renamed project')
       await host.removeProject(addedProject.id)
       expect((await host.listProjects()).map(item => item.path)).not.toContain('/tmp/contract-added')
       expect(await host.resumeSession(session.id)).toMatchObject({ id: session.id })

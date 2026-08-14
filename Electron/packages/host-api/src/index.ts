@@ -138,7 +138,13 @@ export type AgentState = "running" | "stalled" | "ok" | "failed" | "aborted" | "
 /** `cost` remains USD for compatibility; these optional fields select its display unit and USD→CNY rate. */
 export type CostUnit = "USD" | "CNY";
 /** Metadata is optional for v1 producers; v2 producers populate it on snapshots and updates. */
-export type AgentSummary = { agentId: string; runId: string; name: string; task: string; state: AgentState; stalled?: boolean; stalledIdleSec?: number; handled?: boolean; cost?: number; costUnit?: CostUnit; exchangeRate?: number; turns?: number; outputCount?: number; sessionId?: string; parentId?: string | null; /** The main-chat tool_call this agent was dispatched from (subagent tool), if any. Lets the transcript card link a tool_call to its live worker. */ toolCallId?: string; depth?: number; role?: string; createdAt?: number; updatedAt?: number; deadlineAt?: number; endedAt?: number; title?: string; model?: string; provider?: string; listSubtitle?: string; closeout?: string; contextTokens?: number; contextWindowTokens?: number; inputTokens?: number; outputTokens?: number; cacheTokens?: number; finalResult?: string };
+export type AgentSummary = { agentId: string; runId: string; name: string; task: string; state: AgentState; stalled?: boolean; stalledIdleSec?: number; handled?: boolean; cost?: number; costUnit?: CostUnit; exchangeRate?: number; turns?: number; outputCount?: number; sessionId?: string; parentId?: string | null; /** The main-chat tool_call this agent was dispatched from (subagent tool), if any. Lets the transcript card link a tool_call to its live worker. */ toolCallId?: string; depth?: number; role?: string; createdAt?: number; updatedAt?: number; deadlineAt?: number; endedAt?: number; title?: string; model?: string; provider?: string; listSubtitle?: string; closeout?: string; contextTokens?: number; contextWindowTokens?: number; inputTokens?: number; outputTokens?: number; cacheTokens?: number; finalResult?: string;
+  /**
+   * Writable isolation could not be created for this worker (e.g. the project
+   * is not a git work tree). Verbatim technical reason; the UI maps it to an
+   * actionable Chinese hint, so this stays detail, not prose.
+   */
+  worktreeError?: string };
 export type WorktreeLifecycle = "none" | "active" | "pendingReview" | "merged" | "mergedCleanupPending" | "discarded";
 export type WorktreeStatus = { agentId: string; branch?: string; path?: string; error?: string; lifecycle: WorktreeLifecycle; merge: "ready" | "merged" | "conflict" | "unavailable"; discard: "ready" | "discarded" | "unavailable" };
 export type HostCapabilities = { computerUse: boolean; revealInFinder: boolean; terminal: boolean; plan: boolean; retainedWorktreeDisposition: boolean; [capability: string]: boolean };
@@ -475,7 +481,15 @@ export interface PipiHostAPI {
    */
   gitStatus?(projectId: string): Promise<GitStatus>;
   gitCheckout?(projectId: string, branch: string): Promise<GitStatus>;
-  /** Open the project folder in the OS file manager. Older hosts omit it and the UI disables the action. */
+  /**
+   * Optional add-project-time probe of an arbitrary directory the user just
+   * picked in the native chooser. Hosts that advertise it let the UI warn
+   * about non-git folders before the first writable-worker dispatch fails
+   * mid-task; `gitInitDirectory` is the matching one-click remedy.
+   */
+  probeDirectoryGit?(path: string): Promise<GitStatus>;
+  gitInitDirectory?(path: string): Promise<GitStatus>;
+  /** Optional v2 UI convenience; older hosts simply render Finder reveal disabled. */
   revealProject?(projectId: string): Promise<void>;
   /** Optional extension; remote/non-Electron hosts advertise `capabilities().browser === false`. */
   browser?: BrowserHostAPI;
@@ -571,6 +585,8 @@ function apiFrom(
     capabilities: () => invoke("capabilities"),
     gitStatus: projectId => invoke("gitStatus", projectId),
     gitCheckout: (projectId, branch) => invoke("gitCheckout", projectId, branch),
+    probeDirectoryGit: path => invoke("probeDirectoryGit", path),
+    gitInitDirectory: path => invoke("gitInitDirectory", path),
     revealProject: projectId => invoke("revealProject", projectId),
     browser: {
       selectSession: sessionId => invoke("browserSelectSession", sessionId),

@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { useState, type ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { PipiHostAPI, TerminalEvent } from '@pipi/host-api'
+import { TerminalPanel } from './TerminalPanel'
 
 const xtermHarness = vi.hoisted(() => ({ instances: [] as any[] }))
 
@@ -50,9 +52,13 @@ afterEach(() => {
   xtermHarness.instances.length = 0
 })
 
-async function renderTerminalPanel(host: PipiHostAPI, theme: 'light' | 'dark', projectId?: string, projectPath?: string) {
-  const { TerminalPanel } = await import('./TerminalPanel')
-  return render(<TerminalPanel host={host} theme={theme} projectId={projectId} projectPath={projectPath} />)
+function renderTerminalPanel(host: PipiHostAPI, theme: 'light' | 'dark', projectId?: string, projectPath?: string) {
+  return render(<TerminalFixture host={host} theme={theme} projectId={projectId} projectPath={projectPath} />)
+}
+
+function TerminalFixture(props: ComponentProps<typeof TerminalPanel>) {
+  const [slot, setSlot] = useState<HTMLDivElement | null>(null)
+  return <div className="jsdom-header-slot" ref={el => setSlot(el)}>{slot && <TerminalPanel {...props} headerSlot={slot} />}</div>
 }
 
 function terminalHost() {
@@ -204,7 +210,7 @@ describe('TerminalPanel', () => {
 
   it('shows only the active surface and preserves independent terminal sets while switching chat sessions', async () => {
     const harness = terminalHost(); const { TerminalPanel } = await import('./TerminalPanel')
-    const view = render(<TerminalPanel host={harness.host} theme="dark" sessionId="chat-a" projectPath="/tmp/a" />)
+    const view = render(<TerminalFixture host={harness.host} theme="dark" sessionId="chat-a" projectPath="/tmp/a" />)
     await waitFor(() => expect(xtermHarness.instances).toHaveLength(1))
     fireEvent.click(screen.getByRole('button', { name: '新建终端' }))
     await waitFor(() => expect(xtermHarness.instances).toHaveLength(2))
@@ -213,7 +219,7 @@ describe('TerminalPanel', () => {
     expect(screen.getByTestId('xterm-surface-terminal-2')).toBeTruthy()
     harness.emit({ type: 'output', terminalId: 'terminal-2', data: 'chat a second tab\r\n' })
 
-    view.rerender(<TerminalPanel host={harness.host} theme="dark" sessionId="chat-b" projectPath="/tmp/b" />)
+    view.rerender(<TerminalFixture host={harness.host} theme="dark" sessionId="chat-b" projectPath="/tmp/b" />)
     await screen.findByTestId('xterm-surface-terminal-3')
     expect(screen.getAllByRole('tab')).toHaveLength(1)
     expect(screen.queryByTestId('xterm-surface-terminal-1')).toBeNull()
@@ -221,7 +227,7 @@ describe('TerminalPanel', () => {
     expect(screen.getByTestId('xterm-surface-terminal-3')).toBeTruthy()
     expect(harness.open).toHaveBeenLastCalledWith({ sessionId: 'chat-b', projectId: undefined, cwd: '/tmp/b' })
 
-    view.rerender(<TerminalPanel host={harness.host} theme="dark" sessionId="chat-a" projectPath="/tmp/a" />)
+    view.rerender(<TerminalFixture host={harness.host} theme="dark" sessionId="chat-a" projectPath="/tmp/a" />)
     await waitFor(() => expect(screen.getAllByRole('tab')).toHaveLength(2))
     expect(screen.getByRole('tab', { name: '终端 2' }).getAttribute('aria-selected')).toBe('true')
     expect(screen.getByTestId('xterm-surface-terminal-2')).toBeTruthy()
