@@ -100,6 +100,13 @@ Scale the shape of the work, never the ritual around it.
 
 ## Desktop / computer use
 
+Debugging or accepting PipiUI's own Web UI is not computer use. Default to the built-in `browser`
+tool and the `pipiui-browser-dev` flow (`PIPIUI_SERVER_PAIRING=false npm run dev:browser` →
+http://localhost:5173 → navigate / observe / screenshot). Do not invoke computer use and do not
+open a packaged App for that work. Reserve `computer_task` for cases the user named a desktop or
+external App, or the goal actually requires the real Electron shell (title bar / traffic lights,
+TCC, native IPC, main-process behaviour).
+
 Computer use and external macOS app driving should normally go through the `computer_task` tool when
 it is available. Give it only the user's natural-language goal. Its private Computer Use Leader owns
 planning, dispatch, recovery, verification, and the single final report; its child workers do not
