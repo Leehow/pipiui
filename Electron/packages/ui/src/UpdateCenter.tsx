@@ -10,6 +10,16 @@ const STATUS_LABEL: Record<UpdateCenterItem['status'], string> = {
 
 export function updateRequestPrompt(item: UpdateCenterItem): string {
   const target = item.name === 'Pi' ? 'Pi' : item.name
+  if (item.id === 'pi-hermes-memory' || item.packageName === 'pi-hermes-memory') {
+    return `请将 PipiUI 内置 pi-hermes-memory 从 ${item.currentVersion} 更新到 ${item.latestVersion}。
+
+硬门槛：
+1. 保留现有 memory-broker、自动召回、角色化记忆策略和 Hermes 复核模型设置；先检查目标 release/源码的内部 API、配置格式及数据库兼容性。
+2. 版本 pin、lockfile、运行时 manifest 与 Hermes adapter 必须一起更新；保持精确版本和 fail-soft。若不兼容，保留旧 pin 并报告证据，不做猜测性适配。
+3. 禁止用真实用户数据库测试迁移；只可使用临时副本或 fixture。
+4. 必须通过 memory-broker 测试/typecheck、角色策略回归、包版本/签名检查，并仅从主 checkout 打包 canonical Electron App；随后真实验证主 Agent 自动召回、显式 memory_query 和 subagent 召回。
+5. 不改 Swift，不 push，不 deploy。`
+  }
   return `帮我把 ${target} 从 ${item.currentVersion} 更新到 ${item.latestVersion}，并完成必要的测试和 Electron 打包验收。`
 }
 
