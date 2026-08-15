@@ -38,10 +38,16 @@
   --qp-bg: rgba(255, 255, 255, 0.13);
 }
 
-/* Popover rows: window title left, usage right, checkmark last (Swift layout). */
-.quota-menu {
-  right: 0;
+/*
+ * Portaled to document.body (see QuotaPill). Must beat `.quick-menu { left: 0 }`
+ * and escape `.chat-column { overflow: hidden }` so the tool panel cannot clip it.
+ */
+.quick-menu.quota-menu {
+  position: fixed;
   left: auto;
+  right: auto;
+  bottom: auto;
+  z-index: 40;
   min-width: 200px;
 }
 

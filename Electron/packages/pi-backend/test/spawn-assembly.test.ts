@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { assemblePiSpawn, mergedSpawnEnvironment, resolveSpawnPaths, sanitizeEnvironment, withToolPath } from "../src/spawn-assembly.js";
+import { assemblePiSpawn, mergedSpawnEnvironment, resolveSpawnPaths, sanitizeEnvironment, userExtensionMounts, withToolPath } from "../src/spawn-assembly.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
 
 describe("runtime info extension mount", () => {
@@ -60,6 +60,16 @@ describe("built-in browser search mount", () => {
     });
     expect(args).toEqual(["-e", browserSearch]);
     expect(args).not.toContain("/ext/webview.ts");
+  });
+
+  it("puts the extensions directory on NODE_PATH so pi-web-access resolves PipiUI's Glimpse shim", () => {
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      features: { browserSearch: true },
+      paths: { browserSearch },
+      bridgePort: 1234,
+    });
+    expect(env.NODE_PATH?.split(delimiter)[0]).toBe("/runtime/extensions");
   });
 });
 
@@ -352,7 +362,7 @@ describe("installed runtime tree", () => {
     root = await mkdtemp(join(tmpdir(), "pipi-bundled-managed-"));
     const runtimeRoot = join(root, "runtime");
     const nodeModules = join(root, "embedded", "node_modules");
-    for (const [name, version] of [["pi-web-access", "0.20.0"], ["pi-mcp-extension", "1.5.0"]]) {
+    for (const [name, version] of [["pi-web-access", "0.23.0"], ["pi-mcp-extension", "1.5.0"]]) {
       const packageRoot = join(nodeModules, name);
       await mkdir(join(packageRoot, "dist"), { recursive: true });
       await writeFile(join(packageRoot, "dist", "index.js"), "//\n");
@@ -362,7 +372,7 @@ describe("installed runtime tree", () => {
     expect(paths.webSearch).toBe(join(nodeModules, "pi-web-access", "dist", "index.js"));
     expect(paths.mcp).toBe(join(nodeModules, "pi-mcp-extension", "dist", "index.js"));
 
-    await writeFile(join(nodeModules, "pi-web-access", "package.json"), JSON.stringify({ version: "0.20.1", pi: { extensions: ["./dist/index.js"] } }));
+    await writeFile(join(nodeModules, "pi-web-access", "package.json"), JSON.stringify({ version: "0.23.1", pi: { extensions: ["./dist/index.js"] } }));
     expect(resolveSpawnPaths(runtimeRoot, { managedNodeModulesRoot: nodeModules }).webSearch).toBeUndefined();
   });
 });
@@ -393,6 +403,37 @@ describe("default feature set", () => {
   it("does not register the browser extension when the feature is explicitly disabled", () => {
     const { args } = assemblePiSpawn({ cwd: "/tmp/project", features: { browser: false }, paths: { webview: "/ext/browser.ts" }, bridgePort: 1234, sessionCapability: "secret" });
     expect(args).not.toContain("/ext/browser.ts");
+  });
+});
+
+describe("user-added Pi extensions", () => {
+  it("mounts package entrypoints and loose files from the isolated profile, and ignores junk", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-user-ext-"));
+    try {
+      const dir = join(root, "user-extensions");
+      const packaged = join(dir, "demo-pack");
+      await mkdir(join(packaged, "dist"), { recursive: true });
+      await writeFile(join(packaged, "dist", "index.js"), "//\n");
+      await writeFile(join(packaged, "package.json"), JSON.stringify({ name: "demo-pack", pi: { extensions: ["./dist/index.js"] } }));
+      await writeFile(join(dir, "loose.ts"), "//\n");
+      await writeFile(join(dir, "readme.md"), "no\n");
+      await mkdir(join(dir, "empty"), { recursive: true });
+      expect(userExtensionMounts(root)).toEqual([
+        join(packaged, "dist", "index.js"),
+        join(dir, "loose.ts"),
+      ]);
+      const { args } = assemblePiSpawn({ cwd: "/tmp/project", agentDir: root, paths: { updateCenter: "/runtime/update.ts", runtimeInfo: "/runtime/info.ts" } });
+      expect(args).toEqual([
+        "-e", join(packaged, "dist", "index.js"),
+        "-e", join(dir, "loose.ts"),
+        "-e", "/runtime/update.ts",
+        "-e", "/runtime/info.ts",
+      ]);
+      expect(userExtensionMounts(undefined)).toEqual([]);
+      expect(assemblePiSpawn({ cwd: "/tmp/project", paths: { updateCenter: "/runtime/update.ts", runtimeInfo: "/runtime/info.ts" } }).args).toEqual(["-e", "/runtime/update.ts", "-e", "/runtime/info.ts"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

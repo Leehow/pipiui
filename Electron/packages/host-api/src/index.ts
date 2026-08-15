@@ -151,10 +151,13 @@ export type HostCapabilities = { computerUse: boolean; revealInFinder: boolean; 
 export type ComputerUsePermissionKind = "screenRecording" | "accessibility";
 export type ComputerUseState = { enabled: boolean; screenRecording?: boolean; accessibility?: boolean };
 export type UpdateCenterItemStatus = "upToDate" | "updateAvailable" | "checkFailed" | "notCheckable";
+export type UpdateCenterItemCategory = "platform" | "runtime" | "toolchain" | "extension";
 export type UpdateCenterItem = {
   id: string;
   name: string;
   packageName?: string;
+  /** Host-discovered ownership layer. Optional for older hosts and browser fixtures. */
+  category?: UpdateCenterItemCategory;
   currentVersion: string;
   latestVersion?: string;
   status: UpdateCenterItemStatus;

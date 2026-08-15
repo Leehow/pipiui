@@ -1,12 +1,12 @@
-import { accessSync, constants, existsSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
 
-export type Feature = "philosophy"|"plan"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
+export type Feature = "philosophy"|"plan"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"glmVisionMcp"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
-export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"subagentDir"|"agentsDir", string>>;
+export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
 export type SpawnInput = { sessionPath?: string; cwd: string; runtimeRoot?: string; agentDir?: string; sessionsRoot?: string; resourceMode?: "default"|"explicit"; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; /** Optional full provider/model reference for Hermes background review. */ memoryReviewModelId?: string; subagentModelsFile?: string; /** The user's Settings → 工具开关 denylist. Merged with the Boss read-only policy; never passed to workers. */ disabledToolNames?: readonly string[] };
 export type SpawnOutput = { args: string[]; env: Record<string,string> };
@@ -63,7 +63,7 @@ export function mergedSpawnEnvironment(
   });
 }
 /** Assemble the Electron host's Pi process contract. */
-export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.resourceMode==="explicit")args.push("--no-extensions","--no-skills","--no-prompt-templates","--no-themes");if(input.agentDir)env.PI_CODING_AGENT_DIR=input.agentDir;if(input.sessionsRoot)env.PI_CODING_AGENT_SESSION_DIR=input.sessionsRoot;if(input.sessionPath)args.push("--session",input.sessionPath);if(enabled(f,"philosophy"))ext(args,p.philosophy);if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git"))ext(args,p.git);if(enabled(f,"reload"))ext(args,p.reload);if(enabled(f,"webSearch")){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){ext(args,p.skillLoader);if(p.skillLoader&&p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);args.push(...mainSessionExcludeToolArgs({bossReadOnly:enabled(f,"bossReadOnly"),disabledToolNames:input.disabledToolNames}));
+export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.resourceMode==="explicit")args.push("--no-extensions","--no-skills","--no-prompt-templates","--no-themes");if(input.agentDir)env.PI_CODING_AGENT_DIR=input.agentDir;if(input.sessionsRoot)env.PI_CODING_AGENT_SESSION_DIR=input.sessionsRoot;if(input.sessionPath)args.push("--session",input.sessionPath);if(enabled(f,"philosophy"))ext(args,p.philosophy);if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git"))ext(args,p.git);if(enabled(f,"reload"))ext(args,p.reload);if(enabled(f,"webSearch")){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){ext(args,p.skillLoader);if(p.skillLoader&&p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);if(enabled(f,"openaiServerTools"))ext(args,p.openaiServerTools);if(enabled(f,"geminiServerTools"))ext(args,p.geminiServerTools);if(enabled(f,"xaiServerTools"))ext(args,p.xaiServerTools);if(enabled(f,"glmSearchMcp"))ext(args,p.glmSearchMcp);args.push(...mainSessionExcludeToolArgs({bossReadOnly:enabled(f,"bossReadOnly"),disabledToolNames:input.disabledToolNames}));
 // `--exclude-tools` removes bash, but the shared `terminal` tool can also run a command. It is
 // gated by action instead of removed, so the Boss keeps observe/list/wait — see the extension.
 if(enabled(f,"bossReadOnly"))env.PIPIUI_BOSS_READ_ONLY="1";
@@ -81,7 +81,7 @@ if(enabled(f,"subagent")&&p.subagentDir){ext(args,p.subagentDir);env.PIPIUI_SUBA
 // exactly one finalizer ever runs against a repository.
 env.PIPIUI_WORKTREE_FINALIZER="pi";
 if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI_MAIN_MODEL=input.mainModelId;if(input.subagentModelsFile)env.PIPIUI_SUBAGENT_MODELS_FILE=input.subagentModelsFile;env.PIPIUI_COMPUTER_PROCEDURE_STORE=join(homedir(),"Library","Application Support","PipiUI","computer-agent","procedures.json")}
-if(!input.bridgePort){ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env};}
+if(!input.bridgePort){appendUserExtensions(args,input.agentDir);ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env};}
 // Genuinely bridge-dependent: the memory broker issues host-scoped capabilities, the webview
 // extension drives the host's browser surface, and an explicitly enabled plan runtime posts events.
 if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PIPIUI_MEMORY_BROKER_MODE="main";env.PIPIUI_MEMORY_PROJECT_ROOT=input.cwd;if(input.memoryReviewModelId)env.PIPIUI_MEMORY_REVIEW_MODEL=input.memoryReviewModelId;if(p.hermesMemory){env.PIPIUI_HERMES_PACKAGE_ROOT=p.hermesMemory;env.PIPIUI_HERMES_NODE_MODULES_ROOT=dirname(p.hermesMemory)}}}if(enabled(f,"browser"))ext(args,p.webview);
@@ -89,6 +89,12 @@ if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PI
 // gated so the Settings browser toggle and this search route stay separate switches.
 if(enabled(f,"browserSearch"))ext(args,p.browserSearch);
 if(enabled(f,"terminal"))ext(args,p.terminal);if(enabled(f,"plan"))ext(args,p.planRuntime);env.PIPIUI_BRIDGE_PORT=String(input.bridgePort);env.PIPIUI_SESSION_KEY=input.bridgeRoutingKey??"";
+// pi-web-access resolves optional `glimpseui` from this NODE_PATH before falling
+// back to `open`. The shim lives beside the other host extensions.
+{
+  const extensionsDir=p.browserSearch?dirname(p.browserSearch):p.webview?dirname(p.webview):undefined;
+  if(extensionsDir)env.NODE_PATH=extensionsDir;
+}
 // Canonical v1: the extension encodes `sessionCapability` envelopes and fails closed when the
 // capability is missing, so the protocol marker is only ever set together with a real credential.
 if(input.sessionCapability){env.PIPIUI_HOST_PROTOCOL="1";env.PIPIUI_SESSION_CAPABILITY=input.sessionCapability}
@@ -101,7 +107,34 @@ env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.compu
 // The update-center input transformer is a main-session policy seam, independent of the bridge.
 // runtimeInfo stays last so its read-only request observer sees the final provider payload after all
 // PipiUI rewriters. The isolated title helper passes no runtimeInfo path and remains tool-free.
-ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env}; }
+appendUserExtensions(args,input.agentDir);ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env}; }
+export const USER_EXTENSIONS_DIR="user-extensions";
+const USER_EXTENSION_FILE=/\.(?:[cm]?js|ts)$/;
+/**
+ * Extra `-e` mounts from the isolated profile. Electron starts Pi with
+ * `--no-extensions`, so `settings.json` packages never load; user-added Pi
+ * packages live in `{agentDir}/user-extensions` instead.
+ */
+export function userExtensionMounts(agentDir?:string):string[] {
+  if(!agentDir)return[];
+  const root=resolve(agentDir,USER_EXTENSIONS_DIR);
+  let entries:import("node:fs").Dirent[];
+  try{entries=readdirSync(root,{withFileTypes:true,encoding:"utf8"})}catch{return[]}
+  const mounts:string[]=[];
+  for(const entry of entries){
+    if(entry.name.startsWith(".")||entry.name==="node_modules")continue;
+    const full=resolve(root,entry.name);
+    const rel=relative(root,full);
+    if(!rel||rel.startsWith("..")||isAbsolute(rel))continue;
+    if(entry.isFile()&&USER_EXTENSION_FILE.test(entry.name)){mounts.push(full);continue}
+    if(entry.isDirectory()){
+      const entrypoint=declaredEntrypoint(full);
+      if(entrypoint)mounts.push(entrypoint);
+    }
+  }
+  return mounts.sort();
+}
+function appendUserExtensions(args:string[],agentDir?:string){for(const path of userExtensionMounts(agentDir))ext(args,path)}
 function declaredEntrypoint(root:string):string|undefined {
   try {
     const manifest=JSON.parse(readFileSync(join(root,"package.json"),"utf8"));
@@ -195,7 +228,7 @@ export type ManagedPackage={name:string;version:string};
  * let the mounted extension change between launches — and declared once so the installer and the
  * mount lookup can never drift onto different versions.
  */
-export const MANAGED_PACKAGES:readonly ManagedPackage[]=[{name:"pi-web-access",version:"0.20.0"},{name:"pi-mcp-extension",version:"1.5.0"}];
+export const MANAGED_PACKAGES:readonly ManagedPackage[]=[{name:"pi-web-access",version:"0.23.0"},{name:"pi-mcp-extension",version:"1.5.0"}];
 export const HERMES_MEMORY_PACKAGE:ManagedPackage={name:"pi-hermes-memory",version:"0.9.4"};
 const fileIfPresent=(...segments:string[]):string|undefined=>{const path=join(...segments);return existsSync(path)?path:undefined};
 const packageIfPresent=(...segments:string[]):string|undefined=>{const dir=join(...segments);return existsSync(join(dir,"package.json"))?dir:undefined};
@@ -235,6 +268,10 @@ export function resolveSpawnPaths(runtimeRoot:string=defaultRuntimeRoot(),option
     searchScope:fileIfPresent(extensions,"pipiui-search-scope.ts"),
     codexServerTools:fileIfPresent(extensions,"pipiui-codex-server-tools.ts"),
     claudeServerTools:fileIfPresent(extensions,"pipiui-claude-server-tools.ts"),
+    openaiServerTools:fileIfPresent(extensions,"pipiui-openai-server-tools.ts"),
+    geminiServerTools:fileIfPresent(extensions,"pipiui-gemini-server-tools.ts"),
+    xaiServerTools:fileIfPresent(extensions,"pipiui-xai-server-tools.ts"),
+    glmSearchMcp:fileIfPresent(extensions,"pipiui-glm-search-mcp.ts"),
     computerUse:fileIfPresent(extensions,"pipiui-computer-use.ts"),
     webview:fileIfPresent(extensions,"pipiui-electron-webview.ts"),
     browserSearch:fileIfPresent(extensions,"pipiui-browser-search.ts"),

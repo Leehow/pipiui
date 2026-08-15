@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-export type DeliveryState = "pending" | "attempting" | "failed" | "delivered";
+export type DeliveryState = "pending" | "attempting" | "failed" | "queued" | "observed" | "fulfilled";
 
 export interface DeliveryObligation {
 	version: 1;
@@ -56,6 +56,19 @@ const INVALID_CLAIM_GRACE_MS = 5_000;
 const DEFAULT_CLAIM_LEASE_MS = 2 * 60 * 1000;
 const DEFAULT_AUXILIARY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
+export function deliveryRetryDue(
+	record: Pick<DeliveryObligation, "state" | "attempts" | "lastAttemptAt">,
+	now: number,
+	minimumIntervalMs: number,
+	maxAttempts: number,
+): boolean {
+	// `queued` already exists in this live Pi process's in-memory followUp queue.
+	// Only session_start recovery may replay it; timers and lifecycle chatter retry
+	// pending/failed rows and must never duplicate a long-running queued turn.
+	if ((record.state !== "pending" && record.state !== "failed") || record.attempts >= maxAttempts) return false;
+	return record.attempts === 0 || now - record.lastAttemptAt >= minimumIntervalMs;
+}
+
 function processIsAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
@@ -72,6 +85,7 @@ function sha256(text: string): string {
 function isRecord(value: unknown): value is DeliveryObligation {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const r = value as Partial<DeliveryObligation>;
+	const persistedState = (value as { state?: unknown }).state;
 	return (
 		r.version === 1 &&
 		typeof r.id === "string" && /^[a-f0-9]{64}$/.test(r.id) &&
@@ -80,7 +94,7 @@ function isRecord(value: unknown): value is DeliveryObligation {
 		typeof r.runId === "string" && r.runId.length > 0 &&
 		typeof r.payloadHash === "string" && /^[a-f0-9]{64}$/.test(r.payloadHash) &&
 		typeof r.text === "string" &&
-		(r.state === "pending" || r.state === "attempting" || r.state === "failed" || r.state === "delivered") &&
+		(persistedState === "pending" || persistedState === "attempting" || persistedState === "failed" || persistedState === "queued" || persistedState === "observed" || persistedState === "fulfilled" || persistedState === "accepted" || persistedState === "delivered") &&
 		Number.isSafeInteger(r.attempts) && (r.attempts ?? -1) >= 0 &&
 		typeof r.createdAt === "number" && Number.isFinite(r.createdAt) &&
 		typeof r.updatedAt === "number" && Number.isFinite(r.updatedAt) &&
@@ -135,7 +149,9 @@ export class DeliveryObligationStore {
 
 	create(agentId: string, runId: string, text: string): DeliveryObligation {
 		const payloadHash = sha256(text);
-		const id = sha256(`${this.routingKeyHash}\0${agentId}\0${runId}\0${payloadHash}`);
+		// One Pi session + agent generation is one logical completion. The payload hash
+		// protects the stored text, but must not turn retry formatting into a second event.
+		const id = sha256(`${this.routingKeyHash}\0${agentId}\0${runId}`);
 		const existing = this.read(id);
 		if (existing) return existing;
 		const now = this.now();
@@ -161,7 +177,7 @@ export class DeliveryObligationStore {
 	beginAttempt(id: string): DeliveryObligation | undefined {
 		if (!this.acquireClaim(id)) return undefined;
 		const record = this.read(id);
-		if (!record || record.state === "delivered" || record.attempts >= this.maxAttempts) {
+		if (!record || record.state === "fulfilled" || record.attempts >= this.maxAttempts) {
 			this.releaseClaim(id);
 			return undefined;
 		}
@@ -183,14 +199,62 @@ export class DeliveryObligationStore {
 		return next;
 	}
 
-	finishAttempt(id: string, delivered: boolean): DeliveryObligation | undefined {
+	finishAttempt(id: string, queued: boolean): DeliveryObligation | undefined {
 		const record = this.read(id);
 		if (!record) return undefined;
 		// A stale promise from another process/extension instance must not settle our row.
 		if (record.ownerPid !== this.pid || record.ownerToken !== this.ownerToken) return record;
 		const next: DeliveryObligation = {
 			...record,
-			state: delivered ? "delivered" : "failed",
+			state: queued ? "queued" : "failed",
+			updatedAt: this.now(),
+			ownerPid: undefined,
+			ownerToken: undefined,
+		};
+		this.write(next);
+		this.releaseClaim(id);
+		return next;
+	}
+
+	/** Mark only a message independently observed in Pi's persisted session history. */
+	markObserved(id: string): DeliveryObligation | undefined {
+		const record = this.read(id);
+		if (!record) return undefined;
+		if (record.state === "fulfilled") return record;
+		const next: DeliveryObligation = {
+			...record,
+			state: "observed",
+			updatedAt: this.now(),
+			ownerPid: undefined,
+			ownerToken: undefined,
+		};
+		this.write(next);
+		this.releaseClaim(id);
+		return next;
+	}
+
+	markFulfilled(id: string): DeliveryObligation | undefined {
+		const record = this.read(id);
+		if (!record) return undefined;
+		const next: DeliveryObligation = {
+			...record,
+			state: "fulfilled",
+			updatedAt: this.now(),
+			ownerPid: undefined,
+			ownerToken: undefined,
+		};
+		this.write(next);
+		this.releaseClaim(id);
+		return next;
+	}
+
+	/** A persisted Boss assistant ended unsuccessfully; retry through normal bounded gates. */
+	markRetryable(id: string): DeliveryObligation | undefined {
+		const record = this.read(id);
+		if (!record || record.state === "fulfilled") return record;
+		const next: DeliveryObligation = {
+			...record,
+			state: "failed",
 			updatedAt: this.now(),
 			ownerPid: undefined,
 			ownerToken: undefined,
@@ -205,7 +269,7 @@ export class DeliveryObligationStore {
 		const now = this.now();
 		const result: RecoverableDelivery[] = [];
 		for (const record of this.readAll()) {
-			if (record.state === "delivered" || record.attempts >= this.maxAttempts) continue;
+			if (record.state === "fulfilled" || record.attempts >= this.maxAttempts) continue;
 			if (now - record.createdAt > this.maxAgeMs) continue;
 			if (this.attemptIsLiveRecent(record)) continue;
 			result.push({
@@ -227,6 +291,11 @@ export class DeliveryObligationStore {
 				parsed.routingKeyHash !== this.routingKeyHash ||
 				parsed.payloadHash !== sha256(parsed.text)
 			) return undefined;
+			// Older rows used `accepted`/`delivered` for a fire-and-forget call return.
+			// That was not a persistence acknowledgement, so recover them as queued.
+			if ((parsed as { state?: unknown }).state === "accepted" || (parsed as { state?: unknown }).state === "delivered") {
+				return { ...(parsed as DeliveryObligation), state: "queued" };
+			}
 			return parsed;
 		} catch {
 			return undefined;
@@ -264,8 +333,11 @@ export class DeliveryObligationStore {
 		for (const row of rows) {
 			if (this.attemptIsLiveRecent(row)) continue;
 			const expired = now - row.createdAt > this.maxAgeMs;
-			const deliveredExpired = row.state === "delivered" && now - row.updatedAt > this.deliveredRetentionMs;
-			if (expired || deliveredExpired || row.attempts >= this.maxAttempts) this.removeRow(row.id);
+			const fulfilledExpired = row.state === "fulfilled" && now - row.updatedAt > this.deliveredRetentionMs;
+			// Exhausted failures remain as bounded tombstones until age/cap pruning. Removing
+			// them immediately would let a duplicate terminal callback recreate the same run
+			// and silently reset its retry budget.
+			if (expired || fulfilledExpired) this.removeRow(row.id);
 		}
 		rows = this.readAll().sort((a, b) => b.updatedAt - a.updatedAt);
 		const keep = new Set<string>();

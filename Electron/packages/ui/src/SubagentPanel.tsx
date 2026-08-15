@@ -49,8 +49,20 @@ function stateText(agent: Agent) {
     : ({ running: '运行中', ok: '已完成', failed: '失败', aborted: '已中止', interrupted: '已中断', stalled: '卡住' }[agent.state])
 }
 
-function duration(agent: Agent, now: number) {
+function duration(agent: Pick<Agent, 'startedAt' | 'endedAt'>, now: number) {
   return `${Math.max(0, Math.round(((agent.endedAt ?? now) - agent.startedAt) / 1000))}s`
+}
+
+const RUNNING_ELAPSED_TICK_MS = 1_000
+
+function RunningElapsed({ startedAt }: { startedAt: number }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), RUNNING_ELAPSED_TICK_MS)
+    return () => window.clearInterval(timer)
+  }, [startedAt])
+  return <small className="agent-row-time">{duration({ startedAt }, now)}</small>
 }
 
 function completedAt(endedAt?: number) {
@@ -473,15 +485,16 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     localStorage.setItem(splitKey, String(ratio))
   }, [ratio])
 
+  const hasRunning = agents.some(isActive)
   useEffect(() => {
-    if (!agents.some(isActive)) return
-    // Agent events update the activity text immediately. The clock only ages
-    // relative labels and must not churn the whole accessibility tree once per
-    // second: Computer Use deliberately rejects actions when the target UI
-    // changes between observation and click.
+    if (!hasRunning) return
+    // Agent events update the activity text immediately. Age quiet/deadline
+    // labels on a coarse clock so Computer Use is not rejected by a 1Hz
+    // accessibility-tree churn. Running elapsed time ticks in RunningElapsed.
+    setNow(Date.now())
     const timer = window.setInterval(() => setNow(Date.now()), 15_000)
     return () => window.clearInterval(timer)
-  }, [agents])
+  }, [hasRunning])
 
   useEffect(() => {
     if (!selected) return
@@ -673,10 +686,12 @@ function applyAgentEvent(current: Agent[], event: AgentEvent): Agent[] {
       ? previous.logs.map(log => log.contentIndex === undefined ? log : { ...log, contentIndex: undefined })
       : previous.logs
     : []
+  const startedCandidates = [incoming.createdAt, newRun ? undefined : previous?.startedAt]
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
   const next: Agent = {
     ...previous,
     ...incoming,
-    startedAt: incoming.createdAt ?? previous?.startedAt ?? Date.now(),
+    startedAt: startedCandidates.length ? Math.min(...startedCandidates) : Date.now(),
     endedAt: active ? undefined : incoming.endedAt ?? previous?.endedAt ?? Date.now(),
     logs,
   }
@@ -777,9 +792,9 @@ function AgentRow({ agent, childCount, activeChildCount, selected, aborting, now
 		  {childCount > 0 && <em className="agent-leader-badge">主管 · {childCount} 个子 agent</em>}
           {stalled && <em className="stalled-badge">{agent.stalledIdleSec ? `卡住 ${agent.stalledIdleSec}s` : '卡住'}</em>}
           {worktree && <em className={`worktree-badge ${worktree.lifecycle}`}>{worktree.text}</em>}
+          {active && <RunningElapsed startedAt={agent.startedAt} />}
         </span>
         <small>{subtitle}</small>
-        {active && <small className="agent-row-time">· {duration(agent, now)}</small>}
         {!active && agent.endedAt && <small className="agent-row-time">{completedAt(agent.endedAt)} · {duration(agent, now)}</small>}
 		{live && <small className={`agent-live-state ${live.severity}`}>{live.text}</small>}
       </span>

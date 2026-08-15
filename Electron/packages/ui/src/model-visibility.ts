@@ -47,6 +47,13 @@ export interface ProviderModelGroup {
   models: Model[]
 }
 
+/** GLM 家族：主线虽非多模态，但会话走内置视觉 MCP，不经过通用识图模型。 */
+const GLM_VISION_MCP_PROVIDERS = new Set(['zai-coding-cn', 'zai', 'glm'])
+
+export function usesBuiltInVisionMcp(provider: string): boolean {
+  return GLM_VISION_MCP_PROVIDERS.has(provider.trim().toLowerCase())
+}
+
 /** Group by provider preserving first-appearance order. */
 export function groupByProvider(models: Model[]): ProviderModelGroup[] {
   const byProvider = new Map<string, Model[]>()

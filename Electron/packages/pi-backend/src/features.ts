@@ -7,7 +7,12 @@ import type { SpawnFeatures } from "./spawn-assembly.js";
  *   BrowserTabsHost; it does not create a second browser surface.
  * - `browserSearch` adds browser_search/browser_fetch on the same bridge: web research routed
  *   through the app's own browser panel instead of direct HTTP (JS rendering, session login
- *   state). It complements pi-web-access's `web_search`, never replaces it.
+ *   state). It complements pi-web-access's `web_search`, never replaces it. It also intercepts
+ *   that plugin's curator `open`/Glimpse so the review page lands in the same panel.
+ * - Isolated `webSearch` defaults to Exa MCP keyless with `workflow: "none"` (search and
+ *   return). A 429/`quota` error falls through `searchRouting` to SearXNG → OpenAI →
+ *   Firecrawl → the rest of the auto chain. TUN/fake-IP proxies get
+ *   `ssrf.allowRanges: ["198.18.0.0/15"]` so `mcp.exa.ai` is reachable.
  * - `computerUse` is exported only when Electron supplies a usable desktop harness.
  * - `plan`: philosophy remains available, but the Plan runtime stays off until Electron owns a
  *   revisioned store and bridge acknowledgement.
@@ -20,4 +25,4 @@ import type { SpawnFeatures } from "./spawn-assembly.js";
  *
  * Everything else is verified to load: pi boots with all 13 mounts and a clean stderr.
  */
-export const DEFAULT_FEATURES:SpawnFeatures=Object.freeze({philosophy:true,plan:false,subagent:true,memoryBroker:true,git:true,generateImage:true,reload:true,webSearch:true,browserSearch:true,arxivFetch:true,mcp:true,skillLoader:true,searchScope:false,codexServerTools:true,claudeServerTools:true,browser:true,terminal:true,computerUse:true,bossReadOnly:true});
+export const DEFAULT_FEATURES:SpawnFeatures=Object.freeze({philosophy:true,plan:false,subagent:true,memoryBroker:true,git:true,generateImage:true,reload:true,webSearch:true,browserSearch:true,arxivFetch:true,mcp:true,skillLoader:true,searchScope:false,codexServerTools:true,claudeServerTools:true,openaiServerTools:true,geminiServerTools:true,xaiServerTools:true,glmSearchMcp:true,glmVisionMcp:true,browser:true,terminal:true,computerUse:true,bossReadOnly:true});

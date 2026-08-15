@@ -95,6 +95,29 @@ describe('BrowserTabsHost', () => {
     expect(contents.loadURL).toHaveBeenCalled()
   })
 
+  it('recreates the native view when webContents disappears between navigations', async () => {
+    const views: Array<BrowserViewLike & { webContents?: FakeWebContents }> = []
+    const createView = vi.fn(() => {
+      const contents = new FakeWebContents()
+      const view: BrowserViewLike & { webContents?: FakeWebContents } = {
+        webContents: contents,
+        setBounds: vi.fn(),
+        setVisible: vi.fn()
+      }
+      views.push(view)
+      return view
+    })
+    const host = new BrowserTabsHost(createView)
+    host.attachToWindow(vi.fn())
+    await host.setViewBounds({ x: 10, y: 20, width: 300, height: 400, visible: true })
+    await host.loadURL('one.example')
+    expect(createView).toHaveBeenCalledTimes(1)
+    views[0].webContents = undefined
+    await expect(host.loadURL('two.example')).resolves.toMatchObject({ url: 'https://two.example' })
+    expect(createView).toHaveBeenCalledTimes(2)
+    expect((await host.getActiveTab())?.url).toBe('https://two.example')
+  })
+
   it('keeps at least one fresh tab and routes browser commands/events through the host bridge', async () => {
     const { createView, attach } = browserHarness()
     const host = new BrowserSessionHost(createView)

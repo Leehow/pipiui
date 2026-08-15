@@ -29,6 +29,14 @@ node_modules/
 Electron/**/dist/
 Electron/**/out/
 
+# file-viewer vite-plugin copies (regenerated on build; manifest has machine paths)
+Electron/**/public/file-viewer/
+Electron/apps/electron/src/renderer/public/file-viewer/
+
+# Local live-acceptance shots
+tmp-screenshots/
+/pipiui-*-acceptance*.png
+
 # Local Electron checkout runtime (models/settings and live session JSONL)
 Electron/agent/
 Electron/sessions/

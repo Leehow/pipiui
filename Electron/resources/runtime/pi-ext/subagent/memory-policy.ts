@@ -1,6 +1,6 @@
 export const SUBAGENT_MEMORY_AGENT_NAMES = [
-	"explore", "plan", "general-purpose", "reviewer", "computer-use-leader",
-	"operator", "computer-verifier", "computer-terminal", "secretary", "long-test",
+	"explore", "general-purpose", "reviewer", "computer-use-leader",
+	"operator", "computer-verifier", "computer-terminal", "secretary",
 ] as const;
 
 export type SubagentMemoryAgentName = typeof SUBAGENT_MEMORY_AGENT_NAMES[number];
@@ -22,7 +22,6 @@ const PROJECT = ["project"] as const;
 const SEMANTIC_PROCEDURAL = ["semantic", "procedural"] as const;
 const POLICIES: Record<SubagentMemoryAgentName, SubagentMemoryPolicy> = {
 	explore: { recall: { maximumItems: 3, maximumCharacters: 1_000, allowedKinds: ["semantic", "episodic", "procedural"], allowedScopes: PROJECT }, write: "source-backed" },
-	plan: { recall: { maximumItems: 3, maximumCharacters: 1_000, allowedKinds: ["semantic", "procedural"], allowedScopes: PROJECT }, write: "source-backed" },
 	"general-purpose": { recall: { maximumItems: 2, maximumCharacters: 800, allowedKinds: SEMANTIC_PROCEDURAL, allowedScopes: PROJECT }, write: "verification-passed" },
 	reviewer: { recall: { maximumItems: 1, maximumCharacters: 600, allowedKinds: SEMANTIC_PROCEDURAL, allowedScopes: PROJECT }, write: "source-backed" },
 	"computer-use-leader": { recall: { maximumItems: 2, maximumCharacters: 700, allowedKinds: SEMANTIC_PROCEDURAL, allowedScopes: PROJECT }, write: "never" },
@@ -30,7 +29,6 @@ const POLICIES: Record<SubagentMemoryAgentName, SubagentMemoryPolicy> = {
 	"computer-verifier": { recall: { maximumItems: 2, maximumCharacters: 700, allowedKinds: SEMANTIC_PROCEDURAL, allowedScopes: PROJECT }, write: "never" },
 	"computer-terminal": { recall: { maximumItems: 1, maximumCharacters: 450, allowedKinds: ["procedural", "semantic"], allowedScopes: PROJECT }, write: "never" },
 	secretary: { recall: { maximumItems: 1, maximumCharacters: 400, allowedKinds: ["procedural", "semantic"], allowedScopes: PROJECT }, write: "never" },
-	"long-test": { recall: { maximumItems: 2, maximumCharacters: 700, allowedKinds: ["procedural", "episodic", "semantic"], allowedScopes: PROJECT }, write: "verification-passed" },
 };
 
 const SOURCE_EVIDENCE_RE = /(?:https?:\/\/[^\s]+|(?:^|\s)(?:[\w.-]+\/)*[\w.-]+\.[A-Za-z0-9]+:\d+(?::\d+)?)/u;

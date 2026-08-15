@@ -154,7 +154,6 @@ describe("explicit sidebar project persistence", () => {
 	  expect.objectContaining({ name: "computer-use-leader" }),
       expect.objectContaining({ name: "operator" }),
 	  expect.objectContaining({ name: "computer-verifier" }),
-      expect.objectContaining({ name: "long-test" }),
     ]));
     const fresh = backend(fixture.agent, fixture.sessions);
     expect(await fresh.handle("getComputerUseState", [])).toEqual({ enabled: true });

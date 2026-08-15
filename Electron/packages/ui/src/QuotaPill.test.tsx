@@ -105,16 +105,39 @@ describe('QuotaPill', () => {
 
   it('closes the popover on outside click or re-clicking the pill', async () => {
     const { host } = quotaHost(codexSnapshot)
-    const { container } = render(<QuotaPill host={host} provider="openai-codex" />)
+    render(<QuotaPill host={host} provider="openai-codex" />)
     const pill = await screen.findByTestId('quota-pill')
     fireEvent.click(pill)
     await screen.findByTestId('quota-menu')
-    fireEvent.mouseDown(container.querySelector('.quick-menu-backdrop')!)
+    fireEvent.mouseDown(screen.getByTestId('quota-menu-backdrop'))
     expect(screen.queryByTestId('quota-menu')).toBeNull()
     fireEvent.click(pill)
     await screen.findByTestId('quota-menu')
     fireEvent.click(pill)
     expect(screen.queryByTestId('quota-menu')).toBeNull()
+  })
+
+  it('portals the quota menu to document.body so overflow:hidden ancestors cannot clip it', async () => {
+    const { host } = quotaHost(codexSnapshot)
+    const { container } = render(
+      <div data-testid="clip-parent" style={{ overflow: 'hidden', width: 48 }}>
+        <QuotaPill host={host} provider="openai-codex" />
+      </div>
+    )
+    const pill = await screen.findByTestId('quota-pill')
+    vi.spyOn(pill, 'getBoundingClientRect').mockReturnValue({
+      x: 640, y: 720, top: 720, right: 700, bottom: 744, left: 640, width: 60, height: 24, toJSON: () => ({})
+    } as DOMRect)
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1200 })
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 })
+    fireEvent.click(pill)
+    const menu = await screen.findByTestId('quota-menu')
+    expect(screen.getByTestId('clip-parent').contains(menu)).toBe(false)
+    expect(container.contains(menu)).toBe(false)
+    expect(document.body.contains(menu)).toBe(true)
+    expect(menu.style.position).toBe('fixed')
+    expect(menu.style.right).toBe('500px')
+    expect(menu.style.bottom).toBe('88px')
   })
 
   it('renders nothing when the host has no getQuotaSnapshot (older host)', async () => {

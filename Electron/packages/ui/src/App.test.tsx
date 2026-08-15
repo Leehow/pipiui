@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AgentEvent, AgentSummary, Model, ModelState, PipiHostAPI, Project, PromptAttachment, QueuedMessage, Session, SidebarSessionPreferences, StreamEvent } from '@pipi/host-api'
+import type { AgentEvent, AgentSummary, HistoryEntry, Model, ModelState, PipiHostAPI, Project, PromptAttachment, QueuedMessage, Session, SidebarSessionPreferences, StreamEvent } from '@pipi/host-api'
 import { visionHostMethods } from './useVisionRouting'
 
 const xtermHarness = vi.hoisted(() => ({ instances: [] as any[] }))
@@ -71,7 +71,7 @@ vi.mock('@xterm/xterm', () => {
 
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit = vi.fn(); dispose = vi.fn() } }))
 
-import { App, createMockHost, mergeAgentSnapshot, mergeAgentSummary, sidebarPreferencesKey, sidebarModelForSession, sidebarStatusForSession, normalizeArchiveTimestamps, expiredArchivedSessionIds, ARCHIVE_RETENTION_MS, DEMO_MODEL_STORAGE_KEY, DEMO_SESSION_MODELS_STORAGE_KEY } from './App'
+import { App, createMockHost, mergeAgentSnapshot, mergeAgentSummary, mergeSessionSnapshot, sidebarPreferencesKey, sidebarModelForSession, sidebarStatusForSession, normalizeArchiveTimestamps, expiredArchivedSessionIds, ARCHIVE_RETENTION_MS, DEMO_MODEL_STORAGE_KEY, DEMO_SESSION_MODELS_STORAGE_KEY } from './App'
 
 describe('PipiUI Electron main layout', () => {
   it('keeps archive timestamps stable, grants legacy archives a fresh window, and expires at 24 hours', () => {
@@ -284,6 +284,261 @@ describe('PipiUI Electron main layout', () => {
 
     act(() => listener?.({ type: 'session_title', sessionId: 'welcome', title: 'Electron 会话创建修复', source: 'model' }))
     expect(container.querySelector('[data-session-id="welcome"]')?.textContent).toContain('Electron 会话创建修复')
+  })
+
+  it('recovers a missed model title from the next authoritative session snapshot', async () => {
+    const base = createMockHost()
+    const project: Project = { id: 'titles', name: 'Titles', path: '/tmp/titles' }
+    let calls = 0
+    const listSessions = vi.fn(async () => {
+      calls += 1
+      return [{
+        id: 'title-session',
+        projectId: project.id,
+        name: calls === 1 ? '[[PIPIUI_UPDATE_EVALUATI]' : 'pi-web-access update intent',
+        // The model refinement can land in the same millisecond. With no local
+        // title mutation after this request began, the snapshot is authoritative.
+        updatedAt: 1,
+      }]
+    })
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: async () => [project],
+      listSessions,
+      getSessionHistory: async () => [],
+      // No session_title is emitted: this is the missed-event path.
+      subscribeStream: () => () => undefined,
+    }
+
+    const { container } = render(<App host={host} />)
+    await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(container.querySelector('[data-session-id="title-session"]')?.textContent).toContain('pi-web-access update intent'))
+    expect(document.title).toBe('pi-web-access update intent')
+  })
+
+  it('rejects an equal-time list response when a streamed title changed after the request began', async () => {
+    const base = createMockHost()
+    const project: Project = { id: 'title-race', name: 'Title race', path: '/tmp/title-race' }
+    const provisional: Session = { id: 'title-race-session', projectId: project.id, name: 'Provisional title', updatedAt: 20 }
+    let resolveSecond!: (sessions: Session[]) => void
+    const secondResponse = new Promise<Session[]>(resolve => { resolveSecond = resolve })
+    let listCalls = 0
+    let listener: ((event: StreamEvent) => void) | undefined
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: async () => [project],
+      listSessions: async () => (++listCalls === 1 ? [provisional] : secondResponse),
+      getSessionHistory: async () => [],
+      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
+    }
+    const { container } = render(<App host={host} />)
+    await waitFor(() => expect(listCalls).toBe(2))
+    await waitFor(() => expect(listener).toBeDefined())
+
+    const now = vi.spyOn(Date, 'now').mockReturnValue(20)
+    act(() => listener?.({ type: 'session_title', sessionId: provisional.id, title: 'Streamed model title', source: 'model' }))
+    now.mockRestore()
+    await act(async () => {
+      resolveSecond([provisional])
+      await secondResponse
+    })
+
+    expect(container.querySelector(`[data-session-id="${provisional.id}"]`)?.textContent).toContain('Streamed model title')
+  })
+
+  it('does not let older or equal-time list responses overwrite model/manual titles', () => {
+    const current: Session[] = [
+      { id: 'model', projectId: 'p', name: 'Model refined title', updatedAt: 20 },
+      { id: 'manual', projectId: 'p', name: 'Manual title', updatedAt: 20 },
+    ]
+    const stale: Session[] = [
+      { id: 'model', projectId: 'p', name: 'Provisional title', updatedAt: 10 },
+      { id: 'manual', projectId: 'p', name: 'Old model title', updatedAt: 20 },
+    ]
+    expect(mergeSessionSnapshot(current, stale)).toEqual(current)
+    expect(mergeSessionSnapshot(current, stale.slice(0, 1)).map(session => session.id)).toEqual(['model'])
+
+    const equalAuthoritative: Session[] = [
+      { id: 'model', projectId: 'p', name: 'Missed model refinement', updatedAt: 20 },
+      { id: 'manual', projectId: 'p', name: 'Confirmed manual title', updatedAt: 20 },
+    ]
+    const requestRevisions = new Map([['model', 1], ['manual', 2]])
+    expect(mergeSessionSnapshot(current, equalAuthoritative, {
+      titleRevisionsAtRequest: requestRevisions,
+      currentTitleRevisions: new Map(requestRevisions),
+    })).toEqual(equalAuthoritative)
+    expect(mergeSessionSnapshot(current, equalAuthoritative, {
+      titleRevisionsAtRequest: requestRevisions,
+      currentTitleRevisions: new Map([['model', 2], ['manual', 3]]),
+    })).toEqual(current)
+  })
+
+  it('retries when terminal arrives before the final Boss row reaches JSONL', async () => {
+    const base = createMockHost()
+    let listener: ((event: StreamEvent) => void) | undefined
+    const stale: HistoryEntry[] = [
+      { id: 'missed-user', role: 'user', content: '等待两个 subagent 后汇总', timestamp: 1 },
+    ]
+    const final: HistoryEntry[] = [
+      ...stale,
+      { id: 'missed-boss', role: 'assistant', content: '两路调研均已完成，以下是最终汇总。', timestamp: 1 },
+    ]
+    let welcomeReads = 0
+    const getSessionHistory = vi.fn(async (sessionId: string) => {
+      if (sessionId !== 'welcome') return []
+      welcomeReads += 1
+      return welcomeReads < 3 ? stale : final
+    })
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory,
+      subscribeStream: (sessionId, callback) => {
+        if (sessionId === 'welcome') listener = callback
+        return () => { if (listener === callback) listener = undefined }
+      },
+    }
+    render(<App host={host} />)
+    expect(await screen.findByText('等待两个 subagent 后汇总')).toBeTruthy()
+    expect(screen.queryByText('两路调研均已完成')).toBeNull()
+
+    act(() => listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }))
+
+    expect(await screen.findByText('两路调研均已完成，以下是最终汇总。')).toBeTruthy()
+    expect(welcomeReads).toBe(3)
+  })
+
+  it('replaces an equal-time live placeholder with a plain persisted assistant', async () => {
+    const base = createMockHost()
+    let listener: ((event: StreamEvent) => void) | undefined
+    let reads = 0
+    const history: HistoryEntry[] = [
+      { id: 'u-equal', role: 'user', content: 'go', timestamp: 5 },
+      { id: 'a-equal', role: 'assistant', content: 'persisted plain answer', timestamp: 5 },
+    ]
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async sessionId => {
+        if (sessionId !== 'welcome') return []
+        reads += 1
+        return reads === 1 ? history.slice(0, 1) : history
+      },
+      subscribeStream: (sessionId, callback) => {
+        if (sessionId === 'welcome') listener = callback
+        return () => { if (listener === callback) listener = undefined }
+      },
+    }
+    render(<App host={host} />)
+    expect(await screen.findByText('go')).toBeTruthy()
+    act(() => {
+      listener?.({ type: 'status', sessionId: 'welcome', status: 'started' })
+      listener?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: 'live placeholder' })
+      listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' })
+    })
+    expect(await screen.findByText('persisted plain answer')).toBeTruthy()
+    expect(screen.queryByText('live placeholder')).toBeNull()
+  })
+
+  it('does not let an in-flight history response overwrite a local optimistic user row', async () => {
+    const base = createMockHost()
+    let resolveHistory!: (entries: HistoryEntry[]) => void
+    const pendingHistory = new Promise<HistoryEntry[]>(resolve => { resolveHistory = resolve })
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: sessionId => sessionId === 'welcome' ? pendingHistory : base.getSessionHistory(sessionId),
+      sendPrompt: vi.fn(async () => undefined),
+    }
+    render(<App host={host} />)
+    const composer = await screen.findByLabelText('消息输入框')
+    fireEvent.change(composer, { target: { value: 'local optimistic row' } })
+    await waitFor(() => expect((screen.getByLabelText('发送消息') as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    expect(await screen.findByText('local optimistic row')).toBeTruthy()
+
+    await act(async () => {
+      resolveHistory([{ id: 'older-durable', role: 'user', content: 'older durable row', timestamp: 1 }])
+      await pendingHistory
+    })
+
+    expect(screen.getByText('local optimistic row')).toBeTruthy()
+    expect(screen.queryByText('older durable row')).toBeNull()
+  })
+
+  it('coalesces rapid terminal events into one immediate and one delayed read', async () => {
+    const base = createMockHost()
+    let listener: ((event: StreamEvent) => void) | undefined
+    let welcomeReads = 0
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async sessionId => {
+        if (sessionId === 'welcome') welcomeReads += 1
+        return base.getSessionHistory(sessionId)
+      },
+      subscribeStream: (sessionId, callback) => {
+        if (sessionId === 'welcome') listener = callback
+        return () => { if (listener === callback) listener = undefined }
+      },
+    }
+    render(<App host={host} />)
+    await screen.findByText('请实现 Electron 三栏主界面。')
+    act(() => {
+      listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' })
+      listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' })
+    })
+    await waitFor(() => expect(welcomeReads).toBe(3), { timeout: 1_000 })
+    await new Promise(resolve => window.setTimeout(resolve, 100))
+    expect(welcomeReads).toBe(3)
+  })
+
+  it('cancels a terminal delayed refresh when the selected session changes', async () => {
+    const base = createMockHost()
+    let listener: ((event: StreamEvent) => void) | undefined
+    let layoutReads = 0
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async sessionId => {
+        if (sessionId === 'layout') layoutReads += 1
+        return base.getSessionHistory(sessionId)
+      },
+      subscribeStream: (sessionId, callback) => {
+        if (sessionId === 'welcome') listener = callback
+        return () => { if (listener === callback) listener = undefined }
+      },
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findByText('请实现 Electron 三栏主界面。')
+    act(() => listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }))
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await screen.findByText('左栏宽度要能持久化。')
+    await new Promise(resolve => window.setTimeout(resolve, 350))
+    expect(layoutReads).toBe(1)
+  })
+
+  it('cancels a terminal delayed refresh when the host reconnects', async () => {
+    const firstBase = createMockHost()
+    let listener: ((event: StreamEvent) => void) | undefined
+    const firstHost: PipiHostAPI = {
+      ...firstBase,
+      subscribeStream: (sessionId, callback) => {
+        if (sessionId === 'welcome') listener = callback
+        return () => { if (listener === callback) listener = undefined }
+      },
+    }
+    const secondBase = createMockHost()
+    let secondWelcomeReads = 0
+    const secondHost: PipiHostAPI = {
+      ...secondBase,
+      getSessionHistory: async sessionId => {
+        if (sessionId === 'welcome') secondWelcomeReads += 1
+        return secondBase.getSessionHistory(sessionId)
+      },
+    }
+    const view = render(<App host={firstHost} />)
+    await screen.findByText('请实现 Electron 三栏主界面。')
+    act(() => listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }))
+    view.rerender(<App host={secondHost} />)
+    await waitFor(() => expect(secondWelcomeReads).toBe(1))
+    await new Promise(resolve => window.setTimeout(resolve, 350))
+    expect(secondWelcomeReads).toBe(1)
   })
 
   it('renames the selected session from both the sidebar editor and a header double-click', async () => {
@@ -1707,7 +1962,7 @@ async function reopenModelModal(composer: HTMLTextAreaElement) {
 }
 
 describe('session switch transcript cache', () => {
-  it('keeps a visited session transcript on screen when switching away and back', async () => {
+  it('keeps a visited session transcript visible while revalidating it on return', async () => {
     const base = createMockHost()
     let welcomeLoads = 0
     const host: PipiHostAPI = {
@@ -1735,7 +1990,7 @@ describe('session switch transcript cache', () => {
     fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
     expect(welcomeTranscript?.hidden).toBe(false)
     expect(layoutTranscript?.hidden).toBe(true)
-    expect(welcomeLoads).toBe(1)
+    expect(welcomeLoads).toBe(2)
   })
 
   it('does not refetch history when opening a new empty session', async () => {
@@ -1901,6 +2156,35 @@ describe('composer slash commands and model management', () => {
     expect(screen.queryByTestId('model-row-anthropic-claude-sonnet-4')).toBeNull()
     fireEvent.click(screen.getByLabelText('展开 anthropic'))
     expect(await screen.findByTestId('model-row-anthropic-claude-sonnet-4')).toBeTruthy()
+  })
+
+  it('expands and collapses a provider when clicking the name, not only the chevron', async () => {
+    await openModelModal(createMockHost())
+    const provider = await screen.findByTestId('model-provider-anthropic')
+    expect(provider.querySelectorAll('.model-row').length).toBe(0)
+    fireEvent.click(provider.querySelector('.model-provider-name')!)
+    expect(provider.querySelectorAll('.model-row').length).toBe(2)
+    expect(screen.getByLabelText('折叠 anthropic').getAttribute('aria-expanded')).toBe('true')
+    fireEvent.click(provider.querySelector('.model-provider-name')!)
+    expect(screen.queryByTestId('model-row-anthropic-claude-sonnet-4')).toBeNull()
+    expect(screen.getByLabelText('展开 anthropic').getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('highlights the full provider row on hover instead of only the middle toggle', async () => {
+    await openModelModal(createMockHost())
+    await screen.findByTestId('model-provider-anthropic')
+    const css = readAppCss()
+    expect(css).toMatch(/\.model-provider-header:hover\{[^}]*background:var\(--surface-hover\)/)
+    expect(css).not.toMatch(/\.model-provider-toggle:hover\{background:var\(--surface-hover\)/)
+  })
+
+  it('does not expand a provider when clicking its checkbox or delete control', async () => {
+    await openModelModal(createMockHost())
+    fireEvent.click(screen.getByLabelText('anthropic 全部勾选'))
+    expect(screen.queryByTestId('model-row-anthropic-claude-sonnet-4')).toBeNull()
+    fireEvent.click(screen.getByTestId('delete-provider-anthropic'))
+    expect(screen.queryByTestId('model-row-anthropic-claude-sonnet-4')).toBeNull()
+    expect(await screen.findByTestId('delete-confirm-anthropic')).toBeTruthy()
   })
 
   it('refreshes the catalog from the header refresh button', async () => {
@@ -2462,6 +2746,25 @@ describe('composer image attachments', () => {
   })
 })
 
+describe('extensions settings tab', () => {
+  it('opens the MCP / 扩展 tab and copies an add prompt for the main session', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    await openModelModal(createMockHost())
+    fireEvent.click(screen.getByTestId('model-tab-extensions'))
+    expect(await screen.findByTestId('extensions-pane')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'MCP / 扩展' })).toBeTruthy()
+    expect(screen.getByTestId('extensions-item-pi-mcp').textContent).toContain('pi-mcp-extension')
+    fireEvent.click(screen.getByTestId('extensions-add-button'))
+    expect(await screen.findByTestId('extensions-add-dialog')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('extensions-copy-btn-mcp'))
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('请把【厂商或服务名】的【MCP 名称】加到 PipiUI。链接：'))
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByTestId('extensions-add-dialog')).toBeNull())
+    expect(screen.getByTestId('model-modal')).toBeTruthy()
+  })
+})
+
 describe('update center settings flow', () => {
   it('closes settings and sends exactly one update request through the selected main session', async () => {
     const host = createMockHost()
@@ -2476,6 +2779,26 @@ describe('update center settings flow', () => {
     await waitFor(() => expect(sendPrompt).toHaveBeenCalledTimes(1))
     expect(sendPrompt).toHaveBeenCalledWith('welcome', expect.stringMatching(/^\[\[PIPIUI_UPDATE_EVALUATION_INTENT\]\]\{"version":1,"id":"pi","name":"Pi","packageName":"@earendil-works\/pi-coding-agent","currentVersion":"0\.84\.0","latestVersion":"0\.84\.2"\}$/))
     expect((composer as HTMLTextAreaElement).value).toBe('')
+  })
+
+  it('prefetches updates at startup and only refetches when the user clicks refresh', async () => {
+    const host = createMockHost()
+    const check = vi.spyOn(host, 'checkForUpdates')
+    await renderChat(host)
+    await waitFor(() => expect(check).toHaveBeenCalledTimes(1))
+    const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    fireEvent.change(composer, { target: { value: '/model' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await screen.findByTestId('model-modal')
+    fireEvent.click(screen.getByTestId('model-tab-updates'))
+    expect(await screen.findByTestId('update-center')).toBeTruthy()
+    expect(check).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByTestId('model-tab-models'))
+    fireEvent.click(screen.getByTestId('model-tab-updates'))
+    expect(await screen.findByTestId('update-item-pi')).toBeTruthy()
+    expect(check).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByRole('button', { name: '⟳ 刷新' }))
+    await waitFor(() => expect(check).toHaveBeenCalledTimes(2))
   })
 })
 
@@ -2598,6 +2921,48 @@ describe('vision routing (通用 tab)', () => {
     expect(await screen.findByText(/当前模型 DeepSeek V3 不支持图片附件/)).toBeTruthy()
     expect(sendPrompt).not.toHaveBeenCalled()
     expect(screen.getByTestId('composer-thumb-0')).toBeTruthy()
+  })
+
+  it('lists checked non-multimodal models in a collapsible fold under the vision picker', async () => {
+    const host = createMockHost()
+    await host.setHiddenModelIds(['moonshot/moonshot-v8-32k'])
+    await openModelModal(host)
+    fireEvent.click(screen.getByTestId('model-tab-general'))
+    await screen.findByTestId('vision-picker')
+    const fold = await screen.findByTestId('non-multimodal-fold')
+    expect(fold.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByTestId('non-multimodal-list')).toBeNull()
+    expect(fold.textContent).toMatch(/非多模态/)
+    fireEvent.click(fold)
+    const list = await screen.findByTestId('non-multimodal-list')
+    expect(fold.getAttribute('aria-expanded')).toBe('true')
+    expect(list.textContent).toContain('deepseek')
+    expect(list.textContent).toContain('DeepSeek V3')
+    expect(list.textContent).toContain('openai')
+    expect(list.textContent).toContain('OpenAI Codex')
+    expect(list.textContent).not.toContain('moonshot')
+    expect(list.textContent).not.toContain('Moonshot')
+    expect(list.textContent).not.toContain('Claude Sonnet')
+    expect(list.textContent).not.toContain('Grok 4')
+  })
+
+  it('marks checked GLM text models as using built-in vision MCP instead of the vision picker', async () => {
+    const host = createMockHost()
+    const catalog = await host.listModels()
+    host.listModels = vi.fn(async () => [
+      ...catalog,
+      { provider: 'zai-coding-cn', id: 'glm-4.6', name: 'GLM-4.6', reasoning: true, supportsImages: false },
+    ])
+    await openModelModal(host)
+    fireEvent.click(screen.getByTestId('model-tab-general'))
+    await screen.findByTestId('vision-picker')
+    fireEvent.click(await screen.findByTestId('non-multimodal-fold'))
+    const list = await screen.findByTestId('non-multimodal-list')
+    expect(list.textContent).toContain('GLM-4.6')
+    expect(list.textContent).toContain('zai-coding-cn')
+    expect(screen.getByTestId('vision-mcp-badge-zai-coding-cn-glm-4.6').textContent).toMatch(/内置识图 MCP/)
+    expect(screen.queryByTestId('vision-mcp-badge-deepseek-deepseek-v3')).toBeNull()
+    expect(screen.queryByTestId('vision-mcp-badge-openai-openai-codex')).toBeNull()
   })
 })
 

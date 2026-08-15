@@ -78,6 +78,8 @@ import {
   provisionalSessionTitle,
 } from "./session-title.js";
 import { describeImages } from "./vision-describe.js";
+import { ensureWebSearchDefaults } from "./web-search-defaults.js";
+import { describeImagesViaGlmMcp, isGlmProvider } from "./glm-vision-mcp.js";
 export {
   ProactiveCompactionPolicy,
   ProactiveCompactionScheduler,
@@ -269,15 +271,13 @@ type Rpc = Record<string, any>;
 /** Swift `AgentCatalog.builtInAgents` parity for the Electron settings surface. */
 const BUILT_IN_AGENT_DEFINITIONS: AgentDefinition[] = [
   { name: "explore", description: "Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files." },
-  { name: "plan", description: "Grok-style planning agent. Explores and produces an implementation plan; does not edit files." },
-  { name: "general-purpose", description: "Grok-style full-capability worker. Implements tasks in an isolated context." },
+  { name: "general-purpose", description: "Grok-style full-capability worker. Uses an isolated worktree by default; runs directly only when the Boss supplies an explicit reason." },
   { name: "reviewer", description: "Read-only code review specialist for quality and security." },
   { name: "computer-use-leader", description: "Computer Use supervisor. Plans desktop work, receives every private worker result, owns recovery decisions, and returns the single final report." },
   { name: "operator", description: "Computer-use desktop worker. Performs macOS desktop operations and returns a compressed text verdict; does not edit code files." },
   { name: "computer-verifier", description: "Observe-only Computer Use verifier. Takes a fresh desktop observation and independently checks the Leader's requested postconditions." },
   { name: "computer-terminal", description: "Bounded terminal worker using an attenuated one-run Host tool broker; receives no desktop capability." },
   { name: "secretary", description: "Boss closeout secretary. Reconciles agent outcomes, worktrees, branches, verification, temporary artifacts, and the existing Boss ledger without creating another worktree." },
-  { name: "long-test", description: "Long-running test runner. Executes end-to-end suites, integration/regression sweeps, opt-in long tests, and cross-repo E2E harnesses; reports pass/fail without fixing code." },
 ];
 
 type ProcFactory = (
@@ -1639,13 +1639,20 @@ export class PiHostBackend implements HostBackend {
         const all = await this.index();
         return all
           .filter((s) => dirId(s.header.cwd) === pid)
-          .map((s) => ({
-            id: s.header.id,
-            projectId: pid,
-            name: s.name ?? "Session",
-            updatedAt: s.updatedAt,
-            model: this.sessionModelOf(s),
-          }))
+          .map((s) => {
+            // A running Pi owns the newest in-memory session metadata. Its
+            // set_session_name acknowledgement can arrive before the JSONL
+            // stat/index pass observes the appended session_info row, so a
+            // list refresh must not re-publish the older cached title.
+            const live = this.live.get(s.header.id)?.session;
+            return {
+              id: s.header.id,
+              projectId: pid,
+              name: live?.name ?? s.name ?? "Session",
+              updatedAt: Math.max(s.updatedAt, live?.updatedAt ?? 0),
+              model: this.sessionModelOf(s),
+            };
+          })
           .sort((a, b) => b.updatedAt - a.updatedAt);
       }
       case "newSession":
@@ -2135,6 +2142,15 @@ export class PiHostBackend implements HostBackend {
         ? this.bridge.registerComputer(id)
         : undefined;
     await this.loadAndMaterializeSubagentModels();
+    if (this.features.webSearch && this.profileMode === "isolated") {
+      try {
+        await ensureWebSearchDefaults(this.agentDir);
+      } catch (error) {
+        console.warn(
+          `[pipiui] web-search defaults: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
     const output = assemblePiSpawn({
       sessionPath: found.path,
       cwd: found.header.cwd,
@@ -2288,7 +2304,12 @@ export class PiHostBackend implements HostBackend {
       live.hostAbortedTurn = false;
       live.compaction.cancel();
       void this.loadQueue(id).then(() => this.queue.markBusy(id));
-      this.stream({ type: "status", sessionId: id, status: "started" });
+      this.stream({
+        type: "status",
+        sessionId: id,
+        status: "started",
+        pendingFollowUps: live.followUps,
+      });
     } else if (e.type === "agent_settled") {
       this.stream({
         type: "status",
@@ -3307,6 +3328,33 @@ export class PiHostBackend implements HostBackend {
       signal: this.titleGenerationAbort.signal,
     });
   }
+  /**
+   * 描述附图。GLM 会话（feature glmVisionMcp 开启）优先走智谱官方视觉 MCP；MCP 失败、无 key、
+   * 或非 GLM 一律回退到既有 visionDescribePlan 的隔离 Pi 进程路径，优雅降级不打断用户发送。
+   */
+  private async describeAttachments(
+    live: Live,
+    visionRef: string,
+    attachments: PromptAttachment[],
+    userText?: string,
+  ): Promise<string | undefined> {
+    const model = this.sessionModelStates.get(live.session.id)?.model
+      ?? this.sessionModelSnapshots.get(live.session.id)?.model
+      ?? this.modelState.model;
+    if (this.features.glmVisionMcp && isGlmProvider(model.provider)) {
+      const viaMcp = await describeImagesViaGlmMcp({
+        provider: model.provider,
+        agentDir: this.agentDir,
+        env: this.env,
+        images: attachments.map((a) => ({ dataBase64: a.dataBase64, mimeType: a.mimeType })),
+        userText,
+        signal: this.titleGenerationAbort.signal,
+      }).catch(() => undefined);
+      if (viaMcp) return viaMcp;
+    }
+    return this.describeAttachedImages(live, visionRef, attachments, userText)
+      .catch(() => undefined);
+  }
   private async dispatchQueuedMessage(
     id: string,
     payload: QueuedDispatchPayload,
@@ -3335,8 +3383,7 @@ export class PiHostBackend implements HostBackend {
     };
     let described = false;
     if (plan.active && plan.visionRef) {
-      const description = await this.describeAttachedImages(live, plan.visionRef, attachments, payload.text)
-        .catch(() => undefined);
+      const description = await this.describeAttachments(live, plan.visionRef, attachments, payload.text);
       if (description) {
         described = true;
         body.message = `${body.message}\n\n${description}`;

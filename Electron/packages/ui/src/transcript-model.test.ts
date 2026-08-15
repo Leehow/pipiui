@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { appendLiveUserMessage, applyStreamEvent, finishStreamingMessage, historyMessages, planTranscriptSegments, type ChatMessage } from './transcript-model'
+import { appendLiveUserMessage, applyStreamEvent, finishStreamingMessage, historyMessages, planTranscriptSegments, reconcileHistorySnapshot, type ChatMessage } from './transcript-model'
 
 describe('transcript model', () => {
   it('copies user history images onto ChatMessage without rewriting content', () => {
@@ -7,10 +7,38 @@ describe('transcript model', () => {
       { id: 'user-img', role: 'user', content: '看图', timestamp: 1, images: [{ data: 'abc123', mimeType: 'image/png' }] },
     ])
     expect(messages).toEqual([
-      { id: 'user-img', role: 'user', content: '看图', images: [{ data: 'abc123', mimeType: 'image/png' }] },
+      { id: 'user-img', role: 'user', content: '看图', timestamp: 1, images: [{ data: 'abc123', mimeType: 'image/png' }] },
     ])
     expect(messages[0].content).not.toContain('[1张图片]')
     expect(messages[0].content).not.toContain('[1 张图片]')
+  })
+
+  it('preserves ordinary persisted timestamps without using them as ancestry', () => {
+    const entries = [
+      { id: 'u', role: 'user' as const, content: 'question', timestamp: 7 },
+      { id: 'a', role: 'assistant' as const, content: 'answer', timestamp: 7 },
+    ]
+    const result = reconcileHistorySnapshot(entries, 3, 3)
+    expect(result.status).toBe('accepted')
+    expect(result.messages).toEqual([
+      { id: 'u', role: 'user', content: 'question', timestamp: 7 },
+      { id: 'a', role: 'assistant', content: 'answer', timestamp: 7 },
+    ])
+  })
+
+  it('accepts a shorter authoritative branch or compaction snapshot', () => {
+    const result = reconcileHistorySnapshot([
+      { id: 'compact', role: 'assistant', content: 'compacted summary', timestamp: 1 },
+    ], 4, 4, JSON.stringify([{ id: 'old-a' }, { id: 'old-b' }]))
+    expect(result.status).toBe('accepted')
+    expect(result.messages.map(message => message.id)).toEqual(['compact'])
+  })
+
+  it('rejects an async history response when a live stream changed after request start', () => {
+    const result = reconcileHistorySnapshot([
+      { id: 'old', role: 'assistant', content: 'old snapshot', timestamp: 10 },
+    ], 4, 5)
+    expect(result.status).toBe('stale-request')
   })
 
   it('records tool_result as completed transcript truth without live agents', () => {

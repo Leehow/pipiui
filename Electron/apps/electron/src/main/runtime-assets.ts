@@ -23,10 +23,10 @@ export interface ResolvedAssets extends RuntimeAssets {
 }
 
 const fileIfPresent = (path: string): string | undefined => (existsSync(path) ? path : undefined)
-const EXPECTED_NODE_VERSION = '22.19.0'
+export const EMBEDDED_NODE_VERSION = '22.19.0'
 export const MANAGED_RUNTIME_PACKAGE_VERSIONS = {
   '@earendil-works/pi-coding-agent': '0.84.2',
-  'pi-web-access': '0.20.0',
+  'pi-web-access': '0.23.0',
   'pi-mcp-extension': '1.5.0',
   'pi-hermes-memory': '0.9.4',
   'better-sqlite3': '12.11.1'
@@ -101,8 +101,8 @@ function resolveEmbeddedPi(
   }
   if (manifest.schemaVersion !== 1 || manifest.platform !== platform || manifest.arch !== arch)
     throw new Error(`Embedded Pi target mismatch: expected ${platform}-${arch}, got ${manifest.platform}-${manifest.arch}`)
-  if (manifest.nodeVersion !== EXPECTED_NODE_VERSION)
-    throw new Error(`Embedded Pi Node mismatch: expected ${EXPECTED_NODE_VERSION}, got ${manifest.nodeVersion}`)
+  if (manifest.nodeVersion !== EMBEDDED_NODE_VERSION)
+    throw new Error(`Embedded Pi Node mismatch: expected ${EMBEDDED_NODE_VERSION}, got ${manifest.nodeVersion}`)
   for (const [name, version] of Object.entries(EXPECTED_PACKAGES)) {
     if (manifest.packages?.[name] !== version)
       throw new Error(`Embedded Pi manifest mismatch for ${name}: expected ${version}, got ${manifest.packages?.[name] ?? 'missing'}`)

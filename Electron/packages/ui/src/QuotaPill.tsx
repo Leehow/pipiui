@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react'
+import { createPortal } from 'react-dom'
 import type { PipiHostAPI, QuotaSnapshot, QuotaWindow } from '@pipi/host-api'
 import './quota-pill.css'
 
@@ -79,6 +80,8 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
   const [refreshTick, setRefreshTick] = useState(0)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [open, setOpen] = useState(false)
+  const pillRef = useRef<HTMLButtonElement>(null)
+  const [menuStyle, setMenuStyle] = useState<CSSProperties | undefined>()
 
   useEffect(() => {
     if (typeof host.getQuotaSnapshot !== 'function') return
@@ -97,6 +100,27 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
     void load()
     return () => { cancelled = true }
   }, [host, sessionId, provider, refreshKey, refreshTick])
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setMenuStyle(undefined)
+      return
+    }
+    const update = () => {
+      const el = pillRef.current
+      if (!el) return
+      const rect = el.getBoundingClientRect()
+      setMenuStyle({
+        position: 'fixed',
+        left: 'auto',
+        right: `${Math.max(8, window.innerWidth - rect.right)}px`,
+        bottom: `${Math.max(8, window.innerHeight - rect.top + 8)}px`,
+      })
+    }
+    update()
+    window.addEventListener('resize', update)
+    return () => window.removeEventListener('resize', update)
+  }, [open])
 
   const showLogin = loaded && !snapshot && Boolean(onOpenBrowserLogin) && Boolean(provider?.includes('qwen-token-plan'))
 
@@ -146,6 +170,7 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
   return (
     <div className="quick-menu-anchor" data-testid="quota-pill-anchor">
       <button
+        ref={pillRef}
         type="button"
         className="quota-pill"
         data-testid="quota-pill"
@@ -156,10 +181,10 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
       >
         {capsule.label} {Math.round(capsule.usedPercent)}%
       </button>
-      {open && (
+      {open && createPortal(
         <>
           <div className="quick-menu-backdrop" data-testid="quota-menu-backdrop" onMouseDown={() => setOpen(false)} />
-          <div className="quick-menu quota-menu" role="menu" aria-label="额度窗口" data-testid="quota-menu">
+          <div className="quick-menu quota-menu" role="menu" aria-label="额度窗口" data-testid="quota-menu" style={menuStyle}>
             {snapshot.accountLabel && snapshot.accountLabel.trim().length > 0 && (
               <div className="quick-menu-provider">{snapshot.accountLabel}</div>
             )}
@@ -182,7 +207,8 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
               )
             })}
           </div>
-        </>
+        </>,
+        document.body
       )}
     </div>
   )

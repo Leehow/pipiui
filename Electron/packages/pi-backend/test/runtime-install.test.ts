@@ -71,7 +71,7 @@ describe("installRuntimeTree", () => {
       expect(await readFile(join(root, "extensions", "pipiui-runtime-info.ts"), "utf8")).toContain("pipiui_runtime_info");
       expect(await readFile(join(root, "extensions", "pipiui-update-center.ts"), "utf8")).toContain('pi.on("input"');
       expect(await readFile(join(root, "extensions", "pipiui-electron-webview.ts"), "utf8")).toContain("sessionCapability: CAPABILITY");
-      expect(await readdir(join(root, "built-in-skills"))).toContain("create-subagent");
+      expect(await readdir(join(root, "built-in-skills"))).toEqual(expect.arrayContaining(["create-subagent", "add-extension"]));
     } finally { await rm(root, { recursive: true, force: true }) }
   });
 

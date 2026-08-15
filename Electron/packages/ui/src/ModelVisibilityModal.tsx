@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Model, ModelState, PipiHostAPI } from '@pipi/host-api'
 import type { ModelVisibilityController } from './useModelVisibility'
-import { groupByProvider, modelRef } from './model-visibility'
+import { groupByProvider, modelRef, usesBuiltInVisionMcp } from './model-visibility'
 import { ProviderLogo } from './ProviderLogo'
 import { ProviderLoginPanel } from './ProviderLoginPanel'
 import type { VisionRoutingController } from './useVisionRouting'
+import type { UpdateCenterController } from './useUpdateCenter'
 import { UpdateCenter } from './UpdateCenter'
+import { ExtensionsPane } from './ExtensionsPane'
 import './computer-use.css'
 
 function TrashIcon() {
@@ -66,6 +68,12 @@ function VisionRoutingPane({ visibility, vision }: {
     return list
   }, [visibility.quickModels, visibility.models, vision.model])
   const groups = useMemo(() => groupByProvider(candidates), [candidates])
+  const textOnlyChecked = useMemo(
+    () => visibility.visibleModels.filter(model => model.supportsImages === false),
+    [visibility.visibleModels]
+  )
+  const textOnlyGroups = useMemo(() => groupByProvider(textOnlyChecked), [textOnlyChecked])
+  const [textOnlyOpen, setTextOnlyOpen] = useState(false)
 
   if (!vision.available) {
     return <div className="model-modal-state" data-testid="vision-unsupported">当前连接不支持识图设置。</div>
@@ -126,24 +134,67 @@ function VisionRoutingPane({ visibility, vision }: {
       {vision.enabled && vision.model && (
         <p className="vision-picker-hint" data-testid="vision-model-selected">已选：{vision.model}</p>
       )}
+      <div className="vision-text-models">
+        <button
+          type="button"
+          className="vision-text-models-toggle"
+          aria-expanded={textOnlyOpen}
+          aria-label={textOnlyOpen ? '折叠非多模态模型' : '展开非多模态模型'}
+          data-testid="non-multimodal-fold"
+          onClick={() => setTextOnlyOpen(open => !open)}
+        >
+          <span aria-hidden="true">{textOnlyOpen ? '▾' : '▸'}</span>
+          <span>已勾选的非多模态模型</span>
+          <span className="vision-text-models-count">{textOnlyChecked.length}</span>
+        </button>
+        {textOnlyOpen && (
+          <div className="vision-text-models-list" data-testid="non-multimodal-list">
+            {textOnlyChecked.length === 0
+              ? <p className="vision-picker-hint">已勾选的模型都支持图片。</p>
+              : textOnlyGroups.map(group => (
+                <div key={group.provider} className="vision-group">
+                  <div className="vision-group-header">
+                    <ProviderLogo provider={group.provider} size={14} />
+                    <span className="vision-group-name">{group.provider}</span>
+                  </div>
+                  {group.models.map(model => (
+                    <div key={modelRef(model)} className="vision-text-model-row">
+                      <span className="vision-row-name">{model.name}</span>
+                      {usesBuiltInVisionMcp(model.provider) && (
+                        <span
+                          className="vision-text-model-badge"
+                          title="自带视觉 MCP，不走通用识图模型"
+                          data-testid={`vision-mcp-badge-${model.provider}-${model.id}`}
+                        >内置识图 MCP</span>
+                      )}
+                      <span className="model-row-id">{modelRef(model)}</span>
+                    </div>
+                  ))}
+                </div>
+              ))}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
 
 /**
- * `/model` — settings modal with three tabs: 通用 (vision-routing switch +
- * selector, default off) and 模型管理 (provider-collapsible model visibility
- * management mirroring Swift Settings > 模型, the default tab). Provider
- * headers carry a tri-state checkbox (all/none/partial visible), a
- * per-provider delete action (pi logout with confirmation) and an "添加模型"
- * flow driving pi's native OAuth/api-key login. Visibility state is persisted
- * through the host (hiddenModelIds, atomic); vision routing through
- * getVisionEnabled/setVisionEnabled + getVisionModel/setVisionModel.
+ * `/model` — settings modal with four tabs: 通用 (vision-routing switch +
+ * selector, default off), 模型管理 (provider-collapsible model visibility
+ * management mirroring Swift Settings > 模型, the default tab), 扩展 (MCP /
+ * Pi plugins, add-via-main-chat), and 更新中心. Provider headers carry a
+ * tri-state checkbox (all/none/partial visible), a per-provider delete action
+ * (pi logout with confirmation) and an "添加模型" flow driving pi's native
+ * OAuth/api-key login. Visibility state is persisted through the host
+ * (hiddenModelIds, atomic); vision routing through getVisionEnabled/
+ * setVisionEnabled + getVisionModel/setVisionModel.
  */
-export function ModelVisibilityModal({ host, visibility, vision, current, onModelState, onRequestUpdate, onClose, initialView = 'manage' }: {
+export function ModelVisibilityModal({ host, visibility, vision, updates, current, onModelState, onRequestUpdate, onClose, initialView = 'manage' }: {
   host: PipiHostAPI
   visibility: ModelVisibilityController
   vision: VisionRoutingController
+  updates: UpdateCenterController
   current: Model | null
   onModelState?: (state: ModelState) => void
   onRequestUpdate: (prompt: string) => void
@@ -151,7 +202,8 @@ export function ModelVisibilityModal({ host, visibility, vision, current, onMode
   /** First-run onboarding opens straight into the provider login pane. */
   initialView?: 'manage' | 'add'
 }) {
-  const [tab, setTab] = useState<'general' | 'models' | 'updates'>('models')
+  const [tab, setTab] = useState<'general' | 'models' | 'extensions' | 'updates'>('models')
+  const [extensionsAddOpen, setExtensionsAddOpen] = useState(false)
   // Default: every provider collapsed. `expanded` is in-memory only (no cross-session
   // persistence); a refresh keeps it, so already-expanded providers stay open while
   // newly discovered providers (e.g. after refresh) appear collapsed.
@@ -198,10 +250,11 @@ export function ModelVisibilityModal({ host, visibility, vision, current, onMode
     <div className="model-modal-backdrop" data-testid="model-modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
       <section className="model-modal" role="dialog" aria-modal="true" aria-label="设置" data-testid="model-modal">
         <header>
-          <h2>{tab === 'general' ? '通用' : tab === 'updates' ? '更新中心' : view === 'manage' ? '模型管理' : '添加模型'}</h2>
-          <p>{tab === 'general' ? '主线模型不支持图片时，用指定识图模型识别图片后交给文字模型。' : tab === 'updates' ? '比较内置 Pi、Cua Driver 和托管运行时组件的本机与最新版本。' : view === 'manage' ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。' : '登录 pi 支持的 provider 后，其模型目录会自动出现。'}</p>
+          <h2>{tab === 'general' ? '通用' : tab === 'updates' ? '更新中心' : tab === 'extensions' ? 'MCP / 扩展' : view === 'manage' ? '模型管理' : '添加模型'}</h2>
+          <p>{tab === 'general' ? '主线模型不支持图片时，用指定识图模型识别图片后交给文字模型。' : tab === 'updates' ? '比较内置 Pi、Cua Driver 和托管运行时组件的本机与最新版本。' : tab === 'extensions' ? '把外部 MCP 或 Pi 扩展加进来。点添加，复制一句话到主界面即可。' : view === 'manage' ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。' : '登录 pi 支持的 provider 后，其模型目录会自动出现。'}</p>
           <button className="model-modal-close" aria-label="关闭设置" onClick={onClose}>×</button>
           <div className="model-modal-header-actions">
+            {tab === 'extensions' && <button className="model-modal-add" data-testid="extensions-add-button" onClick={() => setExtensionsAddOpen(true)}>＋ 添加</button>}
             {tab === 'models' && (view === 'manage'
               ? <>
                   <button
@@ -223,7 +276,7 @@ export function ModelVisibilityModal({ host, visibility, vision, current, onMode
               aria-selected={tab === 'general'}
               className={`model-modal-tab${tab === 'general' ? ' active' : ''}`}
               data-testid="model-tab-general"
-              onClick={() => setTab('general')}
+              onClick={() => { setExtensionsAddOpen(false); setTab('general') }}
             >通用</button>
             <button
               type="button"
@@ -231,15 +284,23 @@ export function ModelVisibilityModal({ host, visibility, vision, current, onMode
               aria-selected={tab === 'models'}
               className={`model-modal-tab${tab === 'models' ? ' active' : ''}`}
               data-testid="model-tab-models"
-              onClick={() => { setView('manage'); setTab('models') }}
+              onClick={() => { setView('manage'); setExtensionsAddOpen(false); setTab('models') }}
             >模型管理</button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === 'extensions'}
+              className={`model-modal-tab${tab === 'extensions' ? ' active' : ''}`}
+              data-testid="model-tab-extensions"
+              onClick={() => setTab('extensions')}
+            >扩展</button>
             <button
               type="button"
               role="tab"
               aria-selected={tab === 'updates'}
               className={`model-modal-tab${tab === 'updates' ? ' active' : ''}`}
               data-testid="model-tab-updates"
-              onClick={() => setTab('updates')}
+              onClick={() => { setExtensionsAddOpen(false); setTab('updates') }}
             >更新中心</button>
           </div>
         </header>
@@ -247,7 +308,9 @@ export function ModelVisibilityModal({ host, visibility, vision, current, onMode
           {tab === 'general'
             ? <VisionRoutingPane visibility={visibility} vision={vision} />
             : tab === 'updates'
-              ? <UpdateCenter host={host} onRequestUpdate={onRequestUpdate} />
+              ? <UpdateCenter updates={updates} onRequestUpdate={onRequestUpdate} />
+            : tab === 'extensions'
+              ? <ExtensionsPane addOpen={extensionsAddOpen} onCloseAdd={() => setExtensionsAddOpen(false)} />
             : view === 'add'
               ? <ProviderLoginPanel host={host} onAdded={() => { setView('manage'); void visibility.refresh() }} />
               : <>
@@ -280,11 +343,11 @@ export function ModelVisibilityModal({ host, visibility, vision, current, onMode
                             aria-expanded={isExpanded}
                             onClick={() => toggleExpanded(group.provider)}
                           >
-                            {isExpanded ? '▾' : '▸'}
+                            <span aria-hidden="true">{isExpanded ? '▾' : '▸'}</span>
+                            <ProviderLogo provider={group.provider} size={15} />
+                            <span className="model-provider-name">{group.provider}</span>
+                            <span className="model-provider-count" data-testid={`provider-count-${group.provider}`}>{visibleCount}/{total}</span>
                           </button>
-                          <ProviderLogo provider={group.provider} size={15} />
-                          <span className="model-provider-name">{group.provider}</span>
-                          <span className="model-provider-count" data-testid={`provider-count-${group.provider}`}>{visibleCount}/{total}</span>
                           <button
                             className="model-provider-delete"
                             title="删除该 provider 的 Pi 凭据（pi logout）"

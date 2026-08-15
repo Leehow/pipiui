@@ -491,8 +491,19 @@ export class BrowserTabsHost {
     return this.bounds.visible !== false && this.bounds.width > 0 && this.bounds.height > 0
   }
 
+  private viewUsable(view: BrowserViewLike | undefined): view is BrowserViewLike {
+    const contents = view?.webContents
+    return Boolean(contents && typeof contents.loadURL === 'function' && !contents.isDestroyed?.())
+  }
+
   private ensureView(): BrowserViewLike {
-    if (this.view) return this.view
+    if (this.viewUsable(this.view)) return this.view
+    // A closed/crashed WebContentsView keeps the wrapper but drops `webContents`.
+    // Reuse would throw `Cannot read properties of undefined (reading 'loadURL')`
+    // and leave the curator tab stuck on a hostname-only "localhost" chrome.
+    this.view = undefined
+    this.shownTabId = undefined
+    this.attachedVisible = undefined
     if (!this.attach) throw new Error('browser window is unavailable')
     // This is the only `new WebContentsView` path; virtual tabs reuse it.
     const view = this.createView({ webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, partition: this.partition } })

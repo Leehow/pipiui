@@ -91,6 +91,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
           content: [{ type: "text", text: "[subagent-done] agentId=a1 name=explore ok=true" }],
         },
       });
+      send({ type: "queue_update", followUp: ["[subagent-done] agentId=a1 name=explore ok=true"] });
       send({ type: "agent_start" });
       return;
     }

@@ -46,7 +46,7 @@ describe('resolveRuntimeAssets', () => {
       mkdir(join(nodeModules, 'better-sqlite3'), { recursive: true }).then(() =>
         writeFile(join(nodeModules, 'better-sqlite3', 'package.json'), JSON.stringify({ version: '12.11.1' })))
     ])
-    for (const [name, version] of [['pi-web-access', '0.20.0'], ['pi-mcp-extension', '1.5.0']]) {
+    for (const [name, version] of [['pi-web-access', '0.23.0'], ['pi-mcp-extension', '1.5.0']]) {
       const packageRoot = join(nodeModules, name)
       await mkdir(join(packageRoot, 'dist'), { recursive: true })
       await writeFile(join(packageRoot, 'dist', 'index.js'), '// extension\n')
@@ -64,7 +64,7 @@ describe('resolveRuntimeAssets', () => {
       nodeModules: 'pi/lib/node_modules',
       packages: {
         '@earendil-works/pi-coding-agent': '0.84.2',
-        'pi-web-access': '0.20.0',
+        'pi-web-access': '0.23.0',
         'pi-mcp-extension': '1.5.0',
         'pi-hermes-memory': '0.9.4',
         'better-sqlite3': '12.11.1'

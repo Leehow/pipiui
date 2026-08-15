@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useState, type ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent, AgentSummary, PipiHostAPI } from '@pipi/host-api'
@@ -306,6 +306,40 @@ describe('SubagentPanel', () => {
     await screen.findByText('用户任务')
     expect(document.body.textContent).not.toContain('isolation sentinel')
     expect(document.querySelector('[data-testid="subagent-transcript"]')?.textContent).toContain('完成')
+  })
+
+  it('shows live elapsed time on the running name line instead of a fourth row stuck at 0s', async () => {
+    vi.useFakeTimers({ now: 1_700_000_000_000, toFake: ['Date', 'setInterval', 'clearInterval'] })
+    try {
+      const harness = hostHarness()
+      const startedAt = Date.now() - 12_000
+      harness.host.listAgents = async () => [{
+        agentId: 'run', runId: 'r1', name: 'explore', title: '查 Electron GLM 鉴权与 MCP 链路',
+        task: 'research', state: 'running', createdAt: startedAt, updatedAt: Date.now(),
+        listSubtitle: 'tool',
+      }]
+      render(<SubagentPanel host={harness.host} />)
+      const row = await screen.findByTestId('agent-row-run')
+      expect(row.querySelector('.agent-name-line .agent-row-time')?.textContent).toBe('12s')
+      expect(row.querySelectorAll('.agent-copy > small').length).toBe(2)
+      expect(row.textContent).toContain('等待工具返回 · tool')
+
+      act(() => {
+        harness.emitAgent({
+          type: 'agent',
+          agent: {
+            agentId: 'run', runId: 'r1', name: 'explore', title: '查 Electron GLM 鉴权与 MCP 链路',
+            task: 'research', state: 'running', createdAt: Date.now(), updatedAt: Date.now(),
+            listSubtitle: 'tool read',
+          },
+        })
+        vi.advanceTimersByTime(3_000)
+      })
+      expect(row.querySelector('.agent-name-line .agent-row-time')?.textContent).toBe('15s')
+      expect(row.querySelectorAll('.agent-copy > small').length).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('renders lifecycle counts and routes abort to the host', async () => {

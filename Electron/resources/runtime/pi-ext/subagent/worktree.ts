@@ -123,6 +123,8 @@ export function resolveSubagentWorktree(opts: {
 	policy: { worktree: "isolated" | "direct" | "main-session" };
 	/** App-owned session root; was module opts.mainCwd. */
 	mainCwd?: string;
+	/** Bundled general-purpose isolation cannot be disabled by process-global legacy state. */
+	allowEnvironmentOptOut?: boolean;
 }): WorktreePlacement {
 	const fallbackCwd = opts.explicitCwd ?? opts.defaultCwd;
 
@@ -135,7 +137,7 @@ export function resolveSubagentWorktree(opts: {
 	// main-session role: it merely respects the caller/default cwd and never
 	// receives the secretary role or its write/commit policy exemptions.
 	if (opts.policy.worktree === "direct") return { cwd: fallbackCwd };
-	if (opts.readOnly || process.env.PIPIUI_WORKTREE === "0") {
+	if (opts.readOnly || (opts.allowEnvironmentOptOut !== false && process.env.PIPIUI_WORKTREE === "0")) {
 		return { cwd: fallbackCwd };
 	}
 	// Explicit cwd from tool caller → respect, no worktree wrap

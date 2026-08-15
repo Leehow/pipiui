@@ -158,7 +158,12 @@ describe("PiHostBackend message queue integration", () => {
         sessionId: "s1",
         content: "[subagent-done] agentId=a1 name=explore ok=true",
       }),
-      expect.objectContaining({ type: "status", sessionId: "s1", status: "started" }),
+      expect.objectContaining({
+        type: "status",
+        sessionId: "s1",
+        status: "started",
+        pendingFollowUps: ["[subagent-done] agentId=a1 name=explore ok=true"],
+      }),
     ]));
     await backend.close();
   });

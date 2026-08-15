@@ -5,6 +5,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
+import { wrapExecForCurator } from "./web-search-curator.mjs";
 
 const PORT = process.env.PIPIUI_BRIDGE_PORT;
 const KEY = process.env.PIPIUI_SESSION_KEY;
@@ -116,8 +117,13 @@ function formatSearchResults(query: string, url: string, results: SearchResult[]
   return lines.join("\n");
 }
 
+function installCuratorOpenIntercept(pi: ExtensionAPI) {
+  pi.exec = wrapExecForCurator(pi.exec.bind(pi)) as typeof pi.exec;
+}
+
 export default function (pi: ExtensionAPI) {
   if (!PORT || !KEY) return; // Not running inside Pipi UI; stay dormant.
+  installCuratorOpenIntercept(pi);
 
   pi.registerTool({
     name: "browser_search",

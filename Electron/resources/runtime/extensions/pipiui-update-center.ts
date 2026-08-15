@@ -76,6 +76,9 @@ function componentChecks(intent: Intent): string {
   const hermes = intent.id === "pi-hermes-memory" || intent.packageName === "pi-hermes-memory";
   const pi = intent.name === "Pi" || intent.packageName === "@earendil-works/pi-coding-agent";
   const cua = intent.name === "Cua Driver" || intent.id === "cua-driver" || intent.id === "cua";
+  const electron = intent.id === "electron" || intent.packageName === "electron";
+  const node = intent.id === "node";
+  const toolchain = intent.id === "vite" || intent.id === "electron-vite" || intent.packageName === "vite" || intent.packageName === "electron-vite";
   if (hermes) return `Hermes 专属检查：
 - 保留现有 memory-broker、自动召回、角色化记忆策略和 Hermes 复核模型设置；核对 recall 行为、role 策略、数据库格式/迁移、Hermes adapter 内部 API 与配置兼容性。
 - 版本 pin、lockfile、运行时 manifest 与 Hermes adapter 必须作为一个兼容面评估，并保持精确版本和 fail-soft；不兼容时建议保留旧 pin，不做猜测性适配。
@@ -86,6 +89,15 @@ function componentChecks(intent: Intent): string {
   if (cua) return `Cua Driver 专属检查：
 - 核对 driver protocol、tool schema、各架构 driver slices、坐标与输入语义，以及 PipiUI Computer Use 调用约定。
 - 验收方案必须覆盖目标架构、TCC 权限连续性、真实屏幕/输入操作和 canonical Electron App 中的真实 Computer Use。`;
+  if (electron) return `Electron 平台专属检查：
+- 核对 Electron 绑定的 Chromium/Node 版本、原生模块 ABI、preload/contextIsolation、窗口与 IPC API、macOS 签名和 TCC 权限连续性。
+- 必须把 node-pty 等原生依赖重建、主进程/renderer 回归、canonical Electron App 打包，以及真实窗口和 Computer Use 验收纳入方案。`;
+  if (node) return `内置 Node.js 专属检查：
+- 这是 PipiUI 固定打包给 Pi 的独立 Node 运行时，不得与 Electron 自带 Node 混为一谈；核对 Pi 支持范围、原生模块 ABI、launcher、双架构 embedded runtime、manifest 与离线首次运行。
+- 最新大版本只代表上游最新版，不代表建议跨大版本升级；必须先给出 LTS/支持周期和依赖兼容结论，再决定目标版本。`;
+  if (toolchain) return `Electron 构建工具专属检查：
+- 核对 Vite 与 electron-vite 的相互兼容范围、Node 要求、插件 API、配置格式、main/preload/renderer 构建产物和开发服务器行为。
+- 这是构建链更新，不是运行时扩展更新；验收必须覆盖 workspace build/test、preload 校验、canonical Electron App 打包和启动冒烟，跨大版本不得只改版本号。`;
   return `Pi 扩展专属检查：
 - 核对 Pi extension API、hooks、tools、配置格式、精确版本 pins、运行时 manifest 和离线可用性。
 - 验收方案必须覆盖扩展加载、工具注册与调用、配置兼容、clean machine/离线运行和 canonical Electron App。`;

@@ -31,7 +31,9 @@
   /* The transcript area is position:relative with overflow:hidden, and the
      virtualized .message-list fills 100% height — an in-flow placeholder would
      render below the fold and be clipped, so the waiting row would never be
-     visible after a send. Anchor it to the transcript tail so it always shows. */
+     visible after a send. Anchor it to the transcript tail so it always shows.
+     `.transcript-area.is-waiting .message-list` reserves the same strip so the
+     last message time / copy footer is not covered by this overlay. */
   position: absolute;
   left: var(--chat-content-gutter, 16px);
   right: calc(var(--chat-content-gutter, 16px) + var(--chat-scrollbar-gutter, 6px));
@@ -40,6 +42,16 @@
   z-index: 4;
   background: linear-gradient(to top, var(--surface, #fff) 62%, transparent);
   animation: waiting-row-in 0.18s ease-out;
+}
+
+/* Counterpart to the pinned overlay: shrink the virtualized list so the last
+   turn footer sits above the waiting row instead of sharing its pixels. */
+.transcript-area.is-waiting {
+  --waiting-row-reserve: 40px;
+}
+
+.transcript-area.is-waiting .message-list {
+  padding-bottom: var(--waiting-row-reserve);
 }
 
 [data-theme='dark'] .waiting-placeholder {

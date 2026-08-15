@@ -1,10 +1,18 @@
-import type { HostBackend, UpdateCenterItem, UpdateCenterSnapshot } from '@pipi/host-api'
+import type { HostBackend, UpdateCenterItem, UpdateCenterItemCategory, UpdateCenterSnapshot } from '@pipi/host-api'
+
+/** Build-time tools are not shipped as runtime dependencies, so keep their resolved versions explicit and test them against the lockfile. */
+export const UPDATE_CENTER_FRAMEWORK_VERSIONS = {
+  electron: '43.4.0',
+  vite: '7.3.6',
+  'electron-vite': '5.0.0'
+} as const
 
 export type UpdateCatalogItem = {
   id: string
   name: string
+  category: UpdateCenterItemCategory
   currentVersion: string
-  source: { type: 'npm'; packageName: string } | { type: 'cuaGitHub' }
+  source: { type: 'npm'; packageName: string } | { type: 'cuaGitHub' } | { type: 'nodeDist' }
 }
 
 export type UpdateCenterFetch = (input: string, init?: RequestInit) => Promise<Pick<Response, 'ok' | 'status' | 'json'>>
@@ -62,11 +70,22 @@ export function latestCuaDriverVersion(payload: unknown): string | undefined {
   return candidates.sort((a, b) => compareSemver(b, a) ?? 0)[0]
 }
 
+export function latestNodeVersion(payload: unknown): string | undefined {
+  if (!Array.isArray(payload)) return undefined
+  const versions = payload.flatMap(release => {
+    if (!release || typeof release !== 'object') return []
+    const version = (release as { version?: unknown }).version
+    return typeof version === 'string' && parseSemver(version) ? [version.replace(/^v/, '')] : []
+  })
+  return versions.sort((a, b) => compareSemver(b, a) ?? 0)[0]
+}
+
 function checkedItem(item: UpdateCatalogItem, latestVersion: string): UpdateCenterItem {
   const precedence = compareSemver(latestVersion, item.currentVersion)
   if (precedence === undefined) return {
     id: item.id,
     name: item.name,
+    category: item.category,
     ...(item.source.type === 'npm' ? { packageName: item.source.packageName } : {}),
     currentVersion: item.currentVersion,
     status: 'notCheckable',
@@ -75,6 +94,7 @@ function checkedItem(item: UpdateCatalogItem, latestVersion: string): UpdateCent
   return {
     id: item.id,
     name: item.name,
+    category: item.category,
     ...(item.source.type === 'npm' ? { packageName: item.source.packageName } : {}),
     currentVersion: item.currentVersion,
     latestVersion,
@@ -110,7 +130,9 @@ export function createUpdateCenterService(options: {
       try {
         const url = item.source.type === 'npm'
           ? `https://registry.npmjs.org/${encodeURIComponent(item.source.packageName)}`
-          : 'https://api.github.com/repos/trycua/cua/releases?per_page=100'
+          : item.source.type === 'cuaGitHub'
+            ? 'https://api.github.com/repos/trycua/cua/releases?per_page=100'
+            : 'https://nodejs.org/dist/index.json'
         const response = await fetcher(url, {
           signal: controller.signal,
           headers: item.source.type === 'cuaGitHub'
@@ -119,7 +141,11 @@ export function createUpdateCenterService(options: {
         })
         if (!response.ok) throw new Error(`版本服务返回 HTTP ${response.status}`)
         const payload = await response.json()
-        const latest = item.source.type === 'npm' ? npmLatestVersion(payload) : latestCuaDriverVersion(payload)
+        const latest = item.source.type === 'npm'
+          ? npmLatestVersion(payload)
+          : item.source.type === 'cuaGitHub'
+            ? latestCuaDriverVersion(payload)
+            : latestNodeVersion(payload)
         if (!latest) throw new Error('版本服务返回了无法识别的数据')
         return checkedItem(item, latest)
       } catch (error) {

@@ -68,6 +68,8 @@ describe("session title parity with Swift", () => {
       expect.objectContaining({ title: "修复 Electron 会话创建", source: "provisional" }),
       expect.objectContaining({ title: "hello", source: "model" }),
     ]);
+    await expect(backend.handle("listSessions", [project.id]))
+      .resolves.toEqual([expect.objectContaining({ id: session.id, name: "hello" })]);
     expect(spawns.some(args => args.includes("--no-session") && args.includes("--no-tools") && args.includes("--no-extensions"))).toBe(true);
     await backend.close();
   });

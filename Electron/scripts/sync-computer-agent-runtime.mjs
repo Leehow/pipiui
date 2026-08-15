@@ -11,11 +11,9 @@ const philosophySourceRoot = join(repoRoot, "Sources", "PipiUI", "PiPhilosophy")
 const philosophyRuntimeRoot = join(electronRoot, "resources", "runtime", "pi-philosophy");
 const mirrors = [
   ...[
-  "subagent/index.ts",
-  "subagent/model-ref.ts",
-  "subagent/agents.ts",
-  "subagent/runtime-policy.ts",
-  "subagent/rpc-stream.ts",
+  // Electron owns resources/runtime/pi-ext/subagent. Sources/PipiUI/PiExt is
+  // the frozen Swift-app mirror and must not overwrite the default product
+  // during normal Electron dev/build/test preparation.
   "agents/operator/AGENT.md",
   "agents/computer-use-leader/AGENT.md",
   "agents/computer-verifier/AGENT.md",

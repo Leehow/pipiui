@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { formatElapsed, waitingCopy, WaitingPlaceholder } from './WaitingPlaceholder'
@@ -60,6 +62,14 @@ describe('formatElapsed', () => {
   it('clamps negative and fractional inputs', () => {
     expect(formatElapsed(-3)).toBe('0s')
     expect(formatElapsed(0.4)).toBe('0s')
+  })
+})
+
+describe('waiting-placeholder layout', () => {
+  it('reserves list tail space so the pinned waiting row does not cover the last message time', () => {
+    const css = readFileSync(join(import.meta.dirname, 'waiting-placeholder.css'), 'utf8')
+    expect(css).toMatch(/\.waiting-placeholder\s*\{[^}]*position:\s*absolute/)
+    expect(css).toMatch(/\.transcript-area\.is-waiting\s+\.message-list\s*\{[^}]*padding-bottom:\s*var\(--waiting-row-reserve/)
   })
 })
 

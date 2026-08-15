@@ -17,13 +17,15 @@ const context = {
 };
 
 test("all shipped roles have bounded host-enforced recall and write policies", () => {
-  for (const name of ["explore", "plan", "general-purpose", "reviewer", "computer-use-leader", "operator", "computer-verifier", "computer-terminal", "secretary", "long-test"]) {
+  for (const name of ["explore", "general-purpose", "reviewer", "computer-use-leader", "operator", "computer-verifier", "computer-terminal", "secretary"]) {
     const policy = subagentMemoryPolicy(name);
     assert.ok(policy, name);
     assert.ok(policy.recall.maximumItems >= 1 && policy.recall.maximumItems <= 3);
     assert.ok(policy.recall.maximumCharacters >= 400 && policy.recall.maximumCharacters <= 1_000);
     assert.deepEqual(policy.recall.allowedScopes, ["project"]);
   }
+  assert.equal(subagentMemoryPolicy("plan"), undefined);
+  assert.equal(subagentMemoryPolicy("long-test"), undefined);
   assert.equal(subagentMemoryPolicy("unknown"), undefined);
 });
 
@@ -42,7 +44,7 @@ test("terminal writes require role-specific evidence and computer/secretary role
   assert.equal(terminalMemoryEvidence({ agentName: "explore", terminalText: "Evidence: src/index.ts:42", outcome: "success", verificationPassed: false }), "source-backed");
   assert.equal(terminalMemoryEvidence({ agentName: "general-purpose", terminalText: "implemented", outcome: "success", verificationPassed: false }), undefined);
   assert.equal(terminalMemoryEvidence({ agentName: "general-purpose", terminalText: "implemented", outcome: "success", verificationPassed: true }), "verification-passed");
-  assert.equal(terminalMemoryEvidence({ agentName: "long-test", terminalText: "suite passed", outcome: "success", verificationPassed: true }), "verification-passed");
+  assert.equal(terminalMemoryEvidence({ agentName: "long-test", terminalText: "suite passed", outcome: "success", verificationPassed: true }), undefined);
   for (const agentName of ["secretary", "computer-use-leader", "operator", "computer-verifier", "computer-terminal"]) {
     assert.equal(terminalMemoryEvidence({ agentName, terminalText: "Evidence: screenshot and credentials", outcome: "success", verificationPassed: true }), undefined);
   }
@@ -59,6 +61,8 @@ test("candidate remains session brief, carries bounded identity, and rejects for
   assert.match(candidate.evidence[0]!.summary, /Agent role: general-purpose/);
   assert.match(candidate.evidence[0]!.summary, /Agent ID: agent-1/);
   assert.equal(makeTerminalExperienceCandidate({ runID: "run-1", agentName: "secretary", task: "commit", terminalText: "done", outcome: "success", evidenceClass: "source-backed" }), undefined);
+  assert.equal(makeTerminalExperienceCandidate({ runID: "run-1", agentName: "plan", task: "plan", terminalText: "src/index.ts:42", outcome: "success", evidenceClass: "source-backed" }), undefined);
+  assert.equal(makeTerminalExperienceCandidate({ runID: "run-1", agentName: "long-test", task: "suite", terminalText: "passed", outcome: "success", evidenceClass: "verification-passed" }), undefined);
   assert.equal(makeTerminalExperienceCandidate({ runID: "run-1", agentName: "general-purpose", task: "implement", terminalText: "self asserted", outcome: "success", evidenceClass: "source-backed" }), undefined);
   assert.equal(makeTerminalExperienceCandidate({ runID: "run-1", agentName: "explore", task: "research", terminalText: "API_KEY=sk-abcdefghijklmnop", outcome: "success", evidenceClass: "source-backed" }), undefined);
 });

@@ -32,7 +32,7 @@ function intent(overrides: Partial<PipiuiUpdateEvaluationIntentFields> = {}): st
 }
 
 describe("pipiui update center extension seam", () => {
-  it("expands host-api intents for all four component classes with the full two-stage policy", async () => {
+  it("expands host-api intents for runtime, platform, toolchain, and extension components with the full two-stage policy", async () => {
     const { handler, on } = await loadInputHandler();
     expect(on).toHaveBeenCalledTimes(1);
     expect(on).toHaveBeenCalledWith("input", expect.any(Function));
@@ -46,6 +46,21 @@ describe("pipiui update center extension seam", () => {
         fields: { id: "cua-driver", name: "Cua Driver", currentVersion: "0.19.3", latestVersion: "0.20.0" },
         source: "interactive",
         checks: ["driver protocol、tool schema、各架构 driver slices、坐标与输入语义", "TCC 权限连续性", "真实 Computer Use"],
+      },
+      {
+        fields: { id: "electron", name: "Electron", packageName: "electron", currentVersion: "43.4.0", latestVersion: "44.0.0" },
+        source: "rpc",
+        checks: ["Chromium/Node 版本", "原生模块 ABI", "preload/contextIsolation", "macOS 签名和 TCC 权限连续性", "node-pty"],
+      },
+      {
+        fields: { id: "node", name: "Node.js 内置 Pi 运行时", currentVersion: "22.19.0", latestVersion: "24.8.0" },
+        source: "interactive",
+        checks: ["固定打包给 Pi 的独立 Node 运行时", "不得与 Electron 自带 Node 混为一谈", "双架构 embedded runtime", "LTS/支持周期"],
+      },
+      {
+        fields: { id: "vite", name: "Vite", packageName: "vite", currentVersion: "5.4.21", latestVersion: "8.2.1" },
+        source: "rpc",
+        checks: ["Vite 与 electron-vite 的相互兼容范围", "main/preload/renderer 构建产物", "构建链更新，不是运行时扩展更新", "跨大版本不得只改版本号"],
       },
       {
         fields: { id: "pi-web-access", name: "pi-web-access", packageName: "pi-web-access", currentVersion: "0.20.0", latestVersion: "0.21.0" },

@@ -16,8 +16,8 @@ import { CUA_DRIVER_VERSION, CuaDriverHost } from './cua-driver-host.js'
 import { importLegacyPiProfile, installBundledModelCapabilityOverrides, resolveElectronPiProfile } from './pi-profile.js'
 import { withProjectDirectoryPicker } from './project-directory-picker.js'
 import { createQuotaCookieReader, createQuotaCookiePersister } from './quota-capabilities.js'
-import { resolveRuntimeAssets, UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS } from './runtime-assets.js'
-import { createUpdateCenterService, withUpdateCenter, type UpdateCatalogItem } from './update-center.js'
+import { EMBEDDED_NODE_VERSION, resolveRuntimeAssets, UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS } from './runtime-assets.js'
+import { createUpdateCenterService, UPDATE_CENTER_FRAMEWORK_VERSIONS, withUpdateCenter, type UpdateCatalogItem } from './update-center.js'
 import { withOpenDocumentExternally } from './external-document.js'
 import { withOpenExternal } from './external-url.js'
 import { createElectronComputerUsePermissionHost, withComputerUsePermissions } from './computer-use-permissions.js'
@@ -197,13 +197,18 @@ if (app) {
       return result.canceled ? null : result.filePaths[0] ?? null
     }
     const updateCatalog: UpdateCatalogItem[] = [
+      { id: 'electron', name: 'Electron', category: 'platform', currentVersion: process.versions.electron ?? UPDATE_CENTER_FRAMEWORK_VERSIONS.electron, source: { type: 'npm', packageName: 'electron' } },
+      { id: 'node', name: 'Node.js 内置 Pi 运行时', category: 'runtime', currentVersion: EMBEDDED_NODE_VERSION, source: { type: 'nodeDist' } },
       ...Object.entries(UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS).map(([packageName, currentVersion]) => ({
         id: packageName,
         name: packageName === '@earendil-works/pi-coding-agent' ? 'Pi' : packageName,
+        category: packageName === '@earendil-works/pi-coding-agent' ? 'runtime' as const : 'extension' as const,
         currentVersion,
         source: { type: 'npm' as const, packageName }
       })),
-      { id: 'cua-driver', name: 'Cua Driver', currentVersion: CUA_DRIVER_VERSION, source: { type: 'cuaGitHub' } }
+      { id: 'cua-driver', name: 'Cua Driver', category: 'runtime', currentVersion: CUA_DRIVER_VERSION, source: { type: 'cuaGitHub' } },
+      { id: 'vite', name: 'Vite', category: 'toolchain', currentVersion: UPDATE_CENTER_FRAMEWORK_VERSIONS.vite, source: { type: 'npm', packageName: 'vite' } },
+      { id: 'electron-vite', name: 'electron-vite', category: 'toolchain', currentVersion: UPDATE_CENTER_FRAMEWORK_VERSIONS['electron-vite'], source: { type: 'npm', packageName: 'electron-vite' } }
     ]
     const backend = withUpdateCenter(withComputerUsePermissions(withProjectDirectoryPicker(withOpenDocumentExternally(withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)), path => shell.openPath(path)), pickProjectDirectory), createElectronComputerUsePermissionHost({
       getMediaAccessStatus: media => systemPreferences.getMediaAccessStatus(media),

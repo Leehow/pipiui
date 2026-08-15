@@ -293,9 +293,9 @@ export function makeTerminalExperienceCandidate(
 ): MemoryExperienceCandidate | undefined {
   const agentName = boundedOneLine(input.agentName, 80);
   const agentID = boundedOneLine(input.agentID, 120);
-  if (!agentName || !["explore", "plan", "general-purpose", "reviewer", "long-test"].includes(agentName)) return undefined;
+  if (!agentName || !["explore", "general-purpose", "reviewer"].includes(agentName)) return undefined;
   if (input.evidenceClass !== "source-backed" && input.evidenceClass !== "verification-passed") return undefined;
-  const expectedEvidence = agentName === "general-purpose" || agentName === "long-test"
+  const expectedEvidence = agentName === "general-purpose"
     ? "verification-passed"
     : "source-backed";
   if (input.evidenceClass !== expectedEvidence) return undefined;

@@ -122,7 +122,13 @@ import {
 	type WorktreeRecoveryAction,
 } from "./worktree-recovery.ts";
 import type { WorktreeFinalizationStateV1 } from "../subagent-host/worktree/schema.ts";
-import { bindCanonicalComputerAgents, runtimeRolePolicyForAgent } from "./runtime-policy.ts";
+import {
+	bindCanonicalComputerAgents,
+	configuredHeartbeatAt,
+	createRunScopedTimeout,
+	normalizeGeneralPurposeExecutionPolicy,
+	runtimeRolePolicyForAgent,
+} from "./runtime-policy.ts";
 import { registerSubagentManagementTool } from "./agent-management.ts";
 import {
 	encodeAgentEventBridgeRequestV1,
@@ -1080,6 +1086,14 @@ interface RunSingleAgentOptions {
 	retainContext?: boolean;
 	/** Host-owned absolute deadline surfaced to UIs; it never grants the child more runtime. */
 	deadlineAt?: number;
+	/** Bundled general-purpose placement override; omission remains isolated. */
+	worktree?: "isolated" | "none";
+	/** Auditable Boss reason required for bundled general-purpose direct-cwd execution. */
+	noWorktreeReason?: string;
+	/** Bundled general-purpose regular wall-clock check-in cadence. */
+	heartbeatSecs?: number;
+	/** Bundled general-purpose absolute wall-clock runtime limit from first child spawn. */
+	timeoutSecs?: number;
 	/** Explicit per-task Computer Use grant; omission = no desktop tools. */
 	desktop?: "user-requested" | "ui-verify";
 	/** Runtime-owned scoped Computer Agent worker route; never model/frontmatter supplied. */
@@ -1863,7 +1877,9 @@ const CHECKIN_FIRST_MS = envPositiveSecs("PIPIUI_HEARTBEAT_SECS", 10 * 60) * 100
 const CHECKIN_SECOND_MS = CHECKIN_FIRST_MS * 2;
 const CHECKIN_REST_MS = CHECKIN_FIRST_MS * 3;
 
-function nextCheckinAt(startedAt: number, delivered: number): number {
+export function nextCheckinAt(startedAt: number, delivered: number, heartbeatMs?: number): number {
+	const configured = configuredHeartbeatAt(startedAt, delivered, heartbeatMs);
+	if (configured !== undefined) return configured;
 	let due = startedAt;
 	const count = Math.max(0, delivered);
 	for (let i = 0; i <= count; i++) {
@@ -1905,6 +1921,10 @@ interface RunningAgentHandle {
 	checkinInFlight?: boolean;
 	/** When this worker was dispatched; check-ins are scheduled from this instant. */
 	startedAt: number;
+	/** Boss-selected regular check-in interval for this run; absent preserves stepped defaults. */
+	heartbeatMs?: number;
+	/** Absolute runtime deadline for this exact generation, computed at first child spawn. */
+	deadlineAt?: number;
 	/**
 	 * The child has emitted close/error and this run is performing verify/end-report closeout.
 	 * This is set only after an actual child terminal event, so it cannot hide a child that
@@ -2913,10 +2933,10 @@ function selectCallerAgentIds(
  * Pure: `createsWorktree` is injected so this stays testable without an agent catalog.
  */
 export function unnamedWritableDispatchProblem(
-	targets: readonly { agent: string; agentId?: string }[],
-	createsWorktree: (agentName: string) => boolean,
+	targets: readonly { agent: string; agentId?: string; worktree?: "isolated" | "none" }[],
+	createsWorktree: (target: { agent: string; agentId?: string; worktree?: "isolated" | "none" }) => boolean,
 ): string | null {
-	const unnamed = targets.filter((target) => !target.agentId?.trim() && createsWorktree(target.agent));
+	const unnamed = targets.filter((target) => !target.agentId?.trim() && createsWorktree(target));
 	if (unnamed.length === 0) return null;
 	const names = [...new Set(unnamed.map((target) => `"${target.agent}"`))].join(", ");
 	return `Missing agentId for ${names}. A worker that writes code gets its own git branch named pipiui/<agentId>, so it needs a short semantic id naming the slice — e.g. "quota-pill", "doc-panel" (2-24 chars: lowercase letters, digits, "-", "_"). Re-dispatch with one agentId per writable task. Read-only roles may still omit it.`;
@@ -3980,34 +4000,11 @@ async function runSingleAgent(
 	// drift this id contract exists to prevent. Read-only roles never create a worktree or a
 	// branch, so a generated id for a one-shot report costs nothing and stays allowed.
 	const callerAgentId = options?.agentId?.trim() || undefined;
-	const createsWorktree = agent ? runtimeRolePolicyForAgent(agent).worktree === "isolated" : false;
-	const unnamedWritable = createsWorktree && !callerAgentId;
 	const pipiuiAgentId = callerAgentId ?? generatePipiuiAgentId();
 	// Capture this invocation's generation before any early failure path can return a result.
 	const runId = DeliveryObligationStore.runId();
 	const isBackground = options?.background === true;
 	localAgentReservations.add(pipiuiAgentId);
-
-	if (unnamedWritable) {
-		const reason = `Agent "${agentName}" writes code, so it needs a short semantic agentId — it becomes the git branch pipiui/<agentId>. Re-dispatch with one that names this slice, e.g. "quota-pill" or "doc-panel" (2-24 chars: lowercase letters, digits, "-", "_").`;
-		const fail: SingleResult = {
-			agent: agentName,
-			agentSource: agent?.origin ?? "unknown",
-			task,
-			exitCode: 1,
-			messages: [],
-			stderr: reason,
-			usage: emptyUsage(),
-			step,
-			agentId: pipiuiAgentId,
-			runId,
-			stopReason: "error",
-			errorMessage: reason,
-		};
-		jobFinalize(pipiuiAgentId, runId, { name: agentName, task, state: "failed", resultText: reason });
-		localAgentReservations.delete(pipiuiAgentId);
-		return fail;
-	}
 
 	if (!agent) {
 		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
@@ -4034,6 +4031,50 @@ async function runSingleAgent(
 		localAgentReservations.delete(pipiuiAgentId);
 		return fail;
 	}
+	const executionPolicyResult = normalizeGeneralPurposeExecutionPolicy(agent, options);
+	if (executionPolicyResult.problem) {
+		const reason = executionPolicyResult.problem;
+		localAgentReservations.delete(pipiuiAgentId);
+		return {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			title: options?.title,
+			exitCode: 1,
+			messages: [],
+			stderr: reason,
+			errorMessage: reason,
+			usage: emptyUsage(),
+			step,
+			agentId: pipiuiAgentId,
+			runId,
+			stopReason: "error",
+		};
+	}
+	const executionPolicy = executionPolicyResult.policy;
+	const runtimePolicy = runtimeRolePolicyForAgent(agent);
+	const createsWorktree = executionPolicy
+		? executionPolicy.worktree === "isolated"
+		: runtimePolicy.worktree === "isolated";
+	if (createsWorktree && !callerAgentId) {
+		const reason = `Agent "${agentName}" writes code, so it needs a short semantic agentId — it becomes the git branch pipiui/<agentId>. Re-dispatch with one that names this slice, e.g. "quota-pill" or "doc-panel" (2-24 chars: lowercase letters, digits, "-", "_").`;
+		jobFinalize(pipiuiAgentId, runId, { name: agentName, task, state: "failed", resultText: reason });
+		localAgentReservations.delete(pipiuiAgentId);
+		return {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			exitCode: 1,
+			messages: [],
+			stderr: reason,
+			errorMessage: reason,
+			usage: emptyUsage(),
+			step,
+			agentId: pipiuiAgentId,
+			runId,
+			stopReason: "error",
+		};
+	}
 	const leaseResult = acquireAgentLease(path.resolve(PIPIUI_MAIN_CWD || defaultCwd), pipiuiAgentId);
 	if (!leaseResult.lease) {
 		const message = leaseResult.problem;
@@ -4057,7 +4098,6 @@ async function runSingleAgent(
 	const agentLease = leaseResult.lease;
 	try {
 
-	const runtimePolicy = runtimeRolePolicyForAgent(agent);
 	// Pre-dispatch recall is advisory and fail-soft; the launcher never gains a
 	// backend handle and the serialized boundary remains visible to the child.
 	task = await advisoryMemoryForSubagent(runId, path.resolve(PIPIUI_MAIN_CWD || defaultCwd), task);
@@ -4141,13 +4181,18 @@ async function runSingleAgent(
 		&& memoryBrokerExtensionPathForChild(issuedMemoryBrokerEnvironment)
 		? issuedMemoryBrokerEnvironment
 		: undefined;
+	const placementPolicy = executionPolicy?.worktree === "none"
+		? { ...runtimePolicy, worktree: "direct" as const }
+		: runtimePolicy;
+	const targetBaseCwd = executionPolicy?.worktree === "isolated" ? (cwd ?? defaultCwd) : defaultCwd;
 	const placement = resolveSubagentWorktree({
 		mainCwd: PIPIUI_MAIN_CWD,
 		agentId: pipiuiAgentId,
-		defaultCwd,
-		explicitCwd: cwd, // only when caller passed cwd; undefined → auto worktree
+		defaultCwd: targetBaseCwd,
+		explicitCwd: executionPolicy?.worktree === "isolated" ? undefined : cwd,
 		readOnly: agent.traits.readOnly,
-		policy: runtimePolicy,
+		policy: placementPolicy,
+		allowEnvironmentOptOut: executionPolicy?.worktree === "isolated" ? false : undefined,
 	});
 	const resolvedModel = resolveAgentModel(agentName, agent.model, options?.sessionModel);
 	// Tool-selected thinking belongs to this one dispatch only; it never reads the Boss's
@@ -4350,6 +4395,7 @@ async function runSingleAgent(
 			checkinCount: 0,
 			checkinInFlight: false,
 			startedAt: Date.now(),
+			...(executionPolicy?.heartbeatMs ? { heartbeatMs: executionPolicy.heartbeatMs } : {}),
 			finalizing: false,
 		});
 	const pipiuiUpdate = (force = false) => {
@@ -4381,12 +4427,20 @@ async function runSingleAgent(
 		}
 	};
 
+	let runtimeTimedOut = false;
+	let runtimeTimeout: ReturnType<typeof createRunScopedTimeout> | undefined;
+	let firstChildSpawnedAt: number | undefined;
 	try {
 		// Central child prompt: the agent's own system prompt plus, for desktop-
 		// granted dispatches only, the shared Computer Use policy (applies to ALL
 		// subagents — a grant never turns desktop into a general-purpose tool).
 		const promptParts: string[] = [];
 		if (agent.systemPrompt.trim()) promptParts.push(agent.systemPrompt);
+		if (executionPolicy?.worktree === "none" && executionPolicy.noWorktreeReason) {
+			promptParts.push(
+				`[Runtime placement: shared cwd]\nThe Boss explicitly disabled worktree isolation for this dispatch. Reason: ${executionPolicy.noWorktreeReason}\nOperate directly in the assigned cwd. Do not assume automatic merge, cleanup, or isolation from concurrent work.`,
+			);
+		}
 		for (const skillPath of options?.privateSkillPaths ?? []) {
 			try {
 				const content = fs.readFileSync(skillPath, "utf8").trim();
@@ -4473,6 +4527,33 @@ async function runSingleAgent(
 					env: childEnv,
 				});
 				pipiuiTrackChild(proc);
+				if (firstChildSpawnedAt === undefined) {
+					firstChildSpawnedAt = Date.now();
+					const handle = handleForRun(pipiuiAgentId, runId);
+					if (handle) handle.startedAt = firstChildSpawnedAt;
+				}
+				if (executionPolicy?.timeoutMs !== undefined && runtimeTimeout === undefined) {
+					runtimeTimeout = createRunScopedTimeout({
+						runId,
+						timeoutMs: executionPolicy.timeoutMs,
+						now: () => firstChildSpawnedAt!,
+						isCurrentRun: (candidateRunId) => handleForRun(pipiuiAgentId, candidateRunId) !== undefined,
+						onTimeout() {
+							runtimeTimedOut = true;
+							currentResult.stopReason = "runtime_timeout";
+							currentResult.errorMessage = `runtime_timeout: exceeded ${executionPolicy.timeoutMs! / 1000}s absolute runtime limit`;
+							pipiuiActivity = currentResult.errorMessage;
+							pipiuiUpdate(true);
+							handleForRun(pipiuiAgentId, runId)?.controller.abort();
+						},
+					});
+					const handle = handleForRun(pipiuiAgentId, runId);
+					if (handle) {
+						handle.startedAt = runtimeTimeout.deadlineAt - executionPolicy.timeoutMs;
+						handle.deadlineAt = runtimeTimeout.deadlineAt;
+					}
+					pipiuiReport({ kind: "update", agentId: pipiuiAgentId, runId, deadlineAt: runtimeTimeout.deadlineAt });
+				}
 				let procExited = false;
 				const terminateAttempt = () => {
 					if (procExited) return;
@@ -4965,7 +5046,12 @@ async function runSingleAgent(
 			if (abortedDuringBackoff || waitSignal?.aborted) {
 				wasAborted = true;
 				break;
-			}		}
+			}
+		}
+		// The absolute task timer spans retry attempts/backoff, then stops as soon as the
+		// final child attempt has settled; verify/finalization are not child runtime.
+		runtimeTimeout?.dispose();
+		runtimeTimeout = undefined;
 
 		// Child close/error has ended the live process. Keep its handle explicitly finalizing
 		// through verify + end reporting so the 30s watchdog cannot manufacture interruption.
@@ -4994,6 +5080,11 @@ async function runSingleAgent(
 		let endOutput = (getFinalOutput(currentResult.messages) || currentResult.stderr || "").slice(-8000);
 		let endResultText =
 			getResultOutput(currentResult) || currentResult.stderr || getFinalOutput(currentResult.messages) || "(no output)";
+		if (runtimeTimedOut && currentResult.errorMessage) {
+			const timeoutNote = `\n[pipiui] ${currentResult.errorMessage}`;
+			if (!endOutput.includes(currentResult.errorMessage)) endOutput += timeoutNote;
+			if (!endResultText.includes(currentResult.errorMessage)) endResultText += timeoutNote;
+		}
 		if (modelFallbackNotes.length > 0) {
 			const note = modelFallbackNotes.join("");
 			endOutput += note;
@@ -5017,7 +5108,8 @@ async function runSingleAgent(
 		}
 		// Terminal job state before bridge end/notify so a watchdog-only interruption is corrected
 		// even while the bridge report is awaiting its bounded network timeout.
-		const endState: JobState = wasAborted ? "aborted" : endOk ? "ok" : "failed";
+		const externallyAborted = wasAborted && !runtimeTimedOut;
+		const endState: JobState = externallyAborted ? "aborted" : endOk ? "ok" : "failed";
 		const terminalFinalized = jobFinalize(pipiuiAgentId, runId, {
 			name: agentName,
 			task,
@@ -5097,7 +5189,7 @@ async function runSingleAgent(
 			agentId: pipiuiAgentId,
 			runId,
 			ok: endOk,
-			aborted: wasAborted,
+			aborted: externallyAborted,
 			output: endOutput,
 			cost: currentResult.usage.cost,
 			turns: currentResult.usage.turns,
@@ -5114,9 +5206,10 @@ async function runSingleAgent(
 					}
 				: {}),
 		});
-		if (wasAborted) throw new Error("Subagent was aborted");
+		if (wasAborted && !runtimeTimedOut) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
+		runtimeTimeout?.dispose();
 		deleteRunningAgentHandle(pipiuiAgentId, runId);
 		if (sessionDir) pruneAgentSessions(sessionDir, "completed");
 		if (tmpPromptPath)
@@ -5185,6 +5278,23 @@ const ThinkingParam = Type.Optional(
 		description: THINKING_PARAM_DESCRIPTION,
 	}),
 );
+const WorktreeParam = Type.Optional(
+	StringEnum(["isolated", "none"] as const, {
+		description: 'Bundled general-purpose only. Default "isolated". "none" requires noWorktreeReason.',
+	}),
+);
+const NoWorktreeReasonParam = Type.Optional(
+	Type.String({
+		maxLength: 500,
+		description: 'Bundled general-purpose only. Required with worktree="none": the Boss audit reason, one non-empty line.',
+	}),
+);
+const HeartbeatSecsParam = Type.Optional(
+	Type.Integer({ minimum: 30, maximum: 3600, description: "Bundled general-purpose only. Regular wall-clock check-in interval in seconds; omission preserves 10/+20/+30 minute defaults." }),
+);
+const TimeoutSecsParam = Type.Optional(
+	Type.Integer({ minimum: 30, maximum: 604800, description: "Bundled general-purpose only. Absolute wall-clock hard timeout in seconds from actual child spawn." }),
+);
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
@@ -5221,6 +5331,10 @@ const ChainItem = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	thinking: ThinkingParam,
+	worktree: WorktreeParam,
+	noWorktreeReason: NoWorktreeReasonParam,
+	heartbeatSecs: HeartbeatSecsParam,
+	timeoutSecs: TimeoutSecsParam,
 	desktop: Type.Optional(
 		StringEnum(["user-requested", "ui-verify"] as const, {
 			description: DESKTOP_PARAM_DESCRIPTION,
@@ -5254,6 +5368,10 @@ const SubagentParams = Type.Object({
 	title: Type.Optional(Type.String({ description: "Short one-line title; omit to fall back to task text." })),
 	blockedBy: BlockedByParam,
 	thinking: ThinkingParam,
+	worktree: WorktreeParam,
+	noWorktreeReason: NoWorktreeReasonParam,
+	heartbeatSecs: HeartbeatSecsParam,
+	timeoutSecs: TimeoutSecsParam,
 	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process." })),
@@ -5283,6 +5401,10 @@ type SubagentExecuteParams = {
 	title?: string;
 	blockedBy?: string[];
 	thinking?: string;
+	worktree?: "isolated" | "none";
+	noWorktreeReason?: string;
+	heartbeatSecs?: number;
+	timeoutSecs?: number;
 	agentId?: string;
 	runId?: string;
 	reason?: string;
@@ -5298,6 +5420,10 @@ type SubagentExecuteParams = {
 		cwd?: string;
 		verify?: string;
 		thinking?: string;
+		worktree?: "isolated" | "none";
+		noWorktreeReason?: string;
+		heartbeatSecs?: number;
+		timeoutSecs?: number;
 		desktop?: "user-requested" | "ui-verify";
 	}>;
 	tasks?: Array<{
@@ -6246,7 +6372,7 @@ export default function (pi: ExtensionAPI) {
 			if (isHandleVanished(handle, now)) continue;
 			if (stalledInfoFor(agentId, now).stalled) continue;
 			const delivered = handle.checkinCount ?? 0;
-			if (now < nextCheckinAt(handle.startedAt, delivered)) continue;
+			if (now < nextCheckinAt(handle.startedAt, delivered, handle.heartbeatMs)) continue;
 			due.push({ agentId, handle });
 		}
 		if (due.length > 0) {
@@ -6271,10 +6397,12 @@ export default function (pi: ExtensionAPI) {
 			}
 			lines.push(
 				"This is a wall-clock check-in while the worker is still producing output, not a stall.",
-				"Compare each worker's last activity to its assigned task. If it has drifted, abort and re-dispatch by a materially different route, or abort and ask the user. If it is still on task, keep waiting (say why).",
-				"Do not re-dispatch a worker that is still running; that puts two agents in the same files.",
+				"This heartbeat requires one latest-state check in this same Boss turn before any wait decision. For multiple workers in this batch, call one unfiltered subagent_status; do not poll each worker separately. If this turn already has a full latest snapshot covering the same target worker(s), reuse it instead of issuing a duplicate status call.",
+				"Compare each worker's original task against its latest activity, output, and tool phase, then explicitly classify it as on-task, possible-drift, or drifted.",
+				"Only on-task may continue waiting, with a brief reason. For possible-drift, query that exact worker/detail and classify again before deciding. For drifted, abort it; wait for the old run to become terminal, then re-dispatch by a materially different route.",
+				"Never dispatch a replacement while the old worker is still running; two workers must not write the same files concurrently.",
 				...snapshots,
-				"Do not treat this as a new user request. Call subagent_status only if this snapshot is not enough to decide.",
+				"Do not treat this as a new user request; perform the required status-and-drift review as heartbeat handling in the current turn.",
 			);
 			void trySendUserMessage(pi, lines.join("\n")).then((ok) => {
 				for (const { handle } of due) {
@@ -6519,6 +6647,10 @@ export default function (pi: ExtensionAPI) {
 				fresh?: boolean,
 				desktop?: "user-requested" | "ui-verify",
 				blockedBy?: string[],
+				worktree?: "isolated" | "none",
+				noWorktreeReason?: string,
+				heartbeatSecs?: number,
+				timeoutSecs?: number,
 			): void => {
 				void runSingleAgent(
 					ctx.cwd,
@@ -6530,7 +6662,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ toolCallId, background: true, agentId, title, sessionModel, verify, thinking, fresh, desktop, blockedBy },
+					{ toolCallId, background: true, agentId, title, sessionModel, verify, thinking, fresh, desktop, blockedBy, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs },
 				)
 					.then((result) => {
 						notifySubagentDone(pi, result);
@@ -6735,6 +6867,22 @@ export default function (pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
+			const executionTargets = hasChain
+				? (params.chain ?? [])
+				: hasSingle
+					? [params]
+					: [];
+			for (const target of executionTargets) {
+				const config = agents.find((agent) => agent.name === target.agent)!;
+				const normalized = normalizeGeneralPurposeExecutionPolicy(config, target);
+				if (normalized.problem) {
+					return {
+						content: [{ type: "text", text: normalized.problem }],
+						details: makeDetails(hasChain ? "chain" : "single")([]),
+						isError: true,
+					};
+				}
+			}
 
 			// This is deliberately after the final await/validation and immediately before
 			// dispatch. Add to the module reservation set synchronously so a concurrent tool call
@@ -6757,13 +6905,15 @@ export default function (pi: ExtensionAPI) {
 			);
 			const writableProblem = unnamedWritableDispatchProblem(
 				hasChain
-					? (params.chain ?? []).map((step) => ({ agent: step.agent, agentId: step.agentId }))
+					? (params.chain ?? []).map((step) => ({ agent: step.agent, agentId: step.agentId, worktree: step.worktree }))
 					: hasTasks
 						? (params.tasks ?? []).map((task) => ({ agent: task.agent, agentId: task.agentId }))
-						: [{ agent: params.agent!, agentId: params.agentId }],
-				(agentName) => {
-					const config = agents.find((agent) => agent.name === agentName);
-					return config ? runtimeRolePolicyForAgent(config).worktree === "isolated" : false;
+						: [{ agent: params.agent!, agentId: params.agentId, worktree: params.worktree }],
+				(target) => {
+					const config = agents.find((agent) => agent.name === target.agent);
+					if (!config) return false;
+					const execution = normalizeGeneralPurposeExecutionPolicy(config, target).policy;
+					return execution ? execution.worktree === "isolated" : runtimeRolePolicyForAgent(config).worktree === "isolated";
 				},
 			);
 			if (writableProblem) {
@@ -6833,6 +6983,10 @@ export default function (pi: ExtensionAPI) {
 							thinking: step.thinking,
 							agentId: step.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
 							desktop: step.desktop,
+							worktree: step.worktree,
+							noWorktreeReason: step.noWorktreeReason,
+							heartbeatSecs: step.heartbeatSecs,
+							timeoutSecs: step.timeoutSecs,
 						},
 					);
 					results.push(result);
@@ -7097,7 +7251,7 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 					const agentId = params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
-					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy);
+					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs);
 					const placeholder: SingleResult = {
 						agent: params.agent,
 						agentId,
@@ -7148,6 +7302,10 @@ export default function (pi: ExtensionAPI) {
 						fresh: params.fresh,
 						desktop: params.desktop,
 						blockedBy: params.blockedBy,
+						worktree: params.worktree,
+						noWorktreeReason: params.noWorktreeReason,
+						heartbeatSecs: params.heartbeatSecs,
+						timeoutSecs: params.timeoutSecs,
 					},
 				);
 				const isError = isFailedResult(result);

@@ -20,7 +20,7 @@
     "@pipi/account-usage-core": "file:../account-usage-core",
     "@pipi/host-api": "file:../host-api",
     "pi-mcp-extension": "1.5.0",
-    "pi-web-access": "0.20.0"
+    "pi-web-access": "0.23.0"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

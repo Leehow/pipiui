@@ -142,9 +142,40 @@ export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
       previous.timestamp = entry.timestamp
       continue
     }
-    messages.push({ id: entry.id, role: entry.role, content: entry.role === 'user' ? stripAttachmentPathsForDisplay(entry.content) : entry.content, ...(entry.role === 'assistant' && entry.errorMessage ? { error: entry.errorMessage } : {}), ...(entry.role === 'user' && entry.images?.length ? { images: entry.images } : {}) })
+    messages.push({ id: entry.id, role: entry.role, content: entry.role === 'user' ? stripAttachmentPathsForDisplay(entry.content) : entry.content, timestamp: entry.timestamp, ...(entry.role === 'assistant' && entry.errorMessage ? { error: entry.errorMessage } : {}), ...(entry.role === 'user' && entry.images?.length ? { images: entry.images } : {}) })
   }
   return messages
+}
+
+/** Stable persisted-transcript identity. It intentionally describes ordered
+ *  message content/ids rather than ancestry by timestamp: branch and compaction
+ *  snapshots may legitimately be shorter or carry equal/earlier timestamps. */
+export function transcriptFingerprint(messages: readonly ChatMessage[]): string {
+  return JSON.stringify(messages.map(message => ({
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    error: message.error,
+    thinking: message.thinking,
+    tools: message.tools?.map(tool => ({ id: tool.id, name: tool.name, input: tool.input, result: tool.result, error: tool.error })),
+    activities: message.activities?.map(activity => activity.type === 'tool'
+      ? { type: activity.type, contentIndex: activity.contentIndex, toolId: activity.tool.id, result: activity.tool.result, error: activity.tool.error }
+      : { type: activity.type, contentIndex: activity.contentIndex, content: activity.content }),
+    images: message.images?.map(image => ({ mimeType: image.mimeType, size: image.data.length })),
+  })))
+}
+
+export function reconcileHistorySnapshot(
+  entries: HistoryEntry[],
+  requestLiveRevision: number,
+  currentLiveRevision: number,
+  previousFingerprint?: string,
+): { status: 'accepted' | 'unchanged' | 'stale-request'; messages: ChatMessage[]; fingerprint: string } {
+  const messages = historyMessages(entries)
+  const fingerprint = transcriptFingerprint(messages)
+  if (requestLiveRevision !== currentLiveRevision) return { status: 'stale-request', messages, fingerprint }
+  if (fingerprint === previousFingerprint) return { status: 'unchanged', messages, fingerprint }
+  return { status: 'accepted', messages, fingerprint }
 }
 
 export function appendLiveUserMessage(messages: ChatMessage[], incoming: { content: string; id?: string; images?: ChatMessage['images'] }, match?: { id: string; content: string }): ChatMessage[] {
