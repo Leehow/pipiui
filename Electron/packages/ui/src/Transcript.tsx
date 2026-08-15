@@ -10,6 +10,7 @@ import { WaitingPlaceholder, type WaitingPhase } from './WaitingPlaceholder'
 import { buildRailPrompts } from './prompt-rail'
 import { parseSubagentNotice } from './subagent-notice'
 import { parseSubagentSignal } from './subagent-signal'
+import { TruncatedText } from './TruncatedText'
 import type { ChatMessage } from './transcript-model'
 
 export type MessageActionHandlers = { onCopy: (message: ChatMessage) => Promise<void>; onResend: (message: ChatMessage) => void; resendDisabled: boolean; copiedId: string | null }
@@ -51,6 +52,6 @@ export const MessageView = memo(function MessageView({ message, showFooter, docu
   const actions = showFooter && !signal ? <MessageActionBar alignment="trailing" canCopy canResend={message.role === 'user' && Boolean(message.content.trim())} copyDisabled={copyDisabled} resendDisabled={resendDisabled} onCopy={copy} onResend={() => onResend(message)} copied={copied} /> : null
   const footer = actions || time ? <div className="message-footer">{time}{actions}</div> : null
   if (message.role === 'user') return signal ? <article className="message user-message subagent-signal-message"><div className="subagent-signal-stack"><SubagentSignalCard content={message.content} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} />{time}</div></article> : <article className="message user-message" data-user-prompt={message.id}><div className="user-message-stack"><UserMessageBubble text={message.content} images={message.images} /></div>{footer}</article>
-  if (message.role === 'tool') { const notice = parseSubagentNotice(message.content); return notice ? <article className="message assistant-message"><CollapsibleActivityCard kind="result" label="子任务" summary={notice.name} meta={`${notice.ok ? '成功' : '失败'} · ${notice.cost}`} error={!notice.ok}><pre>{message.content}</pre></CollapsibleActivityCard>{footer}</article> : <article className="system-message tool-message"><div>{message.content}</div>{footer}</article> }
+  if (message.role === 'tool') { const notice = parseSubagentNotice(message.content); return notice ? <article className="message assistant-message"><CollapsibleActivityCard kind="result" label="子任务" summary={notice.name} meta={`${notice.ok ? '成功' : '失败'} · ${notice.cost}`} error={!notice.ok}><pre><TruncatedText text={message.content} /></pre></CollapsibleActivityCard>{footer}</article> : <article className="system-message tool-message"><div><TruncatedText text={message.content} /></div>{footer}</article> }
   return <article className="message assistant-message"><AssistantTranscriptContent message={message} onOpenSubagents={onOpenSubagents} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} />{footer}</article>
 })

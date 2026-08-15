@@ -206,6 +206,9 @@ body{overscroll-behavior:none}
 .activity-card-thinking .activity-details p{margin:0;color:var(--muted);font-size:13px;line-height:1.6;white-space:pre-wrap}
 /* Labeled tool input/output sections inside an expanded tool card. */
 .tool-io{margin:0 0 6px}.tool-io:last-child{margin-bottom:0}.tool-io-label{padding:5px 0 3px;color:var(--subtle);font-size:9.5px;font-weight:600;letter-spacing:.05em;text-transform:uppercase}
+.truncated-text-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:6px;color:var(--muted);font-size:11px;line-height:1.4;white-space:normal}
+.truncated-text-toggle{padding:1px 6px;border-radius:5px;color:var(--accent);font-size:11px}
+.truncated-text-toggle:hover{background:var(--surface-hover)}
 /* Screenshot thumbnails in tool results (computer use, browser, etc.). */
 .tool-images{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 6px}.tool-screenshot{max-width:100%;max-height:300px;border:1px solid var(--border);border-radius:6px;object-fit:contain;cursor:zoom-in}
 /* Streamdown 2.5.0 code copy button: hover-reveal only. Identity lives in data-streamdown attributes, not classes — the button's className is tailwind-only (dist/chunk-BO2N2NFS.js: div[data-streamdown="code-block"] > … > button[data-streamdown="code-block-copy-button"][title="Copy Code"]). A button[title="Copy Code"] fallback (translations.copyCode) guards against the data attribute changing in future versions. Opacity only, so the button stays clickable once revealed. Verified in a real browser (dev server): idle opacity 0, container hover → 1, click works, unhover → 0. */

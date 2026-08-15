@@ -8,6 +8,7 @@ import { formatCompactTokens } from './session-stats-format'
 import { DocumentReferenceCards } from './DocumentReferenceCards'
 import { LiveSubagentCard } from './LiveSubagentCard'
 import { useLiveSubagentBindings } from './LiveSubagentBinding'
+import { TruncatedText } from './TruncatedText'
 import type { ChatMessage, TranscriptActivity, TranscriptTool } from './transcript-model'
 import { activitiesFromMessage, planAssistantTranscript } from './transcript-model'
 
@@ -41,7 +42,7 @@ const TranscriptToolCard = memo(function TranscriptToolCard({ tool, streaming }:
   return <ActivityCard kind="tool" summary={summary} meta={meta} error={Boolean(tool.error || (subagentNotice && !subagentNotice.ok))} defaultExpanded={tool.name === 'subagent' ? (Boolean(streaming) || !tool.finished || Boolean(tool.dispatched)) : false}>
     {tool.images && tool.images.length > 0 && <div className="tool-images">{tool.images.map((img, i) => <img key={i} className="tool-screenshot" src={`data:${img.mimeType};base64,${img.data}`} alt="工具截图" loading="lazy" />)}</div>}
     {tool.input && <div className="tool-io"><div className="tool-io-label">输入</div><pre>{formatToolInput(tool.name, tool.input)}</pre></div>}
-    {tool.result && <div className="tool-io"><div className="tool-io-label">输出</div><div className="tool-result">{tool.result}</div></div>}
+    {tool.result && <div className="tool-io"><div className="tool-io-label">输出</div><div className="tool-result"><TruncatedText text={tool.result} /></div></div>}
   </ActivityCard>
 })
 
