@@ -87,6 +87,12 @@ export type GitBranchCleanupResultV1 = {
 	message: string;
 };
 
+export type GitWorktreeListResultV1 = {
+	ok: boolean;
+	worktrees: RegisteredGitWorktreeV1[];
+	error?: string;
+};
+
 /**
  * Adapter boundary for Electron main. It owns Git only; scheduling, process
  * supervision, and persistence remain above it. Every mutating method is
@@ -102,6 +108,9 @@ export interface GitWorktreeAdapter {
 		branch: string;
 		expectedWorktreePath?: string;
 	}): Promise<GitBranchCleanupResultV1>;
+	/** Optional listing seam used by leftover sweep; finalize-only fakes may omit it. */
+	listRegisteredWorktrees?(mainCwd: string): Promise<GitWorktreeListResultV1>;
+	repositoryToplevel?(mainCwd: string): Promise<string | undefined>;
 }
 
 type ParsedStatusV1 = {
@@ -320,6 +329,21 @@ export class NodeGitWorktreeAdapter implements GitWorktreeAdapter {
 			...(workerBranchChangedPaths ? { workerBranchChangedPaths } : {}),
 			errors,
 		};
+	}
+
+	async listRegisteredWorktrees(mainCwd: string): Promise<GitWorktreeListResultV1> {
+		if (!safeAbsolutePath(mainCwd)) return { ok: false, worktrees: [], error: "repository path is invalid" };
+		const list = await this.runGit(mainCwd, ["worktree", "list", "--porcelain"]);
+		if (!list.ok) return { ok: false, worktrees: [], error: operationMessage(list) };
+		return { ok: true, worktrees: parseWorktreeListPorcelainV1(list.stdout) };
+	}
+
+	async repositoryToplevel(mainCwd: string): Promise<string | undefined> {
+		if (!safeAbsolutePath(mainCwd)) return undefined;
+		const result = await this.runGit(mainCwd, ["rev-parse", "--show-toplevel"]);
+		if (!result.ok || !result.stdout.trim()) return undefined;
+		const top = result.stdout.trim();
+		return canonicalGitPathV1(path.isAbsolute(top) ? top : path.resolve(mainCwd, top));
 	}
 
 	/** Existing Swift behavior: `git merge --no-edit <branch>` (not ff-only). */

@@ -22,6 +22,13 @@ export interface AgentLease {
 }
 
 export type AgentLeaseResult = { lease: AgentLease; problem?: never } | { lease?: never; problem: string };
+export type AgentLeasePresence = "absent" | "live" | "stale" | "blocked";
+export type AgentLeaseInspection = {
+	status: AgentLeasePresence;
+	filePath: string;
+	record?: AgentLeaseRecord;
+	reason?: string;
+};
 const AGENT_LEASE_INVALID_GRACE_MS = 30_000;
 
 function leaseProcessIdentity(pid: number): string | undefined {
@@ -59,8 +66,71 @@ function leaseProcessIsAlive(record: AgentLeaseRecord): boolean {
 	return currentIdentity === undefined || currentIdentity === record.processIdentity;
 }
 
-function agentLeaseFile(mainCwd: string, agentId: string): string {
+export function agentLeaseFile(mainCwd: string, agentId: string): string {
 	return path.join(mainCwd, ".pi", "agent-leases", `${agentId}.lease`);
+}
+
+function parseAgentLeaseRecord(raw: unknown): AgentLeaseRecord | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const candidate = raw as Record<string, unknown>;
+	if (typeof candidate.agentId !== "string" || !candidate.agentId.trim()) return undefined;
+	if (!Number.isSafeInteger(candidate.pid) || (candidate.pid as number) <= 0) return undefined;
+	if (typeof candidate.token !== "string" || !candidate.token) return undefined;
+	if (typeof candidate.createdAt !== "number" || !Number.isFinite(candidate.createdAt)) return undefined;
+	return {
+		agentId: candidate.agentId,
+		pid: candidate.pid as number,
+		...(typeof candidate.processIdentity === "string" ? { processIdentity: candidate.processIdentity } : {}),
+		token: candidate.token,
+		createdAt: candidate.createdAt,
+	};
+}
+
+/** Read one lease file without sending a signal. Live pid (or unreadable-young) stays blocked. */
+export function inspectAgentLease(mainCwd: string, agentId: string): AgentLeaseInspection {
+	const filePath = agentLeaseFile(mainCwd, agentId);
+	let ageMs = 0;
+	try {
+		ageMs = Math.max(0, Date.now() - fs.statSync(filePath).mtimeMs);
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return { status: "absent", filePath };
+		return { status: "blocked", filePath, reason: err instanceof Error ? err.message : String(err) };
+	}
+	let record: AgentLeaseRecord | undefined;
+	try {
+		record = parseAgentLeaseRecord(JSON.parse(fs.readFileSync(filePath, "utf8")));
+	} catch {
+		record = undefined;
+	}
+	if (!record) {
+		if (ageMs < AGENT_LEASE_INVALID_GRACE_MS) {
+			return { status: "blocked", filePath, reason: "lease is still initializing" };
+		}
+		return { status: "stale", filePath, reason: "aged-invalid lease" };
+	}
+	if (record.agentId !== agentId) {
+		return { status: "blocked", filePath, record, reason: "lease agentId does not match" };
+	}
+	if (leaseProcessIsAlive(record)) return { status: "live", filePath, record };
+	return { status: "stale", filePath, record, reason: "lease owner pid is not alive" };
+}
+
+/** Atomically claim and drop a dead-owner or aged-invalid lease. Live leases are left untouched. */
+export function reapStaleAgentLease(mainCwd: string, agentId: string): boolean {
+	const inspection = inspectAgentLease(mainCwd, agentId);
+	if (inspection.status !== "stale") return false;
+	const tomb = `${inspection.filePath}.stale-${process.pid}-${randomBytes(6).toString("hex")}`;
+	try {
+		fs.renameSync(inspection.filePath, tomb);
+	} catch (err) {
+		return (err as NodeJS.ErrnoException)?.code === "ENOENT";
+	}
+	try {
+		fs.rmSync(tomb, { force: true });
+	} catch {
+		// The tomb is unaddressable as a live lease.
+	}
+	return true;
 }
 
 function createAgentLeaseFile(filePath: string, agentId: string): AgentLease {
