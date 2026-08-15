@@ -6,7 +6,7 @@ import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
 
 export type Feature = "philosophy"|"plan"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
-export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"computerUse"|"webview"|"terminal"|"runtimeInfo"|"subagentDir"|"agentsDir", string>>;
+export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
 export type SpawnInput = { sessionPath?: string; cwd: string; runtimeRoot?: string; agentDir?: string; sessionsRoot?: string; resourceMode?: "default"|"explicit"; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; /** Optional full provider/model reference for Hermes background review. */ memoryReviewModelId?: string; subagentModelsFile?: string; /** The user's Settings → 工具开关 denylist. Merged with the Boss read-only policy; never passed to workers. */ disabledToolNames?: readonly string[] };
 export type SpawnOutput = { args: string[]; env: Record<string,string> };
@@ -81,7 +81,7 @@ if(enabled(f,"subagent")&&p.subagentDir){ext(args,p.subagentDir);env.PIPIUI_SUBA
 // exactly one finalizer ever runs against a repository.
 env.PIPIUI_WORKTREE_FINALIZER="pi";
 if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI_MAIN_MODEL=input.mainModelId;if(input.subagentModelsFile)env.PIPIUI_SUBAGENT_MODELS_FILE=input.subagentModelsFile;env.PIPIUI_COMPUTER_PROCEDURE_STORE=join(homedir(),"Library","Application Support","PipiUI","computer-agent","procedures.json")}
-if(!input.bridgePort){ext(args,p.runtimeInfo);return{args,env};}
+if(!input.bridgePort){ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env};}
 // Genuinely bridge-dependent: the memory broker issues host-scoped capabilities, the webview
 // extension drives the host's browser surface, and an explicitly enabled plan runtime posts events.
 if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PIPIUI_MEMORY_BROKER_MODE="main";env.PIPIUI_MEMORY_PROJECT_ROOT=input.cwd;if(input.memoryReviewModelId)env.PIPIUI_MEMORY_REVIEW_MODEL=input.memoryReviewModelId;if(p.hermesMemory){env.PIPIUI_HERMES_PACKAGE_ROOT=p.hermesMemory;env.PIPIUI_HERMES_NODE_MODULES_ROOT=dirname(p.hermesMemory)}}}if(enabled(f,"browser"))ext(args,p.webview);
@@ -98,9 +98,10 @@ if(enabled(f,"computerUse")&&enabled(f,"subagent")&&p.subagentDir&&p.computerUse
 // GUI Operator children; never register mutating computer/open_application tools
 // directly in the main session.
 env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.19.2";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
-// Mounted last so its read-only request observer sees the final provider payload after all
+// The update-center input transformer is a main-session policy seam, independent of the bridge.
+// runtimeInfo stays last so its read-only request observer sees the final provider payload after all
 // PipiUI rewriters. The isolated title helper passes no runtimeInfo path and remains tool-free.
-ext(args,p.runtimeInfo);return{args,env}; }
+ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env}; }
 function declaredEntrypoint(root:string):string|undefined {
   try {
     const manifest=JSON.parse(readFileSync(join(root,"package.json"),"utf8"));
@@ -238,6 +239,7 @@ export function resolveSpawnPaths(runtimeRoot:string=defaultRuntimeRoot(),option
     webview:fileIfPresent(extensions,"pipiui-electron-webview.ts"),
     browserSearch:fileIfPresent(extensions,"pipiui-browser-search.ts"),
     terminal:fileIfPresent(extensions,"pipiui-electron-terminal.ts"),
+    updateCenter:fileIfPresent(extensions,"pipiui-update-center.ts"),
     runtimeInfo:fileIfPresent(extensions,"pipiui-runtime-info.ts"),
     subagentDir:fileIfPresent(ext,"subagent"),
     agentsDir:fileIfPresent(ext,"agents"),

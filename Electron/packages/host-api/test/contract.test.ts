@@ -1,10 +1,33 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
-import { createIpcHost, createWsHost, resolveThinkingLevel, thinkingLevelsForModel, type HostBackend, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences } from '../src/index.js'
+import { createIpcHost, createWsHost, encodePipiuiUpdateEvaluationIntent, PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX, PIPIUI_UPDATE_EVALUATION_INTENT_VERSION, resolveThinkingLevel, thinkingLevelsForModel, type HostBackend, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences } from '../src/index.js'
 import { registerPipiHostIpc } from '../../../apps/electron/src/main/index.js'
 import { createWsHostServer } from '../../../apps/server/src/index.js'
 
 type Factory = () => Promise<{ host: PipiHostAPI; close(): Promise<void> }>
+
+describe('update evaluation intent envelope', () => {
+  it('encodes only the versioned minimal renderer-to-Pi fields', () => {
+    const encoded = encodePipiuiUpdateEvaluationIntent({
+      id: 'pi',
+      name: 'Pi',
+      packageName: '@earendil-works/pi-coding-agent',
+      currentVersion: '0.84.0',
+      latestVersion: '0.84.2',
+    })
+    expect(encoded.startsWith(PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX)).toBe(true)
+    expect(JSON.parse(encoded.slice(PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX.length))).toEqual({
+      version: PIPIUI_UPDATE_EVALUATION_INTENT_VERSION,
+      id: 'pi',
+      name: 'Pi',
+      packageName: '@earendil-works/pi-coding-agent',
+      currentVersion: '0.84.0',
+      latestVersion: '0.84.2',
+    })
+    expect(encoded).not.toContain('release notes')
+    expect(encoded).not.toContain('lockfile')
+  })
+})
 
 describe('thinking capability tri-state helper', () => {
   const unknown = { provider: 'unknown', id: 'unknown', name: 'Unknown' }

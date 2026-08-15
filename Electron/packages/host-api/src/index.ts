@@ -161,6 +161,28 @@ export type UpdateCenterItem = {
   error?: string;
 };
 export type UpdateCenterSnapshot = { checkedAt: number; items: UpdateCenterItem[] };
+/** Stable renderer-to-Pi seam. Policy expansion is owned by the bundled Pi extension. */
+export const PIPIUI_UPDATE_EVALUATION_INTENT_VERSION = 1 as const;
+export const PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX = "[[PIPIUI_UPDATE_EVALUATION_INTENT]]";
+export type PipiuiUpdateEvaluationIntent = {
+  version: typeof PIPIUI_UPDATE_EVALUATION_INTENT_VERSION;
+  id: string;
+  name: string;
+  packageName?: string;
+  currentVersion: string;
+  latestVersion: string;
+};
+export type PipiuiUpdateEvaluationIntentFields = Omit<PipiuiUpdateEvaluationIntent, "version">;
+export function encodePipiuiUpdateEvaluationIntent(fields: PipiuiUpdateEvaluationIntentFields): string {
+  return `${PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX}${JSON.stringify({
+    version: PIPIUI_UPDATE_EVALUATION_INTENT_VERSION,
+    id: fields.id,
+    name: fields.name,
+    ...(fields.packageName === undefined ? {} : { packageName: fields.packageName }),
+    currentVersion: fields.currentVersion,
+    latestVersion: fields.latestVersion,
+  })}`;
+}
 
 /**
  * Work-tree git state for the chat toolbar; mirrors Swift `GitRepoStatus`.

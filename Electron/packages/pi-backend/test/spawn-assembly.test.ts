@@ -8,11 +8,12 @@ import { DEFAULT_FEATURES } from "../src/features.js";
 
 describe("runtime info extension mount", () => {
   const runtimeInfo = "/runtime/extensions/pipiui-runtime-info.ts";
+  const updateCenter = "/runtime/extensions/pipiui-update-center.ts";
 
-  it("always mounts for a main session, with or without a host bridge", () => {
-    const input = { cwd: "/tmp/project", paths: { runtimeInfo } };
-    expect(assemblePiSpawn(input).args).toEqual(["-e", runtimeInfo]);
-    expect(assemblePiSpawn({ ...input, bridgePort: 1234 }).args).toEqual(["-e", runtimeInfo]);
+  it("always mounts the update policy and runtime observer for a main session, with or without a host bridge", () => {
+    const input = { cwd: "/tmp/project", paths: { updateCenter, runtimeInfo } };
+    expect(assemblePiSpawn(input).args).toEqual(["-e", updateCenter, "-e", runtimeInfo]);
+    expect(assemblePiSpawn({ ...input, bridgePort: 1234 }).args).toEqual(["-e", updateCenter, "-e", runtimeInfo]);
   });
 
   it("mounts last so request evidence observes the final rewritten payload", () => {
@@ -21,10 +22,14 @@ describe("runtime info extension mount", () => {
     const output = assemblePiSpawn({
       cwd: "/tmp/project",
       features: { codexServerTools: true, browser: true },
-      paths: { codexServerTools: codex, webview: browser, runtimeInfo },
+      paths: { codexServerTools: codex, webview: browser, updateCenter, runtimeInfo },
       bridgePort: 1234,
     });
-    expect(output.args).toEqual(["-e", codex, "-e", browser, "-e", runtimeInfo]);
+    expect(output.args).toEqual(["-e", codex, "-e", browser, "-e", updateCenter, "-e", runtimeInfo]);
+  });
+
+  it("naturally omits both main-only observers when an isolated helper supplies no paths", () => {
+    expect(assemblePiSpawn({ cwd: "/tmp/project", paths: {} }).args).toEqual([]);
   });
 });
 
@@ -318,6 +323,7 @@ describe("installed runtime tree", () => {
     await writeFile(join(root, "extensions", "pipiui-git.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-skillloader.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-runtime-info.ts"), "//\n");
+    await writeFile(join(root, "extensions", "pipiui-update-center.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-browser-search.ts"), "//\n");
     await writeFile(join(root, "pi-philosophy", "package.json"), JSON.stringify({ pi: { extensions: ["./philosophy.ts"] } }));
     await writeFile(join(root, "pi-philosophy", "philosophy.ts"), "//\n");
@@ -325,6 +331,7 @@ describe("installed runtime tree", () => {
     const paths = resolveSpawnPaths(root);
     expect(paths.git).toBe(join(root, "extensions", "pipiui-git.ts"));
     expect(paths.runtimeInfo).toBe(join(root, "extensions", "pipiui-runtime-info.ts"));
+    expect(paths.updateCenter).toBe(join(root, "extensions", "pipiui-update-center.ts"));
     expect(paths.browserSearch).toBe(join(root, "extensions", "pipiui-browser-search.ts"));
     expect(paths.subagentDir).toBe(join(root, "pi-ext", "subagent"));
     expect(paths.philosophy).toBe(join(root, "pi-philosophy", "philosophy.ts"));
