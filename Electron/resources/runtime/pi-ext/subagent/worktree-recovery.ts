@@ -21,6 +21,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import type { WorktreeFinalizationStateV1 } from "../subagent-host/worktree/schema.ts";
+import { inspectAgentLease, reapStaleAgentLease } from "./agent-lease.ts";
 
 /** Swift parity: three fixer attempts; the third switches to a fresh context. */
 export const MAX_RECOVERY_ATTEMPTS = 3;
@@ -89,7 +90,7 @@ export class WorktreeRecoveryStoreV1 {
 		this.filePath = filePath;
 	}
 
-	load(): WorktreeRecoveryStoreShape {
+	readUnarmed(): WorktreeRecoveryStoreShape {
 		try {
 			const raw = JSON.parse(fs.readFileSync(this.filePath, "utf8")) as { schemaVersion?: unknown; records?: unknown };
 			if (raw?.schemaVersion !== 1 || !raw.records || typeof raw.records !== "object") return emptyStore();
@@ -102,6 +103,14 @@ export class WorktreeRecoveryStoreV1 {
 		} catch {
 			return emptyStore();
 		}
+	}
+
+	load(): WorktreeRecoveryStoreShape {
+		const store = this.readUnarmed();
+		// After the caller finishes this turn's recovery decisions (fixer re-dispatch),
+		// reap leftover trees that those decisions did not keep active.
+		armLeftoverWorktreeSweep(this);
+		return store;
 	}
 
 	save(store: WorktreeRecoveryStoreShape): void {
@@ -142,6 +151,79 @@ export class WorktreeRecoveryStoreV1 {
 export function worktreeRecoveryStorePath(mainCwd: string, sessionKey?: string): string {
 	const key = (sessionKey ?? "").trim() || "default";
 	return path.join(mainCwd, ".pi", "pipiui-memory", `worktree-recovery-${key}.json`);
+}
+
+function recoveryStoreMainCwd(store: WorktreeRecoveryStoreV1): string | undefined {
+	const filePath = (store as unknown as { filePath: string }).filePath;
+	const marker = `${path.sep}.pi${path.sep}pipiui-memory${path.sep}`;
+	const index = filePath.lastIndexOf(marker);
+	if (index <= 0) return undefined;
+	return filePath.slice(0, index);
+}
+
+const LEFTOVER_WORKTREE_SWEEP_KEY = "__pipiuiLeftoverWorktreeSweep";
+const LEFTOVER_WORKTREE_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
+const leftoverSweepArmed = new Set<string>();
+
+function leftoverWorktreeActiveAgentIds(store: WorktreeRecoveryStoreV1): Set<string> {
+	const active = new Set<string>();
+	for (const [agentId, record] of Object.entries(store.readUnarmed().records)) {
+		if (record.inFlight || record.waitingState) active.add(agentId);
+	}
+	return active;
+}
+
+async function runLeftoverWorktreeSweep(store: WorktreeRecoveryStoreV1): Promise<void> {
+	const mainCwd = recoveryStoreMainCwd(store);
+	if (!mainCwd) return;
+	try {
+		const { WorktreeFinalizationServiceV1 } = await import("../subagent-host/worktree/index.ts");
+		await new WorktreeFinalizationServiceV1({
+			logger: {
+				info(event, fields) {
+					console.info(`[pipiui-subagent] ${event}`, fields ?? {});
+				},
+				warn(event, fields) {
+					console.warn(`[pipiui-subagent] ${event}`, fields ?? {});
+				},
+			},
+		}).sweepLeftovers({
+			mainCwd,
+			activeAgentIds: leftoverWorktreeActiveAgentIds(store),
+			lease: {
+				inspect(agentId) {
+					return inspectAgentLease(mainCwd, agentId).status;
+				},
+				reapStale(agentId) {
+					return reapStaleAgentLease(mainCwd, agentId);
+				},
+			},
+		});
+	} catch (error) {
+		console.warn("[pipiui-subagent] worktree leftover sweep failed", error);
+	}
+}
+
+/**
+ * Startup recovery loads the ledger first, then this deferred sweep runs after those
+ * decisions are queued. In-flight / waiting-for-main records stay in the active set.
+ */
+function armLeftoverWorktreeSweep(store: WorktreeRecoveryStoreV1): void {
+	const depth = Number.parseInt(process.env.PIPIUI_AGENT_DEPTH || "0", 10);
+	const filePath = (store as unknown as { filePath: string }).filePath;
+	if (depth !== 0 || leftoverSweepArmed.has(filePath)) return;
+	leftoverSweepArmed.add(filePath);
+	queueMicrotask(() => {
+		void runLeftoverWorktreeSweep(store);
+	});
+	const globalState = globalThis as Record<string, unknown>;
+	const previous = globalState[LEFTOVER_WORKTREE_SWEEP_KEY] as ReturnType<typeof setInterval> | undefined;
+	if (previous) return;
+	const timer = setInterval(() => {
+		void runLeftoverWorktreeSweep(store);
+	}, LEFTOVER_WORKTREE_SWEEP_INTERVAL_MS);
+	timer.unref?.();
+	globalState[LEFTOVER_WORKTREE_SWEEP_KEY] = timer;
 }
 
 // ---------------------------------------------------------------------------
@@ -474,4 +556,14 @@ export function resetWaitingForMainForTests(): void {
 	if (waitingForMainTimer) clearTimeout(waitingForMainTimer);
 	waitingForMainTimer = undefined;
 	waitingForMainContexts.clear();
+	resetLeftoverWorktreeSweepForTests();
+}
+
+/** Test-only: drop the leftover-worktree sweep interval armed by store.load(). */
+export function resetLeftoverWorktreeSweepForTests(): void {
+	const globalState = globalThis as Record<string, unknown>;
+	const previous = globalState[LEFTOVER_WORKTREE_SWEEP_KEY] as ReturnType<typeof setInterval> | undefined;
+	if (previous) clearInterval(previous);
+	delete globalState[LEFTOVER_WORKTREE_SWEEP_KEY];
+	leftoverSweepArmed.clear();
 }

@@ -30,6 +30,11 @@ import {
 import type { MainRepoSerialQueueV1 } from "./queue.ts";
 import { PerMainRepoSerialQueueV1 } from "./queue.ts";
 import { evaluateAutoMergeReadinessV1 } from "./policy.ts";
+import {
+	sweepLeftoverWorktreesV1,
+	type LeftoverWorktreeSweepInputV1,
+	type LeftoverWorktreeSweepSummaryV1,
+} from "./sweep.ts";
 
 export type WorktreeFinalizationClockV1 = {
 	now(): Date;
@@ -209,6 +214,29 @@ export class WorktreeFinalizationServiceV1 {
 		this.clock = options.clock ?? systemClock;
 		this.logger = options.logger ?? {};
 		this.postMergeVerify = options.postMergeVerify;
+	}
+
+	/** Reap settled leftover `.pi/worktrees` entries without racing a live finalization. */
+	async sweepLeftovers(
+		input: Omit<LeftoverWorktreeSweepInputV1, "adapter" | "logger">,
+	): Promise<LeftoverWorktreeSweepSummaryV1> {
+		let repositoryKey: string;
+		try {
+			repositoryKey = await this.adapter.repositoryKey(input.mainCwd);
+		} catch (error) {
+			this.logger.warn?.("worktree-leftover-sweep", {
+				pruned: 0,
+				kept: 0,
+				dirty: 0,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return { pruned: 0, kept: 0, dirty: 0, items: [] };
+		}
+		return this.queue.run(repositoryKey, () => sweepLeftoverWorktreesV1({
+			...input,
+			adapter: this.adapter,
+			logger: this.logger,
+		}));
 	}
 
 	/** Validate, serialize by canonical main repository, then either merge or return an actionable retained state. */
