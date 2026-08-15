@@ -150,6 +150,17 @@ export type WorktreeStatus = { agentId: string; branch?: string; path?: string; 
 export type HostCapabilities = { computerUse: boolean; revealInFinder: boolean; terminal: boolean; plan: boolean; retainedWorktreeDisposition: boolean; [capability: string]: boolean };
 export type ComputerUsePermissionKind = "screenRecording" | "accessibility";
 export type ComputerUseState = { enabled: boolean; screenRecording?: boolean; accessibility?: boolean };
+export type UpdateCenterItemStatus = "upToDate" | "updateAvailable" | "checkFailed" | "notCheckable";
+export type UpdateCenterItem = {
+  id: string;
+  name: string;
+  packageName?: string;
+  currentVersion: string;
+  latestVersion?: string;
+  status: UpdateCenterItemStatus;
+  error?: string;
+};
+export type UpdateCenterSnapshot = { checkedAt: number; items: UpdateCenterItem[] };
 
 /**
  * Work-tree git state for the chat toolbar; mirrors Swift `GitRepoStatus`.
@@ -494,6 +505,8 @@ export interface PipiHostAPI {
   gitInitDirectory?(path: string): Promise<GitStatus>;
   /** Optional v2 UI convenience; older hosts simply render Finder reveal disabled. */
   revealProject?(projectId: string): Promise<void>;
+  /** Electron-only, read-only version discovery. It never installs or mutates packages. */
+  checkForUpdates?(): Promise<UpdateCenterSnapshot>;
   /** Optional extension; remote/non-Electron hosts advertise `capabilities().browser === false`. */
   browser?: BrowserHostAPI;
   /** Optional extension; clients show an unavailable state when an old host omits it. */
@@ -515,7 +528,7 @@ function requestId(): string { return `${Date.now()}-${Math.random().toString(36
 function apiFrom(
   call: (method: HostMethod, params: unknown[]) => Promise<unknown>,
   subscribe: (channel: HostEvent["channel"], predicate: (event: HostEvent) => boolean, listener: (event: HostEvent) => void) => Unsubscribe,
-  options: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean; computerUsePermissions?: boolean } = {}
+  options: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean; computerUsePermissions?: boolean; updateCenter?: boolean } = {}
 ): PipiHostAPI {
   const invoke = <T>(method: HostMethod, ...params: unknown[]) => call(method, params) as Promise<T>;
   const api: PipiHostAPI = {
@@ -593,6 +606,7 @@ function apiFrom(
     probeDirectoryGit: path => invoke("probeDirectoryGit", path),
     gitInitDirectory: path => invoke("gitInitDirectory", path),
     revealProject: projectId => invoke("revealProject", projectId),
+    checkForUpdates: () => invoke("checkForUpdates"),
     browser: {
       selectSession: sessionId => invoke("browserSelectSession", sessionId),
       listTabs: sessionId => invoke("browserListTabs", sessionId),
@@ -624,6 +638,7 @@ function apiFrom(
   if (options.openExternal) api.openExternal = url => invoke("openExternal", url);
   if (options.openDocumentExternally) api.openDocumentExternally = path => invoke("openDocumentExternally", path);
   if (options.computerUsePermissions) api.openComputerUsePermission = kind => invoke("openComputerUsePermission", kind);
+  if (!options.updateCenter) delete api.checkForUpdates;
   return api;
 }
 
@@ -633,7 +648,7 @@ function responseError(response: Extract<HostResponse, { ok: false }>): Error & 
   return error;
 }
 
-export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHANNEL, options?: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean; computerUsePermissions?: boolean }): PipiHostAPI {
+export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHANNEL, options?: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean; computerUsePermissions?: boolean; updateCenter?: boolean }): PipiHostAPI {
   return apiFrom(
     async (method, params) => {
       const response = await ipc.invoke(channel, { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: requestId(), type: "request", method, params });

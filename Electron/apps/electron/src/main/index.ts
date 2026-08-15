@@ -12,11 +12,12 @@ import {
 } from '@pipi/host-api'
 import { BrowserSessionHost, routeBrowserView, withBrowserTabsHost } from './browser-host.js'
 import { installOwnedRuntimeShutdown } from './app-lifecycle.js'
-import { CuaDriverHost } from './cua-driver-host.js'
+import { CUA_DRIVER_VERSION, CuaDriverHost } from './cua-driver-host.js'
 import { importLegacyPiProfile, installBundledModelCapabilityOverrides, resolveElectronPiProfile } from './pi-profile.js'
 import { withProjectDirectoryPicker } from './project-directory-picker.js'
 import { createQuotaCookieReader, createQuotaCookiePersister } from './quota-capabilities.js'
-import { resolveRuntimeAssets } from './runtime-assets.js'
+import { resolveRuntimeAssets, UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS } from './runtime-assets.js'
+import { createUpdateCenterService, withUpdateCenter, type UpdateCatalogItem } from './update-center.js'
 import { withOpenDocumentExternally } from './external-document.js'
 import { withOpenExternal } from './external-url.js'
 import { createElectronComputerUsePermissionHost, withComputerUsePermissions } from './computer-use-permissions.js'
@@ -195,14 +196,23 @@ if (app) {
       const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options)
       return result.canceled ? null : result.filePaths[0] ?? null
     }
-    const backend = withComputerUsePermissions(withProjectDirectoryPicker(withOpenDocumentExternally(withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)), path => shell.openPath(path)), pickProjectDirectory), createElectronComputerUsePermissionHost({
+    const updateCatalog: UpdateCatalogItem[] = [
+      ...Object.entries(UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS).map(([packageName, currentVersion]) => ({
+        id: packageName,
+        name: packageName === '@earendil-works/pi-coding-agent' ? 'Pi' : packageName,
+        currentVersion,
+        source: { type: 'npm' as const, packageName }
+      })),
+      { id: 'cua-driver', name: 'Cua Driver', currentVersion: CUA_DRIVER_VERSION, source: { type: 'cuaGitHub' } }
+    ]
+    const backend = withUpdateCenter(withComputerUsePermissions(withProjectDirectoryPicker(withOpenDocumentExternally(withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)), path => shell.openPath(path)), pickProjectDirectory), createElectronComputerUsePermissionHost({
       getMediaAccessStatus: media => systemPreferences.getMediaAccessStatus(media),
       isTrustedAccessibilityClient: prompt => systemPreferences.isTrustedAccessibilityClient(prompt),
       requestScreenRecording: async () => {
         await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } })
       },
       openURL: url => shell.openExternal(url),
-    }))
+    })), createUpdateCenterService({ catalog: updateCatalog }))
     registerPipiHostIpc(ipcMain, backend)
     createWindow(browser, () => terminalHost.closeAll())
     // Once the background profile/capability install lands, invalidate + reload the

@@ -102,7 +102,7 @@ describe('first-run model onboarding', () => {
   it('respects an explicit close while still model-less across remounts', async () => {
     const host: PipiHostAPI = { ...createMockHost(), listModels: vi.fn(async () => []) }
     const first = render(<App host={host} />)
-    fireEvent.click(await screen.findByLabelText('关闭模型管理'))
+    fireEvent.click(await screen.findByLabelText('关闭设置'))
     await waitFor(() => expect(screen.queryByTestId('model-modal')).toBeNull())
     expect(localStorage.getItem('pipiui:model-onboarding-dismissed')).toBe('1')
     first.unmount()

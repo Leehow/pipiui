@@ -2462,6 +2462,23 @@ describe('composer image attachments', () => {
   })
 })
 
+describe('update center settings flow', () => {
+  it('closes settings and sends exactly one update request through the selected main session', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt').mockResolvedValue(undefined)
+    const composer = await openModelModal(host)
+    fireEvent.click(screen.getByTestId('model-tab-updates'))
+    expect(await screen.findByTestId('update-center')).toBeTruthy()
+    expect(screen.getByRole('dialog', { name: '设置' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '关闭设置' })).toBeTruthy()
+    fireEvent.click(await screen.findByRole('button', { name: '更新' }))
+    await waitFor(() => expect(screen.queryByTestId('model-modal')).toBeNull())
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledTimes(1))
+    expect(sendPrompt).toHaveBeenCalledWith('welcome', '帮我把 Pi 从 0.84.0 更新到 0.84.2，并完成必要的测试和 Electron 打包验收。')
+    expect((composer as HTMLTextAreaElement).value).toBe('')
+  })
+})
+
 describe('vision routing (通用 tab)', () => {
   it('renders the 通用 tab with the switch and a disabled selector while the switch is off', async () => {
     const composer = await renderChat(createMockHost())

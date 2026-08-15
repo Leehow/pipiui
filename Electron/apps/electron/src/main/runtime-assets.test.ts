@@ -3,13 +3,24 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
-import { resolveRuntimeAssets } from './runtime-assets.js'
+import { MANAGED_RUNTIME_PACKAGE_VERSIONS, resolveRuntimeAssets, UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS } from './runtime-assets.js'
 
 /** The path the built main bundle actually runs from; the dev branch walks up from here. */
 const builtMainDir = fileURLToPath(new URL('../../out/main', import.meta.url))
 
 describe('resolveRuntimeAssets', () => {
   let root = ''
+
+  it('keeps native integrity dependencies out of the user-facing update catalog', () => {
+    expect(Object.keys(UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS)).toEqual([
+      '@earendil-works/pi-coding-agent',
+      'pi-web-access',
+      'pi-mcp-extension',
+      'pi-hermes-memory'
+    ])
+    expect(UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS).not.toHaveProperty('better-sqlite3')
+    expect(MANAGED_RUNTIME_PACKAGE_VERSIONS).toHaveProperty('better-sqlite3', '12.11.1')
+  })
   afterEach(async () => {
     if (root) await rm(root, { recursive: true, force: true })
     root = ''

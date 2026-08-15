@@ -728,6 +728,10 @@ export function createMockHost(): PipiHostAPI {
     },
     getComputerUseState: async () => ({ enabled: computerUseEnabled }),
     setComputerUseEnabled: async enabled => { computerUseEnabled = enabled; return { enabled: computerUseEnabled } },
+    checkForUpdates: async () => ({ checkedAt: Date.now(), items: [
+      { id: 'pi', name: 'Pi', packageName: '@earendil-works/pi-coding-agent', currentVersion: '0.84.0', latestVersion: '0.84.2', status: 'updateAvailable' },
+      { id: 'cua-driver', name: 'Cua Driver', currentVersion: '0.19.2', latestVersion: '0.19.2', status: 'upToDate' }
+    ] }),
     getVisionModel: async () => visionModel,
     setVisionModel: async ref => { visionModel = ref; return visionModel },
     getVisionEnabled: async () => visionEnabled,
@@ -1592,6 +1596,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       throw error
     }
   }
+  const requestUpdate = (prompt: string) => {
+    closeModelManager()
+    void send(prompt).catch(error => setProjectError(`发送失败：${error instanceof Error ? error.message : String(error)}`))
+  }
   /**
    * `/compact`. Progress and the outcome normally arrive as `compaction` stream
    * events; a refusal ("Nothing to compact") never produces one, so the
@@ -2053,7 +2061,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     </section>
     <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resize('tools', widths.tools)} />
     <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== 'Subagents'} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={openedDocumentPath} onOpenDocument={openDocument} />
-    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} current={modelState?.model ?? null} onModelState={applySelectedModelState} onClose={closeModelManager} initialView={modalInitialView} />}
+    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} />}
     {subagentModelsOpen && <SubagentModelModal host={host} current={modelState?.model ?? null} visibility={modalVisibility} onClose={() => setSubagentModelsOpen(false)} />}
