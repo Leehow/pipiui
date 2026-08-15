@@ -43,7 +43,7 @@ describe('persistent embedded Pi runtime CLI', () => {
         return header
       })()),
       writeFile(launcher, '#!/bin/sh\n'),
-      writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '0.84.0' }))
+      writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '0.84.2' }))
     ])
     await Promise.all([chmod(node, 0o755), chmod(launcher, 0o755)])
     for (const [name, version] of [['pi-web-access', '0.20.0'], ['pi-mcp-extension', '1.5.0']]) {
@@ -62,7 +62,7 @@ describe('persistent embedded Pi runtime CLI', () => {
       piLauncher: 'pi/bin/pi',
       nodeModules: 'pi/lib/node_modules',
       packages: {
-        '@earendil-works/pi-coding-agent': '0.84.0',
+        '@earendil-works/pi-coding-agent': '0.84.2',
         'pi-web-access': '0.20.0',
         'pi-mcp-extension': '1.5.0',
         'pi-hermes-memory': '0.9.4',

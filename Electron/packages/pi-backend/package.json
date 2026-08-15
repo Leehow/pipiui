@@ -16,7 +16,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.0",
+    "@earendil-works/pi-coding-agent": "0.84.2",
     "@pipi/account-usage-core": "file:../account-usage-core",
     "@pipi/host-api": "file:../host-api",
     "pi-mcp-extension": "1.5.0",

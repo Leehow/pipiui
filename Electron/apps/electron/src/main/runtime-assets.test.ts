@@ -40,7 +40,7 @@ describe('resolveRuntimeAssets', () => {
       writeFile(node, ''),
       writeFile(piCli, '// pi cli\n'),
       writeFile(launcher, ''),
-      writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '0.84.0' })),
+      writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '0.84.2' })),
       mkdir(join(nodeModules, 'pi-hermes-memory'), { recursive: true }).then(() =>
         writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ version: '0.9.4' }))),
       mkdir(join(nodeModules, 'better-sqlite3'), { recursive: true }).then(() =>
@@ -63,7 +63,7 @@ describe('resolveRuntimeAssets', () => {
       piLauncher: platform === 'win32' ? 'pi/bin/pi.cmd' : 'pi/bin/pi',
       nodeModules: 'pi/lib/node_modules',
       packages: {
-        '@earendil-works/pi-coding-agent': '0.84.0',
+        '@earendil-works/pi-coding-agent': '0.84.2',
         'pi-web-access': '0.20.0',
         'pi-mcp-extension': '1.5.0',
         'pi-hermes-memory': '0.9.4',
