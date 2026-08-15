@@ -163,6 +163,19 @@ describe("explicit sidebar project persistence", () => {
     });
   });
 
+  it("persists a provider-qualified Hermes review model and clears back to follow-main", async () => {
+    const fixture = await setup();
+    const first = backend(fixture.agent, fixture.sessions);
+    expect(await first.handle("getMemoryReviewModel", [])).toBeNull();
+    expect(await first.handle("setMemoryReviewModel", ["anthropic/claude-sonnet-4"])).toBe("anthropic/claude-sonnet-4");
+    expect(await backend(fixture.agent, fixture.sessions).handle("getMemoryReviewModel", [])).toBe("anthropic/claude-sonnet-4");
+    await expect(first.handle("setMemoryReviewModel", ["claude-sonnet-4"])).rejects.toThrow(/provider\/model/);
+    expect(await first.handle("setMemoryReviewModel", [null])).toBeNull();
+    expect(await backend(fixture.agent, fixture.sessions).handle("getMemoryReviewModel", [])).toBeNull();
+    const settings = JSON.parse(await readFile(join(fixture.agent, "pipiui-settings.json"), "utf8"));
+    expect(settings.memoryReviewModel).toBeUndefined();
+  });
+
   it("renames the stored display name without changing the folder path", async () => {
     const fixture = await setup();
     const first = backend(fixture.agent, fixture.sessions);

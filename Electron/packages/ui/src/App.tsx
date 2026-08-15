@@ -588,6 +588,7 @@ export function createMockHost(): PipiHostAPI {
   let visionEnabled = false
   let visionModel: string | null = null
   let subagentModels: Record<string, SubagentModelSetting[]> = {}
+  let memoryReviewModel: string | null = null
   const agentDefinitions: AgentDefinition[] = [
     { name: 'explore', description: 'Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files.' },
     { name: 'plan', description: 'Grok-style planning agent. Explores and produces an implementation plan; does not edit files.' },
@@ -738,6 +739,8 @@ export function createMockHost(): PipiHostAPI {
     setVisionEnabled: async enabled => { visionEnabled = enabled; return visionEnabled },
     getSubagentModels: async () => Object.fromEntries(Object.entries(subagentModels).map(([name, chain]) => [name, chain.map(entry => ({ ...entry }))])),
     setSubagentModel: async (agentName, chain) => { if (chain.length) subagentModels[agentName] = chain.map(entry => ({ ...entry })); else delete subagentModels[agentName]; return Object.fromEntries(Object.entries(subagentModels).map(([name, saved]) => [name, saved.map(entry => ({ ...entry }))])) },
+    getMemoryReviewModel: async () => memoryReviewModel,
+    setMemoryReviewModel: async model => { memoryReviewModel = model; return memoryReviewModel },
     listAgentDefinitions: async () => agentDefinitions.map(agent => ({ ...agent })),
     getSessionStats: async sessionId => {
       const id = sessionId ?? sessions[0]?.id ?? 'mock-session'

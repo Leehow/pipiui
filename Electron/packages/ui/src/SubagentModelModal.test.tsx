@@ -34,6 +34,40 @@ function visibility(overrides: Partial<ModelVisibilityController> = {}): ModelVi
 }
 
 describe('SubagentModelModal', () => {
+  it('keeps Hermes review separate, follows main by default, filters hidden models, and clears an explicit model', async () => {
+    const host = createMockHost()
+    const save = vi.spyOn(host, 'setMemoryReviewModel')
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+
+    const row = await screen.findByTestId('memory-review-model-row')
+    const picker = within(row).getByRole('button', { name: 'memory-review 0 模型' })
+    expect(picker.textContent).toContain('跟随主 Agent')
+    expect(within(row).queryByText(/思考强度/)).toBeNull()
+    expect(within(row).queryByText(/添加备用模型/)).toBeNull()
+
+    fireEvent.click(picker)
+    expect(screen.queryByTestId('subagent-model-option-memory-review-0-deepseek-deepseek-v3')).toBeNull()
+    fireEvent.click(screen.getByTestId('subagent-model-option-memory-review-0-anthropic-claude-sonnet-4'))
+    await waitFor(() => expect(picker.textContent).toContain('anthropic/claude-sonnet-4'))
+    expect(save).toHaveBeenLastCalledWith('anthropic/claude-sonnet-4')
+    expect(await host.getMemoryReviewModel?.()).toBe('anthropic/claude-sonnet-4')
+
+    fireEvent.click(picker)
+    fireEvent.click(screen.getByRole('option', { name: /跟随主 Agent/ }))
+    await waitFor(() => expect(picker.textContent).toContain('跟随主 Agent'))
+    expect(save).toHaveBeenLastCalledWith(null)
+    expect(await host.getMemoryReviewModel?.()).toBeNull()
+  })
+
+  it('keeps existing subagent settings available when an older host lacks Hermes review methods', async () => {
+    const host = createMockHost()
+    host.getMemoryReviewModel = undefined
+    host.setMemoryReviewModel = undefined
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    expect(await screen.findByTestId('subagent-agent-explore')).toBeTruthy()
+    expect(screen.queryByTestId('memory-review-model-row')).toBeNull()
+  })
+
   it('persists the provider-qualified model selected for a nested Computer Worker', async () => {
     const xaiGrok: Model = { provider: 'xai', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
     const copilotGrok: Model = { provider: 'github-copilot', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }

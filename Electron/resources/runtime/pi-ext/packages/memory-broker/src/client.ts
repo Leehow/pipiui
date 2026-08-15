@@ -261,11 +261,15 @@ export function createMemoryBrokerClient(
 
 export type TerminalExperienceCandidateInput = {
   runID: string;
+  agentName: string;
   task: string;
   title?: string;
   terminalText: string;
   outcome: MemoryOutcome;
+  evidenceClass: "source-backed" | "verification-passed";
 };
+
+type TerminalExperienceCandidateMaterial = TerminalExperienceCandidateInput & { agentID?: string };
 
 const TERMINAL_BRIEF_MAX_CHARS = 900;
 const TERMINAL_EVIDENCE_MAX_CHARS = 1_100;
@@ -285,13 +289,26 @@ function boundedOneLine(value: unknown, maximumChars: number): string {
  * durable project memory.
  */
 export function makeTerminalExperienceCandidate(
-  input: TerminalExperienceCandidateInput,
+  input: TerminalExperienceCandidateMaterial,
 ): MemoryExperienceCandidate | undefined {
+  const agentName = boundedOneLine(input.agentName, 80);
+  const agentID = boundedOneLine(input.agentID, 120);
+  if (!agentName || !["explore", "plan", "general-purpose", "reviewer", "long-test"].includes(agentName)) return undefined;
+  if (input.evidenceClass !== "source-backed" && input.evidenceClass !== "verification-passed") return undefined;
+  const expectedEvidence = agentName === "general-purpose" || agentName === "long-test"
+    ? "verification-passed"
+    : "source-backed";
+  if (input.evidenceClass !== expectedEvidence) return undefined;
   const claim = boundedOneLine([
     input.title ? `Title: ${input.title}` : "",
     `Task: ${input.task}`,
   ].filter(Boolean).join(" — "), TERMINAL_BRIEF_MAX_CHARS);
-  const evidence = boundedOneLine(input.terminalText, TERMINAL_EVIDENCE_MAX_CHARS);
+  const evidence = boundedOneLine([
+    `Agent role: ${agentName}`,
+    agentID ? `Agent ID: ${agentID}` : "",
+    `Evidence class: ${input.evidenceClass}`,
+    input.terminalText,
+  ].filter(Boolean).join(" — "), TERMINAL_EVIDENCE_MAX_CHARS);
   if (!claim || !evidence || containsLikelySecret(claim) || containsLikelySecret(evidence)) return undefined;
   try {
     return normalizeExperienceCandidate({
@@ -320,7 +337,7 @@ export function submitTerminalExperienceCandidate(
   input: TerminalExperienceCandidateInput,
 ): Promise<void> {
   if (!client || client.environment.runID !== input.runID) return Promise.resolve();
-  const candidate = makeTerminalExperienceCandidate(input);
+  const candidate = makeTerminalExperienceCandidate({ ...input, agentID: client.environment.agentID });
   if (!candidate) return Promise.resolve();
   const key = `${client.environment.agentID}\u0000${client.environment.runID}`;
   const existing = terminalExperienceFlights.get(key);

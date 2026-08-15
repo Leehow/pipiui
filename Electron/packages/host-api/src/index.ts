@@ -435,6 +435,9 @@ export interface PipiHostAPI {
   /** Optional per-role model fallback chains. Empty chain follows the main Agent model. */
   getSubagentModels?(): Promise<Record<string, SubagentModelSetting[]>>;
   setSubagentModel?(agentName: string, chain: SubagentModelSetting[]): Promise<Record<string, SubagentModelSetting[]>>;
+  /** Missing/null means Hermes resolves the active main model at review time. */
+  getMemoryReviewModel?(): Promise<string | null>;
+  setMemoryReviewModel?(modelRef: string | null): Promise<string | null>;
   /**
    * Optional persistent vision-model selection (full `provider/modelId` ref).
    * `null` means none selected. Backed by the host (Electron:
@@ -582,6 +585,8 @@ function apiFrom(
     setComputerUseEnabled: enabled => invoke("setComputerUseEnabled", enabled),
     getSubagentModels: () => invoke("getSubagentModels"),
     setSubagentModel: (agentName, chain) => invoke("setSubagentModel", agentName, chain),
+    getMemoryReviewModel: () => invoke("getMemoryReviewModel"),
+    setMemoryReviewModel: (modelRef) => invoke("setMemoryReviewModel", modelRef),
     getVisionModel: () => invoke("getVisionModel"),
     setVisionModel: ref => invoke("setVisionModel", ref),
     getVisionEnabled: () => invoke("getVisionEnabled"),
