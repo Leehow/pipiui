@@ -229,7 +229,7 @@ export type ManagedPackage={name:string;version:string};
  * mount lookup can never drift onto different versions.
  */
 export const MANAGED_PACKAGES:readonly ManagedPackage[]=[{name:"pi-web-access",version:"0.23.0"},{name:"pi-mcp-extension",version:"1.5.0"}];
-export const HERMES_MEMORY_PACKAGE:ManagedPackage={name:"pi-hermes-memory",version:"0.9.4"};
+export const HERMES_MEMORY_PACKAGE:ManagedPackage={name:"pi-hermes-memory",version:"0.9.5"};
 const fileIfPresent=(...segments:string[]):string|undefined=>{const path=join(...segments);return existsSync(path)?path:undefined};
 const packageIfPresent=(...segments:string[]):string|undefined=>{const dir=join(...segments);return existsSync(join(dir,"package.json"))?dir:undefined};
 export type SpawnPathOptions={managedNodeModulesRoot?:string};

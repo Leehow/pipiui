@@ -18,7 +18,7 @@ import type {
 
 /** The one upstream version whose internal adapter shape is verified below. */
 export const HERMES_MEMORY_PACKAGE_NAME = "pi-hermes-memory";
-export const HERMES_MEMORY_PACKAGE_VERSION = "0.9.4";
+export const HERMES_MEMORY_PACKAGE_VERSION = "0.9.5";
 const EXPERIENCE_QUEUE_FILE = "pipiui-memory-broker-experience-v1.jsonl";
 const MAX_STATUS_DETAIL = 300;
 
@@ -164,14 +164,14 @@ export async function mergeHermesConfiguration(
 
 function requireFunction<T extends Function>(value: unknown, name: string): T {
   if (typeof value !== "function") {
-    throw new HermesMemoryAdapterError("shape-incompatible", `pi-hermes-memory 0.9.4 is missing ${name}.`);
+    throw new HermesMemoryAdapterError("shape-incompatible", `pi-hermes-memory 0.9.5 is missing ${name}.`);
   }
   return value as T;
 }
 
 function requireString(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim()) {
-    throw new HermesMemoryAdapterError("shape-incompatible", `pi-hermes-memory 0.9.4 has an invalid ${name}.`);
+    throw new HermesMemoryAdapterError("shape-incompatible", `pi-hermes-memory 0.9.5 has an invalid ${name}.`);
   }
   return value;
 }
@@ -278,7 +278,7 @@ async function loadHermesBridge(
 function loadedHermesConfig(bridge: HermesBridge): UnknownRecord {
   const config = bridge.loadConfig();
   if (!isRecord(config)) {
-    throw new HermesMemoryAdapterError("shape-incompatible", "pi-hermes-memory 0.9.4 returned an invalid configuration shape.");
+    throw new HermesMemoryAdapterError("shape-incompatible", "pi-hermes-memory 0.9.5 returned an invalid configuration shape.");
   }
   return config;
 }
@@ -376,7 +376,7 @@ class DurableExperienceQueue {
 }
 
 /**
- * Real main-only adapter for pi-hermes-memory 0.9.4. Its internals are checked
+ * Real main-only adapter for pi-hermes-memory 0.9.5. Its internals are checked
  * once at load time; replace this file when upstream offers a public broker API.
  */
 export class HermesMemoryBrokerBackend implements MemoryBrokerBackend {

@@ -105,7 +105,7 @@ describe("main-only Hermes runtime ownership", () => {
       const nodeModules = join(root, "node_modules");
       const hermes = join(nodeModules, "pi-hermes-memory");
       await mkdir(hermes, { recursive: true });
-      await writeFile(join(hermes, "package.json"), JSON.stringify({ name: "pi-hermes-memory", version: "0.9.4" }));
+      await writeFile(join(hermes, "package.json"), JSON.stringify({ name: "pi-hermes-memory", version: "0.9.5" }));
       expect(resolveSpawnPaths("/runtime", { managedNodeModulesRoot: nodeModules }).hermesMemory).toBe(hermes);
       await writeFile(join(hermes, "package.json"), JSON.stringify({ name: "pi-hermes-memory", version: "0.9.3" }));
       expect(resolveSpawnPaths("/runtime", { managedNodeModulesRoot: nodeModules }).hermesMemory).toBeUndefined();

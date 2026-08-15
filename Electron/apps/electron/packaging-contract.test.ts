@@ -39,7 +39,7 @@ describe('macOS packaging contract', () => {
     expect(runtimeSource?.filter).toContain('!**/node_modules/**')
     expect(embedded?.from).toBe('../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}')
     expect(embedded?.filter).toBeUndefined()
-    expect(brokerPackage.dependencies['pi-hermes-memory']).toBe('0.9.4')
+    expect(brokerPackage.dependencies['pi-hermes-memory']).toBe('0.9.5')
     expect(runtimePreparer).toContain("const hermesPackageName = 'pi-hermes-memory'")
     expect(runtimePreparer).toContain("npm_config_runtime: 'electron'")
     expect(runtimePreparer).toContain("npm_config_disturl: 'https://electronjs.org/headers'")
