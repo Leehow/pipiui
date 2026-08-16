@@ -10,6 +10,7 @@ import {
 	createRunScopedTimeout,
 	normalizeGeneralPurposeExecutionPolicy,
 } from "../runtime-policy.ts";
+import { createProviderWaitController, providerWaitDeadlineMs } from "../index.ts";
 import { resolveSubagentWorktree } from "../worktree.ts";
 
 const bundledGeneralPurpose = { name: "general-purpose", origin: "bundled" } as const;
@@ -135,6 +136,98 @@ test("runtime timeout aborts the exact run before provider or transient auto-res
 	assert.match(source, /const SubagentParams = Type\.Object\(\{[\s\S]*?worktree: WorktreeParam,[\s\S]*?timeoutSecs: TimeoutSecsParam,/);
 	const parallelSchema = source.slice(source.indexOf("const ParallelSubagentParams"), source.indexOf("const SecretaryCommitParams"));
 	assert.doesNotMatch(parallelSchema, /worktree|heartbeatSecs|timeoutSecs/);
+});
+
+test("provider wait deadline covers initial wait and mid-stream silence, never tool runs", () => {
+	const phases: string[] = [];
+	const timeouts: string[] = [];
+	const make = () => {
+		const timers = new Map<number, { callback: () => void; delay: number }>();
+		const cancelled: number[] = [];
+		let nextId = 1;
+		const controller = createProviderWaitController({
+			model: "test-model",
+			deadlineMs: 1_000,
+			schedule(callback, delay) {
+				const id = nextId++;
+				timers.set(id, { callback, delay });
+				return id as unknown as ReturnType<typeof setTimeout>;
+			},
+			cancel: (timer) => {
+				const id = timer as unknown as number;
+				cancelled.push(id);
+				timers.delete(id);
+			},
+			onPhase: (phase) => phases.push(phase),
+			onTimeout: () => timeouts.push(controller.phase()),
+		});
+		const armTimer = () => [...timers.entries()].at(-1);
+		const fireLatest = () => {
+			const latest = armTimer();
+			assert.ok(latest, "a deadline timer must be armed");
+			timers.delete(latest[0]);
+			latest[1].callback();
+		};
+		return { controller, timers, cancelled, fireLatest, armTimer };
+	};
+
+	// Initial wait: armed at creation, so a connection that dies before the first
+	// byte still times out instead of hanging on an ESTABLISHED-but-dead socket.
+	let s = make();
+	assert.equal(s.armTimer()?.[1].delay, 1_000);
+	s.fireLatest();
+	assert.deepEqual(timeouts, ["model-active"]);
+
+	// Mid-stream silence: every assistant delta re-arms the deadline and cancels
+	// the previous one; a stream that stops producing deltas times out.
+	s = make();
+	s.controller.noteAssistantActivity();
+	assert.equal(s.cancelled.length, 1);
+	assert.equal(s.timers.size, 1);
+	s.fireLatest();
+	assert.deepEqual(timeouts, ["model-active", "model-active"]);
+	assert.match(s.controller.activity(), /流式输出超时/);
+
+	// Tool runs stay unguarded: the batch clears the deadline and nothing re-arms
+	// until the last tool result returns the worker to awaiting-model.
+	s = make();
+	s.controller.noteAssistantActivity();
+	s.controller.noteToolBatch(["t1", "t2"]);
+	assert.equal(s.controller.phase(), "running-tool");
+	assert.equal(s.timers.size, 0);
+	s.controller.noteToolResult("t1");
+	assert.equal(s.timers.size, 0);
+	s.controller.noteToolResult("t2");
+	assert.equal(s.controller.phase(), "awaiting-model");
+	assert.equal(s.timers.size, 1);
+	assert.match(s.controller.activity(), /工具结果已返回/);
+	s.fireLatest();
+	assert.deepEqual(timeouts, ["model-active", "model-active", "awaiting-model"]);
+	assert.deepEqual(phases, [
+		"model-active",
+		"model-active",
+		"running-tool",
+		"awaiting-model",
+	]);
+
+	// Assistant output mid-tool-run (out-of-order delta) wins the phase race,
+	// clears the pending batch, and re-arms: a late tool result must not arm a
+	// second deadline against the live stream.
+	s = make();
+	s.controller.noteToolBatch(["t1"]);
+	s.controller.noteAssistantActivity();
+	s.controller.noteToolResult("t1");
+	assert.equal(s.timers.size, 1);
+	assert.equal(s.controller.phase(), "model-active");
+	s.controller.dispose();
+	assert.equal(s.timers.size, 0);
+});
+
+test("provider wait deadline honors the environment override and a positive default", () => {
+	assert.equal(providerWaitDeadlineMs({}), 180_000);
+	assert.equal(providerWaitDeadlineMs({ PIPIUI_PROVIDER_WAIT_TIMEOUT_MS: "45000" }), 45_000);
+	assert.equal(providerWaitDeadlineMs({ PIPIUI_PROVIDER_WAIT_TIMEOUT_MS: "0" }), 180_000);
+	assert.equal(providerWaitDeadlineMs({ PIPIUI_PROVIDER_WAIT_TIMEOUT_MS: "junk" }), 180_000);
 });
 
 test("shared source is authoritative and heartbeat mandates status plus drift classification", () => {

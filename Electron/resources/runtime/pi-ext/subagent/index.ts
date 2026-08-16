@@ -1685,7 +1685,11 @@ const AUTO_RESUME_BACKOFF_MS = [5_000, 15_000] as const;
 const AUTO_RESUME_JITTER_RATIO = 0.25;
 /** Context size above which a final retryable failure gets a fresh-redispatch hint. */
 const AUTO_RESUME_CONTEXT_HINT_TOKENS = 100_000;
-/** Observed successful provider waits peak at ~82s; recover before the 300s transport idle guard. */
+/**
+ * Observed successful provider waits peak at ~82s; recover before the 300s transport idle guard.
+ * The guard is not reliable on its own: a silently-dropped proxied stream keeps the socket
+ * ESTABLISHED and can outlive it, so this deadline also covers initial and mid-stream waits.
+ */
 const PROVIDER_WAIT_TIMEOUT_MS_DEFAULT = 180_000;
 const PROVIDER_WAIT_AUTO_RESUME_MAX = 1;
 export function providerWaitDeadlineMs(env: Record<string, string | undefined> = process.env): number {
@@ -1698,7 +1702,14 @@ export function providerWaitDeadlineMs(env: Record<string, string | undefined> =
 type ProviderWaitPhase = "model-active" | "running-tool" | "awaiting-model";
 type ProviderWaitTimer = ReturnType<typeof setTimeout>;
 
-/** Exact tool-batch tracker; the child process owner supplies timeout termination. */
+/**
+ * Exact tool-batch tracker plus provider-wait deadline. Tool runs stay unguarded
+ * (the child process owner supplies timeout termination), but every model wait
+ * arms the deadline: the first byte after spawn, a stream that stops producing
+ * deltas mid-flight, and the post-tool-result wait. A silently-dropped proxied
+ * connection never errors at the transport layer — the socket stays ESTABLISHED
+ * forever — so only this app-layer deadline recovers those hangs.
+ */
 export function createProviderWaitController(options: {
 	model: string;
 	deadlineMs?: number;
@@ -1721,6 +1732,15 @@ export function createProviderWaitController(options: {
 		currentPhase = phase;
 		options.onPhase(phase);
 	};
+	const armDeadline = () => {
+		clearTimer();
+		timer = schedule(() => {
+			timer = undefined;
+			if (currentPhase !== "running-tool") options.onTimeout();
+		}, deadlineMs);
+		(timer as { unref?: () => void })?.unref?.();
+	};
+	armDeadline();
 	return {
 		noteToolBatch(toolCallIds: string[]) {
 			clearTimer();
@@ -1730,22 +1750,21 @@ export function createProviderWaitController(options: {
 		noteToolResult(toolCallId: string) {
 			if (currentPhase !== "running-tool" || !pending.delete(toolCallId) || pending.size > 0) return;
 			setPhase("awaiting-model");
-			timer = schedule(() => {
-				timer = undefined;
-				if (currentPhase === "awaiting-model") options.onTimeout();
-			}, deadlineMs);
-			(timer as { unref?: () => void })?.unref?.();
+			armDeadline();
 		},
 		noteAssistantActivity() {
 			clearTimer();
 			pending.clear();
 			setPhase("model-active");
+			armDeadline();
 		},
 		dispose: clearTimer,
 		phase: () => currentPhase,
 		activity: () => currentPhase === "awaiting-model"
 			? `工具结果已返回，等待 ${options.model || "model"} 响应…`
-			: "",
+			: currentPhase === "model-active"
+				? `等待 ${options.model || "model"} 流式输出超时（连接无新增数据）…`
+				: "",
 	};
 }
 
