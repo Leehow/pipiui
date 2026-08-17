@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { promisify } from "node:util";
 import { accessSync, constants, existsSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { join, resolve } from "node:path";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface } from "node:readline";
+import { resolveCuaDriverLaunchPath } from "./runtime-assets.js";
 
 export const CUA_DRIVER_VERSION = "0.20.0";
 export type DisplayDescriptor = {
@@ -230,6 +232,51 @@ export function cuaSocketPath(
 
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
+const execFileAsync = promisify(execFile);
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function commandUsesLaunchPath(command: string, launchPath: string): boolean {
+  if (!launchPath) return false;
+  if (command === launchPath || command.startsWith(`${launchPath} `)) return true;
+  // Shebang helpers exec as `/usr/bin/env node <launchPath> ...`; still require the exact path token.
+  const token = ` ${launchPath}`;
+  const index = command.indexOf(token);
+  if (index === -1) return false;
+  const after = index + token.length;
+  return after === command.length || command[after] === " ";
+}
+
+async function pidsWithExactLaunchPath(launchPath: string): Promise<number[]> {
+  if (process.platform === "win32" || !launchPath || launchPath === "/") return [];
+  const expected = new Set([launchPath, resolve(launchPath)]);
+  try {
+    const { stdout } = await execFileAsync("/bin/ps", ["-axww", "-o", "pid=,command="], {
+      encoding: "utf8",
+      timeout: 2_000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    const pids: number[] = [];
+    for (const line of stdout.split("\n")) {
+      const match = /^\s*(\d+)\s(.*)$/.exec(line);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
+      if (![...expected].some((path) => commandUsesLaunchPath(match[2], path))) continue;
+      pids.push(pid);
+    }
+    return pids;
+  } catch {
+    return [];
+  }
+}
 const record = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
@@ -420,6 +467,10 @@ export class CuaDriverHost {
   private desktopSessions = new Map<string, string>();
   private teardowns = new Set<Promise<void>>();
   private shutdownRequested = false;
+  private activeLaunchPath?: string;
+  private lastGenerationPids: number[] = [];
+  private leftoverSettleMs = 3_000;
+  private listExactLaunchPathPids = pidsWithExactLaunchPath;
 
   constructor(
     readonly driverPath: string,
@@ -428,9 +479,13 @@ export class CuaDriverHost {
     private readonly timeoutMs = 32_000,
   ) {}
 
+  private launchPath(): string {
+    return resolveCuaDriverLaunchPath(this.driverPath);
+  }
+
   usable(): boolean {
     try {
-      accessSync(this.driverPath, constants.X_OK);
+      accessSync(this.launchPath(), constants.X_OK);
       return (
         process.platform === "darwin" ||
         process.platform === "linux" ||
@@ -798,7 +853,7 @@ export class CuaDriverHost {
     this.desktopSessions.clear();
     const teardown = this.terminateGeneration(proxy, daemon, socket);
     this.teardowns.add(teardown);
-    void teardown.finally(() => this.teardowns.delete(teardown));
+    void teardown.catch(() => {}).finally(() => this.teardowns.delete(teardown));
   }
 
   /** Final App-owner boundary: no new generation may start after this resolves. */
@@ -831,7 +886,8 @@ export class CuaDriverHost {
     if (this.shutdownRequested)
       throw new Error("Cua Driver host is shutting down");
     if (this.teardowns.size > 0)
-      await Promise.all([...this.teardowns]);
+      await Promise.allSettled([...this.teardowns]);
+    await this.assertNoLeftoverGeneration();
     if (
       this.proxy && this.daemon &&
       !this.proxy.killed && !this.daemon.killed &&
@@ -847,9 +903,12 @@ export class CuaDriverHost {
   }
 
   private async start(): Promise<void> {
+    await this.assertNoLeftoverGeneration();
     this.socket = cuaSocketPath();
+    const launchPath = this.launchPath();
+    this.activeLaunchPath = launchPath;
     const daemon = this.spawnDriver(
-      this.driverPath,
+      launchPath,
       [
         "serve",
         "--embedded",
@@ -866,6 +925,7 @@ export class CuaDriverHost {
       { stdio: ["pipe", "pipe", "pipe"] },
     );
     this.daemon = daemon;
+    this.rememberGenerationPid(daemon.pid);
     let stderr = "";
     daemon.stderr.on("data", (chunk) => {
       stderr = `${stderr}${chunk}`.slice(-8192);
@@ -886,7 +946,7 @@ export class CuaDriverHost {
         throw new Error("Cua Driver did not create a private socket");
     }
     const proxy = this.spawnDriver(
-      this.driverPath,
+      launchPath,
       [
         "mcp",
         "--embedded",
@@ -898,6 +958,7 @@ export class CuaDriverHost {
       { stdio: ["pipe", "pipe", "pipe"] },
     );
     this.proxy = proxy;
+    this.rememberGenerationPid(proxy.pid);
     proxy.on("exit", () =>
       this.rejectPending(new Error("Cua Driver MCP proxy exited")),
     );
@@ -934,10 +995,18 @@ export class CuaDriverHost {
     daemon: ChildProcessWithoutNullStreams | undefined,
     socket: string | undefined,
   ): Promise<void> {
+    const ownedPids = [proxy?.pid, daemon?.pid].filter(
+      (pid): pid is number => typeof pid === "number" && pid > 1,
+    );
+    for (const pid of ownedPids) this.rememberGenerationPid(pid);
     await Promise.all([
       this.terminateOwnedChild(proxy),
       this.terminateOwnedChild(daemon),
     ]);
+    await this.reapLaunchPathLeftovers(
+      this.activeLaunchPath ?? this.launchPath(),
+      ownedPids,
+    );
     if (socket) {
       try {
         rmSync(socket, { force: true });
@@ -958,6 +1027,81 @@ export class CuaDriverHost {
     const forcedExit = this.waitForChildExit(child, 1_000);
     try { child.kill("SIGKILL"); } catch { /* already exited */ }
     await forcedExit;
+  }
+
+  private rememberGenerationPid(pid: number | undefined): void {
+    if (typeof pid === "number" && pid > 1 && !this.lastGenerationPids.includes(pid)) {
+      this.lastGenerationPids.push(pid);
+    }
+  }
+
+  private leftoverError(pids: number[]): Error {
+    return new Error(`Cua Driver previous generation is still running: ${pids.join(", ")}`);
+  }
+
+  private async collectLeftoverPids(launchPath: string, knownPids: number[]): Promise<number[]> {
+    const found = new Set(await this.listExactLaunchPathPids(launchPath));
+    for (const pid of knownPids) {
+      if (pid > 1 && processIsAlive(pid)) found.add(pid);
+    }
+    found.delete(process.pid);
+    return [...found];
+  }
+
+  private async assertNoLeftoverGeneration(): Promise<void> {
+    const leftovers = await this.collectLeftoverPids(
+      this.activeLaunchPath ?? this.launchPath(),
+      this.lastGenerationPids,
+    );
+    if (leftovers.length) throw this.leftoverError(leftovers);
+  }
+
+  private async reapLaunchPathLeftovers(
+    launchPath: string,
+    knownPids: number[],
+  ): Promise<void> {
+    const collect = () => this.collectLeftoverPids(launchPath, knownPids);
+    const signalAll = (pids: number[], signal: NodeJS.Signals) => {
+      for (const pid of pids) {
+        try { process.kill(pid, signal); } catch { /* already exited */ }
+      }
+    };
+    const waitUntilGone = async (timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const leftovers = await collect();
+        if (!leftovers.length) return leftovers;
+        await sleep(25);
+      }
+      return collect();
+    };
+    const waitForPids = async (pids: number[], timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const live = pids.filter((pid) => pid > 1 && pid !== process.pid && processIsAlive(pid));
+        if (!live.length) return live;
+        await sleep(25);
+      }
+      return pids.filter((pid) => pid > 1 && pid !== process.pid && processIsAlive(pid));
+    };
+    const escalate = async (pids: number[]) => {
+      const live = pids.filter((pid) => pid > 1 && pid !== process.pid && processIsAlive(pid));
+      if (!live.length) return;
+      signalAll(live, "SIGTERM");
+      let leftovers = await waitForPids(live, 400);
+      if (!leftovers.length) return;
+      signalAll(leftovers, "SIGKILL");
+      await waitForPids(leftovers, 1_000);
+    };
+    const owned = [...new Set(knownPids.filter((pid) => pid > 1))];
+    await escalate(owned);
+    const swept = (await this.listExactLaunchPathPids(launchPath))
+      .filter((pid) => pid > 1 && pid !== process.pid && !owned.includes(pid));
+    await escalate(swept);
+    let leftovers = await collect();
+    if (!leftovers.length) return;
+    leftovers = await waitUntilGone(this.leftoverSettleMs);
+    if (leftovers.length) throw this.leftoverError(leftovers);
   }
 
   private waitForChildExit(

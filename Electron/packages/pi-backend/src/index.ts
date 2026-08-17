@@ -77,6 +77,7 @@ import {
   isPlaceholderSessionTitle,
   provisionalSessionTitle,
 } from "./session-title.js";
+import { createToolBatchTelemetry, type ToolBatchTelemetry } from "./tool-batch-telemetry.js";
 import { describeImages } from "./vision-describe.js";
 import { ensureWebSearchDefaults } from "./web-search-defaults.js";
 import { describeImagesViaGlmMcp, isGlmProvider } from "./glm-vision-mcp.js";
@@ -330,6 +331,7 @@ export type PiBackendOptions = {
   authNodePath?: string;
   /** Injectable queue persistence; defaults to ~/.pi/agent/pipiui-queues. */ queueStore?: QueueStore;
   /** Injectable account-quota store for tests; defaults to the real Codex fetch. */ quotaStore?: QuotaStore;
+  /** Injectable tool-batch stats helper for tests; defaults to agentDir JSONL. */ toolBatchTelemetry?: ToolBatchTelemetry;
   /** Watermarks/delays for idle-time compaction; defaults to the Swift app's. */
   compaction?: ProactiveCompactionConfiguration;
   /** Testable canonical Swift project source; undefined preserves existing host state. */
@@ -1137,6 +1139,7 @@ export class PiHostBackend implements HostBackend {
   private queue: SessionMessageQueue;
   private queueStore: QueueStore;
   private quotaStore: QuotaStore;
+  private toolBatchTelemetry: ToolBatchTelemetry;
   private queueLoads = new Map<string, Promise<void>>();
   private queueWrites = new Map<string, Promise<void>>();
   private closed = false;
@@ -1157,6 +1160,7 @@ export class PiHostBackend implements HostBackend {
     this.computerDescriptor = options.computerDescriptor;
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
+    this.toolBatchTelemetry = options.toolBatchTelemetry ?? createToolBatchTelemetry({ agentDir: this.agentDir });
     this.root = options.sessionsRoot ?? join(this.agentDir, "sessions");
     this.piCommand = options.piCommand
       ? {
@@ -1307,6 +1311,7 @@ export class PiHostBackend implements HostBackend {
     this.externalAuthRuntime?.stop();
     for (const wake of [...this.agentTerminalWaiters]) wake();
     this.titleGenerationAbort.abort();
+    this.toolBatchTelemetry.dispose();
     await Promise.allSettled([...this.backgroundTitleGenerations]);
     await this.bridge.close();
     const live = [...this.live.values()];
@@ -1333,6 +1338,8 @@ export class PiHostBackend implements HostBackend {
     // still enqueue persists until their exit settles, and callers (tests,
     // host shutdown) rely on close() completing every write to agentDir.
     await this.agentsWrite;
+    // Bounded wait for already-queued stats lines; a hung append must not block exit.
+    await this.toolBatchTelemetry.close();
     this.leases.clear();
     this.listeners.clear();
   }
@@ -2321,6 +2328,7 @@ export class PiHostBackend implements HostBackend {
       live!.exitError = reason;
       failPending(reason);
       this.bridge.unregister(id);
+      this.toolBatchTelemetry.flushSession(id);
       // Pi sometimes writes the final assistant message and exits without
       // `agent_settled`. Without this the UI stays 进行中 forever.
       if (!this.closed && this.queue.isBusy(id))
@@ -2372,6 +2380,19 @@ export class PiHostBackend implements HostBackend {
     }
   }
   private rpcEvent(live: Live, e: Rpc) {
+    try {
+      const model =
+        this.sessionModelStates.get(live.session.id)?.model
+        ?? this.sessionModelSnapshots.get(live.session.id)?.model
+        ?? this.modelState.model;
+      this.toolBatchTelemetry.observeRpc(e, {
+        sessionId: live.session.id,
+        provider: model?.provider,
+        model: model?.id,
+      });
+    } catch {
+      /* best-effort telemetry must not affect the live stream */
+    }
     if (e.type === "agent_event" || e.type === "pipiui_agent_event") {
       this.mapAgentEvent(e.event ?? e, live.session.id);
       return;

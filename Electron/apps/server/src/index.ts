@@ -10,13 +10,12 @@ import WebSocket, { WebSocketServer, type RawData } from "ws";
 import { createPiHostBackend, type PiBackendOptions } from "@pipi/pi-backend";
 import {
   PIPI_HOST_PROTOCOL_VERSION,
+  createHostBackendSession,
   type HostBackend,
+  type HostBackendSession,
   type HostEvent,
   type HostMethod,
-  type HostRequest,
-  type HostResponse,
   type HostWireFrame,
-  type TerminalEvent,
   type Unsubscribe,
 } from "@pipi/host-api";
 import {
@@ -37,21 +36,6 @@ export {
 } from "./relay-pairing.js";
 
 const MAX_WIRE_PAYLOAD_BYTES = 8 * 1024 * 1024;
-const HOST_METHODS = new Set<HostMethod>([
-  "listProjects", "getProjectPaths", "setProjectPaths", "addProject", "removeProject", "renameProject", "listSessions", "listDocuments", "readDocument",
-  "newSession", "resumeSession", "renameSession", "deleteSession", "moveSession", "getSessionHistory",
-  "getSessionLease", "forceTakeoverSessionLease", "sendPrompt", "listQueue",
-  "enqueueMessage", "updateQueuedMessage", "removeQueuedMessage", "promoteQueuedMessage",
-  "steerQueuedMessage", "retryQueuedMessage", "stop", "queueFollowUp", "compact", "listModels", "getModelState", "setModel",
-  "setThinkingLevel", "getHiddenModelIds", "setHiddenModelIds", "getSidebarSessionPreferences", "setSidebarSessionPreferences", "authProviders", "beginProviderLogin", "continueProviderLogin", "cancelProviderLogin", "removeProviderCredentials", "getSessionStats", "getQuotaSnapshot", "listAgents", "abortAgent", "resolveAgent",
-  "checkAgent", "getWorktreeStatus", "mergeWorktree", "discardWorktree",
-  "getVisionModel", "setVisionModel", "getMemoryReviewModel", "setMemoryReviewModel",
-  "capabilities", "gitStatus", "gitCheckout", "probeDirectoryGit", "gitInitDirectory", "probeGitBinary", "revealProject", "terminalOpen", "terminalWrite",
-  "terminalClear", "terminalClose", "browserListTabs", "browserGetActiveTab",
-  "browserNewTab", "browserSwitchTab", "browserCloseTab", "browserLoadURL",
-  "browserGoBack", "browserGoForward", "browserReload", "browserSnapshot",
-  "browserSetViewBounds",
-]);
 const TERMINAL_METHODS = new Set<HostMethod>([
   "terminalOpen", "terminalWrite", "terminalClear", "terminalClose",
 ]);
@@ -108,7 +92,7 @@ export type WsHostServer = {
 
 type Connection = {
   backend: ManagedHostBackend;
-  unsubscribe: Unsubscribe;
+  session: HostBackendSession;
   pairing?: PairingIdentity;
   cookieHeader?: string;
   expiryTimer?: NodeJS.Timeout;
@@ -127,34 +111,6 @@ function asText(raw: RawData): string {
   if (Buffer.isBuffer(raw)) return raw.toString("utf8");
   if (Array.isArray(raw)) return Buffer.concat(raw).toString("utf8");
   return Buffer.from(raw).toString("utf8");
-}
-
-function requestFromWire(raw: RawData, isBinary: boolean): HostRequest | undefined {
-  if (isBinary) return undefined;
-  let value: unknown;
-  try {
-    value = JSON.parse(asText(raw));
-  } catch {
-    return undefined;
-  }
-  if (!isRecord(value)
-    || value.protocolVersion !== PIPI_HOST_PROTOCOL_VERSION
-    || value.type !== "request"
-    || typeof value.id !== "string"
-    || value.id.length === 0
-    || value.id.length > 256
-    || typeof value.method !== "string"
-    || !HOST_METHODS.has(value.method as HostMethod)
-    || !Array.isArray(value.params)) return undefined;
-  return value as unknown as HostRequest;
-}
-
-function responseError(id: string, error: string): HostResponse {
-  return { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id, type: "response", ok: false, error };
-}
-
-function responseSuccess(id: string, result: unknown): HostResponse {
-  return { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id, type: "response", ok: true, result };
 }
 
 function safeSend(socket: WebSocket, frame: HostWireFrame): void {
@@ -478,28 +434,29 @@ export function createWsHostServer(
     connection.closed = true;
     connections.delete(socket);
     if (connection.expiryTimer) clearTimeout(connection.expiryTimer);
-    connection.unsubscribe();
-    connection.closing = Promise.resolve(connection.backend.close?.()).catch(() => undefined);
+    // Shared backends (options.backend) omit ownsBackend, so this only drops
+    // the connection subscription. Exclusive createBackend() sockets pass
+    // ownsBackend and still drain Pi children here.
+    connection.closing = connection.session.close().catch(() => undefined);
     backendClosings.add(connection.closing);
     void connection.closing.finally(() => backendClosings.delete(connection.closing!));
   };
 
   const openConnection = (socket: WebSocket, identity?: PairingIdentity, cookieHeader?: string): void => {
     const backend = decorateBackend(createBackend(), options);
-    const connection: Connection = {
+    const connection = {
       backend,
       pairing: identity,
       cookieHeader,
       closed: false,
-      unsubscribe: () => {},
-    };
-    connection.unsubscribe = backend.subscribe(event => {
+    } as Connection;
+    connection.session = createHostBackendSession(backend, frame => {
       if (pairing && (!connection.cookieHeader || !pairing.authorize(connection.cookieHeader))) {
         socket.close(4001, "link expired");
         return;
       }
-      safeSend(socket, { type: "event", ...event });
-    });
+      safeSend(socket, frame);
+    }, { ownsBackend: !options.backend });
     if (identity) {
       connection.expiryTimer = setTimeout(() => socket.close(4001, "link expired"), Math.max(1, identity.expiresAt - Date.now()));
       connection.expiryTimer.unref?.();
@@ -507,23 +464,14 @@ export function createWsHostServer(
     connections.set(socket, connection);
     socket.on("close", () => closeConnection(socket, connection));
     socket.on("error", () => closeConnection(socket, connection));
-    socket.on("message", async (raw, isBinary) => {
+    socket.on("message", (raw, isBinary) => {
       // A later use of the same pairing link invalidates the old cookie before
       // this handler can execute another Host API request.
       if (pairing && (!connection.cookieHeader || !pairing.authorize(connection.cookieHeader))) {
         socket.close(4001, "replaced");
         return;
       }
-      const request = requestFromWire(raw, isBinary);
-      if (!request) {
-        safeSend(socket, responseError("", "unsupported protocol"));
-        return;
-      }
-      try {
-        safeSend(socket, responseSuccess(request.id, await backend.handle(request.method, request.params)));
-      } catch (error) {
-        safeSend(socket, responseError(request.id, error instanceof Error ? error.message : String(error)));
-      }
+      connection.session.receive(isBinary ? null : asText(raw));
     });
   };
 

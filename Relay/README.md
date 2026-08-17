@@ -3,6 +3,8 @@
 PipiUI 远程能力隧道的中继服务：提供配对页与 `/tunnel/ws` WebSocket。  
 浏览器与 Mac 通过同一（或分离的）HTTPS/WSS 域名接入；**无需账号、OTP、设备注册或长期 token**。
 
+另有独立的 Host API v2 远控 broker：Electron host 出站连接 `/relay/host`，浏览器经 `/pair/<roomID>#<32-byte-secret>` 配对后使用同源 `/ws`。Relay 只做有界透明转发，不创建 PiHostBackend、不改业务 JSON。旧 `/tunnel/ws` 与 `/downloads` 行为不变。
+
 ## 服务器要求
 
 - Ubuntu（或同类 systemd Linux）
@@ -48,8 +50,23 @@ rsync -a --partial PipiUI-Electron-<date>.zip root@<server>:/opt/pipiui-relay/do
 | `PIPIUI_RELAY_PORT` | 本地端口 | `8787` |
 | `PIPIUI_PUBLIC_ORIGIN` | 浏览器页面源（https） | `https://remote.example.com` |
 | `PIPIUI_TUNNEL_URL` | 隧道 WSS（可与页面同主机） | `wss://remote.example.com/tunnel/ws` |
+| `PIPIUI_BROWSER_UI_DIR` | 共享 browser UI 静态目录（可选） | `/opt/pipiui-relay/browser-ui` |
 
 单域名自托管时，`PIPIUI_PUBLIC_ORIGIN` 与 `PIPIUI_TUNNEL_URL` 使用**同一主机**即可。
+
+Host API v2 部署时把 `Electron/packages/ui/dist/browser` 拷到 `PIPIUI_BROWSER_UI_DIR`（缺省也会探测仓库内该路径）。未部署时配对仍可用，页面回退到占位 HTML。
+
+### Host API v2 端点
+
+| 路径 | 作用 |
+|------|------|
+| `WS /relay/host` | Host 出站控制+数据。首帧 `{v:2,type:"hello",roomID,hostToken,pairSecretHash}` |
+| `GET /pair/<roomID>` | 仅当该 ID 是 v2 房间时返回 claim 页；否则仍是旧 tunnel 配对页 |
+| `POST /pair/<roomID>/claim` | `{secret}` 恒时比对 hash，签发 `pipiui_pair` Secure+HttpOnly+SameSite=Strict |
+| `WS /ws` | 浏览器同源 Host API v2；升级时校验 cookie。只转发 `request` |
+| `GET /` | 已配对则托管 browser UI；未配对仍是旧提示页 |
+
+外层控制帧用 `{v:2,type}`（`hello`/`ready`/`paired`/`replaced`/`end`/`expired`/`error`/`ping`/`pong`）。业务帧用 `{protocolVersion:2,type:request\|response\|event}`，Relay 原样转发、不改 JSON。browser→host 只允许 request，host→browser 只允许 response/event。
 
 ### 3. systemd
 

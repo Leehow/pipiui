@@ -57,6 +57,7 @@ describe("vendored philosophy: structure", () => {
       "craft",
       "domain",
       "orchestration",
+      "same-turn",
       "fanout",
       "toolcall",
       "thinking",
@@ -120,6 +121,7 @@ describe("vendored philosophy: delivery", () => {
       "craft",
       "domain",
       "orchestration",
+      "same-turn",
       "fanout",
     ]);
     expect(result.text).not.toContain("{{");
@@ -143,6 +145,30 @@ describe("vendored philosophy: delivery", () => {
     expect(result.skipped.find((s) => s.id === "typo")?.reason).toMatch(/names nobody that exists/);
   });
 
+  it("delivers same-turn independent-call discipline to boss and lead on every model", () => {
+    const sameTurn = layers.find((l) => l.id === "same-turn");
+    expect(sameTurn, "Electron-only same-turn layer must exist").toBeTruthy();
+    expect(sameTurn!.body).toMatch(/Issue every tool call whose arguments you already know/);
+    expect(sameTurn!.body).toMatch(/Cross a turn only when the next call/);
+    expect(sameTurn!.body).toMatch(/Do not batch desktop \/ computer actions/);
+    expect(layers.find((l) => l.id === "orchestration")!.body).not.toMatch(
+      /Issue every tool call whose arguments you already know/,
+    );
+
+    for (const role of ["main", "lead"] as const) {
+      for (const model of ["openai/gpt-5", SCOPED_MODEL]) {
+        const result = compose({ role, model });
+        expect(result.included.map((l) => l.id)).toContain("same-turn");
+        expect(result.text).toMatch(/Issue every tool call whose arguments you already know/);
+        expect(result.text).toMatch(/Cross a turn only when the next call/);
+        expect(result.text).toMatch(/Do not batch desktop \/ computer actions/);
+      }
+    }
+    expect(
+      compose({ role: "worker", agent: "general-purpose" }).included.map((l) => l.id),
+    ).not.toContain("same-turn");
+  });
+
   it("keeps the boss's whole prefix inside budget", () => {
     // The standalone package capped this at 11500; the vendored tree also carries the
     // host-policy sections (tool withholding, computer_task routing, status persistence,
@@ -150,6 +176,6 @@ describe("vendored philosophy: delivery", () => {
     // load-bearing here and cost the difference. Raised again for the domain-memory layer
     // (CONTEXT.md vocabulary + ADR gate), which pays for itself in re-derived terminology.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(13100);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(13200);
   });
 });

@@ -10,22 +10,24 @@
 |---|---|---|---|---|
 | revealInFinder | ✅ | ❌ 隐藏 | ❌ 隐藏 | `packages/pi-backend`：`capabilities` → `revealInFinder: process.platform === 'darwin'`；UI 由 `capabilities.revealInFinder` 门控（`packages/ui` 的 `canRevealInFinder`） |
 | computerUse | ❌ v1 声明关闭（Swift 版保留 macOS Computer Use） | ❌ | ❌ | `capabilities` → `computerUse: false`；跨平台移植独立排期 |
-| terminal（xterm） | ⚠️ mock 流（node-pty 二期） | ⚠️ mock | ⚠️ mock | `apps/electron/src/main/index.ts` `withMockTerminalOutput`；所有平台暂不提供真实 PTY |
+| terminal（xterm） | ✅ node-pty | ✅ node-pty | ✅ node-pty（glibc ≤ 2.35） | 已入包；Linux `pty.node` 必须在 Ubuntu 22.04（glibc 2.35）上编译 |
 | 应用生命周期 | ✅ 关闭全部窗口不退出（macOS 惯例，dock 激活重建） | ✅ 全部窗口关闭即退出 | ✅ 同 win | `index.ts`：`if (process.platform !== 'darwin') app.quit()` |
 | 安装形态 | .app / dmg / zip（x64+arm64） | NSIS .exe（x64） | AppImage + deb（x64） | `apps/electron/package.json` build.target |
 | 图标 | `build/icon.icns`（`scripts/make-icon.sh` 从 `assets/brand/app-icon.png` 生成，macOS 工具链；build/ 被 gitignore，CI mac job 先行再生成） | `assets/icons/512x512.png`（app-builder 自动转 .ico，≥256px） | `assets/icons/` 目录（16–1024 完整 png 集，deb/AppImage 各尺寸齐全） | 图标集提交在 `Electron/apps/electron/assets/icons/`（sips 生成一次，CI 无需工具链）；win/linux 由 app-builder 自动转换 |
-| 默认 shell | zsh | cmd / PowerShell（node-pty 需 conpty） | bash / sh | 二期 node-pty 落地时按 `process.platform` 选择 |
+| 默认 shell | zsh | cmd / PowerShell（node-pty 需 conpty） | bash / sh | 按 `process.platform` 选择 |
 | 路径 | `~/.pi/agent`、`~/Library/Application Support/PipiUI` | `%USERPROFILE%\.pi\agent`、`%APPDATA%` | `~/.pi/agent`、`~/.config` | ⚠️ `packages/pi-backend/src/spawn-assembly.ts` 目前硬编码 `~/Library/Application Support/PipiUI`（search-grants、subagent-models 等）；win/linux 需改为平台路径（已排期，未在本轮实现） |
 | 文件/分隔符 | POSIX、LF | 反斜杠路径、CRLF | POSIX、LF | JSONL 写入统一 `\n`（与 pi 兼容）；`node:path` 处理分隔符 |
 | pi 进程解析 | PATH 中的 `pi`（`PiBackendOptions.piPath` 可注入） | 需 `pi.exe` 在 PATH | 需 `pi` 在 PATH | `packages/pi-backend` 默认 `"pi"`；win/linux 安装指引另列 |
 | 代码签名 | 无（CI 禁自动发现证书） | 无 | 无 | CI `CSC_IDENTITY_AUTO_DISCOVERY=false`；正式发布按平台接 notary/证书 |
 
-## 原生依赖占位（node-pty，本轮不引入）
+## 原生依赖（node-pty，已入包）
 
-- 终端暂由 `withMockTerminalOutput` 提供确定性 mock 流，任何平台不依赖原生模块。
-- 二期引入 node-pty 后，CI 与本地统一执行 `npx electron-builder install-app-deps`
-  （等价 electron-rebuild，按运行平台编译到 Electron ABI；打包时 `npmRebuild`
-  默认 true 兜底）。工作流中已留注释步骤位。
+- node-pty 已打进 Electron 包；CI 在 `npm ci` 之后执行
+  `npx --maxsockets 3 electron-builder install-app-deps`，按运行平台编到 Electron ABI。
+- Linux `pty.node` 必须在 Ubuntu 22.04（glibc 2.35）上编译。禁止在更新的滚动发行版
+  （如 ubuntu-latest / 24.04+）上编，否则会带上 GLIBC_2.36+，旧发行版无法加载。
+- CI linux job 钉在 `ubuntu-22.04`；打包后用 `scripts/check-linux-pty-glibc.mjs`
+  扫描产物里的 `pty.node`，发现 2.36+ 即失败。
 - 平台注意：Windows 走 node-pty 内建 conpty；Linux 需 gcc/libstdc++ 工具链；
   macOS 无额外依赖。
 
@@ -41,7 +43,7 @@
     明确报错（AppImage 仍正常产出）。deb 请在 ubuntu CI（workflow linux job）
     或 Linux 主机上构建；CI 有同样的大小守卫步骤。
 - CI：`.github/workflows/electron.yml` 三平台 matrix
-  （macos-latest / windows-latest / ubuntu-latest）：
+  （macos-latest / windows-latest / ubuntu-22.04）：
   `npm ci` → `npm test` → `npm run build` → `electron-builder --<platform>` → 上传产物。
   按 AGENTS.md 非主工作区规则，CI 不上传裸 macOS `.app` 目录，只上传
   dmg/zip/exe/AppImage/deb；CI 构建/测试本身允许。

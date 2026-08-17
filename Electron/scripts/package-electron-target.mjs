@@ -65,6 +65,16 @@ function main() {
     cwd: join(electronRoot, 'apps', 'electron'),
     env: { ...releaseEnv, PIPIUI_EMBEDDED_RUNTIME_TARGET: key }
   })
+  if (options.platform === 'linux') {
+    // electron-builder output is repo-root build/ (apps/electron package.json
+    // build.directories.output = ../../../build). Do not fall back to other trees:
+    // an older compatible pty.node elsewhere would hide a too-new packaged binary.
+    run(process.execPath, [
+      join(electronRoot, 'scripts', 'check-linux-pty-glibc.mjs'),
+      '--search',
+      join(electronRoot, '..', 'build')
+    ])
+  }
 }
 
 try { main() } catch (error) {

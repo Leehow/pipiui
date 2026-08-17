@@ -1,8 +1,9 @@
 import { existsSync, statSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import * as nodePty from 'node-pty'
+import type * as nodePty from 'node-pty'
 import { Terminal } from '@xterm/headless'
 import { SerializeAddon } from '@xterm/addon-serialize'
 import type { HostBackend, HostEvent, TerminalToolRequest, TerminalToolResult } from '@pipi/host-api'
@@ -10,6 +11,22 @@ import { PIPI_HOST_PROTOCOL_VERSION } from '@pipi/host-api'
 
 type PtyProcess = Pick<nodePty.IPty, 'write' | 'resize' | 'kill' | 'onData' | 'onExit'>
 type PtySpawn = (file: string, args: string[], options: nodePty.IPtyForkOptions) => PtyProcess
+
+export function loadNativePtySpawn(
+  load: () => { spawn: PtySpawn } = () => createRequire(import.meta.url)('node-pty'),
+): PtySpawn {
+  let cached: PtySpawn | undefined
+  return (file, args, options) => {
+    if (!cached) {
+      try { cached = load().spawn }
+      catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        throw new Error(`Failed to load native module: pty.node: ${reason}`)
+      }
+    }
+    return cached(file, args, options)
+  }
+}
 type PrivateState = 'none' | 'pending' | 'active'
 type RecordEntry = {
   id: string; sessionId: string; title: string; cwd: string; cols: number; rows: number
@@ -49,7 +66,7 @@ export class TerminalSessionHost {
   private env: NodeJS.ProcessEnv
 
   constructor(options: { spawn?: PtySpawn; platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv } = {}) {
-    this.spawn = options.spawn ?? nodePty.spawn
+    this.spawn = options.spawn ?? loadNativePtySpawn()
     this.platform = options.platform ?? process.platform
     this.env = options.env ?? process.env
   }

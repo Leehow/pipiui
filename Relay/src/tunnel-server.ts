@@ -5,6 +5,11 @@ import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
+import {
+  createHostAPIRelay,
+  defaultBrowserUIDir,
+} from "./host-api-relay.js";
+import type { HostAPIV2Limits } from "./host-api-v2.js";
 
 const PAIR_PATH = /^\/pair\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const ROOM_ID = PAIR_PATH;
@@ -51,6 +56,12 @@ export interface TunnelServerOptions {
   tunnelURL: string;
   /** Directory behind GET /downloads/<name>; defaults to <relay>/downloads. */
   downloadsDir?: string;
+  /** Shared packages/ui browser build, or a deployed copy. Missing dir uses fallback HTML. */
+  browserUIDir?: string;
+  now?: () => number;
+  v2TTLMs?: number;
+  v2Limits?: Partial<HostAPIV2Limits>;
+  v2SecureCookies?: boolean;
 }
 
 export function tunnelOptionsFromEnvironment(
@@ -78,11 +89,13 @@ export function tunnelOptionsFromEnvironment(
   if (!Number.isInteger(port) || port < 0 || port > 65_535) {
     throw new Error("PIPIUI_RELAY_PORT must be a valid port");
   }
+  const browserUIDir = env.PIPIUI_BROWSER_UI_DIR?.trim();
   return {
     host,
     port,
     publicOrigin: publicOrigin.origin,
     tunnelURL: tunnelURL.href,
+    ...(browserUIDir ? { browserUIDir } : {}),
   };
 }
 
@@ -242,6 +255,14 @@ export function createTunnelServer(options: TunnelServerOptions) {
   const clients = new Set<Client>();
   const downloadsRoot = options.downloadsDir
     ?? fileURLToPath(new URL("../downloads/", import.meta.url));
+  const v2 = createHostAPIRelay({
+    publicOrigin: options.publicOrigin,
+    browserUIDir: options.browserUIDir ?? defaultBrowserUIDir(),
+    now: options.now,
+    ttlMs: options.v2TTLMs,
+    limits: options.v2Limits,
+    secureCookies: options.v2SecureCookies,
+  });
   const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Referrer-Policy", "no-referrer");
@@ -250,6 +271,7 @@ export function createTunnelServer(options: TunnelServerOptions) {
     if (req.method === "GET" && url.pathname === "/healthz") {
       return json(res, 200, { ok: true });
     }
+    if (v2.handleRequest(req, res, url)) return;
     if (req.method === "GET" && url.pathname === "/") {
       res.statusCode = 200;
       res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -325,14 +347,15 @@ export function createTunnelServer(options: TunnelServerOptions) {
 
   server.on("upgrade", (request, socket, head) => {
     const url = new URL(request.url ?? "/", options.publicOrigin);
-    if (url.pathname !== TUNNEL_PATH || url.search || url.hash) {
-      socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
-      socket.destroy();
+    if (url.pathname === TUNNEL_PATH && !url.search && !url.hash) {
+      wss.handleUpgrade(request, socket, head, (webSocket) => {
+        wss.emit("connection", webSocket, request);
+      });
       return;
     }
-    wss.handleUpgrade(request, socket, head, (webSocket) => {
-      wss.emit("connection", webSocket, request);
-    });
+    if (v2.handleUpgrade(request, socket, head)) return;
+    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+    socket.destroy();
   });
 
   wss.on("connection", (socket) => {
@@ -537,8 +560,11 @@ export function createTunnelServer(options: TunnelServerOptions) {
     options,
     getRoomCount: () => rooms.size,
     getClientCount: () => clients.size,
+    getV2RoomCount: () => v2.getRoomCount(),
+    getV2ClientCount: () => v2.getClientCount(),
     close: async () => {
       clearInterval(heartbeat);
+      await v2.close();
       for (const room of [...rooms.values()]) {
         invalidateRoom(room, "server stopped", false);
       }

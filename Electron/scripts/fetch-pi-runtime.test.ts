@@ -30,7 +30,13 @@ describe('persistent embedded Pi runtime CLI', () => {
       mkdir(join(launcher, '..'), { recursive: true })
     ])
     await Promise.all([
-      writeFile(node, '#!/bin/sh\n'),
+      writeFile(node, (() => {
+        // Darwin now requires a standalone Mach-O Node (not the Electron shim).
+        const header = Buffer.alloc(32)
+        header.writeUInt32LE(0xfeedfacf, 0)
+        header.writeUInt32LE(arch === 'arm64' ? 0x0100000c : 0x01000007, 4)
+        return header
+      })()),
       writeFile(piCli, '// cli\n'),
       writeFile(hermes, JSON.stringify({ name: 'pi-hermes-memory', version: '0.9.5' })),
       writeFile(join(nodeModules, 'better-sqlite3', 'package.json'), JSON.stringify({ name: 'better-sqlite3', version: '12.11.1' })),
@@ -104,6 +110,16 @@ describe('persistent embedded Pi runtime CLI', () => {
     expect(await readdir(root)).toEqual(beforeEntries)
   })
 
+  it('never execs Helper.app from the Node shim (Gatekeeper re-scan)', async () => {
+    const source = await readFile(new URL('./fetch-pi-runtime.mjs', import.meta.url), 'utf8')
+    expect(source).toContain('Never exec * Helper.app here')
+    expect(source).toContain('case "\\${PIPIUI_ELECTRON_BINARY}" in')
+    expect(source).toContain('*" Helper.app"*|*/Contents/Frameworks/*" Helper") ;;')
+    expect(source).not.toMatch(/Frameworks\/\*" Helper\.app"\/Contents\/MacOS/)
+    expect(source).toContain('"$self_dir"/../../../../MacOS/*')
+    expect(source).toContain('node_modules/electron/dist/Electron.app/Contents/MacOS/Electron')
+  })
+
   it('caps npm concurrency on the staged install, which --prefix puts outside the repo .npmrc', async () => {
     const source = await readFile(new URL('./fetch-pi-runtime.mjs', import.meta.url), 'utf8')
     // npm's default of 15 sockets deadlocks behind a local HTTP proxy and strands
@@ -116,18 +132,16 @@ describe('persistent embedded Pi runtime CLI', () => {
     expect(npmrc).toMatch(/^maxsockets=3$/m)
   })
 
-  it('rejects a target whose Node is a standalone binary rather than the Electron shim', async () => {
+  it('rejects a darwin target whose Node is still the Electron shim', async () => {
     const arm = await seed('darwin', 'arm64')
     const node = join(arm, 'node', 'bin', 'node')
-    // seed() writes `#!/bin/sh`, which is what the shim looks like.
     expect(run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '').status).toBe(0)
 
-    // A real Node starts with a Mach-O magic number, never a shebang.
-    await writeFile(node, Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0]))
+    await writeFile(node, '#!/bin/sh\nexec false\n')
     await chmod(node, 0o755)
-    const fat = run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '')
-    expect(fat.status).toBe(1)
-    expect(fat.stderr).toContain('not the Electron shim')
+    const shim = run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '')
+    expect(shim.status).toBe(1)
+    expect(shim.stderr).toContain('Electron shim')
   })
 
   it('rejects a target prepared before pruning so the release cannot ship the fat tree', async () => {

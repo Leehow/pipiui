@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
-import { MANAGED_RUNTIME_PACKAGE_VERSIONS, resolveRuntimeAssets, UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS } from './runtime-assets.js'
+import { CUA_DRIVER_HELPER_APP, MANAGED_RUNTIME_PACKAGE_VERSIONS, resolveCuaDriverLaunchPath, resolveRuntimeAssets, UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS } from './runtime-assets.js'
 
 /** The path the built main bundle actually runs from; the dev branch walks up from here. */
 const builtMainDir = fileURLToPath(new URL('../../out/main', import.meta.url))
@@ -133,8 +133,6 @@ describe('resolveRuntimeAssets', () => {
   it('uses bundled Node and the real unpacked Pi CLI for a packaged launch', async () => {
     const { resourcesPath } = await seedPackagedRuntime()
     const assets = resolveRuntimeAssets({ packaged: true, resourcesPath, dirname: builtMainDir, env: { PATH: '/usr/bin:/bin' }, platform: 'darwin', arch: 'arm64' })
-    const electronName = basename(process.execPath)
-    const backgroundNodeHost = join(dirname(process.execPath), '..', 'Frameworks', `${electronName} Helper.app`, 'Contents', 'MacOS', `${electronName} Helper`)
     expect(assets.sourceRoot).toBe(join(resourcesPath, 'pipiui-runtime'))
     expect(assets.piCommand).toEqual({
       executable: join(resourcesPath, 'pipiui-embedded/node/bin/node'),
@@ -144,9 +142,7 @@ describe('resolveRuntimeAssets', () => {
         PATH: `${join(resourcesPath, 'pipiui-embedded/node/bin')}:${join(resourcesPath, 'pipiui-embedded/pi/bin')}:/usr/bin:/bin`,
         PIPIUI_NODE_PATH: join(resourcesPath, 'pipiui-embedded/node/bin/node'),
         PIPIUI_PI_PATH: join(resourcesPath, 'pipiui-embedded/pi/bin/pi'),
-        // macOS must use Electron's LSUIElement helper so each long-lived Pi
-        // process stays out of the Dock while still sharing Electron's Node.
-        PIPIUI_ELECTRON_BINARY: backgroundNodeHost
+        PIPIUI_ELECTRON_BINARY: process.execPath
       }
     })
     expect(assets.managedNodeModulesRoot).toBe(join(resourcesPath, 'pipiui-embedded/pi/lib/node_modules'))
@@ -166,6 +162,34 @@ describe('resolveRuntimeAssets', () => {
     const assets = resolveRuntimeAssets({ packaged: false, resourcesPath: '/nope', dirname: builtMainDir, env, platform: 'darwin', arch: 'not-prepared' })
     expect(assets.sourceRoot).toBe('/tmp/runtime-source')
     expect(assets.cuaDriver).toBe('/tmp/drv')
+  })
+
+  it('refuses nested CuaDriver Helper.app and detaches Darwin hosts out of the App', async () => {
+    root = await mkdtemp(join(tmpdir(), 'pipiui-cua-helper-'))
+    const configured = join(root, 'cua-driver')
+    const helper = join(root, CUA_DRIVER_HELPER_APP, 'Contents', 'MacOS', 'cua-driver')
+    const userData = join(root, 'udata')
+    await mkdir(dirname(helper), { recursive: true })
+    await writeFile(configured, 'raw-driver')
+    await writeFile(helper, 'helper-driver')
+    expect(resolveCuaDriverLaunchPath(configured, 'darwin')).toBe(configured)
+    expect(resolveCuaDriverLaunchPath(helper, 'darwin')).toBe(configured)
+    expect(resolveCuaDriverLaunchPath(configured, 'linux')).toBe(configured)
+    const { resourcesPath } = await seedPackagedRuntime()
+    await mkdir(join(resourcesPath, 'cua-driver'), { recursive: true })
+    await writeFile(join(resourcesPath, 'cua-driver', 'cua-driver'), 'pkg-driver')
+    const assets = resolveRuntimeAssets({
+      packaged: true,
+      resourcesPath,
+      dirname: builtMainDir,
+      env: { PATH: '/usr/bin:/bin' },
+      platform: 'darwin',
+      arch: 'arm64',
+      userData
+    })
+    expect(assets.cuaDriver).toBe(join(userData, 'detached-hosts', 'cua-driver'))
+    expect(assets.piCommand?.executable).toBe(join(userData, 'detached-hosts', 'node'))
+    expect(await readFile(assets.cuaDriver, 'utf8')).toBe('pkg-driver')
   })
 
   it('ships a provider-visible image block in every screenshot tool result', async () => {

@@ -249,6 +249,10 @@ body{overscroll-behavior:none}
 .browser-host-state { min-height: 100vh; display: grid; place-items: center; padding: 24px; color: var(--text-primary, #202124); background: var(--bg-primary, #fff); }
 .browser-host-error { position: relative; width: min(520px, 100%); padding: 24px; border: 1px solid var(--border, #d7d9df); border-radius: 14px; background: var(--panel-bg, #fff); }
 .browser-host-error > button[aria-label="关闭错误"] { position: absolute; top: 10px; right: 12px; border: 0; background: transparent; font-size: 24px; cursor: pointer; }
+.browser-host-hint { color: var(--text-secondary, #5f6368); font-size: 13px; }
+.remote-browser-shell { min-height: 100vh; display: flex; flex-direction: column; }
+.remote-browser-banner { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding: 8px 14px; background: color-mix(in srgb, #c9a227 18%, var(--bg-primary, #fff)); border-bottom: 1px solid var(--border, #d7d9df); font-size: 13px; }
+.remote-browser-banner button { margin-left: auto; }
 
 /* One outer content track for every chat-surface row. Keep inner component
    padding local, so cards and the composer share the exact same visual edges. */

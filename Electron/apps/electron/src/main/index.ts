@@ -23,6 +23,7 @@ import { withOpenDocumentExternally } from './external-document.js'
 import { withOpenExternal } from './external-url.js'
 import { createElectronComputerUsePermissionHost, withComputerUsePermissions } from './computer-use-permissions.js'
 import { createPtyTerminalBackend, TerminalSessionHost } from './terminal-host.js'
+import { createRemoteControlService, registerRemoteControlIpc } from './remote-control.js'
 export { createPtyTerminalBackend, resolveTerminalCwd, resolveTerminalShell } from './terminal-host.js'
 
 export interface IpcMainLike {
@@ -135,17 +136,18 @@ if (app) {
     })
     const primary = screen.getPrimaryDisplay()
     const display = { displayID: primary.id, width: primary.size.width, height: primary.size.height }
+    const userData = app.getPath('userData')
     const assets = resolveRuntimeAssets({
       packaged: app.isPackaged,
       resourcesPath: process.resourcesPath,
       dirname: __dirname,
-      env: process.env
+      env: process.env,
+      userData
     })
     const computer = new CuaDriverHost(assets.cuaDriver, display)
     // Runtime and mutable Pi state both belong to this Electron profile. A bounded one-time copy
     // preserves continuity from releases that shared ~/.pi/agent, without continuing to couple
     // either installation after migration.
-    const userData = app.getPath('userData')
     const runtimeRoot = process.env.PIPIUI_RUNTIME_ROOT ?? join(userData, 'runtime')
     const piProfile = resolveElectronPiProfile(userData)
     // Profile migration, bundled model-capability overrides, and the runtime-tree
@@ -230,6 +232,13 @@ if (app) {
       openURL: url => shell.openExternal(url),
     })), createUpdateCenterService({ catalog: updateCatalog }))
     registerPipiHostIpc(ipcMain, backend)
+    const remoteControl = createRemoteControlService({
+      backend,
+      userDataDir: userData,
+      relayOrigin: process.env.PIPIUI_RELAY_ORIGIN || 'https://pipi.aichattrpg.com'
+    })
+    registerRemoteControlIpc(ipcMain, remoteControl)
+    void remoteControl.restore()
     createWindow(browser, () => terminalHost.closeAll())
     // Once the background profile/capability install lands, invalidate + reload the
     // backend model catalog so the UI's next listModels reflects the bundled

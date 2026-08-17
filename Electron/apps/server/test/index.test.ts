@@ -3,13 +3,48 @@ import { once } from "node:events";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 
 import { createPiHostBackend } from "@pipi/pi-backend";
 import { createWsHost, type HostBackend } from "@pipi/host-api";
-import { createWsHostServer, RELAY_PAIR_ID, RELAY_PAIR_SECRET, serverOptionsFromEnvironment, type WsHostServer } from "../src/index.js";
+import { createWsHostServer, RELAY_PAIR_ID, RELAY_PAIR_SECRET, serverOptionsFromEnvironment, type WsHostServer, type WsHostServerOptions } from "../src/index.js";
+
+const TEST_STATIC_DIR = fileURLToPath(new URL("./fixtures/browser", import.meta.url));
+const SERVER_ENV_KEYS = [
+  "PIPIUI_SERVER_HOST",
+  "PIPIUI_SERVER_PORT",
+  "PIPIUI_SERVER_PAIRING",
+  "PIPIUI_SERVER_PUBLIC_ORIGIN",
+  "PIPIUI_SERVER_TERMINAL",
+  "PIPIUI_SERVER_BROWSER",
+  "PIPIUI_SERVER_TLS_KEY",
+  "PIPIUI_SERVER_TLS_CERT",
+] as const;
+const previousServerEnv = new Map<string, string | undefined>();
+
+beforeAll(() => {
+  for (const key of SERVER_ENV_KEYS) {
+    previousServerEnv.set(key, process.env[key]);
+    delete process.env[key];
+  }
+});
+
+afterAll(() => {
+  for (const [key, value] of previousServerEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
+function startServer(options: WsHostServerOptions | HostBackend = {}): WsHostServer {
+  const resolved: WsHostServerOptions = ("handle" in options && "subscribe" in options)
+    ? { backend: options }
+    : options;
+  return createWsHostServer({ staticDir: TEST_STATIC_DIR, ...resolved });
+}
 
 let active: WsHostServer | undefined;
 let tempRoot = "";
@@ -77,7 +112,7 @@ describe("server browser host", () => {
     expect(options).toMatchObject({ host: "127.0.0.1", port: 0, publicOrigin: "http://localhost:5173" });
     expect(options.backendOptions?.authHelperPath).toMatch(/resources\/runtime\/auth\/pi-auth-helper\.mjs$/);
 
-    active = createWsHostServer({ ...options, backend: quietBackend() });
+    active = startServer({ ...options, backend: quietBackend() });
     const port = await active.listen();
     expect(new URL(active.pairingLink!).origin).toBe("http://localhost:5173");
     // The TCP endpoint is still loopback-only and root remains protected even
@@ -98,7 +133,7 @@ if (command === "list-providers") console.log(JSON.stringify({ok:true,providers:
 else if (command === "list-models") console.log(JSON.stringify({ok:true,models:configured?[{provider:"deepseek",id:"deepseek-chat",name:"DeepSeek Chat",reasoning:false}]:[]}));
 else console.log(JSON.stringify({ok:false,error:"unsupported test command"}));
 `);
-    active = createWsHostServer({
+    active = startServer({
       pairing: false,
       backendOptions: {
         agentDir,
@@ -120,7 +155,7 @@ else console.log(JSON.stringify({ok:false,error:"unsupported test command"}));
   });
 
   it("serves the packages/ui browser build only after a Relay-compatible random pairing link is claimed", async () => {
-    active = createWsHostServer({ backend: quietBackend() });
+    active = startServer({ backend: quietBackend() });
     const port = await active.listen();
     const origin = `http://127.0.0.1:${port}`;
 
@@ -182,7 +217,7 @@ else console.log(JSON.stringify({ok:false,error:"unsupported test command"}));
     ].join("\n") + "\n");
 
     let backendCount = 0;
-    active = createWsHostServer({
+    active = startServer({
       pairing: false,
       createBackend: () => {
         backendCount += 1;
@@ -251,7 +286,7 @@ else console.log(JSON.stringify({ok:false,error:"unsupported test command"}));
   });
 
   it("revokes the prior browser WebSocket when the same pairing link is opened again", async () => {
-    active = createWsHostServer({ backend: quietBackend() });
+    active = startServer({ backend: quietBackend() });
     const port = await active.listen();
     const origin = `http://127.0.0.1:${port}`;
     const pairingURL = new URL(active.pairingLink!);

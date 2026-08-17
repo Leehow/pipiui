@@ -36,7 +36,7 @@ jobs:
             os: windows-latest
             args: --win
           - platform: linux
-            os: ubuntu-latest
+            os: ubuntu-22.04
             args: --linux
     runs-on: ${{ matrix.os }}
     env:
@@ -56,13 +56,9 @@ jobs:
         working-directory: Electron
         run: npm ci
 
-      # node-pty / native-deps placeholder (NOT wired in yet — round 2):
-      # when a native dependency lands, rebuild it against the pinned
-      # Electron ABI right after `npm ci`, on every platform:
-      #   - name: Rebuild native deps for Electron
-      #     working-directory: Electron
-      #     run: npx electron-builder install-app-deps
-      # (electron-rebuild equivalent; packaging also honors npmRebuild=true.)
+      - name: Rebuild native deps for Electron
+        working-directory: Electron
+        run: npx --maxsockets 3 electron-builder install-app-deps
 
       # server tests serve packages/ui/dist/browser — build must run first.
       - name: Build workspace
@@ -94,6 +90,11 @@ jobs:
           SIZE=$(stat -c %s "$DEB" 2>/dev/null || stat -f %z "$DEB")
           if [ "$SIZE" -lt 1024 ]; then echo "deb is a stub ($SIZE bytes); fpm failed" >&2; exit 1; fi
           echo "deb OK: $DEB ($SIZE bytes)"
+
+      - name: Reject too-new glibc in pty.node
+        if: matrix.platform == 'linux'
+        working-directory: Electron
+        run: node scripts/check-linux-pty-glibc.mjs --search ../build
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

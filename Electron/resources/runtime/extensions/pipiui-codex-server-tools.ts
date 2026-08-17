@@ -17,14 +17,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isCodexResponsesModel(model: { provider?: string; api?: string } | undefined): boolean {
+  if (!model) return false;
+  // Official ChatGPT Codex only. Substring matches would accept compatible gateways
+  // such as `my-openai-codex-proxy` / `openai-codex-compatible`.
+  const provider = (model.provider || "").toLowerCase();
+  if (provider !== "openai-codex") return false;
+  return model.api === "openai-codex-responses";
+}
+
 function isOpenAICodexResponsesRequest(
   model: { provider?: string; api?: string } | undefined,
   payload: unknown,
 ): payload is ResponsesPayload {
-  if (!model) return false;
-  const provider = (model.provider || "").toLowerCase();
-  if (provider !== "openai-codex" && !provider.includes("openai-codex")) return false;
-  if (model.api !== "openai-codex-responses") return false;
+  if (!isCodexResponsesModel(model)) return false;
   if (!isRecord(payload)) return false;
   // Responses API uses `input`; Chat Completions uses `messages`.
   return Array.isArray(payload.input);
@@ -48,13 +54,6 @@ function mergeServerTools(existing: unknown): unknown[] {
   return merged;
 }
 
-function isCodexResponsesModel(model: { provider?: string; api?: string } | undefined): boolean {
-  if (!model) return false;
-  const provider = (model.provider || "").toLowerCase();
-  if (provider !== "openai-codex" && !provider.includes("openai-codex")) return false;
-  return model.api === "openai-codex-responses";
-}
-
 export default function (pi: ExtensionAPI) {
   pi.on("before_provider_request", (event, ctx) => {
     const model = ctx.model;
@@ -63,10 +62,15 @@ export default function (pi: ExtensionAPI) {
     }
 
     const payload = event.payload as ResponsesPayload;
-    return {
+    const next: ResponsesPayload = {
       ...payload,
       tools: makeStrictFunctionTools(mergeServerTools(payload.tools)),
     };
+    // Codex uses the Responses create body. Honor an explicit false; otherwise enable.
+    if (payload.parallel_tool_calls !== false) {
+      next.parallel_tool_calls = true;
+    }
+    return next;
   });
 
   // Tell the model the hosted tool is available alongside Pi's local tools.

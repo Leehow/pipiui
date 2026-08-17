@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { HostBackend, HostEvent } from '@pipi/host-api'
-import { TerminalSessionHost, createPtyTerminalBackend, resolveTerminalCwd, resolveTerminalShell } from './terminal-host.js'
+import { TerminalSessionHost, createPtyTerminalBackend, loadNativePtySpawn, resolveTerminalCwd, resolveTerminalShell } from './terminal-host.js'
 
 function baseBackend(): HostBackend {
   return { handle: vi.fn(async () => undefined), subscribe: vi.fn(() => () => undefined) }
@@ -19,6 +19,13 @@ function ptyHarness() {
 }
 
 describe('PTY terminal host', () => {
+  it('wraps native pty.node load failures and only invokes the loader once', () => {
+    const load = vi.fn(() => { throw new Error('dlopen failed') })
+    const spawn = loadNativePtySpawn(load)
+    expect(() => spawn('/bin/zsh', ['-l'], {} as never)).toThrow(/pty\.node/)
+    expect(load).toHaveBeenCalledTimes(1)
+  })
+
   it('selects the platform default shell without hard-coding zsh cross-platform', () => {
     expect(resolveTerminalShell('darwin', { SHELL: '/opt/homebrew/bin/fish' })).toEqual({ file: '/opt/homebrew/bin/fish', args: ['-l'] })
     expect(resolveTerminalShell('linux', {})).toEqual({ file: '/bin/sh', args: ['-l'] })

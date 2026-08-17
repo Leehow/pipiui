@@ -1,3 +1,4 @@
+import { execFileSync, spawn } from "node:child_process";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -528,19 +529,142 @@ if (mode === "serve") {
 
     const shutdown = host.shutdown();
     await Promise.allSettled([request, shutdown]);
-    const records = (await readFile(trace, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as { mode: string; pid: number });
+    const text = await readFile(trace, "utf8").catch(() => "");
+    const records = text.trim()
+      ? text.trim().split("\n").map((line) => JSON.parse(line) as { mode: string; pid: number })
+      : [];
     const survivors = records.filter(({ pid }) => {
       try { process.kill(pid, 0); return true; } catch { return false; }
     });
     for (const { pid } of survivors) {
       try { process.kill(pid, "SIGKILL"); } catch { /* already exited */ }
     }
+    const liveHelperPids = execFileSync("/bin/ps", ["-axww", "-o", "pid=,command="], { encoding: "utf8" })
+      .split("\n")
+      .flatMap((line) => {
+        const match = /^\s*(\d+)\s(.*)$/.exec(line);
+        if (!match) return [];
+        const command = match[2];
+        if (command === helper || command.startsWith(`${helper} `) || command.includes(` ${helper} `) || command.endsWith(` ${helper}`)) {
+          return [Number(match[1])];
+        }
+        return [];
+      });
 
-    expect(records.map(({ mode }) => mode)).toEqual(["serve"]);
+    // Fenced before the fake helper could write the trace is a valid outcome.
+    if (records.length > 0) {
+      expect(records.map(({ mode }) => mode)).toEqual(["serve"]);
+    }
     expect(survivors).toEqual([]);
+    expect(liveHelperPids).toEqual([]);
+  });
+
+  it("does not spawn a new generation until previous launch-path PIDs are dead", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-host-restart-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    const trace = join(root, "pids.jsonl");
+    await writeFile(helper, `#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const net = require("node:net");
+const readline = require("node:readline");
+const mode = process.argv[2];
+fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify({ mode, pid: process.pid }) + "\\n");
+process.on("SIGTERM", () => {});
+if (mode === "serve") {
+  const leftover = spawn(process.argv[1], ["leftover"], { detached: true, stdio: "ignore" });
+  leftover.unref();
+  net.createServer(() => {}).listen(process.argv[process.argv.indexOf("--socket") + 1]);
+  setInterval(() => {}, 1000);
+} else if (mode === "mcp") {
+  const lines = readline.createInterface({ input: process.stdin });
+  lines.on("line", (line) => {
+    const message = JSON.parse(line);
+    if (!message.id) return;
+    const result = message.method === "initialize"
+      ? { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "fake", version: "1" } }
+      : { content: [], structuredContent: {}, isError: false };
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n");
+  });
+  setInterval(() => {}, 1000);
+} else {
+  setInterval(() => {}, 1000);
+}
+`);
+    await chmod(helper, 0o755);
+    const previousPids: number[] = [];
+    let spawnedWhilePreviousAlive = false;
+    let generation = 0;
+    const host = new CuaDriverHost(helper, { displayID: 1, width: 1, height: 1 }, (command, args, options) => {
+      if (generation > 0) {
+        for (const pid of previousPids) {
+          try {
+            process.kill(pid, 0);
+            spawnedWhilePreviousAlive = true;
+          } catch { /* previous pid already reaped */ }
+        }
+      }
+      return spawn(command, args, options);
+    });
+    const knownPids = new Set<number>();
+    const readPids = async () => {
+      const text = await readFile(trace, "utf8").catch(() => "");
+      return text.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line).pid as number);
+    };
+    try {
+      await expect(host.handle({
+        protocolVersion: 1,
+        action: "computer_runtime_capabilities",
+      })).resolves.toMatchObject({ ok: true });
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        previousPids.splice(0, previousPids.length, ...(await readPids()));
+        if (previousPids.length >= 3) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(previousPids.length).toBeGreaterThanOrEqual(3);
+      for (const pid of previousPids) knownPids.add(pid);
+      generation = 1;
+      host.cancel();
+      await expect(host.handle({
+        protocolVersion: 1,
+        action: "computer_runtime_capabilities",
+      })).resolves.toMatchObject({ ok: true });
+      expect(spawnedWhilePreviousAlive).toBe(false);
+      for (const pid of previousPids) {
+        expect(() => process.kill(pid, 0), `pid ${pid} survived cancel`).toThrow();
+      }
+    } finally {
+      await host.shutdown();
+      for (const pid of [...knownPids, ...(await readPids())]) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  it("blocks restart when a leftover PID remains after the final reap timeout", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-host-leftover-block-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    let spawned = 0;
+    const host: any = new CuaDriverHost(
+      helper,
+      { displayID: 1, width: 1, height: 1 },
+      (command, args, options) => {
+        spawned += 1;
+        return spawn(command, args, options);
+      },
+    );
+    host.leftoverSettleMs = 50;
+    host.listExactLaunchPathPids = async () => [424242];
+    host.cancel();
+    await expect(host.handle({
+      protocolVersion: 1,
+      action: "computer_runtime_capabilities",
+    })).rejects.toThrow(/still running/);
+    expect(spawned).toBe(0);
   });
 
   it("extracts only closed target-window codes from Cua tool failures", () => {

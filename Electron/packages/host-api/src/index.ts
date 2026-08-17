@@ -562,7 +562,12 @@ export type HostMethod = BaseHostMethod | TerminalHostMethod | BrowserHostMethod
 export type HostRequest = { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "request"; method: HostMethod; params: unknown[] };
 export type HostResponse = { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "response"; ok: true; result: unknown } | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "response"; ok: false; error: string; errorCode?: string };
 export type HostWireFrame = HostRequest | HostResponse | ({ type: "event" } & HostEvent);
-export interface HostBackend { handle(method: HostMethod, params: unknown[]): Promise<unknown>; subscribe(listener: (event: HostEvent) => void): Unsubscribe; }
+export interface HostBackend {
+  handle(method: HostMethod, params: unknown[]): Promise<unknown>;
+  subscribe(listener: (event: HostEvent) => void): Unsubscribe;
+  /** Exclusive owners may implement this; shared backends must not be closed by a transport. */
+  close?(): Promise<void> | void;
+}
 export interface IpcRendererLike { invoke(channel: string, request: HostRequest): Promise<HostResponse>; on(channel: string, listener: (_event: unknown, frame: HostWireFrame) => void): void; removeListener(channel: string, listener: (_event: unknown, frame: HostWireFrame) => void): void; }
 
 function requestId(): string { return `${Date.now()}-${Math.random().toString(36).slice(2)}`; }
@@ -713,29 +718,202 @@ export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHAN
   );
 }
 
+/** Stable client error when a socket drops with in-flight Host API requests. Never replay mutations. */
+export const TRANSPORT_DISCONNECTED = "transport_disconnected" as const;
+
+export type HostWireParseResult =
+  | { ok: true; frame: HostWireFrame }
+  | { ok: false; error: string };
+
+export type BindHostBackendOptions = {
+  /** When set, connection close also calls `backend.close?.()`. Shared backends must omit this. */
+  ownsBackend?: boolean;
+};
+
+export type HostBackendSession = {
+  receive(raw: unknown): void;
+  close(): Promise<void>;
+};
+
+function isWireRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function decodeWirePayload(raw: unknown): unknown {
+  if (typeof raw === "string") return raw;
+  if (!isWireRecord(raw) || !("data" in raw)) return raw;
+  const data = raw.data;
+  if (typeof data === "string") return data;
+  if (data == null) return raw;
+  if (typeof (data as { toString?: unknown }).toString === "function") return String(data);
+  return data;
+}
+
+function transportDisconnectedError(): Error & { code: typeof TRANSPORT_DISCONNECTED } {
+  const error = new Error("transport disconnected") as Error & { code: typeof TRANSPORT_DISCONNECTED };
+  error.code = TRANSPORT_DISCONNECTED;
+  return error;
+}
+
+function protocolErrorResponse(id = ""): Extract<HostResponse, { ok: false }> {
+  return { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id, type: "response", ok: false, error: "unsupported protocol" };
+}
+
+function thrownHostError(error: unknown): Pick<Extract<HostResponse, { ok: false }>, "error" | "errorCode"> {
+  const message = error instanceof Error ? error.message : String(error);
+  const errorCode = error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string"
+    ? (error as { code: string }).code
+    : undefined;
+  return errorCode ? { error: message, errorCode } : { error: message };
+}
+
+/**
+ * Host API v2 wire seam. Frames stay `{ protocolVersion: 2, type, ... }` — no room/secret.
+ * Clients send `request`; servers send `response` or `event`.
+ * Unknown response ids are ignored. The first response for an id wins; later duplicates are unknown.
+ * Malformed, wrong-version, and wrong-direction frames are `unsupported protocol`.
+ */
+export function parseHostWireFrame(raw: unknown): HostWireParseResult {
+  let value = raw;
+  if (typeof raw === "string") {
+    try { value = JSON.parse(raw); } catch { return { ok: false, error: "unsupported protocol" }; }
+  }
+  if (!isWireRecord(value) || value.protocolVersion !== PIPI_HOST_PROTOCOL_VERSION) {
+    return { ok: false, error: "unsupported protocol" };
+  }
+  if (value.type === "request") {
+    if (typeof value.id !== "string" || value.id.length === 0 || value.id.length > 256
+      || typeof value.method !== "string" || value.method.length === 0
+      || !Array.isArray(value.params)) {
+      return { ok: false, error: "unsupported protocol" };
+    }
+    return { ok: true, frame: value as unknown as HostRequest };
+  }
+  if (value.type === "response") {
+    if (typeof value.id !== "string" || value.id.length === 0 || value.id.length > 256 || typeof value.ok !== "boolean") {
+      return { ok: false, error: "unsupported protocol" };
+    }
+    if (value.ok === false && typeof value.error !== "string") return { ok: false, error: "unsupported protocol" };
+    if (value.ok === false && value.errorCode !== undefined && typeof value.errorCode !== "string") {
+      return { ok: false, error: "unsupported protocol" };
+    }
+    return { ok: true, frame: value as unknown as HostResponse };
+  }
+  if (value.type === "event") {
+    if (typeof value.channel !== "string" || value.channel.length === 0 || !isWireRecord(value.event)) {
+      return { ok: false, error: "unsupported protocol" };
+    }
+    return { ok: true, frame: value as unknown as HostWireFrame };
+  }
+  return { ok: false, error: "unsupported protocol" };
+}
+
+/** Transport-neutral HostBackend ↔ HostRequest/HostResponse/HostEvent pump. */
+export function createHostBackendSession(
+  backend: HostBackend,
+  send: (frame: HostWireFrame) => void,
+  options: BindHostBackendOptions = {}
+): HostBackendSession {
+  let closed = false;
+  const unsubscribe = backend.subscribe(event => {
+    if (!closed) send({ type: "event", ...event });
+  });
+  return {
+    receive(raw) {
+      if (closed) return;
+      const parsed = parseHostWireFrame(raw);
+      if (!parsed.ok || parsed.frame.type !== "request") {
+        send(protocolErrorResponse());
+        return;
+      }
+      const request = parsed.frame;
+      void Promise.resolve(backend.handle(request.method, request.params)).then(
+        result => {
+          if (!closed) send({ protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: request.id, type: "response", ok: true, result });
+        },
+        error => {
+          if (closed) return;
+          send({ protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: request.id, type: "response", ok: false, ...thrownHostError(error) });
+        }
+      );
+    },
+    async close() {
+      if (closed) return;
+      closed = true;
+      unsubscribe();
+      if (options.ownsBackend) await Promise.resolve(backend.close?.()).catch(() => undefined);
+    }
+  };
+}
+
+/** Bind the v2 pump to any WebSocketLike. Close cancels this connection only unless `ownsBackend`. */
+export function bindHostBackend(backend: HostBackend, socket: WebSocketLike, options?: BindHostBackendOptions): Unsubscribe {
+  const session = createHostBackendSession(backend, frame => {
+    if (socket.readyState !== 1) return;
+    try { socket.send(JSON.stringify(frame)); } catch { /* close race */ }
+  }, options);
+  const onMessage = (raw: unknown) => session.receive(decodeWirePayload(raw));
+  const onStop = () => dispose();
+  let disposed = false;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    socket.removeEventListener("message", onMessage);
+    socket.removeEventListener("close", onStop);
+    socket.removeEventListener("error", onStop);
+    void session.close();
+  };
+  socket.addEventListener("message", onMessage);
+  socket.addEventListener("close", onStop);
+  socket.addEventListener("error", onStop);
+  if (socket.readyState === 2 || socket.readyState === 3) dispose();
+  return dispose;
+}
+
 export interface WebSocketLike { readyState: number; send(data: string): void; addEventListener(type: "message" | "close" | "error", listener: (event: any) => void): void; removeEventListener(type: "message" | "close" | "error", listener: (event: any) => void): void; }
 
 export function createWsHost(socket: WebSocketLike): PipiHostAPI {
   const pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   const events = new Set<(event: HostEvent) => void>();
-  const onMessage = (raw: any) => {
-    const data = typeof raw.data === "string" ? raw.data : raw.data.toString();
-    const frame = JSON.parse(data) as HostWireFrame;
+  let disconnected = socket.readyState === 2 || socket.readyState === 3;
+  const failPending = () => {
+    if (disconnected) return;
+    disconnected = true;
+    const error = transportDisconnectedError();
+    for (const item of pending.values()) item.reject(error);
+    pending.clear();
+  };
+  const onMessage = (raw: unknown) => {
+    if (disconnected) return;
+    const parsed = parseHostWireFrame(decodeWirePayload(raw));
+    if (!parsed.ok || parsed.frame.type === "request") return;
+    const frame = parsed.frame;
     if (frame.type === "response") {
       const item = pending.get(frame.id);
       if (!item) return;
       pending.delete(frame.id);
       frame.ok ? item.resolve(frame.result) : item.reject(responseError(frame));
-    } else if (frame.type === "event") {
+    } else {
       events.forEach(listener => listener(frame));
     }
   };
   socket.addEventListener("message", onMessage);
+  socket.addEventListener("close", failPending);
+  socket.addEventListener("error", failPending);
   return apiFrom(
     (method, params) => new Promise((resolve, reject) => {
+      if (disconnected || socket.readyState === 2 || socket.readyState === 3) {
+        reject(transportDisconnectedError());
+        return;
+      }
       const id = requestId();
       pending.set(id, { resolve, reject });
-      socket.send(JSON.stringify({ protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id, type: "request", method, params } satisfies HostRequest));
+      try {
+        socket.send(JSON.stringify({ protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id, type: "request", method, params } satisfies HostRequest));
+      } catch {
+        pending.delete(id);
+        reject(transportDisconnectedError());
+      }
     }),
     (channel, predicate, listener) => {
       const relay = (event: HostEvent) => { if (event.channel === channel && predicate(event)) listener(event); };

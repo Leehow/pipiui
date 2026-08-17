@@ -1,8 +1,36 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { fileURLToPath } from 'node:url'
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
-import { createIpcHost, createWsHost, encodePipiuiUpdateEvaluationIntent, PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX, PIPIUI_UPDATE_EVALUATION_INTENT_VERSION, resolveThinkingLevel, thinkingLevelsForModel, type HostBackend, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences } from '../src/index.js'
+import { bindHostBackend, createHostBackendSession, createIpcHost, createWsHost, encodePipiuiUpdateEvaluationIntent, parseHostWireFrame, PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX, PIPIUI_UPDATE_EVALUATION_INTENT_VERSION, resolveThinkingLevel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED, type HostBackend, type HostEvent, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences, type WebSocketLike } from '../src/index.js'
 import { registerPipiHostIpc } from '../../../apps/electron/src/main/index.js'
 import { createWsHostServer } from '../../../apps/server/src/index.js'
+
+const TEST_STATIC_DIR = fileURLToPath(new URL('../../../apps/server/test/fixtures/browser', import.meta.url))
+const SERVER_ENV_KEYS = [
+  'PIPIUI_SERVER_HOST',
+  'PIPIUI_SERVER_PORT',
+  'PIPIUI_SERVER_PAIRING',
+  'PIPIUI_SERVER_PUBLIC_ORIGIN',
+  'PIPIUI_SERVER_TERMINAL',
+  'PIPIUI_SERVER_BROWSER',
+  'PIPIUI_SERVER_TLS_KEY',
+  'PIPIUI_SERVER_TLS_CERT',
+] as const
+const previousServerEnv = new Map<string, string | undefined>()
+
+beforeAll(() => {
+  for (const key of SERVER_ENV_KEYS) {
+    previousServerEnv.set(key, process.env[key])
+    delete process.env[key]
+  }
+})
+
+afterAll(() => {
+  for (const [key, value] of previousServerEnv) {
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+})
 
 type Factory = () => Promise<{ host: PipiHostAPI; close(): Promise<void> }>
 
@@ -499,7 +527,7 @@ function ipcFactory(): Promise<{ host: PipiHostAPI; close(): Promise<void> }> {
 }
 
 async function wsFactory(): Promise<{ host: PipiHostAPI; close(): Promise<void> }> {
-  const server = createWsHostServer({ backend: createContractMockBackend(), pairing: false, terminalMode: 'mock' })
+  const server = createWsHostServer({ backend: createContractMockBackend(), pairing: false, terminalMode: 'mock', staticDir: TEST_STATIC_DIR })
   const port = await server.listen()
   const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`)
   await new Promise<void>((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject) })
@@ -508,6 +536,218 @@ async function wsFactory(): Promise<{ host: PipiHostAPI; close(): Promise<void> 
 
 contract('IPC transport', ipcFactory)
 contract('WebSocket transport', wsFactory, { computerUse: false, revealInFinder: false, terminal: true, browser: false })
+
+class MemorySocket implements WebSocketLike {
+  readyState = 1
+  readonly sent: string[] = []
+  peer: MemorySocket | undefined
+  private readonly listeners = {
+    message: new Set<(event: any) => void>(),
+    close: new Set<(event: any) => void>(),
+    error: new Set<(event: any) => void>(),
+  }
+  send(data: string) {
+    this.sent.push(data)
+    this.peer?.emit('message', { data })
+  }
+  addEventListener(type: 'message' | 'close' | 'error', listener: (event: any) => void) {
+    this.listeners[type].add(listener)
+  }
+  removeEventListener(type: 'message' | 'close' | 'error', listener: (event: any) => void) {
+    this.listeners[type].delete(listener)
+  }
+  emit(type: 'message' | 'close' | 'error', event: any = {}) {
+    for (const listener of [...this.listeners[type]]) listener(event)
+  }
+  close() {
+    if (this.readyState === 3) return
+    this.readyState = 3
+    this.emit('close', {})
+  }
+}
+
+function pairedSockets(): [MemorySocket, MemorySocket] {
+  const client = new MemorySocket()
+  const server = new MemorySocket()
+  client.peer = server
+  server.peer = client
+  return [client, server]
+}
+
+function transportBackend(handle?: HostBackend['handle']): HostBackend & { closed: number; emit(event: HostEvent): void } {
+  const listeners = new Set<(event: HostEvent) => void>()
+  return {
+    closed: 0,
+    emit(event) { listeners.forEach(listener => listener(event)) },
+    async handle(method, params) {
+      if (handle) return handle(method, params)
+      if (method === 'listProjects') return [{ id: 'p1', name: 'P', path: '/tmp/p' }]
+      throw new Error(`unexpected ${method}`)
+    },
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
+    close() { this.closed += 1 },
+  }
+}
+
+describe('Host API v2 transport contract', () => {
+  it('parses request/response/event and rejects bad version or shape', () => {
+    expect(parseHostWireFrame({ protocolVersion: 2, id: '1', type: 'request', method: 'listProjects', params: [] })).toEqual({
+      ok: true,
+      frame: { protocolVersion: 2, id: '1', type: 'request', method: 'listProjects', params: [] },
+    })
+    expect(parseHostWireFrame(JSON.stringify({ protocolVersion: 2, id: '1', type: 'response', ok: true, result: [] }))).toMatchObject({
+      ok: true,
+      frame: { type: 'response', ok: true, result: [] },
+    })
+    expect(parseHostWireFrame({ protocolVersion: 2, type: 'event', channel: 'stream', event: { type: 'status', sessionId: 's', status: 'started' } })).toMatchObject({
+      ok: true,
+      frame: { type: 'event', channel: 'stream' },
+    })
+    expect(parseHostWireFrame({ protocolVersion: 1, id: '1', type: 'request', method: 'listProjects', params: [] })).toEqual({ ok: false, error: 'unsupported protocol' })
+    expect(parseHostWireFrame({ protocolVersion: 2, type: 'request', method: 'listProjects', params: [] })).toEqual({ ok: false, error: 'unsupported protocol' })
+    expect(parseHostWireFrame('not-json')).toEqual({ ok: false, error: 'unsupported protocol' })
+  })
+
+  it('round-trips a request/response and forwards backend events', async () => {
+    const [client, server] = pairedSockets()
+    const backend = transportBackend()
+    bindHostBackend(backend, server)
+    const host = createWsHost(client)
+    const stream: any[] = []
+    const off = host.subscribeStream('session-1', event => stream.push(event))
+    await expect(host.listProjects()).resolves.toEqual([{ id: 'p1', name: 'P', path: '/tmp/p' }])
+    backend.emit({ protocolVersion: 2, channel: 'stream', event: { type: 'status', sessionId: 'session-1', status: 'started' } })
+    expect(stream).toEqual([{ type: 'status', sessionId: 'session-1', status: 'started' }])
+    off()
+  })
+
+  it('settles pending client requests with transport_disconnected on socket close and does not replay', async () => {
+    const [client, server] = pairedSockets()
+    let calls = 0
+    bindHostBackend(transportBackend(async () => {
+      calls += 1
+      return new Promise(() => {})
+    }), server)
+    const host = createWsHost(client)
+    const pending = host.sendPrompt('session-1', 'mutate once')
+    expect(calls).toBe(1)
+    client.close()
+    await expect(pending).rejects.toMatchObject({ message: 'transport disconnected', code: TRANSPORT_DISCONNECTED })
+    expect(calls).toBe(1)
+    await expect(host.listProjects()).rejects.toMatchObject({ code: TRANSPORT_DISCONNECTED })
+    expect(calls).toBe(1)
+  })
+
+  it('settles pending client requests with transport_disconnected on socket error', async () => {
+    const [client, server] = pairedSockets()
+    bindHostBackend(transportBackend(async () => new Promise(() => {})), server)
+    const host = createWsHost(client)
+    const pending = host.listProjects()
+    client.emit('error', {})
+    await expect(pending).rejects.toMatchObject({ code: TRANSPORT_DISCONNECTED })
+  })
+
+  it('ignores unknown or duplicate response ids and wrong-direction client frames', async () => {
+    const [client, server] = pairedSockets()
+    bindHostBackend(transportBackend(), server)
+    const host = createWsHost(client)
+    server.send(JSON.stringify({ protocolVersion: 2, id: 'missing', type: 'response', ok: true, result: ['ghost'] }))
+    server.send(JSON.stringify({ protocolVersion: 2, id: 'also-missing', type: 'request', method: 'listProjects', params: [] }))
+    await expect(host.listProjects()).resolves.toEqual([{ id: 'p1', name: 'P', path: '/tmp/p' }])
+    const first = server.sent[0]
+    server.send(first)
+    await expect(host.listProjects()).resolves.toEqual([{ id: 'p1', name: 'P', path: '/tmp/p' }])
+  })
+
+  it('rejects wrong version and wrong-direction frames on the backend pump', () => {
+    const sent: HostWireFrame[] = []
+    const session = createHostBackendSession(transportBackend(), frame => sent.push(frame))
+    session.receive({ protocolVersion: 1, id: 'x', type: 'request', method: 'listProjects', params: [] })
+    session.receive({ protocolVersion: 2, id: 'x', type: 'response', ok: true, result: null })
+    session.receive({ protocolVersion: 2, type: 'event', channel: 'stream', event: { type: 'status', sessionId: 's', status: 'started' } })
+    expect(sent).toEqual([
+      { protocolVersion: 2, id: '', type: 'response', ok: false, error: 'unsupported protocol' },
+      { protocolVersion: 2, id: '', type: 'response', ok: false, error: 'unsupported protocol' },
+      { protocolVersion: 2, id: '', type: 'response', ok: false, error: 'unsupported protocol' },
+    ])
+  })
+
+  it('does not close a shared backend when the connection ends', async () => {
+    const backend = transportBackend()
+    const session = createHostBackendSession(backend, () => {})
+    const subscribed = { current: false }
+    const watched: HostBackend = {
+      handle: backend.handle.bind(backend),
+      subscribe(listener) {
+        subscribed.current = true
+        const off = backend.subscribe(listener)
+        return () => { subscribed.current = false; off() }
+      },
+      close: backend.close.bind(backend),
+    }
+    const shared = createHostBackendSession(watched, () => {})
+    expect(subscribed.current).toBe(true)
+    await shared.close()
+    expect(subscribed.current).toBe(false)
+    expect(backend.closed).toBe(0)
+    await session.close()
+    expect(backend.closed).toBe(0)
+  })
+
+  it('closes an exclusively owned backend when the connection ends', async () => {
+    const [client, server] = pairedSockets()
+    const backend = transportBackend()
+    bindHostBackend(backend, server, { ownsBackend: true })
+    createWsHost(client)
+    server.close()
+    await Promise.resolve()
+    expect(backend.closed).toBe(1)
+  })
+
+  it('keeps a shared createWsHostServer backend alive after the browser socket closes', async () => {
+    const backend = createContractMockBackend()
+    let closed = 0
+    backend.close = async () => { closed += 1 }
+    const server = createWsHostServer({ backend, pairing: false, terminalMode: 'mock', staticDir: TEST_STATIC_DIR })
+    const port = await server.listen()
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject) })
+    const host = createWsHost(socket as any)
+    expect(await host.listProjects()).toMatchObject([{ id: 'project-1' }])
+    socket.close()
+    await new Promise<void>(resolve => socket.once('close', () => resolve()))
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(closed).toBe(0)
+    expect(await backend.handle('listProjects', [])).toMatchObject([{ id: 'project-1' }])
+    await server.close()
+    expect(closed).toBe(0)
+  })
+
+  it('still closes an exclusive createWsHostServer backend when its socket drops', async () => {
+    let closed = 0
+    const server = createWsHostServer({
+      pairing: false,
+      terminalMode: 'mock',
+      staticDir: TEST_STATIC_DIR,
+      createBackend: () => {
+        const backend = createContractMockBackend()
+        backend.close = async () => { closed += 1 }
+        return backend
+      },
+    })
+    const port = await server.listen()
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject) })
+    const host = createWsHost(socket as any)
+    await host.listProjects()
+    socket.close()
+    await new Promise<void>(resolve => socket.once('close', () => resolve()))
+    const deadline = Date.now() + 1000
+    while (closed === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+    expect(closed).toBe(1)
+    await server.close()
+  })
+})
 
 describe('agent log cache identity contract', () => {
   it('serializes the exact session, agent, and run over IPC', async () => {

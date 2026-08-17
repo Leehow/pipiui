@@ -1,6 +1,6 @@
 import { createWsHost, type PipiHostAPI, type WebSocketLike } from '@pipi/host-api'
 
-type BrowserSocket = WebSocketLike & {
+export type BrowserSocket = WebSocketLike & {
   close(): void
   addEventListener(type: string, listener: (event?: any) => void, options?: { once?: boolean }): void
 }

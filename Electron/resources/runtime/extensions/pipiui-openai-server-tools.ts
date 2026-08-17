@@ -67,10 +67,16 @@ export default function (pi: ExtensionAPI) {
     }
 
     const payload = event.payload as ResponsesPayload;
-    return {
+    const next: ResponsesPayload = {
       ...payload,
       tools: mergeServerTools(payload.tools),
     };
+    // Official Responses create params include parallel_tool_calls (openai-python
+    // ResponseCreateParams). Honor an explicit false; otherwise enable.
+    if (payload.parallel_tool_calls !== false) {
+      next.parallel_tool_calls = true;
+    }
+    return next;
   });
 
   pi.on("before_agent_start", (event, ctx) => {

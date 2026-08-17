@@ -1192,6 +1192,18 @@ describe('PipiUI Electron main layout', () => {
     })
     fireEvent.click(screen.getByLabelText('PipiUI 项目菜单'))
     expect((screen.getByRole('menuitem', { name: /在 Finder 中显示/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.queryByRole('button', { name: '桌面控制' })).toBeNull()
+  })
+
+  it('hides Computer Use when the host reports computerUse false', async () => {
+    render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(screen.queryByRole('button', { name: '桌面控制' })).toBeNull())
+    cleanup()
+    const base = createMockHost()
+    render(<App host={{ ...base, capabilities: async () => ({ computerUse: true, revealInFinder: true, terminal: false, documents: true, browser: true, git: true, plan: false, retainedWorktreeDisposition: false }) }} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(screen.getByRole('button', { name: '桌面控制' })).toBeTruthy())
   })
 
   it('shows the project git branch in the chat header and hides it without the capability', async () => {

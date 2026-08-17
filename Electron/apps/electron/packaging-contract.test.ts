@@ -103,6 +103,9 @@ describe('macOS packaging contract', () => {
       from: '../../.cua-driver/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}',
       to: 'cua-driver'
     }))
+    const fetchCua = readFileSync(resolve(import.meta.dirname, '../../scripts/fetch-cua-driver.mjs'), 'utf8')
+    expect(fetchCua).toContain('materializePackagedDarwinCuaDriverSlice')
+    expect(fetchCua).toContain("await rm(join(targetDir, CUA_DRIVER_HELPER_APP)")
     // PIPIUI_EMBEDDED_RUNTIME_TARGET is `<platform>-<arch>`, so whatever the fetch
     // step lays down has to be keyed the same way the packaging step reads it.
     for (const [script, platform] of [['package:mac', 'darwin'], ['package:win', 'win32'], ['package:linux', 'linux']] as const) {
