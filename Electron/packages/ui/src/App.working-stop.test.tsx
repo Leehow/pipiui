@@ -49,13 +49,17 @@ describe('selected-session working stop control', () => {
     const { container } = render(<App host={host} />)
     await ready(listeners)
 
-    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
+    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started', pendingFollowUps: ['host'] }) })
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await waitFor(() => expect(listeners.get('layout')).toBeDefined())
     fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
     await waitFor(() => expect(listeners.get('welcome')).toBeDefined())
 
-    const stopButton = await screen.findByLabelText('停止生成')
+    const stopButton = await waitFor(() => {
+      const button = container.querySelector('.send.stop') as HTMLButtonElement | null
+      expect(button).toBeTruthy()
+      return button!
+    })
     fireEvent.click(stopButton)
     fireEvent.click(screen.getByLabelText('正在停止'))
     await waitFor(() => expect(stop).toHaveBeenCalledTimes(1))
@@ -73,7 +77,7 @@ describe('selected-session working stop control', () => {
     const { host, listeners } = controlledHost({ stop })
     const { container } = render(<App host={host} />)
     await ready(listeners)
-    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
+    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started', pendingFollowUps: ['host'] }) })
 
     const composerStop = () => container.querySelector('.send.stop') as HTMLButtonElement
     fireEvent.click(composerStop())
@@ -89,9 +93,9 @@ describe('selected-session working stop control', () => {
     const { host, listeners } = controlledHost({ stop })
     render(<App host={host} />)
     await ready(listeners)
-    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
+    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started', pendingFollowUps: ['host'] }) })
 
-    fireEvent.click(await screen.findByLabelText('停止生成'))
+    fireEvent.click((await screen.findAllByLabelText('停止生成'))[0])
     act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'stopped' }) })
     rejectStop?.(new Error('too late'))
 
@@ -104,10 +108,10 @@ describe('selected-session working stop control', () => {
     const { host, listeners } = controlledHost({ listQueue: async sessionId => sessionId === 'welcome' ? [sending] : [] })
     render(<App host={host} />)
     await ready(listeners)
-    await screen.findByLabelText('停止生成')
+    await screen.findAllByLabelText('停止生成')
 
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '下一条' } })
-    expect(screen.getByLabelText('停止生成')).toBeTruthy()
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
     expect(screen.getByLabelText('加入消息队列')).toBeTruthy()
   })
 
@@ -138,7 +142,7 @@ describe('selected-session working stop control', () => {
     render(<App host={host} />)
     await ready(listeners)
 
-    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
+    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started', pendingFollowUps: ['host'] }) })
     act(() => { listeners.get('welcome')?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: '打包结果回来了' }) })
     act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'settled' }) })
     await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
@@ -160,7 +164,7 @@ describe('selected-session working stop control', () => {
     render(<App host={host} />)
     await ready(listeners)
 
-    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
+    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started', pendingFollowUps: ['host'] }) })
     act(() => { listeners.get('welcome')?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: '结论已经写完了' }) })
     act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'settled' }) })
     await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())

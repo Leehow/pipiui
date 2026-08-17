@@ -7,7 +7,7 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..")
 const schemaModule = await import(
   pathToFileURL(join(repositoryRoot, "Electron/resources/runtime/pi-ext/subagent/strict-json-schema.ts")).href
 );
-const { makeStrictJsonSchema, omitNulls, makeStrictFunctionTools, prepareStrictToolArguments, sanitizeStrictToolArguments } = schemaModule;
+const { makeStrictJsonSchema, omitNulls, makeStrictFunctionTools, prepareStrictToolArguments, sanitizeStrictToolArguments, remapUnknownSubagentType } = schemaModule;
 
 function collectObjectsMissingRequiredKeys(value, path = "$") {
   const missing = [];
@@ -223,8 +223,179 @@ test("sanitizeStrictToolArguments survives the additionalProperties validation l
   assert.deepEqual(sanitized, {
     agent: "general-purpose",
     task: "Implement the Swift-style cut-in",
+    title: "Implement the Swift-style cut-in",
     background: true,
   });
+});
+
+const grokSubagentSchema = {
+  type: "object",
+  properties: {
+    prompt: { type: "string" },
+    description: { type: "string" },
+    subagent_type: { type: "string" },
+    run_in_background: { type: "boolean" },
+    isolation: { type: "string" },
+    cwd: { type: "string" },
+    resume_from: { type: "string" },
+  },
+  required: ["prompt", "description"],
+  additionalProperties: false,
+};
+
+test("sanitizeStrictToolArguments keeps Grok Build field names and isolation on explore", () => {
+  const sanitized = sanitizeStrictToolArguments(grokSubagentSchema, {
+    prompt: "Find the packaged Electron app and the upload script.",
+    description: "locate artifact",
+    subagent_type: "explore",
+    isolation: "worktree",
+    heartbeatSecs: 60,
+  });
+  assert.equal(sanitized.prompt, "Find the packaged Electron app and the upload script.");
+  assert.equal(sanitized.description, "locate artifact");
+  assert.equal(sanitized.subagent_type, "explore");
+  assert.equal(sanitized.isolation, "worktree");
+  assert.equal(sanitized.heartbeatSecs, undefined);
+  assert.equal(sanitized.task, undefined);
+  assert.equal(sanitized.agent, undefined);
+});
+
+test("sanitizeStrictToolArguments accepts legacy PipiUI names onto the Grok schema", () => {
+  const sanitized = sanitizeStrictToolArguments(grokSubagentSchema, {
+    agent: "explore",
+    task: "Read README.md and summarize it.",
+    title: "定位 relay 产物",
+    worktree: "none",
+    background: true,
+    agentId: "readme-summary",
+  });
+  assert.equal(sanitized.prompt, "Read README.md and summarize it.");
+  assert.equal(sanitized.description, "定位 relay 产物");
+  assert.equal(sanitized.subagent_type, "explore");
+  assert.equal(sanitized.isolation, "none");
+  assert.equal(sanitized.run_in_background, true);
+  assert.equal(sanitized.resume_from, "readme-summary");
+});
+
+test("sanitizeStrictToolArguments expands a short title-only brief so Grok can dispatch", () => {
+  // 2026-08-15 session e9c359b8: Grok filled title + metadata and never emitted
+  // the required brief. The public contract is now prompt/description; a short
+  // description still becomes a dispatchable prompt.
+  const liveMissingPrompt = {
+    agent: "explore",
+    title: "查模型切换失败",
+    thinking: "low",
+    agentId: "explore-model-switch",
+    cwd: "/Users/haoli/leehow/code/pipiui",
+    worktree: "none",
+    noWorktreeReason: "read-only recon",
+    blockedBy: [],
+    fresh: false,
+    background: true,
+    verify: "",
+  };
+  const sanitized = sanitizeStrictToolArguments(grokSubagentSchema, liveMissingPrompt);
+  assert.match(sanitized.prompt, /^查模型切换失败\n/);
+  assert.match(sanitized.prompt, /Read-only investigation/);
+  assert.notEqual(sanitized.prompt, sanitized.description);
+  assert.equal(sanitized.description, "查模型切换失败");
+  assert.equal(sanitized.subagent_type, "explore");
+  assert.equal(sanitized.resume_from, "explore-model-switch");
+  assert.equal(sanitized.isolation, "none");
+  assert.equal(sanitized.run_in_background, true);
+
+  const withPrompt = sanitizeStrictToolArguments(grokSubagentSchema, {
+    subagent_type: "explore",
+    prompt: "Read README.md and summarize it.",
+    description: "定位 relay 产物",
+  });
+  assert.equal(withPrompt.prompt, "Read README.md and summarize it.");
+
+  const longTitle = "Investigate how to host a static download of PipiUI Electron on the existing DMIT VPS. Read-only only.";
+  const fromLongTitle = sanitizeStrictToolArguments(grokSubagentSchema, {
+    subagent_type: "explore",
+    description: longTitle,
+  });
+  assert.equal(fromLongTitle.prompt, longTitle);
+
+  const empty = sanitizeStrictToolArguments(grokSubagentSchema, { subagent_type: "explore" });
+  assert.equal(empty.prompt, undefined);
+  assert.equal(empty.description, undefined);
+});
+
+test("sanitizeStrictToolArguments remaps Grok custom agent names and keeps isolation", () => {
+  const exploreIsolation = sanitizeStrictToolArguments(grokSubagentSchema, {
+    subagent_type: "explore",
+    description: "查 DMIT 静态托管",
+    isolation: "none",
+    resume_from: "dmit-static",
+  });
+  assert.equal(exploreIsolation.subagent_type, "explore");
+  assert.equal(exploreIsolation.resume_from, "dmit-static");
+  assert.equal(exploreIsolation.isolation, "none");
+  assert.match(exploreIsolation.prompt, /^查 DMIT 静态托管\n/);
+
+  const customExplore = sanitizeStrictToolArguments(grokSubagentSchema, {
+    agent: "dmit-static",
+    title: "查 DMIT 静态托管",
+    cwd: "/Users/haoli/leehow/code/pipiui",
+    background: true,
+  });
+  assert.equal(customExplore.subagent_type, "dmit-static");
+  const remappedExplore = remapUnknownSubagentType(customExplore, new Set(["explore", "general-purpose"]));
+  assert.equal(remappedExplore.subagent_type, "explore");
+  assert.equal(remappedExplore.resume_from, "dmit-static");
+
+  const customPackager = sanitizeStrictToolArguments(grokSubagentSchema, {
+    agent: "electron-pkg",
+    title: "打包 Electron App",
+    cwd: "/Users/haoli/leehow/code/pipiui",
+    worktree: "none",
+    noWorktreeReason: "Packaging must run in the primary checkout; isolated worktrees cannot create build/PipiUI Electron.app.",
+    verify: "stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' 'build/PipiUI Electron.app/Contents/MacOS/PipiUI Electron'",
+    background: true,
+  });
+  assert.equal(customPackager.subagent_type, "electron-pkg");
+  assert.equal(customPackager.isolation, "none");
+  assert.match(customPackager.prompt, /^打包 Electron App\n/);
+  assert.match(customPackager.prompt, /Complete the work implied by this title/);
+  const remappedPackager = remapUnknownSubagentType(customPackager, new Set(["explore", "general-purpose"]));
+  assert.equal(remappedPackager.subagent_type, "general-purpose");
+  assert.equal(remappedPackager.resume_from, "electron-pkg");
+
+  const fullBrief = sanitizeStrictToolArguments(grokSubagentSchema, {
+    agent: "pkg-upload",
+    task: "Package the current primary-checkout PipiUI Electron app as a signed local App, then zip it for later upload.",
+    title: "打包 Electron App",
+    worktree: "none",
+  });
+  assert.equal(fullBrief.subagent_type, "pkg-upload");
+  const remappedBrief = remapUnknownSubagentType(fullBrief, new Set(["explore", "general-purpose"]));
+  assert.equal(remappedBrief.subagent_type, "general-purpose");
+  assert.equal(remappedBrief.resume_from, "pkg-upload");
+  assert.equal(fullBrief.prompt.startsWith("Package the current"), true);
+
+  const missingId = sanitizeStrictToolArguments(grokSubagentSchema, {
+    subagent_type: "general-purpose",
+    prompt: "Package the current primary-checkout PipiUI Electron app as a signed local App.",
+    description: "打包 Electron App",
+    isolation: "none",
+  });
+  assert.equal(missingId.resume_from, "electron-app");
+
+  const known = sanitizeStrictToolArguments(grokSubagentSchema, {
+    subagent_type: "reviewer",
+    prompt: "Review the sanitizer change only.",
+    description: "review sanitizer",
+  });
+  assert.equal(known.subagent_type, "reviewer");
+  assert.equal(known.resume_from, undefined);
+
+  const projectAgent = remapUnknownSubagentType(
+    { subagent_type: "probe", prompt: "inspect", description: "probe" },
+    new Set(["probe", "explore"]),
+  );
+  assert.equal(projectAgent.subagent_type, "probe");
 });
 
 test("sanitizeStrictToolArguments keeps declared values and passes through non-objects", () => {

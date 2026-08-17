@@ -8,6 +8,7 @@ import { join } from "node:path";
 import {
 	configuredHeartbeatAt,
 	createRunScopedTimeout,
+	decideRuntimeBudgetExpiry,
 	normalizeGeneralPurposeExecutionPolicy,
 } from "../runtime-policy.ts";
 import { createProviderWaitController, providerWaitDeadlineMs } from "../index.ts";
@@ -21,14 +22,14 @@ test("bundled general-purpose defaults to isolated with legacy timing omitted", 
 	});
 	const agentDefinition = readFileSync(new URL("../../agents/general-purpose/AGENT.md", import.meta.url), "utf8");
 	assert.match(agentDefinition, /isolated worktree by default/);
-	assert.match(agentDefinition, /Boss supplied an auditable reason/);
+	assert.match(agentDefinition, /isolation=none/);
 	assert.doesNotMatch(agentDefinition, /in this isolated context/);
 });
 
-test("direct cwd requires one normalized auditable Boss reason", () => {
-	assert.match(
-		normalizeGeneralPurposeExecutionPolicy(bundledGeneralPurpose, { worktree: "none" }).problem ?? "",
-		/requires noWorktreeReason/,
+test("direct cwd no longer requires a Boss reason", () => {
+	assert.deepEqual(
+		normalizeGeneralPurposeExecutionPolicy(bundledGeneralPurpose, { worktree: "none" }),
+		{ policy: { worktree: "none" } },
 	);
 	assert.match(
 		normalizeGeneralPurposeExecutionPolicy(bundledGeneralPurpose, { worktree: "none", noWorktreeReason: "line one\nline two" }).problem ?? "",
@@ -44,14 +45,14 @@ test("direct cwd requires one normalized auditable Boss reason", () => {
 	);
 });
 
-test("execution overrides reject other roles and non-bundled shadows", () => {
+test("execution overrides on other roles are ignored", () => {
 	for (const agent of [
 		{ name: "explore", origin: "bundled" as const },
 		{ name: "general-purpose", origin: "project" as const },
 	]) {
-		assert.match(
-			normalizeGeneralPurposeExecutionPolicy(agent, { heartbeatSecs: 60 }).problem ?? "",
-			/only available to the bundled general-purpose/,
+		assert.deepEqual(
+			normalizeGeneralPurposeExecutionPolicy(agent, { heartbeatSecs: 60, worktree: "isolated" }),
+			{},
 		);
 	}
 });
@@ -76,7 +77,7 @@ test("heartbeat and timeout bounds are enforced and normalized per dispatch", ()
 	assert.equal(configuredHeartbeatAt(1_000, 2, undefined), undefined);
 });
 
-test("run-scoped timeout ignores a stale generation and is disposable", () => {
+test("run-scoped timeout ignores a stale generation, extends, and is disposable", () => {
 	const scheduled: Array<{ callback: () => void; delay: number }> = [];
 	const cancelled: unknown[] = [];
 	const fired: string[] = [];
@@ -99,7 +100,19 @@ test("run-scoped timeout ignores a stale generation and is disposable", () => {
 	scheduled[0]!.callback();
 	assert.deepEqual(fired, []);
 
+	// extend() re-arms from a fresh base; the old (already fired) handle is not cancelled.
+	assert.equal(timeout.extend(30_000, 60_000), 90_000);
+	assert.equal(scheduled[1]!.delay, 30_000);
+	assert.equal(cancelled.length, 0);
+	// extend() with a live handle cancels it before scheduling the replacement.
 	currentRun = "run-a";
+	assert.equal(timeout.extend(45_000, 100_000), 145_000);
+	assert.equal(cancelled.length, 1);
+	assert.equal(cancelled[0], scheduled[1]);
+	assert.equal(scheduled[2]!.delay, 45_000);
+	scheduled[2]!.callback();
+	assert.deepEqual(fired, ["timeout"]);
+
 	const live = createRunScopedTimeout({
 		runId: "run-a",
 		timeoutMs: 30_000,
@@ -113,7 +126,17 @@ test("run-scoped timeout ignores a stale generation and is disposable", () => {
 		cancel: (handle) => cancelled.push(handle),
 	});
 	live.dispose();
-	assert.equal(cancelled.length, 1);
+	assert.equal(cancelled.length, 2);
+});
+
+test("runtime budget expiry extends producing workers and aborts only after a notified stall", () => {
+	const grace = 120_000;
+	// Producing worker (progress inside the grace window) always re-arms silently.
+	assert.equal(decideRuntimeBudgetExpiry({ idleMs: 0, progressGraceMs: grace, notified: false }), "extend-silent");
+	assert.equal(decideRuntimeBudgetExpiry({ idleMs: grace, progressGraceMs: grace, notified: true }), "extend-silent");
+	// Stalled worker gets exactly one notify+extend, then the next expiry aborts.
+	assert.equal(decideRuntimeBudgetExpiry({ idleMs: grace + 1, progressGraceMs: grace, notified: false }), "notify-extend");
+	assert.equal(decideRuntimeBudgetExpiry({ idleMs: grace + 1, progressGraceMs: grace, notified: true }), "abort");
 });
 
 test("runtime timeout aborts the exact run before provider or transient auto-resume", () => {
@@ -133,9 +156,40 @@ test("runtime timeout aborts the exact run before provider or transient auto-res
 	assert.match(source, /if \(runtimeTimedOut && currentResult\.errorMessage\) \{[\s\S]*?endOutput\.includes\(currentResult\.errorMessage\)[\s\S]*?endResultText\.includes\(currentResult\.errorMessage\)/);
 	assert.match(source, /terminalStateForFinalization\(\{ ok: endOk, aborted: wasAborted \}\)/);
 	assert.match(source, /const ChainItem = Type\.Object\(\{[\s\S]*?worktree: WorktreeParam,[\s\S]*?timeoutSecs: TimeoutSecsParam,/);
-	assert.match(source, /const SubagentParams = Type\.Object\(\{[\s\S]*?worktree: WorktreeParam,[\s\S]*?timeoutSecs: TimeoutSecsParam,/);
+	assert.match(source, /const SubagentParams = Type\.Object\(\{[\s\S]*?prompt: Type\.String\(\{[\s\S]*?isolation: IsolationParam,/);
+	const singleSchema = source.slice(source.indexOf("const SubagentParams"), source.indexOf("const SubagentChainParams"));
+	assert.doesNotMatch(singleSchema, /heartbeatSecs|timeoutSecs|agentScope|confirmProjectAgents|desktop:/);
 	const parallelSchema = source.slice(source.indexOf("const ParallelSubagentParams"), source.indexOf("const SecretaryCommitParams"));
 	assert.doesNotMatch(parallelSchema, /worktree|heartbeatSecs|timeoutSecs/);
+});
+
+test("runtime budget expiry is progress-aware, notifies the boss once, and retries terminal reports", () => {
+	const source = readFileSync(new URL("../../../../../../Sources/PipiUI/PiExt/subagent/index.ts", import.meta.url), "utf8");
+	// The onTimeout body decides before it kills: decide → diagnostic → stopReason → abort,
+	// while extend/notify branches never reach controller.abort().
+	const armIdx = source.indexOf("runtimeTimeout = createRunScopedTimeout({");
+	const onTimeoutIdx = source.indexOf("onTimeout() {", armIdx);
+	const blockEnd = source.indexOf("let procExited", armIdx);
+	assert.ok(armIdx >= 0 && onTimeoutIdx > armIdx && blockEnd > onTimeoutIdx);
+	const onTimeoutBlock = source.slice(onTimeoutIdx, blockEnd);
+	const decisionIdx = onTimeoutBlock.indexOf("decideRuntimeBudgetExpiry({");
+	const stopIdx = onTimeoutBlock.indexOf('currentResult.stopReason = "runtime_timeout"');
+	const abortIdx = onTimeoutBlock.indexOf("handleForRun(pipiuiAgentId, runId)?.controller.abort()");
+	assert.ok(decisionIdx >= 0, "onTimeout must consult decideRuntimeBudgetExpiry");
+	assert.ok(stopIdx > decisionIdx, "stopReason is set only after the expiry decision");
+	assert.ok(abortIdx > stopIdx, "controller.abort() stays after stopReason inside the abort branch");
+	assert.match(onTimeoutBlock, /runtimeTimeout!\.extend\(\);/);
+	assert.match(onTimeoutBlock, /runtimeBudgetDiagnostic\(now\)/);
+	// Extension bookkeeping reaches the host so the panel countdown follows the new budget.
+	assert.match(onTimeoutBlock, /deadlineAt: extendedDeadlineAt/);
+	// The boss escalation mirrors [subagent-stalled]: bounded, self-describing, non-lethal first.
+	assert.match(source, /\[subagent-timeout\] agentId=\$\{pipiuiAgentId\}/);
+	assert.match(source, /runtimeBudgetNotify = \(text\) => \{/);
+	assert.match(source, /re-armed once for another \$\{budgetSec\}s instead of being killed/);
+	// Terminal bridge reports survive a dropped POST instead of stranding a running row.
+	assert.match(source, /const TERMINAL_REPORT_RETRY_DELAYS_MS = \[1_000, 3_000\] as const;/);
+	assert.match(source, /function postPipiuiReportWithRetry/);
+	assert.match(source, /return enqueuePipiuiReport\(payload, postPipiuiReportWithRetry\);/);
 });
 
 test("provider wait deadline covers initial wait and mid-stream silence, never tool runs", () => {

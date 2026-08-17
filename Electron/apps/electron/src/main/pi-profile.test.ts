@@ -1,12 +1,15 @@
+import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  ELECTRON_USER_DATA_DIRNAME,
   PI_PROFILE_MIGRATION_MARKER,
   installBundledModelCapabilityOverrides,
   importLegacyPiProfile,
-  resolveElectronPiProfile
+  resolveElectronPiProfile,
+  resolveStableElectronUserDataPath
 } from './pi-profile.js'
 
 describe('Electron Pi profile', () => {
@@ -21,6 +24,19 @@ describe('Electron Pi profile', () => {
       agentDir: join('/app/user-data', 'pi-agent'),
       sessionsRoot: join('/app/user-data', 'pi-agent', 'sessions')
     })
+  })
+
+  it('keeps the historical Electron profile when the display name is PipiUI', () => {
+    expect(ELECTRON_USER_DATA_DIRNAME).toBe('@pipiui/electron')
+    expect(resolveStableElectronUserDataPath('/Users/me/Library/Application Support')).toBe(
+      join('/Users/me/Library/Application Support', '@pipiui/electron')
+    )
+    expect(resolveStableElectronUserDataPath('/Users/me/Library/Application Support')).not.toBe(
+      join('/Users/me/Library/Application Support', 'PipiUI')
+    )
+    const main = readFileSync(join(import.meta.dirname, 'index.ts'), 'utf8')
+    expect(main).toContain("app.setName('PipiUI')")
+    expect(main).toContain("app.setPath('userData', resolveStableElectronUserDataPath(app.getPath('appData')))")
   })
 
   it('copies only continuity state, preserves the source, and is idempotent', async () => {

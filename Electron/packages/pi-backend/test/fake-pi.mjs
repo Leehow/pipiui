@@ -1,6 +1,13 @@
 import readline from "node:readline";
+import { appendFileSync } from "node:fs";
 
 const send = value => process.stdout.write(JSON.stringify(value) + "\n");
+/** Tests pass FAKE_PI_PROMPT_LOG to assert which prompt commands reached the child. */
+const promptLogPath = process.env.FAKE_PI_PROMPT_LOG ?? "";
+function logPrompt(message) {
+  if (!promptLogPath) return;
+  try { appendFileSync(promptLogPath, message + "\n"); } catch {}
+}
 let prompted = false;
 let omitUsage = false;
 let failStats = false;
@@ -73,6 +80,9 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   }
   if (command.type === "prompt") {
     if (command.message === "__queue_fail__") return response(command.type, command.id, false, undefined, "queue dispatch failed");
+    if (heldTurn && !command.streamingBehavior) {
+      return response(command.type, command.id, false, undefined, "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
+    }
     prompted = true;
     if (command.message === "no-usage") omitUsage = true;
     if (command.message === "fail-stats") failStats = true;
@@ -82,6 +92,20 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     if (command.message === "fill-context-no-compact") { contextTokens = 240000; failCompact = true }
     if (command.message === "fill-context-slow") { contextTokens = 240000; slowCompact = true }
     ok();
+    logPrompt(command.message);
+    if (command.message === "__agent_running__") {
+      // A background subagent starts and the turn settles, but the agent never
+      // ends: the panel holds one running worker for the stop-sweep test.
+      send({ type: "agent_event", event: { kind: "start", agentId: "agent-1", runId: "run-1", parentId: null, name: "builder", role: "general-purpose", title: "Sweep fixture", task: "long task", depth: 1, at: "2026-08-15T00:00:02.000Z" } });
+      send({ type: "agent_start" });
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "/subagent_abort_all") {
+      // The runtime extension aborts every worker; simulate its terminal events.
+      send({ type: "agent_event", event: { kind: "end", agentId: "agent-1", runId: "run-1", ok: false, aborted: true, at: "2026-08-15T00:00:09.000Z" } });
+      return;
+    }
     if (command.message === "__user_followup__") {
       send({
         type: "message_end",
@@ -93,6 +117,30 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       });
       send({ type: "queue_update", followUp: ["[subagent-done] agentId=a1 name=explore ok=true"] });
       send({ type: "agent_start" });
+      return;
+    }
+    if (command.message === "__custom_followup__") {
+      send({
+        type: "message_end",
+        message: {
+          id: "c-done",
+          role: "custom",
+          customType: "pipiui-subagent-complete-v1",
+          display: false,
+          content: "[subagent-done] agentId=a1 name=explore ok=true",
+        },
+      });
+      send({ type: "queue_update", followUp: ["[subagent-done] agentId=a1 name=explore ok=true"] });
+      send({ type: "agent_start" });
+      return;
+    }
+    if (command.message === "__tool_start_only__") {
+      // Real Pi emits toolcall_start as soon as the first tool token arrives.
+      // The host must surface a card then — waiting for toolcall_end is the
+      // "freeze then dump a pile of tools" bug.
+      send({ type: "agent_start" });
+      send({ type: "message_update", assistantMessageEvent: { type: "toolcall_start", contentIndex: 1 } });
+      send({ type: "agent_settled" });
       return;
     }
     if (command.message === "__fail_turn__") {

@@ -19,6 +19,18 @@ describe('macOS packaging contract', () => {
     expect(packageJSON.build.mac.target).toEqual(['dmg', 'zip'])
   })
 
+  it('keeps the artifact folder as PipiUI Electron while Launchpad/Dock show PipiUI', () => {
+    expect(packageJSON.build.productName).toBe('PipiUI Electron')
+    expect(packageJSON.build.appId).toBe('com.leehow.pipiui-electron')
+    expect(packageJSON.build.mac.extendInfo.CFBundleDisplayName).toBe('PipiUI')
+    // Electron resolves helpers as `${CFBundleName} Helper.app`. Shortening
+    // CFBundleName to "PipiUI" makes launch abort with "Unable to find helper app".
+    expect(packageJSON.build.mac.extendInfo.CFBundleName ?? packageJSON.build.productName).toBe(
+      packageJSON.build.productName
+    )
+    expect(packageJSON.build.linux.executableName).toBe('pipiui_e')
+  })
+
   it('ships one Electron-owned runtime tree and no foreign source tree', () => {
     expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
       from: '../../resources/runtime',

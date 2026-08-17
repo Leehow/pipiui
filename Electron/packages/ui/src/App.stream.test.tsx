@@ -57,12 +57,13 @@ describe('stream message reducer', () => {
 
     messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'bash-1', content: 'passed' })
     rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
-    const streamingCompleted = screen.getByRole('button', { name: /4 个步骤/ })
+    const streamingCompleted = screen.getByRole('button', { name: /5 个步骤/ })
     expect(streamingCompleted.getAttribute('aria-expanded')).toBe('false')
     fireEvent.click(streamingCompleted)
     const finishedTool = screen.getByRole('button', { name: /bash · npm test/ })
     expect(finishedTool.getAttribute('aria-expanded')).toBe('false')
     expect(screen.queryByText('passed')).toBeNull()
+    expect(screen.getAllByRole('button', { name: /^Thinking/ }).some(button => button.textContent?.includes('运行中'))).toBe(true)
 
     messages = finishStreamingMessage(messages)
     rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
@@ -97,6 +98,12 @@ describe('stream message reducer', () => {
     expect(firstText.compareDocumentPosition(secondText) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(thinkings[0].compareDocumentPosition(tools[0]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(tools[0].compareDocumentPosition(thinkings[1]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('shows live thinking text instead of holding it behind a collapsed card', () => {
+    const messages = applyStreamEvent([], { type: 'thinking', sessionId: 's', contentIndex: 0, delta: 'I will read QuotaPill next' })
+    render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    expect(screen.getByText('I will read QuotaPill next')).toBeTruthy()
   })
 
   it('appends coalesced tool deltas to one tool and clears streaming on terminal status', () => {
@@ -453,8 +460,9 @@ describe('active tool-card semantics', () => {
     messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'bash-1', content: 'ok' })
     view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
     expect(screen.queryByTestId('active-tool')).toBeNull()
-    expect(screen.getByRole('button', { name: /1 个步骤/ }).getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByRole('button', { name: /2 个步骤/ }).getAttribute('aria-expanded')).toBe('true')
     expect(screen.getByRole('button', { name: /bash · ls -la/ }).getAttribute('aria-expanded')).toBe('false')
+    expect(screen.getByRole('button', { name: /^Thinking/ }).textContent).toContain('运行中')
     // Settled: both the outer card and the finished tool fold back to collapsed.
     messages = finishStreamingMessage(messages)
     view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
@@ -475,6 +483,45 @@ describe('active tool-card semantics', () => {
     const sub = screen.getByRole('button', { name: /子任务/ })
     expect(sub.textContent).not.toContain('运行中 · 2 个子任务')
     expect(sub.textContent).toContain('完成')
+    view.unmount()
+  })
+
+  it('shows growing write token estimates then finished +tokens', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'w1', name: 'write', delta: '{"path":"a.ts","content":"abcd' })
+    const view = render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    const first = screen.getByTestId('active-tool').textContent ?? ''
+    expect(first).toMatch(/~1 tokens/)
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'w1', name: 'write', delta: 'efghijklmno"}' })
+    view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    const second = screen.getByTestId('active-tool').textContent ?? ''
+    expect(second).toMatch(/~4 tokens/)
+    expect(second).not.toBe(first)
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'w1', content: 'ok' })
+    messages = finishStreamingMessage(messages)
+    view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    fireEvent.click(screen.getByRole('button', { name: /1 个步骤/ }))
+    const writeCard = screen.getByRole('button', { name: /write · a.ts/ }).textContent ?? ''
+    expect(writeCard).toMatch(/\+4/)
+    expect(writeCard).not.toMatch(/\u2212/)
+    view.unmount()
+  })
+
+  it('shows growing edit token estimates then +/−', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'e1', name: 'edit', delta: '{"path":"b.ts","edits":[{"oldText":"aa","newText":"bbbb' })
+    const view = render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    expect(screen.getByTestId('active-tool').textContent).toMatch(/~1 tokens/)
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'e1', name: 'edit', delta: 'cccc"}]}' })
+    view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    expect(screen.getByTestId('active-tool').textContent).toMatch(/~2 tokens/)
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'e1', content: 'ok' })
+    messages = finishStreamingMessage(messages)
+    view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    fireEvent.click(screen.getByRole('button', { name: /1 个步骤/ }))
+    const card = screen.getByRole('button', { name: /edit · b.ts/ }).textContent ?? ''
+    expect(card).toMatch(/\+2/)
+    expect(card).toMatch(/\u22121/)
     view.unmount()
   })
 })

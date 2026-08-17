@@ -1,0 +1,33 @@
+/* Computer Use plan/result cards — flat always-visible rows like LiveSubagentCard. */
+.computer-card{overflow:hidden}
+.computer-card .computer-card-head{display:flex;width:100%;min-width:0;align-items:center;gap:7px;padding:9px 11px;border:0;background:transparent;color:inherit;text-align:left}
+.computer-card-head:not(button){cursor:default}
+.computer-card.computer-card-error .activity-status{color:var(--danger)}
+.computer-card .computer-card-head b.computer-card-goal{min-width:0;overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap;font:600 12px ui-monospace,SFMono-Regular,Menlo,monospace}
+.computer-card .activity-meta{margin-left:auto}
+.computer-card-body{padding:2px 11px 10px}
+.computer-section-label{margin:8px 0 4px;color:var(--subtle);font-size:9.5px;font-weight:600;letter-spacing:.04em}
+.computer-step-list{list-style:none;margin:0;padding:0}
+.computer-step-row{display:flex;min-width:0;align-items:baseline;gap:7px;padding:4px 0;font-size:12px}
+.computer-step-index,.computer-step-status{flex:0 0 auto;min-width:14px;color:var(--muted);font-size:11px}
+.computer-step-status.ok{color:var(--success)}
+.computer-step-status.failed{color:var(--danger)}
+.computer-step-role{flex:0 0 auto;padding:1px 5px;border-radius:7px;color:var(--muted);background:var(--surface-hover);font-size:9.5px;font-weight:600}
+.computer-step-objective{min-width:0;overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap}
+.computer-step-depends,.computer-step-meta{flex:0 0 auto;color:var(--subtle);font-size:10px}
+.computer-step-meta{margin-left:auto}
+.computer-condition-row{display:flex;min-width:0;align-items:baseline;gap:7px;padding:3px 0;color:var(--muted);font-size:12px}
+.computer-condition-mark{flex:0 0 auto;min-width:12px;color:var(--subtle);font-size:11px}
+.computer-condition-mark.verified{color:var(--success)}
+.computer-condition-mark.not_verified{color:var(--danger)}
+.computer-result-summary .markdown{font-size:13px}
+.computer-raw{margin-top:8px}
+.computer-raw summary{cursor:pointer;color:var(--subtle);font-size:10.5px}
+.computer-raw pre,.computer-raw .tool-result{margin:6px 0 0;max-height:320px;overflow:auto}
+.computer-episode-list{list-style:none;margin:6px 0 0;padding:0;color:var(--muted);font-size:11px}
+.computer-episode-list li{padding:2px 0}
+.computer-episode-state{display:inline-block;min-width:52px;color:var(--subtle);font-size:10px}
+.computer-episode-state.ok{color:var(--success)}
+.computer-episode-state.failed{color:var(--danger)}
+.computer-episode-state.aborted,.computer-episode-state.interrupted{color:var(--warning,var(--muted))}
+.computer-episode-state.stalled{color:var(--danger)}

@@ -9,6 +9,7 @@ import {
   cuaSocketPath,
   cuaToolFailureCode,
   CuaDriverHost,
+  isDriverSessionEndedError,
   selectLaunchWindow,
 } from "./cua-driver-host.js";
 import { ComputerWorkerBroker } from "../../../../../Sources/PipiUI/PiExt/packages/computer-agent/src/worker-broker.ts";
@@ -32,6 +33,57 @@ describe("CuaDriverHost", () => {
         42,
       ),
     ).toMatchObject({ window_id: 8 });
+  });
+
+  it("rejects app-switcher shortcuts before target-scoped keyboard delivery", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-target-shortcut-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.targets.set("pinned", { session: "pinned", pid: 42, window_id: 77 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "get_window_state") return { structuredContent: { pid: 42, window_id: 77, screenshot_png_b64: "PNG", elements: [] } };
+      return { structuredContent: {} };
+    };
+    for (const action of [
+      { type: "key", key: "CMD+TAB" },
+      { type: "keypress", keys: ["CMD", "SHIFT", "TAB"] },
+    ]) {
+      await expect(host.handle({ protocolVersion: 1, sessionKey: "pinned", action: "computer_batch", actions: [action] }))
+        .resolves.toMatchObject({ ok: false, runtimeError: { code: "target_handoff_untrusted", retryable: false } });
+    }
+    expect(calls.filter((call) => call.name === "press_key" || call.name === "hotkey")).toHaveLength(0);
+    await expect(host.handle({ protocolVersion: 1, sessionKey: "pinned", action: "computer_batch", actions: [{ type: "key", key: "CMD+S" }] }))
+      .resolves.toMatchObject({ ok: true });
+    expect(calls.filter((call) => call.name === "press_key" || call.name === "hotkey")).toHaveLength(1);
+  });
+
+  it("keeps the first proven application identity and rejects later guessed aliases", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-root-identity-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "launch_app") return { structuredContent: { pid: 42, bundle_id: "org.example.app", name: "Example App", windows: [{ pid: 42, window_id: 77, bounds: { width: 800, height: 600 }, is_on_screen: true, on_current_space: true }] } };
+      if (name === "get_window_state") return { structuredContent: { pid: 42, window_id: 77, screenshot_png_b64: "PNG", elements: [] } };
+      if (name === "get_accessibility_tree" || name === "list_windows") return { structuredContent: { windows: [{ pid: 42, window_id: 77, bounds: { width: 800, height: 600 }, is_on_screen: true, on_current_space: true }] } };
+      return { structuredContent: {} };
+    };
+    await expect(host.handle({ protocolVersion: 1, sessionKey: "identity", action: "computer_open_application", bundle_identifier: "org.example.app" }))
+      .resolves.toMatchObject({ ok: true, target: { pid: 42, window_id: 77 } });
+    const rootTarget = structuredClone(host.rootTargets.get("identity"));
+    await expect(host.handle({ protocolVersion: 1, sessionKey: "identity", action: "computer_open_application", application_name: "guessed-alias" }))
+      .resolves.toMatchObject({ ok: false, runtimeError: { code: "target_handoff_untrusted", retryable: false } });
+    expect(calls.filter((call) => call.name === "launch_app")).toHaveLength(1);
+    expect(host.rootTargets.get("identity")).toEqual(rootTarget);
   });
 
   it("pins an on-screen current-space TextEdit window ahead of a larger off-screen sibling", () => {
@@ -534,7 +586,7 @@ if (mode === "serve") {
     );
   });
 
-  it("constructs 0.19.2 target-scoped action arguments", () => {
+  it("constructs 0.20.0 target-scoped action arguments", () => {
     const target = { session: "session-a", pid: 42, window_id: 77 };
     expect(
       buildActionCall({ type: "click", coordinate: [10, 20] }, target),
@@ -596,6 +648,57 @@ if (mode === "serve") {
         direction: "down",
         amount: 4,
       },
+    });
+  });
+
+  it("invokes an exact native menu path only through the already-pinned application", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-native-menu-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1512, height: 982 });
+    host.targets.set("menu", { session: "menu", pid: 98798, window_id: 373954 });
+    host.rootTargets.set("menu", { session: "menu", pid: 98798, window_id: 373954 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "get_window_state") return { structuredContent: {
+        screenshot_png_b64: "PNG",
+        snapshot_id: "s00000001",
+        pid: 98798,
+        window_id: 373954,
+        elements: [{ role: "AXWindow", name: "Document" }],
+      } };
+      if (name === "click") throw Object.assign(new Error("coordinate_outside_target_window"), { code: "coordinate_outside_target_window" });
+      return { structuredContent: { invoked: true } };
+    };
+
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "menu",
+      action: "computer_batch",
+      actions: [{ type: "invoke_menu", path: ["Example App", "Settings…"] }],
+    })).resolves.toMatchObject({ ok: true });
+    expect(calls.find((call) => call.name === "invoke_menu")?.args).toEqual({
+      session: "menu",
+      pid: 98798,
+      window_id: 373954,
+      path: ["Example App", "Settings…"],
+    });
+
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "menu",
+      action: "computer_batch",
+      actions: [{ type: "click", coordinate: [90, -1065] }],
+    })).resolves.toMatchObject({ ok: false, runtimeError: { code: "mutation_outcome_unknown" } });
+    expect(calls.findLast((call) => call.name === "click")?.args).toMatchObject({
+      session: "menu",
+      pid: 98798,
+      window_id: 373954,
+      x: 90,
+      y: -1065,
     });
   });
 
@@ -986,6 +1089,90 @@ if (mode === "serve") {
     expect(calls.some((call) => call.name === "screenshot")).toBe(false);
   });
 
+  it("activates a running uninstalled app by resolving its name through list_apps", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-running-name-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, {
+      displayID: 1,
+      width: 1440,
+      height: 900,
+    });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "launch_app" && args.name === "COC Keeper") {
+        throw new Error("No installed macOS app found for name 'COC Keeper'.");
+      }
+      if (name === "list_apps") {
+        return {
+          structuredContent: {
+            apps: [
+              { name: "PipiUI Electron", bundle_id: "com.leehow.pipiui-electron", pid: 56148, running: true },
+              { name: "COC Keeper", bundle_id: "org.chatrpg.cockeyper", pid: 91368, running: true },
+            ],
+          },
+        };
+      }
+      if (name === "launch_app" && args.bundle_id === "org.chatrpg.cockeyper") {
+        return {
+          structuredContent: {
+            pid: 91368,
+            windows: [
+              { pid: 91368, window_id: 349056, bounds: { width: 500, height: 500 }, is_on_screen: false, on_current_space: null, z_index: 440 },
+              { pid: 91368, window_id: 349047, bounds: { width: 1440, height: 903 }, is_on_screen: true, on_current_space: true, z_index: 136 },
+            ],
+          },
+        };
+      }
+      if (name === "get_window_state") {
+        return {
+          structuredContent: {
+            screenshot_png_b64: `PNG-${args.window_id}`,
+            pid: 91368,
+            window_id: args.window_id,
+            elements: [{ role: "AXWindow", name: "克苏鲁的呼唤 · Keeper" }],
+          },
+        };
+      }
+      return { structuredContent: {} };
+    };
+
+    const opened = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "coc-running",
+      action: "computer_open_application",
+      application_name: "COC Keeper",
+    });
+    expect(opened).toMatchObject({
+      ok: true,
+      target: { pid: 91368, window_id: 349047, session: "coc-running" },
+    });
+    expect(calls.filter((call) => call.name === "launch_app").map((call) => call.args)).toEqual([
+      { name: "COC Keeper" },
+      { bundle_id: "org.chatrpg.cockeyper" },
+    ]);
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "coc-running",
+      action: "computer_open_application",
+      bundle_identifier: "org.chatrpg.cockeyper",
+    })).resolves.toMatchObject({ ok: true, target: { pid: 91368, window_id: 349047 } });
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "coc-running",
+      action: "computer_open_application",
+      application_name: "unproven-third-party-alias",
+    })).resolves.toMatchObject({ ok: false, runtimeError: { code: "target_handoff_untrusted" } });
+    expect(calls.filter((call) => call.name === "launch_app").map((call) => call.args)).toEqual([
+      { name: "COC Keeper" },
+      { bundle_id: "org.chatrpg.cockeyper" },
+      { bundle_id: "org.chatrpg.cockeyper" },
+    ]);
+  });
+
   it("hands one session from its root app to exact out-of-process nested panels and back", async () => {
     const root = await mkdtemp(join(tmpdir(), "cua-panel-handoff-"));
     roots.push(root);
@@ -1250,5 +1437,168 @@ if (mode === "serve") {
     });
     expect(desktopSession).not.toBe("observe");
     expect(calls[1].args).toEqual({ session: desktopSession });
+  });
+
+  it("recognizes only the driver's fixed session-ended rejection", () => {
+    expect(isDriverSessionEndedError(new Error(
+      "session 'pipiui-desktop-3518396c' has ended; tool call 'get_desktop_state' was rejected. Call start_session with this id to revive it before issuing further actions, or use a new session id.",
+    ))).toBe(true);
+    expect(isDriverSessionEndedError(new Error(
+      "session 'a' has ended; tool call 'click' was rejected. Call start_session with this id to revive it before issuing further actions, or use a new session id.",
+    ))).toBe(true);
+    expect(isDriverSessionEndedError(new Error("window_id_not_found"))).toBe(false);
+    expect(isDriverSessionEndedError(new Error("session 'a' has ended"))).toBe(false);
+    expect(isDriverSessionEndedError(undefined)).toBe(false);
+  });
+
+  it("revives a driver-ended desktop session instead of failing forever", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-desktop-revive-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    host.proxy = { killed: false, exitCode: null, stdin: { writable: true, write: () => true } };
+    host.daemon = { killed: false, exitCode: null };
+    let driverEnded = false;
+    let revived = false;
+    let capture = 0;
+    host.rpc = async (_method: string, params: any) => {
+      const { name, arguments: args } = params;
+      calls.push({ name, args });
+      if (name === "start_session") {
+        if (driverEnded) revived = true;
+        return { result: { content: [], structuredContent: {} } };
+      }
+      if (name === "get_desktop_state") {
+        if (driverEnded && !revived) {
+          return { result: {
+            isError: true,
+            content: [{ type: "text", text: `session '${args.session}' has ended; tool call 'get_desktop_state' was rejected. Call start_session with this id to revive it before issuing further actions, or use a new session id.` }],
+          } };
+        }
+        capture += 1;
+        return { result: { structuredContent: {
+          screenshot_png_b64: `DESKTOP-${capture}`,
+          screenshot_mime_type: "image/png",
+        } } };
+      }
+      return { result: { content: [], structuredContent: {} } };
+    };
+
+    expect(await host.handle({
+      protocolVersion: 1,
+      sessionKey: "observe",
+      action: "computer_batch",
+      actions: [{ type: "screenshot" }],
+    })).toMatchObject({ ok: true, base64: "DESKTOP-1" });
+
+    driverEnded = true;
+    expect(await host.handle({
+      protocolVersion: 1,
+      sessionKey: "observe",
+      action: "computer_batch",
+      actions: [{ type: "screenshot" }],
+    })).toMatchObject({ ok: true, base64: "DESKTOP-2" });
+
+    const desktopSession = calls[0].args.session;
+    expect(calls.map((call) => call.name)).toEqual([
+      "start_session",
+      "get_desktop_state",
+      "get_desktop_state",
+      "start_session",
+      "get_desktop_state",
+    ]);
+    expect(calls[3].args).toEqual({
+      session: desktopSession,
+      capture_scope: "desktop",
+    });
+    expect(calls[4].args).toEqual({ session: desktopSession });
+  });
+
+  it("revives a driver-ended pinned window session before acting", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-window-revive-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    host.targets.set("win", { session: "win", pid: 42, window_id: 77 });
+    host.rootTargets.set("win", { session: "win", pid: 42, window_id: 77 });
+    host.sessionScopes.set("win", "window");
+    host.proxy = { killed: false, exitCode: null, stdin: { writable: true, write: () => true } };
+    host.daemon = { killed: false, exitCode: null };
+    let driverEnded = true;
+    let revived = false;
+    let observations = 0;
+    host.rpc = async (_method: string, params: any) => {
+      const { name, arguments: args } = params;
+      calls.push({ name, args });
+      if (name === "start_session") {
+        if (driverEnded) revived = true;
+        return { result: { content: [], structuredContent: {} } };
+      }
+      if (name === "get_window_state") {
+        if (driverEnded && !revived) {
+          return { result: {
+            isError: true,
+            content: [{ type: "text", text: `session '${args.session}' has ended; tool call 'get_window_state' was rejected. Call start_session with this id to revive it before issuing further actions, or use a new session id.` }],
+          } };
+        }
+        observations += 1;
+        return { result: { structuredContent: {
+          screenshot_png_b64: `PNG-${observations}`,
+          snapshot_id: `snapshot-${observations}`,
+          pid: 42,
+          window_id: 77,
+          elements: [{ role: "AXWindow", window_id: 77 }],
+        } } };
+      }
+      return { result: { content: [], structuredContent: {} } };
+    };
+
+    expect(await host.handle({
+      protocolVersion: 1,
+      sessionKey: "win",
+      action: "computer_batch",
+      actions: [{ type: "click", coordinate: [10, 20] }],
+    })).toMatchObject({ ok: true });
+    expect(calls.map((call) => call.name)).toEqual([
+      "get_window_state",
+      "start_session",
+      "get_window_state",
+      "click",
+      "get_window_state",
+      "get_accessibility_tree",
+    ]);
+    expect(calls[1].args).toEqual({ session: "win", capture_scope: "window" });
+  });
+
+  it("surfaces non-session tool failures without a revive attempt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-no-revive-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    host.proxy = { killed: false, exitCode: null, stdin: { writable: true, write: () => true } };
+    host.daemon = { killed: false, exitCode: null };
+    host.rpc = async (_method: string, params: any) => {
+      const { name } = params;
+      calls.push({ name, args: params.arguments });
+      if (name === "get_desktop_state") {
+        return { result: {
+          isError: true,
+          content: [{ type: "text", text: "capture_failed on display 1" }],
+        } };
+      }
+      return { result: { content: [], structuredContent: {} } };
+    };
+    await expect(host.call("get_desktop_state", { session: "pipiui-desktop-x" }))
+      .rejects.toThrow("capture_failed on display 1");
+    expect(calls.map((call) => call.name)).toEqual(["get_desktop_state"]);
   });
 });

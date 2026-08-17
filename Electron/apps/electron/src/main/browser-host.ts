@@ -23,7 +23,7 @@ export interface BrowserWebContentsLike {
   reload(): void
   stop?(): void
   executeJavaScript?(code: string): Promise<unknown>
-  capturePage?(): Promise<{ toPNG(): Uint8Array }>
+  capturePage?(rect?: BrowserViewBounds, options?: { stayHidden?: boolean; stayAwake?: boolean }): Promise<{ toPNG(): Uint8Array }>
   close?(options?: { waitForBeforeUnload?: boolean }): void
   isDestroyed?(): boolean
   session?: { clearStorageData(): Promise<void>; clearCache(): Promise<void> }
@@ -31,43 +31,111 @@ export interface BrowserWebContentsLike {
 }
 export interface BrowserViewLike {
   webContents: BrowserWebContentsLike
-  setBounds(bounds: BrowserViewBounds): void
+  setBounds(bounds: { x: number; y: number; width: number; height: number }): void
+  getBounds?(): { x: number; y: number; width: number; height: number }
   setVisible?(visible: boolean): void
+  getVisible?(): boolean
+  setBackgroundColor?(color: string): void
 }
 export type BrowserViewFactory = (options: { webPreferences: { contextIsolation: boolean; nodeIntegration: boolean; sandbox: boolean; partition?: string } }) => BrowserViewLike
-type BrowserViewAttach = (view: BrowserViewLike, visible: boolean) => void
-type BrowserSpaceEvent = { type: 'tabs'; snapshot: BrowserTabsSnapshot } | { type: 'reveal' }
+type BrowserViewPlacement = boolean | 'detach'
+type BrowserViewAttach = (view: BrowserViewLike, placement: BrowserViewPlacement) => void
+type BrowserSpaceEvent =
+  | { type: 'tabs'; snapshot: BrowserTabsSnapshot }
+  | { type: 'reveal' }
+  | { type: 'error'; message: string }
 
 export interface BrowserViewNativeHostLike {
-  contentView: { addChildView(view: BrowserViewLike): void; removeChildView(view: BrowserViewLike): void }
-  hide?(): void
-  setOpacity?(opacity: number): void
-  setIgnoreMouseEvents?(ignore: boolean): void
-  showInactive?(): void
+  contentView: { children?: BrowserViewLike[]; addChildView(view: BrowserViewLike): void; removeChildView(view: BrowserViewLike): void }
+}
+
+export interface BrowserShellWindowLike extends BrowserViewNativeHostLike {
+  getContentBounds(): { width: number; height: number }
+  on(event: 'resize', listener: () => void): unknown
+  off(event: 'resize', listener: () => void): unknown
+}
+
+/** BaseWindow composition: mount the renderer shell first and keep it full-size. */
+export function mountBrowserShellView(window: BrowserShellWindowLike, shellView: BrowserViewLike): () => void {
+  const layout = () => {
+    const { width, height } = window.getContentBounds()
+    shellView.setBounds({ x: 0, y: 0, width, height })
+    traceBrowserNative('shell:layout', shellView, window, { requested: { x: 0, y: 0, width, height } })
+  }
+  window.contentView.addChildView(shellView)
+  layout()
+  window.on('resize', layout)
+  return () => window.off('resize', layout)
+}
+
+const browserViewParent = new WeakMap<BrowserViewLike, BrowserViewNativeHostLike>()
+const browserViewDebugIds = new WeakMap<BrowserViewLike, number>()
+let browserViewDebugSequence = 0
+let browserNativeTraceSink: ((entry: Record<string, unknown>) => void) | undefined
+
+export function installBrowserNativeTrace(sink: ((entry: Record<string, unknown>) => void) | undefined): void {
+  browserNativeTraceSink = sink
+}
+
+function traceBrowserNative(stage: string, view: BrowserViewLike, host?: BrowserViewNativeHostLike, detail: Record<string, unknown> = {}): void {
+  if (!browserNativeTraceSink) return
+  let viewId = browserViewDebugIds.get(view)
+  if (!viewId) {
+    viewId = ++browserViewDebugSequence
+    browserViewDebugIds.set(view, viewId)
+  }
+  const childIds = host?.contentView.children?.map(child => {
+    let childId = browserViewDebugIds.get(child)
+    if (!childId) {
+      childId = ++browserViewDebugSequence
+      browserViewDebugIds.set(child, childId)
+    }
+    return childId
+  })
+  browserNativeTraceSink({
+    timestamp: Date.now(),
+    stage,
+    viewId,
+    bounds: view.getBounds?.(),
+    visible: view.getVisible?.(),
+    childIds,
+    ...detail
+  })
 }
 
 export function routeBrowserView(
   view: BrowserViewLike,
-  visible: boolean,
+  placement: BrowserViewPlacement,
   mainHost: BrowserViewNativeHostLike,
-  hiddenHost: BrowserViewNativeHostLike
+  hiddenHost?: BrowserViewNativeHostLike
 ): void {
-  mainHost.contentView.removeChildView(view)
-  hiddenHost.contentView.removeChildView(view)
-  if (visible) {
-    mainHost.contentView.addChildView(view)
-  } else {
-    hiddenHost.contentView.addChildView(view)
-    // macOS may constrain an off-screen native window back onto a visible
-    // display. Keep this rendering host transparent before it is shown so the
-    // real Chromium viewport cannot leak out as a white utility window.
-    hiddenHost.setOpacity?.(0)
-    // A fully transparent native window still participates in macOS hit
-    // testing. If the OS constrains this off-screen host onto a display, it
-    // must never intercept the renderer's tool-rail pointer events.
-    hiddenHost.setIgnoreMouseEvents?.(true)
-    hiddenHost.showInactive?.()
+  const parent = browserViewParent.get(view)
+  if (placement === 'detach') {
+    try { mainHost.contentView.removeChildView(view) } catch { /* not attached */ }
+    try { hiddenHost?.contentView.removeChildView(view) } catch { /* not attached */ }
+    browserViewParent.delete(view)
+    view.setVisible?.(false)
+    traceBrowserNative('route:detach', view, mainHost)
+    return
   }
+  const visible = placement
+  // A WebContentsView has one stable native owner for its whole lifetime.
+  // Electron documents same-parent add as a reorder operation, but does not
+  // guarantee that a live Chromium surface can migrate across BaseWindows.
+  // Hidden tool browsing therefore stays attached to main with a real viewport
+  // and setVisible(false), instead of moving through the transparent host.
+  if (parent === mainHost) {
+    if (!visible) view.setVisible?.(false)
+    traceBrowserNative('route:existing-main', view, mainHost, { placement: visible })
+    return
+  }
+  // Clean up a legacy/unknown attachment once, then establish main ownership.
+  try { hiddenHost?.contentView.removeChildView(view) } catch { /* not attached */ }
+  try { mainHost.contentView.removeChildView(view) } catch { /* not attached */ }
+  mainHost.contentView.addChildView(view)
+  browserViewParent.set(view, mainHost)
+  if (!visible) view.setVisible?.(false)
+  traceBrowserNative('route:add-main', view, mainHost, { placement: visible })
 }
 
 type BrowserTabRecord = BrowserTab & { history: string[]; historyIndex: number }
@@ -79,6 +147,13 @@ const hiddenBounds: BrowserViewBounds = { x: 0, y: 0, width: 0, height: 0, visib
 // stays hidden; moving a child View outside its parent clips it back to 0x0.
 const toolHiddenBounds: BrowserViewBounds = { x: 0, y: 0, width: 1280, height: 800, visible: false }
 const defaultPartition = 'persist:pipiui-browser'
+
+function setNativeBounds(view: BrowserViewLike, bounds: BrowserViewBounds): void {
+  // BrowserViewBounds carries API presentation state; Electron View.setBounds
+  // accepts only a native Rectangle. Never leak the custom `visible` key into
+  // gin's Rectangle conversion.
+  view.setBounds({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height })
+}
 
 /** Stable, opaque profile name: raw session ids never become filesystem path components. */
 export function browserPartitionForSession(sessionId: string): string {
@@ -118,6 +193,8 @@ export class BrowserTabsHost {
   private readonly tabs: BrowserTabRecord[] = []
   private readonly listeners = new Set<(event: BrowserSpaceEvent) => void>()
   private readonly revealWaiters = new Set<() => void>()
+  private readonly failedLoadViews = new WeakSet<BrowserViewLike>()
+  private readonly retiredViews = new WeakSet<BrowserViewLike>()
   private view?: BrowserViewLike
   private attach?: BrowserViewAttach
   private attachedVisible?: boolean
@@ -259,7 +336,7 @@ export class BrowserTabsHost {
       if (request.action === 'reload') { if (this.active) await this.show(this.active, 'reload', true); return this.domAction({ action: 'observe', scope: request.scope ?? 'viewport' }) }
       if (request.action === 'screenshot') {
         await this.ensureToolPage()
-        const image = await this.view?.webContents.capturePage?.()
+        const image = await this.view?.webContents.capturePage?.(undefined, { stayHidden: !this.isVisible() })
         if (!image) return { ok: false, error: 'browser screenshot is unavailable' }
         const bytes = Buffer.from(image.toPNG())
         if (bytes.length === 0) return { ok: false, error: 'browser screenshot is empty' }
@@ -356,7 +433,7 @@ export class BrowserTabsHost {
     return this.domAction({ action: 'observe', scope: request.scope ?? 'viewport' })
   }
 
-  async setViewBounds(bounds: BrowserViewBounds): Promise<void> {
+  async setViewBounds(bounds: BrowserViewBounds, restoreActivePage = true): Promise<boolean> {
     this.bounds = {
       x: Math.max(0, Math.round(Number.isFinite(bounds.x) ? bounds.x : 0)),
       y: Math.max(0, Math.round(Number.isFinite(bounds.y) ? bounds.y : 0)),
@@ -366,19 +443,30 @@ export class BrowserTabsHost {
     }
     if (!this.isVisible()) {
       if (this.view) this.attachView(this.view, false)
-      this.view?.setBounds(hiddenBounds)
+      if (this.view) setNativeBounds(this.view, hiddenBounds)
       this.view?.setVisible?.(false)
+      if (this.view) traceBrowserNative('bounds:hidden', this.view, undefined, { requested: this.bounds })
       this.shownTabId = undefined
-      return
+      return false
     }
     const view = this.ensureView()
     this.attachView(view, true)
-    view.setBounds(this.bounds)
+    setNativeBounds(view, this.bounds)
     view.setVisible?.(true)
+    traceBrowserNative('bounds:visible', view, undefined, { requested: this.bounds })
     this.revealWaiters.forEach(resolve => resolve())
     this.revealWaiters.clear()
     const activeHasPage = Boolean(this.active && (this.active.history.length > 0 || this.active.url))
-    if (!this.toolRevealPending && !this.toolNavigationPending && activeHasPage && this.active && this.shownTabId !== this.active.id) void this.show(this.active, 'restore')
+    const needsRestore = !this.toolRevealPending && !this.toolNavigationPending && activeHasPage && this.active && this.shownTabId !== this.active.id
+    if (restoreActivePage && needsRestore) void this.restoreVisiblePage()
+    return Boolean(needsRestore)
+  }
+
+  async restoreVisiblePage(): Promise<void> {
+    const active = this.active
+    if (!this.isVisible() || this.toolRevealPending || this.toolNavigationPending || !active) return
+    if ((!active.history.length && !active.url) || this.shownTabId === active.id) return
+    await this.show(active, 'restore')
   }
 
   subscribe(listener: (event: BrowserSpaceEvent) => void): Unsubscribe {
@@ -389,23 +477,22 @@ export class BrowserTabsHost {
   /** Session deletion is terminal: destroy its page and erase that partition's browsing data. */
   async dispose(clearStorage = false): Promise<void> {
     const view = this.view
+    this.bounds = hiddenBounds
+    this.revealWaiters.forEach(resolve => resolve())
+    this.revealWaiters.clear()
+    const contents = view ? this.beginViewRetirement(view) : undefined
     this.view = undefined
     this.shownTabId = undefined
     this.attach = undefined
     this.attachedVisible = undefined
-    this.bounds = hiddenBounds
-    this.revealWaiters.forEach(resolve => resolve())
-    this.revealWaiters.clear()
-    if (!view) return
-    view.setVisible?.(false)
-    view.webContents.stop?.()
-    if (clearStorage && view.webContents.session) {
+    if (!contents) return
+    if (clearStorage && contents.session) {
       await Promise.allSettled([
-        view.webContents.session.clearStorageData(),
-        view.webContents.session.clearCache()
+        contents.session.clearStorageData(),
+        contents.session.clearCache()
       ])
     }
-    if (!view.webContents.isDestroyed?.()) view.webContents.close?.()
+    if (!contents.isDestroyed?.()) contents.close?.()
   }
 
   private get active(): BrowserTabRecord | undefined {
@@ -418,19 +505,7 @@ export class BrowserTabsHost {
     if (this.isVisible()) return
     this.toolRevealPending = true
     try {
-      this.listeners.forEach(listener => listener({ type: 'reveal' }))
-      if (this.isVisible()) return
-      await new Promise<void>(resolve => {
-        let settled = false
-        const finish = () => {
-          if (settled) return
-          settled = true
-          this.revealWaiters.delete(finish)
-          resolve()
-        }
-        this.revealWaiters.add(finish)
-        setTimeout(finish, 300)
-      })
+      await this.requestReveal()
     } finally {
       this.toolRevealPending = false
     }
@@ -508,15 +583,68 @@ export class BrowserTabsHost {
     // This is the only `new WebContentsView` path; virtual tabs reuse it.
     const view = this.createView({ webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, partition: this.partition } })
     this.view = view
-    view.setBounds(hiddenBounds)
+    setNativeBounds(view, hiddenBounds)
     view.setVisible?.(false)
-    view.webContents.on('did-start-loading', () => this.setLoading(true))
-    view.webContents.on('did-stop-loading', () => this.setLoading(false))
-    view.webContents.on('did-fail-load', () => this.setLoading(false))
-    view.webContents.on('did-navigate', (_event: unknown, url: string) => this.didNavigate(url))
-    view.webContents.on('did-navigate-in-page', (_event: unknown, url: string) => this.didNavigate(url))
-    view.webContents.on('page-title-updated', (_event: unknown, title: string) => this.didUpdateTitle(title))
+    view.webContents.on('did-start-loading', () => {
+      if (this.view !== view) return
+      this.setLoading(true)
+    })
+    view.webContents.on('did-stop-loading', () => {
+      if (this.view !== view) return
+      this.setLoading(false)
+    })
+    view.webContents.on('did-fail-load', (_event: unknown, errorCode: number, errorDescription: string, validatedURL: string, isMainFrame: boolean) => {
+      if (this.view !== view) return
+      if (!isMainFrame || errorCode === -3) return
+      this.failedLoadViews.add(view)
+      this.setLoading(false)
+      const target = validatedURL || this.active?.url || ''
+      this.emitError(`${errorDescription || 'load failed'} (${errorCode})${target ? ` ${target}` : ''}`)
+    })
+    view.webContents.on('render-process-gone', () => {
+      if (this.view !== view) return
+      this.setLoading(false)
+      this.retireView(view)
+      this.emitError('浏览器渲染进程已崩溃，将在下次打开时重建')
+    })
+    view.webContents.on('did-navigate', (_event: unknown, url: string) => {
+      if (this.view !== view) return
+      this.didNavigate(url)
+    })
+    view.webContents.on('did-navigate-in-page', (_event: unknown, url: string) => {
+      if (this.view !== view) return
+      this.didNavigate(url)
+    })
+    view.webContents.on('page-title-updated', (_event: unknown, title: string) => {
+      if (this.view !== view) return
+      this.didUpdateTitle(title)
+    })
     return view
+  }
+
+  /** Remove one failed native surface from all ownership before replacement. */
+  private retireView(view: BrowserViewLike): void {
+    const contents = this.beginViewRetirement(view)
+    if (contents && !contents.isDestroyed?.()) contents.close?.()
+  }
+
+  /** Start retirement once, retaining webContents for ordered cleanup/close. */
+  private beginViewRetirement(view: BrowserViewLike): BrowserWebContentsLike | undefined {
+    if (this.view === view) {
+      this.view = undefined
+      this.shownTabId = undefined
+      this.attachedVisible = undefined
+    }
+    if (this.retiredViews.has(view)) return undefined
+    this.retiredViews.add(view)
+    setNativeBounds(view, hiddenBounds)
+    view.setVisible?.(false)
+    try {
+      this.attach?.(view, 'detach')
+    } finally {
+      view.webContents.stop?.()
+    }
+    return view.webContents
   }
 
   private attachView(view: BrowserViewLike, visible: boolean): void {
@@ -525,14 +653,32 @@ export class BrowserTabsHost {
     this.attachedVisible = visible
   }
 
+  private async requestReveal(): Promise<void> {
+    if (this.isVisible()) return
+    this.listeners.forEach(listener => listener({ type: 'reveal' }))
+    if (this.isVisible()) return
+    await new Promise<void>(resolve => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        this.revealWaiters.delete(finish)
+        resolve()
+      }
+      this.revealWaiters.add(finish)
+      setTimeout(finish, 300)
+    })
+  }
+
   private async show(tab: BrowserTabRecord, kind: NavigationKind, allowHidden = false): Promise<void> {
+    if (!this.isVisible() && !allowHidden) await this.requestReveal()
     const visible = this.isVisible()
-    if (!visible && !allowHidden) return
     const view = this.ensureView()
     this.attachView(view, visible)
-    view.setBounds(visible ? this.bounds : toolHiddenBounds)
-    // Tool-only pages are visible inside a shown, off-screen native host.
-    view.setVisible?.(true)
+    setNativeBounds(view, visible ? this.bounds : toolHiddenBounds)
+    // Hidden tool pages keep a real layout viewport without painting over UI.
+    view.setVisible?.(visible)
+    traceBrowserNative('show:prepared', view, undefined, { visible, requested: visible ? this.bounds : toolHiddenBounds })
     this.shownTabId = tab.id
     const url = (tab.history[tab.historyIndex] ?? tab.url) || 'about:blank'
     this.pending = { tabId: tab.id, kind, url }
@@ -544,6 +690,31 @@ export class BrowserTabsHost {
       if (this.pending?.tabId === tab.id) this.pending = undefined
       tab.isLoading = false
       this.emit()
+      const message = error instanceof Error ? error.message : String(error)
+      this.emitError(message)
+      if (this.view === view && this.failedLoadViews.has(view) && message.includes('ERR_FAILED')) {
+        this.retireView(view)
+        const retryView = this.ensureView()
+        this.attachView(retryView, visible)
+        setNativeBounds(retryView, visible ? this.bounds : toolHiddenBounds)
+        retryView.setVisible?.(visible)
+        this.shownTabId = tab.id
+        this.pending = { tabId: tab.id, kind, url }
+        tab.isLoading = true
+        this.emit()
+        try {
+          await Promise.resolve(retryView.webContents.loadURL(url))
+        } catch (retryError) {
+          if (this.pending?.tabId === tab.id) this.pending = undefined
+          tab.isLoading = false
+          this.emit()
+          const retryMessage = retryError instanceof Error ? retryError.message : String(retryError)
+          this.emitError(retryMessage)
+          if (this.view === retryView && this.failedLoadViews.has(retryView)) this.retireView(retryView)
+          throw retryError
+        }
+        return
+      }
       throw error
     }
   }
@@ -592,6 +763,11 @@ export class BrowserTabsHost {
 
   private emit(): void {
     const event: BrowserSpaceEvent = { type: 'tabs', snapshot: this.state() }
+    this.listeners.forEach(listener => listener(event))
+  }
+
+  private emitError(message: string): void {
+    const event: BrowserSpaceEvent = { type: 'error', message }
     this.listeners.forEach(listener => listener(event))
   }
 }
@@ -644,15 +820,20 @@ export class BrowserSessionHost implements BrowserHostAPI {
   snapshot(sessionId: string, tabId?: string): Promise<BrowserSnapshot> { return this.run(sessionId, host => host.snapshot(tabId)) }
 
   async setViewBounds(sessionId: string, bounds: BrowserViewBounds): Promise<void> {
+    const id = sessionId.trim()
+    const record = this.record(sessionId)
     const visible = bounds.visible !== false && bounds.width > 0 && bounds.height > 0
     const prior = this.visibleSessionId
-    if (visible && prior && prior !== sessionId) {
+    if (visible && prior && prior !== id) {
       const old = this.records.get(prior)
-      if (old && !old.disposing) await this.enqueue(old, () => old.host.setViewBounds(hiddenBounds))
+      if (old && !old.disposing) await old.host.setViewBounds(hiddenBounds, false)
+      if (!this.recordIsCurrent(id, record)) return
     }
-    if (visible) this.visibleSessionId = sessionId
-    else if (this.visibleSessionId === sessionId) this.visibleSessionId = undefined
-    await this.run(sessionId, host => host.setViewBounds(bounds))
+    const needsRestore = await record.host.setViewBounds(bounds, false)
+    if (!this.recordIsCurrent(id, record)) return
+    if (visible) this.visibleSessionId = id
+    else if (this.visibleSessionId === id) this.visibleSessionId = undefined
+    if (needsRestore) void this.enqueue(record, () => record.host.restoreVisiblePage()).catch(() => undefined)
   }
 
   toolAction(sessionId: string, request: BrowserToolRequest): Promise<BrowserToolResult> {
@@ -693,6 +874,10 @@ export class BrowserSessionHost implements BrowserHostAPI {
     })
     this.records.set(id, record)
     return record
+  }
+
+  private recordIsCurrent(sessionId: string, record: BrowserSessionRecord): boolean {
+    return !record.disposing && this.records.get(sessionId) === record
   }
 
   private run<T>(sessionId: string, operation: (host: BrowserTabsHost) => Promise<T>): Promise<T> {

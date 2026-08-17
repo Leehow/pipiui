@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createPiHostBackend } from "../src/index.js";
 
-describe("PiHostBackend fake-pi end to end",()=>{let root="";afterEach(async()=>{if(root)await (await import("node:fs/promises")).rm(root,{recursive:true,force:true})});it("loads a configured project and its JSONL history, then spawns RPC and relays streamed events",async()=>{root=await mkdtemp(join(tmpdir(),"pipi-pi-"));const cwd=join(root,"project");const dir=join(root,"sessions","project");await mkdir(dir,{recursive:true});await mkdir(cwd,{recursive:true});const path=join(dir,"session.jsonl");await writeFile(path,[JSON.stringify({type:"session",version:3,id:"session-1",timestamp:"2026-08-10T00:00:00.000Z",cwd}),JSON.stringify({type:"message",id:"u1",parentId:null,timestamp:"2026-08-10T00:00:01.000Z",message:{role:"user",content:"saved"}})].join("\n")+"\n");const backend=createPiHostBackend({agentDir:join(root,"agent"),sessionsRoot:join(root,"sessions"),runtimeRoot:join(root,"runtime"),canonicalProjectPaths:async()=>undefined,piPath:"node",spawn:(_bin,_args,options)=>spawn("/usr/local/bin/node",[new URL("./fake-pi.mjs",import.meta.url).pathname],{...options,env:{...options.env,PATH:"/usr/local/bin:/usr/bin:/bin"}}) as any});await backend.handle("addProject",[cwd]);const projects=await backend.handle("listProjects",[]) as any[];expect(projects).toHaveLength(1);const sessions=await backend.handle("listSessions",[projects[0].id]) as any[];expect(sessions[0].id).toBe("session-1");expect(await backend.handle("getSessionHistory",["session-1"])).toMatchObject([{content:"saved"}]);const events:any[]=[];const off=backend.subscribe(e=>events.push(e));await backend.handle("queueFollowUp",["session-1","later"]);await backend.handle("sendPrompt",["session-1","go"]);await new Promise(r=>setTimeout(r,20));off();expect(events.map(e=>e.channel==="stream"&&e.event.type)).toEqual(expect.arrayContaining(["thinking","text","tool_call","tool_result","status"]));
-    // Tool args buffered from toolcall_delta are emitted once at toolcall_end under the real id/name.
+describe("PiHostBackend fake-pi end to end",()=>{let root="";afterEach(async()=>{if(root)await (await import("node:fs/promises")).rm(root,{recursive:true,force:true})});
+it("stop sweeps the session's running background subagents instead of leaving them to wake the stopped session",async()=>{root=await mkdtemp(join(tmpdir(),"pipi-pi-sweep-"));const cwd=join(root,"project");const dir=join(root,"sessions","project");await mkdir(dir,{recursive:true});await mkdir(cwd,{recursive:true});const promptLog=join(root,"prompts.log");await writeFile(join(dir,"session.jsonl"),[JSON.stringify({type:"session",version:3,id:"session-1",timestamp:"2026-08-10T00:00:00.000Z",cwd})].join("\n")+"\n");const backend=createPiHostBackend({agentDir:join(root,"agent"),sessionsRoot:join(root,"sessions"),runtimeRoot:join(root,"runtime"),canonicalProjectPaths:async()=>undefined,piPath:"node",spawn:(_bin,_args,options)=>spawn("/usr/local/bin/node",[new URL("./fake-pi.mjs",import.meta.url).pathname],{...options,env:{...options.env,PATH:"/usr/local/bin:/usr/bin:/bin",FAKE_PI_PROMPT_LOG:promptLog}}) as any});await backend.handle("addProject",[cwd]);await backend.handle("sendPrompt",["session-1","__agent_running__"]);await new Promise(r=>setTimeout(r,30));const before=(await backend.handle("listAgents",["session-1"]) as any[]).find(a=>a.agentId==="agent-1");expect(before?.state).toBe("running");await backend.handle("stop",["session-1"]);const log=await readFile(promptLog,"utf8");expect(log).toContain("/subagent_abort_all");const after=(await backend.handle("listAgents",["session-1"]) as any[]).find(a=>a.agentId==="agent-1");expect(after?.state).toBe("aborted");await backend.close();});
+it("stop arms the host-stop quiet sweep even when no background subagent is running",async()=>{root=await mkdtemp(join(tmpdir(),"pipi-pi-quiet-"));const cwd=join(root,"project");const dir=join(root,"sessions","project");await mkdir(dir,{recursive:true});await mkdir(cwd,{recursive:true});const promptLog=join(root,"prompts.log");await writeFile(join(dir,"session.jsonl"),[JSON.stringify({type:"session",version:3,id:"session-1",timestamp:"2026-08-10T00:00:00.000Z",cwd})].join("\n")+"\n");const backend=createPiHostBackend({agentDir:join(root,"agent"),sessionsRoot:join(root,"sessions"),runtimeRoot:join(root,"runtime"),canonicalProjectPaths:async()=>undefined,piPath:"node",spawn:(_bin,_args,options)=>spawn("/usr/local/bin/node",[new URL("./fake-pi.mjs",import.meta.url).pathname],{...options,env:{...options.env,PATH:"/usr/local/bin:/usr/bin:/bin",FAKE_PI_PROMPT_LOG:promptLog}}) as any});await backend.handle("addProject",[cwd]);await backend.handle("sendPrompt",["session-1","go"]);await new Promise(r=>setTimeout(r,30));const agents=await backend.handle("listAgents",["session-1"]) as any[];expect(agents.every(a=>a.state!=="running")).toBe(true);await backend.handle("stop",["session-1"]);expect(await readFile(promptLog,"utf8")).toContain("/subagent_abort_all");await backend.close();});
+it("loads a configured project and its JSONL history, then spawns RPC and relays streamed events",async()=>{root=await mkdtemp(join(tmpdir(),"pipi-pi-"));const cwd=join(root,"project");const dir=join(root,"sessions","project");await mkdir(dir,{recursive:true});await mkdir(cwd,{recursive:true});const path=join(dir,"session.jsonl");await writeFile(path,[JSON.stringify({type:"session",version:3,id:"session-1",timestamp:"2026-08-10T00:00:00.000Z",cwd}),JSON.stringify({type:"message",id:"u1",parentId:null,timestamp:"2026-08-10T00:00:01.000Z",message:{role:"user",content:"saved"}})].join("\n")+"\n");const backend=createPiHostBackend({agentDir:join(root,"agent"),sessionsRoot:join(root,"sessions"),runtimeRoot:join(root,"runtime"),canonicalProjectPaths:async()=>undefined,piPath:"node",spawn:(_bin,_args,options)=>spawn("/usr/local/bin/node",[new URL("./fake-pi.mjs",import.meta.url).pathname],{...options,env:{...options.env,PATH:"/usr/local/bin:/usr/bin:/bin"}}) as any});await backend.handle("addProject",[cwd]);const projects=await backend.handle("listProjects",[]) as any[];expect(projects).toHaveLength(1);const sessions=await backend.handle("listSessions",[projects[0].id]) as any[];expect(sessions[0].id).toBe("session-1");expect(await backend.handle("getSessionHistory",["session-1"])).toMatchObject([{content:"saved"}]);const events:any[]=[];const off=backend.subscribe(e=>events.push(e));await backend.handle("queueFollowUp",["session-1","later"]);await backend.handle("sendPrompt",["session-1","go"]);await new Promise(r=>setTimeout(r,20));off();expect(events.map(e=>e.channel==="stream"&&e.event.type)).toEqual(expect.arrayContaining(["thinking","text","tool_call","tool_result","status"]));
+    // Tool args stream on toolcall_delta; toolcall_end promotes the card to the real id/name.
     expect(events.some(e=>e.channel==="stream"&&e.event.type==="tool_call"&&e.event.contentIndex===1&&e.event.toolCallId==="tool-1"&&e.event.name==="fake_tool"&&e.event.delta==='{"command":"ls -la"}')).toBe(true);expect(events.some(e=>e.channel==="stream"&&e.event.status==="settled")).toBe(true);expect(events.some(e=>e.channel==="stream"&&e.event.pendingFollowUps?.includes("later"))).toBe(true);expect(events.some(e=>e.channel==="session_stats"&&e.event.type==="snapshot"&&e.event.sessionId==="session-1")).toBe(true);expect(await backend.handle("getSessionStats",["session-1"])).toMatchObject({sessionId:"session-1",tokens:{input:1200,output:340,cacheRead:800,cacheWrite:100,total:2440},cost:0.00123,contextUsage:{tokens:15000,contextWindow:262144,percent:5.7},model:{provider:"fake",id:"fake-1",name:"Fake"}});expect(await backend.handle("listAgents",["session-1"])).toEqual([expect.objectContaining({agentId:"agent-1",parentId:null,depth:1,role:"general-purpose",title:"Build fixture",sessionId:"session-1"})]);expect(await backend.handle("getWorktreeStatus",["agent-1"])).toMatchObject({lifecycle:"pendingReview",merge:"ready",discard:"ready"});
 // This used to assert that mergeWorktree reported success. It reported success without running
 // any Git: the branch stayed unmerged and the user was told otherwise. Automatic finalization is
@@ -32,6 +35,10 @@ it("tags streamed thinking with a per-message segment epoch",async()=>{root=awai
 // Pi restarts contentIndex at every assistant message; the second thinking block
 // at contentIndex 0 must carry a fresh segment so the UI keeps the blocks apart.
 const thinking=events.filter(e=>e.channel==="stream"&&e.event.type==="thinking").map(e=>[e.event.segment,e.event.contentIndex,e.event.delta]);expect(thinking).toEqual([[0,0,"think"],[1,0,"reflect"]]);});
+
+it("emits a tool_call card on toolcall_start so the UI does not wait for toolcall_end",async()=>{root=await mkdtemp(join(tmpdir(),"pipi-pi-tool-start-"));const cwd=join(root,"project");const dir=join(root,"sessions","project");await mkdir(dir,{recursive:true});await mkdir(cwd,{recursive:true});await writeFile(join(dir,"session.jsonl"),[JSON.stringify({type:"session",version:3,id:"session-1",timestamp:"2026-08-10T00:00:00.000Z",cwd})].join("\n")+"\n");const backend=createPiHostBackend({agentDir:join(root,"agent"),sessionsRoot:join(root,"sessions"),runtimeRoot:join(root,"runtime"),canonicalProjectPaths:async()=>undefined,piPath:"node",spawn:(_bin,_args,options)=>spawn("/usr/local/bin/node",[new URL("./fake-pi.mjs",import.meta.url).pathname],{...options,env:{...options.env,PATH:"/usr/local/bin:/usr/bin:/bin"}}) as any});await backend.handle("addProject",[cwd]);const events:any[]=[];const off=backend.subscribe(e=>events.push(e));await backend.handle("sendPrompt",["session-1","__tool_start_only__"]);await new Promise(r=>setTimeout(r,20));off();
+const toolCalls=events.filter(e=>e.channel==="stream"&&e.event.type==="tool_call").map(e=>e.event);
+expect(toolCalls).toEqual([expect.objectContaining({type:"tool_call",sessionId:"session-1",contentIndex:1})]);});
 
 it("forwards a terminal stopReason error as a stream error so a failed turn is never blank",async()=>{root=await mkdtemp(join(tmpdir(),"pipi-pi-fail-"));const cwd=join(root,"project");const dir=join(root,"sessions","project");await mkdir(dir,{recursive:true});await mkdir(cwd,{recursive:true});await writeFile(join(dir,"session.jsonl"),[JSON.stringify({type:"session",version:3,id:"session-1",timestamp:"2026-08-10T00:00:00.000Z",cwd})].join("\n")+"\n");const backend=createPiHostBackend({agentDir:join(root,"agent"),sessionsRoot:join(root,"sessions"),runtimeRoot:join(root,"runtime"),canonicalProjectPaths:async()=>undefined,piPath:"node",spawn:(_bin,_args,options)=>spawn("/usr/local/bin/node",[new URL("./fake-pi.mjs",import.meta.url).pathname],{...options,env:{...options.env,PATH:"/usr/local/bin:/usr/bin:/bin"}}) as any});await backend.handle("addProject",[cwd]);const events:any[]=[];const off=backend.subscribe(e=>events.push(e));await backend.handle("sendPrompt",["session-1","__fail_turn__"]);await new Promise(r=>setTimeout(r,20));off();
 // Pi reports message_end with stopReason "error" + errorMessage and no content;
@@ -93,6 +100,47 @@ it("preserves tool structure via the streaming fallback for oversized sessions",
   expect(history).toEqual([
     expect.objectContaining({ role: "assistant", content: "ok", tools: [{ id: "call-9", name: "web_search", input: '{"query":"hello"}' }] }),
     expect.objectContaining({ role: "tool", content: "result!", toolCallId: "call-9", toolName: "web_search" }),
+  ]);
+});
+
+it("surfaces a hidden-display subagent completion custom_message as a user history row", async () => {
+  root = await mkdtemp(join(tmpdir(), "pipi-pi-hist-done-"));
+  const cwd = join(root, "project");
+  const dir = join(root, "sessions", "project");
+  await mkdir(dir, { recursive: true });
+  await mkdir(cwd, { recursive: true });
+  const path = join(dir, "session.jsonl");
+  await writeFile(path, [
+    JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: "2026-08-10T00:00:00.000Z", cwd }),
+    JSON.stringify({ type: "message", id: "a1", parentId: null, timestamp: "2026-08-10T00:00:01.000Z", message: { role: "assistant", content: "already answered", stopReason: "stop" } }),
+    JSON.stringify({
+      type: "custom_message",
+      id: "c-done",
+      parentId: "a1",
+      timestamp: "2026-08-10T00:00:02.000Z",
+      customType: "pipiui-subagent-complete-v1",
+      display: false,
+      content: "[subagent-done] agentId=a1 name=explore ok=true\nTitle: 探索\nResult:\n找到了设置页",
+    }),
+    JSON.stringify({
+      type: "custom_message",
+      id: "c-git",
+      parentId: "c-done",
+      timestamp: "2026-08-10T00:00:03.000Z",
+      customType: "pipiui-git-snapshot",
+      display: false,
+      content: "hidden git snapshot",
+    }),
+  ].join("\n") + "\n");
+  const backend = createPiHostBackend({ agentDir: join(root, "agent"), sessionsRoot: join(root, "sessions"), runtimeRoot: join(root, "runtime"), piPath: "node" });
+  const history = await backend.handle("getSessionHistory", ["session-1"]) as any[];
+  expect(history).toEqual([
+    expect.objectContaining({ role: "assistant", content: "already answered" }),
+    expect.objectContaining({
+      id: "c-done",
+      role: "user",
+      content: "[subagent-done] agentId=a1 name=explore ok=true\nTitle: 探索\nResult:\n找到了设置页",
+    }),
   ]);
 });
 

@@ -1,18 +1,22 @@
-import { memo } from 'react'
-import { Streamdown, type ControlsConfig } from 'streamdown'
-import { code } from '@streamdown/code'
+import { memo, type ReactNode } from 'react'
 import { ActivityCard } from './ActivityCard'
 import { parseSubagentNotice } from './subagent-notice'
 import { toolArgsSummary, toolDisplaySummary, formatToolInput } from './tool-summary'
-import { formatCompactTokens } from './session-stats-format'
+import { fileChangeDeltaLabel, fileChangeTokenStats, liveTokenLabel } from './file-change-tokens'
+import { estimateTokens, formatCompactTokens } from './session-stats-format'
 import { DocumentReferenceCards } from './DocumentReferenceCards'
 import { LiveSubagentCard } from './LiveSubagentCard'
 import { useLiveSubagentBindings } from './LiveSubagentBinding'
 import { TruncatedText } from './TruncatedText'
+import { TranscriptMarkdown } from './TranscriptMarkdown'
+import { ComputerPlanCard } from './ComputerPlanCard'
+import { ComputerTaskResultCard, ComputerWorkerResultCard, computerTaskGoalFromInput } from './ComputerTaskResultCard'
+import { parseComputerPlanSegment, parseComputerTaskResult, parseComputerWorkerResult } from './computer-task-report'
 import type { ChatMessage, TranscriptActivity, TranscriptTool } from './transcript-model'
-import { activitiesFromMessage, planAssistantTranscript } from './transcript-model'
+import { activitiesFromMessage, PENDING_THINKING_ID, planAssistantTranscript } from './transcript-model'
 
 export type { TranscriptActivity, TranscriptTool } from './transcript-model'
+export { TranscriptMarkdown } from './TranscriptMarkdown'
 export type AssistantTranscriptMessage = Pick<ChatMessage, 'content' | 'thinking' | 'tools' | 'activities' | 'streaming' | 'error'>
 
 function elapsed(startedAt: number, endedAt = Date.now()) { return `${Math.max(0, Math.round((endedAt - startedAt) / 1000))}s` }
@@ -27,9 +31,6 @@ function toolRunSummary(steps: number, thinking: string | null, tools: { name: s
   const label = primaryCount > 1 ? `${primary} ×${primaryCount}` : primary
   return `${steps} 个步骤 · ${[thinking, label].filter((part): part is string => Boolean(part)).join(' · ')}`
 }
-const staticMarkdownPlugins = { code }
-const streamdownControls: ControlsConfig = { table: { copy: false, download: false, fullscreen: false }, code: { copy: true, download: false }, mermaid: false }
-export const TranscriptMarkdown = memo(function TranscriptMarkdown({ content, streaming }: { content: string; streaming?: boolean }) { return <div className="markdown"><Streamdown mode={streaming ? 'streaming' : 'static'} isAnimating={streaming} plugins={streaming ? undefined : staticMarkdownPlugins} shikiTheme={['github-light', 'github-dark']} controls={streamdownControls}>{content}</Streamdown></div> })
 
 const TranscriptToolCard = memo(function TranscriptToolCard({ tool, streaming }: { tool: TranscriptTool; streaming?: boolean }) {
   const argsSummary = toolArgsSummary(tool.name, tool.input)
@@ -38,7 +39,13 @@ const TranscriptToolCard = memo(function TranscriptToolCard({ tool, streaming }:
     ? `子任务${argsSummary !== '…' ? ` · ${argsSummary}` : subagentNotice ? ` · ${subagentNotice.name}` : ''}`
     : toolDisplaySummary(tool.name, tool.input)
   const completedElapsed = elapsed(tool.startedAt, tool.finishedAt ?? tool.startedAt)
-  const meta = tool.error ? `失败 · ${completedElapsed}` : subagentNotice ? `${subagentNotice.ok ? '成功' : '失败'} · ${subagentNotice.cost} · ${completedElapsed}` : tool.dispatched ? `已派发 · ${completedElapsed}` : tool.finished ? `完成 · ${completedElapsed}` : `运行中 · ${elapsed(tool.startedAt)}`
+  const stats = !tool.error ? fileChangeTokenStats(tool.name, tool.input ?? '') : null
+  const delta = stats && tool.finished ? fileChangeDeltaLabel(stats.addedChars, stats.removedChars) : undefined
+  const live = stats && !tool.finished ? liveTokenLabel(stats.payloadChars) : undefined
+  const baseMeta = tool.error ? `失败 · ${completedElapsed}` : subagentNotice ? `${subagentNotice.ok ? '成功' : '失败'} · ${subagentNotice.cost} · ${completedElapsed}` : tool.dispatched ? `已派发 · ${completedElapsed}` : tool.finished ? `完成 · ${completedElapsed}` : `运行中 · ${elapsed(tool.startedAt)}`
+  const meta: ReactNode = delta
+    ? <span>{baseMeta} · <span className="tok-add tok-del-wrap">{delta.split(' ').map((part, i) => <span key={i} className={part.startsWith('+') ? 'tok-add' : 'tok-del'}>{i ? ` ${part}` : part}</span>)}</span></span>
+    : live ? `${baseMeta} · ${live}` : baseMeta
   return <ActivityCard kind="tool" summary={summary} meta={meta} error={Boolean(tool.error || (subagentNotice && !subagentNotice.ok))} defaultExpanded={tool.name === 'subagent' ? (Boolean(streaming) || !tool.finished || Boolean(tool.dispatched)) : false}>
     {tool.images && tool.images.length > 0 && <div className="tool-images">{tool.images.map((img, i) => <img key={i} className="tool-screenshot" src={`data:${img.mimeType};base64,${img.data}`} alt="工具截图" loading="lazy" />)}</div>}
     {tool.input && <div className="tool-io"><div className="tool-io-label">输入</div><pre>{formatToolInput(tool.name, tool.input)}</pre></div>}
@@ -47,13 +54,14 @@ const TranscriptToolCard = memo(function TranscriptToolCard({ tool, streaming }:
 })
 
 const ActiveToolCard = memo(function ActiveToolCard({ tool }: { tool: TranscriptTool }) {
-  return <section className="activity-card activity-card-tool activity-card-active-tool" data-activity-card="tool" data-testid="active-tool"><div className="activity-summary"><span className="activity-status" aria-hidden="true">◌</span><b>{toolDisplaySummary(tool.name, tool.input)}</b><small className="activity-meta">运行中 · {elapsed(tool.startedAt)}</small></div></section>
+  const live = liveTokenLabel(fileChangeTokenStats(tool.name, tool.input ?? '')?.payloadChars ?? 0)
+  return <section className="activity-card activity-card-tool activity-card-active-tool" data-activity-card="tool" data-testid="active-tool"><div className="activity-summary"><span className="activity-status" aria-hidden="true">◌</span><b>{toolDisplaySummary(tool.name, tool.input)}</b><small className="activity-meta">运行中 · {elapsed(tool.startedAt)}{live ? ` · ${live}` : ''}</small></div></section>
 })
 
 export const AssistantTranscriptContent = memo(function AssistantTranscriptContent({ message, expandSteps, documentBasePath, onOpenDocument, onOpenSubagents }: { message: AssistantTranscriptMessage; expandSteps?: boolean; documentBasePath?: string; onOpenDocument?: (path: string) => void; onOpenSubagents?: (agentId?: string) => void }) {
   const activities = activitiesFromMessage(message)
   const stepActivities = activities.filter((activity): activity is Extract<TranscriptActivity, { type: 'thinking' | 'tool' }> => activity.type !== 'text')
-  const activeTool = message.streaming ? [...stepActivities].reverse().find((activity): activity is Extract<TranscriptActivity, { type: 'tool' }> => activity.type === 'tool' && !activity.tool.finished && activity.tool.name !== 'subagent') : undefined
+  const activeTool = message.streaming ? [...stepActivities].reverse().find((activity): activity is Extract<TranscriptActivity, { type: 'tool' }> => activity.type === 'tool' && !activity.tool.finished && activity.tool.name !== 'subagent' && activity.tool.name !== 'computer_task') : undefined
   const segments: ReturnType<typeof planAssistantTranscript> = []
   for (const segment of planAssistantTranscript(message)) {
     if (segment.type === 'text') {
@@ -65,9 +73,12 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
   }
   const tools = segments.flatMap(segment => segment.type === 'steps' ? segment.activities.flatMap(activity => activity.type === 'tool' ? [activity.tool] : []) : [])
   const liveByTool = useLiveSubagentBindings(tools)
-  const subagentProjections = tools.filter(tool => tool.name === 'subagent').map(tool => liveByTool.get(tool.id)).filter((projection): projection is NonNullable<typeof projection> => Boolean(projection))
+  // `computer_task` children carry the same toolCallId linkage as `subagent`
+  // children, so both project into live row cards while running.
+  const liveProjectable = (tool: TranscriptTool) => tool.name === 'subagent' || tool.name === 'computer_task'
+  const subagentProjections = tools.filter(liveProjectable).map(tool => liveByTool.get(tool.id)).filter((projection): projection is NonNullable<typeof projection> => Boolean(projection))
   const linkedRunning = subagentProjections.some(projection => projection.runningCount > 0)
-  const pendingDispatch = tools.some(tool => tool.name === 'subagent' && Boolean(tool.dispatched) && (liveByTool.get(tool.id)?.roots.length ?? 0) === 0)
+  const pendingDispatch = tools.some(tool => liveProjectable(tool) && Boolean(tool.dispatched) && (liveByTool.get(tool.id)?.roots.length ?? 0) === 0)
   const linkedFailed = subagentProjections.some(projection => projection.failedCount > 0)
   const failed = tools.some(tool => Boolean(tool.error) || (tool.name === 'subagent' && tool.finished && tool.result ? parseSubagentNotice(tool.result)?.ok === false : false)) || linkedFailed
   const running = Boolean(message.streaming && !activeTool) || linkedRunning || pendingDispatch
@@ -80,15 +91,42 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
   }
   return <div className="assistant-transcript-content" data-testid="assistant-transcript-content">
     {segments.map((segment, index) => {
-      if (segment.type === 'text') return <div key={`text:${segment.id}`} data-transcript-segment="text"><TranscriptMarkdown content={segment.content} streaming={message.streaming && index === segments.length - 1} />{!message.streaming && <DocumentReferenceCards content={segment.content} basePath={documentBasePath} onOpenDocument={onOpenDocument} />}</div>
+      if (segment.type === 'text') {
+        // The Computer Use Leader's plan JSON streams as cumulative text
+        // snapshots; a plan-shaped segment renders as a growing plan card
+        // instead of a raw JSON markdown dump.
+        const plan = parseComputerPlanSegment(segment.content)
+        if (plan) return <div key={`text:${segment.id}`} data-transcript-segment="text"><ComputerPlanCard plan={plan} /></div>
+        const worker = parseComputerWorkerResult(segment.content)
+        if (worker) return <div key={`text:${segment.id}`} data-transcript-segment="text"><ComputerWorkerResultCard result={worker} /></div>
+        return <div key={`text:${segment.id}`} data-transcript-segment="text"><TranscriptMarkdown content={segment.content} streaming={message.streaming && index === segments.length - 1} />{!message.streaming && <DocumentReferenceCards content={segment.content} basePath={documentBasePath} onOpenDocument={onOpenDocument} />}</div>
+      }
       const groupTools = segment.activities.flatMap(activity => activity.type === 'tool' ? [activity.tool] : [])
       const hasThinking = segment.activities.some(activity => activity.type === 'thinking')
       const groupRunning = running && index === lastStepsIndex
       return <ActivityCard key={stepsKey(index)} summary={toolRunSummary(segment.activities.length, hasThinking ? 'Thinking' : null, groupTools)} running={groupRunning} error={failed && !running && index === lastStepsIndex} meta={failed && !running && index === lastStepsIndex ? '失败' : undefined} defaultExpanded={stepsExpanded}>{segment.activities.map((activity, activityIndex) => {
-        const live = Boolean(message.streaming && index === lastStepsIndex && activityIndex === segment.activities.length - 1 && !activeTool && (activity.type === 'thinking' || !activity.tool.finished))
-        if (activity.type === 'thinking') return <ActivityCard key={`thinking:${activity.id}`} kind="thinking" label="Thinking" summary="Thinking" meta={`${formatCompactTokens(Math.round(activity.content.length / 4))} tokens`} running={live} defaultExpanded={false}><p>{activity.content}</p></ActivityCard>
+        const pendingThinking = activity.type === 'thinking' && activity.id === PENDING_THINKING_ID
+        const live = Boolean(message.streaming && index === lastStepsIndex && !activeTool && (
+          activity.type === 'thinking'
+            ? pendingThinking || activityIndex === segment.activities.length - 1
+            : !activity.tool.finished
+        ))
+        if (activity.type === 'thinking') return <ActivityCard key={`thinking:${activity.id}`} kind="thinking" label="Thinking" summary="Thinking" meta={`${formatCompactTokens(estimateTokens(activity.charCount ?? activity.content.length))} tokens`} running={live} defaultExpanded={live}><p>{activity.content || (live ? '模型正在思考…' : '')}</p></ActivityCard>
         const projection = liveByTool.get(activity.tool.id)
-        return activity.tool.name === 'subagent' && projection && projection.totalCount > 0 ? <LiveSubagentCard key={`tool:${activity.tool.id}`} projection={projection} onOpenSubagents={onOpenSubagents} /> : <TranscriptToolCard key={`tool:${activity.tool.id}`} tool={activity.tool} streaming={live} />
+        if (activity.tool.name === 'computer_task' && activity.tool.finished && activity.tool.result) {
+          const computerResult = parseComputerTaskResult(activity.tool.result)
+          if (computerResult) return <ComputerTaskResultCard
+            key={`tool:${activity.tool.id}`}
+            result={computerResult}
+            goal={computerTaskGoalFromInput(activity.tool.input)}
+            raw={activity.tool.result}
+            elapsed={elapsed(activity.tool.startedAt, activity.tool.finishedAt ?? activity.tool.startedAt)}
+            onOpenSubagents={onOpenSubagents}
+          />
+        }
+        return liveProjectable(activity.tool) && projection && projection.totalCount > 0
+          ? <LiveSubagentCard key={`tool:${activity.tool.id}`} projection={projection} onOpenSubagents={onOpenSubagents} title={activity.tool.name === 'computer_task' ? '桌面任务' : undefined} />
+          : <TranscriptToolCard key={`tool:${activity.tool.id}`} tool={activity.tool} streaming={live} />
       })}</ActivityCard>
     })}
     {activeTool && <ActiveToolCard key={`active-tool:${activeTool.tool.id}`} tool={activeTool.tool} />}

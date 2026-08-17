@@ -93,3 +93,37 @@ describe('ProviderLoginPanel provider catalog loading', () => {
     expect(screen.queryByTestId('provider-add-empty')).toBeNull()
   })
 })
+
+describe('ProviderLoginPanel OpenAI-compatible form', () => {
+  it('renders the custom form above official providers', async () => {
+    render(<ProviderLoginPanel host={providerHost()} onAdded={vi.fn()} />)
+    await screen.findByTestId('provider-row-github-copilot')
+    const root = screen.getByTestId('provider-add')
+    const first = root.querySelector('[data-testid]')
+    expect(first?.getAttribute('data-testid')).toBe('provider-compat')
+    expect(screen.getByLabelText('名称')).toBeTruthy()
+    expect(screen.getByLabelText('URL')).toBeTruthy()
+    expect(screen.getByLabelText('Key')).toBeTruthy()
+    expect(screen.getByLabelText('模型 id')).toBeTruthy()
+  })
+
+  it('saves via host.addOpenAICompatibleProvider and notifies onAdded', async () => {
+    const addOpenAICompatibleProvider = vi.fn(async () => ({ providerId: 'my-proxy' }))
+    const onAdded = vi.fn()
+    render(<ProviderLoginPanel host={providerHost({ addOpenAICompatibleProvider })} onAdded={onAdded} />)
+    await screen.findByTestId('provider-row-github-copilot')
+    fireEvent.change(screen.getByTestId('provider-compat-name'), { target: { value: 'My Proxy' } })
+    fireEvent.change(screen.getByTestId('provider-compat-url'), { target: { value: 'https://proxy.example/v1' } })
+    fireEvent.change(screen.getByTestId('provider-compat-key'), { target: { value: 'sk-test' } })
+    fireEvent.change(screen.getByTestId('provider-compat-model'), { target: { value: 'gpt-4o-mini' } })
+    fireEvent.click(screen.getByTestId('provider-compat-save'))
+    await act(async () => { await Promise.resolve() })
+    expect(addOpenAICompatibleProvider).toHaveBeenCalledWith({
+      name: 'My Proxy',
+      baseUrl: 'https://proxy.example/v1',
+      apiKey: 'sk-test',
+      modelId: 'gpt-4o-mini',
+    })
+    expect(onAdded).toHaveBeenCalledTimes(1)
+  })
+})

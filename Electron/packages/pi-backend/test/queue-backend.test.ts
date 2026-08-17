@@ -126,6 +126,25 @@ describe("PiHostBackend message queue integration", () => {
     await backend.close();
   });
 
+  it("announces a drained queue prompt on the next started so the UI does not treat it as a ghost", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const events: any[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream" && event.event.type === "status") events.push(event.event);
+    });
+    expect(await backend.handle("sendPrompt", ["s1", "__hold__"])).toMatchObject({ outcome: "direct" });
+    const queued = await backend.handle("enqueueMessage", ["s1", "继续"]) as any;
+    expect(queued).toMatchObject({ outcome: "queued", message: { text: "继续" } });
+    await backend.handle("stop", ["s1"]);
+    await eventually(() => events.some(event =>
+      event.status === "started" && event.pendingFollowUps?.includes("继续"),
+    ));
+    off();
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([]);
+    await backend.close();
+  });
+
   it("does not emit status:streaming for a late pi queue_update after settle", async () => {
     const setup = await fixture();
     const backend = setup.create();
@@ -165,6 +184,78 @@ describe("PiHostBackend message queue integration", () => {
         pendingFollowUps: ["[subagent-done] agentId=a1 name=explore ok=true"],
       }),
     ]));
+    await backend.close();
+  });
+
+  it("does not surface already-processing when a stale settle drains into a live turn", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    expect(await backend.handle("sendPrompt", ["s1", "__hold__"])).toMatchObject({ outcome: "direct" });
+    const queued = await backend.handle("enqueueMessage", ["s1", "hello after settle"]) as any;
+    expect(queued).toMatchObject({ outcome: "queued", message: { state: "queued" } });
+
+    await (backend as any).queueIdle("s1");
+    await eventually(() => {
+      const items = (backend as any).queue.listQueue("s1");
+      return items.length === 0 || items.some((item: any) => item.state === "failed");
+    });
+
+    const items = await backend.handle("listQueue", ["s1"]) as any[];
+    expect(items.some(item => String(item.error ?? "").includes("already processing"))).toBe(false);
+    expect(items).toEqual([]);
+    await backend.close();
+  });
+
+  it("streams a hidden-display subagent completion custom_message as user_message", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const events: any[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream") events.push(event.event);
+    });
+    await backend.handle("sendPrompt", ["s1", "__custom_followup__"]);
+    await eventually(() => events.some(event => event.type === "user_message"));
+    off();
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "user_message",
+        sessionId: "s1",
+        content: "[subagent-done] agentId=a1 name=explore ok=true",
+      }),
+      expect.objectContaining({
+        type: "status",
+        sessionId: "s1",
+        status: "started",
+        pendingFollowUps: ["[subagent-done] agentId=a1 name=explore ok=true"],
+      }),
+    ]));
+    await backend.close();
+  });
+
+  it("emits settled when the Pi child exits mid-turn without agent_settled", async () => {
+    const setup = await fixture();
+    const children: ReturnType<typeof spawn>[] = [];
+    const backend = createPiHostBackend({
+      agentDir: setup.agentDir,
+      sessionsRoot: setup.sessionsRoot,
+      runtimeRoot: root,
+      piPath: process.execPath,
+      spawn: (_bin, _args, options) => {
+        const child = spawn(process.execPath, [new URL("./fake-pi.mjs", import.meta.url).pathname], options);
+        children.push(child);
+        return child as any;
+      },
+    });
+    const events: any[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream" && event.event.type === "status") events.push(event.event);
+    });
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    await eventually(() => events.some(event => event.status === "started"));
+    children[0].kill("SIGKILL");
+    await eventually(() => events.some(event => event.status === "settled" || event.status === "stopped"));
+    off();
+    expect(events.some(event => event.status === "settled")).toBe(true);
     await backend.close();
   });
 });

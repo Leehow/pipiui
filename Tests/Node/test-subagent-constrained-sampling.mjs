@@ -105,7 +105,7 @@ const abort = abortMatching[0];
 const resolve = resolveMatching[0];
 const status = statusMatching[0];
 if (!subagent) throw new Error("subagent tool was not registered");
-if (!parallel) throw new Error("subagent_parallel tool was not registered");
+if (parallel) throw new Error("subagent_parallel must not be registered");
 if (!chain) throw new Error("subagent_chain tool was not registered");
 if (!abort) throw new Error("subagent_abort tool was not registered");
 if (!resolve) throw new Error("subagent_resolve tool was not registered");
@@ -133,7 +133,7 @@ const probe = stream(
   },
   {
     messages: [{ role: "user", content: "probe", timestamp: Date.now() }],
-    tools: [subagent, parallel],
+    tools: [subagent],
   },
   {
     apiKey: "local-probe-no-network",
@@ -169,7 +169,7 @@ const deepseekProbe = stream(
   },
   {
     messages: [{ role: "user", content: "probe", timestamp: Date.now() }],
-    tools: [subagent, parallel],
+    tools: [subagent],
   },
   {
     apiKey: "local-probe-no-network",
@@ -205,7 +205,7 @@ const codexProbe = streamCodex(
   },
   {
     messages: [{ role: "user", content: "probe", timestamp: Date.now() }],
-    tools: [subagent, parallel],
+    tools: [subagent],
   },
   {
     apiKey: fakeCodexJwt,
@@ -222,26 +222,19 @@ for await (const _event of codexProbe) {
 const serialized = payload?.tools?.find(
   (entry) => entry.type === "function" && entry.function?.name === "subagent",
 );
-const serializedParallel = payload?.tools?.find(
-  (entry) => entry.type === "function" && entry.function?.name === "subagent_parallel",
-);
 const deepseekSerialized = deepseekPayload?.tools?.find(
   (entry) => entry.type === "function" && entry.function?.name === "subagent",
 );
 const parameters = serialized?.function?.parameters;
-const parallelParameters = serializedParallel?.function?.parameters;
 const deepseekParameters = deepseekSerialized?.function?.parameters;
 const codexSerialized = codexPayload?.tools?.find(
   (entry) => entry.type === "function" && entry.name === "subagent",
 );
-const codexSerializedParallel = codexPayload?.tools?.find(
-  (entry) => entry.type === "function" && entry.name === "subagent_parallel",
-);
 const codexParameters = codexSerialized?.parameters;
-const codexParallelParameters = codexSerializedParallel?.parameters;
 const branches = parameters?.anyOf;
-const taskSchema = parallelParameters?.properties?.tasks?.items;
 const chainParameters = chain.parameters;
+const chainItemSchema = chainParameters?.properties?.chain?.items;
+const chainItemProperties = chainItemSchema?.properties ?? {};
 const abortParameters = abort.parameters;
 const resolveParameters = resolve.parameters;
 const statusParameters = status.parameters;
@@ -323,23 +316,45 @@ const singleResult = await executeTool(
   { agent: "probe", task: "inspect the single path", agentId: "deepseek-single-probe" },
   "single-dispatch-probe",
 );
-const chainResult = await executeTool(
-  chain,
-  { chain: [{ agent: "probe", task: "inspect the chain path", agentId: "deepseek-chain-probe" }] },
-  "chain-dispatch-probe",
+// Legacy old-name chain payload (GLM / replayed history style) must survive the
+// prepareArguments sanitizer: it has to come out speaking the public prompt/description
+// schema (or validation would reject it) and still dispatch.
+const chainPreparedLegacy = chain.prepareArguments({
+  chain: [{ agent: "probe", task: "inspect the chain path", agentId: "deepseek-chain-probe" }],
+});
+const chainLegacyItem = chainPreparedLegacy?.chain?.[0] ?? {};
+const chainResult = await executeTool(chain, chainPreparedLegacy, "chain-dispatch-probe");
+// Grok Build spelling is the advertised contract; it must pass through unchanged.
+const chainPreparedGrok = chain.prepareArguments({
+  chain: [
+    {
+      prompt: "inspect the grok chain path",
+      description: "grok chain probe",
+      subagent_type: "probe",
+      isolation: "none",
+    },
+  ],
+});
+const chainGrokItem = chainPreparedGrok?.chain?.[0] ?? {};
+const grokChainResult = await executeTool(chain, chainPreparedGrok, "grok-chain-dispatch-probe");
+function itemConformsToChainSchema(item) {
+  const keys = Object.keys(item);
+  const withinSchema = keys.every((key) => Boolean(chainItemProperties[key]));
+  const required = (chainItemSchema?.required ?? []).every(
+    (key) => typeof item[key] === "string" && item[key].length > 0,
+  );
+  return withinSchema && required;
+}
+const grokSingleResult = await executeTool(
+  subagent,
+  {
+    prompt: "inspect the grok path",
+    description: "grok probe",
+    subagent_type: "probe",
+    resume_from: "grok-single-probe",
+  },
+  "grok-dispatch-probe",
 );
-const parallelWrapperResult = await parallel.execute(
-  "parallel-wrapper-probe",
-  { tasks: [
-    { task: "inspect first slice", agent: "probe" },
-    { task: "inspect second slice", agent: "probe" },
-  ] },
-  new AbortController().signal,
-  undefined,
-  { cwd: process.cwd(), hasUI: false },
-);
-const dispatchedResults = parallelWrapperResult?.details?.results ?? [];
-const generatedIds = dispatchedResults.map((result) => result.agentId);
 const subagentRequired = parameters?.required ?? subagent.parameters?.required ?? [];
 process.stdout.write(JSON.stringify({
   registrationCount: matching.length,
@@ -348,7 +363,6 @@ process.stdout.write(JSON.stringify({
   abortRegistrationCount: abortMatching.length,
   resolveRegistrationCount: resolveMatching.length,
   constrainedSampling: subagent.constrainedSampling ?? null,
-  parallelConstrainedSampling: parallel.constrainedSampling ?? null,
   prepareArgumentsPresent: typeof subagent.prepareArguments === "function",
   serializedRootType: parameters?.type ?? null,
   serializedRootUnionBranches: Array.isArray(branches) ? branches.length : 0,
@@ -360,10 +374,13 @@ process.stdout.write(JSON.stringify({
   advertisesTasks: Boolean(parameters?.properties?.tasks),
   advertisesRunId: Boolean(parameters?.properties?.runId),
   oldSubagentAdvertisesTasks: Boolean(parameters?.properties?.tasks),
-  serializedParallelRootType: parallelParameters?.type ?? null,
-  serializedParallelRequired: parallelParameters?.required ?? null,
-  serializedTaskRequired: taskSchema?.required ?? null,
   chainRequired: chainParameters?.required ?? null,
+  chainItemPropertyNames: Object.keys(chainItemProperties),
+  chainItemRequired: chainItemSchema?.required ?? null,
+  chainItemAdvertisesOldNames: ["task", "title", "agent", "worktree", "noWorktreeReason"]
+    .filter((key) => Boolean(chainItemProperties[key])),
+  legacyChainPreparedConforms: itemConformsToChainSchema(chainLegacyItem),
+  grokChainPreparedConforms: itemConformsToChainSchema(chainGrokItem),
   abortRequired: abortParameters?.required ?? null,
   resolveRequired: resolveParameters?.required ?? null,
   statusRequired: statusParameters?.required ?? [],
@@ -388,17 +405,12 @@ process.stdout.write(JSON.stringify({
   mixedModesRejected: mixedModeResult?.content?.[0]?.text?.startsWith("Invalid parameters.") === true,
   singleDispatches: singleResult?.details?.results?.length === 1 &&
     singleResult.details.results[0]?.exitCode === 0,
+  grokFieldDispatches: grokSingleResult?.details?.results?.length === 1 &&
+    grokSingleResult.details.results[0]?.exitCode === 0,
   chainDispatches: chainResult?.details?.results?.length === 1 &&
     chainResult.details.results[0]?.exitCode === 0,
-  wrapperDispatchesWithoutSelfCollision:
-    parallelWrapperResult?.isError !== true &&
-    dispatchedResults.length === 2 &&
-    dispatchedResults.every((result) => result.exitCode === 0),
-  wrapperPreservesRequiredTasks: dispatchedResults.map((result) => result.task),
-  wrapperGeneratedUniqueAgentIds:
-    generatedIds.length === 2 &&
-    new Set(generatedIds).size === 2 &&
-    generatedIds.every((id) => /^agent-[0-9a-f]{16}$/.test(id)),
+  grokChainDispatches: grokChainResult?.details?.results?.length === 1 &&
+    grokChainResult.details.results[0]?.exitCode === 0,
 }));
 `,
     "utf8",
@@ -442,12 +454,11 @@ test("both runtime copies register split subagent tools with slim required field
 
   const expected = {
     registrationCount: 1,
-    parallelRegistrationCount: 1,
+    parallelRegistrationCount: 0,
     chainRegistrationCount: 1,
     abortRegistrationCount: 1,
     resolveRegistrationCount: 1,
     constrainedSampling: null,
-    parallelConstrainedSampling: null,
     // The pre-validation sanitizer must be attached: pi validates arguments
     // before execute(), and null fillers (`action: null`) would otherwise loop
     // the turn on "root: must not have additional properties".
@@ -456,30 +467,42 @@ test("both runtime copies register split subagent tools with slim required field
     serializedRootUnionBranches: 0,
     serializedRootAdditionalProperties: false,
     serializedRootPropertyNames: [
-      "agent",
-      "task",
-      "title",
-      "blockedBy",
-      "thinking",
-      "agentId",
-      "fresh",
+      "prompt",
+      "description",
+      "subagent_type",
+      "run_in_background",
+      "isolation",
       "cwd",
-      "verify",
-      "desktop",
-      "agentScope",
-      "confirmProjectAgents",
-      "background",
+      "resume_from",
     ],
-    serializedRequired: ["agent", "task"],
+    serializedRequired: ["prompt", "description"],
     advertisesAction: false,
     advertisesChain: false,
     advertisesTasks: false,
     advertisesRunId: false,
     oldSubagentAdvertisesTasks: false,
-    serializedParallelRootType: "object",
-    serializedParallelRequired: ["tasks"],
-    serializedTaskRequired: ["task", "agent"],
     chainRequired: ["chain"],
+    // Chain items must advertise only the Grok Build / Claude-family dispatch names.
+    // Grok 4.6 provably cannot emit a required long field named `task` on this tool
+    // (2026-08-15 live probes: 0/5 with task, 6/6 with prompt); old names stay
+    // sanitizer-only.
+    chainItemPropertyNames: [
+      "prompt",
+      "description",
+      "subagent_type",
+      "agentId",
+      "cwd",
+      "verify",
+      "thinking",
+      "isolation",
+      "heartbeatSecs",
+      "timeoutSecs",
+      "desktop",
+    ],
+    chainItemRequired: ["prompt", "description"],
+    chainItemAdvertisesOldNames: [],
+    legacyChainPreparedConforms: true,
+    grokChainPreparedConforms: true,
     abortRequired: ["agentId"],
     resolveRequired: ["agentId", "runId"],
     statusRequired: [],
@@ -493,10 +516,9 @@ test("both runtime copies register split subagent tools with slim required field
     invalidSingleRejected: true,
     mixedModesRejected: true,
     singleDispatches: true,
+    grokFieldDispatches: true,
     chainDispatches: true,
-    wrapperDispatchesWithoutSelfCollision: true,
-    wrapperPreservesRequiredTasks: ["inspect first slice", "inspect second slice"],
-    wrapperGeneratedUniqueAgentIds: true,
+    grokChainDispatches: true,
   };
   for (const probe of probes) {
     assert.deepEqual(probe.result, expected, probe.source);

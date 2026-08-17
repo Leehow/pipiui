@@ -133,6 +133,27 @@ describe("provider auth via pi ModelRuntime bridge", () => {
     expect(state).toMatchObject({ model: { provider: "openai", id: "o1" } });
   });
 
+  it("persists an OpenAI-compatible custom provider into models.json and lists its model", async () => {
+    root = await tempAgent();
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    const saved = await backend.handle("addOpenAICompatibleProvider", [{
+      name: "My Proxy",
+      baseUrl: "https://proxy.example/v1",
+      apiKey: "sk-literal",
+      modelId: "gpt-4o-mini",
+    }]) as { providerId: string };
+    expect(saved.providerId).toBe("my-proxy");
+    const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    expect(disk.providers["my-proxy"]).toMatchObject({
+      api: "openai-completions",
+      baseUrl: "https://proxy.example/v1",
+      apiKey: "sk-literal",
+      models: [{ id: "gpt-4o-mini", name: "gpt-4o-mini", reasoning: true }],
+    });
+    const models = await backend.handle("listModels", []) as { provider: string; id: string }[];
+    expect(models.map(model => `${model.provider}/${model.id}`)).toContain("my-proxy/gpt-4o-mini");
+  });
+
   it("keeps an env-configured model available when its provider credentials are removed", async () => {
     root = await tempAgent();
     await writeFile(join(root, "models.json"), JSON.stringify({ providers: { openai: { apiKey: "$OPENAI_KEY", models: [{ id: "o1", name: "O1", reasoning: true }] } } }));

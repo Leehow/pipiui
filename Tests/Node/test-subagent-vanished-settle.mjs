@@ -72,9 +72,9 @@ async function prepareHooksModule(directory) {
   );
   // Terminal reports use postPipiuiReport directly. In this isolated no-bridge harness,
   // route that deliberate no-op through the patched in-memory reporter as well.
-  const bridgeNoop = "if (!PIPIUI_PORT) return;";
+  const bridgeNoop = "if (!PIPIUI_PORT) return true;";
   assert.ok(src.includes(bridgeNoop), "postPipiuiReport no-bridge guard must be patchable");
-  src = src.replace(bridgeNoop, "if (!PIPIUI_PORT) { pipiuiReport(payload); return; }");
+  src = src.replace(bridgeNoop, "if (!PIPIUI_PORT) { pipiuiReport(payload); return true; }");
 
   src += `
 

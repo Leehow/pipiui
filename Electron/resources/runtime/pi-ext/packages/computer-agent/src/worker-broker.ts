@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+// @ts-ignore -- the bundled runtime executes TypeScript directly; keep its explicit runtime extension.
 import { validateDesktopActions } from "./desktop-actions.ts";
 
 export type ComputerWorkerRole = "gui-operator" | "terminal-worker" | "verifier";
@@ -38,6 +39,7 @@ type GrantRecord = {
 	busy: boolean;
 	fatalCode?: ComputerWorkerFatalCode;
 	consecutiveObservations: number;
+  requiresFreshObservation: boolean;
   noProgress?: {
     signature: string;
     fingerprint: string;
@@ -128,6 +130,7 @@ export class ComputerWorkerBroker {
       controllers: new Set(),
 				busy: false,
 		consecutiveObservations: 0,
+      requiresFreshObservation: false,
     });
     return {
       token,
@@ -180,7 +183,17 @@ export class ComputerWorkerBroker {
       grant.bindings.set(bindingId, { role: matches[0].role, nameLiteral: matches[0].name });
       return { status: "resolved", bindingId, match: matches[0] };
     }
-	    if (request.operation === "mutate") validateDesktopActions(request.payload.actions);
+    if (request.operation === "mutate") {
+      validateDesktopActions(request.payload.actions);
+      const actions = request.payload.actions as Array<Record<string, unknown>>;
+      const mutationIndexes = actions.flatMap((action, index) => ["wait", "screenshot"].includes(String(action.type)) ? [] : [index]);
+      if (mutationIndexes.length > 1 || (mutationIndexes.length === 1 && actions.slice(mutationIndexes[0] + 1).some((action) => action.type !== "wait"))) {
+        throw new Error("one_state_mutation_per_observation: split the batch and call desktop_observe between mutations");
+      }
+      if (grant.requiresFreshObservation) {
+        throw new Error("fresh_observation_required_after_mutation: call desktop_observe with fresh=true before another UI mutation");
+      }
+    }
     const signature = request.operation === "mutate" ? mutationSignature(request.payload.actions) : undefined;
     if (request.operation === "mutate" && grant.noProgress?.requiresObserve) {
       throw new Error("no_progress_requires_fresh_observation: observe and replan before another UI mutation");
@@ -209,12 +222,13 @@ export class ComputerWorkerBroker {
 		if (grant.busy) throw new Error("computer_worker_request_in_progress");
 		grant.busy = true;
     grant.controllers.add(controller);
+    if (request.operation === "mutate" || request.operation === "openApplication") grant.requiresFreshObservation = true;
     let timedOut = false;
     let callerAborted = false;
     const abort = () => { callerAborted = true; controller.abort(); };
     signal?.addEventListener("abort", abort, { once: true });
     const beforeFingerprint = observationFingerprint(grant.lastObservation);
-			let timeout: ReturnType<typeof setTimeout>;
+			let timeout: ReturnType<typeof setTimeout> | undefined;
 			const deadline = new Promise<never>((_resolve, reject) => {
 				timeout = setTimeout(() => {
 					timedOut = true;
@@ -242,7 +256,7 @@ export class ComputerWorkerBroker {
 					throw new Error(fatalCode);
 				}
 				throw error;
-			} finally { clearTimeout(timeout); grant.busy = false; grant.controllers.delete(controller); signal?.removeEventListener("abort", abort); }
+			} finally { if (timeout) clearTimeout(timeout); grant.busy = false; grant.controllers.delete(controller); signal?.removeEventListener("abort", abort); }
     const observationId = String((result as any).observationId ?? (result as any).screenshotId ?? "");
     const observedAt = new Date().toISOString();
     if (request.operation === "observe" && grant.noProgress) {
@@ -253,6 +267,7 @@ export class ComputerWorkerBroker {
         grant.noProgress.exhausted = true;
       }
     }
+		if (request.operation === "observe" && request.payload.fresh !== false) grant.requiresFreshObservation = false;
 	    if (["observe", "mutate", "openApplication"].includes(request.operation)) grant.lastObservation = result;
 		if (request.operation === "mutate" || request.operation === "openApplication") grant.consecutiveObservations = 0;
     if (request.operation === "mutate" && signature) {

@@ -60,6 +60,12 @@ async function linkRuntimePackages(directory) {
 
 async function prepareHarness(directory) {
   await cp(sourceSubagentDirectory, join(directory, "subagent"), { recursive: true });
+  // subagent/index.ts statically imports ../packages/computer-agent/*.
+  await cp(
+    join(sourceSubagentDirectory, "../packages/computer-agent"),
+    join(directory, "packages/computer-agent"),
+    { recursive: true },
+  );
   await linkRuntimePackages(directory);
 
   const agentsDirectory = join(directory, "agents");
@@ -231,7 +237,9 @@ test("single, tasks, and chain dispatches append structured stats records", asyn
       },
       {
         agent: "probe",
-        title: null,
+        // Chain items now require a description (Grok Build contract); the sanitizer
+        // derives it from the brief for legacy steps, and it lands in stats as the title.
+        title: chainBriefs[1],
         brief_chars: chainBriefs[1].length,
         brief_items: 1,
       },

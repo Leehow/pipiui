@@ -69,6 +69,12 @@ async function linkRuntimePackages(directory) {
 
 async function prepareAgents(directory) {
   await cp(sourceSubagentDirectory, join(directory, "subagent"), { recursive: true });
+  // subagent/index.ts statically imports ../packages/computer-agent/*.
+  await cp(
+    join(sourceSubagentDirectory, "../packages/computer-agent"),
+    join(directory, "packages/computer-agent"),
+    { recursive: true },
+  );
   await linkRuntimePackages(directory);
 
   const agentsDirectory = join(directory, "agents");

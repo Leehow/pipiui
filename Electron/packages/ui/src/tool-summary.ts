@@ -69,12 +69,22 @@ function subagentSummary(args: Record<string, unknown>): string {
   return compact.length <= MAX_PROMPT ? compact : `${compact.slice(0, MAX_PROMPT)}…`
 }
 
+/** `computer_task` → the natural-language goal, so the folded card says what the desktop task is. */
+function computerTaskSummary(args: Record<string, unknown>): string {
+  const goal = stringField(args, 'goal')
+  if (!goal) return '…'
+  const compact = goal.replace(/\s+/g, ' ').trim()
+  return compact.length <= MAX_PROMPT ? compact : `${compact.slice(0, MAX_PROMPT)}…`
+}
+
 function summarizeArgs(name: string, args: Record<string, unknown>): string {
   switch (name) {
     case 'write':
     case 'edit':
       return pathSummary(args)
     case 'generate_image':
+    case 'image_gen':
+    case 'image_edit':
       return promptSummary(args)
     case 'web_search':
     case 'browser_search':
@@ -101,6 +111,8 @@ function summarizeArgs(name: string, args: Record<string, unknown>): string {
       return grepSummary(args)
     case 'subagent':
       return subagentSummary(args)
+    case 'computer_task':
+      return computerTaskSummary(args)
     default:
       return legacySummary(args)
   }
@@ -119,7 +131,7 @@ function truncate(text: string): string {
 }
 
 /** Extract `"key":"value"` from a partial/truncated/escaped JSON string. */
-function scrapeJSONString(key: string, text: string): string | undefined {
+export function scrapeJSONString(key: string, text: string): string | undefined {
   const needle = `"${key}"`
   const start = text.indexOf(needle)
   if (start < 0) return undefined
@@ -145,6 +157,22 @@ function scrapeJSONString(key: string, text: string): string | undefined {
     i += 1
   }
   return out.length > 0 ? out : undefined
+}
+
+/** Every `"key":"…"` occurrence (truncated values included). */
+export function scrapeJSONStringAll(key: string, text: string): string[] {
+  const values: string[] = []
+  let rest = text
+  while (rest.length > 0) {
+    const value = scrapeJSONString(key, rest)
+    if (value === undefined) break
+    values.push(value)
+    const needle = `"${key}"`
+    const at = rest.indexOf(needle)
+    if (at < 0) break
+    rest = rest.slice(at + needle.length + 1)
+  }
+  return values
 }
 
 /** Undo common JSON escapes (`\"` → `"`, `\\` → `\`) for doubly-escaped log args. */
@@ -201,12 +229,16 @@ function scrapeFields(name: string, text: string): string | undefined {
     case 'fetch_content':
     case 'browser_fetch':
       return scrapeJSONString('url', text)
-    case 'generate_image': {
+    case 'generate_image':
+    case 'image_gen':
+    case 'image_edit': {
       const prompt = scrapeJSONString('prompt', text)
       return prompt == null ? undefined : truncate(prompt)
     }
     case 'subagent':
       return scrapeJSONString('title', text) ?? scrapeJSONString('task', text)
+    case 'computer_task':
+      return scrapeJSONString('goal', text)
     default:
       return scrapeJSONString('path', text)
         ?? scrapeJSONString('file_path', text)

@@ -21,12 +21,25 @@ function projectHost(overrides: Partial<PipiHostAPI>): PipiHostAPI {
   let durable: Project[] = [{ id: 'existing', name: 'existing', path: '/Users/demo/existing' }]
   const listProjects = vi.fn(async () => durable.map(project => ({ ...project })))
   const getProjectPaths = vi.fn(async () => durable.map(project => project.path))
+  const listSessions = vi.fn(async (projectId: string) => projectId === 'existing'
+    ? [{ id: 'existing-session', projectId, name: 'existing 会话', updatedAt: Date.now() }]
+    : [])
   const addProject = vi.fn(async (path: string) => {
     const project = { id: path.split('/').pop() ?? path, name: path.split('/').pop() ?? path, path }
     durable = [...durable, project]
     return project
   })
-  return { ...createMockHost(), listProjects, getProjectPaths, addProject, ...overrides }
+  return { ...createMockHost(), listProjects, getProjectPaths, listSessions, addProject, ...overrides }
+}
+
+function emptyHost(overrides: Partial<PipiHostAPI> = {}): PipiHostAPI {
+  return {
+    ...createMockHost(),
+    listProjects: vi.fn(async () => []),
+    listSessions: vi.fn(async () => []),
+    probeGitBinary: vi.fn(async () => true),
+    ...overrides
+  }
 }
 
 describe('add-project silent git setup', () => {
@@ -85,30 +98,52 @@ describe('add-project silent git setup', () => {
   })
 })
 
-describe('first-run model onboarding', () => {
-  it('opens the model manager into the add-provider pane when no model is configured', async () => {
-    const host: PipiHostAPI = { ...createMockHost(), listModels: vi.fn(async () => []) }
-    render(<App host={host} />)
+describe('empty setup guide', () => {
+  it('does not auto-open the model manager, and makes 添加 API Key the empty-page action', async () => {
+    render(<App host={emptyHost({ listModels: vi.fn(async () => []) })} />)
+    expect(await screen.findByTestId('empty-setup')).toBeTruthy()
+    await waitFor(() => expect(screen.queryByTestId('model-modal')).toBeNull())
+    expect(screen.queryByTestId('chat-composer-stack')).toBeNull()
+    fireEvent.click(await screen.findByRole('button', { name: '添加 API Key' }))
     expect(await screen.findByTestId('provider-add')).toBeTruthy()
-    expect(screen.queryByTestId('model-add-button')).toBeNull() // add view, not manage view
   })
 
-  it('stays closed when the catalog has models', async () => {
+  it('asks for a project once models exist, then creates a real session after the first add', async () => {
+    let durable: Project[] = []
+    const newSession = vi.fn(async (projectId: string, name = '新会话') => ({ id: 'auto-session', projectId, name, updatedAt: Date.now() }))
+    const host = emptyHost({
+      listProjects: vi.fn(async () => durable.map(project => ({ ...project }))),
+      getProjectPaths: vi.fn(async () => durable.map(project => project.path)),
+      addProject: vi.fn(async (path: string) => {
+        const project = { id: 'first', name: 'first', path }
+        durable = [project]
+        return project
+      }),
+      pickProjectDirectory: vi.fn(async () => '/Users/demo/first'),
+      newSession
+    })
+    render(<App host={host} />)
+    fireEvent.click(await screen.findByTestId('empty-setup-action'))
+    await waitFor(() => expect(host.addProject).toHaveBeenCalledWith('/Users/demo/first'))
+    await waitFor(() => expect(newSession).toHaveBeenCalledWith('first'))
+    await waitFor(() => expect(screen.queryByTestId('empty-setup')).toBeNull())
+    expect(screen.getByTestId('chat-composer-stack')).toBeTruthy()
+  })
+
+  it('keeps a populated workspace on the transcript instead of the setup guide', async () => {
     render(<App host={createMockHost()} />)
     await screen.findByText('Electron 三栏界面')
+    expect(screen.queryByTestId('empty-setup')).toBeNull()
     await waitFor(() => expect(screen.queryByTestId('model-modal')).toBeNull())
   })
 
-  it('respects an explicit close while still model-less across remounts', async () => {
-    const host: PipiHostAPI = { ...createMockHost(), listModels: vi.fn(async () => []) }
-    const first = render(<App host={host} />)
-    fireEvent.click(await screen.findByLabelText('关闭设置'))
-    await waitFor(() => expect(screen.queryByTestId('model-modal')).toBeNull())
-    expect(localStorage.getItem('pipiui:model-onboarding-dismissed')).toBe('1')
-    first.unmount()
+  it('shows the Git tip only when probeGitBinary reports missing', async () => {
+    const { unmount } = render(<App host={emptyHost({ probeGitBinary: vi.fn(async () => false) })} />)
+    expect((await screen.findByTestId('empty-setup-git')).textContent).toContain('安装 Git')
+    unmount()
 
-    render(<App host={host} />)
-    await screen.findByText('Electron 三栏界面')
-    await waitFor(() => expect(screen.queryByTestId('model-modal')).toBeNull())
+    render(<App host={emptyHost({ probeGitBinary: vi.fn(async () => { throw new Error('probe failed') }) })} />)
+    await screen.findByTestId('empty-setup')
+    await waitFor(() => expect(screen.queryByTestId('empty-setup-git')).toBeNull())
   })
 })

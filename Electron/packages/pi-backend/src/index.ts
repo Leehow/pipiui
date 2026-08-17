@@ -50,7 +50,7 @@ import {
 } from "./spawn-assembly.js";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
 import { LeaseManager } from "./lease.js";
-import { checkoutBranch, initGit, probeGit } from "./git.js";
+import { checkoutBranch, initGit, probeGit, probeGitBinary } from "./git.js";
 import { HostBridge } from "./bridge.js";
 import { DEFAULT_FEATURES } from "./features.js";
 import { ProviderAuthBackend, type AuthRuntimeLike } from "./provider-auth.js";
@@ -210,6 +210,7 @@ export {
   parsePorcelain,
   parseUpstreamCounts,
   probeGit,
+  probeGitBinary,
   validateBranchName,
 } from "./git.js";
 export {
@@ -365,6 +366,10 @@ type Live = {
     { resolve: (data: any) => void; reject: (e: Error) => void }
   >;
   followUps: string[];
+  /** One-shot text for the next `agent_start` after a PipiUI queue drain.
+   *  Pi's own `followUp` list is empty for a regular prompt, and the UI
+   *  otherwise treats that started as a ghost. */
+  pendingDrainPrompt?: string;
   /** contentIndex → streamed tool-args JSON, assembled from toolcall_delta until toolcall_end. */
   toolArgs: Map<number, string>;
   /** Pi restarts contentIndex at every assistant message; this epoch lets the UI
@@ -384,6 +389,10 @@ type Live = {
    * case may turn an interrupted UI back into a completed one.
    */
   hostAbortedTurn?: boolean;
+  /** Queue turn id from the latest `markBusy`; stale settles must pass this to `queueIdle`. */
+  turnEpoch?: number;
+  /** Turn already projected terminal to renderers; suppresses late duplicate settle evidence. */
+  terminalEpoch?: number;
 };
 const PI_STDERR_TAIL_LIMIT = 16 * 1024;
 /** Matches Swift `SubagentWatchdog.staleThreshold`. */
@@ -413,6 +422,19 @@ const text = (content: any) =>
     : Array.isArray(content)
       ? content.map((p) => p.text ?? p.thinking ?? "").join("")
       : "";
+const SUBAGENT_COMPLETION_CUSTOM_TYPE = "pipiui-subagent-complete-v1";
+function isSubagentCompletion(value: any): boolean {
+  if (!value || typeof value !== "object") return false;
+  return value.customType === SUBAGENT_COMPLETION_CUSTOM_TYPE
+    || value.message?.customType === SUBAGENT_COMPLETION_CUSTOM_TYPE;
+}
+function isVisibleCustomMessage(entry: any): boolean {
+  return entry?.type === "custom_message" && (Boolean(entry.display) || isSubagentCompletion(entry));
+}
+function isAlreadyProcessingError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("already processing") && message.includes("streamingBehavior");
+}
 const SCREENSHOT_MARKER = /\[PIPIUI_COMPUTER_SCREENSHOT:([^\]]+)\]/g;
 /** Extract display text and inline images from a tool-result content payload.
  *  Handles structured `{type:"image"}` parts and resolves computer-use markers
@@ -749,8 +771,10 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
 }
 function visibleHistoryEntry(entry: any): HistoryEntry | undefined {
   if (entry?.type === "message") return historyEntryFromMessage(entry);
-  if (entry?.type === "custom_message" && entry.display) {
-    return { id: entry.id, role: "user", content: text(entry.content), timestamp: asTime(entry.timestamp) };
+  if (isVisibleCustomMessage(entry)) {
+    const content = text(entry.content);
+    if (!content) return undefined;
+    return { id: entry.id, role: "user", content, timestamp: asTime(entry.timestamp) };
   }
   if (entry?.type === "compaction" && entry.summary) {
     return { id: entry.id, role: "assistant", content: entry.summary, timestamp: asTime(entry.timestamp) };
@@ -776,7 +800,7 @@ async function activeVisibleIds(path: string): Promise<string[]> {
       parentId: typeof entry.parentId === "string" ? entry.parentId : null,
       type: String(entry.type ?? ""),
       visible: entry.type === "message"
-        || (entry.type === "custom_message" && Boolean(entry.display))
+        || isVisibleCustomMessage(entry)
         || (entry.type === "compaction" && Boolean(entry.summary)),
       ...(typeof entry.firstKeptEntryId === "string" ? { firstKeptEntryId: entry.firstKeptEntryId } : {}),
     };
@@ -917,6 +941,10 @@ const nonEmpty = (value: any): string | undefined =>
 /** `usage` reports whole counts; 0 is meaningful, but a missing field must not overwrite a known one. */
 const num2 = (value: any): number | undefined =>
   typeof value === "number" && Number.isFinite(value) ? value : undefined;
+const positiveWindow = (value: any): number | undefined => {
+  const n = num2(value);
+  return n !== undefined && n > 0 ? n : undefined;
+};
 /** pi model refs are `provider/id`; `start` may send null before the model resolves. */
 const modelRef = (value: any): string | undefined => nonEmpty(value);
 const providerOf = (ref?: string): string | undefined => {
@@ -1001,12 +1029,13 @@ function sanitizeAttachmentName(
   const safe = base.replace(/[^\w.\-() ]/g, "").trim();
   return safe || fallback;
 }
-type CachedAgentLog = { itemType: string; text: string; name?: string; isError?: boolean; contentIndex?: number };
+type CachedAgentLog = { itemType: string; text: string; name?: string; isError?: boolean; contentIndex?: number; charCount?: number };
 function isCachedAgentLog(value: unknown): value is CachedAgentLog {
   if (!isRecord(value) || typeof value.itemType !== "string" || typeof value.text !== "string") return false;
   if (value.name !== undefined && typeof value.name !== "string") return false;
   if (value.isError !== undefined && typeof value.isError !== "boolean") return false;
   if (value.contentIndex !== undefined && typeof value.contentIndex !== "number") return false;
+  if (value.charCount !== undefined && typeof value.charCount !== "number") return false;
   return true;
 }
 export class PiHostBackend implements HostBackend {
@@ -1085,6 +1114,8 @@ export class PiHostBackend implements HostBackend {
   private runtimeModelsPromise?: Promise<Model[]>;
   private manualModelSelection?: { provider: string; modelId: string };
   private manualModelSelectionLoaded?: Promise<void>;
+  private manualThinkingLevel?: ThinkingLevel;
+  private manualThinkingLevelLoaded?: Promise<void>;
   private hiddenIds: string[] = [];
   private hiddenIdsLoaded?: Promise<void>;
   /** Selected vision model (full "provider/id" ref) mirrored into vision.json for @getpipher/vision. */
@@ -1378,11 +1409,11 @@ export class PiHostBackend implements HostBackend {
     }
     await task;
   }
-  private async queueIdle(id: string): Promise<void> {
+  private async queueIdle(id: string, epoch?: number): Promise<void> {
     if (this.closed) return;
     await this.loadQueue(id);
     await new Promise<void>((resolve) => setImmediate(resolve));
-    if (!this.closed) await this.queue.notifyIdle(id);
+    if (!this.closed) await this.queue.notifyIdle(id, epoch);
   }
   private async enqueueMessage(
     id: string,
@@ -1776,6 +1807,11 @@ export class PiHostBackend implements HostBackend {
             if (live) live.hostAbortedTurn = false;
             throw error;
           }
+          // Stop must stop the whole session, not only the model turn: sweep this
+          // session's background subagents so a late [subagent-done] cannot restart
+          // turns the user already stopped (2026-08-15 receipt storm). The sweep also
+          // arms the extension's host-stop quiet gate via /subagent_abort_all.
+          await this.sweepSessionAgents(sessionId);
           this.stream({
             type: "status",
             sessionId,
@@ -1817,6 +1853,8 @@ export class PiHostBackend implements HostBackend {
         return;
       case "removeProviderCredentials":
         return this.removeProviderCredentials(params[0] as string);
+      case "addOpenAICompatibleProvider":
+        return this.addOpenAICompatibleProvider(params[0]);
       case "getComputerUseState":
         return { enabled: await this.loadComputerUseEnabled() };
       case "setComputerUseEnabled":
@@ -1863,12 +1901,39 @@ export class PiHostBackend implements HostBackend {
         return this.getQuotaSnapshot(params[0] as string | undefined);
       case "listAgents": {
         const sessionId = params[0] as string | undefined;
-        return [...this.agents.values()].filter(
+        const rows = [...this.agents.values()].filter(
           (agent) => !sessionId || agent.sessionId === sessionId,
         );
+        if (params[1] === "history") return rows;
+        const current = new Map<string, AgentSummary>();
+        for (const agent of rows) {
+          const key = `${agent.sessionId ?? ""}\u0000${agent.agentId}`;
+          const previous = current.get(key);
+          if (!previous || Number(this.isLiveAgentState(agent.state)) > Number(this.isLiveAgentState(previous.state)) ||
+            (this.isLiveAgentState(agent.state) === this.isLiveAgentState(previous.state) && (agent.createdAt ?? 0) > (previous.createdAt ?? 0))) {
+            current.set(key, agent);
+          }
+        }
+        return [...current.values()];
       }
-      case "getAgentLogs":
-        return this.agentLogCache.get(this.agentLogKey(params[1] as string, params[0] as string, params[2] as string)) ?? [];
+      case "getAgentLogs": {
+        const agentId = params[0] as string;
+        const sessionId = params[1] as string;
+        const runId = params[2] as string;
+        if (params[3] === "agent") {
+          const runs = [...this.agents.values()]
+            .filter(agent => agent.agentId === agentId && (agent.sessionId ?? "") === sessionId)
+            .sort((left, right) => (left.createdAt ?? 0) - (right.createdAt ?? 0) || left.runId.localeCompare(right.runId));
+          const logs: CachedAgentLog[] = [];
+          for (const run of runs) {
+            for (const entry of this.agentLogCache.get(this.agentLogKey(sessionId, agentId, run.runId)) ?? []) {
+              logs.push({ itemType: entry.itemType, text: entry.text, name: entry.name, isError: entry.isError });
+            }
+          }
+          return logs;
+        }
+        return this.agentLogCache.get(this.agentLogKey(sessionId, agentId, runId)) ?? [];
+      }
       case "abortAgent":
         return this.agentCommand(params[0] as string, "abort");
       case "resolveAgent":
@@ -1892,6 +1957,8 @@ export class PiHostBackend implements HostBackend {
         return probeGit(await this.pickedDirectory(params[0]));
       case "gitInitDirectory":
         return initGit(await this.pickedDirectory(params[0]));
+      case "probeGitBinary":
+        return probeGitBinary();
       case "capabilities":
         return {
           computerUse: Boolean(
@@ -1979,6 +2046,7 @@ export class PiHostBackend implements HostBackend {
     // catalog may involve network-backed provider discovery and must never gate a sidebar click.
     await this.loadConfiguredModels();
     this.applyManualModelSelection(await this.loadManualModelSelection());
+    this.applyManualThinkingLevel(await this.loadManualThinkingLevel());
     const projects = (await this.handle("listProjects", [])) as Project[];
     const p = projects.find((x) => x.id === projectId);
     if (!p) throw new Error(`unknown project ${projectId}`);
@@ -2007,6 +2075,18 @@ export class PiHostBackend implements HostBackend {
           name,
         }),
       );
+    const inheritedThinking = this.modelState.thinkingLevel;
+    if (this.modelState.availableThinkingLevels.includes(inheritedThinking)) {
+      lines.push(
+        JSON.stringify({
+          type: "thinking_level_change",
+          id: crypto.randomUUID(),
+          parentId: null,
+          timestamp: new Date().toISOString(),
+          thinkingLevel: inheritedThinking,
+        }),
+      );
+    }
     await fs.writeFile(path, lines.join("\n") + "\n");
     const created = await fs.stat(path);
     this.rememberSessionMeta(
@@ -2015,6 +2095,9 @@ export class PiHostBackend implements HostBackend {
         header,
         name: name ?? "New session",
         updatedAt: Date.now(),
+        thinkingLevel: this.modelState.availableThinkingLevels.includes(inheritedThinking)
+          ? inheritedThinking
+          : undefined,
       },
       created.size,
       created.mtimeMs,
@@ -2237,8 +2320,12 @@ export class PiHostBackend implements HostBackend {
       const reason = new PiExitedError(code, signal, live!.stderrTail);
       live!.exitError = reason;
       failPending(reason);
-      live!.compaction.dispose();
       this.bridge.unregister(id);
+      // Pi sometimes writes the final assistant message and exits without
+      // `agent_settled`. Without this the UI stays 进行中 forever.
+      if (!this.closed && this.queue.isBusy(id))
+        this.projectTurnTerminal(live, live.hostAbortedTurn ? "stopped" : "settled");
+      live.compaction.dispose();
       const finish = () => {
         if (this.live.get(id) === live) this.live.delete(id);
         resolveExit();
@@ -2303,35 +2390,32 @@ export class PiHostBackend implements HostBackend {
     if (e.type === "agent_start") {
       live.hostAbortedTurn = false;
       live.compaction.cancel();
-      void this.loadQueue(id).then(() => this.queue.markBusy(id));
+      // Must be synchronous: fake-pi/real Pi emit agent_start and agent_settled
+      // in the same stdout chunk. An async markBusy lets the settle run with a
+      // stale epoch and drop the drain that should release the next queued item.
+      live.turnEpoch = this.queue.markBusy(id);
+      if (!this.queueLoads.has(id)) {
+        void this.loadQueue(id).then(() => {
+          if (this.live.get(id) !== live) return;
+          live.turnEpoch = this.queue.markBusy(id);
+        });
+      }
+      const pendingFollowUps = live.followUps.length > 0
+        ? live.followUps
+        : live.pendingDrainPrompt
+          ? [live.pendingDrainPrompt]
+          : [];
+      live.pendingDrainPrompt = undefined;
       this.stream({
         type: "status",
         sessionId: id,
         status: "started",
-        pendingFollowUps: live.followUps,
+        pendingFollowUps,
       });
     } else if (e.type === "agent_settled") {
-      this.stream({
-        type: "status",
-        sessionId: id,
-        status: live.hostAbortedTurn ? "stopped" : "settled",
-        pendingFollowUps: live.followUps,
-      });
-      void this.queueIdle(id);
-      // A compact lifecycle that omitted its end event must not wedge the
-      // scheduler; settle is the final authority. The stats push that follows
-      // is what re-arms the policy.
-      live.compaction.settleTurn();
-      void this.pushSessionStats(id);
+      this.projectTurnTerminal(live, live.hostAbortedTurn ? "stopped" : "settled", true);
     } else if (e.type === "agent_stopped" || e.type === "agent_error") {
-      this.stream({
-        type: "status",
-        sessionId: id,
-        status: "stopped",
-        pendingFollowUps: live.followUps,
-      });
-      void this.queueIdle(id);
-      live.compaction.settleTurn();
+      this.projectTurnTerminal(live, "stopped");
     } else if (e.type === "compaction_start") {
       live.compaction.compactionStarted();
       // A compaction that started outside a turn (idle-time or `/compact`) must
@@ -2393,17 +2477,36 @@ export class PiHostBackend implements HostBackend {
         });
       if (process.env.PIPIUI_STREAM_DEBUG && (d.type === "text_delta" || d.type === "thinking_delta"))
         console.log(`[stream-debug] emit ${d.type} sid=${id} t=${Date.now()} len=${(d.delta ?? "").length}`);
-      if (d.type === "toolcall_delta") {
-        // Tool args stream as partial JSON chunks keyed by contentIndex; the real
-        // toolCallId/name only become known at toolcall_end. Buffer the chunks so
-        // the single tool_call card emitted at toolcall_end carries the full args
-        // under the real id/name — the UI renders one card per tool with a readable
-        // summary instead of a placeholder "tool" card plus a name-only card.
+      if (d.type === "toolcall_start") {
+        // Name/id are stripped from RPC start/delta events. Emit a provisional
+        // card immediately so a long think is not followed by a silent wait
+        // until every toolcall_end arrives in one burst.
+        const index = d.contentIndex ?? 0;
+        if (!live.toolArgs.has(index)) live.toolArgs.set(index, "");
+        this.stream({
+          type: "tool_call",
+          sessionId: id,
+          contentIndex: index,
+          segment: live.messageEpoch,
+          toolCallId: `content-${index}`,
+          name: "tool",
+          delta: "",
+        });
+      } else if (d.type === "toolcall_delta") {
         const index = d.contentIndex ?? 0;
         live.toolArgs.set(
           index,
           (live.toolArgs.get(index) ?? "") + (d.delta ?? ""),
         );
+        this.stream({
+          type: "tool_call",
+          sessionId: id,
+          contentIndex: index,
+          segment: live.messageEpoch,
+          toolCallId: `content-${index}`,
+          name: "tool",
+          delta: d.delta ?? "",
+        });
       } else if (d.type === "toolcall_end") {
         const index = d.contentIndex ?? 0;
         const buffered = live.toolArgs.get(index) ?? "";
@@ -2434,8 +2537,8 @@ export class PiHostBackend implements HostBackend {
       // never go through sendPrompt, so without this the live transcript stays on
       // the previous assistant turn and the composer looks falsely stuck.
       const message = e.message ?? {};
-      if (message.role === "user") {
-        const content = text(message.content);
+      if (message.role === "user" || isSubagentCompletion(message) || isSubagentCompletion(e)) {
+        const content = text(message.content ?? e.content);
         if (content) {
           this.stream({
             type: "user_message",
@@ -2456,6 +2559,15 @@ export class PiHostBackend implements HostBackend {
             : undefined;
         if (content) this.stream({ type: "error", sessionId: id, content });
       }
+      if (
+        message.role === "assistant"
+        && message.stopReason === "stop"
+        && !((Array.isArray(message.content) ? message.content : []).some((part: any) =>
+          part?.type === "toolCall" || part?.type === "tool_call" || part?.type === "tool_use"))
+      ) {
+        const epoch = live.turnEpoch;
+        if (epoch !== undefined) void this.reconcileFinalAssistantTurn(live, epoch);
+      }
     } else if (e.type === "tool_execution_end") {
       const { text: resultText, images } = extractResult(e.result?.content, this.computerScreenshots)
       this.stream({
@@ -2467,6 +2579,48 @@ export class PiHostBackend implements HostBackend {
         isError: e.isError,
       });
     }
+  }
+  private projectTurnTerminal(live: Live, status: "settled" | "stopped", pushStats = false): boolean {
+    const epoch = live.turnEpoch;
+    if (epoch === undefined || live.terminalEpoch === epoch) return false;
+    live.terminalEpoch = epoch;
+    this.stream({
+      type: "status",
+      sessionId: live.session.id,
+      status,
+      pendingFollowUps: live.followUps,
+    });
+    void this.queueIdle(live.session.id, epoch);
+    // A compact lifecycle that omitted its end event must not wedge the
+    // scheduler; terminal projection is the final authority for this turn.
+    live.compaction.settleTurn();
+    if (pushStats) void this.pushSessionStats(live.session.id);
+    return true;
+  }
+  private async reconcileFinalAssistantTurn(live: Live, epoch: number): Promise<void> {
+    // Let any normal agent_settled / queued immediate re-entry already present
+    // in the same stdout batch win before asking Pi for its authoritative state.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) return;
+    let state: any;
+    try {
+      state = await this.command(live.session.id, { type: "get_state" });
+    } catch {
+      return;
+    }
+    if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) return;
+    const hasActionableQueue = this.queue.listQueue(live.session.id).some(item => item.state === "queued" || item.state === "sending");
+    if (
+      state?.isStreaming !== false
+      || state?.pendingMessageCount !== 0
+      || state?.isCompacting === true
+      || live.followUps.length > 0
+      || live.pendingDrainPrompt !== undefined
+      || live.compactionHoldsQueue === true
+      || live.compaction.isCompacting
+      || hasActionableQueue
+    ) return;
+    this.projectTurnTerminal(live, "settled", true);
   }
   private async command(id: string, body: Rpc) {
     const live = await this.ensure(id);
@@ -2597,6 +2751,19 @@ export class PiHostBackend implements HostBackend {
     await this.manualModelSelectionLoaded;
     return this.manualModelSelection;
   }
+  private async loadManualThinkingLevel(): Promise<ThinkingLevel | undefined> {
+    if (!this.manualThinkingLevelLoaded) {
+      this.manualThinkingLevelLoaded = (async () => {
+        const value = (await this.readSettings()).manualThinkingLevel;
+        this.manualThinkingLevel =
+          typeof value === "string" && THINKING_LEVELS.includes(value as ThinkingLevel)
+            ? value as ThinkingLevel
+            : undefined;
+      })();
+    }
+    await this.manualThinkingLevelLoaded;
+    return this.manualThinkingLevel;
+  }
   /** A remembered selection affects only future sessions; existing sessions retain their own model state. */
   private applyManualModelSelection(selection: { provider: string; modelId: string } | undefined): void {
     if (!selection) return;
@@ -2612,6 +2779,14 @@ export class PiHostBackend implements HostBackend {
       availableThinkingLevels,
     };
   }
+  /** A remembered thinking档 affects only future sessions; existing sessions keep their own level. */
+  private applyManualThinkingLevel(level: ThinkingLevel | undefined): void {
+    if (!level) return;
+    this.modelState = {
+      ...this.modelState,
+      thinkingLevel: resolveThinkingLevel(level, this.modelState.availableThinkingLevels, this.modelState.thinkingLevel) ?? "off",
+    };
+  }
   private async rememberManualModelSelection(model: Model): Promise<void> {
     const selection = { provider: model.provider, modelId: model.id };
     await this.updateSettings((settings) => {
@@ -2619,14 +2794,24 @@ export class PiHostBackend implements HostBackend {
     });
     this.manualModelSelection = selection;
     this.manualModelSelectionLoaded = Promise.resolve();
-    // Do not inherit the selected session's thinking level into future sessions.
     const availableThinkingLevels = thinkingLevelsForModel(model);
     this.modelState = {
       ...this.modelState,
       model,
-      thinkingLevel: resolveThinkingLevel(this.modelState.thinkingLevel, availableThinkingLevels) ?? "off",
+      thinkingLevel: resolveThinkingLevel(
+        this.manualThinkingLevel ?? this.modelState.thinkingLevel,
+        availableThinkingLevels,
+      ) ?? "off",
       availableThinkingLevels,
     };
+  }
+  private async rememberManualThinkingLevel(level: ThinkingLevel): Promise<void> {
+    await this.updateSettings((settings) => {
+      settings.manualThinkingLevel = level;
+    });
+    this.manualThinkingLevel = level;
+    this.manualThinkingLevelLoaded = Promise.resolve();
+    this.applyManualThinkingLevel(level);
   }
   private checkedProjectPaths(value: unknown): string[] {
     if (
@@ -3141,6 +3326,7 @@ export class PiHostBackend implements HostBackend {
     await this.loadConfiguredModels();
     await this.mergeRuntimeModels(includeCurrent);
     this.applyManualModelSelection(await this.loadManualModelSelection());
+    this.applyManualThinkingLevel(await this.loadManualThinkingLevel());
     for (const [sessionId, state] of this.sessionModelStates) {
       const catalog = this.models.find(model =>
         model.provider === state.model.provider && model.id === state.model.id,
@@ -3204,6 +3390,94 @@ export class PiHostBackend implements HostBackend {
     await this.loadModelCatalog(true);
     return this.models;
   }
+  private slugifyProviderId(name: string): string {
+    const slug = name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48);
+    return slug || "custom-openai";
+  }
+
+  private reservedOfficialProviderIds(): Set<string> {
+    return new Set([
+      "openai",
+      "anthropic",
+      "google",
+      "google-gemini-cli",
+      "github-copilot",
+      "amazon-bedrock",
+      "azure-openai-responses",
+      "openai-codex",
+      "xai",
+      "groq",
+      "mistral",
+      "openrouter",
+      "deepseek",
+      "minimax",
+      "huggingface",
+      "opencode",
+      "opencode-go",
+      "vercel-ai-gateway",
+      "zai",
+    ]);
+  }
+
+  /** Write openai-completions provider into models.json (literal apiKey + baseUrl + models). */
+  private async addOpenAICompatibleProvider(raw: unknown): Promise<{ providerId: string }> {
+    if (!raw || typeof raw !== "object") throw new Error("参数无效");
+    const input = raw as Record<string, unknown>;
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    const baseUrl = typeof input.baseUrl === "string" ? input.baseUrl.trim() : "";
+    const apiKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
+    const modelId = typeof input.modelId === "string" ? input.modelId.trim() : "";
+    if (!name) throw new Error("名称不能为空");
+    if (!baseUrl) throw new Error("URL 不能为空");
+    if (!/^https?:\/\//i.test(baseUrl)) throw new Error("URL 必须是 http(s) 地址");
+    if (!apiKey) throw new Error("Key 不能为空");
+    if (!modelId) throw new Error("模型 id 不能为空");
+
+    let providerId = this.slugifyProviderId(name);
+    if (this.reservedOfficialProviderIds().has(providerId)) {
+      providerId = `custom-${providerId}`;
+    }
+
+    const modelsPath = join(this.agentDir, "models.json");
+    let catalog: any = { providers: {} };
+    try {
+      catalog = JSON.parse(await fs.readFile(modelsPath, "utf8"));
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw new Error(`无法读取 models.json：${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!catalog || typeof catalog !== "object") catalog = { providers: {} };
+    const providers = catalog.providers && typeof catalog.providers === "object" ? catalog.providers : {};
+    let uniqueId = providerId;
+    let n = 2;
+    while (providers[uniqueId] && providers[uniqueId]?.baseUrl !== baseUrl) {
+      uniqueId = `${providerId}-${n++}`;
+    }
+    const existing = providers[uniqueId] && typeof providers[uniqueId] === "object" ? providers[uniqueId] : {};
+    const models = Array.isArray(existing.models) ? [...existing.models] : [];
+    if (!models.some((m: any) => m && m.id === modelId)) {
+      models.push({ id: modelId, name: modelId, reasoning: true });
+    }
+    providers[uniqueId] = {
+      ...existing,
+      baseUrl,
+      api: "openai-completions",
+      apiKey,
+      models,
+    };
+    catalog.providers = providers;
+    const temporary = join(this.agentDir, `.models.json-${process.pid}-${Date.now()}.tmp`);
+    await fs.mkdir(this.agentDir, { recursive: true });
+    await fs.writeFile(temporary, `${JSON.stringify(catalog, null, 2)}\n`);
+    await fs.rename(temporary, modelsPath);
+    await this.refreshModelsAfterAuthChange(false);
+    return { providerId: uniqueId };
+  }
+
   private async removeProviderCredentials(
     providerId: string,
   ): Promise<ModelState> {
@@ -3395,7 +3669,21 @@ export class PiHostBackend implements HostBackend {
         data: a.dataBase64,
         mimeType: a.mimeType,
       }));
-    await this.command(id, body);
+    if (payload.text.trim() && behavior !== "steer") {
+      live.pendingDrainPrompt = payload.text;
+    }
+    try {
+      await this.command(id, body);
+    } catch (error) {
+      if (body.type !== "prompt" || !isAlreadyProcessingError(error)) {
+        if (live.pendingDrainPrompt === payload.text) live.pendingDrainPrompt = undefined;
+        throw error;
+      }
+      // Queue thought the session was idle (stale settle, follow-up already
+      // running). Pi is the authority: re-send with the behavior it asked for
+      // instead of surfacing the raw RPC error to the composer.
+      await this.command(id, { ...body, streamingBehavior: "followUp" });
+    }
   }
 
   /**
@@ -3615,6 +3903,7 @@ export class PiHostBackend implements HostBackend {
       await this.refreshState(live);
       const state = this.sessionModelStates.get(sessionId)!;
       this.sessionModelSnapshots.set(sessionId, state);
+      await this.rememberManualThinkingLevel(state.thinkingLevel);
       return state;
     }
     const current =
@@ -3627,6 +3916,7 @@ export class PiHostBackend implements HostBackend {
     await this.persistColdSessionRow(sessionId, { type: "thinking_level_change", thinkingLevel: level });
     this.sessionModelStates.set(sessionId, next);
     this.sessionModelSnapshots.set(sessionId, next);
+    await this.rememberManualThinkingLevel(next.thinkingLevel);
     return next;
   }
   /**
@@ -3857,8 +4147,8 @@ export class PiHostBackend implements HostBackend {
   private agentLogsFile(): string {
     return join(this.agentDir, "pipiui-agent-logs.json");
   }
-  private agentKey(agentId: string, sessionId?: string): string {
-    return `${sessionId ?? ""}\u0000${agentId}`;
+  private agentKey(agentId: string, sessionId: string | undefined, runId: string): string {
+    return `${sessionId ?? ""}\u0000${agentId}\u0000${runId}`;
   }
   private agentLogKey(sessionId: string, agentId: string, runId: string): string {
     return `${sessionId}\u0000${agentId}\u0000${runId}`;
@@ -3879,7 +4169,7 @@ export class PiHostBackend implements HostBackend {
           agent.endedAt = agent.endedAt ?? restartedAt;
           normalized = true;
         }
-        this.agents.set(this.agentKey(agent.agentId, agent.sessionId), agent);
+        this.agents.set(this.agentKey(agent.agentId, agent.sessionId, agent.runId), agent);
       }
       if (Array.isArray(value.worktrees)) for (const raw of value.worktrees) {
         if (isRecord(raw) && typeof raw.agentId === "string") this.worktrees.set(raw.agentId, raw as unknown as WorktreeStatus);
@@ -4035,7 +4325,7 @@ export class PiHostBackend implements HostBackend {
         endedAt: agent.endedAt ?? now,
         closeout: agent.closeout ?? ORPHAN_CLOSEOUT,
       };
-      this.agents.set(this.agentKey(agent.agentId, agent.sessionId), next);
+      this.agents.set(this.agentKey(agent.agentId, agent.sessionId, agent.runId), next);
       this.agent({ type: "agent", agent: next });
       this.retainOrphanWorktree(agent.agentId);
       changed = true;
@@ -4053,7 +4343,7 @@ export class PiHostBackend implements HostBackend {
     for (const sessionId of sessionIds) this.reconcileOrphanedNow(sessionId, now);
   }
   private forceAbortAgent(agent: AgentSummary, reason: string): void {
-    const key = this.agentKey(agent.agentId, agent.sessionId);
+    const key = this.agentKey(agent.agentId, agent.sessionId, agent.runId);
     const current = this.agents.get(key);
     if (!current || current.runId !== agent.runId) return;
     if (current.state !== "running" && current.state !== "stalled") return;
@@ -4067,6 +4357,46 @@ export class PiHostBackend implements HostBackend {
     this.agent({ type: "agent", agent: next });
     this.persistAgents();
   }
+  /**
+   * Stop-sweep the session's background subagents. Reuses the /subagent_abort_all
+   * extension command so the kill paths, receipt suppression, and the host-stop
+   * quiet gate stay owned by the runtime extension. Force-aborts any panel entry
+   * still running afterwards so the UI never wedges on 运行中.
+   */
+  private async sweepSessionAgents(sessionId: string): Promise<void> {
+    if (this.closed) return;
+    const running = [...this.agents.values()].filter(
+      (agent) => agent.sessionId === sessionId && agent.state === "running",
+    );
+    const live = this.liveSessionProcess(sessionId);
+    if (!live) {
+      for (const agent of running) {
+        this.forceAbortAgent(agent, "宿主停止时无主 Agent 进程，已在界面结束该子任务");
+      }
+      return;
+    }
+    try {
+      await this.withAgentCommandTimeout(
+        this.command(sessionId, { type: "prompt", message: "/subagent_abort_all", streamingBehavior: "followUp" }),
+        5_000,
+        "停止扫场请求在 5 秒内未被主 Agent 接收",
+      );
+      await Promise.allSettled(
+        running.map((agent) => this.waitForAgentTerminal(agent.agentId, agent.sessionId ?? "", agent.runId, 5_000)),
+      );
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "停止扫场请求未能送达";
+      for (const agent of running) this.forceAbortAgent(agent, reason);
+      return;
+    }
+    for (const agent of running) {
+      const current = this.agents.get(this.agentKey(agent.agentId, agent.sessionId, agent.runId));
+      if (current && current.runId === agent.runId && current.state === "running") {
+        this.forceAbortAgent(agent, "停止扫场后未收到终态，已在界面结束该子任务");
+      }
+    }
+  }
+
   private async agentCommand(id: string, operation: "abort" | "resolve") {
     const a = await this.getAgent(id);
 		if (operation === "abort") {
@@ -4079,7 +4409,7 @@ export class PiHostBackend implements HostBackend {
 				// owning process is wedged, already gone, or the host is closing.
 				try {
 					await this.withAgentCommandTimeout(
-						this.command(a.sessionId, { type: "prompt", message: `/subagent_abort ${id}` }),
+						this.command(a.sessionId, { type: "prompt", message: `/subagent_abort ${id}`, streamingBehavior: "followUp" }),
 						5_000,
 						"停止请求在 5 秒内未被主 Agent 接收",
 					);
@@ -4140,7 +4470,7 @@ export class PiHostBackend implements HostBackend {
     void sessionId;
   }
 	private waitForAgentTerminal(agentId: string, sessionId: string, runId: string, timeoutMs = 15_000): Promise<void> {
-		const key = this.agentKey(agentId, sessionId);
+		const key = this.agentKey(agentId, sessionId, runId);
 		const deadline = Date.now() + timeoutMs;
 		return new Promise((resolve, reject) => {
 			let settled = false;
@@ -4190,7 +4520,7 @@ export class PiHostBackend implements HostBackend {
 		});
 	}
   private mapAgentEvent(raw: any, sessionId?: string) {
-    const key = this.agentKey(raw.agentId, sessionId);
+    const key = this.agentKey(raw.agentId, sessionId, raw.runId);
     const current = this.agents.get(key);
     if (raw.kind === "closeout") {
       if (
@@ -4265,7 +4595,9 @@ export class PiHostBackend implements HostBackend {
         raw.createdAt ??
 				(raw.at ? asTime(raw.at) : (sameRun ? current?.createdAt : undefined) ?? Date.now()),
 			updatedAt: eventAt,
-			deadlineAt: num2(raw.deadlineAt) ?? (sameRun ? current?.deadlineAt : undefined),
+			// A terminal event always drops the stored deadline: a dead worker must never keep
+			// showing "最迟 NNN 秒后自动中止" from a budget that no longer exists.
+			deadlineAt: num2(raw.deadlineAt) ?? (terminal ? undefined : (sameRun ? current?.deadlineAt : undefined)),
       // `start` sends `model: null` when the worker inherits the main model, so a null must never
       // clobber a model a later `usage` event resolved.
       model: modelRef(raw.model) ?? (sameRun ? current?.model : undefined),
@@ -4280,10 +4612,13 @@ export class PiHostBackend implements HostBackend {
         : sameRun ? current?.finalResult : undefined,
       worktreeError: nonEmpty(raw.worktreeError) ?? (sameRun ? current?.worktreeError : undefined),
       endedAt: terminal ? (sameRun ? current?.endedAt : undefined) ?? Date.now() : sameRun ? current?.endedAt : undefined,
+      // Usage payloads are already session-cumulative (completed + live
+      // message_update, then message_end). Replace the latest totals; never add.
       inputTokens: num2(usage?.input) ?? (sameRun ? current?.inputTokens : undefined),
       outputTokens: num2(usage?.output) ?? (sameRun ? current?.outputTokens : undefined),
       cacheTokens: num2(usage?.cacheRead) ?? (sameRun ? current?.cacheTokens : undefined),
       contextTokens: num2(usage?.contextTokens) ?? (sameRun ? current?.contextTokens : undefined),
+      contextWindowTokens: positiveWindow(usage?.contextWindow) ?? positiveWindow(raw.contextWindow) ?? (sameRun ? current?.contextWindowTokens : undefined) ?? (sessionId ? this.sessionContextLastKnown.get(sessionId)?.contextWindow : undefined),
     };
     this.agents.set(key, agent);
     const lifecycle =
@@ -4321,14 +4656,16 @@ export class PiHostBackend implements HostBackend {
       // Runtime log_delta pushes cumulative full text keyed by contentIndex; carry
       // the key so the panel upserts one row instead of adding one per chunk.
       const contentIndex = num2(raw.contentIndex);
-      const entry = { itemType: raw.itemType, text: raw.text ?? "", name: raw.name, isError: raw.isError, ...(contentIndex === undefined ? {} : { contentIndex }) };
+      const charCount = num2(raw.charCount);
+      const entry = { itemType: raw.itemType, text: raw.text ?? "", name: raw.name, isError: raw.isError, ...(contentIndex === undefined ? {} : { contentIndex }), ...(charCount === undefined ? {} : { charCount }) };
       this.cacheAgentLog(logSessionId, agent.agentId, agent.runId, entry);
       this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
     } else if (raw.kind === "log" && logSessionId) {
       this.resetAgentLogStreamSlots(logSessionId, agent.agentId, agent.runId);
       this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, itemType: "text", text: "", resetStreamSlots: true });
       for (const item of raw.items ?? []) {
-        const entry = { itemType: item.itemType, text: item.text, name: item.name, isError: item.isError };
+        const charCount = num2(item.charCount);
+        const entry = { itemType: item.itemType, text: item.text, name: item.name, isError: item.isError, ...(charCount === undefined ? {} : { charCount }) };
         this.cacheAgentLog(logSessionId, agent.agentId, agent.runId, entry);
         this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
       }

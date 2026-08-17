@@ -38,14 +38,15 @@ async function prepareHooksModule(directory) {
   const indexPath = join(directory, "subagent/index.ts");
   let src = await readFile(indexPath, "utf8");
   const reportRe =
-    /async function postPipiuiReport\(payload: [^)]+\): Promise<void> \{[\s\S]*?\n\}/;
+    /async function postPipiuiReport\(payload: [^)]+\): Promise<boolean> \{[\s\S]*?\n\}/;
   assert.match(src, reportRe, "postPipiuiReport body must remain patchable for Node behavior tests");
   src = src.replace(
     reportRe,
-    `async function postPipiuiReport(payload: Record<string, unknown>): Promise<void> {
+    `async function postPipiuiReport(payload: Record<string, unknown>): Promise<boolean> {
 \tconst g = globalThis as typeof globalThis & { __pipiuiReports?: Record<string, unknown>[] };
 \tif (!g.__pipiuiReports) g.__pipiuiReports = [];
 \tg.__pipiuiReports.push({ ...payload });
+\treturn true;
 }`,
   );
 

@@ -15,12 +15,12 @@ import {
 } from "@pipi/account-usage-core";
 import type { AccountBalance, QuotaSnapshot, QuotaWindow } from "@pipi/host-api";
 
-export type QuotaProviderKind = "grok" | "glm" | "claude" | "codex" | "kimi" | "qoder" | "qwenTokenPlan" | "opencodeGo";
+export type QuotaProviderKind = "grok" | "glm" | "claude" | "codex" | "cursor" | "kimi" | "qoder" | "qwenTokenPlan" | "opencodeGo";
 export type BalanceProviderKind = "deepseek" | "moonshot" | "siliconflow" | "openrouter";
 
 export const QUOTA_ACCOUNT_LABELS: Record<QuotaProviderKind, string> = {
   grok: "Grok 账号额度", glm: "GLM 账号额度", claude: "Claude 账号额度", codex: "Codex 账号额度",
-  kimi: "Kimi 账号额度", qoder: "Qoder 账号额度", qwenTokenPlan: "Qwen Token Plan 额度", opencodeGo: "OpenCode Go 本机用量",
+  cursor: "Cursor 账号额度", kimi: "Kimi 账号额度", qoder: "Qoder 账号额度", qwenTokenPlan: "Qwen Token Plan 额度", opencodeGo: "OpenCode Go 本机用量",
 };
 export const BALANCE_ACCOUNT_LABEL = "账户余额";
 export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -81,7 +81,9 @@ export type QuotaFetchDeps = {
   readGrokAuth?: () => Promise<string | undefined>;
   readOpenCodeAuth?: () => Promise<string | undefined>;
   openCodeDatabasePath?: string;
+  readGrokRateLimits?: () => Promise<string | undefined>;
   readCookie?: AccountUsageCapabilities["readCookie"];
+  readCursorAuth?: AccountUsageCapabilities["readCursorAuth"];
   persistCookie?: AccountUsageCapabilities["persistCookie"];
   readKeyFile?: AccountUsageCapabilities["readKeyFile"];
   readLocalUsage?: AccountUsageCapabilities["readLocalUsage"];
@@ -175,6 +177,7 @@ async function capabilities(env: NodeJS.ProcessEnv, deps: QuotaFetchDeps): Promi
     now: deps.now,
     timeoutMs: deps.timeoutMs,
     readCookie: deps.readCookie,
+    readCursorAuth: deps.readCursorAuth,
     persistCookie: deps.persistCookie,
     readKeyFile: deps.readKeyFile ?? (async paths => {
       for (const relative of paths) {
@@ -196,6 +199,8 @@ async function capabilities(env: NodeJS.ProcessEnv, deps: QuotaFetchDeps): Promi
         : await readOpenCode();
       return parsed(raw);
     },
+    // Written by the pipiui-xai-server-tools extension from live api.x.ai response headers.
+    readGrokRateLimits: () => (deps.readGrokRateLimits ?? (() => optionalFile(join(agentDir, "grok-rate-limits.json"))))(),
   };
 }
 

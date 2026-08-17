@@ -127,7 +127,7 @@ export function omitNulls<T>(value: T): T {
 }
 
 const NULL_SENTINELS = new Set(["", "null", "undefined", "none", "n/a", "na", "unused", "not used", "not-used"]);
-const SINGLE_MODE_KEYS = ["agent", "task", "title"] as const;
+const SINGLE_MODE_KEYS = ["agent", "task", "title", "prompt", "description", "subagent_type"] as const;
 
 function isNullableSchema(schema: JsonSchema): boolean {
 	if (schemaTypes(schema).includes("null")) return true;
@@ -230,8 +230,184 @@ export function bindPrepareStrictToolArguments(schema: unknown): (args: unknown)
  * `omitNulls` strips null-valued keys (declared or not); the prepare step then
  * drops any remaining unknown keys and coerces sentinel scalars.
  */
+function hasNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+const KNOWN_AGENT_TYPES = new Set([
+	"computer-terminal",
+	"computer-use-leader",
+	"computer-verifier",
+	"explore",
+	"general-purpose",
+	"operator",
+	"plan",
+	"reviewer",
+	"secretary",
+]);
+const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{1,23}$/;
+const TITLE_AS_TASK_MIN_LENGTH = 80;
+
+function mapIsolationToWorktree(value: unknown): "isolated" | "none" | undefined {
+	if (value === "worktree" || value === "isolated") return "isolated";
+	if (value === "none") return "none";
+	return undefined;
+}
+
+function mapWorktreeToIsolation(value: unknown): "worktree" | "none" | undefined {
+	if (value === "worktree" || value === "isolated") return "worktree";
+	if (value === "none") return "none";
+	return undefined;
+}
+
+function slugAgentId(value: string): string | undefined {
+	const slug = value
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 24)
+		.replace(/-+$/g, "");
+	return AGENT_ID_PATTERN.test(slug) ? slug : undefined;
+}
+
+function inferredAgentType(value: JsonSchema): "explore" | "general-purpose" {
+	if (
+		value.isolation != null && value.isolation !== ""
+		|| value.worktree != null && value.worktree !== ""
+		|| hasNonEmptyString(value.noWorktreeReason)
+		|| hasNonEmptyString(value.verify)
+		|| value.heartbeatSecs != null
+		|| value.timeoutSecs != null
+	) {
+		return "general-purpose";
+	}
+	return "explore";
+}
+
+function expandShortBrief(label: string, agentType: unknown): string {
+	const title = label.trim();
+	if (title.length >= TITLE_AS_TASK_MIN_LENGTH) return title;
+	const footer = agentType === "general-purpose"
+		? "Complete the work implied by this title. Follow repository conventions. Do not expand scope."
+		: "Read-only investigation implied by this title. Find the relevant code and report findings. Do not modify files.";
+	return `${title}\n\n${footer}`;
+}
+
+function shortLabel(prompt: string): string {
+	const firstLine = prompt.trim().split(/\n/, 1)[0] ?? "";
+	const words = firstLine.split(/\s+/).filter(Boolean).slice(0, 5);
+	const label = words.join(" ");
+	return label.length > 0 ? label.slice(0, 80) : "subagent task";
+}
+
+function applyAliasesToRecord(value: JsonSchema): JsonSchema {
+	const out: JsonSchema = { ...value };
+	if (!hasNonEmptyString(out.prompt) && hasNonEmptyString(out.task)) out.prompt = out.task;
+	if (!hasNonEmptyString(out.task) && hasNonEmptyString(out.prompt)) out.task = out.prompt;
+	if (!hasNonEmptyString(out.description) && hasNonEmptyString(out.title)) out.description = out.title;
+	if (!hasNonEmptyString(out.title) && hasNonEmptyString(out.description)) out.title = out.description;
+	if (!hasNonEmptyString(out.subagent_type) && hasNonEmptyString(out.agent)) out.subagent_type = out.agent;
+	if (!hasNonEmptyString(out.agent) && hasNonEmptyString(out.subagent_type)) out.agent = out.subagent_type;
+	if ((out.isolation == null || out.isolation === "") && out.worktree != null && out.worktree !== "") {
+		const mapped = mapWorktreeToIsolation(out.worktree);
+		if (mapped) out.isolation = mapped;
+	}
+	if ((out.worktree == null || out.worktree === "") && out.isolation != null && out.isolation !== "") {
+		const mapped = mapIsolationToWorktree(out.isolation);
+		if (mapped) out.worktree = mapped;
+	}
+	if (out.run_in_background == null && typeof out.background === "boolean") out.run_in_background = out.background;
+	if (out.background == null && typeof out.run_in_background === "boolean") out.background = out.run_in_background;
+	if (!hasNonEmptyString(out.resume_from) && hasNonEmptyString(out.agentId)) out.resume_from = out.agentId;
+	if (!hasNonEmptyString(out.agentId) && hasNonEmptyString(out.resume_from)) out.agentId = out.resume_from;
+
+	if (!hasNonEmptyString(out.subagent_type) && !hasNonEmptyString(out.agent) && hasNonEmptyString(out.prompt)) {
+		out.subagent_type = "general-purpose";
+		out.agent = "general-purpose";
+	}
+
+	const typeName = hasNonEmptyString(out.subagent_type) ? out.subagent_type : out.agent;
+	const typeForBrief = hasNonEmptyString(typeName) && KNOWN_AGENT_TYPES.has(typeName)
+		? typeName
+		: inferredAgentType(out);
+	const label = hasNonEmptyString(out.description) ? out.description : hasNonEmptyString(out.title) ? out.title : "";
+	if (!hasNonEmptyString(out.prompt) && !hasNonEmptyString(out.task) && label) {
+		const brief = expandShortBrief(label, typeForBrief);
+		out.prompt = brief;
+		out.task = brief;
+	}
+	if (!hasNonEmptyString(out.description) && !hasNonEmptyString(out.title) && hasNonEmptyString(out.prompt)) {
+		const generated = shortLabel(out.prompt);
+		out.description = generated;
+		out.title = generated;
+	}
+
+	if (
+		(out.agent === "general-purpose" || out.subagent_type === "general-purpose")
+		&& !hasNonEmptyString(out.agentId)
+		&& hasNonEmptyString(out.description)
+	) {
+		const slug = slugAgentId(out.description);
+		if (slug) {
+			out.agentId = slug;
+			if (!hasNonEmptyString(out.resume_from)) out.resume_from = slug;
+		}
+	}
+
+	if (!hasNonEmptyString(out.agent) && hasNonEmptyString(out.subagent_type)) out.agent = out.subagent_type;
+	if (!hasNonEmptyString(out.task) && hasNonEmptyString(out.prompt)) out.task = out.prompt;
+	if (!hasNonEmptyString(out.title) && hasNonEmptyString(out.description)) out.title = out.description;
+	return out;
+}
+
+/**
+ * Bidirectional Grok Build ↔ PipiUI dispatch names.
+ * Public schema is {prompt, description, subagent_type, isolation, …};
+ * execute() still reads {task, agent, title, worktree, background, agentId}.
+ */
+export function adoptGrokBuildDispatch<T>(value: T): T {
+	if (!isRecord(value)) return value;
+	const out = applyAliasesToRecord(value);
+	if (Array.isArray(out.tasks)) {
+		out.tasks = out.tasks.map((item) => (isRecord(item) ? applyAliasesToRecord(item) : item));
+	}
+	if (Array.isArray(out.chain)) {
+		out.chain = out.chain.map((item) => (isRecord(item) ? applyAliasesToRecord(item) : item));
+	}
+	return out as T;
+}
+
+function remapUnknownTypeName(value: JsonSchema, knownNames: ReadonlySet<string>): JsonSchema {
+	const typeName = hasNonEmptyString(value.subagent_type) ? value.subagent_type : value.agent;
+	if (!hasNonEmptyString(typeName) || knownNames.has(typeName) || KNOWN_AGENT_TYPES.has(typeName)) {
+		return value;
+	}
+	if (!AGENT_ID_PATTERN.test(typeName)) return value;
+	const out: JsonSchema = { ...value };
+	if (!hasNonEmptyString(out.agentId)) out.agentId = typeName;
+	if (!hasNonEmptyString(out.resume_from)) out.resume_from = typeName;
+	const inferred = inferredAgentType(out);
+	out.subagent_type = inferred;
+	out.agent = inferred;
+	return out;
+}
+
+/** After agent discovery: treat an unknown type that looks like an id as resume_from. */
+export function remapUnknownSubagentType<T>(value: T, knownNames: ReadonlySet<string>): T {
+	if (!isRecord(value)) return value;
+	const out = remapUnknownTypeName(value, knownNames);
+	if (Array.isArray(out.tasks)) {
+		out.tasks = out.tasks.map((item) => (isRecord(item) ? remapUnknownTypeName(item, knownNames) : item));
+	}
+	if (Array.isArray(out.chain)) {
+		out.chain = out.chain.map((item) => (isRecord(item) ? remapUnknownTypeName(item, knownNames) : item));
+	}
+	return out as T;
+}
+
 export function sanitizeStrictToolArguments(schema: unknown, args: unknown): unknown {
-	const stripped = omitNulls(args);
+	const aliased = adoptGrokBuildDispatch(args);
+	const stripped = omitNulls(aliased);
 	if (typeof stripped !== "object" || stripped === null || Array.isArray(stripped)) return stripped;
 	return prepareStrictToolArguments(schema, stripped);
 }

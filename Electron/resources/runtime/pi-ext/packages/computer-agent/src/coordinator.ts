@@ -3,10 +3,15 @@ import {
   grantsForComputerRole,
   type ComputerWorkerGrant,
   type ComputerWorkerRole,
+// @ts-ignore -- the bundled runtime executes TypeScript directly; keep its explicit runtime extension.
 } from "./worker-broker.ts";
+// @ts-ignore -- the bundled runtime executes TypeScript directly; keep its explicit runtime extension.
 import { isComputerWorkerRole } from "./workers.ts";
 import type { ComputerTaskEvent } from "./plan.ts";
+// @ts-ignore -- the bundled runtime executes TypeScript directly; keep its explicit runtime extension.
 import { validateTerminalBoundaryShape, type TerminalStepPolicy } from "./terminal-policy.ts";
+// @ts-ignore -- the bundled runtime executes TypeScript directly; keep its explicit runtime extension.
+import { validateComputerPlanCuaOnly } from "./plan-proposal.ts";
 
 export type ComputerPostcondition =
   | { kind: "visible_text"; contains: string }
@@ -48,6 +53,7 @@ export type ComputerWorkerDispatch = {
   grants: ComputerWorkerGrant[];
   observation?: ComputerObservation;
   terminalPolicy?: Omit<TerminalStepPolicy, "commands">;
+  planRevision: number;
 };
 
 export type ComputerWorkerResult = {
@@ -60,6 +66,23 @@ export type ComputerWorkerResult = {
   artifactReferences?: Array<{ id: string; kind: "screenshot" | "accessibility" | "terminal" | "trajectory" | "file"; summary: string; digest: string; byteLength: number }>;
   trajectory?: string;
   failureCode?: ComputerWorkerFailureCode;
+  /** Closed recovery signal: the worker proved an external target-state mismatch and the task forbids repairing it. */
+  recoveryDisposition?: "manual_intervention";
+  blockedReason?: "target_state_mismatch";
+  nextAction?: "restore_target_state_manually";
+};
+export type ComputerAgentEpisode = {
+  agentId: string;
+  runId: string;
+  parentId: string | null;
+  name: "operator" | "computer-verifier" | "computer-terminal" | "computer-use-leader";
+  role: ComputerWorkerRole | "computer-use-leader";
+  terminalState: "ok" | "failed" | "aborted" | "interrupted" | "stalled";
+  result: {
+    outcome: ComputerWorkerResult["outcome"] | "cancelled";
+    summary: string;
+    failureCode?: ComputerWorkerFailureCode;
+  };
 };
 export const COMPUTER_WORKER_FAILURE_CODES = [
   "gui_broker_start_failed", "gui_grant_issue_failed", "gui_private_resource_failed",
@@ -75,24 +98,50 @@ export type ComputerWorkerFailureCode = typeof COMPUTER_WORKER_FAILURE_CODES[num
 export const COMPUTER_WORKER_STALL_TIMEOUT_MS = 150_000;
 export const COMPUTER_LEADER_STALL_TIMEOUT_MS = 120_000;
 
+async function runWithStallDeadline<T>(
+  run: () => Promise<T>,
+  onStalled: () => void,
+  timeoutMs: number,
+  failureCode: "gui_child_stalled" | "computer_leader_stalled",
+): Promise<T> {
+  const operation = Promise.resolve().then(run);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stalled = false;
+  const deadline = new Promise<"stalled">((resolve) => {
+    timer = setTimeout(() => {
+      stalled = true;
+      try { onStalled(); } catch { /* The closed failure still wins if best-effort abort reporting fails. */ }
+      resolve("stalled");
+    }, Math.max(10, timeoutMs));
+  });
+  try {
+    const outcome = await Promise.race([
+      operation.then(
+        (value) => ({ kind: "fulfilled" as const, value }),
+        (error) => ({ kind: "rejected" as const, error }),
+      ),
+      deadline.then(() => ({ kind: "stalled" as const })),
+    ]);
+    if (outcome.kind === "stalled" || stalled) {
+      await operation.then(
+        () => undefined,
+        () => undefined,
+      );
+      throw Object.assign(new Error(failureCode), { failureCode });
+    }
+    if (outcome.kind === "fulfilled") return outcome.value;
+    throw outcome.error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function runComputerWorkerWithStallDeadline<T>(
   run: () => Promise<T>,
   onStalled: () => void,
   timeoutMs = COMPUTER_WORKER_STALL_TIMEOUT_MS,
 ): Promise<T> {
-  const operation = Promise.resolve().then(run);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<T>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      try { onStalled(); } catch { /* The closed failure still wins if best-effort abort reporting fails. */ }
-      reject(Object.assign(new Error("gui_child_stalled"), { failureCode: "gui_child_stalled" as const }));
-    }, Math.max(10, timeoutMs));
-  });
-  try {
-    return await Promise.race([operation, deadline]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+  return runWithStallDeadline(run, onStalled, timeoutMs, "gui_child_stalled");
 }
 
 export async function runComputerLeaderWithStallDeadline<T>(
@@ -100,24 +149,12 @@ export async function runComputerLeaderWithStallDeadline<T>(
   onStalled: () => void,
   timeoutMs = COMPUTER_LEADER_STALL_TIMEOUT_MS,
 ): Promise<T> {
-  const operation = Promise.resolve().then(run);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<T>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      try { onStalled(); } catch { /* The closed failure still wins if best-effort abort reporting fails. */ }
-      reject(Object.assign(new Error("computer_leader_stalled"), { failureCode: "computer_leader_stalled" as const }));
-    }, Math.max(10, timeoutMs));
-  });
-  try {
-    return await Promise.race([operation, deadline]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+  return runWithStallDeadline(run, onStalled, timeoutMs, "computer_leader_stalled");
 }
 export type HostExecutionRecord =
   | { role: "gui-operator"; kind: "open_application" | "click" | "type_parameter"; bundleId?: string; appName?: string; locator?: { role: string; nameLiteral: string }; observationId: string; observedAt: string }
   | { role: "terminal-worker"; kind: "write_parameterized_file"; path: string; byteLength: number; contentDigest: string; observationId: string; observedAt: string };
-export type ComputerWorkerDispatchResult = { workerResult: ComputerWorkerResult; hostExecutionRecords: HostExecutionRecord[] };
+export type ComputerWorkerDispatchResult = { workerResult: ComputerWorkerResult; hostExecutionRecords: HostExecutionRecord[]; episode?: ComputerAgentEpisode };
 
 export type ComputerTaskResult = {
   outcome: "succeeded" | "blocked" | "failed" | "cancelled";
@@ -127,9 +164,10 @@ export type ComputerTaskResult = {
     conditionResults: Array<{ conditionId: string; outcome: "verified" | "not_verified" | "unknown" }>;
   };
   planRevisions: number;
+  episodes?: ComputerAgentEpisode[];
   investigation?: {
-    stage: "task_verification" | "recovery_exhausted" | "recovery_plan" | "plan_dependencies" | "cancelled";
-    code: "task_conditions_not_verified" | "worker_postconditions_not_verified" | "worker_failed" | "worker_blocked" | "worker_outcome_unknown" | "recovery_plan_invalid" | "unresolved_dependencies" | "task_cancelled" | ComputerWorkerFailureCode;
+    stage: "task_verification" | "recovery_exhausted" | "recovery_plan" | "plan_dependencies" | "manual_intervention" | "cancelled";
+    code: "task_conditions_not_verified" | "worker_postconditions_not_verified" | "worker_failed" | "worker_blocked" | "worker_outcome_unknown" | "recovery_plan_invalid" | "unresolved_dependencies" | "target_state_mismatch" | "task_cancelled" | ComputerWorkerFailureCode;
     recoveryAttempts: number;
     failedConditions: Array<{ conditionId: string; kind: ComputerPostcondition["kind"]; outcome: "not_verified" | "unknown" }>;
     workerAttempts: Array<{
@@ -138,9 +176,42 @@ export type ComputerTaskResult = {
       outcome: ComputerWorkerResult["outcome"];
       verification: "verified" | "not_verified" | "unknown";
       failureCode?: ComputerWorkerFailureCode;
+      agentId?: string;
+      runId?: string;
+      parentId?: string | null;
+      name?: ComputerAgentEpisode["name"];
+      terminalState?: ComputerAgentEpisode["terminalState"];
+      result?: ComputerAgentEpisode["result"];
     }>;
+    blockedReason?: "target_state_mismatch";
+    nextAction?: "restore_target_state_manually";
   };
 };
+
+/**
+ * A final Leader prose pass is presentation-only once the Coordinator has
+ * produced a verified success. Its stall must not replace that closed result
+ * (or its worker episodes) with a synthetic leader-runtime failure.
+ */
+export async function finalizeComputerTaskWithOptionalSummary(
+  result: ComputerTaskResult,
+  summarize: () => Promise<string>,
+): Promise<{ result: ComputerTaskResult; leaderSummary?: string }> {
+  if (
+    result.outcome === "blocked"
+    && result.investigation?.stage === "manual_intervention"
+    && result.investigation.blockedReason === "target_state_mismatch"
+    && result.investigation.nextAction === "restore_target_state_manually"
+  ) return { result };
+  try {
+    return { result, leaderSummary: await summarize() };
+  } catch (error) {
+    if (result.outcome === "succeeded" && (error as { failureCode?: unknown })?.failureCode === "computer_leader_stalled") {
+      return { result };
+    }
+    throw error;
+  }
+}
 
 type Planner = {
   plan(goal: string): Promise<ComputerPlan>;
@@ -203,6 +274,10 @@ export function projectComputerWorkerResult(value: ComputerWorkerResult): Comput
     const condition = closedPostcondition(item);
     return condition ? [condition] : [];
   }).slice(0, 32);
+  const manualBlock = outcome === "blocked"
+    && value.recoveryDisposition === "manual_intervention"
+    && value.blockedReason === "target_state_mismatch"
+    && value.nextAction === "restore_target_state_manually";
   return {
     outcome,
     summary: WORKER_SUMMARY[outcome],
@@ -210,7 +285,106 @@ export function projectComputerWorkerResult(value: ComputerWorkerResult): Comput
     ...(attestedPostconditions.length ? { attestedPostconditions } : {}),
     ...(observation ? { observation } : {}),
     ...(artifactReferences.length ? { artifactReferences } : {}),
+    ...(manualBlock ? {
+      recoveryDisposition: "manual_intervention" as const,
+      blockedReason: "target_state_mismatch" as const,
+      nextAction: "restore_target_state_manually" as const,
+    } : {}),
   };
+}
+
+function projectComputerAgentEpisode(value: unknown, workerResult: ComputerWorkerResult): ComputerAgentEpisode | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const episode = value as Partial<ComputerAgentEpisode>;
+  if (typeof episode.agentId !== "string" || !/^[A-Za-z0-9_-]{2,160}$/.test(episode.agentId)) return undefined;
+  if (typeof episode.runId !== "string" || !/^[A-Za-z0-9_-]{2,160}$/.test(episode.runId)) return undefined;
+  if (episode.parentId !== null && (typeof episode.parentId !== "string" || !/^[A-Za-z0-9_-]{2,160}$/.test(episode.parentId))) return undefined;
+  if (!["operator", "computer-verifier", "computer-terminal"].includes(String(episode.name))) return undefined;
+  if (!isComputerWorkerRole(episode.role)) return undefined;
+  if (!["ok", "failed", "aborted", "interrupted", "stalled"].includes(String(episode.terminalState))) return undefined;
+  return {
+    agentId: episode.agentId,
+    runId: episode.runId,
+    parentId: episode.parentId,
+    name: episode.name as ComputerAgentEpisode["name"],
+    role: episode.role,
+    terminalState: episode.terminalState as ComputerAgentEpisode["terminalState"],
+    result: {
+      outcome: workerResult.outcome,
+      summary: WORKER_SUMMARY[workerResult.outcome],
+      ...(workerResult.failureCode ? { failureCode: workerResult.failureCode } : {}),
+    },
+  };
+}
+
+export function computerTaskDetails(
+  result: ComputerTaskResult,
+  root: ComputerAgentEpisode,
+  leaderEpisodes: ComputerAgentEpisode[],
+  leaderSummary?: string,
+): ComputerTaskResult & { leaderSummary?: string; hierarchy: { root: Pick<ComputerAgentEpisode, "agentId" | "runId" | "parentId" | "name" | "role">; episodes: ComputerAgentEpisode[] } } {
+  const episodes = [root, ...leaderEpisodes, ...(result.episodes ?? [])].map((episode) => structuredClone(episode));
+  return {
+    ...result,
+    episodes,
+    ...(leaderSummary ? { leaderSummary } : {}),
+    hierarchy: {
+      root: { agentId: root.agentId, runId: root.runId, parentId: root.parentId, name: root.name, role: root.role },
+      episodes: structuredClone(episodes),
+    },
+  };
+}
+
+export function computerTaskContent(
+  details: Pick<ComputerTaskResult, "summary" | "verification" | "planRevisions"> & {
+    episodes?: ReadonlyArray<Omit<ComputerAgentEpisode, "name" | "role" | "terminalState" | "result"> & {
+      name: string;
+      role: string;
+      terminalState: string;
+      result: { outcome: string; summary: string; failureCode?: ComputerWorkerFailureCode };
+    }>;
+    investigation?: ComputerTaskResult["investigation"] | Record<string, unknown>;
+  },
+  summary = details.summary,
+  plan?: ComputerPlan,
+): string {
+  const episodeLedger = (details.episodes ?? []).map((episode) => ({
+    ...episode,
+    result: {
+      outcome: episode.result.outcome,
+      summary: episode.name === "computer-use-leader"
+        ? episode.result.outcome === "completed" ? "Computer Task completed" : episode.result.outcome === "cancelled" ? "Computer Task cancelled" : "Computer Task blocked"
+        : WORKER_SUMMARY[episode.result.outcome as ComputerWorkerResult["outcome"]] ?? "Worker failed",
+      ...(episode.result.failureCode ? { failureCode: episode.result.failureCode } : {}),
+    },
+  }));
+  // `episodeLedger` stays the first key for stable prose-side consumers; the
+  // trailing fields give the main agent (and the UI card renderer) the plan /
+  // verification / investigation view that the tool `details` side-channel
+  // carried but never survived the host RPC hop.
+  return `${summary}\n\nEpisode ledger:\n${JSON.stringify({
+    episodeLedger,
+    ...(plan ? { plan } : {}),
+    verification: details.verification,
+    planRevisions: details.planRevisions,
+    ...(details.investigation ? { investigation: details.investigation } : {}),
+  })}`;
+}
+
+export function computerTaskRootTerminalState(
+  result: { outcome: string; failureCode?: string },
+): ComputerAgentEpisode["terminalState"] {
+  if (result.failureCode === "computer_leader_stalled") return "stalled";
+  if (result.outcome === "succeeded") return "ok";
+  if (result.outcome === "cancelled") return "aborted";
+  return "failed";
+}
+
+export function computerOperatorContextOptions(
+  request: Pick<ComputerWorkerDispatch, "role" | "planRevision">,
+  agentId: string,
+): { agentId: string; retainContext: true; fresh: boolean } {
+  return { agentId, retainContext: true, fresh: request.planRevision > 0 };
 }
 
 function isSubjective(condition: ComputerPostcondition): boolean {
@@ -284,6 +458,35 @@ export class ComputerAgentCoordinator {
     const verificationObservationIds = new Set<string>();
     const verifiedTaskConditions = new Set<string>();
     const workerAttempts: NonNullable<ComputerTaskResult["investigation"]>["workerAttempts"] = [];
+    const episodes: ComputerAgentEpisode[] = [];
+    const recordEpisode = (dispatched: ComputerWorkerDispatchResult, attempt: NonNullable<ComputerTaskResult["investigation"]>["workerAttempts"][number]) => {
+      if (!dispatched.episode) return;
+      episodes.push(structuredClone(dispatched.episode));
+      Object.assign(attempt, {
+        agentId: dispatched.episode.agentId,
+        runId: dispatched.episode.runId,
+        parentId: dispatched.episode.parentId,
+        name: dispatched.episode.name,
+        terminalState: dispatched.episode.terminalState,
+        result: structuredClone(dispatched.episode.result),
+      });
+    };
+    const hasPendingDownstreamVerifier = (stepId: string) => {
+      const dependsOn = (candidateId: string): boolean => {
+        const pending = [candidateId];
+        const seen = new Set<string>();
+        while (pending.length) {
+          const current = pending.pop()!;
+          if (seen.has(current)) continue;
+          seen.add(current);
+          const dependencies = plan.steps.find((item) => item.id === current)?.dependsOn ?? [];
+          if (dependencies.includes(stepId)) return true;
+          pending.push(...dependencies);
+        }
+        return false;
+      };
+      return plan.steps.some((candidate) => candidate.role === "verifier" && !completed.has(candidate.id) && dependsOn(candidate.id));
+    };
 
     const taskVerification = () => {
       const conditionResults = plan.successConditions.map((condition, index) => ({
@@ -331,13 +534,13 @@ export class ComputerAgentCoordinator {
       verification = taskVerification(),
       summary = "Computer Task blocked",
     ) => {
-      const blocked = this.#result("blocked", summary, revisions, verification, investigation(stage, code, verification));
+      const blocked = this.#result("blocked", summary, revisions, verification, investigation(stage, code, verification), episodes);
       this.#emit({ type: "task_finished", taskId, outcome: blocked.outcome });
       return blocked;
     };
     const finishCancelled = () => {
       const verification = taskVerification();
-      const cancelled = this.#result("cancelled", "Computer Task cancelled", revisions, verification, investigation("cancelled", "task_cancelled", verification));
+      const cancelled = this.#result("cancelled", "Computer Task cancelled", revisions, verification, investigation("cancelled", "task_cancelled", verification), episodes);
       this.#emit({ type: "task_finished", taskId, outcome: cancelled.outcome });
       return cancelled;
     };
@@ -359,6 +562,7 @@ export class ComputerAgentCoordinator {
             summary: "Computer Task completed",
             verification,
             planRevisions: revisions,
+            ...(episodes.length ? { episodes: structuredClone(episodes) } : {}),
           });
         }
         return finishBlocked("plan_dependencies", "unresolved_dependencies", taskVerification(), "Computer Task plan has unresolved dependencies");
@@ -373,6 +577,7 @@ export class ComputerAgentCoordinator {
         postconditions: step.postconditions,
         ...(step.terminalPolicy ? { terminalPolicy: step.terminalPolicy } : {}),
         grants: grantsForComputerRole(step.role),
+        planRevision: revisions,
       }, signal);
       if (signal?.aborted) return finishCancelled();
       const result = dispatched.workerResult;
@@ -384,6 +589,7 @@ export class ComputerAgentCoordinator {
         verification: "unknown",
         ...(result.failureCode ? { failureCode: result.failureCode } : {}),
       };
+      recordEpisode(dispatched, attempt);
       workerAttempts.push(attempt);
       this.#emit({ type: "worker_finished", taskId, stepId: step.id, role: step.role, outcome: result.outcome, parentRole: "computer-use-leader", depth: 1 });
       if (result.outcome === "completed" || result.outcome === "verified") {
@@ -395,6 +601,15 @@ export class ComputerAgentCoordinator {
           ? verifiedConditionResults(step.postconditions, `${step.id}:condition`)
           : evaluatePostconditions(step.postconditions, result.observation, `${step.id}:condition`);
         if (verification.status === "verified" && result.observation?.id) verificationObservationIds.add(result.observation.id);
+        if (
+          verification.status === "unknown" &&
+          step.role !== "verifier" &&
+          step.postconditions.every((condition) => condition.kind !== "file_exists") &&
+          hasPendingDownstreamVerifier(step.id)
+        ) {
+          completed.add(step.id);
+          continue;
+        }
         if (verification.status === "unknown" && step.postconditions.every((condition) => condition.kind !== "file_exists")) {
           if (signal?.aborted) return finishCancelled();
           const verified = await this.#dispatch({
@@ -405,6 +620,7 @@ export class ComputerAgentCoordinator {
             postconditions: step.postconditions,
             grants: grantsForComputerRole("verifier"),
             observation: result.observation,
+            planRevision: revisions,
           }, signal);
           if (signal?.aborted) return finishCancelled();
           const verifierAttempt: NonNullable<ComputerTaskResult["investigation"]>["workerAttempts"][number] = {
@@ -414,6 +630,7 @@ export class ComputerAgentCoordinator {
             verification: "unknown",
             ...(verified.workerResult.failureCode ? { failureCode: verified.workerResult.failureCode } : {}),
           };
+          recordEpisode(verified, verifierAttempt);
           workerAttempts.push(verifierAttempt);
           verification = verified.workerResult.outcome === "verified" && verified.workerResult.observation?.id && verified.workerResult.observation.id !== result.observation?.id
             ? verifiedConditionResults(step.postconditions, `${step.id}:condition`)
@@ -443,6 +660,7 @@ export class ComputerAgentCoordinator {
               summary: "Computer Task completed",
               verification,
               planRevisions: revisions,
+              ...(episodes.length ? { episodes: structuredClone(episodes) } : {}),
             });
           }
           continue;
@@ -459,6 +677,7 @@ export class ComputerAgentCoordinator {
           objective: "Obtain a fresh observation before any mutation retry",
           postconditions: step.postconditions,
           grants: grantsForComputerRole("verifier"),
+          planRevision: revisions,
         }, signal);
         if (signal?.aborted) return finishCancelled();
         const verifierAttempt: NonNullable<ComputerTaskResult["investigation"]>["workerAttempts"][number] = {
@@ -468,6 +687,7 @@ export class ComputerAgentCoordinator {
           verification: "unknown",
           ...(observed.workerResult.failureCode ? { failureCode: observed.workerResult.failureCode } : {}),
         };
+        recordEpisode(observed, verifierAttempt);
         workerAttempts.push(verifierAttempt);
         recoveryObservation = observed.workerResult.observation;
         const recovered = evaluatePostconditions(step.postconditions, recoveryObservation, `${step.id}:condition`);
@@ -487,6 +707,7 @@ export class ComputerAgentCoordinator {
               summary: "Computer Task completed",
               verification,
               planRevisions: revisions,
+              ...(episodes.length ? { episodes: structuredClone(episodes) } : {}),
             });
           }
           continue;
@@ -495,6 +716,29 @@ export class ComputerAgentCoordinator {
 
       if (attempt.verification === "unknown" && result.observation) {
         attempt.verification = evaluatePostconditions(step.postconditions, result.observation, `${step.id}:condition`).status;
+      }
+
+      if (
+        result.outcome === "blocked"
+        && result.recoveryDisposition === "manual_intervention"
+        && result.blockedReason === "target_state_mismatch"
+        && result.nextAction === "restore_target_state_manually"
+      ) {
+        const verification = taskVerification();
+        const blocked: ComputerTaskResult = {
+          outcome: "blocked",
+          summary: "Target state requires manual restoration before retry",
+          verification,
+          planRevisions: revisions,
+          investigation: {
+            ...investigation("manual_intervention", "target_state_mismatch", verification),
+            blockedReason: result.blockedReason,
+            nextAction: result.nextAction,
+          },
+          ...(episodes.length ? { episodes: structuredClone(episodes) } : {}),
+        };
+        this.#emit({ type: "task_finished", taskId, outcome: blocked.outcome });
+        return blocked;
       }
 
       if (revisions >= this.#maxReplans) {
@@ -523,6 +767,7 @@ export class ComputerAgentCoordinator {
           verification,
           planRevisions: revisions,
           investigation: investigation("recovery_plan", "recovery_plan_invalid", verification),
+          ...(episodes.length ? { episodes: structuredClone(episodes) } : {}),
         };
         this.#emit({ type: "task_finished", taskId, outcome: blocked.outcome });
         return blocked;
@@ -534,6 +779,7 @@ export class ComputerAgentCoordinator {
 
   #validatePlan(plan: ComputerPlan): void {
     if (!Array.isArray(plan.steps) || plan.steps.length === 0) throw new Error("Computer Plan requires at least one step");
+    validateComputerPlanCuaOnly(plan);
     if (!Array.isArray(plan.successConditions) || plan.successConditions.length === 0) throw new Error("Computer Plan requires at least one task success condition");
     const stepPostconditions = plan.steps.flatMap((step) => step.postconditions.map((condition) => JSON.stringify(condition)));
     if (plan.successConditions.some((condition) => !stepPostconditions.includes(JSON.stringify(condition)))) {
@@ -562,13 +808,19 @@ export class ComputerAgentCoordinator {
   async #dispatch(request: ComputerWorkerDispatch, signal?: AbortSignal): Promise<ComputerWorkerDispatchResult> {
     try {
       const dispatched = await this.#dispatcher.dispatch(request, signal);
-      if ("workerResult" in dispatched && Array.isArray(dispatched.hostExecutionRecords)) return { workerResult: projectComputerWorkerResult(dispatched.workerResult), hostExecutionRecords: structuredClone(dispatched.hostExecutionRecords) };
-      return { workerResult: projectComputerWorkerResult(dispatched), hostExecutionRecords: [] };
+      if ("workerResult" in dispatched && Array.isArray(dispatched.hostExecutionRecords)) {
+        const workerResult = projectComputerWorkerResult(dispatched.workerResult);
+        const episode = projectComputerAgentEpisode(dispatched.episode, workerResult);
+        return { workerResult, hostExecutionRecords: structuredClone(dispatched.hostExecutionRecords), ...(episode ? { episode } : {}) };
+      }
+      return { workerResult: projectComputerWorkerResult(dispatched as ComputerWorkerResult), hostExecutionRecords: [] };
     } catch (error) {
       const failureCode = error && typeof error === "object" && COMPUTER_WORKER_FAILURE_CODES.includes((error as any).failureCode)
         ? (error as any).failureCode as ComputerWorkerFailureCode
         : "computer_worker_dispatch_failed";
-      return { workerResult: projectComputerWorkerResult({ outcome: "failed", summary: error instanceof Error ? error.message : "Computer Worker failed", failureCode }), hostExecutionRecords: [] };
+      const workerResult = projectComputerWorkerResult({ outcome: "failed", summary: error instanceof Error ? error.message : "Computer Worker failed", failureCode });
+      const episode = projectComputerAgentEpisode((error as { episode?: unknown })?.episode, workerResult);
+      return { workerResult, hostExecutionRecords: [], ...(episode ? { episode } : {}) };
     }
   }
 
@@ -597,12 +849,14 @@ export class ComputerAgentCoordinator {
     planRevisions: number,
     verification: ComputerTaskResult["verification"] = { status: "not_verified", conditionResults: [] },
     investigation?: ComputerTaskResult["investigation"],
+    episodes: ComputerAgentEpisode[] = [],
   ): ComputerTaskResult {
     return {
       outcome,
       summary: outcome === "cancelled" ? "Computer Task cancelled" : outcome === "blocked" ? "Computer Task blocked" : "Computer Task failed",
       verification,
       planRevisions,
+      ...(episodes.length ? { episodes: structuredClone(episodes) } : {}),
       ...(investigation ? { investigation } : {}),
     };
   }

@@ -273,6 +273,156 @@ describe("remembered manual model selection", () => {
   });
 });
 
+describe("remembered manual thinking level", () => {
+  let root = "";
+  const backends: ReturnType<typeof createPiHostBackend>[] = [];
+
+  afterEach(async () => {
+    await Promise.all(backends.map((backend) => backend.close().catch(() => undefined)));
+    backends.length = 0;
+    if (root) await rm(root, { recursive: true, force: true });
+    root = "";
+  });
+
+  it("uses the last chosen thinking档 for new sessions after viewing another session, persists it, and keeps old sessions", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-remembered-thinking-"));
+    const agent = join(root, "agent");
+    const cwd = join(root, "project");
+    const dir = join(root, "sessions", "project");
+    await mkdir(agent, { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(agent, "settings.json"), JSON.stringify({
+      defaultProvider: "relay",
+      defaultModel: "model-a",
+      defaultThinkingLevel: "medium",
+    }));
+    await writeFile(join(agent, "models.json"), JSON.stringify({
+      providers: {
+        relay: {
+          apiKey: "$RELAY_KEY",
+          models: [
+            { id: "model-a", name: "Model A", reasoning: true },
+            { id: "model-b", name: "Model B", reasoning: true },
+          ],
+        },
+      },
+    }));
+    await writeFile(join(agent, "pipiui-settings.json"), JSON.stringify({
+      hiddenModelIds: ["relay/hidden"],
+      futureField: { keep: true },
+    }));
+    await writeFile(
+      join(dir, "session-1.jsonl"),
+      JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: "2026-08-11T00:00:00.000Z", cwd }) + "\n",
+    );
+    await writeFile(
+      join(dir, "session-2.jsonl"),
+      JSON.stringify({ type: "session", version: 3, id: "session-2", timestamp: "2026-08-11T00:00:00.000Z", cwd }) + "\n" +
+        JSON.stringify({ type: "thinking_level_change", id: "t2", parentId: null, timestamp: "2026-08-11T00:00:01.000Z", thinkingLevel: "low" }) + "\n",
+    );
+
+    const makeBackend = () => {
+      const backend = createPiHostBackend({
+        agentDir: agent,
+        sessionsRoot: join(root, "sessions"),
+        runtimeRoot: join(root, "runtime"),
+        canonicalProjectPaths: async () => undefined,
+        env: { RELAY_KEY: "present" },
+        piPath: "node",
+        spawn: (_bin: any, _args: any, options: any) => spawn("/usr/local/bin/node", [new URL("./fake-pi.mjs", import.meta.url).pathname], { ...options, env: { ...options.env, PATH: "/usr/local/bin:/usr/bin:/bin" } }) as any,
+        authRuntime: { getProviders: async () => [], getAvailable: async () => [], login: async () => undefined, logout: async () => undefined },
+      });
+      backends.push(backend);
+      return backend;
+    };
+
+    const first = makeBackend();
+    await first.handle("setProjectPaths", [[cwd]]);
+    const [project] = await first.handle("listProjects", []) as any[];
+
+    await first.handle("setThinkingLevel", ["session-1", "high"]);
+    expect(await first.handle("getModelState", ["session-2"])).toMatchObject({
+      thinkingLevel: "low",
+    });
+
+    const session3 = await first.handle("newSession", [project.id, "Session 3"]) as any;
+    expect(await first.handle("getModelState", [session3.id])).toMatchObject({
+      thinkingLevel: "high",
+    });
+    expect(JSON.parse(await readFile(join(agent, "pipiui-settings.json"), "utf8"))).toMatchObject({
+      manualThinkingLevel: "high",
+      hiddenModelIds: ["relay/hidden"],
+      futureField: { keep: true },
+    });
+
+    await first.close();
+    backends.splice(backends.indexOf(first), 1);
+
+    const fresh = makeBackend();
+    const session4 = await fresh.handle("newSession", [project.id, "Session 4"]) as any;
+    expect(await fresh.handle("getModelState", [session4.id])).toMatchObject({
+      thinkingLevel: "high",
+    });
+    expect(await fresh.handle("getModelState", [session3.id])).toMatchObject({
+      thinkingLevel: "high",
+    });
+    expect(await fresh.handle("getModelState", ["session-2"])).toMatchObject({
+      thinkingLevel: "low",
+    });
+  });
+
+  it("clamps a remembered thinking档 to the new session model's available levels", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-unavailable-remembered-thinking-"));
+    const agent = join(root, "agent");
+    const cwd = join(root, "project");
+    await mkdir(agent, { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await writeFile(join(agent, "settings.json"), JSON.stringify({
+      defaultProvider: "relay",
+      defaultModel: "narrow",
+      defaultThinkingLevel: "medium",
+    }));
+    await writeFile(join(agent, "models.json"), JSON.stringify({
+      providers: {
+        relay: {
+          apiKey: "$RELAY_KEY",
+          models: [
+            {
+              id: "narrow",
+              name: "Narrow",
+              reasoning: true,
+              thinkingLevelMap: { off: null, low: "low", medium: "medium" },
+            },
+          ],
+        },
+      },
+    }));
+    await writeFile(join(agent, "pipiui-settings.json"), JSON.stringify({
+      manualThinkingLevel: "xhigh",
+    }));
+    const backend = createPiHostBackend({
+      agentDir: agent,
+      sessionsRoot: join(root, "sessions"),
+      runtimeRoot: join(root, "runtime"),
+      canonicalProjectPaths: async () => undefined,
+      env: { RELAY_KEY: "present" },
+      piPath: "node",
+      spawn: (_bin: any, _args: any, options: any) => spawn("/usr/local/bin/node", [new URL("./fake-pi.mjs", import.meta.url).pathname], { ...options, env: { ...options.env, PATH: "/usr/local/bin:/usr/bin:/bin" } }) as any,
+      authRuntime: { getProviders: async () => [], getAvailable: async () => [], login: async () => undefined, logout: async () => undefined },
+    });
+    backends.push(backend);
+    await backend.handle("setProjectPaths", [[cwd]]);
+    const [project] = await backend.handle("listProjects", []) as any[];
+    const session = await backend.handle("newSession", [project.id]) as any;
+
+    expect(await backend.handle("getModelState", [session.id])).toMatchObject({
+      thinkingLevel: "medium",
+      availableThinkingLevels: ["low", "medium"],
+    });
+  });
+});
+
 describe("session model recovery after Pi exits", () => {
   let root = "";
   let backend: ReturnType<typeof createPiHostBackend> | undefined;

@@ -12,7 +12,7 @@ import { createPiHostBackend } from "../src/index.js";
  * which is exactly how model/activity/final-result silently stayed blank.
  */
 const START = { kind: "start", agentId: "a1", runId: "r1", parentId: null, toolCallId: "tc1", name: "general-purpose", task: "接入真实左侧栏", depth: 2, model: null, title: "接入真实左侧栏", worktreePath: "/tmp/wt", worktreeBranch: "pipiui/worker-a1" };
-const USAGE = { kind: "usage", agentId: "a1", runId: "r1", turn: 3, model: "deepseek/deepseek-v4-flash", tools: [], usage: { input: 12_400, output: 2_130, cacheRead: 8_900, cacheWrite: 100, cost: 0.42, contextTokens: 153_000 } };
+const USAGE = { kind: "usage", agentId: "a1", runId: "r1", turn: 3, model: "deepseek/deepseek-v4-flash", tools: [], usage: { input: 12_400, output: 2_130, cacheRead: 8_900, cacheWrite: 100, cost: 0.42, contextTokens: 153_000, contextWindow: 262_144 } };
 const UPDATE = { kind: "update", agentId: "a1", runId: "r1", output: "部分结果", activity: "bash cd Electron && npm run build", cost: 0.44, turns: 3 };
 const END = { kind: "end", agentId: "a1", runId: "r1", ok: true, output: "最终结果全文", cost: 0.55, turns: 4 };
 
@@ -77,8 +77,8 @@ describe("subagent lifecycle → AgentSummary", () => {
 		const command = vi.fn(async () => ({}));
 		(backend as any).command = command;
 		const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
-		await vi.waitFor(() => expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1" }));
-		expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1" });
+		await vi.waitFor(() => expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1", streamingBehavior: "followUp" }));
+		expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1", streamingBehavior: "followUp" });
 		expect(latest().state).toBe("running");
 		deliver({ ...END, agentId: "agent-safe_1", ok: false, aborted: true, output: "aborted" });
 		await expect(aborting).resolves.toBeUndefined();
@@ -95,7 +95,7 @@ describe("subagent lifecycle → AgentSummary", () => {
 			(backend as any).command = command;
 			const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
 			await vi.advanceTimersByTimeAsync(0);
-			expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1" });
+			expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1", streamingBehavior: "followUp" });
 			await vi.advanceTimersByTimeAsync(5_000);
 			await expect(aborting).resolves.toBeUndefined();
 			expect(latest()).toMatchObject({ agentId: "agent-safe_1", state: "aborted" });
@@ -144,7 +144,7 @@ describe("subagent lifecycle → AgentSummary", () => {
 			(backend as any).command = command;
 			const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
 			await vi.advanceTimersByTimeAsync(0);
-			expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1" });
+			expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1", streamingBehavior: "followUp" });
 			expect(latest().state).toBe("running");
 			await vi.advanceTimersByTimeAsync(15_000);
 			await expect(aborting).resolves.toBeUndefined();
@@ -162,6 +162,26 @@ describe("subagent lifecycle → AgentSummary", () => {
 		deliver({ ...UPDATE, output: "late preview", activity: "stale activity" });
 		expect(latest()).toMatchObject({ state: "aborted", finalResult: "aborted", endedAt });
 	});
+
+  it("clears the runtime-budget deadline on terminal events and lets a new run re-arm it", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    const deadlineAt = Date.now() + 180_000;
+    deliver({ ...UPDATE, deadlineAt });
+    expect(latest().deadlineAt).toBe(deadlineAt);
+    // A dead worker must never keep rendering "最迟 NNN 秒后自动中止".
+    deliver(END);
+    expect(latest().state).toBe("ok");
+    expect(latest().deadlineAt).toBeUndefined();
+    // Late non-terminal events on the terminal run cannot resurrect the deadline either.
+    deliver({ ...UPDATE, output: "late preview" });
+    expect(latest().deadlineAt).toBeUndefined();
+    // A fresh run for the same agentId starts clean and can arm a new deadline.
+    deliver({ ...START, runId: "r2" });
+    const newDeadline = Date.now() + 300_000;
+    deliver({ ...UPDATE, runId: "r2", deadlineAt: newDeadline });
+    expect(latest()).toMatchObject({ runId: "r2", deadlineAt: newDeadline });
+  });
   it("carries identity, model, live activity and tokens through to the panel", async () => {
     const { deliver, latest } = await harness();
 
@@ -172,7 +192,7 @@ describe("subagent lifecycle → AgentSummary", () => {
     expect(latest().provider).toBeUndefined();
 
     deliver(USAGE);
-    expect(latest()).toMatchObject({ model: "deepseek/deepseek-v4-flash", provider: "deepseek", inputTokens: 12_400, outputTokens: 2_130, cacheTokens: 8_900, contextTokens: 153_000, turns: 3, cost: 0.42 });
+    expect(latest()).toMatchObject({ model: "deepseek/deepseek-v4-flash", provider: "deepseek", inputTokens: 12_400, outputTokens: 2_130, cacheTokens: 8_900, contextTokens: 153_000, contextWindowTokens: 262_144, turns: 3, cost: 0.42 });
 
     deliver(UPDATE);
     // The 正在执行 line, and no final-result card while the worker is still running.
@@ -187,6 +207,39 @@ describe("subagent lifecycle → AgentSummary", () => {
     expect(latest().endedAt).toBeGreaterThan(0);
     // Everything learned earlier survives the terminal event.
     expect(latest()).toMatchObject({ model: "deepseek/deepseek-v4-flash", contextTokens: 153_000, listSubtitle: "bash cd Electron && npm run build" });
+  });
+
+  it("replaces streaming usage totals instead of adding them", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver(USAGE);
+    deliver({
+      ...USAGE,
+      turn: 3,
+      usage: { input: 12_800, output: 2_400, cacheRead: 8_900, cacheWrite: 100, cost: 0.45, contextTokens: 154_200 },
+    });
+    expect(latest()).toMatchObject({
+      inputTokens: 12_800,
+      outputTokens: 2_400,
+      cacheTokens: 8_900,
+      contextTokens: 154_200,
+      contextWindowTokens: 262_144,
+      turns: 3,
+      cost: 0.45,
+    });
+    deliver({
+      ...USAGE,
+      turn: 4,
+      usage: { input: 13_100, output: 2_600, cacheRead: 8_900, cacheWrite: 100, cost: 0.48, contextTokens: 155_000 },
+    });
+    expect(latest()).toMatchObject({
+      inputTokens: 13_100,
+      outputTokens: 2_600,
+      cacheTokens: 8_900,
+      contextTokens: 155_000,
+      turns: 4,
+      cost: 0.48,
+    });
   });
 
   it("publishes the worktree lifecycle the panel badges read", async () => {
@@ -246,13 +299,13 @@ describe("subagent lifecycle → AgentSummary", () => {
   it("relays streamed log deltas and batched log items", async () => {
     const { deliver, events } = await harness();
     deliver(START);
-    deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 0, itemType: "thinking", text: "Planning project rebuild" });
+    deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 0, itemType: "thinking", text: "Planning project rebuild", charCount: 2400 });
     deliver({ kind: "log", agentId: "a1", runId: "r1", items: [{ itemType: "tool", name: "bash", text: "npm run build" }, { itemType: "toolResult", text: "done", isError: false }] });
     const logs = events.filter((event): event is Extract<AgentEvent, { type: "agent_log" }> => event.type === "agent_log" && !event.resetStreamSlots);
-    expect(logs.map(log => [log.itemType, log.name ?? "", log.text])).toEqual([
-      ["thinking", "", "Planning project rebuild"],
-      ["tool", "bash", "npm run build"],
-      ["toolResult", "", "done"]
+    expect(logs.map(log => [log.itemType, log.name ?? "", log.text, log.charCount])).toEqual([
+      ["thinking", "", "Planning project rebuild", 2400],
+      ["tool", "bash", "npm run build", undefined],
+      ["toolResult", "", "done", undefined]
     ]);
   });
 

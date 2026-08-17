@@ -11,14 +11,13 @@ const philosophySourceRoot = join(repoRoot, "Sources", "PipiUI", "PiPhilosophy")
 const philosophyRuntimeRoot = join(electronRoot, "resources", "runtime", "pi-philosophy");
 const mirrors = [
   ...[
-  // Electron owns resources/runtime/pi-ext/subagent. Sources/PipiUI/PiExt is
-  // the frozen Swift-app mirror and must not overwrite the default product
-  // during normal Electron dev/build/test preparation.
+  // Electron owns resources/runtime/pi-ext/subagent and packages/computer-agent.
+  // Sources/PipiUI/PiExt is the frozen Swift-app mirror and must not overwrite
+  // the default product during normal Electron dev/build/test preparation.
   "agents/operator/AGENT.md",
   "agents/computer-use-leader/AGENT.md",
   "agents/computer-verifier/AGENT.md",
   "agents/computer-terminal/AGENT.md",
-  "packages/computer-agent",
   ].map((relative) => ({ sourceRoot, runtimeRoot, relative })),
   ...[
     "layers/30-orchestration.md",
@@ -29,7 +28,7 @@ const mirrors = [
 async function checkCuaContract() {
   const [assetsText, skillText] = await Promise.all([
     readFile(join(electronRoot, "cua-driver-assets.json"), "utf8"),
-    readFile(join(sourceRoot, "packages/computer-agent/skills/cua-driver-operation/SKILL.md"), "utf8"),
+    readFile(join(runtimeRoot, "packages/computer-agent/skills/cua-driver-operation/SKILL.md"), "utf8"),
   ]);
   const assetsVersion = JSON.parse(assetsText).version;
   const skillVersion = skillText.match(/cua-driver-version:\s*["']?([^"'\s]+)["']?/)?.[1];

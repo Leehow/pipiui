@@ -1,8 +1,10 @@
 // @vitest-environment jsdom
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PipiHostAPI, QuotaSnapshot } from '@pipi/host-api'
-import { QuotaPill } from './QuotaPill'
+import { QuotaPill, quotaSnapshotMatchesProvider } from './QuotaPill'
 
 beforeEach(() => {
   vi.useRealTimers()
@@ -32,6 +34,20 @@ function quotaHost(snapshot: QuotaSnapshot | null): { host: PipiHostAPI; getQuot
   const getQuotaSnapshot = vi.fn(async () => snapshot)
   return { host: { protocolVersion: 2, getQuotaSnapshot } as unknown as PipiHostAPI, getQuotaSnapshot }
 }
+
+describe('quotaSnapshotMatchesProvider', () => {
+  it('maps host snapshot kinds onto the composer model provider', () => {
+    expect(quotaSnapshotMatchesProvider(codexSnapshot, 'openai-codex')).toBe(true)
+    expect(quotaSnapshotMatchesProvider(codexSnapshot, 'openai')).toBe(true)
+    expect(quotaSnapshotMatchesProvider(codexSnapshot, 'anthropic')).toBe(false)
+    expect(quotaSnapshotMatchesProvider({ provider: 'qwenTokenPlan', accountLabel: '', windows: [] }, 'qwen-token-plan-cn')).toBe(true)
+    expect(quotaSnapshotMatchesProvider({ provider: 'qwenTokenPlan', accountLabel: '', windows: [] }, 'qwen-vl')).toBe(false)
+    expect(quotaSnapshotMatchesProvider({ provider: 'grok', accountLabel: '', windows: [] }, 'xai')).toBe(true)
+    expect(quotaSnapshotMatchesProvider({ provider: 'grok', accountLabel: '', windows: [] }, 'grok-relay')).toBe(false)
+    expect(quotaSnapshotMatchesProvider({ provider: 'cursor', accountLabel: '', windows: [] }, 'cursor')).toBe(true)
+    expect(quotaSnapshotMatchesProvider({ provider: 'cursor', accountLabel: '', windows: [] }, 'cursor-relay')).toBe(false)
+  })
+})
 
 describe('QuotaPill', () => {
   it('renders the Swift-style period label (highest-use window) as a clickable pill', async () => {
@@ -117,11 +133,13 @@ describe('QuotaPill', () => {
     expect(screen.queryByTestId('quota-menu')).toBeNull()
   })
 
-  it('portals the quota menu to document.body so overflow:hidden ancestors cannot clip it', async () => {
+  it('portals the quota menu into .pipiui-shell so theme tokens paint an opaque background', async () => {
     const { host } = quotaHost(codexSnapshot)
     const { container } = render(
-      <div data-testid="clip-parent" style={{ overflow: 'hidden', width: 48 }}>
-        <QuotaPill host={host} provider="openai-codex" />
+      <div className="pipiui-shell" data-theme="light" data-testid="theme-shell">
+        <div data-testid="clip-parent" style={{ overflow: 'hidden', width: 48 }}>
+          <QuotaPill host={host} provider="openai-codex" />
+        </div>
       </div>
     )
     const pill = await screen.findByTestId('quota-pill')
@@ -132,12 +150,18 @@ describe('QuotaPill', () => {
     Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 })
     fireEvent.click(pill)
     const menu = await screen.findByTestId('quota-menu')
+    const shell = screen.getByTestId('theme-shell')
     expect(screen.getByTestId('clip-parent').contains(menu)).toBe(false)
-    expect(container.contains(menu)).toBe(false)
-    expect(document.body.contains(menu)).toBe(true)
+    expect(shell.contains(menu)).toBe(true)
+    expect(container.contains(menu)).toBe(true)
     expect(menu.style.position).toBe('fixed')
     expect(menu.style.right).toBe('500px')
     expect(menu.style.bottom).toBe('88px')
+  })
+
+  it('keeps an opaque menu background when theme tokens are not inherited', () => {
+    const css = readFileSync(join(import.meta.dirname, 'quota-pill.css'), 'utf8')
+    expect(css).toContain('background: var(--surface-raised,#fff)')
   })
 
   it('renders nothing when the host has no getQuotaSnapshot (older host)', async () => {
@@ -197,5 +221,47 @@ describe('QuotaPill', () => {
     await screen.findByTestId('quota-pill')
     rerender(<QuotaPill host={host} provider="deepseek" />)
     await waitFor(() => expect(getQuotaSnapshot).toHaveBeenCalledTimes(2))
+  })
+
+  it('drops the previous capsule immediately when the provider changes', async () => {
+    const getQuotaSnapshot = vi.fn(async () => codexSnapshot)
+    const host = { protocolVersion: 2, getQuotaSnapshot } as unknown as PipiHostAPI
+    const { rerender } = render(<QuotaPill host={host} sessionId="s1" provider="openai-codex" />)
+    expect((await screen.findByTestId('quota-pill')).textContent).toBe('周 41%')
+    getQuotaSnapshot.mockImplementation(() => new Promise(() => undefined))
+    rerender(<QuotaPill host={host} sessionId="s1" provider="deepseek" />)
+    expect(screen.queryByTestId('quota-pill')).toBeNull()
+  })
+
+  it('ignores a host snapshot that still belongs to the previous model', async () => {
+    const getQuotaSnapshot = vi.fn(async () => codexSnapshot)
+    const host = { protocolVersion: 2, getQuotaSnapshot } as unknown as PipiHostAPI
+    const { rerender } = render(<QuotaPill host={host} sessionId="s1" provider="openai-codex" />)
+    expect((await screen.findByTestId('quota-pill')).textContent).toBe('周 41%')
+    rerender(<QuotaPill host={host} sessionId="s1" provider="anthropic" />)
+    await waitFor(() => expect(screen.queryByTestId('quota-pill')).toBeNull())
+    expect(getQuotaSnapshot.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('does not carry an in-session window pick onto another provider', async () => {
+    const claudeSnapshot: QuotaSnapshot = {
+      provider: 'claude',
+      accountLabel: 'Claude 账号额度',
+      windows: [
+        { id: 'window0', usedPercent: 10, label: '5h', title: '5小时额度' },
+        { id: 'window1', usedPercent: 80, label: '周', title: '周额度' }
+      ]
+    }
+    const getQuotaSnapshot = vi.fn(async () => codexSnapshot)
+    const host = { protocolVersion: 2, getQuotaSnapshot } as unknown as PipiHostAPI
+    const { rerender } = render(<QuotaPill host={host} provider="openai-codex" />)
+    fireEvent.click(await screen.findByTestId('quota-pill'))
+    fireEvent.click(screen.getByTestId('quota-row-window0'))
+    expect(screen.getByTestId('quota-pill').textContent).toBe('5h 4%')
+    getQuotaSnapshot.mockResolvedValue(claudeSnapshot)
+    rerender(<QuotaPill host={host} provider="anthropic" />)
+    expect((await screen.findByTestId('quota-pill')).textContent).toBe('周 80%')
+    expect(localStorage.getItem('pipiui.quotaWindow.codex')).toBe('window0')
+    expect(localStorage.getItem('pipiui.quotaWindow.claude')).toBeNull()
   })
 })

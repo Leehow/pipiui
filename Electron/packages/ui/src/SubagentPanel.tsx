@@ -2,7 +2,9 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { createPortal } from 'react-dom'
 import { Diff, Hunk, parseDiff } from 'react-diff-view'
 import { ActivityCard } from './ActivityCard'
+import { cacheHitRate, formatCompactTokens } from './session-stats-format'
 import { toolActivitySummary, toolArgsSummary } from './tool-summary'
+import { fileChangeTokenStats, liveTokenLabel } from './file-change-tokens'
 import { DismissibleError } from './DismissibleError'
 import { ProviderLogo } from './ProviderLogo'
 import { providerBrand, type ProviderBrand } from './provider-logo'
@@ -19,6 +21,8 @@ type Log = {
   isError?: boolean
   /** Runtime log_delta key (cumulative snapshot upsert); undefined for terminal `log` batches. */
   contentIndex?: number
+  /** Uncapped thinking length when preview `text` is sliced. */
+  charCount?: number
 }
 type Agent = AgentSummary & {
   startedAt: number
@@ -93,9 +97,35 @@ function spend(cost: number | undefined, pricing: Pricing, includeConversion = f
 
 function formatTokens(value: number | undefined) {
   if (!value || value <= 0) return ''
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}m`
-  if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`
-  return String(value)
+  return formatCompactTokens(value)
+}
+
+export function agentDetailUsage(agent: Pick<AgentSummary, 'contextTokens' | 'contextWindowTokens' | 'inputTokens' | 'outputTokens' | 'cacheTokens'>): {
+  context?: string
+  cache?: string
+  io?: string
+} {
+  const used = agent.contextTokens
+  const windowSize = agent.contextWindowTokens
+  const context = used && used > 0 && windowSize && windowSize > 0
+    ? `${formatCompactTokens(used)}/${formatCompactTokens(windowSize)}`
+    : windowSize && windowSize > 0
+      ? `?/${formatCompactTokens(windowSize)}`
+      : used && used > 0
+        ? formatCompactTokens(used)
+        : undefined
+  const cache = cacheHitRate(agent.cacheTokens ?? 0, agent.inputTokens ?? 0) ?? undefined
+  const input = agent.inputTokens ?? 0
+  const output = agent.outputTokens ?? 0
+  const io = input > 0 || output > 0
+    ? `${formatCompactTokens(input)} / ${formatCompactTokens(output)}`
+    : undefined
+  return { context, cache, io }
+}
+
+function agentTokenTotal(agent: Pick<AgentSummary, 'inputTokens' | 'outputTokens' | 'cacheTokens' | 'contextTokens'>) {
+  const counted = (agent.inputTokens ?? 0) + (agent.outputTokens ?? 0) + (agent.cacheTokens ?? 0)
+  return counted > 0 ? counted : (agent.contextTokens ?? 0)
 }
 
 function preview(value: string, fallback = '无内容') {
@@ -187,17 +217,32 @@ function agentListSubtitle(agent: Agent): string {
 
 type LiveAgentStatus = { text: string; severity: 'active' | 'quiet' | 'deadline' }
 
-function liveToolActivityLabel(rawActivity: string): string | undefined {
+function liveToolActivityLabel(rawActivity: string, tokenSuffix?: string): string | undefined {
   const match = rawActivity.match(/^([a-z][a-z0-9_-]*)\b/i)
   if (!match) return undefined
   const name = match[1]
   const rest = rawActivity.slice(match[0].length).trim()
-  if (!rest || rest === '…') return name
-  if (rest.startsWith('{')) {
-    const summary = toolArgsSummary(name, rest)
-    return summary !== '…' ? `${name} · ${summary}` : name
+  const base = !rest || rest === '…'
+    ? name
+    : rest.startsWith('{')
+      ? (() => {
+        const summary = toolArgsSummary(name, rest)
+        return summary !== '…' ? `${name} · ${summary}` : name
+      })()
+      : `${name} · ${rest}`
+  return tokenSuffix ? `${base} · ${tokenSuffix}` : base
+}
+
+function latestWriteEditTokenLabel(agent: Agent): string | undefined {
+  for (let i = agent.logs.length - 1; i >= 0; i -= 1) {
+    const log = agent.logs[i]
+    if (log.itemType !== 'tool') continue
+    const name = (log.name ?? '').trim()
+    const stats = fileChangeTokenStats(name, log.text)
+    if (!stats) continue
+    return liveTokenLabel(stats.payloadChars)
   }
-  return `${name} · ${rest}`
+  return undefined
 }
 
 function liveAgentStatus(agent: Agent, now: number, activeChildCount = 0): LiveAgentStatus {
@@ -206,7 +251,9 @@ function liveAgentStatus(agent: Agent, now: number, activeChildCount = 0): LiveA
 	}
   const quietSeconds = agent.updatedAt === undefined ? undefined : Math.max(0, Math.floor((now - agent.updatedAt) / 1000))
   const rawActivity = visibleAgentText(agent.listSubtitle ?? '').trim()
-  const toolLabel = liveToolActivityLabel(rawActivity)
+  const liveName = rawActivity.match(/^([a-z][a-z0-9_-]*)\b/i)?.[1]
+  const tokenSuffix = liveName === 'write' || liveName === 'edit' ? latestWriteEditTokenLabel(agent) : undefined
+  const toolLabel = liveToolActivityLabel(rawActivity, tokenSuffix)
   const replanning = /^(?:Revise this Computer Task plan|Repair this Computer Task plan)/i.test(agent.task)
   const phase = replanning
     ? '正在调查失败并重新规划'
@@ -319,7 +366,7 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
     if (log.itemType === 'thinking') {
       if (!text) continue
       const contentIndex = activityIndex(log)
-      activities.push({ type: 'thinking', id: `thinking:${log.id}`, contentIndex, content: text })
+      activities.push({ type: 'thinking', id: `thinking:${log.id}`, contentIndex, content: text, ...(typeof log.charCount === 'number' ? { charCount: log.charCount } : {}) })
       nextIndex = Math.max(nextIndex, contentIndex + 1)
     } else if (log.itemType === 'tool') {
       const result = takeResult(log, index)
@@ -403,6 +450,7 @@ function treeOrder(agents: Agent[]) {
 }
 
 export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable = false, visible: paneVisible = true, headerSlot, onRunningChange, onRunningCountChange, onAgentStarted, onManualStatusCheck }: { host: PipiHostAPI; sessionId?: string; projectPath?: string; onOpenDocument?: (path: string) => void; retainedWorktreeDispositionAvailable?: boolean; visible?: boolean; headerSlot?: HTMLElement | null; onRunningChange?: (running: boolean) => void; onRunningCountChange?: (count: number) => void; onAgentStarted?: () => void; onManualStatusCheck?: (agentIDs: string[]) => void }) {
+  const terminalAvailable = Boolean(host.terminal?.open)
   const [agents, setAgents] = useState<Agent[]>([])
   const [selectedId, setSelectedId] = useState<string>()
   const [page, setPage] = useState(0)
@@ -505,13 +553,15 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
 
   // Fetch cached logs for the selected agent so completed subagents show their
   // full transcript (live subscription only delivers events while running).
+  // `scope: 'agent'` concatenates every run of this agentId — Computer Use
+  // Leader reuses the id across plan / recovery / final-report runs.
   useEffect(() => {
     if (!selected?.agentId || !host.getAgentLogs) return
     let cancelled = false
     const agentId = selected.agentId
     const session = selected.sessionId ?? ''
     const runId = selected.runId ?? ''
-    void host.getAgentLogs(agentId, session, runId).then(entries => {
+    void host.getAgentLogs(agentId, session, runId, 'agent').then(entries => {
       if (cancelled || !entries.length) return
       setAgents(current => current.map(agent => {
         if (agent.agentId !== agentId || agent.logs.length > 0) return agent
@@ -527,11 +577,16 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     if (follow && agents.length) setPage(0)
   }, [agents.length, follow])
 
-  const summary = useMemo(() => ({
-    running: agents.filter(isActive).length,
-    succeeded: agents.filter(agent => agent.state === 'ok').length,
-    failed: agents.filter(agent => agent.state === 'failed').length,
-  }), [agents])
+  const summary = useMemo(() => {
+    const runningAgents = agents.filter(isActive)
+    const runningTokens = runningAgents.reduce((sum, agent) => sum + agentTokenTotal(agent), 0)
+    return {
+      running: runningAgents.length,
+      succeeded: agents.filter(agent => agent.state === 'ok').length,
+      failed: agents.filter(agent => agent.state === 'failed').length,
+      runningTokens,
+    }
+  }, [agents])
 
   useEffect(() => {
     onRunningCountChange?.(summary.running)
@@ -579,6 +634,14 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
   const worktree = async (agentId: string, action: 'merge' | 'discard') => {
     const status = action === 'merge' ? await host.mergeWorktree(agentId) : await host.discardWorktree(agentId)
     setAgents(current => applyAgentEvent(current, { type: 'worktree', status }))
+  }
+  const openWorktreeTerminal = async (wtPath: string) => {
+    if (!host.terminal?.open) return
+    try {
+      await host.terminal.open({ cwd: wtPath })
+    } catch (error) {
+      setAbortError(`无法打开终端：${error instanceof Error ? error.message : '打开失败'}`)
+    }
   }
 	const abort = async (agent: Agent) => {
 		if (abortingIds.has(agent.agentId)) return
@@ -648,7 +711,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
               </div>}
             </div>
             <div className="subagent-divider" aria-label="调整 agent 列表高度" role="separator" onPointerDown={startDrag} />
-			<AgentDetail agent={selected} activeChildCount={selected ? agents.filter(candidate => candidate.parentId === selected.agentId && isActive(candidate)).length : 0} aborting={Boolean(selected && abortingIds.has(selected.agentId))} now={now} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} onCheck={check} onWorktree={worktree} onAbort={agent => void abort(agent)} />
+			<AgentDetail agent={selected} activeChildCount={selected ? agents.filter(candidate => candidate.parentId === selected.agentId && isActive(candidate)).length : 0} aborting={Boolean(selected && abortingIds.has(selected.agentId))} now={now} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} terminalAvailable={terminalAvailable} onCheck={check} onWorktree={worktree} onOpenWorktreeTerminal={path => void openWorktreeTerminal(path)} onAbort={agent => void abort(agent)} />
           </div>}
   </section>
 }
@@ -712,20 +775,20 @@ function sealStreamSlots(logs: Log[]): Log[] {
 }
 
 function applyLogDelta(logs: Log[], event: Extract<AgentEvent, { type: 'agent_log' }>): Log[] {
-  const { itemType, text, name, isError } = event
+  const { itemType, text, name, isError, charCount } = event
   if (event.resetStreamSlots) logs = sealStreamSlots(logs)
   if (event.contentIndex !== undefined) {
     const index = logs.findIndex(log => log.contentIndex === event.contentIndex)
     if (index >= 0) {
       const old = logs[index]
       return logs.map((log, itemIndex) => itemIndex === index
-        ? { ...old, itemType, text, name: name || old.name, isError: old.isError }
+        ? { ...old, itemType, text, name: name || old.name, isError: old.isError, charCount: charCount ?? old.charCount }
         : log)
     }
     // Skip empty placeholders (delta before the first real chunk) so the panel
     // doesn't flash a blank row.
     if (!text && itemType !== 'tool') return logs
-    return [...logs, { id: logs.length + 1, itemType, text, name, isError, contentIndex: event.contentIndex }]
+    return [...logs, { id: logs.length + 1, itemType, text, name, isError, contentIndex: event.contentIndex, charCount }]
   }
   if (event.resetStreamSlots && !text && itemType !== 'tool') return logs
   // A no-index `kind:"log"` item is a turn boundary: forget live slots so the
@@ -733,28 +796,31 @@ function applyLogDelta(logs: Log[], event: Extract<AgentEvent, { type: 'agent_lo
   logs = event.resetStreamSlots ? logs : sealStreamSlots(logs)
   const last = logs[logs.length - 1]
   if (last && last.itemType === itemType && text.length > last.text.length && text.startsWith(last.text)) {
-    return logs.map(log => log.id === last.id ? { ...log, text } : log)
+    return logs.map(log => log.id === last.id ? { ...log, text, charCount: charCount ?? log.charCount } : log)
   }
-  return [...logs, { id: logs.length + 1, itemType, text, name, isError }]
+  return [...logs, { id: logs.length + 1, itemType, text, name, isError, charCount }]
 }
 
-function SubagentHeader({ total, running, succeeded, failed, onClear }: {
+function SubagentHeader({ total, running, runningTokens, succeeded, failed, onClear }: {
   total: number
   running: number
+  runningTokens: number
   succeeded: number
   failed: number
   onClear: () => void
 }) {
   const finished = Math.max(0, total - running)
+  const runningTokensLabel = formatTokens(runningTokens)
+  const runningLabel = runningTokensLabel ? `${running} 运行中 · ${runningTokensLabel}` : `${running} 运行中`
   return <header className="subagent-header">
     <div className="subagent-header-left">
       <b>♙ Subagents</b>
       <span>{total} 个</span>
-      <i className={`running-badge${running ? '' : ' is-zero'}`}>{running} 运行中</i>
       <i className={`handled-badge${succeeded ? '' : ' is-zero'}`}>{succeeded} 成功</i>
       <i className={`failed-badge${failed ? '' : ' is-zero'}`}>{failed} 失败</i>
     </div>
     <div className="subagent-header-right">
+      <i className={`running-badge${running ? '' : ' is-zero'}`} data-testid="subagent-running-badge">{runningLabel}</i>
       <button onClick={onClear} disabled={finished === 0}>清空</button>
     </div>
   </header>
@@ -777,6 +843,7 @@ function AgentRow({ agent, childCount, activeChildCount, selected, aborting, now
   const handled = !active && !agent.handled && ['failed', 'aborted', 'interrupted'].includes(agent.state)
   const stalled = agent.stalled || agent.state === 'stalled'
 	const live = active ? liveAgentStatus(agent, now, activeChildCount) : undefined
+  const liveTokens = active ? formatTokens(agentTokenTotal(agent)) : ''
 
   return <article className={`agent-row ${agent.parentId ? 'agent-child' : 'agent-root'} ${selected ? 'selected' : ''}`} data-testid={`agent-row-${agent.agentId}`}>
     <button className="agent-select" onClick={onSelect} aria-pressed={selected}>
@@ -792,6 +859,7 @@ function AgentRow({ agent, childCount, activeChildCount, selected, aborting, now
 		  {childCount > 0 && <em className="agent-leader-badge">主管 · {childCount} 个子 agent</em>}
           {stalled && <em className="stalled-badge">{agent.stalledIdleSec ? `卡住 ${agent.stalledIdleSec}s` : '卡住'}</em>}
           {worktree && <em className={`worktree-badge ${worktree.lifecycle}`}>{worktree.text}</em>}
+          {liveTokens && <small className="agent-row-tokens" data-testid={`agent-row-tokens-${agent.agentId}`}>{liveTokens}</small>}
           {active && <RunningElapsed startedAt={agent.startedAt} />}
         </span>
         <small>{subtitle}</small>
@@ -804,7 +872,7 @@ function AgentRow({ agent, childCount, activeChildCount, selected, aborting, now
   </article>
 }
 
-function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable, onCheck, onWorktree, onAbort }: {
+function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable, terminalAvailable, onCheck, onWorktree, onOpenWorktreeTerminal, onAbort }: {
   agent?: Agent
 	activeChildCount: number
 	aborting: boolean
@@ -812,8 +880,10 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
   projectPath?: string
   onOpenDocument?: (path: string) => void
   retainedWorktreeDispositionAvailable: boolean
+  terminalAvailable: boolean
   onCheck: (agent: Agent) => void
   onWorktree: (agentId: string, action: 'merge' | 'discard') => void
+  onOpenWorktreeTerminal: (path: string) => void
   onAbort: (agent: Agent) => void
 }) {
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -854,6 +924,7 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
         <div><ModelFamilyIcon agent={agent} /><b>{detailTitle}</b></div>
         <small>{modelFamily(agent).family}</small>
       </div>
+      <AgentDetailUsage agent={agent} />
     </header>
     <p className="agent-closeout">{agent.closeout ? `收尾　${agent.closeout}` : `${stateText(agent)}${agent.worktree ? `　${worktreeText(agent.worktree)}` : ''}`}</p>
     <div className="agent-transcript-scroll" data-testid="subagent-transcript-scroll" ref={scrollRef} onScroll={event => {
@@ -882,13 +953,27 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
         <span className={`worktree-status ${agent.worktree.lifecycle}`}>{worktreeText(agent.worktree)}</span>
         {agent.worktree.branch && <code>{agent.worktree.branch}</code>}
         {agent.worktree.error && <small>{agent.worktree.error}</small>}
+        {agent.worktree.path && terminalAvailable && <button className="worktree-terminal-btn" title={`在终端中打开 ${agent.worktree.path}`} onClick={() => onOpenWorktreeTerminal(agent.worktree!.path!)}>⌘ 终端</button>}
         {reviewable && retainedWorktreeDispositionAvailable && <span className="worktree-actions"><button onClick={() => void onWorktree(agent.agentId, 'merge')}>合并到主分支</button><button onClick={() => void onWorktree(agent.agentId, 'discard')}>丢弃 worktree</button></span>}
+        {agent.worktree.lifecycle === 'active' && retainedWorktreeDispositionAvailable && <span className="worktree-actions"><button onClick={() => void onWorktree(agent.agentId, 'discard')}>关闭 worktree</button></span>}
       </div>}
       {!isActive(agent) && <span className="agent-finished-at">结束于 {completedAt(agent.endedAt)} · {duration(agent, now)}</span>}
       </details>
     </div>
     {agent && !atBottom && <button className="return-latest" aria-label="回到最新" title="回到最新" onClick={returnLatest}><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg></button>}
   </div>
+}
+
+function AgentDetailUsage({ agent }: { agent: Agent }) {
+  const usage = agentDetailUsage(agent)
+  if (!usage.context && !usage.cache && !usage.io) return null
+  return <dl className="agent-detail-usage" data-testid="agent-detail-usage" aria-label="当前 subagent 用量">
+    {(usage.context || usage.cache) && <div className="agent-detail-usage-row" data-testid="agent-detail-usage-context">
+      {usage.context && <div><dt>上下文</dt><dd title="当前上下文 / 最大窗口">{usage.context}</dd></div>}
+      {usage.cache && <div><dt>缓存</dt><dd title="缓存命中">{usage.cache}</dd></div>}
+    </div>}
+    {usage.io && <div className="agent-detail-usage-row"><div><dt>入/出</dt><dd title="输入 / 输出 tokens">{usage.io}</dd></div></div>}
+  </dl>
 }
 
 function DetailMetrics({ agent, now, pricing }: { agent: Agent; now: number; pricing: Pricing }) {

@@ -19,8 +19,10 @@ When a tool covers the job, calling it *is* doing the job. Rebuilding its behavi
 shell is not a shortcut: a runtime cannot render, attribute or verify a result it never
 saw a call for, so the work lands as unreviewable text.
 
-- Reading, searching, listing and editing files: use the file tools, not `cat`, `sed`,
-  `head`, `grep -r`, or a heredoc.
+- Reading files: `read`. Listing directories: `ls`. Searching: `grep` / `find`. Editing:
+  `edit` / `write`. Do not rebuild those with `cat`, `sed`, `head`, `grep -r`, or a heredoc.
+- Sending work to a worker: the dispatch tool (prompt/description/subagent_type, or task/agent).
+  Do not substitute your own read/grep sweep for a dispatch the user asked for.
 - Fetching a page or looking something up: use {{fetch}}, {{search}} or {{browser}}.
 - `bash` is for what only a shell does — builds, tests, linters, git, processes. That is
   a large and important set, and none of it is a fallback for the rest.

@@ -28,7 +28,7 @@
 - `com.leehow.pipiui`（Swift）与 `com.leehow.pipiui-electron`（Electron）可同时注册运行。
 
 **当前预期状态**：🔶 产物已存在（`build/PipiUI.app` 2026-08-10 06:48、`build/pipiui_e.app` 2026-08-10 06:29，均当日构建）；同开实测 🖐 待做。
-⚠️ 命名偏差：Electron 产物当前为 `pipiui_e.app`（`apps/electron/package.json` productName=`pipiui_e`），与 spec 约定产物名 `PipiUI Electron.app` 不一致，合入前需定夺。
+产物路径保持 `build/PipiUI Electron.app`（`productName`=`PipiUI Electron`，避免覆盖 Swift `PipiUI.app`）；Launchpad/Dock 显示名为 **PipiUI**（`CFBundleDisplayName` / `CFBundleName`）。
 
 ---
 
@@ -151,7 +151,7 @@
 
 1. **Swift 侧租约缺失**（项 3 反向）：`Sources/` 无租约实现 → "由另一版本运行中"的只读体验与反向写阻止无法验收。Electron 侧已就绪并兼容 `pipiui-swift` holder 名。
 2. **远程 Node host 接线已落盘但配套重构未完成**（项 4/8 远程侧）：`apps/server/src/index.ts`（08-10 08:06）已含静态托管/配对页/claim/配对链接输出；`contract.test.ts`（08:09）正改为 `createContractMockBackend` + `pairing:false`，该 mock 未落库 → npm test 短暂红（6 failed）。验收以合入后绿态复核，并补 DOM 级快照对比。
-3. **Electron 产物命名**：当前 `pipiui_e.app`，spec 约定 `PipiUI Electron.app`，需定夺（`productName`）。
+3. **Electron 产物命名**：路径为 `build/PipiUI Electron.app`（`productName` 不改，避免覆盖 Swift）；用户面向名为 **PipiUI**（macOS `CFBundleDisplayName` / `CFBundleName`）。
 4. **`Electron/` 整个工作区未提交**（git 未跟踪）：验收前需先合入主仓，否则无法作为可复核基线。
 5. **Browser 真实能力**：Browser 面板与 `browser-host.ts` 已就绪，但真实浏览器会话依赖共享 pi 扩展（webview）合入；远程连接下按能力降级。
 6. 无独立 perf 自动化（项 5 为手动）；无 Electron E2E（Playwright 等），双 App 同开为手动项。

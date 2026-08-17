@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, readdirSync, readFileSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -6,7 +6,7 @@ import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
 
 export type Feature = "philosophy"|"plan"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"glmVisionMcp"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
-export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"subagentDir"|"agentsDir", string>>;
+export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"codingTools"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
 export type SpawnInput = { sessionPath?: string; cwd: string; runtimeRoot?: string; agentDir?: string; sessionsRoot?: string; resourceMode?: "default"|"explicit"; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; /** Optional full provider/model reference for Hermes background review. */ memoryReviewModelId?: string; subagentModelsFile?: string; /** The user's Settings → 工具开关 denylist. Merged with the Boss read-only policy; never passed to workers. */ disabledToolNames?: readonly string[] };
 export type SpawnOutput = { args: string[]; env: Record<string,string> };
@@ -30,7 +30,7 @@ const ext=(args:string[], path?:string)=>{if(path)args.push("-e",path)};
  * finalizer: a bridge credential inherited from an outer shell would let another process address
  * this session's agent tree. Only the value this host mints for this spawn survives.
  */
-export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,string> { const exact=new Set(["PIPIUI_AGENTS_DIR","PIPIUI_BOSS_READ_ONLY","PIPIUI_BRIDGE_PORT","PIPIUI_BUILT_IN_SKILL_ROOT","PIPIUI_MAIN_CWD","PIPIUI_MAIN_MODEL","PIPIUI_MAIN_MODEL_FILE","PIPIUI_NODE_PATH","PIPIUI_PI_PATH","PIPIUI_RUNTIME_SOURCE_ROOT","PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE","PIPIUI_SESSION_KEY","PIPIUI_SESSION_CAPABILITY","PIPIUI_HOST_PROTOCOL","PIPIUI_SKILL_READ_BLOCK","PIPIUI_TOOL_SKILL_SETTINGS_FILE","PIPIUI_WEB_ACCESS_EXT","PIPIUI_ARXIV_EXT","PIPIUI_WORKTREE"]); return Object.fromEntries(Object.entries(env).filter(([key,value])=>value!==undefined&&!exact.has(key)&&!["PIPIUI_AGENT_","PIPIUI_MEMORY_","PIPIUI_COMPUTER_","PIPIUI_CUA_","PIPIUI_TERMINAL_","PIPIUI_SEARCH_","PIPIUI_SUBAGENT_","PIPIUI_WORKTREE_","PIPIUI_HERMES_"].some(prefix=>key.startsWith(prefix))) as [string,string][]); }
+export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,string> { const exact=new Set(["PIPIUI_AGENTS_DIR","PIPIUI_BOSS_READ_ONLY","PIPIUI_BRIDGE_PORT","PIPIUI_BUILT_IN_SKILL_ROOT","PIPIUI_CODING_TOOLS_EXT","PIPIUI_MAIN_CWD","PIPIUI_MAIN_MODEL","PIPIUI_MAIN_MODEL_FILE","PIPIUI_NODE_PATH","PIPIUI_PI_PATH","PIPIUI_RUNTIME_SOURCE_ROOT","PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE","PIPIUI_SESSION_KEY","PIPIUI_SESSION_CAPABILITY","PIPIUI_HOST_PROTOCOL","PIPIUI_SKILL_READ_BLOCK","PIPIUI_TOOL_SKILL_SETTINGS_FILE","PIPIUI_WEB_ACCESS_EXT","PIPIUI_ARXIV_EXT","PIPIUI_WORKTREE"]); return Object.fromEntries(Object.entries(env).filter(([key,value])=>value!==undefined&&!exact.has(key)&&!["PIPIUI_AGENT_","PIPIUI_MEMORY_","PIPIUI_COMPUTER_","PIPIUI_CUA_","PIPIUI_TERMINAL_","PIPIUI_SEARCH_","PIPIUI_SUBAGENT_","PIPIUI_WORKTREE_","PIPIUI_HERMES_"].some(prefix=>key.startsWith(prefix))) as [string,string][]); }
 /**
  * Layered spawn environment, mirroring Swift `ChatSession.mergedSpawnEnv` + `PiProcess`
  * (T17): every configured `<agentDir>/.env` key is injected into the spawned pi process so
@@ -63,7 +63,7 @@ export function mergedSpawnEnvironment(
   });
 }
 /** Assemble the Electron host's Pi process contract. */
-export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.resourceMode==="explicit")args.push("--no-extensions","--no-skills","--no-prompt-templates","--no-themes");if(input.agentDir)env.PI_CODING_AGENT_DIR=input.agentDir;if(input.sessionsRoot)env.PI_CODING_AGENT_SESSION_DIR=input.sessionsRoot;if(input.sessionPath)args.push("--session",input.sessionPath);if(enabled(f,"philosophy"))ext(args,p.philosophy);if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git"))ext(args,p.git);if(enabled(f,"reload"))ext(args,p.reload);if(enabled(f,"webSearch")){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){ext(args,p.skillLoader);if(p.skillLoader&&p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);if(enabled(f,"openaiServerTools"))ext(args,p.openaiServerTools);if(enabled(f,"geminiServerTools"))ext(args,p.geminiServerTools);if(enabled(f,"xaiServerTools"))ext(args,p.xaiServerTools);if(enabled(f,"glmSearchMcp"))ext(args,p.glmSearchMcp);args.push(...mainSessionExcludeToolArgs({bossReadOnly:enabled(f,"bossReadOnly"),disabledToolNames:input.disabledToolNames}));
+export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.resourceMode==="explicit")args.push("--no-extensions","--no-skills","--no-prompt-templates","--no-themes");if(input.agentDir)env.PI_CODING_AGENT_DIR=input.agentDir;if(input.sessionsRoot)env.PI_CODING_AGENT_SESSION_DIR=input.sessionsRoot;if(input.sessionPath)args.push("--session",input.sessionPath);if(p.codingTools){ext(args,p.codingTools);env.PIPIUI_CODING_TOOLS_EXT=p.codingTools}if(enabled(f,"philosophy"))ext(args,p.philosophy);if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git"))ext(args,p.git);if(enabled(f,"reload"))ext(args,p.reload);if(enabled(f,"webSearch")){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){ext(args,p.skillLoader);if(p.skillLoader&&p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);if(enabled(f,"openaiServerTools"))ext(args,p.openaiServerTools);if(enabled(f,"geminiServerTools"))ext(args,p.geminiServerTools);if(enabled(f,"xaiServerTools"))ext(args,p.xaiServerTools);if(enabled(f,"glmSearchMcp"))ext(args,p.glmSearchMcp);args.push(...mainSessionExcludeToolArgs({bossReadOnly:enabled(f,"bossReadOnly"),disabledToolNames:input.disabledToolNames}));
 // `--exclude-tools` removes bash, but the shared `terminal` tool can also run a command. It is
 // gated by action instead of removed, so the Boss keeps observe/list/wait — see the extension.
 if(enabled(f,"bossReadOnly"))env.PIPIUI_BOSS_READ_ONLY="1";
@@ -81,6 +81,7 @@ if(enabled(f,"subagent")&&p.subagentDir){ext(args,p.subagentDir);env.PIPIUI_SUBA
 // exactly one finalizer ever runs against a repository.
 env.PIPIUI_WORKTREE_FINALIZER="pi";
 if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI_MAIN_MODEL=input.mainModelId;if(input.subagentModelsFile)env.PIPIUI_SUBAGENT_MODELS_FILE=input.subagentModelsFile;env.PIPIUI_COMPUTER_PROCEDURE_STORE=join(homedir(),"Library","Application Support","PipiUI","computer-agent","procedures.json")}
+if(enabled(f,"plan"))ext(args,p.planRuntime);
 if(!input.bridgePort){appendUserExtensions(args,input.agentDir);ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env};}
 // Genuinely bridge-dependent: the memory broker issues host-scoped capabilities, the webview
 // extension drives the host's browser surface, and an explicitly enabled plan runtime posts events.
@@ -88,7 +89,7 @@ if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PI
 // Built-in-browser search/fetch share the webview's bridge; mounted beside it, independently
 // gated so the Settings browser toggle and this search route stay separate switches.
 if(enabled(f,"browserSearch"))ext(args,p.browserSearch);
-if(enabled(f,"terminal"))ext(args,p.terminal);if(enabled(f,"plan"))ext(args,p.planRuntime);env.PIPIUI_BRIDGE_PORT=String(input.bridgePort);env.PIPIUI_SESSION_KEY=input.bridgeRoutingKey??"";
+if(enabled(f,"terminal"))ext(args,p.terminal);env.PIPIUI_BRIDGE_PORT=String(input.bridgePort);env.PIPIUI_SESSION_KEY=input.bridgeRoutingKey??"";
 // pi-web-access resolves optional `glimpseui` from this NODE_PATH before falling
 // back to `open`. The shim lives beside the other host extensions.
 {
@@ -103,7 +104,7 @@ if(enabled(f,"computerUse")&&enabled(f,"subagent")&&p.subagentDir&&p.computerUse
 // extension mounted above. Export the reviewed strategy for explicitly granted
 // GUI Operator children; never register mutating computer/open_application tools
 // directly in the main session.
-env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.19.2";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
+env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.20.0";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
 // The update-center input transformer is a main-session policy seam, independent of the bridge.
 // runtimeInfo stays last so its read-only request observer sees the final provider payload after all
 // PipiUI rewriters. The isolated title helper passes no runtimeInfo path and remains tool-free.
@@ -173,14 +174,48 @@ export function resolvePiExecutable(env:NodeJS.ProcessEnv=process.env):string{
 const NODE_BIN = process.platform === "win32" ? "node.exe" : "node";
 
 /**
+ * Process-wide memoization for the shim scan. A real Node binary is 100+ MB, and reading
+ * even a slice of it on every spawn blocks the host event loop long enough to stall the pi
+ * child's streaming stdout. Entries are validated against the file's size+mtime, so a
+ * replaced executable is re-inspected instead of reused. `withToolPath` itself stays
+ * uncached: its remaining cost is a handful of statSync calls, and caching the first PATH
+ * decision would freeze it for the App's lifetime even after the toolchain changes.
+ */
+type ShimCacheEntry={size:number;mtimeMs:number;isShim:boolean};
+const shimCache=new Map<string,ShimCacheEntry>();
+
+/**
  * Packaged Electron ships `node` as a shim that execs Helper under
  * ELECTRON_RUN_AS_NODE. Detect that script so user commands can prefer a real
  * Node binary instead of turning every `npm test` into a Helper swarm.
+ *
+ * Only the first 400 bytes are read: the marker lives in the shebang header, and a full
+ * `readFileSync` of a real binary blocked the host event loop for several seconds per call
+ * on 100-200MB binaries, batching the pi child's streamed stdout into one burst.
  */
 export function isElectronNodeShim(executable: string): boolean {
   try {
-    const head = readFileSync(executable, "utf8").slice(0, 400);
-    return head.startsWith("#!") && head.includes("ELECTRON_RUN_AS_NODE");
+    const stat = statSync(executable);
+    const cached = shimCache.get(executable);
+    if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.isShim;
+    let isShim: boolean;
+    try {
+      const fd = openSync(executable, "r");
+      try {
+        const buffer = Buffer.alloc(400);
+        const bytesRead = readSync(fd, buffer, 0, 400, 0);
+        const head = buffer.toString("utf8", 0, bytesRead);
+        isShim = head.startsWith("#!") && head.includes("ELECTRON_RUN_AS_NODE");
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // A transient read failure (EMFILE, …) must not be frozen into a permanent verdict:
+      // answer "not a shim" for this call only and leave the cache untouched.
+      return false;
+    }
+    shimCache.set(executable, { size: stat.size, mtimeMs: stat.mtimeMs, isShim });
+    return isShim;
   } catch {
     return false;
   }
@@ -278,6 +313,7 @@ export function resolveSpawnPaths(runtimeRoot:string=defaultRuntimeRoot(),option
     terminal:fileIfPresent(extensions,"pipiui-electron-terminal.ts"),
     updateCenter:fileIfPresent(extensions,"pipiui-update-center.ts"),
     runtimeInfo:fileIfPresent(extensions,"pipiui-runtime-info.ts"),
+    codingTools:fileIfPresent(extensions,"pipiui-coding-tools.ts"),
     subagentDir:fileIfPresent(ext,"subagent"),
     agentsDir:fileIfPresent(ext,"agents"),
     memoryBroker:packageIfPresent(ext,"packages","memory-broker"),

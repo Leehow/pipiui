@@ -117,3 +117,15 @@ export async function initGit(cwd: string): Promise<GitStatus> {
   await gitStrict(cwd, ["init"]);
   return probeGit(cwd);
 }
+
+/** True when a `git` executable answers `--version`. Never throws. */
+export async function probeGitBinary(
+  exec: (file: string, args: string[], options?: object) => Promise<{ stdout: string }> = run,
+): Promise<boolean> {
+  try {
+    await exec("git", ["--version"], { timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, windowsHide: true });
+    return true;
+  } catch {
+    return false;
+  }
+}

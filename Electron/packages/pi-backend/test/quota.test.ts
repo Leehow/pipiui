@@ -28,6 +28,7 @@ describe("quotaProviderFor mirrors Swift ModelInfo.quotaProvider", () => {
     expect(quotaProviderFor("zai-coding-cn")).toBe("glm");
     expect(quotaProviderFor("anthropic")).toBe("claude");
     expect(quotaProviderFor("openai-codex")).toBe("codex");
+    expect(quotaProviderFor("cursor")).toBe("cursor");
     expect(quotaProviderFor("kimi-coding")).toBe("kimi");
     expect(quotaProviderFor("qoder")).toBe("qoder");
     expect(quotaProviderFor("qwen-token-plan-cn")).toBe("qwenTokenPlan");

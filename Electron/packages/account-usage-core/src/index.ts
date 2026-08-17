@@ -24,8 +24,10 @@ export type AccountUsageCapabilities = {
   env?: Record<string, string | undefined>;
   /** Parsed JSON or raw JSON from the host's credential stores. */
   readAuth?: (store: "pi" | "codex" | "grok" | "opencode") => Promise<unknown>;
+  /** Cursor desktop JWT from the host (read-only SQLite). Never refresh this token. */
+  readCursorAuth?: () => Promise<string | undefined>;
   /** Optional browser-cookie capability. Values are never returned in snapshots/errors. */
-  readCookie?: (provider: "kimi" | "qwen-token-plan") => Promise<string | undefined>;
+  readCookie?: (provider: "kimi" | "qwen-token-plan" | "cursor") => Promise<string | undefined>;
   /** Persists a cookie that just produced a successful fetch. Browser session
    *  cookies (e.g. the aliyun login ticket) do not survive an app restart, so
    *  the host caches the last-known-good value (Swift persistCookie parity). */
@@ -35,6 +37,8 @@ export type AccountUsageCapabilities = {
   readKeyFile?: (paths: string[]) => Promise<string | undefined>;
   /** Optional local-database capability; the host owns SQLite access. */
   readLocalUsage?: (provider: "opencode-go") => Promise<LocalUsageRow[] | undefined>;
+  /** Optional rate-limit snapshot captured from live xAI traffic by the host's pi extension. */
+  readGrokRateLimits?: () => Promise<unknown>;
   now?: () => number;
   timeoutMs?: number;
 };
@@ -219,6 +223,49 @@ export function parseQoderWindows(body: unknown): UsageWindow[] {
   return [window("credits", fraction * 100, "额", "订阅额度", resetMs(root.expiresAt))];
 }
 
+function usagePercent(raw: unknown): number | undefined {
+  const r = record(raw); if (!r) return;
+  const named = number(r.usedPercent ?? r.used_percent ?? r.percent ?? r.percentage ?? r.includedUsagePercent ?? r.planUsedPercent);
+  if (named !== undefined) return named > 0 && named <= 1 ? named * 100 : named;
+  const used = number(r.used ?? r.usedUsd ?? r.used_usd ?? r.requestsUsed ?? r.requestUsed);
+  const limit = number(r.limit ?? r.limitUsd ?? r.limit_usd ?? r.total ?? r.requestsLimit ?? r.requestLimit);
+  if (used !== undefined && limit !== undefined && limit > 0) return used / limit * 100;
+}
+
+/** Unofficial cursor.com/api/usage-summary — field names vary; keep this the only parse site. */
+export function parseCursorWindows(body: unknown): UsageWindow[] {
+  const root = record(body); if (!root) return [];
+  const reset = resetMs(root.billingCycleEnd ?? root.billing_cycle_end ?? root.cycleEnd ?? root.resetAt ?? root.resetsAt);
+  const out: UsageWindow[] = [];
+  const push = (id: string, used: number | undefined, label: string, title: string) => {
+    if (used === undefined || !Number.isFinite(used)) return;
+    out.push(window(id, used, label, title, reset));
+  };
+  const plan = usagePercent({
+    usedPercent: root.includedUsagePercent ?? root.planUsedPercent ?? root.usedPercent ?? root.included_usage_percent,
+  }) ?? usagePercent(root.planUsage ?? root.plan_usage ?? root.individualUsage ?? root.usage ?? root.plan ?? root.included);
+  push("plan", plan, "额", "订阅额度");
+  push("cursorModels", usagePercent(root.namedModelSelectedUsage ?? root.cursorModels ?? root.cursor_models), "池", "Cursor 模型池");
+  push("thirdParty", usagePercent(root.thirdPartyUsage ?? root.third_party ?? root.thirdParty), "三方", "第三方模型池");
+  push("onDemand", usagePercent(root.onDemandUsage ?? root.extraUsage ?? root.on_demand ?? root.extra), "额外", "按需额外");
+  return out;
+}
+
+export function jwtUnexpired(tokenValue: string, now: number, skewMs = 60_000): boolean {
+  const parts = tokenValue.split(".");
+  if (parts.length < 2) return true;
+  try {
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/") + "==".slice((parts[1].length % 4) || 4);
+    const payload = record(JSON.parse(atob(b64)));
+    const exp = number(payload?.exp);
+    if (exp === undefined) return true;
+    const expMs = exp > 10_000_000_000 ? exp : exp * 1000;
+    return expMs > now + skewMs;
+  } catch {
+    return true;
+  }
+}
+
 export function parseQwenWindows(body: unknown): UsageWindow[] {
   const payload = record(record(record(record(record(body)?.data)?.DataV2)?.data)?.data); if (!payload) return [];
   return [
@@ -295,6 +342,32 @@ export function parseGrokWindows(input: Uint8Array, now = Date.now()): UsageWind
   return [window("credits", used, label === "额度" ? "额" : label, label === "额度" || label === "额" ? "额度" : `${label}额度`, reset)];
 }
 
+/**
+ * api.x.ai `x-ratelimit-*` headers are a burst window (RPM/TPM). SuperGrok's real
+ * weekly credit pool still comes from grok.com GetGrokCreditsConfig; these headers
+ * are only a fallback when that RPC is empty or unreachable.
+ */
+export function grokRateLimitWindows(limitRequests: unknown, remainingRequests: unknown, limitTokens: unknown, remainingTokens: unknown): UsageWindow[] {
+  const usedPercent = (limit: unknown, remaining: unknown): number | undefined => {
+    const total = number(limit), left = number(remaining);
+    if (total === undefined || total <= 0 || left === undefined || left < 0) return undefined;
+    // One decimal; raw float math here produces artifacts like 22.000000000000004.
+    return Math.round(clamp((1 - left / total) * 100) * 10) / 10;
+  };
+  const out: UsageWindow[] = [];
+  const requests = usedPercent(limitRequests, remainingRequests);
+  if (requests !== undefined) out.push(window("requests", requests, "请求", "请求额度"));
+  const tokens = usedPercent(limitTokens, remainingTokens);
+  if (tokens !== undefined) out.push(window("tokens", tokens, "Tokens", "Token 额度"));
+  return out;
+}
+
+/** Snapshot file written by the pipiui-xai-server-tools extension from live xAI responses. */
+export function parseGrokRateLimitSnapshot(value: unknown): UsageWindow[] {
+  const root = record(json(value));
+  return grokRateLimitWindows(root?.limitRequests, root?.remainingRequests, root?.limitTokens, root?.remainingTokens);
+}
+
 export function openCodeGoWindows(rows: LocalUsageRow[], now: number): UsageWindow[] {
   const fiveStart = now - 5 * 3600_000;
   const date = new Date(now); const day = (date.getUTCDay() + 6) % 7;
@@ -314,6 +387,13 @@ const isRelay = (provider: string) => provider.toLowerCase().includes("relay");
 const includes = (...values: string[]) => (provider: string) => !isRelay(provider) && values.some(value => provider.toLowerCase().includes(value));
 
 async function piAuth(ctx: AccountUsageContext) { return ctx.readAuth?.("pi"); }
+/** grok CLI's ~/.grok/auth.json keeps entries keyed by OAuth scope; the auth.x.ai one carries the usable key. */
+function grokCliAccessKey(raw: unknown): string | undefined {
+  const root = record(json(raw)); if (!root) return;
+  const entries = Object.entries(root).filter(([, value]) => record(value));
+  const preferred = entries.find(([scope]) => scope.startsWith("https://auth.x.ai::")) ?? entries.find(([scope]) => scope.includes("/sign-in"));
+  return token(record(preferred?.[1]), "key");
+}
 async function apiKey(ctx: AccountUsageContext, providerIds: string[], envNames: string[]) {
   const fromEnv = envToken(ctx, ...envNames); if (fromEnv) return fromEnv;
   const entry = authEntry(await piAuth(ctx), ...providerIds); return token(entry, "key", "access", "access_token");
@@ -391,12 +471,67 @@ export function createQoderAdapter(): AccountUsageAdapter {
 export const builtinAccountUsageAdapters: AccountUsageAdapter[] = [
   {
     id: "grok", kind: "subscription", matches: provider => !isRelay(provider) && (provider.toLowerCase() === "xai" || provider.toLowerCase().includes("grok")), async load(ctx) {
-      const root = record(json(await ctx.readAuth?.("grok"))); if (!root) return;
-      const entries = Object.entries(root).filter(([, value]) => record(value));
-      const preferred = entries.find(([scope]) => scope.startsWith("https://auth.x.ai::")) ?? entries.find(([scope]) => scope.includes("/sign-in"));
-      const access = token(record(preferred?.[1]), "key"); if (!access) return;
-      const windows = parseGrokWindows(await fetchBytes(ctx, "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig", { method: "POST", headers: { Authorization: `Bearer ${access}`, Origin: "https://grok.com", Referer: "https://grok.com/?_s=usage", Accept: "*/*", "Content-Type": "application/grpc-web+proto", "x-grpc-web": "1" }, body: new Uint8Array(5) }), ctx.now());
-      return windows.length ? { provider: "grok", accountLabel: "Grok 账号额度", windows, source: "subscription" } : undefined;
+      const access = token(authEntry(await piAuth(ctx), "xai"), "access", "access_token") ?? grokCliAccessKey(await ctx.readAuth?.("grok"));
+      if (access) {
+        try {
+          const windows = parseGrokWindows(await fetchBytes(ctx, "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${access}`,
+              Origin: "https://grok.com",
+              Referer: "https://grok.com/?_s=usage",
+              Accept: "*/*",
+              "Content-Type": "application/grpc-web+proto",
+              "x-grpc-web": "1",
+              "x-user-agent": "connect-es/2.1.1",
+            },
+            body: new Uint8Array(5),
+          }), ctx.now());
+          if (windows.length) return { provider: "grok", accountLabel: "Grok 账号额度", windows, source: "subscription" };
+        } catch {
+          // grok.com is best-effort; fall through to captured headers / probe.
+        }
+      }
+      const captured = parseGrokRateLimitSnapshot(await ctx.readGrokRateLimits?.());
+      if (captured.length) return { provider: "grok", accountLabel: "Grok 账号额度", windows: captured, source: "subscription" };
+      const key = access ?? envToken(ctx, "XAI_API_KEY");
+      if (!key) return;
+      try {
+        const response = await fetchResponse(ctx, "https://api.x.ai/v1/chat/completions", {
+          method: "POST",
+          headers: { ...bearer(key), "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "grok-4.6", messages: [{ role: "user", content: "1" }], max_tokens: 8 }),
+        });
+        if (!response.ok) return;
+        const header = (name: string) => response.headers.get(name) ?? undefined;
+        const windows = grokRateLimitWindows(
+          header("x-ratelimit-limit-requests"), header("x-ratelimit-remaining-requests"),
+          header("x-ratelimit-limit-tokens"), header("x-ratelimit-remaining-tokens"),
+        );
+        return windows.length ? { provider: "grok", accountLabel: "Grok 账号额度", windows, source: "subscription" } : undefined;
+      } catch { return undefined }
+    },
+  },
+  {
+    id: "cursor", kind: "subscription", matches: includes("cursor"), async load(ctx) {
+      const rawToken = clean(await ctx.readCursorAuth?.());
+      const access = rawToken && jwtUnexpired(rawToken, ctx.now()) ? rawToken : undefined;
+      const cookie = await ctx.readCookie?.("cursor");
+      if (!access && !cookie) return;
+      const headers: Record<string, string> = { Accept: "application/json" };
+      if (access) headers.Authorization = `Bearer ${access}`;
+      if (cookie) {
+        headers.Cookie = cookie;
+        headers.Origin = "https://cursor.com";
+        headers.Referer = "https://cursor.com";
+      }
+      try {
+        const windows = parseCursorWindows(await fetchJson(ctx, "https://cursor.com/api/usage-summary", { method: "GET", headers }));
+        return windows.length ? { provider: "cursor", accountLabel: "Cursor 账号额度", windows, source: "subscription" } : undefined;
+      } catch (error) {
+        if (error instanceof UsageError && error.code === "http") return;
+        throw error;
+      }
     },
   },
   {

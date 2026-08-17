@@ -228,6 +228,7 @@ function createContractMockBackend(): HostBackend {
         }
         case 'cancelProviderLogin': return
         case 'removeProviderCredentials': state = { ...state, model: { provider: 'unknown', id: 'unknown', name: '无可用模型', reasoning: false } }; return state
+        case 'addOpenAICompatibleProvider': return { providerId: 'custom-openai' }
         case 'getSessionStats': {
           const sessionId = (params[0] as string | undefined) ?? 'session-1'; requireSession(sessionId)
           return sessionId === 'session-1' ? fullStats(sessionId) : { sessionId, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }
@@ -264,6 +265,7 @@ function createContractMockBackend(): HostBackend {
         }
         case 'terminalClear': { const current = terminals.get(params[0] as string); if (current) current.input = ''; return }
         case 'terminalClose': terminals.delete(params[0] as string); return
+        case 'probeGitBinary': return true
         case 'capabilities': return { computerUse: true, revealInFinder: true, terminal: true }
         default: throw new Error(`unsupported method ${method}`)
       }
@@ -349,6 +351,7 @@ function contract(name: string, factory: Factory, expectedCapabilities: Record<s
       const afterRemove = await host.removeProviderCredentials('mock-provider')
       expect(afterRemove.model.id).toBe('unknown')
       expect(JSON.stringify(afterRemove)).not.toContain(secret)
+      expect(await host.addOpenAICompatibleProvider?.({ name: '兼容', baseUrl: 'https://example.test/v1', apiKey: secret, modelId: 'gpt-test' })).toEqual({ providerId: 'custom-openai' })
     })
 
     it('serves stable session stats and forwards settle snapshots to subscribers', async () => {
@@ -408,6 +411,24 @@ function contract(name: string, factory: Factory, expectedCapabilities: Record<s
       expect(agents.some(event => event.type === 'agent' && event.agent.state === 'aborted')).toBe(true)
       expect(logs[0]).toMatchObject({ sessionId: session.id, agentId: 'agent-1', runId: 'run-1', itemType: 'text', text: 'Prompt received: hello' })
       expect(wrongRunLogs).toEqual([])
+    })
+
+    it('exposes the git-binary probe and one optional all-session stream subscription', async () => {
+      const setup = await factory()
+      close = setup.close
+      const { host } = setup
+      if (!host.probeGitBinary || !host.subscribeAllStreams) throw new Error('optional host extensions unavailable')
+      expect(await host.probeGitBinary()).toBe(true)
+      const [project] = await host.listProjects()
+      const first = await host.newSession(project.id, 'First stream')
+      const second = await host.newSession(project.id, 'Second stream')
+      const sessionIds = new Set<string>()
+      const off = host.subscribeAllStreams(event => sessionIds.add(event.sessionId))
+      await host.sendPrompt(first.id, 'first')
+      await host.sendPrompt(second.id, 'second')
+      await new Promise(resolve => setTimeout(resolve, 10))
+      off()
+      expect(sessionIds).toEqual(new Set([first.id, second.id]))
     })
 
     it('round-trips queue commands and queue_update snapshots while preserving legacy sendPrompt', async () => {
@@ -502,6 +523,8 @@ describe('agent log cache identity contract', () => {
     const host = createIpcHost(ipc)
     await expect(host.getAgentLogs('shared', 'session-exact', 'run-exact')).resolves.toEqual([])
     expect(calls).toEqual([{ method: 'getAgentLogs', params: ['shared', 'session-exact', 'run-exact'] }])
+    await expect(host.getAgentLogs('shared', 'session-exact', 'run-exact', 'agent')).resolves.toEqual([])
+    expect(calls[1]).toEqual({ method: 'getAgentLogs', params: ['shared', 'session-exact', 'run-exact', 'agent'] })
   })
 })
 

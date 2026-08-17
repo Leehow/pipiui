@@ -8,8 +8,8 @@
  */
 
 .quota-pill {
-  --qp-text: #6b6b73;
-  --qp-bg: rgba(0, 0, 0, 0.06);
+  --qp-text: #5a5a63;
+  --qp-bg: #ececf0;
 
   display: inline-flex;
   align-items: center;
@@ -26,29 +26,33 @@
 }
 
 .quota-pill:hover {
-  --qp-bg: rgba(0, 0, 0, 0.1);
+  --qp-bg: #e0e0e6;
 }
 
 [data-theme='dark'] .quota-pill {
-  --qp-text: #9da2ad;
-  --qp-bg: rgba(255, 255, 255, 0.08);
+  --qp-text: #c6cbd6;
+  --qp-bg: #2a2a2e;
 }
 
 [data-theme='dark'] .quota-pill:hover {
-  --qp-bg: rgba(255, 255, 255, 0.13);
+  --qp-bg: #34343a;
 }
 
 /*
- * Portaled to document.body (see QuotaPill). Must beat `.quick-menu { left: 0 }`
- * and escape `.chat-column { overflow: hidden }` so the tool panel cannot clip it.
+ * Portaled to `.pipiui-shell` (see QuotaPill) so `--surface-raised` inherits.
+ * Falls back to document.body; the #fff fallback keeps the menu opaque when
+ * tokens are missing. Must escape `.chat-column { overflow: hidden }`.
  */
 .quick-menu.quota-menu {
   position: fixed;
   left: auto;
   right: auto;
   bottom: auto;
-  z-index: 40;
+  z-index: 80;
   min-width: 200px;
+  background: var(--surface-raised,#fff);
+  color: var(--text,#17171a);
+  border: 1px solid var(--border-strong,#c8c8cf);
 }
 
 .quota-menu-percent {

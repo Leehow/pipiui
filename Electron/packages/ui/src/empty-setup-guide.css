@@ -1,0 +1,102 @@
+.empty-setup{
+  display:flex;
+  width:min(420px, calc(100% - 48px));
+  max-height:100%;
+  flex-direction:column;
+  align-items:stretch;
+  gap:14px;
+  margin:auto;
+  padding:8px 0 24px;
+  color:var(--text);
+}
+.empty-setup h1{
+  margin:0;
+  color:var(--text-strong);
+  font-size:22px;
+  font-weight:700;
+  letter-spacing:-.3px;
+}
+.empty-setup-lead{
+  margin:0;
+  color:var(--muted);
+  font-size:13px;
+  line-height:1.5;
+}
+.empty-setup-checking{
+  margin:4px 0 0;
+  color:var(--subtle);
+  font-size:12px;
+}
+.empty-setup-git{
+  display:flex;
+  align-items:flex-start;
+  gap:8px;
+  padding:8px 10px;
+  border:1px solid color-mix(in srgb,var(--warning) 42%,var(--border));
+  border-radius:8px;
+  background:color-mix(in srgb,var(--warning) 10%,var(--surface-raised));
+  color:var(--text);
+  font-size:12px;
+  line-height:1.5;
+}
+.empty-setup-git p{margin:0;flex:1;min-width:0}
+.empty-setup-git code{
+  font:11px ui-monospace,SFMono-Regular,Menlo,monospace;
+  color:var(--text-strong);
+}
+.empty-setup-git button{
+  flex:none;
+  display:grid;
+  width:20px;
+  height:20px;
+  place-items:center;
+  border-radius:5px;
+  color:var(--muted);
+  font-size:15px;
+  line-height:1;
+}
+.empty-setup-git button:hover{color:var(--text-strong);background:var(--surface-hover)}
+.empty-setup-steps{
+  display:grid;
+  gap:8px;
+  margin:4px 0 0;
+  padding:0;
+  list-style:none;
+}
+.empty-setup-steps li{
+  display:grid;
+  grid-template-columns:22px minmax(0,1fr) auto;
+  align-items:center;
+  gap:10px;
+  min-height:36px;
+  padding:8px 10px;
+  border:1px solid var(--border);
+  border-radius:9px;
+  background:var(--surface-raised);
+}
+.empty-setup-steps li.is-current{border-color:color-mix(in srgb,var(--accent) 45%,var(--border));background:color-mix(in srgb,var(--accent) 8%,var(--surface-raised))}
+.empty-setup-steps li.is-done{color:var(--muted)}
+.empty-setup-steps li.is-upcoming{color:var(--subtle)}
+.empty-setup-index{
+  display:grid;
+  width:22px;
+  height:22px;
+  place-items:center;
+  border-radius:50%;
+  background:color-mix(in srgb,var(--text) 8%,transparent);
+  color:var(--text);
+  font-size:11px;
+  font-weight:650;
+}
+.is-current .empty-setup-index{background:var(--accent);color:#fff}
+.is-done .empty-setup-index{background:color-mix(in srgb,var(--success) 22%,transparent);color:var(--success)}
+.empty-setup-title{min-width:0;font-size:13px;font-weight:600}
+.empty-setup-action{
+  padding:5px 12px;
+  border-radius:8px;
+  background:var(--accent);
+  color:#fff;
+  font-size:12px;
+  font-weight:650;
+}
+.empty-setup-action:hover{filter:brightness(1.06)}

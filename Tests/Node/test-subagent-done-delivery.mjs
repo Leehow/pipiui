@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const sourceSubagentDirectory = join(repositoryRoot, "Sources/PipiUI/PiExt/subagent");
+const sourcePackagesDirectory = join(repositoryRoot, "Sources/PipiUI/PiExt/packages");
 const piPackageRoot = join(
   homedir(),
   ".npm-global/lib/node_modules/@earendil-works/pi-coding-agent",
@@ -30,6 +31,8 @@ async function linkRuntimePackages(directory) {
 
 async function prepareHarness(directory) {
   await cp(sourceSubagentDirectory, join(directory, "subagent"), { recursive: true });
+  // The Swift mirror imports ../packages/computer-agent; copy it alongside.
+  await cp(sourcePackagesDirectory, join(directory, "packages"), { recursive: true });
   await linkRuntimePackages(directory);
 
   const indexPath = join(directory, "subagent/index.ts");
@@ -57,6 +60,9 @@ const registeredTools = [];
 const sent = [];
 let attempts = 0;
 let deliveries = 0;
+// Current delivery contract: receipts ride pi.sendMessage (custom followUp message).
+// Retries are floored at 60s (deliveryRetryDue), so lifecycle churn after a queued
+// delivery must never duplicate it; fulfillment comes from branch proof.
 const fakePi = {
   on(event, handler) {
     const current = handlers.get(event) ?? [];
@@ -65,14 +71,13 @@ const fakePi = {
   },
   registerTool(tool) { registeredTools.push(tool.name); },
   registerCommand() {},
-  async sendUserMessage(text) {
+  sendMessage(message) {
     attempts += 1;
-    sent.push(String(text));
-    // trySendUserMessage tries deliverAs then the legacy fallback. Both reject while
-    // compaction is busy; the first post-settled retry is the single successful delivery.
-    if (attempts <= 2) throw new Error("session compacting / busy");
+    sent.push(String(message.content));
     deliveries += 1;
+    return undefined;
   },
+  async sendUserMessage() { throw new Error("unexpected legacy delivery path"); },
 };
 
 const { default: install, __doneDeliveryTestHooks: hooks } = await import("./subagent/index.ts");
@@ -86,19 +91,38 @@ const waitFor = async (predicate, timeoutMs = 1_000) => {
   return predicate();
 };
 
+// The delivery layer binds to Pi's durable session identity at session_start.
+let branch = [];
+const handlerCtx = { sessionManager: { getSessionId: () => "sess-test", getBranch: () => branch } };
+for (const handler of handlers.get("session_start") ?? []) await handler({}, handlerCtx);
+
 hooks.deliverConfirmedDone(fakePi, "worker-7", "run-7", "[subagent-done] agentId=worker-7");
 const initialSettled = await waitFor(() => {
   const entry = [...hooks.pendingDone.values()][0];
   return hooks.pendingDone.size === 1 && entry && !entry.inFlight;
 });
-for (const handler of handlers.get("session_compact") ?? []) await handler({}, {});
-for (const handler of handlers.get("agent_settled") ?? []) await handler({}, {});
-const delivered = await waitFor(() => hooks.pendingDone.size === 0 && deliveries === 1);
+const delivered = await waitFor(() => deliveries === 1);
+// Lifecycle chatter must not duplicate a queued receipt.
+for (const handler of handlers.get("session_compact") ?? []) await handler({}, handlerCtx);
+for (const handler of handlers.get("agent_settled") ?? []) await handler({}, handlerCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+const noDuplicate = deliveries === 1 && attempts === 1;
+// Fulfillment needs the durable proof in the branch: the completion custom message
+// followed by a terminal assistant entry, exactly what a settled follow-up turn leaves.
+const obligation = [...hooks.pendingDone.values()][0]?.obligation;
+branch = [
+  { type: "custom_message", customType: "pipiui-subagent-complete-v1", content: "[subagent-done] agentId=worker-7", details: { version: 1, sessionId: "sess-test", agentId: "worker-7", runId: "run-7", obligationId: obligation?.id } },
+  { type: "message", message: { role: "assistant", stopReason: "stop" } },
+];
+for (const handler of handlers.get("agent_settled") ?? []) await handler({}, handlerCtx);
+const fulfilled = await waitFor(() => hooks.pendingDone.size === 0 && deliveries === 1);
 await new Promise((resolve) => setTimeout(resolve, 30)); // second signal must stay coalesced
 
 writeFileSync(outputPath, JSON.stringify({
   initialSettled,
   delivered,
+  noDuplicate,
+  fulfilled,
   attempts,
   deliveries,
   pending: hooks.pendingDone.size,
@@ -114,7 +138,7 @@ writeFileSync(outputPath, JSON.stringify({
   return harness;
 }
 
-test("pending [subagent-done] retries immediately after compaction settles, once", async () => {
+test("queued [subagent-done] is delivered once, survives lifecycle chatter unduplicated, and fulfills on branch proof", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pipiui-done-delivery-"));
   try {
     const harness = await prepareHarness(directory);
@@ -123,7 +147,7 @@ test("pending [subagent-done] retries immediately after compaction settles, once
       env: {
         ...process.env,
         PIPIUI_AGENT_DEPTH: "0",
-        PIPIUI_MAIN_CWD: "",
+        PIPIUI_MAIN_CWD: directory,
         PIPIUI_BRIDGE_PORT: "",
         PIPIUI_SESSION_KEY: "",
         PI_SESSION_FILE: "",
@@ -133,11 +157,12 @@ test("pending [subagent-done] retries immediately after compaction settles, once
     });
     const out = JSON.parse(await readFile(join(directory, "result.json"), "utf8"));
 
-    assert.equal(out.initialSettled, true, "busy compaction failure must enter pendingDone");
-    assert.equal(out.delivered, true, "settled signal must retry without waiting for the 60s watchdog");
-    assert.equal(out.attempts, 3, "two busy attempts plus exactly one post-settled retry");
-    assert.equal(out.deliveries, 1, "coalesced compact + settled signals must not duplicate delivery");
-    assert.equal(out.pending, 0, "confirmed delivery must clear pendingDone");
+    assert.equal(out.initialSettled, true, "first attempt must land in pendingDone and complete");
+    assert.equal(out.delivered, true, "the receipt must reach pi.sendMessage exactly once");
+    assert.equal(out.noDuplicate, true, "compact/settled churn must not re-send a queued receipt");
+    assert.equal(out.fulfilled, true, "branch proof after the follow-up turn must mark the obligation fulfilled");
+    assert.equal(out.deliveries, 1, "exactly one delivery despite every lifecycle signal");
+    assert.equal(out.pending, 0, "fulfilled obligation must clear pendingDone");
     assert.equal(out.sessionBeforeCompactHandlers, 1, "the existing main hook remains the only compaction owner");
     assert.equal(out.sessionCompactHandlers, 1);
     assert.equal(out.agentSettledHandlers, 1);

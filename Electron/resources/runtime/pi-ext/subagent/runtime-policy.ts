@@ -39,7 +39,6 @@ export type GeneralPurposeExecutionPolicyResult =
 	| { policy?: GeneralPurposeExecutionPolicy; problem?: undefined }
 	| { policy?: undefined; problem: string };
 
-const EXECUTION_OVERRIDE_KEYS = ["worktree", "noWorktreeReason", "heartbeatSecs", "timeoutSecs"] as const;
 const AUDIT_REASON_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
 
 /** Normalize Boss-owned execution overrides before worktree, lease, or child side effects. */
@@ -48,11 +47,8 @@ export function normalizeGeneralPurposeExecutionPolicy(
 	overrides: GeneralPurposeExecutionOverrides,
 ): GeneralPurposeExecutionPolicyResult {
 	const exactBundledGeneralPurpose = agent.origin === "bundled" && agent.name === "general-purpose";
-	const supplied = EXECUTION_OVERRIDE_KEYS.filter((key) => overrides[key] !== undefined);
 	if (!exactBundledGeneralPurpose) {
-		return supplied.length === 0
-			? {}
-			: { problem: `Execution override ${supplied.join(", ")} is only available to the bundled general-purpose agent.` };
+		return {};
 	}
 
 	const worktree = overrides.worktree ?? "isolated";
@@ -61,12 +57,11 @@ export function normalizeGeneralPurposeExecutionPolicy(
 	}
 	let noWorktreeReason: string | undefined;
 	if (worktree === "none") {
-		if (typeof overrides.noWorktreeReason !== "string") {
-			return { problem: 'worktree="none" requires noWorktreeReason with the Boss reason.' };
-		}
-		noWorktreeReason = overrides.noWorktreeReason.trim();
-		if (!noWorktreeReason || noWorktreeReason.length > 500 || AUDIT_REASON_CONTROL_CHARACTERS.test(noWorktreeReason)) {
-			return { problem: "noWorktreeReason must be a non-empty single line of 1-500 characters with no control characters." };
+		if (typeof overrides.noWorktreeReason === "string") {
+			noWorktreeReason = overrides.noWorktreeReason.trim();
+			if (!noWorktreeReason || noWorktreeReason.length > 500 || AUDIT_REASON_CONTROL_CHARACTERS.test(noWorktreeReason)) {
+				return { problem: "noWorktreeReason must be a non-empty single line of 1-500 characters with no control characters." };
+			}
 		}
 	} else if (overrides.noWorktreeReason !== undefined) {
 		return { problem: 'noWorktreeReason is only allowed with worktree="none".' };
@@ -102,7 +97,11 @@ export function normalizeGeneralPurposeExecutionPolicy(
 
 type RuntimeTimeoutHandle = ReturnType<typeof setTimeout>;
 
-/** Arm one absolute deadline for one exact dispatch generation. */
+/**
+ * Arm one deadline for one exact dispatch generation. The first arm anchors to the
+ * injected `now` (the first child spawn instant); `extend` re-arms from a fresh
+ * base so an alive-but-slow worker can outlive its original budget.
+ */
 export function createRunScopedTimeout(options: {
 	runId: string;
 	timeoutMs: number;
@@ -111,7 +110,7 @@ export function createRunScopedTimeout(options: {
 	now?: () => number;
 	schedule?: (callback: () => void, delayMs: number) => RuntimeTimeoutHandle;
 	cancel?: (handle: RuntimeTimeoutHandle) => void;
-}): { deadlineAt: number; dispose: () => void } {
+}): { deadlineAt: number; extend: (ms?: number, base?: number) => number; dispose: () => void } {
 	const now = options.now ?? Date.now;
 	const schedule = options.schedule ?? ((callback, delayMs) => setTimeout(callback, delayMs));
 	const cancel = options.cancel ?? clearTimeout;
@@ -123,11 +122,37 @@ export function createRunScopedTimeout(options: {
 	(handle as { unref?: () => void })?.unref?.();
 	return {
 		deadlineAt,
+		extend(ms = options.timeoutMs, base = Date.now()) {
+			if (handle !== undefined) cancel(handle);
+			const extendedDeadlineAt = base + ms;
+			handle = schedule(() => {
+				handle = undefined;
+				if (options.isCurrentRun(options.runId)) options.onTimeout();
+			}, ms);
+			(handle as { unref?: () => void })?.unref?.();
+			return extendedDeadlineAt;
+		},
 		dispose() {
 			if (handle !== undefined) cancel(handle);
 			handle = undefined;
 		},
 	};
+}
+
+/**
+ * Budget-expiry policy for the run-scoped timeout: a worker that is still
+ * producing gets its budget silently re-armed; a stalled one earns the boss one
+ * diagnostic notification plus one final grace budget; only a second expiry with
+ * no progress aborts. Never aborts a producing worker just for being slow.
+ */
+export type RuntimeBudgetExpiryDecision = "extend-silent" | "notify-extend" | "abort";
+export function decideRuntimeBudgetExpiry(input: {
+	idleMs: number;
+	progressGraceMs: number;
+	notified: boolean;
+}): RuntimeBudgetExpiryDecision {
+	if (input.idleMs <= input.progressGraceMs) return "extend-silent";
+	return input.notified ? "abort" : "notify-extend";
 }
 
 /** A configured heartbeat is regular; omission lets the caller retain its legacy stepped schedule. */

@@ -45,10 +45,12 @@ the question is never "may I run these together?" — it is "what else can go ou
 call?" That includes work named in an earlier turn that has not started, and parts you split out
 of a single goal yourself.
 
-Dispatch every independent piece in **one** call in the **same** turn:
+Dispatch every independent piece in the **same** turn. The Grok Build default is
+several {{delegate}} calls in one response — one worker per call, fired together:
 
 ```
-{{delegate_parallel}}({ tasks: [ {task, agent}, {task, agent}, ... ] })
+{{delegate}}({ prompt, description, subagent_type })
+{{delegate}}({ prompt, description, subagent_type })
 ```
 
 Concurrency here is cheap for structural reasons, not optimism: writable workers run in isolated

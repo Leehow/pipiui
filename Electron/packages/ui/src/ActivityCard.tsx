@@ -18,21 +18,22 @@ export function ActivityCard({
   error?: boolean
   kind?: ActivityCardKind
   label?: string
-  meta?: string
+  meta?: ReactNode
   defaultExpanded?: boolean
   children: ReactNode
 }) {
-  const [expanded, setExpanded] = useState(defaultExpanded)
+  const [userExpanded, setUserExpanded] = useState<boolean | null>(null)
+  const open = userExpanded ?? (defaultExpanded || (running && kind === 'thinking'))
   const indicator = running ? '◌' : error ? '×' : kind === 'thinking' ? '◌' : '✓'
 
   return <section className={`activity-card activity-card-${kind}${error ? ' activity-card-error' : ''}`} data-activity-card={kind}>
-    <button className="activity-summary" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>
+    <button className="activity-summary" aria-expanded={open} onClick={() => setUserExpanded(!open)}>
       <span className="activity-status" aria-hidden="true">{indicator}</span>
       {label && <span className="activity-kind">{label}</span>}
       <b>{summary}</b>
       <small className="activity-meta">{meta ?? (running ? '运行中' : '已完成')}</small>
-      <span className="activity-chevron" aria-hidden="true">{expanded ? '⌃' : '⌄'}</span>
+      <span className="activity-chevron" aria-hidden="true">{open ? '⌃' : '⌄'}</span>
     </button>
-    {expanded && <div className="activity-details">{children}</div>}
+    {open && <div className="activity-details">{children}</div>}
   </section>
 }

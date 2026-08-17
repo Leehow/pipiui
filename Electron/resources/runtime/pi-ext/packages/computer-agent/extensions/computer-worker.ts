@@ -64,6 +64,15 @@ function elementsFrom(observation: Record<string, any> | undefined): Array<Recor
   return Array.isArray(accessibility?.elements) ? accessibility.elements : [];
 }
 
+const normalizedRole = (value: unknown) => String(value ?? "").replace(/^AX/i, "").toLowerCase();
+const elementName = (element: Record<string, any>) => String(element.name ?? element.label ?? element.title ?? element.text ?? "").trim();
+
+function duplicatedInteractiveLabels(observation: Record<string, any> | undefined): Set<string> {
+  const elements = elementsFrom(observation);
+  const buttons = new Set(elements.filter((element) => normalizedRole(element.role) === "button").map(elementName).filter(Boolean));
+  return new Set(elements.filter((element) => ["group", "statictext", "text"].includes(normalizedRole(element.role))).map(elementName).filter((name) => buttons.has(name)));
+}
+
 export function registerComputerWorkerTools(
   pi: PiLike,
   env: WorkerEnvironment = process.env,
@@ -74,6 +83,7 @@ export function registerComputerWorkerTools(
   let observation: Record<string, any> | undefined;
 	let fatalCode: "computer_worker_runtime_timeout" | "computer_worker_request_cancelled" | "computer_worker_no_progress" | undefined;
 	let requestQueue: Promise<void> = Promise.resolve();
+	const locatedInteractiveBindings = new Map<string, { role: string; name: string }>();
 
   const request = async (
     operation: "observe" | "locate" | "mutate" | "openApplication",
@@ -129,6 +139,9 @@ export function registerComputerWorkerTools(
     async execute(_id, params, signal) {
       if (!observation) throw new Error("desktop_locate requires desktop_observe first");
       const result = await request("locate", params, signal);
+      if (result.status === "resolved" && typeof result.bindingId === "string" && normalizedRole(params.role) === "button") {
+        locatedInteractiveBindings.set(result.bindingId, { role: "button", name: String(params.name ?? "").trim() });
+      }
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
         details: { status: result.status, bindingId: result.bindingId },
@@ -198,11 +211,31 @@ export function registerComputerWorkerTools(
     label: "Desktop Act",
     description: "Execute one coherent target-scoped action batch and return a fresh post-action observation.",
     parameters: objectSchema({
-      actions: { type: "array", minItems: 1, maxItems: 64, items: desktopModelActionSchema, description: "Closed Cua 0.19.2 generic actions only. Multi-key hotkeys use only keys plus optional x/y or coordinate; never attach element_token, element_index, or snapshot_id to a hotkey. When the fresh exact-window observation reports same_pid_keyboard_ambiguity, Host selects foreground delivery for the exact pinned window; never fall back to menus or sidebar navigation. Reliable keyboard-only file open: send {type:'key',keys:['CMD','O']}, fresh observe, send {type:'key',keys:['CMD','SHIFT','G']}, fresh observe, {type:'type',text:<parent-directory>} then RETURN, fresh observe, call the separate desktop_typeahead tool with only the exact basename; it opens the uniquely proven file child and returns only after Host proves the immutable document surface. Then freshly observe the document body; do not press an extra Return. Ordinary type inserts into a text field and must not substitute for desktop_typeahead. Never type the full file path into Go to Folder. Never invent raise, keychord, menu_click, or other action types." },
+      actions: { type: "array", minItems: 1, maxItems: 64, items: desktopModelActionSchema, description: "Closed Cua 0.20.0 generic actions only. For a native application menu outside the pinned content-window AX tree, use exactly one {type:'invoke_menu',path:[<top-level menu>,<immediate child>,...]}; Host binds it to the already-pinned pid/window and the driver resolves every live native menu level exactly, failing closed on missing, ambiguous, disabled, or structurally mismatched segments. Never replace it with screen coordinates. Multi-key hotkeys use only keys plus optional x/y or coordinate; never attach element_token, element_index, or snapshot_id to a hotkey. When the fresh exact-window observation reports same_pid_keyboard_ambiguity, Host selects foreground delivery for the exact pinned window. Reliable keyboard-only file open: send {type:'key',keys:['CMD','O']}, fresh observe, send {type:'key',keys:['CMD','SHIFT','G']}, fresh observe, {type:'type',text:<parent-directory>} then RETURN, fresh observe, call the separate desktop_typeahead tool with only the exact basename; it opens the uniquely proven file child and returns only after Host proves the immutable document surface. Then freshly observe the document body; do not press an extra Return. Ordinary type inserts into a text field and must not substitute for desktop_typeahead. Never type the full file path into Go to Folder. Never invent raise, keychord, menu_click, or other action types." },
       semanticBindings: { type: "array", maxItems: 64, items: objectSchema({ kind: { enum: ["click", "type_parameter"] }, bindingId: { type: "string" } }, ["kind", "bindingId"]) },
     }, ["actions"]),
 		executionMode: "sequential",
     async execute(_id, params, signal) {
+      const duplicatedLabels = duplicatedInteractiveLabels(observation);
+      if (duplicatedLabels.size > 0) {
+        const bindings = (params.semanticBindings ?? []).flatMap((item: any) => {
+          const located = locatedInteractiveBindings.get(String(item?.bindingId ?? ""));
+          return item?.kind === "click" && located ? [located] : [];
+        });
+        for (const action of params.actions as Array<Record<string, any>>) {
+          const type = String(action.type ?? action.action ?? "").toLowerCase();
+          if (["scroll", "key", "keypress"].includes(type)) throw new Error("interactive_control_requires_exact_binding");
+          if (!["click", "left_click", "double_click"].includes(type)) continue;
+          const target = elementsFrom(observation).find((element) =>
+            (typeof action.element_token === "string" && element.element_token === action.element_token) ||
+            (Number.isInteger(action.element_index) && element.element_index === action.element_index));
+          const name = target ? elementName(target) : "";
+          if (duplicatedLabels.has(name) && (
+            normalizedRole(target?.role) !== "button" ||
+            !bindings.some((binding) => binding.role === "button" && binding.name === name)
+          )) throw new Error("interactive_control_requires_exact_binding");
+        }
+      }
       const result = await request("mutate", { actions: params.actions, semanticBindings: params.semanticBindings ?? [] }, signal);
       return { content: contentForResult(result), details: { outcomes: result.outcomes, batchOK: result.batchOK } };
     },

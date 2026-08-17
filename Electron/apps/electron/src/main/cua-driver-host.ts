@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface } from "node:readline";
 
-export const CUA_DRIVER_VERSION = "0.19.2";
+export const CUA_DRIVER_VERSION = "0.20.0";
 export type DisplayDescriptor = {
   displayID: number;
   width: number;
@@ -238,6 +238,17 @@ const TARGET_WINDOW_ERROR_CODES = new Set([
   "window_owner_pid_mismatch",
 ]);
 
+function isAppSwitcherAction(action: Record<string, unknown>): boolean {
+  const type = String(action.type ?? action.action ?? "").toLowerCase();
+  if (type !== "key" && type !== "keypress") return false;
+  const tokens = (Array.isArray(action.keys) ? action.keys : [action.key])
+    .flatMap((value) => String(value ?? "").toUpperCase().split("+"))
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const keys = new Set(tokens.map((value) => value === "COMMAND" ? "CMD" : value));
+  return keys.has("CMD") && keys.has("TAB");
+}
+
 export function cuaToolFailureCode(result: unknown): string | undefined {
   if (!record(result)) return undefined;
   const structured = record(result.structuredContent) ? result.structuredContent : {};
@@ -253,7 +264,36 @@ export function cuaToolFailureCode(result: unknown): string | undefined {
   );
 }
 
-/** Argument construction mirrors the pinned 0.19.2 `describe` schemas. */
+export function isMissingInstalledAppError(error: unknown): boolean {
+  return error instanceof Error &&
+    /No installed macOS app found for name/i.test(error.message);
+}
+
+/** The driver's fixed rejection when the call's lifecycle session idled out. */
+export function isDriverSessionEndedError(error: unknown): boolean {
+  return error instanceof Error &&
+    /has ended; tool call '[^']+' was rejected/i.test(error.message);
+}
+
+export function resolveRunningAppBundleId(
+  apps: unknown,
+  applicationName: string,
+): string | undefined {
+  const needle = applicationName.trim().toLowerCase();
+  if (!needle || !Array.isArray(apps)) return undefined;
+  const matches = apps.filter(record).flatMap((app) => {
+    const name = String(app.name ?? app.app_name ?? "").trim().toLowerCase();
+    const bundle = String(app.bundle_id ?? app.bundleId ?? "").trim();
+    if (name !== needle || !bundle) return [];
+    return [{
+      bundle,
+      running: app.running === true || Number(app.pid) > 0,
+    }];
+  });
+  return (matches.find((app) => app.running) ?? matches[0])?.bundle;
+}
+
+/** Argument construction mirrors the pinned 0.20.0 `describe` schemas. */
 export function buildActionCall(
   action: Record<string, unknown>,
   target: CuaTarget,
@@ -286,6 +326,16 @@ export function buildActionCall(
     ...element,
     ...(action.delivery_mode ? { delivery_mode: action.delivery_mode } : {}),
   };
+  if (type === "invoke_menu")
+    return {
+      tool: "invoke_menu",
+      arguments: {
+        session: target.session,
+        pid: target.pid,
+        window_id: target.window_id,
+        path: action.path,
+      },
+    };
   if (
     [
       "click",
@@ -365,7 +415,8 @@ export class CuaDriverHost {
   private starting?: Promise<void>;
   private targets = new Map<string, CuaTarget>();
   private rootTargets = new Map<string, CuaTarget>();
-  private sessions = new Set<string>();
+  private applicationIdentities = new Map<string, Set<string>>();
+  private sessionScopes = new Map<string, "window" | "desktop">();
   private desktopSessions = new Map<string, string>();
   private teardowns = new Set<Promise<void>>();
   private shutdownRequested = false;
@@ -435,6 +486,7 @@ export class CuaDriverHost {
           "left_click",
           "right_click",
           "double_click",
+		  "invoke_menu",
           "type",
 		  "typeahead",
           "key",
@@ -463,13 +515,23 @@ export class CuaDriverHost {
           "computer runtime requires a session key",
           false,
         );
+      const identityKeys = [
+        typeof request.bundle_identifier === "string" && request.bundle_identifier.trim() ? `bundle:${request.bundle_identifier.trim().toLowerCase()}` : "",
+        typeof request.application_name === "string" && request.application_name.trim() ? `name:${request.application_name.trim().toLowerCase()}` : "",
+      ].filter(Boolean);
+      const established = this.applicationIdentities.get(session);
+      if (this.rootTargets.has(session) && established && identityKeys.some((key) => !established.has(key)))
+        return this.failure(
+          "target_handoff_untrusted",
+          "This Computer Task already has an exact root application; an unproven alias cannot replace it",
+          false,
+        );
       await this.startSession(session);
-      const launched = await this.call(
-        "launch_app",
-        request.bundle_identifier
-          ? { bundle_id: request.bundle_identifier }
-          : { name: request.application_name },
-      );
+      const launch = await this.launchApplication({
+        bundle_identifier: request.bundle_identifier,
+        application_name: request.application_name,
+      });
+      const launched = launch.result;
       const structured = record(launched.structuredContent)
         ? launched.structuredContent
         : {};
@@ -495,6 +557,13 @@ export class CuaDriverHost {
       const target = { pid, window_id: windowID, session };
       this.rootTargets.set(session, target);
       this.targets.set(session, target);
+      const proven = new Set(identityKeys);
+      for (const key of launch.provenIdentityKeys) proven.add(key);
+      for (const [kind, value] of [
+        ["bundle", structured.bundle_id ?? structured.bundle_identifier],
+        ["name", structured.name ?? structured.application_name],
+      ] as const) if (typeof value === "string" && value.trim()) proven.add(`${kind}:${value.trim().toLowerCase()}`);
+      this.applicationIdentities.set(session, proven);
       await this.call("bring_to_front", {
         pid: target.pid,
         window_id: target.window_id,
@@ -535,6 +604,12 @@ export class CuaDriverHost {
         return this.failure(
           "target_unavailable",
           "Open an application before sending desktop input; no exact target is pinned for this session",
+          false,
+        );
+      if (target && actions.some((raw) => record(raw) && isAppSwitcherAction(raw)))
+        return this.failure(
+          "target_handoff_untrusted",
+          "App-switcher shortcuts cannot be used after an exact application window is pinned; observe the pinned target instead",
           false,
         );
       if (target) await this.startSession(session, "window");
@@ -718,7 +793,8 @@ export class CuaDriverHost {
     this.starting = undefined;
     this.targets.clear();
     this.rootTargets.clear();
-    this.sessions.clear();
+    this.applicationIdentities.clear();
+    this.sessionScopes.clear();
     this.desktopSessions.clear();
     const teardown = this.terminateGeneration(proxy, daemon, socket);
     this.teardowns.add(teardown);
@@ -756,7 +832,11 @@ export class CuaDriverHost {
       throw new Error("Cua Driver host is shutting down");
     if (this.teardowns.size > 0)
       await Promise.all([...this.teardowns]);
-    if (this.proxy && this.daemon && !this.proxy.killed && !this.daemon.killed)
+    if (
+      this.proxy && this.daemon &&
+      !this.proxy.killed && !this.daemon.killed &&
+      this.proxy.exitCode === null && this.daemon.exitCode === null
+    )
       return;
     if (this.starting) return this.starting;
     this.starting = this.start().catch((error) => {
@@ -943,6 +1023,26 @@ export class CuaDriverHost {
     args: Record<string, unknown>,
   ): Promise<any> {
     await this.ensureStarted();
+    try {
+      return await this.invoke(name, args);
+    } catch (error) {
+      const session = typeof args.session === "string" ? args.session : "";
+      if (!session || name === "start_session" || !isDriverSessionEndedError(error))
+        throw error;
+      // The driver ends idle lifecycle sessions and ordinary actions never
+      // revive them; re-issue start_session with the same id, then retry once.
+      const scope = this.sessionScopes.get(session) ??
+        (session.startsWith("pipiui-desktop-") ? "desktop" : "window");
+      await this.invoke("start_session", { session, capture_scope: scope });
+      this.sessionScopes.set(session, scope);
+      return await this.invoke(name, args);
+    }
+  }
+
+  private async invoke(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<any> {
     const response = await this.rpc("tools/call", { name, arguments: args });
     if (response.error)
       throw new Error(response.error.message ?? `Cua Driver ${name} failed`);
@@ -957,16 +1057,43 @@ export class CuaDriverHost {
     return result;
   }
 
+  private async launchApplication(target: {
+    bundle_identifier?: unknown;
+    application_name?: unknown;
+  }): Promise<{ result: any; provenIdentityKeys: string[] }> {
+    const bundle = typeof target.bundle_identifier === "string"
+      ? target.bundle_identifier.trim()
+      : "";
+    const name = typeof target.application_name === "string"
+      ? target.application_name.trim()
+      : "";
+    try {
+      const result = await this.call(
+        "launch_app",
+        bundle ? { bundle_id: bundle } : { name },
+      );
+      return { result, provenIdentityKeys: [bundle ? `bundle:${bundle.toLowerCase()}` : `name:${name.toLowerCase()}`] };
+    } catch (error) {
+      if (bundle || !name || !isMissingInstalledAppError(error)) throw error;
+      const listed = await this.call("list_apps", {});
+      const structured = record(listed.structuredContent) ? listed.structuredContent : {};
+      const resolved = resolveRunningAppBundleId(structured.apps, name);
+      if (!resolved) throw error;
+      const result = await this.call("launch_app", { bundle_id: resolved });
+      return { result, provenIdentityKeys: [`name:${name.toLowerCase()}`, `bundle:${resolved.toLowerCase()}`] };
+    }
+  }
+
   private async startSession(
     session: string,
     captureScope: "window" | "desktop" = "window",
   ): Promise<void> {
-    if (this.sessions.has(session)) return;
+    if (this.sessionScopes.has(session)) return;
     await this.call("start_session", {
       session,
       capture_scope: captureScope,
     });
-    this.sessions.add(session);
+    this.sessionScopes.set(session, captureScope);
   }
 
   private async startDesktopSession(ownerSession: string): Promise<string> {

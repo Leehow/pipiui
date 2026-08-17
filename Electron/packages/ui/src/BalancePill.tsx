@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { PipiHostAPI, QuotaSnapshot } from '@pipi/host-api'
-import { visibleQuotaWindows } from './QuotaPill'
+import { quotaSnapshotMatchesProvider, visibleQuotaWindows } from './QuotaPill'
 import './balance-pill.css'
 
 export interface BalancePillProps {
@@ -43,6 +43,13 @@ export function formatBalance(amount: number, currency: string): string {
  */
 export function BalancePill({ host, sessionId, provider, refreshKey }: BalancePillProps) {
   const [snapshot, setSnapshot] = useState<QuotaSnapshot | null>(null)
+  const scopeRef = useRef({ sessionId, provider })
+  // Same render-time reset as QuotaPill: a session / model switch must not
+  // paint the previous provider's capsule while the next snapshot loads.
+  if (scopeRef.current.sessionId !== sessionId || scopeRef.current.provider !== provider) {
+    scopeRef.current = { sessionId, provider }
+    setSnapshot(null)
+  }
 
   useEffect(() => {
     if (typeof host.getQuotaSnapshot !== 'function') return
@@ -50,7 +57,9 @@ export function BalancePill({ host, sessionId, provider, refreshKey }: BalancePi
     const load = async () => {
       try {
         const snap = await host.getQuotaSnapshot!(sessionId)
-        if (!cancelled) setSnapshot(snap)
+        if (cancelled) return
+        if (snap && !quotaSnapshotMatchesProvider(snap, provider)) return
+        setSnapshot(snap)
       } catch {
         // Balance is best-effort: keep the last good snapshot, never error UI.
       }
@@ -59,11 +68,12 @@ export function BalancePill({ host, sessionId, provider, refreshKey }: BalancePi
     return () => { cancelled = true }
   }, [host, sessionId, provider, refreshKey])
 
-  if (!snapshot) return null
-  const balance = snapshot.balance
+  const activeSnapshot = snapshot && quotaSnapshotMatchesProvider(snapshot, provider) ? snapshot : null
+  if (!activeSnapshot) return null
+  const balance = activeSnapshot.balance
   // Quota wins over balance: a snapshot that reports usage windows never shows
   // the prepaid balance capsule (Swift `bindBalanceMonitor` gate).
-  if (!balance || visibleQuotaWindows(snapshot).length > 0) return null
+  if (!balance || visibleQuotaWindows(activeSnapshot).length > 0) return null
   const text = formatBalance(balance.amount, balance.currency)
   return (
     <span
@@ -71,7 +81,7 @@ export function BalancePill({ host, sessionId, provider, refreshKey }: BalancePi
       data-testid="balance-pill"
       role="text"
       aria-label={`账户余额 ${text}`}
-      title={snapshot.accountLabel || '账户余额'}
+      title={activeSnapshot.accountLabel || '账户余额'}
     >
       {text}
     </span>

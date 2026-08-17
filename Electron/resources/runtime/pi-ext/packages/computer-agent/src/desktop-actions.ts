@@ -10,8 +10,22 @@ const closedAction = (types: string[], properties: Record<string, unknown>, requ
 	required: ["type", ...required],
 });
 
+const invokeMenuActionSchema = {
+	type: "object",
+	additionalProperties: false,
+	properties: {
+		type: { enum: ["invoke_menu"] },
+		path: {
+			type: "array", minItems: 1, maxItems: 16,
+			items: { type: "string", minLength: 1, maxLength: 200 },
+		},
+	},
+	required: ["type", "path"],
+};
+
 const modelActionSchemas = [
 		closedAction(["click", "left_click", "right_click", "middle_click", "double_click", "triple_click"], {}),
+		invokeMenuActionSchema,
 		closedAction(["type"], { text: { type: "string" } }, ["text"]),
 		{ ...closedAction(["key", "keypress"], { key: { type: "string", minLength: 1 }, keys: { type: "array", minItems: 1, maxItems: 8, items: { type: "string", minLength: 1 } } }), anyOf: [{ required: ["key"] }, { required: ["keys"] }] },
 		closedAction(["scroll"], { direction: { enum: ["up", "down", "left", "right"] }, scroll_direction: { enum: ["up", "down", "left", "right"] }, amount: { type: "number" }, scroll_amount: { type: "number" } }),
@@ -32,7 +46,7 @@ export const desktopActionSchema = {
 
 const allowedCommon = new Set(["type", "x", "y", "coordinate", "element_token", "element_index", "snapshot_id", "delivery_mode"]);
 const finite = (value: unknown) => typeof value === "number" && Number.isFinite(value);
-const nonempty = (value: unknown) => typeof value === "string" && value.length > 0;
+const nonempty = (value: unknown): value is string => typeof value === "string" && value.length > 0;
 
 export function validateDesktopActions(value: unknown): asserts value is Array<Record<string, unknown>> {
 	if (!Array.isArray(value) || value.length < 1 || value.length > 64) throw new Error("mutate requires 1...64 actions");
@@ -40,13 +54,18 @@ export function validateDesktopActions(value: unknown): asserts value is Array<R
 		if (!action || typeof action !== "object" || Array.isArray(action)) throw new Error("desktop action must be an object");
 		const item = action as Record<string, unknown>;
 		const type = item.type;
-		if (!nonempty(type) || !["click", "left_click", "right_click", "middle_click", "double_click", "triple_click", "type", "typeahead", "key", "keypress", "scroll", "wait", "screenshot"].includes(type)) throw new Error("unsupported desktop action type");
+		if (!nonempty(type) || !["click", "left_click", "right_click", "middle_click", "double_click", "triple_click", "invoke_menu", "type", "typeahead", "key", "keypress", "scroll", "wait", "screenshot"].includes(type)) throw new Error("unsupported desktop action type");
 		const extra = new Set<string>();
+		if (type === "invoke_menu") extra.add("path");
 		if (type === "type" || type === "typeahead") extra.add("text");
 		if (type === "key" || type === "keypress") { extra.add("key"); extra.add("keys"); }
 		if (type === "scroll") for (const key of ["direction", "scroll_direction", "amount", "scroll_amount"]) extra.add(key);
 		if (type === "wait") { extra.add("duration"); extra.add("duration_ms"); }
 		if (Object.keys(item).some((key) => !allowedCommon.has(key) && !extra.has(key))) throw new Error("desktop action contains unsupported fields");
+		if (type === "invoke_menu") {
+			if (Object.keys(item).some((key) => !["type", "path"].includes(key))) throw new Error("invoke_menu accepts only an exact menu path");
+			if (!Array.isArray(item.path) || item.path.length < 1 || item.path.length > 16 || !item.path.every((segment) => nonempty(segment) && segment.length <= 200)) throw new Error("invoke_menu requires 1...16 bounded non-empty path segments");
+		}
 		if ((item.x !== undefined && !finite(item.x)) || (item.y !== undefined && !finite(item.y))) throw new Error("desktop action coordinates must be finite numbers");
 		if (item.coordinate !== undefined && (!Array.isArray(item.coordinate) || item.coordinate.length !== 2 || !item.coordinate.every(finite))) throw new Error("desktop action coordinate must contain two finite numbers");
 		if (item.element_index !== undefined && (!Number.isInteger(item.element_index) || Number(item.element_index) < 0)) throw new Error("desktop action element_index must be a nonnegative integer");

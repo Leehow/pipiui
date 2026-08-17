@@ -9,8 +9,10 @@ import {
   openCodeGoWindows,
   parseClaudeWindows,
   parseCodexWindows,
+  parseCursorWindows,
   parseDeepSeekBalance,
   parseGlmWindows,
+  parseGrokRateLimitSnapshot,
   parseGrokWindows,
   parseKimiWindows,
   parseMoonshotBalance,
@@ -30,6 +32,8 @@ describe("provider parsers", () => {
     expect(parseClaudeWindows({ five_hour: { utilization: 16, resets_at: "2026-08-14T00:00:00Z" }, seven_day: { utilization: "40" } }).map(w => w.usedPercent)).toEqual([16, 40]);
     expect(parseGlmWindows({ success: true, data: { limits: [{ type: "TOKENS_LIMIT", unit: 3, number: 5, usage: 1000, remaining: 700, nextResetTime: 1_800_000_000_000 }] } })[0]).toMatchObject({ label: "5h", usedPercent: 30 });
     expect(parseKimiWindows({ usage: { limit: "100", used: "20" }, limits: [{ detail: { limit: 50, remaining: 40 } }] }).map(w => w.usedPercent)).toEqual([20, 20]);
+    expect(parseCursorWindows({ includedUsagePercent: 33, namedModelSelectedUsage: { used: 2, limit: 8 } }).map(w => [w.id, w.usedPercent])).toEqual([["plan", 33], ["cursorModels", 25]]);
+    expect(parseCursorWindows(null)).toEqual([]);
   });
 
   it("normalizes Qoder, Qwen and every prepaid balance", () => {
@@ -77,6 +81,7 @@ describe("provider parsers", () => {
     expect(parseClaudeWindows({ five_hour: { utilization: "bad" } })).toEqual([]);
     expect(parseGlmWindows({ success: false })).toEqual([]);
     expect(parseKimiWindows({})).toEqual([]);
+    expect(parseCursorWindows({})).toEqual([]);
     expect(parseDeepSeekBalance({ balance_infos: [] })).toBeUndefined();
   });
 });
@@ -148,6 +153,7 @@ describe("Qoder token resolution", () => {
 describe("registry routing", () => {
   const registry = new AccountUsageRegistry();
   it("routes every built-in provider and excludes relays/near misses", () => {
+    expect(registry.resolve("cursor")?.id).toBe("cursor");
     expect(registry.resolve("openai-codex")?.id).toBe("codex");
     expect(registry.resolve("xai")?.id).toBe("grok");
     expect(registry.resolve("anthropic")?.id).toBe("claude");
@@ -184,6 +190,7 @@ describe("built-in adapters", () => {
     openrouter: { type: "api_key", key: "or-token" },
   };
   const bodies: Array<[string, unknown]> = [
+    ["cursor.com/api/usage-summary", { includedUsagePercent: 22, namedModelSelectedUsage: { used: 1, limit: 10 } }],
     ["wham/usage", { rate_limit: { primary_window: { used_percent: 11, limit_window_seconds: 18000 } } }],
     ["anthropic.com", { five_hour: { utilization: 12 } }],
     ["monitor/usage", { success: true, data: { limits: [{ type: "TOKENS_LIMIT", unit: 3, number: 5, usage: 100, remaining: 87 }] } }],
@@ -197,9 +204,15 @@ describe("built-in adapters", () => {
   ];
   const fakeFetch = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
-    if (url.includes("grok.com")) {
-      const payload = new Uint8Array(5); payload[0] = 0x0d; new DataView(payload.buffer).setFloat32(1, 22, true);
-      return new Response(payload);
+    if (url.includes("GetGrokCreditsConfig")) {
+      const payload = new Uint8Array(7);
+      payload[0] = 0x0d;
+      new DataView(payload.buffer).setFloat32(1, 25, true);
+      payload[5] = 0x10; payload[6] = 0x01;
+      return new Response(payload, { status: 200 });
+    }
+    if (url.includes("api.x.ai")) {
+      return new Response("{}", { status: 200, headers: { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "78" } });
     }
     const match = bodies.find(([needle]) => url.includes(needle));
     if (!match) throw new Error(`unexpected URL ${url}`);
@@ -209,17 +222,18 @@ describe("built-in adapters", () => {
     fetch: fakeFetch,
     env: { OPENCODE_API_KEY: "go-key" },
     readAuth: async store => store === "pi" ? pi : store === "codex" ? { tokens: { access_token: "codex-token" } } : store === "grok" ? { "https://auth.x.ai::account": { key: "grok-token" } } : undefined,
-    readCookie: async provider => provider === "qwen-token-plan" ? "ticket=ok" : undefined,
+    readCookie: async provider => provider === "qwen-token-plan" ? "ticket=ok" : provider === "cursor" ? "WorkosCursorSessionToken=ok" : undefined,
+    readCursorAuth: async () => undefined,
     readLocalUsage: async () => [{ createdMs: Date.now() - 1000, cost: 1 }],
   });
 
-  it("loads Grok quota through its isolated gRPC-web adapter", async () => {
+  it("loads Grok quota through grok.com SuperGrok credits", async () => {
     const result = await monitor.snapshot("xai", true);
     expect(result.status).toBe("ready");
-    if (result.status === "ready") expect(result.snapshot.windows[0].usedPercent).toBe(22);
+    if (result.status === "ready") expect(result.snapshot.windows[0].usedPercent).toBe(25);
   });
 
-  for (const [provider, expected] of [["openai-codex", 11], ["anthropic", 12], ["zai-coding-cn", 13], ["kimi-coding", 14], ["qoder-cn", 15], ["qwen-token-plan", 16]] as const) {
+  for (const [provider, expected] of [["cursor", 22], ["openai-codex", 11], ["anthropic", 12], ["zai-coding-cn", 13], ["kimi-coding", 14], ["qoder-cn", 15], ["qwen-token-plan", 16]] as const) {
     it(`loads ${provider} quota`, async () => {
       const result = await monitor.snapshot(provider, true);
       expect(result.status).toBe("ready");
@@ -233,6 +247,13 @@ describe("built-in adapters", () => {
       if (result.status === "ready") expect(result.snapshot.balance?.amount).toBe(expected);
     });
   }
+  it("hides Cursor when no desktop token or cookie is available", async () => {
+    const fetchSpy = vi.fn(async () => response({})) as unknown as typeof fetch;
+    const empty = new AccountUsageMonitor({ fetch: fetchSpy, readCursorAuth: async () => undefined, readCookie: async () => undefined });
+    const result = await empty.snapshot("cursor", true);
+    expect(result).toEqual({ status: "no-data", reason: "missing-credential" });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
   it("loads OpenCode Go only through the injected local reader", async () => {
     const result = await monitor.snapshot("opencode-go", true);
     expect(result.status).toBe("ready");
@@ -319,4 +340,119 @@ describe("monitor caching and failures", () => {
 
 it("exports an explicit, unique provider registry", () => {
   expect(new Set(builtinAccountUsageAdapters.map(adapter => adapter.id)).size).toBe(builtinAccountUsageAdapters.length);
+});
+
+describe("Grok quota via api.x.ai rate-limit headers", () => {
+  const grokAdapter = builtinAccountUsageAdapters.find(adapter => adapter.id === "grok");
+  const now = Date.UTC(2026, 7, 15, 12);
+
+  it("derives request and token windows from a captured snapshot", () => {
+    expect(parseGrokRateLimitSnapshot({ limitRequests: 100, remainingRequests: 25, limitTokens: 1000, remainingTokens: 500 }).map(w => [w.label, w.usedPercent]))
+      .toEqual([["请求", 75], ["Tokens", 50]]);
+    expect(parseGrokRateLimitSnapshot({ limitRequests: 100, remainingRequests: 0 })).toEqual([expect.objectContaining({ label: "请求", usedPercent: 100 })]);
+    expect(parseGrokRateLimitSnapshot({ limitRequests: 0, remainingRequests: 5 })).toEqual([]);
+    expect(parseGrokRateLimitSnapshot(undefined)).toEqual([]);
+    expect(parseGrokRateLimitSnapshot(JSON.stringify({ limitRequests: 10, remainingRequests: 5 })).map(w => [w.label, w.usedPercent])).toEqual([["请求", 50]]);
+  });
+
+  it("prefers grok.com SuperGrok credits over a captured 0% rate-limit snapshot", async () => {
+    const payload = new Uint8Array(7);
+    payload[0] = 0x0d;
+    new DataView(payload.buffer).setFloat32(1, 25, true);
+    payload[5] = 0x10; payload[6] = 0x01;
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      expect(String(input)).toContain("GetGrokCreditsConfig");
+      return new Response(payload, { status: 200 });
+    }) as unknown as typeof fetch;
+    const monitor = new AccountUsageMonitor({
+      fetch: fetcher, now: () => now,
+      readAuth: async store => store === "grok" ? { "https://auth.x.ai::account": { key: "grok-token" } } : undefined,
+      readGrokRateLimits: async () => ({ limitRequests: 8300, remainingRequests: 8300, limitTokens: 53000000, remainingTokens: 53000000 }),
+    });
+    const result = await monitor.snapshot("xai");
+    expect(result.status).toBe("ready");
+    if (result.status === "ready") {
+      expect(result.snapshot.windows[0]).toMatchObject({ usedPercent: 25, title: "额度" });
+      expect(result.snapshot.windows.some(window => window.label === "请求")).toBe(false);
+    }
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("prefers the captured file and never probes the network", async () => {
+    const fetcher = vi.fn() as unknown as typeof fetch;
+    const monitor = new AccountUsageMonitor({ fetch: fetcher, now: () => now, readGrokRateLimits: async () => ({ limitRequests: 10, remainingRequests: 5 }) });
+    const result = await monitor.snapshot("xai");
+    expect(result).toMatchObject({ status: "ready", snapshot: { windows: [{ label: "请求", usedPercent: 50 }] } });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("parses the host's grok-rate-limits.json file contents without a probe", async () => {
+    const fetcher = vi.fn() as unknown as typeof fetch;
+    const monitor = new AccountUsageMonitor({
+      fetch: fetcher, now: () => now,
+      readGrokRateLimits: async () => JSON.stringify({ limitRequests: 8300, remainingRequests: 6225, limitTokens: 53000000, remainingTokens: 47700000 }),
+    });
+    const result = await monitor.snapshot("xai");
+    expect(result).toMatchObject({ status: "ready" });
+    if (result.status === "ready") {
+      expect(result.snapshot.windows.map(w => [w.label, w.usedPercent])).toEqual([["请求", 25], ["Tokens", 10]]);
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("probes one minimal completion when grok.com is empty and nothing was captured", async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("GetGrokCreditsConfig")) return new Response(new Uint8Array(), { status: 200 });
+      expect(url).toBe("https://api.x.ai/v1/chat/completions");
+      const body = JSON.parse(String(init?.body));
+      expect(body.model).toBe("grok-4.6");
+      expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer pi-oauth-token");
+      return new Response("{}", { status: 200, headers: {
+        "x-ratelimit-limit-requests": "8300", "x-ratelimit-remaining-requests": "6225",
+        "x-ratelimit-limit-tokens": "53000000", "x-ratelimit-remaining-tokens": "47700000",
+      } });
+    }) as unknown as typeof fetch;
+    const monitor = new AccountUsageMonitor({
+      fetch: fetcher, now: () => now,
+      readAuth: async store => store === "pi" ? { xai: { type: "oauth", access: "pi-oauth-token" } } : undefined,
+      readGrokRateLimits: async () => undefined,
+    });
+    const result = await monitor.snapshot("xai");
+    expect(result).toMatchObject({ status: "ready" });
+    if (result.status === "ready") {
+      expect(result.snapshot.windows.map(w => [w.label, w.usedPercent])).toEqual([["请求", 25], ["Tokens", 10]]);
+    }
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns no data without credentials and skips the probe on non-OK answers", async () => {
+    const noAuth = new AccountUsageMonitor({ fetch: vi.fn() as unknown as typeof fetch, readGrokRateLimits: async () => undefined });
+    await expect(noAuth.snapshot("xai")).resolves.toMatchObject({ status: "no-data", reason: "missing-credential" });
+    const fetcher = vi.fn(async () => response({}, 429)) as unknown as typeof fetch;
+    const refused = new AccountUsageMonitor({
+      fetch: fetcher, readAuth: async store => store === "pi" ? { xai: { access: "pi-oauth-token" } } : undefined,
+      readGrokRateLimits: async () => undefined,
+    });
+    await expect(refused.snapshot("xai")).resolves.toMatchObject({ status: "no-data" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to the grok CLI credential when pi auth has no xai entry", async () => {
+    expect(grokAdapter).toBeDefined();
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("GetGrokCreditsConfig")) return new Response(new Uint8Array(), { status: 200 });
+      expect(url).toContain("api.x.ai");
+      expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer grok-cli-key");
+      return new Response("{}", { status: 200, headers: { "x-ratelimit-limit-requests": "10", "x-ratelimit-remaining-requests": "10" } });
+    }) as unknown as typeof fetch;
+    const monitor = new AccountUsageMonitor({
+      fetch: fetcher, now: () => now,
+      readAuth: async store => store === "grok" ? { "https://auth.x.ai::client": { key: "grok-cli-key" } } : undefined,
+      readGrokRateLimits: async () => undefined,
+    });
+    const result = await monitor.snapshot("xai");
+    expect(result).toMatchObject({ status: "ready", snapshot: { windows: [{ label: "请求", usedPercent: 0 }] } });
+  });
 });

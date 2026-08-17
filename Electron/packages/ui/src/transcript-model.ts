@@ -15,9 +15,14 @@ export type TranscriptTool = {
 }
 
 export type TranscriptActivity =
-  | { type: 'thinking'; id: string; contentIndex: number; segment?: number; content: string }
+  | { type: 'thinking'; id: string; contentIndex: number; segment?: number; content: string; charCount?: number }
   | { type: 'text'; id: string; contentIndex: number; segment?: number; content: string }
   | { type: 'tool'; contentIndex: number; segment?: number; tool: TranscriptTool }
+
+/** Placeholder thinking activity opened after the last in-flight tool finishes.
+ *  Providers that omit `thinking_delta` (openai-completions / Grok) otherwise
+ *  leave a silent gap that the transcript paints as 已完成. */
+export const PENDING_THINKING_ID = 'thinking:pending'
 
 export type TranscriptSegment =
   | { type: 'steps'; activities: Array<Extract<TranscriptActivity, { type: 'thinking' | 'tool' }>> }
@@ -55,6 +60,25 @@ function mapHistoryActivity(entry: HistoryEntry, activity: NonNullable<HistoryEn
 
 function lastSegment(activities: TranscriptActivity[]): number {
   return activities.reduce((highest, activity) => Math.max(highest, activity.segment ?? 0), 0)
+}
+
+function isPendingThinking(activity: TranscriptActivity | undefined): activity is Extract<TranscriptActivity, { type: 'thinking' }> {
+  return activity?.type === 'thinking' && activity.id === PENDING_THINKING_ID && !activity.content
+}
+
+function stripPendingThinking(activities: TranscriptActivity[]): TranscriptActivity[] {
+  return activities.filter(activity => !isPendingThinking(activity))
+}
+
+function allToolsFinished(tools: TranscriptTool[] | undefined): boolean {
+  return (tools?.length ?? 0) > 0 && (tools ?? []).every(tool => Boolean(tool.finished))
+}
+
+function openPendingThinking(activities: TranscriptActivity[]): void {
+  if (activities.some(isPendingThinking)) return
+  const last = activities[activities.length - 1]
+  if (last?.type === 'thinking') return
+  activities.push({ type: 'thinking', id: PENDING_THINKING_ID, contentIndex: -1, content: '' })
 }
 
 export function activitiesFromMessage(message: Pick<ChatMessage, 'thinking' | 'tools' | 'activities'>): TranscriptActivity[] {
@@ -220,6 +244,8 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
   const updated: ChatMessage = { ...current, tools, activities }
   if (event.type === 'text') {
     updated.content += event.delta
+    const pendingIndex = activities.findIndex(isPendingThinking)
+    if (pendingIndex >= 0) activities.splice(pendingIndex, 1)
     const segment = event.segment ?? 0
     const id = `text:${segment}:${event.contentIndex}`
     const activityIndex = activities.findIndex(activity => activity.type === 'text' && activity.id === id)
@@ -236,24 +262,53 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
     // must be part of the key: same-index thinking from a later message is a
     // distinct block, not a continuation of the first one (history parity).
     const segment = event.segment ?? 0
-    const activityIndex = activities.findIndex(activity => activity.type === 'thinking' && activity.contentIndex === event.contentIndex && activity.id === `thinking:${segment}:${event.contentIndex}`)
+    const pendingIndex = activities.findIndex(isPendingThinking)
+    const activityIndex = pendingIndex >= 0
+      ? pendingIndex
+      : activities.findIndex(activity => activity.type === 'thinking' && activity.contentIndex === event.contentIndex && activity.id === `thinking:${segment}:${event.contentIndex}`)
     if (activityIndex >= 0) {
       const activity = activities[activityIndex]
-      if (activity.type === 'thinking') activities[activityIndex] = { ...activity, content: activity.content + event.delta }
+      if (activity.type === 'thinking') {
+        activities[activityIndex] = {
+          ...activity,
+          id: `thinking:${segment}:${event.contentIndex}`,
+          contentIndex: event.contentIndex,
+          segment,
+          content: activity.id === PENDING_THINKING_ID ? event.delta : activity.content + event.delta,
+        }
+      }
     } else {
       activities.push({ type: 'thinking', id: `thinking:${segment}:${event.contentIndex}`, contentIndex: event.contentIndex, segment, content: event.delta })
     }
   }
   if (event.type === 'tool_call') {
-    const toolIndex = updated.tools!.findIndex(item => item.id === event.toolCallId)
-    if (toolIndex >= 0) updated.tools![toolIndex] = { ...updated.tools![toolIndex], input: updated.tools![toolIndex].input + (event.delta ?? '') }
-    else updated.tools!.push({ id: event.toolCallId, name: event.name, input: event.delta ?? '', startedAt: Date.now() })
-    const tool = updated.tools![toolIndex >= 0 ? toolIndex : updated.tools!.length - 1]
-    const activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.toolCallId)
+    const pendingIndex = activities.findIndex(isPendingThinking)
+    if (pendingIndex >= 0) activities.splice(pendingIndex, 1)
+    const segment = event.segment ?? lastSegment(activities)
+    let activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.toolCallId)
+    if (activityIndex < 0 && event.contentIndex !== undefined) {
+      activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.contentIndex === event.contentIndex && (activity.segment ?? 0) === segment)
+    }
+    let toolIndex = activityIndex >= 0 && activities[activityIndex]?.type === 'tool'
+      ? updated.tools!.findIndex(item => item.id === (activities[activityIndex] as Extract<TranscriptActivity, { type: 'tool' }>).tool.id)
+      : updated.tools!.findIndex(item => item.id === event.toolCallId)
+    if (toolIndex >= 0) {
+      const previous = updated.tools![toolIndex]
+      const remapping = previous.id !== event.toolCallId
+      updated.tools![toolIndex] = {
+        ...previous,
+        id: event.toolCallId,
+        name: event.name && event.name !== 'tool' ? event.name : previous.name,
+        input: remapping && event.delta ? event.delta : previous.input + (event.delta ?? ''),
+      }
+    } else {
+      updated.tools!.push({ id: event.toolCallId, name: event.name, input: event.delta ?? '', startedAt: Date.now() })
+      toolIndex = updated.tools!.length - 1
+    }
+    const tool = updated.tools![toolIndex]
     if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool } as TranscriptActivity
     else {
       const contentIndex = event.contentIndex ?? (activities.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
-      const segment = event.segment ?? lastSegment(activities)
       activities.push({ type: 'tool', contentIndex, segment, tool })
     }
   }
@@ -266,6 +321,7 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
       const activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.toolCallId)
       if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool: completed } as TranscriptActivity
     }
+    if (allToolsFinished(updated.tools)) openPendingThinking(activities)
   }
   // Keep insertion order. Sorting by contentIndex is wrong: Pi restarts the
   // index every assistant message, and text/thinking often share index 0.
@@ -292,6 +348,58 @@ export function finishStreamingMessage(messages: ChatMessage[]): ChatMessage[] {
   const index = messages.findLastIndex(message => message.role === 'assistant' && message.streaming)
   if (index < 0) return messages
   const next = [...messages]
-  next[index] = { ...next[index], streaming: false }
+  const message = next[index]
+  const activities = message.activities ? stripPendingThinking(message.activities) : message.activities
+  next[index] = { ...message, streaming: false, ...(activities ? { activities } : {}) }
+  return next
+}
+
+/** Last durable activity is a finished tool (or the live pending-thinking
+ *  placeholder). A later `started` after that is the next model hop, not a
+ *  ghost turn after a text-only conclusion. */
+export function assistantEndedAwaitingModel(message: Pick<ChatMessage, 'role' | 'content' | 'activities' | 'thinking' | 'tools'>): boolean {
+  if (message.role !== 'assistant') return false
+  const activities = activitiesFromMessage(message)
+  let last: TranscriptActivity | undefined
+  for (const activity of activities) {
+    if (activity.type === 'text' && !activity.content) continue
+    last = activity
+  }
+  if (!last) return false
+  if (last.type === 'thinking') return last.id === PENDING_THINKING_ID
+  if (last.type === 'text') return false
+  if (last.type === 'tool' && last.tool.finished) {
+    // Text-then-tools is a mid-turn hop. Tools plus `content` and no text
+    // activity is a history-merged conclusion (the final prose never became
+    // its own activity).
+    if (activities.some(activity => activity.type === 'text' && activity.content)) return true
+    return !message.content?.trim()
+  }
+  return false
+}
+
+/** JSONL/history conclusion: the assistant already produced readable text and
+ *  is not sitting on a finished tool waiting for the next hop. Ignores
+ *  `streaming` — a lost `settled` leaves that flag stuck true. */
+export function assistantLooksSettled(message: Pick<ChatMessage, 'role' | 'content' | 'activities' | 'thinking' | 'tools' | 'error'>): boolean {
+  if (message.role !== 'assistant') return false
+  if (assistantEndedAwaitingModel(message)) return false
+  const activities = activitiesFromMessage(message)
+  if (activities.some(activity => activity.type === 'text' && activity.content.trim())) return true
+  return Boolean(message.content?.trim() || message.error?.trim())
+}
+
+/** Re-open the last tool-ended assistant so the next silent model hop still
+ *  shows a live Thinking card instead of a pile of 已完成 steps. */
+export function reopenAssistantForNextCompletion(messages: ChatMessage[]): ChatMessage[] {
+  const index = messages.findLastIndex(message => message.role === 'assistant')
+  if (index < 0 || !assistantEndedAwaitingModel(messages[index])) return messages
+  const message = messages[index]
+  const activities = (message.activities ?? activitiesFromMessage(message)).map(activity => activity.type === 'tool'
+    ? { ...activity, tool: { ...activity.tool } }
+    : { ...activity })
+  openPendingThinking(activities)
+  const next = [...messages]
+  next[index] = { ...message, streaming: true, activities }
   return next
 }

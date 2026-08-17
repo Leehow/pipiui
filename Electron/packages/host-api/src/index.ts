@@ -350,7 +350,7 @@ export type BrowserToolRequest = { action: string; url?: string; scope?: "viewpo
 export type BrowserToolResult = Record<string, unknown> & { ok: boolean; error?: string; base64?: string; mimeType?: string };
 export type BrowserTabOptions = { url?: string };
 export type BrowserViewBounds = { x: number; y: number; width: number; height: number; visible?: boolean };
-export type BrowserEvent = ({ type: "tabs"; snapshot: BrowserTabsSnapshot } | { type: "reveal" }) & { sessionId: string };
+export type BrowserEvent = ({ type: "tabs"; snapshot: BrowserTabsSnapshot } | { type: "reveal" } | { type: "error"; message: string }) & { sessionId: string };
 
 /**
  * Optional desktop-browser extension. `loadURL` is the navigation command;
@@ -403,7 +403,7 @@ export type StreamEvent =
    * mutually exclusive with a clean finish. Old clients may safely ignore it.
    */
   | { type: "compaction"; sessionId: string; phase: "start" | "end"; reason?: string; aborted?: boolean; error?: string };
-export type AgentEvent = { type: "agent"; agent: AgentSummary } | { type: "agent_log"; /** Optional only so an older host event can be ignored safely; current hosts always emit both identity fields. */ sessionId?: string; agentId: string; runId?: string; itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; /** Runtime log_delta key: cumulative full text per streamed entry, so the panel can upsert one row per contentIndex instead of one per chunk. */ contentIndex?: number; /** Turn boundary from runtime `kind:"log"`: forget contentIndex slots so the next message's index 0 opens a new row instead of rewriting the previous thinking/text. */ resetStreamSlots?: boolean } | { type: "worktree"; status: WorktreeStatus };
+export type AgentEvent = { type: "agent"; agent: AgentSummary } | { type: "agent_log"; /** Optional only so an older host event can be ignored safely; current hosts always emit both identity fields. */ sessionId?: string; agentId: string; runId?: string; itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; /** Runtime log_delta key: cumulative full text per streamed entry, so the panel can upsert one row per contentIndex instead of one per chunk. */ contentIndex?: number; /** Uncapped thinking length; preview `text` may still be sliced. */ charCount?: number; /** Turn boundary from runtime `kind:"log"`: forget contentIndex slots so the next message's index 0 opens a new row instead of rewriting the previous thinking/text. */ resetStreamSlots?: boolean } | { type: "worktree"; status: WorktreeStatus };
 export type HostEvent =
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "stream"; event: StreamEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "agents"; event: AgentEvent }
@@ -435,6 +435,8 @@ export interface PipiHostAPI {
   sendPrompt(sessionId: string, prompt: string, attachments?: PromptAttachment[]): Promise<void>;
   listQueue(sessionId: string): Promise<QueuedMessage[]>; enqueueMessage(sessionId: string, text: string, attachments?: PromptAttachment[]): Promise<QueueEnqueueResult>; updateQueuedMessage(sessionId: string, messageId: string, text: string, attachments?: PromptAttachment[]): Promise<QueuedMessage>; removeQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; promoteQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; steerQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; retryQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>;
   stop(sessionId: string): Promise<void>; queueFollowUp(sessionId: string, prompt: string): Promise<void>; subscribeStream(sessionId: string, listener: (event: StreamEvent) => void): Unsubscribe;
+  /** Optional compatibility extension: observe stream events from every session without changing the selected-session subscription. */
+  subscribeAllStreams?(listener: (event: StreamEvent) => void): Unsubscribe;
   /**
    * Compact the session's context now (pi's `compact` RPC — the same path
    * `/compact` uses). Optional: older hosts omit it and the UI hides the
@@ -494,6 +496,16 @@ export interface PipiHostAPI {
   cancelProviderLogin(loginId: string): Promise<void>;
   /** Deletes the provider's pi credentials (pi logout) and refreshes models. */
   removeProviderCredentials(providerId: string): Promise<ModelState>;
+  /**
+   * Persist an OpenAI-compatible custom provider into models.json
+   * (`api: openai-completions` + baseUrl + apiKey + models[]) and refresh the catalog.
+   */
+  addOpenAICompatibleProvider?(input: {
+    name: string;
+    baseUrl: string;
+    apiKey: string;
+    modelId: string;
+  }): Promise<{ providerId: string }>;
   /** Electron-only: open an auth URL in the user's browser (safe http/https only). */
   openExternal?(url: string): Promise<void>;
   /** Electron-only: open one validated local supported document in the OS default app. */
@@ -514,7 +526,7 @@ export interface PipiHostAPI {
    */
   getQuotaSnapshot?(sessionId?: string): Promise<QuotaSnapshot | null>;
   /** Current snapshot; omit sessionId only for hosts that intentionally aggregate all sessions. */
-  listAgents(sessionId?: string): Promise<AgentSummary[]>; getAgentLogs(agentId: string, sessionId: string, runId: string): Promise<{ itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; contentIndex?: number }[]>; subscribeAgents(listener: (event: AgentEvent) => void): Unsubscribe; subscribeAgentLog(agentId: string, listener: (event: Extract<AgentEvent, { type: "agent_log" }>) => void, sessionId: string, runId: string): Unsubscribe; abortAgent(agentId: string): Promise<void>; resolveAgent(agentId: string): Promise<void>; checkAgent(agentId: string): Promise<AgentSummary>; getWorktreeStatus(agentId: string): Promise<WorktreeStatus>; mergeWorktree(agentId: string): Promise<WorktreeStatus>; discardWorktree(agentId: string): Promise<WorktreeStatus>;
+  listAgents(sessionId?: string): Promise<AgentSummary[]>; getAgentLogs(agentId: string, sessionId: string, runId: string, scope?: "run" | "agent"): Promise<{ itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; contentIndex?: number; charCount?: number }[]>; subscribeAgents(listener: (event: AgentEvent) => void): Unsubscribe; subscribeAgentLog(agentId: string, listener: (event: Extract<AgentEvent, { type: "agent_log" }>) => void, sessionId: string, runId: string): Unsubscribe; abortAgent(agentId: string): Promise<void>; resolveAgent(agentId: string): Promise<void>; checkAgent(agentId: string): Promise<AgentSummary>; getWorktreeStatus(agentId: string): Promise<WorktreeStatus>; mergeWorktree(agentId: string): Promise<WorktreeStatus>; discardWorktree(agentId: string): Promise<WorktreeStatus>;
   capabilities(): Promise<HostCapabilities>;
   /**
    * Optional git extension for the toolbar branch control. Hosts advertise it
@@ -531,6 +543,8 @@ export interface PipiHostAPI {
    */
   probeDirectoryGit?(path: string): Promise<GitStatus>;
   gitInitDirectory?(path: string): Promise<GitStatus>;
+  /** Electron-only read-only check used by onboarding; old hosts may omit it. */
+  probeGitBinary?(): Promise<boolean>;
   /** Optional v2 UI convenience; older hosts simply render Finder reveal disabled. */
   revealProject?(projectId: string): Promise<void>;
   /** Electron-only, read-only version discovery. It never installs or mutates packages. */
@@ -541,7 +555,7 @@ export interface PipiHostAPI {
   terminal?: TerminalHostAPI;
 }
 
-type BaseHostMethod = Exclude<keyof Omit<PipiHostAPI, "protocolVersion" | "subscribeStream" | "subscribeAgents" | "subscribeAgentLog" | "subscribeSessionStats" | "browser" | "terminal">, "browser" | "terminal">;
+type BaseHostMethod = Exclude<keyof Omit<PipiHostAPI, "protocolVersion" | "subscribeStream" | "subscribeAllStreams" | "subscribeAgents" | "subscribeAgentLog" | "subscribeSessionStats" | "browser" | "terminal">, "browser" | "terminal">;
 export type TerminalHostMethod = "terminalOpen" | "terminalWrite" | "terminalResize" | "terminalClear" | "terminalPrivate" | "terminalSnapshot" | "terminalClose";
 export type BrowserHostMethod = "browserSelectSession" | "browserListTabs" | "browserGetActiveTab" | "browserNewTab" | "browserSwitchTab" | "browserCloseTab" | "browserLoadURL" | "browserGoBack" | "browserGoForward" | "browserReload" | "browserSnapshot" | "browserSetViewBounds";
 export type HostMethod = BaseHostMethod | TerminalHostMethod | BrowserHostMethod;
@@ -593,6 +607,7 @@ function apiFrom(
     queueFollowUp: (sessionId, prompt) => invoke("queueFollowUp", sessionId, prompt),
     compact: sessionId => invoke("compact", sessionId),
     subscribeStream: (sessionId, listener) => subscribe("stream", event => event.channel === "stream" && event.event.sessionId === sessionId, event => listener((event as Extract<HostEvent, { channel: "stream" }>).event)),
+    subscribeAllStreams: listener => subscribe("stream", event => event.channel === "stream", event => listener((event as Extract<HostEvent, { channel: "stream" }>).event)),
     listModels: () => invoke("listModels"),
     getModelState: sessionId => sessionId ? invoke("getModelState", sessionId) : invoke("getModelState"),
     setModel: (sessionId, provider, modelId) => invoke("setModel", sessionId, provider, modelId),
@@ -602,6 +617,7 @@ function apiFrom(
     continueProviderLogin: (loginId, input) => input === undefined ? invoke("continueProviderLogin", loginId) : invoke("continueProviderLogin", loginId, input),
     cancelProviderLogin: loginId => invoke("cancelProviderLogin", loginId),
     removeProviderCredentials: providerId => invoke("removeProviderCredentials", providerId),
+    addOpenAICompatibleProvider: input => invoke("addOpenAICompatibleProvider", input),
     getHiddenModelIds: () => invoke("getHiddenModelIds"),
     setHiddenModelIds: ids => invoke("setHiddenModelIds", ids),
     getSidebarSessionPreferences: () => invoke("getSidebarSessionPreferences"),
@@ -621,7 +637,7 @@ function apiFrom(
     getQuotaSnapshot: sessionId => sessionId === undefined ? invoke("getQuotaSnapshot") : invoke("getQuotaSnapshot", sessionId),
     subscribeSessionStats: listener => subscribe("session_stats", event => event.channel === "session_stats", event => listener((event as Extract<HostEvent, { channel: "session_stats" }>).event)),
     listAgents: sessionId => invoke("listAgents", sessionId),
-    getAgentLogs: (agentId, sessionId, runId) => invoke("getAgentLogs", agentId, sessionId, runId),
+    getAgentLogs: (agentId, sessionId, runId, scope) => scope ? invoke("getAgentLogs", agentId, sessionId, runId, scope) : invoke("getAgentLogs", agentId, sessionId, runId),
     subscribeAgents: listener => subscribe("agents", event => event.channel === "agents", event => listener((event as Extract<HostEvent, { channel: "agents" }>).event)),
     subscribeAgentLog: (agentId, listener, sessionId, runId) => subscribe("agents", event => event.channel === "agents" && event.event.type === "agent_log" && event.event.agentId === agentId && event.event.sessionId === sessionId && event.event.runId === runId, event => listener((event as Extract<HostEvent, { channel: "agents" }>).event as Extract<AgentEvent, { type: "agent_log" }>)),
     abortAgent: agentId => invoke("abortAgent", agentId),
@@ -635,6 +651,7 @@ function apiFrom(
     gitCheckout: (projectId, branch) => invoke("gitCheckout", projectId, branch),
     probeDirectoryGit: path => invoke("probeDirectoryGit", path),
     gitInitDirectory: path => invoke("gitInitDirectory", path),
+    probeGitBinary: () => invoke("probeGitBinary"),
     revealProject: projectId => invoke("revealProject", projectId),
     checkForUpdates: () => invoke("checkForUpdates"),
     browser: {

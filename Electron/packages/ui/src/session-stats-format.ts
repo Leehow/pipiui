@@ -22,6 +22,8 @@ function roundHalfEven(x: number): number {
  * Mirrors Swift `TokenFormat.compact` including its quirk that scaled values
  * ≥ 10 lose the decimal (`26400 → "26k"`, `999999 → "1000k"`).
  */
+export { estimateTokens } from './file-change-tokens'
+
 export function formatCompactTokens(value: number): string {
   const truncated = Math.trunc(value)
   const absValue = Math.abs(truncated)

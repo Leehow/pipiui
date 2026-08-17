@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { appendLiveUserMessage, applyStreamEvent, finishStreamingMessage, historyMessages, planTranscriptSegments, reconcileHistorySnapshot, type ChatMessage } from './transcript-model'
+import { appendLiveUserMessage, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, historyMessages, PENDING_THINKING_ID, planTranscriptSegments, reconcileHistorySnapshot, type ChatMessage } from './transcript-model'
 
 describe('transcript model', () => {
   it('copies user history images onto ChatMessage without rewriting content', () => {
@@ -62,6 +62,67 @@ describe('transcript model', () => {
     } finally { vi.useRealTimers() }
   })
 
+  it('opens a pending thinking block after the last tool so a silent next completion stays visible', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'thinking', sessionId: 's', contentIndex: 0, segment: 0, delta: 'first look' })
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'read', name: 'read', delta: '{}' })
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'read', content: 'ok' })
+    const pending = messages[0].activities?.filter(activity => activity.type === 'thinking') ?? []
+    expect(pending).toHaveLength(2)
+    expect(pending[1]).toMatchObject({ id: PENDING_THINKING_ID, content: '' })
+    expect(messages[0].streaming).toBe(true)
+
+    messages = applyStreamEvent(messages, { type: 'thinking', sessionId: 's', contentIndex: 0, segment: 1, delta: 'next look' })
+    const filled = messages[0].activities?.filter(activity => activity.type === 'thinking') ?? []
+    expect(filled).toHaveLength(2)
+    expect(filled[1]).toMatchObject({ content: 'next look' })
+    expect(filled[1]?.type === 'thinking' && filled[1].id).not.toBe(PENDING_THINKING_ID)
+
+    messages = applyStreamEvent(messages, { type: 'text', sessionId: 's', contentIndex: 1, segment: 1, delta: '结论' })
+    expect(messages[0].activities?.some(activity => activity.type === 'thinking' && activity.id === PENDING_THINKING_ID)).toBe(false)
+
+    const settled = finishStreamingMessage(applyStreamEvent(
+      applyStreamEvent([], { type: 'tool_call', sessionId: 's', toolCallId: 'grep', name: 'grep', delta: '{}' }),
+      { type: 'tool_result', sessionId: 's', toolCallId: 'grep', content: 'none' },
+    ))
+    expect(settled[0].streaming).toBe(false)
+    expect(settled[0].activities?.some(activity => activity.type === 'thinking' && activity.id === PENDING_THINKING_ID)).toBe(false)
+  })
+
+  it('treats text-then-tools as awaiting the next model hop, not a history conclusion', () => {
+    const live: ChatMessage = {
+      id: 'live',
+      role: 'assistant',
+      content: '先核对缓存',
+      activities: [
+        { type: 'text', id: 't', contentIndex: 0, content: '先核对缓存' },
+        { type: 'tool', contentIndex: 1, tool: { id: 'read', name: 'read', input: '{}', startedAt: 1, finished: true } },
+      ],
+    }
+    expect(assistantEndedAwaitingModel(live)).toBe(true)
+    expect(assistantEndedAwaitingModel({
+      role: 'assistant',
+      content: '调整完成：src 布局就位。',
+      tools: [{ id: 'bash', name: 'bash', input: '{}', startedAt: 1, finished: true }],
+    })).toBe(false)
+  })
+
+  it('treats a text conclusion as settled even when streaming was left stuck on', () => {
+    expect(assistantLooksSettled({
+      role: 'assistant',
+      content: '这是一个 COC 守秘人产品仓库。',
+      activities: [{ type: 'text', id: 't', contentIndex: 0, content: '这是一个 COC 守秘人产品仓库。' }],
+    })).toBe(true)
+    expect(assistantLooksSettled({
+      role: 'assistant',
+      content: '先核对缓存',
+      activities: [
+        { type: 'text', id: 't', contentIndex: 0, content: '先核对缓存' },
+        { type: 'tool', contentIndex: 1, tool: { id: 'read', name: 'read', input: '{}', startedAt: 1, finished: true } },
+      ],
+    })).toBe(false)
+  })
+
   it('keeps same-index thinking from later assistant messages as separate activities', () => {
     let messages: ChatMessage[] = []
     messages = applyStreamEvent(messages, { type: 'thinking', sessionId: 's', contentIndex: 0, segment: 0, delta: 'first block' })
@@ -107,6 +168,15 @@ describe('transcript model', () => {
     expect(segments.map(segment => segment.type === 'text' ? `text:${segment.content}` : segment.activities.map(activity => activity.type).join('+'))).toEqual([
       'thinking', 'text:先读 A', 'tool+thinking', 'text:再读 B', 'tool',
     ])
+  })
+
+  it('promotes a provisional tool card to the real id/name without duplicating args', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', contentIndex: 1, toolCallId: 'content-1', name: 'tool', delta: '' })
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', contentIndex: 1, toolCallId: 'content-1', name: 'tool', delta: '{"path":"QuotaPill.tsx"}' })
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', contentIndex: 1, toolCallId: 'call-real', name: 'read', delta: '{"path":"QuotaPill.tsx"}' })
+    expect(messages[0].tools).toEqual([expect.objectContaining({ id: 'call-real', name: 'read', input: '{"path":"QuotaPill.tsx"}' })])
+    expect(messages[0].activities).toEqual([expect.objectContaining({ type: 'tool', contentIndex: 1, tool: expect.objectContaining({ id: 'call-real', name: 'read' }) })])
   })
 
   it('merges thinking deltas without segment info into one activity (older hosts)', () => {

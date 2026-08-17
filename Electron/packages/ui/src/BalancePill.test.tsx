@@ -96,4 +96,14 @@ describe('BalancePill', () => {
     rerender(<BalancePill host={host} provider="openai-codex" />)
     await waitFor(() => expect(getQuotaSnapshot).toHaveBeenCalledTimes(2))
   })
+
+  it('drops the previous capsule immediately when the provider changes', async () => {
+    const getQuotaSnapshot = vi.fn(async () => deepSeekSnapshot)
+    const host = { protocolVersion: 2, getQuotaSnapshot } as unknown as PipiHostAPI
+    const { rerender } = render(<BalancePill host={host} sessionId="s1" provider="deepseek" />)
+    expect((await screen.findByTestId('balance-pill')).textContent).toBe('¥88.00')
+    getQuotaSnapshot.mockImplementation(() => new Promise(() => undefined))
+    rerender(<BalancePill host={host} sessionId="s1" provider="openai-codex" />)
+    expect(screen.queryByTestId('balance-pill')).toBeNull()
+  })
 })

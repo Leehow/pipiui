@@ -39,11 +39,12 @@ describe('active-turn waiting placeholder', () => {
     await waitFor(() => expect(listener).toBeDefined())
 
     // A host-driven turn (not started by a UI send) streams…
-    act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
+    act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'started', pendingFollowUps: ['host'] }) })
     act(() => { listener?.({ type: 'tool_call', sessionId: 'welcome', toolCallId: 'bash-1', name: 'bash', delta: '{"command":"ls -la"}' }) })
     act(() => { listener?.({ type: 'tool_result', sessionId: 'welcome', toolCallId: 'bash-1', content: 'ok', isError: false }) })
-    const outer = await screen.findByRole('button', { name: /1 个步骤/ })
+    const outer = await screen.findByRole('button', { name: /2 个步骤/ })
     expect(outer.getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByRole('button', { name: /^Thinking/ }).textContent).toContain('运行中')
 
     // …and folds when the turn settles, even without a direct user send.
     act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }) })
@@ -211,7 +212,7 @@ describe('active-turn waiting placeholder', () => {
     expect(placeholder.querySelector('[data-testid="waiting-stop"]')).toBeNull()
 
     // A settled main turn with visible text does not remove it.
-    act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
+    act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'started', pendingFollowUps: ['host'] }) })
     act(() => { listener?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: '主回复' }) })
     act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }) })
     await waitFor(() => expect(screen.getByText(/主回复/)).toBeTruthy())
@@ -223,5 +224,56 @@ describe('active-turn waiting placeholder', () => {
     // Agent terminal removes the indicator.
     act(() => { for (const push of agentListeners) push({ type: 'agent', agent: { agentId: 'research', runId: 'mock-1', sessionId: 'welcome', name: 'explore', role: 'explore', title: '调研 UI', task: '调研 Electron UI 结构', state: 'ok', createdAt: Date.now() - 20_000 } }) })
     await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
+  })
+
+  it('reopens a thinking wait after the last tool finishes so a silent next completion is not a blank 生成中', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listener).toBeDefined())
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', pendingFollowUps: ['queued'] }) })
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '先派三个探索' }) })
+    await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
+
+    act(() => { listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'status-1', name: 'subagent_status', delta: '{}' }) })
+    act(() => { listener?.({ type: 'tool_result', sessionId: 'layout', toolCallId: 'status-1', content: 'ok', isError: false }) })
+
+    const wait = await screen.findByTestId('waiting-placeholder')
+    expect(wait.getAttribute('data-phase')).toBe('thinking')
+    expect(wait.textContent).toContain('模型正在思考')
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
+    const liveThinking = screen.getByRole('button', { name: /^Thinking/ })
+    expect(liveThinking.closest('[data-activity-card="thinking"]')).toBeTruthy()
+    expect(liveThinking.getAttribute('aria-expanded')).toBe('true')
+    expect(liveThinking.textContent).toContain('运行中')
+    expect(liveThinking.textContent).not.toContain('已完成')
+    expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running')
+
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '设计方案可以定了' }) })
+    await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
+  })
+
+  it('keeps the tool wait until every in-flight tool has finished', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listener).toBeDefined())
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', pendingFollowUps: ['queued'] }) })
+    act(() => { listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'a', name: 'subagent_status', delta: '{}' }) })
+    act(() => { listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'b', name: 'subagent_status', delta: '{}' }) })
+    act(() => { listener?.({ type: 'tool_result', sessionId: 'layout', toolCallId: 'a', content: 'ok', isError: false }) })
+    expect(screen.getByTestId('waiting-placeholder').getAttribute('data-phase')).toBe('tool')
+
+    act(() => { listener?.({ type: 'tool_result', sessionId: 'layout', toolCallId: 'b', content: 'ok', isError: false }) })
+    expect(screen.getByTestId('waiting-placeholder').getAttribute('data-phase')).toBe('thinking')
+    expect(screen.getByTestId('waiting-placeholder').textContent).toContain('模型正在思考')
   })
 })

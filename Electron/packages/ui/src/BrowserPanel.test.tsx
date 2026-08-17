@@ -1,6 +1,10 @@
 // @vitest-environment jsdom
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { StrictMode } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { BrowserEvent } from '@pipi/host-api'
 import { createMockHost } from './App'
 import { BrowserPanel } from './BrowserPanel'
 
@@ -11,9 +15,23 @@ function renderPanel(host = createMockHost(), sessionId = 'welcome') {
   return { view, slot }
 }
 
-afterEach(cleanup)
+beforeEach(() => {
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(DOMRect.fromRect({ x: 400, y: 100, width: 800, height: 600 }))
+})
+
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
 
 describe('BrowserPanel', () => {
+  it('gives the portaled-tab layout remaining height to the native browser surface', () => {
+    const css = readFileSync(join(import.meta.dirname, 'browser-panel.css'), 'utf8')
+    const panelRule = css.match(/\.browser-panel\{[^}]*\}/)?.[0] ?? ''
+    expect(panelRule).toContain('grid-template-rows:auto minmax(0,1fr)')
+    expect(panelRule).not.toContain('grid-template-rows:auto auto minmax(0,1fr)')
+  })
+
   it('adds, switches, and closes virtual tabs through the host API', async () => {
     const host = createMockHost()
     renderPanel(host)
@@ -134,5 +152,63 @@ describe('BrowserPanel', () => {
 
     rerender(<BrowserPanel host={host} sessionId="welcome" occluded={false} />)
     await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1]).toMatchObject({ visible: true }))
+  })
+
+  it('keeps a nonzero visible presentation last after hidden mount, late session ownership, and StrictMode cleanup', async () => {
+    const host = createMockHost()
+    const setViewBounds = vi.spyOn(host.browser!, 'setViewBounds')
+    const panel = (sessionId: string | undefined, occluded: boolean) => (
+      <StrictMode><BrowserPanel host={host} sessionId={sessionId} occluded={occluded} /></StrictMode>
+    )
+    const { rerender } = render(panel(undefined, true))
+    expect(setViewBounds).not.toHaveBeenCalled()
+
+    rerender(panel('welcome', true))
+    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)).toEqual(['welcome', { x: 0, y: 0, width: 0, height: 0, visible: false }]))
+
+    rerender(panel('welcome', false))
+    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)).toEqual(['welcome', { x: 400, y: 100, width: 800, height: 600, visible: true }]))
+  })
+
+  it('hides the empty-tab hint once a real URL is present and shows host load errors', async () => {
+    const host = createMockHost()
+    const original = host.browser!.subscribe.bind(host.browser)
+    const extra = new Set<(event: BrowserEvent) => void>()
+    host.browser!.subscribe = listener => {
+      extra.add(listener)
+      const unsubscribe = original(listener)
+      return () => {
+        extra.delete(listener)
+        unsubscribe()
+      }
+    }
+    renderPanel(host)
+    expect(screen.getByText('桌面宿主将在此显示网页内容')).toBeTruthy()
+    const address = await screen.findByLabelText('浏览器地址') as HTMLInputElement
+    fireEvent.change(address, { target: { value: 'google.com' } })
+    fireEvent.submit(address.closest('form')!)
+    await waitFor(() => expect(address.value).toBe('https://google.com'))
+    expect(screen.queryByText('桌面宿主将在此显示网页内容')).toBeNull()
+
+    extra.forEach(listener => listener({ type: 'error', sessionId: 'welcome', message: '无法加载页面：ERR_NAME_NOT_RESOLVED' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('无法加载页面：ERR_NAME_NOT_RESOLVED')
+  })
+
+  it('re-pushes current bounds when the host requests reveal', async () => {
+    const host = createMockHost()
+    const setViewBounds = vi.spyOn(host.browser!, 'setViewBounds')
+    const original = host.browser!.subscribe.bind(host.browser)
+    let panelListener: ((event: BrowserEvent) => void) | undefined
+    host.browser!.subscribe = listener => {
+      panelListener = listener
+      return original(listener)
+    }
+    renderPanel(host)
+    await waitFor(() => expect(setViewBounds).toHaveBeenCalledWith('welcome', expect.objectContaining({ visible: true })))
+    const before = setViewBounds.mock.calls.length
+    panelListener?.({ type: 'reveal', sessionId: 'welcome' })
+    await waitFor(() => expect(setViewBounds.mock.calls.length).toBeGreaterThan(before))
+    expect(setViewBounds.mock.calls.at(-1)?.[0]).toBe('welcome')
+    expect(setViewBounds.mock.calls.at(-1)?.[1]).toMatchObject({ visible: true })
   })
 })

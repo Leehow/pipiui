@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, PipiHostAPI } from '@pipi/host-api'
 import { DismissibleError } from './DismissibleError'
@@ -21,7 +21,7 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot }: 
   const [tabs, setTabs] = useState<BrowserTabsSnapshot>(emptyTabs)
   const [address, setAddress] = useState('')
   const [error, setError] = useState<string>()
-  const surfaceRef = useRef<HTMLDivElement>(null)
+  const [surface, setSurface] = useState<HTMLDivElement | null>(null)
   const sessionKey = sessionId ?? ''
   const active = activeTab(tabs)
 
@@ -30,6 +30,17 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot }: 
     const snapshot = await browser.listTabs(sessionKey)
     setTabs(snapshot)
   }, [browser, sessionKey])
+
+  const setBounds = useCallback((visible: boolean): boolean => {
+    if (!browser || !sessionKey) return false
+    const rect = surface?.getBoundingClientRect()
+    if (visible && (!rect || rect.width <= 0 || rect.height <= 0)) return false
+    const bounds: BrowserViewBounds = visible
+      ? { x: rect!.left, y: rect!.top, width: rect!.width, height: rect!.height, visible: true }
+      : { x: 0, y: 0, width: 0, height: 0, visible: false }
+    void browser.setViewBounds(sessionKey, bounds).catch(reason => setError(reason instanceof Error ? reason.message : String(reason)))
+    return true
+  }, [browser, sessionKey, surface])
 
   useEffect(() => {
     if (!browser || !sessionKey) return
@@ -40,40 +51,40 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot }: 
     const unsubscribe = browser.subscribe(event => {
       // Only this session's tab events belong to this panel; drop the rest.
       if (event.type === 'tabs' && event.sessionId === sessionKey && alive) setTabs(event.snapshot)
+      if (event.type === 'error' && event.sessionId === sessionKey && alive) setError(event.message)
+      if (event.type === 'reveal' && event.sessionId === sessionKey && alive) setBounds(!occluded)
     })
     return () => {
       alive = false
       unsubscribe()
     }
-  }, [browser, sync, sessionKey])
+  }, [browser, sync, sessionKey, setBounds, occluded])
 
   useEffect(() => { setAddress(active?.url ?? '') }, [active?.id, active?.url])
 
-  const setBounds = useCallback((visible: boolean) => {
-    if (!browser || !sessionKey) return
-    const rect = surfaceRef.current?.getBoundingClientRect()
-    const bounds: BrowserViewBounds = visible && rect
-      ? { x: rect.left, y: rect.top, width: rect.width, height: rect.height, visible: true }
-      : { x: 0, y: 0, width: 0, height: 0, visible: false }
-    void browser.setViewBounds(sessionKey, bounds).catch(reason => setError(reason instanceof Error ? reason.message : String(reason)))
-  }, [browser, sessionKey])
-
   useLayoutEffect(() => {
-    if (!browser || !sessionKey) return
+    if (!browser || !sessionKey || !surface) return
     const update = () => setBounds(!occluded)
     update()
     const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(update)
-    if (surfaceRef.current) observer?.observe(surfaceRef.current)
+    observer?.observe(surface)
     window.addEventListener('resize', update)
     const frame = typeof window.requestAnimationFrame === 'function' ? window.requestAnimationFrame(update) : undefined
     return () => {
       if (frame !== undefined) window.cancelAnimationFrame(frame)
       window.removeEventListener('resize', update)
       observer?.disconnect()
-      // Hides (rather than destroys) the sole main-process WebContentsView.
+    }
+  }, [browser, occluded, setBounds, sessionKey, surface])
+
+  useEffect(() => {
+    if (!browser || !sessionKey) return
+    return () => {
+      // Session ownership ended (or the panel really unmounted): hide the sole
+      // native view. Layout-effect refreshes must not leave a stale final hide.
       void browser.setViewBounds(sessionKey, { x: 0, y: 0, width: 0, height: 0, visible: false }).catch(() => undefined)
     }
-  }, [browser, occluded, setBounds, sessionKey])
+  }, [browser, sessionKey])
 
   const run = (operation: () => Promise<unknown>) => {
     setError(undefined)
@@ -105,8 +116,10 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot }: 
       {active?.isLoading && <span className="browser-loading" role="status" aria-label="正在加载" title="正在加载" />}
     </form>
 
-    <div id={active ? `browser-tab-${active.id}` : undefined} className="browser-webcontents-surface" ref={surfaceRef} role="tabpanel" aria-label={active ? `浏览器内容：${displayTitle(active)}` : '浏览器内容'}>
-      <div className="browser-surface-fallback" aria-hidden="true">桌面宿主将在此显示网页内容</div>
+    <div id={active ? `browser-tab-${active.id}` : undefined} className="browser-webcontents-surface" ref={setSurface} role="tabpanel" aria-label={active ? `浏览器内容：${displayTitle(active)}` : '浏览器内容'}>
+      {(!active?.url || active.url === 'about:blank') && !active?.isLoading && (
+        <div className="browser-surface-fallback" aria-hidden="true">桌面宿主将在此显示网页内容</div>
+      )}
     </div>
     {error && <DismissibleError className="browser-error" message={error} onDismiss={() => setError(undefined)} />}
   </section>

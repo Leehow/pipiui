@@ -21,16 +21,18 @@ async function loadRule() {
   assert.notEqual(start, -1, "unnamedWritableDispatchProblem must exist in the extension");
   const end = source.indexOf("\n}\n", start);
   assert.notEqual(end, -1, "unnamedWritableDispatchProblem must be a closed declaration");
+  // Strip annotations line-by-line so type edits to the parameters don't break extraction.
   const body = source
     .slice(start, end + 3)
     .replace("export function", "function")
-    .replace(/:\s*readonly \{ agent: string; agentId\?: string \}\[\]/, "")
-    .replace(/:\s*\(agentName: string\) => boolean/, "")
+    .replace(/targets:[^\n]*,/, "targets,")
+    .replace(/createsWorktree:[^\n]*,/, "createsWorktree,")
     .replace(/\)\s*:\s*string \| null \{/, ") {");
   return new Function(`${body}; return unnamedWritableDispatchProblem;`)();
 }
 
-const writable = (name) => name !== "explore";
+// createsWorktree receives the whole target since the isolation-aware signature change.
+const writable = (target) => target.agent !== "explore";
 
 test("an unnamed writable dispatch is refused with a model-addressed message", async () => {
   const problem = await loadRule();
@@ -73,5 +75,12 @@ test("the dispatch tool no longer invites omitting the id for real work", async 
     "the old description told the boss that omitting the id is fine for one-off work",
   );
   // Chain steps could not be named at all before this: the schema had no agentId field.
-  assert.match(source, /const ChainItem = Type\.Object\(\{[\s\S]{0,400}?agentId: Type\.Optional/);
+  // Match inside the ChainItem object literal (up to its options object) so the assertion
+  // does not depend on how many Grok-family fields precede agentId.
+  const chainItemBlock =
+    source.match(/const ChainItem = Type\.Object\(\{[\s\S]*?additionalProperties: false/)?.[0] ?? "";
+  assert.ok(
+    chainItemBlock.includes("agentId: Type.Optional"),
+    "chain steps must accept an optional agentId",
+  );
 });

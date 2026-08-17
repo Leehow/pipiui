@@ -48,6 +48,12 @@ async function prepareHarness(directory) {
   const capabilitiesFile = join(directory, "subagent-model-capabilities.json");
   const captureFile = join(directory, "captures.jsonl");
   await cp(sourceSubagentDirectory, join(runtime, "subagent"), { recursive: true });
+  // subagent/index.ts statically imports ../packages/computer-agent/*.
+  await cp(
+    join(sourceSubagentDirectory, "../packages/computer-agent"),
+    join(runtime, "packages/computer-agent"),
+    { recursive: true },
+  );
   await linkRuntimePackages(runtime);
   await mkdir(agents, { recursive: true });
   await mkdir(repository, { recursive: true });
@@ -164,6 +170,7 @@ install({
   async sendUserMessage() {},
 });
 const subagent = tools.get("subagent");
+const chain = tools.get("subagent_chain");
 const ctx = { cwd: process.env.PIPIUI_MAIN_CWD, hasUI: false };
 const options = [new AbortController().signal, undefined, ctx];
 const results = {};
@@ -210,16 +217,18 @@ for (const handler of handlers.get("before_agent_start") ?? []) {
   if (update?.systemPrompt) systemPrompt = update.systemPrompt;
 }
 const params = subagent.parameters;
+const chainParams = chain.parameters;
 process.stdout.write(JSON.stringify({
   results,
   systemPrompt,
   schema: {
     rootHasModel: Object.hasOwn(params.properties, "model"),
     rootThinking: params.properties.thinking !== undefined,
-    taskHasModel: Object.hasOwn(params.properties.tasks.items.properties, "model"),
-    taskThinking: params.properties.tasks.items.properties.thinking !== undefined,
-    chainHasModel: Object.hasOwn(params.properties.chain.items.properties, "model"),
-    chainThinking: params.properties.chain.items.properties.thinking !== undefined,
+    rootHasPrompt: Object.hasOwn(params.properties, "prompt"),
+    taskHasModel: Object.hasOwn(params.properties, "tasks"),
+    taskThinking: Object.hasOwn(params.properties, "tasks"),
+    chainHasModel: Object.hasOwn(chainParams.properties.chain.items.properties, "model"),
+    chainThinking: chainParams.properties.chain.items.properties.thinking !== undefined,
   },
 }));
 `,
@@ -338,12 +347,13 @@ test("task thinking routes through single/parallel/chain and fallback respects S
       "legacy string stays model-only and omits --thinking",
     );
 
-    // v1 exposes thinking but deliberately no per-task model knob in any task shape.
+    // Public subagent is the Grok Build contract; thinking stays on chain items only.
     assert.deepEqual(output.schema, {
       rootHasModel: false,
-      rootThinking: true,
+      rootThinking: false,
+      rootHasPrompt: true,
       taskHasModel: false,
-      taskThinking: true,
+      taskThinking: false,
       chainHasModel: false,
       chainThinking: true,
     });

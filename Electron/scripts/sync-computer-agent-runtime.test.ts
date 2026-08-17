@@ -45,8 +45,10 @@ async function makeFixture() {
     'agents/computer-verifier/AGENT.md',
     'agents/computer-terminal/AGENT.md',
   ]) await write(sourcePiExt, relative, `shared:${relative}`)
-  await write(sourcePiExt, 'packages/computer-agent/skills/cua-driver-operation/SKILL.md', 'cua-driver-version: fixture-driver\n')
-  await write(sourcePiExt, 'packages/computer-agent/runtime.ts', 'shared computer agent runtime')
+  await write(sourcePiExt, 'packages/computer-agent/skills/cua-driver-operation/SKILL.md', 'cua-driver-version: frozen-swift-driver\n')
+  await write(sourcePiExt, 'packages/computer-agent/runtime.ts', 'frozen Swift computer agent runtime')
+  await write(runtimePiExt, 'packages/computer-agent/skills/cua-driver-operation/SKILL.md', 'cua-driver-version: fixture-driver\n')
+  await write(runtimePiExt, 'packages/computer-agent/runtime.ts', 'electron-owned computer agent runtime')
   await write(sourcePhilosophy, 'layers/30-orchestration.md', 'shared orchestration')
   await write(sourcePhilosophy, 'capabilities.json', '{}')
 
@@ -58,7 +60,7 @@ afterEach(async () => {
 })
 
 describe('Electron computer-agent runtime sync boundary', () => {
-  it('leaves Electron subagent runtime owned by Electron while syncing and checking intended shared mirrors', async () => {
+  it('preserves Electron-owned runtime code while syncing and checking only intended shared mirrors', async () => {
     const { electron, runtimePiExt, runtimePhilosophy } = await makeFixture()
     const script = join(electron, 'scripts', 'sync-computer-agent-runtime.mjs')
 
@@ -69,15 +71,27 @@ describe('Electron computer-agent runtime sync boundary', () => {
         .resolves.toBe(`electron-owned:${relative}`)
     }
     await expect(readFile(join(runtimePiExt, 'packages/computer-agent/runtime.ts'), 'utf8'))
-      .resolves.toBe('shared computer agent runtime')
+      .resolves.toBe('electron-owned computer agent runtime')
+    await expect(readFile(join(runtimePiExt, 'packages/computer-agent/skills/cua-driver-operation/SKILL.md'), 'utf8'))
+      .resolves.toBe('cua-driver-version: fixture-driver\n')
     await expect(readFile(join(runtimePhilosophy, 'layers/30-orchestration.md'), 'utf8'))
       .resolves.toBe('shared orchestration')
 
-    await write(runtimePiExt, 'packages/computer-agent/runtime.ts', 'stale shared mirror')
-    await expect(execFileAsync(process.execPath, [script, '--check'])).rejects.toMatchObject({ code: 1 })
-    await execFileAsync(process.execPath, [script])
+    await write(runtimePiExt, 'packages/computer-agent/runtime.ts', 'newer Electron computer agent runtime')
     await expect(execFileAsync(process.execPath, [script, '--check'])).resolves.toMatchObject({
       stdout: expect.stringContaining('Computer Agent runtime mirror is current.'),
     })
+
+    await write(runtimePiExt, 'agents/operator/AGENT.md', 'stale shared role manifest')
+    await expect(execFileAsync(process.execPath, [script, '--check'])).rejects.toMatchObject({ code: 1 })
+    await execFileAsync(process.execPath, [script])
+    await expect(readFile(join(runtimePiExt, 'packages/computer-agent/runtime.ts'), 'utf8'))
+      .resolves.toBe('newer Electron computer agent runtime')
+    await expect(execFileAsync(process.execPath, [script, '--check'])).resolves.toMatchObject({
+      stdout: expect.stringContaining('Computer Agent runtime mirror is current.'),
+    })
+
+    await write(electron, 'cua-driver-assets.json', JSON.stringify({ version: 'other-driver' }))
+    await expect(execFileAsync(process.execPath, [script, '--check'])).rejects.toMatchObject({ code: 1 })
   })
 })

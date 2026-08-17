@@ -3,7 +3,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { useState, type ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent, AgentSummary, PipiHostAPI } from '@pipi/host-api'
-import { SubagentPanel } from './SubagentPanel'
+import { agentDetailUsage, SubagentPanel } from './SubagentPanel'
+import { PLAN_JSON } from './computer-task-report.test.fixture'
 
 afterEach(() => {
   cleanup()
@@ -58,6 +59,23 @@ function expandTranscriptCards() {
     collapsed.forEach(button => fireEvent.click(button))
   }
 }
+
+describe('agentDetailUsage', () => {
+  it('formats used/window, cache hit rate, and in/out tokens', () => {
+    expect(agentDetailUsage({
+      contextTokens: 38_200, contextWindowTokens: 200_000,
+      inputTokens: 12_400, outputTokens: 2_130, cacheTokens: 8_900,
+    })).toEqual({ context: '38k/200k', cache: '42%', io: '12k / 2.1k' })
+  })
+
+  it('shows a known window without occupancy as ?/window', () => {
+    expect(agentDetailUsage({ contextWindowTokens: 200_000 })).toEqual({ context: '?/200k' })
+  })
+
+  it('returns empty facts when the agent has no usage', () => {
+    expect(agentDetailUsage({})).toEqual({})
+  })
+})
 
 describe('SubagentPanel', () => {
 
@@ -350,8 +368,34 @@ describe('SubagentPanel', () => {
     await screen.findByText('2 个')
     expect(screen.getByText('1 运行中')).toBeTruthy()
     expect(screen.getByText('1 失败')).toBeTruthy()
+    const runningBadge = screen.getByTestId('subagent-running-badge')
+    expect(runningBadge.closest('.subagent-header-right')).toBeTruthy()
+    expect(runningBadge.closest('.subagent-header-left')).toBeNull()
     fireEvent.click(screen.getByLabelText('中止 explore'))
     await waitFor(() => expect(harness.abortAgent).toHaveBeenCalledWith('run'))
+  })
+
+  it('shows live tokens on a running row and totals them on the header badge', async () => {
+    const harness = hostHarness()
+    renderSubagentPanel({ host: harness.host })
+    harness.emitAgent({
+      type: 'agent',
+      agent: {
+        agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running',
+        inputTokens: 12_400, outputTokens: 2_130, cacheTokens: 8_900,
+      },
+    })
+    harness.emitAgent({
+      type: 'agent',
+      agent: { agentId: 'done', runId: 'r2', name: 'review', task: 'verify', state: 'ok', inputTokens: 4_000, outputTokens: 800 },
+    })
+    await screen.findByTestId('agent-row-run')
+    expect(screen.getByTestId('agent-row-tokens-run').textContent).toBe('23k')
+    expect(screen.queryByTestId('agent-row-tokens-done')).toBeNull()
+    const badge = screen.getByTestId('subagent-running-badge')
+    expect(badge.textContent).toBe('1 运行中 · 23k')
+    expect(badge.closest('.subagent-header-right')).toBeTruthy()
+    expect(screen.getByText('1 运行中', { exact: false })).toBeTruthy()
   })
 
   it('shows a pending stop state until the real terminal event arrives', async () => {
@@ -469,7 +513,7 @@ describe('SubagentPanel', () => {
     expect(detail.querySelector('[data-testid="subagent-transcript"]')?.textContent).toContain('中文 TLDR：验证完成')
     const technical = detail.querySelector('.agent-technical-details') as HTMLDetailsElement
     expect(technical.open).toBe(false)
-    expect(detail.querySelector('.agent-detail-header')?.textContent).not.toMatch(/jellytoken|deepseek|session-raw|ctx|cache|RAW_PROMPT|FULL_RAW_ERROR/)
+    expect(detail.querySelector('.agent-detail-header')?.textContent).not.toMatch(/jellytoken|deepseek|session-raw|ctx |cache |RAW_PROMPT|FULL_RAW_ERROR/)
 
     fireEvent.click(screen.getByText('技术详情'))
     expect(technical.open).toBe(true)
@@ -479,6 +523,40 @@ describe('SubagentPanel', () => {
     expect(technical.textContent).toContain('RAW_PROMPT /tmp/exact path')
     expect(technical.textContent).toContain('FULL_RAW_ERROR exact')
     expect(technical.textContent).toMatch(/ctx 120|in 80|out 40|cache 20/)
+  })
+
+  it('shows context window, cache hit, and in/out tokens on the selected detail header', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [{
+      agentId: 'live', runId: 'r-live', name: 'general-purpose', title: '修会话记录丢失',
+      task: 'fix session loss', state: 'running', createdAt: Date.now(), updatedAt: Date.now(), provider: 'xai', model: 'xai/grok-4',
+      contextTokens: 38_200, contextWindowTokens: 200_000, inputTokens: 12_400, outputTokens: 2_130, cacheTokens: 8_900,
+    }]
+    render(<SubagentPanel host={harness.host} />)
+
+    await screen.findByTestId('agent-row-live')
+    const usage = await screen.findByTestId('agent-detail-usage')
+    const contextRow = screen.getByTestId('agent-detail-usage-context')
+    expect(contextRow.textContent).toContain('上下文')
+    expect(contextRow.textContent).toContain('38k/200k')
+    expect(contextRow.textContent).toContain('缓存')
+    expect(contextRow.textContent).toContain('42%')
+    expect(contextRow.textContent).not.toContain('入/出')
+    expect(usage.textContent).toContain('入/出')
+    expect(usage.textContent).toContain('12k / 2.1k')
+    expect(document.querySelector('.agent-detail-header')?.contains(usage)).toBe(true)
+    expect(document.querySelector('.detail-agent-title')?.textContent).toContain('修会话记录丢失')
+    expect(document.querySelector('.detail-agent-title')?.textContent).toContain('Grok')
+  })
+
+  it('omits the detail header usage block when the selected agent has no token facts', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [{
+      agentId: 'empty', runId: 'r-empty', name: 'explore', title: '无用量', task: 'look around', state: 'running', createdAt: 1,
+    }]
+    render(<SubagentPanel host={harness.host} />)
+    await screen.findByTestId('agent-row-empty')
+    expect(screen.queryByTestId('agent-detail-usage')).toBeNull()
   })
 
   it('matches the Swift hierarchy while rendering detail through the shared assistant transcript', async () => {
@@ -732,6 +810,61 @@ describe('SubagentPanel', () => {
     expect(screen.getByText(/TLDR only/)).toBeTruthy()
   })
 
+  it('hydrates earlier computer-use-leader runs so the plan stays after the final report', async () => {
+    const harness = hostHarness()
+    const conclusion = '验收通过：COC Keeper 主窗口已清晰显示“战役卷宗”。'
+    harness.host.listAgents = async () => [
+      {
+        agentId: 'cua-lead-1', runId: 'report-1', sessionId: 's1', name: 'computer-use-leader',
+        task: 'Computer Use Leader', title: '电脑操作主管', state: 'ok', createdAt: 2, endedAt: 3,
+        finalResult: conclusion,
+      },
+    ]
+    harness.host.getAgentLogs = async (_agentId, _session, runId, scope) => {
+      if (scope === 'agent') return [
+        { itemType: 'text', text: PLAN_JSON },
+        { itemType: 'text', text: conclusion },
+      ]
+      if (runId === 'report-1') return [{ itemType: 'text', text: conclusion }]
+      return []
+    }
+    render(<SubagentPanel host={harness.host} />)
+    await screen.findByTestId('agent-row-cua-lead-1')
+    expect(await screen.findByTestId('computer-plan-card')).toBeTruthy()
+    expect(screen.getByText(/战役卷宗/)).toBeTruthy()
+    expect(screen.getByTestId('computer-plan-card').textContent).toContain('共 2 步')
+  })
+
+  it('renders a computer worker verdict JSON as a result card after the stream completes', async () => {
+    const harness = hostHarness()
+    const verdict = '{"outcome":"completed","summary":"目标应用主窗口已刷新观察并显示所需文本。"}'
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({
+      type: 'agent',
+      agent: {
+        agentId: 'op-1', runId: 'op-run', name: 'operator', title: 'Operate Computer Task',
+        task: 'Operate Computer Task', state: 'running', createdAt: 1,
+      },
+    })
+    await screen.findByTestId('agent-row-op-1')
+    await waitFor(() => expect(harness.hasLogSubscriber('op-1')).toBe(true))
+    harness.emitLog('op-1', { type: 'agent_log', agentId: 'op-1', itemType: 'tool', name: 'desktop_observe', text: '{}', contentIndex: 0 })
+    harness.emitLog('op-1', { type: 'agent_log', agentId: 'op-1', itemType: 'toolResult', name: 'desktop_observe', text: 'ok', contentIndex: 1 })
+    harness.emitLog('op-1', { type: 'agent_log', agentId: 'op-1', itemType: 'text', text: '{"outcome":"com', contentIndex: 2 })
+    expect(screen.queryByTestId('computer-worker-result-card')).toBeNull()
+    harness.emitLog('op-1', { type: 'agent_log', agentId: 'op-1', itemType: 'text', text: verdict, contentIndex: 2 })
+    harness.emitAgent({
+      type: 'agent',
+      agent: {
+        agentId: 'op-1', runId: 'op-run', name: 'operator', title: 'Operate Computer Task',
+        task: 'Operate Computer Task', state: 'ok', createdAt: 1, endedAt: 2, finalResult: verdict,
+      },
+    })
+    const card = await screen.findByTestId('computer-worker-result-card')
+    expect(card.textContent).toContain('目标应用主窗口已刷新观察并显示所需文本。')
+    expect(document.querySelector('[data-testid="subagent-transcript"] .markdown')?.textContent ?? '').not.toContain('{"outcome"')
+  })
+
   it('shows the running bash command on the live tool row and status line', async () => {
     const harness = hostHarness()
     const now = Date.now()
@@ -819,8 +952,7 @@ describe('SubagentPanel', () => {
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'thinking', text: 'plan', contentIndex: 1 })
     await screen.findByRole('button', { name: /1 个步骤 · Thinking/ })
     expect(screen.getByText('{"step": 1}')).toBeTruthy()
-    const thinkingCard = screen.getByRole('button', { name: /^Thinking/ })
-    fireEvent.click(thinkingCard)
+    // Live thinking is open so the user sees tokens arrive instead of a collapsed wait.
     expect(await screen.findByText('plan')).toBeTruthy()
   })
 
@@ -1066,5 +1198,39 @@ describe('SubagentPanel', () => {
     fireEvent.click(screen.getByTestId('subagent-detail-status-check'))
     expect(onManualStatusCheck).toHaveBeenCalledWith(['worker-1'])
     expect(harness.checkAgent).toHaveBeenCalledWith('worker-1')
+  })
+
+  it('shows live write token estimates on the active card and list status', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [{
+      agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running',
+      createdAt: Date.now(), updatedAt: Date.now(), listSubtitle: 'write src/a.ts',
+    }]
+    render(<SubagentPanel host={harness.host} />)
+    await screen.findByTestId('agent-row-run')
+    await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'write', text: JSON.stringify({ path: 'src/a.ts', payloadChars: 8 }), contentIndex: 0 })
+    expect((await screen.findByTestId('active-tool')).textContent).toMatch(/~2 tokens/)
+    expect(screen.getAllByText(/等待工具返回 · write · src\/a.ts/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/~2 tokens/).length).toBeGreaterThan(0)
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'write', text: JSON.stringify({ path: 'src/a.ts', payloadChars: 40 }), contentIndex: 0 })
+    await waitFor(() => expect(screen.getByTestId('active-tool').textContent).toMatch(/~10 tokens/))
+  })
+
+  it('shows finished write/edit +/− from compact log stats', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'ok' } })
+    await screen.findByTestId('agent-row-run')
+    await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'write', text: JSON.stringify({ path: 'a.ts', payloadChars: 16, addedChars: 16, removedChars: 0 }) })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'toolResult', name: 'write', text: 'ok' })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'edit', text: JSON.stringify({ path: 'b.ts', payloadChars: 8, addedChars: 8, removedChars: 4 }) })
+    harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'toolResult', name: 'edit', text: 'ok' })
+    const steps = await screen.findByRole('button', { name: /个步骤/ })
+    if (steps.getAttribute('aria-expanded') === 'false') fireEvent.click(steps)
+    expect((await screen.findByRole('button', { name: /write · a.ts/ })).textContent).toMatch(/\+4/)
+    expect(screen.getByRole('button', { name: /edit · b.ts/ }).textContent).toMatch(/\+2/)
+    expect(screen.getByRole('button', { name: /edit · b.ts/ }).textContent).toMatch(/\u22121/)
   })
 })

@@ -226,9 +226,16 @@ export async function installBundledModelCapabilityOverrides(
   return 'updated'
 }
 
+export const ELECTRON_USER_DATA_DIRNAME = '@pipiui/electron'
+
 export function resolveElectronPiProfile(userData: string): ElectronPiProfile {
   const agentDir = join(userData, 'pi-agent')
   return { agentDir, sessionsRoot: join(agentDir, 'sessions') }
+}
+
+/** Historical Electron userData. `app.setName('PipiUI')` must not move this. */
+export function resolveStableElectronUserDataPath(appData: string): string {
+  return join(appData, ELECTRON_USER_DATA_DIRNAME)
 }
 
 function isContinuityEntry(name: string): boolean {

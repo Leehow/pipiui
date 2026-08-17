@@ -5,9 +5,8 @@
  * giving it an isolated context window.
  *
  * Public tools:
- *   - subagent: { agent, task }
- *   - subagent_parallel: { tasks: [{ agent, task }, ...] }
- *   - subagent_chain: { chain: [{ agent, task }, ...] }
+ *   - subagent: { prompt, description, subagent_type?, isolation? }
+ *   - subagent_chain: { chain: [{ prompt, description }, ...] }
  *   - subagent_abort: { agentId }
  *   - subagent_resolve: { agentId, runId }
  *
@@ -21,6 +20,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { JSONLChunkScanner, projectToolResultMessageForParent } from "./rpc-stream.ts";
+import {
+	compactFileChangeFromArgs,
+	compactFileChangeFromPartial,
+	stringifyCompactFileChange,
+} from "./file-change-bridge.ts";
 import { checkedSubagentOverrideModel } from "./model-ref.ts";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
@@ -35,16 +39,17 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { makeStrictJsonSchema, omitNulls, bindSanitizeStrictToolArguments } from "./strict-json-schema.ts";
+import { adoptGrokBuildDispatch, makeStrictJsonSchema, omitNulls, bindSanitizeStrictToolArguments, remapUnknownSubagentType } from "./strict-json-schema.ts";
 import {
 	COMPUTER_WORKER_FAILURE_CODES,
 	type ComputerPlan,
+	type ComputerAgentEpisode,
 	type ComputerWorkerFailureCode,
 	type ComputerWorkerDispatch,
 	type ComputerWorkerResult,
 } from "../packages/computer-agent/src/index.ts";
 import { normalizeTerminalPolicyProposal } from "../packages/computer-agent/src/terminal-policy.ts";
-import { diagnoseComputerPlanAdmissionFailure, normalizeComputerPostconditionProposals, normalizeTerminalWorkerObjective, validateComputerPlanGoalBindings, type ComputerPlanAdmissionDiagnostic } from "../packages/computer-agent/src/plan-proposal.ts";
+import { createComputerPlanRepairTracker, diagnoseComputerPlanAdmissionFailure, normalizeComputerPostconditionProposals, normalizeTerminalWorkerObjective, shouldRepairComputerPlanAdmission, validateComputerPlanCandidateCuaOnly, validateComputerPlanGoalBindings, type ComputerPlanAdmissionDiagnostic } from "../packages/computer-agent/src/plan-proposal.ts";
 import { toolNamesForComputerWorkerRole } from "../packages/computer-agent/extensions/computer-worker.ts";
 import {
 	type AgentConfig,
@@ -56,6 +61,12 @@ import {
 import { registerMainSessionCompactionHook } from "./main-compaction.ts";
 import { registerSessionRecallTool } from "./session-recall.ts";
 import { registerQoderContextWindowCompat } from "./qoder-context-window.ts";
+import {
+	COMPUTER_TASK_CONTINUATION_TIMEOUT_MS,
+	createComputerTaskContinuationWatchdog,
+	queueComputerTaskContinuation,
+	stripComputerTaskContinuationTrigger,
+} from "./computer-task-continuation.ts";
 import {
 	resolveSubagentToolSelection,
 	resolvePipiUIExtensionRouting,
@@ -70,6 +81,11 @@ import {
 	DeliveryObligationStore,
 	type DeliveryObligation,
 } from "./delivery-obligation.ts";
+import {
+	admitSignal,
+	classifyRuntimeSignal,
+	sessionActivity,
+} from "./signal-admission.ts";
 import {
 	completionObservation,
 	completionObservationMatches,
@@ -133,6 +149,7 @@ import {
 	bindCanonicalComputerAgents,
 	configuredHeartbeatAt,
 	createRunScopedTimeout,
+	decideRuntimeBudgetExpiry,
 	normalizeGeneralPurposeExecutionPolicy,
 	runtimeRolePolicyForAgent,
 } from "./runtime-policy.ts";
@@ -141,6 +158,16 @@ import {
 	encodeAgentEventBridgeRequestV1,
 	type AgentBridgeEventPayloadV1,
 } from "./host-bridge.ts";
+import { applyCappedStreamText } from "./stream-part-text.ts";
+import { createComputerTaskRootLifecycle } from "./computer-task-root-lifecycle.ts";
+import {
+	addEstimateChars,
+	combineCompletedAndStreamingUsage,
+	estimateOutputTokens,
+	type EstimateCharCounts,
+	liveUsageOrEstimate,
+	shouldEmitStreamingUsage,
+} from "./streaming-usage.ts";
 
 const MAX_PARALLEL_TASKS = 1000;
 /**
@@ -535,6 +562,7 @@ const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
 // get_search_content. Provider-hosted search may also reach workers through pi's own
 // extension discovery; this pinned route makes research delegable for other providers.
 const PIPIUI_WEB_ACCESS_EXT = process.env.PIPIUI_WEB_ACCESS_EXT;
+const PIPIUI_CODING_TOOLS_EXT = process.env.PIPIUI_CODING_TOOLS_EXT;
 // arXiv remains a specialized local Pi package. Role allowlists decide whether a
 // child may call each mounted package tool.
 const PIPIUI_ARXIV_EXT = process.env.PIPIUI_ARXIV_EXT;
@@ -709,9 +737,13 @@ type PipiuiAgentReport = AgentBridgeEventPayloadV1;
  * The sole live agent-event emitter. It selects exactly one envelope for the
  * same /rpc endpoint: legacy flat Swift bridge by default, canonical v1 only
  * when the Electron host explicitly exported PIPIUI_HOST_PROTOCOL=1.
+ *
+ * Returns true when nothing remains to deliver (no host/no envelope, or the
+ * bridge accepted the report); false only for transport/HTTP failure, which
+ * lets terminal senders retry.
  */
-async function postPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
-	if (!PIPIUI_PORT) return;
+async function postPipiuiReport(payload: PipiuiAgentReport): Promise<boolean> {
+	if (!PIPIUI_PORT) return true;
 	const body = encodeAgentEventBridgeRequestV1(payload, {
 		PIPIUI_HOST_PROTOCOL,
 		PIPIUI_SESSION_KEY: PIPIUI_SESSION,
@@ -719,19 +751,22 @@ async function postPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
 	});
 	// Missing agentId/runId or a missing canonical capability fails closed. Never
 	// send a second legacy fallback and never ask a host to infer a reusable run.
-	if (!body) return;
+	// Both are deterministic config states — retrying cannot fix them.
+	if (!body) return true;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), PIPIUI_REPORT_TIMEOUT_MS);
 	timeout.unref?.();
 	try {
-		await fetch(`http://127.0.0.1:${PIPIUI_PORT}/rpc`, {
+		const response = await fetch(`http://127.0.0.1:${PIPIUI_PORT}/rpc`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(body),
 			signal: controller.signal,
 		});
+		return response.ok;
 	} catch {
 		// Bridge reporting is observability, never a reason to crash the worker.
+		return false;
 	} finally {
 		clearTimeout(timeout);
 	}
@@ -745,9 +780,12 @@ const terminalPipiuiReportFlights = new Map<string, Promise<void>>();
  * receive HTTP requests in completion order. The host still enforces terminal
  * monotonicity because network/process failures can drop or replay messages.
  */
-function enqueuePipiuiReport(payload: PipiuiAgentReport): Promise<void> {
+function enqueuePipiuiReport(
+	payload: PipiuiAgentReport,
+	post: (payload: PipiuiAgentReport) => Promise<unknown> = postPipiuiReport,
+): Promise<void> {
 	const previous = terminalPipiuiReportFlights.get(payload.agentId) ?? Promise.resolve();
-	const flight = previous.catch(() => {}).then(() => postPipiuiReport(payload));
+	const flight = previous.catch(() => {}).then(() => post(payload));
 	terminalPipiuiReportFlights.set(payload.agentId, flight);
 	void flight.finally(() => {
 		if (terminalPipiuiReportFlights.get(payload.agentId) === flight) {
@@ -761,9 +799,29 @@ function pipiuiReport(payload: PipiuiAgentReport): void {
 	void enqueuePipiuiReport(payload);
 }
 
+/** A dropped terminal POST leaves a dead worker rendered as running forever — the
+ *  host's orphan sweep skips sessions whose pi process is still alive. Bounded
+ *  retries keep that row from sticking when the bridge hiccups. */
+const TERMINAL_REPORT_RETRY_DELAYS_MS = [1_000, 3_000] as const;
+async function postPipiuiReportWithRetry(payload: PipiuiAgentReport): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		if (await postPipiuiReport(payload)) return;
+		if (attempt >= TERMINAL_REPORT_RETRY_DELAYS_MS.length) {
+			console.error(
+				`[pipiui-subagent] terminal bridge report dropped for agentId=${payload.agentId} after ${attempt + 1} attempts`,
+			);
+			return;
+		}
+		await new Promise((resolve) => {
+			const timer = setTimeout(resolve, TERMINAL_REPORT_RETRY_DELAYS_MS[attempt]!);
+			timer.unref?.();
+		});
+	}
+}
+
 /** The lease owner awaits the same ordered queue before it releases this agent ID. */
 function postTerminalPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
-	return enqueuePipiuiReport(payload);
+	return enqueuePipiuiReport(payload, postPipiuiReportWithRetry);
 }
 
 async function awaitTerminalPipiuiReports(agentId: string): Promise<void> {
@@ -930,7 +988,9 @@ function summarizeToolArgsForUI(toolName: string, args: Record<string, unknown>)
 			return String(args.query || "…");
 		case "fetch_content":
 			return String(args.url || args.urls?.[0] || "…");
-		case "generate_image": {
+		case "generate_image":
+		case "image_gen":
+		case "image_edit": {
 			const prompt = String(args.prompt || "…").trim();
 			return prompt.length > 80 ? `${prompt.slice(0, 80)}…` : prompt || "…";
 		}
@@ -1021,6 +1081,7 @@ interface UsageStats {
 	cacheWrite: number;
 	cost: number;
 	contextTokens: number;
+	contextWindow?: number;
 	turns: number;
 }
 
@@ -1083,6 +1144,8 @@ interface RunSingleAgentOptions {
 	blockedBy?: string[];
 	/** Current session model as `provider/id` (depth 0 `ctx.model`); used for「跟随主 Agent」. */
 	sessionModel?: string;
+	/** Model context window from the dispatching session; shown on the detail header. */
+	contextWindow?: number;
 	/** Optional Boss-selected thinking for this dispatch; never inherited from the Boss session. */
 	thinking?: string;
 	/** Shell command the runtime runs in the agent's cwd after the process ends (attested verify). */
@@ -1095,7 +1158,7 @@ interface RunSingleAgentOptions {
 	deadlineAt?: number;
 	/** Bundled general-purpose placement override; omission remains isolated. */
 	worktree?: "isolated" | "none";
-	/** Auditable Boss reason required for bundled general-purpose direct-cwd execution. */
+	/** Optional Boss reason when bundled general-purpose runs in a shared cwd. */
 	noWorktreeReason?: string;
 	/** Bundled general-purpose regular wall-clock check-in cadence. */
 	heartbeatSecs?: number;
@@ -1118,6 +1181,12 @@ interface RunSingleAgentOptions {
 function formatCtxModel(model: { provider?: string; id?: string } | undefined | null): string | undefined {
 	if (!model?.provider || !model?.id) return undefined;
 	return `${model.provider}/${model.id}`;
+}
+
+function ctxContextWindow(model: { contextWindow?: number } | undefined | null): number | undefined {
+	return typeof model?.contextWindow === "number" && Number.isFinite(model.contextWindow) && model.contextWindow > 0
+		? model.contextWindow
+		: undefined;
 }
 
 interface SubagentModelOverride {
@@ -2094,8 +2163,27 @@ function abortRunningAgent(agentId: string): { ok: boolean; message: string } {
 	handle.controller.abort();
 	return {
 		ok: true,
-		message: `Abort requested for agentId=${agentId} (${handle.name}). SIGTERM sent (SIGKILL after 5s if still alive); the job will report [subagent-done] with aborted status.`,
+		message: `Abort requested for agentId=${agentId} (${handle.name}). SIGTERM sent (SIGKILL after 5s if still alive). Aborted jobs do not push a [subagent-done] follow-up; check subagent_status.`,
 	};
+}
+
+/**
+ * Abort every queued/running background agent in this boss process (stop sweep).
+ * Returns the agentIds that were actually signalled. Terminal [subagent-done]
+ * receipts of these aborts are suppressed by notifySubagentDone, so the sweep
+ * cannot restart turns by itself.
+ */
+function abortAllRunningAgents(): { aborted: string[] } {
+	const ids = new Set<string>([
+		...dispatchQueue.snapshot().map((item) => item.agentId),
+		...runningAgents.keys(),
+		...runningComputerTasks.keys(),
+	]);
+	const aborted: string[] = [];
+	for (const id of ids) {
+		if (abortRunningAgent(id).ok) aborted.push(id);
+	}
+	return { aborted };
 }
 
 interface ResolveSubagentEpisodeResult {
@@ -2382,6 +2470,9 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
  */
 let dispatchQueueNotify: (text: string) => void = () => {};
 
+/** Boss channel for runtime-budget escalations ([subagent-timeout]); bound to pi in the default export. */
+let runtimeBudgetNotify: (text: string) => void = () => {};
+
 const dispatchQueue = new DispatchQueueV1({
 	limit: MAX_CONCURRENCY,
 	lookup: (agentId): DependencyState => {
@@ -2624,6 +2715,16 @@ interface AgentSliceMetadata {
 	state?: JobState;
 	resultSummary?: string;
 	updatedAt: number;
+}
+
+export function agentResumeIdentityProblem(input: {
+	agentId: string;
+	requestedName: string;
+	historicalName?: string;
+	fresh?: boolean;
+}): string | null {
+	if (!input.historicalName || input.historicalName === input.requestedName) return null;
+	return `agentId ${JSON.stringify(input.agentId)} belongs to ${JSON.stringify(input.historicalName)}, not ${JSON.stringify(input.requestedName)}; changing agent type requires a new agentId`;
 }
 
 function agentSliceMetadataFile(): string | undefined {
@@ -3439,14 +3540,25 @@ async function sendUserMessageAfterCutIn(
 	text: string,
 	shouldSend?: () => boolean,
 ): Promise<boolean> {
+	// Host-stop quiet: reminders/heartbeats/escalations must not restart a stopped
+	// session. They are dropped for this cycle; the boss can still see every job
+	// state through subagent_status and the Subagents panel.
+	if (hostStopQuiet) return false;
+	if (!admitOrHoldRuntimeSignal(text)) return false;
 	// A resolved episode may have been queued behind the cut-in hold. Re-check immediately
 	// before each actual send so resolve can suppress that stale reminder.
 	if (shouldSend && !shouldSend()) return false;
 	try {
 		await pi.sendUserMessage(text, { deliverAs: "followUp" });
 		return true;
-	} catch {
-		// 降级到不带 options 的形式（旧版 pi 可能不认识 deliverAs）。
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		// A live turn without deliverAs is the exact Pi error the host must never
+		// surface. Only fall back when this Pi build does not understand deliverAs.
+		if (message.includes("already processing") || !/unknown|unexpected|deliverAs|options/i.test(message)) {
+			console.error("[pipiui-subagent] failed to deliver message:", err);
+			return false;
+		}
 	}
 	if (shouldSend && !shouldSend()) return false;
 	try {
@@ -3669,6 +3781,82 @@ function retryPendingDoneAfterSessionSettled(pi: ExtensionAPI): void {
 }
 let doneDeliveryPiSessionId: string | undefined;
 
+/**
+ * Host-stop quiet gate. The backend stop sweep sends /subagent_abort_all; from that moment
+ * until the next real user input, no automatic follow-up (completion receipts, interrupted
+ * reminders, heartbeats) may start a boss turn. A stopped session that keeps waking itself
+ * is exactly the 2026-08-15 receipt storm: every late [subagent-done] of an aborted worker
+ * opened a new turn the user had already stopped.
+ */
+let hostStopQuiet = false;
+/** True between before_agent_start and agent_settled. Signals must not enter Pi's follow-up queue while this is set. */
+let bossTurnBusy = false;
+const heldRuntimeSignals: string[] = [];
+
+function releaseHostStopQuiet(pi: ExtensionAPI | undefined): void {
+	if (!hostStopQuiet) return;
+	hostStopQuiet = false;
+	if (pi) {
+		retryPendingDoneAfterSessionSettled(pi);
+		flushHeldRuntimeSignals(pi);
+	}
+}
+
+function workerRunningForSignal(text: string): boolean {
+	const named = /(?:^|\s)agentId=([A-Za-z0-9_-]+)/.exec(text)?.[1];
+	if (named) return runningAgents.has(named);
+	for (const agentId of runningAgents.keys()) {
+		if (text.includes(`  ${agentId} (`)) return true;
+	}
+	return false;
+}
+
+function reminderOpenForSignal(text: string): boolean {
+	const agentId = /(?:^|\s)agentId=([A-Za-z0-9_-]+)/.exec(text)?.[1];
+	if (!agentId) return false;
+	const job = jobRegistry.get(agentId);
+	return Boolean(job && !isHandledJob(job) && isInterruptedReminderState(job.state));
+}
+
+function admitOrHoldRuntimeSignal(text: string): boolean {
+	const kind = classifyRuntimeSignal(text);
+	if (!kind) return true;
+	const decision = admitSignal({
+		kind,
+		activity: sessionActivity({ quiet: hostStopQuiet, busy: bossTurnBusy }),
+		workerRunning: workerRunningForSignal(text),
+		episodeOpen: reminderOpenForSignal(text),
+		alreadyDelivered: false,
+	});
+	if (decision === "send") return true;
+	if (decision === "hold" && !heldRuntimeSignals.includes(text)) heldRuntimeSignals.push(text);
+	return false;
+}
+
+function flushHeldRuntimeSignals(pi: ExtensionAPI): void {
+	if (hostStopQuiet || bossTurnBusy) return;
+	const held = heldRuntimeSignals.splice(0);
+	let sent = false;
+	for (const text of held) {
+		const kind = classifyRuntimeSignal(text);
+		if (!kind) continue;
+		const decision = admitSignal({
+			kind,
+			activity: "idle",
+			workerRunning: workerRunningForSignal(text),
+			episodeOpen: reminderOpenForSignal(text),
+			alreadyDelivered: false,
+		});
+		if (decision === "drop") continue;
+		if (decision === "hold" || sent) {
+			if (!heldRuntimeSignals.includes(text)) heldRuntimeSignals.push(text);
+			continue;
+		}
+		sent = true;
+		void trySendUserMessage(pi, text);
+	}
+}
+
 function logDonePersistenceFailure(action: string, obligationId: string, err: unknown): void {
 	const code = (err as NodeJS.ErrnoException)?.code;
 	console.error(
@@ -3712,7 +3900,11 @@ function sendDoneWithConfirmation(
 	isRetry: boolean,
 ): void {
 	let obligation = entry.obligation;
-	if (obligation.state === "fulfilled" || entry.inFlight || obligation.attempts >= DONE_MAX_ATTEMPTS) return;
+	if (obligation.state === "fulfilled" || obligation.state === "delivered" || entry.inFlight || obligation.attempts >= DONE_MAX_ATTEMPTS) return;
+	// Host-stop quiet: hold the receipt without burning a delivery attempt; the retry
+	// pass after quiet release (next real user input) delivers it.
+	if (hostStopQuiet) return;
+	if (bossTurnBusy) return;
 	if (!entry.sessionId || entry.sessionId !== doneDeliveryPiSessionId) return;
 	const now = Date.now();
 	if (doneDeliveryStore && !obligation.id.startsWith("volatile-")) {
@@ -3789,7 +3981,7 @@ function sendDoneWithConfirmation(
 /** [subagent-done] 专用：带送达确认 + 失败重投。job 此时已 terminal，重投只依赖保存的 text。 */
 function deliverConfirmedDone(pi: ExtensionAPI, agentId: string, runId: string, text: string): void {
 	const obligation = createDoneObligation(agentId, runId, text);
-	if (obligation.state === "observed" || obligation.state === "fulfilled") return;
+	if (obligation.state === "observed" || obligation.state === "fulfilled" || obligation.state === "delivered") return;
 	// Duplicate close/finalize callbacks for the same completion share one in-flight promise.
 	const existing = pendingDone.get(obligation.id);
 	if (existing) {
@@ -3895,10 +4087,32 @@ function notifySubagentDone(
 ): void {
 	// Finalize job BEFORE notification: status must work even if Pi rejects the wake-up.
 	const terminalRunId = ensureJobTerminalFromResult(result, extra);
+	const aborted = extra?.aborted === true || result.stopReason === "aborted";
+	if (aborted) {
+		// An aborted job never pushes a [subagent-done] follow-up. The registry is already
+		// terminal and the Subagents panel shows the aborted state; pushing one receipt
+		// turn per aborted worker is what kept a stopped session churning (2026-08-15).
+		return;
+	}
 	const runId = result.agentId
 		? (result.runId ?? terminalRunId ?? jobRegistry.get(result.agentId)?.runId ?? DeliveryObligationStore.runId())
 		: undefined;
-	const text = formatSubagentDoneMessage(result, runId ? { ...extra, runId } : extra);
+	const WAVE_CAP = 8;
+	const now = Date.now();
+	const running = [...jobRegistry.values()]
+		.filter((j) => j.state === "running")
+		.sort((a, b) => a.startedAt - b.startedAt);
+	const overflow = Math.max(0, running.length - WAVE_CAP);
+	const wave = {
+		workers: running.slice(0, WAVE_CAP).map((j) => ({
+			agentId: j.agentId,
+			name: j.name,
+			elapsed: formatElapsedMs(now - j.startedAt),
+		})),
+		...(overflow > 0 ? { overflow } : {}),
+	};
+	const extraWithWave = { ...extra, wave };
+	const text = formatSubagentDoneMessage(result, runId ? { ...extraWithWave, runId } : extraWithWave);
 	// 前台 job 可能没有 bridge agentId；那种情况下投递确认无从挂起，退化为一次性投递。
 	if (result.agentId && runId) {
 		deliverConfirmedDone(pi, result.agentId, runId, text);
@@ -4113,6 +4327,32 @@ async function runSingleAgent(
 		});
 		localAgentReservations.delete(pipiuiAgentId);
 		return fail;
+	}
+	const identityProblem = callerAgentId
+		? agentResumeIdentityProblem({
+			agentId: pipiuiAgentId,
+			requestedName: agentName,
+			historicalName: readAgentSliceMetadata().find((item) => item.agentId === pipiuiAgentId)?.name,
+			fresh: options?.fresh,
+		})
+		: null;
+	if (identityProblem) {
+		localAgentReservations.delete(pipiuiAgentId);
+		return {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			title: options?.title,
+			exitCode: 1,
+			messages: [],
+			stderr: identityProblem,
+			errorMessage: identityProblem,
+			usage: emptyUsage(),
+			step,
+			agentId: pipiuiAgentId,
+			runId,
+			stopReason: "error",
+		};
 	}
 	const executionPolicyResult = normalizeGeneralPurposeExecutionPolicy(agent, options);
 	if (executionPolicyResult.problem) {
@@ -4397,6 +4637,7 @@ async function runSingleAgent(
 		: normalToolSelection;
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
+	if (PIPIUI_CODING_TOOLS_EXT && !options?.computerWorker) args.push("-e", PIPIUI_CODING_TOOLS_EXT);
 	// The official package owns the child-side read-only query registration.
 	// Mount it only alongside a complete main-issued capability tuple.
 	if (terminalMemoryBrokerEnvironment) {
@@ -4435,7 +4676,10 @@ async function runSingleAgent(
 		exitCode: 0,
 		messages: [],
 		stderr: "",
-		usage: emptyUsage(),
+		usage: {
+			...emptyUsage(),
+			...(options?.contextWindow ? { contextWindow: options.contextWindow } : {}),
+		},
 		model: resolvedModel,
 		step,
 		agentId: pipiuiAgentId,
@@ -4455,6 +4699,7 @@ async function runSingleAgent(
 		task,
 		depth: options?.depth ?? PIPIUI_DEPTH + 1,
 		model: resolvedModel ?? null,
+		...(options?.contextWindow ? { contextWindow: options.contextWindow } : {}),
 		...(options?.title ? { title: options.title } : {}),
 		...(options?.deadlineAt ? { deadlineAt: options.deadlineAt } : {}),
 		...(isBackground ? { background: true } : {}),
@@ -4512,7 +4757,36 @@ async function runSingleAgent(
 
 	let runtimeTimedOut = false;
 	let runtimeTimeout: ReturnType<typeof createRunScopedTimeout> | undefined;
+	let runtimeTimeoutNotified = false;
+	let runtimeProviderPhase: ProviderWaitPhase = "model-active";
+	let runtimePendingTools: string[] = [];
 	let firstChildSpawnedAt: number | undefined;
+	/** One line of "what this worker was doing when its budget expired"; rides the boss
+	 *  notification and the terminal receipt so neither is a bare "exceeded Ns" again. */
+	const runtimeBudgetDiagnostic = (now: number): string => {
+		const handle = handleForRun(pipiuiAgentId, runId);
+		const idleSec = handle ? Math.max(0, Math.floor((now - handle.lastActivityAt) / 1000)) : -1;
+		const phase =
+			runtimeProviderPhase === "awaiting-model"
+				? `awaiting model response (${currentResult.model || resolvedModel || agentName})`
+				: runtimeProviderPhase === "running-tool"
+					? `running tool${runtimePendingTools.length > 0 ? ` ${runtimePendingTools.join(",")}` : "s"}`
+					: "streaming model output";
+		const pid = handle?.pid;
+		const alive = typeof pid === "number" ? (isProcessAlive(pid) ? "alive" : "dead") : "unknown";
+		return [
+			`budget=${Math.round((executionPolicy?.timeoutMs ?? 0) / 1000)}s`,
+			`elapsed=${firstChildSpawnedAt !== undefined ? Math.round((now - firstChildSpawnedAt) / 1000) : 0}s`,
+			`idle=${idleSec}s`,
+			`phase=${phase}`,
+			`turns=${currentResult.usage.turns}`,
+			`contextTokens=${currentResult.usage.contextTokens}`,
+			`cost=$${currentResult.usage.cost.toFixed(4)}`,
+			`child pid=${pid ?? "?"}(${alive})`,
+			`last=${(pipiuiActivity || "(none)").slice(0, 160)}`,
+			sessionDir ? `session=${sessionId}` : "session=none",
+		].join(" · ");
+	};
 	try {
 		// Central child prompt: the agent's own system prompt plus, for desktop-
 		// granted dispatches only, the shared Computer Use policy (applies to ALL
@@ -4622,12 +4896,47 @@ async function runSingleAgent(
 						now: () => firstChildSpawnedAt!,
 						isCurrentRun: (candidateRunId) => handleForRun(pipiuiAgentId, candidateRunId) !== undefined,
 						onTimeout() {
-							runtimeTimedOut = true;
-							currentResult.stopReason = "runtime_timeout";
-							currentResult.errorMessage = `runtime_timeout: exceeded ${executionPolicy.timeoutMs! / 1000}s absolute runtime limit`;
-							pipiuiActivity = currentResult.errorMessage;
+							// Budget expiry is progress-aware: a producing worker silently earns
+							// another budget; a stalled one earns the boss one diagnostic plus one
+							// final budget; only a second stalled expiry aborts.
+							const now = Date.now();
+							const handle = handleForRun(pipiuiAgentId, runId);
+							const idleMs = handle ? Math.max(0, now - handle.lastActivityAt) : Number.POSITIVE_INFINITY;
+							const expiry = decideRuntimeBudgetExpiry({
+								idleMs,
+								progressGraceMs: STALL_THRESHOLD_MS,
+								notified: runtimeTimeoutNotified,
+							});
+							if (expiry === "abort") {
+								runtimeTimedOut = true;
+								currentResult.stopReason = "runtime_timeout";
+								currentResult.errorMessage = `runtime_timeout: exceeded ${executionPolicy.timeoutMs! / 1000}s runtime budget with no progress (${runtimeBudgetDiagnostic(now)})`;
+								pipiuiActivity = currentResult.errorMessage;
+								pipiuiUpdate(true);
+								handleForRun(pipiuiAgentId, runId)?.controller.abort();
+								return;
+							}
+							const extendedDeadlineAt = runtimeTimeout!.extend();
+							if (handle) handle.deadlineAt = extendedDeadlineAt;
+							pipiuiReport({ kind: "update", agentId: pipiuiAgentId, runId, deadlineAt: extendedDeadlineAt });
+							if (expiry === "notify-extend") {
+								runtimeTimeoutNotified = true;
+								const budgetSec = Math.round(executionPolicy.timeoutMs! / 1000);
+								const title = options.title?.trim() || task.split("\n")[0]?.trim().slice(0, 80) || "(untitled)";
+								runtimeBudgetNotify(
+									[
+										`[subagent-timeout] agentId=${pipiuiAgentId} runId=${runId} title=${title}`,
+										`  ${runtimeBudgetDiagnostic(now)}`,
+										`The ${budgetSec}s runtime budget expired while this worker made no progress. It has been re-armed once for another ${budgetSec}s instead of being killed.`,
+										`Before the new budget expires, query subagent_status({agentId:"${pipiuiAgentId}"}), then choose exactly one: keep waiting and say why / subagent_abort({agentId:"${pipiuiAgentId}"}) and re-dispatch by a materially different route / ask the user.`,
+										`If the re-armed budget also expires with no progress the worker is aborted automatically and its result carries this same diagnostic. Do not treat this message as a new user request.`,
+									].join("\n"),
+								);
+								pipiuiActivity = `runtime budget expired (idle ${Math.floor(idleMs / 1000)}s); re-armed once, boss notified`;
+							} else {
+								pipiuiActivity = `runtime budget re-armed (still producing, idle ${Math.floor(idleMs / 1000)}s)`;
+							}
 							pipiuiUpdate(true);
-							handleForRun(pipiuiAgentId, runId)?.controller.abort();
 						},
 					});
 					const handle = handleForRun(pipiuiAgentId, runId);
@@ -4650,6 +4959,8 @@ async function runSingleAgent(
 				providerWait = createProviderWaitController({
 					model: currentResult.model || resolvedModel || agentName,
 					onPhase(phase) {
+						runtimeProviderPhase = phase;
+						if (phase !== "running-tool") runtimePendingTools = [];
 						if (phase !== "awaiting-model") return;
 						pipiuiActivity = providerWait.activity();
 						pipiuiUpdate(true);
@@ -4676,10 +4987,21 @@ async function runSingleAgent(
 				// Assemble text/thinking by contentIndex and push throttled cumulative
 				// snapshots (kind: log_delta) so the native panel streams live.
 				// message_end remains authoritative for tools + non-streamed fallback.
-				type StreamPart = { itemType: "text" | "thinking" | "tool"; text: string; name: string };
+				type StreamPart = { itemType: "text" | "thinking" | "tool"; text: string; name: string; charCount?: number };
 				const streamParts = new Map<number, StreamPart>();
 				const streamDirty = new Set<number>();
+				const fileChangeBuffers = new Map<number, { name: string; raw: string }>();
 				let streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
+					let lastUsageKey = "";
+					let lastUsageEmitAt = 0;
+					// Output-token estimate for providers whose stream reports usage only at
+					// message end (openai-completions). Accumulates delta chars per live
+					// assistant message; message_end resets it with the authoritative total.
+					let liveEstimateChars: EstimateCharCounts = { ascii: 0, cjk: 0 };
+					const countLiveEstimate = (delta: string) => {
+						if (!delta) return;
+						liveEstimateChars = addEstimateChars(liveEstimateChars, delta);
+					};
 				const STREAM_FLUSH_MS = 50;
 				const STREAM_TEXT_CAP = 4000;
 				const STREAM_THINKING_CAP = 600;
@@ -4700,6 +5022,9 @@ async function runSingleAgent(
 							contentIndex: idx,
 							itemType: part.itemType,
 							text: part.text,
+							...(part.itemType === "thinking" && typeof part.charCount === "number"
+								? { charCount: part.charCount }
+								: {}),
 							...(part.name ? { name: part.name } : {}),
 						});
 					}
@@ -4723,6 +5048,45 @@ async function runSingleAgent(
 					flushStreamParts();
 				};
 
+				const emitUsageSnapshot = (usage: {
+					input: number;
+					output: number;
+					cacheRead: number;
+					cacheWrite: number;
+					cost: number;
+					contextTokens: number;
+					contextWindow?: number;
+				}, options?: { force?: boolean; turn?: number; model?: string | null; tools?: string[] }) => {
+					const decision = shouldEmitStreamingUsage({
+						previousKey: lastUsageKey,
+						lastEmitAt: lastUsageEmitAt,
+						next: usage,
+						now: Date.now(),
+						force: options?.force,
+					});
+					if (!decision.emit) return;
+					lastUsageKey = decision.key;
+					lastUsageEmitAt = decision.at;
+					pipiuiReport({
+						kind: "usage",
+						agentId: pipiuiAgentId,
+						runId,
+						turn: options?.turn ?? currentResult.usage.turns,
+						model: options?.model ?? currentResult.model ?? null,
+						tools: options?.tools ?? [],
+						usage: {
+							...usage,
+							...(currentResult.usage.contextWindow ? { contextWindow: currentResult.usage.contextWindow } : {}),
+						},
+					});
+				};
+
+				const emitStreamingUsage = (raw: unknown, force = false) => {
+					const live = liveUsageOrEstimate(raw, estimateOutputTokens(liveEstimateChars));
+					if (!live) return;
+					emitUsageSnapshot(combineCompletedAndStreamingUsage(currentResult.usage, live), { force });
+				};
+
 				const upsertStreamPart = (
 					contentIndex: number,
 					itemType: StreamPart["itemType"],
@@ -4738,12 +5102,12 @@ async function runSingleAgent(
 						part.itemType = itemType;
 					}
 					if (name) part.name = name;
-					const cap = itemType === "thinking" ? STREAM_THINKING_CAP : STREAM_TEXT_CAP;
-					if (typeof replaceText === "string") {
-						part.text = replaceText.slice(0, cap);
-					} else if (delta && part.text.length < cap) {
-						part.text = (part.text + delta).slice(0, cap);
-					}
+					const cap = itemType === "thinking"
+						? STREAM_THINKING_CAP
+						: itemType === "tool"
+							? Number.POSITIVE_INFINITY
+							: STREAM_TEXT_CAP;
+					applyCappedStreamText(part, delta, cap, replaceText);
 					streamDirty.add(contentIndex);
 					scheduleStreamFlush();
 				};
@@ -4759,6 +5123,10 @@ async function runSingleAgent(
 
 					// Live deltas (pi 0.84+). Do not wait for message_end.
 					if (event.type === "message_update") {
+						// Top-level usage is the current assistant message's cumulative
+						// provider report. Combine it with completed turns and emit a
+						// throttled kind:"usage" so the panel can show live tokens.
+						emitStreamingUsage(event.usage ?? event.message?.usage);
 						const ame = event.assistantMessageEvent;
 						if (ame && typeof ame === "object") {
 							providerWait.noteAssistantActivity();
@@ -4770,6 +5138,7 @@ async function runSingleAgent(
 							if (ctype === "text_start") {
 								upsertStreamPart(contentIndex, "text", "");
 							} else if (ctype === "text_delta") {
+								countLiveEstimate(String(ame.delta ?? ""));
 								upsertStreamPart(contentIndex, "text", String(ame.delta ?? ""));
 							} else if (ctype === "text_end") {
 								const finalText =
@@ -4785,6 +5154,7 @@ async function runSingleAgent(
 							} else if (ctype === "thinking_start") {
 								upsertStreamPart(contentIndex, "thinking", "");
 							} else if (ctype === "thinking_delta") {
+								countLiveEstimate(String(ame.delta ?? ""));
 								upsertStreamPart(contentIndex, "thinking", String(ame.delta ?? ""));
 							} else if (ctype === "thinking_end") {
 								const finalThinking =
@@ -4798,12 +5168,32 @@ async function runSingleAgent(
 								}
 								forceFlushStreamParts();
 							} else if (ctype === "toolcall_start") {
-								// Activity-only placeholder; tools still land authoritatively on message_end.
 								const toolName = String(ame.name ?? "tool");
 								pipiuiActivity = `${toolName} …`;
+								if (toolName === "write" || toolName === "edit") {
+									fileChangeBuffers.set(contentIndex, { name: toolName, raw: "" });
+									upsertStreamPart(contentIndex, "tool", "", toolName, stringifyCompactFileChange({
+										path: "…",
+										payloadChars: 0,
+										addedChars: 0,
+										removedChars: 0,
+									}));
+								}
 								pipiuiUpdate();
+							} else if (ctype === "toolcall_delta") {
+								countLiveEstimate(String(ame.delta ?? ""));
+								const buf = fileChangeBuffers.get(contentIndex);
+								if (buf) {
+									buf.raw += String(ame.delta ?? "");
+									const compact = compactFileChangeFromPartial(buf.name, buf.raw);
+									if (compact) {
+										const pathLabel = compact.path && compact.path !== "…" ? compact.path : "…";
+										pipiuiActivity = `${buf.name} ${pathLabel}`;
+										upsertStreamPart(contentIndex, "tool", "", buf.name, stringifyCompactFileChange(compact));
+									}
+								}
 							}
-							// toolcall_delta / toolcall_end: ignore (message_end owns final tool rows)
+							// toolcall_end: ignore (message_end owns final tool rows)
 							return;
 						}
 						// Legacy cumulative snapshot message_update (pre-0.84 / jcode-style).
@@ -4844,9 +5234,8 @@ async function runSingleAgent(
 									currentResult.usage.cacheWrite += usage.cacheWrite || 0;
 									currentResult.usage.cost += usage.cost?.total || 0;
 									currentResult.usage.contextTokens = usage.totalTokens || 0;
-									// Per-turn usage → PipiUI token ledger. Independent of the
-									// cost/turns aggregates above; gives per-turn input/output/cache
-									// breakdown that "end" doesn't carry. Safe to no-op if bridge unset.
+									// Authoritative session-total close-out. Replaces any live
+									// message_update preview so the panel never snaps backwards.
 									const toolSet = new Set<string>();
 									for (const part of (msg as any).content ?? []) {
 										if (part?.type === "toolCall" && typeof part.name === "string" && part.name) {
@@ -4854,21 +5243,18 @@ async function runSingleAgent(
 										}
 									}
 									const tools = [...toolSet].sort();
-									pipiuiReport({
-										kind: "usage",
-										agentId: pipiuiAgentId,
-										runId,
+									emitUsageSnapshot({
+										input: currentResult.usage.input,
+										output: currentResult.usage.output,
+										cacheRead: currentResult.usage.cacheRead,
+										cacheWrite: currentResult.usage.cacheWrite,
+										cost: currentResult.usage.cost,
+										contextTokens: currentResult.usage.contextTokens,
+									}, {
+										force: true,
 										turn: currentResult.usage.turns,
 										model: msg.model || currentResult.model || null,
 										tools,
-										usage: {
-											input: usage.input || 0,
-											output: usage.output || 0,
-											cacheRead: usage.cacheRead || 0,
-											cacheWrite: usage.cacheWrite || 0,
-											cost: usage.cost?.total || 0,
-											contextTokens: usage.totalTokens || 0,
-										},
 									});
 								}
 							if (!currentResult.model && msg.model) currentResult.model = msg.model;
@@ -4879,12 +5265,43 @@ async function runSingleAgent(
 							// 避免面板重复；tool 仍以 message_end 为权威落盘。
 							const pipiuiItems: Record<string, unknown>[] = [];
 							const toolCallIds: string[] = [];
+							const toolNames: string[] = [];
 							for (const part of (msg as any).content ?? []) {
 								if (part?.type === "toolCall") {
 									if (typeof part.id === "string" && part.id) toolCallIds.push(part.id);
+									if (typeof part.name === "string" && part.name) toolNames.push(part.name);
 									const args = (part.arguments ?? {}) as Record<string, unknown>;
 									const summary = summarizeToolArgsForUI(String(part.name ?? ""), args);
 									pipiuiActivity = `${part.name} ${summary}`;
+									const toolName = String(part.name ?? "");
+									const compact = compactFileChangeFromArgs(toolName, args);
+									if (compact) {
+										let extra: Record<string, unknown> | undefined;
+										if (toolName === "edit") {
+											try {
+												const bounded = JSON.parse(boundedEditPayloadForUI(args)) as Record<string, unknown>;
+												if (Array.isArray(bounded.edits)) extra = { edits: bounded.edits };
+											} catch { /* keep counts-only */ }
+										}
+										const compactText = stringifyCompactFileChange(compact, extra);
+										const matchIndex = [...fileChangeBuffers.entries()].find(([_, buf]) => buf.name === toolName)?.[0];
+										const contentIndex = matchIndex;
+										if (typeof contentIndex === "number") {
+											pipiuiReport({
+												kind: "log_delta",
+												agentId: pipiuiAgentId,
+												runId,
+												contentIndex,
+												itemType: "tool",
+												text: compactText,
+												name: toolName,
+											});
+											fileChangeBuffers.delete(contentIndex);
+											continue;
+										}
+										pipiuiItems.push({ itemType: "tool", name: toolName, text: compactText });
+										continue;
+									}
 									// Edit keeps a bounded, valid JSON payload so the native subagent log can
 									// render the same line diff as the main-agent transcript. Other tools
 									// retain their compact human-readable summary.
@@ -4895,10 +5312,12 @@ async function runSingleAgent(
 									pipiuiItems.push({ itemType: "text", text: String(part.text).slice(0, 4000) });
 								} else if (part?.type === "thinking" && String(part.thinking ?? "").trim()) {
 									if (didStreamTextOrThinking) continue;
-									pipiuiItems.push({ itemType: "thinking", text: String(part.thinking).slice(0, 600) });
+									const thinking = String(part.thinking);
+									pipiuiItems.push({ itemType: "thinking", text: thinking.slice(0, 600), charCount: thinking.length });
 								}
 							}
 							providerWait.noteToolBatch(toolCallIds);
+						runtimePendingTools = toolNames;
 							// Always emit log when we streamed text/thinking so Swift resets
 							// contentIndex→row slots even if tools array is empty (otherwise the
 							// next turn would overwrite the previous message's live rows).
@@ -4909,6 +5328,8 @@ async function runSingleAgent(
 							// after kind:"log"; clear local assembly state here.
 							streamParts.clear();
 							streamDirty.clear();
+							fileChangeBuffers.clear();
+							liveEstimateChars = { ascii: 0, cjk: 0 };
 						}
 						emitUpdate();
 						pipiuiUpdate();
@@ -5289,7 +5710,13 @@ async function runSingleAgent(
 					}
 				: {}),
 		});
-		if (wasAborted && !runtimeTimedOut) throw new Error("Subagent was aborted");
+		if (wasAborted && !runtimeTimedOut) throw Object.assign(new Error("Subagent was aborted"), {
+			agentId: pipiuiAgentId,
+			runId,
+			exitCode: currentResult.exitCode,
+			stopReason: currentResult.stopReason,
+			errorMessage: currentResult.errorMessage,
+		});
 		return currentResult;
 	} finally {
 		runtimeTimeout?.dispose();
@@ -5361,15 +5788,10 @@ const ThinkingParam = Type.Optional(
 		description: THINKING_PARAM_DESCRIPTION,
 	}),
 );
-const WorktreeParam = Type.Optional(
-	StringEnum(["isolated", "none"] as const, {
-		description: 'Bundled general-purpose only. Default "isolated". "none" requires noWorktreeReason.',
-	}),
-);
-const NoWorktreeReasonParam = Type.Optional(
-	Type.String({
-		maxLength: 500,
-		description: 'Bundled general-purpose only. Required with worktree="none": the Boss audit reason, one non-empty line.',
+const IsolationParam = Type.Optional(
+	StringEnum(["worktree", "none"] as const, {
+		description:
+			'Writable general-purpose defaults to worktree (isolated tree, then merge). Read-only roles ignore this. "none" shares the assigned cwd.',
 	}),
 );
 const HeartbeatSecsParam = Type.Optional(
@@ -5401,21 +5823,31 @@ const TaskItem = Type.Object({
 	),
 }, { additionalProperties: false });
 
+// Chain items speak the same Grok Build / Claude-family dispatch contract as the
+// single `subagent` tool. Grok 4.6 cannot reliably emit a required long field
+// named `task` on a subagent-dispatch tool (0/5 in the 2026-08-15 A/B probe: it
+// filled every optional field and always skipped `task`; the prompt/description
+// spelling arrived 6/6). Old names {agent, task, title, worktree} live only in
+// the sanitizer and must never re-enter this property list.
 const ChainItem = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
-	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
-	title: Type.Optional(
+	prompt: Type.String({
+		minLength: 1,
+		description: "The full task prompt for this step. May reference the prior step's output with the {previous} placeholder.",
+	}),
+	description: Type.String({
+		minLength: 1,
+		description: "Short description of the step (3-5 words).",
+	}),
+	subagent_type: Type.Optional(
 		Type.String({
-			description:
-				"Short one-line title shown in the Subagents panel list instead of the full task; omit to fall back to task text",
+			description: "Subagent type. Defaults to general-purpose. Built-in: general-purpose, explore, plan, reviewer.",
 		}),
 	),
+	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	thinking: ThinkingParam,
-	worktree: WorktreeParam,
-	noWorktreeReason: NoWorktreeReasonParam,
+	isolation: IsolationParam,
 	heartbeatSecs: HeartbeatSecsParam,
 	timeoutSecs: TimeoutSecsParam,
 	desktop: Type.Optional(
@@ -5446,25 +5878,37 @@ const SharedDispatchParams = {
 // Each public tool is one intent. The shared execute still accepts the internal
 // union (single / chain / tasks / abort / resolve) so wrappers can delegate.
 const SubagentParams = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke." }),
-	task: Type.String({ description: "Task to delegate." }),
-	title: Type.Optional(Type.String({ description: "Short one-line title; omit to fall back to task text." })),
-	blockedBy: BlockedByParam,
-	thinking: ThinkingParam,
-	worktree: WorktreeParam,
-	noWorktreeReason: NoWorktreeReasonParam,
-	heartbeatSecs: HeartbeatSecsParam,
-	timeoutSecs: TimeoutSecsParam,
-	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
-	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
+	prompt: Type.String({
+		minLength: 1,
+		description: "The full task prompt for the subagent to execute.",
+	}),
+	description: Type.String({
+		minLength: 1,
+		description: "Short description of the task (3-5 words).",
+	}),
+	subagent_type: Type.Optional(
+		Type.String({
+			description: "Subagent type. Defaults to general-purpose. Built-in: general-purpose, explore, plan, reviewer.",
+			default: "general-purpose",
+		}),
+	),
+	run_in_background: Type.Optional(
+		Type.Boolean({
+			default: true,
+			description: "If true, return immediately; completion arrives later. Default true at boss depth.",
+		}),
+	),
+	isolation: IsolationParam,
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process." })),
-	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
-	desktop: Type.Optional(StringEnum(["user-requested", "ui-verify"] as const, { description: DESKTOP_PARAM_DESCRIPTION })),
-	...SharedDispatchParams,
+	resume_from: Type.Optional(
+		Type.String({
+			description: "Resume a previous subagent. Pass the agent id returned by a prior call.",
+		}),
+	),
 }, { additionalProperties: false });
 const SubagentChainParams = Type.Object({
 	chain: Type.Array(ChainItem, {
-		description: "Ordered steps. Each item needs agent and task. Use {previous} to pass the prior step's output.",
+		description: "Ordered steps. Each item needs prompt (full brief) and description (3-5 word label). Use {previous} to pass the prior step's output.",
 		minItems: 1,
 	}),
 	...SharedDispatchParams,
@@ -5479,6 +5923,12 @@ const SubagentResolveParams = Type.Object({
 }, { additionalProperties: false });
 type SubagentExecuteParams = {
 	action?: "abort" | "resolve";
+	prompt?: string;
+	description?: string;
+	subagent_type?: string;
+	run_in_background?: boolean;
+	isolation?: "worktree" | "none";
+	resume_from?: string;
 	agent?: string;
 	task?: string;
 	title?: string;
@@ -5495,9 +5945,16 @@ type SubagentExecuteParams = {
 	cwd?: string;
 	verify?: string;
 	desktop?: "user-requested" | "ui-verify";
+	// The public schema speaks Grok-family names (prompt/description/subagent_type/
+	// isolation); adoptGrokBuildDispatch at execute entry fills the internal old names
+	// this runner reads, so agent/task stay required here.
 	chain?: Array<{
 		agent: string;
 		task: string;
+		prompt?: string;
+		description?: string;
+		subagent_type?: string;
+		isolation?: "worktree" | "none";
 		agentId?: string;
 		title?: string;
 		cwd?: string;
@@ -5658,6 +6115,27 @@ function computerWorkerFailureCodeFromOutput(text: string): ComputerWorkerFailur
 	}
 }
 
+export function computerWorkerManualBlockFromOutput(
+	text: string,
+): Pick<ComputerWorkerResult, "recoveryDisposition" | "blockedReason" | "nextAction"> | undefined {
+	try {
+		const output = parseComputerJSON(text);
+		if (
+			output?.outcome !== "blocked"
+			|| output?.recoveryDisposition !== "manual_intervention"
+			|| output?.blockedReason !== "target_state_mismatch"
+			|| output?.nextAction !== "restore_target_state_manually"
+		) return undefined;
+		return {
+			recoveryDisposition: "manual_intervention",
+			blockedReason: "target_state_mismatch",
+			nextAction: "restore_target_state_manually",
+		};
+	} catch {
+		return undefined;
+	}
+}
+
 function computerVerifierAttestationsFromOutput(
 	text: string,
 	requested: ComputerPostcondition[],
@@ -5746,6 +6224,7 @@ function computerPlanFromOutput(output: string, goal: string): ComputerPlan {
 	if (!value || !Array.isArray(value.steps) || value.steps.length < 1 || value.steps.length > 4) {
 		throw new Error("Computer Use Leader returned an invalid step list");
 	}
+	validateComputerPlanCandidateCuaOnly(value);
 	let procedureContext: ComputerPlan["procedureContext"];
 	if (value.procedureContext !== undefined) {
 		const context = value.procedureContext;
@@ -5856,6 +6335,59 @@ function computerPlanInvestigationReport(error: ComputerPlanInvestigationError) 
 function registerComputerTaskTool(pi: ExtensionAPI): void {
 	if (PIPIUI_DEPTH !== 0 || !PIPIUI_PORT || !PIPIUI_SESSION || !process.env.PIPIUI_COMPUTER_CAPABILITY) return;
 	assertComputerAgentRuntimeContract();
+	let continuationObligationId: string | undefined;
+	let continuationAbortRequested = false;
+	const continuationWatchdog = createComputerTaskContinuationWatchdog({
+		deadlineMs: COMPUTER_TASK_CONTINUATION_TIMEOUT_MS,
+		onContinue() {
+			const obligationId = continuationObligationId;
+			if (!obligationId) return;
+			const timer = setTimeout(() => {
+				if (continuationObligationId !== obligationId) return;
+				queueComputerTaskContinuation(pi, obligationId);
+			}, 0);
+			timer.unref?.();
+		},
+	});
+	pi.on("tool_result", (event, ctx) => {
+		if (event.toolName !== "computer_task") return;
+		continuationObligationId = event.toolCallId;
+		continuationAbortRequested = false;
+		continuationWatchdog.arm(() => {
+			continuationAbortRequested = true;
+			ctx.abort();
+		});
+	});
+	const noteComputerTaskAssistantActivity = () => {
+		continuationWatchdog.noteAssistantActivity();
+		if (!continuationAbortRequested) continuationObligationId = undefined;
+	};
+	pi.on("message_start", (event) => {
+		if (event.message.role !== "assistant") return;
+		noteComputerTaskAssistantActivity();
+	});
+	pi.on("message_update", (event) => {
+		if (event.message.role !== "assistant") return;
+		noteComputerTaskAssistantActivity();
+	});
+	pi.on("agent_settled", () => {
+		continuationWatchdog.noteSettled();
+		if (!continuationAbortRequested) continuationObligationId = undefined;
+		continuationAbortRequested = false;
+	});
+	pi.on("context", (event) => {
+		const obligationId = continuationObligationId;
+		if (!obligationId) return;
+		const messages = stripComputerTaskContinuationTrigger(event.messages, obligationId);
+		if (messages === event.messages) return;
+		continuationObligationId = undefined;
+		return { messages };
+	});
+	pi.on("session_shutdown", () => {
+		continuationWatchdog.dispose();
+		continuationObligationId = undefined;
+		continuationAbortRequested = false;
+	});
 	const computerTaskParameters = makeStrictJsonSchema(Type.Object({
 		goal: Type.String({ minLength: 1, maxLength: 12_000 }),
 		agentId: Type.Optional(Type.String({ description: "Exact historical computer-use-leader id selected by the Boss after inspecting subagent_status. Omit for a new hierarchy." })),
@@ -5877,22 +6409,67 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 			if (runningComputerTasks.has(taskId)) throw new Error(`Computer Task agentId=${taskId} is already running`);
 			runningComputerTasks.set(taskId, { runId: coordinatorRunId, controller: taskController });
 			try {
-			const { ComputerAgentCoordinator, ProcedureHostRuntime, COMPUTER_LEADER_STALL_TIMEOUT_MS, COMPUTER_WORKER_STALL_TIMEOUT_MS, runComputerLeaderWithStallDeadline, runComputerWorkerWithStallDeadline } = await loadComputerAgentModule();
+			const { ComputerAgentCoordinator, ProcedureHostRuntime, COMPUTER_LEADER_STALL_TIMEOUT_MS, COMPUTER_WORKER_STALL_TIMEOUT_MS, computerOperatorContextOptions, computerTaskContent, computerTaskDetails, computerTaskRootTerminalState, finalizeComputerTaskWithOptionalSummary, runComputerLeaderWithStallDeadline, runComputerWorkerWithStallDeadline } = await loadComputerAgentModule();
+			const rootLifecycle = createComputerTaskRootLifecycle(
+				{ agentId: taskId, runId: coordinatorRunId },
+				postPipiuiReport,
+				postTerminalPipiuiReport,
+			);
 			const discovery = discoverAgents(ctx.cwd, "user");
 			const canonicalDiscovery = discoverBundledAgentsFromDirectory(fileURLToPath(new URL("../agents", import.meta.url)));
 			if (canonicalDiscovery.diagnostics.some((entry) => entry.severity === "error")) throw new Error("Canonical Computer Agent roles failed validation");
 			const computerAgents = bindCanonicalComputerAgents(discovery.agents, canonicalDiscovery.agents);
 			const sessionModel = formatCtxModel(ctx.model);
+			const contextWindow = ctxContextWindow(ctx.model as { contextWindow?: number } | undefined);
+			const leaderEpisodes: ComputerAgentEpisode[] = [];
+			const childRole = (agentName: string): ComputerAgentEpisode["role"] => agentName === "computer-use-leader" ? "computer-use-leader" : agentName === "computer-verifier" ? "verifier" : agentName === "computer-terminal" ? "terminal-worker" : "gui-operator";
+			const childEpisode = (agentName: string, result: Pick<SingleResult, "agentId" | "runId" | "exitCode" | "stopReason" | "errorMessage">, outcome: ComputerAgentEpisode["result"]["outcome"]): ComputerAgentEpisode | undefined => {
+				if (!result.agentId || !result.runId) return undefined;
+				const terminalState: ComputerAgentEpisode["terminalState"] = result.stopReason === "aborted"
+					? "aborted"
+					: result.stopReason === "interrupted"
+						? "interrupted"
+						: result.stopReason === "runtime_timeout" || result.stopReason === "provider_stall_timeout"
+							? "stalled"
+							: result.exitCode === 0 && !result.errorMessage ? "ok" : "failed";
+				return {
+					agentId: result.agentId,
+					runId: result.runId,
+					parentId: agentName === "computer-use-leader" ? PIPIUI_PARENT : taskId,
+					name: agentName as ComputerAgentEpisode["name"],
+					role: childRole(agentName),
+					terminalState,
+					result: { outcome, summary: outcome === "verified" ? "Verifier completed" : outcome === "completed" ? "Worker completed" : outcome === "cancelled" ? "Computer Task cancelled" : "Worker failed" },
+				};
+			};
+			const rootEpisode = (result: { outcome: string; summary: string }): ComputerAgentEpisode => ({
+				agentId: taskId,
+				runId: coordinatorRunId,
+				parentId: PIPIUI_PARENT,
+				name: "computer-use-leader",
+				role: "computer-use-leader",
+				terminalState: computerTaskRootTerminalState(result),
+				result: { outcome: result.outcome === "succeeded" ? "completed" : result.outcome === "cancelled" ? "cancelled" : "blocked", summary: result.summary },
+			});
 			const runChild = async (agentName: string, task: string, options: Omit<RunSingleAgentOptions, "toolCallId"> = {}, childSignal?: AbortSignal) => {
 				const leader = agentName === "computer-use-leader";
 				const effectiveSignal = childSignal ? AbortSignal.any([taskSignal, childSignal]) : taskSignal;
-				const result = await runSingleAgent(ctx.cwd, computerAgents, agentName, task, undefined, undefined, effectiveSignal, undefined,
-					(results) => ({ mode: "single", agentScope: "user", projectAgentsDir: discovery.projectAgentsDir, results }),
-					{ ...options, toolCallId, ...(leader ? { agentId: taskId, parentAgentId: PIPIUI_PARENT, depth: PIPIUI_DEPTH + 1, retainContext: true, fresh: false } : { parentAgentId: taskId, depth: PIPIUI_DEPTH + 2 }), sessionModel, background: false });
-				if (result.exitCode !== 0 || result.errorMessage) throw Object.assign(new Error(result.errorMessage || result.stderr || `${agentName} failed`), {
-					agentId: result.agentId, runId: result.runId, resolvedModel: result.model, hadMessages: result.messages.length > 0,
-				});
-				return getFinalOutput(result.messages) || result.stderr;
+				try {
+					const result = await runSingleAgent(ctx.cwd, computerAgents, agentName, task, undefined, undefined, effectiveSignal, undefined,
+						(results) => ({ mode: "single", agentScope: "user", projectAgentsDir: discovery.projectAgentsDir, results }),
+						{ ...options, toolCallId, ...(leader ? { agentId: taskId, parentAgentId: PIPIUI_PARENT, depth: PIPIUI_DEPTH + 1, retainContext: true, fresh: false } : { parentAgentId: taskId, depth: PIPIUI_DEPTH + 2 }), sessionModel, contextWindow, background: false });
+					const episode = childEpisode(agentName, result, result.exitCode === 0 && !result.errorMessage ? "completed" : "failed");
+					if (leader && episode) leaderEpisodes.push(episode);
+					if (result.exitCode !== 0 || result.errorMessage) throw Object.assign(new Error(result.errorMessage || result.stderr || `${agentName} failed`), {
+						agentId: result.agentId, runId: result.runId, resolvedModel: result.model, hadMessages: result.messages.length > 0, episode,
+					});
+					return { text: getFinalOutput(result.messages) || result.stderr, episode };
+				} catch (error) {
+					const diagnostic = error as { agentId?: string; runId?: string; exitCode?: number; stopReason?: string; errorMessage?: string; episode?: ComputerAgentEpisode };
+					const episode = diagnostic.episode ?? childEpisode(agentName, { agentId: diagnostic.agentId, runId: diagnostic.runId, exitCode: diagnostic.exitCode ?? 1, stopReason: diagnostic.stopReason, errorMessage: diagnostic.errorMessage ?? "child failed" }, "failed");
+					if (leader && episode && !leaderEpisodes.some((candidate) => candidate.runId === episode.runId)) leaderEpisodes.push(episode);
+					throw Object.assign(error instanceof Error ? error : new Error(String(error)), { episode });
+				}
 			};
 			const runLeader = async (task: string, options: Omit<RunSingleAgentOptions, "toolCallId"> = {}) => {
 				const leaderController = new AbortController();
@@ -5901,13 +6478,10 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 					() => runChild("computer-use-leader", task, { ...options, deadlineAt }, leaderController.signal),
 					() => leaderController.abort(),
 					COMPUTER_LEADER_STALL_TIMEOUT_MS,
-				);
+				).then((episode) => episode.text);
 			};
 			const markComputerLeaderCoordinating = async () => {
-				await postPipiuiReport({
-					kind: "start",
-					agentId: taskId,
-					runId: coordinatorRunId,
+				await rootLifecycle.start({
 					parentId: PIPIUI_PARENT,
 					toolCallId,
 					name: "computer-use-leader",
@@ -5920,15 +6494,12 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 					model: null,
 					title: "Computer Use Leader",
 				});
-				leaderCoordinating = true;
 			};
-			let leaderCoordinating = false;
 			const repairRejectedPlan = async (goal: string, output: string, phase: "initial" | "recovery"): Promise<ComputerPlan> => {
 				let candidate = output;
-				const seenCandidateFingerprints = new Set<string>();
+				const seenCandidateFingerprints = createComputerPlanRepairTracker();
 				for (let attempt = 0; ; attempt += 1) {
-					const fingerprint = candidateFingerprint(candidate);
-					if (seenCandidateFingerprints.has(fingerprint)) {
+					if (!seenCandidateFingerprints.admit(candidate)) {
 						const repeated: ComputerPlanAdmissionDiagnostic = {
 							code: "plan_repair_stalled",
 							summary: "Leader 再次返回了已经被拒绝的同一份计划，本轮没有产生新的修复方案。",
@@ -5936,11 +6507,11 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 						};
 						throw new ComputerPlanInvestigationError(repeated, attempt + 1);
 					}
-					seenCandidateFingerprints.add(fingerprint);
 					try {
 						return computerPlanFromOutput(candidate, goal);
 					} catch (error) {
 						const diagnostic = diagnoseComputerPlanAdmissionFailure(error);
+						if (!shouldRepairComputerPlanAdmission(diagnostic)) throw new ComputerPlanInvestigationError(diagnostic, attempt + 1);
 						if (seenCandidateFingerprints.size >= PLAN_ADMISSION_MAX_DISTINCT_CANDIDATES) throw new ComputerPlanInvestigationError(diagnostic, attempt + 1);
 						candidate = await runLeader([
 							`The Host rejected your ${phase === "initial" ? "initial" : "recovery"} plan before any new worker was dispatched. Investigate the rejected plan yourself, then return a corrected complete JSON plan only.`,
@@ -5978,8 +6549,16 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 				},
 			};
 			let initialPlan: ComputerPlan | undefined;
+			// Latest validated plan (initial or revised) for the tool-result envelope.
+			let latestPlan: ComputerPlan | undefined;
 			const originalPlan = planner.plan;
-			planner.plan = async (goal: string) => initialPlan ??= await originalPlan(goal);
+			planner.plan = async (goal: string) => {
+				const plan = initialPlan ??= await originalPlan(goal);
+				latestPlan = plan;
+				return plan;
+			};
+			const originalReplan = planner.replan;
+			planner.replan = async (input: any) => latestPlan = await originalReplan(input);
 			let broker: InstanceType<ComputerAgentModule["ComputerWorkerBrokerServer"]> | undefined;
 			let terminalBroker: InstanceType<ComputerAgentModule["TerminalWorkerBrokerServer"]> | undefined;
 			const dispatcher = {
@@ -6001,7 +6580,7 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 							PIPIUI_TERMINAL_WORKER_EXECUTABLES: JSON.stringify(request.terminalPolicy.allowedExecutables),
 							PIPIUI_TERMINAL_WORKER_MAX_COMMANDS: String(request.terminalPolicy.maxCommands),
 						};
-								const text = await runChild("computer-terminal", [
+								const child = await runChild("computer-terminal", [
 							request.objective,
 							`Postconditions: ${JSON.stringify(request.postconditions)}`,
 							"For file content mutation, call terminal_write_file directly with the exact requested path and content. Do not use terminal_execute with printf, echo, a shell, >, or >>; argv is literal. Do not add or remove a trailing newline unless the goal explicitly requests it.",
@@ -6020,12 +6599,18 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 								);
 								// Host-owned typed effects remain authoritative: a malformed or pessimistic
 								// worker verdict cannot cause an already-proven write to run twice.
-								const outcome = hostEffectsSatisfyPostconditions ? "completed" : computerWorkerOutcomeFromOutput(text);
-								const failureCode = hostEffectsSatisfyPostconditions ? undefined : computerWorkerFailureCodeFromOutput(text);
-								return { workerResult: { outcome, summary: `Terminal Worker ${outcome}`, ...(failureCode ? { failureCode } : {}), observation: observedFiles.length ? { id: records.at(-1)?.observationId ?? `file:${randomUUID()}`, files: observedFiles } : undefined }, hostExecutionRecords: records.map((record) => ({ ...record, role: "terminal-worker" })) };
+								const outcome = hostEffectsSatisfyPostconditions ? "completed" : computerWorkerOutcomeFromOutput(child.text);
+								const failureCode = hostEffectsSatisfyPostconditions ? undefined : computerWorkerFailureCodeFromOutput(child.text);
+								return { workerResult: { outcome, summary: `Terminal Worker ${outcome}`, ...(failureCode ? { failureCode } : {}), observation: observedFiles.length ? { id: records.at(-1)?.observationId ?? `file:${randomUUID()}`, files: observedFiles } : undefined }, hostExecutionRecords: records.map((record) => ({ ...record, role: "terminal-worker" })), episode: child.episode };
 							} finally { terminalBroker.revokeStep(request.taskId, request.stepId); }
 					}
-					const stageError = (failureCode: string, error: unknown) => Object.assign(new Error(error instanceof Error ? error.message : String(error)), { failureCode });
+					const stageError = (failureCode: string, error: unknown) => {
+						const episode = (error as { episode?: ComputerAgentEpisode })?.episode;
+						return Object.assign(new Error(error instanceof Error ? error.message : String(error)), {
+							failureCode,
+							...(episode ? { episode, agentId: episode.agentId, runId: episode.runId } : {}),
+						});
+					};
 					try { broker ??= await ensureComputerWorkerBroker(); }
 					catch (error) { throw stageError("gui_broker_start_failed", error); }
 					let issued: any;
@@ -6040,21 +6625,26 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 						let privateSkillPaths: string[];
 						try { privateSkillPaths = role === "verifier" ? privateComputerSkills(["desktop-verification"]) : privateComputerSkills(["cua-driver-operation", "desktop-investigation"]); }
 						catch (error) { throw stageError("gui_private_resource_failed", error); }
-						let text: string;
+						let child: Awaited<ReturnType<typeof runChild>>;
+						let failedEpisode: ComputerAgentEpisode | undefined;
 						const deadlineAt = Date.now() + COMPUTER_WORKER_STALL_TIMEOUT_MS;
-						try { text = await runComputerWorkerWithStallDeadline(() => runChild(agentName, objective, {
+						try { child = await runComputerWorkerWithStallDeadline(() => runChild(agentName, objective, {
 							...(role === "verifier"
 								? { fresh: true }
-								: { agentId: computerWorkerAgentId(taskId, "operator"), retainContext: true }),
+								: computerOperatorContextOptions(request, computerWorkerAgentId(taskId, "operator"))),
 							title: role === "verifier" ? "Verify Computer Task" : "Operate Computer Task",
 							computerWorker: { role, environment: issued.environment, extensionPath: COMPUTER_WORKER_EXTENSION, toolNames: toolNamesForComputerWorkerRole(role) },
 								privateSkillPaths,
 								deadlineAt,
-							}, workerController.signal), () => {
+							}, workerController.signal).catch((error) => {
+								failedEpisode = (error as { episode?: ComputerAgentEpisode })?.episode;
+								throw error;
+							}), () => {
 								computerWorkerFatalCodes.set(workerKey, "gui_child_stalled");
 								workerController.abort();
 							}, COMPUTER_WORKER_STALL_TIMEOUT_MS); } catch (error) {
-								const diagnostic = error as { agentId?: string; runId?: string; resolvedModel?: string; hadMessages?: boolean };
+							if (failedEpisode && !(error as { episode?: ComputerAgentEpisode })?.episode) Object.assign(error as object, { episode: failedEpisode });
+							const diagnostic = error as { agentId?: string; runId?: string; resolvedModel?: string; hadMessages?: boolean };
 								const failureCode = computerWorkerFatalCodes.get(workerKey) ?? (diagnostic.hadMessages ? "gui_child_failed" : "gui_child_prestart_failed");
 							if (diagnostic.agentId && diagnostic.runId) {
 								await postPipiuiReport({ kind: "start", agentId: diagnostic.agentId, runId: diagnostic.runId, parentId: taskId, toolCallId, name: agentName, task: "Computer Worker dispatch diagnostic", depth: PIPIUI_DEPTH + 2, model: diagnostic.resolvedModel ?? null, title: role === "verifier" ? "Verify Computer Task" : "Operate Computer Task" });
@@ -6067,9 +6657,10 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 						const hostOutcomeUnknown = runtimeObservation?.outcomeUnknown === true
 							&& runtimeError?.code === "mutation_outcome_unknown"
 							&& runtimeError?.requiresObservation === true;
-						const outcome = computerWorkerOutcomeFromOutput(text, hostOutcomeUnknown);
-						const attestedPostconditions = role === "verifier" ? computerVerifierAttestationsFromOutput(text, request.postconditions) : [];
-						return { workerResult: { outcome, summary: outcome === "outcome_unknown" ? "Computer Worker outcome unknown" : outcome === "failed" ? "Computer Worker failed" : "Computer Worker completed", observation: computerObservationFromRuntime(runtimeObservation), ...(attestedPostconditions.length ? { attestedPostconditions } : {}) }, hostExecutionRecords: broker.consumeExecutions(request.taskId, request.stepId).map((record) => ({ ...record, role: "gui-operator" as const })) };
+						const outcome = computerWorkerOutcomeFromOutput(child.text, hostOutcomeUnknown);
+						const attestedPostconditions = role === "verifier" ? computerVerifierAttestationsFromOutput(child.text, request.postconditions) : [];
+						const manualBlock = role === "gui-operator" ? computerWorkerManualBlockFromOutput(child.text) : undefined;
+						return { workerResult: { outcome, summary: outcome === "outcome_unknown" ? "Computer Worker outcome unknown" : outcome === "failed" ? "Computer Worker failed" : "Computer Worker completed", observation: computerObservationFromRuntime(runtimeObservation), ...(attestedPostconditions.length ? { attestedPostconditions } : {}), ...(manualBlock ?? {}) }, hostExecutionRecords: broker.consumeExecutions(request.taskId, request.stepId).map((record) => ({ ...record, role: "gui-operator" as const })), episode: child.episode };
 						} finally { computerWorkerFatalControllers.delete(workerKey); computerWorkerFatalCodes.delete(workerKey); broker.revokeStep(request.taskId, request.stepId); }
 				},
 			};
@@ -6117,17 +6708,18 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 					},
 				} });
 				const replay = await procedureRuntime.run({ intent: params.goal.trim(), bundleId: procedureContext.application.bundleId, parameters: procedureContext.parameters, taskId, runId: randomUUID(), qualifyCandidate: procedureContext.qualification === true }, taskSignal).catch(() => ({ outcome: "fallback_to_agent" as const }));
-				if (replay.outcome === "succeeded") { leaderCoordinating = false; await postTerminalPipiuiReport({ kind: "end", agentId: taskId, runId: coordinatorRunId, ok: true, output: "Computer Task completed" }); return { content: [{ type: "text", text: JSON.stringify({ outcome: "succeeded", summary: "Computer Task completed", verification: { status: "verified", conditionResults: [] }, planRevisions: 0 }) }], details: { outcome: "succeeded", summary: "Computer Task completed", verification: { status: "verified", conditionResults: [] }, planRevisions: 0 } }; }
+				if (replay.outcome === "succeeded") { await rootLifecycle.close({ ok: true, output: "Computer Task completed" }); const replayResult = { outcome: "succeeded" as const, summary: "Computer Task completed", verification: { status: "verified" as const, conditionResults: [] }, planRevisions: 0 }; const details = computerTaskDetails(replayResult, rootEpisode(replayResult), leaderEpisodes); return { content: [{ type: "text", text: computerTaskContent(details, undefined, latestPlan) }], details }; }
 				if (replay.outcome === "drift" && "procedureId" in replay) repairsProcedureId = replay.procedureId;
 			}
 			const coordinator = new ComputerAgentCoordinator({ planner, dispatcher, ...(procedureRuntime ? { procedureLearning: { recordVerifiedExecution: (input: any) => procedureRuntime!.recordCoordinatorExecution({ ...input, ...(repairsProcedureId ? { repairsProcedureId } : {}) }).then(() => undefined) } } : {}) });
 				const result = await coordinator.run({ goal: params.goal, taskId }, taskSignal);
-				leaderCoordinating = false;
 				if (result.outcome === "cancelled") {
-					await postTerminalPipiuiReport({ kind: "end", agentId: taskId, runId: coordinatorRunId, ok: false, aborted: true, output: "Computer Task cancelled" });
-					return { content: [{ type: "text", text: "Computer Task cancelled" }], details: result };
+					await rootLifecycle.close({ ok: false, aborted: true, output: "Computer Task cancelled" });
+					const details = computerTaskDetails(result, rootEpisode(result), leaderEpisodes);
+					return { content: [{ type: "text", text: computerTaskContent(details, undefined, latestPlan) }], details };
 				}
-				const leaderSummary = await runLeader([
+				await rootLifecycle.close({ ok: result.outcome === "succeeded", output: result.outcome === "succeeded" ? "Computer Task completed" : "Computer Task blocked" });
+				const finalized = await finalizeComputerTaskWithOptionalSummary(result, () => runLeader([
 					`Give the main agent the final result of this Computer Task. Goal: ${params.goal}`,
 					`Coordinator result: ${JSON.stringify(result)}`,
 					"Before concluding, reconcile investigation.workerAttempts with investigation.failedConditions. Preserve completed subordinate work, name the first missing evidence category, and never claim that nothing ran when the ledger shows completed attempts.",
@@ -6135,37 +6727,39 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 				].join("\n"), {
 					privateSkillPaths: privateComputerSkills(["computer-task-planning"]),
 					title: "Computer Use Leader",
-				});
-				return { content: [{ type: "text", text: leaderSummary }], details: { ...result, leaderSummary } };
+				}));
+				const details = computerTaskDetails(finalized.result, rootEpisode(finalized.result), leaderEpisodes, finalized.leaderSummary);
+				return { content: [{ type: "text", text: computerTaskContent(details, finalized.leaderSummary, latestPlan) }], details };
 			} catch (error) {
 				if (error instanceof ComputerPlanInvestigationError) {
-					leaderCoordinating = false;
-					await postTerminalPipiuiReport({ kind: "end", agentId: taskId, runId: coordinatorRunId, ok: false, output: `Computer Task plan admission blocked: ${error.diagnostic.code}` });
-					return computerPlanInvestigationReport(error);
+					await rootLifecycle.close({ ok: false, output: `Computer Task plan admission blocked: ${error.diagnostic.code}` });
+					const report = computerPlanInvestigationReport(error);
+					const details = computerTaskDetails(report.details as any, rootEpisode(report.details), leaderEpisodes);
+					return { ...report, content: [{ type: "text", text: computerTaskContent(details, undefined, latestPlan) }], details };
 				}
 				if ((error as { failureCode?: unknown })?.failureCode === "computer_leader_stalled") {
-					leaderCoordinating = false;
-					await postTerminalPipiuiReport({ kind: "end", agentId: taskId, runId: coordinatorRunId, ok: false, output: "Computer Task paused: computer_leader_stalled" });
+					await rootLifecycle.close({ ok: false, stalled: true, output: "Computer Task paused: computer_leader_stalled" });
 					const summary = "Computer Use Leader 长时间没有响应，当前规划调用已安全停止。主 Agent 应先调用 subagent_status 查看这个 Leader 及其下属的任务和结果，再根据证据使用同一个 Leader agentId 继续，或改走其他可行路线。";
-					return {
-						content: [{ type: "text", text: summary }],
-						details: {
-							outcome: "blocked" as const,
-							summary,
-							leaderAgentId: taskId,
-							investigation: {
-								stage: "leader_runtime",
-								code: "computer_leader_stalled",
-								nextAction: "Call subagent_status, inspect this Leader and its children, then retry with the same leaderAgentId when the evidence supports continuing.",
-							},
-							verification: { status: "unknown" as const, conditionResults: [] },
-							planRevisions: 0,
+					const stalledResult = {
+						outcome: "blocked" as const,
+						summary,
+						failureCode: "computer_leader_stalled" as const,
+						leaderAgentId: taskId,
+						investigation: {
+							stage: "leader_runtime",
+							code: "computer_leader_stalled",
+							nextAction: "Call subagent_status, inspect this Leader and its children, then retry with the same leaderAgentId when the evidence supports continuing.",
 						},
+						verification: { status: "unknown" as const, conditionResults: [] },
+						planRevisions: 0,
 					};
+					const details = computerTaskDetails(stalledResult as any, rootEpisode(stalledResult), leaderEpisodes);
+					return { content: [{ type: "text", text: computerTaskContent(details, undefined, latestPlan) }], details };
 				}
-				if (leaderCoordinating) await postTerminalPipiuiReport({ kind: "end", agentId: taskId, runId: coordinatorRunId, ok: false, ...(taskSignal.aborted ? { aborted: true } : {}), output: taskSignal.aborted ? "Computer Task cancelled" : "Computer Task failed" });
+				await rootLifecycle.close({ ok: false, ...(taskSignal.aborted ? { aborted: true } : {}), output: taskSignal.aborted ? "Computer Task cancelled" : "Computer Task failed" });
 				throw error;
 			} finally {
+				await rootLifecycle.close({ ok: false, ...(taskSignal.aborted ? { aborted: true } : {}), output: taskSignal.aborted ? "Computer Task cancelled" : "Computer Task failed" });
 				broker?.revokeTask(taskId);
 				terminalBroker?.revokeTask(taskId);
 				await terminalBroker?.stop().catch(() => {});
@@ -6199,6 +6793,11 @@ export default function (pi: ExtensionAPI) {
 	// Bind the queue's boss channel: a held task nobody is told about is the forgetting this
 	// queue exists to end.
 	dispatchQueueNotify = (text) => {
+		void trySendUserMessage(pi, text);
+	};
+	// Runtime-budget escalations ([subagent-timeout]) ride the same boss channel so a
+	// stalled worker's budget decision reaches the boss mid-turn instead of killing silently.
+	runtimeBudgetNotify = (text) => {
 		void trySendUserMessage(pi, text);
 	};
 	// Same channel carries worktree merge-recovery escalations; then rebuild the persisted loop
@@ -6241,9 +6840,11 @@ export default function (pi: ExtensionAPI) {
 		retryPendingDoneAfterSessionSettled(pi);
 	});
 	pi.on("agent_settled", (_event, ctx) => {
+		bossTurnBusy = false;
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
 		reconcilePersistedDone(piSessionId, ctx.sessionManager.getBranch());
 		retryPendingDoneAfterSessionSettled(pi);
+		flushHeldRuntimeSignals(pi);
 	});
 	registerSessionRecallTool(pi);
 	// UI-independent definition management. It only reads/scaffolds/installs
@@ -6251,8 +6852,17 @@ export default function (pi: ExtensionAPI) {
 	registerSubagentManagementTool(pi);
 	// Cut-in hold 提前释放：真实用户消息（本地/远程，非扩展自己的 followUp）已进入
 	// turn，说明 cut-in prompt 抢到了先手，暂缓的自动信号可以按原逻辑继续投递。
+	// 同一条真实消息也解除 host-stop 静默：用户的下一条输入是会话重新活动的唯一开关。
 	pi.on("input", (event) => {
-		if (event.source !== "extension") releaseCutInHold();
+		if (event.source !== "extension") {
+			releaseCutInHold();
+			const text = typeof (event as { text?: unknown }).text === "string"
+				? (event as { text: string }).text.trim()
+				: "";
+			// Any input except runtime-owned /subagent_* control commands (stop sweep,
+			// panel abort/resolve/recover) is the user acting again — release the gate.
+			if (!text.startsWith("/subagent_")) releaseHostStopQuiet(pi);
+		}
 	});
 	if (PIPIUI_SUBAGENT_SKILL_ISOLATION) {
 		// Pi still accepts extension-contributed skillPaths under --no-skills. Remove the
@@ -6345,6 +6955,7 @@ export default function (pi: ExtensionAPI) {
 	// prompt tells Boss exactly which agent chain / settings / allowed levels it can select before
 	// a dispatch, while workers stay free of parent orchestration context.
 	pi.on("before_agent_start", (event) => {
+		bossTurnBusy = true;
 		const routing = formatSubagentModelRoutingBlock();
 		const inflight = formatInFlightWorkersBlock(Date.now());
 		const blocks = [routing, inflight].filter((block): block is string => Boolean(block));
@@ -6453,7 +7064,7 @@ export default function (pi: ExtensionAPI) {
 				// be followed here, next to the thing it is about.
 				[
 					`[subagent-stalled] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine}`,
-					`Query it first with subagent_status({agentId:"${agentId}"}), then choose exactly one: keep waiting (say why) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent still reports [subagent-done], and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
+					`Query it first with subagent_status({agentId:"${agentId}"}), then choose exactly one: keep waiting (say why) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent does not push a [subagent-done] follow-up — confirm its terminal state via subagent_status — and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
 					`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${agentId}"}). If it is still running, close it with subagent_abort({agentId}) (or /subagent_abort) so this recurring message stops; if it is terminal (failed/aborted/interrupted), resolve it with subagent_resolve({agentId, runId}) (or /subagent_resolve). A text-only reply does not stop this message.`,
 				].join("\n"),
 			);
@@ -6550,6 +7161,25 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// Host-stop sweep. The backend stop button sends this after aborting the model turn:
+	// stop must stop the whole session, not only the turn. It also arms the host-stop
+	// quiet gate so no held receipt/reminder can wake the stopped session afterwards;
+	// the next real user message releases the gate.
+	pi.registerCommand("subagent_abort_all", {
+		description: "Abort all running/queued background subagents and quiet this session until the next user message: /subagent_abort_all (PipiUI)",
+		handler: async (_args, ctx) => {
+			hostStopQuiet = true;
+			heldRuntimeSignals.length = 0;
+			const { aborted } = abortAllRunningAgents();
+			ctx.ui.notify(
+				aborted.length
+					? `Stop sweep: aborted ${aborted.length} background agent(s) (${aborted.join(", ")}). Receipts are held until your next message.`
+					: "Stop sweep: no background agents were running. Session is quiet until your next message.",
+				"info",
+			);
+		},
+	});
+
 	pi.registerCommand("subagent_resolve", {
 		description: "Mark one failed/aborted/interrupted subagent episode handled: /subagent_resolve <agentId> <runId> [reason] (PipiUI)",
 		handler: async (args, ctx) => {
@@ -6618,15 +7248,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	const subagentParameters = SubagentParams;
-	const parallelSubagentParameters = ParallelSubagentParams;
 	const subagentTool = {
 		name: "subagent",
 		label: "Subagent",
 		description: [
-			"Dispatch one worker. Required: agent, task. Optional: title, agentId, thinking, blockedBy.",
-			"For two or more independent tasks use subagent_parallel. For ordered steps use subagent_chain.",
-			"To stop a running job use subagent_abort. To close a failed episode use subagent_resolve.",
-			"Inspect jobs with subagent_status before re-dispatching the same work.",
+			"Dispatch one worker. Required: prompt (the full brief) and description (3-5 word label). Optional: subagent_type (default general-purpose), isolation (worktree|none), cwd, resume_from, run_in_background.",
+			"Independent workers: call this tool multiple times in the same response. Do not serialize them across turns.",
+			"Ordered steps use subagent_chain. Stop a job with subagent_abort. Close a failed episode with subagent_resolve. Inspect with subagent_status before re-dispatching.",
 		].join(" "),
 		parameters: subagentParameters,
 		// pi validates arguments before execute() runs; models that emit
@@ -6636,14 +7264,14 @@ export default function (pi: ExtensionAPI) {
 		prepareArguments: bindSanitizeStrictToolArguments(subagentParameters),
 
 		async execute(_toolCallId, params: SubagentExecuteParams, signal, onUpdate, ctx) {
-			params = omitNulls(params);
+			params = adoptGrokBuildDispatch(omitNulls(params));
 			const toolCallId = _toolCallId;
 			// One invocation is one wave, however many tasks it carries — that is the unit the
 			// fan-out layer plans in, so it is the unit the ledger's rows are grouped by.
 			beginWave();
-			const sessionModel = formatCtxModel(
-				(ctx as { model?: { provider?: string; id?: string } } | undefined)?.model,
-			);
+			const ctxModel = (ctx as { model?: { provider?: string; id?: string; contextWindow?: number } } | undefined)?.model;
+			const sessionModel = formatCtxModel(ctxModel);
+			const contextWindow = ctxContextWindow(ctxModel);
 			// 多层深度护栏：达到上限的进程不允许继续派 subagent
 			if (PIPIUI_DEPTH >= PIPIUI_MAX_DEPTH) {
 				return {
@@ -6659,6 +7287,7 @@ export default function (pi: ExtensionAPI) {
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
+			params = remapUnknownSubagentType(params, new Set(agents.map((agent) => agent.name)));
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
@@ -6765,7 +7394,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ toolCallId, background: true, agentId, title, sessionModel, verify, thinking, fresh, desktop, blockedBy, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs },
+					{ toolCallId, background: true, agentId, title, sessionModel, contextWindow, verify, thinking, fresh, desktop, blockedBy, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs },
 				)
 					.then((result) => {
 						notifySubagentDone(pi, result);
@@ -7050,7 +7679,7 @@ export default function (pi: ExtensionAPI) {
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					const taskWithContext = (step.task ?? step.prompt ?? "").replace(/\{previous\}/g, previousOutput);
 
 					// Create update callback that includes all previous results
 					const chainUpdate: OnUpdateCallback | undefined = onUpdate
@@ -7082,6 +7711,7 @@ export default function (pi: ExtensionAPI) {
 							toolCallId,
 							title: step.title,
 							sessionModel,
+							contextWindow,
 							verify: step.verify,
 							thinking: step.thinking,
 							agentId: step.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
@@ -7198,7 +7828,7 @@ export default function (pi: ExtensionAPI) {
 								undefined, // no parent abort binding
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ toolCallId, background: true, agentId, title: t.title, sessionModel, verify: t.verify, thinking: t.thinking, fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy },
+								{ toolCallId, background: true, agentId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy },
 							);
 							notifySubagentDone(pi, result);
 						} catch (err) {
@@ -7298,6 +7928,7 @@ export default function (pi: ExtensionAPI) {
 							toolCallId,
 							title: t.title,
 							sessionModel,
+							contextWindow,
 							verify: t.verify,
 							thinking: t.thinking,
 							agentId: t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
@@ -7399,6 +8030,7 @@ export default function (pi: ExtensionAPI) {
 						toolCallId,
 						title: params.title,
 						sessionModel,
+						contextWindow,
 						verify: params.verify,
 						thinking: params.thinking,
 						agentId: params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
@@ -7476,15 +8108,15 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("accent", `chain (${args.chain.length} steps)`) +
 					theme.fg("muted", ` [${scope}]`);
 				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
-					const step = args.chain[i];
-					// Clean up {previous} placeholder for display
-					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
+					const step = args.chain[i] as Record<string, unknown>;
+					// Clean up {previous} placeholder for display; accept both name families.
+					const cleanTask = String((step.prompt ?? step.task) || "").replace(/\{previous\}/g, "").trim();
 					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
 					text +=
 						"\n  " +
 						theme.fg("muted", `${i + 1}.`) +
 						" " +
-						theme.fg("accent", step.agent) +
+						theme.fg("accent", String(step.subagent_type ?? step.agent ?? "general-purpose")) +
 						theme.fg("dim", ` ${preview}`);
 				}
 				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
@@ -7799,16 +8431,18 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_chain",
 		label: "Subagent Chain",
-		description: "Run ordered worker steps. Required: chain[{agent, task}]. Each step may use {previous} for the prior output.",
+		description: "Run ordered worker steps. Each chain item needs prompt (the full brief) and description (3-5 word label). A step may reference the prior step's output as {previous}.",
 		promptSnippet: "Run ordered subagent steps in sequence; a step references the prior step's output as {previous}.",
 		promptGuidelines: [
-			"Use subagent_chain only for genuinely ordered steps; independent tasks belong in subagent_parallel.",
+			"Use subagent_chain only for genuinely ordered steps; independent tasks belong in multiple subagent calls in one response.",
 			"Chain steps run synchronously in order; do not use a chain to serialize work that is actually independent.",
 		],
 		parameters: SubagentChainParams,
 		prepareArguments: bindSanitizeStrictToolArguments(SubagentChainParams),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return subagentTool.execute(toolCallId, omitNulls(params) as SubagentExecuteParams, signal, onUpdate, ctx);
+			// Public chain items carry prompt/description; the shared execute re-runs
+			// adoptGrokBuildDispatch and reads the internal old names it fills.
+			return subagentTool.execute(toolCallId, omitNulls(params) as unknown as SubagentExecuteParams, signal, onUpdate, ctx);
 		},
 		renderCall(args, theme) {
 			const steps = args.chain ?? [];
@@ -7816,14 +8450,15 @@ export default function (pi: ExtensionAPI) {
 				theme.fg("toolTitle", theme.bold("subagent_chain ")) +
 				theme.fg("accent", `${steps.length} steps`);
 			for (let i = 0; i < Math.min(steps.length, 3); i++) {
-				const step = steps[i];
-				const cleanTask = String(step.task ?? "").replace(/\{previous\}/g, "").trim();
+				const step = steps[i] as Record<string, unknown>;
+				// Raw args may carry either spelling: new prompt/description or replayed old task/agent.
+				const cleanTask = String(step.prompt ?? step.task ?? "").replace(/\{previous\}/g, "").trim();
 				const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
 				text +=
 					"\n  " +
 					theme.fg("muted", `${i + 1}.`) +
 					" " +
-					theme.fg("accent", step.agent) +
+					theme.fg("accent", String(step.subagent_type ?? step.agent ?? "general-purpose")) +
 					theme.fg("dim", ` ${preview}`);
 			}
 			if (steps.length > 3) text += `\n  ${theme.fg("muted", `... +${steps.length - 3} more`)}`;
@@ -7876,34 +8511,6 @@ export default function (pi: ExtensionAPI) {
 				0,
 				0,
 			);
-		},
-	});
-	pi.registerTool({
-		name: "subagent_parallel",
-		label: "Subagent Parallel",
-		promptSnippet: "Dispatch two or more independent subagent tasks together; each item requires task and agent.",
-		promptGuidelines: [
-			"Use subagent_parallel for every independent fan-out; never send tasks[] to subagent.",
-			"Every item must include a complete non-empty task before its agent name.",
-		],
-		description:
-			"Dispatch two or more independent workers in one wave. Required: tasks[{task, agent}]. Use subagent for one worker, subagent_chain for ordered steps.",
-		parameters: parallelSubagentParameters,
-		prepareArguments: bindSanitizeStrictToolArguments(parallelSubagentParameters),
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			params = omitNulls(params);
-			const reserved = new Set<string>();
-			const delegated = {
-				tasks: params.tasks.map((task) => ({
-					task: task.task,
-					agent: task.agent,
-					// This wrapper exposes no agentScope, so shared execute stays in user scope and
-					// reaches its synchronous atomic selector without an intervening await. Pre-reserving
-					// here would make that selector reject its own freshly generated candidate.
-					agentId: generatePipiuiAgentId(reserved, { reserveGlobally: false }),
-				})),
-			};
-			return subagentTool.execute(toolCallId, delegated, signal, onUpdate, ctx);
 		},
 	});
 }

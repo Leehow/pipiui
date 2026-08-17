@@ -75,6 +75,8 @@ type SessionState = {
   items: QueuedMessage[];
   /** A turn is running (marked by the host or started by a successful delivery). */
   turnActive: boolean;
+  /** Monotonic id for the current turn. Stale `notifyIdle` calls must not clear a newer one. */
+  turnEpoch: number;
   /** A queue-owned dispatch (drain send or steer) is in flight — single-flight guard. */
   dispatching: boolean;
   /** Current dispatch acknowledgement; exposed for legacy direct-send compatibility. */
@@ -103,7 +105,7 @@ export class SessionMessageQueue {
   private state(sessionId: string): SessionState {
     let session = this.sessions.get(sessionId);
     if (!session) {
-      session = { items: [], turnActive: false, dispatching: false }; 
+      session = { items: [], turnActive: false, turnEpoch: 0, dispatching: false }; 
       this.sessions.set(sessionId, session);
     }
     return session;
@@ -171,6 +173,7 @@ export class SessionMessageQueue {
       error: item.state === "failed" ? item.error : undefined,
     }));
     session.turnActive = false;
+    session.turnEpoch = 0;
     session.dispatching = false;
     session.dispatchPromise = undefined;
     this.changed(sessionId);
@@ -278,18 +281,23 @@ export class SessionMessageQueue {
   }
 
   /** A turn started outside the queue (host-dispatched prompt, pi agent_start). */
-  markBusy(sessionId: string): void {
-    this.state(sessionId).turnActive = true;
+  markBusy(sessionId: string): number {
+    const session = this.state(sessionId);
+    session.turnActive = true;
+    session.turnEpoch += 1;
+    return session.turnEpoch;
   }
 
   /**
    * The session turned idle/settled. Clears the busy flag and delivers the next
    * queued item. Idempotent for duplicate idle/completion events: while a
    * delivery is in flight, or while the session is still marked busy, the drain
-   * is a no-op.
+   * is a no-op. A stale settle (`epoch` older than the current turn) is ignored
+   * so a follow-up `agent_start` cannot be cleared by the previous turn's idle.
    */
-  async notifyIdle(sessionId: string): Promise<void> {
+  async notifyIdle(sessionId: string, epoch?: number): Promise<void> {
     const session = this.state(sessionId);
+    if (epoch !== undefined && epoch !== session.turnEpoch) return;
     session.turnActive = false;
     await this.drain(sessionId);
   }

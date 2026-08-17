@@ -85,6 +85,10 @@
     },
     "mac": {
       "icon": "build/icon.icns",
+      "extendInfo": {
+        "CFBundleDisplayName": "PipiUI",
+        "CFBundleName": "PipiUI Electron"
+      },
       "target": [
         "dmg",
         "zip"

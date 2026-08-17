@@ -46,7 +46,7 @@ const HOST_METHODS = new Set<HostMethod>([
   "setThinkingLevel", "getHiddenModelIds", "setHiddenModelIds", "getSidebarSessionPreferences", "setSidebarSessionPreferences", "authProviders", "beginProviderLogin", "continueProviderLogin", "cancelProviderLogin", "removeProviderCredentials", "getSessionStats", "getQuotaSnapshot", "listAgents", "abortAgent", "resolveAgent",
   "checkAgent", "getWorktreeStatus", "mergeWorktree", "discardWorktree",
   "getVisionModel", "setVisionModel", "getMemoryReviewModel", "setMemoryReviewModel",
-  "capabilities", "gitStatus", "gitCheckout", "probeDirectoryGit", "gitInitDirectory", "revealProject", "terminalOpen", "terminalWrite",
+  "capabilities", "gitStatus", "gitCheckout", "probeDirectoryGit", "gitInitDirectory", "probeGitBinary", "revealProject", "terminalOpen", "terminalWrite",
   "terminalClear", "terminalClose", "browserListTabs", "browserGetActiveTab",
   "browserNewTab", "browserSwitchTab", "browserCloseTab", "browserLoadURL",
   "browserGoBack", "browserGoForward", "browserReload", "browserSnapshot",

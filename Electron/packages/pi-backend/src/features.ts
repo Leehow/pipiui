@@ -14,8 +14,8 @@ import type { SpawnFeatures } from "./spawn-assembly.js";
  *   Firecrawl → the rest of the auto chain. TUN/fake-IP proxies get
  *   `ssrf.allowRanges: ["198.18.0.0/15"]` so `mcp.exa.ai` is reachable.
  * - `computerUse` is exported only when Electron supplies a usable desktop harness.
- * - `plan`: philosophy remains available, but the Plan runtime stays off until Electron owns a
- *   revisioned store and bridge acknowledgement.
+ * - `plan`: mounts `plan_publish` / `plan_task_update` / `plan_approve` / `plan_cancel`.
+ *   State lives under `.pi/plans/`; the host may still drop the bridge event until a Plans panel exists.
  * - `searchScope`: it is a *gate* — searches outside the project need a host-granted path. Electron
  *   has no grant UI, so mounting it could only ever block the agent, never approve it.
  *
@@ -25,4 +25,4 @@ import type { SpawnFeatures } from "./spawn-assembly.js";
  *
  * Everything else is verified to load: pi boots with all 13 mounts and a clean stderr.
  */
-export const DEFAULT_FEATURES:SpawnFeatures=Object.freeze({philosophy:true,plan:false,subagent:true,memoryBroker:true,git:true,generateImage:true,reload:true,webSearch:true,browserSearch:true,arxivFetch:true,mcp:true,skillLoader:true,searchScope:false,codexServerTools:true,claudeServerTools:true,openaiServerTools:true,geminiServerTools:true,xaiServerTools:true,glmSearchMcp:true,glmVisionMcp:true,browser:true,terminal:true,computerUse:true,bossReadOnly:true});
+export const DEFAULT_FEATURES:SpawnFeatures=Object.freeze({philosophy:true,plan:true,subagent:true,memoryBroker:true,git:true,generateImage:true,reload:true,webSearch:true,browserSearch:true,arxivFetch:true,mcp:true,skillLoader:true,searchScope:false,codexServerTools:true,claudeServerTools:true,openaiServerTools:true,geminiServerTools:true,xaiServerTools:true,glmSearchMcp:true,glmVisionMcp:true,browser:true,terminal:true,computerUse:true,bossReadOnly:true});

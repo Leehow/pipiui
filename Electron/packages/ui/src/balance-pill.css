@@ -8,8 +8,8 @@
  */
 
 .balance-pill {
-  --bp-text: #6b6b73;
-  --bp-bg: rgba(0, 0, 0, 0.06);
+  --bp-text: #5a5a63;
+  --bp-bg: #ececf0;
 
   display: inline-flex;
   align-items: center;
@@ -25,7 +25,15 @@
   white-space: nowrap;
 }
 
+.balance-pill:hover {
+  --bp-bg: #e0e0e6;
+}
+
 [data-theme='dark'] .balance-pill {
-  --bp-text: #9da2ad;
-  --bp-bg: rgba(255, 255, 255, 0.08);
+  --bp-text: #c6cbd6;
+  --bp-bg: #2a2a2e;
+}
+
+[data-theme='dark'] .balance-pill:hover {
+  --bp-bg: #34343a;
 }

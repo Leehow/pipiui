@@ -1,5 +1,6 @@
-import { app, BaseWindow, BrowserWindow, desktopCapturer, dialog, ipcMain, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions } from 'electron'
+import { app, BaseWindow, desktopCapturer, dialog, ipcMain, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions } from 'electron'
 import { join } from 'node:path'
+import { appendFileSync, writeFileSync } from 'node:fs'
 import { createPiHostBackend, installRuntimeTree, QuotaStore } from '@pipi/pi-backend'
 import {
   PIPI_HOST_IPC_CHANNEL,
@@ -10,12 +11,12 @@ import {
   type HostResponse,
   type HostWireFrame
 } from '@pipi/host-api'
-import { BrowserSessionHost, routeBrowserView, withBrowserTabsHost } from './browser-host.js'
+import { BrowserSessionHost, installBrowserNativeTrace, mountBrowserShellView, routeBrowserView, withBrowserTabsHost } from './browser-host.js'
 import { installOwnedRuntimeShutdown } from './app-lifecycle.js'
 import { CUA_DRIVER_VERSION, CuaDriverHost } from './cua-driver-host.js'
-import { importLegacyPiProfile, installBundledModelCapabilityOverrides, resolveElectronPiProfile } from './pi-profile.js'
+import { importLegacyPiProfile, installBundledModelCapabilityOverrides, resolveElectronPiProfile, resolveStableElectronUserDataPath } from './pi-profile.js'
 import { withProjectDirectoryPicker } from './project-directory-picker.js'
-import { createQuotaCookieReader, createQuotaCookiePersister } from './quota-capabilities.js'
+import { createQuotaCookieReader, createQuotaCookiePersister, readCursorAccessToken } from './quota-capabilities.js'
 import { EMBEDDED_NODE_VERSION, resolveRuntimeAssets, UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS } from './runtime-assets.js'
 import { createUpdateCenterService, UPDATE_CENTER_FRAMEWORK_VERSIONS, withUpdateCenter, type UpdateCatalogItem } from './update-center.js'
 import { withOpenDocumentExternally } from './external-document.js'
@@ -62,13 +63,16 @@ export function registerPipiHostIpc(
 }
 
 function createWindow(browser: BrowserSessionHost, onClosed: () => void): void {
-  const window = new BrowserWindow({
+  const window = new BaseWindow({
     width: 1280,
     height: 800,
+    title: 'PipiUI',
     // Like VS Code/Notion on macOS: no system title strip, only the traffic
     // lights remain. The renderer reserves a draggable strip via
     // env(titlebar-area-*). Keep the default framed titlebar elsewhere.
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default'
+  })
+  const shellView = new WebContentsView({
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -76,44 +80,51 @@ function createWindow(browser: BrowserSessionHost, onClosed: () => void): void {
       sandbox: true
     }
   })
-
-  // Tool-only browsing needs a real native host to retain a Chromium surface.
-  // Reparent the same physical view into the main window when Browser opens.
-  const hiddenBrowserHost = new BaseWindow({
-    show: false,
-    x: -10000,
-    y: -10000,
-    width: 1280,
-    height: 800,
-    frame: false,
-    focusable: false,
-    hasShadow: false,
-    opacity: 0,
-    skipTaskbar: true
-  })
+  const unmountShellView = mountBrowserShellView(window as any, shellView as any)
   browser.attachToWindow((rawView, visible) => {
-    routeBrowserView(rawView, visible, window as any, hiddenBrowserHost as any)
+    routeBrowserView(rawView, visible, window as any)
   })
   window.on('closed', () => {
     onClosed()
     browser.detachWindow()
-    hiddenBrowserHost.destroy()
+    unmountShellView()
+    if (!shellView.webContents.isDestroyed()) shellView.webContents.close()
   })
 
   if (process.env.ELECTRON_RENDERER_URL) {
-    window.loadURL(process.env.ELECTRON_RENDERER_URL)
+    void shellView.webContents.loadURL(process.env.ELECTRON_RENDERER_URL)
   } else {
-    window.loadFile(join(__dirname, '../renderer/index.html'))
+    void shellView.webContents.loadFile(join(__dirname, '../renderer/index.html'))
   }
 }
 
 // Electron's package exports no runtime app object under Vitest; keep IPC registration importable.
 if (app) {
+  // productName stays "PipiUI Electron" so the artifact folder does not collide
+  // with the frozen Swift app. Override the process name so Dock / About / menus
+  // show PipiUI. setName also changes the default userData folder, so pin it
+  // back to the historical Electron profile immediately.
+  app.setName('PipiUI')
+  app.setPath('userData', resolveStableElectronUserDataPath(app.getPath('appData')))
   app.whenReady().then(async () => {
+    const browserDebugPath = process.env.PIPIUI_BROWSER_NATIVE_DEBUG
+    let browserDebugCaptureSequence = 0
+    if (browserDebugPath) {
+      writeFileSync(browserDebugPath, '')
+      installBrowserNativeTrace(entry => appendFileSync(browserDebugPath, `${JSON.stringify(entry)}\n`))
+    }
     // One BrowserTabsHost owns exactly one WebContentsView at a time. Its
     // `partition` constructor slot is reserved for future BrowserContext Spaces.
     const browser = new BrowserSessionHost(options => {
       const view = new WebContentsView(options)
+      if (browserDebugPath) view.setBackgroundColor('#ff00ff')
+      if (browserDebugPath) {
+        view.webContents.on('did-stop-loading', () => {
+          void view.webContents.capturePage(undefined, { stayHidden: true }).then(image => {
+            writeFileSync(`${browserDebugPath}.capture-${++browserDebugCaptureSequence}.png`, image.toPNG())
+          }).catch(error => appendFileSync(browserDebugPath, `${JSON.stringify({ timestamp: Date.now(), stage: 'capture:error', error: String(error) })}\n`))
+        })
+      }
       // The default UA advertises "PipiUI Electron/… Electron/…" tokens; some sites
       // (e.g. DuckDuckGo's HTML search endpoint) answer such framework UAs with
       // bot-challenge pages instead of content. Keep the standard Chrome tokens only.
@@ -164,7 +175,7 @@ if (app) {
     const terminalHost = new TerminalSessionHost()
     // Browser-cookie quota providers (Qwen Token Plan) read their session cookies
     // from the built-in browser partitions; everything else keeps file defaults.
-    const quotaStore = new QuotaStore(process.env, { agentDir: piProfile.agentDir, readCookie: createQuotaCookieReader(userData), persistCookie: createQuotaCookiePersister(userData) })
+    const quotaStore = new QuotaStore(process.env, { agentDir: piProfile.agentDir, readCookie: createQuotaCookieReader(userData), persistCookie: createQuotaCookiePersister(userData), readCursorAuth: readCursorAccessToken })
     const piBackend = createPiHostBackend({
       piCommand: assets.piCommand,
       managedNodeModulesRoot: assets.managedNodeModulesRoot,
@@ -192,7 +203,7 @@ if (app) {
     const terminalBackend = terminalHost.wrapBackend(piBackend)
     const pickProjectDirectory = async (): Promise<string | null> => {
       const options: OpenDialogOptions = { title: '选择项目文件夹', buttonLabel: '选择', properties: ['openDirectory', 'createDirectory'] }
-      const owner = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
+      const owner = BaseWindow.getFocusedWindow() ?? BaseWindow.getAllWindows()[0]
       const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options)
       return result.canceled ? null : result.filePaths[0] ?? null
     }
@@ -232,7 +243,7 @@ if (app) {
     )
     installOwnedRuntimeShutdown(app, terminalHost, computer, piBackend)
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow(browser, () => terminalHost.closeAll())
+      if (BaseWindow.getAllWindows().length === 0) createWindow(browser, () => terminalHost.closeAll())
     })
   })
 

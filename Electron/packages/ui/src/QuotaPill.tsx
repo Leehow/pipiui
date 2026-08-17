@@ -31,6 +31,27 @@ export function visibleQuotaWindows(snapshot: QuotaSnapshot): QuotaWindow[] {
   )
 }
 
+/**
+ * True when a host snapshot belongs to the composer's current model provider.
+ * Needed because the UI updates the chip immediately while `getQuotaSnapshot`
+ * still reads the session's pre-switch model until `setModel` lands.
+ */
+export function quotaSnapshotMatchesProvider(snapshot: QuotaSnapshot, modelProvider?: string): boolean {
+  if (!modelProvider) return true
+  const model = modelProvider.toLowerCase()
+  if (model.includes('relay')) return false
+  const kind = snapshot.provider.toLowerCase()
+  if (kind === 'qwentokenplan') return model.includes('qwen-token-plan')
+  if (kind === 'opencodengo') return model.includes('opencode-go')
+  if (kind === 'codex') return model.includes('openai') || model.includes('codex')
+  if (kind === 'cursor') return model.includes('cursor')
+  if (kind === 'claude') return model.includes('anthropic') || model.includes('claude')
+  if (kind === 'glm') return ['zai', 'zhipu', 'bigmodel', 'glm'].some(token => model.includes(token))
+  if (kind === 'grok') return model === 'xai' || model.includes('grok')
+  if (kind === 'moonshot') return model.includes('moonshot')
+  return model.includes(kind)
+}
+
 /** Per-provider localStorage key, mirroring Swift `LayoutPersistence.quotaWindowKey`. */
 function quotaWindowKey(provider: string): string {
   return `pipiui.quotaWindow.${provider}`
@@ -51,6 +72,11 @@ function persistWindowId(provider: string, id: string): void {
   } catch {
     // Quota is best-effort; storage unavailability never errors the UI.
   }
+}
+
+/** Theme tokens live on `.pipiui-shell`. Body has none, so a body portal paints transparent. */
+export function quotaMenuPortalRoot(): Element {
+  return document.querySelector('.pipiui-shell') ?? document.body
 }
 
 /**
@@ -82,6 +108,17 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
   const [open, setOpen] = useState(false)
   const pillRef = useRef<HTMLButtonElement>(null)
   const [menuStyle, setMenuStyle] = useState<CSSProperties | undefined>()
+  const scopeRef = useRef({ sessionId, provider })
+  // Same render-time reset as Composer drafts: a session / model switch must
+  // not paint the previous provider's capsule, popover, or in-session pick.
+  // refreshKey / poll ticks still reuse the last good snapshot.
+  if (scopeRef.current.sessionId !== sessionId || scopeRef.current.provider !== provider) {
+    scopeRef.current = { sessionId, provider }
+    setSnapshot(null)
+    setLoaded(false)
+    setSelectedId(null)
+    setOpen(false)
+  }
 
   useEffect(() => {
     if (typeof host.getQuotaSnapshot !== 'function') return
@@ -91,6 +128,9 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
       try {
         const snap = await host.getQuotaSnapshot!(sessionId)
         if (cancelled) return
+        // A snapshot for the previous model is not "last good" — drop it and
+        // wait for the post-setModel refetch instead of painting the wrong pill.
+        if (snap && !quotaSnapshotMatchesProvider(snap, provider)) return
         setSnapshot(snap)
       } catch {
         // Quota is best-effort: keep the last good snapshot, never error UI.
@@ -122,7 +162,8 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
     return () => window.removeEventListener('resize', update)
   }, [open])
 
-  const showLogin = loaded && !snapshot && Boolean(onOpenBrowserLogin) && Boolean(provider?.includes('qwen-token-plan'))
+  const activeSnapshot = snapshot && quotaSnapshotMatchesProvider(snapshot, provider) ? snapshot : null
+  const showLogin = loaded && !activeSnapshot && Boolean(onOpenBrowserLogin) && Boolean(provider?.includes('qwen-token-plan'))
 
   useEffect(() => {
     // While the login capsule is up, the user may complete the bailian login in
@@ -133,7 +174,7 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
     return () => window.clearInterval(timer)
   }, [showLogin])
 
-  if (!snapshot || visibleQuotaWindows(snapshot).length === 0) {
+  if (!activeSnapshot || visibleQuotaWindows(activeSnapshot).length === 0) {
     // Swift parity (InputBar): a Token Plan session without quota data is not
     // logged in — offer a capsule that opens the embedded browser login page.
     // Wait for the fetch so a slow load never flashes the login entry.
@@ -150,8 +191,8 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
       </button>
     )
   }
-  const windows = visibleQuotaWindows(snapshot)
-  const providerName = snapshot.provider
+  const windows = visibleQuotaWindows(activeSnapshot)
+  const providerName = activeSnapshot.provider
 
   // In-session pick wins over the persisted one (which wins over highest-usage).
   const effectiveSelectedId = selectedId ?? persistedWindowId(providerName)
@@ -185,8 +226,8 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
         <>
           <div className="quick-menu-backdrop" data-testid="quota-menu-backdrop" onMouseDown={() => setOpen(false)} />
           <div className="quick-menu quota-menu" role="menu" aria-label="额度窗口" data-testid="quota-menu" style={menuStyle}>
-            {snapshot.accountLabel && snapshot.accountLabel.trim().length > 0 && (
-              <div className="quick-menu-provider">{snapshot.accountLabel}</div>
+            {activeSnapshot.accountLabel && activeSnapshot.accountLabel.trim().length > 0 && (
+              <div className="quick-menu-provider">{activeSnapshot.accountLabel}</div>
             )}
             {windows.map(window => {
               const current = window.id === currentId
@@ -208,7 +249,7 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
             })}
           </div>
         </>,
-        document.body
+        quotaMenuPortalRoot()
       )}
     </div>
   )

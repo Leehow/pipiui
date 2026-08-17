@@ -9,7 +9,7 @@ function hostUpdateError(method: string): HostProviderContractError {
   return new HostProviderContractError(`主进程尚未更新或返回了无效响应（${method}）；请手动退出并重新打开 PipiUI，然后重试。`)
 }
 
-function hostMethod(host: PipiHostAPI, name: 'authProviders' | 'beginProviderLogin' | 'continueProviderLogin' | 'cancelProviderLogin'): (...args: unknown[]) => Promise<unknown> {
+function hostMethod(host: PipiHostAPI, name: 'authProviders' | 'beginProviderLogin' | 'continueProviderLogin' | 'cancelProviderLogin' | 'addOpenAICompatibleProvider'): (...args: unknown[]) => Promise<unknown> {
   const method = (host as unknown as Record<string, unknown>)[name]
   if (typeof method !== 'function') throw hostUpdateError(name)
   return method.bind(host) as (...args: unknown[]) => Promise<unknown>
@@ -58,6 +58,12 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
   const [providersLoading, setProvidersLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [session, setSession] = useState<LoginSessionState | null>(null)
+  const [compatName, setCompatName] = useState('')
+  const [compatUrl, setCompatUrl] = useState('')
+  const [compatKey, setCompatKey] = useState('')
+  const [compatModelId, setCompatModelId] = useState('')
+  const [compatBusy, setCompatBusy] = useState(false)
+  const [compatError, setCompatError] = useState<string | null>(null)
   const mountedRef = useRef(false)
   const providerRequestRef = useRef(0)
   const loginRequestRef = useRef(0)
@@ -192,8 +198,35 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
     }
   }, [host, session])
 
+  const saveCompat = useCallback(async () => {
+    const name = compatName.trim()
+    const baseUrl = compatUrl.trim()
+    const apiKey = compatKey.trim()
+    const modelId = compatModelId.trim()
+    if (!name || !baseUrl || !apiKey || !modelId || compatBusy) return
+    setCompatBusy(true)
+    setCompatError(null)
+    try {
+      const result = await hostMethod(host, 'addOpenAICompatibleProvider')({ name, baseUrl, apiKey, modelId })
+      if (!result || typeof result !== 'object' || typeof (result as { providerId?: unknown }).providerId !== 'string') {
+        throw hostUpdateError('addOpenAICompatibleProvider')
+      }
+      setCompatName('')
+      setCompatUrl('')
+      setCompatKey('')
+      setCompatModelId('')
+      onAdded()
+      loadProviders()
+    } catch (err) {
+      setCompatError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setCompatBusy(false)
+    }
+  }, [compatBusy, compatKey, compatModelId, compatName, compatUrl, host, loadProviders, onAdded])
+
   const activeProvider = providers?.find(provider => provider.id === session?.providerId)
   const retry = () => loadProviders()
+  const canSaveCompat = Boolean(compatName.trim() && compatUrl.trim() && compatKey.trim() && compatModelId.trim()) && !compatBusy
 
   return (
     <div className="provider-add" data-testid="provider-add">
@@ -234,6 +267,26 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
           {session.error && <div className="provider-login-error" data-testid="provider-login-error"><span>{session.error}</span><button aria-label="关闭登录错误" data-testid="provider-login-error-close" onClick={() => { loginRequestRef.current += 1; setSession(null) }}>×</button></div>}
         </section>
       )}
+      <section className="provider-compat" data-testid="provider-compat">
+        <div className="provider-row-main">
+          <span className="provider-row-name">OpenAI 兼容</span>
+          <span className="provider-row-status">自定义名称、URL 与 Key</span>
+        </div>
+        <form className="provider-login-form" data-testid="provider-compat-form" onSubmit={event => { event.preventDefault(); void saveCompat() }}>
+          <label htmlFor="provider-compat-name">名称</label>
+          <input id="provider-compat-name" data-testid="provider-compat-name" value={compatName} onChange={e => setCompatName(e.target.value)} placeholder="例如 my-proxy" autoComplete="off" />
+          <label htmlFor="provider-compat-url">URL</label>
+          <input id="provider-compat-url" data-testid="provider-compat-url" value={compatUrl} onChange={e => setCompatUrl(e.target.value)} placeholder="https://api.example.com/v1" autoComplete="off" />
+          <label htmlFor="provider-compat-key">Key</label>
+          <input id="provider-compat-key" data-testid="provider-compat-key" type="password" value={compatKey} onChange={e => setCompatKey(e.target.value)} placeholder="sk-…" autoComplete="off" />
+          <label htmlFor="provider-compat-model">模型 id</label>
+          <input id="provider-compat-model" data-testid="provider-compat-model" value={compatModelId} onChange={e => setCompatModelId(e.target.value)} placeholder="gpt-4o-mini" autoComplete="off" />
+          {compatError && <div className="provider-login-error" data-testid="provider-compat-error">{compatError}</div>}
+          <div className="provider-login-form-actions">
+            <button type="submit" className="provider-login-submit" data-testid="provider-compat-save" disabled={!canSaveCompat}>{compatBusy ? '保存中…' : '保存'}</button>
+          </div>
+        </form>
+      </section>
       {loadError && <div className="model-modal-error" data-testid="provider-add-error"><span>{loadError}</span><button aria-label="关闭 provider 错误" data-testid="provider-add-error-close" onClick={() => setLoadError(null)}>×</button><button data-testid="provider-add-retry" onClick={retry}>重试</button></div>}
       {providers === null && providersLoading && !loadError && <div className="model-modal-state" data-testid="provider-add-loading">正在加载 provider…</div>}
       {providers === null && !providersLoading && !loadError && <div className="model-modal-state" data-testid="provider-add-unavailable">Provider 目录未加载。<button data-testid="provider-add-retry" onClick={retry}>重试</button></div>}

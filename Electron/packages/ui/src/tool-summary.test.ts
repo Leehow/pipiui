@@ -8,6 +8,14 @@ describe('toolArgsSummary', () => {
     expect(toolArgsSummary('edit', '{}')).toBe('…')
   })
 
+  it('renders image tool prompts (including legacy generate_image)', () => {
+    expect(toolArgsSummary('image_gen', '{"prompt":"a red fox","confirmed":true}')).toBe('a red fox')
+    expect(toolArgsSummary('image_edit', '{"prompt":"make it night","image":"/tmp/a.png"}')).toBe('make it night')
+    expect(toolArgsSummary('generate_image', '{"prompt":"old transcript"}')).toBe('old transcript')
+    expect(toolArgsSummary('image_gen', '{"prompt":"')).toBe('…')
+    expect(toolArgsSummary('image_edit', '{"prompt":"cropped streaming')).toBe('cropped streaming')
+  })
+
   it('renders bash as the command', () => {
     expect(toolArgsSummary('bash', '{"command":"ls -la"}')).toBe('ls -la')
     expect(toolArgsSummary('bash', `{"command":"${'x'.repeat(200)}"}`)).toBe(`${'x'.repeat(120)}…`)

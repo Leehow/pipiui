@@ -415,6 +415,26 @@ describe("SessionMessageQueue", () => {
     expect(() => queue.updateMessage("s1", a.id, { text: " " })).toThrow(/empty message/);
   });
 
+  it("does not drain when a stale idle arrives after a newer turn started", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    const first = queue.markBusy("s1");
+    queue.enqueue("s1", { text: "queued" });
+    const second = queue.markBusy("s1");
+    const stale = queue.notifyIdle("s1", first);
+    expect(host.calls).toHaveLength(0);
+    await flush();
+    expect(host.calls).toHaveLength(0);
+    await Promise.race([stale, flush()]);
+    expect(queue.listQueue("s1").map((item) => item.text)).toEqual(["queued"]);
+    expect(queue.isBusy("s1")).toBe(true);
+
+    const idle = queue.notifyIdle("s1", second);
+    expect(host.calls.map((call) => call.payload.text)).toEqual(["queued"]);
+    host.pending[0].resolve(undefined);
+    await idle;
+  });
+
   it("honors a custom drain behavior", () => {
     const host = recordingHost();
     const queue = new SessionMessageQueue({ dispatch: host.dispatch, drainBehavior: "follow_up" });

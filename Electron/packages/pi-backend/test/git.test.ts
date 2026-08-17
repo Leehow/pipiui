@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkoutBranch, createPiHostBackend, githubBrowserURL, initGit, parsePorcelain, parseUpstreamCounts, probeGit, validateBranchName } from "../src/index.js";
+import { checkoutBranch, createPiHostBackend, githubBrowserURL, initGit, parsePorcelain, parseUpstreamCounts, probeGit, probeGitBinary, validateBranchName } from "../src/index.js";
 
 let root = "";
 afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = ""; });
@@ -71,6 +71,16 @@ describe("probeGit", () => {
   });
 });
 
+describe("probeGitBinary", () => {
+  it("reports true when git --version succeeds", async () => {
+    expect(await probeGitBinary(async () => ({ stdout: "git version 2.50.0\n" }))).toBe(true);
+  });
+
+  it("reports false when git cannot run", async () => {
+    expect(await probeGitBinary(async () => { throw new Error("ENOENT"); })).toBe(false);
+  });
+});
+
 describe("PiHostBackend git methods", () => {
   it("advertises the capability and probes/checks out the project work tree", async () => {
     const cwd = await repository();
@@ -100,5 +110,11 @@ describe("PiHostBackend git methods", () => {
     await expect(backend.handle("probeDirectoryGit", ["relative/path"])).rejects.toThrow(/绝对路径/);
     await expect(backend.handle("probeDirectoryGit", [join(root, "missing")])).rejects.toThrow(/目录不存在或不是文件夹/);
     await expect(backend.handle("gitInitDirectory", [42])).rejects.toThrow(/绝对路径/);
+  });
+
+  it("reports whether a git executable is installed", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-gitbin-"));
+    const backend = createPiHostBackend({ agentDir: join(root, ".agent"), sessionsRoot: join(root, ".sessions"), canonicalProjectPaths: async () => undefined });
+    expect(await backend.handle("probeGitBinary", [])).toBe(true);
   });
 });

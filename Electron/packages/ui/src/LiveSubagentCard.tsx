@@ -11,7 +11,7 @@ function rowLine(agent: AgentSummary): string {
   return '已中断'
 }
 
-export const LiveSubagentCard = memo(function LiveSubagentCard({ projection, onOpenSubagents }: { projection: LiveSubagentProjection; onOpenSubagents?: (agentId?: string) => void }) {
+export const LiveSubagentCard = memo(function LiveSubagentCard({ projection, onOpenSubagents, title }: { projection: LiveSubagentProjection; onOpenSubagents?: (agentId?: string) => void; title?: string }) {
   const running = projection.runningCount > 0
   const failed = projection.failedCount > 0
   const activate = (agentId?: string) => (event: React.MouseEvent | React.KeyboardEvent) => {
@@ -21,7 +21,7 @@ export const LiveSubagentCard = memo(function LiveSubagentCard({ projection, onO
   return <section className="activity-card activity-card-tool subagent-tool-card" data-activity-card="tool" data-testid="subagent-tool-card">
     <button className="subagent-tool-head" onClick={activate(projection.visibleAgents[0]?.agentId)} title="打开 Subagents 面板">
       <span className="activity-status" aria-hidden="true">{running ? <span className="agent-spinner" aria-label="运行中" /> : failed ? '×' : '✓'}</span>
-      <b>subagent</b>
+      <b>{title ?? 'subagent'}</b>
       <small className="activity-meta">共 {projection.totalCount} · 运行 {projection.runningCount} · 完成 {projection.completedCount} · 失败 {projection.failedCount}</small>
       <span className="subagent-tool-open" aria-hidden="true">›</span>
     </button>

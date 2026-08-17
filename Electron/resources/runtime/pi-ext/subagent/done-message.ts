@@ -139,9 +139,17 @@ export function extractDoneTldr(text: string, cap = TLDR_DONE_CAP): string {
 	return `${body.slice(0, Math.max(0, cap - 1))}…`;
 }
 
+export type WaveWorkerSnapshot = { agentId: string; name: string; elapsed: string };
+
+export type WaveSnapshot = {
+	workers: WaveWorkerSnapshot[];
+	/** Count of running workers omitted after the 8-entry cap. */
+	overflow?: number;
+};
+
 export function formatSubagentDoneMessage(
 	result: DoneMessageResult,
-	extra?: { aborted?: boolean; error?: string; runId?: string },
+	extra?: { aborted?: boolean; error?: string; runId?: string; wave?: WaveSnapshot },
 ): string {
 	const aborted = extra?.aborted ?? result.stopReason === "aborted";
 	const ok = !isFailedResult(result) && !aborted && !extra?.error;
@@ -160,6 +168,22 @@ export function formatSubagentDoneMessage(
 		`[subagent-done] agentId=${result.agentId ?? "?"} runId=${extra?.runId ?? "?"} name=${result.agent} ok=${ok} verified=${verified} cost=${cost} turns=${result.usage.turns ?? 0}${result.resumed ? " resumed=true" : ""}`,
 		`Title: ${title}`,
 	];
+	if (extra?.wave) {
+		const listed = extra.wave.workers;
+		const overflow = extra.wave.overflow ?? 0;
+		const n = listed.length + overflow;
+		if (n === 0) {
+			lines.push(
+				"Wave: 0 other workers still running — every dispatched worker is terminal; if no further work is needed, give the user exactly one complete final closeout now (in their language).",
+			);
+		} else {
+			const names = listed.map((w) => `${w.name} ${w.elapsed}`);
+			const more = overflow > 0 ? `, …and ${overflow} more` : "";
+			lines.push(
+				`Wave: ${n} other worker(s) still running (${names.join(", ")}${more}) — do NOT give the user any conclusion, summary, or progress update yet; continue orchestration and wait for their [subagent-done] events.`,
+			);
+		}
+	}
 	if (verified === "none") {
 		if (!att && result.verifyDropped) {
 			// Read-only role: the report IS the deliverable, so re-dispatching to make a
@@ -183,7 +207,7 @@ export function formatSubagentDoneMessage(
 		"Result:",
 		output,
 		`Full report: subagent_status({agentId:"${result.agentId ?? "?"}", full:true})`,
-		"Handling: this is a worker event, not a new user request. One unfiltered subagent_status() without agentId lists every job. If this turn already has that snapshot, reuse it and do not call again; if this turn has no unfiltered subagent_status() yet, call it once without agentId and inspect every worker relevant to this user's goal, including this one. If any related worker is running (including stalled) or expected related work is still unfinished, do NOT give the user a status update, progress report, partial conclusion, or summary: only continue orchestration/internal ledger work or dispatch follow-up work, then wait for the next event. ONLY after status confirms every related worker is terminal may you give the user exactly one complete final closeout in their language — verdict, key evidence, and what changed. Do not end silently once that final-closeout condition is met. Never reply \"already completed\" without a status snapshot this turn; if a related worker is still running but its work is done, close it with subagent_abort({agentId}) (or /subagent_abort) so its messages stop, or resolve terminal failed/aborted/interrupted episodes with subagent_resolve({agentId, runId}) (or /subagent_resolve).",
+		"Handling: The Wave line above is the runtime snapshot of still-running workers taken at this completion; use it to decide whether to speak or stay silent. this is a worker event, not a new user request. One unfiltered subagent_status() without agentId lists every job. If this turn already has that snapshot, reuse it and do not call again; if this turn has no unfiltered subagent_status() yet, call it once without agentId and inspect every worker relevant to this user's goal, including this one. If any related worker is running (including stalled) or expected related work is still unfinished, do NOT give the user a status update, progress report, partial conclusion, or summary: only continue orchestration/internal ledger work or dispatch follow-up work, then wait for the next event. ONLY after status confirms every related worker is terminal may you give the user exactly one complete final closeout in their language — verdict, key evidence, and what changed. Do not end silently once that final-closeout condition is met. Never reply \"already completed\" without a status snapshot this turn; if a related worker is still running but its work is done, close it with subagent_abort({agentId}) (or /subagent_abort) so its messages stop, or resolve terminal failed/aborted/interrupted episodes with subagent_resolve({agentId, runId}) (or /subagent_resolve).",
 	);
 	return lines.join("\n");
 }

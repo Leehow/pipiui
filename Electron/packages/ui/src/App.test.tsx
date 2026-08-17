@@ -373,6 +373,20 @@ describe('PipiUI Electron main layout', () => {
     })).toEqual(current)
   })
 
+  it('retains locally created sessions missing from a list snapshot', () => {
+    const local: Session = { id: 'local', projectId: 'p', name: '新会话', updatedAt: 30 }
+    const listed: Session = { id: 'listed', projectId: 'p', name: 'Listed', updatedAt: 20 }
+    const emptyRevisions = {
+      titleRevisionsAtRequest: new Map<string, number>(),
+      currentTitleRevisions: new Map<string, number>(),
+    }
+    expect(mergeSessionSnapshot([local, listed], [listed], emptyRevisions)).toEqual([listed])
+    expect(mergeSessionSnapshot([local, listed], [listed], {
+      ...emptyRevisions,
+      retainIds: new Set(['local']),
+    })).toEqual([local, listed])
+  })
+
   it('retries when terminal arrives before the final Boss row reaches JSONL', async () => {
     const base = createMockHost()
     let listener: ((event: StreamEvent) => void) | undefined
@@ -487,6 +501,108 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(welcomeReads).toBe(3), { timeout: 1_000 })
     await new Promise(resolve => window.setTimeout(resolve, 100))
     expect(welcomeReads).toBe(3)
+  })
+
+  it('updates a background session row from status events while another session is selected', async () => {
+    const host = createMockHost()
+    let background: ((event: StreamEvent) => void) | undefined
+    host.subscribeAllStreams = listener => { background = listener; return () => { background = undefined } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+
+    act(() => background?.({ type: 'status', sessionId: 'layout', status: 'started' }))
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running'))
+
+    act(() => background?.({ type: 'status', sessionId: 'layout', status: 'settled' }))
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('completed'))
+  })
+
+  it('ignores a background ghost started after a finished assistant', async () => {
+    const host = createMockHost()
+    let background: ((event: StreamEvent) => void) | undefined
+    host.subscribeAllStreams = listener => { background = listener; return () => { background = undefined } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(container.querySelector('[data-session-id="tool-burst"]')!)
+    await screen.findByText('调整完成：src 布局就位，浏览器确认无回归。')
+    fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
+    await waitFor(() => expect(container.querySelector('[data-session-id="welcome"]')?.getAttribute('aria-current')).toBe('true'))
+
+    act(() => background?.({ type: 'status', sessionId: 'tool-burst', status: 'started' }))
+    expect(container.querySelector('[data-session-id="tool-burst"]')?.getAttribute('data-status')).not.toBe('running')
+  })
+
+  it('keeps a sent session marked running in the sidebar after switching away', async () => {
+    const host = createMockHost()
+    // A turn that never settles: the badge must come from the send path itself.
+    host.sendPrompt = () => new Promise(() => undefined)
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    // `site` carries no running-subagent fixture, so the row exposes the
+    // main-agent status chain directly.
+    fireEvent.click(container.querySelector('[data-session-id="site"]')!)
+    await waitFor(() => expect(container.querySelector('[data-session-id="site"]')?.getAttribute('aria-current')).toBe('true'))
+    const composer = await screen.findByLabelText('消息输入框')
+    fireEvent.change(composer, { target: { value: '后台跑一轮' } })
+    await waitFor(() => expect((screen.getByLabelText('发送消息') as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(container.querySelector('[data-session-id="site"]')?.getAttribute('data-status')).toBe('running'))
+
+    fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
+    await waitFor(() => expect(container.querySelector('[data-session-id="welcome"]')?.getAttribute('aria-current')).toBe('true'))
+    expect(container.querySelector('[data-session-id="site"]')?.getAttribute('data-status')).toBe('running')
+  })
+
+  it('recovers a persisted session whose first history read was empty instead of caching the wipe', async () => {
+    const base = createMockHost()
+    const project: Project = { id: 'recover-p', name: 'Recover', path: '/tmp/recover' }
+    const recovered: HistoryEntry[] = [{ id: 'recover-u1', role: 'user', content: '磁盘上一直存在的消息', timestamp: 1 }]
+    let reads = 0
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: async () => [project],
+      listSessions: async () => [
+        { id: 'recover-s1', projectId: project.id, name: '被误读为空的会话', updatedAt: 1 },
+        { id: 'recover-s2', projectId: project.id, name: '切换目标', updatedAt: 2 },
+      ],
+      getSessionHistory: async sessionId => {
+        if (sessionId !== 'recover-s1') return []
+        reads += 1
+        return reads <= 2 ? [] : recovered
+      },
+      subscribeStream: () => () => undefined,
+    }
+    const { container } = render(<App host={host} />)
+    await waitFor(() => expect(reads).toBe(2), { timeout: 2_000 })
+    await waitFor(() => expect(screen.queryByText('磁盘上一直存在的消息')).toBeNull())
+
+    fireEvent.click(container.querySelector('[data-session-id="recover-s2"]')!)
+    await waitFor(() => expect(container.querySelector('[data-session-id="recover-s2"]')?.getAttribute('aria-current')).toBe('true'))
+    fireEvent.click(container.querySelector('[data-session-id="recover-s1"]')!)
+    expect(await screen.findByText('磁盘上一直存在的消息', undefined, { timeout: 2_000 })).toBeTruthy()
+    expect(reads).toBeGreaterThanOrEqual(3)
+  })
+
+  it('restarts paging from the newest page when a mid-pagination compaction retires the cursor', async () => {
+    const base = createMockHost()
+    const project: Project = { id: 'cursor-p', name: 'Cursor', path: '/tmp/cursor' }
+    const entries: HistoryEntry[] = Array.from({ length: 520 }, (_, index) => ({ id: `cursor-${index}`, role: 'user' as const, content: `游标消息 ${index}`, timestamp: index }))
+    let calls = 0
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: async () => [project],
+      listSessions: async () => [{ id: 'cursor-s1', projectId: project.id, name: '游标会话', updatedAt: 1 }],
+      getSessionHistory: async (_sessionId, before) => {
+        calls += 1
+        if (calls === 2) throw new Error(`history cursor no longer exists: ${before}`)
+        return calls === 1 ? entries.slice(-500) : entries.slice(-40)
+      },
+      subscribeStream: () => () => undefined,
+    }
+    render(<App host={host} />)
+    expect(await screen.findByText('游标消息 519', undefined, { timeout: 2_000 })).toBeTruthy()
+    expect(screen.queryByText(/读取会话记录失败/)).toBeNull()
+    expect(calls).toBe(3)
   })
 
   it('cancels a terminal delayed refresh when the selected session changes', async () => {
@@ -884,6 +1000,7 @@ describe('PipiUI Electron main layout', () => {
     ['Document', ['Document', 'Terminal', 'Subagents', 'Browser']],
     ['Terminal', ['Terminal', 'Subagents', 'Browser', 'Document']],
   ] as const)('keeps native Browser input away from the rail across three cycles starting at %s', async (_start, cycle) => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(DOMRect.fromRect({ x: 900, y: 50, width: 380, height: 750 }))
     const host = createMockHost()
     host.terminal = { open: vi.fn(async () => ({ id: 'rail-terminal', title: 'Terminal', cwd: '/tmp' })), write: vi.fn(async () => undefined), resize: vi.fn(async () => undefined), clear: vi.fn(async () => undefined), close: vi.fn(async () => undefined), subscribe: vi.fn(() => () => undefined) }
     host.capabilities = async () => ({ computerUse: false, revealInFinder: true, terminal: true, documents: true, browser: true, git: true, plan: false, retainedWorktreeDisposition: false })
@@ -898,7 +1015,7 @@ describe('PipiUI Electron main layout', () => {
       click(name)
       if (name === 'Browser') {
         browserOpened = true
-        await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1].visible).toBe(true))
+        await waitFor(() => expect(setViewBounds.mock.calls.at(-1)).toEqual(['welcome', { x: 900, y: 50, width: 380, height: 750, visible: true }]))
       } else if (browserOpened) {
         await waitFor(() => expect(setViewBounds.mock.calls.at(-1)).toEqual(['welcome', { x: 0, y: 0, width: 0, height: 0, visible: false }]))
       }
@@ -1190,20 +1307,17 @@ describe('PipiUI Electron main layout', () => {
     expect(screen.getByTestId('model-chip')).toBeTruthy()
     expect(optionsRow.querySelector('.composer-options-left .model-chip')).toBeTruthy()
     expect(optionsRow.querySelector('.composer-options-left .thinking-chip')).toBeTruthy()
-    // Right group: stats + quota stay inside the same right-aligned row.
+    // Right group: stats stay in the right-aligned row; quota only appears when
+    // the snapshot belongs to the selected session's model (welcome is Anthropic).
     expect(optionsRow.querySelector('.composer-stats .session-stats-pill')).toBeTruthy()
-    expect(optionsRow.querySelector('.composer-stats .quota-pill')).toBeTruthy()
     await waitFor(() => expect(getSessionStats).toHaveBeenCalledWith('welcome'))
     await waitFor(() => expect(getQuotaSnapshot).toHaveBeenCalledWith('welcome'))
     // Context indicator unchanged: ring + used/window capsule.
     expect(screen.getByTestId('stats-pill').textContent).toContain('76k/272k')
     expect(screen.getByTestId('context-progress-ring')).toBeTruthy()
-    // Quota sits next to it in the same composer footer, Swift-selected single period.
-    expect(screen.getByTestId('quota-pill').textContent).toBe('周 12%')
-    expect(screen.getAllByTestId('quota-pill')).toHaveLength(1)
-    // Both stay inside the same right-aligned stats row.
+    await waitFor(() => expect(screen.queryByTestId('quota-pill')).toBeNull())
     expect(composerStats.querySelector('.session-stats-pill')).toBeTruthy()
-    expect(composerStats.querySelector('.quota-pill')).toBeTruthy()
+    expect(composerStats.querySelector('.quota-pill')).toBeNull()
     // Quota styling is self-contained: other footer controls keep their own classes/shapes.
     expect(container.querySelector('.model-chip')?.className).toBe('model-chip')
     expect(container.querySelector('.thinking-chip')?.className).toBe('thinking-chip')
@@ -1213,7 +1327,10 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(getSessionStats).toHaveBeenLastCalledWith('layout'))
     await waitFor(() => expect(getQuotaSnapshot).toHaveBeenLastCalledWith('layout'))
     expect(screen.getByTestId('stats-pill').textContent).toContain('40k/272k')
+    // Layout is OpenAI — the Codex snapshot now matches and sits next to stats.
     expect(screen.getByTestId('quota-pill').textContent).toBe('5h 63%')
+    expect(screen.getAllByTestId('quota-pill')).toHaveLength(1)
+    expect(optionsRow.querySelector('.composer-stats .quota-pill')).toBeTruthy()
 
     const callsBeforeSettle = getSessionStats.mock.calls.length
     streamListeners.get('layout')?.({ type: 'status', sessionId: 'layout', status: 'settled' })
@@ -1233,6 +1350,16 @@ describe('PipiUI Electron main layout', () => {
     const statsOnly = await screen.findByTestId('composer-session-stats')
     expect(statsOnly.querySelector('.session-stats-pill')).toBeTruthy()
     expect(statsOnly.querySelector('.quota-pill')).toBeNull()
+  })
+
+  it('shows the Codex quota fixture when switching to a session whose model has quota', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(screen.queryByTestId('quota-pill')).toBeNull()
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    expect((await screen.findByTestId('quota-pill')).textContent).toBe('周 12%')
+    fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
+    await waitFor(() => expect(screen.queryByTestId('quota-pill')).toBeNull())
   })
 
   it('shows the Codex quota fixture next to the context pill in the browser/dev fallback after selecting Codex', async () => {
@@ -1619,8 +1746,9 @@ describe('PipiUI Electron main layout', () => {
     ]
     expect(sidebarStatusForSession('selected', 'selected', true, undefined, agents).status).toBe('running')
     expect(sidebarStatusForSession('subtask', 'selected', false, undefined, agents)).toEqual({ status: 'subagents-running', subagentCount: 1 })
-    // Stream status is only live for the selected session. A leftover
-    // `running` from the last visit must not hide a background subagent badge.
+    // observed is live-updated for every session via subscribeAllStreams (older
+    // hosts stay selected-only). A leftover `running` on a non-selected row
+    // must not hide a background subagent badge.
     expect(sidebarStatusForSession('subtask', 'selected', false, 'running', agents)).toEqual({ status: 'subagents-running', subagentCount: 1 })
     expect(sidebarStatusForSession('subtask', 'subtask', false, 'running', agents).status).toBe('running')
     expect(sidebarStatusForSession('idle-running', 'selected', false, 'running', []).status).toBe('running')
@@ -1900,7 +2028,7 @@ describe('PipiUI Electron main layout', () => {
     fireEvent.click(screen.getByTestId('queue-retry-1'))
     await waitFor(() => expect(retryQueuedMessage).toHaveBeenCalledWith('welcome', 'failed'))
 
-    await act(async () => { listener?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
+    await act(async () => { listener?.({ type: 'status', sessionId: 'welcome', status: 'started', pendingFollowUps: ['host'] }) })
     expect(await screen.findByTestId('queue-steer-0')).toBeTruthy()
     fireEvent.click(screen.getByTestId('queue-steer-0'))
     await waitFor(() => expect(steerQueuedMessage).toHaveBeenCalledWith('welcome', 'editable'))
@@ -2005,6 +2133,59 @@ describe('session switch transcript cache', () => {
     await waitFor(() => expect(screen.getByLabelText('消息输入框')).toBeTruthy())
     expect((screen.getByText('请实现 Electron 三栏主界面。').closest('[data-session-transcript]') as HTMLElement | null)?.hidden).toBe(true)
     expect(getSessionHistory.mock.calls.length).toBe(loadsBeforeNew)
+  })
+
+  it('keeps cached welcome history when a later empty page arrives after switching back', async () => {
+    const base = createMockHost()
+    let welcomeLoads = 0
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async sessionId => {
+        if (sessionId === 'welcome') {
+          welcomeLoads += 1
+          if (welcomeLoads === 1) return base.getSessionHistory(sessionId)
+          if (welcomeLoads === 2) return []
+          return base.getSessionHistory(sessionId)
+        }
+        return base.getSessionHistory(sessionId)
+      },
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findByText('请实现 Electron 三栏主界面。')
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await screen.findByText('左栏宽度要能持久化。')
+    fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
+    expect(screen.getByText('请实现 Electron 三栏主界面。')).toBeTruthy()
+    await waitFor(() => expect(welcomeLoads).toBeGreaterThanOrEqual(2))
+    expect(screen.getByText('请实现 Electron 三栏主界面。')).toBeTruthy()
+  })
+
+  it('retries an empty first welcome page and shows recovered history', async () => {
+    const base = createMockHost()
+    let welcomeLoads = 0
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async sessionId => {
+        if (sessionId === 'welcome') {
+          welcomeLoads += 1
+          if (welcomeLoads === 1) return []
+          return [{ id: 'late', role: 'user', content: 'late recovered history', timestamp: 1 }]
+        }
+        return base.getSessionHistory(sessionId)
+      },
+    }
+    render(<App host={host} />)
+    expect(await screen.findByText('late recovered history')).toBeTruthy()
+  })
+
+  it('does not drop a locally created session when listSessions returns empty', async () => {
+    const base = createMockHost()
+    const host: PipiHostAPI = { ...base, listSessions: async () => [] }
+    render(<App host={host} />)
+    await screen.findByTestId('empty-setup')
+    fireEvent.click(screen.getByRole('button', { name: /在 PipiUI 新建会话/ }))
+    await waitFor(() => expect(document.title).toBe('新会话'))
+    expect(screen.getAllByText('新会话').length).toBeGreaterThan(0)
   })
 })
 
@@ -2389,6 +2570,24 @@ describe('composer quick model menu', () => {
     await waitFor(() => expect(container.querySelector('.model-detail')).toBeNull())
   })
 
+  it('creates a session before switching the model from the empty 新会话 state', async () => {
+    const base = createMockHost()
+    const newSession = vi.spyOn(base, 'newSession')
+    const setModel = vi.spyOn(base, 'setModel')
+    const host = { ...base, listSessions: async () => [] as Session[] }
+    render(<App host={host} />)
+    fireEvent.click(await screen.findByTestId('empty-setup-action'))
+    await waitFor(() => expect(newSession).toHaveBeenCalledWith('pipiui'))
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-openai-gpt-5'))
+    const createdSession = await newSession.mock.results[0].value
+    await waitFor(() => expect(setModel).toHaveBeenCalledWith(createdSession.id, 'openai', 'gpt-5'))
+    expect(setModel).not.toHaveBeenCalledWith('', 'openai', 'gpt-5')
+    expect(screen.queryByText(/切换模型失败/)).toBeNull()
+    expect(screen.queryByText(/unknown session/)).toBeNull()
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('GPT-5'))
+  })
+
   it('shows a lightweight error and keeps the original model on failed switch', async () => {
     const host = { ...createMockHost(), setModel: vi.fn(async () => { throw new Error('模型不可用') }) }
     const { container } = render(<App host={host} />)
@@ -2651,10 +2850,11 @@ describe('composer image attachments', () => {
     // No sessions anywhere → the app boots in the empty 新会话 state.
     const host = { ...base, listSessions: async () => [] as Session[] }
     render(<App host={host} />)
+    fireEvent.click(await screen.findByTestId('empty-setup-action'))
+    await waitFor(() => expect(newSession).toHaveBeenCalledWith('pipiui'))
     const composer = await screen.findByLabelText('消息输入框') as HTMLTextAreaElement
     fireEvent.change(composer, { target: { value: '开个头' } })
     fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(newSession).toHaveBeenCalledWith('pipiui'))
     await waitFor(() => expect(sendPrompt).toHaveBeenCalledTimes(1))
     const createdSession = await newSession.mock.results[0].value
     const [sessionId, prompt] = sendPrompt.mock.calls[0] as [string, string]
@@ -3166,6 +3366,27 @@ describe('composer thinking selector', () => {
     await waitFor(() => expect(setThinkingLevel).toHaveBeenCalledWith('welcome', 'high'))
     await waitFor(() => expect(screen.getByTestId('thinking-chip').textContent).toContain('high'))
     expect(screen.queryByTestId('thinking-menu')).toBeNull()
+  })
+
+  it('creates a session before changing thinking from the empty 新会话 state', async () => {
+    const base = createMockHost()
+    const newSession = vi.spyOn(base, 'newSession')
+    const setThinkingLevel = vi.spyOn(base, 'setThinkingLevel')
+    const host = { ...base, listSessions: async () => [] as Session[] }
+    render(<App host={host} />)
+    fireEvent.click(await screen.findByTestId('empty-setup-action'))
+    await waitFor(() => expect(newSession).toHaveBeenCalledWith('pipiui'))
+    const chip = await screen.findByTestId('thinking-chip')
+    fireEvent.click(chip.querySelector('.thinking-chip-level')!)
+    await screen.findByTestId('thinking-menu')
+    fireEvent.click(screen.getByTestId('thinking-row-high'))
+    await waitFor(() => expect(newSession).toHaveBeenCalledWith('pipiui'))
+    const createdSession = await newSession.mock.results[0].value
+    await waitFor(() => expect(setThinkingLevel).toHaveBeenCalledWith(createdSession.id, 'high'))
+    expect(setThinkingLevel).not.toHaveBeenCalledWith('', 'high')
+    expect(screen.queryByText(/切换思考级别失败/)).toBeNull()
+    expect(screen.queryByText(/unknown session/)).toBeNull()
+    await waitFor(() => expect(screen.getByTestId('thinking-chip').textContent).toContain('high'))
   })
 
   it('renders a proven non-configurable reasoning model as model-default without dispatching a no-op level', async () => {

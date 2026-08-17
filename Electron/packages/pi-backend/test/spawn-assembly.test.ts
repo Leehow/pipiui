@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
-import { assemblePiSpawn, mergedSpawnEnvironment, resolveSpawnPaths, sanitizeEnvironment, userExtensionMounts, withToolPath } from "../src/spawn-assembly.js";
+import { dirname, delimiter, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { assemblePiSpawn, isElectronNodeShim, mergedSpawnEnvironment, resolveSpawnPaths, sanitizeEnvironment, userExtensionMounts, withToolPath } from "../src/spawn-assembly.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
 
 describe("runtime info extension mount", () => {
@@ -30,6 +31,31 @@ describe("runtime info extension mount", () => {
 
   it("naturally omits both main-only observers when an isolated helper supplies no paths", () => {
     expect(assemblePiSpawn({ cwd: "/tmp/project", paths: {} }).args).toEqual([]);
+  });
+});
+
+describe("coding tools extension mount", () => {
+  const codingTools = "/runtime/extensions/pipiui-coding-tools.ts";
+
+  it("always mounts the read-directory wrapper and exports the path for workers", () => {
+    const input = { cwd: "/tmp/project", paths: { codingTools } };
+    expect(assemblePiSpawn(input).args).toEqual(["-e", codingTools]);
+    expect(assemblePiSpawn({ ...input, bridgePort: 1234 }).args).toEqual(["-e", codingTools]);
+    expect(assemblePiSpawn(input).env.PIPIUI_CODING_TOOLS_EXT).toBe(codingTools);
+  });
+
+  it("stays off isolated helpers that pass no paths", () => {
+    expect(assemblePiSpawn({ cwd: "/tmp/project", paths: {} }).args).toEqual([]);
+    expect(assemblePiSpawn({ cwd: "/tmp/project", paths: {} }).env.PIPIUI_CODING_TOOLS_EXT).toBeUndefined();
+  });
+
+  it("cannot be smuggled in from the inherited environment", () => {
+    expect(sanitizeEnvironment({ PIPIUI_CODING_TOOLS_EXT: "/stale.ts", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("resolves the shipped wrapper from the source runtime tree", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "resources", "runtime");
+    expect(resolveSpawnPaths(root).codingTools).toBe(join(root, "extensions", "pipiui-coding-tools.ts"));
   });
 });
 
@@ -193,7 +219,7 @@ describe("Computer Agent host contract", () => {
       computerDescriptor: { displayID: 1, width: 100, height: 100 },
     });
     expect(env.PIPIUI_COMPUTER_PROCEDURE_STORE).toMatch(/\/Library\/Application Support\/PipiUI\/computer-agent\/procedures\.json$/);
-    expect(env.PIPIUI_CUA_DRIVER_VERSION).toBe("0.19.2");
+    expect(env.PIPIUI_CUA_DRIVER_VERSION).toBe("0.20.0");
   });
 
   it("strips inherited terminal broker and Cua contract values", () => {
@@ -303,7 +329,6 @@ describe("bridge-free subagent orchestration", () => {
     expect(args).not.toContain("/ext/memory");
     expect(args).not.toContain("/ext/webview.ts");
     expect(args).not.toContain("/ext/browser-search.ts");
-    expect(args).not.toContain("/ext/plan.ts");
   });
 
   it("mounts Plan only behind its own explicit feature", () => {
@@ -333,6 +358,7 @@ describe("installed runtime tree", () => {
     await writeFile(join(root, "extensions", "pipiui-git.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-skillloader.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-runtime-info.ts"), "//\n");
+    await writeFile(join(root, "extensions", "pipiui-coding-tools.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-update-center.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-browser-search.ts"), "//\n");
     await writeFile(join(root, "pi-philosophy", "package.json"), JSON.stringify({ pi: { extensions: ["./philosophy.ts"] } }));
@@ -341,6 +367,7 @@ describe("installed runtime tree", () => {
     const paths = resolveSpawnPaths(root);
     expect(paths.git).toBe(join(root, "extensions", "pipiui-git.ts"));
     expect(paths.runtimeInfo).toBe(join(root, "extensions", "pipiui-runtime-info.ts"));
+    expect(paths.codingTools).toBe(join(root, "extensions", "pipiui-coding-tools.ts"));
     expect(paths.updateCenter).toBe(join(root, "extensions", "pipiui-update-center.ts"));
     expect(paths.browserSearch).toBe(join(root, "extensions", "pipiui-browser-search.ts"));
     expect(paths.subagentDir).toBe(join(root, "pi-ext", "subagent"));
@@ -379,7 +406,7 @@ describe("installed runtime tree", () => {
 
 describe("default feature set", () => {
   it("mounts the orchestration stack and the built-in browser while withholding unavailable desktop surfaces", () => {
-    expect(DEFAULT_FEATURES).toMatchObject({ philosophy: true, plan: false, subagent: true, git: true, skillLoader: true, searchScope: false, webSearch: true, browserSearch: true, mcp: true, browser: true });
+    expect(DEFAULT_FEATURES).toMatchObject({ philosophy: true, plan: true, subagent: true, git: true, skillLoader: true, searchScope: false, webSearch: true, browserSearch: true, mcp: true, browser: true });
     expect(DEFAULT_FEATURES.computerUse).toBe(true);
   });
 
@@ -473,5 +500,38 @@ describe("withToolPath and the Electron node shim", () => {
   it("still prepends a normal pi executable directory when no shim is involved", () => {
     const env = withToolPath({ PATH: "/usr/bin:/bin" }, "/opt/homebrew/bin/pi");
     expect(env.PATH?.split(delimiter)[0]).toBe("/opt/homebrew/bin");
+  });
+
+  // A rewritten executable changes size/mtime, so the size+mtime-guarded shim memoization
+  // must re-read it instead of replaying the stale verdict.
+  it("re-evaluates a shim file whose content changed (shimCache size+mtime invalidation)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipiui-shim-flip-"));
+    trees.push(root);
+    const node = join(root, "node");
+    await writeFile(node, "#!/bin/sh\nexec env ELECTRON_RUN_AS_NODE=1 /Helper \"$@\"\n", { mode: 0o755 });
+    expect(isElectronNodeShim(node)).toBe(true);
+    await writeFile(node, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await utimes(node, new Date(Date.now() + 2000), new Date(Date.now() + 2000));
+    expect(isElectronNodeShim(node)).toBe(false);
+  });
+
+  // withToolPath must stay uncached: a real Node installed after the first spawn has to
+  // demote the shim directory on the very next call, not reuse the frozen first PATH.
+  it("reflects a real node that appears after the first call (no frozen PATH decision)", async () => {
+    const shimDir = await seedNodeTree("shim");
+    const lateDir = await seedNodeTree("shim");
+    const baseEnv = { PATH: [shimDir, lateDir].join(delimiter) };
+    const pi = join(shimDir, "node");
+    // Both seeded node binaries are shims, so the second directory never wins first.
+    const before = withToolPath(baseEnv, pi);
+    expect(firstNodeDir(before.PATH ?? "")).not.toBe(lateDir);
+    // Flip the second directory into a real node; the size+mtime change must be noticed
+    // on the next call and the directory promoted ahead of the well-known fallbacks.
+    const lateNode = join(lateDir, "node");
+    await writeFile(lateNode, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await utimes(lateNode, new Date(Date.now() + 2000), new Date(Date.now() + 2000));
+    const after = withToolPath(baseEnv, pi);
+    expect(firstNodeDir(after.PATH ?? "")).toBe(lateDir);
+    expect(after.PATH?.split(delimiter)).not.toContain(shimDir);
   });
 });

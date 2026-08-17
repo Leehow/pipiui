@@ -96,6 +96,17 @@ describe("vendored philosophy: delivery", () => {
     expect(result.included.map((l) => l.id)).toEqual(["craft", "toolcall", "thinking"]);
   });
 
+  it("keeps deepseek worker toolcall when the dispatch tool is absent", () => {
+    const result = compose({
+      role: "worker",
+      agent: "general-purpose",
+      model: SCOPED_MODEL,
+      activeTools: [],
+    });
+    expect(result.included.map((l) => l.id)).toEqual(["craft", "toolcall", "thinking"]);
+    expect(result.text).not.toContain("{{");
+  });
+
   it("survives a runtime that has only the single dispatch tool", () => {
     // pi's own subagent extension registers dispatch but no parallel/status tools; the
     // judgement layers must degrade to prose, not disappear or leak dead tool names.

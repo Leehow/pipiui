@@ -5,9 +5,8 @@
  * giving it an isolated context window.
  *
  * Public tools:
- *   - subagent: { agent, task }
- *   - subagent_parallel: { tasks: [{ agent, task }, ...] }
- *   - subagent_chain: { chain: [{ agent, task }, ...] }
+ *   - subagent: { prompt, description, subagent_type?, isolation? }
+ *   - subagent_chain: { chain: [{ prompt, description }, ...] }
  *   - subagent_abort: { agentId }
  *   - subagent_resolve: { agentId, runId }
  *
@@ -35,7 +34,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { makeStrictJsonSchema, omitNulls, bindSanitizeStrictToolArguments } from "./strict-json-schema.ts";
+import { adoptGrokBuildDispatch, makeStrictJsonSchema, omitNulls, bindSanitizeStrictToolArguments, remapUnknownSubagentType } from "./strict-json-schema.ts";
 import {
 	COMPUTER_WORKER_FAILURE_CODES,
 	type ComputerPlan,
@@ -66,9 +65,16 @@ import {
 	isDelegationTool,
 } from "./desktop-tool-policy.mjs";
 import {
+	deliveryRetryDue,
 	DeliveryObligationStore,
 	type DeliveryObligation,
 } from "./delivery-obligation.ts";
+import {
+	completionObservation,
+	completionObservationMatches,
+	completionPersistenceState,
+	queueCompletionAfterCutIn,
+} from "./completion-notification.ts";
 import {
 	formatSecretaryCommitResult,
 	runSecretaryCommit,
@@ -126,6 +132,7 @@ import {
 	bindCanonicalComputerAgents,
 	configuredHeartbeatAt,
 	createRunScopedTimeout,
+	decideRuntimeBudgetExpiry,
 	normalizeGeneralPurposeExecutionPolicy,
 	runtimeRolePolicyForAgent,
 } from "./runtime-policy.ts";
@@ -134,6 +141,14 @@ import {
 	encodeAgentEventBridgeRequestV1,
 	type AgentBridgeEventPayloadV1,
 } from "./host-bridge.ts";
+import {
+	addEstimateChars,
+	combineCompletedAndStreamingUsage,
+	estimateOutputTokens,
+	type EstimateCharCounts,
+	liveUsageOrEstimate,
+	shouldEmitStreamingUsage,
+} from "./streaming-usage.ts";
 
 const MAX_PARALLEL_TASKS = 1000;
 /**
@@ -528,6 +543,7 @@ const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
 // get_search_content. Provider-hosted search may also reach workers through pi's own
 // extension discovery; this pinned route makes research delegable for other providers.
 const PIPIUI_WEB_ACCESS_EXT = process.env.PIPIUI_WEB_ACCESS_EXT;
+const PIPIUI_CODING_TOOLS_EXT = process.env.PIPIUI_CODING_TOOLS_EXT;
 // arXiv remains a specialized local Pi package. Role allowlists decide whether a
 // child may call each mounted package tool.
 const PIPIUI_ARXIV_EXT = process.env.PIPIUI_ARXIV_EXT;
@@ -702,9 +718,13 @@ type PipiuiAgentReport = AgentBridgeEventPayloadV1;
  * The sole live agent-event emitter. It selects exactly one envelope for the
  * same /rpc endpoint: legacy flat Swift bridge by default, canonical v1 only
  * when the Electron host explicitly exported PIPIUI_HOST_PROTOCOL=1.
+ *
+ * Returns true when nothing remains to deliver (no host/no envelope, or the
+ * bridge accepted the report); false only for transport/HTTP failure, which
+ * lets terminal senders retry.
  */
-async function postPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
-	if (!PIPIUI_PORT) return;
+async function postPipiuiReport(payload: PipiuiAgentReport): Promise<boolean> {
+	if (!PIPIUI_PORT) return true;
 	const body = encodeAgentEventBridgeRequestV1(payload, {
 		PIPIUI_HOST_PROTOCOL,
 		PIPIUI_SESSION_KEY: PIPIUI_SESSION,
@@ -712,19 +732,22 @@ async function postPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
 	});
 	// Missing agentId/runId or a missing canonical capability fails closed. Never
 	// send a second legacy fallback and never ask a host to infer a reusable run.
-	if (!body) return;
+	// Both are deterministic config states — retrying cannot fix them.
+	if (!body) return true;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), PIPIUI_REPORT_TIMEOUT_MS);
 	timeout.unref?.();
 	try {
-		await fetch(`http://127.0.0.1:${PIPIUI_PORT}/rpc`, {
+		const response = await fetch(`http://127.0.0.1:${PIPIUI_PORT}/rpc`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(body),
 			signal: controller.signal,
 		});
+		return response.ok;
 	} catch {
 		// Bridge reporting is observability, never a reason to crash the worker.
+		return false;
 	} finally {
 		clearTimeout(timeout);
 	}
@@ -738,9 +761,12 @@ const terminalPipiuiReportFlights = new Map<string, Promise<void>>();
  * receive HTTP requests in completion order. The host still enforces terminal
  * monotonicity because network/process failures can drop or replay messages.
  */
-function enqueuePipiuiReport(payload: PipiuiAgentReport): Promise<void> {
+function enqueuePipiuiReport(
+	payload: PipiuiAgentReport,
+	post: (payload: PipiuiAgentReport) => Promise<unknown> = postPipiuiReport,
+): Promise<void> {
 	const previous = terminalPipiuiReportFlights.get(payload.agentId) ?? Promise.resolve();
-	const flight = previous.catch(() => {}).then(() => postPipiuiReport(payload));
+	const flight = previous.catch(() => {}).then(() => post(payload));
 	terminalPipiuiReportFlights.set(payload.agentId, flight);
 	void flight.finally(() => {
 		if (terminalPipiuiReportFlights.get(payload.agentId) === flight) {
@@ -754,9 +780,29 @@ function pipiuiReport(payload: PipiuiAgentReport): void {
 	void enqueuePipiuiReport(payload);
 }
 
+/** A dropped terminal POST leaves a dead worker rendered as running forever — the
+ *  host's orphan sweep skips sessions whose pi process is still alive. Bounded
+ *  retries keep that row from sticking when the bridge hiccups. */
+const TERMINAL_REPORT_RETRY_DELAYS_MS = [1_000, 3_000] as const;
+async function postPipiuiReportWithRetry(payload: PipiuiAgentReport): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		if (await postPipiuiReport(payload)) return;
+		if (attempt >= TERMINAL_REPORT_RETRY_DELAYS_MS.length) {
+			console.error(
+				`[pipiui-subagent] terminal bridge report dropped for agentId=${payload.agentId} after ${attempt + 1} attempts`,
+			);
+			return;
+		}
+		await new Promise((resolve) => {
+			const timer = setTimeout(resolve, TERMINAL_REPORT_RETRY_DELAYS_MS[attempt]!);
+			timer.unref?.();
+		});
+	}
+}
+
 /** The lease owner awaits the same ordered queue before it releases this agent ID. */
 function postTerminalPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
-	return enqueuePipiuiReport(payload);
+	return enqueuePipiuiReport(payload, postPipiuiReportWithRetry);
 }
 
 async function awaitTerminalPipiuiReports(agentId: string): Promise<void> {
@@ -1014,6 +1060,7 @@ interface UsageStats {
 	cacheWrite: number;
 	cost: number;
 	contextTokens: number;
+	contextWindow?: number;
 	turns: number;
 }
 
@@ -1076,6 +1123,8 @@ interface RunSingleAgentOptions {
 	blockedBy?: string[];
 	/** Current session model as `provider/id` (depth 0 `ctx.model`); used for「跟随主 Agent」. */
 	sessionModel?: string;
+	/** Model context window from the dispatching session; shown on the detail header. */
+	contextWindow?: number;
 	/** Optional Boss-selected thinking for this dispatch; never inherited from the Boss session. */
 	thinking?: string;
 	/** Shell command the runtime runs in the agent's cwd after the process ends (attested verify). */
@@ -1088,7 +1137,7 @@ interface RunSingleAgentOptions {
 	deadlineAt?: number;
 	/** Bundled general-purpose placement override; omission remains isolated. */
 	worktree?: "isolated" | "none";
-	/** Auditable Boss reason required for bundled general-purpose direct-cwd execution. */
+	/** Optional Boss reason when bundled general-purpose runs in a shared cwd. */
 	noWorktreeReason?: string;
 	/** Bundled general-purpose regular wall-clock check-in cadence. */
 	heartbeatSecs?: number;
@@ -1111,6 +1160,12 @@ interface RunSingleAgentOptions {
 function formatCtxModel(model: { provider?: string; id?: string } | undefined | null): string | undefined {
 	if (!model?.provider || !model?.id) return undefined;
 	return `${model.provider}/${model.id}`;
+}
+
+function ctxContextWindow(model: { contextWindow?: number } | undefined | null): number | undefined {
+	return typeof model?.contextWindow === "number" && Number.isFinite(model.contextWindow) && model.contextWindow > 0
+		? model.contextWindow
+		: undefined;
 }
 
 interface SubagentModelOverride {
@@ -2087,8 +2142,27 @@ function abortRunningAgent(agentId: string): { ok: boolean; message: string } {
 	handle.controller.abort();
 	return {
 		ok: true,
-		message: `Abort requested for agentId=${agentId} (${handle.name}). SIGTERM sent (SIGKILL after 5s if still alive); the job will report [subagent-done] with aborted status.`,
+		message: `Abort requested for agentId=${agentId} (${handle.name}). SIGTERM sent (SIGKILL after 5s if still alive). Aborted jobs do not push a [subagent-done] follow-up; check subagent_status.`,
 	};
+}
+
+/**
+ * Abort every queued/running background agent in this boss process (stop sweep).
+ * Returns the agentIds that were actually signalled. Terminal [subagent-done]
+ * receipts of these aborts are suppressed by notifySubagentDone, so the sweep
+ * cannot restart turns by itself.
+ */
+function abortAllRunningAgents(): { aborted: string[] } {
+	const ids = new Set<string>([
+		...dispatchQueue.snapshot().map((item) => item.agentId),
+		...runningAgents.keys(),
+		...runningComputerTasks.keys(),
+	]);
+	const aborted: string[] = [];
+	for (const id of ids) {
+		if (abortRunningAgent(id).ok) aborted.push(id);
+	}
+	return { aborted };
 }
 
 interface ResolveSubagentEpisodeResult {
@@ -2374,6 +2448,9 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
  * A held task that nobody is told about is the forgetting this queue exists to end.
  */
 let dispatchQueueNotify: (text: string) => void = () => {};
+
+/** Boss channel for runtime-budget escalations ([subagent-timeout]); bound to pi in the default export. */
+let runtimeBudgetNotify: (text: string) => void = () => {};
 
 const dispatchQueue = new DispatchQueueV1({
 	limit: MAX_CONCURRENCY,
@@ -3432,14 +3509,24 @@ async function sendUserMessageAfterCutIn(
 	text: string,
 	shouldSend?: () => boolean,
 ): Promise<boolean> {
+	// Host-stop quiet: reminders/heartbeats/escalations must not restart a stopped
+	// session. They are dropped for this cycle; the boss can still see every job
+	// state through subagent_status and the Subagents panel.
+	if (hostStopQuiet) return false;
 	// A resolved episode may have been queued behind the cut-in hold. Re-check immediately
 	// before each actual send so resolve can suppress that stale reminder.
 	if (shouldSend && !shouldSend()) return false;
 	try {
 		await pi.sendUserMessage(text, { deliverAs: "followUp" });
 		return true;
-	} catch {
-		// 降级到不带 options 的形式（旧版 pi 可能不认识 deliverAs）。
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		// A live turn without deliverAs is the exact Pi error the host must never
+		// surface. Only fall back when this Pi build does not understand deliverAs.
+		if (message.includes("already processing") || !/unknown|unexpected|deliverAs|options/i.test(message)) {
+			console.error("[pipiui-subagent] failed to deliver message:", err);
+			return false;
+		}
 	}
 	if (shouldSend && !shouldSend()) return false;
 	try {
@@ -3625,9 +3712,10 @@ function deliverSubagentDone(pi: ExtensionAPI, text: string): void {
 	void trySendUserMessage(pi, text);
 }
 
-/** done 消息在 promise resolve 前都视为未确认；持久 obligation 让新进程恢复未确认投递。 */
+/** done 消息必须跨过 Pi 持久化与后续 Boss 响应边界；持久 obligation 让新进程恢复未完成投递。 */
 interface PendingDoneEntry {
 	obligation: DeliveryObligation;
+	sessionId: string;
 	firstFailedAt: number;
 	inFlight: boolean;
 	recoveredAmbiguous: boolean;
@@ -3646,17 +3734,34 @@ function retryPendingDoneAfterSessionSettled(pi: ExtensionAPI): void {
 	if (pendingDoneSettledRetryTimer) return;
 	pendingDoneSettledRetryTimer = setTimeout(() => {
 		pendingDoneSettledRetryTimer = undefined;
+		const now = Date.now();
 		for (const [obligationId, entry] of [...pendingDone]) {
-			if (entry.obligation.state === "delivered") {
+			if (entry.obligation.state === "fulfilled") {
 				pendingDone.delete(obligationId);
 				continue;
 			}
-			if (!entry.inFlight) sendDoneWithConfirmation(pi, entry, true);
+			if (!entry.inFlight && deliveryRetryDue(
+				entry.obligation, now, DONE_RETRY_MIN_INTERVAL_MS, DONE_MAX_ATTEMPTS,
+			)) sendDoneWithConfirmation(pi, entry, true);
 		}
 	}, 0);
 	pendingDoneSettledRetryTimer.unref?.();
 }
 let doneDeliveryPiSessionId: string | undefined;
+
+/**
+ * Host-stop quiet gate. The backend stop sweep sends /subagent_abort_all; from that moment
+ * until the next real user input, no automatic follow-up (completion receipts, interrupted
+ * reminders, heartbeats) may start a boss turn. A stopped session that keeps waking itself
+ * is exactly the 2026-08-15 receipt storm: every late [subagent-done] of an aborted worker
+ * opened a new turn the user had already stopped.
+ */
+let hostStopQuiet = false;
+function releaseHostStopQuiet(pi: ExtensionAPI | undefined): void {
+	if (!hostStopQuiet) return;
+	hostStopQuiet = false;
+	if (pi) retryPendingDoneAfterSessionSettled(pi);
+}
 
 function logDonePersistenceFailure(action: string, obligationId: string, err: unknown): void {
 	const code = (err as NodeJS.ErrnoException)?.code;
@@ -3701,7 +3806,11 @@ function sendDoneWithConfirmation(
 	isRetry: boolean,
 ): void {
 	let obligation = entry.obligation;
-	if (obligation.state === "delivered" || entry.inFlight || obligation.attempts >= DONE_MAX_ATTEMPTS) return;
+	if (obligation.state === "fulfilled" || obligation.state === "delivered" || entry.inFlight || obligation.attempts >= DONE_MAX_ATTEMPTS) return;
+	// Host-stop quiet: hold the receipt without burning a delivery attempt; the retry
+	// pass after quiet release (next real user input) delivers it.
+	if (hostStopQuiet) return;
+	if (!entry.sessionId || entry.sessionId !== doneDeliveryPiSessionId) return;
 	const now = Date.now();
 	if (doneDeliveryStore && !obligation.id.startsWith("volatile-")) {
 		try {
@@ -3736,29 +3845,36 @@ function sendDoneWithConfirmation(
 	entry.obligation = obligation;
 	entry.inFlight = true;
 	const prefix = entry.recoveredAmbiguous
-		? "(recovered delivery: this [subagent-done] may already have been delivered before restart; treat it as the same completion, not a new event.)"
+		? `(recovered delivery: this completion may already have been queued or persisted before restart; obligationId=${obligation.id}; treat it as the same event.)`
 		: isRetry
-			? `(re-delivery #${obligation.attempts}: the previous [subagent-done] below was not confirmed delivered; treat it as the same event, not a new one.)`
+			? `(re-delivery #${obligation.attempts}: Pi did not confirm the prior completion; obligationId=${obligation.id}; treat it as the same event.)`
 			: "";
 	const outText = prefix ? `${prefix}\n${obligation.text}` : obligation.text;
-	void trySendUserMessage(pi, outText).then((ok) => {
+	void queueCompletionAfterCutIn(pi, {
+		sessionId: entry.sessionId,
+		agentId: obligation.agentId,
+		runId: obligation.runId,
+		obligationId: obligation.id,
+		text: outText,
+	}, {
+		waitForCutIn: awaitCutInHoldRelease,
+		currentSessionId: () => doneDeliveryPiSessionId,
+	}).then((queued) => {
 		if (pendingDone.get(obligation.id) !== entry) return;
 		entry.inFlight = false;
-		let settled = { ...entry.obligation, state: ok ? "delivered" as const : "failed" as const };
+		let settled: DeliveryObligation = { ...entry.obligation, state: queued ? "queued" : "failed" };
 		if (doneDeliveryStore && !obligation.id.startsWith("volatile-")) {
 			try {
-				settled = doneDeliveryStore.finishAttempt(obligation.id, ok) ?? settled;
+				settled = doneDeliveryStore.finishAttempt(obligation.id, queued) ?? settled;
 			} catch (err) {
-				logDonePersistenceFailure(ok ? "confirm" : "fail", obligation.id, err);
+				logDonePersistenceFailure(queued ? "queue" : "fail", obligation.id, err);
 			}
 		}
 		entry.obligation = settled;
-		if (ok) {
-			pendingDone.delete(obligation.id);
-		} else if (entry.firstFailedAt === 0) {
+		if (!queued && entry.firstFailedAt === 0) {
 			entry.firstFailedAt = now;
 		}
-		if (!ok && settled.attempts >= DONE_MAX_ATTEMPTS) {
+		if (!queued && settled.attempts >= DONE_MAX_ATTEMPTS) {
 			pendingDone.delete(obligation.id);
 			console.error(
 				`[pipiui-subagent] giving up done delivery after ${settled.attempts} attempts: ${settled.agentId}`,
@@ -3770,15 +3886,18 @@ function sendDoneWithConfirmation(
 /** [subagent-done] 专用：带送达确认 + 失败重投。job 此时已 terminal，重投只依赖保存的 text。 */
 function deliverConfirmedDone(pi: ExtensionAPI, agentId: string, runId: string, text: string): void {
 	const obligation = createDoneObligation(agentId, runId, text);
-	if (obligation.state === "delivered") return;
+	if (obligation.state === "observed" || obligation.state === "fulfilled" || obligation.state === "delivered") return;
 	// Duplicate close/finalize callbacks for the same completion share one in-flight promise.
 	const existing = pendingDone.get(obligation.id);
 	if (existing) {
-		if (!existing.inFlight) sendDoneWithConfirmation(pi, existing, true);
+		if (!existing.inFlight && deliveryRetryDue(
+			existing.obligation, Date.now(), DONE_RETRY_MIN_INTERVAL_MS, DONE_MAX_ATTEMPTS,
+		)) sendDoneWithConfirmation(pi, existing, true);
 		return;
 	}
 	const entry: PendingDoneEntry = {
 		obligation,
+		sessionId: doneDeliveryPiSessionId ?? "",
 		firstFailedAt: 0,
 		inFlight: false,
 		recoveredAmbiguous: false,
@@ -3787,10 +3906,48 @@ function deliverConfirmedDone(pi: ExtensionAPI, agentId: string, runId: string, 
 	sendDoneWithConfirmation(pi, entry, false);
 }
 
+/** Reconcile only the active branch and inspect the first assistant after each exact wake. */
+function reconcilePersistedDone(piSessionId: string, branch: readonly unknown[]): void {
+	if (!doneDeliveryStore || doneDeliveryPiSessionId !== piSessionId) return;
+	for (const value of branch) {
+		const observed = completionObservation(value);
+		if (!observed || observed.sessionId !== piSessionId) continue;
+		const record = doneDeliveryStore.read(observed.obligationId) ?? pendingDone.get(observed.obligationId)?.obligation;
+		if (!record) continue;
+		const expected = { sessionId: piSessionId, agentId: record.agentId, runId: record.runId, obligationId: record.id };
+		if (!completionObservationMatches(observed, expected)) continue;
+		try {
+			const persistenceState = completionPersistenceState(branch, expected);
+			const settled = persistenceState === "fulfilled"
+				? doneDeliveryStore.markFulfilled(record.id)
+				: persistenceState === "retryable"
+					? doneDeliveryStore.markRetryable(record.id)
+					: doneDeliveryStore.markObserved(record.id);
+			if (!settled) continue;
+			if (settled.state === "failed" && settled.attempts < DONE_MAX_ATTEMPTS) {
+				pendingDone.set(record.id, {
+					obligation: settled,
+					sessionId: piSessionId,
+					firstFailedAt: settled.updatedAt,
+					inFlight: false,
+					recoveredAmbiguous: false,
+				});
+			} else {
+				pendingDone.delete(record.id);
+			}
+		} catch (err) {
+			logDonePersistenceFailure("reconcile", record.id, err);
+		}
+	}
+}
+
 /** Bind persistence to Pi's durable session identity, then restore delivery only (not execution). */
-function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string): void {
+function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string, activeBranch: readonly unknown[]): void {
 	if (!PIPIUI_MAIN_CWD || PIPIUI_DEPTH !== 0 || !piSessionId) return;
-	if (doneDeliveryPiSessionId === piSessionId && doneDeliveryStore) return;
+	if (doneDeliveryPiSessionId === piSessionId && doneDeliveryStore) {
+		reconcilePersistedDone(piSessionId, activeBranch);
+		return;
+	}
 	if (doneDeliveryPiSessionId && doneDeliveryPiSessionId !== piSessionId) {
 		// A runtime session switch must not retry the previous session's messages here.
 		// Their durable rows remain for that Pi session's next startup.
@@ -3799,7 +3956,7 @@ function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string): voi
 	}
 	doneDeliveryPiSessionId = piSessionId;
 	try {
-		doneDeliveryStore = new DeliveryObligationStore(
+			doneDeliveryStore = new DeliveryObligationStore(
 			path.join(
 				PIPIUI_MAIN_CWD,
 				".pi",
@@ -3808,14 +3965,18 @@ function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string): voi
 			),
 			{ routingKey: piSessionId },
 		);
+		reconcilePersistedDone(piSessionId, activeBranch);
 		for (const recovered of doneDeliveryStore.recoverable()) {
 			const entry: PendingDoneEntry = {
 				obligation: recovered.record,
+				sessionId: piSessionId,
 				firstFailedAt: recovered.record.state === "failed" ? recovered.record.updatedAt : 0,
 				inFlight: false,
 				recoveredAmbiguous: recovered.ambiguous,
 			};
 			pendingDone.set(recovered.record.id, entry);
+			// A new session lifecycle owns one replay. Same-process queued/observed
+			// rows never retry while the healthy Boss turn may still be running.
 			sendDoneWithConfirmation(pi, entry, recovered.record.attempts > 0);
 		}
 	} catch (err) {
@@ -3829,8 +3990,15 @@ function notifySubagentDone(
 	result: SingleResult,
 	extra?: { aborted?: boolean; error?: string },
 ): void {
-	// Finalize job BEFORE deliver: status must work even if sendUserMessage fails.
+	// Finalize job BEFORE notification: status must work even if Pi rejects the wake-up.
 	const terminalRunId = ensureJobTerminalFromResult(result, extra);
+	const aborted = extra?.aborted === true || result.stopReason === "aborted";
+	if (aborted) {
+		// An aborted job never pushes a [subagent-done] follow-up. The registry is already
+		// terminal and the Subagents panel shows the aborted state; pushing one receipt
+		// turn per aborted worker is what kept a stopped session churning (2026-08-15).
+		return;
+	}
 	const runId = result.agentId
 		? (result.runId ?? terminalRunId ?? jobRegistry.get(result.agentId)?.runId ?? DeliveryObligationStore.runId())
 		: undefined;
@@ -4333,6 +4501,7 @@ async function runSingleAgent(
 		: normalToolSelection;
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
+	if (PIPIUI_CODING_TOOLS_EXT && !options?.computerWorker) args.push("-e", PIPIUI_CODING_TOOLS_EXT);
 	// The official package owns the child-side read-only query registration.
 	// Mount it only alongside a complete main-issued capability tuple.
 	if (terminalMemoryBrokerEnvironment) {
@@ -4371,7 +4540,10 @@ async function runSingleAgent(
 		exitCode: 0,
 		messages: [],
 		stderr: "",
-		usage: emptyUsage(),
+		usage: {
+			...emptyUsage(),
+			...(options?.contextWindow ? { contextWindow: options.contextWindow } : {}),
+		},
 		model: resolvedModel,
 		step,
 		agentId: pipiuiAgentId,
@@ -4391,6 +4563,7 @@ async function runSingleAgent(
 		task,
 		depth: options?.depth ?? PIPIUI_DEPTH + 1,
 		model: resolvedModel ?? null,
+		...(options?.contextWindow ? { contextWindow: options.contextWindow } : {}),
 		...(options?.title ? { title: options.title } : {}),
 		...(options?.deadlineAt ? { deadlineAt: options.deadlineAt } : {}),
 		...(isBackground ? { background: true } : {}),
@@ -4448,7 +4621,36 @@ async function runSingleAgent(
 
 	let runtimeTimedOut = false;
 	let runtimeTimeout: ReturnType<typeof createRunScopedTimeout> | undefined;
+	let runtimeTimeoutNotified = false;
+	let runtimeProviderPhase: ProviderWaitPhase = "model-active";
+	let runtimePendingTools: string[] = [];
 	let firstChildSpawnedAt: number | undefined;
+	/** One line of "what this worker was doing when its budget expired"; rides the boss
+	 *  notification and the terminal receipt so neither is a bare "exceeded Ns" again. */
+	const runtimeBudgetDiagnostic = (now: number): string => {
+		const handle = handleForRun(pipiuiAgentId, runId);
+		const idleSec = handle ? Math.max(0, Math.floor((now - handle.lastActivityAt) / 1000)) : -1;
+		const phase =
+			runtimeProviderPhase === "awaiting-model"
+				? `awaiting model response (${currentResult.model || resolvedModel || agentName})`
+				: runtimeProviderPhase === "running-tool"
+					? `running tool${runtimePendingTools.length > 0 ? ` ${runtimePendingTools.join(",")}` : "s"}`
+					: "streaming model output";
+		const pid = handle?.pid;
+		const alive = typeof pid === "number" ? (isProcessAlive(pid) ? "alive" : "dead") : "unknown";
+		return [
+			`budget=${Math.round((executionPolicy?.timeoutMs ?? 0) / 1000)}s`,
+			`elapsed=${firstChildSpawnedAt !== undefined ? Math.round((now - firstChildSpawnedAt) / 1000) : 0}s`,
+			`idle=${idleSec}s`,
+			`phase=${phase}`,
+			`turns=${currentResult.usage.turns}`,
+			`contextTokens=${currentResult.usage.contextTokens}`,
+			`cost=$${currentResult.usage.cost.toFixed(4)}`,
+			`child pid=${pid ?? "?"}(${alive})`,
+			`last=${(pipiuiActivity || "(none)").slice(0, 160)}`,
+			sessionDir ? `session=${sessionId}` : "session=none",
+		].join(" · ");
+	};
 	try {
 		// Central child prompt: the agent's own system prompt plus, for desktop-
 		// granted dispatches only, the shared Computer Use policy (applies to ALL
@@ -4558,12 +4760,47 @@ async function runSingleAgent(
 						now: () => firstChildSpawnedAt!,
 						isCurrentRun: (candidateRunId) => handleForRun(pipiuiAgentId, candidateRunId) !== undefined,
 						onTimeout() {
-							runtimeTimedOut = true;
-							currentResult.stopReason = "runtime_timeout";
-							currentResult.errorMessage = `runtime_timeout: exceeded ${executionPolicy.timeoutMs! / 1000}s absolute runtime limit`;
-							pipiuiActivity = currentResult.errorMessage;
+							// Budget expiry is progress-aware: a producing worker silently earns
+							// another budget; a stalled one earns the boss one diagnostic plus one
+							// final budget; only a second stalled expiry aborts.
+							const now = Date.now();
+							const handle = handleForRun(pipiuiAgentId, runId);
+							const idleMs = handle ? Math.max(0, now - handle.lastActivityAt) : Number.POSITIVE_INFINITY;
+							const expiry = decideRuntimeBudgetExpiry({
+								idleMs,
+								progressGraceMs: STALL_THRESHOLD_MS,
+								notified: runtimeTimeoutNotified,
+							});
+							if (expiry === "abort") {
+								runtimeTimedOut = true;
+								currentResult.stopReason = "runtime_timeout";
+								currentResult.errorMessage = `runtime_timeout: exceeded ${executionPolicy.timeoutMs! / 1000}s runtime budget with no progress (${runtimeBudgetDiagnostic(now)})`;
+								pipiuiActivity = currentResult.errorMessage;
+								pipiuiUpdate(true);
+								handleForRun(pipiuiAgentId, runId)?.controller.abort();
+								return;
+							}
+							const extendedDeadlineAt = runtimeTimeout!.extend();
+							if (handle) handle.deadlineAt = extendedDeadlineAt;
+							pipiuiReport({ kind: "update", agentId: pipiuiAgentId, runId, deadlineAt: extendedDeadlineAt });
+							if (expiry === "notify-extend") {
+								runtimeTimeoutNotified = true;
+								const budgetSec = Math.round(executionPolicy.timeoutMs! / 1000);
+								const title = options.title?.trim() || task.split("\n")[0]?.trim().slice(0, 80) || "(untitled)";
+								runtimeBudgetNotify(
+									[
+										`[subagent-timeout] agentId=${pipiuiAgentId} runId=${runId} title=${title}`,
+										`  ${runtimeBudgetDiagnostic(now)}`,
+										`The ${budgetSec}s runtime budget expired while this worker made no progress. It has been re-armed once for another ${budgetSec}s instead of being killed.`,
+										`Before the new budget expires, query subagent_status({agentId:"${pipiuiAgentId}"}), then choose exactly one: keep waiting and say why / subagent_abort({agentId:"${pipiuiAgentId}"}) and re-dispatch by a materially different route / ask the user.`,
+										`If the re-armed budget also expires with no progress the worker is aborted automatically and its result carries this same diagnostic. Do not treat this message as a new user request.`,
+									].join("\n"),
+								);
+								pipiuiActivity = `runtime budget expired (idle ${Math.floor(idleMs / 1000)}s); re-armed once, boss notified`;
+							} else {
+								pipiuiActivity = `runtime budget re-armed (still producing, idle ${Math.floor(idleMs / 1000)}s)`;
+							}
 							pipiuiUpdate(true);
-							handleForRun(pipiuiAgentId, runId)?.controller.abort();
 						},
 					});
 					const handle = handleForRun(pipiuiAgentId, runId);
@@ -4586,6 +4823,8 @@ async function runSingleAgent(
 				providerWait = createProviderWaitController({
 					model: currentResult.model || resolvedModel || agentName,
 					onPhase(phase) {
+						runtimeProviderPhase = phase;
+						if (phase !== "running-tool") runtimePendingTools = [];
 						if (phase !== "awaiting-model") return;
 						pipiuiActivity = providerWait.activity();
 						pipiuiUpdate(true);
@@ -4616,6 +4855,16 @@ async function runSingleAgent(
 				const streamParts = new Map<number, StreamPart>();
 				const streamDirty = new Set<number>();
 				let streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
+					let lastUsageKey = "";
+					let lastUsageEmitAt = 0;
+					// Output-token estimate for providers whose stream reports usage only at
+					// message end (openai-completions). Accumulates delta chars per live
+					// assistant message; message_end resets it with the authoritative total.
+					let liveEstimateChars: EstimateCharCounts = { ascii: 0, cjk: 0 };
+					const countLiveEstimate = (delta: string) => {
+						if (!delta) return;
+						liveEstimateChars = addEstimateChars(liveEstimateChars, delta);
+					};
 				const STREAM_FLUSH_MS = 50;
 				const STREAM_TEXT_CAP = 4000;
 				const STREAM_THINKING_CAP = 600;
@@ -4659,6 +4908,45 @@ async function runSingleAgent(
 					flushStreamParts();
 				};
 
+				const emitUsageSnapshot = (usage: {
+					input: number;
+					output: number;
+					cacheRead: number;
+					cacheWrite: number;
+					cost: number;
+					contextTokens: number;
+					contextWindow?: number;
+				}, options?: { force?: boolean; turn?: number; model?: string | null; tools?: string[] }) => {
+					const decision = shouldEmitStreamingUsage({
+						previousKey: lastUsageKey,
+						lastEmitAt: lastUsageEmitAt,
+						next: usage,
+						now: Date.now(),
+						force: options?.force,
+					});
+					if (!decision.emit) return;
+					lastUsageKey = decision.key;
+					lastUsageEmitAt = decision.at;
+					pipiuiReport({
+						kind: "usage",
+						agentId: pipiuiAgentId,
+						runId,
+						turn: options?.turn ?? currentResult.usage.turns,
+						model: options?.model ?? currentResult.model ?? null,
+						tools: options?.tools ?? [],
+						usage: {
+							...usage,
+							...(currentResult.usage.contextWindow ? { contextWindow: currentResult.usage.contextWindow } : {}),
+						},
+					});
+				};
+
+				const emitStreamingUsage = (raw: unknown, force = false) => {
+					const live = liveUsageOrEstimate(raw, estimateOutputTokens(liveEstimateChars));
+					if (!live) return;
+					emitUsageSnapshot(combineCompletedAndStreamingUsage(currentResult.usage, live), { force });
+				};
+
 				const upsertStreamPart = (
 					contentIndex: number,
 					itemType: StreamPart["itemType"],
@@ -4695,6 +4983,10 @@ async function runSingleAgent(
 
 					// Live deltas (pi 0.84+). Do not wait for message_end.
 					if (event.type === "message_update") {
+						// Top-level usage is the current assistant message's cumulative
+						// provider report. Combine it with completed turns and emit a
+						// throttled kind:"usage" so the panel can show live tokens.
+						emitStreamingUsage(event.usage ?? event.message?.usage);
 						const ame = event.assistantMessageEvent;
 						if (ame && typeof ame === "object") {
 							providerWait.noteAssistantActivity();
@@ -4706,6 +4998,7 @@ async function runSingleAgent(
 							if (ctype === "text_start") {
 								upsertStreamPart(contentIndex, "text", "");
 							} else if (ctype === "text_delta") {
+								countLiveEstimate(String(ame.delta ?? ""));
 								upsertStreamPart(contentIndex, "text", String(ame.delta ?? ""));
 							} else if (ctype === "text_end") {
 								const finalText =
@@ -4721,6 +5014,7 @@ async function runSingleAgent(
 							} else if (ctype === "thinking_start") {
 								upsertStreamPart(contentIndex, "thinking", "");
 							} else if (ctype === "thinking_delta") {
+								countLiveEstimate(String(ame.delta ?? ""));
 								upsertStreamPart(contentIndex, "thinking", String(ame.delta ?? ""));
 							} else if (ctype === "thinking_end") {
 								const finalThinking =
@@ -4738,8 +5032,12 @@ async function runSingleAgent(
 								const toolName = String(ame.name ?? "tool");
 								pipiuiActivity = `${toolName} …`;
 								pipiuiUpdate();
+							} else if (ctype === "toolcall_delta") {
+								// Not rendered live, but the streamed argument chars are still
+								// generated output tokens; feed the live estimate.
+								countLiveEstimate(String(ame.delta ?? ""));
 							}
-							// toolcall_delta / toolcall_end: ignore (message_end owns final tool rows)
+							// toolcall_end: ignore (message_end owns final tool rows)
 							return;
 						}
 						// Legacy cumulative snapshot message_update (pre-0.84 / jcode-style).
@@ -4780,9 +5078,8 @@ async function runSingleAgent(
 									currentResult.usage.cacheWrite += usage.cacheWrite || 0;
 									currentResult.usage.cost += usage.cost?.total || 0;
 									currentResult.usage.contextTokens = usage.totalTokens || 0;
-									// Per-turn usage → PipiUI token ledger. Independent of the
-									// cost/turns aggregates above; gives per-turn input/output/cache
-									// breakdown that "end" doesn't carry. Safe to no-op if bridge unset.
+									// Authoritative session-total close-out. Replaces any live
+									// message_update preview so the panel never snaps backwards.
 									const toolSet = new Set<string>();
 									for (const part of (msg as any).content ?? []) {
 										if (part?.type === "toolCall" && typeof part.name === "string" && part.name) {
@@ -4790,21 +5087,18 @@ async function runSingleAgent(
 										}
 									}
 									const tools = [...toolSet].sort();
-									pipiuiReport({
-										kind: "usage",
-										agentId: pipiuiAgentId,
-										runId,
+									emitUsageSnapshot({
+										input: currentResult.usage.input,
+										output: currentResult.usage.output,
+										cacheRead: currentResult.usage.cacheRead,
+										cacheWrite: currentResult.usage.cacheWrite,
+										cost: currentResult.usage.cost,
+										contextTokens: currentResult.usage.contextTokens,
+									}, {
+										force: true,
 										turn: currentResult.usage.turns,
 										model: msg.model || currentResult.model || null,
 										tools,
-										usage: {
-											input: usage.input || 0,
-											output: usage.output || 0,
-											cacheRead: usage.cacheRead || 0,
-											cacheWrite: usage.cacheWrite || 0,
-											cost: usage.cost?.total || 0,
-											contextTokens: usage.totalTokens || 0,
-										},
 									});
 								}
 							if (!currentResult.model && msg.model) currentResult.model = msg.model;
@@ -4815,9 +5109,11 @@ async function runSingleAgent(
 							// 避免面板重复；tool 仍以 message_end 为权威落盘。
 							const pipiuiItems: Record<string, unknown>[] = [];
 							const toolCallIds: string[] = [];
+							const toolNames: string[] = [];
 							for (const part of (msg as any).content ?? []) {
 								if (part?.type === "toolCall") {
 									if (typeof part.id === "string" && part.id) toolCallIds.push(part.id);
+									if (typeof part.name === "string" && part.name) toolNames.push(part.name);
 									const args = (part.arguments ?? {}) as Record<string, unknown>;
 									const summary = summarizeToolArgsForUI(String(part.name ?? ""), args);
 									pipiuiActivity = `${part.name} ${summary}`;
@@ -4835,6 +5131,7 @@ async function runSingleAgent(
 								}
 							}
 							providerWait.noteToolBatch(toolCallIds);
+						runtimePendingTools = toolNames;
 							// Always emit log when we streamed text/thinking so Swift resets
 							// contentIndex→row slots even if tools array is empty (otherwise the
 							// next turn would overwrite the previous message's live rows).
@@ -4845,6 +5142,7 @@ async function runSingleAgent(
 							// after kind:"log"; clear local assembly state here.
 							streamParts.clear();
 							streamDirty.clear();
+							liveEstimateChars = { ascii: 0, cjk: 0 };
 						}
 						emitUpdate();
 						pipiuiUpdate();
@@ -5297,15 +5595,10 @@ const ThinkingParam = Type.Optional(
 		description: THINKING_PARAM_DESCRIPTION,
 	}),
 );
-const WorktreeParam = Type.Optional(
-	StringEnum(["isolated", "none"] as const, {
-		description: 'Bundled general-purpose only. Default "isolated". "none" requires noWorktreeReason.',
-	}),
-);
-const NoWorktreeReasonParam = Type.Optional(
-	Type.String({
-		maxLength: 500,
-		description: 'Bundled general-purpose only. Required with worktree="none": the Boss audit reason, one non-empty line.',
+const IsolationParam = Type.Optional(
+	StringEnum(["worktree", "none"] as const, {
+		description:
+			'Writable general-purpose defaults to worktree (isolated tree, then merge). Read-only roles ignore this. "none" shares the assigned cwd.',
 	}),
 );
 const HeartbeatSecsParam = Type.Optional(
@@ -5337,21 +5630,31 @@ const TaskItem = Type.Object({
 	),
 }, { additionalProperties: false });
 
+// Chain items speak the same Grok Build / Claude-family dispatch contract as the
+// single `subagent` tool. Grok 4.6 cannot reliably emit a required long field
+// named `task` on a subagent-dispatch tool (0/5 in the 2026-08-15 A/B probe: it
+// filled every optional field and always skipped `task`; the prompt/description
+// spelling arrived 6/6). Old names {agent, task, title, worktree} live only in
+// the sanitizer and must never re-enter this property list.
 const ChainItem = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
-	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
-	title: Type.Optional(
+	prompt: Type.String({
+		minLength: 1,
+		description: "The full task prompt for this step. May reference the prior step's output with the {previous} placeholder.",
+	}),
+	description: Type.String({
+		minLength: 1,
+		description: "Short description of the step (3-5 words).",
+	}),
+	subagent_type: Type.Optional(
 		Type.String({
-			description:
-				"Short one-line title shown in the Subagents panel list instead of the full task; omit to fall back to task text",
+			description: "Subagent type. Defaults to general-purpose. Built-in: general-purpose, explore, plan, reviewer.",
 		}),
 	),
+	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	thinking: ThinkingParam,
-	worktree: WorktreeParam,
-	noWorktreeReason: NoWorktreeReasonParam,
+	isolation: IsolationParam,
 	heartbeatSecs: HeartbeatSecsParam,
 	timeoutSecs: TimeoutSecsParam,
 	desktop: Type.Optional(
@@ -5382,25 +5685,37 @@ const SharedDispatchParams = {
 // Each public tool is one intent. The shared execute still accepts the internal
 // union (single / chain / tasks / abort / resolve) so wrappers can delegate.
 const SubagentParams = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke." }),
-	task: Type.String({ description: "Task to delegate." }),
-	title: Type.Optional(Type.String({ description: "Short one-line title; omit to fall back to task text." })),
-	blockedBy: BlockedByParam,
-	thinking: ThinkingParam,
-	worktree: WorktreeParam,
-	noWorktreeReason: NoWorktreeReasonParam,
-	heartbeatSecs: HeartbeatSecsParam,
-	timeoutSecs: TimeoutSecsParam,
-	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
-	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
+	prompt: Type.String({
+		minLength: 1,
+		description: "The full task prompt for the subagent to execute.",
+	}),
+	description: Type.String({
+		minLength: 1,
+		description: "Short description of the task (3-5 words).",
+	}),
+	subagent_type: Type.Optional(
+		Type.String({
+			description: "Subagent type. Defaults to general-purpose. Built-in: general-purpose, explore, plan, reviewer.",
+			default: "general-purpose",
+		}),
+	),
+	run_in_background: Type.Optional(
+		Type.Boolean({
+			default: true,
+			description: "If true, return immediately; completion arrives later. Default true at boss depth.",
+		}),
+	),
+	isolation: IsolationParam,
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process." })),
-	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
-	desktop: Type.Optional(StringEnum(["user-requested", "ui-verify"] as const, { description: DESKTOP_PARAM_DESCRIPTION })),
-	...SharedDispatchParams,
+	resume_from: Type.Optional(
+		Type.String({
+			description: "Resume a previous subagent. Pass the agent id returned by a prior call.",
+		}),
+	),
 }, { additionalProperties: false });
 const SubagentChainParams = Type.Object({
 	chain: Type.Array(ChainItem, {
-		description: "Ordered steps. Each item needs agent and task. Use {previous} to pass the prior step's output.",
+		description: "Ordered steps. Each item needs prompt (full brief) and description (3-5 word label). Use {previous} to pass the prior step's output.",
 		minItems: 1,
 	}),
 	...SharedDispatchParams,
@@ -5415,6 +5730,12 @@ const SubagentResolveParams = Type.Object({
 }, { additionalProperties: false });
 type SubagentExecuteParams = {
 	action?: "abort" | "resolve";
+	prompt?: string;
+	description?: string;
+	subagent_type?: string;
+	run_in_background?: boolean;
+	isolation?: "worktree" | "none";
+	resume_from?: string;
 	agent?: string;
 	task?: string;
 	title?: string;
@@ -5431,9 +5752,16 @@ type SubagentExecuteParams = {
 	cwd?: string;
 	verify?: string;
 	desktop?: "user-requested" | "ui-verify";
+	// The public schema speaks Grok-family names (prompt/description/subagent_type/
+	// isolation); adoptGrokBuildDispatch at execute entry fills the internal old names
+	// this runner reads, so agent/task stay required here.
 	chain?: Array<{
 		agent: string;
 		task: string;
+		prompt?: string;
+		description?: string;
+		subagent_type?: string;
+		isolation?: "worktree" | "none";
 		agentId?: string;
 		title?: string;
 		cwd?: string;
@@ -5819,12 +6147,13 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 			if (canonicalDiscovery.diagnostics.some((entry) => entry.severity === "error")) throw new Error("Canonical Computer Agent roles failed validation");
 			const computerAgents = bindCanonicalComputerAgents(discovery.agents, canonicalDiscovery.agents);
 			const sessionModel = formatCtxModel(ctx.model);
+			const contextWindow = ctxContextWindow(ctx.model as { contextWindow?: number } | undefined);
 			const runChild = async (agentName: string, task: string, options: Omit<RunSingleAgentOptions, "toolCallId"> = {}, childSignal?: AbortSignal) => {
 				const leader = agentName === "computer-use-leader";
 				const effectiveSignal = childSignal ? AbortSignal.any([taskSignal, childSignal]) : taskSignal;
 				const result = await runSingleAgent(ctx.cwd, computerAgents, agentName, task, undefined, undefined, effectiveSignal, undefined,
 					(results) => ({ mode: "single", agentScope: "user", projectAgentsDir: discovery.projectAgentsDir, results }),
-					{ ...options, toolCallId, ...(leader ? { agentId: taskId, parentAgentId: PIPIUI_PARENT, depth: PIPIUI_DEPTH + 1, retainContext: true, fresh: false } : { parentAgentId: taskId, depth: PIPIUI_DEPTH + 2 }), sessionModel, background: false });
+					{ ...options, toolCallId, ...(leader ? { agentId: taskId, parentAgentId: PIPIUI_PARENT, depth: PIPIUI_DEPTH + 1, retainContext: true, fresh: false } : { parentAgentId: taskId, depth: PIPIUI_DEPTH + 2 }), sessionModel, contextWindow, background: false });
 				if (result.exitCode !== 0 || result.errorMessage) throw Object.assign(new Error(result.errorMessage || result.stderr || `${agentName} failed`), {
 					agentId: result.agentId, runId: result.runId, resolvedModel: result.model, hadMessages: result.messages.length > 0,
 				});
@@ -6137,6 +6466,11 @@ export default function (pi: ExtensionAPI) {
 	dispatchQueueNotify = (text) => {
 		void trySendUserMessage(pi, text);
 	};
+	// Runtime-budget escalations ([subagent-timeout]) ride the same boss channel so a
+	// stalled worker's budget decision reaches the boss mid-turn instead of killing silently.
+	runtimeBudgetNotify = (text) => {
+		void trySendUserMessage(pi, text);
+	};
 	// Same channel carries worktree merge-recovery escalations; then rebuild the persisted loop
 	// (waiting-for-main windows and in-flight claims) exactly once per Boss-depth process.
 	bindWorktreeRecoveryEscalation(pi);
@@ -6150,15 +6484,35 @@ export default function (pi: ExtensionAPI) {
 	registerQoderContextWindowCompat(pi);
 	pi.on("session_start", (_event, ctx) => {
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
-		initializeDoneDeliveryStore(pi, piSessionId);
+		initializeDoneDeliveryStore(pi, piSessionId, ctx.sessionManager.getBranch());
+	});
+	// Extension handlers run before SessionManager persistence. Re-scan the active
+	// branch one tick later; sibling branches cannot acknowledge this wake.
+	pi.on("message_end", (event, ctx) => {
+		const piSessionId = ctx.sessionManager.getSessionId().trim();
+		const observed = completionObservation(event.message);
+		const assistantEnded = event.message.role === "assistant";
+		if ((!observed && !assistantEnded) || (observed && observed.sessionId !== piSessionId)) return;
+		const timer = setTimeout(() => {
+			if (doneDeliveryPiSessionId !== piSessionId) return;
+			reconcilePersistedDone(piSessionId, ctx.sessionManager.getBranch());
+			// A failed first Boss assistant becomes eligible only through the normal
+			// spacing/budget gate; healthy queued/observed rows remain ineligible.
+			retryPendingDoneAfterSessionSettled(pi);
+		}, 0);
+		timer.unref?.();
 	});
 	// Do not add another session_before_compact handler: Pi resolves that hook
 	// last-wins. The existing main-compaction hook remains its only owner; these
 	// post-compaction/settled notifications merely unblock pending done delivery.
-	pi.on("session_compact", () => {
+	pi.on("session_compact", (_event, ctx) => {
+		const piSessionId = ctx.sessionManager.getSessionId().trim();
+		reconcilePersistedDone(piSessionId, ctx.sessionManager.getBranch());
 		retryPendingDoneAfterSessionSettled(pi);
 	});
-	pi.on("agent_settled", () => {
+	pi.on("agent_settled", (_event, ctx) => {
+		const piSessionId = ctx.sessionManager.getSessionId().trim();
+		reconcilePersistedDone(piSessionId, ctx.sessionManager.getBranch());
 		retryPendingDoneAfterSessionSettled(pi);
 	});
 	registerSessionRecallTool(pi);
@@ -6167,8 +6521,17 @@ export default function (pi: ExtensionAPI) {
 	registerSubagentManagementTool(pi);
 	// Cut-in hold 提前释放：真实用户消息（本地/远程，非扩展自己的 followUp）已进入
 	// turn，说明 cut-in prompt 抢到了先手，暂缓的自动信号可以按原逻辑继续投递。
+	// 同一条真实消息也解除 host-stop 静默：用户的下一条输入是会话重新活动的唯一开关。
 	pi.on("input", (event) => {
-		if (event.source !== "extension") releaseCutInHold();
+		if (event.source !== "extension") {
+			releaseCutInHold();
+			const text = typeof (event as { text?: unknown }).text === "string"
+				? (event as { text: string }).text.trim()
+				: "";
+			// Any input except runtime-owned /subagent_* control commands (stop sweep,
+			// panel abort/resolve/recover) is the user acting again — release the gate.
+			if (!text.startsWith("/subagent_")) releaseHostStopQuiet(pi);
+		}
 	});
 	if (PIPIUI_SUBAGENT_SKILL_ISOLATION) {
 		// Pi still accepts extension-contributed skillPaths under --no-skills. Remove the
@@ -6303,8 +6666,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ---- 统一轮询（30s）：承载五条按节奏补推的路径 ——
-	// 1) done 重投：sendUserMessage 的 promise 未确认（reject 或未 settle）的 [subagent-done]，
-	//    同一 obligation 至少隔 60s 重投一次，直到确认。job 已 terminal，重投只依赖持久化 text。
+	// 1) done 重投：仅 Pi 明确拒绝/抛错或首个 Boss assistant 失败后的 pending/failed；
+	//    queued/observed 可能仍在健康长 turn 中，当前进程绝不按墙钟重复。
 	// 2) vanished 即时检测：pid 已死但没人报告 → 立刻推，推一次后从 runningAgents 删除。
 	// 3) stall 复推：idle ≥ 120s 即推 [subagent-stalled]，同一无活动片段最多首次 + 两次复推，
 	//    每次仍至少间隔 5 分钟；有新活动后 noteAgentActivity 复位计数和时间戳，重新武装。
@@ -6321,8 +6684,8 @@ export default function (pi: ExtensionAPI) {
 
 		// (1) done 重投
 		for (const [obligationId, entry] of [...pendingDone]) {
-			if (entry.obligation.state === "delivered") { pendingDone.delete(obligationId); continue; }
-			if (now - entry.obligation.lastAttemptAt < DONE_RETRY_MIN_INTERVAL_MS) continue;
+			if (entry.obligation.state === "fulfilled") { pendingDone.delete(obligationId); continue; }
+			if (!deliveryRetryDue(entry.obligation, now, DONE_RETRY_MIN_INTERVAL_MS, DONE_MAX_ATTEMPTS)) continue;
 			sendDoneWithConfirmation(pi, entry, true);
 		}
 
@@ -6369,7 +6732,7 @@ export default function (pi: ExtensionAPI) {
 				// be followed here, next to the thing it is about.
 				[
 					`[subagent-stalled] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine}`,
-					`Query it first with subagent_status({agentId:"${agentId}"}), then choose exactly one: keep waiting (say why) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent still reports [subagent-done], and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
+					`Query it first with subagent_status({agentId:"${agentId}"}), then choose exactly one: keep waiting (say why) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent does not push a [subagent-done] follow-up — confirm its terminal state via subagent_status — and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
 					`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${agentId}"}). If it is still running, close it with subagent_abort({agentId}) (or /subagent_abort) so this recurring message stops; if it is terminal (failed/aborted/interrupted), resolve it with subagent_resolve({agentId, runId}) (or /subagent_resolve). A text-only reply does not stop this message.`,
 				].join("\n"),
 			);
@@ -6466,6 +6829,24 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// Host-stop sweep. The backend stop button sends this after aborting the model turn:
+	// stop must stop the whole session, not only the turn. It also arms the host-stop
+	// quiet gate so no held receipt/reminder can wake the stopped session afterwards;
+	// the next real user message releases the gate.
+	pi.registerCommand("subagent_abort_all", {
+		description: "Abort all running/queued background subagents and quiet this session until the next user message: /subagent_abort_all (PipiUI)",
+		handler: async (_args, ctx) => {
+			hostStopQuiet = true;
+			const { aborted } = abortAllRunningAgents();
+			ctx.ui.notify(
+				aborted.length
+					? `Stop sweep: aborted ${aborted.length} background agent(s) (${aborted.join(", ")}). Receipts are held until your next message.`
+					: "Stop sweep: no background agents were running. Session is quiet until your next message.",
+				"info",
+			);
+		},
+	});
+
 	pi.registerCommand("subagent_resolve", {
 		description: "Mark one failed/aborted/interrupted subagent episode handled: /subagent_resolve <agentId> <runId> [reason] (PipiUI)",
 		handler: async (args, ctx) => {
@@ -6534,15 +6915,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	const subagentParameters = SubagentParams;
-	const parallelSubagentParameters = ParallelSubagentParams;
 	const subagentTool = {
 		name: "subagent",
 		label: "Subagent",
 		description: [
-			"Dispatch one worker. Required: agent, task. Optional: title, agentId, thinking, blockedBy.",
-			"For two or more independent tasks use subagent_parallel. For ordered steps use subagent_chain.",
-			"To stop a running job use subagent_abort. To close a failed episode use subagent_resolve.",
-			"Inspect jobs with subagent_status before re-dispatching the same work.",
+			"Dispatch one worker. Required: prompt (the full brief) and description (3-5 word label). Optional: subagent_type (default general-purpose), isolation (worktree|none), cwd, resume_from, run_in_background.",
+			"Independent workers: call this tool multiple times in the same response. Do not serialize them across turns.",
+			"Ordered steps use subagent_chain. Stop a job with subagent_abort. Close a failed episode with subagent_resolve. Inspect with subagent_status before re-dispatching.",
 		].join(" "),
 		parameters: subagentParameters,
 		// pi validates arguments before execute() runs; models that emit
@@ -6552,14 +6931,14 @@ export default function (pi: ExtensionAPI) {
 		prepareArguments: bindSanitizeStrictToolArguments(subagentParameters),
 
 		async execute(_toolCallId, params: SubagentExecuteParams, signal, onUpdate, ctx) {
-			params = omitNulls(params);
+			params = adoptGrokBuildDispatch(omitNulls(params));
 			const toolCallId = _toolCallId;
 			// One invocation is one wave, however many tasks it carries — that is the unit the
 			// fan-out layer plans in, so it is the unit the ledger's rows are grouped by.
 			beginWave();
-			const sessionModel = formatCtxModel(
-				(ctx as { model?: { provider?: string; id?: string } } | undefined)?.model,
-			);
+			const ctxModel = (ctx as { model?: { provider?: string; id?: string; contextWindow?: number } } | undefined)?.model;
+			const sessionModel = formatCtxModel(ctxModel);
+			const contextWindow = ctxContextWindow(ctxModel);
 			// 多层深度护栏：达到上限的进程不允许继续派 subagent
 			if (PIPIUI_DEPTH >= PIPIUI_MAX_DEPTH) {
 				return {
@@ -6575,6 +6954,7 @@ export default function (pi: ExtensionAPI) {
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
+			params = remapUnknownSubagentType(params, new Set(agents.map((agent) => agent.name)));
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
@@ -6681,7 +7061,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ toolCallId, background: true, agentId, title, sessionModel, verify, thinking, fresh, desktop, blockedBy, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs },
+					{ toolCallId, background: true, agentId, title, sessionModel, contextWindow, verify, thinking, fresh, desktop, blockedBy, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs },
 				)
 					.then((result) => {
 						notifySubagentDone(pi, result);
@@ -6966,7 +7346,7 @@ export default function (pi: ExtensionAPI) {
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					const taskWithContext = (step.task ?? step.prompt ?? "").replace(/\{previous\}/g, previousOutput);
 
 					// Create update callback that includes all previous results
 					const chainUpdate: OnUpdateCallback | undefined = onUpdate
@@ -6998,6 +7378,7 @@ export default function (pi: ExtensionAPI) {
 							toolCallId,
 							title: step.title,
 							sessionModel,
+							contextWindow,
 							verify: step.verify,
 							thinking: step.thinking,
 							agentId: step.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
@@ -7114,7 +7495,7 @@ export default function (pi: ExtensionAPI) {
 								undefined, // no parent abort binding
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ toolCallId, background: true, agentId, title: t.title, sessionModel, verify: t.verify, thinking: t.thinking, fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy },
+								{ toolCallId, background: true, agentId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy },
 							);
 							notifySubagentDone(pi, result);
 						} catch (err) {
@@ -7214,6 +7595,7 @@ export default function (pi: ExtensionAPI) {
 							toolCallId,
 							title: t.title,
 							sessionModel,
+							contextWindow,
 							verify: t.verify,
 							thinking: t.thinking,
 							agentId: t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
@@ -7315,6 +7697,7 @@ export default function (pi: ExtensionAPI) {
 						toolCallId,
 						title: params.title,
 						sessionModel,
+						contextWindow,
 						verify: params.verify,
 						thinking: params.thinking,
 						agentId: params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
@@ -7392,15 +7775,15 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("accent", `chain (${args.chain.length} steps)`) +
 					theme.fg("muted", ` [${scope}]`);
 				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
-					const step = args.chain[i];
-					// Clean up {previous} placeholder for display
-					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
+					const step = args.chain[i] as Record<string, unknown>;
+					// Clean up {previous} placeholder for display; accept both name families.
+					const cleanTask = String((step.prompt ?? step.task) || "").replace(/\{previous\}/g, "").trim();
 					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
 					text +=
 						"\n  " +
 						theme.fg("muted", `${i + 1}.`) +
 						" " +
-						theme.fg("accent", step.agent) +
+						theme.fg("accent", String(step.subagent_type ?? step.agent ?? "general-purpose")) +
 						theme.fg("dim", ` ${preview}`);
 				}
 				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
@@ -7715,16 +8098,18 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_chain",
 		label: "Subagent Chain",
-		description: "Run ordered worker steps. Required: chain[{agent, task}]. Each step may use {previous} for the prior output.",
+		description: "Run ordered worker steps. Each chain item needs prompt (the full brief) and description (3-5 word label). A step may reference the prior step's output as {previous}.",
 		promptSnippet: "Run ordered subagent steps in sequence; a step references the prior step's output as {previous}.",
 		promptGuidelines: [
-			"Use subagent_chain only for genuinely ordered steps; independent tasks belong in subagent_parallel.",
+			"Use subagent_chain only for genuinely ordered steps; independent tasks belong in multiple subagent calls in one response.",
 			"Chain steps run synchronously in order; do not use a chain to serialize work that is actually independent.",
 		],
 		parameters: SubagentChainParams,
 		prepareArguments: bindSanitizeStrictToolArguments(SubagentChainParams),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return subagentTool.execute(toolCallId, omitNulls(params) as SubagentExecuteParams, signal, onUpdate, ctx);
+			// Public chain items carry prompt/description; the shared execute re-runs
+			// adoptGrokBuildDispatch and reads the internal old names it fills.
+			return subagentTool.execute(toolCallId, omitNulls(params) as unknown as SubagentExecuteParams, signal, onUpdate, ctx);
 		},
 		renderCall(args, theme) {
 			const steps = args.chain ?? [];
@@ -7732,14 +8117,15 @@ export default function (pi: ExtensionAPI) {
 				theme.fg("toolTitle", theme.bold("subagent_chain ")) +
 				theme.fg("accent", `${steps.length} steps`);
 			for (let i = 0; i < Math.min(steps.length, 3); i++) {
-				const step = steps[i];
-				const cleanTask = String(step.task ?? "").replace(/\{previous\}/g, "").trim();
+				const step = steps[i] as Record<string, unknown>;
+				// Raw args may carry either spelling: new prompt/description or replayed old task/agent.
+				const cleanTask = String(step.prompt ?? step.task ?? "").replace(/\{previous\}/g, "").trim();
 				const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
 				text +=
 					"\n  " +
 					theme.fg("muted", `${i + 1}.`) +
 					" " +
-					theme.fg("accent", step.agent) +
+					theme.fg("accent", String(step.subagent_type ?? step.agent ?? "general-purpose")) +
 					theme.fg("dim", ` ${preview}`);
 			}
 			if (steps.length > 3) text += `\n  ${theme.fg("muted", `... +${steps.length - 3} more`)}`;
@@ -7792,34 +8178,6 @@ export default function (pi: ExtensionAPI) {
 				0,
 				0,
 			);
-		},
-	});
-	pi.registerTool({
-		name: "subagent_parallel",
-		label: "Subagent Parallel",
-		promptSnippet: "Dispatch two or more independent subagent tasks together; each item requires task and agent.",
-		promptGuidelines: [
-			"Use subagent_parallel for every independent fan-out; never send tasks[] to subagent.",
-			"Every item must include a complete non-empty task before its agent name.",
-		],
-		description:
-			"Dispatch two or more independent workers in one wave. Required: tasks[{task, agent}]. Use subagent for one worker, subagent_chain for ordered steps.",
-		parameters: parallelSubagentParameters,
-		prepareArguments: bindSanitizeStrictToolArguments(parallelSubagentParameters),
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			params = omitNulls(params);
-			const reserved = new Set<string>();
-			const delegated = {
-				tasks: params.tasks.map((task) => ({
-					task: task.task,
-					agent: task.agent,
-					// This wrapper exposes no agentScope, so shared execute stays in user scope and
-					// reaches its synchronous atomic selector without an intervening await. Pre-reserving
-					// here would make that selector reject its own freshly generated candidate.
-					agentId: generatePipiuiAgentId(reserved, { reserveGlobally: false }),
-				})),
-			};
-			return subagentTool.execute(toolCallId, delegated, signal, onUpdate, ctx);
 		},
 	});
 }

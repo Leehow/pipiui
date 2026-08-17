@@ -99,7 +99,15 @@ test("tool allowlist: desktop tools injected only when the host gate passed", ()
     allowRecursiveDelegation: false,
   });
   assert.equal(unrestricted.flag, "--exclude-tools");
-  assert.deepEqual(unrestricted.names, ["bash", "subagent"]);
+  assert.deepEqual(unrestricted.names, [
+    "bash",
+    "subagent",
+    "subagent_abort",
+    "subagent_chain",
+    "subagent_parallel",
+    "subagent_resolve",
+    "subagent_status",
+  ]);
 
   const legacyNoGrant = resolveSubagentToolSelection({
     declaredTools: undefined,
@@ -174,7 +182,7 @@ test("schema: per-task desktop field on single, tasks[], chain — each independ
   const enumDecls = subagent.match(
     /StringEnum\(\["user-requested", "ui-verify"\] as const, \{/g,
   ) ?? [];
-  assert.equal(enumDecls.length, 3, "TaskItem, ChainItem and SubagentParams each declare desktop");
+  assert.equal(enumDecls.length, 2, "TaskItem and ChainItem each declare desktop");
 
   const desktopParamUses = subagent.match(/params\.desktop/g) ?? [];
   const desktopOptionUses = subagent.match(/desktop: params\.desktop/g) ?? [];

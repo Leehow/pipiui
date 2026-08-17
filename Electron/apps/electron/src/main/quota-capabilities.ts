@@ -1,9 +1,11 @@
+import { existsSync } from 'node:fs'
 import { promises as fs } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import { session } from 'electron'
 
-type CookieReader = (provider: 'kimi' | 'qwen-token-plan') => Promise<string | undefined>
+type CookieReader = (provider: 'kimi' | 'qwen-token-plan' | 'cursor') => Promise<string | undefined>
 type CookiePersister = (provider: 'qwen-token-plan', cookie: string) => Promise<void>
 
 const DEFAULT_BROWSER_PARTITION = 'pipiui-browser'
@@ -65,8 +67,69 @@ async function qwenTokenPlanCookie(userDataPath: string): Promise<string | undef
   return cachedCookie(userDataPath)
 }
 
+const CURSOR_COOKIE_NAMES = new Set([
+  'WorkosCursorSessionToken',
+  '__Secure-next-auth.session-token',
+  'next-auth.session-token',
+])
+
+function cursorCookieHeader(cookies: Electron.Cookie[]): string | undefined {
+  const matched = cookies.filter(cookie => {
+    const domain = cookie.domain.toLowerCase()
+    return (domain.includes('cursor.com') || domain.includes('cursor.sh')) && CURSOR_COOKIE_NAMES.has(cookie.name)
+  })
+  if (!matched.length) return undefined
+  return matched.map(cookie => `${cookie.name}=${cookie.value}`).join('; ')
+}
+
+async function cursorBrowserCookie(userDataPath: string): Promise<string | undefined> {
+  const partitions = [DEFAULT_BROWSER_PARTITION]
+  try {
+    for (const entry of await fs.readdir(join(userDataPath, 'Partitions'))) {
+      if (entry.startsWith(`${DEFAULT_BROWSER_PARTITION}-`)) partitions.push(entry)
+    }
+  } catch { /* no partitions yet */ }
+  for (const partition of partitions) {
+    try {
+      const cookies = await session.fromPartition(`persist:${partition}`).cookies.get({})
+      const header = cursorCookieHeader(cookies)
+      if (header) return header
+    } catch { /* unreadable partition */ }
+  }
+}
+
 export function createQuotaCookieReader(userDataPath: string): CookieReader {
-  return provider => provider === 'qwen-token-plan' ? qwenTokenPlanCookie(userDataPath) : Promise.resolve(undefined)
+  return provider => {
+    if (provider === 'qwen-token-plan') return qwenTokenPlanCookie(userDataPath)
+    if (provider === 'cursor') return cursorBrowserCookie(userDataPath)
+    return Promise.resolve(undefined)
+  }
+}
+
+function cursorStateDbPath(): string {
+  return join(homedir(), 'Library', 'Application Support', 'Cursor', 'User', 'globalStorage', 'state.vscdb')
+}
+
+/** Read-only Cursor JWT. Never writes into Cursor's Application Support dir. */
+export async function readCursorAccessToken(): Promise<string | undefined> {
+  const path = cursorStateDbPath()
+  try { await fs.access(path) } catch { return undefined }
+  const wal = existsSync(`${path}-wal`)
+  const shm = existsSync(`${path}-shm`)
+  const { DatabaseSync } = await import('node:sqlite')
+  const uri = wal && !shm
+    ? `file:${path}?mode=ro&immutable=1`
+    : `file:${path}?mode=ro`
+  let database: InstanceType<typeof DatabaseSync> | undefined
+  try {
+    database = new DatabaseSync(uri, { readOnly: true, timeout: 250 })
+    const row = database.prepare('SELECT value FROM ItemTable WHERE key = ? LIMIT 1').get('cursorAuth/accessToken') as { value?: unknown } | undefined
+    return typeof row?.value === 'string' && row.value.trim() ? row.value.trim() : undefined
+  } catch {
+    return undefined
+  } finally {
+    try { database?.close() } catch { /* ignore */ }
+  }
 }
 
 /** Writes back only after a successful quota fetch (adapter calls this), so an

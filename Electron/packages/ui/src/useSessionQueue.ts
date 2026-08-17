@@ -52,12 +52,14 @@ export function useSessionQueue(host: PipiHostAPI, sessionId: string, streaming:
   const queueRef = useRef<QueuedMessage[]>(queue)
   const pendingRef = useRef(false)
   const loadGenerationRef = useRef(0)
+  const resyncGenerationRef = useRef(0)
   const snapshotGenerationRef = useRef(0)
   sessionRef.current = sessionId
   queueRef.current = queue
 
   useEffect(() => {
     const generation = ++loadGenerationRef.current
+    resyncGenerationRef.current += 1
     const snapshotGeneration = snapshotGenerationRef.current
     pendingRef.current = false
     setPending(false)
@@ -86,10 +88,23 @@ export function useSessionQueue(host: PipiHostAPI, sessionId: string, streaming:
   const resync = useCallback(async () => {
     const activeSessionId = sessionRef.current
     if (!activeSessionId) return
+    const generation = ++resyncGenerationRef.current
+    // `resync` is invoked at the terminal turn boundary. A `sending` item is
+    // only the transient RPC-acceptance state and cannot remain authoritative
+    // once that turn has settled; clear it synchronously so a delayed pull
+    // cannot strand the composer. Queued/failed work remains visible, and the
+    // host response below may still report a genuinely newer sending item.
+    snapshotGenerationRef.current += 1
+    const snapshotGeneration = snapshotGenerationRef.current
+    setQueue(current => current.filter(item => item.state !== 'sending'))
     try {
       const items = await host.listQueue(activeSessionId)
-      // A queue_update that arrived after this pull started is newer; keep it.
-      if (sessionRef.current === activeSessionId) {
+      // A newer resync or queue_update wins even when this request returns last.
+      if (
+        sessionRef.current === activeSessionId
+        && resyncGenerationRef.current === generation
+        && snapshotGenerationRef.current === snapshotGeneration
+      ) {
         snapshotGenerationRef.current += 1
         setQueue(items)
       }
