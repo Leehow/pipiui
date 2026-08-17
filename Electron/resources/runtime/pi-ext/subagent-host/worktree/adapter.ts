@@ -98,10 +98,19 @@ export type GitWorktreeListResultV1 = {
  * supervision, and persistence remain above it. Every mutating method is
  * called only after the service's pure policy permits it.
  */
+export type GitMergeAttestationV1 = {
+	agentId: string;
+	runId: string;
+};
+
 export interface GitWorktreeAdapter {
 	repositoryKey(mainCwd: string): Promise<string>;
 	inspect(input: WorktreeFinalizationInputV1): Promise<GitWorktreeInspectionV1>;
-	merge(mainCwd: string, branch: string): Promise<GitOperationResultV1>;
+	merge(mainCwd: string, branch: string, attestation?: GitMergeAttestationV1): Promise<GitOperationResultV1>;
+	/** Optional: accident-recovery checkpoint before merge. */
+	writeCheckpointRef?(mainCwd: string, agentId: string, sha: string): Promise<GitOperationResultV1>;
+	/** Optional: local-only merge audit note. Failures must not block finalization. */
+	addAuditNote?(mainCwd: string, commitSha: string, message: string): Promise<GitOperationResultV1>;
 	removeWorktree(mainCwd: string, worktreePath: string): Promise<GitOperationResultV1>;
 	cleanupMergedBranch(input: {
 		mainCwd: string;
@@ -137,6 +146,18 @@ function operationMessage(result: GitOperationResultV1): string {
 
 function safeBranch(branch: string): boolean {
 	return Boolean(branch.trim()) && !branch.startsWith("-") && !/[\u0000-\u001f]/.test(branch);
+}
+
+/** Ref-safe agent id for `refs/pipiui/checkpoints/<id>`. */
+export function checkpointRefNameV1(agentId: string): string {
+	const safe = agentId.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 200);
+	return `refs/pipiui/checkpoints/${safe || "unknown"}`;
+}
+
+export function mergeCommitMessageV1(branch: string, attestation?: GitMergeAttestationV1): string {
+	const body = `Merge branch '${branch}'`;
+	if (!attestation) return body;
+	return `${body}\n\nPipiUI-Agent: ${attestation.agentId}\nPipiUI-Run: ${attestation.runId}\n`;
 }
 
 function safeAbsolutePath(value: string): boolean {
@@ -346,10 +367,39 @@ export class NodeGitWorktreeAdapter implements GitWorktreeAdapter {
 		return canonicalGitPathV1(path.isAbsolute(top) ? top : path.resolve(mainCwd, top));
 	}
 
-	/** Existing Swift behavior: `git merge --no-edit <branch>` (not ff-only). */
-	merge(mainCwd: string, branch: string): Promise<GitOperationResultV1> {
+	/**
+	 * Merge with an explicit message so trailers survive. Author/committer stay the
+	 * main-repo identity; we only add `PipiUI-Agent` / `PipiUI-Run` trailers.
+	 */
+	merge(mainCwd: string, branch: string, attestation?: GitMergeAttestationV1): Promise<GitOperationResultV1> {
 		if (!safeBranch(branch)) return Promise.resolve(invalidOperation("branch is invalid"));
-		return this.runGit(mainCwd, ["merge", "--no-edit", branch]);
+		const message = mergeCommitMessageV1(branch, attestation);
+		return this.runGit(mainCwd, ["merge", "--no-ff", "-m", message, branch]);
+	}
+
+	/**
+	 * Accident-recovery anchor: `git reset --hard refs/pipiui/checkpoints/<agentId>`
+	 * restores main to the pre-merge SHA captured by slice 1.
+	 */
+	writeCheckpointRef(mainCwd: string, agentId: string, sha: string): Promise<GitOperationResultV1> {
+		const ref = checkpointRefNameV1(agentId);
+		if (!sha.trim() || !/^[0-9a-fA-F]{7,64}$/.test(sha.trim())) {
+			return Promise.resolve(invalidOperation("checkpoint sha is invalid"));
+		}
+		return this.runGit(mainCwd, ["update-ref", ref, sha.trim()]);
+	}
+
+	/**
+	 * Local-only audit. GitHub does not render notes; default clone/fetch does not
+	 * carry `refs/notes/*`. Cross-machine needs an explicit
+	 * `git push origin refs/notes/pipiui`. This adapter never auto-pushes.
+	 * `-f` keeps retries idempotent.
+	 */
+	addAuditNote(mainCwd: string, commitSha: string, message: string): Promise<GitOperationResultV1> {
+		if (!commitSha.trim() || !/^[0-9a-fA-F]{7,64}$/.test(commitSha.trim())) {
+			return Promise.resolve(invalidOperation("note commit sha is invalid"));
+		}
+		return this.runGit(mainCwd, ["notes", "--ref=pipiui", "add", "-f", "-m", message, commitSha.trim()]);
 	}
 
 	/** Non-force only: dirty registered worktrees remain intact. */
