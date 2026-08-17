@@ -89,6 +89,20 @@ export type WorktreeFinalizationServiceOptionsV1 = {
 	 * default runner only executes `verify.argv` directly with no shell.
 	 */
 	postMergeVerify?: PostMergeVerifyRunnerV1;
+	/**
+	 * Optional host hook after `result.merge === "merged"` and before cleanup.
+	 * Failures here must never fail finalization.
+	 */
+	onMerged?: (event: WorktreeMergedEventV1) => void | Promise<void>;
+};
+
+export type WorktreeMergedEventV1 = {
+	agentId: string;
+	runId: string;
+	mainCwd: string;
+	branch: string;
+	preMergeHead?: string;
+	landedFiles: string[];
 };
 
 type CleanupOutcome = {
@@ -197,6 +211,7 @@ export class WorktreeFinalizationServiceV1 {
 	private readonly clock: WorktreeFinalizationClockV1;
 	private readonly logger: WorktreeFinalizationLoggerV1;
 	private readonly postMergeVerify?: PostMergeVerifyRunnerV1;
+	private readonly onMerged?: WorktreeFinalizationServiceOptionsV1["onMerged"];
 	private readonly verifyTimeoutMs: number;
 	private readonly abortSignal?: AbortSignal;
 	private readonly terminationGraceMs: number;
@@ -214,6 +229,7 @@ export class WorktreeFinalizationServiceV1 {
 		this.clock = options.clock ?? systemClock;
 		this.logger = options.logger ?? {};
 		this.postMergeVerify = options.postMergeVerify;
+		this.onMerged = options.onMerged;
 	}
 
 	/** Reap settled leftover `.pi/worktrees` entries without racing a live finalization. */
@@ -328,6 +344,17 @@ export class WorktreeFinalizationServiceV1 {
 		}
 
 		this.logger.info?.("worktree-finalization-merge", { agentId: input.agentId, runId: input.runId, branch: input.worktree.branch });
+		let preMergeHead: string | undefined;
+		try {
+			const head = await runSpawnV1("git", ["-C", input.mainCwd, "rev-parse", "--verify", "HEAD"], {
+				timeoutMs: DEFAULT_GIT_TIMEOUT_MS,
+				...(this.abortSignal ? { signal: this.abortSignal } : {}),
+				terminationGraceMs: this.terminationGraceMs,
+			});
+			if (head.ok && head.stdout.trim()) preMergeHead = head.stdout.trim();
+		} catch (error) {
+			appendMessages(result, [`pre-merge HEAD capture failed: ${error instanceof Error ? error.message : String(error)}`]);
+		}
 		let merged: GitOperationResultV1;
 		try {
 			merged = await this.adapter.merge(input.mainCwd, input.worktree.branch);
@@ -370,7 +397,45 @@ export class WorktreeFinalizationServiceV1 {
 		}
 		result.merge = "merged";
 		appendMessages(result, ["worker branch merged into main using git merge --no-edit"]);
+		await this.notifyMerged(input, result, preMergeHead);
 		return this.completeIntegrated(input, previous, result);
+	}
+
+	private async notifyMerged(
+		input: WorktreeFinalizationInputV1,
+		result: WorktreeFinalizationResultV1,
+		preMergeHead: string | undefined,
+	): Promise<void> {
+		if (!this.onMerged || result.merge !== "merged") return;
+		let landedFiles: string[] = [];
+		try {
+			if (preMergeHead) {
+				const diff = await runSpawnV1(
+					"git",
+				["-C", input.mainCwd, "diff", "--name-only", `${preMergeHead}..HEAD`],
+				{
+					timeoutMs: DEFAULT_GIT_TIMEOUT_MS,
+					...(this.abortSignal ? { signal: this.abortSignal } : {}),
+					terminationGraceMs: this.terminationGraceMs,
+				},
+				);
+				if (diff.ok) {
+					landedFiles = [...new Set(diff.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean))].sort();
+				} else {
+					appendMessages(result, [`landed-files diff failed: ${diff.error || diff.stderr || `exit ${diff.exitCode ?? "?"}`}`]);
+				}
+			}
+			await this.onMerged({
+				agentId: input.agentId,
+				runId: input.runId,
+				mainCwd: input.mainCwd,
+				branch: input.worktree.branch,
+				...(preMergeHead ? { preMergeHead } : {}),
+				landedFiles,
+			});
+		} catch (error) {
+			appendMessages(result, [`onMerged hook failed: ${error instanceof Error ? error.message : String(error)}`]);
+		}
 	}
 
 	private async completeIntegrated(
