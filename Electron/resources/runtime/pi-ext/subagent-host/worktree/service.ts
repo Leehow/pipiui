@@ -355,9 +355,23 @@ export class WorktreeFinalizationServiceV1 {
 		} catch (error) {
 			appendMessages(result, [`pre-merge HEAD capture failed: ${error instanceof Error ? error.message : String(error)}`]);
 		}
+		// Checkpoint before merge so a bad merge can `git reset --hard` back to this SHA.
+		if (preMergeHead && this.adapter.writeCheckpointRef) {
+			try {
+				const checkpoint = await this.adapter.writeCheckpointRef(input.mainCwd, input.agentId, preMergeHead);
+				if (!checkpoint.ok) {
+					appendMessages(result, [`merge checkpoint ref failed: ${operationDetail(checkpoint)}`]);
+				}
+			} catch (error) {
+				appendMessages(result, [`merge checkpoint ref failed: ${error instanceof Error ? error.message : String(error)}`]);
+			}
+		}
 		let merged: GitOperationResultV1;
 		try {
-			merged = await this.adapter.merge(input.mainCwd, input.worktree.branch);
+			merged = await this.adapter.merge(input.mainCwd, input.worktree.branch, {
+				agentId: input.agentId,
+				runId: input.runId,
+			});
 		} catch (error) {
 			result.disposition = "needs-user";
 			result.merge = "failed";
@@ -396,9 +410,11 @@ export class WorktreeFinalizationServiceV1 {
 			return this.state(input, previous, result);
 		}
 		result.merge = "merged";
-		appendMessages(result, ["worker branch merged into main using git merge --no-edit"]);
+		appendMessages(result, ["worker branch merged into main with PipiUI-Agent / PipiUI-Run trailers"]);
 		await this.notifyMerged(input, result, preMergeHead);
-		return this.completeIntegrated(input, previous, result);
+		const completed = await this.completeIntegrated(input, previous, result);
+		await this.writeMergeAuditNote(input, result);
+		return completed;
 	}
 
 	private async notifyMerged(
@@ -435,6 +451,47 @@ export class WorktreeFinalizationServiceV1 {
 			});
 		} catch (error) {
 			appendMessages(result, [`onMerged hook failed: ${error instanceof Error ? error.message : String(error)}`]);
+		}
+	}
+
+	/**
+	 * Local-only audit note. GitHub does not render notes; default clone/fetch
+	 * does not carry them. Cross-machine requires an explicit
+	 * `git push origin refs/notes/pipiui`. This path never auto-pushes.
+	 * Failures are recorded and never fail finalization.
+	 */
+	private async writeMergeAuditNote(
+		input: WorktreeFinalizationInputV1,
+		result: WorktreeFinalizationResultV1,
+	): Promise<void> {
+		if (result.merge !== "merged" || !this.adapter.addAuditNote) return;
+		try {
+			const head = await runSpawnV1("git", ["-C", input.mainCwd, "rev-parse", "--verify", "HEAD"], {
+				timeoutMs: DEFAULT_GIT_TIMEOUT_MS,
+				...(this.abortSignal ? { signal: this.abortSignal } : {}),
+				terminationGraceMs: this.terminationGraceMs,
+			});
+			const sha = head.ok ? head.stdout.trim() : "";
+			if (!sha) {
+				appendMessages(result, ["merge audit note skipped: could not resolve merge commit SHA"]);
+				return;
+			}
+			const payload = JSON.stringify({
+				schemaVersion: 1,
+				agentId: result.agentId,
+				runId: result.runId,
+				disposition: result.disposition,
+				merge: result.merge,
+				verify: {
+					exitCode: result.verify.exitCode ?? null,
+					postMergeExitCode: result.verify.postMergeExitCode ?? null,
+				},
+				updatedAt: result.updatedAt,
+			});
+			const note = await this.adapter.addAuditNote(input.mainCwd, sha, payload);
+			if (!note.ok) appendMessages(result, [`merge audit note failed: ${operationDetail(note)}`]);
+		} catch (error) {
+			appendMessages(result, [`merge audit note failed: ${error instanceof Error ? error.message : String(error)}`]);
 		}
 	}
 
