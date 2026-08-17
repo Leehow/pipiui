@@ -64,14 +64,13 @@ describe("main session spawn", () => {
     expect(args).not.toContain("--exclude-tools");
   });
 
-  it("closes the second shell: the terminal tool is gated by action, not left open", () => {
-    // `--exclude-tools bash` alone would still leave `terminal send` able to run a command.
+  it("does not set a terminal action gate on the Boss spawn", () => {
     const { env } = assemblePiSpawn({ cwd: "/tmp/project", features: DEFAULT_FEATURES, paths: {}, bridgePort: 1234, sessionCapability: "cap" });
-    expect(env.PIPIUI_BOSS_READ_ONLY).toBe("1");
+    expect(env.PIPIUI_BOSS_READ_ONLY).toBeUndefined();
     expect(assemblePiSpawn({ cwd: "/tmp/project", features: { terminal: true }, paths: {} }).env.PIPIUI_BOSS_READ_ONLY).toBeUndefined();
   });
 
-  it("never inherits the read-only marker from an outer shell", () => {
+  it("never inherits a leftover PIPIUI_BOSS_READ_ONLY marker from an outer shell", () => {
     expect(sanitizeEnvironment({ PIPIUI_BOSS_READ_ONLY: "0", HOME: "/home/x" })).toEqual({ HOME: "/home/x" });
   });
 

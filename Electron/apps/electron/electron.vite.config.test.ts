@@ -12,7 +12,7 @@ import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { resolveFileViewerCopyAssetsTarget } from '@file-viewer/vite-plugin'
-import electronViteConfig, { fileViewerAssetOptions, generatedWatchExcludes } from './electron.vite.config'
+import electronViteConfig, { fileViewerAssetOptions, generatedWatchExcludes, rendererAssetFileNames } from './electron.vite.config'
 
 type AliasEntry = { find: string | RegExp; replacement: string }
 
@@ -74,5 +74,13 @@ describe('main-process development watch stability', () => {
       '**/*.tsbuildinfo',
       '**/.cua-driver/**'
     ]))
+  })
+})
+
+describe('renderer asset names stay packable on macOS', () => {
+  it('gives extensionless LICENSE/NOTICE a .txt suffix instead of a trailing dot', () => {
+    expect(rendererAssetFileNames({ name: 'LICENSE' })).toBe('assets/[name]-[hash].txt')
+    expect(rendererAssetFileNames({ name: 'NOTICE' })).toBe('assets/[name]-[hash].txt')
+    expect(rendererAssetFileNames({ name: 'index.css' })).toBe('assets/[name]-[hash][extname]')
   })
 })

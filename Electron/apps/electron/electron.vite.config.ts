@@ -21,6 +21,15 @@ const hostApiSourceEntry = resolve(workspaceRoot, 'packages/host-api/src/index.t
 // build` alike, so the production bundle is built from the same source.
 const uiSourceEntry = resolve(uiPackageRoot, 'src/index.ts')
 const uiSourceAppCss = resolve(uiPackageRoot, 'src/app.css')
+// Extensionless static files (file-viewer LICENSE/NOTICE) become
+// `NAME-<hash>.` under Vite's default `[extname]`. electron-builder on
+// macOS cannot open a trailing-dot path (ENOENT).
+export function rendererAssetFileNames(assetInfo: { name?: string }): string {
+  const name = assetInfo.name ?? 'asset'
+  if (!/\.[A-Za-z0-9]+$/.test(name)) return 'assets/[name]-[hash].txt'
+  return 'assets/[name]-[hash][extname]'
+}
+
 export const fileViewerAssetOptions = {
   preset: 'office',
   copyAssets: { baseDir: 'file-viewer' },
@@ -60,6 +69,11 @@ export default defineConfig({
   },
   renderer: {
     plugins: [fileViewerRenderers(fileViewerAssetOptions), react()],
+    build: {
+      rollupOptions: {
+        output: { assetFileNames: rendererAssetFileNames }
+      }
+    },
     resolve: {
       // String aliases are prefix-matched, so the more specific style.css
       // subpath must be listed before the bare package alias. Importing
