@@ -26,6 +26,8 @@ export interface QueuedDispatchV1 {
 	title?: string;
 	task: string;
 	blockedBy: string[];
+	/** Advisory path prefixes this worker expects to touch. */
+	scope?: string[];
 	queuedAt: number;
 	/** Set once a dependency ended badly. The item stays queued and waits for the boss. */
 	heldReason?: string;
