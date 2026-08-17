@@ -25,7 +25,17 @@ import type {
 import type {
 	PostMergeVerifyRequestV1,
 	PostMergeVerifyResultV1,
+	WorktreeMergedEventV1,
 } from "../subagent-host/worktree/index.ts";
+
+let onMergedHook: ((event: WorktreeMergedEventV1) => void | Promise<void>) | undefined;
+
+/** Host binds the post-merge swarm broadcast here so the service stays Git-only. */
+export function bindWorktreeMergedHook(
+	hook: ((event: WorktreeMergedEventV1) => void | Promise<void>) | undefined,
+): void {
+	onMergedHook = hook;
+}
 
 /** Env value that hands finalization to pi. Anything else, including unset, leaves it to the host. */
 const PI_OWNED = "pi";
@@ -119,7 +129,10 @@ export async function finalizeWorktreeIfOwned(
 		// The attested verify must also run AFTER integration, in main, or a broken merge can
 		// silently land. The runner executes legacy string commands; argv-only hosts keep the
 		// service's own shell-less path.
-		{ postMergeVerify: piPostMergeVerifyRunner },
+		{
+			postMergeVerify: piPostMergeVerifyRunner,
+			...(onMergedHook ? { onMerged: onMergedHook } : {}),
+		},
 	);
 }
 

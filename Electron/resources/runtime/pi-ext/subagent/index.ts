@@ -132,6 +132,7 @@ import {
 	resolveDispatchConcurrency,
 } from "./dispatch-queue.ts";
 import {
+	bindWorktreeMergedHook,
 	closeoutDispositionFor,
 	finalizeWorktreeIfOwned,
 	summarizeFinalization,
@@ -145,6 +146,14 @@ import {
 	type WorktreeRecoveryAction,
 } from "./worktree-recovery.ts";
 import type { WorktreeFinalizationStateV1 } from "../subagent-host/worktree/schema.ts";
+import type { WorktreeMergedEventV1 } from "../subagent-host/worktree/service.ts";
+import {
+	BaseAdvanceDeduper,
+	createTipPreflightTracker,
+	evaluateBaseAdvanceAlerts,
+	formatBaseAdvancedSignal,
+	formatPreflightConflictSignal,
+} from "../subagent-host/worktree/preflight.ts";
 import {
 	bindCanonicalComputerAgents,
 	configuredHeartbeatAt,
@@ -2033,6 +2042,10 @@ interface RunningAgentHandle {
 	 * handler never ran — which is precisely when the boss would otherwise wait forever.
 	 */
 	pid?: number;
+	/** Isolated writable worktree; absent for read-only / shared-cwd workers. */
+	worktreePath?: string;
+	worktreeBranch?: string;
+	readOnly?: boolean;
 }
 
 /** Every live child is externally abortable; parent cancellation is composed separately. */
@@ -3576,6 +3589,7 @@ async function trySendUserMessage(pi: ExtensionAPI, text: string): Promise<boole
 	return sendUserMessageAfterCutIn(pi, text);
 }
 
+
 // ---------------------------------------------------------------------------
 // Runtime-owned worktree merge recovery (Swift SubagentStore parity, host-free)
 // ---------------------------------------------------------------------------
@@ -3583,9 +3597,60 @@ async function trySendUserMessage(pi: ExtensionAPI, text: string): Promise<boole
 // Boss escalation rides the same cut-in-safe channel as interrupted reminders; the binding
 // happens once in export default, so the module-level recovery loop works without a host.
 let worktreeRecoveryPi: ExtensionAPI | undefined;
+const baseAdvanceDeduper = new BaseAdvanceDeduper();
+const tipPreflightTracker = createTipPreflightTracker();
 
 export function bindWorktreeRecoveryEscalation(pi: ExtensionAPI): void {
 	worktreeRecoveryPi = pi;
+}
+
+async function notifyInflightWorkersOfBaseAdvance(event: WorktreeMergedEventV1): Promise<void> {
+	try {
+		const workers = [...runningAgents.entries()].map(([agentId, handle]) => ({
+			agentId,
+			worktreePath: handle.worktreePath,
+			branch: handle.worktreeBranch,
+			readOnly: handle.readOnly || handle.finalizing,
+		}));
+		const alerts = await evaluateBaseAdvanceAlerts({
+			mainCwd: event.mainCwd,
+			landedFiles: event.landedFiles,
+			workers,
+			skipAgentId: event.agentId,
+		});
+		const pi = worktreeRecoveryPi;
+		if (!pi) return;
+		for (const alert of alerts) {
+			const detail = `${alert.overlap.join(",")}|${alert.conflicts.join(",")}`;
+			if (!baseAdvanceDeduper.shouldInject(alert.agentId, detail)) continue;
+			void trySendUserMessage(pi, formatBaseAdvancedSignal(alert));
+		}
+	} catch (error) {
+		console.error("[pipiui-subagent] base-advance broadcast failed:", error);
+	}
+}
+
+function tickInflightMergePreflight(): void {
+	const mainCwd = PIPIUI_MAIN_CWD;
+	const pi = worktreeRecoveryPi;
+	if (!mainCwd || !pi) return;
+	for (const [agentId, handle] of runningAgents) {
+		if (handle.finalizing || handle.readOnly || !handle.worktreePath || !handle.worktreeBranch) continue;
+		void tipPreflightTracker
+			.onTick({ agentId, mainCwd, branch: handle.worktreeBranch })
+			.then((flip) => {
+				if (!flip) return;
+				const detail = `preflight|${flip.conflictPaths.join(",")}`;
+				if (!baseAdvanceDeduper.shouldInject(agentId, detail)) return;
+				void trySendUserMessage(
+					pi,
+					formatPreflightConflictSignal({ agentId, conflictPaths: flip.conflictPaths }),
+				);
+			})
+			.catch((error) => {
+				console.error("[pipiui-subagent] heartbeat preflight failed:", error);
+			});
+	}
 }
 
 function escalateWorktreeFailureToBoss(text: string): void {
@@ -3670,7 +3735,10 @@ function worktreeRecoveryContext(
 				import("../subagent-host/worktree/index.ts"),
 				import("./worktree-finalize.ts"),
 			]);
-			const next = await new WorktreeFinalizationServiceV1({ postMergeVerify: piPostMergeVerifyRunner }).retry(retained);
+			const next = await new WorktreeFinalizationServiceV1({
+				postMergeVerify: piPostMergeVerifyRunner,
+				onMerged: (event) => notifyInflightWorkersOfBaseAdvance(event),
+			}).retry(retained);
 			applyWorktreeRecovery(next, info);
 		},
 	};
@@ -4725,6 +4793,9 @@ async function runSingleAgent(
 			startedAt: Date.now(),
 			...(executionPolicy?.heartbeatMs ? { heartbeatMs: executionPolicy.heartbeatMs } : {}),
 			finalizing: false,
+			...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
+			...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
+			readOnly: Boolean(agent.traits.readOnly),
 		});
 	const pipiuiUpdate = (force = false) => {
 		const now = Date.now();
@@ -6803,6 +6874,7 @@ export default function (pi: ExtensionAPI) {
 	// Same channel carries worktree merge-recovery escalations; then rebuild the persisted loop
 	// (waiting-for-main windows and in-flight claims) exactly once per Boss-depth process.
 	bindWorktreeRecoveryEscalation(pi);
+	bindWorktreeMergedHook((event) => notifyInflightWorkersOfBaseAdvance(event));
 	resumePersistedWorktreeRecovery();
 	// 主会话上下文压缩走有界快路径（thinking off 的 LLM 摘要 → 确定性摘要 → pi 内置兜底）。
 	// 见 main-compaction.ts：不覆盖 worker（PIPIUI_AGENT_DEPTH 守卫）。
@@ -7132,6 +7204,9 @@ export default function (pi: ExtensionAPI) {
 		for (const reminder of scheduleInterruptedReminders(now, resumableIds)) {
 			void deliverInterruptedReminder(pi, reminder);
 		}
+
+		// (6) tip-move merge preflight vs main HEAD; Boss-only, flip clean→conflict.
+		tickInflightMergePreflight();
 	}, STALL_WATCHDOG_INTERVAL_MS);
 	stallWatchdog.unref?.();
 	g[STALL_WATCHDOG_KEY] = stallWatchdog;
