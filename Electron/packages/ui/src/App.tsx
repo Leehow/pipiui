@@ -971,11 +971,17 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [toolReturnTab, setToolReturnTab] = useState<PanelTab | null>(null)
   const activeTabRef = useRef(activeTab)
   activeTabRef.current = activeTab
+  const activeTabBySessionRef = useRef<Record<string, PanelTab>>({})
+  const applyActiveTab = useCallback((tab: PanelTab) => {
+    const sessionId = selectedSessionRef.current
+    if (sessionId) activeTabBySessionRef.current[sessionId] = tab
+    setActiveTab(tab)
+  }, [])
   const rememberToolReturn = useCallback((tab: PanelTab) => {
     const current = activeTabRef.current
     if (tab !== current) setToolReturnTab(tab === 'Subagents' ? null : current)
-    setActiveTab(tab)
-  }, [])
+    applyActiveTab(tab)
+  }, [applyActiveTab])
   const [openedDocumentPath, setOpenedDocumentPath] = useState<string | null>(null)
   const [announcedTerminals, setAnnouncedTerminals] = useState<Record<string, TerminalSession>>({})
   const [revealedTerminalIds, setRevealedTerminalIds] = useState<Record<string, string>>({})
@@ -1029,6 +1035,11 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       if (current[0] === selectedSession) return current
       return [selectedSession, ...current.filter(id => id !== selectedSession)].slice(0, 6)
     })
+  }, [selectedSession])
+  useEffect(() => {
+    if (!selectedSession) return
+    const remembered = activeTabBySessionRef.current[selectedSession]
+    if (remembered) setActiveTab(remembered)
   }, [selectedSession])
   const [observedSessionStatuses, setObservedSessionStatuses] = useState<Record<string, SessionStatus>>({})
   const [loadedSidebarPreferencesKey, setLoadedSidebarPreferencesKey] = useState('')
@@ -2349,8 +2360,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const goBackTool = useCallback(() => {
     const target = toolReturnTab ?? 'Subagents'
     setToolReturnTab(null)
-    setActiveTab(target)
-  }, [toolReturnTab])
+    applyActiveTab(target)
+  }, [applyActiveTab, toolReturnTab])
   /** Swift panelQuickRail behavior: switching opens the panel, re-clicking the active tool closes it. */
   const selectTool = (tab: PanelTab) => {
     if (!toolsCollapsed && activeTab === tab) {
