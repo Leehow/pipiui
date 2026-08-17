@@ -183,7 +183,6 @@ test("downloads route streams App builds with resumable ranges and no traversal"
     await writeFile(join(dir, "slab", "seed", "index.json"), '{"ok":true}');
     await writeFile(join(dir, "slab", "seed", "v1", "index.json"), '{"v":1}');
     await writeFile(join(dir, "slab", "jq", "jq-linux-amd64"), "jqbin");
-    await writeFile(join(dir, "secret"), "nope");
     await mkdir(join(dir, "foo"), { recursive: true });
     await writeFile(join(dir, "foo", ".hidden"), "dot");
 
