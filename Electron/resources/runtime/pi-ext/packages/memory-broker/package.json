@@ -50,7 +50,7 @@
   ],
   "dependencies": {
     "pipiui-memory-broker-contract": "file:vendor/pipiui-memory-broker-contract",
-    "pi-hermes-memory": "0.9.5"
+    "pi-hermes-memory": "0.9.6"
   },
   "bundledDependencies": [
     "pipiui-memory-broker-contract",

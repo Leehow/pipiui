@@ -65,7 +65,7 @@ export const MANAGED_RUNTIME_PACKAGE_VERSIONS = {
   '@earendil-works/pi-coding-agent': '0.84.2',
   'pi-web-access': '0.23.0',
   'pi-mcp-extension': '1.5.0',
-  'pi-hermes-memory': '0.9.5',
+  'pi-hermes-memory': '0.9.6',
   'better-sqlite3': '12.11.1'
 } as const
 /** User-facing Pi packages with meaningful independent upstream release channels. */

@@ -38,7 +38,7 @@ describe('persistent embedded Pi runtime CLI', () => {
         return header
       })()),
       writeFile(piCli, '// cli\n'),
-      writeFile(hermes, JSON.stringify({ name: 'pi-hermes-memory', version: '0.9.5' })),
+      writeFile(hermes, JSON.stringify({ name: 'pi-hermes-memory', version: '0.9.6' })),
       writeFile(join(nodeModules, 'better-sqlite3', 'package.json'), JSON.stringify({ name: 'better-sqlite3', version: '12.11.1' })),
       // Thin Mach-O header with the requested CPU type. inspectRuntime only
       // needs the header to reject a closure prepared for the other target.
@@ -71,7 +71,7 @@ describe('persistent embedded Pi runtime CLI', () => {
         '@earendil-works/pi-coding-agent': '0.84.2',
         'pi-web-access': '0.23.0',
         'pi-mcp-extension': '1.5.0',
-        'pi-hermes-memory': '0.9.5',
+        'pi-hermes-memory': '0.9.6',
         'better-sqlite3': '12.11.1'
       }
     }))
@@ -163,10 +163,10 @@ describe('persistent embedded Pi runtime CLI', () => {
     await rm(join(nodeModules, 'pi-hermes-memory'), { recursive: true, force: true })
     const missing = run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '')
     expect(missing.status).toBe(1)
-    expect(missing.stderr).toContain('pi-hermes-memory installed version is missing, expected 0.9.5')
+    expect(missing.stderr).toContain('pi-hermes-memory installed version is missing, expected 0.9.6')
 
     await mkdir(join(nodeModules, 'pi-hermes-memory'), { recursive: true })
-    await writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ name: 'pi-hermes-memory', version: '0.9.5' }))
+    await writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ name: 'pi-hermes-memory', version: '0.9.6' }))
     const sqliteNative = join(nodeModules, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')
     const wrongHeader = Buffer.alloc(32)
     wrongHeader.writeUInt32LE(0xfeedfacf, 0)

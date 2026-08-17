@@ -42,7 +42,7 @@ describe('resolveRuntimeAssets', () => {
       writeFile(launcher, ''),
       writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '0.84.2' })),
       mkdir(join(nodeModules, 'pi-hermes-memory'), { recursive: true }).then(() =>
-        writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ version: '0.9.5' }))),
+        writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ version: '0.9.6' }))),
       mkdir(join(nodeModules, 'better-sqlite3'), { recursive: true }).then(() =>
         writeFile(join(nodeModules, 'better-sqlite3', 'package.json'), JSON.stringify({ version: '12.11.1' })))
     ])
@@ -66,7 +66,7 @@ describe('resolveRuntimeAssets', () => {
         '@earendil-works/pi-coding-agent': '0.84.2',
         'pi-web-access': '0.23.0',
         'pi-mcp-extension': '1.5.0',
-        'pi-hermes-memory': '0.9.5',
+        'pi-hermes-memory': '0.9.6',
         'better-sqlite3': '12.11.1'
       }
     }))
@@ -146,7 +146,7 @@ describe('resolveRuntimeAssets', () => {
       }
     })
     expect(assets.managedNodeModulesRoot).toBe(join(resourcesPath, 'pipiui-embedded/pi/lib/node_modules'))
-    expect(JSON.parse(await readFile(join(assets.managedNodeModulesRoot!, 'pi-hermes-memory/package.json'), 'utf8')).version).toBe('0.9.5')
+    expect(JSON.parse(await readFile(join(assets.managedNodeModulesRoot!, 'pi-hermes-memory/package.json'), 'utf8')).version).toBe('0.9.6')
   })
 
   it('fails closed when a packaged runtime is absent or for another architecture', async () => {
