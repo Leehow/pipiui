@@ -27,6 +27,8 @@ prepare_mac_signing_identity() {
   matches="$(while IFS= read -r line; do
     [[ "$line" == *"$requested"* ]] && printf '%s\n' "$line"
   done <<< "$identities"; true)"
+  # Same SHA-1 can appear twice when the cert is in two keychains.
+  matches="$(awk '!seen[$2]++' <<< "$matches")"
   match_count="$(grep -c . <<< "$matches" || true)"
   if [[ "$match_count" != "1" ]]; then
     echo "ERROR: expected exactly one valid macOS signing identity matching '$requested'; found $match_count." >&2
