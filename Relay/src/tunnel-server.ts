@@ -2,13 +2,16 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
 
 const PAIR_PATH = /^\/pair\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const ROOM_ID = PAIR_PATH;
-const DOWNLOAD_PATH = /^\/downloads\/([A-Za-z0-9][A-Za-z0-9._-]{0,180})$/;
+const DOWNLOAD_SEGMENT = "[A-Za-z0-9][A-Za-z0-9._-]{0,60}";
+const DOWNLOAD_PATH = new RegExp(
+  `^/downloads/(${DOWNLOAD_SEGMENT}(?:/${DOWNLOAD_SEGMENT}){0,3})$`,
+);
 const SECRET = /^[0-9a-f]{64}$/;
 const REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TUNNEL_PATH = "/tunnel/ws";
@@ -107,13 +110,15 @@ function downloadContentType(name: string): string {
   if (name.endsWith(".zip")) return "application/zip";
   if (name.endsWith(".dmg")) return "application/x-apple-diskimage";
   if (name.endsWith(".tar.gz")) return "application/gzip";
+  if (name.endsWith(".json")) return "application/json; charset=utf-8";
   return "application/octet-stream";
 }
 
 /**
  * Streams one file from the relay's downloads directory (App builds etc.).
- * The name regex already excludes "/" and leading dots, so join() cannot
- * escape the directory. Single-range responses keep large downloads resumable.
+ * Path is 1–4 segments; each segment starts with [A-Za-z0-9] (no `..` or
+ * dotfiles). After join(), resolve() must stay under downloadsRoot.
+ * Single-range responses keep large downloads resumable.
  */
 async function serveDownload(
   name: string,
@@ -121,7 +126,11 @@ async function serveDownload(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
-  const filePath = join(downloadsRoot, name);
+  const root = resolve(downloadsRoot);
+  const filePath = resolve(join(downloadsRoot, name));
+  if (filePath !== root && !filePath.startsWith(root + sep)) {
+    return json(res, 404, { error: "not found" });
+  }
   let size = 0;
   try {
     const info = await stat(filePath);

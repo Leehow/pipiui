@@ -55,6 +55,7 @@ describe("vendored philosophy: structure", () => {
       "research",
       "planning",
       "craft",
+      "domain",
       "orchestration",
       "fanout",
       "toolcall",
@@ -117,6 +118,7 @@ describe("vendored philosophy: delivery", () => {
       "research",
       "planning",
       "craft",
+      "domain",
       "orchestration",
       "fanout",
     ]);
@@ -145,8 +147,9 @@ describe("vendored philosophy: delivery", () => {
     // The standalone package capped this at 11500; the vendored tree also carries the
     // host-policy sections (tool withholding, computer_task routing, status persistence,
     // session recall) and the deepseek-scoped thinking-discipline layer, which are
-    // load-bearing here and cost the difference.
+    // load-bearing here and cost the difference. Raised again for the domain-memory layer
+    // (CONTEXT.md vocabulary + ADR gate), which pays for itself in re-derived terminology.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(12500);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(13100);
   });
 });

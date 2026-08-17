@@ -5,7 +5,7 @@ summary: 计划是可执行的列表不是文档；什么时候才值得正式�
 order: 24
 requires: []
 requires-capabilities: []
-scope: [main, lead]
+scope: [main, lead, plan]
 ---
 # Planning
 
@@ -45,13 +45,18 @@ untouched: grilling is never a gate for ordinary work.
 
 1. **Grill** — only when genuine unresolved decisions remain after exhausting repository and
    conversation evidence. Confirm availability with `skill_search("grilling")` (or
-   `"grill-me"`), then `skill_load` that skill when present. One question at a time; each
-   question carries your recommended answer. Look up facts in the environment; never ask the
-   user for them. Decisions belong to the user. Do not proceed until shared understanding.
-   Skip grilling entirely when the goal is already pinned. If the skill is unavailable, fall
-   back without blocking: ask the same way from evidence, or skip if nothing is unresolved.
-2. **Spec** — synthesize the detailed plan yourself. Confirm with `skill_search("to-spec")`,
-   then `skill_load("to-spec")` when available. Structure: Problem Statement / Solution /
+   `"grill-me"`), then `skill_load` that skill when present. The loaded skill owns the
+   interview mechanics — question format, batching, ordering; never restate or override them
+   from memory here. What always holds regardless of skill version: facts are looked up in
+   the environment, never asked of the user; decisions belong to the user; each question
+   carries your recommended answer; do not proceed until shared understanding. Skip grilling
+   entirely when the goal is already pinned. If the skill is unavailable, fall back without
+   blocking: batch the open decisions into rounds yourself — every question whose
+   prerequisites are already settled goes out together in one round — or skip if nothing is
+   unresolved.
+2. **Spec** — synthesize the detailed plan yourself. Confirm with `skill_search("spec plan")`
+   — search semantically, never by a hardcoded skill name an upstream rename would silently
+   break — then `skill_load` the best-matching spec-writing skill when one exists. Structure: Problem Statement / Solution /
    User Stories (long numbered list) / Implementation Decisions (no file paths or code
    snippets) / Testing Decisions / Out of Scope / Further Notes. Treat the skill as advice
    and translate: no issue tracker, no triage labels, no design → approval → plan-review

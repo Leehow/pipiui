@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -177,6 +177,32 @@ test("downloads route streams App builds with resumable ranges and no traversal"
     assert.equal((await fetch(`${relay.origin}/downloads/%2e%2e%2fsecret`)).status, 404);
     assert.equal((await fetch(`${relay.origin}/downloads/`)).status, 404);
     assert.equal((await fetch(`${relay.origin}/downloads/.hidden`)).status, 404);
+
+    await mkdir(join(dir, "slab", "seed", "v1"), { recursive: true });
+    await mkdir(join(dir, "slab", "jq"), { recursive: true });
+    await writeFile(join(dir, "slab", "seed", "index.json"), '{"ok":true}');
+    await writeFile(join(dir, "slab", "seed", "v1", "index.json"), '{"v":1}');
+    await writeFile(join(dir, "slab", "jq", "jq-linux-amd64"), "jqbin");
+    await writeFile(join(dir, "secret"), "nope");
+    await mkdir(join(dir, "foo"), { recursive: true });
+    await writeFile(join(dir, "foo", ".hidden"), "dot");
+
+    const nested = await fetch(`${relay.origin}/downloads/slab/seed/index.json`);
+    assert.equal(nested.status, 200);
+    assert.equal(nested.headers.get("content-type"), "application/json; charset=utf-8");
+    assert.equal(await nested.text(), '{"ok":true}');
+
+    const deep = await fetch(`${relay.origin}/downloads/slab/seed/v1/index.json`);
+    assert.equal(deep.status, 200);
+    assert.equal(await deep.text(), '{"v":1}');
+
+    const bin = await fetch(`${relay.origin}/downloads/slab/jq/jq-linux-amd64`);
+    assert.equal(bin.status, 200);
+    assert.equal(await bin.text(), "jqbin");
+
+    assert.equal((await fetch(`${relay.origin}/downloads/foo/%2e%2e%2fsecret`)).status, 404);
+    assert.equal((await fetch(`${relay.origin}/downloads/foo/%2e%2e/secret`)).status, 404);
+    assert.equal((await fetch(`${relay.origin}/downloads/foo/.hidden`)).status, 404);
   } finally {
     await relay.close();
   }

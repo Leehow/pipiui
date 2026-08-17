@@ -27,9 +27,11 @@ npm run build
 
 ### App 分发下载
 
-`GET /downloads/<文件名>` 从 `<relay>/downloads/`（默认 `/opt/pipiui-relay/downloads/`）流式分发
-App 构建包（`.zip`/`.dmg` 等），支持 `Range` 断点续传；文件名仅限 `[A-Za-z0-9._-]`
-且不可以点开头，无目录遍历。上传新构建：
+`GET /downloads/<相对路径>` 从 `<relay>/downloads/`（默认 `/opt/pipiui-relay/downloads/`）流式分发
+App 构建包与安装器静态文件（`.zip`/`.dmg`/`.json` 等），支持 `Range` 断点续传。
+路径最多 4 段、总长受段规则约束；每一段必须以 `[A-Za-z0-9]` 开头，段内仅
+`[A-Za-z0-9._-]`，不允许空段、点文件或 `..`。解析后必须仍落在 downloads 根目录内。
+例如 `/downloads/slab/seed/index.json`。上传新构建：
 
 ```bash
 rsync -a --partial PipiUI-Electron-<date>.zip root@<server>:/opt/pipiui-relay/downloads/

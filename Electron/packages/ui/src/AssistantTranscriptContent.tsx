@@ -61,7 +61,12 @@ const ActiveToolCard = memo(function ActiveToolCard({ tool }: { tool: Transcript
 export const AssistantTranscriptContent = memo(function AssistantTranscriptContent({ message, expandSteps, documentBasePath, onOpenDocument, onOpenSubagents }: { message: AssistantTranscriptMessage; expandSteps?: boolean; documentBasePath?: string; onOpenDocument?: (path: string) => void; onOpenSubagents?: (agentId?: string) => void }) {
   const activities = activitiesFromMessage(message)
   const stepActivities = activities.filter((activity): activity is Extract<TranscriptActivity, { type: 'thinking' | 'tool' }> => activity.type !== 'text')
-  const activeTool = message.streaming ? [...stepActivities].reverse().find((activity): activity is Extract<TranscriptActivity, { type: 'tool' }> => activity.type === 'tool' && !activity.tool.finished && activity.tool.name !== 'subagent' && activity.tool.name !== 'computer_task') : undefined
+  // Lost tool_result/settled: if the model generated text after the last
+  // unfinished tool, the tool must have completed — suppress the live indicator.
+  const lastUnfinishedToolIndex = activities.reduce((last, a, i) =>
+    a.type === 'tool' && !a.tool.finished && a.tool.name !== 'subagent' && a.tool.name !== 'computer_task' ? i : last, -1)
+  const textAfterUnfinishedTool = lastUnfinishedToolIndex >= 0 && activities.slice(lastUnfinishedToolIndex + 1).some(a => a.type === 'text' && a.content.trim())
+  const activeTool = message.streaming && !textAfterUnfinishedTool ? [...stepActivities].reverse().find((activity): activity is Extract<TranscriptActivity, { type: 'tool' }> => activity.type === 'tool' && !activity.tool.finished && activity.tool.name !== 'subagent' && activity.tool.name !== 'computer_task') : undefined
   const segments: ReturnType<typeof planAssistantTranscript> = []
   for (const segment of planAssistantTranscript(message)) {
     if (segment.type === 'text') {
@@ -81,7 +86,7 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
   const pendingDispatch = tools.some(tool => liveProjectable(tool) && Boolean(tool.dispatched) && (liveByTool.get(tool.id)?.roots.length ?? 0) === 0)
   const linkedFailed = subagentProjections.some(projection => projection.failedCount > 0)
   const failed = tools.some(tool => Boolean(tool.error) || (tool.name === 'subagent' && tool.finished && tool.result ? parseSubagentNotice(tool.result)?.ok === false : false)) || linkedFailed
-  const running = Boolean(message.streaming && !activeTool) || linkedRunning || pendingDispatch
+  const running = Boolean(message.streaming && !activeTool && !textAfterUnfinishedTool) || linkedRunning || pendingDispatch
   const stepsExpanded = expandSteps ?? (Boolean(message.streaming) || pendingDispatch || linkedRunning)
   const lastStepsIndex = segments.reduce((last, segment, index) => segment.type === 'steps' ? index : last, -1)
   const stepGroupCount = segments.filter(segment => segment.type === 'steps').length
