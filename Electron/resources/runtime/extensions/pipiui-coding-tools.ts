@@ -1,6 +1,6 @@
 import { createReadToolDefinition, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { activateInspectionTools, readPathIfDirectory, readToolDescription, rewriteReadToolText } from "./coding-tools.ts";
+import { readPathIfDirectory, readToolDescription, rewriteReadToolText } from "./coding-tools.ts";
 
 export default function (pi: ExtensionAPI) {
 	const base = createReadToolDefinition(".");
@@ -30,12 +30,4 @@ export default function (pi: ExtensionAPI) {
 			return { ...result, content };
 		},
 	});
-
-	const activate = () => {
-		pi.setActiveTools(activateInspectionTools(pi.getActiveTools()));
-	};
-	// getActiveTools/setActiveTools are action methods. Pi 0.84+ rejects them
-	// during factory load ("Extension runtime not initialized") and exits the
-	// whole RPC process. Wait for session_start, matching glm-search-mcp.
-	pi.on("session_start", activate);
 }
