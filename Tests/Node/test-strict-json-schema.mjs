@@ -99,6 +99,11 @@ const dispatchSchema = () =>
         items: { type: "string" },
         maxItems: 10,
       },
+      scope: {
+        type: "array",
+        items: { type: "string" },
+        maxItems: 32,
+      },
       chain: {
         type: "array",
         minItems: 1,
@@ -238,6 +243,7 @@ const grokSubagentSchema = {
     isolation: { type: "string" },
     cwd: { type: "string" },
     resume_from: { type: "string" },
+    scope: { type: "array", items: { type: "string" } },
   },
   required: ["prompt", "description"],
   additionalProperties: false,
@@ -441,4 +447,25 @@ test("makeStrictFunctionTools rewrites Responses and Completions function tools"
   assert.deepEqual(tools[1].parameters.properties.agentId.type, ["string", "null"]);
   assert.deepEqual(tools[2].function.parameters.required, ["path", "offset"]);
   assert.deepEqual(tools[2].function.parameters.properties.offset.type, ["number", "null"]);
+});
+
+test("prepareStrictToolArguments keeps declared scope arrays", () => {
+  const schema = dispatchSchema();
+  const prepared = prepareStrictToolArguments(schema, {
+    agent: "general-purpose",
+    task: "edit session store",
+    scope: ["Electron/packages/ui/src/session/", "Electron/packages/ui/src/session/store.ts"],
+  });
+  assert.deepEqual(prepared.scope, [
+    "Electron/packages/ui/src/session/",
+    "Electron/packages/ui/src/session/store.ts",
+  ]);
+  const grok = sanitizeStrictToolArguments(grokSubagentSchema, {
+    prompt: "edit session store",
+    description: "session store",
+    scope: ["Electron/packages/ui/src/session/"],
+    extra: "drop-me",
+  });
+  assert.deepEqual(grok.scope, ["Electron/packages/ui/src/session/"]);
+  assert.equal(grok.extra, undefined);
 });

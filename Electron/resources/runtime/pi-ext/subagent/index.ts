@@ -41,6 +41,12 @@ import { Type } from "typebox";
 
 import { adoptGrokBuildDispatch, makeStrictJsonSchema, omitNulls, bindSanitizeStrictToolArguments, remapUnknownSubagentType } from "./strict-json-schema.ts";
 import {
+	cleanScope,
+	clearRunningDispatchScope,
+	formatDispatchScopeWarning,
+	recordRunningDispatchScope,
+} from "./scope-overlap.ts";
+import {
 	COMPUTER_WORKER_FAILURE_CODES,
 	type ComputerPlan,
 	type ComputerAgentEpisode,
@@ -1151,6 +1157,8 @@ interface RunSingleAgentOptions {
 	title?: string;
 	/** Informational dependency tags (task/agentId short names); display-only. */
 	blockedBy?: string[];
+	/** Advisory write-set path prefixes for overlap warnings. */
+	scope?: string[];
 	/** Current session model as `provider/id` (depth 0 `ctx.model`); used for「跟随主 Agent」. */
 	sessionModel?: string;
 	/** Model context window from the dispatching session; shown on the detail header. */
@@ -5823,7 +5831,9 @@ const FRESH_DESCRIPTION =
 const DESKTOP_PARAM_DESCRIPTION =
 	'Explicit per-task Computer Use authorization. Omitted by default — desktop tools are NEVER injected without it, even when the global toggle is on. Only two values exist: "user-requested" (the user explicitly asked to operate an external app, or named Chrome/Safari/another external browser / "my browser" — then you MUST use exactly that external browser via open_application + computer, never swap in the built-in browser) and "ui-verify" (this task built/changed an app and genuinely needs a visual UI acceptance check). Ordinary web research → built-in browser tool, not desktop. Waiting, polling logs, reading files, and build/test verification never use desktop. Do not grant for convenience; each task is authorized independently and never inherits another task\'s grant.';
 const BLOCKED_BY_DESCRIPTION =
-	'Optional dependency tags (task/agentId short names this task depends on), e.g. ["tldr-done-report"]; informational display only — does not delay or gate scheduling.';
+	'Optional dependency tags (task/agentId short names this task depends on), e.g. ["tldr-done-report"]. The runtime queue holds this task until every named agent succeeds; a failed or never-dispatched dependency holds the item and reports [subagent-blocked] instead of starting it.';
+const SCOPE_DESCRIPTION =
+	'Optional advisory path prefixes this worker expects to touch, e.g. ["Electron/packages/ui/src/session/", "Electron/packages/ui/src/session/store.ts"]. A trailing slash means that directory and everything under it. Concurrent dispatches whose scopes overlap get a [subagent-overlap] warning but still start. Omit when the task is read-only or has no predicted write set.';
 const THINKING_PARAM_DESCRIPTION =
 	"Optional per-task thinking for this dispatch only: off|minimal|low|medium|high|xhigh|max. It never inherits the Boss current thinking and does not select a model (v1 has no per-task model). It overrides the current candidate's configured thinking; if a fallback is needed, it carries only when the Swift capability catalog explicitly allows that fallback level, otherwise that fallback uses its configured thinking/default.";
 
@@ -5854,6 +5864,12 @@ const BlockedByParam = Type.Optional(
 		maxItems: 10,
 	}),
 );
+const ScopeParam = Type.Optional(
+	Type.Array(Type.String({ minLength: 1, maxLength: 512 }), {
+		description: SCOPE_DESCRIPTION,
+		maxItems: 32,
+	}),
+);
 const ThinkingParam = Type.Optional(
 	StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, {
 		description: THINKING_PARAM_DESCRIPTION,
@@ -5882,6 +5898,7 @@ const TaskItem = Type.Object({
 		}),
 	),
 	blockedBy: BlockedByParam,
+	scope: ScopeParam,
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	thinking: ThinkingParam,
@@ -5926,6 +5943,7 @@ const ChainItem = Type.Object({
 			description: DESKTOP_PARAM_DESCRIPTION,
 		}),
 	),
+	scope: ScopeParam,
 }, { additionalProperties: false });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -5976,6 +5994,7 @@ const SubagentParams = Type.Object({
 			description: "Resume a previous subagent. Pass the agent id returned by a prior call.",
 		}),
 	),
+	scope: ScopeParam,
 }, { additionalProperties: false });
 const SubagentChainParams = Type.Object({
 	chain: Type.Array(ChainItem, {
@@ -6004,6 +6023,7 @@ type SubagentExecuteParams = {
 	task?: string;
 	title?: string;
 	blockedBy?: string[];
+	scope?: string[];
 	thinking?: string;
 	worktree?: "isolated" | "none";
 	noWorktreeReason?: string;
@@ -6036,6 +6056,7 @@ type SubagentExecuteParams = {
 		heartbeatSecs?: number;
 		timeoutSecs?: number;
 		desktop?: "user-requested" | "ui-verify";
+		scope?: string[];
 	}>;
 	tasks?: Array<{
 		agent: string;
@@ -6048,6 +6069,7 @@ type SubagentExecuteParams = {
 		agentId?: string;
 		fresh?: boolean;
 		desktop?: "user-requested" | "ui-verify";
+		scope?: string[];
 	}>;
 	agentScope?: AgentScope;
 	confirmProjectAgents?: boolean;
@@ -7458,7 +7480,9 @@ export default function (pi: ExtensionAPI) {
 				noWorktreeReason?: string,
 				heartbeatSecs?: number,
 				timeoutSecs?: number,
+				scope?: string[],
 			): void => {
+				recordRunningDispatchScope(agentId, scope);
 				void runSingleAgent(
 					ctx.cwd,
 					agents,
@@ -7469,12 +7493,14 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ toolCallId, background: true, agentId, title, sessionModel, contextWindow, verify, thinking, fresh, desktop, blockedBy, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs },
+					{ toolCallId, background: true, agentId, title, sessionModel, contextWindow, verify, thinking, fresh, desktop, blockedBy, scope, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs },
 				)
 					.then((result) => {
+						clearRunningDispatchScope(agentId);
 						notifySubagentDone(pi, result);
 					})
 					.catch((err) => {
+						clearRunningDispatchScope(agentId);
 						const msg = err instanceof Error ? err.message : String(err);
 						console.error("[pipiui-subagent] background agent error:", agentId, msg);
 						const aborted = /abort/i.test(msg);
@@ -7892,6 +7918,7 @@ export default function (pi: ExtensionAPI) {
 						index: number,
 					) => {
 						const agentId = agentIds[index];
+						recordRunningDispatchScope(agentId, t.scope);
 						try {
 							const result = await runSingleAgent(
 								ctx.cwd,
@@ -7903,7 +7930,7 @@ export default function (pi: ExtensionAPI) {
 								undefined, // no parent abort binding
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ toolCallId, background: true, agentId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy },
+								{ toolCallId, background: true, agentId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy, scope: t.scope },
 							);
 							notifySubagentDone(pi, result);
 						} catch (err) {
@@ -7924,6 +7951,8 @@ export default function (pi: ExtensionAPI) {
 								stopReason: aborted ? "aborted" : "error",
 							};
 							notifySubagentDone(pi, failResult, { aborted, error: msg });
+						} finally {
+							clearRunningDispatchScope(agentId);
 						}
 					};
 
@@ -7931,6 +7960,14 @@ export default function (pi: ExtensionAPI) {
 					// the `blockedBy` gate, so the boss is free of both the moment this call returns.
 					// Per-item notification is still the finalization boundary, so completed full
 					// results are not retained until the slowest sibling settles.
+					const incomingScopes = params.tasks.map((t, index) => ({
+						agentId: agentIds[index],
+						scope: cleanScope(t.scope),
+					}));
+					const scopeOverlapNotice = formatDispatchScopeWarning(
+						incomingScopes,
+						dispatchQueue.snapshot(),
+					);
 					dispatchQueue.enqueueBatch(
 						params.tasks.map((t, index) => ({
 							agentId: agentIds[index],
@@ -7938,6 +7975,7 @@ export default function (pi: ExtensionAPI) {
 							title: t.title,
 							task: t.task,
 							blockedBy: t.blockedBy ?? [],
+							scope: cleanScope(t.scope),
 							queuedAt: Date.now(),
 							run: () => runQueuedParallelTask(t, index),
 						})),
@@ -7945,7 +7983,13 @@ export default function (pi: ExtensionAPI) {
 
 					return {
 						content: [
-							{ type: "text", text: dispatchNudgePrefix + formatStartedMessage(startedItems) },
+							{
+								type: "text",
+								text:
+									(scopeOverlapNotice ? `${scopeOverlapNotice}\n\n` : "") +
+									dispatchNudgePrefix +
+									formatStartedMessage(startedItems),
+							},
 						],
 						details: makeDetails("parallel", { background: true, agentIds })(placeholders),
 					};
@@ -8060,7 +8104,11 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 					const agentId = params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
-					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs);
+					const scopeOverlapNotice = formatDispatchScopeWarning(
+						[{ agentId, scope: cleanScope(params.scope) }],
+						dispatchQueue.snapshot(),
+					);
+					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.scope);
 					const placeholder: SingleResult = {
 						agent: params.agent,
 						agentId,
@@ -8078,6 +8126,7 @@ export default function (pi: ExtensionAPI) {
 							{
 								type: "text",
 								text:
+									(scopeOverlapNotice ? `${scopeOverlapNotice}\n\n` : "") +
 									dispatchNudgePrefix +
 									formatStartedMessage([
 										{ agentId, name: params.agent, task: params.task, title: params.title, fresh: params.fresh },

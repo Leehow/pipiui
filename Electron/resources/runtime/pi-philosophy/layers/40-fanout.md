@@ -75,6 +75,21 @@ whether two pieces are independent, dispatching both is the cheaper mistake.
   can judge real overlap.
 - Two unrelated small changes are two workers, not one vague task and not two turns.
 
+## Partition writes, then declare scope
+
+Parallel workers stay cheap only when their write sets do not secretly couple.
+Git can merge file-level overlap; it cannot merge two briefs that both own the
+same helper. Split so that:
+
+- Coupled files (one feature's implementation plus its tests, or a function and
+  the only caller that must change with it) stay on the **same** worker.
+- A shared interface or barrel file gets a **single owner**. Other workers may
+  import it; they do not edit it in the same wave.
+- Every parallel writable task should declare `scope` — the path prefixes it
+  expects to touch. The runtime warns when a new dispatch overlaps a queued or
+  running scope; it does not block. Treat that warning as a decomposition hint,
+  not as permission to ignore the overlap.
+
 What actually bounds a wave is your own context, and it binds on reports rather than on
 dispatches: ten workers whose output you never pull in cost you less than two whose full text you
 read. Widen the wave and keep its output out. Never narrow a wave to protect context you have not
