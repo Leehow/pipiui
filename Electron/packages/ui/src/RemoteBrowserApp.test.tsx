@@ -61,10 +61,11 @@ describe('RemoteBrowserApp', () => {
       throw new Error(url)
     })
     const delays: number[] = []
+    const historyReplace = vi.fn()
     render(
       <RemoteBrowserApp
         location={{ protocol: 'http:', host: 'relay.test', pathname: `/pair/${pairID}`, hash: `#${secret}` }}
-        historyReplace={vi.fn()}
+        historyReplace={historyReplace}
         fetch={fetchImpl as unknown as typeof fetch}
         socket={() => {
           const socket = new FakeSocket()
@@ -81,6 +82,8 @@ describe('RemoteBrowserApp', () => {
     )
     await waitFor(() => expect(screen.getByTestId('remote-lifecycle').getAttribute('data-phase')).toBe('connecting'))
     expect(fetchImpl).toHaveBeenCalled()
+    expect(historyReplace).toHaveBeenCalledWith(`/pair/${pairID}#${secret}`)
+    expect(historyReplace).not.toHaveBeenCalledWith('/')
     sockets[0].emit('open')
     await waitFor(() => expect(document.querySelector('.pipiui-shell')).toBeTruthy())
     await waitFor(() => expect(sockets[0].send).toHaveBeenCalled())

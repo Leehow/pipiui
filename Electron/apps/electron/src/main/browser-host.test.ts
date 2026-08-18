@@ -17,6 +17,7 @@ class FakeWebContents {
     this.emit('did-stop-loading')
   })
   reload = vi.fn(() => { void this.loadURL(this.url) })
+  getURL = vi.fn(() => this.url)
   stop = vi.fn()
   executeJavaScript = vi.fn(async (code: string) => code.includes('__pipiBrowserDOM.dispatch')
     ? { ok: true, url: this.url, text: this.pageText, viewport: { ...this.viewport }, elements: this.viewport.width > 0 ? [{ index: 0, role: 'link', name: '热门视频' }] : [] }
@@ -505,6 +506,25 @@ describe('BrowserSessionHost', () => {
     expect([...placements.values()].filter(Boolean)).toHaveLength(1)
   })
 
+  it('does not loadURL again when switching to another session and back', async () => {
+    const { host, created } = sessionsHarness()
+    const visibleBounds = { x: 10, y: 20, width: 500, height: 400, visible: true }
+    await host.loadURL('session-a', 'a.example')
+    await host.setViewBounds('session-a', visibleBounds)
+    const loadsA = created[0].contents.loadURL.mock.calls.length
+    expect(loadsA).toBeGreaterThan(0)
+
+    await host.loadURL('session-b', 'b.example')
+    await host.setViewBounds('session-b', visibleBounds)
+    expect(created[0].contents.loadURL.mock.calls.length).toBe(loadsA)
+    expect(created[0].view.setVisible).toHaveBeenLastCalledWith(false)
+
+    await host.setViewBounds('session-a', visibleBounds)
+    expect(created[0].contents.loadURL.mock.calls.length).toBe(loadsA)
+    expect(created[0].view.setVisible).toHaveBeenLastCalledWith(true)
+    expect(created[1].view.setVisible).toHaveBeenLastCalledWith(false)
+  })
+
   it('ties successful host deleteSession lifecycle to browser-space disposal', async () => {
     const { host, created } = sessionsHarness()
     await host.toolAction('session-delete', { action: 'navigate', url: 'delete.example' })
@@ -613,6 +633,42 @@ describe('BrowserTabsHost crash and load failure recovery', () => {
     expect(attach).toHaveBeenCalledWith(view, true)
     expect(view.setBounds).toHaveBeenCalledWith({ x: 10, y: 20, width: 400, height: 300 })
     expect(contents.loadURL.mock.calls.length).toBe(loads)
+  })
+
+  it('does not loadURL again after hide then show of the same tab', async () => {
+    const { host, contents, view } = browserHarness()
+    await host.setViewBounds({ x: 10, y: 20, width: 300, height: 400, visible: true })
+    await host.loadURL('stay.example')
+    const loads = contents.loadURL.mock.calls.length
+    expect(loads).toBe(1)
+
+    await host.setViewBounds({ x: 0, y: 0, width: 0, height: 0, visible: false })
+    expect(view.setVisible).toHaveBeenLastCalledWith(false)
+    expect(view.setBounds).toHaveBeenLastCalledWith({ x: 0, y: 0, width: 1280, height: 800 })
+    expect(contents.loadURL.mock.calls.length).toBe(loads)
+
+    await host.setViewBounds({ x: 10, y: 20, width: 300, height: 400, visible: true })
+    expect(contents.loadURL.mock.calls.length).toBe(loads)
+    expect(view.setVisible).toHaveBeenLastCalledWith(true)
+    expect(view.setBounds).toHaveBeenLastCalledWith({ x: 10, y: 20, width: 300, height: 400 })
+  })
+
+  it('still loads when switching tabs or navigating explicitly', async () => {
+    const { host, contents } = browserHarness()
+    await host.setViewBounds({ x: 10, y: 20, width: 300, height: 400, visible: true })
+    await host.loadURL('one.example')
+    const afterFirst = contents.loadURL.mock.calls.length
+    const first = (await host.getActiveTab())!
+    await host.newTab()
+    expect(contents.loadURL.mock.calls.length).toBeGreaterThan(afterFirst)
+    const afterNew = contents.loadURL.mock.calls.length
+    await host.switchTab(first.id)
+    expect(contents.loadURL.mock.calls.length).toBeGreaterThan(afterNew)
+    expect(contents.loadURL).toHaveBeenLastCalledWith('https://one.example')
+    const afterSwitch = contents.loadURL.mock.calls.length
+    await host.loadURL('two.example')
+    expect(contents.loadURL.mock.calls.length).toBeGreaterThan(afterSwitch)
+    expect(contents.loadURL).toHaveBeenLastCalledWith('https://two.example')
   })
 
   it('does not remove or re-add the main-owned view during navigation', async () => {

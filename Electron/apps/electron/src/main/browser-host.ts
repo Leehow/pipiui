@@ -22,6 +22,7 @@ export interface BrowserWebContentsLike {
   loadURL(url: string): Promise<unknown> | unknown
   reload(): void
   stop?(): void
+  getURL?(): string
   executeJavaScript?(code: string): Promise<unknown>
   capturePage?(rect?: BrowserViewBounds, options?: { stayHidden?: boolean; stayAwake?: boolean }): Promise<{ toPNG(): Uint8Array }>
   close?(options?: { waitForBeforeUnload?: boolean }): void
@@ -200,6 +201,7 @@ export class BrowserTabsHost {
   private attachedVisible?: boolean
   private activeTabId?: string
   private shownTabId?: string
+  private loadedUrl?: string
   private pending?: PendingNavigation
   private toolRevealPending = false
   private toolNavigationPending = false
@@ -215,6 +217,7 @@ export class BrowserTabsHost {
     this.view?.setVisible?.(false)
     this.view = undefined
     this.shownTabId = undefined
+    this.loadedUrl = undefined
     this.attach = attach
     this.attachedVisible = undefined
   }
@@ -225,6 +228,7 @@ export class BrowserTabsHost {
     if (!this.view?.webContents.isDestroyed?.()) this.view?.webContents.close?.()
     this.view = undefined
     this.shownTabId = undefined
+    this.loadedUrl = undefined
     this.attach = undefined
     this.attachedVisible = undefined
   }
@@ -443,10 +447,11 @@ export class BrowserTabsHost {
     }
     if (!this.isVisible()) {
       if (this.view) this.attachView(this.view, false)
-      if (this.view) setNativeBounds(this.view, hiddenBounds)
+      // Keep a real layout viewport so Chromium does not discard the compositor
+      // surface. The page stays on shownTabId; coming back must not loadURL.
+      if (this.view) setNativeBounds(this.view, toolHiddenBounds)
       this.view?.setVisible?.(false)
       if (this.view) traceBrowserNative('bounds:hidden', this.view, undefined, { requested: this.bounds })
-      this.shownTabId = undefined
       return false
     }
     const view = this.ensureView()
@@ -483,6 +488,7 @@ export class BrowserTabsHost {
     const contents = view ? this.beginViewRetirement(view) : undefined
     this.view = undefined
     this.shownTabId = undefined
+    this.loadedUrl = undefined
     this.attach = undefined
     this.attachedVisible = undefined
     if (!contents) return
@@ -578,6 +584,7 @@ export class BrowserTabsHost {
     // and leave the curator tab stuck on a hostname-only "localhost" chrome.
     this.view = undefined
     this.shownTabId = undefined
+    this.loadedUrl = undefined
     this.attachedVisible = undefined
     if (!this.attach) throw new Error('browser window is unavailable')
     // This is the only `new WebContentsView` path; virtual tabs reuse it.
@@ -633,6 +640,7 @@ export class BrowserTabsHost {
     if (this.view === view) {
       this.view = undefined
       this.shownTabId = undefined
+      this.loadedUrl = undefined
       this.attachedVisible = undefined
     }
     if (this.retiredViews.has(view)) return undefined
@@ -679,13 +687,18 @@ export class BrowserTabsHost {
     // Hidden tool pages keep a real layout viewport without painting over UI.
     view.setVisible?.(visible)
     traceBrowserNative('show:prepared', view, undefined, { visible, requested: visible ? this.bounds : toolHiddenBounds })
-    this.shownTabId = tab.id
     const url = (tab.history[tab.historyIndex] ?? tab.url) || 'about:blank'
+    if (kind === 'restore' && this.canReuseShownPage(tab, view, url)) {
+      this.shownTabId = tab.id
+      return
+    }
+    this.shownTabId = tab.id
     this.pending = { tabId: tab.id, kind, url }
     tab.isLoading = true
     this.emit()
     try {
       await Promise.resolve(view.webContents.loadURL(url))
+      this.loadedUrl = url
     } catch (error) {
       if (this.pending?.tabId === tab.id) this.pending = undefined
       tab.isLoading = false
@@ -704,6 +717,7 @@ export class BrowserTabsHost {
         this.emit()
         try {
           await Promise.resolve(retryView.webContents.loadURL(url))
+          this.loadedUrl = url
         } catch (retryError) {
           if (this.pending?.tabId === tab.id) this.pending = undefined
           tab.isLoading = false
@@ -719,6 +733,12 @@ export class BrowserTabsHost {
     }
   }
 
+  private canReuseShownPage(tab: BrowserTabRecord, view: BrowserViewLike, url: string): boolean {
+    if (this.shownTabId !== tab.id || !this.viewUsable(view)) return false
+    const current = view.webContents.getURL?.() || this.loadedUrl
+    return Boolean(current) && current === url
+  }
+
   private navigationTab(): BrowserTabRecord | undefined {
     return this.pending ? this.tabs.find(tab => tab.id === this.pending!.tabId) : this.active
   }
@@ -732,6 +752,7 @@ export class BrowserTabsHost {
   }
 
   private didNavigate(url: string): void {
+    this.loadedUrl = url
     const tab = this.navigationTab()
     if (!tab) return
     const pending = this.pending

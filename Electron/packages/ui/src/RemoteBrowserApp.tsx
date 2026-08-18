@@ -244,7 +244,7 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
       }
       if (pair && 'pairID' in pair) {
         if (!(await runClaim(pair))) return
-        replace('/')
+        replace(`${location.pathname}${location.hash}`)
       } else if (mode === 'connecting') {
         const stored = readStoredRemotePair()
         if (stored) {

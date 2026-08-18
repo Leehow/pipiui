@@ -141,6 +141,32 @@ describe('BrowserPanel', () => {
     await waitFor(() => expect(address.value).toBe('https://welcome.example'))
   })
 
+  it('does not blank address or tabs when returning to a session before listTabs resolves', async () => {
+    const host = createMockHost()
+    const { rerender } = render(<BrowserPanel host={host} sessionId="welcome" />)
+    const address = await screen.findByLabelText('浏览器地址') as HTMLInputElement
+    fireEvent.change(address, { target: { value: 'welcome.example' } })
+    fireEvent.submit(address.closest('form')!)
+    await waitFor(() => expect(address.value).toBe('https://welcome.example'))
+
+    rerender(<BrowserPanel host={host} sessionId="layout" />)
+    await waitFor(() => expect(address.value).toBe(''))
+
+    const original = host.browser!.listTabs.bind(host.browser)
+    let release!: () => void
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    host.browser!.listTabs = vi.fn(async sessionId => {
+      if (sessionId === 'welcome') await blocked
+      return original(sessionId)
+    })
+
+    rerender(<BrowserPanel host={host} sessionId="welcome" />)
+    expect(address.value).toBe('https://welcome.example')
+    expect(address.value).not.toBe('')
+    release()
+    await waitFor(() => expect(address.value).toBe('https://welcome.example'))
+  })
+
   it('hides the native browser view while occluded and restores its current bounds', async () => {
     const host = createMockHost()
     const setViewBounds = vi.spyOn(host.browser!, 'setViewBounds')

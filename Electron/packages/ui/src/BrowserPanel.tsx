@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, PipiHostAPI } from '@pipi/host-api'
 import { DismissibleError } from './DismissibleError'
@@ -23,6 +23,17 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot }: 
   const [error, setError] = useState<string>()
   const [surface, setSurface] = useState<HTMLDivElement | null>(null)
   const sessionKey = sessionId ?? ''
+  const chromeBySession = useRef(new Map<string, { tabs: BrowserTabsSnapshot; address: string }>())
+  const [chromeKey, setChromeKey] = useState(sessionKey)
+  if (sessionKey !== chromeKey) {
+    if (chromeKey) chromeBySession.current.set(chromeKey, { tabs, address })
+    const cached = sessionKey ? chromeBySession.current.get(sessionKey) : undefined
+    if (cached) {
+      setTabs(cached.tabs)
+      setAddress(cached.address)
+    }
+    setChromeKey(sessionKey)
+  }
   const active = activeTab(tabs)
 
   const sync = useCallback(async () => {
@@ -45,8 +56,6 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot }: 
   useEffect(() => {
     if (!browser || !sessionKey) return
     let alive = true
-    setTabs(emptyTabs)
-    setAddress('')
     void sync().catch(reason => { if (alive) setError(reason instanceof Error ? reason.message : String(reason)) })
     const unsubscribe = browser.subscribe(event => {
       // Only this session's tab events belong to this panel; drop the rest.
