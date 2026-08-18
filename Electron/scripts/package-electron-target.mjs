@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { assertEmbeddedRuntimeTree, assertFreshWindowsInstallerBudget } from './runtime-package-contract.mjs'
 
 const electronRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -136,7 +137,7 @@ export function writeWindowsPtyBuildProps(root) {
   return dirs
 }
 
-function main() {
+async function main() {
   const options = parseArgs(process.argv.slice(2))
   if (options.help) { usage(); return }
   if (!options.platform || !options.arch || options.builderArgs.length === 0) {
@@ -154,7 +155,9 @@ function main() {
     '--arch', options.arch,
     '--check'
   ], { env: releaseEnv })
-  console.log(`Packaging with persistent embedded runtime ${key}`)
+  const embeddedRuntime = join(electronRoot, '.embedded-runtimes', key)
+  const runtimeContract = await assertEmbeddedRuntimeTree(embeddedRuntime)
+  console.log(`Packaging with persistent embedded runtime ${key} (${runtimeContract.files} files, ${runtimeContract.bytes} bytes)`)
   Object.assign(releaseEnv, windowsMsvcEnv(options.platform, releaseEnv))
   if (options.platform === 'win32') {
     const delayimpDir = findDelayimpLibDir(releaseEnv)
@@ -162,6 +165,7 @@ function main() {
     const written = writeWindowsPtyBuildProps(electronRoot)
     if (delayimpDir) console.log(`Windows native rebuild append delayimp LIB ${delayimpDir} spectre-props=${written.length}`)
   }
+  const packageStartedAt = Date.now()
   run(process.execPath, [
     join(electronRoot, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js'),
     ...options.builderArgs,
@@ -174,6 +178,10 @@ function main() {
       PIPIUI_EMBEDDED_RUNTIME_TARGET: key
     }
   })
+  if (options.platform === 'win32') {
+    const installers = await assertFreshWindowsInstallerBudget(join(electronRoot, '..', 'build'), packageStartedAt)
+    for (const installer of installers) console.log(`Windows installer budget OK: ${installer.name} (${installer.bytes} bytes)`)
+  }
   if (options.platform === 'linux') {
     // electron-builder output is repo-root build/ (apps/electron package.json
     // build.directories.output = ../../../build). Do not fall back to other trees:
@@ -193,8 +201,8 @@ function invokedAsCli() {
 }
 
 if (invokedAsCli()) {
-  try { main() } catch (error) {
+  main().catch(error => {
     console.error(error instanceof Error ? error.message : String(error))
     process.exitCode = 1
-  }
+  })
 }

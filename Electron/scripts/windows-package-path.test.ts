@@ -12,6 +12,11 @@ import {
   windowsNativeRebuildEnv,
   writeWindowsPtyBuildProps
 } from './package-electron-target.mjs'
+import {
+  assertFreshWindowsInstallerBudget,
+  inspectEmbeddedRuntimeTree,
+  runtimeStagingPrefix
+} from './runtime-package-contract.mjs'
 
 describe('Windows package and CI path', () => {
   const workflow = readFileSync(resolve(import.meta.dirname, '../../.github/workflows/electron.yml'), 'utf8')
@@ -37,6 +42,59 @@ describe('Windows package and CI path', () => {
     expect(workflow).toContain('fetch-cua-driver.mjs')
     expect(workflow).toMatch(/if: matrix\.platform == 'win'[\s\S]*package-electron-target\.mjs/)
     expect(workflow).toMatch(/if: matrix\.platform != 'win'[\s\S]*npx electron-builder/)
+    expect(packager).toContain('assertEmbeddedRuntimeTree')
+    expect(packager).toContain('assertFreshWindowsInstallerBudget')
+  })
+
+  it('stages outside the copied Electron source and rejects recursive or oversized runtimes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pipiui-win-runtime-contract-'))
+    try {
+      const electronRoot = join(root, 'Electron')
+      const prefix = runtimeStagingPrefix(electronRoot, 'win32-x64')
+      expect(prefix.startsWith(join(root, 'build'))).toBe(true)
+      expect(prefix.startsWith(electronRoot)).toBe(false)
+
+      const runtime = join(root, 'runtime')
+      mkdirSync(join(runtime, 'pi', 'lib', 'node_modules'), { recursive: true })
+      writeFileSync(join(runtime, 'manifest.json'), 'ok')
+      expect(await inspectEmbeddedRuntimeTree(runtime, 1024)).toMatchObject({ ok: true })
+
+      mkdirSync(join(runtime, 'pi', 'lib', 'node_modules', 'pipiui-electron-workspace'))
+      expect(await inspectEmbeddedRuntimeTree(runtime, 1024)).toMatchObject({
+        ok: false,
+        reason: expect.stringContaining('Electron source workspace')
+      })
+      rmSync(join(runtime, 'pi', 'lib', 'node_modules', 'pipiui-electron-workspace'), { recursive: true })
+
+      mkdirSync(join(runtime, 'pi', 'lib', 'node_modules', 'dependency', '.embedded-runtimes', 'win32-x64'), { recursive: true })
+      expect(await inspectEmbeddedRuntimeTree(runtime, 1024)).toMatchObject({
+        ok: false,
+        reason: expect.stringContaining('recursively embeds .embedded-runtimes')
+      })
+      rmSync(join(runtime, 'pi', 'lib', 'node_modules', 'dependency'), { recursive: true })
+
+      writeFileSync(join(runtime, 'oversized.bin'), Buffer.alloc(2_048))
+      expect(await inspectEmbeddedRuntimeTree(runtime, 1_024)).toMatchObject({
+        ok: false,
+        reason: expect.stringContaining('over the 1024-byte budget')
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('requires a fresh Windows installer inside the package size budget', async () => {
+    const output = mkdtempSync(join(tmpdir(), 'pipiui-win-installer-budget-'))
+    try {
+      writeFileSync(join(output, 'PipiUI Setup.exe'), Buffer.alloc(2_048))
+      await expect(assertFreshWindowsInstallerBudget(output, 0, { minBytes: 1_024, maxBytes: 4_096 }))
+        .resolves.toMatchObject([{ name: 'PipiUI Setup.exe', bytes: 2_048 }])
+      writeFileSync(join(output, 'PipiUI Huge.exe'), Buffer.alloc(8_192))
+      await expect(assertFreshWindowsInstallerBudget(output, 0, { minBytes: 1_024, maxBytes: 4_096 }))
+        .rejects.toThrow('over the 4096-byte budget')
+    } finally {
+      rmSync(output, { recursive: true, force: true })
+    }
   })
 
   it('does not require Spectre-mitigated CRT libs for Windows native rebuilds', () => {

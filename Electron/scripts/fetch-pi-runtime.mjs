@@ -5,6 +5,7 @@ import { access, chmod, copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm,
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { assertEmbeddedRuntimeTree, runtimeStagingPrefix } from './runtime-package-contract.mjs'
 
 const electronRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const defaultRuntimesRoot = join(electronRoot, '.embedded-runtimes')
@@ -402,7 +403,9 @@ async function replaceRuntime(staging, destination, runtimesRoot, key) {
 async function buildRuntime({ asset, destination, key, platform, arch, runtimesRoot }) {
   await mkdir(runtimesRoot, { recursive: true })
   const extraction = await mkdtemp(join(tmpdir(), `pipiui-node-runtime-${key}-`))
-  const staging = await mkdtemp(join(runtimesRoot, `.staging-${key}-`))
+  const stagingPrefix = runtimeStagingPrefix(electronRoot, key)
+  await mkdir(dirname(stagingPrefix), { recursive: true })
+  const staging = await mkdtemp(stagingPrefix)
   try {
     const archive = await bytesWithPinnedChecksum(join(electronRoot, '.node-runtime-cache'), asset)
     await extractNode(archive, asset, extraction)
@@ -507,6 +510,8 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
 
     const staged = await inspectRuntime(staging, { platform, arch })
     if (!staged.ok) throw new Error(`Staged runtime validation failed: ${staged.reason}`)
+    const packageContract = await assertEmbeddedRuntimeTree(staging)
+    console.log(`Embedded runtime package contract OK: ${packageContract.files} files, ${packageContract.bytes} bytes`)
     await replaceRuntime(staging, destination, runtimesRoot, key)
   } finally {
     await rm(extraction, { recursive: true, force: true })
