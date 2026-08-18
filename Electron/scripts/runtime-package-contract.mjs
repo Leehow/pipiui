@@ -34,13 +34,15 @@ export async function inspectEmbeddedRuntimeTree(root, maxBytes = EMBEDDED_RUNTI
     for (const entry of entries) {
       const path = join(directory, entry.name)
       const rel = relative(resolvedRoot, path).split('\\').join('/')
+      // Name-first: Windows junctions are Dirent symbolic links, not directories,
+      // and electron-builder extraResources follows them into the Electron tree.
+      if (entry.name === '.embedded-runtimes') {
+        return { ok: false, reason: `runtime recursively embeds .embedded-runtimes at ${rel}`, bytes, files }
+      }
+      if (entry.name === 'pipiui-electron-workspace') {
+        return { ok: false, reason: `runtime contains the Electron source workspace at ${rel}`, bytes, files }
+      }
       if (entry.isDirectory()) {
-        if (entry.name === '.embedded-runtimes') {
-          return { ok: false, reason: `runtime recursively embeds .embedded-runtimes at ${rel}`, bytes, files }
-        }
-        if (rel === 'pi/lib/node_modules/pipiui-electron-workspace') {
-          return { ok: false, reason: `runtime contains the Electron source workspace at ${rel}`, bytes, files }
-        }
         stack.push(path)
         continue
       }

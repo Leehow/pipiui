@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -30,6 +30,10 @@ describe('Windows package and CI path', () => {
     expect(packageJSON.scripts['package:win']).not.toContain('CUA_TARGET_PLATFORM=')
     expect(packager).toContain("'--check'")
     expect(packager).toContain('unsignedBuilderArgs')
+    const runtimePreparer = readFileSync(resolve(import.meta.dirname, './fetch-pi-runtime.mjs'), 'utf8')
+    expect(runtimePreparer).toContain("'--no-workspaces'")
+    expect(runtimePreparer).toContain('cwd: piLib')
+    expect(runtimePreparer).toContain("npm_config_workspaces: 'false'")
   })
 
   it('pins the Windows CI runner to VS 2022 so node-gyp can rebuild Electron natives', () => {
@@ -72,6 +76,13 @@ describe('Windows package and CI path', () => {
         reason: expect.stringContaining('Electron source workspace')
       })
       rmSync(join(runtime, 'pi', 'lib', 'node_modules', 'pipiui-electron-workspace'), { recursive: true })
+
+      symlinkSync(electronRoot, join(runtime, 'pi', 'lib', 'node_modules', 'pipiui-electron-workspace'))
+      expect(await inspectEmbeddedRuntimeTree(runtime, 1024)).toMatchObject({
+        ok: false,
+        reason: expect.stringContaining('Electron source workspace')
+      })
+      rmSync(join(runtime, 'pi', 'lib', 'node_modules', 'pipiui-electron-workspace'), { force: true })
 
       mkdirSync(join(runtime, 'pi', 'lib', 'node_modules', 'dependency', '.embedded-runtimes', 'win32-x64'), { recursive: true })
       expect(await inspectEmbeddedRuntimeTree(runtime, 1024)).toMatchObject({

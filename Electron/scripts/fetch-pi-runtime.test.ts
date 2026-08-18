@@ -127,6 +127,9 @@ describe('persistent embedded Pi runtime CLI', () => {
     // install that runs under --prefix.
     expect(source).toContain("'--maxsockets', '3'")
     expect(source).toContain("'--fetch-timeout', '60000'")
+    expect(source).toContain("'--no-workspaces'")
+    expect(source).toContain('cwd: piLib')
+    expect(source).toContain("npm_config_workspaces: 'false'")
     expect(source).toContain('[`better-sqlite3@${betterSqliteVersion}`]: true')
     const npmrc = await readFile(new URL('../.npmrc', import.meta.url), 'utf8')
     expect(npmrc).toMatch(/^maxsockets=3$/m)

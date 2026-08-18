@@ -455,12 +455,17 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
       // from stranding a release build.
       '--maxsockets', '3',
       '--fetch-timeout', '60000',
+      '--no-workspaces',
       `--os=${platform}`,
       `--cpu=${arch}`,
       '--prefix',
       piLib
     ], {
       shell: npm.shell,
+      // Inherit cwd is Electron/. npm then discovers the workspace and links
+      // pipiui-electron-workspace into the runtime (a Windows junction that
+      // extraResources follows until 7za OOMs). Stay under the isolated prefix.
+      cwd: piLib,
       env: {
         ...process.env,
         // pi-hermes-memory's better-sqlite3 addon is loaded by Electron in
@@ -471,11 +476,13 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
         npm_config_target: platform === 'darwin' ? metadata.version : electronVersion,
         npm_config_disturl: platform === 'darwin' ? 'https://nodejs.org/dist' : 'https://electronjs.org/headers',
         npm_config_arch: arch,
-        npm_config_platform: platform
+        npm_config_platform: platform,
+        npm_config_workspaces: 'false'
       }
     })
 
     const nodeModules = join(piLib, 'node_modules')
+    await rm(join(nodeModules, 'pipiui-electron-workspace'), { recursive: true, force: true })
     const piCli = join(nodeModules, '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js')
     if (!(await isFile(piCli))) throw new Error('Installed Pi package has no dist/cli.js')
 
