@@ -3,6 +3,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
+import { isTrivialBrowserEval } from "./browser-eval-guard.ts";
 
 const PORT = process.env.PIPIUI_BRIDGE_PORT;
 const KEY = process.env.PIPIUI_SESSION_KEY;
@@ -125,7 +126,7 @@ const HELP = [
   "content {mode?}         Raw fallback. mode='text' (default) or 'html'; may be large.",
   "                        WARNING: bypasses structured redaction — may expose credentials,",
   "                        tokens, and payment details. Avoid on auth/checkout pages.",
-  "eval {js}               Debug fallback. Runs page-world JS and bypasses structured guarantees.",
+  "eval {js}               Page-DOM only. Never string literals / keep-alive; use observe then click/input.",
   "                        WARNING: can read DOM values and secrets directly. Avoid on",
   "                        auth/checkout pages; prefer observe/click/input.",
   "console {clear?}        Console output (log/info/warn/error), JS exceptions and failed",
@@ -160,7 +161,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Drive the built-in WebView with structured observations and typed DOM actions. " +
       "actions: navigate, observe, wait, click, input, type, select, scroll, content, eval, console, screenshot, back, forward, reload, help. " +
-      "Fallbacks content/eval/screenshot bypass structured redaction and may expose credentials — avoid on auth/checkout pages. " +
+      "eval is page-DOM only (no literals/keep-alive). Fallbacks content/eval/screenshot bypass structured redaction and may expose credentials — avoid on auth/checkout pages. " +
       'Call with action:"help" for full parameter docs.',
     parameters: Type.Object({
       action: Type.String({
@@ -288,6 +289,14 @@ export default function (pi: ExtensionAPI) {
         }
         case "eval": {
           if (!params.js) return text('browser eval requires "js".\n\n' + HELP);
+          if (isTrivialBrowserEval(params.js)) {
+            return text(
+              "eval rejected because js does not read or change the page. " +
+                "do not use eval to return string literals / count / keep-alive / print progress. " +
+                "to click/type: observe then snapshot_id + element_index or element_token.\n\n" +
+                HELP,
+            );
+          }
           const r = await bridge("eval", { js: params.js }, signal);
           if (!r.ok) return bridgeFailure(r);
           return text(String(r.result ?? "undefined"));

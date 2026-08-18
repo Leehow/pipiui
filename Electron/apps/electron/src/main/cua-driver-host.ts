@@ -102,6 +102,22 @@ function snapshotID(observation: Record<string, unknown> | undefined): string | 
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+function actionSnapshotIDs(action: Record<string, unknown>): string[] {
+  const ids: string[] = [];
+  if (typeof action.snapshot_id === "string" && action.snapshot_id.length > 0)
+    ids.push(action.snapshot_id);
+  if (typeof action.element_token === "string") {
+    const match = /^(.*):\d+$/.exec(action.element_token);
+    if (match?.[1]) ids.push(match[1]);
+  }
+  return [...new Set(ids)];
+}
+
+function computerTaskOwnerKey(session: string, taskId: unknown): string {
+  const task = typeof taskId === "string" ? taskId.trim() : "";
+  return task ? JSON.stringify([session, task]) : session;
+}
+
 function hasSamePidKeyboardAmbiguity(
   observation: Record<string, unknown> | undefined,
 ): boolean {
@@ -284,6 +300,10 @@ const TARGET_WINDOW_ERROR_CODES = new Set([
   "window_id_not_found",
   "window_owner_pid_mismatch",
 ]);
+const STRUCTURED_DRIVER_ERROR_CODES = new Set([
+  ...TARGET_WINDOW_ERROR_CODES,
+  "desktop_already_active",
+]);
 
 function isAppSwitcherAction(action: Record<string, unknown>): boolean {
   const type = String(action.type ?? action.action ?? "").toLowerCase();
@@ -301,7 +321,7 @@ export function cuaToolFailureCode(result: unknown): string | undefined {
   const structured = record(result.structuredContent) ? result.structuredContent : {};
   const nested = record(structured.error) ? structured.error : {};
   for (const value of [structured.error_code, structured.code, nested.code]) {
-    if (typeof value === "string" && TARGET_WINDOW_ERROR_CODES.has(value)) return value;
+    if (typeof value === "string" && STRUCTURED_DRIVER_ERROR_CODES.has(value)) return value;
   }
   const text = Array.isArray(result.content)
     ? result.content.filter(record).map((item) => item.text).filter((item): item is string => typeof item === "string").join("\n")
@@ -320,6 +340,35 @@ export function isMissingInstalledAppError(error: unknown): boolean {
 export function isDriverSessionEndedError(error: unknown): boolean {
   return error instanceof Error &&
     /has ended; tool call '[^']+' was rejected/i.test(error.message);
+}
+
+/** Fixed transient rejection while the daemon closes the preceding operation. */
+export function isDriverActiveOperationError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if ((error as Error & { code?: unknown }).code === "desktop_already_active") return true;
+  return /^Desktop session is (?:occupied by another active operation|currently held by another operation)\.?$/i
+    .test(error.message.trim());
+}
+
+const ACTIVE_OPERATION_RETRY_DELAYS_MS = [20, 50, 100, 200, 400, 800, 1_000] as const;
+const ACTIVE_OPERATION_RETRY_BUDGET_MS = ACTIVE_OPERATION_RETRY_DELAYS_MS
+  .reduce((total, delay) => total + delay, 0);
+
+type ActiveOperationDiagnostics = {
+  code: string;
+  operation: string;
+  sameSession: boolean;
+  attemptCount: number;
+  elapsedMs: number;
+  retryBudgetMs: number;
+};
+
+function activeOperationDiagnostics(error: unknown): ActiveOperationDiagnostics | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const value = error as Error & { activeOperationDiagnostics?: unknown };
+  return record(value.activeOperationDiagnostics)
+    ? value.activeOperationDiagnostics as ActiveOperationDiagnostics
+    : undefined;
 }
 
 export function resolveRunningAppBundleId(
@@ -367,7 +416,6 @@ export function buildActionCall(
       : {}),
   };
   const base = {
-    session: target.session,
     pid: target.pid,
     window_id: target.window_id,
     ...element,
@@ -377,7 +425,6 @@ export function buildActionCall(
     return {
       tool: "invoke_menu",
       arguments: {
-        session: target.session,
         pid: target.pid,
         window_id: target.window_id,
         path: action.path,
@@ -420,9 +467,8 @@ export function buildActionCall(
     return keys.length === 1
       ? { tool: "press_key", arguments: { ...base, key: keys[0] } }
       : {
-          tool: "hotkey",
-          arguments: {
-            session: target.session,
+        tool: "hotkey",
+        arguments: {
             pid: target.pid,
             window_id: target.window_id,
             ...(action.delivery_mode ? { delivery_mode: action.delivery_mode } : {}),
@@ -462,9 +508,11 @@ export class CuaDriverHost {
   private starting?: Promise<void>;
   private targets = new Map<string, CuaTarget>();
   private rootTargets = new Map<string, CuaTarget>();
+  private observations = new Map<string, { target: CuaTarget; observation: Record<string, unknown> }>();
   private applicationIdentities = new Map<string, Set<string>>();
   private sessionScopes = new Map<string, "window" | "desktop">();
-  private desktopSessions = new Map<string, string>();
+  private requestTail: Promise<void> = Promise.resolve();
+  private requestGeneration = 0;
   private teardowns = new Set<Promise<void>>();
   private shutdownRequested = false;
   private activeLaunchPath?: string;
@@ -518,6 +566,30 @@ export class CuaDriverHost {
       this.cancel();
       return { ok: true, cancelled: true };
     }
+    const generation = this.requestGeneration;
+    const run = async () => {
+      try {
+        if (generation !== this.requestGeneration)
+          throw new Error("computer request cancelled");
+        const result = await this.handleRequest(request);
+        if (generation !== this.requestGeneration)
+          throw new Error("computer request cancelled");
+        return result;
+      } catch (error) {
+        const diagnostics = activeOperationDiagnostics(error);
+        if (!diagnostics) throw error;
+        const message = `Cua Driver ${diagnostics.operation} remained busy after ${diagnostics.attemptCount} same-session attempts (${diagnostics.elapsedMs}ms elapsed; ${diagnostics.retryBudgetMs}ms retry budget)`;
+        return this.failure(diagnostics.code, message, true, diagnostics);
+      }
+    };
+    const operation = this.requestTail.then(run, run);
+    this.requestTail = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  private async handleRequest(
+    request: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     if (!this.usable())
       return this.failure(
         "driver_unavailable",
@@ -570,18 +642,18 @@ export class CuaDriverHost {
           "computer runtime requires a session key",
           false,
         );
+      const owner = computerTaskOwnerKey(session, request.taskId);
       const identityKeys = [
         typeof request.bundle_identifier === "string" && request.bundle_identifier.trim() ? `bundle:${request.bundle_identifier.trim().toLowerCase()}` : "",
         typeof request.application_name === "string" && request.application_name.trim() ? `name:${request.application_name.trim().toLowerCase()}` : "",
       ].filter(Boolean);
-      const established = this.applicationIdentities.get(session);
-      if (this.rootTargets.has(session) && established && identityKeys.some((key) => !established.has(key)))
+      const established = this.applicationIdentities.get(owner);
+      if (this.rootTargets.has(owner) && established && identityKeys.some((key) => !established.has(key)))
         return this.failure(
           "target_handoff_untrusted",
           "This Computer Task already has an exact root application; an unproven alias cannot replace it",
           false,
         );
-      await this.startSession(session);
       const launch = await this.launchApplication({
         bundle_identifier: request.bundle_identifier,
         application_name: request.application_name,
@@ -601,8 +673,9 @@ export class CuaDriverHost {
         !Number.isInteger(windowID) ||
         windowID <= 0
       ) {
-        this.targets.delete(session);
-        this.rootTargets.delete(session);
+        this.targets.delete(owner);
+        this.rootTargets.delete(owner);
+        this.observations.delete(owner);
         return this.failure(
           "target_unavailable",
           "Cua Driver launch_app did not return an exact pid and window_id",
@@ -610,27 +683,28 @@ export class CuaDriverHost {
         );
       }
       const target = { pid, window_id: windowID, session };
-      this.rootTargets.set(session, target);
-      this.targets.set(session, target);
+      this.rootTargets.set(owner, target);
+      this.targets.set(owner, target);
       const proven = new Set(identityKeys);
       for (const key of launch.provenIdentityKeys) proven.add(key);
       for (const [kind, value] of [
         ["bundle", structured.bundle_id ?? structured.bundle_identifier],
         ["name", structured.name ?? structured.application_name],
       ] as const) if (typeof value === "string" && value.trim()) proven.add(`${kind}:${value.trim().toLowerCase()}`);
-      this.applicationIdentities.set(session, proven);
+      this.applicationIdentities.set(owner, proven);
       await this.call("bring_to_front", {
         pid: target.pid,
         window_id: target.window_id,
       });
       let current: { target: CuaTarget; observation: Record<string, unknown> };
       try {
-        current = await this.observeSessionTarget(session, true, true);
+        current = await this.observeSessionTarget(owner, true, true);
       } catch (error) {
         if (error instanceof CuaTargetHandoffError)
           return this.failure(error.code, "Desktop target handoff was not authoritative", false);
         throw error;
       }
+      this.observations.set(owner, current);
       return {
         ok: true,
         ...structured,
@@ -647,6 +721,7 @@ export class CuaDriverHost {
           "computer runtime requires a session key",
           false,
         );
+      const owner = computerTaskOwnerKey(session, request.taskId);
       const mutates = actions.some(
         (raw) =>
           record(raw) &&
@@ -654,7 +729,7 @@ export class CuaDriverHost {
             String(raw.type ?? raw.action ?? ""),
           ),
       );
-      let target = this.targets.get(session);
+      let target = this.targets.get(owner);
       if (mutates && !target)
         return this.failure(
           "target_unavailable",
@@ -667,15 +742,35 @@ export class CuaDriverHost {
           "App-switcher shortcuts cannot be used after an exact application window is pinned; observe the pinned target instead",
           false,
         );
-      if (target) await this.startSession(session, "window");
       let observation: Record<string, unknown> | undefined;
       if (target) {
-        try {
-          ({ target, observation } = await this.observeSessionTarget(session));
-        } catch (error) {
-          if (error instanceof CuaTargetHandoffError)
-            return this.failure(error.code, "Desktop target handoff was not authoritative", false);
-          throw error;
+        const suppliedSnapshotIDs = actions.flatMap((raw) => {
+          if (!record(raw)) return [];
+          const type = String(raw.type ?? raw.action ?? "");
+          const usesSnapshotElement = Number.isInteger(raw.element_index) || typeof raw.element_token === "string";
+          return !["screenshot", "wait"].includes(type) && usesSnapshotElement
+            ? actionSnapshotIDs(raw)
+            : [];
+        });
+        const cached = this.observations.get(owner);
+        const canReusePublicObservation = cached !== undefined
+          && cached.target.pid === target.pid
+          && cached.target.window_id === target.window_id
+          && suppliedSnapshotIDs.length > 0
+          && suppliedSnapshotIDs.every(id => id === snapshotID(cached.observation));
+        if (canReusePublicObservation) {
+          observation = cached.observation;
+        } else {
+          try {
+            const current = await this.observeSessionTarget(owner);
+            target = current.target;
+            observation = current.observation;
+            this.observations.set(owner, current);
+          } catch (error) {
+            if (error instanceof CuaTargetHandoffError)
+              return this.failure(error.code, "Desktop target handoff was not authoritative", false);
+            throw error;
+          }
         }
       }
       const batchSnapshotID = snapshotID(observation);
@@ -697,11 +792,10 @@ export class CuaDriverHost {
 			  );
 			}
 			boundAction = { ...raw, ...fileTarget };
-		  }
+          }
           const currentSnapshotID = snapshotID(observation);
-          const suppliedSnapshotID = typeof boundAction.snapshot_id === "string"
-            ? boundAction.snapshot_id
-            : undefined;
+          const boundSnapshotIDs = actionSnapshotIDs(boundAction);
+          const suppliedSnapshotID = boundSnapshotIDs[0];
           const usesSnapshotElement = Number.isInteger(boundAction.element_index) ||
             typeof boundAction.element_token === "string";
           if (
@@ -719,7 +813,7 @@ export class CuaDriverHost {
               ...observation,
             };
           }
-          if (usesSnapshotElement && suppliedSnapshotID && currentSnapshotID && suppliedSnapshotID !== currentSnapshotID) {
+          if (usesSnapshotElement && currentSnapshotID && boundSnapshotIDs.some(id => id !== currentSnapshotID)) {
             return {
               ...this.failure(
                 "stale_snapshot",
@@ -731,7 +825,7 @@ export class CuaDriverHost {
             };
           }
           if (
-            usesSnapshotElement && currentSnapshotID && !suppliedSnapshotID
+            usesSnapshotElement && currentSnapshotID && typeof boundAction.snapshot_id !== "string"
           ) {
             boundAction = { ...boundAction, snapshot_id: batchSnapshotID ?? currentSnapshotID };
           }
@@ -752,10 +846,11 @@ export class CuaDriverHost {
         try {
           await this.perform(boundAction, target);
           if (mutation && target) {
-            const immutableRoot = this.rootTargets.get(session);
-            const freshState = await this.observeSessionTarget(session, true);
+            const immutableRoot = this.rootTargets.get(owner);
+            const freshState = await this.observeSessionTarget(owner, true);
             target = freshState.target;
             const fresh = freshState.observation;
+            this.observations.set(owner, freshState);
 			if (type === "typeahead" && (
 			  !immutableRoot ||
 			  target.pid !== immutableRoot.pid ||
@@ -789,9 +884,10 @@ export class CuaDriverHost {
           // Observe once, return outcome-unknown, and never execute the tail.
           if (mutation && target) {
             try {
-              const freshState = await this.observeSessionTarget(session, true);
+              const freshState = await this.observeSessionTarget(owner, true);
               target = freshState.target;
               observation = freshState.observation;
+              this.observations.set(owner, freshState);
             } catch {
               observation = undefined;
             }
@@ -810,17 +906,18 @@ export class CuaDriverHost {
         }
         completedActions += 1;
         if (type === "wait" && target) {
-          const freshState = await this.observeSessionTarget(session, true);
+          const freshState = await this.observeSessionTarget(owner, true);
           target = freshState.target;
           observation = freshState.observation;
+          this.observations.set(owner, freshState);
           continue;
         }
       }
       return {
         ok: true,
         ...(target
-          ? observation ?? (await this.observeSessionTarget(session)).observation
-          : await this.observeDesktop(await this.startDesktopSession(session))),
+          ? observation ?? (await this.observeSessionTarget(owner)).observation
+          : await this.observeDesktop()),
       };
     }
     return this.failure(
@@ -831,6 +928,7 @@ export class CuaDriverHost {
   }
 
   cancel(): void {
+    this.requestGeneration += 1;
     const error = new Error("computer request cancelled");
     for (const item of this.pending.values()) {
       clearTimeout(item.timer);
@@ -848,9 +946,9 @@ export class CuaDriverHost {
     this.starting = undefined;
     this.targets.clear();
     this.rootTargets.clear();
+    this.observations.clear();
     this.applicationIdentities.clear();
     this.sessionScopes.clear();
-    this.desktopSessions.clear();
     const teardown = this.terminateGeneration(proxy, daemon, socket);
     this.teardowns.add(teardown);
     void teardown.catch(() => {}).finally(() => this.teardowns.delete(teardown));
@@ -869,6 +967,7 @@ export class CuaDriverHost {
     code: string,
     message: string,
     retryable: boolean,
+    details: Record<string, unknown> = {},
   ): Record<string, unknown> {
     return {
       ok: false,
@@ -878,6 +977,7 @@ export class CuaDriverHost {
         message,
         retryable,
         requiresObservation: retryable,
+        ...details,
       },
     };
   }
@@ -887,7 +987,16 @@ export class CuaDriverHost {
       throw new Error("Cua Driver host is shutting down");
     if (this.teardowns.size > 0)
       await Promise.allSettled([...this.teardowns]);
+    if (
+      this.proxy && this.daemon &&
+      !this.proxy.killed && !this.daemon.killed &&
+      this.proxy.exitCode === null && this.daemon.exitCode === null
+    )
+      return;
+    if (this.starting) return this.starting;
     await this.assertNoLeftoverGeneration();
+    // Another caller may have completed startup while the leftover check was
+    // awaiting process discovery. Re-check before creating a generation.
     if (
       this.proxy && this.daemon &&
       !this.proxy.killed && !this.daemon.killed &&
@@ -1166,9 +1275,10 @@ export class CuaDriverHost {
     name: string,
     args: Record<string, unknown>,
   ): Promise<any> {
+    const generation = this.requestGeneration;
     await this.ensureStarted();
     try {
-      return await this.invoke(name, args);
+      return await this.invokeWithActiveOperationJoin(name, args, generation);
     } catch (error) {
       const session = typeof args.session === "string" ? args.session : "";
       if (!session || name === "start_session" || !isDriverSessionEndedError(error))
@@ -1179,7 +1289,43 @@ export class CuaDriverHost {
         (session.startsWith("pipiui-desktop-") ? "desktop" : "window");
       await this.invoke("start_session", { session, capture_scope: scope });
       this.sessionScopes.set(session, scope);
-      return await this.invoke(name, args);
+      return await this.invokeWithActiveOperationJoin(name, args, generation);
+    }
+  }
+
+  private async invokeWithActiveOperationJoin(
+    name: string,
+    args: Record<string, unknown>,
+    generation: number,
+  ): Promise<any> {
+    const session = typeof args.session === "string" ? args.session : "";
+    const startedAt = Date.now();
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.invoke(name, args);
+      } catch (error) {
+        const delay = ACTIVE_OPERATION_RETRY_DELAYS_MS[attempt];
+        if (!isDriverActiveOperationError(error)) throw error;
+        if (!session || name === "start_session" || delay === undefined) {
+          if (error instanceof Error) {
+            const driverCode = (error as Error & { code?: unknown }).code;
+            Object.assign(error, { activeOperationDiagnostics: {
+              code: typeof driverCode === "string" ? driverCode : "desktop_already_active",
+              operation: /^[a-z0-9_]{1,64}$/.test(name) ? name : "unknown_operation",
+              sameSession: Boolean(session),
+              attemptCount: attempt + 1,
+              elapsedMs: Math.max(0, Math.round(Date.now() - startedAt)),
+              retryBudgetMs: name === "start_session" || !session
+                ? 0
+                : ACTIVE_OPERATION_RETRY_BUDGET_MS,
+            } satisfies ActiveOperationDiagnostics });
+          }
+          throw error;
+        }
+        await sleep(delay);
+        if (generation !== this.requestGeneration)
+          throw new Error("computer request cancelled");
+      }
     }
   }
 
@@ -1228,27 +1374,6 @@ export class CuaDriverHost {
     }
   }
 
-  private async startSession(
-    session: string,
-    captureScope: "window" | "desktop" = "window",
-  ): Promise<void> {
-    if (this.sessionScopes.has(session)) return;
-    await this.call("start_session", {
-      session,
-      capture_scope: captureScope,
-    });
-    this.sessionScopes.set(session, captureScope);
-  }
-
-  private async startDesktopSession(ownerSession: string): Promise<string> {
-    const existing = this.desktopSessions.get(ownerSession);
-    if (existing) return existing;
-    const desktopSession = `pipiui-desktop-${randomUUID()}`;
-    await this.startSession(desktopSession, "desktop");
-    this.desktopSessions.set(ownerSession, desktopSession);
-    return desktopSession;
-  }
-
   private async perform(
     action: Record<string, unknown>,
     target?: CuaTarget,
@@ -1268,7 +1393,6 @@ export class CuaDriverHost {
 	if (type === "typeahead") {
 	  // Use only the exact AX action advertised by the Host-resolved file child.
 	  await this.call("click", {
-		session: target.session,
 		pid: target.pid,
 		window_id: target.window_id,
 		...(typeof action.element_token === "string" ? { element_token: action.element_token } : {}),
@@ -1285,7 +1409,8 @@ export class CuaDriverHost {
   private async observe(target: CuaTarget): Promise<Record<string, unknown>> {
     return this.imageResult(
       await this.call("get_window_state", {
-        ...target,
+        pid: target.pid,
+        window_id: target.window_id,
         max_elements: 2000,
         max_depth: 25,
       }),
@@ -1403,10 +1528,10 @@ export class CuaDriverHost {
     }
     return { target, observation };
   }
-  private async observeDesktop(
-    session: string,
-  ): Promise<Record<string, unknown>> {
-    return this.imageResult(await this.call("get_desktop_state", { session }));
+  private async observeDesktop(): Promise<Record<string, unknown>> {
+    // Pre-target observation is screenshot-only. Keep it cursor-less so it
+    // cannot claim a desktop-scoped run before the owner pins a window run.
+    return this.imageResult(await this.call("get_desktop_state", {}));
   }
   private imageResult(result: any): Record<string, unknown> {
     const structured = record(result.structuredContent)

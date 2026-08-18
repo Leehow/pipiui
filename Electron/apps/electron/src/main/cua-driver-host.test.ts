@@ -10,6 +10,7 @@ import {
   cuaSocketPath,
   cuaToolFailureCode,
   CuaDriverHost,
+  isDriverActiveOperationError,
   isDriverSessionEndedError,
   selectLaunchWindow,
 } from "./cua-driver-host.js";
@@ -85,6 +86,56 @@ describe("CuaDriverHost", () => {
       .resolves.toMatchObject({ ok: false, runtimeError: { code: "target_handoff_untrusted", retryable: false } });
     expect(calls.filter((call) => call.name === "launch_app")).toHaveLength(1);
     expect(host.rootTargets.get("identity")).toEqual(rootTarget);
+  });
+
+  it("isolates pinned root applications by Computer Task within one main session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-task-root-identity-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "launch_app") {
+        const keeper = args.bundle_id === "org.chatrpg.cockeyper";
+        const pid = keeper ? 84 : 42;
+        const window_id = keeper ? 88 : 77;
+        return { structuredContent: {
+          pid,
+          bundle_id: keeper ? "org.chatrpg.cockeyper" : "com.apple.finder",
+          name: keeper ? "Pi Keeper" : "Finder",
+          windows: [{ pid, window_id, bounds: { width: 800, height: 600 }, is_on_screen: true, on_current_space: true }],
+        } };
+      }
+      if (name === "get_window_state") return { structuredContent: { pid: args.pid, window_id: args.window_id, screenshot_png_b64: "PNG", elements: [] } };
+      return { structuredContent: {} };
+    };
+
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "main-session",
+      taskId: "task-finder",
+      action: "computer_open_application",
+      application_name: "Finder",
+    })).resolves.toMatchObject({ ok: true, target: { pid: 42, window_id: 77 } });
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "main-session",
+      taskId: "task-keeper",
+      action: "computer_open_application",
+      application_name: "Pi Keeper",
+      bundle_identifier: "org.chatrpg.cockeyper",
+    })).resolves.toMatchObject({ ok: true, target: { pid: 84, window_id: 88 } });
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "main-session",
+      taskId: "task-keeper",
+      action: "computer_open_application",
+      application_name: "unproven-alias",
+    })).resolves.toMatchObject({ ok: false, runtimeError: { code: "target_handoff_untrusted" } });
+    expect(calls.filter((call) => call.name === "launch_app")).toHaveLength(2);
   });
 
   it("pins an on-screen current-space TextEdit window ahead of a larger off-screen sibling", () => {
@@ -308,6 +359,156 @@ describe("CuaDriverHost", () => {
     expect(calls.filter((call) => call.name === "click")).toHaveLength(1);
   });
 
+  it("accepts an exact located combo-box token from the last public observation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-combobox-token-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    let observations = 0;
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.targets.set("combo", { session: "combo", pid: 42, window_id: 77 });
+    host.rootTargets.set("combo", { session: "combo", pid: 42, window_id: 77 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "get_window_state") {
+        observations += 1;
+        return { structuredContent: {
+          screenshot_png_b64: `PNG-${observations}`,
+          snapshot_id: `snapshot-${observations}`,
+          pid: 42,
+          window_id: 77,
+          elements: [{
+            element_index: 27,
+            element_token: `snapshot-${observations}:27`,
+            role: "AXComboBox",
+            label: "剧本",
+            value: "选择剧本…",
+          }],
+        } };
+      }
+      return { structuredContent: {} };
+    };
+
+    const observed = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "combo",
+      action: "computer_batch",
+      actions: [{ type: "screenshot" }],
+    });
+    expect(observed).toMatchObject({ ok: true, snapshot_id: "snapshot-1" });
+
+    const acted = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "combo",
+      action: "computer_batch",
+      actions: [{
+        type: "click",
+        element_token: "snapshot-1:27",
+        snapshot_id: "snapshot-1",
+      }],
+    });
+    expect(acted).toMatchObject({ ok: true, snapshot_id: "snapshot-2" });
+    expect(calls.filter((call) => call.name === "get_window_state")).toHaveLength(2);
+    expect(calls.find((call) => call.name === "click")?.args).toMatchObject({
+      pid: 42,
+      window_id: 77,
+      element_token: "snapshot-1:27",
+      snapshot_id: "snapshot-1",
+    });
+
+    const stale = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "combo",
+      action: "computer_batch",
+      actions: [{
+        type: "click",
+        element_token: "snapshot-1:27",
+        snapshot_id: "snapshot-1",
+      }],
+    });
+    expect(stale).toMatchObject({ ok: false, runtimeError: { code: "stale_snapshot" } });
+    expect(calls.filter((call) => call.name === "click")).toHaveLength(1);
+  });
+
+  it("accepts an exact token returned by open_application without self-staling it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-open-token-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    let observations = 0;
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "launch_app") return { structuredContent: {
+        pid: 42,
+        bundle_id: "org.chatrpg.cockeyper",
+        windows: [{ pid: 42, window_id: 77, bounds: { width: 800, height: 600 }, is_on_screen: true, on_current_space: true }],
+      } };
+      if (name === "get_window_state") {
+        observations += 1;
+        return { structuredContent: {
+          screenshot_png_b64: `PNG-${observations}`,
+          snapshot_id: `s0000000${observations}`,
+          pid: 42,
+          window_id: 77,
+          elements: [{ element_index: 30, element_token: `s0000000${observations}:30`, role: "AXButton", name: "开局" }],
+        } };
+      }
+      return { structuredContent: {} };
+    };
+
+    const opened = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "main-session",
+      taskId: "keeper-fullrun",
+      action: "computer_open_application",
+      bundle_identifier: "org.chatrpg.cockeyper",
+    });
+    expect(opened).toMatchObject({ ok: true, snapshot_id: "s00000001" });
+
+    const acted = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "main-session",
+      taskId: "keeper-fullrun",
+      action: "computer_batch",
+      actions: [{ type: "click", element_token: "s00000001:30" }, { type: "wait", duration_ms: 1 }],
+    });
+    expect(acted).toMatchObject({ ok: true, snapshot_id: "s00000003" });
+    expect(calls.filter((call) => call.name === "click")).toHaveLength(1);
+    expect(calls.find((call) => call.name === "click")?.args).toMatchObject({
+      pid: 42,
+      window_id: 77,
+      element_token: "s00000001:30",
+      snapshot_id: "s00000001",
+    });
+    // Open observation, post-click observation, post-wait observation. There
+    // is no pre-click refresh that invalidates the public launch token.
+    expect(calls.filter((call) => call.name === "get_window_state")).toHaveLength(3);
+
+    const stale = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "main-session",
+      taskId: "keeper-fullrun",
+      action: "computer_batch",
+      actions: [{ type: "click", element_token: "s00000001:30" }],
+    });
+    expect(stale).toMatchObject({ ok: false, runtimeError: { code: "stale_snapshot" } });
+    expect(calls.filter((call) => call.name === "click")).toHaveLength(1);
+
+    const otherTask = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "main-session",
+      taskId: "another-task",
+      action: "computer_batch",
+      actions: [{ type: "click", element_token: "s00000003:30" }],
+    });
+    expect(otherTask).toMatchObject({ ok: false, runtimeError: { code: "target_unavailable" } });
+  });
+
   it("returns outcome unknown when mandatory post-mutation observation fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "cua-unknown-"));
     roots.push(root);
@@ -466,6 +667,12 @@ if (mode === "serve") {
 `);
     await chmod(helper, 0o755);
     const host = new CuaDriverHost(helper, { displayID: 1, width: 1, height: 1 });
+    await expect(host.handle({
+      protocolVersion: 1,
+      action: "computer_runtime_capabilities",
+    })).resolves.toMatchObject({ ok: true });
+    // A healthy generation remains owned by this Host between public calls.
+    // Reusing it must not classify its own daemon/proxy PIDs as leftovers.
     await expect(host.handle({
       protocolVersion: 1,
       action: "computer_runtime_capabilities",
@@ -667,7 +874,7 @@ if (mode === "serve") {
     expect(spawned).toBe(0);
   });
 
-  it("extracts only closed target-window codes from Cua tool failures", () => {
+  it("extracts only closed structured codes and preserves target-window text codes", () => {
     expect(cuaToolFailureCode({
       isError: true,
       structuredContent: { error_code: "window_id_not_found" },
@@ -676,6 +883,10 @@ if (mode === "serve") {
       isError: true,
       content: [{ type: "text", text: "window_owner_pid_mismatch owner_pid=84" }],
     })).toBe("window_owner_pid_mismatch");
+    expect(cuaToolFailureCode({
+      isError: true,
+      structuredContent: { error: { code: "desktop_already_active" } },
+    })).toBe("desktop_already_active");
     expect(cuaToolFailureCode({
       isError: true,
       structuredContent: { error_code: "arbitrary_failure" },
@@ -717,7 +928,6 @@ if (mode === "serve") {
     ).toEqual({
       tool: "click",
       arguments: {
-        session: "session-a",
         pid: 42,
         window_id: 77,
         x: 10,
@@ -734,7 +944,6 @@ if (mode === "serve") {
     ).toEqual({
       tool: "type_text",
       arguments: {
-        session: "session-a",
         pid: 42,
         window_id: 77,
         element_token: "token",
@@ -752,7 +961,6 @@ if (mode === "serve") {
     ).toEqual({
       tool: "hotkey",
       arguments: {
-        session: "session-a",
         pid: 42,
         window_id: 77,
         keys: ["CMD", "L"],
@@ -766,7 +974,6 @@ if (mode === "serve") {
     ).toMatchObject({
       tool: "scroll",
       arguments: {
-        session: "session-a",
         pid: 42,
         window_id: 77,
         direction: "down",
@@ -805,7 +1012,6 @@ if (mode === "serve") {
       actions: [{ type: "invoke_menu", path: ["Example App", "Settings…"] }],
     })).resolves.toMatchObject({ ok: true });
     expect(calls.find((call) => call.name === "invoke_menu")?.args).toEqual({
-      session: "menu",
       pid: 98798,
       window_id: 373954,
       path: ["Example App", "Settings…"],
@@ -818,7 +1024,6 @@ if (mode === "serve") {
       actions: [{ type: "click", coordinate: [90, -1065] }],
     })).resolves.toMatchObject({ ok: false, runtimeError: { code: "mutation_outcome_unknown" } });
     expect(calls.findLast((call) => call.name === "click")?.args).toMatchObject({
-      session: "menu",
       pid: 98798,
       window_id: 373954,
       x: 90,
@@ -1184,7 +1389,6 @@ if (mode === "serve") {
     });
     expect(opened).not.toHaveProperty("screenshot_png_b64");
     expect(calls.map((call) => call.name)).toEqual([
-      "start_session",
       "launch_app",
       "bring_to_front",
       "get_window_state",
@@ -1195,10 +1399,10 @@ if (mode === "serve") {
       window_id: 77,
     });
     expect(calls.find((call) => call.name === "get_window_state")?.args).toMatchObject({
-      session: "a",
       pid: 42,
       window_id: 77,
     });
+    expect(calls.find((call) => call.name === "get_window_state")?.args).not.toHaveProperty("session");
     expect(
       await host.handle({
         protocolVersion: 1,
@@ -1211,6 +1415,76 @@ if (mode === "serve") {
       runtimeError: { code: "target_unavailable" },
     });
     expect(calls.some((call) => call.name === "screenshot")).toBe(false);
+  });
+
+  it("finishes opening and pinning an app before an immediate fresh observation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-open-observe-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    let releaseLaunch!: () => void;
+    let signalLaunch!: () => void;
+    let launchActive = false;
+    const launchGate = new Promise<void>((resolve) => {
+      releaseLaunch = resolve;
+    });
+    const launchEntered = new Promise<void>((resolve) => {
+      signalLaunch = resolve;
+    });
+    const host: any = new CuaDriverHost(helper, {
+      displayID: 1,
+      width: 1440,
+      height: 900,
+    });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "start_session" && args.capture_scope === "desktop" && launchActive)
+        throw new Error("Desktop session is occupied by another active operation.");
+      if (name === "launch_app") {
+        launchActive = true;
+        signalLaunch();
+        await launchGate;
+        launchActive = false;
+        return { structuredContent: {
+          pid: 42,
+          windows: [{ pid: 42, window_id: 77, bounds: { width: 900, height: 700 } }],
+        } };
+      }
+      if (name === "get_window_state") return { structuredContent: {
+        screenshot_png_b64: `WINDOW-${args.window_id}`,
+        pid: 42,
+        window_id: 77,
+        elements: [],
+      } };
+      if (name === "get_accessibility_tree") return { structuredContent: { windows: [] } };
+      return { structuredContent: {} };
+    };
+
+    const opened = host.handle({
+      protocolVersion: 1,
+      sessionKey: "operator",
+      action: "computer_open_application",
+      application_name: "Pi Keeper",
+    });
+    await launchEntered;
+    const observed = host.handle({
+      protocolVersion: 1,
+      sessionKey: "operator",
+      action: "computer_batch",
+      fresh: true,
+      actions: [{ type: "screenshot" }],
+    });
+    releaseLaunch();
+
+    await expect(Promise.all([opened, observed])).resolves.toMatchObject([
+      { ok: true, target: { pid: 42, window_id: 77 } },
+      { ok: true, base64: "WINDOW-77" },
+    ]);
+    expect(host.targets.get("operator")).toMatchObject({ pid: 42, window_id: 77 });
+    expect(calls.filter((call) => call.name === "start_session" && call.args.capture_scope === "desktop"))
+      .toHaveLength(0);
   });
 
   it("activates a running uninstalled app by resolving its name through list_apps", async () => {
@@ -1510,7 +1784,7 @@ if (mode === "serve") {
     expect(host.targets.get("a")).toMatchObject({ pid: 42, window_id: 100 });
   });
 
-  it("uses a separate desktop-scoped session for untargeted observation", async () => {
+  it("uses cursor-less desktop state for untargeted observation", async () => {
     const root = await mkdtemp(join(tmpdir(), "cua-desktop-"));
     roots.push(root);
     const helper = join(root, "cua-driver");
@@ -1550,17 +1824,226 @@ if (mode === "serve") {
       screenshot_width: 1440,
       screenshot_height: 900,
     });
-    expect(calls.map((call) => call.name)).toEqual([
-      "start_session",
-      "get_desktop_state",
-    ]);
-    const desktopSession = calls[0].args.session;
-    expect(calls[0].args).toMatchObject({
-      session: desktopSession,
-      capture_scope: "desktop",
+    expect(calls.map((call) => call.name)).toEqual(["get_desktop_state"]);
+    expect(calls[0].args).toEqual({});
+  });
+
+  it("keeps an untargeted desktop screenshot cursor-less before pinning the owner window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-desktop-then-window-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    let activeSession: string | undefined;
+    const host: any = new CuaDriverHost(helper, {
+      displayID: 1,
+      width: 1440,
+      height: 900,
     });
-    expect(desktopSession).not.toBe("observe");
-    expect(calls[1].args).toEqual({ session: desktopSession });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "get_desktop_state") {
+        if (typeof args.session === "string") activeSession = args.session;
+        return { structuredContent: {
+          screenshot_png_b64: "DESKTOP",
+          screenshot_mime_type: "image/png",
+        } };
+      }
+      if (name === "launch_app") return { structuredContent: {
+        pid: 42,
+        windows: [{ pid: 42, window_id: 77 }],
+      } };
+      if (name === "get_window_state") {
+        if (activeSession && activeSession !== args.session)
+          throw new Error("Desktop control is unavailable while another session is active.");
+        activeSession = args.session;
+        return { structuredContent: {
+          screenshot_png_b64: "WINDOW",
+          screenshot_mime_type: "image/png",
+          pid: 42,
+          window_id: 77,
+          elements: [],
+        } };
+      }
+      if (name === "get_accessibility_tree") return { structuredContent: { windows: [] } };
+      return { structuredContent: {} };
+    };
+
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "operator",
+      action: "computer_batch",
+      fresh: true,
+      actions: [{ type: "screenshot" }],
+    })).resolves.toMatchObject({ ok: true, base64: "DESKTOP" });
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "operator",
+      action: "computer_open_application",
+      application_name: "Pi Keeper",
+    })).resolves.toMatchObject({ ok: true, base64: "WINDOW", target: { session: "operator", pid: 42, window_id: 77 } });
+
+    expect(calls.find((call) => call.name === "get_desktop_state")?.args).toEqual({});
+    expect(calls.find((call) => call.name === "get_window_state")?.args).toMatchObject({
+      pid: 42,
+      window_id: 77,
+    });
+    expect(calls.find((call) => call.name === "get_window_state")?.args).not.toHaveProperty("session");
+  });
+
+  it("uses one implicit driver lifecycle for desktop inspect, pinned window observe, and action", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-implicit-lifecycle-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    let implicitActive = false;
+    const host: any = new CuaDriverHost(helper, {
+      displayID: 1,
+      width: 1440,
+      height: 900,
+    });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "get_desktop_state") {
+        if (!("session" in args)) implicitActive = true;
+        return { structuredContent: {
+          screenshot_png_b64: "DESKTOP",
+          screenshot_mime_type: "image/png",
+        } };
+      }
+      if (name === "launch_app") return { structuredContent: {
+        pid: 42,
+        windows: [{ pid: 42, window_id: 77 }],
+      } };
+      if (["get_window_state", "click"].includes(name)) {
+        if (implicitActive && "session" in args)
+          throw new Error("Desktop access is occupied by another active session.");
+        if (name === "click") return { structuredContent: {} };
+        return { structuredContent: {
+          screenshot_png_b64: "WINDOW",
+          screenshot_mime_type: "image/png",
+          pid: 42,
+          window_id: 77,
+          elements: [],
+        } };
+      }
+      if (name === "get_accessibility_tree") return { structuredContent: { windows: [] } };
+      return { structuredContent: {} };
+    };
+
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "operator",
+      action: "computer_batch",
+      fresh: true,
+      actions: [{ type: "screenshot" }],
+    })).resolves.toMatchObject({ ok: true, base64: "DESKTOP" });
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "operator",
+      action: "computer_open_application",
+      application_name: "Finder",
+    })).resolves.toMatchObject({ ok: true, base64: "WINDOW", target: { session: "operator", pid: 42, window_id: 77 } });
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "operator",
+      action: "computer_batch",
+      actions: [{ type: "click", coordinate: [10, 20] }],
+    })).resolves.toMatchObject({ ok: true, base64: "WINDOW" });
+
+    expect(calls.find((call) => call.name === "get_desktop_state")?.args).toEqual({});
+    expect(calls.filter((call) => call.name === "get_window_state").every((call) => !("session" in call.args))).toBe(true);
+    expect(calls.find((call) => call.name === "get_window_state")?.args).toMatchObject({ pid: 42, window_id: 77 });
+    expect(calls.find((call) => call.name === "click")?.args).toMatchObject({ pid: 42, window_id: 77, x: 10, y: 20 });
+    expect(calls.find((call) => call.name === "click")?.args).not.toHaveProperty("session");
+  });
+
+  it("keeps untargeted observations cursor-less across request owners", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-desktop-owners-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, {
+      displayID: 1,
+      width: 1440,
+      height: 900,
+    });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      return name === "get_desktop_state"
+        ? {
+            structuredContent: {
+              screenshot_png_b64: "DESKTOP",
+              screenshot_mime_type: "image/png",
+            },
+          }
+        : { structuredContent: {} };
+    };
+
+    const observe = (sessionKey: string) => host.handle({
+      protocolVersion: 1,
+      sessionKey,
+      action: "computer_batch",
+      actions: [{ type: "screenshot" }],
+    });
+    await expect(Promise.all([
+      observe("owner-a"),
+      observe("owner-b"),
+    ])).resolves.toMatchObject([{ ok: true }, { ok: true }]);
+    await expect(observe("owner-a")).resolves.toMatchObject({ ok: true });
+
+    const starts = calls.filter((call) => call.name === "start_session");
+    const observations = calls.filter((call) => call.name === "get_desktop_state");
+    expect(starts).toHaveLength(0);
+    expect(observations).toHaveLength(3);
+    expect(observations.map((call) => call.args)).toEqual([{}, {}, {}]);
+  });
+
+  it("keeps the cancellation fence during a cursor-less desktop observation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-desktop-cancel-race-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    let releaseState!: () => void;
+    let signalState!: () => void;
+    const stateGate = new Promise<void>((resolve) => {
+      releaseState = resolve;
+    });
+    const stateEntered = new Promise<void>((resolve) => {
+      signalState = resolve;
+    });
+    const host: any = new CuaDriverHost(helper, {
+      displayID: 1,
+      width: 1440,
+      height: 900,
+    });
+    host.call = async (name: string) => {
+      if (name === "get_desktop_state") {
+        signalState();
+        await stateGate;
+      }
+      return name === "get_desktop_state"
+        ? { structuredContent: { screenshot_png_b64: "DESKTOP" } }
+        : { structuredContent: {} };
+    };
+
+    const observation = host.handle({
+      protocolVersion: 1,
+      sessionKey: "owner",
+      action: "computer_batch",
+      actions: [{ type: "screenshot" }],
+    });
+    await stateEntered;
+    host.cancel();
+    releaseState();
+
+    await expect(observation).rejects.toThrow("computer request cancelled");
   });
 
   it("recognizes only the driver's fixed session-ended rejection", () => {
@@ -1575,8 +2058,31 @@ if (mode === "serve") {
     expect(isDriverSessionEndedError(undefined)).toBe(false);
   });
 
-  it("revives a driver-ended desktop session instead of failing forever", async () => {
-    const root = await mkdtemp(join(tmpdir(), "cua-desktop-revive-"));
+  it("recognizes only the driver's fixed active-operation rejections", () => {
+    expect(isDriverActiveOperationError(new Error(
+      "Desktop session is occupied by another active operation.",
+    ))).toBe(true);
+    expect(isDriverActiveOperationError(new Error(
+      "Desktop session is currently held by another operation.",
+    ))).toBe(true);
+    expect(isDriverActiveOperationError(new Error(
+      "Desktop control is occupied by another session",
+    ))).toBe(false);
+    expect(isDriverActiveOperationError(new Error(
+      "capture_failed while another active operation exists",
+    ))).toBe(false);
+    expect(isDriverActiveOperationError(Object.assign(
+      new Error("Desktop session is unavailable due to an existing active operation."),
+      { code: "desktop_already_active" },
+    ))).toBe(true);
+    expect(isDriverActiveOperationError(Object.assign(
+      new Error("Desktop session is unavailable due to an existing active operation."),
+      { code: "unrelated_driver_code" },
+    ))).toBe(false);
+  });
+
+  it("joins a transient named window operation without an explicit start", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-desktop-operation-join-"));
     roots.push(root);
     const helper = join(root, "cua-driver");
     await writeFile(helper, "#!/bin/sh\n");
@@ -1585,63 +2091,183 @@ if (mode === "serve") {
     const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
     host.proxy = { killed: false, exitCode: null, stdin: { writable: true, write: () => true } };
     host.daemon = { killed: false, exitCode: null };
-    let driverEnded = false;
-    let revived = false;
-    let capture = 0;
+    let busy = true;
     host.rpc = async (_method: string, params: any) => {
       const { name, arguments: args } = params;
       calls.push({ name, args });
-      if (name === "start_session") {
-        if (driverEnded) revived = true;
-        return { result: { content: [], structuredContent: {} } };
+      if (name === "get_window_state" && busy) {
+        busy = false;
+        return { result: {
+          isError: true,
+          content: [{ type: "text", text: "Desktop session is currently held by another operation." }],
+        } };
       }
-      if (name === "get_desktop_state") {
-        if (driverEnded && !revived) {
-          return { result: {
-            isError: true,
-            content: [{ type: "text", text: `session '${args.session}' has ended; tool call 'get_desktop_state' was rejected. Call start_session with this id to revive it before issuing further actions, or use a new session id.` }],
-          } };
-        }
-        capture += 1;
-        return { result: { structuredContent: {
-          screenshot_png_b64: `DESKTOP-${capture}`,
-          screenshot_mime_type: "image/png",
-        } } };
-      }
+      if (name === "get_window_state") return { result: { structuredContent: {
+        screenshot_png_b64: "WINDOW-AFTER-JOIN",
+        screenshot_mime_type: "image/png",
+      } } };
       return { result: { content: [], structuredContent: {} } };
     };
 
-    expect(await host.handle({
-      protocolVersion: 1,
-      sessionKey: "observe",
-      action: "computer_batch",
-      actions: [{ type: "screenshot" }],
-    })).toMatchObject({ ok: true, base64: "DESKTOP-1" });
+    await expect(host.call("get_window_state", { session: "operator", pid: 42, window_id: 77 }))
+      .resolves.toMatchObject({ structuredContent: { screenshot_png_b64: "WINDOW-AFTER-JOIN" } });
 
-    driverEnded = true;
-    expect(await host.handle({
-      protocolVersion: 1,
-      sessionKey: "observe",
-      action: "computer_batch",
-      actions: [{ type: "screenshot" }],
-    })).toMatchObject({ ok: true, base64: "DESKTOP-2" });
-
-    const desktopSession = calls[0].args.session;
     expect(calls.map((call) => call.name)).toEqual([
-      "start_session",
-      "get_desktop_state",
-      "get_desktop_state",
-      "start_session",
-      "get_desktop_state",
+      "get_window_state",
+      "get_window_state",
     ]);
-    expect(calls[3].args).toEqual({
-      session: desktopSession,
-      capture_scope: "desktop",
-    });
-    expect(calls[4].args).toEqual({ session: desktopSession });
+    expect(calls[0].args).toEqual({ session: "operator", pid: 42, window_id: 77 });
+    expect(calls[1].args).toEqual(calls[0].args);
   });
 
-  it("revives a driver-ended pinned window session before acting", async () => {
+  it("joins by stable structured code when active-operation wording changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-desktop-operation-code-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    host.proxy = { killed: false, exitCode: null, stdin: { writable: true, write: () => true } };
+    host.daemon = { killed: false, exitCode: null };
+    let busy = true;
+    host.rpc = async (_method: string, params: any) => {
+      calls.push({ name: params.name, args: params.arguments });
+      if (params.name === "get_desktop_state" && busy) {
+        busy = false;
+        return { result: {
+          isError: true,
+          structuredContent: { error_code: "desktop_already_active" },
+          content: [{ type: "text", text: "Desktop session is unavailable due to an existing active operation." }],
+        } };
+      }
+      return { result: { structuredContent: {
+        screenshot_png_b64: "DESKTOP-AFTER-CODE-JOIN",
+        screenshot_mime_type: "image/png",
+      } } };
+    };
+
+    await expect(host.call("get_desktop_state", { session: "pipiui-desktop-code" }))
+      .resolves.toMatchObject({ structuredContent: { screenshot_png_b64: "DESKTOP-AFTER-CODE-JOIN" } });
+    expect(calls).toHaveLength(2);
+    expect(calls[0].args).toEqual(calls[1].args);
+  });
+
+  it("waits for named window readiness beyond the former 370ms join budget", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-desktop-readiness-join-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    host.proxy = { killed: false, exitCode: null, stdin: { writable: true, write: () => true } };
+    host.daemon = { killed: false, exitCode: null };
+    host.rpc = async (_method: string, params: any) => {
+      calls.push({ name: params.name, args: params.arguments });
+      const stateCalls = calls.filter((call) => call.name === "get_window_state").length;
+      if (params.name === "get_window_state" && stateCalls <= 6) {
+        return { result: {
+          isError: true,
+          structuredContent: { error_code: "desktop_already_active" },
+          content: [{ type: "text", text: "Desktop operation is still settling." }],
+        } };
+      }
+      if (params.name === "get_window_state") return { result: { structuredContent: {
+        screenshot_png_b64: "WINDOW-AFTER-READINESS",
+        screenshot_mime_type: "image/png",
+      } } };
+      return { result: { content: [], structuredContent: {} } };
+    };
+
+    await expect(host.call("get_window_state", { session: "operator", pid: 42, window_id: 77 }))
+      .resolves.toMatchObject({ structuredContent: { screenshot_png_b64: "WINDOW-AFTER-READINESS" } });
+
+    const starts = calls.filter((call) => call.name === "start_session");
+    const states = calls.filter((call) => call.name === "get_window_state");
+    expect(starts).toHaveLength(0);
+    expect(states).toHaveLength(7);
+    expect(states.every((call) => call.args.session === states[0].args.session)).toBe(true);
+  });
+
+  it("does not retry an unrelated structured driver code", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-desktop-operation-unrelated-code-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    let calls = 0;
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    host.proxy = { killed: false, exitCode: null, stdin: { writable: true, write: () => true } };
+    host.daemon = { killed: false, exitCode: null };
+    host.rpc = async () => {
+      calls += 1;
+      return { result: {
+        isError: true,
+        structuredContent: { error_code: "unrelated_driver_code" },
+        content: [{ type: "text", text: "Desktop session is unavailable due to an existing active operation." }],
+      } };
+    };
+
+    await expect(host.call("get_desktop_state", { session: "pipiui-desktop-unrelated" }))
+      .rejects.toThrow("Desktop session is unavailable due to an existing active operation.");
+    expect(calls).toBe(1);
+  });
+
+  it("reports bounded privacy-safe diagnostics for a cursor-less active operation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-desktop-operation-budget-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    host.proxy = { killed: false, exitCode: null, stdin: { writable: true, write: () => true } };
+    host.daemon = { killed: false, exitCode: null };
+    host.rpc = async (_method: string, params: any) => {
+      calls.push({ name: params.name, args: params.arguments });
+      if (params.name === "get_desktop_state") return { result: {
+        isError: true,
+        structuredContent: { error_code: "desktop_already_active" },
+        content: [{ type: "text", text: "PRIVATE DRIVER DETAIL MUST NOT ESCAPE" }],
+      } };
+      return { result: { content: [], structuredContent: {} } };
+    };
+
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "operator-private-session-id",
+      action: "computer_batch",
+      fresh: true,
+      actions: [{ type: "screenshot" }],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      runtimeError: {
+        code: "desktop_already_active",
+        operation: "get_desktop_state",
+        sameSession: false,
+        attemptCount: 1,
+        elapsedMs: expect.any(Number),
+        retryBudgetMs: 0,
+        retryable: true,
+        requiresObservation: true,
+      },
+    });
+    expect(String(result.error)).toMatch(
+      /^Cua Driver get_desktop_state remained busy after 1 same-session attempts \(\d+ms elapsed; 0ms retry budget\)$/,
+    );
+    expect(JSON.stringify(result)).not.toContain("PRIVATE DRIVER DETAIL MUST NOT ESCAPE");
+    expect(JSON.stringify(result)).not.toContain("operator-private-session-id");
+    const starts = calls.filter((call) => call.name === "start_session");
+    const states = calls.filter((call) => call.name === "get_desktop_state");
+    expect(starts).toHaveLength(0);
+    expect(states).toHaveLength(1);
+    expect(states[0].args).toEqual({});
+  });
+
+  it("revives only an explicitly named driver-ended window call", async () => {
     const root = await mkdtemp(join(tmpdir(), "cua-window-revive-"));
     roots.push(root);
     const helper = join(root, "cua-driver");
@@ -1649,8 +2275,6 @@ if (mode === "serve") {
     await chmod(helper, 0o755);
     const calls: Array<{ name: string; args: any }> = [];
     const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
-    host.targets.set("win", { session: "win", pid: 42, window_id: 77 });
-    host.rootTargets.set("win", { session: "win", pid: 42, window_id: 77 });
     host.sessionScopes.set("win", "window");
     host.proxy = { killed: false, exitCode: null, stdin: { writable: true, write: () => true } };
     host.daemon = { killed: false, exitCode: null };
@@ -1683,19 +2307,12 @@ if (mode === "serve") {
       return { result: { content: [], structuredContent: {} } };
     };
 
-    expect(await host.handle({
-      protocolVersion: 1,
-      sessionKey: "win",
-      action: "computer_batch",
-      actions: [{ type: "click", coordinate: [10, 20] }],
-    })).toMatchObject({ ok: true });
+    await expect(host.call("get_window_state", { session: "win", pid: 42, window_id: 77 }))
+      .resolves.toMatchObject({ structuredContent: { screenshot_png_b64: "PNG-1" } });
     expect(calls.map((call) => call.name)).toEqual([
       "get_window_state",
       "start_session",
       "get_window_state",
-      "click",
-      "get_window_state",
-      "get_accessibility_tree",
     ]);
     expect(calls[1].args).toEqual({ session: "win", capture_scope: "window" });
   });

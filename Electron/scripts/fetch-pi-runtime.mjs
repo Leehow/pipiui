@@ -462,9 +462,9 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
         // ELECTRON_RUN_AS_NODE mode. Select the Electron ABI as well as the
         // destination architecture; npm's --cpu/--os alone do not reach every
         // native install script during a cross-architecture release build.
-        npm_config_runtime: 'electron',
-        npm_config_target: electronVersion,
-        npm_config_disturl: 'https://electronjs.org/headers',
+        npm_config_runtime: platform === 'darwin' ? 'node' : 'electron',
+        npm_config_target: platform === 'darwin' ? metadata.version : electronVersion,
+        npm_config_disturl: platform === 'darwin' ? 'https://nodejs.org/dist' : 'https://electronjs.org/headers',
         npm_config_arch: arch,
         npm_config_platform: platform
       }

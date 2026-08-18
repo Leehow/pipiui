@@ -1,6 +1,7 @@
 // PipiUI shared terminal tool. Dormant outside an authenticated Electron session.
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
+import { TerminalVisibility } from './terminal-visibility.ts'
 
 const PORT = process.env.PIPIUI_BRIDGE_PORT
 const CAPABILITY = process.env.PIPIUI_SESSION_CAPABILITY
@@ -39,5 +40,23 @@ export default function (pi: ExtensionAPI) {
       if (['send','key','resize','close','request_private_input'].includes(params.action) && (!params.terminal_id || !params.snapshot_id)) return result({ ok: false, error: `${params.action} requires terminal_id and snapshot_id`, help: HELP })
       return result(await bridge(params as Record<string, unknown>, signal))
     }
+  })
+
+  const visibility = new TerminalVisibility()
+  const apply = (text?: string | null) => {
+    const current = pi.getActiveTools()
+    const next = text === undefined && !visibility.revealed
+      ? visibility.hide(current)
+      : visibility.nextActiveTools(text ?? null, current)
+    if (visibility.shouldCallSetActiveTools(current, next)) pi.setActiveTools(next)
+  }
+  pi.on('session_start', async () => {
+    visibility.revealed = false
+    const current = pi.getActiveTools()
+    const next = visibility.hide(current)
+    if (visibility.shouldCallSetActiveTools(current, next)) pi.setActiveTools(next)
+  })
+  pi.on('input', async (event) => {
+    apply(event.text)
   })
 }
