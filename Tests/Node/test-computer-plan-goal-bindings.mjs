@@ -80,6 +80,29 @@ test("Computer Task admission rejects every non-Cua worker and action", () => {
   }), /Computer Task accepts only Cua desktop actions/, "raw role admission must precede terminal policy validation");
 });
 
+test("Computer Task admission distinguishes prohibited non-Cua actions from requested ones per clause", () => {
+  const candidate = (objective) => ({
+    steps: [
+      { id: "observe", role: "gui-operator", objective, dependsOn: [], postconditions: [visible] },
+    ],
+    successConditions: [visible],
+  });
+
+  assert.doesNotThrow(() => validateComputerPlanCandidateCuaOnly(candidate(
+    "Freshly observe the desktop. If the Pi Keeper main window is not visible, use Finder or Spotlight to launch /Users/haoli/leehow/code/chatrpgv4/desktop/dist/mac-arm64/Pi Keeper.app; wait for the main window. Do not use Terminal, shell, file operations, code, or APIs. Stop after one failed attempt without repair or retry.",
+  )));
+  assert.doesNotThrow(() => validateComputerPlanCandidateCuaOnly(candidate(
+    "只通过 Finder 启动 Pi Keeper。不要使用终端或 shell；禁止运行 npm start；不得调用 terminal_execute；切勿通过 iTerm 启动应用。",
+  )));
+
+  assert.throws(() => validateComputerPlanCandidateCuaOnly(candidate(
+    "Open Terminal and run npm start",
+  )), /Computer Task accepts only Cua desktop actions/);
+  assert.throws(() => validateComputerPlanCandidateCuaOnly(candidate(
+    "Do not use Terminal, but run npm start via shell",
+  )), /Computer Task accepts only Cua desktop actions/);
+});
+
 test("Electron plan parser diagnoses the captured terminal candidate before terminal policy repair", async () => {
   const parse = await loadElectronComputerPlanParser();
   const captured = JSON.stringify({

@@ -11,6 +11,7 @@ import { normalizeTerminalPolicyProposal } from "../../Sources/PipiUI/PiExt/pack
 import { diagnoseComputerPlanAdmissionFailure, normalizeComputerPostconditionProposals, normalizeTerminalWorkerObjective, validateComputerPlanGoalBindings } from "../../Sources/PipiUI/PiExt/packages/computer-agent/src/plan-proposal.ts";
 
 const subagentURL = new URL("../../Sources/PipiUI/PiExt/subagent/index.ts", import.meta.url);
+const electronSubagentURL = new URL("../../Electron/resources/runtime/pi-ext/subagent/index.ts", import.meta.url);
 const leaderAgentURL = new URL("../../Sources/PipiUI/PiExt/agents/computer-use-leader/AGENT.md", import.meta.url);
 
 async function loadActualModelChainParser() {
@@ -634,6 +635,13 @@ test("Computer Use Leader remains coordinating between private planning calls un
 	assert.match(source, /computer_leader_stalled[\s\S]*subagent_status[\s\S]*leaderAgentId/);
 });
 
+test("Electron Computer Use Leader feeds model output activity into the bounded progress deadline", async () => {
+	const source = await readFile(electronSubagentURL, "utf8");
+	assert.match(source, /onActivity\?: \(\) => void/);
+	assert.match(source, /proc\.stdout\.on\("data"[\s\S]*options\?\.onActivity\?\.\(\)/);
+	assert.match(source, /runComputerLeaderWithStallDeadline\([\s\S]*lastProgressAt:[\s\S]*progressGraceMs/);
+});
+
 test("Terminal Worker final contract preserves closed failures without reporting blocked work as completed", async () => {
 	const [source, definition] = await Promise.all([
 		readFile(subagentURL, "utf8"),
@@ -665,6 +673,17 @@ test("Computer Task continuity is Boss-selected and role-aware instead of taskKe
   assert.match(computerTask, /role === "verifier"[\s\S]*fresh:\s*true/);
   assert.doesNotMatch(computerTask, /fresh:\s*true\s*\}\);?[\s\n]*if \(result\.exitCode/, "runChild must not force every private role cold");
   assert.doesNotMatch(source, /taskKey|TASK_KEY_DESCRIPTION|selectTaskKeyAgentIdentity/);
+});
+
+test("Electron Computer Task projects a closed recovery policy into the coordinator request", async () => {
+  const source = await readFile(electronSubagentURL, "utf8");
+  const start = source.indexOf("const computerTaskParameters =");
+  const end = source.indexOf("const result = await coordinator.run", start) + 180;
+  assert.ok(start >= 0 && end > start, "Electron Computer Task policy wiring seam must remain discoverable");
+  const computerTask = source.slice(start, end);
+  assert.match(computerTask, /recoveryPolicy:\s*Type\.Optional[\s\S]*Type\.Literal\("fail_fast"\)/);
+  assert.match(computerTask, /normalizeComputerTaskRecoveryPolicy\(params\.goal,\s*params\.recoveryPolicy\)/);
+  assert.match(computerTask, /coordinator\.run\(\{\s*goal:\s*params\.goal,\s*taskId,\s*recoveryPolicy\s*\}/);
 });
 
 test("Computer Task exact identities resume only a Leader and derive stable subordinate ids", async () => {

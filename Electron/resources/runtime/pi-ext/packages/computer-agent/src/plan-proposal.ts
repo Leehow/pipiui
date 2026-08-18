@@ -6,6 +6,28 @@ export type NormalizedComputerPostcondition =
   | { kind: "file_exists"; path: string }
   | { kind: "visual_judgement"; description: string };
 
+export type ComputerTaskRecoveryPolicy = "auto" | "fail_fast";
+
+const RECOVERY_POLICY_CLAUSE_BOUNDARY = /[。.!?；;\n]+/u;
+const CLOSED_NO_RECOVERY_CLAUSE = /^(?:(?:please\s+)?(?:do\s+not|don't|never)|(?:you\s+)?must\s+not)\s+(?:generate|create|make|produce|start|attempt)\s+(?:an?\s+)?(?:recovery|retry|repair)(?:\s+(?:plan|workflow|attempt))?\b|^(?:请)?(?:不要|不|禁止|不得|切勿)(?:再)?(?:生成|创建|制定|提出|启动|进行|尝试)?(?:任何)?(?:恢复|重试|修复|补救)(?:计划|方案|流程|尝试)?/iu;
+const CLOSED_FAILURE_STOP_CLAUSE = /\b(?:if|when|after)\s+(?:the\s+)?(?:observe|observation|verification|worker|verifier|step|operation)?\s*(?:fails?|failed|failure|is\s+blocked)\b[^.!?;]{0,48}\b(?:stop|end|return|report)\b|(?:observe|观察|观测|验证|操作|步骤|worker|verifier)?\s*(?:失败|出错|受阻|无法完成)(?:后|时|则|就)?(?:立即|直接)?(?:如实)?(?:停止|结束|返回|报告)(?:任务|结果)?/iu;
+
+/**
+ * Project a closed, explicit no-recovery instruction into a typed policy.
+ * Both halves are required so ordinary repair guidance cannot disable recovery.
+ */
+export function normalizeComputerTaskRecoveryPolicy(
+  goal: string,
+  requested?: ComputerTaskRecoveryPolicy,
+): ComputerTaskRecoveryPolicy {
+  if (requested !== undefined) return requested;
+  const clauses = goal.split(RECOVERY_POLICY_CLAUSE_BOUNDARY).map((clause) => clause.trim()).filter(Boolean);
+  return clauses.some((clause) => CLOSED_NO_RECOVERY_CLAUSE.test(clause))
+    && clauses.some((clause) => CLOSED_FAILURE_STOP_CLAUSE.test(clause))
+    ? "fail_fast"
+    : "auto";
+}
+
 /**
  * A safe, stable explanation for a plan that the Host refused before any
  * worker received authority.  Keep the original parser error out of the
@@ -142,6 +164,16 @@ type GoalBoundPlan = {
 };
 
 const NON_CUA_OBJECTIVE = /\bterminal_?(?:read_?file|write_?file|execute)\b|\b(?:bash|zsh|shell|node_modules|bootstrap)\b|\bnpm\s+(?:install|run|start)\b|(?:open|launch|use|through|via|打开|启动|使用|通过)[^\n。.!?]{0,48}(?:Terminal|iTerm|终端)/i;
+const NON_CUA_OBJECTIVE_CLAUSE_BOUNDARY = /[。.!?；;\n]+|\b(?:but|however|yet)\b|(?:但是|但|不过|然而)/giu;
+const CLOSED_NON_CUA_PROHIBITION = /^(?:(?:please\s+)?(?:do\s+not|don't|never)|(?:you\s+)?must\s+not)\b|^(?:不要|禁止|不得|切勿)/iu;
+
+function objectiveRequestsNonCuaAction(objective: string): boolean {
+  return objective
+    .split(NON_CUA_OBJECTIVE_CLAUSE_BOUNDARY)
+    .map((clause) => clause.trim().replace(/^(?:[-*•]\s*)/, ""))
+    .filter(Boolean)
+    .some((clause) => NON_CUA_OBJECTIVE.test(clause) && !CLOSED_NON_CUA_PROHIBITION.test(clause));
+}
 
 export function validateComputerPlanCandidateCuaOnly(candidate: unknown): void {
   const record = candidate && typeof candidate === "object" && !Array.isArray(candidate) ? candidate as Record<string, unknown> : {};
@@ -151,7 +183,7 @@ export function validateComputerPlanCandidateCuaOnly(candidate: unknown): void {
     const postconditions = Array.isArray(step.postconditions) ? step.postconditions : [];
     return step.role === "terminal-worker"
       || postconditions.some((condition) => !!condition && typeof condition === "object" && !Array.isArray(condition) && ((condition as Record<string, unknown>).kind === "file_exists" || (condition as Record<string, unknown>).type === "file_exists"))
-      || NON_CUA_OBJECTIVE.test(String(step.objective ?? ""));
+      || objectiveRequestsNonCuaAction(String(step.objective ?? ""));
   });
   if (containsNonCuaAction) throw new Error("Computer Task accepts only Cua desktop actions; terminal/file/shell/bootstrap work belongs to the Boss");
 }

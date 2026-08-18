@@ -55,7 +55,7 @@ import {
 	type ComputerWorkerResult,
 } from "../packages/computer-agent/src/index.ts";
 import { normalizeTerminalPolicyProposal } from "../packages/computer-agent/src/terminal-policy.ts";
-import { createComputerPlanRepairTracker, diagnoseComputerPlanAdmissionFailure, normalizeComputerPostconditionProposals, normalizeTerminalWorkerObjective, shouldRepairComputerPlanAdmission, validateComputerPlanCandidateCuaOnly, validateComputerPlanGoalBindings, type ComputerPlanAdmissionDiagnostic } from "../packages/computer-agent/src/plan-proposal.ts";
+import { createComputerPlanRepairTracker, diagnoseComputerPlanAdmissionFailure, normalizeComputerPostconditionProposals, normalizeComputerTaskRecoveryPolicy, normalizeTerminalWorkerObjective, shouldRepairComputerPlanAdmission, validateComputerPlanCandidateCuaOnly, validateComputerPlanGoalBindings, type ComputerPlanAdmissionDiagnostic } from "../packages/computer-agent/src/plan-proposal.ts";
 import { toolNamesForComputerWorkerRole } from "../packages/computer-agent/extensions/computer-worker.ts";
 import {
 	type AgentConfig,
@@ -70,6 +70,7 @@ import { registerQoderContextWindowCompat } from "./qoder-context-window.ts";
 import {
 	COMPUTER_TASK_CONTINUATION_TIMEOUT_MS,
 	createComputerTaskContinuationWatchdog,
+	isComputerTaskAssistantActivity,
 	queueComputerTaskContinuation,
 	stripComputerTaskContinuationTrigger,
 } from "./computer-task-continuation.ts";
@@ -1173,6 +1174,8 @@ interface RunSingleAgentOptions {
 	retainContext?: boolean;
 	/** Host-owned absolute deadline surfaced to UIs; it never grants the child more runtime. */
 	deadlineAt?: number;
+	/** Host-observed model output used by a caller-owned bounded progress deadline. */
+	onActivity?: () => void;
 	/** Bundled general-purpose placement override; omission remains isolated. */
 	worktree?: "isolated" | "none";
 	/** Optional Boss reason when bundled general-purpose runs in a shared cwd. */
@@ -4323,9 +4326,8 @@ function isSkillReadPath(requestedPath: unknown): boolean {
 }
 
 // Superpowers' Pi extension skips bootstrap injection when any context message contains
-// this stable marker. The explicit PipiUI extension loads first, so this sentinel reaches
-// Superpowers' messageContainsBootstrap guard without disabling other extensions —
-// `--no-extensions` would also cut the provider server-tool extensions workers rely on.
+// this stable marker. Worker argv also passes `--no-extensions`, so settings-package
+// Superpowers cannot load; the sentinel still covers an explicit `-e` mount.
 const SUPERPOWERS_BOOTSTRAP_MARKER = "superpowers:using-superpowers bootstrap for pi";
 const SUBAGENT_BOOTSTRAP_SUPPRESSION_NOTE = `[PipiUI subagent isolation sentinel: ${SUPERPOWERS_BOOTSTRAP_MARKER}
 The skill-library bootstrap is intentionally suppressed for this dispatched subagent. This sentinel is not a skill instruction; follow only this agent's own system prompt and its brief.]`;
@@ -4689,6 +4691,11 @@ async function runSingleAgent(
 	// Skill libraries are off for every dispatched role, not just plan: a worker that
 	// discovers a process skill on its own turns a scoped brief into someone else's SOP.
 	args.push("--no-skills");
+	// MAIN already uses `--no-extensions` so `settings.json` packages never load.
+	// Workers must do the same: a discovered package can call `setActiveTools()`
+	// and permanently replace the `--tools` allowlist (live failure: only `read`).
+	// Explicit `-e` mounts below still load.
+	args.push("--no-extensions");
 	// PipiUI-only tool names must be filtered before `--tools`: Pi 0.84 applies that flag to
 	// extension/custom registrations too, so an absent feature path cannot leave a dead name in
 	// a role's allowlist. `web_search` stays independent because it may be provider-native.
@@ -4952,6 +4959,10 @@ async function runSingleAgent(
 				const childEnv = options?.computerWorker
 					? isolatedComputerWorkerChildProcessEnv(childEnvironmentInput)
 					: pipiuiChildProcessEnv(childEnvironmentInput, desktopGrant.granted);
+				// chatrpg/keeper and similar packages skip setActiveTools(kpSet) when this is set.
+				// `--no-extensions` is the primary isolation; this keeps the child surface if a
+				// package is still mounted via explicit `-e`.
+				childEnv.PI_SUBAGENT_CHILD = "1";
 				const proc = spawn(invocation.command, invocation.args, {
 					cwd: spawnCwd,
 					shell: false,
@@ -5447,6 +5458,7 @@ async function runSingleAgent(
 					const stdoutScanner = new JSONLChunkScanner(processLine);
 					proc.stdout.on("data", (data) => {
 						noteAgentActivity(pipiuiAgentId, runId);
+						options?.onActivity?.();
 						stdoutScanner.push(data);
 				});
 
@@ -6455,17 +6467,14 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 		continuationWatchdog.noteAssistantActivity();
 		if (!continuationAbortRequested) continuationObligationId = undefined;
 	};
-	pi.on("message_start", (event) => {
-		if (event.message.role !== "assistant") return;
-		noteComputerTaskAssistantActivity();
-	});
 	pi.on("message_update", (event) => {
 		if (event.message.role !== "assistant") return;
+		if (!isComputerTaskAssistantActivity(event)) return;
 		noteComputerTaskAssistantActivity();
 	});
 	pi.on("agent_settled", () => {
-		continuationWatchdog.noteSettled();
-		if (!continuationAbortRequested) continuationObligationId = undefined;
+		const continuationRequested = continuationWatchdog.noteSettled();
+		if (!continuationRequested && !continuationAbortRequested) continuationObligationId = undefined;
 		continuationAbortRequested = false;
 	});
 	pi.on("context", (event) => {
@@ -6484,6 +6493,10 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 	const computerTaskParameters = makeStrictJsonSchema(Type.Object({
 		goal: Type.String({ minLength: 1, maxLength: 12_000 }),
 		agentId: Type.Optional(Type.String({ description: "Exact historical computer-use-leader id selected by the Boss after inspecting subagent_status. Omit for a new hierarchy." })),
+		recoveryPolicy: Type.Optional(Type.Union([
+			Type.Literal("auto"),
+			Type.Literal("fail_fast"),
+		], { description: "Closed recovery policy. fail_fast stops after the first failed Worker or Verifier without revision or replacement; auto preserves bounded recovery." })),
 	}, { additionalProperties: false }));
 	pi.registerTool({
 		name: "computer_task",
@@ -6496,13 +6509,14 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 			params = omitNulls(params);
 			const toolCallId = _toolCallId;
 			const taskId = selectComputerTaskLeaderAgentId(params.agentId);
+			const recoveryPolicy = normalizeComputerTaskRecoveryPolicy(params.goal, params.recoveryPolicy);
 			const coordinatorRunId = randomUUID();
 			const taskController = new AbortController();
 			const taskSignal = signal ? AbortSignal.any([signal, taskController.signal]) : taskController.signal;
 			if (runningComputerTasks.has(taskId)) throw new Error(`Computer Task agentId=${taskId} is already running`);
 			runningComputerTasks.set(taskId, { runId: coordinatorRunId, controller: taskController });
 			try {
-			const { ComputerAgentCoordinator, ProcedureHostRuntime, COMPUTER_LEADER_STALL_TIMEOUT_MS, COMPUTER_WORKER_STALL_TIMEOUT_MS, computerOperatorContextOptions, computerTaskContent, computerTaskDetails, computerTaskRootTerminalState, finalizeComputerTaskWithOptionalSummary, runComputerLeaderWithStallDeadline, runComputerWorkerWithStallDeadline } = await loadComputerAgentModule();
+			const { ComputerAgentCoordinator, ProcedureHostRuntime, COMPUTER_LEADER_PROGRESS_GRACE_MS, COMPUTER_LEADER_STALL_TIMEOUT_MS, COMPUTER_WORKER_STALL_TIMEOUT_MS, computerOperatorContextOptions, computerTaskContent, computerTaskDetails, computerTaskRootTerminalState, finalizeComputerTaskWithOptionalSummary, runComputerLeaderWithStallDeadline, runComputerWorkerWithStallDeadline } = await loadComputerAgentModule();
 			const rootLifecycle = createComputerTaskRootLifecycle(
 				{ agentId: taskId, runId: coordinatorRunId },
 				postPipiuiReport,
@@ -6567,10 +6581,21 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 			const runLeader = async (task: string, options: Omit<RunSingleAgentOptions, "toolCallId"> = {}) => {
 				const leaderController = new AbortController();
 				const deadlineAt = Date.now() + COMPUTER_LEADER_STALL_TIMEOUT_MS;
+				let lastProgressAt: number | undefined;
 				return runComputerLeaderWithStallDeadline(
-					() => runChild("computer-use-leader", task, { ...options, deadlineAt }, leaderController.signal),
+					() => runChild("computer-use-leader", task, { ...options, deadlineAt, onActivity: () => { lastProgressAt = Date.now(); } }, leaderController.signal),
 					() => leaderController.abort(),
 					COMPUTER_LEADER_STALL_TIMEOUT_MS,
+					{
+						lastProgressAt: () => lastProgressAt,
+						progressGraceMs: COMPUTER_LEADER_PROGRESS_GRACE_MS,
+						onExtended: (extendedDeadlineAt) => {
+							const handle = runningAgents.get(taskId);
+							if (!handle || handle.name !== "computer-use-leader") return;
+							handle.deadlineAt = extendedDeadlineAt;
+							pipiuiReport({ kind: "update", agentId: taskId, runId: handle.runId, deadlineAt: extendedDeadlineAt });
+						},
+					},
 				).then((episode) => episode.text);
 			};
 			const markComputerLeaderCoordinating = async () => {
@@ -6805,7 +6830,7 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 				if (replay.outcome === "drift" && "procedureId" in replay) repairsProcedureId = replay.procedureId;
 			}
 			const coordinator = new ComputerAgentCoordinator({ planner, dispatcher, ...(procedureRuntime ? { procedureLearning: { recordVerifiedExecution: (input: any) => procedureRuntime!.recordCoordinatorExecution({ ...input, ...(repairsProcedureId ? { repairsProcedureId } : {}) }).then(() => undefined) } } : {}) });
-				const result = await coordinator.run({ goal: params.goal, taskId }, taskSignal);
+				const result = await coordinator.run({ goal: params.goal, taskId, recoveryPolicy }, taskSignal);
 				if (result.outcome === "cancelled") {
 					await rootLifecycle.close({ ok: false, aborted: true, output: "Computer Task cancelled" });
 					const details = computerTaskDetails(result, rootEpisode(result), leaderEpisodes);

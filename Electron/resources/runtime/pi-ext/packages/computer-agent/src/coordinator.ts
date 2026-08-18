@@ -11,7 +11,8 @@ import type { ComputerTaskEvent } from "./plan.ts";
 // @ts-ignore -- the bundled runtime executes TypeScript directly; keep its explicit runtime extension.
 import { validateTerminalBoundaryShape, type TerminalStepPolicy } from "./terminal-policy.ts";
 // @ts-ignore -- the bundled runtime executes TypeScript directly; keep its explicit runtime extension.
-import { validateComputerPlanCuaOnly } from "./plan-proposal.ts";
+import { validateComputerPlanCuaOnly, type ComputerTaskRecoveryPolicy } from "./plan-proposal.ts";
+export type { ComputerTaskRecoveryPolicy } from "./plan-proposal.ts";
 
 export type ComputerPostcondition =
   | { kind: "visible_text"; contains: string }
@@ -42,6 +43,12 @@ export type ComputerPlan = {
   steps: ComputerPlanStep[];
   revision?: number;
   procedureContext?: { application: { bundleId: string; appName: string }; parameters: Record<string, string>; qualification?: boolean };
+};
+
+export type ComputerTaskRequest = {
+  goal: string;
+  taskId?: string;
+  recoveryPolicy?: ComputerTaskRecoveryPolicy;
 };
 
 export type ComputerWorkerDispatch = {
@@ -97,22 +104,48 @@ export type ComputerWorkerFailureCode = typeof COMPUTER_WORKER_FAILURE_CODES[num
 
 export const COMPUTER_WORKER_STALL_TIMEOUT_MS = 150_000;
 export const COMPUTER_LEADER_STALL_TIMEOUT_MS = 120_000;
+export const COMPUTER_LEADER_PROGRESS_GRACE_MS = 30_000;
+
+type StallProgressOptions = {
+  lastProgressAt: () => number | undefined;
+  progressGraceMs: number;
+  onExtended?: (deadlineAt: number) => void;
+};
 
 async function runWithStallDeadline<T>(
   run: () => Promise<T>,
   onStalled: () => void,
   timeoutMs: number,
   failureCode: "gui_child_stalled" | "computer_leader_stalled",
+  progress?: StallProgressOptions,
 ): Promise<T> {
   const operation = Promise.resolve().then(run);
   let timer: ReturnType<typeof setTimeout> | undefined;
   let stalled = false;
+  let extensionUsed = false;
   const deadline = new Promise<"stalled">((resolve) => {
-    timer = setTimeout(() => {
-      stalled = true;
-      try { onStalled(); } catch { /* The closed failure still wins if best-effort abort reporting fails. */ }
-      resolve("stalled");
-    }, Math.max(10, timeoutMs));
+    const arm = () => {
+      timer = setTimeout(() => {
+        const now = Date.now();
+        const lastProgressAt = progress?.lastProgressAt();
+        if (
+          progress
+          && !extensionUsed
+          && lastProgressAt !== undefined
+          && lastProgressAt <= now
+          && now - lastProgressAt <= Math.max(0, progress.progressGraceMs)
+        ) {
+          extensionUsed = true;
+          try { progress.onExtended?.(now + Math.max(10, timeoutMs)); } catch { /* UI deadline reporting is best-effort. */ }
+          arm();
+          return;
+        }
+        stalled = true;
+        try { onStalled(); } catch { /* The closed failure still wins if best-effort abort reporting fails. */ }
+        resolve("stalled");
+      }, Math.max(10, timeoutMs));
+    };
+    arm();
   });
   try {
     const outcome = await Promise.race([
@@ -148,8 +181,9 @@ export async function runComputerLeaderWithStallDeadline<T>(
   run: () => Promise<T>,
   onStalled: () => void,
   timeoutMs = COMPUTER_LEADER_STALL_TIMEOUT_MS,
+  progress?: StallProgressOptions,
 ): Promise<T> {
-  return runWithStallDeadline(run, onStalled, timeoutMs, "computer_leader_stalled");
+  return runWithStallDeadline(run, onStalled, timeoutMs, "computer_leader_stalled", progress);
 }
 export type HostExecutionRecord =
   | { role: "gui-operator"; kind: "open_application" | "click" | "type_parameter"; bundleId?: string; appName?: string; locator?: { role: string; nameLiteral: string }; observationId: string; observedAt: string }
@@ -166,7 +200,7 @@ export type ComputerTaskResult = {
   planRevisions: number;
   episodes?: ComputerAgentEpisode[];
   investigation?: {
-    stage: "task_verification" | "recovery_exhausted" | "recovery_plan" | "plan_dependencies" | "manual_intervention" | "cancelled";
+    stage: "task_verification" | "recovery_exhausted" | "recovery_plan" | "plan_dependencies" | "manual_intervention" | "fail_fast" | "cancelled";
     code: "task_conditions_not_verified" | "worker_postconditions_not_verified" | "worker_failed" | "worker_blocked" | "worker_outcome_unknown" | "recovery_plan_invalid" | "unresolved_dependencies" | "target_state_mismatch" | "task_cancelled" | ComputerWorkerFailureCode;
     recoveryAttempts: number;
     failedConditions: Array<{ conditionId: string; kind: ComputerPostcondition["kind"]; outcome: "not_verified" | "unknown" }>;
@@ -444,7 +478,7 @@ export class ComputerAgentCoordinator {
     this.#procedureLearning = input.procedureLearning;
   }
 
-  async run(request: { goal: string; taskId?: string }, signal?: AbortSignal): Promise<ComputerTaskResult> {
+  async run(request: ComputerTaskRequest, signal?: AbortSignal): Promise<ComputerTaskResult> {
     const goal = request.goal?.trim();
     if (!goal) throw new Error("computer_task requires a non-empty goal");
     const taskId = request.taskId ?? randomUUID();
@@ -665,6 +699,20 @@ export class ComputerAgentCoordinator {
           }
           continue;
         }
+      }
+
+      if (request.recoveryPolicy === "fail_fast") {
+        const failedAttempt = workerAttempts.at(-1) ?? attempt;
+        const code = failedAttempt.failureCode
+          ?? (failedAttempt.outcome === "outcome_unknown" ? "worker_outcome_unknown"
+            : failedAttempt.verification === "not_verified" ? "worker_postconditions_not_verified"
+              : failedAttempt.outcome === "blocked" ? "worker_blocked" : "worker_failed");
+        return finishBlocked(
+          "fail_fast",
+          code,
+          taskVerification(),
+          "Computer Task stopped after the first failed attempt by fail-fast policy",
+        );
       }
 
       let recoveryObservation = result.observation;

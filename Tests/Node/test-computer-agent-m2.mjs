@@ -15,7 +15,7 @@ import {
   runComputerLeaderWithStallDeadline,
   runComputerWorkerWithStallDeadline,
 } from "../../Electron/resources/runtime/pi-ext/packages/computer-agent/src/coordinator.ts";
-import { diagnoseComputerPlanAdmissionFailure } from "../../Electron/resources/runtime/pi-ext/packages/computer-agent/src/plan-proposal.ts";
+import { diagnoseComputerPlanAdmissionFailure, normalizeComputerTaskRecoveryPolicy } from "../../Electron/resources/runtime/pi-ext/packages/computer-agent/src/plan-proposal.ts";
 import {
   ComputerWorkerBroker,
   grantsForComputerRole,
@@ -45,6 +45,7 @@ const terminalPolicy = { cwd: "/tmp", writeRoots: ["/tmp"], allowedExecutables: 
 
 test("Electron Computer Use instructions keep application targeting, snapshots, and screenshot evidence honest", async () => {
   const investigation = await readFile(new URL("../../Electron/resources/runtime/pi-ext/packages/computer-agent/skills/desktop-investigation/SKILL.md", import.meta.url), "utf8");
+  const operation = await readFile(new URL("../../Electron/resources/runtime/pi-ext/packages/computer-agent/skills/cua-driver-operation/SKILL.md", import.meta.url), "utf8");
   const planning = await readFile(new URL("../../Electron/resources/runtime/pi-ext/packages/computer-agent/skills/computer-task-planning/SKILL.md", import.meta.url), "utf8");
   assert.match(investigation, /observe the desktop first.*exact running application identity/i);
   assert.match(investigation, /failed application-name lookup.*never.*unrelated application/i);
@@ -52,6 +53,18 @@ test("Electron Computer Use instructions keep application targeting, snapshots, 
   assert.match(investigation, /freshly observed single-action token.*stale.*coordinate fallback/i);
   assert.match(investigation, /screenshotId.*not.*filesystem path/i);
   assert.match(investigation, /absolute screenshot path.*blocked/i);
+  assert.match(operation, /collapsible.*(?:thinking|internal notes).*label.*not.*error/i);
+  assert.match(operation, /never (?:expand|open).*raw chain-of-thought/i);
+  assert.match(operation, /input.*disabled.*stop.*(?:progress|in-progress)/i);
+  assert.match(operation, /step.*elapsed.*token.*advance/i);
+  assert.match(operation, /bounded wait.*fresh observe.*worker.*deadline/i);
+  assert.match(operation, /every wait.*mandatory post-wait observation fence/i);
+  assert.match(operation, /must not return.*completed.*verified.*blocked.*failed.*desktop_observe.*fresh:true.*succeeds/is);
+  assert.match(operation, /only.*successful post-wait observation.*terminal UI.*Postconditions.*error.*no-progress/is);
+  assert.match(operation, /do not issue a wait.*deadline.*required fresh observe/i);
+  assert.match(operation, /input.*enabled.*stop.*disappear.*new reply/i);
+  assert.match(operation, /must not.*extend|never.*re-arm/i);
+  assert.match(operation, /explicit.*RPC.*provider.*error/i);
   assert.match(planning, /procedureContext.*qualified Procedure replay.*omit/i);
   assert.match(planning, /bundleId.*appName.*parameters/i);
   assert.match(planning, /PID.*build path.*bridge port/i);
@@ -63,6 +76,15 @@ test("generic plan admission recovery does not invent incomplete procedure conte
   assert.match(diagnostic.leaderInstruction, /omit procedureContext/i);
   assert.match(diagnostic.leaderInstruction, /exact application bundleId.*appName.*parameters/i);
   assert.match(diagnostic.leaderInstruction, /PID.*path.*port/i);
+});
+
+test("only a closed explicit no-recovery goal clause normalizes to typed fail-fast policy", () => {
+  assert.equal(normalizeComputerTaskRecoveryPolicy("不要生成恢复计划；observe失败立即如实停止。"), "fail_fast");
+  assert.equal(normalizeComputerTaskRecoveryPolicy("Do not create a recovery plan; if observation fails, stop immediately."), "fail_fast");
+  assert.equal(normalizeComputerTaskRecoveryPolicy("如果 observe 失败就修复后重试。"), "auto");
+  assert.equal(normalizeComputerTaskRecoveryPolicy("Do not hide failures, but repair and retry if observe fails."), "auto");
+  assert.equal(normalizeComputerTaskRecoveryPolicy("ordinary task", "fail_fast"), "fail_fast");
+  assert.equal(normalizeComputerTaskRecoveryPolicy("不要生成恢复计划；observe失败立即停止。", "auto"), "auto");
 });
 
 test("Computer Worker desktop tools are sequential and broker runtime calls are bounded/fail-fast", async () => {
@@ -206,6 +228,20 @@ test("Computer Worker desktop tools are sequential and broker runtime calls are 
   await progressBroker.execute(progressing.token, { operation: "mutate", payload: { actions: [{ type: "key", key: "ENTER" }], semanticBindings: [] } });
   await progressBroker.execute(progressing.token, { operation: "observe", payload: { fresh: true } });
   assert.equal(progressFatalEvents.length, 1, "a consequential action resets the consecutive-observation budget");
+
+  let temporalCalls = 0;
+  const temporalFatalEvents = [];
+  const temporalBroker = new ComputerWorkerBroker({ onFatal: (event) => temporalFatalEvents.push(event), request: async () => ({
+    observationId: `observation:temporal:${temporalCalls}`,
+    accessibility: { elements: [{ role: "AXStaticText", name: "progress", value: `${temporalCalls += 1}` }] },
+  }) });
+  const longRunning = temporalBroker.issue({ taskId: "task", stepId: "bounded-wait-observe", runId: "run-long", role: "gui-operator" });
+  await temporalBroker.execute(longRunning.token, { operation: "observe", payload: { fresh: true } });
+  for (let index = 0; index < 5; index += 1) {
+    await temporalBroker.execute(longRunning.token, { operation: "mutate", payload: { actions: [{ type: "wait", duration: 15 }], semanticBindings: [] } });
+    await temporalBroker.execute(longRunning.token, { operation: "observe", payload: { fresh: true } });
+  }
+  assert.equal(temporalFatalEvents.length, 0, "bounded wait/fresh-observe cycles remain available for a visibly progressing target");
 
   let contractRuntimeCalls = 0;
   const contractFatalEvents = [];
@@ -391,6 +427,50 @@ test("a silent Computer Use Leader is aborted and returned to the Boss as a clos
   assert.equal(outcome.status, "rejected");
   assert.equal(outcome.error?.message, "computer_leader_stalled");
   assert.equal(outcome.error?.failureCode, "computer_leader_stalled");
+});
+
+test("an incrementally producing Computer Use Leader receives one bounded completion window", async () => {
+  let lastProgressAt = Date.now();
+  let aborted = 0;
+  const operation = new Promise((resolve) => {
+    setTimeout(() => { lastProgressAt = Date.now(); }, 12);
+    setTimeout(() => resolve("compact-plan"), 28);
+  });
+  const result = await runComputerLeaderWithStallDeadline(
+    () => operation,
+    () => { aborted += 1; },
+    20,
+    { lastProgressAt: () => lastProgressAt, progressGraceMs: 15 },
+  );
+  assert.equal(result, "compact-plan");
+  assert.equal(aborted, 0);
+});
+
+test("Computer Use Leader progress can extend the deadline only once", async () => {
+  let lastProgressAt = Date.now();
+  let aborted = 0;
+  let crossedFirstDeadline = false;
+  let rejectLate;
+  const operation = new Promise((_resolve, reject) => { rejectLate = reject; });
+  const progress = setInterval(() => { lastProgressAt = Date.now(); }, 5);
+  const firstDeadlineWitness = setTimeout(() => { crossedFirstDeadline = true; }, 25);
+  await assert.rejects(
+    runComputerLeaderWithStallDeadline(
+      () => operation,
+      () => {
+        aborted += 1;
+        clearInterval(progress);
+        rejectLate(new Error("leader stopped after bounded extension"));
+      },
+      20,
+      { lastProgressAt: () => lastProgressAt, progressGraceMs: 15 },
+    ),
+    (error) => error?.message === "computer_leader_stalled"
+      && error?.failureCode === "computer_leader_stalled",
+  );
+  clearTimeout(firstDeadlineWitness);
+  assert.equal(crossedFirstDeadline, true);
+  assert.equal(aborted, 1);
 });
 
 test("a stall deadline keeps its typed failure when abort synchronously settles the operation", async () => {
@@ -635,6 +715,83 @@ test("invalid recovery Leader output preserves the real worker failure as a boun
   assert.equal(result.summary, "Computer Task recovery plan was invalid after worker failure");
   assert.equal(JSON.stringify(result).includes("raw private output"), false);
   assert.deepEqual(events.at(-1), { type: "task_finished", taskId: events[0].taskId, outcome: "blocked" });
+});
+
+test("typed fail-fast policy closes the exact first failed verifier episode without recovery dispatch", async () => {
+  const condition = { kind: "visible_text", contains: "战役界面" };
+  let replans = 0;
+  let dispatches = 0;
+  const coordinator = new ComputerAgentCoordinator({
+    planner: {
+      plan: async (goal) => ({
+        goal,
+        mode: "direct",
+        successConditions: [condition],
+        steps: [{ id: "verify-campaign", role: "verifier", objective: "freshly observe the campaign", dependsOn: [], postconditions: [condition] }],
+      }),
+      replan: async () => {
+        replans += 1;
+        throw new Error("fail-fast must not ask a Leader for recovery");
+      },
+    },
+    dispatcher: {
+      dispatch: async () => {
+        dispatches += 1;
+        return {
+          workerResult: { outcome: "failed", summary: "target window was obscured" },
+          hostExecutionRecords: [],
+          episode: {
+            agentId: "agent-verifier",
+            runId: "run-verifier",
+            parentId: "root-leader",
+            name: "computer-verifier",
+            role: "verifier",
+            terminalState: "failed",
+            result: { outcome: "failed", summary: "target window was obscured" },
+          },
+        };
+      },
+    },
+  });
+
+  const result = await coordinator.run({
+    goal: "不要生成恢复计划；observe失败立即如实停止。",
+    taskId: "fail-fast-task",
+    recoveryPolicy: "fail_fast",
+  });
+
+  assert.equal(dispatches, 1);
+  assert.equal(replans, 0);
+  assert.equal(result.outcome, "blocked");
+  assert.equal(result.summary, "Computer Task blocked");
+  assert.equal(result.planRevisions, 0);
+  assert.deepEqual(result.investigation, {
+    stage: "fail_fast",
+    code: "worker_failed",
+    recoveryAttempts: 0,
+    failedConditions: [{ conditionId: "task:condition:0", kind: "visible_text", outcome: "not_verified" }],
+    workerAttempts: [{
+      stepId: "verify-campaign",
+      role: "verifier",
+      outcome: "failed",
+      verification: "unknown",
+      agentId: "agent-verifier",
+      runId: "run-verifier",
+      parentId: "root-leader",
+      name: "computer-verifier",
+      terminalState: "failed",
+      result: { outcome: "failed", summary: "Worker failed" },
+    }],
+  });
+  assert.deepEqual(result.episodes, [{
+    agentId: "agent-verifier",
+    runId: "run-verifier",
+    parentId: "root-leader",
+    name: "computer-verifier",
+    role: "verifier",
+    terminalState: "failed",
+    result: { outcome: "failed", summary: "Worker failed" },
+  }]);
 });
 
 test("task success conditions are nonempty, step-bound, and verified from fresh observation rather than verifier prose", async () => {

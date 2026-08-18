@@ -5,9 +5,18 @@ import {
 	COMPUTER_TASK_CONTINUATION_TIMEOUT_MS,
 	COMPUTER_TASK_CONTINUATION_CUSTOM_TYPE,
 	createComputerTaskContinuationWatchdog,
+	isComputerTaskAssistantActivity,
 	queueComputerTaskContinuation,
 	stripComputerTaskContinuationTrigger,
 } from "../../Electron/resources/runtime/pi-ext/subagent/computer-task-continuation.ts";
+
+test("assistant start and empty stream boundaries do not discharge the post-toolResult watchdog", () => {
+	assert.equal(isComputerTaskAssistantActivity({ type: "message_start", message: { role: "assistant", content: [] } }), false);
+	assert.equal(isComputerTaskAssistantActivity({ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } }), false);
+	assert.equal(isComputerTaskAssistantActivity({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "" } }), false);
+	assert.equal(isComputerTaskAssistantActivity({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "final" } }), true);
+	assert.equal(isComputerTaskAssistantActivity({ type: "message_update", assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: "{\"" } }), true);
+});
 
 test("post-computer_task silence aborts at 60 seconds, not before", () => {
 	let now = 0;
@@ -94,9 +103,18 @@ test("the first real assistant activity cancels the deadline even if its stale c
 	assert.deepEqual(subject.counts(), { aborts: 0, continuations: 0, cancelled: 1 });
 });
 
-test("a naturally settled turn never creates a synthetic continuation", () => {
+test("toolResult followed by settle without assistant activity continues exactly once before the deadline", () => {
 	const subject = harness();
 	subject.arm();
+	subject.watchdog.noteSettled();
+	subject.watchdog.noteSettled();
+	assert.deepEqual(subject.counts(), { aborts: 0, continuations: 1, cancelled: 1 });
+});
+
+test("a turn with real assistant activity never creates a synthetic continuation when it settles", () => {
+	const subject = harness();
+	subject.arm();
+	subject.watchdog.noteAssistantActivity();
 	subject.watchdog.noteSettled();
 	assert.deepEqual(subject.counts(), { aborts: 0, continuations: 0, cancelled: 1 });
 });

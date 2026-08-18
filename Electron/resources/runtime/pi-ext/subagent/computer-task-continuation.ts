@@ -37,6 +37,22 @@ type ContextMessage = {
 	details?: unknown;
 };
 
+/** A provider message_start and empty stream boundary prove no durable answer.
+ * Keep the watchdog armed until an assistant update carries actual output. */
+export function isComputerTaskAssistantActivity(event: unknown): boolean {
+	if (!event || typeof event !== "object") return false;
+	const candidate = event as {
+		type?: unknown;
+		assistantMessageEvent?: { delta?: unknown; content?: unknown; toolCall?: unknown };
+	};
+	if (candidate.type !== "message_update") return false;
+	const update = candidate.assistantMessageEvent;
+	if (!update || typeof update !== "object") return false;
+	if (typeof update.delta === "string" && update.delta.length > 0) return true;
+	if (typeof update.content === "string" && update.content.length > 0) return true;
+	return Boolean(update.toolCall && typeof update.toolCall === "object");
+}
+
 /**
  * The custom message is only an ExtensionAPI trigger. Remove it from the model
  * payload, together with the empty assistant produced by our abort, so the
@@ -80,9 +96,10 @@ type ComputerTaskContinuationWatchdogOptions = {
 };
 
 /**
- * Joins a timed-out post-computer_task provider request before continuing it.
- * The timeout only requests abort; the settled event is the sole continuation
- * gate, so a late provider event cannot create two main-agent turns.
+ * Joins a post-computer_task provider request before continuing it. A silent
+ * settle continues immediately; otherwise the timeout only requests abort and
+ * the later settled event remains the continuation gate. Both paths are
+ * monotonic, so late provider events cannot create two main-agent turns.
  */
 export function createComputerTaskContinuationWatchdog(options: ComputerTaskContinuationWatchdogOptions) {
 	const schedule = options.schedule ?? ((callback, delayMs) => setTimeout(callback, delayMs));
@@ -122,12 +139,14 @@ export function createComputerTaskContinuationWatchdog(options: ComputerTaskCont
 			if (state === "armed") {
 				clearTimer();
 				abortCurrent = undefined;
-				state = "idle";
-				return;
+				state = "continued";
+				options.onContinue();
+				return true;
 			}
-			if (state !== "abort-requested") return;
+			if (state !== "abort-requested") return false;
 			state = "continued";
 			options.onContinue();
+			return true;
 		},
 		dispose() {
 			clearTimer();
