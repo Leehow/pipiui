@@ -793,6 +793,37 @@ describe('desktop document host extension', () => {
   })
 })
 
+describe('document drop host methods', () => {
+  it('invokes watch and announce methods over IPC', async () => {
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const listeners = new Set<any>()
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: undefined }
+      },
+      on: (_channel, listener) => listeners.add(listener),
+      removeListener: (_channel, listener) => listeners.delete(listener)
+    }
+    const host = createIpcHost(ipc)
+    const received: unknown[] = []
+    const unsubscribe = host.subscribeDocuments?.(event => received.push(event))
+    await host.watchDocument?.('/abs/notes.md')
+    await host.notifyDocumentsDropped?.('sess-1', ['/abs/notes.md'])
+    await host.unwatchDocument?.()
+    for (const listener of listeners) {
+      listener(undefined, { type: 'event', protocolVersion: 2, channel: 'document', event: { type: 'documentChanged', path: '/abs/notes.md' } })
+    }
+    expect(calls).toEqual([
+      { method: 'watchDocument', params: ['/abs/notes.md'] },
+      { method: 'notifyDocumentsDropped', params: ['sess-1', ['/abs/notes.md']] },
+      { method: 'unwatchDocument', params: [] },
+    ])
+    expect(received).toEqual([{ type: 'documentChanged', path: '/abs/notes.md' }])
+    unsubscribe?.()
+  })
+})
+
 describe('browser transport extension', () => {
   it('maps tab commands, active-tab state, snapshots, bounds, and subscriptions', async () => {
     const calls: Array<{ method: string; params: unknown[] }> = []

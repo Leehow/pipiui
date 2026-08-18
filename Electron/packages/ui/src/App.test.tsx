@@ -21,9 +21,22 @@ afterEach(() => {
   vi.restoreAllMocks()
   localStorage.clear()
   Reflect.deleteProperty(window, 'pipiHost')
+  Reflect.deleteProperty(window, 'pipiPathForFile')
   document.title = ''
   xtermHarness.instances.length = 0
 })
+
+function fileDataTransfer(file: File) {
+  return {
+    types: ['Files'],
+    files: Object.assign([file], { item: (index: number) => index === 0 ? file : null }),
+    items: [{ kind: 'file', type: file.type, getAsFile: () => file }],
+    dropEffect: 'none',
+    effectAllowed: 'all',
+    setData: vi.fn(),
+    getData: vi.fn(() => ''),
+  }
+}
 
 const virtuosoHarness = { atBottom: undefined as undefined | ((value: boolean) => void), scrollToIndex: vi.fn() }
 vi.mock('react-virtuoso', async () => {
@@ -781,7 +794,7 @@ describe('PipiUI Electron main layout', () => {
     expect(rail).toBeTruthy()
     expect(container.querySelector('.tool-panel-header')!.contains(rail)).toBe(true)
     expect(container.querySelector('.chat-viewport')!.contains(rail)).toBe(false)
-    expect(rail.querySelectorAll('button')).toHaveLength(4)
+    expect(rail.querySelectorAll('button')).toHaveLength(5)
     const browser = screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement
     await waitFor(() => expect(browser.disabled).toBe(false))
     // switching via the rail opens that tool and highlights it
@@ -832,8 +845,16 @@ describe('PipiUI Electron main layout', () => {
     // header toggles can still show the panes at narrow width
     fireEvent.click(screen.getByLabelText('展开左栏'))
     expect(shell.className).not.toContain('sidebar-collapsed')
+    fireEvent.mouseDown(screen.getByTestId('pane-overlay-backdrop'))
+    expect(shell.className).toContain('sidebar-collapsed')
     fireEvent.click(screen.getByLabelText('展开右栏'))
     expect(shell.className).not.toContain('tools-collapsed')
+    fireEvent.mouseDown(screen.getByTestId('pane-overlay-backdrop'))
+    expect(shell.className).toContain('tools-collapsed')
+    fireEvent.click(screen.getByLabelText('展开左栏'))
+    expect(screen.getByLabelText('收起左栏')).toBeTruthy()
+    fireEvent.click(screen.getByLabelText('收起左栏'))
+    expect(shell.className).toContain('sidebar-collapsed')
     vi.unstubAllGlobals()
   })
 
@@ -854,10 +875,21 @@ describe('PipiUI Electron main layout', () => {
     const narrow = css.match(/@media \(max-width:720px\)\{[^\n]*\}/)?.[0] ?? ''
     expect(narrow).toMatch(/\.pipiui-shell\.sidebar-collapsed\.tools-collapsed\{[^}]*grid-template-columns:0 minmax\(0,1fr\) 0/)
     expect(narrow).toContain('position:fixed')
+    expect(narrow).toContain('z-index:31')
+    expect(narrow).toMatch(/\.pane-overlay-backdrop\{[^}]*z-index:25/)
     expect(narrow).toContain('width:min(86vw,340px)')
     expect(narrow).toMatch(/\.pipiui-shell\.sidebar-collapsed \.sb-root[^}]*display:none/)
     expect(narrow).toMatch(/\.pipiui-shell\.tools-collapsed \.tool-panel[^}]*display:none/)
     expect(narrow).toContain('.pipiui-shell .resize-handle{visibility:hidden}')
+    const hamburger720 = [...css.matchAll(/@media \(max-width:720px\)\{[^\n]*\}/g)].at(-1)?.[0] ?? ''
+    expect(css.lastIndexOf('@media (max-width:720px){.electron-chrome .pane-restore-sidebar')).toBeGreaterThan(
+      css.lastIndexOf('.electron-chrome .pane-restore-sidebar{left:78px}'),
+    )
+    expect(hamburger720).toMatch(/\.electron-chrome \.pane-restore-sidebar[^}]*left:max\(10px/)
+    expect(hamburger720).not.toMatch(/left:78px/)
+    expect(hamburger720).toMatch(/\.electron-chrome\.sidebar-collapsed \.chat-header\{padding-left:54px/)
+    expect(hamburger720).toMatch(/\.electron-chrome \.sb-topbar\{[^}]*-webkit-app-region:no-drag/)
+    expect(hamburger720).toMatch(/\.electron-chrome \.sb-topbar\{[^}]*padding-left:10px/)
   })
 
   it('keeps collapsed drag handles in the grid flow instead of removing them', () => {
@@ -962,7 +994,8 @@ describe('PipiUI Electron main layout', () => {
     fireEvent.click(browser)
     expect(await screen.findByTestId('browser-panel')).toBeTruthy()
     expect(browser.className).toContain('active')
-    expect(screen.queryByRole('button', { name: 'Plan' })).toBeNull()
+    const plan = await screen.findByRole('button', { name: 'Plan' }) as HTMLButtonElement
+    expect(plan.disabled).toBe(false)
   })
 
   it('opens a main assistant Markdown card in the expanded Document panel using the selected project path', async () => {
@@ -1004,6 +1037,24 @@ describe('PipiUI Electron main layout', () => {
     act(() => pushAgent?.({ type: 'agent', agent: { agentId: 'second', runId: 'run-2', sessionId: 'welcome', name: 'reviewer', task: 'more work', state: 'running' } }))
     await waitFor(() => expect(container.querySelector('.tool-rail-running')?.textContent).toBe('2'))
     expect(browser.className).toContain('active')
+  })
+
+  it('does not auto-expand the right pane when a subagent starts on a narrow viewport', async () => {
+    const media = { matches: true, media: '(max-width: 720px)', onchange: null, addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn() } as unknown as MediaQueryList
+    vi.stubGlobal('matchMedia', vi.fn(() => media))
+    const host = createMockHost()
+    let pushAgent: ((event: AgentEvent) => void) | undefined
+    host.listAgents = async () => []
+    host.subscribeAgents = listener => { pushAgent = listener; return () => { pushAgent = undefined } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    expect(container.querySelector('.pipiui-shell')!.className).toContain('tools-collapsed')
+    expect(screen.getByLabelText('展开右栏')).toBeTruthy()
+    act(() => pushAgent?.({ type: 'agent', agent: { agentId: 'fresh', runId: 'run-1', sessionId: 'welcome', name: 'explore', task: 'new work', state: 'running' } }))
+    await waitFor(() => expect(container.querySelector('.tool-rail-running')?.textContent).toBe('1'))
+    expect(container.querySelector('.pipiui-shell')!.className).toContain('tools-collapsed')
+    expect(screen.getByLabelText('展开右栏')).toBeTruthy()
+    vi.unstubAllGlobals()
   })
 
   it('sends a narrowly scoped status-check prompt when the user clicks the stale-channel warning', async () => {
@@ -1191,6 +1242,84 @@ describe('PipiUI Electron main layout', () => {
     expect(screen.queryByText(/文件列表|个文件|正在同步/)).toBeNull()
   })
 
+  it('announces a transcript card open to the current session', async () => {
+    const host = createMockHost()
+    const notifyDocumentsDropped = vi.fn(async () => undefined)
+    host.notifyDocumentsDropped = notifyDocumentsDropped
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByRole('button', { name: '打开文档 README.md' }))
+    await waitFor(() => expect(notifyDocumentsDropped).toHaveBeenCalledWith('welcome', ['/Users/demo/code/pipiui/README.md']))
+    expect(await screen.findByLabelText('文档内容 README.md')).toBeTruthy()
+  })
+
+  it('drops a document on the right panel without focusing composer or attaching files', async () => {
+    const host = createMockHost()
+    const notifyDocumentsDropped = vi.fn(async () => undefined)
+    host.notifyDocumentsDropped = notifyDocumentsDropped
+    const getPath = vi.fn((file: File) => `/Users/haoli/Downloads/${file.name}`)
+    window.pipiPathForFile = getPath
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(screen.getByRole('button', { name: 'Document' }))
+    const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    composer.blur()
+    const panel = document.querySelector('.tool-panel') as HTMLElement
+    const file = new File(['survey'], '基本情况调查表.txt', { type: 'text/plain' })
+    const dataTransfer = fileDataTransfer(file)
+    fireEvent.dragEnter(panel, { dataTransfer })
+    fireEvent.dragOver(panel, { dataTransfer })
+    fireEvent.drop(panel, { dataTransfer })
+    await waitFor(() => expect(notifyDocumentsDropped).toHaveBeenCalledWith('welcome', ['/Users/haoli/Downloads/基本情况调查表.txt']))
+    expect(getPath).toHaveBeenCalled()
+    expect(document.activeElement).not.toBe(composer)
+    expect(composer.value).not.toContain('基本情况调查表.txt')
+    expect(screen.queryByTestId('composer-thumbs')).toBeNull()
+    expect(screen.queryByTestId('composer-error')).toBeNull()
+    expect(await screen.findByLabelText('文档内容 基本情况调查表.txt')).toBeTruthy()
+  })
+
+  it('ignores a file drop that lands on the composer after crossing the chat column', async () => {
+    const host = createMockHost()
+    host.notifyDocumentsDropped = vi.fn(async () => undefined)
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    const file = new File(['survey'], 'form.doc', { type: 'application/msword' })
+    const dataTransfer = fileDataTransfer(file)
+    fireEvent.dragOver(composer, { dataTransfer })
+    fireEvent.drop(composer, { dataTransfer })
+    expect(composer.value).not.toContain('form.doc')
+    expect(screen.queryByTestId('composer-thumbs')).toBeNull()
+    expect(screen.queryByTestId('composer-error')).toBeNull()
+    expect(host.notifyDocumentsDropped).not.toHaveBeenCalled()
+  })
+
+  it('does not remount an open document preview when the selected session streams tokens', async () => {
+    const host = createMockHost()
+    const streamListeners = new Set<(event: StreamEvent) => void>()
+    const subscribe = host.subscribeStream.bind(host)
+    host.subscribeStream = (sessionId, listener) => {
+      streamListeners.add(listener)
+      const unsubscribe = subscribe(sessionId, listener)
+      return () => { streamListeners.delete(listener); unsubscribe() }
+    }
+    const readDocument = vi.spyOn(host, 'readDocument')
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByRole('button', { name: '打开文档 README.md' }))
+    const preview = await screen.findByLabelText('文档内容 README.md')
+    const reads = readDocument.mock.calls.length
+    await act(async () => {
+      for (const listener of streamListeners) {
+        listener({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: 'token-a' })
+        listener({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: 'token-b' })
+      }
+    })
+    expect(screen.getByLabelText('文档内容 README.md')).toBe(preview)
+    expect(readDocument).toHaveBeenCalledTimes(reads)
+  })
+
   it('disables Browser for a remote host without browser capability', async () => {
     const base = createMockHost()
     const host: PipiHostAPI = { ...base, capabilities: async () => ({ computerUse: false, revealInFinder: true, terminal: true, browser: false, plan: false, retainedWorktreeDisposition: false }) }
@@ -1297,6 +1426,36 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).disabled).toBe(false))
     expect(screen.queryByTestId('composer-read-only')).toBeNull()
     expect(screen.getByTestId('composer-session-stats')).toBeTruthy()
+  })
+
+  it('refreshes a stale writable lease after a queue item fails as held by pipiui-electron', async () => {
+    const getSessionLease = vi.fn(async (sessionId: string): Promise<import('@pipi/host-api').SessionLease> => ({ sessionId, writable: true }))
+    let listener: ((event: StreamEvent) => void) | undefined
+    const host: PipiHostAPI = {
+      ...createMockHost(),
+      getSessionLease,
+      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } }
+    }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(getSessionLease).toHaveBeenCalled())
+    expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).disabled).toBe(false)
+
+    getSessionLease.mockResolvedValue({
+      sessionId: 'welcome',
+      writable: false,
+      holder: { protocolVersion: 1, holder: 'pipiui-electron', pid: 1, hostname: 'mac', acquiredAt: '', heartbeatAt: '', expiresAt: '' }
+    })
+    await act(async () => {
+      listener?.({
+        type: 'queue_update',
+        sessionId: 'welcome',
+        queue: [queuedMessage('blocked', 'welcome', '你重新开一下这个网页', 'failed', [], 'session is read-only: held by pipiui-electron')]
+      })
+    })
+    await waitFor(() => expect(screen.getByTestId('composer-read-only')).toBeTruthy())
+    expect(screen.getByText(/由 pipiui-electron 运行中/)).toBeTruthy()
+    expect(getSessionLease.mock.calls.length).toBeGreaterThan(1)
   })
 
   it('uses an injected host and keeps host effects stable while composing', async () => {

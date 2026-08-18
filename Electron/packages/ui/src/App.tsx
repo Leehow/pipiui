@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
 import type { VirtuosoHandle } from 'react-virtuoso'
 import { SubagentPanel } from './SubagentPanel'
+import { PlanPanel } from './PlanPanel'
 import { makeSubagentStatusCheckPrompt } from './subagent-status-check'
 import { DocumentPanel } from './DocumentPanel'
+import { consumeFileDropEvent, filterSupportedDocumentPaths, ignoreComposerFileDrag, supportedDocumentPathsFromFiles } from './document-drop'
 import { TerminalPanel } from './TerminalPanel'
 import { BrowserPanel } from './BrowserPanel'
 import { documentKindForName, resolveThinkingLevel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED } from '@pipi/host-api'
-import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, Project, PromptAttachment, Session, SessionLease, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
+import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, Project, PromptAttachment, Session, SessionLease, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
 import { ComputerUsePanel } from './ComputerUsePanel'
 import { RemoteConnectionPanel } from './RemoteConnectionPanel'
@@ -46,15 +48,18 @@ import './app.css'
 import './message-actions.css'
 import './subagent.css'
 
-type PanelTab = 'Subagents' | 'Browser' | 'Document' | 'Terminal'
+type PanelTab = 'Subagents' | 'Plan' | 'Browser' | 'Document' | 'Terminal'
 type PaneWidths = { sidebar: number; tools: number; sidebarCollapsed: boolean; toolsCollapsed: boolean }
 type SidebarPreferences = { expandedIds: string[]; pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; visibleLimit: number }
 type SessionWithSidebarMetadata = Session & { provider?: unknown; modelId?: unknown; modelRef?: unknown; model?: unknown }
 type RuntimeSessionLease = SessionLease & { canWrite?: unknown; ownerLabel?: unknown }
 
-/** Accept both the current host-api shape and lease payloads from older running Electron hosts. */
+/** Accept both the current host-api shape and lease payloads from older running Electron hosts.
+ *  `null` means the lease has not loaded yet. The composer is already writable in that
+ *  state (`leaseReadOnly` only locks after a loaded non-writable lease), so send must
+ *  match — otherwise the first click after mount silently no-ops. */
 export function leaseCanWrite(lease: SessionLease | null): boolean {
-  if (!lease) return false
+  if (!lease) return true
   const runtime = lease as RuntimeSessionLease
   if (typeof runtime.canWrite === 'boolean') return runtime.canWrite
   return lease.writable === true
@@ -67,12 +72,16 @@ export function leaseOwnerLabel(lease: SessionLease | null): string {
   return lease.holder?.holder || '另一客户端'
 }
 
-const tabs: PanelTab[] = ['Subagents', 'Browser', 'Document', 'Terminal']
+const tabs: PanelTab[] = ['Subagents', 'Plan', 'Browser', 'Document', 'Terminal']
+/** SF Symbols `checklist` traced inline: the rail masks a shape, and a two-row
+ *  checklist stays legible at 13px without shipping another bitmap. */
+const checklistIcon = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 17 13"><g fill="none" stroke="#000" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M.9 3.1 2.5 4.7 5.5 1.3"/><path d="M.9 9.5 2.5 11.1 5.5 7.7"/><path d="M8.2 3.3h7.9"/><path d="M8.2 9.7h7.9"/></g></svg>')}`
 /** SF Symbols parity tool-rail glyphs (Swift panelQuickRail: person.2/globe/doc.text/terminal).
  *  Rendered from system-exported SF Symbols bitmaps via CSS mask, so the icon shape matches
  *  Swift's `systemName` glyphs exactly and the color follows `currentColor` (accent when active). */
 const toolRailIcons: Record<PanelTab, { src: string; ratio: number }> = {
   Subagents: { src: personGroupIcon, ratio: 70 / 49 },
+  Plan: { src: checklistIcon, ratio: 17 / 13 },
   Browser: { src: globeIcon, ratio: 46 / 46 },
   Document: { src: docTextIcon, ratio: 44 / 49 },
   Terminal: { src: terminalIcon, ratio: 57 / 43 },
@@ -526,6 +535,28 @@ function writeDemoSessionModel(sessionId: string, model: Model) {
   } catch { /* storage can be disabled by the host */ }
 }
 
+/** Demo-only plan so the browser preview shows the Plan panel populated. */
+function mockPlans(): PlanSnapshot[] {
+  const base = Date.now() - 9 * 60_000
+  const at = (minutes: number) => new Date(base + minutes * 60_000).toISOString()
+  return [{
+    id: 'plan-electron-ui',
+    title: '让 Electron 前端跟上 plan 运行时',
+    lifecycle: 'approved',
+    createdAt: at(0),
+    approvedAt: at(1),
+    updatedAt: at(8),
+    active: true,
+    tasks: [
+      { id: 'contract', title: '在 host-api 里定义 plan 快照与事件通道', state: 'completed' },
+      { id: 'store', title: '后端镜像 plan 事件并读回 .pi/plans', state: 'completed', note: '冷会话从磁盘补水一次' },
+      { id: 'panel', title: '实现 Plan 面板与进度展示', state: 'in_progress' },
+      { id: 'rail', title: '工具栏显示计划进度角标', state: 'pending' },
+      { id: 'tests', title: '补面板与后端测试', state: 'pending' }
+    ]
+  }]
+}
+
 /** Local development host; production injects the Electron preload/IPC host. */
 export function createMockHost(): PipiHostAPI {
   const projects: Project[] = [
@@ -864,7 +895,9 @@ export function createMockHost(): PipiHostAPI {
     getWorktreeStatus: async agentId => ({ agentId, lifecycle: 'none', merge: 'unavailable', discard: 'unavailable' }),
     mergeWorktree: async agentId => ({ agentId, lifecycle: 'merged', merge: 'merged', discard: 'unavailable' }),
     discardWorktree: async agentId => ({ agentId, lifecycle: 'discarded', merge: 'unavailable', discard: 'discarded' }),
-    capabilities: async () => ({ computerUse: false, revealInFinder: true, terminal: false, documents: true, browser: true, git: true, plan: false, retainedWorktreeDisposition: false }),
+    getPlans: async sessionId => sessionId ? mockPlans() : [],
+    subscribePlans: () => () => undefined,
+    capabilities: async () => ({ computerUse: false, revealInFinder: true, terminal: false, documents: true, browser: true, git: true, plan: true, retainedWorktreeDisposition: false }),
     probeGitBinary: async () => true,
     gitStatus: async projectId => projectId === 'pipiui' ? { ...mockGit } : { isRepo: false, isDetached: false, localBranches: [], ahead: 0, behind: 0, isDirty: false, staged: 0, unstaged: 0, untracked: 0 },
     gitCheckout: async (_projectId, branch) => { mockGit = { ...mockGit, currentBranch: branch, isDetached: false }; return { ...mockGit } },
@@ -991,7 +1024,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (tab !== current) setToolReturnTab(tab === 'Subagents' ? null : current)
     applyActiveTab(tab)
   }, [applyActiveTab])
-  const [openedDocumentPath, setOpenedDocumentPath] = useState<string | null>(null)
+  // Keyed by session like the terminals: the right panel belongs to one
+  // conversation, so switching sessions must not leave the previous session's
+  // document open in the reader.
+  const [openedDocumentPaths, setOpenedDocumentPaths] = useState<Record<string, string>>({})
   const [announcedTerminals, setAnnouncedTerminals] = useState<Record<string, TerminalSession>>({})
   const [revealedTerminalIds, setRevealedTerminalIds] = useState<Record<string, string>>({})
   const [widths, setWidths] = useState<PaneWidths>(readWidths)
@@ -1046,11 +1082,20 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       return [selectedSession, ...current.filter(id => id !== selectedSession)].slice(0, 6)
     })
   }, [selectedSession])
+  const [hasPlansBySession, setHasPlansBySession] = useState<Record<string, boolean>>({})
+  const handleHasPlansChange = useCallback((sessionId: string, hasPlans: boolean) => {
+    setHasPlansBySession(current => current[sessionId] === hasPlans ? current : { ...current, [sessionId]: hasPlans })
+  }, [])
+  const selectedHasPlans = selectedSession ? hasPlansBySession[selectedSession] === true : false
   useEffect(() => {
     if (!selectedSession) return
-    const remembered = activeTabBySessionRef.current[selectedSession]
-    setActiveTab(remembered ?? 'Subagents')
-  }, [selectedSession])
+    const remembered = activeTabBySessionRef.current[selectedSession] ?? 'Subagents'
+    if (remembered === 'Plan' && !selectedHasPlans) {
+      setActiveTab('Subagents')
+      return
+    }
+    setActiveTab(remembered)
+  }, [selectedSession, selectedHasPlans])
   const [observedSessionStatuses, setObservedSessionStatuses] = useState<Record<string, SessionStatus>>({})
   const [loadedSidebarPreferencesKey, setLoadedSidebarPreferencesKey] = useState('')
   const [canRevealInFinder, setCanRevealInFinder] = useState(false)
@@ -1058,6 +1103,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [browserAvailable, setBrowserAvailable] = useState<boolean | undefined>(host.browser ? undefined : false)
   const [terminalAvailable, setTerminalAvailable] = useState<boolean | undefined>(host.terminal ? undefined : false)
   const [retainedWorktreeDispositionAvailable, setRetainedWorktreeDispositionAvailable] = useState(false)
+  const [planAvailable, setPlanAvailable] = useState<boolean | undefined>(host.getPlans ? undefined : false)
+  const planTabVisible = planAvailable !== false && Boolean(host.getPlans) && selectedHasPlans
+  const [planProgressBadge, setPlanProgressBadge] = useState<{ completed: number; total: number } | null>(null)
   const [computerUseAvailable, setComputerUseAvailable] = useState(false)
   const [projectError, setProjectError] = useState<string | null>(null)
   const [modalOpen, setModalOpen] = useState(false)
@@ -1159,6 +1207,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const sessionWorking = streaming || selectedObservedRunning || (messageStreaming && !selectedObservedClosed) || sessionQueue.busy || compacting || selectedStopping
   const canWriteLease = leaseCanWrite(lease)
   const leaseReadOnly = lease !== null && !canWriteLease
+  const leaseConflictError = sessionQueue.items.find(item =>
+    item.status === 'failed' && typeof item.error === 'string' && item.error.includes('session is read-only'),
+  )?.error
   /** The explicit path read performs the one-time backend migration; listProjects supplies matching UI metadata. */
   const refreshProjects = useCallback(async () => {
     const paths = host.getProjectPaths ? await host.getProjectPaths() : undefined
@@ -1212,7 +1263,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     return items
   }, [beginSessionListRequest, host, isCurrentSessionListRequest])
 
-  useEffect(() => { void refreshProjects().catch(error => setProjectError(`加载项目失败：${error instanceof Error ? error.message : String(error)}`)); void host.capabilities().then(capabilities => { setCanRevealInFinder(capabilities.revealInFinder && typeof host.revealProject === 'function'); setBrowserAvailable(Boolean(capabilities.browser && host.browser)); setTerminalAvailable(Boolean(capabilities.terminal && host.terminal)); setGitAvailable(Boolean(capabilities.git && host.gitStatus)); setRetainedWorktreeDispositionAvailable(Boolean(capabilities.retainedWorktreeDisposition)); setComputerUseAvailable(Boolean(capabilities.computerUse && host.getComputerUseState)) }).catch(() => { setCanRevealInFinder(false); setBrowserAvailable(false); setTerminalAvailable(false); setGitAvailable(false); setRetainedWorktreeDispositionAvailable(false); setComputerUseAvailable(false) }); if (!host.probeGitBinary) { setGitBinary('unknown'); return } void host.probeGitBinary().then(installed => setGitBinary(Boolean(installed))).catch(() => setGitBinary('unknown')) }, [host, refreshProjects])
+  useEffect(() => { void refreshProjects().catch(error => setProjectError(`加载项目失败：${error instanceof Error ? error.message : String(error)}`)); void host.capabilities().then(capabilities => { setCanRevealInFinder(capabilities.revealInFinder && typeof host.revealProject === 'function'); setBrowserAvailable(Boolean(capabilities.browser && host.browser)); setTerminalAvailable(Boolean(capabilities.terminal && host.terminal)); setGitAvailable(Boolean(capabilities.git && host.gitStatus)); setRetainedWorktreeDispositionAvailable(Boolean(capabilities.retainedWorktreeDisposition)); setPlanAvailable(Boolean(capabilities.plan && host.getPlans)); setComputerUseAvailable(Boolean(capabilities.computerUse && host.getComputerUseState)) }).catch(() => { setCanRevealInFinder(false); setBrowserAvailable(false); setTerminalAvailable(false); setGitAvailable(false); setRetainedWorktreeDispositionAvailable(false); setPlanAvailable(false); setComputerUseAvailable(false) }); if (!host.probeGitBinary) { setGitBinary('unknown'); return } void host.probeGitBinary().then(installed => setGitBinary(Boolean(installed))).catch(() => setGitBinary('unknown')) }, [host, refreshProjects])
   useEffect(() => {
     if (!host.browser || !selectedSession) return
     void host.browser.selectSession(selectedSession)
@@ -1555,9 +1606,15 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         const last = restored[restored.length - 1]
         turnJustSettledRef.current = Boolean(last && last.role === 'assistant' && !last.streaming)
       }
-      if (scrollToNewest) requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, restored.length - 1), align: 'end', behavior: 'auto' }))
+      if (scrollToNewest) {
+        const index = Math.max(0, restored.length - 1)
+        requestAnimationFrame(() => requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index, align: 'end', behavior: 'auto' })))
+      }
     }
-    if (cached !== undefined) requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, cached.length - 1), align: 'end', behavior: 'auto' }))
+    if (cached !== undefined) {
+      const index = Math.max(0, cached.length - 1)
+      requestAnimationFrame(() => requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index, align: 'end', behavior: 'auto' })))
+    }
     // Cache is an immediate rendering optimization, never the source of truth.
     // Re-read JSONL on every selection/reconnect and after terminal status so
     // missed/coalesced stream events converge without another live token.
@@ -1632,6 +1689,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       if (emptyPageRetryTimer !== undefined) window.clearTimeout(emptyPageRetryTimer)
     }
   }, [historyRefreshKey, host, selectedSession])
+  useEffect(() => {
+    if (!selectedSession || !leaseConflictError) return
+    let cancelled = false
+    void host.getSessionLease(selectedSession).then(next => {
+      if (!cancelled) setLease(next)
+    }).catch(() => undefined)
+    return () => { cancelled = true }
+  }, [host, selectedSession, leaseConflictError])
   useEffect(() => {
     // Runs after the history-load effect above and the stream-subscription effect
     // below: by the next macrotask the new session's transcript and live events
@@ -2464,19 +2529,39 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     navigateTool('Browser')
   }
   const revealSubagentsForNewRun = useCallback(() => {
+    if (narrowViewport) return
     // Match Swift: reveal a new run only when the right pane is closed. An
     // already-open Browser/Document/Terminal tab remains under user control.
     if (!toolsCollapsed) return
     navigateTool('Subagents')
-  }, [navigateTool, toolsCollapsed])
+  }, [narrowViewport, navigateTool, toolsCollapsed])
   /** Subagent tool-card click: always open the Subagents pane (Swift card tap parity). */
   const openSubagents = useCallback(() => {
     navigateTool('Subagents')
   }, [navigateTool])
+  const announceOpenedDocuments = useCallback((paths: string[]) => {
+    const supported = filterSupportedDocumentPaths(paths)
+    if (!supported.length) return supported
+    const sessionId = selectedSessionRef.current
+    void host.notifyDocumentsDropped?.(sessionId, supported)?.catch(error => console.warn('[document-drop]', error))
+    return supported
+  }, [host])
+  const rememberOpenedDocument = useCallback((path: string) => {
+    const sessionId = selectedSessionRef.current
+    if (!sessionId) return
+    setOpenedDocumentPaths(current => current[sessionId] === path ? current : { ...current, [sessionId]: path })
+  }, [])
   const openDocument = useCallback((path: string) => {
-    setOpenedDocumentPath(path)
+    const supported = announceOpenedDocuments([path])
+    rememberOpenedDocument(supported[supported.length - 1] ?? path)
     navigateTool('Document')
-  }, [navigateTool])
+  }, [announceOpenedDocuments, navigateTool, rememberOpenedDocument])
+  const openDroppedDocuments = useCallback((paths: string[]) => {
+    const supported = announceOpenedDocuments(paths)
+    if (!supported.length) return
+    rememberOpenedDocument(supported[supported.length - 1]!)
+    navigateTool('Document')
+  }, [announceOpenedDocuments, navigateTool, rememberOpenedDocument])
 
   const shellClass = `pipiui-shell${isElectronChrome() ? ' electron-chrome' : ''}${sidebarCollapsed ? ' sidebar-collapsed' : ''}${toolsCollapsed ? ' tools-collapsed' : ''}`
   // The first-response wait (any active main turn) takes precedence at the
@@ -2488,13 +2573,15 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const subagentWaiting = !firstResponseWaiting && subagentsRunningCount > 0 && subagentWaitingStartedAt !== null
     ? { startedAt: subagentWaitingStartedAt, phase: 'tool' as const, detail: `${subagentsRunningCount} 个子任务执行中` }
     : undefined
+  const dismissNarrowOverlays = () => setNarrowPanes({ sidebar: false, tools: false })
   return <main className={shellClass} data-theme={theme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${widths.tools}px` } as React.CSSProperties}>
+    {narrowViewport && (!sidebarCollapsed || !toolsCollapsed) && <div className="pane-overlay-backdrop" data-testid="pane-overlay-backdrop" onMouseDown={dismissNarrowOverlays} />}
     <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} onRenameProject={host.renameProject ? renameSidebarProject : undefined} projectMenuUnavailable={sidebarProjectMenuUnavailable} onMoveProject={host.setProjectPaths ? moveSidebarProject : undefined} onMoveSession={moveSidebarSession} onMoveSessionToPinned={moveSidebarSessionToPinned} onAddProject={addProject} projectAddUnavailable={host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onOpenSettings={openModelManager} onOpenComputerUse={computerUseAvailable ? () => setComputerUseOpen(true) : undefined} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} />
     <ResizeHandle label="调整左栏宽度" side="left" onPointerDown={resize('sidebar', widths.sidebar)} />
     <section className="chat-column">
       <ChatHeader session={sessions.find(item => item.id === selectedSession)} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={sidebarCollapsed} toolsCollapsed={toolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onRename={renameSidebarSession} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} />
       <div className="chat-viewport" data-testid="chat-viewport">
-        {toolsCollapsed && <ToolQuickRail variant="float" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunningCount={subagentsRunningCount} />}
+        {toolsCollapsed && <ToolQuickRail variant="float" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} />}
         {projectsLoaded && !selectedSession ? (
           <div className="empty-setup-viewport">
             <EmptySetupGuide
@@ -2543,7 +2630,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       </div> : null}
     </section>
     <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resize('tools', widths.tools)} />
-    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== 'Subagents'} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={openedDocumentPath} onOpenDocument={openDocument} />
+    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== 'Subagents'} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} />
     {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} />}
@@ -2748,6 +2835,10 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     const files = imageFilesFromClipboard(event.clipboardData)
     if (files.length) { event.preventDefault(); setAttachError(null); addFiles(files) }
   }
+  const ignoreFileDrag = (event: DragEvent) => {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return
+    ignoreComposerFileDrag(event)
+  }
 
   const submit = async () => {
     if (readOnly) return
@@ -2835,7 +2926,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
   }
   const canSend = !readOnly && (draft.trim() !== '' || attachments.length > 0)
   const showQueueSubmit = queueBusy && canSend
-  return <footer className="composer">
+  return <footer className="composer" onDragEnter={ignoreFileDrag} onDragOver={ignoreFileDrag} onDrop={ignoreFileDrag}>
     {readOnly && <div className="composer-read-only" data-testid="composer-read-only" role="status"><span>当前由 {leaseOwner ?? '另一客户端'} 持有，会话只读。</span><button type="button" data-testid="composer-lease-takeover" onClick={onTakeover}>强制接管</button></div>}
     {slashVisible && <SlashMenu commands={slashMatches} selectedIndex={Math.min(slashIndex, Math.max(0, slashMatches.length - 1))} onHighlight={setSlashIndex} onSelect={executeSlash} onDismiss={dismissSlash} />}
     {attachments.length > 0 && <div className="composer-thumbs" data-testid="composer-thumbs">
@@ -2852,9 +2943,10 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     {lightboxIndex !== null && attachments[lightboxIndex] && <div className="lightbox-backdrop" data-testid="lightbox" onMouseDown={event => { if (event.target === event.currentTarget) setLightboxIndex(null) }}><img src={attachments[lightboxIndex].url} alt="图片预览" /><button className="lightbox-close" aria-label="关闭预览" onClick={() => setLightboxIndex(null)}>×</button></div>}
   </footer>
 }
-function ToolQuickRail({ variant, activeTab, toolsCollapsed, onSelect, host, browserAvailable, terminalAvailable, subagentsRunningCount }: { variant: 'header' | 'float'; activeTab: PanelTab; toolsCollapsed: boolean; onSelect: (tab: PanelTab) => void; host: PipiHostAPI; browserAvailable: boolean | undefined; terminalAvailable: boolean | undefined; subagentsRunningCount: number }) {
+function ToolQuickRail({ variant, activeTab, toolsCollapsed, onSelect, host, browserAvailable, terminalAvailable, planTabVisible, planProgress, subagentsRunningCount }: { variant: 'header' | 'float'; activeTab: PanelTab; toolsCollapsed: boolean; onSelect: (tab: PanelTab) => void; host: PipiHostAPI; browserAvailable: boolean | undefined; terminalAvailable: boolean | undefined; planTabVisible: boolean; planProgress: { completed: number; total: number } | null; subagentsRunningCount: number }) {
   return <nav className={`tool-quick-rail tool-quick-rail-${variant}`} aria-label="工具面板" data-testid="tool-quick-rail">
     {tabs.map(tab => {
+      if (tab === 'Plan' && !planTabVisible) return null
       const browserUnavailable = tab === 'Browser' && (browserAvailable === false || !host.browser)
       const terminalUnavailable = tab === 'Terminal' && (terminalAvailable === false || !host.terminal)
       const unavailable = browserUnavailable || terminalUnavailable
@@ -2863,24 +2955,54 @@ function ToolQuickRail({ variant, activeTab, toolsCollapsed, onSelect, host, bro
       return <button key={tab} className={`tool-rail-button${active ? ' active' : ''}`} aria-label={tab} aria-current={active ? 'page' : undefined} aria-disabled={unavailable || undefined} disabled={unavailable} title={unavailable ? unavailableTitle : tab} onClick={() => onSelect(tab)}>
         <span className="tool-rail-icon" aria-hidden="true" style={{ width: 13 * toolRailIcons[tab].ratio, WebkitMaskImage: `url(${toolRailIcons[tab].src})`, maskImage: `url(${toolRailIcons[tab].src})` }} />
         {tab === 'Subagents' && subagentsRunningCount > 0 && <span className="tool-rail-running" aria-label={`${subagentsRunningCount} 个运行中的 subagent`}>{subagentsRunningCount}</span>}
+        {tab === 'Plan' && planProgress && <span className="tool-rail-running tool-rail-progress" data-testid="tool-rail-plan-progress" aria-label={`计划进度 ${planProgress.completed}/${planProgress.total}`}>{planProgress.completed}/{planProgress.total}</span>}
       </button>
     })}
   </nav>
 }
-function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, onBack, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted, onManualSubagentStatusCheck, browserAvailable, browserOccluded, terminalAvailable, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument }: { activeTab: PanelTab; collapsed: boolean; onToggleCollapsed: () => void; rail?: ReactNode; canGoBack: boolean; onBack: () => void; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningCountChange: (count: number) => void; onSubagentStarted: () => void; onManualSubagentStatusCheck: (agentIDs: string[]) => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void }) {
+function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, onBack, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted, onManualSubagentStatusCheck, browserAvailable, browserOccluded, terminalAvailable, planAvailable, onPlanProgressChange, onHasPlansChange, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument, onDropDocuments }: { activeTab: PanelTab; collapsed: boolean; onToggleCollapsed: () => void; rail?: ReactNode; canGoBack: boolean; onBack: () => void; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningCountChange: (count: number) => void; onSubagentStarted: () => void; onManualSubagentStatusCheck: (agentIDs: string[]) => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; planAvailable: boolean | undefined; onPlanProgressChange: (progress: { completed: number; total: number } | null) => void; onHasPlansChange: (sessionId: string, hasPlans: boolean) => void; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void; onDropDocuments: (paths: string[]) => void }) {
   const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null)
   const [terminalMounted, setTerminalMounted] = useState(activeTab === 'Terminal')
   const [documentMounted, setDocumentMounted] = useState(activeTab === 'Document')
   const [browserMounted, setBrowserMounted] = useState(activeTab === 'Browser')
+  const [dropActive, setDropActive] = useState(false)
+  const dropDepthRef = useRef(0)
   useEffect(() => {
     if (activeTab === 'Terminal') setTerminalMounted(true)
     if (activeTab === 'Document') setDocumentMounted(true)
     if (activeTab === 'Browser') setBrowserMounted(true)
   }, [activeTab])
-  return <aside className="tool-panel">
+  const hasFiles = (event: DragEvent) => Array.from(event.dataTransfer?.types ?? []).includes('Files')
+  const onDragEnter = (event: DragEvent) => {
+    if (!hasFiles(event)) return
+    consumeFileDropEvent(event)
+    dropDepthRef.current += 1
+    setDropActive(true)
+  }
+  const onDragOver = (event: DragEvent) => {
+    if (!hasFiles(event)) return
+    consumeFileDropEvent(event)
+  }
+  const onDragLeave = (event: DragEvent) => {
+    if (!hasFiles(event)) return
+    consumeFileDropEvent(event)
+    dropDepthRef.current = Math.max(0, dropDepthRef.current - 1)
+    if (dropDepthRef.current === 0) setDropActive(false)
+  }
+  const onDrop = (event: DragEvent) => {
+    consumeFileDropEvent(event)
+    dropDepthRef.current = 0
+    setDropActive(false)
+    const getPath = typeof window !== 'undefined' ? window.pipiPathForFile : undefined
+    if (!getPath) return
+    onDropDocuments(supportedDocumentPathsFromFiles(event.dataTransfer.files, getPath))
+  }
+  return <aside className={`tool-panel${dropActive ? ' drop-target' : ''}`} onDragEnter={onDragEnter} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}>
+    <div className="tool-panel-drop-overlay" aria-hidden="true" />
     {!collapsed && <header className="tool-panel-header">{rail}{canGoBack && <button type="button" className="tool-panel-back" data-testid="tool-panel-back" aria-label="返回上一栏" onClick={onBack}>‹ 返回</button>}<div className="tool-panel-header-slot" ref={el => setHeaderSlot(el)} /><button className="pane-toggle" data-testid="toggle-tools" title="收起右栏" aria-label="收起右栏" aria-expanded="true" onClick={onToggleCollapsed}><RightPaneToggleIcon expanded /></button></header>}
     <div className="tool-content">
       <div className="tool-page subagent-content" hidden={activeTab !== 'Subagents'}><SubagentPanel host={host} sessionId={sessionId} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} visible={activeTab === 'Subagents' && !collapsed} headerSlot={headerSlot} onRunningCountChange={onSubagentsRunningCountChange} onAgentStarted={onSubagentStarted} onManualStatusCheck={onManualSubagentStatusCheck} /></div>
+      {planAvailable === false ? (activeTab === 'Plan' ? <div className="tool-page"><div className="empty-panel" data-testid="plan-unavailable"><b>Plan 不可用</b><p>当前连接未提供计划能力。</p></div></div> : null) : <div className="tool-page plan-content" hidden={activeTab !== 'Plan'}><PlanPanel host={host} sessionId={sessionId} visible={activeTab === 'Plan' && !collapsed} headerSlot={headerSlot} onProgressChange={onPlanProgressChange} onHasPlansChange={onHasPlansChange} /></div>}
       {activeTab === 'Terminal' && terminalAvailable === false ? <div className="tool-page"><div className="empty-panel" data-testid="terminal-unavailable"><b>Terminal 不可用</b><p>当前连接未提供终端能力。</p></div></div> : terminalMounted || activeTab === 'Terminal' ? <div className="tool-page terminal-content" hidden={activeTab !== 'Terminal'}><TerminalPanel host={host} theme={theme} sessionId={sessionId} announcedTerminal={announcedTerminal} revealedTerminalId={revealedTerminalId} projectId={projectId} projectPath={projectPath} visible={activeTab === 'Terminal'} headerSlot={headerSlot} /></div> : null}
       {documentMounted || activeTab === 'Document' ? <div className="tool-page document-content" hidden={activeTab !== 'Document'}><DocumentPanel host={host} documentPath={openedDocumentPath} /></div> : null}
       {browserMounted || activeTab === 'Browser' ? <div className="tool-page browser-content" hidden={activeTab !== 'Browser'}>{browserAvailable === true && host.browser ? <BrowserPanel host={host} sessionId={sessionId} occluded={browserOccluded || activeTab !== 'Browser'} headerSlot={headerSlot} /> : <div className="empty-panel browser-placeholder" data-testid="browser-unavailable"><b>Browser 不可用</b><p>{browserAvailable === undefined ? '正在检查当前连接的浏览器能力…' : '当前连接未提供桌面浏览器能力。'}</p></div>}</div> : null}

@@ -19,6 +19,7 @@ import {
   type AuthType,
   type DocumentContent,
   type DocumentErrorCode,
+  type DocumentSummary,
   type HostBackend,
   type HostEvent,
   type HostMethod,
@@ -30,13 +31,17 @@ import {
   type Project,
   type QueueEnqueueResult,
   type QuotaSnapshot,
+  type PlanSnapshot,
   type Session,
   type SessionStats,
   type SubagentModelSetting,
   type ThinkingLevel,
   type ThinkingLevelMap,
+  type UserMcpServer,
   type WorktreeStatus,
 } from "@pipi/host-api";
+import { PlanStore, readPlanStore } from "./plan-store.js";
+import { readUserMcpServers } from "./user-mcp-servers.js";
 import {
   assemblePiSpawn,
   defaultRuntimeRoot,
@@ -53,6 +58,8 @@ import { LeaseManager } from "./lease.js";
 import { checkoutBranch, initGit, probeGit, probeGitBinary } from "./git.js";
 import { HostBridge } from "./bridge.js";
 import { DEFAULT_FEATURES } from "./features.js";
+import { DocumentFileWatcher } from "./document-watch.js";
+import { buildDocumentsOpenedInjection, DocumentInjectionStore, prependDocumentInjection } from "./document-inject.js";
 import { ProviderAuthBackend, type AuthRuntimeLike } from "./provider-auth.js";
 import { ExternalAuthRuntime } from "./external-auth-runtime.js";
 import {
@@ -949,6 +956,16 @@ async function readHistory(
 
 const TERMINAL_DURABILITY_TAIL_BYTES = 1024 * 1024;
 type FinalAssistantIdentity = { timestamp: number; responseId?: string };
+function asFinalAssistantTimestamp(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  if (typeof value === "string") {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric > 0) return numeric;
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return undefined;
+}
 async function isLatestDurableFinalAssistant(path: string, identity: FinalAssistantIdentity): Promise<boolean> {
   try {
     const stat = await fs.stat(path);
@@ -975,7 +992,7 @@ async function isLatestDurableFinalAssistant(path: string, identity: FinalAssist
       const message = entry.message;
       return message?.role === "assistant"
         && message.stopReason === "stop"
-        && message.timestamp === identity.timestamp
+        && asFinalAssistantTimestamp(message.timestamp) === identity.timestamp
         && (identity.responseId === undefined || message.responseId === identity.responseId);
     }
   } catch {
@@ -1158,9 +1175,82 @@ function isCachedAgentLog(value: unknown): value is CachedAgentLog {
   if (value.charCount !== undefined && typeof value.charCount !== "number") return false;
   return true;
 }
+
+function parsePositiveInt(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return Math.floor(value);
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+  }
+  return undefined;
+}
+
+function extractContextWindowFromModelEntry(entry: unknown): number | undefined {
+  if (!entry || typeof entry !== "object") return undefined;
+  const rec = entry as Record<string, unknown>;
+  const keys = ["context_length", "context_window", "contextWindow", "max_model_len", "max_context_length", "context"];
+  for (const key of keys) {
+    const parsed = parsePositiveInt(rec[key]);
+    if (parsed !== undefined) return parsed;
+  }
+  const limits = rec.limits;
+  if (limits && typeof limits === "object") {
+    const nested = limits as Record<string, unknown>;
+    return parsePositiveInt(nested.context) ?? parsePositiveInt(nested.context_length);
+  }
+  return undefined;
+}
+
+async function fetchCompatModelsCatalog(baseUrl: string, apiKey: string): Promise<unknown[]> {
+  const url = `${baseUrl.replace(/\/+$/, "")}/models`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    });
+    if (!response.ok) return [];
+    const json: unknown = await response.json();
+    return Array.isArray(json)
+      ? json
+      : json && typeof json === "object" && Array.isArray((json as { data?: unknown }).data)
+        ? (json as { data: unknown[] }).data
+        : [];
+  } catch (error) {
+    console.warn("compat provider context probe failed", error);
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function contextWindowFromCompatList(list: unknown[], modelId: string): number | undefined {
+  const entry = list.find((item: unknown) => {
+    if (!item || typeof item !== "object") return false;
+    const rec = item as Record<string, unknown>;
+    return rec.id === modelId || rec.name === modelId;
+  });
+  return extractContextWindowFromModelEntry(entry);
+}
+
+async function probeCompatContextWindow(baseUrl: string, apiKey: string, modelId: string): Promise<number | undefined> {
+  const list = await fetchCompatModelsCatalog(baseUrl, apiKey);
+  return contextWindowFromCompatList(list, modelId);
+}
+
 export class PiHostBackend implements HostBackend {
   readonly protocolVersion = 2 as const;
   private listeners = new Set<(event: HostEvent) => void>();
+  private openedDocumentPaths: string[] = [];
+  private readonly documentInjections = new DocumentInjectionStore();
+  private readonly documentWatcher = new DocumentFileWatcher((path) => {
+    emitFrame(this.listeners, {
+      protocolVersion: PIPI_HOST_PROTOCOL_VERSION,
+      channel: "document",
+      event: { type: "documentChanged", path },
+    });
+  });
   private readonly projectionDebugBackendTag = `backend#${projectionDebugBackendSerial += 1}`;
   private projectionDebugSessionSerial = 0;
   private projectionDebugAgentSerial = 0;
@@ -1169,6 +1259,8 @@ export class PiHostBackend implements HostBackend {
   private projectionDebugProvenance = new Map<string, string>();
   private projectionDebugFilePath: string | null | undefined;
   private live = new Map<string, Live>();
+  private readonly planStore = new PlanStore();
+  private planRuntimeMounted: boolean | undefined;
   private leases = new Map<string, LeaseManager>();
   /**
    * Per-session in-flight spawn (ensure) promises. Concurrent ensure() calls for
@@ -1238,6 +1330,11 @@ export class PiHostBackend implements HostBackend {
   private modelsLoaded?: Promise<void>;
   /** True only after configured and auth-aware runtime catalogs have been merged successfully. */
   private modelCatalogReady = false;
+  /** One /models probe per backend lifetime per normalized baseUrl. */
+  private probedCompatBaseUrls = new Set<string>();
+  private modelsJsonUnwritableWarned = false;
+  /** Latest fire-and-forget contextWindow backfill (tests may await). */
+  compatContextBackfill?: Promise<void>;
   private configuredModels: Model[] = [];
   /** Cached, deduped pi runtime model catalog for the current auth epoch.
    * Set to undefined by refreshModelsAfterAuthChange so login/logout re-fetches. */
@@ -1530,6 +1627,7 @@ export class PiHostBackend implements HostBackend {
     await this.bridge.close();
     const live = [...this.live.values()];
     this.live.clear();
+    this.planStore.clear();
     for (const item of live) {
       item.compaction.dispose();
       for (const pending of item.pending.values())
@@ -1555,6 +1653,7 @@ export class PiHostBackend implements HostBackend {
     // Bounded wait for already-queued stats lines; a hung append must not block exit.
     await this.toolBatchTelemetry.close();
     this.leases.clear();
+    this.documentWatcher.stop();
     this.listeners.clear();
   }
   private stream(event: any) {
@@ -1706,10 +1805,19 @@ export class PiHostBackend implements HostBackend {
     await this.loadQueue(id);
     const result = this.queue.enqueue(id, { text, attachments });
     if (result.outcome === "dispatched") await this.queue.waitForDispatch(id);
+    else this.retryPendingFinalReconciliation(id);
     return {
       outcome: result.outcome === "dispatched" ? "direct" : "queued",
       message: result.message,
     };
+  }
+  /** A later user prompt must be able to wake a missed-settled turn and drain. */
+  private retryPendingFinalReconciliation(sessionId: string): void {
+    const live = this.live.get(sessionId);
+    const pending = live?.pendingFinalReconciliation;
+    if (!live || !pending) return;
+    if (live.turnEpoch !== pending.epoch || live.terminalEpoch === pending.epoch) return;
+    void this.reconcileFinalAssistantTurn(live, pending.epoch, pending.identity);
   }
   private index(): Promise<SessionMeta[]> {
     // A single session selection fires several locate() calls at once; share one
@@ -1949,11 +2057,21 @@ export class PiHostBackend implements HostBackend {
         return this.renameProject(params[0] as string, params[1]);
       case "revealProject":
         return this.revealProject(params[0] as string);
+      case "listUserMcpServers":
+        return this.listUserMcpServers(params[0]);
       case "listDocuments":
-        // Documents are opened explicitly from transcript references; never scan a project.
-        return [];
+        return this.listOpenedDocuments();
       case "readDocument":
         return readLocalDocument(params[0]);
+      case "watchDocument":
+        this.rememberOpenedDocuments([params[0]]);
+        this.documentWatcher.setPath(typeof params[0] === "string" ? params[0].trim() : null);
+        return undefined;
+      case "unwatchDocument":
+        this.documentWatcher.stop();
+        return undefined;
+      case "notifyDocumentsDropped":
+        return this.notifyDocumentsDropped(params[0], params[1]);
       case "listSessions": {
         const pid = params[0] as string;
         const paths = await this.loadProjectPaths();
@@ -1996,6 +2114,7 @@ export class PiHostBackend implements HostBackend {
         // Revoke tool authority before any asynchronous filesystem/process
         // cleanup; otherwise a stale Pi process can recreate deleted resources.
         this.bridge.unregister(s.header.id);
+        this.planStore.forget(s.header.id);
         this.terminalSessionDeleted?.(s.header.id);
         await this.leases.get(s.header.id)?.release();
         this.leases.delete(s.header.id);
@@ -2235,6 +2354,8 @@ export class PiHostBackend implements HostBackend {
         return initGit(await this.pickedDirectory(params[0]));
       case "probeGitBinary":
         return probeGitBinary();
+      case "getPlans":
+        return this.getPlans(params[0] as string | undefined);
       case "capabilities":
         return {
           computerUse: Boolean(
@@ -2245,11 +2366,56 @@ export class PiHostBackend implements HostBackend {
           revealInFinder: true,
           terminal: true,
           git: true,
-          plan: false,
+          plan: this.planRuntimeAvailable(),
           retainedWorktreeDisposition: false,
           compact: true,
         };
     }
+  }
+  private rememberOpenedDocuments(input: unknown): void {
+    const paths = Array.isArray(input) ? input : [input];
+    for (const raw of paths) {
+      if (typeof raw !== "string") continue;
+      const path = raw.trim();
+      if (!path || !isAbsolute(path) || !documentKindForName(path)) continue;
+      if (!this.openedDocumentPaths.includes(path)) this.openedDocumentPaths.push(path);
+    }
+  }
+  private async listOpenedDocuments(): Promise<DocumentSummary[]> {
+    const out: DocumentSummary[] = [];
+    for (const path of this.openedDocumentPaths) {
+      const kind = documentKindForName(path);
+      if (!kind) continue;
+      try {
+        const stat = await fs.stat(path);
+        out.push({ id: path, name: basename(path), path, kind, size: stat.size, updatedAt: stat.mtimeMs });
+      } catch {
+        out.push({ id: path, name: basename(path), path, kind });
+      }
+    }
+    return out;
+  }
+  private async notifyDocumentsDropped(sessionId: unknown, paths: unknown): Promise<void> {
+    const list = Array.isArray(paths) ? paths.filter((item): item is string => typeof item === "string") : [];
+    this.rememberOpenedDocuments(list);
+    const supported = list.map((item) => item.trim()).filter((item) => item && isAbsolute(item) && documentKindForName(item));
+    if (!supported.length) return;
+    const injection = await buildDocumentsOpenedInjection(supported);
+    if (!injection) return;
+    if (typeof sessionId !== "string" || !sessionId.trim()) {
+      console.warn("[document-drop] no active session; skip announce");
+      return;
+    }
+    const id = sessionId.trim();
+    if (this.queue.isBusy(id) && this.live.has(id)) {
+      try {
+        await this.command(id, { type: "steer", message: injection });
+        return;
+      } catch (error) {
+        console.warn("[document-drop]", error);
+      }
+    }
+    this.documentInjections.setPending(id, injection, supported);
   }
   /** Git operations run in a known project work tree only — never in an id-derived path. */
   private async projectPath(projectId: string): Promise<string> {
@@ -2535,6 +2701,7 @@ export class PiHostBackend implements HostBackend {
     if (this.profileMode === "isolated") await this.ensureIsolatedProjectHome(found.header.cwd);
     const output = assemblePiSpawn({
       sessionPath: found.path,
+      sessionId: id,
       cwd: found.header.cwd,
       runtimeRoot: this.runtimeRoot,
       ...this.isolatedProjectPaths(found.header.cwd),
@@ -2631,9 +2798,11 @@ export class PiHostBackend implements HostBackend {
         this.reconcileOrphanedNow(id);
         if (!this.closed) void this.queueIdle(id, live.turnEpoch);
       };
-      const lease = this.leases.get(id);
-      if (lease) void lease.release().catch(() => undefined).finally(finish);
-      else finish();
+      // Keep the writer lease after Pi exits. Releasing here let another
+      // pipiui-electron (dev:browser, a second App) steal the file while this
+      // UI still looked writable, then the next send failed with
+      // "session is read-only: held by pipiui-electron".
+      finish();
     });
     if (this.closed) {
       await this.stopLiveProcess(live);
@@ -2879,8 +3048,8 @@ export class PiHostBackend implements HostBackend {
           part?.type === "toolCall" || part?.type === "tool_call" || part?.type === "tool_use"))
       ) {
         const epoch = live.turnEpoch;
-        const timestamp = Number(message.timestamp);
-        const identity = Number.isFinite(timestamp) && timestamp > 0
+        const timestamp = asFinalAssistantTimestamp(message.timestamp);
+        const identity = timestamp !== undefined
           ? {
               timestamp,
               ...(typeof message.responseId === "string" && message.responseId
@@ -2965,7 +3134,8 @@ export class PiHostBackend implements HostBackend {
     return true;
   }
   private terminalReconciliationHasPendingWork(live: Live, state: any): boolean {
-    const hasActionableQueue = this.queue.listQueue(live.session.id).some(item => item.state === "queued" || item.state === "sending");
+    // Host-queued user prompts are why we must settle: notifyIdle drains them.
+    // Counting them as pending work deadlocks "typed after a missed agent_settled".
     const hasRunningAgent = [...this.agents.values()].some(agent =>
       agent.sessionId === live.session.id && (agent.state === "running" || agent.state === "stalled"));
     return state?.pendingMessageCount !== 0
@@ -2974,7 +3144,6 @@ export class PiHostBackend implements HostBackend {
       || live.pendingDrainPrompt !== undefined
       || live.compactionHoldsQueue === true
       || live.compaction.isCompacting
-      || hasActionableQueue
       || hasRunningAgent;
   }
   private debugTerminalReconciliation(
@@ -3507,6 +3676,16 @@ export class PiHostBackend implements HostBackend {
     await this.saveProjectNames(next);
     return this.project(path, next);
   }
+  private async listUserMcpServers(projectId: unknown): Promise<UserMcpServer[]> {
+    if (typeof projectId !== "string" || !projectId.trim()) return [];
+    let root: string;
+    try {
+      root = await this.projectPath(projectId);
+    } catch {
+      return [];
+    }
+    return readUserMcpServers(join(root, ".pi", "mcp.json"));
+  }
   private async revealProject(projectId: string): Promise<void> {
     const path = await this.projectPath(projectId);
     let stat;
@@ -3824,6 +4003,7 @@ export class PiHostBackend implements HostBackend {
       }
     }
     this.modelCatalogReady = true;
+    this.scheduleCompatContextBackfill();
   }
   /** Rebuild after pi login/logout while preserving still-configured literal/env-key models. */
   private async refreshModelsAfterAuthChange(
@@ -3894,6 +4074,7 @@ export class PiHostBackend implements HostBackend {
     const baseUrl = typeof input.baseUrl === "string" ? input.baseUrl.trim() : "";
     const apiKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
     const modelId = typeof input.modelId === "string" ? input.modelId.trim() : "";
+    const explicitContextWindow = parsePositiveInt(input.contextWindow);
     if (!name) throw new Error("名称不能为空");
     if (!baseUrl) throw new Error("URL 不能为空");
     if (!/^https?:\/\//i.test(baseUrl)) throw new Error("URL 必须是 http(s) 地址");
@@ -3921,8 +4102,20 @@ export class PiHostBackend implements HostBackend {
     }
     const existing = providers[uniqueId] && typeof providers[uniqueId] === "object" ? providers[uniqueId] : {};
     const models = Array.isArray(existing.models) ? [...existing.models] : [];
-    if (!models.some((m: any) => m && m.id === modelId)) {
-      models.push({ id: modelId, name: modelId, reasoning: true });
+    let contextWindow = explicitContextWindow;
+    if (contextWindow === undefined) {
+      contextWindow = await probeCompatContextWindow(baseUrl, apiKey, modelId);
+    }
+    const existingIndex = models.findIndex((m: any) => m && m.id === modelId);
+    if (existingIndex < 0) {
+      models.push({
+        id: modelId,
+        name: modelId,
+        reasoning: true,
+        ...(contextWindow !== undefined ? { contextWindow } : {}),
+      });
+    } else if (contextWindow !== undefined && parsePositiveInt(models[existingIndex]?.contextWindow) === undefined) {
+      models[existingIndex] = { ...models[existingIndex], contextWindow };
     }
     providers[uniqueId] = {
       ...existing,
@@ -3938,6 +4131,109 @@ export class PiHostBackend implements HostBackend {
     await fs.rename(temporary, modelsPath);
     await this.refreshModelsAfterAuthChange(false);
     return { providerId: uniqueId };
+  }
+
+  private scheduleCompatContextBackfill(): void {
+    if (this.compatContextBackfill) return;
+    this.compatContextBackfill = this.backfillCompatContextWindows().catch((error) => {
+      console.warn("compat provider context backfill failed", error);
+    });
+  }
+
+  private resolveLiteralApiKey(raw: unknown): string | undefined {
+    if (typeof raw !== "string") return undefined;
+    const key = raw.trim();
+    if (!key) return undefined;
+    if (key.startsWith("$")) {
+      const envVal = this.env[key.slice(1)];
+      return typeof envVal === "string" && envVal.trim() ? envVal.trim() : undefined;
+    }
+    return key;
+  }
+
+  private async modelsJsonWritable(modelsPath: string): Promise<boolean> {
+    try {
+      await fs.access(modelsPath, fsConstants.W_OK);
+      return true;
+    } catch (error: any) {
+      if (error?.code === "ENOENT") return true;
+      if (!this.modelsJsonUnwritableWarned) {
+        this.modelsJsonUnwritableWarned = true;
+        console.warn("compat provider context backfill skipped: models.json is not writable");
+      }
+      return false;
+    }
+  }
+
+  private async backfillCompatContextWindows(): Promise<void> {
+    const modelsPath = join(this.agentDir, "models.json");
+    if (!(await this.modelsJsonWritable(modelsPath))) return;
+    let catalog: any;
+    try {
+      catalog = JSON.parse(await fs.readFile(modelsPath, "utf8"));
+    } catch {
+      return;
+    }
+    if (!catalog || typeof catalog !== "object") return;
+    const providers = catalog.providers && typeof catalog.providers === "object" ? catalog.providers : null;
+    if (!providers) return;
+
+    type Need = { providerId: string; baseUrl: string; apiKey: string; models: any[] };
+    const needs: Need[] = [];
+    for (const [providerId, raw] of Object.entries(providers)) {
+      if (!raw || typeof raw !== "object") continue;
+      const entry = raw as Record<string, unknown>;
+      if (entry.api !== "openai-completions") continue;
+      const baseUrl = typeof entry.baseUrl === "string" ? entry.baseUrl.trim() : "";
+      if (!/^https?:\/\//i.test(baseUrl)) continue;
+      const apiKey = this.resolveLiteralApiKey(entry.apiKey);
+      if (!apiKey) continue;
+      const models = Array.isArray(entry.models) ? entry.models : [];
+      if (!models.some((m: any) => m && typeof m.id === "string" && parsePositiveInt(m.contextWindow) === undefined)) continue;
+      needs.push({ providerId, baseUrl, apiKey, models });
+    }
+    if (needs.length === 0) return;
+
+    const byBase = new Map<string, Need[]>();
+    for (const need of needs) {
+      const key = need.baseUrl.replace(/\/+$/, "");
+      const list = byBase.get(key) ?? [];
+      list.push(need);
+      byBase.set(key, list);
+    }
+
+    let wrote = false;
+    for (const [normalized, group] of byBase) {
+      if (this.probedCompatBaseUrls.has(normalized)) continue;
+      this.probedCompatBaseUrls.add(normalized);
+      const { baseUrl, apiKey } = group[0];
+      const list = await fetchCompatModelsCatalog(baseUrl, apiKey);
+      if (list.length === 0) continue;
+      for (const need of group) {
+        const nextModels = need.models.map((model: any) => {
+          if (!model || typeof model !== "object" || typeof model.id !== "string") return model;
+          if (parsePositiveInt(model.contextWindow) !== undefined) return model;
+          const window = contextWindowFromCompatList(list, model.id);
+          if (window === undefined) return model;
+          wrote = true;
+          return { ...model, contextWindow: window };
+        });
+        providers[need.providerId] = { ...(providers[need.providerId] as object), models: nextModels };
+      }
+    }
+    if (!wrote) return;
+    try {
+      const temporary = join(this.agentDir, `.models.json-${process.pid}-${Date.now()}.tmp`);
+      await fs.writeFile(temporary, `${JSON.stringify(catalog, null, 2)}\n`);
+      await fs.rename(temporary, modelsPath);
+    } catch (error) {
+      if (!this.modelsJsonUnwritableWarned) {
+        this.modelsJsonUnwritableWarned = true;
+        console.warn("compat provider context backfill skipped: models.json is not writable", error);
+      }
+      return;
+    }
+    await this.refreshModelCatalog();
   }
 
   private async removeProviderCredentials(
@@ -4105,9 +4401,10 @@ export class PiHostBackend implements HostBackend {
     const plan = attachments.length && behavior !== "follow_up"
       ? await this.visionDescribePlan(live)
       : { active: false, visionRef: null };
+    const promptText = prependDocumentInjection(payload.text, this.documentInjections.takePending(id));
     const message = attachments.length
-      ? await this.prepareImageMessage(live, payload.text, attachments, plan.active)
-      : payload.text;
+      ? await this.prepareImageMessage(live, promptText, attachments, plan.active)
+      : promptText;
     const body: Rpc = {
       type:
         behavior === "steer"
@@ -4955,12 +5252,57 @@ export class PiHostBackend implements HostBackend {
     );
   }
   /**
-   * Reserved for a future Plan store. The default feature set never mounts a Plan runtime and
-   * capabilities report false until this handler persists revisioned state.
+   * True only when a session would actually mount the plan tools: the feature is
+   * enabled *and* the runtime file resolves in the installed tree. Resolved once
+   * per backend — a host missing the extension must not advertise a Plan surface
+   * that can never receive an event.
+   */
+  private planRuntimeAvailable(): boolean {
+    if (!this.features.plan) return false;
+    if (this.planRuntimeMounted === undefined)
+      this.planRuntimeMounted = Boolean(resolveSpawnPaths(this.refreshRuntimeTree()).planRuntime);
+    return this.planRuntimeMounted;
+  }
+  /**
+   * One `plan_event` from the bundled plan runtime. The extension already wrote
+   * `.pi/plans/current.json`; this mirrors the snapshot for the Plan panel and
+   * republishes it on the `plan` channel. An unrecognizable payload is dropped
+   * rather than thrown — the worker's reporting call must still succeed.
    */
   private planEvent(event: Record<string, unknown>, sessionId: string) {
-    void event;
-    void sessionId;
+    const published = this.planStore.accept(event, sessionId);
+    if (!published) return;
+    // The live event supersedes whatever the file said; no cold read can undo it.
+    this.planStore.markHydrated(sessionId);
+    emitFrame(this.listeners, {
+      protocolVersion: PIPI_HOST_PROTOCOL_VERSION,
+      channel: "plan",
+      event: published,
+    });
+  }
+  /**
+   * Plans for one session: the live mirror, backfilled once from the project's
+   * plan file so a resumed session shows the plan it was already executing.
+   */
+  private async getPlans(sessionId?: string): Promise<PlanSnapshot[]> {
+    const id = sessionId ?? [...this.live.keys()].at(-1);
+    if (!id) return [];
+    if (this.planStore.needsHydration(id)) {
+      const cwd = await this.planCwd(id);
+      if (cwd) this.planStore.merge(id, await readPlanStore(cwd, id));
+      this.planStore.markHydrated(id);
+    }
+    return this.planStore.list(id);
+  }
+  /** Work tree a session's plan file lives in: the running cwd, else the JSONL header. */
+  private async planCwd(sessionId: string): Promise<string | null> {
+    const live = this.live.get(sessionId);
+    if (live) return live.cwd;
+    try {
+      return (await this.findSession(sessionId)).header.cwd;
+    } catch {
+      return null;
+    }
   }
 	private waitForAgentTerminal(agentId: string, sessionId: string, runId: string, timeoutMs = 15_000): Promise<void> {
 		const key = this.agentKey(agentId, sessionId, runId);

@@ -1,4 +1,6 @@
 /** Versioned, transport-neutral contract used by every Pipi UI. */
+export * from "./plan.js";
+import type { PlanEvent, PlanSnapshot } from "./plan.js";
 export const PIPI_HOST_PROTOCOL_VERSION = 2 as const;
 /** Stable Electron IPC channel for the Pipi host protocol. */
 export const PIPI_HOST_IPC_CHANNEL = "pipi-host:v1";
@@ -68,6 +70,43 @@ export function documentKindForName(name: string): DocumentKind | null {
   const normalized = name.toLowerCase();
   const extension = Object.keys(DOCUMENT_KIND_BY_EXTENSION).find(candidate => normalized.endsWith(candidate));
   return extension ? DOCUMENT_KIND_BY_EXTENSION[extension as SupportedDocumentExtension] : null;
+}
+export function documentsDroppedAnnouncement(paths: readonly string[]): string {
+  const listed = paths.filter(path => path.trim() && documentKindForName(path)).join("、");
+  return `[文档面板] 用户拖拽打开了文档：${listed}。文件在磁盘上，可读取与编辑；面板会自动刷新。`;
+}
+export const DOCUMENT_INJECTION_EXCERPT_LIMIT = 24_000;
+export type DocumentInjectionEntry = {
+  path: string;
+  kind?: DocumentKind | null;
+  excerpt?: string;
+  size?: number;
+  binary?: boolean;
+};
+function formatDocumentSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+/** Path + readable excerpt (or a binary read hint) so the model can see an opened document. */
+export function documentsOpenedInjection(entries: readonly DocumentInjectionEntry[]): string {
+  const blocks: string[] = [];
+  for (const entry of entries) {
+    const path = entry.path.trim();
+    if (!path || !documentKindForName(path)) continue;
+    const kind = entry.kind ?? documentKindForName(path);
+    const excerpt = entry.excerpt?.trim();
+    if (excerpt) {
+      blocks.push(`[文档面板] 用户打开了文档：${path}\n--- 文档内容 ---\n${excerpt}`);
+      continue;
+    }
+    const size = typeof entry.size === "number" ? `，约 ${formatDocumentSize(entry.size)}` : "";
+    const hint = entry.binary
+      ? `。文件已在右侧面板打开（${kind}${size}）；请用 read 工具读取该路径以查看正文。`
+      : `。文件在磁盘上，可读取与编辑；面板会自动刷新。`;
+    blocks.push(`[文档面板] 用户打开了文档：${path}${hint}`);
+  }
+  return blocks.join("\n\n");
 }
 export type DocumentSummary = { id: string; name: string; path: string; kind: DocumentKind; size?: number; updatedAt?: number };
 export type TextDocumentContent = DocumentSummary & { kind: "markdown" | "plain"; content: string; bytes?: never };
@@ -378,6 +417,13 @@ export interface BrowserHostAPI {
 /** Base64-encoded image attached to a tool result (screenshots, generated images, etc.). */
 export type TranscriptImage = { data: string; mimeType: string };
 
+/** Settings → 扩展 → 你添加的. Never includes env or secrets. */
+export type UserMcpServer = {
+  name: string;
+  transport: string;
+  summary: string;
+};
+
 export type StreamEvent =
   | { type: "user_message"; sessionId: string; content: string; id?: string }
   | { type: "text"; sessionId: string; contentIndex: number; delta: string; segment?: number }
@@ -404,12 +450,15 @@ export type StreamEvent =
    */
   | { type: "compaction"; sessionId: string; phase: "start" | "end"; reason?: string; aborted?: boolean; error?: string };
 export type AgentEvent = { type: "agent"; agent: AgentSummary } | { type: "agent_log"; /** Optional only so an older host event can be ignored safely; current hosts always emit both identity fields. */ sessionId?: string; agentId: string; runId?: string; itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; /** Runtime log_delta key: cumulative full text per streamed entry, so the panel can upsert one row per contentIndex instead of one per chunk. */ contentIndex?: number; /** Uncapped thinking length; preview `text` may still be sliced. */ charCount?: number; /** Turn boundary from runtime `kind:"log"`: forget contentIndex slots so the next message's index 0 opens a new row instead of rewriting the previous thinking/text. */ resetStreamSlots?: boolean } | { type: "worktree"; status: WorktreeStatus };
+export type DocumentEvent = { type: "documentChanged"; path: string };
 export type HostEvent =
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "stream"; event: StreamEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "agents"; event: AgentEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "terminal"; event: TerminalEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "browser"; event: BrowserEvent }
-  | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "session_stats"; event: SessionStatsEvent };
+  | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "session_stats"; event: SessionStatsEvent }
+  | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "document"; event: DocumentEvent }
+  | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "plan"; event: PlanEvent };
 
 export interface PipiHostAPI {
   readonly protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION;
@@ -427,6 +476,12 @@ export interface PipiHostAPI {
   renameProject?(projectId: string, name: string): Promise<Project>;
   /** Optional: absent or unsupported v2 hosts let the UI use its local preview fallback. */
   listDocuments?(projectId?: string): Promise<DocumentSummary[]>; readDocument?(documentId: string): Promise<DocumentContent>;
+  /** Watch the displayed document; switch unwatches the previous path. Watch errors stay silent. */
+  watchDocument?(path: string): Promise<void>;
+  unwatchDocument?(): Promise<void>;
+  subscribeDocuments?(listener: (event: DocumentEvent) => void): Unsubscribe;
+  /** Open or drop: remember the documents and inject path+excerpt into the session. */
+  notifyDocumentsDropped?(sessionId: string, paths: string[]): Promise<void>;
   newSession(projectId: string, name?: string): Promise<Session>; resumeSession(sessionId: string): Promise<Session>; renameSession(sessionId: string, name: string): Promise<Session>; deleteSession(sessionId: string): Promise<void>; moveSession(sessionId: string, targetProjectId: string): Promise<Session>;
   /** Newest-first paging cursor: an entry id is stable/exclusive; numeric newest-relative offsets remain supported for compatibility. */
   getSessionHistory(sessionId: string, before?: number | string, limit?: number): Promise<HistoryEntry[]>;
@@ -505,6 +560,7 @@ export interface PipiHostAPI {
     baseUrl: string;
     apiKey: string;
     modelId: string;
+    contextWindow?: number;
   }): Promise<{ providerId: string }>;
   /** Electron-only: open an auth URL in the user's browser (safe http/https only). */
   openExternal?(url: string): Promise<void>;
@@ -527,6 +583,14 @@ export interface PipiHostAPI {
   getQuotaSnapshot?(sessionId?: string): Promise<QuotaSnapshot | null>;
   /** Current snapshot; omit sessionId only for hosts that intentionally aggregate all sessions. */
   listAgents(sessionId?: string): Promise<AgentSummary[]>; getAgentLogs(agentId: string, sessionId: string, runId: string, scope?: "run" | "agent"): Promise<{ itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; contentIndex?: number; charCount?: number }[]>; subscribeAgents(listener: (event: AgentEvent) => void): Unsubscribe; subscribeAgentLog(agentId: string, listener: (event: Extract<AgentEvent, { type: "agent_log" }>) => void, sessionId: string, runId: string): Unsubscribe; abortAgent(agentId: string): Promise<void>; resolveAgent(agentId: string): Promise<void>; checkAgent(agentId: string): Promise<AgentSummary>; getWorktreeStatus(agentId: string): Promise<WorktreeStatus>; mergeWorktree(agentId: string): Promise<WorktreeStatus>; discardWorktree(agentId: string): Promise<WorktreeStatus>;
+  /**
+   * Plans the session's runtime published through the plan tools, newest
+   * activity first. Optional: hosts that mount no plan runtime advertise
+   * `capabilities().plan === false` and the UI shows the tab as unavailable.
+   * Omitting `sessionId` targets the host's current active session.
+   */
+  getPlans?(sessionId?: string): Promise<PlanSnapshot[]>;
+  subscribePlans?(listener: (event: PlanEvent) => void): Unsubscribe;
   capabilities(): Promise<HostCapabilities>;
   /**
    * Optional git extension for the toolbar branch control. Hosts advertise it
@@ -547,6 +611,8 @@ export interface PipiHostAPI {
   probeGitBinary?(): Promise<boolean>;
   /** Optional v2 UI convenience; older hosts simply render Finder reveal disabled. */
   revealProject?(projectId: string): Promise<void>;
+  /** Read-only project `.pi/mcp.json` servers for Settings → 扩展. */
+  listUserMcpServers?(projectId: string): Promise<UserMcpServer[]>;
   /** Electron-only, read-only version discovery. It never installs or mutates packages. */
   checkForUpdates?(): Promise<UpdateCenterSnapshot>;
   /** Optional extension; remote/non-Electron hosts advertise `capabilities().browser === false`. */
@@ -555,7 +621,7 @@ export interface PipiHostAPI {
   terminal?: TerminalHostAPI;
 }
 
-type BaseHostMethod = Exclude<keyof Omit<PipiHostAPI, "protocolVersion" | "subscribeStream" | "subscribeAllStreams" | "subscribeAgents" | "subscribeAgentLog" | "subscribeSessionStats" | "browser" | "terminal">, "browser" | "terminal">;
+type BaseHostMethod = Exclude<keyof Omit<PipiHostAPI, "protocolVersion" | "subscribeStream" | "subscribeAllStreams" | "subscribeAgents" | "subscribeAgentLog" | "subscribeSessionStats" | "subscribeDocuments" | "subscribePlans" | "browser" | "terminal">, "browser" | "terminal">;
 export type TerminalHostMethod = "terminalOpen" | "terminalWrite" | "terminalResize" | "terminalClear" | "terminalPrivate" | "terminalSnapshot" | "terminalClose";
 export type BrowserHostMethod = "browserSelectSession" | "browserListTabs" | "browserGetActiveTab" | "browserNewTab" | "browserSwitchTab" | "browserCloseTab" | "browserLoadURL" | "browserGoBack" | "browserGoForward" | "browserReload" | "browserSnapshot" | "browserSetViewBounds";
 export type HostMethod = BaseHostMethod | TerminalHostMethod | BrowserHostMethod;
@@ -590,6 +656,10 @@ function apiFrom(
     renameProject: (projectId, name) => invoke("renameProject", projectId, name),
     listDocuments: projectId => invoke("listDocuments", projectId),
     readDocument: documentId => invoke("readDocument", documentId),
+    watchDocument: path => invoke("watchDocument", path),
+    unwatchDocument: () => invoke("unwatchDocument"),
+    notifyDocumentsDropped: (sessionId, paths) => invoke("notifyDocumentsDropped", sessionId, paths),
+    subscribeDocuments: listener => subscribe("document", event => event.channel === "document", event => listener((event as Extract<HostEvent, { channel: "document" }>).event)),
     newSession: (projectId, name) => invoke("newSession", projectId, name),
     resumeSession: sessionId => invoke("resumeSession", sessionId),
     renameSession: (sessionId, name) => invoke("renameSession", sessionId, name),
@@ -652,6 +722,8 @@ function apiFrom(
     getWorktreeStatus: agentId => invoke("getWorktreeStatus", agentId),
     mergeWorktree: agentId => invoke("mergeWorktree", agentId),
     discardWorktree: agentId => invoke("discardWorktree", agentId),
+    getPlans: sessionId => sessionId === undefined ? invoke("getPlans") : invoke("getPlans", sessionId),
+    subscribePlans: listener => subscribe("plan", event => event.channel === "plan", event => listener((event as Extract<HostEvent, { channel: "plan" }>).event)),
     capabilities: () => invoke("capabilities"),
     gitStatus: projectId => invoke("gitStatus", projectId),
     gitCheckout: (projectId, branch) => invoke("gitCheckout", projectId, branch),
@@ -659,6 +731,7 @@ function apiFrom(
     gitInitDirectory: path => invoke("gitInitDirectory", path),
     probeGitBinary: () => invoke("probeGitBinary"),
     revealProject: projectId => invoke("revealProject", projectId),
+    listUserMcpServers: projectId => invoke("listUserMcpServers", projectId),
     checkForUpdates: () => invoke("checkForUpdates"),
     browser: {
       selectSession: sessionId => invoke("browserSelectSession", sessionId),
