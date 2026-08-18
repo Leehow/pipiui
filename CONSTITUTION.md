@@ -79,10 +79,12 @@ Prefer release package via `make-app.sh` for the double-clickable app, but only 
 
 Pi 配置家是当前打开项目自己的目录，不是全局 `~/.pi`，也不是把整个 Application Support `pi-agent` 当项目家。
 
-- 会话、记忆、技能、计划：`{projectRoot}/.pi/agent`
-- 登录/权鉴：所有打开项目指向 App 家同一份 `auth.json` / `.env`（Electron profile `pi-agent`），禁止再按项目复制一份 OAuth
+- App-home canonical：所有打开项目指向 Electron profile `pi-agent` 同一份 `.env`、`auth.json`、`models.json`；禁止再按项目复制 OAuth 或模型目录
+- 项目 Pi home 隔离：`settings.json`、`trust.json`、`models-store.json`、sessions、project skills/memory/resources、extensions、packages 等保留在 `{projectRoot}/.pi/agent`
+- App 宿主管理状态不重路由：project list、调度队列、telemetry、worktree/agent projection 等 bookkeeping 仍可保留在 App profile
+- 新项目不得从 App profile 复制 `trust.json`；已有项目的 trust 决定不得删除或改写
 - chatrpgv4 `pi-coc`：`{chatrpgv4}/.pi/coc-agent`
-- 自己找自己项目的 `.pi/`。禁止从 `~/.pi` 导入 packages。
+- 项目作用域数据不得跨写其他项目或全局 `~/.pi`；仅上述 App-profile canonical 文件与明确列出的 host bookkeeping 可写 App profile。禁止从 `~/.pi` 导入 packages。
 
 ---
 

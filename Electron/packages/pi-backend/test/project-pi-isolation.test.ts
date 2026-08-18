@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -25,6 +25,50 @@ describe("isolated project Pi homes", () => {
     root = "";
   });
 
+  it("batches saved paths deterministically after the App-profile initialization gate", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-project-model-gate-"));
+    const host = join(root, "host-profile");
+    const alpha = join(root, "alpha");
+    const zeta = join(root, "zeta");
+    await mkdir(host, { recursive: true });
+    await mkdir(projectPiAgentDir(alpha), { recursive: true });
+    await mkdir(projectPiAgentDir(zeta), { recursive: true });
+    await writeFile(join(host, "pipiui-settings.json"), JSON.stringify({
+      projectPathsVersion: 1,
+      projectPathsCanonicalMigrationVersion: 1,
+      projectPaths: [zeta, alpha],
+    }));
+    await writeFile(join(host, "models.json"), '{"providers":{}}');
+    await writeFile(join(projectPiAgentDir(alpha), "models.json"), '{"winner":"alpha"}');
+    await writeFile(join(projectPiAgentDir(zeta), "models.json"), '{"winner":"zeta"}');
+    let release!: () => Promise<void>;
+    const profileInitialization = new Promise<void>((resolve) => {
+      release = async () => {
+        await writeFile(join(host, "models.json"), '{"capabilityInstalled":true,"providers":{}}');
+        resolve();
+      };
+    });
+    backend = createPiHostBackend({
+      agentDir: host,
+      profileMode: "isolated",
+      profileInitialization,
+      canonicalProjectPaths: async () => undefined,
+    });
+
+    let listed = false;
+    const listing = backend.handle("listProjects", []).then((value) => { listed = true; return value; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(listed).toBe(false);
+    await release();
+    await listing;
+    expect(JSON.parse(await readFile(join(host, "models.json"), "utf8"))).toMatchObject({
+      capabilityInstalled: true,
+      winner: "alpha",
+    });
+    expect((await lstat(join(projectPiAgentDir(alpha), "models.json"))).isSymbolicLink()).toBe(true);
+    expect((await lstat(join(projectPiAgentDir(zeta), "models.json"))).isSymbolicLink()).toBe(true);
+  });
+
   it("writes new sessions and spawns Pi inside the opened project, not a shared host profile", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-project-isolation-"));
     const host = join(root, "host-profile");
@@ -37,6 +81,9 @@ describe("isolated project Pi homes", () => {
       defaultProvider: "xai",
       packages: ["/Users/me/code/chatrpgv4"],
     })}\n`);
+    await writeFile(join(host, "models.json"), '{"providers":{"xai":{"models":[{"id":"grok"}]}}}\n');
+    await writeFile(join(host, "models-store.json"), '{"host":true}\n');
+    await writeFile(join(host, "trust.json"), '{"trusted":true}\n');
     await writeFile(join(leftoverDir, "old.jsonl"), `${JSON.stringify({
       type: "session",
       version: 3,
@@ -74,8 +121,13 @@ describe("isolated project Pi homes", () => {
     const firstLine = (await readFile(join(projectSessions, files[0]), "utf8")).split("\n")[0];
     expect(JSON.parse(firstLine)).toEqual(expect.objectContaining({ id: created.id, cwd: project }));
 
-    const projectSettings = JSON.parse(await readFile(join(projectPiAgentDir(project), "settings.json"), "utf8"));
+    const projectAgent = projectPiAgentDir(project);
+    const projectSettings = JSON.parse(await readFile(join(projectAgent, "settings.json"), "utf8"));
     expect(projectSettings).not.toHaveProperty("packages");
+    expect(await readlink(join(projectAgent, "models.json"))).toBe(join(await realpath(host), "models.json"));
+    expect(await readFile(join(projectAgent, "models.json"), "utf8")).toContain('"grok"');
+    expect((await lstat(join(projectAgent, "models-store.json"))).isFile()).toBe(true);
+    await expect(readFile(join(projectAgent, "trust.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 
     await backend.handle("sendPrompt", [created.id, "go"]);
     const env = captured.find((item) => item.env.PIPIUI_SESSION_KEY === created.id)?.env ?? captured.at(-1)?.env;

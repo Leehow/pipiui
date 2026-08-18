@@ -97,12 +97,14 @@ import { firecrawlPdfHasKey, writeFirecrawlApiKey } from "./firecrawl-pdf-key.js
 import { describeImagesViaGlmMcp, isGlmProvider } from "./glm-vision-mcp.js";
 import {
   ensureProjectPiHome,
+  migrateSharedProjectModels,
   projectPiAgentDir,
   projectPiSessionsDir,
   sanitizePiSettingsFile,
 } from "./project-pi-home.js";
 export {
   ensureProjectPiHome,
+  migrateSharedProjectModels,
   projectPiAgentDir,
   projectPiSessionsDir,
   sanitizePiSettings,
@@ -337,6 +339,8 @@ export type PiBackendOptions = {
    */
   runtimeAssets?: RuntimeAssets;
   agentDir?: string;
+  /** App-profile writes that must finish before shared models migration starts. */
+  profileInitialization?: Promise<unknown>;
   /** Bind Pi children to agentDir/sessionsRoot instead of inheriting their ambient profile. */
   profileMode?: "default" | "isolated";
   /** Disable Pi's ambient resource discovery while retaining explicit mounts assembled here. */
@@ -1421,6 +1425,9 @@ export class PiHostBackend implements HostBackend {
   private visionEnabledLoaded?: Promise<void>;
   private projectPaths: string[] = [];
   private projectPathsLoaded?: Promise<void>;
+  private projectModelsInitialized?: Promise<void>;
+  private profileInitialization: Promise<void>;
+  private sharedModelsWrite: Promise<void> = Promise.resolve();
   private projectNames: Record<string, string> = {};
   private projectNamesLoaded?: Promise<void>;
   private revealPath: (path: string) => Promise<void>;
@@ -1455,6 +1462,7 @@ export class PiHostBackend implements HostBackend {
     this.computerDescriptor = options.computerDescriptor;
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
+    this.profileInitialization = Promise.resolve(options.profileInitialization).then(() => undefined);
     this.toolBatchTelemetry = options.toolBatchTelemetry ?? createToolBatchTelemetry({ agentDir: this.agentDir });
     this.root = options.sessionsRoot ?? join(this.agentDir, "sessions");
     this.piCommand = options.piCommand
@@ -1553,6 +1561,9 @@ export class PiHostBackend implements HostBackend {
     // instead of re-spawning. Errors are swallowed here — they resurface on the
     // next on-demand listModels, and the cache self-clears on failure.
     void this.loadModelCatalog().catch(() => undefined);
+    // The same promise is awaited by project/session operations, so this eager pass handles all
+    // persisted complete paths as one deterministic batch without making constructor async.
+    if (this.profileMode === "isolated") void this.loadProjectPaths().catch(() => undefined);
     void this.index().catch(() => undefined);
   }
   subscribe(listener: (event: HostEvent) => void) {
@@ -2563,10 +2574,24 @@ export class PiHostBackend implements HostBackend {
       sessionsRoot: projectPiSessionsDir(cwd),
     };
   }
+  private migrateSharedModels(projectRoots: string[]): Promise<void> {
+    const run = this.sharedModelsWrite
+      .catch(() => undefined)
+      .then(() => this.profileInitialization)
+      .then(() => migrateSharedProjectModels({ canonicalAgentDir: this.agentDir, projectRoots }))
+      .then(() => undefined);
+    this.sharedModelsWrite = run;
+    return run;
+  }
   private async ensureIsolatedProjectHome(projectRoot: string): Promise<void> {
     if (this.profileMode !== "isolated") return;
     await sanitizePiSettingsFile(join(this.agentDir, "settings.json")).catch(() => false);
-    await ensureProjectPiHome({ projectRoot, credentialSeedDir: this.agentDir });
+    await ensureProjectPiHome({
+      projectRoot,
+      credentialSeedDir: this.agentDir,
+      deferModelsMigration: true,
+    });
+    await this.migrateSharedModels([projectRoot]);
   }
   private async newSession(projectId: string, name?: string): Promise<Session> {
     // Session creation needs only local configuration. The optional authenticated runtime
@@ -3726,6 +3751,18 @@ export class PiHostBackend implements HostBackend {
       })();
     }
     await this.projectPathsLoaded;
+    if (this.profileMode === "isolated" && !this.projectModelsInitialized) {
+      const initialization = this.migrateSharedModels(this.projectPaths);
+      this.projectModelsInitialized = initialization;
+      try {
+        await initialization;
+      } catch (error) {
+        if (this.projectModelsInitialized === initialization) this.projectModelsInitialized = undefined;
+        throw error;
+      }
+    } else {
+      await this.projectModelsInitialized;
+    }
     return [...this.projectPaths];
   }
   private async saveProjectPaths(value: unknown): Promise<string[]> {
@@ -3738,7 +3775,21 @@ export class PiHostBackend implements HostBackend {
     this.projectPaths = saved;
     this.projectPathsLoaded = Promise.resolve();
     if (this.profileMode === "isolated") {
-      for (const projectRoot of saved) await this.ensureIsolatedProjectHome(projectRoot);
+      for (const projectRoot of saved) {
+        await ensureProjectPiHome({
+          projectRoot,
+          credentialSeedDir: this.agentDir,
+          deferModelsMigration: true,
+        });
+      }
+      const initialization = this.migrateSharedModels(saved);
+      this.projectModelsInitialized = initialization;
+      try {
+        await initialization;
+      } catch (error) {
+        if (this.projectModelsInitialized === initialization) this.projectModelsInitialized = undefined;
+        throw error;
+      }
     }
     return [...saved];
   }

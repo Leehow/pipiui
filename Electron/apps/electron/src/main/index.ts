@@ -190,6 +190,7 @@ if (app) {
       runtimeRoot,
       agentDir: piProfile.agentDir,
       sessionsRoot: piProfile.sessionsRoot,
+      profileInitialization: profileInstall,
       profileMode: 'isolated',
       resourceMode: 'explicit',
       quotaStore,

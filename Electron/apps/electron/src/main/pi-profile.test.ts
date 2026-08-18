@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -167,9 +167,13 @@ describe('Electron Pi profile', () => {
         untouched: { apiKey: 'OTHER_KEY' }
       }
     }, null, 2)}\n`)
+    const projectAgentDir = join(root, 'project', '.pi', 'agent')
+    await mkdir(projectAgentDir, { recursive: true })
+    await symlink(join(profile.agentDir, 'models.json'), join(projectAgentDir, 'models.json'))
 
     expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('updated')
     const installed = await readFile(join(profile.agentDir, 'models.json'), 'utf8')
+    expect(await readFile(join(projectAgentDir, 'models.json'), 'utf8')).toBe(installed)
     const parsed = JSON.parse(installed)
     expect(parsed.topLevelUserField).toEqual({ retained: true })
     expect(parsed.providers.generic).toMatchObject({
@@ -203,7 +207,9 @@ describe('Electron Pi profile', () => {
     upgraded.providers.generic.models.reasoner.verifiedAdditiveEffortValues = ['minimal']
     await writeFile(snapshotPath, JSON.stringify(upgraded))
     expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('updated')
-    const upgradedModels = JSON.parse(await readFile(join(profile.agentDir, 'models.json'), 'utf8'))
+    const upgradedSource = await readFile(join(profile.agentDir, 'models.json'), 'utf8')
+    expect(await readFile(join(projectAgentDir, 'models.json'), 'utf8')).toBe(upgradedSource)
+    const upgradedModels = JSON.parse(upgradedSource)
     // Managed `low` follows the newer snapshot, while the divergent user `high` mapping remains.
     expect(upgradedModels.providers.generic.modelOverrides.reasoner.thinkingLevelMap).toMatchObject({
       minimal: 'minimal', low: null, medium: 'medium', high: 'user-high', xhigh: 'xhigh'
