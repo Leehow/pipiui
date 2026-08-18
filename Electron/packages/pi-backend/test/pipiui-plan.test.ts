@@ -3,17 +3,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const EXTENSION = "../../../resources/runtime/extensions/pipiui-plan.ts";
-
 type Tool = {
   name: string;
   execute: (id: string, params: any, signal?: unknown, onUpdate?: unknown, ctx?: { cwd: string }) => Promise<any>;
 };
 
-async function loadExtension() {
+/**
+ * `sessionId` is read at module load (like the bridge env), so a caller that
+ * wants a session-scoped store must stub the env before the import. The
+ * specifier is a literal on purpose: a variable one is not statically
+ * analyzable and fails to resolve under this vite/vitest.
+ */
+async function loadExtension(sessionId = "") {
   vi.resetModules();
+  vi.stubEnv("PIPIUI_SESSION_ID", sessionId);
   const tools: Tool[] = [];
-  const extension = (await import(EXTENSION)).default;
+  const extension = (await import("../../../resources/runtime/extensions/pipiui-plan.ts")).default;
   extension({
     registerTool: (definition: Tool) => { tools.push(definition); },
   } as never);
@@ -27,6 +32,7 @@ function parse(result: any) {
 describe("pipiui plan tools", () => {
   let root = "";
   afterEach(async () => {
+    vi.unstubAllEnvs();
     if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     root = "";
     vi.unstubAllGlobals();
@@ -161,5 +167,46 @@ describe("pipiui plan tools", () => {
       state: "completed",
     }, undefined, undefined, ctx));
     expect(after.ok).toBe(false);
+  });
+  it("keeps two sessions of one work tree in separate stores", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipiui-plan-sessions-"));
+    const ctx = { cwd: root };
+    const publish = (tools: any, id: string, title: string) => tools.plan_publish.execute("1", {
+      plan: { id, title, tasks: [{ id: "t1", title: "第一步" }] },
+    }, undefined, undefined, ctx);
+
+    const first = await loadExtension("session-a");
+    expect(parse(await publish(first, "plan-a", "会话 A 的计划")).ok).toBe(true);
+    const second = await loadExtension("session-b");
+    expect(parse(await publish(second, "plan-b", "会话 B 的计划")).ok).toBe(true);
+
+    // Each session owns its own file...
+    const a = JSON.parse(await readFile(join(root, ".pi", "plans", "session-a.json"), "utf8"));
+    const b = JSON.parse(await readFile(join(root, ".pi", "plans", "session-b.json"), "utf8"));
+    expect(Object.keys(a.plans)).toEqual(["plan-a"]);
+    expect(Object.keys(b.plans)).toEqual(["plan-b"]);
+    expect(a.activePlanId).toBe("plan-a");
+    expect(b.activePlanId).toBe("plan-b");
+
+    // ...so B's publish never became A's active plan, and B cannot drive A's.
+    const crossSession = parse(await second.plan_task_update.execute("2", {
+      planId: "plan-a", taskId: "t1", state: "completed",
+    }, undefined, undefined, ctx));
+    expect(crossSession.ok).toBe(false);
+    const ownTask = parse(await second.plan_task_update.execute("3", {
+      planId: "plan-b", taskId: "t1", state: "completed",
+    }, undefined, undefined, ctx));
+    expect(ownTask.ok).toBe(true);
+  });
+
+  it("falls back to the legacy single-file store when the host supplies no session id", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipiui-plan-legacy-"));
+    const tools = await loadExtension("");
+    const published = parse(await tools.plan_publish.execute("1", {
+      plan: { id: "plan-legacy", title: "无会话 id", tasks: [{ id: "t1", title: "第一步" }] },
+    }, undefined, undefined, { cwd: root }));
+    expect(published.ok).toBe(true);
+    const disk = JSON.parse(await readFile(join(root, ".pi", "plans", "current.json"), "utf8"));
+    expect(disk.activePlanId).toBe("plan-legacy");
   });
 });

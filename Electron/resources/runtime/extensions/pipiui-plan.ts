@@ -45,6 +45,7 @@ type Store = {
 };
 
 const STORE_NAME = "current.json";
+const SESSION_ID = process.env.PIPIUI_SESSION_ID;
 const PORT = process.env.PIPIUI_BRIDGE_PORT;
 const SESSION_KEY = process.env.PIPIUI_SESSION_KEY;
 const CAPABILITY = process.env.PIPIUI_SESSION_CAPABILITY;
@@ -62,8 +63,20 @@ export function plansDir(cwd: string): string {
   return join(cwd, ".pi", "plans");
 }
 
-export function storePath(cwd: string): string {
-  return join(plansDir(cwd), STORE_NAME);
+/**
+ * A plan belongs to one conversation, so the store is keyed by session id.
+ * Every session of a project shares its work tree; a single `current.json`
+ * would make two chats overwrite each other's active plan and let one show the
+ * other's steps. A host that supplies no session id (bare pi, older host) keeps
+ * the legacy single-file name.
+ */
+export function storeFileName(sessionId: string | undefined = SESSION_ID): string {
+  const safe = (sessionId ?? "").replace(/[^A-Za-z0-9._-]/g, "");
+  return safe ? `${safe}.json` : STORE_NAME;
+}
+
+export function storePath(cwd: string, sessionId?: string): string {
+  return join(plansDir(cwd), storeFileName(sessionId));
 }
 
 function emptyStore(): Store {

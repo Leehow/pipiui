@@ -1,0 +1,52 @@
+.plan-content{display:flex;padding:0;place-items:stretch}
+.plan-panel{display:flex;width:100%;height:100%;min-width:0;min-height:0;flex-direction:column;overflow:hidden;background:var(--surface)}
+.plan-scroll{flex:1;min-height:0;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px;overscroll-behavior:contain}
+.plan-scroll>.empty-panel{align-self:center;margin:auto 0}
+.plan-header{display:flex;min-width:0;align-items:center;gap:8px;color:var(--text-strong);font-size:13px}
+.plan-header-progress{padding:1px 6px;border-radius:999px;color:var(--muted);background:color-mix(in srgb,var(--text) 8%,transparent);font-size:11px;font-variant-numeric:tabular-nums}
+.plan-error{padding:10px 12px;border:1px solid var(--danger);border-radius:8px;color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,transparent);font-size:12px}
+.plan-section-title{padding:6px 2px 0;color:var(--muted);font-size:11px;font-weight:650;letter-spacing:.06em}
+
+.plan-card{border:1px solid var(--border-strong);border-radius:9px;background:var(--surface-raised);overflow:hidden}
+.plan-card-summary{display:grid;gap:6px;padding:10px 12px;cursor:pointer;list-style:none}
+.plan-card-summary::-webkit-details-marker{display:none}
+.plan-card-heading{display:flex;min-width:0;align-items:center;gap:6px}
+.plan-card-title{min-width:0;overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+.plan-lifecycle{flex:none;padding:1px 5px;border-radius:4px;font-size:9px;font-weight:600;white-space:nowrap}
+.plan-lifecycle-draft{color:var(--warning);background:color-mix(in srgb,var(--warning) 16%,transparent)}
+.plan-lifecycle-approved{color:var(--success);background:color-mix(in srgb,var(--success) 16%,transparent)}
+.plan-lifecycle-cancelled{color:var(--muted);background:color-mix(in srgb,var(--text) 10%,transparent)}
+.plan-card-meta{display:flex;min-width:0;flex-wrap:wrap;align-items:center;gap:8px;color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+.plan-card-running{color:var(--accent)}
+.plan-card-failed{color:var(--danger)}
+.plan-card-blocked{color:var(--warning)}
+.plan-card-time{margin-left:auto;color:var(--subtle);font-size:10px}
+
+.plan-progress-bar{display:flex;gap:2px;height:4px}
+.plan-progress-slice{flex:1;min-width:2px;border-radius:2px;background:color-mix(in srgb,var(--text) 12%,transparent)}
+.plan-progress-completed{background:var(--success)}
+.plan-progress-in_progress{background:var(--accent)}
+.plan-progress-failed{background:var(--danger)}
+.plan-progress-blocked{background:var(--warning)}
+.plan-progress-skipped{background:color-mix(in srgb,var(--text) 25%,transparent)}
+
+.plan-cancel-reason{margin:0;padding:0 12px 8px;color:var(--muted);font-size:11px;line-height:1.5}
+.plan-task-list{margin:0;padding:2px 0 6px;border-top:1px solid var(--border);list-style:none}
+.plan-task{display:flex;align-items:flex-start;gap:8px;padding:7px 12px}
+.plan-task+.plan-task{border-top:1px solid color-mix(in srgb,var(--border) 60%,transparent)}
+.plan-task-mark{flex:none;width:14px;color:var(--muted);text-align:center;font-size:11px;line-height:1.6}
+.plan-task-completed .plan-task-mark{color:var(--success)}
+.plan-task-in_progress .plan-task-mark{color:var(--accent)}
+.plan-task-failed .plan-task-mark{color:var(--danger)}
+.plan-task-blocked .plan-task-mark{color:var(--warning)}
+.plan-task-body{min-width:0;flex:1}
+.plan-task-title{color:var(--text);font-size:12px;line-height:1.55;word-break:break-word}
+.plan-task-index{margin-right:5px;color:var(--subtle);font-variant-numeric:tabular-nums}
+.plan-task-completed .plan-task-title,.plan-task-skipped .plan-task-title{color:var(--muted)}
+.plan-task-skipped .plan-task-title{text-decoration:line-through}
+.plan-task-in_progress .plan-task-title{color:var(--text-strong);font-weight:600}
+.plan-task-note{margin-top:3px;color:var(--muted);font-size:11px;line-height:1.5;word-break:break-word}
+.plan-task-state{flex:none;color:var(--subtle);font-size:10px;line-height:1.7;white-space:nowrap}
+.plan-task-in_progress .plan-task-state{color:var(--accent)}
+.plan-task-failed .plan-task-state{color:var(--danger)}
+.plan-task-blocked .plan-task-state{color:var(--warning)}
