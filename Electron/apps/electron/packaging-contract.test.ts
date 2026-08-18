@@ -303,6 +303,7 @@ describe('macOS packaging contract', () => {
   })
 
   it('sources and exercises package_mac_arch safely under nounset', () => {
+    if (process.platform === 'win32') return
     const scriptPath = resolve(import.meta.dirname, '../../../scripts/build-electron-app.sh')
     const output = execFileSync('/bin/bash', ['-c', [
       'set -euo pipefail',
@@ -313,6 +314,7 @@ describe('macOS packaging contract', () => {
   })
 
   it('matches only the exact canonical Electron executable and guards before mac build work', () => {
+    if (process.platform === 'win32') return
     const scriptPath = resolve(import.meta.dirname, '../../../scripts/build-electron-app.sh')
     const result = spawnSync('/bin/bash', ['-c', [
       'set -euo pipefail',

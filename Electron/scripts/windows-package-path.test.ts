@@ -43,7 +43,7 @@ describe('Windows package and CI path', () => {
     const props = readFileSync(resolve(import.meta.dirname, '../Directory.Build.props'), 'utf8')
     expect(props).toContain('<SpectreMitigation>false</SpectreMitigation>')
     expect(props).not.toContain('LibraryPath')
-    expect(windowsNativeRebuildEnv('win32', '/repo/Electron').ForceImportBeforeCppTargets).toBe('/repo/Electron/Directory.Build.props')
+    expect(windowsNativeRebuildEnv('win32', '/repo/Electron').ForceImportBeforeCppTargets).toBe(join('/repo/Electron', 'Directory.Build.props'))
     expect(windowsNativeRebuildEnv('darwin', '/repo/Electron')).toEqual({})
     expect(windowsMsvcEnv('win32')).toEqual({})
     expect(windowsMsvcEnv('darwin')).toEqual({})

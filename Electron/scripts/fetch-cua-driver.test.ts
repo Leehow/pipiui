@@ -1,4 +1,3 @@
-import { spawnSync } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -13,6 +12,54 @@ import {
   writeDarwinCuaDriverHelperApp
 } from './fetch-cua-driver.mjs'
 import { resolveCuaDriverLaunchPath } from '../apps/electron/src/main/runtime-assets.ts'
+
+function crc32(data: Buffer): number {
+  let crc = 0xffffffff
+  for (const byte of data) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (~crc) >>> 0
+}
+
+/** Stored (method 0) zip so Windows CI can exercise extractArchive without a zip CLI. */
+function storedZip(files: Record<string, Buffer>): Buffer {
+  const locals: Buffer[] = []
+  const centrals: Buffer[] = []
+  let offset = 0
+  for (const [name, data] of Object.entries(files)) {
+    const nameBuf = Buffer.from(name, 'utf8')
+    const crc = crc32(data)
+    const local = Buffer.alloc(30)
+    local.writeUInt32LE(0x04034b50, 0)
+    local.writeUInt16LE(20, 4)
+    local.writeUInt32LE(crc, 14)
+    local.writeUInt32LE(data.length, 18)
+    local.writeUInt32LE(data.length, 22)
+    local.writeUInt16LE(nameBuf.length, 26)
+    const localFull = Buffer.concat([local, nameBuf, data])
+    locals.push(localFull)
+    const central = Buffer.alloc(46)
+    central.writeUInt32LE(0x02014b50, 0)
+    central.writeUInt16LE(20, 4)
+    central.writeUInt16LE(20, 6)
+    central.writeUInt32LE(crc, 16)
+    central.writeUInt32LE(data.length, 20)
+    central.writeUInt32LE(data.length, 24)
+    central.writeUInt16LE(nameBuf.length, 28)
+    central.writeUInt32LE(offset, 42)
+    centrals.push(Buffer.concat([central, nameBuf]))
+    offset += localFull.length
+  }
+  const centralDir = Buffer.concat(centrals)
+  const eocd = Buffer.alloc(22)
+  eocd.writeUInt32LE(0x06054b50, 0)
+  eocd.writeUInt16LE(Object.keys(files).length, 8)
+  eocd.writeUInt16LE(Object.keys(files).length, 10)
+  eocd.writeUInt32LE(centralDir.length, 12)
+  eocd.writeUInt32LE(offset, 16)
+  return Buffer.concat([...locals, centralDir, eocd])
+}
 
 describe('Darwin Cua driver helper layout', () => {
   let root = ''
@@ -51,12 +98,8 @@ describe('Darwin Cua driver helper layout', () => {
 
   it('extracts zip archives without powershell and finds the Windows exe', async () => {
     root = await mkdtemp(join(tmpdir(), 'pipiui-cua-zip-'))
-    const payload = join(root, 'payload')
-    await mkdir(join(payload, 'bin'), { recursive: true })
-    await writeFile(join(payload, 'bin', 'cua-driver.exe'), 'win-driver')
     const zip = join(root, 'cua.zip')
-    const zipped = spawnSync('zip', ['-q', '-r', zip, 'bin'], { cwd: payload, encoding: 'utf8' })
-    expect(zipped.status, zipped.stderr).toBe(0)
+    await writeFile(zip, storedZip({ 'bin/cua-driver.exe': Buffer.from('win-driver') }))
     const staging = join(root, 'out')
     await mkdir(staging)
     extractArchive(zip, staging, 'cua.zip')
