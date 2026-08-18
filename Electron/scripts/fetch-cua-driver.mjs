@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { chmod, copyFile, link, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, link, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
@@ -38,6 +38,36 @@ export async function materializePackagedDarwinCuaDriverSlice(targetDir, source,
   return packaged
 }
 
+export function extractArchive(archivePath, staging, archiveName = basename(archivePath)) {
+  if (archiveName.endsWith('.zip')) {
+    if (process.platform === 'win32') {
+      const extract = spawnSync('powershell.exe', ['-NoProfile', '-Command', `Expand-Archive -LiteralPath '${archivePath.replaceAll("'", "''")}' -DestinationPath '${staging.replaceAll("'", "''")}' -Force`], { stdio: 'inherit' })
+      if (extract.status !== 0) throw new Error(`failed to extract ${archiveName}`)
+      return
+    }
+    const unzip = spawnSync('unzip', ['-o', '-q', archivePath, '-d', staging], { stdio: 'inherit' })
+    if (unzip.status === 0) return
+    const ditto = spawnSync('ditto', ['-x', '-k', archivePath, staging], { stdio: 'inherit' })
+    if (ditto.status === 0) return
+    throw new Error(`failed to extract ${archiveName}: need unzip or ditto on this host`)
+  }
+  const extract = spawnSync('tar', ['-xzf', archivePath, '-C', staging], { stdio: 'inherit' })
+  if (extract.status !== 0) throw new Error(`failed to extract ${archiveName}`)
+}
+
+export async function findNamedFile(root, name) {
+  const entries = await readdir(root, { withFileTypes: true })
+  for (const entry of entries) {
+    const path = join(root, entry.name)
+    if (entry.isFile() && entry.name === name) return path
+    if (entry.isDirectory()) {
+      const nested = await findNamedFile(path, name)
+      if (nested) return nested
+    }
+  }
+  return undefined
+}
+
 function invokedAsCli() {
   const entry = process.argv[1]
   if (!entry) return false
@@ -66,14 +96,12 @@ export async function fetchCuaDriver() {
   }
   const staging = await mkdtemp(join(tmpdir(), 'pipiui-electron-cua-'))
   try {
-    const extract = asset.archive.endsWith('.zip')
-      ? spawnSync('powershell.exe', ['-NoProfile', '-Command', `Expand-Archive -LiteralPath '${archive.pathname.replaceAll("'", "''")}' -DestinationPath '${staging.replaceAll("'", "''")}' -Force`], { stdio: 'inherit' })
-      : spawnSync('tar', ['-xzf', archive.pathname, '-C', staging], { stdio: 'inherit' })
-    if (extract.status !== 0) throw new Error(`failed to extract ${basename(asset.archive)}`)
+    const archivePath = fileURLToPath(archive)
+    extractArchive(archivePath, staging, asset.archive)
     const executable = targetPlatform === 'win32' ? 'cua-driver.exe' : 'cua-driver'
-    const find = spawnSync(targetPlatform === 'win32' ? 'where.exe' : 'find', targetPlatform === 'win32' ? ['/r', staging, executable] : [staging, '-type', 'f', '-name', executable], { encoding: 'utf8' })
-    const source = find.stdout.split(/\r?\n/).find(Boolean)
+    const source = await findNamedFile(staging, executable)
     if (!source) throw new Error(`${basename(asset.archive)} did not contain ${executable}`)
+
     const destination = new URL('../.cua-driver/', import.meta.url)
     await mkdir(destination, { recursive: true })
     // Dev resolves this fixed path (runtime-assets.ts, dev-electron-app.sh), so the

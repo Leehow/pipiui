@@ -579,6 +579,31 @@ describe("CuaDriverHost", () => {
     });
   });
 
+  it("refuses Computer Use on Windows instead of reporting a usable driver", async () => {
+    const host = new CuaDriverHost("/missing/cua-driver.exe", {
+      displayID: 1,
+      width: 1440,
+      height: 900,
+    });
+    const original = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    try {
+      expect(host.usable()).toBe(false);
+      expect(
+        await host.handle({
+          protocolVersion: 1,
+          action: "computer_runtime_capabilities",
+        }),
+      ).toMatchObject({
+        ok: false,
+        error: expect.stringMatching(/macOS/),
+        runtimeError: { code: "unsupported_platform", retryable: false },
+      });
+    } finally {
+      if (original) Object.defineProperty(process, "platform", original);
+    }
+  });
+
   it("rejects unsupported runtime protocol before launching a helper", async () => {
     const host = new CuaDriverHost("/missing/cua-driver", {
       displayID: 1,

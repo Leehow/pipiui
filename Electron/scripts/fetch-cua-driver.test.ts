@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -6,6 +7,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   CUA_DRIVER_HELPER_APP,
   CUA_DRIVER_HELPER_INFO_PLIST,
+  extractArchive,
+  findNamedFile,
   materializePackagedDarwinCuaDriverSlice,
   writeDarwinCuaDriverHelperApp
 } from './fetch-cua-driver.mjs'
@@ -44,5 +47,19 @@ describe('Darwin Cua driver helper layout', () => {
     expect(await readFile(helper, 'utf8')).toBe('universal-bytes')
     expect((await stat(raw)).ino).toBe((await stat(helper)).ino)
     expect(resolveCuaDriverLaunchPath(raw, 'darwin')).toBe(raw)
+  })
+
+  it('extracts zip archives without powershell and finds the Windows exe', async () => {
+    root = await mkdtemp(join(tmpdir(), 'pipiui-cua-zip-'))
+    const payload = join(root, 'payload')
+    await mkdir(join(payload, 'bin'), { recursive: true })
+    await writeFile(join(payload, 'bin', 'cua-driver.exe'), 'win-driver')
+    const zip = join(root, 'cua.zip')
+    const zipped = spawnSync('zip', ['-q', '-r', zip, 'bin'], { cwd: payload, encoding: 'utf8' })
+    expect(zipped.status, zipped.stderr).toBe(0)
+    const staging = join(root, 'out')
+    await mkdir(staging)
+    extractArchive(zip, staging, 'cua.zip')
+    expect(await findNamedFile(staging, 'cua-driver.exe')).toMatch(/cua-driver\.exe$/)
   })
 })

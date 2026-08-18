@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import firecrawlPdf, {
   FIRECRAWL_PARSE_URL,
   FIRECRAWL_PDF_TOOL,
@@ -17,6 +17,8 @@ import {
   PDF_INSPECTOR_VERSION,
   inspectPdfWithOfficial,
   normalizeInspectorResult,
+  pdfInspectorEngineAvailability,
+  pdfInspectorNativePackageName,
 } from "../../../resources/runtime/extensions/pdf-inspector-local.ts";
 
 function buildMinimalPdf() {
@@ -223,5 +225,14 @@ describe("pipiui-firecrawl-pdf local extraction", () => {
     });
     expect(result.pageCount).toBeGreaterThan(0);
     expect(typeof result.pdfType).toBe("string");
+  });
+
+  it("declares win32 native vendor missing and refuses a silent empty engine", async () => {
+    expect(pdfInspectorNativePackageName("win32", "x64")).toBe("@firecrawl/pdf-inspector-win32-x64-msvc");
+    const shipped = new URL("../../../resources/runtime/pdf-inspector/node_modules", import.meta.url);
+    const availability = pdfInspectorEngineAvailability(fileURLToPath(shipped), "win32", "x64");
+    expect(availability.native).toBe(false);
+    expect(availability.wasm).toBe(true);
+    await expect(inspectPdfWithOfficial(TEXT_PDF, { platform: "win32", arch: "x64", nodeModules: join(tmpdir(), "pipiui-missing-pdf-inspector", "node_modules") })).rejects.toThrow(/no usable engine/);
   });
 });

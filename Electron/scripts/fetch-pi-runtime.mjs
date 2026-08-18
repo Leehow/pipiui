@@ -49,6 +49,8 @@ Discoverable npm commands:
   npm run runtime:update        # current host target, forced refresh
   npm run runtime:prepare:mac   # darwin x64 + arm64
   npm run runtime:check:mac     # darwin x64 + arm64, read-only
+  npm run runtime:prepare:win   # win32 x64
+  npm run runtime:check:win     # win32 x64, read-only
 
 Advanced/test override:
   PIPIUI_EMBEDDED_RUNTIMES_ROOT=/absolute/path

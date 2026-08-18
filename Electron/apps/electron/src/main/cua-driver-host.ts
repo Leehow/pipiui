@@ -532,13 +532,10 @@ export class CuaDriverHost {
   }
 
   usable(): boolean {
+    if (process.platform !== "darwin") return false;
     try {
       accessSync(this.launchPath(), constants.X_OK);
-      return (
-        process.platform === "darwin" ||
-        process.platform === "linux" ||
-        process.platform === "win32"
-      );
+      return true;
     } catch {
       return false;
     }
@@ -560,6 +557,12 @@ export class CuaDriverHost {
       return this.failure(
         "unsupported_protocol_version",
         "Electron Computer Runtime requires protocolVersion 1",
+        false,
+      );
+    if (process.platform !== "darwin")
+      return this.failure(
+        "unsupported_platform",
+        "Computer Use is only available on macOS",
         false,
       );
     if (request.action === "computer_cancel") {

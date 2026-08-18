@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { HostBackend, HostEvent } from '@pipi/host-api'
-import { TerminalSessionHost, createPtyTerminalBackend, loadNativePtySpawn, resolveTerminalCwd, resolveTerminalShell } from './terminal-host.js'
+import { TerminalSessionHost, createPtyTerminalBackend, loadNativePtySpawn, resolvePtyForkOptions, resolveTerminalCwd, resolveTerminalShell } from './terminal-host.js'
 
 function baseBackend(): HostBackend {
   return { handle: vi.fn(async () => undefined), subscribe: vi.fn(() => () => undefined) }
@@ -31,6 +31,14 @@ describe('PTY terminal host', () => {
     expect(resolveTerminalShell('linux', {})).toEqual({ file: '/bin/sh', args: ['-l'] })
     expect(resolveTerminalShell('win32', { COMSPEC: 'C:\\Windows\\System32\\cmd.exe' })).toEqual({ file: 'C:\\Windows\\System32\\cmd.exe', args: [] })
     expect(resolveTerminalShell('win32', { SystemRoot: 'D:\\Windows' }).file).toContain('WindowsPowerShell')
+  })
+
+  it('requests ConPTY on win32 and leaves POSIX hosts on the default backend', () => {
+    const win = resolvePtyForkOptions('win32', { cwd: 'C:\\work', cols: 80, rows: 24, env: {} }) as { useConpty?: boolean; cwd: string }
+    const mac = resolvePtyForkOptions('darwin', { cwd: '/tmp', cols: 80, rows: 24, env: {} }) as { useConpty?: boolean }
+    expect(win.useConpty).toBe(true)
+    expect(win.cwd).toBe('C:\\work')
+    expect(mac.useConpty).toBeUndefined()
   })
 
   it('falls back from an invalid requested cwd', () => {

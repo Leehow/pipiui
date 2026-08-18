@@ -34,6 +34,26 @@ type RecordEntry = {
   privateState: PrivateState; resyncRequired: boolean; queue: Promise<unknown>; changed: Set<() => void>
 }
 
+export function resolvePtyForkOptions(
+  platform: NodeJS.Platform,
+  options: { cwd: string; cols: number; rows: number; env: NodeJS.ProcessEnv },
+): nodePty.IPtyForkOptions {
+  const env = {
+    ...options.env,
+    TERM: 'xterm-256color',
+    COLORTERM: 'truecolor',
+    LANG: options.env.LANG || 'en_US.UTF-8',
+  } as Record<string, string>
+  return {
+    name: 'xterm-256color',
+    cwd: options.cwd,
+    cols: options.cols,
+    rows: options.rows,
+    env,
+    ...(platform === 'win32' ? { useConpty: true } : {}),
+  } as nodePty.IPtyForkOptions
+}
+
 export function resolveTerminalShell(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): { file: string; args: string[] } {
   if (platform === 'win32') return { file: env.COMSPEC || (env.SystemRoot ? join(env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'powershell.exe'), args: [] }
   return { file: env.SHELL || (platform === 'darwin' ? '/bin/zsh' : '/bin/sh'), args: ['-l'] }
@@ -95,7 +115,7 @@ export class TerminalSessionHost {
     if (!sessionId) throw new Error('terminal sessionId is required')
     const id = `terminal-${randomUUID()}`; const cwd = resolveTerminalCwd(options.cwd); const shell = resolveTerminalShell(this.platform, this.env)
     const cols = Math.max(2, Math.floor(options.cols || 80)); const rows = Math.max(1, Math.floor(options.rows || 24))
-    const pty = this.spawn(shell.file, shell.args, { name: 'xterm-256color', cwd, cols, rows, env: { ...this.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', LANG: this.env.LANG || 'en_US.UTF-8' } as Record<string, string> })
+    const pty = this.spawn(shell.file, shell.args, resolvePtyForkOptions(this.platform, { cwd, cols, rows, env: this.env }))
     const screen = new Terminal({ cols, rows, scrollback: 1000, allowProposedApi: true }); const serializer = new SerializeAddon(); screen.loadAddon(serializer)
     const entry: RecordEntry = { id, sessionId, title: shell.file.split(/[\\/]/).pop() || '终端', cwd, cols, rows, pty, screen, serializer, revision: 1, closed: false, privateState: 'none', resyncRequired: false, queue: Promise.resolve(), changed: new Set() }
     this.space(sessionId).set(id, entry); this.active.set(sessionId, id)

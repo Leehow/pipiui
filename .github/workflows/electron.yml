@@ -34,7 +34,8 @@ jobs:
             args: --mac
           - platform: win
             os: windows-latest
-            args: --win
+            args: --win --x64
+            nodePlatform: win32
           - platform: linux
             os: ubuntu-22.04
             args: --linux
@@ -77,9 +78,28 @@ jobs:
         if: matrix.platform == 'mac'
         run: bash scripts/make-icon.sh assets/brand/app-icon.png Electron/apps/electron/build/icon.icns
 
+      # Windows must go through the same prepare+check packager as local
+      # package:win. Raw electron-builder skips fetch-pi-runtime --check and
+      # ships an empty pipiui-embedded extraResource.
+      - name: Prepare Windows embedded runtime
+        if: matrix.platform == 'win'
+        working-directory: Electron
+        run: npm run runtime:prepare:win
+
       - name: Package (${{ matrix.platform }})
+        if: matrix.platform != 'win'
         working-directory: Electron/apps/electron
         run: npx electron-builder ${{ matrix.args }} --config.directories.output=../../../build
+
+      - name: Package Windows (shared target packager)
+        if: matrix.platform == 'win'
+        working-directory: Electron
+        env:
+          CUA_TARGET_PLATFORM: win32
+          CUA_TARGET_ARCH: x64
+        run: |
+          node scripts/fetch-cua-driver.mjs
+          node scripts/package-electron-target.mjs --platform win32 --arch x64 -- ${{ matrix.args }}
 
       - name: Sanity-check deb artifact (stub guard)
         if: matrix.platform == 'linux'

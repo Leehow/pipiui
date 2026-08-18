@@ -39,6 +39,13 @@ function run(command, args, options = {}) {
   if (result.status !== 0) throw new Error(`${command} failed with status ${result.status}`)
 }
 
+/** Unsigned Windows/Linux CI and local dev must not die on forceCodeSigning. */
+export function unsignedBuilderArgs(platform, env = process.env) {
+  if (platform === 'darwin') return []
+  if (env.CSC_LINK || env.WIN_CSC_LINK || env.CSC_KEY_PASSWORD) return []
+  return ['-c.forceCodeSigning=false']
+}
+
 function main() {
   const options = parseArgs(process.argv.slice(2))
   if (options.help) { usage(); return }
@@ -60,7 +67,8 @@ function main() {
   console.log(`Packaging with persistent embedded runtime ${key}`)
   run(process.execPath, [
     join(electronRoot, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js'),
-    ...options.builderArgs
+    ...options.builderArgs,
+    ...unsignedBuilderArgs(options.platform, releaseEnv)
   ], {
     cwd: join(electronRoot, 'apps', 'electron'),
     env: { ...releaseEnv, PIPIUI_EMBEDDED_RUNTIME_TARGET: key }
@@ -77,7 +85,15 @@ function main() {
   }
 }
 
-try { main() } catch (error) {
-  console.error(error instanceof Error ? error.message : String(error))
-  process.exitCode = 1
+function invokedAsCli() {
+  const entry = process.argv[1]
+  if (!entry) return false
+  try { return fileURLToPath(import.meta.url) === resolve(entry) } catch { return false }
+}
+
+if (invokedAsCli()) {
+  try { main() } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exitCode = 1
+  }
 }
