@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import workspacePackage from '../package.json'
 import packageJSON from '../apps/electron/package.json'
-import { unsignedBuilderArgs } from './package-electron-target.mjs'
+import { unsignedBuilderArgs, windowsNativeRebuildEnv } from './package-electron-target.mjs'
 
 describe('Windows package and CI path', () => {
   const workflow = readFileSync(resolve(import.meta.dirname, '../../.github/workflows/electron.yml'), 'utf8')
@@ -30,6 +30,9 @@ describe('Windows package and CI path', () => {
   it('does not require Spectre-mitigated CRT libs for Windows native rebuilds', () => {
     const props = readFileSync(resolve(import.meta.dirname, '../Directory.Build.props'), 'utf8')
     expect(props).toContain('<SpectreMitigation>false</SpectreMitigation>')
+    expect(windowsNativeRebuildEnv('win32', '/repo/Electron').ForceImportBeforeCppTargets).toBe('/repo/Electron/Directory.Build.props')
+    expect(windowsNativeRebuildEnv('darwin', '/repo/Electron')).toEqual({})
+    expect(packager).toContain('windowsNativeRebuildEnv')
   })
 
   it('drops forceCodeSigning only for unsigned Windows/Linux packaging', () => {

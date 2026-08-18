@@ -46,6 +46,14 @@ export function unsignedBuilderArgs(platform, env = process.env) {
   return ['-c.forceCodeSigning=false']
 }
 
+/** VS 2022 without Spectre CRT libs fails node-pty rebuild (MSB8040). */
+export function windowsNativeRebuildEnv(platform, root = electronRoot, env = process.env) {
+  if (platform !== 'win32') return {}
+  return {
+    ForceImportBeforeCppTargets: env.ForceImportBeforeCppTargets || join(root, 'Directory.Build.props')
+  }
+}
+
 function main() {
   const options = parseArgs(process.argv.slice(2))
   if (options.help) { usage(); return }
@@ -71,7 +79,11 @@ function main() {
     ...unsignedBuilderArgs(options.platform, releaseEnv)
   ], {
     cwd: join(electronRoot, 'apps', 'electron'),
-    env: { ...releaseEnv, PIPIUI_EMBEDDED_RUNTIME_TARGET: key }
+    env: {
+      ...releaseEnv,
+      ...windowsNativeRebuildEnv(options.platform, electronRoot, releaseEnv),
+      PIPIUI_EMBEDDED_RUNTIME_TARGET: key
+    }
   })
   if (options.platform === 'linux') {
     // electron-builder output is repo-root build/ (apps/electron package.json
