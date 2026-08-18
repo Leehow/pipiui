@@ -1,0 +1,8 @@
+<Project>
+  <!-- electron-rebuild/node-gyp compiles node-pty under this workspace.
+       VS 2022 Build Tools without Spectre-mitigated CRT libs fail with MSB8040.
+       Dev/unsigned Windows packaging does not need Spectre-mitigated natives. -->
+  <PropertyGroup>
+    <SpectreMitigation>false</SpectreMitigation>
+  </PropertyGroup>
+</Project>

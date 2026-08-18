@@ -27,6 +27,11 @@ describe('Windows package and CI path', () => {
     expect(workflow).toMatch(/if: matrix\.platform != 'win'[\s\S]*npx electron-builder/)
   })
 
+  it('does not require Spectre-mitigated CRT libs for Windows native rebuilds', () => {
+    const props = readFileSync(resolve(import.meta.dirname, '../Directory.Build.props'), 'utf8')
+    expect(props).toContain('<SpectreMitigation>false</SpectreMitigation>')
+  })
+
   it('drops forceCodeSigning only for unsigned Windows/Linux packaging', () => {
     expect(unsignedBuilderArgs('win32', {})).toEqual(['-c.forceCodeSigning=false'])
     expect(unsignedBuilderArgs('linux', {})).toEqual(['-c.forceCodeSigning=false'])
