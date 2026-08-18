@@ -22,11 +22,13 @@ const emptyReport = (): InstallReport => ({ installed: [], unchanged: [], failur
  * Cheap enough to run on every launch and precise enough that an untouched tree is never
  * recopied, so a no-op refresh never churns a live session's mounted tree.
  */
-export function treeSignature(root: string): string {
+export function treeSignature(root: string, options: { keepNodeModules?: boolean } = {}): string {
+  const skip = new Set(SKIP_ENTRIES);
+  if (options.keepNodeModules) skip.delete("node_modules");
   const parts: string[] = [];
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-      if (SKIP_ENTRIES.has(entry.name) || entry.name.endsWith(".tsbuildinfo")) continue;
+      if (skip.has(entry.name) || entry.name.endsWith(".tsbuildinfo")) continue;
       const path = join(dir, entry.name);
       if (entry.isDirectory()) { walk(path); continue; }
       const stat = statSync(path);
@@ -48,18 +50,20 @@ const storedSignature = (dest: string): string | undefined => {
  * sessions resolve `-e` paths against: a half-copied `pi-ext` would take a session down with an
  * unreadable extension. A failed copy leaves the previous tree exactly as it was.
  */
-export function syncTree(source: string, dest: string, report: InstallReport = emptyReport()): InstallReport {
+export function syncTree(source: string, dest: string, report: InstallReport = emptyReport(), options: { keepNodeModules?: boolean } = {}): InstallReport {
   if (!existsSync(source)) { report.failures.push(`${dest}: source missing at ${source}`); return report }
-  const signature = treeSignature(source);
+  const signature = treeSignature(source, options);
   if (existsSync(dest) && storedSignature(dest) === signature) { report.unchanged.push(dest); return report }
   // Unique per call, not just per process: two sessions can spawn at once, and both refresh the
   // tree before assembling their paths.
   const staging = `${dest}.staging-${process.pid}-${(stagingSeq += 1)}`;
   try {
     rmSync(staging, { recursive: true, force: true });
+    const skip = new Set(SKIP_ENTRIES);
+    if (options.keepNodeModules) skip.delete("node_modules");
     cpSync(source, staging, { recursive: true, filter: path => {
       const name = path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
-      return !SKIP_ENTRIES.has(name) && !name.endsWith(".tsbuildinfo");
+      return !skip.has(name) && !name.endsWith(".tsbuildinfo");
     } });
     writeFileSync(join(staging, SIGNATURE_FILE), JSON.stringify({ signature, installedAt: new Date().toISOString() }), "utf8");
     rmSync(dest, { recursive: true, force: true });
@@ -93,5 +97,6 @@ export function installRuntimeTree(assets: RuntimeAssets, runtimeRoot: string): 
   }
   for (const name of ["pi-ext", "pi-philosophy", "extensions", "built-in-skills"] as const)
     syncTree(join(assets.sourceRoot, name), join(runtimeRoot, name), report);
+  syncTree(join(assets.sourceRoot, "pdf-inspector"), join(runtimeRoot, "pdf-inspector"), report, { keepNodeModules: true });
   return report;
 }

@@ -93,6 +93,7 @@ import {
 import { createToolBatchTelemetry, type ToolBatchTelemetry } from "./tool-batch-telemetry.js";
 import { describeImages } from "./vision-describe.js";
 import { ensureWebSearchDefaults } from "./web-search-defaults.js";
+import { firecrawlPdfHasKey, writeFirecrawlApiKey } from "./firecrawl-pdf-key.js";
 import { describeImagesViaGlmMcp, isGlmProvider } from "./glm-vision-mcp.js";
 import {
   ensureProjectPiHome,
@@ -430,6 +431,8 @@ type Live = {
   hostAbortedTurn?: boolean;
   /** Queue turn id from the latest `markBusy`; stale settles must pass this to `queueIdle`. */
   turnEpoch?: number;
+  /** Concatenated `text_delta` for the in-flight assistant message. */
+  streamedAssistantText?: string;
   /** Turn already projected terminal to renderers; suppresses late duplicate settle evidence. */
   terminalEpoch?: number;
   /** Exact final assistant awaiting the last real subagent terminal event. */
@@ -462,6 +465,12 @@ const text = (content: any) =>
     ? content
     : Array.isArray(content)
       ? content.map((p) => p.text ?? p.thinking ?? "").join("")
+      : "";
+const assistantVisibleText = (content: any) =>
+  typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content.map((part) => part?.type === "text" ? part.text ?? "" : "").join("")
       : "";
 const SUBAGENT_COMPLETION_CUSTOM_TYPE = "pipiui-subagent-complete-v1";
 function isSubagentCompletion(value: any): boolean {
@@ -818,58 +827,106 @@ function visibleHistoryEntry(entry: any): HistoryEntry | undefined {
     if (!content) return undefined;
     return { id: entry.id, role: "user", content, timestamp: asTime(entry.timestamp) };
   }
-  if (entry?.type === "compaction" && entry.summary) {
-    return { id: entry.id, role: "assistant", content: entry.summary, timestamp: asTime(entry.timestamp) };
+  if (entry?.type === "compaction") {
+    return {
+      id: entry.id,
+      role: "compaction",
+      content: typeof entry.summary === "string" ? entry.summary : "",
+      timestamp: asTime(entry.timestamp),
+    };
   }
 }
 
 /**
- * Build the active, compaction-aware id set without retaining message bodies.
- * This is the large-file equivalent of SessionManager.buildContextEntries().
+ * Visible ids on the active leaf parentId chain.
+ * Small-file chat history keeps the full leaf (compaction is a card; firstKept
+ * does not hide earlier bubbles). Large-file fallback matches SessionManager
+ * buildContextEntries: latest compaction, then firstKept through the cut, then
+ * everything after the compaction.
+ * Metadata rows written with parentId=null (thinking/model/session_info) are
+ * stitched to the previous file-order entry instead of starting a new root.
  */
-type ContextEntrySummary = { id: string; parentId: string | null; type: string; firstKeptEntryId?: string; visible: boolean };
+type ContextEntrySummary = {
+  id: string;
+  parentId: string | null;
+  type: string;
+  visible: boolean;
+  firstKeptEntryId?: string;
+};
 
-async function activeVisibleIds(path: string): Promise<string[]> {
-  const byId = new Map<string, ContextEntrySummary>();
-  let leafId: string | undefined;
+function isMetadataReroot(type: string): boolean {
+  return type === "thinking_level_change" || type === "model_change" || type === "session_info";
+}
+
+function leafBranchFromFileOrder(ordered: ContextEntrySummary[]): ContextEntrySummary[] {
+  if (ordered.length === 0) return [];
+  const byId = new Map(ordered.map(entry => [entry.id, entry]));
+  const previous = new Map<string, ContextEntrySummary>();
+  for (let index = 1; index < ordered.length; index++) previous.set(ordered[index].id, ordered[index - 1]);
+  const branch: ContextEntrySummary[] = [];
+  let current: ContextEntrySummary | undefined = ordered[ordered.length - 1];
+  const visited = new Set<string>();
+  while (current && !visited.has(current.id)) {
+    visited.add(current.id);
+    branch.push(current);
+    if (current.parentId && byId.has(current.parentId)) {
+      current = byId.get(current.parentId);
+      continue;
+    }
+    if (!current.parentId && isMetadataReroot(current.type)) {
+      current = previous.get(current.id);
+      continue;
+    }
+    current = undefined;
+  }
+  branch.reverse();
+  return branch;
+}
+
+/** Same reorder as SessionManager.buildContextEntries on the leaf path. */
+function applyLatestCompactionContext(path: ContextEntrySummary[]): ContextEntrySummary[] {
+  let compaction: ContextEntrySummary | undefined;
+  for (const entry of path) {
+    if (entry.type === "compaction") compaction = entry;
+  }
+  if (!compaction) return path;
+  const compactionIdx = path.findIndex(entry => entry.id === compaction.id);
+  if (compactionIdx < 0) return path;
+  const contextEntries: ContextEntrySummary[] = [compaction];
+  let foundFirstKept = false;
+  for (let i = 0; i < compactionIdx; i++) {
+    const entry = path[i]!;
+    if (entry.id === compaction.firstKeptEntryId) foundFirstKept = true;
+    if (foundFirstKept) contextEntries.push(entry);
+  }
+  contextEntries.push(...path.slice(compactionIdx + 1));
+  return contextEntries;
+}
+
+function visibleIdsFromFileOrder(ordered: ContextEntrySummary[], matchSessionManagerContext = false): string[] {
+  const branch = leafBranchFromFileOrder(ordered);
+  const path = matchSessionManagerContext ? applyLatestCompactionContext(branch) : branch;
+  return path.filter(entry => entry.visible).map(entry => entry.id);
+}
+
+async function activeVisibleIds(path: string, matchSessionManagerContext = false): Promise<string[]> {
+  const ordered: ContextEntrySummary[] = [];
   const lines = createInterface({ input: createReadStream(path, { encoding: "utf8" }), crlfDelay: Infinity });
   for await (const line of lines) {
     let entry: any;
     try { entry = JSON.parse(line); } catch { continue; }
     if (entry?.type === "session" || typeof entry?.id !== "string") continue;
-    const summary = {
+    ordered.push({
       id: entry.id,
       parentId: typeof entry.parentId === "string" ? entry.parentId : null,
       type: String(entry.type ?? ""),
       visible: entry.type === "message"
         || isVisibleCustomMessage(entry)
-        || (entry.type === "compaction" && Boolean(entry.summary)),
-      ...(typeof entry.firstKeptEntryId === "string" ? { firstKeptEntryId: entry.firstKeptEntryId } : {}),
-    };
-    byId.set(summary.id, summary);
-    leafId = summary.id;
+        || entry.type === "compaction",
+      firstKeptEntryId: typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined,
+    });
   }
-  const branch: ContextEntrySummary[] = [];
-  let current = leafId ? byId.get(leafId) : undefined;
-  const visited = new Set<string>();
-  while (current && !visited.has(current.id)) {
-    visited.add(current.id);
-    branch.push(current);
-    current = current.parentId ? byId.get(current.parentId) : undefined;
-  }
-  branch.reverse();
-  let compactionIndex = -1;
-  for (let index = 0; index < branch.length; index++) if (branch[index].type === "compaction") compactionIndex = index;
-  if (compactionIndex < 0) return branch.filter(entry => entry.visible).map(entry => entry.id);
-  const compaction = branch[compactionIndex];
-  const context: ContextEntrySummary[] = [compaction];
-  let include = false;
-  for (let index = 0; index < compactionIndex; index++) {
-    if (branch[index].id === compaction.firstKeptEntryId) include = true;
-    if (include) context.push(branch[index]);
-  }
-  context.push(...branch.slice(compactionIndex + 1));
-  return context.filter(entry => entry.visible).map(entry => entry.id);
+  return visibleIdsFromFileOrder(ordered, matchSessionManagerContext);
 }
 
 function historyPage(entries: HistoryEntry[], before: number | string, limit: number): HistoryEntry[] {
@@ -885,8 +942,9 @@ async function readHistoryFallback(
   path: string,
   before: number | string = 0,
   limit = 500,
+  matchSessionManagerContext = false,
 ): Promise<HistoryEntry[]> {
-  const visibleIds = await activeVisibleIds(path);
+  const visibleIds = await activeVisibleIds(path, matchSessionManagerContext);
   const end = typeof before === "string"
     ? visibleIds.indexOf(before)
     : Math.max(0, visibleIds.length - before);
@@ -915,6 +973,31 @@ async function readHistoryFallback(
     return entry ? [entry] : [];
   });
 }
+async function lastJsonlEntryId(path: string): Promise<string | null> {
+  const stat = await fs.stat(path);
+  const length = Math.min(stat.size, 256 * 1024);
+  if (length <= 0) return null;
+  const handle = await fs.open(path, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, stat.size - length);
+    const lines = buffer.toString("utf8").split(/\r?\n/);
+    for (let index = lines.length - 1; index >= 0; index--) {
+      const line = lines[index]!.trim();
+      if (!line) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry?.type === "session" || typeof entry?.id !== "string") continue;
+        return entry.id;
+      } catch {
+        /* incomplete leading tail line */
+      }
+    }
+  } finally {
+    await handle.close();
+  }
+  return null;
+}
 const SESSION_MANAGER_MAX_BYTES = 4 * 1024 * 1024;
 let sessionManagerModule: Promise<{ SessionManager: any }> | undefined;
 async function loadSessionManager() {
@@ -923,35 +1006,20 @@ async function loadSessionManager() {
       SessionManager: any;
     }>);
 }
-/** Uses pi's active-branch/compaction semantics for bounded-size files. Large files stay on the streaming fallback. */
+/** Chat-window history: stitched leaf walk. Large files skip SessionManager and match its context order. */
 async function readHistory(
   path: string,
   before: number | string = 0,
   limit = 500,
 ): Promise<HistoryEntry[]> {
   const stat = await fs.stat(path);
-  if (stat.size > SESSION_MANAGER_MAX_BYTES) {
+  const large = stat.size > SESSION_MANAGER_MAX_BYTES;
+  if (large) {
     console.warn(
       `[pipi-backend] SessionManager skipped for ${path}: ${stat.size} bytes exceeds bounded history limit`,
     );
-    return readHistoryFallback(path, before, limit);
   }
-  try {
-    const { SessionManager } = await loadSessionManager();
-    const manager = SessionManager.open(path);
-    const entries = manager.buildContextEntries();
-    const visible: HistoryEntry[] = [];
-    for (const entry of entries as any[]) {
-      const mapped = visibleHistoryEntry(entry);
-      if (mapped) visible.push(mapped);
-    }
-    return historyPage(visible, before, limit);
-  } catch (error) {
-    console.warn(
-      `[pipi-backend] SessionManager fallback for ${path}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return readHistoryFallback(path, before, limit);
-  }
+  return readHistoryFallback(path, before, limit, large);
 }
 
 const TERMINAL_DURABILITY_TAIL_BYTES = 1024 * 1024;
@@ -1786,6 +1854,7 @@ export class PiHostBackend implements HostBackend {
       sessionId,
       status: "stopped",
       pendingFollowUps: after?.followUps ?? live?.followUps ?? [],
+      turnEpoch: after?.turnEpoch ?? live?.turnEpoch,
     });
     after?.compaction.settleTurn();
     void this.sweepSessionAgents(sessionId);
@@ -1978,7 +2047,7 @@ export class PiHostBackend implements HostBackend {
       provider: ref.provider,
       id: ref.modelId,
       name: ref.modelId,
-      reasoning: false,
+      reasoning: true,
     };
     const availableThinkingLevels = thinkingLevelsForModel(model);
     return {
@@ -2272,6 +2341,10 @@ export class PiHostBackend implements HostBackend {
         return this.loadVisionEnabled();
       case "setVisionEnabled":
         return this.saveVisionEnabled(params[0]);
+      case "getFirecrawlPdfStatus":
+        return this.loadFirecrawlPdfStatus(params[0]);
+      case "setFirecrawlPdfApiKey":
+        return this.saveFirecrawlPdfApiKey(params[0], params[1]);
       case "listAgentDefinitions":
         return BUILT_IN_AGENT_DEFINITIONS.map((agent) => ({ ...agent }));
       case "listModels":
@@ -2587,7 +2660,7 @@ export class PiHostBackend implements HostBackend {
         await fs.appendFile(session.path, `${JSON.stringify({
           type: "session_info",
           id: crypto.randomUUID(),
-          parentId: null,
+          parentId: await lastJsonlEntryId(session.path),
           timestamp,
           name: title,
         })}\n`);
@@ -2888,11 +2961,13 @@ export class PiHostBackend implements HostBackend {
           ? [live.pendingDrainPrompt]
           : [];
       live.pendingDrainPrompt = undefined;
+      live.streamedAssistantText = "";
       this.stream({
         type: "status",
         sessionId: id,
         status: "started",
         pendingFollowUps,
+        turnEpoch: live.turnEpoch,
       });
     } else if (e.type === "agent_settled") {
       this.projectTurnTerminal(live, live.hostAbortedTurn ? "stopped" : "settled", true);
@@ -2941,7 +3016,8 @@ export class PiHostBackend implements HostBackend {
       live.followUps = e.followUp ?? [];
     } else if (e.type === "message_update") {
       const d = e.assistantMessageEvent ?? {};
-      if (d.type === "text_delta")
+      if (d.type === "text_delta") {
+        live.streamedAssistantText = (live.streamedAssistantText ?? "") + (d.delta ?? "");
         this.stream({
           type: "text",
           sessionId: id,
@@ -2949,6 +3025,7 @@ export class PiHostBackend implements HostBackend {
           segment: live.messageEpoch,
           delta: d.delta ?? "",
         });
+      }
       if (d.type === "thinking_delta")
         this.stream({
           type: "thinking",
@@ -3011,6 +3088,22 @@ export class PiHostBackend implements HostBackend {
         });
       }
     } else if (e.type === "message_end") {
+      const endingEpoch = live.messageEpoch;
+      const endedMessage = e.message ?? {};
+      if (endedMessage.role === "assistant") {
+        const fullText = assistantVisibleText(endedMessage.content);
+        const already = live.streamedAssistantText ?? "";
+        if (fullText && (!already || (fullText.startsWith(already) && fullText.length > already.length))) {
+          this.stream({
+            type: "text",
+            sessionId: id,
+            contentIndex: 0,
+            segment: endingEpoch,
+            delta: already ? fullText.slice(already.length) : fullText,
+          });
+        }
+        live.streamedAssistantText = "";
+      }
       // A new message restarts content indexing; drop unclaimed tool buffers and
       // bump the epoch so later thinking segments key apart from earlier ones.
       live.toolArgs.clear();
@@ -3118,6 +3211,7 @@ export class PiHostBackend implements HostBackend {
       sessionId: live.session.id,
       status,
       pendingFollowUps: live.followUps,
+      turnEpoch: epoch,
     });
     this.projectionDebug("terminal_projected", {
       session: this.projectionDebugSessionTag(live.session.id),
@@ -3843,6 +3937,25 @@ export class PiHostBackend implements HostBackend {
     this.visionEnabledLoaded = Promise.resolve();
     return value;
   }
+  private async firecrawlPdfAgentDir(projectId: unknown): Promise<string> {
+    if (typeof projectId !== "string" || !projectId.trim()) throw new Error("projectId 必须是 string");
+    const path = await this.projectPath(projectId);
+    if (this.profileMode === "isolated") {
+      await this.ensureIsolatedProjectHome(path);
+      return projectPiAgentDir(path);
+    }
+    return this.agentDir;
+  }
+  private async loadFirecrawlPdfStatus(projectId: unknown): Promise<{ hasKey: boolean }> {
+    const agentDir = await this.firecrawlPdfAgentDir(projectId);
+    return { hasKey: await firecrawlPdfHasKey(agentDir) };
+  }
+  private async saveFirecrawlPdfApiKey(projectId: unknown, apiKey: unknown): Promise<{ hasKey: boolean }> {
+    if (apiKey !== null && typeof apiKey !== "string") throw new Error("apiKey 必须是 string 或 null");
+    const agentDir = await this.firecrawlPdfAgentDir(projectId);
+    const hasKey = await writeFirecrawlApiKey(agentDir, apiKey);
+    return { hasKey };
+  }
   private checkedSidebarSessionPreferences(value: unknown): { pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 } {
     if (!isRecord(value)) throw new Error("sidebarSessionPreferences 必须是 object");
     const checked = (key: "pinnedSessionIds" | "archivedSessionIds" | "orderedSessionIds", optional = false) => {
@@ -4537,6 +4650,7 @@ export class PiHostBackend implements HostBackend {
       sessionId: id,
       status: "started",
       pendingFollowUps: live.followUps,
+      turnEpoch: live.turnEpoch,
     });
   }
   private async getModelState(sessionId?: string): Promise<ModelState> {
@@ -4605,12 +4719,13 @@ export class PiHostBackend implements HostBackend {
     const status = await this.leaseFor(meta).acquire();
     if (!status.writable)
       throw new Error(`session is read-only: held by ${status.holder?.holder ?? "another writer"}`);
+    const parentId = await lastJsonlEntryId(meta.path);
     await fs.appendFile(
       meta.path,
       `${JSON.stringify({
         ...row,
         id: crypto.randomUUID(),
-        parentId: null,
+        parentId,
         timestamp: new Date().toISOString(),
       })}\n`,
     );
@@ -4653,25 +4768,56 @@ export class PiHostBackend implements HostBackend {
     return next;
   }
   private async setThinking(sessionId: string, level: ThinkingLevel) {
+    await this.loadModelCatalog();
+    const raw =
+      this.sessionModelStates.get(sessionId) ??
+      this.sessionModelSnapshots.get(sessionId);
+    const reported = raw ??
+      ((this.live.has(sessionId) || this.ensureInFlight.has(sessionId))
+        ? this.modelState
+        : await this.getModelState(sessionId));
+    const known = this.models.find(
+      (item) => item.provider === reported.model.provider && item.id === reported.model.id,
+    );
+    const model: Model = known ?? {
+      provider: reported.model.provider,
+      id: reported.model.id,
+      name: reported.model.name || reported.model.id,
+      reasoning: true,
+      ...(reported.model.thinkingLevelMap
+        ? { thinkingLevelMap: reported.model.thinkingLevelMap }
+        : {}),
+    };
+    const availableThinkingLevels = thinkingLevelsForModel(
+      model,
+      reported.availableThinkingLevels.length > 0 ? reported.availableThinkingLevels : undefined,
+    );
+    if (!availableThinkingLevels.includes(level))
+      throw new Error(`thinking level ${level} is unavailable`);
     if (this.live.has(sessionId) || this.ensureInFlight.has(sessionId)) {
       const live = await this.ensure(sessionId);
-      const current = this.sessionModelStates.get(sessionId) ?? this.sessionModelSnapshots.get(sessionId) ?? this.modelState;
-      if (!current.availableThinkingLevels.includes(level))
-        throw new Error(`thinking level ${level} is unavailable`);
       await this.command(sessionId, { type: "set_thinking_level", level });
       await this.refreshState(live);
-      const state = this.sessionModelStates.get(sessionId)!;
+      const refreshed = this.sessionModelStates.get(sessionId)!;
+      const catalog = this.models.find(
+        (item) => item.provider === refreshed.model.provider && item.id === refreshed.model.id,
+      );
+      const state = {
+        model: catalog ?? refreshed.model,
+        thinkingLevel: level,
+        availableThinkingLevels: thinkingLevelsForModel(
+          catalog ?? model,
+          refreshed.availableThinkingLevels.length > 0
+            ? refreshed.availableThinkingLevels
+            : availableThinkingLevels,
+        ),
+      };
+      this.sessionModelStates.set(sessionId, state);
       this.sessionModelSnapshots.set(sessionId, state);
       await this.rememberManualThinkingLevel(state.thinkingLevel);
       return state;
     }
-    const current =
-      this.sessionModelStates.get(sessionId) ??
-      this.sessionModelSnapshots.get(sessionId) ??
-      await this.getModelState(sessionId);
-    if (!current.availableThinkingLevels.includes(level))
-      throw new Error(`thinking level ${level} is unavailable`);
-    const next = { ...current, thinkingLevel: level };
+    const next = { model, thinkingLevel: level, availableThinkingLevels };
     await this.persistColdSessionRow(sessionId, { type: "thinking_level_change", thinkingLevel: level });
     this.sessionModelStates.set(sessionId, next);
     this.sessionModelSnapshots.set(sessionId, next);

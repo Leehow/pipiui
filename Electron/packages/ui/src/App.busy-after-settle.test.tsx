@@ -318,6 +318,54 @@ describe('settled turn stays idle after a late streaming status', () => {
     expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running')
   })
 
+  it('does not freeze a silent next hop when a previous turn settled arrives after tools', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listener).toBeDefined())
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 1 }) })
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '先派三个探索' }) })
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 1 }) })
+    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+
+    act(() => {
+      listener?.({ type: 'user_message', sessionId: 'layout', id: 'done-1', content: '[subagent-done] agentId=a1 name=explore ok=true\nTitle: 探索\nResult:\n报告已齐' })
+      listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 2, pendingFollowUps: ['[subagent-done] agentId=a1 name=explore ok=true\nTitle: 探索\nResult:\n报告已齐'] })
+    })
+    act(() => { listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'status-1', name: 'subagent_status', delta: '{}' }) })
+    act(() => { listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'status-2', name: 'subagent_status', delta: '{}' }) })
+    act(() => { listener?.({ type: 'tool_result', sessionId: 'layout', toolCallId: 'status-1', content: 'ok', isError: false }) })
+    act(() => { listener?.({ type: 'tool_result', sessionId: 'layout', toolCallId: 'status-2', content: 'ok', isError: false }) })
+    act(() => { listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'note-1', name: 'ledger_note', delta: '{}' }) })
+    act(() => { listener?.({ type: 'tool_result', sessionId: 'layout', toolCallId: 'note-1', content: 'ok', isError: false }) })
+
+    const wait = await screen.findByTestId('waiting-placeholder')
+    expect(wait.textContent).toContain('模型正在思考')
+    expect(screen.getByRole('button', { name: /个步骤/ }).textContent).toContain('运行中')
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
+
+    // Production: empty-stop reconciliation from the previous turn emits this
+    // after the follow-up already started its silent openai-codex conclusion.
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 1 }) })
+    expect(screen.getByTestId('waiting-placeholder').textContent).toContain('模型正在思考')
+    expect(screen.getByRole('button', { name: /个步骤/ }).textContent).toContain('运行中')
+    expect(screen.getByRole('button', { name: /个步骤/ }).textContent).not.toContain('已完成')
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
+
+    const conclusion = '`ACTIVE_IMPLEMENTATION_TRACK=pi-coc`\n\n我把两条链路都梳理了一遍。'
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: conclusion }) })
+    await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
+    expect(screen.getByText(/我把两条链路都梳理了一遍/)).toBeTruthy()
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 2 }) })
+    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+    expect(screen.getByText(/我把两条链路都梳理了一遍/)).toBeTruthy()
+  })
+
   it('keeps same-tick follow-up tools after a started that carries the drained prompt', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     const base = createMockHost()

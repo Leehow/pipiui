@@ -143,6 +143,22 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       send({ type: "agent_settled" });
       return;
     }
+    if (command.message === "__no_stream_text__") {
+      // openai-codex-responses often omits text_delta and only persists the
+      // conclusion on message_end. The host must flush that text live.
+      send({ type: "agent_start" });
+      send({
+        type: "message_end",
+        message: {
+          id: "a-final",
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "" }, { type: "text", text: "我把两条链路都梳理了一遍。" }],
+          stopReason: "stop",
+        },
+      });
+      send({ type: "agent_settled" });
+      return;
+    }
     if (command.message === "__fail_turn__") {
       // Provider failure: the assistant message ends with stopReason "error",
       // an errorMessage, and no content — the host must forward it to the UI.

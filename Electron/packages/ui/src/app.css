@@ -215,6 +215,11 @@ body{overscroll-behavior:none}
 .markdown [data-streamdown="code-block-copy-button"],.markdown [data-streamdown="code-block"] button[title="Copy Code"]{opacity:0;transition:opacity .15s ease}.markdown [data-streamdown="code-block"]:hover [data-streamdown="code-block-copy-button"],.markdown [data-streamdown="code-block"]:hover button[title="Copy Code"],.markdown [data-streamdown="code-block-copy-button"]:focus-visible,.markdown [data-streamdown="code-block"] button[title="Copy Code"]:focus-visible{opacity:1}
 /* System-message fallback: rounded card with a softened (non-mono) read. */
 .system-message{margin:12px auto;max-width:var(--chat-content-max);padding:10px 14px;border:1px solid var(--border);border-radius:9px;color:var(--muted);background:var(--surface-raised);font:13px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:.01em}
+.compaction-divider{width:var(--chat-content-width);max-width:var(--chat-content-max);margin:18px auto 14px;padding:0}
+.compaction-divider-rule{height:0;border-top:1px dashed color-mix(in srgb,var(--border) 88%,var(--muted));margin:0 0 8px}
+.compaction-divider-toggle{display:flex;align-items:center;gap:8px;margin:0 auto;padding:2px 0;color:var(--muted);font-size:12px;line-height:1.4}
+.compaction-divider-hint{color:var(--subtle);font-size:11px}
+.compaction-divider-summary{margin:8px 0 0;padding:10px 12px;border:1px dashed color-mix(in srgb,var(--border) 88%,var(--muted));border-radius:8px;color:var(--muted);background:color-mix(in srgb,var(--surface-raised) 70%,transparent);font:12.5px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;white-space:pre-wrap;overflow-wrap:anywhere}
 /* Turn-terminal provider failure (stopReason "error"): the assistant message
    carries no text, so the error bubble is the only visible artifact. */
 .assistant-turn-error{margin:6px 0 0;padding:9px 12px;border:1px solid color-mix(in srgb,var(--danger) 38%,var(--border));border-radius:8px;color:var(--danger);background:color-mix(in srgb,var(--danger) 7%,var(--surface-raised));font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}

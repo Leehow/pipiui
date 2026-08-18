@@ -33,7 +33,7 @@ export type HistoryActivity =
  */
 export type HistoryEntry = {
   id: string;
-  role: "user" | "assistant" | "tool";
+  role: "user" | "assistant" | "tool" | "compaction";
   content: string;
   timestamp: number;
   /** assistant only: reasoning text, rendered inside the folded turn card. */
@@ -102,7 +102,9 @@ export function documentsOpenedInjection(entries: readonly DocumentInjectionEntr
     }
     const size = typeof entry.size === "number" ? `，约 ${formatDocumentSize(entry.size)}` : "";
     const hint = entry.binary
-      ? `。文件已在右侧面板打开（${kind}${size}）；请用 read 工具读取该路径以查看正文。`
+      ? kind === "pdf"
+        ? `。文件已在右侧面板打开（${kind}${size}）；请用 pipiui_firecrawl_pdf 工具本地解析该绝对路径（不要用 read）。默认本地提取文字，不会上传；仅当页面需要 OCR 且已配置可选 OCR Key 时才会上传。打开预览本身不会解析。`
+        : `。文件已在右侧面板打开（${kind}${size}）；请用 read 工具读取该路径以查看正文。`
       : `。文件在磁盘上，可读取与编辑；面板会自动刷新。`;
     blocks.push(`[文档面板] 用户打开了文档：${path}${hint}`);
   }
@@ -431,7 +433,7 @@ export type StreamEvent =
   | { type: "tool_call"; sessionId: string; contentIndex?: number; toolCallId: string; name: string; delta?: string; segment?: number }
   | { type: "tool_result"; sessionId: string; toolCallId: string; content: string; isError?: boolean; images?: TranscriptImage[] }
   | { type: "session_title"; sessionId: string; title: string; source: "provisional" | "model" | "manual" }
-  | { type: "status"; sessionId: string; status: "started" | "streaming" | "settled" | "stopped"; pendingFollowUps?: string[] }
+  | { type: "status"; sessionId: string; status: "started" | "streaming" | "settled" | "stopped"; pendingFollowUps?: string[]; turnEpoch?: number }
   /**
    * Turn-terminal model/provider failure: pi closed the assistant message with
    * `stopReason: "error"` and an `errorMessage` instead of text. Forwarded so a
@@ -538,6 +540,10 @@ export interface PipiHostAPI {
    */
   getVisionEnabled?(): Promise<boolean>;
   setVisionEnabled?(enabled: boolean): Promise<boolean>;
+  /** Project-scoped Firecrawl PDF OCR key. Renderer only receives hasKey, never the secret. */
+  getFirecrawlPdfStatus?(projectId: string): Promise<{ hasKey: boolean }>;
+  /** Pass a new key or null to clear. Never returned back to the renderer. */
+  setFirecrawlPdfApiKey?(projectId: string, apiKey: string | null): Promise<{ hasKey: boolean }>;
   listAgentDefinitions?(): Promise<AgentDefinition[]>;
   /**
    * Provider credentials and login — backed by pi's ModelRuntime
@@ -708,6 +714,8 @@ function apiFrom(
     setVisionModel: ref => invoke("setVisionModel", ref),
     getVisionEnabled: () => invoke("getVisionEnabled"),
     setVisionEnabled: enabled => invoke("setVisionEnabled", enabled),
+    getFirecrawlPdfStatus: projectId => invoke("getFirecrawlPdfStatus", projectId),
+    setFirecrawlPdfApiKey: (projectId, apiKey) => invoke("setFirecrawlPdfApiKey", projectId, apiKey),
     listAgentDefinitions: () => invoke("listAgentDefinitions"),
     getSessionStats: sessionId => invoke("getSessionStats", sessionId),
     getQuotaSnapshot: sessionId => sessionId === undefined ? invoke("getQuotaSnapshot") : invoke("getQuotaSnapshot", sessionId),

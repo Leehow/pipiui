@@ -33,4 +33,15 @@ describe("document injection", () => {
     expect(text).toContain("请用 read 工具");
     expect(text).not.toMatch(/\0/);
   });
+
+  it("tells the model to parse opened PDFs with pipiui_firecrawl_pdf instead of read", async () => {
+    root = await mkdtemp(join(tmpdir(), "doc-inject-pdf-"));
+    const pdf = join(root, "scan.pdf");
+    await writeFile(pdf, Buffer.from("%PDF-1.4\n"));
+    const text = await buildDocumentsOpenedInjection([pdf]);
+    expect(text).toContain(pdf);
+    expect(text).toContain("pipiui_firecrawl_pdf");
+    expect(text).toContain("默认本地提取文字");
+    expect(text).not.toContain("请用 read 工具");
+  });
 });

@@ -48,9 +48,11 @@ describe('document drop helpers', () => {
     expect(documentsOpenedInjection([
       { path: '/abs/notes.md', kind: 'markdown', excerpt: '# 幼儿姓名\n测试' },
       { path: '/abs/form.doc', kind: 'word', binary: true, size: 4096 },
+      { path: '/abs/scan.pdf', kind: 'pdf', binary: true, size: 2048 },
     ])).toBe([
       '[文档面板] 用户打开了文档：/abs/notes.md\n--- 文档内容 ---\n# 幼儿姓名\n测试',
       '[文档面板] 用户打开了文档：/abs/form.doc。文件已在右侧面板打开（word，约 4KB）；请用 read 工具读取该路径以查看正文。',
+      '[文档面板] 用户打开了文档：/abs/scan.pdf。文件已在右侧面板打开（pdf，约 2KB）；请用 pipiui_firecrawl_pdf 工具本地解析该绝对路径（不要用 read）。默认本地提取文字，不会上传；仅当页面需要 OCR 且已配置可选 OCR Key 时才会上传。打开预览本身不会解析。',
     ].join('\n\n'))
   })
 })

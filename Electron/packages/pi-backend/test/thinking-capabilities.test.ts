@@ -394,4 +394,138 @@ describe("model thinking capability contract", () => {
     await expect(backend.handle("setThinkingLevel", ["codex-session", "high"])).rejects.toThrow(/unavailable/);
     await backend.close();
   });
+
+  it("setThinkingLevel succeeds on a live session before catalog hydrate without setModel", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-thinking-set-before-catalog-"));
+    const agentDir = join(root, "agent");
+    const cwd = join(root, "project");
+    const sessionDir = join(root, "sessions", "project");
+    await mkdir(agentDir, { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(join(agentDir, "settings.json"), JSON.stringify({
+      defaultProvider: "xai",
+      defaultModel: "grok-4.6",
+      defaultThinkingLevel: "low",
+    }));
+    await writeFile(
+      join(sessionDir, "session.jsonl"),
+      [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "grok-session",
+          timestamp: "2026-08-13T00:30:28.961Z",
+          cwd,
+        }),
+        JSON.stringify({
+          type: "thinking_level_change",
+          id: "thinking-low",
+          parentId: null,
+          timestamp: "2026-08-13T00:30:30.000Z",
+          thinkingLevel: "low",
+        }),
+      ].join("\n") + "\n",
+    );
+    let releaseCatalog!: () => void;
+    const catalogGate = new Promise<void>(resolve => { releaseCatalog = resolve; });
+    const catalogModel = {
+      provider: "xai",
+      id: "grok-4.6",
+      name: "Grok 4.6",
+      api: "openai-completions",
+      reasoning: true,
+      thinkingLevelMap: {
+        off: null,
+        minimal: "minimal",
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+        max: null,
+      },
+      compat: { supportsReasoningEffort: true },
+      input: ["text", "image"],
+    };
+    const backend = createPiHostBackend({
+      agentDir,
+      sessionsRoot: join(root, "sessions"),
+      runtimeRoot: join(root, "runtime"),
+      canonicalProjectPaths: async () => undefined,
+      piPath: "node",
+      env: { XAI_TEST_KEY: "present" },
+      spawn: (_bin, _args, options) => spawn(
+        "/usr/local/bin/node",
+        [new URL("./fake-pi-grok46.mjs", import.meta.url).pathname],
+        { ...options, env: { ...options.env, PATH: "/usr/local/bin:/usr/bin:/bin" } },
+      ) as any,
+      authRuntime: {
+        getProviders: async () => [],
+        getAvailable: async () => {
+          await catalogGate;
+          return [catalogModel];
+        },
+        login: async () => undefined,
+        logout: async () => undefined,
+      },
+    });
+
+    await (backend as any).ensure("grok-session");
+    const pending = backend.handle("setThinkingLevel", ["grok-session", "high"]);
+    releaseCatalog();
+    expect(await pending).toMatchObject({
+      thinkingLevel: "high",
+      availableThinkingLevels: ["minimal", "low", "medium", "high", "xhigh"],
+    });
+    await expect(backend.handle("setThinkingLevel", ["grok-session", "off"])).rejects.toThrow(/unavailable/);
+    await backend.close();
+  });
+
+  it("setThinkingLevel on a catalog-unknown session model accepts STANDARD levels and rejects unsupported ones", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-thinking-unknown-model-"));
+    const agentDir = join(root, "agent");
+    const cwd = join(root, "project");
+    const sessionDir = join(root, "sessions", "project");
+    await mkdir(agentDir, { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(join(sessionDir, "session.jsonl"), JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "orphan-session",
+      timestamp: "2026-08-13T03:00:00.000Z",
+      cwd,
+    }) + "\n" + JSON.stringify({
+      type: "model_change",
+      id: "model-orphan",
+      parentId: null,
+      timestamp: "2026-08-13T03:00:01.000Z",
+      provider: "xai",
+      modelId: "grok-4.6",
+    }) + "\n");
+    const backend = createPiHostBackend({
+      agentDir,
+      sessionsRoot: join(root, "sessions"),
+      runtimeRoot: join(root, "runtime"),
+      canonicalProjectPaths: async () => undefined,
+      authRuntime: {
+        getProviders: async () => [],
+        getAvailable: async () => [{
+          provider: "other",
+          id: "other-1",
+          name: "Other",
+          reasoning: false,
+        }],
+        login: async () => undefined,
+        logout: async () => undefined,
+      },
+    });
+
+    expect(await backend.handle("setThinkingLevel", ["orphan-session", "low"])).toMatchObject({
+      thinkingLevel: "low",
+      availableThinkingLevels: ["off", "minimal", "low", "medium", "high"],
+    });
+    await expect(backend.handle("setThinkingLevel", ["orphan-session", "xhigh"])).rejects.toThrow(/unavailable/);
+    await backend.close();
+  });
 });

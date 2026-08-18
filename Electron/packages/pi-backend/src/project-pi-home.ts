@@ -1,4 +1,4 @@
-import { existsSync, lstatSync } from "node:fs";
+import { existsSync, lstatSync, readlinkSync, symlinkSync, unlinkSync } from "node:fs";
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
@@ -11,7 +11,8 @@ const AMBIENT_RESOURCE_SETTINGS = [
   "themes",
 ] as const;
 
-const CREDENTIAL_FILES = [".env", "auth.json", "models.json", "models-store.json", "trust.json"] as const;
+const SHARED_CREDENTIAL_FILES = [".env", "auth.json"] as const;
+const COPIED_CREDENTIAL_FILES = ["models.json", "models-store.json", "trust.json"] as const;
 
 /** Coding Pi home for one opened project. Never `~/.pi/agent`. */
 export function projectPiAgentDir(projectRoot: string): string {
@@ -58,10 +59,36 @@ async function copyRegularFileIfMissing(sourceDir: string | undefined, destDir: 
 }
 
 /**
+ * Login identity lives in the host profile. Every opened project points at the
+ * same regular file so an OAuth refresh in one session is visible in all of them.
+ * A seed that is itself a symlink is left untouched — that is how a planted
+ * `~/.pi` or another home must not leak into the project.
+ */
+function linkSharedCredential(sourceDir: string | undefined, destDir: string, name: string): void {
+  if (!sourceDir) return;
+  const source = resolve(sourceDir, name);
+  const dest = resolve(destDir, name);
+  try {
+    if (!existsSync(source) || lstatSync(source).isSymbolicLink()) return;
+  } catch {
+    return;
+  }
+  try {
+    const destStat = lstatSync(dest);
+    if (destStat.isSymbolicLink() && readlinkSync(dest) === source) return;
+    unlinkSync(dest);
+  } catch {
+    /* dest missing */
+  }
+  symlinkSync(source, dest);
+}
+
+/**
  * Create `{project}/.pi/agent` for PipiUI coding sessions.
  *
- * Credentials may be copied once from the host profile so the user does not
- * re-login. Packages and other ambient locators are never copied. The function
+ * Login files (`auth.json`, `.env`) are linked to the host profile so every
+ * opened project shares one identity. Model catalog files may still be copied
+ * once. Packages and other ambient locators are never copied. The function
  * never reads or writes `~/.pi`.
  */
 export async function ensureProjectPiHome(options: {
@@ -87,7 +114,10 @@ export async function ensureProjectPiHome(options: {
     await writeFile(settingsPath, `${JSON.stringify(sanitizePiSettings(source), null, 2)}\n`);
   }
 
-  for (const name of CREDENTIAL_FILES) {
+  for (const name of SHARED_CREDENTIAL_FILES) {
+    linkSharedCredential(options.credentialSeedDir, agentDir, name);
+  }
+  for (const name of COPIED_CREDENTIAL_FILES) {
     await copyRegularFileIfMissing(options.credentialSeedDir, agentDir, name);
   }
   return { agentDir, sessionsDir };

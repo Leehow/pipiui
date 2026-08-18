@@ -77,11 +77,12 @@ Prefer release package via `make-app.sh` for the double-clickable app, but only 
 
 ## 6. Pi 按项目完全隔离（强制）
 
-Pi 配置家是当前打开项目自己的目录，不是全局 `~/.pi`，也不是所有项目共用的 Application Support `pi-agent`。
+Pi 配置家是当前打开项目自己的目录，不是全局 `~/.pi`，也不是把整个 Application Support `pi-agent` 当项目家。
 
-- PipiUI 编码：`{projectRoot}/.pi/agent`
+- 会话、记忆、技能、计划：`{projectRoot}/.pi/agent`
+- 登录/权鉴：所有打开项目指向 App 家同一份 `auth.json` / `.env`（Electron profile `pi-agent`），禁止再按项目复制一份 OAuth
 - chatrpgv4 `pi-coc`：`{chatrpgv4}/.pi/coc-agent`
-- 自己找自己项目的 `.pi/`。禁止从 `~/.pi` 导入 packages，禁止跨项目共享 Pi 家。
+- 自己找自己项目的 `.pi/`。禁止从 `~/.pi` 导入 packages。
 
 ---
 

@@ -65,11 +65,15 @@ describe("installRuntimeTree", () => {
       expect(entries).toContain("pi-philosophy");
       expect(entries).toContain("extensions");
       expect(entries).toContain("built-in-skills");
+      expect(entries).toContain("pdf-inspector");
+      expect(await readdir(join(root, "pdf-inspector", "node_modules", "@firecrawl"))).toEqual(expect.arrayContaining(["pdf-inspector", "pdf-inspector-wasm"]));
       expect(await readdir(join(root, "pi-ext"))).toEqual(expect.arrayContaining(["agents", "packages", "subagent"]));
       expect(await readdir(join(root, "pi-philosophy"))).toContain("philosophy.ts");
       expect(await readFile(join(root, "extensions", "pipiui-git.ts"), "utf8")).toContain("git_status");
       expect(await readFile(join(root, "extensions", "pipiui-runtime-info.ts"), "utf8")).toContain("pipiui_runtime_info");
       expect(await readFile(join(root, "extensions", "pipiui-coding-tools.ts"), "utf8")).toContain("readPathIfDirectory");
+      expect(await readFile(join(root, "extensions", "pipiui-office-doc-shot-gate.ts"), "utf8")).toContain("triggerTurn: true");
+      expect(await readFile(join(root, "extensions", "office-doc-shot-gate.ts"), "utf8")).toContain("mcp_officecli_officecli");
       expect(await readFile(join(root, "extensions", "pipiui-update-center.ts"), "utf8")).toContain('pi.on("input"');
       expect(await readFile(join(root, "extensions", "pipiui-electron-webview.ts"), "utf8")).toContain("sessionCapability: CAPABILITY");
       expect(await readdir(join(root, "built-in-skills"))).toEqual(expect.arrayContaining(["create-subagent", "add-extension"]));

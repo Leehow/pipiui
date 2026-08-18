@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -64,12 +64,38 @@ describe("project Pi home", () => {
     expect(settings.defaultProvider).toBe("xai");
     expect(settings).not.toHaveProperty("packages");
     expect(settings).not.toHaveProperty("extensions");
+    expect(await readlink(join(home.agentDir, "auth.json"))).toBe(join(seed, "auth.json"));
+    expect(await readlink(join(home.agentDir, ".env"))).toBe(join(seed, ".env"));
     expect(await readFile(join(home.agentDir, "auth.json"), "utf8")).toBe('{"xai":{"type":"api_key"}}\n');
-    expect(await readFile(join(home.agentDir, "models.json"), "utf8")).toBe('{"providers":{}}\n');
     expect(await readFile(join(home.agentDir, ".env"), "utf8")).toBe("XAI_API_KEY=seed\n");
-    expect((await lstat(join(home.agentDir, "auth.json"))).isSymbolicLink()).toBe(false);
+    expect(await readFile(join(home.agentDir, "models.json"), "utf8")).toBe('{"providers":{}}\n');
+    expect((await lstat(join(home.agentDir, "models.json"))).isSymbolicLink()).toBe(false);
 
     expect(await readFile(join(globalHome, "settings.json"), "utf8")).toBe(`${JSON.stringify({ packages: ["must-not-change"] })}\n`);
+  });
+
+  it("points every project auth.json at the same host file and replaces a leftover copy", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-project-home-shared-auth-"));
+    const seed = join(root, "host-profile");
+    const first = join(root, "slab");
+    const second = join(root, "pipiui");
+    await mkdir(seed, { recursive: true });
+    await writeFile(join(seed, "auth.json"), '{"xai":{"type":"oauth","refresh":"host"}}\n');
+    await writeFile(join(seed, ".env"), "SHARED=1\n");
+    await mkdir(projectPiAgentDir(first), { recursive: true });
+    await writeFile(join(projectPiAgentDir(first), "auth.json"), '{"xai":{"type":"oauth","refresh":"stale-copy"}}\n');
+
+    await ensureProjectPiHome({ projectRoot: first, credentialSeedDir: seed });
+    await ensureProjectPiHome({ projectRoot: second, credentialSeedDir: seed });
+
+    const firstAuth = join(projectPiAgentDir(first), "auth.json");
+    const secondAuth = join(projectPiAgentDir(second), "auth.json");
+    expect((await lstat(firstAuth)).isSymbolicLink()).toBe(true);
+    expect(await readlink(firstAuth)).toBe(join(seed, "auth.json"));
+    expect(await readlink(secondAuth)).toBe(join(seed, "auth.json"));
+    await writeFile(firstAuth, '{"xai":{"type":"oauth","refresh":"rotated"}}\n');
+    expect(await readFile(join(seed, "auth.json"), "utf8")).toBe('{"xai":{"type":"oauth","refresh":"rotated"}}\n');
+    expect(await readFile(secondAuth, "utf8")).toBe('{"xai":{"type":"oauth","refresh":"rotated"}}\n');
   });
 
   it("rewrites an existing project settings file that still lists packages", async () => {

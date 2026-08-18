@@ -49,4 +49,24 @@ describe('Transcript waiting layout', () => {
     expect(area.querySelector('[data-testid="waiting-placeholder"]')).toBeTruthy()
     expect(area.querySelector('.message-time')?.textContent).toContain('2026-08-14 22:07')
   })
+
+  it('renders a collapsed compaction divider that expands to the summary', async () => {
+    const { fireEvent } = await import('@testing-library/react')
+    const transcriptRef = createRef<VirtuosoHandle>()
+    const history: ChatMessage[] = [
+      { id: 'old', role: 'user', content: '压缩前', timestamp: 1 },
+      { id: 'c1', role: 'compaction', content: '本轮摘要', timestamp: 2 },
+      { id: 'new', role: 'assistant', content: '压缩后', timestamp: 3 },
+      { id: 'c2', role: 'compaction', content: '', timestamp: 4 },
+    ]
+    const view = render(<Transcript messages={history} transcriptRef={transcriptRef} {...handlers} />)
+    const dividers = view.container.querySelectorAll('[data-testid="compaction-divider"]')
+    expect(dividers).toHaveLength(2)
+    expect(view.container.querySelectorAll('[data-testid="compaction-summary"]')).toHaveLength(0)
+    expect(view.container.querySelector('[data-user-prompt="old"]')).toBeTruthy()
+    fireEvent.click(dividers[0]!.querySelector('button')!)
+    expect(view.container.querySelector('[data-testid="compaction-summary"]')?.textContent).toBe('本轮摘要')
+    fireEvent.click(dividers[1]!.querySelector('button')!)
+    expect(Array.from(view.container.querySelectorAll('[data-testid="compaction-summary"]')).map(node => node.textContent)).toEqual(['本轮摘要', '本次压缩未留下摘要。'])
+  })
 })

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createPiHostBackend, installRuntimeTree } from "../src/index.js";
 
@@ -34,11 +34,16 @@ describe("runtime tree refresh across spawns", () => {
     // What the host does at launch. Everything after this is the live-app question.
     expect(installRuntimeTree(assets, runtimeRoot).failures).toEqual([]);
 
-    let args: string[] = [];
+    let sessionArgs: string[] = [];
+    let sessionEnv: NodeJS.ProcessEnv = {};
     const backend = createPiHostBackend({
       sessionsRoot, runtimeRoot, piPath: "node", runtimeAssets: assets,
       spawn: (_bin, _args, options) => {
-        args = _args;
+        // Title/vision helpers also spawn; they must not overwrite the session contract.
+        if (_args.includes("--session")) {
+          sessionArgs = _args;
+          sessionEnv = options?.env ?? {};
+        }
         return spawn(process.execPath, [new URL("./fake-pi.mjs", import.meta.url).pathname], options) as any;
       },
     });
@@ -46,8 +51,11 @@ describe("runtime tree refresh across spawns", () => {
     await backend.handle("sendPrompt", ["session-1", "first"]);
     // Several extensions are mounted with -e and their order is the spawn's business,
     // not this test's: select by path so adding another mount cannot break it.
-    const extensions = args.flatMap((arg, index) => (arg === "-e" ? [args[index + 1]] : []));
+    const extensions = sessionArgs.flatMap((arg, index) => (arg === "-e" ? [sessionArgs[index + 1]] : []));
     expect(extensions).toContain(join(runtimeRoot, "pi-philosophy", "philosophy.ts"));
+    expect(extensions).toContain(join(runtimeRoot, "extensions", "pipiui-firecrawl-pdf.ts"));
+    expect(sessionEnv.PIPIUI_PDF_INSPECTOR_ROOT).toBe(join(runtimeRoot, "pdf-inspector"));
+    expect(String(sessionEnv.NODE_PATH ?? "").split(delimiter)).toContain(join(runtimeRoot, "pdf-inspector", "node_modules"));
     const layer = join(runtimeRoot, "pi-philosophy", "layers", "30-orchestration.md");
     expect(await readFile(layer, "utf8")).not.toContain("REFRESH-PROBE");
 
@@ -61,5 +69,7 @@ describe("runtime tree refresh across spawns", () => {
     await backend.handle("sendPrompt", ["session-1", "second"]);
     expect(await readFile(layer, "utf8")).toContain("REFRESH-PROBE");
     expect(await readFile(join(runtimeRoot, "extensions", "pipiui-git.ts"), "utf8")).toContain("REFRESH-PROBE");
+    expect(sessionEnv.PIPIUI_PDF_INSPECTOR_ROOT).toBe(join(runtimeRoot, "pdf-inspector"));
+    expect(String(sessionEnv.NODE_PATH ?? "").split(delimiter)).toContain(join(runtimeRoot, "pdf-inspector", "node_modules"));
   }, 30_000);
 });

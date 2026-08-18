@@ -150,7 +150,7 @@ describe("vendored philosophy: delivery", () => {
   it("delivers last-resort terminal discipline in debugloop and orchestration", () => {
     expect(layers.find((l) => l.id === "debugloop")!.body).toMatch(/Last-resort only/);
     expect(layers.find((l) => l.id === "orchestration")!.body).toMatch(
-      /visible terminal is not another route to the withheld shell/,
+      /do not look for another route to the same edit/,
     );
   });
 

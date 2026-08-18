@@ -190,7 +190,104 @@ function VisionRoutingPane({ visibility, vision }: {
  * (hiddenModelIds, atomic); vision routing through getVisionEnabled/
  * setVisionEnabled + getVisionModel/setVisionModel.
  */
-export function ModelVisibilityModal({ host, visibility, vision, updates, current, onModelState, onRequestUpdate, onClose, initialView = 'manage' }: {
+const FIRECRAWL_API_KEYS_URL = 'https://www.firecrawl.dev/app/api-keys'
+
+function FirecrawlPdfPane({ host, projectId }: { host: PipiHostAPI; projectId?: string }) {
+  const [draft, setDraft] = useState('')
+  const [hasKey, setHasKey] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const available = Boolean(host.getFirecrawlPdfStatus && host.setFirecrawlPdfApiKey)
+
+  const refresh = async () => {
+    if (!host.getFirecrawlPdfStatus || !projectId) {
+      setHasKey(false)
+      setLoading(false)
+      return
+    }
+    setLoading(true)
+    try {
+      const status = await host.getFirecrawlPdfStatus(projectId)
+      setHasKey(Boolean(status?.hasKey))
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { void refresh() }, [projectId, host])
+
+  const save = async (next: string | null) => {
+    if (!host.setFirecrawlPdfApiKey || !projectId) return
+    setSaving(true)
+    try {
+      const status = await host.setFirecrawlPdfApiKey(projectId, next)
+      setHasKey(Boolean(status?.hasKey))
+      setDraft('')
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!available) {
+    return <p className="vision-picker-hint" data-testid="firecrawl-pdf-unsupported">当前连接不支持 Firecrawl PDF OCR 设置。</p>
+  }
+  return (
+    <div className="vision-picker" data-testid="firecrawl-pdf-pane" style={{ marginTop: 18 }}>
+      <strong>Firecrawl OCR Key（选填）</strong>
+      <p className="vision-picker-hint">
+        选填，不配置仍可本地解析文字型 PDF。配置后扫描件/图片页可用 Firecrawl 云端 OCR（按页计费，由 Firecrawl 处理）。仅 OCR fallback 且已配置 Key 时才会上传；打开右侧栏预览不会解析或上传。密钥按当前项目保存在 .pi/agent/web-search.json。
+      </p>
+      {loading ? <p className="vision-picker-hint" data-testid="firecrawl-pdf-loading">正在读取配置…</p> : (
+        <p className="vision-picker-hint" data-testid="firecrawl-pdf-status">{hasKey ? '已配置 API Key' : '尚未配置 API Key'}</p>
+      )}
+      {error && (
+        <div className="model-modal-error" role="alert" data-testid="firecrawl-pdf-error">
+          <span>{error}</span>
+          <button className="visibility-error-close" aria-label="关闭错误提示" data-testid="firecrawl-pdf-error-close" onClick={() => setError(null)}>×</button>
+        </div>
+      )}
+      <label className="vision-model-select-row" style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 10, color: 'var(--muted)', fontSize: 11 }}>
+        <span>Firecrawl API Key</span>
+        <input
+          type="password"
+          autoComplete="off"
+          spellCheck={false}
+          placeholder={hasKey ? '输入新密钥以替换' : '粘贴 API Key'}
+          value={draft}
+          disabled={!projectId || saving}
+          data-testid="firecrawl-pdf-key-input"
+          onChange={event => setDraft(event.target.value)}
+          style={{ width: '100%', padding: '5px', border: '1px solid var(--border-strong)', borderRadius: 6, color: 'var(--text)', background: 'var(--surface-input)', fontSize: 11 }}
+        />
+      </label>
+      <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+        <button type="button" className="model-modal-add" disabled={!projectId || saving || !draft.trim()} data-testid="firecrawl-pdf-save" onClick={() => void save(draft)}>
+          保存
+        </button>
+        <button type="button" className="model-modal-refresh" disabled={!projectId || saving || !hasKey} data-testid="firecrawl-pdf-clear" onClick={() => void save(null)}>
+          清除
+        </button>
+        <button
+          type="button"
+          className="model-modal-refresh"
+          data-testid="firecrawl-pdf-apply"
+          onClick={() => void host.openExternal?.(FIRECRAWL_API_KEYS_URL)}
+        >
+          申请 API Key
+        </button>
+      </div>
+    </div>
+  )
+}
+
+export function ModelVisibilityModal({ host, visibility, vision, updates, current, onModelState, onRequestUpdate, onClose, initialView = 'manage', projectId }: {
   host: PipiHostAPI
   visibility: ModelVisibilityController
   vision: VisionRoutingController
@@ -201,6 +298,7 @@ export function ModelVisibilityModal({ host, visibility, vision, updates, curren
   onClose: () => void
   /** First-run onboarding opens straight into the provider login pane. */
   initialView?: 'manage' | 'add'
+  projectId?: string
 }) {
   const [tab, setTab] = useState<'general' | 'models' | 'extensions' | 'updates'>('models')
   const [extensionsAddOpen, setExtensionsAddOpen] = useState(false)
@@ -306,7 +404,10 @@ export function ModelVisibilityModal({ host, visibility, vision, updates, curren
         </header>
         <div className="model-modal-body" data-testid="model-modal-body">
           {tab === 'general'
-            ? <VisionRoutingPane visibility={visibility} vision={vision} />
+            ? <>
+                <VisionRoutingPane visibility={visibility} vision={vision} />
+                <FirecrawlPdfPane host={host} projectId={projectId} />
+              </>
             : tab === 'updates'
               ? <UpdateCenter updates={updates} onRequestUpdate={onRequestUpdate} />
             : tab === 'extensions'

@@ -22,6 +22,12 @@ Sources.bak-20260723-104538/
 # once swept 31766 files into a commit.
 node_modules/
 
+# Vendored Firecrawl pdf-inspector (local-first PDF runtime)
+!Electron/resources/runtime/pdf-inspector/
+!Electron/resources/runtime/pdf-inspector/**
+!Electron/resources/runtime/pdf-inspector/node_modules/
+!Electron/resources/runtime/pdf-inspector/node_modules/**
+
 # TypeScript incremental build state
 *.tsbuildinfo
 

@@ -34,6 +34,33 @@ describe("runtime info extension mount", () => {
   });
 });
 
+describe("firecrawl pdf extension mount", () => {
+  const firecrawlPdf = "/runtime/extensions/pipiui-firecrawl-pdf.ts";
+
+  it("always mounts the bundled PDF parser when the runtime file exists", () => {
+    const input = { cwd: "/tmp/project", paths: { firecrawlPdf } };
+    expect(assemblePiSpawn(input).args).toEqual(["-e", firecrawlPdf]);
+    expect(assemblePiSpawn({ ...input, resourceMode: "explicit" as const }).args).toEqual(["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "-e", firecrawlPdf]);
+  });
+
+  it("resolves the shipped extension from the source runtime tree", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "resources", "runtime");
+    expect(resolveSpawnPaths(root).firecrawlPdf).toBe(join(root, "extensions", "pipiui-firecrawl-pdf.ts"));
+    expect(resolveSpawnPaths(root).pdfInspector).toBe(join(root, "pdf-inspector"));
+    expect(existsSync(join(root, "pdf-inspector", "node_modules", "@firecrawl", "pdf-inspector", "package.json"))).toBe(true);
+    expect(existsSync(join(root, "pdf-inspector", "node_modules", "@firecrawl", "pdf-inspector-wasm", "pdf_inspector_wasm_bg.wasm"))).toBe(true);
+  });
+
+  it("exports the inspector root and NODE_PATH so the Pi child can resolve official packages", () => {
+    const firecrawlPdf = "/runtime/extensions/pipiui-firecrawl-pdf.ts";
+    const pdfInspector = "/runtime/pdf-inspector";
+    const { env } = assemblePiSpawn({ cwd: "/tmp/project", paths: { firecrawlPdf, pdfInspector } });
+    expect(env.PIPIUI_PDF_INSPECTOR_ROOT).toBe(pdfInspector);
+    expect(env.NODE_PATH?.split(delimiter)).toContain(join(pdfInspector, "node_modules"));
+    expect(sanitizeEnvironment({ PIPIUI_PDF_INSPECTOR_ROOT: "/stale", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
+  });
+});
+
 describe("coding tools extension mount", () => {
   const codingTools = "/runtime/extensions/pipiui-coding-tools.ts";
 
@@ -56,6 +83,31 @@ describe("coding tools extension mount", () => {
   it("resolves the shipped wrapper from the source runtime tree", () => {
     const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "resources", "runtime");
     expect(resolveSpawnPaths(root).codingTools).toBe(join(root, "extensions", "pipiui-coding-tools.ts"));
+  });
+});
+
+describe("office document screenshot gate mount", () => {
+  const officeDocShotGate = "/runtime/extensions/pipiui-office-doc-shot-gate.ts";
+
+  it("always mounts the gate and exports the path for workers", () => {
+    const input = { cwd: "/tmp/project", paths: { officeDocShotGate } };
+    expect(assemblePiSpawn(input).args).toEqual(["-e", officeDocShotGate]);
+    expect(assemblePiSpawn({ ...input, bridgePort: 1234 }).args).toEqual(["-e", officeDocShotGate]);
+    expect(assemblePiSpawn(input).env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT).toBe(officeDocShotGate);
+  });
+
+  it("stays off isolated helpers that pass no paths", () => {
+    expect(assemblePiSpawn({ cwd: "/tmp/project", paths: {} }).args).toEqual([]);
+    expect(assemblePiSpawn({ cwd: "/tmp/project", paths: {} }).env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT).toBeUndefined();
+  });
+
+  it("cannot be smuggled in from the inherited environment", () => {
+    expect(sanitizeEnvironment({ PIPIUI_OFFICE_DOC_SHOT_GATE_EXT: "/stale.ts", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("resolves the shipped extension from the source runtime tree", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "resources", "runtime");
+    expect(resolveSpawnPaths(root).officeDocShotGate).toBe(join(root, "extensions", "pipiui-office-doc-shot-gate.ts"));
   });
 });
 

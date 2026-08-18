@@ -26,12 +26,42 @@ describe('transcript model', () => {
     ])
   })
 
-  it('accepts a shorter authoritative branch or compaction snapshot', () => {
+  it('accepts a shorter non-empty history snapshot as a legitimate branch', () => {
+    const live = [
+      { id: 'u1', role: 'user' as const, content: 'first', timestamp: 1 },
+      { id: 'a1', role: 'assistant' as const, content: 'one', timestamp: 2 },
+      { id: 'u2', role: 'user' as const, content: 'second', timestamp: 3 },
+      { id: 'a2', role: 'assistant' as const, content: 'two', timestamp: 4 },
+    ]
     const result = reconcileHistorySnapshot([
-      { id: 'compact', role: 'assistant', content: 'compacted summary', timestamp: 1 },
-    ], 4, 4, JSON.stringify([{ id: 'old-a' }, { id: 'old-b' }]))
+      { id: 'u2', role: 'user', content: 'second', timestamp: 3 },
+      { id: 'a2', role: 'assistant', content: 'two', timestamp: 4 },
+    ], 4, 4, undefined, live)
     expect(result.status).toBe('accepted')
-    expect(result.messages.map(message => message.id)).toEqual(['compact'])
+    expect(result.messages.map(message => message.id)).toEqual(['u2', 'a2'])
+  })
+
+  it('does not let an empty history snapshot wipe a non-empty live transcript', () => {
+    const live = [
+      { id: 'u1', role: 'user' as const, content: 'first', timestamp: 1 },
+      { id: 'a1', role: 'assistant' as const, content: 'one', timestamp: 2 },
+    ]
+    const result = reconcileHistorySnapshot([], 4, 4, undefined, live)
+    expect(result.status).toBe('retained-longer-live')
+    expect(result.messages.map(message => message.id)).toEqual(['u1', 'a1'])
+  })
+
+  it('accepts finished history over a streaming live assistant', () => {
+    const live = [
+      { id: 'u1', role: 'user' as const, content: 'ask', timestamp: 1 },
+      { id: 'a-live', role: 'assistant' as const, content: 'partial', timestamp: 2, streaming: true },
+    ]
+    const result = reconcileHistorySnapshot([
+      { id: 'u1', role: 'user', content: 'ask', timestamp: 1 },
+      { id: 'a-done', role: 'assistant', content: 'done', timestamp: 2 },
+    ], 4, 4, undefined, live)
+    expect(result.status).toBe('accepted')
+    expect(result.messages[1]).toMatchObject({ id: 'a-done', content: 'done' })
   })
 
   it('rejects an async history response when a live stream changed after request start', () => {
@@ -39,6 +69,29 @@ describe('transcript model', () => {
       { id: 'old', role: 'assistant', content: 'old snapshot', timestamp: 10 },
     ], 4, 5)
     expect(result.status).toBe('stale-request')
+  })
+
+  it('maps persisted compaction entries to folded divider messages and keeps earlier bubbles', () => {
+    const messages = historyMessages([
+      { id: 'u1', role: 'user', content: 'old', timestamp: 1 },
+      { id: 'a1', role: 'assistant', content: 'reply', timestamp: 2 },
+      { id: 'c1', role: 'compaction', content: 'first summary', timestamp: 3 },
+      { id: 'u2', role: 'user', content: 'later', timestamp: 4 },
+      { id: 'c2', role: 'compaction', content: '', timestamp: 5 },
+    ])
+    expect(messages.map(message => ({ id: message.id, role: message.role, content: message.content }))).toEqual([
+      { id: 'u1', role: 'user', content: 'old' },
+      { id: 'a1', role: 'assistant', content: 'reply' },
+      { id: 'c1', role: 'compaction', content: 'first summary' },
+      { id: 'u2', role: 'user', content: 'later' },
+      { id: 'c2', role: 'compaction', content: '' },
+    ])
+    const accepted = reconcileHistorySnapshot([
+      { id: 'u1', role: 'user', content: 'old', timestamp: 1 },
+      { id: 'c1', role: 'compaction', content: 'first summary', timestamp: 3 },
+    ], 1, 1, undefined, messages)
+    expect(accepted.status).toBe('accepted')
+    expect(accepted.messages.some(message => message.role === 'compaction')).toBe(true)
   })
 
   it('records tool_result as completed transcript truth without live agents', () => {

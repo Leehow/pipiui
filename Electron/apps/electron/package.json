@@ -76,6 +76,10 @@
         ]
       },
       {
+        "from": "../../resources/runtime/pdf-inspector/node_modules",
+        "to": "pipiui-runtime/pdf-inspector/node_modules"
+      },
+      {
         "from": "../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}",
         "to": "pipiui-embedded"
       }

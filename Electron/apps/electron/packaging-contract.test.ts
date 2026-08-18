@@ -49,6 +49,10 @@ describe('macOS packaging contract', () => {
     const runtimeSource = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime')
     const embedded = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-embedded')
     expect(runtimeSource?.filter).toContain('!**/node_modules/**')
+    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+      from: '../../resources/runtime/pdf-inspector/node_modules',
+      to: 'pipiui-runtime/pdf-inspector/node_modules'
+    }))
     expect(embedded?.from).toBe('../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}')
     expect(embedded?.filter).toBeUndefined()
     expect(brokerPackage.dependencies['pi-hermes-memory']).toBe('0.9.6')

@@ -51,7 +51,23 @@ export const MessageView = memo(function MessageView({ message, showFooter, docu
   const time = showFooter && message.timestamp ? <time className="message-time" dateTime={new Date(message.timestamp).toISOString()}>{messageTime(message.timestamp)}</time> : null
   const actions = showFooter && !signal ? <MessageActionBar alignment="trailing" canCopy canResend={message.role === 'user' && Boolean(message.content.trim())} copyDisabled={copyDisabled} resendDisabled={resendDisabled} onCopy={copy} onResend={() => onResend(message)} copied={copied} /> : null
   const footer = actions || time ? <div className="message-footer">{time}{actions}</div> : null
+  if (message.role === 'compaction') return <CompactionDivider message={message} />
   if (message.role === 'user') return signal ? <article className="message user-message subagent-signal-message"><div className="subagent-signal-stack"><SubagentSignalCard content={message.content} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} />{time}</div></article> : <article className="message user-message" data-user-prompt={message.id}><div className="user-message-stack"><UserMessageBubble text={message.content} images={message.images} /></div>{footer}</article>
   if (message.role === 'tool') { const notice = parseSubagentNotice(message.content); return notice ? <article className="message assistant-message"><CollapsibleActivityCard kind="result" label="子任务" summary={notice.name} meta={`${notice.ok ? '成功' : '失败'} · ${notice.cost}`} error={!notice.ok}><pre><TruncatedText text={message.content} /></pre></CollapsibleActivityCard>{footer}</article> : <article className="system-message tool-message"><div><TruncatedText text={message.content} /></div>{footer}</article> }
   return <article className="message assistant-message"><AssistantTranscriptContent message={message} onOpenSubagents={onOpenSubagents} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} />{footer}</article>
 })
+
+export function CompactionDivider({ message }: { message: ChatMessage }) {
+  const [open, setOpen] = useState(false)
+  const summary = message.content.trim()
+  return (
+    <div className="compaction-divider" data-testid="compaction-divider" data-compaction-id={message.id}>
+      <div className="compaction-divider-rule" aria-hidden="true" />
+      <button type="button" className="compaction-divider-toggle" aria-expanded={open} onClick={() => setOpen(value => !value)}>
+        上下文已压缩
+        <span className="compaction-divider-hint">{open ? '收起摘要' : '查看摘要'}</span>
+      </button>
+      {open && <div className="compaction-divider-summary" data-testid="compaction-summary">{summary || '本次压缩未留下摘要。'}</div>}
+    </div>
+  )
+}

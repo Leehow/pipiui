@@ -1144,6 +1144,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   // ghost turn (JSONL already idle). Real follow-ups carry pendingFollowUps or
   // a new user row and still open the wait.
   const turnJustSettledRef = useRef(false)
+  /** Host `turnEpoch` of the started turn now shown as live. A later
+   *  `settled`/`stopped` from an older epoch is the previous empty-stop
+   *  reconciliation and must not freeze the silent next hop. */
+  const openedTurnEpochBySessionRef = useRef(new Map<string, number>())
   /** The optimistic user bubble of the in-flight direct send. The server's
    *  `user_message` echo merges back into this bubble by id, so an assistant
    *  placeholder that already streamed past it cannot wedge a duplicate below. */
@@ -1565,7 +1569,13 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         requestLiveRevision,
         transcriptLiveRevisionRef.current,
         historyFingerprintBySessionRef.current.get(selectedSession),
+        messagesRef.current,
       )
+      if (reconciliation.status === 'retained-longer-live') {
+        resumeOrCloseLostSettle(messagesRef.current)
+        applyRestoredOpenHop(messagesRef.current)
+        return
+      }
       if (reconciliation.status === 'stale-request') {
         // A stream mutation supersedes this request generation. While a turn is
         // open its terminal event owns the retry; otherwise schedule one bounded
@@ -1822,6 +1832,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         // agent_start, or App restart which resets turnJustSettledRef). A real
         // follow-up already has a user row or pendingFollowUps.
         if (event.status === 'started' && !shouldOpenWaitOnStarted(messagesRef.current, event.pendingFollowUps)) return
+        if (staleTurnTerminal(event, openedTurnEpochBySessionRef.current.get(event.sessionId))) return
         const sidebarStatus: SessionStatus = event.status === 'started' || event.status === 'streaming'
           ? 'running'
           : event.status === 'settled' ? 'completed' : 'interrupted'
@@ -1829,6 +1840,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         if (event.status === 'started' || event.status === 'streaming') {
           if (event.status === 'started') {
             if (!mainTurnOpenRef.current) mainTurnEpochRef.current += 1
+            if (event.turnEpoch !== undefined) openedTurnEpochBySessionRef.current.set(event.sessionId, event.turnEpoch)
             mainTurnOpenRef.current = true
             turnJustSettledRef.current = false
             const continued = reopenAssistantForNextCompletion(messagesRef.current)
@@ -1907,7 +1919,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         setMessages(next)
       }
       if (event.type === 'text') {
-        setWaitingVisible(false)
+        if (event.delta.trim()) setWaitingVisible(false)
       } else if (event.type === 'thinking') {
         setWaitingVisible(true)
         setWaitingPhase('thinking')
@@ -1948,6 +1960,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         if (event.status === 'streaming' && observedSessionStatusesRef.current[event.sessionId] !== 'running') return
         // Bare started after a finished assistant is a ghost (duplicate agent_start).
         if (event.status === 'started' && !shouldOpenWaitOnStarted(messagesBySessionRef.current.get(event.sessionId) ?? [], event.pendingFollowUps)) return
+        if (staleTurnTerminal(event, openedTurnEpochBySessionRef.current.get(event.sessionId))) return
+        if (event.status === 'started' && event.turnEpoch !== undefined) {
+          openedTurnEpochBySessionRef.current.set(event.sessionId, event.turnEpoch)
+        }
         applyObservedStatus(event.sessionId, event.status === 'started' || event.status === 'streaming'
           ? 'running'
           : event.status === 'settled' ? 'completed' : 'interrupted')
@@ -2631,7 +2647,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     </section>
     <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resize('tools', widths.tools)} />
     <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== 'Subagents'} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} />
-    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} />}
+    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} />}
     {subagentModelsOpen && <SubagentModelModal host={host} current={modelState?.model ?? null} visibility={modalVisibility} onClose={() => setSubagentModelsOpen(false)} />}
@@ -2694,6 +2710,13 @@ function waitingPhaseForTurn(messages: ChatMessage[], pendingFollowUps?: string[
  *  prompt is already visible or queued. Bare started is the ghost-turn path,
  *  except when the last assistant ended on tools — that is the next silent
  *  model hop (Grok/xhigh often omits thinking_delta). */
+function staleTurnTerminal(event: Extract<StreamEvent, { type: 'status' }>, openedEpoch?: number): boolean {
+  return (event.status === 'settled' || event.status === 'stopped')
+    && event.turnEpoch !== undefined
+    && openedEpoch !== undefined
+    && event.turnEpoch !== openedEpoch
+}
+
 function shouldOpenWaitOnStarted(messages: ChatMessage[], pendingFollowUps?: string[]): boolean {
   if (pendingFollowUps?.some(text => text.trim().length > 0)) return true
   const last = messages[messages.length - 1]

@@ -254,6 +254,11 @@ describe('active-turn waiting placeholder', () => {
     expect(screen.getByRole('button', { name: /个步骤/ }).textContent).not.toContain('已完成')
     expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running')
 
+    // openai-codex-responses often emits an empty text part before the real
+    // conclusion. That must not hide the thinking wait.
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '' }) })
+    expect(screen.getByTestId('waiting-placeholder').textContent).toContain('模型正在思考')
+
     act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '设计方案可以定了' }) })
     await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
   })

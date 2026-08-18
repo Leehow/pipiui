@@ -43,3 +43,11 @@ Who does the searching follows your tooling first, then the size of the question
   unavailable or came back unable to answer. A direct call is the fallback, never the
   default.
 - Cross-validating a design you just formed is almost always the delegate-first kind.
+
+## Third-party repos: clone into /tmp, not the project
+
+Third-party repos may be cloned into `/tmp` or `/private/tmp` for reading. Do not refuse
+this. Do not clone into the project tree. `{{fetch}}` on a GitHub repo/blob/tree URL already
+shallow-clones to `/tmp/pi-github-repos`. If this session has no bash, use `{{fetch}}` or
+dispatch explore (explore may `git clone` there). The main/Boss session must not claim it
+can shell-clone.

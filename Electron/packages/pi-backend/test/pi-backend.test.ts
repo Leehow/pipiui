@@ -47,7 +47,17 @@ expect(toolCalls).toEqual([expect.objectContaining({type:"tool_call",sessionId:"
 it("forwards a terminal stopReason error as a stream error so a failed turn is never blank",async()=>{root=await mkdtemp(join(tmpdir(),"pipi-pi-fail-"));const cwd=join(root,"project");const dir=join(root,"sessions","project");await mkdir(dir,{recursive:true});await mkdir(cwd,{recursive:true});await writeFile(join(dir,"session.jsonl"),[JSON.stringify({type:"session",version:3,id:"session-1",timestamp:"2026-08-10T00:00:00.000Z",cwd})].join("\n")+"\n");const backend=createPiHostBackend({agentDir:join(root,"agent"),sessionsRoot:join(root,"sessions"),runtimeRoot:join(root,"runtime"),canonicalProjectPaths:async()=>undefined,piPath:"node",spawn:(_bin,_args,options)=>spawn("/usr/local/bin/node",[new URL("./fake-pi.mjs",import.meta.url).pathname],{...options,env:{...options.env,PATH:"/usr/local/bin:/usr/bin:/bin"}}) as any});await backend.handle("addProject",[cwd]);const events:any[]=[];const off=backend.subscribe(e=>events.push(e));await backend.handle("sendPrompt",["session-1","__fail_turn__"]);await new Promise(r=>setTimeout(r,20));off();
 // Pi reports message_end with stopReason "error" + errorMessage and no content;
 // the host must surface it as a stream error so the UI can render the failure.
-const errors=events.filter(e=>e.channel==="stream"&&e.event.type==="error").map(e=>e.event);expect(errors).toEqual([{type:"error",sessionId:"session-1",content:"Codex error: Invalid schema for function 'subagent': ..."}]);});});
+const errors=events.filter(e=>e.channel==="stream"&&e.event.type==="error").map(e=>e.event);expect(errors).toEqual([{type:"error",sessionId:"session-1",content:"Codex error: Invalid schema for function 'subagent': ..."}]);});
+
+it("flushes unstreamed assistant text on message_end and tags status with turnEpoch",async()=>{root=await mkdtemp(join(tmpdir(),"pipi-pi-flush-"));const cwd=join(root,"project");const dir=join(root,"sessions","project");await mkdir(dir,{recursive:true});await mkdir(cwd,{recursive:true});await writeFile(join(dir,"session.jsonl"),[JSON.stringify({type:"session",version:3,id:"session-1",timestamp:"2026-08-10T00:00:00.000Z",cwd})].join("\n")+"\n");const backend=createPiHostBackend({agentDir:join(root,"agent"),sessionsRoot:join(root,"sessions"),runtimeRoot:join(root,"runtime"),canonicalProjectPaths:async()=>undefined,piPath:"node",spawn:(_bin,_args,options)=>spawn("/usr/local/bin/node",[new URL("./fake-pi.mjs",import.meta.url).pathname],{...options,env:{...options.env,PATH:"/usr/local/bin:/usr/bin:/bin"}}) as any});await backend.handle("addProject",[cwd]);const events:any[]=[];const off=backend.subscribe(e=>events.push(e));await backend.handle("sendPrompt",["session-1","__no_stream_text__"]);await new Promise(r=>setTimeout(r,20));off();
+const statuses=events.filter(e=>e.channel==="stream"&&e.event.type==="status").map(e=>e.event);
+expect(statuses).toEqual([
+  expect.objectContaining({status:"started",turnEpoch:expect.any(Number)}),
+  expect.objectContaining({status:"settled",turnEpoch:statuses[0].turnEpoch}),
+]);
+const texts=events.filter(e=>e.channel==="stream"&&e.event.type==="text").map(e=>e.event.delta);
+expect(texts).toEqual(["我把两条链路都梳理了一遍。"]);
+});});
 
 describe("PiHostBackend history structure",()=>{let root="";afterEach(async()=>{if(root)await (await import("node:fs/promises")).rm(root,{recursive:true,force:true,maxRetries:10,retryDelay:25});root="";});it("preserves thinking/tool structure in history entries (SessionManager path)", async () => {
   root = await mkdtemp(join(tmpdir(), "pipi-pi-hist-"));

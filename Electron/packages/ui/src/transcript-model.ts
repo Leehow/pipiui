@@ -30,7 +30,7 @@ export type TranscriptSegment =
 
 export type ChatMessage = {
   id: string
-  role: 'user' | 'assistant' | 'tool'
+  role: 'user' | 'assistant' | 'tool' | 'compaction'
   content: string
   thinking?: string
   tools?: TranscriptTool[]
@@ -128,6 +128,10 @@ export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
   const cards = new Map<string, TranscriptTool>()
   const messages: ChatMessage[] = []
   for (const entry of entries) {
+    if (entry.role === 'compaction') {
+      messages.push({ id: entry.id, role: 'compaction', content: entry.content ?? '', timestamp: entry.timestamp })
+      continue
+    }
     if (entry.role === 'assistant' && (entry.thinking || entry.tools?.length || entry.activities?.some(activity => activity.type !== 'text'))) {
       const tools = entry.tools?.map(tool => ({ id: tool.id, name: tool.name, input: tool.input, startedAt: entry.timestamp, finished: true }))
       for (const tool of tools ?? []) cards.set(tool.id, tool)
@@ -194,11 +198,21 @@ export function reconcileHistorySnapshot(
   requestLiveRevision: number,
   currentLiveRevision: number,
   previousFingerprint?: string,
-): { status: 'accepted' | 'unchanged' | 'stale-request'; messages: ChatMessage[]; fingerprint: string } {
+  liveMessages?: readonly ChatMessage[],
+): { status: 'accepted' | 'unchanged' | 'stale-request' | 'retained-longer-live'; messages: ChatMessage[]; fingerprint: string } {
   const messages = historyMessages(entries)
   const fingerprint = transcriptFingerprint(messages)
   if (requestLiveRevision !== currentLiveRevision) return { status: 'stale-request', messages, fingerprint }
   if (fingerprint === previousFingerprint) return { status: 'unchanged', messages, fingerprint }
+  // Only block an empty first-page snapshot from wiping a non-empty live
+  // transcript. Shorter non-empty history is a legitimate branch/retry.
+  if (liveMessages && liveMessages.length > 0 && messages.length === 0) {
+    return {
+      status: 'retained-longer-live',
+      messages: [...liveMessages],
+      fingerprint: previousFingerprint ?? transcriptFingerprint(liveMessages),
+    }
+  }
   return { status: 'accepted', messages, fingerprint }
 }
 
