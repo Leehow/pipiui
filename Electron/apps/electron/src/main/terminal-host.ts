@@ -111,7 +111,7 @@ export class TerminalSessionHost {
 
   async toolAction(sessionId: string, request: TerminalToolRequest): Promise<TerminalToolResult> {
     const action = request.action
-    if (action === 'help') return { ok: true, help: 'Use shared terminal for visible SSH, REPL and TUI state; prefer bash for ordinary commands. Mutations require terminal_id plus latest snapshot_id. Private input requires explicit user handoff.' }
+    if (action === 'help') return { ok: true, help: 'Use shared terminal last-resort for visible SSH, REPL and TUI state; never a substitute for read/ls/git/grep/find/bash. Mutations require terminal_id plus latest snapshot_id. Private input requires explicit user handoff.' }
     if (action === 'list') { const terminals = [...(this.spaces.get(sessionId)?.values() ?? [])].map(e => this.summary(e)); return { ok: true, terminals, activeTerminalId: this.active.get(sessionId), requiresSelection: terminals.length !== 1 } }
     if (action === 'open') { const opened = this.open(sessionId, request); const entry = this.get(sessionId, opened.id); this.reveal(entry); return this.observation(entry) }
     const usable = [...(this.spaces.get(sessionId)?.values() ?? [])]
